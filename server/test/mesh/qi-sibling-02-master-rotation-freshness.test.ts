@@ -54,8 +54,6 @@ import { InMemoryTransport } from "../../src/mesh/in-memory-transport.js";
 import {
   MasterRotationCeremony,
   MasterRotationReceiver,
-  MAX_PENDING_ROTATIONS_ON_RECEIVER,
-  MAX_PENDING_ROTATIONS_PER_EMITTER,
   createMasterRotationAckSubscription,
   wrapMasterRotationBundle,
 } from "../../src/mesh/recovery-flows/index.js";
@@ -76,6 +74,15 @@ const HOUR_MS = 60 * 60 * 1000;
  * carries would be attacker-selectable and therefore no quota at all.
  */
 const PEER = "peer-initiator";
+
+/**
+ * The receiver's `pending` map is deliberately UNBOUNDED on this branch (see the
+ * declaration's own comment and the register row it cites), so there is no
+ * capacity or flood test here. That is a stated gap, not an untested claim: two
+ * admission bounds were attempted and both failed a gate, and a test asserting a
+ * bound that does not exist would be the same decorative-coverage shape the
+ * subtraction is meant to end.
+ */
 
 interface GuardianKp {
   identity: GuardianIdentity;
@@ -550,7 +557,23 @@ describe("QI-SIBLING-02 — planted divergences are refused", () => {
 // ═══════════════════════════════════════════════════════════════════════
 
 describe("QI-SIBLING-02 wired consumer — MasterRotationReceiver enforces the window", () => {
-  async function bootReceiverScenario(rotationContext: GuardianRevokeQuorumContext) {
+  async function bootReceiverScenario(
+    rotationContext: GuardianRevokeQuorumContext,
+    options: {
+      /**
+       * Deliver this many DECOY bundle unicasts at distinct `rotated_at` keys
+       * BEFORE the real one. Each decoy is a genuine bundle (wrapped under the
+       * old per-node transport key), so each parks a bundle-bearing entry in the
+       * receiver's `pending` map and none of them can ever be evicted by a policy
+       * that preserves the bundle half.
+       */
+      prefill_bundles?: number;
+      /** Replace the ack listener with one that throws. */
+      throwing_ack_listener?: boolean;
+      /** Replace `onEnvelopeRejected` with one that throws. */
+      throwing_rejection_hook?: boolean;
+    } = {}
+  ) {
     const transport = new InMemoryTransport();
     const handle = transport.attach("node-1");
     const placeholder = createAutoApproveJoinApprover({
@@ -620,19 +643,21 @@ describe("QI-SIBLING-02 wired consumer — MasterRotationReceiver enforces the w
       new_root_principal_private_key: newPrincipalKp.privateKey,
       new_root_principal_public_key: newPrincipalKp.publicKey,
     });
-    const envelope = wrapMasterRotationBundle({
-      plaintext: {
-        new_master_secret: toBase64url(newMasterKp.privateKey),
-        re_issued_self_cert: cascade.re_issued_node_certificates[0]!,
-        new_root_principal_cert: cascade.new_root_principal_certificate,
-        rotated_at: rotatedAt,
-        new_master_pubkey: newMasterPublic.public_key,
-      },
-      old_fortress_master_secret: result.bootstrap.master_private_key,
-      target_node_id: "node-1",
-      target_node_mode: "local",
-      fortress_id: oldMaster.fortress_id,
-    });
+    const wrapBundleAt = (at: string) =>
+      wrapMasterRotationBundle({
+        plaintext: {
+          new_master_secret: toBase64url(newMasterKp.privateKey),
+          re_issued_self_cert: cascade.re_issued_node_certificates[0]!,
+          new_root_principal_cert: cascade.new_root_principal_certificate,
+          rotated_at: at,
+          new_master_pubkey: newMasterPublic.public_key,
+        },
+        old_fortress_master_secret: result.bootstrap.master_private_key,
+        target_node_id: "node-1",
+        target_node_mode: "local",
+        fortress_id: oldMaster.fortress_id,
+      });
+    const envelope = wrapBundleAt(rotatedAt);
 
     const acks: unknown[] = [];
     const receiver = new MasterRotationReceiver({
@@ -645,13 +670,37 @@ describe("QI-SIBLING-02 wired consumer — MasterRotationReceiver enforces the w
       pinned_guardian_roster: () => roster,
       node_private_key: result.bootstrap.node_private_key,
     });
+    if (options.throwing_ack_listener) {
+      // Registered FIRST so the assertion is that a throwing subscriber does not
+      // starve the one after it, not merely that the loop survives its last
+      // iteration.
+      receiver.onAckEmit(() => {
+        throw new Error("ack listener exploded");
+      });
+    }
     receiver.onAckEmit((ack) => acks.push(ack));
     // The refusal surface the wiring layer consumes. Captured here because the
     // whole point of the fix is that a refusing node is DISTINGUISHABLE from one
     // that never received the broadcast.
     const rejections: Array<{ error: Error; event_type: string; emitter_node?: string }> =
       [];
-    result.node.onEnvelopeRejected = (info) => rejections.push(info);
+    result.node.onEnvelopeRejected = (info) => {
+      rejections.push(info);
+      // In production this hook reaches signing and counter I/O, so it CAN
+      // throw; the receiver must contain that rather than converting it into an
+      // unhandled rejection under the `void`-calling reference wiring.
+      if (options.throwing_rejection_hook) {
+        throw new Error("rejection hook exploded");
+      }
+    };
+    for (let i = 0; i < (options.prefill_bundles ?? 0); i++) {
+      await receiver.handleIncomingUnicast(
+        "node-1",
+        JSON.stringify(
+          wrapBundleAt(`2026-04-01T00:00:00.${String(i).padStart(3, "0")}Z`)
+        )
+      );
+    }
     await receiver.handleIncomingUnicast("node-1", JSON.stringify(envelope));
 
     return {
@@ -723,61 +772,70 @@ describe("QI-SIBLING-02 wired consumer — MasterRotationReceiver enforces the w
     expect(denialEntries(s.node)).toHaveLength(1);
   });
 
-  it("BOUNDS the pending map against a flood of attacker-chosen rotated_at keys (rule 8)", async () => {
-    // MUTATION-PROOF TARGET: this assertion fails if the BoundedMap cap or its
-    // per-emitter quota is removed from `MasterRotationReceiver.pending`. The
-    // attacker-reachable path is a broadcast arriving with NO bundle: it returns
-    // from maybeInstall before any freshness check, so the drop-on-refusal line
-    // is never reached and cannot bound anything. The map key IS the
-    // sender-chosen `rotated_at`, read before any validation, so both the key
-    // count and the key length are attacker-selected. Driver: any in-roster peer.
-    const s = await bootReceiverScenario(mintRevokeCollectionContext());
-    const FLOOD = 200;
-    for (let i = 0; i < FLOOD; i++) {
-      await s.receiver.handleIncomingMasterRotationBroadcast(
-        // Distinct key per replay, everything else identical. Signatures do not
-        // even have to verify: admission happens before verification, which is
-        // exactly why the cap has to sit at admission.
-        { ...s.payload, rotated_at: `2026-04-0${1}T00:00:00.${String(i).padStart(3, "0")}Z` },
-        { emitter_node: PEER }
-      );
-    }
-    // The retained set is bounded by the global cap no matter how many distinct
-    // keys the peer invents. Pre-fix this was exactly FLOOD.
-    expect(s.receiver.pendingRotationCount()).toBeLessThanOrEqual(
-      MAX_PENDING_ROTATIONS_ON_RECEIVER
-    );
-    // And the flooding emitter's OWN contribution is bounded by its quota. The
-    // one extra entry is the legitimate bundle admitted by the scenario's
-    // unicast, which carries no origin because it required the old per-node
-    // transport key to produce.
-    expect(s.receiver.pendingRotationCount()).toBeLessThanOrEqual(
-      MAX_PENDING_ROTATIONS_PER_EMITTER + 1
-    );
-    // Every refusal is surfaced, so the flood is visible rather than silent.
-    expect(s.rejections.length).toBeGreaterThan(0);
-    // ...but the AUDIT writes it drives are governed, so a guaranteed-refusal
-    // path is not a zero-cost audit-write amplifier (rule 8 on the fix's own
-    // state). Individual denial entries are capped per emitter per window.
-    expect(denialEntries(s.node).length).toBeLessThan(FLOOD);
-  });
-
-  it("a flood from one peer never crowds out ANOTHER peer's legitimate rotation", async () => {
-    // Per-origin quota, not just a global cap: a global-only ceiling lets one
-    // flooding peer consume the whole map and lock every other peer out, which
-    // is the finding that put `maxPerOrigin` into core/bounded-map.ts.
-    const s = await bootReceiverScenario(mintRevokeCollectionContext());
-    for (let i = 0; i < 200; i++) {
-      await s.receiver.handleIncomingMasterRotationBroadcast(
-        { ...s.payload, rotated_at: `2026-04-02T00:00:00.${String(i).padStart(3, "0")}Z` },
-        { emitter_node: "flooding-peer" }
-      );
-    }
-    // The real initiator's broadcast, matching the bundle already unwrapped
-    // above, still installs.
+  it("still installs after MANY prior bundle-bearing entries — an admission-only cap must never become a permanent refusal", async () => {
+    // REGRESSION GUARD for the subtracted bound (register row QI-02-F11). The
+    // removed admission cap refused an insert once every retained entry held a
+    // bundle, and NOTHING in this receiver ever removes a bundle-bearing entry:
+    // no sweep, no TTL, no delete after a successful install. The result was a
+    // node that silently stopped installing rotations for the life of the
+    // instance, which is the two-master split the execute-time gate exists to
+    // prevent. This test drives well past the cap that was in place and asserts
+    // the legitimate rotation still lands.
+    //
+    // FAILURE-MODE NOTE for whoever bounds this map next: the symptom of getting
+    // it wrong is nothing at all on the receiving node. The rotation just never
+    // arrives, and the operator sees a healthy node pinned to the old master.
+    const s = await bootReceiverScenario(mintRevokeCollectionContext(), {
+      prefill_bundles: 32,
+    });
     await s.receiver.handleIncomingMasterRotationBroadcast(s.payload, {
       emitter_node: PEER,
     });
+    expect(s.node.getPinnedMaster().public_key).toBe(
+      s.newMasterPublic.public_key
+    );
+    expect(s.acks).toHaveLength(1);
+    expect(s.rejections).toHaveLength(0);
+  });
+
+  it("a THROWING onEnvelopeRejected hook cannot turn a refusal into an unhandled rejection", async () => {
+    // MUTATION-PROOF TARGET: fails if the try/catch around `onEnvelopeRejected`
+    // in `surfaceBroadcastRefusal` is deleted. The hook is caller-supplied and in
+    // production reaches signing and counter I/O, and the reference wiring calls
+    // the receiver as `void ...`, so an unwrapped hook hands an authenticated
+    // peer the exact crash the refusal path was built to close: replay a stale
+    // rotation, the hook throws, the promise rejects, nobody is awaiting it.
+    const s = await bootReceiverScenario(
+      contextOpenedAgo(REVOKE_QUORUM_MAX_LIFETIME_MS + HOUR_MS),
+      { throwing_rejection_hook: true }
+    );
+    await expect(
+      s.receiver.handleIncomingMasterRotationBroadcast(s.payload, {
+        emitter_node: PEER,
+      })
+    ).resolves.toBeUndefined();
+    // The refusal still happened, was still attributed to the authenticated
+    // emitter, and the durable record was still sealed BEFORE the hook ran, so
+    // a broken hook loses its own delivery and nothing else.
+    expect(s.node.getPinnedMaster().public_key).toBe(s.oldMaster.public_key);
+    expect(s.rejections).toHaveLength(1);
+    expect(s.rejections[0]!.emitter_node).toBe(PEER);
+    expect(denialEntries(s.node)).toHaveLength(1);
+  });
+
+  it("a THROWING ack listener neither rejects the install path nor starves the next listener", async () => {
+    // MUTATION-PROOF TARGET: fails if the per-listener try/catch in `emitAck` is
+    // deleted. Same `void`-wiring hazard as above on the success half, plus the
+    // subscriber-starvation half: the throwing listener is registered FIRST, so
+    // an unisolated loop never reaches the one that records the ack.
+    const s = await bootReceiverScenario(mintRevokeCollectionContext(), {
+      throwing_ack_listener: true,
+    });
+    await expect(
+      s.receiver.handleIncomingMasterRotationBroadcast(s.payload, {
+        emitter_node: PEER,
+      })
+    ).resolves.toBeUndefined();
     expect(s.node.getPinnedMaster().public_key).toBe(
       s.newMasterPublic.public_key
     );

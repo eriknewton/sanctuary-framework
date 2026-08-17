@@ -23,42 +23,6 @@
 export const DEFAULT_BROADCAST_ACK_TIMEOUT_MS = 10_000;
 
 /**
- * Global cap on `MasterRotationReceiver`'s in-flight `pending` map
- * (QI-SIBLING-02 fix round, AGENTS.md rule 8).
- *
- * The map is keyed on the broadcast's `rotated_at`, which is a SENDER-CHOSEN
- * string read BEFORE any validation runs, so the key space is attacker-selected
- * and every in-roster peer can mint fresh keys. A broadcast arriving with no
- * matching bundle short-circuits before the freshness gate, so without a
- * ceiling the retained set grows once per distinct `rotated_at` an authenticated
- * peer chooses to send.
- *
- * DERIVATION: a fortress runs master rotations one at a time — the ceremony is
- * operator-confirmed, single-shot, and its whole post-confirm phase completes
- * inside `DEFAULT_BROADCAST_ACK_TIMEOUT_MS` (10 s). A receiver therefore needs
- * ONE live pairing in the normal case, plus headroom for a chained rotation
- * (device recovery chains one) and for an operator retrying a failed ceremony
- * within the same window. 8 is a generous multiple of that real concurrency
- * while keeping worst-case retention to single-digit payloads.
- */
-export const MAX_PENDING_ROTATIONS_ON_RECEIVER = 8;
-
-/**
- * Per-EMITTER quota on that map (rule 8's per-origin quota). The origin is the
- * AUTHENTICATED `emitter_node` of the verified `master_rotation` envelope, so
- * buckets cannot be spoofed. A global-only cap would let one flooding peer
- * consume the whole ceiling and lock every other peer out, which is the exact
- * finding that added `maxPerOrigin` to `core/bounded-map.ts`.
- *
- * DERIVATION: a legitimate rotation has exactly ONE initiator, and that
- * initiator emits one `master_rotation` broadcast per ceremony. 2 leaves room
- * for a chained rotation from the same initiator without ever admitting a
- * third concurrent in-flight rotation from a single peer, which is already
- * anomalous.
- */
-export const MAX_PENDING_ROTATIONS_PER_EMITTER = 2;
-
-/**
  * Orchestration-layer unicast message kinds. These flow over the shipped
  * MeshTransport.unicast path but are NOT federation protocol events; they
  * carry orchestration state between peers during recovery ceremonies.

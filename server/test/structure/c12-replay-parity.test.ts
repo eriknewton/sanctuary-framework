@@ -52,6 +52,97 @@ function walk(dir: string): string[] {
   return out;
 }
 
+/**
+ * Strip COMMENTS from TypeScript source, leaving executable code (and string
+ * contents) intact, so a source scan cannot be fooled by prose and cannot be
+ * fooled into treating prose as code.
+ *
+ * FAILURE-MODE NOTE, which is why this is a character scan and not two regexes:
+ * the previous version ran `/\/\*[\s\S]*?\*\//` then `/^\s*\/\/.*$/gm`. That
+ * pair is wrong in both directions. It misses a TRAILING `// ...` comment
+ * entirely (the regex is anchored to the start of a line), so a comment
+ * mentioning a retired construct false-positives the scan; and running the
+ * block-comment pass first lets a `//` that lives inside a string — `"https://"`
+ * is everywhere in this codebase — or a `/*` sequence inside a line comment
+ * corrupt the boundaries. A scanner that has to reason about which of two
+ * regexes fires first is the shape that goes wrong silently.
+ *
+ * String and regex-literal bodies are PRESERVED, deliberately: this function
+ * only has to know where they START and END so it does not mistake their
+ * contents for a comment. A construct hidden in a string literal should still
+ * trip the scans below.
+ *
+ * Newlines are preserved everywhere, including inside block comments, so line
+ * anchors (`^`/`m`) in the callers' patterns still mean what they say.
+ */
+function stripComments(source: string): string {
+  let out = "";
+  let i = 0;
+  // A `/` starts a regex literal only where a VALUE may begin. Tracking the last
+  // significant character is the standard disambiguation from division.
+  const regexCanStart = (prev: string): boolean =>
+    prev === "" || "=(,:[!&|?{};+-*%~^<>\n".includes(prev);
+  let lastSignificant = "";
+  while (i < source.length) {
+    const ch = source[i]!;
+    const next = source[i + 1] ?? "";
+    if (ch === "/" && next === "/") {
+      while (i < source.length && source[i] !== "\n") i++;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) {
+        if (source[i] === "\n") out += "\n";
+        i++;
+      }
+      i += 2;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      out += ch;
+      i++;
+      while (i < source.length) {
+        if (source[i] === "\\") {
+          out += source.slice(i, i + 2);
+          i += 2;
+          continue;
+        }
+        out += source[i];
+        const closed = source[i] === ch;
+        i++;
+        if (closed) break;
+      }
+      lastSignificant = ch;
+      continue;
+    }
+    if (ch === "/" && regexCanStart(lastSignificant)) {
+      out += ch;
+      i++;
+      let inClass = false;
+      while (i < source.length) {
+        if (source[i] === "\\") {
+          out += source.slice(i, i + 2);
+          i += 2;
+          continue;
+        }
+        if (source[i] === "[") inClass = true;
+        else if (source[i] === "]") inClass = false;
+        const closed = source[i] === "/" && !inClass;
+        out += source[i];
+        i++;
+        if (closed) break;
+      }
+      lastSignificant = "/";
+      continue;
+    }
+    out += ch;
+    if (!/\s/.test(ch) || ch === "\n") lastSignificant = ch;
+    i++;
+  }
+  return out;
+}
+
 describe("C12-REPLAY parity structure (T9)", () => {
   it("the retired v1 builders and their must-match pin comments are gone", () => {
     const nodeRevoke = read("server/src/mesh/recovery-flows/node-revoke.ts");
@@ -62,7 +153,7 @@ describe("C12-REPLAY parity structure (T9)", () => {
     expect(meshNode).not.toMatch(/private nodeRevokeQuorumInput/);
   });
 
-  it("NO mesh module degrades randomness to Math.random — SCAN, not a hand-listed file set", () => {
+  it("NO mesh module reaches Math.random by ANY access form — the class, not one spelling", () => {
     // Fix-round correction (QI-SIBLING-02 gate finding): the prior version of
     // this guard named three files by hand and therefore could not see a FOURTH
     // `generateCeremonyId` copy with the same `Math.random` fallback living in
@@ -71,28 +162,63 @@ describe("C12-REPLAY parity structure (T9)", () => {
     // rule 5: assert over the full set, never over the entries someone
     // remembered). Every ceremony under mesh/ mints its nonces through
     // `core/random`, which throws rather than degrading (MUST-NEVER #5).
+    //
+    // Round-2 correction (re-gate finding): matching the literal string
+    // `Math.random` pinned ONE SPELLING, not the class. `Math["random"]`,
+    // `Math['random']` and `const { random } = Math` all reach the same
+    // degraded source and all evaded it, and the hand-rolled comment stripping
+    // it used mishandled trailing `//` comments so prose about the retired
+    // fallback false-positived. Both halves are fixed: comments are removed by
+    // a character scan, and every property-access form is matched.
+    const propertyAccess = /\bMath\s*(?:\.\s*random\b|\[\s*(['"`])random\1\s*\])/;
+    const destructured = /\{[^{}]*\brandom\b[^{}]*\}\s*=\s*Math\b/;
     for (const file of walk(MESH_SRC)) {
-      const src = readFileSync(file, "utf8");
       // Prose ABOUT the retired fallback is legitimate and is what documents
       // why the rule exists; only executable uses are the finding.
-      const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+      const code = stripComments(readFileSync(file, "utf8"));
       expect(
-        /Math\.random/.test(code),
+        propertyAccess.test(code) || destructured.test(code),
         `Math.random randomness fallback in ${file}`
       ).toBe(false);
     }
   });
 
-  it("the CSPRNG ceremony-id minter has exactly ONE definition — SCAN over all of server/src", () => {
+  it("the CSPRNG ceremony-id minter has exactly ONE definition, in EVERY definition form", () => {
     // Companion to the scan above: deleting a `Math.random` fallback is not the
     // same as retiring the duplicate that carried it. A second hand-written
     // 128-bit-hex minter would pass the scan above while still being the
     // second implementation rule 5 forbids, so pin the DEFINITION count too.
-    const definition = /function\s+(?:mint|generate)CeremonyId\s*\(/g;
+    //
+    // Round-2 correction (re-gate finding): the prior matcher was
+    // `function (mint|generate)CeremonyId\(`, which pinned one SYNTAX. A
+    // `const mintCeremonyId = () => ...`, a class method, or a name outside the
+    // two hardcoded verbs evaded it completely. This matches every definition
+    // form of any identifier carrying the `CeremonyId` token.
+    //
+    // STATED BOUND, so nobody reads this guard as more than it is: it is a
+    // NAME-based scan, so a minter renamed to carry no `CeremonyId` token is
+    // outside what it can see. It is not the only line of defense — the
+    // degradation this class actually causes is caught by the access-form scan
+    // above, which is name-independent — and a rename that also drops the
+    // `Math.random` fallback is a reviewable refactor rather than the silent
+    // duplication this guard exists to stop. Narrow and honest beats broad and
+    // evadable by a one-line edit.
+    const definitionForms = new RegExp(
+      [
+        // `function mintCeremonyId(`, `async function generateCeremonyId(`
+        String.raw`function\s+\w*CeremonyId\s*\(`,
+        // `const mintCeremonyId = () =>`, `= async function`, `= x =>`
+        String.raw`(?:const|let|var)\s+\w*CeremonyId\s*(?::[^=;]+)?=\s*(?:async\s+)?(?:function\b|\(|\w+\s*=>)`,
+        // class / object method: `private mintCeremonyId(): string {`
+        String.raw`^[ \t]*(?:(?:private|public|protected|static|async|readonly)\s+)*\w*CeremonyId\s*\([^)]*\)\s*(?::[^{;]+)?\{`,
+      ].join("|"),
+      "gm"
+    );
     const sharedModule = join(MESH_SRC, "guardian", "revoke-quorum-input.ts");
     let definitionSites = 0;
     for (const file of walk(SERVER_SRC)) {
-      const matches = readFileSync(file, "utf8").match(definition) ?? [];
+      const matches =
+        stripComments(readFileSync(file, "utf8")).match(definitionForms) ?? [];
       if (matches.length > 0) {
         expect(
           file,
