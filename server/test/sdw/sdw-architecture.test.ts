@@ -148,6 +148,28 @@ describe("SDW architecture write gate", () => {
       // the write landed. It must never read as a compliant refusal.
       expect(writeBlockRefusesUnconditionally("{\n}")).toBe(false);
     });
+
+    it("rejects a throw whose ARGUMENT LIST nests the write (laundering inside the throw expression)", () => {
+      // The one-statement rule alone does not close this: the body IS exactly
+      // one throw statement, but the write executes while the constructor's
+      // arguments are evaluated, before anything is thrown. Both mutating
+      // spellings and a bare await are must-fail shapes.
+      expect(
+        writeBlockRefusesUnconditionally(
+          '{\n  throw new Error(String(await this.inner.write(namespace, key, data)));\n}',
+        ),
+      ).toBe(false);
+      expect(
+        writeBlockRefusesUnconditionally(
+          '{\n  throw new Error(String(await this.inner.writeDurable(namespace, key, data)));\n}',
+        ),
+      ).toBe(false);
+      expect(
+        writeBlockRefusesUnconditionally(
+          '{\n  throw new Error(String(this.inner.delete(namespace, key)));\n}',
+        ),
+      ).toBe(false);
+    });
   });
 });
 
@@ -309,6 +331,15 @@ function findSdwNamespacePathExposureOffenders(source: string, path: string): st
  * Deliberately narrow, so it cannot launder a real write path. The body, with
  * comments removed, must be exactly one `throw new X(...)` statement and
  * nothing else; any assignment, call, or branch before the throw fails it.
+ *
+ * The one-statement rule is not sufficient on its own: the constructor's
+ * ARGUMENT LIST is evaluated before the throw, so a write nested inside it
+ * (`throw new E(String(await this.inner.write(…)))`) executes and still reads
+ * as "exactly one throw statement". The argument text is therefore also
+ * refused if it contains an `await` or a call to any of the storage
+ * interface's mutating members — must match
+ * `READ_ONLY_STORAGE_MUTATING_METHODS` in `src/storage/read-only-guard.ts`
+ * (`write`/`writeDurable`/`delete`), the same full set the parity test pins.
  */
 function writeBlockRefusesUnconditionally(block: string): boolean {
   const body = block
@@ -317,7 +348,14 @@ function writeBlockRefusesUnconditionally(block: string): boolean {
     .replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/\/\/[^\n]*/g, "")
     .trim();
-  return /^throw\s+new\s+[A-Za-z_$][\w$]*\s*\([\s\S]*\)\s*;?$/.test(body);
+  const throwOnly = /^throw\s+new\s+[A-Za-z_$][\w$]*\s*\(([\s\S]*)\)\s*;?$/.exec(
+    body
+  );
+  if (throwOnly === null) return false;
+  const argumentText = throwOnly[1]!;
+  return !/(\bawait\b|\.\s*write\s*\(|\.\s*writeDurable\s*\(|\.\s*delete\s*\()/.test(
+    argumentText
+  );
 }
 
 function storageWriteBlockUsesSdwGuard(block: string): boolean {
