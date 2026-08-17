@@ -378,6 +378,13 @@ function parseBaseline(): Map<string, number> {
 }
 
 describe("disclosure guard — in-repo test-header ratchet", () => {
+  // Explicit timeout. This scans the header of every tracked test file through
+  // a shell checker, which is process-heavy by construction: roughly twenty
+  // seconds on an idle Mac and more on a builder running the rest of the suite
+  // beside it. It first ran at the 30s default and timed out on the Linux
+  // builder while passing locally, which is the worst failure shape available
+  // (green where it is written, red where it is enforced). The ceiling is
+  // deliberately far above the real cost; it is a stop, not a budget.
   it("keeps the per-rule hit total in committed test headers at or below the baseline", () => {
     const files = trackedTestFiles();
     expect(files.length).toBeGreaterThan(0);
@@ -443,7 +450,7 @@ describe("disclosure guard — in-repo test-header ratchet", () => {
         "later regression hides under: " + better.join(", "),
       ].join("\n"),
     ).toEqual([]);
-  });
+  }, 300_000);
 });
 
 describe("disclosure guard — CI wiring", () => {
