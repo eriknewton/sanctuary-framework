@@ -334,7 +334,7 @@ export class TokenIssuer {
     // Count in-flight reservations (issuances past their capacity check but
     // not yet in `tokens`) so concurrent issuances cannot overshoot the cap
     // across the success-audit await — see inFlightIssuances' doc.
-    const callerCountKey = `${req.caller.skill} ${req.caller.agent}`;
+    const callerCountKey = `${req.caller.skill}\u0000${req.caller.agent}`;
     if (this.tokens.size + this.inFlightIssuances >= this.maxLiveTokensGlobal) {
       await this.auditLog.appendCritical({
         layer: "l3",
