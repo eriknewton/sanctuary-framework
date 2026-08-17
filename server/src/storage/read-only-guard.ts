@@ -64,6 +64,10 @@ export class ReadOnlyStorageViolationError extends Error {
  * silently inherits or omits, which is the rule-5 hand-mirrored-registry drift
  * shape. Full-set parity (not "the first entry matches") is asserted by
  * `test/structure/read-only-storage-guard-parity.test.ts`.
+ *
+ * Must match the mutating-call spellings the SDW write-gate recognizer refuses
+ * inside a throw's argument list in `test/sdw/sdw-architecture.test.ts`
+ * (`writeBlockRefusesUnconditionally`), which pins to this list by name.
  */
 export const READ_ONLY_STORAGE_MUTATING_METHODS = [
   "write",

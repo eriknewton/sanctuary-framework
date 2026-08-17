@@ -403,32 +403,35 @@ describe("C12-REPLAY parity structure (T9)", () => {
     // window means a different absolute interval on every node. A per-field or
     // per-ceremony copy of the strict check is the hand-mirror shape rule 5
     // forbids, so the pin is "one call site", not "each site looks right".
+    //
+    // TZ-SIB-01/02 widening: the predicate DEFINITION moved to
+    // `server/src/core/time.ts` so consumers outside this module share it; the
+    // single-definition pin and the server-wide `Date.parse` freeze now live in
+    // `tz-strict-offset-adoption.test.ts` (must match this module's import of
+    // `parseIsoInstantWithOffset` from `../../core/time.js`). This pin keeps
+    // the GUARDIAN-module half: the module imports the shared predicate, keeps
+    // no local `Date.parse`, and each of its four timestamp fields reaches the
+    // predicate by name.
     const src = read("server/src/mesh/guardian/revoke-quorum-input.ts");
-    const predicateStart = src.indexOf(
-      "export function parseIsoInstantWithOffset"
+    expect(src).toMatch(
+      /import \{ parseIsoInstantWithOffset \} from "\.\.\/\.\.\/core\/time\.js";/
     );
-    expect(predicateStart).toBeGreaterThan(0);
-    // The predicate ends where the next top-level export begins.
-    const predicateEnd = src.indexOf("export ", predicateStart + 1);
-    expect(predicateEnd).toBeGreaterThan(predicateStart);
 
-    const parseCalls = [...src.matchAll(/Date\.parse\s*\(/g)].map(
-      (m) => m.index ?? -1
-    );
+    // Zero local Date.parse: a bare parse reintroduced here would be the
+    // looser rule returning one field at a time.
+    const parseCalls = [...src.matchAll(/Date\.parse\s*\(/g)];
     expect(
       parseCalls.length,
-      `expected exactly one Date.parse in the shared module, found ${parseCalls.length}`
-    ).toBe(1);
-    expect(parseCalls[0]).toBeGreaterThan(predicateStart);
-    expect(parseCalls[0]).toBeLessThan(predicateEnd);
+      `expected no Date.parse in the shared module (the strict predicate lives in core/time.ts), found ${parseCalls.length}`
+    ).toBe(0);
 
     // Each of the four timestamp fields reaches the predicate by name. A bare
     // occurrence COUNT asserts arity, not identity: a refactor that dropped the
     // rotated_at call and added a second call on some other field would still
-    // count 5 and stay green, which is exactly the defect shape this PR exists
-    // to fix (a check that looks field-by-field but is actually a count). So
-    // this asserts the four call-site argument spellings are ALL present, not
-    // just that five calls exist.
+    // count the same and stay green, which is exactly the defect shape this pin
+    // exists to fix (a check that looks field-by-field but is actually a
+    // count). So this asserts the four call-site argument spellings are ALL
+    // present, not just that four calls exist.
     const predicateCallMatches = [
       ...src.matchAll(/parseIsoInstantWithOffset\s*\(/g),
     ];
@@ -436,9 +439,9 @@ describe("C12-REPLAY parity structure (T9)", () => {
       const openIndex = (m.index ?? 0) + m[0].length - 1;
       return sliceBalancedCall(src, openIndex);
     });
-    // 1 definition (`(value: string)`) + 4 call sites: initiated_at,
+    // 4 call sites (the definition moved to core/time.ts): initiated_at,
     // expires_at, effective_at, rotated_at.
-    expect(predicateCallArgs.length).toBe(5);
+    expect(predicateCallArgs.length).toBe(4);
     for (const argSpelling of [
       "initiatedAt",
       "expiresAt",
