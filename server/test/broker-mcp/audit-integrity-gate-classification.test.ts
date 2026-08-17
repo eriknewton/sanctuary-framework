@@ -6,6 +6,7 @@ import { generateRandomKey } from "../../src/core/random.js";
 import { AuditLog, type PersistedAuditEnvelopeV2 } from "../../src/operational/audit-log.js";
 import { createServer, toolResult, type ToolDefinition } from "../../src/router.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { extraAllowedFieldsForTool } from "../../src/tool-args.js";
 
 async function connectTools(tools: ToolDefinition[], auditLog: AuditLog): Promise<Client> {
   const server = createServer(tools, { auditLog });
@@ -47,7 +48,17 @@ function textPayload(result: Awaited<ReturnType<Client["callTool"]>>): Record<st
 }
 
 describe("MCP audit-integrity gate classification", () => {
-  it("allows read tools, blocks write tools, and permits explicit write override", async () => {
+  it("allows read tools and unconditionally blocks write tools on a broken chain", async () => {
+    // CALLER-CONTROLLED-AUDIT-OVERRIDE (register row, HIGH; MUST-NEVER #5):
+    // this test is the fail-before/after proof for the removal of the
+    // agent-facing accept_broken_chain override. Pre-fix, this same setup
+    // (with `arguments: { accept_broken_chain: true }` added to the write
+    // call) let the write through and recorded an
+    // `mcp_accept_broken_chain_override` audit entry keyed on the CALLING
+    // AGENT's identity — an agent-reachable bypass of the audit-integrity
+    // gate. Post-fix there is no argument that lifts the block. (The
+    // operator CLI's `--accept-broken-chain` is a separate mechanism that
+    // does not clear findings or reach this gate; see castle-wall.ts.)
     const { auditLog } = await makeBrokenAuditLog();
     let writeCount = 0;
     const tools: ToolDefinition[] = [
@@ -90,25 +101,48 @@ describe("MCP audit-integrity gate classification", () => {
     const blockedWrite = await client.callTool({ name: "test_write", arguments: {} });
     expect(blockedWrite.isError).toBe(true);
     expect(textPayload(blockedWrite)).toMatchObject({
-      accept_broken_chain_required: true,
+      remediation: "none_available",
     });
     expect(writeCount).toBe(0);
 
-    const overrideWrite = await client.callTool({
+    // An agent-supplied accept_broken_chain no longer exists as an accepted
+    // argument at all — it is refused at schema validation, BEFORE the
+    // audit-integrity gate even runs, with a diagnosable violation naming
+    // the unknown field (never silently ignored/dropped).
+    const attemptedOverride = await client.callTool({
       name: "test_write",
       arguments: { accept_broken_chain: true },
     });
-    expect(overrideWrite.isError).not.toBe(true);
-    expect(textPayload(overrideWrite)).toMatchObject({ ok: true });
-    expect(writeCount).toBe(1);
+    expect(attemptedOverride.isError).toBe(true);
+    const overridePayload = textPayload(attemptedOverride);
+    expect(overridePayload.error).toBe("validation_failed");
+    expect(overridePayload.violations).toMatchObject([
+      { field: "accept_broken_chain", message: expect.stringContaining("Unknown field") },
+    ]);
+    expect(writeCount).toBe(0);
 
+    // No override audit entry is ever written — the operation name is gone
+    // from the MCP path entirely (it survives only on the operator CLI side
+    // as castle_wall_accept_broken_chain_override, a distinct operation).
     const entries = await auditLog.runAllowingIntegrityFindings(() =>
       auditLog.query({ limit: 20 })
     );
     expect(entries.entries.some((entry) => entry.operation === "mcp_accept_broken_chain_override"))
-      .toBe(true);
+      .toBe(false);
 
     await client.close();
+  });
+
+  it("extraAllowedFieldsForTool returns exactly the current allowlist (full-set assertion)", () => {
+    // AGENTS.md rule 5: a check that asserts only "accept_broken_chain is
+    // gone" cannot detect a differently-named field re-adding an equivalent
+    // escape hatch — every accept_broken_chain-specific assertion above
+    // would stay green. Asserting the WHOLE shape closes that class: any
+    // future addition to this allowlist, under any name, fails this test
+    // until it is a deliberate, reviewed change.
+    expect(extraAllowedFieldsForTool()).toEqual({
+      approval_ref: { type: "string" },
+    });
   });
 
   it("fails registration when a tool lacks tool_class", () => {

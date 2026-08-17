@@ -166,11 +166,20 @@ function checkType(
   return null;
 }
 
-export function extraAllowedFieldsForTool(toolClass?: "read" | "write"): Record<string, SchemaProperty> {
+// CALLER-CONTROLLED-AUDIT-OVERRIDE (register row, HIGH; MUST-NEVER #5): this
+// allowlist previously admitted an agent-supplied `accept_broken_chain`
+// boolean on every write tool, which let the calling agent itself bypass the
+// audit-integrity gate (router.ts) whose findings might be evidence of that
+// same agent's tampering. Do not re-admit `accept_broken_chain` (or any
+// equivalent override field) here: an unknown field is rejected by
+// `validateArgs` below with a diagnosable `ToolArgumentValidationError`,
+// which is the intended behavior for an agent that still sends it. The
+// operator CLI's `--accept-broken-chain` (server/src/cli/castle-wall.ts) is a
+// separate mechanism that does not clear audit-integrity findings and does
+// not reach this gate; restoring MCP write capability once the audit chain
+// has integrity findings is not currently implemented anywhere in this tree.
+export function extraAllowedFieldsForTool(): Record<string, SchemaProperty> {
   return {
-    ...(toolClass === "write"
-      ? { accept_broken_chain: { type: "boolean", default: false } }
-      : {}),
     approval_ref: { type: "string" },
   };
 }
@@ -178,12 +187,21 @@ export function extraAllowedFieldsForTool(toolClass?: "read" | "write"): Record<
 export function normalizeToolArgsForValidation(params: {
   args: Record<string, unknown>;
   schema: Record<string, unknown>;
+  // Kept for existing-caller compatibility (router.ts passes it optionally;
+  // server/test/bridge/bridge.test.ts still passes it directly against this
+  // function). No longer consulted: extraAllowedFieldsForTool() stopped
+  // needing a read/write distinction the moment accept_broken_chain (the
+  // only field that varied by tool_class) was removed from the write-tool
+  // allowlist above. Tracked as follow-up: a separate mechanical PR should
+  // delete this field and its two remaining call sites, with the resulting
+  // bridge.test.ts fail-before-gate exemption as the visible subject of that
+  // change rather than a side effect of this one.
   toolClass?: "read" | "write";
 }): { handlerArgs: Record<string, unknown>; approvalRef?: string } {
   const validationErrors = validateArgs(
     params.args,
     params.schema,
-    extraAllowedFieldsForTool(params.toolClass)
+    extraAllowedFieldsForTool()
   );
   if (validationErrors.length > 0) {
     throw new ToolArgumentValidationError(validationErrors);
