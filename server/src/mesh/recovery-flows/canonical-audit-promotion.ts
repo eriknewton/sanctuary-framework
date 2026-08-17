@@ -18,6 +18,7 @@
 
 import type { MeshNode } from "../lifecycle/mesh-node.js";
 import {
+  mintCeremonyId,
   verifyGuardianQuorum,
   type GuardianQuorumProof,
   type GuardianRoster,
@@ -105,7 +106,7 @@ export class CanonicalAuditPromotionCeremony {
       pinned_roster: params.ctx.pinned_roster,
     });
     return new CanonicalAuditPromotionCeremony({
-      ceremony_id: generateCeremonyId(),
+      ceremony_id: mintCeremonyId(),
       proposal: params.proposal,
       ctx: params.ctx,
     });
@@ -211,16 +212,10 @@ function toBase64UrlLocal(bytes: Uint8Array): string {
   return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function generateCeremonyId(): string {
-  const bytes = new Uint8Array(16);
-  if (typeof globalThis.crypto?.getRandomValues === "function") {
-    globalThis.crypto.getRandomValues(bytes);
-  } else {
-    for (let i = 0; i < bytes.length; i++) {
-      bytes[i] = Math.floor(Math.random() * 256);
-    }
-  }
-  let hex = "";
-  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
-  return hex;
-}
+// QI-SIBLING-02 fix round: the FOURTH local `generateCeremonyId` copy was
+// DELETED here. Like the three retired before it, it silently degraded to
+// `Math.random` when `crypto.getRandomValues` was absent, which is exactly the
+// MUST-NEVER #5 shape (a security primitive quietly weakening on error). The
+// ceremony now calls the ONE CSPRNG-fail-closed minter in
+// `mesh/guardian/revoke-quorum-input.ts`. The hand-listed structure pin that
+// enumerated three files could not see this copy; the pin is now a SCAN.

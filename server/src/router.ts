@@ -195,7 +195,6 @@ export function createServer(
       ({ approvalRef, handlerArgs } = normalizeToolArgsForValidation({
         args: typedArgs,
         schema: tool.inputSchema,
-        toolClass: tool.tool_class,
       }));
     } catch (error) {
       if (!(error instanceof ToolArgumentValidationError)) throw error;
@@ -265,9 +264,23 @@ export function createServer(
     try {
       const findings = await options?.auditLog?.getIntegrityFindings();
       const hasIntegrityFindings = (findings?.length ?? 0) > 0;
-      const acceptBrokenChain = handlerArgs.accept_broken_chain === true;
 
-      if (tool.tool_class === "write" && hasIntegrityFindings && !acceptBrokenChain) {
+      // CALLER-CONTROLLED-AUDIT-OVERRIDE (register row, HIGH; MUST-NEVER #5):
+      // no argument an MCP caller supplies can lift this gate for a tool
+      // classified `write` — `accept_broken_chain` is no longer an accepted
+      // argument at all (see tool-args.ts), and no other agent-facing field
+      // substitutes for it. That guarantee is scoped to classification: it
+      // holds only for tools correctly classified `write`. The bypass below
+      // keys off `tool.tool_class`, so a tool misclassified `read` whose
+      // handler actually performs a write escapes this check structurally,
+      // independent of any argument — a classification-correctness question
+      // this argument-level change does not close. Findings persisting is a
+      // hard stop for `write` tools, not a request for consent to proceed
+      // past them: restoring MCP write capability once the audit chain has
+      // integrity findings is not currently implemented anywhere in this
+      // tree (the operator CLI's `--accept-broken-chain` does not clear
+      // findings or reach this gate; see castle-wall.ts).
+      if (tool.tool_class === "write" && hasIntegrityFindings) {
         return {
           content: [
             {
@@ -275,7 +288,17 @@ export function createServer(
               text: JSON.stringify({
                 error: `${findings!.length} audit integrity findings detected`,
                 audit_integrity_findings: findings,
-                accept_broken_chain_required: true,
+                // Honest value, not a hint: no remediation exists. There is
+                // no agent-usable path past this gate BY DESIGN, and no
+                // operator path that restores MCP write capability once
+                // findings are present is implemented in this tree either
+                // (see the block comment above). An earlier draft said
+                // `operator_recovery_required`, which named a recovery that
+                // does not exist — on a surface an agent reads to decide what
+                // to do next, that is a false promise, not a courtesy. Must
+                // stay consistent with the assertion in
+                // test/broker-mcp/audit-integrity-gate-classification.test.ts.
+                remediation: "none_available",
               }),
             },
           ],
@@ -284,19 +307,6 @@ export function createServer(
       }
 
       const runHandler = async () => {
-        if (tool.tool_class === "write" && hasIntegrityFindings && acceptBrokenChain) {
-          await options?.auditLog?.appendCritical({
-            layer: "l2",
-            operation: "mcp_accept_broken_chain_override",
-            identity_id: callerIdentity,
-            result: "success",
-            details: {
-              tool: name,
-              finding_count: findings!.length,
-              findings,
-            },
-          });
-        }
         // Thread the server-set session principal to every handler (see
         // ToolHandler's doc) — this is what lets handshake/federation
         // per-origin quotas bind to a value the calling agent cannot mint
@@ -304,9 +314,10 @@ export function createServer(
         return tool.handler(handlerArgs, callerIdentity);
       };
 
-      const shouldBypassAuditIntegrity =
-        tool.tool_class === "read" ||
-        (tool.tool_class === "write" && hasIntegrityFindings && acceptBrokenChain);
+      // Read tools bypass the audit-integrity gate unconditionally (an
+      // operator must always be able to introspect); write tools never do,
+      // since the override branch above is gone.
+      const shouldBypassAuditIntegrity = tool.tool_class === "read";
       const result =
         shouldBypassAuditIntegrity && options?.auditLog
           ? await options.auditLog.runAllowingIntegrityFindings(runHandler)

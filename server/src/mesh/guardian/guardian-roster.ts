@@ -295,12 +295,16 @@ export function verifyGuardianRoster(
  * Throws GuardianQuorumError on any failure.
  *
  * Generic over the input type `I` (C12-REPLAY, review F-7): this function only
- * ever canonicalizes `input`, so it verifies a `MasterRotationQuorumInput`, a
- * `GuardianRevokeQuorumInput` (v2), or a `GuardianDeviceRecoveryQuorumInput`
- * without a union, an overload set, or a second verify function (any of which
- * would grow or mirror per input type). The v1 and v2 shapes have DISJOINT
- * field sets, and `canonicalizeToBytes` is field-name-bearing canonical JSON,
- * so their bytes can never collide — the generic is safe.
+ * ever canonicalizes `input`, so it verifies a `GuardianRevokeQuorumInput`, a
+ * `GuardianDeviceRecoveryQuorumInput`, a `GuardianMasterRotationQuorumInput`
+ * (all v2), or the surviving v1 `MasterRotationQuorumInput` that
+ * canonical-audit promotion still uses, without a union, an overload set, or a
+ * second verify function (any of which would grow or mirror per input type).
+ * Every v2 shape carries a distinct `schema` domain separator and the v1 shape
+ * carries none, so their field sets are DISJOINT; `canonicalizeToBytes` is
+ * field-name-bearing canonical JSON, so their bytes can never collide and the
+ * generic is safe. A NEW input shape must add its own separator to keep that
+ * true — the generic gives no cross-ceremony protection by itself.
  */
 export function verifyGuardianQuorum<I>(params: {
   input: I;

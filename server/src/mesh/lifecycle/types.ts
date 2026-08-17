@@ -194,7 +194,30 @@ export interface SyncRequestPayload {
   request_id?: string;
   /** Requester's per-agent policy-version baseline — requester wants anything higher. */
   since_policy_versions?: Record<string, number>;
-  /** Requester's locator-version baseline — requester wants anything higher. */
+  /**
+   * Requester's per-agent locator-version baseline — requester wants anything
+   * higher, per agent. C12-SYNC-ORDER-01: this replaced the single
+   * `since_locator_version` scalar below as the baseline a current build
+   * sends, because per-event isolation can drop one entry while a
+   * higher-versioned sibling in the same batch applies, and a scalar baseline
+   * then advances past the dropped entry and excludes it from every future
+   * responder's delta. Same shape and same delta predicate as
+   * `since_policy_versions` above. Contract pin: consumed by
+   * `buildSyncResponse` in ./sync.ts against
+   * `LocatorTableStore.deltaByAgent` in ./local-state.ts.
+   */
+  since_locator_versions?: Record<string, number>;
+  /**
+   * LEGACY scalar locator-version baseline, superseded by
+   * `since_locator_versions`. Still SENT so a peer on a pre-C12-SYNC-ORDER-01
+   * build can serve us, and still HONORED by our own responder when a
+   * requester sends no vector. Mixed-version residual, stated rather than
+   * hidden: an old responder reads only this field, so until both sides carry
+   * the vector a gap this node is trying to repair may go unserved by that
+   * peer for that round. It is re-requested on every later round (the vector
+   * baseline never advances past an unapplied entry), so the repair is
+   * retried, not lost.
+   */
   since_locator_version?: number;
   /** Requester's per-emitter audit-batch-seq baseline. */
   since_audit_seqs?: Record<string, number>;
@@ -217,7 +240,11 @@ export interface SyncResponsePayload {
   node_lifecycle_events?: SignedEvent<NodeLifecyclePayload>[];
   /** Missed `policy_update` events since `since_policy_versions`. */
   policy_updates?: SignedEvent<PolicyUpdatePayload>[];
-  /** Missed `locator_update` events since `since_locator_version`. */
+  /**
+   * Missed `locator_update` events since the requester's baseline —
+   * `since_locator_versions` for a current requester, the legacy
+   * `since_locator_version` scalar for an older one.
+   */
   locator_updates?: SignedEvent<LocatorUpdatePayload>[];
   /** Missed audit batches since `since_audit_seqs[emitter_node]`. */
   audit_batches?: AuditBatch[];

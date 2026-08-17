@@ -6,23 +6,34 @@
  * Key 13 (recovery cascade).
  *
  * Flow (initiator side):
+ *   0. The ceremony device mints a collection context (`mintRevokeCollection
+ *      Context`) and the guardians sign the rotation input built from it. This
+ *      happens BEFORE `propose` — the window and its ceremony_id exist before
+ *      any signature does (QI-SIBLING-02).
  *   1. `propose` — caller supplies the NEW master public + private key, the
- *      NEW root-principal keypair, and M-of-N guardian signatures. Ceremony
- *      builds the `MasterRotationPayload` and runs the cascade (re-issues
- *      every peer cert + re-derives every peer's HKDF subkeys under the new
- *      master). No state is mutated yet.
+ *      NEW root-principal keypair, that collection context, and M-of-N guardian
+ *      signatures. Ceremony enforces the window with its own clock, builds the
+ *      `MasterRotationPayload` and runs the cascade (re-issues every peer cert +
+ *      re-derives every peer's HKDF subkeys under the new master). No state is
+ *      mutated yet.
  *   2. `confirm` — operator explicit confirmation step. Required by Key 8.
- *   3. `execute` — per-peer unicast of the encrypted secret bundle, broadcast
- *      of the signed `master_rotation` envelope, local install, ack
+ *   3. `execute` — re-assert the collection window with this device's own clock
+ *      BEFORE any wire traffic (the confirm-to-execute gap is operator-paced and
+ *      unbounded), then per-peer unicast of the encrypted secret bundle,
+ *      broadcast of the signed `master_rotation` envelope, local install, ack
  *      collection, emit `gate_approved` audit event.
  *
  * Receiver side (`MasterRotationReceiver`):
  *   1. Unwrap the bundle using the OLD per-node transport key; cache the
- *      decrypted plaintext keyed by rotated_at.
+ *      decrypted plaintext in the pending map keyed by rotated_at.
  *   2. On `master_rotation` broadcast, look up the cached bundle, verify the
- *      quorum, call `installMasterRotation` locally, surface a signed ack
- *      via `onAckEmit` so the wiring layer can unicast it back to the
- *      initiator.
+ *      quorum and the window with this node's own clock, call
+ *      `installMasterRotation` locally, surface a signed ack via `onAckEmit`
+ *      so the wiring layer can unicast it back to the initiator.
+ *   3. A refused broadcast never rejects and never acks: it drops the broadcast
+ *      half, writes a GOVERNED denial audit entry keyed on the authenticated
+ *      emitter, and fires `onEnvelopeRejected`. The pending map itself is
+ *      UNBOUNDED — a stated rule-8 gap on a parked layer, see the declaration.
  *
  * Non-dependency invariant: no Concordia, no Verascore imports.
  * §10 hard gate: the `master_rotation` wire event is an existing V01 event
@@ -38,11 +49,13 @@ import type { MeshTransport } from "../in-memory-transport.js";
 import { MeshNode } from "../lifecycle/mesh-node.js";
 import {
   acceptMasterRotation,
+  assertQuorumContextFresh,
   buildMasterRotationPayload,
+  parseMasterRotationQuorumContext,
   rekeyOnMasterRotation,
   buildMasterRotationAuditPayload,
+  toWireMasterRotationQuorumContext,
   type GuardianRoster,
-  type MasterRotationQuorumInput,
 } from "../guardian/index.js";
 import { SIGNATURE_SCHEME_V1 } from "../constants.js";
 import type {
@@ -188,22 +201,40 @@ export class MasterRotationCeremony {
   }): MasterRotationCeremony {
     const rotatedAt = params.proposal.rotated_at ?? new Date().toISOString();
 
-    const input: MasterRotationQuorumInput = {
+    // QI-SIBLING-02: the collection context was minted BEFORE the guardians
+    // signed, so the signatures bind its ceremony_id. Re-validate the
+    // operator-supplied context element-by-element and refuse a lapsed window
+    // HERE, so the operator gets the feedback at propose time rather than one
+    // step later when the acceptance gate below would refuse anyway.
+    const parsedContext = parseMasterRotationQuorumContext(
+      toWireMasterRotationQuorumContext(params.proposal.quorum_context)
+    );
+    if (!parsedContext.ok) {
+      throw new CeremonyError(
+        `master_rotation proposal has a malformed quorum context: ${parsedContext.reason}`
+      );
+    }
+    assertQuorumContextFresh(parsedContext.context, {
+      mode: "strict",
+      now: new Date(),
+    });
+
+    const payload = buildMasterRotationPayload({
+      quorum_context: params.proposal.quorum_context,
       old_master_pubkey: params.ctx.pinned_old_master.public_key,
       new_master_pubkey: params.proposal.new_master_public,
       rotated_at: rotatedAt,
       fortress_id: params.ctx.pinned_old_master.fortress_id,
-    };
-    const payload = buildMasterRotationPayload({
-      input,
       guardian_signatures: params.proposal.guardian_signatures,
       pinned_roster: params.ctx.pinned_roster,
     });
-    // Catch a mis-assembled quorum BEFORE unlocking confirm().
+    // Catch a mis-assembled quorum BEFORE unlocking confirm(). Same relying-side
+    // gate a receiver runs, same clock discipline (each site uses its own).
     acceptMasterRotation({
       payload,
       pinned_master: params.ctx.pinned_old_master,
       pinned_roster: params.ctx.pinned_roster,
+      now: new Date(),
     });
 
     // Cascade: re-issue self + every peer cert under the new master.
@@ -264,7 +295,12 @@ export class MasterRotationCeremony {
     }
 
     return new MasterRotationCeremony({
-      ceremony_id: generateCeremonyId(),
+      // One identifier end to end (QI-SIBLING-02): adopt the context's
+      // CSPRNG-minted ceremony_id — the one the guardians actually signed —
+      // instead of minting a fresh id after the signatures already exist. This
+      // also retires the local `generateCeremonyId` copy, which silently
+      // degraded to a non-CSPRNG source when getRandomValues was absent.
+      ceremony_id: params.proposal.quorum_context.ceremony_id,
       prepared: {
         rotated_at: rotatedAt,
         new_master_public: params.proposal.new_master_public,
@@ -295,6 +331,20 @@ export class MasterRotationCeremony {
         "operator confirmation requires a non-empty note"
       );
     }
+    // QI-SIBLING-02 (C12 §8 Q4 precedent): an operator confirmation is not a
+    // freshness extension. A ceremony whose collection window lapsed between
+    // propose and confirm refuses here, so the operator learns at the click
+    // rather than mid-execute with bundles already unicast. Same shared
+    // assertion, this device's own clock.
+    const parsed = parseMasterRotationQuorumContext(
+      toWireMasterRotationQuorumContext(this.prepared.proposal.quorum_context)
+    );
+    if (!parsed.ok) {
+      throw new CeremonyError(
+        `master_rotation confirm: malformed quorum context (${parsed.reason})`
+      );
+    }
+    assertQuorumContextFresh(parsed.context, { mode: "strict", now: new Date() });
     this.state = "confirmed";
     this.confirmed_at = confirmation.at ?? new Date().toISOString();
   }
@@ -316,6 +366,45 @@ export class MasterRotationCeremony {
     const expectedAckers = [...this.prepared.peer_bundles.keys()];
 
     try {
+      // 0. PRE-BROADCAST FRESHNESS GATE (QI-SIBLING-02 fix round, state
+      //    `confirmed` -> `executing`). The confirm-to-execute gap is
+      //    operator-paced and unbounded: an operator can confirm at T+1min and
+      //    click execute hours later. Without this line the initiator unicasts
+      //    bundles, broadcasts, and installs the new master under a window that
+      //    has already lapsed, every peer refuses with QuorumFreshnessError, and
+      //    the fortress splits across two masters — a state that needs a fresh
+      //    guardian quorum to leave. `REVOKE_QUORUM_MAX_LIFETIME_MS`'s own
+      //    derivation says the window must cover "execute's local accept", so
+      //    this is the line that makes that comment true rather than aspirational.
+      //
+      //    Mirrors the C12 revoke path's emit-site gate (`mesh-node.ts`
+      //    `revokePeer`, "pre-broadcast guardian invariant"): master rotation
+      //    adopted C12's confirm gate but not its emit gate. Single-shot is
+      //    sufficient because the state machine forbids re-entering `execute`,
+      //    and this device's OWN clock is read here, never a timestamp lifted
+      //    from the payload.
+      //
+      //    Parses `payload.quorum_context` — the field that actually rides the
+      //    wire and that every receiver re-checks — rather than the in-memory
+      //    `proposal.quorum_context` it was projected from. The two agree today
+      //    because `propose` builds one from the other, so gating on the
+      //    proposal would be a check on a value the peers never see; an
+      //    emit-site gate must assert over exactly the bytes it is about to
+      //    emit, or a later divergence between the two representations passes
+      //    here and fails at every receiver.
+      const executeContext = parseMasterRotationQuorumContext(
+        this.prepared.payload.quorum_context
+      );
+      if (!executeContext.ok) {
+        throw new CeremonyError(
+          `master_rotation execute: malformed quorum context (${executeContext.reason})`
+        );
+      }
+      assertQuorumContextFresh(executeContext.context, {
+        mode: "strict",
+        now: new Date(),
+      });
+
       // 1. Per-peer unicast bundle delivery.
       for (const [peerId, envelope] of this.prepared.peer_bundles) {
         await this.ctx.transport.unicast(peerId, JSON.stringify(envelope));
@@ -438,7 +527,20 @@ export class MasterRotationCeremony {
  */
 interface PendingRotationOnReceiver {
   bundle?: MasterRotationBundlePlaintext;
-  broadcast?: MasterRotationPayload;
+  /**
+   * The broadcast half AND the AUTHENTICATED emitter that delivered it, held as
+   * ONE field so the two cannot come apart. `emitter_node` is the emitter of a
+   * SignedEvent that already passed the receive path's `verifyOrThrow`, never a
+   * string lifted from the payload: every refusal is attributed with it, and an
+   * attribution keyed on a spoofable field would let one peer pin its refusals
+   * on another. Pairing them structurally is what lets `surfaceBroadcastRefusal`
+   * require a non-optional emitter, so no refusal can be recorded against an
+   * unknown origin by omission.
+   */
+  broadcast?: {
+    payload: MasterRotationPayload;
+    emitter_node: string;
+  };
 }
 
 export interface MasterRotationReceiverOptions {
@@ -455,6 +557,26 @@ export interface MasterRotationReceiverOptions {
 }
 
 export class MasterRotationReceiver {
+  /**
+   * In-flight rotations, keyed on the SENDER-CHOSEN `rotated_at` string, read
+   * before any validation runs.
+   *
+   * THIS MAP IS UNBOUNDED. That is a known AGENTS.md rule-8 gap on a parked
+   * layer, tracked as QI-02-F11 in the private defect register; the register row
+   * is the only place its details resolve. Nothing in the surrounding freshness
+   * work bounds it, and no comment, doc or claim here may say otherwise.
+   *
+   * Two admission bounds have been attempted at this line and both failed a
+   * gate, which is why there is no third one here rather than a smaller one.
+   * DESIGN CONSTRAINT for whoever bounds it next: a bound must govern entry
+   * LIFETIME, not only admission — delete on successful install, sweep entries
+   * that reached a terminal state, and decide explicitly what happens to a
+   * broadcast that never pairs. An admission-only cap over a map nothing ever
+   * removes from turns a full map into a permanent refusal to install any later
+   * rotation, which is the two-master split this file's execute-time gate exists
+   * to prevent, and its operator symptom is silence. QI-02-F11 also records the
+   * availability tradeoff any eviction policy inherits.
+   */
   private readonly pending = new Map<string, PendingRotationOnReceiver>();
   private readonly installed = new Set<string>();
   private readonly opts: MasterRotationReceiverOptions;
@@ -470,6 +592,17 @@ export class MasterRotationReceiver {
    * Consume a unicast from `transport.subscribeUnicast`. Returns true if the
    * message was a `master_rotation_bundle` (so the caller knows not to pass
    * it to MeshNode's regular dispatcher).
+   *
+   * STATED CONSEQUENCE of the round-2 subtraction, written down rather than left
+   * to be discovered: removing the capacity-refusal branch removed the ONLY
+   * `onEnvelopeRejected` call on this bundle path, so a failure here — a bundle
+   * that will not unwrap under the old per-node transport key — now has NO
+   * operator surface at all. It throws to the caller, and the reference wiring
+   * discards it. That is defensible: unwrapping requires a key an attacker does
+   * not hold, so this is a local or misdelivered-bundle fault rather than an
+   * attacker-driven one, and the broadcast half still refuses loudly. It is also
+   * a real gap in what an operator can see, so whoever gives this path a signal
+   * is ADDING one, not restoring one.
    */
   async handleIncomingUnicast(
     to: string,
@@ -503,12 +636,39 @@ export class MasterRotationReceiver {
   /**
    * Call from a `MeshNode.onLifecycleEvent` hook when a received
    * `master_rotation` event arrives.
+   *
+   * `emitter_node` MUST be the verified envelope's `emitter_node`. The receive
+   * path runs `verifyOrThrow` before dispatching to the router that fires
+   * `onLifecycleEvent(evt, "received")`, so at that hook the value is
+   * authenticated; passing anything read out of the payload instead would key
+   * this receiver's refusal audit — and the per-emitter budget the denial-audit
+   * governor applies to it — on an attacker-chosen string, letting one peer
+   * spend another peer's bucket and pin its own refusals on that peer.
+   *
+   * NEVER REJECTS ON A REFUSAL, and that is the precise guarantee — not a
+   * blanket "never throws". QI-SIBLING-02 made refusal the GUARANTEED outcome
+   * for every stale or replayed broadcast, and the reference wiring invokes this
+   * as `void rec.handleIncomingMasterRotationBroadcast(...)`, so under Node's
+   * default unhandled-rejection behavior a propagating refusal would let an
+   * authenticated peer crash the receiving node by replaying a stale rotation.
+   * Every attacker-reachable failure — a refused window, a refused quorum, and
+   * the operator-surfacing callbacks those fire — is contained: refusals become
+   * a governed audit entry plus `onEnvelopeRejected`, exactly as the
+   * `node_revoke` router handler already does for the identical class, and both
+   * that hook and the ack listeners are caller-supplied, so both are wrapped.
+   *
+   * The residual, stated rather than hidden: a fault on the INSTALL path (an
+   * ed25519 signing failure from a corrupt local node key) still rejects. That
+   * path is only reachable with a bundle already unwrapped under the old
+   * per-node transport key, so it is a local fault and not attacker-drivable,
+   * and silently swallowing a local key fault would be the worse trade.
    */
   async handleIncomingMasterRotationBroadcast(
-    payload: MasterRotationPayload
+    payload: MasterRotationPayload,
+    params: { emitter_node: string }
   ): Promise<void> {
     const entry = this.pending.get(payload.rotated_at) ?? {};
-    entry.broadcast = payload;
+    entry.broadcast = { payload, emitter_node: params.emitter_node };
     this.pending.set(payload.rotated_at, entry);
     await this.maybeInstall(payload.rotated_at);
   }
@@ -518,18 +678,49 @@ export class MasterRotationReceiver {
     const entry = this.pending.get(rotatedAt);
     if (!entry?.bundle || !entry.broadcast) return;
 
-    // Verify the guardian quorum against pinned state.
-    acceptMasterRotation({
-      payload: entry.broadcast,
-      pinned_master: this.opts.pinned_old_master(),
-      pinned_roster: this.opts.pinned_guardian_roster(),
-    });
+    // Verify the guardian quorum against pinned state, and the collection
+    // window against THIS receiver's clock (QI-SIBLING-02). Strict mode, not
+    // the sync-anchored variant: a rotation only installs when the live unicast
+    // bundle and the broadcast are both in hand, and that pairing is collected
+    // inside DEFAULT_BROADCAST_ACK_TIMEOUT_MS, so there is no legitimate
+    // late-joiner case that needs to outlive the collection window. A node that
+    // was offline for the ceremony recovers through device recovery, not
+    // through a replayed rotation.
+    const broadcast = entry.broadcast.payload;
+    try {
+      acceptMasterRotation({
+        payload: broadcast,
+        pinned_master: this.opts.pinned_old_master(),
+        pinned_roster: this.opts.pinned_guardian_roster(),
+        now: new Date(),
+      });
+    } catch (e) {
+      // A refused broadcast is not retained: freshness enforcement makes refusal
+      // the guaranteed outcome for every replay, so holding the rejected payload
+      // would let an authentic-but-replaying peer grow this map for free. This
+      // is a hygiene measure on the PAIRED path and is explicitly NOT a bound on
+      // the map — see the `pending` declaration, whose comment names the gap and
+      // the register row rather than letting this line read as coverage.
+      //
+      // The BUNDLE half is kept: unwrapping it required the old per-node
+      // transport key, so it is not attacker-mintable, and dropping it would
+      // turn a refused broadcast into a permanent inability to install a later
+      // valid one at the same rotated_at.
+      const refusedEmitter = entry.broadcast.emitter_node;
+      entry.broadcast = undefined;
+      this.surfaceBroadcastRefusal(
+        refusedEmitter,
+        rotatedAt,
+        e instanceof Error ? e : new Error(String(e))
+      );
+      return;
+    }
 
     if (
       entry.bundle.re_issued_self_cert.parent_chain.fortress_master_pubkey !==
-      entry.broadcast.new_master_pubkey.public_key
+      broadcast.new_master_pubkey.public_key
     ) {
-      this.surfaceAckError(rotatedAt, entry.broadcast, "cert_chain_mismatch");
+      this.surfaceAckError(rotatedAt, broadcast, "cert_chain_mismatch");
       return;
     }
 
@@ -539,7 +730,7 @@ export class MasterRotationReceiver {
     } catch (e) {
       this.surfaceAckError(
         rotatedAt,
-        entry.broadcast,
+        broadcast,
         `malformed new_master_secret: ${e instanceof Error ? e.message : String(e)}`
       );
       return;
@@ -547,7 +738,7 @@ export class MasterRotationReceiver {
 
     try {
       this.opts.node.installMasterRotation({
-        payload: entry.broadcast,
+        payload: broadcast,
         new_master_secret: newMasterSecret,
         re_issued_self_cert: entry.bundle.re_issued_self_cert,
         new_root_principal_cert: entry.bundle.new_root_principal_cert,
@@ -555,7 +746,7 @@ export class MasterRotationReceiver {
     } catch (e) {
       this.surfaceAckError(
         rotatedAt,
-        entry.broadcast,
+        broadcast,
         e instanceof Error ? e.message : String(e)
       );
       return;
@@ -568,14 +759,14 @@ export class MasterRotationReceiver {
       fortress_id: this.opts.fortress_id,
       node_id: this.opts.node_id,
       rotated_at: rotatedAt,
-      new_master_pubkey: entry.broadcast.new_master_pubkey.public_key,
+      new_master_pubkey: broadcast.new_master_pubkey.public_key,
       status: "installed",
       ack_signature: toBase64url(
         ed25519.sign(
           ackSigningBytes({
             node_id: this.opts.node_id,
             rotated_at: rotatedAt,
-            new_master_pubkey: entry.broadcast.new_master_pubkey.public_key,
+            new_master_pubkey: broadcast.new_master_pubkey.public_key,
             fortress_id: this.opts.fortress_id,
             status: "installed",
           }),
@@ -584,7 +775,121 @@ export class MasterRotationReceiver {
       ),
       signature_scheme: SIGNATURE_SCHEME_V1,
     };
-    for (const l of this.ackEmitListeners) l(ack);
+    this.emitAck(ack);
+  }
+
+  /**
+   * The ONE receiver-side refusal surface (QI-SIBLING-02 fix round, fixes the
+   * "a refusing node looks identical to one that never received the broadcast"
+   * gap). Two effects, both operator-facing and neither decisional:
+   *
+   *   1. A GOVERNED audit entry via `MeshNode.auditMasterRotationDenied`, keyed
+   *      on the AUTHENTICATED emitter. Governed because refusal is the
+   *      guaranteed outcome for every replay, so an ungoverned entry per
+   *      refusal would be a zero-cost audit-write amplifier for any in-roster
+   *      peer (rule 8) — the same reason the revoke-denial and
+   *      uncorrelated-sync paths are governed.
+   *   2. `onEnvelopeRejected`, the hook the `node_revoke` router handler
+   *      already uses for this class, which the failure-mode detector consumes.
+   *
+   * Deliberately NO error ack. An ack is a freshly SIGNED message unicast to
+   * the initiator, so emitting one per refused replay would hand an
+   * authenticated peer a signing-and-reflection amplifier aimed at the
+   * initiator — trading a fixed local defect for an attacker-driven remote one.
+   * The audit entry is the durable operator record and it reaches the canonical
+   * audit node on the normal batch flush, which is where a fleet operator reads
+   * "this node refused" from.
+   *
+   * `emitterNode` is REQUIRED, not optional-with-an-unknown-peer-fallback. It is
+   * carried inside `PendingRotationOnReceiver.broadcast` alongside the payload
+   * it authenticated, so the only way to reach a refusal is to be holding the
+   * emitter that caused it. A refusal attributed to "unknown" is a forensic dead
+   * end and an unkeyed governor bucket every peer would share, so the type
+   * forecloses it instead of a runtime fallback papering over it.
+   */
+  private surfaceBroadcastRefusal(
+    emitterNode: string,
+    rotatedAt: string,
+    error: Error
+  ): void {
+    // Audit-write availability must never change the refusal or the operator
+    // signal (the governor's forensic-only invariant), so a failed audit write
+    // is contained here and `onEnvelopeRejected` still fires below.
+    try {
+      this.opts.node.auditMasterRotationDenied({
+        emitter_node: emitterNode,
+        rotated_at: rotatedAt,
+        error,
+      });
+    } catch {
+      // An unkeyed or mid-rotation node cannot seal an entry; the rejection
+      // hook below is still the operator's signal.
+    }
+    // The hook is CALLER-SUPPLIED and in production reaches signing and counter
+    // I/O, so it can throw. Refusal is the guaranteed outcome for every replay
+    // and the reference wiring calls this receiver as `void ...`, so an
+    // unwrapped hook would hand an authenticated peer the exact
+    // unhandled-rejection crash this refusal path exists to close. Containment
+    // is not silent degradation (MUST-NEVER #5): the refusal has already
+    // happened and is unaffected, and the governed audit entry above is sealed
+    // BEFORE this line, so a broken operator hook loses its own delivery and
+    // never the evidence.
+    //
+    // STATED BOUND (rule 8), accepted rather than closed. The audit write above
+    // is GOVERNED per authenticated emitter; THIS hook is not. It fires once per
+    // refusal, and freshness enforcement makes refusal the guaranteed outcome for
+    // every replay, so the work one refusal causes downstream of this line is
+    // unbounded in the NUMBER of refusals an in-roster peer can drive — the
+    // governed audit entry is not the whole per-refusal cost. It is not bounded
+    // here because the consumer is a shared boundary with its own already-owned
+    // gap: bounding it means changing that boundary for every caller, which is a
+    // design rather than a fix round. Bare ids UEK-02 and QI-02-F12; they resolve
+    // only in the private register. Nothing on this path bounds it today.
+    try {
+      this.opts.node.onEnvelopeRejected({
+        error,
+        event_type: "master_rotation",
+        emitter_node: emitterNode,
+      });
+    } catch {
+      // Nothing further to escalate to: the audit entry is already sealed.
+    }
+  }
+
+  /**
+   * Fan an ack out to every subscriber, isolating each one.
+   *
+   * Listeners are caller-supplied and the reference wiring's listener unicasts
+   * over the transport, so one throwing listener must not (a) reject the
+   * receiver's promise, which the `void`-calling wiring turns into an unhandled
+   * rejection, or (b) starve the listeners registered after it. Both sites that
+   * emit an ack funnel here, so the isolation cannot be present on one and
+   * absent on the other (rule 5: one implementation, never two that drift).
+   *
+   * What the containment COSTS differs by call site, and both are stated below
+   * rather than described from the success path alone.
+   */
+  private emitAck(ack: MasterRotationAckMessage): void {
+    for (const l of this.ackEmitListeners) {
+      try {
+        l(ack);
+      } catch {
+        // Containment, priced per CALL SITE.
+        //
+        // SUCCESS ack: the install decision is already made and recorded, so a
+        // lost delivery costs this subscriber's copy and nothing else.
+        //
+        // ERROR ack: the install FAILED. Nothing is audited on that path, the
+        // rejection hook does not fire, and this ack is the ONLY signal that
+        // exists — so a swallowed throw makes a failed install locally silent
+        // and, at the initiator, indistinguishable from a node that was simply
+        // offline for the ceremony. That is the deliberate round-2 trade and not
+        // an oversight: a rejected promise under the `void`-calling wiring is an
+        // attacker-reachable crash, a lost operator signal is not, and a crash
+        // loses the signal too. The remaining subscribers still get the ack in
+        // both cases.
+      }
+    }
   }
 
   private surfaceAckError(
@@ -614,7 +919,7 @@ export class MasterRotationReceiver {
       ),
       signature_scheme: SIGNATURE_SCHEME_V1,
     };
-    for (const l of this.ackEmitListeners) l(ack);
+    this.emitAck(ack);
   }
 
   /**
@@ -753,19 +1058,12 @@ async function emitMasterRotationBroadcast(
 // Misc
 // ═══════════════════════════════════════════════════════════════════════
 
-function generateCeremonyId(): string {
-  const bytes = new Uint8Array(16);
-  if (typeof globalThis.crypto?.getRandomValues === "function") {
-    globalThis.crypto.getRandomValues(bytes);
-  } else {
-    for (let i = 0; i < bytes.length; i++) {
-      bytes[i] = Math.floor(Math.random() * 256);
-    }
-  }
-  let hex = "";
-  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
-  return hex;
-}
+// QI-SIBLING-02: the local `generateCeremonyId` copy was DELETED here. It
+// silently degraded to a non-CSPRNG source when `crypto.getRandomValues` was
+// absent (a MUST-NEVER #5 degradation) and it minted an id AFTER
+// the guardian signatures existed, so nothing could bind it. The ceremony now
+// adopts the CSPRNG-fail-closed ceremony_id from the collection context minted
+// by `mintRevokeCollectionContext` in `mesh/guardian/revoke-quorum-input.ts`.
 
 export { emitGateApproved, type EmittedAlert };
 

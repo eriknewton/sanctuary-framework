@@ -27,8 +27,10 @@ import {
 } from "../../src/mesh/constants.js";
 import {
   acceptMasterRotation,
+  buildGuardianMasterRotationQuorumInput,
   buildMasterRotationAuditPayload,
   buildMasterRotationPayload,
+  mintRevokeCollectionContext,
   buildPostRecoveryPrompt,
   DEFAULT_GUARDIAN_M,
   DEFAULT_GUARDIAN_N,
@@ -761,12 +763,17 @@ describe("master_rotation acceptance + cascade", () => {
       fortress_id: oldFortress.public.fortress_id,
       created_at: new Date().toISOString(),
     };
-    const input: MasterRotationQuorumInput = {
+    // QI-SIBLING-02: mint the collection window first, then sign the bytes it
+    // names, then package. The window is what every relying site re-checks.
+    const quorumContext = mintRevokeCollectionContext();
+    const rotatedAt = new Date().toISOString();
+    const input = buildGuardianMasterRotationQuorumInput({
+      context: quorumContext,
       old_master_pubkey: oldFortress.public.public_key,
       new_master_pubkey: newMasterPublic,
-      rotated_at: new Date().toISOString(),
+      rotated_at: rotatedAt,
       fortress_id: oldFortress.public.fortress_id,
-    };
+    });
     const sigs = guardians.slice(0, 3).map((g) =>
       signMasterRotationAsGuardian({
         input,
@@ -775,7 +782,11 @@ describe("master_rotation acceptance + cascade", () => {
       })
     );
     const payload = buildMasterRotationPayload({
-      input,
+      quorum_context: quorumContext,
+      old_master_pubkey: oldFortress.public.public_key,
+      new_master_pubkey: newMasterPublic,
+      rotated_at: rotatedAt,
+      fortress_id: oldFortress.public.fortress_id,
       guardian_signatures: sigs,
       pinned_roster: roster,
     });
@@ -787,6 +798,7 @@ describe("master_rotation acceptance + cascade", () => {
       roster,
       guardians,
       input,
+      quorumContext,
       payload,
     };
   }
@@ -797,6 +809,7 @@ describe("master_rotation acceptance + cascade", () => {
       payload: f.payload,
       pinned_master: f.oldFortress.public,
       pinned_roster: f.roster,
+      now: new Date(),
     });
     expect(result.accepted_new_master.public_key).toBe(
       f.newMaster.public.public_key
@@ -815,6 +828,7 @@ describe("master_rotation acceptance + cascade", () => {
         payload: f.payload,
         pinned_master: wrongPinned,
         pinned_roster: f.roster,
+        now: new Date(),
       })
     ).toThrow(MasterRotationError);
   });

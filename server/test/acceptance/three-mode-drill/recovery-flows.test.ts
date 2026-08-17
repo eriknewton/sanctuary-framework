@@ -61,6 +61,7 @@ import {
   type MasterRotationAckMessage,
 } from "../../../src/mesh/recovery-flows/index.js";
 import {
+  buildGuardianMasterRotationQuorumInput,
   buildGuardianRevokeQuorumInput,
   mintRevokeCollectionContext,
   GUARDIAN_REVOKE_QUORUM_SCHEMA_V2,
@@ -665,13 +666,16 @@ describe("WP-MVP-8 ceremony 4 — master rotation + broadcast orchestration with
       };
       const newRootPrincipalKp = generateKeypair();
 
+      // QI-SIBLING-02: window minted before signing; carried on the wire.
+      const rotationContext = mintRevokeCollectionContext();
       const rotatedAt = new Date().toISOString();
-      const input = {
+      const input = buildGuardianMasterRotationQuorumInput({
+        context: rotationContext,
         old_master_pubkey: drill.master_public.public_key,
         new_master_pubkey: newMasterPublic,
         rotated_at: rotatedAt,
         fortress_id: drill.master_public.fortress_id,
-      };
+      });
       const sigs = guardians
         .slice(0, 3)
         .map((g) =>
@@ -715,17 +719,28 @@ describe("WP-MVP-8 ceremony 4 — master rotation + broadcast orchestration with
           try {
             await rec.handleIncomingUnicast(to, message);
           } catch {
-            // Bundle unwrap failures are surfaced through the ack error path
-            // inside the receiver; rethrow here would mask the ceremony
-            // execute() assertions.
+            // A bundle unwrap failure throws out of handleIncomingUnicast BEFORE
+            // any pending entry exists, so it reaches no ack path and no
+            // rejection hook — this catch is the only thing standing between it
+            // and the transport, and swallowing it here keeps it from masking the
+            // ceremony execute() assertions below. (The earlier claim that these
+            // failures surface through the ack error path was wrong: the unwrap
+            // throws before there is an entry to ack about. See the bundle-path
+            // note on MasterRotationReceiver.handleIncomingUnicast.)
           }
         });
         const existingHandler = node.onLifecycleEvent;
         node.onLifecycleEvent = (evt, kind) => {
           existingHandler(evt, kind);
           if (evt.event_type === "master_rotation" && kind === "received") {
+            // `evt.emitter_node` is AUTHENTICATED here: the receive path runs
+            // verifyOrThrow before the router fires this hook with
+            // kind === "received". The `void` call is deliberate and now safe —
+            // the receiver converts refusals to an audit entry plus
+            // onEnvelopeRejected instead of rejecting the promise.
             void rec.handleIncomingMasterRotationBroadcast(
-              evt.payload as import("../../../src/mesh/types.js").MasterRotationPayload
+              evt.payload as import("../../../src/mesh/types.js").MasterRotationPayload,
+              { emitter_node: evt.emitter_node }
             );
           }
         };
@@ -739,6 +754,7 @@ describe("WP-MVP-8 ceremony 4 — master rotation + broadcast orchestration with
           new_root_principal_private_key: newRootPrincipalKp.privateKey,
           new_root_principal_public_key: newRootPrincipalKp.publicKey,
           guardian_signatures: sigs,
+          quorum_context: rotationContext,
           rotated_at: rotatedAt,
           ack_timeout_ms: 15_000,
         },
@@ -799,13 +815,16 @@ describe("WP-MVP-8 ceremony 4 — master rotation + broadcast orchestration with
         created_at: new Date().toISOString(),
       };
       const newRootPrincipalKp = generateKeypair();
+      // QI-SIBLING-02: window minted before signing; carried on the wire.
+      const rotationContext = mintRevokeCollectionContext();
       const rotatedAt = new Date().toISOString();
-      const input = {
+      const input = buildGuardianMasterRotationQuorumInput({
+        context: rotationContext,
         old_master_pubkey: drill.master_public.public_key,
         new_master_pubkey: newMasterPublic,
         rotated_at: rotatedAt,
         fortress_id: drill.master_public.fortress_id,
-      };
+      });
       const sigs = guardians
         .slice(0, 3)
         .map((g) =>
@@ -850,7 +869,8 @@ describe("WP-MVP-8 ceremony 4 — master rotation + broadcast orchestration with
         prevLifecycleB(evt, kind);
         if (evt.event_type === "master_rotation" && kind === "received") {
           void recB.handleIncomingMasterRotationBroadcast(
-            evt.payload as import("../../../src/mesh/types.js").MasterRotationPayload
+            evt.payload as import("../../../src/mesh/types.js").MasterRotationPayload,
+            { emitter_node: evt.emitter_node }
           );
         }
       };
@@ -862,6 +882,7 @@ describe("WP-MVP-8 ceremony 4 — master rotation + broadcast orchestration with
           new_root_principal_private_key: newRootPrincipalKp.privateKey,
           new_root_principal_public_key: newRootPrincipalKp.publicKey,
           guardian_signatures: sigs,
+          quorum_context: rotationContext,
           rotated_at: rotatedAt,
           ack_timeout_ms: 3_000,
         },

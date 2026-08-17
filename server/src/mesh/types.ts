@@ -450,6 +450,22 @@ export interface MasterRotationPayload {
   new_master_pubkey: FortressMasterPublicKey;
   quorum_signatures: Array<{ guardian_pubkey: string; signature: string }>;
   rotated_at: string;
+  /**
+   * QI-SIBLING-02 v2: echoes the freshness fields of the signed quorum input so
+   * a receiver can recompute the canonical bytes AND enforce the collection
+   * window with its own clock. Optional in the TYPE only so the retired v1 shape
+   * is representable and can be named in a refusal; every acceptance site
+   * REFUSES a rotation payload without it (M1 clean break), because a rotation
+   * quorum with no window is the unbounded bearer capability this exists to
+   * kill. `input_schema` must match `GUARDIAN_MASTER_ROTATION_QUORUM_SCHEMA_V2`
+   * in `mesh/guardian/revoke-quorum-input.ts` exactly.
+   */
+  quorum_context?: {
+    input_schema: "sanctuary.guardian-master-rotation-quorum.v2";
+    ceremony_id: string;
+    initiated_at: string;
+    expires_at: string;
+  };
 }
 
 /** receipt_replicate payload (§5.5). */

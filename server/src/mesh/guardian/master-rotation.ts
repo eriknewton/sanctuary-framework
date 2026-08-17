@@ -5,13 +5,18 @@
  * §9.5 (audit continuity).
  *
  * Flow:
- *   1. Guardian quorum signs a `MasterRotationQuorumInput` over the new
- *      fortress-master public key.
+ *   0. The ceremony device mints a collection context (ceremony_id +
+ *      initiated_at + expires_at) BEFORE any guardian signs, so the signatures
+ *      bind the window they were collected in (QI-SIBLING-02).
+ *   1. Guardian quorum signs a `GuardianMasterRotationQuorumInput` over the new
+ *      fortress-master public key plus that context.
  *   2. The quorum proof is packaged into a `MasterRotationPayload` (§4.2-shaped
- *      `quorum_signatures`) and emitted as a SignedEvent on the wire.
- *   3. Receiving nodes verify guardian quorum against the pinned `GuardianRoster`,
- *      accept the new master pubkey, re-derive HKDF subkeys, and re-issue per-
- *      node certificates under the rotated master.
+ *      `quorum_signatures` plus the echoed `quorum_context`) and emitted as a
+ *      SignedEvent on the wire.
+ *   3. Receiving nodes enforce the collection window with their OWN clock, verify
+ *      guardian quorum against the pinned `GuardianRoster`, accept the new master
+ *      pubkey, re-derive HKDF subkeys, and re-issue per-node certificates under
+ *      the rotated master.
  *
  * Audit continuity (§9.5): every node inserts a `master_rotation` boundary
  * entry in its audit batch immediately after acceptance. Pre-rotation audit
@@ -41,10 +46,17 @@ import {
   verifyGuardianQuorum,
   signMasterRotationAsGuardian,
 } from "./guardian-roster.js";
+import {
+  assertQuorumContextFresh,
+  assertRotatedAtWithinContext,
+  buildGuardianMasterRotationQuorumInput,
+  parseMasterRotationQuorumContext,
+  toWireMasterRotationQuorumContext,
+  type GuardianRevokeQuorumContext,
+} from "./revoke-quorum-input.js";
 import type {
   GuardianQuorumProof,
   GuardianRoster,
-  MasterRotationQuorumInput,
 } from "./types.js";
 import { fromBase64url } from "../../core/encoding.js";
 import { ed25519 } from "@noble/curves/ed25519";
@@ -53,26 +65,51 @@ import { ed25519 } from "@noble/curves/ed25519";
 // Building a master-rotation payload (ceremony side)
 // ═══════════════════════════════════════════════════════════════════════
 
-/**
- * Assemble a `MasterRotationPayload` from a quorum-input + per-guardian
- * signatures. The reconstitution ceremony collects M signatures (each produced
- * via `signMasterRotationAsGuardian`), then calls this to package them.
- *
- * Validates the assembled proof against the pinned roster before returning.
- */
-export function buildMasterRotationPayload(params: {
-  input: MasterRotationQuorumInput;
+export interface BuildMasterRotationPayloadParams {
+  /**
+   * The collection context minted BEFORE any guardian signed (QI-SIBLING-02).
+   * Required, not optional: an optional window is a window every production call
+   * site forgets to pass, which is exactly the inert-capability shape rule 3
+   * forbids.
+   */
+  quorum_context: GuardianRevokeQuorumContext;
+  old_master_pubkey: string;
+  new_master_pubkey: FortressMasterPublicKey;
+  rotated_at: string;
+  fortress_id: string;
   guardian_signatures: Array<{ guardian_id: string; signature: string }>;
   pinned_roster: GuardianRoster;
-}): MasterRotationPayload {
+}
+
+/**
+ * Assemble a `MasterRotationPayload` from a collection context + per-guardian
+ * signatures. The reconstitution ceremony mints the context, collects M
+ * signatures over the canonical bytes it names (each produced via
+ * `signMasterRotationAsGuardian`), then calls this to package them.
+ *
+ * Validates the assembled proof against the pinned roster before returning.
+ * Takes the context's FIELDS rather than a pre-built input so the canonical
+ * bytes are constructed here by the one shared builder; a caller cannot hand in
+ * bytes that disagree with the context it echoes onto the wire.
+ */
+export function buildMasterRotationPayload(
+  params: BuildMasterRotationPayloadParams
+): MasterRotationPayload {
   const proof: GuardianQuorumProof = {
     roster_version: params.pinned_roster.version,
     signatures: params.guardian_signatures,
   };
+  const input = buildGuardianMasterRotationQuorumInput({
+    context: params.quorum_context,
+    old_master_pubkey: params.old_master_pubkey,
+    new_master_pubkey: params.new_master_pubkey,
+    rotated_at: params.rotated_at,
+    fortress_id: params.fortress_id,
+  });
   // Validate before emitting — an invalid quorum is operator error, not a
   // wire-side concern.
   verifyGuardianQuorum({
-    input: params.input,
+    input,
     proof,
     pinned_roster: params.pinned_roster,
   });
@@ -82,15 +119,18 @@ export function buildMasterRotationPayload(params: {
   // below is safe only because verifyGuardianQuorum already proved every id is
   // in the pinned roster and that each signature covers this canonical input.
   return {
-    old_master_pubkey: params.input.old_master_pubkey,
-    new_master_pubkey: params.input.new_master_pubkey,
+    old_master_pubkey: params.old_master_pubkey,
+    new_master_pubkey: params.new_master_pubkey,
     quorum_signatures: params.guardian_signatures.map((s) => ({
       guardian_pubkey: params.pinned_roster.guardians.find(
         (g) => g.guardian_id === s.guardian_id
       )!.public_key,
       signature: s.signature,
     })),
-    rotated_at: params.input.rotated_at,
+    rotated_at: params.rotated_at,
+    // The window must ride the wire: every receiver recomputes the canonical
+    // bytes and re-runs the freshness assertion from the payload alone.
+    quorum_context: toWireMasterRotationQuorumContext(params.quorum_context),
   };
 }
 
@@ -102,6 +142,14 @@ export interface AcceptMasterRotationParams {
   payload: MasterRotationPayload;
   pinned_master: FortressMasterPublicKey;
   pinned_roster: GuardianRoster;
+  /**
+   * THIS relying site's own clock at its own moment of verification
+   * (QI-SIBLING-02, rule 10). Required, never defaulted: a site that could omit
+   * it would silently inherit whatever clock the last editor thought was fine,
+   * and an optional freshness argument is a freshness check that is absent in
+   * production and present in tests.
+   */
+  now: Date;
 }
 
 export interface AcceptMasterRotationResult {
@@ -114,15 +162,20 @@ export interface AcceptMasterRotationResult {
  *
  * Steps:
  *   1. Confirm `payload.old_master_pubkey === pinned_master.public_key`.
- *   2. Reconstruct the canonical `MasterRotationQuorumInput`.
- *   3. Verify guardian quorum against the pinned roster (verifyGuardianQuorum).
- *   4. Return the new master pubkey for the cascade orchestrator to install.
+ *   2. Parse the echoed collection context element-by-element and enforce the
+ *      relying-side freshness window with THIS site's clock (QI-SIBLING-02).
+ *   3. Reconstruct the canonical `GuardianMasterRotationQuorumInput`.
+ *   4. Verify guardian quorum against the pinned roster (verifyGuardianQuorum).
+ *   5. Return the new master pubkey for the cascade orchestrator to install.
  *
  * The signature in `payload.quorum_signatures[i].signature` is verified by
  * locating the guardian in the pinned roster by `guardian_pubkey` and running
  * Ed25519 verification.
  *
- * Throws MasterRotationError on any mismatch.
+ * Throws MasterRotationError on any mismatch, QuorumFreshnessError on a stale,
+ * future-dated, or over-long window. Both are fail-closed and both name the
+ * failure class in the message so an operator can tell version skew from clock
+ * skew (MUST-NEVER #5: no silent degradation, and a refusal is diagnosable).
  */
 export function acceptMasterRotation(
   params: AcceptMasterRotationParams
@@ -140,12 +193,58 @@ export function acceptMasterRotation(
       `new_master fortress_id=${payload.new_master_pubkey.fortress_id} does not match current fortress ${pinned_master.fortress_id} — fortress identity is preserved across rotation`
     );
   }
-  const input: MasterRotationQuorumInput = {
+  // M1 clean break (QI-SIBLING-02): a rotation payload with no context is
+  // exactly the retired v1 unbounded-lifetime shape — a quorum proof that
+  // authorizes a master swap forever. Refuse it with a version-distinguishing
+  // reason so a skewed-fleet operator can tell version skew from clock skew.
+  // Never softened: accepting v1 bytes accepts the bearer capability this change
+  // exists to kill.
+  if (!payload.quorum_context) {
+    throw new MasterRotationError(
+      `master_rotation denied: v1-shape rotation quorum (no v2 freshness context) refused under the QI-SIBLING-02 clean break`
+    );
+  }
+  // Element-level parse (rules 5/11): a malformed context fails closed HERE with
+  // a typed reason, never as a downstream dereference. The expected domain
+  // separator is the master-rotation one, so a harvested revoke or
+  // device-recovery context cannot be presented here even before any signature
+  // is checked.
+  const parsed = parseMasterRotationQuorumContext(payload.quorum_context);
+  if (!parsed.ok) {
+    throw new MasterRotationError(
+      `master_rotation denied: malformed quorum context (${parsed.reason})`
+    );
+  }
+  // Relying-side freshness (rule 10) with THIS site's own clock — hard fail,
+  // never a warning. This is the line that makes a harvested abandoned-ceremony
+  // rotation quorum worthless once its window closes; without it an authentic
+  // signature over a signer-chosen timestamp is a permanent master-swap
+  // capability, which is a master ROLLBACK primitive against any node still
+  // pinned to the old master.
+  assertQuorumContextFresh(parsed.context, {
+    mode: "strict",
+    now: params.now,
+  });
+  // rotated_at is signed but is NOT the freshness field; bound it to the window
+  // so the audit boundary entry cannot record a rotation at a moment that never
+  // happened (rule 7 — a signature proves the signer, not the meaning).
+  assertRotatedAtWithinContext({
+    context: parsed.context,
+    rotated_at: payload.rotated_at,
+  });
+  // Rebuild the signed bytes through the ONE shared builder — never trust bytes
+  // handed in by the sender.
+  const input = buildGuardianMasterRotationQuorumInput({
+    context: {
+      ceremony_id: parsed.context.ceremony_id,
+      initiated_at: parsed.context.initiated_at,
+      expires_at: parsed.context.expires_at,
+    },
     old_master_pubkey: payload.old_master_pubkey,
     new_master_pubkey: payload.new_master_pubkey,
     rotated_at: payload.rotated_at,
     fortress_id: pinned_master.fortress_id,
-  };
+  });
   // Re-key payload.quorum_signatures into a GuardianQuorumProof shape by
   // looking up guardian_id from guardian_pubkey.
   const sigsAsProof = payload.quorum_signatures.map((s) => {
@@ -163,10 +262,13 @@ export function acceptMasterRotation(
     // roster version or claimed ids are never trusted across the wire.
     return { guardian_id: guardian.guardian_id, signature: s.signature };
   });
-  // Receiver canonical-input invariant: rebuild the exact input from accepted
-  // event fields plus the receiver's pinned fortress_id, then let
-  // verifyGuardianQuorum enforce roster_version, distinct ids, threshold, and
-  // Ed25519 signatures. The payload cannot smuggle an alternate fortress_id.
+  // Receiver canonical-input invariant: the input above was rebuilt from
+  // accepted event fields plus the receiver's pinned fortress_id, then
+  // verifyGuardianQuorum enforces roster_version, distinct ids, threshold, and
+  // Ed25519 signatures over exactly those bytes. A
+  // payload cannot smuggle an alternate fortress_id, and the ceremony_id rides
+  // inside the signed bytes, so a quorum collected for another ceremony fails
+  // verification structurally rather than by a comparison someone must remember.
   verifyGuardianQuorum({
     input,
     proof: {

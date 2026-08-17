@@ -706,18 +706,27 @@ async function resolveMasterKey(
 
 /**
  * Operation name for the CLI's audited "operator accepted a broken audit chain"
- * consent entry. Parallels the MCP router's `mcp_accept_broken_chain_override`
- * (router.ts) - a privileged CLI action (daemon bring-up, re-pin) past audit
- * integrity findings records the operator's consent BEFORE it proceeds, so the
- * override is itself auditable. The broken history is NEVER repaired or deleted;
- * it stays on disk, visible to `sanctuary castle-wall audit-findings`.
+ * consent entry. This flag lets specific privileged CLI verbs (daemon
+ * bring-up on the legacy chain, re-pin) proceed with their OWN action past
+ * existing audit integrity findings; it does not repair or clear those
+ * findings, and it does not restore MCP write capability — a fortress that
+ * has accumulated an audit-integrity finding has no path back to MCP write
+ * access anywhere in this tree today. The MCP router's former
+ * `mcp_accept_broken_chain_override` agent path was removed from
+ * router.ts/tool-args.ts because it let an MCP-calling agent bypass the same
+ * gate whose findings might be evidence of that agent's own tampering; this
+ * CLI flag is separate, unrelated machinery, not a replacement for it. A
+ * privileged CLI action past audit integrity findings records the
+ * operator's consent BEFORE it proceeds, so the override is itself
+ * auditable. The broken history is NEVER repaired or deleted; it stays on
+ * disk, visible to `sanctuary castle-wall audit-findings`.
  */
 const CASTLE_WALL_ACCEPT_BROKEN_CHAIN_OP = "castle_wall_accept_broken_chain_override";
 
 /**
  * Build the `AuditLog` a privileged CLI verb (daemon / re-pin) should use,
- * applying the operator-override semantics that mirror the MCP router's
- * `accept_broken_chain` path:
+ * applying this CLI's operator-override semantics (the MCP router has no
+ * equivalent agent-facing path anymore; this flag is operator-CLI-only):
  *
  *  - No `--accept-broken-chain`: return a default (strict) `AuditLog`. If the
  *    chain has integrity findings, the verb's first append throws

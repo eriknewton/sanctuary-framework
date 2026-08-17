@@ -69,9 +69,16 @@ export function buildSyncResponse(
     request.since_policy_versions ?? {}
   );
 
-  const locator_updates = state.locator_table.delta(
-    request.since_locator_version ?? 0
-  );
+  // C12-SYNC-ORDER-01: prefer the per-agent vector. A requester on a current
+  // build always sends it, and only the vector can re-serve an entry that
+  // per-event isolation dropped beneath a higher-versioned sibling — the
+  // scalar branch advances past that entry and excludes it forever. The
+  // scalar is the legacy branch, taken only for a pre-C12-SYNC-ORDER-01
+  // requester that sent no vector. Field names must match
+  // `SyncRequestPayload` in ./types.ts.
+  const locator_updates = request.since_locator_versions
+    ? state.locator_table.deltaByAgent(request.since_locator_versions)
+    : state.locator_table.delta(request.since_locator_version ?? 0);
 
   // Initial-sync requests: ship the entire lifecycle log.
   // Delta-sync requests: ship the post-known-event tail (caller passes
