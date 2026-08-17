@@ -1,0 +1,73 @@
+# Sanctuary Disclosure Guard
+#
+# Copyright 2026 Erik Newton
+# SPDX-License-Identifier: Apache-2.0
+#
+# Gates the PULL-REQUEST DESCRIPTION against AGENTS.md MUST-NEVER #9: a
+# description may never describe a defect, only the capability change plus a
+# bare private-register id. The checker and its stated bound live in
+# scripts/check-disclosure.sh.
+#
+# WHY THIS IS A JOB AND NOT A REVIEW ITEM. The rule failed three times on a
+# single pull request inside one day, and two of those three were written by an
+# author who was actively trying to comply. A description is public the instant
+# it is saved and the host keeps its edit history, so review-after-the-fact
+# cannot undo it. This job refuses before the text is worth anything to a
+# reader.
+#
+# THE `edited` TRIGGER IS LOAD-BEARING. Two of the three real instances arrived
+# by EDITING a description that had already been read. A job that fires only on
+# `opened` would have caught one of three, which is worse than useless because
+# it would read as coverage. Every activity type that can change the body text
+# is listed below. Failure mode if `edited` is dropped: the job stays green
+# forever while the body it approved no longer exists.
+#
+# NO `paths` FILTER, ON PURPOSE. Every other guard here scopes itself to the
+# files it protects. This one protects text that is not in the tree at all, so
+# any path filter would silently disable it on the pull requests that touch
+# nothing it lists. Mirrors the always-on posture of secret-scan.yml.
+#
+# NOT `pull_request_target`. That trigger runs with a writable token in the
+# context of the base repository while the content under test is controlled by
+# the fork. This job only needs to read text; `pull_request` with a read-only
+# token is the correct and safe choice.
+
+name: Disclosure Guard
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+  workflow_dispatch: {}
+
+# Least privilege: the job reads the checked-out tree and the event payload.
+# It posts nothing and needs no write scope.
+permissions:
+  contents: read
+
+jobs:
+  disclosure-guard:
+    name: disclosure-guard
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The checker derives its scope vocabulary from the committed tree, so it
+      # must run inside a checkout. Run outside one it falls back to a short
+      # static list and says so in its own report, which is a WEAKER scan.
+      - name: Scan the pull-request description
+        env:
+          # Passed as an environment VALUE, never interpolated into the shell
+          # below. A description on a fork pull request is attacker-controlled
+          # text; splicing it into a `run:` block would execute it. Pinned by
+          # server/test/structure/disclosure-guard.test.ts.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "Not a pull_request event; nothing to scan."
+            exit 0
+          fi
+          printf '%s\n' "${PR_BODY}" \
+            | scripts/check-disclosure.sh --label "pull-request description" -

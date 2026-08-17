@@ -1,0 +1,27 @@
+# Disclosure ratchet baseline — per-rule hit counts in COMMITTED test-file
+# headers, as reported by:
+#
+#   scripts/check-disclosure.sh --surface test-header --extract header \
+#     --format tsv $(git ls-files 'server/test/**/*.test.ts')
+#
+# The guard (server/test/structure/disclosure-guard.test.ts) fails when any
+# count rises above its row, and asks you to tighten the row when a count falls.
+# DO NOT raise a row to make a red go away: raising it is how a new disclosure
+# lands and stays. Lowering a row is always welcome and is the direction of
+# travel; the target for every row is 0.
+#
+# WHY COUNTS AND NOT FILE PATHS. Every other ratchet here stores a per-file row,
+# which is more precise and is right for those rules. It is wrong for this one:
+# a permanent, committed list of which headers trip a non-disclosure check is
+# itself an index telling a reader where to start looking. The precision is
+# given up on purpose. Stated cost: a one-for-one swap inside a single rule
+# (one header cleaned, another header gaining the same shape in the same
+# change) passes this gate. The pull-request diff is the compensating control.
+#
+# Rules are documented at the top of scripts/check-disclosure.sh.
+D1-ANCHOR 6
+D2-CODEPATH 29
+D3-CONFIGPATH 12
+D5-REPRO 17
+D6-INVOCATION 9
+D8-LOCALIZED 20
