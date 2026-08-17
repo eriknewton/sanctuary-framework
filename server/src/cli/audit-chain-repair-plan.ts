@@ -24,6 +24,15 @@
  *     load path, the sealed-region walk, custody unwrap) writes on some of its
  *     paths and does not announce it at the call site.
  *
+ *     The guard is not decorative: loading a chain that HAS findings attempts
+ *     one write of its own, appending to the operator-facing integrity-alert
+ *     log. Refusing it is the intended behavior here and costs the operator
+ *     nothing, because this verb's entire output IS that alert, delivered to
+ *     the operator directly. It is called out because a reader who removes the
+ *     guard sees nothing break in the clean case and concludes it was
+ *     ornamental; the damaged case is where it bites, and there is a test named
+ *     for exactly that.
+ *
  *  2. It does not ADJUDICATE CAUSE. An interrupted write, a restore from
  *     backup, and a deliberate truncation are not distinguishable from the
  *     on-disk evidence. Every field below reports what was OBSERVED. No field

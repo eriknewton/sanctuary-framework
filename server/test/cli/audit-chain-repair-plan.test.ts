@@ -163,11 +163,18 @@ describe("audit-chain repair-plan", () => {
 
   /** In-place corruption of one audit entry's stored bytes: a CONTENT finding
    *  (the recomputed entry hash stops matching), not a read failure. */
-  async function corruptOneEntry(fortressPath: string): Promise<void> {
+  async function corruptOneEntry(
+    fortressPath: string,
+    // On a fortress that has run the writer-split migration the early entries
+    // are SEALED, and the load path deliberately skips that region, so
+    // corrupting one there produces no routine finding. Such tests must damage
+    // the post-split suffix instead.
+    which: "early" | "tip" = "early"
+  ): Promise<void> {
     const auditDir = join(fortressPath, "state", "_audit");
     const files = (await readdir(auditDir)).filter((f) => f.endsWith(".enc")).sort();
     expect(files.length).toBeGreaterThan(2);
-    const target = join(auditDir, files[1]!);
+    const target = join(auditDir, which === "tip" ? files.at(-1)! : files[1]!);
     const raw = JSON.parse(await readFile(target, "utf8")) as Record<string, unknown>;
     const payload = String(raw.encrypted_payload_bytes);
     // Flip one character of the ciphertext while preserving length, so the
@@ -267,6 +274,70 @@ describe("audit-chain repair-plan", () => {
     expect(plan?.plan.next_actions.join(" ")).not.toContain("audit-chain export");
 
     expect(await hashWithDaemonReadable()).toBe(before);
+  });
+
+  it("still refuses a cut when findings AND unreadable evidence are present together", async () => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) return;
+    // The ordering case. With findings alone the plan offers a forward cut, and
+    // with an unreadable region alone it refuses; this is the combination where
+    // the two rules disagree, and the refusal has to win. Without this case a
+    // reviewer could swap the two checks in `classifyPlanState` and every other
+    // test in this file would stay green (found by mutation testing, not by
+    // reading).
+    const fortressPath = await seededFortress();
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const { masterKey } = await establishMaster({ storage, passphrase: PASSPHRASE });
+    await migrateFortressAuditStoreSplit({ storage, masterKey });
+    const daemonLog = createDaemonAuditLog(storage, masterKey);
+    await daemonLog.appendCritical({
+      layer: "l1",
+      operation: "daemon-seed",
+      identity_id: "daemon",
+      result: "success",
+    });
+    await daemonLog.flush();
+    // Post-split entries, so there is a readable suffix left to damage.
+    const opLog = new AuditLog(storage, masterKey);
+    for (let i = 0; i < 3; i++) {
+      await opLog.appendCritical({
+        layer: "l1",
+        operation: `post-split-${i}`,
+        identity_id: "operator",
+        result: "success",
+      });
+    }
+    await opLog.flush();
+    masterKey.fill(0);
+
+    await corruptOneEntry(fortressPath, "tip");
+    await chmod(join(fortressPath, "state", AUDIT_DAEMON_NAMESPACE), 0o000);
+
+    const { code, plan } = await runPlan(fortressPath);
+
+    expect(plan?.chain_state.routine_finding_count).toBeGreaterThan(0);
+    expect(plan?.export_manifest.daemon_chain_access).toBe("present_unreadable");
+    expect(plan?.plan.state).toBe("PLAN_NO_ACTION_PRIVILEGE_LIMITED");
+    expect(code).toBe(REPAIR_PLAN_EXIT_PRIVILEGE_LIMITED);
+  });
+
+  it("does not write the integrity-alert log that loading a damaged chain attempts", async () => {
+    // Loading a chain with findings attempts one write of its own, appending to
+    // the operator-facing integrity-alert log. The read-only guard refuses it.
+    // Asserted explicitly, by name, rather than left implicit in the tree hash:
+    // a reader deleting the guard sees the clean case keep passing, so the
+    // damaged case needs its own statement.
+    const fortressPath = await seededFortress();
+    await corruptOneEntry(fortressPath);
+
+    const { code, plan } = await runPlan(fortressPath);
+    expect(code).toBe(REPAIR_PLAN_EXIT_PLAN_PRODUCED);
+
+    const stateEntries = await readdir(join(fortressPath, "state"));
+    expect(stateEntries.filter((name) => name.includes("integrity_alert"))).toEqual(
+      []
+    );
+    // And nothing is lost by refusing it: the findings still reach the operator.
+    expect(plan?.chain_state.findings.length).toBeGreaterThan(0);
   });
 
   it("runs offline: no server is constructed and no port is opened", async () => {
