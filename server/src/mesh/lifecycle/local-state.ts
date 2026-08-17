@@ -26,6 +26,61 @@ import {
 export const POLICY_BUNDLE_REJECTION_AUDIT_OP =
   "mesh_policy_bundle_rejected" as const;
 
+// ═══════════════════════════════════════════════════════════════════════
+// Version-vector key safety — ONE source for BOTH replicated tables
+// ═══════════════════════════════════════════════════════════════════════
+//
+// A version vector is a wire-facing map keyed by AGENT ID, and an agent id is
+// attacker-chosen text that no upsert path validates, so its keys can collide
+// with `Object.prototype` member names. Both the policy bundle and the locator
+// table express their sync baseline as one of these vectors, and BOTH build it
+// and read it through the two helpers below — one shared source, never a
+// hand-mirrored pair (AGENTS.md rule 5). The hand-copy is not hypothetical:
+// the locator table's baseline was copied from the policy table's, and the
+// copy carried both hazards below with it.
+
+/**
+ * Build side of a version vector.
+ *
+ * `Object.create(null)`, because assigning `__proto__` on an object LITERAL
+ * sets the prototype instead of creating an own property: the entry would
+ * vanish from `Object.keys` and from the serialized vector, that agent's
+ * baseline would read 0 on every future round, and the responder would re-serve
+ * it forever, re-applying as older each time. A null-prototype object takes
+ * `__proto__` as an ordinary own property, and it survives the
+ * `JSON.stringify` / `JSON.parse` wire round-trip as one.
+ */
+function newVersionVector(): Record<string, number> {
+  return Object.create(null) as Record<string, number>;
+}
+
+/**
+ * Read side of a version vector — the requester's baseline for ONE agent.
+ *
+ * Own-property-only, because the vector a responder reads is `JSON.parse`d
+ * wire input carrying an ordinary prototype. A plain `vector[agentId] ?? 0`
+ * for an agent named `toString` (or `valueOf`, `constructor`,
+ * `hasOwnProperty`, …) that the requester has NEVER SEEN returns the INHERITED
+ * FUNCTION: `??` does not fire on a function, and `version > <function>` is
+ * `false`, so that agent is excluded from the delta and the requester never
+ * receives it — from any peer, on any round — while its own baseline reports
+ * fully synced. That is exactly the permanent-hole-under-a-fully-synced-
+ * watermark defect C12-SYNC-ORDER-01 exists to close, reintroduced through an
+ * object-key hazard rather than through a scalar watermark.
+ *
+ * A present-but-non-numeric value is wire text we cannot honor as a baseline;
+ * it reads as 0 (re-serve), never as a suppressor, because an unusable baseline
+ * must never read as "already satisfied".
+ */
+function baselineVersionFor(
+  vector: Record<string, number>,
+  agentId: string
+): number {
+  if (!Object.prototype.hasOwnProperty.call(vector, agentId)) return 0;
+  const value = (vector as Record<string, unknown>)[agentId];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
 export type PolicyBundleRejectionReason =
   | "policy_payload_malformed"
   | "policy_version_replay"
@@ -97,9 +152,13 @@ export class PolicyBundleStore {
     return this.byAgent.get(agentId)?.payload.policy_version ?? 0;
   }
 
-  /** Vector of agent_id → highest-pinned policy_version. */
+  /**
+   * Vector of agent_id → highest-pinned policy_version. Built through the
+   * shared `newVersionVector()` for the `__proto__` key hazard documented
+   * there; `LocatorTableStore.versionVector()` uses the same source.
+   */
   versionVector(): Record<string, number> {
-    const out: Record<string, number> = {};
+    const out = newVersionVector();
     for (const [k, v] of this.byAgent) out[k] = v.payload.policy_version;
     return out;
   }
@@ -108,13 +167,20 @@ export class PolicyBundleStore {
    * Delta query for sync replies - return every event whose policy_version
    * is strictly greater than the requester's per-agent baseline. Agents the
    * requester has never seen (no entry in baseline) are included whole.
+   *
+   * The baseline lookup goes through the shared `baselineVersionFor()`, never
+   * a direct index: `sincePolicyVersions` is `JSON.parse`d wire input, so a
+   * direct index on an unseen agent named after an `Object.prototype` member
+   * returns an inherited function and silently excludes that agent forever.
+   * `LocatorTableStore.deltaByAgent` reads its baseline through the same
+   * helper — one predicate, two callers.
    */
   delta(
     sincePolicyVersions: Record<string, number>
   ): SignedEvent<PolicyUpdatePayload>[] {
     const out: SignedEvent<PolicyUpdatePayload>[] = [];
     for (const [agentId, evt] of this.byAgent) {
-      const baseline = sincePolicyVersions[agentId] ?? 0;
+      const baseline = baselineVersionFor(sincePolicyVersions, agentId);
       if (evt.payload.policy_version > baseline) out.push(evt);
     }
     return out;
@@ -284,8 +350,19 @@ export class LocatorTableStore {
    * the dropped entry to this node again. A per-agent baseline carries no
    * such cross-agent claim: an agent whose entry was dropped simply keeps
    * its old (or absent) baseline, so the responder re-serves that agent on
-   * every later round until it actually applies, and stops re-serving it the
-   * moment it does.
+   * every later round.
+   *
+   * TERMINATION, stated exactly: re-serving stops for an agent as soon as
+   * that agent's entry APPLIES here, because only then does its baseline
+   * advance. It does NOT stop for an entry this node can never apply — a peer
+   * holding a corrupt copy, a certificate this node cannot chain, a signer it
+   * has revoked. That agent's baseline stays pinned and the entry is
+   * re-fetched and re-refused every round, from every peer that holds it,
+   * indefinitely. That is the deliberate half of the trade: the pre-fix scalar
+   * DID terminate on such an entry, by dropping it permanently and silently
+   * beneath a watermark claiming full sync. A bounded, visible, audited
+   * per-round re-refusal is the cost paid to make an unverifiable entry
+   * observable instead of invisible.
    *
    * Derived solely from THIS node's own applied table, never from wire
    * input (rule 7): a refused event's claimed version must not be able to
@@ -294,9 +371,12 @@ export class LocatorTableStore {
    * agent cardinality exactly as `PolicyBundleStore.versionVector()` does
    * for its own — this method neither adds nor tightens a bound on how many
    * agents either table may hold.
+   *
+   * Built through the shared `newVersionVector()`, same source as the policy
+   * table's: see that helper for why the object cannot be a plain literal.
    */
   versionVector(): Record<string, number> {
-    const out: Record<string, number> = {};
+    const out = newVersionVector();
     for (const [k, v] of this.byAgent) out[k] = v.payload.locator_version;
     return out;
   }
@@ -308,14 +388,17 @@ export class LocatorTableStore {
    * matching `PolicyBundleStore.delta`.
    *
    * Must stay in agreement with `versionVector()` above: the vector is the
-   * requester's side of exactly this predicate.
+   * requester's side of exactly this predicate. The baseline lookup goes
+   * through the shared `baselineVersionFor()`, the same helper
+   * `PolicyBundleStore.delta` reads through — a second hand-written copy of
+   * this lookup is what reintroduced the permanent-hole defect once already.
    */
   deltaByAgent(
     sinceLocatorVersions: Record<string, number>
   ): SignedEvent<LocatorUpdatePayload>[] {
     const out: SignedEvent<LocatorUpdatePayload>[] = [];
     for (const [agentId, evt] of this.byAgent) {
-      const baseline = sinceLocatorVersions[agentId] ?? 0;
+      const baseline = baselineVersionFor(sinceLocatorVersions, agentId);
       if (evt.payload.locator_version > baseline) out.push(evt);
     }
     return out;

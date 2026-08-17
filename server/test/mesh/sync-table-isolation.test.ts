@@ -572,3 +572,261 @@ describe("lifecycle/sync - applySync per-table isolation (C12-SYNC-ORDER-01)", (
     expect(first.node.getLocatorTable().get("agent-poison")).toBeUndefined();
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// C12-SYNC-ORDER-01 fix round - version-vector key safety
+//
+// An agent id is attacker-chosen text and no upsert path validates it, so a
+// version vector keyed by agent id can carry keys that collide with
+// `Object.prototype` member names. Two distinct hazards, one on each side of
+// the vector, both of which reproduce the SAME permanent-hole-under-a-
+// fully-synced-watermark defect this register row exists to close:
+//
+//   - READ side: for an agent named `toString` (or `valueOf`, `constructor`,
+//     `hasOwnProperty`, …) that the requester has never seen, a direct index
+//     into the `JSON.parse`d wire vector returns the INHERITED FUNCTION. `??`
+//     does not fire on a function and `number > function` is false, so the
+//     entry is excluded from every delta forever.
+//   - BUILD side: assigning `__proto__` on an object LITERAL sets the
+//     prototype rather than creating an own property, so that agent never
+//     appears in the vector, its baseline reads 0 on every round, and the
+//     entry is re-served forever, re-applying as older each time.
+//
+// Both tests drive the REAL request path (`requestSyncFromPeer` → the wire
+// JSON the transport actually carries → `buildSyncResponse`), so the baseline
+// under test is the one production sends, not one the test composes.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("lifecycle/sync - version-vector key safety (C12-SYNC-ORDER-01)", () => {
+  /**
+   * Attach a capture-only responder peer and return a reader that parses the
+   * single captured `sync_request` back off the wire. Parsing the real JSON
+   * matters: an in-memory object handed straight to the responder would not
+   * have the ordinary prototype that creates the read-side hazard.
+   */
+  function attachRequestCapture(hub: InMemoryTransport, peerId: string) {
+    const captured: string[] = [];
+    hub.attach(peerId).subscribeUnicast((_to, message) =>
+      captured.push(message)
+    );
+    return {
+      captured,
+      request(): SyncRequestPayload {
+        expect(captured).toHaveLength(1);
+        const wire = JSON.parse(captured[0]) as {
+          evt: SignedEvent<SyncRequestPayload>;
+        };
+        return wire.evt.payload;
+      },
+    };
+  }
+
+  it("C12-SYNC-ORDER-01: a locator entry whose agent_id is an Object.prototype member name is served to a node that has never seen it", async () => {
+    const hub = new InMemoryTransport();
+    const first = await bootstrapFirstNode({ transport: hub });
+    const nodeId = first.bootstrap.node_certificate.node_id;
+    const fortressId = first.bootstrap.master_public.fortress_id;
+    const rootPrincipalId =
+      first.bootstrap.root_principal_certificate.principal_id;
+
+    // `toString` is a legal agent_id: LocatorTableStore.upsert does no payload
+    // validation, so a node genuinely can hold this entry and serve it.
+    const hostileAgentId = "toString";
+    const responderLocator = new LocatorTableStore();
+    responderLocator.upsert(
+      packSignedEvent<LocatorUpdatePayload>({
+        event_type: "locator_update",
+        emitter_node: nodeId,
+        emitter_principal: rootPrincipalId,
+        fortress_id: fortressId,
+        payload: {
+          agent_id: hostileAgentId,
+          canonical_node: nodeId,
+          locator_version: 5,
+          last_migration_at: "2026-06-01T00:00:00.000Z",
+          hosting_principal: rootPrincipalId,
+        },
+        monotonic_seq: 1,
+        node_private_key: first.bootstrap.node_private_key,
+      })
+    );
+    const respond = (request: SyncRequestPayload): SyncResponsePayload =>
+      buildSyncResponse(request, {
+        policy_bundle: new PolicyBundleStore(),
+        locator_table: responderLocator,
+        lifecycle_log: new NodeLifecycleEventLog(),
+      });
+
+    // This node has never seen the agent, so its vector omits the key.
+    expect(first.node.getLocatorTable().get(hostileAgentId)).toBeUndefined();
+
+    const capture = attachRequestCapture(hub, "peer-responder");
+    await first.node.requestSyncFromPeer({
+      peer_node_id: "peer-responder",
+      kind: "delta_sync",
+    });
+    const response = respond(capture.request());
+
+    // THE GAP ASSERTION. With a direct index into the parsed vector the
+    // baseline for this agent is `Object.prototype.toString`, `5 > <function>`
+    // is false, and the entry is silently excluded from this and every future
+    // delta while this node's own baseline reports fully synced.
+    const served = response.locator_updates?.find(
+      (e) => e.payload.agent_id === hostileAgentId
+    );
+    expect(served).toBeDefined();
+    expect(served!.payload.locator_version).toBe(5);
+
+    // It applies, and then the re-serve TERMINATES — the baseline advances for
+    // this key like any other, so the repair is not a permanent per-round tax.
+    await first.node.applySync(response);
+    expect(
+      first.node.getLocatorTable().get(hostileAgentId)?.payload.locator_version
+    ).toBe(5);
+    capture.captured.length = 0;
+    await first.node.requestSyncFromPeer({
+      peer_node_id: "peer-responder",
+      kind: "delta_sync",
+    });
+    expect(respond(capture.request()).locator_updates).toHaveLength(0);
+  });
+
+  it("C12-SYNC-ORDER-01: a locator entry whose agent_id is __proto__ appears in the built vector, so its re-serve terminates", async () => {
+    const hub = new InMemoryTransport();
+    const first = await bootstrapFirstNode({ transport: hub });
+    const nodeId = first.bootstrap.node_certificate.node_id;
+    const fortressId = first.bootstrap.master_public.fortress_id;
+    const rootPrincipalId =
+      first.bootstrap.root_principal_certificate.principal_id;
+
+    const hostileAgentId = "__proto__";
+    const responderLocator = new LocatorTableStore();
+    responderLocator.upsert(
+      packSignedEvent<LocatorUpdatePayload>({
+        event_type: "locator_update",
+        emitter_node: nodeId,
+        emitter_principal: rootPrincipalId,
+        fortress_id: fortressId,
+        payload: {
+          agent_id: hostileAgentId,
+          canonical_node: nodeId,
+          locator_version: 5,
+          last_migration_at: "2026-06-01T00:00:00.000Z",
+          hosting_principal: rootPrincipalId,
+        },
+        monotonic_seq: 1,
+        node_private_key: first.bootstrap.node_private_key,
+      })
+    );
+    const respond = (request: SyncRequestPayload): SyncResponsePayload =>
+      buildSyncResponse(request, {
+        policy_bundle: new PolicyBundleStore(),
+        locator_table: responderLocator,
+        lifecycle_log: new NodeLifecycleEventLog(),
+      });
+
+    const capture = attachRequestCapture(hub, "peer-responder");
+    await first.node.requestSyncFromPeer({
+      peer_node_id: "peer-responder",
+      kind: "delta_sync",
+    });
+    await first.node.applySync(respond(capture.request()));
+    expect(
+      first.node.getLocatorTable().get(hostileAgentId)?.payload.locator_version
+    ).toBe(5);
+
+    // BUILD-SIDE ASSERTION. On an object literal this assignment sets the
+    // prototype and creates no own property, so the applied entry never
+    // reaches the vector at all.
+    expect(
+      Object.keys(first.node.getLocatorTable().versionVector())
+    ).toContain(hostileAgentId);
+
+    // …which is observable as a re-serve that never terminates: the baseline
+    // stays 0 forever and the responder ships the entry again every round,
+    // where it re-applies as `older` each time.
+    capture.captured.length = 0;
+    await first.node.requestSyncFromPeer({
+      peer_node_id: "peer-responder",
+      kind: "delta_sync",
+    });
+    expect(respond(capture.request()).locator_updates).toHaveLength(0);
+  });
+
+  it("C12-SYNC-ORDER-01: the policy table's baseline holds the same key safety, since both tables share one predicate", async () => {
+    const hub = new InMemoryTransport();
+    const first = await bootstrapFirstNode({ transport: hub });
+    const nodeId = first.bootstrap.node_certificate.node_id;
+    const fortressId = first.bootstrap.master_public.fortress_id;
+    const rootPrincipalId =
+      first.bootstrap.root_principal_certificate.principal_id;
+
+    // One agent per hazard, both in the SAME table, because the policy site
+    // is the pre-existing instance of the read-side bug and the source the
+    // locator site's copy came from.
+    const inheritedKeyAgent = "toString";
+    const protoKeyAgent = "__proto__";
+    const policyEvent = (agentId: string, seq: number) =>
+      packSignedEvent({
+        event_type: "policy_update",
+        emitter_node: nodeId,
+        emitter_principal: rootPrincipalId,
+        fortress_id: fortressId,
+        payload: {
+          agent_id: agentId,
+          policy_version: 1,
+          valid_from: "2026-06-01T00:00:00.000Z",
+          valid_until: "2099-01-01T00:00:00.000Z",
+          policy_blob: compiledPolicyBlob(agentId, 1, { fortressId }),
+        },
+        monotonic_seq: seq,
+        node_private_key: first.bootstrap.node_private_key,
+      });
+
+    const responderPolicy = new PolicyBundleStore();
+    expect(responderPolicy.upsert(policyEvent(inheritedKeyAgent, 1))).toBe(
+      "applied"
+    );
+    expect(responderPolicy.upsert(policyEvent(protoKeyAgent, 2))).toBe(
+      "applied"
+    );
+    const respond = (request: SyncRequestPayload): SyncResponsePayload =>
+      buildSyncResponse(request, {
+        policy_bundle: responderPolicy,
+        locator_table: new LocatorTableStore(),
+        lifecycle_log: new NodeLifecycleEventLog(),
+      });
+
+    const capture = attachRequestCapture(hub, "peer-responder");
+    await first.node.requestSyncFromPeer({
+      peer_node_id: "peer-responder",
+      kind: "delta_sync",
+    });
+    const response = respond(capture.request());
+
+    // READ-SIDE GAP: both are excluded by a direct index — the inherited
+    // function for `toString`, `Object.prototype` itself for `__proto__` —
+    // so a node that has never seen either can never learn either.
+    const servedIds = (response.policy_updates ?? []).map(
+      (e) => e.payload.agent_id
+    );
+    expect(servedIds).toContain(inheritedKeyAgent);
+    expect(servedIds).toContain(protoKeyAgent);
+
+    await first.node.applySync(response);
+    expect(first.node.getPolicyBundle().get(inheritedKeyAgent)).toBeDefined();
+    expect(first.node.getPolicyBundle().get(protoKeyAgent)).toBeDefined();
+
+    // BUILD-SIDE GAP on the same table: `__proto__` must reach the vector, or
+    // the policy bundle re-serves it every round forever.
+    expect(
+      Object.keys(first.node.getPolicyBundle().versionVector())
+    ).toContain(protoKeyAgent);
+    capture.captured.length = 0;
+    await first.node.requestSyncFromPeer({
+      peer_node_id: "peer-responder",
+      kind: "delta_sync",
+    });
+    expect(respond(capture.request()).policy_updates).toHaveLength(0);
+  });
+});
