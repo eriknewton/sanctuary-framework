@@ -122,15 +122,30 @@ export class ReadOnlyStorageGuard
 
   // ---- refused ----
 
-  async write(namespace: string, key: string): Promise<void> {
+  // Each refusal declares the FULL parameter list of the method it stands in
+  // for, unused arguments included. A shortened signature is still assignable
+  // to the interface, so nothing would have caught the divergence at the class
+  // level; it only surfaces at a call site, as a confusing arity error. Keeping
+  // the shapes identical also means a reader comparing the guard against
+  // `storage/interface.ts` sees one contract, not two.
+
+  async write(namespace: string, key: string, _data: Uint8Array): Promise<void> {
     throw new ReadOnlyStorageViolationError("write", namespace, key);
   }
 
-  async writeDurable(namespace: string, key: string): Promise<void> {
+  async writeDurable(
+    namespace: string,
+    key: string,
+    _data: Uint8Array
+  ): Promise<void> {
     throw new ReadOnlyStorageViolationError("writeDurable", namespace, key);
   }
 
-  async delete(namespace: string, key: string): Promise<boolean> {
+  async delete(
+    namespace: string,
+    key: string,
+    _secureOverwrite?: boolean
+  ): Promise<boolean> {
     throw new ReadOnlyStorageViolationError("delete", namespace, key);
   }
 
