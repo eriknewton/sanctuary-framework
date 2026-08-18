@@ -27,6 +27,15 @@
  * Ed25519 identity, real state writes through the L1 tools. No mocks. Each
  * test isolates its own tmp fortress and restores SANCTUARY_STORAGE_PATH.
  */
+// fail-before-exempt: the "an uncurated underscore namespace is excluded"
+// test below (RESERVED-NS-DIVERGE-01) asserts behavior that was already
+// correct against origin/main - the exit-bundle exporter's namespace checks
+// each OR'd a redundant underscore-prefix check before the consolidation, so
+// an uncurated underscore namespace was already excluded pre-PR. It cannot
+// fail against pre-fix source by construction. It exists to give the
+// consolidated reserved-namespace predicate a wired-consumer test at this
+// call site (AGENTS.md rule 4), not to catch a regression from a behavior
+// change.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
