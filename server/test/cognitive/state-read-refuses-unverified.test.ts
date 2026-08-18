@@ -2,24 +2,25 @@
  * CAPABILITY (STATE-READ-REFUSE-01): the enforcing read path returns a value
  * only when signature verification established who wrote the entry. An entry
  * whose writer cannot be established is REFUSED with the distinct
- * classification `writer_unverified`, instead of being returned with
- * `signature_verified: false` for every caller to remember to check.
+ * classification `writer_unverified`, so the obligation sits at one line
+ * rather than at every caller that has to remember to inspect a flag.
  *
  * These tests assert the MECHANISM, not the property. Each one pins a specific
- * discriminator rather than "the read failed":
+ * discriminator rather than "the read did not return":
  *
  *   - the refusal carries `writer_unverified`, which is what tells a caller
- *     that a migration, not a repair, is the remedy;
- *   - a verified entry still reads, so a regression that simply broke reads
- *     could not pass;
- *   - `readUnverified` still returns the SAME entry the enforcing path refuses,
- *     which is the only thing that makes the split meaningful;
- *   - an entry that is both unattributable and below its anchor is reported as
- *     the ROLLBACK, proving the refusal was not ordered above the detection it
+ *     that restoring the writer identity, not repairing the entry, is the
+ *     remedy;
+ *   - a verified entry still reads, so a change that merely stopped reads
+ *     working could not pass;
+ *   - `readUnverified` still returns the SAME entry the enforcing path
+ *     refuses, which is the only thing that makes the split meaningful;
+ *   - an entry that is both unattributable and below its anchor is reported
+ *     as the rollback, proving the refusal is ordered below the detection it
  *     would otherwise mask;
- *   - the owner's `list`, `export`, and `delete` still reach the refused entry,
+ *   - the owner's `list`, `export`, and `delete` still reach a refused entry,
  *     which is the AGENTS.md MUST-NEVER #2 obligation the refusal must not
- *     trade away. The export assertion decrypts the exported payload with the
+ *     trade away. The export assertion decrypts the exported bytes with the
  *     owner's own namespace key, because a bundle that merely CONTAINS opaque
  *     bytes would not prove the owner can still get their data out.
  */
