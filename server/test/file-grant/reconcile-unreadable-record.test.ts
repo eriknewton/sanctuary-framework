@@ -21,30 +21,10 @@ import { describe, expect, it } from "vitest";
 import { mintFileGrant } from "../../src/file-grant/mint.js";
 import { reconcileFileGrantTree } from "../../src/file-grant/reconcile.js";
 import { FileGrantUnreadableEntriesError } from "../../src/file-grant/types.js";
-import type { StateStore } from "../../src/cognitive/state-store.js";
-import { FakeFsOps, makeFileGrantTestStore } from "./fixtures.js";
+import { FakeFsOps, failReadFor, makeFileGrantTestStore } from "./fixtures.js";
 
 const MINTED_AT = new Date("2026-07-07T00:00:00.000Z");
 const PAST_TTL = new Date("2026-07-07T02:00:00.000Z");
-
-/**
- * Make one specific grant key's StateStore read reject, the way an entry whose
- * writer key cannot be resolved does, while every other key still reads. The
- * patch goes on `read` only: `StateStore.list` enumerates through the storage
- * backend, so both keys still appear in the listing and the fan-out genuinely
- * has to survive one of them.
- */
-function failReadFor(stateStore: StateStore, key: string, message: string): void {
-  const realRead = stateStore.read.bind(stateStore);
-  stateStore.read = (async (
-    namespace: string,
-    readKey: string,
-    ...rest: unknown[]
-  ) => {
-    if (readKey === key) throw new Error(message);
-    return (realRead as (...args: unknown[]) => unknown)(namespace, readKey, ...rest);
-  }) as typeof stateStore.read;
-}
 
 async function mintGrant(
   deps: { fsOps: FakeFsOps; store: Awaited<ReturnType<typeof makeFileGrantTestStore>>["grantStore"]; auditLog: Awaited<ReturnType<typeof makeFileGrantTestStore>>["auditLog"] },

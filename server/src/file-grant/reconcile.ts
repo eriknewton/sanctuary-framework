@@ -23,21 +23,36 @@
  * so it can only ever REDUCE access -- safe to run on any touch.
  *
  * THROW CONTRACT (round 4, opus LOW-2; widened to the READ fan-out under
- * FG-RECONCILE-ORDER-01): every per-entry failure -- an unreadable grant record
- * in step 1, a `removeEntry` throw or a reported ACL-removal failure in step 4
- * -- is caught and deferred here (`firstDeferredError`), so no single entry can
- * skip another entry's scrub or the status bookkeeping. The first such error is
- * surfaced only AFTER every best-effort removal AND the bookkeeping flip. Each
- * scrubbed entry's access is removed BEFORE any throw, so a surfaced throw is
- * fail-closed. Being idempotent and safe-direction, a subsequent
- * `reconcileFileGrantTree` run re-converges the shared fortress ACE.
+ * FG-RECONCILE-ORDER-01; the two losses separated under
+ * FG-RECONCILE-REPORT-01): every per-entry failure is caught and deferred, so
+ * no single entry can skip another entry's scrub or the status bookkeeping.
+ * There are TWO KINDS and they are tracked separately on purpose:
+ *
+ *   - A RECORD THAT DID NOT READ BACK (step 1). One grant is unconverged. Its
+ *     tree entry is untouched, which is where the run found it.
+ *   - A READABLE GRANT THAT DID NOT RECONCILE (`readableGrantFailure`): a
+ *     `removeEntry` throw or a reported ACL-removal failure in step 4, or a
+ *     status write that rejected in step 3. This is the one that means a grant
+ *     which SHOULD have lost access still has it.
+ *
+ * A single slot holding whichever came first would let the read failure swallow
+ * every instance of the second in the same pass, so the report at the end
+ * carries BOTH, and claims a reconciliation of the readable grants only when
+ * that is what happened. Each scrubbed entry's access is removed BEFORE any
+ * throw, so a surfaced throw is fail-closed. Being idempotent and
+ * safe-direction, a subsequent `reconcileFileGrantTree` run re-converges the
+ * shared fortress ACE.
  *
  * WHAT AN UNREADABLE RECORD DOES AND DOES NOT MEAN. A grant whose record cannot
- * be read is left entirely alone: its tree entry is not scrubbed, because its
- * state is unknown and reconcile never acts on a record it has not read. That
- * is the same position the run started in, so the honest bound is "one grant
- * unconverged", not "access silently widened" -- and every OTHER grant is
- * reconciled normally, which is the property the read fan-out used to lose.
+ * be read -- a read that rejects, or a record that comes back carrying none of
+ * a grant's shape -- is left entirely alone: its tree entry is not scrubbed,
+ * because its state is unknown and reconcile never acts on a record it has not
+ * read. That is the same position the run started in, so the honest bound is
+ * "one grant unconverged", not "access silently widened" -- and every OTHER
+ * grant is reconciled normally, which is the property the read fan-out used to
+ * lose. The second half of that definition lives in the store's decode, and it
+ * has to: a record admitted by a cast fails HERE instead, outside the per-entry
+ * isolation, where it takes every other grant's reconcile down with it.
  */
 
 import type { AuditLog } from "../operational/audit-log.js";
@@ -92,30 +107,29 @@ export async function reconcileFileGrantTree(
   // expired grant's access away, so a read that can reject before the scrub
   // starts makes the scrub's own per-entry tolerance unreachable and lets one
   // unreadable record hold every other grant's access open past its TTL. The
-  // read failure is not discarded -- it is deferred to the same slot the scrub
-  // failures use and thrown after the scrub and the bookkeeping flip.
+  // read failure is not discarded -- it is deferred and reported after the
+  // scrub and the bookkeeping flip, alongside any failure the readable grants
+  // hit, never in place of one.
   const listing = await deps.store.listEntries();
   const grants = listing.grants;
   const plan = planGrantTree(grants, deps.now);
   const grantsById = new Map(grants.map((grant) => [grant.grant_id, grant]));
 
   const scrubbed: string[] = [];
-  // The single deferred-failure slot for the whole pass. Seeded from the read
-  // fan-out because those failures happen first in wall-clock order, so "first
-  // error" stays literally true; scrub failures below fill it only if it is
-  // still empty.
-  let firstDeferredError: unknown =
-    listing.unreadable.length > 0
-      ? new FileGrantUnreadableEntriesError(
-          listing.unreadable.map((entry) => entry.grant_id),
-          listing.unreadable[0]!.cause
-        )
-      : null;
-  for (const entry of listing.unreadable) {
-    await appendUnreadableGrantAudit(deps, entry);
-  }
+  // The deferred-failure slot for the grants that DID read back: the scrub loop
+  // and the bookkeeping loop below both fill it. It is deliberately NOT seeded
+  // from the read fan-out. A record that did not read and a removal that did
+  // not complete are different losses -- the first means one grant is
+  // unconverged, the second means a grant that SHOULD have lost access still
+  // has it -- and seeding here would let the first silently swallow every
+  // instance of the second in the same pass. The read failure is reported
+  // ALONGSIDE this one at the end, never instead of it.
+  let readableGrantFailure: unknown = null;
 
-  // SAFETY-CRITICAL, FIRST AMONG THE MUTATIONS: scrub every tree entry the plan
+  // SAFETY-CRITICAL, FIRST AMONG THE MUTATIONS, and deliberately the first
+  // AWAIT of any kind after the listing -- a delay ahead of it is the same
+  // shape as a block, which is why the unreadable-record audit appends were
+  // moved below. Scrub every tree entry the plan
   // says must not be present (revoked + expired grants). Removing access is the
   // safety-critical action; the persisted-status flip below is only
   // bookkeeping. So the scrub runs BEFORE and INDEPENDENTLY of the status write
@@ -140,15 +154,15 @@ export async function reconcileFileGrantTree(
       } else {
         aclFailureByGrantId.set(entry.grant_id, removeResult.aclRemoval);
         await appendScrubFailureAudit(deps, entry, grant, removeResult.aclRemoval);
-        if (firstDeferredError === null) {
-          firstDeferredError = new Error(
+        if (readableGrantFailure === null) {
+          readableGrantFailure = new Error(
             `Governed File-Grant: failed to remove ACL for ` +
               `${entry.relative_tree_entry}: ${removeResult.aclRemoval.reason ?? "unknown"}`
           );
         }
       }
     } catch (err) {
-      if (firstDeferredError === null) firstDeferredError = err;
+      if (readableGrantFailure === null) readableGrantFailure = err;
     }
   }
 
@@ -163,25 +177,67 @@ export async function reconcileFileGrantTree(
     const shouldExpire = grant.status === "active" && isGrantExpired(grant, deps.now);
     const shouldClearAce =
       confirmedScrubbedGrantIds.has(grant.grant_id) && grant.granted_read_ace != null;
+    let flipped = true;
     if (shouldExpire || shouldClearAce) {
       let revised = shouldExpire ? reviseGrantForExpiry(grant, deps.now) : grant;
       if (shouldClearAce) {
         revised = { ...revised, granted_read_ace: null };
       }
-      await deps.store.put(revised);
+      // BEST-EFFORT PER ENTRY, LIKE THE SCRUB ABOVE. This used to be the one
+      // mutation loop in the function without a per-entry catch, which made it
+      // the one loop that could both skip the remaining grants' flips and erase
+      // a failure already deferred from the scrub -- the caller then saw the
+      // write error alone and was told nothing about the access still live or
+      // the record that never read. The stated principle ("no single entry can
+      // skip another entry's scrub or the status bookkeeping") is this loop's
+      // too. Access is already removed by the time this runs, so a rejection
+      // here is a record lagging at "active", reported and not fatal.
+      try {
+        await deps.store.put(revised);
+      } catch (err) {
+        flipped = false;
+        if (readableGrantFailure === null) readableGrantFailure = err;
+      }
     }
     if (shouldExpire) {
-      expired.push(grant.grant_id);
+      // Only a flip that actually landed is reported as one; `expired` names
+      // the records whose PERSISTED status changed.
+      if (flipped) expired.push(grant.grant_id);
       await appendExpiryAudit(deps, grant, aclFailureByGrantId.get(grant.grant_id));
     }
   }
 
-  // Surface the first deferred failure now -- a read failure from the fan-out
-  // above or a scrub failure below it -- only after best-effort access removal
-  // AND the status flip, so neither the remaining scrubs nor the bookkeeping are
-  // skipped by an early throw. Swallowing it instead would trade one silent
-  // failure for another: the caller would be told a partial reconcile converged.
-  if (firstDeferredError !== null) throw firstDeferredError;
+  // THE UNREADABLE-RECORD TRAIL RUNS HERE, AFTER BOTH MUTATION LOOPS. It is a
+  // durable audit append, one per unreadable record, and nothing bounds how
+  // long an append can take -- there is no timeout on `appendCritical`. The
+  // ordering rationale this whole function is built on is that nothing which
+  // can delay or prevent the scrub may precede it, and an unbounded await is
+  // exactly that shape. Nothing downstream reads these rows, so the position
+  // costs nothing, and the "first among the mutations" claim above is then
+  // literally true rather than nearly true.
+  for (const entry of listing.unreadable) {
+    await appendUnreadableGrantAudit(deps, entry);
+  }
+
+  // Report the pass that actually ran, after best-effort access removal AND the
+  // status flip, so neither the remaining scrubs nor the bookkeeping are skipped
+  // by an early throw. Swallowing either failure would trade one silent failure
+  // for another: the caller would be told a partial reconcile converged.
+  //
+  // BOTH LOSSES TRAVEL TOGETHER. When records did not read AND a readable
+  // grant did not reconcile, one error carries both: the ids that were not
+  // read, and the failure that left a readable grant unconverged. Whichever
+  // happened first, neither is dropped, and the message states only what this
+  // pass observed -- it can no longer claim a reconciliation of the readable
+  // grants in a run where one of them was not reconciled.
+  if (listing.unreadable.length > 0) {
+    throw new FileGrantUnreadableEntriesError(
+      listing.unreadable.map((entry) => entry.grant_id),
+      listing.unreadable[0]!.cause,
+      { failure: readableGrantFailure }
+    );
+  }
+  if (readableGrantFailure !== null) throw readableGrantFailure;
 
   return { expired, scrubbed };
 }
@@ -198,9 +254,19 @@ async function appendUnreadableGrantAudit(
   entry: FileGrantUnreadableEntry
 ): Promise<void> {
   try {
+    // ITS OWN OPERATION, NOT `file_grant_revoke`. The expiry append below
+    // reuses the revoke op with a stated justification -- a TTL expiry, like a
+    // revoke, is an access REDUCTION that really happened. Nothing here was
+    // revoked and no access changed, so that justification does not reach this
+    // row, and an auditor filtering the revoke operation would otherwise be
+    // handed rows where nothing was revoked. `operation` is a free-form string
+    // (see `operational/audit-log.ts`), so a distinct name costs nothing; this
+    // follows mint's `file_grant_recorded` precedent, and like it, the string
+    // is an AuditLog value only and is never dispatched to the approval gate,
+    // so it carries no tier of its own.
     await deps.auditLog?.appendCritical({
       layer: "l1",
-      operation: "file_grant_revoke",
+      operation: "file_grant_reconcile_failed",
       identity_id: deps.reconciledBy ?? "system",
       result: "failure",
       details: {
