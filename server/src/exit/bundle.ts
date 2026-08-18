@@ -858,7 +858,9 @@ async function exportEncryptedState(
     // F6: never export internal `_`-prefixed namespaces - the rekey/import path
     // rejects them, so exporting one (e.g. an explicit `--state-namespace _x`)
     // would silently fail to round-trip. Symmetric with the import guard.
-    if (namespace.startsWith("_") || isReservedNamespace(namespace)) continue;
+    // RESERVED-NS-DIVERGE-01: `isReservedNamespace` applies the blanket
+    // underscore rule on its own, so no separate `startsWith("_")` is needed.
+    if (isReservedNamespace(namespace)) continue;
     const metas = await opts.storage.list(namespace);
     for (const meta of metas) {
       const raw = await opts.storage.read(namespace, meta.key);
@@ -1600,7 +1602,9 @@ function compromisedRetiredSignatureUse(
   let count = 0;
   let firstRetiredIndex: number | undefined;
   for (const item of encryptedState?.entries ?? []) {
-    if (item.namespace.startsWith("_") || isReservedNamespace(item.namespace)) {
+    // RESERVED-NS-DIVERGE-01: `isReservedNamespace` applies the blanket
+    // underscore rule on its own, so no separate `startsWith("_")` is needed.
+    if (isReservedNamespace(item.namespace)) {
       continue;
     }
     const candidates = publicKeysByIdentityId.get(item.entry.kid) ?? [];
@@ -2117,7 +2121,9 @@ function activationSnapshotLocations(
   }
 
   for (const item of encryptedState?.json.entries ?? []) {
-    if (item.namespace.startsWith("_") || isReservedNamespace(item.namespace)) {
+    // RESERVED-NS-DIVERGE-01: `isReservedNamespace` applies the blanket
+    // underscore rule on its own, so no separate `startsWith("_")` is needed.
+    if (isReservedNamespace(item.namespace)) {
       continue;
     }
     locations.push({ namespace: item.namespace, key: item.key });
@@ -2195,12 +2201,13 @@ async function rekeyState(
   let decryptFailures = 0;
 
   for (const item of encryptedState.entries) {
-    // F6: reject ALL underscore-prefixed (internal) namespaces on import, not
-    // just the curated reserved list. Export only ever emits non-`_` namespaces
-    // (see discoverFilesystemStateNamespaces / exportEncryptedState), so any
-    // `_`-namespace in a bundle is crafted; the curated isReservedNamespace list
-    // could miss a newer internal `_`-namespace and let a bundle rekey into it.
-    if (item.namespace.startsWith("_") || isReservedNamespace(item.namespace)) {
+    // F6: reject ALL underscore-prefixed (internal) namespaces on import.
+    // Export only ever emits non-`_` namespaces (see
+    // discoverFilesystemStateNamespaces / exportEncryptedState), so any
+    // `_`-namespace in a bundle is crafted. RESERVED-NS-DIVERGE-01:
+    // `isReservedNamespace` applies the blanket underscore rule itself, so
+    // it can't miss a newer internal `_`-namespace the curated list lags.
+    if (isReservedNamespace(item.namespace)) {
       skipped++;
       continue;
     }

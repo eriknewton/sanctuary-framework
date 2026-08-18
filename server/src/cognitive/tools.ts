@@ -9,6 +9,8 @@ import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import {
   decodeExportBundleNamespaces,
+  isReservedNamespace,
+  RESERVED_NAMESPACE_PREFIXES,
   StateStore,
   StateVerificationError,
 } from "./state-store.js";
@@ -104,51 +106,24 @@ export class IdentityOverwriteRefusedError extends Error {
 }
 
 /**
- * Reserved namespace prefixes - used by internal subsystems.
- * Agent-facing state tools MUST reject reads, writes, deletes, lists, and
- * imports to these namespaces. Internal subsystems access the StateStore
- * directly, bypassing these tool-level checks.
- */
-const RESERVED_NAMESPACE_PREFIXES = [
-  "_identities",
-  "_policies",
-  "_audit",
-  "_meta",
-  "_principal",
-  "_commitments",
-  "_reputation",
-  "_escrow",
-  "_guarantees",
-  "_bridge",
-  "_federation",
-  "_handshake",
-  "_shr",
-  "_sovereignty_profile",
-  "_context_gate_policies",
-  "_fortress_mode",
-  "_facade",
-  "_file_grants",
-  "_castle_wall_observe",
-] as const;
-
-/**
  * Check whether a namespace is reserved for internal use.
  * Returns the matching reserved prefix, or null if the namespace is safe.
+ *
+ * RESERVED-NS-DIVERGE-01: `RESERVED_NAMESPACE_PREFIXES` and the membership
+ * rule both live in `state-store.ts` (`isReservedNamespace`); this function
+ * only adds the precise-label lookup that `isReservedNamespace`'s boolean
+ * return can't carry. A non-curated `_foo` is still reserved (falls through
+ * to returning the namespace itself) because `isReservedNamespace` applies
+ * the blanket underscore rule regardless of curation.
  */
 function getReservedNamespaceViolation(namespace: string): string | null {
-  // F6: ALL underscore-prefixed namespaces are reserved for internal subsystems;
-  // external callers must not write/read/list/delete them. The curated list below
-  // enumerates the known internal namespaces (used for a precise violation label),
-  // but the `_` prefix is the contract - a non-curated `_foo` is still reserved.
-  if (namespace.startsWith("_")) {
-    for (const prefix of RESERVED_NAMESPACE_PREFIXES) {
-      if (namespace === prefix || namespace.startsWith(prefix + "/")) {
-        return prefix;
-      }
+  if (!isReservedNamespace(namespace)) return null;
+  for (const prefix of RESERVED_NAMESPACE_PREFIXES) {
+    if (namespace === prefix || namespace.startsWith(prefix + "/")) {
+      return prefix;
     }
-    return namespace;
   }
-  return null;
+  return namespace;
 }
 
 function canonicalJson(value: unknown): string {

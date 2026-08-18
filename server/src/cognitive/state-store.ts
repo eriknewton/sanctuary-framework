@@ -260,8 +260,16 @@ export interface SignedStateEnvelope {
 /**
  * Reserved namespace prefixes - used by internal subsystems.
  * Imported bundles MUST NOT write to these namespaces.
+ *
+ * RESERVED-NS-DIVERGE-01: this is the single source of truth for the curated
+ * list. `cognitive/tools.ts` and `exit/bundle.ts` import it (and
+ * `isReservedNamespace`) rather than keeping their own copies, so the list
+ * cannot drift between call sites again. A structure test
+ * (`test/structure/reserved-namespace-single-source.test.ts`) fails the build if
+ * a second `RESERVED_NAMESPACE_PREFIXES`-shaped literal reappears anywhere in
+ * `server/src`.
  */
-const RESERVED_NAMESPACE_PREFIXES = [
+export const RESERVED_NAMESPACE_PREFIXES = [
   "_identities",
   "_policies",
   "_audit",
@@ -278,16 +286,24 @@ const RESERVED_NAMESPACE_PREFIXES = [
   "_sovereignty_profile",
   "_context_gate_policies",
   "_fortress_mode",
+  "_facade",
+  "_file_grants",
+  "_castle_wall_observe",
 ] as const;
 
 /**
  * Check whether a namespace is reserved (internal subsystem use only).
  * External callers MUST NOT read, write, list, or import these namespaces.
+ *
+ * RESERVED-NS-DIVERGE-01: the underscore prefix IS the contract, not the
+ * curated list above - this predicate must stay correct on its own so a
+ * caller who forgets to also spell `namespace.startsWith("_")` inline is
+ * still safe. `RESERVED_NAMESPACE_PREFIXES` exists only to give callers that
+ * want a precise label (see `tools.ts`'s `getReservedNamespaceViolation`)
+ * something to match against; it is never the boundary itself.
  */
 export function isReservedNamespace(namespace: string): boolean {
-  return RESERVED_NAMESPACE_PREFIXES.some(
-    (prefix) => namespace === prefix || namespace.startsWith(prefix + "/")
-  );
+  return namespace.startsWith("_");
 }
 
 /** On-disk format for an encrypted state entry */
@@ -2120,13 +2136,11 @@ export class StateStore {
 
     for (const [ns, entries] of Object.entries(data)) {
       // Namespace firewall: skip reserved namespaces during import.
-      // F6: reject ALL underscore-prefixed (internal) namespaces, not just the
-      // curated RESERVED_NAMESPACE_PREFIXES list. Export never emits a
-      // `_`-prefixed namespace, so any in a bundle is crafted; the curated list
-      // could miss a newer internal `_`-namespace and let a bundle write into it.
-      if (ns.startsWith("_") || RESERVED_NAMESPACE_PREFIXES.some(
-        (prefix) => ns === prefix || ns.startsWith(prefix + "/")
-      )) {
+      // RESERVED-NS-DIVERGE-01: `isReservedNamespace` applies the blanket
+      // underscore rule itself, so this check can't miss a newer internal
+      // `_`-namespace the curated list hasn't caught up with yet. Export
+      // never emits a `_`-prefixed namespace, so any in a bundle is crafted.
+      if (isReservedNamespace(ns)) {
         skippedKeys += entries.length;
         continue;
       }
