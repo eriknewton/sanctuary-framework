@@ -98,6 +98,15 @@ exemption_reason_for_test_file() {
 # A COPY is deliberately not paired: the copied path is genuinely new and its
 # marker renders as an added line in review, which is the reviewable artifact
 # this gate is asking for.
+#
+# BOUND (do not read the invariant above as total): pairing is only as good as
+# git's own similarity detection. A rename combined with a rewrite of roughly
+# half the file is not detected as a rename AT ANY `-M` threshold, so the moved
+# file reads as an addition and its inherited marker exempts the new path. What
+# keeps that honest rather than silent is the same fact that causes it: because
+# git cannot pair it either, review renders a delete plus an add and the marker
+# IS visible as added text. So the failure mode is a reviewer who does not look,
+# not a gate that hides the line.
 base_path_for_test_file() {
   local head_path="$1"
   local i=0
