@@ -40,12 +40,15 @@
  *      CLOSED shapes only. It does not exhibit what it fails to catch, and a
  *      reader must not take its extent for the closure's extent: the bound is
  *      stated in prose on the analyzer and resolves in the private register.
- *   3. SOUNDNESS. The walk is a static, checker-resolved UNDER-approximation.
- *      The full bound, including the measured call sites through injected
- *      function-typed dependencies that it does NOT resolve, is stated with its
- *      counting method on `read-tool-mutation-reachability.ts`. A green here
- *      means "no mutation is reachable along a statically resolvable path",
- *      never "no mutation is possible".
+ *   3. SOUNDNESS. The walk is a static, checker-resolved UNDER-approximation,
+ *      with one deliberate over-approximating exception: a function handed over
+ *      as a value counts as reached whether or not the receiving function
+ *      invokes it. The full bound, in both directions, including the measured
+ *      call sites through injected function-typed dependencies that it does NOT
+ *      resolve, is stated with its counting method on
+ *      `read-tool-mutation-reachability.ts`. A green here means "no mutation is
+ *      reachable along a statically resolvable path", never "no mutation is
+ *      possible", and a red means a path exists, not that it necessarily runs.
  *
  * WHY THE MECHANISM IS ASSERTED FIRST. Several assertions below check that the
  * analyzer still works at all — that the tables parsed non-empty, that every
@@ -63,6 +66,7 @@ import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 import {
+  admitDescent,
   analyzeReadToolMutationReachability,
   createCalleeResolver,
   sinksForTool,
@@ -1213,6 +1217,37 @@ describe("read-classified MCP tools and durable-state mutation", () => {
     // iterating would pass on the fixtures it never reached.
     expect(actual).toEqual(expected);
     expect(Object.keys(actual)).toHaveLength(LAUNDERING_FIXTURES.length);
+  });
+
+  it("a descent refused by the depth ceiling does not claim the memo", () => {
+    // PROOF OF CLOSURE for a reach regression that was real and is now closed,
+    // pinned because the shape is CLOSED: it exhibits nothing an attacker can
+    // spell, only the analyzer's own admission order.
+    //
+    // The walk memoizes each descent edge as `(body, caller frame, callee
+    // frame)` so a shared helper is not re-walked per route. When the memo was
+    // written BEFORE the depth ceiling was tested, a descent the ceiling
+    // refused still claimed its triple, and a later SHORTER route to the same
+    // pair was skipped as already-walked. The observable effect was a sink two
+    // hops from a handler going unreported because an unrelated deep traversal
+    // touched the same pair first: a cap that fails open locally silently
+    // blanking an unrelated shallow path.
+    //
+    // The ceiling is `MAX_CALL_DEPTH`, so a childDepth of `Number.MAX_SAFE_INTEGER`
+    // is refused under any value of it and this case never needs editing when
+    // the constant moves.
+    const walked = new Set<string>();
+    const key = "body|caller|callee";
+
+    // Refused by the ceiling: descends nothing, so it must learn nothing.
+    expect(admitDescent(walked, key, Number.MAX_SAFE_INTEGER)).toBe(false);
+    expect(walked.has(key)).toBe(false);
+
+    // The shorter route to the same pair is therefore still walked...
+    expect(admitDescent(walked, key, 1)).toBe(true);
+    // ...and only then is the triple claimed, so it is walked exactly once.
+    expect(admitDescent(walked, key, 1)).toBe(false);
+    expect([...walked]).toEqual([key]);
   });
 
   it("classifies the commitment-minting verbs together", () => {

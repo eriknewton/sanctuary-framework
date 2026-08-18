@@ -57,7 +57,27 @@
  * them; the test asserts only on mutations and subprocesses.
  *
  * SOUNDNESS BOUND, STATED SO THE CLAIM DOES NOT EXCEED THE REACH. This is a
- * static, checker-resolved call graph, and it is an UNDER-approximation:
+ * static, checker-resolved call graph. It is an UNDER-approximation of what a
+ * handler can reach, and, in ONE respect stated first because it is the newer
+ * direction and the easier one to be surprised by, an OVER-approximation:
+ *
+ *   - A FUNCTION HANDED OVER AS A VALUE IS TREATED AS REACHED, WHETHER OR NOT
+ *     THE CALLEE EVER INVOKES IT. Resolving a callable argument is what catches
+ *     a primitive that is passed rather than called, and deciding whether the
+ *     receiving function actually calls its parameter is a dataflow question
+ *     this analyzer does not answer. So `keep(execSync)`, for a `keep` that
+ *     drops its argument, is reported as reaching a subprocess and is a FALSE
+ *     POSITIVE by construction. That is the right side to err on for a
+ *     must-not-reach guard: an over-approximation costs a review of a hit that
+ *     turns out to be inert, and the reviewer has the code in front of them,
+ *     while an under-approximation costs a mutation that no one ever sees. The
+ *     failure that this whole file exists to prevent is absent reading as
+ *     passing, and a guard tuned to avoid false alarms is tuned toward exactly
+ *     that. No instance exists on the real tree today. When one appears, the
+ *     answer is to stop handing the primitive over, never to pin it: see the
+ *     residual-pin bullet below.
+ *
+ * Everything else below is the under-approximating half:
  *
  *   - A call made through a value the checker cannot resolve to a declaration
  *     (a dynamically indexed method, an `unknown`-typed dispatch) is not
@@ -144,14 +164,26 @@
  *     that put the target somewhere this resolver does not look remain, they
  *     resolve only in the private register under ABC-READCLASS-01, and no count
  *     is given: the count in this paragraph has been wrong at every previous
- *     revision, and a wrong count reads as an assurance.
+ *     revision, and a wrong count reads as an assurance. THE SAME RULE IS
+ *     APPLIED TO THE WALK-LEVEL BOUNDS FURTHER DOWN, so both halves of this
+ *     file's open surface are described the same way. An earlier revision made
+ *     this trade for the resolver and declined it for the walk, which was an
+ *     accident rather than a judgement; that they now match is a decision.
  *
  *     THE VALUE PATH INHERITS THE CALLEE PATH'S BOUND, stated because closing
  *     one is easily read as closing more than it does. An argument is resolved
  *     by exactly the same chokepoint as a callee, so it reaches what a callee
  *     reaches and stops where a callee stops. Where a target is hidden from
  *     that resolution, moving it into an argument position does not reveal it.
- *     That residue is the measured dataflow gap above, not a separate class.
+ *     That residue shares the MECHANISM of the measured dataflow gap above (a
+ *     declared type standing where a declaration would be, so there is nothing
+ *     with a body to resolve to), but THE 18-SITE COUNT DOES NOT BOUND IT: that
+ *     count's stated method admits only a property signature or a parameter,
+ *     and the value path's residue includes declarations the method excludes by
+ *     construction. Carrying the number across would be quoting a measurement
+ *     outside the class it measured, which is the same defect as a count with
+ *     no method. No count is given for the value path; the register entry under
+ *     ABC-READCLASS-01 carries the detail.
  *   - Traversal stops AT the storage and audit-log module boundaries: a call
  *     into one of those is classified (sink, append, or read-only) and its body
  *     is not walked, because the question this guard answers is which primitive
@@ -169,31 +201,41 @@
  *     caller. A SECOND call to the SAME primitive inside an ALREADY-pinned
  *     function reached from the SAME caller is not distinguished from the first
  *     one. Closing that needs a statement-level (line-numbered) pin, which
- *     would churn on every edit above it.
+ *     would churn on every edit above it. A COROLLARY THAT FOLLOWS FROM THAT
+ *     COARSENESS: a hit whose argument is never invoked must not be pinned as a
+ *     reviewed residual, however obviously inert it is. Pinning it blesses the
+ *     whole triple, after which a REAL call to that primitive from that
+ *     function through that caller passes silently — a false positive would
+ *     have been converted into a blind spot by the review itself. Remove the
+ *     handover instead.
  *   - `proxy/*` tools are named at runtime from an upstream catalog and are
  *     forced `write` at classification time, so they are outside this analysis.
- *   - INVOCATION THAT PRODUCES NO CALL NODE IS NOT FOLLOWED. The walk visits
- *     call, construction, and tagged-template expressions. JavaScript has other
- *     forms that run a function body without producing one of those, through
- *     property accessors and through protocol methods the language invokes on
- *     your behalf; none of them is followed. Read the laundering corpus's
- *     accessor fixtures narrowly because of this: they pin an accessor that
- *     HANDS BACK a function, which is a different thing from an accessor that
- *     performs the effect itself, and the corpus says nothing about the latter.
- *     Owned under ABC-READCLASS-01.
- *   - CLASS-INHERITANCE DISPATCH IS NOT FOLLOWED; only interface
- *     implementation is. The heritage index behind `implementationsOf`
- *     collects `extends` as well as `implements`, but the expansion fires only
- *     for interface members, so a bodyless member declared on an abstract base
- *     stops the walk at the base rather than reaching the subclass that
- *     implements it. Four abstract classes exist in `src` today. The fix is
- *     small and is deliberately not made in this change.
- *   - THE FOUR TRAVERSAL CAPS FAIL OPEN AND SILENTLY. Call depth, alias hops,
- *     cast hops, and reflective hops each stop on exhaustion with nothing
- *     recorded, so exhausting one is indistinguishable from finding nothing.
- *     This is the file's own exception to its thesis, which is why it is stated
- *     at the claim rather than left to a reader of the constants. Recording a
- *     truncation and asserting there are none is the fix; it is not built here.
+ *   - THE WALK IS NOT TOTAL OVER INVOCATION OR OVER DISPATCH, and this is the
+ *     bound rather than an oversight. It visits some invocation forms and not
+ *     others, and it follows some ways one declaration stands in for another
+ *     and not others, so a body can run without this analyzer reaching it. A
+ *     bounded number of syntactic and dataflow shapes remain open on both
+ *     counts. WHICH ONES IS NOT WRITTEN DOWN HERE, and neither is a count of
+ *     them: this file ships in a public repository, an open shape named in
+ *     prose is most of the way to a working evasion of a live guard, and a
+ *     count of open shapes reads as an assurance that the rest are closed. They
+ *     resolve in the private register under ABC-READCLASS-01. The corresponding
+ *     honesty obligation is discharged by stating plainly that the coverage is
+ *     partial, which is what this bullet does; softening it further would not
+ *     be permitted, and describing the shapes is not required to state it.
+ *     Read the laundering corpus narrowly for the same reason: a fixture there
+ *     pins exactly the shape it spells and nothing adjacent to it.
+ *   - THE FOUR TRAVERSAL CAPS FAIL OPEN, THOUGH NO LONGER SILENTLY BEYOND
+ *     THEMSELVES. Call depth, alias hops, cast hops, and reflective hops each
+ *     stop on exhaustion with nothing recorded, so exhausting one is
+ *     indistinguishable from finding nothing ALONG THAT PATH. It can no longer
+ *     do worse than that: a descent refused by the depth ceiling leaves the
+ *     walk's memo untouched (`admitDescent`), so exhaustion cannot suppress a
+ *     sink on a shorter, unrelated path that reaches the same pair. It could,
+ *     until this revision. This remains the file's own exception to its thesis,
+ *     which is why it is stated at the claim rather than left to a reader of
+ *     the constants. Recording a truncation and asserting there are none is the
+ *     remaining fix; it is not built here.
  *   - THE LAUNDERING CLOSURE HAS NO REAL-TREE WITNESS. With the expanded-set
  *     classification disabled, every real-tree assertion in the test still
  *     passes and only the synthetic corpus reds. The corpus is that closure's
@@ -1181,13 +1223,19 @@ export function createCalleeResolver(
    * named callback handed to a wrapper (an inline arrow was already walked as
    * part of the enclosing body; a named one was not).
    *
-   * The test is the argument's TYPE, not its spelling. An earlier draft of this
+   * The test is the argument's TYPE, not its spelling: an earlier draft
    * accepted only an identifier or a property access, which is an enumeration
-   * of spellings and therefore reopens one spelling out (`fns[0]`, a ternary, a
-   * call returning a function). A string, an object literal, or a number has no
-   * call signature and costs one type lookup to skip. A function LITERAL is
-   * excluded because it is already inside the enclosing body the walk is
-   * traversing, so resolving it here would only re-walk it.
+   * of spellings and reopens whichever one it forgot. A string, an object
+   * literal, or a number has no call signature and costs one type lookup to
+   * skip. A function LITERAL is excluded because it is already inside the
+   * enclosing body the walk is traversing, so resolving it here would only
+   * re-walk it.
+   *
+   * THIS SELECTS CANDIDATES; IT DOES NOT PROMISE THEY RESOLVE. Reaching the
+   * primitive behind a selected argument is the callee resolver's job and
+   * inherits its bound exactly, so an argument whose type is callable can still
+   * resolve to nothing. Read no coverage claim into the selection test, and see
+   * the value-path bound in the header for the residue.
    */
   function functionValuedArguments(args: readonly ts.Expression[]): ts.Expression[] {
     const out: ts.Expression[] = [];
@@ -1301,6 +1349,47 @@ export function createCalleeResolver(
   return {
     resolve: (callee, callSiteName, args) => resolveAt(callee, callSiteName, args, 0),
   };
+}
+
+/**
+ * Admission for ONE descent edge of the call-graph walk, and the single place
+ * the depth ceiling and the per-edge memo are decided together.
+ *
+ * THE ORDER IS THE WHOLE POINT: the ceiling is tested BEFORE the memo is
+ * written, because a descent the ceiling refuses entered nothing and therefore
+ * knows nothing about that `(body, caller frame, callee frame)` triple. An
+ * earlier revision inserted the key first and let `walk` discover the ceiling
+ * after the call, so a truncated descent CLAIMED the triple: any later route to
+ * the same pair — including a two-hop route straight from the handler — was
+ * then skipped as already-walked, and a sink that the walk would otherwise have
+ * found went unreported. That turns a cap which fails open locally into one
+ * that suppresses results on unrelated shorter paths, which is the failure this
+ * whole file exists to prevent. Pinned by "a descent refused by the depth
+ * ceiling does not claim the memo" in the test file.
+ *
+ * Both descent sites in `sinksFor` (the `callPrimitive` dispatch and the
+ * ordinary callee/value descent) go through here rather than repeating the
+ * two-step, so the sites cannot drift apart.
+ *
+ * Refusing without memoizing cannot loop: a refusal recurses nowhere, and the
+ * walk terminates on the finite triple space that the memo enumerates.
+ *
+ * @param childDepth depth the callee WOULD be walked at, i.e. the caller's
+ *                   depth plus one.
+ * @returns whether to descend. Writes the memo only when it returns true.
+ */
+export function admitDescent(
+  walked: Set<string>,
+  key: string,
+  childDepth: number
+): boolean {
+  // Truncation leaves the memo untouched: nothing was entered, so nothing is
+  // known. Exhausting the ceiling still fails open for THIS path (see the
+  // bound stated in the header); it must not also blank another one.
+  if (childDepth > MAX_CALL_DEPTH) return false;
+  if (walked.has(key)) return false;
+  walked.add(key);
+  return true;
 }
 
 function buildAnalyzer(): Analyzer {
@@ -1538,6 +1627,10 @@ function buildAnalyzer(): Analyzer {
     const walked = new Set<string>();
 
     const walk = (node: ts.Node, chain: string[], frames: string[], depth: number): void => {
+      // Backstop only: every descent edge is admitted by `admitDescent`, which
+      // is the authoritative ceiling test. Kept so a future descent site that
+      // forgets the admission gate still stops rather than recursing forever,
+      // and the two must not diverge — both read `MAX_CALL_DEPTH`.
       if (depth > MAX_CALL_DEPTH) return;
       const currentFrame = frames[frames.length - 1];
       const callerFrame = frames[frames.length - 2];
@@ -1608,8 +1701,7 @@ function buildAnalyzer(): Analyzer {
                   targetHandler.node.getSourceFile().fileName
                 )}`;
                 const key = `${targetHandler.node.pos}|${currentFrame ?? ""}|${frame}`;
-                if (!walked.has(key)) {
-                  walked.add(key);
+                if (admitDescent(walked, key, depth + 1)) {
                   walk(
                     targetHandler.node,
                     [...chain, `callPrimitive("${target}")@${locate(current)}`],
@@ -1639,8 +1731,7 @@ function buildAnalyzer(): Analyzer {
             if (body === undefined) continue;
             const frame = declarationFrame(decl);
             const key = `${body.pos}|${currentFrame ?? ""}|${frame}`;
-            if (walked.has(key)) continue;
-            walked.add(key);
+            if (!admitDescent(walked, key, depth + 1)) continue;
             walk(
               body,
               [...chain, `${memberName ?? "?"}@${locate(decl)}`],
