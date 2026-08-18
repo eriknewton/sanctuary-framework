@@ -43,6 +43,7 @@
     "sdw_import",
     "sovereignty_profile_update",
     "state_delete",
+    "state_disclose_unattributed",
     "state_export",
     "state_import",
     "unwrap"

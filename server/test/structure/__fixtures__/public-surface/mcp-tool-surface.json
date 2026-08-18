@@ -2237,6 +2237,24 @@
     }
   },
   {
+    "name": "state_disclose_unattributed",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "namespace": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "namespace",
+        "key"
+      ]
+    }
+  },
+  {
     "name": "state_export",
     "inputSchema": {
       "type": "object",

@@ -28,6 +28,7 @@ import {
   NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS,
   NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS,
   NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS,
+  NON_RELAXABLE_STATE_DISCLOSURE_TIER1_OPERATIONS,
 } from "./loader.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import { InjectionDetector, type DetectionResult } from "../security/injection-detector.js";
@@ -57,7 +58,8 @@ export type ProxyTierResolver = (toolName: string) => (1 | 2 | 3) | null;
 // Runtime-classifier non-relaxable Tier-1 set. `memory_delete` plus the
 // operator-cloud cloud-custody operations, the Governed File-Grant v1 mint
 // operation, and the Castle Wall Observe / Learn Allow-List v1 promote
-// operation, all spread from the SINGLE SOURCE OF TRUTH in loader.ts so
+// operation, and the operator unattributed-disclosure surface, all spread from
+// the SINGLE SOURCE OF TRUTH in loader.ts so
 // this list and the loader's FORCED_TIER1_OPERATIONS cannot drift apart
 // (Operator Cloud Slice 2 MED-1; a drift guard test pins the relationship).
 // classifyRiskTier checks this list first, so even a policy file that lists
@@ -70,6 +72,7 @@ const FORCED_TIER1_OPERATIONS = [
   ...NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS,
   ...NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS,
   ...NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS,
+  ...NON_RELAXABLE_STATE_DISCLOSURE_TIER1_OPERATIONS,
 ] as const;
 
 /**

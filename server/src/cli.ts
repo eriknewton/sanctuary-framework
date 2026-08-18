@@ -361,6 +361,14 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "state_disclose_unattributed") {
+    const { runStateDiscloseUnattributedCommand } = await import(
+      "./cli/state-disclose.js"
+    );
+    const code = await runStateDiscloseUnattributedCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "license") {
     const { runLicenseCommand } = await import("./cli/license.js");
     const code = await runLicenseCommand({ argv: args.slice(1) });
@@ -965,6 +973,8 @@ Usage:
   sanctuary memory_ingest [opts]          # Mirror harness memory into SDW
   sanctuary memory_emit [opts]            # Emit harness memory from SDW
   sanctuary memory_archive_export [opts]  # Export one SDW archive through Exit V2
+  sanctuary state_disclose_unattributed [opts]
+                                          # Tier-1: disclose one entry whose writer cannot be established
   sanctuary memory_archive_import [opts]  # Import one SDW archive through Exit V2
   sanctuary memory_transcode [opts]       # Project memory into another harness format
   sanctuary memory_transcode_restore [opts] # Restore an exact transcode source archive

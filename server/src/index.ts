@@ -1982,6 +1982,15 @@ const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([
   "shr_gateway_export",
   "shr_generate",
   "state_delete",
+  // Classified `write`, not `read`, and the conservative direction is the
+  // deliberate one. It reads no more than `state_read` does, but membership in
+  // the read table is what lets a tool run while the audit chain reports
+  // integrity findings, and a Tier-1 hole in the verification guard is the last
+  // operation that should keep running against a fortress whose own record of
+  // what happened is in doubt. It also appends a critical audit record, which
+  // is the only trace of the disclosure. Classifying it `write` costs an
+  // operator nothing on a healthy fortress and fails closed on a sick one.
+  "state_disclose_unattributed",
   "state_export",
   "state_import",
   "state_write",

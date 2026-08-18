@@ -1,5 +1,5 @@
 {
-  "tool_count": 101,
+  "tool_count": 102,
   "tools": [
     {
       "name": "identity_create",
@@ -184,6 +184,24 @@
           "verify_integrity": {
             "type": "boolean",
             "default": true
+          }
+        },
+        "required": [
+          "namespace",
+          "key"
+        ]
+      }
+    },
+    {
+      "name": "state_disclose_unattributed",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "namespace": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
           }
         },
         "required": [

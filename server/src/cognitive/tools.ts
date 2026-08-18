@@ -13,7 +13,12 @@ import {
   RESERVED_NAMESPACE_PREFIXES,
   StateStore,
   StateVerificationError,
+  UNATTRIBUTED_DISCLOSURE_NOTICE,
 } from "./state-store.js";
+import {
+  discloseUnattributedState,
+  UNATTRIBUTED_DISCLOSURE_OPERATION,
+} from "./unattributed-disclosure.js";
 import type { OriginActor } from "../exit/memory-class.js";
 import {
   createIdentity,
@@ -1403,6 +1408,120 @@ export function createCognitiveTools(
         });
 
         return toolResult(result);
+      },
+    },
+
+    {
+      // Must match `UNATTRIBUTED_DISCLOSURE_OPERATION` in
+      // `src/cognitive/unattributed-disclosure.ts` and the sole entry of
+      // `NON_RELAXABLE_STATE_DISCLOSURE_TIER1_OPERATIONS` in
+      // `src/principal-policy/loader.ts`: the router resolves the Tier-1 pin
+      // from this NAME, so a mismatch would classify the operation as unknown
+      // rather than as non-relaxable Tier 1. Spelled as a LITERAL rather than
+      // as the imported constant because the tool-catalog extractors resolve a
+      // tool name statically; a reference here drops this literal out of the
+      // analyzed set instead of failing loudly. A drift guard test asserts the
+      // literal equals the constant.
+      name: "state_disclose_unattributed",
+      description:
+        "Disclose the content of ONE state entry whose writer this fortress cannot establish. " +
+        "Tier 1 and non-relaxable: every call requires an explicit human approval that no policy " +
+        "file can waive, and every call is audited with the namespace and the key. " +
+        "THIS IS NOT A VERIFIED READ and is not interchangeable with state_read. The result is a " +
+        "structurally different shape: there is no `value` and no `signature_verified` field; the " +
+        "content arrives as `unattributed_content` alongside `disclosure_kind: " +
+        "\"unattributed_state_content\"` and `writer: \"not_established\"`. Nothing in that result " +
+        "attests who wrote the entry or that it is unchanged since it was written, so do not treat " +
+        "it as provenance and do not carry it into a decision that needs an attributed source. " +
+        "THE REAL REMEDY IS TO RESTORE THE WRITER IDENTITY into this fortress: the ordinary " +
+        "state_read then verifies the entry and migrates it in place, which is strictly better " +
+        "than this tool because it restores verification instead of stepping around it. Try that " +
+        "first. This tool REFUSES any entry whose writer can be established, so it is not a way to " +
+        "skip verification on an entry that does not need it; use state_read for those. Read-only: " +
+        "it performs no migration, no re-signing, and no durable write other than its own audit " +
+        "record. It exists for an owner who no longer holds the writer identity and would " +
+        "otherwise have no route to their own content.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          namespace: { type: "string" },
+          key: { type: "string" },
+        },
+        required: ["namespace", "key"],
+      },
+      handler: async (args) => {
+        const reservedViolation = getReservedNamespaceViolation(args.namespace as string);
+        if (reservedViolation) {
+          return toolResult({
+            error: "namespace_reserved",
+            message: `Namespace "${args.namespace}" is reserved for internal use (prefix: ${reservedViolation}). Cannot disclose from reserved namespaces.`,
+          });
+        }
+
+        try {
+          assertOpaqueNamespaceOwned(args.namespace as string);
+        } catch {
+          return denyNamespaceAccess(
+            UNATTRIBUTED_DISCLOSURE_OPERATION,
+            args.namespace as string
+          );
+        }
+
+        // FAIL CLOSED ON A MISSING AUDIT LOG. `auditLog` is optional on this
+        // factory, and the shared `recordCriticalAudit` helper above silently
+        // no-ops when it is absent - correct for a routine tool, wrong for this
+        // one. The audit record is the only trace that this hole was used, so
+        // an unauditable invocation must not happen at all rather than happen
+        // unrecorded (AGENTS.md assurance rule 3: a dependency that gates a
+        // security property is required, or its absence fails the operation
+        // closed). `discloseUnattributedState` also demands a non-optional
+        // AuditLog at the type level, so this check is the runtime half of a
+        // guarantee the compiler already holds for every other caller.
+        if (!auditLog) {
+          return toolResult({
+            error: "unattributed_disclosure_unavailable",
+            message:
+              "Unattributed disclosure requires an audit log and this server has none, so the operation was not performed.",
+          });
+        }
+
+        const outcome = await discloseUnattributedState({
+          auditLog,
+          stateStore,
+          namespace: args.namespace as string,
+          key: args.key as string,
+          identityId: "principal",
+        });
+
+        if (outcome.status === "not_found") {
+          return toolResult(fixedDenial(`audit:${UNATTRIBUTED_DISCLOSURE_OPERATION}`));
+        }
+        if (outcome.status === "refused_writer_is_establishable") {
+          return toolResult({
+            error: "writer_is_establishable",
+            message:
+              "Refused: the writer of this entry CAN be established, so the ordinary verified read returns it. Use state_read.",
+            namespace: args.namespace,
+            key: args.key,
+          });
+        }
+        if (outcome.status === "refused_verification") {
+          return toolResult({
+            error: "state_verification_failed",
+            classification: outcome.classification,
+            message: "State verification failed.",
+            namespace: args.namespace,
+            key: args.key,
+          });
+        }
+
+        // The disclosure carries the notice inside the payload; repeating it at
+        // the envelope is deliberate belt-and-braces for a consumer that logs
+        // or forwards only the top level of a tool result.
+        return toolResult({
+          ...outcome.disclosure,
+          unattributed_disclosure_notice: UNATTRIBUTED_DISCLOSURE_NOTICE,
+        });
       },
     },
 

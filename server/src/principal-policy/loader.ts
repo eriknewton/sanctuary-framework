@@ -179,6 +179,46 @@ export const NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS = [
   "memory_archive_import",
 ] as const;
 
+/**
+ * Operator unattributed-disclosure surface (STATE-DISCLOSE-UNATTRIB-01):
+ * `state_disclose_unattributed` hands an operator the plaintext of an entry
+ * whose writer the fortress could not establish. It is a deliberate, narrow
+ * hole in the enforcing read path, opened so an owner who no longer holds the
+ * writer identity can still reach their own content, and it must ALWAYS require
+ * an explicit human approval.
+ *
+ * A SIBLING NON-RELAXABLE SET, NOT A `DEFAULT_POLICY` ENTRY, AND THE DIFFERENCE
+ * IS THE WHOLE REQUIREMENT. `tier1_always_approve` in `DEFAULT_POLICY` is a
+ * DEFAULT: a hand-authored `principal-policy.yaml` may drop an entry from it or
+ * list the same operation under `tier3_always_allow`, and the operation then
+ * runs with no approval at all. That is the downgradable list. This set is
+ * force-pinned instead: `validatePolicy` adds every member to Tier 1 and prunes
+ * it out of Tier 3 at load time, `enforceForcedTiers` re-applies that on the
+ * policy-MUTATION path so an activated English-policy draft cannot drop it, and
+ * `gate.ts`'s runtime mirror classifies it Tier 1 even against a policy object
+ * that was never routed through either. There is no spelling of a policy file
+ * that relaxes it. The precedent is
+ * `NON_RELAXABLE_FILE_GRANT_TIER1_OPERATIONS` above, which exists because the
+ * downgradable-list version of exactly this decision was the file-grant build
+ * spec's named must-fix. `state_disclose_unattributed` is also enrolled in
+ * `DEFAULT_POLICY.tier1_always_approve` below, which is presentation (a freshly
+ * generated policy reads honestly), not enforcement; the enforcement is here.
+ * Spread into the SAME two force-lists as the sets above so the loader and the
+ * runtime classifier cannot drift apart; a drift guard test pins the
+ * relationship (mirrors `test/principal-policy/operator-cloud-tier1.test.ts`).
+ *
+ * The ordinary `state_read` is deliberately NOT here: it stays Tier-3
+ * auto-allow. Verified reads are the routine path this surface exists to avoid
+ * displacing, and pinning them to an approval would push operators toward the
+ * hole instead of away from it.
+ *
+ * Must match `UNATTRIBUTED_DISCLOSURE_OPERATION` in
+ * `src/cognitive/unattributed-disclosure.ts`.
+ */
+export const NON_RELAXABLE_STATE_DISCLOSURE_TIER1_OPERATIONS = [
+  "state_disclose_unattributed",
+] as const;
+
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
   "principal_policy_view",
@@ -195,6 +235,7 @@ const FORCED_TIER1_OPERATIONS = [
   ...NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS,
   ...NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS,
   ...NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS,
+  ...NON_RELAXABLE_STATE_DISCLOSURE_TIER1_OPERATIONS,
 ] as const;
 
 /**
@@ -581,6 +622,11 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     // NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS so a hand-authored policy
     // cannot relax it out of Tier 1.
     "memory_checkpoint_restore",
+    // Operator unattributed-disclosure surface: discloses the content of an
+    // entry whose writer could not be established. ALSO force-pinned via
+    // NON_RELAXABLE_STATE_DISCLOSURE_TIER1_OPERATIONS, which is what makes it
+    // non-relaxable; this entry only keeps a generated policy file honest.
+    "state_disclose_unattributed",
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [

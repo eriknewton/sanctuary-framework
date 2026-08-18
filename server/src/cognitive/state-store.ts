@@ -127,7 +127,14 @@ export type StateVerificationClassification =
   // path when verification was REQUESTED and finished without establishing a
   // writer. A caller that treats them as the same value loses the one
   // distinction that tells it a migration, not a repair, is the remedy.
-  | "writer_unverified";
+  | "writer_unverified"
+  // "the writer COULD be established, so this caller asked the wrong path".
+  // Raised only by the operator disclosure surface, which serves exactly the
+  // entries the enforcing read refuses and refuses everything else, so it can
+  // never become a way to skip verification on an entry that does not need it.
+  // Distinct from every value above because nothing failed: this is a refusal
+  // to bypass a control that would have succeeded.
+  | "writer_is_establishable";
 
 export class StateVerificationError extends Error {
   readonly classification: StateVerificationClassification;
@@ -442,6 +449,78 @@ export interface ReadResult {
   written_at: string;
   written_by: string;
   warnings?: LegacyEnvelopeWarningInfo[];
+}
+
+/**
+ * The exact sentence an unattributed disclosure carries at every layer. Single
+ * source so the MCP tool description, the returned shape, and the CLI banner
+ * cannot drift into three different strengths of the same warning; a drift
+ * guard test pins that all three carry it. Written as an operator-facing
+ * CAPABILITY BOUND, never as a defect description (AGENTS.md MUST-NEVER #9):
+ * it states what this content is not, and what the real remedy is.
+ */
+export const UNATTRIBUTED_DISCLOSURE_NOTICE =
+  "UNATTRIBUTED CONTENT. The writer of this entry could not be established, " +
+  "so nothing here attests who wrote it or that it is unchanged since it was " +
+  "written. It is not a verified read and must not be treated as one. The real " +
+  "remedy is to restore the writer identity into this fortress, after which the " +
+  "ordinary read verifies the entry and migrates it in place. This surface " +
+  "exists for an owner who no longer holds that identity and would otherwise " +
+  "have no route to their own content.";
+
+/**
+ * Result of an operator-approved unattributed disclosure.
+ *
+ * STRUCTURALLY DISTINCT FROM `ReadResult`, AND THAT IS THE WHOLE POINT. The
+ * alternative design was `ReadResult` with a flag attached, which is the shape
+ * this store just finished removing: a flag that one consumer inspected and
+ * every other one dropped is indistinguishable from no flag at all, so the safe
+ * outcome depended on every future caller remembering it. The type system, not
+ * a convention, has to be what separates unverified content from verified
+ * content.
+ *
+ * The separation is enforced in BOTH directions, so neither type is assignable
+ * to the other and no cast-free mix-up is possible:
+ *
+ *   - this type has no `value`, no `signature_verified`, no `written_by`, and
+ *     no `merkle_proof`, all of which `ReadResult` REQUIRES, so an
+ *     `UnattributedStateDisclosure` can never be passed where a `ReadResult` is
+ *     expected;
+ *   - this type REQUIRES `disclosure_kind` and `writer`, which `ReadResult`
+ *     does not have, so a `ReadResult` can never be passed where an
+ *     `UnattributedStateDisclosure` is expected.
+ *
+ * `writer` is a single-inhabitant literal rather than a boolean on purpose:
+ * there is no `true` spelling of it to drift to, and no consumer can flip it.
+ * A test pins the mutual non-assignability; if a later change adds `value` here
+ * or `disclosure_kind` there, that pin is what reds.
+ */
+export interface UnattributedStateDisclosure {
+  /** Literal discriminant. `ReadResult` carries no such field. */
+  readonly disclosure_kind: "unattributed_state_content";
+  readonly namespace: string;
+  readonly key: string;
+  /**
+   * Deliberately NOT named `value`. A consumer that reaches for `.value` on
+   * this object gets a compile error rather than plaintext, which is the
+   * difference between a type that separates the two outcomes and a comment
+   * that asks a reader to.
+   */
+  readonly unattributed_content: string;
+  readonly version: number;
+  /**
+   * Deliberately NOT named `written_at`: this timestamp is the entry's own
+   * unauthenticated claim, and on this path nothing establishes who made it.
+   * Absent when the stored entry carries no such claim.
+   */
+  readonly claimed_written_at?: string;
+  /**
+   * Single-inhabitant literal, never a boolean. The one thing this surface
+   * knows about the writer is that it could not be established.
+   */
+  readonly writer: "not_established";
+  /** `UNATTRIBUTED_DISCLOSURE_NOTICE`, carried in the payload itself. */
+  readonly notice: string;
 }
 
 /** Options for state write */
@@ -1532,7 +1611,10 @@ export class StateStore {
    * fortress whose writer identity is absent from `_identities`, those entries
    * stop reading here until that identity is restored; `list`, `export`, and
    * `delete` do not route through this method and are unaffected. Use
-   * `readUnverified` for a migration flow that must reach the plaintext first.
+   * `readUnverified` for an in-process migration flow that must reach the
+   * plaintext first, and `readUnattributed` for the operator-gated, audited
+   * surface that discloses such an entry in a shape no consumer can mistake for
+   * a verified one.
    *
    * @param namespace - Logical grouping
    * @param key - State key
@@ -1574,17 +1656,21 @@ export class StateStore {
    * false`), so the refusal there does not fire; that asymmetry is the whole
    * point of this method and must survive any change to `readInternal`.
    *
-   * HONEST BOUND: "the only way" describes this class, not a shipped surface.
-   * This method has no production caller today, no CLI verb and no MCP tool
-   * reaches it, and export followed by import does not restore that plaintext
-   * either, because import re-verifies and skips an entry whose writer key it
-   * cannot resolve. An operator who has lost the writer identity therefore has
-   * no shipped route to the content of an affected entry. Giving this method
-   * an operator-gated, audited caller is the open item; until then the
-   * compatibility story rests on a capability with no production call path
-   * (AGENTS.md assurance rule 9). Kept in step with the ASSURANCE_MATRIX.md
-   * row "State envelope integrity / default verify-on-read", which states the
-   * same bound.
+   * HONEST BOUND, NARROWED BUT NOT REMOVED (STATE-DISCLOSE-UNATTRIB-01): "the
+   * only way" describes this class, not this method. THIS method still has no
+   * production caller: no CLI verb and no MCP tool reaches it, so on its own it
+   * remains a capability with no production call path (AGENTS.md assurance rule
+   * 9), and it stays here for an in-process migration flow. What changed is the
+   * CLASS. `readUnattributed` below is the operator-gated, audited, Tier-1
+   * surface that reaches the same plaintext, and it IS wired to both a CLI verb
+   * and an MCP tool, so an operator who has lost the writer identity now has a
+   * shipped route to their content. It is not the same capability: it refuses
+   * an entry whose writer can be established, it performs no durable side
+   * effect, and it returns a structurally distinct shape rather than this
+   * method's `ReadResult`. Export followed by import still does not close the
+   * loop, because import re-verifies and skips an entry whose writer key it
+   * cannot resolve. Kept in step with the ASSURANCE_MATRIX.md row "State
+   * envelope integrity / default verify-on-read", which states the same bound.
    */
   async readUnverified(
     namespace: string,
@@ -1596,6 +1682,79 @@ export class StateStore {
       verifySignature: false,
       enforceRollback: false,
     });
+  }
+
+  /**
+   * OPERATOR DISCLOSURE SURFACE: return the content of an entry whose writer
+   * cannot be established, in a shape that cannot be mistaken for a verified
+   * read. This is the shipped route for the one person `readUnverified` was
+   * never reachable by: an owner who NO LONGER HOLDS the writer identity, and
+   * for whom no import, export, or migration restores the content.
+   *
+   * IT IS NOT A GENERAL BYPASS, and the refusal below is what makes that true
+   * rather than merely intended. When verification SUCCEEDS - that is, when the
+   * ordinary `read` would have returned this entry - this method refuses with
+   * `writer_is_establishable` instead of disclosing. An operator who still holds
+   * the writer identity is steered to the ordinary read, which is strictly
+   * better than this surface because it RESTORES verification instead of
+   * stepping around it and migrates the entry in place. So the set of entries
+   * this method will serve is exactly the set the enforcing read refuses, and
+   * the two sets can never overlap. Without that refusal the surface would be a
+   * verification-optional read for every entry in the fortress, reachable by
+   * anyone who can obtain one Tier-1 approval, which is a different capability
+   * from the one the owner asked for.
+   *
+   * READ ONLY, ENFORCED BY THE OPTION AND NOT BY CARE. `unattributedDisclosure`
+   * forces `durableSideEffectsPermitted` false in `readInternal` regardless of
+   * the verification outcome, so the legacy-schema migration, the re-sign, and
+   * the version-anchor RAISE are all unreachable from here. The anchor CHECK
+   * still runs, and still wins: an entry that is both unattributable and below
+   * its persisted floor is reported as the rollback it is, never disclosed. The
+   * only write this operation performs is its own audit record, which its
+   * callers make, not this method.
+   *
+   * The approval gate is NOT applied here. It is applied at each transport - the
+   * router classifies the MCP tool Tier 1 from the non-relaxable set, and the
+   * CLI evaluates the same operation name against the same set - because those
+   * are the two places an operator actually is. See
+   * `NON_RELAXABLE_STATE_DISCLOSURE_TIER1_OPERATIONS` in
+   * `src/principal-policy/loader.ts`.
+   */
+  async readUnattributed(
+    namespace: string,
+    key: string,
+    verifyIntegrity = true
+  ): Promise<UnattributedStateDisclosure | null> {
+    // The internal result is a `ReadResult` carrying `signature_verified:
+    // false`, which is precisely the shape this change exists to keep out of
+    // consumers' hands. It is converted below and never returned; that
+    // conversion is the boundary, so nothing between here and the callers ever
+    // holds the flagged shape.
+    const internal = await this.readInternal(namespace, key, {
+      verifyIntegrity,
+      verifySignature: true,
+      enforceRollback: true,
+      unattributedDisclosure: true,
+    });
+    if (!internal) return null;
+
+    if (internal.signature_verified) {
+      throw new StateVerificationError(
+        "writer_is_establishable",
+        `Refusing to disclose ${namespace}/${key} without attribution: its writer CAN be established, so the ordinary verified read returns it and this surface does not apply`
+      );
+    }
+
+    return {
+      disclosure_kind: "unattributed_state_content",
+      namespace,
+      key,
+      unattributed_content: internal.value,
+      version: internal.version,
+      ...(internal.written_at ? { claimed_written_at: internal.written_at } : {}),
+      writer: "not_established",
+      notice: UNATTRIBUTED_DISCLOSURE_NOTICE,
+    };
   }
 
   private validateSignedEnvelope(
@@ -1869,6 +2028,14 @@ export class StateStore {
       verifySignature: boolean;
       enforceRollback: boolean;
       signerPublicKey?: Uint8Array;
+      /**
+       * Operator disclosure mode (`readUnattributed`). Two effects, both
+       * narrowing: durable side effects are withheld even when verification
+       * succeeds, and the refusal below RETURNS instead of throwing so the
+       * caller can convert the result into a structurally distinct shape.
+       * Absent on every other path, so the enforcing read is byte-identical.
+       */
+      unattributedDisclosure?: boolean;
     }
   ): Promise<ReadResult | null> {
     const raw = await this.storage.read(namespace, key);
@@ -1961,7 +2128,17 @@ export class StateStore {
     // returned at all, but only when verification was requested: the
     // `readUnverified` escape hatch passes `verifySignature: false`, so it
     // reaches the return with this predicate false, by design.
-    const durableSideEffectsPermitted = signatureVerified;
+    //
+    // The operator disclosure surface withholds the durable half outright, on
+    // top of this predicate rather than instead of it: that surface exists to
+    // let an owner READ content it cannot attribute, and a read that also
+    // rewrote the entry (or raised its anchor) would be a repair the operator
+    // did not ask for and cannot undo. Combining the two here, at the one
+    // predicate every durable effect below already gates on, is what makes the
+    // "no write but the audit entry" claim structural rather than a review
+    // note: a durable effect added later inherits both halves.
+    const durableSideEffectsPermitted =
+      signatureVerified && options.unattributedDisclosure !== true;
 
     // Decrypt
     const namespaceKey = this.getNamespaceKey(namespace);
@@ -2096,15 +2273,32 @@ export class StateStore {
     // `readUnverified` remains the in-process escape hatch for a migration flow
     // that must reach the plaintext first, and is deliberately not exposed
     // through MCP.
-    if (options.verifySignature && !signatureVerified) {
+    //
+    // THE ONE EXIT FROM THIS REFUSAL is the operator disclosure surface, which
+    // does not skip verification (it runs above, and its outcome is what the
+    // surface reports) and does not receive this shape: `readUnattributed`
+    // converts the result into `UnattributedStateDisclosure` before any caller
+    // sees it, so no `signature_verified: false` `ReadResult` escapes this
+    // class on that path either. Conditioning on the option rather than on the
+    // caller keeps the enforcing read's behavior unchanged for everyone else.
+    if (
+      options.verifySignature &&
+      !signatureVerified &&
+      options.unattributedDisclosure !== true
+    ) {
       throw new StateVerificationError(
         "writer_unverified",
         `Writer could not be established for ${namespace}/${key}: the enforcing read path returns a value only when signature verification succeeds`
       );
     }
 
-    // Update version cache
-    this.versionCache.set(vk, stateEntry.ver);
+    // Update version cache. Withheld in disclosure mode for the same reason the
+    // durable anchor RAISE is: the version of an entry this read could not
+    // attribute must not become the floor a later read is measured against,
+    // and a disclosure must leave the fortress exactly as it found it.
+    if (options.unattributedDisclosure !== true) {
+      this.versionCache.set(vk, stateEntry.ver);
+    }
 
     return {
       key,

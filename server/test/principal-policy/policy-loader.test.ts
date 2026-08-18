@@ -69,6 +69,7 @@ approval_channel:
         "memory_checkpoint_restore",
         "memory_archive_export",
         "memory_archive_import",
+        "state_disclose_unattributed",
       ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("approve");
       expect(policy.tier2_anomaly.new_counterparty).toBe("log");
@@ -252,6 +253,7 @@ approval_channel:
         "memory_checkpoint_restore",
         "memory_archive_export",
         "memory_archive_import",
+        "state_disclose_unattributed",
       ]);
     });
 
@@ -285,6 +287,7 @@ approval_channel:
         "memory_checkpoint_restore",
         "memory_archive_export",
         "memory_archive_import",
+        "state_disclose_unattributed",
       ]);
       // Tier 2 should have defaults
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(5);
@@ -331,6 +334,7 @@ approval_channel:
         "memory_checkpoint_restore",
         "memory_archive_export",
         "memory_archive_import",
+        "state_disclose_unattributed",
       ]);
       expect(policy.tier2_anomaly.new_namespace_access).toBe("log");
       expect(policy.tier2_anomaly.frequency_spike_multiplier).toBe(8);
