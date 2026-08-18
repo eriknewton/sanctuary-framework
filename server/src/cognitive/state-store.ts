@@ -320,11 +320,35 @@ export const RESERVED_NAMESPACE_PREFIXES = [
  * curated list above - this predicate must stay correct on its own so a
  * caller who forgets to also spell `namespace.startsWith("_")` inline is
  * still safe. `RESERVED_NAMESPACE_PREFIXES` exists only to give callers that
- * want a precise label (see `tools.ts`'s `getReservedNamespaceViolation`)
+ * want a precise label (see `getReservedNamespaceViolation` directly below)
  * something to match against; it is never the boundary itself.
  */
 export function isReservedNamespace(namespace: string): boolean {
   return namespace.startsWith("_");
+}
+
+/**
+ * Reserved-namespace check that also reports WHICH curated prefix matched.
+ * Returns the matching reserved prefix, or null if the namespace is safe.
+ *
+ * RESERVED-NS-DIVERGE-01: this lives beside `RESERVED_NAMESPACE_PREFIXES` and
+ * `isReservedNamespace` rather than in a consumer, because it is the same
+ * contract wearing a different return type, and a label lookup that drifts from
+ * the predicate it labels is the divergence that register id names. It adds
+ * only the precise-label lookup that `isReservedNamespace`'s boolean return
+ * cannot carry; the boundary is still the predicate. A non-curated `_foo` is
+ * still reserved (it falls through to returning the namespace itself) because
+ * `isReservedNamespace` applies the blanket underscore rule regardless of
+ * curation.
+ */
+export function getReservedNamespaceViolation(namespace: string): string | null {
+  if (!isReservedNamespace(namespace)) return null;
+  for (const prefix of RESERVED_NAMESPACE_PREFIXES) {
+    if (namespace === prefix || namespace.startsWith(prefix + "/")) {
+      return prefix;
+    }
+  }
+  return namespace;
 }
 
 /** On-disk format for an encrypted state entry */
@@ -492,8 +516,30 @@ export const UNATTRIBUTED_DISCLOSURE_NOTICE =
  *
  * `writer` is a single-inhabitant literal rather than a boolean on purpose:
  * there is no `true` spelling of it to drift to, and no consumer can flip it.
- * A test pins the mutual non-assignability; if a later change adds `value` here
- * or `disclosure_kind` there, that pin is what reds.
+ *
+ * TWO DIFFERENT PROPERTIES, TWO DIFFERENT PINS, AND THE SECOND ONE IS THE
+ * SECURITY ARGUMENT. Mutual NON-ASSIGNABILITY and "this type carries no
+ * `value`" are not the same statement, and pinning only the first leaves the
+ * second protected by nothing:
+ *
+ *   - non-assignability is pinned by the paired `@ts-expect-error` directives
+ *     in `test/cognitive/state-disclose-unattributed.test.ts`. On its own that
+ *     pin is SATISFIED BY THE OTHER MISSING FIELDS. An adversarial gate on this
+ *     change added `readonly value: string` here and populated it, and added
+ *     `readonly value?: string` here and did not, and BOTH kept
+ *     `npm run typecheck` green: the type still lacked `signature_verified`,
+ *     `merkle_proof` and `integrity_verified`, so it was still non-assignable
+ *     to `ReadResult` and the directives stayed "used";
+ *   - the ABSENCE of the verified-read spellings is pinned by
+ *     `DisclosureWithoutVerifiedReadFields` directly below, which
+ *     `readUnattributed` constructs through. That alias collapses to `never`
+ *     the moment any of those key names appears on this interface - required or
+ *     optional, populated or not - so the construction site stops compiling.
+ *     It is checked by `tsc --noEmit` over `src`, which is a hard failure,
+ *     rather than by the tests/scripts diagnostic baseline.
+ *
+ * A runtime key assertion is kept as well, but it is the weaker half: an
+ * optional, unpopulated widening walks straight past it.
  */
 export interface UnattributedStateDisclosure {
   /** Literal discriminant. `ReadResult` carries no such field. */
@@ -515,6 +561,21 @@ export interface UnattributedStateDisclosure {
    */
   readonly claimed_written_at?: string;
   /**
+   * The entry's own unauthenticated writer-id claim (its `kid`), carried so the
+   * remedy every layer of this surface advertises - restore the writer identity
+   * into this fortress - names an identity the owner can actually act on.
+   * Without it the instruction has no handle: the disclosure omits the attested
+   * `written_by` by design and `StateStore.list` carries no key id, so an owner
+   * following the advice had nothing to look up.
+   *
+   * Deliberately NOT named `written_by`, and spelled with the same `claimed_`
+   * discipline as `claimed_written_at`: NOTHING ON THIS PATH ESTABLISHED IT.
+   * It is a string copied out of bytes whose signature did not verify, so an
+   * attacker who can write the entry chooses it. Treat it as a lead to check,
+   * never as attribution. Absent when the stored entry carries no such claim.
+   */
+  readonly claimed_writer_id?: string;
+  /**
    * Single-inhabitant literal, never a boolean. The one thing this surface
    * knows about the writer is that it could not be established.
    */
@@ -522,6 +583,40 @@ export interface UnattributedStateDisclosure {
   /** `UNATTRIBUTED_DISCLOSURE_NOTICE`, carried in the payload itself. */
   readonly notice: string;
 }
+
+/**
+ * The field NAMES a verified read owns, which this disclosure must never carry
+ * under any spelling. `value` is the one the security argument rests on; the
+ * rest are the trust-bearing fields whose presence would let a consumer read a
+ * reassuring answer off an unverified object.
+ */
+type VerifiedReadFieldSpelling =
+  | "value"
+  | "signature_verified"
+  | "integrity_verified"
+  | "written_by"
+  | "merkle_proof"
+  | "warnings";
+
+/**
+ * `UnattributedStateDisclosure` if it carries none of those spellings, and
+ * `never` if it carries any one of them.
+ *
+ * THIS IS THE PIN, and it is load-bearing rather than decorative because
+ * `readUnattributed` builds its result THROUGH this alias. Add `value` to the
+ * interface above - required or optional, populated or not - and this alias
+ * becomes `never`, so the object literal in `readUnattributed` is no longer
+ * assignable and `npm run typecheck` fails on `src`. `keyof` sees optional keys
+ * too, which is exactly the widening a runtime `Object.keys` assertion misses.
+ *
+ * Adding a NEW honest field (a further `claimed_*`, say) is unaffected: only
+ * these six names collapse it.
+ */
+type DisclosureWithoutVerifiedReadFields = [
+  Extract<keyof UnattributedStateDisclosure, VerifiedReadFieldSpelling>,
+] extends [never]
+  ? UnattributedStateDisclosure
+  : never;
 
 /** Options for state write */
 export interface WriteOptions {
@@ -1745,16 +1840,29 @@ export class StateStore {
       );
     }
 
-    return {
+    // ANNOTATED WITH THE PIN, NOT WITH THE INTERFACE. The annotation is what
+    // makes `DisclosureWithoutVerifiedReadFields` load-bearing: if a later
+    // change adds `value` (or any other verified-read spelling) to
+    // `UnattributedStateDisclosure`, that alias resolves to `never` and this
+    // assignment stops compiling. Returning the literal directly, or annotating
+    // it with the interface, would leave the absence of `value` protected only
+    // by a runtime key assertion that an optional field walks past.
+    const disclosure: DisclosureWithoutVerifiedReadFields = {
       disclosure_kind: "unattributed_state_content",
       namespace,
       key,
       unattributed_content: internal.value,
       version: internal.version,
       ...(internal.written_at ? { claimed_written_at: internal.written_at } : {}),
+      // The entry's own `kid`, unverified by construction: this path exists
+      // precisely because no key resolved for it. It is carried so the
+      // advertised remedy names something, and named `claimed_` so it cannot be
+      // read as attribution.
+      ...(internal.written_by ? { claimed_writer_id: internal.written_by } : {}),
       writer: "not_established",
       notice: UNATTRIBUTED_DISCLOSURE_NOTICE,
     };
+    return disclosure;
   }
 
   private validateSignedEnvelope(
@@ -2293,9 +2401,27 @@ export class StateStore {
     }
 
     // Update version cache. Withheld in disclosure mode for the same reason the
-    // durable anchor RAISE is: the version of an entry this read could not
-    // attribute must not become the floor a later read is measured against,
-    // and a disclosure must leave the fortress exactly as it found it.
+    // durable anchor RAISE is: a version this read could not attribute should
+    // not be what a later read is measured against.
+    //
+    // WHAT THIS GUARD DOES NOT DO, stated because an earlier version of this
+    // comment claimed it did. It does NOT make a disclosure leave the fortress
+    // exactly as it found it, and it does NOT keep an unattributable version
+    // out of `versionCache`. `readUnattributed` passes `verifyIntegrity: true`,
+    // so `getNamespaceHashes` runs earlier in this same read and seeds the
+    // cache from RAW on-disk versions for every key in the namespace, this one
+    // included, before control reaches this line. A disclosure therefore can
+    // and does set the in-memory floor: disclose an entry, roll it back on
+    // disk, disclose again, and the second call reports `rollback_detected`.
+    //
+    // That is the separate, still-open residual STATE-CACHE-FLOOR-01, written
+    // out identically at the refusal block roughly 200 lines above; this change
+    // neither widens nor narrows it. What this placement buys is narrower and
+    // real: it avoids ADDING a second cache write from a value this read
+    // declined to attribute, so the disclosure path contributes nothing the
+    // enforcing read would not have contributed anyway. The DURABLE half - the
+    // anchor RAISE, the migration, the re-sign - is genuinely withheld, and
+    // that is the "no write but the audit record" claim.
     if (options.unattributedDisclosure !== true) {
       this.versionCache.set(vk, stateEntry.ver);
     }

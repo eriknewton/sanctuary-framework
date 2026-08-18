@@ -20,7 +20,12 @@
  *     exit code, is what distinguishes a real gate from one that prints first
  *     and reports later;
  *   - the subcommand is registered, so shell completion and the dispatcher
- *     agree the verb exists.
+ *     agree the verb exists;
+ *   - NAMESPACE PARITY: the namespace firewall is part of the shared
+ *     operation, not part of one transport, so this verb refuses exactly the
+ *     namespaces the MCP tool refuses. Asserted here on the APPROVED path,
+ *     because a refusal that only holds when the operator says no is not the
+ *     property being claimed.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -47,6 +52,7 @@ import { runInit as runInitRaw, type InitOptions } from "../../src/wrap/init.js"
 import type { ExecResult } from "../../src/wrap/passphrase.js";
 
 const NAMESPACE = "memories";
+const RESERVED_NAMESPACE = "_reputation";
 const KEY = "orphaned";
 const CONTENT = "the-owner-must-still-reach-this-through-the-cli";
 
@@ -228,6 +234,12 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     expect(channel.calls).toBe(1);
     expect(out.text).toContain(CONTENT);
     expect(out.text).toContain("writer:    not_established");
+    // The identity to restore is named, and named as UNVERIFIED at the point of
+    // display rather than only in the field name: the advertised remedy has to
+    // be actionable, and it has to stay un-mistakable for attribution.
+    expect(out.text).toContain(
+      "claimed writer id (UNVERIFIED, from the entry itself): sanctuary-no-such-writer-identity"
+    );
     // Labelled at BOTH ends: one occurrence would be satisfied by a banner an
     // operator scrolls past.
     expect(out.text.split(UNATTRIBUTED_DISCLOSURE_NOTICE).length - 1).toBe(2);
@@ -247,6 +259,91 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
       key: KEY,
     });
     masterKey.fill(0);
+  });
+
+  it("refuses a reserved namespace, the refusal the MCP tool also makes", async () => {
+    // The same fixture as the happy path, planted in a reserved namespace and
+    // driven through the same verb, so the only variable is the namespace.
+    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      storagePathHint: fortressPath,
+    });
+    const plaintext = stringToBytes(CONTENT);
+    const entry: StateEntry = {
+      v: 1,
+      payload: encrypt(
+        plaintext,
+        deriveNamespaceKey(masterKey, RESERVED_NAMESPACE)
+      ),
+      ver: 1,
+      sig: toBase64url(new Uint8Array(64)),
+      kid: "sanctuary-no-such-writer-identity",
+      integrity_hash: hashToString(plaintext),
+      metadata: { written_at: "2026-08-18T00:00:08.000Z" },
+    };
+    await storage.write(
+      RESERVED_NAMESPACE,
+      KEY,
+      stringToBytes(JSON.stringify(entry))
+    );
+    masterKey.fill(0);
+
+    const out = new StringWritable();
+    const err = new StringWritable();
+    // APPROVED, deliberately. A denial would pass this test for the wrong
+    // reason; the namespace refusal has to hold on the path where the operator
+    // said yes.
+    const channel = new FixedChannel("approve");
+
+    const code = await runStateDiscloseUnattributedCommand({
+      argv: [
+        "--fortress",
+        fortressPath,
+        "--namespace",
+        RESERVED_NAMESPACE,
+        "--key",
+        KEY,
+      ],
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      approvalChannel: channel,
+    });
+
+    expect(code).not.toBe(0);
+    expect(out.text).not.toContain(CONTENT);
+    expect(err.text).toContain("reserved");
+  });
+
+  it("refuses an opaque memory handle, which this process can never own", async () => {
+    // A CLI process holds no agent session, so it owns no `mem_*` handle. The
+    // shared operation is handed a fresh empty registry and no binding, which
+    // refuses rather than treating "no session" as "nothing to check".
+    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const channel = new FixedChannel("approve");
+
+    const code = await runStateDiscloseUnattributedCommand({
+      argv: [
+        "--fortress",
+        fortressPath,
+        "--namespace",
+        "mem_0123456789abcdef0123456789abcdef",
+        "--key",
+        KEY,
+      ],
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      approvalChannel: channel,
+    });
+
+    expect(code).not.toBe(0);
+    expect(out.text).not.toContain(CONTENT);
+    expect(err.text).toContain("not available");
   });
 
   it("discloses nothing when the Tier-1 approval is refused", async () => {

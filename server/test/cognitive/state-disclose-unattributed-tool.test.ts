@@ -100,7 +100,7 @@ async function makeRig(options?: { withAuditLog?: boolean }) {
       )
     )
   );
-  const { tools } = createCognitiveTools(
+  const { tools, namespaceRegistry } = createCognitiveTools(
     stateStore,
     storage,
     MASTER_KEY,
@@ -110,7 +110,16 @@ async function makeRig(options?: { withAuditLog?: boolean }) {
   const tool = tools.find(
     (candidate) => candidate.name === UNATTRIBUTED_DISCLOSURE_OPERATION
   );
-  return { storage, stateStore, auditLog, identity, identityEncKey, tools, tool };
+  return {
+    storage,
+    stateStore,
+    auditLog,
+    identity,
+    identityEncKey,
+    tools,
+    tool,
+    namespaceRegistry,
+  };
 }
 
 async function plantUnattributableLegacyEntry(
@@ -190,6 +199,62 @@ describe("the unattributed-disclosure MCP tool", () => {
     );
     expect(payload.error).toBe("writer_is_establishable");
     expect(payload).not.toHaveProperty("unattributed_content");
+  });
+
+  it("points an agent at WHICH identity to restore, and labels it a claim", async () => {
+    // The description tells an agent the remedy is to restore the writer
+    // identity; the result has to name one, or the instruction is not
+    // actionable through this surface.
+    const { storage, tool } = await makeRig();
+    await plantUnattributableLegacyEntry(storage, "orphaned", "tool-content");
+
+    const payload = parseToolResult(
+      await tool!.handler({ namespace: NAMESPACE, key: "orphaned" })
+    );
+    expect(payload.claimed_writer_id).toBe("sanctuary-no-such-writer-identity");
+    // Under the `claimed_` spelling only: the attested name stays absent, so a
+    // consumer cannot read this as attribution.
+    expect(payload).not.toHaveProperty("written_by");
+    expect(tool!.description!).toContain("claimed_writer_id");
+  });
+
+  it("refuses a reserved namespace, the refusal the CLI verb also makes", async () => {
+    // TRANSPORT PARITY. The check lives in the shared operation, so this
+    // asserts the tool RENDERS it; the CLI half of the same property is in
+    // test/cli/state-disclose-unattributed-cli.test.ts, and the shared-path
+    // half is in test/cognitive/state-disclose-unattributed.test.ts.
+    const { tool } = await makeRig();
+    const payload = parseToolResult(
+      await tool!.handler({ namespace: "_reputation", key: "anything" })
+    );
+    expect(payload.error).toBe("namespace_reserved");
+    expect(payload).not.toHaveProperty("unattributed_content");
+  });
+
+  it("refuses an opaque memory handle owned by another session", async () => {
+    const { tool, namespaceRegistry, auditLog } = await makeRig();
+    const someoneElsesHandle =
+      namespaceRegistry.issueMemoryHandle("another-identity");
+
+    const payload = parseToolResult(
+      await tool!.handler({ namespace: someoneElsesHandle, key: "anything" })
+    );
+    expect(payload).not.toHaveProperty("unattributed_content");
+    // The GENERIC denial, not a specific one: which of "not yours" or "no
+    // session" it was is not something the caller is told, so the denial leaks
+    // no structure about the fortress.
+    expect(payload.denied).toBe(true);
+    expect(payload.audit_ref).toBe(`audit:${UNATTRIBUTED_DISCLOSURE_OPERATION}`);
+
+    // And the denial is on the record, written by the shared operation rather
+    // than by this transport.
+    const denials = await auditLog!.query({
+      operation_type: UNATTRIBUTED_DISCLOSURE_OPERATION,
+    });
+    expect(denials.entries).toHaveLength(1);
+    expect(denials.entries[0]!.details).toMatchObject({
+      denial_class: "namespace_unavailable",
+    });
   });
 
   it("fails closed when the server has no audit log, rather than disclosing unrecorded", async () => {

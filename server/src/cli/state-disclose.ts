@@ -17,9 +17,10 @@
  * failure mode if this were the other way round is invisible from the outside -
  * the command succeeds, the operator sees output, and nobody approved anything.
  *
- * The disclosure itself, and its audit record, are performed by the shared
- * `discloseUnattributedState` so this file and the MCP tool cannot implement
- * the obligation two different ways.
+ * The disclosure itself, its namespace firewall and its audit record are all
+ * performed by the shared `discloseUnattributedState` so this file and the MCP
+ * tool cannot implement the obligation two different ways. This file renders
+ * refusals; it does not decide them.
  */
 
 import { mkdir } from "node:fs/promises";
@@ -36,6 +37,7 @@ import {
   UNATTRIBUTED_DISCLOSURE_OPERATION,
 } from "../cognitive/unattributed-disclosure.js";
 import { IdentityManager } from "../cognitive/tools.js";
+import { OpaqueNamespaceRegistry } from "../agent-native/safety-base.js";
 import { loadConfig } from "../config.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
@@ -217,6 +219,13 @@ export async function runStateDiscloseUnattributedCommand(
     const outcome = await discloseUnattributedState({
       auditLog,
       stateStore,
+      // A FRESH, EMPTY REGISTRY AND NO SESSION BINDING, on purpose. An opaque
+      // `mem_*` handle is issued to a live agent session inside a running MCP
+      // server; this process is the operator's own out-of-band presence and
+      // holds no such session, so it owns no handle and every `mem_*` namespace
+      // refuses here. Fail-closed, and the same code path the MCP tool takes
+      // rather than a CLI-shaped approximation of it.
+      namespaceRegistry: new OpaqueNamespaceRegistry(),
       namespace,
       key,
       identityId: primary.identity_id,
@@ -225,6 +234,19 @@ export async function runStateDiscloseUnattributedCommand(
         : {}),
     });
 
+    if (outcome.status === "refused_namespace_reserved") {
+      write(
+        err,
+        `Refused: namespace "${namespace}" is reserved for internal use ` +
+          `(prefix: ${outcome.reservedPrefix}). This surface does not disclose\n` +
+          "from reserved namespaces.\n",
+      );
+      return 1;
+    }
+    if (outcome.status === "refused_namespace_unavailable") {
+      write(err, `Refused: namespace "${namespace}" is not available here.\n`);
+      return 1;
+    }
     if (outcome.status === "not_found") {
       write(err, `Not found: ${namespace}/${key}\n`);
       return 1;
@@ -261,6 +283,16 @@ export async function runStateDiscloseUnattributedCommand(
       write(
         out,
         `claimed_written_at: ${disclosure.claimed_written_at ?? "(none recorded)"}\n`,
+      );
+      // The identity to restore, printed so the remedy this command advertises
+      // on every path names something the operator can act on. Labelled
+      // UNVERIFIED at the point of display, not only in the field name: this
+      // string comes out of an entry whose signature did not verify, so whoever
+      // wrote the entry chose it. It is a lead to check, never attribution.
+      write(
+        out,
+        "claimed writer id (UNVERIFIED, from the entry itself): " +
+          `${disclosure.claimed_writer_id ?? "(none recorded)"}\n`,
       );
       write(out, "\n--- unattributed content ---\n");
       write(out, `${disclosure.unattributed_content}\n`);

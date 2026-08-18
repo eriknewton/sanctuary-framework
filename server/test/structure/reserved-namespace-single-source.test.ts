@@ -196,7 +196,11 @@ describe("DEFINITION_PATTERN: widened shape coverage", () => {
 
 // --- Tool-layer classification parity -------------------------------------
 //
-// getReservedNamespaceViolation (cognitive/tools.ts) is internal, so its
+// getReservedNamespaceViolation now lives beside the list it labels, in
+// cognitive/state-store.ts (it moved out of cognitive/tools.ts when a second
+// consumer, cognitive/unattributed-disclosure.ts, needed the same label
+// lookup; a second copy would have reopened this very divergence class). It
+// carries no separate list of its own, so its
 // classification is exercised the same way test/file-grant/
 // reserved-namespace-firewall.test.ts already exercises `_file_grants`: via
 // the agent-facing state_* MCP tool handlers. This proves the tools-layer

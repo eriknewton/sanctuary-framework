@@ -21,13 +21,19 @@
  *   - it performs no durable side effect: the stored bytes and the version
  *     anchor record are compared byte-for-byte across the call;
  *   - it REFUSES an entry whose writer can be established, so it can never be
- *     used to skip verification on an entry that does not need it.
+ *     used to skip verification on an entry that does not need it, and it
+ *     performs no durable side effect on THAT path either;
+ *   - the namespace firewall is part of the shared operation rather than part
+ *     of one transport, so both transports refuse the same namespaces;
+ *   - it carries the entry's own unverified writer-id claim, so the remedy it
+ *     advertises names something an owner can act on.
  */
 import { describe, expect, it } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 import { encrypt } from "../../src/core/encryption.js";
 import {
   bytesToString,
+  fromBase64url,
   stringToBytes,
   toBase64url,
 } from "../../src/core/encoding.js";
@@ -52,6 +58,7 @@ import {
   discloseUnattributedState,
   UNATTRIBUTED_DISCLOSURE_OPERATION,
 } from "../../src/cognitive/unattributed-disclosure.js";
+import { OpaqueNamespaceRegistry } from "../../src/agent-native/safety-base.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import {
@@ -161,6 +168,54 @@ async function plantUnattributableLegacyEntry(args: {
   );
 }
 
+/**
+ * Plant a legacy (schema-1) entry whose writer IS establishable: `kid` names a
+ * stored identity and the signature over the CIPHERTEXT verifies under it.
+ *
+ * This is the fixture the read-only conjunct needs. On the DISCLOSED path
+ * `signatureVerified` is always false, so `&& options.unattributedDisclosure
+ * !== true` is redundant there and every test built on an unattributable entry
+ * passes with the conjunct deleted. It is load-bearing only HERE, on the
+ * refusal path: `readUnattributed` throws `writer_is_establishable` only AFTER
+ * `readInternal` has returned, so without the conjunct this entry gets migrated
+ * to schema 2 on disk and its anchor raised by a call that then discloses
+ * nothing.
+ *
+ * The signature is made with `ed25519.sign` over `fromBase64url(payload.ct)`,
+ * which is the exact preimage a v1 signature binds; `core/identity.sign` signs
+ * a different preimage and would not verify here.
+ */
+async function plantAttributableLegacyEntry(args: {
+  storage: MemoryStorage;
+  identityId: string;
+  namespace: string;
+  key: string;
+  value: string;
+  version: number;
+}): Promise<void> {
+  const plaintext = stringToBytes(args.value);
+  const payload = encrypt(
+    plaintext,
+    deriveNamespaceKey(MASTER_KEY, args.namespace)
+  );
+  const entry: StateEntry = {
+    v: 1,
+    payload,
+    ver: args.version,
+    sig: toBase64url(
+      ed25519.sign(fromBase64url(payload.ct), WRITER_PRIVATE_KEY)
+    ),
+    kid: args.identityId,
+    integrity_hash: hashToString(plaintext),
+    metadata: { written_at: "2026-08-18T00:00:07.000Z" },
+  };
+  await args.storage.write(
+    args.namespace,
+    args.key,
+    stringToBytes(JSON.stringify(entry))
+  );
+}
+
 /** A policy that tries as hard as a policy file can to make this auto-allow. */
 const hostilePolicy = (operation: string): PrincipalPolicy => ({
   version: 1,
@@ -248,12 +303,19 @@ describe("the operator unattributed-disclosure surface", () => {
       "orphaned"
     ))!;
 
-    // COMPILE-TIME HALF. These two `@ts-expect-error` directives are the actual
-    // assertion: each FAILS THE TYPECHECK if the error disappears, so a later
-    // change that adds `value` to the disclosure (or `disclosure_kind` to the
-    // read result) cannot make the two interchangeable without reddening
-    // `npm run typecheck`. A runtime-only key comparison would not catch a
-    // widening that keeps the current keys and adds one.
+    // COMPILE-TIME HALF, PROPERTY ONE: MUTUAL NON-ASSIGNABILITY. Each
+    // `@ts-expect-error` FAILS THE TYPECHECK if its error disappears, so the
+    // two types cannot become interchangeable silently.
+    //
+    // READ THE BOUND ON THIS PAIR BEFORE TRUSTING IT, because an adversarial
+    // gate on this change disproved the stronger reading. These directives do
+    // NOT pin "the disclosure has no `value`". They are satisfied by ANY
+    // remaining difference, and there are four; the gate added `readonly value:
+    // string` here and populated it, and added `readonly value?: string` here
+    // and did not, and BOTH kept `npm run typecheck` green, because the type
+    // still lacked `signature_verified` / `merkle_proof` / `integrity_verified`
+    // and so stayed non-assignable with the directives still "used". Property
+    // two is pinned separately, directly below.
     // @ts-expect-error a disclosure is not assignable to a verified ReadResult
     const notARead: ReadResult = disclosure;
     // @ts-expect-error a verified ReadResult is not assignable to a disclosure
@@ -261,10 +323,35 @@ describe("the operator unattributed-disclosure surface", () => {
     expect(notARead).toBeDefined();
     expect(notADisclosure).toBeDefined();
 
-    // RUNTIME HALF. The value-bearing and trust-bearing field NAMES do not
-    // overlap, so a consumer that reaches for the verified spelling gets
-    // `undefined` rather than plaintext, and one that reads the disclosure
-    // cannot find a boolean to misread.
+    // COMPILE-TIME HALF, PROPERTY TWO: THE VERIFIED SPELLINGS ARE ABSENT. This
+    // is the property the security argument actually rests on, and it is a
+    // different statement from non-assignability. `keyof` sees OPTIONAL keys,
+    // so `readonly value?: string` collapses this alias to `never` and the
+    // `true` below stops compiling - which is precisely the widening the
+    // runtime `Object.keys` check underneath walks straight past.
+    //
+    // The primary pin for this property is in `src`, not here:
+    // `DisclosureWithoutVerifiedReadFields` in `cognitive/state-store.ts` is
+    // the type `readUnattributed` constructs through, so the mutation reds
+    // under `tsc --noEmit` over `src`. This copy is the second line of defence
+    // and documents the property at the point a reader looks for it.
+    type ForbiddenSpelling = Extract<
+      keyof UnattributedStateDisclosure,
+      | "value"
+      | "signature_verified"
+      | "integrity_verified"
+      | "written_by"
+      | "merkle_proof"
+    >;
+    type CarriesNoVerifiedReadField = [ForbiddenSpelling] extends [never]
+      ? true
+      : never;
+    const carriesNoVerifiedReadField: CarriesNoVerifiedReadField = true;
+    expect(carriesNoVerifiedReadField).toBe(true);
+
+    // RUNTIME HALF, kept because it catches a POPULATED widening at the value
+    // level, but it is the weaker of the two: it cannot see an optional field
+    // that is declared and never set.
     expect(Object.keys(verified)).toContain("value");
     expect(Object.keys(verified)).toContain("signature_verified");
     expect(Object.keys(disclosure)).not.toContain("value");
@@ -320,6 +407,7 @@ describe("the operator unattributed-disclosure surface", () => {
     const outcome = await discloseUnattributedState({
       auditLog,
       stateStore,
+      namespaceRegistry: new OpaqueNamespaceRegistry(),
       namespace: NAMESPACE,
       key: "orphaned",
       identityId: "principal",
@@ -350,6 +438,7 @@ describe("the operator unattributed-disclosure surface", () => {
     const outcome = await discloseUnattributedState({
       auditLog,
       stateStore,
+      namespaceRegistry: new OpaqueNamespaceRegistry(),
       namespace: NAMESPACE,
       key: "attributable",
       identityId: "principal",
@@ -446,6 +535,187 @@ describe("the operator unattributed-disclosure surface", () => {
   it("returns null for an entry that does not exist", async () => {
     const { stateStore } = await makeRig();
     expect(await stateStore.readUnattributed(NAMESPACE, "absent")).toBeNull();
+  });
+
+  it("performs no durable side effect on the REFUSAL path either", async () => {
+    // THE TEST FOR THE READ-ONLY CONJUNCT. Every other durability test in this
+    // file uses an UNATTRIBUTABLE entry, where `signatureVerified` is false and
+    // `&& options.unattributedDisclosure !== true` therefore changes nothing:
+    // an adversarial gate deleted that conjunct and all of them stayed green.
+    // This entry's writer CAN be established, so `readInternal` reaches its
+    // durable half with verification succeeding, and only the conjunct stops
+    // the migration and the anchor raise. The call still refuses - which is the
+    // point: a call that discloses nothing must also REPAIR nothing.
+    const { storage, stateStore, identity, identityEncKey } = await makeRig();
+
+    // A neighbouring verified write establishes a real anchor record, so
+    // "the anchor is unchanged" is a comparison against something.
+    await stateStore.write(
+      NAMESPACE,
+      "neighbour",
+      "anchored",
+      identity.identity_id,
+      identity.encrypted_private_key,
+      identityEncKey
+    );
+    await plantAttributableLegacyEntry({
+      storage,
+      identityId: identity.identity_id,
+      namespace: NAMESPACE,
+      key: "legacy-attributable",
+      value: "must-not-be-migrated-by-a-call-that-refuses",
+      version: 1,
+    });
+
+    const bytesBefore = bytesToString(
+      (await storage.read(NAMESPACE, "legacy-attributable"))!
+    );
+    const anchorsBefore = bytesToString(
+      (await storage.read(ANCHORS_NAMESPACE, ANCHORS_KEY))!
+    );
+
+    await expect(
+      stateStore.readUnattributed(NAMESPACE, "legacy-attributable")
+    ).rejects.toMatchObject({ classification: "writer_is_establishable" });
+
+    const bytesAfter = bytesToString(
+      (await storage.read(NAMESPACE, "legacy-attributable"))!
+    );
+    // The schema version is the loudest discriminator (a migration rewrites the
+    // entry as a schema-2 signed envelope), and the byte comparison catches a
+    // re-sign that preserved it.
+    expect((JSON.parse(bytesAfter) as StateEntry).v).toBe(1);
+    expect(bytesAfter).toBe(bytesBefore);
+    expect(
+      bytesToString((await storage.read(ANCHORS_NAMESPACE, ANCHORS_KEY))!)
+    ).toBe(anchorsBefore);
+  });
+
+  it("names the identity to restore, as a claim and never as attribution", async () => {
+    // The remedy every layer of this surface advertises is "restore the writer
+    // identity". Without this field nothing tells the owner WHICH one: the
+    // disclosure omits the attested `written_by` by design and `list` carries
+    // no key id, so the instruction had no handle to act on.
+    const { storage, stateStore } = await makeRig();
+    await plantUnattributableLegacyEntry({
+      storage,
+      namespace: NAMESPACE,
+      key: "orphaned",
+      value: "content",
+      version: 1,
+    });
+
+    const disclosure = (await stateStore.readUnattributed(
+      NAMESPACE,
+      "orphaned"
+    ))!;
+    expect(disclosure.claimed_writer_id).toBe(
+      "sanctuary-no-such-writer-identity"
+    );
+    // Spelled `claimed_`, like `claimed_written_at`, and NOT under the attested
+    // spelling: nothing on this path established it, so a consumer reaching for
+    // the verified name must still find nothing.
+    expect(Object.keys(disclosure)).not.toContain("written_by");
+    expect(Object.keys(disclosure)).toContain("claimed_writer_id");
+  });
+
+  it("audits a miss as a miss, not as a disclosure", async () => {
+    // The pre-read record is appended BEFORE the read (that ordering is the
+    // contract), so on its own a missing key leaves a log entry byte-identical
+    // in shape to a disclosure that actually handed content to an operator.
+    const { stateStore, auditLog } = await makeRig();
+
+    const outcome = await discloseUnattributedState({
+      auditLog,
+      stateStore,
+      namespaceRegistry: new OpaqueNamespaceRegistry(),
+      namespace: NAMESPACE,
+      key: "absent",
+      identityId: "principal",
+    });
+    expect(outcome.status).toBe("not_found");
+
+    const refused = await auditLog.query({
+      operation_type: "state_disclose_unattributed_refused",
+    });
+    expect(refused.entries).toHaveLength(1);
+    expect(refused.entries[0]!.details).toMatchObject({
+      namespace: NAMESPACE,
+      key: "absent",
+      classification: "not_found",
+    });
+  });
+});
+
+describe("the namespace firewall belongs to the operation, not to one transport", () => {
+  // Both checks are transport-independent, so they live in the shared
+  // operation rather than in either caller: that is the only place a transport
+  // cannot skip one by forgetting it. These assert the checks THERE; the
+  // transport-level tests assert that each caller renders the refusal.
+
+  it("refuses a reserved namespace, before it audits and before it reads", async () => {
+    const { stateStore, auditLog } = await makeRig();
+
+    const outcome = await discloseUnattributedState({
+      auditLog,
+      stateStore,
+      namespaceRegistry: new OpaqueNamespaceRegistry(),
+      namespace: "_reputation",
+      key: "anything",
+      identityId: "principal",
+    });
+    expect(outcome.status).toBe("refused_namespace_reserved");
+    expect(
+      (outcome as { reservedPrefix?: string }).reservedPrefix
+    ).toBe("_reputation");
+
+    // No `success` record for a call that was never a disclosure attempt
+    // against a servable namespace.
+    const audit = await auditLog.query({
+      operation_type: UNATTRIBUTED_DISCLOSURE_OPERATION,
+    });
+    expect(audit.entries).toHaveLength(0);
+  });
+
+  it("refuses an uncurated underscore namespace too, on the blanket rule", async () => {
+    const { stateStore, auditLog } = await makeRig();
+    const outcome = await discloseUnattributedState({
+      auditLog,
+      stateStore,
+      namespaceRegistry: new OpaqueNamespaceRegistry(),
+      namespace: "_not_on_the_curated_list",
+      key: "anything",
+      identityId: "principal",
+    });
+    expect(outcome.status).toBe("refused_namespace_reserved");
+  });
+
+  it("refuses an opaque memory handle this caller does not own, and audits the denial", async () => {
+    const { stateStore, auditLog } = await makeRig();
+    const registry = new OpaqueNamespaceRegistry();
+    const someoneElsesHandle = registry.issueMemoryHandle("another-identity");
+
+    // No session binding: there is no live session to own the handle with, so
+    // the assertion fails closed rather than treating "no session" as "no
+    // owner to check against".
+    const outcome = await discloseUnattributedState({
+      auditLog,
+      stateStore,
+      namespaceRegistry: registry,
+      namespace: someoneElsesHandle,
+      key: "anything",
+      identityId: "principal",
+    });
+    expect(outcome.status).toBe("refused_namespace_unavailable");
+
+    const audit = await auditLog.query({
+      operation_type: UNATTRIBUTED_DISCLOSURE_OPERATION,
+    });
+    expect(audit.entries).toHaveLength(1);
+    expect(audit.entries[0]!.result).toBe("failure");
+    expect(audit.entries[0]!.details).toMatchObject({
+      denial_class: "namespace_unavailable",
+    });
   });
 });
 
