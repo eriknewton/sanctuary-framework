@@ -27,6 +27,15 @@
  * Ed25519 identity, real state writes through the L1 tools. No mocks. Each
  * test isolates its own tmp fortress and restores SANCTUARY_STORAGE_PATH.
  */
+// fail-before-exempt: the "an uncurated underscore namespace is excluded"
+// test below (RESERVED-NS-DIVERGE-01) asserts behavior that was already
+// correct against origin/main - the exit-bundle exporter's namespace checks
+// each OR'd a redundant underscore-prefix check before the consolidation, so
+// an uncurated underscore namespace was already excluded pre-PR. It cannot
+// fail against pre-fix source by construction. It exists to give the
+// consolidated reserved-namespace predicate a wired-consumer test at this
+// call site (AGENTS.md rule 4), not to catch a regression from a behavior
+// change.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
@@ -386,6 +395,97 @@ describe("exportExitBundle: empty stateNamespaces is rejected, not honored", () 
           keySource: "recovery-key",
         }),
       ).rejects.toThrow(/stateNamespaces was supplied but empty/);
+    } finally {
+      await rm(bundleDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("exportExitBundle: an uncurated underscore namespace is excluded even when explicitly named", () => {
+  it("skips a namespace only isReservedNamespace's blanket rule catches, not the curated list", async () => {
+    // RESERVED-NS-DIVERGE-01 wired-consumer coverage: consolidating
+    // exportEncryptedState's four call sites onto the shared
+    // `isReservedNamespace` predicate stripped their own inline
+    // `namespace.startsWith("_")` check, and no existing exit-bundle suite
+    // ever named a namespace outside `RESERVED_NAMESPACE_PREFIXES` here - an
+    // independent gate on this PR found all 25 pre-existing exit-bundle tests
+    // stayed green when `isReservedNamespace` was narrowed back to
+    // curated-list-only membership. This is that witness: an underscore
+    // namespace the curated list has never heard of must still be excluded
+    // from the export.
+    //
+    // Discovery (no --state-namespace) already filters `_`-prefixed
+    // directories before they reach exportEncryptedState (see
+    // `discoverFilesystemStateNamespaces`), so the only way to reach the
+    // in-loop `isReservedNamespace` check with such a namespace is to name it
+    // explicitly, the same way `--state-namespace` lets an operator do.
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const stateStore = new StateStore(storage, masterKey);
+    const { tools, identityManager } = createL1Tools(
+      stateStore,
+      storage,
+      masterKey,
+      "recovery-key",
+      auditLog,
+    );
+    await identityManager.load();
+    const { reputationStore } = createL4Tools(
+      storage,
+      masterKey,
+      identityManager,
+      auditLog,
+    );
+    const created = await callTool(tools as ToolLike[], "identity_create", {
+      label: "agent",
+    });
+
+    // Written directly to storage: `state_write` already refuses every
+    // underscore-prefixed namespace at the tools-layer firewall this same
+    // predicate guards, so an uncurated `_`-namespace can only exist on disk
+    // from an internal subsystem or a pre-curation fortress, never from an
+    // agent-facing write. That is exactly the case the export-time check
+    // defends against.
+    // A bare unquoted string is not valid JSON, and exportEncryptedState
+    // silently drops anything that fails `JSON.parse` (corrupt state is
+    // omitted, never trusted into the exit bundle) - so the entry must
+    // parse successfully or this test would pass for the wrong reason (a
+    // parse failure) regardless of the reserved-namespace check.
+    await storage.write(
+      "_uncurated_internal",
+      "secret",
+      stringToBytes(JSON.stringify({ payload: "must never leave the fortress" })),
+    );
+    await callTool(tools as ToolLike[], "state_write", {
+      namespace: "agent-memory",
+      key: "note",
+      value: "ordinary state",
+      identity_id: created.identity_id as string,
+    });
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-bundle-reserved-"));
+    try {
+      const result = await exportExitBundle({
+        unpartitionedLegacyExport: true,
+        bundleDir,
+        storage,
+        masterKey,
+        identityManager,
+        auditLog,
+        reputationStore,
+        policy: DEFAULT_POLICY,
+        config: defaultConfig(),
+        stateNamespaces: ["_uncurated_internal", "agent-memory"],
+        keySource: "recovery-key",
+      });
+
+      expect(result.state_entry_count).toBe(1);
+      const state = await readEncryptedState(bundleDir);
+      expect(state.namespaces).toEqual(["agent-memory"]);
+      expect(
+        state.entries.some((entry) => entry.namespace === "_uncurated_internal"),
+      ).toBe(false);
     } finally {
       await rm(bundleDir, { recursive: true, force: true });
     }
