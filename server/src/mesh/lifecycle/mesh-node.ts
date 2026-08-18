@@ -968,6 +968,16 @@ export class MeshNode {
     });
     const result = this.locatorTable.upsert(evt);
     this.onLocatorUpdate(evt, result);
+    // PUBLOC-ASYMMETRY-01: an emitter must never broadcast an entry its OWN
+    // table refused. `upsert` returns "applied" | "older" | "conflict", and
+    // both refusals mean this node did not record the entry - so broadcasting
+    // anyway would leave every other node holding an entry that the emitting
+    // node alone is missing, after which its own sync vector omits the entry
+    // and it re-requests it indefinitely. Symmetric with `publishPolicyUpdate`
+    // above; the two publish paths must refuse on the same condition.
+    if (result !== "applied") {
+      throw new MeshError(`locator_update rejected before publish: ${result}`);
+    }
     await this.transport.broadcast(evt);
     return evt;
   }

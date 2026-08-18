@@ -962,6 +962,91 @@ describe("lifecycle/mesh-node - bootstrap → join → revoke", () => {
     expect(observed.filter((evt) => evt.event_type === "policy_update")).toHaveLength(0);
   });
 
+  // PUBLOC-ASYMMETRY-01: the locator publish path must refuse on the same
+  // condition as the policy publish path above. These two tests are the twin
+  // of "refuses to publish a locally rejected policy bundle"; keep them
+  // adjacent so a future editor who relaxes one sees the other.
+  it("refuses to publish a locator update its own table rejected as older", async () => {
+    const first = await bootstrapFirstNode({ transport: hub });
+    const observer = hub.attach("observer-locator-older");
+    const observed: SignedEvent[] = [];
+    observer.subscribe((evt) => observed.push(evt));
+
+    const base = {
+      agent_id: "agent-locator-older",
+      canonical_node: "node-1",
+      last_migration_at: "2026-01-01T00:00:00.000Z",
+      hosting_principal: first.bootstrap.root_principal_certificate.principal_id,
+    };
+    const publish = (locator_version: number) =>
+      first.node.publishLocatorUpdate({
+        payload: { ...base, locator_version },
+        principal_private_key: first.bootstrap.root_principal_private_key,
+        emitter_principal:
+          first.bootstrap.root_principal_certificate.principal_id,
+      });
+
+    await publish(2);
+    await new Promise((r) => setTimeout(r, 0));
+    const afterApplied = observed.filter(
+      (evt) => evt.event_type === "locator_update"
+    ).length;
+    expect(afterApplied).toBe(1);
+
+    // The emitter's own table refuses this as older. Broadcasting anyway would
+    // leave every peer holding an entry this node alone is missing.
+    await expect(publish(1)).rejects.toThrow(/older/);
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(
+      observed.filter((evt) => evt.event_type === "locator_update")
+    ).toHaveLength(afterApplied);
+    expect(
+      first.node.getLocatorTable().get("agent-locator-older")?.payload
+        .locator_version
+    ).toBe(2);
+  });
+
+  it("refuses to publish a locator update its own table rejected as a conflict", async () => {
+    const first = await bootstrapFirstNode({ transport: hub });
+    const observer = hub.attach("observer-locator-conflict");
+    const observed: SignedEvent[] = [];
+    observer.subscribe((evt) => observed.push(evt));
+
+    const base = {
+      agent_id: "agent-locator-conflict",
+      locator_version: 1,
+      last_migration_at: "2026-01-01T00:00:00.000Z",
+      hosting_principal: first.bootstrap.root_principal_certificate.principal_id,
+    };
+    const publish = (canonical_node: string) =>
+      first.node.publishLocatorUpdate({
+        payload: { ...base, canonical_node },
+        principal_private_key: first.bootstrap.root_principal_private_key,
+        emitter_principal:
+          first.bootstrap.root_principal_certificate.principal_id,
+      });
+
+    await publish("node-1");
+    await new Promise((r) => setTimeout(r, 0));
+    const afterApplied = observed.filter(
+      (evt) => evt.event_type === "locator_update"
+    ).length;
+    expect(afterApplied).toBe(1);
+
+    // Same version, different canonical node: the table reports a conflict.
+    await expect(publish("some-other-node")).rejects.toThrow(/conflict/);
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(
+      observed.filter((evt) => evt.event_type === "locator_update")
+    ).toHaveLength(afterApplied);
+    expect(
+      first.node.getLocatorTable().get("agent-locator-conflict")?.payload
+        .canonical_node
+    ).toBe("node-1");
+  });
+
   it("revoke marks a peer revoked and rejects subsequent envelopes from that peer", async () => {
     const first = await bootstrapFirstNode({ transport: hub });
 
