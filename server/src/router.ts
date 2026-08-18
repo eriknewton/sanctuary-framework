@@ -322,7 +322,9 @@ export function createServer(
       // since the override branch above is gone. This line is why the read set
       // is a security-relevant list and not a taxonomy: a handler reached from
       // here also gets its audit appends admitted onto a chain that already has
-      // findings. What keeps that set honest today is review, not a test.
+      // findings. Six commitment and verifier verbs have their membership
+      // frozen by `test/structure/mcp-commitment-verb-classification.test.ts`;
+      // the rest of the set is kept honest by review, not by a test.
       // Note WHICH set, because `tool_class` is assigned two different ways:
       // the `READ_MCP_TOOLS` table in index.ts (see the contract note on it)
       // UNIONED with every tool literal carrying an inline

@@ -1963,8 +1963,11 @@ const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([
   // answer for anything that creates new persisted state is no. This one
   // correction was established by reading the handler; the systematic
   // reconciliation of the whole read set against what each handler can reach is
-  // a separate change and has not landed, so nothing mechanical checks this
-  // entry today (ABC-READCLASS-01, open).
+  // a separate change and has not landed. Two distinct claims, kept apart on
+  // purpose: this entry's MEMBERSHIP is frozen by
+  // `test/structure/mcp-commitment-verb-classification.test.ts`, so moving it
+  // back to the read table reds; whether the read table is CORRECT against what
+  // its handlers actually reach is unchecked (ABC-READCLASS-01, open).
   "proof_commitment",
   "proof_reveal",
   "reputation_export",
@@ -2004,10 +2007,14 @@ const OPERATOR_TERMINAL_ONLY_MCP_TOOLS: ReadonlySet<string> = new Set([
  * which is the only place membership here has an effect. Adding a name is a
  * security decision made at that site, not a taxonomy entry made at this one.
  *
- * NOTHING MECHANICAL CHECKS THIS TABLE TODAY, stated plainly so a reader does
- * not assume a guard that is not here. A name added without reading its handler
- * widens what may run against a fortress whose audit chain has findings, and no
- * test reds. Reconciling the whole table against what each handler's call graph
+ * WHAT IS AND IS NOT CHECKED, stated plainly so a reader assumes neither more
+ * nor less than ships. CHECKED: the membership of the six commitment and
+ * verifier verbs is frozen by
+ * `test/structure/mcp-commitment-verb-classification.test.ts` — move one of
+ * them across, or add a minting verb here, and it reds. NOT CHECKED: every
+ * other name in this table. Adding one without reading its handler widens what
+ * may run against a fortress whose audit chain has findings, and no test reds.
+ * Reconciling the whole table against what each handler's call graph
  * can actually reach is tracked as ABC-READCLASS-01, which stays OPEN: it is
  * deferred to its own change and is not closed by the one correction that
  * shipped with this comment.
