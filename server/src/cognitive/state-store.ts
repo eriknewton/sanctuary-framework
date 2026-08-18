@@ -1573,6 +1573,18 @@ export class StateStore {
    * (STATE-READ-REFUSE-01). It requests no verification (`verifySignature:
    * false`), so the refusal there does not fire; that asymmetry is the whole
    * point of this method and must survive any change to `readInternal`.
+   *
+   * HONEST BOUND: "the only way" describes this class, not a shipped surface.
+   * This method has no production caller today, no CLI verb and no MCP tool
+   * reaches it, and export followed by import does not restore that plaintext
+   * either, because import re-verifies and skips an entry whose writer key it
+   * cannot resolve. An operator who has lost the writer identity therefore has
+   * no shipped route to the content of an affected entry. Giving this method
+   * an operator-gated, audited caller is the open item; until then the
+   * compatibility story rests on a capability with no production call path
+   * (AGENTS.md assurance rule 9). Kept in step with the ASSURANCE_MATRIX.md
+   * row "State envelope integrity / default verify-on-read", which states the
+   * same bound.
    */
   async readUnverified(
     namespace: string,
@@ -2061,11 +2073,20 @@ export class StateStore {
     // it; the placement here only avoids ADDING a second write from a value
     // this line is about to refuse.
     //
+    // THE TRIGGER IS "NO AUTHENTICATED WRITER KEY", which is slightly broader
+    // than "the writer identity is missing". `resolveWriterPublicKeys` tags a
+    // key recovered only from the plaintext registry `trustBasis:
+    // "unauthenticated"`, and `verifyEntrySignature` keeps only
+    // `"authenticated"` keys, so an entry whose `kid` resolves in that registry
+    // and nowhere else still refuses. Written out because the narrower phrasing
+    // invites a reader to conclude a registry entry is enough to satisfy this.
+    //
     // COMPATIBILITY BOUND, stated plainly because it is a real cost the owner
-    // accepted: on a genuinely un-migrated pre-v2 fortress whose writer
-    // identity is not present in `_identities` (or no longer decrypts), the
-    // affected entries stop returning through `state_read` and through every
-    // internal caller of `read()`. Their owner keeps every other sovereignty
+    // accepted: on a genuinely un-migrated pre-v2 fortress with no
+    // authenticated writer key for the entry (the identity is absent from
+    // `_identities`, no longer decrypts, or resolves only from the plaintext
+    // registry), the affected entries stop returning through `state_read` and
+    // through every internal caller of `read()`. Their owner keeps every other sovereignty
     // affordance AGENTS.md MUST-NEVER #2 requires: `state_list` reads metadata
     // without decrypting, `state_export` serializes the stored entries straight
     // from the storage backend, and `state_delete` removes them, none of which
