@@ -229,6 +229,58 @@ case_all_exempt_errors() {
   assert_empty_or_absent "$root" npx-calls.log
 }
 
+# The regression this guards: a marker written for ONE change used to exempt its
+# whole file FOREVER, so a later change to the same file went unverified with no
+# signal. Here the marker is committed in the BASE, then a later change edits the
+# same file; the exemption must NOT carry over, and the file must actually be run
+# against pre-fix source.
+case_inherited_exemption_is_ignored() {
+  local root="$1"
+  setup_fixture "$root"
+  # Base commit carries the marker on a file that DOES have a behavioral pin.
+  write_file "$root" "server/test/real-pin.test.ts" "// fail-before-exempt: written for an earlier change
+import { behavior } from '../src/subject.js';
+it('pins behavior', () => {
+  expect(behavior).toBe('new-behavior');
+});
+"
+  commit_all "$root" "base commit introduces the exemption"
+  # A later change edits source and the same test file. The inherited marker
+  # must not speak for it.
+  stage_source_change "$root"
+  write_file "$root" "server/test/real-pin.test.ts" "// fail-before-exempt: written for an earlier change
+import { behavior } from '../src/subject.js';
+it('pins behavior', () => {
+  expect(behavior).toBe('new-behavior');
+});
+it('a later change adds a pin the old exemption never covered', () => {
+  expect(behavior).toBe('new-behavior');
+});
+"
+  commit_all "$root" "later change edits the exempt file"
+  run_verify "$root"
+  assert_status "$root" 0
+  assert_contains "$root" stdout.log "INHERITED-EXEMPTION-IGNORED(server/test/real-pin.test.ts)"
+  # The whole point: the file is actually RUN against pre-fix source now.
+  assert_contains "$root" npx-calls.log "test/real-pin.test.ts"
+  assert_empty_or_absent "$root" .fail-before-overrides.log
+}
+
+# The complement: a marker introduced BY this change still exempts, so the
+# per-change scoping did not simply delete the exemption mechanism.
+case_marker_introduced_here_still_exempts() {
+  local root="$1"
+  setup_fixture "$root"
+  stage_source_change "$root"
+  stage_real_pin "$root"
+  stage_exempt "$root" "// fail-before-exempt: introduced by this very change"
+  commit_all "$root" "change introduces both a pin and an exemption"
+  run_verify "$root"
+  assert_status "$root" 0
+  assert_contains "$root" stdout.log "EXEMPT(server/test/passthrough.test.ts): introduced by this very change"
+  assert_not_contains "$root" npx-calls.log "test/passthrough.test.ts"
+}
+
 case_mixed_passes() {
   local root="$1"
   setup_fixture "$root"
@@ -259,5 +311,7 @@ run_case "exempt file with reason is skipped and logged" case_exempt_logs
 run_case "empty exemption reason is a hard error" case_empty_reason_errors
 run_case "all-exempt source change is a hard error" case_all_exempt_errors
 run_case "mixed real pin plus exempt file passes" case_mixed_passes
+run_case "an inherited exemption does not exempt a later change" case_inherited_exemption_is_ignored
+run_case "a marker introduced by this change still exempts" case_marker_introduced_here_still_exempts
 
 echo "PASS: verify-fail-before self-tests"

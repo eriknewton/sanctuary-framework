@@ -21,6 +21,31 @@ trim_ws() {
   printf '%s' "$value"
 }
 
+# INVARIANT: an exemption is a PER-PULL-REQUEST assertion, never a permanent
+# property of a file. The marker exempts only the change that INTRODUCES it, so
+# a marker inherited from the base ref does not exempt this PR's edits to the
+# same file.
+#
+# This exists because the file-scoped version caused a proven silent miss. A
+# marker written for one test in `server/test/mesh/lifecycle.test.ts` exempted
+# that whole file permanently; a later security PR changed 86 lines of it
+# alongside five other test files, the siblings satisfied the gate, and those 86
+# lines went mechanically unverified with NO signal at all. The loud failure
+# (a PR whose only changed test file is the exempt one) is the lucky case; the
+# silent one is the dangerous one, and the tempting "fix" for the loud case
+# (add a second changed test file) is exactly the silent path.
+#
+# Failure mode from the outside: an inherited marker now prints
+# `INHERITED-EXEMPTION-IGNORED` and the file is verified normally. If that
+# genuinely must not happen, restate the marker in this PR (which makes the
+# exemption an explicit, reviewable line in the diff) or use SKIP_FAIL_BEFORE
+# with a reason, which is logged.
+marker_introduced_in_this_range() {
+  local test_file="$1"
+  git diff "$BASE_REF"...HEAD -- "$test_file" 2>/dev/null \
+    | grep -qE '^\+[[:space:]]*// fail-before-exempt:'
+}
+
 exemption_reason_for_test_file() {
   local test_file="$1"
   local line=""
@@ -160,7 +185,12 @@ for test_file in "${CHANGED_TESTS[@]}"; do
   exemption_status=$?
   set -e
 
-  if [[ "$exemption_status" -eq 0 ]]; then
+  if [[ "$exemption_status" -eq 0 ]] && ! marker_introduced_in_this_range "$test_file"; then
+    # The marker came from the base ref, so it was written for a different
+    # change. It does not speak for this one.
+    echo "INHERITED-EXEMPTION-IGNORED($test_file): the fail-before-exempt marker predates this change, so it does not exempt it; this file will be verified normally. Restate the marker in this change if the exemption genuinely applies."
+    COVERED_TESTS+=("$test_file")
+  elif [[ "$exemption_status" -eq 0 ]]; then
     EXEMPT_TESTS+=("$test_file")
     echo "EXEMPT($test_file): $exemption_reason"
     record_file_exemption "$test_file" "$exemption_reason"
