@@ -66,10 +66,17 @@ const EXPECTED_PREFIXES = [
   "_castle_wall_observe",
 ];
 
-// Matches `const RESERVED_NAMESPACE_PREFIXES = [` with an optional `export`,
-// the exact shape of the array-literal declaration this list was defined as
-// in both hand-mirrored copies before consolidation.
-const DEFINITION_PATTERN = /(export\s+)?const\s+RESERVED_NAMESPACE_PREFIXES\s*=\s*\[/;
+// Matches a `const`/`let`/`var` declaration of `RESERVED_NAMESPACE_PREFIXES`,
+// with an optional `export` and an optional type annotation, initialized
+// either as an array literal or as `new Set([...])`. Widened from the
+// original `const RESERVED_NAMESPACE_PREFIXES = [` (the exact shape both
+// hand-mirrored copies used before consolidation) after an adversarial gate
+// on this PR found that shape alone stays green under a type-annotated
+// const, a `new Set(...)` initializer, and a `let` in place of `const` -
+// see the scope note on the assertion below for what this still cannot
+// catch.
+const DEFINITION_PATTERN =
+  /(export\s+)?(const|let|var)\s+RESERVED_NAMESPACE_PREFIXES\s*(:[^=]+)?=\s*(\[|new\s+Set\s*\(\s*\[)/;
 
 function tsFiles(dir: string): string[] {
   const out: string[] = [];
@@ -92,12 +99,27 @@ describe("reserved-namespace contract: single source of truth", () => {
       .filter((f) => DEFINITION_PATTERN.test(f.text))
       .map((f) => f.rel);
 
+    // Scope note (this IS the guard's real reach, not aspirational): this
+    // scan covers `const`/`let`/`var` array-literal or `new Set([...])`
+    // declarations of this EXACT identifier name, with or without a type
+    // annotation, in `.ts` files under `server/src` only. It CANNOT catch a
+    // copy under a different name (e.g. `RESERVED_PREFIXES`), a copy in a
+    // `.mts`/`.cts`/`.js` file, a copy in `server/test` or outside
+    // `server/src` entirely, or a class-static/object-property/spread-built
+    // list. A renamed or differently-shaped copy is a name-based-scan blind
+    // spot no regex closes; catching it needs a semantic (AST/type-level)
+    // check, not this test.
     expect(
       definers,
-      "a RESERVED_NAMESPACE_PREFIXES array literal was found outside " +
-        "cognitive/state-store.ts; this reopens the divergence class " +
-        "RESERVED-NS-DIVERGE-01 fixed - the list must have exactly one " +
-        "definition and every other consumer must import it: " + definers.join(", ")
+      "a RESERVED_NAMESPACE_PREFIXES declaration (const/let/var array " +
+        "literal or new Set([...]) initializer, with or without a type " +
+        "annotation) was found outside cognitive/state-store.ts; this " +
+        "reopens the divergence class RESERVED-NS-DIVERGE-01 fixed - the " +
+        "list must have exactly one definition and every other consumer " +
+        "must import it. This scan covers only .ts files under server/src " +
+        "and only this exact identifier name (see the scope note above " +
+        "this assertion for what it cannot catch). Found in: " +
+        definers.join(", ")
     ).toEqual(["cognitive/state-store.ts"]);
   });
 
@@ -127,6 +149,49 @@ describe("reserved-namespace contract: single source of truth", () => {
     // the prefix match must not fire on substring similarity alone.
     expect(isReservedNamespace("identities")).toBe(false);
   });
+});
+
+// --- DEFINITION_PATTERN coverage --------------------------------------
+//
+// An independent adversarial gate on this PR mutation-tested the original
+// `(export\s+)?const\s+RESERVED_NAMESPACE_PREFIXES\s*=\s*\[` pattern and
+// found four reintroduction shapes that stayed 10/10 green: a type-annotated
+// const, a `new Set([...])` initializer, `let` in place of `const`, and a
+// renamed const. The widened `DEFINITION_PATTERN` above closes the first
+// three (each is asserted directly below); the fourth is a name-based-scan
+// blind spot the widening cannot close, asserted here only to document that
+// it stays open, never to claim coverage it does not have.
+describe("DEFINITION_PATTERN: widened shape coverage", () => {
+  const newlyCoveredShapes: Record<string, string> = {
+    "type-annotated const": 'const RESERVED_NAMESPACE_PREFIXES: readonly string[] = [\n  "_a",\n];',
+    "let instead of const": 'let RESERVED_NAMESPACE_PREFIXES = [\n  "_a",\n];',
+    "var instead of const": 'var RESERVED_NAMESPACE_PREFIXES = [\n  "_a",\n];',
+    "new Set(...) initializer": 'const RESERVED_NAMESPACE_PREFIXES = new Set([\n  "_a",\n]);',
+    "exported, type-annotated, new Set(...)":
+      'export const RESERVED_NAMESPACE_PREFIXES: ReadonlySet<string> = new Set([\n  "_a",\n]);',
+  };
+
+  for (const [label, snippet] of Object.entries(newlyCoveredShapes)) {
+    it(`matches a reintroduction shaped as: ${label}`, () => {
+      expect(DEFINITION_PATTERN.test(snippet)).toBe(true);
+    });
+  }
+
+  it("still matches the original plain-const shape (no regression from widening)", () => {
+    expect(
+      DEFINITION_PATTERN.test('const RESERVED_NAMESPACE_PREFIXES = [\n  "_a",\n];')
+    ).toBe(true);
+  });
+
+  it(
+    "does NOT match a renamed copy - documents the known scan gap, not a claim " +
+      "of coverage (a name-based regex cannot see a different identifier)",
+    () => {
+      expect(
+        DEFINITION_PATTERN.test('const RESERVED_PREFIXES = [\n  "_a",\n];')
+      ).toBe(false);
+    }
+  );
 });
 
 // --- Tool-layer classification parity -------------------------------------

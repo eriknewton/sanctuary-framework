@@ -262,12 +262,15 @@ export interface SignedStateEnvelope {
  * Imported bundles MUST NOT write to these namespaces.
  *
  * RESERVED-NS-DIVERGE-01: this is the single source of truth for the curated
- * list. `cognitive/tools.ts` and `exit/bundle.ts` import it (and
- * `isReservedNamespace`) rather than keeping their own copies, so the list
- * cannot drift between call sites again. A structure test
- * (`test/structure/reserved-namespace-single-source.test.ts`) fails the build if
- * a second `RESERVED_NAMESPACE_PREFIXES`-shaped literal reappears anywhere in
- * `server/src`.
+ * list. `cognitive/tools.ts` imports this list and `isReservedNamespace`;
+ * `exit/bundle.ts` imports only `isReservedNamespace`. Neither keeps its own
+ * copy, so the list cannot drift between call sites again. A structure test
+ * (`test/structure/reserved-namespace-single-source.test.ts`) fails the build
+ * if a second `const`/`let`/`var` array-literal or `new Set([...])`
+ * initializer named `RESERVED_NAMESPACE_PREFIXES` (with or without a type
+ * annotation) appears in any `.ts` file under `server/src`. It cannot catch a
+ * copy under a different name, in a non-`.ts` file, or outside `server/src` -
+ * see the test file's own scope note on the assertion that enforces this.
  */
 export const RESERVED_NAMESPACE_PREFIXES = [
   "_identities",
