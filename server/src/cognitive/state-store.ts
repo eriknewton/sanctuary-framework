@@ -1089,7 +1089,11 @@ export class StateStore {
    *     stripping the marker and rewriting the values. Instead the floor
    *     re-establishes from the *authenticated* v2 entries via observeVersion,
    *     so a stripped/legacy anchor self-heals on the next read/write without
-   *     ever trusting attacker-supplied values.
+   *     ever trusting attacker-supplied values. The "authenticated" half of that
+   *     sentence is enforced at the `observeVersion` call site in `readInternal`
+   *     (STATE-READ-ANCHOR-01), which raises the floor only from a read whose
+   *     signature actually verified; a read that could not verify leaves the
+   *     floor where it is rather than pinning it from an unattested version.
    *
    * Residual (documented, not closed here): deleting the anchor AND replacing a
    * key's entry with an older validly-signed v2 entry resets that key's floor
@@ -1806,6 +1810,10 @@ export class StateStore {
     // un-migrated pre-v2 fortresses - a backward-compat migration decision left
     // as a follow-up. (A genuine pre-migration v1 entry sits at/below its anchor;
     // on a bare-anchor fortress it reads normally because the gate is skipped.)
+    // Narrowed, not closed, by STATE-READ-ANCHOR-01: since the anchor write
+    // below now requires a VERIFIED read, a reset floor can no longer be
+    // re-pinned by a read that failed to verify - but a bare/absent anchor is
+    // still no floor, so the reset itself remains open exactly as described.
     if (options.enforceRollback && stateEntry.v === 1) {
       const anchoredVersion = await this.getAnchoredVersion(namespace, key);
       if (anchoredVersion > 0 && stateEntry.ver > anchoredVersion) {
@@ -1829,6 +1837,18 @@ export class StateStore {
       warnings = verification.warnings;
     }
 
+    // CLASS INVARIANT (STATE-READ-MIGRATE-01, STATE-READ-ANCHOR-01): a read that
+    // did not VERIFY must not mutate durable state, because every durable effect
+    // below would otherwise take its input from an entry whose provenance this
+    // read could not establish. `signatureVerified` is the only honest witness:
+    // it stays false when verification was skipped AND when
+    // `verifyEntrySignature` returns `verified: false` without throwing (the
+    // legacy-schema path where no AUTHENTICATED writer key resolves), so
+    // absent and unproven both read as not-verified here. Every durable side
+    // effect in this function gates on this one predicate so that a third one
+    // added later inherits the rule instead of being missed.
+    const durableSideEffectsPermitted = signatureVerified;
+
     // Decrypt
     const namespaceKey = this.getNamespaceKey(namespace);
     const plaintext = decrypt(stateEntry.payload, namespaceKey);
@@ -1843,7 +1863,14 @@ export class StateStore {
       );
     }
 
-    if (options.verifySignature && stateEntry.v === 1) {
+    // Migration re-signs the entry under a locally resolved identity and
+    // OVERWRITES the original legacy bytes in place, so it must run only behind
+    // a verified read: the original bytes are the only copy an operator or a
+    // later verified read has to work from, and re-signing an entry this read
+    // could not verify destroys that evidence and leaves an entry that fails on
+    // the next read. Gated on the outcome of verification, never on the request
+    // option that merely ASKED for it.
+    if (durableSideEffectsPermitted && stateEntry.v === 1) {
       stateEntry = await this.migrateLegacyEntryToSchema2(stateEntry, namespace, key);
     }
 
@@ -1862,7 +1889,15 @@ export class StateStore {
       }
     }
 
-    if (options.enforceRollback) {
+    // The version anchor is a MAC-authenticated MONOTONE floor: `observeVersion`
+    // only ever raises it, so a wrong pin can never be lowered back and is
+    // therefore unrecoverable. Refusing to raise is the recoverable side to fail
+    // to, so only a VERIFIED read may move it. A legacy (v1) signature binds the
+    // ciphertext alone, not namespace/key/version, so an unverified read cannot
+    // attest that this entry belongs at this key at this version, and adopting
+    // its claimed version would pin the floor from the weakest available source
+    // during exactly the incident the anchor exists to make detectable.
+    if (options.enforceRollback && durableSideEffectsPermitted) {
       await this.observeVersion(namespace, key, stateEntry.ver);
     }
 
