@@ -1087,13 +1087,22 @@ export class StateStore {
    *     (return {}). We deliberately do NOT trust or re-MAC a bare record:
    *     re-MACing it would let a filesystem adversary bypass authentication by
    *     stripping the marker and rewriting the values. Instead the floor
-   *     re-establishes from the *authenticated* v2 entries via observeVersion,
-   *     so a stripped/legacy anchor self-heals on the next read/write without
-   *     ever trusting attacker-supplied values. The "authenticated" half of that
-   *     sentence is enforced at the `observeVersion` call site in `readInternal`
-   *     (STATE-READ-ANCHOR-01), which raises the floor only from a read whose
-   *     signature actually verified; a read that could not verify leaves the
-   *     floor where it is rather than pinning it from an unattested version.
+   *     re-establishes via observeVersion on the next read or write. That
+   *     re-establishment is only as authenticated as the caller that drives it,
+   *     and the two callers differ:
+   *       - READ path: enforced (STATE-READ-ANCHOR-01). `readInternal` RAISES
+   *         the floor only from a read whose signature actually verified; a
+   *         read that could not verify leaves the floor where it is rather
+   *         than pinning it from an unattested version. (The rollback CHECK is
+   *         separate and still runs on every enforcing read - see
+   *         `assertNotBelowVersionFloor`.)
+   *       - WRITE path: NOT enforced. This is the uncovered case. `write()`
+   *         derives its new version from `versionCache`, which
+   *         `getNamespaceHashes` fills by parsing the namespace's raw on-disk
+   *         entries with no signature check of any kind, so a legitimate write
+   *         can carry an unattested on-disk version into the durable floor.
+   *         Tracked as STATE-WRITE-ANCHOR-01. Do not read this block as
+   *         covering the write path.
    *
    * Residual (documented, not closed here): deleting the anchor AND replacing a
    * key's entry with an older validly-signed v2 entry resets that key's floor
@@ -1252,11 +1261,34 @@ export class StateStore {
       : 0;
   }
 
-  private async observeVersion(
+  /**
+   * CHECK half of the version floor: reject an entry sitting BELOW the
+   * MAC-authenticated anchor.
+   *
+   * INVARIANT: this check is an authenticated control in its own right. The
+   * floor it compares against was established by an earlier VERIFIED write or
+   * read and is MAC-authenticated on disk, so its authority does not come from
+   * the current access being able to resolve a writer key. Every
+   * rollback-enforcing access must therefore run it, including one whose
+   * signature could not be verified: gating detection on verification would
+   * turn "this read cannot establish the writer" into "this read cannot detect
+   * a rollback", the silent degradation to a less-secure behavior that
+   * AGENTS.md MUST-NEVER #5 forbids. Regression-guarded by "detects a rollback
+   * below the persisted anchor even when the read cannot verify" in
+   * server/test/cognitive/state-read-durable-side-effects.test.ts.
+   *
+   * Returns the loaded anchor record and the current floor so a caller that
+   * goes on to RAISE the floor does not have to reload it.
+   */
+  private async assertNotBelowVersionFloor(
     namespace: string,
     key: string,
     version: number
-  ): Promise<void> {
+  ): Promise<{
+    anchors: Record<string, unknown>;
+    vk: string;
+    lastSeen: number;
+  }> {
     const anchors = await this.loadVersionAnchors();
     const vk = this.versionKey(namespace, key);
     const anchored = anchors[vk];
@@ -1271,6 +1303,29 @@ export class StateStore {
         `Rollback detected for ${namespace}/${key}: found version ${version}, expected at least ${lastSeen}`
       );
     }
+
+    return { anchors, vk, lastSeen };
+  }
+
+  /**
+   * CHECK-AND-RAISE, not a raiser. The two halves carry different trust
+   * requirements: the check above is unconditional on any rollback-enforcing
+   * access, while the raise is a durable, monotone, unrecoverable-if-wrong side
+   * effect and is reserved for a caller that established the version's
+   * provenance. Call this only from such a caller; where the provenance is
+   * unproven, call `assertNotBelowVersionFloor` alone so detection survives
+   * without the pin.
+   */
+  private async observeVersion(
+    namespace: string,
+    key: string,
+    version: number
+  ): Promise<void> {
+    const { anchors, vk, lastSeen } = await this.assertNotBelowVersionFloor(
+      namespace,
+      key,
+      version
+    );
 
     if (version > lastSeen) {
       anchors[vk] = version;
@@ -1298,6 +1353,13 @@ export class StateStore {
         try {
           const stateEntry: StateEntry = JSON.parse(bytesToString(raw));
           hashMap.set(entry.key, stateEntry.integrity_hash);
+          // FOLLOW-UP, honest residual (STATE-CACHE-FLOOR-01, not closed here):
+          // these versions come straight from raw on-disk bytes with no
+          // signature check, and `versionCache` is consulted by the
+          // anti-rollback check in `readInternal` and by the version
+          // computation in `write()`. STATE-READ-ANCHOR-01 closed the DURABLE
+          // half of this on the read path; the process-scoped in-memory half,
+          // and the write path that reads it (STATE-WRITE-ANCHOR-01), are open.
           this.versionCache.set(
             this.versionKey(namespace, entry.key),
             stateEntry.ver
@@ -1810,10 +1872,13 @@ export class StateStore {
     // un-migrated pre-v2 fortresses - a backward-compat migration decision left
     // as a follow-up. (A genuine pre-migration v1 entry sits at/below its anchor;
     // on a bare-anchor fortress it reads normally because the gate is skipped.)
-    // Narrowed, not closed, by STATE-READ-ANCHOR-01: since the anchor write
-    // below now requires a VERIFIED read, a reset floor can no longer be
-    // re-pinned by a read that failed to verify - but a bare/absent anchor is
-    // still no floor, so the reset itself remains open exactly as described.
+    // Narrowed, not closed, by STATE-READ-ANCHOR-01: on the READ path the
+    // anchor RAISE below now requires a VERIFIED read, so a reset floor can no
+    // longer be re-pinned by a read that failed to verify. Two bounds survive
+    // and neither is closed here: a bare/absent anchor is still no floor, so
+    // the reset itself remains open exactly as described; and the WRITE path
+    // still derives the floor from unverified on-disk versions
+    // (STATE-WRITE-ANCHOR-01), so this narrowing covers reads only.
     if (options.enforceRollback && stateEntry.v === 1) {
       const anchoredVersion = await this.getAnchoredVersion(namespace, key);
       if (anchoredVersion > 0 && stateEntry.ver > anchoredVersion) {
@@ -1870,6 +1935,12 @@ export class StateStore {
     // could not verify destroys that evidence and leaves an entry that fails on
     // the next read. Gated on the outcome of verification, never on the request
     // option that merely ASKED for it.
+    //
+    // FOLLOW-UP, honest residual (STATE-READ-MIGRATE-02, not closed here): this
+    // migration is ordered BEFORE the anchor check further down, so a read that
+    // verifies and is then REJECTED by that check has already rewritten the
+    // entry on disk. Ordering the check above the migration is the fix and is
+    // deliberately out of scope for this change.
     if (durableSideEffectsPermitted && stateEntry.v === 1) {
       stateEntry = await this.migrateLegacyEntryToSchema2(stateEntry, namespace, key);
     }
@@ -1889,16 +1960,29 @@ export class StateStore {
       }
     }
 
-    // The version anchor is a MAC-authenticated MONOTONE floor: `observeVersion`
-    // only ever raises it, so a wrong pin can never be lowered back and is
-    // therefore unrecoverable. Refusing to raise is the recoverable side to fail
-    // to, so only a VERIFIED read may move it. A legacy (v1) signature binds the
-    // ciphertext alone, not namespace/key/version, so an unverified read cannot
-    // attest that this entry belongs at this key at this version, and adopting
-    // its claimed version would pin the floor from the weakest available source
-    // during exactly the incident the anchor exists to make detectable.
-    if (options.enforceRollback && durableSideEffectsPermitted) {
-      await this.observeVersion(namespace, key, stateEntry.ver);
+    // The version anchor is a MAC-authenticated MONOTONE floor and a
+    // CHECK-AND-RAISE. The two halves are gated differently, on purpose:
+    //
+    // CHECK (every enforcing read): an entry BELOW the floor is a rollback
+    // whether or not this read could resolve a writer key, because the floor's
+    // authority comes from the earlier verified access that set it, not from
+    // this one. The throw is also the ONLY signal such a read would produce -
+    // no internal consumer of `read()` inspects `signature_verified` - so
+    // suppressing the check would silently return a rolled-back value as truth.
+    //
+    // RAISE (verified reads only): the floor only ever goes up, so a wrong pin
+    // can never be lowered back and is unrecoverable, while refusing to raise
+    // is recoverable. A legacy (v1) signature binds the ciphertext alone, not
+    // namespace/key/version, so an unverified read cannot attest that this
+    // entry belongs at this key at this version, and adopting its claimed
+    // version would pin the floor from the weakest available source during
+    // exactly the incident the anchor exists to make detectable.
+    if (options.enforceRollback) {
+      if (durableSideEffectsPermitted) {
+        await this.observeVersion(namespace, key, stateEntry.ver);
+      } else {
+        await this.assertNotBelowVersionFloor(namespace, key, stateEntry.ver);
+      }
     }
 
     // Update version cache

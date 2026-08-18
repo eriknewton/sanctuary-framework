@@ -145,6 +145,48 @@ async function seedLegacyEntry(args: {
   );
 }
 
+/**
+ * Plant a legacy (schema-1) entry whose `kid` resolves to NO stored identity
+ * and to no AUTHENTICATED registry key, carrying a well-formed but meaningless
+ * signature (64 zero bytes = the Ed25519 signature length).
+ *
+ * `verifyEntrySignature` short-circuits the v1 branch and returns
+ * `verified: false` WITHOUT throwing as soon as no authenticated writer key
+ * resolves, so the signature bytes are never examined on this shape. That is
+ * the exact state in which the read path must nonetheless still detect a
+ * rollback: the persisted floor's authority comes from the earlier verified
+ * access that set it, not from this read.
+ */
+async function plantUnattributableLegacyEntry(args: {
+  storage: MemoryStorage;
+  namespace: string;
+  key: string;
+  value: string;
+  version: number;
+}): Promise<void> {
+  const plaintext = stringToBytes(args.value);
+  const payload = encrypt(
+    plaintext,
+    deriveNamespaceKey(MASTER_KEY, args.namespace)
+  );
+  const entry: StateEntry = {
+    v: 1,
+    payload,
+    ver: args.version,
+    // ED25519_SIGNATURE_BYTES = 64; the value is irrelevant because no key
+    // resolves for `kid`, which is the point of this fixture.
+    sig: toBase64url(new Uint8Array(64)),
+    kid: "sanctuary-no-such-writer-identity",
+    integrity_hash: hashToString(plaintext),
+    metadata: { written_at: "2026-05-16T00:00:02.000Z" },
+  };
+  await args.storage.write(
+    args.namespace,
+    args.key,
+    stringToBytes(JSON.stringify(entry))
+  );
+}
+
 async function rawBytes(
   storage: MemoryStorage,
   namespace: string,
@@ -258,5 +300,103 @@ describe("read-path durable side effects require a verified read", () => {
     expect(after).not.toBeNull();
     const anchors = JSON.parse(after!) as { data: Record<string, number> };
     expect(anchors.data["memories/verified-anchor"]).toBe(7);
+  });
+
+  // The floor is a CHECK-AND-RAISE. Gating the whole call on verification
+  // would suppress DETECTION along with the pin, so these two cases must hold
+  // at the same time: the check fires without verification, the raise does not.
+  it("detects a rollback below the persisted anchor even when the read cannot verify", async () => {
+    const { storage, stateStore, identity, identityEncKey } = await makeRig({
+      breakRotationChain: false,
+    });
+
+    // Establish a genuine floor: five verified writes leave the anchor at 5.
+    for (let version = 1; version <= 5; version += 1) {
+      await stateStore.write(
+        "memories",
+        "policy",
+        `ALLOW=v${version}`,
+        identity.identity_id,
+        identity.encrypted_private_key,
+        identityEncKey
+      );
+    }
+    const anchorRecord = await rawBytes(storage, ANCHORS_NAMESPACE, ANCHORS_KEY);
+    expect(
+      (JSON.parse(anchorRecord!) as { data: Record<string, number> }).data[
+        "memories/policy"
+      ]
+    ).toBe(5);
+
+    // Replace the entry with an older version the read cannot attribute.
+    await plantUnattributableLegacyEntry({
+      storage,
+      namespace: "memories",
+      key: "policy",
+      value: "ALLOW=nobody",
+      version: 1,
+    });
+    const planted = await rawBytes(storage, "memories", "policy");
+
+    // Cold process: the in-memory version cache is empty, so the persisted
+    // anchor is the only discriminator left.
+    const restarted = new StateStore(storage, MASTER_KEY);
+    await expect(restarted.read("memories", "policy")).rejects.toThrow(
+      /Rollback detected for memories\/policy: found version 1, expected at least 5/
+    );
+
+    // The rejected read is still a read that did not verify, so it must not
+    // have touched the bytes either.
+    expect(await rawBytes(storage, "memories", "policy")).toBe(planted);
+  });
+
+  it("still refuses to pin the floor from an unverified read after the anchor record is reset", async () => {
+    const { storage, stateStore, identity, identityEncKey } = await makeRig({
+      breakRotationChain: false,
+    });
+    for (let version = 1; version <= 5; version += 1) {
+      await stateStore.write(
+        "memories",
+        "policy",
+        `ALLOW=v${version}`,
+        identity.identity_id,
+        identity.encrypted_private_key,
+        identityEncKey
+      );
+    }
+    const genuineEntry = await rawBytes(storage, "memories", "policy");
+
+    // A filesystem adversary deletes the anchor record (no trusted floor) and
+    // plants a high-version entry that cannot be attributed.
+    await storage.delete(ANCHORS_NAMESPACE, ANCHORS_KEY);
+    await plantUnattributableLegacyEntry({
+      storage,
+      namespace: "memories",
+      key: "policy",
+      value: "ALLOW=everyone",
+      version: 500,
+    });
+
+    const attacked = new StateStore(storage, MASTER_KEY);
+    const forgedRead = await attacked.read("memories", "policy");
+    expect(forgedRead?.signature_verified).toBe(false);
+    expect(forgedRead?.version).toBe(500);
+
+    // The durable floor stays absent: an unattributable version must never
+    // become a monotone pin that no later write could lower.
+    expect(await rawBytes(storage, ANCHORS_NAMESPACE, ANCHORS_KEY)).toBeNull();
+
+    // Restore the genuine entry. A restarted process (the in-memory cache
+    // poisoned by the forged read is process-scoped) reads it normally.
+    await storage.write(
+      "memories",
+      "policy",
+      stringToBytes(genuineEntry!)
+    );
+    const recovered = new StateStore(storage, MASTER_KEY);
+    const genuineRead = await recovered.read("memories", "policy");
+    expect(genuineRead?.value).toBe("ALLOW=v5");
+    expect(genuineRead?.version).toBe(5);
+    expect(genuineRead?.signature_verified).toBe(true);
   });
 });
