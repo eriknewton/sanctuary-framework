@@ -18,6 +18,9 @@
  *      targets only ever checks the entries its author happened to remember.
  *   3. Find every `ToolDefinition` object literal in `src` (a literal with both
  *      a resolvable `name` and a `handler`) and take the handler function node.
+ *      A `handler` holding a REFERENCE rather than a function literal is
+ *      resolved to the declarations behind it; one that resolves to no walkable
+ *      body is reported, never analyzed as reaching nothing.
  *   4. From each handler, walk the call graph with the type checker, following
  *      calls into any function declared under `src`, and report the sites that
  *      reach a durable-state mutation primitive or a subprocess.
@@ -65,17 +68,11 @@
  *     INJECTED function-typed dependency is not followed, because resolving it
  *     needs dataflow (which object literal supplied that property, at which
  *     construction site, reaching this call), not a syntactic lookup. Tracked as
- *     a separate build; it is NOT closed here and no result below should be read
- *     as covering it.
- *
- *     DISTANCE IS NOT WHAT MAKES IT OPEN, stated because an earlier revision
- *     described the gap as the literal being somewhere "the callee has no
- *     syntactic link to", which reads as though proximity would close it. It
- *     does not: the class holds just as well with the object literal in the
- *     SAME file, on the same page, with the primitive visibly written into it.
- *     What defeats the lookup is the ANNOTATION on the interface member, which
- *     is the only type the call site can see, and that is true at any
- *     distance.
+ *     a separate build under ABC-READCLASS-01; it is NOT closed here and no
+ *     result below should be read as covering it. Neither the mechanism that
+ *     defeats the lookup nor a spelling of it is written out here, because the
+ *     class is open and this file ships in a public repository; the register
+ *     entry carries the detail.
  *
  *     THE COUNT IS STATED WITH ITS METHOD, because it moves by a factor of four
  *     with the method and a bare number here was wrong twice. Counting UNIQUE
@@ -113,35 +110,48 @@
  *
  *     WHAT IS CLOSED IS AN ENUMERATION, NOT A CATEGORY. This paragraph twice
  *     carried a category claim ("this is where syntax runs out"), and twice a
- *     later attack found a syntactic shape outside it, most recently one of
- *     the reflective spellings now pinned below. A category is not something
- *     this analyzer can establish, so it no longer claims one. The shapes closed, each pinned as a must-fail
- *     fixture in the test file, are exactly: a destructured namespace import; a
- *     bare aliased `const`; an annotated `const` whose annotation erases the
- *     target; an object-literal property; a getter handing the function back; a
- *     getter returning it behind a cast; a class field; a default parameter; a
- *     default parameter carrying a cast; a destructure out of an array; a
- *     destructured dynamic `import`; a destructure of a cast namespace; a
- *     re-export chain; a wildcard re-export; a `.bind()`; a conditional
- *     selecting between two functions; a factory return; a generic identity
- *     function; an `await`ed promise; a `Map` lookup; an object spread of a
- *     namespace import; an `Object.assign` target; a computed key on an object
- *     literal; an indexed access on a namespace import; a callee the call site
- *     does not name at all; an optional call; the five type-only wrappers (`as`,
- *     `satisfies`, parentheses, `!`, and the angle-bracket assertion) on an
- *     initializer AND at the call site; `.call`; `.apply`; `Reflect.apply`; and
- *     those three composed with any receiver shape above.
+ *     later attack found a syntactic shape outside it. A category is not
+ *     something this analyzer can establish, so it no longer claims one. The
+ *     shapes closed, each pinned as a must-fail fixture in the test file, are
+ *     exactly: a destructured namespace import; a bare aliased `const`; an
+ *     annotated `const` whose annotation erases the target; an object-literal
+ *     property; a getter handing the function back; a getter returning it
+ *     behind a cast; a class field; a default parameter; a default parameter
+ *     carrying a cast; a destructure out of an array; a destructured dynamic
+ *     `import`; a destructure of a cast namespace; a re-export chain; a
+ *     wildcard re-export; a `.bind()`; a conditional selecting between two
+ *     functions; a factory return; a generic identity function; an `await`ed
+ *     promise; a `Map` lookup; an object spread of a namespace import; an
+ *     `Object.assign` target; a computed key on an object literal; an indexed
+ *     access on a namespace import; a callee the call site does not name at
+ *     all; an optional call; the five type-only wrappers (`as`, `satisfies`,
+ *     parentheses, `!`, and the angle-bracket assertion) on an initializer AND
+ *     at the call site; `.call`; `.apply`; `Reflect.apply`; a function handed
+ *     over as a VALUE at a call site rather than called at it; and those
+ *     composed with any receiver shape above.
  *
- *     WHAT REMAINS OPEN, from the same attack rounds, is not pinned as a
- *     fixture, because a fixture for an unclosed shape is a working evasion
- *     published against a live guard. Four spellings put the target somewhere
- *     this resolver does not look: two reflective forms that nest one level
- *     further than the receiver-and-first-argument rule reaches, one that
- *     computes the member name rather than writing it, and one calling form the
- *     walk does not visit, which no sink in the sets above can accept an
- *     argument from and so reaches none of them. They are recorded in the
- *     private register under ABC-READCLASS-01 rather than here. The injected
- *     function-typed dependency above is the fifth and is the measured one.
+ *     TWO MORE INVOCATION SITES ARE NOW VISITED, and they are reach rather than
+ *     resolution, so they are not fixture-pinnable in the corpus (which
+ *     resolves call sites without walking bodies): a tagged template, whose tag
+ *     is a callee like any other, and a `handler:` property holding a reference
+ *     rather than a function literal. Both are verified by planting the shape
+ *     into a real read handler and confirming the guard reds.
+ *
+ *     WHAT REMAINS OPEN IS NOT ENUMERATED HERE and is deliberately not pinned
+ *     as a fixture: a fixture is a copy-pasteable spelling, so a fixture for an
+ *     unclosed shape is a working evasion published against a live guard, and
+ *     an enumeration in prose is most of the way to the same thing. Spellings
+ *     that put the target somewhere this resolver does not look remain, they
+ *     resolve only in the private register under ABC-READCLASS-01, and no count
+ *     is given: the count in this paragraph has been wrong at every previous
+ *     revision, and a wrong count reads as an assurance.
+ *
+ *     THE VALUE PATH INHERITS THE CALLEE PATH'S BOUND, stated because closing
+ *     one is easily read as closing more than it does. An argument is resolved
+ *     by exactly the same chokepoint as a callee, so it reaches what a callee
+ *     reaches and stops where a callee stops. Where a target is hidden from
+ *     that resolution, moving it into an argument position does not reveal it.
+ *     That residue is the measured dataflow gap above, not a separate class.
  *   - Traversal stops AT the storage and audit-log module boundaries: a call
  *     into one of those is classified (sink, append, or read-only) and its body
  *     is not walked, because the question this guard answers is which primitive
@@ -162,6 +172,34 @@
  *     would churn on every edit above it.
  *   - `proxy/*` tools are named at runtime from an upstream catalog and are
  *     forced `write` at classification time, so they are outside this analysis.
+ *   - INVOCATION THAT PRODUCES NO CALL NODE IS NOT FOLLOWED. The walk visits
+ *     call, construction, and tagged-template expressions. JavaScript has other
+ *     forms that run a function body without producing one of those, through
+ *     property accessors and through protocol methods the language invokes on
+ *     your behalf; none of them is followed. Read the laundering corpus's
+ *     accessor fixtures narrowly because of this: they pin an accessor that
+ *     HANDS BACK a function, which is a different thing from an accessor that
+ *     performs the effect itself, and the corpus says nothing about the latter.
+ *     Owned under ABC-READCLASS-01.
+ *   - CLASS-INHERITANCE DISPATCH IS NOT FOLLOWED; only interface
+ *     implementation is. The heritage index behind `implementationsOf`
+ *     collects `extends` as well as `implements`, but the expansion fires only
+ *     for interface members, so a bodyless member declared on an abstract base
+ *     stops the walk at the base rather than reaching the subclass that
+ *     implements it. Four abstract classes exist in `src` today. The fix is
+ *     small and is deliberately not made in this change.
+ *   - THE FOUR TRAVERSAL CAPS FAIL OPEN AND SILENTLY. Call depth, alias hops,
+ *     cast hops, and reflective hops each stop on exhaustion with nothing
+ *     recorded, so exhausting one is indistinguishable from finding nothing.
+ *     This is the file's own exception to its thesis, which is why it is stated
+ *     at the claim rather than left to a reader of the constants. Recording a
+ *     truncation and asserting there are none is the fix; it is not built here.
+ *   - THE LAUNDERING CLOSURE HAS NO REAL-TREE WITNESS. With the expanded-set
+ *     classification disabled, every real-tree assertion in the test still
+ *     passes and only the synthetic corpus reds. The corpus is that closure's
+ *     ONLY evidence. That is defensible for a class the tree does not currently
+ *     contain, and it is stated so a green real-tree result is not read as
+ *     evidence for the closure.
  *
  * A clean result therefore means "no mutation is reachable along a
  * statically resolvable path", not "no mutation is possible".
@@ -237,12 +275,16 @@ const STORAGE_READ_ONLY: ReadonlySet<string> = new Set([
   "readTransientError",
   "throwModeRejected",
   "sleep",
-  // caller-supplied observation hooks; the callback body is walked at its own
-  // declaration site, so treating the hook itself as a sink would double-report
+  // Caller-supplied observation hooks. Treating the hook itself as a sink would
+  // misattribute the site: the callback is what runs, and the callback IS
+  // walked, whether it is written inline at the call site or passed by name.
+  // The by-name half of that was an assumption until the resolver started
+  // resolving function-valued arguments; before that this justification held
+  // only for an inline arrow, which is what every call site happened to use.
   "onContended",
   "onDescriptorVerified",
-  // runs a caller-supplied callback under a different effective identity. Not a
-  // durable-state write in itself; the callback is walked where it is written.
+  // Runs a caller-supplied callback under a different effective identity. Not a
+  // durable-state write in itself; same justification as the two hooks above.
   "withOwnerEffectiveIdentity",
 ]);
 
@@ -305,8 +347,11 @@ const AUDIT_LOG_READ_ONLY: ReadonlySet<string> = new Set([
   // Drains writes that `append` already queued; it creates no record of its
   // own, and appends are not sinks by the rule above.
   "flush",
-  // Runs a caller-supplied callback; the callback body is walked where it is
-  // written, so treating the wrapper as a sink would misattribute the site.
+  // Runs a caller-supplied callback; the callback is walked whether it is
+  // written inline or passed by name, so treating the wrapper as a sink would
+  // misattribute the site. Same note as the storage hooks: the by-name half of
+  // this justification became true when the resolver started resolving
+  // function-valued arguments, and was an assumption before that.
   "runAllowingIntegrityFindings",
 ]);
 
@@ -409,7 +454,16 @@ const PRIMITIVE_DISPATCH_FUNCTIONS: ReadonlySet<string> = new Set(["callPrimitiv
 /**
  * Depth ceiling for the call-graph walk. Not a semantic limit: the walk already
  * memoizes each function body per tool, so it terminates on its own. This only
- * bounds a pathological chain and keeps a stack overflow from reading as a pass.
+ * bounds a pathological chain.
+ *
+ * IT FAILS OPEN, and an earlier version of this comment claimed the opposite —
+ * that it "keeps a stack overflow from reading as a pass". Exhausting it IS a
+ * pass: the walk returns with nothing recorded and the result is
+ * indistinguishable from a clean one. The same is true of the three hop
+ * ceilings below. The bound is stated in the header rather than only here,
+ * because a cap that fails open in a file whose thesis is that absent must not
+ * read as passing is the file's own exception and has to be visible from the
+ * claim, not just from the constant.
  */
 const MAX_CALL_DEPTH = 60;
 
@@ -468,6 +522,15 @@ export interface ToolClassification {
   inlineRead: string[];
   /** Tool literals carrying an inline `tool_class: "write"`. */
   inlineWrite: string[];
+  /**
+   * Anti-vacuity for the TABLE half of the target set, and the counterpart of
+   * `inlineAntiVacuity` below. One entry per element of a classification table
+   * that this parser could not read as a string literal. The shipping router
+   * builds the same `Set` at runtime and classifies from it either way, so a
+   * skipped element removes a tool from this analysis while leaving it fully
+   * classified in production. Asserted empty by the test.
+   */
+  unparsableTableElements: string[];
 }
 
 export interface ReachabilityReport {
@@ -476,14 +539,33 @@ export interface ReachabilityReport {
   readTools: string[];
   /** tool name -> `<path>:<line>` of its handler, for coverage assertions. */
   handlerLocations: Map<string, string>;
-  /** Read-classified tools with no discoverable handler literal. */
+  /**
+   * Read-classified tools this analyzer could not start a walk from: no tool
+   * literal was found for the name, or a literal was found whose `handler`
+   * could not be resolved to a function body under `src`. Both cases would
+   * otherwise report zero sinks and read exactly like a clean tool, and eight
+   * read tools legitimately report zero sinks today, so a newly-zeroed one
+   * would be invisible. The entry names which of the two it was.
+   */
   unresolvedHandlers: string[];
   /**
-   * Anti-vacuity for the INLINE half of the target set. A table entry the
-   * analyzer cannot resolve lands in `unresolvedHandlers` and reds; an inline
-   * tool literal it cannot parse would just drop out of the analyzed set while
-   * the shipping router still classifies and still grants the bypass. These
-   * three make that silent drop loud.
+   * Every tool-literal name the analyzer resolved, across the whole tree and in
+   * source order, duplicates PRESERVED. The handler map is first-wins, so two
+   * literals sharing a name means the second was analyzed as if it did not
+   * exist. This is the full set rather than the inline-classified subset,
+   * because the table-classified tools are the majority and had no duplicate
+   * check at all.
+   */
+  resolvedToolLiteralNames: string[];
+  /**
+   * Anti-vacuity for the INLINE half of the target set, and the third of the
+   * three backstops rather than the second of two. A table ELEMENT this parser
+   * cannot read lands in `classification.unparsableTableElements`; a parsed
+   * table NAME with nothing behind it lands in `unresolvedHandlers`; an inline
+   * tool literal whose `tool_class` or `name` cannot be parsed would drop out
+   * of the analyzed set with no signal at all while the shipping router still
+   * classifies it and still grants the bypass. These three fields are what make
+   * that last drop loud.
    */
   inlineAntiVacuity: {
     /**
@@ -522,6 +604,9 @@ interface Analyzer {
   handlers: Map<string, { node: ts.Node; location: string }>;
   classification: ToolClassification;
   inlineAntiVacuity: ReachabilityReport["inlineAntiVacuity"];
+  resolvedToolLiteralNames: string[];
+  /** False when the handler literal exists but resolves to no walkable body. */
+  handlerWalkable(tool: string): boolean;
   sinksFor(tool: string): SinkHit[];
 }
 
@@ -591,9 +676,25 @@ function resolveToolName(
   return undefined;
 }
 
-/** Read a `const X: ReadonlySet<string> = new Set([...] as const)` table. */
-function readNameTable(source: ts.SourceFile, tableName: string): string[] {
+/**
+ * Read a `const X: ReadonlySet<string> = new Set([...] as const)` table.
+ *
+ * Returns the names AND the elements it could not read, because those two are
+ * the same measurement: the shipping `classifyMcpTools` builds this `Set` at
+ * RUNTIME, so an element this parser drops (a spread, a template with a
+ * substitution, an identifier) is still classified `read` by the router and
+ * still granted the audit-integrity bypass, while silently leaving the analyzed
+ * target set. A dropped element used to be indistinguishable from a shorter
+ * table; the `toBeGreaterThan` floor on the table length cannot see one tool
+ * go missing. Absent must not read as passing, so the skips are reported and
+ * the test asserts there are none.
+ */
+function readNameTable(
+  source: ts.SourceFile,
+  tableName: string
+): { names: string[]; skipped: string[] } {
   const names: string[] = [];
+  const skipped: string[] = [];
   const arrayOf = (expr: ts.Expression | undefined): ts.ArrayLiteralExpression | undefined => {
     if (expr === undefined) return undefined;
     if (ts.isArrayLiteralExpression(expr)) return expr;
@@ -611,15 +712,26 @@ function readNameTable(source: ts.SourceFile, tableName: string): string[] {
       node.initializer !== undefined &&
       ts.isNewExpression(node.initializer)
     ) {
-      const array = arrayOf(node.initializer.arguments?.[0]);
+      const argument = node.initializer.arguments?.[0];
+      const array = arrayOf(argument);
+      if (array === undefined && argument !== undefined) {
+        // The whole table is unreadable, which is worse than one element.
+        skipped.push(`${tableName}: whole initializer at ${locate(argument)}`);
+      }
       for (const element of array?.elements ?? []) {
-        if (ts.isStringLiteralLike(element)) names.push(element.text);
+        if (ts.isStringLiteralLike(element)) {
+          names.push(element.text);
+          continue;
+        }
+        skipped.push(
+          `${tableName}: <${ts.SyntaxKind[element.kind]}> element at ${locate(element)}`
+        );
       }
     }
     ts.forEachChild(node, visit);
   };
   visit(source);
-  return names;
+  return { names, skipped };
 }
 
 function enclosingFunctionName(node: ts.Node): string {
@@ -786,6 +898,18 @@ function indirectTargets(
   return out;
 }
 
+/**
+ * The name a call site spells for its callee, when it spells one at all. Shared
+ * by the walk and by the resolver's own nested resolutions so both classify a
+ * given expression under the same name; two copies of this three-line rule are
+ * how a call-site name and a declaration name drift apart.
+ */
+function calleeName(expr: ts.Expression): string | undefined {
+  if (ts.isPropertyAccessExpression(expr) || ts.isPropertyAccessChain(expr)) return expr.name.text;
+  if (ts.isIdentifier(expr)) return expr.text;
+  return undefined;
+}
+
 /** A function-typed property signature is a callable member, not a value. */
 function isCallablePropertySignature(decl: ts.Declaration): decl is ts.PropertySignature {
   if (!ts.isPropertySignature(decl)) return false;
@@ -810,6 +934,16 @@ export interface CalleeResolution {
   readonly classified: boolean;
   /** Declarations to walk into, used only when nothing was recognized. */
   readonly walkTargets: readonly ts.Declaration[];
+  /**
+   * Declarations reached because a function was passed as a VALUE at this call
+   * site rather than called at it (`["id"].forEach(execSync)`,
+   * `setTimeout(execSync, 0, "id")`, `Function.prototype.call.call(execSync,
+   * …)`). Kept separate from `walkTargets`, and walked UNCONDITIONALLY rather
+   * than only when the callee came back unrecognized: the callee of such a call
+   * is frequently a recognized boundary or a builtin, and gating the argument
+   * on the callee's verdict would drop precisely the case this exists for.
+   */
+  readonly valueTargets: readonly ts.Declaration[];
 }
 
 /**
@@ -1035,11 +1169,35 @@ export function createCalleeResolver(
     return undefined;
   }
 
-  /** The name a nested resolution should classify under, from its own shape. */
-  function nameOf(expr: ts.Expression): string | undefined {
-    if (ts.isPropertyAccessExpression(expr) || ts.isPropertyAccessChain(expr)) return expr.name.text;
-    if (ts.isIdentifier(expr)) return expr.text;
-    return undefined;
+  /**
+   * The arguments at this call site that are functions handed over as VALUES.
+   *
+   * A primitive passed rather than called is invoked by the callee, so no
+   * `CallExpression` in this file names it and neither the callee's
+   * declarations nor its type ever mention it: `["id"].forEach(execSync)` and
+   * `setTimeout(execSync, 0, "id")` each spawn a subprocess while the resolved
+   * callee is a standard-library method in no sink set. Classifying and walking
+   * the argument is what closes that, and it is the same move that reaches a
+   * named callback handed to a wrapper (an inline arrow was already walked as
+   * part of the enclosing body; a named one was not).
+   *
+   * The test is the argument's TYPE, not its spelling. An earlier draft of this
+   * accepted only an identifier or a property access, which is an enumeration
+   * of spellings and therefore reopens one spelling out (`fns[0]`, a ternary, a
+   * call returning a function). A string, an object literal, or a number has no
+   * call signature and costs one type lookup to skip. A function LITERAL is
+   * excluded because it is already inside the enclosing body the walk is
+   * traversing, so resolving it here would only re-walk it.
+   */
+  function functionValuedArguments(args: readonly ts.Expression[]): ts.Expression[] {
+    const out: ts.Expression[] = [];
+    for (const arg of args) {
+      const value = unwrapTypeOnly(arg);
+      if (ts.isArrowFunction(value) || ts.isFunctionExpression(value)) continue;
+      if (checker.getTypeAtLocation(value).getCallSignatures().length === 0) continue;
+      out.push(value);
+    }
+    return out;
   }
 
   function resolveAt(
@@ -1111,18 +1269,33 @@ export function createCalleeResolver(
     // is descended into instead of terminating at a standard-library
     // declaration outside `src`.
     const walkTargets = [...expanded];
+    const valueTargets: ts.Declaration[] = [];
     if (hop < MAX_REFLECTIVE_HOPS) {
       for (const target of indirectTargets(callee, args)) {
         // An indirect target is the FUNCTION being invoked, not another call
         // expression, so it carries no arguments of its own to pass down.
-        const nested = resolveAt(target, nameOf(target), [], hop + 1);
+        const nested = resolveAt(target, calleeName(target), [], hop + 1);
         sinks.push(...nested.sinks);
         if (nested.classified) classified = true;
         walkTargets.push(...nested.walkTargets.filter((decl) => !walkTargets.includes(decl)));
+        valueTargets.push(...nested.valueTargets.filter((decl) => !valueTargets.includes(decl)));
+      }
+
+      // FUNCTION-VALUED ARGUMENTS, resolved as targets in their own right.
+      // `classified` is deliberately NOT set from one: an argument says nothing
+      // about whether the CALLEE was recognized, and setting it here would stop
+      // the walk from descending into a `src`-local higher-order helper that
+      // happened to be handed a function.
+      for (const argument of functionValuedArguments(args)) {
+        const nested = resolveAt(argument, calleeName(argument), [], hop + 1);
+        sinks.push(...nested.sinks);
+        for (const decl of [...nested.walkTargets, ...nested.valueTargets]) {
+          if (!valueTargets.includes(decl)) valueTargets.push(decl);
+        }
       }
     }
 
-    return { sinks, classified, walkTargets };
+    return { sinks, classified, walkTargets, valueTargets };
   }
 
   return {
@@ -1145,6 +1318,7 @@ function buildAnalyzer(): Analyzer {
   const inlineWrite: string[] = [];
   const resolvedReadLiteralNames: string[] = [];
   const resolvedWriteLiteralNames: string[] = [];
+  const resolvedToolLiteralNames: string[] = [];
   const unresolvableToolLiterals: string[] = [];
   const unparsableToolClassLiterals: string[] = [];
 
@@ -1176,6 +1350,7 @@ function buildAnalyzer(): Analyzer {
           unparsableToolClassLiterals.push(relPath(sf.fileName));
         }
         if (name !== undefined && handler !== undefined) {
+          resolvedToolLiteralNames.push(name);
           if (!handlers.has(name)) handlers.set(name, { node: handler, location: locate(node) });
           if (inlineClass === "read") {
             inlineRead.push(name);
@@ -1207,12 +1382,20 @@ function buildAnalyzer(): Analyzer {
   if (indexSource === undefined) {
     throw new Error(`read-tool guard could not load ${relPath(INDEX_FILE)}`);
   }
+  const readTableParse = readNameTable(indexSource, "READ_MCP_TOOLS");
+  const writeTableParse = readNameTable(indexSource, "WRITE_MCP_TOOLS");
+  const operatorTableParse = readNameTable(indexSource, "OPERATOR_TERMINAL_ONLY_MCP_TOOLS");
   const classification: ToolClassification = {
-    readTable: readNameTable(indexSource, "READ_MCP_TOOLS"),
-    writeTable: readNameTable(indexSource, "WRITE_MCP_TOOLS"),
-    operatorTable: readNameTable(indexSource, "OPERATOR_TERMINAL_ONLY_MCP_TOOLS"),
+    readTable: readTableParse.names,
+    writeTable: writeTableParse.names,
+    operatorTable: operatorTableParse.names,
     inlineRead: [...new Set(inlineRead)].sort(),
     inlineWrite: [...new Set(inlineWrite)].sort(),
+    unparsableTableElements: [
+      ...readTableParse.skipped,
+      ...writeTableParse.skipped,
+      ...operatorTableParse.skipped,
+    ],
   };
 
   /** Every name the server treats as state-changing, for dispatch edges. */
@@ -1286,6 +1469,65 @@ function buildAnalyzer(): Analyzer {
 
   const resolver = createCalleeResolver(checker, implementationsOf);
 
+  /**
+   * Where a handler walk STARTS, and why that is not simply the `handler`
+   * property's initializer.
+   *
+   * `handler: async (args) => { … }` is a function literal and is walked as
+   * written. `handler: sovereigntyAuditHandler` is an IDENTIFIER: it contains
+   * no call expression at all, so a walk starting there terminates immediately
+   * and reports zero sinks while the function behind the name can spawn a
+   * subprocess. Hoisting a handler out of its literal is an ordinary refactor,
+   * not an exotic shape, and eight read tools legitimately report zero sinks
+   * today, so a newly-zeroed tool would be indistinguishable from them. The
+   * identifier is therefore resolved through the SAME callee chokepoint the
+   * walk uses, and the declarations behind it are what get walked.
+   *
+   * An EMPTY result is the loud case, never a quiet one: the caller records the
+   * tool in `unresolvedHandlers`, so a handler this analyzer cannot walk reds
+   * the guard instead of reading as clean.
+   */
+  interface HandlerEntry {
+    /** Nodes to walk. Empty means the handler did not resolve to a body. */
+    readonly walkFrom: readonly ts.Node[];
+    /** Sinks named by the handler position itself (`handler: execSync`). */
+    readonly sinks: readonly { readonly primitive: string; readonly sinkKind: SinkKind }[];
+  }
+
+  const handlerEntries = new Map<string, HandlerEntry>();
+
+  function handlerEntry(tool: string): HandlerEntry {
+    const memo = handlerEntries.get(tool);
+    if (memo !== undefined) return memo;
+    const entry = handlers.get(tool);
+    let resolved: HandlerEntry = { walkFrom: [], sinks: [] };
+    if (entry !== undefined) {
+      const node = entry.node;
+      if (
+        ts.isMethodDeclaration(node) ||
+        ts.isArrowFunction(node) ||
+        ts.isFunctionExpression(node)
+      ) {
+        // Walk the function node itself rather than its body, so a parameter
+        // default carrying a call is inside the walk.
+        resolved = { walkFrom: [node], sinks: [] };
+      } else {
+        // Everything else a `handler:` property can hold is an expression.
+        const expression = unwrapTypeOnly(node as ts.Expression);
+        const resolution = resolver.resolve(expression, calleeName(expression), []);
+        const walkFrom: ts.Node[] = [];
+        for (const decl of [...resolution.walkTargets, ...resolution.valueTargets]) {
+          if (!decl.getSourceFile().fileName.startsWith(SRC_DIR)) continue;
+          if (functionBody(decl) === undefined) continue;
+          if (!walkFrom.includes(decl)) walkFrom.push(decl);
+        }
+        resolved = { walkFrom, sinks: resolution.sinks };
+      }
+    }
+    handlerEntries.set(tool, resolved);
+    return resolved;
+  }
+
   function sinksFor(tool: string): SinkHit[] {
     const entry = handlers.get(tool);
     if (entry === undefined) return [];
@@ -1319,14 +1561,22 @@ function buildAnalyzer(): Analyzer {
       };
 
       const visit = (current: ts.Node): void => {
-        if (ts.isCallExpression(current) || ts.isNewExpression(current)) {
-          const callee = current.expression;
-          const memberName =
-            ts.isPropertyAccessExpression(callee) || ts.isPropertyAccessChain(callee)
-              ? callee.name.text
-              : ts.isIdentifier(callee)
-                ? callee.text
-                : undefined;
+        // A TAGGED TEMPLATE is an invocation, and the walk used to skip it.
+        // `Tpl.run\`id\`` calls `Tpl.run` with the template's parts, so a
+        // `src`-local tag function is reached exactly like any other callee and
+        // can do anything its body does. An earlier revision argued the shape
+        // was harmless because no sink in the sets above accepts a
+        // `TemplateStringsArray`; that argument only covers a BUILTIN used as
+        // the tag, and the reachable case is the source-local one.
+        const isCall = ts.isCallExpression(current) || ts.isNewExpression(current);
+        if (isCall || ts.isTaggedTemplateExpression(current)) {
+          const callee = ts.isTaggedTemplateExpression(current)
+            ? current.tag
+            : current.expression;
+          const callArguments = isCall
+            ? ((current as ts.CallExpression | ts.NewExpression).arguments ?? [])
+            : [];
+          const memberName = calleeName(callee);
           // One resolution per call site, shared by classification and the
           // walk. They must not resolve the callee separately: that split is
           // what let an interposed source-local declaration launder a builtin
@@ -1334,7 +1584,7 @@ function buildAnalyzer(): Analyzer {
           // The arguments go with it because a reflective invocation
           // (`Reflect.apply(fn, …)`) names its target there and not in the
           // callee.
-          const resolution = resolver.resolve(callee, memberName, current.arguments ?? []);
+          const resolution = resolver.resolve(callee, memberName, callArguments);
 
           // --- runtime primitive dispatch, resolved through its literal ------
           // `callPrimitive("state_write", ...)`: name a mutation edge when the
@@ -1375,22 +1625,28 @@ function buildAnalyzer(): Analyzer {
             record(current, sink.primitive, sink.sinkKind, memberName);
           }
 
-          if (!resolution.classified) {
-            for (const decl of resolution.walkTargets) {
-              if (!decl.getSourceFile().fileName.startsWith(SRC_DIR)) continue;
-              const body = functionBody(decl);
-              if (body === undefined) continue;
-              const frame = declarationFrame(decl);
-              const key = `${body.pos}|${currentFrame ?? ""}|${frame}`;
-              if (walked.has(key)) continue;
-              walked.add(key);
-              walk(
-                body,
-                [...chain, `${memberName ?? "?"}@${locate(decl)}`],
-                [...frames, frame],
-                depth + 1
-              );
-            }
+          // A recognized callee is not walked (that is the storage/audit
+          // boundary rule), but a function handed to it as a VALUE is walked
+          // either way: the callee's verdict is about the callee, and the
+          // argument is a separate target that this call site reaches.
+          const descendInto = [
+            ...(resolution.classified ? [] : resolution.walkTargets),
+            ...resolution.valueTargets,
+          ];
+          for (const decl of descendInto) {
+            if (!decl.getSourceFile().fileName.startsWith(SRC_DIR)) continue;
+            const body = functionBody(decl);
+            if (body === undefined) continue;
+            const frame = declarationFrame(decl);
+            const key = `${body.pos}|${currentFrame ?? ""}|${frame}`;
+            if (walked.has(key)) continue;
+            walked.add(key);
+            walk(
+              body,
+              [...chain, `${memberName ?? "?"}@${locate(decl)}`],
+              [...frames, frame],
+              depth + 1
+            );
           }
         }
         ts.forEachChild(current, visit);
@@ -1398,12 +1654,26 @@ function buildAnalyzer(): Analyzer {
       visit(node);
     };
 
-    walk(
-      entry.node,
-      [`${tool}@${entry.location}`],
-      [`${tool} handler@${relPath(entry.node.getSourceFile().fileName)}`],
-      0
-    );
+    const start = handlerEntry(tool);
+    for (const sink of start.sinks) {
+      // The handler property IS the primitive (`handler: execSync`). Recorded
+      // at the literal so it cannot pass for want of a call expression.
+      found.push({
+        kind: sink.sinkKind,
+        primitive: sink.primitive,
+        site: `${tool} handler@${relPath(entry.node.getSourceFile().fileName)}`,
+        caller: undefined,
+        via: [`${tool}@${entry.location}`],
+      });
+    }
+    for (const node of start.walkFrom) {
+      walk(
+        node,
+        [`${tool}@${entry.location}`],
+        [`${tool} handler@${relPath(node.getSourceFile().fileName)}`],
+        0
+      );
+    }
 
     const unique = new Map<string, SinkHit>();
     for (const hit of found) {
@@ -1424,6 +1694,8 @@ function buildAnalyzer(): Analyzer {
       unresolvableToolLiterals: [...new Set(unresolvableToolLiterals)].sort(),
       unparsableToolClassLiterals: [...new Set(unparsableToolClassLiterals)].sort(),
     },
+    resolvedToolLiteralNames,
+    handlerWalkable: (tool) => handlerEntry(tool).walkFrom.length > 0,
     sinksFor,
   };
 }
@@ -1447,7 +1719,14 @@ export function hasHandler(tool: string): boolean {
 }
 
 export function analyzeReadToolMutationReachability(): ReachabilityReport {
-  const { classification, handlers, inlineAntiVacuity, sinksFor } = analyzer();
+  const {
+    classification,
+    handlers,
+    inlineAntiVacuity,
+    resolvedToolLiteralNames,
+    handlerWalkable,
+    sinksFor,
+  } = analyzer();
   const readTools = [
     ...new Set([...classification.readTable, ...classification.inlineRead]),
   ].sort();
@@ -1459,7 +1738,14 @@ export function analyzeReadToolMutationReachability(): ReachabilityReport {
   for (const tool of readTools) {
     const entry = handlers.get(tool);
     if (entry === undefined) {
-      unresolvedHandlers.push(tool);
+      unresolvedHandlers.push(`${tool}: no tool literal`);
+      continue;
+    }
+    // A literal whose handler resolves to no walkable body is the same failure
+    // as an absent literal, and it used to be silent: the tool stayed in
+    // `handlers`, so nothing here saw it, and the walk reported nothing.
+    if (!handlerWalkable(tool)) {
+      unresolvedHandlers.push(`${tool}: handler at ${entry.location} has no walkable body`);
       continue;
     }
     handlerLocations.set(tool, entry.location);
@@ -1472,6 +1758,7 @@ export function analyzeReadToolMutationReachability(): ReachabilityReport {
     readTools,
     handlerLocations,
     unresolvedHandlers,
+    resolvedToolLiteralNames,
     inlineAntiVacuity,
     hits,
   };

@@ -13,11 +13,19 @@
  *      `src/index.ts` read by AST, unioned with every tool literal carrying an
  *      inline `tool_class: "read"`. Both are live classification inputs to
  *      `classifyMcpTools`. BOTH HALVES have an anti-vacuity backstop, and they
- *      are not the same backstop: a table entry that fails to resolve lands in
- *      `unresolvedHandlers`, while an inline literal that fails to parse would
- *      simply drop out of the analyzed set while the shipping router still
- *      classified it read and still granted the bypass. The
- *      `inlineAntiVacuity` assertions below are what make that drop loud.
+ *      are three distinct backstops rather than one, because there are three
+ *      distinct ways a tool can leave this analysis while the shipping router
+ *      still classifies it read and still grants the bypass:
+ *        - a table element this parser cannot read as a string literal, which
+ *          the runtime `Set` still contains (`unparsableTableElements`);
+ *        - a parsed table name with no tool literal behind it, or a literal
+ *          whose handler resolves to no walkable body (`unresolvedHandlers`);
+ *        - an inline literal whose `tool_class` or `name` this extractor cannot
+ *          parse (`inlineAntiVacuity`).
+ *      An earlier revision of this comment claimed the first case landed in
+ *      `unresolvedHandlers`. It did not: it landed nowhere, and the
+ *      order-of-magnitude floor on table length cannot see one tool go missing.
+ *      All three are asserted empty below.
  *   2. SINKS. Durable-state mutation and subprocess: the storage boundary under
  *      an inverted allowlist, the mutating `node:fs` entry points, the
  *      `node:child_process` spawn entry points, and a `callPrimitive` dispatch
@@ -28,8 +36,10 @@
  *      are still measured and are reported by the analyzer. A sink is matched
  *      on the DECLARATION the callee resolves to, never on the spelling at the
  *      call site, so interposing a local binding does not launder it; the
- *      laundering corpus below is the must-fail proof of that, and names the
- *      one shape it does not cover.
+ *      laundering corpus below is the must-fail proof of that. The corpus pins
+ *      CLOSED shapes only. It does not exhibit what it fails to catch, and a
+ *      reader must not take its extent for the closure's extent: the bound is
+ *      stated in prose on the analyzer and resolves in the private register.
  *   3. SOUNDNESS. The walk is a static, checker-resolved UNDER-approximation.
  *      The full bound, including the measured call sites through injected
  *      function-typed dependencies that it does NOT resolve, is stated with its
@@ -281,25 +291,44 @@ const GATED_KINDS = new Set(["mutation", "subprocess"]);
 // time it survived one indirection further out. A fixture that stops reporting
 // its primitive is the class reopening.
 //
-// PROVENANCE, CORRECTED. Of the first nineteen, SIXTEEN went red when the
-// corpus was run against a resolver with the expanded-set classification
-// disabled. Three did not, and were already caught by the pre-existing
-// alias-following in `calleeDeclarations`: "a re-export chain through two
-// hops", "a wildcard re-export", and "an object spread of a namespace import",
-// all three of which resolve straight back to the imported symbol through
-// `getAliasedSymbol`. An earlier description of this corpus said all nineteen
-// went red. They are kept anyway, since a shape closed by one mechanism is
-// exactly the shape a refactor of a different mechanism reopens.
+// PROVENANCE, STATED WITH ITS METHOD, because a count without one is not a
+// measurement and this corpus's count has been restated twice. Method: run the
+// corpus against a resolver with the expanded-set classification pass disabled,
+// and count the must-fail fixtures (those with a non-empty `expect`) whose
+// resolved primitive set becomes empty. Re-measured after the fourth attack
+// round, on the corpus as it stands: 32 of 44 must-fail fixtures flip, and of
+// the first nineteen, 16 flip.
+//
+// The three survivors among the first nineteen are "a re-export chain through
+// two hops", "a wildcard re-export", and "an object spread of a namespace
+// import", all of which resolve straight back to the imported symbol through
+// the pre-existing `getAliasedSymbol` alias-following in `calleeDeclarations`.
+// They are kept anyway, since a shape closed by one mechanism is exactly the
+// shape a refactor of a different mechanism reopens.
+//
+// The whole-corpus figure MOVED DOWN as the resolver got wider (an earlier
+// measurement on 41 must-fail fixtures gave 34), and that is the expected
+// direction rather than a regression: two fixtures that used to depend on the
+// expanded-set pass alone now also resolve through the function-valued-argument
+// path, so disabling one pass no longer blanks them. A fixture with two
+// independent routes to its primitive is a stronger pin, not a weaker one.
 //
 // They drive the SHIPPING resolver (`createCalleeResolver`) over a synthetic
 // program, not a copy of it, so a resolver change cannot pass here and regress
 // in the analyzer.
 //
-// ONLY CLOSED SHAPES ARE PINNED HERE, apart from the one declared-open case
-// below, which is the measured boundary and shows nothing the guard would
-// otherwise catch. A fixture for a shape that still evades would be a working
-// evasion of a live guard, published. Shapes found open by the attack rounds
-// are recorded in the private register under ABC-READCLASS-01.
+// ONLY CLOSED SHAPES ARE PINNED HERE, with no exception. A fixture for a shape
+// that still evades is a working evasion of a live guard, published in a public
+// repository, and this corpus shipped one such fixture as a drift tripwire
+// while stating the rule against it twice. Shapes found open by the attack
+// rounds are recorded in the private register under ABC-READCLASS-01 and are
+// bounded in prose on the analyzer, never spelled out here.
+//
+// EVERY MUST-STAY-CLEAN FIXTURE BELOW IS A NEGATIVE CONTROL, not a declared
+// gap: each one is an indirection the resolver DOES follow, over a primitive
+// that is deliberately absent from the sink sets. They prove the resolver still
+// discriminates after each widening, which is the failure a corpus of must-fail
+// shapes alone cannot detect.
 // ---------------------------------------------------------------------------
 
 interface LaunderingFixture {
@@ -802,40 +831,52 @@ export function launder(command: string): void {
 }
 `,
   },
+  // The fourth attack round: a primitive handed over as a VALUE rather than
+  // called. Nothing in this file's own text names it as a callee, so before the
+  // resolver looked at arguments these reported nothing at all while spawning a
+  // real subprocess. The tagged-template form of the same round is closed in
+  // the analyzer's walk rather than in the resolver, so it has no fixture here:
+  // its sink is found by descending into a source-local tag function, and this
+  // corpus resolves call sites without walking bodies.
   {
-    // THE DECLARED BOUND, PINNED SO IT CANNOT DRIFT UNNOTICED. This one is
-    // expected to stay unresolved: the interface member's ANNOTATION is the
-    // only type the call site can see, and following it back to the object
-    // literal that supplied the property needs dataflow rather than a lookup.
-    // It is the injected function-typed dependency class measured in the
-    // analyzer header, it is NOT closed, and it is listed here so a reader can
-    // see the boundary of the laundering closure instead of inferring one.
-    //
-    // DISTANCE IS NOT THE REASON, and the earlier wording implied it was by
-    // describing the literal as sitting at a construction site the callee has
-    // no syntactic link to. The fixture below is the narrow version, where the
-    // dependency arrives as a parameter. The class holds just as well with the
-    // literal in the SAME file, initialized on the line above the call, with
-    // the primitive visibly written into it: the annotation defeats the lookup
-    // at any distance. Read this fixture as one instance of the class, never as
-    // its extent.
-    //
-    // Not stated here: what else is still open. Those shapes are recorded in
-    // the private register under ABC-READCLASS-01, because a fixture for an
-    // unclosed shape is a working evasion published against a live guard.
-    what: "an injected function-typed dependency (the declared gap; stays open)",
-    expect: [],
+    what: "a primitive passed as a function value to a builtin higher-order call",
+    expect: ["child_process.execSync"],
     code: `
 import { execSync } from "node:child_process";
-interface Deps {
-  run: (command: string) => unknown;
-}
-export const deps: Deps = { run: execSync };
-export function launder(d: Deps, command: string): void {
-  d.run(command);
+export function launder(): void {
+  ["id"].forEach(execSync);
 }
 `,
   },
+  {
+    what: "a primitive passed as a function value to a deferred call",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+export function launder(): void {
+  setTimeout(execSync, 0, "id");
+}
+`,
+  },
+  {
+    what: "a reflective call one level out, target in argument zero",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+type Invoke = (target: unknown, thisArg: unknown, command: unknown) => unknown;
+export function launder(command: string): void {
+  (Function.prototype.call as unknown as Invoke)(execSync, null, command);
+}
+`,
+  },
+  // NO FIXTURE FOR AN OPEN SHAPE, INCLUDING THE MEASURED ONE. A fixture is a
+  // typecheck-clean, copy-pasteable spelling; a fixture for a shape the guard
+  // does not catch is a working evasion of a live guard, published in a public
+  // repository. This corpus carried one anyway — the measured dependency-call
+  // gap, pinned as an `expect: []` drift tripwire — while the file stated the
+  // rule against exactly that twice. The rule wins and the fixture is gone. The
+  // bound itself is not softened: it is stated in prose on the analyzer, and
+  // the shapes resolve only in the private register under ABC-READCLASS-01.
   {
     // The negative control. Without it a resolver that reported a sink for
     // every resolved builtin would satisfy every fixture above, so the corpus
@@ -886,6 +927,19 @@ function local(value: string): string {
 }
 export function launder(value: string): string {
   return local.call(null, value);
+}
+`,
+  },
+  {
+    // The control for the function-valued-argument closure. Resolving every
+    // callable argument is the widest of these widenings, so it needs the
+    // sharpest control: the same shape over a read-only primitive.
+    what: "a read-only primitive passed as a function value (must stay clean)",
+    expect: [],
+    code: `
+import { readFileSync } from "node:fs";
+export function launder(paths: string[]): void {
+  paths.forEach(readFileSync);
 }
 `,
   },
@@ -994,6 +1048,17 @@ describe("read-classified MCP tools and durable-state mutation", () => {
     );
   });
 
+  it("read every element of the shipping classification tables", () => {
+    // The anti-vacuity backstop for the TABLE half of the target set, and the
+    // counterpart of the inline one below. `classifyMcpTools` builds the same
+    // `Set` at RUNTIME, so an element this parser drops (a spread, an
+    // identifier, a template with a substitution) is still classified `read`
+    // and still granted the audit-integrity bypass while quietly leaving this
+    // analysis. The length floor above is order-of-magnitude and cannot see one
+    // tool go missing; this can.
+    expect(report.classification.unparsableTableElements).toEqual([]);
+  });
+
   it("classifies each tool exactly once", () => {
     // `classifyMcpTools` in src/index.ts checks the write table, then the
     // operator table, then the read table, then any inline tool_class. That
@@ -1036,11 +1101,16 @@ describe("read-classified MCP tools and durable-state mutation", () => {
     expect(unparsableToolClassLiterals).toEqual([]);
 
     // Two literals sharing a name means the handler map kept only the first and
-    // the second was analyzed as if it did not exist.
+    // the second was analyzed as if it did not exist. Checked over EVERY
+    // resolved tool literal, not just the inline-classified ones: the majority
+    // of read tools are classified by the `READ_MCP_TOOLS` table and carry no
+    // inline `tool_class`, so scoping this to the inline set (the earlier
+    // shape) left the larger half of the target set unguarded.
     const duplicates = (names: readonly string[]): string[] =>
       names.filter((name, index) => names.indexOf(name) !== index);
     expect(duplicates(resolvedReadLiteralNames)).toEqual([]);
     expect(duplicates(resolvedWriteLiteralNames)).toEqual([]);
+    expect(duplicates(report.resolvedToolLiteralNames)).toEqual([]);
 
     // Every literal the extractor RESOLVED has to appear in the parsed set it
     // feeds the analysis. Full-set equality, not a count: a count can match
@@ -1122,6 +1192,14 @@ describe("read-classified MCP tools and durable-state mutation", () => {
   it("classifies a laundered sink, whatever the indirection", () => {
     // One program for the whole corpus, so a fixture cannot pass by loading a
     // different `@types/node` than its neighbours.
+    //
+    // THE WHOLE CORPUS IS ONE TEST, which is a known weakness of this shape and
+    // is recorded rather than left for a reader to notice: a regression that
+    // blanks most of the corpus moves the repo-wide passing-test floor in
+    // `.test-baseline` by exactly one, so that floor is nearly blind to it. The
+    // whole-map equality below is what carries the signal instead. Splitting
+    // this into a case per fixture would put the corpus into the floor, at the
+    // cost of churning the floor whenever a fixture is added.
     const resolved = resolveLaunderingFixtures();
     const actual: Record<string, readonly string[]> = {};
     const expected: Record<string, readonly string[]> = {};
