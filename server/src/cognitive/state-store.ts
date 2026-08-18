@@ -1266,9 +1266,13 @@ export class StateStore {
    * MAC-authenticated anchor.
    *
    * INVARIANT: this check is an authenticated control in its own right. The
-   * floor it compares against was established by an earlier VERIFIED write or
-   * read and is MAC-authenticated on disk, so its authority does not come from
-   * the current access being able to resolve a writer key. Every
+   * floor it compares against is MAC-authenticated on disk, so its authority
+   * does not come from the current access being able to resolve a writer key.
+   * Note the floor's authority is INTEGRITY, not provenance: a verified read
+   * raises it, but so does `write()`, whose version can come from unattested
+   * on-disk bytes (STATE-WRITE-ANCHOR-01). Do not restate this as "established
+   * by an earlier verified write"; that is the claim this file's write-path
+   * block explicitly refuses to make. Every
    * rollback-enforcing access must therefore run it, including one whose
    * signature could not be verified: gating detection on verification would
    * turn "this read cannot establish the writer" into "this read cannot detect
@@ -1965,14 +1969,20 @@ export class StateStore {
     //
     // CHECK (every enforcing read): an entry BELOW the floor is a rollback
     // whether or not this read could resolve a writer key, because the floor's
-    // authority comes from the earlier verified access that set it, not from
-    // this one. The throw is also the ONLY signal such a read would produce -
-    // no internal consumer of `read()` inspects `signature_verified` - so
-    // suppressing the check would silently return a rolled-back value as truth.
+    // authority comes from the earlier access that set it, not from this one.
+    // The throw is also the only signal MOST callers would get: exactly one
+    // internal consumer inspects `signature_verified` (the cooperative
+    // surface's recall path, which denies on it); every other caller of
+    // `read()` drops it. So for all but that one path, suppressing the check
+    // would silently return a rolled-back value as truth.
     //
-    // RAISE (verified reads only): the floor only ever goes up, so a wrong pin
-    // can never be lowered back and is unrecoverable, while refusing to raise
-    // is recoverable. A legacy (v1) signature binds the ciphertext alone, not
+    // RAISE (verified reads only): the floor is monotone under SEQUENTIAL
+    // access, so a wrong pin is not recoverable by any ordinary later read,
+    // while refusing to raise is recoverable on the next verified read. (It is
+    // NOT monotone under concurrency: the anchor load-modify-store is not
+    // atomic, so interleaved raises can lose one another. That race is
+    // byte-identical on the pre-change path and is tracked as
+    // STATE-ANCHOR-RACE-01; do not read this line as a concurrency claim.) A legacy (v1) signature binds the ciphertext alone, not
     // namespace/key/version, so an unverified read cannot attest that this
     // entry belongs at this key at this version, and adopting its claimed
     // version would pin the floor from the weakest available source during
