@@ -214,9 +214,13 @@ describe("read-path durable side effects require a verified read", () => {
     const before = await rawBytes(storage, "memories", "unverified-legacy");
     expect(before).not.toBeNull();
 
-    const read = await stateStore.read("memories", "unverified-legacy");
-    expect(read?.value).toBe("evidence-under-investigation");
-    expect(read?.signature_verified).toBe(false);
+    // Since STATE-READ-REFUSE-01 the enforcing path refuses this read instead
+    // of returning the value flagged `signature_verified: false`. The property
+    // under test is unchanged and is asserted below: the refusal happens after
+    // the migration point, so the on-disk bytes must still be untouched.
+    await expect(
+      stateStore.read("memories", "unverified-legacy")
+    ).rejects.toMatchObject({ classification: "writer_unverified" });
 
     const after = await rawBytes(storage, "memories", "unverified-legacy");
     expect(after).toBe(before);
@@ -268,8 +272,9 @@ describe("read-path durable side effects require a verified read", () => {
     const before = await rawBytes(storage, ANCHORS_NAMESPACE, ANCHORS_KEY);
     expect(before).toBeNull();
 
-    const read = await stateStore.read("memories", "unverified-anchor");
-    expect(read?.signature_verified).toBe(false);
+    await expect(
+      stateStore.read("memories", "unverified-anchor")
+    ).rejects.toMatchObject({ classification: "writer_unverified" });
 
     // The anchor floor is monotone, so a pin taken from an unattested version
     // could never be lowered again; the read must leave the record untouched.
@@ -378,21 +383,30 @@ describe("read-path durable side effects require a verified read", () => {
     });
 
     const attacked = new StateStore(storage, MASTER_KEY);
-    const forgedRead = await attacked.read("memories", "policy");
-    expect(forgedRead?.signature_verified).toBe(false);
-    expect(forgedRead?.version).toBe(500);
+    await expect(attacked.read("memories", "policy")).rejects.toMatchObject({
+      classification: "writer_unverified",
+    });
 
     // The durable floor stays absent: an unattributable version must never
     // become a monotone pin that no later write could lower.
     expect(await rawBytes(storage, ANCHORS_NAMESPACE, ANCHORS_KEY)).toBeNull();
 
-    // Restore the genuine entry. A restarted process (the in-memory cache
-    // poisoned by the forged read is process-scoped) reads it normally.
+    // Restore the genuine entry. A restarted process reads it normally. The
+    // in-memory version cache in the ATTACKED process is still poisoned to 500
+    // and the same process still rejects the genuine entry as a rollback: the
+    // refusal added by STATE-READ-REFUSE-01 sits above the cache update in
+    // `readInternal`, but `getNamespaceHashes` populates that cache from raw
+    // on-disk bytes earlier in the same read, which is the separate, documented
+    // and still-open residual STATE-CACHE-FLOOR-01. Do not read the recovery
+    // below as a claim that the refusal cleans up the in-process floor.
     await storage.write(
       "memories",
       "policy",
       stringToBytes(genuineEntry!)
     );
+    await expect(attacked.read("memories", "policy")).rejects.toMatchObject({
+      classification: "rollback_detected",
+    });
     const recovered = new StateStore(storage, MASTER_KEY);
     const genuineRead = await recovered.read("memories", "policy");
     expect(genuineRead?.value).toBe("ALLOW=v5");
