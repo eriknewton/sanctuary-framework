@@ -116,7 +116,18 @@ export type StateVerificationClassification =
   | "kid_unknown"
   | "integrity_hash_mismatch"
   | "schema_mismatch"
-  | "rollback_detected";
+  | "rollback_detected"
+  // "the writer could not be established", which is a DISTINCT answer from all
+  // four above and must never be collapsed into one of them: the bytes are
+  // intact (not `integrity_hash_mismatch`), no signature was examined and found
+  // wrong (not `signature_mismatch`), the shape parsed (not `schema_mismatch`),
+  // and the version is at or above its floor (not `rollback_detected`). It is
+  // also distinct from `kid_unknown`, which a signed-envelope (v2+) read raises
+  // when key resolution fails outright; this one is raised by the enforcing read
+  // path when verification was REQUESTED and finished without establishing a
+  // writer. A caller that treats them as the same value loses the one
+  // distinction that tells it a migration, not a repair, is the remedy.
+  | "writer_unverified";
 
 export class StateVerificationError extends Error {
   readonly classification: StateVerificationClassification;
@@ -1511,6 +1522,18 @@ export class StateStore {
   /**
    * Read and decrypt state with default-on envelope verification.
    *
+   * This is the ENFORCING read path: it returns a value only when signature
+   * verification established the writer. An entry whose writer cannot be
+   * established throws `StateVerificationError` with classification
+   * `writer_unverified` rather than returning the plaintext with
+   * `signature_verified: false` (STATE-READ-REFUSE-01). Callers therefore no
+   * longer have to inspect `signature_verified` to be safe; on this path a
+   * returned result always carries it true. On a genuinely un-migrated pre-v2
+   * fortress whose writer identity is absent from `_identities`, those entries
+   * stop reading here until that identity is restored; `list`, `export`, and
+   * `delete` do not route through this method and are unaffected. Use
+   * `readUnverified` for a migration flow that must reach the plaintext first.
+   *
    * @param namespace - Logical grouping
    * @param key - State key
    * @param signerPublicKeyOrVerifyIntegrity - Optional expected public key for legacy callers, or verifyIntegrity boolean
@@ -1544,6 +1567,12 @@ export class StateStore {
    * This skips signature and rollback verification and is intentionally not
    * exposed through MCP tools. Integrity hash and decryption authentication
    * are still checked before plaintext is returned.
+   *
+   * It is the ONLY way to reach the plaintext of an entry whose writer cannot
+   * be established, because the enforcing `read` path refuses that entry
+   * (STATE-READ-REFUSE-01). It requests no verification (`verifySignature:
+   * false`), so the refusal there does not fire; that asymmetry is the whole
+   * point of this method and must survive any change to `readInternal`.
    */
   async readUnverified(
     namespace: string,
@@ -1915,7 +1944,11 @@ export class StateStore {
     // legacy-schema path where no AUTHENTICATED writer key resolves), so
     // absent and unproven both read as not-verified here. Every durable side
     // effect in this function gates on this one predicate so that a third one
-    // added later inherits the rule instead of being missed.
+    // added later inherits the rule instead of being missed. Since
+    // STATE-READ-REFUSE-01 this predicate ALSO decides whether a value is
+    // returned at all, but only when verification was requested: the
+    // `readUnverified` escape hatch passes `verifySignature: false`, so it
+    // reaches the return with this predicate false, by design.
     const durableSideEffectsPermitted = signatureVerified;
 
     // Decrypt
@@ -1970,11 +2003,15 @@ export class StateStore {
     // CHECK (every enforcing read): an entry BELOW the floor is a rollback
     // whether or not this read could resolve a writer key, because the floor's
     // authority comes from the earlier access that set it, not from this one.
-    // The throw is also the only signal MOST callers would get: exactly one
-    // internal consumer inspects `signature_verified` (the cooperative
-    // surface's recall path, which denies on it); every other caller of
-    // `read()` drops it. So for all but that one path, suppressing the check
-    // would silently return a rolled-back value as truth.
+    // The throw is also the only signal MOST callers would get. That used to be
+    // because exactly one internal consumer inspected `signature_verified` (the
+    // cooperative surface's recall path, which denies on it) while every other
+    // caller of `read()` dropped it. STATE-READ-REFUSE-01 removed the reliance
+    // on that flag by refusing the read outright further down, but this check
+    // must still run ABOVE that refusal: a rolled-back entry that also cannot
+    // be attributed has to be reported as the rollback it is, not as a generic
+    // failure to establish a writer, or the incident the anchor exists to make
+    // detectable is downgraded to a compatibility complaint.
     //
     // RAISE (verified reads only): the floor is monotone under SEQUENTIAL
     // access, so a wrong pin is not recoverable by any ordinary later read,
@@ -1993,6 +2030,56 @@ export class StateStore {
       } else {
         await this.assertNotBelowVersionFloor(namespace, key, stateEntry.ver);
       }
+    }
+
+    // REFUSAL (STATE-READ-REFUSE-01): a read that ASKED for verification and
+    // could not establish who wrote the entry does not hand the value back. It
+    // used to return the plaintext flagged `signature_verified: false`, which
+    // made an unestablished writer indistinguishable from an established one
+    // for every caller that did not read that flag, and exactly one production
+    // consumer did (the cooperative surface's recall path). Returning a value
+    // whose provenance this read could not establish is the silent degradation
+    // to a less-secure behavior that AGENTS.md MUST-NEVER #5 forbids, and
+    // making the safe outcome depend on every future caller remembering a flag
+    // is the shape that guarantees the next one forgets. Refusing here moves
+    // the obligation from the caller to this line.
+    //
+    // ORDERING MATTERS IN BOTH DIRECTIONS. This throw sits BELOW the
+    // rollback checks on purpose. Those checks are authenticated controls whose
+    // authority comes from the persisted floor, not from this read's ability to
+    // resolve a writer key, so they must still run and must still WIN when both
+    // conditions hold: a rolled-back entry that also cannot be attributed is
+    // reported as `rollback_detected`, the strictly more specific and more
+    // urgent finding, and refusing earlier would have suppressed detection
+    // along with the value (the regression PR #1270's gate caught). It also
+    // sits ABOVE the version-cache update on the same reasoning that keeps the
+    // durable anchor RAISE behind a verified read. That placement is NOT a
+    // claim that an unattributable version never reaches `versionCache`: it
+    // still does, from `getNamespaceHashes`, which populates the cache from raw
+    // on-disk versions earlier in this same read. That is the separate,
+    // still-open residual STATE-CACHE-FLOOR-01 and this change does not narrow
+    // it; the placement here only avoids ADDING a second write from a value
+    // this line is about to refuse.
+    //
+    // COMPATIBILITY BOUND, stated plainly because it is a real cost the owner
+    // accepted: on a genuinely un-migrated pre-v2 fortress whose writer
+    // identity is not present in `_identities` (or no longer decrypts), the
+    // affected entries stop returning through `state_read` and through every
+    // internal caller of `read()`. Their owner keeps every other sovereignty
+    // affordance AGENTS.md MUST-NEVER #2 requires: `state_list` reads metadata
+    // without decrypting, `state_export` serializes the stored entries straight
+    // from the storage backend, and `state_delete` removes them, none of which
+    // route through this function. The migration path is to restore the writer
+    // identity into the fortress, after which the first read verifies and
+    // migrates the entry to the signed-envelope schema in place;
+    // `readUnverified` remains the in-process escape hatch for a migration flow
+    // that must reach the plaintext first, and is deliberately not exposed
+    // through MCP.
+    if (options.verifySignature && !signatureVerified) {
+      throw new StateVerificationError(
+        "writer_unverified",
+        `Writer could not be established for ${namespace}/${key}: the enforcing read path returns a value only when signature verification succeeds`
+      );
     }
 
     // Update version cache
