@@ -25,6 +25,10 @@ on:
       - "!server/src/**/*.md"
       - "server/test/**/*.test.ts"
       - "scripts/verify-fail-before.sh"
+      # The guard's own guard. Without this entry a change to the harness alone
+      # would not run it, which is the same shape of silence the guard exists to
+      # prevent: a check that stops running emits no signal that it stopped.
+      - "scripts/verify-fail-before-self-test.sh"
       - ".github/workflows/verify-fail-before.yml"
   workflow_dispatch: {}
 
@@ -41,6 +45,20 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      # Runs BEFORE the Node setup on purpose: the harness drives
+      # verify-fail-before.sh against disposable git fixtures with a fake `npx`
+      # on PATH, so it needs neither Node nor `npm ci`, takes a few seconds, and
+      # a broken guard should red before two minutes of install.
+      #
+      # This step is the harness's only consumer. Its absence was the defect it
+      # now closes: the self-tests existed, passed, and were invoked by no
+      # workflow, no npm script, and no hook, so a change reverting the guard
+      # would have reddened nothing. It is deliberately a step in this job
+      # rather than a job of its own, because a new job name is a new check that
+      # every already-open PR would have to be updated to acquire.
+      - name: Self-test the fail-before guard
+        run: bash scripts/verify-fail-before-self-test.sh
 
       - name: Use Node.js 24
         uses: actions/setup-node@v7

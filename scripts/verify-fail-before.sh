@@ -21,67 +21,185 @@ trim_ws() {
   printf '%s' "$value"
 }
 
-# INVARIANT: an exemption is a PER-PULL-REQUEST assertion, never a permanent
-# property of a file. The marker exempts only the change that INTRODUCES it, so
-# a marker inherited from the base ref does not exempt this PR's edits to the
-# same file.
-#
-# This exists because the file-scoped version caused a proven silent miss. A
-# marker written for one test in `server/test/mesh/lifecycle.test.ts` exempted
-# that whole file permanently; a later security PR changed 86 lines of it
-# alongside five other test files, the siblings satisfied the gate, and those 86
-# lines went mechanically unverified with NO signal at all. The loud failure
-# (a PR whose only changed test file is the exempt one) is the lucky case; the
-# silent one is the dangerous one, and the tempting "fix" for the loud case
-# (add a second changed test file) is exactly the silent path.
-#
-# Failure mode from the outside: an inherited marker now prints
-# `INHERITED-EXEMPTION-IGNORED` and the file is verified normally. If that
-# genuinely must not happen, restate the marker in this PR (which makes the
-# exemption an explicit, reviewable line in the diff) or use SKIP_FAIL_BEFORE
-# with a reason, which is logged.
-marker_introduced_in_this_range() {
-  local test_file="$1"
-  git diff "$BASE_REF"...HEAD -- "$test_file" 2>/dev/null \
-    | grep -qE '^\+[[:space:]]*// fail-before-exempt:'
+# INVARIANT: the two reasons being compared are normalized identically, because
+# the comparison decides whether an exemption was re-asserted. Leading and
+# trailing whitespace is trimmed and internal runs are collapsed, so a cosmetic
+# re-spacing of the reason cannot pass as a fresh assertion. A trailing space is
+# invisible under GitHub's "Hide whitespace changes", so a comparison that
+# honored it would let a re-assertion nobody can see in review stand as one.
+normalize_reason() {
+  local value
+  value="$(printf '%s' "$1" | tr -s '[:space:]' ' ')"
+  trim_ws "$value"
 }
 
-exemption_reason_for_test_file() {
-  local test_file="$1"
+# The marker window is the first 30 lines of a test file. Prints the trimmed
+# reason and returns 0 when a marker is present (the reason MAY be empty; the
+# caller decides whether that is an error), 1 when the window carries none.
+#
+# INVARIANT: both sides of the base-vs-HEAD comparison below read through THIS
+# function. A second, hand-written parser for the base side is how the two sides
+# would drift about where the window ends or how whitespace is trimmed, and a
+# drifted parser reads as "the reason changed", which exempts.
+marker_reason_from_stdin() {
   local line=""
   local trimmed=""
-  local raw_reason=""
   local reason=""
   local line_no=0
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     line_no=$((line_no + 1))
-    [[ "$line_no" -gt 30 ]] && break
+    if [[ "$line_no" -gt 30 ]]; then
+      break
+    fi
     trimmed="$(trim_ws "$line")"
     case "$trimmed" in
       "// fail-before-exempt:"*)
-        raw_reason="${trimmed#// fail-before-exempt:}"
-        reason="$(trim_ws "$raw_reason")"
-        if [[ -z "$reason" ]]; then
-          echo "FAIL: fail-before-exempt marker in $test_file has an empty reason; use // fail-before-exempt: <non-empty reason>." >&2
-          return 2
-        fi
+        reason="$(trim_ws "${trimmed#// fail-before-exempt:}")"
         printf '%s\n' "$reason"
         return 0
         ;;
     esac
-  done < "$test_file"
+  done
 
   return 1
+}
+
+exemption_reason_for_test_file() {
+  local test_file="$1"
+  local reason=""
+  local status=0
+
+  set +e
+  reason="$(marker_reason_from_stdin < "$test_file")"
+  status=$?
+  set -e
+
+  if [[ "$status" -ne 0 ]]; then
+    return 1
+  fi
+  if [[ -z "$reason" ]]; then
+    echo "FAIL: fail-before-exempt marker in $test_file has an empty reason; use // fail-before-exempt: <non-empty reason>." >&2
+    return 2
+  fi
+  printf '%s\n' "$reason"
+  return 0
+}
+
+# Resolves the path this file occupied at the merge base. Falls back to the
+# file's own path, which is the answer for everything that was not renamed.
+#
+# INVARIANT: a rename must be paired before the base version is read. A
+# pathspec-limited diff cannot pair a rename source, so a renamed file reads as
+# wholly added and its INHERITED marker would read as introduced here. Failure
+# mode from the outside: one directory reorg re-asserts every inherited
+# exemption in the tree at once, and GitHub renders the move as `old -> new`
+# with the marker line not highlighted at all, so there is nothing to review.
+# A COPY is deliberately not paired: the copied path is genuinely new and its
+# marker renders as an added line in review, which is the reviewable artifact
+# this gate is asking for.
+base_path_for_test_file() {
+  local head_path="$1"
+  local i=0
+  while [[ "$i" -lt "${#RENAME_NEW_PATHS[@]}" ]]; do
+    if [[ "${RENAME_NEW_PATHS[$i]}" == "$head_path" ]]; then
+      printf '%s' "${RENAME_OLD_PATHS[$i]}"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  printf '%s' "$head_path"
+}
+
+# INVARIANT: an exemption is a PER-CHANGE assertion, never a permanent property
+# of a file. The marker exempts only the change that introduces or restates it,
+# so a marker inherited unchanged from the merge base does not exempt this
+# change's edits to the same file.
+#
+# The test is a CONTENT comparison: the marker reason at the merge base against
+# the reason at HEAD, read through the same window by the same parser. It never
+# looks at diff text, and that is the point. A diff-shaped test ("was a marker
+# line added in this range?") is satisfiable three ways a reviewer cannot see:
+# by a rename (the pathspec-limited diff cannot pair the source, so the whole
+# file reads as added), by a marker-shaped line added anywhere ELSE in the file
+# (so the line that proves re-assertion is not the line whose reason is consumed
+# and logged), and by a trailing space on the marker line (which vanishes under
+# "Hide whitespace changes"). Requiring the REASON itself to change makes
+# re-assertion a real edit that shows up as changed text.
+#
+# This exists because the file-scoped version caused a proven silent miss. A
+# marker written for one test in `server/test/mesh/lifecycle.test.ts` exempted
+# that whole file permanently; a later security PR changed 86 lines of it
+# alongside six other changed test files, the siblings satisfied the gate, and
+# those 86 lines went mechanically unverified with NO signal at all. The loud
+# failure (a change whose only edited test file is the exempt one) is the lucky
+# case; the silent one is the dangerous one.
+#
+# Failure mode from the outside: an inherited marker now prints
+# `INHERITED-EXEMPTION-IGNORED` and the file is verified normally. If that
+# genuinely must not happen, restate the marker with a reason that describes
+# THIS change, or use SKIP_FAIL_BEFORE with a reason, which is logged.
+marker_is_asserted_by_this_change() {
+  local test_file="$1"
+  local head_reason="$2"
+  local base_path=""
+  local base_blob=""
+  local base_reason=""
+  local show_status=0
+  local parse_status=0
+
+  base_path="$(base_path_for_test_file "$test_file")"
+
+  # No counterpart at the merge base (a genuinely new file, or a rename whose
+  # source is itself new): a marker here cannot have been inherited.
+  if ! git cat-file -e "$MERGE_BASE:$base_path" 2>/dev/null; then
+    return 0
+  fi
+
+  # The blob is captured whole rather than piped into the parser. The parser
+  # stops at the first marker, so a pipe would leave `git show` writing into a
+  # closed pipe; with `pipefail` set at the top of this script, that SIGPIPE
+  # (141) would propagate and be read as "no marker at the base", which exempts.
+  # It only bites once a file exceeds the pipe buffer, so the marker's meaning
+  # would silently depend on file size.
+  set +e
+  base_blob="$(git show "$MERGE_BASE:$base_path" 2>/dev/null)"
+  show_status=$?
+  set -e
+
+  # The base version exists but could not be read. Fail closed: treat the marker
+  # as inherited, which routes the file to normal verification.
+  if [[ "$show_status" -ne 0 ]]; then
+    return 1
+  fi
+
+  set +e
+  base_reason="$(marker_reason_from_stdin <<<"$base_blob")"
+  parse_status=$?
+  set -e
+
+  # No marker at the base: this change introduced it.
+  if [[ "$parse_status" -ne 0 ]]; then
+    return 0
+  fi
+
+  # Present at both. Only a CHANGED reason is a fresh assertion; an identical
+  # reason is the inherited one wearing a new commit.
+  [[ "$(normalize_reason "$base_reason")" != "$(normalize_reason "$head_reason")" ]]
 }
 
 record_file_exemption() {
   local test_file="$1"
   local reason="$2"
-  printf '[%s] fail-before-exempt file=%s base_ref=%s branch=%s head=%s actor=%s reason=%s\n' \
+  # merge_base is recorded alongside base_ref because the merge base, not the
+  # base branch tip, is the commit the exemption was judged against; an audit
+  # reader who cannot see which commit the reason was compared to cannot check
+  # the decision.
+  printf '[%s] fail-before-exempt file=%s base_ref=%s merge_base=%s branch=%s head=%s actor=%s reason=%s\n' \
     "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
     "$test_file" \
     "$BASE_REF" \
+    "$(git rev-parse --short "$MERGE_BASE")" \
     "$(git branch --show-current 2>/dev/null || echo unknown)" \
     "$(git rev-parse --short HEAD)" \
     "${GITHUB_ACTOR:-${USER:-unknown}}" \
@@ -108,6 +226,19 @@ fi
 
 if ! git rev-parse --verify "$BASE_REF^{commit}" >/dev/null 2>&1; then
   echo "Base ref does not resolve to a commit: $BASE_REF" >&2
+  exit 2
+fi
+
+# INVARIANT: the base-side blob read must come from the SAME commit the
+# three-dot diffs below compare against, or a file could read as "changed by
+# this branch" against one commit and "unchanged" against another. `A...B` is by
+# definition `merge-base(A,B) B`, so the merge base IS that commit; reading
+# `$BASE_REF` directly would consult the base BRANCH TIP and mistake a marker
+# that landed on main after the branch point for one this branch inherited.
+# Failure mode from the outside: a shallow clone has no merge base, and this
+# exits 2 loudly rather than silently treating every marker as introduced.
+if ! MERGE_BASE="$(git merge-base "$BASE_REF" HEAD 2>/dev/null)"; then
+  echo "FAIL: could not resolve a merge base between $BASE_REF and HEAD." >&2
   exit 2
 fi
 
@@ -177,6 +308,25 @@ if [[ ${#CHANGED_TESTS[@]} -eq 0 ]]; then
   exit 1
 fi
 
+# `-M` asks git for the rename pairs it already detects; `--diff-filter=R` keeps
+# only renames, so a copy stays an addition. Consumed by base_path_for_test_file
+# above, whose invariant comment explains why pairing is load-bearing.
+RENAME_OLD_PATHS=()
+RENAME_NEW_PATHS=()
+RENAME_RAW="$(mktemp "${TMPDIR:-/tmp}/verify-fail-before-renames.XXXXXX")"
+if ! git diff -M --diff-filter=R --name-status "$MERGE_BASE" HEAD -- server/test > "$RENAME_RAW"; then
+  echo "FAIL: could not resolve server/test rename pairs between $MERGE_BASE and HEAD." >&2
+  rm -f "$RENAME_RAW"
+  exit 2
+fi
+while IFS=$'\t' read -r rename_status rename_old rename_new; do
+  [[ "$rename_status" == R* ]] || continue
+  [[ -z "$rename_new" ]] && continue
+  RENAME_OLD_PATHS+=("$rename_old")
+  RENAME_NEW_PATHS+=("$rename_new")
+done < "$RENAME_RAW"
+rm -f "$RENAME_RAW"
+
 COVERED_TESTS=()
 EXEMPT_TESTS=()
 for test_file in "${CHANGED_TESTS[@]}"; do
@@ -185,10 +335,13 @@ for test_file in "${CHANGED_TESTS[@]}"; do
   exemption_status=$?
   set -e
 
-  if [[ "$exemption_status" -eq 0 ]] && ! marker_introduced_in_this_range "$test_file"; then
-    # The marker came from the base ref, so it was written for a different
-    # change. It does not speak for this one.
-    echo "INHERITED-EXEMPTION-IGNORED($test_file): the fail-before-exempt marker predates this change, so it does not exempt it; this file will be verified normally. Restate the marker in this change if the exemption genuinely applies."
+  # The reason compared here is the same string that is printed and logged
+  # below, so the assertion that authorizes the exemption and the assertion the
+  # audit record names can never be two different lines.
+  if [[ "$exemption_status" -eq 0 ]] && ! marker_is_asserted_by_this_change "$test_file" "$exemption_reason"; then
+    # The marker's reason is unchanged from the one at the merge base, so it was
+    # written for a different change. It does not speak for this one.
+    echo "INHERITED-EXEMPTION-IGNORED($test_file): the fail-before-exempt marker is unchanged from the merge base, so it was written for a different change and does not exempt this one; this file will be verified normally. Restate the marker with a reason that describes THIS change if the exemption genuinely applies."
     COVERED_TESTS+=("$test_file")
   elif [[ "$exemption_status" -eq 0 ]]; then
     EXEMPT_TESTS+=("$test_file")

@@ -72,6 +72,10 @@ castle-wall-vmm/Package.resolved
 * [0-9].md
 
 .test-baseline-overrides.log
+# Written into the repo root by scripts/verify-fail-before.sh whenever a run
+# records an exemption or a SKIP_FAIL_BEFORE override. Local runs left it as an
+# untracked file one `git add .` away from being committed.
+.fail-before-overrides.log
 
 # Marker written by the vitest globalSetup for the duration of a run; the
 # credential chokepoint reads it so a child spawned with a scrubbed env still
