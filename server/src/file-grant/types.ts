@@ -355,3 +355,46 @@ export class FileGrantMintFailedError extends Error {
     this.name = "FileGrantMintFailedError";
   }
 }
+
+/**
+ * One persisted grant record that could not be read back. Carries the grant id
+ * (the StateStore key) and the underlying cause; it deliberately carries no
+ * path, since an unreadable record's scope is exactly what could not be read.
+ */
+export interface FileGrantUnreadableEntry {
+  grant_id: string;
+  cause: unknown;
+}
+
+/**
+ * The result of a per-entry-tolerant grant listing: the grants that read back,
+ * plus the ones that did not. The two halves travel together on purpose -- a
+ * consumer handed only `grants` cannot tell a complete set from a partial one,
+ * and would read the missing records as absent rather than as unread.
+ */
+export interface FileGrantListing {
+  grants: FileGrant[];
+  unreadable: FileGrantUnreadableEntry[];
+}
+
+/**
+ * Raised when one or more persisted grant records could not be read back.
+ * Names the grant ids so an operator can act, and never the scope paths (an
+ * unreadable record's path is not known, and a readable neighbour's is not this
+ * error's business).
+ */
+export class FileGrantUnreadableEntriesError extends Error {
+  constructor(
+    public readonly grantIds: readonly string[],
+    public readonly cause: unknown
+  ) {
+    super(
+      `Governed File-Grant: ${grantIds.length} grant record(s) could not be ` +
+        `read back (${grantIds.join(", ")}). Their tree entries were left ` +
+        `untouched because their state is unknown; every readable grant was ` +
+        `still reconciled. ` +
+        `Cause: ${cause instanceof Error ? cause.message : String(cause)}`
+    );
+    this.name = "FileGrantUnreadableEntriesError";
+  }
+}

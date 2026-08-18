@@ -184,12 +184,13 @@ describe("file-grant reconcile: expired grants are actually scrubbed", () => {
       { fsOps, store: grantStore, now: new Date("2026-07-07T00:00:00.000Z"), auditLog },
     );
 
-    // A store whose list() works but whose put() (the status flip) throws. The
-    // scrub is the safety-critical action and must run BEFORE / independently of
-    // the status write, so a status-write throw must NOT skip the scrub. The
-    // throw is still surfaced (bookkeeping lag), but access is already gone.
+    // A store whose listEntries() works but whose put() (the status flip)
+    // throws. The scrub is the safety-critical action and must run BEFORE and
+    // independently of the status write, so a status-write throw must NOT skip
+    // the scrub. The throw is still surfaced (bookkeeping lag), but access is
+    // already gone.
     const statusPutThrows = {
-      list: () => grantStore.list(),
+      listEntries: () => grantStore.listEntries(),
       put: async () => {
         throw new Error("status persist failed");
       },

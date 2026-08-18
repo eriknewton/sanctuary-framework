@@ -167,6 +167,13 @@ export class SanctuaryContextReader {
   }
 
   private async readTaskState(): Promise<TaskStateContext> {
+    // No local catch, and that is a contract on the callee, not an oversight:
+    // `TaskService.list` is per-row tolerant (it skips and audits a row it
+    // cannot read) precisely so this surface does not have to be. It matters
+    // here because `readContext` fans these surfaces out through `Promise.all`,
+    // so one rejection loses ALL SIX surfaces, not just this one. If that
+    // tolerance is ever removed from `TaskService.list`, this call needs its own
+    // guard, the way `readStateStore` below guards its per-key payload read.
     const tasks = this.deps.taskService ? await this.deps.taskService.list() : [];
     const status_counts = TASK_STATUSES.reduce(
       (acc, status) => ({ ...acc, [status]: 0 }),

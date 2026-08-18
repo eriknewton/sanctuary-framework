@@ -4,6 +4,7 @@ import { randomBytes } from "../../core/random.js";
 import { stringToBytes } from "../../core/encoding.js";
 import type { StoredIdentity } from "../../core/identity.js";
 import type { StateStore } from "../../cognitive/state-store.js";
+import { scanNamespaceEntries } from "../../cognitive/namespace-scan.js";
 import type { AuditLog } from "../audit-log.js";
 import {
   TASK_STATUSES,
@@ -95,17 +96,33 @@ export class TaskService {
     return task;
   }
 
+  /**
+   * List this fortress's tasks.
+   *
+   * SKIP-AND-RECORD PER ROW. One stored task that cannot be read back (an
+   * unresolvable writer key, a failed integrity check) or cannot be normalized
+   * must not take the whole listing down: this method backs the hub tasks
+   * endpoint, the CLI task list, and the concierge's task-state surface, and a
+   * propagating row error turns all three into a total outage over a single bad
+   * row. The failed rows are audited rather than discarded, because a listing
+   * that is quietly shorter than the truth is the same absent-reads-as-present
+   * conflation in the other direction.
+   *
+   * `get()` deliberately keeps propagating: a caller asking for ONE task by id
+   * must never be told it does not exist when it merely could not be read.
+   *
+   * STATED BOUND: the unreadable count reaches the audit log, not yet the hub
+   * JSON response or the CLI output.
+   */
   async list(filter: ListTasksFilter = {}): Promise<Task[]> {
-    const listed = await this.deps.stateStore.list(
+    const { items: tasks, failures } = await scanNamespaceEntries<Task>(
+      this.deps.stateStore,
       TASK_NAMESPACE,
-      this.keyPrefix(),
-      undefined,
-      10_000,
+      (value) => normalizeTask(JSON.parse(value)),
+      { prefix: this.keyPrefix() },
     );
-    const tasks: Task[] = [];
-    for (const entry of listed.keys) {
-      const task = await this.readTaskByKey(entry.key);
-      if (task) tasks.push(task);
+    for (const failure of failures) {
+      await this.auditUnreadableTaskRow(failure.key, failure.error);
     }
     return tasks
       .filter((task) => task.fortress_id === this.deps.fortressId)
@@ -247,6 +264,31 @@ export class TaskService {
         approval_request_id: task.approval_request_id,
       },
     });
+  }
+
+  /**
+   * Durable record that a stored task row could not be read back. Best-effort:
+   * an audit-write failure must not turn a listing that DID recover most rows
+   * into a total failure, which is the exact outage this method exists to
+   * prevent. The key is recorded; the row's contents are not, since they are
+   * what could not be read.
+   */
+  private async auditUnreadableTaskRow(key: string, cause: unknown): Promise<void> {
+    try {
+      await this.deps.auditLog.appendCritical({
+        layer: "l2",
+        operation: "task.list_row_unreadable",
+        identity_id: this.deps.identityId,
+        result: "failure",
+        details: {
+          event_type: "task.list_row_unreadable",
+          state_key: key,
+          reason: cause instanceof Error ? cause.message : String(cause),
+        },
+      });
+    } catch {
+      // Best-effort by design; see the doc-comment above.
+    }
   }
 
   private keyPrefix(): string {

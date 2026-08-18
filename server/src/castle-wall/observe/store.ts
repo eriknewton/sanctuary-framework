@@ -16,6 +16,20 @@
  * it must never be a policy-inference oracle for the agent it describes
  * (Invariant #7, property #11; adversarial review finding M1).
  *
+ * WHY THE LISTING LOOPS BELOW DO NOT USE THE TOLERANT NAMESPACE SCAN. The
+ * shared `cognitive/namespace-scan.ts` fan-out isolates a per-entry read
+ * failure so a caller can act on a partial set. That is right where a partial
+ * set is still useful, and wrong here. Each of these three loops feeds a
+ * consumer that treats a MISSING row as a positive verdict: an absent
+ * `source-state:` row means "this source never contributed", which is what
+ * carries definitive-empty authority downstream; an absent `candidate:` row
+ * means "no denial was observed for this destination"; an absent
+ * `candidate-review:` row means "not yet reviewed". Skipping an unreadable row
+ * would be indistinguishable from those, so an unreadable row would be READ AS
+ * A PASS. A propagating read failure is the fail-closed answer here, and the
+ * malformed-row cases that CAN be told apart are already routed to the
+ * `quarantined` lists rather than dropped. Do not "fix" these into tolerance.
+ *
  * THE RED-LINE INVARIANT: nothing in this file, or anywhere reachable from
  * it, ever writes to the live signed allowlist manifest. This store is
  * read/written ONLY by the observe CLI surface and `promote.ts`'s

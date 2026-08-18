@@ -13,6 +13,7 @@ export {
   FileGrantModeRejectedError,
   FileGrantMintFailedError,
   FileGrantAgentIdRejectedError,
+  FileGrantUnreadableEntriesError,
   isSafeFileGrantAgentId,
 } from "./types.js";
 export type {
@@ -31,6 +32,8 @@ export type {
   FileGrantAclRemovalStatus,
   FileGrantRemoveEntryOptions,
   FileGrantRemoveEntryResult,
+  FileGrantListing,
+  FileGrantUnreadableEntry,
   FsOps,
   TreePlan,
   TreePlanEntry,
