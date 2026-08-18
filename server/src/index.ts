@@ -1954,6 +1954,18 @@ const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([
   "memory_attest",
   "memory_delete",
   "memory_insert",
+  // `proof_commitment` mints a new commitment record and persists it to the
+  // encrypted commitment store, so it belongs with the other commitment-minting
+  // verbs (`zk_commit`, `zk_prove`, `zk_range_prove`, all below) rather than
+  // with the verifiers. Classification is what the router's audit-integrity
+  // gate keys on, so this entry is the line that decides whether a
+  // state-creating call still runs while the audit chain has findings; the
+  // answer for anything that creates new persisted state is no. This one
+  // correction was established by reading the handler; the systematic
+  // reconciliation of the whole read set against what each handler can reach is
+  // a separate change and has not landed, so nothing mechanical checks this
+  // entry today (ABC-READCLASS-01, open).
+  "proof_commitment",
   "proof_reveal",
   "reputation_export",
   "reputation_import",
@@ -1982,6 +1994,29 @@ const OPERATOR_TERMINAL_ONLY_MCP_TOOLS: ReadonlySet<string> = new Set([
   "context_gate_set_policy",
 ] as const);
 
+/**
+ * Tools the router may run while the audit chain reports integrity findings, so
+ * an operator can always introspect a fortress that is in trouble. Membership
+ * here is therefore a claim that the tool's handler introspects and does not
+ * create or destroy persisted state.
+ *
+ * Must match the bypass site in `router.ts` (`tool.tool_class === "read"`),
+ * which is the only place membership here has an effect. Adding a name is a
+ * security decision made at that site, not a taxonomy entry made at this one.
+ *
+ * NOTHING MECHANICAL CHECKS THIS TABLE TODAY, stated plainly so a reader does
+ * not assume a guard that is not here. A name added without reading its handler
+ * widens what may run against a fortress whose audit chain has findings, and no
+ * test reds. Reconciling the whole table against what each handler's call graph
+ * can actually reach is tracked as ABC-READCLASS-01, which stays OPEN: it is
+ * deferred to its own change and is not closed by the one correction that
+ * shipped with this comment.
+ *
+ * THIS TABLE IS ONLY HALF THE READ SET. `classifyMcpTools` below also honors an
+ * inline `tool_class: "read"` on a tool literal, and those tools get exactly the
+ * same bypass without ever appearing here. Any future reconciliation has to
+ * cover both halves; a review that reads only this table has read half the set.
+ */
 const READ_MCP_TOOLS: ReadonlySet<string> = new Set([
   "bridge_verify",
   "compliance_eu_ai_act_annex_iii_classify",
@@ -2006,7 +2041,6 @@ const READ_MCP_TOOLS: ReadonlySet<string> = new Set([
   "monitor_health",
   "principal_baseline_view",
   "principal_policy_view",
-  "proof_commitment",
   "reputation_query",
   "reputation_query_weighted",
   "sanctuary_policy_status",

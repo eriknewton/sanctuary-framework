@@ -270,11 +270,14 @@ export function createServer(
       // classified `write` — `accept_broken_chain` is no longer an accepted
       // argument at all (see tool-args.ts), and no other agent-facing field
       // substitutes for it. That guarantee is scoped to classification: it
-      // holds only for tools correctly classified `write`. The bypass below
-      // keys off `tool.tool_class`, so a tool misclassified `read` whose
-      // handler actually performs a write escapes this check structurally,
-      // independent of any argument — a classification-correctness question
-      // this argument-level change does not close. Findings persisting is a
+      // holds only for tools correctly classified `write`, because this branch
+      // and the bypass below both key off `tool.tool_class` and neither looks
+      // at what a handler does. Classification correctness is therefore a
+      // separate property, and it has no gate: the read set in `index.ts`
+      // (`READ_MCP_TOOLS`, plus every tool literal carrying an inline
+      // `tool_class: "read"`) is maintained by review, so what this branch can
+      // promise is bounded by that set being right (ABC-READCLASS-01, open).
+      // Findings persisting is a
       // hard stop for `write` tools, not a request for consent to proceed
       // past them: restoring MCP write capability once the audit chain has
       // integrity findings is not currently implemented anywhere in this
@@ -316,7 +319,17 @@ export function createServer(
 
       // Read tools bypass the audit-integrity gate unconditionally (an
       // operator must always be able to introspect); write tools never do,
-      // since the override branch above is gone.
+      // since the override branch above is gone. This line is why the read set
+      // is a security-relevant list and not a taxonomy: a handler reached from
+      // here also gets its audit appends admitted onto a chain that already has
+      // findings. What keeps that set honest today is review, not a test.
+      // Note WHICH set, because `tool_class` is assigned two different ways:
+      // the `READ_MCP_TOOLS` table in index.ts (see the contract note on it)
+      // UNIONED with every tool literal carrying an inline
+      // `tool_class: "read"`. The inline half is the one an editor is likely to
+      // assume the table covers, and it does not. Reconciling both halves
+      // against what each handler's call graph can reach is ABC-READCLASS-01,
+      // open and deferred to its own change.
       const shouldBypassAuditIntegrity = tool.tool_class === "read";
       const result =
         shouldBypassAuditIntegrity && options?.auditLog
