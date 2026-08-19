@@ -235,14 +235,22 @@ export async function reconcileFileGrantTree(
   // may lag at "active"), but the tree entry is already gone.
   // `reviseGrantForExpiry` is a no-op for revoked or not-yet-expired grants.
   const expired: string[] = [];
-  // Grants whose expiry append RAN this pass. Consulted by the deferred
+  // Grants whose expiry append CONFIRMED durable this pass -- populated only
+  // after the awaited append resolves without the helper reporting a swallowed
+  // failure, never at the call site before it. Consulted by the deferred
   // thrown-scrub trail below: for an ACTIVE expiring grant whose scrub threw,
-  // the expiry row already reports the failure
-  // (`expired_ttl_scrub_did_not_complete`), so a second row here would be one
-  // fault described twice -- the FG-RECONCILE-ACL-DOUBLE-01 shape, and a
-  // pinned test asserts exactly one row for that grant. Recording the append
-  // that actually ran, rather than re-deriving the `shouldExpire` predicate at
-  // the other site, is what keeps the two sites from drifting.
+  // a LANDED expiry row already reports the failure
+  // (`expired_ttl_scrub_did_not_complete`), so a second row would be one fault
+  // described twice -- the FG-RECONCILE-ACL-DOUBLE-01 shape, and a pinned test
+  // asserts exactly one row for that grant. Membership recorded on ATTEMPT
+  // rather than confirmation was a round-6 defect: the helper swallows its own
+  // append failure, so a rejected expiry append still suppressed the fallback
+  // and the grant ended the pass with a persisted `expired` status, live
+  // access, and zero rows in any channel. The bound, stated: the property held
+  // is AT LEAST ONE durable row per thrown scrub; if the audit backend durably
+  // wrote and then threw (an ambiguous failure it cannot distinguish), the
+  // fallback fires too and that one fault carries two rows -- over-reporting a
+  // failed access reduction is the survivable direction, silence is not.
   const expiryAuditedGrantIds = new Set<string>();
   for (const grant of grants) {
     const shouldExpire = grant.status === "active" && isGrantExpired(grant, deps.now);
@@ -310,8 +318,7 @@ export async function reconcileFileGrantTree(
       // exists and answers the question directly: was this grant due to be
       // scrubbed, and did that scrub actually complete.
       const dueToScrub = scrubDueGrantIds.has(grant.grant_id);
-      expiryAuditedGrantIds.add(grant.grant_id);
-      await appendExpiryAudit(
+      const expiryRowLanded = await appendExpiryAudit(
         deps,
         grant,
         aclFailureByGrantId.get(grant.grant_id),
@@ -319,6 +326,10 @@ export async function reconcileFileGrantTree(
         writeError,
         !dueToScrub || confirmedScrubbedGrantIds.has(grant.grant_id)
       );
+      // Only a CONFIRMED append suppresses the thrown-scrub fallback; an
+      // attempt is not a row. See the set's declaration for the executed
+      // schedule this ordering closes and the stated duplicate bound.
+      if (expiryRowLanded) expiryAuditedGrantIds.add(grant.grant_id);
     } else if (writeError !== undefined) {
       // The clear-the-ACE-only path: the record was rewritten to drop a stale
       // `granted_read_ace` without expiring, so no expiry row is due. The write
@@ -558,6 +569,14 @@ async function appendStatusWriteFailureAudit(
  *
  * Before this argument existed the caller appended unconditionally, so a
  * rejected `put` produced exactly that false row.
+ *
+ * RETURNS whether the append CONFIRMED durable (resolved without the catch
+ * running). The caller uses this to decide whether the grant still needs the
+ * thrown-scrub fallback row: this helper swallows its own append failure by
+ * design (an audit failure must not abort an access-reducing reconcile), so
+ * "the helper was called" and "a row exists" are different facts, and round 6
+ * conflated them into a zero-row schedule. A missing `auditLog` reads as
+ * not-landed for the same reason: no backend, no row.
  */
 async function appendExpiryAudit(
   deps: ReconcileFileGrantDeps,
@@ -566,14 +585,15 @@ async function appendExpiryAudit(
   statusFlipped: boolean = true,
   writeError?: unknown,
   scrubConfirmed: boolean = true
-): Promise<void> {
+): Promise<boolean> {
+  if (!deps.auditLog) return false;
   try {
     // Auto-expiry reuses the `file_grant_revoke` audit operation (not a new
     // op string): TTL expiry, like revoke, is a safe-direction access
     // REDUCTION, and reusing the op keeps the CLI audit-write inventory small.
     // The distinct `reason: "expired_ttl_scrub"` (vs revoke's absence of it)
     // disambiguates an auto-expiry from an operator revoke in the trail.
-    await deps.auditLog?.appendCritical({
+    await deps.auditLog.appendCritical({
       layer: "l1",
       operation: "file_grant_revoke",
       identity_id: deps.reconciledBy ?? "system",
@@ -605,8 +625,12 @@ async function appendExpiryAudit(
           : {}),
       },
     });
+    return true;
   } catch {
     // Best-effort: an audit failure must not abort a reconcile that is
-    // reducing (never expanding) access.
+    // reducing (never expanding) access. Reported as not-landed so the caller
+    // can fall back to the thrown-scrub row instead of trusting a row that
+    // does not exist.
+    return false;
   }
 }

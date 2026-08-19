@@ -559,6 +559,61 @@ describe("file-grant reconcile: the report names every loss in the pass, and cla
     expect((await rowsFor(sibling.grant_id)) - revokedRowsBefore).toBe(1);
   });
 
+  it("falls back to the thrown-scrub row when the expiry append itself rejects", async () => {
+    // ROUND-7 SCHEDULE (FG-RECONCILE-THROW-SILENT-01, second reach). The
+    // fallback suppression must key off a CONFIRMED durable expiry append,
+    // not an attempted one: the expiry helper swallows its own append
+    // failure, so a set populated before the await records intent, not a
+    // row. Executed against round 6: scrub threw AND only the expiry append
+    // rejected -> persisted status became `expired`, access remained live,
+    // and total audit rows for the grant were ZERO -- the exact silent state
+    // the round-6 fix targeted, reached via a different fault schedule.
+    const removeFailed = new Error("scrub failed (acl backend down)");
+    const { grantStore, auditLog, fsOps, expiring } = await twoGrants({
+      removeThrows: removeFailed,
+    });
+
+    // Fail ONLY the expiry-reason append; every other append (including the
+    // fallback row this test exists to demand) goes through to the real log.
+    const appendFailed = new Error("audit backend rejected the append");
+    const realAppend = auditLog.appendCritical.bind(auditLog);
+    auditLog.appendCritical = (async (entry: Parameters<typeof realAppend>[0]) => {
+      const reason = String(
+        (entry.details as { reason?: string } | undefined)?.reason ?? "",
+      );
+      if (reason.startsWith("expired_ttl")) throw appendFailed;
+      return realAppend(entry);
+    }) as typeof auditLog.appendCritical;
+
+    const rowsForGrantBefore = (await auditLog.query({ limit: 500 })).entries.filter(
+      (entry) => (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id,
+    ).length;
+
+    const error = await reconcileError({ store: grantStore, fsOps, now: PAST_TTL, auditLog });
+
+    // The gate's executed state: flip landed, access still live, caller told.
+    expect(error).toBe(removeFailed);
+    expect((await grantStore.get(expiring.grant_id))!.status).toBe("expired");
+    expect(fsOps.scrubbed).not.toContain(expiring.tree_entry);
+
+    // EXACTLY the fallback row: the expiry row never landed, so the grant
+    // must still be eligible for the thrown-scrub trail. Zero rows here is
+    // the defect; the count is a delta across every operation so a row filed
+    // anywhere would be seen.
+    const revokes = await auditLog.query({ operation_type: "file_grant_revoke", limit: 200 });
+    const rows = revokes.entries.filter(
+      (entry) => (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.result).toBe("failure");
+    expect((rows[0]!.details as { reason?: string }).reason).toBe("reconcile_scrub_threw");
+    expect((rows[0]!.details as { error?: string }).error).toContain(removeFailed.message);
+    const rowsForGrantAfter = (await auditLog.query({ limit: 500 })).entries.filter(
+      (entry) => (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id,
+    ).length;
+    expect(rowsForGrantAfter - rowsForGrantBefore).toBe(1);
+  });
+
   it("never records an expiry as a success when the scrub that should have removed access threw", async () => {
     // The false-success row. `aclFailureByGrantId` records only a STRUCTURED
     // removal failure; a scrub that THROWS is caught and leaves no entry there.
