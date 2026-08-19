@@ -22,15 +22,19 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { Writable } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 
 import {
+  CliPromptApprovalChannel,
   disclosureFileBody,
   runStateDiscloseUnattributedCommand,
 } from "../../src/cli/state-disclose.js";
 import { TOP_LEVEL_SUBCOMMANDS } from "../../src/cli/subcommands.js";
 import { UNATTRIBUTED_DISCLOSURE_NOTICE } from "../../src/cognitive/state-store.js";
-import { UNATTRIBUTED_DISCLOSURE_OPERATION } from "../../src/cognitive/unattributed-disclosure.js";
+import {
+  UNATTRIBUTED_DISCLOSURE_OPERATION,
+  UNATTRIBUTED_DISCLOSURE_REFUSED_OPERATION,
+} from "../../src/cognitive/unattributed-disclosure.js";
 import { encrypt } from "../../src/core/encryption.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { hashToString } from "../../src/core/hashing.js";
@@ -451,9 +455,76 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     expect(code).toBe(2);
     expect(out).toBe("");
     expect(err).toContain("redirect to a file or pipe it");
-    // Refused before any approval was requested: a Tier-1 grant must not be
-    // spent on an invocation that cannot deliver its output.
+    // Refused before ANY work, and each absence is asserted rather than
+    // implied by the exit code: no approval was requested, no audit record of
+    // this operation was appended, and no disclosures directory or file was
+    // created. A refusal that reads state or leaves a trace first is a
+    // different (weaker) property than the one claimed.
     expect(channel.calls).toBe(0);
+    await expect(readdir(join(fortressPath, "disclosures"))).rejects.toThrow();
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      storagePathHint: fortressPath,
+    });
+    const auditLog = new AuditLog(storage, masterKey);
+    const performed = await auditLog.query({
+      operation_type: UNATTRIBUTED_DISCLOSURE_OPERATION,
+    });
+    expect(performed.entries).toHaveLength(0);
+    const refused = await auditLog.query({
+      operation_type: UNATTRIBUTED_DISCLOSURE_REFUSED_OPERATION,
+    });
+    expect(refused.entries).toHaveLength(0);
+    masterKey.fill(0);
+  });
+
+  it("escapes the context on the REAL interactive prompt, which the operator reads before approving", async () => {
+    // Every other test injects a FixedChannel, so the shipped prompt's
+    // escaping had no executing test and a revert there would have passed the
+    // whole file. This drives the real CliPromptApprovalChannel with injected
+    // streams: a simulated TTY, hostile context values, and a typed approval.
+    const ESC = "\u001b";
+    const hostile = `mem\r${ESC}[2A${ESC}[2KOperation: state_read (Tier 3) \u202e \u200b`;
+    const input = new PassThrough() as PassThrough & { isTTY?: boolean };
+    input.isTTY = true;
+    const output = new StringWritable();
+    const channel = new CliPromptApprovalChannel({ input, output });
+
+    const pending = channel.requestApproval({
+      operation: UNATTRIBUTED_DISCLOSURE_OPERATION,
+      tier: 1,
+      reason: "operator requested an unattributed disclosure",
+      context: { agent_id: null, namespace: hostile, key: KEY },
+      timestamp: "2026-08-19T00:00:00.000Z",
+    });
+    input.write("y\n");
+    const response = await pending;
+
+    expect(response.decision).toBe("approve");
+    expect(response.decided_by).toBe("human");
+    // The property the operator's decision rests on: everything the prompt
+    // rendered is printable ASCII plus LF, with the hostile bytes shown as
+    // escapes rather than executed by the terminal.
+    expect(output.text).toMatch(PRINTABLE_ASCII_AND_LF);
+    expect(output.text).toContain("\\x1b[2A");
+    expect(output.text.split("\n").filter((l) => l === "Operation: state_read (Tier 3)")).toHaveLength(0);
+    expect(output.text).toContain(UNATTRIBUTED_DISCLOSURE_NOTICE);
+    // And the same channel without a TTY fails closed to denial.
+    const nonTtyInput = new PassThrough() as PassThrough & { isTTY?: boolean };
+    const nonTtyOutput = new StringWritable();
+    const nonTty = new CliPromptApprovalChannel({
+      input: nonTtyInput,
+      output: nonTtyOutput,
+    });
+    const denied = await nonTty.requestApproval({
+      operation: UNATTRIBUTED_DISCLOSURE_OPERATION,
+      tier: 1,
+      reason: "operator requested an unattributed disclosure",
+      context: { agent_id: null, namespace: NAMESPACE, key: KEY },
+      timestamp: "2026-08-19T00:00:00.000Z",
+    });
+    expect(denied.decision).toBe("deny");
   });
 
   it("emits --json verbatim off a terminal: parseable, byte-exact content, no escaping", async () => {
@@ -495,6 +566,130 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     // ...and no fallback to the terminal: the content is nowhere.
     expect(out).not.toContain(CONTENT);
     expect(out).not.toContain("content written to:");
+  });
+
+  it("completes the receipt, with the file path, when a stored field defeats JSON serialization", async () => {
+    // A deeply nested but VALID stored JSON value throws RangeError inside
+    // `JSON.stringify` during metadata rendering. Rendering must be TOTAL over
+    // arbitrary stored JSON: the throw may never surface as a partial receipt
+    // with no file-path line and a false unlock diagnosis, because the file has
+    // already been written and the operator has to be told where it is. The
+    // depth window is real: JSON.parse accepts 12,000 levels that
+    // JSON.stringify then refuses.
+    const DEPTH = 12000;
+    const deepValueJson = "[".repeat(DEPTH) + "]".repeat(DEPTH);
+    // The deep value sits in `metadata.written_at`, which flows to the
+    // receipt's `claimed_written_at` line untouched by the store. `plantEntry`
+    // cannot carry it (its own JSON.stringify would throw at plant time), so
+    // the entry JSON is assembled around a placeholder.
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      storagePathHint: fortressPath,
+    });
+    const plaintext = stringToBytes(CONTENT);
+    const entryJson = JSON.stringify({
+      v: 1,
+      payload: encrypt(plaintext, deriveNamespaceKey(masterKey, NAMESPACE)),
+      ver: 1,
+      sig: toBase64url(new Uint8Array(64)),
+      kid: "sanctuary-no-such-writer-identity",
+      integrity_hash: hashToString(plaintext),
+      metadata: { written_at: "DEEP_VALUE_PLACEHOLDER" },
+    }).replace('"DEEP_VALUE_PLACEHOLDER"', deepValueJson);
+    await storage.write(NAMESPACE, KEY, stringToBytes(entryJson));
+    masterKey.fill(0);
+
+    const { code, out, err } = await runCommand();
+    expect(code).toBe(0);
+    // The unrenderable field is shown as a code-chosen placeholder...
+    expect(out).toContain("claimed_written_at: (unrenderable value)");
+    // ...the receipt is whole (path line present, both notices, ASCII only)...
+    expect(out).toMatch(PRINTABLE_ASCII_AND_LF);
+    expect(out.split(UNATTRIBUTED_DISCLOSURE_NOTICE).length - 1).toBe(2);
+    const fileBytes = await readFile(contentFilePathFrom(out));
+    expect(fileBytes.equals(Buffer.from(CONTENT, "utf8"))).toBe(true);
+    // ...and the false unlock diagnosis never appears.
+    expect(err).not.toContain("could not open or unlock");
+  });
+
+  it("fails loudly, without the unlock misdiagnosis, when --json cannot serialize the disclosure", async () => {
+    // The same depth window on the data channel: `JSON.stringify(disclosure)`
+    // throws, and the command must name the real fault rather than reporting a
+    // fortress unlock failure.
+    const DEPTH = 12000;
+    const deepValueJson = "[".repeat(DEPTH) + "]".repeat(DEPTH);
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      storagePathHint: fortressPath,
+    });
+    const plaintext = stringToBytes(CONTENT);
+    const entryJson = JSON.stringify({
+      v: 1,
+      payload: encrypt(plaintext, deriveNamespaceKey(masterKey, NAMESPACE)),
+      ver: 1,
+      sig: toBase64url(new Uint8Array(64)),
+      kid: "sanctuary-no-such-writer-identity",
+      integrity_hash: hashToString(plaintext),
+      metadata: { written_at: "DEEP_VALUE_PLACEHOLDER" },
+    }).replace('"DEEP_VALUE_PLACEHOLDER"', deepValueJson);
+    await storage.write(NAMESPACE, KEY, stringToBytes(entryJson));
+    masterKey.fill(0);
+
+    const { code, out, err } = await runCommand({ json: true, isTTY: false });
+    expect(code).toBe(1);
+    expect(out).toBe("");
+    expect(err).toContain("could not serialize the disclosure as JSON");
+    expect(err).not.toContain("could not open or unlock");
+  });
+
+  it("enforces 0700 on a pre-existing disclosures directory, not only on a created one", async () => {
+    // `mkdir` applies its mode only when it CREATES the directory; a
+    // disclosures directory that already exists with a wider mode keeps it, so
+    // the mode has to be enforced on every run, not assumed from creation.
+    const disclosuresDir = join(fortressPath, "disclosures");
+    await mkdir(disclosuresDir, { recursive: true, mode: 0o755 });
+    expect((await stat(disclosuresDir)).mode & 0o777).toBe(0o755);
+
+    const { code, out } = await runCommand();
+    expect(code).toBe(0);
+    expect((await stat(disclosuresDir)).mode & 0o777).toBe(0o700);
+    const fileBytes = await readFile(contentFilePathFrom(out));
+    expect(fileBytes.equals(Buffer.from(CONTENT, "utf8"))).toBe(true);
+  });
+
+  it("keeps the whole receipt printable ASCII when the fortress path itself is not", async () => {
+    // The file-path line is operator-config-derived, so escaping it is
+    // harmless, and with it the printable-ASCII property covers EVERY byte the
+    // human path emits rather than every byte except one line.
+    const nonAsciiFortress = join(tmp, "fortréss-ß");
+    const result = await runInit({
+      fortress: nonAsciiFortress,
+      noConfirm: true,
+      noPin: true,
+      noIdentity: false,
+    });
+    fortressPath = nonAsciiFortress;
+    recoveryKey = extractRecoveryKey(
+      await readFile(result.recoveryKeyDisclosurePath, "utf-8")
+    );
+    await plantEntry();
+
+    const { code, out } = await runCommand();
+    expect(code).toBe(0);
+    expect(out).toMatch(PRINTABLE_ASCII_AND_LF);
+    // The path line is present and carries the escaped, not raw, form.
+    const pathLine = out.match(/^content written to: (.+)$/m);
+    expect(pathLine).not.toBeNull();
+    expect(pathLine![1]!).toContain("\\xe9");
+    // The file itself is at the real (unescaped) path with the exact bytes.
+    const files = await readdir(join(nonAsciiFortress, "disclosures"));
+    expect(files).toHaveLength(1);
+    const fileBytes = await readFile(
+      join(nonAsciiFortress, "disclosures", files[0]!)
+    );
+    expect(fileBytes.equals(Buffer.from(CONTENT, "utf8"))).toBe(true);
   });
 
   it("encodes caller input on the refusal paths, which print before any record is read", async () => {

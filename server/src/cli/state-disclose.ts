@@ -41,7 +41,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -167,15 +167,30 @@ function metadataDisplayString(value: unknown): string {
   return json === undefined ? String(value) : json;
 }
 
+/** Code-chosen placeholder for a stored value no renderer can display. */
+const UNRENDERABLE_VALUE_PLACEHOLDER = "(unrenderable value)";
+
 /**
  * Render one untrusted metadata VALUE for the receipt: faithful display
  * string, ASCII-only injective escaping, then truncation at
  * `METADATA_VALUE_MAX_RENDERED_CODE_POINTS` with an explicit marker.
  * Truncation cuts only at whole-escape-sequence boundaries (the loop appends
  * per-code-point chunks), so what IS shown still decodes unambiguously.
+ *
+ * TOTALITY INVARIANT: this function must return for ARBITRARY stored JSON and
+ * never throw. `JSON.stringify` recurses, so a deeply nested but valid stored
+ * value throws RangeError before any truncation can bound it; uncaught, that
+ * throw escaped mid-receipt, suppressed the file-path line, and was
+ * misreported as a fortress unlock failure. A value that defeats
+ * serialization renders as a code-chosen placeholder instead.
  */
 function renderUntrustedMetadata(value: unknown): string {
-  const raw = metadataDisplayString(value);
+  let raw: string;
+  try {
+    raw = metadataDisplayString(value);
+  } catch {
+    return UNRENDERABLE_VALUE_PLACEHOLDER;
+  }
   let rendered = "";
   let emitted = 0;
   for (const ch of raw) {
@@ -243,8 +258,24 @@ function write(stream: Writable, text: string): void {
  * own terminal. Mirrors `CliPromptApprovalChannel` in `cli/file-grant.ts`; the
  * duplication is two short classes over one shared `ApprovalChannel` interface,
  * and both fail closed to denial off a TTY.
+ *
+ * The streams are injectable (defaulting to the process's own stdin/stderr)
+ * and the class is exported, so the REAL prompt path - including the escaping
+ * of the context values the operator reads before approving - has an
+ * executing test rather than being replaced by a test double everywhere.
  */
-class CliPromptApprovalChannel implements ApprovalChannel {
+export class CliPromptApprovalChannel implements ApprovalChannel {
+  private readonly input: NodeJS.ReadableStream & { isTTY?: boolean };
+  private readonly output: Writable;
+
+  constructor(io?: {
+    readonly input?: NodeJS.ReadableStream & { isTTY?: boolean };
+    readonly output?: Writable;
+  }) {
+    this.input = io?.input ?? process.stdin;
+    this.output = io?.output ?? process.stderr;
+  }
+
   async requestApproval(request: ApprovalRequest): Promise<ApprovalResponse> {
     // THE PROMPT IS THE MOST IMPORTANT SURFACE HERE, not the least. `context`
     // carries the namespace and key the caller asked for, and this text is what
@@ -260,7 +291,7 @@ class CliPromptApprovalChannel implements ApprovalChannel {
       )
       .join("\n");
     write(
-      process.stderr,
+      this.output,
       "\nSanctuary: Tier-1 approval required\n" +
         `  Operation: ${request.operation}\n` +
         `  Reason:    ${request.reason}\n` +
@@ -271,7 +302,7 @@ class CliPromptApprovalChannel implements ApprovalChannel {
         "\n",
     );
 
-    if (!process.stdin.isTTY) {
+    if (!this.input.isTTY) {
       return {
         decision: "deny",
         decided_at: new Date().toISOString(),
@@ -279,7 +310,7 @@ class CliPromptApprovalChannel implements ApprovalChannel {
       };
     }
 
-    const rl = createInterface({ input: process.stdin, output: process.stderr });
+    const rl = createInterface({ input: this.input, output: this.output });
     try {
       const answer = await rl.question(
         "Disclose this entry WITHOUT attribution? [y/N] ",
@@ -475,19 +506,43 @@ export async function runStateDiscloseUnattributedCommand(
     const disclosure = outcome.disclosure;
     if (json) {
       // Verbatim, and only here: the TTY refusal above already established
-      // that a program, not a terminal, is reading this stream.
-      write(out, JSON.stringify(disclosure) + "\n");
+      // that a program, not a terminal, is reading this stream. The
+      // serialization can itself fail on a deeply nested stored value, and
+      // that failure must be named as what it is rather than falling through
+      // to the generic unlock diagnosis below.
+      let payload: string;
+      try {
+        payload = JSON.stringify(disclosure);
+      } catch {
+        write(
+          err,
+          "Error: could not serialize the disclosure as JSON; a stored field defeats serialization. Use the human path, which writes the content to a file.\n",
+        );
+        return 1;
+      }
+      write(out, payload + "\n");
     } else {
-      // THE CONTENT FILE IS WRITTEN BEFORE THE RECEIPT, so the receipt can
-      // never name a file that does not exist, and a write failure fails the
-      // whole command LOUDLY with the content nowhere: printing the content as
-      // a fallback would be the silent downgrade to the exact behavior this
-      // design removed (AGENTS.md MUST-NEVER #5).
+      // ORDER OF OPERATIONS, and why: the receipt is composed IN FULL before
+      // the content file is written and before any byte reaches the terminal,
+      // and it is then emitted as one write. Receipt rendering must be TOTAL
+      // over arbitrary stored JSON (every untrusted field goes through the
+      // total metadata renderer), and composing first makes the failure
+      // geometry safe in both directions: a render fault can never leave a
+      // partial receipt with the file already on disk and no line saying
+      // where, and a file-write fault fails the command loudly before the
+      // terminal has claimed anything happened. Printing the content as a
+      // fallback in either case would be the silent downgrade to the exact
+      // behavior this design removed (AGENTS.md MUST-NEVER #5).
       let contentFilePath: string;
-      let storedValueWasString: boolean;
+      let fileBody: { body: string; storedValueWasString: boolean };
       try {
         const disclosuresDir = join(config.storage_path, "disclosures");
         await mkdir(disclosuresDir, { recursive: true, mode: 0o700 });
+        // `mkdir`'s mode applies only when it CREATES the directory; a
+        // pre-existing disclosures directory keeps whatever mode it had, so
+        // operator-only access is ENFORCED on every run rather than assumed
+        // from creation.
+        await chmod(disclosuresDir, 0o700);
         // The filename is derived by THIS CODE alone. `namespace` and `key`
         // are attacker-influenced and never reach the path: a stored or
         // caller-chosen string in a filename is filesystem injection
@@ -507,8 +562,66 @@ export async function runStateDiscloseUnattributedCommand(
           disclosuresDir,
           `disclosure-${timestamp}-${randomHex}.txt`,
         );
-        const fileBody = disclosureFileBody(disclosure.unattributed_content);
-        storedValueWasString = fileBody.storedValueWasString;
+        fileBody = disclosureFileBody(disclosure.unattributed_content);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        write(
+          err,
+          "Error: could not prepare the disclosure content file: " +
+            `${renderUntrusted(message)}\n` +
+            "The disclosure was not completed and no content was printed.\n",
+        );
+        return 1;
+      }
+
+      // THE RECEIPT, composed whole. The banner leads and repeats at the end,
+      // so an operator who scrolls still sees it. Every value on it is either
+      // a label this code chose, an attacker-influenced value rendered through
+      // the bounded, total, ASCII-only metadata encoder, or the content-file
+      // path. The path is operator-config-derived plus the code-chosen
+      // filename, so it is escaped (the whole receipt stays printable ASCII
+      // even under a non-ASCII storage path) but deliberately never
+      // truncated: a shortened path names no file. TOTALITY INVARIANT: no
+      // expression below may throw on any stored value; a render failure may
+      // never suppress the file-path line or misreport the disclosure.
+      const receipt =
+        `\n${UNATTRIBUTED_DISCLOSURE_NOTICE}\n\n` +
+        `namespace: ${renderUntrustedMetadata(disclosure.namespace)}\n` +
+        `key:       ${renderUntrustedMetadata(disclosure.key)}\n` +
+        // `version` IS attacker-controlled, despite its `number` type. The
+        // stored entry is parsed from legacy JSON and cast to `StateEntry`
+        // without runtime field validation, so `ver` can be any JSON value a
+        // writer put there. The metadata renderer encodes it, carries a
+        // faithful JSON display of a non-primitive, and is total, so nothing
+        // here trusts the type.
+        `version:   ${renderUntrustedMetadata(disclosure.version)}\n` +
+        // `writer` is the one field this code chooses rather than reads: a
+        // single-inhabitant literal set by the disclosure path itself.
+        `writer:    ${disclosure.writer}\n` +
+        `claimed_written_at: ${
+          disclosure.claimed_written_at === undefined
+            ? "(none recorded)"
+            : renderUntrustedMetadata(disclosure.claimed_written_at)
+        }\n` +
+        // The identity to restore, printed so the remedy this command
+        // advertises on every path names something the operator can act on.
+        // Labelled UNVERIFIED at the point of display, not only in the field
+        // name: this string comes out of an entry whose signature did not
+        // verify, so whoever wrote the entry chose it. It is a lead to check,
+        // never attribution.
+        "claimed writer id (UNVERIFIED, from the entry itself): " +
+        `${
+          disclosure.claimed_writer_id === undefined
+            ? "(none recorded)"
+            : renderUntrustedMetadata(disclosure.claimed_writer_id)
+        }\n` +
+        `\ncontent written to: ${renderUntrusted(contentFilePath)}\n` +
+        (fileBody.storedValueWasString
+          ? ""
+          : "note: the stored value was not a string; the file carries its exact JSON serialization.\n") +
+        `\n${UNATTRIBUTED_DISCLOSURE_NOTICE}\n`;
+
+      try {
         // FIDELITY INVARIANT AT THE WRITE SITE: the file carries the stored
         // value byte-for-byte (or its exact JSON serialization when the stored
         // value was not a string); no display encoding is ever applied to it.
@@ -532,55 +645,9 @@ export async function runStateDiscloseUnattributedCommand(
         );
         return 1;
       }
-      // THE RECEIPT. The banner is printed BEFORE the metadata and repeated
-      // after it, so an operator who scrolls still sees it. Every value on it
-      // is either a label this code chose, an attacker-influenced value
-      // rendered through the bounded ASCII-only metadata encoder, or the
-      // content-file path, which is code-derived (operator-configured
-      // directory plus the code-chosen filename above) and is deliberately
-      // never truncated: a shortened path names no file.
-      write(out, `\n${UNATTRIBUTED_DISCLOSURE_NOTICE}\n\n`);
-      write(out, `namespace: ${renderUntrustedMetadata(disclosure.namespace)}\n`);
-      write(out, `key:       ${renderUntrustedMetadata(disclosure.key)}\n`);
-      // `version` IS attacker-controlled, despite its `number` type. The stored
-      // entry is parsed from legacy JSON and cast to `StateEntry` without
-      // runtime field validation, so `ver` can be any JSON value a writer put
-      // there. The metadata renderer both encodes it and carries a faithful
-      // JSON display of a non-primitive, so nothing here trusts the type.
-      write(out, `version:   ${renderUntrustedMetadata(disclosure.version)}\n`);
-      // `writer` is the one field this code chooses rather than reads: a
-      // single-inhabitant literal set by the disclosure path itself.
-      write(out, `writer:    ${disclosure.writer}\n`);
-      write(
-        out,
-        `claimed_written_at: ${
-          disclosure.claimed_written_at === undefined
-            ? "(none recorded)"
-            : renderUntrustedMetadata(disclosure.claimed_written_at)
-        }\n`,
-      );
-      // The identity to restore, printed so the remedy this command advertises
-      // on every path names something the operator can act on. Labelled
-      // UNVERIFIED at the point of display, not only in the field name: this
-      // string comes out of an entry whose signature did not verify, so whoever
-      // wrote the entry chose it. It is a lead to check, never attribution.
-      write(
-        out,
-        "claimed writer id (UNVERIFIED, from the entry itself): " +
-          `${
-            disclosure.claimed_writer_id === undefined
-              ? "(none recorded)"
-              : renderUntrustedMetadata(disclosure.claimed_writer_id)
-          }\n`,
-      );
-      write(out, `\ncontent written to: ${contentFilePath}\n`);
-      if (!storedValueWasString) {
-        write(
-          out,
-          "note: the stored value was not a string; the file carries its exact JSON serialization.\n",
-        );
-      }
-      write(out, `\n${UNATTRIBUTED_DISCLOSURE_NOTICE}\n`);
+      // One write, after the file exists: the receipt the operator sees always
+      // names a file that is really there.
+      write(out, receipt);
     }
     await auditLog.flush().catch(() => undefined);
     return 0;
