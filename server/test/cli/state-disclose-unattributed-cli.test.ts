@@ -9,32 +9,25 @@
  * a change that leaves the surface intact while unhooking the operator's route
  * to it reds here rather than passing.
  *
- * Three properties, each with its own discriminator:
- *
- *   - APPROVED: the command exits 0, the content reaches the operator, and the
- *     output is LABELLED - the notice appears above and below the content, so a
- *     reader who scrolls a long value past the top of the terminal still sees
- *     it;
- *   - DENIED: an approval channel that says no produces a non-zero exit and NO
- *     content on stdout. Asserting the absence of the content, not merely the
- *     exit code, is what distinguishes a real gate from one that prints first
- *     and reports later;
- *   - the subcommand is registered, so shell completion and the dispatcher
- *     agree the verb exists;
- *   - NAMESPACE PARITY: the namespace firewall is part of the shared
- *     operation, not part of one transport, so this verb refuses exactly the
- *     namespaces the MCP tool refuses. Asserted here on the APPROVED path,
- *     because a refusal that only holds when the operator says no is not the
- *     property being claimed.
+ * THE RENDERING CONTRACT UNDER TEST is the receipt+file design: the terminal
+ * NEVER carries the disclosed content (the human path prints a bounded,
+ * printable-ASCII receipt naming a file), the file carries the stored value
+ * byte-for-byte, and `--json` refuses a TTY and stays verbatim off one. The
+ * old contract (render the content to the terminal, escaped and framed) is
+ * gone; both headline assertions here were run against the pre-change code and
+ * failed there, which is what makes them assertions about the change.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Writable } from "node:stream";
 
-import { runStateDiscloseUnattributedCommand } from "../../src/cli/state-disclose.js";
+import {
+  disclosureFileBody,
+  runStateDiscloseUnattributedCommand,
+} from "../../src/cli/state-disclose.js";
 import { TOP_LEVEL_SUBCOMMANDS } from "../../src/cli/subcommands.js";
 import { UNATTRIBUTED_DISCLOSURE_NOTICE } from "../../src/cognitive/state-store.js";
 import { UNATTRIBUTED_DISCLOSURE_OPERATION } from "../../src/cognitive/unattributed-disclosure.js";
@@ -55,6 +48,14 @@ const NAMESPACE = "memories";
 const RESERVED_NAMESPACE = "_reputation";
 const KEY = "orphaned";
 const CONTENT = "the-owner-must-still-reach-this-through-the-cli";
+
+/**
+ * Whole-stdout shape of the human path: printable ASCII and LF, nothing else.
+ * This is the receipt design's testable core - not "these named bad sequences
+ * are absent" (a denylist assertion, weaker than it reads) but "nothing
+ * outside this set is present at all".
+ */
+const PRINTABLE_ASCII_AND_LF = /^[\x20-\x7e\n]*$/;
 
 // ── Keychain-free fortress seeding (mirrors test/cli/file-grant-revoke-error-handling.test.ts) ──
 
@@ -156,6 +157,68 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
   let fortressPath: string;
   let recoveryKey: string;
 
+  /** The receipt names the content file; this reads the path off it. */
+  function contentFilePathFrom(stdout: string): string {
+    const match = stdout.match(/^content written to: (.+)$/m);
+    expect(match, "receipt names the content file").not.toBeNull();
+    return match![1]!;
+  }
+
+  async function plantEntry(overrides: Partial<Record<string, unknown>> = {}, content: string = CONTENT, namespace: string = NAMESPACE): Promise<void> {
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      storagePathHint: fortressPath,
+    });
+    const plaintext = stringToBytes(content);
+    const entry = {
+      v: 1,
+      payload: encrypt(plaintext, deriveNamespaceKey(masterKey, namespace)),
+      ver: 1,
+      // ED25519_SIGNATURE_BYTES = 64; the value is irrelevant because no key
+      // resolves for `kid`, which is the point of this fixture.
+      sig: toBase64url(new Uint8Array(64)),
+      kid: "sanctuary-no-such-writer-identity",
+      integrity_hash: hashToString(plaintext),
+      metadata: { written_at: "2026-08-18T00:00:05.000Z" },
+      ...overrides,
+    } as unknown as StateEntry;
+    await storage.write(namespace, KEY, stringToBytes(JSON.stringify(entry)));
+    masterKey.fill(0);
+  }
+
+  async function runCommand(options: {
+    namespace?: string;
+    key?: string;
+    json?: boolean;
+    isTTY?: boolean;
+    decision?: "approve" | "deny";
+    fileNameSeam?: { now: Date; randomHex: string };
+  } = {}): Promise<{ code: number; out: string; err: string; channel: FixedChannel }> {
+    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+    const out = new StringWritable() as StringWritable & { isTTY?: boolean };
+    if (options.isTTY !== undefined) out.isTTY = options.isTTY;
+    const err = new StringWritable();
+    const channel = new FixedChannel(options.decision ?? "approve");
+    const code = await runStateDiscloseUnattributedCommand({
+      argv: [
+        "--fortress",
+        fortressPath,
+        "--namespace",
+        options.namespace ?? NAMESPACE,
+        "--key",
+        options.key ?? KEY,
+        ...(options.json ? ["--json"] : []),
+      ],
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      approvalChannel: channel,
+      ...(options.fileNameSeam ? { fileNameSeam: options.fileNameSeam } : {}),
+    });
+    return { code, out: out.text, err: err.text, channel };
+  }
+
   beforeEach(async () => {
     tmp = await mkdtemp(join(tmpdir(), "sanctuary-state-disclose-cli-"));
     fortressPath = join(tmp, "fortress");
@@ -168,29 +231,10 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     recoveryKey = extractRecoveryKey(
       await readFile(result.recoveryKeyDisclosurePath, "utf-8")
     );
-
     // Plant the one persisted shape whose writer cannot be established: a
     // legacy (schema-1) entry whose `kid` resolves to no stored identity and to
     // no authenticated registry key.
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
-      recoveryKey,
-      storagePathHint: fortressPath,
-    });
-    const plaintext = stringToBytes(CONTENT);
-    const entry: StateEntry = {
-      v: 1,
-      payload: encrypt(plaintext, deriveNamespaceKey(masterKey, NAMESPACE)),
-      ver: 1,
-      // ED25519_SIGNATURE_BYTES = 64; the value is irrelevant because no key
-      // resolves for `kid`, which is the point of this fixture.
-      sig: toBase64url(new Uint8Array(64)),
-      kid: "sanctuary-no-such-writer-identity",
-      integrity_hash: hashToString(plaintext),
-      metadata: { written_at: "2026-08-18T00:00:05.000Z" },
-    };
-    await storage.write(NAMESPACE, KEY, stringToBytes(JSON.stringify(entry)));
-    masterKey.fill(0);
+    await plantEntry();
   });
 
   afterEach(async () => {
@@ -209,40 +253,42 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     );
   });
 
-  it("discloses the content, labelled above and below, and audits the call", async () => {
-    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
-    const out = new StringWritable();
-    const err = new StringWritable();
-    const channel = new FixedChannel("approve");
-
-    const code = await runStateDiscloseUnattributedCommand({
-      argv: [
-        "--fortress",
-        fortressPath,
-        "--namespace",
-        NAMESPACE,
-        "--key",
-        KEY,
-      ],
-      out,
-      err,
-      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
-      approvalChannel: channel,
-    });
+  it("writes the content to a private file, prints a receipt without it, and audits the call", async () => {
+    const { code, out, channel } = await runCommand();
 
     expect(code).toBe(0);
     expect(channel.calls).toBe(1);
-    expect(out.text).toContain(CONTENT);
-    expect(out.text).toContain("writer:    not_established");
+
+    // THE RECEIPT CARRIES NO CONTENT. Run against the pre-change code this
+    // assertion failed (the content was rendered, escaped, to stdout), which is
+    // the captured must-fail for the design change.
+    expect(out).not.toContain(CONTENT);
+    expect(out).toMatch(PRINTABLE_ASCII_AND_LF);
+    expect(out).toContain("writer:    not_established");
     // The identity to restore is named, and named as UNVERIFIED at the point of
     // display rather than only in the field name: the advertised remedy has to
     // be actionable, and it has to stay un-mistakable for attribution.
-    expect(out.text).toContain(
+    expect(out).toContain(
       "claimed writer id (UNVERIFIED, from the entry itself): sanctuary-no-such-writer-identity"
     );
     // Labelled at BOTH ends: one occurrence would be satisfied by a banner an
     // operator scrolls past.
-    expect(out.text.split(UNATTRIBUTED_DISCLOSURE_NOTICE).length - 1).toBe(2);
+    expect(out.split(UNATTRIBUTED_DISCLOSURE_NOTICE).length - 1).toBe(2);
+
+    // THE FILE CARRIES THE CONTENT, byte-for-byte, privately. The directory is
+    // operator-only (0700) and the file operator-only read-write (0600).
+    const filePath = contentFilePathFrom(out);
+    expect(filePath).toBe(join(fortressPath, "disclosures", filePath.split("/").pop()!));
+    // Code-derived name: timestamp + randomness, never stored/caller strings.
+    expect(filePath.split("/").pop()).toMatch(
+      /^disclosure-\d{8}T\d{6}Z-[0-9a-f]{6}\.txt$/
+    );
+    const fileBytes = await readFile(filePath);
+    expect(fileBytes.equals(Buffer.from(CONTENT, "utf8"))).toBe(true);
+    expect((await stat(filePath)).mode & 0o777).toBe(0o600);
+    expect((await stat(join(fortressPath, "disclosures"))).mode & 0o777).toBe(
+      0o700
+    );
 
     const storage = new FilesystemStorage(join(fortressPath, "state"));
     const masterKey = await resolveCliMasterKey(storage, {
@@ -261,275 +307,194 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     masterKey.fill(0);
   });
 
-  it("escapes terminal controls, so the entry's author cannot forge the security header on the operator's screen", async () => {
-    // REGRESSION, found re-gating this PR. Every string this command prints
-    // except its own notice comes out of an entry whose signature did NOT
-    // verify, so whoever wrote the entry chooses it. Rendered raw to a
-    // terminal those bytes are not text: CR returns to column 0, `ESC [ 2 A`
-    // walks the cursor up onto the real `writer:    not_established` line, and
-    // `ESC [ 2 K` erases it - after which the payload writes whatever it likes
-    // in its place. The operator would then be reading the ATTACKER's security
-    // statement, delivered by the one surface built to warn them.
-    //
-    // The assertion is deliberately the general property (no control byte
-    // reaches stdout) rather than the absence of this one payload, because
-    // there are many payloads and only one property.
+  it("keeps hostile stored bytes off the terminal entirely, and byte-exact in the file", async () => {
+    // Every string on the receipt except this command's own labels comes out of
+    // an entry whose signature did NOT verify, so whoever wrote the entry
+    // chooses it. This payload carries the classes five adversarial gates used:
+    // cursor movement (CR, `ESC [ 2 A`, `ESC [ 2 K`), a C1 control, a bidi
+    // override, a line separator, a lone surrogate, default-ignorables, and a
+    // forged `writer:` line. Under the receipt design NONE of it is rendered:
+    // the content never reaches stdout at all, and the metadata fields carrying
+    // the same bytes are escaped into printable ASCII.
     const ESC = "\u001b";
     const forgery =
       `\r${ESC}[2A${ESC}[2Kwriter:    established\n` +
       `${ESC}[2Kclaimed writer id (VERIFIED): alice` +
-      // Beyond the cursor sequences: a C1 control, a bidi override, a line
-      // separator, and a lone surrogate. Each misrepresents the text on screen
-      // by a different mechanism, and the header is read to make a decision.
-      // Beyond the cursor sequences: a C1 control, a bidi override, a line
-      // separator, a lone surrogate, and the default-ignorable formatting
-      // characters that render as nothing at all.
-      `\u009b31m \u202ereversed\u202c \u2028 \ud800 \u00ad\u200b\u200d\u2060\ufeff` +
-      // AND the delimiter forgery: the content prints what looks like the end
-      // of its own block, then a header the operator would read as the
-      // fortress speaking. Line breaks are legitimate content, so escaping
-      // them is not the answer; the gutter is.
+      "\u009b31m \u202ereversed\u202c \u2028 \ud800 \u00ad\u200b\u200d\u2060\ufeff" +
       `\n--- end unattributed content ---\nwriter:    established\n`;
-
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
-      recoveryKey,
-      storagePathHint: fortressPath,
-    });
-    // The same unattributable fixture as the happy path, with the payload in
-    // all three attacker-chosen strings at once: the writer-id claim, the
-    // timestamp claim, and the content itself. The content matters as much as
-    // the header fields - it sits BETWEEN the two notices, so an unescaped
-    // cursor sequence there erases the closing banner just as easily.
-    const hostilePlaintext = stringToBytes(forgery);
-    const hostileEntry: StateEntry = {
-      v: 1,
-      payload: encrypt(
-        hostilePlaintext,
-        deriveNamespaceKey(masterKey, NAMESPACE)
-      ),
-      ver: 1,
-      sig: toBase64url(new Uint8Array(64)),
-      kid: forgery,
-      integrity_hash: hashToString(hostilePlaintext),
-      metadata: { written_at: forgery },
-    };
-    await storage.write(
-      NAMESPACE,
-      KEY,
-      stringToBytes(JSON.stringify(hostileEntry))
+    // The same bytes in all three attacker-chosen slots at once: the content,
+    // the writer-id claim, and the timestamp claim.
+    await plantEntry(
+      { kid: forgery, metadata: { written_at: forgery } },
+      forgery
     );
-    masterKey.fill(0);
 
-    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
-    const out = new StringWritable();
-    const err = new StringWritable();
-
-    const code = await runStateDiscloseUnattributedCommand({
-      argv: [
-        "--fortress",
-        fortressPath,
-        "--namespace",
-        NAMESPACE,
-        "--key",
-        KEY,
-      ],
-      out,
-      err,
-      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
-      approvalChannel: new FixedChannel("approve"),
-    });
-
+    const { code, out } = await runCommand();
     expect(code).toBe(0);
 
-    // THE PROPERTY, EXPRESSED AS AN ALLOWLIST. An earlier version of this test
-    // listed the character classes that must be absent, which is the same
-    // mistake the code made: a review enumerated over 4,000 code points the
-    // list did not name. The header lines contain identifiers and timestamps,
-    // so the defensible set for them is printable ASCII, and asserting that is
-    // complete by construction.
-    const headerLines = out.text
-      .split("\n")
-      .filter((l) => /^(namespace|key|version|writer|claimed)/.test(l));
-    expect(headerLines.length).toBeGreaterThan(0);
-    for (const line of headerLines) {
-      expect(line).toMatch(/^[\x20-\x7e]*$/);
-    }
-    // The content block may carry any ordinary visible glyph, because it is the
-    // owner's own data and must be readable in any script. What it may not
-    // carry is anything in the control, format, unassigned, private-use or
-    // separator categories, which is where every invisible and
-    // display-reordering character lives.
-    const contentLines = out.text.split("\n").filter((l) => l.startsWith("| "));
-    expect(contentLines.length).toBeGreaterThan(0);
-    for (const line of contentLines) {
-      expect(line).not.toMatch(/\p{C}|\p{Zl}|\p{Zp}/u);
-    }
+    // Whole-output property, not a denylist: printable ASCII and LF only.
+    expect(out).toMatch(PRINTABLE_ASCII_AND_LF);
+    // The real security statement survives, and the forged one never appears
+    // as a line of its own.
+    expect(out).toContain("writer:    not_established");
+    expect(out.split("\n").filter((l) => l === "writer:    established")).toHaveLength(0);
+    // The hostile metadata is SHOWN, escaped, not silently dropped: an
+    // operator has to be able to see that a field carried something it should
+    // not.
+    expect(out).toContain("\\x1b[2A");
+    // Both notices still present, so nothing could erase the closing one.
+    expect(out.split(UNATTRIBUTED_DISCLOSURE_NOTICE).length - 1).toBe(2);
 
-    // The real security statement survives, because nothing could move the
-    // cursor onto its line.
-    expect(out.text).toContain("writer:    not_established");
-    // And the forged one never appears as a line of its own.
-    expect(out.text).not.toMatch(/^writer: {4}established$/m);
+    // FIDELITY: the file carries the hostile bytes exactly as stored, no
+    // display encoding applied. (A lone surrogate round-trips through Node's
+    // WTF-8-tolerant utf8 write as U+FFFD; compare against the same encoding
+    // the write used, which is Buffer.from of the stored string.)
+    const fileBytes = await readFile(contentFilePathFrom(out));
+    expect(fileBytes.equals(Buffer.from(forgery, "utf8"))).toBe(true);
+  });
 
-    // The strange bytes are SHOWN, escaped, not silently dropped: an operator
-    // has to be able to see that a field carried something it should not.
-    // Deleting them would trade one presentation lie for a quieter one.
-    expect(out.text).toContain("\\x1b[2A");
-    // Both notices still present, so the content could not erase the closing
-    // one either.
-    expect(out.text.split(UNATTRIBUTED_DISCLOSURE_NOTICE).length - 1).toBe(2);
+  it("renders a stored ESC and a literal backslash-x-1-b differently (injective escaping)", async () => {
+    // NONINJECTIVE-01's shape: with backslash passed through unchanged, a
+    // stored ESC escaped to `\x1b` and the four literal characters `\`,`x`,
+    // `1`,`b` rendered identically, so the display could not say which was
+    // stored. Backslash now self-escapes, so the two receipts differ.
+    const realEsc = "marker:\u001b:end";
+    const literalBackslash = "marker:\\x1b:end";
+
+    await plantEntry({ kid: realEsc });
+    const first = await runCommand();
+    await plantEntry({ kid: literalBackslash });
+    const second = await runCommand();
+
+    const claimLine = (text: string): string =>
+      text.split("\n").find((l) => l.startsWith("claimed writer id")) ?? "";
+    // A stored ESC renders as the escape sequence...
+    expect(claimLine(first.out)).toContain("marker:\\x1b:end");
+    // ...and stored literal characters render with the backslash doubled, so
+    // the two inputs are distinguishable on screen.
+    expect(claimLine(second.out)).toContain("marker:\\\\x1b:end");
+    expect(claimLine(first.out)).not.toBe(claimLine(second.out));
+  });
+
+  it("truncates an over-long metadata value at the bound, with an explicit marker", async () => {
+    // WRAP-01's residual bound: a long attacker-chosen metadata value wraps
+    // the terminal row and lands lookalike text at column zero. Truncation
+    // bounds the spoof surface; the marker makes the truncation visible.
+    await plantEntry({ kid: "A".repeat(200) });
+    const long = await runCommand();
+    expect(long.code).toBe(0);
+    // Exactly the bound, then the marker; never the 121st character.
+    expect(long.out).toMatch(/claimed writer id \(UNVERIFIED, from the entry itself\): A{120}\.\.\.\(truncated\)$/m);
+    expect(long.out).not.toMatch(/A{121}/);
+
+    // At the bound: untouched, no marker.
+    await plantEntry({ kid: "B".repeat(120) });
+    const exact = await runCommand();
+    expect(exact.out).toMatch(/: B{120}$/m);
+    expect(exact.out).not.toContain("(truncated)");
   });
 
   it("encodes the stored version, which is attacker-chosen despite its number type", async () => {
-    // The bypass an independent review found. `StateEntry` is parsed from
-    // stored JSON and CAST, with no runtime validation of `ver`, so the field
-    // typed `number` can hold a string carrying escape sequences. The render
-    // site had a comment asserting it was safe BECAUSE it was a number. The
-    // type says what the code expects; it says nothing about what the bytes
-    // contain.
+    // `StateEntry` is parsed from stored JSON and CAST, with no runtime
+    // validation of `ver`, so the field typed `number` can hold a string
+    // carrying escape sequences. The type says what the code expects; it says
+    // nothing about what the bytes contain.
     const ESC = "\u001b";
-    const hostileVersion = `1\r${ESC}[2A${ESC}[2Kwriter:    established`;
+    await plantEntry({ ver: `1\r${ESC}[2A${ESC}[2Kwriter:    established` });
 
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
-      recoveryKey,
-      storagePathHint: fortressPath,
-    });
-    const plaintext = stringToBytes(CONTENT);
-    const entry = {
-      v: 1,
-      payload: encrypt(plaintext, deriveNamespaceKey(masterKey, NAMESPACE)),
-      // Deliberately not a number. This is what a stored record can contain.
-      ver: hostileVersion,
-      sig: toBase64url(new Uint8Array(64)),
-      kid: "sanctuary-no-such-writer-identity",
-      integrity_hash: hashToString(plaintext),
-      metadata: { written_at: "2026-08-18T00:00:05.000Z" },
-    } as unknown as StateEntry;
-    await storage.write(NAMESPACE, KEY, stringToBytes(JSON.stringify(entry)));
-    masterKey.fill(0);
-
-    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
-    const out = new StringWritable();
-    await runStateDiscloseUnattributedCommand({
-      argv: ["--fortress", fortressPath, "--namespace", NAMESPACE, "--key", KEY],
-      out,
-      err: new StringWritable(),
-      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
-      approvalChannel: new FixedChannel("approve"),
-    });
-
-    expect(out.text).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f\u0080-\u009f]/);
-    expect(out.text).toContain("writer:    not_established");
-    expect(out.text.split("\n").filter((l) => l === "writer:    established")).toHaveLength(0);
-  });
-
-  it("discloses rather than crashing when a stored field is not the type it is typed as", async () => {
-    // A review found this by planting a numeric `kid` and an object-valued
-    // `written_at`. Both are permitted by the same cast that permits a string
-    // `ver`, and both reached a string-only encoder, which threw. The throw was
-    // caught by the outer handler and reported to the operator as a fortress
-    // unlock failure: a false explanation of a real fault, on the one surface
-    // whose job is telling the truth about a record.
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
-      recoveryKey,
-      storagePathHint: fortressPath,
-    });
-    const plaintext = stringToBytes(CONTENT);
-    const entry = {
-      v: 1,
-      payload: encrypt(plaintext, deriveNamespaceKey(masterKey, NAMESPACE)),
-      ver: 1,
-      sig: toBase64url(new Uint8Array(64)),
-      kid: 12345,
-      integrity_hash: hashToString(plaintext),
-      metadata: { written_at: { nested: "object" } },
-    } as unknown as StateEntry;
-    await storage.write(NAMESPACE, KEY, stringToBytes(JSON.stringify(entry)));
-    masterKey.fill(0);
-
-    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
-    const out = new StringWritable();
-    const err = new StringWritable();
-    const code = await runStateDiscloseUnattributedCommand({
-      argv: ["--fortress", fortressPath, "--namespace", NAMESPACE, "--key", KEY],
-      out,
-      err,
-      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
-      approvalChannel: new FixedChannel("approve"),
-    });
-
+    const { code, out } = await runCommand();
     expect(code).toBe(0);
-    expect(out.text).toContain(CONTENT);
-    expect(out.text).toContain("writer:    not_established");
-    // And specifically NOT the unlock error, which is what the operator used
-    // to be told.
-    expect(err.text).not.toContain("could not open or unlock");
+    expect(out).toMatch(PRINTABLE_ASCII_AND_LF);
+    expect(out).toContain("writer:    not_established");
+    expect(out.split("\n").filter((l) => l === "writer:    established")).toHaveLength(0);
   });
 
-  it("encodes --json when stdout is a terminal, and leaves it verbatim when it is not", async () => {
-    // `--json` was documented as a data channel and left unencoded on that
-    // basis. It writes to stdout, and stdout is often a terminal, so the same
-    // display-affecting characters arrived at the same screen with only
-    // `JSON.stringify`'s escaping, which covers C0 and lone surrogates and
-    // passes format characters through. The question is answerable rather than
-    // assumable: ask where the stream points.
+  it("renders non-string stored fields faithfully rather than as [object Object] or a crash", async () => {
+    // LOSSY-01's shape: `String()` on an object-valued stored field printed
+    // `[object Object]` and the value vanished; before that, the same fields
+    // CRASHED a string-only encoder and the throw was misreported as a
+    // fortress unlock failure. Non-strings now render as their exact JSON.
+    await plantEntry({ kid: 12345, metadata: { written_at: { nested: "object" } } });
+
+    const { code, out, err } = await runCommand();
+    expect(code).toBe(0);
+    expect(out).not.toContain("[object Object]");
+    expect(out).toContain("claimed writer id (UNVERIFIED, from the entry itself): 12345");
+    expect(out).toContain('claimed_written_at: {"nested":"object"}');
+    expect(err).not.toContain("could not open or unlock");
+    // And the content still reached its file.
+    const fileBytes = await readFile(contentFilePathFrom(out));
+    expect(fileBytes.equals(Buffer.from(CONTENT, "utf8"))).toBe(true);
+  });
+
+  it("writes a non-string stored value as its exact JSON serialization, flagged as such", () => {
+    // The wired path decodes content through `bytesToString`, so a non-string
+    // arrives only through the same cast-without-validation class the other
+    // fields exhibit; the file-body builder is exported so this arm has direct
+    // coverage rather than none.
+    const value = { nested: ["a", 1, true] };
+    const nonString = disclosureFileBody(value);
+    expect(nonString.storedValueWasString).toBe(false);
+    expect(nonString.body).toBe(JSON.stringify(value, null, 2));
+
+    const str = disclosureFileBody("bytes  exactly");
+    expect(str.storedValueWasString).toBe(true);
+    expect(str.body).toBe("bytes  exactly");
+  });
+
+  it("refuses --json on a terminal, before the Tier-1 prompt fires", async () => {
+    // JSONBREAK-01's shape: a previous round ran the terminal encoder over
+    // serialized JSON and emitted escape forms `JSON.parse` rejects. No
+    // encoder runs over JSON any more; a TTY stdout is refused outright.
+    // Against the pre-change code this exited 0 (captured must-fail).
+    const { code, out, err, channel } = await runCommand({ json: true, isTTY: true });
+    expect(code).toBe(2);
+    expect(out).toBe("");
+    expect(err).toContain("redirect to a file or pipe it");
+    // Refused before any approval was requested: a Tier-1 grant must not be
+    // spent on an invocation that cannot deliver its output.
+    expect(channel.calls).toBe(0);
+  });
+
+  it("emits --json verbatim off a terminal: parseable, byte-exact content, no escaping", async () => {
     const ESC = "\u001b";
     const hostile = `x\r${ESC}[2Kwriter: established \u202e \u200b`;
+    await plantEntry({}, hostile);
 
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
-      recoveryKey,
-      storagePathHint: fortressPath,
-    });
-    const plaintext = stringToBytes(hostile);
-    const entry: StateEntry = {
-      v: 1,
-      payload: encrypt(plaintext, deriveNamespaceKey(masterKey, NAMESPACE)),
-      ver: 1,
-      sig: toBase64url(new Uint8Array(64)),
-      kid: "sanctuary-no-such-writer-identity",
-      integrity_hash: hashToString(plaintext),
-      metadata: { written_at: "2026-08-18T00:00:05.000Z" },
-    };
-    await storage.write(NAMESPACE, KEY, stringToBytes(JSON.stringify(entry)));
-    masterKey.fill(0);
-    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+    const { code, out } = await runCommand({ json: true, isTTY: false });
+    expect(code).toBe(0);
+    // Verbatim: the raw display-affecting characters are present, because a
+    // program is reading and escaping would corrupt the value for it.
+    expect(out).toContain("\u202e");
+    const parsed = JSON.parse(out) as { unattributed_content: string };
+    expect(parsed.unattributed_content).toBe(hostile);
+    // The payload is exactly one JSON document plus this command's own newline.
+    expect(out.endsWith("\n")).toBe(true);
+    expect(out.slice(0, -1)).toBe(JSON.stringify(parsed));
+  });
 
-    const runJson = async (isTTY: boolean): Promise<string> => {
-      const out = new StringWritable() as StringWritable & { isTTY?: boolean };
-      out.isTTY = isTTY;
-      await runStateDiscloseUnattributedCommand({
-        argv: [
-          "--fortress",
-          fortressPath,
-          "--namespace",
-          NAMESPACE,
-          "--key",
-          KEY,
-          "--json",
-        ],
-        out,
-        err: new StringWritable(),
-        env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
-        approvalChannel: new FixedChannel("approve"),
-      });
-      return out.text;
-    };
+  it("fails loudly when the content file already exists, without overwriting or printing", async () => {
+    // The `wx` flag's contract: a path collision must never silently replace a
+    // disclosure an operator has not read yet, and the failure must not
+    // degrade to printing the content (the exact behavior this design
+    // removed).
+    const seam = { now: new Date("2026-08-19T00:00:00.000Z"), randomHex: "aabbcc" };
+    const disclosuresDir = join(fortressPath, "disclosures");
+    await mkdir(disclosuresDir, { recursive: true, mode: 0o700 });
+    const collidingPath = join(
+      disclosuresDir,
+      "disclosure-20260819T000000Z-aabbcc.txt"
+    );
+    await writeFile(collidingPath, "pre-existing", { mode: 0o600 });
 
-    // A human is reading: encoded. The trailing newline is this command's own
-    // and is excluded, which is the difference between asserting on the payload
-    // and asserting on the write.
-    const toTerminal = (await runJson(true)).trimEnd();
-    expect(toTerminal).not.toMatch(/\p{C}|\p{Zl}|\p{Zp}/u);
-    expect(toTerminal).not.toContain("\u202e");
-
-    // A program is reading: verbatim, because escaping would corrupt the value
-    // for the consumer that asked for it.
-    const toPipe = await runJson(false);
-    expect(JSON.parse(toPipe).unattributed_content).toBe(hostile);
+    const { code, out, err } = await runCommand({ fileNameSeam: seam });
+    expect(code).toBe(1);
+    expect(err).toContain("could not write the disclosure content file");
+    // No overwrite...
+    expect(await readFile(collidingPath, "utf8")).toBe("pre-existing");
+    // ...and no fallback to the terminal: the content is nowhere.
+    expect(out).not.toContain(CONTENT);
+    expect(out).not.toContain("content written to:");
   });
 
   it("encodes caller input on the refusal paths, which print before any record is read", async () => {
@@ -540,163 +505,60 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     const ESC = "\u001b";
     const hostileNamespace = `_reputation\r${ESC}[2Kwriter:    established`;
 
-    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
-    const err = new StringWritable();
-    const code = await runStateDiscloseUnattributedCommand({
-      argv: [
-        "--fortress",
-        fortressPath,
-        "--namespace",
-        hostileNamespace,
-        "--key",
-        KEY,
-      ],
-      out: new StringWritable(),
-      err,
-      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
-      approvalChannel: new FixedChannel("approve"),
-    });
-
-    expect(code).toBe(1);
-    expect(err.text).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f\u0080-\u009f]/);
-    expect(err.text.split("\n").filter((l) => l === "writer:    established")).toHaveLength(0);
+    const first = await runCommand({ namespace: hostileNamespace });
+    expect(first.code).toBe(1);
+    expect(first.err).toMatch(PRINTABLE_ASCII_AND_LF);
+    expect(first.err.split("\n").filter((l) => l === "writer:    established")).toHaveLength(0);
 
     // THE OTHER REFUSAL PATH, covered separately because it is a separate
     // interpolation site. A mutation that un-encodes only this one passes a
     // test that exercises only the reserved-namespace branch, which is how a
     // per-site fix gets called a class fix.
     const hostileKey = `missing\r${ESC}[2Kwriter:    established`;
-    const err2 = new StringWritable();
-    const code2 = await runStateDiscloseUnattributedCommand({
-      argv: [
-        "--fortress",
-        fortressPath,
-        "--namespace",
-        NAMESPACE,
-        "--key",
-        hostileKey,
-      ],
-      out: new StringWritable(),
-      err: err2,
-      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
-      approvalChannel: new FixedChannel("approve"),
-    });
-    expect(code2).toBe(1);
-    expect(err2.text).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f\u0080-\u009f]/);
-    expect(err2.text.split("\n").filter((l) => l === "writer:    established")).toHaveLength(0);
+    const second = await runCommand({ key: hostileKey });
+    expect(second.code).toBe(1);
+    expect(second.err).toMatch(PRINTABLE_ASCII_AND_LF);
+    expect(second.err.split("\n").filter((l) => l === "writer:    established")).toHaveLength(0);
   });
 
   it("refuses a reserved namespace, the refusal the MCP tool also makes", async () => {
     // The same fixture as the happy path, planted in a reserved namespace and
     // driven through the same verb, so the only variable is the namespace.
-    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
-      recoveryKey,
-      storagePathHint: fortressPath,
-    });
-    const plaintext = stringToBytes(CONTENT);
-    const entry: StateEntry = {
-      v: 1,
-      payload: encrypt(
-        plaintext,
-        deriveNamespaceKey(masterKey, RESERVED_NAMESPACE)
-      ),
-      ver: 1,
-      sig: toBase64url(new Uint8Array(64)),
-      kid: "sanctuary-no-such-writer-identity",
-      integrity_hash: hashToString(plaintext),
-      metadata: { written_at: "2026-08-18T00:00:08.000Z" },
-    };
-    await storage.write(
-      RESERVED_NAMESPACE,
-      KEY,
-      stringToBytes(JSON.stringify(entry))
-    );
-    masterKey.fill(0);
+    await plantEntry({}, CONTENT, RESERVED_NAMESPACE);
 
-    const out = new StringWritable();
-    const err = new StringWritable();
     // APPROVED, deliberately. A denial would pass this test for the wrong
     // reason; the namespace refusal has to hold on the path where the operator
     // said yes.
-    const channel = new FixedChannel("approve");
-
-    const code = await runStateDiscloseUnattributedCommand({
-      argv: [
-        "--fortress",
-        fortressPath,
-        "--namespace",
-        RESERVED_NAMESPACE,
-        "--key",
-        KEY,
-      ],
-      out,
-      err,
-      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
-      approvalChannel: channel,
-    });
-
+    const { code, out, err } = await runCommand({ namespace: RESERVED_NAMESPACE });
     expect(code).not.toBe(0);
-    expect(out.text).not.toContain(CONTENT);
-    expect(err.text).toContain("reserved");
+    expect(out).not.toContain(CONTENT);
+    expect(err).toContain("reserved");
+    // And no content file either: a refusal that leaves the content on disk
+    // outside the store is a disclosure with extra steps.
+    await expect(readdir(join(fortressPath, "disclosures"))).rejects.toThrow();
   });
 
   it("refuses an opaque memory handle, which this process can never own", async () => {
     // A CLI process holds no agent session, so it owns no `mem_*` handle. The
     // shared operation is handed a fresh empty registry and no binding, which
     // refuses rather than treating "no session" as "nothing to check".
-    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
-    const out = new StringWritable();
-    const err = new StringWritable();
-    const channel = new FixedChannel("approve");
-
-    const code = await runStateDiscloseUnattributedCommand({
-      argv: [
-        "--fortress",
-        fortressPath,
-        "--namespace",
-        "mem_0123456789abcdef0123456789abcdef",
-        "--key",
-        KEY,
-      ],
-      out,
-      err,
-      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
-      approvalChannel: channel,
+    const { code, out, err } = await runCommand({
+      namespace: "mem_0123456789abcdef0123456789abcdef",
     });
-
     expect(code).not.toBe(0);
-    expect(out.text).not.toContain(CONTENT);
-    expect(err.text).toContain("not available");
+    expect(out).not.toContain(CONTENT);
+    expect(err).toContain("not available");
   });
 
   it("discloses nothing when the Tier-1 approval is refused", async () => {
-    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
-    const out = new StringWritable();
-    const err = new StringWritable();
-    const channel = new FixedChannel("deny");
-
-    const code = await runStateDiscloseUnattributedCommand({
-      argv: [
-        "--fortress",
-        fortressPath,
-        "--namespace",
-        NAMESPACE,
-        "--key",
-        KEY,
-      ],
-      out,
-      err,
-      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
-      approvalChannel: channel,
-    });
-
+    const { code, out, err, channel } = await runCommand({ decision: "deny" });
     expect(code).not.toBe(0);
     expect(channel.calls).toBe(1);
     // The content itself, not just the exit code: a gate that renders before it
     // reports would pass an exit-code-only assertion.
-    expect(out.text).not.toContain(CONTENT);
-    expect(err.text).toContain("Denied");
+    expect(out).not.toContain(CONTENT);
+    expect(err).toContain("Denied");
+    // And no content file was created on the denied path.
+    await expect(readdir(join(fortressPath, "disclosures"))).rejects.toThrow();
   });
 });

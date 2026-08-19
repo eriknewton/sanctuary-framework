@@ -21,9 +21,27 @@
  * performed by the shared `discloseUnattributedState` so this file and the MCP
  * tool cannot implement the obligation two different ways. This file renders
  * refusals; it does not decide them.
+ *
+ * THE TERMINAL SHOWS A RECEIPT; THE DATA GOES TO A FILE. Earlier versions of
+ * this file rendered the disclosed content to the terminal and tried to make
+ * that rendering safe: escaping enumerated character sets, then a category
+ * allowlist, then a gutter frame around the content block. Five independent
+ * adversarial reviews each found the property still not held, because the
+ * property "arbitrary attacker-chosen Unicode rendered faithfully inside a
+ * framed region of a terminal" is not reachable: category tests do not separate
+ * visible from invisible, escaping wide enough to be safe destroys the text an
+ * owner came to read, and a terminal WRAPS, so content long enough to fill a
+ * row lands attacker-chosen text at column zero of the next visual row with no
+ * newline involved, defeating any line-oriented frame. So the content block is
+ * gone, by owner decision (register id STATE-DISCLOSE-UNATTRIB-01): the human
+ * path writes the stored value verbatim to a file this code names, and prints
+ * only a bounded, printable-ASCII receipt naming that file. Nothing an entry's
+ * author wrote is ever rendered to a terminal, and nothing the terminal does to
+ * a byte can change what the owner reads back out of the file.
  */
 
-import { mkdir } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -54,103 +72,152 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { flagValue } from "./argv.js";
 
 /**
- * ALLOWLIST, NOT A DENYLIST, and the switch is the point.
+ * Maximum RENDERED length of one untrusted metadata value on the receipt, in
+ * code points, all of which are printable ASCII after escaping.
  *
- * Every string this command prints except its own labels is chosen by whoever
- * wrote a record whose signature did not verify, or supplied by the caller.
- * Written raw to a terminal such a string does not display as itself: some code
- * points move the cursor over lines already printed, some reorder the display
- * of surrounding text without changing the bytes, and thousands render as
- * nothing at all.
+ * Derivation: the receipt's metadata values are attacker-chosen (they come out
+ * of an entry whose signature did not verify, or from the caller), and a long
+ * enough value wraps the terminal row, landing lookalike text at column zero of
+ * the next visual row where it reads as a new line this command printed.
+ * Truncation bounds that spoof surface to one value's worth of visible ASCII;
+ * 120 covers every legitimate identifier and timestamp this surface renders
+ * (the longest code-chosen label plus a UUID-sized value is under 90) while
+ * staying under the 32 rows a 4-row-per-value wrap would need to bury the
+ * notice on an 80-column terminal. The full value is always available
+ * untruncated in the content file / `--json` channel.
  *
- * An earlier version escaped an ENUMERATED set: C0, DEL, C1, the bidi
- * formatting characters, the separators, a handful of default-ignorables. A
- * review enumerated what that missed and found 4,157 uncovered
- * `Default_Ignorable_Code_Point` values, 153 uncovered format characters, and a
- * bidi control the list had simply not named. That is the predictable outcome:
- * a denylist over Unicode is a list someone maintains against a standard that
- * keeps growing, and it is wrong the day a new format character is assigned.
- *
- * So the rule is inverted. A code point is emitted only if it is in a set we
- * can defend; everything else becomes a visible escape. Complete by
- * construction rather than by diligence.
- *
- * WHAT IS NOT SOLVED BY THIS, stated because a previous round claimed a
- * property it did not have: a terminal WRAPS. Content long enough to fill a row
- * continues at column zero on the next visual row, so text can appear where a
- * line-oriented frame did not put it, with no newline involved. Nothing this
- * function does prevents that, and the gutter below does not either. The
- * defended property is narrower: the entry's author cannot move the cursor,
- * cannot reorder the display, and cannot emit an invisible character. They can
- * still write something that LOOKS like a label if a row happens to wrap.
+ * HONEST RESIDUAL BOUND, recorded here because withdrawing a claim is not the
+ * same as fixing it: a value at or under this limit can still wrap on a
+ * terminal narrower than the limit, so a lookalike line at column zero is
+ * bounded, not impossible. What truncation plus the ASCII-only escaping DOES
+ * guarantee: the spoof is at most this many visible characters, it cannot move
+ * the cursor, and it cannot be invisible.
+ */
+const METADATA_VALUE_MAX_RENDERED_CODE_POINTS = 120;
+
+/** Appended (by this code, never by a value) when truncation was applied. */
+const METADATA_TRUNCATION_MARKER = "...(truncated)";
+
+/**
+ * ASCII-ONLY, AND COMPLETE BY CONSTRUCTION. Every string this command prints
+ * except its own labels is chosen by whoever wrote a record whose signature did
+ * not verify, or supplied by the caller. Written raw to a terminal such a
+ * string does not display as itself: some code points move the cursor over
+ * lines already printed, some reorder the display of surrounding text, and
+ * thousands render as nothing at all. Earlier rounds tried a denylist, then a
+ * Unicode-category allowlist; independent reviews found thousands of uncovered
+ * code points in the first and invisible non-`C`-category code points
+ * (variation selectors, fillers, combining marks) in the second. A category
+ * test does not separate visible from invisible, so no category test appears
+ * here: the emitted set is printable ASCII 0x20-0x7E and nothing else, a set
+ * that does not grow when Unicode does.
  */
 
-/** Space through `~`: the printable ASCII range, minus nothing. */
+/** Space through `~`: the printable ASCII range. */
 function isPrintableAscii(code: number): boolean {
   return code >= 0x20 && code <= 0x7e;
 }
 
 /**
- * Emit `raw` with every code point outside the safe set replaced by a visible
- * escape.
- *
- * `allowLetters` widens the set to any code point a terminal renders as an
- * ordinary visible glyph, which is what the content block needs: an owner
- * reading their own notes in Japanese or Arabic must see them, not a wall of
- * escapes. It is implemented as a category test rather than a range list, and
- * it deliberately excludes the format (`Cf`), control (`Cc`), unassigned (`Cn`)
- * and private-use (`Co`) categories, which is where every invisible and
- * display-reordering character lives.
- *
- * `allowLineBreaks` permits LF alone, for the content block. TAB is NOT
- * permitted even there: it advances to the next tab stop rather than occupying
- * one cell, so it moves text horizontally by an amount the content chooses.
+ * The escape for a single code point of untrusted input. INJECTIVITY INVARIANT
+ * (enforced by the backslash arm): every escape sequence begins with a
+ * backslash and no literal backslash survives unescaped, so a rendering
+ * decodes to exactly one input - a stored ESC (`\x1b`) and the four literal
+ * characters `\`, `x`, `1`, `b` (`\\x1b`) render differently. Without the
+ * self-escape the two were identical on screen, and the display could not say
+ * which was stored.
  */
-function renderUntrusted(
-  raw: string,
-  options?: { readonly allowLineBreaks?: boolean; readonly allowLetters?: boolean },
-): string {
+function escapeUntrustedCodePoint(ch: string, code: number): string {
+  if (ch === "\\") return "\\\\";
+  if (isPrintableAscii(code)) return ch;
+  return code <= 0xff
+    ? `\\x${code.toString(16).padStart(2, "0")}`
+    : `\\u{${code.toString(16)}}`;
+}
+
+/**
+ * Emit `raw` with every code point escaped into the printable-ASCII set,
+ * unbounded. Used only where the input is OS- or code-originated text that is
+ * not attacker metadata (a filesystem error message) but must still never
+ * carry a non-ASCII byte to the terminal; attacker-influenced values go
+ * through `renderUntrustedMetadata`, which also truncates.
+ */
+function renderUntrusted(raw: string): string {
   let rendered = "";
   for (const ch of raw) {
-    const code = ch.codePointAt(0) ?? 0;
-    if (options?.allowLineBreaks === true && ch === "\n") {
-      rendered += ch;
-      continue;
-    }
-    if (isPrintableAscii(code)) {
-      rendered += ch;
-      continue;
-    }
-    if (options?.allowLetters === true && isOrdinaryVisibleGlyph(ch)) {
-      rendered += ch;
-      continue;
-    }
-    rendered +=
-      code <= 0xff
-        ? `\\x${code.toString(16).padStart(2, "0")}`
-        : `\\u{${code.toString(16)}}`;
+    rendered += escapeUntrustedCodePoint(ch, ch.codePointAt(0) ?? 0);
   }
   return rendered;
 }
 
 /**
- * Whether a code point is an ordinary visible glyph: a letter, a mark, a
- * number, a punctuation mark, a symbol, or an ordinary space.
- *
- * Defined by what it EXCLUDES, which is the part that matters. `\p{C}` covers
- * control, format, unassigned, private-use and surrogate code points, and that
- * single category is where the entire class of invisible and
- * display-reordering characters lives. `\p{Zl}` and `\p{Zp}` are the line and
- * paragraph separators. `\p{Zs}` is allowed but normalised below, because a
- * space of a different width is still a space an operator cannot measure.
+ * The faithful display string for a metadata value of unknown runtime type.
+ * Stored records are parsed from JSON and CAST without runtime field
+ * validation, so a field typed `string` or `number` can arrive as an object or
+ * an array; `String()` on those prints `[object Object]` and discards the
+ * value, which an independent review flagged as lossy on the one surface whose
+ * job is fidelity. JSON serialization carries the actual value instead. The
+ * `undefined` fallback exists because `JSON.stringify` returns `undefined` for
+ * values JSON cannot represent; `String()` is then the last resort and is
+ * labelled honest by being reachable only off the JSON path.
  */
-function isOrdinaryVisibleGlyph(ch: string): boolean {
-  if (/\p{C}|\p{Zl}|\p{Zp}/u.test(ch)) return false;
-  // Any space separator other than U+0020 is rendered as an escape rather than
-  // passed through: a narrow or ideographic space is invisible as a difference
-  // and is one of the ways two visibly identical values differ in bytes.
-  if (/\p{Zs}/u.test(ch)) return ch === " ";
-  return true;
+function metadataDisplayString(value: unknown): string {
+  if (typeof value === "string") return value;
+  const json = JSON.stringify(value);
+  return json === undefined ? String(value) : json;
+}
+
+/**
+ * Render one untrusted metadata VALUE for the receipt: faithful display
+ * string, ASCII-only injective escaping, then truncation at
+ * `METADATA_VALUE_MAX_RENDERED_CODE_POINTS` with an explicit marker.
+ * Truncation cuts only at whole-escape-sequence boundaries (the loop appends
+ * per-code-point chunks), so what IS shown still decodes unambiguously.
+ */
+function renderUntrustedMetadata(value: unknown): string {
+  const raw = metadataDisplayString(value);
+  let rendered = "";
+  let emitted = 0;
+  for (const ch of raw) {
+    const chunk = escapeUntrustedCodePoint(ch, ch.codePointAt(0) ?? 0);
+    // Chunks are pure ASCII, so `.length` is the emitted code-point count.
+    if (emitted + chunk.length > METADATA_VALUE_MAX_RENDERED_CODE_POINTS) {
+      return rendered + METADATA_TRUNCATION_MARKER;
+    }
+    rendered += chunk;
+    emitted += chunk.length;
+  }
+  return rendered;
+}
+
+/**
+ * The exact bytes the disclosure content file carries, exported for direct
+ * test coverage of the non-string arm, which no currently persisted shape
+ * reaches end to end (the store decodes content through `bytesToString`, so it
+ * arrives as a string today; the arm guards the same cast-without-validation
+ * class every other field on the record has already exhibited).
+ *
+ * FIDELITY INVARIANT: the file carries the stored value byte-for-byte when it
+ * is a string, or its exact `JSON.stringify(value, null, 2)` serialization
+ * when it is not; no display encoding, escaping, or truncation is ever applied
+ * to it. A non-string value with no JSON serialization throws rather than
+ * degrading to a lossy `String()` coercion - failing loudly is the safe
+ * direction, printing something that is not the value is not.
+ */
+export function disclosureFileBody(content: unknown): {
+  body: string;
+  storedValueWasString: boolean;
+} {
+  if (typeof content === "string") {
+    return { body: content, storedValueWasString: true };
+  }
+  const json = JSON.stringify(content, null, 2);
+  if (json === undefined) {
+    throw new Error(
+      "the stored value is not a string and has no JSON serialization; refusing to write a lossy coercion"
+    );
+  }
+  return { body: json, storedValueWasString: false };
 }
 
 export interface StateDiscloseCommandArgs {
@@ -160,6 +227,11 @@ export interface StateDiscloseCommandArgs {
   env?: NodeJS.ProcessEnv;
   /** Test seam. Absent uses the interactive terminal prompt. */
   approvalChannel?: ApprovalChannel;
+  /**
+   * Test seam for the content-file name derivation. Absent uses the host
+   * clock and fresh randomness; the derivation itself never changes.
+   */
+  fileNameSeam?: { readonly now: Date; readonly randomHex: string };
 }
 
 function write(stream: Writable, text: string): void {
@@ -179,14 +251,12 @@ class CliPromptApprovalChannel implements ApprovalChannel {
     // the operator reads before granting a Tier-1 approval that no policy file
     // can waive. A value that drives the cursor could rewrite the operation
     // name or the notice printed below, so the human approves one thing while
-    // reading another. `JSON.stringify` is not sufficient on its own: it
-    // escapes C0 controls but passes bidi formatting and U+2028/U+2029 through
-    // unchanged.
+    // reading another. Every context key and value therefore goes through the
+    // bounded ASCII-only metadata renderer.
     const contextLines = Object.entries(request.context)
       .map(
         ([k, v]) =>
-          `  ${renderUntrusted(k)}: ` +
-          renderUntrusted(typeof v === "string" ? v : JSON.stringify(v)),
+          `  ${renderUntrustedMetadata(k)}: ${renderUntrustedMetadata(v)}`,
       )
       .join("\n");
     write(
@@ -233,6 +303,9 @@ function printHelp(out: Writable): void {
       "Discloses the content of one state entry whose writer this fortress cannot\n" +
       "establish. Tier 1: requires an interactive approval that no policy file can\n" +
       "waive, and every invocation is audited with the namespace and the key.\n\n" +
+      "The content is never written to the terminal. It is written verbatim to a\n" +
+      "new file under <fortress>/disclosures/ and the terminal prints a receipt\n" +
+      "naming that file.\n\n" +
       "This is NOT a verified read. If the writer CAN be established the command\n" +
       "refuses and points you at `sanctuary state read`-equivalent surfaces, because\n" +
       "restoring the writer identity is the real remedy and it restores verification\n" +
@@ -243,7 +316,8 @@ function printHelp(out: Writable): void {
       "  --fortress <path>  Fortress path (default: the configured storage path).\n" +
       "  --passphrase <p>   Custody material; SANCTUARY_PASSPHRASE or\n" +
       "                     SANCTUARY_RECOVERY_KEY are the preferred sources.\n" +
-      "  --json             Emit the disclosure as JSON.\n" +
+      "  --json             Emit the disclosure verbatim as JSON. Refused when\n" +
+      "                     stdout is a terminal; redirect to a file or pipe it.\n" +
       "  --help, -h         Show this help.\n",
   );
 }
@@ -268,6 +342,19 @@ export async function runStateDiscloseUnattributedCommand(
     return 2;
   }
   const json = argv.includes("--json");
+  // `--json` IS a data channel: its payload goes out verbatim, because
+  // escaping serialized JSON corrupts it for the program reading it (an
+  // earlier round ran the terminal encoder over it and produced escape forms
+  // `JSON.parse` rejects). Verbatim bytes must therefore never reach a
+  // terminal, so a TTY stdout refuses HERE, before the Tier-1 prompt, rather
+  // than choosing between an unsafe write and a corrupted one afterwards.
+  if (json && (out as { isTTY?: boolean }).isTTY === true) {
+    write(
+      err,
+      "Error: --json emits the disclosure verbatim and stdout is a terminal; redirect to a file or pipe it.\n",
+    );
+    return 2;
+  }
 
   const fortressFlag = flagValue(argv, "--fortress");
   if (fortressFlag) {
@@ -349,8 +436,8 @@ export async function runStateDiscloseUnattributedCommand(
     if (outcome.status === "refused_namespace_reserved") {
       write(
         err,
-        `Refused: namespace "${renderUntrusted(namespace)}" is reserved for internal ` +
-          `use (prefix: ${renderUntrusted(outcome.reservedPrefix)}). This surface\n` +
+        `Refused: namespace "${renderUntrustedMetadata(namespace)}" is reserved for internal ` +
+          `use (prefix: ${renderUntrustedMetadata(outcome.reservedPrefix)}). This surface\n` +
           "does not disclose from reserved namespaces.\n",
       );
       return 1;
@@ -358,14 +445,14 @@ export async function runStateDiscloseUnattributedCommand(
     if (outcome.status === "refused_namespace_unavailable") {
       write(
         err,
-        `Refused: namespace "${renderUntrusted(namespace)}" is not available here.\n`,
+        `Refused: namespace "${renderUntrustedMetadata(namespace)}" is not available here.\n`,
       );
       return 1;
     }
     if (outcome.status === "not_found") {
       write(
         err,
-        `Not found: ${renderUntrusted(namespace)}/${renderUntrusted(key)}\n`,
+        `Not found: ${renderUntrustedMetadata(namespace)}/${renderUntrustedMetadata(key)}\n`,
       );
       return 1;
     }
@@ -380,48 +467,87 @@ export async function runStateDiscloseUnattributedCommand(
     if (outcome.status === "refused_verification") {
       write(
         err,
-        `Refused: state verification failed (${outcome.classification}).\n`,
+        `Refused: state verification failed (${renderUntrustedMetadata(outcome.classification)}).\n`,
       );
       return 1;
     }
 
     const disclosure = outcome.disclosure;
     if (json) {
-      // `--json` IS a data channel, and treating it as one was defensible only
-      // while nobody checked where it points. It writes to stdout, and stdout
-      // is frequently a terminal, so the same values that cannot be trusted in
-      // the human path arrive at the same terminal with only
-      // `JSON.stringify`'s escaping, which covers C0 and lone surrogates and
-      // passes every display-affecting format character through.
-      //
-      // Resolved by asking rather than assuming: piped or redirected, the
-      // bytes are data and go out verbatim, because escaping them would
-      // corrupt the value for the program reading it. Attached to a terminal,
-      // a human is reading, and the encoder applies.
-      const toTerminal = (out as { isTTY?: boolean }).isTTY === true;
-      const payload = JSON.stringify(disclosure);
-      write(out, (toTerminal ? renderUntrusted(payload) : payload) + "\n");
+      // Verbatim, and only here: the TTY refusal above already established
+      // that a program, not a terminal, is reading this stream.
+      write(out, JSON.stringify(disclosure) + "\n");
     } else {
-      // The banner is printed BEFORE the content and repeated after it. An
-      // operator who scrolls a long value away from the top of the terminal is
-      // the ordinary case, and a warning that only the first line carries is a
-      // warning most readers of a long entry never see.
+      // THE CONTENT FILE IS WRITTEN BEFORE THE RECEIPT, so the receipt can
+      // never name a file that does not exist, and a write failure fails the
+      // whole command LOUDLY with the content nowhere: printing the content as
+      // a fallback would be the silent downgrade to the exact behavior this
+      // design removed (AGENTS.md MUST-NEVER #5).
+      let contentFilePath: string;
+      let storedValueWasString: boolean;
+      try {
+        const disclosuresDir = join(config.storage_path, "disclosures");
+        await mkdir(disclosuresDir, { recursive: true, mode: 0o700 });
+        // The filename is derived by THIS CODE alone. `namespace` and `key`
+        // are attacker-influenced and never reach the path: a stored or
+        // caller-chosen string in a filename is filesystem injection
+        // (separators, `..`, device names), so the name is a timestamp plus
+        // randomness, both chosen here.
+        const now = args.fileNameSeam?.now ?? new Date();
+        // 3 random bytes hex-encoded = the 6 hex characters in the name.
+        const randomHex =
+          args.fileNameSeam?.randomHex ?? randomBytes(3).toString("hex");
+        // ISO-8601 basic form: strip `-`/`:` and fractional seconds from the
+        // extended form, e.g. 20260819T031500Z.
+        const timestamp = now
+          .toISOString()
+          .replace(/[-:]/g, "")
+          .replace(/\.\d+/, "");
+        contentFilePath = join(
+          disclosuresDir,
+          `disclosure-${timestamp}-${randomHex}.txt`,
+        );
+        const fileBody = disclosureFileBody(disclosure.unattributed_content);
+        storedValueWasString = fileBody.storedValueWasString;
+        // FIDELITY INVARIANT AT THE WRITE SITE: the file carries the stored
+        // value byte-for-byte (or its exact JSON serialization when the stored
+        // value was not a string); no display encoding is ever applied to it.
+        // `wx` refuses an existing file rather than overwriting: a path
+        // collision must never silently replace a disclosure an operator has
+        // not read yet.
+        await writeFile(contentFilePath, fileBody.body, {
+          flag: "wx",
+          mode: 0o600,
+        });
+      } catch (error) {
+        // The OS/error message is code- or kernel-originated, not attacker
+        // metadata, but it still goes through the unbounded ASCII escape so
+        // no path this command prints can carry a raw non-ASCII byte.
+        const message = error instanceof Error ? error.message : String(error);
+        write(
+          err,
+          "Error: could not write the disclosure content file: " +
+            `${renderUntrusted(message)}\n` +
+            "The disclosure was not completed and no content was printed.\n",
+        );
+        return 1;
+      }
+      // THE RECEIPT. The banner is printed BEFORE the metadata and repeated
+      // after it, so an operator who scrolls still sees it. Every value on it
+      // is either a label this code chose, an attacker-influenced value
+      // rendered through the bounded ASCII-only metadata encoder, or the
+      // content-file path, which is code-derived (operator-configured
+      // directory plus the code-chosen filename above) and is deliberately
+      // never truncated: a shortened path names no file.
       write(out, `\n${UNATTRIBUTED_DISCLOSURE_NOTICE}\n\n`);
-      // `namespace` and `key` are caller-chosen; the three `claimed_*`-class
-      // fields and the content are chosen by whoever wrote the unverified
-      // entry. All of them go through renderUntrusted; see its header for why
-      // a raw write here lets the entry's author forge the `writer:` line.
-      write(out, `namespace: ${renderUntrusted(String(disclosure.namespace))}\n`);
-      write(out, `key:       ${renderUntrusted(String(disclosure.key))}\n`);
+      write(out, `namespace: ${renderUntrustedMetadata(disclosure.namespace)}\n`);
+      write(out, `key:       ${renderUntrustedMetadata(disclosure.key)}\n`);
       // `version` IS attacker-controlled, despite its `number` type. The stored
       // entry is parsed from legacy JSON and cast to `StateEntry` without
       // runtime field validation, so `ver` can be any JSON value a writer put
-      // there, including a string carrying escape sequences. An earlier comment
-      // here asserted the opposite and was wrong: the type describes what the
-      // code expects, never what the bytes contain. Encode it like any other
-      // stored value, and read `String(...)` as the reminder that it may not be
-      // a number.
-      write(out, `version:   ${renderUntrusted(String(disclosure.version))}\n`);
+      // there. The metadata renderer both encodes it and carries a faithful
+      // JSON display of a non-primitive, so nothing here trusts the type.
+      write(out, `version:   ${renderUntrustedMetadata(disclosure.version)}\n`);
       // `writer` is the one field this code chooses rather than reads: a
       // single-inhabitant literal set by the disclosure path itself.
       write(out, `writer:    ${disclosure.writer}\n`);
@@ -430,7 +556,7 @@ export async function runStateDiscloseUnattributedCommand(
         `claimed_written_at: ${
           disclosure.claimed_written_at === undefined
             ? "(none recorded)"
-            : renderUntrusted(String(disclosure.claimed_written_at))
+            : renderUntrustedMetadata(disclosure.claimed_written_at)
         }\n`,
       );
       // The identity to restore, printed so the remedy this command advertises
@@ -444,50 +570,17 @@ export async function runStateDiscloseUnattributedCommand(
           `${
             disclosure.claimed_writer_id === undefined
               ? "(none recorded)"
-              : renderUntrusted(String(disclosure.claimed_writer_id))
+              : renderUntrustedMetadata(disclosure.claimed_writer_id)
           }\n`,
       );
-      write(out, "\n--- unattributed content ---\n");
-      // EVERY CONTENT LINE IS GUTTERED, and the gutter is the delimiter's only
-      // defence. Line breaks survive here because this is the text the operator
-      // asked to read, and that exemption is exactly what let the content print
-      // its own `--- end unattributed content ---` line followed by a forged
-      // header: the real delimiter arriving later does not undo what was read.
-      // Prefixing each line means anything the content emits appears INSIDE the
-      // block, so a forged delimiter reads as `| --- end unattributed content
-      // ---` and the ungutted delimiters are unreachable from the content.
-      // Escaping LF instead would make ordinary multi-line values unreadable,
-      // which is the thing this command exists to provide.
-      // The gutter's honest bound, recorded where it is applied: it prefixes
-      // LOGICAL lines. A terminal WRAPS, so content long enough to fill a row
-      // continues at column zero on the next visual row with no newline
-      // involved, and text can appear where a line-oriented frame did not put
-      // it. Nothing in-band fixes that. What the encoder above still
-      // guarantees is that the content cannot move the cursor, cannot reorder
-      // the display, and cannot emit an invisible character; it can only
-      // produce visible text that may land in an unexpected column.
-      const gutter = "| ";
-      // `allowLetters` here and nowhere else: this is the owner's own data and
-      // must be readable in any script. The header fields above are
-      // identifiers and timestamps, so printable ASCII is the whole of what
-      // they legitimately contain.
-      //
-      // `String(...)` on every stored field, for the same reason `version`
-      // needed it: the record is cast from stored JSON with no runtime
-      // validation, so a field typed `string` can arrive as a number, an
-      // object, or an array. Passing one to a string-only encoder threw, and
-      // the throw was caught by the outer handler and reported to the operator
-      // as a fortress unlock failure, which is a false explanation of a real
-      // fault.
-      const body = renderUntrusted(String(disclosure.unattributed_content), {
-        allowLineBreaks: true,
-        allowLetters: true,
-      });
-      for (const line of body.split("\n")) {
-        write(out, `${gutter}${line}\n`);
+      write(out, `\ncontent written to: ${contentFilePath}\n`);
+      if (!storedValueWasString) {
+        write(
+          out,
+          "note: the stored value was not a string; the file carries its exact JSON serialization.\n",
+        );
       }
-      write(out, "--- end unattributed content ---\n\n");
-      write(out, `${UNATTRIBUTED_DISCLOSURE_NOTICE}\n`);
+      write(out, `\n${UNATTRIBUTED_DISCLOSURE_NOTICE}\n`);
     }
     await auditLog.flush().catch(() => undefined);
     return 0;
