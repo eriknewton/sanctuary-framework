@@ -42,6 +42,10 @@ import type {
   SignedEvent,
 } from "./types.js";
 import { verifyCertChain } from "./trust-root.js";
+// a mesh envelope arrives off the wire and is `JSON.parse`d, so every field is
+// attacker-controlled until this verifier accepts it; diagnostics go through
+// the untrusted-diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Packing (emitter side)
@@ -260,7 +264,7 @@ export function verifySignedEvent(
 ): VerifyResult {
   if (evt.protocol_version !== PROTOCOL_VERSION) {
     throw new MeshSignatureError(
-      `unknown protocol_version ${evt.protocol_version}; v0.1 verifier accepts only ${PROTOCOL_VERSION}`
+      `unknown protocol_version ${describeUntrusted(evt.protocol_version)}; v0.1 verifier accepts only ${PROTOCOL_VERSION}`
     );
   }
   const requireMatchingFortress = ctx.requireMatchingFortress ?? true;
@@ -269,7 +273,7 @@ export function verifySignedEvent(
     evt.fortress_id !== ctx.pinnedMasterPubkey.fortress_id
   ) {
     throw new MeshSignatureError(
-      `envelope fortress_id=${evt.fortress_id} does not match pinned fortress ${ctx.pinnedMasterPubkey.fortress_id} — cross-operator isolation invariant`
+      `envelope fortress_id=${describeUntrusted(evt.fortress_id)} does not match pinned fortress ${ctx.pinnedMasterPubkey.fortress_id} — cross-operator isolation invariant`
     );
   }
 
@@ -287,7 +291,7 @@ export function verifySignedEvent(
   const nodeCert = ctx.lookupNodeCert(evt.emitter_node);
   if (!nodeCert) {
     throw new MeshSignatureError(
-      `emitter_node ${evt.emitter_node} is not in local roster`
+      `emitter_node ${describeUntrusted(evt.emitter_node)} is not in local roster`
     );
   }
   if (hasReservedCapabilityBits(nodeCert.capabilities)) {
@@ -296,7 +300,7 @@ export function verifySignedEvent(
   const principalCert = ctx.lookupPrincipalCert(evt.emitter_principal);
   if (evt.principal_signature && !principalCert) {
     throw new MeshSignatureError(
-      `emitter_principal ${evt.emitter_principal} is not in local roster but a principal_signature is present`
+      `emitter_principal ${describeUntrusted(evt.emitter_principal)} is not in local roster but a principal_signature is present`
     );
   }
   // Chain-validate every node cert, including system-principal events. The
@@ -335,7 +339,7 @@ export function verifySignedEvent(
   );
   if (!nodeOk) {
     throw new MeshSignatureError(
-      `node_signature does not verify against ${evt.emitter_node}`
+      `node_signature does not verify against ${describeUntrusted(evt.emitter_node)}`
     );
   }
 
@@ -347,7 +351,7 @@ export function verifySignedEvent(
     );
     if (!principalOk) {
       throw new MeshSignatureError(
-        `principal_signature does not verify against ${evt.emitter_principal}`
+        `principal_signature does not verify against ${describeUntrusted(evt.emitter_principal)}`
       );
     }
   }

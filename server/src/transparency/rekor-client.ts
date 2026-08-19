@@ -14,6 +14,10 @@
  */
 
 import type { HashedRekordProposal, RekorEntryRef } from "./anchor.js";
+// a Rekor response body is remote JSON, so its fields are supplied by a third
+// party and go through the untrusted-diagnostic chokepoint (STATE-STORE-
+// ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 export const REKOR_ENTRIES_PATH = "/api/v1/log/entries";
 export const REKOR_SUBMIT_TIMEOUT_MS = 30_000;
@@ -215,7 +219,7 @@ export class HttpRekorClient implements RekorClient {
         !uuid.endsWith(entry.uuid)
       ) {
         throw new RekorClientError(
-          `Rekor answered with entry ${entry.uuid} when asked for ${uuid}`
+          `Rekor answered with entry ${describeUntrusted(entry.uuid)} when asked for ${uuid}`
         );
       }
       return entry;

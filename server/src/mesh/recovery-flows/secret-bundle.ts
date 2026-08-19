@@ -34,6 +34,10 @@ import type {
   PrincipalCertificate,
 } from "../types.js";
 import { SecretBundleError } from "./errors.js";
+// the bundle plaintext is `JSON.parse`d after decryption, so its fields are
+// peer-supplied; diagnostics go through the untrusted-diagnostic chokepoint
+// (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../../errors/index.js";
 
 /** Plaintext bundle payload, pre-wrap. */
 export interface MasterRotationBundlePlaintext {
@@ -200,7 +204,7 @@ export function unwrapMasterRotationBundle(params: {
   }
   if (plaintext.re_issued_self_cert.node_id !== params.this_node_id) {
     throw new SecretBundleError(
-      `master_rotation_bundle re_issued_self_cert.node_id=${plaintext.re_issued_self_cert.node_id} does not match this node ${params.this_node_id}`
+      `master_rotation_bundle re_issued_self_cert.node_id=${describeUntrusted(plaintext.re_issued_self_cert.node_id)} does not match this node ${params.this_node_id}`
     );
   }
   return plaintext;

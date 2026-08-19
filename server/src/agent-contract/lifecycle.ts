@@ -44,6 +44,10 @@ import {
 import { LifecycleTransitionError } from "./errors.js";
 import { validateLifecycleEvent } from "./schema.js";
 import type { LifecycleEvent } from "./types.js";
+// `evt` is a wire-supplied signed event whose declared shape is unverified
+// until this function verifies it, so its fields are rendered through the
+// untrusted-diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 export const AGENT_LIFECYCLE_EVENT_TYPE: AgentContractEventType =
   "agent_lifecycle_event";
@@ -167,7 +171,7 @@ export function verifyLifecycleEvent(
     throw new LifecycleTransitionError(
       "<unknown>",
       "<unknown>",
-      `wrong event_type "${evt.event_type}"`
+      `wrong event_type "${describeUntrusted(evt.event_type)}"`
     );
   }
   const verifyResult = verifySignedEvent(evt as SignedEvent, ctx);

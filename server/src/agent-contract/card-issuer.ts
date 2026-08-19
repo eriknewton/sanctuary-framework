@@ -38,6 +38,10 @@ import type {
   AgentCardCapability,
   AgentIdentityBinding,
 } from "./types.js";
+// `evt` is a wire-supplied signed event whose declared shape is unverified
+// until this function verifies it, so its fields are rendered through the
+// untrusted-diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 export const AGENT_CARD_ISSUED_EVENT_TYPE: AgentContractEventType =
   "agent_card_issued";
@@ -163,7 +167,7 @@ export function verifyAgentCard(
 ): VerifyAgentCardResult {
   if (evt.event_type !== AGENT_CARD_ISSUED_EVENT_TYPE) {
     throw new AgentCardVerificationError(
-      `expected event_type "${AGENT_CARD_ISSUED_EVENT_TYPE}"; got "${evt.event_type}"`
+      `expected event_type "${AGENT_CARD_ISSUED_EVENT_TYPE}"; got "${describeUntrusted(evt.event_type)}"`
     );
   }
   const verifyResult = verifySignedEvent(evt as SignedEvent, ctx);

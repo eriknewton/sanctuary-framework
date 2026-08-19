@@ -14,6 +14,10 @@
 import { gcm } from "@noble/ciphers/aes.js";
 import { generateIV } from "./random.js";
 import { toBase64url, fromBase64url } from "./encoding.js";
+// an `EncryptedPayload` is `JSON.parse`d off disk before it is decrypted, so
+// its header fields are attacker-influenced and go through the untrusted-
+// diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 /** Encrypted payload structure stored on disk */
 export interface EncryptedPayload {
@@ -86,10 +90,10 @@ export function decrypt(
     throw new Error("Key must be exactly 32 bytes (256 bits)");
   }
   if (payload.v !== 1) {
-    throw new Error(`Unsupported payload version: ${payload.v}`);
+    throw new Error(`Unsupported payload version: ${describeUntrusted(payload.v)}`);
   }
   if (payload.alg !== "aes-256-gcm") {
-    throw new Error(`Unsupported algorithm: ${payload.alg}`);
+    throw new Error(`Unsupported algorithm: ${describeUntrusted(payload.alg)}`);
   }
 
   const iv = fromBase64url(payload.iv);

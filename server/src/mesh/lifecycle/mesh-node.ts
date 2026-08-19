@@ -131,6 +131,10 @@ import type {
   SyncResponsePayload,
 } from "./types.js";
 import type { MeshNodeState } from "./constants.js";
+// unicast payloads and envelopes arrive off the wire and are `JSON.parse`d, so
+// their fields are attacker-controlled; diagnostics go through the untrusted-
+// diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../../errors/index.js";
 
 /**
  * Bootstrap result for the very first node in a fortress (§3.7).
@@ -1051,7 +1055,7 @@ export class MeshNode {
     }
     const parsed = JSON.parse(message) as { kind: string; batch: import("../types.js").AuditBatch };
     if (parsed.kind !== "audit_batch") {
-      throw new MeshError(`ingestAuditBatch: unknown unicast kind ${parsed.kind}`);
+      throw new MeshError(`ingestAuditBatch: unknown unicast kind ${describeUntrusted(parsed.kind)}`);
     }
     const auditChainKey = deriveNodeAuditChainKey({
       fortress_master_secret: this.fortressMasterSecret,
@@ -1933,7 +1937,7 @@ export class MeshNode {
     if (last !== undefined && evt.monotonic_seq <= last) {
       throw new MeshRollbackDetectedError(
         evt.emitter_node,
-        `non-monotonic envelope monotonic_seq (got ${evt.monotonic_seq}, last seen ${last})`
+        `non-monotonic envelope monotonic_seq (got ${describeUntrusted(evt.monotonic_seq)}, last seen ${last})`
       );
     }
     this.lastReceivedMonotonicSeq.set(evt.emitter_node, evt.monotonic_seq);

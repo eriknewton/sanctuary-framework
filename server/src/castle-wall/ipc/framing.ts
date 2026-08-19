@@ -11,6 +11,10 @@
 
 import { CASTLE_WALL_IPC_CONTENT_LENGTH_HEADER } from "../constants.js";
 import { IpcFramingError } from "../errors.js";
+// header bytes arrive off the IPC socket, so the decoded text is unbounded
+// attacker input and goes through the untrusted-diagnostic chokepoint (STATE-
+// STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../../errors/index.js";
 
 const DEFAULT_MAX_FRAME_BYTES = 16 * 1024 * 1024; // 16 MB
 const MIN_MAX_FRAME_BYTES = 1024;
@@ -97,14 +101,14 @@ export function parseFrame(buf: Uint8Array): ParseStep {
   for (const line of lines) {
     const colon = line.indexOf(":");
     if (colon === -1) {
-      return { kind: "error", reason: `malformed header line: ${line}` };
+      return { kind: "error", reason: `malformed header line: ${describeUntrusted(line)}` };
     }
     const name = line.slice(0, colon).trim();
     const value = line.slice(colon + 1).trim();
     if (name.toLowerCase() === CASTLE_WALL_IPC_CONTENT_LENGTH_HEADER.toLowerCase()) {
       const parsed = Number(value);
       if (!Number.isInteger(parsed) || parsed < 0) {
-        return { kind: "error", reason: `invalid Content-Length value: ${value}` };
+        return { kind: "error", reason: `invalid Content-Length value: ${describeUntrusted(value)}` };
       }
       contentLength = parsed;
     }
