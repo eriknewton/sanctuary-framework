@@ -33,6 +33,10 @@ import { validateOperatorBaseline } from "../allowlist/operator-baseline.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { RuntimeManifestPublishError } from "./errors.js";
 import { ED25519_SIGNATURE_BYTES } from "../../core/crypto-suite-registry.js";
+// `rule.id` is type-checked just above but is unbounded in length, so the
+// diagnostic goes through the untrusted-diagnostic chokepoint for its length
+// bound (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../../errors/index.js";
 
 /**
  * Encrypted private-key material for the LOCAL (dev/test) signing path. Under
@@ -143,10 +147,10 @@ export async function buildSignedManifest(input: BuildSignedManifestInput): Prom
       throw new RuntimeManifestPublishError("rule missing id");
     }
     if (seen.has(rule.id)) {
-      throw new RuntimeManifestPublishError(`duplicate rule id: ${rule.id}`);
+      throw new RuntimeManifestPublishError(`duplicate rule id: ${describeUntrusted(rule.id)}`);
     }
     seen.add(rule.id);
-    const filename = `${rule.id}.json`;
+    const filename = `${describeUntrusted(rule.id)}.json`;
     const bytes = renderRuleFile(rule);
     const digest = sha256Hex(bytes);
     entries.push({ rule_id: rule.id, file: filename, sha256: digest });

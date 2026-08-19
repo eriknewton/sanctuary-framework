@@ -634,7 +634,9 @@ export class MasterRotationReceiver {
     // JSON, and its fields are consumed in comparisons and AAD construction
     // before anything is authenticated. Both sides of that boundary consume
     // THIS one schema, so the typed result is the agreement (AGENTS.md rule 11)
-    // rather than two validators that can drift.
+    // rather than two validators that can drift. This bounds THIS envelope's
+    // fields only; it is not a claim that the recovery path's untrusted input
+    // is generally safe to dereference.
     const envelopeParse = parseMasterRotationBundleEnvelope(parsed);
     if (!envelopeParse.ok) {
       throw new SecretBundleError(

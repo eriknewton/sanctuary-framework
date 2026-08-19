@@ -45,7 +45,9 @@ export {
   unwrapMasterRotationBundle,
   // The element-level wire parse. Exported because it IS the agreement between
   // the unicast receiver and the unwrapper; a caller that casts instead is the
-  // shape that kept the wire variant of STATE-STORE-ERRMSG-INTERP-01 reachable.
+  // shape this parse exists to prevent (STATE-STORE-ERRMSG-INTERP-01). It
+  // bounds THIS envelope's fields; it is not a general guarantee that wire
+  // input elsewhere in this module is safe to dereference.
   parseMasterRotationBundleEnvelope,
   toBundleSecret,
   fromBundleSecret,

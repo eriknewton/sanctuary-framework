@@ -28,25 +28,35 @@
  *   always well-formed UTF-16).
  *
  * WORK BOUND (state it exactly; an overstated bound is the same defect one
- * level up):
+ * level up, and this block has been wrong twice):
  *
  *   OUTPUT length is strictly bounded, always, at
  *   MAX_UNTRUSTED_DIAGNOSTIC_CHARS + UNTRUSTED_TRUNCATION_MARKER.length.
  *
- *   WORK is bounded by that same budget, NOT by the size of the caller's value,
- *   for strings, objects, arrays, and property keys: every stage clamps before
- *   it transforms, so no scan, escape, quote, or allocation ever runs over more
- *   than the budget's worth of characters. This is a property that has to be
- *   maintained at each new stage, not one the shape guarantees: a full-input
- *   `.replace`, `String()`, or regex added ABOVE a clamp silently reintroduces
- *   input-proportional cost while every test still passes.
+ *   WORK is bounded by the render budget for: string and property-key CONTENT
+ *   (every stage clamps before it transforms), array elements, nesting depth,
+ *   and bulk containers, which are described by their element count rather than
+ *   walked. Accessors are never invoked, so no attacker-supplied getter runs.
  *
- *   Two costs are inherent rather than bounded, and are named here rather than
- *   claimed away. Rendering a BigInt compares it against a precomputed ceiling,
- *   which reads its existing binary representation (cheap per digit, no
- *   allocation, no decimal conversion). Enumerating a hostile Proxy runs that
- *   Proxy's own traps, which can do arbitrary work before this function regains
- *   control; the budget stops the iteration, it cannot bound one trap.
+ *   WORK IS NOT BOUNDED for the three costs below. They are named because they
+ *   are real, not because they are acceptable everywhere; a caller putting a
+ *   value of unbounded WIDTH into a diagnostic still pays for it.
+ *
+ *     1. Enumerating a plain object's own keys is O(number of own keys) inside
+ *        the engine, BEFORE any per-key work this function does. Measured on a
+ *        1e6-key object: `for...in` that breaks on the first iteration costs
+ *        ~112ms, the same as `Object.keys(...).length` (~111ms);
+ *        `getOwnPropertyNames` and `Reflect.ownKeys` cost about twice that.
+ *        No JavaScript API returns a bounded slice of an arbitrary object's
+ *        keys, so this floor cannot be removed from here. What IS bounded, and
+ *        is asserted by test, is the work added ON TOP of that floor.
+ *     2. A hostile Proxy runs its own `get`, `getOwnPropertyDescriptor`, and
+ *        `ownKeys` traps, which are attacker code and can do arbitrary work
+ *        before this function regains control. The budget stops the iteration;
+ *        it cannot bound one trap.
+ *     3. Rendering a BigInt compares it against a precomputed ceiling, which
+ *        reads the value's existing binary representation. Cheap per digit, no
+ *        allocation and no decimal conversion, but not constant.
  *
  * NOT A REDACTOR. This does not decide what is safe to disclose; that judgment
  * belongs to the caller and, for the evidence pack, to
@@ -92,6 +102,12 @@ export const UNRENDERABLE_UNTRUSTED_VALUE = "<unrenderable value>";
  * it, and it does not pretend to be a number.
  */
 export const OVERSIZED_BIGINT = "<bigint exceeds the diagnostic length bound>";
+
+/**
+ * Stands in for a property defined by a getter or setter. Code-chosen: the
+ * accessor is NEVER invoked, so nothing derived from running it appears here.
+ */
+export const ACCESSOR_PLACEHOLDER = "<accessor>";
 
 /**
  * A BigInt at or beyond this magnitude needs more than the bound's worth of
@@ -217,6 +233,17 @@ function renderStructured(
     return capped;
   }
 
+  // BULK CONTAINERS ARE DESCRIBED, NOT WALKED. A typed array, buffer, Map, or
+  // Set carries its element count as a property, so a million-element value can
+  // be described in constant time. Iterating it instead makes the cost scale
+  // with the caller's data for a result the length bound throws away anyway
+  // (measured: a 1e6-element Uint8Array cost ~11ms to render ~128 characters).
+  const bulk = describeBulkContainer(container);
+  if (bulk !== null) {
+    budget.remaining -= bulk.length;
+    return bulk;
+  }
+
   seen.add(container);
   try {
     const parts: string[] = [];
@@ -227,7 +254,7 @@ function renderStructured(
           parts.push(ELIDED);
           break;
         }
-        parts.push(renderChild(() => elements[i], depth, seen, budget));
+        parts.push(renderOwnProperty(container, String(i), depth, seen, budget));
       }
       budget.remaining -= parts.length + 1;
       return `[${parts.join(",")}]`;
@@ -247,8 +274,9 @@ function renderStructured(
       if (!Object.prototype.hasOwnProperty.call(container, propertyKey)) continue;
       const renderedKey = quoteKeyOrString(propertyKey);
       budget.remaining -= renderedKey.length;
-      const renderedValue = renderChild(
-        () => (container as Record<string, unknown>)[propertyKey],
+      const renderedValue = renderOwnProperty(
+        container,
+        propertyKey,
         depth,
         seen,
         budget
@@ -260,6 +288,76 @@ function renderStructured(
   } finally {
     seen.delete(container);
   }
+}
+
+/**
+ * Describe a container that carries its own element count, in constant time.
+ * Returns null when `container` is not one of these and must be walked.
+ *
+ * The tag comes from `Object.prototype.toString`, which is spec-defined but
+ * spoofable through `Symbol.toStringTag`; it is only ever a string, and it is
+ * escaped and clamped downstream like any other untrusted text.
+ */
+function describeBulkContainer(container: object): string | null {
+  try {
+    if (ArrayBuffer.isView(container)) {
+      const view = container as ArrayBufferView & { length?: number };
+      const count = typeof view.length === "number" ? view.length : view.byteLength;
+      return `<${bulkTag(container)} length=${count}>`;
+    }
+    if (container instanceof ArrayBuffer) {
+      return `<ArrayBuffer byteLength=${container.byteLength}>`;
+    }
+    if (container instanceof Map || container instanceof Set) {
+      return `<${bulkTag(container)} size=${container.size}>`;
+    }
+  } catch {
+    // A hostile `Symbol.toStringTag` getter or a spoofed prototype can throw
+    // here; a container we cannot even name is simply walked instead.
+    return null;
+  }
+  return null;
+}
+
+function bulkTag(container: object): string {
+  // "[object Uint8Array]" -> "Uint8Array"; 8 = length of "[object ".
+  const raw = Object.prototype.toString.call(container);
+  return raw.slice(8, -1);
+}
+
+/**
+ * Render one OWN property without invoking an accessor.
+ *
+ * WHY A DESCRIPTOR AND NOT A READ: a plain `container[key]` runs a getter, and
+ * a getter is attacker-supplied code that can burn arbitrary time, mutate
+ * state, or throw. Building a diagnostic must never execute the subject it is
+ * describing (measured before this change: a 30ms getter cost the render 30ms,
+ * and it ran). `getOwnPropertyDescriptor` reports the accessor without calling
+ * it. On a Proxy this still runs that trap, which stays a named cost.
+ */
+function renderOwnProperty(
+  container: object,
+  propertyKey: string,
+  depth: number,
+  seen: WeakSet<object>,
+  budget: RenderBudget
+): string {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(container, propertyKey);
+  } catch {
+    budget.remaining -= UNREADABLE.length;
+    return UNREADABLE;
+  }
+  if (descriptor === undefined) {
+    budget.remaining -= UNREADABLE.length;
+    return UNREADABLE;
+  }
+  if (descriptor.get !== undefined || descriptor.set !== undefined) {
+    budget.remaining -= ACCESSOR_PLACEHOLDER.length;
+    return ACCESSOR_PLACEHOLDER;
+  }
+  return renderChild(() => descriptor.value, depth, seen, budget);
 }
 
 /** Read + render one child, converting any throw (getter, proxy trap) into a placeholder. */

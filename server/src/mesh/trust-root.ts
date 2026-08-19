@@ -494,7 +494,10 @@ export function verifyFederationRootRotationCertificate(
 ): void {
   if (cert.kind !== FEDERATION_ROOT_ROTATION_KIND) {
     throw new MeshChainError(
-      `rotation cert kind=${String(cert.kind)} is not ${FEDERATION_ROOT_ROTATION_KIND}`,
+      // `String(x)` coerces exactly like a template literal does, so it is the
+      // same defect wearing a different syntax; the first scan looked only for
+      // interpolations and missed this shape (STATE-STORE-ERRMSG-INTERP-01).
+      `rotation cert kind=${describeUntrusted(cert.kind)} is not ${FEDERATION_ROOT_ROTATION_KIND}`,
     );
   }
   if (cert.fortress_id !== pinnedOldMaster.fortress_id) {

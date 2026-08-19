@@ -103,6 +103,13 @@ export type MasterRotationBundleEnvelopeParseResult =
  * STATE-STORE-ERRMSG-INTERP-01, wire variant). Bounding the MESSAGE is not
  * enough when the value is consumed before the message is built; the shape has
  * to be established first.
+ *
+ * SCOPE, stated so a later reader does not over-trust this: the result is a
+ * validated view of the ORIGINAL object, not a copied snapshot, and callers
+ * still re-read fields off it. A stateful accessor can therefore satisfy this
+ * parse and return something else on a later read. Closing that, and the
+ * matching gaps on the decrypted plaintext and on the bootstrap-token path, is
+ * separate tracked work; this function does not claim to have closed it.
  */
 export function parseMasterRotationBundleEnvelope(
   value: unknown
@@ -246,9 +253,8 @@ export function unwrapMasterRotationBundle(params: {
 }): MasterRotationBundlePlaintext {
   // Establish the SHAPE before any field is compared or folded into the AAD.
   // This function is exported and reachable directly, so it re-parses rather
-  // than trusting that its caller did: the parse is O(1) field checks, and the
-  // alternative is a caller that casts (which is exactly how the wire variant
-  // of STATE-STORE-ERRMSG-INTERP-01 stayed reachable).
+  // than trusting that its caller did: the parse is O(1) field checks, and a
+  // caller that casts instead is the shape this exists to prevent.
   const parsed = parseMasterRotationBundleEnvelope(params.envelope);
   if (!parsed.ok) {
     throw new SecretBundleError(
