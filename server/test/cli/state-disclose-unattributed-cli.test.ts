@@ -19,7 +19,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PassThrough, Writable } from "node:stream";
@@ -690,6 +690,66 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
       join(nonAsciiFortress, "disclosures", files[0]!)
     );
     expect(fileBytes.equals(Buffer.from(CONTENT, "utf8"))).toBe(true);
+  });
+
+  it("removes the disclosure file and reports distinctly when the receipt cannot be delivered", async () => {
+    // A stdout write failure AFTER the content file is persisted would
+    // otherwise strand a plaintext disclosure on disk that no receipt ever
+    // named: the operator does not know it exists, and the generic unlock
+    // diagnosis points them away from it. The command must deliver both the
+    // file and the receipt, or neither.
+    class ThrowingWritable extends Writable {
+      override write(): never {
+        throw new Error("terminal is gone");
+      }
+    }
+    const seam = { now: new Date("2026-08-19T01:00:00.000Z"), randomHex: "ddeeff" };
+    const expectedPath = join(
+      fortressPath,
+      "disclosures",
+      "disclosure-20260819T010000Z-ddeeff.txt"
+    );
+    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+    const err = new StringWritable();
+    const code = await runStateDiscloseUnattributedCommand({
+      argv: ["--fortress", fortressPath, "--namespace", NAMESPACE, "--key", KEY],
+      out: new ThrowingWritable(),
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      approvalChannel: new FixedChannel("approve"),
+      fileNameSeam: seam,
+    });
+
+    // A distinct exit status: not the unlock-failure 1, not the usage 2.
+    expect(code).toBe(3);
+    expect(err.text).toContain(
+      "the receipt could not be delivered; the disclosure file was removed; re-run the command"
+    );
+    expect(err.text).not.toContain("could not open or unlock");
+    // The rollback: the just-written file is gone, and nothing else was left.
+    await expect(readFile(expectedPath)).rejects.toThrow();
+    expect(await readdir(join(fortressPath, "disclosures"))).toHaveLength(0);
+  });
+
+  it("refuses a symlinked disclosures path rather than following it", async () => {
+    // `chmod` and a path-based write both FOLLOW a symlink, so a
+    // pre-positioned `disclosures -> elsewhere` link would redirect the mode
+    // change and the plaintext disclosure onto an external target. The
+    // no-follow custody check refuses the shape outright.
+    const external = join(tmp, "elsewhere");
+    await mkdir(external, { recursive: true, mode: 0o755 });
+    await symlink(external, join(fortressPath, "disclosures"));
+
+    const { code, out, err } = await runCommand();
+    expect(code).toBe(1);
+    expect(err).toContain("could not prepare the disclosure content file");
+    expect(err).toContain("symbolic links are not permitted");
+    // The external target is untouched: mode unchanged, nothing written.
+    expect((await stat(external)).mode & 0o777).toBe(0o755);
+    expect(await readdir(external)).toHaveLength(0);
+    // And no receipt claimed anything happened.
+    expect(out).not.toContain("content written to:");
+    expect(out).not.toContain(CONTENT);
   });
 
   it("encodes caller input on the refusal paths, which print before any record is read", async () => {

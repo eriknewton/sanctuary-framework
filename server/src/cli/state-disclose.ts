@@ -41,7 +41,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, unlink, writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -68,6 +68,7 @@ import type {
   ApprovalRequest,
   ApprovalResponse,
 } from "../principal-policy/types.js";
+import { verifyDirectoryCustodyWithinBase } from "../storage/custody-fs.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { flagValue } from "./argv.js";
 
@@ -538,6 +539,17 @@ export async function runStateDiscloseUnattributedCommand(
       try {
         const disclosuresDir = join(config.storage_path, "disclosures");
         await mkdir(disclosuresDir, { recursive: true, mode: 0o700 });
+        // NO-FOLLOW CUSTODY BEFORE ANY MODE CHANGE OR WRITE: `chmod` and a
+        // path-based file write both FOLLOW a symlink, so a pre-positioned
+        // `disclosures -> elsewhere` link would redirect the mode change and
+        // the plaintext disclosure onto an external target. The shared
+        // custody verifier (`storage/custody-fs`, the same machinery the
+        // fortress custody paths use) lstats the leaf and refuses a symlink
+        // or non-directory; the refusal is loud with no fallback.
+        await verifyDirectoryCustodyWithinBase(
+          disclosuresDir,
+          config.storage_path,
+        );
         // `mkdir`'s mode applies only when it CREATES the directory; a
         // pre-existing disclosures directory keeps whatever mode it had, so
         // operator-only access is ENFORCED on every run rather than assumed
@@ -647,7 +659,23 @@ export async function runStateDiscloseUnattributedCommand(
       }
       // One write, after the file exists: the receipt the operator sees always
       // names a file that is really there.
-      write(out, receipt);
+      try {
+        write(out, receipt);
+      } catch {
+        // ROLLBACK INVARIANT: no disclosure file may outlive a run whose
+        // receipt never named it; the operator either gets both or neither. A
+        // receipt that failed to reach the terminal leaves a plaintext file on
+        // disk the operator does not know exists, so the file is removed
+        // (best-effort) and the failure is reported on stderr with its own
+        // exit status, distinct from the unlock-failure (1) and usage (2)
+        // paths, so a wrapper can tell "re-run" from "wrong credentials".
+        await unlink(contentFilePath).catch(() => undefined);
+        write(
+          err,
+          "Error: the receipt could not be delivered; the disclosure file was removed; re-run the command.\n",
+        );
+        return 3;
+      }
     }
     await auditLog.flush().catch(() => undefined);
     return 0;
