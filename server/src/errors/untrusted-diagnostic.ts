@@ -36,12 +36,41 @@
  *   WORK is bounded by the render budget for: string and property-key CONTENT
  *   (every stage clamps before it transforms), array elements, nesting depth,
  *   and bulk containers, which are described by their element count rather than
- *   walked. No CALLER-SUPPLIED accessor is ever invoked: properties are read
- *   through descriptors, and a bulk container's count comes from the built-in
- *   getter taken off the prototype, which bypasses any own shadow. Engine
+ *   walked.
+ *
+ * ACCESSOR GUARANTEE (stated at exactly its width; the wider version of this
+ * sentence was here and was false):
+ *
+ *   FOR AN ORDINARY OBJECT, no caller-supplied accessor runs. Properties are
+ *   read through `getOwnPropertyDescriptor` instead of being read, so a getter
+ *   or setter is REPORTED and never called; a bulk container's count comes from
+ *   the built-in getter taken off the prototype, which bypasses any own shadow;
+ *   and the container's own name is never read, because `Symbol.toStringTag`
+ *   would be caller code, so bulk labels are code-chosen and generic. Engine
  *   getters ARE invoked, deliberately; they are constant-time and not caller
- *   code. The container's own name is never read, because `Symbol.toStringTag`
- *   would be caller code, so bulk labels are code-chosen and generic.
+ *   code.
+ *
+ *   FOR A HOSTILE PROXY THE GUARANTEE IS WEAKER, and the weakening is
+ *   structural rather than a rounding error: a Proxy's traps ARE caller code,
+ *   and reaching a Proxy's shape at all means running them. Two paths run
+ *   caller code that this module cannot route around; both were observed by
+ *   probe, not reasoned about:
+ *
+ *     - `getPrototypeOf` runs, because the `instanceof` checks that recognise a
+ *       bulk container consult the prototype chain (measured: 4 invocations on
+ *       one render of a trapping Proxy).
+ *     - A `getOwnPropertyDescriptor` trap may return a descriptor OBJECT whose
+ *       own `enumerable`, `value`, `get`, or `set` field is itself a getter,
+ *       and the engine invokes those fields while converting the returned
+ *       object into a property descriptor (measured: 3 invocations on the same
+ *       render). The accessor that runs belongs to the descriptor the trap
+ *       fabricated, not to the property being described, so the SUBJECT's own
+ *       getter is still never called; caller code still ran.
+ *
+ *   So the honest form is: this module never READS a property in a way that
+ *   runs the subject's own accessor, and for an ordinary object that means no
+ *   caller code runs at all. It is not, and cannot be, a guarantee that no
+ *   caller code runs when the caller supplied a Proxy.
  *
  *   WORK IS NOT BOUNDED for the three costs below. They are named because they
  *   are real, not because they are acceptable everywhere; a caller putting a
@@ -55,10 +84,14 @@
  *        No JavaScript API returns a bounded slice of an arbitrary object's
  *        keys, so this floor cannot be removed from here. What IS bounded, and
  *        is asserted by test, is the work added ON TOP of that floor.
- *     2. A hostile Proxy runs its own `get`, `getOwnPropertyDescriptor`, and
- *        `ownKeys` traps, which are attacker code and can do arbitrary work
- *        before this function regains control. The budget stops the iteration;
- *        it cannot bound one trap.
+ *     2. A hostile Proxy runs its own `getPrototypeOf`, `ownKeys`,
+ *        `getOwnPropertyDescriptor`, and `get` traps, plus any accessor the
+ *        `getOwnPropertyDescriptor` trap plants on the descriptor it returns
+ *        (see the ACCESSOR GUARANTEE above; the list is what a probe observed,
+ *        so treat it as the traps this module is KNOWN to reach, not as a
+ *        proof that no other trap can be). All of it is attacker code and can
+ *        do arbitrary work before this function regains control. The budget
+ *        stops the iteration; it cannot bound one trap.
  *     3. Rendering a BigInt compares it against a precomputed ceiling, which
  *        reads the value's existing binary representation. Cheap per digit, no
  *        allocation and no decimal conversion, but not constant.
@@ -109,8 +142,11 @@ export const UNRENDERABLE_UNTRUSTED_VALUE = "<unrenderable value>";
 export const OVERSIZED_BIGINT = "<bigint exceeds the diagnostic length bound>";
 
 /**
- * Stands in for a property defined by a getter or setter. Code-chosen: the
- * accessor is NEVER invoked, so nothing derived from running it appears here.
+ * Stands in for a property defined by a getter or setter. Code-chosen: that
+ * property's own accessor is NEVER invoked, so nothing derived from running it
+ * appears here. A Proxy can still run its own traps, and a descriptor its trap
+ * fabricates can carry an accessor the engine invokes; neither produces this
+ * string's content. See the ACCESSOR GUARANTEE in the file header.
  */
 export const ACCESSOR_PLACEHOLDER = "<accessor>";
 
@@ -299,9 +335,11 @@ function renderStructured(
  * Describe a container that carries its own element count, in constant time.
  * Returns null when `container` is not one of these and must be walked.
  *
- * The tag comes from `Object.prototype.toString`, which is spec-defined but
- * spoofable through `Symbol.toStringTag`; it is only ever a string, and it is
- * escaped and clamped downstream like any other untrusted text.
+ * NO TAG IS READ OFF THE VALUE. An earlier revision labelled the container from
+ * `Object.prototype.toString` and that path was deliberately removed, because
+ * it reads `Symbol.toStringTag` and so runs caller code (see the note on the
+ * captured getters below). Recognition is by internal checks a caller cannot
+ * forge, and every label here is a code-chosen literal.
  */
 function describeBulkContainer(container: object): string | null {
   try {
@@ -370,7 +408,10 @@ const SET_SIZE_GETTER = protoGetter(Set.prototype, "size");
  * state, or throw. Building a diagnostic must never execute the subject it is
  * describing (measured before this change: a 30ms getter cost the render 30ms,
  * and it ran). `getOwnPropertyDescriptor` reports the accessor without calling
- * it. On a Proxy this still runs that trap, which stays a named cost.
+ * it. On a Proxy this still runs that trap, which stays a named cost, and a
+ * trap may return a descriptor object whose own fields are getters that the
+ * engine then invokes: see the ACCESSOR GUARANTEE in the file header for what
+ * survives in that case and what does not.
  */
 function renderOwnProperty(
   container: object,

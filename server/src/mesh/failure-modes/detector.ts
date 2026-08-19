@@ -394,6 +394,17 @@ export class FailureModeDetector {
           ? FAILURE_MODE.COMPROMISED
           : FAILURE_MODE.PEER_REFUSED,
         target,
+        // SIGNED-DOWNSTREAM DIAGNOSTIC (invariant, and an obligation on whoever
+        // edits this composition). `info.error.message` is a refusal rendering
+        // whose untrusted fragments were bounded by `describeUntrusted` at the
+        // verifier that produced it, and anything added to this message must be
+        // bounded the same way - the string does not stop here: it is retained
+        // in the alert map, emitted as sentinel input, and hashed and signed
+        // downstream. The refused peer's original value is deliberately NOT
+        // recoverable from it, because the rendering truncates. Nothing
+        // downstream may parse this text or branch on it; `reason_class`,
+        // `event_type`, and `error_name` in `detail` below are the
+        // machine-readable facts.
         message: compromiseClass
           ? `An event of type ${info.event_type} received ${describeOrigin(target)} was refused (${info.reason_class}): ${info.error.message}.`
           : `An event of type ${info.event_type} received ${describeOrigin(target)} was refused by this node (${info.reason_class}): ${info.error.message}. This describes a timing or capacity condition on this node, not evidence that the peer is compromised. Check clock synchronisation before treating it as an incident.`,
@@ -967,6 +978,14 @@ export class FailureModeDetector {
   }
 
   private publishAlert(alert: FailureModeAlert): void {
+    // RETAINED DIAGNOSTIC (invariant): `alert.message` can carry a rendering of
+    // peer-supplied text, so it is bounded before it reaches here and the
+    // peer's original value is deliberately NOT recoverable from it. This map
+    // retains it and `on_alert` forwards it onward, including to paths that
+    // hash and sign it, so an unbounded message assigned upstream would be both
+    // retained and sealed. Neither this store nor any `on_alert` consumer may
+    // parse the message or branch on its text; the structured alert fields are
+    // what a consumer reads.
     this.alerts.set(alert.alert_id, alert);
     this.opts.on_alert(alert);
   }
@@ -977,6 +996,13 @@ export class FailureModeDetector {
       target: alert.target_node,
       detail: {
         alert_id: alert.alert_id,
+        // SENTINEL INPUT (invariant): this is a bounded DISPLAY rendering of a
+        // refusal, not a parseable record. It enters sentinel evaluation here
+        // and can be hashed and signed further downstream, so it must already
+        // be bounded when it arrives, and the refused peer's original value is
+        // deliberately NOT recoverable from it. No sentinel rule may match on
+        // this text or branch on it - the structured fields spread in below are
+        // what a rule reads.
         message: alert.message,
         ...alert.detail,
       },

@@ -2109,6 +2109,18 @@ export class MeshNode {
         ...(evt.emitter_node === governorKey
           ? {}
           : { claimed_emitter_node: evt.emitter_node }),
+        // SIGNED DIAGNOSTIC (invariant, and an obligation on whoever edits the
+        // refusal paths that feed it). This string is sealed into the entry
+        // below, so: (1) it MUST be BOUNDED BEFORE IT IS SEALED - the refusals
+        // reaching here are built by the envelope verifier, which renders every
+        // untrusted fragment through `describeUntrusted`, and a refusal message
+        // added on this path must do the same, or unbounded peer text lands
+        // inside a signed, replicated entry; (2) the peer's original value is
+        // deliberately NOT recoverable from it, because the rendering
+        // truncates - this signature attests what this node SAID about the
+        // refusal, never the bytes it refused; (3) nothing downstream may parse
+        // this field or branch on its text. The machine-readable facts are the
+        // sibling fields above.
         reason: error.message,
       },
       node_private_key: this.nodePrivateKey,
@@ -2228,6 +2240,14 @@ export class MeshNode {
         event_type: "master_rotation",
         peer_node: params.emitter_node,
         rotated_at: params.rotated_at,
+        // SIGNED DIAGNOSTIC (invariant, same obligation as the revoke-denial
+        // entry above). Sealed into the entry below, so: it MUST be bounded
+        // before it is sealed - the master-rotation refusals that reach here
+        // render every untrusted fragment through `describeUntrusted`, and a
+        // message added on this path must do the same; the peer's original
+        // value is deliberately NOT recoverable from it, since the rendering
+        // truncates; and nothing downstream may parse it or branch on its text,
+        // the sibling fields being the machine-readable facts.
         reason: params.error.message,
       },
       node_private_key: this.nodePrivateKey,
@@ -2386,6 +2406,14 @@ export class MeshNode {
         // for forensics only, never trusted as attribution and never used
         // to key the governor above — see the KEYING note on this method.
         claimed_emitter_node: evt.emitter_node,
+        // SIGNED DIAGNOSTIC (invariant, same obligation as the two denial
+        // entries above). Sealed into the entry below, so: it MUST be bounded
+        // before it is sealed - the table-event refusals that reach here render
+        // every untrusted fragment through `describeUntrusted`, and a message
+        // added on this path must do the same; the peer's original value is
+        // deliberately NOT recoverable from it, since the rendering truncates;
+        // and nothing downstream may parse it or branch on its text, the
+        // sibling fields being the machine-readable facts.
         reason: error.message,
       },
       node_private_key: this.nodePrivateKey,
