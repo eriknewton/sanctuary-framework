@@ -1,3 +1,4 @@
+// fail-before-exempt: this PR's only change to this file is a comment correcting where getReservedNamespaceViolation now lives; no assertion changed, so nothing here can fail against pre-fix source.
 /**
  * Reserved-namespace contract: single source of truth (RESERVED-NS-DIVERGE-01).
  *
