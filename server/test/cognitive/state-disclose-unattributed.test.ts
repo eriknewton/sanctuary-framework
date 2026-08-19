@@ -53,6 +53,7 @@ import {
   type ReadResult,
   type StateEntry,
   type UnattributedStateDisclosure,
+  type VerifiedReadFieldSpelling,
 } from "../../src/cognitive/state-store.js";
 import {
   discloseUnattributedState,
@@ -333,15 +334,19 @@ describe("the operator unattributed-disclosure surface", () => {
     // The primary pin for this property is in `src`, not here:
     // `DisclosureWithoutVerifiedReadFields` in `cognitive/state-store.ts` is
     // the type `readUnattributed` constructs through, so the mutation reds
-    // under `tsc --noEmit` over `src`. This copy is the second line of defence
-    // and documents the property at the point a reader looks for it.
+    // under `tsc --noEmit` over `src`. This is the second line of defence and
+    // documents the property at the point a reader looks for it.
+    //
+    // The spelling list is IMPORTED, never re-typed. It was hand-copied when
+    // this test was written and was already wrong on arrival - it omitted
+    // `warnings`, the only optional field on `ReadResult` and so the single
+    // likeliest accidental widening, which means the "mirror" would have
+    // passed the exact mutation the src pin catches. Must match
+    // `VerifiedReadFieldSpelling` in `src/cognitive/state-store.ts`; it does
+    // now because there is only one list.
     type ForbiddenSpelling = Extract<
       keyof UnattributedStateDisclosure,
-      | "value"
-      | "signature_verified"
-      | "integrity_verified"
-      | "written_by"
-      | "merkle_proof"
+      VerifiedReadFieldSpelling
     >;
     type CarriesNoVerifiedReadField = [ForbiddenSpelling] extends [never]
       ? true
@@ -653,7 +658,7 @@ describe("the namespace firewall belongs to the operation, not to one transport"
   // cannot skip one by forgetting it. These assert the checks THERE; the
   // transport-level tests assert that each caller renders the refusal.
 
-  it("refuses a reserved namespace, before it audits and before it reads", async () => {
+  it("refuses a reserved namespace before it reads, and audits the refusal rather than returning silently", async () => {
     const { stateStore, auditLog } = await makeRig();
 
     const outcome = await discloseUnattributedState({
@@ -669,12 +674,29 @@ describe("the namespace firewall belongs to the operation, not to one transport"
       (outcome as { reservedPrefix?: string }).reservedPrefix
     ).toBe("_reputation");
 
-    // No `success` record for a call that was never a disclosure attempt
-    // against a servable namespace.
+    // NOT a `success` record - this call was never a disclosure attempt
+    // against a servable namespace, so counting it as one would inflate the
+    // number an operator reads to answer "how often was unattributed content
+    // disclosed".
+    //
+    // But not SILENCE either, which is what it used to be. Reaching this line
+    // means a human already granted the Tier-1 approval and the target was the
+    // reserved internal set; an operator grepping this operation has to see
+    // that. Its sibling refusal (`namespace_unavailable`) always audited, and
+    // the asymmetry meant the security-interesting half was the invisible one.
     const audit = await auditLog.query({
       operation_type: UNATTRIBUTED_DISCLOSURE_OPERATION,
     });
-    expect(audit.entries).toHaveLength(0);
+    expect(audit.entries).toHaveLength(1);
+    expect(audit.entries[0]!.result).toBe("failure");
+    expect(audit.entries[0]!.identity_id).toBe("system");
+    expect(audit.entries[0]!.details).toMatchObject({
+      namespace: "_reputation",
+      denial_class: "namespace_reserved",
+    });
+    // The KEY is deliberately absent: the namespace alone justifies the
+    // refusal, and a key an operator never got to disclose is not evidence.
+    expect(audit.entries[0]!.details).not.toHaveProperty("key");
   });
 
   it("refuses an uncurated underscore namespace too, on the blanket rule", async () => {

@@ -139,6 +139,14 @@ export type UnattributedDisclosureOutcome =
  * which left a miss byte-identical in the log to a disclosure that happened,
  * and the error ran in the safe direction (over-counting disclosures) but the
  * log could not answer the question an operator reads it to answer.
+ *
+ * It is also true of BOTH halves of the namespace firewall below, which is a
+ * correction: the reserved-namespace refusal used to return silently while its
+ * sibling audited, so an operator greping this operation saw opaque-handle
+ * denials and did NOT see an approved attempt to disclose `_identities`. The
+ * asymmetry made the sentence above false against a shipped test in the same
+ * commit that wrote it. Both now audit; if you add a third refusal, it audits
+ * too, or this paragraph becomes false again.
  */
 export async function discloseUnattributedState(
   request: UnattributedDisclosureRequest,
@@ -158,6 +166,26 @@ export async function discloseUnattributedState(
   // was never a disclosure attempt against a servable namespace.
   const reservedPrefix = getReservedNamespaceViolation(request.namespace);
   if (reservedPrefix !== null) {
+    // Audited, in the same shape as its sibling refusal below. This is the
+    // MORE security-interesting of the two attempts, not the less: reaching
+    // here means a human already granted the Tier-1 approval (the gate runs
+    // before this function, in both transports) and the target was the
+    // reserved internal set - `_identities`, `_principal`, `_file_grants`.
+    // An operator grepping this operation must see that attempt. It used to
+    // write nothing, so it was invisible.
+    //
+    // No write amplification: the human approval upstream bounds the rate, so
+    // an untrusted caller cannot drive this append in a loop.
+    await request.auditLog.appendCritical({
+      layer: "l1",
+      operation: UNATTRIBUTED_DISCLOSURE_OPERATION,
+      identity_id: "system",
+      result: "failure",
+      details: {
+        namespace: request.namespace,
+        denial_class: "namespace_reserved",
+      },
+    });
     return { status: "refused_namespace_reserved", reservedPrefix };
   }
 

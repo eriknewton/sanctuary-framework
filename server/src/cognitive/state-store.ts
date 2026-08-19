@@ -585,12 +585,24 @@ export interface UnattributedStateDisclosure {
 }
 
 /**
- * The field NAMES a verified read owns, which this disclosure must never carry
- * under any spelling. `value` is the one the security argument rests on; the
- * rest are the trust-bearing fields whose presence would let a consumer read a
+ * The SIX EXACT FIELD NAMES a verified read owns, which this disclosure must
+ * never carry. `value` is the one the security argument rests on; the rest are
+ * the trust-bearing fields whose presence would let a consumer read a
  * reassuring answer off an unverified object.
+ *
+ * Six literal names is the whole of it, and saying so is the point: this models
+ * NOTHING about meaning. A new field carrying the same plaintext under a
+ * different name - `claimed_value`, say - is not caught here and cannot be.
+ * That gap is real and is closed by review, not by this type.
+ *
+ * Exported ONLY so `test/cognitive/state-disclose-unattributed.test.ts` pins
+ * the same list instead of hand-copying it. The copy drifted the day it was
+ * written (it omitted `warnings`, the one optional field on `ReadResult` and
+ * therefore the likeliest accidental widening), which is the same
+ * hand-mirrored-registry failure this module's reserved-namespace
+ * consolidation exists to prevent. One source, or the mirror lies.
  */
-type VerifiedReadFieldSpelling =
+export type VerifiedReadFieldSpelling =
   | "value"
   | "signature_verified"
   | "integrity_verified"

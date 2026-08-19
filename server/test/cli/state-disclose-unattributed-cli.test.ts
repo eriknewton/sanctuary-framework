@@ -261,6 +261,97 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     masterKey.fill(0);
   });
 
+  it("escapes terminal controls, so the entry's author cannot forge the security header on the operator's screen", async () => {
+    // REGRESSION, found re-gating this PR. Every string this command prints
+    // except its own notice comes out of an entry whose signature did NOT
+    // verify, so whoever wrote the entry chooses it. Rendered raw to a
+    // terminal those bytes are not text: CR returns to column 0, `ESC [ 2 A`
+    // walks the cursor up onto the real `writer:    not_established` line, and
+    // `ESC [ 2 K` erases it - after which the payload writes whatever it likes
+    // in its place. The operator would then be reading the ATTACKER's security
+    // statement, delivered by the one surface built to warn them.
+    //
+    // The assertion is deliberately the general property (no control byte
+    // reaches stdout) rather than the absence of this one payload, because
+    // there are many payloads and only one property.
+    const ESC = "\u001b";
+    const forgery =
+      `\r${ESC}[2A${ESC}[2Kwriter:    established\n` +
+      `${ESC}[2Kclaimed writer id (VERIFIED): alice`;
+
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      storagePathHint: fortressPath,
+    });
+    // The same unattributable fixture as the happy path, with the payload in
+    // all three attacker-chosen strings at once: the writer-id claim, the
+    // timestamp claim, and the content itself. The content matters as much as
+    // the header fields - it sits BETWEEN the two notices, so an unescaped
+    // cursor sequence there erases the closing banner just as easily.
+    const hostilePlaintext = stringToBytes(forgery);
+    const hostileEntry: StateEntry = {
+      v: 1,
+      payload: encrypt(
+        hostilePlaintext,
+        deriveNamespaceKey(masterKey, NAMESPACE)
+      ),
+      ver: 1,
+      sig: toBase64url(new Uint8Array(64)),
+      kid: forgery,
+      integrity_hash: hashToString(hostilePlaintext),
+      metadata: { written_at: forgery },
+    };
+    await storage.write(
+      NAMESPACE,
+      KEY,
+      stringToBytes(JSON.stringify(hostileEntry))
+    );
+    masterKey.fill(0);
+
+    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+    const out = new StringWritable();
+    const err = new StringWritable();
+
+    const code = await runStateDiscloseUnattributedCommand({
+      argv: [
+        "--fortress",
+        fortressPath,
+        "--namespace",
+        NAMESPACE,
+        "--key",
+        KEY,
+      ],
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      approvalChannel: new FixedChannel("approve"),
+    });
+
+    expect(code).toBe(0);
+
+    // THE PROPERTY: no C0 control, DEL, or C1 byte reaches the terminal. `\n`
+    // and `\t` are excluded from the class because they are ordinary text in
+    // the content block and this command emits them itself.
+    expect(out.text).not.toMatch(
+      /[\u0000-\u0008\u000b-\u001f\u007f\u0080-\u009f]/
+    );
+
+    // The real security statement survives, because nothing could move the
+    // cursor onto its line.
+    expect(out.text).toContain("writer:    not_established");
+    // And the forged one never appears as a line of its own.
+    expect(out.text).not.toMatch(/^writer: {4}established$/m);
+
+    // The strange bytes are SHOWN, escaped, not silently dropped: an operator
+    // has to be able to see that a field carried something it should not.
+    // Deleting them would trade one presentation lie for a quieter one.
+    expect(out.text).toContain("\\x1b[2A");
+    // Both notices still present, so the content could not erase the closing
+    // one either.
+    expect(out.text.split(UNATTRIBUTED_DISCLOSURE_NOTICE).length - 1).toBe(2);
+  });
+
   it("refuses a reserved namespace, the refusal the MCP tool also makes", async () => {
     // The same fixture as the happy path, planted in a reserved namespace and
     // driven through the same verb, so the only variable is the namespace.

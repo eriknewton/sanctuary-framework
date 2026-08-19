@@ -53,6 +53,56 @@ import type {
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { flagValue } from "./argv.js";
 
+/**
+ * Every string this command prints except its own notice is chosen by whoever
+ * wrote the entry, and that entry's signature did NOT verify - which is the
+ * entire premise of the command. Written raw to a terminal those bytes are not
+ * text: a carriage return followed by `ESC [ 2 A` and `ESC [ 2 K` walks the
+ * cursor back over the header and erases it, so the entry's author can replace
+ * `writer:    not_established` on the operator's screen with
+ * `writer:    established`. The one security statement this surface exists to
+ * make would then be made BY the attacker, to the human it is meant to warn.
+ *
+ * So no untrusted string reaches `out` except through here.
+ *
+ * Controls become VISIBLE `\xNN` escapes rather than being dropped. An operator
+ * must be able to see that a field carried something strange; silently deleting
+ * it trades one presentation lie for a quieter one.
+ *
+ * `allowLineBreaks` is for the content block alone, where `\n` and `\t` are
+ * ordinary text the operator asked to read. ESC and CR stay escaped even there:
+ * neither is needed to display text, and both are what drive a cursor.
+ *
+ * C1 (0x80-0x9f) is escaped too. 0x9b is CSI, and a terminal that is not in
+ * UTF-8 mode will act on it exactly as it acts on `ESC [`.
+ *
+ * The `--json` path needs none of this and must NOT be routed through here:
+ * `JSON.stringify` already escapes every C0 control, so passing it through
+ * would double-escape. Verified against the MCP transport, which renders the
+ * same way.
+ */
+function renderUntrusted(
+  raw: string,
+  options?: { readonly allowLineBreaks?: boolean },
+): string {
+  const keepBreaks = options?.allowLineBreaks === true;
+  let rendered = "";
+  for (const ch of raw) {
+    if (keepBreaks && (ch === "\n" || ch === "\t")) {
+      rendered += ch;
+      continue;
+    }
+    const code = ch.codePointAt(0) ?? 0;
+    // 0x20 = space, the lowest printable; 0x7f = DEL; 0x80-0x9f = C1.
+    if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
+      rendered += `\\x${code.toString(16).padStart(2, "0")}`;
+      continue;
+    }
+    rendered += ch;
+  }
+  return rendered;
+}
+
 export interface StateDiscloseCommandArgs {
   argv: string[];
   out?: Writable;
@@ -276,13 +326,23 @@ export async function runStateDiscloseUnattributedCommand(
       // the ordinary case, and a warning that only the first line carries is a
       // warning most readers of a long entry never see.
       write(out, `\n${UNATTRIBUTED_DISCLOSURE_NOTICE}\n\n`);
-      write(out, `namespace: ${disclosure.namespace}\n`);
-      write(out, `key:       ${disclosure.key}\n`);
+      // `namespace` and `key` are caller-chosen; the three `claimed_*`-class
+      // fields and the content are chosen by whoever wrote the unverified
+      // entry. All of them go through renderUntrusted; see its header for why
+      // a raw write here lets the entry's author forge the `writer:` line.
+      write(out, `namespace: ${renderUntrusted(disclosure.namespace)}\n`);
+      write(out, `key:       ${renderUntrusted(disclosure.key)}\n`);
+      // `version` is a number and `writer` is a single-inhabitant literal we
+      // choose, so neither is attacker-controlled.
       write(out, `version:   ${disclosure.version}\n`);
       write(out, `writer:    ${disclosure.writer}\n`);
       write(
         out,
-        `claimed_written_at: ${disclosure.claimed_written_at ?? "(none recorded)"}\n`,
+        `claimed_written_at: ${
+          disclosure.claimed_written_at === undefined
+            ? "(none recorded)"
+            : renderUntrusted(disclosure.claimed_written_at)
+        }\n`,
       );
       // The identity to restore, printed so the remedy this command advertises
       // on every path names something the operator can act on. Labelled
@@ -292,10 +352,21 @@ export async function runStateDiscloseUnattributedCommand(
       write(
         out,
         "claimed writer id (UNVERIFIED, from the entry itself): " +
-          `${disclosure.claimed_writer_id ?? "(none recorded)"}\n`,
+          `${
+            disclosure.claimed_writer_id === undefined
+              ? "(none recorded)"
+              : renderUntrusted(disclosure.claimed_writer_id)
+          }\n`,
       );
       write(out, "\n--- unattributed content ---\n");
-      write(out, `${disclosure.unattributed_content}\n`);
+      // Line breaks and tabs survive because this is the text the operator
+      // asked to read; ESC, CR and the rest do not, because the content sits
+      // BETWEEN the two notices and an unescaped cursor sequence here erases
+      // the closing one as easily as it erases the header.
+      write(
+        out,
+        `${renderUntrusted(disclosure.unattributed_content, { allowLineBreaks: true })}\n`,
+      );
       write(out, "--- end unattributed content ---\n\n");
       write(out, `${UNATTRIBUTED_DISCLOSURE_NOTICE}\n`);
     }
