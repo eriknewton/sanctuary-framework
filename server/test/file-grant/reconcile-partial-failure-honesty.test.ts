@@ -28,7 +28,13 @@ import { describe, expect, it } from "vitest";
 import { mintFileGrant } from "../../src/file-grant/mint.js";
 import { reconcileFileGrantTree } from "../../src/file-grant/reconcile.js";
 import { FileGrantUnreadableEntriesError } from "../../src/file-grant/types.js";
-import { FakeFsOps, failReadFor, makeFileGrantTestStore, readsBackAs } from "./fixtures.js";
+import {
+  DEFAULT_FAKE_SOURCE_IDENTITY,
+  FakeFsOps,
+  failReadFor,
+  makeFileGrantTestStore,
+  readsBackAs,
+} from "./fixtures.js";
 
 const MINTED_AT = new Date("2026-07-07T00:00:00.000Z");
 const PAST_TTL = new Date("2026-07-07T02:00:00.000Z");
@@ -272,11 +278,73 @@ describe("file-grant reconcile: the report names every loss in the pass, and cla
           "expired_ttl_status_write_failed" &&
         (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id,
     );
-    expect(writeFailureRows.length).toBeGreaterThanOrEqual(1);
+    // EXACTLY ONE, not "at least one". The weaker assertion is what let a
+    // duplicate ship: an earlier round emitted this failure from its own helper
+    // AND from the expiry append, so one rejected write produced two records
+    // with the same reason - one fault reported as two events, and 2F appends
+    // for F failures against a bounded retention budget. A `>=` assertion
+    // cannot see that. Any row-count assertion on an audit trail should be
+    // exact for the same reason.
+    expect(writeFailureRows).toHaveLength(1);
     expect(writeFailureRows[0]!.result).toBe("failure");
     expect((writeFailureRows[0]!.details as { error?: string }).error).toContain(
       writeFailed.message,
     );
+    // And the whole grant emits one row this pass, not one per helper that had
+    // an opinion about it.
+    const allRowsForGrant = revokes.entries.filter(
+      (entry) => (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id,
+    );
+    expect(allRowsForGrant).toHaveLength(1);
+  });
+
+  it("still records a rejected write on the clear-the-ACE path, where no expiry row is due", async () => {
+    // The branch the consolidation created, tested because an untested branch
+    // is how the duplicate got in. A REVOKED grant that still carries a
+    // `granted_read_ace` gets its record rewritten to drop the stale ACE, and
+    // `shouldExpire` is false for it, so the expiry row that carries the write
+    // error on the other path never runs here. Folding both paths into that one
+    // row would make this failure invisible again, on exactly the path the row
+    // does not cover.
+    const { grantStore, auditLog, fsOps, expiring } = await twoGrants();
+
+    // Revoked (so it scrubs but never expires) and still holding an ACE whose
+    // inode identity matches, so the removal SUCCEEDS and the grant lands in
+    // the confirmed-scrubbed set. An ACE without that identity fails cleanup
+    // and never reaches the branch at all.
+    const live = await grantStore.get(expiring.grant_id);
+    await grantStore.put({
+      ...live!,
+      status: "revoked",
+      granted_read_ace: {
+        agent_uid: 502,
+        platform: "darwin",
+        source_realpath: "/tmp/expiring.txt",
+        source_dev: DEFAULT_FAKE_SOURCE_IDENTITY.source_dev,
+        source_ino: DEFAULT_FAKE_SOURCE_IDENTITY.source_ino,
+      },
+    });
+
+    const writeFailed = new Error("state write failed (disk full)");
+    const realPut = grantStore.put.bind(grantStore);
+    let armed = false;
+    grantStore.put = async (g) => {
+      if (armed) throw writeFailed;
+      return realPut(g);
+    };
+    armed = true;
+
+    await reconcileError({ store: grantStore, fsOps, now: PAST_TTL, auditLog });
+
+    const revokes = await auditLog.query({ operation_type: "file_grant_revoke", limit: 200 });
+    const rows = revokes.entries.filter(
+      (entry) =>
+        (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id &&
+        (entry.details as { reason?: string } | undefined)?.reason ===
+          "expired_ttl_status_write_failed",
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.result).toBe("failure");
   });
 
   it("makes no reconcile claim on the strict display listing, which never reconciles", async () => {

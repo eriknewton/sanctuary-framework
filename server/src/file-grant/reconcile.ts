@@ -193,6 +193,7 @@ export async function reconcileFileGrantTree(
     const shouldClearAce =
       confirmedScrubbedGrantIds.has(grant.grant_id) && grant.granted_read_ace != null;
     let flipped = true;
+    let writeError: unknown | undefined;
     if (shouldExpire || shouldClearAce) {
       let revised = shouldExpire ? reviseGrantForExpiry(grant, deps.now) : grant;
       if (shouldClearAce) {
@@ -214,16 +215,22 @@ export async function reconcileFileGrantTree(
         // AUDITED UNCONDITIONALLY, BEFORE the deferred-slot race below.
         // `readableGrantFailure` holds ONE failure and is first-wins, so when a
         // scrub already failed earlier in this pass, this write error loses the
-        // race and is never thrown. Without a row of its own it would then be
+        // race and is never thrown. Without a durable row it would then be
         // absent from EVERY channel - not thrown, not returned, not logged -
         // while the earlier scrub failure is the only thing the caller sees.
-        // The scrub path has had `appendScrubFailureAudit` since it gained its
-        // own catch; this is the missing counterpart, and its absence is what
-        // made the deferred slot lossy rather than merely first-wins.
-        await appendStatusWriteFailureAudit(deps, grant, err);
+        // The row is emitted below, exactly once; see the ordering note there.
+        writeError = err;
         if (readableGrantFailure === null) readableGrantFailure = err;
       }
     }
+    // EXACTLY ONE ROW PER GRANT PER PASS, and the branching exists only to keep
+    // it that way. An earlier round emitted the write failure from its own
+    // helper AND from the expiry append, so one rejected `put` produced two
+    // records carrying the same reason: a single fault reported as two events,
+    // 2F appends for F failures, and the retention budget consumed twice as
+    // fast. `appendExpiryAudit` already runs on the expiring path and already
+    // carries the durability, so it takes the error too; the separate helper is
+    // reached ONLY on the path where that append does not run at all.
     if (shouldExpire) {
       // Only a flip that actually landed is reported as one; `expired` names
       // the records whose PERSISTED status changed.
@@ -232,8 +239,15 @@ export async function reconcileFileGrantTree(
         deps,
         grant,
         aclFailureByGrantId.get(grant.grant_id),
-        flipped
+        flipped,
+        writeError
       );
+    } else if (writeError !== undefined) {
+      // The clear-the-ACE-only path: the record was rewritten to drop a stale
+      // `granted_read_ace` without expiring, so no expiry row is due. The write
+      // still rejected, and without this the failure would be invisible again
+      // on exactly the path the expiry row does not cover.
+      await appendStatusWriteFailureAudit(deps, grant, writeError);
     }
   }
 
@@ -394,7 +408,8 @@ async function appendExpiryAudit(
   deps: ReconcileFileGrantDeps,
   grant: FileGrant,
   aclFailure?: FileGrantAclRemovalResult,
-  statusFlipped: boolean = true
+  statusFlipped: boolean = true,
+  writeError?: unknown
 ): Promise<void> {
   try {
     // Auto-expiry reuses the `file_grant_revoke` audit operation (not a new
@@ -419,6 +434,16 @@ async function appendExpiryAudit(
         // Stated on every row rather than only the failing one, so an operator
         // reading the trail never has to infer durability from a reason string.
         status_flipped: statusFlipped,
+        // Carried HERE rather than emitted as a second row: one fault is one
+        // event. See the ordering note at the call site.
+        ...(writeError !== undefined
+          ? {
+              error:
+                writeError instanceof Error
+                  ? writeError.message
+                  : String(writeError),
+            }
+          : {}),
       },
     });
   } catch {
