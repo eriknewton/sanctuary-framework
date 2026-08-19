@@ -29,8 +29,11 @@
 #          commit 4ac95830 failure class.
 #
 #       b. Silent test file drop.
-#          Count .test.ts files under server/test/ and compare to
-#          vitest's reported "Test Files N passed (TOTAL)" count.
+#          Count .test.ts files matched by vitest.config.ts's
+#          test.include globs (both server/test/ and
+#          ../scripts/synthetic-coverage/test/, via
+#          server/scripts/count-vitest-test-files.mjs) and compare
+#          to vitest's reported "Test Files N passed (TOTAL)" count.
 #          If files on disk > files vitest attempted, some file
 #          failed to load before vitest registered it — the same
 #          failure shape as 4ac95830, hiding 98 tests for 26 hours.
@@ -299,12 +302,21 @@ if [[ -f .test-baseline ]]; then
   fi
 fi
 
-# Count test files on disk (expected).
-expected_files=$(find server/test -name "*.test.ts" -not -path "*/node_modules/*" 2>/dev/null | wc -l | tr -d '[:space:]')
+# Count the files vitest's OWN test.include globs match on disk (expected).
+# MUST MATCH: test.include in server/vitest.config.ts (cross-file pin). This
+# reads server/scripts/count-vitest-test-files.mjs's shared derivation
+# instead of a hand-restated `find server/test`, because that restated form
+# only scanned one of vitest.config.ts's two include roots (the other is
+# ../scripts/synthetic-coverage/test) and silently gave up to 14 files of
+# slack a real drop could hide inside before this was fixed (2026-08-19; see
+# that script's header and .github/workflows/test-baseline-guard.yml Gate 2b,
+# which uses the same script so this hook and CI cannot drift apart again).
+expected_files=$(node server/scripts/count-vitest-test-files.mjs 2>/dev/null | tr -d '[:space:]')
 if [[ -z "$expected_files" || "$expected_files" == "0" ]]; then
-  fail "No test files found under server/test/ — something is wrong"
+  fail "No test files found matching vitest's test.include globs — something is wrong"
   exit 1
 fi
+validate_counter "expected test file count" "$expected_files"
 
 # Run the test suite and capture BOTH output and exit code. Using
 # `set +e` around the assignment means the subshell's non-zero exit
@@ -397,8 +409,8 @@ validate_counter "Test Files count" "$actual_total"
 
 if (( actual_total < expected_files )); then
   fail "SILENT TEST FILE DROP DETECTED — commit blocked"
-  printf '[baseline-guard]   Files on disk under server/test/: %s\n' "$expected_files" >&2
-  printf '[baseline-guard]   Files vitest reported:            %s\n' "$actual_total" >&2
+  printf '[baseline-guard]   Files matching test.include globs: %s\n' "$expected_files" >&2
+  printf '[baseline-guard]   Files vitest reported:              %s\n' "$actual_total" >&2
   printf '[baseline-guard]   Missing: %s test file(s).\n' "$((expected_files - actual_total))" >&2
   printf '\n' >&2
   fail "This is the specific failure class from commit 4ac95830."

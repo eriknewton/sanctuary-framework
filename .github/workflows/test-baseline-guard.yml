@@ -161,24 +161,13 @@ jobs:
           echo "✓ No transform/collection errors detected."
 
       - name: Gate 2b — silent test file drop detection
-        run: |
-          expected_files=$(find server/test -name "*.test.ts" -not -path "*/node_modules/*" | wc -l | tr -d '[:space:]')
-          actual_total=$(grep -oE "Test Files[[:space:]]+.*\([0-9]+\)" /tmp/vitest-output.log | grep -oE "\([0-9]+\)" | tr -d '()' | tail -1)
-          if [[ -z "$actual_total" ]]; then
-            actual_total=$(grep -oE "Test Files[[:space:]]+[0-9]+ passed" /tmp/vitest-output.log | grep -oE "[0-9]+" | head -1)
-          fi
-          if [[ -z "$actual_total" ]]; then
-            echo "::error::Could not parse 'Test Files' count from vitest output."
-            tail -30 /tmp/vitest-output.log
-            exit 1
-          fi
-          echo "Files on disk:       $expected_files"
-          echo "Files vitest loaded: $actual_total"
-          if (( actual_total < expected_files )); then
-            echo "::error::Silent test file drop detected: $expected_files files on disk, $actual_total loaded by vitest. Missing $((expected_files - actual_total)) file(s). This is the exact failure class from commit 4ac95830 (see docs/audit/commit-4ac95830-postmortem.md)."
-            exit 1
-          fi
-          echo "✓ All $expected_files test files loaded by vitest."
+        # Logic lives in scripts/gate2b-check.sh (with a self-test at
+        # scripts/gate2b-self-test.sh) rather than inline here, so it can be
+        # driven against a planted-divergence fixture outside Actions. See
+        # that script for the invariant this enforces and why expected_files
+        # is derived from server/vitest.config.ts's test.include globs
+        # instead of a hand-restated shell `find`.
+        run: scripts/gate2b-check.sh /tmp/vitest-output.log
 
       - name: Gate 2c — passing count >= baseline
         run: |

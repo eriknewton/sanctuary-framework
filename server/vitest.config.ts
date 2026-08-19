@@ -18,6 +18,15 @@ export default defineConfig({
     // probe itself either delete the var locally and point the probe at a
     // loopback server, or inject a stub via RunWrapDeps.
     env: { SANCTUARY_NO_UPDATE_CHECK: "1" },
+    // MUST MATCH: read directly (not copied) by scripts/count-vitest-test-files.mjs,
+    // which feeds CI's silent-test-file-drop detector (Gate 2b in
+    // .github/workflows/test-baseline-guard.yml and .githooks/pre-commit). Both
+    // consumers derive their expected-file count from THIS array via vite's own
+    // config loader, so adding or removing an include root here needs no matching
+    // edit anywhere else — the old shape (a hand-restated `find server/test` in
+    // both places) silently missed the second root below and let up to 14 dropped
+    // files pass undetected. If this array ever again needs a manual mirror
+    // somewhere, that itself is a sign the derivation broke.
     include: ["test/**/*.test.ts", "../scripts/synthetic-coverage/test/**/*.test.ts"],
     coverage: {
       provider: "v8",
