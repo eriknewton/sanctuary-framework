@@ -13,23 +13,15 @@ inputs:
 runs:
   using: composite
   steps:
-    # timeout-minutes=22: a job-level (whole-job) timeout is too coarse for
-    # this — a hung install would then consume the entire remaining job
-    # budget before failing, exactly the "eats hours" problem this action
-    # exists to fix. This step-level timeout is the outer backstop, sized
-    # a couple of minutes above install.sh's own worst case of ~18.6
-    # minutes (two retried phases, each up to 3 attempts * 180s + backoff)
-    # so the inner, attributable `timeout`/retry failure is what normally
-    # fires, and this backstop only trips if something outside that
-    # accounting (process overhead, a wedged sudo prompt, etc.) also goes
-    # wrong.
-    #
-    # Failure mode: if THIS step-level timeout is what fires (the log ends
-    # abruptly with a generic "The action has timed out" instead of one of
-    # install.sh's own attempt/failure lines), something outside the
-    # retry accounting hung — that is itself a signal worth a look, not
-    # just a rerun.
+    # NOTE: a composite action's steps CANNOT carry `timeout-minutes`; GitHub
+    # rejects the whole action file with "Unexpected value 'timeout-minutes'",
+    # so the action does not merely lose its backstop, it fails to LOAD.
+    # (Proven on PR #1282's first run: three jobs died in 7-9 seconds with a
+    # TemplateValidationException.) The outer bound therefore lives in
+    # install.sh's own accounting (3 attempts x 180s + 2 x 10s backoff, about
+    # 9.3 minutes per call, two calls here), and any CALLER that wants a
+    # belt-and-braces backstop sets `timeout-minutes` on its own `uses:` step,
+    # which IS supported in a workflow job.
     - name: apt-get update && install (bounded, retried)
       shell: bash
-      timeout-minutes: 22
       run: ${{ github.action_path }}/install.sh ${{ inputs.packages }}

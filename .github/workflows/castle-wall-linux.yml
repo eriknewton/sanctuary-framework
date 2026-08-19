@@ -32,6 +32,10 @@ jobs:
       # the timeout/retry derivation.
       - name: Install system dependencies
         uses: ./.github/actions/apt-install-resilient
+        # Backstop ABOVE install.sh's own ~18.6 min worst case (two retried
+        # phases). Lives here because a composite action's steps cannot carry
+        # timeout-minutes; a workflow job's `uses:` step can.
+        timeout-minutes: 22
         with:
           packages: nftables libnetfilter-queue-dev libnfnetlink-dev
 
@@ -152,6 +156,10 @@ jobs:
       # the timeout/retry derivation.
       - name: Install cross/static toolchain packages
         uses: ./.github/actions/apt-install-resilient
+        # Backstop ABOVE install.sh's own ~18.6 min worst case (two retried
+        # phases). Lives here because a composite action's steps cannot carry
+        # timeout-minutes; a workflow job's `uses:` step can.
+        timeout-minutes: 22
         with:
           packages: musl-tools gcc-aarch64-linux-gnu file
 
