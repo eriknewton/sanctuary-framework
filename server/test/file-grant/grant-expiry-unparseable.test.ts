@@ -20,6 +20,9 @@
 import { describe, expect, it } from "vitest";
 
 import { isGrantExpired, projectGrantStatus } from "../../src/file-grant/lifecycle.js";
+import { mintFileGrant } from "../../src/file-grant/mint.js";
+import { reconcileFileGrantTree } from "../../src/file-grant/reconcile.js";
+import { FakeFsOps, makeFileGrantTestStore } from "./fixtures.js";
 import {
   FILE_GRANT_SCHEMA_VERSION,
   type FileGrant,
@@ -93,5 +96,66 @@ describe("an expiry that cannot be parsed", () => {
     const revoked = { ...grantWithExpiry("banana"), status: "revoked" as const };
     expect(isGrantExpired(revoked, NOW)).toBe(false);
     expect(projectGrantStatus(revoked, NOW)).toBe("revoked");
+  });
+});
+
+/**
+ * The unit tests above pin the predicate. They would all still pass if the
+ * reconcile pass scrubbed access but left the record persisted as active, which
+ * is a half-converged state, so the behaviour is proven end to end here from a
+ * record that has been through JSON exactly as a stored one has.
+ */
+describe("reconcile over a record whose expiry cannot be parsed", () => {
+  it("removes the entry AND persists the status, from a JSON round-tripped record", async () => {
+    const store = await makeFileGrantTestStore();
+    const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
+    const { grant } = await mintFileGrant(
+      {
+        subjectAgentId: "agent-1",
+        scope: { kind: "file", path: "/tmp/x.txt" },
+        mode: "read",
+        ttlSeconds: 3600,
+        createdBy: "operator-1",
+      },
+      {
+        fsOps,
+        store: store.grantStore,
+        now: new Date("2026-08-01T00:00:00.000Z"),
+        auditLog: store.auditLog,
+      }
+    );
+    expect(fsOps.placed).toHaveLength(1);
+
+    // Round-tripped through JSON, which is the only way a stored record is ever
+    // read back, so the value under test is the value a real fortress holds.
+    const live = await store.grantStore.get(grant.grant_id);
+    const corrupted = JSON.parse(
+      JSON.stringify({ ...live!, expires_at: "not-a-date" })
+    );
+    await store.grantStore.put(corrupted);
+
+    const result = await reconcileFileGrantTree({
+      store: store.grantStore,
+      fsOps,
+      now: NOW,
+      auditLog: store.auditLog,
+    });
+
+    // Access is gone.
+    expect(fsOps.scrubbed).toContain(grant.tree_entry);
+    // AND the record agrees, which is the half the predicate tests cannot see.
+    const after = await store.grantStore.get(grant.grant_id);
+    expect(after!.status).toBe("expired");
+    expect(result.expired).toContain(grant.grant_id);
+    // The pass leaves a durable trace rather than reducing access silently.
+    const audit = await store.auditLog.query({
+      operation_type: "file_grant_revoke",
+      limit: 50,
+    });
+    expect(
+      audit.entries.filter(
+        (e) => (e.details as { grant_id?: string } | undefined)?.grant_id === grant.grant_id
+      ).length
+    ).toBeGreaterThan(0);
   });
 });
