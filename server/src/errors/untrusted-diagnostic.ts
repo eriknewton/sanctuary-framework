@@ -48,10 +48,10 @@
  *   Proxy's own traps, which can do arbitrary work before this function regains
  *   control; the budget stops the iteration, it cannot bound one trap.
  *
- *   It is deliberately NOT a redactor. It does not decide what is safe to
- *   disclose; that judgment belongs to the caller and, for the evidence pack,
- *   to `evidence-pack/read-outcome.ts`'s `sanitizeReason`, which is a
- *   DIFFERENT concern (scrubbing operator paths out of a signed document).
+ * NOT A REDACTOR. This does not decide what is safe to disclose; that judgment
+ * belongs to the caller and, for the evidence pack, to
+ * `evidence-pack/read-outcome.ts`'s `sanitizeReason`, which is a DIFFERENT
+ * concern (scrubbing operator paths out of a signed document).
  *
  * This file is a pure declaration: no imports, no top-level side effects, no
  * I/O. Keep it that way so any module, including the crypto core, can depend
