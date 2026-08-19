@@ -82,11 +82,37 @@ export function computeExpiresAt(
  * Whether a grant's expiry has passed at `now`. A `null` `expires_at`
  * (standing grant) never expires. A grant already marked `revoked` is not
  * additionally "expired" -- revoked is a distinct terminal state.
+ *
+ * AN UNPARSEABLE `expires_at` COUNTS AS EXPIRED, and that direction is the
+ * whole point. `expires_at` is typed `string | null`, but the record is read
+ * back from stored JSON, so the field holds whatever was written there. A
+ * value that is not a date yields `NaN` from `Date.getTime()`, and every
+ * comparison against `NaN` is false -- so the obvious spelling,
+ * `new Date(...).getTime() <= now.getTime()`, answers "not expired" for a
+ * grant whose expiry cannot be read at all.
+ *
+ * That answer is silent and it fails OPEN. The reconcile pass scrubs on this
+ * verdict, so a grant with a garbled expiry keeps its tree entry, and on a
+ * uid-split box the agent keeps filesystem read access, indefinitely. The pass
+ * reports `{expired: [], scrubbed: []}` and exits zero, because from its point
+ * of view nothing was due. Nothing is logged, because nothing failed.
+ *
+ * Treating it as expired inverts that: the entry is scrubbed and the record is
+ * flipped, which is an access REDUCTION and the safe direction for a value
+ * nobody can interpret. A standing grant is spelled `null` and is unaffected;
+ * only a present-but-unreadable value takes this path.
+ *
+ * Deliberately NOT solved by refusing the record at the store's decode. A
+ * record that fails to decode is treated as unreadable, and an unreadable
+ * record's tree entry is left untouched by design -- which is the fail-open
+ * outcome again, reached by a different route.
  */
 export function isGrantExpired(grant: FileGrant, now: Date): boolean {
   if (grant.status === "revoked") return false;
   if (grant.expires_at === null) return false;
-  return new Date(grant.expires_at).getTime() <= now.getTime();
+  const expiresAt = new Date(grant.expires_at).getTime();
+  if (Number.isNaN(expiresAt)) return true;
+  return expiresAt <= now.getTime();
 }
 
 /**
