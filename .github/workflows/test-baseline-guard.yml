@@ -273,10 +273,30 @@ jobs:
 
   # ── The recorder ─────────────────────────────────────────────────────────
   #
+  # It does NOT push to main. It proposes the recorded floor as an ordinary
+  # pull request from a fixed branch and lets auto-merge land it once the
+  # required checks pass. That is what keeps this mechanism free of any new
+  # authority: the branch ruleset requires a pull request and zero approving
+  # reviews, and the repository allows auto-merge, so a machine-authored change
+  # can satisfy the rules exactly as a person's does. No bypass actor, no
+  # deploy key, no app token, and the pull-request requirement plus every
+  # required check stay intact for this change too.
+  #
   # Everything this job executes has already been reviewed, gated and merged.
-  # There is no fork case, no push to a contributor's branch, no head-SHA race
-  # with a force-push, and no decision an outsider can influence: it records
-  # what the suite counted, on the one branch the ruleset already governs.
+  # There is no fork case, no push to a contributor's branch, and no decision an
+  # outsider can influence: it records what the suite counted.
+  #
+  # KNOWN CONSTRAINT, and the one thing to confirm before relying on this: a
+  # pull request opened with the default GITHUB_TOKEN does not itself start new
+  # workflow runs, which is GitHub's recursion guard. If the required checks
+  # therefore never report on the recorded-floor pull request, auto-merge cannot
+  # fire and the pull request waits. That failure is bounded and loud rather than
+  # silent: the fixed branch means at most ONE such pull request exists at a
+  # time and it always carries the newest count, and the scheduled check in
+  # .github/workflows/test-baseline-floor-drift.yml reports a recorded-floor
+  # pull request that stays open past its window. Clearing it needs either a
+  # token whose events start workflow runs, or one human action on the waiting
+  # pull request.
   record-floor:
     name: record-floor
     needs: test-baseline-guard
@@ -285,12 +305,17 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
+    # Narrow on purpose: enough to push ONE branch that is not main and to open
+    # one pull request. Nothing here can write main; the ruleset still decides
+    # that, which is the entire point of proposing rather than pushing.
     permissions:
       contents: write
+      pull-requests: write
 
     # Two merges in quick succession must not race. cancel-in-progress is false
-    # so a queued recorder waits for the running one rather than replacing its
-    # push; the queue is first-in-first-out, so the later tree is recorded last.
+    # so a queued recorder waits for the running one rather than racing it; the
+    # queue is first-in-first-out, so the later tree is recorded last and its
+    # count is the one that survives on the shared branch.
     #
     # Failure mode note: GitHub cancels a PENDING job in a group when a newer
     # one queues behind a running one. That is benign here and shows as
@@ -312,7 +337,7 @@ jobs:
 
       # The count came from the guard job, which measured GITHUB_SHA. If main
       # has moved since, that count no longer describes the tip, and recording
-      # it would write a number for a tree that no longer exists. The newer
+      # it would propose a number for a tree that no longer exists. The newer
       # push has its own recorder; let that one do it.
       - name: Skip when a newer commit already landed on main
         id: tip
@@ -325,10 +350,17 @@ jobs:
             echo "proceed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # LOOP BOUND TWO OF TWO (semantic, and the self-tested one). A refusal
-      # here is a clean skip, never a failure: a recorder that reddened main
-      # every time it correctly declined to record would train everyone to
-      # ignore a red main, which is the opposite of the alarm this design needs.
+      # LOOP BOUND TWO OF THREE (semantic, and the self-tested one). It matters
+      # MORE under the pull-request route, not less: the recorded floor now
+      # reaches main by merging, and that merge is itself a push to main that
+      # runs this workflow again. The subject it must recognize is the SQUASHED
+      # one, which carries a trailing ` (#N)`; the matcher in the floor script
+      # accounts for that and the self-test pins the squashed shape.
+      #
+      # A refusal here is a clean skip, never a failure: a recorder that
+      # reddened main every time it correctly declined to record would train
+      # everyone to ignore a red main, which is the opposite of the alarm this
+      # design needs.
       - name: Refuse to record on our own commit
         id: context
         if: steps.tip.outputs.proceed == 'true'
@@ -349,6 +381,11 @@ jobs:
             exit "$status"
           fi
 
+      # LOOP BOUND THREE OF THREE, and the one that holds even if both others
+      # were removed: if the floor already equals the observed count there is
+      # nothing to propose, so the recorded-floor merge that lands N against a
+      # floor of N produces no second pull request by arithmetic rather than by
+      # recognition.
       - name: Record the observed count
         id: record
         if: steps.context.outputs.proceed == 'true'
@@ -360,7 +397,7 @@ jobs:
           status=$?
           set -e
           # 10 is the floor script's "no action needed": the file already holds
-          # this count, so there is nothing to commit and nothing to push.
+          # this count, so there is nothing to propose.
           if [[ "$status" -eq 10 ]]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           elif [[ "$status" -eq 0 ]]; then
@@ -369,24 +406,65 @@ jobs:
             exit "$status"
           fi
 
-      - name: Commit and push the recorded floor
+      - name: Propose the recorded floor as a pull request
         if: steps.record.outputs.changed == 'true'
         env:
           OBSERVED: ${{ needs.test-baseline-guard.outputs.passing }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          branch="$(scripts/test-baseline-floor.sh record-branch)"
+          subject="$(scripts/test-baseline-floor.sh commit-subject "$OBSERVED")"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
           git add .test-baseline
-          # INVARIANT: one file, checked rather than assumed. The whole safety
-          # argument for granting this job a write token is that it can commit
-          # nothing else, so the claim is asserted here instead of being left to
-          # the reader of the `git add` line above.
+          # INVARIANT: one file, checked rather than assumed. The safety argument
+          # for this job is that it can propose nothing else, so the claim is
+          # asserted here instead of being left to the reader of `git add`.
           staged="$(git diff --cached --name-only)"
           if [[ "$staged" != ".test-baseline" ]]; then
             echo "::error::the recorder staged something other than .test-baseline: $staged"
             exit 1
           fi
-          subject="$(scripts/test-baseline-floor.sh commit-subject "$OBSERVED")"
           git commit -m "$subject"
-          git push origin HEAD:main
-          echo "::notice::$subject"
+
+          # Force is correct and is the convergence mechanism, not a shortcut.
+          # The branch name is fixed, so a second merge landing while an earlier
+          # recorded-floor pull request is still open must REPLACE its content
+          # with the later count rather than open a competing pull request.
+          # Failure mode note: this shows up in the pull request as a normal
+          # force-push, and its checks restart. That is the intended behaviour;
+          # the older count was already wrong.
+          git push --force origin "$branch"
+
+          existing="$(gh pr list --state open --head "$branch" --json number --jq '.[0].number // empty')"
+          if [[ -z "$existing" ]]; then
+            gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "$subject" \
+              --body "Recorded automatically after a merge to main: the observed passing count on Linux CI is ${OBSERVED}. No human needs to compute or type this number. This pull request carries one line and goes through the same required checks as any other change."
+            existing="$(gh pr list --state open --head "$branch" --json number --jq '.[0].number // empty')"
+          else
+            # Idempotent by design: the branch was force-updated above, so the
+            # open pull request now carries the later count. Only its title still
+            # names the older one, and the title becomes the squashed commit
+            # subject, so it has to follow.
+            echo "::notice::updating the open recorded-floor pull request #$existing to $OBSERVED"
+            gh pr edit "$existing" --title "$subject"
+          fi
+
+          if [[ -z "$existing" ]]; then
+            echo "::error::could not determine the recorded-floor pull request number"
+            exit 1
+          fi
+
+          # Auto-merge is what makes this route need no elevated authority: the
+          # pull request merges itself when the required checks pass, under the
+          # same rules as everything else. Enabling it twice is not an error
+          # worth failing the job over, so a second call is tolerated.
+          gh pr merge --squash --auto "$existing" \
+            || echo "::notice::auto-merge was already enabled on #$existing, or could not be enabled; see the log above"
+
+          echo "::notice::$subject proposed in #$existing"

@@ -243,7 +243,7 @@ that teaches nothing and catches nothing.
 | Where | What runs | Authority |
 |---|---|---|
 | On a pull request | The observed passing count must not be **below** the recorded floor, plus the unchanged gates: the suite executed, no transform or collection error, no silent test-file drop, zero failures. A count above the floor passes normally. | read-only |
-| On `main`, after a merge | The `record-floor` job writes the observed count into `.test-baseline` when it differs, as a one-file commit by the CI actor. | write, on `main` only, one file only |
+| On `main`, after a merge | The `record-floor` job proposes the observed count as an ordinary one-line pull request from a fixed branch, with auto-merge enabled. | no elevated authority; the same required checks as any change |
 
 The regression property is unchanged: a change that reduces the passing count
 still fails on the pull request, before merge. The staleness objection the old
@@ -257,16 +257,31 @@ runs before it installs anything. An earlier attempt put the same decisions in
 workflow steps, where the only way to exercise a branch was to merge it and
 watch.
 
+**The recorded floor is not a privileged write.** The recorder does not push to
+`main`. The `main` ruleset requires a pull request with zero approving reviews
+and the repository allows auto-merge, so CI can satisfy the rules the same way a
+person does: push a branch, open a pull request, let it merge itself when the
+required checks pass. No bypass actor, no deploy key, no app token, and the
+pull-request requirement plus every required check stay intact for this change
+too. The branch name is fixed rather than per-count, so two merges in quick
+succession converge on the later count instead of opening competing pull
+requests. Detail, including the bypass routes that were considered and dropped:
+[`branch-protection-setup.md`](./branch-protection-setup.md).
+
 **Failure mode, and the reason it needs its own alarm.** The new failure is
-permissive rather than restrictive: if the recorder fails or never runs, the
-floor stays low and the pull-request gate quietly asserts less than it should.
+permissive rather than restrictive: if the recorder fails, never runs, or opens a
+pull request that never merges, the floor stays low and the pull-request gate
+quietly asserts less than it should.
 From a pull request's point of view a stale floor looks exactly like a healthy
 one: the check passes, in the same colour, with the same message. Two alarms sit
 outside that path. The recorder failing reds a push to `main`, which is immediate
 and visible. The scheduled backstop at
 `.github/workflows/test-baseline-floor-drift.yml` runs the suite on `main`,
 compares the fresh count against the recorded floor, and fails when a mismatch
-has outlived its window. That backstop proves the floor matched a count on one
+has outlived its window. It also reports a recorded-floor pull request that has
+stayed open past that window, since an unmerged one is a stale floor wearing a
+different hat: it looks healthier, because there is a visible pull request, and
+it has exactly the same effect on every other pull request. That backstop proves the floor matched a count on one
 day and says nothing about the days between runs, which is why the recorder's own
 red is the primary signal and this is the second.
 

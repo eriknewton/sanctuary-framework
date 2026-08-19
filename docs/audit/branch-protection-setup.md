@@ -151,61 +151,54 @@ Document any rollback action in `docs/audit/branch-protection-overrides.log` (cr
 
 ---
 
-## 2026-08-19: the recorded floor needs one narrow write, and the ruleset cannot express it
+## 2026-08-19: the recorded floor goes through the same gate as everything else
 
 The `record-floor` job added on 2026-08-19 (see
-[`test-baseline-hardening-plan.md`](./test-baseline-hardening-plan.md)) pushes a
-one-file commit to `main` after every merge. **Under the ruleset as configured
-today it cannot.** This section states what was observed and what the decision
-costs, because the decision belongs to the repository owner and to nobody else.
+[`test-baseline-hardening-plan.md`](./test-baseline-hardening-plan.md)) has to
+get one line into `.test-baseline` on `main` after every merge. **It does that by
+opening an ordinary pull request, not by pushing.** No ruleset change was needed
+and none was made.
 
-**Observed** (read-only inspection of
-`repos/eriknewton/sanctuary-framework/rulesets` and the branch-protection
-endpoint):
+**Why that works here.** Read-only inspection of
+`repos/eriknewton/sanctuary-framework/rulesets` and the repository settings:
 
-- The default branch is governed by one active repository ruleset, `main`.
-- It carries a `pull_request` rule, a `non_fast_forward` rule, a `deletion` rule,
-  and required status checks with the up-to-date policy on.
-- Its bypass list is **empty**, and the API reports the current user as never
-  able to bypass. There is no classic branch protection alongside it.
-- The repository's default workflow permission is `read`.
+- The `main` ruleset requires a pull request with
+  `required_approving_review_count: 0` and no code-owner requirement.
+- The repository has `allow_auto_merge: true`, `allow_squash_merge: true`, and
+  `delete_branch_on_merge: true`.
 
-**Consequence.** A direct push from the job is refused by the `pull_request`
-rule. Declaring `contents: write` on the job is necessary and is done, but it is
-not sufficient on its own.
+So a machine-authored change can satisfy the rules exactly as a person's does:
+the recorder pushes a branch, opens a pull request, and enables auto-merge. The
+required checks run on it, it merges itself when they pass, and the branch is
+cleaned up. **The pull-request requirement and every required check stay intact
+for this change too**, which is the property that matters: the recorded floor is
+not a privileged write, it is a normal change that happens to be written by CI.
 
-**What the ruleset can and cannot express.** A ruleset bypass is granted to an
-*actor*: a GitHub App such as Actions, a repository role, a team, or a deploy
-key. It applies to the entire ruleset on that branch, and it cannot be narrowed
-to a path, a file, a workflow, or a job. So the narrowest grant available is
-"this actor may bypass the `main` ruleset", which is broader than "this job may
-write one file", by a wide margin: it would also lift the pull-request
-requirement and the required checks for every workflow run holding that token.
+**Considered and rejected: giving the job a bypass.** A ruleset bypass is granted
+to an *actor* (a GitHub App, a repository role, a team, or a deploy key) and
+applies to the whole ruleset on that branch. It cannot be scoped to a path, a
+file, a workflow, or a job. The narrowest version of it would still lift the
+pull-request requirement and the required checks for anything holding that token,
+which is a much larger grant than "write one line". The pull-request route needs
+none of it, so the bypass routes (Actions app, deploy key, personal token) were
+all dropped rather than ranked.
 
-**This is an owner decision and was deliberately not taken.** Widening the
-ruleset was not attempted, and the pull request that introduces `record-floor`
-should not merge until this is resolved, because the recorder failing on every
-merge is a red `main` rather than a silent one, but a merged design that cannot
-record leaves the floor frozen at whatever value it last held.
+**One constraint to confirm before relying on this.** A pull request opened with
+the default `GITHUB_TOKEN` does not itself start new workflow runs; that is
+GitHub's guard against a workflow triggering itself. If the required checks
+therefore never report on the recorded-floor pull request, auto-merge cannot fire
+and the pull request waits. The failure is bounded and alarmed rather than
+silent: the recorder uses one fixed branch, so at most one such pull request
+exists at a time and it always carries the newest count, and the scheduled check
+in `.github/workflows/test-baseline-floor-drift.yml` reports a recorded-floor
+pull request that stays open past its window. Clearing it needs either a token
+whose events start workflow runs, or one human action on the waiting pull
+request. Nothing about it can silently weaken the gate.
 
-Three routes, in descending order of how narrow they are:
-
-1. **Leave the ruleset alone and let the recorder open a pull request** instead
-   of pushing, with auto-merge. This keeps every rule intact and adds a
-   machine-authored pull request per merge, which is real review noise and one
-   more moving part.
-2. **Grant a deploy key bypass**, with the key held only by this workflow. Still
-   a whole-branch bypass, but the credential is scoped to one workflow rather
-   than to every run of every workflow.
-3. **Grant the GitHub Actions app a bypass.** Simplest, and the broadest: any
-   workflow that acquires a write token can then push to `main` directly.
-
-Failure-mode note for whoever executes whichever route is chosen: a push refused
-by a ruleset and a push refused by a missing `contents: write` grant produce
-similar-looking permission errors, and a shallow clone produces a third
-("shallow update not allowed") that also reads as a permissions problem. Check
-the job's declared permissions, the ruleset bypass list, and the checkout depth
-before concluding which one you are looking at.
+Failure-mode note for whoever looks at a waiting recorded-floor pull request:
+"required checks red" and "required checks never reported" look similar in the
+merge box and have opposite causes. Check whether the check runs exist at all
+before hunting for a test failure.
 
 ---
 

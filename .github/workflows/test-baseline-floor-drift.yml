@@ -36,6 +36,10 @@ on:
 
 permissions:
   contents: read
+  # Read-only, and only so the stale-pull-request check below can see whether a
+  # recorded-floor pull request is sitting unmerged. This job proposes nothing
+  # and merges nothing.
+  pull-requests: read
 
 jobs:
   floor-drift:
@@ -124,5 +128,43 @@ jobs:
           echo "$verdict"
           if [[ "$status" -ne 0 ]]; then
             echo "::error::The recorded test baseline floor has drifted and stayed drifted. See the run log for the counts."
+            exit "$status"
+          fi
+
+      # A recorded-floor pull request that never merges has exactly the same
+      # effect as a floor that was never recorded: every other pull request keeps
+      # passing against a number that no longer describes main. It just looks
+      # healthier, because there is a visible pull request. Moving the write
+      # behind a pull request added a link that can fail on its own, so it gets
+      # its own alarm rather than inheriting the previous step's.
+      #
+      # Failure mode note: this is the step that fires if the recorded-floor
+      # pull request's required checks never report at all, which is the known
+      # constraint documented on the record-floor job.
+      - name: Report a recorded-floor pull request that is not merging
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          window_seconds=$(( DRIFT_WINDOW_HOURS * 3600 ))
+          branch="$(scripts/test-baseline-floor.sh record-branch)"
+          created="$(gh pr list --state open --head "$branch" --json createdAt --jq '.[0].createdAt // empty')"
+          if [[ -z "$created" ]]; then
+            open_count=0
+            age=0
+          else
+            open_count="$(gh pr list --state open --head "$branch" --json number --jq 'length')"
+            # `date -d` on an ISO-8601 instant is GNU-only, which is fine on
+            # ubuntu-latest and would silently misparse on a macOS runner.
+            age=$(( $(date -u +%s) - $(date -u -d "$created" +%s) ))
+            if (( age < 0 )); then age=0; fi
+          fi
+          echo "Open recorded-floor pull requests: $open_count (oldest ${age}s, window ${window_seconds}s)"
+          set +e
+          verdict="$(scripts/test-baseline-floor.sh record-pr-verdict "$open_count" "$age" "$window_seconds" 2>&1)"
+          status=$?
+          set -e
+          echo "$verdict"
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error::A recorded-floor pull request has stayed open past its window, which leaves the floor stale."
             exit "$status"
           fi

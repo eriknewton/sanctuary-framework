@@ -266,6 +266,53 @@ case_record_refuses_its_own_commit() {
   assert_stderr_contains "$root" "recording again would loop"
 }
 
+# THE SHAPE THAT ACTUALLY LANDS, and the reason the matcher is not an exact
+# suffix comparison. The recorder proposes its change as a pull request, so its
+# commit reaches main through a squash, and this repository's
+# squash_merge_commit_title is COMMIT_OR_PR_TITLE, which GitHub renders as the
+# title plus ` (#N)`. Verified against real history: pull request 1272's title
+# reaches main as that title plus ` (#1272)`. A guard that recognizes only the
+# pre-merge subject recognizes the one form it never sees, and the recorded floor
+# would then propose another recorded floor on every merge.
+case_squashed_own_subject_is_refused() {
+  local root="$1"
+  run_floor "$root" commit-subject 14338
+  assert_status "$root" 0
+  local squashed
+  squashed="$(cat "$root/stdout.log") (#1283)"
+
+  run_floor "$root" guard-record-context refs/heads/main "$squashed"
+  assert_status "$root" 1
+  assert_stderr_contains "$root" "recording again would loop"
+}
+
+# The complement, so the wildcard that admits the squashed form has not turned
+# the matcher into something that swallows unrelated subjects. A change whose
+# subject merely mentions the floor file must still record normally.
+case_a_subject_that_only_mentions_the_floor_still_records() {
+  local root="$1"
+  run_floor "$root" guard-record-context refs/heads/main "fix(ci): read .test-baseline through one parser (#1290)"
+  assert_status "$root" 0
+  assert_stdout_contains "$root" "recording is permitted"
+}
+
+# The arithmetic bound, stated as its own case because it is the one that holds
+# even if every subject matcher were deleted. When the recorded-floor pull
+# request merges, main carries floor == the observed count, so the recorder that
+# runs on that merge has nothing to propose.
+case_no_op_is_the_second_line_of_defence() {
+  local root="$1"
+  printf '14338\n' > "$root/.test-baseline"
+  # Exactly the state the recorded-floor merge leaves behind.
+  run_floor "$root" record-decision 14338 14338
+  assert_status "$root" 10
+  assert_stdout_contains "$root" "already 14338"
+  run_floor "$root" record .test-baseline 14338
+  assert_status "$root" 10
+  assert_stdout_contains "$root" "not writing"
+  assert_file_equals "$root/.test-baseline" 14338
+}
+
 case_record_permitted_on_main_after_an_ordinary_merge() {
   local root="$1"
   run_floor "$root" guard-record-context refs/heads/main "feat(state): something real (#1234)"
@@ -332,6 +379,32 @@ case_drift_age_measures_from_the_first_unrecorded_commit() {
   (( age >= 7000 )) || fail "drift age reset to the newest commit: got ${age}s, expected roughly 7200s"
 }
 
+# ── The stale recorded-floor pull request ───────────────────────────────────
+
+case_no_open_record_pr_is_fine() {
+  local root="$1"
+  run_floor "$root" record-pr-verdict 0 0 3600
+  assert_status "$root" 0
+  assert_stdout_contains "$root" "NO-OPEN-RECORD-PR"
+}
+
+case_young_open_record_pr_is_not_reported() {
+  local root="$1"
+  run_floor "$root" record-pr-verdict 1 60 3600
+  assert_status "$root" 0
+  assert_stdout_contains "$root" "OPEN-RECORD-PR-WITHIN-WINDOW"
+}
+
+# An unmerged recorded-floor pull request is a stale floor that looks healthier
+# than one, which is exactly why it needs an alarm of its own.
+case_old_open_record_pr_is_reported() {
+  local root="$1"
+  run_floor "$root" record-pr-verdict 1 7200 3600
+  assert_status "$root" 1
+  assert_stderr_contains "$root" "has been open for 7200s"
+  assert_stderr_contains "$root" "stale floor wearing a different hat"
+}
+
 # ── Cross-file pins: the workflow must keep the write where it belongs ──────
 
 workflow_line_of() {
@@ -366,6 +439,40 @@ case_only_the_record_job_can_write() {
   done < <(grep -nE 'test-baseline-floor\.sh (record|commit-subject)' "$GUARD_WORKFLOW" || true)
 
   # A no-op read so the fixture root is used and the case shape matches the rest.
+  [[ -d "$root" ]] || fail "fixture root vanished"
+}
+
+# INVARIANT this case pins: the recorder PROPOSES, it does not push main. The
+# whole no-new-authority argument rests on that one fact, and a future edit that
+# "simplifies" the pull request away into a direct push would restore the need
+# for a ruleset bypass while every test still passed.
+case_the_recorder_never_pushes_main() {
+  local root="$1"
+  if grep -qE 'git push[^|]*HEAD:main|git push[^|]*origin main' "$GUARD_WORKFLOW"; then
+    fail "$GUARD_WORKFLOW pushes main directly; the recorder must open a pull request instead"
+  fi
+  grep -q 'gh pr create' "$GUARD_WORKFLOW" \
+    || fail "$GUARD_WORKFLOW no longer opens a pull request for the recorded floor"
+  grep -q 'gh pr merge --squash --auto' "$GUARD_WORKFLOW" \
+    || fail "$GUARD_WORKFLOW no longer enables auto-merge on the recorded-floor pull request"
+  [[ -d "$root" ]] || fail "fixture root vanished"
+}
+
+# The recorder's branch name is shared with the drift check's stale-pull-request
+# query. Both must obtain it from `record-branch`; a second literal is how the
+# alarm would end up watching a branch nobody proposes from, and an alarm
+# pointed at the wrong branch reports "all clear" forever.
+case_the_record_branch_is_not_spelled_out_twice() {
+  local root="$1"
+  local drift_workflow="$REPO_ROOT/.github/workflows/test-baseline-floor-drift.yml"
+  local literal
+  for f in "$GUARD_WORKFLOW" "$drift_workflow"; do
+    literal="$(grep -c 'ci/record-baseline' "$f" || true)"
+    [[ "$literal" == "0" ]] \
+      || fail "$f spells the recorded-floor branch out $literal time(s); call record-branch instead"
+    grep -q 'test-baseline-floor\.sh record-branch' "$f" \
+      || fail "$f does not obtain the recorded-floor branch from record-branch"
+  done
   [[ -d "$root" ]] || fail "fixture root vanished"
 }
 
@@ -407,7 +514,15 @@ run_case "a differing count is written to the floor" case_record_writes_when_dif
 run_case "a deliberate lowering is recorded, not clamped" case_record_accepts_a_deliberate_lowering
 run_case "the recorder refuses to run off main" case_record_refuses_off_main
 run_case "the recorder refuses its own commit, bounding the loop" case_record_refuses_its_own_commit
+run_case "the recorder refuses its own SQUASHED commit, the form that lands" case_squashed_own_subject_is_refused
+run_case "a subject that merely mentions the floor still records" case_a_subject_that_only_mentions_the_floor_still_records
+run_case "an already-correct floor bounds the loop by arithmetic alone" case_no_op_is_the_second_line_of_defence
 run_case "the recorder proceeds on main after an ordinary merge" case_record_permitted_on_main_after_an_ordinary_merge
+run_case "no open recorded-floor pull request is fine" case_no_open_record_pr_is_fine
+run_case "a young open recorded-floor pull request is not reported" case_young_open_record_pr_is_not_reported
+run_case "an old open recorded-floor pull request is reported loudly" case_old_open_record_pr_is_reported
+run_case "the recorder proposes a pull request and never pushes main" case_the_recorder_never_pushes_main
+run_case "the recorded-floor branch is not spelled out twice" case_the_record_branch_is_not_spelled_out_twice
 run_case "drift reports in sync when the floor matches a fresh count" case_drift_in_sync
 run_case "drift younger than the window is not reported" case_drift_within_window_is_not_reported
 run_case "drift older than the window is reported loudly" case_drift_past_window_reports
