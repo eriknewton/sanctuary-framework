@@ -7,26 +7,49 @@ set -euo pipefail
 # can be exercised (and proven) outside GitHub Actions. See
 # scripts/gate2b-self-test.sh for the self-test that plants a divergence.
 #
-# INVARIANT: `expected_files` MUST be derived from the same `test.include`
-# globs vitest.config.ts hands to vitest at runtime, never restated by hand
-# in this script. A hand-restated root here is exactly the drift class that
-# let a real silent-drop bug hide under a 14-file cushion: `expected_files`
-# used to be `find server/test -name "*.test.ts" | wc -l`, which only scans
-# one of vitest.config.ts's two `test.include` roots
-# (`test/**/*.test.ts` and `../scripts/synthetic-coverage/test/**/*.test.ts`).
-# On a real run that was 992 files on disk vs. 1006 loaded by vitest — up to
-# 14 server/test files could be silently dropped and this gate would still
-# report green, because the untracked second root's 14 files masked the
-# gap. Fixed 2026-08-19 (pre-existing on main, independent of any open PR).
-# MUST MATCH: `test.include` in server/vitest.config.ts (cross-file pin;
-# server/scripts/count-vitest-test-files.mjs reads that array directly
-# instead of copying it, so this file needs no matching edit when the
-# include list changes).
+# INVARIANT: `expected_files` MUST come from vitest's OWN file discovery
+# (server/scripts/count-vitest-test-files.mjs, which shells out to `vitest
+# list --filesOnly`), never from a re-implementation of test.include/exclude/
+# dot/root/projects resolution in this script or in that one. Round 1 of this
+# gate (`find server/test -name "*.test.ts"`) only scanned one of
+# vitest.config.ts's two `test.include` roots and let up to 14 dropped files
+# pass undetected (992 on disk vs. 1006 loaded by vitest). Round 2 replaced
+# the shell `find` with a hand-rolled glob over `test.include` in the count
+# script — closer, but still a second implementation of vitest's resolution
+# that had no idea about `test.exclude`, `dot`, `root`/`dir`, `includeSource`,
+# or a workspace/projects config, any of which could silently diverge from
+# what vitest actually runs. See the count script's header for round 2's fix:
+# it now asks vitest for the list directly instead of modeling it, so there
+# is nothing left in either file to keep in sync with vitest.config.ts.
 #
 # Usage: scripts/gate2b-check.sh <vitest-output-log>
 
 usage() {
   echo "Usage: scripts/gate2b-check.sh <vitest-output-log>" >&2
+}
+
+# Mirrors .githooks/pre-commit's validate_counter: a vitest-derived counter is
+# grep -oE "[0-9]+"-shaped but not yet SAFE to hand to `(( ))`. A leading-zero
+# string (e.g. "007") risks an octal-parse surprise, and an absurdly long
+# digit string can overflow bash's signed-64-bit arithmetic and silently
+# wrap — on a wrapped-negative count, a "less than" comparison can invert.
+# This is the single implementation both this script (CI, and via the hook
+# below) and the local pre-commit hook now share for its own counters, so
+# the two cannot drift on how strict this check is the way they drifted on
+# whether expected_files=0 was acceptable (finding that motivated unifying
+# this file in the first place).
+COUNTER_MAX=100000000 # 9 digits; no real suite approaches 100M files/tests.
+validate_counter() {
+  local name="$1" value="$2"
+  if ! [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "::error::$name is not a canonical non-negative integer, got: '$value'" >&2
+    exit 1
+  fi
+  if (( ${#value} > ${#COUNTER_MAX} )) \
+     || { (( ${#value} == ${#COUNTER_MAX} )) && (( value > COUNTER_MAX )); }; then
+    echo "::error::$name is implausibly large ('$value') — refusing to trust it." >&2
+    exit 1
+  fi
 }
 
 if [[ $# -ne 1 ]]; then
@@ -57,6 +80,16 @@ if ! [[ "$expected_files" =~ ^[0-9]+$ ]]; then
   echo "::error::count-vitest-test-files.mjs did not print an integer: '$expected_files'" >&2
   exit 1
 fi
+validate_counter "expected test file count" "$expected_files"
+if (( expected_files == 0 )); then
+  # FAILURE MODE: 0 is never a valid expected count, however cleanly the
+  # arithmetic below might compare it. It means vitest's OWN discovery found
+  # nothing to run — a bad vitest.config.ts, a wrong --root, or a moved test
+  # directory — and letting 0 flow into "actual_total == expected_files"
+  # would make the gate pass vacuously if the run also (wrongly) reports 0.
+  echo "::error::vitest's own discovery (vitest list --filesOnly) found 0 test files. Refusing to treat 0 as a valid expected count — something is catastrophically wrong with vitest.config.ts or the invocation root." >&2
+  exit 1
+fi
 
 actual_total=$(grep -oE "Test Files[[:space:]]+.*\([0-9]+\)" "$VITEST_LOG" | grep -oE "\([0-9]+\)" | tr -d '()' | tail -1)
 if [[ -z "$actual_total" ]]; then
@@ -67,28 +100,36 @@ if [[ -z "$actual_total" ]]; then
   tail -30 "$VITEST_LOG" >&2
   exit 1
 fi
+validate_counter "vitest-reported Test Files count" "$actual_total"
 
-echo "Files matching vitest's test.include globs: $expected_files"
-echo "Files vitest loaded:                        $actual_total"
+echo "Files vitest's own discovery finds: $expected_files"
+echo "Files vitest loaded for the run:    $actual_total"
 
-# FAILURE MODE: this inequality (not exact equality) is intentional, not a
-# leftover from the pre-fix shape. expected_files is a static glob match on
-# disk; actual_total is vitest's own runtime "Test Files" reporter total. A
-# future vitest version could in principle report a matched-but-fully-skipped
-# file differently than "collected", so exact equality risks a false CI
-# failure on a benign reporting nuance. What equality would buy over `<` is
-# catching the *surplus* direction (actual_total > expected_files), which
-# cannot represent a drop — it is logged below, not failed. The slack this
-# leaves is bounded to zero in the common case, because both sides now come
-# from the identical include globs; it is not bounded to zero by the type
-# system, which is why this stays a runtime check.
-if (( actual_total < expected_files )); then
-  echo "::error::Silent test file drop detected: $expected_files files match vitest's test.include globs, $actual_total loaded by vitest. Missing $((expected_files - actual_total)) file(s). This is the exact failure class from commit 4ac95830 (see docs/audit/commit-4ac95830-postmortem.md)."
+# FAILURE MODE: this is EXACT equality, not `actual_total < expected_files`.
+# An earlier version of this gate tolerated actual_total > expected_files on
+# the theory that expected_files was a static glob model that could
+# legitimately undercount a runtime edge case. That reasoning no longer
+# applies: expected_files now comes from `vitest list --filesOnly`, which
+# calls vitest's OWN `getRelevantTestSpecifications` — the exact same method
+# a real `vitest run` uses to decide what to run. Both numbers describe the
+# identical set by construction, computed by vitest itself against the same
+# checkout in the same CI job. There is no known legitimate case where they
+# differ in EITHER direction: a shortfall is a drop (the class this gate
+# exists to catch); a surplus would mean vitest ran a file its own discovery
+# call didn't report, which is not a "less bad" story than a drop — it means
+# the two vitest invocations disagreed with themselves, and that is exactly
+# as untrustworthy. Do not reintroduce a `<`-only comparison or a tolerated
+# surplus without first identifying a concrete, named case that makes them
+# differ (see the review note against the original inequality version of
+# this gate for why "a future vitest version might report a skipped file
+# differently" was not such a case once both sides share one discovery call).
+if (( actual_total != expected_files )); then
+  if (( actual_total < expected_files )); then
+    echo "::error::Silent test file drop detected: vitest's own discovery found $expected_files test file(s), but only $actual_total loaded for the run. Missing $((expected_files - actual_total)) file(s). This is the exact failure class from commit 4ac95830 (see docs/audit/commit-4ac95830-postmortem.md)."
+  else
+    echo "::error::Unexpected surplus: vitest loaded $actual_total file(s) for the run but its own discovery call only found $expected_files. Both numbers are supposed to come from the same vitest discovery mechanism against the same checkout — this means the two invocations disagreed, which is not a known-safe case. Investigate before assuming this is benign."
+  fi
   exit 1
-fi
-
-if (( actual_total > expected_files )); then
-  echo "Note: vitest loaded more files ($actual_total) than the include globs matched on disk ($expected_files). Not a drop (a drop is undercounting, not overcounting) — worth a look if unexpected, not failing this gate."
 fi
 
 echo "✓ All $expected_files test files loaded by vitest."

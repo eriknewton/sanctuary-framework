@@ -29,14 +29,15 @@
 #          commit 4ac95830 failure class.
 #
 #       b. Silent test file drop.
-#          Count .test.ts files matched by vitest.config.ts's
-#          test.include globs (both server/test/ and
-#          ../scripts/synthetic-coverage/test/, via
-#          server/scripts/count-vitest-test-files.mjs) and compare
-#          to vitest's reported "Test Files N passed (TOTAL)" count.
-#          If files on disk > files vitest attempted, some file
-#          failed to load before vitest registered it — the same
-#          failure shape as 4ac95830, hiding 98 tests for 26 hours.
+#          Delegates to scripts/gate2b-check.sh — the same
+#          implementation CI's Gate 2b calls — which compares the
+#          test files VITEST ITSELF discovers (`vitest list
+#          --filesOnly`, via server/scripts/count-vitest-test-files.mjs)
+#          against vitest's reported "Test Files N passed (TOTAL)"
+#          count from this run. If vitest ran fewer files than its own
+#          discovery found, some file failed to load before vitest
+#          registered it — the same failure shape as 4ac95830, hiding
+#          98 tests for 26 hours.
 #
 #       c. Test baseline drift (BOTH directions).
 #          If vitest's passing-test count falls below the integer
@@ -302,22 +303,6 @@ if [[ -f .test-baseline ]]; then
   fi
 fi
 
-# Count the files vitest's OWN test.include globs match on disk (expected).
-# MUST MATCH: test.include in server/vitest.config.ts (cross-file pin). This
-# reads server/scripts/count-vitest-test-files.mjs's shared derivation
-# instead of a hand-restated `find server/test`, because that restated form
-# only scanned one of vitest.config.ts's two include roots (the other is
-# ../scripts/synthetic-coverage/test) and silently gave up to 14 files of
-# slack a real drop could hide inside before this was fixed (2026-08-19; see
-# that script's header and .github/workflows/test-baseline-guard.yml Gate 2b,
-# which uses the same script so this hook and CI cannot drift apart again).
-expected_files=$(node server/scripts/count-vitest-test-files.mjs 2>/dev/null | tr -d '[:space:]')
-if [[ -z "$expected_files" || "$expected_files" == "0" ]]; then
-  fail "No test files found matching vitest's test.include globs — something is wrong"
-  exit 1
-fi
-validate_counter "expected test file count" "$expected_files"
-
 # Run the test suite and capture BOTH output and exit code. Using
 # `set +e` around the assignment means the subshell's non-zero exit
 # does not abort this hook under `set -e` — we want to inspect the
@@ -390,33 +375,58 @@ fi
 
 # ── Check 2b: silent test file drop ─────────────────────────────────
 #
-# Parse vitest's "Test Files  N passed (TOTAL)" summary line. The
-# number inside parentheses is vitest's attempted-file count. If
-# files on disk exceed that count, some file(s) dropped silently
-# during collection — the exact failure class from 4ac95830.
-actual_total=$(echo "$test_output" | grep -oE "Test Files[[:space:]]+.*\([0-9]+\)" | grep -oE "\([0-9]+\)" | tr -d '()' | tail -1)
-if [[ -z "$actual_total" ]]; then
-  # Fallback for older vitest output shape.
-  actual_total=$(echo "$test_output" | grep -oE "Test Files[[:space:]]+[0-9]+ passed" | grep -oE "[0-9]+" | head -1)
-fi
-if [[ -z "$actual_total" ]]; then
-  fail "Could not parse 'Test Files' count from vitest output"
-  echo "$test_output" | tail -30 >&2
-  exit 1
-fi
-# Validate before any arithmetic (fail CLOSED on non-canonical / overflow).
-validate_counter "Test Files count" "$actual_total"
+# Delegates to scripts/gate2b-check.sh — the SAME implementation
+# .github/workflows/test-baseline-guard.yml's Gate 2b calls. This hook used
+# to keep its own copy of the "Test Files N passed (TOTAL)" parsing and the
+# expected-vs-actual comparison; that second copy is exactly the kind of
+# drift that let this hook and CI disagree on whether expected_files=0 was
+# acceptable (this hook rejected it outright; the other copy did not) until
+# both were unified into gate2b-check.sh, which now owns that refusal in one
+# place. See that script for the vitest-own-discovery expected count
+# (server/scripts/count-vitest-test-files.mjs, via `vitest list --filesOnly`)
+# and its self-test (scripts/gate2b-self-test.sh).
+GATE2B_LOG="$(mktemp)"
+trap 'rm -f "$GATE2B_LOG"' EXIT
+printf '%s\n' "$test_output" > "$GATE2B_LOG"
 
-if (( actual_total < expected_files )); then
-  fail "SILENT TEST FILE DROP DETECTED — commit blocked"
-  printf '[baseline-guard]   Files matching test.include globs: %s\n' "$expected_files" >&2
-  printf '[baseline-guard]   Files vitest reported:              %s\n' "$actual_total" >&2
-  printf '[baseline-guard]   Missing: %s test file(s).\n' "$((expected_files - actual_total))" >&2
+set +e
+gate2b_output=$(bash scripts/gate2b-check.sh "$GATE2B_LOG" 2>&1)
+gate2b_status=$?
+set -e
+
+# FAILURE MODE: gate2b-check.sh's own messages use GitHub Actions'
+# "::error::" annotation prefix, which is meaningless outside Actions but
+# harmless — it just prints as literal text here. Re-prefixing every line
+# with this hook's own "[baseline-guard]" tag keeps the local output visually
+# consistent with every other check in this script instead of leaving one
+# check's output in a different voice.
+while IFS= read -r gate2b_line; do
+  printf '[baseline-guard] %s\n' "$gate2b_line" >&2
+done <<< "$gate2b_output"
+
+if (( gate2b_status != 0 )); then
+  fail "SILENT TEST FILE DROP DETECTED (or an inconsistency in vitest's own file discovery) — commit blocked"
   printf '\n' >&2
   fail "This is the specific failure class from commit 4ac95830."
   printf '[baseline-guard]   See docs/audit/commit-4ac95830-postmortem.md\n' >&2
   exit 1
 fi
+
+# Recover actual_total (needed for the Gate 2/2 summary line below) from
+# gate2b-check.sh's own output instead of re-parsing test_output a second
+# time with a second copy of the same regex — that second copy is the exact
+# shape of drift this delegation exists to remove, even for a cosmetic
+# summary number.
+actual_total=$(echo "$gate2b_output" | grep -oE "Files vitest loaded for the run:[[:space:]]+[0-9]+" | grep -oE "[0-9]+")
+if [[ -z "$actual_total" ]]; then
+  fail "Could not recover the test-file count from scripts/gate2b-check.sh output — internal error"
+  exit 1
+fi
+# Validate before any arithmetic (fail CLOSED on non-canonical / overflow).
+# gate2b-check.sh already validated this value itself; this is defense in
+# depth for the LOCAL re-parse above, not a claim that gate2b-check.sh might
+# be wrong.
+validate_counter "Test Files count" "$actual_total"
 
 # ── Check 2c: passing count >= baseline ─────────────────────────────
 #

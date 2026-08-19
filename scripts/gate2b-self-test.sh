@@ -1,25 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Self-test for scripts/gate2b-check.sh (and, by extension, the identical
-# logic inlined at .githooks/pre-commit's `expected_files=$(node
-# server/scripts/count-vitest-test-files.mjs ...)` line).
+# Self-test for scripts/gate2b-check.sh, which .githooks/pre-commit now
+# calls directly instead of keeping its own copy of this logic.
 #
-# Proves two things against a throwaway fixture whose vitest.config.ts has
-# the same shape as server/vitest.config.ts (two test.include roots):
+# Four cases against throwaway fixtures whose vitest.config.ts has the same
+# two-root include shape as server/vitest.config.ts:
 #
-#   1. The FIXED check (gate2b-check.sh, deriving expected_files from the
-#      include globs across BOTH roots) correctly FAILS when a server/test
-#      file silently stops loading, even though the file is still present on
-#      disk (the exact commit-4ac95830 shape: a transform/collection error
-#      drops a file from the run without vitest exiting non-zero on its own).
-#   2. The PRE-FIX check (a `find server/test` restated inline below, the
-#      literal formula this fix replaced) PASSES on the exact same planted
-#      drop, because the untracked second include root's file count was
-#      masking it. This is the 992-vs-1006 / 14-file-cushion defect,
-#      reproduced at a small scale (5 + 2 files) so it runs in milliseconds.
+#   1. No drop: the fixed check passes.
+#   2. Planted drop (fabricated actual_total): the fixed check FAILS, and
+#      the ROUND-1 formula (`find server/test` only, restated inline below
+#      for comparison — the literal formula the original fix replaced)
+#      PASSES on the exact same drop, reproducing the 992-vs-1006 /
+#      14-file-cushion defect at a small scale.
+#   3. Surplus (fabricated actual_total): now a hard failure, not a
+#      tolerated informational note — proves equality is enforced.
+#   4. A REAL `vitest run` plus a REAL `test.exclude` entry: proves the
+#      counter's discovery side (not just the comparison logic) matches
+#      vitest's own behavior on a config surface a hand-rolled glob would
+#      miss, and reproduces the ROUND-2 formula (test.include globbed by
+#      hand, no test.exclude support — the fix that preceded asking vitest
+#      directly) FALSE-FAILING that same healthy run.
 #
-# Mirrors the fixture-and-assert shape of scripts/verify-fail-before-self-test.sh.
+# Cases 1-3 fabricate actual_total to test the comparison logic in
+# isolation and deterministically; case 4 drives both sides from vitest
+# itself so the discovery side is proven against real vitest behavior, not
+# just modeled. Mirrors the fixture-and-assert shape of
+# scripts/verify-fail-before-self-test.sh.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -114,9 +121,70 @@ pre_fix_check_passes() {
   return 0
 }
 
+# Reproduces round 2's fix (server/scripts/count-vitest-test-files.mjs
+# before the vitest-list-based rewrite this self-test also proves): glob
+# BOTH test.include roots by hand, but with no idea that test.exclude
+# exists. Not used by the fixed gate — exists only so Case 4 can show that
+# round 2, while it fixed round 1's missing-root bug, could still
+# false-fail a perfectly healthy run the moment vitest.config.ts grows a
+# config surface it didn't model.
+round2_expected_files() {
+  local root="$1"
+  {
+    find "$root/server/test" -name "*.test.ts" -not -path "*/node_modules/*"
+    find "$root/scripts/synthetic-coverage/test" -name "*.test.ts" -not -path "*/node_modules/*" 2>/dev/null
+  } | wc -l | tr -d '[:space:]'
+}
+
 make_vitest_log() {
   local path="$1" total="$2"
   printf ' Test Files  %s passed (%s)\n Tests  10 passed (10)\n' "$total" "$total" > "$path"
+}
+
+# Builds a fixture with REAL, runnable test files (vitest's own `it`/`expect`
+# globals, no imports needed) and a REAL test.exclude entry, so Case 4 can
+# drive gate2b-check.sh from an ACTUAL `vitest run` + `vitest list
+# --filesOnly` invocation rather than a fabricated summary line. This is the
+# fixture shape that answers the "exclude/dot/project divergence is outside
+# this self-test's proof" gap: fixtures 1-3 test the COMPARISON logic against
+# a controlled, fabricated actual_total; this one tests that the DISCOVERY
+# side (count-vitest-test-files.mjs) agrees with vitest's real behavior when
+# a config surface round 2's hand-rolled glob never modeled is in play.
+build_real_vitest_fixture() {
+  local root="$1"
+  local server_test_count="$2"   # files under server/test
+  local synthetic_count="$3"     # files under scripts/synthetic-coverage/test
+  local excluded_rel="$4"        # e.g. "test/fixture-5.test.ts" — real to disk, real to test.include, excluded from test.exclude
+
+  mkdir -p "$root/server/scripts" "$root/scripts/synthetic-coverage/test" "$root/server/test"
+
+  cp "$SCRIPT_DIR/gate2b-check.sh" "$root/scripts/gate2b-check.sh"
+  chmod +x "$root/scripts/gate2b-check.sh"
+  cp "$REPO_ROOT/server/scripts/count-vitest-test-files.mjs" "$root/server/scripts/count-vitest-test-files.mjs"
+  ln -s "$REPO_ROOT/server/node_modules" "$root/server/node_modules"
+
+  write_file "$root" "server/package.json" '{"type": "module"}
+'
+  write_file "$root" "server/vitest.config.ts" "import { defineConfig } from \"vitest/config\";
+
+export default defineConfig({
+  test: {
+    globals: true,
+    environment: \"node\",
+    include: [\"test/**/*.test.ts\", \"../scripts/synthetic-coverage/test/**/*.test.ts\"],
+    exclude: [\"$excluded_rel\"],
+  },
+});
+"
+
+  for i in $(seq 1 "$server_test_count"); do
+    write_file "$root" "server/test/fixture-$i.test.ts" "it('real fixture $i', () => { expect(1 + 1).toBe(2); });
+"
+  done
+  for i in $(seq 1 "$synthetic_count"); do
+    write_file "$root" "scripts/synthetic-coverage/test/fixture-$i.test.ts" "it('real synthetic fixture $i', () => { expect(1 + 1).toBe(2); });
+"
+  done
 }
 
 run_case() {
@@ -180,8 +248,15 @@ else
   fail "expected the pre-fix formula to (incorrectly) pass on this planted drop — if it now fails, the reproduction of the historical defect is wrong and this self-test needs to be revisited"
 fi
 
-# ── Case 3: surplus (informational only, not a failure) ─────────────
-run_case "surplus: actual_total > expected_files logs a note but still exits 0"
+# ── Case 3: surplus is now a HARD FAILURE, not tolerated informational ──
+# An earlier version of this gate tolerated actual_total > expected_files
+# (expected_files was a static glob model that could plausibly undercount a
+# runtime edge case). That is no longer true: both sides now come from
+# vitest's own discovery/run against the same checkout, so a surplus means
+# the two vitest invocations disagreed with each other, which is exactly as
+# untrustworthy as a shortfall — this case proves the gate no longer lets it
+# through as a "not a drop, don't worry about it" note.
+run_case "surplus: actual_total > expected_files is now a hard failure (equality required)"
 FIXTURE_3="$(mktemp -d)"
 CLEANUP_DIRS+=("$FIXTURE_3")
 build_fixture "$FIXTURE_3" 5 2
@@ -190,12 +265,75 @@ set +e
 bash "$FIXTURE_3/scripts/gate2b-check.sh" "$FIXTURE_3/vitest-output.log" > "$FIXTURE_3/stdout.log" 2>&1
 status3=$?
 set -e
-[[ "$status3" == "0" ]] || fail "expected exit 0 on surplus (not a drop), got $status3:
+[[ "$status3" == "1" ]] || fail "expected exit 1 on surplus (equality required), got $status3:
 $(cat "$FIXTURE_3/stdout.log")"
-grep -q 'Note: vitest loaded more files' "$FIXTURE_3/stdout.log" \
-  || fail "expected an informational surplus note in output:
+grep -q 'Unexpected surplus' "$FIXTURE_3/stdout.log" \
+  || fail "expected the surplus error message in output:
 $(cat "$FIXTURE_3/stdout.log")"
-echo "  ok: surplus is logged, not failed"
+echo "  ok: surplus fails (equality enforced), not silently tolerated"
+
+# ── Case 4: REAL vitest run + a REAL test.exclude entry ──────────────
+#
+# Cases 1-3 fabricate the "actual_total" side to test the COMPARISON logic
+# deterministically. This case drives BOTH sides for real: an actual `vitest
+# run` produces the vitest-output log gate2b-check.sh parses, and an actual
+# `vitest list --filesOnly` (inside count-vitest-test-files.mjs) produces
+# expected_files — against a fixture whose vitest.config.ts carries a REAL
+# test.exclude entry, the exact config surface round 2's hand-rolled
+# tinyglobby-over-test.include glob had no idea existed.
+#
+#   - On disk: 5 files under server/test + 2 under synthetic-coverage = 7
+#     files match test.include.
+#   - test.exclude drops 1 of the server/test files, so vitest's REAL
+#     discovery and REAL run both land on 6.
+#   - The FIXED counter (vitest list --filesOnly) reports 6 — it respects
+#     exclude because it asks vitest, not because this script re-implements
+#     the rule — so gate2b-check.sh sees expected=6, actual=6 and PASSES on
+#     a perfectly healthy run.
+#   - The ROUND-2 counter (glob test.include by hand, no exclude support)
+#     would have reported 7. Fed the SAME real actual_total=6, round 2's
+#     `actual_total < expected_files` (6 < 7) would have FALSE-FAILED this
+#     healthy run — the "false failure" direction of the finding this fixes,
+#     demonstrated against vitest's real behavior rather than asserted.
+run_case "real vitest run + real test.exclude: fixed check passes, round-2 formula would have false-failed a healthy run"
+FIXTURE_4="$(mktemp -d)"
+CLEANUP_DIRS+=("$FIXTURE_4")
+build_real_vitest_fixture "$FIXTURE_4" 5 2 "test/fixture-5.test.ts"
+
+VITEST_BIN="$FIXTURE_4/server/node_modules/.bin/vitest"
+[[ -x "$VITEST_BIN" ]] || fail "vitest binary not found at $VITEST_BIN — is server/node_modules present in this worktree?"
+
+set +e
+(
+  cd "$FIXTURE_4/server"
+  NO_COLOR=1 FORCE_COLOR=0 "$VITEST_BIN" run > "$FIXTURE_4/vitest-real-output.log" 2>&1
+)
+real_run_status=$?
+set -e
+[[ "$real_run_status" == "0" ]] || fail "expected the real vitest run to pass (nothing is actually broken in this fixture), got exit $real_run_status:
+$(cat "$FIXTURE_4/vitest-real-output.log")"
+grep -q 'Test Files  6 passed (6)' "$FIXTURE_4/vitest-real-output.log" \
+  || fail "expected the real vitest run to report 'Test Files  6 passed (6)' (7 on disk minus 1 excluded), got:
+$(cat "$FIXTURE_4/vitest-real-output.log")"
+
+new_expected="$(node "$FIXTURE_4/server/scripts/count-vitest-test-files.mjs")"
+[[ "$new_expected" == "6" ]] || fail "expected the fixed counter to report 6 (respecting test.exclude), got $new_expected"
+
+set +e
+bash "$FIXTURE_4/scripts/gate2b-check.sh" "$FIXTURE_4/vitest-real-output.log" > "$FIXTURE_4/gate2b-stdout.log" 2>&1
+status4=$?
+set -e
+[[ "$status4" == "0" ]] || fail "expected the fixed check to pass against a real vitest run with a real exclude, got $status4:
+$(cat "$FIXTURE_4/gate2b-stdout.log")"
+echo "  ok: fixed check passes against a real vitest run (expected=6, actual=6, exclude respected)"
+
+round2_expected="$(round2_expected_files "$FIXTURE_4")"
+[[ "$round2_expected" == "7" ]] || fail "expected the round-2 reproduction to compute 7 (test.exclude ignored), got $round2_expected"
+if (( 6 < round2_expected )); then
+  echo "  ok: reproduced round 2's blind spot — its formula would have computed expected_files=$round2_expected (test.exclude ignored) against this SAME real run's actual_total=6, so round 2 would have FALSE-FAILED a healthy run"
+else
+  fail "expected round 2's reproduction (7) to exceed the real actual_total (6) — if it doesn't, this case no longer demonstrates the false-failure direction and needs to be revisited"
+fi
 
 echo ""
-echo "PASS: gate2b-check.sh self-test (3/3 cases)"
+echo "PASS: gate2b-check.sh self-test"

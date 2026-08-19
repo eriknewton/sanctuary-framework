@@ -1,117 +1,170 @@
 #!/usr/bin/env node
-// Computes the expected vitest test-file count from the SAME `test.include`
-// globs vitest.config.ts hands to vitest at runtime, walked with the same
-// glob engine vitest itself uses internally (tinyglobby is a direct vitest
-// dependency, not a substitute we picked). This is the single source of
-// truth for CI's silent-test-file-drop detector (Gate 2b in
-// .github/workflows/test-baseline-guard.yml): the gate no longer restates
-// the include roots by hand in shell, so a future include-root change in
-// vitest.config.ts cannot silently widen the drop-detection blind spot the
-// way it already did once.
+// Reports the test files VITEST ITSELF would discover for a run, via
+// `vitest list --filesOnly --json`, instead of re-implementing test file
+// discovery. This is the single source of truth for CI's
+// silent-test-file-drop detector (Gate 2b in
+// .github/workflows/test-baseline-guard.yml and its mirror in
+// .githooks/pre-commit): the gate compares this against vitest's own
+// "Test Files ... (N)" run-time report, so both sides now come from vitest's
+// real resolution pipeline rather than two independent models of it.
 //
-// MUST MATCH: `test.include` in server/vitest.config.ts (cross-file pin).
-// This script reads that array via vite's own config loader rather than
-// copying it, so the normal case needs no matching edit here at all; if you
-// ever DO find yourself editing this file to keep up with vitest.config.ts,
-// that itself is a signal the derivation broke and should be restored.
+// FINDING THIS FIXES, ROUND 1 (2026-08-19, pre-existing on main, independent
+// of any open PR): Gate 2b originally computed `expected_files` with
+// `find server/test -name "*.test.ts" | wc -l`, which only scans one of
+// vitest.config.ts's two `test.include` roots (`test/**/*.test.ts` and
+// `../scripts/synthetic-coverage/test/**/*.test.ts`). On a real run: 992
+// files on disk in server/test vs. 1006 loaded by vitest — a 14-file
+// cushion baked into the comparison before any files ever went missing.
 //
-// FINDING THIS FIXES (2026-08-19, pre-existing on main, independent of any
-// open PR): Gate 2b computed `expected_files` with
-// `find server/test -name "*.test.ts" | wc -l`, which only scans
-// server/test. vitest.config.ts's `include` is BOTH `test/**/*.test.ts` AND
-// `../scripts/synthetic-coverage/test/**/*.test.ts` — a second root
-// `expected_files` never scanned. `actual_total` (parsed from vitest's own
-// "Test Files ... (N)" summary) counts files from BOTH roots, so on a real
-// run: 992 files on disk in server/test vs. 1006 loaded by vitest, a
-// 14-file cushion baked into the diff before any files ever go missing. Up
-// to 14 server/test files could be silently dropped (deleted, or silently
-// fail to load — the exact commit-4ac95830 failure class this whole gate
-// exists to catch) with the gate still reporting green, because the
-// synthetic-coverage root's file count was masking the drop.
+// FINDING THIS FIXES, ROUND 2 (2026-08-19, independent gate on the round-1
+// fix, PR #1280 head 05ec7229): the round-1 fix replaced the shell `find`
+// with a hand-rolled re-implementation of vitest's discovery (loading
+// test.include via vite's config loader, then globbing it with tinyglobby
+// directly in this script). That re-implementation only modeled
+// `test.include` — it had no idea about `test.exclude`, the `dot` option,
+// `test.root`/`dir`, `includeSource`, a workspace/projects config, a
+// per-invocation project filter, or an include list a plugin resolves at
+// runtime. Any one of those, if vitest.config.ts ever grows it, would make
+// `expected_files` diverge from what vitest actually runs — in EITHER
+// direction: a false failure (this script says N, vitest correctly runs
+// fewer because of an exclude it didn't know about), or a fresh masking gap
+// exactly like round 1's. Re-modeling vitest's resolution is a chase that
+// can never fully catch up to vitest's own resolution rules. The fix is to
+// stop modeling it: ask vitest for the list directly. `vitest list
+// --filesOnly` calls the SAME internal method
+// (`ctx.getRelevantTestSpecifications`) a real `vitest run` uses to decide
+// which files to run, so whatever test.include/exclude/dot/root/projects/
+// plugin-resolved config vitest.config.ts carries, this script's expected
+// set is exact by construction — there is no second implementation of
+// discovery left to drift.
 //
-// FAILURE MODE: this script computing 0 (a missing/misconfigured include)
-// would make Gate 2b pass vacuously no matter how many test files vitest
-// actually drops — see the explicit refusal below.
+// FAILURE MODE: an empty or malformed result here would make Gate 2b pass
+// vacuously no matter how many test files vitest actually drops — see the
+// explicit refusals below, both for a vitest exit failure and for an
+// unparseable/malformed/duplicated file list.
 
-import { loadConfigFromFile } from "vite";
-import { globSync } from "tinyglobby";
+import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
-const defaultConfigPath = resolve(scriptDir, "..", "vitest.config.ts");
+const defaultServerRoot = resolve(scriptDir, "..");
 
 /**
- * Resolves the set of test files vitest.config.ts's `test.include` globs
- * match on disk, using the same glob library vitest uses to discover them.
- *
- * @param {string} configPath absolute path to a vitest config file.
- * @returns {Promise<{ root: string, include: string[], files: string[] }>}
+ * Locates vitest's CLI entry point via real Node module resolution (its
+ * package.json `bin` field), not a hand-picked `node_modules/.bin/vitest`
+ * path — this works regardless of hoisting/monorepo layout and fails with a
+ * real, legible ERR_MODULE_NOT_FOUND if vitest is not installed, rather than
+ * a "file not found" on a path we guessed.
  */
-export async function countVitestTestFiles(configPath = defaultConfigPath) {
-  const absoluteConfigPath = resolve(configPath);
-  const root = dirname(absoluteConfigPath);
+function resolveVitestEntry() {
+  const pkgUrl = import.meta.resolve("vitest/package.json");
+  const pkg = JSON.parse(readFileSync(fileURLToPath(pkgUrl), "utf8"));
+  const binRelative = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.vitest;
+  if (!binRelative) {
+    throw new Error(
+      `vitest's package.json has no "vitest" bin entry (got: ${JSON.stringify(pkg.bin)}). ` +
+        "Is the installed vitest version compatible with this script (built against vitest@4)?",
+    );
+  }
+  return fileURLToPath(new URL(binRelative, pkgUrl));
+}
 
-  const loaded = await loadConfigFromFile(
-    { command: "serve", mode: "test" },
-    absoluteConfigPath,
-    root,
+/**
+ * Asks vitest itself which test files it would run under `serverRoot`.
+ *
+ * @param {string} serverRoot absolute path to the vitest project root (the
+ *   directory containing vitest.config.ts).
+ * @returns {string[]} absolute, deduplicated, sorted test file paths.
+ */
+export function listVitestTestFiles(serverRoot = defaultServerRoot) {
+  const vitestEntry = resolveVitestEntry();
+
+  const result = spawnSync(
+    process.execPath,
+    [vitestEntry, "list", "--filesOnly", "--json", "--root", serverRoot],
+    { cwd: serverRoot, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
   );
-  if (!loaded) {
-    throw new Error(`Unable to load vitest config at ${absoluteConfigPath}`);
+
+  if (result.error) {
+    // FAILURE MODE: a spawn-level failure (e.g. node itself could not be
+    // launched). Never swallow this into an empty file list.
+    throw new Error(`Failed to spawn vitest for file discovery: ${result.error.message}`);
   }
 
-  const include = loaded.config?.test?.include;
-  if (!Array.isArray(include) || include.length === 0) {
-    // See the FAILURE MODE note at the top of this file: an empty/missing
-    // include here must be a hard error, never a silent expected_files=0.
+  if (result.status !== 0) {
+    // FAILURE MODE: vitest failed before it could report a file list — a
+    // broken vitest.config.ts, a throwing plugin, or (flagged during review
+    // of this script, though not reproduced in every environment: vitest's
+    // "native" config loader path does not always need this) an EPERM
+    // writing the bundled-config temp file vitest's default "bundle"
+    // configLoader creates under node_modules/.vite-temp when node_modules
+    // is read-only. Whatever the cause, fail closed with vitest's real
+    // stderr attached instead of reporting zero expected files.
+    const stderrTail = (result.stderr || "").trim().split("\n").slice(-25).join("\n");
     throw new Error(
-      `test.include in ${absoluteConfigPath} is missing or empty ` +
-        `(got: ${JSON.stringify(include)}). Refusing to compute an expected ` +
-        "file count of 0 — the silent-drop gate would pass vacuously.",
+      `vitest list --filesOnly exited ${result.status} — could not discover test files. ` +
+        "This is usually a vitest.config.ts load failure: check for a read-only " +
+        "node_modules (the default config loader needs write access under " +
+        `node_modules/.vite-temp) or a config/plugin error. stderr:\n${stderrTail}`,
     );
   }
 
-  const files = new Set();
-  for (const pattern of include) {
-    const matches = globSync(pattern, {
-      cwd: root,
-      ignore: ["**/node_modules/**"],
-      onlyFiles: true,
-    });
-    for (const match of matches) {
-      files.add(resolve(root, match));
-    }
+  let entries;
+  try {
+    entries = JSON.parse(result.stdout);
+  } catch (err) {
+    throw new Error(`Could not parse 'vitest list --filesOnly --json' output as JSON: ${err.message}`);
+  }
+  if (!Array.isArray(entries)) {
+    throw new Error(`Expected 'vitest list --filesOnly --json' to output a JSON array, got: ${typeof entries}`);
   }
 
-  return { root, include, files: [...files].sort() };
+  const files = entries.map((entry, i) => {
+    if (typeof entry?.file !== "string" || entry.file.length === 0) {
+      throw new Error(
+        `Entry ${i} in 'vitest list --filesOnly --json' output has no string "file" field: ${JSON.stringify(entry)}`,
+      );
+    }
+    return entry.file;
+  });
+
+  const unique = new Set(files);
+  if (unique.size !== files.length) {
+    // FAILURE MODE: a duplicate would silently inflate expected_files, which
+    // could mask a real drop of the same size elsewhere in the count.
+    // Vitest should never report the same file twice; if it does, refuse to
+    // trust the list rather than silently deduplicating past it.
+    throw new Error(
+      `'vitest list --filesOnly --json' reported ${files.length} entries but only ` +
+        `${unique.size} unique file paths — refusing to trust a duplicated list.`,
+    );
+  }
+
+  return [...unique].sort();
 }
 
-async function main() {
+function main() {
   const args = process.argv.slice(2);
   const jsonOutput = args.includes("--json");
-  const configArg = args.find((arg) => !arg.startsWith("--"));
-  const configPath = configArg ? resolve(configArg) : defaultConfigPath;
+  const rootArg = args.find((arg) => !arg.startsWith("--"));
+  const serverRoot = rootArg ? resolve(rootArg) : defaultServerRoot;
 
-  const result = await countVitestTestFiles(configPath);
+  const files = listVitestTestFiles(serverRoot);
 
   if (jsonOutput) {
     console.log(
       JSON.stringify(
-        {
-          root: result.root,
-          include: result.include,
-          count: result.files.length,
-          files: result.files.map((file) => relative(result.root, file)),
-        },
+        { root: serverRoot, count: files.length, files: files.map((f) => relative(serverRoot, f)) },
         null,
         2,
       ),
     );
   } else {
     // Bare count on stdout: `expected_files=$(node scripts/count-vitest-test-files.mjs)`.
-    console.log(result.files.length);
+    console.log(files.length);
   }
 }
 
@@ -129,8 +182,10 @@ const invokedDirectly =
   process.argv[1] &&
   realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
 if (invokedDirectly) {
-  main().catch((err) => {
+  try {
+    main();
+  } catch (err) {
     console.error(err.message);
     process.exit(1);
-  });
+  }
 }

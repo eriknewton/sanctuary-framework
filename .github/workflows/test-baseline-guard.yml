@@ -160,13 +160,24 @@ jobs:
           fi
           echo "✓ No transform/collection errors detected."
 
+      - name: Gate 2b self-test — prove the drop detector before trusting it
+        # A gate that is never itself exercised in CI is an artifact, not a
+        # consumer — this step is what makes scripts/gate2b-self-test.sh a
+        # real gate on scripts/gate2b-check.sh rather than a script that only
+        # ever runs on someone's laptop. Runs BEFORE the real Gate 2b step
+        # below so a broken drop detector fails loudly here, on its own
+        # planted-divergence proof, rather than silently passing (or
+        # silently failing to catch a real drop) in the step that follows.
+        run: scripts/gate2b-self-test.sh
+
       - name: Gate 2b — silent test file drop detection
-        # Logic lives in scripts/gate2b-check.sh (with a self-test at
-        # scripts/gate2b-self-test.sh) rather than inline here, so it can be
-        # driven against a planted-divergence fixture outside Actions. See
-        # that script for the invariant this enforces and why expected_files
-        # is derived from server/vitest.config.ts's test.include globs
-        # instead of a hand-restated shell `find`.
+        # Logic lives in scripts/gate2b-check.sh rather than inline here, so
+        # it can be driven against a planted-divergence fixture outside
+        # Actions (see the self-test step above). expected_files comes from
+        # vitest's OWN file discovery (server/scripts/count-vitest-test-files.mjs,
+        # via `vitest list --filesOnly`) rather than a re-implementation of
+        # test.include/exclude/dot/root/projects resolution, so there is no
+        # second model of vitest.config.ts left to drift out of sync with it.
         run: scripts/gate2b-check.sh /tmp/vitest-output.log
 
       - name: Gate 2c — passing count >= baseline

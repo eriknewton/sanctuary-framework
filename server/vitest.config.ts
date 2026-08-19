@@ -18,15 +18,21 @@ export default defineConfig({
     // probe itself either delete the var locally and point the probe at a
     // loopback server, or inject a stub via RunWrapDeps.
     env: { SANCTUARY_NO_UPDATE_CHECK: "1" },
-    // MUST MATCH: read directly (not copied) by scripts/count-vitest-test-files.mjs,
-    // which feeds CI's silent-test-file-drop detector (Gate 2b in
-    // .github/workflows/test-baseline-guard.yml and .githooks/pre-commit). Both
-    // consumers derive their expected-file count from THIS array via vite's own
-    // config loader, so adding or removing an include root here needs no matching
-    // edit anywhere else — the old shape (a hand-restated `find server/test` in
-    // both places) silently missed the second root below and let up to 14 dropped
-    // files pass undetected. If this array ever again needs a manual mirror
-    // somewhere, that itself is a sign the derivation broke.
+    // CI's silent-test-file-drop detector (Gate 2b in
+    // .github/workflows/test-baseline-guard.yml and .githooks/pre-commit, both
+    // delegating to scripts/gate2b-check.sh) needs its "expected files" count
+    // to track whatever this array (and test.exclude, dot, root, projects, or
+    // any other resolution knob added here later) actually is at any given
+    // moment. It gets that by asking vitest itself — `vitest list --filesOnly`
+    // in server/scripts/count-vitest-test-files.mjs — rather than reading or
+    // modeling this array, so there is nothing here to keep in sync and no
+    // comment pin needed on this side: change this array (add a root, an
+    // exclude, a workspace config) freely, the detector follows automatically.
+    // History: a hand-restated `find server/test` once missed the second root
+    // below and let up to 14 dropped files pass undetected (2026-08-19); the
+    // fix that followed re-modeled this array by hand instead of asking
+    // vitest, which would have silently missed the NEXT config surface added
+    // here too. See that script's header for the full account.
     include: ["test/**/*.test.ts", "../scripts/synthetic-coverage/test/**/*.test.ts"],
     coverage: {
       provider: "v8",
