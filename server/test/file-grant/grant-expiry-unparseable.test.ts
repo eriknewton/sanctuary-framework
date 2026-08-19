@@ -99,32 +99,30 @@ describe("an expiry that cannot be parsed", () => {
     }
   });
 
-  it("OPEN DEFECT FG-EXPIRY-CALENDAR-01: an impossible calendar date is normalised and honoured", () => {
-    // ASSERTS THE CURRENT BEHAVIOUR AND CALLS IT A DEFECT, which is not the
-    // same as endorsing it. An earlier version asserted the same result and
-    // JUSTIFIED it, and the justification answered the wrong question: I argued
-    // that refusing odd spellings buys nothing because a malicious writer can
-    // choose a valid far-future date. The stated threat is CORRUPTION, and this
-    // is DETECTABLE corruption. The shipping mint path always writes
-    // `toISOString()` output, so no legitimate grant carries February 30.
+  it("FG-EXPIRY-CALENDAR-01 (fixed): an impossible calendar date is refused, so the grant expires", () => {
+    // Before the fix, `Date.parse` NORMALISED these instead of refusing them
+    // (`2999-02-30` to March 2, `2026-02-29` to March 1, `2026-04-31` to
+    // May 1), and the far-future one preserved access past the date actually
+    // written. The stated threat is CORRUPTION, and this is DETECTABLE
+    // corruption: the shipping mint path always writes `toISOString()` output,
+    // so no legitimate grant carries February 30.
     //
-    // Executed: `2999-02-30` normalises to March 2, `2026-02-29` to March 1,
-    // `2026-04-31` to May 1. Each preserves access past the date written.
-    //
-    // WHOEVER FIXES THIS FLIPS THESE EXPECTATIONS TO `true`. The check must
-    // compare the written calendar fields against the parsed instant in the
-    // SAME offset; an over-strict version would refuse legitimate grants and
-    // remove their access, which is the destructive direction and the reason
-    // this was not done at the end of a long session.
-    // The defect is narrower than the raw list of impossible dates suggests,
-    // and the difference is worth pinning. Only a date that normalises INTO THE
-    // FUTURE preserves access:
-    expect(isGrantExpired(grantWithExpiry("2999-02-30T00:00:00.000Z"), NOW)).toBe(false);
-
-    // These normalise into the PAST, so they expire correctly and cost nothing.
-    // A fix must not be justified by them.
+    // The shared parser now compares the written calendar fields against the
+    // parsed instant re-rendered in the written offset
+    // (`parseIsoInstantWithOffset`, core/time.ts) and refuses on mismatch,
+    // which routes down the same fail-closed branch as any other unreadable
+    // expiry. All three reproductions now expire, INCLUDING the far-future one
+    // that used to keep its access:
+    expect(isGrantExpired(grantWithExpiry("2999-02-30T00:00:00.000Z"), NOW)).toBe(true);
     expect(isGrantExpired(grantWithExpiry("2026-02-29T00:00:00.000Z"), NOW)).toBe(true);
     expect(isGrantExpired(grantWithExpiry("2026-04-31T00:00:00.000Z"), NOW)).toBe(true);
+
+    // The over-strictness guard, on THIS surface: a legitimate future expiry
+    // whose written day differs from its UTC day must keep its access. The
+    // parser-level must-pass corpus lives in
+    // test/core/time-calendar-validity.test.ts; this one line pins that the
+    // grant surface inherits it.
+    expect(isGrantExpired(grantWithExpiry("2026-08-19T02:00:00+05:30"), NOW)).toBe(false);
   });
 
   it("leaves a standing grant standing, which is spelled null and nothing else", () => {

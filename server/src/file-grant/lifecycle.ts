@@ -122,10 +122,13 @@ export function computeExpiresAt(
  * `expires_at` can write a well-formed far-future value and keep access that
  * way, so refusing non-canonical spellings buys nothing against a writer. What
  * this defends is that a value nobody can READ must not silently mean "never
- * expires". Accordingly an impossible calendar date that the engine normalises
- * (`2999-02-30` becoming March 2) is HONOURED rather than refused: it was read,
- * just written oddly, and refusing it would cost a real grant its access over a
- * two-day normalisation.
+ * expires". An impossible calendar date (`2999-02-30`, which the engine would
+ * normalise to March 2) is in that class and is REFUSED by the shared parser
+ * (FG-EXPIRY-CALENDAR-01): the shipping mint path only ever writes
+ * `toISOString` output, so no legitimate grant carries February 30, and a
+ * record that does is detectable corruption whose normalisation preserved
+ * access past the date actually written. Refusal routes through the same
+ * fail-closed branch as any other unreadable expiry: the grant expires.
  *
  * Deliberately NOT solved by refusing the record at the store's decode. On this
  * branch a `JSON.parse` failure is not caught per record, so the listing aborts
