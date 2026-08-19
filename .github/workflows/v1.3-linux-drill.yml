@@ -22,11 +22,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y nftables libnetfilter-queue-dev libnfnetlink-dev jq
-          sudo modprobe nfnetlink_queue || true
+      # CI-APT-RESILIENCE-01: routed through the shared apt-install-resilient
+      # composite action (bounded, retried apt-get) after the unwrapped
+      # shape of this same command hung for 2.5h-80min across four PRs on
+      # 2026-08-19 in a sibling workflow; see that action's install.sh for
+      # the timeout/retry derivation.
+      - name: Install apt prerequisites
+        uses: ./.github/actions/apt-install-resilient
+        with:
+          packages: nftables libnetfilter-queue-dev libnfnetlink-dev jq
+
+      - name: Load nfnetlink_queue kernel module
+        run: sudo modprobe nfnetlink_queue || true
 
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

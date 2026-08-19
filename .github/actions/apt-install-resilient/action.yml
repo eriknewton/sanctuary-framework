@@ -1,0 +1,35 @@
+name: Resilient apt-get install
+description: >-
+  Runs `apt-get update` + `apt-get install` for the given packages with a
+  bounded per-attempt timeout, a small number of retries with backoff, and
+  apt's own non-interactive / short-network-timeout options, so a stalled
+  package mirror fails this step in minutes instead of hanging until a
+  human or GitHub reaps the runner. See install.sh for the retry/timeout
+  logic and scripts/retry-with-timeout-self-test.sh for the self-test.
+inputs:
+  packages:
+    description: Space-separated apt package names to install.
+    required: true
+runs:
+  using: composite
+  steps:
+    # timeout-minutes=22: a job-level (whole-job) timeout is too coarse for
+    # this — a hung install would then consume the entire remaining job
+    # budget before failing, exactly the "eats hours" problem this action
+    # exists to fix. This step-level timeout is the outer backstop, sized
+    # a couple of minutes above install.sh's own worst case of ~18.6
+    # minutes (two retried phases, each up to 3 attempts * 180s + backoff)
+    # so the inner, attributable `timeout`/retry failure is what normally
+    # fires, and this backstop only trips if something outside that
+    # accounting (process overhead, a wedged sudo prompt, etc.) also goes
+    # wrong.
+    #
+    # Failure mode: if THIS step-level timeout is what fires (the log ends
+    # abruptly with a generic "The action has timed out" instead of one of
+    # install.sh's own attempt/failure lines), something outside the
+    # retry accounting hung — that is itself a signal worth a look, not
+    # just a rerun.
+    - name: apt-get update && install (bounded, retried)
+      shell: bash
+      timeout-minutes: 22
+      run: ${{ github.action_path }}/install.sh ${{ inputs.packages }}
