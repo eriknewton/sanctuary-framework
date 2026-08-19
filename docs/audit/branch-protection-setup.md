@@ -151,54 +151,48 @@ Document any rollback action in `docs/audit/branch-protection-overrides.log` (cr
 
 ---
 
-## 2026-08-19: the recorded floor goes through the same gate as everything else
+## 2026-08-19: the floor mechanism needs nothing from branch protection
 
-The `record-floor` job added on 2026-08-19 (see
-[`test-baseline-hardening-plan.md`](./test-baseline-hardening-plan.md)) has to
-get one line into `.test-baseline` on `main` after every merge. **It does that by
-opening an ordinary pull request, not by pushing.** No ruleset change was needed
-and none was made.
+The test-baseline floor (see
+[`test-baseline-hardening-plan.md`](./test-baseline-hardening-plan.md)) publishes
+`main`'s passing count to an **Actions cache entry** after each push, and pull
+requests read it back as their floor. **Nothing about it touches this runbook's
+subject matter:** no commit, no branch write, no pull request, no ruleset
+interaction, no bypass actor, no deploy key, no app token. The default
+`GITHUB_TOKEN` may write a cache with no permission grant at all, so the guard
+workflow declares `contents: read` and nothing else.
 
-**Why that works here.** Read-only inspection of
-`repos/eriknewton/sanctuary-framework/rulesets` and the repository settings:
+This section exists so nobody re-derives the two shapes that were tried first.
 
-- The `main` ruleset requires a pull request with
-  `required_approving_review_count: 0` and no code-owner requirement.
-- The repository has `allow_auto_merge: true`, `allow_squash_merge: true`, and
-  `delete_branch_on_merge: true`.
+**Considered and rejected: giving a job a bypass so it could push `main`.** A
+ruleset bypass is granted to an *actor* (a GitHub App, a repository role, a team,
+or a deploy key) and applies to the whole ruleset on that branch. It cannot be
+scoped to a path, a file, a workflow, or a job. Even its narrowest form would
+lift the pull-request requirement and the required checks for anything holding
+that token, which is a far larger grant than writing one line.
 
-So a machine-authored change can satisfy the rules exactly as a person's does:
-the recorder pushes a branch, opens a pull request, and enables auto-merge. The
-required checks run on it, it merges itself when they pass, and the branch is
-cleaned up. **The pull-request requirement and every required check stay intact
-for this change too**, which is the property that matters: the recorded floor is
-not a privileged write, it is a normal change that happens to be written by CI.
+**Considered and rejected: having CI open a pull request carrying the count.**
+This needed no bypass, since the `main` ruleset requires a pull request with
+`required_approving_review_count: 0` and the repository has
+`allow_auto_merge: true`. It failed for a different reason: a pull request opened
+with the default `GITHUB_TOKEN` has its workflow runs created in an
+**approval-required** state, so the pull request shows "Approve workflows to run"
+and waits for a maintainer click rather than merging itself. A recorder that
+needs a human click per merge is not automation, and the fixed-branch version of
+it was also not convergent when two merges landed close together.
 
-**Considered and rejected: giving the job a bypass.** A ruleset bypass is granted
-to an *actor* (a GitHub App, a repository role, a team, or a deploy key) and
-applies to the whole ruleset on that branch. It cannot be scoped to a path, a
-file, a workflow, or a job. The narrowest version of it would still lift the
-pull-request requirement and the required checks for anything holding that token,
-which is a much larger grant than "write one line". The pull-request route needs
-none of it, so the bypass routes (Actions app, deploy key, personal token) were
-all dropped rather than ranked.
+Publishing a number to a cache needs no write anywhere, which is why it survives
+where both of those did not.
 
-**One constraint to confirm before relying on this.** A pull request opened with
-the default `GITHUB_TOKEN` does not itself start new workflow runs; that is
-GitHub's guard against a workflow triggering itself. If the required checks
-therefore never report on the recorded-floor pull request, auto-merge cannot fire
-and the pull request waits. The failure is bounded and alarmed rather than
-silent: the recorder uses one fixed branch, so at most one such pull request
-exists at a time and it always carries the newest count, and the scheduled check
-in `.github/workflows/test-baseline-floor-drift.yml` reports a recorded-floor
-pull request that stays open past its window. Clearing it needs either a token
-whose events start workflow runs, or one human action on the waiting pull
-request. Nothing about it can silently weaken the gate.
+**Cache scope, verified rather than assumed**, since the design rests on it: a
+run triggered by `pull_request` restores caches created on the default branch.
+Pull request 1281 restored `node-cache-Linux-x64-npm-7efea387...`, and the caches
+API shows that key under `refs/heads/main`, not under that pull request's own
+ref.
 
-Failure-mode note for whoever looks at a waiting recorded-floor pull request:
-"required checks red" and "required checks never reported" look similar in the
-merge box and have opposite causes. Check whether the check runs exist at all
-before hunting for a test failure.
+Failure-mode note: if the cached entry is missing or unreadable, the gate falls
+back to the committed integer in `.test-baseline` and says so in the job log. The
+gate is never absent; it is sometimes older, and it tells you when it is.
 
 ---
 

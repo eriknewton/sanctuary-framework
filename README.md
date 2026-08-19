@@ -386,7 +386,7 @@ Total hook runtime: approximately 21 seconds on a modern Mac. Emergency bypass: 
 
 The same two gates run in CI via [`.github/workflows/test-baseline-guard.yml`](.github/workflows/test-baseline-guard.yml) on every PR and push to main. See [`docs/audit/branch-protection-setup.md`](docs/audit/branch-protection-setup.md) for the branch-protection runbook that makes the CI check a hard merge gate.
 
-You never need to edit `.test-baseline` yourself. A pull request that adds tests simply counts higher than the floor and passes; after it merges, a job in the same workflow opens a one-line pull request recording the observed count, which merges itself once the usual checks pass. The one exception is a deliberate removal of platform-agnostic tests, which lowers the floor by hand in an explicitly scoped commit with a written justification. Background: [`docs/audit/test-baseline-hardening-plan.md`](docs/audit/test-baseline-hardening-plan.md).
+You never need to edit `.test-baseline` yourself. CI publishes the passing count from `main` after each push, and a pull request is held to that published number, so a change that adds tests simply counts higher and passes. `.test-baseline` is the fallback floor used when no published count is available, and the job log always says which of the two it used. The one reason to edit it by hand is a deliberate removal of platform-agnostic tests, in an explicitly scoped commit with a written justification. Background: [`docs/audit/test-baseline-hardening-plan.md`](docs/audit/test-baseline-hardening-plan.md).
 
 ---
 

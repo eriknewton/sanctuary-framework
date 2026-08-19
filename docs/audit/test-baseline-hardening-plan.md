@@ -242,56 +242,61 @@ that teaches nothing and catches nothing.
 
 | Where | What runs | Authority |
 |---|---|---|
-| On a pull request | The observed passing count must not be **below** the recorded floor, plus the unchanged gates: the suite executed, no transform or collection error, no silent test-file drop, zero failures. A count above the floor passes normally. | read-only |
-| On `main`, after a merge | The `record-floor` job proposes the observed count as an ordinary one-line pull request from a fixed branch, with auto-merge enabled. | no elevated authority; the same required checks as any change |
+| On a pull request | The observed passing count must not be **below** the floor in force, plus the unchanged gates: the suite executed, no transform or collection error, no silent test-file drop, zero failures. A count above the floor passes normally. | read-only |
+| On a push to `main` | After the suite runs, the observed count is published to an Actions cache entry scoped to the default branch. No commit, no branch write, no pull request, no ruleset interaction. | none beyond the default token |
 
-The regression property is unchanged: a change that reduces the passing count
-still fails on the pull request, before merge. The staleness objection the old
-rule answered by demanding an in-pull-request bump is answered structurally
-instead, because the floor is rewritten after every merge and is at most one
-merge behind reality.
+The floor in force is the published count when a cached entry is available, and
+the committed integer in `.test-baseline` otherwise. That file stays in the tree
+as a slow-moving fallback floor which humans update rarely, and it is never
+silently preferred: when it is in use the job log says so. A cached count can
+only ever RAISE the floor, so an evicted, truncated, stale, or out-of-order entry
+fails towards the stricter number rather than weakening one a human committed.
 
-Decision logic for both sides lives in `scripts/test-baseline-floor.sh` and is
-exercised by `scripts/test-baseline-floor-self-test.sh`, which the guard workflow
-runs before it installs anything. An earlier attempt put the same decisions in
-workflow steps, where the only way to exercise a branch was to merge it and
-watch.
+**The mechanism holds no write authority at all.** It needs no ruleset bypass, no
+deploy key, no app token, and no elevated actor, because a count travelling
+through the Actions cache is not a change to the repository. Cache scope,
+verified in this repository rather than assumed: a run triggered by
+`pull_request` restores caches created on the default branch. Pull request 1281
+restored `node-cache-Linux-x64-npm-7efea387...`, a key that exists under
+`refs/heads/main` and not under that pull request's own ref.
 
-**The recorded floor is not a privileged write.** The recorder does not push to
-`main`. The `main` ruleset requires a pull request with zero approving reviews
-and the repository allows auto-merge, so CI can satisfy the rules the same way a
-person does: push a branch, open a pull request, let it merge itself when the
-required checks pass. No bypass actor, no deploy key, no app token, and the
-pull-request requirement plus every required check stay intact for this change
-too. The branch name is fixed rather than per-count, so two merges in quick
-succession converge on the later count instead of opening competing pull
-requests. Detail, including the bypass routes that were considered and dropped:
-[`branch-protection-setup.md`](./branch-protection-setup.md).
+**THE HONEST BOUND, and it replaces an earlier claim that was not one.** A pull
+request fails when its count is below the floor in force. While a floor is stale
+by D, a change can delete up to D passing tests and still pass. Publishing
+happens on every push to `main`, so D is normally zero once that run completes,
+but it is not zero by construction. Earlier drafts of this document said the
+regression property was "unchanged" and that the floor was "at most one merge
+behind". Neither is honest if publishing can fail, and both have been removed.
+
+Decision logic lives in `scripts/test-baseline-floor.sh` and is exercised by
+`scripts/test-baseline-floor-self-test.sh`, which the guard workflow runs before
+it installs anything. An earlier attempt put the same decisions in workflow
+steps, where the only way to exercise a branch was to merge it and watch.
+
+**Two shapes were built and discarded before this one**, and both are worth
+recording because each failed for a reason the next design had to answer. Having
+CI write the integer to the pull request's own branch put a privileged write
+downstream of code the proposer controls. Having CI open a pull request carrying
+the integer removed that, but a pull request opened with the default token has
+its workflow runs held for maintainer approval, so it waited rather than merging,
+and a fixed-branch recorder was not convergent under the default concurrency
+behaviour. Publishing a number to a cache needs no write at all, which is why it
+survives where those did not.
 
 **Failure mode, and the reason it needs its own alarm.** The new failure is
-permissive rather than restrictive: if the recorder fails, never runs, or opens a
-pull request that never merges, the floor stays low and the pull-request gate
-quietly asserts less than it should.
-From a pull request's point of view a stale floor looks exactly like a healthy
-one: the check passes, in the same colour, with the same message. Two alarms sit
-outside that path. The recorder failing reds a push to `main`, which is immediate
-and visible. The scheduled backstop at
-`.github/workflows/test-baseline-floor-drift.yml` runs the suite on `main`,
-compares the fresh count against the recorded floor, and fails when a mismatch
-has outlived its window. It also reports a recorded-floor pull request that has
-stayed open past that window, since an unmerged one is a stale floor wearing a
-different hat: it looks healthier, because there is a visible pull request, and
-it has exactly the same effect on every other pull request. That backstop proves the floor matched a count on one
-day and says nothing about the days between runs, which is why the recorder's own
-red is the primary signal and this is the second.
+permissive rather than restrictive: if publishing fails or never runs, the floor
+in force falls back to the committed integer, which is older, and the gate then
+asserts less than it should. It still asserts something, and it says which floor
+it used, which is the difference between this and a silent weakening.
 
-**The deliberate-lowering path is unchanged and still human.** Removing
-platform-agnostic tests on purpose goes through an explicitly scoped commit with
-a written justification. It is now the only reason `.test-baseline` appears in a
-pull request diff at all, so its appearance is a review signal rather than
-routine noise, and the guard annunciates it in the check output. After the merge
-the recorder writes what the suite counted, so a reviewed reduction lands as a
-normal recorded floor.
+**The deliberate-lowering path is still human.** Removing platform-agnostic tests
+on purpose goes through an explicitly scoped commit with a written justification
+that lowers `.test-baseline`. Because a cached count never lowers the floor, a
+deliberate reduction also needs the published entry cleared before it takes
+effect (`gh cache delete` on the `baseline-floor-main-count-` entry); after the
+merge, the default branch's next run publishes the true lower count. That is a
+rare, explicit maintainer action by design, and it is the property that matters:
+nothing a pull request contains can lower the floor on its own.
 
 **The residual, stated because it is not closed.** A count is not an inventory. A
 change that removes N real tests and adds N trivial ones passes both the old rule

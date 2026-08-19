@@ -10,7 +10,7 @@
 #
 # Every case below is a decision the floor mechanism makes in CI. The point of
 # the file is that those decisions are exercisable without merging a branch and
-# watching main, which is how the previous attempt at this mechanism had to be
+# watching main, which is how earlier versions of this mechanism had to be
 # tested.
 
 set -euo pipefail
@@ -19,9 +19,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FLOOR_SCRIPT="$SCRIPT_DIR/test-baseline-floor.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 GUARD_WORKFLOW="$REPO_ROOT/.github/workflows/test-baseline-guard.yml"
+DRIFT_WORKFLOW="$REPO_ROOT/.github/workflows/test-baseline-floor-drift.yml"
 
 # Real vitest summary output, ANSI-free, captured from a run of this repo's
-# suite with NO_COLOR=1 (the same environment the workflow sets). The parser is
+# suite with NO_COLOR=1 (the same environment the workflows set). The parser is
 # tested against vitest's actual formatting rather than a hand-written
 # approximation of it, because a summary-format change is exactly the drift that
 # would make the parser silently stop matching.
@@ -59,6 +60,16 @@ assert_status() {
   [[ "$actual" == "$expected" ]] || fail "expected exit $expected, got $actual
 stdout:
 $(cat "$root/stdout.log")
+stderr:
+$(cat "$root/stderr.log")"
+}
+
+assert_stdout_is() {
+  local root="$1"
+  local expected="$2"
+  local actual
+  actual="$(cat "$root/stdout.log")"
+  [[ "$actual" == "$expected" ]] || fail "stdout was '$actual', expected exactly '$expected'
 stderr:
 $(cat "$root/stderr.log")"
 }
@@ -124,32 +135,26 @@ case_below_floor_fails() {
 
 case_equal_to_floor_passes() {
   local root="$1"
-  write_vitest_log "$root"
-  printf '%s\n' "$VITEST_LOG_COUNT" > "$root/.test-baseline"
   run_floor "$root" assert-not-below "$VITEST_LOG_COUNT" "$VITEST_LOG_COUNT"
   assert_status "$root" 0
-  assert_stdout_contains "$root" "exactly at the recorded floor"
-  assert_file_equals "$root/.test-baseline" "$VITEST_LOG_COUNT"
+  assert_stdout_contains "$root" "exactly at the floor in force"
 }
 
-# Above the floor is the ordinary resting state under this design: a pull
-# request that adds tests counts higher than the floor main recorded, and it
+# Above the floor is the ordinary resting state under this design: a change that
+# adds tests counts higher than the floor the default branch published, and it
 # passes without anyone typing the new number. Under the previous rule this same
-# state was a hard failure demanding an integer computed on a platform the
-# author cannot run, which is what made three of three pull requests on
-# 2026-08-19 guess it wrong.
+# state was a hard failure demanding an integer computed on a platform the author
+# cannot run, which is what made three of three pull requests on 2026-08-19 guess
+# it wrong.
 case_above_floor_passes_and_writes_nothing() {
   local root="$1"
-  write_vitest_log "$root"
   printf '%s\n' "$((VITEST_LOG_COUNT - 1))" > "$root/.test-baseline"
   local before
   before="$(cat "$root/.test-baseline")"
 
   run_floor "$root" assert-not-below "$((VITEST_LOG_COUNT - 1))" "$VITEST_LOG_COUNT"
   assert_status "$root" 0
-  assert_stdout_contains "$root" "above the recorded floor"
-  # The whole point of the redesign: no write is attempted on the pull-request
-  # side, so the file is byte-identical after the gate ran.
+  assert_stdout_contains "$root" "above the floor in force"
   [[ "$(cat "$root/.test-baseline")" == "$before" ]] \
     || fail "the pull-request gate modified .test-baseline"
 }
@@ -190,164 +195,153 @@ case_unparseable_suite_output_refuses() {
   assert_stderr_contains "$root" "Refusing rather than assuming zero regression"
 }
 
-# ── The recording decision on main ──────────────────────────────────────────
+# ── Choosing the floor in force ─────────────────────────────────────────────
 
-case_record_decision_records_when_different() {
+# The ordinary path: the default branch published a count above the slow-moving
+# committed fallback, so that count is the floor.
+case_cache_hit_above_fallback_wins() {
   local root="$1"
-  run_floor "$root" record-decision 100 137
+  run_floor "$root" effective-floor 14000 14338
   assert_status "$root" 0
-  assert_stdout_contains "$root" "record: 100 -> 137"
+  assert_stdout_is "$root" 14338
+  assert_stderr_contains "$root" "CACHED-FLOOR-IN-FORCE"
 }
 
-case_record_decision_no_action_when_correct() {
+case_cache_hit_equal_to_fallback() {
   local root="$1"
-  run_floor "$root" record-decision 137 137
-  assert_status "$root" 10
-  assert_stdout_contains "$root" "already 137"
-}
-
-# The floor already being correct must produce no commit at all. Writing the
-# same bytes back would produce an empty commit or a no-op push on every merge,
-# which is noise that trains a reader to ignore the one commit that matters.
-case_record_already_correct_leaves_file_untouched() {
-  local root="$1"
-  printf '137\n' > "$root/.test-baseline"
-  local before_hash
-  before_hash="$(cksum < "$root/.test-baseline")"
-  run_floor "$root" record .test-baseline 137
-  assert_status "$root" 10
-  assert_stdout_contains "$root" "not writing"
-  [[ "$(cksum < "$root/.test-baseline")" == "$before_hash" ]] \
-    || fail "record rewrote a floor that was already correct"
-}
-
-case_record_writes_when_different() {
-  local root="$1"
-  printf '100\n' > "$root/.test-baseline"
-  run_floor "$root" record .test-baseline 137
+  run_floor "$root" effective-floor 14338 14338
   assert_status "$root" 0
-  assert_file_equals "$root/.test-baseline" 137
+  assert_stdout_is "$root" 14338
+  assert_stderr_contains "$root" "CACHED-FLOOR-IN-FORCE"
 }
 
-# A deliberate, reviewed test removal lands as a LOWER recorded floor. The
-# recorder describes main rather than arguing with it; the argument happened in
-# the pull request that removed the tests.
-case_record_accepts_a_deliberate_lowering() {
+# A missing cache entry is expected, not exceptional: a first run, an evicted
+# entry, a restricted fork pull request. It must route to the committed fallback
+# AND say so. A fallback preferred quietly is indistinguishable from a healthy
+# cached floor and asserts less, which is the exact failure this design is trying
+# not to reintroduce.
+case_cache_miss_falls_back_and_says_so() {
   local root="$1"
-  printf '137\n' > "$root/.test-baseline"
-  run_floor "$root" record .test-baseline 120
+  run_floor "$root" effective-floor 14338 ""
   assert_status "$root" 0
-  assert_file_equals "$root/.test-baseline" 120
+  assert_stdout_is "$root" 14338
+  assert_stderr_contains "$root" "FALLBACK-IN-FORCE"
+  assert_stderr_contains "$root" "no cached count from the default branch was available"
 }
 
-# ── Context guards on the recorder ──────────────────────────────────────────
-
-case_record_refuses_off_main() {
+# An unreadable entry is more alarming than a missing one, and the message says
+# which it was. Both are safe; only one means something wrote a cache this gate
+# cannot parse.
+case_cache_unreadable_falls_back_and_says_which() {
   local root="$1"
-  run_floor "$root" guard-record-context refs/heads/feature/some-branch "feat: something"
+  run_floor "$root" effective-floor 14338 "not-a-number"
+  assert_status "$root" 0
+  assert_stdout_is "$root" 14338
+  assert_stderr_contains "$root" "present but unreadable"
+}
+
+# THE PROOF THAT A LOW CACHE CANNOT WEAKEN THE COMMITTED FLOOR. The cache is
+# written by CI and reviewed by nobody, so an evicted, truncated, stale, or
+# out-of-order entry must never lower a number a human committed on purpose.
+case_cache_below_fallback_does_not_weaken_it() {
+  local root="$1"
+  run_floor "$root" effective-floor 14338 9000
+  assert_status "$root" 0
+  assert_stdout_is "$root" 14338
+  assert_stderr_contains "$root" "COMMITTED-FLOOR-IN-FORCE"
+  assert_stderr_contains "$root" "never lowers the floor"
+}
+
+# The same fact, carried all the way to a verdict, because "the higher number is
+# printed" is not the same claim as "the gate actually reds". A change counting
+# between the low cached value and the committed fallback would pass if the
+# cached value won, and must fail because it does not.
+case_cache_below_fallback_still_reds_the_gate() {
+  local root="$1"
+  run_floor "$root" effective-floor 14338 9000
+  assert_status "$root" 0
+  local floor
+  floor="$(cat "$root/stdout.log")"
+  run_floor "$root" assert-not-below "$floor" 10000
   assert_status "$root" 1
-  assert_stderr_contains "$root" "recorded on refs/heads/main only"
+  assert_stderr_contains "$root" "Missing 4338 tests"
 }
 
-# The loop bound. The subject the recorder REFUSES is generated by the same
-# subcommand that produces the subject it WRITES, so the two cannot drift into a
-# recorder that does not recognize its own commits and pushes forever.
-case_record_refuses_its_own_commit() {
-  local root="$1"
-  run_floor "$root" commit-subject 14338
-  assert_status "$root" 0
-  local subject
-  subject="$(cat "$root/stdout.log")"
-  [[ "$subject" == "chore(ci): record .test-baseline 14338 after merge" ]] \
-    || fail "commit-subject produced an unexpected subject: '$subject'"
+# ── Deciding whether to publish ─────────────────────────────────────────────
 
-  run_floor "$root" guard-record-context refs/heads/main "$subject"
+case_publish_on_main_at_the_tip() {
+  local root="$1"
+  run_floor "$root" publish-decision refs/heads/main aaaa1111 aaaa1111
+  assert_status "$root" 0
+  assert_stdout_contains "$root" "publishing the observed count"
+}
+
+case_publish_declines_off_the_default_branch() {
+  local root="$1"
+  run_floor "$root" publish-decision refs/heads/feature/x aaaa1111 aaaa1111
   assert_status "$root" 1
-  assert_stderr_contains "$root" "recording again would loop"
+  assert_stderr_contains "$root" "published from refs/heads/main only"
 }
 
-# THE SHAPE THAT ACTUALLY LANDS, and the reason the matcher is not an exact
-# suffix comparison. The recorder proposes its change as a pull request, so its
-# commit reaches main through a squash, and this repository's
-# squash_merge_commit_title is COMMIT_OR_PR_TITLE, which GitHub renders as the
-# title plus ` (#N)`. Verified against real history: pull request 1272's title
-# reaches main as that title plus ` (#1272)`. A guard that recognizes only the
-# pre-merge subject recognizes the one form it never sees, and the recorded floor
-# would then propose another recorded floor on every merge.
-case_squashed_own_subject_is_refused() {
+# Two pushes can finish out of order, and the restore side takes the most
+# recently CREATED entry, so an older run finishing late would otherwise
+# overwrite a newer count with an older one. It declines instead.
+case_publish_declines_when_the_branch_moved() {
   local root="$1"
-  run_floor "$root" commit-subject 14338
-  assert_status "$root" 0
-  local squashed
-  squashed="$(cat "$root/stdout.log") (#1283)"
-
-  run_floor "$root" guard-record-context refs/heads/main "$squashed"
+  run_floor "$root" publish-decision refs/heads/main aaaa1111 bbbb2222
   assert_status "$root" 1
-  assert_stderr_contains "$root" "recording again would loop"
+  assert_stderr_contains "$root" "the newer push publishes its own count"
 }
 
-# The complement, so the wildcard that admits the squashed form has not turned
-# the matcher into something that swallows unrelated subjects. A change whose
-# subject merely mentions the floor file must still record normally.
-case_a_subject_that_only_mentions_the_floor_still_records() {
-  local root="$1"
-  run_floor "$root" guard-record-context refs/heads/main "fix(ci): read .test-baseline through one parser (#1290)"
-  assert_status "$root" 0
-  assert_stdout_contains "$root" "recording is permitted"
-}
+# ── The scheduled fallback-decay backstop ───────────────────────────────────
 
-# The arithmetic bound, stated as its own case because it is the one that holds
-# even if every subject matcher were deleted. When the recorded-floor pull
-# request merges, main carries floor == the observed count, so the recorder that
-# runs on that merge has nothing to propose.
-case_no_op_is_the_second_line_of_defence() {
+case_fallback_in_sync() {
   local root="$1"
-  printf '14338\n' > "$root/.test-baseline"
-  # Exactly the state the recorded-floor merge leaves behind.
-  run_floor "$root" record-decision 14338 14338
-  assert_status "$root" 10
-  assert_stdout_contains "$root" "already 14338"
-  run_floor "$root" record .test-baseline 14338
-  assert_status "$root" 10
-  assert_stdout_contains "$root" "not writing"
-  assert_file_equals "$root/.test-baseline" 14338
-}
-
-case_record_permitted_on_main_after_an_ordinary_merge() {
-  local root="$1"
-  run_floor "$root" guard-record-context refs/heads/main "feat(state): something real (#1234)"
-  assert_status "$root" 0
-  assert_stdout_contains "$root" "recording is permitted"
-}
-
-# ── The scheduled drift backstop ────────────────────────────────────────────
-
-case_drift_in_sync() {
-  local root="$1"
-  run_floor "$root" drift-verdict 137 137 999999 3600
+  run_floor "$root" fallback-drift-verdict 14338 14338 999999 604800 250
   assert_status "$root" 0
   assert_stdout_contains "$root" "IN-SYNC"
 }
 
-case_drift_within_window_is_not_reported() {
+# The fallback sitting ABOVE a fresh count is unconditionally news: every pull
+# request that falls back to it reds with a regression that is not one.
+case_fallback_above_fresh_count_reports() {
   local root="$1"
-  run_floor "$root" drift-verdict 137 140 60 3600
-  assert_status "$root" 0
-  assert_stdout_contains "$root" "DRIFT-WITHIN-WINDOW"
-}
-
-case_drift_past_window_reports() {
-  local root="$1"
-  run_floor "$root" drift-verdict 137 140 7200 3600
+  run_floor "$root" fallback-drift-verdict 14338 14000 0 604800 250
   assert_status "$root" 1
-  assert_stderr_contains "$root" "has been stale"
-  assert_stderr_contains "$root" "indistinguishable from a healthy one"
+  assert_stderr_contains "$root" "is ABOVE a fresh count"
 }
 
-# Drift age is measured from the first commit AFTER the floor's last change, so
-# a busy branch cannot keep persistent drift permanently inside the grace
-# window by continuously producing young commits.
-case_drift_age_measures_from_the_first_unrecorded_commit() {
+# The fallback is meant to lag. A small gap is not news at any age.
+case_small_gap_is_tolerated_even_when_old() {
+  local root="$1"
+  run_floor "$root" fallback-drift-verdict 14338 14400 999999 604800 250
+  assert_status "$root" 0
+  assert_stdout_contains "$root" "FALLBACK-LAGGING-ACCEPTABLY"
+}
+
+# Nor is a large gap that is still fresh: the fallback was updated recently and
+# main has simply gained tests since.
+case_large_gap_is_tolerated_while_young() {
+  local root="$1"
+  run_floor "$root" fallback-drift-verdict 14338 20000 60 604800 250
+  assert_status "$root" 0
+  assert_stdout_contains "$root" "FALLBACK-LAGGING-ACCEPTABLY"
+}
+
+# Large AND old together is decay: on a day the cached floor is unavailable,
+# this is the number every pull request would be held to.
+case_large_and_old_gap_reports() {
+  local root="$1"
+  run_floor "$root" fallback-drift-verdict 14338 20000 999999 604800 250
+  assert_status "$root" 1
+  assert_stderr_contains "$root" "has decayed"
+  assert_stderr_contains "$root" "would let 5662 deletions through"
+}
+
+# Fallback age is measured from the first commit AFTER its last change, so a busy
+# branch cannot keep a permanently stale fallback inside any grace window by
+# continuously producing young commits.
+case_fallback_age_measures_from_the_first_later_commit() {
   local root="$1"
   git -C "$root" init --quiet
   git -C "$root" config --local user.email test@example.com
@@ -355,19 +349,17 @@ case_drift_age_measures_from_the_first_unrecorded_commit() {
 
   printf '100\n' > "$root/.test-baseline"
   git -C "$root" add .test-baseline
-  git -C "$root" commit --quiet --no-verify -m "record the floor"
+  git -C "$root" commit --quiet --no-verify -m "set the fallback"
 
   run_floor "$root" drift-age-seconds .test-baseline
   assert_status "$root" 0
   [[ "$(cat "$root/stdout.log")" == "0" ]] \
-    || fail "a floor that is the newest change should report zero drift age, got $(cat "$root/stdout.log")"
+    || fail "a fallback that is the newest change should report zero age, got $(cat "$root/stdout.log")"
 
-  # Two commits land after the floor. The FIRST of them dates the drift; the
-  # second is newer and must not reset the clock.
   printf 'one\n' > "$root/other.txt"
   git -C "$root" add other.txt
   GIT_COMMITTER_DATE="@$(( $(date -u +%s) - 7200 )) +0000" \
-    git -C "$root" commit --quiet --no-verify --date "@$(( $(date -u +%s) - 7200 )) +0000" -m "first commit after the floor"
+    git -C "$root" commit --quiet --no-verify --date "@$(( $(date -u +%s) - 7200 )) +0000" -m "first commit after the fallback"
   printf 'two\n' > "$root/other.txt"
   git -C "$root" add other.txt
   git -C "$root" commit --quiet --no-verify -m "a much newer commit"
@@ -376,116 +368,77 @@ case_drift_age_measures_from_the_first_unrecorded_commit() {
   assert_status "$root" 0
   local age
   age="$(cat "$root/stdout.log")"
-  (( age >= 7000 )) || fail "drift age reset to the newest commit: got ${age}s, expected roughly 7200s"
+  (( age >= 7000 )) || fail "fallback age reset to the newest commit: got ${age}s, expected roughly 7200s"
 }
 
-# ── The stale recorded-floor pull request ───────────────────────────────────
+# ── Cross-file pins ─────────────────────────────────────────────────────────
 
-case_no_open_record_pr_is_fine() {
+# INVARIANT this case pins: the floor mechanism holds NO write authority. The
+# count travels through the Actions cache, which the default token may write with
+# no permission grant, so any `write` permission appearing in this workflow means
+# something has been added that needs one, and that is the whole class of
+# question this design exists to avoid.
+case_the_guard_workflow_grants_no_write() {
   local root="$1"
-  run_floor "$root" record-pr-verdict 0 0 3600
-  assert_status "$root" 0
-  assert_stdout_contains "$root" "NO-OPEN-RECORD-PR"
-}
-
-case_young_open_record_pr_is_not_reported() {
-  local root="$1"
-  run_floor "$root" record-pr-verdict 1 60 3600
-  assert_status "$root" 0
-  assert_stdout_contains "$root" "OPEN-RECORD-PR-WITHIN-WINDOW"
-}
-
-# An unmerged recorded-floor pull request is a stale floor that looks healthier
-# than one, which is exactly why it needs an alarm of its own.
-case_old_open_record_pr_is_reported() {
-  local root="$1"
-  run_floor "$root" record-pr-verdict 1 7200 3600
-  assert_status "$root" 1
-  assert_stderr_contains "$root" "has been open for 7200s"
-  assert_stderr_contains "$root" "stale floor wearing a different hat"
-}
-
-# ── Cross-file pins: the workflow must keep the write where it belongs ──────
-
-workflow_line_of() {
-  grep -nE "$1" "$GUARD_WORKFLOW" | head -1 | cut -d: -f1
-}
-
-# INVARIANT this case pins: exactly one job in the guard workflow holds a write
-# token, and it is the record-floor job. If a future edit moves `contents: write`
-# up to the workflow level or onto the pull-request job, the pull request's own
-# test code executes with push authority, which is precisely the finding that
-# killed the previous design.
-case_only_the_record_job_can_write() {
-  local root="$1"
-  local write_lines
-  write_lines="$(grep -cE '^[[:space:]]+contents:[[:space:]]*write[[:space:]]*$' "$GUARD_WORKFLOW" || true)"
-  [[ "$write_lines" == "1" ]] \
-    || fail "$GUARD_WORKFLOW declares 'contents: write' $write_lines times; exactly one, inside record-floor, is allowed"
-
-  local record_job_line write_line
-  record_job_line="$(workflow_line_of '^  record-floor:')"
-  write_line="$(workflow_line_of '^[[:space:]]+contents:[[:space:]]*write[[:space:]]*$')"
-  [[ -n "$record_job_line" ]] || fail "$GUARD_WORKFLOW has no record-floor job"
-  (( write_line > record_job_line )) \
-    || fail "'contents: write' at line $write_line sits outside the record-floor job (line $record_job_line)"
-
-  # And every mutating invocation of the floor script sits inside that job too.
-  local mutating_line
-  while IFS=: read -r mutating_line _; do
-    [[ -z "$mutating_line" ]] && continue
-    (( mutating_line > record_job_line )) \
-      || fail "a mutating floor-script call at line $mutating_line sits outside the record-floor job"
-  done < <(grep -nE 'test-baseline-floor\.sh (record|commit-subject)' "$GUARD_WORKFLOW" || true)
-
-  # A no-op read so the fixture root is used and the case shape matches the rest.
+  local writes
+  writes="$(grep -cE '^[[:space:]]*[a-z-]+:[[:space:]]*write[[:space:]]*$|^[[:space:]]*permissions:[[:space:]]*write-all' "$GUARD_WORKFLOW" || true)"
+  [[ "$writes" == "0" ]] \
+    || fail "$GUARD_WORKFLOW declares $writes write permission(s); the floor mechanism needs none"
   [[ -d "$root" ]] || fail "fixture root vanished"
 }
 
-# INVARIANT this case pins: the recorder PROPOSES, it does not push main. The
-# whole no-new-authority argument rests on that one fact, and a future edit that
-# "simplifies" the pull request away into a direct push would restore the need
-# for a ruleset bypass while every test still passed.
-case_the_recorder_never_pushes_main() {
+# The recorder that committed, pushed a branch, and opened a pull request is
+# gone. A future edit that reintroduces any of it also reintroduces the need for
+# authority the cache route does not require.
+case_nothing_commits_pushes_or_opens_a_pull_request() {
   local root="$1"
-  if grep -qE 'git push[^|]*HEAD:main|git push[^|]*origin main' "$GUARD_WORKFLOW"; then
-    fail "$GUARD_WORKFLOW pushes main directly; the recorder must open a pull request instead"
-  fi
-  grep -q 'gh pr create' "$GUARD_WORKFLOW" \
-    || fail "$GUARD_WORKFLOW no longer opens a pull request for the recorded floor"
-  grep -q 'gh pr merge --squash --auto' "$GUARD_WORKFLOW" \
-    || fail "$GUARD_WORKFLOW no longer enables auto-merge on the recorded-floor pull request"
-  [[ -d "$root" ]] || fail "fixture root vanished"
-}
-
-# The recorder's branch name is shared with the drift check's stale-pull-request
-# query. Both must obtain it from `record-branch`; a second literal is how the
-# alarm would end up watching a branch nobody proposes from, and an alarm
-# pointed at the wrong branch reports "all clear" forever.
-case_the_record_branch_is_not_spelled_out_twice() {
-  local root="$1"
-  local drift_workflow="$REPO_ROOT/.github/workflows/test-baseline-floor-drift.yml"
-  local literal
-  for f in "$GUARD_WORKFLOW" "$drift_workflow"; do
-    literal="$(grep -c 'ci/record-baseline' "$f" || true)"
-    [[ "$literal" == "0" ]] \
-      || fail "$f spells the recorded-floor branch out $literal time(s); call record-branch instead"
-    grep -q 'test-baseline-floor\.sh record-branch' "$f" \
-      || fail "$f does not obtain the recorded-floor branch from record-branch"
+  local forbidden
+  for forbidden in 'gh pr create' 'gh pr merge' 'git push' 'git commit' 'record-floor:'; do
+    if grep -Fq "$forbidden" "$GUARD_WORKFLOW"; then
+      fail "$GUARD_WORKFLOW still contains '$forbidden'; the floor is published to a cache, not written to the repository"
+    fi
   done
+  grep -q 'actions/cache/save@' "$GUARD_WORKFLOW" \
+    || fail "$GUARD_WORKFLOW no longer publishes the observed count to a cache"
+  grep -q 'actions/cache/restore@' "$GUARD_WORKFLOW" \
+    || fail "$GUARD_WORKFLOW no longer restores the published count"
   [[ -d "$root" ]] || fail "fixture root vanished"
 }
 
-# The guard workflow and this script must agree on the recorded-floor commit
-# subject. The workflow gets it by calling `commit-subject`; this case pins that
-# it does not spell the subject out a second time, which is how the recognizer
-# and the writer would drift apart.
-case_workflow_does_not_hardcode_the_commit_subject() {
+# The cache key prefix and paths are shared between the publish side, the
+# restore side, and this script. A prefix that agrees on only one side is the
+# worst failure this design has: the restore misses, the fallback quietly takes
+# over, and every check stays green while asserting less.
+case_cache_locations_are_not_spelled_out_in_the_workflow() {
   local root="$1"
-  local hardcoded
-  hardcoded="$(grep -E "chore\(ci\): record" "$GUARD_WORKFLOW" | grep -vc 'commit-subject' || true)"
-  [[ "$hardcoded" == "0" ]] \
-    || fail "the guard workflow hardcodes the recorded-floor commit subject on $hardcoded line(s); call commit-subject instead"
+  local prefix dir
+  run_floor "$root" cache-key-prefix
+  assert_status "$root" 0
+  prefix="$(cat "$root/stdout.log")"
+  run_floor "$root" cache-dir
+  assert_status "$root" 0
+  dir="$(cat "$root/stdout.log")"
+
+  local hits
+  hits="$(grep -cF "$prefix" "$GUARD_WORKFLOW" || true)"
+  [[ "$hits" == "0" ]] \
+    || fail "$GUARD_WORKFLOW spells the cache key prefix out $hits time(s); it must come from cache-key-prefix"
+  hits="$(grep -cF "$dir" "$GUARD_WORKFLOW" || true)"
+  [[ "$hits" == "0" ]] \
+    || fail "$GUARD_WORKFLOW spells the cache directory out $hits time(s); it must come from cache-dir"
+  grep -q 'test-baseline-floor\.sh cache-key-prefix' "$GUARD_WORKFLOW" \
+    || fail "$GUARD_WORKFLOW does not obtain the cache key prefix from the floor script"
+}
+
+# The scheduled backstop watches the committed FALLBACK. If it were repointed at
+# something else, a permanently decayed fallback would go unwatched, and it is
+# the only thing watching it.
+case_the_drift_workflow_watches_the_fallback() {
+  local root="$1"
+  grep -q 'test-baseline-floor\.sh fallback-drift-verdict' "$DRIFT_WORKFLOW" \
+    || fail "$DRIFT_WORKFLOW no longer runs the fallback-decay verdict"
+  grep -q 'read-floor \.test-baseline' "$DRIFT_WORKFLOW" \
+    || fail "$DRIFT_WORKFLOW no longer reads the committed fallback"
   [[ -d "$root" ]] || fail "fixture root vanished"
 }
 
@@ -500,34 +453,31 @@ run_case() {
   echo "PASS: $name"
 }
 
-run_case "a count below the recorded floor reds the pull-request gate" case_below_floor_fails
+run_case "a count below the floor in force reds the pull-request gate" case_below_floor_fails
 run_case "a count equal to the floor passes" case_equal_to_floor_passes
 run_case "a count above the floor passes and writes nothing" case_above_floor_passes_and_writes_nothing
-run_case "a malformed floor is refused, not guessed" case_malformed_floor_refuses
+run_case "a malformed fallback floor is refused, not guessed" case_malformed_floor_refuses
 run_case "a leading-zero floor is refused rather than read as octal" case_leading_zero_floor_refuses
-run_case "a missing floor is refused" case_missing_floor_refuses
+run_case "a missing fallback floor is refused" case_missing_floor_refuses
 run_case "an unparseable suite summary is refused, never read as passing" case_unparseable_suite_output_refuses
-run_case "the recorder records when the count differs" case_record_decision_records_when_different
-run_case "the recorder takes no action when the floor is already correct" case_record_decision_no_action_when_correct
-run_case "an already-correct floor is not rewritten" case_record_already_correct_leaves_file_untouched
-run_case "a differing count is written to the floor" case_record_writes_when_different
-run_case "a deliberate lowering is recorded, not clamped" case_record_accepts_a_deliberate_lowering
-run_case "the recorder refuses to run off main" case_record_refuses_off_main
-run_case "the recorder refuses its own commit, bounding the loop" case_record_refuses_its_own_commit
-run_case "the recorder refuses its own SQUASHED commit, the form that lands" case_squashed_own_subject_is_refused
-run_case "a subject that merely mentions the floor still records" case_a_subject_that_only_mentions_the_floor_still_records
-run_case "an already-correct floor bounds the loop by arithmetic alone" case_no_op_is_the_second_line_of_defence
-run_case "the recorder proceeds on main after an ordinary merge" case_record_permitted_on_main_after_an_ordinary_merge
-run_case "no open recorded-floor pull request is fine" case_no_open_record_pr_is_fine
-run_case "a young open recorded-floor pull request is not reported" case_young_open_record_pr_is_not_reported
-run_case "an old open recorded-floor pull request is reported loudly" case_old_open_record_pr_is_reported
-run_case "the recorder proposes a pull request and never pushes main" case_the_recorder_never_pushes_main
-run_case "the recorded-floor branch is not spelled out twice" case_the_record_branch_is_not_spelled_out_twice
-run_case "drift reports in sync when the floor matches a fresh count" case_drift_in_sync
-run_case "drift younger than the window is not reported" case_drift_within_window_is_not_reported
-run_case "drift older than the window is reported loudly" case_drift_past_window_reports
-run_case "drift age is measured from the first unrecorded commit" case_drift_age_measures_from_the_first_unrecorded_commit
-run_case "only the record-floor job holds a write token" case_only_the_record_job_can_write
-run_case "the workflow does not hardcode the recorded-floor commit subject" case_workflow_does_not_hardcode_the_commit_subject
+run_case "a cached count above the fallback is the floor" case_cache_hit_above_fallback_wins
+run_case "a cached count equal to the fallback is the floor" case_cache_hit_equal_to_fallback
+run_case "a cache miss falls back to the committed floor and says so" case_cache_miss_falls_back_and_says_so
+run_case "an unreadable cache falls back and says which it was" case_cache_unreadable_falls_back_and_says_which
+run_case "a cached count below the fallback never weakens it" case_cache_below_fallback_does_not_weaken_it
+run_case "a cached count below the fallback still reds the gate" case_cache_below_fallback_still_reds_the_gate
+run_case "the default branch at its tip publishes its count" case_publish_on_main_at_the_tip
+run_case "publishing is declined off the default branch" case_publish_declines_off_the_default_branch
+run_case "publishing is declined when the branch moved underneath" case_publish_declines_when_the_branch_moved
+run_case "the fallback in sync with a fresh count is quiet" case_fallback_in_sync
+run_case "a fallback above a fresh count is reported" case_fallback_above_fresh_count_reports
+run_case "a small gap is tolerated even when old" case_small_gap_is_tolerated_even_when_old
+run_case "a large gap is tolerated while young" case_large_gap_is_tolerated_while_young
+run_case "a large and old gap is reported as decay" case_large_and_old_gap_reports
+run_case "fallback age is measured from the first later commit" case_fallback_age_measures_from_the_first_later_commit
+run_case "the guard workflow grants no write permission" case_the_guard_workflow_grants_no_write
+run_case "nothing commits, pushes, or opens a pull request" case_nothing_commits_pushes_or_opens_a_pull_request
+run_case "the cache locations are not spelled out in the workflow" case_cache_locations_are_not_spelled_out_in_the_workflow
+run_case "the scheduled backstop watches the committed fallback" case_the_drift_workflow_watches_the_fallback
 
 echo "PASS: test-baseline-floor self-tests ($PASSED cases)"

@@ -1,28 +1,33 @@
-# Sanctuary recorded-floor drift backstop
+# Sanctuary fallback-floor decay backstop
 #
 # Copyright 2026 Erik Newton
 # SPDX-License-Identifier: Apache-2.0
 #
-# The floor in .test-baseline is recorded on main after every merge by the
-# record-floor job in .github/workflows/test-baseline-guard.yml. This job exists
-# for the one failure that job cannot report on its own: a recorder that never
-# ran at all leaves no failed run for anyone to notice, and the floor then sits
-# stale LOW while the pull-request gate keeps passing in exactly the same colour
-# with exactly the same message. A stale floor is indistinguishable from a
-# healthy floor from a pull request's point of view. That is the whole reason
-# this alarm lives outside the pull-request path.
+# The floor a pull request is held to is normally the count the default branch
+# published to the Actions cache. `.test-baseline` in the tree is the FALLBACK:
+# the floor used when no cached count is available (a first run, an evicted
+# entry, a restricted fork pull request). It is slow-moving by design and humans
+# update it rarely.
 #
-# What it does: runs the suite on main, compares the fresh count against the
-# recorded floor, and fails loudly when a mismatch has outlived its window.
+# A fallback nobody looks at decays. This job watches it, and it is the only
+# thing that does. Two states are news:
 #
-# BOUND, so nobody reads this as more than it is: this job proves the floor
-# matched a count taken on ONE day. It says nothing about the days between runs,
-# and it cannot tell a floor that was never recorded from one that was recorded
-# and then invalidated. The primary alarm remains record-floor failing on a push
-# to main, which is immediate; this is the backstop for its silence.
+#   - the fallback sitting ABOVE a fresh count on the default branch, which
+#     would red every pull request that falls back to it with a regression that
+#     is not one, and
+#   - a gap below a fresh count that is both large and old, which means the
+#     fallback would protect almost nothing on the day the cache is missing.
 #
-# It is deliberately not a required status check and does not gate any merge. It
-# is an alarm, and an alarm that blocks work gets disabled.
+# An ordinary gap is not news. Alarming on every gap would train everyone to
+# ignore this check, and the fallback is meant to lag.
+#
+# BOUND, so nobody reads this as more than it is: this job compares one count
+# taken on one day. It says nothing about the days between runs, and it does not
+# observe the cached floor at all, which is the floor actually in force almost
+# always.
+#
+# It is deliberately not a required status check and gates no merge. It is an
+# alarm, and an alarm that blocks work gets disabled.
 
 name: Test Baseline Floor Drift
 
@@ -36,10 +41,6 @@ on:
 
 permissions:
   contents: read
-  # Read-only, and only so the stale-pull-request check below can see whether a
-  # recorded-floor pull request is sitting unmerged. This job proposes nothing
-  # and merges nothing.
-  pull-requests: read
 
 jobs:
   floor-drift:
@@ -47,11 +48,16 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # The grace window, in hours. Set to half the daily cadence above so drift
-      # that begins immediately after one run is already outside the window by
-      # the next one, while a recorder still in flight (a suite run is minutes,
-      # not hours) is never reported.
-      DRIFT_WINDOW_HOURS: "12"
+      # How long the committed fallback may lag before its gap counts as decay.
+      # A week, because the fallback is a floor of last resort that humans touch
+      # rarely; anything shorter turns this into a weekly chore rather than an
+      # alarm.
+      FALLBACK_MAX_AGE_HOURS: "168"
+      # How far below a fresh count the fallback may sit before its size counts
+      # as decay, independent of age. This is exactly the number of deletions
+      # that would pass unnoticed on a day the cached floor is unavailable, so
+      # it is the quantity worth capping.
+      FALLBACK_MAX_GAP: "250"
 
     steps:
       - name: Checkout main
@@ -111,60 +117,22 @@ jobs:
           npm test 2>&1 | tee /tmp/vitest-output.log
           exit "${PIPESTATUS[0]}"
 
-      - name: Compare the recorded floor against a fresh count
+      - name: Compare the committed fallback against a fresh count
         run: |
-          # 3600 seconds per hour; the window itself is named above.
-          window_seconds=$(( DRIFT_WINDOW_HOURS * 3600 ))
-          floor="$(scripts/test-baseline-floor.sh read-floor .test-baseline)"
+          # 3600 seconds per hour; the window itself is named in env above.
+          max_age_seconds=$(( FALLBACK_MAX_AGE_HOURS * 3600 ))
+          fallback="$(scripts/test-baseline-floor.sh read-floor .test-baseline)"
           observed="$(scripts/test-baseline-floor.sh parse-count /tmp/vitest-output.log)"
           age="$(scripts/test-baseline-floor.sh drift-age-seconds .test-baseline)"
-          echo "Recorded floor: $floor"
-          echo "Fresh count:    $observed"
-          echo "Drift age:      ${age}s (window ${window_seconds}s)"
+          echo "Committed fallback: $fallback"
+          echo "Fresh count:        $observed"
+          echo "Fallback age:       ${age}s (max ${max_age_seconds}s, max gap $FALLBACK_MAX_GAP)"
           set +e
-          verdict="$(scripts/test-baseline-floor.sh drift-verdict "$floor" "$observed" "$age" "$window_seconds" 2>&1)"
+          verdict="$(scripts/test-baseline-floor.sh fallback-drift-verdict "$fallback" "$observed" "$age" "$max_age_seconds" "$FALLBACK_MAX_GAP" 2>&1)"
           status=$?
           set -e
           echo "$verdict"
           if [[ "$status" -ne 0 ]]; then
-            echo "::error::The recorded test baseline floor has drifted and stayed drifted. See the run log for the counts."
-            exit "$status"
-          fi
-
-      # A recorded-floor pull request that never merges has exactly the same
-      # effect as a floor that was never recorded: every other pull request keeps
-      # passing against a number that no longer describes main. It just looks
-      # healthier, because there is a visible pull request. Moving the write
-      # behind a pull request added a link that can fail on its own, so it gets
-      # its own alarm rather than inheriting the previous step's.
-      #
-      # Failure mode note: this is the step that fires if the recorded-floor
-      # pull request's required checks never report at all, which is the known
-      # constraint documented on the record-floor job.
-      - name: Report a recorded-floor pull request that is not merging
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          window_seconds=$(( DRIFT_WINDOW_HOURS * 3600 ))
-          branch="$(scripts/test-baseline-floor.sh record-branch)"
-          created="$(gh pr list --state open --head "$branch" --json createdAt --jq '.[0].createdAt // empty')"
-          if [[ -z "$created" ]]; then
-            open_count=0
-            age=0
-          else
-            open_count="$(gh pr list --state open --head "$branch" --json number --jq 'length')"
-            # `date -d` on an ISO-8601 instant is GNU-only, which is fine on
-            # ubuntu-latest and would silently misparse on a macOS runner.
-            age=$(( $(date -u +%s) - $(date -u -d "$created" +%s) ))
-            if (( age < 0 )); then age=0; fi
-          fi
-          echo "Open recorded-floor pull requests: $open_count (oldest ${age}s, window ${window_seconds}s)"
-          set +e
-          verdict="$(scripts/test-baseline-floor.sh record-pr-verdict "$open_count" "$age" "$window_seconds" 2>&1)"
-          status=$?
-          set -e
-          echo "$verdict"
-          if [[ "$status" -ne 0 ]]; then
-            echo "::error::A recorded-floor pull request has stayed open past its window, which leaves the floor stale."
+            echo "::error::The committed fallback floor needs attention. See the run log for the counts."
             exit "$status"
           fi

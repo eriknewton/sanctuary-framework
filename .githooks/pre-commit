@@ -39,10 +39,11 @@
 #          If vitest's passing-test count falls below the integer
 #          in .test-baseline at repo root, the commit is blocked.
 #          A count ABOVE the floor is the normal resting state and
-#          passes: the floor is recorded on main after a merge by the
-#          record-floor job in
-#          .github/workflows/test-baseline-guard.yml, so a commit that
-#          adds tests owes nobody an integer.
+#          passes: CI publishes the observed count from the default
+#          branch after each push, and a pull request is held to that
+#          published number, so a commit that adds tests owes nobody an
+#          integer. `.test-baseline` is the FALLBACK floor, used when no
+#          published count is available.
 #
 #          WHY THE FAIL-ABOVE DEMAND IS GONE: the floor is the passing
 #          count on Linux CI, which an author on macOS cannot compute.
@@ -234,8 +235,8 @@ fi
 # SKIP_TEST_BASELINE=1 (observed 2026-07-18, PR #965), and a gate that must be
 # bypassed to do ordinary work stops being a gate. A carve-out for commits
 # staging nothing under server/ narrowed that, and the redesign below removes
-# the demand entirely: the floor is now recorded on main after every merge, so
-# nothing local ever needs to state it.
+# the demand entirely: CI publishes the count from the default branch after every
+# push, so nothing local ever needs to state it.
 #
 # The fail-BELOW regression check still blocks unconditionally, on every commit,
 # regardless of what is staged, and the CI guard
@@ -408,8 +409,9 @@ if (( passing < baseline )); then
 fi
 
 # A staged edit to .test-baseline. Under this design nothing routine touches
-# the file: CI records the floor on main after a merge, so an edit here is one
-# of two things, and both want to be seen rather than blocked.
+# the file: it is the FALLBACK floor, used only when no published count is
+# available, and humans update it rarely. So an edit here is one of two things,
+# and both want to be seen rather than blocked.
 #
 #   A DELIBERATE LOWERING. Tests were removed on purpose and the floor is being
 #   brought down to match. That is legitimate, it needs a written justification
@@ -449,8 +451,8 @@ if [[ -n "$baseline_is_staged" ]]; then
     warn "request. Nothing else should ever edit .test-baseline by hand."
   elif (( staged_baseline > baseline )); then
     warn "This commit raises the committed floor from $baseline to $staged_baseline."
-    warn "You do not need to: the record-floor job writes the observed Linux count to"
-    warn ".test-baseline on main after this merges, and will overwrite this value."
+    warn "Usually unnecessary: the floor a pull request is held to is the count CI"
+    warn "published from the default branch, and this file is only the fallback."
   fi
 fi
 
@@ -459,7 +461,7 @@ fi
 # reported, never blocked, and the floor is left alone.
 if (( passing > baseline )); then
   ok "Passing count ($passing) is $((passing - baseline)) above the committed floor ($baseline)."
-  ok "Nothing to do: the floor is recorded on main after this merges."
+  ok "Nothing to do: CI publishes the default branch's count after this merges."
 fi
 
 ok "Gate 2/2: $actual_total test files loaded, $passing tests passed (baseline: $baseline)."

@@ -6,121 +6,96 @@
 #
 # Every decision the test-baseline floor mechanism makes lives here, as a
 # subcommand with an exit code, so the whole mechanism is exercisable without a
-# CI runner. The workflow at .github/workflows/test-baseline-guard.yml and the
-# scheduled drift check at .github/workflows/test-baseline-floor-drift.yml call
-# these subcommands and do the I/O the runner has to do (running the suite,
-# committing, pushing); they contain no comparison of their own.
-#
-# Why the logic is not inline in the YAML: an earlier attempt at this mechanism
-# put its decisions in workflow steps, where the only way to exercise a branch
-# was to merge it and watch. The self-test at
-# scripts/test-baseline-floor-self-test.sh is this file's only reason to be a
-# separate script.
+# CI runner. The workflows call these subcommands and do the I/O a runner has to
+# do (running the suite, reading and writing the cache); they contain no
+# comparison of their own.
 #
 # THE SHAPE OF THE RULE (see AGENTS.md, "Commit discipline"):
 #
-#   On a pull request  the observed passing count must not be BELOW the floor
-#                      committed at the repo root. A count above the floor is
-#                      normal and passes. Nothing writes the floor.
-#   On main, on push   the observed count is RECORDED when it differs, by the
-#                      CI actor, one file, one line. The recorder does NOT push
-#                      to main: it proposes the change as an ordinary pull
-#                      request from a fixed branch and lets auto-merge land it
-#                      once the required checks pass. So the recorded floor goes
-#                      through exactly the same gate as every other change, and
-#                      the mechanism needs no bypass, no elevated actor, and no
-#                      relaxation of the branch rules.
+#   On main, on push   after the suite runs, the observed passing count is
+#                      PUBLISHED to an Actions cache entry scoped to the default
+#                      branch. Nothing is committed, no branch is written, no
+#                      pull request is opened, and the default token is the only
+#                      credential involved.
+#   On a pull request  the cached count is RESTORED and used as the floor. The
+#                      observed count must not be BELOW it. A count above it is
+#                      normal and passes.
+#   When there is no   the committed integer in .test-baseline is used instead,
+#   usable cache       loudly. That file stays in the tree as a slow-moving
+#                      fallback floor that humans update rarely.
+#
+# THE HONEST BOUND, stated here because the docs must not overclaim it: a pull
+# request fails when its count is below THE FLOOR IN FORCE. The floor in force is
+# main's most recent completed CI count when a cache entry is available, and the
+# committed fallback otherwise. While a floor is stale by D, a change can delete
+# up to D passing tests and still pass. Publishing happens on every push to main,
+# so D is normally zero once main's run completes, but it is not zero by
+# construction and must never be described as if it were.
 #
 # Exit codes, uniform across subcommands:
 #   0   the checked condition holds / proceed
 #   1   the checked condition fails / refuse
 #   2   usage error, or an input this script will not interpret (fail closed)
-#   10  no action needed (record-decision only: the floor is already correct)
 #
-# A note on failing closed: every parse below refuses rather than guessing. An
-# unreadable floor or an unparseable suite summary must not read as "no
-# regression"; that conflation is the failure class this whole guard exists for.
+# A note on failing closed: every parse below refuses rather than guessing, with
+# one deliberate exception. An unreadable CACHED floor falls back to the
+# committed one rather than refusing, because a cache is allowed to be absent;
+# that path is loud, and it can only ever raise the floor, never lower it.
 
 set -euo pipefail
 
-# Exit code for "the floor is already what it should be, do nothing". Distinct
-# from 0 so a caller cannot read "no work to do" as "work done".
-readonly EXIT_NO_ACTION=10
-
-# The canonical recorded-floor commit subject, in printf form. It is BOTH the
-# message the record step writes AND the pattern the loop bound recognizes, and
-# it is defined once here so those two can never drift into a loop where the
-# recorder does not recognize its own commits.
-#
-# Must match the commit step in .github/workflows/test-baseline-guard.yml, which
-# obtains the subject by calling `commit-subject` rather than spelling it out.
-readonly FLOOR_COMMIT_SUBJECT_FORMAT='chore(ci): record .test-baseline %s after merge'
-
-# The branch this mechanism records FOR. It never writes this branch directly:
-# the recorder opens a pull request against it like any other change. Must match
-# the `if:` on the record-floor job in .github/workflows/test-baseline-guard.yml,
-# which gates on the same ref before the job is even created.
+# The branch whose count is published and read back. Must match the `if:` on the
+# publish step in .github/workflows/test-baseline-guard.yml.
 readonly FLOOR_BRANCH_REF='refs/heads/main'
 
-# The branch the recorder proposes from. A FIXED name, not one per count, and
-# that is load-bearing rather than cosmetic: two merges in quick succession must
-# converge on the LATER count, and a per-count name cannot converge without
-# either opening a second pull request or carrying a name that contradicts its
-# own contents. One name means the later run force-updates the same branch and
-# the same pull request, and the newest count wins by construction.
-#
-# Must match the branch used by the record-floor job in
-# .github/workflows/test-baseline-guard.yml and the stale-pull-request query in
-# .github/workflows/test-baseline-floor-drift.yml. Both obtain it by calling
-# `record-branch` rather than spelling it out, and the self-test pins that.
-readonly RECORD_PR_BRANCH='ci/record-baseline'
+# The cache key prefix the publish step writes under and the restore step reads
+# back with. Defined once here because a prefix that agrees on only one side is
+# a floor that silently never loads: the restore misses, the fallback takes over,
+# and everything stays green while asserting less. Must match the `key` and
+# `restore-keys` in .github/workflows/test-baseline-guard.yml, which obtain it by
+# calling `cache-key-prefix` rather than spelling it out.
+readonly FLOOR_CACHE_KEY_PREFIX='baseline-floor-main-count-'
+
+# The file inside the cached directory that carries the count. Same reasoning.
+readonly FLOOR_CACHE_DIR='.baseline-floor-cache'
+readonly FLOOR_CACHE_FILE="$FLOOR_CACHE_DIR/count"
 
 usage() {
   cat >&2 <<'USAGE'
 Usage: scripts/test-baseline-floor.sh <subcommand> [args]
 
   read-floor <floor-file>
-      Print the committed floor integer. Exit 2 if missing or malformed.
+      Print the committed fallback floor integer. Exit 2 if missing or
+      malformed.
 
   parse-count <vitest-log>
       Print the passing-test count parsed from a captured vitest run.
       Exit 2 if the summary line is absent or not a plain integer.
 
+  effective-floor <fallback> [cached]
+      Print the floor in force on stdout and explain the choice on stderr.
+      With a usable cached count, that is the HIGHER of the two, so a low
+      cached value can never weaken the committed floor. With no usable
+      cached count, it is the committed fallback, said out loud.
+
   assert-not-below <floor> <observed>
       The pull-request gate. Exit 0 when observed >= floor, 1 when below.
 
-  record-decision <floor> <observed>
-      Exit 0 when the floor must be rewritten to <observed>, 10 when it is
-      already correct.
+  publish-decision <ref> <measured-sha> <tip-sha>
+      Exit 0 when this run may publish its count, 1 with a reason otherwise
+      (not the default branch, or the branch moved while the suite ran).
 
-  record <floor-file> <observed>
-      Write <observed> into <floor-file>. Exit 10 without touching the file
-      when it already holds that value.
-
-  commit-subject <n>
-      Print the canonical recorded-floor commit subject for count <n>.
-
-  guard-record-context <ref> <head-subject>
-      Exit 0 when it is safe to record a floor in this context, 1 with a
-      reason otherwise (wrong branch, or the head commit is one of ours,
-      including the squashed `... (#N)` form that a merge actually lands).
-
-  record-branch
-      Print the branch the recorder proposes its change from.
-
-  record-pr-verdict <open-pr-count> <oldest-age-seconds> <window-seconds>
-      Exit 1 when a recorded-floor pull request has stayed open past the
-      window, which is a stale floor by another route. Exit 0 otherwise.
+  cache-key-prefix | cache-dir | cache-file
+      Print the shared cache locations, so no workflow spells them out.
 
   drift-age-seconds <floor-file>
-      Print how many seconds the tree has moved without the floor being
-      rewritten: now minus the commit date of the first commit that followed
-      the floor's last change. Prints 0 when the floor is the newest change.
+      Print how many seconds the tree has moved without the committed
+      fallback being rewritten. Prints 0 when it is the newest change.
 
-  drift-verdict <floor> <observed> <age-seconds> <window-seconds>
-      The scheduled backstop. Exit 0 when in sync, or when drift is younger
-      than the window (a record job may still be in flight). Exit 1 when
-      drift has outlived the window.
+  fallback-drift-verdict <fallback> <observed> <age-seconds> <max-age-seconds> <max-gap>
+      The scheduled backstop over the committed fallback. Exit 1 when the
+      fallback sits above a fresh count, or when the gap below it is both
+      large and old. Exit 0 otherwise: the fallback is slow-moving by design.
 USAGE
 }
 
@@ -152,7 +127,7 @@ cmd_read_floor() {
   local floor_file="${1:-}"
   [[ -n "$floor_file" ]] || die_usage "read-floor needs a floor file path."
   if [[ ! -f "$floor_file" ]]; then
-    echo "FAIL: $floor_file is missing. It must exist and hold a single integer, the recorded passing count on main." >&2
+    echo "FAIL: $floor_file is missing. It must exist and hold a single integer, the committed fallback floor." >&2
     exit 2
   fi
   local raw
@@ -161,10 +136,11 @@ cmd_read_floor() {
   printf '%s\n' "$raw"
 }
 
-# The single parser for vitest's passing count. Both the pull-request gate and
-# the recorder read the suite through this function, so the number the gate
-# compares and the number the recorder writes cannot come from two regexes that
-# drift. Real vitest summary line, ANSI stripped by NO_COLOR in the workflow:
+# The single parser for vitest's passing count. The pull-request gate, the
+# publisher, and the scheduled backstop all read the suite through this function,
+# so the number the gate compares and the number that gets published cannot come
+# from two regexes that drift. Real vitest summary line, ANSI stripped by
+# NO_COLOR in the workflows:
 #
 #      Tests  2 passed (2)
 #
@@ -187,10 +163,54 @@ cmd_parse_count() {
   printf '%s\n' "$matched"
 }
 
-# INVARIANT: the pull-request side asserts a FLOOR and nothing else. It does not
-# demand equality and does not ask the author to record anything, because under
-# this design the recorded value is produced on main after the merge. Demanding
-# equality here is what forced every PR to guess an integer computed on a
+# INVARIANT: the cached count may only ever RAISE the floor, never lower it.
+# The cache is written by CI and is not reviewed by anyone, so treating a low
+# cached value as authoritative would let an evicted, truncated, or simply stale
+# entry silently weaken a floor that a human committed on purpose. Taking the
+# higher of the two makes every cache failure mode fail towards the stricter
+# number.
+#
+# The choice is always announced on stderr. A fallback that is preferred quietly
+# is the failure this whole design is trying not to reintroduce: it looks
+# identical to a healthy cached floor from the outside, and it asserts less.
+#
+# The number goes to stdout ALONE so a caller can capture it with `$(...)`;
+# everything explanatory goes to stderr, where the runner prints it into the log.
+cmd_effective_floor() {
+  local fallback="${1:-}"
+  local cached="${2-}"
+  [[ -n "$fallback" ]] || die_usage "effective-floor needs <fallback> [cached]."
+  require_count "committed fallback floor" "$fallback"
+
+  if [[ -z "$cached" ]]; then
+    echo "FALLBACK-IN-FORCE: no cached count from the default branch was available, so the floor is the committed fallback $fallback." >&2
+    echo "  While the fallback is in force the floor is only as current as that file, and a change can delete up to the difference and still pass." >&2
+    printf '%s\n' "$fallback"
+    return 0
+  fi
+
+  if ! is_canonical_count "$cached"; then
+    echo "FALLBACK-IN-FORCE: the cached count was present but unreadable ('$cached'), so the floor is the committed fallback $fallback." >&2
+    echo "  An unreadable entry is more alarming than a missing one: something wrote a cache this gate cannot parse. Worth a look even though the gate is safe." >&2
+    printf '%s\n' "$fallback"
+    return 0
+  fi
+
+  if (( cached >= fallback )); then
+    echo "CACHED-FLOOR-IN-FORCE: the default branch last counted $cached, at or above the committed fallback $fallback." >&2
+    printf '%s\n' "$cached"
+    return 0
+  fi
+
+  echo "COMMITTED-FLOOR-IN-FORCE: the cached count $cached is BELOW the committed fallback $fallback, so the committed value stands." >&2
+  echo "  A cached value never lowers the floor. If the default branch genuinely counts fewer tests now, lower the committed fallback deliberately, with a written justification." >&2
+  printf '%s\n' "$fallback"
+}
+
+# INVARIANT: this asserts a FLOOR and nothing else. It does not demand equality
+# and it does not ask the author to record anything, because the number it
+# compares against is published by CI on the default branch. Demanding equality
+# here is what forced every pull request to guess an integer computed on a
 # platform the author cannot run.
 cmd_assert_not_below() {
   local floor="${1:-}"
@@ -200,147 +220,54 @@ cmd_assert_not_below() {
   require_count "observed count" "$observed"
 
   if (( observed < floor )); then
-    echo "FAIL: test baseline regression. Recorded floor on main: $floor. Observed passing: $observed. Missing $((floor - observed)) tests." >&2
-    echo "  Restore the tests, or lower the floor deliberately in this pull request with a written justification (see AGENTS.md)." >&2
+    echo "FAIL: test baseline regression. Floor in force: $floor. Observed passing: $observed. Missing $((floor - observed)) tests." >&2
+    echo "  Restore the tests, or lower the floor deliberately with a written justification (see AGENTS.md)." >&2
     exit 1
   fi
   if (( observed > floor )); then
-    echo "OK: $observed passing, $((observed - floor)) above the recorded floor of $floor. The floor is recorded on main after this merges."
+    echo "OK: $observed passing, $((observed - floor)) above the floor in force of $floor."
     exit 0
   fi
-  echo "OK: $observed passing, exactly at the recorded floor."
+  echo "OK: $observed passing, exactly at the floor in force."
 }
 
-cmd_record_decision() {
-  local floor="${1:-}"
-  local observed="${2:-}"
-  [[ -n "$floor" && -n "$observed" ]] || die_usage "record-decision needs <floor> <observed>."
-  require_count "floor" "$floor"
-  require_count "observed count" "$observed"
-
-  if [[ "$floor" == "$observed" ]]; then
-    echo "unchanged: the recorded floor is already $floor."
-    exit "$EXIT_NO_ACTION"
-  fi
-  echo "record: $floor -> $observed"
-}
-
-# INVARIANT: the recorded value is whatever the suite counted on main, in both
-# directions. It is not clamped upward. A deliberate test removal that a
-# reviewer approved lands here as a lower recorded floor, which is the point:
-# the floor describes main, it does not argue with it.
-cmd_record() {
-  local floor_file="${1:-}"
-  local observed="${2:-}"
-  [[ -n "$floor_file" && -n "$observed" ]] || die_usage "record needs <floor-file> <observed>."
-  require_count "observed count" "$observed"
-
-  local current=""
-  if [[ -f "$floor_file" ]]; then
-    current="$(tr -d '[:space:]' < "$floor_file")"
-  fi
-  if [[ "$current" == "$observed" ]]; then
-    echo "unchanged: $floor_file already holds $observed; not writing."
-    exit "$EXIT_NO_ACTION"
-  fi
-  printf '%s\n' "$observed" > "$floor_file"
-  echo "recorded: $floor_file now holds $observed (was '${current:-absent}')."
-}
-
-cmd_commit_subject() {
-  local count="${1:-}"
-  [[ -n "$count" ]] || die_usage "commit-subject needs a count."
-  require_count "count" "$count"
-  # shellcheck disable=SC2059
-  printf "$FLOOR_COMMIT_SUBJECT_FORMAT\\n" "$count"
-}
-
-# INVARIANT: the recorder must not observe its own commit, or every recorded
-# floor would land a change that triggers another run that records again. Three
-# independent bounds hold that closed and all three are self-tested: the
-# paths-ignore filter on the push trigger, this refusal on the subject, and
-# record-decision returning "no action" because the value it would write is
-# already there. The subject is generated by cmd_commit_subject, so the writer
-# and the recognizer are one string.
-#
-# THE TRAILING WILDCARD IS LOAD-BEARING, and it is why this is matched rather
-# than compared. The recorder now proposes its change as a pull request, so its
-# commit reaches main through a SQUASH, and this repository's
-# squash_merge_commit_title is COMMIT_OR_PR_TITLE, which GitHub renders as the
-# title followed by ` (#N)`. Verified against real history: pull request 1272's
-# title reaches main as that title plus ` (#1272)`. An exact-suffix match would
-# therefore recognize the pre-merge commit and MISS the one that actually lands,
-# which is the only form this guard ever sees.
-#
-# BOUND, stated rather than implied: a human squash-merge titled exactly like a
-# recorded-floor commit makes this refuse for that one merge, leaving the floor
-# stale by one merge. The next merge records it, and the scheduled drift check
-# is the backstop if there is no next merge.
-cmd_guard_record_context() {
+# INVARIANT: a run publishes only the count that describes the CURRENT tip of the
+# default branch. Two pushes in quick succession can finish out of order, and a
+# slower older run must not overwrite a newer count with an older one; the
+# restore side picks the most recently created entry, so ordering is decided
+# here, not there. A run whose commit is no longer the tip simply declines: the
+# newer push has its own run and publishes from it.
+cmd_publish_decision() {
   local ref="${1:-}"
-  local head_subject="${2-}"
-  [[ -n "$ref" ]] || die_usage "guard-record-context needs <ref> <head-subject>."
+  local measured_sha="${2:-}"
+  local tip_sha="${3:-}"
+  [[ -n "$ref" && -n "$measured_sha" && -n "$tip_sha" ]] \
+    || die_usage "publish-decision needs <ref> <measured-sha> <tip-sha>."
 
   if [[ "$ref" != "$FLOOR_BRANCH_REF" ]]; then
-    echo "REFUSE: the floor is recorded on $FLOOR_BRANCH_REF only, and this ran on '$ref'." >&2
+    echo "DECLINE: a count is published from $FLOOR_BRANCH_REF only, and this ran on '$ref'." >&2
     exit 1
   fi
-
-  local own_subject_prefix="${FLOOR_COMMIT_SUBJECT_FORMAT%%%s*}"
-  local own_subject_suffix="${FLOOR_COMMIT_SUBJECT_FORMAT##*%s}"
-  if [[ "$head_subject" == "$own_subject_prefix"*"$own_subject_suffix"* ]]; then
-    echo "REFUSE: the head commit is a recorded-floor commit ('$head_subject'); recording again would loop." >&2
+  if [[ "$measured_sha" != "$tip_sha" ]]; then
+    echo "DECLINE: the suite measured $measured_sha but the branch is now at $tip_sha; the newer push publishes its own count." >&2
     exit 1
   fi
-
-  echo "OK: recording is permitted on $ref."
+  echo "OK: publishing the observed count for $measured_sha."
 }
 
-cmd_record_branch() {
-  printf '%s\n' "$RECORD_PR_BRANCH"
-}
+cmd_cache_key_prefix() { printf '%s\n' "$FLOOR_CACHE_KEY_PREFIX"; }
+cmd_cache_dir()        { printf '%s\n' "$FLOOR_CACHE_DIR"; }
+cmd_cache_file()       { printf '%s\n' "$FLOOR_CACHE_FILE"; }
 
-# INVARIANT: an open recorded-floor pull request that nobody merges IS a stale
-# floor. It reads differently (there is a visible pull request, so the mechanism
-# looks alive) and it has exactly the same effect on every other pull request:
-# the gate keeps comparing against a number that no longer describes main. This
-# check exists because moving the write behind a pull request added a link that
-# can fail on its own, and an added link with no alarm is an added silence.
-cmd_record_pr_verdict() {
-  local open_count="${1:-}"
-  local age="${2:-}"
-  local window="${3:-}"
-  [[ -n "$open_count" && -n "$age" && -n "$window" ]] \
-    || die_usage "record-pr-verdict needs <open-pr-count> <oldest-age-seconds> <window-seconds>."
-  require_count "open pull request count" "$open_count"
-  require_count "pull request age in seconds" "$age"
-  require_count "window in seconds" "$window"
-
-  if (( open_count == 0 )); then
-    echo "NO-OPEN-RECORD-PR: nothing is waiting to record a floor."
-    return 0
-  fi
-
-  if (( age < window )); then
-    echo "OPEN-RECORD-PR-WITHIN-WINDOW: $open_count open, oldest ${age}s, window ${window}s. Its checks may still be running; not reporting yet."
-    return 0
-  fi
-
-  echo "FAIL: a recorded-floor pull request has been open for ${age}s, past the ${window}s window, on branch $RECORD_PR_BRANCH." >&2
-  echo "  An unmerged recorded-floor pull request is a stale floor wearing a different hat: every other pull request keeps passing against a number that no longer describes main." >&2
-  echo "  Find out why it is not merging (a red required check, or required checks that never reported at all) and clear it." >&2
-  exit 1
-}
-
-# How long the tree has moved on without the floor being rewritten. Measured
-# from the FIRST commit that followed the floor's last change, not from the
+# How long the tree has moved on without the committed fallback being rewritten.
+# Measured from the FIRST commit that followed its last change, not from the
 # newest commit, because a busy branch keeps the newest commit young forever and
-# would keep persistent drift permanently inside any grace window.
+# would keep a permanently stale fallback inside any grace window.
 #
 # Failure mode note for whoever reads this at 2am: a shallow clone has no such
 # history and this returns 0, which reads as "no drift", so the workflow that
 # calls it checks out with full history. A truncated history looks exactly like
-# a healthy floor from here.
+# a fresh fallback from here.
 cmd_drift_age_seconds() {
   local floor_file="${1:-}"
   [[ -n "$floor_file" ]] || die_usage "drift-age-seconds needs a floor file path."
@@ -348,8 +275,6 @@ cmd_drift_age_seconds() {
   local floor_commit=""
   floor_commit="$(git log -1 --format=%H -- "$floor_file" 2>/dev/null || true)"
   if [[ -z "$floor_commit" ]]; then
-    # The floor has no commit touching it in the visible history. There is no
-    # honest age to report, so report none rather than inventing a large one.
     printf '0\n'
     return 0
   fi
@@ -370,38 +295,48 @@ cmd_drift_age_seconds() {
   printf '%s\n' "$age"
 }
 
-# INVARIANT: this check is a BACKSTOP, not the primary alarm. The primary alarm
-# is the record job failing on main, which reds a push to main and is visible
-# immediately. This exists for the case that alarm cannot cover: a record job
-# that never ran at all, which produces no failed run to notice.
+# INVARIANT: the committed fallback is SUPPOSED to lag. It is the floor of last
+# resort, not a live number, so an ordinary gap is not news and alarming on every
+# gap would train everyone to ignore this check. Two things are news:
 #
-# BOUND: drift younger than the window is deliberately not reported, so a record
-# job in flight does not page anyone. That grace is also this check's limit.
-cmd_drift_verdict() {
-  local floor="${1:-}"
+#   - the fallback sitting ABOVE a fresh count, which blocks every pull request
+#     with a regression that is not one, and
+#   - a gap that is both large and old, which means the fallback has decayed far
+#     enough that it would protect almost nothing if the cache went away.
+cmd_fallback_drift_verdict() {
+  local fallback="${1:-}"
   local observed="${2:-}"
   local age="${3:-}"
-  local window="${4:-}"
-  [[ -n "$floor" && -n "$observed" && -n "$age" && -n "$window" ]] \
-    || die_usage "drift-verdict needs <floor> <observed> <age-seconds> <window-seconds>."
-  require_count "floor" "$floor"
+  local max_age="${4:-}"
+  local max_gap="${5:-}"
+  [[ -n "$fallback" && -n "$observed" && -n "$age" && -n "$max_age" && -n "$max_gap" ]] \
+    || die_usage "fallback-drift-verdict needs <fallback> <observed> <age-seconds> <max-age-seconds> <max-gap>."
+  require_count "committed fallback floor" "$fallback"
   require_count "observed count" "$observed"
-  require_count "drift age in seconds" "$age"
-  require_count "drift window in seconds" "$window"
+  require_count "fallback age in seconds" "$age"
+  require_count "maximum age in seconds" "$max_age"
+  require_count "maximum gap" "$max_gap"
 
-  if [[ "$floor" == "$observed" ]]; then
-    echo "IN-SYNC: the recorded floor and a fresh count both read $floor."
+  if (( observed < fallback )); then
+    echo "FAIL: the committed fallback floor $fallback is ABOVE a fresh count of $observed on the default branch." >&2
+    echo "  Every pull request that falls back to it will red with a regression that is not one. Lower it deliberately, with a written justification." >&2
+    exit 1
+  fi
+
+  if (( observed == fallback )); then
+    echo "IN-SYNC: the committed fallback and a fresh count both read $fallback."
     return 0
   fi
 
-  if (( age < window )); then
-    echo "DRIFT-WITHIN-WINDOW: recorded floor $floor, fresh count $observed, drift ${age}s old, window ${window}s. A record job may still be in flight; not reporting yet."
+  local gap=$(( observed - fallback ))
+  if (( gap <= max_gap )) || (( age < max_age )); then
+    echo "FALLBACK-LAGGING-ACCEPTABLY: fallback $fallback, fresh count $observed, gap $gap (max $max_gap), age ${age}s (max ${max_age}s). The fallback is slow-moving by design."
     return 0
   fi
 
-  echo "FAIL: the recorded floor has been stale for ${age}s, past the ${window}s window. Recorded floor: $floor. Fresh count: $observed." >&2
-  echo "  A stale floor is indistinguishable from a healthy one on a pull request: the gate still passes, it simply asserts less than it should." >&2
-  echo "  Find the record job that failed or never ran on a push to main, and re-run it." >&2
+  echo "FAIL: the committed fallback floor has decayed. Fallback: $fallback. Fresh count: $observed. Gap: $gap, past the $max_gap tolerated, and ${age}s old, past ${max_age}s." >&2
+  echo "  If the cached floor ever became unavailable, this is the number every pull request would be held to, and it would let $gap deletions through." >&2
+  echo "  Raise the committed fallback in a scoped commit." >&2
   exit 1
 }
 
@@ -414,19 +349,18 @@ main() {
   shift
 
   case "$subcommand" in
-    read-floor)           cmd_read_floor "$@" ;;
-    parse-count)          cmd_parse_count "$@" ;;
-    assert-not-below)     cmd_assert_not_below "$@" ;;
-    record-decision)      cmd_record_decision "$@" ;;
-    record)               cmd_record "$@" ;;
-    commit-subject)       cmd_commit_subject "$@" ;;
-    guard-record-context) cmd_guard_record_context "$@" ;;
-    record-branch)        cmd_record_branch "$@" ;;
-    record-pr-verdict)    cmd_record_pr_verdict "$@" ;;
-    drift-age-seconds)    cmd_drift_age_seconds "$@" ;;
-    drift-verdict)        cmd_drift_verdict "$@" ;;
-    -h|--help|help)       usage; exit 0 ;;
-    *)                    die_usage "Unknown subcommand: $subcommand" ;;
+    read-floor)             cmd_read_floor "$@" ;;
+    parse-count)            cmd_parse_count "$@" ;;
+    effective-floor)        cmd_effective_floor "$@" ;;
+    assert-not-below)       cmd_assert_not_below "$@" ;;
+    publish-decision)       cmd_publish_decision "$@" ;;
+    cache-key-prefix)       cmd_cache_key_prefix "$@" ;;
+    cache-dir)              cmd_cache_dir "$@" ;;
+    cache-file)             cmd_cache_file "$@" ;;
+    drift-age-seconds)      cmd_drift_age_seconds "$@" ;;
+    fallback-drift-verdict) cmd_fallback_drift_verdict "$@" ;;
+    -h|--help|help)         usage; exit 0 ;;
+    *)                      die_usage "Unknown subcommand: $subcommand" ;;
   esac
 }
 

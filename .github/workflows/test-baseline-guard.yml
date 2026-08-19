@@ -3,79 +3,73 @@
 # Copyright 2026 Erik Newton
 # SPDX-License-Identifier: Apache-2.0
 #
-# Two sides of one mechanism, with the decision logic for both in
-# scripts/test-baseline-floor.sh so it can be exercised without a runner:
+# One job, one read-only token, and a number that travels between runs through
+# the Actions cache instead of through the repository:
 #
-#   test-baseline-guard  Runs on every pull request and every push to main.
-#                        Asserts the observed passing count is NOT BELOW the
-#                        floor recorded at the repo root, alongside the
-#                        unchanged gates (typecheck, no transform or collection
-#                        error, no silent test-file drop, zero failures). A
-#                        count above the floor is the normal resting state of a
-#                        pull request that adds tests, and it passes. This job
-#                        holds a read-only token and writes nothing, anywhere.
+#   On a pull request  Restore the count the default branch last published and
+#                      use it as the floor. The observed passing count must not
+#                      be BELOW it, alongside the unchanged gates (typecheck, no
+#                      transform or collection error, no silent test-file drop,
+#                      zero failures). A count above the floor is the normal
+#                      resting state of a change that adds tests, and it passes.
 #
-#   record-floor         Runs only on a push to main, after the guard. Records
-#                        the observed count into .test-baseline when it differs.
-#                        This is the only job in the repository that may write
-#                        that file, it may write no other file, and it may write
-#                        no other branch.
+#   On a push to main  Publish the observed count to that cache after the suite
+#                      runs. No commit, no branch write, no pull request, no
+#                      ruleset interaction, and nothing beyond the default token.
 #
-# WHY A PULL REQUEST NO LONGER CARRIES THE INTEGER: the floor is the passing
-# count on Linux CI, which an author on macOS cannot compute locally. Asking
-# every pull request to state it made the number a guess; on 2026-08-19 three of
-# three open pull requests guessed it wrong, and the remedy each time was to
-# read the number out of a failed run and push it back. Recording the count on
-# main after the merge removes the guess without removing the gate.
+# WHY A PULL REQUEST DOES NOT CARRY THE INTEGER: the floor is the passing count
+# on Linux CI, which an author on macOS cannot compute. Asking every pull request
+# to state it made the number a guess; on 2026-08-19 three of three open pull
+# requests guessed it wrong, and the remedy each time was to read the number out
+# of a failed run and push it back.
 #
-# THE FAILURE MODE THIS DESIGN INTRODUCES, STATED PLAINLY: if record-floor fails
-# or never runs, the floor goes stale LOW and the pull-request gate quietly
-# asserts less than it should. A stale floor looks EXACTLY like a healthy floor
-# from a pull request's point of view: the check still passes, in the same
-# colour, with the same message. That is why the alarm lives outside the
-# pull-request path. Two alarms cover it: this job failing on a push to main is
-# immediately visible on main, and the scheduled backstop in
-# .github/workflows/test-baseline-floor-drift.yml compares the recorded floor
-# against a fresh count and reports drift that outlives its window.
+# THE HONEST BOUND, which must not be softened anywhere it is repeated: a pull
+# request fails when its count is below THE FLOOR IN FORCE. The floor in force is
+# main most recent completed CI count when a cache entry is available, and the
+# committed fallback in .test-baseline otherwise. While a floor is stale by D, a
+# change can delete up to D passing tests and still pass. Publishing happens on
+# every push to main, so D is normally zero once that run completes, but it is
+# not zero by construction. Do not describe the regression property as
+# "unchanged" from the old rule; it is not.
 #
-# The guard job is DELIBERATELY separate from the `test` matrix in ci.yml so it
-# can be named as a distinct required status check. See
-# docs/audit/branch-protection-setup.md for the runbook, and
-# docs/audit/test-baseline-hardening-plan.md for the layered plan this belongs
-# to. The local convenience copy of the pull-request side is .githooks/pre-commit.
+# THE FALLBACK IS NEVER SILENT. When no usable cached count is available (a first
+# run, an evicted entry, a restricted fork pull request), the committed integer
+# in .test-baseline is used and the job log says so in as many words. That file
+# stays in the tree precisely so there is always a floor, and humans update it
+# rarely rather than every pull request. The scheduled check in
+# .github/workflows/test-baseline-floor-drift.yml reports when it has decayed far
+# enough to be worth little.
+#
+# CACHE SCOPE, verified in this repository rather than assumed: a run triggered
+# by pull_request restores caches created on the default branch. Pull request
+# 1281 restored node-cache-Linux-x64-npm-7efea387..., a key that exists under
+# refs/heads/main and not under that pull request's own ref.
+#
+# This job is DELIBERATELY separate from the `test` matrix in ci.yml so it can be
+# named as a distinct required status check. See
+# docs/audit/branch-protection-setup.md and
+# docs/audit/test-baseline-hardening-plan.md. The local convenience copy of the
+# pull-request side is .githooks/pre-commit.
 
 name: Test Baseline Guard
 
 on:
   push:
     branches: [main]
-    # LOOP BOUND ONE OF TWO (structural). A record-floor commit changes nothing
-    # but .test-baseline, so it cannot change the passing count, and re-running
-    # the whole suite to conclude that would burn a runner to learn nothing. The
-    # semantic bound is in scripts/test-baseline-floor.sh guard-record-context,
-    # which refuses when the head commit is one of ours; that one is self-tested
-    # and survives an edit to this filter.
-    #
-    # Failure mode note: paths-ignore skips a run only when EVERY changed path
-    # matches, so a merge that lowers the floor deliberately alongside real code
-    # changes still runs and still records.
-    paths-ignore:
-      - ".test-baseline"
   pull_request:
     branches: [main]
 
-# Read-only is the workflow-level default so a new job inherits no authority.
-# The single write grant is declared on record-floor and nowhere else; the
-# self-test at scripts/test-baseline-floor-self-test.sh asserts that this file
-# contains exactly one `contents: write` line and that it sits inside that job.
+# Read-only, everywhere, with no job-level override anywhere in this file. The
+# floor mechanism needs no write authority at all: the count travels through the
+# Actions cache, which the default token may write without any permission grant,
+# and the cache is scoped to the branch that wrote it. The self-test at
+# scripts/test-baseline-floor-self-test.sh asserts that no `write` permission
+# appears here, because a future edit that reintroduces one would also
+# reintroduce the whole class of question this design exists to avoid.
 #
-# That grant also makes this a PRIVILEGED workflow, which is why every external
-# action below is pinned to an immutable 40-character commit SHA rather than a
-# tag. `npm run check:release-action-pins` enforces it; a tag is a mutable
-# pointer, and a repointed tag on a workflow holding a write token is a supply
-# chain into main. Failure mode when a new step is added with a bare `@v7`: the
-# `test (22)` and `test (24)` jobs red on the pin check within seconds, which
-# reads as an unrelated test failure until you look at the step name.
+# External actions stay pinned to immutable commit SHAs even though this
+# workflow is no longer privileged. A tag is a mutable pointer, and re-floating
+# these would be a silent downgrade.
 permissions:
   contents: read
 
@@ -83,11 +77,6 @@ jobs:
   test-baseline-guard:
     name: test-baseline-guard
     runs-on: ubuntu-latest
-
-    outputs:
-      # Consumed by record-floor. The count the recorder writes is the count
-      # this job's gate compared, never a second measurement.
-      passing: ${{ steps.floor_gate.outputs.passing }}
 
     steps:
       - name: Checkout
@@ -106,12 +95,53 @@ jobs:
       - name: Self-test the floor decision logic
         run: bash scripts/test-baseline-floor-self-test.sh
 
-      - name: Read the recorded floor
-        id: baseline
+      # The shared locations, read from the script so no workflow spells them
+      # out. A prefix that agrees on only one side is a floor that silently
+      # never loads: the restore misses, the fallback quietly takes over, and
+      # everything stays green while asserting less than it should.
+      - name: Resolve the shared cache locations
+        id: cachedef
         run: |
-          baseline="$(scripts/test-baseline-floor.sh read-floor .test-baseline)"
+          {
+            echo "prefix=$(scripts/test-baseline-floor.sh cache-key-prefix)"
+            echo "dir=$(scripts/test-baseline-floor.sh cache-dir)"
+            echo "file=$(scripts/test-baseline-floor.sh cache-file)"
+          } >> "$GITHUB_OUTPUT"
+
+      # Restore the count the default branch last published. The primary key is
+      # deliberately one that is never written, so this always falls through to
+      # the prefix match, which returns the most recently created entry.
+      #
+      # Failure mode note: a miss here is NOT an error and does not fail the
+      # step. It routes the gate to the committed fallback, which the next step
+      # announces in the log. Silence would be the bug.
+      - name: Restore the published floor
+        id: floorcache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.0.0
+        with:
+          path: ${{ steps.cachedef.outputs.dir }}
+          key: baseline-floor-main-lookup-only-never-written
+          restore-keys: ${{ steps.cachedef.outputs.prefix }}
+
+      - name: Determine the floor in force
+        id: baseline
+        env:
+          CACHE_FILE: ${{ steps.cachedef.outputs.file }}
+        run: |
+          cached=""
+          if [[ -f "$CACHE_FILE" ]]; then
+            cached="$(tr -d '[:space:]' < "$CACHE_FILE")"
+          fi
+          fallback="$(scripts/test-baseline-floor.sh read-floor .test-baseline)"
+          # effective-floor prints the number on stdout and its reasoning on
+          # stderr, which the runner shows in the log. The reasoning is the part
+          # that keeps a fallback from ever being preferred silently.
+          baseline="$(scripts/test-baseline-floor.sh effective-floor "$fallback" "$cached")"
           echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
-          echo "Recorded floor: $baseline"
+          echo "Committed fallback: $fallback"
+          echo "Cached count:       ${cached:-<none>}"
+          echo "Floor in force:     $baseline"
 
       # A pull request that changes .test-baseline is the deliberate-lowering
       # path, which is human and reviewed. Since routine pull requests no longer
@@ -254,217 +284,74 @@ jobs:
       #
       # INVARIANT: this asserts a FLOOR and nothing more. It does not demand
       # equality and it does not ask the author to record anything, because the
-      # recorded value is produced by record-floor after the merge.
+      # number it compares against is published by CI on the default branch.
       #
-      # The floor is read from the pull request's own tree rather than from
-      # main. Those are the same value at merge time because the repository
-      # ruleset requires a branch to be up to date before it merges, which is
-      # what makes reading it here equivalent to reading main. If that
-      # requirement is ever relaxed, a stale branch could carry an old low floor
-      # into its gate, and this comment is the thread to pull.
-      - name: Gate 2c — passing count is not below the recorded floor
+      # The floor in force came from the cache when one was available and from
+      # the committed fallback otherwise, and the step above said which in the
+      # log. Both paths land here identically on purpose: there is one gate, and
+      # it is the same gate whichever floor is in force.
+      - name: Gate 2c — passing count is not below the floor in force
         id: floor_gate
         env:
-          RECORDED_FLOOR: ${{ steps.baseline.outputs.baseline }}
+          FLOOR_IN_FORCE: ${{ steps.baseline.outputs.baseline }}
         run: |
           passing="$(scripts/test-baseline-floor.sh parse-count /tmp/vitest-output.log)"
           echo "passing=$passing" >> "$GITHUB_OUTPUT"
-          scripts/test-baseline-floor.sh assert-not-below "$RECORDED_FLOOR" "$passing"
+          scripts/test-baseline-floor.sh assert-not-below "$FLOOR_IN_FORCE" "$passing"
 
-  # ── The recorder ─────────────────────────────────────────────────────────
-  #
-  # It does NOT push to main. It proposes the recorded floor as an ordinary
-  # pull request from a fixed branch and lets auto-merge land it once the
-  # required checks pass. That is what keeps this mechanism free of any new
-  # authority: the branch ruleset requires a pull request and zero approving
-  # reviews, and the repository allows auto-merge, so a machine-authored change
-  # can satisfy the rules exactly as a person's does. No bypass actor, no
-  # deploy key, no app token, and the pull-request requirement plus every
-  # required check stay intact for this change too.
-  #
-  # Everything this job executes has already been reviewed, gated and merged.
-  # There is no fork case, no push to a contributor's branch, and no decision an
-  # outsider can influence: it records what the suite counted.
-  #
-  # KNOWN CONSTRAINT, and the one thing to confirm before relying on this: a
-  # pull request opened with the default GITHUB_TOKEN does not itself start new
-  # workflow runs, which is GitHub's recursion guard. If the required checks
-  # therefore never report on the recorded-floor pull request, auto-merge cannot
-  # fire and the pull request waits. That failure is bounded and loud rather than
-  # silent: the fixed branch means at most ONE such pull request exists at a
-  # time and it always carries the newest count, and the scheduled check in
-  # .github/workflows/test-baseline-floor-drift.yml reports a recorded-floor
-  # pull request that stays open past its window. Clearing it needs either a
-  # token whose events start workflow runs, or one human action on the waiting
-  # pull request.
-  record-floor:
-    name: record-floor
-    needs: test-baseline-guard
-    # The write token is minted only for a push to main. On a pull request this
-    # job does not exist, so no pull-request code ever executes beside it.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-
-    # Narrow on purpose: enough to push ONE branch that is not main and to open
-    # one pull request. Nothing here can write main; the ruleset still decides
-    # that, which is the entire point of proposing rather than pushing.
-    permissions:
-      contents: write
-      pull-requests: write
-
-    # Two merges in quick succession must not race. cancel-in-progress is false
-    # so a queued recorder waits for the running one rather than racing it; the
-    # queue is first-in-first-out, so the later tree is recorded last and its
-    # count is the one that survives on the shared branch.
-    #
-    # Failure mode note: GitHub cancels a PENDING job in a group when a newer
-    # one queues behind a running one. That is benign here and shows as
-    # `cancelled`, not `failure`: the cancelled run's tree is stale by
-    # definition, and the newest run records the newest count.
-    concurrency:
-      group: test-baseline-floor-record
-      cancel-in-progress: false
-
-    steps:
-      - name: Checkout main
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
-          # A commit pushed on top of a shallow history is refused by the remote
-          # with "shallow update not allowed", which reads as a permissions
-          # failure and sends the reader hunting in the wrong place.
-          fetch-depth: 0
-
-      # The count came from the guard job, which measured GITHUB_SHA. If main
-      # has moved since, that count no longer describes the tip, and recording
-      # it would propose a number for a tree that no longer exists. The newer
-      # push has its own recorder; let that one do it.
-      - name: Skip when a newer commit already landed on main
-        id: tip
-        run: |
-          head="$(git rev-parse HEAD)"
-          if [[ "$head" != "$GITHUB_SHA" ]]; then
-            echo "::notice::main advanced from $GITHUB_SHA to $head while the suite ran; the newer push records the floor."
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      # LOOP BOUND TWO OF THREE (semantic, and the self-tested one). It matters
-      # MORE under the pull-request route, not less: the recorded floor now
-      # reaches main by merging, and that merge is itself a push to main that
-      # runs this workflow again. The subject it must recognize is the SQUASHED
-      # one, which carries a trailing ` (#N)`; the matcher in the floor script
-      # accounts for that and the self-test pins the squashed shape.
+      # ── Publish, on the default branch only ────────────────────────
       #
-      # A refusal here is a clean skip, never a failure: a recorder that
-      # reddened main every time it correctly declined to record would train
-      # everyone to ignore a red main, which is the opposite of the alarm this
-      # design needs.
-      - name: Refuse to record on our own commit
-        id: context
-        if: steps.tip.outputs.proceed == 'true'
+      # This is the entire "recording" mechanism now: write the observed count
+      # into a file and let the cache action carry it to later runs. No commit,
+      # no branch, no pull request, no ruleset interaction, and no credential
+      # beyond the default token, which may write a cache with no permission
+      # grant at all.
+      #
+      # INVARIANT: only the run whose commit is still the tip publishes. Two
+      # pushes can finish out of order, and the restore side takes the most
+      # recently CREATED entry, so ordering has to be decided here. A run that
+      # is no longer the tip declines and the newer push publishes its own count.
+      # Failure mode note: a decline is a normal, expected outcome and is not an
+      # error; it prints and the step succeeds.
+      - name: Decide whether to publish this count
+        id: publish
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           REF: ${{ github.ref }}
         run: |
-          subject="$(git log -1 --format=%s)"
+          git fetch --quiet origin main
+          tip="$(git rev-parse origin/main)"
           set +e
-          scripts/test-baseline-floor.sh guard-record-context "$REF" "$subject"
+          scripts/test-baseline-floor.sh publish-decision "$REF" "$GITHUB_SHA" "$tip"
           status=$?
           set -e
           if [[ "$status" -eq 0 ]]; then
             echo "proceed=true" >> "$GITHUB_OUTPUT"
           elif [[ "$status" -eq 1 ]]; then
-            echo "::notice::Not recording a floor for this commit; see the refusal above."
+            echo "::notice::Not publishing a floor from this run; see the reason above."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
           else
             exit "$status"
           fi
 
-      # LOOP BOUND THREE OF THREE, and the one that holds even if both others
-      # were removed: if the floor already equals the observed count there is
-      # nothing to propose, so the recorded-floor merge that lands N against a
-      # floor of N produces no second pull request by arithmetic rather than by
-      # recognition.
-      - name: Record the observed count
-        id: record
-        if: steps.context.outputs.proceed == 'true'
+      - name: Stage the observed count
+        if: steps.publish.outputs.proceed == 'true'
         env:
-          OBSERVED: ${{ needs.test-baseline-guard.outputs.passing }}
+          CACHE_DIR: ${{ steps.cachedef.outputs.dir }}
+          CACHE_FILE: ${{ steps.cachedef.outputs.file }}
+          OBSERVED: ${{ steps.floor_gate.outputs.passing }}
         run: |
-          set +e
-          scripts/test-baseline-floor.sh record .test-baseline "$OBSERVED"
-          status=$?
-          set -e
-          # 10 is the floor script's "no action needed": the file already holds
-          # this count, so there is nothing to propose.
-          if [[ "$status" -eq 10 ]]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          elif [[ "$status" -eq 0 ]]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            exit "$status"
-          fi
+          mkdir -p "$CACHE_DIR"
+          printf '%s\n' "$OBSERVED" > "$CACHE_FILE"
+          echo "Publishing $OBSERVED as the floor for later runs."
 
-      - name: Propose the recorded floor as a pull request
-        if: steps.record.outputs.changed == 'true'
-        env:
-          OBSERVED: ${{ needs.test-baseline-guard.outputs.passing }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          branch="$(scripts/test-baseline-floor.sh record-branch)"
-          subject="$(scripts/test-baseline-floor.sh commit-subject "$OBSERVED")"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "$branch"
-          git add .test-baseline
-          # INVARIANT: one file, checked rather than assumed. The safety argument
-          # for this job is that it can propose nothing else, so the claim is
-          # asserted here instead of being left to the reader of `git add`.
-          staged="$(git diff --cached --name-only)"
-          if [[ "$staged" != ".test-baseline" ]]; then
-            echo "::error::the recorder staged something other than .test-baseline: $staged"
-            exit 1
-          fi
-          git commit -m "$subject"
-
-          # Force is correct and is the convergence mechanism, not a shortcut.
-          # The branch name is fixed, so a second merge landing while an earlier
-          # recorded-floor pull request is still open must REPLACE its content
-          # with the later count rather than open a competing pull request.
-          # Failure mode note: this shows up in the pull request as a normal
-          # force-push, and its checks restart. That is the intended behaviour;
-          # the older count was already wrong.
-          git push --force origin "$branch"
-
-          existing="$(gh pr list --state open --head "$branch" --json number --jq '.[0].number // empty')"
-          if [[ -z "$existing" ]]; then
-            gh pr create \
-              --base main \
-              --head "$branch" \
-              --title "$subject" \
-              --body "Recorded automatically after a merge to main: the observed passing count on Linux CI is ${OBSERVED}. No human needs to compute or type this number. This pull request carries one line and goes through the same required checks as any other change."
-            existing="$(gh pr list --state open --head "$branch" --json number --jq '.[0].number // empty')"
-          else
-            # Idempotent by design: the branch was force-updated above, so the
-            # open pull request now carries the later count. Only its title still
-            # names the older one, and the title becomes the squashed commit
-            # subject, so it has to follow.
-            echo "::notice::updating the open recorded-floor pull request #$existing to $OBSERVED"
-            gh pr edit "$existing" --title "$subject"
-          fi
-
-          if [[ -z "$existing" ]]; then
-            echo "::error::could not determine the recorded-floor pull request number"
-            exit 1
-          fi
-
-          # Auto-merge is what makes this route need no elevated authority: the
-          # pull request merges itself when the required checks pass, under the
-          # same rules as everything else. Enabling it twice is not an error
-          # worth failing the job over, so a second call is tolerated.
-          gh pr merge --squash --auto "$existing" \
-            || echo "::notice::auto-merge was already enabled on #$existing, or could not be enabled; see the log above"
-
-          echo "::notice::$subject proposed in #$existing"
+      # The key carries the commit, the run and the attempt because a cache
+      # entry is immutable: re-running the same commit would otherwise fail on
+      # "cache already exists". The restore side matches on the prefix and takes
+      # the most recent, so the exact suffix never has to be predicted.
+      - name: Publish the observed count
+        if: steps.publish.outputs.proceed == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.0.0
+        with:
+          path: ${{ steps.cachedef.outputs.dir }}
+          key: ${{ steps.cachedef.outputs.prefix }}${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
