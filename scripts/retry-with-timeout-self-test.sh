@@ -200,3 +200,18 @@ run_case "a stuck command is killed at the attempt timeout and reported as 124" 
 run_case "falls back to the pure-bash watchdog when timeout/gtimeout are both absent" case_falls_back_without_coreutils
 
 echo "PASS: retry-with-timeout self-tests"
+
+# --- class guard: composite actions must never carry step-level timeout-minutes ---
+# GitHub rejects the ENTIRE action file with a TemplateValidationException rather
+# than ignoring the field, so this is a load-time break, not a lost backstop.
+# Proven on PR #1282: three jobs died in under 10 seconds. The bound belongs in
+# retry-with-timeout.sh's own accounting, or on the CALLER's `uses:` step.
+# Failure mode if this guard is deleted: the next composite action to add a
+# timeout looks correct in review and breaks every workflow that uses it.
+offenders="$(grep -rlE '^[[:space:]]*timeout-minutes:' "$SCRIPT_DIR"/../.github/actions/*/action.yml 2>/dev/null || true)"
+if [ -n "$offenders" ]; then
+  echo "FAIL: composite action step carries timeout-minutes (rejected by GitHub at load time):"
+  echo "$offenders"
+  exit 1
+fi
+echo "PASS: no composite action carries a step-level timeout-minutes"
