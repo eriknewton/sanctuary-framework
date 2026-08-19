@@ -156,6 +156,10 @@ export async function reconcileFileGrantTree(
   // below.
   const aclFailureByGrantId = new Map<string, FileGrantAclRemovalResult>();
   const confirmedScrubbedGrantIds = new Set<string>();
+  // Every grant the plan says must lose its tree entry. Needed separately from
+  // the confirmed set so the expiry audit can distinguish "was not due a scrub"
+  // from "was due one and it did not complete".
+  const scrubDueGrantIds = new Set(plan.toScrub.map((e) => e.grant_id));
   // Collected during the scrub loop, appended after it. See the deferral note
   // at the push site: an awaited append between two grants' scrubs delays the
   // second grant's access removal.
@@ -266,12 +270,22 @@ export async function reconcileFileGrantTree(
       // Only a flip that actually landed is reported as one; `expired` names
       // the records whose PERSISTED status changed.
       if (flipped) expired.push(grant.grant_id);
+      // `scrubConfirmed` is what stops this row claiming success for access that
+      // is still live. `aclFailureByGrantId` only records a STRUCTURED failure;
+      // a scrub that THREW is caught above and leaves no entry there, so the
+      // row saw no failure, no write error, a landed flip, and reported
+      // `result: "success"` / `reason: "expired_ttl_scrub"` for a grant whose
+      // tree entry was never removed. The set of confirmed scrubs already
+      // exists and answers the question directly: was this grant due to be
+      // scrubbed, and did that scrub actually complete.
+      const dueToScrub = scrubDueGrantIds.has(grant.grant_id);
       await appendExpiryAudit(
         deps,
         grant,
         aclFailureByGrantId.get(grant.grant_id),
         flipped,
-        writeError
+        writeError,
+        !dueToScrub || confirmedScrubbedGrantIds.has(grant.grant_id)
       );
     } else if (writeError !== undefined) {
       // The clear-the-ACE-only path: the record was rewritten to drop a stale
@@ -460,7 +474,8 @@ async function appendExpiryAudit(
   grant: FileGrant,
   aclFailure?: FileGrantAclRemovalResult,
   statusFlipped: boolean = true,
-  writeError?: unknown
+  writeError?: unknown,
+  scrubConfirmed: boolean = true
 ): Promise<void> {
   try {
     // Auto-expiry reuses the `file_grant_revoke` audit operation (not a new
@@ -472,15 +487,18 @@ async function appendExpiryAudit(
       layer: "l1",
       operation: "file_grant_revoke",
       identity_id: deps.reconciledBy ?? "system",
-      result: aclFailure || !statusFlipped ? "failure" : "success",
+      result:
+        aclFailure || !statusFlipped || !scrubConfirmed ? "failure" : "success",
       details: {
         grant_id: grant.grant_id,
         subject_agent_id: grant.subject_agent_id,
         reason: aclFailure
           ? "expired_ttl_acl_removal_failed"
-          : statusFlipped
-            ? "expired_ttl_scrub"
-            : "expired_ttl_status_write_failed",
+          : !scrubConfirmed
+            ? "expired_ttl_scrub_did_not_complete"
+            : statusFlipped
+              ? "expired_ttl_scrub"
+              : "expired_ttl_status_write_failed",
         ...(aclFailure ? { acl_removal: aclFailure } : {}),
         // Stated on every row rather than only the failing one, so an operator
         // reading the trail never has to infer durability from a reason string.

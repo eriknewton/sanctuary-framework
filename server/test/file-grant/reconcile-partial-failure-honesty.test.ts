@@ -266,7 +266,9 @@ describe("file-grant reconcile: the report names every loss in the pass, and cla
     // NOT VACUOUS. Asserting only "no success rows" passes when there are no
     // rows at all, which is a different outcome and would hide the append being
     // dropped entirely. Pin that the row exists first.
-    expect(expiryRows.length).toBeGreaterThan(0);
+    // Exactly one, not "at least one": a duplicate is the shape this whole
+    // section exists to catch, and `>` cannot see one.
+    expect(expiryRows).toHaveLength(1);
     const successRows = expiryRows.filter((entry) => entry.result === "success");
     // THE PROPERTY: no row may claim success for a flip that did not land.
     expect(successRows).toHaveLength(0);
@@ -312,10 +314,16 @@ describe("file-grant reconcile: the report names every loss in the pass, and cla
     // But the write failure must still be SOMEWHERE. This is the assertion the
     // fix round was missing.
     const revokes = await auditLog.query({ operation_type: "file_grant_revoke", limit: 200 });
+    // The reason names the SCRUB, not the write, and that ordering is correct:
+    // this grant's tree entry was never removed, so access is still live, which
+    // is the more urgent of the two facts. The write failure is not lost, it
+    // travels on the same row in `error`. Asserting the old
+    // `expired_ttl_status_write_failed` label here would pin the row to the
+    // less important truth.
     const writeFailureRows = revokes.entries.filter(
       (entry) =>
         (entry.details as { reason?: string } | undefined)?.reason ===
-          "expired_ttl_status_write_failed" &&
+          "expired_ttl_scrub_did_not_complete" &&
         (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id,
     );
     // EXACTLY ONE, not "at least one". The weaker assertion is what let a
@@ -471,6 +479,34 @@ describe("file-grant reconcile: the report names every loss in the pass, and cla
       "expired_ttl_acl_removal_failed",
       "reconcile_acl_removal_failed",
     ]);
+  });
+
+  it("never records an expiry as a success when the scrub that should have removed access threw", async () => {
+    // The false-success row. `aclFailureByGrantId` records only a STRUCTURED
+    // removal failure; a scrub that THROWS is caught and leaves no entry there.
+    // The expiry append therefore saw no failure, a landed status flip, and no
+    // write error, and wrote `result: "success"` / `reason: "expired_ttl_scrub"`
+    // for a grant whose tree entry was never removed. An audit trail that
+    // over-reports an access reduction is the direction that gets believed.
+    const { grantStore, auditLog, fsOps, expiring } = await twoGrants({
+      removeThrows: new Error("scrub failed (acl backend down)"),
+    });
+
+    await reconcileError({ store: grantStore, fsOps, now: PAST_TTL, auditLog });
+
+    // Access was NOT removed.
+    expect(fsOps.scrubbed).not.toContain(expiring.tree_entry);
+
+    const revokes = await auditLog.query({ operation_type: "file_grant_revoke", limit: 200 });
+    const rows = revokes.entries.filter(
+      (e) => (e.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id,
+    );
+    expect(rows).toHaveLength(1);
+    // THE PROPERTY: no row may report success for a pass that left access live.
+    expect(rows[0]!.result).toBe("failure");
+    expect((rows[0]!.details as { reason?: string }).reason).toBe(
+      "expired_ttl_scrub_did_not_complete",
+    );
   });
 
   it("makes no reconcile claim on the strict display listing, which never reconciles", async () => {
