@@ -53,6 +53,21 @@
  * lose. The second half of that definition lives in the store's decode, and it
  * has to: a record admitted by a cast fails HERE instead, outside the per-entry
  * isolation, where it takes every other grant's reconcile down with it.
+ *
+ * THE BOUND, STATED AT ITS OWN POSITION (FG-RECONCILE-ENUM-01). The tolerance
+ * above is PER RECORD. It is not tolerance of an ENUMERATION failure: if the
+ * listing's own scan rejects - a page of the underlying store failing rather
+ * than one record failing to decode - `listEntries` rejects, and this function
+ * throws before `plan.toScrub` exists. Zero entries are scrubbed, including for
+ * every grant that read back perfectly on an earlier page.
+ *
+ * That is the SAME class this module was hardened against, surviving one
+ * position earlier: one fault holding every other grant's access open past its
+ * TTL. It is narrowed, not closed. What closes it is a listing that is tolerant
+ * at the page boundary as well as the record boundary, which is a change to the
+ * store's listing contract rather than a catch added here - so it is a design,
+ * and it is tracked rather than patched. Do not read the per-record tolerance
+ * below as covering it.
  */
 
 import type { AuditLog } from "../operational/audit-log.js";
@@ -196,6 +211,16 @@ export async function reconcileFileGrantTree(
         await deps.store.put(revised);
       } catch (err) {
         flipped = false;
+        // AUDITED UNCONDITIONALLY, BEFORE the deferred-slot race below.
+        // `readableGrantFailure` holds ONE failure and is first-wins, so when a
+        // scrub already failed earlier in this pass, this write error loses the
+        // race and is never thrown. Without a row of its own it would then be
+        // absent from EVERY channel - not thrown, not returned, not logged -
+        // while the earlier scrub failure is the only thing the caller sees.
+        // The scrub path has had `appendScrubFailureAudit` since it gained its
+        // own catch; this is the missing counterpart, and its absence is what
+        // made the deferred slot lossy rather than merely first-wins.
+        await appendStatusWriteFailureAudit(deps, grant, err);
         if (readableGrantFailure === null) readableGrantFailure = err;
       }
     }
@@ -203,7 +228,12 @@ export async function reconcileFileGrantTree(
       // Only a flip that actually landed is reported as one; `expired` names
       // the records whose PERSISTED status changed.
       if (flipped) expired.push(grant.grant_id);
-      await appendExpiryAudit(deps, grant, aclFailureByGrantId.get(grant.grant_id));
+      await appendExpiryAudit(
+        deps,
+        grant,
+        aclFailureByGrantId.get(grant.grant_id),
+        flipped
+      );
     }
   }
 
@@ -304,10 +334,67 @@ async function appendScrubFailureAudit(
   }
 }
 
+/**
+ * The counterpart to `appendScrubFailureAudit` for the OTHER mutation in this
+ * function.
+ *
+ * It exists because the two mutation loops share one deferred-error slot and
+ * that slot is first-wins. A scrub failure earlier in the pass therefore
+ * suppresses this one from the thrown error, and with no row of its own a
+ * status-write failure would be invisible in every channel at once. An access
+ * reduction that did not durably land is not a thing an operator may have to
+ * infer from silence.
+ *
+ * Best-effort like its sibling: an audit failure must never abort a reconcile
+ * that is reducing access.
+ */
+async function appendStatusWriteFailureAudit(
+  deps: ReconcileFileGrantDeps,
+  grant: FileGrant,
+  err: unknown
+): Promise<void> {
+  try {
+    await deps.auditLog?.appendCritical({
+      layer: "l1",
+      operation: "file_grant_revoke",
+      identity_id: deps.reconciledBy ?? "system",
+      result: "failure",
+      details: {
+        grant_id: grant.grant_id,
+        subject_agent_id: grant.subject_agent_id,
+        reason: "expired_ttl_status_write_failed",
+        error: err instanceof Error ? err.message : String(err),
+        // Always false here by construction - this row exists only because the
+        // write rejected - but stated anyway so every row this reconcile emits
+        // for an expiring grant carries the same durability field and an
+        // operator never has to know which helper wrote which row.
+        status_flipped: false,
+      },
+    });
+  } catch {
+    // Best-effort: reconcile still reports what it can to its caller.
+  }
+}
+
+/**
+ * `statusFlipped` is NOT optional bookkeeping detail: it is what keeps this row
+ * from asserting something that did not happen.
+ *
+ * The expiry pass has two independent halves - taking the ACL away, and
+ * persisting the record as expired - and either can fail on its own. A row that
+ * reads `result: "success"` for a grant whose record is still persisted as
+ * `active` tells an operator the TTL was enforced when the durable state says
+ * it was not, and an audit trail that overstates an access REDUCTION is the
+ * direction that gets believed.
+ *
+ * Before this argument existed the caller appended unconditionally, so a
+ * rejected `put` produced exactly that false row.
+ */
 async function appendExpiryAudit(
   deps: ReconcileFileGrantDeps,
   grant: FileGrant,
-  aclFailure?: FileGrantAclRemovalResult
+  aclFailure?: FileGrantAclRemovalResult,
+  statusFlipped: boolean = true
 ): Promise<void> {
   try {
     // Auto-expiry reuses the `file_grant_revoke` audit operation (not a new
@@ -319,12 +406,19 @@ async function appendExpiryAudit(
       layer: "l1",
       operation: "file_grant_revoke",
       identity_id: deps.reconciledBy ?? "system",
-      result: aclFailure ? "failure" : "success",
+      result: aclFailure || !statusFlipped ? "failure" : "success",
       details: {
         grant_id: grant.grant_id,
         subject_agent_id: grant.subject_agent_id,
-        reason: aclFailure ? "expired_ttl_acl_removal_failed" : "expired_ttl_scrub",
+        reason: aclFailure
+          ? "expired_ttl_acl_removal_failed"
+          : statusFlipped
+            ? "expired_ttl_scrub"
+            : "expired_ttl_status_write_failed",
         ...(aclFailure ? { acl_removal: aclFailure } : {}),
+        // Stated on every row rather than only the failing one, so an operator
+        // reading the trail never has to infer durability from a reason string.
+        status_flipped: statusFlipped,
       },
     });
   } catch {

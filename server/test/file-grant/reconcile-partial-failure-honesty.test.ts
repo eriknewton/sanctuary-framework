@@ -200,6 +200,85 @@ describe("file-grant reconcile: the report names every loss in the pass, and cla
     expect(String((error as Error).message)).toContain(writeFailed.message);
   });
 
+  it("never records an expiry as a success when the status write did not land", async () => {
+    // REGRESSION introduced by this PR's own fix round. Gating `expired.push`
+    // on the flip was right; leaving the audit append ungated was not. A
+    // rejected `put` then produced a `result: "success"` /
+    // `reason: "expired_ttl_scrub"` row for a record still persisted as
+    // `active` - the trail asserting the TTL was enforced while the durable
+    // state says it was not. Before the fix round the throw propagated and the
+    // row did not exist at all, so this shipped strictly worse than what it
+    // replaced.
+    const { grantStore, auditLog, fsOps, expiring } = await twoGrants();
+
+    const writeFailed = new Error("state write failed (disk full)");
+    grantStore.put = async () => {
+      throw writeFailed;
+    };
+
+    await reconcileError({ store: grantStore, fsOps, now: PAST_TTL, auditLog });
+
+    // Access WAS removed - this is a bookkeeping lag, not a fail-open.
+    expect(fsOps.scrubbed).toContain(expiring.tree_entry);
+
+    const revokes = await auditLog.query({ operation_type: "file_grant_revoke", limit: 200 });
+    const expiryRows = revokes.entries.filter(
+      (entry) => (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id,
+    );
+    const successRows = expiryRows.filter((entry) => entry.result === "success");
+    // THE PROPERTY: no row may claim success for a flip that did not land.
+    expect(successRows).toHaveLength(0);
+    const scrubClaims = expiryRows.filter(
+      (entry) => (entry.details as { reason?: string } | undefined)?.reason === "expired_ttl_scrub",
+    );
+    expect(scrubClaims).toHaveLength(0);
+    // And the durability is stated outright rather than left to be inferred
+    // from a reason string.
+    for (const entry of expiryRows) {
+      expect((entry.details as { status_flipped?: boolean }).status_flipped).toBe(false);
+    }
+  });
+
+  it("keeps a status-write failure visible even when a scrub failure already claimed the one deferred slot", async () => {
+    // REGRESSION introduced by this PR's own fix round, and the subtler of the
+    // two. `readableGrantFailure` holds ONE failure, first-wins. Adding a catch
+    // around the status write without giving it a row of its own meant that
+    // when a scrub failed earlier in the same pass, the write error was neither
+    // thrown, nor returned, nor recorded: absent from every channel at once.
+    // The scrub path has had an audit row since it gained its catch. This is
+    // the missing counterpart.
+    const removeFailed = new Error("scrub failed first (acl backend down)");
+    const { grantStore, auditLog, fsOps, expiring } = await twoGrants({
+      removeThrows: removeFailed,
+    });
+
+    const writeFailed = new Error("state write failed (disk full)");
+    grantStore.put = async () => {
+      throw writeFailed;
+    };
+
+    const error = await reconcileError({ store: grantStore, fsOps, now: PAST_TTL, auditLog });
+
+    // First-wins is preserved deliberately: the scrub failure is the one that
+    // means access is still live, so it is the right one to throw.
+    expect(error).toBe(removeFailed);
+
+    // But the write failure must still be SOMEWHERE. This is the assertion the
+    // fix round was missing.
+    const revokes = await auditLog.query({ operation_type: "file_grant_revoke", limit: 200 });
+    const writeFailureRows = revokes.entries.filter(
+      (entry) =>
+        (entry.details as { reason?: string } | undefined)?.reason ===
+          "expired_ttl_status_write_failed" &&
+        (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id,
+    );
+    expect(writeFailureRows.length).toBeGreaterThanOrEqual(1);
+    expect(writeFailureRows[0]!.result).toBe("failure");
+    expect((writeFailureRows[0]!.details as { error?: string }).error).toContain(
+      writeFailed.message,
+    );
+  });
+
   it("makes no reconcile claim on the strict display listing, which never reconciles", async () => {
     const { grantStore, stateStore, sibling } = await twoGrants();
 
