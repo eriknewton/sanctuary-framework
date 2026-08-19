@@ -57,6 +57,7 @@ import {
 } from "../../src/cognitive/state-store.js";
 import {
   discloseUnattributedState,
+  UNATTRIBUTED_DISCLOSURE_ATTEMPT_OPERATION,
   UNATTRIBUTED_DISCLOSURE_OPERATION,
 } from "../../src/cognitive/unattributed-disclosure.js";
 import { OpaqueNamespaceRegistry } from "../../src/agent-native/safety-base.js";
@@ -429,6 +430,132 @@ describe("the operator unattributed-disclosure surface", () => {
     });
   });
 
+  it("records an attempt row before the read and a terminal row that says what happened", async () => {
+    // A `success` row committed BEFORE the read says a disclosure happened at
+    // a moment when nothing has been read yet. The pre-read marker and the
+    // terminal answer are two different facts and now have two different
+    // rows: the attempt is durable before anything is read (so a crash
+    // mid-read is not an untraced use of the hole), and the terminal row is
+    // written after the outcome is known.
+    const { storage, stateStore, auditLog } = await makeRig();
+    await plantUnattributableLegacyEntry({
+      storage,
+      namespace: NAMESPACE,
+      key: "orphaned",
+      value: "audited-content",
+      version: 1,
+    });
+
+    const outcome = await discloseUnattributedState({
+      auditLog,
+      stateStore,
+      namespaceRegistry: new OpaqueNamespaceRegistry(),
+      namespace: NAMESPACE,
+      key: "orphaned",
+      identityId: "principal",
+    });
+    expect(outcome.status).toBe("disclosed");
+
+    // The constant must be a real, distinct operation name: querying on an
+    // undefined `operation_type` matches every row, so asserting a count
+    // against it would pass whether or not the attempt row exists.
+    expect(UNATTRIBUTED_DISCLOSURE_ATTEMPT_OPERATION).toBe(
+      "state_disclose_unattributed_attempt"
+    );
+    const attempt = await auditLog.query({
+      operation_type: UNATTRIBUTED_DISCLOSURE_ATTEMPT_OPERATION,
+    });
+    expect(attempt.entries).toHaveLength(1);
+    expect(attempt.entries[0]!.operation).toBe(
+      UNATTRIBUTED_DISCLOSURE_ATTEMPT_OPERATION
+    );
+    expect(attempt.entries[0]!.details).toMatchObject({
+      namespace: NAMESPACE,
+      key: "orphaned",
+    });
+    const terminal = await auditLog.query({
+      operation_type: UNATTRIBUTED_DISCLOSURE_OPERATION,
+    });
+    expect(terminal.entries).toHaveLength(1);
+    expect(terminal.entries[0]!.operation).toBe(UNATTRIBUTED_DISCLOSURE_OPERATION);
+    expect(terminal.entries[0]!.result).toBe("success");
+    // And the terminal row lands AFTER the attempt row, which is the whole
+    // point of splitting them.
+    expect(
+      new Date(terminal.entries[0]!.timestamp).getTime()
+    ).toBeGreaterThanOrEqual(new Date(attempt.entries[0]!.timestamp).getTime());
+  });
+
+  it("writes a terminal failure row when the read throws an unclassified error", async () => {
+    // The classified refusals each audit. An ORDINARY error - a malformed
+    // encrypted payload, a storage fault - carries no classification and was
+    // rethrown with no terminal row at all, leaving the pre-read row as the
+    // log's last word: durable history read "disclosed" for a call that
+    // disclosed nothing and threw.
+    const { auditLog } = await makeRig();
+    const throwingStore = {
+      readUnattributed: async (): Promise<never> => {
+        throw new Error("decryption failed");
+      },
+    } as unknown as StateStore;
+
+    await expect(
+      discloseUnattributedState({
+        auditLog,
+        stateStore: throwingStore,
+        namespaceRegistry: new OpaqueNamespaceRegistry(),
+        namespace: NAMESPACE,
+        key: "orphaned",
+        identityId: "principal",
+      })
+    ).rejects.toThrow("decryption failed");
+
+    const terminal = await auditLog.query({
+      operation_type: UNATTRIBUTED_DISCLOSURE_OPERATION,
+    });
+    expect(terminal.entries).toHaveLength(1);
+    expect(terminal.entries[0]!.result).toBe("failure");
+    expect(terminal.entries[0]!.details).toMatchObject({
+      namespace: NAMESPACE,
+      key: "orphaned",
+      classification: "unclassified_error",
+    });
+  });
+
+  it("names the key on the namespace-firewall rows, not only the namespace", async () => {
+    // The audited claim is "namespace AND key". The firewall rows carried only
+    // the namespace, so the two refusals an operator most wants to reconstruct
+    // were the two that did not say what was asked for.
+    const { stateStore, auditLog } = await makeRig();
+    const reserved = await discloseUnattributedState({
+      auditLog,
+      stateStore,
+      namespaceRegistry: new OpaqueNamespaceRegistry(),
+      namespace: "_identities",
+      key: "target-key",
+      identityId: "principal",
+    });
+    expect(reserved.status).toBe("refused_namespace_reserved");
+
+    const unavailable = await discloseUnattributedState({
+      auditLog,
+      stateStore,
+      namespaceRegistry: new OpaqueNamespaceRegistry(),
+      namespace: "mem_0123456789abcdef0123456789abcdef",
+      key: "handle-key",
+      identityId: "principal",
+    });
+    expect(unavailable.status).toBe("refused_namespace_unavailable");
+
+    const rows = await auditLog.query({
+      operation_type: UNATTRIBUTED_DISCLOSURE_OPERATION,
+    });
+    expect(rows.entries).toHaveLength(2);
+    expect(
+      rows.entries.map((e) => (e.details as { key?: string }).key).sort()
+    ).toEqual(["handle-key", "target-key"]);
+  });
+
   it("audits the refusal too, so a declined use is distinguishable from none", async () => {
     const { stateStore, auditLog, identity, identityEncKey } = await makeRig();
     await stateStore.write(
@@ -690,13 +817,16 @@ describe("the namespace firewall belongs to the operation, not to one transport"
     expect(audit.entries).toHaveLength(1);
     expect(audit.entries[0]!.result).toBe("failure");
     expect(audit.entries[0]!.identity_id).toBe("system");
+    // The KEY is named alongside the namespace. An earlier version omitted it
+    // on the reasoning that the namespace alone justifies the refusal, which
+    // is true of the DECISION and false of the RECORD: this surface claims
+    // every call is audited with the namespace and the key, and a row missing
+    // half of that makes the claim broader than the code.
     expect(audit.entries[0]!.details).toMatchObject({
       namespace: "_reputation",
+      key: "anything",
       denial_class: "namespace_reserved",
     });
-    // The KEY is deliberately absent: the namespace alone justifies the
-    // refusal, and a key an operator never got to disclose is not evidence.
-    expect(audit.entries[0]!.details).not.toHaveProperty("key");
   });
 
   it("refuses an uncurated underscore namespace too, on the blanket rule", async () => {

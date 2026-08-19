@@ -1404,7 +1404,10 @@ export function createCognitiveTools(
       description:
         "Disclose the content of ONE state entry whose writer this fortress cannot establish. " +
         "Tier 1 and non-relaxable: every call requires an explicit human approval that no policy " +
-        "file can waive, and every call is audited with the namespace and the key. " +
+        "file can waive, and every call that reaches the disclosure operation is audited with " +
+        "the namespace and the key (an approval the operator declines is recorded by the " +
+        "approval gate under its own operation, which binds an arguments hash rather than the " +
+        "namespace and key in the clear). " +
         "THIS IS NOT A VERIFIED READ and is not interchangeable with state_read. The result is a " +
         "structurally different shape: there is no `value` and no `signature_verified` field; the " +
         "content arrives as `unattributed_content` alongside `disclosure_kind: " +
@@ -1417,10 +1420,18 @@ export function createCognitiveTools(
         "first, and use `claimed_writer_id` in the result as the lead for WHICH identity to " +
         "restore: it is the entry's own unverified claim about its writer, so check it rather " +
         "than trusting it. This tool REFUSES any entry whose writer can be established, so it is not a way to " +
-        "skip verification on an entry that does not need it; use state_read for those. Read-only: " +
-        "it performs no migration, no re-signing, and no durable write other than its own audit " +
-        "record. It exists for an owner who no longer holds the writer identity and would " +
-        "otherwise have no route to their own content.",
+        "skip verification on an entry that does not need it; use state_read for those. IT ALSO " +
+        "REFUSES, before it reads anything, any reserved namespace (every name beginning with " +
+        "`_`, such as `_identities` and `_principal`) and any opaque `mem_*` handle this session " +
+        "does not own, so a Tier-1 approval cannot become a way to read internal state. Check the " +
+        "namespace against those bounds BEFORE asking a human to approve: an approval spent on a " +
+        "request that can only be refused costs the operator something and buys nothing. " +
+        "Read-only with respect to stored state: it performs no migration, no re-signing, no " +
+        "version-anchor raise, and no mutation of the state store. The writes it does make are " +
+        "its own audit records and, on the CLI transport only, one operator-visible disclosure " +
+        "file that the CLI creates deliberately and names on its receipt. It exists for an owner " +
+        "who no longer holds the writer identity and would otherwise have no route to their own " +
+        "content.",
       inputSchema: {
         type: "object",
         properties: {

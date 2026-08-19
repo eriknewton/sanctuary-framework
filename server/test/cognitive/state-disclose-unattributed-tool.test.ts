@@ -162,6 +162,22 @@ describe("the unattributed-disclosure MCP tool", () => {
     // It must not read as a general-purpose read, so the copy names the ordinary
     // path as the one to try first.
     expect(description).toContain("state_read");
+
+    // THE REFUSAL BOUNDS AN AGENT CANNOT DISCOVER BY TRYING CHEAPLY. Reserved
+    // `_` namespaces and unowned opaque handles are refused BEFORE the read,
+    // but the approval gate runs before that, so an agent that does not know
+    // the bound spends a human's Tier-1 approval on a request that could only
+    // ever be refused. The copy has to state them, and say to check first.
+    expect(description).toContain("_identities");
+    expect(description).toContain("mem_*");
+    expect(description).toMatch(/reserved namespace/i);
+    expect(description).toMatch(/BEFORE asking a human to approve/);
+
+    // And the read-only claim is scoped to the state store, because the CLI
+    // transport does deliberately create a disclosure file. A description that
+    // said "no durable write other than its own audit record" would be false.
+    expect(description).toMatch(/no mutation of the state store/i);
+    expect(description).not.toContain("no durable write other than");
   });
 
   it("returns the distinct shape, not a read result with a flag", async () => {

@@ -52,6 +52,7 @@ import {
 } from "../cognitive/state-store.js";
 import {
   discloseUnattributedState,
+  UNATTRIBUTED_DISCLOSURE_DELIVERY_OPERATION,
   UNATTRIBUTED_DISCLOSURE_OPERATION,
 } from "../cognitive/unattributed-disclosure.js";
 import { IdentityManager } from "../cognitive/tools.js";
@@ -385,7 +386,11 @@ function printHelp(out: Writable): void {
     "Usage: sanctuary state_disclose_unattributed --namespace <ns> --key <key> [options]\n\n" +
       "Discloses the content of one state entry whose writer this fortress cannot\n" +
       "establish. Tier 1: requires an interactive approval that no policy file can\n" +
-      "waive, and every invocation is audited with the namespace and the key.\n\n" +
+      "waive, and every invocation that reaches the disclosure operation is audited\n" +
+      "with the namespace and the key. A request refused on its arguments before the\n" +
+      "fortress is opened (--json to a terminal, a missing flag) is refused before any\n" +
+      "audit log exists; a declined approval is recorded by the approval gate under its\n" +
+      "own operation, which binds an arguments hash rather than the namespace and key.\n\n" +
       "The content is never written to the terminal. It is written verbatim to a\n" +
       "new file under <fortress>/disclosures/ and the terminal prints a receipt\n" +
       "naming that file.\n\n" +
@@ -556,6 +561,50 @@ export async function runStateDiscloseUnattributedCommand(
     }
 
     const disclosure = outcome.disclosure;
+
+    /**
+     * Record what happened to the DELIVERY of this disclosure.
+     *
+     * The shared operation's terminal row says an entry was read. It cannot
+     * say whether the operator received it, because the transport is what
+     * delivers: a file that cannot be written, a receipt that never reaches
+     * the terminal, and a rollback that could not remove the plaintext are all
+     * outcomes that happen after the read succeeded. Without a row here the
+     * durable history reads success while the command told the operator it
+     * failed, and, worse, while plaintext may still be sitting on their disk.
+     * Critical because it is the only durable answer to "did this content
+     * actually leave the fortress".
+     */
+    const auditDelivery = async (
+      deliveryOutcome: string,
+      result: "success" | "failure",
+      extra?: Record<string, unknown>,
+    ): Promise<void> => {
+      try {
+        await auditLog.appendCritical({
+          layer: "l1",
+          operation: UNATTRIBUTED_DISCLOSURE_DELIVERY_OPERATION,
+          identity_id: primary.identity_id,
+          result,
+          details: {
+            namespace,
+            key,
+            delivery_outcome: deliveryOutcome,
+            ...extra,
+          },
+        });
+      } catch {
+        // The delivery row itself could not be persisted. Say so here rather
+        // than letting it fall to the outer handler, which would report a
+        // storage fault as a fortress unlock failure: a false explanation of a
+        // real fault, on the one surface whose job is telling the truth.
+        write(
+          err,
+          "Warning: the disclosure delivery audit record could not be written.\n",
+        );
+      }
+    };
+
     if (json) {
       // Verbatim, and only here: the TTY refusal above already established
       // that a program, not a terminal, is reading this stream. The
@@ -566,6 +615,7 @@ export async function runStateDiscloseUnattributedCommand(
       try {
         payload = JSON.stringify(disclosure);
       } catch {
+        await auditDelivery("json_serialization_failed", "failure");
         write(
           err,
           "Error: could not serialize the disclosure as JSON; a stored field defeats serialization. Use the human path, which writes the content to a file.\n",
@@ -573,6 +623,7 @@ export async function runStateDiscloseUnattributedCommand(
         return 1;
       }
       write(out, payload + "\n");
+      await auditDelivery("delivered_json", "success");
     } else {
       // ORDER OF OPERATIONS, and why: the receipt is composed IN FULL before
       // the content file is written and before any byte reaches the terminal,
@@ -648,6 +699,7 @@ export async function runStateDiscloseUnattributedCommand(
         fileBody = disclosureFileBody(disclosure.unattributed_content);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        await auditDelivery("prepare_failed", "failure");
         write(
           err,
           "Error: could not prepare the disclosure content file: " +
@@ -720,6 +772,9 @@ export async function runStateDiscloseUnattributedCommand(
         // metadata, but it still goes through the unbounded ASCII escape so
         // no path this command prints can carry a raw non-ASCII byte.
         const message = error instanceof Error ? error.message : String(error);
+        await auditDelivery("file_write_failed", "failure", {
+          content_file: contentFilePath,
+        });
         write(
           err,
           "Error: could not write the disclosure content file: " +
@@ -752,6 +807,16 @@ export async function runStateDiscloseUnattributedCommand(
         // plaintext file on their disk, and it is the one case where they
         // must act. When the removal fails the path is named (escaped, like
         // every other path this command prints) and the message says so.
+        // The rollback outcome is part of the durable record, not only of the
+        // message: "the plaintext may still be there, at this path" is the one
+        // fact an operator reading the log later has to be able to find.
+        await auditDelivery(
+          removed
+            ? "receipt_undelivered_file_removed"
+            : "receipt_undelivered_file_may_remain",
+          "failure",
+          { content_file: contentFilePath },
+        );
         write(
           err,
           removed
@@ -762,6 +827,9 @@ export async function runStateDiscloseUnattributedCommand(
         );
         return 3;
       }
+      await auditDelivery("delivered", "success", {
+        content_file: contentFilePath,
+      });
     }
     await auditLog.flush().catch(() => undefined);
     return 0;

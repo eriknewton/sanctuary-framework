@@ -33,6 +33,7 @@ import {
 import { TOP_LEVEL_SUBCOMMANDS } from "../../src/cli/subcommands.js";
 import { UNATTRIBUTED_DISCLOSURE_NOTICE } from "../../src/cognitive/state-store.js";
 import {
+  UNATTRIBUTED_DISCLOSURE_DELIVERY_OPERATION,
   UNATTRIBUTED_DISCLOSURE_OPERATION,
   UNATTRIBUTED_DISCLOSURE_REFUSED_OPERATION,
 } from "../../src/cognitive/unattributed-disclosure.js";
@@ -192,6 +193,38 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     masterKey.fill(0);
   }
 
+  /**
+   * The DELIVERY rows for this fortress. The disclosure operation says an
+   * entry was read; only these say whether the operator actually received it,
+   * which is the fact durable history was missing on every failure path.
+   */
+  async function deliveryRows(
+    root: string = fortressPath
+  ): Promise<Array<{ result: string; details: Record<string, unknown> }>> {
+    // The constant must be a real, distinct operation name: an undefined
+    // `operation_type` matches every row, so a count against it would pass
+    // whether or not any delivery row exists.
+    expect(UNATTRIBUTED_DISCLOSURE_DELIVERY_OPERATION).toBe(
+      "state_disclose_unattributed_delivery"
+    );
+    const storage = new FilesystemStorage(join(root, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      storagePathHint: root,
+    });
+    try {
+      const audit = await new AuditLog(storage, masterKey).query({
+        operation_type: UNATTRIBUTED_DISCLOSURE_DELIVERY_OPERATION,
+      });
+      return audit.entries.map((e) => ({
+        result: e.result,
+        details: (e.details ?? {}) as Record<string, unknown>,
+      }));
+    } finally {
+      masterKey.fill(0);
+    }
+  }
+
   async function runCommand(options: {
     namespace?: string;
     key?: string;
@@ -315,6 +348,18 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
       key: KEY,
     });
     masterKey.fill(0);
+
+    // The delivery row: the operator really did receive this.
+    expect(await deliveryRows()).toEqual([
+      {
+        result: "success",
+        details: expect.objectContaining({
+          namespace: NAMESPACE,
+          key: KEY,
+          delivery_outcome: "delivered",
+        }),
+      },
+    ]);
   });
 
   it("keeps hostile stored bytes off the terminal entirely, and byte-exact in the file", async () => {
@@ -548,6 +593,16 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     // The payload is exactly one JSON document plus this command's own newline.
     expect(out.endsWith("\n")).toBe(true);
     expect(out.slice(0, -1)).toBe(JSON.stringify(parsed));
+    expect(await deliveryRows()).toEqual([
+      {
+        result: "success",
+        details: expect.objectContaining({
+          namespace: NAMESPACE,
+          key: KEY,
+          delivery_outcome: "delivered_json",
+        }),
+      },
+    ]);
   });
 
   it("fails loudly when the content file already exists, without overwriting or printing", async () => {
@@ -572,6 +627,16 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     // ...and no fallback to the terminal: the content is nowhere.
     expect(out).not.toContain(CONTENT);
     expect(out).not.toContain("content written to:");
+    expect(await deliveryRows()).toEqual([
+      {
+        result: "failure",
+        details: expect.objectContaining({
+          namespace: NAMESPACE,
+          key: KEY,
+          delivery_outcome: "file_write_failed",
+        }),
+      },
+    ]);
   });
 
   it("completes the receipt, with the file path, when a stored field defeats JSON serialization", async () => {
@@ -648,6 +713,16 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     expect(out).toBe("");
     expect(err).toContain("could not serialize the disclosure as JSON");
     expect(err).not.toContain("could not open or unlock");
+    expect(await deliveryRows()).toEqual([
+      {
+        result: "failure",
+        details: expect.objectContaining({
+          namespace: NAMESPACE,
+          key: KEY,
+          delivery_outcome: "json_serialization_failed",
+        }),
+      },
+    ]);
   });
 
   it("enforces 0700 on a pre-existing disclosures directory, not only on a created one", async () => {
@@ -774,6 +849,19 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
       // The rollback: the just-written file is gone, and nothing else was left.
       await expect(readFile(expectedPath)).rejects.toThrow();
       expect(await readdir(join(fortressPath, "disclosures"))).toHaveLength(0);
+      // Durable history says the operator did NOT get it, which is what the
+      // command told them. Without this row the log's last word is the
+      // disclosure success.
+      expect(await deliveryRows()).toEqual([
+        {
+          result: "failure",
+          details: expect.objectContaining({
+            namespace: NAMESPACE,
+            key: KEY,
+            delivery_outcome: "receipt_undelivered_file_removed",
+          }),
+        },
+      ]);
     }
   );
 
@@ -815,6 +903,23 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     // And the file really does remain, which is what the message now says.
     const fileBytes = await readFile(expectedPath);
     expect(fileBytes.equals(Buffer.from(CONTENT, "utf8"))).toBe(true);
+    // The row has to record that plaintext MAY REMAIN, and where: this is the
+    // one outcome where the operator has to go and do something.
+    const rows = await deliveryRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.result).toBe("failure");
+    expect(rows[0]!.details).toMatchObject({
+      namespace: NAMESPACE,
+      key: KEY,
+      delivery_outcome: "receipt_undelivered_file_may_remain",
+      // The CANONICAL path, the same one the receipt would have named and the
+      // one an operator can act on without re-resolving a link.
+      content_file: join(
+        await realpath(fortressPath),
+        "disclosures",
+        "disclosure-20260819T020000Z-112233.txt"
+      ),
+    });
   });
 
   it("succeeds when the operator's storage ROOT is itself a symlink", async () => {
@@ -873,6 +978,16 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     // And no receipt claimed anything happened.
     expect(out).not.toContain("content written to:");
     expect(out).not.toContain(CONTENT);
+    expect(await deliveryRows()).toEqual([
+      {
+        result: "failure",
+        details: expect.objectContaining({
+          namespace: NAMESPACE,
+          key: KEY,
+          delivery_outcome: "prepare_failed",
+        }),
+      },
+    ]);
   });
 
   it("encodes caller input on the refusal paths, which print before any record is read", async () => {
