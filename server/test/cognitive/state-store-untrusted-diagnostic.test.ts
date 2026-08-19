@@ -1,14 +1,13 @@
 /**
- * STATE-STORE-ERRMSG-INTERP-01 regression.
+ * Regression cover for register row STATE-STORE-ERRMSG-INTERP-01.
  *
- * A state entry is read back with `JSON.parse`, so its declared TypeScript
- * shape is a bare assertion and every field can hold any JSON value at runtime.
- * Building a diagnostic out of such a field must not be able to fail: if it
- * does, the correctly-detected failure is replaced by an unrelated one and the
- * operator is told the wrong thing.
+ * PROPERTY UNDER TEST: whatever a persisted state entry holds in its fields,
+ * the state store's refusal reaches the caller as its own typed, bounded
+ * verdict. A malformed stored field must change WHAT the store reports, never
+ * WHETHER the report arrives.
  *
- * These tests assert the MECHANISM (a typed, bounded refusal reaches the
- * caller), not merely that something threw.
+ * These assert the mechanism (a typed refusal, with a length that does not
+ * scale with the stored value), not merely that something threw.
  */
 import { describe, expect, it } from "vitest";
 import {
@@ -64,9 +63,8 @@ describe("state-store diagnostics over untrusted stored fields", () => {
   it("reports kid_unknown for a deeply nested stored kid instead of overflowing the stack", async () => {
     const store = makeStore();
 
-    // FAIL-BEFORE: on the unfixed code this rejects with
-    // `RangeError: Maximum call stack size exceeded`, so the caller never sees
-    // the real diagnosis at all.
+    // FAIL-BEFORE: confirmed failing against the pre-fix tree, where the
+    // caller never received this typed verdict at all.
     const result = await store.remintVerifiedProvenanceStampForExport(
       entryWithKid(deeplyNested()),
       "ns",
@@ -129,9 +127,8 @@ describe("state-store diagnostics over untrusted stored fields", () => {
       payload: encrypt(stringToBytes("plaintext"), namespaceKey),
     }).replace('"PLACEHOLDER_KID"', nestedJson);
 
-    // FAIL-BEFORE: on the unfixed code the deeply nested kid reaches the
-    // resolver and the message template, and a RangeError escapes in place of
-    // the typed rotation refusal.
+    // FAIL-BEFORE: confirmed failing against the pre-fix tree, where the typed
+    // rotation refusal was not what reached the caller.
     await expect(
       rotateStateEntryBytes({
         raw: stringToBytes(entryJson),
