@@ -23,6 +23,39 @@
 # .githooks/pre-commit for the authoritative copy and the postmortem
 # at docs/audit/commit-4ac95830-postmortem.md for the specific
 # failure class it defends against).
+#
+# BASELINE AUTOCORRECT (added 2026-08-19, design:
+# Review/Sanctuary/Baseline_Autocorrect_Design_2026-08-19.md, Erik-approved).
+# Measured on 2026-08-19: 3 of 3 same-day PRs failed this guard on the
+# integer alone (a guessed .test-baseline value that did not match what
+# Linux CI actually counted), each costing a full ~15-minute CI cycle. The
+# builder cannot compute the true count locally (the suite is a serialized
+# macOS resource and the macOS count differs from the Linux count anyway), so
+# every PR was asking a human or agent to predict a number only the machine
+# running THIS job can know.
+#
+# When Gate 2c finds a passing count that disagrees with the PR's committed
+# `.test-baseline`, AND every other gate in this job passed, AND the new
+# count is a genuine improvement over the BASE branch's floor (never a
+# regression), this job writes the correct integer and pushes a single-file
+# commit to the PR branch itself, then intentionally leaves ITS OWN run
+# non-green (the pushed commit, not this stale SHA, is the one that should
+# read as passing) and lets the re-triggered run confirm it.
+#
+# The actual decision (all five preconditions, the loop bound, the fork bar)
+# lives in scripts/baseline-autocorrect-decision.sh, unit-tested by
+# scripts/baseline-autocorrect-decision-self-test.sh, NOT inline here — a
+# conditional this security-sensitive (it gates whether CI pushes a commit to
+# someone else's branch) cannot be verified by reading YAML. This job's job
+# is only to gather the honest inputs (parsed counts, a fresh remote-tip
+# read, the PR's real head commit, whether the PR is from a fork) and hand
+# them to that script unchanged.
+#
+# What still fails exactly as before: gate 2a/2b failures, any real test
+# failure, a count at or below the base floor (a REGRESSION, not a drift —
+# the human-authored `-N` path with its written justification still applies),
+# any push directly to main (no PR branch exists to autocorrect on), and any
+# fork PR (no write access is even considered).
 
 name: Test Baseline Guard
 
@@ -39,6 +72,14 @@ jobs:
   test-baseline-guard:
     name: test-baseline-guard
     runs-on: ubuntu-latest
+    # Scoped to the minimum this job needs and no more: write access ONLY to
+    # repository contents (so it can push the single-file autocorrect
+    # commit), nothing else. Every other permission this job might touch
+    # (issues, pull-requests, actions, etc.) stays at the top-level `read`
+    # default. This is the narrowest unit GitHub Actions permission syntax
+    # allows — there is no per-step permission scoping.
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
@@ -180,7 +221,8 @@ jobs:
           fi
           echo "✓ All $expected_files test files loaded by vitest."
 
-      - name: Gate 2c — passing count >= baseline
+      - name: Gate 2c — passing count vs baseline
+        id: gate2c
         run: |
           baseline="${{ steps.baseline.outputs.baseline }}"
           passing=$(grep -oE "Tests[[:space:]]+[0-9]+ passed" /tmp/vitest-output.log | grep -oE "[0-9]+" | head -1)
@@ -191,18 +233,216 @@ jobs:
           fi
           echo "Baseline floor: $baseline"
           echo "Passing tests:  $passing"
+          echo "passing=$passing" >> "$GITHUB_OUTPUT"
+
+          if (( passing == baseline )); then
+            echo "✓ Baseline guard passed."
+            echo "needs_decision=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if (( passing < baseline )); then
             echo "::error::Test baseline regression: baseline=$baseline, passing=$passing, missing $((baseline - passing)) tests. Fix the regression or update .test-baseline in a separate explicitly-scoped commit."
-            exit 1
-          fi
-          # Fail-above (mirror of the pre-commit hook): a passing count
-          # higher than the floor must be locked into .test-baseline in
-          # the SAME PR. A stale low floor lets a later regression hide
-          # under the gap — the extra passing tests mask the loss until
-          # the floor is finally bumped. The fix is mechanical: set
-          # .test-baseline to the new count in this PR.
-          if (( passing > baseline )); then
+          else
+            # Fail-above (mirror of the pre-commit hook): a passing count
+            # higher than the floor must be locked into .test-baseline in
+            # the SAME PR. A stale low floor lets a later regression hide
+            # under the gap — the extra passing tests mask the loss until
+            # the floor is finally bumped. The fix is mechanical: set
+            # .test-baseline to the new count in this PR.
             echo "::error::Test baseline drifted above the floor: baseline=$baseline, passing=$passing, $((passing - baseline)) new tests above floor. Raise .test-baseline to $passing IN THIS PR. A deferred bump lets a future regression hide under the stale floor."
+          fi
+
+          # Autocorrect is only ever a candidate on a same-repo pull_request:
+          # a push event has no PR branch to push a fix to, and a fork PR
+          # never gets write access considered (scripts/baseline-autocorrect-
+          # decision.sh enforces the fork bar again independently below; this
+          # is the first of the two bars, not the only one). Everything else
+          # fails exactly as it did before this feature existed.
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "Not a pull_request run; not eligible for autocorrect. Failing as before."
             exit 1
           fi
-          echo "✓ Baseline guard passed."
+          echo "needs_decision=true" >> "$GITHUB_OUTPUT"
+
+      - name: Determine fork-PR status
+        id: fork-check
+        if: steps.gate2c.outputs.needs_decision == 'true'
+        run: |
+          # `pull_request` (never `pull_request_target`) already denies this
+          # job's token write scope on a fork PR at the platform level; this
+          # output is the second, explicit bar that
+          # scripts/baseline-autocorrect-decision.sh's FORK_PR check consumes,
+          # so the refusal is provable in that script's own unit tests rather
+          # than resting on GitHub's event-permission model alone.
+          if [[ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]]; then
+            echo "is_fork=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_fork=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Read base branch's .test-baseline (autocorrect regression floor)
+        id: base-floor
+        if: steps.gate2c.outputs.needs_decision == 'true'
+        # BASE_REF goes through env, never `${{ github.base_ref }}` spliced
+        # straight into the script body: a git ref name is allowed to contain
+        # `$`, backticks, and quotes (git only excludes a short, different
+        # set of characters), so a base branch named to exploit that would
+        # have its bytes evaluated as shell BEFORE bash ever runs if it were
+        # templated directly into the script text. Routed through the
+        # environment, the same hostile bytes are inert data in "$BASE_REF".
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          # Deliberately NOT steps.baseline.outputs.baseline: that output is
+          # the PR's OWN committed value, which may itself be the guess that
+          # was wrong. Condition 4 of the autocorrect decision must compare
+          # against the pristine BASE branch's floor, or a PR that already
+          # guessed wrong could use its own bad guess as the regression
+          # floor. A shallow, single-ref fetch by name is used rather than
+          # trusting whatever the initial checkout's shallow history happens
+          # to include, since that is not a documented guarantee for a
+          # merge-commit checkout's parent objects.
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          base_floor="$(git show FETCH_HEAD:.test-baseline | tr -d '[:space:]')"
+          if ! [[ "$base_floor" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not read a valid integer .test-baseline from origin/$BASE_REF; got: '$base_floor'"
+            exit 1
+          fi
+          echo "Base branch ($BASE_REF) floor: $base_floor"
+          echo "base_floor=$base_floor" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the PR's real head (not this checkout's merge commit)
+        id: pr-head
+        if: steps.gate2c.outputs.needs_decision == 'true'
+        # See the base-floor step's comment on why ref names and free-text
+        # commit content are never spliced directly into a `run:` script.
+        # PR_HEAD_SHA is server-validated hex so it is technically low-risk
+        # either way, but it is routed the same way for consistency with
+        # HEAD_REF, which is a genuine attacker-influenced ref name.
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          # actions/checkout on a pull_request event checks out the
+          # synthetic refs/pull/N/merge commit by default, so this job's own
+          # HEAD is a GitHub-generated merge commit, never the PR's actual
+          # last commit — see the matching comment in
+          # scripts/baseline-autocorrect-decision.sh for why every check that
+          # cares about "the PR's real head" takes it as an explicit input
+          # instead of reading the checkout's HEAD. Fetching the head SHA by
+          # object id (rather than assuming the shallow merge-commit checkout
+          # already has it as a full object) is what makes `git log` on it
+          # reliable regardless of checkout depth.
+          git fetch --no-tags --depth=1 origin "$PR_HEAD_SHA"
+          head_commit_subject="$(git log -1 --format=%s "$PR_HEAD_SHA")"
+
+          # A LIVE read of the branch's current tip, taken as close as
+          # possible to the moment the write decision is made (this step
+          # runs right before it). Compared against pr_head_sha by the
+          # decision script's HEAD_SHA_MISMATCH check to catch a push that
+          # landed on the PR branch while this ~10+ minute job was running.
+          remote_head_sha="$(git ls-remote origin "refs/heads/$HEAD_REF" | cut -f1)"
+          if [[ -z "$remote_head_sha" ]]; then
+            echo "::error::Could not read the current tip of $HEAD_REF from origin."
+            exit 1
+          fi
+
+          {
+            echo "pr_head_sha=$PR_HEAD_SHA"
+            echo "remote_head_sha=$remote_head_sha"
+            echo "head_commit_subject<<BASELINE_AUTOCORRECT_EOF"
+            echo "$head_commit_subject"
+            echo "BASELINE_AUTOCORRECT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Decide and, if safe, autocorrect .test-baseline
+        if: steps.gate2c.outputs.needs_decision == 'true'
+        # Every value below is routed through env rather than spliced
+        # directly into the script body. PASSING/BASE_FLOOR/IS_FORK are
+        # already regex-validated by the steps that produced them, but
+        # HEAD_COMMIT_SUBJECT is raw, attacker-controlled free text (a PR's
+        # commit message, entirely up to whoever authored it) and HEAD_REF is
+        # an attacker-influenced ref name — see the base-floor step's comment
+        # for why templating either straight into a `run:` script in a job
+        # with `contents: write` would be a script-injection hole, not a
+        # style nit.
+        env:
+          PASSING: ${{ steps.gate2c.outputs.passing }}
+          BASE_FLOOR: ${{ steps.base-floor.outputs.base_floor }}
+          PR_HEAD_SHA: ${{ steps.pr-head.outputs.pr_head_sha }}
+          REMOTE_HEAD_SHA: ${{ steps.pr-head.outputs.remote_head_sha }}
+          HEAD_COMMIT_SUBJECT: ${{ steps.pr-head.outputs.head_commit_subject }}
+          IS_FORK: ${{ steps.fork-check.outputs.is_fork }}
+          HEAD_REF: ${{ github.head_ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e
+          decision_output="$(scripts/baseline-autocorrect-decision.sh \
+            --gate2a-status pass \
+            --gate2b-status pass \
+            --failures 0 \
+            --observed-count "$PASSING" \
+            --base-floor "$BASE_FLOOR" \
+            --pr-head-sha "$PR_HEAD_SHA" \
+            --remote-head-sha "$REMOTE_HEAD_SHA" \
+            --head-commit-subject "$HEAD_COMMIT_SUBJECT" \
+            --is-fork-pr "$IS_FORK")"
+          decision_status=$?
+          set -e
+          echo "$decision_output"
+
+          # gate2a-status/gate2b-status/failures are passed as constants
+          # here, not measured again: reaching this step already required
+          # the Gate 2a and Gate 2b steps above (and the `npm test` step
+          # before them) to have exited zero, since a GitHub Actions job
+          # stops at the first failing step by default and none of those
+          # steps were skipped. The decision script still validates them
+          # itself (see its own unit tests for gate-2a-fail / gate-2b-fail /
+          # test-failure-present) so it stays correct if this job's step
+          # order or continue-on-error behavior ever changes; today, in this
+          # wiring, they can only ever be "pass"/"pass"/"0" by construction.
+          if [[ "$decision_status" -ne 0 ]]; then
+            echo "::error::Baseline autocorrect refused (see DECISION/REASON above). This is not the integer-only case; fix .test-baseline by hand as the original Gate 2c error above describes."
+            exit 1
+          fi
+
+          new_baseline="$(printf '%s\n' "$decision_output" | grep -m1 '^NEW_BASELINE=' | cut -d= -f2)"
+          if ! [[ "$new_baseline" =~ ^[0-9]+$ ]]; then
+            echo "::error::Decision script reported ACCEPT but printed no valid NEW_BASELINE; refusing to write blindly."
+            exit 1
+          fi
+
+          # Commit ON the PR's real head, never on this job's merge-commit
+          # checkout (see the pr-head step above): checking out the head SHA
+          # directly means the pushed commit's parent is exactly the branch
+          # tip a moment ago, so the push below is a plain fast-forward, not
+          # a rewrite, and cannot smuggle in anything from the synthetic
+          # merge state.
+          git checkout --quiet "$PR_HEAD_SHA"
+
+          printf '%s\n' "$new_baseline" > .test-baseline
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .test-baseline
+          git commit --quiet \
+            -m "chore(ci): set .test-baseline to $new_baseline (autocorrect)" \
+            -m "run: $RUN_URL" \
+            -m "observed_count=$new_baseline base_floor=$BASE_FLOOR"
+          git push origin "HEAD:$HEAD_REF"
+
+          echo "::notice title=Baseline autocorrected::.test-baseline set to $new_baseline (base floor $BASE_FLOOR) and pushed to $HEAD_REF. This run's SHA is now stale; the re-triggered run on the new commit verifies it."
+          {
+            echo "### Baseline autocorrected"
+            echo
+            echo "- New \`.test-baseline\`: **$new_baseline**"
+            echo "- Base branch floor: $BASE_FLOOR"
+            echo "- Pushed to: \`$HEAD_REF\`"
+            echo "- This run's SHA is intentionally left non-green; the re-triggered run on the pushed commit confirms the corrected floor."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # This run's own checked-out SHA genuinely did not match its
+          # baseline; only the commit just pushed does. Exiting non-zero here
+          # keeps that true — a green check on the stale SHA would be a false
+          # signal, not a convenience.
+          exit 1
