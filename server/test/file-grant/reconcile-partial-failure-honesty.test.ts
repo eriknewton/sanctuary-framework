@@ -68,12 +68,19 @@ async function mintGrant(
  * first grant's access, which is the only thing that distinguishes a reconcile
  * that ran from one that never reached its removal loop.
  */
-async function twoGrants(opts: { removeThrows?: Error } = {}) {
+async function twoGrants(
+  opts: { removeThrows?: Error; removeAclThrows?: Error } = {},
+) {
   const store = await makeFileGrantTestStore();
   const fsOps = new FakeFsOps({
     agentUid: 502,
     sourceOwnerUid: 501,
     ...(opts.removeThrows ? { removeThrows: opts.removeThrows } : {}),
+    // Forwarded, because it was not. `removeThrows` makes `removeEntry` THROW;
+    // `removeAclThrows` makes it RETURN a structured failure. They are
+    // different branches of the scrub loop, and a helper that silently drops
+    // the second means every test written against it exercises the first.
+    ...(opts.removeAclThrows ? { removeAclThrows: opts.removeAclThrows } : {}),
   });
   const seed = { fsOps, store: store.grantStore, auditLog: store.auditLog };
   const expiring = await mintGrant(seed, "agent-expiring", "/tmp/expiring.txt");
@@ -87,6 +94,31 @@ async function reconcileError(deps: Parameters<typeof reconcileFileGrantTree>[0]
     () => null,
     (err: unknown) => err,
   );
+}
+
+/**
+ * Give a grant a darwin ACE whose inode identity matches, so `removeEntry`
+ * reaches the ACL-removal branch. Combined with `removeAclThrows` this yields a
+ * STRUCTURED failure (`scrubbed: false`) rather than a throw, which is a
+ * different code path in the scrub loop and the one the throw-based fixtures
+ * never reach.
+ */
+async function giveDarwinAce(
+  store: TestStore["grantStore"],
+  grantId: string,
+  path: string,
+): Promise<void> {
+  const live = await store.get(grantId);
+  await store.put({
+    ...live!,
+    granted_read_ace: {
+      agent_uid: 502,
+      platform: "darwin",
+      source_realpath: path,
+      source_dev: DEFAULT_FAKE_SOURCE_IDENTITY.source_dev,
+      source_ino: DEFAULT_FAKE_SOURCE_IDENTITY.source_ino,
+    },
+  });
 }
 
 describe("file-grant reconcile: a record that does not decode is one record, not the whole pass", () => {
@@ -231,6 +263,10 @@ describe("file-grant reconcile: the report names every loss in the pass, and cla
     const expiryRows = revokes.entries.filter(
       (entry) => (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id,
     );
+    // NOT VACUOUS. Asserting only "no success rows" passes when there are no
+    // rows at all, which is a different outcome and would hide the append being
+    // dropped entirely. Pin that the row exists first.
+    expect(expiryRows.length).toBeGreaterThan(0);
     const successRows = expiryRows.filter((entry) => entry.result === "success");
     // THE PROPERTY: no row may claim success for a flip that did not land.
     expect(successRows).toHaveLength(0);
@@ -263,6 +299,10 @@ describe("file-grant reconcile: the report names every loss in the pass, and cla
       throw writeFailed;
     };
 
+    const rowsForGrantBefore = (await auditLog.query({ limit: 500 })).entries.filter(
+      (entry) => (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id,
+    ).length;
+
     const error = await reconcileError({ store: grantStore, fsOps, now: PAST_TTL, auditLog });
 
     // First-wins is preserved deliberately: the scrub failure is the one that
@@ -290,12 +330,16 @@ describe("file-grant reconcile: the report names every loss in the pass, and cla
     expect((writeFailureRows[0]!.details as { error?: string }).error).toContain(
       writeFailed.message,
     );
-    // And the whole grant emits one row this pass, not one per helper that had
-    // an opinion about it.
-    const allRowsForGrant = revokes.entries.filter(
+    // And THIS PASS emits one row for the grant, not one per helper that had an
+    // opinion about it. Measured as a delta across every audit operation rather
+    // than by filtering one operation name: a duplicate written under a
+    // different operation would be invisible to a scoped filter, and the
+    // fixture's own mint rows carry the same grant_id so an absolute count over
+    // all operations would be counting setup.
+    const rowsForGrantAfter = (await auditLog.query({ limit: 500 })).entries.filter(
       (entry) => (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id,
-    );
-    expect(allRowsForGrant).toHaveLength(1);
+    ).length;
+    expect(rowsForGrantAfter - rowsForGrantBefore).toBe(1);
   });
 
   it("still records a rejected write on the clear-the-ACE path, where no expiry row is due", async () => {
@@ -341,10 +385,92 @@ describe("file-grant reconcile: the report names every loss in the pass, and cla
       (entry) =>
         (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id &&
         (entry.details as { reason?: string } | undefined)?.reason ===
-          "expired_ttl_status_write_failed",
+          "ace_metadata_clear_persist_failed",
     );
     expect(rows).toHaveLength(1);
     expect(rows[0]!.result).toBe("failure");
+    // The reason must NOT claim an expiry: nothing aged out here, the grant was
+    // revoked. An `expired_ttl_*` label on this path tells an operator the
+    // wrong story about why access changed.
+    const expiryLabelled = revokes.entries.filter(
+      (entry) =>
+        (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id &&
+        String((entry.details as { reason?: string } | undefined)?.reason ?? "").startsWith(
+          "expired_ttl",
+        ),
+    );
+    expect(expiryLabelled).toHaveLength(0);
+  });
+
+  it("never lets one grant's failure audit sit between another grant's scrub", async () => {
+    // The module's ordering rule is that the scrub loop takes access away and
+    // nothing which can block may run inside it. The scrub-failure audit was
+    // awaited in that loop, so grant A's durable append sat between A's failed
+    // scrub and B's `removeEntry`, and nothing bounds how long an append takes.
+    // A blocked audit on one grant therefore held another grant's access open
+    // past its TTL. Position is the assertion, exactly as it is for the
+    // unreadable-record trail.
+    const { grantStore, auditLog, fsOps, expiring, sibling } = await twoGrants({
+      removeAclThrows: new Error("acl backend down"),
+    });
+    await giveDarwinAce(grantStore, expiring.grant_id, "/tmp/expiring.txt");
+    await giveDarwinAce(grantStore, sibling.grant_id, "/tmp/sibling.txt");
+
+    const realAppend = auditLog.appendCritical.bind(auditLog);
+    auditLog.appendCritical = (async (entry: Parameters<typeof realAppend>[0]) => {
+      const reason = (entry.details as { reason?: string } | undefined)?.reason;
+      if (reason === "reconcile_acl_removal_failed") {
+        fsOps.events.push("audit:scrub-failure");
+      }
+      return realAppend(entry);
+    }) as typeof auditLog.appendCritical;
+
+    await reconcileError({ store: grantStore, fsOps, now: PAST_TTL, auditLog });
+
+    const firstAudit = fsOps.events.indexOf("audit:scrub-failure");
+    const removals = fsOps.events
+      .map((e, i) => (e.startsWith("remove:") ? i : -1))
+      .filter((i) => i >= 0);
+    expect(firstAudit).toBeGreaterThanOrEqual(0);
+    expect(removals.length).toBeGreaterThan(1);
+    // EVERY removal precedes the first failure audit. Asserting only "the last
+    // removal happened" would pass with an append wedged between the two.
+    expect(Math.max(...removals)).toBeLessThan(firstAudit);
+    expect(sibling.grant_id).toBeTruthy();
+    expect(expiring.grant_id).toBeTruthy();
+  });
+
+  it("reports a structured ACL failure twice, which is a known bound and not the fixed duplicate", async () => {
+    // PINS A BOUND RATHER THAN A FIX. When `removeEntry` reports a structured
+    // failure (rather than throwing) and the status write then rejects, the
+    // grant gets a `reconcile_acl_removal_failed` row from the scrub trail AND
+    // an `expired_ttl_acl_removal_failed` row from the expiry append. That is
+    // one fault described twice, in two vocabularies, and it predates the
+    // duplicate this PR removed.
+    //
+    // It is pinned here so the "one row per grant per pass" claim is not made
+    // where it is untrue, and so a future fix that picks a canonical row has a
+    // test to flip rather than a behaviour to discover. Register:
+    // FG-RECONCILE-ACL-DOUBLE-01.
+    const { grantStore, auditLog, fsOps, expiring } = await twoGrants({
+      removeAclThrows: new Error("acl backend down"),
+    });
+    await giveDarwinAce(grantStore, expiring.grant_id, "/tmp/expiring.txt");
+    grantStore.put = async () => {
+      throw new Error("state write failed (disk full)");
+    };
+
+    await reconcileError({ store: grantStore, fsOps, now: PAST_TTL, auditLog });
+
+    const revokes = await auditLog.query({ operation_type: "file_grant_revoke", limit: 200 });
+    const reasons = revokes.entries
+      .filter((e) => (e.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id)
+      .map((e) => (e.details as { reason?: string }).reason)
+      .sort();
+    expect(reasons).toEqual([
+      "expired_ttl_acl_removal_failed",
+      "reconcile_acl_removal_failed",
+    ]);
   });
 
   it("makes no reconcile claim on the strict display listing, which never reconciles", async () => {

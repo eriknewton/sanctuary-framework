@@ -156,6 +156,14 @@ export async function reconcileFileGrantTree(
   // below.
   const aclFailureByGrantId = new Map<string, FileGrantAclRemovalResult>();
   const confirmedScrubbedGrantIds = new Set<string>();
+  // Collected during the scrub loop, appended after it. See the deferral note
+  // at the push site: an awaited append between two grants' scrubs delays the
+  // second grant's access removal.
+  const deferredScrubFailureAudits: Array<{
+    entry: (typeof plan.toScrub)[number];
+    grant: FileGrant | undefined;
+    aclRemoval: FileGrantAclRemovalResult;
+  }> = [];
   for (const entry of plan.toScrub) {
     try {
       const grant = grantsById.get(entry.grant_id);
@@ -168,7 +176,20 @@ export async function reconcileFileGrantTree(
         confirmedScrubbedGrantIds.add(entry.grant_id);
       } else {
         aclFailureByGrantId.set(entry.grant_id, removeResult.aclRemoval);
-        await appendScrubFailureAudit(deps, entry, grant, removeResult.aclRemoval);
+        // DEFERRED, NOT APPENDED HERE. This append used to be awaited inside
+        // the loop, so one grant's audit write sat between that grant's failed
+        // scrub and the NEXT grant's `removeEntry`. Nothing bounds how long a
+        // durable append takes, and this loop is the only thing that takes
+        // expired access away, so a slow or blocked audit on grant A held
+        // grant B's access open past its TTL. The module header already states
+        // the rule this violated, and the unreadable-record trail was moved
+        // below for exactly this reason; the scrub loop's own failure append
+        // was left behind.
+        deferredScrubFailureAudits.push({
+          entry,
+          grant,
+          aclRemoval: removeResult.aclRemoval,
+        });
         if (readableGrantFailure === null) {
           readableGrantFailure = new Error(
             `Governed File-Grant: failed to remove ACL for ` +
@@ -223,14 +244,24 @@ export async function reconcileFileGrantTree(
         if (readableGrantFailure === null) readableGrantFailure = err;
       }
     }
-    // EXACTLY ONE ROW PER GRANT PER PASS, and the branching exists only to keep
-    // it that way. An earlier round emitted the write failure from its own
-    // helper AND from the expiry append, so one rejected `put` produced two
-    // records carrying the same reason: a single fault reported as two events,
+    // ONE ROW PER FAILED STATUS WRITE, which is narrower than "one row per
+    // grant per pass" and the narrower claim is the true one.
+    //
+    // What this branching fixes: an earlier round emitted the write failure
+    // from its own helper AND from the expiry append, both carrying the same
+    // reason, so one rejected `put` produced two records describing one fault,
     // 2F appends for F failures, and the retention budget consumed twice as
     // fast. `appendExpiryAudit` already runs on the expiring path and already
     // carries the durability, so it takes the error too; the separate helper is
     // reached ONLY on the path where that append does not run at all.
+    //
+    // What it does NOT fix, stated here because the stronger claim was made and
+    // was wrong: a STRUCTURED ACL-removal failure still produces two rows for
+    // one fault, `reconcile_acl_removal_failed` from the scrub trail and
+    // `expired_ttl_acl_removal_failed` from this append. That pair predates the
+    // duplicate above and picking a canonical row is a consumer-visible
+    // decision, so it is tracked (FG-RECONCILE-ACL-DOUBLE-01) and pinned by a
+    // test rather than changed here.
     if (shouldExpire) {
       // Only a flip that actually landed is reported as one; `expired` names
       // the records whose PERSISTED status changed.
@@ -249,6 +280,18 @@ export async function reconcileFileGrantTree(
       // on exactly the path the expiry row does not cover.
       await appendStatusWriteFailureAudit(deps, grant, writeError);
     }
+  }
+
+  // THE DEFERRED SCRUB-FAILURE TRAIL RUNS HERE, for the same reason the
+  // unreadable-record trail below does: every access removal this pass will
+  // attempt has already been attempted, so an append can no longer delay one.
+  for (const deferred of deferredScrubFailureAudits) {
+    await appendScrubFailureAudit(
+      deps,
+      deferred.entry,
+      deferred.grant,
+      deferred.aclRemoval
+    );
   }
 
   // THE UNREADABLE-RECORD TRAIL RUNS HERE, AFTER BOTH MUTATION LOOPS. It is a
@@ -376,12 +419,20 @@ async function appendStatusWriteFailureAudit(
       details: {
         grant_id: grant.grant_id,
         subject_agent_id: grant.subject_agent_id,
-        reason: "expired_ttl_status_write_failed",
+        // NOT an expiry reason, because nothing expired on this path. This
+        // helper is now reached only when a REVOKED grant's record failed to
+        // persist its cleared ACE metadata: no TTL passed, no status
+        // transition was attempted. Labelling it `expired_ttl_*` told an
+        // operator a grant had aged out when it had been revoked, which is a
+        // different event with a different cause. `revoke.ts` already had the
+        // accurate word for it and this reuses it rather than minting a
+        // second name for one thing.
+        reason: "ace_metadata_clear_persist_failed",
         error: err instanceof Error ? err.message : String(err),
-        // Always false here by construction - this row exists only because the
-        // write rejected - but stated anyway so every row this reconcile emits
-        // for an expiring grant carries the same durability field and an
-        // operator never has to know which helper wrote which row.
+        // False by construction here: this row exists only because the write
+        // rejected. Stated anyway so every row this reconcile emits for a
+        // grant carries the same durability field, and an operator never has
+        // to know which helper wrote which row.
         status_flipped: false,
       },
     });
