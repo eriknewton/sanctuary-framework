@@ -52,6 +52,11 @@ import type {
   NodeIdentityCertificate,
   PrincipalCertificate,
 } from "./types.js";
+// certificates arrive off the wire and are compared here BEFORE their
+// signature is checked, so every field is attacker-chosen at this point;
+// diagnostics go through the untrusted-diagnostic chokepoint (STATE-STORE-
+// ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 export const NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING =
   "sanctuary.v1.expiring-node-cert" as const;
@@ -237,12 +242,12 @@ export function verifyPrincipalCertificate(
 ): void {
   if (cert.fortress_id !== pinnedMasterPubkey.fortress_id) {
     throw new MeshChainError(
-      `principal cert fortress_id=${cert.fortress_id} does not match pinned master fortress_id=${pinnedMasterPubkey.fortress_id} — cross-operator isolation invariant`
+      `principal cert fortress_id=${describeUntrusted(cert.fortress_id)} does not match pinned master fortress_id=${pinnedMasterPubkey.fortress_id} — cross-operator isolation invariant`
     );
   }
   if (cert.expires_at && Date.parse(cert.expires_at) < nowMs) {
     throw new MeshChainError(
-      `principal cert ${cert.principal_id} expired at ${cert.expires_at}`
+      `principal cert ${describeUntrusted(cert.principal_id)} expired at ${describeUntrusted(cert.expires_at)}`
     );
   }
   const body = {
@@ -260,7 +265,7 @@ export function verifyPrincipalCertificate(
   );
   if (!ok) {
     throw new MeshChainError(
-      `principal cert ${cert.principal_id} signature does not verify against pinned fortress-master`
+      `principal cert ${describeUntrusted(cert.principal_id)} signature does not verify against pinned fortress-master`
     );
   }
 }
@@ -291,7 +296,7 @@ export function verifyCertChain(
   // Fortress-id coherence across the whole chain.
   if (cert.fortress_id !== pinnedMasterPubkey.fortress_id) {
     throw new MeshChainError(
-      `node cert fortress_id=${cert.fortress_id} does not match pinned master fortress_id=${pinnedMasterPubkey.fortress_id} — cross-operator isolation invariant`
+      `node cert fortress_id=${describeUntrusted(cert.fortress_id)} does not match pinned master fortress_id=${pinnedMasterPubkey.fortress_id} — cross-operator isolation invariant`
     );
   }
   if (principalCert.fortress_id !== pinnedMasterPubkey.fortress_id) {
@@ -308,7 +313,7 @@ export function verifyCertChain(
   }
   if (cert.parent_chain.principal_id !== principalCert.principal_id) {
     throw new MeshChainError(
-      `node cert parent_chain.principal_id=${cert.parent_chain.principal_id} does not match given principal cert ${principalCert.principal_id}`
+      `node cert parent_chain.principal_id=${describeUntrusted(cert.parent_chain.principal_id)} does not match given principal cert ${principalCert.principal_id}`
     );
   }
   if (cert.parent_chain.principal_pubkey !== principalCert.principal_pubkey) {
@@ -325,25 +330,25 @@ export function verifyCertChain(
   if (cert.certificate_version !== undefined) {
     if (cert.certificate_version !== NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING) {
       throw new MeshChainError(
-        `node cert ${cert.node_id} has unsupported certificate_version ${cert.certificate_version}`
+        `node cert ${describeUntrusted(cert.node_id)} has unsupported certificate_version ${describeUntrusted(cert.certificate_version)}`
       );
     }
     if (!cert.expires_at) {
       throw new MeshChainError(
-        `node cert ${cert.node_id} has certificate_version without expires_at`
+        `node cert ${describeUntrusted(cert.node_id)} has certificate_version without expires_at`
       );
     }
   }
   if (cert.expires_at) {
     if (cert.certificate_version !== NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING) {
       throw new MeshChainError(
-        `node cert ${cert.node_id} missing certificate_version ${NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING}`
+        `node cert ${describeUntrusted(cert.node_id)} missing certificate_version ${NODE_IDENTITY_CERTIFICATE_VERSION_EXPIRING}`
       );
     }
     const expiresMs = Date.parse(cert.expires_at);
     if (Number.isNaN(expiresMs) || expiresMs < nowMs) {
       throw new MeshChainError(
-        `node cert ${cert.node_id} expired at ${cert.expires_at}`
+        `node cert ${describeUntrusted(cert.node_id)} expired at ${describeUntrusted(cert.expires_at)}`
       );
     }
   }
@@ -371,7 +376,7 @@ export function verifyCertChain(
   );
   if (!principalOk) {
     throw new MeshChainError(
-      `node cert ${cert.node_id} principal_signature does not verify against principal ${principalCert.principal_id}`
+      `node cert ${describeUntrusted(cert.node_id)} principal_signature does not verify against principal ${principalCert.principal_id}`
     );
   }
 
@@ -384,7 +389,7 @@ export function verifyCertChain(
     );
     if (!masterOk) {
       throw new MeshChainError(
-        `node cert ${cert.node_id} master_signature present but does not verify against pinned fortress-master`
+        `node cert ${describeUntrusted(cert.node_id)} master_signature present but does not verify against pinned fortress-master`
       );
     }
   }
@@ -494,7 +499,7 @@ export function verifyFederationRootRotationCertificate(
   }
   if (cert.fortress_id !== pinnedOldMaster.fortress_id) {
     throw new MeshChainError(
-      `rotation cert fortress_id=${cert.fortress_id} does not match the pinned master fortress_id=${pinnedOldMaster.fortress_id} (fortress identity is preserved across renewal)`,
+      `rotation cert fortress_id=${describeUntrusted(cert.fortress_id)} does not match the pinned master fortress_id=${pinnedOldMaster.fortress_id} (fortress identity is preserved across renewal)`,
     );
   }
   if (cert.old_master_pubkey !== pinnedOldMaster.public_key) {
@@ -512,7 +517,7 @@ export function verifyFederationRootRotationCertificate(
   }
   if (opts.minSerial !== undefined && cert.rotation_serial <= opts.minSerial) {
     throw new MeshChainError(
-      `rotation cert rotation_serial=${cert.rotation_serial} does not advance the adopted serial ${opts.minSerial} (stale / replayed rotation rejected)`,
+      `rotation cert rotation_serial=${describeUntrusted(cert.rotation_serial)} does not advance the adopted serial ${opts.minSerial} (stale / replayed rotation rejected)`,
     );
   }
   const body = rotationCertSignedBody(cert);

@@ -22,10 +22,31 @@
  *   BE ABLE TO MISLEAD. {@link describeUntrusted} is total (it returns a
  *   code-chosen placeholder rather than throwing, for every input including
  *   cyclic, deeply nested, enormous, symbol, and throwing-getter values),
- *   bounded (its output length has a ceiling that does not depend on the
- *   input), and non-deceptive (a value that was shortened SAYS it was
- *   shortened, and control characters are escaped so a value cannot forge
- *   extra log lines in an operator's terminal).
+ *   bounded (see WORK BOUND below), and non-deceptive (a value that was
+ *   shortened SAYS it was shortened, control characters are escaped so a value
+ *   cannot forge extra log lines in an operator's terminal, and the result is
+ *   always well-formed UTF-16).
+ *
+ * WORK BOUND (state it exactly; an overstated bound is the same defect one
+ * level up):
+ *
+ *   OUTPUT length is strictly bounded, always, at
+ *   MAX_UNTRUSTED_DIAGNOSTIC_CHARS + UNTRUSTED_TRUNCATION_MARKER.length.
+ *
+ *   WORK is bounded by that same budget, NOT by the size of the caller's value,
+ *   for strings, objects, arrays, and property keys: every stage clamps before
+ *   it transforms, so no scan, escape, quote, or allocation ever runs over more
+ *   than the budget's worth of characters. This is a property that has to be
+ *   maintained at each new stage, not one the shape guarantees: a full-input
+ *   `.replace`, `String()`, or regex added ABOVE a clamp silently reintroduces
+ *   input-proportional cost while every test still passes.
+ *
+ *   Two costs are inherent rather than bounded, and are named here rather than
+ *   claimed away. Rendering a BigInt compares it against a precomputed ceiling,
+ *   which reads its existing binary representation (cheap per digit, no
+ *   allocation, no decimal conversion). Enumerating a hostile Proxy runs that
+ *   Proxy's own traps, which can do arbitrary work before this function regains
+ *   control; the budget stops the iteration, it cannot bound one trap.
  *
  *   It is deliberately NOT a redactor. It does not decide what is safe to
  *   disclose; that judgment belongs to the caller and, for the evidence pack,
@@ -65,6 +86,27 @@ export const UNTRUSTED_TRUNCATION_MARKER = "...<truncated>";
 /** Returned when the value could not be rendered at all. Code-chosen, never derived from the value. */
 export const UNRENDERABLE_UNTRUSTED_VALUE = "<unrenderable value>";
 
+/**
+ * Stands in for a BigInt whose decimal form cannot fit the length bound.
+ * Code-chosen and self-describing: nothing derived from the value appears in
+ * it, and it does not pretend to be a number.
+ */
+export const OVERSIZED_BIGINT = "<bigint exceeds the diagnostic length bound>";
+
+/**
+ * A BigInt at or beyond this magnitude needs more than the bound's worth of
+ * decimal digits, so it can never render in full and must not be converted.
+ * 10 ** MAX = the smallest value with MAX + 1 decimal digits.
+ */
+const BIGINT_RENDER_CEILING = 10n ** BigInt(MAX_UNTRUSTED_DIAGNOSTIC_CHARS);
+
+// The UTF-16 surrogate ranges, named once so no call site open-codes them.
+// D800-DBFF is the high (leading) half, DC00-DFFF the low (trailing) half.
+const HIGH_SURROGATE_FIRST = 0xd800;
+const HIGH_SURROGATE_LAST = 0xdbff;
+const LOW_SURROGATE_FIRST = 0xdc00;
+const LOW_SURROGATE_LAST = 0xdfff;
+
 /** Stands in for a nested value the renderer refused to descend into or read. */
 const ELIDED = "...";
 const CIRCULAR = "<circular>";
@@ -82,11 +124,17 @@ function renderPrimitive(value: unknown): string | null {
   if (value === null) return "null";
   switch (typeof value) {
     case "string":
-      return value;
+      // Clamped BEFORE it is handed on: every later stage transforms what it
+      // is given, so an unclamped string here is the one place a caller's size
+      // could become this function's work (see the WORK BOUND note above).
+      return clampAtCodePoint(value, MAX_UNTRUSTED_DIAGNOSTIC_CHARS);
     case "number":
     case "boolean":
-    case "bigint":
+      // A double's decimal form is at most ~24 characters and a boolean is at
+      // most 5, so neither can exceed the bound or cost input-dependent work.
       return String(value);
+    case "bigint":
+      return renderBigInt(value);
     case "undefined":
       return "undefined";
     case "symbol":
@@ -96,6 +144,22 @@ function renderPrimitive(value: unknown): string | null {
     default:
       return null;
   }
+}
+
+/**
+ * A BigInt has no length bound, and `String(bigint)` builds the WHOLE decimal
+ * representation before anything can clamp it. That conversion is superlinear
+ * (measured: a one-million-digit value took ~100ms to render a 142-character
+ * result), so it must not run on a value that cannot fit the bound anyway.
+ *
+ * Comparing against a precomputed power of ten decides that without converting
+ * or allocating: it reads the value's existing binary representation and stops.
+ */
+function renderBigInt(value: bigint): string {
+  if (value > BIGINT_RENDER_CEILING || value < -BIGINT_RENDER_CEILING) {
+    return OVERSIZED_BIGINT;
+  }
+  return String(value);
 }
 
 /** Work budget shared across one whole render, so total work is O(budget), not O(input). */
@@ -108,7 +172,14 @@ function quoteKeyOrString(text: string): string {
   // `{"kid":1}`; the TOP-LEVEL string is deliberately NOT quoted, so an
   // ordinary diagnostic renders byte-identically to the template literal it
   // replaced.
-  return `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  //
+  // CLAMP FIRST. The two replacements below each scan their whole input, so
+  // running them on a twenty-megabyte nested string or property KEY costs work
+  // and allocation proportional to the attacker's value for a result that is
+  // then thrown away at the bound. Nothing downstream needs more than the
+  // bound's worth of characters, so nothing upstream should produce more.
+  const clamped = clampAtCodePoint(text, MAX_UNTRUSTED_DIAGNOSTIC_CHARS);
+  return `"${clamped.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
 /**
@@ -207,17 +278,27 @@ function renderChild(
 }
 
 /**
- * Escape characters that would let an untrusted value forge structure in an
- * operator's terminal or log file: C0 controls (which include newline, carriage
- * return, and the ESC that starts an ANSI sequence), DEL, and the C1 range.
+ * Escape anything that would let an untrusted value forge structure in an
+ * operator's terminal or log file, or leave the result malformed:
  *
- * This is an ALLOW-shaped rule over a closed, complete set of code UNITS - every
- * character in these ranges is a single UTF-16 unit, so scanning by unit misses
- * none of them. It deliberately does NOT touch printable non-ASCII, because
- * legitimate namespaces and keys may be non-Latin and mangling them would make
- * ordinary diagnostics worse.
+ *   - C0 controls (which include newline, carriage return, and the ESC that
+ *     starts an ANSI sequence), DEL, and the C1 range;
+ *   - LONE surrogates, i.e. a high surrogate with no low half after it or a low
+ *     surrogate with no high half before it. These are not characters; emitting
+ *     one produces a string that is not well-formed UTF-16, which downstream
+ *     encoders silently replace with U+FFFD and which makes a later clamp
+ *     unable to tell a boundary from a break.
+ *
+ * These are ALLOW-shaped rules over closed, complete ranges of code UNITS, so
+ * scanning by unit misses none of them. Printable non-ASCII is deliberately
+ * untouched: legitimate namespaces and keys may be non-Latin and mangling them
+ * would make ordinary diagnostics worse.
+ *
+ * POSTCONDITION relied on by {@link clampAtCodePoint}: every surrogate left in
+ * the result belongs to a complete pair, so backing a cut off a high surrogate
+ * is sufficient to keep the output well-formed.
  */
-function escapeControlCharacters(text: string): string {
+function escapeForDiagnostic(text: string): string {
   let out = "";
   for (let i = 0; i < text.length; i += 1) {
     const unit = text.charCodeAt(i);
@@ -225,11 +306,33 @@ function escapeControlCharacters(text: string): string {
     // 0x80-0x9f = the C1 control range.
     if (unit < 0x20 || unit === 0x7f || (unit >= 0x80 && unit <= 0x9f)) {
       out += `\\x${unit.toString(16).padStart(2, "0")}`;
-    } else {
-      out += text[i];
+      continue;
     }
+    if (unit >= HIGH_SURROGATE_FIRST && unit <= HIGH_SURROGATE_LAST) {
+      const next = i + 1 < text.length ? text.charCodeAt(i + 1) : -1;
+      if (next >= LOW_SURROGATE_FIRST && next <= LOW_SURROGATE_LAST) {
+        // A complete pair: emit both units untouched and skip the low half.
+        out += text[i]! + text[i + 1]!;
+        i += 1;
+        continue;
+      }
+      out += escapedSurrogate(unit);
+      continue;
+    }
+    if (unit >= LOW_SURROGATE_FIRST && unit <= LOW_SURROGATE_LAST) {
+      // Reached only when no high surrogate preceded it, because a complete
+      // pair consumes its low half above.
+      out += escapedSurrogate(unit);
+      continue;
+    }
+    out += text[i];
   }
   return out;
+}
+
+function escapedSurrogate(unit: number): string {
+  // 4 = the number of hex digits in a UTF-16 code unit (16 bits / 4 bits each).
+  return `\\u${unit.toString(16).padStart(4, "0")}`;
 }
 
 /**
@@ -243,9 +346,12 @@ function escapeControlCharacters(text: string): string {
  * Non-deceptive: a shortened result carries {@link UNTRUSTED_TRUNCATION_MARKER},
  * and control characters are escaped rather than emitted.
  *
- * An ordinary short primitive renders EXACTLY as `${value}` would, so replacing
- * a template interpolation with this call does not change any honest
- * diagnostic - only the dishonest ones.
+ * A short string, number, boolean, null, or undefined renders EXACTLY as
+ * `${value}` would, so replacing a template interpolation with this call does
+ * not change any honest diagnostic - only the dishonest ones. The two
+ * deliberate exceptions are the ones where `${value}` is not a rendering at
+ * all: a symbol, where a template literal THROWS, and a BigInt too long for the
+ * bound; both yield a code-chosen placeholder instead.
  */
 export function describeUntrusted(value: unknown): string {
   let rendered: string;
@@ -255,16 +361,15 @@ export function describeUntrusted(value: unknown): string {
   try {
     const primitive = renderPrimitive(value);
     if (primitive !== null) {
-      // Clamp BEFORE escaping: escaping a hundred-megabyte stored string to
-      // find out it is too long is exactly the unbounded-work-per-request shape
-      // the bound exists to prevent.
-      rendered = clampRaw(primitive);
-      shortened = rendered.length < primitive.length;
+      // Already clamped inside `renderPrimitive`, which is where the clamp has
+      // to happen: it is the only place that still holds the caller's value.
+      rendered = primitive;
+      shortened = typeof value === "string" && rendered.length < value.length;
     } else {
       const budget: RenderBudget = { remaining: MAX_UNTRUSTED_DIAGNOSTIC_CHARS };
       rendered = renderStructured(value, 0, new WeakSet<object>(), budget);
       shortened = budget.remaining <= 0;
-      const clamped = clampRaw(rendered);
+      const clamped = clampAtCodePoint(rendered, MAX_UNTRUSTED_DIAGNOSTIC_CHARS);
       if (clamped.length < rendered.length) shortened = true;
       rendered = clamped;
     }
@@ -277,14 +382,18 @@ export function describeUntrusted(value: unknown): string {
 
   let escaped: string;
   try {
-    escaped = escapeControlCharacters(rendered);
+    // `rendered` is at most the bound in length by construction, so this scan
+    // is bounded no matter how large the caller's value was.
+    escaped = escapeForDiagnostic(rendered);
   } catch {
     return UNRENDERABLE_UNTRUSTED_VALUE;
   }
   if (escaped.length > MAX_UNTRUSTED_DIAGNOSTIC_CHARS) {
-    // Escaping expands at most 1 code unit to 4, so this second clamp only ever
-    // trims an already-bounded string.
-    escaped = escaped.slice(0, MAX_UNTRUSTED_DIAGNOSTIC_CHARS);
+    // Escaping expands at most 1 code unit to 6, so this second clamp only ever
+    // trims an already-bounded string. It must be the CODE-POINT-aware clamp:
+    // a raw slice here cut a surrogate pair in half, because escaping shifts
+    // every later character by an amount the first clamp could not know.
+    escaped = clampAtCodePoint(escaped, MAX_UNTRUSTED_DIAGNOSTIC_CHARS);
     shortened = true;
   }
 
@@ -292,15 +401,20 @@ export function describeUntrusted(value: unknown): string {
 }
 
 /**
- * Cut to the length ceiling without leaving a lone surrogate behind. A half
- * code point is not a truthful rendering of what was stored.
+ * Cut to `max` code units without splitting a surrogate pair. A half code point
+ * is not a truthful rendering of what was stored, and it leaves the result
+ * malformed UTF-16.
+ *
+ * Backing off by one is sufficient because the only surrogates this is ever
+ * asked to cut are complete pairs: raw input is clamped before any lone
+ * surrogate could be introduced, and {@link escapeForDiagnostic} escapes lone
+ * surrogates outright (see its POSTCONDITION).
  */
-function clampRaw(text: string): string {
-  if (text.length <= MAX_UNTRUSTED_DIAGNOSTIC_CHARS) return text;
-  let cut = MAX_UNTRUSTED_DIAGNOSTIC_CHARS;
+function clampAtCodePoint(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let cut = max;
   const last = text.charCodeAt(cut - 1);
-  // 0xd800-0xdbff = the UTF-16 high-surrogate range; a high surrogate at the
-  // cut point has lost its low half.
-  if (last >= 0xd800 && last <= 0xdbff) cut -= 1;
+  // A high surrogate at the last kept position has lost its low half.
+  if (last >= HIGH_SURROGATE_FIRST && last <= HIGH_SURROGATE_LAST) cut -= 1;
   return text.slice(0, cut);
 }

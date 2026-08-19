@@ -178,7 +178,7 @@ export function verifyAgentCard(
   // would let a misconfigured issuer ship a card into the wrong fortress.
   if (card.fortress_id !== verifyResult.event.fortress_id) {
     throw new AgentCardVerificationError(
-      `card fortress_id=${card.fortress_id} does not match envelope fortress_id=${verifyResult.event.fortress_id}`
+      `card fortress_id=${card.fortress_id} does not match envelope fortress_id=${describeUntrusted(verifyResult.event.fortress_id)}`
     );
   }
   return {

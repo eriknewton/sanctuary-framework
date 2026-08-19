@@ -78,6 +78,10 @@ import {
 } from "../core/anti-rollback.js";
 import { readTransientError } from "../storage/transient-read.js";
 import { withCrossProcessLock } from "../storage/cross-process-lock.js";
+// the version anchor is read back from storage and JSON-parsed, so its fields
+// are attacker-influenced; diagnostics go through the untrusted-diagnostic
+// chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 /** `_meta` key holding the master-MAC'd monotonic revocation-list version anchor. */
 export const REVOCATION_VERSION_ANCHOR_META_KEY =
@@ -195,7 +199,7 @@ export async function writeRevocationVersionAnchor(
   if (current.status === "valid" && version < current.data.version) {
     throw new Error(
       "Sanctuary: refusing to lower the fleet revocation-list version anchor " +
-        `(${current.data.version} -> ${version}); a lower version is a ` +
+        `(${describeUntrusted(current.data.version)} -> ${version}); a lower version is a ` +
         "rollback-laundering write.",
     );
   }

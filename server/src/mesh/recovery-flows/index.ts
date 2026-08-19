@@ -43,9 +43,15 @@ export * from "./types.js";
 export {
   wrapMasterRotationBundle,
   unwrapMasterRotationBundle,
+  // The element-level wire parse. Exported because it IS the agreement between
+  // the unicast receiver and the unwrapper; a caller that casts instead is the
+  // shape that kept the wire variant of STATE-STORE-ERRMSG-INTERP-01 reachable.
+  parseMasterRotationBundleEnvelope,
   toBundleSecret,
   fromBundleSecret,
   type MasterRotationBundleEnvelope,
+  type MasterRotationBundleEnvelopeParseFailure,
+  type MasterRotationBundleEnvelopeParseResult,
   type MasterRotationBundlePlaintext,
 } from "./secret-bundle.js";
 export {
