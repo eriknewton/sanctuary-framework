@@ -936,6 +936,11 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
       delivery_outcome: "file_write_failed_file_may_remain",
       content_file: expectedPath,
     });
+    // The row SAYS the plaintext may remain; this asserts it actually does.
+    // Without this, an implementation that deletes the file while reporting
+    // `file_may_remain` passes every assertion above, and the operator is sent
+    // hunting for a file that is not there.
+    await expect(stat(expectedPath)).resolves.toBeDefined();
   });
 
   it.each<StdoutFailureMode>(["sync-throw", "callback-error", "error-event"])(
