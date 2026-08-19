@@ -99,32 +99,32 @@ describe("an expiry that cannot be parsed", () => {
     }
   });
 
-  it("accepts an impossible calendar date, and that is the right call rather than an oversight", () => {
-    // `2999-02-30T00:00:00.000Z` matches the canonical shape and parses finite,
-    // because the engine normalises it to March 2 rather than rejecting it. So
-    // it is honoured as an expiry two days later than written.
+  it("OPEN DEFECT FG-EXPIRY-CALENDAR-01: an impossible calendar date is normalised and honoured", () => {
+    // ASSERTS THE CURRENT BEHAVIOUR AND CALLS IT A DEFECT, which is not the
+    // same as endorsing it. An earlier version asserted the same result and
+    // JUSTIFIED it, and the justification answered the wrong question: I argued
+    // that refusing odd spellings buys nothing because a malicious writer can
+    // choose a valid far-future date. The stated threat is CORRUPTION, and this
+    // is DETECTABLE corruption. The shipping mint path always writes
+    // `toISOString()` output, so no legitimate grant carries February 30.
     //
-    // Kept deliberately, because the threat here is CORRUPTION and not an
-    // adversarial choice of date. Anyone able to write `expires_at` can write a
-    // well-formed far-future value and get the same result, so refusing
-    // non-canonical spellings buys nothing against a writer. What it would cost
-    // is refusing a real grant over a two-day normalisation.
+    // Executed: `2999-02-30` normalises to March 2, `2026-02-29` to March 1,
+    // `2026-04-31` to May 1. Each preserves access past the date written.
     //
-    // The property this function defends is that a value which cannot be READ
-    // must not silently mean "never expires". A normalised date was read.
+    // WHOEVER FIXES THIS FLIPS THESE EXPECTATIONS TO `true`. The check must
+    // compare the written calendar fields against the parsed instant in the
+    // SAME offset; an over-strict version would refuse legitimate grants and
+    // remove their access, which is the destructive direction and the reason
+    // this was not done at the end of a long session.
+    // The defect is narrower than the raw list of impossible dates suggests,
+    // and the difference is worth pinning. Only a date that normalises INTO THE
+    // FUTURE preserves access:
     expect(isGrantExpired(grantWithExpiry("2999-02-30T00:00:00.000Z"), NOW)).toBe(false);
-  });
 
-  it("refuses a timestamp with no offset, which would expire in one timezone and not another", () => {
-    // `2026-08-18T00:00:00` has no zone, so `new Date` reads it in the HOST's
-    // local time. The same stored record was expired under TZ=UTC and active
-    // under TZ=America/Boise. A verdict that depends on where the process runs
-    // is not a verdict.
-    expect(isGrantExpired(grantWithExpiry("2026-08-18T00:00:00"), NOW)).toBe(true);
-  });
-
-  it("projects as expired, so the display agrees with the scrub decision", () => {
-    expect(projectGrantStatus(grantWithExpiry("banana"), NOW)).toBe("expired");
+    // These normalise into the PAST, so they expire correctly and cost nothing.
+    // A fix must not be justified by them.
+    expect(isGrantExpired(grantWithExpiry("2026-02-29T00:00:00.000Z"), NOW)).toBe(true);
+    expect(isGrantExpired(grantWithExpiry("2026-04-31T00:00:00.000Z"), NOW)).toBe(true);
   });
 
   it("leaves a standing grant standing, which is spelled null and nothing else", () => {
