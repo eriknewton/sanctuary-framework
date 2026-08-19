@@ -41,7 +41,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { chmod, mkdir, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, realpath, unlink, writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -252,6 +252,57 @@ export interface StateDiscloseCommandArgs {
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
+}
+
+/**
+ * Write `text` and WAIT for the stream to say whether it worked.
+ *
+ * A bare `stream.write(text)` inside a `try` observes only a SYNCHRONOUS
+ * throw, which is the failure mode a real stdout almost never has. A broken
+ * pipe (the operator closes the pager, the consumer exits) surfaces through
+ * the write CALLBACK or as an `error` EVENT, both after `write()` has already
+ * returned, so a synchronous guard reports success on a receipt nobody
+ * received. Both asynchronous routes are observed here because the caller's
+ * rollback decision depends on knowing the receipt was delivered.
+ *
+ * The error listener is detached one turn LATE, on purpose: Node commonly
+ * delivers the callback error first and then emits `error` on the same
+ * stream, and a stream with no `error` listener throws that as an uncaught
+ * exception. Staying attached through the following immediate absorbs the
+ * duplicate without permanently muting the stream.
+ *
+ * HONEST BOUND: this observes a synchronous throw, a callback error, and an
+ * `error` event raised while the write is in flight. A failure the OS reports
+ * only after the callback has already succeeded cannot be seen from here; in
+ * that case the receipt did reach the stream and retaining the file is the
+ * correct outcome anyway.
+ */
+async function writeAwaitingCompletion(
+  stream: Writable,
+  text: string,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const onError = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      setImmediate(() => stream.off("error", onError));
+      reject(error);
+    };
+    const settle = (error?: Error | null): void => {
+      if (settled) return;
+      settled = true;
+      setImmediate(() => stream.off("error", onError));
+      if (error) reject(error);
+      else resolve();
+    };
+    stream.on("error", onError);
+    try {
+      stream.write(text, settle);
+    } catch (error) {
+      settle(error as Error);
+    }
+  });
 }
 
 /**
@@ -537,7 +588,18 @@ export async function runStateDiscloseUnattributedCommand(
       let contentFilePath: string;
       let fileBody: { body: string; storedValueWasString: boolean };
       try {
-        const disclosuresDir = join(config.storage_path, "disclosures");
+        // THE STORAGE ROOT IS CANONICALIZED FIRST, and everything downstream
+        // uses the canonical path. An operator whose fortress path is itself a
+        // symlink (a fortress on another volume reached through a link in the
+        // home directory) is an ordinary, legitimate setup, and the no-follow
+        // verifier below includes its BASE in the chain it refuses symlinks
+        // on. Verifying against the un-resolved root would therefore lock that
+        // operator out of their own data, which is a worse outcome than the
+        // attack being defended against. Resolving once and using the result
+        // everywhere also means the custody check and the write are provably
+        // about the same directory rather than two spellings of it.
+        const canonicalStoragePath = await realpath(config.storage_path);
+        const disclosuresDir = join(canonicalStoragePath, "disclosures");
         await mkdir(disclosuresDir, { recursive: true, mode: 0o700 });
         // NO-FOLLOW CUSTODY BEFORE ANY MODE CHANGE OR WRITE: `chmod` and a
         // path-based file write both FOLLOW a symlink, so a pre-positioned
@@ -546,9 +608,18 @@ export async function runStateDiscloseUnattributedCommand(
         // custody verifier (`storage/custody-fs`, the same machinery the
         // fortress custody paths use) lstats the leaf and refuses a symlink
         // or non-directory; the refusal is loud with no fallback.
+        //
+        // HONEST BOUND, recorded because the verifier documents it
+        // (`custody-fs.ts`, `openDirectoryCustodyWithinBase`): the check and
+        // the use are two path-based syscalls, and Node exposes no
+        // `openat`-bound write to fuse them. This refuses a PRE-POSITIONED
+        // link and any statically hostile shape; it does not prevent a
+        // concurrent same-uid swap of `disclosures` between this check and
+        // the write below. That residual is inside the operator's own storage
+        // path, where a same-uid attacker already holds the fortress.
         await verifyDirectoryCustodyWithinBase(
           disclosuresDir,
-          config.storage_path,
+          canonicalStoragePath,
         );
         // `mkdir`'s mode applies only when it CREATES the directory; a
         // pre-existing disclosures directory keeps whatever mode it had, so
@@ -660,19 +731,34 @@ export async function runStateDiscloseUnattributedCommand(
       // One write, after the file exists: the receipt the operator sees always
       // names a file that is really there.
       try {
-        write(out, receipt);
+        await writeAwaitingCompletion(out, receipt);
       } catch {
         // ROLLBACK INVARIANT: no disclosure file may outlive a run whose
         // receipt never named it; the operator either gets both or neither. A
         // receipt that failed to reach the terminal leaves a plaintext file on
-        // disk the operator does not know exists, so the file is removed
-        // (best-effort) and the failure is reported on stderr with its own
-        // exit status, distinct from the unlock-failure (1) and usage (2)
-        // paths, so a wrapper can tell "re-run" from "wrong credentials".
-        await unlink(contentFilePath).catch(() => undefined);
+        // disk the operator does not know exists, so the file is removed and
+        // the failure is reported on stderr with its own exit status, distinct
+        // from the unlock-failure (1) and usage (2) paths, so a wrapper can
+        // tell "re-run" from "wrong credentials".
+        let removed = true;
+        try {
+          await unlink(contentFilePath);
+        } catch {
+          removed = false;
+        }
+        // THE TWO OUTCOMES ARE REPORTED DIFFERENTLY, and that is the point. A
+        // swallowed unlink failure under a message saying the file "was
+        // removed" tells the operator the opposite of the truth about a
+        // plaintext file on their disk, and it is the one case where they
+        // must act. When the removal fails the path is named (escaped, like
+        // every other path this command prints) and the message says so.
         write(
           err,
-          "Error: the receipt could not be delivered; the disclosure file was removed; re-run the command.\n",
+          removed
+            ? "Error: the receipt could not be delivered; the disclosure file was removed; re-run the command.\n"
+            : "Error: the receipt could not be delivered and the disclosure file could NOT be removed. " +
+                `It remains at ${renderUntrusted(contentFilePath)} and contains unattributed plaintext; ` +
+                "remove it manually, then re-run the command.\n",
         );
         return 3;
       }

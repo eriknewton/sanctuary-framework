@@ -19,7 +19,8 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmodSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PassThrough, Writable } from "node:stream";
@@ -282,7 +283,12 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     // THE FILE CARRIES THE CONTENT, byte-for-byte, privately. The directory is
     // operator-only (0700) and the file operator-only read-write (0600).
     const filePath = contentFilePathFrom(out);
-    expect(filePath).toBe(join(fortressPath, "disclosures", filePath.split("/").pop()!));
+    // The receipt names the CANONICAL path: the storage root is resolved once
+    // and every later step uses that same resolved path, so the check and the
+    // write can never be about two different directories.
+    expect(filePath).toBe(
+      join(await realpath(fortressPath), "disclosures", filePath.split("/").pop()!)
+    );
     // Code-derived name: timestamp + randomness, never stored/caller strings.
     expect(filePath.split("/").pop()).toMatch(
       /^disclosure-\d{8}T\d{6}Z-[0-9a-f]{6}\.txt$/
@@ -692,43 +698,160 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     expect(fileBytes.equals(Buffer.from(CONTENT, "utf8"))).toBe(true);
   });
 
-  it("removes the disclosure file and reports distinctly when the receipt cannot be delivered", async () => {
-    // A stdout write failure AFTER the content file is persisted would
-    // otherwise strand a plaintext disclosure on disk that no receipt ever
-    // named: the operator does not know it exists, and the generic unlock
-    // diagnosis points them away from it. The command must deliver both the
-    // file and the receipt, or neither.
-    class ThrowingWritable extends Writable {
-      override write(): never {
-        throw new Error("terminal is gone");
-      }
+  // The three ways a real stdout fails. A synchronous throw is the EASY one and
+  // was the only one an earlier round observed; a broken pipe surfaces through
+  // the write CALLBACK or as an `error` EVENT, which a bare try/catch around
+  // `write()` cannot see at all. Each mode must reach the same rollback.
+  type StdoutFailureMode = "sync-throw" | "callback-error" | "error-event";
+
+  function failingStdout(
+    mode: StdoutFailureMode,
+    beforeFailing?: () => void
+  ): Writable {
+    if (mode === "sync-throw") {
+      return new (class extends Writable {
+        override write(): never {
+          beforeFailing?.();
+          throw new Error("EPIPE: broken pipe");
+        }
+      })();
     }
-    const seam = { now: new Date("2026-08-19T01:00:00.000Z"), randomHex: "ddeeff" };
+    if (mode === "callback-error") {
+      return new (class extends Writable {
+        override _write(
+          _c: Buffer | string,
+          _e: BufferEncoding,
+          cb: (err?: Error) => void
+        ): void {
+          beforeFailing?.();
+          cb(new Error("EPIPE: broken pipe"));
+        }
+      })();
+    }
+    return new (class extends Writable {
+      override _write(
+        _c: Buffer | string,
+        _e: BufferEncoding,
+        _cb: (err?: Error) => void
+      ): void {
+        beforeFailing?.();
+        this.destroy(new Error("EPIPE: broken pipe"));
+      }
+    })();
+  }
+
+  it.each<StdoutFailureMode>(["sync-throw", "callback-error", "error-event"])(
+    "removes the disclosure file and reports distinctly when the receipt cannot be delivered (%s)",
+    async (mode) => {
+      // A stdout write failure AFTER the content file is persisted would
+      // otherwise strand a plaintext disclosure on disk that no receipt ever
+      // named: the operator does not know it exists, and the generic unlock
+      // diagnosis points them away from it. The command must deliver both the
+      // file and the receipt, or neither, whichever way the stream reports.
+      const seam = { now: new Date("2026-08-19T01:00:00.000Z"), randomHex: "ddeeff" };
+      const expectedPath = join(
+        fortressPath,
+        "disclosures",
+        "disclosure-20260819T010000Z-ddeeff.txt"
+      );
+      process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+      const err = new StringWritable();
+      const code = await runStateDiscloseUnattributedCommand({
+        argv: ["--fortress", fortressPath, "--namespace", NAMESPACE, "--key", KEY],
+        out: failingStdout(mode),
+        err,
+        env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+        approvalChannel: new FixedChannel("approve"),
+        fileNameSeam: seam,
+      });
+
+      // A distinct exit status: not the unlock-failure 1, not the usage 2.
+      expect(code).toBe(3);
+      expect(err.text).toContain(
+        "the receipt could not be delivered; the disclosure file was removed; re-run the command"
+      );
+      expect(err.text).not.toContain("could not open or unlock");
+      // The rollback: the just-written file is gone, and nothing else was left.
+      await expect(readFile(expectedPath)).rejects.toThrow();
+      expect(await readdir(join(fortressPath, "disclosures"))).toHaveLength(0);
+    }
+  );
+
+  it("says the file REMAINS, and names it, when the rollback unlink itself fails", async () => {
+    // The other half of the rollback contract. Swallowing the unlink failure
+    // while the message says the file "was removed" tells the operator the
+    // opposite of the truth about a plaintext file on their disk. The failing
+    // stdout here makes the disclosures directory unwritable at the moment of
+    // the write, so the REAL unlink fails (EACCES) rather than a stubbed one.
+    const disclosuresDir = join(fortressPath, "disclosures");
+    const seam = { now: new Date("2026-08-19T02:00:00.000Z"), randomHex: "112233" };
     const expectedPath = join(
-      fortressPath,
-      "disclosures",
-      "disclosure-20260819T010000Z-ddeeff.txt"
+      disclosuresDir,
+      "disclosure-20260819T020000Z-112233.txt"
     );
     process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
     const err = new StringWritable();
     const code = await runStateDiscloseUnattributedCommand({
       argv: ["--fortress", fortressPath, "--namespace", NAMESPACE, "--key", KEY],
-      out: new ThrowingWritable(),
+      out: failingStdout("callback-error", () => {
+        chmodSync(disclosuresDir, 0o500);
+      }),
       err,
       env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
       approvalChannel: new FixedChannel("approve"),
       fileNameSeam: seam,
     });
 
-    // A distinct exit status: not the unlock-failure 1, not the usage 2.
+    // Restore before asserting, so the assertions (and teardown) can read.
+    chmodSync(disclosuresDir, 0o700);
+
     expect(code).toBe(3);
-    expect(err.text).toContain(
-      "the receipt could not be delivered; the disclosure file was removed; re-run the command"
+    // The honest message: it is still there, it is named, and removing it is
+    // the operator's job.
+    expect(err.text).toContain("could NOT be removed");
+    expect(err.text).toContain(expectedPath);
+    expect(err.text).toContain("remove it manually");
+    expect(err.text).not.toContain("was removed; re-run the command");
+    // And the file really does remain, which is what the message now says.
+    const fileBytes = await readFile(expectedPath);
+    expect(fileBytes.equals(Buffer.from(CONTENT, "utf8"))).toBe(true);
+  });
+
+  it("succeeds when the operator's storage ROOT is itself a symlink", async () => {
+    // The no-follow check must refuse a planted `disclosures` link WITHOUT
+    // refusing a legitimate operator setup whose fortress path is a symlink
+    // (a fortress on another volume reached through a link in the home
+    // directory is an ordinary arrangement). Refusing that would lock an
+    // operator out of their own data, which is a worse failure than the one
+    // being defended against.
+    const realRoot = join(tmp, "real-fortress");
+    const result = await runInit({
+      fortress: realRoot,
+      noConfirm: true,
+      noPin: true,
+      noIdentity: false,
+    });
+    const linkedRoot = join(tmp, "linked-fortress");
+    await symlink(realRoot, linkedRoot);
+    fortressPath = linkedRoot;
+    recoveryKey = extractRecoveryKey(
+      await readFile(result.recoveryKeyDisclosurePath, "utf-8")
     );
-    expect(err.text).not.toContain("could not open or unlock");
-    // The rollback: the just-written file is gone, and nothing else was left.
-    await expect(readFile(expectedPath)).rejects.toThrow();
-    expect(await readdir(join(fortressPath, "disclosures"))).toHaveLength(0);
+    await plantEntry();
+
+    const { code, out } = await runCommand();
+    expect(code).toBe(0);
+    // The content landed under the real root, and the receipt names the
+    // canonical location rather than the link it was reached through.
+    const files = await readdir(join(realRoot, "disclosures"));
+    expect(files).toHaveLength(1);
+    const fileBytes = await readFile(join(realRoot, "disclosures", files[0]!));
+    expect(fileBytes.equals(Buffer.from(CONTENT, "utf8"))).toBe(true);
+    expect(contentFilePathFrom(out)).toBe(
+      join(await realpath(realRoot), "disclosures", files[0]!)
+    );
+    // The directory mode is still enforced through the link.
+    expect((await stat(join(realRoot, "disclosures"))).mode & 0o777).toBe(0o700);
   });
 
   it("refuses a symlinked disclosures path rather than following it", async () => {
