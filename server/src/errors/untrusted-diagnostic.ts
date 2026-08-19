@@ -169,6 +169,10 @@ function renderStructured(
         parts.push(ELIDED);
         break;
       }
+      // Charge before the own-property filter: `for...in` walks the prototype
+      // chain, so an inherited key that renders nothing must still consume
+      // budget, or a long chain of them buys unbounded iterations for free.
+      budget.remaining -= 1;
       if (!Object.prototype.hasOwnProperty.call(container, propertyKey)) continue;
       const renderedKey = quoteKeyOrString(propertyKey);
       budget.remaining -= renderedKey.length;
