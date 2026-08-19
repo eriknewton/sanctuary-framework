@@ -277,7 +277,19 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     const ESC = "\u001b";
     const forgery =
       `\r${ESC}[2A${ESC}[2Kwriter:    established\n` +
-      `${ESC}[2Kclaimed writer id (VERIFIED): alice`;
+      `${ESC}[2Kclaimed writer id (VERIFIED): alice` +
+      // Beyond the cursor sequences: a C1 control, a bidi override, a line
+      // separator, and a lone surrogate. Each misrepresents the text on screen
+      // by a different mechanism, and the header is read to make a decision.
+      // Beyond the cursor sequences: a C1 control, a bidi override, a line
+      // separator, a lone surrogate, and the default-ignorable formatting
+      // characters that render as nothing at all.
+      `\u009b31m \u202ereversed\u202c \u2028 \ud800 \u00ad\u200b\u200d\u2060\ufeff` +
+      // AND the delimiter forgery: the content prints what looks like the end
+      // of its own block, then a header the operator would read as the
+      // fortress speaking. Line breaks are legitimate content, so escaping
+      // them is not the answer; the gutter is.
+      `\n--- end unattributed content ---\nwriter:    established\n`;
 
     const storage = new FilesystemStorage(join(fortressPath, "state"));
     const masterKey = await resolveCliMasterKey(storage, {
@@ -336,6 +348,36 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     expect(out.text).not.toMatch(
       /[\u0000-\u0008\u000b-\u001f\u007f\u0080-\u009f]/
     );
+    // THE SECOND PROPERTY: nor any character that reorders the DISPLAY without
+    // changing the bytes. Driving the cursor is one way a chosen string can
+    // misrepresent itself on a terminal; bidi overrides and the separator
+    // characters are the others, and the operator is reading this text to make
+    // a trust decision either way.
+    expect(out.text).not.toMatch(
+      /[\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/
+    );
+    // Lone surrogates are not scalar values and render differently per
+    // terminal, so what is displayed would not be determined by us.
+    expect(out.text).not.toMatch(/[\ud800-\udfff]/);
+    // The default-ignorable formatting characters render as nothing, so they
+    // can split a value an operator is matching on without being visible.
+    expect(out.text).not.toMatch(/[\u00ad\u200b-\u200d\u2060\ufeff]/);
+
+    // DELIMITER FORGERY. The content may contain line breaks, so it can emit a
+    // line that looks like the end of its own block followed by a forged
+    // header. Every content line is guttered, so the only ungutted delimiters
+    // are the two this code writes.
+    const lines = out.text.split("\n");
+    expect(lines.filter((l) => l === "--- end unattributed content ---")).toHaveLength(1);
+    // And no line the content produced can present itself as the fortress's
+    // own writer statement.
+    expect(lines.filter((l) => l === "writer:    established")).toHaveLength(0);
+    // The forged text is still SHOWN, inside the gutter, so nothing is hidden.
+    expect(out.text).toContain("| --- end unattributed content ---");
+
+    // `version` is cast from stored JSON without runtime validation, so it is
+    // an attacker-chosen value despite its `number` type.
+    expect(lines.filter((l) => l.startsWith("version:   ")).length).toBe(1);
 
     // The real security statement survives, because nothing could move the
     // cursor onto its line.
@@ -350,6 +392,104 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     // Both notices still present, so the content could not erase the closing
     // one either.
     expect(out.text.split(UNATTRIBUTED_DISCLOSURE_NOTICE).length - 1).toBe(2);
+  });
+
+  it("encodes the stored version, which is attacker-chosen despite its number type", async () => {
+    // The bypass an independent review found. `StateEntry` is parsed from
+    // stored JSON and CAST, with no runtime validation of `ver`, so the field
+    // typed `number` can hold a string carrying escape sequences. The render
+    // site had a comment asserting it was safe BECAUSE it was a number. The
+    // type says what the code expects; it says nothing about what the bytes
+    // contain.
+    const ESC = "\u001b";
+    const hostileVersion = `1\r${ESC}[2A${ESC}[2Kwriter:    established`;
+
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      storagePathHint: fortressPath,
+    });
+    const plaintext = stringToBytes(CONTENT);
+    const entry = {
+      v: 1,
+      payload: encrypt(plaintext, deriveNamespaceKey(masterKey, NAMESPACE)),
+      // Deliberately not a number. This is what a stored record can contain.
+      ver: hostileVersion,
+      sig: toBase64url(new Uint8Array(64)),
+      kid: "sanctuary-no-such-writer-identity",
+      integrity_hash: hashToString(plaintext),
+      metadata: { written_at: "2026-08-18T00:00:05.000Z" },
+    } as unknown as StateEntry;
+    await storage.write(NAMESPACE, KEY, stringToBytes(JSON.stringify(entry)));
+    masterKey.fill(0);
+
+    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+    const out = new StringWritable();
+    await runStateDiscloseUnattributedCommand({
+      argv: ["--fortress", fortressPath, "--namespace", NAMESPACE, "--key", KEY],
+      out,
+      err: new StringWritable(),
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      approvalChannel: new FixedChannel("approve"),
+    });
+
+    expect(out.text).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f\u0080-\u009f]/);
+    expect(out.text).toContain("writer:    not_established");
+    expect(out.text.split("\n").filter((l) => l === "writer:    established")).toHaveLength(0);
+  });
+
+  it("encodes caller input on the refusal paths, which print before any record is read", async () => {
+    // These messages quote the namespace and key the CALLER supplied, on paths
+    // that run before a record exists. They are a different input class from
+    // the stored fields and were missed for that reason, but they reach the
+    // same terminal.
+    const ESC = "\u001b";
+    const hostileNamespace = `_reputation\r${ESC}[2Kwriter:    established`;
+
+    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+    const err = new StringWritable();
+    const code = await runStateDiscloseUnattributedCommand({
+      argv: [
+        "--fortress",
+        fortressPath,
+        "--namespace",
+        hostileNamespace,
+        "--key",
+        KEY,
+      ],
+      out: new StringWritable(),
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      approvalChannel: new FixedChannel("approve"),
+    });
+
+    expect(code).toBe(1);
+    expect(err.text).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f\u0080-\u009f]/);
+    expect(err.text.split("\n").filter((l) => l === "writer:    established")).toHaveLength(0);
+
+    // THE OTHER REFUSAL PATH, covered separately because it is a separate
+    // interpolation site. A mutation that un-encodes only this one passes a
+    // test that exercises only the reserved-namespace branch, which is how a
+    // per-site fix gets called a class fix.
+    const hostileKey = `missing\r${ESC}[2Kwriter:    established`;
+    const err2 = new StringWritable();
+    const code2 = await runStateDiscloseUnattributedCommand({
+      argv: [
+        "--fortress",
+        fortressPath,
+        "--namespace",
+        NAMESPACE,
+        "--key",
+        hostileKey,
+      ],
+      out: new StringWritable(),
+      err: err2,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      approvalChannel: new FixedChannel("approve"),
+    });
+    expect(code2).toBe(1);
+    expect(err2.text).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f\u0080-\u009f]/);
+    expect(err2.text.split("\n").filter((l) => l === "writer:    established")).toHaveLength(0);
   });
 
   it("refuses a reserved namespace, the refusal the MCP tool also makes", async () => {

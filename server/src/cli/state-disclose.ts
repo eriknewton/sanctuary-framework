@@ -54,6 +54,52 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { flagValue } from "./argv.js";
 
 /**
+ * Characters that are not C0/C1 controls but still change what a reader SEES
+ * rather than what the text says.
+ *
+ * The C0 escaping stops the cursor being driven. It does not stop the other
+ * ways a chosen string misrepresents itself:
+ *
+ *   - U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are treated as line
+ *     breaks by some terminals, so a value carrying one can appear to end a
+ *     line the header means to own.
+ *   - The bidirectional formatting characters (marks, embeddings, overrides,
+ *     isolates) reorder the DISPLAY of surrounding text without changing its
+ *     bytes. Published as "Trojan Source": what is read is not the order the
+ *     characters are in.
+ *   - The DEFAULT-IGNORABLE format characters render as nothing at all, so
+ *     they can split a word an operator is matching on, or pad a value so two
+ *     visibly identical strings are different bytes. U+00AD soft hyphen,
+ *     U+200B..U+200D zero-width space/non-joiner/joiner, U+2060 word joiner,
+ *     U+FEFF zero-width no-break space.
+ *   - Surrogate code points are not scalar values. Unescaped they reach the
+ *     terminal as U+FFFD, so the substitution rather than the input decides
+ *     what is shown.
+ *
+ * All are escaped for one reason: on this surface the operator reads the text
+ * to make a trust decision, and every string on it was chosen by whoever wrote
+ * a record whose signature did not verify.
+ *
+ * Right-to-left CONTENT is unaffected. Arabic and Hebrew letters carry their
+ * own directionality; only the explicit formatting characters are escaped.
+ */
+function isDisplayReorderingControl(code: number): boolean {
+  return (
+    code === 0x2028 || // LINE SEPARATOR
+    code === 0x2029 || // PARAGRAPH SEPARATOR
+    code === 0x200e || // LEFT-TO-RIGHT MARK
+    code === 0x200f || // RIGHT-TO-LEFT MARK
+    (code >= 0x202a && code <= 0x202e) || // embeddings, overrides, pop
+    (code >= 0x2066 && code <= 0x2069) || // isolates, pop
+    code === 0x00ad || // SOFT HYPHEN, renders as nothing
+    (code >= 0x200b && code <= 0x200d) || // zero-width space / non-joiner / joiner
+    code === 0x2060 || // WORD JOINER
+    code === 0xfeff || // ZERO WIDTH NO-BREAK SPACE
+    (code >= 0xd800 && code <= 0xdfff) // surrogate, not a scalar value
+  );
+}
+
+/**
  * Every string this command prints except its own notice is chosen by whoever
  * wrote the entry, and that entry's signature did NOT verify - which is the
  * entire premise of the command. Written raw to a terminal those bytes are not
@@ -76,10 +122,18 @@ import { flagValue } from "./argv.js";
  * C1 (0x80-0x9f) is escaped too. 0x9b is CSI, and a terminal that is not in
  * UTF-8 mode will act on it exactly as it acts on `ESC [`.
  *
- * The `--json` path needs none of this and must NOT be routed through here:
- * `JSON.stringify` already escapes every C0 control, so passing it through
- * would double-escape. Verified against the MCP transport, which renders the
- * same way.
+ * THE `--json` PATH AND THE MCP TOOL ARE NOT ROUTED THROUGH HERE, AND THAT IS
+ * A BOUND RATHER THAN A SAFETY CLAIM. An earlier version of this comment said
+ * they were safe because `JSON.stringify` escapes controls. It escapes C0 and
+ * lone surrogates; it passes bidirectional formatting characters and
+ * U+2028/U+2029 through unchanged, which was verified by driving both paths.
+ *
+ * They are still not encoded here, deliberately. Those are DATA channels: a
+ * consumer receives the content to process, and silently substituting escape
+ * sequences into the bytes would corrupt the value rather than protect anyone.
+ * The obligation moves to the consumer, so state it where a consumer reads it:
+ * ANY CONSUMER THAT RENDERS THIS CONTENT TO A TERMINAL MUST ENCODE IT FIRST.
+ * The human-readable path below is this command's own consumer, and it does.
  */
 function renderUntrusted(
   raw: string,
@@ -96,6 +150,10 @@ function renderUntrusted(
     // 0x20 = space, the lowest printable; 0x7f = DEL; 0x80-0x9f = C1.
     if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
       rendered += `\\x${code.toString(16).padStart(2, "0")}`;
+      continue;
+    }
+    if (isDisplayReorderingControl(code)) {
+      rendered += `\\u{${code.toString(16)}}`;
       continue;
     }
     rendered += ch;
@@ -124,8 +182,20 @@ function write(stream: Writable, text: string): void {
  */
 class CliPromptApprovalChannel implements ApprovalChannel {
   async requestApproval(request: ApprovalRequest): Promise<ApprovalResponse> {
+    // THE PROMPT IS THE MOST IMPORTANT SURFACE HERE, not the least. `context`
+    // carries the namespace and key the caller asked for, and this text is what
+    // the operator reads before granting a Tier-1 approval that no policy file
+    // can waive. A value that drives the cursor could rewrite the operation
+    // name or the notice printed below, so the human approves one thing while
+    // reading another. `JSON.stringify` is not sufficient on its own: it
+    // escapes C0 controls but passes bidi formatting and U+2028/U+2029 through
+    // unchanged.
     const contextLines = Object.entries(request.context)
-      .map(([k, v]) => `  ${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`)
+      .map(
+        ([k, v]) =>
+          `  ${renderUntrusted(k)}: ` +
+          renderUntrusted(typeof v === "string" ? v : JSON.stringify(v)),
+      )
       .join("\n");
     write(
       process.stderr,
@@ -287,18 +357,24 @@ export async function runStateDiscloseUnattributedCommand(
     if (outcome.status === "refused_namespace_reserved") {
       write(
         err,
-        `Refused: namespace "${namespace}" is reserved for internal use ` +
-          `(prefix: ${outcome.reservedPrefix}). This surface does not disclose\n` +
+        `Refused: namespace "${renderUntrusted(namespace)}" is reserved for internal ` +
+          `use (prefix: ${renderUntrusted(outcome.reservedPrefix)}). This surface\n` +
           "from reserved namespaces.\n",
       );
       return 1;
     }
     if (outcome.status === "refused_namespace_unavailable") {
-      write(err, `Refused: namespace "${namespace}" is not available here.\n`);
+      write(
+        err,
+        `Refused: namespace "${renderUntrusted(namespace)}" is not available here.\n`,
+      );
       return 1;
     }
     if (outcome.status === "not_found") {
-      write(err, `Not found: ${namespace}/${key}\n`);
+      write(
+        err,
+        `Not found: ${renderUntrusted(namespace)}/${renderUntrusted(key)}\n`,
+      );
       return 1;
     }
     if (outcome.status === "refused_writer_is_establishable") {
@@ -332,9 +408,17 @@ export async function runStateDiscloseUnattributedCommand(
       // a raw write here lets the entry's author forge the `writer:` line.
       write(out, `namespace: ${renderUntrusted(disclosure.namespace)}\n`);
       write(out, `key:       ${renderUntrusted(disclosure.key)}\n`);
-      // `version` is a number and `writer` is a single-inhabitant literal we
-      // choose, so neither is attacker-controlled.
-      write(out, `version:   ${disclosure.version}\n`);
+      // `version` IS attacker-controlled, despite its `number` type. The stored
+      // entry is parsed from legacy JSON and cast to `StateEntry` without
+      // runtime field validation, so `ver` can be any JSON value a writer put
+      // there, including a string carrying escape sequences. An earlier comment
+      // here asserted the opposite and was wrong: the type describes what the
+      // code expects, never what the bytes contain. Encode it like any other
+      // stored value, and read `String(...)` as the reminder that it may not be
+      // a number.
+      write(out, `version:   ${renderUntrusted(String(disclosure.version))}\n`);
+      // `writer` is the one field this code chooses rather than reads: a
+      // single-inhabitant literal set by the disclosure path itself.
       write(out, `writer:    ${disclosure.writer}\n`);
       write(
         out,
@@ -359,14 +443,23 @@ export async function runStateDiscloseUnattributedCommand(
           }\n`,
       );
       write(out, "\n--- unattributed content ---\n");
-      // Line breaks and tabs survive because this is the text the operator
-      // asked to read; ESC, CR and the rest do not, because the content sits
-      // BETWEEN the two notices and an unescaped cursor sequence here erases
-      // the closing one as easily as it erases the header.
-      write(
-        out,
-        `${renderUntrusted(disclosure.unattributed_content, { allowLineBreaks: true })}\n`,
-      );
+      // EVERY CONTENT LINE IS GUTTERED, and the gutter is the delimiter's only
+      // defence. Line breaks survive here because this is the text the operator
+      // asked to read, and that exemption is exactly what let the content print
+      // its own `--- end unattributed content ---` line followed by a forged
+      // header: the real delimiter arriving later does not undo what was read.
+      // Prefixing each line means anything the content emits appears INSIDE the
+      // block, so a forged delimiter reads as `| --- end unattributed content
+      // ---` and the ungutted delimiters are unreachable from the content.
+      // Escaping LF instead would make ordinary multi-line values unreadable,
+      // which is the thing this command exists to provide.
+      const gutter = "| ";
+      const body = renderUntrusted(disclosure.unattributed_content, {
+        allowLineBreaks: true,
+      });
+      for (const line of body.split("\n")) {
+        write(out, `${gutter}${line}\n`);
+      }
       write(out, "--- end unattributed content ---\n\n");
       write(out, `${UNATTRIBUTED_DISCLOSURE_NOTICE}\n`);
     }
