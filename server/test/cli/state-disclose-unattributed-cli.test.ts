@@ -786,41 +786,157 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
   // `write()` cannot see at all. Each mode must reach the same rollback.
   type StdoutFailureMode = "sync-throw" | "callback-error" | "error-event";
 
+  /**
+   * A stdout that fails, optionally AFTER accepting a prefix of the chunk.
+   *
+   * A real pipe does not fail atomically: the consumer can take some bytes and
+   * then go away, so a rejected write proves the delivery was INCOMPLETE, not
+   * that it was empty. `accepted` records what the far side got, so a test can
+   * assert the command does not claim zero bytes were received.
+   */
   function failingStdout(
     mode: StdoutFailureMode,
-    beforeFailing?: () => void
-  ): Writable {
+    options?: { beforeFailing?: () => void; acceptPrefixChars?: number }
+  ): Writable & { accepted: string } {
+    const chunks: string[] = [];
+    const takePrefix = (c: Buffer | string): void => {
+      const n = options?.acceptPrefixChars ?? 0;
+      if (n <= 0) return;
+      chunks.push((typeof c === "string" ? c : c.toString("utf8")).slice(0, n));
+    };
+    const accepted = { get: (): string => chunks.join("") };
     if (mode === "sync-throw") {
       return new (class extends Writable {
-        override write(): never {
-          beforeFailing?.();
+        get accepted(): string {
+          return accepted.get();
+        }
+        override write(c: Buffer | string): never {
+          takePrefix(c);
+          options?.beforeFailing?.();
           throw new Error("EPIPE: broken pipe");
         }
       })();
     }
     if (mode === "callback-error") {
       return new (class extends Writable {
+        get accepted(): string {
+          return accepted.get();
+        }
         override _write(
-          _c: Buffer | string,
+          c: Buffer | string,
           _e: BufferEncoding,
           cb: (err?: Error) => void
         ): void {
-          beforeFailing?.();
+          takePrefix(c);
+          options?.beforeFailing?.();
           cb(new Error("EPIPE: broken pipe"));
         }
       })();
     }
     return new (class extends Writable {
+      get accepted(): string {
+        return accepted.get();
+      }
       override _write(
-        _c: Buffer | string,
+        c: Buffer | string,
         _e: BufferEncoding,
         _cb: (err?: Error) => void
       ): void {
-        beforeFailing?.();
+        takePrefix(c);
+        options?.beforeFailing?.();
         this.destroy(new Error("EPIPE: broken pipe"));
       }
     })();
   }
+
+  it("removes the advertised path when the write fails AFTER creating it", async () => {
+    // `writeFile(path, {flag:"wx"})` claims the advertised pathname and fills
+    // it in one call, so an ENOSPC, an EIO, or a late close failure rejects
+    // with the file already created and partly populated. The committed fault
+    // coverage was a pre-existing-path COLLISION, which fails before any byte
+    // is written and therefore says nothing about this case. The advertised
+    // path must not keep partial plaintext, and the report must say so.
+    const seam = { now: new Date("2026-08-19T03:00:00.000Z"), randomHex: "445566" };
+    const expectedPath = join(
+      await realpath(fortressPath),
+      "disclosures",
+      "disclosure-20260819T030000Z-445566.txt"
+    );
+    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runStateDiscloseUnattributedCommand({
+      argv: ["--fortress", fortressPath, "--namespace", NAMESPACE, "--key", KEY],
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      approvalChannel: new FixedChannel("approve"),
+      fileNameSeam: seam,
+      contentWriteSeam: async () => {
+        // The file has been created by now; this is the fill step failing.
+        throw new Error("ENOSPC: no space left on device");
+      },
+    });
+
+    expect(code).toBe(1);
+    expect(err.text).toContain("could not write the disclosure content file");
+    expect(err.text).toContain("was removed");
+    expect(err.text).not.toContain("could not open or unlock");
+    // The advertised path is gone, not left holding a truncated disclosure.
+    await expect(readFile(expectedPath)).rejects.toThrow();
+    expect(await readdir(join(fortressPath, "disclosures"))).toHaveLength(0);
+    // And no receipt claimed the content had been written anywhere.
+    expect(out.text).not.toContain("content written to:");
+    expect(await deliveryRows()).toEqual([
+      {
+        result: "failure",
+        details: expect.objectContaining({
+          delivery_outcome: "file_write_failed_partial_removed",
+          content_file: expectedPath,
+        }),
+      },
+    ]);
+  });
+
+  it("says plaintext MAY REMAIN when a partial write cannot be cleaned up", async () => {
+    // The other half. The removal here is the REAL unlink failing against a
+    // directory made unwritable, not a stub, and the operator has to be told
+    // the truth: a file they never asked for may be holding their plaintext.
+    const disclosuresDir = join(fortressPath, "disclosures");
+    const seam = { now: new Date("2026-08-19T04:00:00.000Z"), randomHex: "778899" };
+    const expectedPath = join(
+      await realpath(fortressPath),
+      "disclosures",
+      "disclosure-20260819T040000Z-778899.txt"
+    );
+    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+    const err = new StringWritable();
+    const code = await runStateDiscloseUnattributedCommand({
+      argv: ["--fortress", fortressPath, "--namespace", NAMESPACE, "--key", KEY],
+      out: new StringWritable(),
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      approvalChannel: new FixedChannel("approve"),
+      fileNameSeam: seam,
+      contentWriteSeam: async () => {
+        chmodSync(disclosuresDir, 0o500);
+        throw new Error("EIO: i/o error");
+      },
+    });
+    chmodSync(disclosuresDir, 0o700);
+
+    expect(code).toBe(1);
+    expect(err.text).toContain("could NOT be removed");
+    expect(err.text).toContain(expectedPath);
+    expect(err.text).toContain("remove it manually");
+    expect(err.text).not.toContain("was removed and no content");
+    const rows = await deliveryRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.details).toMatchObject({
+      delivery_outcome: "file_write_failed_file_may_remain",
+      content_file: expectedPath,
+    });
+  });
 
   it.each<StdoutFailureMode>(["sync-throw", "callback-error", "error-event"])(
     "removes the disclosure file and reports distinctly when the receipt cannot be delivered (%s)",
@@ -907,7 +1023,7 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
       });
 
       expect(code).toBe(3);
-      expect(err.text).toContain("the disclosure could not be delivered");
+      expect(err.text).toContain("not fully delivered");
       expect(err.text).not.toContain("could not open or unlock");
       expect(await deliveryRows()).toEqual([
         {
@@ -915,12 +1031,55 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
           details: expect.objectContaining({
             namespace: NAMESPACE,
             key: KEY,
-            delivery_outcome: "json_delivery_failed",
+            delivery_outcome: "json_delivery_incomplete",
           }),
         },
       ]);
     }
   );
+
+  it("does not claim nothing was received when the consumer took a prefix first", async () => {
+    // A pipe accepts bytes and then breaks. The write rejects either way, so a
+    // rejection proves the delivery was INCOMPLETE, never that it was empty:
+    // telling the operator "nothing was received" when a truncated fragment IS
+    // sitting in their file or their consumer's buffer points them away from
+    // the thing they have to go and check.
+    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+    const out = failingStdout("callback-error", { acceptPrefixChars: 40 });
+    const err = new StringWritable();
+    const code = await runStateDiscloseUnattributedCommand({
+      argv: [
+        "--fortress",
+        fortressPath,
+        "--namespace",
+        NAMESPACE,
+        "--key",
+        KEY,
+        "--json",
+      ],
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      approvalChannel: new FixedChannel("approve"),
+    });
+
+    expect(code).toBe(3);
+    // The consumer really did receive a proper, non-empty prefix.
+    expect(out.accepted).toHaveLength(40);
+    expect(out.accepted.startsWith('{"disclosure_kind"')).toBe(true);
+    // So the report must not say zero bytes arrived, and must warn that what
+    // did arrive is not a parseable document.
+    expect(err.text).not.toContain("nothing was received");
+    expect(err.text).toContain("not fully delivered");
+    expect(err.text).toContain("incomplete");
+    expect(err.text).toContain("must not be");
+    const rows = await deliveryRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.result).toBe("failure");
+    expect(rows[0]!.details).toMatchObject({
+      delivery_outcome: "json_delivery_incomplete",
+    });
+  });
 
   it("warns, rather than misreporting an unlock failure, when the delivery row cannot be written", async () => {
     // The delivery-row append is wrapped so a storage fault is not reported as
@@ -976,8 +1135,10 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     const err = new StringWritable();
     const code = await runStateDiscloseUnattributedCommand({
       argv: ["--fortress", fortressPath, "--namespace", NAMESPACE, "--key", KEY],
-      out: failingStdout("callback-error", () => {
-        chmodSync(disclosuresDir, 0o500);
+      out: failingStdout("callback-error", {
+        beforeFailing: () => {
+          chmodSync(disclosuresDir, 0o500);
+        },
       }),
       err,
       env: { SANCTUARY_RECOVERY_KEY: recoveryKey },

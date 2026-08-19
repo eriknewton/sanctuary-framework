@@ -41,7 +41,8 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { chmod, mkdir, realpath, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, realpath, unlink } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -249,6 +250,18 @@ export interface StateDiscloseCommandArgs {
    * clock and fresh randomness; the derivation itself never changes.
    */
   fileNameSeam?: { readonly now: Date; readonly randomHex: string };
+  /**
+   * Test seam for the FILL step only, after the content file has been
+   * created. Absent writes through the real handle.
+   *
+   * It exists because the behaviour that matters here cannot be produced in
+   * process: a genuine ENOSPC, EIO, or late close failure arrives after the
+   * advertised path is already created, and the property to prove is that the
+   * path never keeps partial plaintext. The seam replaces one call and
+   * nothing else, so the creation, the removal, and the reporting under test
+   * are all the shipped ones.
+   */
+  contentWriteSeam?: (body: string) => Promise<void>;
 }
 
 function write(stream: Writable, text: string): void {
@@ -632,10 +645,18 @@ export async function runStateDiscloseUnattributedCommand(
       try {
         await writeAwaitingCompletion(out, payload + "\n");
       } catch {
-        await auditDelivery("json_delivery_failed", "failure");
+        // INCOMPLETE, NOT EMPTY, and the distinction is the whole report. A
+        // pipe accepts bytes and then breaks, so a rejected write proves the
+        // stream stopped part way; it never proves the consumer got nothing.
+        // Saying "nothing was received" would point the operator away from a
+        // truncated fragment that is really sitting in their file or their
+        // consumer's buffer, which is the thing they have to go and check.
+        await auditDelivery("json_delivery_incomplete", "failure");
         write(
           err,
-          "Error: the disclosure could not be delivered to stdout; nothing was received. Re-run with a writable destination.\n",
+          "Error: the disclosure was not fully delivered to stdout; the stream failed part way, " +
+            "so any output that did arrive is an incomplete fragment and must not be parsed or " +
+            "trusted as a complete document. Discard it and re-run with a writable destination.\n",
         );
         return 3;
       }
@@ -772,30 +793,80 @@ export async function runStateDiscloseUnattributedCommand(
           : "note: the stored value was not a string; the file carries its exact JSON serialization.\n") +
         `\n${UNATTRIBUTED_DISCLOSURE_NOTICE}\n`;
 
+      // CLAIMING THE PATH AND FILLING IT ARE TWO STEPS, on purpose. A single
+      // `writeFile(path, {flag:"wx"})` conflates two failures that call for
+      // opposite responses: a refusal to CLAIM the pathname (something is
+      // already there, and that something is an earlier disclosure this run
+      // must never delete) and a failure while FILLING the file this run just
+      // created (which can leave partial plaintext at the advertised path and
+      // must be cleaned up). Opening first makes `created` the discriminator.
+      //
+      // `wx` still carries the no-overwrite guarantee: the open refuses an
+      // existing file rather than truncating it.
+      let handle: FileHandle | undefined;
+      let created = false;
       try {
+        handle = await open(contentFilePath, "wx", 0o600);
+        created = true;
         // FIDELITY INVARIANT AT THE WRITE SITE: the file carries the stored
         // value byte-for-byte (or its exact JSON serialization when the stored
         // value was not a string); no display encoding is ever applied to it.
-        // `wx` refuses an existing file rather than overwriting: a path
-        // collision must never silently replace a disclosure an operator has
-        // not read yet.
-        await writeFile(contentFilePath, fileBody.body, {
-          flag: "wx",
-          mode: 0o600,
-        });
+        await (args.contentWriteSeam
+          ? args.contentWriteSeam(fileBody.body)
+          : handle.writeFile(fileBody.body));
+        // Closed explicitly rather than left to the runtime, because a close
+        // is where a deferred write error surfaces; awaiting it here puts that
+        // failure inside this handler instead of after the receipt is printed.
+        await handle.close();
+        handle = undefined;
       } catch (error) {
         // The OS/error message is code- or kernel-originated, not attacker
         // metadata, but it still goes through the unbounded ASCII escape so
         // no path this command prints can carry a raw non-ASCII byte.
         const message = error instanceof Error ? error.message : String(error);
-        await auditDelivery("file_write_failed", "failure", {
-          content_file: contentFilePath,
-        });
+        await handle?.close().catch(() => undefined);
+        if (!created) {
+          // This run never owned that pathname. Whatever occupies it belongs
+          // to an earlier disclosure, so it is reported and left alone;
+          // removing it here would destroy content the operator has not read.
+          await auditDelivery("file_write_failed", "failure", {
+            content_file: contentFilePath,
+          });
+          write(
+            err,
+            "Error: could not write the disclosure content file: " +
+              `${renderUntrusted(message)}\n` +
+              "The disclosure was not completed and no content was printed.\n",
+          );
+          return 1;
+        }
+        // This run created the file, so it may now hold a PARTIAL copy of the
+        // plaintext under the advertised name. Same rollback contract the
+        // receipt path uses: remove it, and report removal and residue
+        // differently, because only one of those two is something the
+        // operator has to go and act on.
+        let removed = true;
+        try {
+          await unlink(contentFilePath);
+        } catch {
+          removed = false;
+        }
+        await auditDelivery(
+          removed
+            ? "file_write_failed_partial_removed"
+            : "file_write_failed_file_may_remain",
+          "failure",
+          { content_file: contentFilePath },
+        );
         write(
           err,
           "Error: could not write the disclosure content file: " +
             `${renderUntrusted(message)}\n` +
-            "The disclosure was not completed and no content was printed.\n",
+            (removed
+              ? "The partially written file was removed, no content was printed, and the disclosure was not completed.\n"
+              : "The partially written file could NOT be removed. It remains at " +
+                `${renderUntrusted(contentFilePath)} and may contain unattributed plaintext; ` +
+                "remove it manually. The disclosure was not completed and no content was printed.\n"),
         );
         return 1;
       }
