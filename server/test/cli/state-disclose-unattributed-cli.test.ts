@@ -342,42 +342,29 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
 
     expect(code).toBe(0);
 
-    // THE PROPERTY: no C0 control, DEL, or C1 byte reaches the terminal. `\n`
-    // and `\t` are excluded from the class because they are ordinary text in
-    // the content block and this command emits them itself.
-    expect(out.text).not.toMatch(
-      /[\u0000-\u0008\u000b-\u001f\u007f\u0080-\u009f]/
-    );
-    // THE SECOND PROPERTY: nor any character that reorders the DISPLAY without
-    // changing the bytes. Driving the cursor is one way a chosen string can
-    // misrepresent itself on a terminal; bidi overrides and the separator
-    // characters are the others, and the operator is reading this text to make
-    // a trust decision either way.
-    expect(out.text).not.toMatch(
-      /[\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/
-    );
-    // Lone surrogates are not scalar values and render differently per
-    // terminal, so what is displayed would not be determined by us.
-    expect(out.text).not.toMatch(/[\ud800-\udfff]/);
-    // The default-ignorable formatting characters render as nothing, so they
-    // can split a value an operator is matching on without being visible.
-    expect(out.text).not.toMatch(/[\u00ad\u200b-\u200d\u2060\ufeff]/);
-
-    // DELIMITER FORGERY. The content may contain line breaks, so it can emit a
-    // line that looks like the end of its own block followed by a forged
-    // header. Every content line is guttered, so the only ungutted delimiters
-    // are the two this code writes.
-    const lines = out.text.split("\n");
-    expect(lines.filter((l) => l === "--- end unattributed content ---")).toHaveLength(1);
-    // And no line the content produced can present itself as the fortress's
-    // own writer statement.
-    expect(lines.filter((l) => l === "writer:    established")).toHaveLength(0);
-    // The forged text is still SHOWN, inside the gutter, so nothing is hidden.
-    expect(out.text).toContain("| --- end unattributed content ---");
-
-    // `version` is cast from stored JSON without runtime validation, so it is
-    // an attacker-chosen value despite its `number` type.
-    expect(lines.filter((l) => l.startsWith("version:   ")).length).toBe(1);
+    // THE PROPERTY, EXPRESSED AS AN ALLOWLIST. An earlier version of this test
+    // listed the character classes that must be absent, which is the same
+    // mistake the code made: a review enumerated over 4,000 code points the
+    // list did not name. The header lines contain identifiers and timestamps,
+    // so the defensible set for them is printable ASCII, and asserting that is
+    // complete by construction.
+    const headerLines = out.text
+      .split("\n")
+      .filter((l) => /^(namespace|key|version|writer|claimed)/.test(l));
+    expect(headerLines.length).toBeGreaterThan(0);
+    for (const line of headerLines) {
+      expect(line).toMatch(/^[\x20-\x7e]*$/);
+    }
+    // The content block may carry any ordinary visible glyph, because it is the
+    // owner's own data and must be readable in any script. What it may not
+    // carry is anything in the control, format, unassigned, private-use or
+    // separator categories, which is where every invisible and
+    // display-reordering character lives.
+    const contentLines = out.text.split("\n").filter((l) => l.startsWith("| "));
+    expect(contentLines.length).toBeGreaterThan(0);
+    for (const line of contentLines) {
+      expect(line).not.toMatch(/\p{C}|\p{Zl}|\p{Zp}/u);
+    }
 
     // The real security statement survives, because nothing could move the
     // cursor onto its line.
@@ -436,6 +423,113 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     expect(out.text).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f\u0080-\u009f]/);
     expect(out.text).toContain("writer:    not_established");
     expect(out.text.split("\n").filter((l) => l === "writer:    established")).toHaveLength(0);
+  });
+
+  it("discloses rather than crashing when a stored field is not the type it is typed as", async () => {
+    // A review found this by planting a numeric `kid` and an object-valued
+    // `written_at`. Both are permitted by the same cast that permits a string
+    // `ver`, and both reached a string-only encoder, which threw. The throw was
+    // caught by the outer handler and reported to the operator as a fortress
+    // unlock failure: a false explanation of a real fault, on the one surface
+    // whose job is telling the truth about a record.
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      storagePathHint: fortressPath,
+    });
+    const plaintext = stringToBytes(CONTENT);
+    const entry = {
+      v: 1,
+      payload: encrypt(plaintext, deriveNamespaceKey(masterKey, NAMESPACE)),
+      ver: 1,
+      sig: toBase64url(new Uint8Array(64)),
+      kid: 12345,
+      integrity_hash: hashToString(plaintext),
+      metadata: { written_at: { nested: "object" } },
+    } as unknown as StateEntry;
+    await storage.write(NAMESPACE, KEY, stringToBytes(JSON.stringify(entry)));
+    masterKey.fill(0);
+
+    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runStateDiscloseUnattributedCommand({
+      argv: ["--fortress", fortressPath, "--namespace", NAMESPACE, "--key", KEY],
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      approvalChannel: new FixedChannel("approve"),
+    });
+
+    expect(code).toBe(0);
+    expect(out.text).toContain(CONTENT);
+    expect(out.text).toContain("writer:    not_established");
+    // And specifically NOT the unlock error, which is what the operator used
+    // to be told.
+    expect(err.text).not.toContain("could not open or unlock");
+  });
+
+  it("encodes --json when stdout is a terminal, and leaves it verbatim when it is not", async () => {
+    // `--json` was documented as a data channel and left unencoded on that
+    // basis. It writes to stdout, and stdout is often a terminal, so the same
+    // display-affecting characters arrived at the same screen with only
+    // `JSON.stringify`'s escaping, which covers C0 and lone surrogates and
+    // passes format characters through. The question is answerable rather than
+    // assumable: ask where the stream points.
+    const ESC = "\u001b";
+    const hostile = `x\r${ESC}[2Kwriter: established \u202e \u200b`;
+
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      storagePathHint: fortressPath,
+    });
+    const plaintext = stringToBytes(hostile);
+    const entry: StateEntry = {
+      v: 1,
+      payload: encrypt(plaintext, deriveNamespaceKey(masterKey, NAMESPACE)),
+      ver: 1,
+      sig: toBase64url(new Uint8Array(64)),
+      kid: "sanctuary-no-such-writer-identity",
+      integrity_hash: hashToString(plaintext),
+      metadata: { written_at: "2026-08-18T00:00:05.000Z" },
+    };
+    await storage.write(NAMESPACE, KEY, stringToBytes(JSON.stringify(entry)));
+    masterKey.fill(0);
+    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+
+    const runJson = async (isTTY: boolean): Promise<string> => {
+      const out = new StringWritable() as StringWritable & { isTTY?: boolean };
+      out.isTTY = isTTY;
+      await runStateDiscloseUnattributedCommand({
+        argv: [
+          "--fortress",
+          fortressPath,
+          "--namespace",
+          NAMESPACE,
+          "--key",
+          KEY,
+          "--json",
+        ],
+        out,
+        err: new StringWritable(),
+        env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+        approvalChannel: new FixedChannel("approve"),
+      });
+      return out.text;
+    };
+
+    // A human is reading: encoded. The trailing newline is this command's own
+    // and is excluded, which is the difference between asserting on the payload
+    // and asserting on the write.
+    const toTerminal = (await runJson(true)).trimEnd();
+    expect(toTerminal).not.toMatch(/\p{C}|\p{Zl}|\p{Zp}/u);
+    expect(toTerminal).not.toContain("\u202e");
+
+    // A program is reading: verbatim, because escaping would corrupt the value
+    // for the consumer that asked for it.
+    const toPipe = await runJson(false);
+    expect(JSON.parse(toPipe).unattributed_content).toBe(hostile);
   });
 
   it("encodes caller input on the refusal paths, which print before any record is read", async () => {

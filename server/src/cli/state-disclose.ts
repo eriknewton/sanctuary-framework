@@ -54,111 +54,103 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { flagValue } from "./argv.js";
 
 /**
- * Characters that are not C0/C1 controls but still change what a reader SEES
- * rather than what the text says.
+ * ALLOWLIST, NOT A DENYLIST, and the switch is the point.
  *
- * The C0 escaping stops the cursor being driven. It does not stop the other
- * ways a chosen string misrepresents itself:
+ * Every string this command prints except its own labels is chosen by whoever
+ * wrote a record whose signature did not verify, or supplied by the caller.
+ * Written raw to a terminal such a string does not display as itself: some code
+ * points move the cursor over lines already printed, some reorder the display
+ * of surrounding text without changing the bytes, and thousands render as
+ * nothing at all.
  *
- *   - U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are treated as line
- *     breaks by some terminals, so a value carrying one can appear to end a
- *     line the header means to own.
- *   - The bidirectional formatting characters (marks, embeddings, overrides,
- *     isolates) reorder the DISPLAY of surrounding text without changing its
- *     bytes. Published as "Trojan Source": what is read is not the order the
- *     characters are in.
- *   - The DEFAULT-IGNORABLE format characters render as nothing at all, so
- *     they can split a word an operator is matching on, or pad a value so two
- *     visibly identical strings are different bytes. U+00AD soft hyphen,
- *     U+200B..U+200D zero-width space/non-joiner/joiner, U+2060 word joiner,
- *     U+FEFF zero-width no-break space.
- *   - Surrogate code points are not scalar values. Unescaped they reach the
- *     terminal as U+FFFD, so the substitution rather than the input decides
- *     what is shown.
+ * An earlier version escaped an ENUMERATED set: C0, DEL, C1, the bidi
+ * formatting characters, the separators, a handful of default-ignorables. A
+ * review enumerated what that missed and found 4,157 uncovered
+ * `Default_Ignorable_Code_Point` values, 153 uncovered format characters, and a
+ * bidi control the list had simply not named. That is the predictable outcome:
+ * a denylist over Unicode is a list someone maintains against a standard that
+ * keeps growing, and it is wrong the day a new format character is assigned.
  *
- * All are escaped for one reason: on this surface the operator reads the text
- * to make a trust decision, and every string on it was chosen by whoever wrote
- * a record whose signature did not verify.
+ * So the rule is inverted. A code point is emitted only if it is in a set we
+ * can defend; everything else becomes a visible escape. Complete by
+ * construction rather than by diligence.
  *
- * Right-to-left CONTENT is unaffected. Arabic and Hebrew letters carry their
- * own directionality; only the explicit formatting characters are escaped.
+ * WHAT IS NOT SOLVED BY THIS, stated because a previous round claimed a
+ * property it did not have: a terminal WRAPS. Content long enough to fill a row
+ * continues at column zero on the next visual row, so text can appear where a
+ * line-oriented frame did not put it, with no newline involved. Nothing this
+ * function does prevents that, and the gutter below does not either. The
+ * defended property is narrower: the entry's author cannot move the cursor,
+ * cannot reorder the display, and cannot emit an invisible character. They can
+ * still write something that LOOKS like a label if a row happens to wrap.
  */
-function isDisplayReorderingControl(code: number): boolean {
-  return (
-    code === 0x2028 || // LINE SEPARATOR
-    code === 0x2029 || // PARAGRAPH SEPARATOR
-    code === 0x200e || // LEFT-TO-RIGHT MARK
-    code === 0x200f || // RIGHT-TO-LEFT MARK
-    (code >= 0x202a && code <= 0x202e) || // embeddings, overrides, pop
-    (code >= 0x2066 && code <= 0x2069) || // isolates, pop
-    code === 0x00ad || // SOFT HYPHEN, renders as nothing
-    (code >= 0x200b && code <= 0x200d) || // zero-width space / non-joiner / joiner
-    code === 0x2060 || // WORD JOINER
-    code === 0xfeff || // ZERO WIDTH NO-BREAK SPACE
-    (code >= 0xd800 && code <= 0xdfff) // surrogate, not a scalar value
-  );
+
+/** Space through `~`: the printable ASCII range, minus nothing. */
+function isPrintableAscii(code: number): boolean {
+  return code >= 0x20 && code <= 0x7e;
 }
 
 /**
- * Every string this command prints except its own notice is chosen by whoever
- * wrote the entry, and that entry's signature did NOT verify - which is the
- * entire premise of the command. Written raw to a terminal those bytes are not
- * text: a carriage return followed by `ESC [ 2 A` and `ESC [ 2 K` walks the
- * cursor back over the header and erases it, so the entry's author can replace
- * `writer:    not_established` on the operator's screen with
- * `writer:    established`. The one security statement this surface exists to
- * make would then be made BY the attacker, to the human it is meant to warn.
+ * Emit `raw` with every code point outside the safe set replaced by a visible
+ * escape.
  *
- * So no untrusted string reaches `out` except through here.
+ * `allowLetters` widens the set to any code point a terminal renders as an
+ * ordinary visible glyph, which is what the content block needs: an owner
+ * reading their own notes in Japanese or Arabic must see them, not a wall of
+ * escapes. It is implemented as a category test rather than a range list, and
+ * it deliberately excludes the format (`Cf`), control (`Cc`), unassigned (`Cn`)
+ * and private-use (`Co`) categories, which is where every invisible and
+ * display-reordering character lives.
  *
- * Controls become VISIBLE `\xNN` escapes rather than being dropped. An operator
- * must be able to see that a field carried something strange; silently deleting
- * it trades one presentation lie for a quieter one.
- *
- * `allowLineBreaks` is for the content block alone, where `\n` and `\t` are
- * ordinary text the operator asked to read. ESC and CR stay escaped even there:
- * neither is needed to display text, and both are what drive a cursor.
- *
- * C1 (0x80-0x9f) is escaped too. 0x9b is CSI, and a terminal that is not in
- * UTF-8 mode will act on it exactly as it acts on `ESC [`.
- *
- * THE `--json` PATH AND THE MCP TOOL ARE NOT ROUTED THROUGH HERE, AND THAT IS
- * A BOUND RATHER THAN A SAFETY CLAIM. An earlier version of this comment said
- * they were safe because `JSON.stringify` escapes controls. It escapes C0 and
- * lone surrogates; it passes bidirectional formatting characters and
- * U+2028/U+2029 through unchanged, which was verified by driving both paths.
- *
- * They are still not encoded here, deliberately. Those are DATA channels: a
- * consumer receives the content to process, and silently substituting escape
- * sequences into the bytes would corrupt the value rather than protect anyone.
- * The obligation moves to the consumer, so state it where a consumer reads it:
- * ANY CONSUMER THAT RENDERS THIS CONTENT TO A TERMINAL MUST ENCODE IT FIRST.
- * The human-readable path below is this command's own consumer, and it does.
+ * `allowLineBreaks` permits LF alone, for the content block. TAB is NOT
+ * permitted even there: it advances to the next tab stop rather than occupying
+ * one cell, so it moves text horizontally by an amount the content chooses.
  */
 function renderUntrusted(
   raw: string,
-  options?: { readonly allowLineBreaks?: boolean },
+  options?: { readonly allowLineBreaks?: boolean; readonly allowLetters?: boolean },
 ): string {
-  const keepBreaks = options?.allowLineBreaks === true;
   let rendered = "";
   for (const ch of raw) {
-    if (keepBreaks && (ch === "\n" || ch === "\t")) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (options?.allowLineBreaks === true && ch === "\n") {
       rendered += ch;
       continue;
     }
-    const code = ch.codePointAt(0) ?? 0;
-    // 0x20 = space, the lowest printable; 0x7f = DEL; 0x80-0x9f = C1.
-    if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
-      rendered += `\\x${code.toString(16).padStart(2, "0")}`;
+    if (isPrintableAscii(code)) {
+      rendered += ch;
       continue;
     }
-    if (isDisplayReorderingControl(code)) {
-      rendered += `\\u{${code.toString(16)}}`;
+    if (options?.allowLetters === true && isOrdinaryVisibleGlyph(ch)) {
+      rendered += ch;
       continue;
     }
-    rendered += ch;
+    rendered +=
+      code <= 0xff
+        ? `\\x${code.toString(16).padStart(2, "0")}`
+        : `\\u{${code.toString(16)}}`;
   }
   return rendered;
+}
+
+/**
+ * Whether a code point is an ordinary visible glyph: a letter, a mark, a
+ * number, a punctuation mark, a symbol, or an ordinary space.
+ *
+ * Defined by what it EXCLUDES, which is the part that matters. `\p{C}` covers
+ * control, format, unassigned, private-use and surrogate code points, and that
+ * single category is where the entire class of invisible and
+ * display-reordering characters lives. `\p{Zl}` and `\p{Zp}` are the line and
+ * paragraph separators. `\p{Zs}` is allowed but normalised below, because a
+ * space of a different width is still a space an operator cannot measure.
+ */
+function isOrdinaryVisibleGlyph(ch: string): boolean {
+  if (/\p{C}|\p{Zl}|\p{Zp}/u.test(ch)) return false;
+  // Any space separator other than U+0020 is rendered as an escape rather than
+  // passed through: a narrow or ideographic space is invisible as a difference
+  // and is one of the ways two visibly identical values differ in bytes.
+  if (/\p{Zs}/u.test(ch)) return ch === " ";
+  return true;
 }
 
 export interface StateDiscloseCommandArgs {
@@ -359,7 +351,7 @@ export async function runStateDiscloseUnattributedCommand(
         err,
         `Refused: namespace "${renderUntrusted(namespace)}" is reserved for internal ` +
           `use (prefix: ${renderUntrusted(outcome.reservedPrefix)}). This surface\n` +
-          "from reserved namespaces.\n",
+          "does not disclose from reserved namespaces.\n",
       );
       return 1;
     }
@@ -395,7 +387,20 @@ export async function runStateDiscloseUnattributedCommand(
 
     const disclosure = outcome.disclosure;
     if (json) {
-      write(out, JSON.stringify(disclosure) + "\n");
+      // `--json` IS a data channel, and treating it as one was defensible only
+      // while nobody checked where it points. It writes to stdout, and stdout
+      // is frequently a terminal, so the same values that cannot be trusted in
+      // the human path arrive at the same terminal with only
+      // `JSON.stringify`'s escaping, which covers C0 and lone surrogates and
+      // passes every display-affecting format character through.
+      //
+      // Resolved by asking rather than assuming: piped or redirected, the
+      // bytes are data and go out verbatim, because escaping them would
+      // corrupt the value for the program reading it. Attached to a terminal,
+      // a human is reading, and the encoder applies.
+      const toTerminal = (out as { isTTY?: boolean }).isTTY === true;
+      const payload = JSON.stringify(disclosure);
+      write(out, (toTerminal ? renderUntrusted(payload) : payload) + "\n");
     } else {
       // The banner is printed BEFORE the content and repeated after it. An
       // operator who scrolls a long value away from the top of the terminal is
@@ -406,8 +411,8 @@ export async function runStateDiscloseUnattributedCommand(
       // fields and the content are chosen by whoever wrote the unverified
       // entry. All of them go through renderUntrusted; see its header for why
       // a raw write here lets the entry's author forge the `writer:` line.
-      write(out, `namespace: ${renderUntrusted(disclosure.namespace)}\n`);
-      write(out, `key:       ${renderUntrusted(disclosure.key)}\n`);
+      write(out, `namespace: ${renderUntrusted(String(disclosure.namespace))}\n`);
+      write(out, `key:       ${renderUntrusted(String(disclosure.key))}\n`);
       // `version` IS attacker-controlled, despite its `number` type. The stored
       // entry is parsed from legacy JSON and cast to `StateEntry` without
       // runtime field validation, so `ver` can be any JSON value a writer put
@@ -425,7 +430,7 @@ export async function runStateDiscloseUnattributedCommand(
         `claimed_written_at: ${
           disclosure.claimed_written_at === undefined
             ? "(none recorded)"
-            : renderUntrusted(disclosure.claimed_written_at)
+            : renderUntrusted(String(disclosure.claimed_written_at))
         }\n`,
       );
       // The identity to restore, printed so the remedy this command advertises
@@ -439,7 +444,7 @@ export async function runStateDiscloseUnattributedCommand(
           `${
             disclosure.claimed_writer_id === undefined
               ? "(none recorded)"
-              : renderUntrusted(disclosure.claimed_writer_id)
+              : renderUntrusted(String(disclosure.claimed_writer_id))
           }\n`,
       );
       write(out, "\n--- unattributed content ---\n");
@@ -453,9 +458,30 @@ export async function runStateDiscloseUnattributedCommand(
       // ---` and the ungutted delimiters are unreachable from the content.
       // Escaping LF instead would make ordinary multi-line values unreadable,
       // which is the thing this command exists to provide.
+      // The gutter's honest bound, recorded where it is applied: it prefixes
+      // LOGICAL lines. A terminal WRAPS, so content long enough to fill a row
+      // continues at column zero on the next visual row with no newline
+      // involved, and text can appear where a line-oriented frame did not put
+      // it. Nothing in-band fixes that. What the encoder above still
+      // guarantees is that the content cannot move the cursor, cannot reorder
+      // the display, and cannot emit an invisible character; it can only
+      // produce visible text that may land in an unexpected column.
       const gutter = "| ";
-      const body = renderUntrusted(disclosure.unattributed_content, {
+      // `allowLetters` here and nowhere else: this is the owner's own data and
+      // must be readable in any script. The header fields above are
+      // identifiers and timestamps, so printable ASCII is the whole of what
+      // they legitimately contain.
+      //
+      // `String(...)` on every stored field, for the same reason `version`
+      // needed it: the record is cast from stored JSON with no runtime
+      // validation, so a field typed `string` can arrive as a number, an
+      // object, or an array. Passing one to a string-only encoder threw, and
+      // the throw was caught by the outer handler and reported to the operator
+      // as a fortress unlock failure, which is a false explanation of a real
+      // fault.
+      const body = renderUntrusted(String(disclosure.unattributed_content), {
         allowLineBreaks: true,
+        allowLetters: true,
       });
       for (const line of body.split("\n")) {
         write(out, `${gutter}${line}\n`);
