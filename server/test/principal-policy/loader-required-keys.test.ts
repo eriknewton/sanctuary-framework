@@ -108,6 +108,7 @@ approval_channel:
       "memory_checkpoint_restore",
       "memory_archive_export",
       "memory_archive_import",
+      "state_disclose_unattributed",
     ]);
     expect(policy.approval_channel.type).toBe("stderr");
   });
@@ -137,6 +138,7 @@ approval_channel:
       "memory_checkpoint_restore",
       "memory_archive_export",
       "memory_archive_import",
+      "state_disclose_unattributed",
     ]);
   });
 

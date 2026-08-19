@@ -343,6 +343,59 @@ describe("state envelope integrity", () => {
     expect(read.signature_verified).toBe(false);
   });
 
+  it("state_read surfaces `writer_unverified` in the shape the cooperative recall gate denies on", async () => {
+    // The cooperative surface's `sanctuary_recall` is the ONE production
+    // consumer that inspected `signature_verified`. It reaches state_read
+    // through callPrimitive and admits a result only when BOTH
+    // `integrity_verified` and `signature_verified` are literally true
+    // (`isVerifiedRead` in src/agent-native/cooperative-surface.ts). This test
+    // pins the tool-layer contract that keeps that gate closed after
+    // STATE-READ-REFUSE-01: the refusal comes back as an error result carrying
+    // the new classification and NO `integrity_verified` field at all, so the
+    // gate denies on the first conjunct rather than on the flag it used to
+    // need. Asserting the classification alone would not prove the recall path
+    // still denies.
+    const { storage, masterKey } = makeStateRig();
+    const plaintext = stringToBytes("legacy value with no resolvable writer");
+    const payload = encrypt(plaintext, deriveNamespaceKey(masterKey, "memory"));
+    const orphaned: StateEntry = {
+      v: 1,
+      payload,
+      ver: 1,
+      // ED25519_SIGNATURE_BYTES = 64; never examined, because no authenticated
+      // key resolves for `kid`.
+      sig: toBase64url(new Uint8Array(64)),
+      kid: "sanctuary-no-such-writer-identity",
+      integrity_hash: hashToString(plaintext),
+      metadata: { written_at: "2026-08-18T00:00:00.000Z" },
+    };
+    await storage.write(
+      "memory",
+      "profile",
+      stringToBytes(JSON.stringify(orphaned))
+    );
+
+    const auditLog = new AuditLog(storage, masterKey);
+    const { tools, identityManager } = createL1Tools(
+      new StateStore(storage, masterKey),
+      storage,
+      masterKey,
+      "recovery-key",
+      auditLog
+    );
+    await identityManager.load();
+
+    const read = await callTool(tools, "state_read", {
+      namespace: "memory",
+      key: "profile",
+    });
+
+    expect(read.error).toBe("state_verification_failed");
+    expect(read.classification).toBe("writer_unverified");
+    expect(read.integrity_verified).toBeUndefined();
+    expect(read.value).toBeUndefined();
+  });
+
   it("loads legacy schema-1 entries with a warning", async () => {
     const { storage, masterKey, identity, identityEncKey } = makeStateRig();
     await storage.write(
@@ -452,7 +505,13 @@ describe("state envelope integrity", () => {
   });
 
   it("still re-reads a genuine legacy (v1) entry at its own anchor (no over-rejection)", async () => {
-    const { storage, masterKey, identity, identityEncKey } = makeStateRig();
+    const rig = makeStateRig();
+    // The writer identity is present in the fortress, which since
+    // STATE-READ-REFUSE-01 is what makes this a GENUINE legacy entry rather
+    // than an unattributable one: the enforcing read path refuses the latter,
+    // so an over-rejection probe has to use a shape a real fortress can verify.
+    await persistRigIdentity(rig);
+    const { storage, masterKey, identity, identityEncKey } = rig;
     await writeLegacyEntry({
       storage,
       masterKey,
@@ -462,13 +521,25 @@ describe("state envelope integrity", () => {
       key: "k",
       value: "legacy value",
     });
+    const legacyBytes = await storage.read("legacy", "k");
 
-    // First read establishes the anchor at the v1 entry's own version (1).
+    // First read verifies, so it establishes the anchor at the v1 entry's own
+    // version (1) and migrates the entry in place to the signed-envelope
+    // schema.
     const first = await new StateStore(storage, masterKey).read("legacy", "k");
     expect(first?.value).toBe("legacy value");
+    expect(first?.signature_verified).toBe(true);
 
-    // A subsequent read with the anchor now set (== the entry's version) must
-    // still succeed — the F1 guard only rejects a v1 entry ABOVE the anchor.
+    // Put the ORIGINAL v1 bytes back so the next read is genuinely a v1 read
+    // with the anchor now set. Without this the migration above would leave a
+    // schema-2 entry and the F1 guard would not be exercised at all.
+    await storage.write("legacy", "k", legacyBytes!);
+    expect(
+      (JSON.parse(bytesToString((await storage.read("legacy", "k"))!)) as StateEntry).v
+    ).toBe(1);
+
+    // A v1 read with the anchor set (== the entry's version) must still
+    // succeed — the F1 guard only rejects a v1 entry ABOVE the anchor.
     const second = await new StateStore(storage, masterKey).read("legacy", "k");
     expect(second?.value).toBe("legacy value");
   });

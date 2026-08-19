@@ -49,6 +49,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "rotate-master",
   "secrets",
   "sentinel",
+  "state_disclose_unattributed",
   "status",
   "task",
   "template",
