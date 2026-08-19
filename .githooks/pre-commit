@@ -35,31 +35,30 @@
 #          failed to load before vitest registered it — the same
 #          failure shape as 4ac95830, hiding 98 tests for 26 hours.
 #
-#       c. Test baseline drift (BOTH directions).
+#       c. Test baseline regression (BELOW the floor only).
 #          If vitest's passing-test count falls below the integer
 #          in .test-baseline at repo root, the commit is blocked.
-#          If the passing count rises ABOVE the baseline without the
-#          author bumping .test-baseline in the SAME commit, the
-#          commit is also blocked: a silent ratchet-up lets a later
-#          regression hide under the stale floor (the new passing
-#          tests mask the loss). The fix is mechanical and required —
-#          stage the new count in .test-baseline. Net-zero churn
-#          commits (count == baseline) pass untouched.
+#          A count ABOVE the floor is the normal resting state and
+#          passes: the floor is recorded on main after a merge by the
+#          record-floor job in
+#          .github/workflows/test-baseline-guard.yml, so a commit that
+#          adds tests owes nobody an integer.
 #
-#          PLATFORM-DELTA CARVE-OUT: the fail-above demand applies
-#          only to commits that stage something under server/. On a
-#          macOS dev box the local passing count always exceeds the
-#          Linux floor by the platform delta (macOS-gated suites that
-#          skip on Linux), so `passing > baseline` is the normal
-#          resting state, not a signal. A commit staging nothing under
-#          server/ cannot have added a test, so demanding a bump there
-#          asked for an accounting that did not exist and made
-#          SKIP_TEST_BASELINE=1 the routine way to commit a docs edit.
-#          That is how a gate stops being a gate. Such commits now warn
-#          with the observed delta and pass; the floor is untouched.
-#          The fail-BELOW regression check still blocks on every commit,
-#          and the CI mirror (which runs on Linux, where no delta
-#          exists) still enforces the floor exactly.
+#          WHY THE FAIL-ABOVE DEMAND IS GONE: the floor is the passing
+#          count on Linux CI, which an author on macOS cannot compute.
+#          Demanding it in the commit made the number a guess, and the
+#          routine way through a wrong guess was SKIP_TEST_BASELINE=1,
+#          which is how a gate stops being a gate. The staleness that
+#          demand existed to prevent is now answered structurally: the
+#          floor is rewritten after every merge, so it is at most one
+#          merge behind reality.
+#
+#          The one remaining reason to edit .test-baseline by hand is
+#          the deliberate-lowering path: tests removed on purpose,
+#          with a written justification in the commit and the pull
+#          request. This hook warns on that edit rather than blocking
+#          it, because it cannot read a justification; the reviewer is
+#          the gate there.
 #
 # Runtime budget: < 60 seconds on a modern Mac. Typecheck is ~3s,
 # the test suite is ~20s, total well under the budget.
@@ -217,52 +216,31 @@ log "Gate 2/2: npm test + transform-error detection + baseline check"
 # commit. So the floor must come from git's object store, not the working tree.
 #
 # The floor IN EFFECT for this commit is HEAD's committed blob
-# (`HEAD:.test-baseline`). A STAGED raise is a *proposed* new floor and is
-# validated separately, in the fail-above block, by comparing the staged blob
-# (`:.test-baseline`) against HEAD and requiring a strict increase. Keeping the
-# regression/trigger floor at HEAD avoids a false "regression" when a Linux-floor
-# bump is staged that is (legitimately) below the higher local macOS passing count.
+# (`HEAD:.test-baseline`). A staged edit to the file is the deliberate-lowering
+# path and is annunciated separately below; keeping the regression floor at HEAD
+# means a staged lowering does not retroactively excuse a regression in the same
+# commit.
 baseline_is_staged=""
 if git diff --cached --name-only 2>/dev/null | grep -qx ".test-baseline"; then
   baseline_is_staged="yes"
 fi
 
-# Does this commit stage anything that could CHANGE the test count?
+# HISTORY, kept because the reasoning still binds: the hook used to demand that
+# a passing count above the floor be "accounted for" by staging a raised
+# .test-baseline. On a macOS dev box the local count ALWAYS exceeds the Linux
+# floor by the platform delta (macOS-gated suites that skip on Linux), so
+# `passing > baseline` is the normal resting state locally and the demand asked
+# for an accounting that did not exist. The routine way through was
+# SKIP_TEST_BASELINE=1 (observed 2026-07-18, PR #965), and a gate that must be
+# bypassed to do ordinary work stops being a gate. A carve-out for commits
+# staging nothing under server/ narrowed that, and the redesign below removes
+# the demand entirely: the floor is now recorded on main after every merge, so
+# nothing local ever needs to state it.
 #
-# The fail-above check below exists to stop a silent ratchet: new tests raising
-# the passing count without the floor being raised to match. But on a macOS dev
-# box the local passing count ALWAYS exceeds the Linux floor by the platform
-# delta (macOS-gated suites that skip on Linux), so `passing > baseline` is the
-# NORMAL resting state locally, not evidence of anything.
-#
-# That produced a real failure mode (observed 2026-07-18, PR #965): on a commit
-# that touches no server code at all (a ROADMAP.md edit, a dev-script fix), the
-# hook demanded the author "account for the drift" by raising .test-baseline —
-# but there was nothing to account for. The correct Linux floor had not changed,
-# and raising it to the local macOS count would set a floor Linux can never
-# reach, breaking CI for everyone. The only way through was
-# SKIP_TEST_BASELINE=1. A gate that must be routinely bypassed to do ordinary
-# work stops being a gate, and its override log stops being a signal.
-#
-# So: scope the fail-above demand to commits that could plausibly have changed
-# the count. Anything under server/ qualifies (test files obviously, but also
-# src, package.json, and vitest config — all of which can move the count). A
-# commit staging NOTHING under server/ cannot have added a test, so an excess
-# over the floor there is platform delta by construction, and is reported as a
-# warning instead of a block.
-#
-# What this deliberately does NOT relax:
-#   - the fail-BELOW regression check still blocks unconditionally, on every
-#     commit, regardless of what is staged;
-#   - any commit touching server/ still owes the full accounting;
-#   - the CI guard (.github/workflows/test-baseline-guard.yml) is UNCHANGED and
-#     still enforces the floor exactly. It runs on ubuntu-latest, where local
-#     == CI and no platform delta exists, so it is the authority this local hook
-#     is only the fast convenience copy of.
-server_code_staged=""
-if git diff --cached --name-only 2>/dev/null | grep -qE '^server/'; then
-  server_code_staged="yes"
-fi
+# The fail-BELOW regression check still blocks unconditionally, on every commit,
+# regardless of what is staged, and the CI guard
+# (.github/workflows/test-baseline-guard.yml) remains the authority this local
+# hook is the fast convenience copy of.
 
 # `|| true`: under `set -o pipefail` a failing `git show` (e.g. no HEAD on the
 # first-ever commit) would otherwise propagate non-zero through the command
@@ -429,133 +407,59 @@ if (( passing < baseline )); then
   exit 1
 fi
 
-# Fail-above WITHOUT an in-commit baseline bump. A passing count higher
-# than the floor must be ACCOUNTED FOR — either by raising .test-baseline
-# in this same commit, or it is a silent ratchet that lets a later
-# regression hide under the stale floor (the extra passing tests mask the
-# loss until the floor is finally bumped).
+# A staged edit to .test-baseline. Under this design nothing routine touches
+# the file: CI records the floor on main after a merge, so an edit here is one
+# of two things, and both want to be seen rather than blocked.
 #
-# Local-vs-CI note (coordinator baseline-floor rule): the floor is the
-# LINUX CI passing count; a macOS dev box legitimately runs MORE tests
-# than that floor (platform-specific suites), so requiring passing ==
-# baseline locally would be impossible. The reconciliation: if the author
-# RAISED .test-baseline in THIS commit (an UPWARD bump of the staged value
-# over the previous committed value), the drift is accounted for and the
-# commit passes even though local passing > the new (Linux) floor. If
-# .test-baseline is NOT staged and passing > baseline, that is an
-# unaccounted drift and the commit is blocked. The CI guard (which runs on
-# Linux, where local == CI) enforces the exact floor.
+#   A DELIBERATE LOWERING. Tests were removed on purpose and the floor is being
+#   brought down to match. That is legitimate, it needs a written justification
+#   in the commit and the pull request, and this hook cannot read a
+#   justification, so it warns and lets the reviewer be the gate.
 #
-# IMPORTANT (mirrors the CI guard's intent): merely STAGING .test-baseline is
-# not enough — the staged value must be GREATER than the previously committed
-# value. A flat re-stage (same number) or a LOWERED edit is NOT an accounting
-# of the drift: it would let an author satisfy this gate while keeping the
-# floor stale (or pushing it down so a real regression slips under it). So we
-# compare the staged blob against HEAD's blob and require a strict increase.
+#   A RAISE. Harmless but pointless: the recorder overwrites it with the count
+#   Linux actually observes after the merge. Worse, a raise ABOVE the local
+#   passing count is a floor no run can meet, and it blocks the next commit
+#   with a regression that is not one. That one is still refused.
 #
-# STRICT-UPWARD STAGED CHECK RUNS UNCONDITIONALLY (codex #571 round-2 fix): if
-# .test-baseline is staged at all, validate it HERE, before the passing>baseline
-# branch. Otherwise, when passing == the committed floor, a staged LOWERED value
-# or a staged DELETION would skip the in-branch check below and quietly commit a
-# weaker/missing floor that a future regression could hide under. Fresh locals
-# (_sb/_pb) so the in-branch "drift accounted" message keeps its own vars.
+# Failure mode note for a reader wondering why the raise is refused only when it
+# exceeds local passing: on macOS the local count legitimately EXCEEDS the Linux
+# floor, so a value between the two is indistinguishable from a correct Linux
+# floor and cannot be judged here. CI judges it in minutes.
 if [[ -n "$baseline_is_staged" ]]; then
-  _sb=$(git show :.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
-  if ! [[ "$_sb" =~ ^(0|[1-9][0-9]*)$ ]]; then
-    fail "STAGED .test-baseline IS NOT A SINGLE INTEGER (or was deleted) — commit blocked"
-    printf '[baseline-guard]   Staged value: %s\n' "'$_sb'" >&2
-    printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git commit ...\n' >&2
-    exit 1
-  fi
-  _pb=$(git show HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
-  [[ "$_pb" =~ ^(0|[1-9][0-9]*)$ ]] || _pb=0
-  if (( _sb <= _pb )); then
-    fail "STAGED .test-baseline IS NOT AN UPWARD BUMP — commit blocked"
-    printf '[baseline-guard]   Previously committed: %s\n' "$_pb" >&2
-    printf '[baseline-guard]   Staged value:         %s\n' "$_sb" >&2
-    printf '\n' >&2
-    fail "A flat re-stage, a lowered edit, or a deletion is not an accounting of"
-    fail "drift — it keeps the floor stale (or pushes it down so a regression"
-    fail "slips under it). Raise it to the new Linux CI passing count and re-stage."
-    printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git commit ...\n' >&2
-    exit 1
-  fi
-  # An OVER-RAISED staged floor (above the current passing count) is also invalid:
-  # it poisons the NEXT commit (passing < floor -> fail-below blocks a clean commit)
-  # and can mask a real regression up to the inflated number. The correct staged
-  # value is the new LINUX CI passing count, which is <= local passing (a macOS box
-  # legitimately runs MORE tests than the Linux floor), so a legitimate value never
-  # trips this — only an inflated one does. (codex #571 r3 finding.)
-  if (( _sb > passing )); then
-    fail "STAGED .test-baseline ($_sb) EXCEEDS the current passing count ($passing) — commit blocked"
-    printf '[baseline-guard]   An over-raised floor poisons the next commit and can mask a\n' >&2
-    printf '[baseline-guard]   regression up to the inflated number. Set .test-baseline to the\n' >&2
-    printf '[baseline-guard]   new LINUX CI passing count (<= your local passing), not higher.\n' >&2
-    printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git commit ...\n' >&2
-    exit 1
-  fi
-fi
-if (( passing > baseline )); then
-  if [[ -z "$baseline_is_staged" ]]; then
-    # Platform-delta case: nothing under server/ is staged, so this commit
-    # cannot have added a test. The excess is the macOS-over-Linux delta, which
-    # is the normal resting state on a dev box. Report it and allow; do NOT
-    # demand a bump that would set a floor Linux can never reach.
-    if [[ -z "$server_code_staged" ]]; then
-      warn "Passing count ($passing) exceeds the committed floor ($baseline) by $((passing - baseline))."
-      warn "This commit stages nothing under server/, so it cannot have added a test —"
-      warn "treating the excess as the known macOS-over-Linux platform delta."
-      warn "The floor is UNCHANGED at $baseline. Do NOT raise it to your local count:"
-      warn "the floor is the LINUX CI passing count, and CI enforces it exactly."
-      ok "Gate 2/2: $actual_total test files loaded, $passing tests passed (floor: $baseline, platform delta: $((passing - baseline)))."
-      ok "All baseline-guard checks passed. Commit allowed."
-      exit 0
-    fi
-    fail "TEST BASELINE DRIFTED ABOVE THE FLOOR — commit blocked"
-    printf '[baseline-guard]   Committed floor (HEAD:.test-baseline): %s\n' "$baseline" >&2
-    printf '[baseline-guard]   Current passing count:                 %s\n' "$passing" >&2
-    printf '[baseline-guard]   Unaccounted above floor:               %s\n' "$((passing - baseline))" >&2
-    printf '\n' >&2
-    fail "Account for the drift IN THIS COMMIT: raise .test-baseline (by the"
-    fail "number of NEW tests that run on Linux CI, per the baseline-floor"
-    fail "rule — NOT to your local macOS count) and stage it"
-    fail "(git add .test-baseline). A deferred bump lets a future regression"
-    fail "hide under the stale floor."
-    printf '[baseline-guard] To override in an emergency: SKIP_TEST_BASELINE=1 git commit ...\n' >&2
-    exit 1
-  fi
-
-  # .test-baseline IS staged — verify the staged value is a strict UPWARD
-  # bump over the previously committed value. The staged content is the
-  # `:.test-baseline` blob (the index); the previous committed content is
-  # `HEAD:.test-baseline`. On the very first commit of the file there is no
-  # HEAD blob, so the prior value is treated as 0 and any positive staged
-  # value qualifies as an upward bump.
   staged_baseline=$(git show :.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
   if ! [[ "$staged_baseline" =~ ^(0|[1-9][0-9]*)$ ]]; then
-    fail "STAGED .test-baseline IS NOT A SINGLE INTEGER — commit blocked"
+    fail "STAGED .test-baseline IS NOT A SINGLE INTEGER (or was deleted) — commit blocked"
     printf '[baseline-guard]   Staged value: %s\n' "'$staged_baseline'" >&2
+    printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git commit ...\n' >&2
     exit 1
   fi
-  prev_baseline=$(git show HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
-  if ! [[ "$prev_baseline" =~ ^(0|[1-9][0-9]*)$ ]]; then
-    prev_baseline=0
-  fi
-  if (( staged_baseline <= prev_baseline )); then
-    fail "STAGED .test-baseline IS NOT AN UPWARD BUMP — commit blocked"
-    printf '[baseline-guard]   Previously committed: %s\n' "$prev_baseline" >&2
-    printf '[baseline-guard]   Staged value:         %s\n' "$staged_baseline" >&2
-    printf '[baseline-guard]   Current passing:      %s\n' "$passing" >&2
-    printf '\n' >&2
-    fail "Staging .test-baseline only accounts for the drift if it RAISES the"
-    fail "floor. A flat re-stage or a lowered edit is not an accounting — it"
-    fail "keeps the floor stale (or pushes it down so a regression slips"
-    fail "under it). Raise it to the new Linux CI passing count and re-stage"
-    fail "(git add .test-baseline)."
-    printf '[baseline-guard] To override in an emergency: SKIP_TEST_BASELINE=1 git commit ...\n' >&2
+  if (( staged_baseline > passing )); then
+    fail "STAGED .test-baseline ($staged_baseline) EXCEEDS the current passing count ($passing) — commit blocked"
+    printf '[baseline-guard]   A floor above what any run can reach blocks the next commit with a\n' >&2
+    printf '[baseline-guard]   regression that is not one, and can mask a real regression up to the\n' >&2
+    printf '[baseline-guard]   inflated number. CI records the true floor on main after the merge;\n' >&2
+    printf '[baseline-guard]   you do not need to state it here at all.\n' >&2
+    printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git commit ...\n' >&2
     exit 1
   fi
-  ok "Passing count ($passing) exceeds the floor ($baseline); .test-baseline raised $prev_baseline -> $staged_baseline in this commit — drift accounted for (local may exceed the Linux floor)."
+  if (( staged_baseline < baseline )); then
+    warn "This commit LOWERS the committed floor from $baseline to $staged_baseline."
+    warn "That is the deliberate-lowering path: legitimate only when tests were removed"
+    warn "on purpose, and it needs a written justification in this commit and its pull"
+    warn "request. Nothing else should ever edit .test-baseline by hand."
+  elif (( staged_baseline > baseline )); then
+    warn "This commit raises the committed floor from $baseline to $staged_baseline."
+    warn "You do not need to: the record-floor job writes the observed Linux count to"
+    warn ".test-baseline on main after this merges, and will overwrite this value."
+  fi
+fi
+
+# Above the floor is the ordinary resting state, both because a change may add
+# tests and because a macOS box runs more of them than Linux does. It is
+# reported, never blocked, and the floor is left alone.
+if (( passing > baseline )); then
+  ok "Passing count ($passing) is $((passing - baseline)) above the committed floor ($baseline)."
+  ok "Nothing to do: the floor is recorded on main after this merges."
 fi
 
 ok "Gate 2/2: $actual_total test files loaded, $passing tests passed (baseline: $baseline)."

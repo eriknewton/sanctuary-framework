@@ -10,13 +10,27 @@ This file is a briefing for any AI coding agent working in these codebases. Read
 
 Every commit to Sanctuary main MUST run `npm run typecheck && npm test` against a clean working tree before staging; block the commit if either fails, if any transform/collection error appears in vitest output, or if the passing-test count drops below the integer in `.test-baseline` at repo root.
 
-**This rule is now backed by structural enforcement, not just instruction:**
+**A pull request never carries that integer.** The floor is maintained on `main`:
 
-- **Pre-commit hook** at `.githooks/pre-commit` runs both gates locally on every `git commit`. Install once with `cd server && npm run install-hooks` (copies the hook into `.git/hooks/pre-commit`). The hook takes ~21 seconds on a modern Mac. Emergency bypass: `SKIP_TEST_BASELINE=1 git commit ...` (logged to `.test-baseline-overrides.log` for audit).
-- **CI check** at `.github/workflows/test-baseline-guard.yml` runs the same two gates on every PR and every push to main. This is the second enforcement layer for commits that bypass the local hook with `--no-verify` or from uninstalled environments. See `docs/audit/branch-protection-setup.md` for the Git branch-protection runbook required to make this check a hard merge gate.
+- **On a pull request** the guard asserts the observed passing count is **not below** the floor recorded at the repo root, alongside the unchanged gates (the suite actually executed, no transform or collection error, no silent test-file drop, zero failures). A count **above** the floor is the normal resting state of a change that adds tests, and it passes. Nothing on this path writes anything.
+- **On `main`, after a merge**, the `record-floor` job in the same workflow writes the observed count into `.test-baseline` when it differs, as a one-file commit authored by the CI actor. It is the only job in the repository with a write token, it writes only that file, and only on `main`.
+
+The reason a pull request stopped carrying the integer: the floor is the passing count on Linux CI, which an author on macOS cannot compute. Demanding it made the number a guess. On 2026-08-19 three of three open pull requests guessed it wrong, and the remedy each time was to read the number out of a failed run and push it back. The staleness that demand existed to prevent (a deferred bump letting a later regression hide under a low floor) is now answered structurally instead: the floor is rewritten after every merge, so it is at most one merge behind reality.
+
+**The failure mode this introduces, stated plainly: if the recorder fails or never runs, the floor goes stale LOW and the pull-request gate quietly asserts less than it should. A stale floor is indistinguishable from a healthy floor on a pull request.** That is why its alarm lives outside the pull-request path. Two alarms cover it: the recorder failing reds a push to `main` immediately, and the scheduled backstop at `.github/workflows/test-baseline-floor-drift.yml` compares the recorded floor against a fresh count and reports drift that outlives its window. The backstop's own bound: it proves the floor matched a count on one day, and it says nothing about the days between runs.
+
+**The deliberate-lowering path stays human and is unchanged.** Removing platform-agnostic tests on purpose still goes through an explicitly scoped commit with a written justification, and it is now the only reason `.test-baseline` ever appears in a pull request's diff. That makes its appearance a review signal rather than routine noise, and the guard annunciates it. After the merge, the recorder writes whatever the suite counted, so a reviewed reduction simply lands as a normal recorded floor; the justification lives in the pull request that removed the tests, not in the file.
+
+**The residual, stated because it is not closed: a count is not an inventory.** A change that removes N real tests and adds N trivial ones passes both the old rule and this one. Closing that needs a base-versus-head comparison of collected test identities rather than totals, which is separate, larger work and is not claimed here.
+
+**Structural enforcement:**
+
+- **Decision logic** lives in `scripts/test-baseline-floor.sh`, self-tested by `scripts/test-baseline-floor-self-test.sh`, which the guard workflow runs before it installs anything. Both sides of the mechanism read the floor and parse the suite summary through that one script, so the number a gate compares and the number the recorder writes cannot come from two parsers that drift.
+- **Pre-commit hook** at `.githooks/pre-commit` runs the local copy of the pull-request side on every `git commit`. Install once with `cd server && npm run install-hooks`. The hook takes about 21 seconds on a modern Mac. It blocks a count below the floor, reports a count above it, and warns rather than blocks when `.test-baseline` is edited by hand, since it cannot read a justification. Emergency bypass: `SKIP_TEST_BASELINE=1 git commit ...` (logged to `.test-baseline-overrides.log` for audit).
+- **CI check** at `.github/workflows/test-baseline-guard.yml` is the authority, and the hook is only its fast local copy. See `docs/audit/branch-protection-setup.md` for the branch-protection runbook that makes it a hard merge gate.
 - **Written instruction (this block)** remains the human-facing contract. The structural layers make violations hard; this rule makes the intent explicit so a reviewer or auditor can cite it.
 
-See `docs/audit/test-baseline-hardening-plan.md` for the full three-layer hardening plan, `docs/audit/commit-4ac95830-postmortem.md` for the trigger incident, and `docs/audit/branch-protection-setup.md` for the GitHub branch-protection runbook.
+See `docs/audit/test-baseline-hardening-plan.md` for the full hardening plan, `docs/audit/commit-4ac95830-postmortem.md` for the trigger incident, and `docs/audit/branch-protection-setup.md` for the GitHub branch-protection runbook.
 
 ### Test isolation: the operator's machine is not a fixture (MANDATORY)
 

@@ -1,0 +1,128 @@
+# Sanctuary recorded-floor drift backstop
+#
+# Copyright 2026 Erik Newton
+# SPDX-License-Identifier: Apache-2.0
+#
+# The floor in .test-baseline is recorded on main after every merge by the
+# record-floor job in .github/workflows/test-baseline-guard.yml. This job exists
+# for the one failure that job cannot report on its own: a recorder that never
+# ran at all leaves no failed run for anyone to notice, and the floor then sits
+# stale LOW while the pull-request gate keeps passing in exactly the same colour
+# with exactly the same message. A stale floor is indistinguishable from a
+# healthy floor from a pull request's point of view. That is the whole reason
+# this alarm lives outside the pull-request path.
+#
+# What it does: runs the suite on main, compares the fresh count against the
+# recorded floor, and fails loudly when a mismatch has outlived its window.
+#
+# BOUND, so nobody reads this as more than it is: this job proves the floor
+# matched a count taken on ONE day. It says nothing about the days between runs,
+# and it cannot tell a floor that was never recorded from one that was recorded
+# and then invalidated. The primary alarm remains record-floor failing on a push
+# to main, which is immediate; this is the backstop for its silence.
+#
+# It is deliberately not a required status check and does not gate any merge. It
+# is an alarm, and an alarm that blocks work gets disabled.
+
+name: Test Baseline Floor Drift
+
+on:
+  schedule:
+    # Daily, mid-morning UTC. The cadence and the grace window below are a pair;
+    # changing one without the other either pages on drift that is about to fix
+    # itself or lets real drift sit for an extra day.
+    - cron: "0 9 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  floor-drift:
+    name: floor-drift
+    runs-on: ubuntu-latest
+
+    env:
+      # The grace window, in hours. Set to half the daily cadence above so drift
+      # that begins immediately after one run is already outside the window by
+      # the next one, while a recorder still in flight (a suite run is minutes,
+      # not hours) is never reported.
+      DRIFT_WINDOW_HOURS: "12"
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          # The drift age is read from commit history. A shallow clone reports
+          # an age of zero, which reads as "no drift" and would make this alarm
+          # silently useless while continuing to pass.
+          fetch-depth: 0
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Set up Python 3.12 for Concordia sidecar
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Provision Concordia sidecar venv
+        # --require-hashes enforces that every dependency in requirements.txt is
+        # pinned with a SHA256 hash, matching the guard workflow. A sidecar that
+        # fails to install silently removes the tests that need it, which would
+        # show up here as drift rather than as an install failure if this step
+        # were allowed to continue.
+        run: |
+          python3 -m venv sidecars/concordia/.venv
+          sidecars/concordia/.venv/bin/pip install --upgrade pip
+          sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
+
+      - name: Build
+        working-directory: server
+        run: npm run build
+
+      - name: Install libsecret + Secret Service backend
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/setup-linux-secret-service
+
+      - name: Run the suite and capture output
+        working-directory: server
+        # Must match the capture environment in test-baseline-guard.yml: the
+        # shared parser in scripts/test-baseline-floor.sh reads an ANSI-free
+        # summary line, and a coloured run would make it refuse.
+        env:
+          NO_COLOR: "1"
+          FORCE_COLOR: "0"
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee /tmp/vitest-output.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Compare the recorded floor against a fresh count
+        run: |
+          # 3600 seconds per hour; the window itself is named above.
+          window_seconds=$(( DRIFT_WINDOW_HOURS * 3600 ))
+          floor="$(scripts/test-baseline-floor.sh read-floor .test-baseline)"
+          observed="$(scripts/test-baseline-floor.sh parse-count /tmp/vitest-output.log)"
+          age="$(scripts/test-baseline-floor.sh drift-age-seconds .test-baseline)"
+          echo "Recorded floor: $floor"
+          echo "Fresh count:    $observed"
+          echo "Drift age:      ${age}s (window ${window_seconds}s)"
+          set +e
+          verdict="$(scripts/test-baseline-floor.sh drift-verdict "$floor" "$observed" "$age" "$window_seconds" 2>&1)"
+          status=$?
+          set -e
+          echo "$verdict"
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error::The recorded test baseline floor has drifted and stayed drifted. See the run log for the counts."
+            exit "$status"
+          fi

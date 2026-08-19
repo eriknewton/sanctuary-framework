@@ -3,35 +3,71 @@
 # Copyright 2026 Erik Newton
 # SPDX-License-Identifier: Apache-2.0
 #
-# CI mirror of the pre-commit hook at .githooks/pre-commit. Runs the
-# same two gates (typecheck + transform-error detection + baseline
-# check) on every PR and every push to main. This is the belt-and-
-# suspenders layer that catches:
+# Two sides of one mechanism, with the decision logic for both in
+# scripts/test-baseline-floor.sh so it can be exercised without a runner:
 #
-#   - Contributors who ran `git commit --no-verify` locally
-#   - Contributors who never installed the hook (fresh clones,
-#     one-off environments)
-#   - Agents that commit via a pipeline that bypasses .git/hooks
-#   - Direct pushes to main from any environment
+#   test-baseline-guard  Runs on every pull request and every push to main.
+#                        Asserts the observed passing count is NOT BELOW the
+#                        floor recorded at the repo root, alongside the
+#                        unchanged gates (typecheck, no transform or collection
+#                        error, no silent test-file drop, zero failures). A
+#                        count above the floor is the normal resting state of a
+#                        pull request that adds tests, and it passes. This job
+#                        holds a read-only token and writes nothing, anywhere.
 #
-# The job is DELIBERATELY separate from the existing `test` matrix
-# in ci.yml so it can be named as a distinct required status check
-# in GitHub branch-protection rules. See
-# docs/audit/branch-protection-setup.md for the runbook.
+#   record-floor         Runs only on a push to main, after the guard. Records
+#                        the observed count into .test-baseline when it differs.
+#                        This is the only job in the repository that may write
+#                        that file, it may write no other file, and it may write
+#                        no other branch.
 #
-# This job mirrors the pre-commit hook's logic (see
-# .githooks/pre-commit for the authoritative copy and the postmortem
-# at docs/audit/commit-4ac95830-postmortem.md for the specific
-# failure class it defends against).
+# WHY A PULL REQUEST NO LONGER CARRIES THE INTEGER: the floor is the passing
+# count on Linux CI, which an author on macOS cannot compute locally. Asking
+# every pull request to state it made the number a guess; on 2026-08-19 three of
+# three open pull requests guessed it wrong, and the remedy each time was to
+# read the number out of a failed run and push it back. Recording the count on
+# main after the merge removes the guess without removing the gate.
+#
+# THE FAILURE MODE THIS DESIGN INTRODUCES, STATED PLAINLY: if record-floor fails
+# or never runs, the floor goes stale LOW and the pull-request gate quietly
+# asserts less than it should. A stale floor looks EXACTLY like a healthy floor
+# from a pull request's point of view: the check still passes, in the same
+# colour, with the same message. That is why the alarm lives outside the
+# pull-request path. Two alarms cover it: this job failing on a push to main is
+# immediately visible on main, and the scheduled backstop in
+# .github/workflows/test-baseline-floor-drift.yml compares the recorded floor
+# against a fresh count and reports drift that outlives its window.
+#
+# The guard job is DELIBERATELY separate from the `test` matrix in ci.yml so it
+# can be named as a distinct required status check. See
+# docs/audit/branch-protection-setup.md for the runbook, and
+# docs/audit/test-baseline-hardening-plan.md for the layered plan this belongs
+# to. The local convenience copy of the pull-request side is .githooks/pre-commit.
 
 name: Test Baseline Guard
 
 on:
   push:
     branches: [main]
+    # LOOP BOUND ONE OF TWO (structural). A record-floor commit changes nothing
+    # but .test-baseline, so it cannot change the passing count, and re-running
+    # the whole suite to conclude that would burn a runner to learn nothing. The
+    # semantic bound is in scripts/test-baseline-floor.sh guard-record-context,
+    # which refuses when the head commit is one of ours; that one is self-tested
+    # and survives an edit to this filter.
+    #
+    # Failure mode note: paths-ignore skips a run only when EVERY changed path
+    # matches, so a merge that lowers the floor deliberately alongside real code
+    # changes still runs and still records.
+    paths-ignore:
+      - ".test-baseline"
   pull_request:
     branches: [main]
 
+# Read-only is the workflow-level default so a new job inherits no authority.
+# The single write grant is declared on record-floor and nowhere else; the
+# self-test at scripts/test-baseline-floor-self-test.sh asserts that this file
+# contains exactly one `contents: write` line and that it sits inside that job.
 permissions:
   contents: read
 
@@ -40,24 +76,49 @@ jobs:
     name: test-baseline-guard
     runs-on: ubuntu-latest
 
+    outputs:
+      # Consumed by record-floor. The count the recorder writes is the count
+      # this job's gate compared, never a second measurement.
+      passing: ${{ steps.floor_gate.outputs.passing }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # Full history: the deliberate-lowering annunciation below diffs
+          # against the base branch, and a shallow clone cannot.
+          fetch-depth: 0
 
-      - name: Read test baseline floor
+      # Runs before the Node setup on purpose: it drives the floor script
+      # against disposable fixtures, needs no dependencies, takes seconds, and a
+      # broken floor guard should red before two minutes of install.
+      #
+      # This step is the self-test's only consumer. A harness nothing invokes is
+      # a harness that cannot notice its own guard being reverted.
+      - name: Self-test the floor decision logic
+        run: bash scripts/test-baseline-floor-self-test.sh
+
+      - name: Read the recorded floor
         id: baseline
         run: |
-          if [[ ! -f .test-baseline ]]; then
-            echo "::error::.test-baseline file missing at repo root. Create it with a single integer: the current passing count."
-            exit 1
-          fi
-          baseline=$(tr -d '[:space:]' < .test-baseline)
-          if ! [[ "$baseline" =~ ^[0-9]+$ ]]; then
-            echo "::error::.test-baseline must contain a single integer, got: '$baseline'"
-            exit 1
-          fi
+          baseline="$(scripts/test-baseline-floor.sh read-floor .test-baseline)"
           echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
-          echo "Baseline floor: $baseline"
+          echo "Recorded floor: $baseline"
+
+      # A pull request that changes .test-baseline is the deliberate-lowering
+      # path, which is human and reviewed. Since routine pull requests no longer
+      # touch the file at all, its appearance in a diff is now a review signal
+      # rather than background noise. This annunciates; the gate is the reviewer.
+      - name: Annunciate a deliberate floor change
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if git diff --name-only "origin/$BASE_REF...HEAD" -- .test-baseline | grep -q .; then
+            echo "::warning::This pull request changes .test-baseline by hand. That is the deliberate-lowering path: it is legitimate only when tests were removed on purpose, and it needs a written justification in the pull request. Routine pull requests never touch this file."
+          else
+            echo "This pull request does not touch .test-baseline, which is the normal case."
+          fi
 
       - name: Use Node.js 24
         uses: actions/setup-node@v7
@@ -102,11 +163,11 @@ jobs:
       # ── Gate 2: npm test + transform/collection error detection ───
       #
       # Captures vitest output in one invocation so all three checks
-      # (transform errors, silent file drop, baseline regression)
-      # parse the same run. If `npm test` exits non-zero the step
-      # fails immediately and the parsing checks below do not run —
-      # that is correct behaviour, a test failure is a commit-blocker
-      # regardless of the passing count.
+      # (transform errors, silent file drop, floor comparison) parse the
+      # same run. If `npm test` exits non-zero the step fails immediately
+      # and the parsing checks below do not run — that is correct
+      # behaviour, a test failure is a merge-blocker regardless of the
+      # passing count.
       - name: Gate 2 — run tests and capture output
         id: run_tests
         working-directory: server
@@ -114,7 +175,8 @@ jobs:
         # grep-based gates 2b and 2c can parse the summary lines without
         # tripping over color escape codes. Without this, vitest emits
         # e.g. `Tests \e[1m\e[32m1328 passed\e[22m` which breaks the
-        # `Tests[[:space:]]+[0-9]+ passed` regex in Gate 2c.
+        # `Tests[[:space:]]+[0-9]+ passed` regex the floor script uses.
+        # Must match the parser in scripts/test-baseline-floor.sh.
         env:
           NO_COLOR: "1"
           FORCE_COLOR: "0"
@@ -180,29 +242,143 @@ jobs:
           fi
           echo "✓ All $expected_files test files loaded by vitest."
 
-      - name: Gate 2c — passing count >= baseline
+      # ── Gate 2c: the floor ─────────────────────────────────────────
+      #
+      # INVARIANT: this asserts a FLOOR and nothing more. It does not demand
+      # equality and it does not ask the author to record anything, because the
+      # recorded value is produced by record-floor after the merge.
+      #
+      # The floor is read from the pull request's own tree rather than from
+      # main. Those are the same value at merge time because the repository
+      # ruleset requires a branch to be up to date before it merges, which is
+      # what makes reading it here equivalent to reading main. If that
+      # requirement is ever relaxed, a stale branch could carry an old low floor
+      # into its gate, and this comment is the thread to pull.
+      - name: Gate 2c — passing count is not below the recorded floor
+        id: floor_gate
+        env:
+          RECORDED_FLOOR: ${{ steps.baseline.outputs.baseline }}
         run: |
-          baseline="${{ steps.baseline.outputs.baseline }}"
-          passing=$(grep -oE "Tests[[:space:]]+[0-9]+ passed" /tmp/vitest-output.log | grep -oE "[0-9]+" | head -1)
-          if [[ -z "$passing" ]]; then
-            echo "::error::Could not parse passing-test count from vitest output."
-            tail -30 /tmp/vitest-output.log
+          passing="$(scripts/test-baseline-floor.sh parse-count /tmp/vitest-output.log)"
+          echo "passing=$passing" >> "$GITHUB_OUTPUT"
+          scripts/test-baseline-floor.sh assert-not-below "$RECORDED_FLOOR" "$passing"
+
+  # ── The recorder ─────────────────────────────────────────────────────────
+  #
+  # Everything this job executes has already been reviewed, gated and merged.
+  # There is no fork case, no push to a contributor's branch, no head-SHA race
+  # with a force-push, and no decision an outsider can influence: it records
+  # what the suite counted, on the one branch the ruleset already governs.
+  record-floor:
+    name: record-floor
+    needs: test-baseline-guard
+    # The write token is minted only for a push to main. On a pull request this
+    # job does not exist, so no pull-request code ever executes beside it.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    # Two merges in quick succession must not race. cancel-in-progress is false
+    # so a queued recorder waits for the running one rather than replacing its
+    # push; the queue is first-in-first-out, so the later tree is recorded last.
+    #
+    # Failure mode note: GitHub cancels a PENDING job in a group when a newer
+    # one queues behind a running one. That is benign here and shows as
+    # `cancelled`, not `failure`: the cancelled run's tree is stale by
+    # definition, and the newest run records the newest count.
+    concurrency:
+      group: test-baseline-floor-record
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          # A commit pushed on top of a shallow history is refused by the remote
+          # with "shallow update not allowed", which reads as a permissions
+          # failure and sends the reader hunting in the wrong place.
+          fetch-depth: 0
+
+      # The count came from the guard job, which measured GITHUB_SHA. If main
+      # has moved since, that count no longer describes the tip, and recording
+      # it would write a number for a tree that no longer exists. The newer
+      # push has its own recorder; let that one do it.
+      - name: Skip when a newer commit already landed on main
+        id: tip
+        run: |
+          head="$(git rev-parse HEAD)"
+          if [[ "$head" != "$GITHUB_SHA" ]]; then
+            echo "::notice::main advanced from $GITHUB_SHA to $head while the suite ran; the newer push records the floor."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # LOOP BOUND TWO OF TWO (semantic, and the self-tested one). A refusal
+      # here is a clean skip, never a failure: a recorder that reddened main
+      # every time it correctly declined to record would train everyone to
+      # ignore a red main, which is the opposite of the alarm this design needs.
+      - name: Refuse to record on our own commit
+        id: context
+        if: steps.tip.outputs.proceed == 'true'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          subject="$(git log -1 --format=%s)"
+          set +e
+          scripts/test-baseline-floor.sh guard-record-context "$REF" "$subject"
+          status=$?
+          set -e
+          if [[ "$status" -eq 0 ]]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$status" -eq 1 ]]; then
+            echo "::notice::Not recording a floor for this commit; see the refusal above."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            exit "$status"
+          fi
+
+      - name: Record the observed count
+        id: record
+        if: steps.context.outputs.proceed == 'true'
+        env:
+          OBSERVED: ${{ needs.test-baseline-guard.outputs.passing }}
+        run: |
+          set +e
+          scripts/test-baseline-floor.sh record .test-baseline "$OBSERVED"
+          status=$?
+          set -e
+          # 10 is the floor script's "no action needed": the file already holds
+          # this count, so there is nothing to commit and nothing to push.
+          if [[ "$status" -eq 10 ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$status" -eq 0 ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            exit "$status"
+          fi
+
+      - name: Commit and push the recorded floor
+        if: steps.record.outputs.changed == 'true'
+        env:
+          OBSERVED: ${{ needs.test-baseline-guard.outputs.passing }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .test-baseline
+          # INVARIANT: one file, checked rather than assumed. The whole safety
+          # argument for granting this job a write token is that it can commit
+          # nothing else, so the claim is asserted here instead of being left to
+          # the reader of the `git add` line above.
+          staged="$(git diff --cached --name-only)"
+          if [[ "$staged" != ".test-baseline" ]]; then
+            echo "::error::the recorder staged something other than .test-baseline: $staged"
             exit 1
           fi
-          echo "Baseline floor: $baseline"
-          echo "Passing tests:  $passing"
-          if (( passing < baseline )); then
-            echo "::error::Test baseline regression: baseline=$baseline, passing=$passing, missing $((baseline - passing)) tests. Fix the regression or update .test-baseline in a separate explicitly-scoped commit."
-            exit 1
-          fi
-          # Fail-above (mirror of the pre-commit hook): a passing count
-          # higher than the floor must be locked into .test-baseline in
-          # the SAME PR. A stale low floor lets a later regression hide
-          # under the gap — the extra passing tests mask the loss until
-          # the floor is finally bumped. The fix is mechanical: set
-          # .test-baseline to the new count in this PR.
-          if (( passing > baseline )); then
-            echo "::error::Test baseline drifted above the floor: baseline=$baseline, passing=$passing, $((passing - baseline)) new tests above floor. Raise .test-baseline to $passing IN THIS PR. A deferred bump lets a future regression hide under the stale floor."
-            exit 1
-          fi
-          echo "✓ Baseline guard passed."
+          subject="$(scripts/test-baseline-floor.sh commit-subject "$OBSERVED")"
+          git commit -m "$subject"
+          git push origin HEAD:main
+          echo "::notice::$subject"

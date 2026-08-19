@@ -221,3 +221,65 @@ containment assertion checks that git agrees the temp directory is its own top
 level **before** any mutating command runs. The same scrub is applied in
 `resolveHooksDir` itself, where an inherited `GIT_DIR` would otherwise make it
 answer for the wrong repository while appearing perfectly healthy.
+
+---
+
+## 2026-08-19: the floor moved to `main`
+
+Everything above stays true about *why* the floor exists. What changed is *who
+writes it*.
+
+**The measured problem.** The guard demanded that `.test-baseline` hold the exact
+passing count, so a change that added tests had to state the new number in the
+same pull request. That number is the count on Linux CI, which an author on macOS
+cannot compute: a macOS box legitimately runs more tests than the Linux floor.
+Every pull request that added a test therefore guessed, and on 2026-08-19 three
+of three open pull requests guessed wrong. The remedy each time was to read the
+number out of a failed run and push it back, which is a two-round-trip ritual
+that teaches nothing and catches nothing.
+
+**What replaced it.**
+
+| Where | What runs | Authority |
+|---|---|---|
+| On a pull request | The observed passing count must not be **below** the recorded floor, plus the unchanged gates: the suite executed, no transform or collection error, no silent test-file drop, zero failures. A count above the floor passes normally. | read-only |
+| On `main`, after a merge | The `record-floor` job writes the observed count into `.test-baseline` when it differs, as a one-file commit by the CI actor. | write, on `main` only, one file only |
+
+The regression property is unchanged: a change that reduces the passing count
+still fails on the pull request, before merge. The staleness objection the old
+rule answered by demanding an in-pull-request bump is answered structurally
+instead, because the floor is rewritten after every merge and is at most one
+merge behind reality.
+
+Decision logic for both sides lives in `scripts/test-baseline-floor.sh` and is
+exercised by `scripts/test-baseline-floor-self-test.sh`, which the guard workflow
+runs before it installs anything. An earlier attempt put the same decisions in
+workflow steps, where the only way to exercise a branch was to merge it and
+watch.
+
+**Failure mode, and the reason it needs its own alarm.** The new failure is
+permissive rather than restrictive: if the recorder fails or never runs, the
+floor stays low and the pull-request gate quietly asserts less than it should.
+From a pull request's point of view a stale floor looks exactly like a healthy
+one: the check passes, in the same colour, with the same message. Two alarms sit
+outside that path. The recorder failing reds a push to `main`, which is immediate
+and visible. The scheduled backstop at
+`.github/workflows/test-baseline-floor-drift.yml` runs the suite on `main`,
+compares the fresh count against the recorded floor, and fails when a mismatch
+has outlived its window. That backstop proves the floor matched a count on one
+day and says nothing about the days between runs, which is why the recorder's own
+red is the primary signal and this is the second.
+
+**The deliberate-lowering path is unchanged and still human.** Removing
+platform-agnostic tests on purpose goes through an explicitly scoped commit with
+a written justification. It is now the only reason `.test-baseline` appears in a
+pull request diff at all, so its appearance is a review signal rather than
+routine noise, and the guard annunciates it in the check output. After the merge
+the recorder writes what the suite counted, so a reviewed reduction lands as a
+normal recorded floor.
+
+**The residual, stated because it is not closed.** A count is not an inventory. A
+change that removes N real tests and adds N trivial ones passes both the old rule
+and this one. Closing that needs a base-versus-head comparison of collected test
+identities rather than totals; that is separate, larger work and is not claimed
+here.
