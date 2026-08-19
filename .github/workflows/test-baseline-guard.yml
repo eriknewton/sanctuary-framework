@@ -68,6 +68,14 @@ on:
 # The single write grant is declared on record-floor and nowhere else; the
 # self-test at scripts/test-baseline-floor-self-test.sh asserts that this file
 # contains exactly one `contents: write` line and that it sits inside that job.
+#
+# That grant also makes this a PRIVILEGED workflow, which is why every external
+# action below is pinned to an immutable 40-character commit SHA rather than a
+# tag. `npm run check:release-action-pins` enforces it; a tag is a mutable
+# pointer, and a repointed tag on a workflow holding a write token is a supply
+# chain into main. Failure mode when a new step is added with a bare `@v7`: the
+# `test (22)` and `test (24)` jobs red on the pin check within seconds, which
+# reads as an unrelated test failure until you look at the step name.
 permissions:
   contents: read
 
@@ -83,7 +91,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history: the deliberate-lowering annunciation below diffs
           # against the base branch, and a shallow clone cannot.
@@ -121,7 +129,7 @@ jobs:
           fi
 
       - name: Use Node.js 24
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -132,7 +140,7 @@ jobs:
         run: npm ci
 
       - name: Set up Python 3.12 for Concordia sidecar
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -294,7 +302,7 @@ jobs:
 
     steps:
       - name: Checkout main
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           # A commit pushed on top of a shallow history is refused by the remote
