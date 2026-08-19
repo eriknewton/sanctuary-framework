@@ -463,3 +463,63 @@ describe("castle-wall/runtime/manifest-publisher : publishSignedManifest", () =>
     expect(bytes.byteLength).toBeGreaterThan(0);
   });
 });
+
+/**
+ * Regression cover for the round-4 sweep defect on this file.
+ *
+ * PROPERTY: a rule id determines its FILENAME and the manifest entry that
+ * points at it, so the mapping id -> filename must be injective and lossless.
+ *
+ * The sweep that bounded diagnostic text for STATE-STORE-ERRMSG-INTERP-01
+ * replaced every occurrence of the id in this file, including the one that
+ * builds the filename. A truncating renderer is correct for text a human READS
+ * and wrong for a value the system CONSUMES: two distinct ids sharing a long
+ * prefix collapsed to one filename, so one rule's file silently overwrote the
+ * other while the manifest still recorded two different digests.
+ */
+describe("rule id to filename mapping", () => {
+  let signer: ManifestSigner;
+
+  beforeEach(() => {
+    const masterKey = generateRandomKey();
+    const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+    const { storedIdentity } = createIdentity(
+      "castle-wall-filename-test",
+      identityEncKey,
+      "passphrase"
+    );
+    signer = localManifestSigner({
+      signingKeyId: storedIdentity.identity_id,
+      encryptedPrivateKey: storedIdentity.encrypted_private_key,
+      encryptionKey: identityEncKey,
+    });
+  });
+
+  it("keeps distinct long ids distinct on disk", async () => {
+    const shared = "r".repeat(200);
+    const { ruleFiles, signed } = await buildSignedManifest({
+      fortressId: "f",
+      issuedAt: "t",
+      rules: [makeRule(shared + "-alpha", "a.example"), makeRule(shared + "-beta", "b.example")],
+      signer,
+    });
+    const filenames = new Set(ruleFiles.map((f) => f.filename));
+    expect(filenames.size).toBe(2);
+    // The manifest's pointer must match the file actually written.
+    for (const entry of signed.manifest.rules) {
+      expect(filenames.has(entry.file)).toBe(true);
+    }
+    expect(new Set(signed.manifest.rules.map((r) => r.file)).size).toBe(2);
+  });
+
+  it("round-trips a long id verbatim into its filename", async () => {
+    const id = "x".repeat(300);
+    const { ruleFiles } = await buildSignedManifest({
+      fortressId: "f",
+      issuedAt: "t",
+      rules: [makeRule(id, "a.example")],
+      signer,
+    });
+    expect(ruleFiles[0]!.filename).toBe(`${id}.json`);
+  });
+});

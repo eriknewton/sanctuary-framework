@@ -36,7 +36,12 @@
  *   WORK is bounded by the render budget for: string and property-key CONTENT
  *   (every stage clamps before it transforms), array elements, nesting depth,
  *   and bulk containers, which are described by their element count rather than
- *   walked. Accessors are never invoked, so no attacker-supplied getter runs.
+ *   walked. No CALLER-SUPPLIED accessor is ever invoked: properties are read
+ *   through descriptors, and a bulk container's count comes from the built-in
+ *   getter taken off the prototype, which bypasses any own shadow. Engine
+ *   getters ARE invoked, deliberately; they are constant-time and not caller
+ *   code. The container's own name is never read, because `Symbol.toStringTag`
+ *   would be caller code, so bulk labels are code-chosen and generic.
  *
  *   WORK IS NOT BOUNDED for the three costs below. They are named because they
  *   are real, not because they are acceptable everywhere; a caller putting a
@@ -300,30 +305,62 @@ function renderStructured(
  */
 function describeBulkContainer(container: object): string | null {
   try {
+    // `ArrayBuffer.isView` and `instanceof` are internal checks a caller cannot
+    // forge. The COUNT is then read through the built-in getter taken off the
+    // prototype, NOT off the instance: a caller can shadow `length`, `size`, or
+    // `byteLength` with its own accessor, and reading the property normally
+    // would invoke that accessor. `.call(container)` on the built-in bypasses
+    // any own shadow and runs engine code rather than caller code.
     if (ArrayBuffer.isView(container)) {
-      const view = container as ArrayBufferView & { length?: number };
-      const count = typeof view.length === "number" ? view.length : view.byteLength;
-      return `<${bulkTag(container)} length=${count}>`;
+      const count = TYPED_ARRAY_LENGTH_GETTER
+        ? TYPED_ARRAY_LENGTH_GETTER.call(container)
+        : undefined;
+      // A DataView has no `length`; fall back to its byteLength getter.
+      if (typeof count === "number") return `<typed-array length=${count}>`;
+      const byteLength = DATA_VIEW_BYTE_LENGTH_GETTER?.call(container);
+      if (typeof byteLength === "number") return `<data-view byteLength=${byteLength}>`;
+      return null;
     }
     if (container instanceof ArrayBuffer) {
-      return `<ArrayBuffer byteLength=${container.byteLength}>`;
+      const byteLength = ARRAY_BUFFER_BYTE_LENGTH_GETTER?.call(container);
+      if (typeof byteLength === "number") return `<ArrayBuffer byteLength=${byteLength}>`;
+      return null;
     }
-    if (container instanceof Map || container instanceof Set) {
-      return `<${bulkTag(container)} size=${container.size}>`;
+    if (container instanceof Map) {
+      const size = MAP_SIZE_GETTER?.call(container);
+      if (typeof size === "number") return `<Map size=${size}>`;
+      return null;
+    }
+    if (container instanceof Set) {
+      const size = SET_SIZE_GETTER?.call(container);
+      if (typeof size === "number") return `<Set size=${size}>`;
+      return null;
     }
   } catch {
-    // A hostile `Symbol.toStringTag` getter or a spoofed prototype can throw
-    // here; a container we cannot even name is simply walked instead.
+    // A built-in getter throws when applied to a forged receiver (a plain
+    // object with a spoofed prototype). Such a value is simply walked instead.
     return null;
   }
   return null;
 }
 
-function bulkTag(container: object): string {
-  // "[object Uint8Array]" -> "Uint8Array"; 8 = length of "[object ".
-  const raw = Object.prototype.toString.call(container);
-  return raw.slice(8, -1);
+// Built-in count getters, captured once at module load so a later mutation of a
+// prototype cannot redirect them. Deliberately NOT `Object.prototype.toString`:
+// that reads `Symbol.toStringTag`, which is a caller-supplied accessor, so the
+// container's own NAME cannot be trusted. The labels above are code-chosen and
+// generic for that reason - `<typed-array>` rather than the element type.
+function protoGetter(proto: object | null, key: string): (() => unknown) | undefined {
+  if (proto === null) return undefined;
+  return Object.getOwnPropertyDescriptor(proto, key)?.get;
 }
+const TYPED_ARRAY_LENGTH_GETTER = protoGetter(
+  Object.getPrototypeOf(Uint8Array.prototype) as object,
+  "length"
+);
+const DATA_VIEW_BYTE_LENGTH_GETTER = protoGetter(DataView.prototype, "byteLength");
+const ARRAY_BUFFER_BYTE_LENGTH_GETTER = protoGetter(ArrayBuffer.prototype, "byteLength");
+const MAP_SIZE_GETTER = protoGetter(Map.prototype, "size");
+const SET_SIZE_GETTER = protoGetter(Set.prototype, "size");
 
 /**
  * Render one OWN property without invoking an accessor.

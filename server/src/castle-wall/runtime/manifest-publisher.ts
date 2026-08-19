@@ -150,7 +150,13 @@ export async function buildSignedManifest(input: BuildSignedManifestInput): Prom
       throw new RuntimeManifestPublishError(`duplicate rule id: ${describeUntrusted(rule.id)}`);
     }
     seen.add(rule.id);
-    const filename = `${describeUntrusted(rule.id)}.json`;
+    // NEVER `describeUntrusted` here. This value is CONSUMED, not displayed:
+    // it names a file on disk and is recorded in the signed manifest entry that
+    // points at that file. The diagnostic renderer truncates, so two distinct
+    // ids sharing a long prefix would collapse to one filename and one rule's
+    // file would overwrite the other's while the manifest recorded two digests.
+    // Bounding belongs on text a human reads, never on a value a system uses.
+    const filename = `${rule.id}.json`;
     const bytes = renderRuleFile(rule);
     const digest = sha256Hex(bytes);
     entries.push({ rule_id: rule.id, file: filename, sha256: digest });
