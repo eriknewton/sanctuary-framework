@@ -82,8 +82,14 @@
  *        ~112ms, the same as `Object.keys(...).length` (~111ms);
  *        `getOwnPropertyNames` and `Reflect.ownKeys` cost about twice that.
  *        No JavaScript API returns a bounded slice of an arbitrary object's
- *        keys, so this floor cannot be removed from here. What IS bounded, and
- *        is asserted by test, is the work added ON TOP of that floor.
+ *        keys, so this floor cannot be removed from here. What IS bounded is
+ *        the work added ON TOP of that floor, and the test that asserts it is
+ *        narrower than that sentence sounds: it counts this module's own
+ *        property reads through a counting Proxy, which is the only vantage a
+ *        test has, and shows they do not grow with the key count. The engine
+ *        floor itself is not observable from there and is not measured. An
+ *        earlier version of this test TIMED the render against the floor; it
+ *        could false-pass and false-fail, and it is gone rather than tuned.
  *     2. A hostile Proxy runs its own `getPrototypeOf`, `ownKeys`,
  *        `getOwnPropertyDescriptor`, and `get` traps, plus any accessor the
  *        `getOwnPropertyDescriptor` trap plants on the descriptor it returns
