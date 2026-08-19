@@ -2111,16 +2111,28 @@ export class MeshNode {
           : { claimed_emitter_node: evt.emitter_node }),
         // SIGNED DIAGNOSTIC (invariant, and an obligation on whoever edits the
         // refusal paths that feed it). This string is sealed into the entry
-        // below, so: (1) it MUST be BOUNDED BEFORE IT IS SEALED - the refusals
-        // reaching here are built by the envelope verifier, which renders every
-        // untrusted fragment through `describeUntrusted`, and a refusal message
-        // added on this path must do the same, or unbounded peer text lands
-        // inside a signed, replicated entry; (2) the peer's original value is
-        // deliberately NOT recoverable from it, because the rendering
-        // truncates - this signature attests what this node SAID about the
-        // refusal, never the bytes it refused; (3) nothing downstream may parse
-        // this field or branch on its text. The machine-readable facts are the
-        // sibling fields above.
+        // below, so whatever it carries is signed and replicated. Four things
+        // are true about it, and the first two are narrower than they look:
+        //
+        //   BOUNDED ONLY WHERE IT WAS RENDERED. Fragments that reached this
+        //   message through `describeUntrusted` are length-clamped and
+        //   control-character escaped. That is a property of THOSE RENDERINGS,
+        //   never of this field: a message can arrive at a sealed field without
+        //   having passed through the chokepoint, and this comment makes no
+        //   claim about one that did not. A message added here goes through the
+        //   chokepoint, and an inherited fragment counts as unbounded until you
+        //   have followed it back to one. Do not read this comment as
+        //   permission to assume the field is already safe.
+        //
+        //   PARTIALLY RECOVERABLE, BY DESIGN. A value that exceeded the bound
+        //   is truncated and cannot be reconstructed from this field. A short
+        //   primitive renders byte-identically, so it IS recoverable, which is
+        //   deliberate - converting a site must never change an honest
+        //   diagnostic. The signature attests what this node SAID about the
+        //   refusal, never that the peer's bytes are reproduced faithfully.
+        //
+        //   NEVER PARSED. No consumer may parse this field or branch on its
+        //   text; the machine-readable facts are the sibling fields above.
         reason: error.message,
       },
       node_private_key: this.nodePrivateKey,
@@ -2241,13 +2253,15 @@ export class MeshNode {
         peer_node: params.emitter_node,
         rotated_at: params.rotated_at,
         // SIGNED DIAGNOSTIC (invariant, same obligation as the revoke-denial
-        // entry above). Sealed into the entry below, so: it MUST be bounded
-        // before it is sealed - the master-rotation refusals that reach here
-        // render every untrusted fragment through `describeUntrusted`, and a
-        // message added on this path must do the same; the peer's original
-        // value is deliberately NOT recoverable from it, since the rendering
-        // truncates; and nothing downstream may parse it or branch on its text,
-        // the sibling fields being the machine-readable facts.
+        // entry above, and read that one for the full statement). Sealed into
+        // the entry below. Fragments rendered through `describeUntrusted` are
+        // bounded before they are sealed; that is a claim about those
+        // renderings and not about this field, since a message can reach it
+        // without having passed the chokepoint. A message added here goes
+        // through the chokepoint. A truncated value is not recoverable
+        // from this field; a short primitive renders unchanged and therefore
+        // is. Nothing downstream may parse it or branch on its text, the
+        // sibling fields being the machine-readable facts.
         reason: params.error.message,
       },
       node_private_key: this.nodePrivateKey,
@@ -2407,13 +2421,16 @@ export class MeshNode {
         // to key the governor above — see the KEYING note on this method.
         claimed_emitter_node: evt.emitter_node,
         // SIGNED DIAGNOSTIC (invariant, same obligation as the two denial
-        // entries above). Sealed into the entry below, so: it MUST be bounded
-        // before it is sealed - the table-event refusals that reach here render
-        // every untrusted fragment through `describeUntrusted`, and a message
-        // added on this path must do the same; the peer's original value is
-        // deliberately NOT recoverable from it, since the rendering truncates;
-        // and nothing downstream may parse it or branch on its text, the
-        // sibling fields being the machine-readable facts.
+        // entries above, and read the first for the full statement). Sealed
+        // into the entry below. Fragments rendered through `describeUntrusted`
+        // are bounded before they are sealed; that is a claim about those
+        // renderings and not about this field, since a message can reach it
+        // without having passed the chokepoint. A message added here goes
+        // through the chokepoint, and an inherited fragment counts as unbounded
+        // until followed back to one. A truncated
+        // value is not recoverable from this field; a short primitive renders
+        // unchanged and therefore is. Nothing downstream may parse it or branch
+        // on its text, the sibling fields being the machine-readable facts.
         reason: error.message,
       },
       node_private_key: this.nodePrivateKey,

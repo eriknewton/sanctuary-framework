@@ -38,39 +38,42 @@
  *   and bulk containers, which are described by their element count rather than
  *   walked.
  *
- * ACCESSOR GUARANTEE (stated at exactly its width; the wider version of this
- * sentence was here and was false):
+ * ACCESSOR GUARANTEE (stated at exactly its width; two wider versions of this
+ * paragraph have stood here and both were false, so resist widening it again):
  *
- *   FOR AN ORDINARY OBJECT, no caller-supplied accessor runs. Properties are
- *   read through `getOwnPropertyDescriptor` instead of being read, so a getter
- *   or setter is REPORTED and never called; a bulk container's count comes from
- *   the built-in getter taken off the prototype, which bypasses any own shadow;
- *   and the container's own name is never read, because `Symbol.toStringTag`
- *   would be caller code, so bulk labels are code-chosen and generic. Engine
- *   getters ARE invoked, deliberately; they are constant-time and not caller
- *   code.
+ *   WHAT HOLDS: no accessor that lives ON THE VALUE BEING DESCRIBED is ever
+ *   invoked. Properties are read through `getOwnPropertyDescriptor` instead of
+ *   being read, so a getter or setter is REPORTED and never called; a bulk
+ *   container's count comes from the built-in getter taken off the prototype,
+ *   which bypasses any own shadow; and the container's own name is never read,
+ *   because `Symbol.toStringTag` would be caller code, so bulk labels are
+ *   code-chosen and generic. Engine getters ARE invoked, deliberately; they are
+ *   constant-time and not caller code. Nothing this function returns is ever
+ *   the result of running the subject's own accessor.
  *
- *   FOR A HOSTILE PROXY THE GUARANTEE IS WEAKER, and the weakening is
- *   structural rather than a rounding error: a Proxy's traps ARE caller code,
- *   and reaching a Proxy's shape at all means running them. Two paths run
- *   caller code that this module cannot route around; both were observed by
- *   probe, not reasoned about:
+ *   WHAT DOES NOT HOLD: "no caller code runs." That is a wider claim about the
+ *   whole render, and it is false whenever a Proxy is reachable from the value
+ *   - as the value itself, or anywhere in its PROTOTYPE CHAIN, since an
+ *   otherwise ordinary object created over a proxied prototype carries the same
+ *   exposure (probed: `Object.create(proxy)` runs the prototype's trap the same
+ *   4 times a bare Proxy does). Three paths run caller code this module cannot
+ *   route around, all three observed by probe rather than reasoned about:
  *
+ *     - A Proxy's `ownKeys`, `getOwnPropertyDescriptor`, and `get` traps run
+ *       during the walk.
  *     - `getPrototypeOf` runs, because the `instanceof` checks that recognise a
- *       bulk container consult the prototype chain (measured: 4 invocations on
- *       one render of a trapping Proxy).
+ *       bulk container consult the prototype chain (measured: 4 invocations,
+ *       for a Proxy value and for a plain object whose chain holds one alike).
  *     - A `getOwnPropertyDescriptor` trap may return a descriptor OBJECT whose
  *       own `enumerable`, `value`, `get`, or `set` field is itself a getter,
  *       and the engine invokes those fields while converting the returned
- *       object into a property descriptor (measured: 3 invocations on the same
- *       render). The accessor that runs belongs to the descriptor the trap
- *       fabricated, not to the property being described, so the SUBJECT's own
- *       getter is still never called; caller code still ran.
+ *       object into a property descriptor (measured: 3 invocations). That
+ *       accessor belongs to the descriptor the trap fabricated, not to the
+ *       value being described, so the guarantee above survives it intact.
  *
- *   So the honest form is: this module never READS a property in a way that
- *   runs the subject's own accessor, and for an ordinary object that means no
- *   caller code runs at all. It is not, and cannot be, a guarantee that no
- *   caller code runs when the caller supplied a Proxy.
+ *   The two paragraphs are one sentence: this module never runs the subject's
+ *   own accessors, and it makes no claim at all about caller code the engine
+ *   reaches through a Proxy on the way.
  *
  *   WORK IS NOT BOUNDED for the three costs below. They are named because they
  *   are real, not because they are acceptable everywhere; a caller putting a
@@ -90,7 +93,8 @@
  *        floor itself is not observable from there and is not measured. An
  *        earlier version of this test TIMED the render against the floor; it
  *        could false-pass and false-fail, and it is gone rather than tuned.
- *     2. A hostile Proxy runs its own `getPrototypeOf`, `ownKeys`,
+ *     2. A hostile Proxy - the value itself, or one in its prototype chain -
+ *        runs its own `getPrototypeOf`, `ownKeys`,
  *        `getOwnPropertyDescriptor`, and `get` traps, plus any accessor the
  *        `getOwnPropertyDescriptor` trap plants on the descriptor it returns
  *        (see the ACCESSOR GUARANTEE above; the list is what a probe observed,
