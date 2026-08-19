@@ -446,15 +446,50 @@ describe("the operator unattributed-disclosure surface", () => {
       version: 1,
     });
 
+    // CAUSALITY, OBSERVED FROM INSIDE THE READ, not inferred from timestamps.
+    // A `terminal >= attempt` timestamp comparison is satisfied by same-
+    // millisecond ties and stays true even if the attempt append moves AFTER
+    // the read, which is exactly the ordering the split exists to forbid. So
+    // the read seam itself reports what the log already contained at the
+    // moment it was entered: the attempt row must be durable BEFORE any byte
+    // of the entry is read, because a crash mid-read must still leave a trace
+    // that the hole was entered.
+    let attemptRowsVisibleInsideRead = -1;
+    let terminalRowsVisibleInsideRead = -1;
+    const observingStore = {
+      readUnattributed: async (
+        ns: string,
+        k: string
+      ): Promise<UnattributedStateDisclosure | null> => {
+        attemptRowsVisibleInsideRead = (
+          await auditLog.query({
+            operation_type: UNATTRIBUTED_DISCLOSURE_ATTEMPT_OPERATION,
+          })
+        ).entries.length;
+        terminalRowsVisibleInsideRead = (
+          await auditLog.query({
+            operation_type: UNATTRIBUTED_DISCLOSURE_OPERATION,
+          })
+        ).entries.length;
+        return stateStore.readUnattributed(ns, k);
+      },
+    } as unknown as StateStore;
+
     const outcome = await discloseUnattributedState({
       auditLog,
-      stateStore,
+      stateStore: observingStore,
       namespaceRegistry: new OpaqueNamespaceRegistry(),
       namespace: NAMESPACE,
       key: "orphaned",
       identityId: "principal",
     });
     expect(outcome.status).toBe("disclosed");
+
+    // The attempt row was already durable when the read began...
+    expect(attemptRowsVisibleInsideRead).toBe(1);
+    // ...and the terminal row was NOT, because nothing had been read yet.
+    // This is the assertion a pre-read `success` row fails.
+    expect(terminalRowsVisibleInsideRead).toBe(0);
 
     // The constant must be a real, distinct operation name: querying on an
     // undefined `operation_type` matches every row, so asserting a count
@@ -479,11 +514,6 @@ describe("the operator unattributed-disclosure surface", () => {
     expect(terminal.entries).toHaveLength(1);
     expect(terminal.entries[0]!.operation).toBe(UNATTRIBUTED_DISCLOSURE_OPERATION);
     expect(terminal.entries[0]!.result).toBe("success");
-    // And the terminal row lands AFTER the attempt row, which is the whole
-    // point of splitting them.
-    expect(
-      new Date(terminal.entries[0]!.timestamp).getTime()
-    ).toBeGreaterThanOrEqual(new Date(attempt.entries[0]!.timestamp).getTime());
   });
 
   it("writes a terminal failure row when the read throws an unclassified error", async () => {

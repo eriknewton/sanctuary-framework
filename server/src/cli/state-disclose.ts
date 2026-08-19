@@ -622,7 +622,23 @@ export async function runStateDiscloseUnattributedCommand(
         );
         return 1;
       }
-      write(out, payload + "\n");
+      // THE SAME COMPLETION-OBSERVING WRITE THE RECEIPT USES, and for a
+      // sharper reason: `--json` writes to a redirected file or a pipe, which
+      // is precisely where a broken pipe happens. A bare `write()` followed by
+      // an unconditional success row records "delivered" for bytes the
+      // consumer never received, which is the one thing an audit log must not
+      // do. The terminal row is derived from the write's OUTCOME, never
+      // assumed from having called it.
+      try {
+        await writeAwaitingCompletion(out, payload + "\n");
+      } catch {
+        await auditDelivery("json_delivery_failed", "failure");
+        write(
+          err,
+          "Error: the disclosure could not be delivered to stdout; nothing was received. Re-run with a writable destination.\n",
+        );
+        return 3;
+      }
       await auditDelivery("delivered_json", "success");
     } else {
       // ORDER OF OPERATIONS, and why: the receipt is composed IN FULL before

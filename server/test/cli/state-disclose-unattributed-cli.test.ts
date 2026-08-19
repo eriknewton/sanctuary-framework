@@ -349,7 +349,8 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     });
     masterKey.fill(0);
 
-    // The delivery row: the operator really did receive this.
+    // The delivery row: the operator really did receive this, and the row
+    // names WHICH file, so the log answers "where did that content go".
     expect(await deliveryRows()).toEqual([
       {
         result: "success",
@@ -357,6 +358,7 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
           namespace: NAMESPACE,
           key: KEY,
           delivery_outcome: "delivered",
+          content_file: filePath,
         }),
       },
     ]);
@@ -634,6 +636,11 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
           namespace: NAMESPACE,
           key: KEY,
           delivery_outcome: "file_write_failed",
+          content_file: join(
+            await realpath(fortressPath),
+            "disclosures",
+            "disclosure-20260819T000000Z-aabbcc.txt"
+          ),
         }),
       },
     ]);
@@ -859,11 +866,99 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
             namespace: NAMESPACE,
             key: KEY,
             delivery_outcome: "receipt_undelivered_file_removed",
+            // Named even though it is gone: the row is the only remaining
+            // record that this path existed and was cleaned up. Canonical,
+            // like every other path this command records.
+            content_file: join(
+              await realpath(fortressPath),
+              "disclosures",
+              "disclosure-20260819T010000Z-ddeeff.txt"
+            ),
           }),
         },
       ]);
     }
   );
+
+  it.each<StdoutFailureMode>(["sync-throw", "callback-error", "error-event"])(
+    "audits a --json delivery that never reached the consumer as a failure (%s)",
+    async (mode) => {
+      // `--json` writes to a pipe, which is exactly where a broken pipe
+      // happens. A bare write() followed by an unconditional success row
+      // records "delivered" for output the consumer never received, and a
+      // synchronous failure reached the generic unlock message with no
+      // delivery row at all. Same completion-observing write as the receipt.
+      process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+      const err = new StringWritable();
+      const code = await runStateDiscloseUnattributedCommand({
+        argv: [
+          "--fortress",
+          fortressPath,
+          "--namespace",
+          NAMESPACE,
+          "--key",
+          KEY,
+          "--json",
+        ],
+        out: failingStdout(mode),
+        err,
+        env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+        approvalChannel: new FixedChannel("approve"),
+      });
+
+      expect(code).toBe(3);
+      expect(err.text).toContain("the disclosure could not be delivered");
+      expect(err.text).not.toContain("could not open or unlock");
+      expect(await deliveryRows()).toEqual([
+        {
+          result: "failure",
+          details: expect.objectContaining({
+            namespace: NAMESPACE,
+            key: KEY,
+            delivery_outcome: "json_delivery_failed",
+          }),
+        },
+      ]);
+    }
+  );
+
+  it("warns, rather than misreporting an unlock failure, when the delivery row cannot be written", async () => {
+    // The delivery-row append is wrapped so a storage fault is not reported as
+    // a fortress unlock failure. Nothing drove that rejection, so removing the
+    // wrapper and letting it fall to the outer handler stayed green. The
+    // stdout double makes the audit namespace unwritable at the moment of the
+    // write, so the REAL appendCritical rejects.
+    const auditDir = join(fortressPath, "state", "_audit");
+    const out = new (class extends Writable {
+      override _write(
+        _c: Buffer | string,
+        _e: BufferEncoding,
+        cb: (err?: Error) => void
+      ): void {
+        chmodSync(auditDir, 0o500);
+        cb();
+      }
+    })();
+    process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
+    const err = new StringWritable();
+    const code = await runStateDiscloseUnattributedCommand({
+      argv: ["--fortress", fortressPath, "--namespace", NAMESPACE, "--key", KEY],
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      approvalChannel: new FixedChannel("approve"),
+    });
+    chmodSync(auditDir, 0o700);
+
+    // The receipt WAS delivered, so the command succeeded; what failed is the
+    // record of it, and that is said out loud rather than mislabelled.
+    expect(code).toBe(0);
+    expect(err.text).toContain(
+      "the disclosure delivery audit record could not be written"
+    );
+    expect(err.text).not.toContain("could not open or unlock");
+    expect(await deliveryRows()).toHaveLength(0);
+  });
 
   it("says the file REMAINS, and names it, when the rollback unlink itself fails", async () => {
     // The other half of the rollback contract. Swallowing the unlink failure
