@@ -16,6 +16,37 @@
  * it must never be a policy-inference oracle for the agent it describes
  * (Invariant #7, property #11; adversarial review finding M1).
  *
+ * WHY THE LISTING LOOPS BELOW DO NOT USE THE TOLERANT NAMESPACE SCAN. The
+ * shared `cognitive/namespace-scan.ts` fan-out isolates a per-entry read
+ * failure so a caller can act on a partial set. That is right where a partial
+ * set is still useful, and wrong here. All three loops stay strict, but NOT for
+ * one reason, and the difference is the part a later editor needs.
+ *
+ * TWO OF THEM feed a consumer that treats a MISSING row as a positive verdict.
+ * An absent `source-state:` row means "this source never contributed", which is
+ * what disables the source-completeness gate in `refresh.ts` and carries
+ * definitive-empty authority downstream. An absent `candidate:` row means "no
+ * denial was observed for this destination", and the fold would additionally
+ * read a skipped row as new and reset its first-seen and times-seen counters.
+ * For those two, a skipped unreadable row is indistinguishable from an absent
+ * one, so it would be READ AS A PASS.
+ *
+ * `listCandidateReviews` IS DIFFERENT, AND THE POSITIVE-VERDICT ARGUMENT DOES
+ * NOT APPLY TO IT. An absent `candidate-review:` row does not pass anything:
+ * `eventSurvivesReviewLedger` in `refresh.ts` makes the event SURVIVE the
+ * ledger, so the candidate is re-folded and re-surfaced for review, and nothing
+ * is auto-promoted. "Not yet reviewed" is the conservative direction. What
+ * makes tolerance wrong for this loop is a stricter policy a few lines from
+ * that folder: `runRefresh` returns `source_read_incomplete` whenever ANY
+ * review row is quarantined, so the module's actual rule is that any doubt
+ * about the review ledger refuses the whole pass. A silently skipped row would
+ * be the one kind of doubt that never reaches that refusal. Strict is right
+ * here; the reason is the refusal, not a verdict.
+ *
+ * A propagating read failure is the fail-closed answer in all three, and the
+ * malformed-row cases that CAN be told apart are already routed to the
+ * `quarantined` lists rather than dropped. Do not "fix" these into tolerance.
+ *
  * THE RED-LINE INVARIANT: nothing in this file, or anywhere reachable from
  * it, ever writes to the live signed allowlist manifest. This store is
  * read/written ONLY by the observe CLI surface and `promote.ts`'s

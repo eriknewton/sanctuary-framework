@@ -389,13 +389,28 @@ async function cmdMint(
 
   // Reconcile the tree on this mutating touch: scrub any expired grant's tree
   // entry and flip its persisted status, so access never outlives its TTL.
-  await reconcileFileGrantTree({
-    store: boot.grantStore,
-    fsOps: boot.fsOps,
-    now: new Date(),
-    auditLog: boot.auditLog,
-    reconciledBy: boot.primary.identity_id,
-  });
+  // FAIL-CLOSED HERE, AND ONLY HERE: mint is the one file-grant touch that
+  // EXPANDS access. If the tree could not be fully converged, adding a new
+  // entry to it is the wrong direction, so a reconcile failure refuses the
+  // mint. The catch is what makes that a clean exit code instead of an
+  // unhandled rejection; the failure mode it replaces looks, from outside, like
+  // the command crashing with no verdict at all.
+  try {
+    await reconcileFileGrantTree({
+      store: boot.grantStore,
+      fsOps: boot.fsOps,
+      now: new Date(),
+      auditLog: boot.auditLog,
+      reconciledBy: boot.primary.identity_id,
+    });
+  } catch (reconcileErr) {
+    write(
+      err,
+      `Error: the grant tree could not be fully reconciled, so no new grant ` +
+        `was minted. ${(reconcileErr as Error).message}\n`
+    );
+    return 1;
+  }
 
   const policy = await loadPrincipalPolicy(boot.config.storage_path);
   const baseline = new BaselineTracker(boot.storage, boot.masterKey);
@@ -486,16 +501,40 @@ async function cmdList(
   // mints, revokes, OR lists) still relies on an out-of-band sweep -- the
   // exported `reconcileFileGrantTree` is the reusable entry point a future
   // `file-grant sweep` / cron calls to cover that case.
-  await reconcileFileGrantTree({
-    store: boot.grantStore,
-    fsOps: boot.fsOps,
-    now: new Date(),
-    auditLog: boot.auditLog,
-    reconciledBy: boot.primary.identity_id,
-  });
+  //
+  // A reconcile failure here is REPORTED, not fatal: the reconcile is a
+  // safe-direction cleanup ridden along on a read command, and every grant it
+  // could converge is already converged by the time it reports. Refusing the
+  // whole listing over it would leave the operator with neither the cleanup nor
+  // the list. The notice is what keeps that from being a silent partial run.
+  try {
+    await reconcileFileGrantTree({
+      store: boot.grantStore,
+      fsOps: boot.fsOps,
+      now: new Date(),
+      auditLog: boot.auditLog,
+      reconciledBy: boot.primary.identity_id,
+    });
+  } catch (reconcileErr) {
+    write(
+      err,
+      `Notice: the tree reconcile that runs before a list did not fully ` +
+        `converge. ${(reconcileErr as Error).message}\n`
+    );
+  }
 
   const filter = agentFilter ? { subjectAgentId: agentFilter } : undefined;
-  const grants = await listFileGrants(boot.grantStore, new Date(), filter);
+  let grants;
+  try {
+    // The DISPLAY read stays strict (`listFileGrants` -> `store.list()`): a
+    // grant table that quietly omitted an unreadable grant would tell the
+    // operator that access does not exist when the truth is that it could not
+    // be read.
+    grants = await listFileGrants(boot.grantStore, new Date(), filter);
+  } catch (listErr) {
+    write(err, `Error: the grant list could not be read. ${(listErr as Error).message}\n`);
+    return 1;
+  }
   // Tier-3 auto-allow AND audited (build spec section 3.2): record the access.
   await recordFileGrantListAudit(
     boot.auditLog,
@@ -539,13 +578,16 @@ async function cmdRevoke(
   const boot = await bootstrap(argv, err, env);
   if (!boot) return 1;
 
-  // R3-3 (round 4 completion): the revoke-time reconcile is now INSIDE the
-  // same clean try/catch as `revokeFileGrant` below, not a bare `await`
-  // beside it. `reconcileFileGrantTree` can throw a genuine scrub error
-  // (ENOTDIR/EACCES) while scrubbing an UNRELATED expired/revoked grant's
-  // tree entry -- that throw has nothing to do with the grant the operator
-  // is actually revoking, but it still must never surface as an unhandled
-  // rejection. Mirrors cmdMint's existing try/catch pattern.
+  // R3-3 (round 4) put the revoke-time reconcile inside a clean try/catch so a
+  // genuine scrub error (ENOTDIR/EACCES) on an UNRELATED grant's tree entry
+  // could never surface as an unhandled rejection. That is still required, but
+  // sharing ONE catch with `revokeFileGrant` was too coarse, so the reconcile
+  // now gets its own. A revoke is
+  // access-REDUCING and is the operator's explicit instruction; it must never
+  // be blocked by an unrelated grant that reconcile could not converge. The
+  // shape this replaces is the one that reads worst from outside: the operator
+  // is told the revoke "did not complete cleanly" when in fact the revoke never
+  // ran at all, and the reason had nothing to do with the grant they named.
   try {
     // Reconcile on this mutating touch too, so a listed-but-expired grant's
     // tree entry is scrubbed even if the operator only ever revokes.
@@ -556,7 +598,19 @@ async function cmdRevoke(
       auditLog: boot.auditLog,
       reconciledBy: boot.primary.identity_id,
     });
+  } catch (reconcileErr) {
+    write(
+      err,
+      `Notice: the tree reconcile that runs before a revoke did not fully ` +
+        `converge; the revoke below is unaffected. ` +
+        `${(reconcileErr as Error).message}\n`
+    );
+  }
 
+  // R3-3 (round 4 completion): the revoke itself stays inside a clean
+  // try/catch so a genuine filesystem error never surfaces as an unhandled
+  // rejection. Mirrors cmdMint's pattern.
+  try {
     const result = await revokeFileGrant(grantId, boot.primary.identity_id, {
       fsOps: boot.fsOps,
       store: boot.grantStore,

@@ -338,3 +338,34 @@ export class FakeFsOps implements FsOps {
     return this.opts.sourceOwnerUid === undefined ? 501 : this.opts.sourceOwnerUid;
   }
 }
+
+/**
+ * Make one specific StateStore key's read reject, the way an entry whose writer
+ * key cannot be resolved does, while every other key still reads. The patch
+ * goes on `read` only: `StateStore.list` enumerates through the storage
+ * backend, so the key still appears in the listing and the fan-out genuinely
+ * has to survive it.
+ */
+export function failReadFor(stateStore: StateStore, key: string, message: string): void {
+  const realRead = stateStore.read.bind(stateStore);
+  stateStore.read = (async (namespace: string, readKey: string, ...rest: unknown[]) => {
+    if (readKey === key) throw new Error(message);
+    return (realRead as (...args: unknown[]) => unknown)(namespace, readKey, ...rest);
+  }) as typeof stateStore.read;
+}
+
+/**
+ * Make one specific StateStore key READ BACK SUCCESSFULLY with a stored value
+ * the caller supplies. The distinction from `failReadFor` is the whole point of
+ * the fault: this key does not reject anywhere in the storage layer, so nothing
+ * below the decode can tell that anything is wrong with it. Patching `read`
+ * rather than writing the value keeps the record inside the reserved grant
+ * namespace, which no write surface reachable from a test can target.
+ */
+export function readsBackAs(stateStore: StateStore, key: string, value: string): void {
+  const realRead = stateStore.read.bind(stateStore);
+  stateStore.read = (async (namespace: string, readKey: string, ...rest: unknown[]) => {
+    if (readKey === key) return { value } as unknown;
+    return (realRead as (...args: unknown[]) => unknown)(namespace, readKey, ...rest);
+  }) as typeof stateStore.read;
+}

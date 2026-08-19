@@ -1,37 +1,30 @@
 /**
- * `sanctuary file-grant revoke` CLI error-handling test (R3-3, completed
- * round 4).
+ * `sanctuary file-grant revoke` CLI: the operator's revoke always gets a
+ * verdict (R3-3; extended under FG-RECONCILE-SIBLINGS-01).
  *
- * `revokeFileGrant` (src/file-grant/revoke.ts) deliberately PROPAGATES a tree
- * scrub failure (see its own doc comment: the persisted record is marked
- * revoked BEFORE the scrub is attempted, and if the scrub throws the error
- * propagates so the caller learns the tree entry may still be present).
- * Before R3-3, `cmdRevoke` in src/cli/file-grant.ts called `revokeFileGrant`
- * with no try/catch, so that propagated error surfaced to the CLI's caller as
- * an unhandled rejection / raw stack trace instead of a clean operator-facing
- * message and a non-zero exit code -- unlike `cmdMint`, which already wraps
- * `mintFileGrant` in exactly this pattern.
+ * CAPABILITIES ASSERTED HERE, end to end against a real keychain-free fortress.
  *
- * R3-3 was only PARTIALLY applied: it wrapped `revokeFileGrant` in the clean
- * try/catch, but left the `reconcileFileGrantTree(...)` call that runs
- * immediately before it as a bare, unguarded `await` beside the try block.
- * `reconcileFileGrantTree` can throw the SAME class of genuine filesystem
- * error (ENOTDIR/EACCES) while scrubbing an UNRELATED expired or revoked
- * grant's tree entry -- unrelated to the grant the operator is actually
- * revoking -- and that throw was still unhandled. Round 4 moves the
- * reconcile call inside the same try/catch.
+ *   1. `revokeFileGrant` propagates a tree-scrub failure by design (see its own
+ *      doc comment: the record is marked revoked BEFORE the scrub is attempted,
+ *      so the caller must learn the tree entry may still be present). The CLI
+ *      turns that into a clean operator-facing line and a non-zero exit code,
+ *      never a raw stack trace, matching the pattern `cmdMint` already uses.
  *
- * This file proves both paths end-to-end: seed a real (keychain-free)
- * fortress and identity, seed file-grant records directly (bypassing the
- * interactive Tier-1 mint approval prompt, which auto-denies in a
- * non-interactive test process), force a tree scrub to fail with a genuine
- * filesystem error (ENOTDIR, not ENOENT -- the same real-error class
- * `test/file-grant/fs-ops.test.ts` uses), and assert `runFileGrantCommand`
- * resolves (never rejects) with a non-zero code and a clean error line.
- *   1. `revokeFileGrant`'s OWN scrub, on the grant being revoked, fails.
- *   2. The revoke-time `reconcileFileGrantTree` call's scrub, on a
- *      DIFFERENT, unrelated expired grant, fails -- before `revokeFileGrant`
- *      for the actual target grant is ever reached.
+ *   2. The reconcile pass that runs before the revoke gets its OWN handler, and
+ *      a failure there does not cancel the revoke. A reconcile failure concerns
+ *      some OTHER grant, and a revoke is the operator's explicit,
+ *      access-reducing instruction; it must not be withheld because an
+ *      unrelated grant could not be converged. The operator gets a notice about
+ *      the reconcile AND the revoke's own verdict.
+ *
+ *   3. Mint is the opposite call: it is the one file-grant touch that EXPANDS
+ *      access, so a reconcile failure refuses it rather than proceeding.
+ *
+ * The fixtures seed a real fortress and identity, write grant records directly
+ * (the interactive Tier-1 mint approval auto-denies in a non-interactive test
+ * process), and force a scrub failure with a genuine ENOTDIR, the same real
+ * error class `test/file-grant/fs-ops.test.ts` uses, rather than an ENOENT that
+ * the idempotent scrub treats as a no-op.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -248,7 +241,7 @@ describe("sanctuary file-grant revoke: clean error on a scrub failure (R3-3)", (
     expect(err.text).not.toContain("at process.processTicksAndRejections");
   });
 
-  it("a reconcile-time scrub error on an UNRELATED expired grant also resolves with a clean non-zero exit (round 4, R3-3 completion)", async () => {
+  it("a reconcile-time scrub error on an UNRELATED expired grant does not cancel the revoke (FG-RECONCILE-SIBLINGS-01)", async () => {
     // Same fortress/identity seeding as the previous test.
     const stateStoragePath = join(fortressPath, "state");
     const storage = new FilesystemStorage(stateStoragePath);
@@ -292,8 +285,10 @@ describe("sanctuary file-grant revoke: clean error on a scrub failure (R3-3)", (
     };
     await grantStore.put(expiredGrant);
 
-    // Grant B: the operator's actual revoke TARGET -- unrelated, unexpired,
-    // and never reached because the reconcile above throws first.
+    // Grant B: the operator's actual revoke TARGET -- unrelated and unexpired.
+    // Its own tree entry is absent, so its scrub is the idempotent no-op case
+    // and the revoke itself has nothing to fail on. The only thing that could
+    // stop it is the reconcile above, which is exactly what is under test.
     const targetGrantId = "fg_revoke_target01";
     const targetGrant: FileGrant = {
       grant_id: targetGrantId,
@@ -322,9 +317,9 @@ describe("sanctuary file-grant revoke: clean error on a scrub failure (R3-3)", (
     const out = new StringWritable();
     const err = new StringWritable();
 
-    // Revoking the UNRELATED target grant must still resolve cleanly (never
-    // reject), even though the reconcile it triggers throws while scrubbing
-    // a completely different grant's tree entry.
+    // The reconcile this triggers fails while scrubbing a completely different
+    // grant's tree entry. The operator asked to revoke THIS grant, and a revoke
+    // reduces access, so it must still happen and must still get its verdict.
     const code = await runFileGrantCommand({
       argv: ["revoke", "--grant", targetGrantId, "--fortress", fortressPath],
       out,
@@ -332,8 +327,84 @@ describe("sanctuary file-grant revoke: clean error on a scrub failure (R3-3)", (
       env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
     });
 
+    expect(code).toBe(0);
+    expect(out.text).toContain(`Grant ${targetGrantId} revoked.`);
+    // The reconcile failure is reported, not swallowed: the operator is told
+    // the sweep did not fully converge, and is told it separately from the
+    // revoke's own verdict so the two are never confused.
+    expect(err.text).toContain("Notice: the tree reconcile that runs before a revoke");
+    expect(err.text).not.toContain("Error: revoke did not complete cleanly.");
+    expect(err.text).not.toContain("at process.processTicksAndRejections");
+
+    // The revoke actually landed on the record, not merely in the message.
+    expect((await grantStore.get(targetGrantId))!.status).toBe("revoked");
+  });
+
+  it("refuses a mint when the reconcile that precedes it does not converge (FG-RECONCILE-SIBLINGS-01)", async () => {
+    const stateStoragePath = join(fortressPath, "state");
+    const storage = new FilesystemStorage(stateStoragePath);
+    const masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      storagePathHint: fortressPath,
+    });
+    const identityManager = new IdentityManager(storage, masterKey);
+    await identityManager.load();
+    const { createIdentity } = await import("../../src/core/identity.js");
+    const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+    const { storedIdentity } = createIdentity("operator", identityEncKey, "recovery-key");
+    await identityManager.save(storedIdentity);
+    await identityManager.setPrimary(storedIdentity.identity_id);
+
+    const stateStore = new StateStore(storage, masterKey);
+    const grantStore = new FileGrantStore(stateStore, {
+      identityId: storedIdentity.identity_id,
+      encryptedPrivateKey: storedIdentity.encrypted_private_key,
+      identityEncryptionKey: identityEncKey,
+    });
+
+    const expiredGrantId = "fg_expired_scrub02";
+    await grantStore.put({
+      grant_id: expiredGrantId,
+      schema_version: FILE_GRANT_SCHEMA_VERSION,
+      subject_agent_id: "agent-expired",
+      scope: { kind: "file", path: "/tmp/does-not-matter-either.txt" },
+      mode: "read",
+      created_by: storedIdentity.identity_id,
+      created_at: new Date(Date.now() - 60_000).toISOString(),
+      expires_at: new Date(Date.now() - 30_000).toISOString(),
+      status: "active",
+      revoked_at: null,
+      tree_entry: `agent-expired/${expiredGrantId}`,
+      audit_refs: [],
+    });
+
+    const grantsRoot = join(fortressPath, "grants");
+    await mkdir(grantsRoot, { recursive: true, mode: 0o711 });
+    await writeFile(join(grantsRoot, "agent-expired"), "not a directory");
+
+    const out = new StringWritable();
+    const err = new StringWritable();
+
+    // Mint is the one touch that EXPANDS access, so an unconverged tree refuses
+    // it. Fail-closed here is the opposite policy from the revoke above, and
+    // deliberately so: the direction of the operation is what decides.
+    const code = await runFileGrantCommand({
+      argv: [
+        "mint",
+        "--agent",
+        "agent-new",
+        "--path",
+        "/tmp/does-not-matter-at-all.txt",
+        "--fortress",
+        fortressPath,
+      ],
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+    });
+
     expect(code).toBe(1);
-    expect(err.text).toContain("Error: revoke did not complete cleanly.");
+    expect(err.text).toContain("no new grant");
     expect(err.text).not.toContain("at process.processTicksAndRejections");
   });
 });

@@ -355,3 +355,85 @@ export class FileGrantMintFailedError extends Error {
     this.name = "FileGrantMintFailedError";
   }
 }
+
+/**
+ * One persisted grant record that could not be read back. Carries the grant id
+ * (the StateStore key) and the underlying cause; it deliberately carries no
+ * path, since an unreadable record's scope is exactly what could not be read.
+ */
+export interface FileGrantUnreadableEntry {
+  grant_id: string;
+  cause: unknown;
+}
+
+/**
+ * The result of a per-entry-tolerant grant listing: the grants that read back,
+ * plus the ones that did not. The two halves travel together on purpose -- a
+ * consumer handed only `grants` cannot tell a complete set from a partial one,
+ * and would read the missing records as absent rather than as unread.
+ */
+export interface FileGrantListing {
+  grants: FileGrant[];
+  unreadable: FileGrantUnreadableEntry[];
+}
+
+/**
+ * What a reconcile pass actually achieved for the grants that DID read back,
+ * handed to `FileGrantUnreadableEntriesError` by a thrower that has already
+ * finished the pass.
+ *
+ * IT EXISTS SO THE ERROR CANNOT CLAIM A RECONCILE IT HAS NOT SEEN. The message
+ * below used to assert that every readable grant was reconciled, and it was
+ * built before the reconcile ran, so nothing connected the sentence to the
+ * outcome. It also carries the readable-grant failure rather than letting the
+ * unread ids stand in for it: a record that did not read and a removal that did
+ * not complete are different losses, and the operator needs both.
+ */
+export interface FileGrantReadableGrantOutcome {
+  /**
+   * `null` when every grant that read back was reconciled; otherwise the first
+   * failure that stopped one of them. Never dropped in favour of the read
+   * failure -- this is the half that means access is still live.
+   */
+  failure: unknown;
+}
+
+/**
+ * Raised when one or more persisted grant records could not be read back.
+ * Names the grant ids so an operator can act, and never the scope paths (an
+ * unreadable record's path is not known, and a readable neighbour's is not this
+ * error's business).
+ *
+ * `readableGrants` is OPTIONAL on purpose. A caller that never reconciled (the
+ * strict display listing) omits it, and the message then makes no claim about a
+ * reconcile at all, because there was not one.
+ */
+export class FileGrantUnreadableEntriesError extends Error {
+  constructor(
+    public readonly grantIds: readonly string[],
+    public readonly cause: unknown,
+    public readonly readableGrants?: FileGrantReadableGrantOutcome
+  ) {
+    super(
+      `Governed File-Grant: ${grantIds.length} grant record(s) could not be ` +
+        `read back (${grantIds.join(", ")}). Their tree entries were left ` +
+        `untouched because their state is unknown. ` +
+        describeReadableGrantOutcome(readableGrants) +
+        `Cause: ${cause instanceof Error ? cause.message : String(cause)}`
+    );
+    this.name = "FileGrantUnreadableEntriesError";
+  }
+}
+
+/** Renders the reconcile clause, or nothing when the thrower did not reconcile. */
+function describeReadableGrantOutcome(
+  outcome?: FileGrantReadableGrantOutcome
+): string {
+  if (outcome === undefined) return "";
+  if (outcome.failure === null) return "Every readable grant was still reconciled. ";
+  const detail =
+    outcome.failure instanceof Error
+      ? outcome.failure.message
+      : String(outcome.failure);
+  return `At least one readable grant was NOT reconciled either: ${detail}. `;
+}
