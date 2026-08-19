@@ -8,6 +8,7 @@
  * place, so deterministic tests just pass different `now` values.
  */
 
+import { parseIsoInstantWithOffset } from "../core/time.js";
 import type { FileGrant, FileGrantEnforcement, FileGrantStatus } from "./types.js";
 
 /**
@@ -102,16 +103,43 @@ export function computeExpiresAt(
  * nobody can interpret. A standing grant is spelled `null` and is unaffected;
  * only a present-but-unreadable value takes this path.
  *
- * Deliberately NOT solved by refusing the record at the store's decode. A
- * record that fails to decode is treated as unreadable, and an unreadable
- * record's tree entry is left untouched by design -- which is the fail-open
- * outcome again, reached by a different route.
+ * A NaN CHECK IS NOT ENOUGH, and this is the part that matters. `new Date(x)`
+ * does not merely fail on garbage, it COERCES: a bare number becomes an epoch
+ * offset, an array becomes its `toString`, `"2999"` becomes a year, and
+ * `"2026-08-18T00:00:00"` with no offset is interpreted in the HOST's local
+ * zone, so the same stored record expires in one timezone and not in another.
+ * Every one of those yields a valid FUTURE date, sails past a NaN test, and
+ * preserves access exactly as before. Fail-closed on NaN alone closes the
+ * loudest case and leaves the class open.
+ *
+ * So the value is parsed rather than coerced, through the repository's shared
+ * canonical parser, which requires a full ISO 8601 instant WITH an explicit
+ * offset and a finite result. Anything else, including a non-string, is
+ * unreadable and therefore expired.
+ *
+ * THE THREAT MODEL, because it decides how strict this has to be: the danger is
+ * CORRUPTION, not an adversarial choice of date. Anyone able to write
+ * `expires_at` can write a well-formed far-future value and keep access that
+ * way, so refusing non-canonical spellings buys nothing against a writer. What
+ * this defends is that a value nobody can READ must not silently mean "never
+ * expires". Accordingly an impossible calendar date that the engine normalises
+ * (`2999-02-30` becoming March 2) is HONOURED rather than refused: it was read,
+ * just written oddly, and refusing it would cost a real grant its access over a
+ * two-day normalisation.
+ *
+ * Deliberately NOT solved by refusing the record at the store's decode. On this
+ * branch a `JSON.parse` failure is not caught per record, so the listing aborts
+ * and EVERY entry is left untouched, which is the fail-open outcome again and
+ * at a wider blast radius than one record.
  */
 export function isGrantExpired(grant: FileGrant, now: Date): boolean {
   if (grant.status === "revoked") return false;
   if (grant.expires_at === null) return false;
-  const expiresAt = new Date(grant.expires_at).getTime();
-  if (Number.isNaN(expiresAt)) return true;
+  const expiresAt =
+    typeof grant.expires_at === "string"
+      ? parseIsoInstantWithOffset(grant.expires_at)
+      : undefined;
+  if (expiresAt === undefined) return true;
   return expiresAt <= now.getTime();
 }
 

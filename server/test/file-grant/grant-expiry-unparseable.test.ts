@@ -78,6 +78,51 @@ describe("an expiry that cannot be parsed", () => {
     }
   });
 
+  it("is not fooled by values JavaScript COERCES into valid future dates", () => {
+    // The case a NaN check cannot see, and the reason this function parses
+    // rather than coerces. `new Date(x)` turns a bare number into an epoch
+    // offset, an array into its `toString`, and a bare year into a year. Each
+    // yields a valid FUTURE date, so a NaN test passes it and access is
+    // preserved exactly as before the fix.
+    //
+    // The previous version of the test above passed for `[]` and `true` only
+    // because they coerce to 1970, which is in the past. It read as "every
+    // uninterpretable shape" while proving nothing about the shapes that
+    // coerce forwards.
+    for (const value of [
+      4102444800000, // epoch ms in 2100
+      ["2999-01-01T00:00:00.000Z"], // array, via toString
+      "2999", // a bare year
+      "08/19/2999", // a locale-ish date
+    ]) {
+      expect(isGrantExpired(grantWithExpiry(value), NOW)).toBe(true);
+    }
+  });
+
+  it("accepts an impossible calendar date, and that is the right call rather than an oversight", () => {
+    // `2999-02-30T00:00:00.000Z` matches the canonical shape and parses finite,
+    // because the engine normalises it to March 2 rather than rejecting it. So
+    // it is honoured as an expiry two days later than written.
+    //
+    // Kept deliberately, because the threat here is CORRUPTION and not an
+    // adversarial choice of date. Anyone able to write `expires_at` can write a
+    // well-formed far-future value and get the same result, so refusing
+    // non-canonical spellings buys nothing against a writer. What it would cost
+    // is refusing a real grant over a two-day normalisation.
+    //
+    // The property this function defends is that a value which cannot be READ
+    // must not silently mean "never expires". A normalised date was read.
+    expect(isGrantExpired(grantWithExpiry("2999-02-30T00:00:00.000Z"), NOW)).toBe(false);
+  });
+
+  it("refuses a timestamp with no offset, which would expire in one timezone and not another", () => {
+    // `2026-08-18T00:00:00` has no zone, so `new Date` reads it in the HOST's
+    // local time. The same stored record was expired under TZ=UTC and active
+    // under TZ=America/Boise. A verdict that depends on where the process runs
+    // is not a verdict.
+    expect(isGrantExpired(grantWithExpiry("2026-08-18T00:00:00"), NOW)).toBe(true);
+  });
+
   it("projects as expired, so the display agrees with the scrub decision", () => {
     expect(projectGrantStatus(grantWithExpiry("banana"), NOW)).toBe("expired");
   });
