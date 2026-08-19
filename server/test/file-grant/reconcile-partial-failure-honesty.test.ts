@@ -386,7 +386,21 @@ describe("file-grant reconcile: the report names every loss in the pass, and cla
     };
     armed = true;
 
+    // Delta across EVERY audit operation, like the deferred-slot test above,
+    // not only the operation-and-reason filter below: a duplicate row written
+    // under a different operation or reason would be invisible to a scoped
+    // filter, and the fixture's own mint rows carry the same grant_id so an
+    // absolute count would be counting setup (FG-RECONCILE-TEST-ORDERING-01).
+    const rowsForGrantBefore = (await auditLog.query({ limit: 500 })).entries.filter(
+      (entry) => (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id,
+    ).length;
+
     await reconcileError({ store: grantStore, fsOps, now: PAST_TTL, auditLog });
+
+    const rowsForGrantAfter = (await auditLog.query({ limit: 500 })).entries.filter(
+      (entry) => (entry.details as { grant_id?: string } | undefined)?.grant_id === expiring.grant_id,
+    ).length;
+    expect(rowsForGrantAfter - rowsForGrantBefore).toBe(1);
 
     const revokes = await auditLog.query({ operation_type: "file_grant_revoke", limit: 200 });
     const rows = revokes.entries.filter(
@@ -440,12 +454,18 @@ describe("file-grant reconcile: the report names every loss in the pass, and cla
       .map((e, i) => (e.startsWith("remove:") ? i : -1))
       .filter((i) => i >= 0);
     expect(firstAudit).toBeGreaterThanOrEqual(0);
-    expect(removals.length).toBeGreaterThan(1);
+    // THE EXACT TWO removals, tied to their grants, not a count
+    // (FG-RECONCILE-TEST-ORDERING-01). "More than one removal" is satisfied by
+    // two removals of the SAME grant while its sibling is skipped, which is
+    // precisely the shape an append wedged into the loop could produce; a
+    // count cannot see a duplicate, and an untied count cannot see whose
+    // access was never taken away.
+    expect(fsOps.events.filter((e) => e.startsWith("remove:")).sort()).toEqual(
+      [`remove:${expiring.tree_entry}`, `remove:${sibling.tree_entry}`].sort(),
+    );
     // EVERY removal precedes the first failure audit. Asserting only "the last
     // removal happened" would pass with an append wedged between the two.
     expect(Math.max(...removals)).toBeLessThan(firstAudit);
-    expect(sibling.grant_id).toBeTruthy();
-    expect(expiring.grant_id).toBeTruthy();
   });
 
   it("reports a structured ACL failure twice, which is a known bound and not the fixed duplicate", async () => {
@@ -479,6 +499,64 @@ describe("file-grant reconcile: the report names every loss in the pass, and cla
       "expired_ttl_acl_removal_failed",
       "reconcile_acl_removal_failed",
     ]);
+  });
+
+  it("leaves a durable failure row when the scrub of an already-expired or already-revoked grant throws", async () => {
+    // THE SILENT PAIR (FG-RECONCILE-THROW-SILENT-01). A grant whose persisted
+    // status is already `expired` or `revoked` takes no expiry flip, so the
+    // expiry row that carries a thrown scrub for ACTIVE expiring grants never
+    // runs for it. The throw is caught by the scrub loop's per-entry catch,
+    // `aclFailureByGrantId` records only STRUCTURED failures, and the deferred
+    // scrub-failure trail used to carry only those, so a thrown scrub left
+    // ZERO durable rows for these two states: access still live, no trace in
+    // any channel but the thrown error the CLI may summarize. Round 5's fix
+    // looked complete precisely because the active-expiring state happens to
+    // be covered.
+    const removeFailed = new Error("scrub failed (acl backend down)");
+    const { grantStore, auditLog, fsOps, expiring, sibling } = await twoGrants({
+      removeThrows: removeFailed,
+    });
+
+    // One grant per silent state. Neither takes the expiry path: no status
+    // flip is due, so no expiry row can carry the failure for them.
+    const expiredLive = await grantStore.get(expiring.grant_id);
+    await grantStore.put({ ...expiredLive!, status: "expired" });
+    const revokedLive = await grantStore.get(sibling.grant_id);
+    await grantStore.put({ ...revokedLive!, status: "revoked" });
+
+    // Delta shape, not an operation-scoped count: a row emitted under a
+    // different operation or reason must not be invisible to the assertion.
+    const rowsFor = async (grantId: string) =>
+      (await auditLog.query({ limit: 500 })).entries.filter(
+        (entry) => (entry.details as { grant_id?: string } | undefined)?.grant_id === grantId,
+      ).length;
+    const expiredRowsBefore = await rowsFor(expiring.grant_id);
+    const revokedRowsBefore = await rowsFor(sibling.grant_id);
+
+    const error = await reconcileError({ store: grantStore, fsOps, now: PAST_TTL, auditLog });
+
+    // Access is still live for both, and the caller does hear about it...
+    expect(error).toBe(removeFailed);
+    expect(fsOps.scrubbed).not.toContain(expiring.tree_entry);
+    expect(fsOps.scrubbed).not.toContain(sibling.tree_entry);
+
+    // ...but a thrown message is not a durable trail. EXACTLY ONE failure row
+    // per grant: zero is the silent defect, two is the duplicate class the
+    // rest of this suite exists to keep out.
+    const revokes = await auditLog.query({ operation_type: "file_grant_revoke", limit: 200 });
+    for (const grant of [expiring, sibling]) {
+      const rows = revokes.entries.filter(
+        (entry) =>
+          (entry.details as { grant_id?: string } | undefined)?.grant_id === grant.grant_id &&
+          (entry.details as { reason?: string } | undefined)?.reason === "reconcile_scrub_threw",
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.result).toBe("failure");
+      expect((rows[0]!.details as { error?: string }).error).toContain(removeFailed.message);
+      expect((rows[0]!.details as { tree_entry?: string }).tree_entry).toBe(grant.tree_entry);
+    }
+    expect((await rowsFor(expiring.grant_id)) - expiredRowsBefore).toBe(1);
+    expect((await rowsFor(sibling.grant_id)) - revokedRowsBefore).toBe(1);
   });
 
   it("never records an expiry as a success when the scrub that should have removed access threw", async () => {

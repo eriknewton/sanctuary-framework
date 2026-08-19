@@ -162,15 +162,24 @@ export async function reconcileFileGrantTree(
   const scrubDueGrantIds = new Set(plan.toScrub.map((e) => e.grant_id));
   // Collected during the scrub loop, appended after it. See the deferral note
   // at the push site: an awaited append between two grants' scrubs delays the
-  // second grant's access removal.
+  // second grant's access removal. BOTH failure shapes of the scrub loop land
+  // here -- a removal that RETURNED a structured failure and a removal that
+  // THREW -- because the throw path used to leave no deferred record at all,
+  // and for a grant already persisted `expired` or `revoked` (no expiry flip
+  // due, so no expiry row runs for it) that meant access stayed live with
+  // zero durable rows in any channel (FG-RECONCILE-THROW-SILENT-01).
   const deferredScrubFailureAudits: Array<{
     entry: (typeof plan.toScrub)[number];
     grant: FileGrant | undefined;
-    aclRemoval: FileGrantAclRemovalResult;
+    failure:
+      | { kind: "acl_removal_reported"; aclRemoval: FileGrantAclRemovalResult }
+      | { kind: "removal_threw"; error: unknown };
   }> = [];
   for (const entry of plan.toScrub) {
+    // Resolved OUTSIDE the try so the catch below can name the grant on the
+    // deferred failure record; a Map lookup cannot throw.
+    const grant = grantsById.get(entry.grant_id);
     try {
-      const grant = grantsById.get(entry.grant_id);
       const removeResult = await deps.fsOps.removeEntry(
         entry.relative_tree_entry,
         grant ? { grantedReadAce: grant.granted_read_ace ?? null } : undefined
@@ -192,7 +201,7 @@ export async function reconcileFileGrantTree(
         deferredScrubFailureAudits.push({
           entry,
           grant,
-          aclRemoval: removeResult.aclRemoval,
+          failure: { kind: "acl_removal_reported", aclRemoval: removeResult.aclRemoval },
         });
         if (readableGrantFailure === null) {
           readableGrantFailure = new Error(
@@ -202,6 +211,19 @@ export async function reconcileFileGrantTree(
         }
       }
     } catch (err) {
+      // A throw is deferred like the structured failure above, NOT only
+      // remembered in the first-wins slot: the slot feeds the thrown error,
+      // and a thrown message is not a durable trail. Without this record a
+      // grant already persisted `expired` or `revoked` -- the states the
+      // expiry append below never runs for -- kept live access with zero
+      // audit rows (FG-RECONCILE-THROW-SILENT-01). Appended after the loop
+      // for the same reason as its sibling: an awaited append here would sit
+      // between this grant's failed scrub and the next grant's removal.
+      deferredScrubFailureAudits.push({
+        entry,
+        grant,
+        failure: { kind: "removal_threw", error: err },
+      });
       if (readableGrantFailure === null) readableGrantFailure = err;
     }
   }
@@ -213,6 +235,15 @@ export async function reconcileFileGrantTree(
   // may lag at "active"), but the tree entry is already gone.
   // `reviseGrantForExpiry` is a no-op for revoked or not-yet-expired grants.
   const expired: string[] = [];
+  // Grants whose expiry append RAN this pass. Consulted by the deferred
+  // thrown-scrub trail below: for an ACTIVE expiring grant whose scrub threw,
+  // the expiry row already reports the failure
+  // (`expired_ttl_scrub_did_not_complete`), so a second row here would be one
+  // fault described twice -- the FG-RECONCILE-ACL-DOUBLE-01 shape, and a
+  // pinned test asserts exactly one row for that grant. Recording the append
+  // that actually ran, rather than re-deriving the `shouldExpire` predicate at
+  // the other site, is what keeps the two sites from drifting.
+  const expiryAuditedGrantIds = new Set<string>();
   for (const grant of grants) {
     const shouldExpire = grant.status === "active" && isGrantExpired(grant, deps.now);
     const shouldClearAce =
@@ -279,6 +310,7 @@ export async function reconcileFileGrantTree(
       // exists and answers the question directly: was this grant due to be
       // scrubbed, and did that scrub actually complete.
       const dueToScrub = scrubDueGrantIds.has(grant.grant_id);
+      expiryAuditedGrantIds.add(grant.grant_id);
       await appendExpiryAudit(
         deps,
         grant,
@@ -300,12 +332,28 @@ export async function reconcileFileGrantTree(
   // unreadable-record trail below does: every access removal this pass will
   // attempt has already been attempted, so an append can no longer delay one.
   for (const deferred of deferredScrubFailureAudits) {
-    await appendScrubFailureAudit(
-      deps,
-      deferred.entry,
-      deferred.grant,
-      deferred.aclRemoval
-    );
+    if (deferred.failure.kind === "acl_removal_reported") {
+      await appendScrubFailureAudit(
+        deps,
+        deferred.entry,
+        deferred.grant,
+        deferred.failure.aclRemoval
+      );
+    } else if (!expiryAuditedGrantIds.has(deferred.entry.grant_id)) {
+      // A thrown scrub gets its row ONLY when no expiry row carried it: for an
+      // active expiring grant the expiry append above already reported
+      // `expired_ttl_scrub_did_not_complete`, and one fault is one row. The
+      // structured branch above stays unconditional on purpose -- its
+      // two-rows-for-one-fault bound predates this fix, is tracked as
+      // FG-RECONCILE-ACL-DOUBLE-01, and is pinned by a test; collapsing it is
+      // a consumer-visible decision that is not taken here.
+      await appendThrownScrubFailureAudit(
+        deps,
+        deferred.entry,
+        deferred.grant,
+        deferred.failure.error
+      );
+    }
   }
 
   // THE UNREADABLE-RECORD TRAIL RUNS HERE, AFTER BOTH MUTATION LOOPS. It is a
@@ -402,6 +450,48 @@ async function appendScrubFailureAudit(
     });
   } catch {
     // Best-effort: reconcile still reports the scrub failure to its caller.
+  }
+}
+
+/**
+ * The counterpart to `appendScrubFailureAudit` for the scrub loop's OTHER
+ * failure shape: `removeEntry` THREW rather than returning a structured
+ * ACL-removal result. It exists because the throw path used to leave only the
+ * first-wins error slot, so for a grant already persisted `expired` or
+ * `revoked` -- the states the expiry append never runs for -- a thrown scrub
+ * left zero durable rows while access stayed live
+ * (FG-RECONCILE-THROW-SILENT-01). Filed under `file_grant_revoke` with
+ * `result: "failure"` like its structured sibling: both are attempted access
+ * reductions that did not land. Best-effort for the same reason as every
+ * append here: an audit failure must never abort a reconcile that is reducing
+ * access.
+ */
+async function appendThrownScrubFailureAudit(
+  deps: ReconcileFileGrantDeps,
+  entry: { grant_id: string; relative_tree_entry: string },
+  grant: FileGrant | undefined,
+  err: unknown
+): Promise<void> {
+  try {
+    await deps.auditLog?.appendCritical({
+      layer: "l1",
+      operation: "file_grant_revoke",
+      identity_id: deps.reconciledBy ?? "system",
+      result: "failure",
+      details: {
+        grant_id: entry.grant_id,
+        subject_agent_id: grant?.subject_agent_id,
+        // Distinct from `reconcile_acl_removal_failed`: that reason means the
+        // removal RAN and reported which ACL step failed; this one means the
+        // removal threw before reporting anything, so there is no structured
+        // result to attach and the error text is the whole evidence.
+        reason: "reconcile_scrub_threw",
+        tree_entry: entry.relative_tree_entry,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    });
+  } catch {
+    // Best-effort: reconcile still reports the thrown scrub to its caller.
   }
 }
 
