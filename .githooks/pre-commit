@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Sanctuary pre-commit hook — test baseline guard
+# Sanctuary pre-commit hook - test baseline guard
 # Copyright 2026 Erik Newton
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -25,15 +25,19 @@
 #          Any occurrence of "transform error", "failed to parse",
 #          "failed to collect", "failed to load source", or
 #          "cannot find module" in the vitest output aborts the
-#          commit — these are the exact signatures of the
+#          commit - these are the exact signatures of the
 #          commit 4ac95830 failure class.
 #
 #       b. Silent test file drop.
-#          Count .test.ts files under server/test/ and compare to
-#          vitest's reported "Test Files N passed (TOTAL)" count.
-#          If files on disk > files vitest attempted, some file
-#          failed to load before vitest registered it — the same
-#          failure shape as 4ac95830, hiding 98 tests for 26 hours.
+#          Delegates to scripts/gate2b-check.sh - the same
+#          implementation CI's Gate 2b calls - which compares the
+#          test files VITEST ITSELF discovers (`vitest list
+#          --filesOnly`, via server/scripts/count-vitest-test-files.mjs)
+#          against vitest's reported "Test Files N passed (TOTAL)"
+#          count from this run. If vitest ran fewer files than its own
+#          discovery found, some file failed to load before vitest
+#          registered it - the same failure shape as 4ac95830, hiding
+#          98 tests for 26 hours.
 #
 #       c. Test baseline drift (BOTH directions).
 #          If vitest's passing-test count falls below the integer
@@ -42,7 +46,7 @@
 #          author bumping .test-baseline in the SAME commit, the
 #          commit is also blocked: a silent ratchet-up lets a later
 #          regression hide under the stale floor (the new passing
-#          tests mask the loss). The fix is mechanical and required —
+#          tests mask the loss). The fix is mechanical and required -
 #          stage the new count in .test-baseline. Net-zero churn
 #          commits (count == baseline) pass untouched.
 #
@@ -71,9 +75,9 @@
 # The override is logged to .test-baseline-overrides.log with timestamp,
 # HEAD SHA, branch, author (whoami), and the reason for audit.
 #
-# Enforcement status (be precise — do NOT call this hook "not
+# Enforcement status (be precise - do NOT call this hook "not
 # bypassable"): this LOCAL hook is the fast first line, but it is
-# CI-enforced with an audited emergency override — it can be skipped
+# CI-enforced with an audited emergency override - it can be skipped
 # with `SKIP_TEST_BASELINE=1` (documented + logged above) or with
 # `git commit --no-verify`, and it is absent in environments where the
 # hook was never installed. The HARD merge gate is the CI mirror at
@@ -116,12 +120,12 @@ ok()   { printf '%s[baseline-guard]%s %s%s%s\n' "$BLUE" "$NC" "$GREEN" "$1" "$NC
 # non-negative integer, but two pathological inputs are still possible and both
 # would corrupt the arithmetic guards downstream:
 #
-#   - a leading-zero string (e.g. "007") — historically a source of octal-parse
+#   - a leading-zero string (e.g. "007") - historically a source of octal-parse
 #     surprises in `(( ... ))`; we reject it for the same reason we reject a
 #     leading-zero .test-baseline above; and
 #   - an absurdly large value (e.g. a 19-digit string) that overflows bash's
 #     signed-64-bit `(( ... ))` arithmetic and silently wraps (the macOS system
-#     bash is 3.2), so a numeric `(( _val > MAX ))` guard CANNOT catch it — the
+#     bash is 3.2), so a numeric `(( _val > MAX ))` guard CANNOT catch it - the
 #     comparison itself overflows. Left unchecked, a wrapped-negative count would
 #     turn a "passing < baseline" regression check into a false PASS.
 #
@@ -139,7 +143,7 @@ COUNTER_MAX=100000000   # 9 digits; see digit-count guard below.
 validate_counter() {
   local _name="$1" _val="$2"
   if ! [[ "$_val" =~ ^(0|[1-9][0-9]*)$ ]]; then
-    fail "$_name from vitest output is not a canonical integer, got: '$_val' — commit blocked"
+    fail "$_name from vitest output is not a canonical integer, got: '$_val' - commit blocked"
     exit 1
   fi
   # Reject by digit count first (overflow-safe), then numerically for same-length
@@ -148,7 +152,7 @@ validate_counter() {
   # it is known to fit in 64-bit.
   if (( ${#_val} > ${#COUNTER_MAX} )) \
      || { (( ${#_val} == ${#COUNTER_MAX} )) && (( _val > COUNTER_MAX )); }; then
-    fail "$_name from vitest output ($_val) exceeds the sane upper bound ($COUNTER_MAX) — commit blocked"
+    fail "$_name from vitest output ($_val) exceeds the sane upper bound ($COUNTER_MAX) - commit blocked"
     printf '[baseline-guard]   This is almost certainly a parse-corrupted or adversarial value; refusing\n' >&2
     printf '[baseline-guard]   to run arithmetic on it (overflow could mask a regression).\n' >&2
     exit 1
@@ -163,7 +167,7 @@ if [[ "${SKIP_TEST_BASELINE:-}" == "1" ]]; then
   # prevent. `SKIP_REASON` must be a non-empty, non-whitespace string.
   skip_reason="${SKIP_REASON:-}"
   if [[ -z "${skip_reason//[[:space:]]/}" ]]; then
-    fail "SKIP_TEST_BASELINE=1 was set WITHOUT a justification — override refused."
+    fail "SKIP_TEST_BASELINE=1 was set WITHOUT a justification - override refused."
     printf '[baseline-guard]   An emergency override must be accountable. Re-run with a reason:\n' >&2
     printf '[baseline-guard]     SKIP_TEST_BASELINE=1 SKIP_REASON="why you are bypassing" git commit ...\n' >&2
     exit 1
@@ -171,7 +175,7 @@ if [[ "${SKIP_TEST_BASELINE:-}" == "1" ]]; then
   # Collapse newlines/tabs so a multi-line reason cannot corrupt the single-line
   # log record (each override is exactly one tab-delimited line).
   skip_reason=$(printf '%s' "$skip_reason" | tr '\n\t' '  ')
-  warn "SKIP_TEST_BASELINE=1 — emergency override active"
+  warn "SKIP_TEST_BASELINE=1 - emergency override active"
   warn "This commit is being made without running the baseline guard."
   warn "Override is logged to .test-baseline-overrides.log for audit."
   timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -194,7 +198,7 @@ cd "$repo_root"
 # ── Gate 1: typecheck ────────────────────────────────────────────────
 log "Gate 1/2: npm run typecheck"
 if ! (cd server && npm run typecheck --silent > /tmp/sanctuary-precommit-tsc.log 2>&1); then
-  fail "TYPECHECK FAILED — commit blocked"
+  fail "TYPECHECK FAILED - commit blocked"
   tail -40 /tmp/sanctuary-precommit-tsc.log >&2
   printf '\n' >&2
   fail "Fix all TypeScript errors before committing."
@@ -206,7 +210,7 @@ ok "Gate 1/2: typecheck clean."
 # ── Gate 2: transform-error detection + test baseline ───────────────
 log "Gate 2/2: npm test + transform-error detection + baseline check"
 
-# Resolve the enforcement floor from the SOURCE THAT WILL BE COMMITTED — never the
+# Resolve the enforcement floor from the SOURCE THAT WILL BE COMMITTED - never the
 # unstaged working tree (the bypass this guard closes).
 #
 # Why not the working tree: if we read .test-baseline off disk here, an author
@@ -237,7 +241,7 @@ fi
 #
 # That produced a real failure mode (observed 2026-07-18, PR #965): on a commit
 # that touches no server code at all (a ROADMAP.md edit, a dev-script fix), the
-# hook demanded the author "account for the drift" by raising .test-baseline —
+# hook demanded the author "account for the drift" by raising .test-baseline -
 # but there was nothing to account for. The correct Linux floor had not changed,
 # and raising it to the local macOS count would set a floor Linux can never
 # reach, breaking CI for everyone. The only way through was
@@ -246,7 +250,7 @@ fi
 #
 # So: scope the fail-above demand to commits that could plausibly have changed
 # the count. Anything under server/ qualifies (test files obviously, but also
-# src, package.json, and vitest config — all of which can move the count). A
+# src, package.json, and vitest config - all of which can move the count). A
 # commit staging NOTHING under server/ cannot have added a test, so an excess
 # over the floor there is platform delta by construction, and is reported as a
 # warning instead of a block.
@@ -290,7 +294,7 @@ fi
 
 # Defense-in-depth diagnostic: if the working-tree file disagrees with the
 # enforced (committed) floor, surface it. An UNSTAGED raise is exactly the bypass
-# shape, so make it loud — it is being IGNORED for enforcement, by design.
+# shape, so make it loud - it is being IGNORED for enforcement, by design.
 if [[ -f .test-baseline ]]; then
   worktree_baseline=$(tr -d '[:space:]' < .test-baseline)
   if [[ "$worktree_baseline" =~ ^(0|[1-9][0-9]*)$ && "$worktree_baseline" != "$baseline" && -z "$baseline_is_staged" ]]; then
@@ -299,16 +303,9 @@ if [[ -f .test-baseline ]]; then
   fi
 fi
 
-# Count test files on disk (expected).
-expected_files=$(find server/test -name "*.test.ts" -not -path "*/node_modules/*" 2>/dev/null | wc -l | tr -d '[:space:]')
-if [[ -z "$expected_files" || "$expected_files" == "0" ]]; then
-  fail "No test files found under server/test/ — something is wrong"
-  exit 1
-fi
-
 # Run the test suite and capture BOTH output and exit code. Using
 # `set +e` around the assignment means the subshell's non-zero exit
-# does not abort this hook under `set -e` — we want to inspect the
+# does not abort this hook under `set -e` - we want to inspect the
 # captured output to classify the failure before deciding how to
 # report it.
 set +e
@@ -320,7 +317,7 @@ set -e
 #
 # The 2026-04-10 incident (commit 4ac95830) was a parse error at
 # vitest's transform step that caused test files to drop silently.
-# The PRIMARY signal is vitest's exit code — if `npm test` returns
+# The PRIMARY signal is vitest's exit code - if `npm test` returns
 # non-zero, the commit MUST be blocked regardless of any substring
 # parsing. The substring match then runs as a classifier to decide
 # whether to name the error as the specific 4ac95830 failure class
@@ -328,14 +325,14 @@ set -e
 #
 # Patterns covered (case-insensitive):
 #
-#   "transform failed"           — vite:esbuild plugin message
+#   "transform failed"           - vite:esbuild plugin message
 #                                  (e.g. "Transform failed with 1 error")
-#   "transform error"            — alternate vitest transform message
-#   "failed to parse"            — esbuild / swc parse error
-#   "failed to collect"          — vitest collection failure
-#   "failed to load source"      — vitest source-loading failure
-#   "cannot find module"         — missing import or dependency
-#   "Failed Suites"              — vitest summary header for
+#   "transform error"            - alternate vitest transform message
+#   "failed to parse"            - esbuild / swc parse error
+#   "failed to collect"          - vitest collection failure
+#   "failed to load source"      - vitest source-loading failure
+#   "cannot find module"         - missing import or dependency
+#   "Failed Suites"              - vitest summary header for
 #                                  suite-level failures (shown when
 #                                  a test file fails to register)
 #
@@ -347,7 +344,7 @@ TRANSFORM_ERROR_PATTERNS='(transform failed|transform error|failed to parse|fail
 
 if (( test_exit != 0 )); then
   if echo "$test_output" | grep -Eqi "$TRANSFORM_ERROR_PATTERNS"; then
-    fail "TRANSFORM/COLLECTION ERROR DETECTED — commit blocked"
+    fail "TRANSFORM/COLLECTION ERROR DETECTED - commit blocked"
     printf '\n' >&2
     echo "$test_output" | grep -Ei "$TRANSFORM_ERROR_PATTERNS" | head -20 >&2
     printf '\n' >&2
@@ -357,7 +354,7 @@ if (( test_exit != 0 )); then
     printf '[baseline-guard]   docs/audit/commit-4ac95830-postmortem.md\n' >&2
     exit 1
   fi
-  fail "TEST SUITE FAILED (exit code $test_exit) — commit blocked"
+  fail "TEST SUITE FAILED (exit code $test_exit) - commit blocked"
   printf '\n' >&2
   echo "$test_output" | tail -40 >&2
   exit 1
@@ -367,7 +364,7 @@ fi
 # as defense-in-depth. In theory a vitest version could report the
 # error without failing the run (unlikely but worth the extra line).
 if echo "$test_output" | grep -Eqi "$TRANSFORM_ERROR_PATTERNS"; then
-  fail "TRANSFORM/COLLECTION ERROR DETECTED (despite zero exit) — commit blocked"
+  fail "TRANSFORM/COLLECTION ERROR DETECTED (despite zero exit) - commit blocked"
   printf '\n' >&2
   echo "$test_output" | grep -Ei "$TRANSFORM_ERROR_PATTERNS" | head -20 >&2
   printf '\n' >&2
@@ -378,33 +375,58 @@ fi
 
 # ── Check 2b: silent test file drop ─────────────────────────────────
 #
-# Parse vitest's "Test Files  N passed (TOTAL)" summary line. The
-# number inside parentheses is vitest's attempted-file count. If
-# files on disk exceed that count, some file(s) dropped silently
-# during collection — the exact failure class from 4ac95830.
-actual_total=$(echo "$test_output" | grep -oE "Test Files[[:space:]]+.*\([0-9]+\)" | grep -oE "\([0-9]+\)" | tr -d '()' | tail -1)
-if [[ -z "$actual_total" ]]; then
-  # Fallback for older vitest output shape.
-  actual_total=$(echo "$test_output" | grep -oE "Test Files[[:space:]]+[0-9]+ passed" | grep -oE "[0-9]+" | head -1)
-fi
-if [[ -z "$actual_total" ]]; then
-  fail "Could not parse 'Test Files' count from vitest output"
-  echo "$test_output" | tail -30 >&2
-  exit 1
-fi
-# Validate before any arithmetic (fail CLOSED on non-canonical / overflow).
-validate_counter "Test Files count" "$actual_total"
+# Delegates to scripts/gate2b-check.sh - the SAME implementation
+# .github/workflows/test-baseline-guard.yml's Gate 2b calls. This hook used
+# to keep its own copy of the "Test Files N passed (TOTAL)" parsing and the
+# expected-vs-actual comparison; that second copy is exactly the kind of
+# drift that let this hook and CI disagree on whether expected_files=0 was
+# acceptable (this hook rejected it outright; the other copy did not) until
+# both were unified into gate2b-check.sh, which now owns that refusal in one
+# place. See that script for the vitest-own-discovery expected count
+# (server/scripts/count-vitest-test-files.mjs, via `vitest list --filesOnly`)
+# and its self-test (scripts/gate2b-self-test.sh).
+GATE2B_LOG="$(mktemp)"
+trap 'rm -f "$GATE2B_LOG"' EXIT
+printf '%s\n' "$test_output" > "$GATE2B_LOG"
 
-if (( actual_total < expected_files )); then
-  fail "SILENT TEST FILE DROP DETECTED — commit blocked"
-  printf '[baseline-guard]   Files on disk under server/test/: %s\n' "$expected_files" >&2
-  printf '[baseline-guard]   Files vitest reported:            %s\n' "$actual_total" >&2
-  printf '[baseline-guard]   Missing: %s test file(s).\n' "$((expected_files - actual_total))" >&2
+set +e
+gate2b_output=$(bash scripts/gate2b-check.sh "$GATE2B_LOG" 2>&1)
+gate2b_status=$?
+set -e
+
+# FAILURE MODE: gate2b-check.sh's own messages use GitHub Actions'
+# "::error::" annotation prefix, which is meaningless outside Actions but
+# harmless - it just prints as literal text here. Re-prefixing every line
+# with this hook's own "[baseline-guard]" tag keeps the local output visually
+# consistent with every other check in this script instead of leaving one
+# check's output in a different voice.
+while IFS= read -r gate2b_line; do
+  printf '[baseline-guard] %s\n' "$gate2b_line" >&2
+done <<< "$gate2b_output"
+
+if (( gate2b_status != 0 )); then
+  fail "SILENT TEST FILE DROP DETECTED (or an inconsistency in vitest's own file discovery) - commit blocked"
   printf '\n' >&2
   fail "This is the specific failure class from commit 4ac95830."
   printf '[baseline-guard]   See docs/audit/commit-4ac95830-postmortem.md\n' >&2
   exit 1
 fi
+
+# Recover actual_total (needed for the Gate 2/2 summary line below) from
+# gate2b-check.sh's own output instead of re-parsing test_output a second
+# time with a second copy of the same regex - that second copy is the exact
+# shape of drift this delegation exists to remove, even for a cosmetic
+# summary number.
+actual_total=$(echo "$gate2b_output" | grep -oE "Files vitest loaded for the run:[[:space:]]+[0-9]+" | grep -oE "[0-9]+")
+if [[ -z "$actual_total" ]]; then
+  fail "Could not recover the test-file count from scripts/gate2b-check.sh output - internal error"
+  exit 1
+fi
+# Validate before any arithmetic (fail CLOSED on non-canonical / overflow).
+# gate2b-check.sh already validated this value itself; this is defense in
+# depth for the LOCAL re-parse above, not a claim that gate2b-check.sh might
+# be wrong.
+validate_counter "Test Files count" "$actual_total"
 
 # ── Check 2c: passing count >= baseline ─────────────────────────────
 #
@@ -419,7 +441,7 @@ fi
 validate_counter "passing-test count" "$passing"
 
 if (( passing < baseline )); then
-  fail "TEST BASELINE REGRESSION — commit blocked"
+  fail "TEST BASELINE REGRESSION - commit blocked"
   printf '[baseline-guard]   Committed floor (HEAD:.test-baseline): %s\n' "$baseline" >&2
   printf '[baseline-guard]   Current passing count:                 %s\n' "$passing" >&2
   printf '[baseline-guard]   Regression: %s tests\n' "$((baseline - passing))" >&2
@@ -430,7 +452,7 @@ if (( passing < baseline )); then
 fi
 
 # Fail-above WITHOUT an in-commit baseline bump. A passing count higher
-# than the floor must be ACCOUNTED FOR — either by raising .test-baseline
+# than the floor must be ACCOUNTED FOR - either by raising .test-baseline
 # in this same commit, or it is a silent ratchet that lets a later
 # regression hide under the stale floor (the extra passing tests mask the
 # loss until the floor is finally bumped).
@@ -447,7 +469,7 @@ fi
 # Linux, where local == CI) enforces the exact floor.
 #
 # IMPORTANT (mirrors the CI guard's intent): merely STAGING .test-baseline is
-# not enough — the staged value must be GREATER than the previously committed
+# not enough - the staged value must be GREATER than the previously committed
 # value. A flat re-stage (same number) or a LOWERED edit is NOT an accounting
 # of the drift: it would let an author satisfy this gate while keeping the
 # floor stale (or pushing it down so a real regression slips under it). So we
@@ -462,7 +484,7 @@ fi
 if [[ -n "$baseline_is_staged" ]]; then
   _sb=$(git show :.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
   if ! [[ "$_sb" =~ ^(0|[1-9][0-9]*)$ ]]; then
-    fail "STAGED .test-baseline IS NOT A SINGLE INTEGER (or was deleted) — commit blocked"
+    fail "STAGED .test-baseline IS NOT A SINGLE INTEGER (or was deleted) - commit blocked"
     printf '[baseline-guard]   Staged value: %s\n' "'$_sb'" >&2
     printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git commit ...\n' >&2
     exit 1
@@ -470,12 +492,12 @@ if [[ -n "$baseline_is_staged" ]]; then
   _pb=$(git show HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
   [[ "$_pb" =~ ^(0|[1-9][0-9]*)$ ]] || _pb=0
   if (( _sb <= _pb )); then
-    fail "STAGED .test-baseline IS NOT AN UPWARD BUMP — commit blocked"
+    fail "STAGED .test-baseline IS NOT AN UPWARD BUMP - commit blocked"
     printf '[baseline-guard]   Previously committed: %s\n' "$_pb" >&2
     printf '[baseline-guard]   Staged value:         %s\n' "$_sb" >&2
     printf '\n' >&2
     fail "A flat re-stage, a lowered edit, or a deletion is not an accounting of"
-    fail "drift — it keeps the floor stale (or pushes it down so a regression"
+    fail "drift - it keeps the floor stale (or pushes it down so a regression"
     fail "slips under it). Raise it to the new Linux CI passing count and re-stage."
     printf '[baseline-guard] Override (emergency): SKIP_TEST_BASELINE=1 git commit ...\n' >&2
     exit 1
@@ -485,9 +507,9 @@ if [[ -n "$baseline_is_staged" ]]; then
   # and can mask a real regression up to the inflated number. The correct staged
   # value is the new LINUX CI passing count, which is <= local passing (a macOS box
   # legitimately runs MORE tests than the Linux floor), so a legitimate value never
-  # trips this — only an inflated one does. (codex #571 r3 finding.)
+  # trips this - only an inflated one does. (codex #571 r3 finding.)
   if (( _sb > passing )); then
-    fail "STAGED .test-baseline ($_sb) EXCEEDS the current passing count ($passing) — commit blocked"
+    fail "STAGED .test-baseline ($_sb) EXCEEDS the current passing count ($passing) - commit blocked"
     printf '[baseline-guard]   An over-raised floor poisons the next commit and can mask a\n' >&2
     printf '[baseline-guard]   regression up to the inflated number. Set .test-baseline to the\n' >&2
     printf '[baseline-guard]   new LINUX CI passing count (<= your local passing), not higher.\n' >&2
@@ -503,7 +525,7 @@ if (( passing > baseline )); then
     # demand a bump that would set a floor Linux can never reach.
     if [[ -z "$server_code_staged" ]]; then
       warn "Passing count ($passing) exceeds the committed floor ($baseline) by $((passing - baseline))."
-      warn "This commit stages nothing under server/, so it cannot have added a test —"
+      warn "This commit stages nothing under server/, so it cannot have added a test -"
       warn "treating the excess as the known macOS-over-Linux platform delta."
       warn "The floor is UNCHANGED at $baseline. Do NOT raise it to your local count:"
       warn "the floor is the LINUX CI passing count, and CI enforces it exactly."
@@ -511,21 +533,21 @@ if (( passing > baseline )); then
       ok "All baseline-guard checks passed. Commit allowed."
       exit 0
     fi
-    fail "TEST BASELINE DRIFTED ABOVE THE FLOOR — commit blocked"
+    fail "TEST BASELINE DRIFTED ABOVE THE FLOOR - commit blocked"
     printf '[baseline-guard]   Committed floor (HEAD:.test-baseline): %s\n' "$baseline" >&2
     printf '[baseline-guard]   Current passing count:                 %s\n' "$passing" >&2
     printf '[baseline-guard]   Unaccounted above floor:               %s\n' "$((passing - baseline))" >&2
     printf '\n' >&2
     fail "Account for the drift IN THIS COMMIT: raise .test-baseline (by the"
     fail "number of NEW tests that run on Linux CI, per the baseline-floor"
-    fail "rule — NOT to your local macOS count) and stage it"
+    fail "rule - NOT to your local macOS count) and stage it"
     fail "(git add .test-baseline). A deferred bump lets a future regression"
     fail "hide under the stale floor."
     printf '[baseline-guard] To override in an emergency: SKIP_TEST_BASELINE=1 git commit ...\n' >&2
     exit 1
   fi
 
-  # .test-baseline IS staged — verify the staged value is a strict UPWARD
+  # .test-baseline IS staged - verify the staged value is a strict UPWARD
   # bump over the previously committed value. The staged content is the
   # `:.test-baseline` blob (the index); the previous committed content is
   # `HEAD:.test-baseline`. On the very first commit of the file there is no
@@ -533,7 +555,7 @@ if (( passing > baseline )); then
   # value qualifies as an upward bump.
   staged_baseline=$(git show :.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
   if ! [[ "$staged_baseline" =~ ^(0|[1-9][0-9]*)$ ]]; then
-    fail "STAGED .test-baseline IS NOT A SINGLE INTEGER — commit blocked"
+    fail "STAGED .test-baseline IS NOT A SINGLE INTEGER - commit blocked"
     printf '[baseline-guard]   Staged value: %s\n' "'$staged_baseline'" >&2
     exit 1
   fi
@@ -542,20 +564,20 @@ if (( passing > baseline )); then
     prev_baseline=0
   fi
   if (( staged_baseline <= prev_baseline )); then
-    fail "STAGED .test-baseline IS NOT AN UPWARD BUMP — commit blocked"
+    fail "STAGED .test-baseline IS NOT AN UPWARD BUMP - commit blocked"
     printf '[baseline-guard]   Previously committed: %s\n' "$prev_baseline" >&2
     printf '[baseline-guard]   Staged value:         %s\n' "$staged_baseline" >&2
     printf '[baseline-guard]   Current passing:      %s\n' "$passing" >&2
     printf '\n' >&2
     fail "Staging .test-baseline only accounts for the drift if it RAISES the"
-    fail "floor. A flat re-stage or a lowered edit is not an accounting — it"
+    fail "floor. A flat re-stage or a lowered edit is not an accounting - it"
     fail "keeps the floor stale (or pushes it down so a regression slips"
     fail "under it). Raise it to the new Linux CI passing count and re-stage"
     fail "(git add .test-baseline)."
     printf '[baseline-guard] To override in an emergency: SKIP_TEST_BASELINE=1 git commit ...\n' >&2
     exit 1
   fi
-  ok "Passing count ($passing) exceeds the floor ($baseline); .test-baseline raised $prev_baseline -> $staged_baseline in this commit — drift accounted for (local may exceed the Linux floor)."
+  ok "Passing count ($passing) exceeds the floor ($baseline); .test-baseline raised $prev_baseline -> $staged_baseline in this commit - drift accounted for (local may exceed the Linux floor)."
 fi
 
 ok "Gate 2/2: $actual_total test files loaded, $passing tests passed (baseline: $baseline)."

@@ -18,6 +18,38 @@ export default defineConfig({
     // probe itself either delete the var locally and point the probe at a
     // loopback server, or inject a stub via RunWrapDeps.
     env: { SANCTUARY_NO_UPDATE_CHECK: "1" },
+    // CI's silent-test-file-drop detector (Gate 2b in
+    // .github/workflows/test-baseline-guard.yml and .githooks/pre-commit, both
+    // delegating to scripts/gate2b-check.sh) needs its "expected files" count
+    // to track whatever this array (and test.exclude, dot, root, projects, or
+    // any other resolution knob added here later) actually is at any given
+    // moment. It gets that by asking vitest itself - `vitest list --filesOnly`
+    // in server/scripts/count-vitest-test-files.mjs - rather than reading or
+    // modeling this array, so there is nothing here to keep in sync and no
+    // comment pin needed on this side for the RESOLUTION knobs: add a root, an
+    // exclude, or an includeSource here and the detector follows automatically.
+    // TWO SHAPES ARE THE EXCEPTION, and each refuses rather than miscounting.
+    // OVERLAPPING projects (the same file resolved under more than one project,
+    // which a real run executes more than once) refuse in the counter. And the
+    // test INVOCATION itself is checked against a short allowlist of exact
+    // strings in scripts/gate2b-check.sh, so anything other than the verified
+    // invocation refuses there: not because those flags are all unsafe, but
+    // because deciding safety by parsing that string was tried twice and
+    // produced a parser that rejected a healthy flag while admitting an unsafe
+    // one. The two refusals do NOT mean the same thing, and conflating them is
+    // what would mislead the next reader: an overlapping project genuinely
+    // changes what a run EXECUTES relative to what `vitest list` REPORTS, which
+    // is the single assumption the detector rests on, while an unallowlisted
+    // invocation refuses only because its safety is UNVERIFIED. A reporter flag
+    // almost certainly changes nothing; it still refuses, because the allowlist
+    // records what someone checked rather than what someone assumed. Adopting
+    // either means updating scripts/gate2b-check.sh deliberately and
+    // re-verifying scripts/gate2b-self-test.sh.
+    // History: a hand-restated `find server/test` once missed the second root
+    // below and let up to 14 dropped files pass undetected (2026-08-19); the
+    // fix that followed re-modeled this array by hand instead of asking
+    // vitest, which would have silently missed the NEXT config surface added
+    // here too. See that script's header for the full account.
     include: ["test/**/*.test.ts", "../scripts/synthetic-coverage/test/**/*.test.ts"],
     coverage: {
       provider: "v8",
