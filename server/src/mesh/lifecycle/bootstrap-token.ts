@@ -17,6 +17,10 @@ import { MeshError } from "../errors.js";
 import type { PrincipalCertificate } from "../types.js";
 import { BOOTSTRAP_TOKEN_TTL_MS } from "./constants.js";
 import type { BootstrapToken } from "./types.js";
+// a bootstrap token is attacker-suppliable and is compared here BEFORE its
+// signature is checked, so its fields are unvalidated; diagnostics go through
+// the untrusted-diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../../errors/index.js";
 
 export class MeshBootstrapTokenError extends MeshError {
   constructor(message: string) {
@@ -61,7 +65,7 @@ export function verifyBootstrapToken(params: {
   const now = params.now_ms ?? Date.now();
   if (params.token.fortress_id !== params.expected_fortress_id) {
     throw new MeshBootstrapTokenError(
-      `bootstrap token fortress_id=${params.token.fortress_id} does not match expected ${params.expected_fortress_id}`
+      `bootstrap token fortress_id=${describeUntrusted(params.token.fortress_id)} does not match expected ${params.expected_fortress_id}`
     );
   }
   if (
@@ -69,12 +73,12 @@ export function verifyBootstrapToken(params: {
     params.issuing_principal_cert.principal_id
   ) {
     throw new MeshBootstrapTokenError(
-      `bootstrap token issuing_principal=${params.token.issuing_principal} does not match principal cert ${params.issuing_principal_cert.principal_id}`
+      `bootstrap token issuing_principal=${describeUntrusted(params.token.issuing_principal)} does not match principal cert ${params.issuing_principal_cert.principal_id}`
     );
   }
   if (Date.parse(params.token.expires_at) < now) {
     throw new MeshBootstrapTokenError(
-      `bootstrap token expired at ${params.token.expires_at}`
+      `bootstrap token expired at ${describeUntrusted(params.token.expires_at)}`
     );
   }
   if (params.token.signature_scheme !== SIGNATURE_SCHEME_V1) {

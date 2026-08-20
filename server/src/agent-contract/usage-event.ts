@@ -34,6 +34,10 @@ import {
 import { UsageEventSchemaError } from "./errors.js";
 import { validateUsageEvent } from "./schema.js";
 import type { UsageEvent } from "./types.js";
+// `evt` is a wire-supplied signed event whose declared shape is unverified
+// until this function verifies it, so its fields are rendered through the
+// untrusted-diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 export const AGENT_USAGE_EVENT_TYPE: AgentContractEventType =
   "agent_usage_event";
@@ -125,7 +129,7 @@ export function verifyUsageEvent(
 ): { event: UsageEvent; signed_event: SignedEvent<UsageEvent> } {
   if (evt.event_type !== AGENT_USAGE_EVENT_TYPE) {
     throw new UsageEventSchemaError(
-      `expected event_type "${AGENT_USAGE_EVENT_TYPE}"; got "${evt.event_type}"`
+      `expected event_type "${AGENT_USAGE_EVENT_TYPE}"; got "${describeUntrusted(evt.event_type)}"`
     );
   }
   const verifyResult = verifySignedEvent(evt as SignedEvent, ctx);

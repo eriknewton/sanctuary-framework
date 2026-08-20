@@ -83,11 +83,13 @@ import {
   CeremonyNotConfirmedError,
 } from "./errors.js";
 import {
+  parseMasterRotationBundleEnvelope,
   unwrapMasterRotationBundle,
   wrapMasterRotationBundle,
   type MasterRotationBundleEnvelope,
   type MasterRotationBundlePlaintext,
 } from "./secret-bundle.js";
+import { SecretBundleError } from "./errors.js";
 import type {
   MasterRotationProposal,
   MasterRotationResult,
@@ -628,7 +630,20 @@ export class MasterRotationReceiver {
     if (parsed.kind !== RECOVERY_UNICAST_KINDS.MASTER_ROTATION_BUNDLE) {
       return false;
     }
-    const envelope = parsed as unknown as MasterRotationBundleEnvelope;
+    // Element-level parse, not a cast: `parsed` is arbitrary attacker-chosen
+    // JSON, and its fields are consumed in comparisons and AAD construction
+    // before anything is authenticated. Both sides of that boundary consume
+    // THIS one schema, so the typed result is the agreement (AGENTS.md rule 11)
+    // rather than two validators that can drift. This bounds THIS envelope's
+    // fields only; it is not a claim that the recovery path's untrusted input
+    // is generally safe to dereference.
+    const envelopeParse = parseMasterRotationBundleEnvelope(parsed);
+    if (!envelopeParse.ok) {
+      throw new SecretBundleError(
+        `master_rotation_bundle envelope is malformed (${envelopeParse.reason})`
+      );
+    }
+    const envelope = envelopeParse.envelope;
     const plaintext = unwrapMasterRotationBundle({
       envelope,
       old_fortress_master_secret: this.opts.old_fortress_master_secret(),

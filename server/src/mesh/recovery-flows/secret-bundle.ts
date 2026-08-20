@@ -34,6 +34,10 @@ import type {
   PrincipalCertificate,
 } from "../types.js";
 import { SecretBundleError } from "./errors.js";
+// the bundle plaintext is `JSON.parse`d after decryption, so its fields are
+// peer-supplied; diagnostics go through the untrusted-diagnostic chokepoint
+// (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../../errors/index.js";
 
 /** Plaintext bundle payload, pre-wrap. */
 export interface MasterRotationBundlePlaintext {
@@ -62,6 +66,103 @@ export interface MasterRotationBundleEnvelope {
   rotated_at: string;
   /** Base64url-encoded NEW master pubkey (unencrypted for receiver routing). */
   new_master_pubkey: string;
+}
+
+/** Why a wire envelope was refused. Closed set; each names one field. */
+export type MasterRotationBundleEnvelopeParseFailure =
+  | "envelope_not_object"
+  | "kind_invalid"
+  | "target_node_id_not_string"
+  | "fortress_id_not_string"
+  | "rotated_at_not_string"
+  | "new_master_pubkey_not_string"
+  | "ciphertext_not_object"
+  | "ciphertext_field_invalid"
+  // Reading a field threw: an exotic object (a Proxy, a throwing accessor).
+  // Not reachable from `JSON.parse` output, but this function is exported and
+  // a parse that can throw fails open at the very boundary it defines.
+  | "envelope_unreadable";
+
+export type MasterRotationBundleEnvelopeParseResult =
+  | { ok: true; envelope: MasterRotationBundleEnvelope }
+  | { ok: false; reason: MasterRotationBundleEnvelopeParseFailure };
+
+/**
+ * THE element-level parse for a wire master-rotation bundle envelope, and the
+ * only agreement between the unicast receiver and this unwrapper (AGENTS.md
+ * rule 11: one shared schema whose typed result IS the contract, never two
+ * hand-mirrored validators that can drift).
+ *
+ * WHY THIS IS A PARSE AND NOT A CAST: the envelope arrives as arbitrary JSON
+ * off the unicast path, so `MasterRotationBundleEnvelope` is an assertion about
+ * bytes an attacker chose. Its fields are consumed in COMPARISONS and in AAD
+ * CONSTRUCTION before anything is authenticated, and both coerce with String().
+ * A deeply nested value there overflows the stack inside the comparison itself,
+ * so the receiver fails with an unrelated RangeError instead of the typed
+ * cross-operator-isolation refusal it correctly reached (defect
+ * STATE-STORE-ERRMSG-INTERP-01, wire variant). Bounding the MESSAGE is not
+ * enough when the value is consumed before the message is built; the shape has
+ * to be established first.
+ *
+ * SCOPE, stated so a later reader does not over-trust this: the result is a
+ * validated view of the ORIGINAL object, not a copied snapshot, and callers
+ * still re-read fields off it. A stateful accessor can therefore satisfy this
+ * parse and return something else on a later read. Closing that, and the
+ * matching gaps on the decrypted plaintext and on the bootstrap-token path, is
+ * separate tracked work; this function does not claim to have closed it.
+ */
+export function parseMasterRotationBundleEnvelope(
+  value: unknown
+): MasterRotationBundleEnvelopeParseResult {
+  try {
+    return parseEnvelopeFields(value);
+  } catch {
+    return { ok: false, reason: "envelope_unreadable" };
+  }
+}
+
+function parseEnvelopeFields(
+  value: unknown
+): MasterRotationBundleEnvelopeParseResult {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return { ok: false, reason: "envelope_not_object" };
+  }
+  const raw = value as Record<string, unknown>;
+  if (raw.kind !== "master_rotation_bundle") {
+    return { ok: false, reason: "kind_invalid" };
+  }
+  if (typeof raw.target_node_id !== "string") {
+    return { ok: false, reason: "target_node_id_not_string" };
+  }
+  if (typeof raw.fortress_id !== "string") {
+    return { ok: false, reason: "fortress_id_not_string" };
+  }
+  if (typeof raw.rotated_at !== "string") {
+    return { ok: false, reason: "rotated_at_not_string" };
+  }
+  if (typeof raw.new_master_pubkey !== "string") {
+    return { ok: false, reason: "new_master_pubkey_not_string" };
+  }
+  const ciphertext = raw.ciphertext;
+  if (ciphertext === null || typeof ciphertext !== "object" || Array.isArray(ciphertext)) {
+    return { ok: false, reason: "ciphertext_not_object" };
+  }
+  const payload = ciphertext as Record<string, unknown>;
+  // Exactly the fields `decrypt` consumes: it compares `v`/`alg` and
+  // base64url-decodes `iv`/`ct`, and a non-string there is a raw TypeError one
+  // frame later. `ts` is documented envelope metadata that no security decision
+  // reads, so requiring it here would reject valid bundles for no gain - the
+  // check must match what the consumer actually touches (must stay in step with
+  // `EncryptedPayload` and `decrypt` in `core/encryption.ts`).
+  if (
+    typeof payload.v !== "number" ||
+    typeof payload.alg !== "string" ||
+    typeof payload.iv !== "string" ||
+    typeof payload.ct !== "string"
+  ) {
+    return { ok: false, reason: "ciphertext_field_invalid" };
+  }
+  return { ok: true, envelope: raw as unknown as MasterRotationBundleEnvelope };
 }
 
 /**
@@ -150,14 +251,26 @@ export function unwrapMasterRotationBundle(params: {
   this_node_mode: NodeMode;
   this_fortress_id: string;
 }): MasterRotationBundlePlaintext {
-  if (params.envelope.target_node_id !== params.this_node_id) {
+  // Establish the SHAPE before any field is compared or folded into the AAD.
+  // This function is exported and reachable directly, so it re-parses rather
+  // than trusting that its caller did: the parse is O(1) field checks, and a
+  // caller that casts instead is the shape this exists to prevent.
+  const parsed = parseMasterRotationBundleEnvelope(params.envelope);
+  if (!parsed.ok) {
     throw new SecretBundleError(
-      `master_rotation_bundle target_node_id=${params.envelope.target_node_id} does not match this node ${params.this_node_id}`
+      `master_rotation_bundle envelope is malformed (${parsed.reason})`
     );
   }
-  if (params.envelope.fortress_id !== params.this_fortress_id) {
+  const envelope = parsed.envelope;
+
+  if (envelope.target_node_id !== params.this_node_id) {
     throw new SecretBundleError(
-      `master_rotation_bundle fortress_id=${params.envelope.fortress_id} does not match this fortress ${params.this_fortress_id} (cross-operator isolation)`
+      `master_rotation_bundle target_node_id=${describeUntrusted(envelope.target_node_id)} does not match this node ${params.this_node_id}`
+    );
+  }
+  if (envelope.fortress_id !== params.this_fortress_id) {
+    throw new SecretBundleError(
+      `master_rotation_bundle fortress_id=${describeUntrusted(envelope.fortress_id)} does not match this fortress ${params.this_fortress_id} (cross-operator isolation)`
     );
   }
   const wrappingKey = deriveNodeTransportKey({
@@ -168,12 +281,12 @@ export function unwrapMasterRotationBundle(params: {
   const aad = bundleAad({
     target_node_id: params.this_node_id,
     fortress_id: params.this_fortress_id,
-    rotated_at: params.envelope.rotated_at,
-    new_master_pubkey: params.envelope.new_master_pubkey,
+    rotated_at: envelope.rotated_at,
+    new_master_pubkey: envelope.new_master_pubkey,
   });
   let plaintextBytes: Uint8Array;
   try {
-    plaintextBytes = decrypt(params.envelope.ciphertext, wrappingKey, aad);
+    plaintextBytes = decrypt(envelope.ciphertext, wrappingKey, aad);
   } catch (e) {
     throw new SecretBundleError(
       `master_rotation_bundle AES-GCM authentication failed: ${e instanceof Error ? e.message : String(e)}`
@@ -188,19 +301,29 @@ export function unwrapMasterRotationBundle(params: {
       `master_rotation_bundle plaintext is not valid JSON: ${e instanceof Error ? e.message : String(e)}`
     );
   }
-  if (plaintext.new_master_pubkey !== params.envelope.new_master_pubkey) {
+  if (plaintext.new_master_pubkey !== envelope.new_master_pubkey) {
     throw new SecretBundleError(
       `master_rotation_bundle plaintext new_master_pubkey does not match envelope`
     );
   }
-  if (plaintext.rotated_at !== params.envelope.rotated_at) {
+  if (plaintext.rotated_at !== envelope.rotated_at) {
     throw new SecretBundleError(
       `master_rotation_bundle plaintext rotated_at does not match envelope`
     );
   }
-  if (plaintext.re_issued_self_cert.node_id !== params.this_node_id) {
+  // The plaintext is AES-GCM authenticated, so its author held the key - but
+  // authenticity is not shape. Dereferencing an absent or non-object
+  // `re_issued_self_cert` here is a raw TypeError where a typed refusal
+  // belongs (AGENTS.md rule 11).
+  const selfCert = plaintext.re_issued_self_cert;
+  if (selfCert === null || typeof selfCert !== "object") {
     throw new SecretBundleError(
-      `master_rotation_bundle re_issued_self_cert.node_id=${plaintext.re_issued_self_cert.node_id} does not match this node ${params.this_node_id}`
+      `master_rotation_bundle plaintext re_issued_self_cert is malformed`
+    );
+  }
+  if (selfCert.node_id !== params.this_node_id) {
+    throw new SecretBundleError(
+      `master_rotation_bundle re_issued_self_cert.node_id=${describeUntrusted(selfCert.node_id)} does not match this node ${params.this_node_id}`
     );
   }
   return plaintext;

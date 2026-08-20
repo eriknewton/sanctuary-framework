@@ -25,6 +25,7 @@ import {
   MeshReservedCapabilityBitError,
 } from "../../src/mesh/errors.js";
 import {
+  verifyFederationRootRotationCertificate,
   deriveNodeAuditChainKey,
   deriveNodeTransportKey,
   generateFortressMaster,
@@ -614,5 +615,41 @@ describe("mesh/trust-root — HKDF per-node key derivation", () => {
       node_id: "node-abc",
     });
     expect(Buffer.from(original).equals(Buffer.from(recovered))).toBe(true);
+  });
+});
+
+/**
+ * Regression cover for STATE-STORE-ERRMSG-INTERP-01, `String()` variant.
+ *
+ * PROPERTY: a malformed `kind` on the wire changes WHAT this verifier reports,
+ * never WHETHER it reports. `String(x)` coerces exactly like a template literal
+ * does, so a scan that looks only for interpolations does not see this shape.
+ */
+describe("federation root rotation cert kind coercion", () => {
+  it("refuses a deeply nested kind with its own typed error", () => {
+    let nested: unknown = "x";
+    for (let index = 0; index < 200_000; index += 1) nested = [nested];
+    // Guard against a vacuous assertion: an undefined constructor would make
+    // `toThrow` match any error at all, including the RangeError being fixed.
+    expect(typeof MeshChainError).toBe("function");
+    expect(() =>
+      verifyFederationRootRotationCertificate(
+        { kind: nested } as never,
+        { fortress_id: "f", public_key: "p" } as never,
+      ),
+    ).toThrow(MeshChainError);
+  });
+
+  it("bounds the diagnostic for an enormous kind", () => {
+    try {
+      verifyFederationRootRotationCertificate(
+        { kind: "A".repeat(5_000_000) } as never,
+        { fortress_id: "f", public_key: "p" } as never,
+      );
+      throw new Error("expected a refusal");
+    } catch (err) {
+      expect(err).toBeInstanceOf(MeshChainError);
+      expect((err as Error).message.length).toBeLessThan(1_000);
+    }
   });
 });

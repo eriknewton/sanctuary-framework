@@ -19,6 +19,10 @@ import { sha256 } from "@noble/hashes/sha256";
 import { canonicalizeToBytes } from "./canonical-json.js";
 import { reject } from "./errors.js";
 import { validateBundlePath, validateId } from "./paths.js";
+// a descriptor entry comes from an untrusted bundle; `path` is type-checked
+// but unbounded in length, so diagnostics go through the untrusted-diagnostic
+// chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 export const BUNDLE_SCHEMA = "sanctuary.plugin.bundle/v1";
 export const SIGNATURE_FILENAME = "SIGNATURE.json";
@@ -153,15 +157,15 @@ export function validateDescriptorShape(raw: unknown): BundleDescriptor {
     if (e.path === SIGNATURE_FILENAME) {
       reject("bundle_signature_file_listed", "SIGNATURE.json must not be listed in files[] (non-cyclic rule)");
     }
-    if (seenPaths.has(e.path)) reject("descriptor_malformed", `duplicate file path "${e.path}" in descriptor`);
+    if (seenPaths.has(e.path)) reject("descriptor_malformed", `duplicate file path "${describeUntrusted(e.path)}" in descriptor`);
     seenPaths.add(e.path);
-    if (e.type !== "file") reject("bundle_non_regular_file", `file "${e.path}" type must be "file"`);
-    if (typeof e.mode_exec !== "boolean") reject("descriptor_malformed", `file "${e.path}" mode_exec must be boolean`);
+    if (e.type !== "file") reject("bundle_non_regular_file", `file "${describeUntrusted(e.path)}" type must be "file"`);
+    if (typeof e.mode_exec !== "boolean") reject("descriptor_malformed", `file "${describeUntrusted(e.path)}" mode_exec must be boolean`);
     if (typeof e.size !== "number" || !Number.isInteger(e.size) || e.size < 0) {
-      reject("descriptor_malformed", `file "${e.path}" size must be a non-negative integer`);
+      reject("descriptor_malformed", `file "${describeUntrusted(e.path)}" size must be a non-negative integer`);
     }
     if (typeof e.sha256 !== "string" || !HEX64.test(e.sha256)) {
-      reject("descriptor_malformed", `file "${e.path}" sha256 must be a 64-char hex string`);
+      reject("descriptor_malformed", `file "${describeUntrusted(e.path)}" sha256 must be a 64-char hex string`);
     }
     files.push({
       path: e.path,

@@ -39,6 +39,10 @@ import {
   type AuditCheckpointSignature,
   type AuditCheckpointSigningPayload,
 } from "./chain.js";
+// the resolved identity is `JSON.parse`d off disk, so `identity_id` is
+// attacker-influenced and goes through the untrusted-diagnostic chokepoint
+// (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 /**
  * Namespace holding master-key-encrypted `StoredIdentity` records.
@@ -367,7 +371,7 @@ export function createFortressCheckpointIdentityBinding(
         // fail-open this error type exists to prevent.
         throw new CheckpointSignerUnavailableError(
           "signing_failed",
-          `checkpoint signing failed for identity ${identity.identity_id}: ${
+          `checkpoint signing failed for identity ${describeUntrusted(identity.identity_id)}: ${
             err instanceof Error ? err.message : String(err)
           }`
         );

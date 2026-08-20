@@ -44,6 +44,10 @@ import type {
   SignedEvent,
 } from "../mesh/types.js";
 import { MeshSignatureError } from "../mesh/errors.js";
+// the envelope header is parsed from an untrusted policy blob, so its fields
+// carry no shape; diagnostics go through the untrusted-diagnostic chokepoint
+// (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 /** Parameters for packing a policy_update event. */
 export interface PackPolicyUpdateParams {
@@ -152,22 +156,22 @@ export function unpackPolicyUpdate(
 
   if (compiled.agent_id !== payload.agent_id) {
     throw new CompiledPolicyShapeError(
-      `header/blob agent_id mismatch: envelope says ${payload.agent_id}, blob says ${compiled.agent_id}`
+      `header/blob agent_id mismatch: envelope says ${describeUntrusted(payload.agent_id)}, blob says ${compiled.agent_id}`
     );
   }
   if (compiled.policy_version !== payload.policy_version) {
     throw new CompiledPolicyShapeError(
-      `header/blob policy_version mismatch: envelope says ${payload.policy_version}, blob says ${compiled.policy_version}`
+      `header/blob policy_version mismatch: envelope says ${describeUntrusted(payload.policy_version)}, blob says ${compiled.policy_version}`
     );
   }
   if (compiled.parent_version !== payload.parent_version) {
     throw new CompiledPolicyShapeError(
-      `header/blob parent_version mismatch: envelope says ${String(payload.parent_version)}, blob says ${String(compiled.parent_version)}`
+      `header/blob parent_version mismatch: envelope says ${describeUntrusted(payload.parent_version)}, blob says ${String(compiled.parent_version)}`
     );
   }
   if (compiled.fortress_id !== evt.fortress_id) {
     throw new CompiledPolicyShapeError(
-      `envelope/blob fortress_id mismatch: envelope says ${evt.fortress_id}, blob says ${compiled.fortress_id}`
+      `envelope/blob fortress_id mismatch: envelope says ${describeUntrusted(evt.fortress_id)}, blob says ${compiled.fortress_id}`
     );
   }
 
