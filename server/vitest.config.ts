@@ -36,10 +36,15 @@ export default defineConfig({
     // invocation refuses there: not because those flags are all unsafe, but
     // because deciding safety by parsing that string was tried twice and
     // produced a parser that rejected a healthy flag while admitting an unsafe
-    // one. Both exceptions change what a run EXECUTES relative to what
-    // `vitest list` REPORTS, which is the single assumption the detector rests
-    // on. Adopting either means updating scripts/gate2b-check.sh deliberately
-    // and re-verifying scripts/gate2b-self-test.sh.
+    // one. The two refusals do NOT mean the same thing, and conflating them is
+    // what would mislead the next reader: an overlapping project genuinely
+    // changes what a run EXECUTES relative to what `vitest list` REPORTS, which
+    // is the single assumption the detector rests on, while an unallowlisted
+    // invocation refuses only because its safety is UNVERIFIED. A reporter flag
+    // almost certainly changes nothing; it still refuses, because the allowlist
+    // records what someone checked rather than what someone assumed. Adopting
+    // either means updating scripts/gate2b-check.sh deliberately and
+    // re-verifying scripts/gate2b-self-test.sh.
     // History: a hand-restated `find server/test` once missed the second root
     // below and let up to 14 dropped files pass undetected (2026-08-19); the
     // fix that followed re-modeled this array by hand instead of asking
