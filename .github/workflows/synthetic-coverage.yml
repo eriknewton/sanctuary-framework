@@ -42,11 +42,20 @@ jobs:
         with:
           python-version: "3.12"
 
+      # CI-APT-RESILIENCE-01: both pip installs are routed through the
+      # shared retry-with-timeout.sh wrapper (same fix applied to every
+      # apt-get site after the 2026-08-19 hang incident, extended here to
+      # pip since an unbounded network install can hang the same way).
+      # This job's matrix includes macos-latest; the wrapper falls back to
+      # a portable bash timeout there instead of assuming GNU `timeout`.
       - name: Provision Concordia sidecar venv
+        timeout-minutes: 20
         run: |
           python3 -m venv sidecars/concordia/.venv
-          sidecars/concordia/.venv/bin/pip install --upgrade pip
-          sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
+          scripts/ci/retry-with-timeout.sh "pip upgrade (concordia venv)" -- \
+            sidecars/concordia/.venv/bin/pip install --upgrade pip
+          scripts/ci/retry-with-timeout.sh "pip install (concordia venv, hash-pinned)" -- \
+            sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
 
       - name: Run synthetic coverage
         run: npm run synthetic-coverage

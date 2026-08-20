@@ -3,23 +3,29 @@ description: Install libsecret tooling and start a headless Secret Service backe
 runs:
   using: composite
   steps:
+    # CI-APT-RESILIENCE-01: this used to be a bare `sudo apt-get update &&
+    # install` with no timeout and no retry. Measured 2026-08-19 across four
+    # separate PRs: a stalled package mirror hung this exact shape for
+    # 2.5h, 40+min, ~80min, and once until GitHub reaped the dead runners --
+    # the job never reached a test step. Routed through the shared
+    # apt-install-resilient composite action so every apt-get site in this
+    # repo bounds and retries the same way; see that action's install.sh
+    # for the timeout/retry derivation.
     - name: Install libsecret and pass-secret-service prerequisites
-      shell: bash
-      run: |
-        set -euo pipefail
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq \
-          dbus \
-          dbus-x11 \
-          gnupg \
-          pass \
-          libsecret-1-dev \
-          libsecret-tools \
-          python3-venv \
-          python3-dev \
-          libcairo2-dev \
-          libgirepository1.0-dev \
-          pkg-config \
+      uses: ./.github/actions/apt-install-resilient
+      with:
+        packages: >-
+          dbus
+          dbus-x11
+          gnupg
+          pass
+          libsecret-1-dev
+          libsecret-tools
+          python3-venv
+          python3-dev
+          libcairo2-dev
+          libgirepository1.0-dev
+          pkg-config
           gir1.2-glib-2.0
 
     # CSO-CICD-01: pygobject, cryptography, and pass-secret-service (plus
@@ -31,14 +37,23 @@ runs:
     # Concordia sidecar step also runs a bare `pip install --upgrade pip`);
     # pip-tools treats pip/setuptools/wheel as bootstrap tooling it will not
     # pin by default (`--allow-unsafe` opts in, and this repo does not).
+    # No `timeout-minutes` here: a composite action's steps cannot carry it,
+    # and GitHub rejects the ENTIRE action file rather than ignoring the field
+    # (proven on PR #1282: three jobs died in under 10 seconds with a
+    # TemplateValidationException). The bound lives in retry-with-timeout.sh's
+    # own accounting; a caller wanting a backstop sets timeout-minutes on its
+    # own `uses:` step, which a workflow job does support.
     - name: Install pass-secret-service
       shell: bash
       run: |
         set -euo pipefail
         python3 -m venv "$HOME/pss-venv"
-        "$HOME/pss-venv/bin/pip" install --quiet --upgrade pip wheel
-        "$HOME/pss-venv/bin/pip" install --quiet --require-hashes \
-          -r "$GITHUB_ACTION_PATH/requirements.txt"
+        RETRY="$GITHUB_WORKSPACE/scripts/ci/retry-with-timeout.sh"
+        "$RETRY" "pip upgrade (pss-venv)" -- \
+          "$HOME/pss-venv/bin/pip" install --quiet --upgrade pip wheel
+        "$RETRY" "pip install (pss-venv, hash-pinned)" -- \
+          "$HOME/pss-venv/bin/pip" install --quiet --require-hashes \
+            -r "$GITHUB_ACTION_PATH/requirements.txt"
 
         SESSION_FILE="$(find "$HOME/pss-venv/lib" -path '*/pass_secret_service/interfaces/session.py' -print -quit)"
         if [ -z "$SESSION_FILE" ]; then
