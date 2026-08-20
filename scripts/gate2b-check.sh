@@ -22,6 +22,19 @@ set -euo pipefail
 # it now asks vitest for the list directly instead of modeling it, so there
 # is nothing left in either file to keep in sync with vitest.config.ts.
 #
+# SCOPE (narrowed round 3): expected_files (a fresh `vitest list --filesOnly`
+# call) and actual_total (parsed from the vitest-output log below) are proven
+# equal ONLY for a FULL, UNSHARDED, UNFILTERED `vitest run` over a
+# NON-OVERLAPPING project set - see count-vitest-test-files.mjs's header for
+# the full account and its own refusals (overlapping projects, an
+# unrecognized argument to the discovery call, an unverified vitest version).
+# This script's own piece of that bound is the "REAL RUN INVOCATION" check
+# below: it verifies server/package.json's `test` script is still the exact
+# invocation this equivalence was verified against, rather than trying to
+# infer a shard/filter from the vitest-output log's text (vitest's own
+# summary line does not reliably say whether it was sharded or filtered -
+# confirmed empirically while writing this check, not assumed).
+#
 # Usage: scripts/gate2b-check.sh <vitest-output-log>
 
 usage() {
@@ -75,6 +88,32 @@ if [[ ! -f "$COUNT_SCRIPT" ]]; then
   exit 1
 fi
 
+# REAL RUN INVOCATION check (round 3, item 2): the expected/actual
+# equivalence this gate enforces assumes actual_total (below) comes from a
+# full, unsharded, unfiltered `vitest run` - see the SCOPE note above. This
+# repo controls that invocation entirely through package.json's "test"
+# script (CI's Gate 2 step runs exactly `npm test`, no extra arguments), so
+# verify that script is still the exact known-safe shape this equivalence
+# was verified against, rather than trying to infer sharding or filtering
+# from vitest's own text summary - empirically, a real `vitest run --shard`
+# does not print anything in its summary line that names sharding, so text
+# inference would be unreliable even if attempted.
+PACKAGE_JSON="$REPO_ROOT/server/package.json"
+if [[ ! -f "$PACKAGE_JSON" ]]; then
+  echo "::error::server/package.json not found at $PACKAGE_JSON" >&2
+  exit 1
+fi
+EXPECTED_TEST_SCRIPT="vitest run"
+actual_test_script=$(node -e '
+  const fs = require("fs");
+  const pkg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  process.stdout.write(typeof pkg.scripts?.test === "string" ? pkg.scripts.test : "");
+' "$PACKAGE_JSON")
+if [[ "$actual_test_script" != "$EXPECTED_TEST_SCRIPT" ]]; then
+  echo "::error::server/package.json's \"test\" script is '$actual_test_script', not the expected '$EXPECTED_TEST_SCRIPT'. This gate's expected/actual equivalence (see the SCOPE note above) is proven only for a full, unsharded, unfiltered vitest run. If you've added --shard, a project filter, or a file filter to the test script, this check needs a deliberate update - and re-verification via scripts/gate2b-self-test.sh - before it can be trusted against the new invocation." >&2
+  exit 1
+fi
+
 expected_files=$(node "$COUNT_SCRIPT")
 if ! [[ "$expected_files" =~ ^[0-9]+$ ]]; then
   echo "::error::count-vitest-test-files.mjs did not print an integer: '$expected_files'" >&2
@@ -111,14 +150,18 @@ echo "Files vitest loaded for the run:    $actual_total"
 # legitimately undercount a runtime edge case. That reasoning no longer
 # applies: expected_files now comes from `vitest list --filesOnly`, which
 # calls vitest's OWN `getRelevantTestSpecifications` - the exact same method
-# a real `vitest run` uses to decide what to run. Both numbers describe the
+# a real `vitest run` uses to decide what to run. For a full, unsharded,
+# unfiltered run over a non-overlapping project set (the SCOPE this gate
+# enforces above, and the only shape this repo's package.json "test" script
+# and vitest.config.ts currently produce), both numbers describe the
 # identical set by construction, computed by vitest itself against the same
-# checkout in the same CI job. There is no known legitimate case where they
-# differ in EITHER direction: a shortfall is a drop (the class this gate
-# exists to catch); a surplus would mean vitest ran a file its own discovery
-# call didn't report, which is not a "less bad" story than a drop - it means
-# the two vitest invocations disagreed with themselves, and that is exactly
-# as untrustworthy. Do not reintroduce a `<`-only comparison or a tolerated
+# checkout in the same CI job. Within that scope there is no known
+# legitimate case where they differ in EITHER direction: a shortfall is a
+# drop (the class this gate exists to catch); a surplus would mean vitest
+# ran a file its own discovery call didn't report, which is not a "less bad"
+# story than a drop - it means the two vitest invocations disagreed with
+# themselves, and that is exactly as untrustworthy. Do not reintroduce a
+# `<`-only comparison or a tolerated
 # surplus without first identifying a concrete, named case that makes them
 # differ (see the review note against the original inequality version of
 # this gate for why "a future vitest version might report a skipped file

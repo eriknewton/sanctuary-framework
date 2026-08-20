@@ -4,8 +4,8 @@ set -euo pipefail
 # Self-test for scripts/gate2b-check.sh, which .githooks/pre-commit now
 # calls directly instead of keeping its own copy of this logic.
 #
-# Four cases against throwaway fixtures whose vitest.config.ts has the same
-# two-root include shape as server/vitest.config.ts:
+# WHAT THIS PROVES, PRECISELY (narrowed round 3 - do not read this as a
+# general "the gate handles every vitest config shape" proof):
 #
 #   1. No drop: the fixed check passes.
 #   2. Planted drop (fabricated actual_total): the fixed check FAILS, and
@@ -17,15 +17,35 @@ set -euo pipefail
 #      tolerated informational note - proves equality is enforced.
 #   4. A REAL `vitest run` plus a REAL `test.exclude` entry: proves the
 #      counter's discovery side (not just the comparison logic) matches
-#      vitest's own behavior on a config surface a hand-rolled glob would
-#      miss, and reproduces the ROUND-2 formula (test.include globbed by
-#      hand, no test.exclude support - the fix that preceded asking vitest
-#      directly) FALSE-FAILING that same healthy run.
+#      vitest's own behavior on test.exclude specifically - the one config
+#      surface this case actually varies - and reproduces the ROUND-2
+#      formula (test.include globbed by hand, no test.exclude support)
+#      FALSE-FAILING that same healthy run. It does NOT drive `dot`, a
+#      filter, a shard, or an overlapping project through a real run; those
+#      are out of scope by count-vitest-test-files.mjs's own SCOPE note, and
+#      case 6 below proves the overlapping-project case refuses rather than
+#      silently mismatching, which is the claim actually made for it.
+#   5. Direct invocation through an EXPLICIT fixture symlink: a
+#      cross-platform regression proof for the resolve()-vs-realpath() fix
+#      in count-vitest-test-files.mjs. An earlier version of this case
+#      relied on invoking the script from a plain mktemp path and happened
+#      to only exercise the bug on macOS, because mktemp there traverses an
+#      ambient /tmp -> /private/tmp (or /var -> /private/var) symlink that
+#      Linux's mktemp does not have - so the SAME reverted bug would have
+#      passed silently on Linux CI. Creating the symlink explicitly inside
+#      the fixture reproduces the bug's exact trigger condition on every OS.
+#   6. Overlapping vitest projects (a real two-project config sharing one
+#      file): proves the round-3 refusal fires with the named bound,
+#      instead of the confusing raw "duplicate" error a naive dedup-reject
+#      would have produced, and instead of silently counting the shared
+#      file once (undercounting relative to a real run, which counts it
+#      once per project - verified separately while building this case).
 #
 # Cases 1-3 fabricate actual_total to test the comparison logic in
-# isolation and deterministically; case 4 drives both sides from vitest
-# itself so the discovery side is proven against real vitest behavior, not
-# just modeled. Mirrors the fixture-and-assert shape of
+# isolation and deterministically; cases 4 and 6 drive real vitest
+# invocations so the discovery side is proven against real vitest behavior
+# on the ONE config surface each varies, not modeled or assumed to
+# generalize. Mirrors the fixture-and-assert shape of
 # scripts/verify-fail-before-self-test.sh.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -83,7 +103,11 @@ build_fixture() {
   # "type": "module" mirrors server/package.json - without it, Vite's config
   # loader treats the .ts config as CommonJS and emits an unrelated migration
   # warning on stderr that has nothing to do with what this self-test proves.
-  write_file "$root" "server/package.json" '{"type": "module"}
+  # scripts.test MUST be exactly "vitest run": gate2b-check.sh's REAL RUN
+  # INVOCATION check (round 3) refuses when it isn't, so every fixture that
+  # drives gate2b-check.sh needs this or it fails at that check instead of
+  # exercising what the case actually means to prove.
+  write_file "$root" "server/package.json" '{"type": "module", "scripts": {"test": "vitest run"}}
 '
   write_file "$root" "server/vitest.config.ts" 'export default {
   test: {
@@ -144,12 +168,15 @@ make_vitest_log() {
 # Builds a fixture with REAL, runnable test files (vitest's own `it`/`expect`
 # globals, no imports needed) and a REAL test.exclude entry, so Case 4 can
 # drive gate2b-check.sh from an ACTUAL `vitest run` + `vitest list
-# --filesOnly` invocation rather than a fabricated summary line. This is the
-# fixture shape that answers the "exclude/dot/project divergence is outside
-# this self-test's proof" gap: fixtures 1-3 test the COMPARISON logic against
-# a controlled, fabricated actual_total; this one tests that the DISCOVERY
-# side (count-vitest-test-files.mjs) agrees with vitest's real behavior when
-# a config surface round 2's hand-rolled glob never modeled is in play.
+# --filesOnly` invocation rather than a fabricated summary line. Precisely:
+# this proves the DISCOVERY side (count-vitest-test-files.mjs) agrees with
+# vitest's real behavior on test.exclude specifically, the one config
+# surface round 2's hand-rolled glob never modeled and this fixture varies.
+# It does not exercise `dot`, a workspace/projects config, a filter, or a
+# shard - those are named out of scope in count-vitest-test-files.mjs's own
+# SCOPE note, and the overlapping-project shape is proven separately by
+# build_overlapping_projects_fixture / case 6 below (a refusal, not an
+# equivalence).
 build_real_vitest_fixture() {
   local root="$1"
   local server_test_count="$2"   # files under server/test
@@ -163,7 +190,9 @@ build_real_vitest_fixture() {
   cp "$REPO_ROOT/server/scripts/count-vitest-test-files.mjs" "$root/server/scripts/count-vitest-test-files.mjs"
   ln -s "$REPO_ROOT/server/node_modules" "$root/server/node_modules"
 
-  write_file "$root" "server/package.json" '{"type": "module"}
+  # scripts.test MUST be exactly "vitest run": see build_fixture's identical
+  # note above.
+  write_file "$root" "server/package.json" '{"type": "module", "scripts": {"test": "vitest run"}}
 '
   write_file "$root" "server/vitest.config.ts" "import { defineConfig } from \"vitest/config\";
 
@@ -185,6 +214,43 @@ export default defineConfig({
     write_file "$root" "scripts/synthetic-coverage/test/fixture-$i.test.ts" "it('real synthetic fixture $i', () => { expect(1 + 1).toBe(2); });
 "
   done
+}
+
+# Builds a fixture with a REAL vitest.config.ts `projects` array: two named
+# projects ("project-a", "project-b") that both `include` the SAME file.
+# Confirmed empirically (not assumed) while writing this case: `vitest list
+# --filesOnly --json` reports that file twice, once per project, each entry
+# carrying a distinct "projectName" - and a real `vitest run` against the
+# same config genuinely runs it twice too (its own "Test Files" total counts
+# it once per project). This is the exact shape count-vitest-test-files.mjs
+# now refuses on (see its overlap check) rather than silently deduplicating
+# to 1 (undercounting relative to a real run) or crashing on a confusing
+# "duplicate" error that doesn't name why.
+build_overlapping_projects_fixture() {
+  local root="$1"
+
+  mkdir -p "$root/scripts" "$root/server/scripts" "$root/server/test"
+
+  cp "$SCRIPT_DIR/gate2b-check.sh" "$root/scripts/gate2b-check.sh"
+  chmod +x "$root/scripts/gate2b-check.sh"
+  cp "$REPO_ROOT/server/scripts/count-vitest-test-files.mjs" "$root/server/scripts/count-vitest-test-files.mjs"
+  ln -s "$REPO_ROOT/server/node_modules" "$root/server/node_modules"
+
+  write_file "$root" "server/package.json" '{"type": "module", "scripts": {"test": "vitest run"}}
+'
+  write_file "$root" "server/vitest.config.ts" 'import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    projects: [
+      { test: { name: "project-a", root: ".", include: ["test/shared.test.ts"] } },
+      { test: { name: "project-b", root: ".", include: ["test/shared.test.ts"] } },
+    ],
+  },
+});
+'
+  write_file "$root" "server/test/shared.test.ts" "it('shared', () => { expect(1 + 1).toBe(2); });
+"
 }
 
 run_case() {
@@ -334,6 +400,68 @@ if (( 6 < round2_expected )); then
 else
   fail "expected round 2's reproduction (7) to exceed the real actual_total (6) - if it doesn't, this case no longer demonstrates the false-failure direction and needs to be revisited"
 fi
+
+
+# ── Case 5: direct invocation through an EXPLICIT fixture symlink ────
+#
+# Regression proof for count-vitest-test-files.mjs's `invokedDirectly` check
+# (compares realpathSync(process.argv[1]) against realpathSync(the script's
+# own import.meta.url)). A resolve()-only version of that check silently
+# no-ops (exit 0, empty stdout) whenever the invocation path crosses a
+# symlink Node has already resolved away when building import.meta.url.
+# Relying on an ambient OS symlink to trigger that condition (an earlier
+# version of this case did, via a plain mktemp path on macOS's /tmp ->
+# /private/tmp or /var -> /private/var) makes the regression check
+# PLATFORM-DEPENDENT: Linux's mktemp typically has no such symlink in the
+# path, so the same reverted bug would pass silently there. Creating the
+# symlink explicitly inside the fixture reproduces the exact trigger
+# condition on every OS, deterministically.
+run_case "direct invocation through an explicit fixture symlink: main() actually runs (cross-platform regression proof)"
+FIXTURE_5="$(mktemp -d)"
+CLEANUP_DIRS+=("$FIXTURE_5")
+build_fixture "$FIXTURE_5" 3 2
+ln -s "$FIXTURE_5/server/scripts/count-vitest-test-files.mjs" "$FIXTURE_5/count-entry-symlink.mjs"
+
+set +e
+direct_invocation_output=$(node "$FIXTURE_5/count-entry-symlink.mjs" 2>&1)
+direct_invocation_status=$?
+set -e
+[[ "$direct_invocation_status" == "0" ]] || fail "expected direct invocation through a symlink to exit 0, got $direct_invocation_status:
+$direct_invocation_output"
+[[ "$direct_invocation_output" =~ ^[0-9]+$ ]] || fail "expected direct invocation through a symlink to print an integer, proving main() actually ran rather than silently no-op'ing on the resolve()-vs-realpath() bug - got: '$direct_invocation_output'"
+[[ "$direct_invocation_output" == "5" ]] || fail "expected 5 (3 + 2 fixture files), got $direct_invocation_output"
+echo "  ok: direct invocation through an explicit fixture symlink runs main() and reports 5 - proves the realpath fix independent of any host OS's ambient /tmp or /var symlink"
+
+# ── Case 6: overlapping vitest projects - refuse with the named bound ──
+run_case "overlapping vitest projects: the counter refuses with the named bound, not a crash or a silent miscount"
+FIXTURE_6="$(mktemp -d)"
+CLEANUP_DIRS+=("$FIXTURE_6")
+build_overlapping_projects_fixture "$FIXTURE_6"
+
+set +e
+overlap_count_output=$(node "$FIXTURE_6/server/scripts/count-vitest-test-files.mjs" "$FIXTURE_6/server" 2>&1)
+overlap_count_status=$?
+set -e
+[[ "$overlap_count_status" == "1" ]] || fail "expected the counter to refuse (exit 1) on overlapping projects, got $overlap_count_status:
+$overlap_count_output"
+echo "$overlap_count_output" | grep -q 'more than one vitest project' \
+  || fail "expected the overlap refusal to name the bound ('more than one vitest project'), got:
+$overlap_count_output"
+
+# Also drive it through gate2b-check.sh (what CI and the hook actually call)
+# to prove the refusal surfaces end-to-end, not only at the count script's
+# own CLI.
+printf ' Test Files  2 passed (2)\n Tests  2 passed (2)\n' > "$FIXTURE_6/vitest-output.log"
+set +e
+gate2b_overlap_output=$(bash "$FIXTURE_6/scripts/gate2b-check.sh" "$FIXTURE_6/vitest-output.log" 2>&1)
+gate2b_overlap_status=$?
+set -e
+[[ "$gate2b_overlap_status" == "1" ]] || fail "expected gate2b-check.sh to refuse (exit 1) on overlapping projects, got $gate2b_overlap_status:
+$gate2b_overlap_output"
+echo "$gate2b_overlap_output" | grep -q 'more than one vitest project' \
+  || fail "expected gate2b-check.sh's output to carry the overlap refusal, got:
+$gate2b_overlap_output"
+echo "  ok: overlapping projects refuse (both at the counter directly and end-to-end through gate2b-check.sh), not a confusing duplicate crash and not a silent undercount"
 
 echo ""
 echo "PASS: gate2b-check.sh self-test"
