@@ -1369,6 +1369,11 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runAuditStoreStatus(args.slice(1));
   }
 
+  if (command === "manifest-preflight") {
+    const { runManifestPreflight } = await import("./cli/castle-wall-manifest-preflight.js");
+    return runManifestPreflight(args.slice(1));
+  }
+
   if (command === "approve") {
     const { runApprove } = await import("./cli/castle-wall.js");
     return runApprove(args.slice(1));
@@ -1592,6 +1597,9 @@ function printCastleWallHelp(): void {
     audit-store-status Report BOTH the operator and root-daemon audit chain verdicts (F2 Option A
                      writer-split), each honestly and separately; a daemon chain that exists but
                      is unreadable at this privilege reports as such, never as "verified". Read-only.
+    manifest-preflight Read the persisted signed egress manifest and every validated referenced
+                     rule body, reporting compatibility findings without changing policy. Read-only.
+                     --fortress <path>  Target a specific fortress.
     approve          Approve a pending Castle Wall request.
     configure-origin Configure the agent-origin descriptor for origin-differential enforcement.
     re-pin           Migrate the trust anchor to the root signer helper's key (one-time, operator-approved).
