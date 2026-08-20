@@ -1,3 +1,4 @@
+// fail-before-exempt: the two rule-id filename tests here are REGRESSION PINS, not proof of a fix. A round of this PR converted the filename mapping to the bounded diagnostic renderer, which collapsed two long ids sharing a prefix onto one file; that change was reverted in the same PR, so the branch's filename behaviour now equals main's and these tests correctly pass against both. They exist so the conversion cannot come back.
 /**
  * Castle Wall manifest publisher tests.
  *
