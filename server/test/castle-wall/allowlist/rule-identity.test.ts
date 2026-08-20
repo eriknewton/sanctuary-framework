@@ -1,11 +1,35 @@
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import {
   classifyManifestRuleFilename,
   encodeRuleFilename,
   parseRuleId,
   preflightManifestRuleEntries,
 } from "../../../src/castle-wall/allowlist/rule-identity.js";
+import { CURATED_ALLOWLIST } from "../../../src/castle-wall/runtime/curated-allowlist.js";
+import { DERIVED_DNS_RULE_ID } from "../../../src/castle-wall/allowlist/dns-derivation.js";
+import { DERIVED_GATE_RULE_ID } from "../../../src/castle-wall/allowlist/gate-derivation.js";
+import {
+  HABEAS_LOCAL_RULE_ID,
+  HABEAS_WEBHOOK_RULE_ID,
+} from "../../../src/castle-wall/allowlist/habeas-port.js";
+import { OBSERVE_PROMOTED_RULE_ID_PREFIX } from "../../../src/castle-wall/constants.js";
+import { provisionedRuleId } from "../../../src/castle-wall/provision/egress.js";
+
+function fixtureRuleIds(value: unknown): string[] {
+  if (Array.isArray(value)) return value.flatMap(fixtureRuleIds);
+  if (value === null || typeof value !== "object") return [];
+  const record = value as Record<string, unknown>;
+  const ownId =
+    typeof record.id === "string" &&
+    "schema_version" in record &&
+    "match" in record &&
+    "scope" in record &&
+    "disposition" in record
+      ? [record.id]
+      : [];
+  return ownId.concat(...Object.values(record).flatMap(fixtureRuleIds));
+}
 
 describe("castle-wall/allowlist/rule-identity", () => {
   it("matches the shared Rust and Swift contract vectors exactly", () => {
@@ -56,5 +80,36 @@ describe("castle-wall/allowlist/rule-identity", () => {
     expect(issues).toHaveLength(4);
     expect(issues.join("\n")).toContain("duplicate rule id");
     expect(issues.join("\n")).toContain("duplicate rule filename");
+  });
+
+  it("records the curated, derived, reserved, fixture, and cross-language id inventory", () => {
+    const crossLanguageFixture = JSON.parse(
+      readFileSync("../castle-wall-daemon/test-vectors/rule-id-filename-v1.json", "utf8"),
+    ) as { valid: Array<{ id: string }> };
+    const fixtureIds = readdirSync("test/castle-wall/fixtures")
+      .filter((name) => name.endsWith(".json"))
+      .flatMap((name) => fixtureRuleIds(JSON.parse(readFileSync(`test/castle-wall/fixtures/${name}`, "utf8"))));
+    const inventory = {
+      curated: CURATED_ALLOWLIST.map((entry) => entry.rule_id),
+      derived: [
+        DERIVED_DNS_RULE_ID,
+        DERIVED_GATE_RULE_ID,
+        `${OBSERVE_PROMOTED_RULE_ID_PREFIX}0123456789abcdef`,
+        provisionedRuleId("claude-code", {
+          name: "inventory endpoint",
+          host: "api.example.com",
+          port: 443,
+          protocol: "tcp",
+          riskClass: "standard",
+        }),
+      ],
+      reserved: [HABEAS_LOCAL_RULE_ID, HABEAS_WEBHOOK_RULE_ID],
+      fixtures: fixtureIds,
+      cross_language_vectors: crossLanguageFixture.valid.map((entry) => entry.id),
+    };
+
+    for (const ids of Object.values(inventory)) {
+      for (const id of ids) expect(parseRuleId(id).ok).toBe(true);
+    }
   });
 });
