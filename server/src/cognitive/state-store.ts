@@ -41,6 +41,12 @@ import type { EncryptedPayload as EncPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import type { StoredIdentity } from "../core/identity.js";
 import { verifyRotationChain } from "../core/rotation-chain.js";
+// Every field of a persisted entry is attacker-influenced: `JSON.parse` gives
+// back whatever is on disk, so `StateEntry` is an assertion, not a guarantee.
+// Diagnostics built from those fields go through this chokepoint, never a bare
+// template interpolation (STATE-STORE-ERRMSG-INTERP-01); see the invariant in
+// `errors/untrusted-diagnostic.ts`.
+import { describeUntrusted } from "../errors/index.js";
 import {
   mintProvenanceStamp,
   serializeStamp,
@@ -1421,6 +1427,15 @@ export class StateStore {
   private async resolveWriterPublicKeys(
     kid: string
   ): Promise<ResolvedWriterPublicKey[]> {
+    // `kid` reaches here off disk, so the `string` annotation is an assertion,
+    // not a guarantee. It is about to be used as a storage key and as a record
+    // index, and BOTH coerce it with String(): a deeply nested stored value
+    // overflows the stack there, replacing the real "writer key not found"
+    // diagnosis with an unrelated RangeError. A non-string kid can never name a
+    // resident identity, so refusing it here IS the correct answer, and the
+    // caller's typed `kid_unknown` refusal is then reached and reported
+    // (STATE-STORE-ERRMSG-INTERP-01).
+    if (typeof kid !== "string") return [];
     const keys: ResolvedWriterPublicKey[] = [];
     const seen = new Set<string>();
     const identity = await this.resolveStoredIdentity(kid);
@@ -1895,7 +1910,7 @@ export class StateStore {
     ) {
       throw new StateVerificationError(
         "schema_mismatch",
-        `Unsupported state envelope schema: ${entry.v}`
+        `Unsupported state envelope schema: ${describeUntrusted(entry.v)}`
       );
     }
 
@@ -1977,14 +1992,14 @@ export class StateStore {
     ) {
       throw new StateVerificationError(
         "schema_mismatch",
-        `Unsupported state envelope schema: ${entry.v}`
+        `Unsupported state envelope schema: ${describeUntrusted(entry.v)}`
       );
     }
 
     if (publicKeys.length === 0) {
       throw new StateVerificationError(
         "kid_unknown",
-        `Writer key not found for ${entry.kid}`
+        `Writer key not found for ${describeUntrusted(entry.kid)}`
       );
     }
 
@@ -2055,7 +2070,7 @@ export class StateStore {
           status: "verification_failed",
           error: new StateVerificationError(
             "kid_unknown",
-            `Writer key not found for ${entry.kid}`
+            `Writer key not found for ${describeUntrusted(entry.kid)}`
           ),
         };
       }
@@ -2181,7 +2196,7 @@ export class StateStore {
     ) {
       throw new StateVerificationError(
         "rollback_detected",
-        `Rollback detected for ${namespace}/${key}: found version ${stateEntry.ver}, expected at least ${cachedVersion}`
+        `Rollback detected for ${namespace}/${key}: found version ${describeUntrusted(stateEntry.ver)}, expected at least ${cachedVersion}`
       );
     }
 
@@ -2216,7 +2231,7 @@ export class StateStore {
       if (anchoredVersion > 0 && stateEntry.ver > anchoredVersion) {
         throw new StateVerificationError(
           "rollback_detected",
-          `Rollback detected for ${namespace}/${key}: a legacy (v1) entry at version ${stateEntry.ver} cannot exceed the established anchor ${anchoredVersion} (legitimate advances are written as signed-envelope schemas)`
+          `Rollback detected for ${namespace}/${key}: a legacy (v1) entry at version ${describeUntrusted(stateEntry.ver)} cannot exceed the established anchor ${anchoredVersion} (legitimate advances are written as signed-envelope schemas)`
         );
       }
     }
@@ -2270,7 +2285,7 @@ export class StateStore {
     if (computedHash !== stateEntry.integrity_hash) {
       throw new StateVerificationError(
         "integrity_hash_mismatch",
-        `Integrity hash mismatch for ${namespace}/${key}: computed ${computedHash}, stored ${stateEntry.integrity_hash}`
+        `Integrity hash mismatch for ${namespace}/${key}: computed ${computedHash}, stored ${describeUntrusted(stateEntry.integrity_hash)}`
       );
     }
 
@@ -2963,11 +2978,26 @@ export async function rotateStateEntryBytes(args: {
     );
   }
 
+  // `entry.kid` came straight out of `JSON.parse`, so the `StateEntry`
+  // annotation is an assertion. It is handed to a caller-supplied resolver that
+  // will use it as a lookup key, and String() coercion of a deeply nested value
+  // overflows the stack there. Refuse it with the typed rotation error the
+  // operator can act on, rather than letting a RangeError escape and read as an
+  // unrelated failure (STATE-STORE-ERRMSG-INTERP-01).
+  if (typeof entry.kid !== "string") {
+    throw new RotationStateEntryError(
+      `state entry ${namespace}/${key} has a malformed writer identity (kid): ` +
+        `${describeUntrusted(entry.kid)}. Rotation re-signs every state entry ` +
+        `with its writer's key and cannot identify one here. Restore the entry ` +
+        `from a good backup, or delete it, then retry.`
+    );
+  }
+
   try {
     const writer = await args.resolveWriter(entry.kid);
     if (!writer) {
       throw new RotationStateEntryError(
-        `state entry ${namespace}/${key} was written by identity "${entry.kid}", ` +
+        `state entry ${namespace}/${key} was written by identity "${describeUntrusted(entry.kid)}", ` +
           `which is not resident in this fortress. Rotation re-signs every state ` +
           `entry with its writer's key and cannot proceed without it. ` +
           `Re-import the identity, or delete the orphaned entry, then retry.`
@@ -2979,7 +3009,7 @@ export async function rotateStateEntryBytes(args: {
     );
     if (verificationPublicKeys.length === 0) {
       throw new RotationStateEntryError(
-        `state entry ${namespace}/${key} has no authenticated writer key chain for identity "${entry.kid}"; refusing to re-sign it`
+        `state entry ${namespace}/${key} has no authenticated writer key chain for identity "${describeUntrusted(entry.kid)}"; refusing to re-sign it`
       );
     }
 
@@ -3002,7 +3032,7 @@ export async function rotateStateEntryBytes(args: {
     } else {
       if (!entry.envelope || typeof entry.envelope_sig !== "string") {
         throw new RotationStateEntryError(
-          `state entry ${namespace}/${key} is schema ${entry.v} but is missing its signed envelope`
+          `state entry ${namespace}/${key} is schema ${describeUntrusted(entry.v)} but is missing its signed envelope`
         );
       }
       const expected = buildSignedEnvelope({

@@ -45,6 +45,10 @@ import {
   resolveActiveSessionIdentity,
   type SessionBinding,
 } from "../agent-native/safety-base.js";
+// a `StoredIdentity` is `JSON.parse`d off disk, so every field is attacker-
+// influenced and goes through the untrusted-diagnostic chokepoint (STATE-
+// STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 export const AUDIT_EVENT_SIGNING_DOMAIN = "sanctuary.audit.v1";
 export const INTERNAL_RECEIPT_SIGNING_DOMAIN = "sanctuary.receipt.v1";
@@ -489,7 +493,7 @@ export class IdentityManager {
       decoded = fromBase64url(identity.public_key);
     } catch {
       throw new Error(
-        `identity ${identity.identity_id} has a non-base64url public_key; ` +
+        `identity ${describeUntrusted(identity.identity_id)} has a non-base64url public_key; ` +
           "refusing to admit it into the identity set."
       );
     }
@@ -497,7 +501,7 @@ export class IdentityManager {
       assertEd25519PublicKey(decoded);
     } catch {
       throw new Error(
-        `identity ${identity.identity_id} has a public_key that does not ` +
+        `identity ${describeUntrusted(identity.identity_id)} has a public_key that does not ` +
           "decode to a well-formed Ed25519 key; refusing to admit it into " +
           "the identity set."
       );

@@ -158,6 +158,10 @@ import {
   openDirectoryCustodyWithinBase,
   verifyDirectoryCustodyWithinBase,
 } from "../storage/custody-fs.js";
+// these records are parsed out of `dscl` subprocess output, so their fields
+// are not established by any schema; diagnostics go through the untrusted-
+// diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -861,7 +865,7 @@ export function parseDsclSearchAccountNames(stdout: string, searchedUid: number)
     if (record.uid !== searchedUid) {
       throw new AccountUidEnumerationError(
         `Refusing to trust dscl . -search /Users UniqueID ${searchedUid}: record ` +
-          `${JSON.stringify(record.accountName)} reported UniqueID=${record.uid}, expected ${searchedUid}. ` +
+          `${JSON.stringify(record.accountName)} reported UniqueID=${describeUntrusted(record.uid)}, expected ${searchedUid}. ` +
           `Search output must prove the requested name-to-uid binding.`,
       );
     }

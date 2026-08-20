@@ -71,6 +71,10 @@ import {
   constantTimeEqual,
 } from "../core/encoding.js";
 import { verifyLedgerIntegrity, type Ledger } from "./ledger.js";
+// the generation anchor is read back from storage and JSON-parsed, so its
+// fields are attacker-influenced; diagnostics go through the untrusted-
+// diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 /** `_meta` key holding the master-MAC'd monotonic ledger-generation anchor. */
 export const LEDGER_GENERATION_ANCHOR_META_KEY =
@@ -202,7 +206,7 @@ export async function writeLedgerGenerationAnchor(
   if (current.status === "valid" && generation < current.data.generation) {
     throw new Error(
       "Sanctuary: refusing to lower the fleet license ledger generation anchor " +
-        `(${current.data.generation} -> ${generation}); a lower generation is a ` +
+        `(${describeUntrusted(current.data.generation)} -> ${generation}); a lower generation is a ` +
         "rollback-laundering write.",
     );
   }

@@ -131,6 +131,10 @@ import type {
   SyncResponsePayload,
 } from "./types.js";
 import type { MeshNodeState } from "./constants.js";
+// unicast payloads and envelopes arrive off the wire and are `JSON.parse`d, so
+// their fields are attacker-controlled; diagnostics go through the untrusted-
+// diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../../errors/index.js";
 
 /**
  * Bootstrap result for the very first node in a fortress (§3.7).
@@ -1051,7 +1055,7 @@ export class MeshNode {
     }
     const parsed = JSON.parse(message) as { kind: string; batch: import("../types.js").AuditBatch };
     if (parsed.kind !== "audit_batch") {
-      throw new MeshError(`ingestAuditBatch: unknown unicast kind ${parsed.kind}`);
+      throw new MeshError(`ingestAuditBatch: unknown unicast kind ${describeUntrusted(parsed.kind)}`);
     }
     const auditChainKey = deriveNodeAuditChainKey({
       fortress_master_secret: this.fortressMasterSecret,
@@ -1933,7 +1937,7 @@ export class MeshNode {
     if (last !== undefined && evt.monotonic_seq <= last) {
       throw new MeshRollbackDetectedError(
         evt.emitter_node,
-        `non-monotonic envelope monotonic_seq (got ${evt.monotonic_seq}, last seen ${last})`
+        `non-monotonic envelope monotonic_seq (got ${describeUntrusted(evt.monotonic_seq)}, last seen ${last})`
       );
     }
     this.lastReceivedMonotonicSeq.set(evt.emitter_node, evt.monotonic_seq);
@@ -2105,6 +2109,32 @@ export class MeshNode {
         ...(evt.emitter_node === governorKey
           ? {}
           : { claimed_emitter_node: evt.emitter_node }),
+        // SIGNED DIAGNOSTIC (invariant, and an obligation on whoever edits the
+        // refusal paths that feed it). This string is sealed into the entry
+        // below, so whatever it carries is signed and replicated. Four things
+        // are true about it, and the first two are narrower than they look:
+        //
+        //   BOUNDED ONLY WHERE IT WAS RENDERED. Fragments that reached this
+        //   message through `describeUntrusted` are length-clamped and
+        //   control-character escaped. That is a property of THOSE RENDERINGS,
+        //   never of this field: a message can arrive at a sealed field without
+        //   having passed through the chokepoint, and this comment makes no
+        //   claim about one that did not. A message added here goes through the
+        //   chokepoint, and an inherited fragment counts as unbounded until you
+        //   have followed it back to one. Do not read this comment as
+        //   permission to assume the field is already safe.
+        //
+        //   PARTIALLY RECOVERABLE, BY DESIGN. A value that exceeded the bound
+        //   is truncated and cannot be reconstructed from this field, and so is
+        //   one that was escaped or replaced by a placeholder. A short
+        //   primitive needing neither escaping nor substitution renders
+        //   byte-identically, so THAT case IS recoverable, deliberately -
+        //   converting a site must never change an honest diagnostic. The
+        //   signature attests what this node SAID about the refusal, never that
+        //   the peer's bytes are reproduced faithfully.
+        //
+        //   NEVER PARSED. No consumer may parse this field or branch on its
+        //   text; the machine-readable facts are the sibling fields above.
         reason: error.message,
       },
       node_private_key: this.nodePrivateKey,
@@ -2224,6 +2254,17 @@ export class MeshNode {
         event_type: "master_rotation",
         peer_node: params.emitter_node,
         rotated_at: params.rotated_at,
+        // SIGNED DIAGNOSTIC (invariant, same obligation as the revoke-denial
+        // entry above, and read that one for the full statement). Sealed into
+        // the entry below. Fragments rendered through `describeUntrusted` are
+        // bounded before they are sealed; that is a claim about those
+        // renderings and not about this field, since a message can reach it
+        // without having passed the chokepoint. A message added here goes
+        // through the chokepoint. A value that was truncated, escaped, or
+        // replaced by a placeholder is not recoverable from this field; a short
+        // primitive that needed none of those renders unchanged and therefore
+        // is. Nothing downstream may parse it or branch on its text, the
+        // sibling fields being the machine-readable facts.
         reason: params.error.message,
       },
       node_private_key: this.nodePrivateKey,
@@ -2382,6 +2423,18 @@ export class MeshNode {
         // for forensics only, never trusted as attribution and never used
         // to key the governor above — see the KEYING note on this method.
         claimed_emitter_node: evt.emitter_node,
+        // SIGNED DIAGNOSTIC (invariant, same obligation as the two denial
+        // entries above, and read the first for the full statement). Sealed
+        // into the entry below. Fragments rendered through `describeUntrusted`
+        // are bounded before they are sealed; that is a claim about those
+        // renderings and not about this field, since a message can reach it
+        // without having passed the chokepoint. A message added here goes
+        // through the chokepoint, and an inherited fragment counts as unbounded
+        // until followed back to one. A value that was truncated, escaped, or
+        // replaced by a placeholder is not recoverable from this field; a short
+        // primitive that needed none of those renders unchanged and therefore
+        // is. Nothing downstream may parse it or branch
+        // on its text, the sibling fields being the machine-readable facts.
         reason: error.message,
       },
       node_private_key: this.nodePrivateKey,

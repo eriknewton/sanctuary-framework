@@ -34,6 +34,10 @@ import { derivePurposeKey } from "../core/key-derivation.js";
 import { stringToBytes, bytesToString } from "../core/encoding.js";
 import type { AggregatorPayloadStore } from "./aggregator-store.js";
 import { APPROVAL_AGGREGATOR_AUDIT_OPS } from "./approval-aggregator-ops.js";
+// aggregator entries are rehydrated from the store by `JSON.parse`, so their
+// ids are attacker-influenced and go through the untrusted-diagnostic
+// chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 export { APPROVAL_AGGREGATOR_AUDIT_OPS } from "./approval-aggregator-ops.js";
 
@@ -1148,7 +1152,7 @@ export class ApprovalAggregator {
       } catch (restoreErr) {
         throw new Error(
           "approval-aggregator: resolution persist failed AND the rollback to " +
-            `pending failed for ${updated.aggregator_id}; the persisted entry may ` +
+            `pending failed for ${describeUntrusted(updated.aggregator_id)}; the persisted entry may ` +
             "be inconsistent (terminal on disk despite this failure) and must be " +
             "reconciled. original: " +
             (err instanceof Error ? err.message : String(err)) +

@@ -69,6 +69,10 @@ import {
   type ProvisionLockOps,
 } from "../castle-wall/provision/lockfile.js";
 import { hasGenerationHeadroom } from "./anchor-registry.js";
+// a staging record is read off disk and JSON-parsed, so its fields are
+// attacker-influenced; diagnostics go through the untrusted-diagnostic
+// chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 /** Default per-uid generation lock path prefix (an internal on-disk artifact). */
 export const GENERATION_LOCK_PATH_PREFIX = "/var/db/sanctuary/generation";
@@ -535,7 +539,7 @@ export function createFsGenerationStagingStore(
       // for must never drive that uid's recovery (cross-uid port/fortress mixup).
       if (record.agent_uid !== agentUid) {
         throw new GenerationStateError(
-          `staging record at ${path} carries agent_uid ${record.agent_uid} but was loaded for uid ${agentUid}; refusing to interpret it`,
+          `staging record at ${path} carries agent_uid ${describeUntrusted(record.agent_uid)} but was loaded for uid ${agentUid}; refusing to interpret it`,
         );
       }
       return record;

@@ -394,6 +394,27 @@ export class FailureModeDetector {
           ? FAILURE_MODE.COMPROMISED
           : FAILURE_MODE.PEER_REFUSED,
         target,
+        // SIGNED-DOWNSTREAM DIAGNOSTIC (invariant, and an obligation on whoever
+        // edits this composition). This string does not stop here: it is
+        // retained in the alert map, emitted as sentinel input, and hashed and
+        // signed downstream. Say the bound exactly:
+        //
+        //   `info.error.message` is bounded WHERE its fragments were rendered
+        //   through `describeUntrusted`. Do NOT read that as a property of the
+        //   composed message: this comment claims the chokepoint's renderings
+        //   and nothing wider, and a message can reach a sink like this one
+        //   without having passed through it. Anything ADDED here goes through
+        //   the chokepoint, and treat an inherited fragment as unbounded until
+        //   you have followed it back to one.
+        //
+        //   A value that was truncated, escaped, or replaced by a placeholder
+        //   cannot be reconstructed from this text; a short primitive that
+        //   needed none of those renders unchanged and therefore can. The alert
+        //   says what this node observed, not what the peer sent verbatim.
+        //
+        //   Nothing downstream may parse this text or branch on it;
+        //   `reason_class`, `event_type`, and `error_name` in `detail` below
+        //   are the machine-readable facts.
         message: compromiseClass
           ? `An event of type ${info.event_type} received ${describeOrigin(target)} was refused (${info.reason_class}): ${info.error.message}.`
           : `An event of type ${info.event_type} received ${describeOrigin(target)} was refused by this node (${info.reason_class}): ${info.error.message}. This describes a timing or capacity condition on this node, not evidence that the peer is compromised. Check clock synchronisation before treating it as an incident.`,
@@ -967,6 +988,19 @@ export class FailureModeDetector {
   }
 
   private publishAlert(alert: FailureModeAlert): void {
+    // RETAINED DIAGNOSTIC (invariant, and an obligation on whoever adds an
+    // alert): `alert.message` can carry peer-supplied text. Where that text was
+    // rendered through `describeUntrusted` it is bounded before it arrives.
+    // This store makes no such claim about what it is given in general: it
+    // retains whatever an alert carries, and `on_alert` forwards it onward,
+    // including to paths that hash and sign it, so a message composed without
+    // the chokepoint is both retained here and sealed there. That is the reason
+    // to compose through it. A value that was truncated, escaped, or replaced
+    // by a placeholder is not reconstructable from the message; a short
+    // primitive that needed none of those renders unchanged and therefore is.
+    // Neither this store
+    // nor any `on_alert` consumer may parse the message or branch on its text;
+    // the structured alert fields are what a consumer reads.
     this.alerts.set(alert.alert_id, alert);
     this.opts.on_alert(alert);
   }
@@ -977,6 +1011,17 @@ export class FailureModeDetector {
       target: alert.target_node,
       detail: {
         alert_id: alert.alert_id,
+        // SENTINEL INPUT (invariant, and an obligation on whoever composes an
+        // alert): this is a DISPLAY rendering of a refusal, never a parseable
+        // record. It enters sentinel evaluation here and can be hashed and
+        // signed further downstream, so it must be bounded BEFORE it arrives.
+        // That holds for fragments rendered through `describeUntrusted`, and is
+        // an obligation on the composing side rather than a property this line
+        // can check or claim. A value that was truncated, escaped, or replaced
+        // by a placeholder is not reconstructable from this text; a short
+        // primitive that needed none of those renders unchanged and therefore is.
+        // No sentinel rule may match on this text or branch on it - the
+        // structured fields spread in below are what a rule reads.
         message: alert.message,
         ...alert.detail,
       },

@@ -147,6 +147,10 @@ import {
   bytesToString,
   constantTimeEqual,
 } from "./encoding.js";
+// the epoch witness is read back from storage and JSON-parsed, so its fields
+// are attacker-influenced; diagnostics go through the untrusted-diagnostic
+// chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 // ── Stage identifiers (Stage 2 implemented below; Stage 3/4 deferred) ───────
 
@@ -378,7 +382,7 @@ export async function writeEpochWitness(
     if (current.status === "valid" && data.epoch < current.data.epoch) {
       throw new Error(
         "Sanctuary: refusing to lower the custody epoch witness " +
-          `(${current.data.epoch} → ${data.epoch}) without an explicit restore ` +
+          `(${describeUntrusted(current.data.epoch)} → ${data.epoch}) without an explicit restore ` +
           "attestation. Use `sanctuary restore-attest` (runbook: the " +
           '"Restore and recovery" section of docs/castle-wall-macos-install.md).'
       );

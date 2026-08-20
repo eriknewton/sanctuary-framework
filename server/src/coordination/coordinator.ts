@@ -55,6 +55,10 @@ import {
   HandoffSignatureError,
   HandoffStateError,
 } from "./errors.js";
+// a handoff record is rehydrated from the store by `JSON.parse`, so its ids
+// are attacker-influenced and go through the untrusted-diagnostic chokepoint
+// (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 export type HandoffReasonClass = NonNullable<
   LocalHandoffRecord["status_reason_class"]
@@ -455,7 +459,7 @@ export class LocalCoordinator {
   private assertLayer1Signature(record: LocalHandoffRecord): void {
     if (!verifyHandoffRecord(record, this.keyResolver)) {
       throw new HandoffSignatureError(
-        `Layer 1 signature on handoff ${record.handoff_id} failed verification`,
+        `Layer 1 signature on handoff ${describeUntrusted(record.handoff_id)} failed verification`,
       );
     }
   }

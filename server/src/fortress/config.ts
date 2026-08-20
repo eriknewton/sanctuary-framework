@@ -29,6 +29,10 @@ import type {
   TransitionHistoryEntry,
 } from "./types.js";
 import { FortressConfigError } from "./errors.js";
+// the mode config is `JSON.parse`d after decryption, so its schema field is
+// attacker-influenced and goes through the untrusted-diagnostic chokepoint
+// (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 // ---------------------------------------------------------------------------
 // FortressModeStore
@@ -68,7 +72,7 @@ export class FortressModeStore {
 
       if (config.schema_version !== "1.0") {
         throw new FortressConfigError(
-          `Unsupported fortress mode config schema version: ${config.schema_version}`
+          `Unsupported fortress mode config schema version: ${describeUntrusted(config.schema_version)}`
         );
       }
 

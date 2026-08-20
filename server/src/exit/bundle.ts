@@ -91,6 +91,10 @@ import {
   type PartitionCandidate,
   type PartitionResult,
 } from "./memory-class.js";
+// the parser proves this is a string but not that it is short; the diagnostic
+// goes through the untrusted-diagnostic chokepoint for its length bound
+// (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 const ARTIFACT_DIR = "artifacts";
 
@@ -1503,7 +1507,7 @@ function validateExportDidWeb(
   const parsed = parseDidWeb(binding.identifier);
   if (parsed.authority_host.toLowerCase() !== binding.authority_host.toLowerCase()) {
     throw new Error(
-      `exit-bundle: did_web.identifier authority host '${parsed.authority_host}' does not match did_web.authority_host '${binding.authority_host}'`,
+      `exit-bundle: did_web.identifier authority host '${describeUntrusted(parsed.authority_host)}' does not match did_web.authority_host '${binding.authority_host}'`,
     );
   }
   return {

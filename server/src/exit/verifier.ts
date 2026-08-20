@@ -58,6 +58,10 @@ import {
   readSourceCustodyState,
   type SourceCustodyState,
 } from "./source-custody.js";
+// an exit-bundle manifest is `JSON.parse`d from an imported archive, so every
+// artifact field is attacker-supplied and goes through the untrusted-
+// diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
+import { describeUntrusted } from "../errors/index.js";
 
 /**
  * Which re-key material the encrypted_state artifact DECLARES it needs, read
@@ -915,7 +919,7 @@ export async function verifyExitBundle(
   const seenPaths = new Set<string>();
   for (const artifact of body.artifacts) {
     if (!isKnownKind(artifact.kind)) {
-      return fail(root, manifest, "other", [`unknown artifact kind: ${artifact.kind}`]);
+      return fail(root, manifest, "other", [`unknown artifact kind: ${describeUntrusted(artifact.kind)}`]);
     }
     if (seenPaths.has(artifact.path)) {
       return fail(root, manifest, "artifact_path_duplicate", warnings, unsupportedArtifacts);
