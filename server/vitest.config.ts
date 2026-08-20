@@ -23,8 +23,8 @@ export default defineConfig({
     // delegating to scripts/gate2b-check.sh) needs its "expected files" count
     // to track whatever this array (and test.exclude, dot, root, projects, or
     // any other resolution knob added here later) actually is at any given
-    // moment. It gets that by asking vitest itself — `vitest list --filesOnly`
-    // in server/scripts/count-vitest-test-files.mjs — rather than reading or
+    // moment. It gets that by asking vitest itself - `vitest list --filesOnly`
+    // in server/scripts/count-vitest-test-files.mjs - rather than reading or
     // modeling this array, so there is nothing here to keep in sync and no
     // comment pin needed on this side: change this array (add a root, an
     // exclude, a workspace config) freely, the detector follows automatically.

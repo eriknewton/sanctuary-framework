@@ -86,12 +86,12 @@ jobs:
           sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
 
       # ── Gate 0: build (populates dist/templates for tarball tests) ─
-      - name: Gate 0 — build
+      - name: Gate 0 - build
         working-directory: server
         run: npm run build
 
       # ── Gate 1: typecheck ──────────────────────────────────────────
-      - name: Gate 1 — typecheck
+      - name: Gate 1 - typecheck
         working-directory: server
         run: npm run typecheck
 
@@ -104,10 +104,10 @@ jobs:
       # Captures vitest output in one invocation so all three checks
       # (transform errors, silent file drop, baseline regression)
       # parse the same run. If `npm test` exits non-zero the step
-      # fails immediately and the parsing checks below do not run —
+      # fails immediately and the parsing checks below do not run -
       # that is correct behaviour, a test failure is a commit-blocker
       # regardless of the passing count.
-      - name: Gate 2 — run tests and capture output
+      - name: Gate 2 - run tests and capture output
         id: run_tests
         working-directory: server
         # NO_COLOR / FORCE_COLOR=0 keep vitest's output ANSI-free so the
@@ -124,19 +124,19 @@ jobs:
           npm test 2>&1 | tee /tmp/vitest-output.log
           exit "${PIPESTATUS[0]}"
 
-      - name: Gate 2a — transform/collection error detection
+      - name: Gate 2a - transform/collection error detection
         run: |
           # Patterns match the vitest / vite:esbuild failure signatures
           # for the commit 4ac95830 class. Case-insensitive.
           #
-          #   "transform failed"      — vite:esbuild plugin
+          #   "transform failed"      - vite:esbuild plugin
           #                             ("Transform failed with N error")
-          #   "transform error"       — alternate vitest message
-          #   "failed to parse"       — esbuild / swc
-          #   "failed to collect"     — vitest collection failure
-          #   "failed to load source" — vitest source load
-          #   "cannot find module"    — missing import
-          #   "Failed Suites"         — vitest summary header for
+          #   "transform error"       - alternate vitest message
+          #   "failed to parse"       - esbuild / swc
+          #   "failed to collect"     - vitest collection failure
+          #   "failed to load source" - vitest source load
+          #   "cannot find module"    - missing import
+          #   "Failed Suites"         - vitest summary header for
           #                             suite-level failures
           #
           # Note: if `npm test` already exited non-zero in the previous
@@ -160,9 +160,9 @@ jobs:
           fi
           echo "✓ No transform/collection errors detected."
 
-      - name: Gate 2b self-test — prove the drop detector before trusting it
+      - name: Gate 2b self-test - prove the drop detector before trusting it
         # A gate that is never itself exercised in CI is an artifact, not a
-        # consumer — this step is what makes scripts/gate2b-self-test.sh a
+        # consumer - this step is what makes scripts/gate2b-self-test.sh a
         # real gate on scripts/gate2b-check.sh rather than a script that only
         # ever runs on someone's laptop. Runs BEFORE the real Gate 2b step
         # below so a broken drop detector fails loudly here, on its own
@@ -170,7 +170,7 @@ jobs:
         # silently failing to catch a real drop) in the step that follows.
         run: scripts/gate2b-self-test.sh
 
-      - name: Gate 2b — silent test file drop detection
+      - name: Gate 2b - silent test file drop detection
         # Logic lives in scripts/gate2b-check.sh rather than inline here, so
         # it can be driven against a planted-divergence fixture outside
         # Actions (see the self-test step above). expected_files comes from
@@ -180,7 +180,7 @@ jobs:
         # second model of vitest.config.ts left to drift out of sync with it.
         run: scripts/gate2b-check.sh /tmp/vitest-output.log
 
-      - name: Gate 2c — passing count >= baseline
+      - name: Gate 2c - passing count >= baseline
         run: |
           baseline="${{ steps.baseline.outputs.baseline }}"
           passing=$(grep -oE "Tests[[:space:]]+[0-9]+ passed" /tmp/vitest-output.log | grep -oE "[0-9]+" | head -1)
@@ -198,7 +198,7 @@ jobs:
           # Fail-above (mirror of the pre-commit hook): a passing count
           # higher than the floor must be locked into .test-baseline in
           # the SAME PR. A stale low floor lets a later regression hide
-          # under the gap — the extra passing tests mask the loss until
+          # under the gap - the extra passing tests mask the loss until
           # the floor is finally bumped. The fix is mechanical: set
           # .test-baseline to the new count in this PR.
           if (( passing > baseline )); then

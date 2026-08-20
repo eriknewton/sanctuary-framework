@@ -13,7 +13,7 @@
 // `find server/test -name "*.test.ts" | wc -l`, which only scans one of
 // vitest.config.ts's two `test.include` roots (`test/**/*.test.ts` and
 // `../scripts/synthetic-coverage/test/**/*.test.ts`). On a real run: 992
-// files on disk in server/test vs. 1006 loaded by vitest — a 14-file
+// files on disk in server/test vs. 1006 loaded by vitest - a 14-file
 // cushion baked into the comparison before any files ever went missing.
 //
 // FINDING THIS FIXES, ROUND 2 (2026-08-19, independent gate on the round-1
@@ -21,11 +21,11 @@
 // with a hand-rolled re-implementation of vitest's discovery (loading
 // test.include via vite's config loader, then globbing it with tinyglobby
 // directly in this script). That re-implementation only modeled
-// `test.include` — it had no idea about `test.exclude`, the `dot` option,
+// `test.include` - it had no idea about `test.exclude`, the `dot` option,
 // `test.root`/`dir`, `includeSource`, a workspace/projects config, a
 // per-invocation project filter, or an include list a plugin resolves at
 // runtime. Any one of those, if vitest.config.ts ever grows it, would make
-// `expected_files` diverge from what vitest actually runs — in EITHER
+// `expected_files` diverge from what vitest actually runs - in EITHER
 // direction: a false failure (this script says N, vitest correctly runs
 // fewer because of an exclude it didn't know about), or a fresh masking gap
 // exactly like round 1's. Re-modeling vitest's resolution is a chase that
@@ -35,11 +35,11 @@
 // (`ctx.getRelevantTestSpecifications`) a real `vitest run` uses to decide
 // which files to run, so whatever test.include/exclude/dot/root/projects/
 // plugin-resolved config vitest.config.ts carries, this script's expected
-// set is exact by construction — there is no second implementation of
+// set is exact by construction - there is no second implementation of
 // discovery left to drift.
 //
 // FAILURE MODE: an empty or malformed result here would make Gate 2b pass
-// vacuously no matter how many test files vitest actually drops — see the
+// vacuously no matter how many test files vitest actually drops - see the
 // explicit refusals below, both for a vitest exit failure and for an
 // unparseable/malformed/duplicated file list.
 
@@ -55,7 +55,7 @@ const defaultServerRoot = resolve(scriptDir, "..");
 /**
  * Locates vitest's CLI entry point via real Node module resolution (its
  * package.json `bin` field), not a hand-picked `node_modules/.bin/vitest`
- * path — this works regardless of hoisting/monorepo layout and fails with a
+ * path - this works regardless of hoisting/monorepo layout and fails with a
  * real, legible ERR_MODULE_NOT_FOUND if vitest is not installed, rather than
  * a "file not found" on a path we guessed.
  */
@@ -95,7 +95,7 @@ export function listVitestTestFiles(serverRoot = defaultServerRoot) {
   }
 
   if (result.status !== 0) {
-    // FAILURE MODE: vitest failed before it could report a file list — a
+    // FAILURE MODE: vitest failed before it could report a file list - a
     // broken vitest.config.ts, a throwing plugin, or (flagged during review
     // of this script, though not reproduced in every environment: vitest's
     // "native" config loader path does not always need this) an EPERM
@@ -105,7 +105,7 @@ export function listVitestTestFiles(serverRoot = defaultServerRoot) {
     // stderr attached instead of reporting zero expected files.
     const stderrTail = (result.stderr || "").trim().split("\n").slice(-25).join("\n");
     throw new Error(
-      `vitest list --filesOnly exited ${result.status} — could not discover test files. ` +
+      `vitest list --filesOnly exited ${result.status} - could not discover test files. ` +
         "This is usually a vitest.config.ts load failure: check for a read-only " +
         "node_modules (the default config loader needs write access under " +
         `node_modules/.vite-temp) or a config/plugin error. stderr:\n${stderrTail}`,
@@ -139,7 +139,7 @@ export function listVitestTestFiles(serverRoot = defaultServerRoot) {
     // trust the list rather than silently deduplicating past it.
     throw new Error(
       `'vitest list --filesOnly --json' reported ${files.length} entries but only ` +
-        `${unique.size} unique file paths — refusing to trust a duplicated list.`,
+        `${unique.size} unique file paths - refusing to trust a duplicated list.`,
     );
   }
 
@@ -171,12 +171,12 @@ function main() {
 // FAILURE MODE: comparing resolve()d paths here (instead of realpath()d ones)
 // silently fails to detect direct invocation whenever the invocation path
 // traverses a symlink Node itself resolves away when building import.meta.url
-// — e.g. macOS's /tmp -> /private/tmp and /var -> /private/var. `resolve()`
+// - e.g. macOS's /tmp -> /private/tmp and /var -> /private/var. `resolve()`
 // only normalizes `.`/`..`/separators; it never touches the filesystem, so it
 // leaves such a symlink in place while import.meta.url has already been
 // resolved through it, and the two paths compare unequal even though they
 // name the same file. That mismatch made this script silently no-op (exit 0,
-// no output) under `node "$FIX/..."` for any mktemp fixture on macOS — caught
+// no output) under `node "$FIX/..."` for any mktemp fixture on macOS - caught
 // by gate2b-self-test.sh, which runs from exactly such a path.
 const invokedDirectly =
   process.argv[1] &&
