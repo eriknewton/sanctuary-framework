@@ -80,10 +80,18 @@ jobs:
         # pinned with a SHA256 hash. A compromised PyPI release that replaces the
         # tarball under the same version is rejected at install time. Regenerate
         # hashes on Concordia version bump per sidecars/concordia/README.md.
+        #
+        # CI-APT-RESILIENCE-01: both pip installs are routed through the
+        # shared retry-with-timeout.sh wrapper (same fix applied to every
+        # apt-get site after the 2026-08-19 hang incident, extended here to
+        # pip since an unbounded network install can hang the same way).
+        timeout-minutes: 20
         run: |
           python3 -m venv sidecars/concordia/.venv
-          sidecars/concordia/.venv/bin/pip install --upgrade pip
-          sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
+          scripts/ci/retry-with-timeout.sh "pip upgrade (concordia venv)" -- \
+            sidecars/concordia/.venv/bin/pip install --upgrade pip
+          scripts/ci/retry-with-timeout.sh "pip install (concordia venv, hash-pinned)" -- \
+            sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
 
       # ── Gate 0: build (populates dist/templates for tarball tests) ─
       - name: Gate 0 - build

@@ -113,10 +113,20 @@ jobs:
         with:
           python-version: "3.12"
 
+      # CI-APT-RESILIENCE-01: routed through the shared retry-with-timeout.sh
+      # wrapper (same fix applied to every apt-get site after the
+      # 2026-08-19 hang incident, extended here to pip since an unbounded
+      # network install can hang the same way). timeout-minutes=12: this
+      # step has only ONE retried call (~9.3 min worst case; see
+      # scripts/ci/retry-with-timeout.sh for the derivation), so its
+      # backstop is smaller than the 20-minute one used at sites with two
+      # chained calls.
       - name: Provision Concordia sidecar venv
+        timeout-minutes: 12
         run: |
           python3 -m venv sidecars/concordia/.venv
-          sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
+          scripts/ci/retry-with-timeout.sh "pip install (concordia venv, hash-pinned)" -- \
+            sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
 
       - name: Type check
         working-directory: server
