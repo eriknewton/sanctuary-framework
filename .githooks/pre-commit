@@ -362,7 +362,7 @@ transform_error_hits=$(classify_transform_errors "$test_output")
 
 if (( test_exit != 0 )); then
   if [[ -n "$transform_error_hits" ]]; then
-    fail "TRANSFORM/COLLECTION ERROR DETECTED — commit blocked"
+    fail "TRANSFORM/COLLECTION ERROR DETECTED - commit blocked"
     printf '\n' >&2
     printf '%s\n' "$transform_error_hits" | head -20 >&2
     printf '\n' >&2
@@ -382,7 +382,7 @@ fi
 # as defense-in-depth. In theory a vitest version could report the
 # error without failing the run (unlikely but worth the extra line).
 if [[ -n "$transform_error_hits" ]]; then
-  fail "TRANSFORM/COLLECTION ERROR DETECTED (despite zero exit) — commit blocked"
+  fail "TRANSFORM/COLLECTION ERROR DETECTED (despite zero exit) - commit blocked"
   printf '\n' >&2
   printf '%s\n' "$transform_error_hits" | head -20 >&2
   printf '\n' >&2
