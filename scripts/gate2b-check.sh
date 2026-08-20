@@ -103,14 +103,40 @@ if [[ ! -f "$PACKAGE_JSON" ]]; then
   echo "::error::server/package.json not found at $PACKAGE_JSON" >&2
   exit 1
 fi
-EXPECTED_TEST_SCRIPT="vitest run"
+# WHICH SHAPES ARE UNSUPPORTED, rather than which string is canonical. An
+# exact-string match rejected healthy equivalents (a reporter flag keeps the run
+# full, unsharded and unfiltered), and a guard that fires on a healthy repo is
+# one the next person under time pressure disables. So refuse only the execution
+# shapes whose expected/actual equivalence is genuinely unproven: sharding, a
+# project filter, a name filter, a changed root, or a positional file filter.
+# Failure mode of widening this list carelessly: a legitimate flag starts
+# blocking every PR and the fix looks like "delete the check".
 actual_test_script=$(node -e '
   const fs = require("fs");
   const pkg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   process.stdout.write(typeof pkg.scripts?.test === "string" ? pkg.scripts.test : "");
 ' "$PACKAGE_JSON")
-if [[ "$actual_test_script" != "$EXPECTED_TEST_SCRIPT" ]]; then
-  echo "::error::server/package.json's \"test\" script is '$actual_test_script', not the expected '$EXPECTED_TEST_SCRIPT'. This gate's expected/actual equivalence (see the SCOPE note above) is proven only for a full, unsharded, unfiltered vitest run. If you've added --shard, a project filter, or a file filter to the test script, this check needs a deliberate update - and re-verification via scripts/gate2b-self-test.sh - before it can be trusted against the new invocation." >&2
+if [[ -z "$actual_test_script" ]]; then
+  echo "::error::server/package.json has no string \"test\" script; this gate cannot confirm the run shape." >&2
+  exit 1
+fi
+# The runner must still be a plain `vitest run`; anything else (a wrapper script,
+# a different runner) is outside what the equivalence was proven against.
+if [[ "$actual_test_script" != vitest\ run* ]]; then
+  echo "::error::server/package.json's \"test\" script is '$actual_test_script', which does not start with 'vitest run'. This gate's expected/actual equivalence (see the SCOPE note above) is proven only for a plain vitest run. Update this check and re-verify via scripts/gate2b-self-test.sh before trusting it against a different runner." >&2
+  exit 1
+fi
+unsupported=""
+for flag in --shard --project --dir --root -t --testNamePattern --changed --related; do
+  case " $actual_test_script " in
+    *" $flag "*|*" $flag="*) unsupported="$unsupported $flag" ;;
+  esac
+done
+# A positional argument after `vitest run` is a file filter.
+positional=$(printf '%s' "$actual_test_script" | awk '{for(i=3;i<=NF;i++) if (substr($i,1,1) != "-") {print $i; exit}}')
+if [[ -n "$positional" ]]; then unsupported="$unsupported (file filter: $positional)"; fi
+if [[ -n "$unsupported" ]]; then
+  echo "::error::server/package.json's \"test\" script carries an execution shape this gate's equivalence was never proven against:$unsupported. Sharding, project/name filters, a changed root, and file filters each make vitest RUN a different set than 'vitest list' reports. Update this check and re-verify via scripts/gate2b-self-test.sh before trusting it." >&2
   exit 1
 fi
 
