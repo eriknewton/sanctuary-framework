@@ -342,11 +342,29 @@ set -e
 # is a generic test failure and is blocked with a simpler message.
 TRANSFORM_ERROR_PATTERNS='(transform failed|transform error|failed to parse|failed to collect|failed to load source|cannot find module|failed suites)'
 
+# Keep this classifier aligned with the CI mirror in
+# .github/workflows/test-baseline-guard.yml. Vite 8 can emit a benign
+# "failed to load source map" warning while the suite still runs cleanly;
+# filtering that exact phrase prevents a false positive without weakening the
+# real source-load, transform, parse, collect, missing-module, or failed-suite
+# signatures. Both exit paths below consume this one result so they cannot
+# drift apart.
+classify_transform_errors() {
+  local _output="$1"
+  printf '%s\n' "$_output" \
+    | grep -Eqi "$TRANSFORM_ERROR_PATTERNS" >/dev/null && \
+    printf '%s\n' "$_output" \
+      | grep -Ei "$TRANSFORM_ERROR_PATTERNS" \
+      | grep -viE 'failed to load source map' || true
+}
+
+transform_error_hits=$(classify_transform_errors "$test_output")
+
 if (( test_exit != 0 )); then
-  if echo "$test_output" | grep -Eqi "$TRANSFORM_ERROR_PATTERNS"; then
-    fail "TRANSFORM/COLLECTION ERROR DETECTED - commit blocked"
+  if [[ -n "$transform_error_hits" ]]; then
+    fail "TRANSFORM/COLLECTION ERROR DETECTED — commit blocked"
     printf '\n' >&2
-    echo "$test_output" | grep -Ei "$TRANSFORM_ERROR_PATTERNS" | head -20 >&2
+    printf '%s\n' "$transform_error_hits" | head -20 >&2
     printf '\n' >&2
     fail "This is the specific failure class from commit 4ac95830:"
     printf '[baseline-guard]   a parse/transform error causing test files to fail at\n' >&2
@@ -363,10 +381,10 @@ fi
 # Exit code was zero, but ALSO scan for transform-error substrings
 # as defense-in-depth. In theory a vitest version could report the
 # error without failing the run (unlikely but worth the extra line).
-if echo "$test_output" | grep -Eqi "$TRANSFORM_ERROR_PATTERNS"; then
-  fail "TRANSFORM/COLLECTION ERROR DETECTED (despite zero exit) - commit blocked"
+if [[ -n "$transform_error_hits" ]]; then
+  fail "TRANSFORM/COLLECTION ERROR DETECTED (despite zero exit) — commit blocked"
   printf '\n' >&2
-  echo "$test_output" | grep -Ei "$TRANSFORM_ERROR_PATTERNS" | head -20 >&2
+  printf '%s\n' "$transform_error_hits" | head -20 >&2
   printf '\n' >&2
   fail "This is the specific failure class from commit 4ac95830."
   printf '[baseline-guard]   See docs/audit/commit-4ac95830-postmortem.md\n' >&2
