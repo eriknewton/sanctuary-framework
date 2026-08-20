@@ -46,10 +46,18 @@ jobs:
         # pinned with a SHA256 hash. A compromised PyPI release that replaces the
         # tarball under the same version is rejected at install time. Regenerate
         # hashes on Concordia version bump per sidecars/concordia/README.md.
+        #
+        # CI-APT-RESILIENCE-01: both pip installs are routed through the
+        # shared retry-with-timeout.sh wrapper (same fix applied to every
+        # apt-get site after the 2026-08-19 hang incident, extended here to
+        # pip since an unbounded network install can hang the same way).
+        timeout-minutes: 20
         run: |
           python3 -m venv sidecars/concordia/.venv
-          sidecars/concordia/.venv/bin/pip install --upgrade pip
-          sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
+          scripts/ci/retry-with-timeout.sh "pip upgrade (concordia venv)" -- \
+            sidecars/concordia/.venv/bin/pip install --upgrade pip
+          scripts/ci/retry-with-timeout.sh "pip install (concordia venv, hash-pinned)" -- \
+            sidecars/concordia/.venv/bin/pip install --require-hashes -r sidecars/concordia/requirements.txt
 
       - name: Type check
         working-directory: server
@@ -75,12 +83,19 @@ jobs:
         # Runs once (node 24 only); the provider is pure-stdlib so pytest is the
         # only dependency. Tests use the in-process stub layer (no live server,
         # no keychain).
+        # CI-APT-RESILIENCE-01: both pip installs are routed through the
+        # shared retry-with-timeout.sh wrapper (same fix applied to every
+        # apt-get site after the 2026-08-19 hang incident, extended here to
+        # pip since an unbounded network install can hang the same way).
         if: matrix.node-version == 24
+        timeout-minutes: 20
         run: |
           cd sidecars/sanctuary-memory
           python3 -m venv .venv
-          .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install pytest==8.4.2
+          ../../scripts/ci/retry-with-timeout.sh "pip upgrade (sanctuary-memory venv)" -- \
+            .venv/bin/pip install --upgrade pip
+          ../../scripts/ci/retry-with-timeout.sh "pip install pytest (sanctuary-memory venv)" -- \
+            .venv/bin/pip install pytest==8.4.2
           .venv/bin/python -m pytest -q
 
       - name: Install libsecret + Secret Service backend

@@ -1,0 +1,27 @@
+name: Resilient apt-get install
+description: >-
+  Runs `apt-get update` + `apt-get install` for the given packages with a
+  bounded per-attempt timeout, a small number of retries with backoff, and
+  apt's own non-interactive / short-network-timeout options, so a stalled
+  package mirror fails this step in minutes instead of hanging until a
+  human or GitHub reaps the runner. See install.sh for the retry/timeout
+  logic and scripts/retry-with-timeout-self-test.sh for the self-test.
+inputs:
+  packages:
+    description: Space-separated apt package names to install.
+    required: true
+runs:
+  using: composite
+  steps:
+    # NOTE: a composite action's steps CANNOT carry `timeout-minutes`; GitHub
+    # rejects the whole action file with "Unexpected value 'timeout-minutes'",
+    # so the action does not merely lose its backstop, it fails to LOAD.
+    # (Proven on PR #1282's first run: three jobs died in 7-9 seconds with a
+    # TemplateValidationException.) The outer bound therefore lives in
+    # install.sh's own accounting (3 attempts x 180s + 2 x 10s backoff, about
+    # 9.3 minutes per call, two calls here), and any CALLER that wants a
+    # belt-and-braces backstop sets `timeout-minutes` on its own `uses:` step,
+    # which IS supported in a workflow job.
+    - name: apt-get update && install (bounded, retried)
+      shell: bash
+      run: ${{ github.action_path }}/install.sh ${{ inputs.packages }}
