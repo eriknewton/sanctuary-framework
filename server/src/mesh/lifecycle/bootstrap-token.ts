@@ -11,15 +11,13 @@ import { hmac } from "@noble/hashes/hmac";
 import { sha256 } from "@noble/hashes/sha256";
 import { fromBase64url, toBase64url } from "../../core/encoding.js";
 import { randomBytes } from "../../core/random.js";
+import { parseIsoInstantWithOffset } from "../../core/time.js";
 import { canonicalizeToBytes } from "../canonical-json.js";
 import { SIGNATURE_SCHEME_V1, type NodeMode } from "../constants.js";
 import { MeshError } from "../errors.js";
 import type { PrincipalCertificate } from "../types.js";
 import { BOOTSTRAP_TOKEN_TTL_MS } from "./constants.js";
 import type { BootstrapToken } from "./types.js";
-// a bootstrap token is attacker-suppliable and is compared here BEFORE its
-// signature is checked, so its fields are unvalidated; diagnostics go through
-// the untrusted-diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
 import { describeUntrusted } from "../../errors/index.js";
 
 export class MeshBootstrapTokenError extends MeshError {
@@ -27,6 +25,96 @@ export class MeshBootstrapTokenError extends MeshError {
     super(message);
     this.name = "MeshBootstrapTokenError";
   }
+}
+
+type BootstrapTokenSnapshot = Readonly<BootstrapToken>;
+
+const BOOTSTRAP_TOKEN_NODE_MODES: readonly NodeMode[] = [
+  "local",
+  "operator_cloud",
+  "sovereign_tee",
+];
+
+function isBootstrapTokenNodeMode(value: string): value is NodeMode {
+  return BOOTSTRAP_TOKEN_NODE_MODES.includes(value as NodeMode);
+}
+
+/**
+ * Read a wire token exactly once into plain strings before verification.
+ *
+ * The caller's TypeScript annotation is not evidence: this boundary receives
+ * decoded network data, whose properties can be stateful accessors or a Proxy.
+ * Every later trust decision reads this new object only, so a single signed
+ * snapshot is what expiry, principal binding, and canonical bytes all mean.
+ */
+function snapshotBootstrapToken(value: unknown): BootstrapTokenSnapshot {
+  let intended_node_id: unknown;
+  let intended_node_mode: unknown;
+  let fortress_id: unknown;
+  let issuing_principal: unknown;
+  let issued_at: unknown;
+  let expires_at: unknown;
+  let nonce: unknown;
+  let signature_scheme: unknown;
+  let signature: unknown;
+
+  try {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error("bootstrap token is not an object");
+    }
+    const wire = value as Record<string, unknown>;
+    // Read each field once: later validation and verification must not revisit
+    // an attacker-owned accessor after this stable copy exists.
+    ({
+      intended_node_id,
+      intended_node_mode,
+      fortress_id,
+      issuing_principal,
+      issued_at,
+      expires_at,
+      nonce,
+      signature_scheme,
+      signature,
+    } = wire);
+  } catch {
+    throw new MeshBootstrapTokenError("bootstrap token has an unreadable wire shape");
+  }
+
+  if (
+    typeof intended_node_id !== "string" ||
+    typeof intended_node_mode !== "string" ||
+    typeof fortress_id !== "string" ||
+    typeof issuing_principal !== "string" ||
+    typeof issued_at !== "string" ||
+    typeof expires_at !== "string" ||
+    typeof nonce !== "string" ||
+    typeof signature_scheme !== "string" ||
+    typeof signature !== "string"
+  ) {
+    throw new MeshBootstrapTokenError(
+      "bootstrap token has a missing or wrong-type required field"
+    );
+  }
+  if (!isBootstrapTokenNodeMode(intended_node_mode)) {
+    throw new MeshBootstrapTokenError("bootstrap token has an unknown intended_node_mode");
+  }
+  if (signature_scheme !== SIGNATURE_SCHEME_V1) {
+    throw new MeshBootstrapTokenError(
+      `bootstrap token signature_scheme must be ${SIGNATURE_SCHEME_V1}`
+    );
+  }
+
+  return Object.freeze({
+    intended_node_id,
+    intended_node_mode,
+    fortress_id,
+    issuing_principal,
+    issued_at,
+    expires_at,
+    nonce,
+    signature_scheme,
+    signature,
+  });
 }
 
 export function issueBootstrapToken(params: {
@@ -62,45 +150,58 @@ export function verifyBootstrapToken(params: {
   issuing_principal_cert: PrincipalCertificate;
   now_ms?: number;
 }): void {
-  const now = params.now_ms ?? Date.now();
-  if (params.token.fortress_id !== params.expected_fortress_id) {
+  const token = snapshotBootstrapToken(params.token);
+  // Trust arithmetic accepts only the shared strict offset-bearing instant;
+  // a wrong-type or ambiguous wire timestamp must fail before signature work.
+  const expiresAtMs = parseIsoInstantWithOffset(token.expires_at);
+  if (
+    parseIsoInstantWithOffset(token.issued_at) === undefined ||
+    expiresAtMs === undefined
+  ) {
     throw new MeshBootstrapTokenError(
-      `bootstrap token fortress_id=${describeUntrusted(params.token.fortress_id)} does not match expected ${params.expected_fortress_id}`
+      "bootstrap token issued_at and expires_at must be strict ISO instants with an offset"
+    );
+  }
+
+  const now = params.now_ms ?? Date.now();
+  if (token.fortress_id !== params.expected_fortress_id) {
+    throw new MeshBootstrapTokenError(
+      `bootstrap token fortress_id=${describeUntrusted(token.fortress_id)} does not match expected ${params.expected_fortress_id}`
     );
   }
   if (
-    params.token.issuing_principal !==
+    token.issuing_principal !==
     params.issuing_principal_cert.principal_id
   ) {
     throw new MeshBootstrapTokenError(
-      `bootstrap token issuing_principal=${describeUntrusted(params.token.issuing_principal)} does not match principal cert ${params.issuing_principal_cert.principal_id}`
+      `bootstrap token issuing_principal=${describeUntrusted(token.issuing_principal)} does not match principal cert ${params.issuing_principal_cert.principal_id}`
     );
   }
-  if (Date.parse(params.token.expires_at) < now) {
+  if (expiresAtMs < now) {
     throw new MeshBootstrapTokenError(
-      `bootstrap token expired at ${describeUntrusted(params.token.expires_at)}`
-    );
-  }
-  if (params.token.signature_scheme !== SIGNATURE_SCHEME_V1) {
-    throw new MeshBootstrapTokenError(
-      `bootstrap token signature_scheme must be ${SIGNATURE_SCHEME_V1}`
+      `bootstrap token expired at ${describeUntrusted(token.expires_at)}`
     );
   }
   const body: Omit<BootstrapToken, "signature"> = {
-    intended_node_id: params.token.intended_node_id,
-    intended_node_mode: params.token.intended_node_mode,
-    fortress_id: params.token.fortress_id,
-    issuing_principal: params.token.issuing_principal,
-    issued_at: params.token.issued_at,
-    expires_at: params.token.expires_at,
-    nonce: params.token.nonce,
-    signature_scheme: params.token.signature_scheme,
+    intended_node_id: token.intended_node_id,
+    intended_node_mode: token.intended_node_mode,
+    fortress_id: token.fortress_id,
+    issuing_principal: token.issuing_principal,
+    issued_at: token.issued_at,
+    expires_at: token.expires_at,
+    nonce: token.nonce,
+    signature_scheme: token.signature_scheme,
   };
-  const ok = ed25519.verify(
-    fromBase64url(params.token.signature),
-    canonicalizeToBytes(body),
-    fromBase64url(params.issuing_principal_cert.principal_pubkey)
-  );
+  let ok: boolean;
+  try {
+    ok = ed25519.verify(
+      fromBase64url(token.signature),
+      canonicalizeToBytes(body),
+      fromBase64url(params.issuing_principal_cert.principal_pubkey)
+    );
+  } catch {
+    throw new MeshBootstrapTokenError("bootstrap token signature encoding is invalid");
+  }
   if (!ok) {
     throw new MeshBootstrapTokenError(
       "bootstrap token signature does not verify against issuing principal"

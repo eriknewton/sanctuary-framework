@@ -85,6 +85,7 @@ import type {
   PrincipalCertificate,
   SignedEvent,
 } from "../../src/mesh/types.js";
+import type { BootstrapToken } from "../../src/mesh/lifecycle/types.js";
 import type { CompiledPolicy } from "../../src/policy-engine/types.js";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -491,6 +492,31 @@ describe("lifecycle/counters - strict-advance guarantee", () => {
 // ═══════════════════════════════════════════════════════════════════════
 
 describe("lifecycle/bootstrap-token - issue + verify gate", () => {
+  function verifyWireToken(
+    fx: FortressFixture,
+    token: unknown,
+    now_ms?: number
+  ): void {
+    verifyBootstrapToken({
+      // The public TypeScript type is not evidence about a wire value.
+      token: token as BootstrapToken,
+      expected_fortress_id: fx.master_public.fortress_id,
+      issuing_principal_cert: fx.root_principal_cert,
+      now_ms,
+    });
+  }
+
+  function signWireToken(
+    token: Record<string, unknown>,
+    privateKey: Uint8Array
+  ): Record<string, unknown> {
+    const { signature: _ignored, ...body } = token;
+    return {
+      ...body,
+      signature: toBase64url(ed25519.sign(canonicalizeToBytes(body), privateKey)),
+    };
+  }
+
   it("issues a token whose signature verifies under the issuing principal cert", () => {
     const fx = bootFortress();
     const token = issueBootstrapToken({
@@ -577,6 +603,95 @@ describe("lifecycle/bootstrap-token - issue + verify gate", () => {
         issuing_principal_cert: fx.root_principal_cert,
       })
     ).toThrow(MeshBootstrapTokenError);
+  });
+
+  it.each([
+    ["an invalid timestamp", "not-an-iso-instant"],
+    ["a timestamp without an offset", "2099-01-01T00:00:00"],
+  ])("rejects %s before signature work", (_label, expires_at) => {
+    const fx = bootFortress();
+    const issued = issueBootstrapToken({
+      intended_node_id: "node-X",
+      intended_node_mode: "local",
+      fortress_id: fx.master_public.fortress_id,
+      issuing_principal: fx.root_principal_cert.principal_id,
+      principal_private_key: fx.root_principal_keypair.privateKey,
+    });
+    const wire = signWireToken(
+      { ...issued, expires_at },
+      fx.root_principal_keypair.privateKey
+    );
+
+    expect(() => verifyWireToken(fx, wire)).toThrow(MeshBootstrapTokenError);
+  });
+
+  it("rejects a deeply nested non-string expires_at as a bootstrap-token error", () => {
+    const fx = bootFortress();
+    const issued = issueBootstrapToken({
+      intended_node_id: "node-X",
+      intended_node_mode: "local",
+      fortress_id: fx.master_public.fortress_id,
+      issuing_principal: fx.root_principal_cert.principal_id,
+      principal_private_key: fx.root_principal_keypair.privateKey,
+    });
+    let expires_at: unknown = "not-a-timestamp";
+    // A wire parser must reject by type without traversing attacker-owned depth.
+    for (let depth = 0; depth < 1_000; depth += 1) {
+      expires_at = { depth, expires_at };
+    }
+
+    expect(() =>
+      verifyWireToken(fx, { ...issued, expires_at })
+    ).toThrow(MeshBootstrapTokenError);
+  });
+
+  it.each([
+    ["intended_node_id", 7],
+    ["intended_node_mode", "unrecognized_mode"],
+    ["nonce", 7],
+  ])("rejects a malformed required %s field", (field, value) => {
+    const fx = bootFortress();
+    const issued = issueBootstrapToken({
+      intended_node_id: "node-X",
+      intended_node_mode: "local",
+      fortress_id: fx.master_public.fortress_id,
+      issuing_principal: fx.root_principal_cert.principal_id,
+      principal_private_key: fx.root_principal_keypair.privateKey,
+    });
+    const wire = signWireToken(
+      { ...issued, [field]: value },
+      fx.root_principal_keypair.privateKey
+    );
+
+    expect(() => verifyWireToken(fx, wire)).toThrow(MeshBootstrapTokenError);
+  });
+
+  it("reads every wire field once into a stable snapshot", () => {
+    const fx = bootFortress();
+    const issued = issueBootstrapToken({
+      intended_node_id: "node-X",
+      intended_node_mode: "local",
+      fortress_id: fx.master_public.fortress_id,
+      issuing_principal: fx.root_principal_cert.principal_id,
+      principal_private_key: fx.root_principal_keypair.privateKey,
+    });
+    const reads = new Map<string, number>();
+    const fields = new Set(Object.keys(issued));
+    const statefulWire = new Proxy(issued, {
+      get(target, property, receiver) {
+        if (typeof property === "string" && fields.has(property)) {
+          const count = (reads.get(property) ?? 0) + 1;
+          reads.set(property, count);
+          if (count > 1) {
+            throw new Error(`wire field ${property} was read more than once`);
+          }
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    expect(() => verifyWireToken(fx, statefulWire)).not.toThrow();
+    for (const field of fields) expect(reads.get(field)).toBe(1);
   });
 });
 
