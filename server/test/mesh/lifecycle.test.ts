@@ -625,6 +625,23 @@ describe("lifecycle/bootstrap-token - issue + verify gate", () => {
     expect(() => verifyWireToken(fx, wire)).toThrow(MeshBootstrapTokenError);
   });
 
+  it("rejects a malformed issued_at even with an otherwise valid expires_at", () => {
+    const fx = bootFortress();
+    const issued = issueBootstrapToken({
+      intended_node_id: "node-X",
+      intended_node_mode: "local",
+      fortress_id: fx.master_public.fortress_id,
+      issuing_principal: fx.root_principal_cert.principal_id,
+      principal_private_key: fx.root_principal_keypair.privateKey,
+    });
+    const wire = signWireToken(
+      { ...issued, issued_at: "not-an-iso-instant" },
+      fx.root_principal_keypair.privateKey
+    );
+
+    expect(() => verifyWireToken(fx, wire)).toThrow(MeshBootstrapTokenError);
+  });
+
   it("rejects a deeply nested non-string expires_at as a bootstrap-token error", () => {
     const fx = bootFortress();
     const issued = issueBootstrapToken({

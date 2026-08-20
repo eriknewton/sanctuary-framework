@@ -29,6 +29,8 @@ export class MeshBootstrapTokenError extends MeshError {
 
 type BootstrapTokenSnapshot = Readonly<BootstrapToken>;
 
+// Must match NodeMode in ../constants.ts: the verifier rejects values outside
+// the protocol's closed node-mode wire contract before canonical verification.
 const BOOTSTRAP_TOKEN_NODE_MODES: readonly NodeMode[] = [
   "local",
   "operator_cloud",
