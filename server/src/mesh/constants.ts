@@ -33,6 +33,7 @@ export const SIGNATURE_SCHEME_V1: SignatureScheme = "ed25519-v1";
 /**
  * v0.1 node modes — per-node-cert binds a node to exactly one.
  * Spec: §2.2.
+ * Must match BOOTSTRAP_TOKEN_NODE_MODES in lifecycle/bootstrap-token.ts.
  */
 export type NodeMode = "local" | "operator_cloud" | "sovereign_tee";
 

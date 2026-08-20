@@ -102,7 +102,6 @@ const GRANDFATHERED: ReadonlyMap<string, { count: number; why: string }> =
     ["intelligence/selector.ts", { count: 1, why: "cutoff filtering of local entries" }],
     ["memory-checkpoint/retention.ts", { count: 2, why: "retention-expiry comparisons on local records" }],
     ["mesh/envelope.ts", { count: 1, why: "ULID event-id timestamp with an explicit Date.now fallback" }],
-    ["mesh/lifecycle/bootstrap-token.ts", { count: 1, why: "expiry comparison on a verified join token" }],
     ["mesh/lifecycle/durable-claim-set-store.ts", { count: 1, why: "expiry sweep of stored claims" }],
     ["mesh/lifecycle/local-state.ts", { count: 2, why: "valid_from/valid_until comparisons on stored records" }],
     ["mesh/lifecycle/operator-cloud-join-approver.ts", { count: 1, why: "expiry comparison on a verified claim" }],
