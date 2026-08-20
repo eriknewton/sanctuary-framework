@@ -28,13 +28,18 @@ export default defineConfig({
     // modeling this array, so there is nothing here to keep in sync and no
     // comment pin needed on this side for the RESOLUTION knobs: add a root, an
     // exclude, or an includeSource here and the detector follows automatically.
-    // TWO SHAPES ARE THE EXCEPTION, and they refuse loudly rather than
-    // miscounting: OVERLAPPING projects (the same file resolved under more than
-    // one project, which a real run executes more than once) and any test
-    // invocation that shards, filters, or changes the root. Those change what a
-    // run EXECUTES relative to what `vitest list` reports, which is the one
-    // assumption the detector rests on. Adding either means updating
-    // scripts/gate2b-check.sh and re-verifying scripts/gate2b-self-test.sh.
+    // TWO SHAPES ARE THE EXCEPTION, and each refuses rather than miscounting.
+    // OVERLAPPING projects (the same file resolved under more than one project,
+    // which a real run executes more than once) refuse in the counter. And the
+    // test INVOCATION itself is checked against a short allowlist of exact
+    // strings in scripts/gate2b-check.sh, so anything other than the verified
+    // invocation refuses there: not because those flags are all unsafe, but
+    // because deciding safety by parsing that string was tried twice and
+    // produced a parser that rejected a healthy flag while admitting an unsafe
+    // one. Both exceptions change what a run EXECUTES relative to what
+    // `vitest list` REPORTS, which is the single assumption the detector rests
+    // on. Adopting either means updating scripts/gate2b-check.sh deliberately
+    // and re-verifying scripts/gate2b-self-test.sh.
     // History: a hand-restated `find server/test` once missed the second root
     // below and let up to 14 dropped files pass undetected (2026-08-19); the
     // fix that followed re-modeled this array by hand instead of asking
