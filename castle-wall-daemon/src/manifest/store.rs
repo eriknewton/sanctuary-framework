@@ -17,7 +17,10 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::ffi::CString;
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::constants::SCHEMA_VERSION_V1;
@@ -25,6 +28,7 @@ use crate::manifest::verify::{
     verify_manifest_signature, verify_rule_digests, AllowlistManifest, ManifestSignature,
     SignedManifest, VerifyResult,
 };
+use crate::manifest::rule_identity::preflight_manifest_rule_entries;
 use crate::policy::{PolicySnapshot, PolicySnapshotError};
 
 /// File name of the canonical signed manifest within the policy directory.
@@ -80,6 +84,8 @@ pub enum ManifestStoreError {
         reason: String,
         issues: Vec<String>,
     },
+    #[error("manifest rule identity preflight failed: {issues:?}")]
+    RuleIdentityPreflight { issues: Vec<String> },
     #[error("policy snapshot construction failed: {source_message}")]
     PolicySnapshot { source_message: String },
 }
@@ -244,13 +250,17 @@ pub fn load_signed_manifest_from_disk(
         }
     }
 
+    let preflight_issues = preflight_manifest_rule_entries(&signed.manifest.rules);
+    if !preflight_issues.is_empty() {
+        return Err(ManifestStoreError::RuleIdentityPreflight { issues: preflight_issues });
+    }
+
     let rules_dir = policy_dir.join(RULES_SUBDIR);
+    let rules_dir_fd = open_rules_directory_no_follow(&rules_dir)?;
     let mut rule_files: HashMap<String, Vec<u8>> = HashMap::new();
     for entry in &signed.manifest.rules {
-        let path = rules_dir.join(&entry.file);
-        let bytes = fs::read(&path).map_err(|err| ManifestStoreError::RuleFileIo {
-            file: entry.file.clone(),
-            source_message: err.to_string(),
+        let bytes = read_rule_relative_no_follow(&rules_dir_fd, &entry.file).map_err(|err| {
+            ManifestStoreError::RuleFileIo { file: entry.file.clone(), source_message: err }
         })?;
         rule_files.insert(entry.file.clone(), bytes);
     }
@@ -271,6 +281,35 @@ pub fn load_signed_manifest_from_disk(
         manifest_signature_b64url,
         rule_count,
     })
+}
+
+/// Linux `openat` binds the final component to the opened rules-directory
+/// descriptor and `O_NOFOLLOW` refuses a symlink at either boundary. This
+/// prevents manifest fields from acquiring path authority. A same-UID attacker
+/// can still replace policy files before the directory descriptor is opened.
+fn open_rules_directory_no_follow(rules_dir: &Path) -> Result<fs::File, ManifestStoreError> {
+    let path = CString::new(rules_dir.as_os_str().as_bytes()).map_err(|_| ManifestStoreError::RuleFileIo {
+        file: RULES_SUBDIR.to_string(), source_message: "rules directory path contains NUL".to_string(),
+    })?;
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(ManifestStoreError::RuleFileIo {
+            file: RULES_SUBDIR.to_string(), source_message: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    // Safety: `fd` is a successful `open` result and ownership transfers to
+    // File, which closes it even on a later per-rule refusal.
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+fn read_rule_relative_no_follow(rules_dir: &fs::File, filename: &str) -> Result<Vec<u8>, String> {
+    let component = CString::new(filename).map_err(|_| "rule filename contains NUL".to_string())?;
+    let fd = unsafe { libc::openat(rules_dir.as_raw_fd(), component.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 { return Err(std::io::Error::last_os_error().to_string()); }
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|err| err.to_string())?;
+    Ok(bytes)
 }
 
 /// Mirrors the on-disk signed manifest envelope shape so serde_json can
@@ -338,8 +377,8 @@ mod tests {
 
         let mut entries = Vec::new();
         for i in 0..count {
-            let file = format!("rule-{}.json", i);
             let rule_id = format!("uuid-{}", i);
+            let file = format!("{}.json", rule_id);
             let body = rule_body_for(&rule_id);
             fs::write(policy_dir.join(RULES_SUBDIR).join(&file), &body).unwrap();
             entries.push(ManifestRuleEntry {
@@ -352,7 +391,7 @@ mod tests {
         // (always-on-lane gate, codex round-4 HIGH); the snapshot the store
         // builds on reload refuses a lane-less manifest.
         let habeas_body = crate::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes().to_vec();
-        let habeas_file = "rule-habeas.json".to_string();
+        let habeas_file = format!("{}.json", crate::habeas::HABEAS_LOCAL_RULE_ID);
         fs::write(
             policy_dir.join(RULES_SUBDIR).join(&habeas_file),
             &habeas_body,
@@ -405,7 +444,7 @@ mod tests {
         // 2 synthetic rules + the always-present habeas local lane.
         assert_eq!(loaded.rule_count, 3);
         assert_eq!(loaded.rule_files.len(), 3);
-        assert!(loaded.rule_files.contains_key("rule-0.json"));
+        assert!(loaded.rule_files.contains_key("uuid-0.json"));
     }
 
     #[test]
@@ -423,9 +462,62 @@ mod tests {
     fn load_fails_when_rule_file_missing() {
         let policy = write_valid_policy(1);
         // Remove the rule file referenced by the manifest.
-        fs::remove_file(policy.dir.path().join(RULES_SUBDIR).join("rule-0.json")).unwrap();
+        fs::remove_file(policy.dir.path().join(RULES_SUBDIR).join("uuid-0.json")).unwrap();
         let err = load_signed_manifest_from_disk(policy.dir.path(), &policy.pinned_key).unwrap_err();
         assert!(matches!(err, ManifestStoreError::RuleFileIo { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_a_symlinked_rule_without_reading_outside_rules_directory() {
+        use std::os::unix::fs::symlink;
+
+        let policy = write_valid_policy(1);
+        let outside = policy.dir.path().join("outside-sentinel.json");
+        let sentinel = b"outside sentinel remains unchanged";
+        fs::write(&outside, sentinel).unwrap();
+        let rule_path = policy.dir.path().join(RULES_SUBDIR).join("uuid-0.json");
+        fs::remove_file(&rule_path).unwrap();
+        symlink(&outside, &rule_path).unwrap();
+
+        let err = load_signed_manifest_from_disk(policy.dir.path(), &policy.pinned_key).unwrap_err();
+        assert!(matches!(err, ManifestStoreError::RuleFileIo { .. }));
+        assert_eq!(fs::read(outside).unwrap(), sentinel);
+    }
+
+    #[test]
+    fn load_rejects_all_identity_preflight_failures_before_rule_reads() {
+        let policy = write_valid_policy(1);
+        let raw = fs::read_to_string(policy.dir.path().join(MANIFEST_FILENAME)).unwrap();
+        let parsed: super::ParsedSignedManifest = serde_json::from_str(&raw).unwrap();
+        let mut manifest = parsed.manifest;
+        manifest.rules.push(ManifestRuleEntry {
+            rule_id: "uuid-0".to_string(),
+            file: "uuid-0.json".to_string(),
+            sha256: "00".to_string(),
+        });
+        manifest.rules.push(ManifestRuleEntry {
+            rule_id: "unsafe/path".to_string(),
+            file: "unsafe/path.json".to_string(),
+            sha256: "00".to_string(),
+        });
+        let canonical = canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();
+        let signature = policy.signing_key.sign(&canonical);
+        let envelope = ParsedSignedManifest {
+            manifest,
+            signature: ManifestSignature {
+                signature_scheme: crate::constants::SIGNATURE_SCHEME_V1.to_string(),
+                signing_key_id: "test".to_string(),
+                signature_b64url: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            },
+        };
+        fs::write(policy.dir.path().join(MANIFEST_FILENAME), serde_json::to_string(&envelope).unwrap()).unwrap();
+
+        let err = load_signed_manifest_from_disk(policy.dir.path(), &policy.pinned_key).unwrap_err();
+        match err {
+            ManifestStoreError::RuleIdentityPreflight { issues } => assert!(issues.len() >= 3),
+            other => panic!("expected identity preflight refusal, got {other:?}"),
+        }
     }
 
     #[test]
@@ -433,7 +525,7 @@ mod tests {
         let policy = write_valid_policy(1);
         // Swap the rule file body without updating the manifest digest.
         fs::write(
-            policy.dir.path().join(RULES_SUBDIR).join("rule-0.json"),
+            policy.dir.path().join(RULES_SUBDIR).join("uuid-0.json"),
             b"{\"a\":2}",
         )
         .unwrap();
@@ -522,7 +614,7 @@ mod tests {
         // manifest entry expects. The simpler equivalent: rewrite the rule
         // body AND the manifest digest to keep the digest aligned but the
         // body invalid as AllowlistRule.
-        let rule_path = policy.dir.path().join(RULES_SUBDIR).join("rule-0.json");
+        let rule_path = policy.dir.path().join(RULES_SUBDIR).join("uuid-0.json");
         let bad_body = b"{\"id\":\"uuid-0\",\"schema_version\":1}";
         // Can't simply overwrite, the digest in the existing manifest no
         // longer matches. The real demonstration here is via the snapshot
@@ -590,7 +682,7 @@ mod tests {
         // Tamper with the rule file. Reload should fail; current should
         // still hold the prior good snapshot.
         fs::write(
-            policy.dir.path().join(RULES_SUBDIR).join("rule-0.json"),
+            policy.dir.path().join(RULES_SUBDIR).join("uuid-0.json"),
             b"{\"a\":2}",
         )
         .unwrap();

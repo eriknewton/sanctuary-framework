@@ -496,8 +496,8 @@ describe("rule id to filename mapping", () => {
     });
   });
 
-  it("keeps distinct long ids distinct on disk", async () => {
-    const shared = "r".repeat(200);
+  it("keeps distinct maximum-length ids distinct on disk", async () => {
+    const shared = "r".repeat(113);
     const { ruleFiles, signed } = await buildSignedManifest({
       fortressId: "f",
       issuedAt: "t",
@@ -513,14 +513,13 @@ describe("rule id to filename mapping", () => {
     expect(new Set(signed.manifest.rules.map((r) => r.file)).size).toBe(2);
   });
 
-  it("round-trips a long id verbatim into its filename", async () => {
-    const id = "x".repeat(300);
-    const { ruleFiles } = await buildSignedManifest({
+  it("rejects an overlong id before signing", async () => {
+    const id = "x".repeat(121);
+    await expect(buildSignedManifest({
       fortressId: "f",
       issuedAt: "t",
       rules: [makeRule(id, "a.example")],
       signer,
-    });
-    expect(ruleFiles[0]!.filename).toBe(`${id}.json`);
+    })).rejects.toThrow(/invalid rule id/);
   });
 });

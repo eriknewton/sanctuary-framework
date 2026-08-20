@@ -33,7 +33,13 @@ import {
 import { generateRandomKey } from "../../../src/core/random.js";
 import { encrypt } from "../../../src/core/encryption.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
-import type { AgentOrigin, OperatorBaseline } from "../../../src/castle-wall/allowlist/manifest.js";
+import type {
+  AgentOrigin,
+  OperatorBaseline,
+  SignedManifest,
+} from "../../../src/castle-wall/allowlist/manifest.js";
+import { canonicalize } from "../../../src/mesh/canonical-json.js";
+import { stringToBytes, toBase64url } from "../../../src/core/encoding.js";
 
 function rule(id: string, host: string): AllowlistRule {
   return {
@@ -129,6 +135,24 @@ describe("readVerifiedManifest: real publisher round-trip + tamper detection (FI
     // path instead of stranding the operator on a generic tamper message.
     expect(read.reason).toContain("Remedy");
     expect(read.reason).toContain(join(egressDir, "manifest.json"));
+  });
+
+  it("refuses a signed off-contract filename before the real reader consumes its path", async () => {
+    await publish([rule("r-good", "api.example.com")]);
+    const manifestPath = join(egressDir, "manifest.json");
+    const signed = JSON.parse(await readFile(manifestPath, "utf8")) as SignedManifest;
+    signed.manifest.rules[0]!.file = "../outside-sentinel.json";
+    signed.signature.signature_b64url = toBase64url(
+      await signer.sign(stringToBytes(canonicalize(signed.manifest))),
+    );
+    await writeFile(join(egressDir, "outside-sentinel.json"), "outside sentinel");
+    await writeFile(manifestPath, canonicalize(signed));
+
+    const read = await readVerifiedManifest(egressDir, publicKey);
+    expect(read.status).toBe("tampered");
+    if (read.status !== "tampered") throw new Error("unreachable");
+    expect(read.reason).toContain("identity preflight failed");
+    expect(read.reason).not.toContain("unreadable");
   });
 
   it("a rule file at the LEGACY location (beside manifest.json) is an explicit refusal naming the remedy, never a silent fallback read", async () => {

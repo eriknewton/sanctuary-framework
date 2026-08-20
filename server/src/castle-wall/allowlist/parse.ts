@@ -21,6 +21,7 @@ import {
 } from "../constants.js";
 import type { AllowlistRule } from "./schema.js";
 import { validateRule } from "./schema.js";
+import { preflightManifestRuleEntries } from "./rule-identity.js";
 import type { SignedManifest } from "./manifest.js";
 
 /** Result type returned by the verifier. */
@@ -93,7 +94,8 @@ export function verifyAndParseRules(
   ruleFiles: RuleFileBytes
 ): ParseResult<ReadonlyArray<AllowlistRule>> {
   const collected: AllowlistRule[] = [];
-  const issues: string[] = [];
+  const issues = preflightManifestRuleEntries(signed.manifest.rules);
+  if (issues.length > 0) return { ok: false, error: "rule validation failed", issues };
 
   for (const entry of signed.manifest.rules) {
     const bytes = ruleFiles.get(entry.file);

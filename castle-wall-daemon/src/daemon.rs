@@ -720,14 +720,14 @@ mod tests {
             "{{\"id\":\"{rule_id}\",\"schema_version\":1,\"created_at\":\"2026-05-05T00:00:00Z\",\"match\":{{\"host\":[\"{host}\"],\"port\":[443],\"protocol\":\"tcp\"}},\"disposition\":\"{disposition}\"}}"
         );
         let body_bytes = body.into_bytes();
-        let file = "rule-0.json";
-        fs::write(policy_dir.join(RULES_SUBDIR).join(file), &body_bytes).unwrap();
+        let file = format!("{rule_id}.json");
+        fs::write(policy_dir.join(RULES_SUBDIR).join(&file), &body_bytes).unwrap();
         // Every composed manifest must carry the genuine habeas local lane
         // (always-on-lane gate); include it so the snapshot builds.
         let habeas_bytes = crate::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes().to_vec();
-        let habeas_file = "rule-habeas.json";
+        let habeas_file = format!("{}.json", crate::habeas::HABEAS_LOCAL_RULE_ID);
         fs::write(
-            policy_dir.join(RULES_SUBDIR).join(habeas_file),
+            policy_dir.join(RULES_SUBDIR).join(&habeas_file),
             &habeas_bytes,
         )
         .unwrap();
@@ -740,12 +740,12 @@ mod tests {
             rules: vec![
                 ManifestRuleEntry {
                     rule_id: rule_id.to_string(),
-                    file: file.to_string(),
+                    file,
                     sha256: sha256_hex(&body_bytes),
                 },
                 ManifestRuleEntry {
                     rule_id: crate::habeas::HABEAS_LOCAL_RULE_ID.to_string(),
-                    file: habeas_file.to_string(),
+                    file: habeas_file,
                     sha256: sha256_hex(&habeas_bytes),
                 },
             ],

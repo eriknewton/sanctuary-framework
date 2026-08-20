@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import XCTest
 @testable import CastleWallFilter
 @testable import CastleWallIPC
 
@@ -14,7 +15,7 @@ func makeSignedManifestUpdatedBody(
         let ruleBytes = try SignedManifestVerifier.canonicalJSONData(rule)
         return ManifestRuleDigestEntry(
             ruleId: rule.id,
-            file: "\(rule.id).json",
+            file: try XCTUnwrap(SignedManifestVerifier.legacyRuleFilename(for: rule.id)),
             sha256: SignedManifestVerifier.sha256Hex(ruleBytes)
         )
     }
@@ -63,7 +64,11 @@ func makeSignedBodyWithRawRules(
         let digest = try SignedManifestVerifier.sha256Hex(
             SignedManifestVerifier.canonicalJSONData(rawValue)
         )
-        entries.append(ManifestRuleDigestEntry(ruleId: id, file: "\(id).json", sha256: digest))
+        entries.append(ManifestRuleDigestEntry(
+            ruleId: id,
+            file: try XCTUnwrap(SignedManifestVerifier.legacyRuleFilename(for: id)),
+            sha256: digest
+        ))
         rawRuleObjects.append(try JSONSerialization.jsonObject(with: data))
     }
     let manifest = ManifestSignedBody(

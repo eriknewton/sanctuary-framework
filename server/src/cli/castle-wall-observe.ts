@@ -66,6 +66,7 @@ import {
   verifyManifestSignature,
   verifyAndParseRules,
 } from "../castle-wall/allowlist/parse.js";
+import { preflightManifestRuleEntries } from "../castle-wall/allowlist/rule-identity.js";
 import {
   ObserveStore,
   candidatePromotedAwaitingRearm,
@@ -1460,6 +1461,14 @@ export async function readVerifiedManifest(
   const sigResult = verifyManifestSignature(signed, pinnedPublicKey);
   if (!sigResult.ok) {
     return { status: "tampered", reason: `manifest signature verification failed: ${sigResult.error}` };
+  }
+
+  const identityIssues = preflightManifestRuleEntries(signed.manifest.rules);
+  if (identityIssues.length > 0) {
+    return {
+      status: "tampered",
+      reason: `manifest rule identity preflight failed: ${identityIssues.join("; ")}`,
+    };
   }
 
   // Load every referenced rule file's bytes, keyed by the manifest's own

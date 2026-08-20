@@ -25,6 +25,10 @@ public enum SignedManifestVerificationError: Error, Equatable {
     case canonicalizationFailed(String)
     case ruleDigestCountMismatch(manifest: Int, delivered: Int)
     case duplicateRuleId(String)
+    case duplicateRuleFilename(String)
+    case invalidRuleIdentity(String)
+    case invalidManifestRuleFilename(ruleId: String, filename: String)
+    case manifestRuleIdentityPreflight([String])
     case missingDeliveredRule(String)
     case unexpectedDeliveredRule(String)
     case ruleDigestMismatch(ruleId: String, expected: String, actual: String)
@@ -53,6 +57,56 @@ public enum SignedManifestVerificationError: Error, Equatable {
 }
 
 public enum SignedManifestVerifier {
+    private static let ruleFilenamePrefix = "rid1_"
+    private static let ruleFilenameSuffix = ".json"
+
+    /// MANIFEST-RULEID-PATH-01: the ASCII-only gate avoids Unicode
+    /// normalization equivalence before values reach Swift dictionaries.
+    static func validateRuleId(_ ruleId: String) -> Bool {
+        let bytes = Array(ruleId.utf8)
+        guard !bytes.isEmpty, bytes.count <= 120, asciiAlphaNumeric(bytes[0]) else { return false }
+        return bytes.allSatisfy { asciiAlphaNumeric($0) || $0 == 46 || $0 == 95 || $0 == 58 || $0 == 45 }
+    }
+
+    static func encodedRuleFilename(for ruleId: String) -> String? {
+        guard validateRuleId(ruleId) else { return nil }
+        return ruleFilenamePrefix + Base64URL.encode(Data(ruleId.utf8)) + ruleFilenameSuffix
+    }
+
+    static func legacyRuleFilename(for ruleId: String) -> String? {
+        guard validateRuleId(ruleId) else { return nil }
+        return ruleId + ruleFilenameSuffix
+    }
+
+    private static func asciiAlphaNumeric(_ byte: UInt8) -> Bool {
+        (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+    }
+
+    /// Pure phase-one scan. It runs before any filename is consumed as a map
+    /// key or filesystem path and returns every bounded refusal.
+    static func preflightManifestRuleEntries(_ entries: [ManifestRuleDigestEntry]) -> [String] {
+        var issues: [String] = []
+        var ruleIds = Set<String>()
+        var filenames = Set<String>()
+        for (index, entry) in entries.enumerated() {
+            if !ruleIds.insert(entry.ruleId).inserted {
+                issues.append("manifest rule \(index): duplicate rule id")
+            }
+            if !filenames.insert(entry.file).inserted {
+                issues.append("manifest rule \(index): duplicate rule filename")
+            }
+            guard validateRuleId(entry.ruleId) else {
+                issues.append("manifest rule \(index): invalid rule id")
+                continue
+            }
+            let encoded = encodedRuleFilename(for: entry.ruleId)!
+            let legacy = legacyRuleFilename(for: entry.ruleId)!
+            if entry.file != encoded && entry.file != legacy {
+                issues.append("manifest rule \(index): invalid rule filename relation")
+            }
+        }
+        return issues
+    }
     public static func verifiedSnapshot(
         from body: ManifestUpdatedBody,
         pinnedPublicKey: Data,
@@ -733,9 +787,17 @@ public enum SignedManifestVerifier {
             )
         }
 
+        let identityIssues = preflightManifestRuleEntries(manifest.rules)
+        if !identityIssues.isEmpty {
+            throw SignedManifestVerificationError.manifestRuleIdentityPreflight(identityIssues)
+        }
+
         var deliveredById: [String: ManifestRule] = [:]
         var receivedById: [String: JSONValue] = [:]
         for (index, rule) in rules.enumerated() {
+            guard validateRuleId(rule.id) else {
+                throw SignedManifestVerificationError.invalidRuleIdentity(rule.id)
+            }
             guard rule.schemaVersion == CastleWallConstants.schemaVersionV1 else {
                 throw SignedManifestVerificationError.unsupportedRuleSchemaVersion(
                     ruleId: rule.id,

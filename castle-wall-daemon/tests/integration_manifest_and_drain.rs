@@ -101,8 +101,8 @@ fn write_signed_manifest(policy_dir: &Path, signing: &SigningKey, rule_count: us
     fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
     let mut entries = Vec::new();
     for i in 0..rule_count {
-        let file = format!("rule-{}.json", i);
         let rule_id = format!("uuid-{}", i);
+        let file = format!("{}.json", rule_id);
         let body = rule_body_for(&rule_id);
         fs::write(policy_dir.join(RULES_SUBDIR).join(&file), &body).unwrap();
         entries.push(ManifestRuleEntry {
@@ -114,7 +114,7 @@ fn write_signed_manifest(policy_dir: &Path, signing: &SigningKey, rule_count: us
     // Every composed manifest must carry the genuine habeas local lane
     // (always-on-lane gate); the daemon refuses a lane-less manifest.
     let habeas_body = HABEAS_LOCAL_RULE_BODY.as_bytes().to_vec();
-    let habeas_file = "rule-habeas.json".to_string();
+    let habeas_file = "reserved_habeas_distress_local.json".to_string();
     fs::write(policy_dir.join(RULES_SUBDIR).join(&habeas_file), &habeas_body).unwrap();
     entries.push(ManifestRuleEntry {
         rule_id: "reserved_habeas_distress_local".to_string(),
@@ -292,7 +292,7 @@ fn policy_reload_keeps_prior_on_signature_failure() {
     let booted = boot_daemon_with_policy(1);
     // Tamper: rewrite the rule file, breaking the recorded SHA-256 digest.
     fs::write(
-        booted.policy_dir.join(RULES_SUBDIR).join("rule-0.json"),
+        booted.policy_dir.join(RULES_SUBDIR).join("uuid-0.json"),
         b"{\"r\":\"tampered\"}",
     )
     .unwrap();

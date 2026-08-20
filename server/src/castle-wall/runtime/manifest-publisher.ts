@@ -31,6 +31,7 @@ import type {
 import { validateAgentOrigin } from "../allowlist/agent-origin.js";
 import { validateOperatorBaseline } from "../allowlist/operator-baseline.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
+import { parseRuleId } from "../allowlist/rule-identity.js";
 import { RuntimeManifestPublishError } from "./errors.js";
 import { ED25519_SIGNATURE_BYTES } from "../../core/crypto-suite-registry.js";
 // `rule.id` is type-checked just above but is unbounded in length, so the
@@ -143,20 +144,21 @@ export async function buildSignedManifest(input: BuildSignedManifestInput): Prom
   const entries: ManifestRuleEntry[] = [];
   const ruleFiles: { filename: string; bytes: Uint8Array }[] = [];
   for (const rule of input.rules) {
-    if (!rule.id || typeof rule.id !== "string") {
-      throw new RuntimeManifestPublishError("rule missing id");
+    const parsedRuleId = parseRuleId(rule.id);
+    if (!parsedRuleId.ok) {
+      throw new RuntimeManifestPublishError(`invalid rule id: ${parsedRuleId.error}`);
     }
-    if (seen.has(rule.id)) {
-      throw new RuntimeManifestPublishError(`duplicate rule id: ${describeUntrusted(rule.id)}`);
+    if (seen.has(parsedRuleId.value)) {
+      throw new RuntimeManifestPublishError(`duplicate rule id: ${describeUntrusted(parsedRuleId.value)}`);
     }
-    seen.add(rule.id);
+    seen.add(parsedRuleId.value);
     // NEVER `describeUntrusted` here. This value is CONSUMED, not displayed:
     // it names a file on disk and is recorded in the signed manifest entry that
     // points at that file. The diagnostic renderer truncates, so two distinct
     // ids sharing a long prefix would collapse to one filename and one rule's
     // file would overwrite the other's while the manifest recorded two digests.
     // Bounding belongs on text a human reads, never on a value a system uses.
-    const filename = `${rule.id}.json`;
+    const filename = `${parsedRuleId.value}.json`;
     const bytes = renderRuleFile(rule);
     const digest = sha256Hex(bytes);
     entries.push({ rule_id: rule.id, file: filename, sha256: digest });
