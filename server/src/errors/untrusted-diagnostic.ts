@@ -41,26 +41,33 @@
  * ACCESSOR GUARANTEE (stated at exactly its width; two wider versions of this
  * paragraph have stood here and both were false, so resist widening it again):
  *
- *   WHAT HOLDS: no accessor that lives ON THE VALUE BEING DESCRIBED is ever
- *   invoked. Properties are read through `getOwnPropertyDescriptor` instead of
- *   being read, so a getter or setter is REPORTED and never called; a bulk
- *   container's count comes from the built-in getter taken off the prototype,
- *   which bypasses any own shadow; and the container's own name is never read,
- *   because `Symbol.toStringTag` would be caller code, so bulk labels are
- *   code-chosen and generic. Engine getters ARE invoked, deliberately; they are
- *   constant-time and not caller code. Nothing this function returns is ever
- *   the result of running the subject's own accessor.
+ *   WHAT HOLDS is a statement about what THIS CODE does, not about what happens
+ *   overall: the renderer never invokes the subject's accessors through DIRECT
+ *   PROPERTY ACCESS. It never evaluates `container[key]`; every property is read
+ *   as a DESCRIPTOR, so a getter or setter is reported and never called by us. A
+ *   bulk container's count comes from the built-in getter taken off the
+ *   prototype, which bypasses any own shadow, and the container's own name is
+ *   never read, because `Symbol.toStringTag` would be caller code, so bulk
+ *   labels are code-chosen and generic. Engine getters ARE invoked,
+ *   deliberately; they are constant-time and not caller code.
  *
- *   WHAT DOES NOT HOLD: "no caller code runs." That is a wider claim about the
- *   whole render, and it is false whenever a Proxy is reachable from the value
- *   - as the value itself, or anywhere in its PROTOTYPE CHAIN, since an
- *   otherwise ordinary object created over a proxied prototype carries the same
- *   exposure (probed: `Object.create(proxy)` runs the prototype's trap the same
- *   4 times a bare Proxy does). Three paths run caller code this module cannot
- *   route around, all three observed by probe rather than reasoned about:
+ *   WHAT DOES NOT HOLD: "the subject's own accessors never run", and the wider
+ *   "no caller code runs". Both are claims about the whole render rather than
+ *   about this code, and a Proxy anywhere in play falsifies both. Its traps ARE
+ *   caller code and can invoke anything, INCLUDING the subject's own getters: a
+ *   `getOwnPropertyDescriptor` trap is free to read the property off its own
+ *   target on the way to answering us, and does so entirely outside the
+ *   descriptor discipline above (probed: 3 invocations of a getter living on the
+ *   value being described). "Reachable from the value" includes the PROTOTYPE
+ *   CHAIN, since an otherwise ordinary object created over a proxied prototype
+ *   carries the same exposure (probed: `Object.create(proxy)` runs the
+ *   prototype's trap the same 4 times a bare Proxy does). Three paths run caller
+ *   code this module cannot route around, all three observed by probe rather
+ *   than reasoned about:
  *
  *     - A Proxy's `ownKeys`, `getOwnPropertyDescriptor`, and `get` traps run
- *       during the walk.
+ *       during the walk, and what they do inside is unconstrained: reading the
+ *       subject's own accessors is one of the things they may do.
  *     - `getPrototypeOf` runs, because the `instanceof` checks that recognise a
  *       bulk container consult the prototype chain (measured: 4 invocations,
  *       for a Proxy value and for a plain object whose chain holds one alike).
@@ -68,12 +75,13 @@
  *       own `enumerable`, `value`, `get`, or `set` field is itself a getter,
  *       and the engine invokes those fields while converting the returned
  *       object into a property descriptor (measured: 3 invocations). That
- *       accessor belongs to the descriptor the trap fabricated, not to the
- *       value being described, so the guarantee above survives it intact.
+ *       accessor belongs to the descriptor the trap fabricated rather than to
+ *       the value being described, which changes who wrote it and not whether
+ *       it runs.
  *
- *   The two paragraphs are one sentence: this module never runs the subject's
- *   own accessors, and it makes no claim at all about caller code the engine
- *   reaches through a Proxy on the way.
+ *   The two paragraphs are one sentence: this module never reaches a property
+ *   in a way that runs an accessor, and it makes no claim about what a Proxy's
+ *   traps do on the way, up to and including running the subject's own.
  *
  *   WORK IS NOT BOUNDED for the three costs below. They are named because they
  *   are real, not because they are acceptable everywhere; a caller putting a
@@ -152,11 +160,12 @@ export const UNRENDERABLE_UNTRUSTED_VALUE = "<unrenderable value>";
 export const OVERSIZED_BIGINT = "<bigint exceeds the diagnostic length bound>";
 
 /**
- * Stands in for a property defined by a getter or setter. Code-chosen: that
- * property's own accessor is NEVER invoked, so nothing derived from running it
- * appears here. A Proxy can still run its own traps, and a descriptor its trap
- * fabricates can carry an accessor the engine invokes; neither produces this
- * string's content. See the ACCESSOR GUARANTEE in the file header.
+ * Stands in for a property defined by a getter or setter. Code-chosen: THIS
+ * CODE never invokes that accessor, because it decides from a descriptor rather
+ * than a read, so nothing derived from running it appears here. A Proxy's traps
+ * are caller code and can run anything, the subject's own accessor included;
+ * nothing they return becomes this constant. See the ACCESSOR GUARANTEE in the
+ * file header for the exact width of the claim.
  */
 export const ACCESSOR_PLACEHOLDER = "<accessor>";
 
@@ -418,10 +427,11 @@ const SET_SIZE_GETTER = protoGetter(Set.prototype, "size");
  * state, or throw. Building a diagnostic must never execute the subject it is
  * describing (measured before this change: a 30ms getter cost the render 30ms,
  * and it ran). `getOwnPropertyDescriptor` reports the accessor without calling
- * it. On a Proxy this still runs that trap, which stays a named cost, and a
- * trap may return a descriptor object whose own fields are getters that the
- * engine then invokes: see the ACCESSOR GUARANTEE in the file header for what
- * survives in that case and what does not.
+ * it. On a Proxy this still runs that trap, which stays a named cost; the trap
+ * may read the property off its own target (running the very getter this avoids
+ * reading directly) and may return a descriptor object whose own fields are
+ * getters that the engine then invokes. See the ACCESSOR GUARANTEE in the file
+ * header for what survives in that case and what does not.
  */
 function renderOwnProperty(
   container: object,
@@ -532,9 +542,11 @@ function escapedSurrogate(unit: number): string {
  * Non-deceptive: a shortened result carries {@link UNTRUSTED_TRUNCATION_MARKER},
  * and control characters are escaped rather than emitted.
  *
- * A short string, number, boolean, null, or undefined renders EXACTLY as
- * `${value}` would, so replacing a template interpolation with this call does
- * not change any honest diagnostic - only the dishonest ones. The two
+ * A short string that needs no escaping, and any number, boolean, null, or
+ * undefined, renders EXACTLY as `${value}` would, so replacing a template
+ * interpolation with this call does not change any honest diagnostic - only the
+ * dishonest ones. A short string carrying a control character is NOT in that
+ * set: it renders escaped, which is the point of escaping it. The two further
  * deliberate exceptions are the ones where `${value}` is not a rendering at
  * all: a symbol, where a template literal THROWS, and a BigInt too long for the
  * bound; both yield a code-chosen placeholder instead.

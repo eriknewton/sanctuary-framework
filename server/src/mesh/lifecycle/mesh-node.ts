@@ -2125,11 +2125,13 @@ export class MeshNode {
         //   permission to assume the field is already safe.
         //
         //   PARTIALLY RECOVERABLE, BY DESIGN. A value that exceeded the bound
-        //   is truncated and cannot be reconstructed from this field. A short
-        //   primitive renders byte-identically, so it IS recoverable, which is
-        //   deliberate - converting a site must never change an honest
-        //   diagnostic. The signature attests what this node SAID about the
-        //   refusal, never that the peer's bytes are reproduced faithfully.
+        //   is truncated and cannot be reconstructed from this field, and so is
+        //   one that was escaped or replaced by a placeholder. A short
+        //   primitive needing neither escaping nor substitution renders
+        //   byte-identically, so THAT case IS recoverable, deliberately -
+        //   converting a site must never change an honest diagnostic. The
+        //   signature attests what this node SAID about the refusal, never that
+        //   the peer's bytes are reproduced faithfully.
         //
         //   NEVER PARSED. No consumer may parse this field or branch on its
         //   text; the machine-readable facts are the sibling fields above.
@@ -2258,8 +2260,9 @@ export class MeshNode {
         // bounded before they are sealed; that is a claim about those
         // renderings and not about this field, since a message can reach it
         // without having passed the chokepoint. A message added here goes
-        // through the chokepoint. A truncated value is not recoverable
-        // from this field; a short primitive renders unchanged and therefore
+        // through the chokepoint. A value that was truncated, escaped, or
+        // replaced by a placeholder is not recoverable from this field; a short
+        // primitive that needed none of those renders unchanged and therefore
         // is. Nothing downstream may parse it or branch on its text, the
         // sibling fields being the machine-readable facts.
         reason: params.error.message,
@@ -2427,9 +2430,10 @@ export class MeshNode {
         // renderings and not about this field, since a message can reach it
         // without having passed the chokepoint. A message added here goes
         // through the chokepoint, and an inherited fragment counts as unbounded
-        // until followed back to one. A truncated
-        // value is not recoverable from this field; a short primitive renders
-        // unchanged and therefore is. Nothing downstream may parse it or branch
+        // until followed back to one. A value that was truncated, escaped, or
+        // replaced by a placeholder is not recoverable from this field; a short
+        // primitive that needed none of those renders unchanged and therefore
+        // is. Nothing downstream may parse it or branch
         // on its text, the sibling fields being the machine-readable facts.
         reason: error.message,
       },

@@ -407,10 +407,10 @@ export class FailureModeDetector {
         //   the chokepoint, and treat an inherited fragment as unbounded until
         //   you have followed it back to one.
         //
-        //   A value that exceeded the bound is truncated and cannot be
-        //   reconstructed from this text; a short primitive renders unchanged
-        //   and therefore can. The alert says what this node observed, not what
-        //   the peer sent verbatim.
+        //   A value that was truncated, escaped, or replaced by a placeholder
+        //   cannot be reconstructed from this text; a short primitive that
+        //   needed none of those renders unchanged and therefore can. The alert
+        //   says what this node observed, not what the peer sent verbatim.
         //
         //   Nothing downstream may parse this text or branch on it;
         //   `reason_class`, `event_type`, and `error_name` in `detail` below
@@ -995,8 +995,10 @@ export class FailureModeDetector {
     // retains whatever an alert carries, and `on_alert` forwards it onward,
     // including to paths that hash and sign it, so a message composed without
     // the chokepoint is both retained here and sealed there. That is the reason
-    // to compose through it. A truncated value is not reconstructable from the message;
-    // a short primitive renders unchanged and therefore is. Neither this store
+    // to compose through it. A value that was truncated, escaped, or replaced
+    // by a placeholder is not reconstructable from the message; a short
+    // primitive that needed none of those renders unchanged and therefore is.
+    // Neither this store
     // nor any `on_alert` consumer may parse the message or branch on its text;
     // the structured alert fields are what a consumer reads.
     this.alerts.set(alert.alert_id, alert);
@@ -1015,8 +1017,9 @@ export class FailureModeDetector {
         // signed further downstream, so it must be bounded BEFORE it arrives.
         // That holds for fragments rendered through `describeUntrusted`, and is
         // an obligation on the composing side rather than a property this line
-        // can check or claim. A truncated value is not reconstructable
-        // from this text; a short primitive renders unchanged and therefore is.
+        // can check or claim. A value that was truncated, escaped, or replaced
+        // by a placeholder is not reconstructable from this text; a short
+        // primitive that needed none of those renders unchanged and therefore is.
         // No sentinel rule may match on this text or branch on it - the
         // structured fields spread in below are what a rule reads.
         message: alert.message,
