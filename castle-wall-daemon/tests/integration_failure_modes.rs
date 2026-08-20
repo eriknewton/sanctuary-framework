@@ -116,12 +116,16 @@ fn write_signed_manifest_one_rule(policy_dir: &Path, signing: &SigningKey) {
         "rule-allow-example"
     );
     let body_bytes = body.into_bytes();
-    let file = "rule-0.json";
+    let file = "rule-allow-example.json";
     fs::write(policy_dir.join(RULES_SUBDIR).join(file), &body_bytes).unwrap();
     // Every composed manifest must carry the genuine habeas local lane
     // (always-on-lane gate); the daemon refuses a lane-less manifest.
     let habeas_body = castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes();
-    fs::write(policy_dir.join(RULES_SUBDIR).join("rule-habeas.json"), habeas_body).unwrap();
+    fs::write(
+        policy_dir.join(RULES_SUBDIR).join("reserved_habeas_distress_local.json"),
+        habeas_body,
+    )
+    .unwrap();
 
     let manifest = AllowlistManifest {
         schema_version: 1,
@@ -137,7 +141,7 @@ fn write_signed_manifest_one_rule(policy_dir: &Path, signing: &SigningKey) {
             },
             ManifestRuleEntry {
                 rule_id: "reserved_habeas_distress_local".to_string(),
-                file: "rule-habeas.json".to_string(),
+                file: "reserved_habeas_distress_local.json".to_string(),
                 sha256: sha256_hex(habeas_body),
             },
         ],

@@ -11,6 +11,7 @@
 
 import { CASTLE_WALL_SCHEMA_VERSION_V1 } from "../constants.js";
 import { isValidIp, isValidCidr } from "./ip-cidr.js";
+import { validateRuleId } from "./rule-identity.js";
 
 /** Protocol value for a rule's match clause. */
 export type RuleProtocol = "tcp" | "udp" | "tcp+udp";
@@ -71,8 +72,9 @@ export interface RuleScope {
 }
 
 /**
- * A single allowlist rule. The `id` is a stable UUID used for audit references
- * and manifest entries; if you change a rule's effect, mint a new id.
+ * A single allowlist rule. The `id` is a stable, bounded ASCII identity used
+ * for audit references and manifest entries; if you change a rule's effect,
+ * mint a new id. It is not required to be a UUID.
  */
 export interface AllowlistRule {
   id: string;
@@ -196,9 +198,8 @@ function rejectUnknownKeys(
 
 export function validateRule(rule: AllowlistRule): string[] {
   const issues: string[] = [];
-  if (!rule.id || typeof rule.id !== "string") {
-    issues.push("rule.id missing or not a string");
-  }
+  const ruleIdIssue = validateRuleId(rule.id);
+  if (ruleIdIssue !== null) issues.push(ruleIdIssue);
   if (rule.schema_version !== CASTLE_WALL_SCHEMA_VERSION_V1) {
     issues.push(
       `rule.schema_version unsupported (expected ${CASTLE_WALL_SCHEMA_VERSION_V1}, got ${String(rule.schema_version)})`

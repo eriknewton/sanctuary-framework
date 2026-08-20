@@ -108,12 +108,16 @@ fn boot_with_only_example_com_443_allowed() -> (DaemonHandle, TempDir) {
 fn write_signed_allow_only_example_443(policy_dir: &Path, signing: &SigningKey) {
     fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
     let body = b"{\"id\":\"rule-allow-example\",\"schema_version\":1,\"created_at\":\"2026-05-06T00:00:00Z\",\"match\":{\"host\":[\"example.com\"],\"port\":[443],\"protocol\":\"tcp\"},\"disposition\":\"allow\"}";
-    fs::write(policy_dir.join(RULES_SUBDIR).join("rule-0.json"), body).unwrap();
+    fs::write(policy_dir.join(RULES_SUBDIR).join("rule-allow-example.json"), body).unwrap();
     // Every composed manifest must carry the genuine habeas local lane
     // (always-on-lane gate). Scoped to the reserved emitter id, so it cannot
     // satisfy any agent-classified flow in these bypass tests.
     let habeas_body = castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes();
-    fs::write(policy_dir.join(RULES_SUBDIR).join("rule-habeas.json"), habeas_body).unwrap();
+    fs::write(
+        policy_dir.join(RULES_SUBDIR).join("reserved_habeas_distress_local.json"),
+        habeas_body,
+    )
+    .unwrap();
 
     let manifest = AllowlistManifest {
         schema_version: 1,
@@ -124,12 +128,12 @@ fn write_signed_allow_only_example_443(policy_dir: &Path, signing: &SigningKey) 
         rules: vec![
             ManifestRuleEntry {
                 rule_id: "rule-allow-example".to_string(),
-                file: "rule-0.json".to_string(),
+                file: "rule-allow-example.json".to_string(),
                 sha256: sha256_hex(body),
             },
             ManifestRuleEntry {
                 rule_id: "reserved_habeas_distress_local".to_string(),
-                file: "rule-habeas.json".to_string(),
+                file: "reserved_habeas_distress_local.json".to_string(),
                 sha256: sha256_hex(habeas_body),
             },
         ],

@@ -577,7 +577,11 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         "disposition": "allow"
     });
     let rule_bytes = serde_json::to_vec(&rule_body).unwrap();
-    fs::write(policy_dir.join(RULES_SUBDIR).join("rule-0.json"), &rule_bytes).unwrap();
+    fs::write(
+        policy_dir.join(RULES_SUBDIR).join("rule-allow-test.json"),
+        &rule_bytes,
+    )
+    .unwrap();
 
     let mut sha_hasher = Sha256::new();
     sha_hasher.update(&rule_bytes);
@@ -586,7 +590,11 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     // Every composed manifest must carry the genuine habeas local lane
     // (always-on-lane gate); the daemon refuses a lane-less manifest.
     let habeas_bytes = castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes();
-    fs::write(policy_dir.join(RULES_SUBDIR).join("rule-habeas.json"), habeas_bytes).unwrap();
+    fs::write(
+        policy_dir.join(RULES_SUBDIR).join("reserved_habeas_distress_local.json"),
+        habeas_bytes,
+    )
+    .unwrap();
     let mut habeas_hasher = Sha256::new();
     habeas_hasher.update(habeas_bytes);
     let habeas_sha = format!("{:x}", habeas_hasher.finalize());
@@ -600,12 +608,12 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         rules: vec![
             ManifestRuleEntry {
                 rule_id: "rule-allow-test".to_string(),
-                file: "rule-0.json".to_string(),
+                file: "rule-allow-test.json".to_string(),
                 sha256: sha_hex,
             },
             ManifestRuleEntry {
                 rule_id: "reserved_habeas_distress_local".to_string(),
-                file: "rule-habeas.json".to_string(),
+                file: "reserved_habeas_distress_local.json".to_string(),
                 sha256: habeas_sha,
             },
         ],

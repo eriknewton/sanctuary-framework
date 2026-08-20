@@ -61,7 +61,7 @@ function buildSignedManifest(ruleIds: string[]): Fixture {
   for (const id of ruleIds) {
     const rule = makeRule(id);
     const bytes = stringToBytes(JSON.stringify(rule));
-    const filePath = `rules/${id}.json`;
+    const filePath = `${id}.json`;
     ruleFiles.set(filePath, bytes);
     ruleEntries.push({
       rule_id: id,
@@ -139,6 +139,31 @@ describe("castle-wall/allowlist/parse : manifest signature", () => {
 });
 
 describe("castle-wall/allowlist/parse : rule body verification", () => {
+  it("preflights every manifest identity issue before consuming an unsafe filename", () => {
+    const f = buildSignedManifest(["rule-a"]);
+    f.signed.manifest.rules.push({
+      rule_id: "rule-a",
+      file: "rule-a.json",
+      sha256: "00",
+    });
+    f.signed.manifest.rules.push({
+      rule_id: "unsafe/path",
+      file: "unsafe/path.json",
+      sha256: "00",
+    });
+    let reads = 0;
+    class ReadTrackingMap extends Map<string, Uint8Array> {
+      override get(key: string): Uint8Array | undefined {
+        reads += 1;
+        return super.get(key);
+      }
+    }
+    const result = verifyAndParseRules(f.signed, new ReadTrackingMap());
+    expect(result.ok).toBe(false);
+    expect(reads).toBe(0);
+    if (!result.ok) expect(result.issues).toHaveLength(3);
+  });
+
   it("parses every rule when manifest references match disk bytes", () => {
     const f = buildSignedManifest(["rule-a", "rule-b", "rule-c"]);
     const result = verifyAndParseRules(f.signed, f.ruleFiles as RuleFileBytes);
@@ -149,7 +174,7 @@ describe("castle-wall/allowlist/parse : rule body verification", () => {
   it("flags missing rule files", () => {
     const f = buildSignedManifest(["rule-a", "rule-b"]);
     const partial = new Map(f.ruleFiles);
-    partial.delete("rules/rule-b.json");
+    partial.delete("rule-b.json");
     const result = verifyAndParseRules(f.signed, partial);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.issues?.some((s) => s.includes("missing"))).toBe(true);
@@ -158,7 +183,7 @@ describe("castle-wall/allowlist/parse : rule body verification", () => {
   it("flags sha256 mismatch when a rule file has been altered", () => {
     const f = buildSignedManifest(["rule-a"]);
     const tampered = new Map(f.ruleFiles);
-    tampered.set("rules/rule-a.json", stringToBytes('{"id":"rule-a","tampered":true}'));
+    tampered.set("rule-a.json", stringToBytes('{"id":"rule-a","tampered":true}'));
     const result = verifyAndParseRules(f.signed, tampered);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.issues?.some((s) => s.includes("sha256 mismatch"))).toBe(true);
@@ -172,7 +197,7 @@ describe("castle-wall/allowlist/parse : rule body verification", () => {
     const declaredBytes = stringToBytes(JSON.stringify(declaredRule));
     const fileEntry: ManifestRuleEntry = {
       rule_id: "rule-different-id",
-      file: "rules/rule-mismatch.json",
+      file: "rule-different-id.json",
       sha256: toHex(sha256(declaredBytes)),
     };
 
@@ -193,7 +218,7 @@ describe("castle-wall/allowlist/parse : rule body verification", () => {
     };
     expect(verifyManifestSignature(signed, publicKey).ok).toBe(true);
 
-    const ruleFiles = new Map<string, Uint8Array>([["rules/rule-mismatch.json", declaredBytes]]);
+    const ruleFiles = new Map<string, Uint8Array>([["rule-different-id.json", declaredBytes]]);
     const result = verifyAndParseRules(signed, ruleFiles);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.issues?.some((s) => s.includes("declares id"))).toBe(true);

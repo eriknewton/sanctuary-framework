@@ -1,0 +1,11 @@
+{
+  "valid": [
+    { "id": "a", "encoded_v1": "rid1_YQ.json", "legacy_safe": "a.json" },
+    { "id": "rid1_YQ", "encoded_v1": "rid1_cmlkMV9ZUQ.json", "legacy_safe": "rid1_YQ.json" },
+    { "id": "curated:alpha_1.2-3", "encoded_v1": "rid1_Y3VyYXRlZDphbHBoYV8xLjItMw.json", "legacy_safe": "curated:alpha_1.2-3.json" },
+    { "id": "reserved_habeas_distress_local", "encoded_v1": "rid1_cmVzZXJ2ZWRfaGFiZWFzX2Rpc3RyZXNzX2xvY2Fs.json", "legacy_safe": "reserved_habeas_distress_local.json" },
+    { "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "encoded_v1": "rid1_YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh.json", "legacy_safe": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json" }
+  ],
+  "invalid_ids": ["", ".leading", "has space", "a/b", "a\\b", "café", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+  "invalid_filenames": ["rid1_YQ=.json", "rid1_YR.json", "a.json.bak", "../a.json"]
+}

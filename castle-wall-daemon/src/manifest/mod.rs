@@ -5,6 +5,7 @@
 //! pinning lifecycle ship in PR 2b alongside the kernel-touching modules.
 
 pub mod canonical_json;
+pub mod rule_identity;
 pub mod store;
 pub mod verify;
 pub mod watcher;
