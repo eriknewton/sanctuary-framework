@@ -18,6 +18,7 @@ import {
   HABEAS_RULE_ID_PREFIX,
   isGenuineDerivedHabeasRule,
 } from "../allowlist/habeas-port.js";
+import { normalizeResolvers } from "../allowlist/dns-derivation.js";
 import { composeExclusiveRoutingRules } from "../allowlist/exclusive-routing.js";
 import { loadExclusiveRoutingMarker } from "../allowlist/routing-marker.js";
 import { collectSystemResolvers } from "./system-resolvers.js";
@@ -93,6 +94,13 @@ import {
 } from "../../core/crypto-suite-registry.js";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * A resolver transition is rare relative to the daemon's 5s lease heartbeat.
+ * Thirty seconds bounds a post-login Tailscale/DHCP transition without turning
+ * every heartbeat into a helper-signing round trip.
+ */
+const DEFAULT_RESOLVER_LIFECYCLE_REFRESH_INTERVAL_SECONDS = 30;
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
@@ -434,6 +442,19 @@ export interface MacOSCastleWallDaemonInput {
    * Undefined in production.
    */
   reloadComposeHook?: () => Promise<void>;
+  /**
+   * Interval (seconds) for checking whether the host's active resolver SET has
+   * changed since the last successful manifest publication. Default 30s keeps
+   * a boot daemon from retaining a pre-login DNS snapshot without creating
+   * signer churn on the normal unchanged path. Tests inject a short cadence.
+   */
+  resolverLifecycleRefreshIntervalSeconds?: number;
+  /**
+   * Test-only resolver reader. Production always uses the fresh, fail-closed
+   * `scutil --dns` collector; this seam lets lifecycle tests model a late
+   * MagicDNS arrival without consulting the build host's network state.
+   */
+  systemResolverProvider?: () => Promise<readonly unknown[]>;
 }
 
 export type MacOSCastleWallListenerOptions = ConstructorParameters<
@@ -723,17 +744,69 @@ export async function startMacOSCastleWallDaemon(
     input.fortressPath,
     input.exclusiveEgressGate,
   );
-  let manifestState = await loadManifestState({
-    fortressPath: input.fortressPath,
-    fortressId: input.fortressId,
-    signer,
-    agentOrigin,
-    operatorBaseline,
-    exclusiveEgressGate,
-    ...(input.globalPinnedPublicKeyPath
-      ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
-      : {}),
-  });
+  const resolverProvider = input.systemResolverProvider ?? (() =>
+    collectSystemResolvers({
+      onMacOSFailure(error) {
+        // The collector returns [] so DNS is withdrawn fail-closed; this
+        // separate operator signal makes a transient scutil failure visible
+        // instead of looking indistinguishable from an intentionally empty set.
+        // SAFETY: daemon stderr is the independent operator alarm channel.
+        console.error(
+          `[castle-wall] resolver lifecycle scutil read failed; publishing an empty fail-closed resolver set: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      },
+    }));
+  const canonicalResolverSet = (resolvers: readonly unknown[]): string[] =>
+    [...normalizeResolvers(resolvers)].sort();
+  const sameResolverSet = (left: readonly string[], right: readonly string[]): boolean =>
+    left.length === right.length && left.every((resolver, index) => resolver === right[index]);
+  const readCurrentResolverSet = async (
+    source: "startup" | "monitor" | "reload",
+  ): Promise<readonly unknown[]> => {
+    try {
+      return await resolverProvider();
+    } catch (err) {
+      // A failed live read must withdraw, not retain, a stale DNS grant. The
+      // stderr line is deliberately independent of audit availability so a
+      // wedged audit store cannot hide this fail-closed transition.
+      // SAFETY: daemon stderr is the independent operator alarm channel.
+      console.error(
+        `[castle-wall] resolver lifecycle ${source} read failed; using an empty resolver set and withdrawing any derived DNS grant: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return [];
+    }
+  };
+  const composeManifestForResolvers = async (
+    resolvers: readonly unknown[],
+    composition: {
+      agentOrigin: unknown;
+      operatorBaseline: unknown;
+      exclusiveEgressGate: ExclusiveEgressGatePolicy | undefined;
+    } = { agentOrigin, operatorBaseline, exclusiveEgressGate },
+  ): Promise<ManifestState> =>
+    loadManifestState({
+      fortressPath: input.fortressPath,
+      fortressId: input.fortressId,
+      signer,
+      agentOrigin: composition.agentOrigin,
+      operatorBaseline: composition.operatorBaseline,
+      exclusiveEgressGate: composition.exclusiveEgressGate,
+      systemResolverProvider: async () => resolvers,
+      ...(input.globalPinnedPublicKeyPath
+        ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
+        : {}),
+    });
+  const startupResolvers = await readCurrentResolverSet("startup");
+  // This tracks the resolver set represented by the local manifest snapshot,
+  // not whether the last broadcast reached every subscriber. A manual reload
+  // intentionally keeps its candidate locally installed after a broadcast
+  // error, so the lifecycle comparator must follow that local snapshot.
+  let installedManifestResolverSet = canonicalResolverSet(startupResolvers);
+  let manifestState = await composeManifestForResolvers(startupResolvers);
   const pendingRequests = new Set<string>();
   const heartbeatIntervalSeconds = input.armLeaseHeartbeatIntervalSeconds ?? 5;
   let leaseHeartbeat: NodeJS.Timeout | undefined;
@@ -915,6 +988,39 @@ export async function startMacOSCastleWallDaemon(
   const leaseDeliveryContradictions = new Map<string, number>();
   let leaseDeliveryRecycles = 0;
   let listener: MacOSCastleWallListenerHandle | null = null;
+  const resolverLifecycleRefreshIntervalSeconds =
+    input.resolverLifecycleRefreshIntervalSeconds ??
+    DEFAULT_RESOLVER_LIFECYCLE_REFRESH_INTERVAL_SECONDS;
+  if (
+    !Number.isFinite(resolverLifecycleRefreshIntervalSeconds) ||
+    resolverLifecycleRefreshIntervalSeconds <= 0
+  ) {
+    throw new Error(
+      `startMacOSCastleWallDaemon: resolverLifecycleRefreshIntervalSeconds must be a positive finite number (got ${String(
+        input.resolverLifecycleRefreshIntervalSeconds,
+      )})`,
+    );
+  }
+  let resolverLifecycleTimer: NodeJS.Timeout | undefined;
+  let resolverLifecycleRefresh: Promise<void> | undefined;
+  let daemonStopping = false;
+  const stopResolverLifecycleTimer = (): void => {
+    if (!resolverLifecycleTimer) return;
+    clearInterval(resolverLifecycleTimer);
+    resolverLifecycleTimer = undefined;
+  };
+  // All manifest writers share this tail. A monitor candidate must never
+  // publish after a newer manual reload merely because its host read began
+  // first; serialization covers compose, sign, and broadcast as one update.
+  let manifestUpdateTail: Promise<void> = Promise.resolve();
+  const serializeManifestUpdate = async <T>(operation: () => Promise<T>): Promise<T> => {
+    const result = manifestUpdateTail.then(operation, operation);
+    manifestUpdateTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return await result;
+  };
   /**
    * Lease-delivery watchdog (mini2 finding, 2026-08-03): on 2026-08-01 the
    * daemon spent 2h09m broadcasting armed leases while the same connected
@@ -1353,6 +1459,16 @@ export async function startMacOSCastleWallDaemon(
     await emitLease();
     restartLeaseHeartbeat();
 
+    // The first manifest is composed from a fresh startup read. Thereafter,
+    // poll only at the low lifecycle cadence and only re-sign when the
+    // normalized SET changes (for example, post-login MagicDNS appearing).
+    // This is intentionally separate from the 5s arm heartbeat: leases are
+    // cheap liveness frames; a manifest refresh invokes the root signer.
+    resolverLifecycleTimer = setInterval(() => {
+      void refreshResolverLifecycle();
+    }, resolverLifecycleRefreshIntervalSeconds * 1000);
+    resolverLifecycleTimer.unref();
+
     // Observability Slice 2: periodic AUDIT liveness heartbeat. SEPARATE from the
     // IPC arm-lease heartbeat above (that is an in-memory broadcast; this writes
     // ONE audit entry). A reader turns a MISSING heartbeat in a quiet window into
@@ -1555,6 +1671,7 @@ export async function startMacOSCastleWallDaemon(
     }
   } catch (err) {
     stopLeaseHeartbeat();
+    stopResolverLifecycleTimer();
     stopAuditHeartbeat();
     await waitForAuditHeartbeatIdle();
     stopAgentEgressProbeTimer();
@@ -1584,6 +1701,7 @@ export async function startMacOSCastleWallDaemon(
     operation: "policy_loaded" | "policy_validation_failed",
     details: Record<string, unknown>,
     result: "success" | "failure",
+    source: "castle-wall-reload" | "castle-wall-resolver-lifecycle" = "castle-wall-reload",
   ): void {
     void withReloadDeadline(
       (async () => {
@@ -1591,7 +1709,7 @@ export async function startMacOSCastleWallDaemon(
           "l1",
           operation,
           input.fortressId,
-          { ...details, source: "castle-wall-reload" },
+          { ...details, source },
           result,
         );
         await input.auditLog.flush();
@@ -1614,6 +1732,162 @@ export async function startMacOSCastleWallDaemon(
     });
   }
 
+  async function resolveCurrentCompositionInputs(): Promise<{
+    agentOrigin: unknown;
+    operatorBaseline: unknown;
+    exclusiveEgressGate: ExclusiveEgressGatePolicy | undefined;
+  }> {
+    return {
+      agentOrigin: await resolveAgentOrigin(input.fortressPath, input.agentOrigin),
+      operatorBaseline: await resolveOperatorBaseline(
+        input.fortressPath,
+        input.operatorBaseline,
+      ),
+      exclusiveEgressGate: await resolveExclusiveEgressGate(
+        input.fortressPath,
+        input.exclusiveEgressGate,
+      ),
+    };
+  }
+
+  /**
+   * Compose, sign, and publish one new manifest under the single writer tail.
+   * The candidate is complete before it replaces `manifestState`. Lifecycle
+   * refresh opts into local rollback on a failed broadcast so an unchanged
+   * resolver transition remains retryable; manual reload deliberately keeps
+   * its established install-before-broadcast behavior. Neither policy makes
+   * subscriber delivery globally atomic: a listener may have delivered a
+   * candidate to some subscribers before reporting failure.
+   */
+  async function composeAndPublishManifestInWriter(input: {
+    resolvers: readonly unknown[];
+    beforeCompose?: () => Promise<void>;
+    /** Lifecycle refresh retries an unbroadcast resolver transition; manual reload preserves prior semantics. */
+    rollbackLocalStateOnBroadcastFailure: boolean;
+  }): Promise<{ emittedSubscribers: number; manifest: ManifestState }> {
+    if (daemonStopping) {
+      throw new Error("Castle Wall daemon is stopping; refusing manifest publication");
+    }
+    const candidate = await withReloadDeadline(
+      (async () => {
+        await input.beforeCompose?.();
+        return await composeManifestForResolvers(
+          input.resolvers,
+          await resolveCurrentCompositionInputs(),
+        );
+      })(),
+      reloadSignDeadlineMs,
+      `policy reload did not compose and sign within ${reloadSignDeadlineMs}ms (signer helper or fortress read stalled)`,
+    );
+    if (daemonStopping) {
+      throw new Error("Castle Wall daemon stopped during manifest composition");
+    }
+    const previous = manifestState;
+    const previousInstalledResolverSet = installedManifestResolverSet;
+    manifestState = candidate;
+    installedManifestResolverSet = canonicalResolverSet(input.resolvers);
+    try {
+      const emittedSubscribers = await withReloadDeadline(
+        listener!.broadcastManifestUpdate(),
+        reloadBroadcastDeadlineMs,
+        `manifest broadcast did not complete within ${reloadBroadcastDeadlineMs}ms during policy reload`,
+      );
+      return { emittedSubscribers, manifest: candidate };
+    } catch (err) {
+      if (input.rollbackLocalStateOnBroadcastFailure) {
+        manifestState = previous;
+        installedManifestResolverSet = previousInstalledResolverSet;
+      }
+      throw err;
+    }
+  }
+
+  async function readComposeAndPublishCurrentResolvers(input: {
+    beforeCompose?: () => Promise<void>;
+  }): Promise<{ emittedSubscribers: number; manifest: ManifestState }> {
+    return await serializeManifestUpdate(async () => {
+      // Read INSIDE the same writer tail as compose/sign/broadcast. Reading a
+      // manual reload's resolver set before waiting for a monitor publication
+      // would let that older snapshot publish after the newer one.
+      const resolvers = await withReloadDeadline(
+        readCurrentResolverSet("reload"),
+        reloadSignDeadlineMs,
+        `policy reload did not read resolvers within ${reloadSignDeadlineMs}ms`,
+      );
+      return await composeAndPublishManifestInWriter({
+        resolvers,
+        ...(input.beforeCompose ? { beforeCompose: input.beforeCompose } : {}),
+        rollbackLocalStateOnBroadcastFailure: false,
+      });
+    });
+  }
+
+  async function refreshResolverLifecycle(): Promise<void> {
+    if (daemonStopping || resolverLifecycleRefresh !== undefined) return;
+    const refresh = serializeManifestUpdate(async () => {
+      if (daemonStopping) return;
+      let observedResolvers: readonly unknown[];
+      try {
+        // Read under the writer tail too: a monitor snapshot cannot become
+        // stale while queued behind a manual reload, nor can a later manual
+        // snapshot be overtaken by a previously-read monitor value.
+        observedResolvers = await withReloadDeadline(
+          readCurrentResolverSet("monitor"),
+          reloadSignDeadlineMs,
+          `resolver lifecycle read did not complete within ${reloadSignDeadlineMs}ms`,
+        );
+      } catch (err) {
+        // SAFETY: daemon stderr is the independent operator alarm channel.
+        console.error(
+          `[castle-wall] resolver lifecycle monitor failed before composition; retaining last-known-good manifest: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        return;
+      }
+      const observedSet = canonicalResolverSet(observedResolvers);
+      if (daemonStopping || sameResolverSet(observedSet, installedManifestResolverSet)) return;
+      try {
+        const published = await composeAndPublishManifestInWriter({
+          resolvers: observedResolvers,
+          rollbackLocalStateOnBroadcastFailure: true,
+        });
+        recordReloadOutcome(
+          "policy_loaded",
+          {
+            loaded_rule_count: published.manifest.rules.length,
+            derived_rule_ids: published.manifest.rules
+              .filter((rule) => rule.derived === true)
+              .map((rule) => rule.id),
+            emitted_subscribers: published.emittedSubscribers,
+            resolver_lifecycle_refresh: true,
+          },
+          "success",
+          "castle-wall-resolver-lifecycle",
+        );
+      } catch (err) {
+        // A failed lifecycle publication restores both the local manifest and
+        // its resolver fingerprint. The next low-rate tick therefore retries
+        // the still-uninstalled transition; manual reload separately retains
+        // its established local-install behavior after broadcast failure.
+        // SAFETY: daemon stderr is the independent operator alarm channel.
+        console.error(
+          `[castle-wall] resolver lifecycle refresh failed; retaining last-known-good manifest: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    });
+    resolverLifecycleRefresh = refresh;
+    try {
+      await refresh;
+    } finally {
+      if (resolverLifecycleRefresh === refresh) {
+        resolverLifecycleRefresh = undefined;
+      }
+    }
+  }
+
   async function reloadPolicy(
     request?: PolicyReloadRequest,
   ): Promise<PolicyReloadResponse> {
@@ -1623,66 +1897,24 @@ export async function startMacOSCastleWallDaemon(
     // wedged) shared state.
     const lastKnownSignature = manifestState.signed.signature.signature_b64url;
     try {
-      // Drill-found hang guard (Mini1 egress drill 2026-07-12): a policy reload
-      // RE-COMPOSES and RE-SIGNS the ruleset through the root signer helper. The
-      // ENTIRE compose+sign phase (the fortress reads AND the re-sign) runs under
-      // one internal deadline strictly shorter than the client's request
-      // deadline, so a stall ANYWHERE before the sign completes (a hung fortress
-      // read, a stalled signer helper) surfaces as a FAST, SPECIFIC `ok:false`
-      // from the daemon rather than a generic client-side "IPC request timed
-      // out". The response is NEVER gated on the audit write (see
-      // recordReloadOutcome). A bounded specific refusal preserves fail-closed
-      // refuse-to-arm.
-      manifestState = await withReloadDeadline(
-        (async () => {
-          // Test-only fault-injection point (before any real work), so the
-          // whole-body bound can be proven for a stall that is NOT the signer.
-          if (input.reloadComposeHook) {
-            await input.reloadComposeHook();
-          }
-          const reloadedOrigin = await resolveAgentOrigin(
-            input.fortressPath,
-            input.agentOrigin,
-          );
-          const reloadedBaseline = await resolveOperatorBaseline(
-            input.fortressPath,
-            input.operatorBaseline,
-          );
-          const reloadedGate = await resolveExclusiveEgressGate(
-            input.fortressPath,
-            input.exclusiveEgressGate,
-          );
-          return await loadManifestState({
-            fortressPath: input.fortressPath,
-            fortressId: input.fortressId,
-            signer,
-            agentOrigin: reloadedOrigin,
-            operatorBaseline: reloadedBaseline,
-            exclusiveEgressGate: reloadedGate,
-            ...(input.globalPinnedPublicKeyPath
-              ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
-              : {}),
-          });
-        })(),
-        reloadSignDeadlineMs,
-        `policy reload did not compose and sign within ${reloadSignDeadlineMs}ms (signer helper or fortress read stalled)`,
-      );
-      const emitted = await withReloadDeadline(
-        listener!.broadcastManifestUpdate(),
-        reloadBroadcastDeadlineMs,
-        `manifest broadcast did not complete within ${reloadBroadcastDeadlineMs}ms during policy reload`,
-      );
+      // Drill-found hang guard (Mini1 egress drill 2026-07-12): both the fresh
+      // resolver read and compose/sign/broadcast stay bounded below the client
+      // deadline. The shared serialized publication path keeps manual reload
+      // and lifecycle refresh from publishing stale state over one another.
+      const published = await readComposeAndPublishCurrentResolvers({
+        ...(input.reloadComposeHook ? { beforeCompose: input.reloadComposeHook } : {}),
+      });
       // Fire-and-forget: the response is returned WITHOUT awaiting the audit.
       recordReloadOutcome(
         "policy_loaded",
         {
-          loaded_rule_count: manifestState.rules.length,
+          loaded_rule_count: published.manifest.rules.length,
           // Surface auto-derived rules (#380) so a derived grant is never
           // silently invisible in policy introspection.
-          derived_rule_ids: manifestState.rules
+          derived_rule_ids: published.manifest.rules
             .filter((rule) => rule.derived === true)
             .map((rule) => rule.id),
-          emitted_subscribers: emitted,
+          emitted_subscribers: published.emittedSubscribers,
         },
         "success",
       );
@@ -1690,8 +1922,8 @@ export async function startMacOSCastleWallDaemon(
         type: "policy_reload_response",
         request_id: requestId,
         ok: true,
-        loaded_manifest_signature_b64url: manifestState.signed.signature.signature_b64url,
-        loaded_rule_count: manifestState.rules.length,
+        loaded_manifest_signature_b64url: published.manifest.signed.signature.signature_b64url,
+        loaded_rule_count: published.manifest.rules.length,
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1714,7 +1946,10 @@ export async function startMacOSCastleWallDaemon(
     reloadPolicy,
     async stop() {
       try {
+        daemonStopping = true;
         stopLeaseHeartbeat();
+        stopResolverLifecycleTimer();
+        await resolverLifecycleRefresh?.catch(() => undefined);
         // Stop the audit liveness heartbeat in the SAME teardown that stops the
         // IPC lease heartbeat, so a stopped daemon stops claiming liveness.
         stopAuditHeartbeat();
@@ -2273,6 +2508,13 @@ export async function loadManifestState(input: {
   operatorBaseline?: unknown;
   exclusiveEgressGate?: ExclusiveEgressGatePolicy | undefined;
   globalPinnedPublicKeyPath?: string;
+  /**
+   * Internal/test seam for one already-observed live resolver read. Production
+   * callers omit it and therefore collect fresh `scutil --dns` state here.
+   * A lifecycle refresh passes its just-read snapshot so comparison and signing
+   * are about the same resolver set, never two racing host reads.
+   */
+  systemResolverProvider?: () => Promise<readonly unknown[]>;
 }): Promise<ManifestState> {
   // Defense-in-depth: cross-check the persisted root-owned pin against the live
   // helper key before trusting this signer to sign a manifest (F-A2-1 #4).
@@ -2329,7 +2571,7 @@ export async function loadManifestState(input: {
   // signed from this long-lived process's stale dns.getServers() snapshot;
   // the 2026-07-12 drill bug); absent when no hostname rules exist.
   const distressConfig = await readDistressConfig(input.fortressPath);
-  const resolvers = await collectSystemResolvers();
+  const resolvers = await (input.systemResolverProvider ?? collectSystemResolvers)();
   // Unified Protect Slice 5 S5-6: the exclusive-routing MODE MARKER decides
   // which composition this manifest gets. Marker ABSENT = coarse (today's
   // path, byte-unchanged). Marker PRESENT = the S5-4 exclusive composition:
