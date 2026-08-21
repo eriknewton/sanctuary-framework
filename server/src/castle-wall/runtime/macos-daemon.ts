@@ -1948,9 +1948,6 @@ export async function startMacOSCastleWallDaemon(
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      // A deadline rejects without cancelling its underlying operation. Take
-      // the snapshot now so a later callback cannot rewrite this response's
-      // diagnosis while the abandoned operation winds down.
       const failedAt = Date.now();
       const failureStageElapsedMs = Math.max(0, failedAt - failureStageStartedAt);
       const reloadElapsedMs = Math.max(0, failedAt - reloadStartedAt);
@@ -2579,8 +2576,10 @@ export async function loadManifestState(input: {
     if (code !== "ENOENT") throw err;
   }
   filenames.sort();
+  // Keep one phase clock for the complete rule-file read phase; resetting it
+  // per file would make a slow later read look like a fast phase completion.
+  if (filenames.length > 0) input.onReloadStage?.("rule_read");
   for (const filename of filenames) {
-    input.onReloadStage?.("rule_read");
     const raw = await readFileCustody(join(rulesDir, filename), {
       verifyPathIdentity: true,
     });

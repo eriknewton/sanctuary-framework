@@ -1,7 +1,10 @@
 import { randomBytes } from "node:crypto";
 import { createConnection } from "node:net";
 
-import { CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS } from "../constants.js";
+import {
+  CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS,
+  CASTLE_WALL_RELOAD_DIAGNOSTIC_MAX_ELAPSED_MS,
+} from "../constants.js";
 import { frame, parseFrame } from "../ipc/framing.js";
 import { POLICY_RELOAD_STAGES } from "../ipc/messages.js";
 import type {
@@ -91,19 +94,27 @@ function isPolicyReloadStage(value: unknown): value is PolicyReloadStage {
 }
 
 function isBoundedElapsedMs(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+  return typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= CASTLE_WALL_RELOAD_DIAGNOSTIC_MAX_ELAPSED_MS;
 }
 
 function formatReloadFailure(reply: PolicyReloadResponse): string {
   const message = reply.error ?? "policy reload failed";
-  if (
-    !isPolicyReloadStage(reply.failure_stage) ||
-    !isBoundedElapsedMs(reply.failure_stage_elapsed_ms) ||
-    !isBoundedElapsedMs(reply.reload_elapsed_ms)
-  ) {
+  if (!isPolicyReloadStage(reply.failure_stage)) {
     return message;
   }
-  return `${message} [stage=${reply.failure_stage} stage_ms=${reply.failure_stage_elapsed_ms} total_ms=${reply.reload_elapsed_ms}]`;
+  const stageElapsedMs = reply.failure_stage_elapsed_ms;
+  const totalElapsedMs = reply.reload_elapsed_ms;
+  if (
+    !isBoundedElapsedMs(stageElapsedMs) ||
+    !isBoundedElapsedMs(totalElapsedMs) ||
+    stageElapsedMs > totalElapsedMs
+  ) {
+    return `${message} [stage=${reply.failure_stage}]`;
+  }
+  return `${message} [stage=${reply.failure_stage} stage_ms=${stageElapsedMs} total_ms=${totalElapsedMs}]`;
 }
 
 /**
