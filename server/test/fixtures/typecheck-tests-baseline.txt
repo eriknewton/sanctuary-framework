@@ -40,15 +40,15 @@ test/castle-wall/runtime/daemon-agent-origin.test.ts(146,11): error TS2322: Type
 test/castle-wall/runtime/daemon-agent-origin.test.ts(175,15): error TS2322: Type 'string | undefined' is not assignable to type 'string'.
 test/castle-wall/runtime/linux-producer-signed-activation.test.ts(1709,16): error TS2352: Conversion of type '{ events: never[]; next_after_seq: number | null; more_pending: false; wal_overflow_count: number; }' to type 'AuditDrainResponse' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
 test/castle-wall/runtime/macos-daemon-reload.test.ts(225,47): error TS2554: Expected 0 arguments, but got 1.
-test/castle-wall/runtime/macos-daemon-reload.test.ts(250,47): error TS2554: Expected 0 arguments, but got 1.
-test/castle-wall/runtime/macos-daemon-reload.test.ts(282,47): error TS2554: Expected 0 arguments, but got 1.
-test/castle-wall/runtime/macos-daemon-reload.test.ts(323,47): error TS2554: Expected 0 arguments, but got 1.
-test/castle-wall/runtime/macos-daemon-reload.test.ts(458,48): error TS2554: Expected 0 arguments, but got 1.
-test/castle-wall/runtime/macos-daemon-reload.test.ts(487,48): error TS2554: Expected 0 arguments, but got 1.
-test/castle-wall/runtime/macos-daemon-reload.test.ts(532,47): error TS2554: Expected 0 arguments, but got 1.
-test/castle-wall/runtime/macos-daemon-reload.test.ts(551,50): error TS2554: Expected 0 arguments, but got 1.
-test/castle-wall/runtime/macos-daemon-reload.test.ts(563,50): error TS2554: Expected 0 arguments, but got 1.
-test/castle-wall/runtime/macos-daemon-reload.test.ts(597,47): error TS2554: Expected 0 arguments, but got 1.
+test/castle-wall/runtime/macos-daemon-reload.test.ts(255,47): error TS2554: Expected 0 arguments, but got 1.
+test/castle-wall/runtime/macos-daemon-reload.test.ts(292,47): error TS2554: Expected 0 arguments, but got 1.
+test/castle-wall/runtime/macos-daemon-reload.test.ts(333,47): error TS2554: Expected 0 arguments, but got 1.
+test/castle-wall/runtime/macos-daemon-reload.test.ts(468,48): error TS2554: Expected 0 arguments, but got 1.
+test/castle-wall/runtime/macos-daemon-reload.test.ts(497,48): error TS2554: Expected 0 arguments, but got 1.
+test/castle-wall/runtime/macos-daemon-reload.test.ts(542,47): error TS2554: Expected 0 arguments, but got 1.
+test/castle-wall/runtime/macos-daemon-reload.test.ts(566,50): error TS2554: Expected 0 arguments, but got 1.
+test/castle-wall/runtime/macos-daemon-reload.test.ts(578,50): error TS2554: Expected 0 arguments, but got 1.
+test/castle-wall/runtime/macos-daemon-reload.test.ts(612,47): error TS2554: Expected 0 arguments, but got 1.
 test/castle-wall/runtime/macos-ipc-listener.test.ts(223,11): error TS2349: This expression is not callable.
 test/castle-wall/runtime/producer-signature.test.ts(15,3): error TS2440: Import declaration conflicts with local declaration of 'toBase64url'.
 test/chat/agent-context-cache.test.ts(122,5): error TS2322: Type '"running"' is not assignable to type '"active" | "unknown" | "error" | "paused" | "restarting" | "locked_down" | "unwrapping"'.
@@ -68,8 +68,8 @@ test/cli/auto-trigger-audit.test.ts(47,75): error TS2345: Argument of type '() =
 test/cli/castle-wall-audit-verify.test.ts(115,7): error TS2739: Type '{ host: string; ip: string; port: number; protocol: "tcp"; }' is missing the following properties from type 'IpcDestination': hostname_source, opaque
 test/cli/castle-wall-repair-custody.test.ts(140,5): error TS2322: Type 'Writable' is not assignable to type 'Writable & CaptureStream'.
 test/cli/castle-wall-repair-custody.test.ts(141,5): error TS2322: Type 'Writable' is not assignable to type 'Writable & CaptureStream'.
-test/cli/castle-wall.test.ts(1350,26): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
-test/cli/castle-wall.test.ts(1350,52): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
+test/cli/castle-wall.test.ts(1395,26): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
+test/cli/castle-wall.test.ts(1395,52): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
 test/cli/singleton-audit-writes.test.ts(179,75): error TS2345: Argument of type '() => void' is not assignable to parameter of type '(layer: "l1" | "l2" | "l3" | "l4", operation: string, identityId: string, details?: Record<string, unknown> | undefined, result?: "success" | "failure" | undefined) => Promise<...>'.
 test/cli/singleton-audit-writes.test.ts(217,75): error TS2345: Argument of type '() => void' is not assignable to parameter of type '(layer: "l1" | "l2" | "l3" | "l4", operation: string, identityId: string, details?: Record<string, unknown> | undefined, result?: "success" | "failure" | undefined) => Promise<...>'.
 test/cli/singleton-audit-writes.test.ts(239,8): error TS7006: Parameter 'c' implicitly has an 'any' type.

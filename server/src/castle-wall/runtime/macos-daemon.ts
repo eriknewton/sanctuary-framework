@@ -46,6 +46,7 @@ import type {
   EnforcementAvailabilitySnapshot,
   PolicyReloadRequest,
   PolicyReloadResponse,
+  PolicyReloadStage,
 } from "../ipc/messages.js";
 import {
   buildSignedManifest,
@@ -787,6 +788,7 @@ export async function startMacOSCastleWallDaemon(
       operatorBaseline: unknown;
       exclusiveEgressGate: ExclusiveEgressGatePolicy | undefined;
     } = { agentOrigin, operatorBaseline, exclusiveEgressGate },
+    onStage?: (stage: PolicyReloadStage) => void,
   ): Promise<ManifestState> =>
     loadManifestState({
       fortressPath: input.fortressPath,
@@ -796,6 +798,7 @@ export async function startMacOSCastleWallDaemon(
       operatorBaseline: composition.operatorBaseline,
       exclusiveEgressGate: composition.exclusiveEgressGate,
       systemResolverProvider: async () => resolvers,
+      ...(onStage ? { onReloadStage: onStage } : {}),
       ...(input.globalPinnedPublicKeyPath
         ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
         : {}),
@@ -1732,11 +1735,14 @@ export async function startMacOSCastleWallDaemon(
     });
   }
 
-  async function resolveCurrentCompositionInputs(): Promise<{
+  async function resolveCurrentCompositionInputs(
+    onStage?: (stage: PolicyReloadStage) => void,
+  ): Promise<{
     agentOrigin: unknown;
     operatorBaseline: unknown;
     exclusiveEgressGate: ExclusiveEgressGatePolicy | undefined;
   }> {
+    onStage?.("composition_inputs");
     return {
       agentOrigin: await resolveAgentOrigin(input.fortressPath, input.agentOrigin),
       operatorBaseline: await resolveOperatorBaseline(
@@ -1762,6 +1768,7 @@ export async function startMacOSCastleWallDaemon(
   async function composeAndPublishManifestInWriter(input: {
     resolvers: readonly unknown[];
     beforeCompose?: () => Promise<void>;
+    onStage?: (stage: PolicyReloadStage) => void;
     /** Lifecycle refresh retries an unbroadcast resolver transition; manual reload preserves prior semantics. */
     rollbackLocalStateOnBroadcastFailure: boolean;
   }): Promise<{ emittedSubscribers: number; manifest: ManifestState }> {
@@ -1770,10 +1777,12 @@ export async function startMacOSCastleWallDaemon(
     }
     const candidate = await withReloadDeadline(
       (async () => {
+        input.onStage?.("composition_start");
         await input.beforeCompose?.();
         return await composeManifestForResolvers(
           input.resolvers,
-          await resolveCurrentCompositionInputs(),
+          await resolveCurrentCompositionInputs(input.onStage),
+          input.onStage,
         );
       })(),
       reloadSignDeadlineMs,
@@ -1787,6 +1796,7 @@ export async function startMacOSCastleWallDaemon(
     manifestState = candidate;
     installedManifestResolverSet = canonicalResolverSet(input.resolvers);
     try {
+      input.onStage?.("broadcast");
       const emittedSubscribers = await withReloadDeadline(
         listener!.broadcastManifestUpdate(),
         reloadBroadcastDeadlineMs,
@@ -1804,11 +1814,13 @@ export async function startMacOSCastleWallDaemon(
 
   async function readComposeAndPublishCurrentResolvers(input: {
     beforeCompose?: () => Promise<void>;
+    onStage?: (stage: PolicyReloadStage) => void;
   }): Promise<{ emittedSubscribers: number; manifest: ManifestState }> {
     return await serializeManifestUpdate(async () => {
       // Read INSIDE the same writer tail as compose/sign/broadcast. Reading a
       // manual reload's resolver set before waiting for a monitor publication
       // would let that older snapshot publish after the newer one.
+      input.onStage?.("resolver_read");
       const resolvers = await withReloadDeadline(
         readCurrentResolverSet("reload"),
         reloadSignDeadlineMs,
@@ -1817,6 +1829,7 @@ export async function startMacOSCastleWallDaemon(
       return await composeAndPublishManifestInWriter({
         resolvers,
         ...(input.beforeCompose ? { beforeCompose: input.beforeCompose } : {}),
+        ...(input.onStage ? { onStage: input.onStage } : {}),
         rollbackLocalStateOnBroadcastFailure: false,
       });
     });
@@ -1892,6 +1905,13 @@ export async function startMacOSCastleWallDaemon(
     request?: PolicyReloadRequest,
   ): Promise<PolicyReloadResponse> {
     const requestId = request?.request_id ?? randomBytes(16).toString("hex");
+    const reloadStartedAt = Date.now();
+    let failureStage: PolicyReloadStage = "publication_queue";
+    let failureStageStartedAt = reloadStartedAt;
+    const markStage = (stage: PolicyReloadStage): void => {
+      failureStage = stage;
+      failureStageStartedAt = Date.now();
+    };
     // Preserve the last-known-good signature for the failure response BEFORE any
     // await, so a bounded refusal can be returned without touching (possibly
     // wedged) shared state.
@@ -1903,6 +1923,7 @@ export async function startMacOSCastleWallDaemon(
       // and lifecycle refresh from publishing stale state over one another.
       const published = await readComposeAndPublishCurrentResolvers({
         ...(input.reloadComposeHook ? { beforeCompose: input.reloadComposeHook } : {}),
+        onStage: markStage,
       });
       // Fire-and-forget: the response is returned WITHOUT awaiting the audit.
       recordReloadOutcome(
@@ -1927,9 +1948,24 @@ export async function startMacOSCastleWallDaemon(
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      // A deadline rejects without cancelling its underlying operation. Take
+      // the snapshot now so a later callback cannot rewrite this response's
+      // diagnosis while the abandoned operation winds down.
+      const failedAt = Date.now();
+      const failureStageElapsedMs = Math.max(0, failedAt - failureStageStartedAt);
+      const reloadElapsedMs = Math.max(0, failedAt - reloadStartedAt);
       // Fire-and-forget: a bounded refusal must reach the client even if the
       // audit log is the thing that is wedged.
-      recordReloadOutcome("policy_validation_failed", { error: message }, "failure");
+      recordReloadOutcome(
+        "policy_validation_failed",
+        {
+          error: message,
+          failure_stage: failureStage,
+          failure_stage_elapsed_ms: failureStageElapsedMs,
+          reload_elapsed_ms: reloadElapsedMs,
+        },
+        "failure",
+      );
       return {
         type: "policy_reload_response",
         request_id: requestId,
@@ -1937,6 +1973,9 @@ export async function startMacOSCastleWallDaemon(
         loaded_manifest_signature_b64url: lastKnownSignature,
         loaded_rule_count: manifestState.rules.length,
         error: message,
+        failure_stage: failureStage,
+        failure_stage_elapsed_ms: failureStageElapsedMs,
+        reload_elapsed_ms: reloadElapsedMs,
       };
     }
   }
@@ -2515,10 +2554,13 @@ export async function loadManifestState(input: {
    * are about the same resolver set, never two racing host reads.
    */
   systemResolverProvider?: () => Promise<readonly unknown[]>;
+  /** Optional bounded phase observer used only by manual reload diagnostics. */
+  onReloadStage?: (stage: PolicyReloadStage) => void;
 }): Promise<ManifestState> {
   // Defense-in-depth: cross-check the persisted root-owned pin against the live
   // helper key before trusting this signer to sign a manifest (F-A2-1 #4).
   if (input.signer.mode === "helper") {
+    input.onReloadStage?.("pin_check");
     await assertGlobalPinMatchesLiveKey(
       input.signer.publicKey,
       input.globalPinnedPublicKeyPath ?? CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
@@ -2528,6 +2570,7 @@ export async function loadManifestState(input: {
   const rules: AllowlistRule[] = [];
   let filenames: string[] = [];
   try {
+    input.onReloadStage?.("rule_enumeration");
     filenames = (await readdir(rulesDir)).filter((name) => name.endsWith(".json"));
   } catch (err) {
     const code = err instanceof Error && "code" in err
@@ -2537,6 +2580,7 @@ export async function loadManifestState(input: {
   }
   filenames.sort();
   for (const filename of filenames) {
+    input.onReloadStage?.("rule_read");
     const raw = await readFileCustody(join(rulesDir, filename), {
       verifyPathIdentity: true,
     });
@@ -2570,7 +2614,9 @@ export async function loadManifestState(input: {
   // fresh scutil --dns read, EMPTY on failure -- fail closed, never a grant
   // signed from this long-lived process's stale dns.getServers() snapshot;
   // the 2026-07-12 drill bug); absent when no hostname rules exist.
+  input.onReloadStage?.("distress_read");
   const distressConfig = await readDistressConfig(input.fortressPath);
+  input.onReloadStage?.("resolver_snapshot");
   const resolvers = await (input.systemResolverProvider ?? collectSystemResolvers)();
   // Unified Protect Slice 5 S5-6: the exclusive-routing MODE MARKER decides
   // which composition this manifest gets. Marker ABSENT = coarse (today's
@@ -2582,7 +2628,9 @@ export async function loadManifestState(input: {
   // throws (loadExclusiveRoutingMarker's contract) rather than guessing a
   // mode. This makes the daemon -- the only real manifest producer -- the
   // chokepoint for the BLOCKER-1 routing property on every load AND reload.
+  input.onReloadStage?.("routing_marker_read");
   const routingMarker = await loadExclusiveRoutingMarker(input.fortressPath);
+  input.onReloadStage?.("rule_composition");
   let effectiveRules: AllowlistRule[];
   if (routingMarker !== null) {
     const composition = await composeExclusiveRoutingRules({
@@ -2615,6 +2663,7 @@ export async function loadManifestState(input: {
       createdAt: new Date().toISOString(),
     });
   }
+  input.onReloadStage?.("manifest_sign");
   const { signed } = await buildSignedManifest({
     fortressId: input.fortressId,
     issuedAt: new Date().toISOString(),
@@ -2626,6 +2675,7 @@ export async function loadManifestState(input: {
     agentOrigin: input.agentOrigin,
     operatorBaseline: input.operatorBaseline,
   });
+  input.onReloadStage?.("manifest_verify");
   const verifyResult = verifyManifestSignature(signed, input.signer.publicKey);
   if (!verifyResult.ok) {
     throw new Error(`manifest signature verification failed: ${verifyResult.error}`);

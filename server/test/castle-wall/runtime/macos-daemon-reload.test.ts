@@ -229,6 +229,11 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       const elapsed = Date.now() - started;
       expect(reply.ok).toBe(false);
       expect(reply.error ?? "").toMatch(/did not compose and sign within 50ms/);
+      expect(reply.failure_stage).toBe("manifest_sign");
+      expect(reply.failure_stage_elapsed_ms).toBeGreaterThanOrEqual(0);
+      expect(reply.reload_elapsed_ms).toBeGreaterThanOrEqual(
+        reply.failure_stage_elapsed_ms ?? Number.POSITIVE_INFINITY,
+      );
       // Bounded: nowhere near the client's multi-second deadline.
       expect(elapsed).toBeLessThan(2_000);
     } finally {
@@ -254,6 +259,11 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       const elapsed = Date.now() - started;
       expect(reply.ok).toBe(false);
       expect(reply.error ?? "").toMatch(/manifest broadcast did not complete within 50ms/);
+      expect(reply.failure_stage).toBe("broadcast");
+      expect(reply.failure_stage_elapsed_ms).toBeGreaterThanOrEqual(0);
+      expect(reply.reload_elapsed_ms).toBeGreaterThanOrEqual(
+        reply.failure_stage_elapsed_ms ?? Number.POSITIVE_INFINITY,
+      );
       expect(elapsed).toBeLessThan(2_000);
     } finally {
       await handle.stop();
@@ -536,6 +546,11 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       const elapsed = Date.now() - started;
       expect(reply.ok).toBe(false);
       expect(reply.error ?? "").toMatch(/did not compose and sign within 50ms/);
+      expect(reply.failure_stage).toBe("composition_start");
+      expect(reply.failure_stage_elapsed_ms).toBeGreaterThanOrEqual(0);
+      expect(reply.reload_elapsed_ms).toBeGreaterThanOrEqual(
+        reply.failure_stage_elapsed_ms ?? Number.POSITIVE_INFINITY,
+      );
       expect(elapsed).toBeLessThan(2_000);
     } finally {
       await handle.stop();
@@ -602,6 +617,7 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       // A genuine helper error, NOT the deadline message: refuse-to-arm holds.
       expect(reply.error ?? "").toMatch(/root signer helper unavailable/);
       expect(reply.error ?? "").not.toMatch(/did not respond within/);
+      expect(reply.failure_stage).toBe("manifest_sign");
     } finally {
       helper.setSign("ok");
       await handle.stop();
