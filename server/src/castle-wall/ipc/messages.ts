@@ -85,6 +85,26 @@ export interface PolicyReloadRequest {
   manifest_path?: string;
 }
 
+/** Closed, non-sensitive phase labels for bounded reload failure diagnostics. */
+export const POLICY_RELOAD_STAGES = [
+  "publication_queue",
+  "resolver_read",
+  "composition_start",
+  "composition_inputs",
+  "pin_check",
+  "rule_enumeration",
+  "rule_read",
+  "distress_read",
+  "resolver_snapshot",
+  "routing_marker_read",
+  "rule_composition",
+  "manifest_sign",
+  "manifest_verify",
+  "broadcast",
+] as const;
+
+export type PolicyReloadStage = (typeof POLICY_RELOAD_STAGES)[number];
+
 /** Response from daemon to main confirming reload outcome. */
 export interface PolicyReloadResponse {
   type: "policy_reload_response";
@@ -93,6 +113,12 @@ export interface PolicyReloadResponse {
   loaded_manifest_signature_b64url: string | null;
   loaded_rule_count: number;
   error?: string;
+  /** Last bounded phase entered before a failed reload; never contains a path or rule id. */
+  failure_stage?: PolicyReloadStage;
+  /** Milliseconds spent in `failure_stage` when the failure response was formed. */
+  failure_stage_elapsed_ms?: number;
+  /** Total reload milliseconds when the failure response was formed. */
+  reload_elapsed_ms?: number;
 }
 
 /**

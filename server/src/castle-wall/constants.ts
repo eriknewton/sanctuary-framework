@@ -329,6 +329,16 @@ export const CASTLE_WALL_IPC_NAMESPACE = "castle-wall" as const;
 export const CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS = 20_000 as const;
 
 /**
+ * Largest elapsed value the reload client will render from a daemon reply.
+ * Equality to the client timeout is intentional: a response delivered after
+ * the client deadline cannot be observed through this path, so accepting
+ * larger values would only make untrusted diagnostic output grow without
+ * adding useful timing information.
+ */
+export const CASTLE_WALL_RELOAD_DIAGNOSTIC_MAX_ELAPSED_MS =
+  CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS;
+
+/**
  * Daemon-side backstop deadline (ms) for the compose+sign phase of a policy
  * reload (`reloadPolicy` -> `loadManifestState`). The helper-sign shim already
  * self-bounds at its own timeout; this is an independent ceiling over the WHOLE

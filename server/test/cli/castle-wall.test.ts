@@ -89,6 +89,10 @@ describe("castle-wall CLI verbs", () => {
   async function startFakeReloadDaemon(
     socketPath: string,
     loadedRuleCount: number,
+    failure?: Pick<
+      PolicyReloadResponse,
+      "error" | "failure_stage" | "failure_stage_elapsed_ms" | "reload_elapsed_ms"
+    >,
   ): Promise<{ server: Server; close: () => Promise<void> }> {
     const server = createServer((socket: NetSocket) => {
       let inbound = new Uint8Array(0);
@@ -106,9 +110,10 @@ describe("castle-wall CLI verbs", () => {
             const response: PolicyReloadResponse = {
               type: "policy_reload_response",
               request_id: envelope.params.request_id,
-              ok: true,
+              ok: failure === undefined,
               loaded_manifest_signature_b64url: null,
               loaded_rule_count: loadedRuleCount,
+              ...failure,
             };
             socket.write(
               frame(
@@ -710,7 +715,7 @@ describe("castle-wall CLI verbs", () => {
     expect(err.text()).toContain("no Castle Wall daemon is reachable");
   });
 
-  it("NF-08: reload --require-daemon exits 0 when a daemon answers the reload", async () => {
+  it("NF-08: reload --require-daemon handles success and bounded failure diagnostics", async () => {
     const { fortressPath } = await makeFortress();
     const socketPath = join(fortressPath, "castle.sock");
     const daemon = await startFakeReloadDaemon(socketPath, 3);
@@ -727,6 +732,77 @@ describe("castle-wall CLI verbs", () => {
       expect(err.text()).toBe("");
     } finally {
       await daemon.close();
+    }
+
+    // Valid bounded timings render both numbers, preserving the positive
+    // diagnostic contract alongside the stage-only fallback cases below.
+    const validTimingDaemon = await startFakeReloadDaemon(socketPath, 3, {
+      error: "policy reload timed out",
+      failure_stage: "manifest_sign",
+      failure_stage_elapsed_ms: 12_001,
+      reload_elapsed_ms: 12_018,
+    });
+    try {
+      const err = new CaptureStream();
+      const code = await runReload(["--fortress", fortressPath, "--require-daemon"], {
+        err,
+        platform: "darwin",
+      });
+      expect(code).not.toBe(0);
+      expect(err.text()).toContain("policy reload timed out");
+      expect(err.text()).toContain(
+        "stage=manifest_sign stage_ms=12001 total_ms=12018",
+      );
+    } finally {
+      await validTimingDaemon.close();
+    }
+
+    const unknownStageDaemon = await startFakeReloadDaemon(socketPath, 3, {
+      error: "untrusted stage refused",
+      failure_stage: "private/path/sentinel" as PolicyReloadResponse["failure_stage"],
+      failure_stage_elapsed_ms: 1,
+      reload_elapsed_ms: 2,
+    });
+    try {
+      const err = new CaptureStream();
+      const code = await runReload(["--fortress", fortressPath, "--require-daemon"], {
+        err,
+        platform: "darwin",
+      });
+      expect(code).not.toBe(0);
+      expect(err.text()).toContain("untrusted stage refused");
+      expect(err.text()).not.toContain("private/path/sentinel");
+    } finally {
+      await unknownStageDaemon.close();
+    }
+
+    const malformedTimingCases = [
+      { label: "negative timing", stageMs: -1, totalMs: 12 },
+      // Version-skewed replies outside the current client window deliberately
+      // degrade to stage-only output, even when only total_ms is over the cap.
+      { label: "over-limit timing", stageMs: 12, totalMs: 20_001 },
+      { label: "inconsistent timing", stageMs: 12_003, totalMs: 12_002 },
+    ] as const;
+    for (const { label, stageMs, totalMs } of malformedTimingCases) {
+      const malformedTimingDaemon = await startFakeReloadDaemon(socketPath, 3, {
+        error: `${label} refused`,
+        failure_stage: "manifest_sign",
+        failure_stage_elapsed_ms: stageMs,
+        reload_elapsed_ms: totalMs,
+      });
+      try {
+        const err = new CaptureStream();
+        const code = await runReload(["--fortress", fortressPath, "--require-daemon"], {
+          err,
+          platform: "darwin",
+        });
+        expect(code).not.toBe(0);
+        expect(err.text()).toContain(`${label} refused`);
+        expect(err.text()).toContain("stage=manifest_sign");
+        expect(err.text()).not.toMatch(/stage_ms=|total_ms=/);
+      } finally {
+        await malformedTimingDaemon.close();
+      }
     }
   });
 

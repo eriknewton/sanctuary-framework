@@ -1,10 +1,15 @@
 import { randomBytes } from "node:crypto";
 import { createConnection } from "node:net";
 
-import { CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS } from "../constants.js";
+import {
+  CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS,
+  CASTLE_WALL_RELOAD_DIAGNOSTIC_MAX_ELAPSED_MS,
+} from "../constants.js";
 import { frame, parseFrame } from "../ipc/framing.js";
+import { POLICY_RELOAD_STAGES } from "../ipc/messages.js";
 import type {
   CastleWallMessage,
+  PolicyReloadStage,
   PolicyReloadResponse,
 } from "../ipc/messages.js";
 import { resolveCastleWallSocketPath } from "./socket-path.js";
@@ -83,6 +88,35 @@ function isSocketUnavailable(error: unknown): boolean {
   );
 }
 
+function isPolicyReloadStage(value: unknown): value is PolicyReloadStage {
+  return typeof value === "string" &&
+    (POLICY_RELOAD_STAGES as readonly string[]).includes(value);
+}
+
+function isBoundedElapsedMs(value: unknown): value is number {
+  return typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= CASTLE_WALL_RELOAD_DIAGNOSTIC_MAX_ELAPSED_MS;
+}
+
+function formatReloadFailure(reply: PolicyReloadResponse): string {
+  const message = reply.error ?? "policy reload failed";
+  if (!isPolicyReloadStage(reply.failure_stage)) {
+    return message;
+  }
+  const stageElapsedMs = reply.failure_stage_elapsed_ms;
+  const totalElapsedMs = reply.reload_elapsed_ms;
+  if (
+    !isBoundedElapsedMs(stageElapsedMs) ||
+    !isBoundedElapsedMs(totalElapsedMs) ||
+    stageElapsedMs > totalElapsedMs
+  ) {
+    return `${message} [stage=${reply.failure_stage}]`;
+  }
+  return `${message} [stage=${reply.failure_stage} stage_ms=${stageElapsedMs} total_ms=${totalElapsedMs}]`;
+}
+
 /**
  * Ask the running Castle Wall policy daemon for this fortress to re-read,
  * re-compose, re-sign, and broadcast its manifest. FAIL-CLOSED result shape:
@@ -108,7 +142,7 @@ export async function requestPolicyReload(
       CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS,
     );
     if (!reply.ok) {
-      return { ok: false, error: reply.error ?? "policy reload failed" };
+      return { ok: false, error: formatReloadFailure(reply) };
     }
     return { ok: true, loadedRuleCount: reply.loaded_rule_count };
   } catch (error) {
