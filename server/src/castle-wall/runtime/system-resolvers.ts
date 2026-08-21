@@ -107,6 +107,12 @@ export interface CollectSystemResolversOptions {
   getServersFn?: () => string[];
   /** Defaults to running `/usr/sbin/scutil --dns` (deadline-bounded). */
   runScutilDns?: () => Promise<string>;
+  /**
+   * Optional operator-facing failure sink. The returned resolver set remains
+   * empty on a macOS read failure, so callers can retain fail-closed behavior
+   * while making a long-lived lifecycle monitor's failure observable.
+   */
+  onMacOSFailure?: (error: unknown) => void;
 }
 
 async function runScutilDnsReal(): Promise<string> {
@@ -136,7 +142,8 @@ export async function collectSystemResolvers(
   let scutilOutput: string;
   try {
     scutilOutput = await (options.runScutilDns ?? runScutilDnsReal)();
-  } catch {
+  } catch (error) {
+    options.onMacOSFailure?.(error);
     return [];
   }
   return parseScutilDnsNameservers(scutilOutput);
