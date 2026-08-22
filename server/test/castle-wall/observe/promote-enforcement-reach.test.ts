@@ -69,6 +69,10 @@ import {
   exclusiveRoutingMarkerPath,
   renderExclusiveRoutingMarker,
 } from "../../../src/castle-wall/allowlist/index.js";
+import {
+  encodeRuleFilename,
+  parseRuleId,
+} from "../../../src/castle-wall/allowlist/rule-identity.js";
 import { ExclusiveRoutingViolationError } from "../../../src/castle-wall/allowlist/exclusive-routing.js";
 import type { ExclusiveEgressGatePolicy } from "../../../src/castle-wall/allowlist/gate-derivation.js";
 import { promoteCandidates, type PromoteOutcome } from "../../../src/castle-wall/observe/promote.js";
@@ -644,7 +648,12 @@ describe("observe promote reaches live enforcement (the real composer, not promo
       },
       new FilesystemManifestStorage(egressDir),
     );
-    const provisionedPath = join(egressDir, "rules", "provisioned-hermes-abc123def456.json");
+    // Derive the rule filename using the same contract as publishSignedManifest.
+    const parsedId = parseRuleId(provisionedRule.id);
+    expect(parsedId.ok).toBe(true);
+    if (!parsedId.ok) throw new Error("unreachable");
+    const encodedFilename = encodeRuleFilename(parsedId.value);
+    const provisionedPath = join(egressDir, "rules", encodedFilename);
     const bytesBefore = await readFile(provisionedPath);
 
     const outcome = await promoteViaProductionWiring(candidate("api.newlyapproved.example"));

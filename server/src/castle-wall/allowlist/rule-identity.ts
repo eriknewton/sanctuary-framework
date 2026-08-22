@@ -1,8 +1,10 @@
 /**
  * Stable rule identity and manifest filename contract.
  *
- * MANIFEST-RULEID-PATH-01: readers accept only the exact encoded-v1 or
- * legacy-safe relation. The publisher remains legacy-safe until PR 2.
+ * MANIFEST-RULEID-PATH-01: the producer (manifest-publisher.ts) writes
+ * encoded_v1 filenames (rid1_<base64url(id)>.json). Readers accept both
+ * encoded_v1 and legacy_safe for backward compatibility with already-persisted
+ * manifests.
  */
 
 import { bytesToString, fromBase64urlStrict, stringToBytes, toBase64url } from "../../core/encoding.js";

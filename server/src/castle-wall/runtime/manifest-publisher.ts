@@ -31,7 +31,7 @@ import type {
 import { validateAgentOrigin } from "../allowlist/agent-origin.js";
 import { validateOperatorBaseline } from "../allowlist/operator-baseline.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
-import { parseRuleId } from "../allowlist/rule-identity.js";
+import { encodeRuleFilename, parseRuleId } from "../allowlist/rule-identity.js";
 import { RuntimeManifestPublishError } from "./errors.js";
 import { ED25519_SIGNATURE_BYTES } from "../../core/crypto-suite-registry.js";
 // `rule.id` is type-checked just above but is unbounded in length, so the
@@ -158,7 +158,14 @@ export async function buildSignedManifest(input: BuildSignedManifestInput): Prom
     // ids sharing a long prefix would collapse to one filename and one rule's
     // file would overwrite the other's while the manifest recorded two digests.
     // Bounding belongs on text a human reads, never on a value a system uses.
-    const filename = `${parsedRuleId.value}.json`;
+    //
+    // PR-2 (MANIFEST-RULEID-PATH-01): use the code-controlled injective
+    // `encodeRuleFilename` relation (rid1_<base64url(id)>.json) so the
+    // filename never inherits shell-unsafe or path-traversal characters from
+    // the rule id, and the id→filename mapping is always lossless and distinct.
+    // Consumers continue to accept both encoded_v1 and legacy_safe for
+    // backward compatibility with already-persisted manifests.
+    const filename = encodeRuleFilename(parsedRuleId.value);
     const bytes = renderRuleFile(rule);
     const digest = sha256Hex(bytes);
     entries.push({ rule_id: rule.id, file: filename, sha256: digest });
