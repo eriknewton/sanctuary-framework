@@ -1,0 +1,12 @@
+# Detector attribution of the 11 refused files (real corpus, identical in cycles 1-3).
+# Method: scratch mirror of the detector list in server/src/sdw/write-gate.ts classifyText,
+# run per file; the mirror flagged exactly the same 11 of 487 files the CLI refused.
+# Counts and classes only. File names withheld (they are titles of private memory).
+keyword_gated_high_entropy   7 files   (MEMORY.md is one of these)
+known_secret_token           4 files
+# Of the 7 keyword_gated_high_entropy files, 6 fire only at whole-file scope (no single
+# line trips the detector on its own): the gating keyword and the high-entropy candidate
+# are on different lines. 1 file has a single self-contained offending line.
+# MEMORY.md specifics: keyword hits = token x3, authorization x1; 153 candidates of 32+
+# chars; exactly 1 has Shannon entropy >= 4.5 (measured 4.537, length 46, a mixed
+# letters-digits-hyphens-underscores identifier, not a link target, not a memory slug).

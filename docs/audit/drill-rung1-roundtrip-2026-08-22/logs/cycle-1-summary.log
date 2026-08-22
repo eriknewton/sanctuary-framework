@@ -1,0 +1,43 @@
+[cycle-1] init fortress-1-a exit=0
+[cycle-1] init fortress-1-b exit=0
+[cycle-1] init fortress-1-c exit=0
+[cycle-1] init fortress-1-d exit=0
+[cycle-1] source tree: cc-memory-snapshot
+[cycle-1] C1 ingest exit=0
+memory_ingest: ingested 476 of 487 Claude Code memory files into owner_ref fleet-self
+memory_ingest: WARNING - the mirror is INCOMPLETE. 11 file(s) were refused by the secret classifier and are NOT in the vault:
+memory_ingest: remove the sensitive material from those files or keep them outside the mirrored directory, then re-run.
+[cycle-1] C1 refused_count=11
+[cycle-1] C1 MEMORY.md=REFUSED
+[cycle-1] C1 refusal classes:  11 classifier_reject;
+[cycle-1] C2 emit exit=0
+memory_emit: emitted 476 Claude Code memory files to cycle-1/emit-cc (index_present: no)
+memory_emit: WARNING - emitted tree is missing MEMORY.md and cannot be re-ingested as a Claude Code memory directory.
+[cycle-1] C2 accepted=476 byte_identical=476 differ=0 missing_from_emit=0 extra_in_emit=0 emitted_total=476
+[cycle-1] C2 diff -rq non-'Only in snapshot' lines=0
+[cycle-1] C2 delta (md only in snapshot)=11 equals refused set: yes
+[cycle-1] C2 link_targets=189 accepted_targets=189 present_in_emit=189 missing_in_emit=0 emitted_MEMORY.md=no
+[cycle-1] C3 reingest exit=1
+memory_ingest failed: Claude Code memory directory is missing MEMORY.md
+[cycle-1] C4 phrase P1 (len 35) plaintext hits under fortress-1-a=0
+[cycle-1] C4 phrase P1 hits in emitted plaintext tree (control, expected >0 for P2)=1
+[cycle-1] C4 phrase P2 (len 40) plaintext hits under fortress-1-a=0
+[cycle-1] C4 phrase P2 hits in emitted plaintext tree (control, expected >0 for P2)=1
+[cycle-1] C4 raw passage file: fortress-1-a/state/_sdw_document_corpus/doc.mem.fleet-self.92fb1acb145a215fb917bd1ddacdf1d8.enc size=1905 printable_ratio=1.00 contains_P2=0
+[cycle-1] C4 fortress file count=977 namespaces=_audit _audit_checkpoints _meta _sdw_document_corpus sdw_memory_locks 
+[cycle-1] C5 ingest exit=0
+memory_ingest: ingested 3 of 3 Codex memory files into owner_ref fleet-self
+[cycle-1] C5 emit exit=0
+memory_emit: emitted 3 Codex memory files to cycle-1/emit-codex (index_present: yes)
+[cycle-1] C5 MEMORY.md byte_identical=yes
+[cycle-1] C5 memory_summary.md byte_identical=yes
+[cycle-1] C5 raw_memories.md byte_identical=yes
+[cycle-1] C5 emitted file list: MEMORY.md memory_summary.md raw_memories.md 
+[cycle-1] C5 canary hits under fortress-1-c=0 canary hits in emit-codex=0
+[cycle-1] C5 reingest exit=0
+memory_ingest: ingested 3 of 3 Codex memory files into owner_ref fleet-self
+[cycle-1] C6 transcode exit=1
+memory_transcode failed: vault has no complete claude-code memory snapshot: MEMORY.md is absent
+[cycle-1] C6 no archive id (transcode failed)
+memory_transcode failed: vault has no complete claude-code memory snapshot: MEMORY.md is absent
+[cycle-1] DONE

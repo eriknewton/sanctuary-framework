@@ -1,0 +1,43 @@
+[cycle-S1] init fortress-S1-a exit=0
+[cycle-S1] init fortress-S1-b exit=0
+[cycle-S1] init fortress-S1-c exit=0
+[cycle-S1] init fortress-S1-d exit=0
+[cycle-S1] source tree: cc-scrubbed
+[cycle-S1] C1 ingest exit=0
+memory_ingest: ingested 477 of 477 Claude Code memory files into owner_ref fleet-self
+[cycle-S1] C1 refused_count=0
+[cycle-S1] C1 MEMORY.md=ACCEPTED
+[cycle-S1] C1 refusal classes: 
+[cycle-S1] C2 emit exit=0
+memory_emit: emitted 477 Claude Code memory files to cycle-S1/emit-cc (index_present: yes)
+[cycle-S1] C2 accepted=477 byte_identical=477 differ=0 missing_from_emit=0 extra_in_emit=0 emitted_total=477
+[cycle-S1] C2 diff -rq non-'Only in snapshot' lines=0
+[cycle-S1] C2 delta (md only in snapshot)=0 equals refused set: yes
+[cycle-S1] C2 link_targets=189 accepted_targets=189 present_in_emit=189 missing_in_emit=0 emitted_MEMORY.md=yes
+[cycle-S1] C3 reingest exit=0
+memory_ingest: ingested 477 of 477 Claude Code memory files into owner_ref fleet-self
+[cycle-S1] C4 phrase P1 (len 58) plaintext hits under fortress-S1-a=0
+[cycle-S1] C4 phrase P1 hits in emitted plaintext tree (control, expected >0 for P2)=1
+[cycle-S1] C4 phrase P2 (len 40) plaintext hits under fortress-S1-a=0
+[cycle-S1] C4 phrase P2 hits in emitted plaintext tree (control, expected >0 for P2)=1
+[cycle-S1] C4 raw passage file: fortress-S1-a/state/_sdw_document_corpus/chunk.mem.fleet-self.d183966c538c4819c68bd5f155ff0b2c.000000.c000000.enc size=4195 printable_ratio=1.00 contains_P2=0
+[cycle-S1] C4 fortress file count=981 namespaces=_audit _audit_checkpoints _meta _sdw_document_corpus sdw_memory_locks 
+[cycle-S1] C5 ingest exit=0
+memory_ingest: ingested 3 of 3 Codex memory files into owner_ref fleet-self
+[cycle-S1] C5 emit exit=0
+memory_emit: emitted 3 Codex memory files to cycle-S1/emit-codex (index_present: yes)
+[cycle-S1] C5 MEMORY.md byte_identical=yes
+[cycle-S1] C5 memory_summary.md byte_identical=yes
+[cycle-S1] C5 raw_memories.md byte_identical=yes
+[cycle-S1] C5 emitted file list: MEMORY.md memory_summary.md raw_memories.md 
+[cycle-S1] C5 canary hits under fortress-S1-c=0 canary hits in emit-codex=0
+[cycle-S1] C5 reingest exit=0
+memory_ingest: ingested 3 of 3 Codex memory files into owner_ref fleet-self
+[cycle-S1] C6 transcode exit=0
+memory_transcode: projected 477 Claude Code source files into 3 Codex plaintext files at cycle-S1/transcode
+memory_transcode: exact source recovery archive_id <id>
+[cycle-S1] C6 restore exit=0
+memory_transcode_restore: restored 477 exact Claude Code source files to cycle-S1/restore
+[cycle-S1] C6 restore vs emit diff lines=0
+[cycle-S1] C6 label 'descriptive and unsigned' present in transcode MEMORY.md=1 memory_class string present=cycle-S1/transcode/raw_memories.md:0 cycle-S1/transcode/MEMORY.md:0 cycle-S1/transcode/memory_summary.md:0 
+[cycle-S1] DONE
