@@ -1,10 +1,13 @@
 /**
  * Internal signing-domain prefixes.
  *
- * Every payload Sanctuary signs with a managed identity key for an INTERNAL
- * protocol purpose is domain-separated by one of these prefixes, so a
- * signature over one artifact can never be replayed as another. The list is
- * the single source both sides pin on:
+ * Payloads Sanctuary signs with a managed identity key for an INTERNAL
+ * protocol purpose are domain-separated by prefixes like these, so a
+ * signature over one artifact can never be replayed as another. This file
+ * holds the SDW export domains (their only declaration) and mirrors the
+ * state-store and audit/receipt domains (declared at their producers, pinned
+ * here by must-match comments); see the SCOPE note on
+ * INTERNAL_SIGNING_DOMAIN_PREFIXES. Two sides use it:
  *
  *   - producers (for example `sdw/export.ts`) import their domain constant
  *     from HERE rather than declaring a local literal;
@@ -14,7 +17,7 @@
  *     internal verifier would accept (the triggering shape: a hand-built
  *     `sdw_export_delete` manifest signed through `identity_sign`).
  *
- * Adding a new internally signed artifact means adding its domain here; a
+ * Adding a new identity-signed artifact means adding its domain here; a
  * structural test asserts `export.ts` declares no local `sanctuary.*\n`
  * signing domain of its own.
  */
@@ -26,10 +29,41 @@ export const SDW_EXPORT_SCOPE_DIGEST_DOMAIN = "sanctuary.sdw-export-scope-digest
 /** Signing domain for the SDW export manifest (Ed25519 via core/identity.ts). */
 export const SDW_EXPORT_MANIFEST_SIGNING_DOMAIN = "sanctuary.sdw-export-manifest.v1\n";
 
+/**
+ * State-store artifacts signed or MAC'd under identity-derived or
+ * master-derived keys (must match `STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX`,
+ * `LEGACY_STATE_ENVELOPE_SIGNING_DOMAIN` and `STATE_EXPORT_BUNDLE_MAC_DOMAIN`
+ * in cognitive/state-store.ts). Listed as PREFIXES: every versioned state
+ * envelope domain starts with the first entry.
+ */
+export const STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX = "sanctuary.state-envelope.v";
+export const STATE_EXPORT_BUNDLE_MAC_DOMAIN = "sanctuary.state-export-bundle.v1\n";
+
+/**
+ * Managed-identity audit-event and internal-receipt signing domains (must
+ * match AUDIT_EVENT_SIGNING_DOMAIN / INTERNAL_RECEIPT_SIGNING_DOMAIN in
+ * cognitive/tools.ts, which cannot import this file's consumers).
+ */
+export const AUDIT_EVENT_SIGNING_DOMAIN_PREFIX = "sanctuary.audit.v1";
+export const INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX = "sanctuary.receipt.v1";
+
+/**
+ * Prefixes the raw `identity_sign` surface refuses. EXACT SCOPE, nothing
+ * more: the SDW export domains, the state-store envelope and export-bundle
+ * domains, and the managed-identity audit-event and receipt domains. This is
+ * NOT a registry of every signing domain in the tree: MAC-only domains keyed
+ * under master-derived secrets (audit anchors, custody journals, federation
+ * records) are not listed because an identity signature cannot satisfy them,
+ * and any future identity-signed artifact must add its domain here.
+ */
 export const INTERNAL_SIGNING_DOMAIN_PREFIXES: readonly string[] = [
   SDW_EXPORT_RECORD_HASH_DOMAIN,
   SDW_EXPORT_SCOPE_DIGEST_DOMAIN,
   SDW_EXPORT_MANIFEST_SIGNING_DOMAIN,
+  STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX,
+  STATE_EXPORT_BUNDLE_MAC_DOMAIN,
+  AUDIT_EVENT_SIGNING_DOMAIN_PREFIX,
+  INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX,
 ];
 
 const encoder = new TextEncoder();

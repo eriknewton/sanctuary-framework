@@ -1575,11 +1575,14 @@ export async function createSanctuaryServer(options?: {
     isolationGuard: sdwMemoryIsolationGuard,
   });
 
-  // 16b1a. SDW vault export / import / post-export delete (IC-15). MUST-NEVER
-  // #2 requires every persisted agent output to be inspectable, exportable and
-  // deletable; these are the shipped surfaces for the `_sdw_*` namespaces.
-  // All three are force-pinned Tier 1 in the policy loader (FORCED_TIER1
-  // _OPERATIONS; must match the names in principal-policy/loader.ts). Bundles
+  // 16b1a. SDW vault export / import (IC-15). MUST-NEVER #2 requires every
+  // persisted agent output to be inspectable, exportable and deletable; these
+  // are the shipped export/import surfaces for the `_sdw_*` namespaces.
+  // `sdw_export_delete` is deliberately NOT registered: it needs a
+  // backend-wide serialization boundary that does not exist yet. Both shipped
+  // tools are force-pinned Tier 1 (NON_RELAXABLE_SDW_VAULT_TIER1_OPERATIONS
+  // in principal-policy/loader.ts; must match the names createSdwTools
+  // registers). Bundles
   // are written only under the fortress's own export directory (the agent
   // chooses a filename stem, never a path), carry ciphertext only, and are
   // signed by the fortress's primary identity; the signing key is resolved at
@@ -2061,7 +2064,6 @@ const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([
   "sanctuary_link_to_human",
   "sanctuary_sign_challenge",
   "sdw_export",
-  "sdw_export_delete",
   "sdw_import",
   "shr_gateway_export",
   "shr_generate",

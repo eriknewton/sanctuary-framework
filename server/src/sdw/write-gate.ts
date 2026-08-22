@@ -196,7 +196,46 @@ export async function writeReplayAnchor(
  * authorization as every other SDW-namespace write so the raw-write guard
  * accepts exactly these bytes and nothing else.
  */
-/** Write the owner pin through the gate (the only SDW-namespace writer for it). */
+/**
+ * Create the owner pin only if none exists (exclusive create through the
+ * backend's `writeIfAbsent`). Returns "created", "exists", or "unsupported"
+ * when the backend has no create-if-absent capability (the guard then fails
+ * closed rather than falling back to an overwrite).
+ */
+export async function createSdwOwnerPinIfAbsent(
+  backend: Pick<StorageBackend, "writeIfAbsent">,
+  masterKey: Uint8Array,
+  data: SdwOwnerPinData,
+): Promise<"created" | "exists" | "unsupported"> {
+  if (typeof backend.writeIfAbsent !== "function") return "unsupported";
+  const prepared = prepareSdwOwnerPinWrite(masterKey, data);
+  const created = await backend.writeIfAbsent(prepared.namespace, prepared.storageKey, prepared.data);
+  return created ? "created" : "exists";
+}
+
+/**
+ * Claim an UNCLAIMED pin: replace the record only if its current bytes are
+ * exactly `expectedRaw` (the verified null-id record the caller just read).
+ * Never an overwrite: a record that changed since the read is not replaced.
+ */
+export async function claimSdwOwnerPin(
+  backend: Pick<StorageBackend, "replaceIfEquals">,
+  masterKey: Uint8Array,
+  expectedRaw: Uint8Array,
+  data: SdwOwnerPinData,
+): Promise<"claimed" | "changed" | "unsupported"> {
+  if (typeof backend.replaceIfEquals !== "function") return "unsupported";
+  const prepared = prepareSdwOwnerPinWrite(masterKey, data);
+  const replaced = await backend.replaceIfEquals(
+    prepared.namespace,
+    prepared.storageKey,
+    expectedRaw,
+    prepared.data,
+  );
+  return replaced ? "claimed" : "changed";
+}
+
+/** Write the owner pin through the gate (master rotation restamp only; the guard never overwrites). */
 export async function writeSdwOwnerPin(
   backend: Pick<StorageBackend, "write">,
   masterKey: Uint8Array,
@@ -204,6 +243,53 @@ export async function writeSdwOwnerPin(
 ): Promise<void> {
   const prepared = prepareSdwOwnerPinWrite(masterKey, data);
   await backend.write(prepared.namespace, prepared.storageKey, prepared.data);
+}
+
+/** Read and verify the owner pin: absent, valid, or invalid (fail closed). */
+export async function readSdwOwnerPin(
+  storage: Pick<StorageBackend, "read">,
+  masterKey: Uint8Array,
+): Promise<
+  | { readonly status: "absent" }
+  | { readonly status: "valid"; readonly data: SdwOwnerPinData; readonly raw: Uint8Array }
+  | { readonly status: "invalid" }
+> {
+  const raw = await storage.read(SDW_META_NAMESPACE, SDW_OWNER_PIN_KEY);
+  if (raw === null) return { status: "absent" };
+  const verified = verifySdwOwnerPinEnvelope(masterKey, raw);
+  return verified.status === "valid" ? { ...verified, raw } : verified;
+}
+
+/**
+ * Master rotation step for the owner pin (called from core/master-rotation.ts
+ * for the `_sdw_meta` namespace; must stay the only writer of this record
+ * besides `writeSdwOwnerPin`). Dual-master transitional verification, same
+ * contract as the audit MAC anchors: a pin already valid under the NEW master
+ * is tolerated (resume); valid under the OLD master is restamped under the new
+ * one; a record failing BOTH is tamper and aborts the rotation rather than
+ * being restamped into validity.
+ */
+export async function restampSdwOwnerPinForRotation(args: {
+  storage: Pick<StorageBackend, "read" | "write">;
+  oldMaster: Uint8Array;
+  newMaster: Uint8Array;
+  verifyOnly: boolean;
+}): Promise<"absent" | "already-new" | "converted"> {
+  const raw = await args.storage.read(SDW_META_NAMESPACE, SDW_OWNER_PIN_KEY);
+  if (raw === null) return "absent";
+  const underNew = verifySdwOwnerPinEnvelope(args.newMaster, raw);
+  if (underNew.status === "valid") return "already-new";
+  const underOld = verifySdwOwnerPinEnvelope(args.oldMaster, raw);
+  if (underOld.status !== "valid") {
+    throw new SdwValidationError(
+      "owner_pin_tampered",
+      `${SDW_META_NAMESPACE}/${SDW_OWNER_PIN_KEY} failed authentication under both the old and the new master; rotation must not restamp it`,
+    );
+  }
+  if (!args.verifyOnly) {
+    await writeSdwOwnerPin(args.storage, args.newMaster, underOld.data);
+  }
+  return "converted";
 }
 
 export function prepareSdwOwnerPinWrite(

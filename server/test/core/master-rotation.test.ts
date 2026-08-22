@@ -108,6 +108,11 @@ import {
   FEDERATION_REISSUE_CHALLENGE_STORE_HKDF_INFO,
 } from "../../src/v1/federation-reissue-challenge-store.js";
 import { rotateKeys, type StoredIdentity } from "../../src/core/identity.js";
+import { writeSdwOwnerPin } from "../../src/sdw/write-gate.js";
+import {
+  createPersistentMultiAgentIsolationGuard,
+  readSdwOwnerPin,
+} from "../../src/sdw/memory-isolation.js";
 
 const PASSPHRASE = "rotation-test-passphrase";
 const KID = "agent-rotate-1";
@@ -435,6 +440,40 @@ describe("master rotation — happy path", () => {
     expect(before?.signature_verified).toBe(true);
     expect(after?.value).toBe("written after identity rotation");
     expect(after?.signature_verified).toBe(true);
+  });
+
+  it("MEDIUM-N1: a fortress carrying the SDW owner pin rotates, and the guard still resolves under the new master", async () => {
+    const fortress = await buildFortress();
+    await writeSdwOwnerPin(fortress.storage, fortress.master, {
+      version: 1,
+      fortress_id: "fortress-rot",
+      owner_ref: "fleet-self",
+      agent_id: "claude_code:fortress-rot",
+      pinned_at: "2026-08-22T00:00:00.000Z",
+    });
+    await rotateMaster(rotateOpts(fortress));
+    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    // The old master no longer verifies the pin; the new one does, with the data intact.
+    expect((await readSdwOwnerPin(fortress.storage, fortress.master)).status).toBe("invalid");
+    const pin = await readSdwOwnerPin(fortress.storage, est.masterKey);
+    expect(pin.status).toBe("valid");
+    expect((pin as { data: { agent_id: string } }).data.agent_id).toBe("claude_code:fortress-rot");
+    const guard = createPersistentMultiAgentIsolationGuard({
+      storage: fortress.storage,
+      masterKey: est.masterKey,
+      fortressId: "fortress-rot",
+      ownerRef: "fleet-self",
+      ownerIdentity: () => "claude_code:fortress-rot",
+    });
+    expect(await guard("memory_count")).toEqual({ allowed: true });
+    const other = createPersistentMultiAgentIsolationGuard({
+      storage: fortress.storage,
+      masterKey: est.masterKey,
+      fortressId: "fortress-rot",
+      ownerRef: "fleet-self",
+      ownerIdentity: () => "cursor:fortress-rot",
+    });
+    expect(await other("memory_count")).toEqual({ allowed: false, reason: "owner_scope_conflict" });
   });
 
   it("re-encrypts the castle pin file in place", async () => {

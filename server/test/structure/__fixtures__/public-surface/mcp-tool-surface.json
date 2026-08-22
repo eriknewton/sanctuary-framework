@@ -2076,21 +2076,6 @@
     }
   },
   {
-    "name": "sdw_export_delete",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "manifest": {
-          "type": "string",
-          "description": "Base64url-encoded signed export manifest from a completed sdw_export"
-        }
-      },
-      "required": [
-        "manifest"
-      ]
-    }
-  },
-  {
     "name": "sdw_import",
     "inputSchema": {
       "type": "object",

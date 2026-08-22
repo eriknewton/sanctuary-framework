@@ -20,7 +20,8 @@
  *   happens exclusively inside an approved import). Export never decrypts.
  */
 
-import { rename, unlink, writeFile } from "node:fs/promises";
+import { lstat, open, rename, unlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import type { EncryptedPayload } from "../core/encryption.js";
 import { bytesToString, stringToBytes, toBase64url } from "../core/encoding.js";
@@ -512,6 +513,44 @@ const defaultFs: SdwExportFs = {
  * A crash or failure at any point leaves NO partial bundle at the destination
  * path; the temp file is best-effort cleaned on failure.
  */
+/**
+ * fd-based write inside a fresh per-export directory (see tools.ts
+ * prepareExportDestination): the temp file is opened O_CREAT|O_EXCL (a
+ * planted symlink is refused, not followed), written and fsynced through the
+ * handle, renamed within the same directory, then the final path is lstat'ed
+ * and its inode compared with the handle's, so the bytes at the destination
+ * are provably the bytes this call wrote.
+ */
+export async function writeSdwExportBundleInFreshDir(
+  bundle: SdwStateExportBundle,
+  freshDir: string,
+  destinationPath: string,
+): Promise<void> {
+  const tempPath = join(freshDir, `.tmp-${randomBytes(8).toString("hex")}`);
+  const handle = await open(tempPath, "wx", 0o600);
+  let inode: bigint;
+  try {
+    await handle.writeFile(JSON.stringify(bundle));
+    await handle.sync();
+    inode = (await handle.stat({ bigint: true })).ino;
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    await unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
+  await handle.close();
+  try {
+    await rename(tempPath, destinationPath);
+    const final = await lstat(destinationPath, { bigint: true });
+    if (final.isSymbolicLink() || final.ino !== inode) {
+      throw new Error("export destination is not the file this export wrote");
+    }
+  } catch (error) {
+    await unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function writeSdwExportBundleAtomic(
   bundle: SdwStateExportBundle,
   destinationPath: string,

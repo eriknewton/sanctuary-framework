@@ -111,7 +111,6 @@ approval_channel:
       "state_disclose_unattributed",
       "sdw_export",
       "sdw_import",
-      "sdw_export_delete",
     ]);
     expect(policy.approval_channel.type).toBe("stderr");
   });
@@ -144,7 +143,6 @@ approval_channel:
       "state_disclose_unattributed",
       "sdw_export",
       "sdw_import",
-      "sdw_export_delete",
     ]);
   });
 

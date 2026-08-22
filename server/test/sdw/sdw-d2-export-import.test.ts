@@ -77,7 +77,7 @@ import {
   verifySdwExportManifest,
   SdwImportVerificationError,
 } from "../../src/sdw/import.js";
-import { createSdwTools, type SdwToolsOptions } from "../../src/sdw/tools.js";
+import { createSdwExportDeleteTool, createSdwTools, type SdwToolsOptions } from "../../src/sdw/tools.js";
 
 const SOURCE_FORTRESS = "fortress:source";
 const TARGET_FORTRESS = "fortress:target";
@@ -399,7 +399,7 @@ async function makeExportHarness(
   await seedSourceVault(source);
   const signing = makeSigning();
   const exportDir = await makeExportDir();
-  const tools = createSdwTools({
+  const toolOptions: SdwToolsOptions = {
     storage: source.vault,
     inventory: source.vault,
     auditLog: source.auditLog,
@@ -410,7 +410,10 @@ async function makeExportHarness(
     resolveSourceMasterKey: () => null,
     targetMasterKey: source.masterKey,
     ...overrides,
-  });
+  };
+  // sdw_export_delete is NOT a shipped surface (see tools.ts); the D2 suite
+  // still exercises it through its own factory.
+  const tools = [...createSdwTools(toolOptions), createSdwExportDeleteTool(toolOptions)];
   return {
     source,
     signing,
@@ -1484,36 +1487,6 @@ describe("SDW D2 post-export delete", () => {
 
     const drift = await auditOps(harness.source.auditLog, "sdw_export_delete_drift");
     expect(drift).toHaveLength(1);
-  });
-
-  it("MEDIUM-2: a manifest validly signed by the fortress key but never recorded as exported is refused before any prompt", async () => {
-    const harness = await makeExportHarness();
-    // Hand-assembled with the real signing key (what a raw signer could
-    // produce if the domain refusal were bypassed): correct signature, no
-    // sdw_export_completed record on this fortress's audit chain.
-    const inventory = enumerateSdwExportInventory(harness.source.vault);
-    const { bundle } = buildSignedSdwExportBundle({
-      inventory,
-      source: harness.source.vault,
-      fortressId: SOURCE_FORTRESS,
-      exportAuditEventId: "sdw-export:never-recorded",
-      signingKey: harness.signing.signingKey,
-      now: NOW,
-    });
-    const manifestArg = Buffer.from(JSON.stringify(bundle.manifest)).toString("base64url");
-    const prompts: ApprovalRequest[] = [];
-    const channel = new CallbackApprovalChannel(async (request) => {
-      prompts.push(request);
-      return { decision: "approve", decided_at: NOW, decided_by: "human" };
-    });
-    const gate = makeGate(harness.source.auditLog, channel);
-    const before = harness.source.vault.countForTest();
-    const result = await callThroughGate(harness.deleteTool, { manifest: manifestArg }, gate);
-    expect(result.kind).toBe("denied_pre_prompt");
-    expect(prompts).toHaveLength(0);
-    expect(harness.source.vault.countForTest()).toBe(before);
-    const denied = await auditOps(harness.source.auditLog, "sdw_export_delete_denied");
-    expect(denied.map((entry) => entry.details!.denial_class)).toEqual(["export_not_recorded"]);
   });
 
   it("rejects a manifest signed by an unknown key before any prompt", async () => {

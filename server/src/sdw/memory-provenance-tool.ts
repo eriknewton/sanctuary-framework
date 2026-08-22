@@ -141,12 +141,15 @@ export function createSdwMemoryProvenanceTool(
       required: ["passage_id"],
     },
     handler: async (args) => {
-      if (
-        options.isolationGuard !== undefined &&
-        !(await options.isolationGuard("sdw_memory_provenance")).allowed
-      ) {
-        await auditFailure({ denial_class: SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS });
-        return deny();
+      if (options.isolationGuard !== undefined) {
+        const verdict = await options.isolationGuard("sdw_memory_provenance");
+        if (!verdict.allowed) {
+          await auditFailure({
+            denial_class: SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS,
+            denial_reason: verdict.reason,
+          });
+          return deny();
+        }
       }
       const passageId = args.passage_id;
       if (typeof passageId !== "string" || passageId.length === 0) {

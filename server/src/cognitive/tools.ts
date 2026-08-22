@@ -51,6 +51,8 @@ import {
 // STORE-ERRMSG-INTERP-01).
 import { describeUntrusted } from "../errors/index.js";
 
+// Must match AUDIT_EVENT_SIGNING_DOMAIN_PREFIX / INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX
+// in core/signing-domains.ts (the identity_sign refusal list).
 export const AUDIT_EVENT_SIGNING_DOMAIN = "sanctuary.audit.v1";
 export const INTERNAL_RECEIPT_SIGNING_DOMAIN = "sanctuary.receipt.v1";
 

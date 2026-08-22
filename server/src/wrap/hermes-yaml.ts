@@ -425,6 +425,45 @@ export interface ScannerMcpServersView {
  * @param existingContent  Current file content, or null when absent (an
  *                         absent file has no block and no entries).
  */
+/**
+ * Does the `sanctuary` entry of a Hermes `config.yaml` carry `env.<key>`?
+ * Read through the SAME block scanner the wrap writer uses. Returns null when
+ * the file has no `sanctuary` entry (or an unsupported shape), so a caller
+ * never mistakes "not wrapped" for "wrapped without the key".
+ */
+export function hermesSanctuaryEntryHasEnvKey(
+  existingContent: string | null,
+  key: string,
+): boolean | null {
+  if (existingContent === null) return null;
+  const lines = existingContent.split("\n");
+  let block: McpServersBlock | null;
+  try {
+    block = scanMcpServersBlock(lines);
+  } catch (err) {
+    if (err instanceof HermesYamlUnsupportedError) return null;
+    throw err;
+  }
+  const entry = block?.entries.find((e) => e.name === "sanctuary");
+  if (!entry) return null;
+  let inEnv = false;
+  let envIndent = -1;
+  for (let i = entry.start + 1; i < entry.end; i += 1) {
+    const line = lines[i]!;
+    if (isBlankOrComment(line)) continue;
+    const indent = indentOf(line);
+    const trimmed = line.trim();
+    if (inEnv && indent <= envIndent) inEnv = false;
+    if (!inEnv && /^env\s*:/.test(trimmed)) {
+      inEnv = true;
+      envIndent = indent;
+      continue;
+    }
+    if (inEnv && trimmed.startsWith(`${key}:`)) return true;
+  }
+  return false;
+}
+
 export function scannerMcpServersView(
   existingContent: string | null
 ): ScannerMcpServersView {

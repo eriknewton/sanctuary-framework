@@ -103,6 +103,7 @@ import {
   envelopeEpochOf,
 } from "./master-custody.js";
 import { canonicalJson } from "../audit/chain.js";
+import { SDW_OWNER_PIN_KEY, restampSdwOwnerPinForRotation } from "../sdw/write-gate.js";
 import {
   AuditLog,
   deriveAuditEpochKeys,
@@ -235,6 +236,7 @@ type NamespaceRecipe =
   | { kind: "meta" }
   | { kind: "audit" }
   | { kind: "audit-checkpoints" }
+  | { kind: "sdw-meta" }
   | { kind: "plaintext"; reason: string }
   | { kind: "unsupported"; reason: string };
 
@@ -452,7 +454,9 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
       "rotation needs the anchor-key cascade. " + UNSUPPORTED_DEFERRAL,
   },
   _sdw_catalog: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
-  _sdw_meta: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
+  // Closed set: only the owner pin (MAC'd marker record) is rotatable; any
+  // other `_sdw_meta` key (the replay anchor) still aborts by name.
+  _sdw_meta: { kind: "sdw-meta" },
   _sdw_working_state: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
   _sdw_query_history: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
   _sdw_document_corpus: { kind: "unsupported", reason: UNSUPPORTED_DEFERRAL },
@@ -1229,6 +1233,42 @@ async function convertMeta(ctx: Ctx, verifyOnly: boolean): Promise<number> {
  *  - `audit-checkpoint-*` / `legacy-anchor-*` records → hash/signature based
  *    (no master-keyed material), positively shape-checked, kept as-is;
  *  - anything else → abort. */
+/**
+ * `_sdw_meta`: the ONLY rotatable key is the multi-agent owner pin
+ * (SDW_OWNER_PIN_KEY, a MAC'd marker record restamped by the SDW write gate
+ * with the same dual-master contract as the audit anchors). Every other key in
+ * the namespace (the replay anchor, MAC'd under the SDW vault's own keys)
+ * still aborts rotation BY NAME: an unknown key is never silently skipped.
+ */
+async function convertSdwMeta(ctx: Ctx, verifyOnly: boolean): Promise<number> {
+  let converted = 0;
+  for (const key of await listKeys(ctx.storage, "_sdw_meta")) {
+    if (key !== SDW_OWNER_PIN_KEY) {
+      throw new RotationPreflightError(
+        `namespace "_sdw_meta" key "${key}": ${UNSUPPORTED_DEFERRAL}`
+      );
+    }
+    let outcome: "absent" | "already-new" | "converted";
+    try {
+      outcome = await restampSdwOwnerPinForRotation({
+        storage: ctx.storage,
+        oldMaster: ctx.oldMaster,
+        newMaster: ctx.newMaster,
+        verifyOnly,
+      });
+    } catch (err) {
+      throw new RotationPreflightError(
+        `_sdw_meta/${SDW_OWNER_PIN_KEY}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    if (outcome === "converted" && !verifyOnly) {
+      converted++;
+      ctx.failpoint(`converted:_sdw_meta/${SDW_OWNER_PIN_KEY}`);
+    }
+  }
+  return converted;
+}
+
 async function convertAuditAnchors(ctx: Ctx, verifyOnly: boolean): Promise<number> {
   let converted = 0;
   const MAC_ANCHORS: Record<
@@ -1504,6 +1544,9 @@ async function walkFortress(
         break;
       case "audit-checkpoints":
         converted += await convertAuditAnchors(ctx, verifyOnly);
+        break;
+      case "sdw-meta":
+        converted += await convertSdwMeta(ctx, verifyOnly);
         break;
     }
   }

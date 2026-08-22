@@ -1,5 +1,5 @@
 {
-  "tool_count": 105,
+  "tool_count": 104,
   "tools": [
     {
       "name": "identity_create",
@@ -2009,21 +2009,6 @@
         "required": [
           "bundle",
           "source_key_ref"
-        ]
-      }
-    },
-    {
-      "name": "sdw_export_delete",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "manifest": {
-            "type": "string",
-            "description": "Base64url-encoded signed export manifest from a completed sdw_export"
-          }
-        },
-        "required": [
-          "manifest"
         ]
       }
     },

@@ -41,7 +41,7 @@
  */
 
 import { constants as fsConstants } from "node:fs";
-import { open, unlink, readdir, stat, lstat } from "node:fs/promises";
+import { open, unlink, readdir, stat, lstat, mkdir } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomBytes } from "../core/random.js";
@@ -77,6 +77,12 @@ function legacyNamespaceSanitize(name: string): string {
 }
 function legacyKeySanitize(name: string): string {
   return name.replace(/[^a-zA-Z0-9_.-]/g, "_");
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i += 1) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 function encodedNamespacePath(basePath: string, namespace: string): string {
@@ -132,6 +138,44 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const filePath = this.entryPath(namespace, key);
 
     await this.atomicWriteFile(filePath, checkedData, false);
+  }
+
+  async writeIfAbsent(namespace: string, key: string, data: Uint8Array): Promise<boolean> {
+    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+    const filePath = this.entryPath(namespace, key);
+    await mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
+    // "wx" = O_CREAT | O_EXCL: the kernel arbitrates creation, so exactly one
+    // of two racing creators gets true; O_EXCL also refuses a pre-planted
+    // symlink at the leaf instead of following it.
+    let handle;
+    try {
+      handle = await open(filePath, "wx", 0o600);
+    } catch (err: unknown) {
+      if (err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === "EEXIST") {
+        return false;
+      }
+      throw err;
+    }
+    try {
+      await handle.writeFile(checkedData);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    return true;
+  }
+
+  async replaceIfEquals(
+    namespace: string,
+    key: string,
+    expected: Uint8Array,
+    data: Uint8Array,
+  ): Promise<boolean> {
+    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+    const current = await this.read(namespace, key);
+    if (current === null || !bytesEqual(current, expected)) return false;
+    await this.atomicWriteFile(this.entryPath(namespace, key), checkedData, true);
+    return true;
   }
 
   async writeDurable(

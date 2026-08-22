@@ -36,7 +36,7 @@
  */
 
 import { join, relative, resolve, sep } from "node:path";
-import { lstat, mkdir, realpath } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, realpath } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
@@ -50,6 +50,7 @@ import {
   sdwManifestBodyDigest,
   sdwManifestCanonicalBytes,
   writeSdwExportBundleAtomic,
+  writeSdwExportBundleInFreshDir,
   computeSdwExportRecordHash,
   isSdwExportableNamespace,
   SdwExportScopeDriftError,
@@ -83,13 +84,6 @@ const MAX_MANIFEST_ARG_BYTES = 1_048_576;
  * both while keeping a stale binding from being consumable indefinitely.
  */
 const APPROVAL_BINDING_TTL_MS = 15 * 60_000;
-/**
- * Upper bound on audit entries scanned when matching a manifest to its
- * export record. Exports are Tier-1, human-approved events, so a fortress
- * with more recorded exports than this is not a realistic shape; the bound
- * keeps the scan finite rather than correct-only-for-small-logs.
- */
-const MAX_EXPORT_RECORDS_SCANNED = 100_000;
 
 export interface SdwToolsOptions {
   readonly storage: StorageBackend;
@@ -121,6 +115,8 @@ export interface SdwToolsOptions {
    * `sdw-exports` link. Tests that write to a plain temp dir may omit it.
    */
   readonly fortressRoot?: string;
+  /** TEST-ONLY seam: runs after the export directory is validated and the fresh per-export directory exists, before the bytes are written. */
+  readonly __afterExportDirPrepared?: () => Promise<void>;
   /**
    * Resolve operator-configured source key material by opaque reference.
    * Raw key bytes never transit tool arguments or the approval channel.
@@ -213,7 +209,28 @@ function takeApprovalBinding(
   return binding;
 }
 
+/**
+ * NOT WIRED IN PRODUCTION. `sdw_export_delete` stays unregistered: the
+ * backend-wide serialization boundary a verify-then-delete needs is not
+ * designed yet (an ordinary writer is not serialized against the SDW
+ * transaction that re-verifies the records). It is built here only for the
+ * D2 test suite and returns when that boundary exists.
+ */
+export function createSdwExportDeleteTool(options: SdwToolsOptions): ToolDefinition {
+  return buildSdwTools(options, { includeExportDelete: true }).find(
+    (tool) => tool.name === "sdw_export_delete",
+  )!;
+}
+
+/** The shipped vault surface: `sdw_export` and `sdw_import`. */
 export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
+  return buildSdwTools(options, { includeExportDelete: false });
+}
+
+function buildSdwTools(
+  options: SdwToolsOptions,
+  build: { includeExportDelete: boolean },
+): ToolDefinition[] {
   const now = options.now ?? (() => new Date().toISOString());
 
   const auditFailure = (
@@ -271,11 +288,13 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
   // record; the pin is never advanced (see memory-isolation.ts).
   const refusedForeignIdentity = async (operation: string): Promise<boolean> => {
     if (options.isolationGuard === undefined) return false;
-    if ((await options.isolationGuard(operation)).allowed) return false;
+    const verdict = await options.isolationGuard(operation);
+    if (verdict.allowed) return false;
     // Same denial class as the memory families (must match
     // SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS in memory-tools.ts).
     await auditFailure(`${operation}_denied`, {
       denial_class: SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS,
+      denial_reason: verdict.reason,
     });
     return true;
   };
@@ -314,50 +333,28 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
   };
 
   /**
-   * A manifest is deletable only if THIS fortress's audit chain records the
-   * export that produced it: an `sdw_export_completed` entry whose
-   * manifest_body_digest AND export_audit_event_id match. A manifest that was
-   * merely signed by a fortress key (for example through the raw
-   * `identity_sign` surface, which is separately domain-refused) has no such
-   * record and cannot drive a delete.
+   * Archive destination with symlink containment (fortressRoot set):
+   *   1. walk every component of exportDir below the root, refusing any
+   *      symlink, creating missing ones;
+   *   2. require realpath(exportDir) under realpath(root);
+   *   3. mkdtemp a FRESH per-export directory inside it (its name is
+   *      unpredictable, so nothing can be pre-planted there) and require its
+   *      realpath under the root as well;
+   * The caller then writes with an fd opened O_EXCL inside that fresh
+   * directory and renames within it (see writeSdwExportBundleInFreshDir).
+   * BOUND: Node has no openat/renameat, so a parent swapped to a symlink
+   * AFTER step 3 makes the fresh-dir path resolve elsewhere; the O_EXCL open
+   * then fails (the unpredictable directory does not exist there) and the
+   * export fails closed rather than landing outside.
+   * Without fortressRoot (test harnesses writing to a plain temp dir) the
+   * legacy path-based atomic write is used.
    */
-  const assertExportRecorded = async (
-    manifest: SdwSignedExportManifest,
-    digest: string,
-  ): Promise<void> => {
-    const log = options.auditLog as AuditLog & {
-      query?: (q: {
-        operation_type?: string;
-        limit?: number;
-      }) => Promise<{ entries: Array<{ details?: Record<string, unknown> }> }>;
-    };
-    let recorded = false;
-    if (typeof log.query === "function") {
-      const { entries } = await log.query({
-        operation_type: "sdw_export_completed",
-        limit: MAX_EXPORT_RECORDS_SCANNED,
-      });
-      recorded = entries.some(
-        (entry) =>
-          entry.details?.manifest_body_digest === digest &&
-          entry.details?.export_audit_event_id === manifest.body.export_audit_event_id,
-      );
-    }
-    if (!recorded) throw new SdwImportVerificationError("export_not_recorded", digest);
-  };
-
-  /**
-   * Symlink containment for the archive destination (fortressRoot set):
-   * walk every component of exportDir below the root, refusing any symlink,
-   * create the directory, then require realpath(exportDir) to sit under
-   * realpath(root). The destination file itself is written temp+rename by
-   * writeSdwExportBundleAtomic, so a planted symlink at the file name is
-   * replaced, never followed.
-   */
-  const assertExportDirContained = async (): Promise<void> => {
+  const prepareExportDestination = async (
+    exportName: string,
+  ): Promise<{ destinationPath: string; freshDir: string | null }> => {
     if (options.fortressRoot === undefined) {
       await mkdir(options.exportDir, { recursive: true, mode: 0o700 });
-      return;
+      return { destinationPath: join(options.exportDir, `${exportName}.sdw-export.json`), freshDir: null };
     }
     const root = resolve(options.fortressRoot);
     const dir = resolve(options.exportDir);
@@ -378,12 +375,15 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
       }
     }
     const realRoot = await realpath(root);
-    const realDir = await realpath(dir);
-    if (!realDir.startsWith(realRoot + sep)) {
+    if (!(await realpath(dir)).startsWith(realRoot + sep)) {
       throw new Error("export directory resolved outside the fortress root");
     }
+    const freshDir = await mkdtemp(join(dir, `${exportName}.`));
+    if (!(await realpath(freshDir)).startsWith(realRoot + sep)) {
+      throw new Error("export directory resolved outside the fortress root");
+    }
+    return { destinationPath: join(freshDir, `${exportName}.sdw-export.json`), freshDir };
   };
-
   // Fail closed on a malformed namespaces argument: silently treating it as
   // "no filter" would WIDEN the export scope past what the caller asked for.
   const requestedNamespaces = (args: Record<string, unknown>): string[] | undefined => {
@@ -540,13 +540,19 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
         return genericDeny("sdw_export");
       }
 
-      const destinationPath = join(options.exportDir, `${exportName}.sdw-export.json`);
+      let destinationPath: string;
       try {
         // The export directory is created here, by the first approved export,
         // never at server boot (boot must not add anything to the fortress),
         // with symlink containment under the fortress root.
-        await assertExportDirContained();
-        await writeSdwExportBundleAtomic(built.bundle, destinationPath, options.fs);
+        const destination = await prepareExportDestination(exportName);
+        destinationPath = destination.destinationPath;
+        await options.__afterExportDirPrepared?.();
+        if (destination.freshDir === null) {
+          await writeSdwExportBundleAtomic(built.bundle, destinationPath, options.fs);
+        } else {
+          await writeSdwExportBundleInFreshDir(built.bundle, destination.freshDir, destinationPath);
+        }
       } catch {
         await auditFailure("sdw_export_failed", {
           export_audit_event_id: exportAuditEventId,
@@ -622,6 +628,12 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
           "owner_scope_conflict",
           "SDW vault tool refused for a second wrapped-agent identity",
         );
+      }
+      // Mirrors the delete gate: never prompt a human for an import the
+      // handler will refuse because the backend cannot apply it atomically.
+      if (asTransactional() === null) {
+        await auditFailure("sdw_import_denied", { denial_class: "storage_not_transactional" });
+        throw new SdwImportVerificationError("storage_not_transactional");
       }
       const sourceKeyRef = args.source_key_ref;
       if (typeof sourceKeyRef !== "string" || sourceKeyRef.length === 0) {
@@ -813,17 +825,6 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
       }
       const manifest = decodeSignedManifestArg(args.manifest);
       const summary = verifyManifestSignatureOnly(manifest, options.resolvePublicKey);
-      // A signature alone is not enough: the export must be on THIS
-      // fortress's audit chain (export_audit_event_id + digest).
-      try {
-        await assertExportRecorded(manifest, summary.digest);
-      } catch (error) {
-        await auditFailure("sdw_export_delete_denied", {
-          denial_class: "export_not_recorded",
-          manifest_body_digest: summary.digest,
-        });
-        throw error;
-      }
       await refreshInventory();
       // Freeze the CURRENT inventory of the manifest's namespaces so the
       // handler deletes only what the human saw — and only if nothing moved.
@@ -872,7 +873,6 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
       try {
         manifest = decodeSignedManifestArg(args.manifest);
         ({ digest } = verifyManifestSignatureOnly(manifest, options.resolvePublicKey));
-        await assertExportRecorded(manifest, digest);
       } catch (error) {
         const category =
           error instanceof SdwImportVerificationError ? error.category : "malformed_bundle";
@@ -985,7 +985,7 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
     },
   };
 
-  return [sdwExport, sdwImport, sdwExportDelete];
+  return build.includeExportDelete ? [sdwExport, sdwImport, sdwExportDelete] : [sdwExport, sdwImport];
 }
 
 // ── Manifest-arg helpers (sdw_export_delete) ─────────────────────────────────
