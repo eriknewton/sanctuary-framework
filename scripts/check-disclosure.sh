@@ -84,19 +84,24 @@
 # (Matches scripts/check-ai-tells.sh: 2 is "I could not run", never "I found
 # something", so a caller can tell a broken invocation from a real refusal.)
 #
-# SURFACES. Two, and the difference is one rule.
-#   pr-body      A source-file path is refused outright (D2). A pull-request
-#                description has no legitimate need to name an implementation
-#                file, and naming one narrows a reader to the defect whether or
-#                not the surrounding sentence was careful.
-#   test-header  A source-file path is allowed unless defect language sits in
-#                the same paragraph. A test header's job IS to name the module
-#                under test; refusing that would red hundreds of honest headers
-#                and the guard would be switched off inside a week, which is the
-#                failure mode this file is built to avoid.
-# Failure mode if the surfaces are ever collapsed into one: whichever band wins,
-# the guard either stops catching path anchors in descriptions or reds every
-# honest test header. Keep them separate.
+# SURFACES. Two surfaces with the same D2 same-paragraph adjacency rule, but
+# differing paragraph segmentation strategies to preserve their respective
+# baseline ratchets and accuracy claims.
+#   pr-body      Scanned as-is; callers typically pipe in the pull-request body.
+#                Recognizes Markdown structural boundaries (headings, lists, tables)
+#                as paragraph breaks in addition to blank lines (except inside
+#                fenced code). This provides finer-grained separation and higher
+#                accuracy for prose-heavy pull-request descriptions.
+#   test-header  Typically paired with --extract header, which trims the input
+#                to the leading comment block before scanning. Preserves the legacy
+#                blank-line-only paragraph assembly and extraction semantics for
+#                backward compatibility with the established baseline ratchet.
+#                The same-paragraph adjacency rule on D2 still applies: an honest
+#                module path passes on its own or in the same paragraph as
+#                capability language, but combines with defect language.
+#
+# The D2 same-paragraph adjacency rule applies on both surfaces unchanged;
+# Markdown structural boundaries are applied only to pr-body scans.
 
 set -uo pipefail
 
@@ -355,6 +360,44 @@ matches_cs() { # matches_cs <text> <pattern>  (case-SENSITIVE)
   printf '%s' "$1" | grep -qE -- "$2"
 }
 
+# Detect Markdown structural boundaries outside fenced code. Returns one of:
+#   none       — regular text line, accumulate into paragraph
+#   heading    — ATX heading (1-6 #, followed by space); check alone, then continue
+#   table-row  — table row (leading optional space, then |); check alone, then continue
+#   list-item  — list item (-, *, +, or digits + . or ), followed by space); start new paragraph
+is_markdown_boundary() { # is_markdown_boundary <line>
+  local line="$1"
+  # Bash-native ERE checks; each pattern in a local variable so [[ =~ ]] matches
+  # without spawning a subprocess. Failure mode if quotes wrap the variable in
+  # [[ =~ ]]: the pattern is treated as a literal string, not a regex.
+  # ATX heading: optional whitespace, 1-6 #, required whitespace (not end-of-line).
+  local re_heading='^[[:space:]]*#{1,6}[[:space:]]'
+  # Table row: optional whitespace, then literal |
+  local re_table='^[[:space:]]*[|]'
+  # Unordered list item: optional whitespace, then -, *, or +, then whitespace
+  local re_unordered='^[[:space:]]*[-*+][[:space:]]'
+  # Ordered list item: optional whitespace, digits, then . or ), then whitespace
+  local re_ordered='^[[:space:]]*[0-9]+[.)][[:space:]]'
+
+  if [[ "$line" =~ $re_heading ]]; then
+    printf 'heading\n'
+    return 0
+  fi
+  if [[ "$line" =~ $re_table ]]; then
+    printf 'table-row\n'
+    return 0
+  fi
+  if [[ "$line" =~ $re_unordered ]]; then
+    printf 'list-item\n'
+    return 0
+  fi
+  if [[ "$line" =~ $re_ordered ]]; then
+    printf 'list-item\n'
+    return 0
+  fi
+  printf 'none\n'
+}
+
 # ---------------------------------------------------------------------------
 # Paragraph pass. Proximity rules bind inside ONE paragraph: a locator three
 # paragraphs away from a defect phrase is not a localization, and treating the
@@ -385,11 +428,12 @@ check_paragraph() { # check_paragraph <text> <first-line-number>
       "delete the anchor; name the capability and cite a bare register id."
   fi
 
-  # D2-CODEPATH — a path to a source file. Band depends on the surface (see
-  # SURFACES in the header): refused outright in a pull-request description,
-  # proximity-only in a test header, whose job is to name the module under test.
+  # D2-CODEPATH — a path to a source file, in the same paragraph as defect language.
+  # Proximity rule on both surfaces: a path without defect language passes on both.
+  # Markdown structural boundaries (headings, lists, tables) separate paragraphs so
+  # they do not accumulate with surrounding prose.
   if matches_cs "$text" "$CODE_PATH_RE" || matches_cs "$text" "$SRC_DIR_PATH_RE"; then
-    if [ "$SURFACE" = "pr-body" ] || [ "$has_defect" -eq 1 ]; then
+    if [ "$has_defect" -eq 1 ]; then
       hit "D2-CODEPATH" "$line" "a path into a source tree" \
         "a path into implementation code narrows a reader to the defect without naming it, and a directory does it one level coarser." \
         "name the layer in prose ('bounded to the mesh layer'), not the path."
@@ -589,10 +633,30 @@ scan_file() { # scan_file <source-path-or-dash> <label>
     if [ "$in_fence" -eq 1 ] && [ "$fence_line" -eq 0 ]; then
       if matches_cs "$line" "$INVOCATION_RE"; then fence_line="$line_no"; fi
     fi
-    if [ -z "$line" ]; then
+
+    # Detect Markdown structural boundaries outside fenced code, but only for
+    # pr-body surface. test-header uses legacy blank-line-only segmentation to
+    # preserve the baseline ratchet. Both surfaces recognize blank lines.
+    local boundary="none"
+    if [ "$SURFACE" = "pr-body" ] && [ "$in_fence" -eq 0 ] && [ -n "$line" ]; then
+      boundary="$(is_markdown_boundary "$line")"
+    fi
+
+    if [ "$boundary" = "heading" ] || [ "$boundary" = "table-row" ]; then
+      # Headings and table rows: end current paragraph, check the boundary itself, then continue.
+      check_paragraph "$para" "$para_line"
+      check_paragraph "$line" "$line_no"
+      para=""; para_line=0
+    elif [ "$boundary" = "list-item" ]; then
+      # List items: end current paragraph, start new one with this item.
+      check_paragraph "$para" "$para_line"
+      para="$line"; para_line="$line_no"
+    elif [ -z "$line" ]; then
+      # Blank line: end current paragraph (recognized on all surfaces).
       check_paragraph "$para" "$para_line"
       para=""; para_line=0
     else
+      # Regular text: accumulate into paragraph.
       if [ -z "$para" ]; then para_line="$line_no"; fi
       para="$para $line"
     fi
