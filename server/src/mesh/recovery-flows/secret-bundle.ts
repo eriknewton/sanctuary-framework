@@ -104,12 +104,15 @@ export type MasterRotationBundleEnvelopeParseResult =
  * enough when the value is consumed before the message is built; the shape has
  * to be established first.
  *
- * SCOPE, stated so a later reader does not over-trust this: the result is a
- * validated view of the ORIGINAL object, not a copied snapshot, and callers
- * still re-read fields off it. A stateful accessor can therefore satisfy this
- * parse and return something else on a later read. Closing that, and the
- * matching gaps on the decrypted plaintext and on the bootstrap-token path, is
- * separate tracked work; this function does not claim to have closed it.
+ * SNAPSHOT BOUNDARY (WIRE-PARSE-SNAPSHOT-01): the result is a new plain object
+ * built only from the values that were read and validated here. Each field of
+ * the untrusted input is read exactly once into a local; the local is validated;
+ * the returned envelope is constructed from those locals. A caller that re-reads
+ * a field from the returned envelope reads from the snapshot, never from the
+ * original input again. This closes the class where a stateful accessor (Proxy,
+ * getter) satisfies the validation read and returns a different value on any
+ * later read. Scope of this boundary: the envelope wire shape validated here.
+ * The decrypted plaintext and other recovery paths are separate.
  */
 export function parseMasterRotationBundleEnvelope(
   value: unknown
@@ -128,41 +131,75 @@ function parseEnvelopeFields(
     return { ok: false, reason: "envelope_not_object" };
   }
   const raw = value as Record<string, unknown>;
-  if (raw.kind !== "master_rotation_bundle") {
+  // Read each field exactly once into a local, validate the local, and build
+  // the snapshot from those locals. Never re-read from `raw` after this point.
+  // (snapshot boundary: WIRE-PARSE-SNAPSHOT-01)
+  const kind = raw.kind;
+  if (kind !== "master_rotation_bundle") {
     return { ok: false, reason: "kind_invalid" };
   }
-  if (typeof raw.target_node_id !== "string") {
+  const target_node_id = raw.target_node_id;
+  if (typeof target_node_id !== "string") {
     return { ok: false, reason: "target_node_id_not_string" };
   }
-  if (typeof raw.fortress_id !== "string") {
+  const fortress_id = raw.fortress_id;
+  if (typeof fortress_id !== "string") {
     return { ok: false, reason: "fortress_id_not_string" };
   }
-  if (typeof raw.rotated_at !== "string") {
+  const rotated_at = raw.rotated_at;
+  if (typeof rotated_at !== "string") {
     return { ok: false, reason: "rotated_at_not_string" };
   }
-  if (typeof raw.new_master_pubkey !== "string") {
+  const new_master_pubkey = raw.new_master_pubkey;
+  if (typeof new_master_pubkey !== "string") {
     return { ok: false, reason: "new_master_pubkey_not_string" };
   }
   const ciphertext = raw.ciphertext;
   if (ciphertext === null || typeof ciphertext !== "object" || Array.isArray(ciphertext)) {
     return { ok: false, reason: "ciphertext_not_object" };
   }
-  const payload = ciphertext as Record<string, unknown>;
-  // Exactly the fields `decrypt` consumes: it compares `v`/`alg` and
-  // base64url-decodes `iv`/`ct`, and a non-string there is a raw TypeError one
-  // frame later. `ts` is documented envelope metadata that no security decision
-  // reads, so requiring it here would reject valid bundles for no gain - the
-  // check must match what the consumer actually touches (must stay in step with
-  // `EncryptedPayload` and `decrypt` in `core/encryption.ts`).
+  const ctRaw = ciphertext as Record<string, unknown>;
+  // Read each ciphertext field exactly once into a local, validate the local,
+  // and build the snapshot from those locals. (same invariant as above,
+  // WIRE-PARSE-SNAPSHOT-01)
+  // v must be exactly 1 and alg must be exactly "aes-256-gcm": accepting any
+  // number or any string would pass a payload this decrypt() cannot handle,
+  // producing an unrelated AES failure instead of this typed refusal.
+  // ts must be a string so the snapshot type is truthful — EncryptedPayload.ts
+  // is string, not string|undefined (must stay in step with core/encryption.ts).
+  const ct_v = ctRaw.v;
+  const ct_alg = ctRaw.alg;
+  const ct_iv = ctRaw.iv;
+  const ct_ct = ctRaw.ct;
+  const ct_ts = ctRaw.ts;
   if (
-    typeof payload.v !== "number" ||
-    typeof payload.alg !== "string" ||
-    typeof payload.iv !== "string" ||
-    typeof payload.ct !== "string"
+    ct_v !== 1 ||
+    ct_alg !== "aes-256-gcm" ||
+    typeof ct_iv !== "string" ||
+    typeof ct_ct !== "string" ||
+    typeof ct_ts !== "string"
   ) {
     return { ok: false, reason: "ciphertext_field_invalid" };
   }
-  return { ok: true, envelope: raw as unknown as MasterRotationBundleEnvelope };
+  // Fresh plain object from validated locals — not a reference to the input or
+  // any part of it. (snapshot boundary: WIRE-PARSE-SNAPSHOT-01)
+  return {
+    ok: true,
+    envelope: {
+      kind: "master_rotation_bundle" as const,
+      target_node_id,
+      fortress_id,
+      rotated_at,
+      new_master_pubkey,
+      ciphertext: {
+        v: ct_v,
+        alg: ct_alg,
+        iv: ct_iv,
+        ct: ct_ct,
+        ts: ct_ts,
+      },
+    },
+  };
 }
 
 /**
