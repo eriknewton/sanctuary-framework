@@ -80,6 +80,8 @@ import {
   readManifest,
   loadExitArtifact,
   isWellFormedExitStateEntryElement,
+  checkEncryptedStateStructure,
+  type EncryptedStateStructureProblem,
 } from "./verifier.js";
 import {
   isValidSourceCustody,
@@ -142,6 +144,17 @@ const EXIT_POLICY_SETS_NAMESPACE = "_exit_policy_sets";
 const EXIT_COMMITMENTS_NAMESPACE = "_exit_commitments";
 const EXIT_PLACEHOLDER_METADATA_NAMESPACE = "_exit_placeholder_metadata";
 const PRIVACY_PLACEHOLDER_NAMESPACE = "_privacy_placeholder_vault";
+/**
+ * F1 (Exit V2 drill D1, 2026-08-22): a per-import durable rollback journal,
+ * under the fortress's own reserved `_exit_*` family (staging-only; never
+ * appears in an exported bundle - export only reads the named artifact
+ * namespaces above, never this one). Written BEFORE any staging write below
+ * begins and deleted only after a successful activation OR a successful
+ * rollback, so a leftover entry here always means "an import was
+ * interrupted before it finished either way." See
+ * `recoverInterruptedExitImports` for the read side.
+ */
+const EXIT_IMPORT_JOURNAL_NAMESPACE = "_exit_import_journal";
 
 /**
  * Custody-envelope re-key block (post-#496). Carries a wrap of the SOURCE
@@ -689,6 +702,65 @@ function sha256Hex(bytes: Uint8Array): string {
 
 function jsonBytes(value: unknown): Uint8Array {
   return stringToBytes(JSON.stringify(value, null, 2) + "\n");
+}
+
+/**
+ * CONTRACT PIN: mirrors `EncryptedStateStructureProblem` (verifier.ts,
+ * `checkEncryptedStateStructure`). The first two codes are unchanged from
+ * before F3/F4 (server/test/exit/exit-verifier-aggregator.test.ts and
+ * server/test/exit/exit-inspect-declares.test.ts pin
+ * `ENCRYPTED_STATE_ENTRIES_UNREADABLE` for both); the other two are new,
+ * named separately from that code because they describe a DIFFERENT
+ * defect (a stale header count, a disallowed namespace) than "the entries
+ * list itself cannot be read."
+ */
+function encryptedStateStructureErrorCode(
+  problem: EncryptedStateStructureProblem | undefined
+): string {
+  switch (problem) {
+    case "total_keys_mismatch":
+      return "ENCRYPTED_STATE_TOTAL_KEYS_MISMATCH";
+    case "reserved_namespace_entry":
+      return "ENCRYPTED_STATE_RESERVED_NAMESPACE_ENTRY";
+    case "entries_unreadable":
+    case "entries_malformed_elements":
+    default:
+      return "ENCRYPTED_STATE_ENTRIES_UNREADABLE";
+  }
+}
+
+function encryptedStateStructureErrorMessage(check: {
+  problem?: EncryptedStateStructureProblem;
+  detail?: string;
+}): string {
+  switch (check.problem) {
+    case "total_keys_mismatch":
+      return (
+        "This bundle's encrypted_state artifact declares a total_keys count " +
+        `that does not match its readable entries (${check.detail ?? "mismatch"}). ` +
+        "The manifest signature is valid, but the artifact's own header " +
+        "disagrees with its own body. Re-export the bundle from the source " +
+        "fortress."
+      );
+    case "reserved_namespace_entry":
+      return (
+        "This bundle's encrypted_state artifact carries an entry under a " +
+        `reserved namespace (${check.detail ?? "reserved namespace"}), which ` +
+        "is never a legitimate export and is refused before any write. " +
+        "Re-export the bundle from the source fortress."
+      );
+    case "entries_unreadable":
+    case "entries_malformed_elements":
+    default:
+      return (
+        "This bundle's encrypted_state artifact has no readable entries list " +
+        "(the `entries` field is absent or is not an array), or its entries " +
+        "list contains a malformed element (missing or wrong-typed " +
+        "namespace/key/entry fields). This is not an empty bundle: the " +
+        "entry list itself cannot be read. Re-export the bundle from the " +
+        "source fortress."
+      );
+  }
 }
 
 async function writeJsonArtifact(
@@ -2083,6 +2155,173 @@ async function restoreStorageSnapshots(
   return { removed, restored, failed };
 }
 
+/** On-disk (JSON-safe) form of a {@link StorageSnapshot}: `data` base64url'd. */
+interface SerializedStorageSnapshot {
+  namespace: string;
+  key: string;
+  data: string | null;
+}
+
+interface SerializedStorageNamespaceSnapshot {
+  namespace: string;
+  entries: SerializedStorageSnapshot[];
+}
+
+/**
+ * F1 (Exit V2 drill D1, 2026-08-22): the durable record `writeImportJournal`
+ * persists and `recoverInterruptedExitImports` replays. Its `snapshots` /
+ * `namespace_snapshots` fields are byte-for-byte what `importExitBundle`
+ * already computes as `activationSnapshots` / `activationNamespaceSnapshots`
+ * before it starts writing - this record is just that same data made
+ * durable, so a hard kill and a caught exception roll back through the
+ * exact same `restoreStorageSnapshots` call with the exact same input.
+ */
+interface ExitImportJournalRecord {
+  import_id: string;
+  identity_id: string;
+  started_at: string;
+  snapshots: SerializedStorageSnapshot[];
+  namespace_snapshots: SerializedStorageNamespaceSnapshot[];
+}
+
+function serializeStorageSnapshot(
+  snapshot: StorageSnapshot
+): SerializedStorageSnapshot {
+  return {
+    namespace: snapshot.namespace,
+    key: snapshot.key,
+    data: snapshot.data ? toBase64url(snapshot.data) : null,
+  };
+}
+
+function deserializeStorageSnapshot(
+  record: SerializedStorageSnapshot
+): StorageSnapshot {
+  return {
+    namespace: record.namespace,
+    key: record.key,
+    data: record.data ? fromBase64url(record.data) : null,
+  };
+}
+
+function deserializeStorageNamespaceSnapshot(
+  record: SerializedStorageNamespaceSnapshot
+): StorageNamespaceSnapshot {
+  return {
+    namespace: record.namespace,
+    entries: record.entries.map(deserializeStorageSnapshot),
+  };
+}
+
+/**
+ * Persist the pre-import snapshot to durable storage BEFORE any staging
+ * write below begins. A SIGKILL, power loss, or OOM never reaches the
+ * `catch` block's in-memory `restoreStorageSnapshots` call a few lines
+ * below in `importExitBundle`; without a durable copy of "what this import
+ * is about to overwrite," a hard kill leaves the target half-applied with
+ * no way to detect or undo it (Exit V2 drill D1, F1: observed 3/3, a killed
+ * import left 6 staged `_exit_*` artifacts and 1-115 of 120 reputation
+ * attestations behind). Idempotent per `importId`: a caller that retries
+ * the exact same import after a kill overwrites its own leftover record
+ * with an equivalent one (recovered first, by `recoverInterruptedExitImports`
+ * at the top of `importExitBundle`, before this write ever runs again).
+ */
+async function writeImportJournal(
+  storage: StorageBackend,
+  importId: string,
+  identityId: string,
+  snapshots: StorageSnapshot[],
+  namespaceSnapshots: StorageNamespaceSnapshot[]
+): Promise<void> {
+  const record: ExitImportJournalRecord = {
+    import_id: importId,
+    identity_id: identityId,
+    started_at: new Date().toISOString(),
+    snapshots: snapshots.map(serializeStorageSnapshot),
+    namespace_snapshots: namespaceSnapshots.map((ns) => ({
+      namespace: ns.namespace,
+      entries: ns.entries.map(serializeStorageSnapshot),
+    })),
+  };
+  await stageArtifact(storage, EXIT_IMPORT_JOURNAL_NAMESPACE, importId, record);
+}
+
+/** Clears the journal entry once activation OR rollback has fully finished. */
+async function deleteImportJournal(
+  storage: StorageBackend,
+  importId: string
+): Promise<void> {
+  await storage.delete(EXIT_IMPORT_JOURNAL_NAMESPACE, importId);
+}
+
+/**
+ * F1 (Exit V2 drill D1, 2026-08-22): roll back any import whose journal
+ * entry survived a hard kill, using the SAME `restoreStorageSnapshots` the
+ * exception-path cleanup in `importExitBundle` uses - a killed run and a
+ * thrown-exception run roll back through one mechanism, not two. Called
+ * from the START of `importExitBundle` (so a retry of a killed import
+ * begins from a clean target) AND from fortress open in `exit/cli.ts`'s
+ * `openExitContext` (so a killed import is undone even if the operator
+ * never retries it, and any OTHER fortress operation that opens storage
+ * next never observes half-applied exit-import state). Safe to call on a
+ * fortress with no interrupted import: the journal namespace is then
+ * empty and this is a single no-op `list()`.
+ *
+ * A snapshot whose restoration itself fails (disk error, permissions) is
+ * NOT deleted from the journal: it stays discoverable so the next fortress
+ * open or import attempt retries it, rather than silently dropping a
+ * rollback that did not actually complete.
+ */
+export async function recoverInterruptedExitImports(
+  storage: StorageBackend,
+  auditLog: AuditLog
+): Promise<{ recovered: number; failed: string[] }> {
+  const entries = await storage.list(EXIT_IMPORT_JOURNAL_NAMESPACE);
+  let recovered = 0;
+  const failed: string[] = [];
+  for (const entry of entries) {
+    const raw = await storage.read(EXIT_IMPORT_JOURNAL_NAMESPACE, entry.key);
+    if (!raw) continue;
+    let record: ExitImportJournalRecord;
+    try {
+      record = JSON.parse(bytesToString(raw)) as ExitImportJournalRecord;
+    } catch {
+      failed.push(entry.key);
+      continue;
+    }
+    const snapshots = record.snapshots.map(deserializeStorageSnapshot);
+    const namespaceSnapshots = record.namespace_snapshots.map(
+      deserializeStorageNamespaceSnapshot
+    );
+    const cleanup = await restoreStorageSnapshots(
+      storage,
+      snapshots,
+      namespaceSnapshots
+    );
+    if (cleanup.failed.length > 0) {
+      failed.push(entry.key);
+      continue;
+    }
+    await deleteImportJournal(storage, entry.key);
+    recovered++;
+    void auditLog.append(
+      "l1",
+      "exit_bundle_interrupted_import_recovered",
+      record.identity_id,
+      {
+        import_id: record.import_id,
+        started_at: record.started_at,
+        removed_total: cleanup.removed,
+        restored_total: cleanup.restored,
+      }
+    );
+  }
+  if (recovered > 0) {
+    await auditLog.flush();
+  }
+  return { recovered, failed };
+}
+
 function activationSnapshotLocations(
   importId: string,
   identityArtifact: { json: ExitPublicIdentityArtifact } | null,
@@ -2379,6 +2618,12 @@ async function stageArtifact(
 export async function importExitBundle(
   opts: ImportExitBundleOptions
 ): Promise<ImportExitBundleResult> {
+  // F1 (Exit V2 drill D1): roll back any import left `in_progress` by a
+  // prior hard kill on THIS fortress before doing anything else - including
+  // before `conflictReport` below runs, so a killed import of the SAME
+  // importId does not read as a staged-artifact conflict against a target
+  // that recovery is about to clean up anyway.
+  await recoverInterruptedExitImports(opts.storage, opts.auditLog);
   // The IMPORT path ALWAYS verifies strictly: there is no accept-unverifiable
   // relaxation here regardless of `activate`. An unverifiable-signer or forged
   // attestation fails the bundle whether the caller is doing a dry-run
@@ -2551,29 +2796,32 @@ export async function importExitBundle(
   // Narrow the JSON ROOT itself first, through `unknown`, so a malformed
   // root reaches the SAME named error instead.
   //
-  // INVARIANT (EXIT-STRUCT-02): verify fails closed on a malformed ELEMENT
-  // exactly where import dereferences it; container+count checks are not
-  // enough. `isWellFormedExitStateEntryElement` is the SAME predicate
-  // `verifier.ts` `summarizeEncryptedState` and `resolveSourceMasterKey`
-  // (below) use, so this check and verify's `passed` boolean can never
-  // disagree about which element is damaged.
+  // INVARIANT (EXIT-STRUCT-02, extended by F3/F4 - Exit V2 drill D1,
+  // 2026-08-22): verify fails closed on a malformed ELEMENT, a stale
+  // `total_keys`, or a reserved-namespace entry exactly where import would
+  // otherwise dereference it or silently skip it; container+count checks
+  // alone are not enough. `checkEncryptedStateStructure` (verifier.ts) is
+  // the SAME shared function `summarizeEncryptedState` uses (rule 11,
+  // AGENTS.md: "must match" - if this call site's shape changes, change
+  // that function's doc comment too), so this check and verify's `passed`
+  // boolean can never disagree about which entry is damaged, and the
+  // refusal below happens BEFORE any staging write, not after (F4 used to
+  // let `rekeyState`'s reserved-namespace skip trip an incomplete-state
+  // rollback AFTER staging; this gate now catches it first).
   const encryptedStateJsonRoot: unknown = encryptedState?.json;
-  const encryptedStateEntriesReadable =
-    encryptedStateJsonRoot !== null &&
-    typeof encryptedStateJsonRoot === "object" &&
-    Array.isArray((encryptedStateJsonRoot as { entries?: unknown }).entries) &&
-    (encryptedStateJsonRoot as { entries: unknown[] }).entries.every((item) =>
-      isWellFormedExitStateEntryElement(item)
-    );
-  if (encryptedState && !encryptedStateEntriesReadable) {
+  const encryptedStateStructureCheck =
+    encryptedStateJsonRoot !== null && typeof encryptedStateJsonRoot === "object"
+      ? checkEncryptedStateStructure(
+          encryptedStateJsonRoot as { entries?: unknown; total_keys?: unknown }
+        )
+      : ({
+          ok: false,
+          problem: "entries_unreadable",
+        } as const);
+  if (encryptedState && !encryptedStateStructureCheck.ok) {
     throw new ExitBundleImportError(
-      "ENCRYPTED_STATE_ENTRIES_UNREADABLE",
-      "This bundle's encrypted_state artifact has no readable entries list " +
-        "(the `entries` field is absent or is not an array), or its entries " +
-        "list contains a malformed element (missing or wrong-typed " +
-        "namespace/key/entry fields). This is not an empty bundle: the " +
-        "entry list itself cannot be read. Re-export the bundle from the " +
-        "source fortress."
+      encryptedStateStructureErrorCode(encryptedStateStructureCheck.problem),
+      encryptedStateStructureErrorMessage(encryptedStateStructureCheck)
     );
   }
   if (!verification.passed) {
@@ -2884,6 +3132,18 @@ export async function importExitBundle(
   const activationNamespaceSnapshots = [
     await snapshotStorageNamespace(opts.storage, "_meta"),
   ];
+  // F1 (Exit V2 drill D1): make the pre-import snapshot durable BEFORE the
+  // `try` block below writes anything. See `writeImportJournal`'s doc
+  // comment - this is what lets a hard-killed import be rolled back on the
+  // next `importExitBundle` call or fortress open, not just on a caught
+  // exception.
+  await writeImportJournal(
+    opts.storage,
+    importId,
+    manifest.body.identity_binding.identity_id,
+    activationSnapshots,
+    activationNamespaceSnapshots
+  );
   // Track every staged storage location for result telemetry and cleanup
   // accounting. Snapshot restoration below is what preserves overwritten
   // pre-existing bytes.
@@ -2966,10 +3226,16 @@ export async function importExitBundle(
         key: importId,
       });
     }
+    // F1 (Exit V2 drill D1): this record used to be stamped `activated_at`
+    // HERE, before the reputation import or state re-key had run - so a
+    // hard kill during either left an `_exit_imports` record on disk
+    // falsely claiming the import had completed. Stage an `in_progress`
+    // interim record now; the `activated_at`-stamped FINAL record is
+    // written LAST, after both of those have actually succeeded, below.
     await stageArtifact(opts.storage, EXIT_IMPORT_NAMESPACE, importId, {
       manifest: manifest.body,
       verified_at: verification.verified_at,
-      activated_at: new Date().toISOString(),
+      in_progress: true,
     });
     stagedLocations.push({ namespace: EXIT_IMPORT_NAMESPACE, key: importId });
 
@@ -3118,6 +3384,18 @@ export async function importExitBundle(
         },
       });
     }
+    // F1 (Exit V2 drill D1): promote the interim `in_progress` import
+    // record to its final `activated_at`-stamped form LAST - only after the
+    // reputation import and state re-key above have both actually
+    // succeeded. This is the write that makes an import "done"; everything
+    // the journal protects has already completed by the time it runs, so a
+    // kill after this point has nothing left to roll back.
+    await stageArtifact(opts.storage, EXIT_IMPORT_NAMESPACE, importId, {
+      manifest: manifest.body,
+      verified_at: verification.verified_at,
+      activated_at: new Date().toISOString(),
+    });
+    await deleteImportJournal(opts.storage, importId);
     await opts.auditLog.flush();
   } catch (err) {
     const cleanup = await restoreStorageSnapshots(
@@ -3125,6 +3403,15 @@ export async function importExitBundle(
       activationSnapshots,
       activationNamespaceSnapshots
     );
+    // F1 (Exit V2 drill D1): only clear the durable journal once the
+    // in-memory restore above actually finished cleanly. A partial restore
+    // (disk error mid-cleanup) must stay discoverable so the next fortress
+    // open or import attempt retries it, mirroring
+    // `recoverInterruptedExitImports`'s own "leave it on partial failure"
+    // rule - one retry policy for both the kill path and the exception path.
+    if (cleanup.failed.length === 0) {
+      await deleteImportJournal(opts.storage, importId);
+    }
     const cleanupOperation =
       stateRekeyStarted || err instanceof ExitBundleImportError
         ? "exit_bundle_rekey_failed_cleanup"

@@ -37,6 +37,7 @@ import {
 } from "../contracts/v1.1/exit-bundle-manifest.js";
 import { fromBase64url, stringToBytes } from "../core/encoding.js";
 import { publicKeyToDid } from "../core/identity.js";
+import { isReservedNamespace } from "../cognitive/state-store.js";
 import {
   verifyRotationChain,
   type RotationChainInvalidReason,
@@ -418,6 +419,102 @@ export function isWellFormedExitStateEntryElement(item: unknown): boolean {
 }
 
 /**
+ * The four ways an `encrypted_state` artifact's `entries`/`total_keys`
+ * declaration can fail to describe itself honestly, in the order
+ * {@link checkEncryptedStateStructure} checks them.
+ */
+export type EncryptedStateStructureProblem =
+  | "entries_unreadable"
+  | "entries_malformed_elements"
+  | "total_keys_mismatch"
+  | "reserved_namespace_entry";
+
+export interface EncryptedStateStructureCheck {
+  ok: boolean;
+  problem?: EncryptedStateStructureProblem;
+  detail?: string;
+}
+
+/**
+ * CONTRACT PIN (AGENTS.md rule 11): the ONE structural-soundness check for
+ * an encrypted_state artifact's `entries` container and `total_keys`
+ * declaration, consumed by BOTH `summarizeEncryptedState` (verify, right
+ * below) AND `importExitBundle`'s pre-staging gate
+ * (server/src/exit/bundle.ts - search "checkEncryptedStateStructure" there)
+ * so neither stage can accept an artifact the other refuses. Must match
+ * that call site if this function's signature or problem set changes.
+ *
+ * Four findings from the Exit V2 drill (D1, 2026-08-22) motivated the
+ * problem set: an unreadable `entries` container (LD2-01), a malformed
+ * element (EXIT-STRUCT-02), a source-signed artifact whose `total_keys`
+ * was left stale after `entries` was truncated (F3: verify and inspect
+ * both reported PASS for a bundle with 5 of 6 entries and `total_keys: 6`),
+ * and a reserved-namespace entry that only the IMPORTER refused, after
+ * staging (F4: `exit verify` reported PASS for a bundle the importer went
+ * on to reject). Fail closed: an artifact this function cannot fully vouch
+ * for is `ok: false`, never a default `ok: true`.
+ */
+export function checkEncryptedStateStructure(record: {
+  entries?: unknown;
+  total_keys?: unknown;
+}): EncryptedStateStructureCheck {
+  if (!Array.isArray(record.entries)) {
+    return {
+      ok: false,
+      problem: "entries_unreadable",
+      detail: "the `entries` field is absent or is not an array",
+    };
+  }
+  const entries = record.entries;
+  for (const item of entries) {
+    if (!isWellFormedExitStateEntryElement(item)) {
+      return {
+        ok: false,
+        problem: "entries_malformed_elements",
+        detail:
+          "an entries element is missing or has a wrong-typed " +
+          "namespace/key/entry field",
+      };
+    }
+  }
+  // F3: `total_keys` must be PRESENT as a number and agree with the
+  // readable entries length. A bundle's own export always sets
+  // `total_keys: entries.length` (bundle.ts exportEncryptedState); a
+  // hand-crafted or truncated-then-resigned artifact is the only way this
+  // can disagree.
+  if (
+    typeof record.total_keys !== "number" ||
+    record.total_keys !== entries.length
+  ) {
+    return {
+      ok: false,
+      problem: "total_keys_mismatch",
+      detail:
+        `declared total_keys (${JSON.stringify(record.total_keys)}) does ` +
+        `not match the readable entries count (${entries.length})`,
+    };
+  }
+  // F4: the SAME predicate import's rekeyState (bundle.ts) uses to skip a
+  // reserved-namespace entry, checked here BEFORE any write so verify and
+  // import agree before staging, not after.
+  const reserved = entries.find(
+    (item) =>
+      isWellFormedExitStateEntryElement(item) &&
+      isReservedNamespace((item as { namespace: string }).namespace)
+  );
+  if (reserved) {
+    return {
+      ok: false,
+      problem: "reserved_namespace_entry",
+      detail:
+        `entry namespace '${(reserved as { namespace: string }).namespace}' ` +
+        "is a reserved namespace",
+    };
+  }
+  return { ok: true };
+}
+
+/**
  * Summarize a parsed `artifacts/encrypted_state.json`. Pure, total, and
  * defensive: every field is narrowed from `unknown`, so a hand-crafted or
  * truncated artifact yields a conservative summary rather than throwing.
@@ -441,19 +538,20 @@ export function summarizeEncryptedState(
   const entries: unknown[] | null = Array.isArray(record.entries)
     ? record.entries
     : null;
-  // INVARIANT (EXIT-STRUCT-02, one level deeper than the LD2-01 check above):
-  // `entries` being a non-null array only proves the CONTAINER is readable.
-  // A `null` element, or one missing/wrong-typed `namespace`/`entry`/
-  // `entry.kid`/`entry.payload.ct`/`entry.sig`, passes that container check
-  // and then throws a raw TypeError at import's first per-element
-  // dereference (`compromisedRetiredSignatureUse` in bundle.ts). Checked
-  // with the SAME predicate import's own container guards use
-  // (`isWellFormedExitStateEntryElement` above), so "malformed" here means
-  // exactly what makes import throw. `entries === null` short-circuits this
+  // INVARIANT (EXIT-STRUCT-02, one level deeper than the LD2-01 check above;
+  // extended by F3/F4, Exit V2 drill D1): `entries` being a non-null array
+  // only proves the CONTAINER is readable. A `null` element, a
+  // missing/wrong-typed `namespace`/`entry`/`entry.kid`/`entry.payload.ct`/
+  // `entry.sig`, a stale self-declared `total_keys`, or a reserved-namespace
+  // entry all pass a bare container check and either crash import
+  // (`compromisedRetiredSignatureUse` in bundle.ts) or get silently applied
+  // partially. Routed through `checkEncryptedStateStructure`, the SAME
+  // function import's pre-staging gate uses, so "malformed" here means
+  // exactly what makes import refuse. `entries === null` short-circuits this
   // to `false`: an unreadable container is the already-covered LD2-01 case,
   // not this one.
   const entriesMalformed =
-    entries !== null && entries.some((item) => !isWellFormedExitStateEntryElement(item));
+    entries !== null && !checkEncryptedStateStructure(record).ok;
   const namespaces = Array.isArray(record.namespaces)
     ? record.namespaces.filter((n): n is string => typeof n === "string")
     : [];

@@ -71,6 +71,7 @@ import {
 import {
   verifyExitBundle,
   encryptedStateSubVerdictFailed,
+  checkEncryptedStateStructure,
 } from "../../src/exit/verifier.js";
 import type { ExitBundleArtifactEntry } from "../../src/contracts/v1.1/exit-bundle-manifest.js";
 
@@ -1105,6 +1106,126 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
         }),
       { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
     );
+  });
+
+  // ---- F3/F4 (Exit V2 drill D1, 2026-08-22): two structural checks that
+  // ---- used to be absent from BOTH verify and import (F3) or present only
+  // ---- in import, AFTER staging (F4). Both now route through the same
+  // ---- `checkEncryptedStateStructure` (verifier.ts) that
+  // ---- entries-malformed uses above, so they share its
+  // ---- `encrypted_state_entries_unreadable` failure_class on the verify
+  // ---- side, with their own named import error for a diagnosable cause.
+
+  it("F3: a source-signed artifact whose total_keys was left stale after entries were truncated fails verify closed, and import refuses with a NAMED error", async () => {
+    const source = await makeSource("aggregator-f3-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      // total_keys stays at its pre-truncation value (1, from makeSource's
+      // single state entry); entries is truncated to 0. A hand-crafted
+      // bundle could not otherwise produce this: only a bundle re-signed by
+      // the SOURCE's own key (like this test does) can carry a
+      // self-declared total_keys that disagrees with its own entries.
+      artifact.total_keys = 1;
+      artifact.entries = [];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_TOTAL_KEYS_MISMATCH", reason: "structural" }
+    );
+  });
+
+  it("F4: a reserved-namespace entry fails verify closed (not just import), and import refuses BEFORE staging any artifact", async () => {
+    const source = await makeSource("aggregator-f4-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      artifact.entries = [{ ...entries[0], namespace: "_injected" }];
+      artifact.namespaces = ["_injected"];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_RESERVED_NAMESPACE_ENTRY", reason: "structural" }
+    );
+
+    // The whole point of F4's fix: the refusal happens BEFORE any staging
+    // write, not after (the drill's pre-fix behavior staged 6 `_exit_*`
+    // artifacts, THEN refused on the incomplete-state rollback). These
+    // namespace literals must match the `EXIT_*_NAMESPACE` constants in
+    // src/exit/bundle.ts.
+    for (const ns of [
+      "_exit_public_identities",
+      "_exit_policy_sets",
+      "_exit_audit_receipts",
+      "_exit_commitments",
+      "_exit_placeholder_metadata",
+      "_exit_imports",
+      "_exit_import_journal",
+      "_injected",
+    ]) {
+      expect(await destination.storage.list(ns)).toHaveLength(0);
+    }
+  });
+
+  it("checkEncryptedStateStructure: total_keys_mismatch and reserved_namespace_entry are computed directly, not folded into entries_malformed_elements", () => {
+    expect(
+      checkEncryptedStateStructure({ entries: [], total_keys: 1 })
+    ).toMatchObject({ ok: false, problem: "total_keys_mismatch" });
+    expect(
+      checkEncryptedStateStructure({ entries: [], total_keys: 0 })
+    ).toMatchObject({ ok: true });
+    expect(
+      checkEncryptedStateStructure({
+        entries: [
+          {
+            namespace: "_reserved",
+            key: "k",
+            entry: {
+              kid: "kid",
+              sig: "sig",
+              payload: { ct: "ct" },
+              metadata: {},
+            },
+          },
+        ],
+        total_keys: 1,
+      })
+    ).toMatchObject({ ok: false, problem: "reserved_namespace_entry" });
   });
 
   // ---- Artifact 1's OTHER mutation-provable half: the fail-closed default ---

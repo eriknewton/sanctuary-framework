@@ -395,7 +395,7 @@ describe("exit import state warning", () => {
     expect(freeze.frozen).toBe(false);
   });
 
-  it("refuses and prints skipped counters when state import drops an entry", async () => {
+  it("refuses a reserved-namespace entry BEFORE staging, with a named error (F4, Exit V2 drill D1, 2026-08-22)", async () => {
     const source = await bootstrapFortress(SOURCE_PASSPHRASE, "source");
     cleanup.push(source.storagePath);
     const stateStore = new StateStore(source.storage, source.masterKey);
@@ -437,12 +437,18 @@ describe("exit import state warning", () => {
       env: { SANCTUARY_PASSPHRASE: DESTINATION_PASSPHRASE },
     });
 
+    // F4 (Exit V2 drill D1): before the fix, this scenario staged every
+    // artifact, hit the reserved-namespace entry inside `rekeyState`, and
+    // only THEN reported `state_skipped_keys: 1` / "state import
+    // incomplete" and rolled back. The fix moves the SAME refusal to the
+    // shared pre-staging gate (checkEncryptedStateStructure,
+    // verifier.ts/bundle.ts), so it never gets that far: a NAMED error, not
+    // a late-stage skip counter.
     expect(code).toBe(1);
     expect(out.text).not.toContain("verdict: PASS");
-    expect(err.text).toContain("state_skipped_keys: 1");
-    expect(err.text).toContain("state_skipped_invalid_sig: 0");
-    expect(err.text).toContain("state_skipped_unknown_kid: 0");
-    expect(err.text).toContain("state import incomplete");
+    expect(err.text).toContain("ENCRYPTED_STATE_RESERVED_NAMESPACE_ENTRY");
+    expect(err.text).toContain("reserved namespace");
+    expect(err.text).not.toContain("state_skipped_keys");
 
     const destinationState = new StateStore(
       destination.storage,

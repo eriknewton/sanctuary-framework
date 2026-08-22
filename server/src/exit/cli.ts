@@ -23,6 +23,7 @@ import {
   exitBundleManifestShape,
   ExitBundleImportError,
   ExitBundleStateImportIncompleteError,
+  recoverInterruptedExitImports,
   type ImportExitBundleResult,
 } from "./bundle.js";
 import type {
@@ -185,6 +186,16 @@ async function openExitContext(
   await identityManager.load();
   const reputationStore = new ReputationStore(storage, masterKey);
   void stateStore;
+
+  // F1 (Exit V2 drill D1, 2026-08-22): "fortress open" for every `sanctuary
+  // exit` subcommand. A prior process kill mid-`exit import` on THIS
+  // fortress can leave a durable rollback journal behind
+  // (importExitBundle's own start-of-call recovery only fires on the NEXT
+  // import; an operator who instead runs `exit verify`/`exit inspect`/
+  // `exit export` after a kill would otherwise read a half-applied target
+  // with no warning). Roll it back here too, before any subcommand's own
+  // work runs.
+  await recoverInterruptedExitImports(storage, auditLog);
 
   return {
     storagePath: config.storage_path,
