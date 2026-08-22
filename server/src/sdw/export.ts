@@ -78,6 +78,61 @@ export interface SdwExportInventorySource {
   listNamespaceSync(
     namespace: SdwExportableNamespace,
   ): readonly SdwInventoryEntry[];
+  /**
+   * Optional: re-read the live store before the next synchronous enumeration.
+   * A source whose backing store is asynchronous (the shipped filesystem
+   * fortress) exposes this; the tool layer awaits it immediately before EVERY
+   * enumeration (gate-time freeze, assembly-time drift recheck, delete-time
+   * recheck) so the scope digest is always computed over current bytes.
+   */
+  refresh?(): Promise<void>;
+}
+
+/**
+ * Inventory source over any async `StorageBackend` (the shipped fortress is a
+ * `FilesystemStorage`, which has no synchronous listing). `refresh()` reads the
+ * exportable namespaces into a snapshot; `listNamespaceSync` serves the
+ * snapshot.
+ *
+ * Fail closed on a never-refreshed namespace: an empty answer here would read
+ * as "nothing to export" (silently shipping nothing) or "nothing listed in
+ * the manifest is still present" (silently deleting nothing) rather than as
+ * the programming error it is.
+ */
+export class StorageSnapshotSdwInventorySource implements SdwExportInventorySource {
+  private readonly snapshot = new Map<SdwExportableNamespace, readonly SdwInventoryEntry[]>();
+
+  constructor(
+    private readonly storage: {
+      list(namespace: string, prefix?: string): Promise<readonly { key: string }[]>;
+      read(namespace: string, key: string): Promise<Uint8Array | null>;
+    },
+  ) {}
+
+  async refresh(): Promise<void> {
+    for (const namespace of SDW_EXPORTABLE_NAMESPACES) {
+      const entries: SdwInventoryEntry[] = [];
+      for (const meta of await this.storage.list(namespace)) {
+        const data = await this.storage.read(namespace, meta.key);
+        // A record deleted between list and read is simply absent from this
+        // snapshot; the drift recheck at assembly time catches it if it
+        // matters to an approval already shown.
+        if (data !== null) entries.push({ key: meta.key, data });
+      }
+      this.snapshot.set(namespace, entries);
+    }
+  }
+
+  listNamespaceSync(namespace: SdwExportableNamespace): readonly SdwInventoryEntry[] {
+    const entries = this.snapshot.get(namespace);
+    if (entries === undefined) {
+      throw new SdwValidationError(
+        "namespace_mismatch",
+        "SDW export inventory was enumerated before refresh()",
+      );
+    }
+    return entries;
+  }
 }
 
 export interface SdwInventoryEntry {

@@ -701,8 +701,21 @@ export function formatMcpServerCount(
  * path on its boot path. Resolved to absolute so subsequent CWD
  * changes do not break the persisted reference.
  */
-function buildSanctuaryEnv(options: WrapOptions): Record<string, string> {
+export function buildSanctuaryEnv(
+  options: WrapOptions,
+  wrapped: { platform: AgentPlatform; storagePath: string },
+): Record<string, string> {
   const sanctuaryEnv: Record<string, string> = {};
+  // The wrapped-agent identity the server's multi-agent isolation guard pins
+  // (must match `wrappedAgentIdentityFromEnv` in sdw/memory-isolation.ts).
+  // INVARIANT: written HERE, at wrap time, by the operator-run wrap, from the
+  // harness kind and fortress id, never from anything the agent supplies: a
+  // guard keyed on an agent-chosen value is defeatable because an agent can
+  // mint identities. Two harnesses wrapped on one host (or one harness over
+  // two fortresses) get two distinct ids, which is what lets the guard refuse
+  // the second. It is the same value the hub's LocalAgentRecord carries, so
+  // the router's `agent:<id>` caller principal and the fleet record agree.
+  sanctuaryEnv.SANCTUARY_AGENT_ID = wrappedAgentId(wrapped.platform, wrapped.storagePath);
   if (process.env.SANCTUARY_PASSPHRASE) {
     sanctuaryEnv.SANCTUARY_PASSPHRASE = process.env.SANCTUARY_PASSPHRASE;
   }
@@ -1315,7 +1328,13 @@ async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
   } catch {
     // File absent - the plan would create it.
   }
-  const sanctuaryEnv = buildSanctuaryEnv(options);
+  // Fortress promotion (--fortress / SANCTUARY_FORTRESS_PATH) has already run
+  // by the time a dry run reaches here, so this previews the same storage
+  // path and therefore the same SANCTUARY_AGENT_ID the real run writes.
+  const sanctuaryEnv = buildSanctuaryEnv(options, {
+    platform: "hermes",
+    storagePath: resolveStoragePath(),
+  });
   const { command, args } = resolveSanctuaryCommand(options);
   try {
     // Preview the parse-parity guard too: a dry run should report that the
@@ -3929,7 +3948,10 @@ export async function runWrap(
   // command/args construction live in buildSanctuaryEnv /
   // resolveSanctuaryCommand so the dry-run reporter previews the exact
   // entry the real run writes.
-  const sanctuaryEnv = buildSanctuaryEnv(options);
+  const sanctuaryEnv = buildSanctuaryEnv(options, {
+    platform: agentConfig.platform,
+    storagePath,
+  });
   const { command: sanctuaryCommand, args: sanctuaryArgs } =
     resolveSanctuaryCommand(options);
 
@@ -6102,16 +6124,27 @@ export function harnessKindForPlatform(platform: AgentPlatform): LocalHarnessKin
  * uid after auto-provision, and `can_change_template` is registry-local
  * through the Tier 1 binding flow.
  */
+/**
+ * The wrap-time identity of one wrapped harness over one fortress:
+ * `<harness-kind>:<fortress-id>`. Written into the harness's `sanctuary` MCP
+ * entry as `SANCTUARY_AGENT_ID` (buildSanctuaryEnv) and carried, with the
+ * `agent:` prefix the router also adds, as the hub record's `agent_id`
+ * (buildLocalAgentRecord). One function so the two can never disagree.
+ */
+export function wrappedAgentId(platform: AgentPlatform, storagePath: string): string {
+  return `${harnessKindForPlatform(platform)}:${fortressIdFromStoragePath(storagePath)}`;
+}
+
 function buildLocalAgentRecord(input: {
   storagePath: string;
   platform: AgentPlatform;
 }): LocalAgentRecord {
   const harness = harnessKindForPlatform(input.platform);
-  const fortressId = fortressIdFromStoragePath(input.storagePath);
   const nowIso = new Date().toISOString();
   return {
     version: "1.1",
-    agent_id: `agent:${harness}:${fortressId}`,
+    // Must equal `agent:` + the SANCTUARY_AGENT_ID written by buildSanctuaryEnv.
+    agent_id: `agent:${wrappedAgentId(input.platform, input.storagePath)}`,
     identity_id: `fortress:${input.storagePath}`,
     harness,
     model_provider: {

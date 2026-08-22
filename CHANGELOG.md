@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Sovereign Data Warehouse vault export, import and post-export delete are now on the shipped MCP catalog.** `sdw_export`, `sdw_import` and `sdw_export_delete` were built and tested but never registered by the production server, so no shipped surface could export the vault despite the project rule that persisted agent output be inspectable, exportable and deletable. They are now wired into the composition root as force-pinned Tier 1 operations: export writes a signed, still-encrypted bundle under the fortress's own `sdw-exports/` directory (an operator-directed archive, never a carriage path), delete removes exactly the manifest-listed records while their ciphertext still matches, and import is all-or-nothing inside one storage transaction or refuses with `storage_not_transactional`. Bound: the shipped filesystem fortress has no transaction primitive, so `sdw_import` refuses on it today, and only a bundle this fortress exported (`source_key_ref: this-fortress`) can be re-imported.
+- **The multi-agent memory isolation guard is live.** `sanctuary wrap` now writes `SANCTUARY_AGENT_ID` (`<harness>:<fortress-id>`) into the harness's `sanctuary` MCP entry, so the server's isolation guard resolves a real per-wrap identity and refuses a second wrapped agent on the same host instead of never firing. The same guard now also covers the vault tools. This corrects the 1.7.0 "Multi-agent SDW isolation guard" correction note below.
+- **Successful `sdw_memory_provenance` reads are audited.** Each read appends one durable record (passage id and whether it was found, never the body) before the answer is returned; a downed audit sink denies rather than answers unlogged.
+
 - `sanctuary audit-chain verify --no-strict` exits 10 when verification completes with findings, while clean verification exits 0 and strict findings exit 1. The JSON report remains `FAIL` whenever findings are present.
 - `sanctuary doctor` warns when an audit chain has unsigned checkpoints and no verified checkpoint signatures.
 

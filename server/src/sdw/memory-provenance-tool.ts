@@ -68,6 +68,19 @@ function provenanceGaps(): Record<string, unknown> {
   };
 }
 
+/**
+ * Audit operation catalog for this tool. Every `appendCritical` here names its
+ * operation through this table (never a string literal) so the wired-consumer
+ * test in test/sdw/memory-provenance-tool.test.ts and the tool agree on one
+ * source; a test pinned to the same constants cannot drift from the code.
+ */
+export const SDW_MEMORY_PROVENANCE_AUDIT_OPS = {
+  /** One record per successful provenance read (found or not found). */
+  read: "sdw_memory_provenance_read",
+  /** Denial paths: invalid passage id, integrity failure, backend failure. */
+  denied: "sdw_memory_provenance_denied",
+} as const;
+
 export function createSdwMemoryProvenanceTool(
   options: SdwMemoryProvenanceToolOptions,
 ): ToolDefinition {
@@ -76,9 +89,23 @@ export function createSdwMemoryProvenanceTool(
   const auditFailure = (details: Record<string, unknown>): Promise<void> =>
     auditLog.appendCritical({
       layer: "l1",
-      operation: "sdw_memory_provenance_denied",
+      operation: SDW_MEMORY_PROVENANCE_AUDIT_OPS.denied,
       identity_id: "system",
       result: "failure",
+      details,
+    });
+
+  // Provenance inspection is as sensitive as the read it judges: a successful
+  // read leaves exactly one durable record (IC-28), written BEFORE the answer
+  // is returned so a downed audit sink denies rather than answers unlogged
+  // (audit-before-return, MUST-NEVER #5). Details carry the passage id and
+  // whether it was found; never the passage body.
+  const auditRead = (details: { passage_id: string; found: boolean }): Promise<void> =>
+    auditLog.appendCritical({
+      layer: "l1",
+      operation: SDW_MEMORY_PROVENANCE_AUDIT_OPS.read,
+      identity_id: "principal",
+      result: "success",
       details,
     });
 
@@ -114,8 +141,10 @@ export function createSdwMemoryProvenanceTool(
       try {
         const passage = await adapter.getPassage(passageId);
         if (passage === null) {
+          await auditRead({ passage_id: passageId, found: false });
           return toolResult({ found: false });
         }
+        await auditRead({ passage_id: passageId, found: true });
         // Public-safe provenance: the passage's own non-sensitive facts plus
         // the honest gaps block. No body text, no audit internals, no ids
         // beyond the caller's own passage/owner refs.

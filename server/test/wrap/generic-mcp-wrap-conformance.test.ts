@@ -30,6 +30,7 @@ import {
 } from "../../src/core/master-custody.js";
 import { readPersistedLocalAgents } from "../../src/hub/agent-registry-persistence.js";
 import { SANCTUARY_VERSION } from "../../src/config.js";
+import { wrappedAgentId } from "../../src/wrap/cli.js";
 
 /**
  * The published-version MCP entry the wrap writes (v1.6.1 install-path
@@ -151,6 +152,8 @@ describe("generic MCP wrap conformance", () => {
     expect(wrapped.mcpServers?.sanctuary).toEqual({
       command: "npx",
       args: PINNED_SANCTUARY_ARGS,
+      // The wrap-time agent identity the server's isolation guard pins.
+      env: { SANCTUARY_AGENT_ID: wrappedAgentId("generic", process.env.SANCTUARY_STORAGE_PATH!) },
     });
 
     const profile = JSON.parse(
@@ -214,6 +217,8 @@ describe("generic MCP wrap conformance", () => {
     expect(wrapped.mcpServers?.sanctuary).toEqual({
       command: "npx",
       args: PINNED_SANCTUARY_ARGS,
+      // The wrap-time agent identity the server's isolation guard pins.
+      env: { SANCTUARY_AGENT_ID: wrappedAgentId("generic", process.env.SANCTUARY_STORAGE_PATH!) },
     });
     expect(
       readPersistedLocalAgents(process.env.SANCTUARY_STORAGE_PATH!)[0]?.harness,
@@ -240,6 +245,7 @@ describe("generic MCP wrap conformance", () => {
       sanctuary: {
         command: "npx",
         args: PINNED_SANCTUARY_ARGS,
+        env: { SANCTUARY_AGENT_ID: wrappedAgentId("generic", process.env.SANCTUARY_STORAGE_PATH!) },
       },
     });
     expect(

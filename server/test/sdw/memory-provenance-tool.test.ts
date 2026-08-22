@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
-import { createSdwMemoryProvenanceTool } from "../../src/sdw/memory-provenance-tool.js";
+import {
+  SDW_MEMORY_PROVENANCE_AUDIT_OPS,
+  createSdwMemoryProvenanceTool,
+} from "../../src/sdw/memory-provenance-tool.js";
 import { assertSdwRawWriteAuthorized } from "../../src/sdw/write-gate.js";
 import type { AuditLog } from "../../src/operational/audit-log.js";
 
@@ -42,17 +45,22 @@ class MemoryStorage implements StorageBackend {
   }
 }
 
-function makeAuditLog(): { log: AuditLog; calls: Array<{ operation: string }> } {
-  const calls: Array<{ operation: string }> = [];
+type AuditCall = { operation: string; result?: string; details?: Record<string, unknown> };
+
+function makeAuditLog(failOn?: string): { log: AuditLog; calls: AuditCall[] } {
+  const calls: AuditCall[] = [];
   const log = {
-    async appendCritical(entry: { operation: string }): Promise<void> {
-      calls.push({ operation: entry.operation });
+    async appendCritical(entry: AuditCall): Promise<void> {
+      if (failOn !== undefined && entry.operation === failOn) {
+        throw new Error(`audit sink down for ${entry.operation}`);
+      }
+      calls.push({ operation: entry.operation, result: entry.result, details: entry.details });
     },
   } as unknown as AuditLog;
   return { log, calls };
 }
 
-function setup() {
+function setup(failOn?: string) {
   const storage = new MemoryStorage();
   const adapter = new SdwMemoryBackendAdapter({
     storage,
@@ -61,7 +69,7 @@ function setup() {
     ownerRef: "prov-archive",
     now: () => NOW,
   });
-  const { log, calls } = makeAuditLog();
+  const { log, calls } = makeAuditLog(failOn);
   const tool = createSdwMemoryProvenanceTool({ adapter, auditLog: log });
   return { adapter, tool, calls };
 }
@@ -160,5 +168,45 @@ describe("sdw_memory_provenance: honesty + public-safety", () => {
     expect(out.denied).toBe(true);
     expect(out).not.toHaveProperty("provenance");
     expect(calls.some((c) => c.operation === "sdw_memory_provenance_denied")).toBe(true);
+  });
+});
+
+describe("IC-28: successful provenance reads are audited (one record per read, through the catalog)", () => {
+  const readOp = SDW_MEMORY_PROVENANCE_AUDIT_OPS.read;
+  const readRecords = (calls: AuditCall[]) => calls.filter((c) => c.operation === readOp);
+
+  it("a found passage appends exactly one read record naming the passage, with result success", async () => {
+    const { adapter, tool, calls } = setup();
+    await adapter.insertPassage({ passage_id: "r1", text: "audited read" }, "agent_derived_clean");
+    const out = parse(await tool.handler({ passage_id: "r1" }));
+    expect(out.found).toBe(true);
+    expect(readRecords(calls)).toEqual([
+      { operation: readOp, result: "success", details: { passage_id: "r1", found: true } },
+    ]);
+    // The record carries no passage body (MUST-NEVER #7 projection).
+    expect(JSON.stringify(calls)).not.toContain("audited read");
+  });
+
+  it("a missing passage is still a read: exactly one record with found:false", async () => {
+    const { tool, calls } = setup();
+    expect(parse(await tool.handler({ passage_id: "absent" })).found).toBe(false);
+    expect(readRecords(calls)).toEqual([
+      { operation: readOp, result: "success", details: { passage_id: "absent", found: false } },
+    ]);
+  });
+
+  it("a denied call writes a denial record and NO read record", async () => {
+    const { tool, calls } = setup();
+    expect(parse(await tool.handler({ passage_id: "" })).denied).toBe(true);
+    expect(readRecords(calls)).toEqual([]);
+    expect(calls.map((c) => c.operation)).toEqual([SDW_MEMORY_PROVENANCE_AUDIT_OPS.denied]);
+  });
+
+  it("audit-before-return: a downed audit sink denies instead of answering unlogged", async () => {
+    const { adapter, tool } = setup(readOp);
+    await adapter.insertPassage({ passage_id: "r2", text: "never answered unlogged" }, "agent_derived_clean");
+    const out = parse(await tool.handler({ passage_id: "r2" }));
+    expect(out.denied).toBe(true);
+    expect(out).not.toHaveProperty("provenance");
   });
 });

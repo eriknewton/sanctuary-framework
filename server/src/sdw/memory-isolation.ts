@@ -34,6 +34,26 @@ export type MultiAgentIsolationGuard = (
   operation: string,
 ) => { allowed: true } | { allowed: false };
 
+/**
+ * The production identity resolver every guard instance in index.ts is built
+ * over. It reads `SANCTUARY_AGENT_ID` from the SERVER's own process
+ * environment, which `sanctuary wrap` writes into the harness's `sanctuary`
+ * MCP entry at wrap time (must match `SANCTUARY_AGENT_ID` in
+ * `wrap/cli.ts:buildSanctuaryEnv`; the value is `wrappedAgentId(...)`).
+ *
+ * INVARIANT: the guard keys on this wrap-time, operator-bound identity and
+ * NEVER on a value the agent asserts in a tool argument or mints for itself.
+ * An agent can create identities at will, so any per-identity property it can
+ * choose is defeatable; the env var exists before the agent process does and
+ * is set by whoever ran the wrap, which is the same trust basis as the
+ * passphrase and fortress path that travel in the same entry. This is also
+ * the identity the router stamps as `callerIdentity` (`agent:<id>`), so the
+ * pin and the audit principal agree.
+ */
+export function wrappedAgentIdentityFromEnv(): string | undefined {
+  return process.env.SANCTUARY_AGENT_ID;
+}
+
 export function createMultiAgentIsolationGuard(
   ownerIdentity: (() => string | undefined) | undefined,
 ): MultiAgentIsolationGuard {

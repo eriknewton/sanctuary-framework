@@ -108,9 +108,16 @@ import { createSanctuaryTools } from "./sanctuary-tools.js";
 import { createMemoryAttestTools } from "./cognitive/memory-attest.js";
 import { createSdwMemoryTools, memoryInsertApprovalArgs } from "./sdw/memory-tools.js";
 import { createSdwMemoryFileTools } from "./sdw/memory-file-tools.js";
-import { createMultiAgentIsolationGuard } from "./sdw/memory-isolation.js";
+import {
+  createMultiAgentIsolationGuard,
+  wrappedAgentIdentityFromEnv,
+} from "./sdw/memory-isolation.js";
 import { createSdwMemoryProvenanceTool } from "./sdw/memory-provenance-tool.js";
 import { SdwMemoryBackendAdapter } from "./sdw/adapters/sdw-memory-backend.js";
+import { createSdwTools } from "./sdw/tools.js";
+import { StorageSnapshotSdwInventorySource } from "./sdw/export.js";
+import { fromBase64url } from "./core/encoding.js";
+import { join as joinPath } from "node:path";
 import { createComplianceTools } from "./compliance/eu_ai_act/generator.js";
 import { createErc8004Tools } from "./key-17/erc8004-tools.js";
 import { createErc8004ResolveTools } from "./key-17/erc8004-resolve.js";
@@ -1512,7 +1519,13 @@ export async function createSanctuaryServer(options?: {
   // pins each family's own first caller, so the agent refused by memory_get
   // would be the FIRST caller of memory_emit and could dump the whole shared
   // corpus as plaintext files.
-  const sdwMemoryIdentity = (): string | undefined => process.env.SANCTUARY_AGENT_ID;
+  //
+  // The resolver is the production one from memory-isolation.ts: it reads the
+  // wrap-time `SANCTUARY_AGENT_ID` that `sanctuary wrap` writes into the
+  // harness's MCP entry (wrap/cli.ts:buildSanctuaryEnv), never an
+  // agent-asserted value, so two wrapped harnesses on one host resolve two
+  // distinct ids and the second is refused.
+  const sdwMemoryIdentity = wrappedAgentIdentityFromEnv;
   const sdwMemoryIsolationGuard = createMultiAgentIsolationGuard(sdwMemoryIdentity);
   const sdwMemoryTools = createSdwMemoryTools({
     adapter: sdwMemoryAdapter,
@@ -1543,6 +1556,51 @@ export async function createSanctuaryServer(options?: {
     // to sit behind the identical pin, and the approval projection uses the
     // resolver to tell the operator whose memory a dump moves.
     ownerIdentity: sdwMemoryIdentity,
+    isolationGuard: sdwMemoryIsolationGuard,
+  });
+
+  // 16b1a. SDW vault export / import / post-export delete (IC-15). MUST-NEVER
+  // #2 requires every persisted agent output to be inspectable, exportable and
+  // deletable; these are the shipped surfaces for the `_sdw_*` namespaces.
+  // All three are force-pinned Tier 1 in the policy loader (FORCED_TIER1
+  // _OPERATIONS; must match the names in principal-policy/loader.ts). Bundles
+  // are written only under the fortress's own export directory (the agent
+  // chooses a filename stem, never a path), carry ciphertext only, and are
+  // signed by the fortress's primary identity; the signing key is resolved at
+  // call time because the identity can be created after boot, and no identity
+  // means no export (never an unsigned bundle). The directory is created
+  // lazily by the first approved export, never at boot: boot must not write
+  // anything new into the fortress on the operator's behalf.
+  const sdwExportDir = joinPath(config.storage_path, "sdw-exports");
+  const sdwIdentityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+  const sdwVaultTools = createSdwTools({
+    storage,
+    // The shipped fortress is an async FilesystemStorage: the snapshot source
+    // re-reads the live store before every enumeration (see tools.ts).
+    inventory: new StorageSnapshotSdwInventorySource(storage),
+    auditLog,
+    fortressId: fortressIdFromStoragePath(config.storage_path),
+    exportDir: sdwExportDir,
+    signingKey: () => {
+      const identity = identityManager.getDefault();
+      if (!identity) return null;
+      return {
+        keyRef: identity.identity_id,
+        encryptedPrivateKey: identity.encrypted_private_key,
+        encryptionKey: sdwIdentityEncryptionKey,
+      };
+    },
+    resolvePublicKey: (keyRef) => {
+      const identity = identityManager.get(keyRef);
+      return identity ? fromBase64url(identity.public_key) : null;
+    },
+    // Only a bundle THIS fortress exported can be re-imported today; the ref
+    // is a fixed token, so no key material ever transits a tool argument.
+    // Cross-fortress source keys are not operator-configurable yet (the tool
+    // description says so), and any other ref fails closed.
+    resolveSourceMasterKey: (ref) => (ref === "this-fortress" ? masterKey : null),
+    targetMasterKey: masterKey,
+    // Same guard instance as every other family over the shared corpus.
     isolationGuard: sdwMemoryIsolationGuard,
   });
 
@@ -1734,6 +1792,7 @@ export async function createSanctuaryServer(options?: {
     ...sdwMemoryTools,
     sdwMemoryProvenanceTool,
     ...sdwMemoryFileTools,
+    ...sdwVaultTools,
     ...complianceTools,
     ...erc8004Tools,
     ...erc8004ResolveTools,
@@ -1979,6 +2038,9 @@ const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([
   "sanctuary_export_identity_bundle",
   "sanctuary_link_to_human",
   "sanctuary_sign_challenge",
+  "sdw_export",
+  "sdw_export_delete",
+  "sdw_import",
   "shr_gateway_export",
   "shr_generate",
   "state_delete",
