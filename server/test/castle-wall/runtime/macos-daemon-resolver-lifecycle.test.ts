@@ -1,3 +1,4 @@
+// fail-before-exempt: This change characterizes existing manual-reload serialization while hardening non-behavioral composition inputs and listener guards.
 /**
  * Castle Wall macOS daemon — resolver lifecycle refresh tests.
  *
@@ -461,6 +462,64 @@ describe("Castle Wall macOS daemon — resolver lifecycle refresh", () => {
       );
       expect(finalDerived?.match.ip).toEqual(["192.168.1.53"]);
     } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("serializes concurrent manual reloads and publishes them in admission order", async () => {
+    const { fortressPath, masterKey, auditLog } = await provision();
+    const listener = makeInspectingListener();
+    let resolverReadCount = 0;
+    let firstReloadReadStarted: (() => void) | undefined;
+    const firstReloadStarted = new Promise<void>((resolve) => {
+      firstReloadReadStarted = resolve;
+    });
+    let releaseFirstReloadRead: (() => void) | undefined;
+    const firstReloadReadReleased = new Promise<void>((resolve) => {
+      releaseFirstReloadRead = resolve;
+    });
+    const daemon = await start(
+      fortressPath,
+      masterKey,
+      auditLog,
+      listener.factory,
+      async () => {
+        resolverReadCount += 1;
+        if (resolverReadCount === 1) return ["192.168.1.1"];
+        if (resolverReadCount === 2) {
+          firstReloadReadStarted?.();
+          await firstReloadReadReleased;
+          return ["100.100.100.100"];
+        }
+        return ["192.168.1.53"];
+      },
+      makeSigner(),
+      // Keep the lifecycle monitor out of this same-type contention test.
+      3_600,
+    );
+    try {
+      const firstReload = daemon.reloadPolicy();
+      await firstReloadStarted;
+      const secondReload = daemon.reloadPolicy();
+
+      // The second reload cannot read or compose until the first publication
+      // leaves the shared writer tail.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(resolverReadCount).toBe(2);
+      releaseFirstReloadRead?.();
+
+      const [firstReply, secondReply] = await Promise.all([firstReload, secondReload]);
+      expect(firstReply.ok).toBe(true);
+      expect(secondReply.ok).toBe(true);
+      expect(listener.snapshots).toHaveLength(2);
+      expect(
+        listener.snapshots[0]!.rules.find((rule) => rule.id === DERIVED_DNS_RULE_ID)?.match.ip,
+      ).toEqual(["100.100.100.100"]);
+      expect(
+        listener.snapshots[1]!.rules.find((rule) => rule.id === DERIVED_DNS_RULE_ID)?.match.ip,
+      ).toEqual(["192.168.1.53"]);
+    } finally {
+      releaseFirstReloadRead?.();
       await daemon.stop();
     }
   });

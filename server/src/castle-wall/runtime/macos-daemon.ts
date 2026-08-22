@@ -787,7 +787,7 @@ export async function startMacOSCastleWallDaemon(
       agentOrigin: unknown;
       operatorBaseline: unknown;
       exclusiveEgressGate: ExclusiveEgressGatePolicy | undefined;
-    } = { agentOrigin, operatorBaseline, exclusiveEgressGate },
+    },
     onStage?: (stage: PolicyReloadStage) => void,
   ): Promise<ManifestState> =>
     loadManifestState({
@@ -809,7 +809,11 @@ export async function startMacOSCastleWallDaemon(
   // intentionally keeps its candidate locally installed after a broadcast
   // error, so the lifecycle comparator must follow that local snapshot.
   let installedManifestResolverSet = canonicalResolverSet(startupResolvers);
-  let manifestState = await composeManifestForResolvers(startupResolvers);
+  let manifestState = await composeManifestForResolvers(startupResolvers, {
+    agentOrigin,
+    operatorBaseline,
+    exclusiveEgressGate,
+  });
   const pendingRequests = new Set<string>();
   const heartbeatIntervalSeconds = input.armLeaseHeartbeatIntervalSeconds ?? 5;
   let leaseHeartbeat: NodeJS.Timeout | undefined;
@@ -991,6 +995,12 @@ export async function startMacOSCastleWallDaemon(
   const leaseDeliveryContradictions = new Map<string, number>();
   let leaseDeliveryRecycles = 0;
   let listener: MacOSCastleWallListenerHandle | null = null;
+  const requireListener = (): MacOSCastleWallListenerHandle => {
+    if (listener === null) {
+      throw new Error("Castle Wall listener is unavailable for manifest publication");
+    }
+    return listener;
+  };
   const resolverLifecycleRefreshIntervalSeconds =
     input.resolverLifecycleRefreshIntervalSeconds ??
     DEFAULT_RESOLVER_LIFECYCLE_REFRESH_INTERVAL_SECONDS;
@@ -1798,7 +1808,7 @@ export async function startMacOSCastleWallDaemon(
     try {
       input.onStage?.("broadcast");
       const emittedSubscribers = await withReloadDeadline(
-        listener!.broadcastManifestUpdate(),
+        requireListener().broadcastManifestUpdate(),
         reloadBroadcastDeadlineMs,
         `manifest broadcast did not complete within ${reloadBroadcastDeadlineMs}ms during policy reload`,
       );
