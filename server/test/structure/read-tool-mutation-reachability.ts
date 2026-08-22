@@ -210,21 +210,13 @@
  *     handover instead.
  *   - `proxy/*` tools are named at runtime from an upstream catalog and are
  *     forced `write` at classification time, so they are outside this analysis.
- *   - THE WALK IS NOT TOTAL OVER INVOCATION OR OVER DISPATCH, and this is the
- *     bound rather than an oversight. It visits some invocation forms and not
- *     others, and it follows some ways one declaration stands in for another
- *     and not others, so a body can run without this analyzer reaching it. A
- *     bounded number of syntactic and dataflow shapes remain open on both
- *     counts. WHICH ONES IS NOT WRITTEN DOWN HERE, and neither is a count of
- *     them: this file ships in a public repository, an open shape named in
- *     prose is most of the way to a working evasion of a live guard, and a
- *     count of open shapes reads as an assurance that the rest are closed. They
- *     resolve in the private register under ABC-READCLASS-01. The corresponding
- *     honesty obligation is discharged by stating plainly that the coverage is
- *     partial, which is what this bullet does; softening it further would not
- *     be permitted, and describing the shapes is not required to state it.
- *     Read the laundering corpus narrowly for the same reason: a fixture there
- *     pins exactly the shape it spells and nothing adjacent to it.
+ *   - IMPLICIT-INVOCATION COVERAGE REMAINS PARTIAL. This change closes exactly
+ *     getter read, simple setter assignment, and synchronous source-local
+ *     for-of, each pinned as a must-fail fixture in the test file. Remaining
+ *     bounds resolve privately under ABC-READCLASS-01 / GATE-A-R5. The walk is
+ *     also not total over the ways one declaration stands in for another; the
+ *     dispatch residual is stated separately and resolves in the same register
+ *     entry.
  *   - THE FOUR TRAVERSAL CAPS FAIL OPEN, THOUGH NO LONGER SILENTLY BEYOND
  *     THEMSELVES. Call depth, alias hops, cast hops, and reflective hops each
  *     stop on exhaustion with nothing recorded, so exhausting one is
@@ -667,6 +659,11 @@ function locate(node: ts.Node): string {
   return `${relPath(node.getSourceFile().fileName)}:${lineOf(node)}`;
 }
 
+/** True when `filePath` is strictly under `dir`, safe against sibling-prefix confusion. */
+function isUnder(filePath: string, dir: string): boolean {
+  return filePath.startsWith(dir + "/");
+}
+
 /** True for the `@types/node` fs typings, so `FS_MUTATORS` cannot cross-match. */
 function isFsDeclarationFile(fileName: string): boolean {
   return (
@@ -828,7 +825,8 @@ function functionBody(decl: ts.Declaration): ts.Node | undefined {
     ts.isFunctionDeclaration(decl) ||
     ts.isMethodDeclaration(decl) ||
     ts.isConstructorDeclaration(decl) ||
-    ts.isGetAccessorDeclaration(decl)
+    ts.isGetAccessorDeclaration(decl) ||
+    ts.isSetAccessorDeclaration(decl)
   ) {
     return decl.body;
   }
@@ -852,6 +850,7 @@ function isFunctionLike(decl: ts.Declaration): boolean {
     ts.isMethodSignature(decl) ||
     ts.isConstructorDeclaration(decl) ||
     ts.isGetAccessorDeclaration(decl) ||
+    ts.isSetAccessorDeclaration(decl) ||
     ts.isArrowFunction(decl) ||
     ts.isFunctionExpression(decl) ||
     ((ts.isPropertySignature(decl) ||
@@ -937,6 +936,123 @@ function indirectTargets(
       out.push(callee.expression);
     }
   }
+  return out;
+}
+
+/**
+ * THE IMPLICIT-INVOCATION CHOKEPOINT. Three TypeScript runtime forms invoke a
+ * declaration's body without a CallExpression, NewExpression, or
+ * TaggedTemplateExpression at the consuming site:
+ *
+ *   1. GETTER READ: a PropertyAccessExpression or ElementAccessExpression whose
+ *      symbol resolves to a GetAccessorDeclaration invokes that getter's body.
+ *      The existing resolver already follows getter RETURN VALUES to classify
+ *      what the getter hands back; this is the complementary half: the body
+ *      itself can spawn a subprocess or mutate state as a side effect of being
+ *      invoked, and that side effect is invisible to the call-expression walk.
+ *
+ *   2. SETTER ASSIGNMENT: a BinaryExpression with `=` whose left-hand side
+ *      resolves to a SetAccessorDeclaration invokes the setter's body. Remaining
+ *      bounds resolve privately under ABC-READCLASS-01 / GATE-A-R5.
+ *
+ *   3. ITERATOR PROTOCOL: a ForOfStatement over an expression whose type has a
+ *      source-local `[Symbol.iterator]()` method invokes that method's body.
+ *      Remaining bounds resolve privately under ABC-READCLASS-01 / GATE-A-R5.
+ *
+ * Returns source-local declarations whose bodies are implicitly invoked. The
+ * walk descends into them exactly as it does for an explicit call's walk
+ * targets, through the same `admitDescent` / memo / depth-ceiling path.
+ *
+ * Called internally by `walkForSinks`, which is exported and drives this
+ * function over both the production tree and the test's synthetic programs.
+ */
+function resolveImplicitInvocations(
+  node: ts.Node,
+  checker: ts.TypeChecker,
+  srcRoot: string
+): ts.Declaration[] {
+  const out: ts.Declaration[] = [];
+
+  // --- 1. Getter read -------------------------------------------------------
+  if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+    // A simple `obj.prop = value` assignment does NOT invoke the getter: the
+    // setter (if any) is dispatched from the BinaryExpression in section 2.
+    // Resolving the getter here would manufacture a false mutation hit for
+    // every getter-on-the-setter-LHS pattern. Exclude exactly the case where
+    // this property/element access is the left operand of a parent `=`.
+    const parent = node.parent;
+    const isSimpleAssignmentLHS =
+      ts.isBinaryExpression(parent) &&
+      parent.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      parent.left === node;
+    if (isSimpleAssignmentLHS) {
+      // The setter is picked up by section 2 when the BinaryExpression is
+      // visited; nothing more to do here.
+    } else {
+      const nameNode = ts.isPropertyAccessExpression(node) ? node.name : node.argumentExpression;
+      let symbol = checker.getSymbolAtLocation(nameNode);
+      if (symbol !== undefined && (symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+        symbol = checker.getAliasedSymbol(symbol);
+      }
+      for (const decl of symbol?.getDeclarations() ?? []) {
+        if (
+          ts.isGetAccessorDeclaration(decl) &&
+          decl.body !== undefined &&
+          isUnder(decl.getSourceFile().fileName, srcRoot)
+        ) {
+          out.push(decl);
+        }
+      }
+    } // closes else (not a simple-assignment LHS)
+  }
+
+  // --- 2. Setter assignment (simple `=` only) -------------------------------
+  if (
+    ts.isBinaryExpression(node) &&
+    node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+  ) {
+    const lhs = node.left;
+    if (ts.isPropertyAccessExpression(lhs) || ts.isElementAccessExpression(lhs)) {
+      const nameNode = ts.isPropertyAccessExpression(lhs) ? lhs.name : lhs.argumentExpression;
+      let symbol = checker.getSymbolAtLocation(nameNode);
+      if (symbol !== undefined && (symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+        symbol = checker.getAliasedSymbol(symbol);
+      }
+      for (const decl of symbol?.getDeclarations() ?? []) {
+        if (
+          ts.isSetAccessorDeclaration(decl) &&
+          decl.body !== undefined &&
+          isUnder(decl.getSourceFile().fileName, srcRoot)
+        ) {
+          out.push(decl);
+        }
+      }
+    }
+  }
+
+  // --- 3. Iterator protocol (for-of with source-local [Symbol.iterator]) ----
+  if (ts.isForOfStatement(node)) {
+    const iterableType = checker.getTypeAtLocation(node.expression);
+    for (const prop of iterableType.getProperties()) {
+      for (const decl of prop.getDeclarations() ?? []) {
+        // Must be a source-local method with a body.
+        if (!isUnder(decl.getSourceFile().fileName, srcRoot)) continue;
+        if (!ts.isMethodDeclaration(decl) || decl.body === undefined) continue;
+        // Must be a computed property name referencing Symbol.iterator.
+        if (!ts.isComputedPropertyName(decl.name)) continue;
+        const nameExpr = decl.name.expression;
+        if (
+          ts.isPropertyAccessExpression(nameExpr) &&
+          ts.isIdentifier(nameExpr.expression) &&
+          nameExpr.expression.text === "Symbol" &&
+          nameExpr.name.text === "iterator"
+        ) {
+          out.push(decl);
+        }
+      }
+    }
+  }
+
   return out;
 }
 
@@ -1178,7 +1294,7 @@ export function createCalleeResolver(
     // WALKED rather than reported under a made-up name.
     if (memberName === undefined) return undefined;
 
-    if (file.startsWith(STORAGE_DIR)) {
+    if (isUnder(file, STORAGE_DIR)) {
       // A class or error constructor under storage is not a primitive; treat it
       // as recognized-and-not-walked rather than inventing a sink for it.
       if (!isFunctionLike(decl)) return { kind: "opaque" };
@@ -1392,6 +1508,118 @@ export function admitDescent(
   return true;
 }
 
+/**
+ * The shipping walk primitive for sink collection. Visits every node under
+ * `root`, resolving explicit calls through `resolver` and implicit invocations
+ * through `resolveImplicitInvocations`, and descends into source-local bodies
+ * through `admitDescent`. Both the production analyzer's `sinksFor` and the
+ * implicit-invocation regression fixtures call this function, so the test
+ * cannot stay green if the walk stops descending into implicit invocation
+ * bodies or changes how it integrates them.
+ *
+ * Frame/chain tracking and callPrimitive dispatch are handled by the caller
+ * through callbacks so the test can call this without the full analyzer state.
+ */
+export function walkForSinks(
+  root: ts.Node,
+  checker: ts.TypeChecker,
+  resolver: ReturnType<typeof createCalleeResolver>,
+  srcRoot: string,
+  onSink: (
+    node: ts.Node,
+    primitive: string,
+    sinkKind: SinkKind,
+    memberName: string | undefined,
+    frames: readonly string[],
+    chain: readonly string[],
+  ) => void,
+  walked: Set<string>,
+  depth: number,
+  frames: readonly string[],
+  chain: readonly string[],
+  /**
+   * Optional: called for each explicit call node. Production uses this for
+   * callPrimitive dispatch; test fixtures omit it.
+   */
+  onExplicitCall?: (
+    memberName: string | undefined,
+    node: ts.CallExpression | ts.NewExpression | ts.TaggedTemplateExpression,
+    resolution: CalleeResolution,
+    currentFrameKey: string,
+    depth: number,
+    frames: readonly string[],
+    chain: readonly string[],
+  ) => void,
+): void {
+  // Backstop: every descent edge is admitted by `admitDescent`, which is the
+  // authoritative ceiling test. Kept so a future descent site that forgets the
+  // admission gate still stops rather than recursing forever.
+  if (depth > MAX_CALL_DEPTH) return;
+  const currentFrameKey = frames[frames.length - 1] ?? "";
+
+  /** Descend into one declaration's body if it is source-local and walkable. */
+  const descend = (decl: ts.Declaration, newChainEntry: string): void => {
+    if (!isUnder(decl.getSourceFile().fileName, srcRoot)) return;
+    const body = functionBody(decl);
+    if (body === undefined) return;
+    const frame = declarationFrame(decl);
+    const key = `${body.pos}|${currentFrameKey}|${frame}`;
+    if (!admitDescent(walked, key, depth + 1)) return;
+    walkForSinks(
+      body, checker, resolver, srcRoot, onSink, walked, depth + 1,
+      [...frames, frame], [...chain, newChainEntry], onExplicitCall,
+    );
+  };
+
+  const visit = (current: ts.Node): void => {
+    // A TAGGED TEMPLATE is an invocation: `Tpl.run\`id\`` calls `Tpl.run`
+    // with the template's parts. A source-local tag function is reached
+    // exactly like any other callee and can do anything its body does.
+    const isCall = ts.isCallExpression(current) || ts.isNewExpression(current);
+    if (isCall || ts.isTaggedTemplateExpression(current)) {
+      const callee = ts.isTaggedTemplateExpression(current)
+        ? current.tag
+        : current.expression;
+      const callArguments = isCall
+        ? ((current as ts.CallExpression | ts.NewExpression).arguments ?? [])
+        : [];
+      const memberName = calleeName(callee);
+      // One resolution per call site, shared by classification and the walk.
+      const resolution = resolver.resolve(callee, memberName, callArguments);
+
+      onExplicitCall?.(
+        memberName,
+        current as ts.CallExpression | ts.NewExpression | ts.TaggedTemplateExpression,
+        resolution, currentFrameKey, depth, frames, chain,
+      );
+
+      for (const sink of resolution.sinks) {
+        onSink(current, sink.primitive, sink.sinkKind, memberName, frames, chain);
+      }
+
+      // A recognized callee is not walked (the storage/audit boundary rule),
+      // but a function handed to it as a VALUE is walked either way.
+      const descendInto = [
+        ...(resolution.classified ? [] : resolution.walkTargets),
+        ...resolution.valueTargets,
+      ];
+      for (const decl of descendInto) {
+        descend(decl, `${memberName ?? "?"}@${locate(decl)}`);
+      }
+    }
+
+    // IMPLICIT INVOCATIONS: getter reads, setter assignments, iterator
+    // protocol. Same descent logic as explicit calls, through the same
+    // admitDescent / memo / depth path.
+    for (const decl of resolveImplicitInvocations(current, checker, srcRoot)) {
+      descend(decl, declarationFrame(decl));
+    }
+
+    ts.forEachChild(current, visit);
+  };
+  visit(root);
+}
+
 function buildAnalyzer(): Analyzer {
   const configFile = ts.readConfigFile(join(SERVER_DIR, "tsconfig.json"), ts.sys.readFile);
   const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, SERVER_DIR);
@@ -1399,7 +1627,7 @@ function buildAnalyzer(): Analyzer {
   const checker = program.getTypeChecker();
   const sources = program
     .getSourceFiles()
-    .filter((sf) => !sf.isDeclarationFile && sf.fileName.startsWith(SRC_DIR));
+    .filter((sf) => !sf.isDeclarationFile && isUnder(sf.fileName, SRC_DIR));
 
   // ---- tool literals + inline classification -----------------------------
   const handlers = new Map<string, { node: ts.Node; location: string }>();
@@ -1606,7 +1834,7 @@ function buildAnalyzer(): Analyzer {
         const resolution = resolver.resolve(expression, calleeName(expression), []);
         const walkFrom: ts.Node[] = [];
         for (const decl of [...resolution.walkTargets, ...resolution.valueTargets]) {
-          if (!decl.getSourceFile().fileName.startsWith(SRC_DIR)) continue;
+          if (!isUnder(decl.getSourceFile().fileName, SRC_DIR)) continue;
           if (functionBody(decl) === undefined) continue;
           if (!walkFrom.includes(decl)) walkFrom.push(decl);
         }
@@ -1626,123 +1854,72 @@ function buildAnalyzer(): Analyzer {
     // which is exactly the distinction a per-caller residual pin depends on.
     const walked = new Set<string>();
 
-    const walk = (node: ts.Node, chain: string[], frames: string[], depth: number): void => {
-      // Backstop only: every descent edge is admitted by `admitDescent`, which
-      // is the authoritative ceiling test. Kept so a future descent site that
-      // forgets the admission gate still stops rather than recursing forever,
-      // and the two must not diverge — both read `MAX_CALL_DEPTH`.
-      if (depth > MAX_CALL_DEPTH) return;
-      const currentFrame = frames[frames.length - 1];
-      const callerFrame = frames[frames.length - 2];
+    /** Record a sink with frame/chain context from the walk. */
+    const onSink = (
+      current: ts.Node,
+      primitive: string,
+      sinkKind: SinkKind,
+      memberName: string | undefined,
+      sinkFrames: readonly string[],
+      sinkChain: readonly string[],
+    ): void => {
+      const currentFrame = sinkFrames[sinkFrames.length - 1];
+      const callerFrame = sinkFrames[sinkFrames.length - 2];
+      const site = frameOf(current);
+      found.push({
+        kind: sinkKind,
+        primitive,
+        site,
+        // `site` is the function the sink call sits in. When that is the frame
+        // we are currently inside, the caller is one frame further up.
+        caller: site === currentFrame ? callerFrame : currentFrame,
+        via: [...sinkChain, `${memberName ?? "?"}@${locate(current)}`],
+      });
+    };
 
-      const record = (
-        current: ts.Node,
-        primitive: string,
-        sinkKind: SinkKind,
-        memberName: string | undefined
-      ): void => {
-        const site = frameOf(current);
-        found.push({
-          kind: sinkKind,
-          primitive,
-          site,
-          // `site` is the function the sink call sits in. When that is the frame
-          // we are currently inside, the caller is one frame further up.
-          caller: site === currentFrame ? callerFrame : currentFrame,
-          via: [...chain, `${memberName ?? "?"}@${locate(current)}`],
-        });
-      };
-
-      const visit = (current: ts.Node): void => {
-        // A TAGGED TEMPLATE is an invocation, and the walk used to skip it.
-        // `Tpl.run\`id\`` calls `Tpl.run` with the template's parts, so a
-        // `src`-local tag function is reached exactly like any other callee and
-        // can do anything its body does. An earlier revision argued the shape
-        // was harmless because no sink in the sets above accepts a
-        // `TemplateStringsArray`; that argument only covers a BUILTIN used as
-        // the tag, and the reachable case is the source-local one.
-        const isCall = ts.isCallExpression(current) || ts.isNewExpression(current);
-        if (isCall || ts.isTaggedTemplateExpression(current)) {
-          const callee = ts.isTaggedTemplateExpression(current)
-            ? current.tag
-            : current.expression;
-          const callArguments = isCall
-            ? ((current as ts.CallExpression | ts.NewExpression).arguments ?? [])
-            : [];
-          const memberName = calleeName(callee);
-          // One resolution per call site, shared by classification and the
-          // walk. They must not resolve the callee separately: that split is
-          // what let an interposed source-local declaration launder a builtin
-          // sink past classification while the walk still knew the true target.
-          // The arguments go with it because a reflective invocation
-          // (`Reflect.apply(fn, …)`) names its target there and not in the
-          // callee.
-          const resolution = resolver.resolve(callee, memberName, callArguments);
-
-          // --- runtime primitive dispatch, resolved through its literal ------
-          // `callPrimitive("state_write", ...)`: name a mutation edge when the
-          // target is write-classified, and walk the target's handler either
-          // way so a read-classified target contributes its own sinks to this
-          // tool (which is how `sanctuary_recall` inherits `state_read`'s set).
-          if (
-            memberName !== undefined &&
-            PRIMITIVE_DISPATCH_FUNCTIONS.has(memberName) &&
-            ts.isCallExpression(current)
-          ) {
-            const first = current.arguments[0];
-            if (first !== undefined && ts.isStringLiteralLike(first)) {
-              const target = first.text;
-              if (writeClassified.has(target)) {
-                record(current, `callPrimitive:${target}`, "mutation", memberName);
-              }
-              const targetHandler = handlers.get(target);
-              if (targetHandler !== undefined) {
-                const frame = `${target} handler@${relPath(
-                  targetHandler.node.getSourceFile().fileName
-                )}`;
-                const key = `${targetHandler.node.pos}|${currentFrame ?? ""}|${frame}`;
-                if (admitDescent(walked, key, depth + 1)) {
-                  walk(
-                    targetHandler.node,
-                    [...chain, `callPrimitive("${target}")@${locate(current)}`],
-                    [...frames, frame],
-                    depth + 1
-                  );
-                }
-              }
-            }
-          }
-
-          for (const sink of resolution.sinks) {
-            record(current, sink.primitive, sink.sinkKind, memberName);
-          }
-
-          // A recognized callee is not walked (that is the storage/audit
-          // boundary rule), but a function handed to it as a VALUE is walked
-          // either way: the callee's verdict is about the callee, and the
-          // argument is a separate target that this call site reaches.
-          const descendInto = [
-            ...(resolution.classified ? [] : resolution.walkTargets),
-            ...resolution.valueTargets,
-          ];
-          for (const decl of descendInto) {
-            if (!decl.getSourceFile().fileName.startsWith(SRC_DIR)) continue;
-            const body = functionBody(decl);
-            if (body === undefined) continue;
-            const frame = declarationFrame(decl);
-            const key = `${body.pos}|${currentFrame ?? ""}|${frame}`;
-            if (!admitDescent(walked, key, depth + 1)) continue;
-            walk(
-              body,
-              [...chain, `${memberName ?? "?"}@${locate(decl)}`],
-              [...frames, frame],
-              depth + 1
-            );
-          }
+    // --- runtime primitive dispatch, resolved through its literal ----------
+    // `callPrimitive("state_write", ...)`: name a mutation edge when the
+    // target is write-classified, and walk the target's handler either way so
+    // a read-classified target contributes its own sinks to this tool (which
+    // is how `sanctuary_recall` inherits `state_read`'s set).
+    const onExplicitCall = (
+      memberName: string | undefined,
+      node: ts.CallExpression | ts.NewExpression | ts.TaggedTemplateExpression,
+      _resolution: CalleeResolution,
+      currentFrameKey: string,
+      depth: number,
+      callFrames: readonly string[],
+      callChain: readonly string[],
+    ): void => {
+      if (
+        memberName === undefined ||
+        !PRIMITIVE_DISPATCH_FUNCTIONS.has(memberName) ||
+        !ts.isCallExpression(node)
+      ) {
+        return;
+      }
+      const first = node.arguments[0];
+      if (first === undefined || !ts.isStringLiteralLike(first)) return;
+      const target = first.text;
+      if (writeClassified.has(target)) {
+        onSink(node, `callPrimitive:${target}`, "mutation", memberName, callFrames, callChain);
+      }
+      const targetHandler = handlers.get(target);
+      if (targetHandler !== undefined) {
+        const frame = `${target} handler@${relPath(
+          targetHandler.node.getSourceFile().fileName
+        )}`;
+        const key = `${targetHandler.node.pos}|${currentFrameKey}|${frame}`;
+        if (admitDescent(walked, key, depth + 1)) {
+          walkForSinks(
+            targetHandler.node, checker, resolver, SRC_DIR,
+            onSink, walked, depth + 1,
+            [...callFrames, frame],
+            [...callChain, `callPrimitive("${target}")@${locate(node)}`],
+            onExplicitCall,
+          );
         }
-        ts.forEachChild(current, visit);
-      };
-      visit(node);
+      }
     };
 
     const start = handlerEntry(tool);
@@ -1758,11 +1935,11 @@ function buildAnalyzer(): Analyzer {
       });
     }
     for (const node of start.walkFrom) {
-      walk(
-        node,
-        [`${tool}@${entry.location}`],
+      walkForSinks(
+        node, checker, resolver, SRC_DIR, onSink, walked, 0,
         [`${tool} handler@${relPath(node.getSourceFile().fileName)}`],
-        0
+        [`${tool}@${entry.location}`],
+        onExplicitCall,
       );
     }
 
