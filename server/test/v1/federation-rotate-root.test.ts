@@ -62,6 +62,7 @@ import {
   FEDERATION_ROTATE_ROOT_JOURNAL_KEY,
   FEDERATION_ROTATE_ROOT_STAGED_KEY,
   FederationRotateRootError,
+  FederationRotateRootResumeError,
   assertHybridRecordWellFormedForRotation,
 } from "../../src/mesh/federation-rotate-root.js";
 import { verifyFederationRootRotationHybridBinding } from "../../src/mesh/trust-root-hybrid.js";
@@ -527,6 +528,155 @@ describe("rotate-root --resume: atomicity (no half-rotated corrupt state)", () =
     });
     expect(renewCode).toBe(3);
     expect(err2.get()).toMatch(/already in progress|--resume/i);
+    masterKey.fill(0);
+  });
+
+  it("rejects staged records with malformed identity fields before decoding secrets", async () => {
+    // Table-driven: each case tampers a single identity field and asserts the
+    // bounded error reason, the original live root unchanged, and the journal
+    // retained. Identity parse fires BEFORE secret decoding (requireStagedString).
+    const cases: Array<{
+      label: string;
+      field: "fortress_id" | "node_id";
+      value: unknown;
+      reason: RegExp;
+    }> = [
+      {
+        label: "fortress_id=null",
+        field: "fortress_id",
+        value: null,
+        reason: /fortress_id.*non-empty string/,
+      },
+      {
+        label: "fortress_id=number",
+        field: "fortress_id",
+        value: 42,
+        reason: /fortress_id.*non-empty string/,
+      },
+      {
+        label: "fortress_id=array",
+        field: "fortress_id",
+        value: ["x"],
+        reason: /fortress_id.*non-empty string/,
+      },
+      {
+        label: "fortress_id=object",
+        field: "fortress_id",
+        value: { a: 1 },
+        reason: /fortress_id.*non-empty string/,
+      },
+      {
+        label: "fortress_id=empty",
+        field: "fortress_id",
+        value: "",
+        reason: /fortress_id.*non-empty string/,
+      },
+      {
+        label: "fortress_id=undefined",
+        field: "fortress_id",
+        value: undefined,
+        reason: /fortress_id.*non-empty string/,
+      },
+      {
+        label: "node_id=null",
+        field: "node_id",
+        value: null,
+        reason: /node_id.*non-empty string/,
+      },
+      {
+        label: "node_id=number",
+        field: "node_id",
+        value: 99,
+        reason: /node_id.*non-empty string/,
+      },
+      {
+        label: "node_id=array",
+        field: "node_id",
+        value: [1, 2],
+        reason: /node_id.*non-empty string/,
+      },
+      {
+        label: "node_id=object",
+        field: "node_id",
+        value: { nested: true },
+        reason: /node_id.*non-empty string/,
+      },
+      {
+        label: "node_id=empty",
+        field: "node_id",
+        value: "",
+        reason: /node_id.*non-empty string/,
+      },
+      {
+        label: "node_id=undefined",
+        field: "node_id",
+        value: undefined,
+        reason: /node_id.*non-empty string/,
+      },
+    ];
+
+    async function resetFortress(): Promise<void> {
+      await rm(statePath, { recursive: true, force: true });
+      storage = new FilesystemStorage(statePath);
+    }
+
+    for (const c of cases) {
+      await resetFortress();
+      const { masterKey } = await seedIssuer();
+      const before = await loadLive(masterKey);
+      const oldPub = before.pinned_master_pubkey.public_key;
+
+      await expect(
+        rotateFederationRootCompromised({
+          storage,
+          masterKey,
+          failpoint: (p) => {
+            if (p === "journal-staged-written") throw new Error("crash before promote");
+          },
+        }),
+      ).rejects.toThrow("crash before promote");
+      await tamperStagedRecord(masterKey, (record) => {
+        record[c.field] = c.value;
+      });
+
+      const rejection = resumeFederationRootCompromised({ storage, masterKey });
+      await expect(rejection, `[${c.label}] should reject`).rejects.toThrow(c.reason);
+      await expect(rejection, `[${c.label}] instanceof`).rejects.toBeInstanceOf(
+        FederationRotateRootResumeError,
+      );
+      const after = await loadLive(masterKey);
+      expect(after.pinned_master_pubkey.public_key, `[${c.label}] live root unchanged`).toBe(oldPub);
+      expect(
+        await federationRotateRootInProgress(storage),
+        `[${c.label}] journal retained`,
+      ).toBe(true);
+      masterKey.fill(0);
+    }
+
+    // Identity reason fires BEFORE secret decoding: pair an invalid fortress_id
+    // with a malformed master_secret and assert the identity reason, not a
+    // secret-decode reason.
+    await resetFortress();
+    const { masterKey } = await seedIssuer();
+    await expect(
+      rotateFederationRootCompromised({
+        storage,
+        masterKey,
+        failpoint: (p) => {
+          if (p === "journal-staged-written") throw new Error("crash before promote");
+        },
+      }),
+    ).rejects.toThrow("crash before promote");
+    await tamperStagedRecord(masterKey, (record) => {
+      record.fortress_id = 123;
+      record.master_secret = "not-valid-base64-and-wrong-length!!";
+    });
+    const identityFirst = resumeFederationRootCompromised({ storage, masterKey });
+    await expect(
+      identityFirst,
+      "identity reason must fire before secret decode",
+    ).rejects.toThrow(/fortress_id.*non-empty string/);
+    await expect(identityFirst).rejects.toBeInstanceOf(FederationRotateRootResumeError);
     masterKey.fill(0);
   });
 });
@@ -1314,9 +1464,9 @@ describe("rotate-root on a HYBRID root: malformed hybrid refuses fail-closed (ne
       record.hybrid = "present-but-not-object";
     });
 
-    await expect(resumeFederationRootCompromised({ storage, masterKey })).rejects.toThrow(
-      /hybrid block/i,
-    );
+    const rejection = resumeFederationRootCompromised({ storage, masterKey });
+    await expect(rejection).rejects.toThrow(/hybrid block/i);
+    await expect(rejection).rejects.toBeInstanceOf(FederationRotateRootResumeError);
     const after = await loadLive(masterKey);
     expect(after.pinned_master_pubkey.public_key).toBe(oldClassical);
     expect(after.hybrid!.pinned_master.public_keys.ed25519.public_key).toBe(oldHybridEd);

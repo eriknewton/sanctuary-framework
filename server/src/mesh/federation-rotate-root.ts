@@ -441,6 +441,26 @@ function isStagedObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Accept only a non-empty primitive string, matching the live store's
+ * `readString` contract. Throws the module's bounded resume error with a
+ * closed field-name reason — never interpolates the raw value.
+ */
+function requireStagedString(
+  value: Record<string, unknown>,
+  field: "fortress_id" | "node_id",
+): string {
+  const v = value[field];
+  // Must be a primitive string and non-empty; rejects null, undefined, number,
+  // boolean, array, object, and empty string without coercion or recursion.
+  if (typeof v !== "string" || v.length === 0) {
+    throw new FederationRotateRootResumeError(
+      `${field} in staged record must be a non-empty string`,
+    );
+  }
+  return v;
+}
+
 function parseStagedRecord(json: string): FederationTrustRootRecord {
   // Structural decode only; the promote step's liveStore.save() runs the full
   // cert-chain + rotation-cert + hybrid-coherence validation before the record
@@ -454,6 +474,14 @@ function parseStagedRecord(json: string): FederationTrustRootRecord {
       "hybrid block in staged record is present but malformed; refusing to resume fail-closed",
     );
   }
+
+  // Parse identity fields BEFORE decoding any secret material. A malformed
+  // identity must reject without touching key bytes (untrusted parse boundary;
+  // String() coercion would admit wrong types and may recurse/throw on nested
+  // values). Must match the live store's readString contract: non-empty string.
+  const fortress_id = requireStagedString(value, "fortress_id");
+  const node_id = requireStagedString(value, "node_id");
+
   const decodedSecrets: Uint8Array[] = [];
   // 32 is correct for every field this decodes, but for two different reasons:
   // `master_secret` is a 256-bit symmetric secret while the three private-key
@@ -474,8 +502,8 @@ function parseStagedRecord(json: string): FederationTrustRootRecord {
   };
   try {
     const record: FederationTrustRootRecord = {
-      fortress_id: String(value.fortress_id),
-      node_id: String(value.node_id),
+      fortress_id,
+      node_id,
       pinned_master_pubkey:
         value.pinned_master_pubkey as FederationTrustRootRecord["pinned_master_pubkey"],
       master_secret: decode32(value.master_secret, "master_secret"),
