@@ -6,7 +6,7 @@
  * signature over one artifact can never be replayed as another. This file
  * holds the SDW export domains (their only declaration) and mirrors the
  * identity-verified domains declared at their producers (pinned by
- * must-match comments); see the EXACT SCOPE note on
+ * must-match comments); see the scope note on
  * INTERNAL_SIGNING_DOMAIN_PREFIXES. Two sides use it:
  *
  *   - producers (for example `sdw/export.ts`) import their domain constant
@@ -48,15 +48,16 @@ export const INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX = "sanctuary.receipt.v1";
 export const AUDIT_CHECKPOINT_SIGNING_DOMAIN_PREFIX = "sanctuary.audit-checkpoint.v1\n";
 
 /**
- * Prefixes the raw `identity_sign` surface refuses. EXACT SCOPE: the domains
- * over which a MANAGED IDENTITY KEY signature is verified somewhere in the
- * tree, which is what the raw signer could forge: the SDW export manifest,
- * state-store envelopes, audit events, internal receipts and audit
- * checkpoints. Hash-only domains (the SDW record-hash and scope-digest
- * domains) and master-MAC domains (state export bundle, audit anchors,
- * custody journals, federation records) are NOT listed: an identity
- * signature cannot satisfy them, so listing them would be noise. Any future
- * identity-verified artifact adds its domain here.
+ * Prefixes the raw `identity_sign` surface refuses: the domains enumerated
+ * in this change, each one verified somewhere in the tree against a managed
+ * identity key (the SDW export manifest, state-store envelopes, audit events,
+ * internal receipts and audit checkpoints). Other identity-signed domains
+ * exist and are tracked separately (operator-signed v1, sign-challenge,
+ * bridge, reputation, memory-attest, exit-lineage); they are not yet on this
+ * list. Hash-only domains (the SDW record-hash and scope-digest domains) and
+ * master-MAC domains (state export bundle, audit anchors, custody journals,
+ * federation records) are not listed: an identity signature cannot satisfy
+ * them. Adding a domain here is how a future artifact joins the refusal.
  */
 export const INTERNAL_SIGNING_DOMAIN_PREFIXES: readonly string[] = [
   SDW_EXPORT_MANIFEST_SIGNING_DOMAIN,

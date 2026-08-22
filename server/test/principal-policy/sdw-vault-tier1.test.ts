@@ -27,7 +27,7 @@ function gateFor(policy: ReturnType<typeof parsePolicy>): ApprovalGate {
 }
 
 describe("SDW vault non-relaxable Tier 1", () => {
-  it("single-sources exactly the three vault tool names createSdwTools registers", () => {
+  it("single-sources the two vault tool names createSdwTools registers", () => {
     const registered = createSdwTools({
       storage: new MemoryStorage(),
       inventory: { listNamespaceSync: () => [] },

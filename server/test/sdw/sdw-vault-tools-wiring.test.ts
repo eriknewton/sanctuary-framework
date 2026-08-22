@@ -176,7 +176,7 @@ describe("IC-15: the vault tools are reached by the production composition root"
   // REGRESSION PIN, not a fail-before proof: this already held on origin/main
   // (the names were in DEFAULT_POLICY before the tools were wired). The
   // non-relaxable proof is test/principal-policy/sdw-vault-tier1.test.ts.
-  it("all three are listed Tier 1 in the default policy (MUST-NEVER #3)", () => {
+  it("both are listed Tier 1 in the default policy (MUST-NEVER #3)", () => {
     expect(Object.fromEntries(VAULT_TOOLS.map((n) => [n, DEFAULT_POLICY.tier1_always_approve.includes(n)]))).toEqual(
       Object.fromEntries(VAULT_TOOLS.map((n) => [n, true])),
     );
