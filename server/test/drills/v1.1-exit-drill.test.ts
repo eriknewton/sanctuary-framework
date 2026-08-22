@@ -1,3 +1,4 @@
+// fail-before-exempt: A7 updates this existing drill adapter for the required export-result field; dedicated dashboard tests carry the pre-fix witness.
 /**
  * Sanctuary v1.1 Acceptance Drill - Pillar 4: Portability and Exit.
  *
@@ -249,6 +250,8 @@ async function startHubBundleRig(
       bundle_dir: exported.bundle_dir,
       manifest_hash: exported.manifest_hash,
       artifact_count: exported.artifact_count,
+      // A7: carry state_entry_count from the real export result.
+      state_entry_count: exported.state_entry_count,
     };
   };
 

@@ -175,6 +175,8 @@ async function startRig(options: RigOptions = {}): Promise<TestRig> {
     manifest_hash:
       "0000000000000000000000000000000000000000000000000000000000000000",
     artifact_count: 7,
+    // A7: state_entry_count is now required on HubFortressExportResult.
+    state_entry_count: 0,
   };
   const exportImpl =
     options.fortressExportImpl ?? (async () => defaultExportResult);
@@ -709,6 +711,8 @@ describe("Fortress exit-bundle export happy path (Test 5)", () => {
         bundle_dir: bundleDir,
         manifest_hash: exported.manifest_hash,
         artifact_count: exported.artifact_count,
+        // A7: carry state_entry_count from the real export result.
+        state_entry_count: exported.state_entry_count,
       };
     };
 
@@ -766,6 +770,12 @@ describe("Fortress exit-bundle export happy path (Test 5)", () => {
     expect((payload!.manifest_hash ?? "").length).toBeGreaterThan(16);
     expect(typeof payload!.artifact_count).toBe("number");
     expect((payload!.artifact_count ?? 0)).toBeGreaterThan(0);
+
+    // A7: state_entry_count must be a nonnegative number so the dashboard
+    // can surface a truthful count. A fixture with zero state entries should
+    // carry state_entry_count: 0, not null/undefined.
+    expect(typeof payload!.state_entry_count).toBe("number");
+    expect(payload!.state_entry_count).toBeGreaterThanOrEqual(0);
 
     // Manifest signature verifies (sanity check; PR #70 owns the primitive).
     const verified = await verifyExitBundle(payload!.bundle_dir!);

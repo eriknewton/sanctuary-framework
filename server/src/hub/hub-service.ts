@@ -921,6 +921,7 @@ export class HubService {
           bundle_dir: result.bundle_dir,
           manifest_hash: result.manifest_hash,
           artifact_count: result.artifact_count,
+          state_entry_count: result.state_entry_count,
         },
       );
       return {
@@ -928,6 +929,13 @@ export class HubService {
           bundle_dir: result.bundle_dir,
           manifest_hash: result.manifest_hash,
           artifact_count: result.artifact_count,
+          // A7: carry state_entry_count and warnings through so the dashboard
+          // inbox item carries the honest count. Must match HubFortressExportResult
+          // in hub/types.ts and resolution_payload in hub-events.ts.
+          state_entry_count: result.state_entry_count,
+          ...(result.warnings !== undefined
+            ? { warnings: result.warnings }
+            : {}),
         },
       };
     });
