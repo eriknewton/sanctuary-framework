@@ -124,16 +124,16 @@ const MUST_FAIL: ReadonlyArray<{ shape: string; body: string }> = [
     body: "Corrects the tip comparison in server/src/audit/chain.ts:412.",
   },
   {
-    shape: "anchor without a line number",
-    body: "Corrects the tip comparison in server/src/audit/chain.ts.",
+    shape: "anchor without a line number, with defect adjacency",
+    body: "Corrects the regression in server/src/audit/chain.ts.",
   },
   {
-    shape: "bare source filename, no directory",
-    body: "The change lands in checkpoint-signer.ts.",
+    shape: "bare source filename with defect adjacency",
+    body: "The bug lands in checkpoint-signer.ts.",
   },
   {
-    shape: "a Rust path (the guard is not TypeScript-only)",
-    body: "Adjusts castle-wall-daemon/src/enforce.rs so the lease is honoured.",
+    shape: "a Rust path with defect adjacency (the guard is not TypeScript-only)",
+    body: "The vulnerability in castle-wall-daemon/src/enforce.rs lets an attacker bypass the lease.",
   },
   {
     shape: "presence claim on main",
@@ -210,8 +210,8 @@ const MUST_FAIL: ReadonlyArray<{ shape: string; body: string }> = [
     ].join("\n"),
   },
   {
-    shape: "wave analogue 2: first scrub, still naming a file outside the layer",
-    body: "The same handling is wrong in server/src/recovery/escrow.ts, outside this layer.",
+    shape: "wave analogue 2: first scrub, still naming a file with defect adjacency",
+    body: "The same vulnerability remains in server/src/recovery/escrow.ts, outside this layer.",
   },
   {
     // The second scrub. Named no file, and the first version of this checker
@@ -235,6 +235,10 @@ const MUST_FAIL: ReadonlyArray<{ shape: string; body: string }> = [
       "drop paths also call the rejection hook ungoverned into a shared unbounded",
       "roster.",
     ].join("\n"),
+  },
+  {
+    shape: "source path with generic defect adjacency",
+    body: "Covers server/src/audit/index.ts, where the regression was introduced.",
   },
 ];
 
@@ -338,6 +342,69 @@ const MUST_PASS: ReadonlyArray<{ shape: string; body: string }> = [
     shape: "an ordinal that is not a residual-instance claim",
     body: "Adds a second guard to the sync path.",
   },
+  {
+    shape: "bare Markdown heading",
+    body: "## Testing",
+  },
+  {
+    shape: "ordinary Markdown table structure",
+    body: [
+      "| Check | Result |",
+      "| --- | --- |",
+      "| Typecheck | clean |",
+    ].join("\n"),
+  },
+  {
+    shape: "source path without defect adjacency",
+    body: "Typecheck is clean for server/src/audit/index.ts.",
+  },
+  {
+    shape: "positive domain separator enforcement",
+    body: "Adds a code-controlled domain-separator constant for signed records.",
+  },
+  {
+    shape: "positive malformed-input refusal",
+    body: "The parser now refuses malformed inputs before dispatch.",
+  },
+  // ---- structural boundary tests: paragraph separation prevents matching ----
+  {
+    shape: "path in one list item, defect in the next (must pass)",
+    body: [
+      "- Covers server/src/audit/index.ts.",
+      "- Fixes an issue with incorrect state transitions.",
+    ].join("\n"),
+  },
+  {
+    // Defect/regression prose on the immediately preceding nonblank line, then an
+    // indented ordered item containing the path. Passes only because the ordered
+    // item is a structural boundary: under blank-line-only assembly both lines
+    // would be in the same paragraph and D2 would fire (defect + path).
+    shape: "ordered list item with path, regression prose on the immediately preceding nonblank line (must pass)",
+    body: [
+      "This change addresses the regression in the component.",
+      "   1. Covers server/src/audit/index.ts for all cases.",
+    ].join("\n"),
+  },
+  {
+    shape: "path in one table row, defect in another (must pass)",
+    body: [
+      "| Component | Status |",
+      "| --- | --- |",
+      "| server/src/audit | audited |",
+      "| behavior on bypass | changed |",
+    ].join("\n"),
+  },
+  {
+    // Path in the heading, regression prose on the immediately following nonblank
+    // line with no blank line between them. Passes only because the heading is
+    // checked separately and does not accumulate: under blank-line-only assembly
+    // the two lines would be one paragraph and D2 would fire (path + defect).
+    shape: "heading with path, regression prose on the immediately following nonblank line with no blank line (must pass)",
+    body: [
+      "## Audit in server/src/audit",
+      "The regression in this component has been corrected.",
+    ].join("\n"),
+  },
 ];
 
 describe("disclosure guard — checker behaviour", () => {
@@ -417,24 +484,29 @@ describe("disclosure guard — checker behaviour", () => {
     }
   });
 
-  it("allows a source path in a test header but not in a pull-request description", () => {
+  it("accepts a source path on both pr-body and test-header when defect language is absent", () => {
     const body = "Covers the barrel export in server/src/audit/index.ts.";
-    expect(runChecker(body, "pr-body").status).toBe(1);
+    expect(runChecker(body, "pr-body").status).toBe(0);
     expect(runChecker(body, "test-header").status).toBe(0);
   });
 
-  it("still refuses a source path in a test header when defect language shares the paragraph", () => {
+  it("still refuses a source path when defect language shares the paragraph, on both surfaces", () => {
     const body =
       "Covers server/src/audit/index.ts, where the regression was introduced.";
+    expect(runChecker(body, "pr-body").status).toBe(1);
     expect(runChecker(body, "test-header").status).toBe(1);
   });
 
-  it("treats a source-tree directory as an anchor, not only a path with a filename", () => {
+  it("accepts a source-tree directory path when defect language is absent", () => {
     // The second scrub of the triggering wave carried a directory and no
-    // filename, and the first version of this checker read that as clean.
+    // filename. A source-tree directory alone now passes; it fails only with
+    // defect language in the same paragraph.
     const run = runChecker("The new scan here is bounded to server/src/mesh.");
-    expect(run.status).toBe(1);
-    expect(run.stdout).toContain("D2-CODEPATH");
+    expect(run.status).toBe(0);
+    // But the same directory with defect language in the paragraph fails.
+    const withDefect = runChecker("The flaw here is in server/src/mesh, where the regression occurs.");
+    expect(withDefect.status).toBe(1);
+    expect(withDefect.stdout).toContain("D2-CODEPATH");
     // Naming a directory that is not a source tree still passes: reddening
     // scripts/ or .github/ would locate nothing and would red honest bodies.
     expect(runChecker("Adds the job under .github/workflows.").status).toBe(0);
