@@ -464,7 +464,12 @@ describe("memory file CLI: fortress-backed round trip", () => {
     expect(code).toBe(0);
     expect(out.text()).toContain("ingested 3 of 4 Claude Code memory files");
     expect(err.text()).toContain("the mirror is INCOMPLETE");
-    expect(err.text()).toContain("note-with-secret.md (classifier_reject)");
+    // F2: names the detector and line, never the matched content.
+    expect(err.text()).toContain(
+      "refused note-with-secret.md: looks like a labeled Sanctuary recovery key value (line 3)",
+    );
+    expect(out.text()).not.toContain("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE");
+    expect(err.text()).not.toContain("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE");
 
     const operations = await auditOperations();
     expect(operations.filter((op) => op.startsWith("memory_ingest"))).toEqual([
@@ -490,7 +495,9 @@ describe("memory file CLI: fortress-backed round trip", () => {
       env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
     });
     expect(ingestCode).toBe(0);
-    expect(ingestErr.text()).toContain("MEMORY.md (classifier_reject)");
+    expect(ingestErr.text()).toContain(
+      "refused MEMORY.md: looks like a labeled Sanctuary recovery key value (line 3)",
+    );
 
     const emitOut = makeSink();
     const emitErr = makeSink();

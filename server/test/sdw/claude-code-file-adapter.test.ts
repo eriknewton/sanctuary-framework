@@ -306,6 +306,8 @@ describe("Claude Code memory-file adapter", () => {
         source_path: "note-with-secret.md",
         reason: "classifier_reject",
         detail: expect.stringContaining("classifier"),
+        detector: "labeled_recovery_key",
+        line: 3,
       },
     ]);
 

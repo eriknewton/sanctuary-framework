@@ -331,8 +331,12 @@ describe("SDW memory file tools", () => {
         source_path: "note-with-secret.md",
         reason: "classifier_reject",
         detail: expect.stringContaining("classifier"),
+        detector: "labeled_recovery_key",
+        line: 3,
       },
     ]);
+    // F2: content never appears in the tool result.
+    expect(JSON.stringify(ingested)).not.toContain("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE");
 
     const outcome = auditCalls.find((call) => call.operation === "memory_ingest")!;
     expect(outcome.details).toMatchObject({

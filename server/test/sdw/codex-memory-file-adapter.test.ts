@@ -246,6 +246,8 @@ describe("Codex memory-file adapter", () => {
         source_path: "raw_memories.md",
         reason: "classifier_reject",
         detail: expect.stringContaining("classifier"),
+        detector: "labeled_recovery_key",
+        line: 3,
       },
     ]);
     const corpusDir = join(storagePath, SDW_DOCUMENT_CORPUS_NAMESPACE);

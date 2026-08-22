@@ -82,6 +82,12 @@ export type MemoryPassageScreen =
       /** SdwValidationError category, e.g. "classifier_reject". */
       readonly category: string;
       readonly message: string;
+      /** SdwValidationError.detector; populated only for category "classifier_reject". */
+      readonly detector?: string;
+      /** SdwValidationError.line; the 1-based line the detector matched, when known. */
+      readonly line?: number;
+      /** SdwValidationError.column; present only alongside line. */
+      readonly column?: number;
     };
 
 /**

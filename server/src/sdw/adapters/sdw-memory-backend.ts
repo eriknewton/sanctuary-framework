@@ -284,7 +284,14 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       return { ok: true };
     } catch (error) {
       if (error instanceof SdwValidationError) {
-        return { ok: false, category: error.category, message: error.message };
+        return {
+          ok: false,
+          category: error.category,
+          message: error.message,
+          detector: error.detector,
+          line: error.line,
+          column: error.column,
+        };
       }
       throw error;
     }

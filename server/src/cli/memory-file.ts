@@ -27,7 +27,11 @@ import {
   ingestCodexMemorySnapshot,
   readCodexMemoryDirectory,
 } from "../sdw/adapters/codex-memory-file-adapter.js";
-import { SdwValidationError } from "../sdw/errors.js";
+import {
+  SDW_CLASSIFIER_DETECTOR_REASONS,
+  SdwValidationError,
+  type SdwClassifierDetector,
+} from "../sdw/errors.js";
 import { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
 import {
   MEMORY_TRANSCODE_MODE,
@@ -139,7 +143,7 @@ export async function runMemoryIngestCommand(
         `memory_ingest: WARNING - the mirror is INCOMPLETE. ${String(result.skipped.length)} file(s) were refused by the secret classifier and are NOT in the vault:\n`,
       );
       for (const skip of result.skipped) {
-        write(err, `  - ${skip.source_path} (${skip.reason})\n`);
+        write(err, `  refused ${skip.source_path}: ${describeMemorySkipReason(skip)}\n`);
       }
       write(
         err,
@@ -612,6 +616,28 @@ function harnessLabel(
   harness: typeof CLAUDE_CODE_MEMORY_HARNESS | typeof CODEX_MEMORY_HARNESS,
 ): string {
   return harness === CLAUDE_CODE_MEMORY_HARNESS ? "Claude Code" : "Codex";
+}
+
+function isSdwClassifierDetector(value: string): value is SdwClassifierDetector {
+  return Object.prototype.hasOwnProperty.call(SDW_CLASSIFIER_DETECTOR_REASONS, value);
+}
+
+/**
+ * Rung-1 F2: name which detector refused a file and where, in plain English,
+ * instead of the constant "classifier_reject" category alone. Class and
+ * location only, never the matched content (must match
+ * SDW_CLASSIFIER_DETECTOR_REASONS in sdw/errors.ts).
+ */
+function describeMemorySkipReason(skip: {
+  readonly reason: string;
+  readonly detector?: string;
+  readonly line?: number;
+}): string {
+  const reasonText =
+    skip.detector !== undefined && isSdwClassifierDetector(skip.detector)
+      ? SDW_CLASSIFIER_DETECTOR_REASONS[skip.detector]
+      : skip.reason;
+  return skip.line === undefined ? reasonText : `${reasonText} (line ${String(skip.line)})`;
 }
 
 function printIngestHelp(out: Writable): void {

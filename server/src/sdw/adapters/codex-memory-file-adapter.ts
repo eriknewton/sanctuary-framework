@@ -62,6 +62,10 @@ export interface CodexMemorySkip {
   readonly source_path: string;
   readonly reason: string;
   readonly detail: string;
+  /** SdwValidationError.detector; populated only when reason is "classifier_reject". */
+  readonly detector?: string;
+  /** SdwValidationError.line; the 1-based line the detector matched, when known. */
+  readonly line?: number;
 }
 
 export interface IngestCodexMemoryResult {
@@ -185,6 +189,8 @@ export async function ingestCodexMemorySnapshot(
         source_path: entry.source_path,
         reason: screen.category,
         detail: screen.message,
+        detector: screen.detector,
+        line: screen.line,
       });
       continue;
     }

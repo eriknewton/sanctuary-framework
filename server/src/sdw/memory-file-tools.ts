@@ -301,6 +301,8 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
             source_path: skip.source_path,
             reason: skip.reason,
             detail: skip.detail,
+            detector: skip.detector,
+            line: skip.line,
           })),
           passages: result.ingested.map((passage) => ({
             passage_id: passage.passage_id,
