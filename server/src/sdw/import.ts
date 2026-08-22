@@ -62,7 +62,9 @@ export type SdwImportRejectCategory =
   | "decrypt_failed"
   | "schema_invalid"
   | "source_key_unavailable"
-  | "storage_not_transactional";
+  | "storage_not_transactional"
+  // sdw_export_delete: the manifest is signed but THIS fortress never recorded the export.
+  | "export_not_recorded";
 
 /**
  * Typed verification/import failure. `message` and `category` are safe to

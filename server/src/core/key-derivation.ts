@@ -29,6 +29,17 @@ const ARGON2_PARALLELISM = 4; // 4 lanes
 export const ARGON2_HASH_LENGTH = 32;
 
 /**
+ * HKDF purpose label for the key that encrypts managed-identity private keys
+ * at rest. Must match the literal `"identity-encryption"` still used by the
+ * older call sites across the tree and the `_identities` row in
+ * `core/master-custody.ts` (derived-key inventory); the composition root
+ * (`index.ts`) and `IdentityManager.encryptionKey` (`cognitive/tools.ts`)
+ * consume this constant so the SDW export signing key and the identity store
+ * cannot drift onto two different derivations.
+ */
+export const IDENTITY_ENCRYPTION_PURPOSE = "identity-encryption";
+
+/**
  * Acceptance bounds for KeyDerivationParams that arrive from OUTSIDE this
  * process (an on-disk `_meta/key-params` marker, an exit bundle's
  * `source_key_derivation`). They are deliberately wide enough to contain every

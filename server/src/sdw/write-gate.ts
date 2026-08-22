@@ -1,6 +1,6 @@
 import type { StorageBackend } from "../storage/interface.js";
 import { encrypt } from "../core/encryption.js";
-import { bytesToString, stringToBytes, toBase64url } from "../core/encoding.js";
+import { bytesToString, constantTimeEqual, stringToBytes, toBase64url } from "../core/encoding.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { hashToString, hmacSha256 } from "../core/hashing.js";
 import { sdwAad, assertSdwIdentifier } from "./grammar.js";
@@ -24,6 +24,23 @@ const MAX_RECORD_BYTES = 1024 * 1024;
 const SDW_REPLAY_MAC_DOMAIN = "sanctuary.sdw-replay-anchor-mac.v1\n";
 const SDW_REPLAY_MAC_MARKER = "__sanctuary_sdw_replay_anchor_mac_v1";
 const SDW_REPLAY_MAC_INFO = "sdw-replay-anchor-mac";
+// Owner pin (multi-agent isolation, persisted in the fortress). Must match
+// SDW_OWNER_PIN_KEY in sdw/memory-isolation.ts; the HKDF label is registered
+// in docs/hkdf-info-string-registry.md and test/structure/frozen-surfaces.test.ts.
+const SDW_OWNER_PIN_MAC_DOMAIN = "sanctuary.sdw-owner-pin-mac.v1\n";
+const SDW_OWNER_PIN_MAC_MARKER = "__sanctuary_sdw_owner_pin_mac_v1";
+const SDW_OWNER_PIN_MAC_INFO = "sdw-owner-pin-mac";
+export const SDW_OWNER_PIN_KEY = "sdw-owner-pin-v1";
+
+/** The persisted owner pin: which wrapped-agent identity the shared scope is bound to. */
+export interface SdwOwnerPinData {
+  readonly version: 1;
+  readonly fortress_id: string;
+  readonly owner_ref: string;
+  /** The wrap-time `SANCTUARY_AGENT_ID`; null pins the "no id configured" caller. */
+  readonly agent_id: string | null;
+  readonly pinned_at: string;
+}
 // ceil(32 bytes * 8 bits / 6 base64 bits) without the trailing `=` padding.
 const BASE64URL_32_BYTE_KEY_CHARS = 43;
 // Two hex characters encode each of 32 bytes.
@@ -172,6 +189,80 @@ export async function writeReplayAnchor(
 ): Promise<void> {
   const prepared = prepareReplayAnchorWrite(masterKey, data);
   await backend.write(prepared.namespace, prepared.storageKey, prepared.data);
+}
+
+/**
+ * Prepare the MAC'd owner-pin record for `_sdw_meta`. Goes through the same
+ * authorization as every other SDW-namespace write so the raw-write guard
+ * accepts exactly these bytes and nothing else.
+ */
+/** Write the owner pin through the gate (the only SDW-namespace writer for it). */
+export async function writeSdwOwnerPin(
+  backend: Pick<StorageBackend, "write">,
+  masterKey: Uint8Array,
+  data: SdwOwnerPinData,
+): Promise<void> {
+  const prepared = prepareSdwOwnerPinWrite(masterKey, data);
+  await backend.write(prepared.namespace, prepared.storageKey, prepared.data);
+}
+
+export function prepareSdwOwnerPinWrite(
+  masterKey: Uint8Array,
+  data: SdwOwnerPinData,
+): PreparedSdwWrite {
+  assertSdwIdentifier(data.fortress_id, "fortress_id");
+  assertSdwIdentifier(data.owner_ref, "owner_ref");
+  if (
+    data.version !== 1 ||
+    (data.agent_id !== null && (typeof data.agent_id !== "string" || data.agent_id.length === 0)) ||
+    typeof data.pinned_at !== "string"
+  ) {
+    throw new SdwValidationError("malformed", "Invalid SDW owner pin");
+  }
+  const envelope = {
+    marker: SDW_OWNER_PIN_MAC_MARKER,
+    data,
+    mac: sdwOwnerPinMac(masterKey, data),
+  };
+  return authorizePreparedSdwPayload({
+    namespace: SDW_META_NAMESPACE,
+    storageKey: SDW_OWNER_PIN_KEY,
+    data: new Uint8Array(stringToBytes(JSON.stringify(envelope))),
+  });
+}
+
+/**
+ * Verify a stored owner-pin record. Returns the pin only when the marker is
+ * present AND the MAC verifies under the master-derived key; any other shape
+ * (stripped, malformed, wrong key) is `invalid`, which the guard treats as a
+ * refusal (fail closed, never as "no pin yet").
+ */
+export function verifySdwOwnerPinEnvelope(
+  masterKey: Uint8Array,
+  raw: Uint8Array,
+): { readonly status: "valid"; readonly data: SdwOwnerPinData } | { readonly status: "invalid" } {
+  let parsed: { marker?: unknown; data?: SdwOwnerPinData; mac?: unknown };
+  try {
+    parsed = JSON.parse(bytesToString(raw)) as typeof parsed;
+  } catch {
+    return { status: "invalid" };
+  }
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    parsed.marker !== SDW_OWNER_PIN_MAC_MARKER ||
+    typeof parsed.mac !== "string" ||
+    parsed.data === undefined ||
+    parsed.data === null
+  ) {
+    return { status: "invalid" };
+  }
+  const expected = stringToBytes(sdwOwnerPinMac(masterKey, parsed.data));
+  const actual = stringToBytes(parsed.mac);
+  if (expected.length !== actual.length || !constantTimeEqual(expected, actual)) {
+    return { status: "invalid" };
+  }
+  return { status: "valid", data: parsed.data };
 }
 
 export function prepareReplayAnchorWrite(
@@ -790,6 +881,12 @@ function authorizePreparedSdwPayload(prepared: PreparedSdwWrite): PreparedSdwWri
     storageKey: prepared.storageKey,
     data,
   };
+}
+
+function sdwOwnerPinMac(masterKey: Uint8Array, data: SdwOwnerPinData): string {
+  const macKey = derivePurposeKey(masterKey, SDW_OWNER_PIN_MAC_INFO);
+  const payload = SDW_OWNER_PIN_MAC_DOMAIN + SDW_OWNER_PIN_KEY + "\n" + canonicalJson(data);
+  return toBase64url(hmacSha256(macKey, stringToBytes(payload)));
 }
 
 function sdwReplayAnchorMac(masterKey: Uint8Array, data: SdwReplayAnchorData): string {

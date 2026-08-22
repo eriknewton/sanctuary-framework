@@ -715,6 +715,11 @@ export function buildSanctuaryEnv(
   // two fortresses) get two distinct ids, which is what lets the guard refuse
   // the second. It is the same value the hub's LocalAgentRecord carries, so
   // the router's `agent:<id>` caller principal and the fleet record agree.
+  // BOUND: the value is plaintext in the harness-controlled config and is
+  // accepted unauthenticated, so an agent that can rewrite its own harness
+  // config can present the first-pinned id. The guard separates distinct
+  // wrapped identities; it does not defend against that agent (shared trust
+  // basis with SANCTUARY_PASSPHRASE in the same entry).
   sanctuaryEnv.SANCTUARY_AGENT_ID = wrappedAgentId(wrapped.platform, wrapped.storagePath);
   if (process.env.SANCTUARY_PASSPHRASE) {
     sanctuaryEnv.SANCTUARY_PASSPHRASE = process.env.SANCTUARY_PASSPHRASE;

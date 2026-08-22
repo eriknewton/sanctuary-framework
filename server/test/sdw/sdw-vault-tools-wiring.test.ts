@@ -19,12 +19,19 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createSanctuaryServer } from "../../src/index.js";
+import type { AuditLog as RealAuditLog } from "../../src/operational/audit-log.js";
+import { createCognitiveTools } from "../../src/cognitive/tools.js";
+import { StateStore } from "../../src/cognitive/state-store.js";
+import { encrypt } from "../../src/core/encryption.js";
+import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
+import { derivePurposeKey, IDENTITY_ENCRYPTION_PURPOSE } from "../../src/core/key-derivation.js";
+import { SDW_EXPORT_MANIFEST_SIGNING_DOMAIN } from "../../src/core/signing-domains.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
@@ -41,10 +48,14 @@ import {
 } from "../../src/sdw/export.js";
 import { importSdwExportBundle } from "../../src/sdw/import.js";
 import { createSdwTools } from "../../src/sdw/tools.js";
-import { createSdwMemoryTools } from "../../src/sdw/memory-tools.js";
+import {
+  SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS,
+  createSdwMemoryTools,
+} from "../../src/sdw/memory-tools.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
 import {
   createMultiAgentIsolationGuard,
+  createPersistentMultiAgentIsolationGuard,
   wrappedAgentIdentityFromEnv,
 } from "../../src/sdw/memory-isolation.js";
 import { buildSanctuaryEnv, wrappedAgentId } from "../../src/wrap/cli.js";
@@ -66,6 +77,46 @@ function recordingAudit(): { log: AuditLog; calls: Array<{ operation: string; de
 function parse(result: { content: Array<{ type: "text"; text: string }> }): Record<string, unknown> {
   return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
 }
+
+/** Issue tools/call through the production router (+ gate), exactly as a harness would. */
+async function callTool(
+  server: Awaited<ReturnType<typeof createSanctuaryServer>>["server"],
+  name: string,
+  args: Record<string, unknown> = {},
+): Promise<Record<string, unknown>> {
+  const handler = (
+    server as unknown as { _requestHandlers: Map<string, (...a: unknown[]) => unknown> }
+  )._requestHandlers.get("tools/call")!;
+  const result = (await handler(
+    { method: "tools/call" as const, params: { name, arguments: args } },
+    {},
+  )) as { content: Array<{ type: "text"; text: string }> };
+  return parse(result);
+}
+
+async function auditOps(log: RealAuditLog, operation: string) {
+  await log.flush();
+  const { entries } = await log.query({ operation_type: operation, limit: 1000 });
+  return entries;
+}
+
+/**
+ * A hand-authored policy that lets the memory READ tools run unattended so the
+ * production-graph tests reach the isolation guard without an approval channel.
+ * The vault ops are force-pinned Tier 1 regardless of what this file says.
+ */
+const READ_TOOLS_TIER3_POLICY = [
+  "version: 1",
+  "tier1_always_approve: []",
+  "tier3_always_allow:",
+  "  - memory_count",
+  "  - memory_get",
+  "  - sdw_memory_provenance",
+  "approval_channel:",
+  "  type: stderr",
+  "  timeout_seconds: 1",
+  "",
+].join("\n");
 
 function makeSigning(): { signingKey: SdwExportSigningKey; resolvePublicKey: (ref: string) => Uint8Array | null } {
   const keyEncryptionKey = generateRandomKey();
@@ -119,7 +170,10 @@ describe("IC-15: the vault tools are reached by the production composition root"
     expect(byName.get("sdw_import")!.description).toContain("all-or-nothing");
   });
 
-  it("all three are force-pinned Tier 1 in the default policy (MUST-NEVER #3)", () => {
+  // REGRESSION PIN, not a fail-before proof: this already held on origin/main
+  // (the names were in DEFAULT_POLICY before the tools were wired). The
+  // non-relaxable proof is test/principal-policy/sdw-vault-tier1.test.ts.
+  it("all three are listed Tier 1 in the default policy (MUST-NEVER #3)", () => {
     expect(Object.fromEntries(VAULT_TOOLS.map((n) => [n, DEFAULT_POLICY.tier1_always_approve.includes(n)]))).toEqual(
       Object.fromEntries(VAULT_TOOLS.map((n) => [n, true])),
     );
@@ -140,9 +194,16 @@ describe("IC-15: the vault tools are reached by the production composition root"
 
 describe("IC-16: the isolation guard fires from the production-written SANCTUARY_AGENT_ID", () => {
   const savedAgentId = process.env.SANCTUARY_AGENT_ID;
-  afterEach(() => {
+  let home: Awaited<ReturnType<typeof createTempHome>>;
+  beforeEach(async () => {
+    home = await createTempHome("sanctuary-isolation");
+    await mkdir(home.defaultFortressPath, { recursive: true, mode: 0o700 });
+    await writeFile(join(home.defaultFortressPath, "principal-policy.yaml"), READ_TOOLS_TIER3_POLICY, { mode: 0o600 });
+  });
+  afterEach(async () => {
     if (savedAgentId === undefined) delete process.env.SANCTUARY_AGENT_ID;
     else process.env.SANCTUARY_AGENT_ID = savedAgentId;
+    await home.cleanup();
   });
 
   it("sanctuary wrap writes SANCTUARY_AGENT_ID into the MCP entry env, distinct per harness and per fortress", () => {
@@ -156,60 +217,248 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
       .toBe(envA.SANCTUARY_AGENT_ID);
   });
 
-  it("two wrapped agents on one host: the second cannot read the first's passages, through the production resolver", async () => {
-    const agentA = wrappedAgentId("claude-code", "/srv/shared-host-fortress");
-    const agentB = wrappedAgentId("cursor", "/srv/shared-host-fortress");
-    expect(agentA).not.toBe(agentB);
+  it("HIGH-1: two independent server graphs over ONE fortress: the second identity is refused and audited", async () => {
+    // Each wrapped harness spawns its own stdio server. Two production graphs
+    // over the same on-disk fortress, booted with different wrap-time ids,
+    // stand in for two processes; the pin lives in the fortress, not in
+    // either graph's memory.
+    const agentA = wrappedAgentId("claude-code", home.defaultFortressPath);
+    const agentB = wrappedAgentId("cursor", home.defaultFortressPath);
+    const statePath = join(home.defaultFortressPath, "state");
 
+    process.env.SANCTUARY_AGENT_ID = agentA;
+    const graphA = await createSanctuaryServer({
+      storage: new FilesystemStorage(statePath),
+      passphrase: "isolation-two-graphs-v1",
+    });
+    expect(graphA.config.storage_path).toBe(home.defaultFortressPath);
+    const countByA = await callTool(graphA.server, "memory_count");
+    expect(countByA.count).toBe(0);
+
+    process.env.SANCTUARY_AGENT_ID = agentB;
+    const graphB = await createSanctuaryServer({
+      storage: new FilesystemStorage(statePath),
+      passphrase: "isolation-two-graphs-v1",
+    });
+    const countByB = await callTool(graphB.server, "memory_count");
+    expect(countByB.denied).toBe(true);
+    expect(countByB.count).toBeUndefined();
+    const denials = await auditOps(graphB.auditLog, "memory_count_denied");
+    expect(denials.map((e) => e.details?.denial_class)).toEqual([SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS]);
+
+    // The pin never advances: A (its own graph) still reads after B was refused.
+    process.env.SANCTUARY_AGENT_ID = agentA;
+    expect((await callTool(graphA.server, "memory_count")).count).toBe(0);
+  });
+
+  it("MEDIUM-4/C5/C7: through the production router + gate, ONE guard instance covers memory, provenance AND vault tools", async () => {
+    const agentA = wrappedAgentId("claude-code", home.defaultFortressPath);
+    const agentB = wrappedAgentId("cursor", home.defaultFortressPath);
+    process.env.SANCTUARY_AGENT_ID = agentA;
+    const { server, auditLog } = await createSanctuaryServer({
+      storage: new MemoryStorage(),
+      passphrase: "isolation-one-graph-v1",
+    });
+    // A touches the scope first through a memory tool.
+    expect((await callTool(server, "memory_count")).count).toBe(0);
+
+    process.env.SANCTUARY_AGENT_ID = agentB;
+    // B is refused by the vault export at GATE time: the denial comes back
+    // from the router's approvalTargetArgs path (no enumeration, no Tier-1
+    // prompt) and the REAL audit log carries the isolation denial.
+    const exportByB = await callTool(server, "sdw_export", { export_name: "steal" });
+    expect(exportByB.denied).toBe(true);
+    expect(exportByB.exported).toBeUndefined();
+    expect((await auditOps(auditLog, "sdw_export_denied")).map((e) => e.details?.denial_class))
+      .toEqual([SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS]);
+    // No export scope was ever frozen for B (gate refused before enumeration).
+    expect(await auditOps(auditLog, "sdw_export_scope_approved")).toEqual([]);
+    // Same instance: provenance is refused for B too.
+    const provenanceByB = await callTool(server, "sdw_memory_provenance", { passage_id: "anything" });
+    expect(provenanceByB.denied).toBe(true);
+    expect((await auditOps(auditLog, "sdw_memory_provenance_denied")).map((e) => e.details?.denial_class))
+      .toEqual([SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS]);
+    // And the import/delete gates refuse B the same way.
+    expect((await callTool(server, "sdw_import", { bundle: "AAAA", source_key_ref: "this-fortress" })).denied).toBe(true);
+    expect((await callTool(server, "sdw_export_delete", { manifest: "AAAA" })).denied).toBe(true);
+    expect((await auditOps(auditLog, "sdw_import_denied")).map((e) => e.details?.denial_class))
+      .toEqual([SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS]);
+    expect((await auditOps(auditLog, "sdw_export_delete_denied")).map((e) => e.details?.denial_class))
+      .toEqual([SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS]);
+  });
+
+  it("the persisted pin fails closed: a stripped or foreign-keyed pin record refuses every identity", async () => {
+    const storage = new MemoryStorage();
+    const guardUnderKey1 = createPersistentMultiAgentIsolationGuard({
+      storage,
+      masterKey: new Uint8Array(32).fill(1),
+      fortressId: "fortress:pin",
+      ownerRef: "fleet-self",
+      ownerIdentity: () => "agent-one",
+    });
+    expect((await guardUnderKey1("memory_get")).allowed).toBe(true);
+    // A second process over the SAME fortress bytes but a different id.
+    const guardOther = createPersistentMultiAgentIsolationGuard({
+      storage,
+      masterKey: new Uint8Array(32).fill(1),
+      fortressId: "fortress:pin",
+      ownerRef: "fleet-self",
+      ownerIdentity: () => "agent-two",
+    });
+    expect((await guardOther("memory_get")).allowed).toBe(false);
+    // A pin MAC'd under a different master key is INVALID, never "no pin yet".
+    const guardWrongKey = createPersistentMultiAgentIsolationGuard({
+      storage,
+      masterKey: new Uint8Array(32).fill(2),
+      fortressId: "fortress:pin",
+      ownerRef: "fleet-self",
+      ownerIdentity: () => "agent-one",
+    });
+    expect((await guardWrongKey("memory_get")).allowed).toBe(false);
+  });
+
+  it("in-process guard (test-only): two ids on one guard instance", async () => {
     const adapter = new SdwMemoryBackendAdapter({
       storage: new MemoryStorage(),
       masterKey: new Uint8Array(32).fill(3),
       fortressId: "fortress:shared-host",
       ownerRef: "fleet-self",
     });
-    const { log, calls } = recordingAudit();
-    // Exactly the index.ts wiring: the production resolver and ONE guard
-    // instance shared by every family over the scope.
+    const { log } = recordingAudit();
     const guard = createMultiAgentIsolationGuard(wrappedAgentIdentityFromEnv);
     const memoryTools = new Map(
       createSdwMemoryTools({ adapter, auditLog: log, isolationGuard: guard }).map((t) => [t.name, t]),
     );
-    const vaultTools = new Map(
+    process.env.SANCTUARY_AGENT_ID = "a";
+    await adapter.insertPassage({ passage_id: "owned-by-a", text: "agent A's private passage" }, "user_content");
+    expect(parse(await memoryTools.get("memory_get")!.handler({ passage_id: "owned-by-a" })).found).toBe(true);
+    process.env.SANCTUARY_AGENT_ID = "b";
+    const readByB = parse(await memoryTools.get("memory_get")!.handler({ passage_id: "owned-by-a" }));
+    expect(readByB.denied).toBe(true);
+    expect(JSON.stringify(readByB)).not.toContain("agent A's private passage");
+  });
+});
+
+describe("HIGH-C2: sdw_export_delete is all-or-nothing or refuses", () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "sanctuary-vault-delete-"));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("refuses at gate time on the shipped filesystem backend (no transaction primitive), before any manifest work", async () => {
+    const { log, calls } = recordingAudit();
+    const signing = makeSigning();
+    let enumerated = 0;
+    const tools = new Map(
+      createSdwTools({
+        storage: new FilesystemStorage(join(dir, "state")),
+        inventory: { listNamespaceSync: () => { enumerated += 1; return []; } },
+        auditLog: log,
+        fortressId: "fortress:fs",
+        exportDir: join(dir, "sdw-exports"),
+        signingKey: signing.signingKey,
+        resolvePublicKey: signing.resolvePublicKey,
+        resolveSourceMasterKey: () => null,
+        targetMasterKey: new Uint8Array(32).fill(9),
+      }).map((t) => [t.name, t]),
+    );
+    const del = tools.get("sdw_export_delete")!;
+    await expect(Promise.resolve(del.approvalTargetArgs!({ manifest: "not-even-parsed" }))).rejects.toMatchObject({
+      category: "storage_not_transactional",
+    });
+    expect(enumerated).toBe(0);
+    const denied = parse(await del.handler({ manifest: "not-even-parsed" }));
+    expect(denied.denied).toBe(true);
+    expect(calls.filter((c) => c.operation === "sdw_export_delete_denied").map((c) => (c.details as { denial_class: string }).denial_class))
+      .toEqual(["storage_not_transactional", "storage_not_transactional"]);
+  });
+});
+
+describe("MEDIUM-C6: the export archive cannot be redirected outside the fortress by a symlink", () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "sanctuary-vault-symlink-"));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("a planted sdw-exports symlink fails the export closed and nothing lands outside", async () => {
+    const fortress = join(dir, "fortress");
+    const outside = join(dir, "outside");
+    await mkdir(fortress, { recursive: true, mode: 0o700 });
+    await mkdir(outside, { recursive: true, mode: 0o700 });
+    await symlink(outside, join(fortress, "sdw-exports"));
+    const { log, calls } = recordingAudit();
+    const signing = makeSigning();
+    const tools = new Map(
       createSdwTools({
         storage: new MemoryStorage(),
         inventory: { listNamespaceSync: () => [] },
         auditLog: log,
-        fortressId: "fortress:shared-host",
-        exportDir: tmpdir(),
-        signingKey: () => null,
-        resolvePublicKey: () => null,
+        fortressId: "fortress:sym",
+        exportDir: join(fortress, "sdw-exports"),
+        fortressRoot: fortress,
+        signingKey: signing.signingKey,
+        resolvePublicKey: signing.resolvePublicKey,
         resolveSourceMasterKey: () => null,
-        targetMasterKey: new Uint8Array(32).fill(3),
-        isolationGuard: guard,
+        targetMasterKey: new Uint8Array(32).fill(4),
       }).map((t) => [t.name, t]),
     );
+    const exportTool = tools.get("sdw_export")!;
+    const args: Record<string, unknown> = { export_name: "redirected" };
+    await exportTool.approvalTargetArgs!(args);
+    const out = parse(await exportTool.handler(args));
+    expect(out.denied).toBe(true);
+    expect(out.exported).toBeUndefined();
+    expect(await readdir(outside)).toEqual([]);
+    const failed = calls.filter((c) => c.operation === "sdw_export_failed");
+    expect(failed.map((c) => (c.details as { category: string }).category)).toEqual(["write_failed"]);
+  });
+});
 
-    process.env.SANCTUARY_AGENT_ID = agentA;
-    await adapter.insertPassage({ passage_id: "owned-by-a", text: "agent A's private passage" }, "user_content");
-    const readByA = parse(await memoryTools.get("memory_get")!.handler({ passage_id: "owned-by-a" }));
-    expect(readByA.found).toBe(true);
+describe("MEDIUM-2: the raw identity_sign surface cannot mint an internal artifact", () => {
+  it("refuses a payload that begins with an internal signing domain, and signs ordinary bytes", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = new Uint8Array(32).fill(11);
+    const auditLog = new (await import("../../src/operational/audit-log.js")).AuditLog(new MemoryStorage(), generateRandomKey());
+    const identityEncKey = derivePurposeKey(masterKey, IDENTITY_ENCRYPTION_PURPOSE);
+    const { storedIdentity } = createIdentity("raw-signer", identityEncKey, "passphrase");
+    await storage.write(
+      "_identities",
+      storedIdentity.identity_id,
+      stringToBytes(JSON.stringify(encrypt(stringToBytes(JSON.stringify(storedIdentity)), identityEncKey))),
+    );
+    const { tools, identityManager } = createCognitiveTools(
+      new StateStore(storage, masterKey),
+      storage,
+      masterKey,
+      "passphrase",
+      auditLog,
+    );
+    await identityManager.load();
+    const sign = tools.find((t) => t.name === "identity_sign")!;
+    const forged = parse(
+      await sign.handler({
+        identity_id: storedIdentity.identity_id,
+        payload: toBase64url(stringToBytes(`${SDW_EXPORT_MANIFEST_SIGNING_DOMAIN}{"body":"hand-built manifest"}`)),
+      }),
+    );
+    expect(forged.denied).toBe(true);
+    expect(forged.signature).toBeUndefined();
+    const plain = parse(
+      await sign.handler({ identity_id: storedIdentity.identity_id, payload: toBase64url(stringToBytes("an ordinary commitment")) }),
+    );
+    expect(typeof plain.signature).toBe("string");
+  });
 
-    process.env.SANCTUARY_AGENT_ID = agentB;
-    const readByB = parse(await memoryTools.get("memory_get")!.handler({ passage_id: "owned-by-a" }));
-    expect(readByB.denied).toBe(true);
-    expect(JSON.stringify(readByB)).not.toContain("agent A's private passage");
-    // The vault export sits behind the SAME pin: B cannot move the corpus
-    // out either, and the refusal is audited with the isolation class.
-    const exportByB = parse(await vaultTools.get("sdw_export")!.handler({ export_name: "steal" }));
-    expect(exportByB.denied).toBe(true);
-    expect(exportByB.exported).toBeUndefined();
-    expect(
-      calls.filter((c) => c.operation === "sdw_export_denied").map((c) => (c.details as { denial_class: string }).denial_class),
-    ).toEqual(["multi_agent_isolation"]);
-
-    // The pin never advances: A still reads after B was refused.
-    process.env.SANCTUARY_AGENT_ID = agentA;
-    expect(parse(await memoryTools.get("memory_get")!.handler({ passage_id: "owned-by-a" })).found).toBe(true);
+  it("export.ts declares no signing domain of its own (single source in core/signing-domains.ts)", () => {
+    const exportSource = readFileSync(join(SERVER_DIR, "src", "sdw", "export.ts"), "utf8");
+    expect(exportSource.match(/"sanctuary\.[a-z0-9.-]+\\n"/g) ?? []).toEqual([]);
+    expect(exportSource).toContain('from "../core/signing-domains.js"');
   });
 });
 
@@ -222,6 +471,9 @@ describe("IC-27: import is all-or-nothing on the shipped backend", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  // REGRESSION PIN for the import module (the transactional-or-refuse check
+  // predates this change, #449); the fail-before witness for THIS change is the
+  // delete refusal test below.
   it("FilesystemStorage has no transaction primitive, so a verified bundle is refused before any write", async () => {
     const signing = makeSigning();
     const emptySource = { listNamespaceSync: () => [] };

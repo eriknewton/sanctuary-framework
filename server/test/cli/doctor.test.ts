@@ -550,3 +550,38 @@ approval_channel:
     expect(check?.hint).toContain("ran but cannot import yaml");
   });
 });
+
+describe("sanctuary doctor: wrapped harness agent ids (MEDIUM-5)", () => {
+  const originalHome = process.env.HOME;
+  const homes: string[] = [];
+  afterEach(async () => {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    for (const dir of homes.splice(0)) await rm(dir, { recursive: true, force: true });
+  });
+
+  async function withHome(claudeJson: unknown): Promise<string> {
+    const home = await mkdtemp(join(tmpdir(), "sanctuary-doctor-home-"));
+    homes.push(home);
+    process.env.HOME = home;
+    await writeFile(join(home, ".claude.json"), JSON.stringify(claudeJson), { mode: 0o600 });
+    return home;
+  }
+
+  it("WARNs for a sanctuary entry wrapped before SANCTUARY_AGENT_ID existed", async () => {
+    const home = await withHome({ mcpServers: { sanctuary: { command: "npx", args: ["sanctuary"] } } });
+    const checks = await runDoctorChecks({ env: {}, storagePath: join(home, ".sanctuary"), platform: "darwin" });
+    const check = checks.find((c) => c.name === "wrapped harness ids")!;
+    expect(check.status).toBe("WARN");
+    expect(check.message).toContain("without SANCTUARY_AGENT_ID");
+    expect(check.hint).toContain("re-run sanctuary wrap");
+  });
+
+  it("is OK when the entry carries the identity", async () => {
+    const home = await withHome({
+      mcpServers: { sanctuary: { command: "npx", args: ["sanctuary"], env: { SANCTUARY_AGENT_ID: "claude_code:fortress-abc" } } },
+    });
+    const checks = await runDoctorChecks({ env: {}, storagePath: join(home, ".sanctuary"), platform: "darwin" });
+    expect(checks.find((c) => c.name === "wrapped harness ids")!.status).toBe("OK");
+  });
+});

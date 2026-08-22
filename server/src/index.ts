@@ -109,7 +109,7 @@ import { createMemoryAttestTools } from "./cognitive/memory-attest.js";
 import { createSdwMemoryTools, memoryInsertApprovalArgs } from "./sdw/memory-tools.js";
 import { createSdwMemoryFileTools } from "./sdw/memory-file-tools.js";
 import {
-  createMultiAgentIsolationGuard,
+  createPersistentMultiAgentIsolationGuard,
   wrappedAgentIdentityFromEnv,
 } from "./sdw/memory-isolation.js";
 import { createSdwMemoryProvenanceTool } from "./sdw/memory-provenance-tool.js";
@@ -134,7 +134,7 @@ import {
   readEnvelopeEpoch,
 } from "./core/master-custody.js";
 import { decrypt } from "./core/encryption.js";
-import { derivePurposeKey } from "./core/key-derivation.js";
+import { derivePurposeKey, IDENTITY_ENCRYPTION_PURPOSE } from "./core/key-derivation.js";
 import {
   observeWitnessEpoch,
   evaluateAndEnforceRollback,
@@ -1525,8 +1525,22 @@ export async function createSanctuaryServer(options?: {
   // harness's MCP entry (wrap/cli.ts:buildSanctuaryEnv), never an
   // agent-asserted value, so two wrapped harnesses on one host resolve two
   // distinct ids and the second is refused.
+  //
+  // The pin is PERSISTED in the fortress (`_sdw_meta`, MAC'd under a
+  // master-derived key): every wrapped harness spawns its own stdio server, so
+  // an in-process pin could never see a second process. The persistent guard
+  // reads the pin on every call, so a second process over this fortress with a
+  // different wrap-time id is refused. Bound: an agent that rewrites its own
+  // harness config can present the FIRST id (see memory-isolation.ts).
   const sdwMemoryIdentity = wrappedAgentIdentityFromEnv;
-  const sdwMemoryIsolationGuard = createMultiAgentIsolationGuard(sdwMemoryIdentity);
+  const sdwFortressId = fortressIdFromStoragePath(config.storage_path);
+  const sdwMemoryIsolationGuard = createPersistentMultiAgentIsolationGuard({
+    storage,
+    masterKey,
+    fortressId: sdwFortressId,
+    ownerRef: "fleet-self",
+    ownerIdentity: sdwMemoryIdentity,
+  });
   const sdwMemoryTools = createSdwMemoryTools({
     adapter: sdwMemoryAdapter,
     auditLog,
@@ -1547,6 +1561,8 @@ export async function createSanctuaryServer(options?: {
   const sdwMemoryProvenanceTool = createSdwMemoryProvenanceTool({
     adapter: sdwMemoryAdapter,
     auditLog,
+    // Same guard instance: provenance reveals existence, owner ref, hashes.
+    isolationGuard: sdwMemoryIsolationGuard,
   });
   const sdwMemoryFileTools = createSdwMemoryFileTools({
     adapter: sdwMemoryAdapter,
@@ -1572,15 +1588,21 @@ export async function createSanctuaryServer(options?: {
   // lazily by the first approved export, never at boot: boot must not write
   // anything new into the fortress on the operator's behalf.
   const sdwExportDir = joinPath(config.storage_path, "sdw-exports");
-  const sdwIdentityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+  // Must match IdentityManager.encryptionKey (cognitive/tools.ts): the export
+  // manifest is signed with the same identity key the manager encrypts.
+  const sdwIdentityEncryptionKey = derivePurposeKey(masterKey, IDENTITY_ENCRYPTION_PURPOSE);
   const sdwVaultTools = createSdwTools({
     storage,
     // The shipped fortress is an async FilesystemStorage: the snapshot source
     // re-reads the live store before every enumeration (see tools.ts).
     inventory: new StorageSnapshotSdwInventorySource(storage),
     auditLog,
-    fortressId: fortressIdFromStoragePath(config.storage_path),
+    fortressId: sdwFortressId,
     exportDir: sdwExportDir,
+    // Symlink containment for the archive: every component under the fortress
+    // root is refused if it is a symlink, and the resolved directory must
+    // stay inside the fortress.
+    fortressRoot: config.storage_path,
     signingKey: () => {
       const identity = identityManager.getDefault();
       if (!identity) return null;
@@ -1660,7 +1682,7 @@ export async function createSanctuaryServer(options?: {
       };
     }
 
-    const identityEncryptionKey = derivePurposeKey(masterKey, "identity-encryption");
+    const identityEncryptionKey = derivePurposeKey(masterKey, IDENTITY_ENCRYPTION_PURPOSE);
     const nodeSigningKey = decrypt(
       identity.encrypted_private_key,
       identityEncryptionKey,

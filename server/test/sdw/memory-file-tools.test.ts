@@ -683,10 +683,18 @@ describe("SDW memory file tools", () => {
       fileURLToPath(new URL("../../src/index.ts", import.meta.url)),
       "utf8",
     );
-    const guardConstructions = indexSource.match(/createMultiAgentIsolationGuard\(/g) ?? [];
+    const guardConstructions =
+      indexSource.match(/createPersistentMultiAgentIsolationGuard\(/g) ?? [];
+    // The in-process pin must not be constructed in production at all.
+    expect(indexSource.match(/createMultiAgentIsolationGuard\(/g) ?? []).toHaveLength(0);
     expect(guardConstructions).toHaveLength(1);
 
-    for (const factory of ["createSdwMemoryTools", "createSdwMemoryFileTools"]) {
+    for (const factory of [
+      "createSdwMemoryTools",
+      "createSdwMemoryFileTools",
+      "createSdwMemoryProvenanceTool",
+      "createSdwTools",
+    ]) {
       const call = new RegExp(`${factory}\\(\\{[\\s\\S]*?\\n  \\}\\)`).exec(indexSource);
       expect(call, `${factory} call not found in index.ts`).not.toBeNull();
       expect(call![0], `${factory} must receive the shared isolation guard`).toContain(

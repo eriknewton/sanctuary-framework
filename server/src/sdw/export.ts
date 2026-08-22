@@ -42,9 +42,13 @@ import { SdwValidationError } from "./errors.js";
 // rotation events, and checkpoints. Every D2 artifact hash/signature input is
 // domain-prefixed so an export manifest can never be confused with (or replayed
 // as) any other signed payload, and vice versa.
-const SDW_EXPORT_RECORD_HASH_DOMAIN = "sanctuary.sdw-export-record-hash.v1\n";
-const SDW_EXPORT_SCOPE_DIGEST_DOMAIN = "sanctuary.sdw-export-scope-digest.v1\n";
-const SDW_EXPORT_MANIFEST_SIGNING_DOMAIN = "sanctuary.sdw-export-manifest.v1\n";
+// Declared in core/signing-domains.ts so the raw `identity_sign` surface can
+// refuse payloads carrying them (must match that list; never re-declare here).
+import {
+  SDW_EXPORT_MANIFEST_SIGNING_DOMAIN,
+  SDW_EXPORT_RECORD_HASH_DOMAIN,
+  SDW_EXPORT_SCOPE_DIGEST_DOMAIN,
+} from "../core/signing-domains.js";
 
 /**
  * Namespaces eligible for export. `_sdw_catalog` and `_sdw_meta` are

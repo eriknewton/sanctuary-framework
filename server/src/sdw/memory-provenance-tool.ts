@@ -37,11 +37,19 @@ import type { AuditLog } from "../operational/audit-log.js";
 import { fixedDenial } from "../agent-native/safety-base.js";
 import type { MemoryBackendAdapter } from "./adapters/memory-backend.js";
 import { SdwValidationError } from "./errors.js";
+import type { MultiAgentIsolationGuard } from "./memory-isolation.js";
+import { SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS } from "./memory-tools.js";
 
 export interface SdwMemoryProvenanceToolOptions {
   /** The shipped sovereign passage backend, scoped to one owner_ref. */
   readonly adapter: MemoryBackendAdapter;
   readonly auditLog: AuditLog;
+  /**
+   * The SAME guard instance as every other family over the shared scope
+   * (index.ts). Provenance reads reveal passage existence, owner ref, hashes
+   * and tags, so a second wrapped-agent identity is refused here too.
+   */
+  readonly isolationGuard?: MultiAgentIsolationGuard;
 }
 
 /**
@@ -133,6 +141,13 @@ export function createSdwMemoryProvenanceTool(
       required: ["passage_id"],
     },
     handler: async (args) => {
+      if (
+        options.isolationGuard !== undefined &&
+        !(await options.isolationGuard("sdw_memory_provenance")).allowed
+      ) {
+        await auditFailure({ denial_class: SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS });
+        return deny();
+      }
       const passageId = args.passage_id;
       if (typeof passageId !== "string" || passageId.length === 0) {
         await auditFailure({ denial_class: "invalid_passage_id" });

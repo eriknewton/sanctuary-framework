@@ -35,8 +35,8 @@
  *   no digests, no policy detail (invariant #7). Details go to audit.
  */
 
-import { join } from "node:path";
-import { mkdir } from "node:fs/promises";
+import { join, relative, resolve, sep } from "node:path";
+import { lstat, mkdir, realpath } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
@@ -71,6 +71,8 @@ import { bytesToString, fromBase64url } from "../core/encoding.js";
 import { isSdwIdentifier } from "./grammar.js";
 import { SdwValidationError } from "./errors.js";
 import type { MultiAgentIsolationGuard } from "./memory-isolation.js";
+import { SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS } from "./memory-tools.js";
+import type { SdwTransactional, SdwTxn } from "./lmdb-backend.js";
 
 const EXPORT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MAX_MANIFEST_ARG_BYTES = 1_048_576;
@@ -81,6 +83,13 @@ const MAX_MANIFEST_ARG_BYTES = 1_048_576;
  * both while keeping a stale binding from being consumable indefinitely.
  */
 const APPROVAL_BINDING_TTL_MS = 15 * 60_000;
+/**
+ * Upper bound on audit entries scanned when matching a manifest to its
+ * export record. Exports are Tier-1, human-approved events, so a fortress
+ * with more recorded exports than this is not a realistic shape; the bound
+ * keeps the scan finite rather than correct-only-for-small-logs.
+ */
+const MAX_EXPORT_RECORDS_SCANNED = 100_000;
 
 export interface SdwToolsOptions {
   readonly storage: StorageBackend;
@@ -104,6 +113,14 @@ export interface SdwToolsOptions {
    * `memory_emit`; a second wrapped-agent identity must be refused here too.
    */
   readonly isolationGuard?: MultiAgentIsolationGuard;
+  /**
+   * The fortress root the export directory must stay inside. When set, every
+   * path component of `exportDir` below this root is refused if it is a
+   * symlink and the resolved directory must be contained under the root, so
+   * an archive can never be redirected outside the fortress by a planted
+   * `sdw-exports` link. Tests that write to a plain temp dir may omit it.
+   */
+  readonly fortressRoot?: string;
   /**
    * Resolve operator-configured source key material by opaque reference.
    * Raw key bytes never transit tool arguments or the approval channel.
@@ -254,9 +271,117 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
   // record; the pin is never advanced (see memory-isolation.ts).
   const refusedForeignIdentity = async (operation: string): Promise<boolean> => {
     if (options.isolationGuard === undefined) return false;
-    if (options.isolationGuard(operation).allowed) return false;
-    await auditFailure(`${operation}_denied`, { denial_class: "multi_agent_isolation" });
+    if ((await options.isolationGuard(operation)).allowed) return false;
+    // Same denial class as the memory families (must match
+    // SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS in memory-tools.ts).
+    await auditFailure(`${operation}_denied`, {
+      denial_class: SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS,
+    });
     return true;
+  };
+
+  /**
+   * Gate-time wrapper shared by every vault tool: the isolation guard runs
+   * FIRST, before any enumeration or manifest work, so a foreign identity
+   * never sees the vault's inventory and never raises a Tier-1 prompt (the
+   * throw makes the router deny without prompting; the audit record above is
+   * the operator's signal). Then the live re-read, then the synchronous gate
+   * body. Stays synchronous for sources that need neither, so the existing
+   * synchronous gate contract (and its tests) is unchanged.
+   */
+  const gateWithGuard = (
+    toolName: SdwApprovalBinding["toolName"],
+    gate: () => Record<string, unknown>,
+  ): Record<string, unknown> | Promise<Record<string, unknown>> => {
+    if (options.isolationGuard === undefined) return gateAfterRefresh(gate);
+    return (async () => {
+      if (await refusedForeignIdentity(toolName)) {
+        throw new SdwValidationError(
+          "owner_scope_conflict",
+          "SDW vault tool refused for a second wrapped-agent identity",
+        );
+      }
+      await refreshInventory();
+      return gate();
+    })();
+  };
+
+  const asTransactional = (): (StorageBackend & SdwTransactional) | null => {
+    const candidate = options.storage as StorageBackend & { sdwTransaction?: unknown };
+    return typeof candidate.sdwTransaction === "function"
+      ? (candidate as StorageBackend & SdwTransactional)
+      : null;
+  };
+
+  /**
+   * A manifest is deletable only if THIS fortress's audit chain records the
+   * export that produced it: an `sdw_export_completed` entry whose
+   * manifest_body_digest AND export_audit_event_id match. A manifest that was
+   * merely signed by a fortress key (for example through the raw
+   * `identity_sign` surface, which is separately domain-refused) has no such
+   * record and cannot drive a delete.
+   */
+  const assertExportRecorded = async (
+    manifest: SdwSignedExportManifest,
+    digest: string,
+  ): Promise<void> => {
+    const log = options.auditLog as AuditLog & {
+      query?: (q: {
+        operation_type?: string;
+        limit?: number;
+      }) => Promise<{ entries: Array<{ details?: Record<string, unknown> }> }>;
+    };
+    let recorded = false;
+    if (typeof log.query === "function") {
+      const { entries } = await log.query({
+        operation_type: "sdw_export_completed",
+        limit: MAX_EXPORT_RECORDS_SCANNED,
+      });
+      recorded = entries.some(
+        (entry) =>
+          entry.details?.manifest_body_digest === digest &&
+          entry.details?.export_audit_event_id === manifest.body.export_audit_event_id,
+      );
+    }
+    if (!recorded) throw new SdwImportVerificationError("export_not_recorded", digest);
+  };
+
+  /**
+   * Symlink containment for the archive destination (fortressRoot set):
+   * walk every component of exportDir below the root, refusing any symlink,
+   * create the directory, then require realpath(exportDir) to sit under
+   * realpath(root). The destination file itself is written temp+rename by
+   * writeSdwExportBundleAtomic, so a planted symlink at the file name is
+   * replaced, never followed.
+   */
+  const assertExportDirContained = async (): Promise<void> => {
+    if (options.fortressRoot === undefined) {
+      await mkdir(options.exportDir, { recursive: true, mode: 0o700 });
+      return;
+    }
+    const root = resolve(options.fortressRoot);
+    const dir = resolve(options.exportDir);
+    const rel = relative(root, dir);
+    if (rel === "" || rel.startsWith("..") || rel.includes(`..${sep}`)) {
+      throw new Error("export directory is outside the fortress root");
+    }
+    let current = root;
+    for (const component of rel.split(sep)) {
+      current = join(current, component);
+      try {
+        if ((await lstat(current)).isSymbolicLink()) {
+          throw new Error("export directory path contains a symlink");
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        await mkdir(current, { mode: 0o700 });
+      }
+    }
+    const realRoot = await realpath(root);
+    const realDir = await realpath(dir);
+    if (!realDir.startsWith(realRoot + sep)) {
+      throw new Error("export directory resolved outside the fortress root");
+    }
   };
 
   // Fail closed on a malformed namespaces argument: silently treating it as
@@ -303,7 +428,7 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
     // (synchronous once the live store has been re-read). Throwing here makes
     // the router deny without prompting.
     approvalTargetArgs: (args) =>
-      gateAfterRefresh(() => {
+      gateWithGuard("sdw_export", () => {
         const exportName = args.export_name;
         if (
           typeof exportName !== "string" ||
@@ -418,8 +543,9 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
       const destinationPath = join(options.exportDir, `${exportName}.sdw-export.json`);
       try {
         // The export directory is created here, by the first approved export,
-        // never at server boot (boot must not add anything to the fortress).
-        await mkdir(options.exportDir, { recursive: true, mode: 0o700 });
+        // never at server boot (boot must not add anything to the fortress),
+        // with symlink containment under the fortress root.
+        await assertExportDirContained();
         await writeSdwExportBundleAtomic(built.bundle, destinationPath, options.fs);
       } catch {
         await auditFailure("sdw_export_failed", {
@@ -488,6 +614,15 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
     // itself is deliberately absent (constraint #1); the manifest digest
     // binds it into the approval and into any approval proof.
     approvalTargetArgs: async (args) => {
+      // Guard first: a foreign identity never gets as far as manifest parsing
+      // or an approval prompt (see gateWithGuard). Only awaited when a guard
+      // is wired, so the no-guard path keeps its synchronous binding order.
+      if (options.isolationGuard !== undefined && (await refusedForeignIdentity("sdw_import"))) {
+        throw new SdwValidationError(
+          "owner_scope_conflict",
+          "SDW vault tool refused for a second wrapped-agent identity",
+        );
+      }
       const sourceKeyRef = args.source_key_ref;
       if (typeof sourceKeyRef !== "string" || sourceKeyRef.length === 0) {
         // Fail closed pre-prompt; the router converts the throw to the fixed
@@ -644,9 +779,12 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
     name: "sdw_export_delete",
     description:
       "Post-export local-state delete: removes exactly the records listed in a " +
-      "signed export manifest from a completed sdw_export, and only while their " +
-      "stored ciphertext still matches the manifest. Any drift aborts with zero " +
-      "deletes. Irreversible; Tier 1.",
+      "signed export manifest that THIS fortress recorded completing, and only " +
+      "while their stored ciphertext still matches the manifest. All-or-nothing: " +
+      "every record is re-verified and deleted inside one storage transaction, so " +
+      "any drift aborts with zero deletes. A backend without transactions refuses " +
+      "outright; the shipped filesystem fortress has no transaction primitive, so " +
+      "on that backend this tool refuses today. Irreversible; Tier 1.",
     tool_class: "write",
     inputSchema: {
       type: "object",
@@ -658,42 +796,75 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
       },
       required: ["manifest"],
     },
-    approvalTargetArgs: (args) =>
-      gateAfterRefresh(() => {
-        const manifest = decodeSignedManifestArg(args.manifest);
-        const summary = verifyManifestSignatureOnly(manifest, options.resolvePublicKey);
-        // Freeze the CURRENT inventory of the manifest's namespaces so the
-        // handler deletes only what the human saw — and only if nothing moved.
-        const namespaces = [
-          ...new Set(manifest.body.records.map((record) => record.namespace)),
-        ].sort();
-        for (const namespace of namespaces) {
-          if (!isSdwExportableNamespace(namespace)) {
-            throw new SdwImportVerificationError("schema_invalid", summary.digest);
-          }
-        }
-        const inventory = enumerateSdwExportInventory(options.inventory, namespaces);
-        assertManifestMatchesInventory(manifest, inventory, summary.digest);
-        // Bind THIS call's frozen inventory to THIS call's handler execution
-        // (see SDW_APPROVAL_BINDING): the handler deletes only against the
-        // snapshot the approval prompt displayed.
-        attachApprovalBinding(args, {
-          kind: "export_scope",
-          toolName: "sdw_export_delete",
-          argsHash: normalizedArgsHash(args),
-          inventory,
-          storedAtMs: Date.now(),
+    approvalTargetArgs: async (args) => {
+      // Guard first (see gateWithGuard), then the transactional-backend check:
+      // both refuse before any manifest work and before any prompt.
+      if (await refusedForeignIdentity("sdw_export_delete")) {
+        throw new SdwValidationError(
+          "owner_scope_conflict",
+          "SDW vault tool refused for a second wrapped-agent identity",
+        );
+      }
+      if (asTransactional() === null) {
+        await auditFailure("sdw_export_delete_denied", {
+          denial_class: "storage_not_transactional",
         });
-        return {
+        throw new SdwImportVerificationError("storage_not_transactional");
+      }
+      const manifest = decodeSignedManifestArg(args.manifest);
+      const summary = verifyManifestSignatureOnly(manifest, options.resolvePublicKey);
+      // A signature alone is not enough: the export must be on THIS
+      // fortress's audit chain (export_audit_event_id + digest).
+      try {
+        await assertExportRecorded(manifest, summary.digest);
+      } catch (error) {
+        await auditFailure("sdw_export_delete_denied", {
+          denial_class: "export_not_recorded",
           manifest_body_digest: summary.digest,
-          scope_digest: inventory.scope_digest,
-          namespaces,
-          record_count: manifest.body.records.length,
-          source_fortress_id: manifest.body.source_fortress_id,
-        };
-      }),
+        });
+        throw error;
+      }
+      await refreshInventory();
+      // Freeze the CURRENT inventory of the manifest's namespaces so the
+      // handler deletes only what the human saw — and only if nothing moved.
+      const namespaces = [
+        ...new Set(manifest.body.records.map((record) => record.namespace)),
+      ].sort();
+      for (const namespace of namespaces) {
+        if (!isSdwExportableNamespace(namespace)) {
+          throw new SdwImportVerificationError("schema_invalid", summary.digest);
+        }
+      }
+      const inventory = enumerateSdwExportInventory(options.inventory, namespaces);
+      assertManifestMatchesInventory(manifest, inventory, summary.digest);
+      // Bind THIS call's frozen inventory to THIS call's handler execution
+      // (see SDW_APPROVAL_BINDING): the handler deletes only against the
+      // snapshot the approval prompt displayed.
+      attachApprovalBinding(args, {
+        kind: "export_scope",
+        toolName: "sdw_export_delete",
+        argsHash: normalizedArgsHash(args),
+        inventory,
+        storedAtMs: Date.now(),
+      });
+      return {
+        manifest_body_digest: summary.digest,
+        export_audit_event_id: manifest.body.export_audit_event_id,
+        scope_digest: inventory.scope_digest,
+        namespaces,
+        record_count: manifest.body.records.length,
+        source_fortress_id: manifest.body.source_fortress_id,
+      };
+    },
     handler: async (args) => {
       if (await refusedForeignIdentity("sdw_export_delete")) {
+        return genericDeny("sdw_export_delete");
+      }
+      const transactional = asTransactional();
+      if (transactional === null) {
+        await auditFailure("sdw_export_delete_denied", {
+          denial_class: "storage_not_transactional",
+        });
         return genericDeny("sdw_export_delete");
       }
       let manifest: SdwSignedExportManifest;
@@ -701,6 +872,7 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
       try {
         manifest = decodeSignedManifestArg(args.manifest);
         ({ digest } = verifyManifestSignatureOnly(manifest, options.resolvePublicKey));
+        await assertExportRecorded(manifest, digest);
       } catch (error) {
         const category =
           error instanceof SdwImportVerificationError ? error.category : "malformed_bundle";
@@ -724,8 +896,20 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
       // exactly the exported ciphertext. Any mismatch aborts with zero deletes
       // (no partial deletion of records the human did not see). Re-read the
       // live store first so "live" means current bytes, not the gate snapshot.
-      await refreshInventory();
-      const live = enumerateSdwExportInventory(options.inventory, approved.namespaces);
+      // Both the re-read and the enumeration can throw (a storage error is not
+      // a drift); either way nothing has been deleted yet, and the failure is
+      // audited and denied rather than propagated as a raw error.
+      let live: SdwExportInventory;
+      try {
+        await refreshInventory();
+        live = enumerateSdwExportInventory(options.inventory, approved.namespaces);
+      } catch {
+        await auditFailure("sdw_export_delete_failed", {
+          manifest_body_digest: digest,
+          category: "inventory_unavailable",
+        });
+        return genericDeny("sdw_export_delete");
+      }
       if (live.scope_digest !== approved.scope_digest) {
         await auditFailure("sdw_export_delete_drift", {
           manifest_body_digest: digest,
@@ -745,26 +929,44 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
         return genericDeny("sdw_export_delete");
       }
 
-      // Defense-in-depth against a write racing the recheck above: re-read
-      // each record and verify its ciphertext hash IMMEDIATELY before its
-      // delete. A mismatch aborts the loop (deletes so far were all verified;
-      // the abort is honestly audited with the partial count).
-      let deleted = 0;
-      for (const record of manifest.body.records) {
-        const raw = await options.storage.read(record.namespace, record.key);
-        const liveHash = raw === null ? null : recordHashOfRawEnvelope(raw);
-        if (liveHash !== record.record_hash) {
+      // All-or-nothing: inside ONE storage transaction (which the backend
+      // serializes against every other SDW writer), re-read and verify EVERY
+      // listed record's ciphertext hash first; only when all of them still
+      // match are any deleted. A mismatch throws before the first delete, so
+      // the transaction commits nothing; a throw from a delete rolls the
+      // transaction back, so there is no partial irreversible delete.
+      let deleted: number;
+      try {
+        deleted = await transactional.sdwTransaction(async (txn: SdwTxn) => {
+          for (const record of manifest.body.records) {
+            const raw = await txn.read(record.namespace, record.key);
+            const liveHash = raw === null ? null : recordHashOfRawEnvelope(raw);
+            if (liveHash !== record.record_hash) {
+              throw new SdwExportDeleteDriftError(record.namespace, record.key);
+            }
+          }
+          let count = 0;
+          for (const record of manifest.body.records) {
+            if (await txn.delete(record.namespace, record.key)) count += 1;
+          }
+          return count;
+        });
+      } catch (error) {
+        if (error instanceof SdwExportDeleteDriftError) {
           await auditFailure("sdw_export_delete_drift", {
             manifest_body_digest: digest,
             approved_scope_digest: approved.scope_digest,
             denial_class: "record_changed_mid_delete",
-            deleted_before_abort: deleted,
+            deleted_before_abort: 0,
           });
-          return genericDeny("sdw_export_delete");
+        } else {
+          await auditFailure("sdw_export_delete_failed", {
+            manifest_body_digest: digest,
+            category: "transaction_failed",
+            deleted_before_abort: 0,
+          });
         }
-        if (await options.storage.delete(record.namespace, record.key)) {
-          deleted += 1;
-        }
+        return genericDeny("sdw_export_delete");
       }
 
       await auditSuccess("sdw_export_delete_completed", {
@@ -787,6 +989,14 @@ export function createSdwTools(options: SdwToolsOptions): ToolDefinition[] {
 }
 
 // ── Manifest-arg helpers (sdw_export_delete) ─────────────────────────────────
+
+/** Thrown inside the delete transaction so the catch can tell drift from a storage failure. */
+class SdwExportDeleteDriftError extends Error {
+  constructor(namespace: string, key: string) {
+    super(`SDW record changed before delete: ${namespace}/${key}`);
+    this.name = "SdwExportDeleteDriftError";
+  }
+}
 
 /** Hash a stored ciphertext envelope (raw bytes form) — no decryption. */
 function recordHashOfRawEnvelope(raw: Uint8Array): string | null {
