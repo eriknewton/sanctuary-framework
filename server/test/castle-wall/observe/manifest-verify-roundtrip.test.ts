@@ -40,6 +40,14 @@ import type {
 } from "../../../src/castle-wall/allowlist/manifest.js";
 import { canonicalize } from "../../../src/mesh/canonical-json.js";
 import { stringToBytes, toBase64url } from "../../../src/core/encoding.js";
+import { encodeRuleFilename, parseRuleId } from "../../../src/castle-wall/allowlist/rule-identity.js";
+
+/** Derive the encoded-v1 filename for a rule id (must be valid by the pattern). */
+function encodedFilename(id: string): string {
+  const parsed = parseRuleId(id);
+  if (!parsed.ok) throw new Error(`test setup: invalid rule id "${id}": ${parsed.error}`);
+  return encodeRuleFilename(parsed.value);
+}
 
 function rule(id: string, host: string): AllowlistRule {
   return {
@@ -114,9 +122,9 @@ describe("readVerifiedManifest: real publisher round-trip + tamper detection (FI
 
   it("editing a referenced rule file's bytes after signing is tampered (sha256 mismatch)", async () => {
     await publish([rule("r-good", "api.example.com")]);
-    // The rule file lives in the enforcement rule source `rules/<id>.json`
-    // (2026-07-27 enforcement-reach fix, Option A).
-    const ruleFile = join(egressDir, "rules", "r-good.json");
+    // PR-2: producer writes encoded-v1 names; the enforcement rule source
+    // path is rules/<encoded-v1-filename> (2026-07-27 enforcement-reach fix).
+    const ruleFile = join(egressDir, "rules", encodedFilename("r-good"));
     const original = JSON.parse(await readFile(ruleFile, "utf8")) as AllowlistRule;
     original.match = { host_pattern: "*", port: [443], protocol: "tcp" }; // widen to everything
     await writeFile(ruleFile, JSON.stringify(original));
@@ -126,11 +134,14 @@ describe("readVerifiedManifest: real publisher round-trip + tamper detection (FI
 
   it("dropping a referenced rule file is tampered (missing file) WITH a named remedy, never a silent drop or a bare 'unreadable' (F8)", async () => {
     await publish([rule("r-good", "api.example.com")]);
-    await rm(join(egressDir, "rules", "r-good.json"));
+    // PR-2: producer writes encoded-v1 names.
+    await rm(join(egressDir, "rules", encodedFilename("r-good")));
     const read = await readVerifiedManifest(egressDir, publicKey);
     expect(read.status).toBe("tampered");
     if (read.status !== "tampered") throw new Error("unreachable");
-    expect(read.reason).toContain("r-good.json");
+    // PR-2: producer writes encoded-v1 names; the error message names the
+    // encoded filename (entry.file), not the original rule id.
+    expect(read.reason).toContain(encodedFilename("r-good"));
     // Fix-round F8 (remedy discoverability): the refusal names the recovery
     // path instead of stranding the operator on a generic tamper message.
     expect(read.reason).toContain("Remedy");
@@ -160,8 +171,10 @@ describe("readVerifiedManifest: real publisher round-trip + tamper detection (FI
     // whose file sits BESIDE manifest.json (the location the defective
     // promote wrote to, which no enforcement path reads).
     await publish([rule("r-good", "api.example.com")]);
-    const inRules = join(egressDir, "rules", "r-good.json");
-    const legacy = join(egressDir, "r-good.json");
+    // PR-2: producer writes encoded-v1 names; move the encoded file out of
+    // rules/ to beside manifest.json to reproduce the pre-2026-07-27 shape.
+    const inRules = join(egressDir, "rules", encodedFilename("r-good"));
+    const legacy = join(egressDir, encodedFilename("r-good"));
     await writeFile(legacy, await readFile(inRules));
     await rm(inRules);
 

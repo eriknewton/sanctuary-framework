@@ -46,6 +46,7 @@ import {
   DERIVED_DNS_RULE_ID,
   deriveDnsRuleForHostnameRules,
 } from "../../../src/castle-wall/allowlist/dns-derivation.js";
+import { encodeRuleFilename, parseRuleId, RULE_ID_MAX_LENGTH } from "../../../src/castle-wall/allowlist/rule-identity.js";
 
 void _did;
 
@@ -266,14 +267,19 @@ describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
     const derivedEntry = signed.manifest.rules.find(
       (entry) => entry.rule_id === DERIVED_DNS_RULE_ID
     );
+    // PR-2: producer now writes encoded_v1 filenames. The sha256 is of the
+    // rule body (canonical JSON), unchanged by the filename encoding.
+    const parsedDnsId = parseRuleId(DERIVED_DNS_RULE_ID);
+    if (!parsedDnsId.ok) throw new Error(`test setup: ${parsedDnsId.error}`);
+    const expectedDnsFilename = encodeRuleFilename(parsedDnsId.value);
     expect(derivedEntry).toEqual({
       rule_id: DERIVED_DNS_RULE_ID,
-      file: `${DERIVED_DNS_RULE_ID}.json`,
+      file: expectedDnsFilename,
       sha256: "5fc5aba5ae6c1e5dfd907528759ff73038d3a6ed7351499d51c84c90843ab26e",
     });
     expect(signed.manifest.rules).toHaveLength(3);
     expect(ruleFiles.map((file) => file.filename)).toContain(
-      `${DERIVED_DNS_RULE_ID}.json`
+      expectedDnsFilename
     );
   });
 
@@ -497,11 +503,16 @@ describe("rule id to filename mapping", () => {
   });
 
   it("keeps distinct maximum-length ids distinct on disk", async () => {
-    const shared = "r".repeat(113);
+    // Both IDs exactly at the 120-char contract ceiling; explicit assertion so the claim cannot drift.
+    const shared = "r".repeat(114);
+    const idAlpha = shared + "-alpha"; // 114 + 6 = 120 exactly
+    const idBeta  = shared + "-beta0"; // 114 + 6 = 120 exactly
+    expect(idAlpha.length).toBe(RULE_ID_MAX_LENGTH);
+    expect(idBeta.length).toBe(RULE_ID_MAX_LENGTH);
     const { ruleFiles, signed } = await buildSignedManifest({
       fortressId: "f",
       issuedAt: "t",
-      rules: [makeRule(shared + "-alpha", "a.example"), makeRule(shared + "-beta", "b.example")],
+      rules: [makeRule(idAlpha, "a.example"), makeRule(idBeta, "b.example")],
       signer,
     });
     const filenames = new Set(ruleFiles.map((f) => f.filename));
