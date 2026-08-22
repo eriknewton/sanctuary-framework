@@ -17,6 +17,7 @@ import { readDistressConfig } from "./distress/config.js";
 import { deliverDistressLocally } from "./distress/local-delivery.js";
 import { loadOrCreateLocalListenerSecret } from "./distress/local-secret.js";
 import { AuditLog } from "./operational/audit-log.js";
+import { recoverInterruptedExitImportsOrThrow } from "./exit/bundle.js";
 import { createDisclosureTools } from "./disclosure/tools.js";
 import { createReputationTools } from "./reputation/tools.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "./principal-policy/loader.js";
@@ -240,6 +241,20 @@ export async function createSanctuaryServer(options?: {
 
   // 5. Initialize audit log
   const auditLog = new AuditLog(storage, masterKey);
+
+  // 5b. HIGH-2 (coordinator gate, 2026-08-22): roll back any exit-import
+  // left interrupted by a prior hard kill on THIS fortress BEFORE any other
+  // subsystem below reads or writes storage - including before the
+  // anti-rollback cross-check right after this, so that check evaluates
+  // the RECOVERED state, not a half-applied one. Without this, the MCP
+  // server could boot on a half-applied target, accumulate days of
+  // legitimate writes, and then have a LATER `sanctuary exit verify`/
+  // `import` silently reconcile (delete/overwrite) some of them via the
+  // durable journal replay. `recoverInterruptedExitImportsOrThrow` stops
+  // boot outright (a partial/unparseable rollback is worse than refusing
+  // to start) rather than let the server run against storage it cannot
+  // vouch for.
+  await recoverInterruptedExitImportsOrThrow(storage, auditLog);
 
   // 5rb. Anti-rollback Stage 1 boot cross-check. Compare the on-disk custody
   // epoch against the surviving on-disk witnesses (the #501 rotation epoch

@@ -1,36 +1,31 @@
 /**
- * F1 (Exit V2 drill D1, 2026-08-22): `importExitBundle` activation used to
- * be exception-rollback only. A hard process kill never reaches the
- * `catch` block's in-memory `restoreStorageSnapshots` call, so a SIGKILL
- * mid-import (observed 3/3 in the drill, at 4.0s/5.0s/6.0s of an 8.8s
- * import) left the target with 6 staged `_exit_*` artifacts - including an
- * `_exit_imports` record already stamped `activated_at` - plus a partial
- * reputation import (1, 92, and 115 of 120 attestations). State entries
- * were never half-applied only because the re-key stage starts last, so
- * the exposed window was the reputation import.
- *
- * The fix (server/src/exit/bundle.ts): a durable per-import rollback
- * journal (`writeImportJournal`) is written BEFORE any staging write
- * begins, using the exact snapshot data the exception path already
- * computes. `recoverInterruptedExitImports` replays that journal through
- * the SAME `restoreStorageSnapshots` the exception path uses, and is
- * called at the START of every `importExitBundle` AND at "fortress open"
- * for every `sanctuary exit` subcommand (`openExitContext`,
- * server/src/exit/cli.ts). The `_exit_imports` record itself is now staged
- * `in_progress` first and only promoted to its `activated_at`-stamped final
- * form LAST, after the reputation import and state re-key have both
- * actually succeeded.
+ * F1: `importExitBundle` activation is atomic under a hard process kill,
+ * not just under a caught JS exception. A durable per-import rollback
+ * journal (`writeImportJournal`, server/src/exit/bundle.ts) is written
+ * BEFORE any staging write begins, using the exact snapshot data the
+ * exception path already computes. `recoverInterruptedExitImportsOrThrow`
+ * replays that journal through the SAME `restoreStorageSnapshots` the
+ * exception path uses, and is called at the START of every
+ * `importExitBundle` AND at "fortress open" for every `sanctuary exit`
+ * subcommand (`openExitContext`, server/src/exit/cli.ts) and every other
+ * fortress-owning composition point that derives a master key (see
+ * `recoverInterruptedExitImportsOrThrow`'s doc comment for the inventory).
+ * The `_exit_imports` completion record is staged `in_progress` first and
+ * only promoted to its `activated_at`-stamped final form LAST, after the
+ * reputation import and state re-key have both actually succeeded.
  *
  * This file has two halves:
  *  - in-process fault injection at three stage boundaries (AGENTS.md rule
- *    12), proving the new journal-write/delete bookkeeping does not break
- *    the pre-existing exception-based rollback and cleans itself up
- *    correctly at each boundary;
+ *    12), proving the journal-write/delete bookkeeping does not break the
+ *    pre-existing exception-based rollback and cleans itself up correctly
+ *    at each boundary;
  *  - a REAL child-process SIGKILL of the CLI import (rule 12's "AND a real
- *    child-process kill", the drill's own harness/atomic-kill.sh shape),
- *    proving the durable-journal fix actually survives a kill the
- *    in-process fault-injection tests cannot exercise (a thrown JS
- *    exception always reaches the `catch` block; a SIGKILL never does).
+ *    child-process kill"), proving the durable-journal mechanism survives
+ *    a kill the in-process fault-injection tests cannot exercise (a
+ *    thrown JS exception always reaches the `catch` block; a SIGKILL never
+ *    does). The kill is timed by POLLING for the journal write rather than
+ *    a fixed delay, so the test proves it landed mid-flight instead of
+ *    assuming a timing guess was right.
  *
  * Every fortress here is a disposable temp directory
  * (`mkdtemp`/`SANCTUARY_STORAGE_PATH`), never `~/.sanctuary` or the login
@@ -453,6 +448,94 @@ describe("F1: durable rollback journal - in-process fault injection at each stag
     const after = await snapshotAll(destinationStorage);
     expect(after).toBe(before);
   });
+
+  it("a kill between the final promote write and the journal delete does NOT revert a successful import on the next recovery (coordinator gate finding, 2026-08-22)", async () => {
+    // A storage wrapper that lets everything through EXCEPT the journal's
+    // OWN delete call, which it silently drops - simulating a process kill
+    // landing exactly between the import's last write (the `activated_at`
+    // promote) and the journal cleanup that follows it. The import itself
+    // completes successfully; only the journal's own removal is what a
+    // kill at this point would leave undone.
+    class DropJournalDeleteStorage implements StorageBackend {
+      constructor(private readonly inner: StorageBackend) {}
+      write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+        return this.inner.write(namespace, key, data);
+      }
+      read(namespace: string, key: string): Promise<Uint8Array | null> {
+        return this.inner.read(namespace, key);
+      }
+      async delete(
+        namespace: string,
+        key: string,
+        secureOverwrite?: boolean
+      ): Promise<boolean> {
+        if (namespace === "_exit_import_journal") return true;
+        return this.inner.delete(namespace, key, secureOverwrite);
+      }
+      list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]> {
+        return this.inner.list(namespace, prefix);
+      }
+      exists(namespace: string, key: string): Promise<boolean> {
+        return this.inner.exists(namespace, key);
+      }
+      totalSize(): Promise<number> {
+        return this.inner.totalSize();
+      }
+      listNamespaces(): Promise<string[]> {
+        return (this.inner as MemoryStorage).listNamespaces();
+      }
+    }
+
+    const source = await makeSource("atomic-postpromote", 2, 2);
+    const bundleDir = await newBundleDir();
+    const exported = await exportBundle(source, bundleDir, "atomic-postpromote-ns");
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+    const wrapped = new DropJournalDeleteStorage(destinationStorage);
+
+    const result = await importExitBundle({
+      bundleDir,
+      storage: wrapped,
+      masterKey: destination.masterKey,
+      identityManager: destination.identityManager,
+      auditLog: destination.auditLog,
+      activate: true,
+      forceRebind: true,
+      sourceRecoveryKey: exported.state_rekey_key,
+      destinationSignerIdentityId: destination.identityId,
+    });
+    expect(result.activated).toBe(true);
+
+    // The journal survived (the delete was dropped); the import's own data
+    // is fully, successfully applied. Excluding the journal itself (which
+    // recovery is EXPECTED to remove) from the comparison below, since the
+    // property under test is "everything the import actually wrote stays
+    // exactly as the import left it" - not "the journal survives too".
+    expect(await destinationStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(1);
+    const stripJournal = (snapshot: string): string =>
+      snapshot
+        .split("\n")
+        .filter((line) => !line.startsWith(`${EXIT_IMPORT_JOURNAL_NAMESPACE}/`))
+        .join("\n");
+    const afterSuccessfulImport = stripJournal(await snapshotAll(destinationStorage));
+
+    // Recovery must recognize the import ALREADY completed (via the
+    // `activated_at`-stamped record) and clear the stale journal WITHOUT
+    // restoring its snapshot - restoring it would revert this successful
+    // import back to its pre-image, which is the exact defect this test
+    // pins closed.
+    const recovery = await recoverInterruptedExitImports(
+      destinationStorage,
+      destination.auditLog
+    );
+    expect(recovery.recovered).toBe(1);
+    expect(recovery.failed).toEqual([]);
+    expect(await destinationStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
+
+    const afterRecovery = stripJournal(await snapshotAll(destinationStorage));
+    expect(afterRecovery).toBe(afterSuccessfulImport);
+    expect(await destinationStorage.list("atomic-postpromote-ns")).toHaveLength(2);
+  });
 });
 
 /**
@@ -632,11 +715,8 @@ describe("F1: a real child-process SIGKILL mid-import leaves the target unable t
         }
       );
       // POLL for the write, don't guess a delay: a fixed sleep before the
-      // kill was tried first and was flaky - most of an import's wall time
-      // turned out to be Argon2id master-key derivation BEFORE any storage
-      // write happens at all (measured ~8s for this bundle size, dominated
-      // by KDF), so a short fixed delay reliably killed the process before
-      // it had written anything, proving nothing about atomicity. Instead,
+      // kill was tried first and was flaky, killing the process before it
+      // had written anything and proving nothing about atomicity. Instead,
       // poll the target's OWN durable journal namespace (written durably
       // BEFORE any staging write - see writeImportJournal's doc comment in
       // bundle.ts) until an entry appears, confirming staging has actually
@@ -655,16 +735,38 @@ describe("F1: a real child-process SIGKILL mid-import leaves the target unable t
       }
       // Let it get further into the reputation import / state re-key before
       // killing, so the interrupted work is not just the journal write
-      // itself.
-      if (journalSeen) {
-        await new Promise((resolve) => setTimeout(resolve, 300));
+      // itself. Poll for a REPUTATION write specifically (rather than a
+      // fixed sleep) so the "writes had begun" assertion below is proven,
+      // not assumed.
+      let reputationWriteSeen = false;
+      const reputationPollDeadline = Date.now() + 20_000;
+      while (journalSeen && Date.now() < reputationPollDeadline) {
+        if (child.exitCode !== null || child.signalCode !== null) break;
+        const reputationEntries = await targetStorage.list("_reputation");
+        if (reputationEntries.length > 0) {
+          reputationWriteSeen = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
       }
       const stillRunning = child.exitCode === null && child.signalCode === null;
       if (stillRunning && child.pid) {
         process.kill(child.pid, "SIGKILL");
       }
-      await exited;
+      const exitInfo = await exited;
       expect(journalSeen).toBe(true);
+      // MEDIUM (coordinator gate, 2026-08-22): prove the kill actually
+      // used SIGKILL (not, say, a normal exit racing the poll loop) - a
+      // `signal` of anything else means this run's "interrupted" evidence
+      // below is not about a hard kill at all.
+      if (stillRunning) {
+        expect(exitInfo.signal).toBe("SIGKILL");
+      }
+      // MEDIUM (coordinator gate, 2026-08-22): prove REPUTATION writes -
+      // not just the journal write - had begun before the kill, so the
+      // rollback this test exercises is undoing real per-attestation
+      // writes, not only the journal bookkeeping.
+      expect(reputationWriteSeen).toBe(true);
 
       // `journalSeen` above proves the journal write (and therefore at
       // least one storage write) happened before the kill, so the target
@@ -686,6 +788,17 @@ describe("F1: a real child-process SIGKILL mid-import leaves the target unable t
       expect(afterRecovery).toBe(beforeKill);
       expect(recovery.recovered).toBe(1);
       expect(recovery.failed).toEqual([]);
+
+      // MEDIUM (coordinator gate, 2026-08-22): idempotency - a SECOND
+      // recovery call against the now-clean fortress (simulating a second
+      // "fortress open" with no new interruption in between) must be a
+      // pure no-op, not re-apply anything or error.
+      const secondRecovery = await recoverInterruptedExitImports(
+        reopenedStorage,
+        reopenedAuditLog
+      );
+      expect(secondRecovery).toEqual({ recovered: 0, failed: [] });
+      expect(await snapshotFilesystem(reopenedStorage)).toBe(beforeKill);
 
       // Now prove the SECOND half of F1's fix: a subsequent CLEAN import
       // (via the real CLI again, matching the drill's recovery leg) yields

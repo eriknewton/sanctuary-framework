@@ -28,6 +28,7 @@ import { join } from "node:path";
 import { loadConfig, SANCTUARY_VERSION } from "./config.js";
 import { FilesystemStorage } from "./storage/filesystem.js";
 import { AuditLog } from "./operational/audit-log.js";
+import { recoverInterruptedExitImportsOrThrow } from "./exit/bundle.js";
 import {
   consumeResetHistoryMarker,
   ResetHistoryMalformedError,
@@ -921,6 +922,12 @@ async function wireUnlockedDeps(args: {
 
   // 5. Initialize audit log (for reading historical entries)
   const auditLog = new AuditLog(storage, masterKey);
+
+  // HIGH-2 (coordinator gate, 2026-08-22): roll back any exit-import left
+  // interrupted by a prior hard kill on THIS fortress before the dashboard
+  // reads or serves anything from storage. See index.ts's matching call
+  // site for the full rationale (createSanctuaryServer, step 5b).
+  await recoverInterruptedExitImportsOrThrow(storage, auditLog);
 
   // Unified Protect Slice 5 S5-6: bind the exclusive-egress posture PRODUCER
   // (the S5-P provider -- previously "no live producer exists"). Reads the

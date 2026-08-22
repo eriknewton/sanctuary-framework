@@ -14,6 +14,12 @@ import {
   StateStore,
   isReservedNamespace,
   type StateEntry,
+  // CONTRACT PIN: must match the export in
+  // server/src/cognitive/state-store.ts - see that file's comment on these
+  // constants. Used by activationSnapshotLocations to snapshot the exact
+  // `_meta` keys a state re-key touches (coordinator gate, 2026-08-22).
+  STATE_ENVELOPE_PUBLIC_KEYS_KEY,
+  STATE_ENVELOPE_VERSION_ANCHORS_KEY,
 } from "../cognitive/state-store.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
@@ -2085,18 +2091,14 @@ async function snapshotStorageLocations(
   return snapshots;
 }
 
-async function snapshotStorageNamespace(
-  storage: StorageBackend,
-  namespace: string
-): Promise<StorageNamespaceSnapshot> {
-  const entries: StorageSnapshot[] = [];
-  for (const entry of await storage.list(namespace)) {
-    const data = await storage.read(namespace, entry.key);
-    if (!data) continue;
-    entries.push({ namespace, key: entry.key, data });
-  }
-  return { namespace, entries };
-}
+// `snapshotStorageNamespace` (whole-namespace snapshot) was removed
+// (coordinator gate HIGH finding, 2026-08-22): its restore path deletes
+// every key present at restore time that was absent from the snapshot,
+// which is imprecise for a durable, possibly-days-later replay - see the
+// "PRECISE `_meta` LOCATIONS" comment in `activationSnapshotLocations`.
+// `StorageNamespaceSnapshot` / `namespaceSnapshots` plumbing stays in
+// `restoreStorageSnapshots` below (always called with `[]` today) so a
+// future genuinely-namespace-scoped need does not have to rebuild it.
 
 async function restoreStorageSnapshots(
   storage: StorageBackend,
@@ -2175,6 +2177,23 @@ interface SerializedStorageNamespaceSnapshot {
  * before it starts writing - this record is just that same data made
  * durable, so a hard kill and a caught exception roll back through the
  * exact same `restoreStorageSnapshots` call with the exact same input.
+ *
+ * UNCONDITIONAL RESTORE (coordinator gate finding, 2026-08-22): recovery
+ * writes every snapshotted byte back verbatim with no check that the
+ * CURRENT bytes at that namespace/key still match what the import
+ * actually wrote. Scoped narrow today because every known caller
+ * (`importExitBundle`'s own start-of-call recovery, and every fortress-open
+ * call site that constructs a masterKey+AuditLog for a real fortress) runs
+ * recovery before any OTHER writer has had a chance to touch the same
+ * locations - see `recoverInterruptedExitImportsOrThrow`'s doc comment for
+ * the call-site inventory and its stated bound. DEBT: if a future caller can
+ * legitimately write to a fortress BETWEEN a kill and the next recovery
+ * call (a currently-uncovered call site, or a second fortress-owning
+ * process), an unconditional restore can clobber a legitimate later write.
+ * The fix is to restore a location only where its current on-disk bytes
+ * still equal what the import wrote (a hash comparison before each
+ * `storage.write`/`storage.delete` in `restoreStorageSnapshots`), not
+ * implemented this PR - tracked as follow-up, not silently accepted.
  */
 interface ExitImportJournalRecord {
   import_id: string;
@@ -2182,6 +2201,130 @@ interface ExitImportJournalRecord {
   started_at: string;
   snapshots: SerializedStorageSnapshot[];
   namespace_snapshots: SerializedStorageNamespaceSnapshot[];
+}
+
+/**
+ * CONTRACT PIN (AGENTS.md rule 11 / coordinator gate MEDIUM-4, 2026-08-22):
+ * `recoverInterruptedExitImports` used to cast a bare `JSON.parse` result
+ * straight to `ExitImportJournalRecord` with no shape check - a journal
+ * entry that was itself corrupted (`{}`, a non-string `data` field, a
+ * missing array) threw a raw TypeError out of `recoverInterruptedExitImports`,
+ * which every fortress-open call site awaits directly, so a single
+ * malformed journal entry would have crashed fortress open entirely rather
+ * than routing to the named, fail-closed `failed` list. This is the ONE
+ * shape check every journal entry passes through before its bytes are
+ * trusted.
+ */
+function isWellFormedSerializedStorageSnapshot(
+  value: unknown
+): value is SerializedStorageSnapshot {
+  if (value === null || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  if (typeof record.namespace !== "string") return false;
+  if (typeof record.key !== "string") return false;
+  if (record.data !== null && typeof record.data !== "string") return false;
+  return true;
+}
+
+function isWellFormedSerializedStorageNamespaceSnapshot(
+  value: unknown
+): value is SerializedStorageNamespaceSnapshot {
+  if (value === null || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  if (typeof record.namespace !== "string") return false;
+  if (!Array.isArray(record.entries)) return false;
+  return record.entries.every(isWellFormedSerializedStorageSnapshot);
+}
+
+/**
+ * CONFINEMENT (Codex gate HIGH finding, 2026-08-22): a journal entry is
+ * only ever TRUSTED if every location it names is one `activationSnapshotLocations`
+ * could actually have produced for SOME import - the exit staging
+ * namespaces (keyed by import id or identity id), `_reputation` (keyed by
+ * attestation id), the two named `_meta` keys `StateStore.write` touches,
+ * or a non-reserved state namespace (the operator's own data, any key). A
+ * journal is read from disk and, short of a MAC, is only as trustworthy as
+ * the filesystem it lives on; without this confinement a corrupted or
+ * adversarially-written journal entry naming an UNRELATED sensitive
+ * location (`_meta/custody-envelope-v1`, an `_audit` entry) would be
+ * blindly "restored" by `restoreStorageSnapshots`, which is exactly the
+ * kind of write this recovery path must never be tricked into making.
+ *
+ * BOUND: this is a shape/membership check, not an authenticator - it
+ * proves a location is the RIGHT KIND of thing an import writes, not that
+ * THIS SPECIFIC journal is the one `importExitBundle` actually wrote. A
+ * MAC over the journal record, keyed from the master key (mirroring
+ * `state-store.ts`'s version-anchor MAC), would close that gap and is not
+ * implemented this PR - a filesystem-level write to `_exit_import_journal`
+ * already requires the same access an attacker would need to tamper with
+ * every other `_exit_*`/`_reputation`/state file this confinement allows
+ * touching anyway, so the bound is narrow, but it is a bound, not zero.
+ */
+function isLocationWithinImportWriteSet(
+  namespace: string,
+  key: string
+): boolean {
+  switch (namespace) {
+    case EXIT_PUBLIC_IDENTITIES_NAMESPACE:
+    case EXIT_POLICY_SETS_NAMESPACE:
+    case EXIT_AUDIT_RECEIPTS_NAMESPACE:
+    case EXIT_COMMITMENTS_NAMESPACE:
+    case EXIT_PLACEHOLDER_METADATA_NAMESPACE:
+    case EXIT_IMPORT_NAMESPACE:
+    case "_reputation":
+      return true;
+    case "_meta":
+      return (
+        key === STATE_ENVELOPE_PUBLIC_KEYS_KEY ||
+        key === STATE_ENVELOPE_VERSION_ANCHORS_KEY
+      );
+    default:
+      // Any OTHER reserved (underscore-prefixed) namespace is never a
+      // legitimate import-write location; a non-reserved namespace is the
+      // operator's own state and is always in bounds (any key).
+      return !isReservedNamespace(namespace);
+  }
+}
+
+function isWellFormedExitImportJournalRecord(
+  value: unknown
+): value is ExitImportJournalRecord {
+  if (value === null || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  if (typeof record.import_id !== "string") return false;
+  if (typeof record.identity_id !== "string") return false;
+  if (typeof record.started_at !== "string") return false;
+  if (!Array.isArray(record.snapshots)) return false;
+  if (!record.snapshots.every(isWellFormedSerializedStorageSnapshot)) return false;
+  if (
+    !record.snapshots.every((snapshot) =>
+      isLocationWithinImportWriteSet(
+        (snapshot as SerializedStorageSnapshot).namespace,
+        (snapshot as SerializedStorageSnapshot).key
+      )
+    )
+  ) {
+    return false;
+  }
+  if (!Array.isArray(record.namespace_snapshots)) return false;
+  if (
+    !record.namespace_snapshots.every(
+      isWellFormedSerializedStorageNamespaceSnapshot
+    )
+  ) {
+    return false;
+  }
+  if (
+    !record.namespace_snapshots.every((ns) => {
+      const namespaceSnapshot = ns as SerializedStorageNamespaceSnapshot;
+      return namespaceSnapshot.entries.every((entry) =>
+        isLocationWithinImportWriteSet(entry.namespace, entry.key)
+      );
+    })
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function serializeStorageSnapshot(
@@ -2218,13 +2361,12 @@ function deserializeStorageNamespaceSnapshot(
  * write below begins. A SIGKILL, power loss, or OOM never reaches the
  * `catch` block's in-memory `restoreStorageSnapshots` call a few lines
  * below in `importExitBundle`; without a durable copy of "what this import
- * is about to overwrite," a hard kill leaves the target half-applied with
- * no way to detect or undo it (Exit V2 drill D1, F1: observed 3/3, a killed
- * import left 6 staged `_exit_*` artifacts and 1-115 of 120 reputation
- * attestations behind). Idempotent per `importId`: a caller that retries
- * the exact same import after a kill overwrites its own leftover record
- * with an equivalent one (recovered first, by `recoverInterruptedExitImports`
- * at the top of `importExitBundle`, before this write ever runs again).
+ * is about to overwrite," a hard kill would leave the target half-applied
+ * with no way to detect or undo it. Idempotent per `importId`: a caller
+ * that retries the exact same import after a kill overwrites its own
+ * leftover record with an equivalent one (recovered first, by
+ * `recoverInterruptedExitImportsOrThrow` at the top of `importExitBundle`,
+ * before this write ever runs again).
  */
 async function writeImportJournal(
   storage: StorageBackend,
@@ -2246,12 +2388,32 @@ async function writeImportJournal(
   await stageArtifact(storage, EXIT_IMPORT_JOURNAL_NAMESPACE, importId, record);
 }
 
-/** Clears the journal entry once activation OR rollback has fully finished. */
+/**
+ * Clears the journal entry once activation OR rollback has fully finished.
+ *
+ * INVARIANT (Codex gate HIGH finding, 2026-08-22): `secureOverwrite: false`
+ * is deliberate. The default filesystem delete overwrites the file with
+ * random bytes across three fsync'd passes BEFORE unlinking it; a kill
+ * mid-overwrite leaves the journal as neither valid JSON nor gone - a
+ * corrupt file `recoverInterruptedExitImports` can no longer parse, so a
+ * fully-resolved import (data already correctly restored or promoted)
+ * would read as a permanently stuck `failed` entry with nothing left to
+ * actually recover. Skipping the overwrite makes this a single `unlink`
+ * syscall: from a crash-consistency standpoint it either fully happens or
+ * it doesn't, so the file is always either the last complete journal or
+ * gone entirely; there is no third, corrupted state. This is safe because
+ * a journal entry's `data` fields are exact copies of bytes this function's
+ * caller already read from the fortress's own encrypted-at-rest storage
+ * (state entries, reputation attestations, staged identity/policy
+ * artifacts are all ciphertext on disk before the journal ever copies
+ * them) - the journal introduces no NEW plaintext secret exposure that
+ * secure overwrite-on-delete would otherwise protect.
+ */
 async function deleteImportJournal(
   storage: StorageBackend,
   importId: string
 ): Promise<void> {
-  await storage.delete(EXIT_IMPORT_JOURNAL_NAMESPACE, importId);
+  await storage.delete(EXIT_IMPORT_JOURNAL_NAMESPACE, importId, false);
 }
 
 /**
@@ -2277,16 +2439,86 @@ export async function recoverInterruptedExitImports(
   auditLog: AuditLog
 ): Promise<{ recovered: number; failed: string[] }> {
   const entries = await storage.list(EXIT_IMPORT_JOURNAL_NAMESPACE);
+  // INVARIANT (Codex gate HIGH finding, 2026-08-22): recovery assumes AT
+  // MOST ONE journal entry exists at a time - importExitBundle's own
+  // top-of-function recovery call drains any leftover journal before it
+  // ever writes a new one, so under normal sequential use there is never
+  // more than one. More than one can only mean either a genuine
+  // concurrent-import race (two importExitBundle calls against the same
+  // fortress storage overlapping their own recovery-then-write windows) or
+  // an already-inconsistent fortress. Replaying multiple journals in
+  // whatever order `list()` happens to return them is ORDER-DEPENDENT: two
+  // journals can snapshot overlapping locations, and restoring them in one
+  // order produces a different final byte-for-byte result than the other
+  // order. Refuse ALL of them via `failed` (which `recoverInterruptedExitImportsOrThrow`
+  // turns into a hard stop) rather than silently pick an order and risk
+  // producing a result no operator asked for.
+  if (entries.length > 1) {
+    return { recovered: 0, failed: entries.map((entry) => entry.key) };
+  }
   let recovered = 0;
   const failed: string[] = [];
   for (const entry of entries) {
     const raw = await storage.read(EXIT_IMPORT_JOURNAL_NAMESPACE, entry.key);
     if (!raw) continue;
-    let record: ExitImportJournalRecord;
+    let parsed: unknown;
     try {
-      record = JSON.parse(bytesToString(raw)) as ExitImportJournalRecord;
+      parsed = JSON.parse(bytesToString(raw));
     } catch {
       failed.push(entry.key);
+      continue;
+    }
+    // MEDIUM-4 (coordinator gate, 2026-08-22): a malformed journal entry
+    // (`{}`, a non-string `data`, a missing array) must route to `failed`
+    // like any other unrecoverable entry, never throw a raw TypeError out
+    // of this function - every caller awaits it directly at fortress open.
+    if (!isWellFormedExitImportJournalRecord(parsed)) {
+      failed.push(entry.key);
+      continue;
+    }
+    const record = parsed;
+    // INVARIANT (kill-during-promote-and-delete case, coordinator gate,
+    // 2026-08-22): a kill AFTER the final `activated_at`-stamped import
+    // record is written but BEFORE this journal entry is deleted leaves a
+    // journal whose import ALREADY SUCCEEDED - restoring its snapshot would
+    // silently revert a fully successful, already-promoted import back to
+    // its pre-image, which is worse than the half-applied case this
+    // function exists to fix. Check the import's OWN completion record
+    // first: if it exists and carries `activated_at`, this import is done;
+    // the journal is a harmless stale leftover and is deleted, never
+    // replayed.
+    const importRecordRaw = await storage.read(
+      EXIT_IMPORT_NAMESPACE,
+      record.import_id
+    );
+    let alreadyActivated = false;
+    if (importRecordRaw) {
+      try {
+        const importRecordParsed = JSON.parse(
+          bytesToString(importRecordRaw)
+        ) as Record<string, unknown>;
+        alreadyActivated =
+          importRecordParsed !== null &&
+          typeof importRecordParsed === "object" &&
+          typeof importRecordParsed.activated_at === "string";
+      } catch {
+        // An unparseable import record is handled by the normal path below
+        // (attempt the restore); it is not evidence of completion.
+      }
+    }
+    if (alreadyActivated) {
+      await deleteImportJournal(storage, entry.key);
+      recovered++;
+      void auditLog.append(
+        "l1",
+        "exit_bundle_stale_journal_cleared",
+        record.identity_id,
+        {
+          import_id: record.import_id,
+          started_at: record.started_at,
+          reason: "import already activated; journal was a stale leftover",
+        }
+      );
       continue;
     }
     const snapshots = record.snapshots.map(deserializeStorageSnapshot);
@@ -2320,6 +2552,65 @@ export async function recoverInterruptedExitImports(
     await auditLog.flush();
   }
   return { recovered, failed };
+}
+
+/**
+ * MEDIUM-3 (coordinator gate, 2026-08-22): `recoverInterruptedExitImports`
+ * returning `{ failed }` is not enough on its own - a caller that awaits it
+ * and discards the result treats a PARTIAL or unparseable rollback exactly
+ * like "nothing to recover," then proceeds to read and write the
+ * half-applied target as though it were the legitimate pre-import state
+ * (AGENTS.md rule 5: never silently degrade to a less-secure behavior on
+ * error). This wrapper is the ONE place that turns `failed.length > 0` into
+ * a hard stop, so the fail-closed behavior cannot drift between callers.
+ *
+ * Call-site inventory (HIGH-2, coordinator gate, 2026-08-22): every place
+ * that constructs BOTH a real fortress `FilesystemStorage` AND derives its
+ * master key (so an `AuditLog` exists to log the recovery) now routes
+ * through this wrapper before any other store reads or writes:
+ * `importExitBundle` (top of function), `exit/cli.ts` `openExitContext`
+ * (every `sanctuary exit` subcommand), `index.ts` `createSanctuaryServer`
+ * (the MCP composition root), `dashboard-standalone.ts`, `cli/distress.ts`,
+ * `cli/anomaly.ts` (every verb that derives a master key), and
+ * `cli/transparency.ts` (every verb that derives a master key). See the
+ * call sites themselves for the exact line; this comment is the map, not a
+ * substitute for reading them.
+ *
+ * STATED BOUND: dozens of other narrower CLI verbs across the codebase
+ * (`cli/castle-wall.ts`, `cli/sentinel.ts`, `cli/policy.ts`,
+ * `cli/checkpoint.ts`, `cli/custody-unlock.ts`, `cli/restore-attest.ts`,
+ * and others) also construct a fortress `FilesystemStorage` directly and
+ * are NOT wired to this wrapper. The specific data-loss window the gate
+ * named - a killed exit-import surviving into normal operation until a
+ * LATER `exit verify`/`exit import` silently reconciles it - is closed at
+ * the call sites listed above; the remaining CLI verbs are a narrower,
+ * pre-existing exposure (each already had its own independent risk profile
+ * before this PR) and are tracked as follow-up, not fixed here.
+ * `cli/doctor.ts`'s custody-factor check is a DELIBERATE exception: it is
+ * documented read-only and never derives a master key by design
+ * (`checkCustodyFactors`'s own doc comment), so it has no `AuditLog` to
+ * call this wrapper with; recovering there would mean unlocking the
+ * fortress specifically to check whether it needs unlocking, which is a
+ * larger behavior change than this fix round scopes.
+ */
+export async function recoverInterruptedExitImportsOrThrow(
+  storage: StorageBackend,
+  auditLog: AuditLog
+): Promise<{ recovered: number }> {
+  const result = await recoverInterruptedExitImports(storage, auditLog);
+  if (result.failed.length > 0) {
+    throw new ExitBundleImportError(
+      "INTERRUPTED_IMPORT_RECOVERY_FAILED",
+      `${result.failed.length} interrupted exit-bundle import journal entr${
+        result.failed.length === 1 ? "y" : "ies"
+      } could not be safely rolled back (journal entries: ` +
+        `${result.failed.join(", ")}). Refusing to proceed against this ` +
+        "fortress while it may hold half-applied exit-import state. Do not " +
+        "run further Sanctuary operations against this storage path until " +
+        "this is resolved."
+    );
+  }
+  return { recovered: result.recovered };
 }
 
 function activationSnapshotLocations(
@@ -2370,6 +2661,30 @@ function activationSnapshotLocations(
       continue;
     }
     locations.push({ namespace: item.namespace, key: item.key });
+  }
+
+  // PRECISE `_meta` LOCATIONS (coordinator gate HIGH finding, 2026-08-22):
+  // `StateStore.write` (called per entry by `rekeyState` below) touches
+  // exactly these two `_meta` keys - the writer-public-key registry and the
+  // version-anchor rollback floor - and nothing else in `_meta`. Naming them
+  // precisely here, instead of snapshotting the WHOLE `_meta` namespace,
+  // means restore only ever touches bytes THIS import could have written:
+  // no unrelated `_meta` key written by anything else, at any point between
+  // this import and a later recovery replay, is ever deleted or overwritten.
+  // A whole-namespace snapshot could not make that guarantee: its restore
+  // deletes every key present at restore time that was absent from the
+  // snapshot, which is any unrelated write, not just this import's own.
+  // Snapshotting these two keys is harmless even when the import carries no
+  // state entries or `rekeyState` never runs (a snapshot of an unwritten
+  // location is a no-op restore). If `StateStore.write` starts touching a
+  // different or additional `_meta` key, update this list in the same
+  // change (see the "must match" pin on the import above).
+  if (encryptedState) {
+    locations.push({ namespace: "_meta", key: STATE_ENVELOPE_PUBLIC_KEYS_KEY });
+    locations.push({
+      namespace: "_meta",
+      key: STATE_ENVELOPE_VERSION_ANCHORS_KEY,
+    });
   }
 
   return locations;
@@ -2622,8 +2937,10 @@ export async function importExitBundle(
   // prior hard kill on THIS fortress before doing anything else - including
   // before `conflictReport` below runs, so a killed import of the SAME
   // importId does not read as a staged-artifact conflict against a target
-  // that recovery is about to clean up anyway.
-  await recoverInterruptedExitImports(opts.storage, opts.auditLog);
+  // that recovery is about to clean up anyway. MEDIUM-3 (coordinator gate):
+  // `...OrThrow` so a partial/unparseable rollback stops this import
+  // instead of silently proceeding against a possibly half-applied target.
+  await recoverInterruptedExitImportsOrThrow(opts.storage, opts.auditLog);
   // The IMPORT path ALWAYS verifies strictly: there is no accept-unverifiable
   // relaxation here regardless of `activate`. An unverifiable-signer or forged
   // attestation fails the bundle whether the caller is doing a dry-run
@@ -3129,9 +3446,14 @@ export async function importExitBundle(
       placeholderMetadata ?? null
     )
   );
-  const activationNamespaceSnapshots = [
-    await snapshotStorageNamespace(opts.storage, "_meta"),
-  ];
+  // (coordinator gate HIGH finding, 2026-08-22): NOT a namespace-wide
+  // `_meta` snapshot any more - see the "PRECISE `_meta` LOCATIONS" comment
+  // in `activationSnapshotLocations` above for why. `activationSnapshots`
+  // already carries the two precise `_meta` locations this import can
+  // touch; there is nothing left for a namespace-level snapshot to add, and
+  // keeping it empty is what removes the "delete every unrelated key
+  // written since" imprecision from restore.
+  const activationNamespaceSnapshots: StorageNamespaceSnapshot[] = [];
   // F1 (Exit V2 drill D1): make the pre-import snapshot durable BEFORE the
   // `try` block below writes anything. See `writeImportJournal`'s doc
   // comment - this is what lets a hard-killed import be rolled back on the
@@ -3226,12 +3548,11 @@ export async function importExitBundle(
         key: importId,
       });
     }
-    // F1 (Exit V2 drill D1): this record used to be stamped `activated_at`
-    // HERE, before the reputation import or state re-key had run - so a
-    // hard kill during either left an `_exit_imports` record on disk
-    // falsely claiming the import had completed. Stage an `in_progress`
-    // interim record now; the `activated_at`-stamped FINAL record is
-    // written LAST, after both of those have actually succeeded, below.
+    // F1: stage an `in_progress` interim record here, BEFORE the
+    // reputation import or state re-key run; the `activated_at`-stamped
+    // FINAL record is written LAST, after both have actually succeeded,
+    // below - so the record's own claim of completion is always accurate,
+    // including if this import is interrupted between the two writes.
     await stageArtifact(opts.storage, EXIT_IMPORT_NAMESPACE, importId, {
       manifest: manifest.body,
       verified_at: verification.verified_at,

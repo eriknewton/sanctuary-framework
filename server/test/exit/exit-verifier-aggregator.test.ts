@@ -1108,6 +1108,146 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
     );
   });
 
+  // ---- Coordinator gate HIGH finding (2026-08-22): the crypto-payload
+  // ---- fields decrypt()/the integrity check read, which the container +
+  // ---- element-shape checks above did NOT cover before this fix. Each of
+  // ---- these fixtures removes exactly one such field; before the fix a
+  // ---- missing `payload.iv` reached a raw TypeError inside rekeyState's
+  // ---- bare per-entry catch (swallowed, not a crash out of importExitBundle,
+  // ---- but still a "verify PASS, import refuses after staging" gap this
+  // ---- predicate now closes at the SAME pre-staging gate as F3/F4).
+
+  it("an entries element missing `entry.integrity_hash` fails verify closed, and import refuses with a NAMED error, never a crash", async () => {
+    const source = await makeSource("aggregator-cryptofield-hash-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const { integrity_hash: _hash, ...entryWithoutHash } = entries[0]!.entry as Record<string, unknown>;
+      artifact.entries = [{ ...entries[0]!, entry: entryWithoutHash }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
+  it("an entries element missing `entry.payload.v` fails verify closed, and import refuses with a NAMED error, never a crash", async () => {
+    const source = await makeSource("aggregator-cryptofield-v-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      const { v: _v, ...payloadWithoutV } = entry.payload as Record<string, unknown>;
+      artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload: payloadWithoutV } }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
+  it("an entries element missing `entry.payload.alg` fails verify closed, and import refuses with a NAMED error, never a crash", async () => {
+    const source = await makeSource("aggregator-cryptofield-alg-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      const { alg: _alg, ...payloadWithoutAlg } = entry.payload as Record<string, unknown>;
+      artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload: payloadWithoutAlg } }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
+  it("an entries element missing `entry.payload.iv` fails verify closed, and import refuses with a NAMED error, never a crash (a raw TypeError before this fix)", async () => {
+    const source = await makeSource("aggregator-cryptofield-iv-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      const { iv: _iv, ...payloadWithoutIv } = entry.payload as Record<string, unknown>;
+      artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload: payloadWithoutIv } }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
   // ---- F3/F4 (Exit V2 drill D1, 2026-08-22): two structural checks that
   // ---- used to be absent from BOTH verify and import (F3) or present only
   // ---- in import, AFTER staging (F4). Both now route through the same
@@ -1203,6 +1343,18 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
   });
 
   it("checkEncryptedStateStructure: total_keys_mismatch and reserved_namespace_entry are computed directly, not folded into entries_malformed_elements", () => {
+    // A complete, otherwise well-formed entry (every field
+    // isWellFormedExitStateEntryElement now checks, coordinator gate HIGH
+    // finding 2026-08-22: integrity_hash/payload.v/alg/iv), so these two
+    // assertions exercise ONLY the total_keys/reserved-namespace checks,
+    // not the element-shape check.
+    const wellFormedEntry = {
+      kid: "kid",
+      sig: "sig",
+      integrity_hash: "hash",
+      payload: { v: 1, alg: "aes-256-gcm", iv: "iv", ct: "ct" },
+      metadata: {},
+    };
     expect(
       checkEncryptedStateStructure({ entries: [], total_keys: 1 })
     ).toMatchObject({ ok: false, problem: "total_keys_mismatch" });
@@ -1215,17 +1367,18 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
           {
             namespace: "_reserved",
             key: "k",
-            entry: {
-              kid: "kid",
-              sig: "sig",
-              payload: { ct: "ct" },
-              metadata: {},
-            },
+            entry: wellFormedEntry,
           },
         ],
         total_keys: 1,
       })
     ).toMatchObject({ ok: false, problem: "reserved_namespace_entry" });
+    expect(
+      checkEncryptedStateStructure({
+        entries: [{ namespace: "ns", key: "k", entry: wellFormedEntry }],
+        total_keys: 1,
+      })
+    ).toMatchObject({ ok: true });
   });
 
   // ---- Artifact 1's OTHER mutation-provable half: the fail-closed default ---

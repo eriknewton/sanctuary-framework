@@ -61,8 +61,16 @@ const STATE_ENVELOPE_SCHEMA_VERSION = 3;
 const LEGACY_STATE_ENVELOPE_SIGNING_DOMAIN = "sanctuary.state-envelope.v1\n";
 // Must match STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX in core/signing-domains.ts (identity_sign refusal list).
 const STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX = "sanctuary.state-envelope.v";
-const STATE_ENVELOPE_PUBLIC_KEYS_KEY = "state-envelope-public-keys-v1";
-const STATE_ENVELOPE_VERSION_ANCHORS_KEY = "state-envelope-version-anchors-v1";
+// CONTRACT PIN (coordinator gate, 2026-08-22): exported so
+// server/src/exit/bundle.ts can snapshot these two exact `_meta` keys by
+// PRECISE location before an exit-import's state re-key runs, instead of a
+// namespace-wide `_meta` snapshot (which deletes any unrelated `_meta` key
+// written between the snapshot and a later replay - see
+// `activationSnapshotLocations` in bundle.ts). If `write()` below starts
+// touching a different or additional `_meta` key, update that call site in
+// the SAME change.
+export const STATE_ENVELOPE_PUBLIC_KEYS_KEY = "state-envelope-public-keys-v1";
+export const STATE_ENVELOPE_VERSION_ANCHORS_KEY = "state-envelope-version-anchors-v1";
 // F1: domain-separated MAC over the version-anchor record (the rollback floor),
 // which is stored plaintext. Without authentication a filesystem adversary could
 // silently EDIT/LOWER a key's floor to defeat the #391 leapfrog gate; the MAC

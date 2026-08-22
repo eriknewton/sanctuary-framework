@@ -48,6 +48,7 @@ import {
 import { ClassifierStateStore } from "../anomaly-detection/classifier-state-store.js";
 import { ANOMALY_SENTINEL_ID_PREFIX } from "../anomaly-detection/types.js";
 import { AuditLog } from "../operational/audit-log.js";
+import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
 import { flagValue } from "./argv.js";
 
 export interface AnomalyArgs {
@@ -247,6 +248,10 @@ async function cmdSubscribe(
   const storage = new FilesystemStorage(`${storagePath}/state`);
   const fortressId = fortressIdFromStoragePath(storagePath);
   const auditLog = new AuditLog(storage, masterKey);
+  // HIGH-2 (coordinator gate, 2026-08-22): roll back any exit-import left
+  // interrupted by a prior hard kill before this verb touches storage
+  // further. See index.ts's matching call site for the full rationale.
+  await recoverInterruptedExitImportsOrThrow(storage, auditLog);
   await auditLog.append("l2", "anomaly.subscribe", `fortress:${fortressId}`, {
     detector_id: detectorId,
     classifier_id: classifierId,
@@ -293,6 +298,8 @@ async function cmdUnsubscribe(
   const storage = new FilesystemStorage(`${storagePath}/state`);
   const fortressId = fortressIdFromStoragePath(storagePath);
   const auditLog = new AuditLog(storage, masterKey);
+  // HIGH-2 (coordinator gate, 2026-08-22): see cmdSubscribe's matching call.
+  await recoverInterruptedExitImportsOrThrow(storage, auditLog);
   await auditLog.append("l2", "anomaly.unsubscribe", `fortress:${fortressId}`, {
     detector_id: detectorId,
     classifier_id: classifierId,

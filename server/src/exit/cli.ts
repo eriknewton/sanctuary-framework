@@ -23,7 +23,7 @@ import {
   exitBundleManifestShape,
   ExitBundleImportError,
   ExitBundleStateImportIncompleteError,
-  recoverInterruptedExitImports,
+  recoverInterruptedExitImportsOrThrow,
   type ImportExitBundleResult,
 } from "./bundle.js";
 import type {
@@ -195,7 +195,10 @@ async function openExitContext(
   // `exit export` after a kill would otherwise read a half-applied target
   // with no warning). Roll it back here too, before any subcommand's own
   // work runs.
-  await recoverInterruptedExitImports(storage, auditLog);
+  // MEDIUM-3 (coordinator gate, 2026-08-22): `...OrThrow` so a
+  // partial/unparseable rollback stops fortress open instead of
+  // silently proceeding against a possibly half-applied target.
+  await recoverInterruptedExitImportsOrThrow(storage, auditLog);
 
   return {
     storagePath: config.storage_path,

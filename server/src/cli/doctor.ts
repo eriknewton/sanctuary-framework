@@ -570,6 +570,16 @@ async function resolveMasterKeyIfAvailable(
   // Doctor is a read-only diagnostic: an unresolvable master degrades the
   // identity check (null) instead of aborting the run. Recovery key keeps
   // precedence over passphrase, matching the legacy resolution order.
+  //
+  // STATED BOUND (HIGH-2, coordinator gate, 2026-08-22): this file does NOT
+  // call `recoverInterruptedExitImportsOrThrow` (server/src/exit/bundle.ts),
+  // even where a master key is available. Every check in this file,
+  // including this one, is deliberately read-only and never-aborting by
+  // design (the whole point of `doctor` is to diagnose a fortress that may
+  // already be broken); recovery is a WRITE that can also THROW, both of
+  // which contradict that contract. A fortress with a half-applied
+  // exit-import is still diagnosable read-only by every check here; it
+  // just is not RECOVERED by running `doctor`.
   try {
     return await resolveCliMasterKey(storage, {
       ...(env.SANCTUARY_RECOVERY_KEY !== undefined
