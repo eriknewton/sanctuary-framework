@@ -1,3 +1,4 @@
+// fail-before-exempt: this PR's only edit here is a fixture consistency fix (total_keys=0 on the "genuinely empty bundle" case, F3/Exit V2 drill D1 2026-08-22) that holds under both pre-fix and post-fix source; the new F3/F4 behavior itself is covered fail-before by test/exit/exit-verifier-aggregator.test.ts and test/cli/import-state-warning.test.ts
 /**
  * `sanctuary exit inspect` (exit-cluster item A5, 2026-08-05).
  *
