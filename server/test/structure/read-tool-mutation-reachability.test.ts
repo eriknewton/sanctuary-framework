@@ -70,6 +70,7 @@ import {
   analyzeReadToolMutationReachability,
   createCalleeResolver,
   sinksForTool,
+  walkForSinks,
 } from "./read-tool-mutation-reachability.js";
 
 interface ReviewedSite {
@@ -1037,6 +1038,267 @@ function resolveLaunderingFixtures(): Map<string, string[]> {
   return byFile;
 }
 
+// ---------------------------------------------------------------------------
+// IMPLICIT-INVOCATION FIXTURES: the permanent regression and negative-control
+// corpus for the three implicit invocation forms closed by GATE-A-R5.
+//
+// Each fixture is a self-contained TypeScript module whose `handler` function
+// contains one of three implicit invocation forms — getter read, setter
+// assignment, for-of iteration — over a source-local declaration whose body
+// calls a `node:child_process` or `node:fs` entry point. The test walks the
+// `handler` body using the same chokepoint the analyzer uses, descending into
+// implicitly-invoked bodies and classifying calls inside them through the
+// shipping resolver. The fixture proves the form IS walked (regressions) or IS
+// NOT falsely walked (negative controls).
+//
+// WHAT IS CLOSED IS EXACTLY THREE FORMS: getter read, simple setter
+// assignment, and synchronous source-local for-of. Implicit-invocation
+// coverage remains partial; remaining bounds resolve privately under
+// ABC-READCLASS-01 / GATE-A-R5.
+// ---------------------------------------------------------------------------
+
+interface ImplicitInvocationFixture {
+  /** The implicit invocation form under test. */
+  readonly what: string;
+  /** Sink primitives the walk must report, as a sorted set. */
+  readonly expect: readonly string[];
+  /** The module containing a `handler` function with the implicit form. */
+  readonly code: string;
+}
+
+const IMPLICIT_INVOCATION_FIXTURES: readonly ImplicitInvocationFixture[] = [
+  // ---- regressions: each must report child_process.execSync ----------------
+  {
+    what: "a getter whose body spawns a subprocess (GATE-A-R5 form 1)",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+class Probe {
+  get status(): string { execSync("id"); return "ok"; }
+}
+export function handler(): string {
+  return new Probe().status;
+}
+`,
+  },
+  {
+    what: "a setter whose body spawns a subprocess (GATE-A-R5 form 2)",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+class Target {
+  set value(v: string) { execSync(v); }
+}
+export function handler(v: string): void {
+  new Target().value = v;
+}
+`,
+  },
+  {
+    what: "a for-of loop invoking a source-local [Symbol.iterator] that spawns a subprocess (GATE-A-R5 form 3)",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+class Items {
+  *[Symbol.iterator](): Generator<string> {
+    execSync("id");
+    yield "done";
+  }
+}
+export function handler(): void {
+  for (const item of new Items()) { void item; }
+}
+`,
+  },
+  // ---- negative controls: must stay clean -----------------------------------
+  //
+  // These fixtures prove that the resolver does NOT manufacture a mutation sink
+  // for the form under test. They do NOT prove the form is reached at all —
+  // that proof comes from the positive controls (the regression fixtures above),
+  // which must report their primitive. Both directions are required: a resolver
+  // that reported nothing for everything would satisfy every negative control
+  // while being entirely inert; a resolver that reported everything would
+  // satisfy every positive control while being entirely wrong.
+  {
+    what: "a getter that reads only (must stay clean)",
+    expect: [],
+    code: `
+import { readFileSync } from "node:fs";
+class Reader {
+  get content(): string { return readFileSync("/dev/null", "utf8"); }
+}
+export function handler(): string {
+  return new Reader().content;
+}
+`,
+  },
+  {
+    what: "a setter that reads only (must stay clean)",
+    expect: [],
+    code: `
+import { readFileSync } from "node:fs";
+class Writer {
+  private _data = "";
+  set data(v: string) { this._data = readFileSync("/dev/null", "utf8"); }
+}
+export function handler(): void {
+  new Writer().data = "x";
+}
+`,
+  },
+  {
+    what: "a for-of loop over a source-local iterator that reads only (must stay clean)",
+    expect: [],
+    code: `
+import { readFileSync } from "node:fs";
+class SafeItems {
+  *[Symbol.iterator](): Generator<string> {
+    yield readFileSync("/dev/null", "utf8");
+  }
+}
+export function handler(): void {
+  for (const item of new SafeItems()) { void item; }
+}
+`,
+  },
+  {
+    what: "an ordinary property read, not a getter (must stay clean)",
+    expect: [],
+    code: `
+class Plain {
+  status = "ok";
+}
+export function handler(): string {
+  return new Plain().status;
+}
+`,
+  },
+  {
+    what: "an ordinary property write, not a setter (must stay clean)",
+    expect: [],
+    code: `
+class Plain {
+  value = "";
+}
+export function handler(): void {
+  new Plain().value = "x";
+}
+`,
+  },
+  {
+    // Paired getter/setter: simple assignment invokes the setter only, not the getter.
+    // Verifies that `resolveImplicitInvocations` correctly excludes getter lookup
+    // when the property access is the assignment target.
+    what: "a paired getter (calls execSync) with read-only setter — simple assignment must stay clean",
+    expect: [],
+    code: `
+import { execSync } from "node:child_process";
+class Accessor {
+  private _v = "";
+  get value(): string { execSync("id"); return this._v; }
+  set value(v: string) { this._v = v; }
+}
+export function handler(v: string): void {
+  new Accessor().value = v;
+}
+`,
+  },
+];
+
+/**
+ * Walk each implicit-invocation fixture's `handler` function, descending into
+ * implicitly-invoked bodies through the same chokepoint the analyzer uses and
+ * classifying calls inside them through the shipping resolver.
+ *
+ * The fixtures use the same overlay-on-real-host technique as the laundering
+ * corpus, so `node:child_process` and `node:fs` resolve to the real
+ * `@types/node` declaration files.
+ */
+function resolveImplicitInvocationFixtures(): Map<string, string[]> {
+  const options: ts.CompilerOptions = {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    lib: ["lib.es2022.d.ts"],
+    strict: true,
+    noEmit: true,
+    skipLibCheck: true,
+  };
+  const virtual = new Map<string, string>();
+  const fileNames: string[] = [];
+  // Associate each virtual file name directly with its fixture's `what` string
+  // so callers can key results by `what` and not by Map-insertion position.
+  const fileToWhat = new Map<string, string>();
+  IMPLICIT_INVOCATION_FIXTURES.forEach((fixture, index) => {
+    const fileName = join(TEST_STRUCTURE_DIR, `implicit-${index}-main.virtual.ts`);
+    virtual.set(fileName, fixture.code);
+    fileNames.push(fileName);
+    fileToWhat.set(fileName, fixture.what);
+  });
+
+  const host = ts.createCompilerHost(options, true);
+  const baseGetSourceFile = host.getSourceFile.bind(host);
+  const baseFileExists = host.fileExists.bind(host);
+  const baseReadFile = host.readFile.bind(host);
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreate) => {
+    const text = virtual.get(fileName);
+    if (text !== undefined) {
+      return ts.createSourceFile(fileName, text, languageVersion, true, ts.ScriptKind.TS);
+    }
+    return baseGetSourceFile(fileName, languageVersion, onError, shouldCreate);
+  };
+  host.fileExists = (fileName) => virtual.has(fileName) || baseFileExists(fileName);
+  host.readFile = (fileName) => virtual.get(fileName) ?? baseReadFile(fileName);
+  host.getCurrentDirectory = () => FIXTURE_SERVER_DIR;
+
+  const program = ts.createProgram(fileNames, options, host);
+  const checker = program.getTypeChecker();
+  const resolver = createCalleeResolver(checker, () => []);
+
+  const byFile = new Map<string, string[]>();
+  for (const fileName of fileNames) {
+    const source = program.getSourceFile(fileName);
+    if (source === undefined) throw new Error(`fixture did not load: ${fileName}`);
+
+    // Find the `handler` function — the entry point the production walk starts
+    // from. Walking it through `walkForSinks` (the same primitive `sinksFor`
+    // uses) means the test cannot stay green if the production walk changes
+    // how it descends into implicit invocation bodies or integrates them.
+    let handlerNode: ts.Node | undefined;
+    const findHandler = (node: ts.Node): void => {
+      if (
+        ts.isFunctionDeclaration(node) &&
+        node.name?.text === "handler" &&
+        node.body !== undefined
+      ) {
+        handlerNode = node;
+        return;
+      }
+      ts.forEachChild(node, findHandler);
+    };
+    findHandler(source);
+    if (handlerNode === undefined) throw new Error(`fixture has no handler function: ${fileName}`);
+
+    const found: string[] = [];
+    const walked = new Set<string>();
+    walkForSinks(
+      handlerNode,
+      checker,
+      resolver,
+      TEST_STRUCTURE_DIR,
+      (_node, primitive) => { found.push(primitive); },
+      walked,
+      0,
+      ["handler"],
+      [],
+    );
+    const what = fileToWhat.get(fileName);
+    if (what === undefined) throw new Error(`no fixture registered for: ${fileName}`);
+    byFile.set(what, [...new Set(found)].sort());
+  }
+  return byFile;
+}
+
 describe("read-classified MCP tools and durable-state mutation", () => {
   const report = analyzeReadToolMutationReachability();
 
@@ -1217,6 +1479,38 @@ describe("read-classified MCP tools and durable-state mutation", () => {
     // iterating would pass on the fixtures it never reached.
     expect(actual).toEqual(expected);
     expect(Object.keys(actual)).toHaveLength(LAUNDERING_FIXTURES.length);
+  });
+
+  it("walks implicit invocations: getter reads, setter assignments, and iterator protocol", () => {
+    // GATE-A-R5 regression and negative-control corpus. Three implicit
+    // invocation forms can reach a subprocess while a call-expression-only
+    // walk reports nothing: (1) reading a property whose declaration is a
+    // getter, (2) assigning a property whose declaration is a setter, (3)
+    // consuming an iterable whose source-local [Symbol.iterator] is invoked
+    // by the iterator protocol.
+    //
+    // Each regression fixture contains a source-local accessor or iterator
+    // whose body calls `child_process.execSync` and a `handler` function
+    // that triggers the implicit invocation. Each negative control contains
+    // the same form over a read-only primitive or an ordinary (non-accessor)
+    // property and must report no sinks.
+    //
+    // WHAT IS CLOSED IS EXACTLY THREE FORMS: getter read, simple setter
+    // assignment, and synchronous source-local for-of. Implicit-invocation
+    // coverage remains partial; remaining bounds resolve privately under
+    // ABC-READCLASS-01 / GATE-A-R5.
+    // Results are keyed by `fixture.what` — no insertion-order coupling.
+    const resolved = resolveImplicitInvocationFixtures();
+    const actual: Record<string, readonly string[]> = {};
+    const expected: Record<string, readonly string[]> = {};
+    for (const [what, primitives] of resolved) {
+      actual[what] = primitives;
+    }
+    for (const fixture of IMPLICIT_INVOCATION_FIXTURES) {
+      expected[fixture.what] = [...fixture.expect].sort();
+    }
+    expect(actual).toEqual(expected);
+    expect(Object.keys(actual)).toHaveLength(IMPLICIT_INVOCATION_FIXTURES.length);
   });
 
   it("a descent refused by the depth ceiling does not claim the memo", () => {
