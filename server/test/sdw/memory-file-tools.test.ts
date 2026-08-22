@@ -333,6 +333,7 @@ describe("SDW memory file tools", () => {
         detail: expect.stringContaining("classifier"),
         detector: "labeled_recovery_key",
         line: 3,
+        reason_text: "looks like a labeled Sanctuary recovery key value",
       },
     ]);
     // F2: content never appears in the tool result.

@@ -1,18 +1,23 @@
 /**
- * Rung-1 F1/F2: the keyword-gated entropy check is scoped to a proximity
- * window (same line, or within a bounded character distance) instead of the
- * whole scanned text, and a classifier_reject names the detector and line.
+ * Rung-1 F1/F2 plus the 2026-08-22 fix-round: the keyword-gated entropy
+ * check is scoped to a proximity window (same line, or within a bounded
+ * Unicode code-point distance) instead of the whole scanned text; a
+ * classifier_reject names the detector and line; the keyword boundary
+ * matches UPPER_SNAKE_CASE=value shapes; the proximity check is O(candidates
+ * * log keywords), not O(candidates * keywords); and a bare, unexempted
+ * high-entropy value farther than the window from any keyword is still
+ * caught by a narrow file-scope fallback.
  *
  * Fixtures here are shaped after the real refusals in the 2026-08-22
  * round-trip drill (Review/Sanctuary/drill-rung1-roundtrip-2026-08-22/RESULTS.md,
- * finding F1): a keyword and an unrelated high-entropy identifier that
- * happen to share a file but are not part of the same secret. Every
- * must-fail case here is a shape write-gate.ts already refused before this
- * change; only the must-pass, far-apart shape is new.
+ * finding F1) and after the two independent adversarial gates that returned
+ * UNSOUND on the first Rung-1 F1/F2 PR (HIGH-A1: unbounded per-candidate
+ * keyword scan; HIGH-A2: `_`/`=`-adjacent keywords never matched; DESIGN:
+ * a bare far-apart secret had no backstop).
  */
 import { describe, expect, it } from "vitest";
-import { assertSdwClassifierCleanText } from "../../src/sdw/write-gate.js";
-import { SdwValidationError } from "../../src/sdw/errors.js";
+import { assertSdwClassifierCleanText, rung1ClassifierTestOnly } from "../../src/sdw/write-gate.js";
+import { SdwValidationError, type SdwClassifierDetector } from "../../src/sdw/errors.js";
 
 // 46 characters, mixed-case alnum, Shannon entropy ~5.2 bits/char (> the 4.5
 // keyword_gated_high_entropy threshold and > the 3.2 hex-only threshold),
@@ -37,7 +42,12 @@ function fillerParagraph(lineCount: number): string {
 
 function classifierResult(text: string): { readonly ok: true } | { readonly ok: false; readonly error: SdwValidationError } {
   try {
-    assertSdwClassifierCleanText(text);
+    // true: these fixtures represent harness memory-file text, matching how
+    // claude-code-file-adapter.ts/codex-memory-file-adapter.ts call this
+    // function (Rung-1 fix-round DESIGN scoping — see write-gate.ts's
+    // assertSdwClassifierCleanText doc comment for why this is opt-in, not
+    // the default, for every other SDW caller).
+    assertSdwClassifierCleanText(text, true);
     return { ok: true };
   } catch (error) {
     if (error instanceof SdwValidationError) return { ok: false, error };
@@ -49,8 +59,12 @@ describe("SDW classifier: keyword-entropy proximity window (Rung-1 F1)", () => {
   it("passes a keyword and an unrelated high-entropy identifier 40 lines apart", () => {
     // Heading on line 1, identifier on line 41: 40 lines apart, reproducing
     // the drill's MEMORY.md shape (a "token" mention and one unrelated
-    // high-entropy identifier, far apart in one large file).
-    const text = `# Token policy\n${fillerParagraph(39)}Unrelated identifier: ${FAR_IDENTIFIER}\n`;
+    // high-entropy identifier, far apart in one large file). Backticked, as
+    // the real corpus's one such identifier was (a file-path reference) —
+    // this is what keeps it a MUST-PASS after the fix-round's bare-credential
+    // fallback (see the DESIGN describe block below): an unbackticked bare
+    // value in the same position is a separate, intentional MUST-FAIL case.
+    const text = `# Token policy\n${fillerParagraph(39)}Unrelated identifier: \`${FAR_IDENTIFIER}\`\n`;
     expect(classifierResult(text)).toEqual({ ok: true });
   });
 
@@ -87,6 +101,130 @@ describe("SDW classifier: keyword-entropy proximity window (Rung-1 F1)", () => {
       expect(result.error.detector).toBe("keyword_gated_high_entropy");
       expect(result.error.line).toBe(1);
     }
+  });
+});
+
+describe("SDW classifier: keyword boundary catches UPPER_SNAKE_CASE=value shapes (Rung-1 fix-round HIGH-A2)", () => {
+  // `_` is a \w character, so a `\b...\b`-anchored keyword alternation never
+  // matched "PASSWORD" inside "DATABASE_PASSWORD" — there is no word
+  // boundary between two word characters — and F1 removed the whole-file
+  // scope that used to catch these by accident. This is exactly the
+  // UPPER_SNAKE_CASE=value shape most secret-bearing environment/config
+  // lines use.
+  const UPPER_SNAKE_CASE_FIXTURES: readonly { readonly label: string; readonly text: string; readonly value: string }[] = [
+    { label: "DATABASE_PASSWORD=", text: `DATABASE_PASSWORD=${SAME_LINE_IDENTIFIER}\n`, value: SAME_LINE_IDENTIFIER },
+    { label: "OPENAI_API_KEY=", text: `OPENAI_API_KEY=${FAR_IDENTIFIER}\n`, value: FAR_IDENTIFIER },
+    { label: "MY_SECRET_TOKEN=", text: `MY_SECRET_TOKEN=${LONG_LINE_IDENTIFIER}\n`, value: LONG_LINE_IDENTIFIER },
+  ];
+
+  it("refuses every UPPER_SNAKE_CASE=value shape, counted, with detector/line and no leaked content", () => {
+    const outcomes = UPPER_SNAKE_CASE_FIXTURES.map((fixture) => ({
+      fixture,
+      result: classifierResult(fixture.text),
+    }));
+    const refused = outcomes.filter((entry) => !entry.result.ok);
+    expect(refused).toHaveLength(UPPER_SNAKE_CASE_FIXTURES.length);
+    for (const entry of refused) {
+      const result = entry.result as { readonly ok: false; readonly error: SdwValidationError };
+      expect(result.error.detector, entry.fixture.label).toBe("keyword_gated_high_entropy");
+      expect(result.error.line, entry.fixture.label).toBe(1);
+      expect(result.error.message, entry.fixture.label).not.toContain(entry.fixture.value);
+    }
+  });
+
+  it("does not regress the #1217 must-pass prose set (no new false positives from the boundary widening)", () => {
+    // Re-verified here (not just cited) per the coordinator's fix-round
+    // instruction: none of these contain an UPPER_SNAKE_CASE-adjacent
+    // keyword, so the HIGH-A2 boundary widening must not flip them.
+    const stillPasses = [
+      "# Security notes\n\nThe principal policy and recovery key are stored offline.\n",
+      "Never paste a secret into an operator memory file.\n",
+    ].map((text) => classifierResult(text));
+    expect(stillPasses.filter((result) => result.ok)).toHaveLength(2);
+  });
+});
+
+describe("SDW classifier: proximity window measured in Unicode code points (Rung-1 fix-round, Codex MEDIUM)", () => {
+  // "secret" is 6 UTF-16 units / 6 code points, at index 0. Padding fills the
+  // rest of the gap and ends with exactly one newline, so the keyword and
+  // the candidate land on DIFFERENT lines — isolating the char-distance leg
+  // of the proximity check from the same-line leg, which would otherwise
+  // gate regardless of distance.
+  function paddingWithLineBreak(distanceFromKeywordStart: number): string {
+    const dotCount = distanceFromKeywordStart - "secret".length - 1;
+    return ".".repeat(dotCount) + "\n";
+  }
+
+  it("gates at exactly 256 code points apart (the window boundary, inclusive)", () => {
+    const text = `secret${paddingWithLineBreak(256)}${FAR_IDENTIFIER}\n`;
+    const result = classifierResult(text);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.detector).toBe("keyword_gated_high_entropy");
+  });
+
+  it("does not gate via the keyword check at 257 code points apart, one past the window", () => {
+    const text = `secret${paddingWithLineBreak(257)}${FAR_IDENTIFIER}\n`;
+    const result = classifierResult(text);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      // Still refused overall — but via the bare-credential fallback
+      // (DESIGN describe block below), never via the keyword gate: this is
+      // what proves the keyword-proximity boundary itself sits at 256, not
+      // "whatever the bare fallback also happens to catch".
+      expect(result.error.detector).toBe("bare_high_entropy_credential");
+    }
+  });
+
+  it("gates a keyword and candidate 256 CODE POINTS apart even when padded with non-BMP characters (505 UTF-16 units)", () => {
+    // .index from a regex match is a UTF-16 code-UNIT offset. A non-BMP
+    // character (here, an emoji) is ONE code point but TWO UTF-16 units, so
+    // 249 of them is 249 code points of padding but 498 UTF-16 units — total
+    // code-point distance from "secret" is 256 (6 + 1 newline + 249 emoji),
+    // but the raw UTF-16 index distance is 505. A UTF-16-based
+    // implementation would treat this as far outside the window and fall
+    // through to the bare-credential fallback, exactly like the 257-apart
+    // case above; a correct, code-point-based implementation gates it via
+    // the keyword check, same as the 256-apart ASCII case.
+    const emoji = "\u{1F600}"; // non-BMP: 2 UTF-16 code units, 1 code point.
+    const text = `secret\n${emoji.repeat(249)}${FAR_IDENTIFIER}\n`;
+    expect(text.indexOf(FAR_IDENTIFIER)).toBe(505); // sanity: UTF-16 distance really is 505, not 256.
+    const result = classifierResult(text);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.detector).toBe("keyword_gated_high_entropy");
+  });
+});
+
+describe("SDW classifier: bare high-entropy value far from any keyword (Rung-1 fix-round DESIGN, Codex HIGH-1)", () => {
+  // For a memory-file mirror the classifier is the ONLY backstop (both
+  // harness adapters tag mirrored files "user_content"), so a bare
+  // credential-shaped value with no keyword nearby needs a narrow file-scope
+  // fallback rather than passing outright. Measured against a read-only copy
+  // of a real 487-file Claude Code memory corpus (never modified, counts and
+  // classes only): before this fallback, 480 accepted / 7 refused, MEMORY.md
+  // accepted; after, IDENTICAL counts — the corpus's one bare candidate (a
+  // backticked file-path reference in MEMORY.md) is exempt, and the
+  // fallback adds zero refusals across the rest of the corpus.
+  it("refuses a bare unexempted high-entropy value with no keyword anywhere nearby", () => {
+    const text = `Some filler prose about weather.\n\n${FAR_IDENTIFIER}\n\nmore filler prose here.\n`;
+    const result = classifierResult(text);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.detector).toBe("bare_high_entropy_credential");
+      expect(result.error.message).not.toContain(FAR_IDENTIFIER);
+    }
+  });
+
+  const EXEMPT_FIXTURES: readonly { readonly label: string; readonly text: string }[] = [
+    { label: "backticked inline code span", text: `Some filler prose about weather.\n\n\`${FAR_IDENTIFIER}\`\n\nmore filler prose here.\n` },
+    { label: "markdown link target", text: `See [notes](${FAR_IDENTIFIER}) for details.\n` },
+    { label: "sha256: label", text: `content sha256:${FAR_IDENTIFIER} end\n` },
+    { label: "URL path segment", text: `see https://example.test/path/${FAR_IDENTIFIER} for details\n` },
+  ];
+
+  it("passes every exempted bare-value context, counted", () => {
+    const results = EXEMPT_FIXTURES.map((fixture) => ({ fixture, result: classifierResult(fixture.text) }));
+    const passed = results.filter((entry) => entry.result.ok);
+    expect(passed.map((entry) => entry.fixture.label)).toEqual(EXEMPT_FIXTURES.map((f) => f.label));
   });
 });
 
@@ -133,8 +271,8 @@ describe("SDW classifier: #1217 prose regression stays clean (Rung-1 F1 must not
       text: "Never paste a secret into an operator memory file.\n",
     },
     {
-      label: "keyword far from an unrelated candidate",
-      text: `# Token policy\n${fillerParagraph(39)}Unrelated identifier: ${FAR_IDENTIFIER}\n`,
+      label: "keyword far from an unrelated, backticked candidate",
+      text: `# Token policy\n${fillerParagraph(39)}Unrelated identifier: \`${FAR_IDENTIFIER}\`\n`,
     },
   ];
 
@@ -170,6 +308,129 @@ describe("SDW classifier: refusal names the detector and line, never the content
     if (result.ok) return;
     expect(result.error.detector).toBe("private_key_marker");
     expect(result.error.line).toBeUndefined();
-    expect(result.error.column).toBeUndefined();
+  });
+
+  // One fixture per detector id, asserted as a COUNT (not per-item booleans
+  // alone): a filter that silently dropped a row, or a detector id that
+  // stopped firing, would still read as "some passed" without this.
+  const ALL_DETECTOR_FIXTURES: readonly { readonly detector: SdwClassifierDetector; readonly text: string; readonly secret: string }[] = [
+    {
+      detector: "private_key_marker",
+      text: "-----BEGIN RSA PRIVATE KEY-----\nMIIBogIBAAJ\n-----END RSA PRIVATE KEY-----\n",
+      secret: "MIIBogIBAAJ",
+    },
+    {
+      detector: "private_key_marker_split",
+      text: "BEGIN some-other-text PRIVATE KEY\n",
+      secret: "some-other-text",
+    },
+    {
+      detector: "encoded_private_key",
+      text: `content hash reference: ${"302e020100300506032b657004220420" + "11".repeat(32)}\n`,
+      secret: "11".repeat(32),
+    },
+    {
+      detector: "labeled_private_key",
+      text: "ed25519 private key: AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE\n",
+      secret: "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE",
+    },
+    {
+      detector: "labeled_recovery_key",
+      text: "SANCTUARY_RECOVERY_KEY=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE\n",
+      secret: "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE",
+    },
+    {
+      detector: "known_secret_token",
+      text: `value: ${"AKIA" + "IOSFODNN7EXAMPLQ"}\n`,
+      secret: "AKIA" + "IOSFODNN7EXAMPLQ",
+    },
+    {
+      detector: "jwt",
+      text: `token: ${"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" + "." + "eyJzdWIiOiIxMjM0NTY3ODkwIn0" + "." + "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"}\n`,
+      secret: "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+    },
+    {
+      detector: "url_credential",
+      text: "see https://user:password12345678@example.test/path for details\n",
+      secret: "password12345678",
+    },
+    {
+      detector: "keyword_gated_high_entropy",
+      text: `Ops notes.\n\ntoken=${SAME_LINE_IDENTIFIER}\n`,
+      secret: SAME_LINE_IDENTIFIER,
+    },
+    {
+      detector: "bare_high_entropy_credential",
+      text: `Some filler prose about weather.\n\n${FAR_IDENTIFIER}\n\nmore filler prose here.\n`,
+      secret: FAR_IDENTIFIER,
+    },
+  ];
+
+  it("names all ten detectors, counted, with the matched content absent from every message", () => {
+    const outcomes = ALL_DETECTOR_FIXTURES.map((fixture) => ({
+      fixture,
+      result: classifierResult(fixture.text),
+    }));
+    const refused = outcomes.filter((entry) => !entry.result.ok);
+    expect(refused).toHaveLength(ALL_DETECTOR_FIXTURES.length);
+    const detectorsSeen = new Set<string>();
+    for (const entry of refused) {
+      const result = entry.result as { readonly ok: false; readonly error: SdwValidationError };
+      expect(result.error.detector, entry.fixture.detector).toBe(entry.fixture.detector);
+      expect(result.error.message, entry.fixture.detector).not.toContain(entry.fixture.secret);
+      detectorsSeen.add(result.error.detector ?? "");
+    }
+    // Every detector id is DISTINCT (not two fixtures accidentally landing
+    // on the same one, which would make the "ten" count vacuous).
+    expect(detectorsSeen.size).toBe(ALL_DETECTOR_FIXTURES.length);
+  });
+});
+
+describe("SDW classifier: O(candidates * log keywords), not O(candidates * keywords) (Rung-1 fix-round HIGH-A1)", () => {
+  it("performs a bounded number of keyword-array reads per candidate on an adversarial input", () => {
+    // Rung-1 fix-round HIGH-A1 measured the pre-fix linear-scan shape at
+    // 5.9s for 100 KB, 75s for 400 KB, and killed at the 10-minute mark for
+    // 1 MB, reachable via memory_emit/screenPassage under the SDW 1 MiB
+    // record cap, with the classifier returning `ok: true` (no refusal), so
+    // nothing about the slowdown was logged. This exercises the REAL shipped
+    // hasNearbyKeyword (via rung1ClassifierTestOnly), not a reimplementation,
+    // and counts actual array reads via a counting Proxy rather than wall
+    // time, which cannot tell "still O(K), just under a small K today" apart
+    // from a real fix.
+    const { hasNearbyKeyword, buildLineIndex } = rung1ClassifierTestOnly;
+
+    const KEYWORD_COUNT = 4000;
+    const CANDIDATE_COUNT = 4000;
+    const STRIDE = 250;
+    // Ascending, matching what matchAll produces on real text; spread far
+    // enough apart (and off the candidate positions) that neither the
+    // char-window nor the same-line leg trivially short-circuits the search.
+    const keywordIndices = Array.from({ length: KEYWORD_COUNT }, (_, i) => i * STRIDE);
+    const candidateIndices = Array.from({ length: CANDIDATE_COUNT }, (_, i) => i * STRIDE + Math.floor(STRIDE / 2));
+    // A real (large, single-line) text and real lineStarts so the same-line
+    // leg of isKeywordNear runs against genuine data, not a stub.
+    const text = "x".repeat(KEYWORD_COUNT * STRIDE + STRIDE);
+    const lineStarts = buildLineIndex(text);
+
+    let accessCount = 0;
+    const countingKeywordIndices = new Proxy(keywordIndices, {
+      get(target, prop, receiver) {
+        if (typeof prop === "string" && /^\d+$/.test(prop)) accessCount += 1;
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    for (const candidateIndex of candidateIndices) {
+      hasNearbyKeyword(text, countingKeywordIndices, lineStarts, candidateIndex);
+    }
+
+    // O(log K) per candidate: binary search over 4000 keywords needs at
+    // most ceil(log2(4000)) = 12 comparisons, plus up to 2 more reads for
+    // the two post-search neighbor lookups — a small constant, generously
+    // bounded at 20 reads/candidate. A linear scan (the pre-fix shape) would
+    // need up to KEYWORD_COUNT (4000) reads per candidate — 200x this bound.
+    const perCandidateBound = 20;
+    expect(accessCount).toBeLessThanOrEqual(CANDIDATE_COUNT * perCandidateBound);
+    expect(accessCount).toBeGreaterThan(0); // the search does read the array; this is not a vacuous no-op count.
   });
 });

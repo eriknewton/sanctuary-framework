@@ -86,8 +86,6 @@ export type MemoryPassageScreen =
       readonly detector?: string;
       /** SdwValidationError.line; the 1-based line the detector matched, when known. */
       readonly line?: number;
-      /** SdwValidationError.column; present only alongside line. */
-      readonly column?: number;
     };
 
 /**
@@ -124,10 +122,20 @@ export interface MemoryBackendAdapter {
    * before the original error is surfaced. If rollback cannot be verified, the
    * implementation MUST fail with a partial_scope category so the caller and
    * audit trail do not report the run as a clean all-or-nothing failure.
+   *
+   * `applyBareCredentialFallback` (Rung-1 fix-round, default false) opts
+   * every input in this batch into the extra bare-high-entropy-credential
+   * classifier check (see write-gate.ts's `assertSdwClassifierCleanText`).
+   * Only a caller mirroring RAW HARNESS MEMORY FILES (where the classifier
+   * is the only backstop) should pass true; a caller writing
+   * system-generated content shaped like a credential (archive manifests,
+   * signed lineage receipts, content hashes) must leave it false or every
+   * such write becomes a false refusal.
    */
   putPassages(
     inputs: readonly MemoryPassageInput[],
     taint: PersistableTaint,
+    applyBareCredentialFallback?: boolean,
   ): Promise<readonly MemoryPassage[]>;
 
   /**
@@ -152,8 +160,16 @@ export interface MemoryBackendAdapter {
    * A batch caller uses this to decide per input whether to include it, so one
    * rejected input does not abort a whole mirror. It NEVER relaxes the gate:
    * putPassages re-runs the real gate on everything it writes.
+   *
+   * `applyBareCredentialFallback`: see putPassages above; a screen and the
+   * real write it is deciding for must pass the SAME value or the dry run
+   * can disagree with what actually gets persisted.
    */
-  screenPassage(input: MemoryPassageInput, taint: PersistableTaint): MemoryPassageScreen;
+  screenPassage(
+    input: MemoryPassageInput,
+    taint: PersistableTaint,
+    applyBareCredentialFallback?: boolean,
+  ): MemoryPassageScreen;
 
   /**
    * Derive a stable passage id from a caller label, keyed to this fortress and

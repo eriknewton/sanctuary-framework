@@ -27,11 +27,7 @@ import {
   ingestCodexMemorySnapshot,
   readCodexMemoryDirectory,
 } from "../sdw/adapters/codex-memory-file-adapter.js";
-import {
-  SDW_CLASSIFIER_DETECTOR_REASONS,
-  SdwValidationError,
-  type SdwClassifierDetector,
-} from "../sdw/errors.js";
+import { SdwValidationError, sdwClassifierReasonText } from "../sdw/errors.js";
 import { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
 import {
   MEMORY_TRANSCODE_MODE,
@@ -618,25 +614,19 @@ function harnessLabel(
   return harness === CLAUDE_CODE_MEMORY_HARNESS ? "Claude Code" : "Codex";
 }
 
-function isSdwClassifierDetector(value: string): value is SdwClassifierDetector {
-  return Object.prototype.hasOwnProperty.call(SDW_CLASSIFIER_DETECTOR_REASONS, value);
-}
-
 /**
  * Rung-1 F2: name which detector refused a file and where, in plain English,
  * instead of the constant "classifier_reject" category alone. Class and
- * location only, never the matched content (must match
- * SDW_CLASSIFIER_DETECTOR_REASONS in sdw/errors.ts).
+ * location only, never the matched content. The reason-text lookup itself is
+ * sdwClassifierReasonText (sdw/errors.ts), shared with the memory_ingest MCP
+ * tool result so the two surfaces cannot drift on what a detector id means.
  */
 function describeMemorySkipReason(skip: {
   readonly reason: string;
   readonly detector?: string;
   readonly line?: number;
 }): string {
-  const reasonText =
-    skip.detector !== undefined && isSdwClassifierDetector(skip.detector)
-      ? SDW_CLASSIFIER_DETECTOR_REASONS[skip.detector]
-      : skip.reason;
+  const reasonText = sdwClassifierReasonText(skip.reason, skip.detector);
   return skip.line === undefined ? reasonText : `${reasonText} (line ${String(skip.line)})`;
 }
 

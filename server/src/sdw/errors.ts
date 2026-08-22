@@ -6,7 +6,7 @@ export type SdwReadFailureKind =
   | "unsupported_record_version";
 
 /**
- * The nine independent checks `classifyText` (server/src/sdw/write-gate.ts)
+ * The ten independent checks `classifyText` (server/src/sdw/write-gate.ts)
  * runs before a `classifier_reject`. One entry per check, in the order
  * `classifyText` evaluates them, so an operator refusal can name which one
  * fired instead of a single constant message (Rung-1 F2).
@@ -20,15 +20,17 @@ export type SdwClassifierDetector =
   | "known_secret_token"
   | "jwt"
   | "url_credential"
-  | "keyword_gated_high_entropy";
+  | "keyword_gated_high_entropy"
+  | "bare_high_entropy_credential";
 
 /**
  * Plain-English, operator-facing reason for each classifier detector. Class
  * and location only: every string here must be safe to print without
  * revealing what was matched (MUST-NEVER #9 in AGENTS.md). Consumed by
- * cli/memory-file.ts's refusal report and the memory_ingest/memory_emit MCP
- * tool results — cross-file pin: keep both in sync with this table ("must
- * match SDW_CLASSIFIER_DETECTOR_REASONS in sdw/errors.ts").
+ * cli/memory-file.ts's refusal report and the memory_ingest MCP tool result
+ * (memory_emit does not classify: it only emits already-accepted passages)
+ * — cross-file pin: keep both in sync with this table ("must match
+ * SDW_CLASSIFIER_DETECTOR_REASONS in sdw/errors.ts").
  */
 export const SDW_CLASSIFIER_DETECTOR_REASONS: Readonly<Record<SdwClassifierDetector, string>> = {
   private_key_marker: "looks like a PEM-style private key block",
@@ -41,7 +43,31 @@ export const SDW_CLASSIFIER_DETECTOR_REASONS: Readonly<Record<SdwClassifierDetec
   url_credential: "looks like a credential embedded in a URL",
   keyword_gated_high_entropy:
     "a security-sensitive keyword appears near a high-entropy value that looks like a secret",
+  bare_high_entropy_credential:
+    "a high-entropy value elsewhere in the file looks like a raw credential",
 };
+
+/**
+ * The plain-English reason for a classifier_reject, resolved from the
+ * shared table when `detector` names a known detector, falling back to the
+ * raw category string otherwise (an older/foreign SdwValidationError, or a
+ * non-classifier category passed in by a caller that reuses this helper).
+ * `detector` is `string | undefined` rather than SdwClassifierDetector
+ * because it crosses the CLI/MCP adapter boundary (server/src/sdw/adapters/
+ * memory-backend.ts's MemoryPassageScreen) as a loosely-typed field, so the
+ * membership check is a runtime one. Single source for cli/memory-file.ts
+ * and sdw/memory-file-tools.ts so the two cannot drift on what a detector id
+ * means in English.
+ */
+export function sdwClassifierReasonText(reason: string, detector: string | undefined): string {
+  if (
+    detector !== undefined &&
+    Object.prototype.hasOwnProperty.call(SDW_CLASSIFIER_DETECTOR_REASONS, detector)
+  ) {
+    return SDW_CLASSIFIER_DETECTOR_REASONS[detector as SdwClassifierDetector];
+  }
+  return reason;
+}
 
 export interface SdwValidationErrorOptions {
   readonly cause?: unknown;
@@ -55,15 +81,12 @@ export interface SdwValidationErrorOptions {
    * content itself.
    */
   readonly line?: number;
-  /** 1-based column of the match start, when line is present and cheap to compute. */
-  readonly column?: number;
 }
 
 export class SdwValidationError extends Error {
   readonly category: string;
   readonly detector?: SdwClassifierDetector;
   readonly line?: number;
-  readonly column?: number;
 
   constructor(category: string, message: string, options?: SdwValidationErrorOptions) {
     super(message, options?.cause === undefined ? undefined : { cause: options.cause });
@@ -71,7 +94,6 @@ export class SdwValidationError extends Error {
     this.category = category;
     this.detector = options?.detector;
     this.line = options?.line;
-    this.column = options?.column;
   }
 }
 
