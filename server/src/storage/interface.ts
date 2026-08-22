@@ -66,24 +66,6 @@ export interface StorageBackend {
   totalSize(): Promise<number>;
 
   /**
-   * OPTIONAL capability: create-if-absent. Returns true when THIS call created
-   * the entry, false when an entry already existed (nothing written). The SDW
-   * owner pin (sdw/memory-isolation.ts) requires it; a backend without it
-   * cannot host the pin and the guard fails closed. Filesystem: O_EXCL open;
-   * LMDB: ifNoExists; memory: map check.
-   */
-  writeIfAbsent?(namespace: string, key: string, data: Uint8Array): Promise<boolean>;
-
-  /**
-   * OPTIONAL capability: compare-and-replace. Replaces the entry only when its
-   * current bytes equal `expected`; returns false (nothing written) otherwise.
-   * BOUND: on the filesystem backend this is read-compare-then-atomic-rename,
-   * not a kernel-level compare-and-swap, so two replacers racing inside that
-   * window can both observe `expected`; the caller re-reads after the call.
-   */
-  replaceIfEquals?(namespace: string, key: string, expected: Uint8Array, data: Uint8Array): Promise<boolean>;
-
-  /**
    * Enumerate every namespace that currently holds at least one entry.
    * OPTIONAL capability: master-key rotation requires it (the rotation
    * walker must be able to prove it visited the WHOLE fortress and fails

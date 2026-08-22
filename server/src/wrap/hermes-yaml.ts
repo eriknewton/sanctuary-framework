@@ -426,26 +426,28 @@ export interface ScannerMcpServersView {
  *                         absent file has no block and no entries).
  */
 /**
- * Does the `sanctuary` entry of a Hermes `config.yaml` carry `env.<key>`?
- * Read through the SAME block scanner the wrap writer uses. Returns null when
- * the file has no `sanctuary` entry (or an unsupported shape), so a caller
- * never mistakes "not wrapped" for "wrapped without the key".
+ * The value of `env.<key>` inside the `sanctuary` entry of a Hermes
+ * `config.yaml`, read through the SAME block scanner the wrap writer uses and
+ * scoped to that entry's lines only (a `<key>:` anywhere else in the file is
+ * never consulted). Returns `undefined` when the file has no `sanctuary`
+ * entry (or an unsupported shape), so a caller never mistakes "not wrapped"
+ * for "wrapped without the key"; `null` when the entry has no such env key.
  */
-export function hermesSanctuaryEntryHasEnvKey(
+export function hermesSanctuaryEntryEnvValue(
   existingContent: string | null,
   key: string,
-): boolean | null {
-  if (existingContent === null) return null;
+): string | null | undefined {
+  if (existingContent === null) return undefined;
   const lines = existingContent.split("\n");
   let block: McpServersBlock | null;
   try {
     block = scanMcpServersBlock(lines);
   } catch (err) {
-    if (err instanceof HermesYamlUnsupportedError) return null;
+    if (err instanceof HermesYamlUnsupportedError) return undefined;
     throw err;
   }
   const entry = block?.entries.find((e) => e.name === "sanctuary");
-  if (!entry) return null;
+  if (!entry) return undefined;
   let inEnv = false;
   let envIndent = -1;
   for (let i = entry.start + 1; i < entry.end; i += 1) {
@@ -459,9 +461,13 @@ export function hermesSanctuaryEntryHasEnvKey(
       envIndent = indent;
       continue;
     }
-    if (inEnv && trimmed.startsWith(`${key}:`)) return true;
+    if (inEnv && trimmed.startsWith(`${key}:`)) {
+      const raw = trimmed.slice(key.length + 1).replace(/\s+#.*$/, "").trim();
+      const value = raw.replace(/^["']|["']$/g, "");
+      return value.length > 0 ? value : null;
+    }
   }
-  return false;
+  return null;
 }
 
 export function scannerMcpServersView(

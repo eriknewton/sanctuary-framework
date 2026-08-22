@@ -54,6 +54,7 @@ export const AUDIT_CHECKPOINT_SCHEMA_VERSION = 1;
 export const AUDIT_CHAIN_GENESIS = "GENESIS";
 export const AUDIT_CHAIN_SCHEMA_VERSION = 2;
 export const AUDIT_CHECKPOINT_DOMAIN = "sanctuary.audit-checkpoint.v1";
+// Must match AUDIT_CHECKPOINT_SIGNING_DOMAIN_PREFIX in core/signing-domains.ts (identity_sign refusal list).
 export const AUDIT_CHECKPOINT_DOMAIN_PREFIX = `${AUDIT_CHECKPOINT_DOMAIN}\n`;
 
 /**

@@ -109,7 +109,7 @@ import { createMemoryAttestTools } from "./cognitive/memory-attest.js";
 import { createSdwMemoryTools, memoryInsertApprovalArgs } from "./sdw/memory-tools.js";
 import { createSdwMemoryFileTools } from "./sdw/memory-file-tools.js";
 import {
-  createPersistentMultiAgentIsolationGuard,
+  createMultiAgentIsolationGuard,
   wrappedAgentIdentityFromEnv,
 } from "./sdw/memory-isolation.js";
 import { createSdwMemoryProvenanceTool } from "./sdw/memory-provenance-tool.js";
@@ -1523,24 +1523,12 @@ export async function createSanctuaryServer(options?: {
   // The resolver is the production one from memory-isolation.ts: it reads the
   // wrap-time `SANCTUARY_AGENT_ID` that `sanctuary wrap` writes into the
   // harness's MCP entry (wrap/cli.ts:buildSanctuaryEnv), never an
-  // agent-asserted value, so two wrapped harnesses on one host resolve two
-  // distinct ids and the second is refused.
-  //
-  // The pin is PERSISTED in the fortress (`_sdw_meta`, MAC'd under a
-  // master-derived key): every wrapped harness spawns its own stdio server, so
-  // an in-process pin could never see a second process. The persistent guard
-  // reads the pin on every call, so a second process over this fortress with a
-  // different wrap-time id is refused. Bound: an agent that rewrites its own
-  // harness config can present the FIRST id (see memory-isolation.ts).
+  // agent-asserted value. BOUND: the pin lives in this process; two harnesses
+  // over one fortress run separate server processes and are not separated
+  // (IC-16 stays open).
   const sdwMemoryIdentity = wrappedAgentIdentityFromEnv;
   const sdwFortressId = fortressIdFromStoragePath(config.storage_path);
-  const sdwMemoryIsolationGuard = createPersistentMultiAgentIsolationGuard({
-    storage,
-    masterKey,
-    fortressId: sdwFortressId,
-    ownerRef: "fleet-self",
-    ownerIdentity: sdwMemoryIdentity,
-  });
+  const sdwMemoryIsolationGuard = createMultiAgentIsolationGuard(sdwMemoryIdentity);
   const sdwMemoryTools = createSdwMemoryTools({
     adapter: sdwMemoryAdapter,
     auditLog,

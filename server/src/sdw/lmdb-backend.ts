@@ -85,32 +85,6 @@ export class LmdbStorageBackend implements StorageBackend, SdwTransactional {
     await this.db.put(compositeKey(namespace, key), this.lmdb.asBinary(checkedData));
   }
 
-  async writeIfAbsent(namespace: string, key: string, data: Uint8Array): Promise<boolean> {
-    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
-    const composite = compositeKey(namespace, key);
-    // ifNoExists runs the put inside LMDB's own write transaction, so exactly
-    // one racing creator observes "absent".
-    return this.db.ifNoExists(composite, () => {
-      void this.db.put(composite, this.lmdb.asBinary(checkedData));
-    });
-  }
-
-  async replaceIfEquals(
-    namespace: string,
-    key: string,
-    expected: Uint8Array,
-    data: Uint8Array,
-  ): Promise<boolean> {
-    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
-    const composite = compositeKey(namespace, key);
-    return this.db.transaction(() => {
-      const current = this.db.getBinary(composite);
-      if (current === undefined || Buffer.compare(current, expected) !== 0) return false;
-      void this.db.put(composite, this.lmdb.asBinary(checkedData));
-      return true;
-    });
-  }
-
   async read(namespace: string, key: string): Promise<Uint8Array | null> {
     const value = this.db.getBinary(compositeKey(namespace, key));
     if (value === undefined) return null;

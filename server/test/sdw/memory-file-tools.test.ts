@@ -683,10 +683,7 @@ describe("SDW memory file tools", () => {
       fileURLToPath(new URL("../../src/index.ts", import.meta.url)),
       "utf8",
     );
-    const guardConstructions =
-      indexSource.match(/createPersistentMultiAgentIsolationGuard\(/g) ?? [];
-    // The in-process pin must not be constructed in production at all.
-    expect(indexSource.match(/createMultiAgentIsolationGuard\(/g) ?? []).toHaveLength(0);
+    const guardConstructions = indexSource.match(/createMultiAgentIsolationGuard\(/g) ?? [];
     expect(guardConstructions).toHaveLength(1);
 
     for (const factory of [

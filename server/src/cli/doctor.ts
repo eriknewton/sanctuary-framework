@@ -16,8 +16,7 @@ import { IdentityManager } from "../cognitive/tools.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { detectCustodyFactorOrphan } from "../wrap/orphan-detection.js";
 import { getPlatformPaths } from "../wrap/config-reader.js";
-import { hermesConfigYamlPath, hermesSanctuaryEntryHasEnvKey } from "../wrap/hermes-yaml.js";
-import { readSdwOwnerPin } from "../sdw/memory-isolation.js";
+import { hermesConfigYamlPath, hermesSanctuaryEntryEnvValue } from "../wrap/hermes-yaml.js";
 import {
   describePyYamlCandidateFailure,
   probePyYamlCandidates,
@@ -148,7 +147,6 @@ export async function runDoctorChecks(opts: {
   checks.push(await checkCastleWall(opts));
   const harnessIds = await collectWrappedHarnessAgentIds();
   checks.push(checkWrappedHarnessAgentIds(harnessIds));
-  checks.push(await checkSdwOwnerPin(opts.storagePath, masterKey, harnessIds));
   if (masterKey) masterKey.fill(0);
   return checks;
 }
@@ -486,25 +484,11 @@ async function collectWrappedHarnessAgentIds(): Promise<WrappedHarnessEntry[]> {
   } catch {
     yaml = null;
   }
-  const hasId = hermesSanctuaryEntryHasEnvKey(yaml, "SANCTUARY_AGENT_ID");
-  if (hasId !== null) {
-    found.push({
-      platform: "hermes",
-      path: yamlPath,
-      // The scanner reports presence, not the value; a present key is
-      // reported as identified and its value is left to the pin check's
-      // "matches no wrapped entry" WARN if it disagrees.
-      agentId: hasId ? hermesYamlAgentIdValue(yaml!) : null,
-    });
+  const hermesId = hermesSanctuaryEntryEnvValue(yaml, "SANCTUARY_AGENT_ID");
+  if (hermesId !== undefined) {
+    found.push({ platform: "hermes", path: yamlPath, agentId: hermesId });
   }
   return found;
-}
-
-/** Best-effort value of `SANCTUARY_AGENT_ID:` inside the Hermes sanctuary entry (presence is decided by the scanner). */
-function hermesYamlAgentIdValue(yaml: string): string | null {
-  const match = /^\s*SANCTUARY_AGENT_ID\s*:\s*["']?([^"'\n#]+)["']?\s*(?:#.*)?$/m.exec(yaml);
-  const value = match?.[1]?.trim();
-  return value && value.length > 0 ? value : "present";
 }
 
 function checkWrappedHarnessAgentIds(entries: readonly WrappedHarnessEntry[]): DoctorCheck {
@@ -518,54 +502,6 @@ function checkWrappedHarnessAgentIds(entries: readonly WrappedHarnessEntry[]): D
     `${missing.length} wrapped harness entr${missing.length === 1 ? "y" : "ies"} without SANCTUARY_AGENT_ID (${missing.join("; ")})`,
     "re-run sanctuary wrap on each harness so the multi-agent isolation guard has an identity to pin",
   );
-}
-
-/**
- * The persisted SDW owner pin against the wrapped harness entries on this
- * host. Read-only. Failure modes from the outside: an UNCLAIMED (null) pin
- * with identified harness entries means the next memory call from any of them
- * claims the scope for that harness alone; a pin id that matches no wrapped
- * entry means the harness that owns the memory is no longer wrapped here (or
- * was re-wrapped under another fortress path), so every current harness will
- * be refused; a pin that does not verify means the fortress master changed
- * outside of master rotation.
- */
-async function checkSdwOwnerPin(
-  storagePath: string,
-  masterKey: Uint8Array | null,
-  entries: readonly WrappedHarnessEntry[],
-): Promise<DoctorCheck> {
-  if (masterKey === null) {
-    return ok("sdw owner pin", "not checked (no key available to verify it)", "set SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY to verify the pin");
-  }
-  const storage = new FilesystemStorage(join(storagePath, "state"));
-  let pin: Awaited<ReturnType<typeof readSdwOwnerPin>>;
-  try {
-    pin = await readSdwOwnerPin(storage, masterKey);
-  } catch (error) {
-    return warn("sdw owner pin", `could not be read: ${error instanceof Error ? error.message : String(error)}`, "inspect the fortress state directory permissions");
-  }
-  if (pin.status === "absent") return ok("sdw owner pin", "no owner pin yet (no memory tool has touched this fortress)", "n/a");
-  if (pin.status === "invalid") {
-    return warn("sdw owner pin", "present but does not verify under this master", "every memory, provenance and vault call will be refused; if the master was replaced outside master rotation, rotate through sanctuary rotate-master");
-  }
-  const ids = entries.map((e) => e.agentId).filter((id): id is string => id !== null);
-  if (pin.data.agent_id === null) {
-    if (ids.length === 0) return ok("sdw owner pin", "unclaimed (pinned by a harness with no SANCTUARY_AGENT_ID)", "n/a");
-    return warn(
-      "sdw owner pin",
-      `unclaimed, but ${ids.length} wrapped harness entr${ids.length === 1 ? "y carries" : "ies carry"} an id; the first memory call claims the scope for that harness alone`,
-      "expected after a re-wrap; if more than one harness is wrapped here, only the first to call memory tools will own this fortress's memory",
-    );
-  }
-  if (!ids.includes(pin.data.agent_id)) {
-    return warn(
-      "sdw owner pin",
-      `pinned to ${pin.data.agent_id}, which matches no wrapped harness entry on this host`,
-      "re-wrap the owning harness with the same fortress path, or accept that current harnesses are refused",
-    );
-  }
-  return ok("sdw owner pin", `pinned to ${pin.data.agent_id}, a wrapped harness on this host`, "n/a");
 }
 
 /** The `sanctuary` MCP entry in any of the harness config shapes wrap writes. */

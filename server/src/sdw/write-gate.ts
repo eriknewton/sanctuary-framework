@@ -1,6 +1,6 @@
 import type { StorageBackend } from "../storage/interface.js";
 import { encrypt } from "../core/encryption.js";
-import { bytesToString, constantTimeEqual, stringToBytes, toBase64url } from "../core/encoding.js";
+import { bytesToString, stringToBytes, toBase64url } from "../core/encoding.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { hashToString, hmacSha256 } from "../core/hashing.js";
 import { sdwAad, assertSdwIdentifier } from "./grammar.js";
@@ -24,23 +24,6 @@ const MAX_RECORD_BYTES = 1024 * 1024;
 const SDW_REPLAY_MAC_DOMAIN = "sanctuary.sdw-replay-anchor-mac.v1\n";
 const SDW_REPLAY_MAC_MARKER = "__sanctuary_sdw_replay_anchor_mac_v1";
 const SDW_REPLAY_MAC_INFO = "sdw-replay-anchor-mac";
-// Owner pin (multi-agent isolation, persisted in the fortress). Must match
-// SDW_OWNER_PIN_KEY in sdw/memory-isolation.ts; the HKDF label is registered
-// in docs/hkdf-info-string-registry.md and test/structure/frozen-surfaces.test.ts.
-const SDW_OWNER_PIN_MAC_DOMAIN = "sanctuary.sdw-owner-pin-mac.v1\n";
-const SDW_OWNER_PIN_MAC_MARKER = "__sanctuary_sdw_owner_pin_mac_v1";
-const SDW_OWNER_PIN_MAC_INFO = "sdw-owner-pin-mac";
-export const SDW_OWNER_PIN_KEY = "sdw-owner-pin-v1";
-
-/** The persisted owner pin: which wrapped-agent identity the shared scope is bound to. */
-export interface SdwOwnerPinData {
-  readonly version: 1;
-  readonly fortress_id: string;
-  readonly owner_ref: string;
-  /** The wrap-time `SANCTUARY_AGENT_ID`; null pins the "no id configured" caller. */
-  readonly agent_id: string | null;
-  readonly pinned_at: string;
-}
 // ceil(32 bytes * 8 bits / 6 base64 bits) without the trailing `=` padding.
 const BASE64URL_32_BYTE_KEY_CHARS = 43;
 // Two hex characters encode each of 32 bytes.
@@ -189,166 +172,6 @@ export async function writeReplayAnchor(
 ): Promise<void> {
   const prepared = prepareReplayAnchorWrite(masterKey, data);
   await backend.write(prepared.namespace, prepared.storageKey, prepared.data);
-}
-
-/**
- * Prepare the MAC'd owner-pin record for `_sdw_meta`. Goes through the same
- * authorization as every other SDW-namespace write so the raw-write guard
- * accepts exactly these bytes and nothing else.
- */
-/**
- * Create the owner pin only if none exists (exclusive create through the
- * backend's `writeIfAbsent`). Returns "created", "exists", or "unsupported"
- * when the backend has no create-if-absent capability (the guard then fails
- * closed rather than falling back to an overwrite).
- */
-export async function createSdwOwnerPinIfAbsent(
-  backend: Pick<StorageBackend, "writeIfAbsent">,
-  masterKey: Uint8Array,
-  data: SdwOwnerPinData,
-): Promise<"created" | "exists" | "unsupported"> {
-  if (typeof backend.writeIfAbsent !== "function") return "unsupported";
-  const prepared = prepareSdwOwnerPinWrite(masterKey, data);
-  const created = await backend.writeIfAbsent(prepared.namespace, prepared.storageKey, prepared.data);
-  return created ? "created" : "exists";
-}
-
-/**
- * Claim an UNCLAIMED pin: replace the record only if its current bytes are
- * exactly `expectedRaw` (the verified null-id record the caller just read).
- * Never an overwrite: a record that changed since the read is not replaced.
- */
-export async function claimSdwOwnerPin(
-  backend: Pick<StorageBackend, "replaceIfEquals">,
-  masterKey: Uint8Array,
-  expectedRaw: Uint8Array,
-  data: SdwOwnerPinData,
-): Promise<"claimed" | "changed" | "unsupported"> {
-  if (typeof backend.replaceIfEquals !== "function") return "unsupported";
-  const prepared = prepareSdwOwnerPinWrite(masterKey, data);
-  const replaced = await backend.replaceIfEquals(
-    prepared.namespace,
-    prepared.storageKey,
-    expectedRaw,
-    prepared.data,
-  );
-  return replaced ? "claimed" : "changed";
-}
-
-/** Write the owner pin through the gate (master rotation restamp only; the guard never overwrites). */
-export async function writeSdwOwnerPin(
-  backend: Pick<StorageBackend, "write">,
-  masterKey: Uint8Array,
-  data: SdwOwnerPinData,
-): Promise<void> {
-  const prepared = prepareSdwOwnerPinWrite(masterKey, data);
-  await backend.write(prepared.namespace, prepared.storageKey, prepared.data);
-}
-
-/** Read and verify the owner pin: absent, valid, or invalid (fail closed). */
-export async function readSdwOwnerPin(
-  storage: Pick<StorageBackend, "read">,
-  masterKey: Uint8Array,
-): Promise<
-  | { readonly status: "absent" }
-  | { readonly status: "valid"; readonly data: SdwOwnerPinData; readonly raw: Uint8Array }
-  | { readonly status: "invalid" }
-> {
-  const raw = await storage.read(SDW_META_NAMESPACE, SDW_OWNER_PIN_KEY);
-  if (raw === null) return { status: "absent" };
-  const verified = verifySdwOwnerPinEnvelope(masterKey, raw);
-  return verified.status === "valid" ? { ...verified, raw } : verified;
-}
-
-/**
- * Master rotation step for the owner pin (called from core/master-rotation.ts
- * for the `_sdw_meta` namespace; must stay the only writer of this record
- * besides `writeSdwOwnerPin`). Dual-master transitional verification, same
- * contract as the audit MAC anchors: a pin already valid under the NEW master
- * is tolerated (resume); valid under the OLD master is restamped under the new
- * one; a record failing BOTH is tamper and aborts the rotation rather than
- * being restamped into validity.
- */
-export async function restampSdwOwnerPinForRotation(args: {
-  storage: Pick<StorageBackend, "read" | "write">;
-  oldMaster: Uint8Array;
-  newMaster: Uint8Array;
-  verifyOnly: boolean;
-}): Promise<"absent" | "already-new" | "converted"> {
-  const raw = await args.storage.read(SDW_META_NAMESPACE, SDW_OWNER_PIN_KEY);
-  if (raw === null) return "absent";
-  const underNew = verifySdwOwnerPinEnvelope(args.newMaster, raw);
-  if (underNew.status === "valid") return "already-new";
-  const underOld = verifySdwOwnerPinEnvelope(args.oldMaster, raw);
-  if (underOld.status !== "valid") {
-    throw new SdwValidationError(
-      "owner_pin_tampered",
-      `${SDW_META_NAMESPACE}/${SDW_OWNER_PIN_KEY} failed authentication under both the old and the new master; rotation must not restamp it`,
-    );
-  }
-  if (!args.verifyOnly) {
-    await writeSdwOwnerPin(args.storage, args.newMaster, underOld.data);
-  }
-  return "converted";
-}
-
-export function prepareSdwOwnerPinWrite(
-  masterKey: Uint8Array,
-  data: SdwOwnerPinData,
-): PreparedSdwWrite {
-  assertSdwIdentifier(data.fortress_id, "fortress_id");
-  assertSdwIdentifier(data.owner_ref, "owner_ref");
-  if (
-    data.version !== 1 ||
-    (data.agent_id !== null && (typeof data.agent_id !== "string" || data.agent_id.length === 0)) ||
-    typeof data.pinned_at !== "string"
-  ) {
-    throw new SdwValidationError("malformed", "Invalid SDW owner pin");
-  }
-  const envelope = {
-    marker: SDW_OWNER_PIN_MAC_MARKER,
-    data,
-    mac: sdwOwnerPinMac(masterKey, data),
-  };
-  return authorizePreparedSdwPayload({
-    namespace: SDW_META_NAMESPACE,
-    storageKey: SDW_OWNER_PIN_KEY,
-    data: new Uint8Array(stringToBytes(JSON.stringify(envelope))),
-  });
-}
-
-/**
- * Verify a stored owner-pin record. Returns the pin only when the marker is
- * present AND the MAC verifies under the master-derived key; any other shape
- * (stripped, malformed, wrong key) is `invalid`, which the guard treats as a
- * refusal (fail closed, never as "no pin yet").
- */
-export function verifySdwOwnerPinEnvelope(
-  masterKey: Uint8Array,
-  raw: Uint8Array,
-): { readonly status: "valid"; readonly data: SdwOwnerPinData } | { readonly status: "invalid" } {
-  let parsed: { marker?: unknown; data?: SdwOwnerPinData; mac?: unknown };
-  try {
-    parsed = JSON.parse(bytesToString(raw)) as typeof parsed;
-  } catch {
-    return { status: "invalid" };
-  }
-  if (
-    parsed === null ||
-    typeof parsed !== "object" ||
-    parsed.marker !== SDW_OWNER_PIN_MAC_MARKER ||
-    typeof parsed.mac !== "string" ||
-    parsed.data === undefined ||
-    parsed.data === null
-  ) {
-    return { status: "invalid" };
-  }
-  const expected = stringToBytes(sdwOwnerPinMac(masterKey, parsed.data));
-  const actual = stringToBytes(parsed.mac);
-  if (expected.length !== actual.length || !constantTimeEqual(expected, actual)) {
-    return { status: "invalid" };
-  }
-  return { status: "valid", data: parsed.data };
 }
 
 export function prepareReplayAnchorWrite(
@@ -967,12 +790,6 @@ function authorizePreparedSdwPayload(prepared: PreparedSdwWrite): PreparedSdwWri
     storageKey: prepared.storageKey,
     data,
   };
-}
-
-function sdwOwnerPinMac(masterKey: Uint8Array, data: SdwOwnerPinData): string {
-  const macKey = derivePurposeKey(masterKey, SDW_OWNER_PIN_MAC_INFO);
-  const payload = SDW_OWNER_PIN_MAC_DOMAIN + SDW_OWNER_PIN_KEY + "\n" + canonicalJson(data);
-  return toBase64url(hmacSha256(macKey, stringToBytes(payload)));
 }
 
 function sdwReplayAnchorMac(masterKey: Uint8Array, data: SdwReplayAnchorData): string {

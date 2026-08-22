@@ -4,10 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { runDoctorChecks, runDoctorCommand } from "../../src/cli/doctor.js";
-import { establishMaster } from "../../src/core/master-custody.js";
-import { writeSdwOwnerPin } from "../../src/sdw/write-gate.js";
-
-const PIN_PASSPHRASE = "doctor-pin-passphrase";
 import { exportAuditChain } from "../../src/cli/audit-chain-export.js";
 import type {
   CheckpointExportRecord,
@@ -592,6 +588,10 @@ describe("sanctuary doctor: wrapped harness agent ids (MEDIUM-5)", () => {
     let check = checks.find((c) => c.name === "wrapped harness ids")!;
     expect(check.status).toBe("WARN");
     expect(check.message).toContain("hermes");
+    // A SANCTUARY_AGENT_ID under ANOTHER entry must not count for sanctuary.
+    await writeFile(yamlPath, ["mcp_servers:", "  other:", "    env:", "      SANCTUARY_AGENT_ID: other:fortress", "  sanctuary:", "    command: npx", ""].join("\n"));
+    checks = await runDoctorChecks({ env: {}, storagePath: join(home, ".sanctuary"), platform: "darwin" });
+    expect(checks.find((c) => c.name === "wrapped harness ids")!.status).toBe("WARN");
     await writeFile(yamlPath, ["mcp_servers:", "  sanctuary:", "    command: npx", "    env:", "      SANCTUARY_AGENT_ID: hermes:fortress-abc", ""].join("\n"));
     checks = await runDoctorChecks({ env: {}, storagePath: join(home, ".sanctuary"), platform: "darwin" });
     check = checks.find((c) => c.name === "wrapped harness ids")!;
@@ -604,58 +604,5 @@ describe("sanctuary doctor: wrapped harness agent ids (MEDIUM-5)", () => {
     });
     const checks = await runDoctorChecks({ env: {}, storagePath: join(home, ".sanctuary"), platform: "darwin" });
     expect(checks.find((c) => c.name === "wrapped harness ids")!.status).toBe("OK");
-  });
-});
-
-describe("sanctuary doctor: sdw owner pin (MEDIUM-N2)", () => {
-  const originalHome = process.env.HOME;
-  const dirs: string[] = [];
-  afterEach(async () => {
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
-    for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true });
-  });
-
-  async function pinnedFortress(agentId: string | null, harnessId: string | null) {
-    const home = await mkdtemp(join(tmpdir(), "sanctuary-doctor-pin-"));
-    dirs.push(home);
-    process.env.HOME = home;
-    const fortress = join(home, ".sanctuary");
-    await mkdir(fortress, { recursive: true, mode: 0o700 });
-    const storage = new FilesystemStorage(join(fortress, "state"));
-    const established = await establishMaster({ storage, passphrase: PIN_PASSPHRASE, storagePathHint: fortress, firstRun: { installMode: "headless", mintRecoveryKey: false } });
-    await writeSdwOwnerPin(storage, established.masterKey, {
-      version: 1,
-      fortress_id: "fortress-doctor",
-      owner_ref: "fleet-self",
-      agent_id: agentId,
-      pinned_at: "2026-08-22T00:00:00.000Z",
-    });
-    const entry: Record<string, unknown> = { command: "npx", args: ["sanctuary"] };
-    if (harnessId !== null) entry.env = { SANCTUARY_AGENT_ID: harnessId };
-    await writeFile(join(home, ".claude.json"), JSON.stringify({ mcpServers: { sanctuary: entry } }), { mode: 0o600 });
-    return fortress;
-  }
-
-  async function pinCheck(fortress: string) {
-    const checks = await runDoctorChecks({ env: { SANCTUARY_PASSPHRASE: PIN_PASSPHRASE }, storagePath: fortress, platform: "darwin" });
-    return checks.find((c) => c.name === "sdw owner pin")!;
-  }
-
-  it("WARNs when the pin is unclaimed but a wrapped harness entry carries an id", async () => {
-    const check = await pinCheck(await pinnedFortress(null, "claude_code:fortress-doctor"));
-    expect(check.status).toBe("WARN");
-    expect(check.message).toContain("unclaimed");
-  });
-
-  it("WARNs when the pin id matches no wrapped harness entry", async () => {
-    const check = await pinCheck(await pinnedFortress("cursor:fortress-doctor", "claude_code:fortress-doctor"));
-    expect(check.status).toBe("WARN");
-    expect(check.message).toContain("matches no wrapped harness entry");
-  });
-
-  it("is OK when the pin id is a wrapped harness on this host", async () => {
-    const check = await pinCheck(await pinnedFortress("claude_code:fortress-doctor", "claude_code:fortress-doctor"));
-    expect(check.status).toBe("OK");
   });
 });

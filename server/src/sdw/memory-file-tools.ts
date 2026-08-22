@@ -218,12 +218,8 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
     toolResult(fixedDenial(`audit:${operation}`, "request_review", null));
 
   const refuseSecondIdentity = async (operation: string): Promise<boolean> => {
-    const verdict = await isolationGuard(operation);
-    if (verdict.allowed) return false;
-    await auditFailure(`${operation}_denied`, {
-      denial_class: "owner_scope_conflict",
-      denial_reason: verdict.reason,
-    });
+    if (isolationGuard(operation).allowed) return false;
+    await auditFailure(`${operation}_denied`, { denial_class: "owner_scope_conflict" });
     return true;
   };
 

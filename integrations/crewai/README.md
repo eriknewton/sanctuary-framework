@@ -157,7 +157,7 @@ negotiator = Agent(
 )
 ```
 
-Each agent gets its own cryptographic identity, encrypted state store, and reputation history. Same-host isolation between wrapped agents is a fail-closed guard, not per-agent custody: the sovereign memory store is one shared scope per fortress, pinned in the fortress to the first wrapped-agent identity that touches it, and a second wrapped agent with a different identity over that fortress is refused rather than isolated. The identity is written into the harness MCP entry by `sanctuary wrap`, so an agent that can rewrite its own harness config is not what this guard defends against.
+Each agent gets its own cryptographic identity, encrypted state store, and reputation history. Same-host isolation between wrapped agents is partial: the sovereign memory store is one shared scope per fortress, and the guard over it separates distinct wrapped-agent identities only within one server process. Two harnesses wrapped over one fortress run separate server processes and are not separated by it (tracked as **IC-16**, open).
 
 ### Context Gating for Inference Calls
 

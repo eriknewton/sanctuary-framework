@@ -73,7 +73,6 @@ import { isSdwIdentifier } from "./grammar.js";
 import { SdwValidationError } from "./errors.js";
 import type { MultiAgentIsolationGuard } from "./memory-isolation.js";
 import { SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS } from "./memory-tools.js";
-import type { SdwTransactional, SdwTxn } from "./lmdb-backend.js";
 
 const EXPORT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MAX_MANIFEST_ARG_BYTES = 1_048_576;
@@ -102,21 +101,24 @@ export interface SdwToolsOptions {
   readonly resolvePublicKey: (keyRef: string) => Uint8Array | null;
   /**
    * The SAME multi-agent isolation guard instance the memory tool families
-   * share (`memory-isolation.ts`). An export or post-export delete moves or
-   * removes the whole shared corpus, so it is the same custody question as
-   * `memory_emit`; a second wrapped-agent identity must be refused here too.
+   * share (`memory-isolation.ts`). An export moves, and an import replaces,
+   * the whole shared corpus, so they are the same custody question as
+   * `memory_emit`; a second wrapped-agent identity reaching THIS process is
+   * refused here too (bound: the guard is per server process).
    */
   readonly isolationGuard?: MultiAgentIsolationGuard;
   /**
-   * The fortress root the export directory must stay inside. When set, every
-   * path component of `exportDir` below this root is refused if it is a
-   * symlink and the resolved directory must be contained under the root, so
-   * an archive can never be redirected outside the fortress by a planted
-   * `sdw-exports` link. Tests that write to a plain temp dir may omit it.
+   * The fortress root the export directory must stay inside. When set, the
+   * archive is written into a fresh per-export directory under `exportDir`
+   * with the bounded symlink containment described at
+   * `prepareExportDestination`. Tests that write to a plain temp dir may
+   * omit it.
    */
   readonly fortressRoot?: string;
-  /** TEST-ONLY seam: runs after the export directory is validated and the fresh per-export directory exists, before the bytes are written. */
+  /** TEST-ONLY seam: runs after the fresh per-export directory exists, before the bytes are written. */
   readonly __afterExportDirPrepared?: () => Promise<void>;
+  /** TEST-ONLY seam: runs after the rename, before the post-rename containment check. */
+  readonly __afterExportRenamed?: () => Promise<void>;
   /**
    * Resolve operator-configured source key material by opaque reference.
    * Raw key bytes never transit tool arguments or the approval channel.
@@ -212,9 +214,8 @@ function takeApprovalBinding(
 /**
  * NOT WIRED IN PRODUCTION. `sdw_export_delete` stays unregistered: the
  * backend-wide serialization boundary a verify-then-delete needs is not
- * designed yet (an ordinary writer is not serialized against the SDW
- * transaction that re-verifies the records). It is built here only for the
- * D2 test suite and returns when that boundary exists.
+ * designed yet. It is built here, unchanged from its pre-wiring form, only for
+ * the D2 test suite.
  */
 export function createSdwExportDeleteTool(options: SdwToolsOptions): ToolDefinition {
   return buildSdwTools(options, { includeExportDelete: true }).find(
@@ -264,55 +265,39 @@ function buildSdwTools(
     typeof options.signingKey === "function" ? options.signingKey() : options.signingKey;
 
   // Every enumeration re-reads the live store first when the source can (the
-  // shipped filesystem fortress is async). Gate-time freeze, assembly-time
-  // drift recheck and delete-time recheck all go through here so the scope
-  // digest is never computed over a stale snapshot.
+  // shipped filesystem fortress is async): gate-time freeze and assembly-time
+  // drift recheck both go through here so the scope digest is never computed
+  // over a stale snapshot.
   const refreshInventory = (): Promise<void> | undefined => options.inventory.refresh?.();
 
-  /**
-   * Run the synchronous gate-time freeze after a live re-read. Returns the
-   * plain value when the source needs no refresh so the existing synchronous
-   * gate contract (and the tests that exercise it) is unchanged.
-   */
-  const gateAfterRefresh = (
-    gate: () => Record<string, unknown>,
-  ): Record<string, unknown> | Promise<Record<string, unknown>> => {
-    const pending = refreshInventory();
-    return pending === undefined ? gate() : pending.then(gate);
-  };
-
-  // Shared-scope custody: the vault tools move (export), replace (import) or
-  // remove (post-export delete) the whole `fleet-self` corpus, so they sit
-  // behind the SAME pinned-identity guard as memory_get/memory_emit. A second
-  // wrapped-agent identity is refused with the fixed denial and an audit
-  // record; the pin is never advanced (see memory-isolation.ts).
+  // Shared-scope custody: export moves and import replaces the whole
+  // `fleet-self` corpus, so both sit behind the SAME pinned-identity guard as
+  // memory_get/memory_emit; a second identity reaching this process is
+  // refused with the fixed denial and an audit record.
   const refusedForeignIdentity = async (operation: string): Promise<boolean> => {
     if (options.isolationGuard === undefined) return false;
-    const verdict = await options.isolationGuard(operation);
-    if (verdict.allowed) return false;
+    if (options.isolationGuard(operation).allowed) return false;
     // Same denial class as the memory families (must match
     // SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS in memory-tools.ts).
-    await auditFailure(`${operation}_denied`, {
-      denial_class: SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS,
-      denial_reason: verdict.reason,
-    });
+    await auditFailure(`${operation}_denied`, { denial_class: SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS });
     return true;
   };
 
   /**
-   * Gate-time wrapper shared by every vault tool: the isolation guard runs
-   * FIRST, before any enumeration or manifest work, so a foreign identity
-   * never sees the vault's inventory and never raises a Tier-1 prompt (the
-   * throw makes the router deny without prompting; the audit record above is
-   * the operator's signal). Then the live re-read, then the synchronous gate
-   * body. Stays synchronous for sources that need neither, so the existing
+   * Gate-time wrapper for sdw_export: the isolation guard runs FIRST, before
+   * any enumeration, so a foreign identity never sees the vault's inventory
+   * and never raises a Tier-1 prompt (the throw makes the router deny without
+   * prompting). Then the live re-read, then the synchronous gate body. Stays
+   * synchronous when neither a guard nor a refresh is wired, so the existing
    * synchronous gate contract (and its tests) is unchanged.
    */
   const gateWithGuard = (
-    toolName: SdwApprovalBinding["toolName"],
+    toolName: "sdw_export",
     gate: () => Record<string, unknown>,
   ): Record<string, unknown> | Promise<Record<string, unknown>> => {
-    if (options.isolationGuard === undefined) return gateAfterRefresh(gate);
+    if (options.isolationGuard === undefined && options.inventory.refresh === undefined) {
+      return gate();
+    }
     return (async () => {
       if (await refusedForeignIdentity(toolName)) {
         throw new SdwValidationError(
@@ -325,36 +310,40 @@ function buildSdwTools(
     })();
   };
 
-  const asTransactional = (): (StorageBackend & SdwTransactional) | null => {
-    const candidate = options.storage as StorageBackend & { sdwTransaction?: unknown };
-    return typeof candidate.sdwTransaction === "function"
-      ? (candidate as StorageBackend & SdwTransactional)
-      : null;
-  };
+  const storageIsTransactional = (): boolean =>
+    typeof (options.storage as { sdwTransaction?: unknown }).sdwTransaction === "function";
 
   /**
-   * Archive destination with symlink containment (fortressRoot set):
+   * Archive destination with BOUNDED symlink containment (fortressRoot set).
+   * Node has no openat/renameat, so every check here is path-based:
    *   1. walk every component of exportDir below the root, refusing any
-   *      symlink, creating missing ones;
+   *      symlink and creating missing ones;
    *   2. require realpath(exportDir) under realpath(root);
-   *   3. mkdtemp a FRESH per-export directory inside it (its name is
-   *      unpredictable, so nothing can be pre-planted there) and require its
-   *      realpath under the root as well;
-   * The caller then writes with an fd opened O_EXCL inside that fresh
-   * directory and renames within it (see writeSdwExportBundleInFreshDir).
-   * BOUND: Node has no openat/renameat, so a parent swapped to a symlink
-   * AFTER step 3 makes the fresh-dir path resolve elsewhere; the O_EXCL open
-   * then fails (the unpredictable directory does not exist there) and the
-   * export fails closed rather than landing outside.
+   *   3. mkdtemp a fresh per-export directory inside it (unpredictable name,
+   *      so nothing can be pre-planted there), capture its inode and realpath.
+   * `verifyFreshDirUnchanged` then re-runs the component walk and asserts the
+   * inode and realpath are unchanged; the writer calls it immediately before
+   * the O_EXCL open and immediately after the rename, unlinking what it
+   * wrote on any mismatch.
+   * RESIDUAL (stated, not closed): a swap inside the window between the last
+   * check and the following syscall is not detected; that window is the
+   * microseconds between `lstat`/`realpath` returning and `open`/`rename`
+   * being issued. Closing it needs openat-style fd-relative syscalls Node
+   * does not expose.
    * Without fortressRoot (test harnesses writing to a plain temp dir) the
    * legacy path-based atomic write is used.
    */
+  interface FreshExportDir {
+    readonly destinationPath: string;
+    readonly freshDir: string;
+    readonly verify: () => Promise<void>;
+  }
   const prepareExportDestination = async (
     exportName: string,
-  ): Promise<{ destinationPath: string; freshDir: string | null }> => {
+  ): Promise<{ destinationPath: string; fresh: FreshExportDir | null }> => {
     if (options.fortressRoot === undefined) {
       await mkdir(options.exportDir, { recursive: true, mode: 0o700 });
-      return { destinationPath: join(options.exportDir, `${exportName}.sdw-export.json`), freshDir: null };
+      return { destinationPath: join(options.exportDir, `${exportName}.sdw-export.json`), fresh: null };
     }
     const root = resolve(options.fortressRoot);
     const dir = resolve(options.exportDir);
@@ -362,28 +351,46 @@ function buildSdwTools(
     if (rel === "" || rel.startsWith("..") || rel.includes(`..${sep}`)) {
       throw new Error("export directory is outside the fortress root");
     }
-    let current = root;
-    for (const component of rel.split(sep)) {
-      current = join(current, component);
-      try {
-        if ((await lstat(current)).isSymbolicLink()) {
-          throw new Error("export directory path contains a symlink");
+    const walkRefusingSymlinks = async (target: string, create: boolean): Promise<void> => {
+      let current = root;
+      for (const component of relative(root, target).split(sep)) {
+        current = join(current, component);
+        try {
+          if ((await lstat(current)).isSymbolicLink()) {
+            throw new Error("export directory path contains a symlink");
+          }
+        } catch (error) {
+          if (!create || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          await mkdir(current, { mode: 0o700 });
         }
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        await mkdir(current, { mode: 0o700 });
       }
-    }
+    };
+    await walkRefusingSymlinks(dir, true);
     const realRoot = await realpath(root);
     if (!(await realpath(dir)).startsWith(realRoot + sep)) {
       throw new Error("export directory resolved outside the fortress root");
     }
     const freshDir = await mkdtemp(join(dir, `${exportName}.`));
-    if (!(await realpath(freshDir)).startsWith(realRoot + sep)) {
+    const freshReal = await realpath(freshDir);
+    const freshInode = (await lstat(freshDir, { bigint: true })).ino;
+    if (!freshReal.startsWith(realRoot + sep)) {
       throw new Error("export directory resolved outside the fortress root");
     }
-    return { destinationPath: join(freshDir, `${exportName}.sdw-export.json`), freshDir };
+    const verify = async (): Promise<void> => {
+      await walkRefusingSymlinks(freshDir, false);
+      if ((await lstat(freshDir, { bigint: true })).ino !== freshInode) {
+        throw new Error("export directory changed identity after validation");
+      }
+      if ((await realpath(freshDir)) !== freshReal) {
+        throw new Error("export directory resolved elsewhere after validation");
+      }
+    };
+    return {
+      destinationPath: join(freshDir, `${exportName}.sdw-export.json`),
+      fresh: { destinationPath: join(freshDir, `${exportName}.sdw-export.json`), freshDir, verify },
+    };
   };
+
   // Fail closed on a malformed namespaces argument: silently treating it as
   // "no filter" would WIDEN the export scope past what the caller asked for.
   const requestedNamespaces = (args: Record<string, unknown>): string[] | undefined => {
@@ -402,12 +409,13 @@ function buildSdwTools(
     name: "sdw_export",
     description:
       "Export the Sovereign Data Warehouse (working state, query history, document " +
-      "corpus, vector memory) as a signed, still-encrypted bundle written to the " +
-      "operator-configured export directory on this machine. Nothing is decrypted " +
-      "and nothing leaves the host; this is an operator-directed archive, not a " +
-      "carriage path, and unsealed memory is never carried by participant Exit. " +
-      "Tier 1: the approval freezes a ciphertext-inventory fingerprint of exactly " +
-      "what will ship; any vault change before packaging aborts the export.",
+      "corpus, vector memory) as a signed, still-encrypted bundle written into a fresh " +
+      "per-export directory under the operator-configured export directory on this " +
+      "machine. Nothing is decrypted and nothing leaves the host; this is an " +
+      "operator-directed archive, not a carriage path, and unsealed memory is never " +
+      "carried by participant Exit. Tier 1: the approval freezes a " +
+      "ciphertext-inventory fingerprint of exactly what will ship; any vault change " +
+      "before packaging aborts the export.",
     tool_class: "write",
     inputSchema: {
       type: "object",
@@ -543,15 +551,17 @@ function buildSdwTools(
       let destinationPath: string;
       try {
         // The export directory is created here, by the first approved export,
-        // never at server boot (boot must not add anything to the fortress),
-        // with symlink containment under the fortress root.
+        // never at server boot (boot must not add anything to the fortress).
         const destination = await prepareExportDestination(exportName);
         destinationPath = destination.destinationPath;
         await options.__afterExportDirPrepared?.();
-        if (destination.freshDir === null) {
+        if (destination.fresh === null) {
           await writeSdwExportBundleAtomic(built.bundle, destinationPath, options.fs);
         } else {
-          await writeSdwExportBundleInFreshDir(built.bundle, destination.freshDir, destinationPath);
+          await writeSdwExportBundleInFreshDir(built.bundle, destination.fresh.freshDir, destinationPath, {
+            verify: destination.fresh.verify,
+            afterRename: options.__afterExportRenamed,
+          });
         }
       } catch {
         await auditFailure("sdw_export_failed", {
@@ -592,11 +602,12 @@ function buildSdwTools(
       "signature is verified before any approval prompt; records are decrypted " +
       "only inside the approved flow and re-encrypted under this fortress. " +
       "Imports are all-or-nothing: they run inside one storage transaction, and a " +
-      "backend without transactions refuses the import outright rather than " +
-      "applying part of it. The shipped filesystem fortress has no transaction " +
-      "primitive today, so on that backend this tool refuses; only the source key " +
-      "reference `this-fortress` (a bundle this fortress exported) resolves, since " +
-      "cross-fortress source key material is not yet operator-configurable. Tier 1.",
+      "backend without transactions refuses the import outright, before any " +
+      "prompt, rather than applying part of it. The shipped filesystem fortress has " +
+      "no transaction primitive today, so on that backend this tool refuses; only " +
+      "the source key reference `this-fortress` (a bundle this fortress exported) " +
+      "resolves, since cross-fortress source key material is not yet " +
+      "operator-configurable. Tier 1.",
     tool_class: "write",
     inputSchema: {
       type: "object",
@@ -621,17 +632,17 @@ function buildSdwTools(
     // binds it into the approval and into any approval proof.
     approvalTargetArgs: async (args) => {
       // Guard first: a foreign identity never gets as far as manifest parsing
-      // or an approval prompt (see gateWithGuard). Only awaited when a guard
-      // is wired, so the no-guard path keeps its synchronous binding order.
+      // or an approval prompt. Only awaited when a guard is wired, so the
+      // no-guard path keeps its synchronous binding order.
       if (options.isolationGuard !== undefined && (await refusedForeignIdentity("sdw_import"))) {
         throw new SdwValidationError(
           "owner_scope_conflict",
           "SDW vault tool refused for a second wrapped-agent identity",
         );
       }
-      // Mirrors the delete gate: never prompt a human for an import the
-      // handler will refuse because the backend cannot apply it atomically.
-      if (asTransactional() === null) {
+      // Never prompt a human for an import the handler will refuse because
+      // the backend cannot apply it atomically.
+      if (!storageIsTransactional()) {
         await auditFailure("sdw_import_denied", { denial_class: "storage_not_transactional" });
         throw new SdwImportVerificationError("storage_not_transactional");
       }
@@ -791,12 +802,8 @@ function buildSdwTools(
     name: "sdw_export_delete",
     description:
       "Post-export local-state delete: removes exactly the records listed in a " +
-      "signed export manifest that THIS fortress recorded completing, and only " +
-      "while their stored ciphertext still matches the manifest. All-or-nothing: " +
-      "every record is re-verified and deleted inside one storage transaction, so " +
-      "any drift aborts with zero deletes. A backend without transactions refuses " +
-      "outright; the shipped filesystem fortress has no transaction primitive, so " +
-      "on that backend this tool refuses today. Irreversible; Tier 1.",
+      "signed export manifest, and only while their stored ciphertext still " +
+      "matches the manifest. Tier 1.",
     tool_class: "write",
     inputSchema: {
       type: "object",
@@ -808,24 +815,9 @@ function buildSdwTools(
       },
       required: ["manifest"],
     },
-    approvalTargetArgs: async (args) => {
-      // Guard first (see gateWithGuard), then the transactional-backend check:
-      // both refuse before any manifest work and before any prompt.
-      if (await refusedForeignIdentity("sdw_export_delete")) {
-        throw new SdwValidationError(
-          "owner_scope_conflict",
-          "SDW vault tool refused for a second wrapped-agent identity",
-        );
-      }
-      if (asTransactional() === null) {
-        await auditFailure("sdw_export_delete_denied", {
-          denial_class: "storage_not_transactional",
-        });
-        throw new SdwImportVerificationError("storage_not_transactional");
-      }
+    approvalTargetArgs: (args) => {
       const manifest = decodeSignedManifestArg(args.manifest);
       const summary = verifyManifestSignatureOnly(manifest, options.resolvePublicKey);
-      await refreshInventory();
       // Freeze the CURRENT inventory of the manifest's namespaces so the
       // handler deletes only what the human saw — and only if nothing moved.
       const namespaces = [
@@ -850,7 +842,6 @@ function buildSdwTools(
       });
       return {
         manifest_body_digest: summary.digest,
-        export_audit_event_id: manifest.body.export_audit_event_id,
         scope_digest: inventory.scope_digest,
         namespaces,
         record_count: manifest.body.records.length,
@@ -858,16 +849,6 @@ function buildSdwTools(
       };
     },
     handler: async (args) => {
-      if (await refusedForeignIdentity("sdw_export_delete")) {
-        return genericDeny("sdw_export_delete");
-      }
-      const transactional = asTransactional();
-      if (transactional === null) {
-        await auditFailure("sdw_export_delete_denied", {
-          denial_class: "storage_not_transactional",
-        });
-        return genericDeny("sdw_export_delete");
-      }
       let manifest: SdwSignedExportManifest;
       let digest: string;
       try {
@@ -894,22 +875,8 @@ function buildSdwTools(
 
       // Fail-closed drift recheck: every listed record must STILL exist with
       // exactly the exported ciphertext. Any mismatch aborts with zero deletes
-      // (no partial deletion of records the human did not see). Re-read the
-      // live store first so "live" means current bytes, not the gate snapshot.
-      // Both the re-read and the enumeration can throw (a storage error is not
-      // a drift); either way nothing has been deleted yet, and the failure is
-      // audited and denied rather than propagated as a raw error.
-      let live: SdwExportInventory;
-      try {
-        await refreshInventory();
-        live = enumerateSdwExportInventory(options.inventory, approved.namespaces);
-      } catch {
-        await auditFailure("sdw_export_delete_failed", {
-          manifest_body_digest: digest,
-          category: "inventory_unavailable",
-        });
-        return genericDeny("sdw_export_delete");
-      }
+      // (no partial deletion of records the human did not see).
+      const live = enumerateSdwExportInventory(options.inventory, approved.namespaces);
       if (live.scope_digest !== approved.scope_digest) {
         await auditFailure("sdw_export_delete_drift", {
           manifest_body_digest: digest,
@@ -929,44 +896,26 @@ function buildSdwTools(
         return genericDeny("sdw_export_delete");
       }
 
-      // All-or-nothing: inside ONE storage transaction (which the backend
-      // serializes against every other SDW writer), re-read and verify EVERY
-      // listed record's ciphertext hash first; only when all of them still
-      // match are any deleted. A mismatch throws before the first delete, so
-      // the transaction commits nothing; a throw from a delete rolls the
-      // transaction back, so there is no partial irreversible delete.
-      let deleted: number;
-      try {
-        deleted = await transactional.sdwTransaction(async (txn: SdwTxn) => {
-          for (const record of manifest.body.records) {
-            const raw = await txn.read(record.namespace, record.key);
-            const liveHash = raw === null ? null : recordHashOfRawEnvelope(raw);
-            if (liveHash !== record.record_hash) {
-              throw new SdwExportDeleteDriftError(record.namespace, record.key);
-            }
-          }
-          let count = 0;
-          for (const record of manifest.body.records) {
-            if (await txn.delete(record.namespace, record.key)) count += 1;
-          }
-          return count;
-        });
-      } catch (error) {
-        if (error instanceof SdwExportDeleteDriftError) {
+      // Defense-in-depth against a write racing the recheck above: re-read
+      // each record and verify its ciphertext hash IMMEDIATELY before its
+      // delete. A mismatch aborts the loop (deletes so far were all verified;
+      // the abort is honestly audited with the partial count).
+      let deleted = 0;
+      for (const record of manifest.body.records) {
+        const raw = await options.storage.read(record.namespace, record.key);
+        const liveHash = raw === null ? null : recordHashOfRawEnvelope(raw);
+        if (liveHash !== record.record_hash) {
           await auditFailure("sdw_export_delete_drift", {
             manifest_body_digest: digest,
             approved_scope_digest: approved.scope_digest,
             denial_class: "record_changed_mid_delete",
-            deleted_before_abort: 0,
+            deleted_before_abort: deleted,
           });
-        } else {
-          await auditFailure("sdw_export_delete_failed", {
-            manifest_body_digest: digest,
-            category: "transaction_failed",
-            deleted_before_abort: 0,
-          });
+          return genericDeny("sdw_export_delete");
         }
-        return genericDeny("sdw_export_delete");
+        if (await options.storage.delete(record.namespace, record.key)) {
+          deleted += 1;
+        }
       }
 
       await auditSuccess("sdw_export_delete_completed", {
@@ -989,14 +938,6 @@ function buildSdwTools(
 }
 
 // ── Manifest-arg helpers (sdw_export_delete) ─────────────────────────────────
-
-/** Thrown inside the delete transaction so the catch can tell drift from a storage failure. */
-class SdwExportDeleteDriftError extends Error {
-  constructor(namespace: string, key: string) {
-    super(`SDW record changed before delete: ${namespace}/${key}`);
-    this.name = "SdwExportDeleteDriftError";
-  }
-}
 
 /** Hash a stored ciphertext envelope (raw bytes form) — no decryption. */
 function recordHashOfRawEnvelope(raw: Uint8Array): string | null {

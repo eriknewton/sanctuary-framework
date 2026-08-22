@@ -19,24 +19,6 @@ export class MemoryStorage implements StorageBackend {
     return `${namespace}/${key}`;
   }
 
-  async writeIfAbsent(namespace: string, key: string, data: Uint8Array): Promise<boolean> {
-    if (this.store.has(this.storageKey(namespace, key))) return false;
-    await this.write(namespace, key, data);
-    return true;
-  }
-
-  async replaceIfEquals(
-    namespace: string,
-    key: string,
-    expected: Uint8Array,
-    data: Uint8Array,
-  ): Promise<boolean> {
-    const current = this.store.get(this.storageKey(namespace, key));
-    if (current === undefined || Buffer.compare(current.data, expected) !== 0) return false;
-    await this.write(namespace, key, data);
-    return true;
-  }
-
   async write(
     namespace: string,
     key: string,

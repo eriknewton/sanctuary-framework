@@ -120,6 +120,13 @@ export function createSdwMemoryProvenanceTool(
   const deny = () =>
     toolResult(fixedDenial("audit:sdw_memory_provenance", "request_review", null));
 
+  const refusedForeignIdentity = async (): Promise<boolean> => {
+    if (options.isolationGuard === undefined) return false;
+    if (options.isolationGuard("sdw_memory_provenance").allowed) return false;
+    await auditFailure({ denial_class: SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS });
+    return true;
+  };
+
   return {
     name: "sdw_memory_provenance",
     description:
@@ -140,17 +147,25 @@ export function createSdwMemoryProvenanceTool(
       },
       required: ["passage_id"],
     },
-    handler: async (args) => {
-      if (options.isolationGuard !== undefined) {
-        const verdict = await options.isolationGuard("sdw_memory_provenance");
-        if (!verdict.allowed) {
-          await auditFailure({
-            denial_class: SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS,
-            denial_reason: verdict.reason,
-          });
-          return deny();
-        }
+    // Gate-time projection: the shared isolation guard runs BEFORE the
+    // approval gate sees the call, so a foreign identity never reaches a
+    // prompt or a Tier decision; the throw makes the router deny without
+    // prompting. The projection carries only the passage id (no body exists
+    // on this read tool).
+    approvalTargetArgs: async (args) => {
+      if (await refusedForeignIdentity()) {
+        throw new SdwValidationError(
+          "owner_scope_conflict",
+          "sdw_memory_provenance refused for a second wrapped-agent identity",
+        );
       }
+      return { passage_id: args.passage_id };
+    },
+    handler: async (args) => {
+      // Handler recheck (the gate-time projection above already refused a
+      // foreign identity before the approval gate; this keeps the handler
+      // safe when invoked without the router).
+      if (await refusedForeignIdentity()) return deny();
       const passageId = args.passage_id;
       if (typeof passageId !== "string" || passageId.length === 0) {
         await auditFailure({ denial_class: "invalid_passage_id" });

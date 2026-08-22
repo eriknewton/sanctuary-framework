@@ -172,7 +172,6 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   "sdw-source-ref-v1",
   "sdw-memory-passage-content-v1",
   "sdw-replay-anchor-mac",
-  "sdw-owner-pin-mac",
   "sanctuary.audit.v1",
   "sanctuary.receipt.v1",
   "sanctuary.transparency.anchor-commitment.v1",

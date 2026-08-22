@@ -5,8 +5,8 @@
  * protocol purpose are domain-separated by prefixes like these, so a
  * signature over one artifact can never be replayed as another. This file
  * holds the SDW export domains (their only declaration) and mirrors the
- * state-store and audit/receipt domains (declared at their producers, pinned
- * here by must-match comments); see the SCOPE note on
+ * identity-verified domains declared at their producers (pinned by
+ * must-match comments); see the EXACT SCOPE note on
  * INTERNAL_SIGNING_DOMAIN_PREFIXES. Two sides use it:
  *
  *   - producers (for example `sdw/export.ts`) import their domain constant
@@ -30,44 +30,43 @@ export const SDW_EXPORT_SCOPE_DIGEST_DOMAIN = "sanctuary.sdw-export-scope-digest
 export const SDW_EXPORT_MANIFEST_SIGNING_DOMAIN = "sanctuary.sdw-export-manifest.v1\n";
 
 /**
- * State-store artifacts signed or MAC'd under identity-derived or
- * master-derived keys (must match `STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX`,
- * `LEGACY_STATE_ENVELOPE_SIGNING_DOMAIN` and `STATE_EXPORT_BUNDLE_MAC_DOMAIN`
- * in cognitive/state-store.ts). Listed as PREFIXES: every versioned state
- * envelope domain starts with the first entry.
+ * State-store envelope signing domain PREFIX (must match
+ * `STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX` in cognitive/state-store.ts; every
+ * versioned envelope domain starts with it). Envelopes are signed with the
+ * writer's managed identity key.
  */
 export const STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX = "sanctuary.state-envelope.v";
-export const STATE_EXPORT_BUNDLE_MAC_DOMAIN = "sanctuary.state-export-bundle.v1\n";
 
 /**
- * Managed-identity audit-event and internal-receipt signing domains (must
- * match AUDIT_EVENT_SIGNING_DOMAIN / INTERNAL_RECEIPT_SIGNING_DOMAIN in
- * cognitive/tools.ts, which cannot import this file's consumers).
+ * Managed-identity audit-event, internal-receipt and audit-checkpoint signing
+ * domains (must match AUDIT_EVENT_SIGNING_DOMAIN / INTERNAL_RECEIPT_SIGNING_DOMAIN
+ * in cognitive/tools.ts and AUDIT_CHECKPOINT_DOMAIN_PREFIX in
+ * audit/checkpoint-shape.ts, verified at audit/chain.ts checkpointSigningBytes).
  */
 export const AUDIT_EVENT_SIGNING_DOMAIN_PREFIX = "sanctuary.audit.v1";
 export const INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX = "sanctuary.receipt.v1";
+export const AUDIT_CHECKPOINT_SIGNING_DOMAIN_PREFIX = "sanctuary.audit-checkpoint.v1\n";
 
 /**
- * Prefixes the raw `identity_sign` surface refuses. EXACT SCOPE, nothing
- * more: the SDW export domains, the state-store envelope and export-bundle
- * domains, and the managed-identity audit-event and receipt domains. This is
- * NOT a registry of every signing domain in the tree: MAC-only domains keyed
- * under master-derived secrets (audit anchors, custody journals, federation
- * records) are not listed because an identity signature cannot satisfy them,
- * and any future identity-signed artifact must add its domain here.
+ * Prefixes the raw `identity_sign` surface refuses. EXACT SCOPE: the domains
+ * over which a MANAGED IDENTITY KEY signature is verified somewhere in the
+ * tree, which is what the raw signer could forge: the SDW export manifest,
+ * state-store envelopes, audit events, internal receipts and audit
+ * checkpoints. Hash-only domains (the SDW record-hash and scope-digest
+ * domains) and master-MAC domains (state export bundle, audit anchors,
+ * custody journals, federation records) are NOT listed: an identity
+ * signature cannot satisfy them, so listing them would be noise. Any future
+ * identity-verified artifact adds its domain here.
  */
 export const INTERNAL_SIGNING_DOMAIN_PREFIXES: readonly string[] = [
-  SDW_EXPORT_RECORD_HASH_DOMAIN,
-  SDW_EXPORT_SCOPE_DIGEST_DOMAIN,
   SDW_EXPORT_MANIFEST_SIGNING_DOMAIN,
   STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX,
-  STATE_EXPORT_BUNDLE_MAC_DOMAIN,
   AUDIT_EVENT_SIGNING_DOMAIN_PREFIX,
   INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX,
+  AUDIT_CHECKPOINT_SIGNING_DOMAIN_PREFIX,
 ];
 
 const encoder = new TextEncoder();
-
 /**
  * True when `payload` begins with any internal signing-domain prefix (byte
  * comparison, so a base64url-decoded payload and a plain-text payload are

@@ -10,9 +10,10 @@
  *   - that the multi-agent isolation guard fires from the PRODUCTION-written
  *     identity: `sanctuary wrap` writes `SANCTUARY_AGENT_ID` into the
  *     harness MCP entry, the server resolves it through
- *     `wrappedAgentIdentityFromEnv`, and two wrapped agents on one host
- *     resolve two distinct ids so the second is refused (memory reads AND the
- *     vault export);
+ *     `wrappedAgentIdentityFromEnv`, and two distinct ids reaching ONE server
+ *     process are separated (memory reads, provenance AND the vault tools).
+ *     BOUND: the guard is per process; two harnesses over one fortress run
+ *     separate processes and are not separated (IC-16 stays open);
  *   - that on the SHIPPED filesystem backend `sdw_import` fails closed with
  *     `storage_not_transactional` before touching the store (IC-27).
  */
@@ -55,10 +56,9 @@ import {
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
 import {
   createMultiAgentIsolationGuard,
-  createPersistentMultiAgentIsolationGuard,
-  readSdwOwnerPin,
   wrappedAgentIdentityFromEnv,
 } from "../../src/sdw/memory-isolation.js";
+import { createSdwMemoryProvenanceTool } from "../../src/sdw/memory-provenance-tool.js";
 import { buildSanctuaryEnv, wrappedAgentId } from "../../src/wrap/cli.js";
 import type { AuditLog } from "../../src/operational/audit-log.js";
 
@@ -219,40 +219,6 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
       .toBe(envA.SANCTUARY_AGENT_ID);
   });
 
-  it("HIGH-1: two independent server graphs over ONE fortress: the second identity is refused and audited", async () => {
-    // Each wrapped harness spawns its own stdio server. Two production graphs
-    // over the same on-disk fortress, booted with different wrap-time ids,
-    // stand in for two processes; the pin lives in the fortress, not in
-    // either graph's memory.
-    const agentA = wrappedAgentId("claude-code", home.defaultFortressPath);
-    const agentB = wrappedAgentId("cursor", home.defaultFortressPath);
-    const statePath = join(home.defaultFortressPath, "state");
-
-    process.env.SANCTUARY_AGENT_ID = agentA;
-    const graphA = await createSanctuaryServer({
-      storage: new FilesystemStorage(statePath),
-      passphrase: "isolation-two-graphs-v1",
-    });
-    expect(graphA.config.storage_path).toBe(home.defaultFortressPath);
-    const countByA = await callTool(graphA.server, "memory_count");
-    expect(countByA.count).toBe(0);
-
-    process.env.SANCTUARY_AGENT_ID = agentB;
-    const graphB = await createSanctuaryServer({
-      storage: new FilesystemStorage(statePath),
-      passphrase: "isolation-two-graphs-v1",
-    });
-    const countByB = await callTool(graphB.server, "memory_count");
-    expect(countByB.denied).toBe(true);
-    expect(countByB.count).toBeUndefined();
-    const denials = await auditOps(graphB.auditLog, "memory_count_denied");
-    expect(denials.map((e) => e.details?.denial_class)).toEqual([SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS]);
-
-    // The pin never advances: A (its own graph) still reads after B was refused.
-    process.env.SANCTUARY_AGENT_ID = agentA;
-    expect((await callTool(graphA.server, "memory_count")).count).toBe(0);
-  });
-
   it("MEDIUM-4/C5/C7: through the production router + gate, ONE guard instance covers memory, provenance AND vault tools", async () => {
     const agentA = wrappedAgentId("claude-code", home.defaultFortressPath);
     const agentB = wrappedAgentId("cursor", home.defaultFortressPath);
@@ -286,120 +252,27 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
       .toEqual([SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS]);
   });
 
-  it("the persisted pin fails closed: a foreign-keyed pin refuses; a different id over a claimed pin is refused", async () => {
-    const storage = new MemoryStorage();
-    const mk = (key: number, id: string | undefined) =>
-      createPersistentMultiAgentIsolationGuard({
-        storage,
-        masterKey: new Uint8Array(32).fill(key),
-        fortressId: "fortress:pin",
-        ownerRef: "fleet-self",
-        ownerIdentity: () => id,
-      });
-    expect(await mk(1, "agent-one")("memory_get")).toEqual({ allowed: true });
-    expect(await mk(1, "agent-two")("memory_get")).toEqual({ allowed: false, reason: "owner_scope_conflict" });
-    // A pin MAC'd under a different master key is INVALID, never "no pin yet".
-    expect(await mk(2, "agent-one")("memory_get")).toEqual({ allowed: false, reason: "owner_pin_invalid" });
-    // A null caller over a claimed pin is refused too.
-    expect(await mk(1, undefined)("memory_get")).toEqual({ allowed: false, reason: "owner_scope_conflict" });
-  });
-
-  it("HIGH pin-1 (a): a simultaneous first touch has exactly one winner; the loser is refused on its FIRST call", async () => {
-    // Delay reads so both guards observe "absent" before either creates;
-    // the exclusive create (writeIfAbsent) then arbitrates.
-    const inner = new MemoryStorage();
-    const gate = { release: () => {} };
-    const held = new Promise<void>((resolve) => { gate.release = resolve; });
-    let reads = 0;
-    const storage = new Proxy(inner, {
-      get(target, prop, receiver) {
-        if (prop === "read") {
-          return async (ns: string, key: string) => {
-            reads += 1;
-            if (reads <= 2) await held;
-            return target.read(ns, key);
-          };
-        }
-        return Reflect.get(target, prop, receiver);
-      },
-    }) as MemoryStorage;
-    const mk = (id: string) =>
-      createPersistentMultiAgentIsolationGuard({
-        storage,
-        masterKey: new Uint8Array(32).fill(5),
-        fortressId: "fortress:race",
-        ownerRef: "fleet-self",
-        ownerIdentity: () => id,
-      });
-    const first = mk("harness-one")("memory_count");
-    const second = mk("harness-two")("memory_count");
-    gate.release();
-    const results = await Promise.all([first, second]);
-    const allowed = results.filter((r) => r.allowed);
-    const refused = results.filter((r) => !r.allowed);
-    expect(allowed).toHaveLength(1);
-    expect(refused).toEqual([{ allowed: false, reason: "owner_scope_conflict" }]);
-    // The pin on disk is the winner's, and only one record was ever created.
-    const pin = await readSdwOwnerPin(inner, new Uint8Array(32).fill(5));
-    expect(pin.status).toBe("valid");
-    expect(["harness-one", "harness-two"]).toContain((pin as { data: { agent_id: string } }).data.agent_id);
-  });
-
-  it("HIGH pin-1 (b): a removed pin over a used store refuses every caller and is never re-pinned", async () => {
-    const storage = new MemoryStorage();
-    const masterKey = new Uint8Array(32).fill(6);
-    const adapter = new SdwMemoryBackendAdapter({ storage, masterKey, fortressId: "fortress:floor", ownerRef: "fleet-self" });
-    const guard = createPersistentMultiAgentIsolationGuard({
-      storage, masterKey, fortressId: "fortress:floor", ownerRef: "fleet-self", ownerIdentity: () => "owner",
+  it("provenance: the gate-time projection refuses a foreign identity before the approval gate, and the handler rechecks", async () => {
+    const adapter = new SdwMemoryBackendAdapter({
+      storage: new MemoryStorage(),
+      masterKey: new Uint8Array(32).fill(3),
+      fortressId: "fortress:prov-gate",
+      ownerRef: "fleet-self",
     });
-    expect(await guard("memory_insert")).toEqual({ allowed: true });
-    await adapter.insertPassage({ passage_id: "p1", text: "establishes the store" }, "user_content");
-    // Remove the pin out from under the guard (a disk adversary / stray cleanup).
-    expect(await storage.delete("_sdw_meta", "sdw-owner-pin-v1")).toBe(true);
-    expect(await guard("memory_get")).toEqual({ allowed: false, reason: "owner_pin_missing_after_establishment" });
-    // Even the original owner is refused, and nothing was re-pinned.
-    expect(await readSdwOwnerPin(storage, masterKey)).toEqual({ status: "absent" });
-    expect(await guard("memory_get")).toEqual({ allowed: false, reason: "owner_pin_missing_after_establishment" });
-  });
-
-  it("MEDIUM-N2: a null pin is UNCLAIMED; a non-null id claims it once; a claimed pin never moves", async () => {
-    const storage = new MemoryStorage();
-    const masterKey = new Uint8Array(32).fill(7);
-    const mk = (id: string | undefined) =>
-      createPersistentMultiAgentIsolationGuard({
-        storage, masterKey, fortressId: "fortress:upgrade", ownerRef: "fleet-self", ownerIdentity: () => id,
-      });
-    // Pre-upgrade harness (no SANCTUARY_AGENT_ID) pins null.
-    expect(await mk(undefined)("memory_count")).toEqual({ allowed: true });
-    expect((await readSdwOwnerPin(storage, masterKey) as { data: { agent_id: null } }).data.agent_id).toBeNull();
-    // A second null caller is allowed and leaves it unclaimed.
-    expect(await mk(undefined)("memory_count")).toEqual({ allowed: true });
-    expect((await readSdwOwnerPin(storage, masterKey) as { data: { agent_id: null } }).data.agent_id).toBeNull();
-    // After the re-wrap the harness presents an id and claims the pin once.
-    expect(await mk("claude_code:fortress-x")("memory_count")).toEqual({ allowed: true });
-    expect((await readSdwOwnerPin(storage, masterKey) as { data: { agent_id: string } }).data.agent_id).toBe("claude_code:fortress-x");
-    // Claimed: a different id and a null caller are refused; the owner keeps reading.
-    expect(await mk("cursor:fortress-x")("memory_count")).toEqual({ allowed: false, reason: "owner_scope_conflict" });
-    expect(await mk(undefined)("memory_count")).toEqual({ allowed: false, reason: "owner_scope_conflict" });
-    expect(await mk("claude_code:fortress-x")("memory_count")).toEqual({ allowed: true });
-  });
-
-  it("a backend without create-if-absent cannot host the pin: refused, never overwritten", async () => {
-    const inner = new MemoryStorage();
-    const storage = new Proxy(inner, {
-      get(target, prop, receiver) {
-        if (prop === "writeIfAbsent" || prop === "replaceIfEquals") return undefined;
-        return Reflect.get(target, prop, receiver);
-      },
-    }) as MemoryStorage;
-    const guard = createPersistentMultiAgentIsolationGuard({
-      storage, masterKey: new Uint8Array(32).fill(8), fortressId: "fortress:nocap", ownerRef: "fleet-self", ownerIdentity: () => "x",
+    const { log, calls } = recordingAudit();
+    const guard = createMultiAgentIsolationGuard(wrappedAgentIdentityFromEnv);
+    const tool = createSdwMemoryProvenanceTool({ adapter, auditLog: log, isolationGuard: guard });
+    process.env.SANCTUARY_AGENT_ID = "a";
+    expect(await tool.approvalTargetArgs!({ passage_id: "p" })).toEqual({ passage_id: "p" });
+    process.env.SANCTUARY_AGENT_ID = "b";
+    await expect(Promise.resolve(tool.approvalTargetArgs!({ passage_id: "p" }))).rejects.toMatchObject({
+      category: "owner_scope_conflict",
     });
-    expect(await guard("memory_count")).toEqual({ allowed: false, reason: "owner_pin_backend_unsupported" });
-    expect(await inner.list("_sdw_meta")).toEqual([]);
+    expect(parse(await tool.handler({ passage_id: "p" })).denied).toBe(true);
+    expect(calls.filter((c) => c.operation === "sdw_memory_provenance_denied")).toHaveLength(2);
   });
 
-  it("in-process guard (test-only): two ids on one guard instance", async () => {
+  it("two ids reaching one guard instance: the second cannot read the first's passages", async () => {
     const adapter = new SdwMemoryBackendAdapter({
       storage: new MemoryStorage(),
       masterKey: new Uint8Array(32).fill(3),
@@ -463,7 +336,11 @@ describe("MEDIUM-C6: the export archive cannot be redirected outside the fortres
     await rm(dir, { recursive: true, force: true });
   });
 
-  function exportToolOver(fortress: string, log: AuditLog, hook?: () => Promise<void>) {
+  function exportToolOver(
+    fortress: string,
+    log: AuditLog,
+    hooks: { beforeOpen?: () => Promise<void>; afterRename?: () => Promise<void> } = {},
+  ) {
     const signing = makeSigning();
     return createSdwTools({
       storage: new MemoryStorage(),
@@ -476,27 +353,52 @@ describe("MEDIUM-C6: the export archive cannot be redirected outside the fortres
       resolvePublicKey: signing.resolvePublicKey,
       resolveSourceMasterKey: () => null,
       targetMasterKey: new Uint8Array(32).fill(4),
-      ...(hook ? { __afterExportDirPrepared: hook } : {}),
+      ...(hooks.beforeOpen ? { __afterExportDirPrepared: hooks.beforeOpen } : {}),
+      ...(hooks.afterRename ? { __afterExportRenamed: hooks.afterRename } : {}),
     }).find((t) => t.name === "sdw_export")!;
   }
 
-  it("a scheduled swap (sdw-exports replaced by a symlink AFTER validation) fails closed; nothing lands outside", async () => {
-    const fortress = join(dir, "fortress-swap");
-    const outside = join(dir, "outside-swap");
+  /** The attacker's move: replace the validated directory with a link to the outside, carrying the fresh dir's name across. */
+  async function swapToOutside(fortress: string, outside: string): Promise<void> {
+    const exportsDir = join(fortress, "sdw-exports");
+    const fresh = (await readdir(exportsDir))[0];
+    await rm(exportsDir, { recursive: true, force: true });
+    await symlink(outside, exportsDir);
+    if (fresh) await mkdir(join(outside, fresh), { recursive: true, mode: 0o700 });
+  }
+
+  async function nothingOutside(outside: string): Promise<void> {
+    for (const entry of await readdir(outside)) expect(await readdir(join(outside, entry))).toEqual([]);
+  }
+
+  it("swap BEFORE the open (after validation): the pre-open recheck refuses; nothing lands outside", async () => {
+    const fortress = join(dir, "fortress-swap-open");
+    const outside = join(dir, "outside-swap-open");
     await mkdir(fortress, { recursive: true, mode: 0o700 });
     await mkdir(outside, { recursive: true, mode: 0o700 });
     const { log, calls } = recordingAudit();
-    const exportTool = exportToolOver(fortress, log, async () => {
-      // The attacker's move between validation and write: replace the
-      // validated directory with a link to the outside.
-      await rm(join(fortress, "sdw-exports"), { recursive: true, force: true });
-      await symlink(outside, join(fortress, "sdw-exports"));
-    });
+    const exportTool = exportToolOver(fortress, log, { beforeOpen: () => swapToOutside(fortress, outside) });
     const args: Record<string, unknown> = { export_name: "swapped" };
     await exportTool.approvalTargetArgs!(args);
     const out = parse(await exportTool.handler(args));
     expect(out.denied).toBe(true);
-    expect(await readdir(outside)).toEqual([]);
+    await nothingOutside(outside);
+    expect(calls.filter((c) => c.operation === "sdw_export_failed").map((c) => (c.details as { category: string }).category))
+      .toEqual(["write_failed"]);
+  });
+
+  it("swap AFTER the rename: the post-rename recheck refuses and unlinks what was written", async () => {
+    const fortress = join(dir, "fortress-swap-rename");
+    const outside = join(dir, "outside-swap-rename");
+    await mkdir(fortress, { recursive: true, mode: 0o700 });
+    await mkdir(outside, { recursive: true, mode: 0o700 });
+    const { log, calls } = recordingAudit();
+    const exportTool = exportToolOver(fortress, log, { afterRename: () => swapToOutside(fortress, outside) });
+    const args: Record<string, unknown> = { export_name: "swapped" };
+    await exportTool.approvalTargetArgs!(args);
+    const out = parse(await exportTool.handler(args));
+    expect(out.denied).toBe(true);
+    await nothingOutside(outside);
     expect(calls.filter((c) => c.operation === "sdw_export_failed").map((c) => (c.details as { category: string }).category))
       .toEqual(["write_failed"]);
   });

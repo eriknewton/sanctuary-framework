@@ -515,18 +515,23 @@ const defaultFs: SdwExportFs = {
  */
 /**
  * fd-based write inside a fresh per-export directory (see tools.ts
- * prepareExportDestination): the temp file is opened O_CREAT|O_EXCL (a
- * planted symlink is refused, not followed), written and fsynced through the
- * handle, renamed within the same directory, then the final path is lstat'ed
- * and its inode compared with the handle's, so the bytes at the destination
- * are provably the bytes this call wrote.
+ * prepareExportDestination). `hooks.verify` is the caller's bounded
+ * containment recheck; it runs immediately before the O_CREAT|O_EXCL open
+ * and immediately after the rename, and on any failure whatever was written
+ * is unlinked and the error propagates. The temp name is unpredictable, a
+ * planted symlink at it is refused by O_EXCL rather than followed, the bytes
+ * are written and fsynced through the handle, and the final path's inode must
+ * equal the handle's. RESIDUAL: the window between a check returning and the
+ * next syscall is not covered (Node has no openat/renameat).
  */
 export async function writeSdwExportBundleInFreshDir(
   bundle: SdwStateExportBundle,
   freshDir: string,
   destinationPath: string,
+  hooks: { verify: () => Promise<void>; afterRename?: () => Promise<void> },
 ): Promise<void> {
   const tempPath = join(freshDir, `.tmp-${randomBytes(8).toString("hex")}`);
+  await hooks.verify();
   const handle = await open(tempPath, "wx", 0o600);
   let inode: bigint;
   try {
@@ -541,12 +546,15 @@ export async function writeSdwExportBundleInFreshDir(
   await handle.close();
   try {
     await rename(tempPath, destinationPath);
+    await hooks.afterRename?.();
+    await hooks.verify();
     const final = await lstat(destinationPath, { bigint: true });
     if (final.isSymbolicLink() || final.ino !== inode) {
       throw new Error("export destination is not the file this export wrote");
     }
   } catch (error) {
     await unlink(tempPath).catch(() => undefined);
+    await unlink(destinationPath).catch(() => undefined);
     throw error;
   }
 }
