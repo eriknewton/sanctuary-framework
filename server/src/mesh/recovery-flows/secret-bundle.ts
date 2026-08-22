@@ -202,6 +202,262 @@ function parseEnvelopeFields(
   };
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Plaintext parse — element-level typed parse of the decrypted bundle
+// (WIRE-PARSE-PLAINTEXT-02, AGENTS.md rule 11).
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Why a decrypted plaintext was refused. Closed set; each names one field path. */
+type MasterRotationBundlePlaintextParseFailure =
+  | "plaintext_not_object"
+  | "new_master_secret_not_string"
+  | "rotated_at_not_string"
+  | "new_master_pubkey_not_string"
+  | "re_issued_self_cert_invalid"
+  | "new_root_principal_cert_invalid";
+
+type MasterRotationBundlePlaintextParseResult =
+  | { ok: true; plaintext: MasterRotationBundlePlaintext }
+  | { ok: false; reason: MasterRotationBundlePlaintextParseFailure };
+
+// Members must stay in sync with mesh/constants.ts::NodeMode; satisfies
+// Record<NodeMode, true> enforces exhaustiveness at compile time — adding a
+// NodeMode variant without updating this map is a compile error, and extra
+// misspelled keys are rejected by the object literal excess-property check.
+const VALID_NODE_MODES = {
+  local: true,
+  operator_cloud: true,
+  sovereign_tee: true,
+} as const satisfies Record<NodeMode, true>;
+
+// Members must stay in sync with mesh/types.ts::PrincipalCertificate.role;
+// satisfies Record<PrincipalCertificate["role"], true> enforces exhaustiveness
+// at compile time — adding a role variant without updating this map is a
+// compile error, and extra misspelled keys are rejected by the excess-property
+// check.
+const VALID_PRINCIPAL_ROLES = {
+  root: true,
+  partner: true,
+  associate: true,
+} as const satisfies Record<PrincipalCertificate["role"], true>;
+
+// ── helpers ──────────────────────────────────────────────────────────
+
+function isNonArrayObject(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+function isOptionalString(v: unknown): v is string | undefined {
+  return v === undefined || typeof v === "string";
+}
+
+function isOptionalUnknownArray(v: unknown): v is unknown[] | undefined {
+  return v === undefined || Array.isArray(v);
+}
+
+function isValidNodeMode(v: string): v is NodeMode {
+  return Object.prototype.hasOwnProperty.call(VALID_NODE_MODES, v);
+}
+
+function isValidPrincipalRole(v: string): v is PrincipalCertificate["role"] {
+  return Object.prototype.hasOwnProperty.call(VALID_PRINCIPAL_ROLES, v);
+}
+
+/**
+ * Validate and construct a `NodeIdentityCertificate` from arbitrary `unknown`.
+ * Returns the constructed certificate or `null` on any shape violation.
+ *
+ * Must match the structural contract in `server/src/mesh/types.ts`
+ * (`NodeIdentityCertificate`). Validates shapes, not cryptographic truth.
+ */
+function parseNodeIdentityCertificate(
+  value: unknown
+): NodeIdentityCertificate | null {
+  if (!isNonArrayObject(value)) return null;
+  const r = value as Record<string, unknown>;
+
+  const node_id = r.node_id;
+  const node_pubkey = r.node_pubkey;
+  const node_mode = r.node_mode;
+  const fortress_id = r.fortress_id;
+  const joined_at = r.joined_at;
+  const capabilities = r.capabilities;
+  const principal_signature = r.principal_signature;
+  const parent_chain = r.parent_chain;
+
+  if (
+    typeof node_id !== "string" ||
+    typeof node_pubkey !== "string" ||
+    typeof node_mode !== "string" || !isValidNodeMode(node_mode) ||
+    typeof fortress_id !== "string" ||
+    typeof joined_at !== "string" ||
+    typeof capabilities !== "number" ||
+    typeof principal_signature !== "string"
+  ) {
+    return null;
+  }
+
+  // parent_chain is a required nested object with three required string fields.
+  // installMasterRotation dereferences parent_chain.fortress_master_pubkey;
+  // this parse prevents a TypeError when parent_chain is missing or non-object.
+  if (!isNonArrayObject(parent_chain)) return null;
+  const pc = parent_chain as Record<string, unknown>;
+  const pc_fortress_master_pubkey = pc.fortress_master_pubkey;
+  const pc_principal_id = pc.principal_id;
+  const pc_principal_pubkey = pc.principal_pubkey;
+  if (
+    typeof pc_fortress_master_pubkey !== "string" ||
+    typeof pc_principal_id !== "string" ||
+    typeof pc_principal_pubkey !== "string"
+  ) {
+    return null;
+  }
+
+  // Optional fields: reject wrong types when present.
+  const certificate_version = r.certificate_version;
+  const expires_at = r.expires_at;
+  const tee_attestation_hash = r.tee_attestation_hash;
+  const master_signature = r.master_signature;
+  const delegated_grants = r.delegated_grants;
+  const attestation_lineage_chain = r.attestation_lineage_chain;
+
+  if (
+    !isOptionalString(certificate_version) ||
+    !isOptionalString(expires_at) ||
+    !isOptionalString(tee_attestation_hash) ||
+    !isOptionalString(master_signature) ||
+    !isOptionalUnknownArray(delegated_grants) ||
+    !isOptionalUnknownArray(attestation_lineage_chain)
+  ) {
+    return null;
+  }
+
+  // Construct a fresh plain object from validated locals.
+  const cert: NodeIdentityCertificate = {
+    node_id,
+    node_pubkey,
+    node_mode: node_mode as NodeMode,
+    fortress_id,
+    joined_at,
+    capabilities,
+    parent_chain: {
+      fortress_master_pubkey: pc_fortress_master_pubkey,
+      principal_id: pc_principal_id,
+      principal_pubkey: pc_principal_pubkey,
+    },
+    principal_signature,
+  };
+  if (certificate_version !== undefined) cert.certificate_version = certificate_version;
+  if (expires_at !== undefined) cert.expires_at = expires_at;
+  if (tee_attestation_hash !== undefined) cert.tee_attestation_hash = tee_attestation_hash;
+  if (master_signature !== undefined) cert.master_signature = master_signature;
+  if (delegated_grants !== undefined) cert.delegated_grants = [...delegated_grants];
+  if (attestation_lineage_chain !== undefined) cert.attestation_lineage_chain = [...attestation_lineage_chain];
+  return cert;
+}
+
+/**
+ * Validate and construct a `PrincipalCertificate` from arbitrary `unknown`.
+ * Returns the constructed certificate or `null` on any shape violation.
+ *
+ * Must match the structural contract in `server/src/mesh/types.ts`
+ * (`PrincipalCertificate`). Validates shapes, not cryptographic truth.
+ */
+function parsePrincipalCertificate(
+  value: unknown
+): PrincipalCertificate | null {
+  if (!isNonArrayObject(value)) return null;
+  const r = value as Record<string, unknown>;
+
+  const principal_id = r.principal_id;
+  const principal_pubkey = r.principal_pubkey;
+  const role = r.role;
+  const fortress_id = r.fortress_id;
+  const issued_at = r.issued_at;
+  const master_signature = r.master_signature;
+
+  if (
+    typeof principal_id !== "string" ||
+    typeof principal_pubkey !== "string" ||
+    typeof role !== "string" || !isValidPrincipalRole(role) ||
+    typeof fortress_id !== "string" ||
+    typeof issued_at !== "string" ||
+    typeof master_signature !== "string"
+  ) {
+    return null;
+  }
+
+  const expires_at = r.expires_at;
+  if (!isOptionalString(expires_at)) return null;
+
+  const cert: PrincipalCertificate = {
+    principal_id,
+    principal_pubkey,
+    role: role as PrincipalCertificate["role"],
+    fortress_id,
+    issued_at,
+    master_signature,
+  };
+  if (expires_at !== undefined) cert.expires_at = expires_at;
+  return cert;
+}
+
+/**
+ * THE element-level parse for a decrypted master-rotation bundle plaintext
+ * (WIRE-PARSE-PLAINTEXT-02, AGENTS.md rule 11: one shared schema whose typed
+ * result IS the contract). Called by `unwrapMasterRotationBundle` immediately
+ * after `JSON.parse`; not exported — the only consumer is the unwrap path,
+ * whose input is JSON.parse output (plain objects, no Proxies/getters).
+ *
+ * SNAPSHOT BOUNDARY: the result is a new plain object built only from
+ * validated locals — the original input is never referenced again from the
+ * returned value. Each nested certificate is also freshly constructed.
+ * Optional array fields (delegated_grants, attestation_lineage_chain) are
+ * shallow-cloned so the snapshot holds its own references.
+ */
+function parseMasterRotationBundlePlaintext(
+  value: unknown
+): MasterRotationBundlePlaintextParseResult {
+  if (!isNonArrayObject(value)) {
+    return { ok: false, reason: "plaintext_not_object" };
+  }
+  const r = value as Record<string, unknown>;
+
+  const new_master_secret = r.new_master_secret;
+  if (typeof new_master_secret !== "string") {
+    return { ok: false, reason: "new_master_secret_not_string" };
+  }
+  const rotated_at = r.rotated_at;
+  if (typeof rotated_at !== "string") {
+    return { ok: false, reason: "rotated_at_not_string" };
+  }
+  const new_master_pubkey = r.new_master_pubkey;
+  if (typeof new_master_pubkey !== "string") {
+    return { ok: false, reason: "new_master_pubkey_not_string" };
+  }
+
+  const re_issued_self_cert = parseNodeIdentityCertificate(r.re_issued_self_cert);
+  if (re_issued_self_cert === null) {
+    return { ok: false, reason: "re_issued_self_cert_invalid" };
+  }
+
+  const new_root_principal_cert = parsePrincipalCertificate(r.new_root_principal_cert);
+  if (new_root_principal_cert === null) {
+    return { ok: false, reason: "new_root_principal_cert_invalid" };
+  }
+
+  return {
+    ok: true,
+    plaintext: {
+      new_master_secret,
+      re_issued_self_cert,
+      new_root_principal_cert,
+      rotated_at,
+      new_master_pubkey,
+    },
+  };
+}
+
 /**
  * AAD string bound into the AES-GCM tag so a bundle cannot be replayed at a
  * different rotated_at or re-targeted at a different peer.
@@ -329,15 +585,26 @@ export function unwrapMasterRotationBundle(params: {
       `master_rotation_bundle AES-GCM authentication failed: ${e instanceof Error ? e.message : String(e)}`
     );
   }
-  let plaintext: MasterRotationBundlePlaintext;
+  let parsedPlaintext: unknown;
   try {
     const decoder = new TextDecoder();
-    plaintext = JSON.parse(decoder.decode(plaintextBytes));
+    parsedPlaintext = JSON.parse(decoder.decode(plaintextBytes));
   } catch (e) {
     throw new SecretBundleError(
       `master_rotation_bundle plaintext is not valid JSON: ${e instanceof Error ? e.message : String(e)}`
     );
   }
+  // Authenticity (AES-GCM tag) is not shape. The plaintext is peer-supplied
+  // JSON; every field must be validated before dereference so a non-object
+  // plaintext (JSON null, number, array, string) produces a typed refusal
+  // instead of a raw TypeError (WIRE-PARSE-PLAINTEXT-02, AGENTS.md rule 11).
+  const ptResult = parseMasterRotationBundlePlaintext(parsedPlaintext);
+  if (!ptResult.ok) {
+    throw new SecretBundleError(
+      `master_rotation_bundle plaintext is malformed (${ptResult.reason})`
+    );
+  }
+  const plaintext = ptResult.plaintext;
   if (plaintext.new_master_pubkey !== envelope.new_master_pubkey) {
     throw new SecretBundleError(
       `master_rotation_bundle plaintext new_master_pubkey does not match envelope`
@@ -348,16 +615,7 @@ export function unwrapMasterRotationBundle(params: {
       `master_rotation_bundle plaintext rotated_at does not match envelope`
     );
   }
-  // The plaintext is AES-GCM authenticated, so its author held the key - but
-  // authenticity is not shape. Dereferencing an absent or non-object
-  // `re_issued_self_cert` here is a raw TypeError where a typed refusal
-  // belongs (AGENTS.md rule 11).
   const selfCert = plaintext.re_issued_self_cert;
-  if (selfCert === null || typeof selfCert !== "object") {
-    throw new SecretBundleError(
-      `master_rotation_bundle plaintext re_issued_self_cert is malformed`
-    );
-  }
   if (selfCert.node_id !== params.this_node_id) {
     throw new SecretBundleError(
       `master_rotation_bundle re_issued_self_cert.node_id=${describeUntrusted(selfCert.node_id)} does not match this node ${params.this_node_id}`
