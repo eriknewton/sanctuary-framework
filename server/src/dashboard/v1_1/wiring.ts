@@ -737,6 +737,14 @@ export function buildV11Bindings(
               bundle_dir: exported.bundle_dir,
               manifest_hash: exported.manifest_hash,
               artifact_count: exported.artifact_count,
+              // A7: carry trusted export values through so the dashboard can
+              // surface an honest count and prevent "Bundle ready" from masking
+              // a zero-state export. Must match HubFortressExportResult in
+              // hub/types.ts and resolution_payload in hub-events.ts.
+              state_entry_count: exported.state_entry_count,
+              ...(exported.warnings !== undefined
+                ? { warnings: exported.warnings }
+                : {}),
             };
           },
         }

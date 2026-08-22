@@ -2363,9 +2363,22 @@ function renderExitDrill() {
     ? '<span class="muted">Awaiting approval. See inbox in the right pane.</span>'
     : '<button class="btn btn-primary" data-action="exit-export-start">Snapshot now</button>';
   const step2Body = exportDone ? 'Re-key complete.' : '<span class="muted">Re-keying state for portable export.</span>';
+  // A7: always render state_entry_count (including 0) so "Bundle ready" cannot
+  // imply state was included when none was. When count is null/undefined despite
+  // exportDone, render explicit "Unavailable" so absence is not silent.
+  // Warnings are text-escaped to prevent HTML injection; they must not be rendered as raw HTML.
+  var step3StateCount = exportDone
+    ? (state.exitDrill.bundleResult.state_entry_count !== null && state.exitDrill.bundleResult.state_entry_count !== undefined
+        ? '<dt>State entries</dt><dd class="mono">' + escHtml(String(state.exitDrill.bundleResult.state_entry_count)) + '</dd>'
+        : '<dt>State entries</dt><dd class="mono">Unavailable</dd>')
+    : '';
+  var step3Warnings = (exportDone && Array.isArray(state.exitDrill.bundleResult.warnings) && state.exitDrill.bundleResult.warnings.length > 0)
+    ? '<ul class="warnings">' + state.exitDrill.bundleResult.warnings.map(function(w) { return '<li>' + escHtml(String(w)) + '</li>'; }).join('') + '</ul>'
+    : '';
   const step3Body = exportDone
     ? '<dl class="kv"><dt>Bundle dir</dt><dd class="mono">' + escHtml(state.exitDrill.bundleResult.bundle_dir || "") + '</dd>' +
-      '<dt>Manifest hash</dt><dd class="mono">' + escHtml((state.exitDrill.bundleResult.manifest_hash || "").slice(0, 32) + "...") + '</dd></dl>'
+      '<dt>Manifest hash</dt><dd class="mono">' + escHtml((state.exitDrill.bundleResult.manifest_hash || "").slice(0, 32) + "...") + '</dd>' +
+      step3StateCount + '</dl>' + step3Warnings
     : '<span class="muted">Bundle artifacts will be listed here once packaging completes.</span>';
   const verifyCmd = "sanctuary verify-exit-bundle &lt;bundle_dir&gt;";
   const importCmd = "sanctuary import-exit-bundle &lt;bundle_dir&gt;";
@@ -3497,8 +3510,11 @@ async function onInboxAction(itemId, action) {
   try {
     const r = await api("/inbox/" + encodeURIComponent(itemId) + "/" + action, { method: "POST", body: {} });
     const item = (r.data && r.data.item) || null;
+    // payload is resolved here, before the lockdown and exit-drill branches, so both can
+    // read it. Declaring it inside the lockdown if-block puts it out of scope for the
+    // exit-drill branch and causes ReferenceError when the lockdown branch did not execute.
+    const payload = item ? (item.resolution_payload || {}) : {};
     if (item && state.tier1.lockdown.inboxItemId === itemId) {
-      const payload = item.resolution_payload || {};
       if (action === "approve" && payload.outcome === "engaged") {
         state.tier1.lockdown.state = "engaged";
       } else if (action === "approve" && payload.outcome === "partial") {
@@ -3513,10 +3529,28 @@ async function onInboxAction(itemId, action) {
       renderTopbar();
     }
     if (state.exitDrill.inboxItemId === itemId && action === "approve") {
-      // Real export call would land server-side via the inbox-resolution
-      // handler; the dashboard reflects the result asynchronously via the
-      // activity feed. v1.1 ships projection-only.
-      state.exitDrill.bundleResult = { bundle_dir: "(see activity feed)", manifest_hash: "" };
+      // A7: read the real export values from resolution_payload rather than
+      // a placeholder, so the dashboard renders the honest state_entry_count
+      // and warnings. payload is in scope from the outer block above.
+      // state_entry_count accepts only nonneg integers; fractional or negative
+      // values are stored as null so the renderer omits the field rather than
+      // displaying a nonsensical count.
+      // warnings accepts only string entries; non-string entries are filtered
+      // out before they reach escHtml so a future coercion change cannot widen
+      // the injection surface.
+      const rawCount = payload.state_entry_count;
+      const secCount = (typeof rawCount === "number" && Number.isInteger(rawCount) && rawCount >= 0) ? rawCount : null;
+      const rawWarnings = payload.warnings;
+      const secWarnings = Array.isArray(rawWarnings)
+        ? rawWarnings.filter(function(w) { return typeof w === "string"; })
+        : undefined;
+      state.exitDrill.bundleResult = {
+        bundle_dir: payload.bundle_dir || "(see activity feed)",
+        manifest_hash: payload.manifest_hash || "",
+        artifact_count: typeof payload.artifact_count === "number" ? payload.artifact_count : 0,
+        state_entry_count: secCount,
+        warnings: (secWarnings && secWarnings.length > 0) ? secWarnings : undefined,
+      };
     }
     await fetchAll();
     // After approve on an agent-bound inbox item, refresh the inspect

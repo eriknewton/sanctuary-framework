@@ -103,11 +103,20 @@ export interface HubTier1FortressApprovalEnqueuedResult {
  * Result returned from `fortressExportBundle` after a fortress-scope
  * exit-bundle export approval lands. Surfaced both in the inbox item's
  * `resolution_payload` and (separately) in an activity feed entry.
+ *
+ * `state_entry_count` is always present (including 0) so the dashboard
+ * can surface the honest count and prevent "Bundle ready" from masking
+ * an empty-state export. Must match the `resolution_payload` field
+ * in `hub-events.ts` `HubApprovalPendingItem`.
  */
 export interface HubFortressExportResult {
   bundle_dir: string;
   manifest_hash: string;
   artifact_count: number;
+  /** Number of encrypted state entries included in the bundle (0 when none). */
+  state_entry_count: number;
+  /** Non-fatal export advisories (e.g., audit-receipt truncation). Absent when none. */
+  warnings?: string[];
 }
 
 /**

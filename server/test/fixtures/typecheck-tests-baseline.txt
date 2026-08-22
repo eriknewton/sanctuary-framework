@@ -190,15 +190,15 @@ test/dashboard/v1_1/agents-empty-state-canary.test.ts(60,5): error TS2741: Prope
 test/dashboard/v1_1/agents-empty-state-canary.test.ts(62,5): error TS2322: Type '"running"' is not assignable to type '"active" | "unknown" | "error" | "paused" | "restarting" | "locked_down" | "unwrapping"'.
 test/dashboard/v1_1/agents-empty-state-canary.test.ts(64,7): error TS2353: Object literal may only specify known properties, and 'window' does not exist in type 'LocalAgentBudgetSummary'.
 test/dashboard/v1_1/agents-empty-state-canary.test.ts(71,5): error TS2739: Type '{ can_pause: true; can_resume: true; can_restart: true; can_unwrap: true; can_lockdown: true; }' is missing the following properties from type '{ can_pause: boolean; can_resume: boolean; can_restart: boolean; can_unwrap: boolean; can_lockdown: boolean; can_chat: boolean; can_change_template: boolean; }': can_chat, can_change_template
-test/dashboard/v1_1/exit-bundle-wiring.test.ts(62,30): error TS2339: Property 'resolution_payload' does not exist on type 'HubInboxItem'.
+test/dashboard/v1_1/exit-bundle-wiring.test.ts(63,30): error TS2339: Property 'resolution_payload' does not exist on type 'HubInboxItem'.
 test/dashboard/v1_1/intelligence-api-router.test.ts(147,40): error TS2304: Cannot find name 'HeadersInit'.
 test/dashboard/v1_1/intelligence-real-browser-drill.test.ts(148,27): error TS2304: Cannot find name 'HeadersInit'.
 test/dashboard/v1_1/intelligence-real-browser-drill.test.ts(152,31): error TS2304: Cannot find name 'HeadersInit'.
 test/dashboard/v1_1/queue-approve-token-gate.test.ts(63,10): error TS2352: Conversion of type '{ version: "1.1"; agent_id: string; identity_id: string; harness: "openclaw"; harness_version: string; model_provider: { vendor: string; model_id: string; runs_locally: false; }; policy_id: string; ... 5 more ...; capabilities: { ...; }; }' to type 'LocalAgentRecord' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
 test/dashboard/v1_1/seal-freshness.test.ts(189,5): error TS2322: Type 'string | null' is not assignable to type 'string'.
 test/dashboard/v1_1/seal-freshness.test.ts(212,5): error TS2322: Type 'string | null' is not assignable to type 'string'.
-test/drills/v1.1-exit-drill.test.ts(326,28): error TS2304: Cannot find name 'HeadersInit'.
-test/drills/v1.1-exit-drill.test.ts(326,57): error TS2304: Cannot find name 'HeadersInit'.
+test/drills/v1.1-exit-drill.test.ts(329,28): error TS2304: Cannot find name 'HeadersInit'.
+test/drills/v1.1-exit-drill.test.ts(329,57): error TS2304: Cannot find name 'HeadersInit'.
 test/drills/v1.1-hub-drill.test.ts(222,28): error TS2304: Cannot find name 'HeadersInit'.
 test/drills/v1.1-hub-drill.test.ts(222,57): error TS2304: Cannot find name 'HeadersInit'.
 test/drills/v1.x-provider-matrix-privacy-drill.test.ts(591,39): error TS2339: Property 'denial_reason_class' does not exist on type 'PrivacyAuditPayload'.
@@ -355,8 +355,8 @@ test/honeypot/pi4-credential-honeypot.test.ts(458,9): error TS2740: Type 'Writab
 test/http/error-envelope-routes.test.ts(36,25): error TS2304: Cannot find name 'HeadersInit'.
 test/hub/activity-feed-attestation.test.ts(153,9): error TS2322: Type '() => { agent_id: string; protection_subject: string; }[]' is not assignable to type '() => LocalAgentRecord[]'.
 test/hub/chat-routes.test.ts(53,3): error TS2741: Property 'budget_summary' is missing in type '{ version: "1.1"; agent_id: string; identity_id: string; harness: "claude_code"; harness_version: string; model_provider: { vendor: string; model_id: string; runs_locally: false; }; policy_id: string; ... 4 more ...; capabilities: { ...; }; }' but required in type 'LocalAgentRecord'.
-test/hub/fortress-tier1.test.ts(267,28): error TS2304: Cannot find name 'HeadersInit'.
-test/hub/fortress-tier1.test.ts(267,57): error TS2304: Cannot find name 'HeadersInit'.
+test/hub/fortress-tier1.test.ts(269,28): error TS2304: Cannot find name 'HeadersInit'.
+test/hub/fortress-tier1.test.ts(269,57): error TS2304: Cannot find name 'HeadersInit'.
 test/hub/hub-v1.1.test.ts(431,28): error TS2304: Cannot find name 'HeadersInit'.
 test/hub/hub-v1.1.test.ts(431,57): error TS2304: Cannot find name 'HeadersInit'.
 test/hub/inbox-aggregator.test.ts(102,3): error TS2322: Type '{ bucket: "daily"; severity: "soft_warn"; used_fraction: number; version: "1.1"; item_id: string; kind: "approval_pending" | "blocked_egress" | "privacy_event" | "budget_warning" | "recovery_prompt" | "agent_error"; ... 4 more ...; resolved: boolean; }' is not assignable to type 'HubBudgetWarningItem'.

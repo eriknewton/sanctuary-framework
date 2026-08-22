@@ -135,6 +135,18 @@ export interface HubApprovalPendingItem extends HubInboxItemHeader {
     bundle_dir?: string;
     manifest_hash?: string;
     artifact_count?: number;
+    /**
+     * Number of encrypted state entries included in the bundle (0 when none).
+     * Must match `HubFortressExportResult.state_entry_count` in
+     * `hub/types.ts`. Present on `exit_bundle_export` items after approval.
+     */
+    state_entry_count?: number;
+    /**
+     * Non-fatal export advisories (e.g., audit-receipt truncation). Absent
+     * when the export raised no warnings. Must match
+     * `HubFortressExportResult.warnings` in `hub/types.ts`.
+     */
+    warnings?: string[];
     outcome?: "engaged" | "partial" | "failed" | "no_agents";
     locked_count?: number;
     failed_count?: number;
