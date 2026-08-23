@@ -1,3 +1,4 @@
+// fail-before-exempt: this PR's only edit here is re-pointing the exit/bundle.ts allowlist entry's `context` window string at restoreStorageSnapshots's new surrounding code (HIGH-1, Codex gate, 2026-08-22) after that function grew a divergence check between the loop and the write; the mechanical 220-char context-window match still finds the new string in pre-fix source too, so this file cannot fail-before by construction. HIGH-1's actual new behavior is covered fail-before by test/exit/exit-import-atomic-activation.test.ts and test/core/master-rotation.test.ts.
 import { describe, expect, it } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
