@@ -553,11 +553,11 @@ export interface ImportExitBundleOptions {
   auditLog: AuditLog;
   reputationStore?: ReputationStore;
   /**
-   * LOW (re-gate on #1303, 2026-08-23): test-only injection point, mirroring
-   * `reputationStore` above - production call sites never set this. Lets a
-   * quota-refusal test drive a small `KnownSignersStore` cap through the
-   * REAL `importExitBundle` path instead of writing thousands of real
-   * entries to reach the production ceiling.
+   * Test-only injection point, mirroring `reputationStore` above -
+   * production call sites never set this. Lets a quota-refusal test drive
+   * a small `KnownSignersStore` cap through the REAL `importExitBundle`
+   * path instead of writing thousands of real entries to reach the
+   * production ceiling.
    */
   knownSignersStore?: KnownSignersStore;
   activate?: boolean;
@@ -1344,13 +1344,12 @@ async function exportKnownSigners(
   }
   const knownSignersStore = new KnownSignersStore(storage, masterKey);
   const resolvedCandidates = await knownSignersStore.resolveMany(foreignSignerDids);
-  // HIGH (Codex re-gate on #1303, 2026-08-23): `foreignSignerDids` excludes
-  // this fortress's own identity by DID STRING only, which misses its own
-  // key under an alternate (legacy vs canonical) DID encoding. A defensive
-  // second filter, independent of DID string form: even if a self-entry
-  // somehow reached `_known_signers` (e.g. persisted before this fix
-  // shipped), it is never re-exported. Without this, a receiving fortress's
-  // OWN byte-level self-check (resolveKnownSigners) would reject the ENTIRE
+  // `foreignSignerDids` excludes this fortress's own identity by DID
+  // STRING only, which misses its own key under an alternate (legacy vs
+  // canonical) DID encoding. A defensive second filter, independent of DID
+  // string form: even if a self-entry somehow reached `_known_signers`, it
+  // is never re-exported. Without this, a receiving fortress's OWN
+  // byte-level self-check (resolveKnownSigners) would reject the ENTIRE
   // table over one bad entry, rather than the table simply never carrying
   // it.
   const ownPublicKeyBytes = fromBase64url(identity.public_key);
@@ -1361,12 +1360,12 @@ async function exportKnownSigners(
   // array elements, and a signed table whose element order tracked
   // Set/Map iteration order would make two exports of the IDENTICAL trust
   // state sign to different bytes for no semantic reason.
-  // LOW (re-gate on #1303, 2026-08-23): `first_seen_import_id` is
-  // deliberately NOT carried onto the wire - see KnownSignersEntry's doc
-  // comment (exit/verifier.ts). It embeds the UPSTREAM exporting identity's
-  // identity_id + exported_at (importIdForManifest, below); re-exporting it
-  // would relay that upstream metadata to a downstream fortress with no
-  // operator intent behind the disclosure.
+  // `first_seen_import_id` is deliberately NOT carried onto the wire -
+  // see KnownSignersEntry's doc comment (exit/verifier.ts). It embeds the
+  // UPSTREAM exporting identity's identity_id + exported_at
+  // (importIdForManifest, below); re-exporting it would relay that
+  // upstream metadata to a downstream fortress with no operator intent
+  // behind the disclosure.
   const signers: KnownSignersEntry[] = resolved
     .map((entry) => ({
       did: entry.did,
@@ -1559,9 +1558,9 @@ export async function exportExitBundle(
 
   // `didWebBinding` was validated at the top of this function, before the
   // first side effect (A9), and is embedded here unchanged.
-  // Independent gate on #1303 (2026-08-23), item 5: this export ALWAYS
-  // carries the known_signers artifact (built above), so the manifest
-  // declares the KNOWN_SIGNERS version literal, never the frozen V1 one -
+  // This export ALWAYS carries the known_signers artifact (built above),
+  // so the manifest declares the KNOWN_SIGNERS version literal, never the
+  // frozen V1 one -
   // see EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS's doc comment
   // (contracts/v1.1/constants.ts). A pre-this-change verifier, which only
   // recognizes the original literal, refuses this export cleanly via
@@ -3486,9 +3485,9 @@ export async function importExitBundle(
     // `encryptedState` is loaded, instead of a bare "not verified" that gives
     // the operator no named cause. Import stays fail-closed either way.
     verification.failure_class !== "encrypted_state_entries_unreadable" &&
-    // Independent gate on #1303 (2026-08-23), item 6: same "fall through
-    // to the specific throw" shape as the three siblings above -
-    // known_signers_invalid must NOT short to the generic not-verified
+    // Same "fall through to the specific throw" shape as the three
+    // siblings above - known_signers_invalid must NOT short to the
+    // generic not-verified
     // result here. Falling through preserves the specific, typed
     // KNOWN_SIGNERS_INVALID throw below (once identityArtifact/
     // knownSignersArtifact are loaded), instead of a bare "not verified"
@@ -3578,8 +3577,7 @@ export async function importExitBundle(
   // stale, known_signers-blind map. VERSION-GATED: absent on a bundle
   // exported before this change, `loadExitArtifact` returns null, and
   // `mergedByDid` is just a copy of `publicKeys.byDid` - behavior unchanged.
-  // MEDIUM (Codex re-gate on #1303, 2026-08-23): the SAME declared-size
-  // check `verifyExitBundle` runs (verifier.ts
+  // The SAME declared-size check `verifyExitBundle` runs (verifier.ts
   // `isKnownSignersArtifactSizeAcceptable`), before this artifact is
   // parsed - defense in depth, mirroring the resolution hard-fail
   // immediately below. (`loadExitArtifact` below still reads the bytes off
@@ -3606,7 +3604,7 @@ export async function importExitBundle(
       identityArtifact.json.bundle.did,
       publicKeys.chain.current_public_key
     );
-    // Independent gate on #1303 (2026-08-23), item 6: a PRESENT table that
+    // INVARIANT (private register EXIT-KS-01): a PRESENT table that
     // cannot be trusted is a typed HARD FAILURE, thrown here BEFORE any
     // staging write begins - defense in depth mirroring
     // `verifyExitBundle`'s SAME hard-fail (verifier.ts), which already
@@ -3966,14 +3964,13 @@ export async function importExitBundle(
     ? opts.identityManager.get(opts.destinationSignerIdentityId)
     : opts.identityManager.getDefault();
   const destinationOwnDid = destinationOwnIdentity?.did;
-  // HIGH (Codex re-gate on #1303, 2026-08-23): resolved once here, alongside
-  // `destinationOwnDid`, for the SAME byte-level self-exclusion the persist
-  // loop below and `exportKnownSigners` both need - a DID-STRING-only
-  // exclusion misses the destination's own key under an alternate
-  // (legacy vs canonical) DID encoding, which could otherwise enter
-  // `_known_signers` and later cause a receiving fortress's OWN byte-level
-  // check (resolveKnownSigners) to reject an entire otherwise-legitimate
-  // table.
+  // Resolved once here, alongside `destinationOwnDid`, for the SAME
+  // byte-level self-exclusion the persist loop below and
+  // `exportKnownSigners` both need - a DID-STRING-only exclusion misses
+  // the destination's own key under an alternate (legacy vs canonical) DID
+  // encoding, which could otherwise enter `_known_signers` and later cause
+  // a receiving fortress's OWN byte-level check (resolveKnownSigners) to
+  // reject an entire otherwise-legitimate table.
   const destinationOwnPublicKey = destinationOwnIdentity
     ? fromBase64url(destinationOwnIdentity.public_key)
     : undefined;
@@ -4240,23 +4237,22 @@ export async function importExitBundle(
     await opts.auditLog.flush();
 
     if (reputationArtifact && reputationStore) {
-      // HIGH (Codex re-gate on #1303, 2026-08-23): the known-signers
-      // CANDIDATE set and its capacity PREFLIGHT are computed here, BEFORE
-      // `reputationStore.importBundle` below writes a single `_reputation`
-      // entry. Every input this needs (the bundle's OWN declared
-      // attestations, `mergedByDid`, `publicKeys.byIdentityId`,
-      // `destinationOwnPublicKey`) is already available - none of it
-      // depends on what importBundle actually admits. Running the
-      // capacity decision first means a batch that would exceed the cap is
-      // refused with NOTHING written anywhere, including the reputation
-      // attestations that would themselves have been admitted - avoiding a
-      // narrower, harder-to-reason-about failure mode where a LATER
-      // KnownSignersQuotaError forces rollback of `_reputation` writes
-      // whose post-image recording (a separate, best-effort write) might
-      // itself have failed silently.
+      // The known-signers CANDIDATE set and its capacity PREFLIGHT are
+      // computed here, BEFORE `reputationStore.importBundle` below writes
+      // a single `_reputation` entry. Every input this needs (the
+      // bundle's OWN declared attestations, `mergedByDid`,
+      // `publicKeys.byIdentityId`, `destinationOwnPublicKey`) is already
+      // available - none of it depends on what importBundle actually
+      // admits. Running the capacity decision first means a batch that
+      // would exceed the cap is refused with NOTHING written anywhere,
+      // including the reputation attestations that would themselves have
+      // been admitted - avoiding a narrower, harder-to-reason-about
+      // failure mode where a LATER KnownSignersQuotaError forces rollback
+      // of `_reputation` writes whose post-image recording (a separate,
+      // best-effort write) might itself have failed silently.
       //
-      // Exit V2 drill F2 (2026-08-22/23): every foreign attestation
-      // signer's key this fortress is about to verify (via the source
+      // Exit V2 drill F2: every foreign attestation signer's key this
+      // fortress is about to verify (via the source
       // bundle's own identity chain or the resolved known_signers table)
       // is a persistence candidate, so a LATER export from THIS fortress
       // can rebuild a known_signers table of its own and a re-exported
@@ -4276,26 +4272,25 @@ export async function importExitBundle(
       for (const did of foreignSignerDids) {
         const key = mergedByDid.get(did);
         if (!key) continue;
-        // HIGH (Codex re-gate on #1303, 2026-08-23): `foreignSignerDids`
-        // excludes the destination's own DID by STRING only
-        // (`knownSignerForeignDids`), which misses the destination's own
-        // key under an alternate (legacy vs canonical) DID encoding - an
-        // attestation whose `signer` happens to be the destination's key
-        // spelled the OTHER way would otherwise be persisted as though it
-        // were a genuinely foreign signer. Excluded here by KEY BYTES,
-        // independent of DID string form.
+        // `foreignSignerDids` excludes the destination's own DID by
+        // STRING only (`knownSignerForeignDids`), which misses the
+        // destination's own key under an alternate (legacy vs canonical)
+        // DID encoding - an attestation whose `signer` happens to be the
+        // destination's key spelled the OTHER way would otherwise be
+        // persisted as though it were a genuinely foreign signer. Excluded
+        // here by KEY BYTES, independent of DID string form.
         if (
           destinationOwnPublicKey &&
           publicKeyBytesEqual(key, destinationOwnPublicKey)
         ) {
           continue;
         }
-        // MEDIUM-4 (independent gate on #1303, 2026-08-23): never persist,
-        // and therefore never later RE-VOUCH FOR, a key the source
-        // fortress's own rotation chain marks `compromised` - persisting it
-        // here would let THIS fortress launder trust in a key its own
-        // exporter has disclaimed, presenting it to a THIRD fortress on a
-        // later re-export as though it were an ordinary verified signer.
+        // Never persist, and therefore never later RE-VOUCH FOR, a key
+        // the source fortress's own rotation chain marks `compromised` -
+        // persisting it here would let THIS fortress launder trust in a
+        // key its own exporter has disclaimed, presenting it to a THIRD
+        // fortress on a later re-export as though it were an ordinary
+        // verified signer.
         // Cross-referenced by KEY BYTES (not DID) against every candidate
         // in `publicKeys.byIdentityId` - the SAME structure
         // `compromisedRetiredSignatureUse` (above) already uses for the
@@ -4325,15 +4320,15 @@ export async function importExitBundle(
           knownSignersToPersist
         );
         if (preflight.exceeds) {
-          // F5 (Codex re-gate 2 on #1303, 2026-08-23): `wouldExceedCapacity`
-          // only ever reports `exceeds: true` after it has actually read the
-          // store-wide count (see its doc comment - the `undefined` case is
-          // paired ONLY with `exceeds: false`), so `currentCount` is
-          // guaranteed defined on this branch. The explicit check below
-          // still fails CLOSED (throws either way) rather than trusting
-          // that pairing with an unchecked cast, so a future change to
-          // `wouldExceedCapacity` that breaks the pairing cannot silently
-          // let an over-capacity batch through.
+          // `wouldExceedCapacity` only ever reports `exceeds: true` after
+          // it has actually read the store-wide count (see its doc
+          // comment - the `undefined` case is paired ONLY with
+          // `exceeds: false`), so `currentCount` is guaranteed defined on
+          // this branch. The explicit check below still fails CLOSED
+          // (throws either way) rather than trusting that pairing with an
+          // unchecked cast, so a future change to `wouldExceedCapacity`
+          // that breaks the pairing cannot silently let an over-capacity
+          // batch through.
           if (preflight.currentCount === undefined) {
             throw new Error(
               "known-signers capacity preflight reported exceeds=true " +
@@ -4660,8 +4655,8 @@ export async function importExitBundle(
 }
 
 export function exitBundleManifestShape(): Record<string, unknown> {
-  // Independent gate on #1303 (2026-08-23), item 5: this reflects what a
-  // CURRENT export actually produces (the known_signers-carrying version
+  // This reflects what a CURRENT export actually produces (the
+  // known_signers-carrying version
   // and its 8-kind set) - the frozen original V1 shape
   // (EXIT_BUNDLE_MANIFEST_VERSION + EXIT_BUNDLE_ARTIFACT_KINDS) still
   // exists and still verifies unchanged, but is no longer what this build

@@ -18,9 +18,8 @@
  * single source of truth - so it is refused to every external read/write/
  * import path the same way `_reputation` is.
  *
- * GROWTH BOUND (AGENTS.md rule 8; HARDENED - independent gate on #1303,
- * 2026-08-23, item 4, HIGH: a per-IMPORT bound alone is not a STORE-WIDE
- * bound. Each import individually stays under
+ * GROWTH BOUND (AGENTS.md rule 8): a per-IMPORT bound alone is not a
+ * STORE-WIDE bound. Each import individually stays under
  * `ReputationStore.importBundle`'s own quota
  * (`assertRecordQuotaForCount`), but a caller-controlled attestation_id and
  * fresh signer DIDs mean a sequence of otherwise-legitimate, individually
@@ -57,8 +56,8 @@ import { MAX_REPUTATION_RECORDS } from "./reputation-store.js";
 export const KNOWN_SIGNERS_NAMESPACE = "_known_signers";
 
 /**
- * Independent gate on #1303 (2026-08-23), item 4: the store-wide ceiling on
- * total persisted `_known_signers` records, checked by `persistIfAbsent`
+ * The store-wide ceiling on total persisted `_known_signers` records,
+ * checked by `persistIfAbsent`
  * before every write batch. Equal to `MAX_REPUTATION_RECORDS` (not a
  * fraction of it, unlike the global/per-origin 10x ratio elsewhere in this
  * file family): in the worst case every one of up to `MAX_REPUTATION_RECORDS`
@@ -99,8 +98,8 @@ export interface StoredKnownSigner {
   public_key: string;
   /**
    * The `_exit_imports` import id at which THIS fortress first verified
-   * this signer. MEDIUM-3 (independent gate on #1303, 2026-08-23):
-   * informational and diagnostic ONLY - see the matching field doc on
+   * this signer. Informational and diagnostic ONLY - see the matching
+   * field doc on
    * `KnownSignersEntry` (exit/verifier.ts) for the full hearsay-bound
    * statement. Once this value crosses a re-export hop it is the relaying
    * fortress's own self-report about ITS import history, not this
@@ -112,7 +111,7 @@ export interface StoredKnownSigner {
 
 /**
  * Storage key for a DID's known-signer record. Hashed rather than the raw
- * DID (MEDIUM-2 pattern, server/src/exit/bundle.ts `postImageRecordKey`):
+ * DID (same pattern as server/src/exit/bundle.ts `postImageRecordKey`):
  * `did:web:...` DIDs can be arbitrarily long operator-influenced strings,
  * and an unbounded raw key risks a filesystem path-component limit whose
  * ENAMETOOLONG failure would otherwise be misread as "never persisted".
@@ -156,8 +155,8 @@ export class KnownSignersStore {
    * is stamped as `first_seen_import_id` on every NEWLY written record only
    * - an already-persisted DID keeps its original import id.
    *
-   * Independent gate on #1303 (2026-08-23), item 4: the STORE-WIDE cap
-   * (`MAX_KNOWN_SIGNERS`) is checked ONCE, atomically, before any write in
+   * The STORE-WIDE cap (`MAX_KNOWN_SIGNERS`) is checked ONCE, atomically,
+   * before any write in
    * this batch - `currentCount` (a single `storage.list` call) plus the
    * NET-NEW count (candidates not already present; an already-persisted DID
    * costs nothing) is compared against the cap, and the WHOLE batch is
@@ -200,27 +199,26 @@ export class KnownSignersStore {
   }
 
   /**
-   * HIGH (Codex re-gate on #1303, 2026-08-23): a READ-ONLY capacity dry-run
-   * - writes nothing, throws nothing. Lets a caller (importExitBundle,
-   * server/src/exit/bundle.ts) preflight the capacity decision BEFORE any
-   * OTHER write in the same activation (specifically, before
-   * `ReputationStore.importBundle`'s `_reputation` writes), so a batch that
-   * would exceed the cap is refused with NOTHING written anywhere - not
-   * even the reputation attestations that would themselves have been
-   * admitted. `persistIfAbsent` below re-runs the SAME check as the
-   * authoritative second line immediately before it writes, so a caller
-   * that skips this preflight (or a state change between the two calls)
-   * still cannot write past the cap.
+   * A READ-ONLY capacity dry-run - writes nothing, throws nothing. Lets a
+   * caller (importExitBundle, server/src/exit/bundle.ts) preflight the
+   * capacity decision BEFORE any OTHER write in the same activation
+   * (specifically, before `ReputationStore.importBundle`'s `_reputation`
+   * writes), so a batch that would exceed the cap is refused with NOTHING
+   * written anywhere - not even the reputation attestations that would
+   * themselves have been admitted. `persistIfAbsent` below re-runs the
+   * SAME check as the authoritative second line immediately before it
+   * writes, so a caller that skips this preflight (or a state change
+   * between the two calls) still cannot write past the cap.
    */
   async wouldExceedCapacity(
     entries: Array<{ did: string; publicKey: Uint8Array }>
   ): Promise<{
     exceeds: boolean;
-    // F5 (Codex re-gate 2 on #1303, 2026-08-23): `undefined`, not a `-1`
-    // sentinel, when nothing net-new means the store-wide count was never
-    // read - a caller that (incorrectly) read `currentCount` without first
-    // checking `exceeds` would otherwise see a fabricated negative number
-    // that looks like real data instead of "not computed".
+    // `undefined`, not a `-1` sentinel, when nothing net-new means the
+    // store-wide count was never read - a caller that (incorrectly) read
+    // `currentCount` without first checking `exceeds` would otherwise see
+    // a fabricated negative number that looks like real data instead of
+    // "not computed".
     currentCount: number | undefined;
     netNewCount: number;
     limit: number;
