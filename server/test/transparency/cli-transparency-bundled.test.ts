@@ -1,3 +1,4 @@
+// fail-before-exempt: this PR's only edit here is removing a stale stderr filter for a line now gated behind SANCTUARY_VERBOSE (adaptation-only, no new assertion). This file's own subprocess checks need a built dist/cli.js, which the fail-before job never produces (only npm ci runs there; the full CI job runs npm run build first), so they stay skip-gated under both pre-fix and post-fix source in this harness by construction. The SANCTUARY_VERBOSE default-quiet behavior itself is covered fail-before by audit-log-stdout-purity.test.ts's default-quiet assertion.
 /**
  * Bundled-binary round-trip drill for `sanctuary transparency`.
  *

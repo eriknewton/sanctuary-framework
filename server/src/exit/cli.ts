@@ -15,8 +15,14 @@ import { StateStore } from "../cognitive/state-store.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { ReputationStore } from "../reputation/reputation-store.js";
 import { loadConfig } from "../config.js";
+import { resolveStoragePath } from "../paths.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "../principal-policy/loader.js";
-import { resolveCliMasterKey, readCustodyEnvelope } from "../core/master-custody.js";
+import {
+  resolveCliMasterKey,
+  readCustodyEnvelope,
+  envelopeMissingButSentinelPresent,
+  CUSTODY_SENTINEL_KEY,
+} from "../core/master-custody.js";
 import {
   exportExitBundle,
   importExitBundle,
@@ -362,8 +368,24 @@ async function openFortressForRecoveryOnly(
   const passphrase =
     flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
   const recoveryKey = env.SANCTUARY_RECOVERY_KEY;
-  const config = await loadConfig();
-  const stateStoragePath = join(config.storage_path, "state");
+  // Round-2 fix (independent gate on #1304, HIGH): deliberately NOT
+  // `loadConfig()`. `loadConfig` reads and parses `sanctuary.json`, and on
+  // a malformed or schema-incompatible file it calls `quarantineConfigFile`
+  // (config.ts), which RENAMES that file - a write, reachable before any
+  // lock, even while another process holds the admission lock this
+  // function is supposed to defer to. `resolveStoragePath` (paths.ts) is
+  // the same SANCTUARY_STORAGE_PATH-then-default precedence every `exit`
+  // verb resolves to in the common case (no verb passes an explicit
+  // config path), and it never touches `sanctuary.json` at all - the
+  // config file's OTHER settings (dashboard port, etc.) are irrelevant to
+  // rolling back a journal, so this function has no legitimate reason to
+  // read it. BOUND: an operator whose sanctuary.json declares a
+  // storage_path different from the directory the file itself lives in
+  // (an unusual, self-referential setup) resolves to a different fortress
+  // here than other verbs would - the read-only envelope peek below still
+  // fails safe in that case (refuses by name; never guesses).
+  const storagePath = resolveStoragePath(env);
+  const stateStoragePath = join(storagePath, "state");
   const storage = new FilesystemStorage(stateStoragePath);
 
   // Read-only peek. `readCustodyEnvelope` is a plain `storage.read` (see
@@ -371,6 +393,20 @@ async function openFortressForRecoveryOnly(
   // ENOENT and returns null) - a missing fortress leaves NOTHING on disk.
   const envelope = await readCustodyEnvelope(storage);
   if (!envelope) {
+    // LOW (round-2 fix, independent gate on #1304): a custody SENTINEL
+    // with no envelope means the envelope was deleted, hidden, or
+    // corrupted after this fortress was already migrated - a possible
+    // integrity problem, not "no fortress" and not "needs migration".
+    // Checked FIRST, matching `establishMaster`'s own ordering
+    // (core/master-custody.ts) and severity: an integrity concern
+    // outranks either of the other two refusals. Reuses
+    // `envelopeMissingButSentinelPresent()` verbatim - the SAME error the
+    // normal resolver throws for this exact condition - rather than a
+    // hand-mirrored copy of its guidance that could drift from it.
+    const sentinel = await storage.read("_meta", CUSTODY_SENTINEL_KEY);
+    if (sentinel) {
+      throw envelopeMissingButSentinelPresent();
+    }
     // Legacy markers (core/master-custody.ts's `establishMaster`): present
     // without an envelope means this fortress predates envelope custody
     // and opening it normally would migrate it - a write `recover` must
@@ -381,19 +417,19 @@ async function openFortressForRecoveryOnly(
     if (legacyParams || legacyRecoveryHash) {
       throw new ExitRecoverLegacyMigrationRequiredError();
     }
-    throw new ExitRecoverNoFortressError(config.storage_path);
+    throw new ExitRecoverNoFortressError(storagePath);
   }
 
   let masterKey: Uint8Array;
   if (passphrase) {
     masterKey = await resolveCliMasterKey(storage, {
       passphrase,
-      storagePathHint: config.storage_path,
+      storagePathHint: storagePath,
     });
   } else if (recoveryKey) {
     masterKey = await resolveCliMasterKey(storage, {
       recoveryKey,
-      storagePathHint: config.storage_path,
+      storagePathHint: storagePath,
     });
   } else {
     throw new Error(

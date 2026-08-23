@@ -49,11 +49,12 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
-import { mkdir, open, readdir, readFile, stat } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { resolveCliMasterKey } from "../../src/core/master-custody.js";
+import { deriveMasterKey } from "../../src/core/key-derivation.js";
 import {
   runExitCommand,
   printExitHelp,
@@ -169,15 +170,60 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
           SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
         },
       });
+      // The tree-diff assertion runs FIRST, ahead of the message/code
+      // checks below: this is the property the test exists to prove, and
+      // ordering it first means a divergence that still refuses (for a
+      // wrong reason) but silently mutates fails HERE, not on a later,
+      // less specific assertion.
+      const after = await snapshotTree(tempFortress.storagePath);
+      expect(after).toBe(before);
+      expect(after).toBe("ABSENT");
       expect(code).toBe(1);
       expect(err.text).toContain("No fortress found at");
       expect(err.text).toContain("Nothing to recover");
       expect(err.text).toContain(`sanctuary exit ${EXIT_RECOVERY_VERB}`);
       expect(err.text).toContain("deliberately never establishes custody");
+    } finally {
+      await tempFortress.cleanup();
+    }
+  });
 
+  it("LOW fix (round 2, independent gate on #1304): a custody sentinel with no envelope is refused as a possible integrity problem, not treated as 'no fortress', and creates NOTHING new on disk (no-diff)", async () => {
+    const tempFortress = await createTempFortress("sanctuary-recover-sentinel-nodiff");
+    try {
+      // Plant ONLY the sentinel - no envelope, no legacy markers. This is
+      // the shape `establishMaster` (core/master-custody.ts) treats as a
+      // possible envelope loss or tampering: an envelope existed once
+      // (only established alongside a sentinel) and is now gone.
+      const storage = new FilesystemStorage(join(tempFortress.storagePath, "state"));
+      await storage.write("_meta", "custody-sentinel", Buffer.from("planted-sentinel-ciphertext"));
+
+      const before = await snapshotTree(tempFortress.storagePath);
+
+      const out = new StringWritable();
+      const err = new StringWritable();
+      const code = await runExitCommand({
+        argv: [EXIT_RECOVERY_VERB],
+        out,
+        err,
+        env: {
+          SANCTUARY_STORAGE_PATH: tempFortress.storagePath,
+          SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
+        },
+      });
+      // Tree-diff FIRST; see the fresh-fortress test above for why.
       const after = await snapshotTree(tempFortress.storagePath);
       expect(after).toBe(before);
-      expect(after).toBe("ABSENT");
+      expect(code).toBe(1);
+      // The SAME integrity guidance establishMaster's own resolver gives
+      // for this exact condition (envelopeMissingButSentinelPresent,
+      // core/master-custody.ts) - reused verbatim, not paraphrased.
+      expect(err.text).toContain("custody sentinel exists but its custody envelope");
+      expect(err.text).toContain("is missing or unreadable");
+      // NOT the "no fortress" or "legacy migration" refusals - a sentinel
+      // without an envelope is neither of those.
+      expect(err.text).not.toContain("No fortress found at");
+      expect(err.text).not.toContain("legacy (pre-envelope) custody");
     } finally {
       await tempFortress.cleanup();
     }
@@ -187,22 +233,23 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
     const tempFortress = await createTempFortress("sanctuary-recover-legacy-nodiff");
     try {
       // Plant ONLY the legacy marker - no envelope, no other state -
-      // simulating a pre-envelope fortress. The refusal is a truthy
-      // read before any parse, so the payload need not be a real,
-      // usable KeyDerivationParams for this test's purpose.
+      // simulating a pre-envelope fortress. `openFortressForRecoveryOnly`
+      // refuses on this marker before ever parsing it, so a malformed
+      // payload would still pass THIS test - but the MANUAL divergence
+      // proof (see the file-level comment) reverts to the pre-fix code,
+      // which DOES reach `deriveMasterKey(passphrase, params)`
+      // (core/key-derivation.ts) on its way to the migration write this
+      // test exists to detect. A fixture that is not real
+      // KeyDerivationParams shape (real field names: alg/salt/m/t/p/l)
+      // makes that reverted run fail on parameter validation instead of
+      // on the tree-diff assertion, which is a false negative on the
+      // negative control - so this uses REAL derivable params.
       const storage = new FilesystemStorage(join(tempFortress.storagePath, "state"));
+      const { params: legacyKeyParams } = await deriveMasterKey(TEST_PASSPHRASE);
       await storage.write(
         "_meta",
         "key-params",
-        Buffer.from(
-          JSON.stringify({
-            algorithm: "argon2id",
-            salt: "test-salt-not-real",
-            iterations: 3,
-            memory_kib: 65536,
-            parallelism: 1,
-          })
-        )
+        Buffer.from(JSON.stringify(legacyKeyParams))
       );
 
       const before = await snapshotTree(tempFortress.storagePath);
@@ -218,15 +265,15 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
           SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
         },
       });
+      // Tree-diff FIRST; see the fresh-fortress test above for why.
+      const after = await snapshotTree(tempFortress.storagePath);
+      expect(after).toBe(before);
       expect(code).toBe(1);
       expect(err.text).toContain("legacy (pre-envelope) custody");
       expect(err.text).toContain(`sanctuary exit ${EXIT_RECOVERY_VERB}`);
       expect(err.text).toContain("deliberately never migrates custody");
       // Names the verb(s) that legitimately perform the migration.
       expect(err.text).toContain("sanctuary exit export");
-
-      const after = await snapshotTree(tempFortress.storagePath);
-      expect(after).toBe(before);
     } finally {
       await tempFortress.cleanup();
     }
@@ -261,12 +308,71 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
           SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
         },
       });
+      // Tree-diff FIRST; see the fresh-fortress test above for why.
+      const after = await snapshotTree(tempFortress.storagePath);
+      expect(after).toBe(before);
       expect(code).toBe(1);
       expect(err.text).toContain(`sanctuary exit ${EXIT_RECOVERY_VERB}`);
       expect(err.text).not.toContain("sanctuary exit verify");
+    } finally {
+      await tempFortress.cleanup();
+    }
+  });
 
+  it("HIGH fix (round 2, independent gate on #1304): a malformed sanctuary.json is never read or quarantined by recover, even while refusing on a held admission lock (no-diff, config file not renamed)", async () => {
+    const tempFortress = await createTempFortress("sanctuary-recover-malformed-config-nodiff");
+    try {
+      const storage = await bootstrapFortress(tempFortress.storagePath);
+
+      // `loadConfig` (server/src/config.ts) renames a malformed
+      // sanctuary.json to `<path>.corrupted.<timestamp>` via
+      // `quarantineConfigFile` - a write `recover` must never trigger,
+      // whether or not it also happens to refuse for another reason
+      // (here: a held admission lock). Deliberately invalid JSON, not a
+      // schema mismatch, so the OLD (pre-round-2) code would have hit
+      // `loadConfig`'s SyntaxError->quarantine branch specifically.
+      await writeFile(
+        join(tempFortress.storagePath, "sanctuary.json"),
+        "{ this is not valid json"
+      );
+
+      const lockDir = storage.namespacePath(EXIT_IMPORT_JOURNAL_NAMESPACE);
+      const lockPath = join(lockDir, "admission.lock");
+      await mkdir(lockDir, { recursive: true, mode: 0o700 });
+      const handle = await open(lockPath, "wx+", 0o600);
+      await handle.writeFile(
+        JSON.stringify({ owner: "rotate", pid: 999_999, acquired_at: new Date(0).toISOString() })
+      );
+      await handle.close();
+
+      // Snapshot AFTER bootstrap/config-plant/lock-plant setup - the
+      // window under test is only the recover ATTEMPT itself. The
+      // malformed sanctuary.json is already part of this snapshot (it
+      // lives directly under the fortress root, which snapshotTree walks
+      // recursively), so a quarantine-rename would show up as a diff.
+      const before = await snapshotTree(tempFortress.storagePath);
+
+      const out = new StringWritable();
+      const err = new StringWritable();
+      const code = await runExitCommand({
+        argv: [EXIT_RECOVERY_VERB],
+        out,
+        err,
+        env: {
+          SANCTUARY_STORAGE_PATH: tempFortress.storagePath,
+          SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
+        },
+      });
+      // Tree-diff FIRST; see the fresh-fortress test above for why.
       const after = await snapshotTree(tempFortress.storagePath);
       expect(after).toBe(before);
+      // Explicit, not just implied by the tree-diff: the exact file is
+      // still exactly where it was, under its original name.
+      expect(
+        await stat(join(tempFortress.storagePath, "sanctuary.json"))
+      ).toBeTruthy();
+      expect(code).toBe(1);
+      expect(err.text).toContain(`sanctuary exit ${EXIT_RECOVERY_VERB}`);
     } finally {
       await tempFortress.cleanup();
     }

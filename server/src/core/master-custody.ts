@@ -464,8 +464,15 @@ export class CustodyRotationInProgressError extends Error {
   }
 }
 
-/** Message for "the sentinel proves an envelope existed, but it is gone". */
-function envelopeMissingButSentinelPresent(): CustodyEnvelopeIntegrityError {
+/**
+ * Message for "the sentinel proves an envelope existed, but it is gone".
+ * Exported (round-2 fix, independent gate on #1304) so a caller outside
+ * `establishMaster` that peeks at custody read-only before deciding
+ * whether to open at all - `exit/cli.ts`'s `openFortressForRecoveryOnly` -
+ * can throw the SAME error for the SAME condition, rather than a
+ * hand-mirrored copy of its guidance that could drift from this one.
+ */
+export function envelopeMissingButSentinelPresent(): CustodyEnvelopeIntegrityError {
   return new CustodyEnvelopeIntegrityError(
     "Sanctuary: this fortress's custody sentinel exists but its custody envelope\n" +
       "is missing or unreadable. The envelope was deleted, hidden, or corrupted —\n" +
