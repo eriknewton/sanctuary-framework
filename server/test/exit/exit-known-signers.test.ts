@@ -598,6 +598,22 @@ describe("Exit V2 known_signers (drill F2)", () => {
     );
     const beforeSnapshot = await snapshotAll(fortressB.storage);
 
+    // F3 (Codex re-gate 2 on #1303, 2026-08-23): the known_signers capacity
+    // preflight (`wouldExceedCapacity`) now runs BEFORE
+    // `ReputationStore.importBundle` even starts (see bundle.ts - the
+    // preflight was reordered ahead of the reputation write for exactly
+    // this reason, addendum HIGH on #1303). This is a counting assertion,
+    // not a snapshot-only one, so it distinguishes that ordering from a
+    // "write-then-roll-back" outcome that would look identical in the
+    // BEFORE/AFTER snapshot alone: it proves zero `_reputation` writes were
+    // ever attempted, not merely that any that happened were undone.
+    let reputationWriteCount = 0;
+    const originalWrite = fortressB.storage.write.bind(fortressB.storage);
+    fortressB.storage.write = async (namespace, key, data) => {
+      if (namespace === "_reputation") reputationWriteCount++;
+      return originalWrite(namespace, key, data);
+    };
+
     let thrown: unknown;
     try {
       await importExitBundle({
@@ -620,11 +636,13 @@ describe("Exit V2 known_signers (drill F2)", () => {
       "ACTIVATION_FAILED_AND_CLEANED"
     );
 
-    // The reputation attestation that DID succeed (imported before the
-    // known_signers quota check ran) must be rolled back too - a partial
-    // activation is not an acceptable outcome, so the WHOLE destination
-    // tree - including `_reputation`, not only `_known_signers` - is
-    // byte-identical to before the attempt.
+    // The known_signers capacity preflight refuses the WHOLE activation
+    // before `_reputation` (or `_known_signers`) is ever written - not a
+    // partial write rolled back afterward. Both the counting assertion
+    // above (preflight-first) and this byte-identical snapshot (nothing
+    // observable changed either way) hold, and together they are stronger
+    // than either alone.
+    expect(reputationWriteCount).toBe(0);
     const afterSnapshot = await snapshotAll(fortressB.storage);
     expect(afterSnapshot).toBe(beforeSnapshot);
   });
@@ -896,6 +914,56 @@ describe("Exit V2 known_signers (drill F2)", () => {
     } catch (err) {
       thrown = err;
     }
+    expect(thrown).toBeInstanceOf(ExitBundleImportError);
+    expect((thrown as ExitBundleImportError).code).toBe("KNOWN_SIGNERS_INVALID");
+
+    const afterSnapshot = await snapshotAll(cStorage);
+    expect(afterSnapshot).toBe(beforeSnapshot);
+  });
+
+  it("a malformed-length signature (1 byte, still valid base64url) is refused as known_signers_invalid, never an uncaught exception (Codex re-gate 2 on #1303, item 2)", async () => {
+    const fortressA = await makeHarness();
+    const aIdentityId = await createIdentity(fortressA, "sig-a");
+    await recordAttestation(fortressA, aIdentityId, "sig-ix-a1", "sig-ctx");
+    const bundleAB = await newBundleDir("sanctuary-known-signers-sig-ab-");
+    await exportBundle(fortressA, bundleAB);
+    const fortressB = await makeHarness();
+    const bIdentityId = await createIdentity(fortressB, "sig-b");
+    const importedAB = await importInto(fortressB, bIdentityId, bundleAB);
+    expect(importedAB.activated).toBe(true);
+
+    const bundleBC = await newBundleDir("sanctuary-known-signers-sig-bc-");
+    await exportBundle(fortressB, bundleBC);
+    // Deliberately NOT passing a `resignWith` identity - a real signer
+    // would never produce a 1-byte signature, so this fixture writes the
+    // malformed bytes directly and leaves them unsigned-over, exercising
+    // the raw decode-and-verify path exactly as a corrupted-on-disk or
+    // truncated-in-transit artifact would arrive.
+    await rewriteKnownSigners(bundleBC, fortressB, (parsed) => ({
+      ...parsed,
+      signature: toBase64url(new Uint8Array([7])),
+    }));
+
+    // Noble's ed25519.verify throws on a malformed-length signature rather
+    // than returning false; verify must still report the typed failure
+    // class, not propagate an uncaught exception to its caller.
+    const verifiedBC = await verifyExitBundle(bundleBC);
+    expect(verifiedBC.passed).toBe(false);
+    expect(verifiedBC.failure_class).toBe("known_signers_invalid");
+
+    const fortressC = await makeHarness();
+    const cIdentityId = await createIdentity(fortressC, "sig-c");
+    const cStorage = fortressC.storage;
+    const beforeSnapshot = await snapshotAll(cStorage);
+
+    let thrown: unknown;
+    try {
+      await importInto(fortressC, cIdentityId, bundleBC);
+    } catch (err) {
+      thrown = err;
+    }
+    // Same requirement on the import path: a typed ExitBundleImportError,
+    // never the raw exception escaping from resolveKnownSigners.
     expect(thrown).toBeInstanceOf(ExitBundleImportError);
     expect((thrown as ExitBundleImportError).code).toBe("KNOWN_SIGNERS_INVALID");
 

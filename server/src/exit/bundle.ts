@@ -3580,9 +3580,12 @@ export async function importExitBundle(
   // `mergedByDid` is just a copy of `publicKeys.byDid` - behavior unchanged.
   // MEDIUM (Codex re-gate on #1303, 2026-08-23): the SAME declared-size
   // check `verifyExitBundle` runs (verifier.ts
-  // `isKnownSignersArtifactSizeAcceptable`), before this artifact is ever
-  // read - defense in depth, mirroring the resolution hard-fail
-  // immediately below.
+  // `isKnownSignersArtifactSizeAcceptable`), before this artifact is
+  // parsed - defense in depth, mirroring the resolution hard-fail
+  // immediately below. (`loadExitArtifact` below still reads the bytes off
+  // disk to hash them, same as every other artifact kind; this check's
+  // job is only to refuse before those bytes are ever handed to a JSON
+  // parser.)
   if (!isKnownSignersArtifactSizeAcceptable(manifest)) {
     throw new ExitBundleImportError(
       "KNOWN_SIGNERS_INVALID",
@@ -4322,6 +4325,22 @@ export async function importExitBundle(
           knownSignersToPersist
         );
         if (preflight.exceeds) {
+          // F5 (Codex re-gate 2 on #1303, 2026-08-23): `wouldExceedCapacity`
+          // only ever reports `exceeds: true` after it has actually read the
+          // store-wide count (see its doc comment - the `undefined` case is
+          // paired ONLY with `exceeds: false`), so `currentCount` is
+          // guaranteed defined on this branch. The explicit check below
+          // still fails CLOSED (throws either way) rather than trusting
+          // that pairing with an unchecked cast, so a future change to
+          // `wouldExceedCapacity` that breaks the pairing cannot silently
+          // let an over-capacity batch through.
+          if (preflight.currentCount === undefined) {
+            throw new Error(
+              "known-signers capacity preflight reported exceeds=true " +
+                "without a computed currentCount; refusing rather than " +
+                "guessing"
+            );
+          }
           throw new KnownSignersQuotaError(
             preflight.currentCount,
             preflight.netNewCount,

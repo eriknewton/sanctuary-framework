@@ -43,7 +43,7 @@ import {
   SUPPORTED_PAYLOAD_ALG,
   PAYLOAD_IV_BYTE_LENGTH,
 } from "../core/encryption.js";
-import { publicKeyToDid, legacyPublicKeyToDid, publicKeyBytesEqual } from "../core/identity.js";
+import { publicKeyToDid, legacyPublicKeyToDid, publicKeyBytesEqual, verify as identityVerify } from "../core/identity.js";
 import { EXIT_KNOWN_SIGNERS_DOMAIN } from "../core/crypto-suite-registry.js";
 import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 import { isReservedNamespace } from "../cognitive/state-store.js";
@@ -379,6 +379,29 @@ async function assertDescendant(root: string, candidate: string): Promise<boolea
 const MAX_BUNDLE_DIRECTORY_ENTRIES = 10_000;
 
 /**
+ * Absolute per-artifact read cap (HIGH, Codex re-gate 2 on #1303,
+ * 2026-08-23) - the artifact-hash loop below refuses to read ANY exit
+ * artifact whose on-disk size exceeds this, regardless of what the
+ * manifest declares. 24 MiB matches the existing precedent for a related
+ * exit-archive format's per-artifact cap (`exit/v2-memory-archive.ts`
+ * `MAX_ARTIFACT_BYTES`), which is generous over every artifact kind this
+ * bundle format carries today (identity, policy, audit receipts,
+ * reputation, commitments, placeholder vault metadata, known_signers - the
+ * only kind expected to scale with fortress lifetime is `encrypted_state`,
+ * and 24 MiB of serialized state is already a very large single fortress).
+ */
+const MAX_EXIT_ARTIFACT_READ_BYTES = 24 * 1024 * 1024;
+
+/**
+ * Cap on how many unlisted paths the `artifact_directory_unlisted_file`
+ * warning names explicitly (F1, Codex re-gate 2 on #1303, 2026-08-23) - the
+ * warning exists to make the failure actionable, not to reproduce the
+ * whole walk output; anything past this count collapses into a "+N more"
+ * suffix.
+ */
+const UNLISTED_FILE_WARNING_MAX_PATHS = 10;
+
+/**
  * Recursively list every FILE (not directory) under `root`, as paths
  * relative to `root` in POSIX form - independent gate on #1303, item 5:
  * verification must see what is actually on disk, not only what the
@@ -391,7 +414,16 @@ const MAX_BUNDLE_DIRECTORY_ENTRIES = 10_000;
  */
 type BundleWalkOutcome = "ok" | "too_many" | "error";
 
-async function listBundleFiles(
+/**
+ * Exported for direct unit testing (F2, Codex re-gate 2 on #1303,
+ * 2026-08-23) - the `too_many`/`error` outcomes are exercised against a
+ * caller-supplied `maxEntries` rather than the real
+ * `MAX_BUNDLE_DIRECTORY_ENTRIES` (10,000), so the cap-crossing case is
+ * proven without a test fixture that creates ten thousand directories on
+ * disk. `verifyExitBundle` below is still the only PRODUCTION caller and
+ * always passes the real constant.
+ */
+export async function listBundleFiles(
   root: string,
   maxEntries: number
 ): Promise<string[] | "too_many" | "error"> {
@@ -1226,14 +1258,20 @@ export function checkKnownSignersStructure(record: {
 /**
  * MEDIUM (Codex re-gate on #1303, 2026-08-23, AGENTS.md rule 8): the
  * byte-size cap for a `known_signers` artifact, checked from the manifest's
- * OWN declared `size_bytes` for that entry BEFORE the artifact is ever
- * read off disk - this is the "before reading/parsing" half of the
- * bound (`checkKnownSignersStructure`'s element-COUNT cap, above, is the
- * "before iterating" half). ~300 bytes is a generous per-entry estimate
- * for one `{did, public_key}` JSON element (a real entry serializes to
- * roughly 130-150 bytes: a did:key string plus a base64url public key plus
- * object/quote/comma overhead), so `MAX_KNOWN_SIGNERS` entries at that
- * generous rate bounds the whole artifact.
+ * OWN declared `size_bytes` for that entry BEFORE the artifact is parsed -
+ * this is the "before parsing" half of the bound
+ * (`checkKnownSignersStructure`'s element-COUNT cap, above, is the "before
+ * iterating" half). This is narrower than a general per-artifact read cap:
+ * `loadExitArtifact`'s hash/read loop already reads every declared
+ * artifact's bytes off disk regardless of kind, so this check's job is
+ * only to refuse an oversized known_signers artifact before its JSON is
+ * ever handed to a parser - a general read-size cap across all artifact
+ * kinds is a separate, unbuilt row, not this PR. ~300 bytes is a generous
+ * per-entry estimate for one `{did, public_key}` JSON element (a real
+ * entry serializes to roughly 130-150 bytes: a did:key string plus a
+ * base64url public key plus object/quote/comma overhead), so
+ * `MAX_KNOWN_SIGNERS` entries at that generous rate bounds the whole
+ * artifact.
  */
 const KNOWN_SIGNERS_ARTIFACT_BYTES_PER_ENTRY_ESTIMATE = 300;
 export const MAX_KNOWN_SIGNERS_ARTIFACT_BYTES =
@@ -1308,40 +1346,36 @@ export type KnownSignersResolution =
  * `verifyIdentityBindingBeforeManifestKeyUse` (verify) or
  * `publicKeysFromIdentityArtifact` (import) already bound to the bundle's
  * manifest identity before this function is ever called, so a table
- * "signed" by any other key is rejected as a forgery, not merely
- * unattributed.
+ * signed by any other key is refused, not merely left unattributed.
  *
  * INVARIANT (drill F2 ruling, "the table can never introduce a signer for
- * the exporting fortress's own DID"; HARDENED to a whole-table REJECTION,
- * independent gate on #1303, 2026-08-23, item 6 - a prior revision merely
- * dropped the one offending entry, which is the wrong shape: it lets a
- * forger probe which entries get silently discarded): an entry whose `did`
- * equals `exportingDid`, OR whose `public_key` byte-equals
- * `exportingPublicKey` (checked independently of the DID string - HIGH-1,
- * same gate: a self-consistent did:key entry could otherwise carry the
- * exporter's OWN key under a DID string that does not textually match
- * `exportingDid`, e.g. a legacy encoding or a future non-did:key scheme),
+ * the exporting fortress's own DID"; private register EXIT-KS-01): an
+ * entry whose `did` equals `exportingDid`, OR whose `public_key`
+ * byte-equals `exportingPublicKey` (checked independently of the DID
+ * string, since a self-consistent did:key entry can carry the exporter's
+ * own key under a DID string that does not textually match
+ * `exportingDid` - e.g. a legacy encoding or a future non-did:key scheme),
  * REJECTS THE ENTIRE TABLE (`signers_self_entry_present`) even when the
  * table otherwise parses and verifies cleanly - the exporting identity's
  * own key is established by the bundle's public_identity artifact and
  * rotation chain, never by this auxiliary table, so this table can never be
  * used to shadow or override it, and a well-formed table never needs to
- * name its own exporter in the first place.
+ * name its own exporter in the first place. This is a whole-table
+ * rejection, not a per-entry filter (private register EXIT-KS-01).
  *
- * WHAT THIS DOES NOT PROVE (HIGH-1 finding, stated so a future caller does
- * not over-read the return value): `checkKnownSignersStructure`'s did:key
- * check proves an entry's `(did, public_key)` pair is SELF-CONSISTENT -
- * that `did` is the deterministic encoding of `public_key` - never that the
- * EXPORTING fortress genuinely verified an attestation from that signer at
- * some earlier legitimate import. Self-consistency is necessary (it rules
- * out the key-substitution forgery this fix closes) but not sufficient: the
- * exporter could still mint a brand-new keypair, label its DID as a
- * "known signer," and sign fabricated attestations under it. This table is
- * therefore no stronger a trust primitive than a first-hop bundle's own
- * self-certified identity always was - a receiving fortress trusts it
- * exactly that much, no more (MEDIUM-3, same gate: each hop re-derives its
- * own trust from what its own signature chain proves, never from an
- * upstream fortress's unverifiable claim to have "checked" a signer).
+ * WHAT THIS DOES NOT PROVE (stated so a future caller does not over-read
+ * the return value): `checkKnownSignersStructure`'s did:key check proves
+ * an entry's `(did, public_key)` pair is SELF-CONSISTENT - that `did` is
+ * the deterministic encoding of `public_key` - never that the EXPORTING
+ * fortress genuinely verified an attestation from that signer at some
+ * earlier legitimate import. Self-consistency is necessary but not
+ * sufficient: the exporter could still mint a brand-new keypair, label its
+ * DID as a "known signer," and sign fabricated attestations under it. This
+ * table is therefore no stronger a trust primitive than a first-hop
+ * bundle's own self-certified identity always was - a receiving fortress
+ * trusts it exactly that much, no more: each hop re-derives its own trust
+ * from what its own signature chain proves, never from an upstream
+ * fortress's unverifiable claim to have "checked" a signer.
  */
 export function resolveKnownSigners(
   artifact: unknown,
@@ -1366,9 +1400,20 @@ export function resolveKnownSigners(
   } catch {
     return { ok: false, problem: "signature_invalid", detail: "known_signers.signature is not valid base64url" };
   }
-  const signatureValid = ed25519.verify(
-    signatureBytes,
+  // MEDIUM (Codex re-gate 2 on #1303, 2026-08-23): `identityVerify`
+  // (core/identity.ts `verify`), not a raw `ed25519.verify` call - Noble
+  // throws on a malformed-length signature (e.g. a one-byte value that
+  // still decodes as valid base64url) instead of returning false, and an
+  // uncaught throw here would escape `resolveKnownSigners` entirely,
+  // crashing verification instead of reporting the typed
+  // `known_signers_invalid` / `KNOWN_SIGNERS_INVALID` failure this
+  // function exists to produce. `identityVerify` wraps exactly this in a
+  // try/catch (see its doc comment); note its argument order is
+  // `(payload, signature, publicKey)`, the REVERSE of Noble's
+  // `ed25519.verify(signature, payload, publicKey)`.
+  const signatureValid = identityVerify(
     knownSignersSigningBytes({ version: 1, signers }),
+    signatureBytes,
     exportingPublicKey
   );
   if (!signatureValid) {
@@ -1626,14 +1671,37 @@ export async function verifyExitBundle(
   // MEDIUM (Codex re-gate on #1303, 2026-08-23): "too_many" (the count
   // cap, files or directories) and "error" (a directory this walk could
   // not read) are BOTH verification failures - a walk that cannot see the
-  // whole bundle directory can never vouch that nothing is unlisted.
+  // whole bundle directory can never vouch that nothing is unlisted. The
+  // caller only learns WHICH class of failure this was through `warnings`
+  // (F1, Codex re-gate 2 on #1303, 2026-08-23) - without a path or a cause,
+  // a bundle that fails because of an OS sidecar file (a Finder
+  // `.DS_Store`, an AppleDouble `._known_signers.json` left behind by a
+  // USB or SMB copy) is indistinguishable from one that fails because a
+  // real attacker planted an unaccounted-for file, and the operator has no
+  // way to tell which without re-running the walk by hand.
   if (bundleFiles === "too_many" || bundleFiles === "error") {
+    warnings.push(
+      bundleFiles === "too_many"
+        ? `bundle directory walk exceeded ${MAX_BUNDLE_DIRECTORY_ENTRIES} entries before it could confirm nothing is unlisted`
+        : "bundle directory walk could not read a subdirectory; verification cannot confirm nothing is unlisted"
+    );
     return fail(root, manifest, "artifact_directory_unlisted_file", warnings, unsupportedArtifacts);
   }
   const unlisted = bundleFiles.filter(
     (relPath) => relPath !== "manifest.json" && !seenPaths.has(relPath)
   );
   if (unlisted.length > 0) {
+    // Bounded to UNLISTED_FILE_WARNING_MAX_PATHS entries so an operator can
+    // act on the common case (one or two stray sidecar files) without this
+    // warning itself becoming an unbounded-output vector if a bundle
+    // directory were flooded with junk files (AGENTS.md rule 8 applies to
+    // output size, not only recursion depth).
+    const shown = unlisted.slice(0, UNLISTED_FILE_WARNING_MAX_PATHS);
+    const remainder = unlisted.length - shown.length;
+    warnings.push(
+      `unlisted file(s) present in bundle directory: ${shown.join(", ")}` +
+        (remainder > 0 ? ` (+${remainder} more)` : "")
+    );
     return fail(root, manifest, "artifact_directory_unlisted_file", warnings, unsupportedArtifacts);
   }
 
@@ -1693,6 +1761,42 @@ export async function verifyExitBundle(
       const linkStat = await lstat(artifactPath);
       if (linkStat.isSymbolicLink()) {
         artifactFailure = "archive_contains_symlink";
+        artifactResults.push({
+          path: artifact.path,
+          kind: artifact.kind,
+          hash_passed: false,
+          size_passed: false,
+        });
+        continue;
+      }
+      // HIGH (Codex re-gate 2 on #1303, 2026-08-23): checked from the
+      // `lstat` already taken above - no extra syscall - and BEFORE the
+      // full-content read below. By this point in the function the
+      // manifest's signature and `artifacts_aggregate_hash` have ALREADY
+      // been verified (both run earlier in this function), so
+      // `artifact.size_bytes` is a value the exporting fortress genuinely
+      // signed; a REAL on-disk file that does not match it, or that
+      // exceeds the absolute per-artifact cap even when it does match, is
+      // never read in full - only hashed-and-refused after the fact. Read
+      // in full and refuse afterward, an on-disk file substituted (or
+      // simply left oversized) after signing would otherwise cost a full
+      // read - unbounded memory for an unbounded on-disk file - before its
+      // declared size was ever consulted; this closes that class for the
+      // common, realistic case (a stat lstat already returned, not a
+      // fresh syscall). It does not close a same-uid writer that grows
+      // this exact file, in place, in the narrow window between this
+      // check and `readFileCustodyWithStats`'s own internal path-identity
+      // recheck below - `verifyPathIdentity` catches a SWAPPED file
+      // (different inode) in that window but not a GROWN one (same
+      // inode); that residual requires a single fd-based bounded-read
+      // primitive shared with `readFileCustodyWithStats` and is tracked as
+      // a separate, unbuilt row rather than duplicated here (AGENTS.md
+      // rule 5 - custody checks live in ONE place, storage/custody-fs.ts).
+      if (
+        linkStat.size !== artifact.size_bytes ||
+        linkStat.size > MAX_EXIT_ARTIFACT_READ_BYTES
+      ) {
+        artifactFailure = "artifact_size_mismatch";
         artifactResults.push({
           path: artifact.path,
           kind: artifact.kind,

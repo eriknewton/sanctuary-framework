@@ -216,7 +216,12 @@ export class KnownSignersStore {
     entries: Array<{ did: string; publicKey: Uint8Array }>
   ): Promise<{
     exceeds: boolean;
-    currentCount: number;
+    // F5 (Codex re-gate 2 on #1303, 2026-08-23): `undefined`, not a `-1`
+    // sentinel, when nothing net-new means the store-wide count was never
+    // read - a caller that (incorrectly) read `currentCount` without first
+    // checking `exceeds` would otherwise see a fabricated negative number
+    // that looks like real data instead of "not computed".
+    currentCount: number | undefined;
     netNewCount: number;
     limit: number;
   }> {
@@ -224,7 +229,7 @@ export class KnownSignersStore {
     if (netNew.size === 0) {
       return {
         exceeds: false,
-        currentCount: -1,
+        currentCount: undefined,
         netNewCount: 0,
         limit: this.maxKnownSigners,
       };

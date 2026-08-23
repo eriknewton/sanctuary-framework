@@ -175,19 +175,17 @@ export type HandoffStatus = (typeof HANDOFF_STATUSES)[number];
  * Exit V2 known_signers addition below. v1.x bumps require
  * coordinator-approved manifest amendment.
  *
- * `EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS` (independent Codex gate
- * finding, 2026-08-23, item 5 on the #1303 fix round: HIGH - "the frozen V1
- * artifact-kind set was changed in place; an older verifier would reject a
- * new export as carrying an unknown artifact kind"): a bundle that carries
- * the `known_signers` artifact (Exit V2 drill F2) declares a DIFFERENT
- * `manifest_version` literal, so a pre-this-change verifier - which only
- * recognizes the exact string "SANCTUARY_EXIT_BUNDLE_V1" - refuses it
- * through the EXISTING, already-handled `manifest_unknown_version` path
- * instead of silently attempting to parse an artifact set it does not
- * understand. A V1 bundle (declaring the original literal) is refused by
- * this build's verifier unless it carries EXACTLY
- * `EXIT_BUNDLE_ARTIFACT_KINDS` (below) and nothing else; a
- * known-signers bundle is refused unless it carries EXACTLY
+ * `EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS`: a bundle that carries the
+ * `known_signers` artifact (Exit V2 drill F2) declares a DIFFERENT,
+ * ADDITIVE `manifest_version` literal rather than widening the frozen V1
+ * one in place, so a pre-this-change verifier - which only recognizes the
+ * exact string "SANCTUARY_EXIT_BUNDLE_V1" - refuses it through the
+ * EXISTING, already-handled `manifest_unknown_version` path instead of
+ * attempting to parse an artifact set it does not understand (private
+ * register EXIT-KS-01). A V1 bundle (declaring the original literal) is
+ * refused by this build's verifier unless it carries EXACTLY
+ * `EXIT_BUNDLE_ARTIFACT_KINDS` (below) and nothing else; a known-signers
+ * bundle is refused unless it carries EXACTLY
  * `EXIT_BUNDLE_ARTIFACT_KINDS_V1_KNOWN_SIGNERS` and nothing else (checked in
  * server/src/exit/verifier.ts).
  */
