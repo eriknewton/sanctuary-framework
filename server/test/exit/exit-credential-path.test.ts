@@ -673,11 +673,16 @@ describe("exit cluster A3/A4: which credential opens this bundle", () => {
     const lines = chunks.join("").split("\n");
     // Every one of these shipped before this change and must survive
     // byte-for-byte (reorg-surface-manifest: user-visible display strings).
+    // Exit V2 drill F2 (2026-08-22/23, Erik-ratified option a): "artifacts: 7"
+    // -> "artifacts: 8" is a DELIBERATE change to this frozen surface -
+    // exports now always carry an additional "known_signers" artifact (see
+    // EXIT_BUNDLE_ARTIFACT_KINDS's doc comment). Every other line is
+    // unchanged.
     expect(lines.slice(0, 6)).toEqual([
       "verdict: PASS",
       "manifest: verified",
       `identity: ${source.identityId}`,
-      "artifacts: 7",
+      "artifacts: 8",
       "reputation: 0/0 attestations verified",
       "reputation completeness: verified",
     ]);

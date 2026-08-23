@@ -189,6 +189,17 @@ export const EXIT_BUNDLE_ARTIFACT_KINDS = [
   "reputation_bundle",
   "commitments",
   "placeholder_vault_metadata",
+  // Exit V2 drill F2 (2026-08-22/23, Erik-ratified option a): a signed
+  // DID -> public key table for every attestation signer the exporting
+  // fortress verified at an earlier import, so a re-exported (second-hop)
+  // reputation bundle stays verifiable. VERSION-GATED, additive-only: a
+  // bundle exported before this change carries no "known_signers" entry in
+  // its artifacts list, loadExitArtifact returns null for the missing kind,
+  // and verify/import both fall back to exactly today's behavior (own
+  // identity keys only). See server/src/exit/verifier.ts
+  // (resolveKnownSigners, "must match" this literal) and
+  // server/reorg-surface-manifest.md.
+  "known_signers",
 ] as const;
 export type ExitBundleArtifactKind =
   (typeof EXIT_BUNDLE_ARTIFACT_KINDS)[number];

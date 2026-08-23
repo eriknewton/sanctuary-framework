@@ -98,7 +98,16 @@ import {
   isWellFormedExitStateEntryElement,
   checkEncryptedStateStructure,
   type EncryptedStateStructureProblem,
+  resolveKnownSigners,
+  knownSignersSigningBytes,
+  type KnownSignersArtifact,
+  type KnownSignersEntry,
 } from "./verifier.js";
+import {
+  KnownSignersStore,
+  KNOWN_SIGNERS_NAMESPACE,
+  knownSignerStorageKey,
+} from "../reputation/known-signers-store.js";
 import {
   isValidSourceCustody,
   SOURCE_CUSTODY_FORMAT,
@@ -1291,6 +1300,62 @@ async function exportPlaceholderVaultMetadata(
   };
 }
 
+/**
+ * Exit V2 drill F2 (2026-08-22/23, Erik-ratified option a): build the
+ * signed `known_signers` table for this export. Collects the DIDs of every
+ * attestation signer in `attestations` that is NOT this fortress's own
+ * current identity (a "foreign" signer - typically an attestation this
+ * fortress admitted via an earlier `exit import`), resolves each against
+ * the `_known_signers` store this fortress persisted at the import that
+ * first verified it (server/src/reputation/known-signers-store.ts), and
+ * signs the resulting table with this fortress's OWN identity key - never
+ * the foreign signer's key, which this fortress does not hold.
+ *
+ * A DID with no persisted record (never actually verified by this
+ * fortress - should not happen for an admitted attestation, since
+ * `ReputationStore.importBundle` never admits an unverifiable one, but
+ * defensive rather than assumed) is simply omitted, not a hard failure:
+ * the resulting attestation stays unverifiable to a later importer exactly
+ * as it would without this artifact at all.
+ */
+async function exportKnownSigners(
+  storage: StorageBackend,
+  masterKey: Uint8Array,
+  identity: StoredIdentity,
+  identityEncryptionKey: Uint8Array,
+  attestations: ReputationBundle["attestations"]
+): Promise<KnownSignersArtifact> {
+  const foreignSignerDids = new Set<string>();
+  for (const attestation of attestations) {
+    if (attestation.signer !== identity.did) {
+      foreignSignerDids.add(attestation.signer);
+    }
+  }
+  const knownSignersStore = new KnownSignersStore(storage, masterKey);
+  const resolved = await knownSignersStore.resolveMany(foreignSignerDids);
+  // Deterministic ordering (sorted by DID): `canonicalize` does not sort
+  // array elements, and a signed table whose element order tracked
+  // Set/Map iteration order would make two exports of the IDENTICAL trust
+  // state sign to different bytes for no semantic reason.
+  const signers: KnownSignersEntry[] = resolved
+    .map((entry) => ({
+      did: entry.did,
+      public_key: toBase64url(entry.publicKey),
+      first_seen_import_id: entry.first_seen_import_id,
+    }))
+    .sort((a, b) => (a.did < b.did ? -1 : a.did > b.did ? 1 : 0));
+  const signature = identitySign(
+    knownSignersSigningBytes({ version: 1, signers }),
+    identity.encrypted_private_key,
+    identityEncryptionKey
+  );
+  return {
+    version: 1,
+    signers,
+    signature: toBase64url(signature),
+  };
+}
+
 export async function exportExitBundle(
   opts: ExportExitBundleOptions
 ): Promise<ExportExitBundleResult> {
@@ -1415,12 +1480,35 @@ export async function exportExitBundle(
       "audit_receipts"
     )
   );
+  const reputationBundleExport = await reputationStore.exportBundle(
+    identity,
+    identityEncryptionKey
+  );
   artifacts.push(
     await writeJsonArtifact(
       bundleDir,
       `${ARTIFACT_DIR}/reputation_bundle.json`,
-      await reputationStore.exportBundle(identity, identityEncryptionKey),
+      reputationBundleExport,
       "reputation_bundle"
+    )
+  );
+  // Exit V2 drill F2 (2026-08-22/23): always emitted (even with an empty
+  // `signers` list) so every export from this build forward carries a
+  // consistent artifact set; a bundle exported BEFORE this change simply
+  // has no "known_signers" entry in its artifacts list at all
+  // (VERSION-GATED - see EXIT_BUNDLE_ARTIFACT_KINDS's doc comment).
+  artifacts.push(
+    await writeJsonArtifact(
+      bundleDir,
+      `${ARTIFACT_DIR}/known_signers.json`,
+      await exportKnownSigners(
+        opts.storage,
+        opts.masterKey,
+        identity,
+        identityEncryptionKey,
+        reputationBundleExport.attestations
+      ),
+      "known_signers"
     )
   );
   artifacts.push(
@@ -2417,6 +2505,13 @@ function isLocationWithinImportWriteSet(
     case EXIT_PLACEHOLDER_METADATA_NAMESPACE:
     case EXIT_IMPORT_NAMESPACE:
     case "_reputation":
+    // Exit V2 drill F2 (2026-08-22/23, falls through to the same `return
+    // true` as "_reputation" above): known-signer persistence writes
+    // (server/src/reputation/known-signers-store.ts) are part of THIS
+    // import's own write set, journaled exactly like `_reputation` -
+    // see `activationSnapshotLocations`'s known_signers loop (bundle.ts).
+    // falls through
+    case KNOWN_SIGNERS_NAMESPACE:
       return true;
     case "_meta":
       return (
@@ -2876,6 +2971,31 @@ export async function recoverInterruptedExitImportsOrThrow(
   return { recovered: result.recovered };
 }
 
+/**
+ * Exit V2 drill F2 (2026-08-22/23): the ONE definition of "which attestation
+ * signer DIDs in this bundle are FOREIGN to the destination fortress" -
+ * every signer that is not the destination's own current identity DID.
+ * Shared by `activationSnapshotLocations` (below, which must pre-declare
+ * every `_known_signers` location a later write can touch) and the
+ * post-import persistence call in `importExitBundle` (search
+ * "knownSignerForeignDids" there) - a hand-mirrored second definition is
+ * exactly the drift AGENTS.md rule 5 rules out; if the two disagreed, the
+ * durable pre-image journal could miss a location the persistence step
+ * then writes.
+ */
+function knownSignerForeignDids(
+  attestations: ReputationBundle["attestations"],
+  destinationOwnDid: string | undefined
+): Set<string> {
+  const dids = new Set<string>();
+  for (const attestation of attestations) {
+    if (attestation.signer !== destinationOwnDid) {
+      dids.add(attestation.signer);
+    }
+  }
+  return dids;
+}
+
 function activationSnapshotLocations(
   importId: string,
   identityArtifact: { json: ExitPublicIdentityArtifact } | null,
@@ -2884,7 +3004,8 @@ function activationSnapshotLocations(
   policySet: { json: ExitPolicySetArtifact } | null,
   auditReceipts: { json: ExitAuditReceiptsArtifact } | null,
   commitments: { json: ExitCommitmentsArtifact } | null,
-  placeholderMetadata: { json: ExitPlaceholderVaultMetadataArtifact } | null
+  placeholderMetadata: { json: ExitPlaceholderVaultMetadataArtifact } | null,
+  destinationOwnDid: string | undefined
 ): StagedLocation[] {
   const locations: StagedLocation[] = [];
   if (identityArtifact) {
@@ -2914,6 +3035,21 @@ function activationSnapshotLocations(
     locations.push({
       namespace: "_reputation",
       key: attestation.attestation_id,
+    });
+  }
+
+  // Exit V2 drill F2 (2026-08-22/23): pre-declare every `_known_signers`
+  // location the post-import persistence step (importExitBundle, search
+  // "knownSignerForeignDids") can possibly write, using the SAME foreign-DID
+  // set - so the durable pre-image snapshot covers this namespace exactly
+  // like `_reputation` above, before the admission-locked writes begin.
+  for (const did of knownSignerForeignDids(
+    reputationArtifact?.json.attestations ?? [],
+    destinationOwnDid
+  )) {
+    locations.push({
+      namespace: KNOWN_SIGNERS_NAMESPACE,
+      key: knownSignerStorageKey(did),
     });
   }
 
@@ -3382,6 +3518,43 @@ export async function importExitBundle(
       rotationChainRefusalMessage(publicKeys)
     );
   }
+  // Exit V2 drill F2 (2026-08-22/23, Erik-ratified option a): resolve the
+  // optional known_signers artifact into a map merged with this bundle's
+  // own identity keys, through the SAME `resolveKnownSigners` function
+  // `verifyExitBundle` (verifier.ts) already used to compute `verification`
+  // above - "must match" if either call site's shape changes.
+  // `reputationStore.verifyBundle`/`importBundle` below run their own
+  // strict re-verification as defense in depth and need this SAME resolved
+  // map, not just `verification`'s already-computed verdict; without this,
+  // a bundle `verifyExitBundle` reports PASS for (because ITS internal map
+  // includes the resolved signers) would still be refused here with a
+  // stale, known_signers-blind map. VERSION-GATED: absent on a bundle
+  // exported before this change, `loadExitArtifact` returns null, and
+  // `mergedByDid` is just a copy of `publicKeys.byDid` - behavior unchanged.
+  const knownSignersArtifact = await loadExitArtifact<KnownSignersArtifact>(
+    opts.bundleDir,
+    manifest,
+    "known_signers"
+  );
+  const mergedByDid = new Map(publicKeys.byDid);
+  if (knownSignersArtifact && identityArtifact) {
+    const knownSignersResolution = resolveKnownSigners(
+      knownSignersArtifact.json,
+      identityArtifact.json.bundle.did,
+      publicKeys.chain.current_public_key
+    );
+    if (knownSignersResolution.ok) {
+      for (const [did, key] of knownSignersResolution.signers) {
+        if (!mergedByDid.has(did)) mergedByDid.set(did, key);
+      }
+    }
+    // A table that fails to resolve (wrong signature, malformed, duplicate
+    // conflicting DID) contributes nothing - the affected attestations stay
+    // unverifiable and `reputationStore.verifyBundle`/`importBundle` refuse
+    // the whole bundle below exactly as they would with no known_signers
+    // artifact at all. Never partially trust a table that failed to verify.
+  }
+
   // LD2-01 (verify/import parity aggregator, class fix), extended by
   // EXIT-STRUCT-02 one level deeper: an encrypted_state artifact whose
   // `entries` field is missing or not an array is structural damage to the
@@ -3484,7 +3657,7 @@ export async function importExitBundle(
   // (exit/verifier.ts, verifyExitBundle with acceptUnverifiableAttestations).
   if (reputationArtifact && reputationStore) {
     try {
-      reputationStore.verifyBundle(reputationArtifact.json, publicKeys.byDid);
+      reputationStore.verifyBundle(reputationArtifact.json, mergedByDid);
     } catch (err) {
       if (err instanceof ReputationBundleVerificationError) {
         return notVerifiedResult(
@@ -3710,6 +3883,15 @@ export async function importExitBundle(
   }
 
   const importId = importIdForManifest(manifest);
+  // Exit V2 drill F2 (2026-08-22/23): resolved ONCE here and reused both to
+  // pre-declare `_known_signers` journal locations below and, after a
+  // successful reputation import, to decide which resolved signer DIDs are
+  // "foreign" and get persisted (search "knownSignerForeignDids").
+  const destinationOwnDid = (
+    opts.destinationSignerIdentityId
+      ? opts.identityManager.get(opts.destinationSignerIdentityId)
+      : opts.identityManager.getDefault()
+  )?.did;
   const stagedConflicts = stagedArtifactConflicts(conflicts, importId);
   const allowStagedOverwrite =
     opts.conflictResolution === "overwrite" || opts.forceRebind === true;
@@ -3744,7 +3926,8 @@ export async function importExitBundle(
     policySet ?? null,
     auditReceipts ?? null,
     commitments ?? null,
-    placeholderMetadata ?? null
+    placeholderMetadata ?? null,
+    destinationOwnDid
   );
   // MEDIUM-C (Codex gate, 2026-08-22): refuse before any snapshot read or
   // journal write, not partway through - see MAX_EXIT_IMPORT_JOURNAL_LOCATIONS's
@@ -3982,7 +4165,7 @@ export async function importExitBundle(
       const imported = await reputationStore.importBundle(
         reputationArtifact.json,
         true,
-        publicKeys.byDid,
+        mergedByDid,
         // N4 (coordinator gate, 2026-08-22): THIS import's own journal is
         // present on disk for the entire duration of this call - see
         // ReputationStore.importBundle's matching doc comment.
@@ -3997,6 +4180,36 @@ export async function importExitBundle(
         unverifiable_attestations: imported.unverifiable,
       };
       stagedArtifacts.push("reputation_bundle");
+
+      // Exit V2 drill F2 (2026-08-22/23): persist every foreign attestation
+      // signer's key this fortress just verified (via the source bundle's
+      // own identity chain or the resolved known_signers table), so a
+      // LATER export from THIS fortress can rebuild a known_signers table
+      // of its own and a re-exported (second-hop) bundle stays verifiable.
+      // Only DIDs that are NOT the destination's own identity are
+      // persisted - this fortress's own key needs no such record; it is
+      // already carried by its own public_identity/rotation-chain
+      // artifacts on every export. `destinationOwnDid` is the SAME value
+      // already used above to pre-declare `_known_signers` journal
+      // locations, so the durable pre-image journal already covers every
+      // key this loop can possibly write.
+      const foreignSignerDids = knownSignerForeignDids(
+        reputationArtifact.json.attestations,
+        destinationOwnDid
+      );
+      const knownSignersToPersist: Array<{ did: string; publicKey: Uint8Array }> = [];
+      for (const did of foreignSignerDids) {
+        const key = mergedByDid.get(did);
+        if (key) knownSignersToPersist.push({ did, publicKey: key });
+      }
+      if (knownSignersToPersist.length > 0) {
+        await new KnownSignersStore(opts.storage, opts.masterKey).persistIfAbsent(
+          knownSignersToPersist,
+          importId,
+          (namespace, key, bytes) =>
+            recordPostImage(opts.storage, importId, namespace, key, bytes)
+        );
+      }
     }
 
     stateRekeyStarted = true;
@@ -4284,6 +4497,8 @@ export function exitBundleManifestShape(): Record<string, unknown> {
       "artifacts/reputation_bundle.json",
       "artifacts/commitments.json",
       "artifacts/placeholder_vault_metadata.json",
+      // Exit V2 drill F2 (2026-08-22/23): additive 8th artifact path.
+      "artifacts/known_signers.json",
     ],
   };
 }

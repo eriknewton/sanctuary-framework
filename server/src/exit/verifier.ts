@@ -42,6 +42,7 @@ import {
   PAYLOAD_IV_BYTE_LENGTH,
 } from "../core/encryption.js";
 import { publicKeyToDid } from "../core/identity.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 import { isReservedNamespace } from "../cognitive/state-store.js";
 import {
   verifyRotationChain,
@@ -942,6 +943,218 @@ async function verifyIdentityBindingBeforeManifestKeyUse(
   );
 }
 
+/**
+ * Exit V2 drill F2 (2026-08-22/23, Erik-ratified option a): the
+ * `known_signers` artifact carries a signed DID -> public key table for
+ * every attestation signer the EXPORTING fortress itself verified at an
+ * earlier import (see server/src/reputation/known-signers-store.ts), so a
+ * re-exported (second-hop) reputation bundle stays verifiable without
+ * re-deriving trust the receiving fortress has no way to establish on its
+ * own. VERSION-GATED: the field is `1` today; a future version this parser
+ * does not recognize is treated as unreadable (fail closed), never
+ * silently accepted under different semantics.
+ */
+export interface KnownSignersEntry {
+  did: string;
+  /** base64url raw Ed25519 public key. */
+  public_key: string;
+  first_seen_import_id: string;
+}
+
+export interface KnownSignersArtifact {
+  version: 1;
+  signers: KnownSignersEntry[];
+  /** base64url Ed25519 signature by the EXPORTING fortress's identity over {@link knownSignersSigningBytes}. */
+  signature: string;
+}
+
+/**
+ * CONTRACT PIN (AGENTS.md rule 11): element-level typed parse for one
+ * `known_signers` table entry, mirroring
+ * {@link isWellFormedExitStateEntryElement}'s shape - a container-only
+ * check ("`signers` is an array") cannot see a malformed ELEMENT
+ * (missing/wrong-typed `did`, an undecodable or wrong-length `public_key`),
+ * and admitting one here would either crash a later `ed25519.verify` call
+ * or silently coerce a bad key into "no key", which is the exact
+ * absent-vs-malformed conflation AGENTS.md rule 11 rules out.
+ * `ED25519_PUBLIC_KEY_BYTES` is the SAME constant `assertEd25519PublicKey`
+ * (core/identity.ts) checks against - CONTRACT PIN, must match if either
+ * changes.
+ */
+export function isWellFormedKnownSignersEntry(
+  item: unknown
+): item is KnownSignersEntry {
+  if (item === null || typeof item !== "object") return false;
+  const record = item as Record<string, unknown>;
+  if (typeof record.did !== "string" || record.did.length === 0) return false;
+  if (typeof record.first_seen_import_id !== "string" || record.first_seen_import_id.length === 0) {
+    return false;
+  }
+  if (typeof record.public_key !== "string") return false;
+  try {
+    if (fromBase64urlStrict(record.public_key).length !== ED25519_PUBLIC_KEY_BYTES) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+export type KnownSignersStructureProblem =
+  | "signers_unreadable"
+  | "signers_malformed_elements"
+  | "signers_duplicate_did_conflict"
+  | "signers_version_unsupported";
+
+export interface KnownSignersStructureCheck {
+  ok: boolean;
+  problem?: KnownSignersStructureProblem;
+  detail?: string;
+}
+
+/**
+ * CONTRACT PIN (AGENTS.md rule 11): the ONE structural-soundness check for a
+ * `known_signers` artifact's container, version, and per-element shape -
+ * consumed by BOTH `resolveKnownSigners` (below, used by `verifyExitBundle`
+ * here AND `importExitBundle`'s pre-staging gate in
+ * server/src/exit/bundle.ts - search "resolveKnownSigners" there), so
+ * `exit verify` and `exit import` can never disagree about whether a
+ * known_signers table is sound. Pure and total: never throws, and does not
+ * touch the table's SIGNATURE (that is a separate, caller-supplied-identity
+ * check in `resolveKnownSigners`, mirroring how `checkEncryptedStateStructure`
+ * stays structural-only and `verifyReputationArtifact` does its own
+ * signature pass). Fail closed: `ok: false` is the default, never assumed
+ * sound.
+ */
+export function checkKnownSignersStructure(record: {
+  version?: unknown;
+  signers?: unknown;
+}): KnownSignersStructureCheck {
+  if (record.version !== 1) {
+    return {
+      ok: false,
+      problem: "signers_version_unsupported",
+      detail: `known_signers.version is ${JSON.stringify(record.version)}, expected 1`,
+    };
+  }
+  if (!Array.isArray(record.signers)) {
+    return {
+      ok: false,
+      problem: "signers_unreadable",
+      detail: "the `signers` field is absent or is not an array",
+    };
+  }
+  const byDid = new Map<string, string>();
+  for (const item of record.signers) {
+    if (!isWellFormedKnownSignersEntry(item)) {
+      return {
+        ok: false,
+        problem: "signers_malformed_elements",
+        detail:
+          "a signers element is missing or has a wrong-typed did/public_key/first_seen_import_id",
+      };
+    }
+    const existing = byDid.get(item.did);
+    if (existing !== undefined && existing !== item.public_key) {
+      return {
+        ok: false,
+        problem: "signers_duplicate_did_conflict",
+        detail: `DID ${item.did} appears twice with two different public keys`,
+      };
+    }
+    byDid.set(item.did, item.public_key);
+  }
+  return { ok: true };
+}
+
+/**
+ * Canonical signing bytes for a `known_signers` table. The `signature`
+ * field is deliberately excluded (it signs everything ELSE), mirroring
+ * `reputationBundleSigningBytes`'s shape.
+ */
+export function knownSignersSigningBytes(table: {
+  version: 1;
+  signers: KnownSignersEntry[];
+}): Uint8Array {
+  return canonicalizeToBytes({ version: table.version, signers: table.signers });
+}
+
+export type KnownSignersResolution =
+  | { ok: true; signers: Map<string, Uint8Array> }
+  | { ok: false; problem: KnownSignersStructureProblem | "signature_invalid" | "artifact_shape_invalid"; detail?: string };
+
+/**
+ * Resolve a parsed `known_signers` artifact into a DID -> public key map,
+ * or report why it could not be trusted. Used identically by
+ * `verifyExitBundle` (below) and `importExitBundle`
+ * (server/src/exit/bundle.ts) - the ONE place either stage decides whether
+ * a known_signers table's entries are admissible, so a table one stage
+ * refuses can never be the one the other silently accepts (the same parity
+ * `checkEncryptedStateStructure` holds for `encrypted_state`).
+ *
+ * Fails closed to an EMPTY resolution (never partial) on any structural
+ * problem or a signature that does not verify under the EXPORTING
+ * fortress's own identity key - `exportingPublicKey` is the SAME key
+ * `verifyIdentityBindingBeforeManifestKeyUse` (verify) or
+ * `publicKeysFromIdentityArtifact` (import) already bound to the bundle's
+ * manifest identity before this function is ever called, so a table
+ * "signed" by any other key is rejected as a forgery, not merely
+ * unattributed.
+ *
+ * INVARIANT (drill F2 ruling, "the table can never introduce a signer for
+ * the exporting fortress's own DID"): an entry whose `did` equals
+ * `exportingDid` is dropped from the resolved map even when the table
+ * otherwise parses and verifies cleanly - the exporting identity's own key
+ * is established by the bundle's public_identity artifact and rotation
+ * chain, never by this auxiliary table, so this table can never be used to
+ * shadow or override it.
+ */
+export function resolveKnownSigners(
+  artifact: unknown,
+  exportingDid: string,
+  exportingPublicKey: Uint8Array
+): KnownSignersResolution {
+  if (artifact === null || typeof artifact !== "object" || Array.isArray(artifact)) {
+    return { ok: false, problem: "artifact_shape_invalid", detail: "known_signers artifact is not a JSON object" };
+  }
+  const record = artifact as { version?: unknown; signers?: unknown; signature?: unknown };
+  const structureCheck = checkKnownSignersStructure(record);
+  if (!structureCheck.ok) {
+    return { ok: false, problem: structureCheck.problem!, detail: structureCheck.detail };
+  }
+  if (typeof record.signature !== "string") {
+    return { ok: false, problem: "artifact_shape_invalid", detail: "known_signers.signature is missing or not a string" };
+  }
+  const signers = record.signers as KnownSignersEntry[];
+  let signatureBytes: Uint8Array;
+  try {
+    signatureBytes = fromBase64urlStrict(record.signature);
+  } catch {
+    return { ok: false, problem: "signature_invalid", detail: "known_signers.signature is not valid base64url" };
+  }
+  const signatureValid = ed25519.verify(
+    signatureBytes,
+    knownSignersSigningBytes({ version: 1, signers }),
+    exportingPublicKey
+  );
+  if (!signatureValid) {
+    return { ok: false, problem: "signature_invalid", detail: "known_signers table signature does not verify under the bundle's exporting identity" };
+  }
+  const resolved = new Map<string, Uint8Array>();
+  for (const entry of signers) {
+    if (entry.did === exportingDid) continue;
+    try {
+      resolved.set(entry.did, fromBase64urlStrict(entry.public_key));
+    } catch {
+      // Unreachable: isWellFormedKnownSignersEntry already decoded this
+      // exact field successfully. Defensive only - never populate a
+      // partially-resolved entry.
+    }
+  }
+  return { ok: true, signers: resolved };
+}
+
 function verifyReputationArtifact(
   reputationArtifact: unknown,
   publicKeysByDid: Map<string, Uint8Array>
@@ -1370,6 +1583,42 @@ export async function verifyExitBundle(
           }
         }
       }
+    }
+  }
+
+  // Exit V2 drill F2 (2026-08-22/23): resolve the optional known_signers
+  // artifact into `publicKeysByDid` BEFORE reputation verification runs
+  // below, so a re-exported (second-hop) bundle's foreign-signed
+  // attestations can resolve through it. VERSION-GATED: a bundle exported
+  // before this change carries no "known_signers" artifact kind,
+  // `loadExitArtifact` returns null, and this block is a no-op - verify
+  // behaves exactly as it did before this change. A table that fails to
+  // resolve (wrong signature, malformed, absent identity binding) simply
+  // contributes no entries; it does not fail the bundle outright - the
+  // attestations that would have needed it fall through to the EXISTING
+  // `unverifiable_attestations` accounting below, the same as any other
+  // unknown-signer attestation.
+  const knownSignersArtifact = await loadExitArtifact(root, manifest, "known_signers");
+  if (
+    knownSignersArtifact &&
+    identityVerification?.did !== undefined &&
+    identityVerification.public_key !== undefined
+  ) {
+    const knownSignersResolution = resolveKnownSigners(
+      knownSignersArtifact.json,
+      identityVerification.did,
+      fromBase64url(identityVerification.public_key)
+    );
+    if (knownSignersResolution.ok) {
+      for (const [did, key] of knownSignersResolution.signers) {
+        if (!publicKeysByDid.has(did)) publicKeysByDid.set(did, key);
+      }
+    } else {
+      warnings.push(
+        `known_signers table could not be trusted (${knownSignersResolution.problem}` +
+          (knownSignersResolution.detail ? `: ${knownSignersResolution.detail}` : "") +
+          "); any attestation signed by a DID only this table would have resolved stays unverifiable"
+      );
     }
   }
 

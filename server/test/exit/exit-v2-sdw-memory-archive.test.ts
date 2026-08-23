@@ -161,6 +161,12 @@ function synchronizeInitialPassageReads(
 describe("Exit V2 SDW memory archive", () => {
   it("adds a distinct V2 contract while leaving the closed V1 contract byte-stable", async () => {
     expect(EXIT_BUNDLE_MANIFEST_VERSION).toBe("SANCTUARY_EXIT_BUNDLE_V1");
+    // Exit V2 drill F2 (2026-08-22/23, Erik-ratified option a): a DELIBERATE
+    // addition to this frozen surface - "known_signers" is a new, optional,
+    // additive artifact kind (a bundle exported before this change simply
+    // omits it; loadExitArtifact returns null and verify/import fall back
+    // to today's behavior). See server/reorg-surface-manifest.md and
+    // server/src/exit/verifier.ts (resolveKnownSigners).
     expect(EXIT_BUNDLE_ARTIFACT_KINDS).toEqual([
       "public_identity",
       "encrypted_state",
@@ -169,6 +175,7 @@ describe("Exit V2 SDW memory archive", () => {
       "reputation_bundle",
       "commitments",
       "placeholder_vault_metadata",
+      "known_signers",
     ]);
     expect(EXIT_V2_MANIFEST_VERSION).toBe("SANCTUARY_EXIT_BUNDLE_V2");
     expect(SDW_MEMORY_ARCHIVE_ARTIFACT_KIND).toBe("sdw_memory_archive");

@@ -65,6 +65,8 @@ const EXPECTED_PREFIXES = [
   "_facade",
   "_file_grants",
   "_castle_wall_observe",
+  // Exit V2 drill F2 (2026-08-22/23): server/src/reputation/known-signers-store.ts.
+  "_known_signers",
 ];
 
 // Matches a `const`/`let`/`var` declaration of `RESERVED_NAMESPACE_PREFIXES`,

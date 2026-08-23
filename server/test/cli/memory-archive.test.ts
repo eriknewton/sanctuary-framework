@@ -758,6 +758,9 @@ describe("Exit V2 memory archive CLI", () => {
     expect(await runExitCommand({ argv: ["manifest-shape"], out, err: new Sink(), env: {} })).toBe(0);
     expect(JSON.parse(out.text())).toMatchObject({
       manifest_version: "SANCTUARY_EXIT_BUNDLE_V1",
+      // Exit V2 drill F2 (2026-08-22/23): a DELIBERATE, additive 8th entry
+      // (see EXIT_BUNDLE_ARTIFACT_KINDS's doc comment); V1 remains unchanged
+      // otherwise, matching this test's own title.
       artifacts: [
         "public_identity",
         "encrypted_state",
@@ -766,6 +769,7 @@ describe("Exit V2 memory archive CLI", () => {
         "reputation_bundle",
         "commitments",
         "placeholder_vault_metadata",
+        "known_signers",
       ],
     });
   }, CLI_SUBPROCESS_TEST_TIMEOUT_MS);

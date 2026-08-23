@@ -329,6 +329,14 @@ export const RESERVED_NAMESPACE_PREFIXES = [
   "_facade",
   "_file_grants",
   "_castle_wall_observe",
+  // Exit V2 drill F2 (2026-08-22/23): per-DID public keys this fortress
+  // verified at import time (own key or a signer resolved from an earlier
+  // bundle's known_signers table), persisted here so a LATER export can
+  // rebuild a known_signers table without re-deriving trust. Written only
+  // by server/src/reputation/known-signers-store.ts, under the exit-import
+  // journal/write set (server/src/exit/bundle.ts activationSnapshotLocations)
+  // so #1301's rollback and writer-guard cover it the same as `_reputation`.
+  "_known_signers",
 ] as const;
 
 /**

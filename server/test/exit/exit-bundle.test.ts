@@ -132,6 +132,9 @@ describe("SANCTUARY_EXIT_BUNDLE_V1", () => {
       "audit_receipts",
       "commitments",
       "encrypted_state",
+      // Exit V2 drill F2 (2026-08-22/23): new, additive, always-emitted
+      // artifact kind (see EXIT_BUNDLE_ARTIFACT_KINDS's doc comment).
+      "known_signers",
       "placeholder_vault_metadata",
       "policy_set",
       "public_identity",
