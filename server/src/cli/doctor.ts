@@ -17,7 +17,7 @@ import { resolveCliMasterKey } from "../core/master-custody.js";
 import { detectCustodyFactorOrphan } from "../wrap/orphan-detection.js";
 import { getPlatformPaths } from "../wrap/config-reader.js";
 import { hermesConfigYamlPath, hermesSanctuaryEntryEnvValue } from "../wrap/hermes-yaml.js";
-import { EXIT_IMPORT_JOURNAL_NAMESPACE } from "../exit/bundle.js";
+import { EXIT_IMPORT_JOURNAL_NAMESPACE, EXIT_RECOVERY_VERB } from "../exit/bundle.js";
 import {
   describePyYamlCandidateFailure,
   probePyYamlCandidates,
@@ -35,7 +35,7 @@ import {
   verifyAuditChainRecords,
   type ExportRecord,
 } from "./audit-chain-verify.js";
-import { flagValue } from "./argv.js";
+import { flagValue, shellQuoteSingleArg } from "./argv.js";
 
 // Canonical version source. A bare `require("../../package.json")` resolves to
 // the repo-root package.json (no `version`) when bundled to server/dist/; the
@@ -248,13 +248,31 @@ async function checkInterruptedExitImport(storagePath: string): Promise<DoctorCh
     return fail(
       "exit import recovery",
       "interrupted exit import pending recovery",
-      "ITEM-3 (coordinator gate, 2026-08-22): run any `sanctuary exit` verb " +
-        "(for example `sanctuary exit verify`) to recover. If that itself " +
-        "reports the journal could not be safely rolled back, this needs " +
-        "operator intervention: inspect the journal entries directly under " +
-        "<fortress state path>/_exit_import_journal, confirm which value " +
-        "at the affected location is the one you want to keep, and only " +
-        "then remove the journal entry - do not remove it first.",
+      // F1/F4 (Exit V2 D1 operator finding, 2026-08-23): names
+      // EXIT_RECOVERY_VERB (imported above from exit/bundle.js, defined in
+      // storage/exit-import-journal.ts) - the verb that actually opens
+      // this fortress and rolls the journal back, not `exit verify` (which
+      // only checks a bundle directory and never touches local state; a
+      // drill operator who followed that old hint got PASS twice while
+      // this FAIL stayed). The internal tracking fragment ("ITEM-3
+      // (coordinator gate, 2026-08-22)") that used to prefix this text is
+      // removed per the same finding: it is not guidance, just noise on
+      // an operator's screen. Round-3: `recover` takes a REQUIRED
+      // `--fortress <path>` with no ambient fallback, so this hint
+      // interpolates the ACTUAL `storagePath` this check already has -
+      // the one hint site in the codebase that can, since every other
+      // site throws from inside library code with no path string handy.
+      // Round-4 fix (independent gate on #1304, P2): shell-quoted - an
+      // unquoted path containing a space (e.g. `/tmp/My Fortress`) would
+      // otherwise render a suggested command that splits into two
+      // arguments and fails, or does something the operator never typed.
+      `run \`sanctuary exit ${EXIT_RECOVERY_VERB} --fortress ${shellQuoteSingleArg(storagePath)}\` ` +
+        "to recover. If that itself reports the journal could not be " +
+        "safely rolled back, this needs operator intervention: inspect " +
+        "the journal entries directly " +
+        "under <fortress state path>/_exit_import_journal, confirm which " +
+        "value at the affected location is the one you want to keep, and " +
+        "only then remove the journal entry - do not remove it first.",
     );
   }
   return ok(

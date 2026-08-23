@@ -1,3 +1,4 @@
+// fail-before-exempt: this PR's only edit here is removing a stale stderr filter for a line now gated behind SANCTUARY_VERBOSE (adaptation-only, no new assertion). This file's own subprocess checks need a built dist/cli.js, which the fail-before job never produces (only npm ci runs there; the full CI job runs npm run build first), so they stay skip-gated under both pre-fix and post-fix source in this harness by construction. The SANCTUARY_VERBOSE default-quiet behavior itself is covered fail-before by audit-log-stdout-purity.test.ts's default-quiet assertion.
 /**
  * Bundled-binary round-trip drill for `sanctuary transparency`.
  *
@@ -45,24 +46,6 @@ interface RunResult {
   code: number;
   stdout: string;
   stderr: string;
-}
-
-/**
- * F5 (v1.6.1 stdio stdout purity): the audit-log's one-time file-locking
- * announcement is an operator-facing diagnostic that now correctly lands on
- * STDERR (stdout is the JSON-RPC / payload channel and must stay pure).
- * Strip that known diagnostic before asserting stderr silence, so the
- * assertions still catch real error output.
- */
-function nonDiagnosticStderr(stderr: string): string {
-  return stderr
-    .split("\n")
-    .filter(
-      (line) =>
-        !line.startsWith("[audit-log] cross-process file locking enabled")
-    )
-    .join("\n")
-    .trim();
 }
 
 async function runCli(
@@ -175,7 +158,12 @@ describe("sanctuary transparency (bundled binary round-trip)", () => {
 
       // (1) First checkpoint.
       const c1 = await runCli(checkpointArgs, env);
-      expect(nonDiagnosticStderr(c1.stderr)).toBe("");
+      // F4 (Exit V2 D1 operator finding, 2026-08-23): the audit-log
+      // file-locking announcement is now gated behind SANCTUARY_VERBOSE
+      // (server/src/operational/audit-log.ts) and this run never sets it,
+      // so it cannot appear here - a stderr filter stripping it would be
+      // stale, not defensive; assert plain silence instead.
+      expect(c1.stderr.trim()).toBe("");
       expect(c1.code).toBe(0);
       expect(c1.stdout).toContain("Enforcement checkpoint 1 emitted");
 
@@ -185,7 +173,7 @@ describe("sanctuary transparency (bundled binary round-trip)", () => {
       // tampered)". This is the regression assertion.
       const c2 = await runCli(checkpointArgs, env);
       expect(c2.stdout + c2.stderr).not.toContain("malformed");
-      expect(nonDiagnosticStderr(c2.stderr)).toBe("");
+      expect(c2.stderr.trim()).toBe("");
       expect(c2.code).toBe(0);
       expect(c2.stdout).toContain("Enforcement checkpoint 2 emitted");
 

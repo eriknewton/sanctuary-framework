@@ -2326,16 +2326,27 @@ export class AuditLog {
         this.filesystemCapabilities.namespacePath(AUDIT_NAMESPACE),
         AUDIT_WRITE_LOCK_FILE
       );
-      // SAFETY: one-time startup announcement of the audit-write coordination
-      // mechanism, routed to STDERR via console.error. Operators need to see
-      // this so they can locate the lock file and inspect lsof on it if writes
-      // appear stuck. It must NEVER touch stdout: on an MCP stdio boot stdout
+      // One-time startup announcement of the audit-write coordination
+      // mechanism. It must NEVER touch stdout: on an MCP stdio boot stdout
       // is the JSON-RPC channel, and console.info writes to stdout in Node
       // (this line was empirically the first stdout byte, ahead of the
       // initialize response).
-      console.error(
-        `[audit-log] cross-process file locking enabled: ${this.auditWriteLockPath}`
-      );
+      //
+      // F4 (Exit V2 D1 operator finding, 2026-08-23): gated on
+      // SANCTUARY_VERBOSE, not printed by default. Every `sanctuary exit`
+      // verb constructs an AuditLog, so this internal implementation detail
+      // (a lock file path an operator never needs) previously landed on the
+      // terminal of every invocation - drill transcript, Erik's own read of
+      // several steps: "greek". Diagnosing a stuck write still needs the
+      // path; set SANCTUARY_VERBOSE=1 to see it.
+      if (process.env.SANCTUARY_VERBOSE === "1") {
+        // SAFETY: operator explicitly opted in (SANCTUARY_VERBOSE=1);
+        // routed to STDERR via console.error, never stdout - see the
+        // stdio-purity note above.
+        console.error(
+          `[audit-log] cross-process file locking enabled: ${this.auditWriteLockPath}`
+        );
+      }
     }
   }
 

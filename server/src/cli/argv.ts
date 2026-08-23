@@ -177,3 +177,21 @@ export function hasFlag(argv: string[], name: string): boolean {
   const prefix = `${name}=`;
   return argv.some((arg) => arg === name || arg.startsWith(prefix));
 }
+
+/**
+ * POSIX single-quote-with-escaping: wraps `value` in single quotes,
+ * escaping any embedded single quote as `'\''` (close-quote, escaped
+ * quote, reopen-quote) so the result is safe to paste as ONE argument
+ * into a POSIX shell command line. Round-4 fix (independent gate on
+ * #1304, P2): a suggested-command hint that interpolates an operator's
+ * REAL fortress path unquoted breaks the moment that path contains a
+ * space or a shell metacharacter (`/tmp/My Fortress` splits into two
+ * arguments; the intended target is `<user>'s Fortress`, not the string
+ * that follows it). NOT consolidated here with the near-identical
+ * private `shellQuote` helpers already living in cli/deploy.ts and
+ * cli/castle-wall.ts (pre-existing, out of scope for this fix) - a
+ * future cleanup pass can fold all three into one shared export.
+ */
+export function shellQuoteSingleArg(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}

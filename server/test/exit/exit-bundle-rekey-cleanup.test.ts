@@ -561,4 +561,101 @@ describe("Exit-bundle re-key staged-artifact cleanup (finding #78)", () => {
     expect(anchorRecord.data["user-data/k1"]).toBe(1);
     expect(typeof anchorRecord.mac).toBe("string");
   });
+
+  it("wrong-length --source-recovery-key: prefixes a plain-English correction naming the BUNDLE RE-KEY KEY, since cleanup fully restored the fortress (F3, Exit V2 D1 operator finding, 2026-08-23)", async () => {
+    const source = await makeHarness();
+    const sourceIdentity = await callTool(source.tools, "identity_create", {
+      label: "source-agent",
+    });
+    const sourceIdentityId = sourceIdentity.identity_id as string;
+    await callTool(source.tools, "state_write", {
+      namespace: "user-data",
+      key: "k1",
+      value: "v1",
+      identity_id: sourceIdentityId,
+    });
+
+    const bundleDir = await mkdtemp(join(tmpdir(), "sanctuary-rekey-cleanup-bad-key-"));
+    tempDirs.push(bundleDir);
+    // mintStateRekeyKey: true so the manifest carries a source_custody
+    // block - decodeSourceRecoveryKey's "bundle-rekey" keyKind branch
+    // (server/src/exit/bundle.ts, resolveSourceMasterKey) is only reached
+    // when that block is present; without it a bad key hits the
+    // AMBIGUOUS/legacy branch instead.
+    await exportExitBundle({
+      unpartitionedLegacyExport: true,
+      bundleDir,
+      storage: source.storage,
+      masterKey: source.masterKey,
+      identityManager: source.identityManager,
+      auditLog: source.auditLog,
+      reputationStore: source.reputationStore,
+      policy: DEFAULT_POLICY,
+      config: defaultConfig(),
+      stateNamespaces: ["user-data"],
+      keySource: "recovery-key",
+      mintStateRekeyKey: true,
+    });
+
+    const destStorage = new MemoryStorage();
+    const destMasterKey = generateRandomKey();
+    const destAuditLog = new AuditLog(destStorage, destMasterKey);
+    const setupStateStore = new StateStore(destStorage, destMasterKey);
+    const { tools: setupTools, identityManager: destIdentityManager } = createL1Tools(
+      setupStateStore,
+      destStorage,
+      destMasterKey,
+      "recovery-key",
+      destAuditLog
+    );
+    await destIdentityManager.load();
+    await callTool(setupTools as ToolDef[], "identity_create", {
+      label: "dest-default",
+    });
+    const { reputationStore: destReputationStore } = createL4Tools(
+      destStorage,
+      destMasterKey,
+      destIdentityManager,
+      destAuditLog
+    );
+
+    let caught: ExitBundleImportError | null = null;
+    try {
+      await importExitBundle({
+        bundleDir,
+        storage: destStorage,
+        masterKey: destMasterKey,
+        identityManager: destIdentityManager,
+        auditLog: destAuditLog,
+        reputationStore: destReputationStore,
+        activate: true,
+        forceRebind: true,
+        // Deliberately wrong: this decodes fine as base64url but to far
+        // fewer than the required 32 bytes - the drill's own trigger (a
+        // rig placeholder, not the product, but the message is the
+        // product's).
+        sourceRecoveryKey: "AAAAAAAA",
+      });
+    } catch (err) {
+      caught = err as ExitBundleImportError;
+    }
+    expect(caught).toBeInstanceOf(ExitBundleImportError);
+    expect(caught?.code).toBe("REKEY_FAILED_AND_CLEANED");
+    expect(caught?.message).toContain(
+      "This is not a valid BUNDLE RE-KEY KEY (the key shown once at export)."
+    );
+    expect(caught?.message).toContain("The fortress was left unchanged.");
+    // F3: "keep the existing counts after it" - the original cleanup
+    // sentence must still follow the new prefix, not be replaced by it.
+    expect(caught?.message).toContain("Cleanup removed");
+    expect(caught?.message).toContain("Source recovery key must decode to 32 bytes");
+
+    // No user-data entry landed on the destination: the failure occurs
+    // before any state write is attempted (decodeSourceRecoveryKey runs
+    // inside resolveSourceMasterKey, called before the re-key loop), so
+    // "cleanup genuinely restored everything" is trivially true here and
+    // the destination is untouched, consistent with "the fortress was
+    // left unchanged".
+    expect(await destStorage.exists("user-data", "k1")).toBe(false);
+  });
 });

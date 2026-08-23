@@ -72,6 +72,7 @@ import type { StorageBackend } from "../storage/interface.js";
 import {
   hasInterruptedExitImport,
   EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
+  EXIT_RECOVERY_VERB,
   withExitAdmissionLock,
 } from "../storage/exit-import-journal.js";
 import {
@@ -1699,9 +1700,14 @@ export async function rotateMaster(
   // exclusion checks above do: refuse before any conversion begins.
   if (await hasInterruptedExitImport(storage)) {
     throw new RotationPreflightError(
+      // F1/round-3: must match EXIT_RECOVERY_VERB, imported above from
+      // storage/exit-import-journal.ts, AND the exact
+      // "--fortress <fortress path>" form - recover takes no ambient path
+      // (exit/cli.ts's ExitRecoverFortressPathRequiredError).
       "an exit-import rollback journal exists for this fortress, meaning an " +
-        "import is in progress or pending recovery; run any `sanctuary exit` " +
-        "verb (for example `sanctuary exit verify`) to recover, then retry"
+        `import is in progress or pending recovery; run \`sanctuary exit ` +
+        `${EXIT_RECOVERY_VERB} --fortress <fortress path>\` to recover, ` +
+        "then retry"
     );
   }
 
@@ -1937,10 +1943,14 @@ export async function rotateMaster(
     return await withExitAdmissionLock(storage, "rotate", async () => {
       if (await hasInterruptedExitImport(storage)) {
         throw new RotationPreflightError(
+          // F1/round-3: must match EXIT_RECOVERY_VERB, imported above,
+          // AND the exact "--fortress <fortress path>" form - recover
+          // takes no ambient path (exit/cli.ts's
+          // ExitRecoverFortressPathRequiredError).
           "an exit-import rollback journal exists for this fortress, meaning " +
-            "an import started after this rotation's preflight passed; run " +
-            "any `sanctuary exit` verb (for example `sanctuary exit verify`) " +
-            "to recover, then retry the rotation"
+            `an import started after this rotation's preflight passed; run ` +
+            `\`sanctuary exit ${EXIT_RECOVERY_VERB} --fortress <fortress ` +
+            "path>` to recover, then retry the rotation"
         );
       }
       await writeJournal(storage, journal, newMaster);
@@ -1994,9 +2004,13 @@ export async function resumeRotation(
   // directly, outside the writer guard's chokepoints.
   if (await hasInterruptedExitImport(storage)) {
     throw new RotationResumeError(
+      // F1/round-3: must match EXIT_RECOVERY_VERB, imported above, AND
+      // the exact "--fortress <fortress path>" form - recover takes no
+      // ambient path (exit/cli.ts's ExitRecoverFortressPathRequiredError).
       "an exit-import rollback journal exists for this fortress, meaning an " +
-        "import is in progress or pending recovery; run any `sanctuary exit` " +
-        "verb (for example `sanctuary exit verify`) to recover, then retry"
+        `import is in progress or pending recovery; run \`sanctuary exit ` +
+        `${EXIT_RECOVERY_VERB} --fortress <fortress path>\` to recover, ` +
+        "then retry"
     );
   }
 
@@ -2070,10 +2084,14 @@ export async function resumeRotation(
     return await withExitAdmissionLock(storage, "resume", async () => {
       if (await hasInterruptedExitImport(storage)) {
         throw new RotationResumeError(
+          // F1/round-3: must match EXIT_RECOVERY_VERB, imported above,
+          // AND the exact "--fortress <fortress path>" form - recover
+          // takes no ambient path (exit/cli.ts's
+          // ExitRecoverFortressPathRequiredError).
           "an exit-import rollback journal exists for this fortress, " +
-            "meaning an import started after this resume began; run any " +
-            "`sanctuary exit` verb (for example `sanctuary exit verify`) " +
-            "to recover, then retry the resume"
+            `meaning an import started after this resume began; run ` +
+            `\`sanctuary exit ${EXIT_RECOVERY_VERB} --fortress <fortress ` +
+            "path>` to recover, then retry the resume"
         );
       }
       let converted = 0;

@@ -6,7 +6,7 @@
  */
 
 import { createReadStream, openSync } from "node:fs";
-import { access, readFile as fsReadFile, mkdir } from "node:fs/promises";
+import { access, readFile as fsReadFile, mkdir, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { FilesystemStorage } from "../storage/filesystem.js";
@@ -16,7 +16,12 @@ import { IdentityManager } from "../cognitive/tools.js";
 import { ReputationStore } from "../reputation/reputation-store.js";
 import { loadConfig } from "../config.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "../principal-policy/loader.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import {
+  resolveCliMasterKey,
+  readCustodyEnvelope,
+  envelopeMissingButSentinelPresent,
+  CUSTODY_SENTINEL_KEY,
+} from "../core/master-custody.js";
 import {
   exportExitBundle,
   importExitBundle,
@@ -24,6 +29,8 @@ import {
   ExitBundleImportError,
   ExitBundleStateImportIncompleteError,
   recoverInterruptedExitImportsOrThrow,
+  EXIT_RECOVERY_VERB,
+  EXIT_IMPORT_JOURNAL_NAMESPACE,
   type ImportExitBundleResult,
 } from "./bundle.js";
 import type {
@@ -33,7 +40,7 @@ import type {
 import { verifyExitBundle, InvalidExitBundleError } from "./verifier.js";
 import { inspectExitBundle, inspectExitCode } from "./inspect.js";
 import { loadFortressDidWebRecord } from "../recognition/did-web.js";
-import { flagValue, flagValues } from "../cli/argv.js";
+import { flagValue, flagValues, consumeFlagValue } from "../cli/argv.js";
 
 const EXIT_EXPORT_ABORTED_EXIT_CODE = 78;
 
@@ -70,6 +77,79 @@ function manifestSignatureVerified(result: ExitBundleVerifierResult): boolean {
   if (result.failure_class === undefined) return true;
   return !MANIFEST_INTEGRITY_FAILURE_CLASSES.has(result.failure_class);
 }
+
+/**
+ * F2 (Exit V2 D1 operator finding, 2026-08-23): THE single shared table of
+ * plain-English sentences for every `failure_class` the verifier can emit.
+ * Both the human-mode `verify` output and the `--json` output's
+ * `reason_text` field read from this SAME object (see the `verify` command
+ * handler below) - never a hand-mirrored switch in one branch and this
+ * table in the other - so the two surfaces cannot describe the same
+ * failure differently. `Record<NonNullable<...failure_class>, string>`
+ * means TypeScript itself refuses to compile if a class is ever added to
+ * the contract's union without a sentence here (full-set parity enforced
+ * at the type level, not just by a test).
+ *
+ * Drill trigger (D1-OP-F2): human-mode `verify` on a refused bundle printed
+ * `verdict: FAIL` and three neutral fields with no reason at all, even
+ * though the JSON path already carried a specific `failure_class` -
+ * "Mostly greek" was Erik's own read of the human output.
+ */
+const FAILURE_CLASS_EXPLANATIONS: Record<
+  NonNullable<ExitBundleVerifierResult["failure_class"]>,
+  string
+> = {
+  manifest_signature_invalid:
+    "The bundle's signed manifest does not verify against its claimed signer. It may be corrupted, tampered with, or exported by a different process than the one that signed it.",
+  manifest_unknown_version:
+    "This bundle's manifest format version is not one this Sanctuary build knows how to verify. Update Sanctuary, or re-export the bundle from a compatible version.",
+  manifest_signature_scheme_invalid:
+    "The manifest declares a signature scheme this Sanctuary build does not support. Update Sanctuary, or re-export the bundle from a compatible version.",
+  artifact_hash_mismatch:
+    "At least one artifact's contents do not match the hash recorded in the signed manifest. The file was altered, or the bundle is corrupted.",
+  artifact_missing:
+    "At least one artifact the manifest lists could not be found in the bundle directory. The download or copy is incomplete.",
+  artifact_size_mismatch:
+    "At least one artifact's size does not match what the signed manifest recorded. The file was truncated, altered, or the bundle is corrupted.",
+  aggregate_hash_mismatch:
+    "The combined hash of the bundle's artifacts does not match the value the manifest signed. The bundle's artifact set does not match what was originally exported.",
+  artifact_path_unsafe:
+    "The manifest names an artifact path that cannot be trusted to stay inside the bundle directory. Refusing this bundle.",
+  artifact_path_duplicate:
+    "The manifest lists the same artifact path more than once. This bundle is malformed.",
+  artifact_kind_duplicate:
+    "The manifest lists more than one artifact of a kind this format allows only once. This bundle is malformed.",
+  artifact_set_invalid:
+    "The set of artifacts in this bundle does not match what this manifest version requires (something is missing or something extra is present). This bundle is malformed.",
+  artifact_directory_unlisted_file:
+    "A file exists in the bundle directory that the manifest does not list. Refusing to trust an unaccounted-for file.",
+  artifact_path_escapes_root:
+    "An artifact path in the manifest points outside the bundle directory. This bundle is malformed or was tampered with.",
+  archive_contains_symlink:
+    "The bundle contains a symbolic link, which this format never uses legitimately. Refusing this bundle.",
+  private_material_present:
+    "The bundle appears to contain private key material that should never leave a fortress. Refusing to import it; do not share this bundle with anyone.",
+  identity_binding_mismatch:
+    "The identity recorded in the manifest does not match the identity artifact inside the bundle.",
+  identity_signature_invalid:
+    "The identity artifact's own signature does not verify.",
+  rotation_chain_invalid:
+    "This identity's key-rotation history does not verify from its retired keys forward to the current one.",
+  reputation_bundle_signature_invalid:
+    "The reputation data's signature does not verify.",
+  reputation_completeness_mismatch:
+    "The reputation data does not account for the number of attestations the manifest claims.",
+  reputation_attestation_signature_invalid:
+    "At least one reputation attestation's signature does not verify.",
+  reputation_unverifiable_attestations:
+    "At least one reputation attestation was signed by a party this bundle does not identify, so it cannot be verified. Re-run with --accept-unverifiable-attestations to preview anyway (import always verifies strictly regardless of this flag).",
+  known_signers_invalid:
+    "The bundle's table of known signers, used to verify reputation attestations, is malformed, incorrectly signed, or otherwise cannot be trusted.",
+  encrypted_state_entries_unreadable:
+    "The bundle's encrypted state passed its own signature and hash checks, but its internal entry list is not in the shape this Sanctuary build expects to read.",
+  other:
+    "The verifier reported a failure it does not have a specific category for. Check the warnings below for detail.",
+};
 
 export interface ExitCommandArgs {
   argv: string[];
@@ -211,6 +291,224 @@ async function openExitContext(
   };
 }
 
+/**
+ * F1 fix-round (independent gate on #1304, HIGH): named refusals for
+ * `openFortressForRecoveryOnly` below. `recover`'s entire point is to roll
+ * back an interrupted import without itself being a thing that mutates a
+ * fortress; these name exactly what is missing and which OTHER verb is the
+ * one that would legitimately perform the write `recover` refuses to do.
+ */
+export class ExitRecoverNoFortressError extends Error {
+  constructor(storagePath: string) {
+    super(
+      `No fortress found at ${storagePath}: there is no custody envelope ` +
+        "and no legacy custody markers. Nothing to recover. `sanctuary exit " +
+        `${EXIT_RECOVERY_VERB}\` deliberately never establishes custody; if ` +
+        "you intended to create a new fortress, run a normal Sanctuary " +
+        "operation instead (for example `sanctuary exit export`, or start " +
+        "the Sanctuary MCP server)."
+    );
+    this.name = "ExitRecoverNoFortressError";
+  }
+}
+
+export class ExitRecoverLegacyMigrationRequiredError extends Error {
+  constructor() {
+    super(
+      "This fortress uses legacy (pre-envelope) custody. `sanctuary exit " +
+        `${EXIT_RECOVERY_VERB}\` deliberately never migrates custody as a ` +
+        "side effect. Run `sanctuary exit export`, `sanctuary exit import`, " +
+        "or any other normal Sanctuary operation against this fortress " +
+        "first to complete the migration, then re-run `sanctuary exit " +
+        `${EXIT_RECOVERY_VERB}\`.`
+    );
+    this.name = "ExitRecoverLegacyMigrationRequiredError";
+  }
+}
+
+/**
+ * Round-3 fix (independent gate on #1304, HIGH). `--fortress` is the ONLY
+ * source of the path `recover` operates against, and it is REQUIRED - no
+ * ambient fallback of any kind. Same flag name `sanctuary doctor` uses.
+ */
+export class ExitRecoverFortressPathRequiredError extends Error {
+  constructor() {
+    super(
+      `sanctuary exit ${EXIT_RECOVERY_VERB} requires --fortress <path>: ` +
+        "the path to the fortress to check. This verb never reads " +
+        "sanctuary.json and never consults SANCTUARY_STORAGE_PATH; name " +
+        "the fortress explicitly, the same way `sanctuary doctor " +
+        "--fortress <path>` does. Example: `sanctuary exit " +
+        `${EXIT_RECOVERY_VERB} --fortress ~/.sanctuary\``
+    );
+    this.name = "ExitRecoverFortressPathRequiredError";
+  }
+}
+
+/**
+ * F1 fix-round (independent gate on #1304, HIGH): `recover`'s OWN open
+ * path, deliberately NOT `openExitContext` above. `openExitContext` always
+ * passes `bootstrap: true` to `resolveCliMasterKey`, and `establishMaster`
+ * (core/master-custody.ts) can MINT a brand-new custody envelope on a
+ * virgin fortress via that flag, or MIGRATE a legacy (pre-envelope)
+ * fortress to an envelope regardless of that flag (the legacy branches key
+ * off `_meta` markers, not `firstRun`) - both real writes, and both used to
+ * happen before the exit-admission lock was ever acquired
+ * (`recoverInterruptedExitImportsOrThrow`, which owns the lock, only runs
+ * AFTER `mkdir` + master-key resolution in `openExitContext`). On a fresh
+ * fortress `recover` used to print "nothing to recover" AFTER silently
+ * creating custody state; on a legacy fortress it migrated custody before
+ * ever discovering a held admission lock.
+ *
+ * The fix: peek at custody with a read-only `readCustodyEnvelope` call - no
+ * `mkdir`, no `establishMaster`, so nothing on disk changes - before
+ * resolving anything. If no envelope exists, refuse BY NAME (distinguishing
+ * "no fortress here at all" from "legacy fortress, needs migration") and
+ * never call `resolveCliMasterKey` at all, so `establishMaster`'s mutating
+ * branches are structurally unreachable from this function. Only once an
+ * envelope is CONFIRMED present does it resolve the master key -
+ * `establishMaster`'s `if (envelope) {...}` branch unwraps and returns
+ * without ever writing, so this is non-mutating regardless of the
+ * `bootstrap` flag, and `bootstrap` is not passed here at all. Nothing
+ * above `recoverInterruptedExitImportsOrThrow` performs a write, so the
+ * admission lock it acquires genuinely gates every possible one.
+ *
+ * Round-3 fix (independent gate on #1304, HIGH): the path itself is now
+ * `--fortress` ONLY (see `ExitRecoverFortressPathRequiredError` above) -
+ * the round-2 fix's `resolveStoragePath(env)` (SANCTUARY_STORAGE_PATH,
+ * else the default `~/.sanctuary`) still diverged from what other `exit`
+ * verbs resolve to whenever the operator's fortress path lives ONLY in
+ * `sanctuary.json`'s own `storage_path` key, since those verbs' shared
+ * `loadConfig()` DOES read that key. Removing the ambient resolution
+ * entirely (rather than trying to replicate that one config field
+ * read-only) means there is no path source left to diverge from, and the
+ * round-2 fix (never triggering `quarantineConfigFile`) now holds by
+ * construction - there is no `sanctuary.json` read anywhere in this
+ * function to regress.
+ *
+ * Deliberately does NOT load IdentityManager or construct ReputationStore:
+ * `recover` needs neither, and skipping them removes any question of
+ * whether their own load paths could write (see
+ * fortress-open-recovery-wiring.test.ts's own note on IdentityManager's
+ * primary-identity-pointer persistence for why that question is live for
+ * OTHER verbs, just not for this one).
+ */
+async function openFortressForRecoveryOnly(
+  argv: string[],
+  env: NodeJS.ProcessEnv
+): Promise<{ recovered: number }> {
+  const passphrase =
+    flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
+  const recoveryKey = env.SANCTUARY_RECOVERY_KEY;
+  // Round-4 fix (independent gate on #1304, P2): `flagValue` is
+  // permissive - `--fortress --json` reads `--json` AS the path (it never
+  // checks whether the "value" it captured looks like another flag), so
+  // `sanctuary exit recover --fortress --json` silently searched
+  // `./--json` and refused with a confusing "No fortress found at
+  // --json". `consumeFlagValue` (cli/argv.ts) is the fail-closed parser
+  // every other verb in this codebase uses for a required single-value
+  // flag: it refuses BY NAME (a distinct "--fortress requires a value"
+  // error) when the value is missing entirely OR the next token itself
+  // starts with `--`.
+  const fortressResult = consumeFlagValue(argv, "--fortress");
+  if (fortressResult.error !== undefined) {
+    throw new Error(fortressResult.error);
+  }
+  const storagePath = fortressResult.value;
+  if (!storagePath) {
+    throw new ExitRecoverFortressPathRequiredError();
+  }
+  const stateStoragePath = join(storagePath, "state");
+  const storage = new FilesystemStorage(stateStoragePath);
+
+  // Read-only peek. `readCustodyEnvelope` is a plain `storage.read` (see
+  // storage/filesystem.ts: `read()` never creates a directory, it catches
+  // ENOENT and returns null) - a missing fortress leaves NOTHING on disk.
+  const envelope = await readCustodyEnvelope(storage);
+  if (!envelope) {
+    // LOW (round-2 fix, independent gate on #1304): a custody SENTINEL
+    // with no envelope means the envelope was deleted, hidden, or
+    // corrupted after this fortress was already migrated - a possible
+    // integrity problem, not "no fortress" and not "needs migration".
+    // Checked FIRST, matching `establishMaster`'s own ordering
+    // (core/master-custody.ts) and severity: an integrity concern
+    // outranks either of the other two refusals. Reuses
+    // `envelopeMissingButSentinelPresent()` verbatim - the SAME error the
+    // normal resolver throws for this exact condition - rather than a
+    // hand-mirrored copy of its guidance that could drift from it.
+    const sentinel = await storage.read("_meta", CUSTODY_SENTINEL_KEY);
+    if (sentinel) {
+      throw envelopeMissingButSentinelPresent();
+    }
+    // Legacy markers (core/master-custody.ts's `establishMaster`): present
+    // without an envelope means this fortress predates envelope custody
+    // and opening it normally would migrate it - a write `recover` must
+    // not perform as a side effect of a "did anything need rolling back"
+    // check.
+    const legacyParams = await storage.read("_meta", "key-params");
+    const legacyRecoveryHash = await storage.read("_meta", "recovery-key-hash");
+    if (legacyParams || legacyRecoveryHash) {
+      throw new ExitRecoverLegacyMigrationRequiredError();
+    }
+    throw new ExitRecoverNoFortressError(storagePath);
+  }
+
+  // LOW (round-3 fix, independent gate on #1304): `withPathLock`
+  // (storage/cross-process-lock.ts) mkdirs the lock's namespace directory
+  // BEFORE attempting the O_EXCL acquire, so even a lock attempt that
+  // immediately releases (a no-op recovery) leaves a brand-new, empty
+  // `_exit_import_journal` directory behind on a fortress that never had
+  // one - a tree change from a command whose entire point is "did
+  // anything need rolling back". Checked here, read-only, BEFORE
+  // resolving a master key at all: a journal-set write is the ONLY thing
+  // that ever creates this directory (`writeImportJournal`,
+  // exit/bundle.ts; the admission lock file itself also lives inside it,
+  // so a fortress with no directory cannot have a held lock either), so
+  // its absence means there is genuinely nothing to recover and nothing
+  // to contend with - skip locking entirely rather than create-then-
+  // release it. BOUND: this covers only the empty-namespace case; once
+  // the directory exists (any journal-set write ever happened here),
+  // `withPathLock`'s own mkdir may still create files inside an
+  // already-existing tree on a no-op recovery. That machinery belongs to
+  // cross-process-lock.ts and is not touched here.
+  const journalDir = storage.namespacePath(EXIT_IMPORT_JOURNAL_NAMESPACE);
+  try {
+    await stat(journalDir);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return { recovered: 0 };
+    }
+    throw error;
+  }
+
+  let masterKey: Uint8Array;
+  if (passphrase) {
+    masterKey = await resolveCliMasterKey(storage, {
+      passphrase,
+      storagePathHint: storagePath,
+    });
+  } else if (recoveryKey) {
+    masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      storagePathHint: storagePath,
+    });
+  } else {
+    throw new Error(
+      "sanctuary exit requires SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY."
+    );
+  }
+
+  const auditLog = new AuditLog(storage, masterKey);
+  // The ONLY write this function's success path can perform, and only
+  // once `recoverInterruptedExitImportsOrThrow` has acquired the
+  // exit-admission lock internally (storage/exit-import-journal.ts).
+  return recoverInterruptedExitImportsOrThrow(storage, auditLog);
+}
+
 export function printExitHelp(out: Writable = process.stdout): void {
   write(out, `
 Usage: sanctuary exit <command> [options]
@@ -223,6 +521,22 @@ Commands:
   inspect <dir>               Read-only: what the bundle carries and WHICH
                               credential it DECLARES it needs. No passphrase,
                               no writes, and no import is attempted.
+  recover --fortress <path>   Open THIS fortress (not a bundle directory) and
+                              roll back any interrupted exit-import journal
+                              entry left by a killed import, rotation, or
+                              resume. --fortress is REQUIRED: this verb
+                              never reads sanctuary.json and never
+                              consults SANCTUARY_STORAGE_PATH (the same
+                              flag "sanctuary doctor --fortress <path>"
+                              uses). Also needs fortress credentials same
+                              as export/import. Mutates nothing beyond
+                              finishing that rollback; safe to run when
+                              there is nothing to recover. Refuses (never
+                              creates or migrates custody) if no fortress
+                              exists at that path, or if it still uses
+                              pre-envelope legacy custody - run
+                              export/import or a normal Sanctuary
+                              operation first in either case.
 
 Options:
   --passphrase <value>              Current destination/source passphrase
@@ -376,10 +690,19 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         throw e;
       }
       if (json) {
+        // F2: `reason_text` reads FAILURE_CLASS_EXPLANATIONS, the same
+        // table the human branch below reads for its `reason:` sentence -
+        // one table, never a hand-mirrored copy per output mode. Additive
+        // field, only present when there is a failure_class to explain;
+        // every existing JSON key is untouched.
+        const reasonText =
+          result.failure_class !== undefined
+            ? { reason_text: FAILURE_CLASS_EXPLANATIONS[result.failure_class] }
+            : {};
         write(
           out,
           JSON.stringify(
-            { verdict: result.passed ? "PASS" : "FAIL", ...result },
+            { verdict: result.passed ? "PASS" : "FAIL", ...result, ...reasonText },
             null,
             2,
           ) + "\n",
@@ -406,6 +729,17 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         // string and stays byte-identical (frozen-surface rule). The state
         // lines are appended, never interleaved, so an operator script that
         // greps for `identity:` or `artifacts:` is unaffected.
+        //
+        // F2 (Exit V2 D1 operator finding, 2026-08-23): same additive-only
+        // discipline - a refused bundle previously printed `verdict: FAIL`
+        // and three neutral fields with NO reason at all. `reason:` is the
+        // machine-branchable failure_class (the exact string `--json`'s
+        // `reason_text` key is looked up from too); the sentence under it
+        // is FAILURE_CLASS_EXPLANATIONS[<that class>].
+        if (result.failure_class !== undefined) {
+          write(out, `reason: ${result.failure_class}\n`);
+          write(out, `${FAILURE_CLASS_EXPLANATIONS[result.failure_class]}\n`);
+        }
         if (result.state) {
           // `entry_count === null` means the artifact's entries list could not
           // be read at all. Printing `0` there would be the absent-as-empty
@@ -425,6 +759,34 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         }
       }
       return result.passed ? 0 : 1;
+    }
+
+    // F1 (Exit V2 D1 operator finding, 2026-08-23): the verb every
+    // recovery hint in the codebase names (EXIT_RECOVERY_VERB, defined in
+    // storage/exit-import-journal.ts and re-exported via bundle.js).
+    // Deliberately `openFortressForRecoveryOnly`, NOT `openExitContext`
+    // (fix round, independent gate on #1304, HIGH): that function refuses
+    // by name rather than bootstrapping or migrating custody as a side
+    // effect, and only resolves anything after confirming an envelope
+    // already exists, so the exit-admission lock it acquires internally
+    // (recoverInterruptedExitImportsOrThrow -> withExitAdmissionLock) gates
+    // every possible write, not just the ones after mkdir/master-key
+    // resolution. Round-3 fix: `--fortress <path>` is REQUIRED (no
+    // SANCTUARY_STORAGE_PATH/sanctuary.json fallback of any kind) - see
+    // ExitRecoverFortressPathRequiredError above for why.
+    if (command === EXIT_RECOVERY_VERB) {
+      const { recovered } = await openFortressForRecoveryOnly(argv, env);
+      if (json) {
+        write(out, JSON.stringify({ recovered }, null, 2) + "\n");
+      } else if (recovered > 0) {
+        write(
+          out,
+          `recovered: ${recovered} journal entr${recovered === 1 ? "y" : "ies"} rolled back\n`
+        );
+      } else {
+        write(out, "nothing to recover\n");
+      }
+      return 0;
     }
 
     if (command === "inspect") {

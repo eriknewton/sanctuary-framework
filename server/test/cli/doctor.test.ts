@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { runDoctorChecks, runDoctorCommand } from "../../src/cli/doctor.js";
+import { EXIT_RECOVERY_VERB } from "../../src/exit/bundle.js";
 import { exportAuditChain } from "../../src/cli/audit-chain-export.js";
 import type {
   CheckpointExportRecord,
@@ -363,6 +364,67 @@ approval_channel:
     expect(out.text()).toContain("FAIL exit import recovery");
     expect(out.text()).toContain("interrupted exit import pending recovery");
     expect(out.text()).toContain("recover");
+  });
+
+  it("round-4 fix (independent gate on #1304, P2): the exit-import-recovery hint's suggested command survives a fortress path containing a space and a single quote (behavioral, real shell round-trip)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sanctuary-doctor-quoting-"));
+    tempDirs.push(root);
+    // Both a space (splits an unquoted command into two arguments) and a
+    // single quote (breaks a naive `'${path}'` wrap outright) in one path.
+    const fortress = join(root, "My Fortress's Data");
+    await mkdir(fortress, { recursive: true, mode: 0o700 });
+    await chmod(fortress, 0o700);
+    const storage = new FilesystemStorage(join(fortress, "state"));
+    const derived = await deriveMasterKey(passphrase);
+    await storage.write("_meta", "key-params", stringToBytes(JSON.stringify(derived.params)));
+    // Plant a leftover exit-import journal entry so doctor's FAIL path
+    // (and its suggested-command hint) actually fires.
+    await storage.write(
+      "_exit_import_journal",
+      "planted-doctor-quoting-import",
+      new TextEncoder().encode(
+        JSON.stringify({
+          import_id: "planted-doctor-quoting-import",
+          identity_id: "unknown",
+          started_at: new Date().toISOString(),
+          snapshots: [],
+        }),
+      ),
+    );
+
+    const out = new Capture();
+    const code = await runDoctorCommand({
+      argv: ["--fortress", fortress],
+      out,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+      platform: "linux",
+    });
+    expect(code).not.toBe(0);
+    expect(out.text()).toContain("FAIL exit import recovery");
+
+    // Extract the suggested command's --fortress argument (everything
+    // between "--fortress " and the closing "`" before " to recover.")
+    // without re-implementing the quoting/escaping logic under test -
+    // then feed it to a REAL POSIX shell and confirm it evaluates back to
+    // the original path. An unquoted or wrongly-escaped path would either
+    // split into multiple arguments or fail to round-trip.
+    const text = out.text();
+    const startMarker = `${EXIT_RECOVERY_VERB} --fortress `;
+    const endMarker = "` to recover.";
+    const startIdx = text.indexOf(startMarker);
+    expect(startIdx, "suggested command not found in doctor output").toBeGreaterThan(-1);
+    const afterStart = text.slice(startIdx + startMarker.length);
+    const endIdx = afterStart.indexOf(endMarker);
+    expect(endIdx, "closing backtick before \" to recover.\" not found").toBeGreaterThan(-1);
+    const quotedPath = afterStart.slice(0, endIdx);
+
+    const { execFileSync } = await import("node:child_process");
+    const roundTripped = execFileSync(
+      "/bin/sh",
+      ["-c", `printf '%s' ${quotedPath}`],
+      { encoding: "utf8" },
+    );
+    expect(roundTripped).toBe(fortress);
   });
 
   it("MEDIUM-D (coordinator gate, 2026-08-22): reports OK for exit import recovery when no journal exists", async () => {
