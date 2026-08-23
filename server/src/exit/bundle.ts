@@ -13,10 +13,15 @@ import type { StorageBackend } from "../storage/interface.js";
 import {
   EXIT_IMPORT_JOURNAL_NAMESPACE,
   EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
+  EXIT_RECOVERY_VERB,
   withExitAdmissionLock,
   hasInterruptedExitImport,
 } from "../storage/exit-import-journal.js";
-export { EXIT_IMPORT_JOURNAL_NAMESPACE, EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE };
+export {
+  EXIT_IMPORT_JOURNAL_NAMESPACE,
+  EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
+  EXIT_RECOVERY_VERB,
+};
 import {
   StateStore,
   isReservedNamespace,
@@ -1969,13 +1974,52 @@ function validateSourceCustody(custody: ExitSourceCustody): void {
   }
 }
 
-function decodeSourceRecoveryKey(sourceRecoveryKey: string): Uint8Array {
+/**
+ * F3 (Exit V2 D1 operator finding, 2026-08-23): named (rather than a plain
+ * `Error`) so the import-failure cleanup catch below can recognise "the
+ * operator's `--source-recovery-key` string did not even decode to the
+ * right width" and prefix a plain-English correction ahead of the raw
+ * byte-count message, instead of leaving the operator to parse
+ * "must decode to 32 bytes" unaided (drill transcript: "I answered Y, but
+ * it looks like it failed? I can't tell"). `keyKind` records which of the
+ * two meanings `--source-recovery-key` had at the throwing call site (see
+ * `resolveSourceMasterKey` below) so the correction names the credential
+ * the operator actually typed wrong, rather than guessing.
+ */
+export class SourceRecoveryKeyDecodeError extends Error {
+  constructor(public readonly keyKind: "bundle-rekey" | "legacy-master") {
+    super("Source recovery key must decode to 32 bytes.");
+    this.name = "SourceRecoveryKeyDecodeError";
+  }
+}
+
+/**
+ * F3: the plain-English correction the cleanup catch (below,
+ * `importExitBundle`'s failure path) prefixes onto a `SourceRecoveryKeyDecodeError`'s
+ * message, keyed by which credential the operator actually typed wrong.
+ * `Record<..., string>` over the error's own `keyKind` union, so a third
+ * `keyKind` added later fails to compile here until it gets a sentence too.
+ */
+const SOURCE_RECOVERY_KEY_DECODE_HINTS: Record<
+  SourceRecoveryKeyDecodeError["keyKind"],
+  string
+> = {
+  "bundle-rekey":
+    "This is not a valid BUNDLE RE-KEY KEY (the key shown once at export).",
+  "legacy-master":
+    "This is not a valid SOURCE FORTRESS MASTER KEY (the credential --legacy-source-master confirmed).",
+};
+
+function decodeSourceRecoveryKey(
+  sourceRecoveryKey: string,
+  keyKind: "bundle-rekey" | "legacy-master"
+): Uint8Array {
   const key = fromBase64url(sourceRecoveryKey);
   // 32 = the 256-bit recovery key minted by `generateRandomKey()`. The SOURCE
   // fortress's recovery key, so the width must match `decodeRecoveryKey` in
   // `core/master-custody.ts`. Symmetric material, not an Ed25519 key.
   if (key.length !== 32) {
-    throw new Error("Source recovery key must decode to 32 bytes.");
+    throw new SourceRecoveryKeyDecodeError(keyKind);
   }
   return key;
 }
@@ -2103,7 +2147,7 @@ async function resolveSourceMasterKey(
   if (opts.sourceRecoveryKey) {
     if (sourceCustody !== undefined) {
       const master = await unwrapMasterFromWraps(sourceCustody.wraps, {
-        recoveryKey: decodeSourceRecoveryKey(opts.sourceRecoveryKey),
+        recoveryKey: decodeSourceRecoveryKey(opts.sourceRecoveryKey, "bundle-rekey"),
       });
       if (!master) {
         throw new ExitBundleImportError(
@@ -2143,7 +2187,7 @@ async function resolveSourceMasterKey(
     // Legacy semantics, explicitly confirmed by the operator: the recovery key
     // IS the master. A wrong key is still caught downstream by rekeyState's
     // all-entries-failed SOURCE_KEY_MISMATCH.
-    return decodeSourceRecoveryKey(opts.sourceRecoveryKey);
+    return decodeSourceRecoveryKey(opts.sourceRecoveryKey, "legacy-master");
   }
 
   return null;
@@ -4095,9 +4139,10 @@ export async function importExitBundle(
   if (await hasInterruptedExitImport(opts.storage)) {
     throw new ExitBundleImportError(
       "CONCURRENT_IMPORT_IN_PROGRESS",
-      "another exit-import journal already exists for this fortress; run " +
-        "any `sanctuary exit` verb (for example `sanctuary exit verify`) " +
-        "to recover, then retry"
+      // F1: must match EXIT_RECOVERY_VERB, imported above from
+      // storage/exit-import-journal.ts (re-exported by this file).
+      `another exit-import journal already exists for this fortress; run ` +
+        `\`sanctuary exit ${EXIT_RECOVERY_VERB}\` to recover, then retry`
     );
   }
   await writeImportJournal(
@@ -4593,7 +4638,7 @@ export async function importExitBundle(
       : stateRekeyStarted
         ? "REKEY_FAILED_AND_CLEANED"
         : "ACTIVATION_FAILED_AND_CLEANED";
-    const cleanupMessage =
+    const baseCleanupMessage =
       // Preserve structured fail-closed codes (SOURCE_CREDENTIAL_INVALID,
       // SOURCE_KEY_MISMATCH, ...) so callers can branch on the cause; the
       // generic code covers non-structured failures (disk full, etc.).
@@ -4602,6 +4647,18 @@ export async function importExitBundle(
         `${activationSnapshots.length} snapshotted paths ` +
         `(${importedRekeyEntries.length} re-keyed entries plus ${stagedLocations.length} staged artifacts; ` +
         `${cleanup.failed.length} cleanup writes/deletes failed).`;
+    // F3 (Exit V2 D1 operator finding, 2026-08-23): prefix the plain-English
+    // correction ONLY when `cleanup.failed.length === 0` - the same
+    // condition `deleteImportJournal` above already used to decide the
+    // journal is safe to clear, i.e. "genuinely restored everything" means
+    // no snapshot in this cleanup pass was left un-restored or diverged.
+    // Telling an operator "the fortress was left unchanged" while a
+    // snapshot actually failed to restore would be a false reassurance.
+    const cleanupMessage =
+      err instanceof SourceRecoveryKeyDecodeError && cleanup.failed.length === 0
+        ? `${SOURCE_RECOVERY_KEY_DECODE_HINTS[err.keyKind]} The fortress was ` +
+          `left unchanged. ${baseCleanupMessage}`
+        : baseCleanupMessage;
     if (err instanceof ExitBundleStateImportIncompleteError) {
       throw new ExitBundleStateImportIncompleteError(err.state, cleanupMessage, {
         cause: err,

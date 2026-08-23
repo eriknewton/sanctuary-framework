@@ -17,7 +17,7 @@ import { resolveCliMasterKey } from "../core/master-custody.js";
 import { detectCustodyFactorOrphan } from "../wrap/orphan-detection.js";
 import { getPlatformPaths } from "../wrap/config-reader.js";
 import { hermesConfigYamlPath, hermesSanctuaryEntryEnvValue } from "../wrap/hermes-yaml.js";
-import { EXIT_IMPORT_JOURNAL_NAMESPACE } from "../exit/bundle.js";
+import { EXIT_IMPORT_JOURNAL_NAMESPACE, EXIT_RECOVERY_VERB } from "../exit/bundle.js";
 import {
   describePyYamlCandidateFailure,
   probePyYamlCandidates,
@@ -248,13 +248,22 @@ async function checkInterruptedExitImport(storagePath: string): Promise<DoctorCh
     return fail(
       "exit import recovery",
       "interrupted exit import pending recovery",
-      "ITEM-3 (coordinator gate, 2026-08-22): run any `sanctuary exit` verb " +
-        "(for example `sanctuary exit verify`) to recover. If that itself " +
-        "reports the journal could not be safely rolled back, this needs " +
-        "operator intervention: inspect the journal entries directly under " +
-        "<fortress state path>/_exit_import_journal, confirm which value " +
-        "at the affected location is the one you want to keep, and only " +
-        "then remove the journal entry - do not remove it first.",
+      // F1/F4 (Exit V2 D1 operator finding, 2026-08-23): names
+      // EXIT_RECOVERY_VERB (imported above from exit/bundle.js, defined in
+      // storage/exit-import-journal.ts) - the verb that actually opens
+      // this fortress and rolls the journal back, not `exit verify` (which
+      // only checks a bundle directory and never touches local state; a
+      // drill operator who followed that old hint got PASS twice while
+      // this FAIL stayed). The internal tracking fragment ("ITEM-3
+      // (coordinator gate, 2026-08-22)") that used to prefix this text is
+      // removed per the same finding: it is not guidance, just noise on
+      // an operator's screen.
+      `run \`sanctuary exit ${EXIT_RECOVERY_VERB}\` to recover. If that ` +
+        "itself reports the journal could not be safely rolled back, this " +
+        "needs operator intervention: inspect the journal entries directly " +
+        "under <fortress state path>/_exit_import_journal, confirm which " +
+        "value at the affected location is the one you want to keep, and " +
+        "only then remove the journal entry - do not remove it first.",
     );
   }
   return ok(

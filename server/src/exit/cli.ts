@@ -24,6 +24,7 @@ import {
   ExitBundleImportError,
   ExitBundleStateImportIncompleteError,
   recoverInterruptedExitImportsOrThrow,
+  EXIT_RECOVERY_VERB,
   type ImportExitBundleResult,
 } from "./bundle.js";
 import type {
@@ -71,6 +72,79 @@ function manifestSignatureVerified(result: ExitBundleVerifierResult): boolean {
   return !MANIFEST_INTEGRITY_FAILURE_CLASSES.has(result.failure_class);
 }
 
+/**
+ * F2 (Exit V2 D1 operator finding, 2026-08-23): THE single shared table of
+ * plain-English sentences for every `failure_class` the verifier can emit.
+ * Both the human-mode `verify` output and the `--json` output's
+ * `reason_text` field read from this SAME object (see the `verify` command
+ * handler below) - never a hand-mirrored switch in one branch and this
+ * table in the other - so the two surfaces cannot describe the same
+ * failure differently. `Record<NonNullable<...failure_class>, string>`
+ * means TypeScript itself refuses to compile if a class is ever added to
+ * the contract's union without a sentence here (full-set parity enforced
+ * at the type level, not just by a test).
+ *
+ * Drill trigger (D1-OP-F2): human-mode `verify` on a refused bundle printed
+ * `verdict: FAIL` and three neutral fields with no reason at all, even
+ * though the JSON path already carried a specific `failure_class` -
+ * "Mostly greek" was Erik's own read of the human output.
+ */
+const FAILURE_CLASS_EXPLANATIONS: Record<
+  NonNullable<ExitBundleVerifierResult["failure_class"]>,
+  string
+> = {
+  manifest_signature_invalid:
+    "The bundle's signed manifest does not verify against its claimed signer. It may be corrupted, tampered with, or exported by a different process than the one that signed it.",
+  manifest_unknown_version:
+    "This bundle's manifest format version is not one this Sanctuary build knows how to verify. Update Sanctuary, or re-export the bundle from a compatible version.",
+  manifest_signature_scheme_invalid:
+    "The manifest declares a signature scheme this Sanctuary build does not support. Update Sanctuary, or re-export the bundle from a compatible version.",
+  artifact_hash_mismatch:
+    "At least one artifact's contents do not match the hash recorded in the signed manifest. The file was altered, or the bundle is corrupted.",
+  artifact_missing:
+    "At least one artifact the manifest lists could not be found in the bundle directory. The download or copy is incomplete.",
+  artifact_size_mismatch:
+    "At least one artifact's size does not match what the signed manifest recorded. The file was truncated, altered, or the bundle is corrupted.",
+  aggregate_hash_mismatch:
+    "The combined hash of the bundle's artifacts does not match the value the manifest signed. The bundle's artifact set does not match what was originally exported.",
+  artifact_path_unsafe:
+    "The manifest names an artifact path that cannot be trusted to stay inside the bundle directory. Refusing this bundle.",
+  artifact_path_duplicate:
+    "The manifest lists the same artifact path more than once. This bundle is malformed.",
+  artifact_kind_duplicate:
+    "The manifest lists more than one artifact of a kind this format allows only once. This bundle is malformed.",
+  artifact_set_invalid:
+    "The set of artifacts in this bundle does not match what this manifest version requires (something is missing or something extra is present). This bundle is malformed.",
+  artifact_directory_unlisted_file:
+    "A file exists in the bundle directory that the manifest does not list. Refusing to trust an unaccounted-for file.",
+  artifact_path_escapes_root:
+    "An artifact path in the manifest points outside the bundle directory. This bundle is malformed or was tampered with.",
+  archive_contains_symlink:
+    "The bundle contains a symbolic link, which this format never uses legitimately. Refusing this bundle.",
+  private_material_present:
+    "The bundle appears to contain private key material that should never leave a fortress. Refusing to import it; do not share this bundle with anyone.",
+  identity_binding_mismatch:
+    "The identity recorded in the manifest does not match the identity artifact inside the bundle.",
+  identity_signature_invalid:
+    "The identity artifact's own signature does not verify.",
+  rotation_chain_invalid:
+    "This identity's key-rotation history does not verify from its retired keys forward to the current one.",
+  reputation_bundle_signature_invalid:
+    "The reputation data's signature does not verify.",
+  reputation_completeness_mismatch:
+    "The reputation data does not account for the number of attestations the manifest claims.",
+  reputation_attestation_signature_invalid:
+    "At least one reputation attestation's signature does not verify.",
+  reputation_unverifiable_attestations:
+    "At least one reputation attestation was signed by a party this bundle does not identify, so it cannot be verified. Re-run with --accept-unverifiable-attestations to preview anyway (import always verifies strictly regardless of this flag).",
+  known_signers_invalid:
+    "The bundle's table of known signers, used to verify reputation attestations, is malformed, incorrectly signed, or otherwise cannot be trusted.",
+  encrypted_state_entries_unreadable:
+    "The bundle's encrypted state passed its own signature and hash checks, but its internal entry list is not in the shape this Sanctuary build expects to read.",
+  other:
+    "The verifier reported a failure it does not have a specific category for. Check the warnings below for detail.",
+};
+
 export interface ExitCommandArgs {
   argv: string[];
   out?: Writable;
@@ -88,6 +162,11 @@ interface ExitContext {
   identityManager: IdentityManager;
   reputationStore: ReputationStore;
   keySource: "passphrase" | "recovery-key" | "unknown";
+  // F1 (Exit V2 D1 operator finding, 2026-08-23): the outcome of the
+  // recovery pass every `openExitContext` call already runs (below), so
+  // the new `recover` verb can report it instead of silently discarding
+  // it the way every other verb does today.
+  recoveryResult: { recovered: number };
 }
 
 function write(stream: Writable, text: string): void {
@@ -191,7 +270,7 @@ async function openExitContext(
   // coordinator gate, 2026-08-22) so a partial/unparseable rollback stops
   // fortress open instead of silently proceeding against a possibly
   // half-applied target.
-  await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+  const recoveryResult = await recoverInterruptedExitImportsOrThrow(storage, auditLog);
 
   const stateStore = new StateStore(storage, masterKey);
   const identityManager = new IdentityManager(storage, masterKey);
@@ -208,6 +287,7 @@ async function openExitContext(
     identityManager,
     reputationStore,
     keySource,
+    recoveryResult,
   };
 }
 
@@ -223,6 +303,13 @@ Commands:
   inspect <dir>               Read-only: what the bundle carries and WHICH
                               credential it DECLARES it needs. No passphrase,
                               no writes, and no import is attempted.
+  recover                     Open THIS fortress (not a bundle directory) and
+                              roll back any interrupted exit-import journal
+                              entry left by a killed import, rotation, or
+                              resume. Needs fortress credentials same as
+                              export/import. Mutates nothing beyond finishing
+                              that rollback; safe to run when there is
+                              nothing to recover.
 
 Options:
   --passphrase <value>              Current destination/source passphrase
@@ -376,10 +463,19 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         throw e;
       }
       if (json) {
+        // F2: `reason_text` reads FAILURE_CLASS_EXPLANATIONS, the same
+        // table the human branch below reads for its `reason:` sentence -
+        // one table, never a hand-mirrored copy per output mode. Additive
+        // field, only present when there is a failure_class to explain;
+        // every existing JSON key is untouched.
+        const reasonText =
+          result.failure_class !== undefined
+            ? { reason_text: FAILURE_CLASS_EXPLANATIONS[result.failure_class] }
+            : {};
         write(
           out,
           JSON.stringify(
-            { verdict: result.passed ? "PASS" : "FAIL", ...result },
+            { verdict: result.passed ? "PASS" : "FAIL", ...result, ...reasonText },
             null,
             2,
           ) + "\n",
@@ -406,6 +502,17 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         // string and stays byte-identical (frozen-surface rule). The state
         // lines are appended, never interleaved, so an operator script that
         // greps for `identity:` or `artifacts:` is unaffected.
+        //
+        // F2 (Exit V2 D1 operator finding, 2026-08-23): same additive-only
+        // discipline - a refused bundle previously printed `verdict: FAIL`
+        // and three neutral fields with NO reason at all. `reason:` is the
+        // machine-branchable failure_class (the exact string `--json`'s
+        // `reason_text` key is looked up from too); the sentence under it
+        // is FAILURE_CLASS_EXPLANATIONS[<that class>].
+        if (result.failure_class !== undefined) {
+          write(out, `reason: ${result.failure_class}\n`);
+          write(out, `${FAILURE_CLASS_EXPLANATIONS[result.failure_class]}\n`);
+        }
         if (result.state) {
           // `entry_count === null` means the artifact's entries list could not
           // be read at all. Printing `0` there would be the absent-as-empty
@@ -425,6 +532,31 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
         }
       }
       return result.passed ? 0 : 1;
+    }
+
+    // F1 (Exit V2 D1 operator finding, 2026-08-23): the verb every
+    // recovery hint in the codebase names (EXIT_RECOVERY_VERB, defined in
+    // storage/exit-import-journal.ts and re-exported via bundle.js). Opens
+    // THIS fortress through the exact same `openExitContext` path every
+    // other verb uses, so `recoverInterruptedExitImportsOrThrow` runs with
+    // the standard admission-lock handling (a live lock refuses here
+    // exactly like it refuses export/import, via the outer catch below).
+    // Mutates nothing beyond finishing the rollback that call already
+    // performs; there is no separate write here.
+    if (command === EXIT_RECOVERY_VERB) {
+      const ctx = await openExitContext(argv, env);
+      const recovered = ctx.recoveryResult.recovered;
+      if (json) {
+        write(out, JSON.stringify({ recovered }, null, 2) + "\n");
+      } else if (recovered > 0) {
+        write(
+          out,
+          `recovered: ${recovered} journal entr${recovered === 1 ? "y" : "ies"} rolled back\n`
+        );
+      } else {
+        write(out, "nothing to recover\n");
+      }
+      return 0;
     }
 
     if (command === "inspect") {

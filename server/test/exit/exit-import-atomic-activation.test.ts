@@ -1666,8 +1666,12 @@ describe("HIGH-B (coordinator gate, 2026-08-22): fortress-wide exit-admission lo
     );
 
     const auditLog = new AuditLog(storage, generateRandomKey());
+    // F1 (Exit V2 D1 operator finding, 2026-08-23): the refusal now names
+    // `sanctuary exit recover` (EXIT_RECOVERY_VERB), not `sanctuary exit
+    // verify` - verify never opened the local fortress, so the old hint
+    // sent an operator to a verb that could not clear this condition.
     await expect(recoverInterruptedExitImports(storage, auditLog)).rejects.toThrow(
-      /Run any `sanctuary exit` verb .* to recover, then retry\. If no other Sanctuary operation is actually running .* inspect the lock directly .* before removing it - do not remove it first/
+      /Run `sanctuary exit recover` to recover, then retry\. If no other Sanctuary operation is actually running .* inspect the lock directly .* before removing it - do not remove it first/
     );
 
     // The lock file itself is untouched by the failed acquire attempt (no

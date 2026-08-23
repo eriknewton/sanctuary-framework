@@ -25,6 +25,22 @@ export { ExitAdmissionLockError };
 export const EXIT_IMPORT_JOURNAL_NAMESPACE = "_exit_import_journal";
 
 /**
+ * CONTRACT PIN (F1, Exit V2 D1 operator finding, 2026-08-23): the one verb
+ * name every operator-facing recovery hint in this file (and in
+ * `cli/doctor.ts`, which imports this constant via `exit/bundle.ts`'s
+ * re-export) must name - and the exact string `exit/cli.ts`'s
+ * `command === EXIT_RECOVERY_VERB` dispatch branch matches against. Before
+ * this pin existed, every hint below hardcoded `sanctuary exit verify` as
+ * "the verb that recovers a fortress"; `verify` only checks a bundle
+ * directory and never opens the local fortress, so an operator following
+ * that hint got a clean PASS/PASS while the interrupted import stayed on
+ * disk (drill D1-OP-F1). Interpolate this constant into every recovery
+ * hint instead of retyping the verb name, so a future rename cannot
+ * silently strand a hint on a verb that no longer does the job.
+ */
+export const EXIT_RECOVERY_VERB = "recover";
+
+/**
  * MEDIUM-C (Codex gate, 2026-08-22): one small append-only record per
  * journal-set location the exit-import module actually writes, keyed by
  * `${importId}:${locationDedupeKey(loc)}` (server/src/exit/bundle.ts) -
@@ -64,8 +80,9 @@ export class InterruptedExitImportPendingError extends Error {
     super(
       `Refusing to write (${context}): an exit-import rollback journal exists ` +
         "for this fortress, meaning an import is in progress or pending " +
-        "recovery. Run any `sanctuary exit` verb (for example `sanctuary exit " +
-        "verify`) to recover, then retry."
+        // F1: must name EXIT_RECOVERY_VERB, defined above in this same file.
+        `recovery. Run \`sanctuary exit ${EXIT_RECOVERY_VERB}\` to recover, ` +
+        "then retry."
     );
     this.name = "InterruptedExitImportPendingError";
   }
@@ -152,8 +169,9 @@ export async function withExitAdmissionLock<T>(
       throw new ExitAdmissionLockError(
         `refusing to proceed (${owner}): another exit-import or master-rotation ` +
           "operation holds the admission lock for this fortress, or a prior " +
-          "holder crashed while holding it. Run any `sanctuary exit` verb (for " +
-          "example `sanctuary exit verify`) to recover, then retry. If no other " +
+          // F1: must name EXIT_RECOVERY_VERB, defined above in this same file.
+          `holder crashed while holding it. Run \`sanctuary exit ${EXIT_RECOVERY_VERB}\` ` +
+          "to recover, then retry. If no other " +
           "Sanctuary operation is actually running against this fortress, " +
           "inspect the lock directly under <fortress state path>/" +
           `${EXIT_IMPORT_JOURNAL_NAMESPACE}/${EXIT_ADMISSION_LOCK_FILE} before ` +
