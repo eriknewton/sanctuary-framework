@@ -1,3 +1,4 @@
+// fail-before-exempt: this PR's only edit here adds "l4-known-signers" to DEFERRED_LAYER_TOKEN_FIXTURES (Exit V2 drill F2, 2026-08-22/23) - a reconciliation-list entry that stays internally consistent (classification + deferred list agree) whether or not reputation/known-signers-store.ts exists, so this file cannot fail-before by construction; the new behavior itself is covered fail-before by test/exit/exit-known-signers.test.ts and test/structure/reserved-namespace-single-source.test.ts
 /**
  * Phase-0 at-rest decrypt fixtures — the byte-level rename safety net.
  *
@@ -109,6 +110,11 @@ const DEFERRED_LAYER_TOKEN_FIXTURES = [
   "l2-approval-aggregator-v1",
   "l2-approval-aggregator-payload-v1",
   "l2-english-policy-activation-v1",
+  // Exit V2 drill F2 (2026-08-22/23): l4-known-signers
+  // (reputation/known-signers-store.ts) - deferred, no fixture built in
+  // this PR yet (matches the "fixture: false" note in
+  // fixtures/at-rest/hkdf-label-classification.json).
+  "l4-known-signers",
 ] as const;
 
 /**

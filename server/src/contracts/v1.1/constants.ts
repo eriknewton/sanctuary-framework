@@ -170,16 +170,46 @@ export const HANDOFF_STATUSES = [
 export type HandoffStatus = (typeof HANDOFF_STATUSES)[number];
 
 /**
- * Exit-bundle manifest version. v1 is the only valid value at v1.1 ship.
- * v1.x bumps require coordinator-approved manifest amendment.
+ * Exit-bundle manifest version. `EXIT_BUNDLE_MANIFEST_VERSION` ("V1") is the
+ * ORIGINAL, FROZEN, seven-artifact contract - byte-stable, untouched by the
+ * Exit V2 known_signers addition below. v1.x bumps require
+ * coordinator-approved manifest amendment.
+ *
+ * `EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS`: a bundle that carries the
+ * `known_signers` artifact (Exit V2 drill F2) declares a DIFFERENT,
+ * ADDITIVE `manifest_version` literal rather than widening the frozen V1
+ * one in place, so a pre-this-change verifier - which only recognizes the
+ * exact string "SANCTUARY_EXIT_BUNDLE_V1" - refuses it through the
+ * EXISTING, already-handled `manifest_unknown_version` path instead of
+ * attempting to parse an artifact set it does not understand (private
+ * register EXIT-KS-01). A V1 bundle (declaring the original literal) is
+ * refused by this build's verifier unless it carries EXACTLY
+ * `EXIT_BUNDLE_ARTIFACT_KINDS` (below) and nothing else; a known-signers
+ * bundle is refused unless it carries EXACTLY
+ * `EXIT_BUNDLE_ARTIFACT_KINDS_V1_KNOWN_SIGNERS` and nothing else (checked in
+ * server/src/exit/verifier.ts).
  */
 export const EXIT_BUNDLE_MANIFEST_VERSION = "SANCTUARY_EXIT_BUNDLE_V1" as const;
-export type ExitBundleManifestVersion = typeof EXIT_BUNDLE_MANIFEST_VERSION;
+export const EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS =
+  "SANCTUARY_EXIT_BUNDLE_V1_KNOWN_SIGNERS" as const;
+export type ExitBundleManifestVersion =
+  | typeof EXIT_BUNDLE_MANIFEST_VERSION
+  | typeof EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS;
 
 /**
- * Artifact kinds enumerated by the exit-bundle manifest. The export command
- * MUST list every included artifact under one of these kinds. The verifier
- * CLI rejects unknown kinds.
+ * Artifact kinds enumerated by the ORIGINAL v1.1 exit-bundle manifest
+ * (`manifest_version === EXIT_BUNDLE_MANIFEST_VERSION`). FROZEN: this exact
+ * seven-element array, in this exact order, is the byte-stable V1 contract
+ * (test/exit/exit-v2-sdw-memory-archive.test.ts pins it verbatim). The
+ * export command MUST list every V1-bundle artifact under one of these
+ * kinds and no other; the verifier CLI rejects unknown kinds AND rejects a
+ * V1 bundle whose artifact set is not EXACTLY this one (independent gate,
+ * item 5).
+ *
+ * Do NOT add "known_signers" here - see
+ * `EXIT_BUNDLE_ARTIFACT_KINDS_V1_KNOWN_SIGNERS` below, which is the exact
+ * contract for the SEPARATE `EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS`
+ * manifest version instead.
  */
 export const EXIT_BUNDLE_ARTIFACT_KINDS = [
   "public_identity",
@@ -190,5 +220,38 @@ export const EXIT_BUNDLE_ARTIFACT_KINDS = [
   "commitments",
   "placeholder_vault_metadata",
 ] as const;
+
+/**
+ * Exit V2 drill F2 (2026-08-22/23, Erik-ratified option a): the signed
+ * DID -> public key table for every attestation signer the exporting
+ * fortress verified at an earlier import, so a re-exported (second-hop)
+ * reputation bundle stays verifiable. NOT part of the V1 contract above -
+ * see `EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS`'s doc comment for why a
+ * separate manifest version exists instead of widening V1 in place.
+ */
+export const KNOWN_SIGNERS_ARTIFACT_KIND = "known_signers" as const;
+
+/**
+ * The exact, complete artifact-kind set for
+ * `manifest_version === EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS`: the
+ * frozen V1 seven plus `known_signers`. A bundle declaring this manifest
+ * version is refused unless its artifact set is EXACTLY this one (checked
+ * in server/src/exit/verifier.ts, "must match" this literal).
+ */
+export const EXIT_BUNDLE_ARTIFACT_KINDS_V1_KNOWN_SIGNERS = [
+  ...EXIT_BUNDLE_ARTIFACT_KINDS,
+  KNOWN_SIGNERS_ARTIFACT_KIND,
+] as const;
+
+/**
+ * Every artifact-kind literal this codebase recognizes SYNTACTICALLY,
+ * across every manifest version - used by the verifier's `isKnownKind`
+ * membership check. Recognizing a kind string here is necessary but not
+ * sufficient: whether a PARTICULAR kind is required, permitted, or
+ * forbidden for a given bundle is the separate, exact per-version set
+ * check (`EXIT_BUNDLE_ARTIFACT_KINDS` for V1, above,
+ * `EXIT_BUNDLE_ARTIFACT_KINDS_V1_KNOWN_SIGNERS` for the known-signers
+ * version) - never this union alone.
+ */
 export type ExitBundleArtifactKind =
-  (typeof EXIT_BUNDLE_ARTIFACT_KINDS)[number];
+  (typeof EXIT_BUNDLE_ARTIFACT_KINDS_V1_KNOWN_SIGNERS)[number];

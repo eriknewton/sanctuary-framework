@@ -756,8 +756,13 @@ describe("Exit V2 memory archive CLI", () => {
 
     const out = new Sink();
     expect(await runExitCommand({ argv: ["manifest-shape"], out, err: new Sink(), env: {} })).toBe(0);
+    // Independent gate item 5 (2026-08-23): manifest-shape reflects what a
+    // CURRENT export actually produces - the SEPARATE known-signers manifest
+    // version and its own exact 8-kind contract - never the frozen V1
+    // literal or its 7-kind contract (which stay byte-stable and untouched;
+    // see contracts/v1.1/constants.ts), matching this test's own title.
     expect(JSON.parse(out.text())).toMatchObject({
-      manifest_version: "SANCTUARY_EXIT_BUNDLE_V1",
+      manifest_version: "SANCTUARY_EXIT_BUNDLE_V1_KNOWN_SIGNERS",
       artifacts: [
         "public_identity",
         "encrypted_state",
@@ -766,6 +771,7 @@ describe("Exit V2 memory archive CLI", () => {
         "reputation_bundle",
         "commitments",
         "placeholder_vault_metadata",
+        "known_signers",
       ],
     });
   }, CLI_SUBPROCESS_TEST_TIMEOUT_MS);

@@ -286,6 +286,16 @@ export interface ExitBundleVerifierResult {
     | "aggregate_hash_mismatch"
     | "artifact_path_unsafe"
     | "artifact_path_duplicate"
+    // Independent gate on #1303 (2026-08-23), item 5: a kind repeated at a
+    // DIFFERENT path (every kind in this format is singular by design);
+    // the artifact SET for this bundle's manifest_version is not EXACTLY
+    // the contract that version requires (missing or extra kind); a file
+    // exists under the bundle root that no manifest entry names (the
+    // directory walk, not just the manifest, must agree with what is
+    // signed).
+    | "artifact_kind_duplicate"
+    | "artifact_set_invalid"
+    | "artifact_directory_unlisted_file"
     | "artifact_path_escapes_root"
     | "archive_contains_symlink"
     | "private_material_present"
@@ -303,6 +313,15 @@ export interface ExitBundleVerifierResult {
     | "reputation_completeness_mismatch"
     | "reputation_attestation_signature_invalid"
     | "reputation_unverifiable_attestations"
+    // Independent gate on #1303 (2026-08-23), item 6: a PRESENT
+    // known_signers artifact that cannot be trusted (malformed, wrong
+    // signature, a duplicate DID with conflicting keys, or an entry naming
+    // the exporting fortress's own identity) is a typed verifier FAILURE
+    // before staging, never a warning - even when no attestation in this
+    // particular bundle happens to depend on it. Distinct from the
+    // ABSENCE of a known_signers artifact, which is the ordinary,
+    // pre-this-feature version-gated case and never fails.
+    | "known_signers_invalid"
     // The encrypted_state artifact passed its own hash and manifest-
     // signature checks, but its internal entries list could not be read in
     // the expected shape — either the CONTAINER (`entries` missing or not

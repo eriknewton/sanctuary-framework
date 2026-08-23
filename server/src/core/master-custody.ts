@@ -996,6 +996,9 @@ async function checkMasterEvidence(
   const purposeProbes: Array<{ namespace: string; purpose: string }> = [
     { namespace: "_identities", purpose: "identity-encryption" },
     { namespace: "_reputation", purpose: "l4-reputation" },
+    // HIGH-2 (independent gate on #1303, 2026-08-23): Exit V2 drill F2's
+    // known-signer persistence store (reputation/known-signers-store.ts).
+    { namespace: "_known_signers", purpose: "l4-known-signers" },
   ];
   for (const probe of purposeProbes) {
     let entries: Array<{ key: string }>;

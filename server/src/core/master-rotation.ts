@@ -302,6 +302,12 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
   },
 
   _reputation: { kind: "purpose-encrypted", infos: ["l4-reputation"] },
+  // HIGH-2 (independent gate on #1303, 2026-08-23): Exit V2 drill F2 added
+  // `_known_signers` (reputation/known-signers-store.ts) with no rotation
+  // recipe, so rotation preflight refused ("unsupported") on any fortress
+  // that had ever imported foreign reputation - a namespace-recipe registry
+  // gap, not a security defect, but a fortress-bricking one.
+  _known_signers: { kind: "purpose-encrypted", infos: ["l4-known-signers"] },
   _escrows: { kind: "purpose-encrypted", infos: ["l4-reputation"] },
   _guarantees: { kind: "purpose-encrypted", infos: ["l4-reputation"] },
   _commitments: { kind: "purpose-encrypted", infos: ["l3-commitments"] },
