@@ -66,6 +66,14 @@ export interface CrossProcessLockOptions {
   /** Poll interval while a lock is held (default {@link CROSS_PROCESS_LOCK_RETRY_MS}). */
   retryMs?: number;
   /**
+   * HIGH-B (Codex gate, 2026-08-22): merged into the lockfile's own JSON
+   * alongside `pid`/`acquired_at`, purely for a human reading the file
+   * during the manual-recovery path this module's header describes (there
+   * is no auto-stale-break) - never read back or interpreted by this
+   * module itself.
+   */
+  metadata?: Record<string, unknown>;
+  /**
    * Observability seam: invoked each time an acquire OBSERVES the lock already
    * held (an `EEXIST` on the O_EXCL create) and is about to sleep and retry.
    * `attempt` counts observed contentions, starting at 1.
@@ -109,6 +117,23 @@ export async function withCrossProcessLock<T>(
 }
 
 /**
+ * HIGH-B (Codex gate, 2026-08-22): the SAME contention error a caller sees
+ * from withCrossProcessLock/withPathLock, reworded to name the exit-import
+ * writer guard's own remediation instead of a generic manual-`rm` hint -
+ * for lock names where the holder set is exactly {import, rotate, resume,
+ * recovery} and the fix is the same "run `sanctuary exit verify`, or
+ * inspect before removing" text those callers already use elsewhere. Not a
+ * different lock mechanism; a different message on the SAME
+ * CrossProcessLockError shape, thrown from the SAME no-auto-break path.
+ */
+export class ExitAdmissionLockError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ExitAdmissionLockError";
+  }
+}
+
+/**
  * Lower-level path-keyed variant of {@link withCrossProcessLock}: serialize
  * `operation` under an O_EXCL lockfile at `<lockDir>/<lockFileName>`, with the
  * SAME discipline as the storage-backed helper -- bounded wait, NO
@@ -144,6 +169,7 @@ export async function withPathLock<T>(
           JSON.stringify({
             pid: process.pid,
             acquired_at: new Date().toISOString(),
+            ...options.metadata,
           }),
         );
         await handle.sync();

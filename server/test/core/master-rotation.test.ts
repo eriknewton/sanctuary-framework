@@ -640,7 +640,12 @@ describe("master rotation — Tier-1 gate and capture rules", () => {
       fortressId: FORTRESS_ID,
       passphrase: PASSPHRASE,
     });
-    expect(result.converted_entries).toBeGreaterThanOrEqual(0);
+    // MEDIUM-D (Codex gate, 2026-08-22): exact, not >= 0 (vacuously true) -
+    // 8 is buildFortress's own fixed fixture count (identity, castle pin,
+    // two state entries, audit epoch bookkeeping, etc.); a regression that
+    // drops a namespace from the walk silently would still pass a >= 0
+    // assertion.
+    expect(result.converted_entries).toBe(8);
   });
 });
 

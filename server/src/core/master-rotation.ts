@@ -69,7 +69,11 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import type { StorageBackend } from "../storage/interface.js";
-import { hasInterruptedExitImport } from "../storage/exit-import-journal.js";
+import {
+  hasInterruptedExitImport,
+  EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
+  withExitAdmissionLock,
+} from "../storage/exit-import-journal.js";
 import {
   encrypt,
   decrypt,
@@ -488,6 +492,16 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
       "holds the exit-import writer guard's own rollback journal; rotation " +
       "is refused outright while one exists (see the preflight check), " +
       "never partially applied to it. " + UNSUPPORTED_DEFERRAL,
+  },
+  // MEDIUM-C (Codex gate, 2026-08-22): the writer guard's per-location
+  // post-image records; same reasoning and same preflight refusal as the
+  // main journal namespace above.
+  [EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE]: {
+    kind: "unsupported",
+    reason:
+      "holds the exit-import writer guard's per-location post-image " +
+      "records; rotation is refused outright while an import journal " +
+      "exists (see the preflight check). " + UNSUPPORTED_DEFERRAL,
   },
 };
 
@@ -1906,23 +1920,23 @@ export async function rotateMaster(
       old_wrap_ids: oldEnvelope.wraps.map((w) => w.id),
       new_wrap_ids: stagedEnvelope.wraps.map((w) => w.id),
     };
-    await writeJournal(storage, journal, newMaster);
+    // HIGH-B (Codex gate, 2026-08-22): the re-check and this journal
+    // publish happen TOGETHER under the exit-admission lock - an
+    // exit-import cannot land ITS journal in the gap between this check
+    // and this write. HIGH-2 (Codex gate, 2026-08-22), kept as the
+    // check half of that atomic step.
+    await withExitAdmissionLock(storage, "rotate", async () => {
+      if (await hasInterruptedExitImport(storage)) {
+        throw new RotationPreflightError(
+          "an exit-import rollback journal exists for this fortress, meaning " +
+            "an import started after this rotation's preflight passed; run " +
+            "any `sanctuary exit` verb (for example `sanctuary exit verify`) " +
+            "to recover, then retry the rotation"
+        );
+      }
+      await writeJournal(storage, journal, newMaster);
+    });
     failpoint("journal-converting-written");
-
-    // HIGH-2 (Codex gate, 2026-08-22): re-check immediately before the
-    // first actual conversion write, not only at the top-level preflight -
-    // an exit-import can start and journal AFTER preflight passed but
-    // BEFORE this point. No lock; this narrows the race window to
-    // "between this check and the write immediately after it" rather than
-    // eliminating it structurally.
-    if (await hasInterruptedExitImport(storage)) {
-      throw new RotationPreflightError(
-        "an exit-import rollback journal exists for this fortress, meaning " +
-          "an import started after this rotation's preflight passed; run " +
-          "any `sanctuary exit` verb (for example `sanctuary exit verify`) " +
-          "to recover, then retry the rotation"
-      );
-    }
 
     log("Converting: re-encrypting fortress data under the new master...");
     const convertResult = await walkFortress(ctx, false);
@@ -2037,6 +2051,25 @@ export async function resumeRotation(
   try {
     let converted = 0;
     if (journal.phase === "converting") {
+      // F1 (coordinator gate, 2026-08-22): re-check immediately before
+      // THIS walkFortress call too, not only the top-of-function preflight
+      // above - an exit-import can start and journal between resumeRotation
+      // being invoked and reaching this point (e.g. a caller that read the
+      // journal, unwrapped keys, then paused before this line). HIGH-B
+      // (Codex gate, 2026-08-22): run under the exit-admission lock for
+      // consistency with the other three owners, even though this
+      // function publishes no NEW durable marker of its own (the rotation
+      // journal already exists from the original rotateMaster attempt).
+      await withExitAdmissionLock(storage, "resume", async () => {
+        if (await hasInterruptedExitImport(storage)) {
+          throw new RotationResumeError(
+            "an exit-import rollback journal exists for this fortress, " +
+              "meaning an import started after this resume began; run any " +
+              "`sanctuary exit` verb (for example `sanctuary exit verify`) " +
+              "to recover, then retry the resume"
+          );
+        }
+      });
       log("Resuming: converting remaining fortress data...");
       converted = (await walkFortress(ctx, false)).converted;
       await convertAuditEpochs(ctx);

@@ -2056,14 +2056,16 @@ export class ReputationStore {
     } = {},
     origin?: string,
     /**
-     * HIGH-1 (Codex gate, 2026-08-22): called after each attestation write
-     * commits, so the exit-import module's journal can durably record what
-     * THIS call wrote before the next one - a kill between two attestations
-     * in a large bundle still leaves every already-written one correctly
-     * confirmable by a later recovery. The one legitimate caller is the
+     * HIGH-1 (Codex gate, 2026-08-22): called synchronously with the EXACT
+     * bytes each attestation write just persisted, so the exit-import
+     * module's journal can durably record what THIS call wrote before the
+     * next one. HIGH-A (Codex gate, 2026-08-22): the bytes are handed over
+     * directly, never re-read from storage - a re-read after the write
+     * cannot distinguish this write's own bytes from a different writer's
+     * bytes landing in the same instant. The one legitimate caller is the
      * exit-import module's own activation path.
      */
-    recordPostImage?: (namespace: string, key: string) => Promise<void>
+    recordPostImage?: (namespace: string, key: string, bytes: Uint8Array) => Promise<void>
   ): Promise<{
     imported: number;
     invalid: number;
@@ -2143,12 +2145,27 @@ export class ReputationStore {
         }
         const serialized = stringToBytes(JSON.stringify(stored));
         const encrypted = encrypt(serialized, this.encryptionKey);
+        const onDiskBytes = stringToBytes(JSON.stringify(encrypted));
         await this.storage.write(
           "_reputation",
           attestation.attestation_id,
-          stringToBytes(JSON.stringify(encrypted))
+          onDiskBytes
         );
-        await recordPostImage?.("_reputation", attestation.attestation_id);
+        // HIGH-A (Codex gate, 2026-08-22): pass the EXACT bytes just
+        // written, never re-read from storage - a re-read cannot tell
+        // this write's own bytes from a different writer's bytes landing
+        // in the same instant.
+        // F4 (coordinator gate, 2026-08-22): a failed post-image record
+        // must never turn "the attestation landed" into "this write
+        // failed" - see the matching wrapper's doc comment in
+        // cognitive/state-store.ts.
+        if (recordPostImage) {
+          try {
+            await recordPostImage("_reputation", attestation.attestation_id, onDiskBytes);
+          } catch {
+            // Intentionally swallowed.
+          }
+        }
 
         count++;
         contexts.add(attestation.data.context);

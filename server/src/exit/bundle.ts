@@ -10,8 +10,12 @@
 import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { StorageBackend } from "../storage/interface.js";
-import { EXIT_IMPORT_JOURNAL_NAMESPACE } from "../storage/exit-import-journal.js";
-export { EXIT_IMPORT_JOURNAL_NAMESPACE };
+import {
+  EXIT_IMPORT_JOURNAL_NAMESPACE,
+  EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
+  withExitAdmissionLock,
+} from "../storage/exit-import-journal.js";
+export { EXIT_IMPORT_JOURNAL_NAMESPACE, EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE };
 import {
   StateStore,
   isReservedNamespace,
@@ -154,6 +158,21 @@ const EXIT_POLICY_SETS_NAMESPACE = "_exit_policy_sets";
 const EXIT_COMMITMENTS_NAMESPACE = "_exit_commitments";
 const EXIT_PLACEHOLDER_METADATA_NAMESPACE = "_exit_placeholder_metadata";
 const PRIVACY_PLACEHOLDER_NAMESPACE = "_privacy_placeholder_vault";
+
+/**
+ * MEDIUM-C (Codex gate, 2026-08-22): caps how many journal-set locations a
+ * single import may snapshot/journal, so a crafted or absurd bundle stays
+ * bounded to a fixed number of per-location post-image records (one small
+ * durable write per location - see recordPostImage) and a fixed-size
+ * pre-image snapshot array in the main journal record. 100_000 = two
+ * orders of magnitude above the largest real fortress this format has
+ * been exercised against (low thousands of state entries plus
+ * attestations in the F1 drill's stress bundles), chosen as a safety
+ * bound, not a usage estimate - a legitimate export this large is not
+ * expected, and a bundle claiming to be is refused before any journal
+ * write, not partway through.
+ */
+export const MAX_EXIT_IMPORT_JOURNAL_LOCATIONS = 100_000;
 /**
  * F1 (Exit V2 drill D1, 2026-08-22): a per-import durable rollback journal,
  * under the fortress's own reserved `_exit_*` family (staging-only; never
@@ -2062,14 +2081,6 @@ interface StagedLocation {
 
 interface StorageSnapshot extends StagedLocation {
   data: Uint8Array | null;
-  /**
-   * HIGH-1 (Codex gate, 2026-08-22): the hash of what THIS import last
-   * wrote here, recorded per-write (see recordSnapshotPostImage), null
-   * until that write happens. Lets restore tell "the import's own write
-   * is still there, safe to revert" from "something else wrote here
-   * since" without a lock - see classifyRestoreSafety.
-   */
-  postImageHash: string | null;
 }
 
 function locationDedupeKey(loc: StagedLocation): string {
@@ -2097,10 +2108,74 @@ async function snapshotStorageLocations(
     snapshots.push({
       ...loc,
       data: await storage.read(loc.namespace, loc.key),
-      postImageHash: null,
     });
   }
   return snapshots;
+}
+
+/**
+ * MEDIUM-C (Codex gate, 2026-08-22): one small write to the dedicated
+ * post-image namespace, keyed by this exact location - not a re-read of
+ * `namespace`/`key` (HIGH-A: a re-read cannot tell this write's own bytes
+ * from a different writer's bytes landing in the same instant) and not a
+ * rewrite of the whole journal record (the quadratic-I/O finding this
+ * replaces). `bytes` must be the EXACT buffer the caller just passed to
+ * `storage.write` for this location.
+ */
+async function recordPostImage(
+  storage: StorageBackend,
+  importId: string,
+  namespace: string,
+  key: string,
+  bytes: Uint8Array
+): Promise<void> {
+  const postImageKey = `${importId}:${locationDedupeKey({ namespace, key })}`;
+  await storage.write(
+    EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
+    postImageKey,
+    stringToBytes(JSON.stringify({ hash: hashToString(bytes) }))
+  );
+}
+
+/**
+ * Companion read side of {@link recordPostImage}: null when no post-image
+ * was ever recorded for this location (the import never wrote it, or a
+ * kill landed before this write's post-image record reached disk) or the
+ * record is unparseable - both fall back to classifyRestoreSafety's
+ * "not confirmed" branch, never a guess.
+ */
+async function readPostImageHash(
+  storage: StorageBackend,
+  importId: string,
+  loc: StagedLocation
+): Promise<string | null> {
+  const postImageKey = `${importId}:${locationDedupeKey(loc)}`;
+  const raw = await storage.read(EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE, postImageKey);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(bytesToString(raw)) as Record<string, unknown>;
+    return typeof parsed.hash === "string" ? parsed.hash : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Deletes every post-image record for this import - cleanup counterpart
+ * to {@link recordPostImage}, called alongside deleteImportJournal so a
+ * finished import (successful or rolled back) leaves nothing behind.
+ */
+async function deletePostImageRecords(
+  storage: StorageBackend,
+  importId: string
+): Promise<void> {
+  const entries = await storage.list(
+    EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
+    `${importId}:`
+  );
+  for (const entry of entries) {
+    await storage.delete(EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE, entry.key, false);
+  }
 }
 
 // `snapshotStorageNamespace` (whole-namespace snapshot) and the
@@ -2164,6 +2239,7 @@ function classifyRestoreSafety(
 
 async function restoreStorageSnapshots(
   storage: StorageBackend,
+  importId: string,
   snapshots: StorageSnapshot[]
 ): Promise<{
   removed: number;
@@ -2180,11 +2256,16 @@ async function restoreStorageSnapshots(
       const needsCheck = locationNeedsPostImageDivergenceCheck(snapshot.namespace);
       if (needsCheck) {
         const current = await storage.read(snapshot.namespace, snapshot.key);
-        const safety = classifyRestoreSafety(
-          current,
-          snapshot.data,
-          snapshot.postImageHash
-        );
+        // HIGH-A (Codex gate, 2026-08-22): the post-image hash comes from
+        // the dedicated per-location record this import wrote from KNOWN
+        // bytes at write time (recordPostImage) - never from re-reading
+        // `namespace`/`key` here, which is exactly the TOCTOU this
+        // divergence check exists to close.
+        const postImageHash = await readPostImageHash(storage, importId, {
+          namespace: snapshot.namespace,
+          key: snapshot.key,
+        });
+        const safety = classifyRestoreSafety(current, snapshot.data, postImageHash);
         if (safety === "safe-noop") continue;
         if (safety === "diverged") {
           const loc = { namespace: snapshot.namespace, key: snapshot.key };
@@ -2213,7 +2294,6 @@ interface SerializedStorageSnapshot {
   namespace: string;
   key: string;
   data: string | null;
-  post_image_hash: string | null;
 }
 
 /**
@@ -2246,7 +2326,6 @@ const SERIALIZED_STORAGE_SNAPSHOT_KEYS = new Set([
   "namespace",
   "key",
   "data",
-  "post_image_hash",
 ]);
 
 function isWellFormedSerializedStorageSnapshot(
@@ -2280,9 +2359,6 @@ function isWellFormedSerializedStorageSnapshot(
     } catch {
       return false;
     }
-  }
-  if (record.post_image_hash !== null && typeof record.post_image_hash !== "string") {
-    return false;
   }
   return true;
 }
@@ -2389,7 +2465,6 @@ function serializeStorageSnapshot(
     // delete the key). Explicit `!== null` on both sides keeps the
     // distinction intact end to end.
     data: snapshot.data !== null ? toBase64url(snapshot.data) : null,
-    post_image_hash: snapshot.postImageHash,
   };
 }
 
@@ -2405,7 +2480,6 @@ function deserializeStorageSnapshot(
     // would silently reopen the non-canonical-input gap that guard exists
     // to close.
     data: record.data !== null ? fromBase64urlStrict(record.data) : null,
-    postImageHash: record.post_image_hash,
   };
 }
 
@@ -2461,6 +2535,14 @@ async function deleteImportJournal(
   storage: StorageBackend,
   importId: string
 ): Promise<void> {
+  // MEDIUM-C (Codex gate, 2026-08-22): post-image records first, main
+  // journal last - the journal's presence is what `hasInterruptedExitImport`
+  // and recovery key off of, so it stays the definitive "still needs
+  // handling" signal. A kill between these two leaves the journal
+  // discoverable and every location it names already either fully
+  // restored or untouched by this cleanup call, so a retry recovery pass
+  // finds nothing left to do (safe-noop throughout).
+  await deletePostImageRecords(storage, importId);
   await storage.delete(EXIT_IMPORT_JOURNAL_NAMESPACE, importId, false);
 }
 
@@ -2478,29 +2560,6 @@ async function deleteImportJournal(
  * location is not one this journal is tracking (the caller passed a
  * location `activationSnapshotLocations` never listed).
  */
-async function recordSnapshotPostImages(
-  storage: StorageBackend,
-  importId: string,
-  identityId: string,
-  snapshots: StorageSnapshot[],
-  locations: StagedLocation[]
-): Promise<void> {
-  let touched = false;
-  for (const loc of locations) {
-    const snapshot = snapshots.find(
-      (s) => s.namespace === loc.namespace && s.key === loc.key
-    );
-    if (!snapshot) continue;
-    snapshot.postImageHash = hashOfNullable(
-      await storage.read(loc.namespace, loc.key)
-    );
-    touched = true;
-  }
-  if (touched) {
-    await writeImportJournal(storage, importId, identityId, snapshots);
-  }
-}
-
 /**
  * F1 (Exit V2 drill D1, 2026-08-22): roll back any import whose journal
  * entry survived a hard kill, using the SAME `restoreStorageSnapshots` the
@@ -2519,10 +2578,15 @@ async function recordSnapshotPostImages(
  * open or import attempt retries it, rather than silently dropping a
  * rollback that did not actually complete.
  */
-export async function recoverInterruptedExitImports(
+async function recoverInterruptedExitImportsInner(
   storage: StorageBackend,
   auditLog: AuditLog
-): Promise<{ recovered: number; failed: string[]; diverged: string[] }> {
+): Promise<{
+  recovered: number;
+  failed: string[];
+  diverged: string[];
+  divergedLocations: StagedLocation[];
+}> {
   const entries = await storage.list(EXIT_IMPORT_JOURNAL_NAMESPACE);
   // INVARIANT (Codex gate finding, 2026-08-22): recovery assumes AT
   // MOST ONE journal entry exists at a time - importExitBundle's own
@@ -2539,11 +2603,17 @@ export async function recoverInterruptedExitImports(
   // turns into a hard stop) rather than silently pick an order and risk
   // producing a result no operator asked for.
   if (entries.length > 1) {
-    return { recovered: 0, failed: entries.map((entry) => entry.key), diverged: [] };
+    return {
+      recovered: 0,
+      failed: entries.map((entry) => entry.key),
+      diverged: [],
+      divergedLocations: [],
+    };
   }
   let recovered = 0;
   const failed: string[] = [];
   const diverged: string[] = [];
+  const divergedLocations: StagedLocation[] = [];
   for (const entry of entries) {
     const raw = await storage.read(EXIT_IMPORT_JOURNAL_NAMESPACE, entry.key);
     // G-H (coordinator gate, 2026-08-22): a journal entry `list()`
@@ -2617,11 +2687,12 @@ export async function recoverInterruptedExitImports(
       continue;
     }
     const snapshots = record.snapshots.map(deserializeStorageSnapshot);
-    const cleanup = await restoreStorageSnapshots(storage, snapshots);
+    const cleanup = await restoreStorageSnapshots(storage, record.import_id, snapshots);
     if (cleanup.failed.length > 0) {
       failed.push(entry.key);
       if (cleanup.diverged.length > 0) {
         diverged.push(entry.key);
+        divergedLocations.push(...cleanup.diverged);
         void auditLog.append(
           "l1",
           "exit_bundle_recovery_diverged",
@@ -2652,7 +2723,29 @@ export async function recoverInterruptedExitImports(
   if (recovered > 0) {
     await auditLog.flush();
   }
-  return { recovered, failed, diverged };
+  return { recovered, failed, diverged, divergedLocations };
+}
+
+/**
+ * HIGH-B (Codex gate, 2026-08-22): the whole of recovery runs under the
+ * exit-admission lock, not just a check-then-publish step - unlike import
+ * and rotation, recovery IS the bounded critical section (read the
+ * journal, restore or diverge, delete or leave it), so locking its whole
+ * duration is cheap and closes a concurrent import/rotation racing a
+ * concurrent recovery pass on the same journal.
+ */
+export async function recoverInterruptedExitImports(
+  storage: StorageBackend,
+  auditLog: AuditLog
+): Promise<{
+  recovered: number;
+  failed: string[];
+  diverged: string[];
+  divergedLocations: StagedLocation[];
+}> {
+  return withExitAdmissionLock(storage, "recovery", () =>
+    recoverInterruptedExitImportsInner(storage, auditLog)
+  );
 }
 
 /**
@@ -2829,14 +2922,15 @@ async function rekeyState(
    */
   importedRekeyEntries?: StagedLocation[],
   /**
-   * HIGH-1 (Codex gate, 2026-08-22): called after each entry write
-   * commits, durably recording what THIS import wrote there (the entry
-   * itself, plus the two `_meta` keys that write also touched as a side
-   * effect) so a later recovery can tell its own write from a race.
+   * HIGH-1 + HIGH-A (Codex gate, 2026-08-22): passed straight through to
+   * StateStore.write's own `onRawWrite` option - fires synchronously with
+   * the EXACT bytes each raw write persists (the entry itself, plus
+   * either `_meta` key that same call touches as a side effect), so the
+   * caller can record a post-image from KNOWN bytes, never a re-read.
    * Undefined only in a caller that has no journal to update (there is
    * none today; every production call site passes it).
    */
-  recordPostImages?: (locations: StagedLocation[]) => Promise<void>
+  onRawWrite?: (namespace: string, key: string, bytes: Uint8Array) => Promise<void>
 ): Promise<ImportExitBundleResult["state"]> {
   const destinationSigner = opts.destinationSignerIdentityId
     ? opts.identityManager.get(opts.destinationSignerIdentityId)
@@ -2990,6 +3084,7 @@ async function rekeyState(
         // WriteOptions's doc comment (cognitive/state-store.ts) for why
         // this is the one legitimate bypass.
         allowDuringOwnExitImportActivation: true,
+        onRawWrite,
       }
     );
     imported++;
@@ -3002,18 +3097,6 @@ async function rekeyState(
       }
     }
     importedRekeyEntries?.push({ namespace: item.namespace, key: item.key });
-    // HIGH-1 (Codex gate, 2026-08-22): the two `_meta` keys are side
-    // effects of THIS write (rememberWriterPublicKey / observeVersion
-    // inside StateStore.write), so their post-image is recorded in the
-    // SAME batch as the entry itself - capturing them only once after the
-    // whole loop would leave every `_meta` change made before the LAST
-    // entry with no post-image, false-diverging on a kill anywhere before
-    // the final iteration.
-    await recordPostImages?.([
-      { namespace: item.namespace, key: item.key },
-      { namespace: "_meta", key: STATE_ENVELOPE_PUBLIC_KEYS_KEY },
-      { namespace: "_meta", key: STATE_ENVELOPE_VERSION_ANCHORS_KEY },
-    ]);
   }
 
   if (decryptAttempts > 0 && decryptFailures === decryptAttempts) {
@@ -3569,18 +3652,30 @@ export async function importExitBundle(
     );
   }
   const stagedArtifacts: string[] = [];
+  const journalLocations = activationSnapshotLocations(
+    importId,
+    identityArtifact ?? null,
+    encryptedState ?? null,
+    reputationArtifact ?? null,
+    policySet ?? null,
+    auditReceipts ?? null,
+    commitments ?? null,
+    placeholderMetadata ?? null
+  );
+  // MEDIUM-C (Codex gate, 2026-08-22): refuse before any snapshot read or
+  // journal write, not partway through - see MAX_EXIT_IMPORT_JOURNAL_LOCATIONS's
+  // derivation.
+  if (journalLocations.length > MAX_EXIT_IMPORT_JOURNAL_LOCATIONS) {
+    throw new ExitBundleImportError(
+      "EXIT_IMPORT_TOO_LARGE",
+      `this bundle names ${journalLocations.length} journal-set locations, ` +
+        `above the ${MAX_EXIT_IMPORT_JOURNAL_LOCATIONS} safety bound; refusing ` +
+        "before any snapshot or journal write"
+    );
+  }
   const activationSnapshots = await snapshotStorageLocations(
     opts.storage,
-    activationSnapshotLocations(
-      importId,
-      identityArtifact ?? null,
-      encryptedState ?? null,
-      reputationArtifact ?? null,
-      policySet ?? null,
-      auditReceipts ?? null,
-      commitments ?? null,
-      placeholderMetadata ?? null
-    )
+    journalLocations
   );
   // (coordinator gate finding, 2026-08-22): there is no
   // namespace-wide `_meta` snapshot - see the "PRECISE `_meta` LOCATIONS"
@@ -3592,12 +3687,29 @@ export async function importExitBundle(
   // comment - this is what lets a hard-killed import be rolled back on the
   // next `importExitBundle` call or fortress open, not just on a caught
   // exception.
-  await writeImportJournal(
-    opts.storage,
-    importId,
-    manifest.body.identity_binding.identity_id,
-    activationSnapshots
-  );
+  //
+  // HIGH-B (Codex gate, 2026-08-22): the rotation re-check and the journal
+  // publish happen TOGETHER under the exit-admission lock, so a rotation
+  // whose own preflight passes cannot land its journal in the gap between
+  // this check and this write - the SAME race the top-of-function check
+  // (before verification, above) cannot see. Nothing has been staged yet at
+  // this point, so a refusal here throws directly; there is nothing for the
+  // catch block below to roll back.
+  await withExitAdmissionLock(opts.storage, "import", async () => {
+    if (await opts.storage.read("_meta", ROTATION_JOURNAL_KEY)) {
+      throw new ExitBundleImportError(
+        "ROTATION_IN_PROGRESS",
+        "a master rotation is in progress on this fortress; finish it " +
+          "(`sanctuary rotate-master --resume`) before importing an exit bundle"
+      );
+    }
+    await writeImportJournal(
+      opts.storage,
+      importId,
+      manifest.body.identity_binding.identity_id,
+      activationSnapshots
+    );
+  });
   // Track every staged storage location for result telemetry and cleanup
   // accounting. Snapshot restoration below is what preserves overwritten
   // pre-existing bytes.
@@ -3634,6 +3746,21 @@ export async function importExitBundle(
   const ownsSourceKey = !opts.sourceMasterKey;
   let stateRekeyStarted = false;
   try {
+    // F1 (coordinator gate, 2026-08-22), kept as defense in depth under
+    // HIGH-B's admission lock: the check-then-publish above now runs
+    // atomically under the lock, so this second read only catches a
+    // rotation that lands in the brief gap between the lock's release and
+    // this line - not the race the lock closes. Thrown from inside the try
+    // block so the catch below runs its normal cleanup: nothing has been
+    // staged yet, so every snapshot is safe-noop and the journal this
+    // import just wrote is deleted, not left stuck.
+    if (await opts.storage.read("_meta", ROTATION_JOURNAL_KEY)) {
+      throw new ExitBundleImportError(
+        "ROTATION_IN_PROGRESS",
+        "a master rotation is in progress on this fortress; finish it " +
+          "(`sanctuary rotate-master --resume`) before importing an exit bundle"
+      );
+    }
     if (identityArtifact) {
       await stageArtifact(
         opts.storage,
@@ -3724,14 +3851,8 @@ export async function importExitBundle(
         // ReputationStore.importBundle's matching doc comment.
         { allowDuringOwnExitImportActivation: true },
         undefined,
-        (namespace, key) =>
-          recordSnapshotPostImages(
-            opts.storage,
-            importId,
-            manifest.body.identity_binding.identity_id,
-            activationSnapshots,
-            [{ namespace, key }]
-          )
+        (namespace, key, bytes) =>
+          recordPostImage(opts.storage, importId, namespace, key, bytes)
       );
       reputationResult = {
         imported_attestations: imported.imported,
@@ -3756,14 +3877,8 @@ export async function importExitBundle(
               publicKeys.byIdentityId,
               rotationStats,
               importedRekeyEntries,
-              (locations) =>
-                recordSnapshotPostImages(
-                  opts.storage,
-                  importId,
-                  manifest.body.identity_binding.identity_id,
-                  activationSnapshots,
-                  locations
-                )
+              (namespace, key, bytes) =>
+                recordPostImage(opts.storage, importId, namespace, key, bytes)
             )
           : {
               status: "staged_requires_source_key" as const,
@@ -3874,6 +3989,7 @@ export async function importExitBundle(
   } catch (err) {
     const cleanup = await restoreStorageSnapshots(
       opts.storage,
+      importId,
       activationSnapshots
     );
     // F1 (Exit V2 drill D1): only clear the durable journal once the

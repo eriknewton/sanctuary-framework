@@ -35,7 +35,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,7 +44,11 @@ import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { toBase64url, stringToBytes } from "../../src/core/encoding.js";
-import { resolveCliMasterKey } from "../../src/core/master-custody.js";
+import { hashToString } from "../../src/core/hashing.js";
+import {
+  resolveCliMasterKey,
+  ROTATION_JOURNAL_KEY,
+} from "../../src/core/master-custody.js";
 import {
   StateStore,
   STATE_ENVELOPE_VERSION_ANCHORS_KEY,
@@ -61,8 +65,22 @@ import {
   ExitBundleStateImportIncompleteError,
   recoverInterruptedExitImports,
   recoverInterruptedExitImportsOrThrow,
+  EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
   type ExportExitBundleResult,
 } from "../../src/exit/bundle.js";
+
+/**
+ * CONTRACT PIN: must match locationDedupeKey in server/src/exit/bundle.ts -
+ * the encoding a planted post-image record's key needs to match for
+ * readPostImageHash (bundle.ts) to find it.
+ */
+function postImageKey(
+  importId: string,
+  namespace: string,
+  key: string
+): string {
+  return `${importId}:${namespace.length}:${namespace}${key}`;
+}
 
 const HELPER_DIR = dirname(fileURLToPath(import.meta.url));
 /** server/test/exit/exit-import-atomic-activation.test.ts -> server/src/cli.ts */
@@ -860,7 +878,12 @@ describe("F1: a real child-process SIGKILL mid-import leaves the target unable t
       // write was its own (clean, byte-identical recovery) or it reports
       // the location diverged and leaves it untouched, never a third
       // silent outcome.
-      if (recovery.failed.length === 0) {
+      // F3 (coordinator gate, 2026-08-22): both branches run the SAME
+      // idempotency and clean-import-afterward checks below, not just the
+      // clean branch - a diverged result is still a DETERMINATE, reportable
+      // state, not a dead end this test stops verifying at.
+      const cleanlyRecovered = recovery.failed.length === 0;
+      if (cleanlyRecovered) {
         const afterRecovery = await snapshotFilesystem(reopenedStorage);
         expect(afterRecovery).toBe(beforeKill);
         expect(recovery.recovered).toBe(1);
@@ -872,24 +895,50 @@ describe("F1: a real child-process SIGKILL mid-import leaves the target unable t
         // open route enforces on top of this); assert it is still there,
         // not silently dropped.
         expect(await reopenedStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).not.toHaveLength(0);
-        return;
+        // MEDIUM-D (Codex gate, 2026-08-22): every diverged location, by
+        // name, is byte-identical to what it held right after the kill -
+        // "diverged" means untouched, proven per-location, not inferred
+        // from the aggregate count.
+        expect(recovery.divergedLocations.length).toBeGreaterThan(0);
+        for (const loc of recovery.divergedLocations) {
+          const postKillBytes = await targetStorage.read(loc.namespace, loc.key);
+          const postRecoveryBytes = await reopenedStorage.read(loc.namespace, loc.key);
+          expect(
+            postRecoveryBytes ? toBase64url(postRecoveryBytes) : null
+          ).toBe(postKillBytes ? toBase64url(postKillBytes) : null);
+        }
       }
 
       // MEDIUM (coordinator gate, 2026-08-22): idempotency - a SECOND
-      // recovery call against the now-clean fortress (simulating a second
-      // "fortress open" with no new interruption in between) must be a
-      // pure no-op, not re-apply anything or error.
+      // recovery call with no new interruption in between must report the
+      // SAME determinate outcome again, not drift: a pure no-op on the
+      // clean branch, the SAME diverged locations again on the other (this
+      // function never guesses on a repeat call any more than the first).
       const secondRecovery = await recoverInterruptedExitImports(
         reopenedStorage,
         reopenedAuditLog
       );
-      expect(secondRecovery).toEqual({ recovered: 0, failed: [], diverged: [] });
-      expect(await snapshotFilesystem(reopenedStorage)).toBe(beforeKill);
+      if (cleanlyRecovered) {
+        expect(secondRecovery).toEqual({
+          recovered: 0,
+          failed: [],
+          diverged: [],
+          divergedLocations: [],
+        });
+        expect(await snapshotFilesystem(reopenedStorage)).toBe(beforeKill);
+      } else {
+        expect(secondRecovery.recovered).toBe(0);
+        expect(secondRecovery.diverged).toEqual(recovery.diverged);
+      }
 
-      // Now prove the SECOND half of F1's fix: a subsequent CLEAN import
-      // (via the real CLI again, matching the drill's recovery leg) yields
-      // EXACTLY the same entry/attestation counts as the untouched
-      // reference import - never the drill's pre-fix 122-vs-121 duplicate.
+      // Now prove the SECOND half of F1's fix: a subsequent import attempt
+      // (via the real CLI again, matching the drill's recovery leg) either
+      // yields EXACTLY the same entry/attestation counts as the untouched
+      // reference import (clean branch - never the drill's pre-fix
+      // 122-vs-121 duplicate), or is refused outright by the SAME
+      // fortress-open recovery gate the diverged state left in place
+      // (diverged branch - a real "fortress open" must not silently run
+      // against a fortress recovery could not confirm).
       const retryEnv: NodeJS.ProcessEnv = {
         ...process.env,
         SANCTUARY_STORAGE_PATH: targetDir,
@@ -898,44 +947,57 @@ describe("F1: a real child-process SIGKILL mid-import leaves the target unable t
         NODE_NO_WARNINGS: "1",
       };
       delete retryEnv.SANCTUARY_RECOVERY_KEY;
-      const retryOutput = await new Promise<string>((resolve, reject) => {
-        const retryChild = spawn(
-          NODE_BIN,
-          [
-            ...TSX_ESM_LOADER_ARGS,
-            CLI_SRC,
-            "exit",
-            "import",
-            bundleDir,
-            "--activate",
-            "--import-state",
-            "--force-rebind",
-            "--source-recovery-key",
-            exported.state_rekey_key!,
-            "--yes",
-            "--skip-did-web-verify",
-          ],
-          { env: retryEnv, stdio: ["ignore", "pipe", "pipe"] }
-        );
-        let out = "";
-        retryChild.stdout?.on("data", (chunk) => (out += String(chunk)));
-        retryChild.stderr?.on("data", (chunk) => (out += String(chunk)));
-        retryChild.once("exit", (code) => {
-          if (code === 0) resolve(out);
-          else reject(new Error(`retry import exited ${code}: ${out}`));
-        });
-        retryChild.once("error", reject);
-      });
-      expect(retryOutput).toContain("verdict: PASS");
-      expect(retryOutput).toContain(`state_imported_keys: ${ENTRY_COUNT}`);
+      const retryResult = await new Promise<{ code: number | null; out: string }>(
+        (resolve, reject) => {
+          const retryChild = spawn(
+            NODE_BIN,
+            [
+              ...TSX_ESM_LOADER_ARGS,
+              CLI_SRC,
+              "exit",
+              "import",
+              bundleDir,
+              "--activate",
+              "--import-state",
+              "--force-rebind",
+              "--source-recovery-key",
+              exported.state_rekey_key!,
+              "--yes",
+              "--skip-did-web-verify",
+            ],
+            { env: retryEnv, stdio: ["ignore", "pipe", "pipe"] }
+          );
+          let out = "";
+          retryChild.stdout?.on("data", (chunk) => (out += String(chunk)));
+          retryChild.stderr?.on("data", (chunk) => (out += String(chunk)));
+          retryChild.once("exit", (code) => resolve({ code, out }));
+          retryChild.once("error", reject);
+        }
+      );
 
-      const finalStorage = new FilesystemStorage(join(targetDir, "state"));
-      const finalRepFiles = (await finalStorage.list("_reputation")).length;
-      expect(finalRepFiles).toBe(referenceRepFiles);
-      const finalImportRecords = await finalStorage.list(EXIT_IMPORT_NAMESPACE);
-      expect(finalImportRecords).toHaveLength(1);
-      const finalJournal = await finalStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE);
-      expect(finalJournal).toHaveLength(0);
+      if (cleanlyRecovered) {
+        expect(retryResult.code).toBe(0);
+        expect(retryResult.out).toContain("verdict: PASS");
+        expect(retryResult.out).toContain(`state_imported_keys: ${ENTRY_COUNT}`);
+
+        const finalStorage = new FilesystemStorage(join(targetDir, "state"));
+        const finalRepFiles = (await finalStorage.list("_reputation")).length;
+        expect(finalRepFiles).toBe(referenceRepFiles);
+        const finalImportRecords = await finalStorage.list(EXIT_IMPORT_NAMESPACE);
+        expect(finalImportRecords).toHaveLength(1);
+        const finalJournal = await finalStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE);
+        expect(finalJournal).toHaveLength(0);
+      } else {
+        // F3 (coordinator gate, 2026-08-22): a real "fortress open" (this
+        // CLI invocation) must refuse outright against a fortress recovery
+        // could not confirm - the SAME gate `recoverInterruptedExitImportsOrThrow`
+        // enforces, reached here through the CLI's own openExitContext, not
+        // called directly.
+        expect(retryResult.code).not.toBe(0);
+        expect(retryResult.out).toContain("could not be safely rolled back");
+        const finalJournal = await reopenedStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE);
+        expect(finalJournal).not.toHaveLength(0);
+      }
     },
     90_000
   );
@@ -1136,7 +1198,6 @@ describe("N4 (coordinator gate, 2026-08-22): write chokepoints refuse while an e
           namespace: "n4-recover-ns",
           key: "k",
           data: actualCurrentBytes ? toBase64url(actualCurrentBytes) : null,
-          post_image_hash: null,
         },
       ],
     };
@@ -1214,5 +1275,389 @@ describe("N4 (coordinator gate, 2026-08-22): write chokepoints refuse while an e
     expect(anchorAfter ? toBase64url(anchorAfter) : null).toBe(
       anchorBefore ? toBase64url(anchorBefore) : null
     );
+  });
+});
+
+describe("F2 (coordinator gate, 2026-08-22): exit-import refuses while a master rotation is in progress, in both directions", () => {
+  const tempDirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+  async function newBundleDir(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-exit-f2-"));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  it("top-level check: importExitBundle throws ROTATION_IN_PROGRESS when a rotation journal already exists, mutating nothing", async () => {
+    const source = await makeSource("f2-toplevel", 2, 1);
+    const bundleDir = await newBundleDir();
+    const exported = await exportBundle(source, bundleDir, "f2-toplevel-ns");
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+
+    await destinationStorage.write(
+      "_meta",
+      ROTATION_JOURNAL_KEY,
+      stringToBytes("planted-rotation-journal-placeholder")
+    );
+    const before = await snapshotAll(destinationStorage);
+
+    await expect(
+      importExitBundle({
+        bundleDir,
+        storage: destinationStorage,
+        masterKey: destination.masterKey,
+        identityManager: destination.identityManager,
+        auditLog: destination.auditLog,
+        reputationStore: destination.reputationStore,
+        activate: true,
+        forceRebind: true,
+        sourceRecoveryKey: exported.state_rekey_key,
+        destinationSignerIdentityId: destination.identityId,
+      })
+    ).rejects.toMatchObject({ code: "ROTATION_IN_PROGRESS" });
+
+    expect(await snapshotAll(destinationStorage)).toBe(before);
+  });
+
+  it("F1 re-check: a rotation journal that appears DURING this import's own journal write is caught, and the import cleans up its own journal", async () => {
+    class InjectRotationJournalOnFirstWrite implements StorageBackend {
+      injected = false;
+      constructor(private readonly inner: StorageBackend) {}
+      async write(namespace: string, key: string, value: Uint8Array): Promise<void> {
+        await this.inner.write(namespace, key, value);
+        // Fires exactly once, right after this import's OWN journal write
+        // lands - simulating a rotation whose preflight passed and whose
+        // journal write raced in between the top-of-function check and
+        // writeImportJournal.
+        if (!this.injected && namespace === EXIT_IMPORT_JOURNAL_NAMESPACE) {
+          this.injected = true;
+          await this.inner.write(
+            "_meta",
+            ROTATION_JOURNAL_KEY,
+            stringToBytes("planted-mid-import-rotation-journal")
+          );
+        }
+      }
+      read(namespace: string, key: string): Promise<Uint8Array | null> {
+        return this.inner.read(namespace, key);
+      }
+      delete(
+        namespace: string,
+        key: string,
+        secureOverwrite?: boolean
+      ): Promise<boolean> {
+        return this.inner.delete(namespace, key, secureOverwrite);
+      }
+      list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]> {
+        return this.inner.list(namespace, prefix);
+      }
+      exists(namespace: string, key: string): Promise<boolean> {
+        return this.inner.exists(namespace, key);
+      }
+      totalSize(): Promise<number> {
+        return this.inner.totalSize();
+      }
+      listNamespaces(): Promise<string[]> {
+        return (this.inner as MemoryStorage).listNamespaces();
+      }
+    }
+
+    const source = await makeSource("f2-midwrite", 2, 1);
+    const bundleDir = await newBundleDir();
+    const exported = await exportBundle(source, bundleDir, "f2-midwrite-ns");
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+    const wrapped = new InjectRotationJournalOnFirstWrite(destinationStorage);
+
+    await expect(
+      importExitBundle({
+        bundleDir,
+        storage: wrapped,
+        masterKey: destination.masterKey,
+        identityManager: destination.identityManager,
+        auditLog: destination.auditLog,
+        reputationStore: destination.reputationStore,
+        activate: true,
+        forceRebind: true,
+        sourceRecoveryKey: exported.state_rekey_key,
+        destinationSignerIdentityId: destination.identityId,
+      })
+    ).rejects.toMatchObject({ code: "ROTATION_IN_PROGRESS" });
+
+    // The import's OWN journal is gone (clean rollback - nothing had been
+    // staged yet, so the catch path's restore found every location
+    // safe-noop and deleted it).
+    expect(await destinationStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
+    // Nothing from the bundle landed.
+    expect(await destinationStorage.list(EXIT_IMPORT_NAMESPACE)).toHaveLength(0);
+    expect(await destinationStorage.list("f2-midwrite-ns")).toHaveLength(0);
+  });
+});
+
+describe("F3 (coordinator gate, 2026-08-22): post-image-confirmed restore, deterministic", () => {
+  it("current bytes equal the recorded post-image: restored to the pre-image", async () => {
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+
+    const preImage = stringToBytes("pre-image value");
+    const postImageBytes = stringToBytes("post-image value (this import's own write)");
+    await destinationStorage.write("f3-ns", "k", postImageBytes);
+
+    const journalRecord = {
+      import_id: "planted-f3-safe-restore",
+      identity_id: destination.identityId,
+      started_at: new Date().toISOString(),
+      snapshots: [
+        {
+          namespace: "f3-ns",
+          key: "k",
+          data: toBase64url(preImage),
+        },
+      ],
+    };
+    await destinationStorage.write(
+      EXIT_IMPORT_JOURNAL_NAMESPACE,
+      "planted-f3-safe-restore",
+      stringToBytes(JSON.stringify(journalRecord))
+    );
+    // MEDIUM-C (Codex gate, 2026-08-22): the post-image is a SEPARATE
+    // per-location record now, not a field embedded in the journal.
+    await destinationStorage.write(
+      EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
+      postImageKey("planted-f3-safe-restore", "f3-ns", "k"),
+      stringToBytes(JSON.stringify({ hash: hashToString(postImageBytes) }))
+    );
+
+    const result = await recoverInterruptedExitImports(destinationStorage, destination.auditLog);
+    expect(result.recovered).toBe(1);
+    expect(result.failed).toEqual([]);
+    expect(result.diverged).toEqual([]);
+    const restored = await destinationStorage.read("f3-ns", "k");
+    expect(restored ? toBase64url(restored) : null).toBe(toBase64url(preImage));
+    expect(await destinationStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
+  });
+
+  it("current bytes match neither the pre-image nor the recorded post-image: diverged, bytes left untouched, audited, remediation text present", async () => {
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+
+    const preImage = stringToBytes("pre-image value");
+    const importsOwnPostImage = stringToBytes("post-image this import actually wrote");
+    const thirdPartyBytes = stringToBytes("a DIFFERENT writer's bytes, after this import's own write");
+    await destinationStorage.write("f3-ns", "k", thirdPartyBytes);
+
+    const journalRecord = {
+      import_id: "planted-f3-diverged",
+      identity_id: destination.identityId,
+      started_at: new Date().toISOString(),
+      snapshots: [
+        {
+          namespace: "f3-ns",
+          key: "k",
+          data: toBase64url(preImage),
+        },
+      ],
+    };
+    await destinationStorage.write(
+      EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
+      postImageKey("planted-f3-diverged", "f3-ns", "k"),
+      stringToBytes(JSON.stringify({ hash: hashToString(importsOwnPostImage) }))
+    );
+    await destinationStorage.write(
+      EXIT_IMPORT_JOURNAL_NAMESPACE,
+      "planted-f3-diverged",
+      stringToBytes(JSON.stringify(journalRecord))
+    );
+
+    const result = await recoverInterruptedExitImports(destinationStorage, destination.auditLog);
+    expect(result.recovered).toBe(0);
+    expect(result.failed).toEqual(["planted-f3-diverged"]);
+    expect(result.diverged).toEqual(["planted-f3-diverged"]);
+    const untouched = await destinationStorage.read("f3-ns", "k");
+    expect(untouched ? toBase64url(untouched) : null).toBe(toBase64url(thirdPartyBytes));
+    // Journal is left in place, not deleted, on a diverged result.
+    expect(await destinationStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(1);
+
+    const audited = await destination.auditLog.query({
+      operation_type: "exit_bundle_recovery_diverged",
+    });
+    expect(audited.entries.length).toBeGreaterThan(0);
+    expect(audited.entries[0]!.result).toBe("failure");
+
+    await expect(
+      recoverInterruptedExitImportsOrThrow(destinationStorage, destination.auditLog)
+    ).rejects.toThrow(/At least one location changed since this import last touched/);
+  });
+
+  it("no post-image record exists at all (never recorded) and current differs from the pre-image: diverged, not silently restored", async () => {
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+
+    const preImage = stringToBytes("pre-image value");
+    const unrecordedWrite = stringToBytes("a write with no recorded post-image at all");
+    await destinationStorage.write("f3-ns", "k", unrecordedWrite);
+
+    const journalRecord = {
+      import_id: "planted-f3-null-postimage",
+      identity_id: destination.identityId,
+      started_at: new Date().toISOString(),
+      snapshots: [
+        {
+          namespace: "f3-ns",
+          key: "k",
+          data: toBase64url(preImage),
+        },
+      ],
+    };
+    await destinationStorage.write(
+      EXIT_IMPORT_JOURNAL_NAMESPACE,
+      "planted-f3-null-postimage",
+      stringToBytes(JSON.stringify(journalRecord))
+    );
+
+    const result = await recoverInterruptedExitImports(destinationStorage, destination.auditLog);
+    expect(result.recovered).toBe(0);
+    expect(result.diverged).toEqual(["planted-f3-null-postimage"]);
+    const untouched = await destinationStorage.read("f3-ns", "k");
+    expect(untouched ? toBase64url(untouched) : null).toBe(toBase64url(unrecordedWrite));
+  });
+});
+
+describe("HIGH-B (coordinator gate, 2026-08-22): fortress-wide exit-admission lock", () => {
+  const tempDirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  it("a held admission lock refuses recovery with the SAME operator remediation shape a refused journal uses, no auto-break", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-exit-admission-"));
+    tempDirs.push(dir);
+    const storage = new FilesystemStorage(join(dir, "state"));
+    // Force the namespace directory to exist (a fresh fortress has none of
+    // its namespaces on disk yet).
+    await storage.write(EXIT_IMPORT_JOURNAL_NAMESPACE, "warm-namespace-dir", stringToBytes("x"));
+    await storage.delete(EXIT_IMPORT_JOURNAL_NAMESPACE, "warm-namespace-dir", false);
+
+    // Simulate a held lock exactly the way withPathLock itself creates one -
+    // an O_EXCL create with the SAME payload shape, standing in for either a
+    // live concurrent holder or a crashed one (no auto-stale-break means
+    // this test cannot and does not need to distinguish the two; see
+    // cross-process-lock.ts's module header for why).
+    const lockDir = storage.namespacePath(EXIT_IMPORT_JOURNAL_NAMESPACE);
+    const lockPath = join(lockDir, "admission.lock");
+    const handle = await open(lockPath, "wx", 0o600);
+    await handle.writeFile(
+      JSON.stringify({ owner: "import", pid: 999_999, acquired_at: new Date(0).toISOString() })
+    );
+    await handle.close();
+
+    const auditLog = new AuditLog(storage, generateRandomKey());
+    await expect(recoverInterruptedExitImports(storage, auditLog)).rejects.toThrow(
+      /Run any `sanctuary exit` verb .* to recover, then retry\. If no other Sanctuary operation is actually running .* inspect the lock directly .* before removing it - do not remove it first/
+    );
+
+    // The lock file itself is untouched by the failed acquire attempt (no
+    // auto-break) - still there, still readable, still the original holder.
+    const readHandle = await open(lockPath, "r");
+    const stillLocked = JSON.parse(await readHandle.readFile("utf8"));
+    await readHandle.close();
+    expect(stillLocked.owner).toBe("import");
+  }, 20_000);
+});
+
+describe("F4 (coordinator gate, 2026-08-22): a `_meta` write fault after entry bytes land must roll back cleanly, not diverge", () => {
+  const tempDirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+  async function newBundleDir(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-exit-f4-"));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  it("Nth `_meta` write fault (after a later entry's own bytes and post-image already landed): recovery is clean, not diverged", async () => {
+    class NthMetaWriteFaultStorage implements StorageBackend {
+      private metaWrites = 0;
+      constructor(
+        private readonly inner: StorageBackend,
+        private readonly faultOnMetaWriteNumber: number
+      ) {}
+      async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+        if (namespace === "_meta") {
+          this.metaWrites++;
+          if (this.metaWrites === this.faultOnMetaWriteNumber) {
+            throw new Error("F4 injected fault: simulated _meta write failure");
+          }
+        }
+        return this.inner.write(namespace, key, data);
+      }
+      read(namespace: string, key: string): Promise<Uint8Array | null> {
+        return this.inner.read(namespace, key);
+      }
+      delete(
+        namespace: string,
+        key: string,
+        secureOverwrite?: boolean
+      ): Promise<boolean> {
+        return this.inner.delete(namespace, key, secureOverwrite);
+      }
+      list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]> {
+        return this.inner.list(namespace, prefix);
+      }
+      exists(namespace: string, key: string): Promise<boolean> {
+        return this.inner.exists(namespace, key);
+      }
+      totalSize(): Promise<number> {
+        return this.inner.totalSize();
+      }
+      listNamespaces(): Promise<string[]> {
+        return (this.inner as MemoryStorage).listNamespaces();
+      }
+    }
+
+    const source = await makeSource("f4-metafault", 2, 0);
+    const bundleDir = await newBundleDir();
+    const exported = await exportBundle(source, bundleDir, "f4-metafault-ns");
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+    // 3rd `_meta` write = the SECOND entry's version-anchor update (the
+    // first entry's writer-key-registry write is #1, its own anchor
+    // update is #2; the second entry's writer-key-registry write is
+    // skipped - same signer, unchanged - so its anchor update is #3).
+    // By this point entry 1's bytes AND post-image are already durably
+    // recorded; entry 2's own MAIN ENTRY write (which happens before this
+    // `_meta` update, inside the same stateStore.write call) has ALSO
+    // already landed with its own post-image recorded (HIGH-A: recorded
+    // per raw write, not batched at the end of the call).
+    const wrapped = new NthMetaWriteFaultStorage(destinationStorage, 3);
+
+    await expect(
+      importExitBundle({
+        bundleDir,
+        storage: wrapped,
+        masterKey: destination.masterKey,
+        identityManager: destination.identityManager,
+        auditLog: destination.auditLog,
+        reputationStore: destination.reputationStore,
+        activate: true,
+        forceRebind: true,
+        sourceRecoveryKey: exported.state_rekey_key,
+        destinationSignerIdentityId: destination.identityId,
+      })
+    ).rejects.toThrow(/F4 injected fault/);
+
+    // The exception-path cleanup inside importExitBundle already ran
+    // restoreStorageSnapshots synchronously before rejecting - assert the
+    // result directly rather than re-invoking recovery.
+    expect(await destinationStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
+    expect(await destinationStorage.list("f4-metafault-ns")).toHaveLength(0);
+
+    // A fresh fortress-open recovery pass finds nothing left to do (the
+    // exception-path cleanup already resolved it cleanly).
+    const recovery = await recoverInterruptedExitImports(destinationStorage, destination.auditLog);
+    expect(recovery).toEqual({ recovered: 0, failed: [], diverged: [], divergedLocations: [] });
   });
 });

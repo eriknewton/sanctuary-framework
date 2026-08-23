@@ -650,6 +650,45 @@ type DisclosureWithoutVerifiedReadFields = [
   : never;
 
 /** Options for state write */
+/**
+ * HIGH-A (Codex gate, 2026-08-22, register id EXIT-JOURNAL-DIVERGE-01):
+ * called synchronously with the EXACT bytes a raw storage write is about
+ * to persist, for a location this write touches (the main entry, or
+ * a `_meta` side effect). The exit-import module's own writer uses this to
+ * record its post-image from what it KNOWS it wrote, never from a re-read
+ * of storage after the fact - a re-read cannot tell this write's own bytes
+ * from a different writer's bytes landing in the same instant.
+ */
+type RawWriteObserver = (
+  namespace: string,
+  key: string,
+  bytes: Uint8Array
+) => Promise<void>;
+
+/**
+ * F4 (coordinator gate, 2026-08-22): a failure recording a post-image must
+ * NEVER turn "the entry/`_meta` bytes landed" into "this write failed" -
+ * that would be an availability regression (a fortress that actually
+ * finished its work refuses to open because BOOKKEEPING about that work
+ * failed). A swallowed failure here is not a silent data-loss risk: the
+ * one thing an unrecorded post-image can cause is a later recovery
+ * treating this location as unconfirmed (safe-noop or diverged) rather
+ * than confirmed-safe-to-restore - never a wrong restore.
+ */
+async function runRawWriteObserver(
+  onRawWrite: RawWriteObserver | undefined,
+  namespace: string,
+  key: string,
+  bytes: Uint8Array
+): Promise<void> {
+  if (!onRawWrite) return;
+  try {
+    await onRawWrite(namespace, key, bytes);
+  } catch {
+    // Intentionally swallowed - see the doc comment above.
+  }
+}
+
 export interface WriteOptions {
   content_type?: string;
   ttl_seconds?: number;
@@ -675,6 +714,14 @@ export interface WriteOptions {
    * a cryptographic proof of which module is calling.
    */
   allowDuringOwnExitImportActivation?: boolean;
+  /**
+   * HIGH-A (Codex gate, 2026-08-22): paired with
+   * allowDuringOwnExitImportActivation - lets the exit-import module
+   * capture the exact bytes THIS write persists (the main entry and any
+   * `_meta` side effect), for its own post-image recording. Not for
+   * general use; same in-process-forgeable bound as the option above.
+   */
+  onRawWrite?: RawWriteObserver;
 }
 
 /** Cached namespace key with TTL */
@@ -1284,9 +1331,12 @@ export class StateStore {
 
   private async saveJsonRecord(
     key: string,
-    record: Record<string, unknown>
+    record: Record<string, unknown>,
+    onRawWrite?: RawWriteObserver
   ): Promise<void> {
-    await this.storage.write("_meta", key, stringToBytes(JSON.stringify(record)));
+    const bytes = stringToBytes(JSON.stringify(record));
+    await this.storage.write("_meta", key, bytes);
+    await runRawWriteObserver(onRawWrite, "_meta", key, bytes);
   }
 
   /**
@@ -1405,7 +1455,8 @@ export class StateStore {
 
   /** Persist the version-anchor record in a MAC-authenticated envelope (F1). */
   private async saveVersionAnchors(
-    record: Record<string, unknown>
+    record: Record<string, unknown>,
+    onRawWrite?: RawWriteObserver
   ): Promise<void> {
     const envelope = {
       [STATE_META_MAC_MARKER]: true,
@@ -1414,23 +1465,27 @@ export class StateStore {
         this.metaRecordMacBytes(STATE_ENVELOPE_VERSION_ANCHORS_KEY, record)
       ),
     };
-    await this.storage.write(
+    const bytes = stringToBytes(JSON.stringify(envelope));
+    await this.storage.write("_meta", STATE_ENVELOPE_VERSION_ANCHORS_KEY, bytes);
+    await runRawWriteObserver(
+      onRawWrite,
       "_meta",
       STATE_ENVELOPE_VERSION_ANCHORS_KEY,
-      stringToBytes(JSON.stringify(envelope))
+      bytes
     );
   }
 
   private async rememberWriterPublicKey(
     kid: string,
-    publicKey: Uint8Array
+    publicKey: Uint8Array,
+    onRawWrite?: RawWriteObserver
   ): Promise<void> {
     const registry = await this.loadJsonRecord(STATE_ENVELOPE_PUBLIC_KEYS_KEY);
     const publicKeyString = toBase64url(publicKey);
     if (registry[kid] === publicKeyString) return;
 
     registry[kid] = publicKeyString;
-    await this.saveJsonRecord(STATE_ENVELOPE_PUBLIC_KEYS_KEY, registry);
+    await this.saveJsonRecord(STATE_ENVELOPE_PUBLIC_KEYS_KEY, registry, onRawWrite);
   }
 
   private async resolveStoredIdentity(kid: string): Promise<StoredIdentity | null> {
@@ -1559,7 +1614,8 @@ export class StateStore {
   private async observeVersion(
     namespace: string,
     key: string,
-    version: number
+    version: number,
+    onRawWrite?: RawWriteObserver
   ): Promise<void> {
     const { anchors, vk, lastSeen } = await this.assertNotBelowVersionFloor(
       namespace,
@@ -1569,7 +1625,7 @@ export class StateStore {
 
     if (version > lastSeen) {
       anchors[vk] = version;
-      await this.saveVersionAnchors(anchors);
+      await this.saveVersionAnchors(anchors, onRawWrite);
     }
   }
 
@@ -1635,14 +1691,23 @@ export class StateStore {
     options: WriteOptions = {}
   ): Promise<WriteResult> {
     // N4 (coordinator gate, 2026-08-22): while a durable exit-import
-    // journal exists, refuse THIS write rather than let it land and then
-    // possibly be silently reverted by a LATER recovery replay - the
-    // unconditional restore in restoreStorageSnapshots (exit/bundle.ts)
-    // has no way to tell "this write happened after the kill" from "this
-    // is the pre-import byte the journal itself remembers". `rekeyState`
-    // (exit/bundle.ts) is the one legitimate caller that writes while its
-    // OWN journal is present and passes `allowDuringOwnExitImportActivation`
-    // to skip this; every other caller is refused while ANY journal exists.
+    // journal exists, refuse THIS write - F6 (coordinator gate,
+    // 2026-08-22): restore is now post-image-confirmed, not unconditional
+    // (HIGH-1/HIGH-A, Codex gate, register id EXIT-JOURNAL-DIVERGE-01:
+    // restoreStorageSnapshots restores a location only when its current
+    // bytes match the import's own recorded post-image, otherwise it
+    // reports diverged and leaves it untouched); this refusal stays the
+    // first line of defense so a legitimate write is never even put in
+    // that position. `rekeyState` (exit/bundle.ts) is the one legitimate
+    // caller that writes while its OWN journal is present and passes
+    // `allowDuringOwnExitImportActivation` to skip this; every other
+    // caller is refused while ANY journal exists. RESIDUAL BOUND: the
+    // check-then-write gap this refusal itself has is closed by the
+    // fortress-wide admission lock around journal publication (HIGH-B,
+    // Codex gate, 2026-08-22) for the rotation/import ordering race
+    // specifically; a lock-acquire timeout still fails this operation
+    // closed rather than proceeding, which is an availability, not a
+    // correctness, trade-off.
     if (
       !options.allowDuringOwnExitImportActivation &&
       (await hasInterruptedExitImport(this.storage))
@@ -1737,8 +1802,9 @@ export class StateStore {
     // Serialize and write to storage
     const serialized = stringToBytes(JSON.stringify(stateEntry));
     await this.storage.write(namespace, key, serialized);
-    await this.rememberWriterPublicKey(identityId, writerPublicKey);
-    await this.observeVersion(namespace, key, newVersion);
+    await runRawWriteObserver(options.onRawWrite, namespace, key, serialized);
+    await this.rememberWriterPublicKey(identityId, writerPublicKey, options.onRawWrite);
+    await this.observeVersion(namespace, key, newVersion, options.onRawWrite);
 
     // Update caches
     this.versionCache.set(vk, newVersion);
@@ -2915,6 +2981,12 @@ export class StateStore {
         // the top of import() for the whole loop - a bulk import can run
         // long enough for a journal to appear after the top-level check
         // already passed.
+        //
+        // F7 (coordinator gate, 2026-08-22), pre-existing behavior: a
+        // mid-loop refusal here leaves every entry this SAME import() call
+        // already wrote earlier in the loop in place - import() has never
+        // rolled back its own partial progress on any refusal, and this
+        // check does not change that.
         if (await hasInterruptedExitImport(this.storage)) {
           throw new InterruptedExitImportPendingError(`state_import:${ns}/${key}`);
         }
