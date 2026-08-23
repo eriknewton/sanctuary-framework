@@ -35,7 +35,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, rm, open, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, open, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -43,7 +43,7 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { toBase64url, stringToBytes } from "../../src/core/encoding.js";
+import { toBase64url, stringToBytes, bytesToString } from "../../src/core/encoding.js";
 import { hashToString } from "../../src/core/hashing.js";
 import {
   resolveCliMasterKey,
@@ -67,6 +67,7 @@ import {
   recoverInterruptedExitImports,
   recoverInterruptedExitImportsOrThrow,
   EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
+  MAX_EXIT_IMPORT_JOURNAL_LOCATIONS,
   type ExportExitBundleResult,
 } from "../../src/exit/bundle.js";
 
@@ -76,6 +77,21 @@ import {
  * fixed length, not embedded raw) - the encoding a planted post-image
  * record's key needs to match for readPostImageHash (bundle.ts) to find it.
  */
+/**
+ * CodeQL js/file-system-race (2026-08-23): reads the WHOLE file through an
+ * already-open handle at an explicit position (0), never a fresh path
+ * lookup - filehandle.readFile() reads from the handle's CURRENT position,
+ * which a prior filehandle.writeFile() call on the SAME handle has already
+ * advanced to end-of-file, so a plain handle.readFile() after a write
+ * returns empty rather than the content just written.
+ */
+async function readWholeFileHandle(handle: FileHandle): Promise<string> {
+  const { size } = await handle.stat();
+  const buffer = Buffer.alloc(size);
+  await handle.read(buffer, 0, size, 0);
+  return buffer.toString("utf8");
+}
+
 function postImageKey(
   importId: string,
   namespace: string,
@@ -524,6 +540,53 @@ describe("F1: durable rollback journal - in-process fault injection at each stag
     expect(
       await destinationStorage.read("_identities", "canary-identity-key")
     ).not.toBeNull();
+
+    // The open path stops with the named error rather than silently
+    // proceeding against a fortress it could not fully recover.
+    await expect(
+      recoverInterruptedExitImportsOrThrow(destinationStorage, destination.auditLog)
+    ).rejects.toMatchObject({ code: "INTERRUPTED_IMPORT_RECOVERY_FAILED" });
+  });
+
+  it("Codex gate MEDIUM (2026-08-23): a journal whose snapshots array exceeds MAX_EXIT_IMPORT_JOURNAL_LOCATIONS is refused BEFORE per-element validation runs, named, retained, and audited durably", async () => {
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+
+    // Every element is `null` - deliberately NOT a well-formed snapshot.
+    // If the cap check ran AFTER isWellFormedExitImportJournalRecord (the
+    // ordering this test guards against), this record would still be
+    // routed to `failed`, but via the generic malformed-journal branch,
+    // never `exit_bundle_recovery_journal_too_large` - and only after
+    // paying for a full per-element traversal of an oversized array. The
+    // audit-event assertion below is what distinguishes "rejected for
+    // being oversized" from "rejected for some other reason".
+    const oversizedRecord = {
+      import_id: "oversized-import",
+      identity_id: "oversized-identity",
+      started_at: new Date().toISOString(),
+      snapshots: new Array(MAX_EXIT_IMPORT_JOURNAL_LOCATIONS + 1).fill(null),
+    };
+    await destinationStorage.write(
+      EXIT_IMPORT_JOURNAL_NAMESPACE,
+      "oversized-import",
+      stringToBytes(JSON.stringify(oversizedRecord))
+    );
+
+    const result = await recoverInterruptedExitImports(destinationStorage, destination.auditLog);
+    expect(result.recovered).toBe(0);
+    expect(result.failed).toEqual(["oversized-import"]);
+
+    // Named refusal: the oversized-specific audit event fired, not a
+    // generic malformed-journal one.
+    await destination.auditLog.flush();
+    const audited = await destination.auditLog.query({
+      operation_type: "exit_bundle_recovery_journal_too_large",
+    });
+    expect(audited.entries.length).toBeGreaterThan(0);
+    expect(audited.entries[0]!.result).toBe("failure");
+
+    // The journal is retained (discoverable), not silently dropped.
+    expect(await destinationStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(1);
 
     // The open path stops with the named error rather than silently
     // proceeding against a fortress it could not fully recover.
@@ -1588,11 +1651,16 @@ describe("HIGH-B (coordinator gate, 2026-08-22): fortress-wide exit-admission lo
     // cross-process-lock.ts's module header for why).
     const lockDir = storage.namespacePath(EXIT_IMPORT_JOURNAL_NAMESPACE);
     const lockPath = join(lockDir, "admission.lock");
-    const handle = await open(lockPath, "wx", 0o600);
+    // CodeQL js/file-system-race (2026-08-23): keep the handle this create
+    // returns and read through IT (handle.readFile()) below, rather than a
+    // path-based create followed by a path-based read - CodeQL does not
+    // credit "the create used wx" as a sanitizer for a later path lookup
+    // on the same variable, so the fix is to remove that shape entirely,
+    // not to add error handling around it.
+    const handle = await open(lockPath, "wx+", 0o600);
     await handle.writeFile(
       JSON.stringify({ owner: "import", pid: 999_999, acquired_at: new Date(0).toISOString() })
     );
-    await handle.close();
 
     const auditLog = new AuditLog(storage, generateRandomKey());
     await expect(recoverInterruptedExitImports(storage, auditLog)).rejects.toThrow(
@@ -1600,21 +1668,10 @@ describe("HIGH-B (coordinator gate, 2026-08-22): fortress-wide exit-admission lo
     );
 
     // The lock file itself is untouched by the failed acquire attempt (no
-    // auto-break) - still there, still readable, still the original holder.
-    // CodeQL js/file-system-race (2026-08-23): read the path directly with
-    // its own error handling rather than a check (stat/exists) followed by
-    // a separate open - readFile is the single atomic operation, and a
-    // vanished file surfaces as this call throwing, not as a prior check
-    // going stale.
-    let stillLockedRaw: string;
-    try {
-      stillLockedRaw = await readFile(lockPath, "utf8");
-    } catch (err) {
-      throw new Error(
-        `expected the admission lock at ${lockPath} to still be present ` +
-          `(no auto-stale-break): ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
+    // auto-break) - still there, still readable, still the original
+    // holder. Read through the SAME open handle, not a fresh path lookup.
+    const stillLockedRaw = await readWholeFileHandle(handle);
+    await handle.close();
     const stillLocked = JSON.parse(stillLockedRaw);
     expect(stillLocked.owner).toBe("import");
   }, 20_000);
@@ -1641,11 +1698,13 @@ describe("HIGH-B (coordinator gate, 2026-08-22): fortress-wide exit-admission lo
     const lockDir = storage.namespacePath(EXIT_IMPORT_JOURNAL_NAMESPACE);
     const lockPath = join(lockDir, "admission.lock");
     await mkdir(lockDir, { recursive: true, mode: 0o700 });
-    const handle = await open(lockPath, "wx", 0o600);
+    // CodeQL js/file-system-race (2026-08-23): same fix as the test
+    // above - keep this create's own handle and read through it, no
+    // path-based read after a path-based create.
+    const handle = await open(lockPath, "wx+", 0o600);
     await handle.writeFile(
       JSON.stringify({ owner: "rotate", pid: 999_999, acquired_at: new Date(0).toISOString() })
     );
-    await handle.close();
 
     await expect(
       importExitBundle({
@@ -1670,7 +1729,8 @@ describe("HIGH-B (coordinator gate, 2026-08-22): fortress-wide exit-admission lo
     // lock is even reached, and that is not this test's property.)
     expect(await storage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
     expect(await storage.list("highb-import-lock-ns")).toHaveLength(0);
-    const stillLockedRaw2 = await readFile(lockPath, "utf8");
+    const stillLockedRaw2 = await readWholeFileHandle(handle);
+    await handle.close();
     expect(JSON.parse(stillLockedRaw2).owner).toBe("rotate");
   }, 20_000);
 });
@@ -1898,4 +1958,290 @@ describe("HIGH-1 (coordinator gate, 2026-08-22): two graphs, one on-disk fortres
     const cleanOpen = await recoverInterruptedExitImports(graphBStorage, graphBAuditLog);
     expect(cleanOpen).toEqual({ recovered: 0, failed: [], diverged: [], divergedLocations: [] });
   }, 30_000);
+});
+
+describe("Codex gate HIGH (2026-08-23): audit flush and journal deletion order around the activation commit", () => {
+  const tempDirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+  async function newBundleDir(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-exit-commit-order-"));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  it("audit flush throws BEFORE deleteImportJournal runs: the journal and post-images are still intact, so the catch block's rollback is clean", async () => {
+    const source = await makeSource("commit-order-flush", 1, 0);
+    const bundleDir = await newBundleDir();
+    const exported = await exportBundle(source, bundleDir, "commit-order-flush-ns");
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+
+    let flushCount = 0;
+    const originalFlush = destination.auditLog.flush.bind(destination.auditLog);
+    destination.auditLog.flush = async () => {
+      flushCount++;
+      // Let every EARLIER flush (audit appends made while staging/rekeying)
+      // succeed normally; fail only the flush immediately after the
+      // activation record is written - the one this test targets.
+      if (flushCount > 1) {
+        throw new Error("Codex gate HIGH injected fault: audit flush failed");
+      }
+      return originalFlush();
+    };
+
+    await expect(
+      importExitBundle({
+        bundleDir,
+        storage: destinationStorage,
+        masterKey: destination.masterKey,
+        identityManager: destination.identityManager,
+        auditLog: destination.auditLog,
+        reputationStore: destination.reputationStore,
+        activate: true,
+        forceRebind: true,
+        sourceRecoveryKey: exported.state_rekey_key,
+        destinationSignerIdentityId: destination.identityId,
+      })
+    ).rejects.toThrow(/audit flush failed/);
+
+    // Clean rollback: the journal is gone (cleanup succeeded - everything
+    // was still there to restore against) and none of the bundle's state
+    // landed.
+    expect(await destinationStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
+    expect(await destinationStorage.list("commit-order-flush-ns")).toHaveLength(0);
+    expect(await destinationStorage.list(EXIT_IMPORT_NAMESPACE)).toHaveLength(0);
+  });
+
+  it("deleteImportJournal fails AFTER the activation record and audit flush both already succeeded: importExitBundle still reports success, and the next open's recovery clears the stale journal without restoring anything", async () => {
+    class FailJournalDeleteStorage implements StorageBackend {
+      constructor(private readonly inner: StorageBackend) {}
+      write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+        return this.inner.write(namespace, key, data);
+      }
+      read(namespace: string, key: string): Promise<Uint8Array | null> {
+        return this.inner.read(namespace, key);
+      }
+      async delete(
+        namespace: string,
+        key: string,
+        secureOverwrite?: boolean
+      ): Promise<boolean> {
+        if (namespace === EXIT_IMPORT_JOURNAL_NAMESPACE) {
+          throw new Error("Codex gate HIGH injected fault: journal delete failed after commit");
+        }
+        return this.inner.delete(namespace, key, secureOverwrite);
+      }
+      list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]> {
+        return this.inner.list(namespace, prefix);
+      }
+      exists(namespace: string, key: string): Promise<boolean> {
+        return this.inner.exists(namespace, key);
+      }
+      totalSize(): Promise<number> {
+        return this.inner.totalSize();
+      }
+      listNamespaces(): Promise<string[]> {
+        return (this.inner as MemoryStorage).listNamespaces();
+      }
+    }
+
+    const source = await makeSource("commit-order-delete", 1, 0);
+    const bundleDir = await newBundleDir();
+    const exported = await exportBundle(source, bundleDir, "commit-order-delete-ns");
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+    const wrapped = new FailJournalDeleteStorage(destinationStorage);
+
+    const result = await importExitBundle({
+      bundleDir,
+      storage: wrapped,
+      masterKey: destination.masterKey,
+      identityManager: destination.identityManager,
+      auditLog: destination.auditLog,
+      reputationStore: destination.reputationStore,
+      activate: true,
+      forceRebind: true,
+      sourceRecoveryKey: exported.state_rekey_key,
+      destinationSignerIdentityId: destination.identityId,
+    });
+    // The import itself is reported as a SUCCESS - the delete failure is
+    // cleanup, not commit, and never reaches the caller as an error.
+    expect(result.activated).toBe(true);
+    expect(result.state.imported_keys).toBe(1);
+
+    // The journal is left behind (stale) because the delete genuinely
+    // failed - this is the expected, safe residue, not a bug.
+    expect(await destinationStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(1);
+    const importRecords = await destinationStorage.list(EXIT_IMPORT_NAMESPACE);
+    expect(importRecords).toHaveLength(1);
+    const importRecordRaw = await destinationStorage.read(EXIT_IMPORT_NAMESPACE, importRecords[0]!.key);
+    const importRecord = JSON.parse(bytesToString(importRecordRaw!)) as Record<string, unknown>;
+    expect(importRecord.activated_at).toBeTruthy();
+
+    // The next open's recovery (via the REAL, unwrapped storage this
+    // time - a fresh process would reopen a working handle) finds
+    // `activated_at` already stamped, clears the stale journal, and
+    // restores NOTHING (the data is already correct).
+    const beforeRecovery = await destinationStorage.read("commit-order-delete-ns", "k0");
+    const recovery = await recoverInterruptedExitImports(destinationStorage, destination.auditLog);
+    expect(recovery.recovered).toBe(1);
+    expect(recovery.failed).toEqual([]);
+    expect(recovery.diverged).toEqual([]);
+    expect(await destinationStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
+    const afterRecovery = await destinationStorage.read("commit-order-delete-ns", "k0");
+    expect(afterRecovery ? toBase64url(afterRecovery) : null).toBe(
+      beforeRecovery ? toBase64url(beforeRecovery) : null
+    );
+  });
+});
+
+describe("Codex gate HIGH (2026-08-23): an ordinary writer racing journal publication is detected at recovery, not silently reverted or silently overwritten", () => {
+  const tempDirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+  async function newBundleDir(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-exit-writer-race-"));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  /**
+   * Simulates the exact interleaving the coordinator's finding names: "a
+   * StateStore.write passes the journal check, does async work, the
+   * import locks/snapshots/publishes, the writer commits, the import
+   * continues." The RULING (do not widen the admission lock to cover
+   * every ordinary write): post-images are hashed from the import's own
+   * KNOWN written bytes at the moment they are written, never re-derived
+   * afterward, so a DIFFERENT writer's bytes landing on the same location
+   * can never match that post-image.
+   *
+   * The shared restore path this test exercises then treats that location
+   * as needing operator review, and never as safe to touch, in either
+   * direction - it is neither reverted to the pre-image (which would
+   * discard the writer's legitimate data) nor accepted as the import's
+   * own (there is no signature or attribution on a raw write to tell the
+   * two apart other than the post-image hash).
+   *
+   * This wrapper stands in for the writer's delayed commit: it lets the
+   * import's own write to the target namespace land first (exactly as
+   * `recordPostImage` observes it, via `onRawWrite`), then immediately
+   * writes DIFFERENT bytes to the SAME location directly through the
+   * unwrapped inner storage (bypassing this class's own single-fire
+   * gate, so the racing write is never itself mistaken for the import's
+   * own), then throws - forcing the import into its exception-path
+   * rollback with the raced location already in its final, racer-owned
+   * state.
+   */
+  class RaceWriterAfterImportWriteStorage implements StorageBackend {
+    private fired = false;
+    constructor(
+      private readonly inner: StorageBackend,
+      private readonly targetNamespace: string,
+      private readonly racingBytes: Uint8Array
+    ) {}
+    async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+      await this.inner.write(namespace, key, data);
+      if (!this.fired && namespace === this.targetNamespace) {
+        this.fired = true;
+        await this.inner.write(namespace, key, this.racingBytes);
+        throw new Error("INJECTED_FAULT_AFTER_RACING_WRITE_LANDED");
+      }
+    }
+    read(namespace: string, key: string): Promise<Uint8Array | null> {
+      return this.inner.read(namespace, key);
+    }
+    delete(namespace: string, key: string, secureOverwrite?: boolean): Promise<boolean> {
+      return this.inner.delete(namespace, key, secureOverwrite);
+    }
+    list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]> {
+      return this.inner.list(namespace, prefix);
+    }
+    exists(namespace: string, key: string): Promise<boolean> {
+      return this.inner.exists(namespace, key);
+    }
+    totalSize(): Promise<number> {
+      return this.inner.totalSize();
+    }
+    listNamespaces(): Promise<string[]> {
+      return (this.inner as MemoryStorage).listNamespaces();
+    }
+  }
+
+  it("a racing writer's bytes on the SAME location the import just wrote are preserved untouched, and the location is reported diverged, never silently reverted or silently kept as the import's own", async () => {
+    const source = await makeSource("race-writer", 1, 0);
+    const bundleDir = await newBundleDir();
+    const exported = await exportBundle(source, bundleDir, "race-writer-ns");
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+
+    const racingBytes = stringToBytes(
+      "ordinary writer's own legitimate value - not the import's, not the pre-image"
+    );
+    const faultStorage = new RaceWriterAfterImportWriteStorage(
+      destinationStorage,
+      "race-writer-ns",
+      racingBytes
+    );
+
+    let caught: unknown;
+    try {
+      await importExitBundle({
+        bundleDir,
+        storage: faultStorage,
+        masterKey: destination.masterKey,
+        identityManager: destination.identityManager,
+        auditLog: destination.auditLog,
+        activate: true,
+        forceRebind: true,
+        sourceRecoveryKey: exported.state_rekey_key,
+        destinationSignerIdentityId: destination.identityId,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(
+      caught instanceof ExitBundleImportError ||
+        caught instanceof ExitBundleStateImportIncompleteError
+    ).toBe(true);
+
+    // The critical assertion: the racing writer's bytes are exactly what
+    // survives - not the pre-image (that would silently discard the
+    // writer's legitimate write) and not the import's own value (there is
+    // none left to compare against; the race overwrote it).
+    const afterRacingWrite = await destinationStorage.read("race-writer-ns", "k0");
+    expect(afterRacingWrite).not.toBeNull();
+    expect(toBase64url(afterRacingWrite!)).toBe(toBase64url(racingBytes));
+
+    // The journal stays in place - a diverged location is reportable, not
+    // silently cleared, matching the SAME rule the separate-process
+    // recovery path (recoverInterruptedExitImportsInner) already enforces
+    // for a diverged result; both paths share ONE restoreStorageSnapshots/
+    // classifyRestoreSafety implementation, so this test's outcome for the
+    // in-process exception path is evidence for that shared path, not a
+    // property proven only in isolation.
+    expect(await destinationStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).not.toHaveLength(0);
+
+    // Everything else the import touched still cleaned up completely -
+    // only the raced location diverges, nothing else is left half-done.
+    // EXIT_IMPORT_JOURNAL_NAMESPACE is deliberately excluded here: it is
+    // the journal itself, asserted non-empty just above (a diverged
+    // result leaves it in place on purpose, the same rule the separate-
+    // process recovery path already enforces).
+    for (const ns of STAGED_ARTIFACT_NAMESPACES) {
+      if (ns === EXIT_IMPORT_JOURNAL_NAMESPACE) continue;
+      expect(await destinationStorage.list(ns)).toHaveLength(0);
+    }
+
+    // A second recovery pass against the SAME storage reports the SAME
+    // diverged location again, deterministically - not a one-shot result
+    // that drifts or clears itself on a retry.
+    const recovery = await recoverInterruptedExitImports(destinationStorage, destination.auditLog);
+    expect(recovery.recovered).toBe(0);
+    expect(recovery.diverged.length).toBeGreaterThan(0);
+    const stillPreserved = await destinationStorage.read("race-writer-ns", "k0");
+    expect(toBase64url(stillPreserved!)).toBe(toBase64url(racingBytes));
+  });
 });

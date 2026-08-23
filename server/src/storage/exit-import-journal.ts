@@ -75,36 +75,59 @@ export class InterruptedExitImportPendingError extends Error {
  * HIGH-B (Codex gate, 2026-08-22, "the final mechanism, authorized"): the
  * check/write gap the journal re-checks (F1) narrow but cannot close - a
  * checked-then-published durable marker still has a window between the
- * check and the publish. `withExitAdmissionLock` makes exactly that step
- * atomic across processes, reusing the proven O_EXCL lock primitive
- * (`withCrossProcessLock`) rather than a new one: acquire, run the
- * check-then-publish-a-durable-marker step, release. Once a marker
- * (the import journal or the rotation journal) is durably on disk, the
- * EXISTING checks (`hasInterruptedExitImport`, a `_meta/ROTATION_JOURNAL_KEY`
- * read) continue to work correctly without holding this lock any longer -
- * this is an ADMISSION lock, not a lock over the whole bulk operation.
+ * check and the publish. `withExitAdmissionLock` makes that step atomic
+ * across processes, reusing the proven O_EXCL lock primitive
+ * (`withCrossProcessLock`) rather than a new one.
+ *
+ * HIGH-1 (Codex gate, 2026-08-22): the lock spans the WHOLE import /
+ * rotation / recovery, not only the check-then-publish step - a short
+ * lock left every write AFTER publish (the rest of the rekey/reputation
+ * loop, or the rest of a rotation's conversion) reachable by a
+ * concurrent recovery pass, which could then match a still-running
+ * import's own writes against their own just-recorded post-images,
+ * classify them safe-restore, and revert a write that import was still
+ * making. Holding the lock for the operation's whole duration is what
+ * makes that impossible: a concurrent open cannot even acquire the lock
+ * until the live operation releases it.
  *
  * Four owners share ONE lock file under the exit-import journal's own
- * namespace: `import` (around writeImportJournal), `rotate`/`resume`
- * (around the first conversion write, core/master-rotation.ts), and
- * `recovery` (for the whole of recoverInterruptedExitImports - a bounded,
- * quick pass, unlike the other three).
+ * namespace: `import` (from the pre-image snapshot through
+ * deleteImportJournal, exit/bundle.ts), `rotate`/`resume` (from the
+ * journal re-check through finalize, core/master-rotation.ts), and
+ * `recovery` (for the whole of recoverInterruptedExitImports).
  *
  * NO AUTO-STALE-BREAK: inherited unchanged from withCrossProcessLock (see
  * that module's header for the #871 TOCTOU lesson this deliberately does
  * not reopen). A stale lock refuses with the SAME operator remediation
  * shape a refused journal already uses - inspect before removing, never
- * remove first.
+ * remove first. A kill while an owner holds this lock therefore leaves
+ * a fortress that refuses to open (via `recovery`'s own lock acquire)
+ * until an operator clears the stale lock file - doctor's admission-lock
+ * check (cli/doctor.ts) surfaces this.
+ *
+ * WHAT THIS LOCK DELIBERATELY DOES NOT COVER (Codex gate HIGH,
+ * 2026-08-23): an ORDINARY StateStore.write() never acquires this lock -
+ * only import/rotate/resume/recovery do. A writer that races journal
+ * publication is detected at recovery, not prevented: post-images are
+ * hashed from the import's own known written bytes at the moment they are
+ * written, never re-derived afterward, so a racing writer's bytes can
+ * never match one, and restoreStorageSnapshots reports the location
+ * diverged rather than restoring it. Widening this lock to every ordinary
+ * write was considered and rejected - it would serialize the whole
+ * fortress behind any in-flight import/rotation/recovery for no
+ * correctness gain the post-image check does not already provide.
  */
 export type ExitAdmissionOwner = "import" | "rotate" | "resume" | "recovery";
 
 const EXIT_ADMISSION_LOCK_FILE = "admission.lock";
 
 /**
- * Bounded wait before an admission-lock contention fails closed. Short by
- * design: the critical section this lock protects is a single
- * check-then-publish step or a bounded recovery pass, never the whole
- * bulk conversion/rekey loop those durable markers otherwise protect.
+ * Bounded wait before an admission-lock contention fails closed. This
+ * bounds how long a CONTENDER waits to acquire, not how long the holder
+ * may run - the holder keeps the lock for its whole operation (see the
+ * doc comment above); a caller that cannot acquire within this window
+ * fails closed rather than waiting indefinitely on a live or crashed
+ * holder.
  */
 const EXIT_ADMISSION_LOCK_TIMEOUT_MS = 10_000;
 

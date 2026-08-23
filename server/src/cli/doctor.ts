@@ -222,14 +222,6 @@ async function checkHermesConfigParser(opts: {
 }
 
 /**
- * Custody-factor orphan check (element 5): WARN before a lockout. If the
- * envelope enrolled an OS-keyring custody factor but the keyring item is GONE,
- * surface a WARN so the operator re-enrolls / confirms their recovery key
- * before they are locked out. A locked/unreachable keyring is inconclusive
- * (no GUI / SSH) and reports OK rather than a false alarm; no enrolled keychain
- * factor is OK (nothing to orphan). Read-only; never unlocks anything.
- */
-/**
  * MEDIUM-D (coordinator gate, 2026-08-22), Codex-tightened: a fortress
  * left with an interrupted exit-import is genuinely BROKEN (a real risk
  * of the LATER data-loss reconciliation `recoverInterruptedExitImportsOrThrow`
@@ -354,6 +346,14 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
+/**
+ * Custody-factor orphan check (element 5): WARN before a lockout. If the
+ * envelope enrolled an OS-keyring custody factor but the keyring item is GONE,
+ * surface a WARN so the operator re-enrolls / confirms their recovery key
+ * before they are locked out. A locked/unreachable keyring is inconclusive
+ * (no GUI / SSH) and reports OK rather than a false alarm; no enrolled keychain
+ * factor is OK (nothing to orphan). Read-only; never unlocks anything.
+ */
 async function checkCustodyFactors(storagePath: string): Promise<DoctorCheck> {
   const storage = new FilesystemStorage(join(storagePath, "state"));
   let result;

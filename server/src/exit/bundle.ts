@@ -14,6 +14,7 @@ import {
   EXIT_IMPORT_JOURNAL_NAMESPACE,
   EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
   withExitAdmissionLock,
+  hasInterruptedExitImport,
 } from "../storage/exit-import-journal.js";
 export { EXIT_IMPORT_JOURNAL_NAMESPACE, EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE };
 import {
@@ -2475,6 +2476,24 @@ function isWellFormedExitImportJournalRecord(
   return true;
 }
 
+/**
+ * Codex gate MEDIUM (2026-08-23): a SHALLOW pre-check run BEFORE
+ * `isWellFormedExitImportJournalRecord`'s full per-element traversal
+ * (`snapshots.every(isWellFormedSerializedStorageSnapshot)`, plus the
+ * namespace-membership check on every element). The cap this function
+ * enforces exists precisely so a journal record cannot force unbounded
+ * per-element work; running the full validation FIRST and only checking
+ * the cap afterward means the length itself already bought an attacker
+ * the full O(N) traversal it was supposed to bound. This function only
+ * trusts `typeof`/`Array.isArray`/`.length` - never a well-formed
+ * element - so it stays cheap regardless of what the array contains.
+ */
+function hasOversizedSnapshotsArray(value: unknown): boolean {
+  if (value === null || typeof value !== "object") return false;
+  const snapshots = (value as Record<string, unknown>).snapshots;
+  return Array.isArray(snapshots) && snapshots.length > MAX_EXIT_IMPORT_JOURNAL_LOCATIONS;
+}
+
 function serializeStorageSnapshot(
   snapshot: StorageSnapshot
 ): SerializedStorageSnapshot {
@@ -2647,6 +2666,32 @@ async function recoverInterruptedExitImportsInner(
       failed.push(entry.key);
       continue;
     }
+    // Codex gate MEDIUM (2026-08-23): the cap check runs BEFORE the full
+    // per-element `isWellFormedExitImportJournalRecord` validation below,
+    // on a SHALLOW read of `snapshots.length` only - see
+    // `hasOversizedSnapshotsArray`'s own doc comment for why running full
+    // validation first would defeat the point of having a cap at all.
+    // `identity_id`/`import_id`/`snapshots.length` are read loosely here
+    // (this record has not been shape-validated yet) with safe fallbacks,
+    // since a hand-crafted or corrupted record is exactly the case this
+    // branch exists to catch.
+    if (hasOversizedSnapshotsArray(parsed)) {
+      const loose = parsed as Record<string, unknown>;
+      const looseSnapshots = loose.snapshots as unknown[];
+      failed.push(entry.key);
+      void auditLog.append(
+        "l1",
+        "exit_bundle_recovery_journal_too_large",
+        typeof loose.identity_id === "string" ? loose.identity_id : "unknown",
+        {
+          import_id: typeof loose.import_id === "string" ? loose.import_id : entry.key,
+          snapshot_count: looseSnapshots.length,
+          max_allowed: MAX_EXIT_IMPORT_JOURNAL_LOCATIONS,
+        },
+        "failure"
+      );
+      continue;
+    }
     // G-4 (coordinator gate, 2026-08-22): a malformed journal entry
     // (`{}`, a non-string `data`, a missing array) must route to `failed`
     // like any other unrecoverable entry, never throw a raw TypeError out
@@ -2656,28 +2701,6 @@ async function recoverInterruptedExitImportsInner(
       continue;
     }
     const record = parsed;
-    // Codex addendum (2026-08-22): enforce the SAME cap the writer side
-    // advertises (MAX_EXIT_IMPORT_JOURNAL_LOCATIONS, checked before any
-    // journal write) on the READ side too - a journal whose own snapshot
-    // count exceeds it did not come from this import path honoring its
-    // own bound (corrupted, hand-crafted, or a future writer bug), and
-    // must not be trusted to restore/diverge-check an unbounded number of
-    // locations.
-    if (record.snapshots.length > MAX_EXIT_IMPORT_JOURNAL_LOCATIONS) {
-      failed.push(entry.key);
-      void auditLog.append(
-        "l1",
-        "exit_bundle_recovery_journal_too_large",
-        record.identity_id,
-        {
-          import_id: record.import_id,
-          snapshot_count: record.snapshots.length,
-          max_allowed: MAX_EXIT_IMPORT_JOURNAL_LOCATIONS,
-        },
-        "failure"
-      );
-      continue;
-    }
     // INVARIANT (kill-during-promote-and-delete case, coordinator gate,
     // 2026-08-22): a kill AFTER the final `activated_at`-stamped import
     // record is written but BEFORE this journal entry is deleted leaves a
@@ -2763,12 +2786,14 @@ async function recoverInterruptedExitImportsInner(
 }
 
 /**
- * HIGH-B (Codex gate, 2026-08-22): the whole of recovery runs under the
- * exit-admission lock, not just a check-then-publish step - unlike import
- * and rotation, recovery IS the bounded critical section (read the
- * journal, restore or diverge, delete or leave it), so locking its whole
- * duration is cheap and closes a concurrent import/rotation racing a
- * concurrent recovery pass on the same journal.
+ * HIGH-B / HIGH-1 (Codex gate, 2026-08-22): the whole of recovery runs
+ * under the exit-admission lock - the SAME lock import and rotation now
+ * also hold for their whole operation (see withExitAdmissionLock's own
+ * doc comment). Recovery's own critical section (read the journal,
+ * restore or diverge, delete or leave it) is bounded and quick
+ * regardless, so locking its whole duration is cheap; it closes a
+ * concurrent import/rotation racing a concurrent recovery pass on the
+ * same journal.
  */
 export async function recoverInterruptedExitImports(
   storage: StorageBackend,
@@ -3786,6 +3811,22 @@ export async function importExitBundle(
         "(`sanctuary rotate-master --resume`) before importing an exit bundle"
     );
   }
+  // Codex addendum (2026-08-23): symmetric with rotate/resume's own
+  // in-lock hasInterruptedExitImport re-check (core/master-rotation.ts) -
+  // a DIFFERENT exit-import's journal (still in flight, or crashed and
+  // undrained) landing in the gap between this import's own top-of-function
+  // recovery call and reaching this lock is the same class of race those
+  // two checks close for a rotation. The "at most one journal" invariant
+  // (recoverInterruptedExitImportsInner) means this should never actually
+  // fire in normal use; it is here so a violation is refused, not raced.
+  if (await hasInterruptedExitImport(opts.storage)) {
+    throw new ExitBundleImportError(
+      "CONCURRENT_IMPORT_IN_PROGRESS",
+      "another exit-import journal already exists for this fortress; run " +
+        "any `sanctuary exit` verb (for example `sanctuary exit verify`) " +
+        "to recover, then retry"
+    );
+  }
   await writeImportJournal(
     opts.storage,
     importId,
@@ -3822,14 +3863,26 @@ export async function importExitBundle(
   const ownsSourceKey = !opts.sourceMasterKey;
   let stateRekeyStarted = false;
   try {
-    // F1 (coordinator gate, 2026-08-22), kept as defense in depth under
-    // HIGH-B's admission lock: the check-then-publish above now runs
-    // atomically under the lock, so this second read only catches a
-    // rotation that lands in the brief gap between the lock's release and
-    // this line - not the race the lock closes. Thrown from inside the try
-    // block so the catch below runs its normal cleanup: nothing has been
-    // staged yet, so every snapshot is safe-noop and the journal this
-    // import just wrote is deleted, not left stuck.
+    // Self-correction (2026-08-23): an earlier pass THIS round deleted
+    // this check as "provably redundant" under the reasoning that nothing
+    // can write `_meta/rotation-journal` while this import holds the
+    // admission lock. That reasoning does not hold: the top-of-function
+    // rotation check (before verification, well before this import
+    // acquires the admission lock) and THIS import's own journal write
+    // (writeImportJournal, above, inside the lock) bracket a window in
+    // which a rotation can have already passed ITS OWN preflight (finding
+    // no import journal, since none existed yet) and be racing this
+    // import for the SAME admission lock; whichever loses that race is
+    // NOT necessarily refused outright - see F1's own re-check discipline
+    // above for the symmetric case. The existing test "F1 re-check: a
+    // rotation journal that appears DURING this import's own journal
+    // write is caught..." (exit-import-atomic-activation.test.ts) plants
+    // exactly this interleaving and FAILED once this check was removed,
+    // which is definitive proof it is live, not dead code. Restored
+    // verbatim in effect; kept as defense in depth under HIGH-B's
+    // admission lock, this second read catches a rotation whose own
+    // journal write raced in during the window described above - a
+    // narrower gap than the one the lock closes, not the same one.
     if (await opts.storage.read("_meta", ROTATION_JOURNAL_KEY)) {
       throw new ExitBundleImportError(
         "ROTATION_IN_PROGRESS",
@@ -4060,8 +4113,36 @@ export async function importExitBundle(
       verified_at: verification.verified_at,
       activated_at: new Date().toISOString(),
     });
-    await deleteImportJournal(opts.storage, importId);
+    // Codex gate HIGH (2026-08-23): audit flush runs BEFORE
+    // deleteImportJournal, not after - the flush is a fallible step that
+    // must still be able to trigger the catch block's rollback below
+    // (with the journal AND its post-images fully intact, a rollback here
+    // is correct: the import is treated as not-yet-durable until its
+    // audit trail is too). deleteImportJournal is the LAST thing this
+    // function does and is the true commit boundary: by the time it
+    // runs, `activated_at` is durable AND the audit trail is flushed, so
+    // its own failure must never route through the outer catch's
+    // rollback - `recoverInterruptedExitImportsInner`'s "alreadyActivated"
+    // check is what makes leaving a stale journal here safe: the NEXT
+    // open finds `activated_at` already stamped and deletes the leftover
+    // journal without restoring anything.
     await opts.auditLog.flush();
+    try {
+      await deleteImportJournal(opts.storage, importId);
+    } catch (deleteErr) {
+      void opts.auditLog.append(
+        "l1",
+        "exit_bundle_journal_delete_failed_after_commit",
+        manifest.body.identity_binding.identity_id,
+        {
+          import_id: importId,
+          original_error:
+            deleteErr instanceof Error ? deleteErr.message : String(deleteErr),
+        },
+        "failure"
+      );
+      void opts.auditLog.flush().catch(() => {});
+    }
   } catch (err) {
     const cleanup = await restoreStorageSnapshots(
       opts.storage,

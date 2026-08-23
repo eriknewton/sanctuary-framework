@@ -164,13 +164,26 @@ export async function withPathLock<T>(
   for (;;) {
     try {
       const handle = await open(lockPath, "wx", 0o600);
-      // MEDIUM (Codex gate, 2026-08-22): the O_EXCL create SUCCEEDED at
-      // this point, so this process (uniquely) owns the lock file - a
-      // failure writing/syncing its metadata below is NOT a contention
-      // signal (that is the outer catch's EEXIST branch) and must not
-      // leave an empty, ownerless lock file wedging every future
-      // acquire with no diagnostic content to explain why. Unlink what
-      // this process itself just created before rethrowing.
+      // MEDIUM (Codex gate, 2026-08-22 / 2026-08-23): the O_EXCL create
+      // SUCCEEDED at this point, so this process (uniquely) owns the lock
+      // file - a failure writing/syncing its metadata, OR a failure in
+      // handle.close() itself (even after a clean write/sync), is NOT a
+      // contention signal (that is the outer catch's EEXIST branch) and
+      // must not leave an empty or orphaned lock file wedging every
+      // future acquire. Both stages are tried independently (never a bare
+      // try/finally around close, which would let a close() throw
+      // silently discard an earlier write/sync error) so the unlink runs
+      // whichever stage failed, and BOTH errors are preserved in the
+      // thrown message when both occur.
+      //
+      // COOPERATIVE-OWNER ASSUMPTION: the unlink below trusts that nothing
+      // else has replaced this exact path between this process's own
+      // O_EXCL create and this cleanup - true here because O_EXCL makes
+      // this process the unique owner of the path until it unlinks (this
+      // module has no auto-stale-break, so no contender can have taken
+      // over in between); a lock primitive that DID stale-break would need
+      // a liveness re-check here before unlinking.
+      let writeSyncErr: unknown;
       try {
         await handle.writeFile(
           JSON.stringify({
@@ -180,21 +193,42 @@ export async function withPathLock<T>(
           }),
         );
         await handle.sync();
-      } catch (metadataErr) {
+      } catch (err) {
+        writeSyncErr = err;
+      }
+      let closeErr: unknown;
+      try {
         await handle.close();
-        await rm(lockPath, { force: true });
+      } catch (err) {
+        closeErr = err;
+      }
+      if (writeSyncErr !== undefined || closeErr !== undefined) {
+        let unlinkErr: unknown;
+        try {
+          await rm(lockPath, { force: true });
+        } catch (err) {
+          unlinkErr = err;
+        }
+        const causes = [
+          writeSyncErr !== undefined
+            ? `metadata write/sync: ${errorMessage(writeSyncErr)}`
+            : null,
+          closeErr !== undefined ? `handle close: ${errorMessage(closeErr)}` : null,
+        ].filter((cause): cause is string => cause !== null);
         throw new CrossProcessLockError(
-          `cross-process lock (${lockPath}) was created but its metadata could ` +
-            `not be written, so the empty lock file was removed rather than left ` +
-            `stuck: ${errorMessage(metadataErr)}`,
+          `cross-process lock (${lockPath}) was created but could not be ` +
+            `finalized (${causes.join("; ")}), so the lock file was ` +
+            (unlinkErr === undefined
+              ? `removed rather than left stuck.`
+              : `ALSO left behind - a follow-up removal attempt failed too ` +
+                `(${errorMessage(unlinkErr)}); remove it manually: rm '${lockPath}'.`),
         );
       }
-      await handle.close();
       break;
     } catch (err) {
-      // The metadata-write branch above already unlinked its own orphan
-      // and threw a fully-formed CrossProcessLockError - pass it straight
-      // through instead of re-wrapping it a second time.
+      // The finalize branch above (write/sync/close) already unlinked its
+      // own orphan and threw a fully-formed CrossProcessLockError - pass
+      // it straight through instead of re-wrapping it a second time.
       if (err instanceof CrossProcessLockError) throw err;
       const code =
         err instanceof Error && "code" in err

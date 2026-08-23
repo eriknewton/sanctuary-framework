@@ -649,16 +649,6 @@ type DisclosureWithoutVerifiedReadFields = [
   ? UnattributedStateDisclosure
   : never;
 
-/** Options for state write */
-/**
- * HIGH-A (Codex gate, 2026-08-22, register id EXIT-JOURNAL-DIVERGE-01):
- * called synchronously with the EXACT bytes a raw storage write is about
- * to persist, for a location this write touches (the main entry, or
- * a `_meta` side effect). The exit-import module's own writer uses this to
- * record its post-image from what it KNOWS it wrote, never from a re-read
- * of storage after the fact - a re-read cannot tell this write's own bytes
- * from a different writer's bytes landing in the same instant.
- */
 /**
  * HIGH (Codex gate, 2026-08-22): a caller-supplied box letting a BATCH of
  * writes (the exit-import module's rekeyState loop is the only caller
@@ -671,12 +661,29 @@ type DisclosureWithoutVerifiedReadFields = [
  * floor and cleared by flushVersionAnchorsCache. The cache is scoped to
  * ONE caller's batch (never shared across callers) - `write()` and
  * `flushVersionAnchorsCache` are the only two places that touch it.
+ * Another in-process StateStore instance reading the on-disk version
+ * anchors while this cache is dirty (pre-flush) sees a stale floor for
+ * the entries this batch has touched so far; that is safe because an
+ * ordinary write from that other instance is refused outright while this
+ * import's journal exists (N4 above), and the read-side anchor-mismatch
+ * raise is gated off for the exit-import module's own reads for the same
+ * reason - there is no write or read in that window that would act on
+ * the stale floor.
  */
 export interface VersionAnchorsCache {
   anchors: Record<string, unknown> | null;
   dirty: boolean;
 }
 
+/**
+ * HIGH-A (Codex gate, 2026-08-22, register id EXIT-JOURNAL-DIVERGE-01):
+ * called synchronously with the EXACT bytes a raw storage write is about
+ * to persist, for a location this write touches (the main entry, or
+ * a `_meta` side effect). The exit-import module's own writer uses this to
+ * record its post-image from what it KNOWS it wrote, never from a re-read
+ * of storage after the fact - a re-read cannot tell this write's own bytes
+ * from a different writer's bytes landing in the same instant.
+ */
 type RawWriteObserver = (
   namespace: string,
   key: string,
@@ -707,6 +714,7 @@ async function runRawWriteObserver(
   }
 }
 
+/** Options for state write */
 export interface WriteOptions {
   content_type?: string;
   ttl_seconds?: number;
@@ -1773,16 +1781,31 @@ export class StateStore {
     // bytes match the import's own recorded post-image, otherwise it
     // reports diverged and leaves it untouched); this refusal stays the
     // first line of defense so a legitimate write is never even put in
-    // that position. `rekeyState` (exit/bundle.ts) is the one legitimate
-    // caller that writes while its OWN journal is present and passes
-    // `allowDuringOwnExitImportActivation` to skip this; every other
-    // caller is refused while ANY journal exists. RESIDUAL BOUND: the
-    // check-then-write gap this refusal itself has is closed by the
-    // fortress-wide admission lock around journal publication (HIGH-B,
-    // Codex gate, 2026-08-22) for the rotation/import ordering race
-    // specifically; a lock-acquire timeout still fails this operation
-    // closed rather than proceeding, which is an availability, not a
-    // correctness, trade-off.
+    // that position. The exit-import module's own state-rekey path is the
+    // one legitimate caller that writes while its OWN journal is present
+    // and passes `allowDuringOwnExitImportActivation` to skip this; every
+    // other caller is refused while ANY journal exists. RESIDUAL BOUND:
+    // the check-then-write gap this refusal itself has is closed by the
+    // fortress-wide admission lock the exit-import module now holds for
+    // its whole import / rotation / recovery (HIGH-1/HIGH-B, Codex gate,
+    // 2026-08-22), for the rotation/import ordering race specifically; a
+    // lock-acquire timeout still fails this operation closed rather than
+    // proceeding, which is an availability, not a correctness, trade-off.
+    // A DIFFERENT residual is deliberately NOT closed by widening this
+    // lock: an ordinary writer that reads this check as false (no journal
+    // yet), then does async work, while an import's own check/lock/
+    // snapshot/publish runs and completes, then finally commits its write
+    // - a writer that races journal publication is detected at recovery,
+    // not prevented. That writer's committed bytes can never match the
+    // import's own recorded post-image for that location (post-images are
+    // hashed from the import's own KNOWN written bytes, never a re-read of
+    // storage, per HIGH-1/HIGH-A above), so restoreStorageSnapshots
+    // classifies the location diverged and leaves it untouched on both the
+    // in-process exception-path rollback and the separate-process recovery
+    // path (recoverInterruptedExitImportsInner) - they share ONE
+    // classifyRestoreSafety implementation. Proven deterministically by
+    // "Codex gate HIGH (2026-08-23): an ordinary writer racing journal
+    // publication..." in test/exit/exit-import-atomic-activation.test.ts.
     if (
       !options.allowDuringOwnExitImportActivation &&
       (await hasInterruptedExitImport(this.storage))
