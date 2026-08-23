@@ -242,18 +242,10 @@ export async function createSanctuaryServer(options?: {
   // 5. Initialize audit log
   const auditLog = new AuditLog(storage, masterKey);
 
-  // 5b. G-2 (coordinator gate, 2026-08-22): roll back any exit-import
-  // left interrupted by a prior hard kill on THIS fortress BEFORE any other
-  // subsystem below reads or writes storage - including before the
-  // anti-rollback cross-check right after this, so that check evaluates
-  // the RECOVERED state, not a half-applied one. Without this, the MCP
-  // server could boot on a half-applied target, accumulate days of
-  // legitimate writes, and then have a LATER `sanctuary exit verify`/
-  // `import` silently reconcile (delete/overwrite) some of them via the
-  // durable journal replay. `recoverInterruptedExitImportsOrThrow` stops
-  // boot outright (a partial/unparseable rollback is worse than refusing
-  // to start) rather than let the server run against storage it cannot
-  // vouch for.
+  // 5b. G-2 (coordinator gate, 2026-08-22): roll back any interrupted
+  // exit-import BEFORE any other subsystem below reads or writes storage,
+  // and refuse to boot if that rollback cannot be confirmed complete
+  // (register id EXIT-JOURNAL-DIVERGE-01).
   await recoverInterruptedExitImportsOrThrow(storage, auditLog);
 
   // 5rb. Anti-rollback Stage 1 boot cross-check. Compare the on-disk custody

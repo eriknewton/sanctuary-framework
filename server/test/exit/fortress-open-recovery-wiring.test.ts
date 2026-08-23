@@ -106,7 +106,7 @@ const ALLOWLIST: Record<string, string> = {
   "src/cli/audit-chain-repair-plan.ts": "read-only repair-PLAN verb (proposes a plan, does not apply one); not wired this fix round.",
   "src/cli/memory-file.ts": "memory-file verb; not wired this fix round, same bounded-scope reason.",
   "src/cli/did-web.ts": "did-web verb family, multiple AuditLog sites; not wired this fix round.",
-  "src/cli/file-grant.ts": "read-only file-grant verb; not wired this fix round.",
+  "src/cli/file-grant.ts": "ITEM-2 (coordinator gate, 2026-08-22): corrected from a false \"read-only\" claim - mint/revoke write a grant via FileGrantStore.put, which routes through StateStore.write (N4-guarded, refuses while a journal exists); not wired to recoverInterruptedExitImportsOrThrow itself this fix round.",
   "src/cli/cortex-export.ts": "cortex-export verb; not wired this fix round, same bounded-scope reason.",
   "src/cli/audit.ts": "read-only audit verb; not wired this fix round.",
   "src/cli/castle-wall-boot.ts": "castle-wall boot-install verb; not wired this fix round, same bounded-scope reason.",
@@ -126,6 +126,7 @@ const ALLOWLIST: Record<string, string> = {
   "src/cli/federation-operator-signing.ts": "N1 (coordinator gate, 2026-08-22): derives a master key with no local AuditLog; not wired this fix round, same bounded-scope reason.",
   "src/cli/custody-unlock.ts": "N1 (coordinator gate, 2026-08-22): derives a master key with no local AuditLog; not wired this fix round, same bounded-scope reason.",
   "src/cli/doctor.ts": "deliberate exception, documented at resolveMasterKeyIfAvailable's own STATED BOUND comment: every check in this file is read-only and never-aborting by design, so it never calls the writing recovery path even where it derives a master key. Its own journal-presence check (checkInterruptedExitImport) is read-only and needs no credential.",
+  "src/cli/rotate-master.ts": "ITEM-1 (coordinator gate, 2026-08-22): not wired to recoverInterruptedExitImportsOrThrow (auto-recover-then-proceed) - rotateMaster/resumeRotation (core/master-rotation.ts) instead REFUSE outright via hasInterruptedExitImport while a journal exists, a deliberately stricter choice for an irreversible Tier-1 operation than silently recovering and continuing. See the N4-ROTATE preflight checks in both entry points.",
 };
 
 describe("structural pin: every named fortress-open call site routes through recoverInterruptedExitImportsOrThrow", () => {
@@ -136,8 +137,14 @@ describe("structural pin: every named fortress-open call site routes through rec
   // requirement missed exactly this shape (cli/identity.ts, doctor.ts,
   // federation-operator-signing.ts, custody-unlock.ts all derive a master
   // key with no local AuditLog).
+  //
+  // ITEM-1 (coordinator gate, 2026-08-22): also missed a file that unlocks
+  // the master indirectly, by calling into master-rotation.ts's own entry
+  // points, which derive it internally (cli/rotate-master.ts constructs
+  // storage and calls rotateMaster/resumeRotation, neither an AuditLog nor
+  // one of the three names above).
   const MASTER_KEY_DERIVATION_RE =
-    /resolveCliMasterKey\(|deriveFortressMasterKey\(|resolveMasterKey\(/;
+    /resolveCliMasterKey\(|deriveFortressMasterKey\(|resolveMasterKey\(|rotateMaster\(|resumeRotation\(/;
   const candidates = listTsFiles(srcDir)
     .map(toRelSrcPath)
     .filter((relPath) => {

@@ -69,6 +69,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import type { StorageBackend } from "../storage/interface.js";
+import { hasInterruptedExitImport } from "../storage/exit-import-journal.js";
 import {
   encrypt,
   decrypt,
@@ -474,6 +475,19 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
     reason:
       "castle-wall IPC frames are runtime artifacts; stop the daemon and " +
       "clear the namespace before rotating. " + UNSUPPORTED_DEFERRAL,
+  },
+  // N4-ROTATE (coordinator gate, 2026-08-22): explicit, not the underscore
+  // fallback below - this namespace holds the exit-import writer guard's
+  // own rollback records. The preflight refusal above
+  // (hasInterruptedExitImport) is what stops rotation while it exists;
+  // this entry keeps rotation from treating the journal's own bytes as
+  // ordinary state independently of that check.
+  _exit_import_journal: {
+    kind: "unsupported",
+    reason:
+      "holds the exit-import writer guard's own rollback journal; rotation " +
+      "is refused outright while one exists (see the preflight check), " +
+      "never partially applied to it. " + UNSUPPORTED_DEFERRAL,
   },
 };
 
@@ -1656,6 +1670,21 @@ export async function rotateMaster(
     );
   }
 
+  // N4-ROTATE (coordinator gate, 2026-08-22): rotation re-encrypts every
+  // "state"-classified namespace and re-stamps `_meta` MAC records by
+  // writing directly to storage (the writer guard's chokepoints - the state
+  // and reputation stores' write paths - are not on this path at all).
+  // Those are exactly the journal-set locations a pending exit-import
+  // journal can later restore, so run this the same way the two mutual-
+  // exclusion checks above do: refuse before any conversion begins.
+  if (await hasInterruptedExitImport(storage)) {
+    throw new RotationPreflightError(
+      "an exit-import rollback journal exists for this fortress, meaning an " +
+        "import is in progress or pending recovery; run any `sanctuary exit` " +
+        "verb (for example `sanctuary exit verify`) to recover, then retry"
+    );
+  }
+
   // Mutual exclusion with the federation rotate-root journal (Slice 3a). A
   // federation signing-master rotation re-keys the _federation/trust-root-v1
   // payload; running a custody rotation concurrently could re-encrypt a
@@ -1880,6 +1909,21 @@ export async function rotateMaster(
     await writeJournal(storage, journal, newMaster);
     failpoint("journal-converting-written");
 
+    // HIGH-2 (Codex gate, 2026-08-22): re-check immediately before the
+    // first actual conversion write, not only at the top-level preflight -
+    // an exit-import can start and journal AFTER preflight passed but
+    // BEFORE this point. No lock; this narrows the race window to
+    // "between this check and the write immediately after it" rather than
+    // eliminating it structurally.
+    if (await hasInterruptedExitImport(storage)) {
+      throw new RotationPreflightError(
+        "an exit-import rollback journal exists for this fortress, meaning " +
+          "an import started after this rotation's preflight passed; run " +
+          "any `sanctuary exit` verb (for example `sanctuary exit verify`) " +
+          "to recover, then retry the rotation"
+      );
+    }
+
     log("Converting: re-encrypting fortress data under the new master...");
     const convertResult = await walkFortress(ctx, false);
     await convertAuditEpochs(ctx);
@@ -1921,6 +1965,18 @@ export async function resumeRotation(
 ): Promise<RotateMasterResult> {
   const storage = opts.storage;
   const log = opts.log ?? (() => {});
+
+  // N4-ROTATE (coordinator gate, 2026-08-22): same refusal as rotateMaster's
+  // preflight - a resume also converts and writes journal-set locations
+  // directly, outside the writer guard's chokepoints.
+  if (await hasInterruptedExitImport(storage)) {
+    throw new RotationResumeError(
+      "an exit-import rollback journal exists for this fortress, meaning an " +
+        "import is in progress or pending recovery; run any `sanctuary exit` " +
+        "verb (for example `sanctuary exit verify`) to recover, then retry"
+    );
+  }
+
   const rawJournal = await storage.read("_meta", ROTATION_JOURNAL_KEY);
   if (!rawJournal) {
     throw new RotationResumeError(

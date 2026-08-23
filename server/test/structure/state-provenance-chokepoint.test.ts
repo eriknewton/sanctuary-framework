@@ -124,9 +124,9 @@ function isAllowedDynamicWrite(call: WriteCall): boolean {
     },
     {
       path: "server/src/exit/bundle.ts",
-      context: "for (const snapshot of snapshots)",
+      context: "if (snapshot.data) {",
       reason:
-        "exit activation rollback (restoreStorageSnapshots) restores byte-identical pre-activation snapshots that already carry their original Slice-2 provenance; routing through StateStore.write would re-mint and corrupt the byte-for-byte rollback the atomicity guarantee requires",
+        "exit activation rollback (restoreStorageSnapshots) restores byte-identical pre-activation snapshots that already carry their original Slice-2 provenance; routing through StateStore.write would re-mint and corrupt the byte-for-byte rollback the atomicity guarantee requires. HIGH-1 (Codex gate, 2026-08-22): the write is now reached only after a post-image-confirmed divergence check (classifyRestoreSafety), not unconditionally.",
     },
     {
       path: "server/src/transparency/anchoring.ts",

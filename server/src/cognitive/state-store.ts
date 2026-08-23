@@ -665,15 +665,14 @@ export interface WriteOptions {
     derived_from?: readonly DerivedFromEdge[];
   };
   /**
-   * N4 (coordinator gate, 2026-08-22): bypasses the pending-exit-import
-   * write refusal below. Not for general use - the only legitimate caller
-   * is the exit-import module's own state-rekey path, which writes state
-   * entries while its own not-yet-cleaned-up journal is present on disk
-   * (the journal is written before staging and deleted only after
-   * activation fully succeeds, so it exists for the entire duration of
-   * the import that owns it). Every other caller is refused while any
-   * journal exists, including a journal left by a different, interrupted
-   * import.
+   * N4 (coordinator gate, 2026-08-22): a scoped opt-out of the
+   * pending-exit-import write refusal below, for the one call path that
+   * legitimately writes while its own journal exists. CAPABILITY BOUND
+   * (Codex gate MEDIUM, 2026-08-22): this is a plain boolean, not an
+   * authenticator - any in-process caller can pass it, so it narrows the
+   * refusal's guarantee to "an external caller cannot forge this without
+   * also being trusted to construct WriteOptions in the first place," not
+   * a cryptographic proof of which module is calling.
    */
   allowDuringOwnExitImportActivation?: boolean;
 }
@@ -2320,10 +2319,22 @@ export class StateStore {
     // durable effect already gates on, so a read still returns its value
     // while a journal is pending; it just stops persisting the migration or
     // raising the anchor until recovery clears it.
+    //
+    // Codex gate MEDIUM (2026-08-22): a read must never fail BECAUSE this
+    // check itself could not run - a `storage.list()` error here skips the
+    // durable side effect (the safe default) rather than throwing out of
+    // read(), which would turn "the guard couldn't confirm" into "the read
+    // failed."
+    let journalMaybePending: boolean;
+    try {
+      journalMaybePending = await hasInterruptedExitImport(this.storage);
+    } catch {
+      journalMaybePending = true;
+    }
     const durableSideEffectsPermitted =
       signatureVerified &&
       options.unattributedDisclosure !== true &&
-      !(await hasInterruptedExitImport(this.storage));
+      !journalMaybePending;
 
     // Decrypt
     const namespaceKey = this.getNamespaceKey(namespace);
@@ -2900,6 +2911,13 @@ export class StateStore {
           // conflictResolution === "overwrite" falls through
         }
 
+        // Codex gate finding (2026-08-22): re-check per write, not once at
+        // the top of import() for the whole loop - a bulk import can run
+        // long enough for a journal to appear after the top-level check
+        // already passed.
+        if (await hasInterruptedExitImport(this.storage)) {
+          throw new InterruptedExitImportPendingError(`state_import:${ns}/${key}`);
+        }
         // Write the entry
         const serialized = stringToBytes(JSON.stringify(entry));
         await this.storage.write(ns, key, serialized);
@@ -2928,6 +2946,11 @@ export class StateStore {
           !importedNamespaceSet.has(markerRecord.namespace)
         ) {
           continue;
+        }
+        if (await hasInterruptedExitImport(this.storage)) {
+          throw new InterruptedExitImportPendingError(
+            `state_import_facade_marker:${record.key}`
+          );
         }
         await this.storage.write(
           FACADE_HIDDEN_MARKER_NAMESPACE,

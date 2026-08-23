@@ -45,7 +45,10 @@ import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interfa
 import { generateRandomKey } from "../../src/core/random.js";
 import { toBase64url, stringToBytes } from "../../src/core/encoding.js";
 import { resolveCliMasterKey } from "../../src/core/master-custody.js";
-import { StateStore } from "../../src/cognitive/state-store.js";
+import {
+  StateStore,
+  STATE_ENVELOPE_VERSION_ANCHORS_KEY,
+} from "../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { createReputationTools } from "../../src/reputation/tools.js";
@@ -439,8 +442,8 @@ describe("F1: durable rollback journal - in-process fault injection at each stag
   it("HIGH-A (coordinator gate, 2026-08-22, register id EXIT-JOURNAL-CONFINE-01): a journal carrying an unsupported key is rejected outright, never replayed - _meta/_identities stay untouched", async () => {
     const destination = await makeDestination();
     const destinationStorage = destination.storage as MemoryStorage;
-    // Plant real data in _meta and _identities so a wipe would be
-    // directly observable, not just inferred from a count.
+    // Canary data so a content check, not just a count, proves these
+    // namespaces stay untouched.
     await destinationStorage.write("_meta", "canary-meta-key", stringToBytes("canary-meta-value"));
     await destinationStorage.write(
       "_identities",
@@ -847,10 +850,30 @@ describe("F1: a real child-process SIGKILL mid-import leaves the target unable t
       const reopenedAuditLog = new AuditLog(reopenedStorage, targetMasterKey);
       const recovery = await recoverInterruptedExitImports(reopenedStorage, reopenedAuditLog);
       await reopenedAuditLog.flush();
-      const afterRecovery = await snapshotFilesystem(reopenedStorage);
-      expect(afterRecovery).toBe(beforeKill);
-      expect(recovery.recovered).toBe(1);
-      expect(recovery.failed).toEqual([]);
+      // HIGH-1 (Codex gate, 2026-08-22, register id EXIT-JOURNAL-DIVERGE-01):
+      // a real SIGKILL's timing is not fully controlled by this test (only
+      // "after a reputation write is observed"), so the kill CAN now land
+      // in the narrow window between a write committing and this same
+      // import's own post-image record for that write reaching disk - the
+      // residual gap the no-lock design explicitly does not close. Recovery
+      // must never silently discard that write: either it confirms the
+      // write was its own (clean, byte-identical recovery) or it reports
+      // the location diverged and leaves it untouched, never a third
+      // silent outcome.
+      if (recovery.failed.length === 0) {
+        const afterRecovery = await snapshotFilesystem(reopenedStorage);
+        expect(afterRecovery).toBe(beforeKill);
+        expect(recovery.recovered).toBe(1);
+      } else {
+        expect(recovery.diverged.length).toBeGreaterThan(0);
+        expect(recovery.recovered).toBe(0);
+        // The journal is deliberately left in place on a diverged result
+        // (recoverInterruptedExitImportsOrThrow is what a real fortress
+        // open route enforces on top of this); assert it is still there,
+        // not silently dropped.
+        expect(await reopenedStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).not.toHaveLength(0);
+        return;
+      }
 
       // MEDIUM (coordinator gate, 2026-08-22): idempotency - a SECOND
       // recovery call against the now-clean fortress (simulating a second
@@ -860,7 +883,7 @@ describe("F1: a real child-process SIGKILL mid-import leaves the target unable t
         reopenedStorage,
         reopenedAuditLog
       );
-      expect(secondRecovery).toEqual({ recovered: 0, failed: [] });
+      expect(secondRecovery).toEqual({ recovered: 0, failed: [], diverged: [] });
       expect(await snapshotFilesystem(reopenedStorage)).toBe(beforeKill);
 
       // Now prove the SECOND half of F1's fix: a subsequent CLEAN import
@@ -1085,5 +1108,111 @@ describe("N4 (coordinator gate, 2026-08-22): write chokepoints refuse while an e
       conflict_resolution: "overwrite",
     });
     expect(succeeded.error).toBeUndefined();
+  });
+
+  it("plants a real recoverable journal (a location whose current bytes already match the pre-image), runs recoverInterruptedExitImportsOrThrow directly, then a write succeeds", async () => {
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+
+    // Pre-existing bytes at a location the journal snapshots - captured
+    // AFTER the write, so the journal's pre-image byte-for-byte matches
+    // what is actually on disk right now (a genuine "nothing changed since"
+    // no-op restore), not a placeholder that would trip HIGH-1's
+    // divergence check.
+    await callTool(destination.tools, "state_write", {
+      namespace: "n4-recover-ns",
+      key: "k",
+      value: "pre-journal value",
+      identity_id: destination.identityId,
+    });
+    const actualCurrentBytes = await destinationStorage.read("n4-recover-ns", "k");
+
+    const journalRecord = {
+      import_id: "planted-n4-real-recovery",
+      identity_id: destination.identityId,
+      started_at: new Date().toISOString(),
+      snapshots: [
+        {
+          namespace: "n4-recover-ns",
+          key: "k",
+          data: actualCurrentBytes ? toBase64url(actualCurrentBytes) : null,
+          post_image_hash: null,
+        },
+      ],
+    };
+    await destinationStorage.write(
+      EXIT_IMPORT_JOURNAL_NAMESPACE,
+      "planted-n4-real-recovery",
+      stringToBytes(JSON.stringify(journalRecord))
+    );
+
+    const refusedBeforeRecovery = await callTool(destination.tools, "state_write", {
+      namespace: "n4-recover-ns",
+      key: "k2",
+      value: "should still be refused",
+      identity_id: destination.identityId,
+    });
+    expect(refusedBeforeRecovery.error).toBe("exit_import_pending_recovery");
+
+    const result = await recoverInterruptedExitImportsOrThrow(
+      destinationStorage,
+      destination.auditLog
+    );
+    expect(result.recovered).toBe(1);
+    expect(await destinationStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
+
+    const succeeded = await callTool(destination.tools, "state_write", {
+      namespace: "n4-recover-ns",
+      key: "k2",
+      value: "written after real recovery",
+      identity_id: destination.identityId,
+    });
+    expect(succeeded.error).toBeUndefined();
+    expect(await destinationStorage.exists("n4-recover-ns", "k2")).toBe(true);
+  });
+
+  it("N4-READ: state_read returns the value with no `_meta` version-anchor write while a journal exists", async () => {
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+
+    const written = await callTool(destination.tools, "state_write", {
+      namespace: "n4-read-ns",
+      key: "k",
+      value: "readable while a journal is pending",
+      identity_id: destination.identityId,
+    });
+    expect(written.error).toBeUndefined();
+
+    const anchorBefore = await destinationStorage.read(
+      "_meta",
+      STATE_ENVELOPE_VERSION_ANCHORS_KEY
+    );
+
+    const journalRecord = {
+      import_id: "planted-n4-read",
+      identity_id: destination.identityId,
+      started_at: new Date().toISOString(),
+      snapshots: [],
+    };
+    await destinationStorage.write(
+      EXIT_IMPORT_JOURNAL_NAMESPACE,
+      "planted-n4-read",
+      stringToBytes(JSON.stringify(journalRecord))
+    );
+
+    const read = await callTool(destination.tools, "state_read", {
+      namespace: "n4-read-ns",
+      key: "k",
+      identity_id: destination.identityId,
+    });
+    expect(read.value).toBe("readable while a journal is pending");
+
+    const anchorAfter = await destinationStorage.read(
+      "_meta",
+      STATE_ENVELOPE_VERSION_ANCHORS_KEY
+    );
+    expect(anchorAfter ? toBase64url(anchorAfter) : null).toBe(
+      anchorBefore ? toBase64url(anchorBefore) : null
+    );
   });
 });

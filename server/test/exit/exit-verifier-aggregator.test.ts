@@ -43,7 +43,7 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { deriveMasterKey, derivePurposeKey } from "../../src/core/key-derivation.js";
-import { hash } from "../../src/core/hashing.js";
+import { hash, hashToString } from "../../src/core/hashing.js";
 import { sign as identitySign } from "../../src/core/identity.js";
 import { canonicalize, canonicalizeToBytes } from "../../src/mesh/canonical-json.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
@@ -485,14 +485,39 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
   }
 
   /**
+   * Codex gate net-new (2026-08-22): whole-destination-tree hash, not just
+   * the exit-reserved namespaces - proves the refusal touched NOTHING, not
+   * only that it left the exit-staging namespaces empty. Excludes `_audit*`
+   * (timestamped, expected to differ run to run for reasons unrelated to
+   * staging).
+   */
+  async function destinationTreeHash(
+    destinationStorage: MemoryStorage
+  ): Promise<string> {
+    const namespaces = await destinationStorage.listNamespaces();
+    const rows: string[] = [];
+    for (const ns of namespaces) {
+      if (ns.startsWith("_audit")) continue;
+      const entries = await destinationStorage.list(ns);
+      for (const entry of entries) {
+        const data = await destinationStorage.read(ns, entry.key);
+        rows.push(`${ns}/${entry.key}:${data ? toBase64url(data) : "null"}`);
+      }
+    }
+    return hashToString(stringToBytes(rows.sort().join("\n")));
+  }
+
+  /**
    * Codex gate net-new (2026-08-22): a "structural" throw at the
    * pre-staging gate must be proven, not just named - assert NO staging
    * artifact ever appeared under any of the exit-reserved namespaces on a
-   * fresh (pristine) destination. These namespace literals must match the
-   * `EXIT_*_NAMESPACE` constants in src/exit/bundle.ts.
+   * fresh (pristine) destination, AND that the whole destination tree hash
+   * is unchanged from before the refused call. These namespace literals
+   * must match the `EXIT_*_NAMESPACE` constants in src/exit/bundle.ts.
    */
   async function assertNoStagingWrites(
-    destinationStorage: MemoryStorage
+    destinationStorage: MemoryStorage,
+    treeHashBefore: string
   ): Promise<void> {
     for (const ns of [
       "_exit_public_identities",
@@ -505,6 +530,7 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
     ]) {
       expect(await destinationStorage.list(ns)).toHaveLength(0);
     }
+    expect(await destinationTreeHash(destinationStorage)).toBe(treeHashBefore);
   }
 
   it("control: a healthy bundle verifies PASS and activates cleanly", async () => {
@@ -1287,6 +1313,7 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
       artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload } }];
     });
     const destination = await makeDestination();
+    const treeHashBefore = await destinationTreeHash(destination.storage as MemoryStorage);
 
     await assertVerifyImportInvariant(
       bundleDir,
@@ -1308,7 +1335,7 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
       { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
     );
 
-    await assertNoStagingWrites(destination.storage as MemoryStorage);
+    await assertNoStagingWrites(destination.storage as MemoryStorage, treeHashBefore);
   });
 
   it("an entries element whose `entry.payload.v` is a well-typed but wrong value (2) fails verify closed, and import refuses with a NAMED error", async () => {
@@ -1322,6 +1349,7 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
       artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload } }];
     });
     const destination = await makeDestination();
+    const treeHashBefore = await destinationTreeHash(destination.storage as MemoryStorage);
 
     await assertVerifyImportInvariant(
       bundleDir,
@@ -1343,7 +1371,7 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
       { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
     );
 
-    await assertNoStagingWrites(destination.storage as MemoryStorage);
+    await assertNoStagingWrites(destination.storage as MemoryStorage, treeHashBefore);
   });
 
   it("an entries element whose `entry.payload.iv` decodes to the wrong byte length fails verify closed, and import refuses with a NAMED error", async () => {
@@ -1361,6 +1389,7 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
       artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload } }];
     });
     const destination = await makeDestination();
+    const treeHashBefore = await destinationTreeHash(destination.storage as MemoryStorage);
 
     await assertVerifyImportInvariant(
       bundleDir,
@@ -1382,7 +1411,7 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
       { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
     );
 
-    await assertNoStagingWrites(destination.storage as MemoryStorage);
+    await assertNoStagingWrites(destination.storage as MemoryStorage, treeHashBefore);
   });
 
   // ---- F3/F4 (Exit V2 drill D1, 2026-08-22): two structural checks that

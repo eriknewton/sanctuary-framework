@@ -2046,15 +2046,24 @@ export class ReputationStore {
     options: {
       allowUnverifiedLegacy?: boolean;
       /**
-       * N4 (coordinator gate, 2026-08-22): bypasses the pending-exit-import
-       * write refusal below. The one legitimate caller is the exit-import
-       * module's own bundle-activation path, which calls this while its
-       * own not-yet-cleaned-up journal is present on disk - see the
-       * matching WriteOptions doc comment on the state store's write path.
+       * N4 (coordinator gate, 2026-08-22): a scoped opt-out of the
+       * pending-exit-import write refusal below - see the matching
+       * WriteOptions field on the state store's write path, including its
+       * CAPABILITY BOUND note (Codex gate MEDIUM, 2026-08-22): a plain
+       * boolean, not an authenticator.
        */
       allowDuringOwnExitImportActivation?: boolean;
     } = {},
-    origin?: string
+    origin?: string,
+    /**
+     * HIGH-1 (Codex gate, 2026-08-22): called after each attestation write
+     * commits, so the exit-import module's journal can durably record what
+     * THIS call wrote before the next one - a kill between two attestations
+     * in a large bundle still leaves every already-written one correctly
+     * confirmable by a later recovery. The one legitimate caller is the
+     * exit-import module's own activation path.
+     */
+    recordPostImage?: (namespace: string, key: string) => Promise<void>
   ): Promise<{
     imported: number;
     invalid: number;
@@ -2117,6 +2126,21 @@ export class ReputationStore {
           origin: resolvedOrigin,
         };
 
+        // Codex gate finding (2026-08-22): re-check per attestation, not
+        // once at the top of importBundle for the whole loop - a large
+        // bundle can run long enough for a journal to appear after the
+        // top-level check already passed. Respects the SAME bypass the
+        // top-level check does: the exit-import module's own activation
+        // call (allowDuringOwnExitImportActivation) always skips this,
+        // since a journal legitimately exists for its entire duration.
+        if (
+          !options.allowDuringOwnExitImportActivation &&
+          (await hasInterruptedExitImport(this.storage))
+        ) {
+          throw new InterruptedExitImportPendingError(
+            `reputation_import_bundle:${attestation.attestation_id}`
+          );
+        }
         const serialized = stringToBytes(JSON.stringify(stored));
         const encrypted = encrypt(serialized, this.encryptionKey);
         await this.storage.write(
@@ -2124,6 +2148,7 @@ export class ReputationStore {
           attestation.attestation_id,
           stringToBytes(JSON.stringify(encrypted))
         );
+        await recordPostImage?.("_reputation", attestation.attestation_id);
 
         count++;
         contexts.add(attestation.data.context);

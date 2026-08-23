@@ -554,6 +554,94 @@ describe("master rotation — Tier-1 gate and capture rules", () => {
       rotateMaster(rotateOpts(fortress, { passphrase: "wrong-passphrase" }))
     ).rejects.toThrow(CustodyUnlockError);
   });
+
+  it("N4-ROTATE (coordinator gate, 2026-08-22): refuses while an exit-import journal exists, mutating nothing, then succeeds once it is removed", async () => {
+    const fortress = await buildFortress();
+    const journalRecord = {
+      import_id: "planted-n4-rotate-import",
+      identity_id: KID,
+      started_at: new Date().toISOString(),
+      snapshots: [],
+    };
+    await fortress.storage.write(
+      "_exit_import_journal",
+      "planted-n4-rotate-import",
+      stringToBytes(JSON.stringify(journalRecord))
+    );
+
+    await expect(rotateMaster(rotateOpts(fortress))).rejects.toThrow(
+      RotationPreflightError
+    );
+    // Fortress untouched: old credentials still unlock; no rotation artifacts.
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
+    expect(
+      await fortress.storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY)
+    ).toBeNull();
+
+    await fortress.storage.delete(
+      "_exit_import_journal",
+      "planted-n4-rotate-import",
+      false
+    );
+    const result = await rotateMaster(rotateOpts(fortress));
+    expect(result.converted_entries).toBeGreaterThan(0);
+  });
+
+  it("N4-ROTATE (coordinator gate, 2026-08-22): resumeRotation also refuses while an exit-import journal exists", async () => {
+    const fortress = await buildFortress();
+    // Get an in-progress rotation journal on disk without finishing it, by
+    // failing the run at the first conversion failpoint.
+    await expect(
+      rotateMaster(
+        rotateOpts(fortress, {
+          failpoint: (p) => {
+            if (p === "journal-converting-written") {
+              throw new Error("injected mid-conversion fault");
+            }
+          },
+        })
+      )
+    ).rejects.toThrow(/injected mid-conversion fault/);
+    expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).not.toBeNull();
+
+    const journalRecord = {
+      import_id: "planted-n4-resume-import",
+      identity_id: KID,
+      started_at: new Date().toISOString(),
+      snapshots: [],
+    };
+    await fortress.storage.write(
+      "_exit_import_journal",
+      "planted-n4-resume-import",
+      stringToBytes(JSON.stringify(journalRecord))
+    );
+
+    await expect(
+      resumeRotation({
+        storage: fortress.storage,
+        fortressPath: undefined,
+        fortressId: FORTRESS_ID,
+        passphrase: PASSPHRASE,
+      })
+    ).rejects.toThrow(RotationResumeError);
+
+    await fortress.storage.delete(
+      "_exit_import_journal",
+      "planted-n4-resume-import",
+      false
+    );
+    const result = await resumeRotation({
+      storage: fortress.storage,
+      fortressPath: undefined,
+      fortressId: FORTRESS_ID,
+      passphrase: PASSPHRASE,
+    });
+    expect(result.converted_entries).toBeGreaterThanOrEqual(0);
+  });
 });
 
 describe("master rotation — fail-closed coverage", () => {

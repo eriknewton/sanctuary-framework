@@ -255,7 +255,13 @@ async function checkInterruptedExitImport(storagePath: string): Promise<DoctorCh
     return fail(
       "exit import recovery",
       "interrupted exit import pending recovery",
-      "run any `sanctuary exit` verb (for example `sanctuary exit verify`) to recover",
+      "ITEM-3 (coordinator gate, 2026-08-22): run any `sanctuary exit` verb " +
+        "(for example `sanctuary exit verify`) to recover. If that itself " +
+        "reports the journal could not be safely rolled back, this needs " +
+        "operator intervention: inspect the journal entries directly under " +
+        "<fortress state path>/_exit_import_journal, confirm which value " +
+        "at the affected location is the one you want to keep, and only " +
+        "then remove the journal entry - do not remove it first.",
     );
   }
   return ok(
