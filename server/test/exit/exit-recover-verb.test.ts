@@ -613,21 +613,41 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
     // an interpolation); requiring it immediately adjacent to `--fortress`
     // targets the actual emitted text and cannot be satisfied by a
     // neighboring comment, however similarly worded.
-    const HINT_FILES = [
-      "src/storage/exit-import-journal.ts",
-      "src/cli/doctor.ts",
-      "src/exit/bundle.ts",
-      "src/core/master-rotation.ts",
+    // Round-5 finding (independent gate on #1304): the round-4 version
+    // matched the RAW source, so a COMMENT containing the interpolation
+    // syntax could satisfy it, and `> 0` let one valid occurrence mask a
+    // broken sibling hint in the same file. This version (a) strips
+    // comment-only lines before matching, so only code can satisfy it,
+    // and (b) pins the EXACT per-file occurrence count, so removing any
+    // one hint fails even while others remain. The pattern tolerates the
+    // repo's string-concatenation style (`...${EXIT_RECOVERY_VERB} ` +
+    // "--fortress ...") - the round-4 adjacency regex silently missed
+    // that shape and under-counted exit-import-journal.ts as 1 of 2.
+    const HINT_FILE_EXPECTED_CODE_OCCURRENCES: ReadonlyArray<[string, number]> = [
+      ["src/storage/exit-import-journal.ts", 2],
+      ["src/cli/doctor.ts", 1],
+      ["src/exit/bundle.ts", 1],
+      ["src/core/master-rotation.ts", 4],
     ];
-    const INTERPOLATION_ADJACENT_TO_FLAG_RE = /\$\{EXIT_RECOVERY_VERB\}\s*--fortress\b/;
+    // Comment-only-line stripper: drops lines whose first non-space token
+    // opens or continues a comment. Deliberately conservative - it never
+    // clips a code line with a trailing comment, so a template literal
+    // containing "//" (e.g. a URL) survives intact.
+    const stripCommentOnlyLines = (source: string): string =>
+      source
+        .split("\n")
+        .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+        .join("\n");
+    const INTERPOLATION_ADJACENT_TO_FLAG_RE = /\$\{EXIT_RECOVERY_VERB\}[\s`"'+]*--fortress/g;
     const SERVER_ROOT = join(__dirname, "../..");
-    for (const relPath of HINT_FILES) {
+    for (const [relPath, expectedCount] of HINT_FILE_EXPECTED_CODE_OCCURRENCES) {
       const source = await readFile(join(SERVER_ROOT, relPath), "utf8");
-      const matches = source.match(new RegExp(INTERPOLATION_ADJACENT_TO_FLAG_RE, "g")) ?? [];
+      const code = stripCommentOnlyLines(source);
+      const matches = code.match(INTERPOLATION_ADJACENT_TO_FLAG_RE) ?? [];
       expect(
         matches.length,
-        `${relPath} must interpolate \${EXIT_RECOVERY_VERB} immediately adjacent to --fortress in its recovery hint CODE (found ${matches.length} occurrences)`
-      ).toBeGreaterThan(0);
+        `${relPath} must interpolate \${EXIT_RECOVERY_VERB} adjacent to --fortress in CODE (comment-only lines stripped) exactly ${expectedCount} time(s); found ${matches.length}. If a hint site was legitimately added or removed, update this table in the same PR.`
+      ).toBe(expectedCount);
       expect(
         source,
         `${relPath} must not hardcode the stale "sanctuary exit verify ... to recover" hint`
