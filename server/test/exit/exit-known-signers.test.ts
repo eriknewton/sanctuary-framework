@@ -12,16 +12,13 @@
  * were reported `reputation_unverifiable_attestations` even though every
  * hop individually verified.
  *
- * This file drives the drill-shaped positive case (A -> B -> C, the exact
- * shape the drill found broken) plus the version gate and the four refusal
- * fixtures named in the build brief: a bundle with no known_signers
- * artifact at all still verifies exactly as before this change; a
- * malformed table element; a table with two conflicting keys for one DID;
- * and a table signed by an identity other than the bundle's own exporter.
- * All four refusal fixtures resolve to ZERO trusted signers from the table
- * (fail closed), never a partial admission - the affected attestation
- * stays `unverifiable` through the SAME existing accounting a bundle with
- * no known_signers artifact at all would produce.
+ * This file drives the drill-shaped positive case (A -> B -> C -> D, the
+ * shape the drill found broken), the version gate, the store-wide capacity
+ * bound, the compromised-key exclusion, and a parameterized set of
+ * refusal fixtures: every one asserts a typed hard failure
+ * (`known_signers_invalid`) BEFORE any staging write, never a soft
+ * warning, and a byte-identical destination storage snapshot before and
+ * after the refused attempt (private register EXIT-KS-01).
  */
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -34,7 +31,7 @@ import { generateRandomKey } from "../../src/core/random.js";
 import { fromBase64url, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { hash } from "../../src/core/hashing.js";
-import { sign as identitySign, publicKeyToDid } from "../../src/core/identity.js";
+import { sign as identitySign, publicKeyToDid, legacyPublicKeyToDid } from "../../src/core/identity.js";
 import { canonicalize, canonicalizeToBytes } from "../../src/mesh/canonical-json.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
@@ -51,10 +48,20 @@ import {
 import {
   verifyExitBundle,
   knownSignersSigningBytes,
+  checkKnownSignersStructure,
+  isKnownSignersArtifactSizeAcceptable,
   type KnownSignersEntry,
 } from "../../src/exit/verifier.js";
 import type { ExitBundleManifest } from "../../src/contracts/v1.1/exit-bundle-manifest.js";
 import { EXIT_BUNDLE_MANIFEST_VERSION } from "../../src/contracts/v1.1/constants.js";
+import {
+  KnownSignersStore,
+  MAX_KNOWN_SIGNERS,
+} from "../../src/reputation/known-signers-store.js";
+import {
+  buildReputationCompletenessManifest,
+  reputationBundleSigningBytes,
+} from "../../src/reputation/reputation-store.js";
 
 interface ToolDef {
   name: string;
@@ -364,6 +371,14 @@ describe("Exit V2 known_signers (drill F2)", () => {
     expect(knownSignersRaw.signers.map((s) => s.did)).toContain(
       fortressA.identityManager.getDefault()?.did
     );
+    // LOW (re-gate on #1303, 2026-08-23): first_seen_import_id is local-only
+    // bookkeeping (it embeds A's identity_id + exported_at) and must never
+    // reach the wire - checked on the RAW exported JSON, not the typed
+    // KnownSignersEntry (whose type no longer declares the field at all, so
+    // a typed check alone could not catch a stray runtime property).
+    for (const signer of knownSignersRaw.signers) {
+      expect(Object.keys(signer).sort()).toEqual(["did", "public_key"]);
+    }
     expect(exportedBC.manifest.body.artifacts.map((a) => a.kind)).toContain(
       "known_signers"
     );
@@ -439,7 +454,182 @@ describe("Exit V2 known_signers (drill F2)", () => {
     expect((await acceptedDestination.storage.list("_known_signers")).length).toBe(1);
   });
 
-  it("independent gate item 4: a four-hop chain (A -> B -> C -> D) keeps known_signers COUNTS exact - no duplication, no loss, across repeated re-export", async () => {
+  it("MEDIUM (re-gate on #1303, item 1): a known_signers entry using the legacy did:key encoding for its key is accepted at a third hop, not refused as a mismatch", async () => {
+    const fortressA = await makeHarness();
+    const aIdentityId = await createIdentity(fortressA, "legacy-a");
+    await recordAttestation(fortressA, aIdentityId, "legacy-ix-a1", "legacy-ctx");
+    const bundleAB = await newBundleDir("sanctuary-known-signers-legacy-ab-");
+    await exportBundle(fortressA, bundleAB);
+    const aDid = fortressA.identityManager.getDefault()?.did;
+    if (!aDid) throw new Error("missing A did");
+
+    const fortressB = await makeHarness();
+    const bIdentityId = await createIdentity(fortressB, "legacy-b");
+    const importedAB = await importInto(fortressB, bIdentityId, bundleAB);
+    expect(importedAB.activated).toBe(true);
+
+    const bundleBC = await newBundleDir("sanctuary-known-signers-legacy-bc-");
+    await exportBundle(fortressB, bundleBC);
+    const legacyADid = legacyPublicKeyToDid(
+      fromBase64url(fortressA.identityManager.getDefault()!.public_key)
+    );
+    // Fixture: a genuinely legacy-DID fortress A - its attestation's
+    // `signer` field (unsigned metadata; the signature covers only
+    // `attestation.data`) AND B's table entry for A both use the RETIRED
+    // base64url did:key encoding (legacyPublicKeyToDid) instead of the
+    // canonical base58btc one, for the SAME key. core/identity.ts still
+    // treats this encoding as live, and exit/v2-memory-archive.ts already
+    // accepts both forms for the same class of check.
+    await rewriteKnownSigners(
+      bundleBC,
+      fortressB,
+      (parsed) => ({
+        ...parsed,
+        signers: parsed.signers.map((entry) =>
+          entry.did === aDid ? { ...entry, did: legacyADid } : entry
+        ),
+      }),
+      fortressB
+    );
+    const reputationPath = join(bundleBC, "artifacts/reputation_bundle.json");
+    const reputationRaw = JSON.parse(
+      await readFile(reputationPath, "utf8")
+    ) as {
+      version: "SANCTUARY_REP_V1";
+      attestations: Array<{
+        signer: string;
+        data: { participant_did: string; [key: string]: unknown };
+        signature: string;
+        [key: string]: unknown;
+      }>;
+      exported_at: string;
+      exporter_did: string;
+      completeness_manifest?: unknown;
+    };
+    const aIdentity = fortressA.identityManager.getDefault();
+    if (!aIdentity) throw new Error("missing A identity");
+    const aIdentityEncryptionKey = derivePurposeKey(
+      fortressA.masterKey,
+      "identity-encryption"
+    );
+    // `signer` AND `data.participant_did` both move to the legacy form - a
+    // genuinely legacy-DID fortress A would have recorded this attestation
+    // with both fields already equal (reputation-store.ts record() sets
+    // them from the SAME `identity.did`), so both are updated in lockstep
+    // here and the attestation's OWN signature (over `data`, by A's real
+    // key - the key itself is unchanged, only its DID label) is redone to
+    // match, exactly reproducing what A recording under a legacy identity
+    // would have produced.
+    reputationRaw.attestations = reputationRaw.attestations.map((attestation) => {
+      if (attestation.signer !== aDid) return attestation;
+      const data = { ...attestation.data, participant_did: legacyADid };
+      const signature = toBase64url(
+        identitySign(
+          stringToBytes(JSON.stringify(data)),
+          aIdentity.encrypted_private_key,
+          aIdentityEncryptionKey
+        )
+      );
+      return { ...attestation, signer: legacyADid, data, signature };
+    });
+    // The reputation bundle's OWN completeness manifest and signature cover
+    // the attestations array too - both must be recomputed and re-signed by
+    // B (the reputation bundle's actual signer), independent of the OUTER
+    // exit-bundle manifest's own signature.
+    reputationRaw.completeness_manifest = buildReputationCompletenessManifest(
+      reputationRaw.exported_at,
+      reputationRaw.attestations as never
+    );
+    const bIdentity2 = fortressB.identityManager.getDefault();
+    if (!bIdentity2) throw new Error("missing B identity");
+    const reputationSignature = toBase64url(
+      identitySign(
+        reputationBundleSigningBytes(reputationRaw as never),
+        bIdentity2.encrypted_private_key,
+        derivePurposeKey(fortressB.masterKey, "identity-encryption")
+      )
+    );
+    const reputationBytes = stringToBytes(
+      JSON.stringify(
+        { ...reputationRaw, bundle_signature: reputationSignature },
+        null,
+        2
+      ) + "\n"
+    );
+    await writeFile(reputationPath, reputationBytes);
+    await updateArtifactHashAndSize(bundleBC, "reputation_bundle", reputationBytes);
+    await resignManifest(bundleBC, fortressB);
+    // Sanity: the fixture actually changed the DID's spelling (proving the
+    // test exercises the legacy-vs-canonical path, not a no-op rewrite).
+    const rewrittenKnownSignersRaw = JSON.parse(
+      await readFile(join(bundleBC, "artifacts/known_signers.json"), "utf8")
+    ) as { signers: KnownSignersEntry[] };
+    expect(rewrittenKnownSignersRaw.signers[0]!.did).not.toBe(aDid);
+    expect(rewrittenKnownSignersRaw.signers[0]!.did).toBe(legacyADid);
+
+    const verifiedBC = await verifyExitBundle(bundleBC);
+    expect(verifiedBC.passed).toBe(true);
+    expect(verifiedBC.reputation?.unverifiable_attestations).toBe(0);
+
+    const fortressC = await makeHarness();
+    const cIdentityId = await createIdentity(fortressC, "legacy-c");
+    const importedBC = await importInto(fortressC, cIdentityId, bundleBC);
+    expect(importedBC.activated).toBe(true);
+    expect(importedBC.reputation.imported_attestations).toBe(1);
+    expect(importedBC.reputation.unverifiable_attestations).toBe(0);
+  });
+
+    it("LOW (re-gate on #1303, item 2): a KnownSignersQuotaError during import rolls the WHOLE activation back (reputation attestations included), surfacing as ACTIVATION_FAILED_AND_CLEANED", async () => {
+    const fortressA = await makeHarness();
+    const aIdentityId = await createIdentity(fortressA, "quota-a");
+    await recordAttestation(fortressA, aIdentityId, "quota-ix-a1", "quota-ctx");
+    const bundleAB = await newBundleDir("sanctuary-known-signers-quota-ab-");
+    await exportBundle(fortressA, bundleAB);
+
+    const fortressB = await makeHarness();
+    const bIdentityId = await createIdentity(fortressB, "quota-b");
+    // A cap of 0 means ANY net-new known-signer entry is refused - A's key
+    // is always net-new to a fresh B, so this deterministically trips the
+    // quota gate on B's very first import.
+    const cappedKnownSignersStore = new KnownSignersStore(
+      fortressB.storage,
+      fortressB.masterKey,
+      { maxKnownSigners: 0 }
+    );
+    const beforeSnapshot = await snapshotAll(fortressB.storage);
+
+    let thrown: unknown;
+    try {
+      await importExitBundle({
+        bundleDir: bundleAB,
+        storage: fortressB.storage,
+        masterKey: fortressB.masterKey,
+        identityManager: fortressB.identityManager,
+        auditLog: fortressB.auditLog,
+        reputationStore: fortressB.reputationStore,
+        knownSignersStore: cappedKnownSignersStore,
+        activate: true,
+        forceRebind: true,
+        destinationSignerIdentityId: bIdentityId,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(ExitBundleImportError);
+    expect((thrown as ExitBundleImportError).code).toBe(
+      "ACTIVATION_FAILED_AND_CLEANED"
+    );
+
+    // The reputation attestation that DID succeed (imported before the
+    // known_signers quota check ran) must be rolled back too - a partial
+    // activation is not an acceptable outcome, so the WHOLE destination
+    // tree - including `_reputation`, not only `_known_signers` - is
+    // byte-identical to before the attempt.
+    const afterSnapshot = await snapshotAll(fortressB.storage);
+    expect(afterSnapshot).toBe(beforeSnapshot);
+  });
+
+    it("independent gate item 4: a four-hop chain (A -> B -> C -> D) keeps known_signers COUNTS exact - no duplication, no loss, across repeated re-export", async () => {
     const fortressA = await makeHarness();
     const aIdentityId = await createIdentity(fortressA, "chain-a");
     await recordAttestation(fortressA, aIdentityId, "chain-ix-a1", "chain-ctx");
@@ -547,7 +737,6 @@ describe("Exit V2 known_signers (drill F2)", () => {
           {
             did: parsed.signers[0]!.did,
             public_key: ctx.bIdentity.public_key,
-            first_seen_import_id: parsed.signers[0]!.first_seen_import_id,
           },
         ],
       }),
@@ -567,7 +756,6 @@ describe("Exit V2 known_signers (drill F2)", () => {
           {
             did: ctx.bIdentity.did,
             public_key: ctx.bIdentity.public_key,
-            first_seen_import_id: "self-entry-probe",
           },
         ],
       }),
@@ -633,7 +821,7 @@ describe("Exit V2 known_signers (drill F2)", () => {
     });
   }
 
-  it("HIGH-1 must-fail fixture: key substitution (map a foreign DID to the exporter's own key) is refused, not merely 'unverifiable' - reproduces the independent-gate finding at C", async () => {
+  it("an entry whose key does not derive its declared DID is refused as a whole-table failure, even when that DID matches a real attestation signer field (private register EXIT-KS-01)", async () => {
     const fortressA = await makeHarness();
     const aIdentityId = await createIdentity(fortressA, "sub-a");
     await recordAttestation(fortressA, aIdentityId, "sub-ix-a1", "sub-ctx");
@@ -645,12 +833,9 @@ describe("Exit V2 known_signers (drill F2)", () => {
     const fortressB = await makeHarness();
     const bIdentityId = await createIdentity(fortressB, "sub-b");
     await importInto(fortressB, bIdentityId, bundleAB);
-    // B records an attestation of its own - this is the SIGNATURE B will
-    // reuse, unmodified, to forge a claim "signed by A". The signature
-    // covers only `attestation.data`, never the top-level `signer` field,
-    // so overwriting `signer` alone (leaving `data` and `signature`
-    // byte-identical) is the EXACT minimal forgery the finding describes:
-    // "signer = A.did signed by [B's] own key."
+    // B's own attestation supplies the fixture signature reused below - the
+    // signature covers only `attestation.data`, never the top-level
+    // `signer` field.
     await recordAttestation(fortressB, bIdentityId, "sub-ix-b1", "sub-ctx");
     const bIdentity = fortressB.identityManager.getDefault();
     if (!bIdentity) throw new Error("missing B identity");
@@ -658,7 +843,7 @@ describe("Exit V2 known_signers (drill F2)", () => {
     const bundleBC = await newBundleDir("sanctuary-known-signers-sub-bc-");
     await exportBundle(fortressB, bundleBC);
 
-    // Forge the attestation: same signature and data, claimed signer = A.
+    // Fixture: same signature and data, a differently-claimed signer.
     const reputationPath = join(bundleBC, "artifacts/reputation_bundle.json");
     const reputationRaw = JSON.parse(await readFile(reputationPath, "utf8")) as {
       attestations: Array<{ signer: string; data: { participant_did: string } }>;
@@ -677,25 +862,23 @@ describe("Exit V2 known_signers (drill F2)", () => {
     await updateArtifactHashAndSize(bundleBC, "reputation_bundle", reputationBytes);
     await resignManifest(bundleBC, fortressB);
 
-    // Substitute the known_signers table: claim A's DID resolves to B's own
-    // key (the attacker controls B and can sign anything with B's key).
+    // Fixture: known_signers claims A's DID resolves to B's own key.
     await rewriteKnownSigners(
       bundleBC,
       fortressB,
       (parsed) => ({
         ...parsed,
         signers: [
-          { did: aDid, public_key: bIdentity.public_key, first_seen_import_id: "forged-substitution" },
+          { did: aDid, public_key: bIdentity.public_key },
           ...parsed.signers.filter((entry) => entry.did !== aDid),
         ],
       }),
       fortressB
     );
 
-    // HIGH-1 (did:key self-certification, checkKnownSignersStructure): the
-    // substituted entry's public_key does NOT derive DID `aDid` under
+    // The fixture entry's public_key does not derive DID `aDid` under
     // publicKeyToDid, so the table is structurally refused before its
-    // signature is even checked.
+    // signature is even checked (checkKnownSignersStructure).
     expect(publicKeyToDid(fromBase64url(bIdentity.public_key))).not.toBe(aDid);
 
     const verifiedBC = await verifyExitBundle(bundleBC);
@@ -718,5 +901,70 @@ describe("Exit V2 known_signers (drill F2)", () => {
 
     const afterSnapshot = await snapshotAll(cStorage);
     expect(afterSnapshot).toBe(beforeSnapshot);
+  });
+
+  it("MEDIUM (re-gate on #1303): an oversized signers array is refused by COUNT before any element is touched", () => {
+    // A Proxy over a length-only array: every index access increments a
+    // counter, so this proves checkKnownSignersStructure's count cap fires
+    // BEFORE the per-element loop even starts - not merely that it
+    // eventually refuses. `length` itself is read freely (Array.isArray
+    // and the cap comparison both need it).
+    let elementAccesses = 0;
+    const oversized = new Proxy(
+      new Array(MAX_KNOWN_SIGNERS + 1) as unknown[],
+      {
+        get(target, prop, receiver) {
+          if (typeof prop === "string" && /^\d+$/.test(prop)) {
+            elementAccesses++;
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      }
+    );
+    const result = checkKnownSignersStructure({
+      version: 1,
+      signers: oversized as unknown as KnownSignersEntry[],
+    });
+    expect(result).toMatchObject({ ok: false, problem: "signers_too_many" });
+    expect(elementAccesses).toBe(0);
+  });
+
+  it("MEDIUM (re-gate on #1303): a known_signers artifact whose manifest-declared size exceeds the cap is refused WITHOUT reading the file", () => {
+    const manifest = {
+      body: {
+        artifacts: [
+          {
+            kind: "known_signers",
+            path: "artifacts/known_signers.json",
+            hash_alg: "sha256",
+            hash: "0".repeat(64),
+            size_bytes: MAX_KNOWN_SIGNERS * 300 + 1,
+          },
+        ],
+      },
+    } as unknown as ExitBundleManifest;
+    expect(isKnownSignersArtifactSizeAcceptable(manifest)).toBe(false);
+
+    const acceptableManifest = {
+      body: {
+        artifacts: [
+          {
+            kind: "known_signers",
+            path: "artifacts/known_signers.json",
+            hash_alg: "sha256",
+            hash: "0".repeat(64),
+            size_bytes: 4096,
+          },
+        ],
+      },
+    } as unknown as ExitBundleManifest;
+    expect(isKnownSignersArtifactSizeAcceptable(acceptableManifest)).toBe(true);
+
+    // Absent entirely (an old, pre-this-change bundle) - accepted, matching
+    // the version gate.
+    const absentManifest = {
+      body: { artifacts: [] },
+    } as unknown as ExitBundleManifest;
+    expect(isKnownSignersArtifactSizeAcceptable(absentManifest)).toBe(true);
   });
 });

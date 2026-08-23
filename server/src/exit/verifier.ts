@@ -43,7 +43,7 @@ import {
   SUPPORTED_PAYLOAD_ALG,
   PAYLOAD_IV_BYTE_LENGTH,
 } from "../core/encryption.js";
-import { publicKeyToDid, publicKeyBytesEqual } from "../core/identity.js";
+import { publicKeyToDid, legacyPublicKeyToDid, publicKeyBytesEqual } from "../core/identity.js";
 import { EXIT_KNOWN_SIGNERS_DOMAIN } from "../core/crypto-suite-registry.js";
 import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 import { isReservedNamespace } from "../cognitive/state-store.js";
@@ -60,6 +60,7 @@ import {
   type ReputationBundle,
   type ReputationBundleCompletenessVerification,
 } from "../reputation/reputation-store.js";
+import { MAX_KNOWN_SIGNERS } from "../reputation/known-signers-store.js";
 import {
   readFileCustody,
   readFileCustodyWithStats,
@@ -388,30 +389,49 @@ const MAX_BUNDLE_DIRECTORY_ENTRIES = 10_000;
  * could let files past the cap hide as "not found", which is the opposite
  * of fail-closed.
  */
+type BundleWalkOutcome = "ok" | "too_many" | "error";
+
 async function listBundleFiles(
   root: string,
   maxEntries: number
-): Promise<string[] | "too_many"> {
+): Promise<string[] | "too_many" | "error"> {
   const out: string[] = [];
-  async function walk(dir: string, relPrefix: string): Promise<boolean> {
+  // MEDIUM (Codex re-gate on #1303, 2026-08-23): a SINGLE counter over
+  // EVERY entry this walk encounters - files, symlinks, AND directories -
+  // not only `out.length` (which only grew for pushed files). Counting
+  // files alone left the recursion itself unbounded: a bundle containing
+  // many nested or sibling EMPTY directories, or directories containing
+  // only further directories, never pushed anything to `out` and so never
+  // tripped the old check, however deep or wide the tree - AGENTS.md rule
+  // 8 requires the bound to cover the WORK this function does, not only
+  // its output size.
+  let entriesSeen = 0;
+  async function walk(dir: string, relPrefix: string): Promise<BundleWalkOutcome> {
     let entries;
     try {
       entries = await readdir(dir, { withFileTypes: true });
     } catch {
-      // Unreadable directory: no files to report from here. Defensive only
-      // - every directory this walk descends into was itself just listed
-      // by readdir a moment earlier.
-      return true;
+      // MEDIUM (Codex re-gate on #1303, 2026-08-23): a directory this walk
+      // cannot read is a VERIFICATION FAILURE, not "nothing to report from
+      // here". Treating an unreadable directory as empty could silently
+      // hide files a caller needs to see - exactly the failure mode this
+      // whole function exists to catch (a file present on disk but
+      // unaccounted for in the manifest). Every directory this walk
+      // descends into was itself just listed a moment earlier by the
+      // PARENT's readdir, so a read failure here means something changed
+      // (or was denied) between listing and reading it - fail closed.
+      return "error";
     }
     for (const entry of entries) {
-      if (out.length >= maxEntries) return false;
+      entriesSeen++;
+      if (entriesSeen > maxEntries) return "too_many";
       const relPath = relPrefix
         ? `${relPrefix}/${entry.name}`
         : entry.name;
       const fullPath = join(dir, entry.name);
       if (entry.isDirectory()) {
-        const ok = await walk(fullPath, relPath);
-        if (!ok) return false;
+        const outcome = await walk(fullPath, relPath);
+        if (outcome !== "ok") return outcome;
         continue;
       }
       // Files AND symlinks are both recorded (never followed) - an
@@ -422,10 +442,10 @@ async function listBundleFiles(
       // `archive_contains_symlink`).
       out.push(relative(root, fullPath).split(sep).join("/"));
     }
-    return true;
+    return "ok";
   }
-  const complete = await walk(root, "");
-  if (!complete) return "too_many";
+  const outcome = await walk(root, "");
+  if (outcome !== "ok") return outcome;
   return out;
 }
 
@@ -1027,23 +1047,22 @@ export interface KnownSignersEntry {
   did: string;
   /** base64url raw Ed25519 public key. */
   public_key: string;
-  /**
-   * MEDIUM-3 (independent gate on #1303, 2026-08-23): the LOCAL `_exit_imports`
-   * id of the import at which the ORIGINAL exporting fortress first verified
-   * this signer - informational and diagnostic ONLY, never a trust input.
-   * With HIGH-1 fixed (did:key self-certification), the property this table
-   * actually needs to prove - "this key derives this DID" - is carried
-   * entirely by the structural check plus the table's own signature; this
-   * field carries none of that weight. It is the EXPORTER's self-report,
-   * unverifiable by a receiving fortress (which cannot confirm when, or
-   * whether, the claimed import genuinely happened), and after N re-export
-   * hops it is hearsay relayed and re-signed N times, never independently
-   * re-derived. No consumer in this codebase reads its VALUE for any
-   * security decision - required non-empty purely so a malformed or
-   * truncated entry is still caught by the element-level structural check.
-   */
-  first_seen_import_id: string;
 }
+
+/**
+ * `first_seen_import_id` (LOW, re-gate on #1303, 2026-08-23) is
+ * deliberately NOT part of this wire type. It is local-only bookkeeping
+ * (`StoredKnownSigner`, server/src/reputation/known-signers-store.ts): the
+ * `_exit_imports` id of the import at which THIS fortress first verified a
+ * signer, which embeds the UPSTREAM exporting identity's `identity_id` and
+ * `exported_at` (`importIdForManifest`, exit/bundle.ts). Carrying it onto
+ * the wire and re-exporting it downstream would relay that upstream
+ * identity/timestamp metadata to a THIRD fortress with no operator intent
+ * behind the disclosure and no security property depending on it - the
+ * property this table needs to prove (a key derives a DID) is carried
+ * entirely by the did:key structural check plus the table's own signature,
+ * never by this field.
+ */
 
 export interface KnownSignersArtifact {
   version: 1;
@@ -1071,9 +1090,6 @@ export function isWellFormedKnownSignersEntry(
   if (item === null || typeof item !== "object") return false;
   const record = item as Record<string, unknown>;
   if (typeof record.did !== "string" || record.did.length === 0) return false;
-  if (typeof record.first_seen_import_id !== "string" || record.first_seen_import_id.length === 0) {
-    return false;
-  }
   if (typeof record.public_key !== "string") return false;
   try {
     if (fromBase64urlStrict(record.public_key).length !== ED25519_PUBLIC_KEY_BYTES) {
@@ -1087,6 +1103,7 @@ export function isWellFormedKnownSignersEntry(
 
 export type KnownSignersStructureProblem =
   | "signers_unreadable"
+  | "signers_too_many"
   | "signers_malformed_elements"
   | "signers_did_key_mismatch"
   | "signers_duplicate_did_conflict"
@@ -1130,6 +1147,22 @@ export function checkKnownSignersStructure(record: {
       detail: "the `signers` field is absent or is not an array",
     };
   }
+  // MEDIUM (Codex re-gate on #1303, 2026-08-23, AGENTS.md rule 8): a COUNT
+  // cap, checked before the per-element loop below ever runs - an
+  // attacker-controlled `signers` array (a bundle is untrusted input until
+  // verified) could otherwise force this function to do unbounded
+  // per-element work - a did:key derivation plus a base64url decode per
+  // entry - before its own signature is even checked. `MAX_KNOWN_SIGNERS`
+  // is the SAME store-wide cap `KnownSignersStore` enforces
+  // (reputation/known-signers-store.ts): a table this fortress would ever
+  // legitimately need to admit can never exceed it either.
+  if (record.signers.length > MAX_KNOWN_SIGNERS) {
+    return {
+      ok: false,
+      problem: "signers_too_many",
+      detail: `known_signers.signers has ${record.signers.length} elements, above the ${MAX_KNOWN_SIGNERS}-element cap`,
+    };
+  }
   const byDid = new Map<string, string>();
   for (const item of record.signers) {
     if (!isWellFormedKnownSignersEntry(item)) {
@@ -1137,25 +1170,30 @@ export function checkKnownSignersStructure(record: {
         ok: false,
         problem: "signers_malformed_elements",
         detail:
-          "a signers element is missing or has a wrong-typed did/public_key/first_seen_import_id",
+          "a signers element is missing or has a wrong-typed did/public_key",
       };
     }
-    // HIGH-1 (independent gate on #1303, 2026-08-23, key-substitution
-    // REPRODUCED): `did:key` is SELF-CERTIFYING - the DID is a deterministic
-    // encoding of the public key (publicKeyToDid, core/identity.ts) - so an
-    // entry whose declared `did` does not derive from its declared
-    // `public_key` is not a differently-encoded truth, it is a FORGED
-    // mapping: the exporter can name ANY did on this table and pair it with
-    // a key it controls, then sign attestations under that fabricated
-    // pairing with `signer` set to the victim DID. Checked BEFORE the
-    // duplicate-DID check below so a forged entry is refused on its own
-    // demerits, not conflated with a legitimate re-assertion. `publicKeyToDid`
-    // never throws here - `isWellFormedKnownSignersEntry` above already
-    // proved `public_key` decodes to exactly `ED25519_PUBLIC_KEY_BYTES`,
-    // the one precondition `publicKeyToDid`/`assertEd25519PublicKey` require.
-    let derivedDid: string;
+    // INVARIANT (private register EXIT-KS-01; independent gate on #1303,
+    // 2026-08-23): `did:key` is SELF-CERTIFYING - an entry is accepted only
+    // if its declared public key derives its declared DID
+    // (`publicKeyToDid`, core/identity.ts), checked BEFORE the duplicate-DID
+    // check below so a non-self-certifying entry is refused on its own
+    // demerits. `publicKeyToDid` never throws here - `isWellFormedKnownSignersEntry`
+    // above already proved `public_key` decodes to exactly
+    // `ED25519_PUBLIC_KEY_BYTES`, the one precondition
+    // `publicKeyToDid`/`assertEd25519PublicKey` require.
+    //
+    // BOTH the canonical base58btc `publicKeyToDid` encoding AND the
+    // retired base64url `legacyPublicKeyToDid` form are accepted -
+    // core/identity.ts still treats the legacy form as live
+    // (persisted-identity migration), and exit/v2-memory-archive.ts already
+    // accepts both for the same signer key at its own signature-binding
+    // check, so refusing the legacy form here would narrow this check
+    // below what the rest of the codebase treats as a valid DID for the
+    // SAME key.
+    let entryKeyBytes: Uint8Array;
     try {
-      derivedDid = publicKeyToDid(fromBase64urlStrict(item.public_key));
+      entryKeyBytes = fromBase64urlStrict(item.public_key);
     } catch {
       return {
         ok: false,
@@ -1163,11 +1201,13 @@ export function checkKnownSignersStructure(record: {
         detail: `signers element for DID ${item.did} has an undecodable public_key`,
       };
     }
-    if (derivedDid !== item.did) {
+    const derivedDid = publicKeyToDid(entryKeyBytes);
+    const legacyDerivedDid = legacyPublicKeyToDid(entryKeyBytes);
+    if (derivedDid !== item.did && legacyDerivedDid !== item.did) {
       return {
         ok: false,
         problem: "signers_did_key_mismatch",
-        detail: `signers element claims DID ${item.did} but its public_key derives DID ${derivedDid}`,
+        detail: `signers element claims DID ${item.did} but its public_key derives DID ${derivedDid} (or, under the legacy encoding, ${legacyDerivedDid})`,
       };
     }
     const existing = byDid.get(item.did);
@@ -1181,6 +1221,41 @@ export function checkKnownSignersStructure(record: {
     byDid.set(item.did, item.public_key);
   }
   return { ok: true };
+}
+
+/**
+ * MEDIUM (Codex re-gate on #1303, 2026-08-23, AGENTS.md rule 8): the
+ * byte-size cap for a `known_signers` artifact, checked from the manifest's
+ * OWN declared `size_bytes` for that entry BEFORE the artifact is ever
+ * read off disk - this is the "before reading/parsing" half of the
+ * bound (`checkKnownSignersStructure`'s element-COUNT cap, above, is the
+ * "before iterating" half). ~300 bytes is a generous per-entry estimate
+ * for one `{did, public_key}` JSON element (a real entry serializes to
+ * roughly 130-150 bytes: a did:key string plus a base64url public key plus
+ * object/quote/comma overhead), so `MAX_KNOWN_SIGNERS` entries at that
+ * generous rate bounds the whole artifact.
+ */
+const KNOWN_SIGNERS_ARTIFACT_BYTES_PER_ENTRY_ESTIMATE = 300;
+export const MAX_KNOWN_SIGNERS_ARTIFACT_BYTES =
+  MAX_KNOWN_SIGNERS * KNOWN_SIGNERS_ARTIFACT_BYTES_PER_ENTRY_ESTIMATE;
+
+/**
+ * True iff the bundle's manifest does not declare a `known_signers`
+ * artifact, or declares one at or under `MAX_KNOWN_SIGNERS_ARTIFACT_BYTES`.
+ * Shared by `verifyExitBundle` (below) and `importExitBundle`'s
+ * pre-staging gate (server/src/exit/bundle.ts - search
+ * "isKnownSignersArtifactSizeAcceptable" there), so neither stage reads a
+ * known_signers artifact the other would refuse purely on declared size.
+ * Reads only the manifest already in memory - no file I/O.
+ */
+export function isKnownSignersArtifactSizeAcceptable(
+  manifest: ExitBundleManifest
+): boolean {
+  const entry = manifest.body.artifacts.find(
+    (artifact) => artifact.kind === "known_signers"
+  );
+  if (!entry) return true;
+  return entry.size_bytes <= MAX_KNOWN_SIGNERS_ARTIFACT_BYTES;
 }
 
 /**
@@ -1548,7 +1623,11 @@ export async function verifyExitBundle(
   // presence is unaccountable, whatever it contains. `manifest.json` at the
   // bundle root is the one expected non-artifact file.
   const bundleFiles = await listBundleFiles(root, MAX_BUNDLE_DIRECTORY_ENTRIES);
-  if (bundleFiles === "too_many") {
+  // MEDIUM (Codex re-gate on #1303, 2026-08-23): "too_many" (the count
+  // cap, files or directories) and "error" (a directory this walk could
+  // not read) are BOTH verification failures - a walk that cannot see the
+  // whole bundle directory can never vouch that nothing is unlisted.
+  if (bundleFiles === "too_many" || bundleFiles === "error") {
     return fail(root, manifest, "artifact_directory_unlisted_file", warnings, unsupportedArtifacts);
   }
   const unlisted = bundleFiles.filter(
@@ -1842,6 +1921,16 @@ export async function verifyExitBundle(
   // this particular bundle happened to need the table. A tampered or
   // forged known_signers artifact is evidence of tampering in its own
   // right and must never be silently absorbed.
+  // MEDIUM (Codex re-gate on #1303, 2026-08-23): the declared-size check
+  // runs BEFORE `loadExitArtifact` reads the file at all, from the
+  // manifest already in memory - see `isKnownSignersArtifactSizeAcceptable`'s
+  // doc comment. An oversized declaration is treated the SAME as any other
+  // untrustworthy table (item 6: a typed hard failure, never a silent skip
+  // - skipping would misreport a PRESENT, oversized artifact as though it
+  // were simply absent).
+  if (!isKnownSignersArtifactSizeAcceptable(manifest)) {
+    return fail(root, manifest, "known_signers_invalid", warnings, unsupportedArtifacts);
+  }
   const knownSignersArtifact = await loadExitArtifact(root, manifest, "known_signers");
   if (knownSignersArtifact) {
     if (

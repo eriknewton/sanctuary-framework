@@ -178,6 +178,67 @@ export class KnownSignersStore {
    * journal's divergence check covers this namespace identically to
    * `_reputation`.
    */
+  /**
+   * Phase 1 of the quota-check-then-write shape, shared by
+   * `wouldExceedCapacity` and `persistIfAbsent` so the two can never
+   * disagree about which candidates are net-new (AGENTS.md rule 5).
+   * Dedupes by storage key - the caller's `entries` array is not itself
+   * guaranteed deduplicated - without writing anything.
+   */
+  private async computeNetNew(
+    entries: Array<{ did: string; publicKey: Uint8Array }>
+  ): Promise<Map<string, { did: string; publicKey: Uint8Array }>> {
+    const netNew = new Map<string, { did: string; publicKey: Uint8Array }>();
+    for (const { did, publicKey } of entries) {
+      const key = knownSignerStorageKey(did);
+      if (netNew.has(key)) continue;
+      const existing = await this.storage.read(KNOWN_SIGNERS_NAMESPACE, key);
+      if (existing !== null) continue;
+      netNew.set(key, { did, publicKey });
+    }
+    return netNew;
+  }
+
+  /**
+   * HIGH (Codex re-gate on #1303, 2026-08-23): a READ-ONLY capacity dry-run
+   * - writes nothing, throws nothing. Lets a caller (importExitBundle,
+   * server/src/exit/bundle.ts) preflight the capacity decision BEFORE any
+   * OTHER write in the same activation (specifically, before
+   * `ReputationStore.importBundle`'s `_reputation` writes), so a batch that
+   * would exceed the cap is refused with NOTHING written anywhere - not
+   * even the reputation attestations that would themselves have been
+   * admitted. `persistIfAbsent` below re-runs the SAME check as the
+   * authoritative second line immediately before it writes, so a caller
+   * that skips this preflight (or a state change between the two calls)
+   * still cannot write past the cap.
+   */
+  async wouldExceedCapacity(
+    entries: Array<{ did: string; publicKey: Uint8Array }>
+  ): Promise<{
+    exceeds: boolean;
+    currentCount: number;
+    netNewCount: number;
+    limit: number;
+  }> {
+    const netNew = await this.computeNetNew(entries);
+    if (netNew.size === 0) {
+      return {
+        exceeds: false,
+        currentCount: -1,
+        netNewCount: 0,
+        limit: this.maxKnownSigners,
+      };
+    }
+    const currentCount = (await this.storage.list(KNOWN_SIGNERS_NAMESPACE))
+      .length;
+    return {
+      exceeds: currentCount + netNew.size > this.maxKnownSigners,
+      currentCount,
+      netNewCount: netNew.size,
+      limit: this.maxKnownSigners,
+    };
+  }
+
   async persistIfAbsent(
     entries: Array<{ did: string; publicKey: Uint8Array }>,
     importId: string,
@@ -187,20 +248,15 @@ export class KnownSignersStore {
       bytes: Uint8Array
     ) => Promise<void>
   ): Promise<void> {
-    // Phase 1: determine which candidates are NET-NEW (dedupe by storage
-    // key too - the caller's `entries` array is not itself guaranteed
-    // deduplicated) without writing anything yet.
-    const netNew = new Map<string, { did: string; publicKey: Uint8Array }>();
-    for (const { did, publicKey } of entries) {
-      const key = knownSignerStorageKey(did);
-      if (netNew.has(key)) continue;
-      const existing = await this.storage.read(KNOWN_SIGNERS_NAMESPACE, key);
-      if (existing !== null) continue;
-      netNew.set(key, { did, publicKey });
-    }
+    // Phase 1 (shared with wouldExceedCapacity - see computeNetNew).
+    const netNew = await this.computeNetNew(entries);
     if (netNew.size === 0) return;
 
-    // Phase 2: the store-wide cap check, BEFORE any write.
+    // Phase 2: the store-wide cap check, BEFORE any write. This is the
+    // AUTHORITATIVE, second-line check - callers are expected to have
+    // already preflighted with `wouldExceedCapacity` before doing anything
+    // else that would need rolling back, but this method never trusts that
+    // they did.
     const currentCount = (await this.storage.list(KNOWN_SIGNERS_NAMESPACE))
       .length;
     if (currentCount + netNew.size > this.maxKnownSigners) {

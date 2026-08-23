@@ -1,4 +1,3 @@
-// fail-before-exempt: this branch's ONLY net diff in this file relative to origin/main, after the independent gate on #1303 (2026-08-23, item 5) reverted the earlier in-place EXIT_BUNDLE_ARTIFACT_KINDS widening, is an explanatory comment above an assertion whose expected value is byte-identical to origin/main's - it holds under both pre-fix and post-fix source by construction. The actual new behavior (the separate known-signers manifest version + its own exact artifact-set contract) is covered fail-before by test/exit/exit-known-signers.test.ts and test/exit/exit-bundle.test.ts.
 import { ed25519 } from "@noble/curves/ed25519";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -162,16 +161,6 @@ function synchronizeInitialPassageReads(
 describe("Exit V2 SDW memory archive", () => {
   it("adds a distinct V2 contract while leaving the closed V1 contract byte-stable", async () => {
     expect(EXIT_BUNDLE_MANIFEST_VERSION).toBe("SANCTUARY_EXIT_BUNDLE_V1");
-    // Exit V2 drill F2 (2026-08-22/23) / independent gate item 5
-    // (2026-08-23): EXIT_BUNDLE_ARTIFACT_KINDS names the ORIGINAL, FROZEN
-    // V1 seven-artifact contract, byte-stable and UNCHANGED - a bundle
-    // carrying the new known_signers artifact declares a SEPARATE manifest
-    // version (EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS) with its own
-    // exact eight-kind contract (EXIT_BUNDLE_ARTIFACT_KINDS_V1_KNOWN_SIGNERS,
-    // contracts/v1.1/constants.ts) instead of widening V1 in place - so a
-    // pre-this-change verifier, which only recognizes the original literal,
-    // refuses a new export cleanly via manifest_unknown_version rather than
-    // choking on an artifact kind it has no way to interpret.
     expect(EXIT_BUNDLE_ARTIFACT_KINDS).toEqual([
       "public_identity",
       "encrypted_state",
