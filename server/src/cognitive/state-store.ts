@@ -659,6 +659,24 @@ type DisclosureWithoutVerifiedReadFields = [
  * of storage after the fact - a re-read cannot tell this write's own bytes
  * from a different writer's bytes landing in the same instant.
  */
+/**
+ * HIGH (Codex gate, 2026-08-22): a caller-supplied box letting a BATCH of
+ * writes (the exit-import module's rekeyState loop is the only caller
+ * today) reuse ONE loaded+parsed+MAC-verified version-anchors record
+ * across every write in the batch, instead of each write reloading the
+ * record from scratch - the record grows by one entry per distinct
+ * namespace/key ever written, so N writes each reloading it is O(N^2)
+ * work for an N-entry import. `anchors` is `null` until the first write
+ * in the batch populates it; `dirty` is set whenever a write raises the
+ * floor and cleared by flushVersionAnchorsCache. The cache is scoped to
+ * ONE caller's batch (never shared across callers) - `write()` and
+ * `flushVersionAnchorsCache` are the only two places that touch it.
+ */
+export interface VersionAnchorsCache {
+  anchors: Record<string, unknown> | null;
+  dirty: boolean;
+}
+
 type RawWriteObserver = (
   namespace: string,
   key: string,
@@ -722,6 +740,16 @@ export interface WriteOptions {
    * general use; same in-process-forgeable bound as the option above.
    */
   onRawWrite?: RawWriteObserver;
+  /**
+   * HIGH (Codex gate, 2026-08-22): see {@link VersionAnchorsCache}'s doc
+   * comment - a batch caller reuses one loaded record across every write
+   * in the batch instead of paying an O(record size) reload per write.
+   * Not for general use; the record is NOT durably flushed by write()
+   * itself when this is set (call flushVersionAnchorsCache when the batch
+   * finishes) - a caller that sets this and never flushes leaves the
+   * floor raise unpersisted.
+   */
+  versionAnchorsCache?: VersionAnchorsCache;
 }
 
 /** Cached namespace key with TTL */
@@ -1541,15 +1569,51 @@ export class StateStore {
     return keys;
   }
 
+  /**
+   * HIGH (Codex gate, 2026-08-22): the cache-aware load - populates
+   * `cache.anchors` on first use within a batch, then reuses it for every
+   * later call in the SAME batch instead of reloading. No cache supplied
+   * (every caller except rekeyState's batch) behaves exactly as
+   * loadVersionAnchors() always has - a fresh load every call.
+   */
+  private async loadVersionAnchorsCached(
+    cache?: VersionAnchorsCache
+  ): Promise<Record<string, unknown>> {
+    if (!cache) return this.loadVersionAnchors();
+    if (cache.anchors === null) {
+      cache.anchors = await this.loadVersionAnchors();
+    }
+    return cache.anchors;
+  }
+
   private async getAnchoredVersion(
     namespace: string,
-    key: string
+    key: string,
+    cache?: VersionAnchorsCache
   ): Promise<number> {
-    const anchors = await this.loadVersionAnchors();
+    const anchors = await this.loadVersionAnchorsCached(cache);
     const anchored = anchors[this.versionKey(namespace, key)];
     return typeof anchored === "number" && Number.isSafeInteger(anchored)
       ? anchored
       : 0;
+  }
+
+  /**
+   * HIGH (Codex gate, 2026-08-22): flushes a batch's cached, in-memory
+   * anchor raises to durable storage in ONE write, instead of one write
+   * per raise. Call once a batch (rekeyState's loop) finishes; a no-op if
+   * nothing in the batch actually raised the floor. `onRawWrite` fires for
+   * this ONE flush write with the FINAL bytes, so the exit-import
+   * module's post-image record reflects what is actually on disk when the
+   * batch completes - never an intermediate, unflushed value.
+   */
+  async flushVersionAnchorsCache(
+    cache: VersionAnchorsCache,
+    onRawWrite?: RawWriteObserver
+  ): Promise<void> {
+    if (!cache.dirty || cache.anchors === null) return;
+    await this.saveVersionAnchors(cache.anchors, onRawWrite);
+    cache.dirty = false;
   }
 
   /**
@@ -1578,13 +1642,14 @@ export class StateStore {
   private async assertNotBelowVersionFloor(
     namespace: string,
     key: string,
-    version: number
+    version: number,
+    cache?: VersionAnchorsCache
   ): Promise<{
     anchors: Record<string, unknown>;
     vk: string;
     lastSeen: number;
   }> {
-    const anchors = await this.loadVersionAnchors();
+    const anchors = await this.loadVersionAnchorsCached(cache);
     const vk = this.versionKey(namespace, key);
     const anchored = anchors[vk];
     const lastSeen =
@@ -1615,17 +1680,27 @@ export class StateStore {
     namespace: string,
     key: string,
     version: number,
-    onRawWrite?: RawWriteObserver
+    onRawWrite?: RawWriteObserver,
+    cache?: VersionAnchorsCache
   ): Promise<void> {
     const { anchors, vk, lastSeen } = await this.assertNotBelowVersionFloor(
       namespace,
       key,
-      version
+      version,
+      cache
     );
 
     if (version > lastSeen) {
       anchors[vk] = version;
-      await this.saveVersionAnchors(anchors, onRawWrite);
+      // HIGH (Codex gate, 2026-08-22): with a cache, defer the durable
+      // write to flushVersionAnchorsCache - `anchors` IS `cache.anchors`
+      // (same object, mutated in place above), so this raise is already
+      // visible to every later call in the SAME batch without a save.
+      if (cache) {
+        cache.dirty = true;
+      } else {
+        await this.saveVersionAnchors(anchors, onRawWrite);
+      }
     }
   }
 
@@ -1736,7 +1811,11 @@ export class StateStore {
     // Determine version number (monotonically increasing)
     const vk = this.versionKey(namespace, key);
     const currentVersion = this.versionCache.get(vk) ?? 0;
-    const anchoredVersion = await this.getAnchoredVersion(namespace, key);
+    const anchoredVersion = await this.getAnchoredVersion(
+      namespace,
+      key,
+      options.versionAnchorsCache
+    );
     const newVersion = Math.max(currentVersion, anchoredVersion) + 1;
 
     const now = new Date().toISOString();
@@ -1804,7 +1883,13 @@ export class StateStore {
     await this.storage.write(namespace, key, serialized);
     await runRawWriteObserver(options.onRawWrite, namespace, key, serialized);
     await this.rememberWriterPublicKey(identityId, writerPublicKey, options.onRawWrite);
-    await this.observeVersion(namespace, key, newVersion, options.onRawWrite);
+    await this.observeVersion(
+      namespace,
+      key,
+      newVersion,
+      options.onRawWrite,
+      options.versionAnchorsCache
+    );
 
     // Update caches
     this.versionCache.set(vk, newVersion);

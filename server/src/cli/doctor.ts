@@ -144,6 +144,7 @@ export async function runDoctorChecks(opts: {
   checks.push(await checkAuditChain(opts.storagePath, masterKey ?? undefined));
   checks.push(await checkCustodyFactors(opts.storagePath));
   checks.push(await checkInterruptedExitImport(opts.storagePath));
+  checks.push(await checkExitAdmissionLock(opts.storagePath));
   checks.push(checkRuntime());
   checks.push(await checkHermesConfigParser(opts));
   checks.push(await checkCastleWall(opts));
@@ -269,6 +270,88 @@ async function checkInterruptedExitImport(storagePath: string): Promise<DoctorCh
     "no interrupted exit import pending",
     "n/a",
   );
+}
+
+/**
+ * MEDIUM-3 (Codex gate, 2026-08-22): the writer guard's fortress-wide
+ * admission lock is a plain file, not visible through
+ * checkInterruptedExitImport above (which only lists journal entries,
+ * never the lock file - list() filters to entry files and the lock is
+ * not one). A held lock now blocks recovery outright by design (no
+ * auto-stale-break), so a stuck fortress with no journal-namespace
+ * finding otherwise reads as healthy while actually wedged on this file.
+ */
+async function checkExitAdmissionLock(storagePath: string): Promise<DoctorCheck> {
+  const storage = new FilesystemStorage(join(storagePath, "state"));
+  let lockDir: string;
+  try {
+    lockDir = storage.namespacePath(EXIT_IMPORT_JOURNAL_NAMESPACE);
+  } catch (error) {
+    return warn(
+      "exit admission lock",
+      `could not resolve the admission lock path: ${error instanceof Error ? error.message : String(error)}`,
+      "re-run after confirming the fortress storage path is reachable",
+    );
+  }
+  const lockPath = join(lockDir, "admission.lock");
+  let raw: string;
+  try {
+    raw = await readFile(lockPath, "utf8");
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return ok("exit admission lock", "no admission lock held", "n/a");
+    }
+    return warn(
+      "exit admission lock",
+      `could not check the admission lock: ${error instanceof Error ? error.message : String(error)}`,
+      "re-run after confirming the fortress storage path is reachable",
+    );
+  }
+  let owner: string | undefined;
+  let pid: number | undefined;
+  let acquiredAt: string | undefined;
+  try {
+    const candidate = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof candidate.owner === "string") owner = candidate.owner;
+    if (typeof candidate.pid === "number") pid = candidate.pid;
+    if (typeof candidate.acquired_at === "string") acquiredAt = candidate.acquired_at;
+  } catch {
+    // owner/pid/acquiredAt stay undefined; handled by the check below.
+  }
+  if (owner === undefined || pid === undefined || acquiredAt === undefined) {
+    return fail(
+      "exit admission lock",
+      "admission lock present, metadata unreadable",
+      `inspect ${lockPath} directly; if no exit-import, rotate-master, ` +
+        "resume, or recovery process is actually running against this " +
+        "fortress, remove it - confirm that first, do not remove it on assumption alone.",
+    );
+  }
+  const ownerAlive = isPidAlive(pid);
+  return fail(
+    "exit admission lock",
+    `held by owner=${owner} pid=${pid} acquired_at=${acquiredAt} ` +
+      `(process ${ownerAlive ? "alive" : "not found"})`,
+    ownerAlive
+      ? `pid ${pid} is still running; wait for it to finish, or inspect ` +
+          `${lockPath} directly before deciding to remove it`
+      : `pid ${pid} is not running; confirm no OTHER exit-import, ` +
+          "rotate-master, resume, or recovery process is active against this " +
+          `fortress, then remove ${lockPath} - confirm that first, do not remove it on assumption alone.`,
+  );
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !(error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ESRCH");
+  }
 }
 
 async function checkCustodyFactors(storagePath: string): Promise<DoctorCheck> {

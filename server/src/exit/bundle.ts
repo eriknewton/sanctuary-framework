@@ -26,6 +26,7 @@ import {
   // `_meta` keys a state re-key touches (coordinator gate, 2026-08-22).
   STATE_ENVELOPE_PUBLIC_KEYS_KEY,
   STATE_ENVELOPE_VERSION_ANCHORS_KEY,
+  type VersionAnchorsCache,
 } from "../cognitive/state-store.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
@@ -2114,6 +2115,21 @@ async function snapshotStorageLocations(
 }
 
 /**
+ * MEDIUM-2 (Codex gate, 2026-08-22): the LOCATION half is hashed to a
+ * fixed length - `locationDedupeKey` embeds the raw namespace/key, so an
+ * arbitrarily long operator-chosen state key (there is no length cap on
+ * one) could otherwise push the on-disk record name past a filesystem's
+ * path-component limit, and the resulting ENAMETOOLONG would be read as
+ * "no post-image was ever recorded" (readPostImageHash's own
+ * fail-to-null contract), turning a long key's every recovery into a
+ * false diverged. The `importId:` prefix stays literal (not hashed) so
+ * deletePostImageRecords's prefix-listed cleanup keeps working.
+ */
+function postImageRecordKey(importId: string, loc: StagedLocation): string {
+  return `${importId}:${hashToString(stringToBytes(locationDedupeKey(loc)))}`;
+}
+
+/**
  * MEDIUM-C (Codex gate, 2026-08-22): one small write to the dedicated
  * post-image namespace, keyed by this exact location - not a re-read of
  * `namespace`/`key` (HIGH-A: a re-read cannot tell this write's own bytes
@@ -2121,6 +2137,18 @@ async function snapshotStorageLocations(
  * rewrite of the whole journal record (the quadratic-I/O finding this
  * replaces). `bytes` must be the EXACT buffer the caller just passed to
  * `storage.write` for this location.
+ *
+ * ORDERING (Codex addendum, 2026-08-22): every production caller `await`s
+ * this before its own next journal-set write starts (rekeyState's loop,
+ * ReputationStore.importBundle's loop) - the SAME atomic-rename write
+ * primitive `storage.write` uses everywhere else in this journal (never a
+ * separate fsync step; see writeFileCustody, storage/filesystem.ts), run
+ * strictly in sequence, never concurrently with the next write. A kill
+ * between this write completing and the NEXT journal-set write starting
+ * is the stated fail-closed outcome this function exists to make safe:
+ * the location this call just recorded is confirmed; whatever the next
+ * write would have touched is not, and reads as diverged rather than
+ * being guessed at.
  */
 async function recordPostImage(
   storage: StorageBackend,
@@ -2129,7 +2157,7 @@ async function recordPostImage(
   key: string,
   bytes: Uint8Array
 ): Promise<void> {
-  const postImageKey = `${importId}:${locationDedupeKey({ namespace, key })}`;
+  const postImageKey = postImageRecordKey(importId, { namespace, key });
   await storage.write(
     EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
     postImageKey,
@@ -2149,7 +2177,7 @@ async function readPostImageHash(
   importId: string,
   loc: StagedLocation
 ): Promise<string | null> {
-  const postImageKey = `${importId}:${locationDedupeKey(loc)}`;
+  const postImageKey = postImageRecordKey(importId, loc);
   const raw = await storage.read(EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE, postImageKey);
   if (!raw) return null;
   try {
@@ -2547,20 +2575,6 @@ async function deleteImportJournal(
 }
 
 /**
- * HIGH-1 (Codex gate, 2026-08-22, register id EXIT-JOURNAL-DIVERGE-01):
- * records what THIS import actually wrote to one journal-set location,
- * durably, right after that write - not batched at the end of a phase,
- * so a kill between two entries in a long loop still leaves every
- * already-written entry's post-image on disk for the next recovery to
- * confirm against. Re-persists the WHOLE journal record (reuses
- * writeImportJournal, the same durable-write mechanism the pre-image
- * snapshot already uses); O(total snapshot bytes) per call, uncapped for
- * a very large export - tracked as a follow-up if that becomes the
- * bottleneck a real fortress export actually hits. A no-op when the given
- * location is not one this journal is tracking (the caller passed a
- * location `activationSnapshotLocations` never listed).
- */
-/**
  * F1 (Exit V2 drill D1, 2026-08-22): roll back any import whose journal
  * entry survived a hard kill, using the SAME `restoreStorageSnapshots` the
  * exception-path cleanup in `importExitBundle` uses - a killed run and a
@@ -2642,6 +2656,28 @@ async function recoverInterruptedExitImportsInner(
       continue;
     }
     const record = parsed;
+    // Codex addendum (2026-08-22): enforce the SAME cap the writer side
+    // advertises (MAX_EXIT_IMPORT_JOURNAL_LOCATIONS, checked before any
+    // journal write) on the READ side too - a journal whose own snapshot
+    // count exceeds it did not come from this import path honoring its
+    // own bound (corrupted, hand-crafted, or a future writer bug), and
+    // must not be trusted to restore/diverge-check an unbounded number of
+    // locations.
+    if (record.snapshots.length > MAX_EXIT_IMPORT_JOURNAL_LOCATIONS) {
+      failed.push(entry.key);
+      void auditLog.append(
+        "l1",
+        "exit_bundle_recovery_journal_too_large",
+        record.identity_id,
+        {
+          import_id: record.import_id,
+          snapshot_count: record.snapshots.length,
+          max_allowed: MAX_EXIT_IMPORT_JOURNAL_LOCATIONS,
+        },
+        "failure"
+      );
+      continue;
+    }
     // INVARIANT (kill-during-promote-and-delete case, coordinator gate,
     // 2026-08-22): a kill AFTER the final `activated_at`-stamped import
     // record is written but BEFORE this journal entry is deleted leaves a
@@ -2781,8 +2817,9 @@ export async function recoverInterruptedExitImportsOrThrow(
     // rather than only "resolved" with no pointer.
     const remediation =
       result.diverged.length > 0
-        ? "At least one location changed since this import last touched " +
-          "it and was left untouched rather than guessed at. Inspect the " +
+        ? "At least one location's current bytes could not be confirmed " +
+          "as this import's own write and was left untouched rather than " +
+          "guessed at. Inspect the " +
           `journal entr${result.diverged.length === 1 ? "y" : "ies"} under ` +
           "<fortress state path>/_exit_import_journal directly, confirm " +
           "which value is the one you want to keep, and only then remove " +
@@ -2947,6 +2984,12 @@ async function rekeyState(
   }
 
   const stateStore = new StateStore(opts.storage, opts.masterKey);
+  // HIGH (Codex gate, 2026-08-22): one version-anchors cache for this
+  // WHOLE loop, not a fresh load per entry - see VersionAnchorsCache's
+  // own doc comment for why a per-entry reload of this specific record
+  // is quadratic for an N-entry import. Flushed once after the loop
+  // below.
+  const versionAnchorsCache: VersionAnchorsCache = { anchors: null, dirty: false };
   const identityEncryptionKey = derivePurposeKey(opts.masterKey, "identity-encryption");
   let imported = 0;
   let skipped = 0;
@@ -3085,6 +3128,7 @@ async function rekeyState(
         // this is the one legitimate bypass.
         allowDuringOwnExitImportActivation: true,
         onRawWrite,
+        versionAnchorsCache,
       }
     );
     imported++;
@@ -3098,6 +3142,13 @@ async function rekeyState(
     }
     importedRekeyEntries?.push({ namespace: item.namespace, key: item.key });
   }
+
+  // HIGH (Codex gate, 2026-08-22): flush the batched version-anchors raise
+  // (if any entry actually raised it) to durable storage in ONE write,
+  // with `onRawWrite` recording ITS post-image from the final flushed
+  // bytes - never an intermediate, unflushed value. A no-op when the loop
+  // wrote nothing (skipped_no_destination_signer, or every entry skipped).
+  await stateStore.flushVersionAnchorsCache(versionAnchorsCache, onRawWrite);
 
   if (decryptAttempts > 0 && decryptFailures === decryptAttempts) {
     // Nothing decrypted under the recovered source master: wrong source
@@ -3673,6 +3724,38 @@ export async function importExitBundle(
         "before any snapshot or journal write"
     );
   }
+  // Hoisted out of the admission-lock callback below (HIGH-1, Codex gate,
+  // 2026-08-22): assigned inside the locked region, read by the final
+  // `return` after the lock releases.
+  // Definite-assignment (`!`): both are only ever read after the admission
+  // lock's callback below returns without throwing, at which point they
+  // are always assigned - if the callback throws, this function throws
+  // too and the read never happens.
+  let reputationResult!: {
+    imported_attestations: number;
+    invalid_attestations: number;
+    unverifiable_attestations: number;
+  };
+  const rotationStats = {
+    entriesAdmittedByCurrentKey: 0,
+    entriesAdmittedByRetiredKey: 0,
+    entriesAdmittedByCompromisedRetiredKey: 0,
+  };
+  let stateResult!: ImportExitBundleResult["state"];
+  // HIGH-1 (Codex gate, 2026-08-22): the admission lock now spans
+  // from BEFORE the pre-image snapshot through deleteImportJournal on
+  // every path (success and the catch-block cleanup) - not just the
+  // journal-publish step. A short lock left every OTHER location this
+  // import writes (after publish, before completion) reachable by a
+  // concurrent recovery pass: recovery cannot tell "this journal
+  // belongs to a LIVE import" from "this journal belongs to a DEAD
+  // one" except by mutual exclusion with the live one, since a live
+  // write and its own recorded post-image look, to recovery, exactly
+  // like a dead import's already-confirmed write. A concurrent open
+  // now waits the admission lock's bound and refuses (the existing
+  // remediation) rather than ever reverting a write this import is
+  // still making.
+  await withExitAdmissionLock(opts.storage, "import", async () => {
   const activationSnapshots = await snapshotStorageLocations(
     opts.storage,
     journalLocations
@@ -3688,28 +3771,27 @@ export async function importExitBundle(
   // next `importExitBundle` call or fortress open, not just on a caught
   // exception.
   //
-  // HIGH-B (Codex gate, 2026-08-22): the rotation re-check and the journal
-  // publish happen TOGETHER under the exit-admission lock, so a rotation
-  // whose own preflight passes cannot land its journal in the gap between
-  // this check and this write - the SAME race the top-of-function check
-  // (before verification, above) cannot see. Nothing has been staged yet at
-  // this point, so a refusal here throws directly; there is nothing for the
-  // catch block below to roll back.
-  await withExitAdmissionLock(opts.storage, "import", async () => {
-    if (await opts.storage.read("_meta", ROTATION_JOURNAL_KEY)) {
-      throw new ExitBundleImportError(
-        "ROTATION_IN_PROGRESS",
-        "a master rotation is in progress on this fortress; finish it " +
-          "(`sanctuary rotate-master --resume`) before importing an exit bundle"
-      );
-    }
-    await writeImportJournal(
-      opts.storage,
-      importId,
-      manifest.body.identity_binding.identity_id,
-      activationSnapshots
+  // HIGH-1 (Codex gate, 2026-08-22): the rotation re-check and the journal
+  // publish happen under the SAME admission lock that now spans the whole
+  // rest of this function (see the withExitAdmissionLock wrap below) - a
+  // rotation whose own preflight passes cannot land its journal in the gap
+  // between this check and this write, the SAME race the top-of-function
+  // check (before verification, above) cannot see. Nothing has been staged
+  // yet at this point, so a refusal here throws directly; there is nothing
+  // for the catch block below to roll back.
+  if (await opts.storage.read("_meta", ROTATION_JOURNAL_KEY)) {
+    throw new ExitBundleImportError(
+      "ROTATION_IN_PROGRESS",
+      "a master rotation is in progress on this fortress; finish it " +
+        "(`sanctuary rotate-master --resume`) before importing an exit bundle"
     );
-  });
+  }
+  await writeImportJournal(
+    opts.storage,
+    importId,
+    manifest.body.identity_binding.identity_id,
+    activationSnapshots
+  );
   // Track every staged storage location for result telemetry and cleanup
   // accounting. Snapshot restoration below is what preserves overwritten
   // pre-existing bytes.
@@ -3717,17 +3799,11 @@ export async function importExitBundle(
   // Same accumulator for the per-entry rekey writes, populated by
   // rekeyState as it succeeds, consumed on failure.
   const importedRekeyEntries: StagedLocation[] = [];
-  let reputationResult = {
+  reputationResult = {
     imported_attestations: 0,
     invalid_attestations: 0,
     unverifiable_attestations: verification.reputation?.unverifiable_attestations ?? 0,
   };
-  const rotationStats = {
-    entriesAdmittedByCurrentKey: 0,
-    entriesAdmittedByRetiredKey: 0,
-    entriesAdmittedByCompromisedRetiredKey: 0,
-  };
-  let stateResult: ImportExitBundleResult["state"];
   // Resolved INSIDE the try block: a fail-closed source-credential error
   // (SOURCE_CREDENTIAL_INVALID / SOURCE_KEY_UNAVAILABLE / malformed
   // source_custody) must roll back the artifacts staged above, exactly like
@@ -4061,6 +4137,7 @@ export async function importExitBundle(
       sourceMasterKey.fill(0);
     }
   }
+  });
 
   return {
     verified: true,

@@ -35,7 +35,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, rm, open } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, open, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -49,6 +49,7 @@ import {
   resolveCliMasterKey,
   ROTATION_JOURNAL_KEY,
 } from "../../src/core/master-custody.js";
+import { ExitAdmissionLockError } from "../../src/storage/exit-import-journal.js";
 import {
   StateStore,
   STATE_ENVELOPE_VERSION_ANCHORS_KEY,
@@ -70,16 +71,17 @@ import {
 } from "../../src/exit/bundle.js";
 
 /**
- * CONTRACT PIN: must match locationDedupeKey in server/src/exit/bundle.ts -
- * the encoding a planted post-image record's key needs to match for
- * readPostImageHash (bundle.ts) to find it.
+ * CONTRACT PIN: must match postImageRecordKey in server/src/exit/bundle.ts
+ * (MEDIUM-2, Codex gate, 2026-08-22: the location half is hashed to a
+ * fixed length, not embedded raw) - the encoding a planted post-image
+ * record's key needs to match for readPostImageHash (bundle.ts) to find it.
  */
 function postImageKey(
   importId: string,
   namespace: string,
   key: string
 ): string {
-  return `${importId}:${namespace.length}:${namespace}${key}`;
+  return `${importId}:${hashToString(stringToBytes(`${namespace.length}:${namespace}${key}`))}`;
 }
 
 const HELPER_DIR = dirname(fileURLToPath(import.meta.url));
@@ -235,6 +237,21 @@ async function snapshotAll(storage: MemoryStorage): Promise<string> {
   for (const ns of namespaces) {
     if (ns.startsWith("_audit")) continue;
     const entries: StorageEntryMeta[] = await storage.list(ns);
+    for (const entry of entries) {
+      const data = await storage.read(ns, entry.key);
+      rows.push(`${ns}/${entry.key}:${data ? toBase64url(data) : "null"}`);
+    }
+  }
+  return rows.sort().join("\n");
+}
+
+/** Full-content snapshot of a FilesystemStorage's `state` tree, same exclusions as `snapshotAll`. */
+async function snapshotFilesystem(storage: FilesystemStorage): Promise<string> {
+  const namespaces = await storage.listNamespaces();
+  const rows: string[] = [];
+  for (const ns of namespaces) {
+    if (ns.startsWith("_audit")) continue;
+    const entries = await storage.list(ns);
     for (const entry of entries) {
       const data = await storage.read(ns, entry.key);
       rows.push(`${ns}/${entry.key}:${data ? toBase64url(data) : "null"}`);
@@ -649,21 +666,6 @@ describe("F1: a real child-process SIGKILL mid-import leaves the target unable t
     return dir;
   }
 
-  /** Full-content snapshot of a FilesystemStorage's `state` tree, same exclusions as `snapshotAll`. */
-  async function snapshotFilesystem(storage: FilesystemStorage): Promise<string> {
-    const namespaces = await storage.listNamespaces();
-    const rows: string[] = [];
-    for (const ns of namespaces) {
-      if (ns.startsWith("_audit")) continue;
-      const entries = await storage.list(ns);
-      for (const entry of entries) {
-        const data = await storage.read(ns, entry.key);
-        rows.push(`${ns}/${entry.key}:${data ? toBase64url(data) : "null"}`);
-      }
-    }
-    return rows.sort().join("\n");
-  }
-
   it(
     "SIGKILL mid-import: target tree is byte-identical to pre-import after fortress-open recovery, and a subsequent clean import yields the same entry counts as a fresh target",
     async () => {
@@ -866,7 +868,25 @@ describe("F1: a real child-process SIGKILL mid-import leaves the target unable t
       // retry import at all.
       const reopenedStorage = new FilesystemStorage(join(targetDir, "state"));
       const reopenedAuditLog = new AuditLog(reopenedStorage, targetMasterKey);
-      const recovery = await recoverInterruptedExitImports(reopenedStorage, reopenedAuditLog);
+      // HIGH-1 (Codex gate, 2026-08-22): the SIGKILL now lands WHILE the
+      // import holds the admission lock for its whole duration, so this
+      // reopen can ALSO observe a stale lock (no auto-stale-break) and
+      // refuse outright, never revert a write the (now-dead) import was
+      // still making - this is the fix working as designed, not a flake.
+      // Simulate the operator remediation doctor's MEDIUM-3 fix directs
+      // (confirm the owner pid is dead, then remove) and retry once.
+      let recovery: Awaited<ReturnType<typeof recoverInterruptedExitImports>>;
+      try {
+        recovery = await recoverInterruptedExitImports(reopenedStorage, reopenedAuditLog);
+      } catch (err) {
+        if (!(err instanceof ExitAdmissionLockError)) throw err;
+        const lockPath = join(
+          reopenedStorage.namespacePath(EXIT_IMPORT_JOURNAL_NAMESPACE),
+          "admission.lock"
+        );
+        await rm(lockPath, { force: true });
+        recovery = await recoverInterruptedExitImports(reopenedStorage, reopenedAuditLog);
+      }
       await reopenedAuditLog.flush();
       // HIGH-1 (Codex gate, 2026-08-22, register id EXIT-JOURNAL-DIVERGE-01):
       // a real SIGKILL's timing is not fully controlled by this test (only
@@ -1437,6 +1457,14 @@ describe("F3 (coordinator gate, 2026-08-22): post-image-confirmed restore, deter
     const restored = await destinationStorage.read("f3-ns", "k");
     expect(restored ? toBase64url(restored) : null).toBe(toBase64url(preImage));
     expect(await destinationStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
+
+    // Codex addendum (2026-08-22): a clean recovery is also audited, not
+    // just returned.
+    const audited = await destination.auditLog.query({
+      operation_type: "exit_bundle_interrupted_import_recovered",
+    });
+    expect(audited.entries.length).toBeGreaterThan(0);
+    expect(audited.entries[0]!.result).toBe("success");
   });
 
   it("current bytes match neither the pre-image nor the recorded post-image: diverged, bytes left untouched, audited, remediation text present", async () => {
@@ -1488,7 +1516,7 @@ describe("F3 (coordinator gate, 2026-08-22): post-image-confirmed restore, deter
 
     await expect(
       recoverInterruptedExitImportsOrThrow(destinationStorage, destination.auditLog)
-    ).rejects.toThrow(/At least one location changed since this import last touched/);
+    ).rejects.toThrow(/could not be confirmed as this import's own write/);
   });
 
   it("no post-image record exists at all (never recorded) and current differs from the pre-image: diverged, not silently restored", async () => {
@@ -1522,6 +1550,19 @@ describe("F3 (coordinator gate, 2026-08-22): post-image-confirmed restore, deter
     expect(result.diverged).toEqual(["planted-f3-null-postimage"]);
     const untouched = await destinationStorage.read("f3-ns", "k");
     expect(untouched ? toBase64url(untouched) : null).toBe(toBase64url(unrecordedWrite));
+
+    // Codex addendum (2026-08-22): a never-recorded post-image is still
+    // audited as diverged, and the OrThrow wrapper's error names the
+    // SAME remediation text a diverged-with-a-post-image case gets - the
+    // operator does not need to know WHY it diverged to know what to do.
+    const audited = await destination.auditLog.query({
+      operation_type: "exit_bundle_recovery_diverged",
+    });
+    expect(audited.entries.length).toBeGreaterThan(0);
+    expect(audited.entries[0]!.result).toBe("failure");
+    await expect(
+      recoverInterruptedExitImportsOrThrow(destinationStorage, destination.auditLog)
+    ).rejects.toThrow(/could not be confirmed as this import's own write/);
   });
 });
 
@@ -1560,10 +1601,77 @@ describe("HIGH-B (coordinator gate, 2026-08-22): fortress-wide exit-admission lo
 
     // The lock file itself is untouched by the failed acquire attempt (no
     // auto-break) - still there, still readable, still the original holder.
-    const readHandle = await open(lockPath, "r");
-    const stillLocked = JSON.parse(await readHandle.readFile("utf8"));
-    await readHandle.close();
+    // CodeQL js/file-system-race (2026-08-23): read the path directly with
+    // its own error handling rather than a check (stat/exists) followed by
+    // a separate open - readFile is the single atomic operation, and a
+    // vanished file surfaces as this call throwing, not as a prior check
+    // going stale.
+    let stillLockedRaw: string;
+    try {
+      stillLockedRaw = await readFile(lockPath, "utf8");
+    } catch (err) {
+      throw new Error(
+        `expected the admission lock at ${lockPath} to still be present ` +
+          `(no auto-stale-break): ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    const stillLocked = JSON.parse(stillLockedRaw);
     expect(stillLocked.owner).toBe("import");
+  }, 20_000);
+
+  it("MEDIUM-4 (coordinator gate, 2026-08-22): a held admission lock refuses importExitBundle before any snapshot or journal write, changing nothing", async () => {
+    const source = await makeSource("highb-import-lock", 1, 0);
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-exit-admission-import-"));
+    tempDirs.push(dir);
+    const bundleDirLocal = await mkdtemp(join(tmpdir(), "sanctuary-exit-admission-import-bundle-"));
+    tempDirs.push(bundleDirLocal);
+    const exported = await exportBundle(source, bundleDirLocal, "highb-import-lock-ns");
+
+    const storage = new FilesystemStorage(join(dir, "state"));
+    const destMasterKey = generateRandomKey();
+    const destination = await buildHarness(storage, destMasterKey);
+    const identity = await callTool(destination.tools, "identity_create", {
+      label: "highb-import-lock-signer",
+    });
+    // identity_create's own audit append is fire-and-forget; flush before
+    // snapshotting so this test's own setup does not read as a change
+    // caused by the (refused) import attempt below.
+    await destination.auditLog.flush();
+
+    const lockDir = storage.namespacePath(EXIT_IMPORT_JOURNAL_NAMESPACE);
+    const lockPath = join(lockDir, "admission.lock");
+    await mkdir(lockDir, { recursive: true, mode: 0o700 });
+    const handle = await open(lockPath, "wx", 0o600);
+    await handle.writeFile(
+      JSON.stringify({ owner: "rotate", pid: 999_999, acquired_at: new Date(0).toISOString() })
+    );
+    await handle.close();
+
+    await expect(
+      importExitBundle({
+        bundleDir: bundleDirLocal,
+        storage,
+        masterKey: destMasterKey,
+        identityManager: destination.identityManager,
+        auditLog: destination.auditLog,
+        reputationStore: destination.reputationStore,
+        activate: true,
+        forceRebind: true,
+        sourceRecoveryKey: exported.state_rekey_key,
+        destinationSignerIdentityId: identity.identity_id as string,
+      })
+    ).rejects.toThrow(ExitAdmissionLockError);
+
+    // No journal was ever published and none of the bundle's data was
+    // imported - the lock refusal happens BEFORE writeImportJournal, per
+    // HIGH-1's fix. (Not a whole-tree hash comparison: legitimate,
+    // lock-unrelated setup work - e.g. IdentityManager's own lazy
+    // primary-identity-pointer persistence - can still run before the
+    // lock is even reached, and that is not this test's property.)
+    expect(await storage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
+    expect(await storage.list("highb-import-lock-ns")).toHaveLength(0);
+    const stillLockedRaw2 = await readFile(lockPath, "utf8");
+    expect(JSON.parse(stillLockedRaw2).owner).toBe("rotate");
   }, 20_000);
 });
 
@@ -1623,16 +1731,17 @@ describe("F4 (coordinator gate, 2026-08-22): a `_meta` write fault after entry b
     const exported = await exportBundle(source, bundleDir, "f4-metafault-ns");
     const destination = await makeDestination();
     const destinationStorage = destination.storage as MemoryStorage;
-    // 3rd `_meta` write = the SECOND entry's version-anchor update (the
-    // first entry's writer-key-registry write is #1, its own anchor
-    // update is #2; the second entry's writer-key-registry write is
-    // skipped - same signer, unchanged - so its anchor update is #3).
-    // By this point entry 1's bytes AND post-image are already durably
-    // recorded; entry 2's own MAIN ENTRY write (which happens before this
-    // `_meta` update, inside the same stateStore.write call) has ALSO
-    // already landed with its own post-image recorded (HIGH-A: recorded
-    // per raw write, not batched at the end of the call).
-    const wrapped = new NthMetaWriteFaultStorage(destinationStorage, 3);
+    // 2nd `_meta` write = the BATCHED version-anchors flush (HIGH,
+    // Codex gate, 2026-08-22: rekeyState caches the anchors record across
+    // its whole loop and flushes it ONCE after both entries, instead of
+    // once per entry - see VersionAnchorsCache's doc comment,
+    // cognitive/state-store.ts). The first `_meta` write is entry 1's
+    // writer-key-registry update (entry 2's is skipped - same signer,
+    // unchanged). By the time this batched flush runs, BOTH entries' own
+    // MAIN ENTRY bytes and post-images are already durably recorded
+    // (HIGH-A: recorded per raw write as each entry's loop iteration
+    // completes, before the batch flush that follows the whole loop).
+    const wrapped = new NthMetaWriteFaultStorage(destinationStorage, 2);
 
     await expect(
       importExitBundle({
@@ -1660,4 +1769,133 @@ describe("F4 (coordinator gate, 2026-08-22): a `_meta` write fault after entry b
     const recovery = await recoverInterruptedExitImports(destinationStorage, destination.auditLog);
     expect(recovery).toEqual({ recovered: 0, failed: [], diverged: [], divergedLocations: [] });
   });
+});
+
+describe("HIGH-1 (coordinator gate, 2026-08-22): two graphs, one on-disk fortress - a concurrent open cannot revert a live import", () => {
+  const tempDirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+  async function newBundleDir(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-exit-highb-"));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  it("graph B's open refuses with the lock error and changes nothing while graph A is mid-import; after A completes, B opens cleanly", async () => {
+    class PauseOnFirstMainEntryWrite implements StorageBackend {
+      private paused = false;
+      readonly pausedSignal: Promise<void>;
+      private releasePause!: () => void;
+      private release: Promise<void>;
+      private resolveRelease!: () => void;
+      constructor(private readonly inner: StorageBackend, private readonly pauseNamespace: string) {
+        this.pausedSignal = new Promise((resolve) => {
+          this.releasePause = resolve;
+        });
+        this.release = new Promise((resolve) => {
+          this.resolveRelease = resolve;
+        });
+      }
+      async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+        if (!this.paused && namespace === this.pauseNamespace) {
+          this.paused = true;
+          await this.inner.write(namespace, key, data);
+          this.releasePause();
+          await this.release;
+          return;
+        }
+        return this.inner.write(namespace, key, data);
+      }
+      releaseGraphA(): void {
+        this.resolveRelease();
+      }
+      read(namespace: string, key: string): Promise<Uint8Array | null> {
+        return this.inner.read(namespace, key);
+      }
+      delete(namespace: string, key: string, secureOverwrite?: boolean): Promise<boolean> {
+        return this.inner.delete(namespace, key, secureOverwrite);
+      }
+      list(namespace: string, prefix?: string): Promise<StorageEntryMeta[]> {
+        return this.inner.list(namespace, prefix);
+      }
+      exists(namespace: string, key: string): Promise<boolean> {
+        return this.inner.exists(namespace, key);
+      }
+      totalSize(): Promise<number> {
+        return this.inner.totalSize();
+      }
+      listNamespaces(): Promise<string[]> {
+        return (this.inner as FilesystemStorage).listNamespaces();
+      }
+      namespacePath(namespace: string): string {
+        return (this.inner as FilesystemStorage).namespacePath(namespace);
+      }
+      writeDurable(namespace: string, key: string, data: Uint8Array): Promise<void> {
+        return (this.inner as FilesystemStorage).writeDurable(namespace, key, data);
+      }
+    }
+
+    const source = await makeSource("highb-graphs", 2, 0);
+    const bundleDir = await newBundleDir();
+    const exported = await exportBundle(source, bundleDir, "highb-graphs-ns");
+
+    const destDir = await mkdtemp(join(tmpdir(), "sanctuary-exit-highb-dest-"));
+    tempDirs.push(destDir);
+    const rawDestStorage = new FilesystemStorage(join(destDir, "state"));
+    const destMasterKey = generateRandomKey();
+    const destination = await buildHarness(rawDestStorage, destMasterKey);
+    const identity = await callTool(destination.tools, "identity_create", {
+      label: "highb-destination-signer",
+    });
+    const destinationIdentityId = identity.identity_id as string;
+
+    const wrapped = new PauseOnFirstMainEntryWrite(rawDestStorage, "highb-graphs-ns");
+    const beforeGraphA = await snapshotFilesystem(rawDestStorage);
+
+    // Graph A: import, paused mid-loop right after its FIRST main-entry
+    // write lands (and that entry's own post-image is recorded) - the
+    // admission lock is still held throughout, per HIGH-1's fix.
+    const graphAPromise = importExitBundle({
+      bundleDir,
+      storage: wrapped,
+      masterKey: destMasterKey,
+      identityManager: destination.identityManager,
+      auditLog: destination.auditLog,
+      reputationStore: destination.reputationStore,
+      activate: true,
+      forceRebind: true,
+      sourceRecoveryKey: exported.state_rekey_key,
+      destinationSignerIdentityId: destinationIdentityId,
+    });
+
+    await wrapped.pausedSignal;
+
+    // Graph B: a concurrent "open" (recoverInterruptedExitImports, the
+    // same call createSanctuaryServer/openExitContext make on every
+    // boot) against the SAME on-disk fortress, via a SEPARATE unwrapped
+    // storage handle (a different process would open its own handle the
+    // same way).
+    const graphBStorage = new FilesystemStorage(join(destDir, "state"));
+    const graphBAuditLog = new AuditLog(graphBStorage, destMasterKey);
+    await expect(recoverInterruptedExitImports(graphBStorage, graphBAuditLog)).rejects.toThrow(
+      ExitAdmissionLockError
+    );
+
+    // B's refused attempt changed nothing - the mid-flight tree (paused
+    // exactly after entry 1's write) is unchanged by B's failed attempt.
+    const duringGraphA = await snapshotFilesystem(rawDestStorage);
+    expect(duringGraphA).not.toBe(beforeGraphA);
+    const afterBAttempt = await snapshotFilesystem(rawDestStorage);
+    expect(afterBAttempt).toBe(duringGraphA);
+
+    // Let graph A finish.
+    wrapped.releaseGraphA();
+    const resultA = await graphAPromise;
+    expect(resultA.activated).toBe(true);
+
+    // Now graph B opens cleanly - nothing left to recover.
+    const cleanOpen = await recoverInterruptedExitImports(graphBStorage, graphBAuditLog);
+    expect(cleanOpen).toEqual({ recovered: 0, failed: [], diverged: [], divergedLocations: [] });
+  }, 30_000);
 });

@@ -164,6 +164,13 @@ export async function withPathLock<T>(
   for (;;) {
     try {
       const handle = await open(lockPath, "wx", 0o600);
+      // MEDIUM (Codex gate, 2026-08-22): the O_EXCL create SUCCEEDED at
+      // this point, so this process (uniquely) owns the lock file - a
+      // failure writing/syncing its metadata below is NOT a contention
+      // signal (that is the outer catch's EEXIST branch) and must not
+      // leave an empty, ownerless lock file wedging every future
+      // acquire with no diagnostic content to explain why. Unlink what
+      // this process itself just created before rethrowing.
       try {
         await handle.writeFile(
           JSON.stringify({
@@ -173,11 +180,22 @@ export async function withPathLock<T>(
           }),
         );
         await handle.sync();
-      } finally {
+      } catch (metadataErr) {
         await handle.close();
+        await rm(lockPath, { force: true });
+        throw new CrossProcessLockError(
+          `cross-process lock (${lockPath}) was created but its metadata could ` +
+            `not be written, so the empty lock file was removed rather than left ` +
+            `stuck: ${errorMessage(metadataErr)}`,
+        );
       }
+      await handle.close();
       break;
     } catch (err) {
+      // The metadata-write branch above already unlinked its own orphan
+      // and threw a fully-formed CrossProcessLockError - pass it straight
+      // through instead of re-wrapping it a second time.
+      if (err instanceof CrossProcessLockError) throw err;
       const code =
         err instanceof Error && "code" in err
           ? String((err as NodeJS.ErrnoException).code)

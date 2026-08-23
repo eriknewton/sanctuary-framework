@@ -96,6 +96,17 @@ function toRelSrcPath(absPath: string): string {
  * this fix round, with a one-line reason. Each entry is checked against
  * the LIVE candidate set below, so a stale entry (the file no longer
  * matches, or was wired since) fails loud rather than rotting silently.
+ *
+ * BOUND (Codex gate, 2026-08-22): being on this list is a RECOVERY-WIRING
+ * gap, not a WRITE-SAFETY one - the write chokepoints (StateStore.write/
+ * delete/import, ReputationStore.record/importBundle) refuse while an
+ * exit-import journal exists regardless of whether the call site that
+ * derived its master key also calls recoverInterruptedExitImportsOrThrow.
+ * An unwired path only means: this fortress-owning entry point will not
+ * itself roll back an interrupted import on open, so a stale journal
+ * (and the write refusals it causes) persists until SOME wired path or a
+ * `sanctuary exit` verb runs recovery - never that this path can write
+ * around the guard.
  */
 const ALLOWLIST: Record<string, string> = {
   "src/disclosure/broker/open.ts": "L3 secret-broker open helper; not wired this fix round, scope bounded to the named sites plus low-risk additions found while auditing.",

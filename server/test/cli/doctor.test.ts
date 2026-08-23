@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -376,6 +376,49 @@ approval_channel:
     });
     expect(code).toBe(0);
     expect(out.text()).toContain("OK   exit import recovery");
+  });
+
+  it("MEDIUM-3 (Codex gate, 2026-08-22): FAILs with owner/pid/acquired_at when the admission lock is held", async () => {
+    const fortress = await makeFortress({ identity: true, policy: "valid" });
+    const storage = new FilesystemStorage(join(fortress, "state"));
+    const lockDir = storage.namespacePath("_exit_import_journal");
+    await mkdir(lockDir, { recursive: true, mode: 0o700 });
+    const handle = await open(join(lockDir, "admission.lock"), "wx", 0o600);
+    await handle.writeFile(
+      JSON.stringify({
+        owner: "rotate",
+        pid: 999_999,
+        acquired_at: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    await handle.close();
+
+    const out = new Capture();
+    const code = await runDoctorCommand({
+      argv: ["--fortress", fortress],
+      out,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+      platform: "linux",
+    });
+    expect(code).not.toBe(0);
+    expect(out.text()).toContain("FAIL exit admission lock");
+    expect(out.text()).toContain("owner=rotate");
+    expect(out.text()).toContain("pid=999999");
+    expect(out.text()).toContain("2026-01-01T00:00:00.000Z");
+    expect(out.text()).toContain("not found");
+  });
+
+  it("MEDIUM-3 (Codex gate, 2026-08-22): reports OK for the admission lock when none is held", async () => {
+    const fortress = await makeFortress({ identity: true, policy: "valid", audit: true });
+    const out = new Capture();
+    const code = await runDoctorCommand({
+      argv: ["--fortress", fortress],
+      out,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+      platform: "linux",
+    });
+    expect(code).toBe(0);
+    expect(out.text()).toContain("OK   exit admission lock");
   });
 
   it("emits JSON shape and exits non-zero when checks fail", async () => {

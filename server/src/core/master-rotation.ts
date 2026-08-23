@@ -1920,12 +1920,15 @@ export async function rotateMaster(
       old_wrap_ids: oldEnvelope.wraps.map((w) => w.id),
       new_wrap_ids: stagedEnvelope.wraps.map((w) => w.id),
     };
-    // HIGH-B (Codex gate, 2026-08-22): the re-check and this journal
-    // publish happen TOGETHER under the exit-admission lock - an
-    // exit-import cannot land ITS journal in the gap between this check
-    // and this write. HIGH-2 (Codex gate, 2026-08-22), kept as the
-    // check half of that atomic step.
-    await withExitAdmissionLock(storage, "rotate", async () => {
+    // HIGH-1 (Codex gate, 2026-08-22): the admission lock now spans the
+    // re-check, the journal publish, AND the whole conversion/finalize
+    // that follows - not just the publish step. A short lock left the
+    // conversion writes reachable by a concurrent exit-import's own
+    // recovery-lock-holding pass in the SAME way a short import-side lock
+    // did (see importExitBundle's matching comment, exit/bundle.ts): a
+    // concurrent open must wait this lock's bound and refuse, never
+    // observe or act on a rotation that is still in progress.
+    return await withExitAdmissionLock(storage, "rotate", async () => {
       if (await hasInterruptedExitImport(storage)) {
         throw new RotationPreflightError(
           "an exit-import rollback journal exists for this fortress, meaning " +
@@ -1935,24 +1938,24 @@ export async function rotateMaster(
         );
       }
       await writeJournal(storage, journal, newMaster);
+      failpoint("journal-converting-written");
+
+      log("Converting: re-encrypting fortress data under the new master...");
+      const convertResult = await walkFortress(ctx, false);
+      await convertAuditEpochs(ctx);
+      await convertCastlePin(ctx, false);
+      failpoint("convert-complete");
+
+      log("Finalizing: promoting the new custody envelope...");
+      await finalize(ctx, journal);
+
+      return {
+        rotation_id: rotationId,
+        old_wrap_ids: journal.old_wrap_ids,
+        new_wrap_ids: journal.new_wrap_ids,
+        converted_entries: convertResult.converted,
+      };
     });
-    failpoint("journal-converting-written");
-
-    log("Converting: re-encrypting fortress data under the new master...");
-    const convertResult = await walkFortress(ctx, false);
-    await convertAuditEpochs(ctx);
-    await convertCastlePin(ctx, false);
-    failpoint("convert-complete");
-
-    log("Finalizing: promoting the new custody envelope...");
-    await finalize(ctx, journal);
-
-    return {
-      rotation_id: rotationId,
-      old_wrap_ids: journal.old_wrap_ids,
-      new_wrap_ids: journal.new_wrap_ids,
-      converted_entries: convertResult.converted,
-    };
   } finally {
     zeroizeWriterCache(ctx);
     oldMaster.fill(0);
@@ -2049,40 +2052,40 @@ export async function resumeRotation(
     writerCache: new Map(),
   };
   try {
-    let converted = 0;
-    if (journal.phase === "converting") {
-      // F1 (coordinator gate, 2026-08-22): re-check immediately before
-      // THIS walkFortress call too, not only the top-of-function preflight
-      // above - an exit-import can start and journal between resumeRotation
-      // being invoked and reaching this point (e.g. a caller that read the
-      // journal, unwrapped keys, then paused before this line). HIGH-B
-      // (Codex gate, 2026-08-22): run under the exit-admission lock for
-      // consistency with the other three owners, even though this
-      // function publishes no NEW durable marker of its own (the rotation
-      // journal already exists from the original rotateMaster attempt).
-      await withExitAdmissionLock(storage, "resume", async () => {
-        if (await hasInterruptedExitImport(storage)) {
-          throw new RotationResumeError(
-            "an exit-import rollback journal exists for this fortress, " +
-              "meaning an import started after this resume began; run any " +
-              "`sanctuary exit` verb (for example `sanctuary exit verify`) " +
-              "to recover, then retry the resume"
-          );
-        }
-      });
-      log("Resuming: converting remaining fortress data...");
-      converted = (await walkFortress(ctx, false)).converted;
-      await convertAuditEpochs(ctx);
-      await convertCastlePin(ctx, false);
-    }
-    log("Resuming: finalizing...");
-    await finalize(ctx, journal);
-    return {
-      rotation_id: journal.rotation_id,
-      old_wrap_ids: journal.old_wrap_ids,
-      new_wrap_ids: journal.new_wrap_ids,
-      converted_entries: converted,
-    };
+    // F1 (coordinator gate, 2026-08-22): re-check immediately before
+    // resuming conversion, not only the top-of-function preflight above -
+    // an exit-import can start and journal between resumeRotation being
+    // invoked and reaching this point. HIGH-1 (Codex gate, 2026-08-22):
+    // the admission lock now spans the re-check AND the whole remaining
+    // conversion/finalize, not only the check - same reason as
+    // rotateMaster's matching widened lock (a short lock left the
+    // conversion writes reachable by a concurrent exit-import's own
+    // recovery pass).
+    return await withExitAdmissionLock(storage, "resume", async () => {
+      if (await hasInterruptedExitImport(storage)) {
+        throw new RotationResumeError(
+          "an exit-import rollback journal exists for this fortress, " +
+            "meaning an import started after this resume began; run any " +
+            "`sanctuary exit` verb (for example `sanctuary exit verify`) " +
+            "to recover, then retry the resume"
+        );
+      }
+      let converted = 0;
+      if (journal.phase === "converting") {
+        log("Resuming: converting remaining fortress data...");
+        converted = (await walkFortress(ctx, false)).converted;
+        await convertAuditEpochs(ctx);
+        await convertCastlePin(ctx, false);
+      }
+      log("Resuming: finalizing...");
+      await finalize(ctx, journal);
+      return {
+        rotation_id: journal.rotation_id,
+        old_wrap_ids: journal.old_wrap_ids,
+        new_wrap_ids: journal.new_wrap_ids,
+        converted_entries: converted,
+      };
+    });
   } finally {
     zeroizeWriterCache(ctx);
     oldMaster.fill(0);
