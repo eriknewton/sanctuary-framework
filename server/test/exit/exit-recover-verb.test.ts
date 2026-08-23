@@ -638,7 +638,13 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
         .split("\n")
         .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
         .join("\n");
-    const INTERPOLATION_ADJACENT_TO_FLAG_RE = /\$\{EXIT_RECOVERY_VERB\}[\s`"'+]*--fortress/g;
+    // Trailing \b: "--fortressSettings" must not count (gate round-6 P2).
+    // Consciously deferred (recorded here per the scoping rule): the
+    // comment stripper does not strip unstarred block-comment interiors -
+    // evading this pin that way requires deliberately deceptive code, and
+    // an author willing to do that can as easily edit this test; the pin
+    // exists to catch accidental drift, not malice.
+    const INTERPOLATION_ADJACENT_TO_FLAG_RE = /\$\{EXIT_RECOVERY_VERB\}[\s`"'+]*--fortress\b/g;
     const SERVER_ROOT = join(__dirname, "../..");
     for (const [relPath, expectedCount] of HINT_FILE_EXPECTED_CODE_OCCURRENCES) {
       const source = await readFile(join(SERVER_ROOT, relPath), "utf8");
