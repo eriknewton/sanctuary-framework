@@ -38,7 +38,7 @@ import {
   transcodeMemoryDirectory,
 } from "../sdw/memory-transcode.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { flagValue, flagValues, hasFlag } from "./argv.js";
+import { consumeFlagValues, flagValue, hasFlag } from "./argv.js";
 
 export interface MemoryFileCommandArgs {
   readonly argv: string[];
@@ -82,8 +82,17 @@ export async function runMemoryIngestCommand(
   // force flag. Each path is exact-match only (no globs, no directories) and
   // is checked against the actual source directory listing below; an unknown
   // path is an error (see assertAllowFilesKnown in memory-file-allow-list.ts),
-  // not a silently ignored one.
-  const allowFiles: ReadonlySet<string> = new Set(flagValues(args.argv, "--allow-file"));
+  // not a silently ignored one. consumeFlagValues (not the bare flagValues
+  // scan) so a trailing bare --allow-file, or --allow-file followed by
+  // another flag, is a loud parse error instead of a silently dropped or
+  // silently wrong waiver: a requested waiver must never vanish quietly.
+  const allowFileFlags = consumeFlagValues(args.argv, "--allow-file");
+  if (allowFileFlags.error !== undefined) {
+    write(err, `memory_ingest: ${allowFileFlags.error}
+`);
+    return 2;
+  }
+  const allowFiles: ReadonlySet<string> = new Set(allowFileFlags.values);
 
   const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin);
   if (!boot) return 1;

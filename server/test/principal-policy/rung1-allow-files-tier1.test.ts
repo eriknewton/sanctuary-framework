@@ -28,7 +28,7 @@ function gateFor(policy: ReturnType<typeof parsePolicy>): ApprovalGate {
   );
 }
 
-/** A policy that relaxes memory_ingest to Tier 3 — legal today, unlike memory_delete. */
+/** A policy that relaxes memory_ingest to Tier 3: legal today, unlike memory_delete. */
 function policyRelaxingMemoryIngest(): ReturnType<typeof parsePolicy> {
   return parsePolicy(
     [

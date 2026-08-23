@@ -505,7 +505,7 @@ describe("SDW memory file tools", () => {
       });
 
       // The unknown path throws inside the handler's own pre-write
-      // assertAllowFilesKnown call (Rung-1 fix-round LOW-3), which runs BEFORE
+      // assertAllowFilesKnown call, which runs BEFORE
       // memory_ingest_started, so this denies via the ingest_failed catch path
       // with NO intent record at all -- not the invalid_args pre-check (that
       // is reserved for a malformed harness/dir/allow_files shape), and not a
@@ -602,7 +602,7 @@ describe("SDW memory file tools", () => {
       ).toBe(true);
     });
 
-    it("HIGH-C2: writes the override audit record BEFORE the first corpus write, even when that write then fails", async () => {
+    it("writes the override audit record BEFORE the first corpus write, even when that write then fails", async () => {
       // Injects a failure at the very first storage write the commit phase
       // performs, then proves the override record is already durable -- the
       // override audit is NOT a side effect of a successful commit.
@@ -611,7 +611,7 @@ describe("SDW memory file tools", () => {
         override async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
           this.writeCount += 1;
           if (this.writeCount === 1) {
-            throw new Error("HIGH-C2 injected failure: first corpus write");
+            throw new Error("injected failure: first corpus write");
           }
           return super.write(namespace, key, data);
         }
@@ -679,7 +679,7 @@ describe("SDW memory file tools", () => {
       expect(denialIndex).toBeGreaterThan(overrideIndex);
     });
 
-    it("LOW-3: a throwing audit log commits NOTHING to the vault, on the MCP surface", async () => {
+    it("a throwing audit log commits NOTHING to the vault, on the MCP surface", async () => {
       const storage = new FilesystemStorage(await tempDir("cc-memory-tool-audit-throws"));
       const adapter = new SdwMemoryBackendAdapter({
         storage,
@@ -693,7 +693,7 @@ describe("SDW memory file tools", () => {
       // the commit phase, and nothing should land in the vault.
       const auditLog = {
         async appendCritical(): Promise<void> {
-          throw new Error("LOW-3 injected failure: audit log unavailable");
+          throw new Error("injected failure: audit log unavailable");
         },
       } as unknown as AuditLog;
       const tools = new Map(

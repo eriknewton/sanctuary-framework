@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   consumeFlagValue,
+  consumeFlagValues,
   flagValue,
   flagValues,
   hasFlag,
@@ -75,6 +76,61 @@ describe("shared CLI argv flag parser", () => {
     expect(consumeFlagValue(["--fortress=/tmp/a", "--fortress", "/tmp/b"], "--fortress")).toEqual({
       argv: ["--fortress=/tmp/a", "--fortress", "/tmp/b"],
       error: "--fortress may only be provided once",
+    });
+  });
+
+  it("consumeFlagValues collects every occurrence, split and equals forms, in argv order", () => {
+    expect(
+      consumeFlagValues(
+        ["ingest", "--allow-file", "a.md", "--allow-file=b.md", "--dir", "/tmp"],
+        "--allow-file",
+      ),
+    ).toEqual({
+      argv: ["ingest", "--dir", "/tmp"],
+      values: ["a.md", "b.md"],
+    });
+  });
+
+  it("consumeFlagValues returns no values (not an error) when the flag is absent", () => {
+    expect(consumeFlagValues(["ingest", "--dir", "/tmp"], "--allow-file")).toEqual({
+      argv: ["ingest", "--dir", "/tmp"],
+      values: [],
+    });
+  });
+
+  it("consumeFlagValues fails closed on a trailing bare flag instead of silently dropping the value", () => {
+    expect(consumeFlagValues(["--allow-file"], "--allow-file")).toEqual({
+      argv: ["--allow-file"],
+      values: [],
+      error: "--allow-file requires a value",
+    });
+  });
+
+  it("consumeFlagValues fails closed on an empty or whitespace-only equals value", () => {
+    expect(consumeFlagValues(["--allow-file="], "--allow-file")).toEqual({
+      argv: ["--allow-file="],
+      values: [],
+      error: "--allow-file requires a value",
+    });
+    expect(consumeFlagValues(["--allow-file", "   "], "--allow-file")).toEqual({
+      argv: ["--allow-file", "   "],
+      values: [],
+      error: "--allow-file requires a value",
+    });
+  });
+
+  it("consumeFlagValues fails closed when the next token is itself flag-shaped, instead of consuming it as the value", () => {
+    expect(consumeFlagValues(["--allow-file", "--dir", "/tmp"], "--allow-file")).toEqual({
+      argv: ["--allow-file", "--dir", "/tmp"],
+      values: [],
+      error: "--allow-file requires a value",
+    });
+  });
+
+  it("consumeFlagValues accepts a flag-shaped value in the equals form (unambiguous, operator-bound)", () => {
+    expect(consumeFlagValues(["--allow-file=--dir"], "--allow-file")).toEqual({
+      argv: [],
+      values: ["--dir"],
     });
   });
 

@@ -87,19 +87,17 @@ declare const CLASSIFIER_OVERRIDE_BRAND: unique symbol;
  * Unforgeable, content-bound capability to skip the secret classifier for
  * ONE record, minted ONLY by `mintClassifierOverrideAuthorization` below.
  *
- * Carries NO real runtime data, not even the content hash: an earlier
- * version stored `contentHash` as a plain field on the token, but a plain
- * field is a plain field -- a holder could mutate it (`token.contentHash =
- * somethingElse`) and the object would still pass a WeakSet membership
- * check, silently re-authorizing whatever the mutated value claimed. The
- * bound hash instead lives in the module-private `CLASSIFIER_OVERRIDE_CONTENT_HASHES`
+ * Carries NO real runtime data, not even the content hash: the bound hash
+ * lives only in the module-private `CLASSIFIER_OVERRIDE_CONTENT_HASHES`
  * WeakMap below (token identity -> hash), which nothing outside this file can
- * read or write, and every minted token is `Object.freeze`d on top of that so
- * there is not even a spare property to attach a lie to. The `[CLASSIFIER_OVERRIDE_BRAND]`
- * member is TYPE-ONLY (the symbol is `declare`d, never assigned at runtime):
- * it makes TypeScript refuse a hand-built object literal at compile time, on
- * top of the WeakMap-based runtime check that is the actual security
- * boundary a caller cannot route around.
+ * read or write. Every minted token is `Object.freeze`d and has no field of
+ * its own, so there is nothing on the token a holder could read or mutate to
+ * change what it authorizes; verification reads the WeakMap, never a token
+ * property. The `[CLASSIFIER_OVERRIDE_BRAND]` member is TYPE-ONLY (the symbol
+ * is `declare`d, never assigned at runtime): it makes TypeScript refuse a
+ * hand-built object literal at compile time, on top of the WeakMap-based
+ * runtime check that is the actual security boundary a caller cannot route
+ * around.
  */
 export interface ClassifierOverrideAuthorization {
   readonly [CLASSIFIER_OVERRIDE_BRAND]: true;
@@ -167,18 +165,14 @@ export function passageContentHash(text: string): string {
  * Narrow an already-verified PASSAGE-level authorization to ONE record (the
  * document record itself, or a single chunk) derived from that passage.
  *
- * A genuine, verified parent token used to be a MINT ORACLE for arbitrary
- * content -- the caller supplied
- * `recordContentHash` directly, so once the parent verified, ANY hash
- * (matching ANY unrelated text elsewhere) got a fresh authorized token.
- * Closed by taking the actual RECORD TEXT and the actual PARENT TEXT and
- * computing both hashes internally: mints only when `recordText` is a
- * literal, contiguous substring of `parentText` -- true for the document's
- * own full text (recordText === parentText) and for every chunk (chunking is
- * a contiguous slice, sdw-memory-backend.ts's chunkText), so a derived token
- * can only ever authorize bytes that were genuinely part of the SAME passage
- * the operator allow-listed, never unrelated content smuggled in through a
- * hash collision or a caller-supplied claim.
+ * Takes the actual RECORD TEXT and the actual PARENT TEXT and computes both
+ * hashes internally, never a caller-supplied hash: mints only when
+ * `recordText` is a literal, contiguous substring of `parentText` -- true for
+ * the document's own full text (recordText === parentText) and for every
+ * chunk (chunking is a contiguous slice, sdw-memory-backend.ts's chunkText).
+ * A verified parent token therefore authorizes only bytes that were
+ * genuinely part of the SAME passage the operator allow-listed, never
+ * unrelated content.
  *
  * Returns `undefined`, never a token, when `parent` does not verify against
  * `parentText`'s hash, OR when `recordText` is not contained in `parentText`.

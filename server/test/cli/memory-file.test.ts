@@ -136,6 +136,41 @@ describe("memory file CLI: argument parsing", () => {
     })).toBe(2);
     expect(err.text()).toContain("must name different values");
   });
+
+  it("refuses a trailing bare --allow-file with the usage exit code, instead of silently dropping the waiver", async () => {
+    const out = makeSink();
+    const err = makeSink();
+    const code = await runMemoryIngestCommand({
+      argv: ["--harness", "claude-code", "--dir", "/operator/not-opened", "--allow-file"],
+      out: out.stream,
+      err: err.stream,
+      env: {},
+    });
+    expect(code).toBe(2);
+    expect(err.text()).toContain("--allow-file requires a value");
+    expect(out.text()).toBe("");
+  });
+
+  it("refuses --allow-file immediately followed by another flag, instead of silently consuming it as the path", async () => {
+    const out = makeSink();
+    const err = makeSink();
+    const code = await runMemoryIngestCommand({
+      // Without required-value parsing, "--dir" here would be consumed as
+      // the allow-listed path AND would vanish as a flag, so the real --dir
+      // that follows would be read as a second, unexpected positional value.
+      argv: [
+        "--harness", "claude-code",
+        "--allow-file", "--dir",
+        "--dir", "/operator/not-opened",
+      ],
+      out: out.stream,
+      err: err.stream,
+      env: {},
+    });
+    expect(code).toBe(2);
+    expect(err.text()).toContain("--allow-file requires a value");
+    expect(out.text()).toBe("");
+  });
 });
 
 describe("memory file CLI: credential gate", () => {
@@ -621,7 +656,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
       });
     }
 
-    it("LOW-3 CLI mirror: writes the override audit record BEFORE the first corpus write, even when the corpus write then fails", async () => {
+    it("writes the override audit record BEFORE the first corpus write, even when the corpus write then fails", async () => {
       const source = await refusedFixture("memfile-cli-high-c2-source");
       // Pre-occupy the corpus namespace as a plain FILE instead of a
       // directory: every corpus write inside it fails (ENOTDIR/EEXIST-class),
@@ -663,7 +698,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
       expect(JSON.stringify(entries)).not.toContain(SECRET_VALUE);
     }, 60_000);
 
-    it("LOW-3: a throwing audit log commits NOTHING to the vault, on the CLI surface", async () => {
+    it("a throwing audit log commits NOTHING to the vault, on the CLI surface", async () => {
       const source = await refusedFixture("memfile-cli-audit-throws-source");
       // Pre-occupy the _audit namespace as a file: every audit write fails
       // from the very first one (memory_ingest_started), so the command must

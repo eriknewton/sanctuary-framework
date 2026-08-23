@@ -56,10 +56,11 @@ export interface MemoryPassageInput {
    * write into a valid one, only a classifier_reject into an accepted one.
    *
    * Deliberately an OPAQUE, unforgeable token (`ClassifierOverrideAuthorization`
-   * from write-gate.ts), not a plain boolean: a boolean here was a
-   * true/false switch any caller constructing a MemoryPassageInput could
-   * flip with zero verification. A token can only be produced by the ROOT
-   * minting function write-gate.ts declares for this purpose, which ONLY
+   * from write-gate.ts), not a plain boolean: authorization is a value only
+   * the root minting function can produce, verified against module-private
+   * state that only that function can set, so a value the caller merely
+   * constructs here can never satisfy it. A token can only be produced by the
+   * ROOT minting function write-gate.ts declares for this purpose, which ONLY
    * sdw/adapters/memory-file-allow-list.ts may call (structurally pinned by
    * a test), after the classifier genuinely refused this exact text (via
    * screenPassage, which never mints or honors this field) and the operator

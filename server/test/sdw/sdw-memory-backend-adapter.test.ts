@@ -450,7 +450,7 @@ describe("SDW memory-backend adapter: write-gate enforcement", () => {
     }
   });
 
-  it("HIGH-C3: restores a previously-waived (classifier-overridden) passage byte-for-byte when a later batch write fails, without re-tripping the classifier", async () => {
+  it("restores a previously-waived (classifier-overridden) passage byte-for-byte when a later batch write fails, without re-tripping the classifier", async () => {
     const passageId = "waived-rollback-1";
     const documentId = `mem.letta-archive-1.${passageId}`;
     const waivedText = "remember this: -----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2Vw";

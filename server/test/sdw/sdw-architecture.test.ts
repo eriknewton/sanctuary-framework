@@ -306,12 +306,12 @@ ${VALID_TXN_WRITE}
     });
   });
 
-  describe("classifier-override / restore capability containment (HIGH-C1, HIGH-C3 fix round, 2026-08-22)", () => {
+  describe("classifier-override / restore capability containment (2026-08-22)", () => {
     // NOTE (not a fail-before-exempt marker -- too far from the file top to
     // register as one, and deliberately so): this describe block is a
     // STRUCTURAL containment scan over the real src/ tree, not a behavior
     // test with a pre-fix/post-fix shape. The two functions it pins
-    // (mintClassifierOverrideAuthorization, mintRestoredPersistable) and
+    // (mintClassifierOverrideAuthorization, restoreRawSdwBackendWrite) and
     // their sole legitimate callers were BOTH introduced in the same change,
     // so there is no earlier "unfixed" source state for these two assertions
     // to fail against; "fails before the fix" has no meaning when the
@@ -340,7 +340,7 @@ ${VALID_TXN_WRITE}
       expect(offenders).toEqual([]);
     });
 
-    it("deriveClassifierOverrideAuthorization is referenced ONLY by write-gate.ts and sdw-memory-backend.ts (MEDIUM-1 fix round)", async () => {
+    it("deriveClassifierOverrideAuthorization is referenced ONLY by write-gate.ts and sdw-memory-backend.ts", async () => {
       const offenders = await findUnauthorizedReferences(
         "deriveClassifierOverrideAuthorization",
         new Set([
@@ -351,7 +351,7 @@ ${VALID_TXN_WRITE}
       expect(offenders).toEqual([]);
     });
 
-    it("restorePriorChunk is referenced ONLY by document-corpus-store.ts and sdw-memory-backend.ts (MEDIUM-2 fix round)", async () => {
+    it("restorePriorChunk is referenced ONLY by document-corpus-store.ts and sdw-memory-backend.ts", async () => {
       const offenders = await findUnauthorizedReferences(
         "restorePriorChunk",
         new Set([
@@ -362,7 +362,7 @@ ${VALID_TXN_WRITE}
       expect(offenders).toEqual([]);
     });
 
-    it("restorePriorDocument is referenced ONLY by document-corpus-store.ts and sdw-memory-backend.ts (MEDIUM-2 fix round)", async () => {
+    it("restorePriorDocument is referenced ONLY by document-corpus-store.ts and sdw-memory-backend.ts", async () => {
       const offenders = await findUnauthorizedReferences(
         "restorePriorDocument",
         new Set([
@@ -415,7 +415,7 @@ ${VALID_TXN_WRITE}
       ).rejects.toMatchObject({ category: "classifier_reject" });
     });
 
-    it("deriveClassifierOverrideAuthorization refuses a derived token for text not contained in the parent (MEDIUM-1 fix round: a verified parent is not a mint oracle)", () => {
+    it("deriveClassifierOverrideAuthorization refuses a derived token for text not contained in the parent (a verified parent is not a mint oracle)", () => {
       const parentText = "the operator allow-listed exactly this refused file's text";
       const parentToken = mintClassifierOverrideAuthorization(passageContentHash(parentText));
 
@@ -425,8 +425,8 @@ ${VALID_TXN_WRITE}
 
       // Unrelated text, even innocuous-looking text with no relationship to
       // the allow-listed passage, must NOT verify just because the parent
-      // token is genuine and WeakSet-registered -- proves the containment
-      // check, not only the WeakSet check, is load-bearing.
+      // token is genuine and WeakMap-registered -- proves the containment
+      // check, not only the WeakMap check, is load-bearing.
       const unrelatedText = "a totally different secret living somewhere else entirely";
       expect(
         deriveClassifierOverrideAuthorization(parentToken, parentText, unrelatedText),
@@ -470,9 +470,9 @@ ${VALID_TXN_WRITE}
  * Scan the real src/ tree for source-level references to `symbolName`
  * (import specifier, call, or bare identifier) outside `allowedPaths`
  * (relative to src/). Used to pin the two capability-minting functions
- * (mintClassifierOverrideAuthorization, mintRestoredPersistable) to their
+ * (mintClassifierOverrideAuthorization, restoreRawSdwBackendWrite) to their
  * sole legitimate callers -- the runtime unforgeability comes from a
- * module-private WeakSet (see write-gate.ts), and this scan is the
+ * module-private WeakMap (see write-gate.ts), and this scan is the
  * complementary STATIC containment check: even a caller with legitimate
  * reasons to think it needs the function should not be able to reach it and
  * ship, because CI fails on the reference alone.

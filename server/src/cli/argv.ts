@@ -50,6 +50,53 @@ export function consumeFlagValue(argv: string[], name: string): ConsumedFlagValu
   return value === undefined ? { argv: filtered } : { argv: filtered, value };
 }
 
+/**
+ * Repeatable counterpart of `consumeFlagValue`, with the SAME fail-closed
+ * validation applied to EVERY occurrence: a caller must never let a
+ * requested value silently vanish because the next token looked like a
+ * flag, or land the wrong string because a bare `--` prefix consumed the
+ * FOLLOWING flag as if it were this option's value. Each occurrence's value
+ * must be present, non-blank (not empty, not whitespace-only), and, for the
+ * bare-token form (`--name value`, as opposed to `--name=value`), not itself
+ * `--`-prefixed -- the `=` form has no such ambiguity to guard against,
+ * since the operator explicitly bound the value with `=`.
+ */
+export interface ConsumedFlagValues {
+  argv: string[];
+  values: string[];
+  error?: string;
+}
+
+export function consumeFlagValues(argv: string[], name: string): ConsumedFlagValues {
+  const prefix = `${name}=`;
+  const filtered: string[] = [];
+  const values: string[] = [];
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === name) {
+      const next = argv[i + 1];
+      if (next === undefined || next.trim().length === 0 || next.startsWith("--")) {
+        return { argv, values: [], error: `${name} requires a value` };
+      }
+      values.push(next);
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith(prefix)) {
+      const next = arg.slice(prefix.length);
+      if (next.trim().length === 0) {
+        return { argv, values: [], error: `${name} requires a value` };
+      }
+      values.push(next);
+      continue;
+    }
+    filtered.push(arg);
+  }
+
+  return { argv: filtered, values };
+}
+
 export function unknownFlagWithPrefix(
   argv: string[],
   name: string,
