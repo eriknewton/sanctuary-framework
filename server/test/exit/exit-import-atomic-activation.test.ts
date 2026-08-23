@@ -577,8 +577,11 @@ describe("F1: durable rollback journal - in-process fault injection at each stag
     expect(result.failed).toEqual(["oversized-import"]);
 
     // Named refusal: the oversized-specific audit event fired, not a
-    // generic malformed-journal one.
-    await destination.auditLog.flush();
+    // generic malformed-journal one. No explicit flush here on purpose -
+    // recoverInterruptedExitImportsInner itself now flushes whenever
+    // `failed.length > 0` (coordinator gate, 2026-08-23), even when
+    // nothing was recovered, so this proves THAT flush, not a flush this
+    // test performs on its own.
     const audited = await destination.auditLog.query({
       operation_type: "exit_bundle_recovery_journal_too_large",
     });
@@ -1971,7 +1974,7 @@ describe("Codex gate HIGH (2026-08-23): audit flush and journal deletion order a
     return dir;
   }
 
-  it("audit flush throws BEFORE deleteImportJournal runs: the journal and post-images are still intact, so the catch block's rollback is clean", async () => {
+  it("audit flush throws BEFORE the activation stamp is written: no activation record ever lands, and the catch block's rollback is clean", async () => {
     const source = await makeSource("commit-order-flush", 1, 0);
     const bundleDir = await newBundleDir();
     const exported = await exportBundle(source, bundleDir, "commit-order-flush-ns");
@@ -1983,8 +1986,10 @@ describe("Codex gate HIGH (2026-08-23): audit flush and journal deletion order a
     destination.auditLog.flush = async () => {
       flushCount++;
       // Let every EARLIER flush (audit appends made while staging/rekeying)
-      // succeed normally; fail only the flush immediately after the
-      // activation record is written - the one this test targets.
+      // succeed normally; fail only the flush immediately BEFORE the
+      // activation stamp would be written - the one this test targets,
+      // per the coordinator's final re-check ordering (flush, THEN the
+      // `activated_at` stageArtifact call, THEN deleteImportJournal).
       if (flushCount > 1) {
         throw new Error("Codex gate HIGH injected fault: audit flush failed");
       }
@@ -2008,7 +2013,10 @@ describe("Codex gate HIGH (2026-08-23): audit flush and journal deletion order a
 
     // Clean rollback: the journal is gone (cleanup succeeded - everything
     // was still there to restore against) and none of the bundle's state
-    // landed.
+    // landed. EXIT_IMPORT_NAMESPACE stays empty for a stronger reason now
+    // than a reverted write - the flush that failed runs BEFORE the
+    // activation stamp, so the stamp was never written in the first
+    // place; there is nothing for the rollback to have reverted there.
     expect(await destinationStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
     expect(await destinationStorage.list("commit-order-flush-ns")).toHaveLength(0);
     expect(await destinationStorage.list(EXIT_IMPORT_NAMESPACE)).toHaveLength(0);
@@ -2109,14 +2117,23 @@ describe("Codex gate HIGH (2026-08-23): an ordinary writer racing journal public
   }
 
   /**
-   * Simulates the exact interleaving the coordinator's finding names: "a
-   * StateStore.write passes the journal check, does async work, the
-   * import locks/snapshots/publishes, the writer commits, the import
-   * continues." The RULING (do not widen the admission lock to cover
-   * every ordinary write): post-images are hashed from the import's own
-   * KNOWN written bytes at the moment they are written, never re-derived
-   * afterward, so a DIFFERENT writer's bytes landing on the same location
-   * can never match that post-image.
+   * Simulates the OUTCOME of the exact interleaving the coordinator's
+   * finding names: "a StateStore.write passes the journal check, does
+   * async work, the import locks/snapshots/publishes, the writer
+   * commits, the import continues." This test writes the racing bytes
+   * directly through the inner storage backend, not through
+   * StateStore.write's own guard check, so it does not step through the
+   * guard-check-then-async-gap timing itself - that interleaving is
+   * covered by DETECTION, not by a literal end-to-end simulation here:
+   * post-image hashing does not care how a racing write arrived, only
+   * whether its bytes match what the import itself wrote, so any write
+   * landing on the same location after the import's own write proves the
+   * same divergence outcome regardless of the path it took to get there.
+   * The RULING (do not widen the admission lock to cover every ordinary
+   * write): post-images are hashed from the import's own KNOWN written
+   * bytes at the moment they are written, never re-derived afterward, so
+   * a DIFFERENT writer's bytes landing on the same location can never
+   * match that post-image.
    *
    * The shared restore path this test exercises then treats that location
    * as needing operator review, and never as safe to touch, in either
@@ -2170,7 +2187,7 @@ describe("Codex gate HIGH (2026-08-23): an ordinary writer racing journal public
     }
   }
 
-  it("a racing writer's bytes on the SAME location the import just wrote are preserved untouched, and the location is reported diverged, never silently reverted or silently kept as the import's own", async () => {
+  it("bytes written by another writer after the import's write are reported diverged and preserved", async () => {
     const source = await makeSource("race-writer", 1, 0);
     const bundleDir = await newBundleDir();
     const exported = await exportBundle(source, bundleDir, "race-writer-ns");

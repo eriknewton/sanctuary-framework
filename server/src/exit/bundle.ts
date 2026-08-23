@@ -2779,7 +2779,15 @@ async function recoverInterruptedExitImportsInner(
       }
     );
   }
-  if (recovered > 0) {
+  // Coordinator gate (2026-08-23): flush whenever there is EITHER a
+  // recovered entry OR a failed one (oversized-journal and diverged
+  // failures both append their own audit event above, per-entry, as they
+  // occur) - not only on `recovered > 0`. `recoverInterruptedExitImportsOrThrow`
+  // reads this function's `failed` array and throws immediately after it
+  // returns; without this flush a fortress whose recovery found ONLY
+  // failures (no successes at all) could throw before those
+  // failure-specific events ever reached durable storage.
+  if (recovered > 0 || failed.length > 0) {
     await auditLog.flush();
   }
   return { recovered, failed, diverged, divergedLocations };
@@ -4102,31 +4110,42 @@ export async function importExitBundle(
         },
       });
     }
+    // Codex gate HIGH (2026-08-23), refined by the coordinator's final
+    // re-check: audit flush now runs BEFORE the `activated_at` stamp
+    // below, not just before deleteImportJournal - the flush is a
+    // fallible step that must still be able to trigger the catch block's
+    // rollback (with the journal AND its post-images fully intact, and
+    // with NO activation stamp on disk yet, a rollback here is clean).
+    // Putting the stamp AFTER the flush closes a narrower residual the
+    // earlier ordering left open: a kill DURING that rollback could
+    // previously land between the stamp being written and the rollback
+    // finishing, leaving `activated_at` present with the earlier
+    // artifacts already removed - an inconsistent state no recovery path
+    // was designed to interpret. With the flush first, that state is no
+    // longer reachable: the stamp is written only after the audit trail
+    // is already durable, so a rollback in progress here never has a
+    // stamp to leave behind.
+    await opts.auditLog.flush();
     // F1 (Exit V2 drill D1): promote the interim `in_progress` import
-    // record to its final `activated_at`-stamped form LAST - only after the
-    // reputation import and state re-key above have both actually
-    // succeeded. This is the write that makes an import "done"; everything
-    // the journal protects has already completed by the time it runs, so a
-    // kill after this point has nothing left to roll back.
+    // record to its final `activated_at`-stamped form LAST - only after
+    // the reputation import, the state re-key, and the audit flush above
+    // have all actually succeeded. This is the write that makes an
+    // import "done"; everything the journal protects, INCLUDING the
+    // audit trail, has already completed by the time it runs, so a kill
+    // after this point has nothing left to roll back.
     await stageArtifact(opts.storage, EXIT_IMPORT_NAMESPACE, importId, {
       manifest: manifest.body,
       verified_at: verification.verified_at,
       activated_at: new Date().toISOString(),
     });
-    // Codex gate HIGH (2026-08-23): audit flush runs BEFORE
-    // deleteImportJournal, not after - the flush is a fallible step that
-    // must still be able to trigger the catch block's rollback below
-    // (with the journal AND its post-images fully intact, a rollback here
-    // is correct: the import is treated as not-yet-durable until its
-    // audit trail is too). deleteImportJournal is the LAST thing this
-    // function does and is the true commit boundary: by the time it
-    // runs, `activated_at` is durable AND the audit trail is flushed, so
-    // its own failure must never route through the outer catch's
-    // rollback - `recoverInterruptedExitImportsInner`'s "alreadyActivated"
-    // check is what makes leaving a stale journal here safe: the NEXT
-    // open finds `activated_at` already stamped and deletes the leftover
-    // journal without restoring anything.
-    await opts.auditLog.flush();
+    // deleteImportJournal is the LAST thing this function does and is the
+    // true commit boundary: by the time it runs, `activated_at` is
+    // durable AND the audit trail was already flushed before that stamp
+    // was written, so its own failure must never route through the outer
+    // catch's rollback - `recoverInterruptedExitImportsInner`'s
+    // "alreadyActivated" check is what makes leaving a stale journal here
+    // safe: the NEXT open finds `activated_at` already stamped and
+    // deletes the leftover journal without restoring anything.
     try {
       await deleteImportJournal(opts.storage, importId);
     } catch (deleteErr) {

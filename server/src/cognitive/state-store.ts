@@ -1805,7 +1805,15 @@ export class StateStore {
     // path (recoverInterruptedExitImportsInner) - they share ONE
     // classifyRestoreSafety implementation. Proven deterministically by
     // "Codex gate HIGH (2026-08-23): an ordinary writer racing journal
-    // publication..." in test/exit/exit-import-atomic-activation.test.ts.
+    // publication..." in test/exit/exit-import-atomic-activation.test.ts -
+    // that test writes the racing bytes directly through the storage
+    // backend, not through this method's own guard check, so it proves
+    // the divergence-detection outcome for ANY write landing on the same
+    // location after the import's own write; the guard-check-then-
+    // async-gap interleaving described in this paragraph is covered by
+    // that same detection mechanism (post-image hashing does not care
+    // HOW the racing write arrived), not separately re-simulated end to
+    // end by that test.
     if (
       !options.allowDuringOwnExitImportActivation &&
       (await hasInterruptedExitImport(this.storage))
