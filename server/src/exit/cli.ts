@@ -16,7 +16,7 @@ import { IdentityManager } from "../cognitive/tools.js";
 import { ReputationStore } from "../reputation/reputation-store.js";
 import { loadConfig } from "../config.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "../principal-policy/loader.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { resolveCliMasterKey, readCustodyEnvelope } from "../core/master-custody.js";
 import {
   exportExitBundle,
   importExitBundle,
@@ -162,11 +162,6 @@ interface ExitContext {
   identityManager: IdentityManager;
   reputationStore: ReputationStore;
   keySource: "passphrase" | "recovery-key" | "unknown";
-  // F1 (Exit V2 D1 operator finding, 2026-08-23): the outcome of the
-  // recovery pass every `openExitContext` call already runs (below), so
-  // the new `recover` verb can report it instead of silently discarding
-  // it the way every other verb does today.
-  recoveryResult: { recovered: number };
 }
 
 function write(stream: Writable, text: string): void {
@@ -270,7 +265,7 @@ async function openExitContext(
   // coordinator gate, 2026-08-22) so a partial/unparseable rollback stops
   // fortress open instead of silently proceeding against a possibly
   // half-applied target.
-  const recoveryResult = await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+  await recoverInterruptedExitImportsOrThrow(storage, auditLog);
 
   const stateStore = new StateStore(storage, masterKey);
   const identityManager = new IdentityManager(storage, masterKey);
@@ -287,8 +282,130 @@ async function openExitContext(
     identityManager,
     reputationStore,
     keySource,
-    recoveryResult,
   };
+}
+
+/**
+ * F1 fix-round (independent gate on #1304, HIGH): named refusals for
+ * `openFortressForRecoveryOnly` below. `recover`'s entire point is to roll
+ * back an interrupted import without itself being a thing that mutates a
+ * fortress; these name exactly what is missing and which OTHER verb is the
+ * one that would legitimately perform the write `recover` refuses to do.
+ */
+export class ExitRecoverNoFortressError extends Error {
+  constructor(storagePath: string) {
+    super(
+      `No fortress found at ${storagePath}: there is no custody envelope ` +
+        "and no legacy custody markers. Nothing to recover. `sanctuary exit " +
+        `${EXIT_RECOVERY_VERB}\` deliberately never establishes custody; if ` +
+        "you intended to create a new fortress, run a normal Sanctuary " +
+        "operation instead (for example `sanctuary exit export`, or start " +
+        "the Sanctuary MCP server)."
+    );
+    this.name = "ExitRecoverNoFortressError";
+  }
+}
+
+export class ExitRecoverLegacyMigrationRequiredError extends Error {
+  constructor() {
+    super(
+      "This fortress uses legacy (pre-envelope) custody. `sanctuary exit " +
+        `${EXIT_RECOVERY_VERB}\` deliberately never migrates custody as a ` +
+        "side effect. Run `sanctuary exit export`, `sanctuary exit import`, " +
+        "or any other normal Sanctuary operation against this fortress " +
+        "first to complete the migration, then re-run `sanctuary exit " +
+        `${EXIT_RECOVERY_VERB}\`.`
+    );
+    this.name = "ExitRecoverLegacyMigrationRequiredError";
+  }
+}
+
+/**
+ * F1 fix-round (independent gate on #1304, HIGH): `recover`'s OWN open
+ * path, deliberately NOT `openExitContext` above. `openExitContext` always
+ * passes `bootstrap: true` to `resolveCliMasterKey`, and `establishMaster`
+ * (core/master-custody.ts) can MINT a brand-new custody envelope on a
+ * virgin fortress via that flag, or MIGRATE a legacy (pre-envelope)
+ * fortress to an envelope regardless of that flag (the legacy branches key
+ * off `_meta` markers, not `firstRun`) - both real writes, and both used to
+ * happen before the exit-admission lock was ever acquired
+ * (`recoverInterruptedExitImportsOrThrow`, which owns the lock, only runs
+ * AFTER `mkdir` + master-key resolution in `openExitContext`). On a fresh
+ * fortress `recover` used to print "nothing to recover" AFTER silently
+ * creating custody state; on a legacy fortress it migrated custody before
+ * ever discovering a held admission lock.
+ *
+ * The fix: peek at custody with a read-only `readCustodyEnvelope` call - no
+ * `mkdir`, no `establishMaster`, so nothing on disk changes - before
+ * resolving anything. If no envelope exists, refuse BY NAME (distinguishing
+ * "no fortress here at all" from "legacy fortress, needs migration") and
+ * never call `resolveCliMasterKey` at all, so `establishMaster`'s mutating
+ * branches are structurally unreachable from this function. Only once an
+ * envelope is CONFIRMED present does it resolve the master key -
+ * `establishMaster`'s `if (envelope) {...}` branch unwraps and returns
+ * without ever writing, so this is non-mutating regardless of the
+ * `bootstrap` flag, and `bootstrap` is not passed here at all. Nothing
+ * above `recoverInterruptedExitImportsOrThrow` performs a write, so the
+ * admission lock it acquires genuinely gates every possible one.
+ *
+ * Deliberately does NOT load IdentityManager or construct ReputationStore:
+ * `recover` needs neither, and skipping them removes any question of
+ * whether their own load paths could write (see
+ * fortress-open-recovery-wiring.test.ts's own note on IdentityManager's
+ * primary-identity-pointer persistence for why that question is live for
+ * OTHER verbs, just not for this one).
+ */
+async function openFortressForRecoveryOnly(
+  argv: string[],
+  env: NodeJS.ProcessEnv
+): Promise<{ recovered: number }> {
+  const passphrase =
+    flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
+  const recoveryKey = env.SANCTUARY_RECOVERY_KEY;
+  const config = await loadConfig();
+  const stateStoragePath = join(config.storage_path, "state");
+  const storage = new FilesystemStorage(stateStoragePath);
+
+  // Read-only peek. `readCustodyEnvelope` is a plain `storage.read` (see
+  // storage/filesystem.ts: `read()` never creates a directory, it catches
+  // ENOENT and returns null) - a missing fortress leaves NOTHING on disk.
+  const envelope = await readCustodyEnvelope(storage);
+  if (!envelope) {
+    // Legacy markers (core/master-custody.ts's `establishMaster`): present
+    // without an envelope means this fortress predates envelope custody
+    // and opening it normally would migrate it - a write `recover` must
+    // not perform as a side effect of a "did anything need rolling back"
+    // check.
+    const legacyParams = await storage.read("_meta", "key-params");
+    const legacyRecoveryHash = await storage.read("_meta", "recovery-key-hash");
+    if (legacyParams || legacyRecoveryHash) {
+      throw new ExitRecoverLegacyMigrationRequiredError();
+    }
+    throw new ExitRecoverNoFortressError(config.storage_path);
+  }
+
+  let masterKey: Uint8Array;
+  if (passphrase) {
+    masterKey = await resolveCliMasterKey(storage, {
+      passphrase,
+      storagePathHint: config.storage_path,
+    });
+  } else if (recoveryKey) {
+    masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      storagePathHint: config.storage_path,
+    });
+  } else {
+    throw new Error(
+      "sanctuary exit requires SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY."
+    );
+  }
+
+  const auditLog = new AuditLog(storage, masterKey);
+  // The ONLY write this function's success path can perform, and only
+  // once `recoverInterruptedExitImportsOrThrow` has acquired the
+  // exit-admission lock internally (storage/exit-import-journal.ts).
+  return recoverInterruptedExitImportsOrThrow(storage, auditLog);
 }
 
 export function printExitHelp(out: Writable = process.stdout): void {
@@ -309,7 +426,11 @@ Commands:
                               resume. Needs fortress credentials same as
                               export/import. Mutates nothing beyond finishing
                               that rollback; safe to run when there is
-                              nothing to recover.
+                              nothing to recover. Refuses (never creates or
+                              migrates custody) if no fortress exists yet,
+                              or if the fortress still uses pre-envelope
+                              legacy custody - run export/import or a normal
+                              Sanctuary operation first in either case.
 
 Options:
   --passphrase <value>              Current destination/source passphrase
@@ -536,16 +657,17 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
 
     // F1 (Exit V2 D1 operator finding, 2026-08-23): the verb every
     // recovery hint in the codebase names (EXIT_RECOVERY_VERB, defined in
-    // storage/exit-import-journal.ts and re-exported via bundle.js). Opens
-    // THIS fortress through the exact same `openExitContext` path every
-    // other verb uses, so `recoverInterruptedExitImportsOrThrow` runs with
-    // the standard admission-lock handling (a live lock refuses here
-    // exactly like it refuses export/import, via the outer catch below).
-    // Mutates nothing beyond finishing the rollback that call already
-    // performs; there is no separate write here.
+    // storage/exit-import-journal.ts and re-exported via bundle.js).
+    // Deliberately `openFortressForRecoveryOnly`, NOT `openExitContext`
+    // (fix round, independent gate on #1304, HIGH): that function refuses
+    // by name rather than bootstrapping or migrating custody as a side
+    // effect, and only resolves anything after confirming an envelope
+    // already exists, so the exit-admission lock it acquires internally
+    // (recoverInterruptedExitImportsOrThrow -> withExitAdmissionLock) gates
+    // every possible write, not just the ones after mkdir/master-key
+    // resolution.
     if (command === EXIT_RECOVERY_VERB) {
-      const ctx = await openExitContext(argv, env);
-      const recovered = ctx.recoveryResult.recovered;
+      const { recovered } = await openFortressForRecoveryOnly(argv, env);
       if (json) {
         write(out, JSON.stringify({ recovered }, null, 2) + "\n");
       } else if (recovered > 0) {
