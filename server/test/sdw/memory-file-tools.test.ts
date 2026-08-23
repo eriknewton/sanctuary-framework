@@ -1,5 +1,5 @@
 // fail-before-exempt: adaptation-only in this PR — the changed fake backend implements the newly required atomic putPassagesIfAbsent method; assertions and the memory-file-tools behavior they bind are unchanged. Exit V2 behavior, including atomic replay/conflict handling, is fail-before-proven in test/exit/exit-v2-sdw-memory-archive.test.ts.
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -331,8 +331,13 @@ describe("SDW memory file tools", () => {
         source_path: "note-with-secret.md",
         reason: "classifier_reject",
         detail: expect.stringContaining("classifier"),
+        detector: "labeled_recovery_key",
+        line: 3,
+        reason_text: "looks like a labeled Sanctuary recovery key value",
       },
     ]);
+    // F2: content never appears in the tool result.
+    expect(JSON.stringify(ingested)).not.toContain("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE");
 
     const outcome = auditCalls.find((call) => call.operation === "memory_ingest")!;
     expect(outcome.details).toMatchObject({
@@ -344,6 +349,72 @@ describe("SDW memory file tools", () => {
     expect(outcome.details.skipped).toEqual([
       { source_path: "note-with-secret.md", reason: "classifier_reject" },
     ]);
+  });
+
+  it("names the bare_high_entropy_credential detector for Claude Code, without leaking the value (Rung-1 fix-round-2)", async () => {
+    const BARE_CREDENTIAL_VALUE = "Rk2Nc9Wp5Ju1Vd8Sy3Ma6Ib0Ge7Tn4Ox1Cl9Aq3Fy6Un8x";
+    const { tools } = await makeTools();
+    const source = await copyFixtureSet("basic", "cc-memory-tool-bare-cred");
+    await writeFile(
+      join(source, "note-with-bare-id.md"),
+      `# Notes
+
+Unrelated identifier: ${BARE_CREDENTIAL_VALUE}
+`,
+    );
+
+    const ingested = parse(
+      await tools.get("memory_ingest")!.handler({ harness: "claude-code", dir: source }),
+    );
+
+    expect(ingested.skipped).toEqual([
+      {
+        source_path: "note-with-bare-id.md",
+        reason: "classifier_reject",
+        detail: expect.stringContaining("classifier"),
+        detector: "bare_high_entropy_credential",
+        line: 3,
+        reason_text: "a high-entropy value elsewhere in the file looks like a raw credential",
+      },
+    ]);
+    expect(JSON.stringify(ingested)).not.toContain(BARE_CREDENTIAL_VALUE);
+  });
+
+  it("names the bare_high_entropy_credential detector for Codex, without leaking the value (Rung-1 fix-round-2)", async () => {
+    const BARE_CREDENTIAL_VALUE = "Bt3Qm7Xd1Kj5Rw9Vc2Ny6Ha0If4Ge8Ou1Sp3Lz6Wk9Tr2x";
+    const { tools } = await makeTools();
+    const codexHome = await tempDir("codex-memory-tool-bare-cred");
+    const memories = join(codexHome, "memories");
+    await mkdir(memories, { recursive: true });
+    for (const filename of ["MEMORY.md", "memory_summary.md", "raw_memories.md"]) {
+      await writeFile(
+        join(memories, filename),
+        await readFile(join(CODEX_FIXTURE_ROOT, "unicode", filename)),
+      );
+    }
+    await writeFile(
+      join(memories, "raw_memories.md"),
+      `# Raw Memories
+
+Unrelated identifier: ${BARE_CREDENTIAL_VALUE}
+`,
+    );
+
+    const ingested = parse(
+      await tools.get("memory_ingest")!.handler({ harness: "codex", dir: codexHome }),
+    );
+
+    expect(ingested.skipped).toEqual([
+      {
+        source_path: "raw_memories.md",
+        reason: "classifier_reject",
+        detail: expect.stringContaining("classifier"),
+        detector: "bare_high_entropy_credential",
+        line: 3,
+        reason_text: "a high-entropy value elsewhere in the file looks like a raw credential",
+      },
+    ]);
+    expect(JSON.stringify(ingested)).not.toContain(BARE_CREDENTIAL_VALUE);
   });
 
   it("appends NO success-labelled record when the ingest itself fails", async () => {

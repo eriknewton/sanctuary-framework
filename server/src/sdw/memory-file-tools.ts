@@ -24,7 +24,7 @@ import {
   ingestCodexMemorySnapshot,
   readCodexMemoryDirectory,
 } from "./adapters/codex-memory-file-adapter.js";
-import { SdwValidationError } from "./errors.js";
+import { SdwValidationError, sdwClassifierReasonText } from "./errors.js";
 import {
   createMultiAgentIsolationGuard,
   type MultiAgentIsolationGuard,
@@ -301,6 +301,13 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
             source_path: skip.source_path,
             reason: skip.reason,
             detail: skip.detail,
+            detector: skip.detector,
+            line: skip.line,
+            // The same plain-English text the
+            // CLI prints, resolved from the shared table so an MCP caller does
+            // not have to re-derive it from `detector`. Class and location
+            // only, never the matched content.
+            reason_text: sdwClassifierReasonText(skip.reason, skip.detector),
           })),
           passages: result.ingested.map((passage) => ({
             passage_id: passage.passage_id,

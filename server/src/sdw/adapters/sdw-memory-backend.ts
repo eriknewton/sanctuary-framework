@@ -270,9 +270,13 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     return this.toPassage(documentRecord, prepared.text);
   }
 
-  screenPassage(input: MemoryPassageInput, taint: PersistableTaint): MemoryPassageScreen {
+  screenPassage(
+    input: MemoryPassageInput,
+    taint: PersistableTaint,
+    applyBareCredentialFallback = false,
+  ): MemoryPassageScreen {
     try {
-      const prepared = this.preparePassage(input);
+      const prepared = this.preparePassage(input, applyBareCredentialFallback);
       // Mint (and discard) every record the real write would persist. Minting
       // is the enforcement point for the grammar checks and the fail-closed
       // secret classifier and has no side effects, so this screen cannot drift
@@ -284,7 +288,13 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       return { ok: true };
     } catch (error) {
       if (error instanceof SdwValidationError) {
-        return { ok: false, category: error.category, message: error.message };
+        return {
+          ok: false,
+          category: error.category,
+          message: error.message,
+          detector: error.detector,
+          line: error.line,
+        };
       }
       throw error;
     }
@@ -293,6 +303,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   async putPassages(
     inputs: readonly MemoryPassageInput[],
     taint: PersistableTaint,
+    applyBareCredentialFallback = false,
   ): Promise<readonly MemoryPassage[]> {
     if (inputs.length === 0) return [];
     for (const input of inputs) {
@@ -306,7 +317,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     // Prepare (and therefore validate and classify) EVERYTHING before the first
     // byte is written. A rejection found halfway through would otherwise be the
     // partial-commit this method exists to prevent.
-    const prepared = inputs.map((input) => this.preparePassage(input));
+    const prepared = inputs.map((input) => this.preparePassage(input, applyBareCredentialFallback));
     const seen = new Set<string>();
     for (const item of prepared) {
       if (seen.has(item.documentId)) {
@@ -567,7 +578,10 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
    * screenPassage all go through here so the three cannot disagree about what
    * "acceptable" means.
    */
-  private preparePassage(input: MemoryPassageInput): PreparedPassage {
+  private preparePassage(
+    input: MemoryPassageInput,
+    applyBareCredentialFallback = false,
+  ): PreparedPassage {
     const passageId = input.passage_id ?? generatePassageId();
     const documentId = this.documentId(passageId);
     const createdAt = input.created_at ?? this.now();
@@ -575,7 +589,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     const metadata = input.metadata ?? [];
     validatePassageText(input.text);
     validatePassageDecorators(tags, metadata);
-    assertSdwClassifierCleanText(input.text);
+    assertSdwClassifierCleanText(input.text, applyBareCredentialFallback);
     const chunks = chunkText(input.text, this.maxChunkChars);
     const chunkRecords = chunks.map(
       (text, ordinal): SdwDocumentChunkRecord => ({

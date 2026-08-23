@@ -17,7 +17,7 @@ import {
   type SdwReplayAnchorData,
   type SdwRecord,
 } from "./records.js";
-import { SdwValidationError } from "./errors.js";
+import { SdwValidationError, type SdwClassifierDetector } from "./errors.js";
 
 const PERSISTABLE_BRAND: unique symbol = Symbol("sanctuary.sdw.persistable");
 const MAX_RECORD_BYTES = 1024 * 1024;
@@ -160,9 +160,27 @@ export function prepareSdwBackendWrite<T extends SdwRecord>(
   });
 }
 
-export function assertSdwClassifierCleanText(text: string): void {
+/**
+ * `applyBareCredentialFallback` defaults to false for every caller that does
+ * not opt in. The classifier is the ONLY backstop for a harness memory file
+ * mirrored by CLAUDE_CODE_MEMORY_TAINT/CODEX_MEMORY_TAINT-labeled
+ * "user_content" (no provenance/taint check catches it either), so
+ * claude-code-file-adapter.ts and codex-memory-file-adapter.ts opt in via
+ * SdwMemoryBackendAdapter.screenPassage/putPassages. Every OTHER caller of
+ * this function through the SDW memory backend (archive-import lineage
+ * receipts, memory-transcode's own encrypted-archive bookkeeping, the
+ * general-purpose agent-memory MCP tool) legitimately writes
+ * system-generated or already-once-classified content shaped like a
+ * credential (signatures, public keys, content hashes) and must NOT opt in:
+ * turning this on unconditionally for those callers misclassifies their
+ * content.
+ */
+export function assertSdwClassifierCleanText(
+  text: string,
+  applyBareCredentialFallback = false,
+): void {
   if (text.length === 0) return;
-  classifyText(text, text.replace(/[^A-Za-z0-9]+/g, ""), undefined, [text]);
+  classifyText(text, text.replace(/[^A-Za-z0-9]+/g, ""), undefined, [text], applyBareCredentialFallback);
 }
 
 export async function writeReplayAnchor(
@@ -510,7 +528,35 @@ function classifyRecord(record: SdwRecord): void {
   // in one field and a "KEY" in another and defeat the compact PRIVATEKEY match. The
   // values-only compact reassembles a marker fragmented across non-adjacent fields.
   const views = collectClassifierTextViews(record);
+  // applyBareCredentialFallback defaults to false here:
+  // every OTHER SDW record kind (query-history, document chunks, working
+  // state, catalog) legitimately carries system-generated ids, content
+  // hashes, and chunk metadata that are base64url/hex-shaped and
+  // high-entropy by construction, not operator prose a secret could hide
+  // in. Turning the bare-credential fallback on here reproduced exactly
+  // that false-positive class across every SDW store in this repo's own
+  // test suite (measured: 138 test failures). The fallback is scoped to
+  // the memory-file ingest path (assertSdwClassifierCleanText) only, where
+  // the DESIGN ruling's "classifier is the only backstop" argument holds;
+  // every other record kind keeps its existing backstops (provenance taint,
+  // the other nine detectors).
   classifyText(text, views.compactValues, normalized, views.entropyContexts);
+}
+
+/**
+ * Outcome of one detector check: `undefined` means no match; a defined hit
+ * with `index` set means a match was found at that character offset in the
+ * text the detector was given; a defined hit with `index` absent means a
+ * match was found only in a normalized or field-reassembled view whose
+ * offsets do not map back onto the original text, so no location can be
+ * reported for it (SdwValidationError.line stays absent in that case).
+ */
+interface ClassifierHit {
+  readonly index?: number;
+}
+
+interface AttributedClassifierHit extends ClassifierHit {
+  readonly detector: SdwClassifierDetector;
 }
 
 function classifyText(
@@ -518,43 +564,178 @@ function classifyText(
   compact: string,
   normalized = normalizeClassifierText(text),
   entropyContexts: readonly string[] = [text],
+  applyBareCredentialFallback = false,
 ): void {
-  if (
-    PRIVATE_KEY_MARKER_PROBES.some((probe) => probe.test(text) || probe.test(normalized)) ||
-    containsSplitPrivateKeyMarker(compact) ||
-    containsEncodedEd25519Pkcs8PrivateKey(text) ||
-    containsLabeledEd25519PrivateKeyMaterial(text) ||
-    containsLabeledRecoveryKeyMaterial(text) ||
-    containsKnownSecretToken(text) ||
-    containsJwt(text) ||
-    containsUrlCredential(text) ||
-    entropyContexts.some((context) => containsKeywordGatedHighEntropySecret(context))
-  ) {
-    throw new SdwValidationError("classifier_reject", "SDW classifier rejected sensitive material");
+  const hit = findClassifierHit(text, compact, normalized, entropyContexts, applyBareCredentialFallback);
+  if (hit === undefined) return;
+  const line = hit.index === undefined ? undefined : lineNumberAt(text, hit.index);
+  throw new SdwValidationError("classifier_reject", "SDW classifier rejected sensitive material", {
+    detector: hit.detector,
+    line,
+  });
+}
+
+/**
+ * Run the classifier checks in order and return the first hit, named by
+ * detector so a refusal can tell an operator which one fired. The first
+ * nine match a fixed evaluation order, so which detector wins when more
+ * than one would match is stable. The tenth, bare_high_entropy_credential,
+ * runs last (after every other check has had a chance to name a more
+ * specific detector), and runs ONLY when `applyBareCredentialFallback` is
+ * true — the memory-file ingest path (assertSdwClassifierCleanText) sets
+ * it; classifyRecord (every other SDW record kind) does not, because those
+ * records legitimately carry system-generated ids/hashes/chunk metadata
+ * that are high-entropy by construction and are not the false-positive
+ * class this fallback exists to catch.
+ */
+function findClassifierHit(
+  text: string,
+  compact: string,
+  normalized: string,
+  entropyContexts: readonly string[],
+  applyBareCredentialFallback: boolean,
+): AttributedClassifierHit | undefined {
+  const privateKeyMarker = findPrivateKeyMarker(text, normalized);
+  if (privateKeyMarker !== undefined) {
+    return { detector: "private_key_marker", ...privateKeyMarker };
   }
+
+  const splitPrivateKeyMarker = findSplitPrivateKeyMarker(compact);
+  if (splitPrivateKeyMarker !== undefined) {
+    return { detector: "private_key_marker_split", ...splitPrivateKeyMarker };
+  }
+
+  const encodedPrivateKey = findEncodedEd25519Pkcs8PrivateKey(text);
+  if (encodedPrivateKey !== undefined) {
+    return { detector: "encoded_private_key", ...encodedPrivateKey };
+  }
+
+  const labeledPrivateKey = findLabeledEd25519PrivateKeyMaterial(text);
+  if (labeledPrivateKey !== undefined) {
+    return { detector: "labeled_private_key", ...labeledPrivateKey };
+  }
+
+  const labeledRecoveryKey = findLabeledRecoveryKeyMaterial(text);
+  if (labeledRecoveryKey !== undefined) {
+    return { detector: "labeled_recovery_key", ...labeledRecoveryKey };
+  }
+
+  const knownSecretToken = findKnownSecretToken(text);
+  if (knownSecretToken !== undefined) {
+    return { detector: "known_secret_token", ...knownSecretToken };
+  }
+
+  const jwt = findJwt(text);
+  if (jwt !== undefined) return { detector: "jwt", ...jwt };
+
+  const urlCredential = findUrlCredential(text);
+  if (urlCredential !== undefined) return { detector: "url_credential", ...urlCredential };
+
+  for (const context of entropyContexts) {
+    const hit = findKeywordGatedHighEntropySecret(context);
+    if (hit === undefined) continue;
+    // entropyContexts may be per-field slices (collectClassifierTextViews),
+    // so a hit's index is relative to its own context, not `text`; map it
+    // back only when that mapping is reliable (see locateInSourceText).
+    const index = hit.index === undefined ? undefined : locateInSourceText(text, context, hit.index);
+    return { detector: "keyword_gated_high_entropy", index };
+  }
+
+  if (applyBareCredentialFallback) {
+    const bareHighEntropyCredential = findBareHighEntropyCredential(text);
+    if (bareHighEntropyCredential !== undefined) {
+      return { detector: "bare_high_entropy_credential", ...bareHighEntropyCredential };
+    }
+  }
+
+  return undefined;
 }
 
-function containsLabeledRecoveryKeyMaterial(text: string): boolean {
-  return containsLabeled32ByteKeyMaterial(text, RECOVERY_KEY_LABEL_PATTERN);
+function buildLineIndex(text: string): readonly number[] {
+  const starts = [0];
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === "\n") starts.push(i + 1);
+  }
+  return starts;
 }
 
-function containsLabeledEd25519PrivateKeyMaterial(text: string): boolean {
-  return containsLabeled32ByteKeyMaterial(text, ED25519_PRIVATE_KEY_LABEL_PATTERN);
+function lineNumberForIndex(lineStarts: readonly number[], index: number): number {
+  // Binary search for the last line start <= index; lineStarts is sorted
+  // ascending by construction (buildLineIndex appends in text order).
+  let low = 0;
+  let high = lineStarts.length - 1;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (lineStarts[mid]! <= index) low = mid;
+    else high = mid - 1;
+  }
+  return low + 1;
 }
 
-function containsLabeled32ByteKeyMaterial(text: string, labelPattern: string): boolean {
+function lineNumberAt(text: string, index: number): number {
+  return lineNumberForIndex(buildLineIndex(text), index);
+}
+
+/**
+ * Maps an index found inside `context` back to its offset in `text`, for the
+ * common case where `context` is `text` itself or a literal substring of it
+ * (every entropyContexts entry collectClassifierTextViews pushes for a plain
+ * string field is one). Returns undefined for a synthetic reassembly (the
+ * "key\nvalue" metadata pairing at collectClassifierTextViews below) that
+ * does not appear verbatim in `text`, since no reliable offset exists to map
+ * back to; the caller reports no location for that hit rather than a wrong one.
+ * Bound: `text.indexOf(context)` finds the FIRST occurrence, so if the same
+ * string value repeats as more than one field, a hit in a LATER occurrence
+ * is misattributed to the first one's line — the line reported is then a
+ * plausible but not necessarily correct location.
+ */
+function locateInSourceText(text: string, context: string, indexInContext: number): number | undefined {
+  if (context === text) return indexInContext;
+  const contextOffset = text.indexOf(context);
+  return contextOffset === -1 ? undefined : contextOffset + indexInContext;
+}
+
+function findPrivateKeyMarker(text: string, normalized: string): ClassifierHit | undefined {
+  for (const probe of PRIVATE_KEY_MARKER_PROBES) {
+    const match = probe.exec(text);
+    if (match) return { index: match.index };
+  }
+  for (const probe of PRIVATE_KEY_MARKER_PROBES) {
+    if (probe.test(normalized)) {
+      // Matched only after normalization (punctuation/whitespace collapsed
+      // to spaces); normalized offsets do not correspond to positions in
+      // the original text, so this hit carries no location.
+      return {};
+    }
+  }
+  return undefined;
+}
+
+function findLabeledRecoveryKeyMaterial(text: string): ClassifierHit | undefined {
+  return findLabeled32ByteKeyMaterial(text, RECOVERY_KEY_LABEL_PATTERN);
+}
+
+function findLabeledEd25519PrivateKeyMaterial(text: string): ClassifierHit | undefined {
+  return findLabeled32ByteKeyMaterial(text, ED25519_PRIVATE_KEY_LABEL_PATTERN);
+}
+
+function findLabeled32ByteKeyMaterial(text: string, labelPattern: string): ClassifierHit | undefined {
+  // "d" (hasIndices) exposes match.indices[1], the CAPTURED VALUE's own
+  // span, not the whole match's (which starts at the label). A "label:\n
+  // value" layout puts the two on different lines; attributing to the
+  // label's line would point the operator at the wrong place to fix.
   const pattern = new RegExp(
     String.raw`\b(?:${labelPattern})(?:\s*(?:=|:)\s*|\s+is\s+|\s+)["']?([A-Za-z0-9_-]+)(?![A-Za-z0-9_-])`,
-    "gi",
+    "gdi",
   );
   for (const match of text.matchAll(pattern)) {
     const candidate = match[1] ?? "";
-    if (
-      isPlausible32ByteBase64urlKey(candidate) ||
-      HEX_32_BYTE_KEY_SHAPE.test(candidate)
-    ) return true;
+    if (isPlausible32ByteBase64urlKey(candidate) || HEX_32_BYTE_KEY_SHAPE.test(candidate)) {
+      const groupStart = match.indices?.[1]?.[0];
+      return { index: groupStart ?? match.index };
+    }
   }
-  return false;
+  return undefined;
 }
 
 function isPlausible32ByteBase64urlKey(value: string): boolean {
@@ -563,21 +744,27 @@ function isPlausible32ByteBase64urlKey(value: string): boolean {
   return BASE64URL_32_BYTE_KEY_SHAPE.test(value) && !isAllowedPlaceholder(value);
 }
 
-function containsSplitPrivateKeyMarker(compactText: string): boolean {
+function findSplitPrivateKeyMarker(compactText: string): ClassifierHit | undefined {
   const beginIndex = compactText.search(/BEGIN/i);
   const privateKeyIndex = compactText.search(/PRIVATEKEY/i);
-  return (
-    beginIndex !== -1 &&
-    privateKeyIndex !== -1 &&
-    Math.abs(beginIndex - privateKeyIndex) <= 4096
-  );
+  if (beginIndex !== -1 && privateKeyIndex !== -1 && Math.abs(beginIndex - privateKeyIndex) <= 4096) {
+    // Matched only in the values-only compacted reassembly (collectClassifierTextViews);
+    // its offsets do not correspond to positions in the original text.
+    return {};
+  }
+  return undefined;
 }
 
-function containsEncodedEd25519Pkcs8PrivateKey(text: string): boolean {
+function findEncodedEd25519Pkcs8PrivateKey(text: string): ClassifierHit | undefined {
   const compact = text.replace(/[\s"'`,;:]+/g, "");
   const hexPrefix = "302e020100300506032b657004220420";
   const base64Prefix = "MC4CAQAwBQYDK2VwBCIEI";
-  return compact.toLowerCase().includes(hexPrefix) || compact.includes(base64Prefix);
+  if (compact.toLowerCase().includes(hexPrefix) || compact.includes(base64Prefix)) {
+    // Matched in the whitespace/punctuation-stripped view; its offsets do
+    // not correspond to positions in the original text.
+    return {};
+  }
+  return undefined;
 }
 
 function canonicalClassifierText(value: SdwRecord): string {
@@ -631,6 +818,12 @@ function collectClassifierTextViews(value: SdwRecord): ClassifierTextViews {
       // boundary intentionally lets a label such as `credential` gate the
       // candidate stored in its paired value. Individual strings are also
       // retained below so their self-contained signals remain detectable.
+      // Edge case: SDW identifiers, which
+      // metadata keys satisfy (grammar.ts, SDW_IDENTIFIER_PATTERN), allow up
+      // to 256 characters, so a maximal-length key can itself push a keyword
+      // near its start outside the proximity window from a candidate near
+      // the end of a long value, despite this context intentionally pairing
+      // the two as one field.
       if (typeof object.key === "string" && typeof object.value === "string") {
         entropyContexts.push(`${object.key}\n${object.value}`);
       }
@@ -646,33 +839,49 @@ function collectClassifierTextViews(value: SdwRecord): ClassifierTextViews {
   };
 }
 
-function containsKnownSecretToken(text: string): boolean {
-  return (
-    containsGitHubToken(text) ||
-    /\b(?:sk|sk-ant|rk)_(?:live|test|proj)?_[A-Za-z0-9_-]{20,}\b/.test(text) ||
-    /\bsk-[A-Za-z0-9_-]{20,}\b/.test(text) ||
-    /\bAKIA[0-9A-Z]{16}\b/.test(text) ||
-    /\bASIA[0-9A-Z]{16}\b/.test(text) ||
-    /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/.test(text) ||
-    /\bAIza[0-9A-Za-z_-]{35}\b/.test(text) ||
-    /\bglpat-[0-9A-Za-z_-]{20,}\b/.test(text) ||
-    /\bnpm_[0-9A-Za-z]{36,}\b/.test(text) ||
-    /\b(?:stripe|slack|google|github|aws|npm)[_-]?(?:token|key|secret)\b/i.test(text) &&
-      /\b[A-Za-z0-9_-]{32,}\b/.test(text)
-  );
+// Whole-record by design (unchanged by Rung-1 F1, which scopes only the
+// keyword-gated entropy check below): every branch here is a specific,
+// high-confidence shape (a vendor token prefix, a checksum-validated GitHub
+// token) except the last, which pairs a vendor-name keyword with any 32+
+// char token-shaped run anywhere in the same text. That last branch is
+// deliberately as broad today as the pre-fix entropy check was; it stays
+// that way because narrowing it is a separate, not-yet-measured change
+// (see the F1 finding in Review/Sanctuary/drill-rung1-roundtrip-2026-08-22/RESULTS.md).
+function findKnownSecretToken(text: string): ClassifierHit | undefined {
+  const githubToken = findGitHubToken(text);
+  if (githubToken !== undefined) return githubToken;
+
+  const shapePatterns: readonly RegExp[] = [
+    /\b(?:sk|sk-ant|rk)_(?:live|test|proj)?_[A-Za-z0-9_-]{20,}\b/,
+    /\bsk-[A-Za-z0-9_-]{20,}\b/,
+    /\bAKIA[0-9A-Z]{16}\b/,
+    /\bASIA[0-9A-Z]{16}\b/,
+    /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
+    /\bAIza[0-9A-Za-z_-]{35}\b/,
+    /\bglpat-[0-9A-Za-z_-]{20,}\b/,
+    /\bnpm_[0-9A-Za-z]{36,}\b/,
+  ];
+  for (const pattern of shapePatterns) {
+    const match = pattern.exec(text);
+    if (match) return { index: match.index };
+  }
+
+  const vendorLabel = /\b(?:stripe|slack|google|github|aws|npm)[_-]?(?:token|key|secret)\b/i.exec(text);
+  const tokenShaped = /\b[A-Za-z0-9_-]{32,}\b/.exec(text);
+  if (vendorLabel && tokenShaped) return { index: vendorLabel.index };
+  return undefined;
 }
 
 // Deliberate FP-control trade-off (documented in README "known false negatives"):
 // a gh*_/github_pat_ token is flagged only when its trailing CRC32-base62 checksum
 // validates. Malformed/legacy-format tokens may pass — this is defense-in-depth, not
 // the enforced boundary (provenance is). Tightening it belongs in consumer-integration.
-function containsGitHubToken(text: string): boolean {
+function findGitHubToken(text: string): ClassifierHit | undefined {
   const tokenPattern = /\b(?:gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{40,})\b/g;
   for (const match of text.matchAll(tokenPattern)) {
-    const token = match[0];
-    if (hasValidGitHubChecksum(token)) return true;
+    if (hasValidGitHubChecksum(match[0])) return { index: match.index };
   }
-  return false;
+  return undefined;
 }
 
 function hasValidGitHubChecksum(token: string): boolean {
@@ -705,7 +914,7 @@ function crc32(value: string): number {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-function containsJwt(text: string): boolean {
+function findJwt(text: string): ClassifierHit | undefined {
   const jwtPattern = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
   for (const match of text.matchAll(jwtPattern)) {
     try {
@@ -713,33 +922,317 @@ function containsJwt(text: string): boolean {
         readonly alg?: unknown;
         readonly typ?: unknown;
       };
-      if (typeof header.alg === "string" && (header.typ === undefined || header.typ === "JWT")) return true;
+      if (typeof header.alg === "string" && (header.typ === undefined || header.typ === "JWT")) {
+        return { index: match.index };
+      }
     } catch {
       // Malformed JWT-shaped text is ignored by this heuristic.
     }
   }
-  return false;
+  return undefined;
 }
 
-function containsUrlCredential(text: string): boolean {
-  return /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]{1,128}:[^/\s:@]{8,128}@/i.test(text);
+function findUrlCredential(text: string): ClassifierHit | undefined {
+  const match = /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]{1,128}:[^/\s:@]{8,128}@/i.exec(text);
+  return match ? { index: match.index } : undefined;
 }
 
-function containsKeywordGatedHighEntropySecret(text: string): boolean {
-  if (!/\b(?:api[_-]?key|access[_-]?key|auth|authorization|bearer|credential|password|private[_-]?key|secret|token)\b/i.test(text)) {
-    return false;
-  }
+// Longest string a candidate pattern below matches (the `{32,128}` quantifier
+// on each). The proximity window is sized to comfortably hold one candidate
+// plus the keyword that gates it, whichever side of the pair is longer.
+// Measured in Unicode CODE POINTS, not UTF-16 code units (see
+// isWithinCodePointWindow below) — a run of astral characters (e.g. emoji)
+// between a keyword and a candidate must not silently widen or narrow the
+// window relative to what an operator sees as "how many characters apart".
+const KEYWORD_ENTROPY_CANDIDATE_MAX_CHARS = 128;
+/**
+ * Rung-1 F1: a keyword and a high-entropy candidate must be near each other
+ * to read as one secret-shaped pair. Pre-fix, this check scanned an entire
+ * context (often a whole file) for "a keyword appears somewhere" AND "a
+ * high-entropy run appears somewhere", so an index file that says "token" in
+ * one heading and holds one unrelated high-entropy identifier hundreds of
+ * lines away was refused as a secret (Rung-1 round-trip drill, 2026-08-22:
+ * 5 of 6 whole-context keyword_gated_high_entropy refusals on the real
+ * corpus fired only at file scope, no single line tripped on its own). The
+ * window below is two candidate-lengths of code points, OR the same physical
+ * line, so a keyword immediately before/after a maximal-length candidate on
+ * one line, or split across a "label:\n  value" line break, still gates,
+ * while unrelated mentions elsewhere in the same file do not. Every other
+ * detector in this file stays whole-record: the shapes they match (a PEM
+ * block, a vendor token prefix, a JWT, a URL credential, a labeled 32-byte
+ * key) are self-contained and specific enough that scanning the whole
+ * context does not create the same false-positive class this narrows.
+ */
+const KEYWORD_ENTROPY_PROXIMITY_CODE_POINTS = KEYWORD_ENTROPY_CANDIDATE_MAX_CHARS * 2;
+
+// `_` and `=` are common secret-assignment punctuation, but `_` is a \w
+// character, so a `\b...\b`-anchored alternation never matches a keyword
+// immediately preceded or followed by an underscore — there is no word
+// boundary between two word characters. The lookaround below treats ANY
+// non-alphanumeric character, including `_` and `=`, as a delimiter, while
+// still requiring a full-word match (no partial hit inside "tokenize" or
+// "mytoken"). This is a plain delimiter rule, not a continuation-aware one,
+// by deliberate choice (see server/src/sdw/README.md's known false-positive
+// entry): correctness on the assignment shape outweighs a prose false
+// positive when a keyword is itself the prefix of a longer identifier. Do
+// not replace this with a lookahead that special-cases an underscore-joined
+// continuation — that shape was tried and reverted; it silently widened the
+// class of assignment lines this check fails to catch.
+const KEYWORD_GATE_PATTERN =
+  /(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?key|auth|authorization|bearer|credential|password|private[_-]?key|secret|token)(?![A-Za-z0-9])/gi;
+
+function findKeywordGatedHighEntropySecret(text: string): ClassifierHit | undefined {
+  const keywordIndices = [...text.matchAll(KEYWORD_GATE_PATTERN)].map((m) => m.index ?? 0);
+  if (keywordIndices.length === 0) return undefined;
+
   const candidates = [
     ...text.matchAll(/\b[A-Fa-f0-9]{32,128}\b/g),
     ...text.matchAll(/\b[A-Za-z0-9+/=]{32,128}\b/g),
     ...text.matchAll(/\b[A-Za-z0-9_-]{32,128}\b/g),
   ];
+  const lineStarts = buildLineIndex(text);
   for (const match of candidates) {
     const candidate = match[0];
     if (isAllowedPlaceholder(candidate) || isKnownHashLength(candidate)) continue;
     const threshold = /^[A-Fa-f0-9]+$/.test(candidate) ? 3.2 : 4.5;
-    if (shannonEntropy(candidate) >= threshold) return true;
+    if (shannonEntropy(candidate) < threshold) continue;
+    const candidateIndex = match.index ?? 0;
+    if (hasNearbyKeyword(text, keywordIndices, lineStarts, candidateIndex)) {
+      return { index: candidateIndex };
+    }
   }
+  return undefined;
+}
+
+/**
+ * AGENTS.md rule 8 (adversarial-complexity bound): a linear scan of every
+ * keyword per candidate is O(candidates * keywords) — unbounded work per
+ * call on attacker-influenced text. keywordIndices is ascending (matchAll
+ * on a non-overlapping global pattern yields matches in text order), so ONE
+ * binary search finds the nearest keyword at-or-before and at-or-after the
+ * candidate; testing only those two neighbors is sufficient because a
+ * keyword sharing the candidate's line is, by construction, closer in
+ * character index than any keyword on an earlier or later line, so it is
+ * always one of these two. This is O(candidates * log keywords) instead.
+ */
+function hasNearbyKeyword(
+  text: string,
+  keywordIndices: readonly number[],
+  lineStarts: readonly number[],
+  candidateIndex: number,
+): boolean {
+  let low = 0;
+  let high = keywordIndices.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (keywordIndices[mid]! < candidateIndex) low = mid + 1;
+    else high = mid;
+  }
+  const candidateLine = lineNumberForIndex(lineStarts, candidateIndex);
+  if (low < keywordIndices.length) {
+    const afterIndex = keywordIndices[low]!;
+    if (isKeywordNear(text, afterIndex, candidateIndex, candidateLine, lineStarts)) return true;
+  }
+  if (low > 0) {
+    const beforeIndex = keywordIndices[low - 1]!;
+    if (isKeywordNear(text, beforeIndex, candidateIndex, candidateLine, lineStarts)) return true;
+  }
+  return false;
+}
+
+function isKeywordNear(
+  text: string,
+  keywordIndex: number,
+  candidateIndex: number,
+  candidateLine: number,
+  lineStarts: readonly number[],
+): boolean {
+  if (isWithinCodePointWindow(text, keywordIndex, candidateIndex, KEYWORD_ENTROPY_PROXIMITY_CODE_POINTS)) {
+    return true;
+  }
+  return lineNumberForIndex(lineStarts, keywordIndex) === candidateLine;
+}
+
+/**
+ * Exposed ONLY so the adversarial-complexity test
+ * (test/sdw/sdw-classifier-proximity.test.ts) can wrap `keywordIndices` in a
+ * counting Proxy and prove the REAL shipped function performs O(log K) array
+ * reads per candidate, not O(K) — a wall-clock timing assertion cannot
+ * distinguish "fast today" from "still linear, just under a small K", and a
+ * reimplementation of the algorithm in the test would prove the test's
+ * understanding of the algorithm, not the shipped one's. Not part of the
+ * classifier's public contract; production code must never import this.
+ */
+export const rung1ClassifierTestOnly = {
+  hasNearbyKeyword,
+  buildLineIndex,
+  buildLineBacktickSpans,
+  isExemptHighEntropyContext,
+  findBareHighEntropyCredential,
+};
+
+/**
+ * Whether two UTF-16 offsets are within `windowCodePoints` Unicode code
+ * points of each other. `.index` from a
+ * regex match is a UTF-16 code-UNIT offset; a non-BMP character (most emoji,
+ * some CJK extension characters) is ONE code point but TWO UTF-16 units, so
+ * comparing raw index deltas against a "character" window over/under-counts
+ * padding built from astral characters. Bounded to O(window) work: the
+ * UTF-16 delta is always >= the code-point delta (equality when there are no
+ * surrogate pairs in between, since each is >= 1 code unit), so a UTF-16
+ * delta already inside the window proves the code-point delta is too
+ * (cheap accept); a UTF-16 delta more than 2x the window proves the
+ * code-point delta exceeds it too, since a code point is at most 2 UTF-16
+ * units (cheap reject). Only the remaining narrow band needs an exact,
+ * bounded-length code-point count.
+ */
+function isWithinCodePointWindow(
+  text: string,
+  indexA: number,
+  indexB: number,
+  windowCodePoints: number,
+): boolean {
+  const lowIndex = Math.min(indexA, indexB);
+  const highIndex = Math.max(indexA, indexB);
+  const utf16Delta = highIndex - lowIndex;
+  if (utf16Delta <= windowCodePoints) return true;
+  if (utf16Delta > windowCodePoints * 2) return false;
+  return countCodePoints(text, lowIndex, highIndex) <= windowCodePoints;
+}
+
+function countCodePoints(text: string, start: number, end: number): number {
+  let count = 0;
+  for (let i = start; i < end; count += 1) {
+    const code = text.codePointAt(i);
+    i += code !== undefined && code > 0xffff ? 2 : 1;
+  }
+  return count;
+}
+
+/**
+ * For a harness-mirrored memory file the classifier is the ONLY backstop,
+ * and a bare credential-shaped value with no keyword nearby otherwise
+ * passed every detector. Fails closed on a bare base64url/hex run at or
+ * above the entropy threshold, with a small set of exemptions for shapes
+ * that are not themselves the secret (see server/src/sdw/README.md's
+ * capability bound). This is defense in depth, not a closed gap: it does
+ * not replace provenance as the enforced boundary. `buildFeatures` is
+ * injectable so a test can count how many times feature construction runs
+ * per call, defaulting to the real production builder.
+ */
+function findBareHighEntropyCredential(
+  text: string,
+  buildFeatures: (text: string, lineStarts: readonly number[]) => LineBacktickSpans = buildLineBacktickSpans,
+): ClassifierHit | undefined {
+  const candidates = [
+    ...text.matchAll(/\b[A-Fa-f0-9]{32,128}\b/g),
+    ...text.matchAll(/\b[A-Za-z0-9_-]{32,128}\b/g),
+  ];
+  if (candidates.length === 0) return undefined;
+  // Precomputed ONCE per call, not per candidate: an O(line length) rescan
+  // per candidate reproduces unbounded per-call work on attacker-influenced
+  // text. A line index plus one backtick-span pass per call gives O(log n)
+  // line lookup and O(1)-to-O(log spans) checks per candidate below.
+  const lineStarts = buildLineIndex(text);
+  const backtickSpans = buildFeatures(text, lineStarts);
+  for (const match of candidates) {
+    const candidate = match[0];
+    if (isAllowedPlaceholder(candidate) || isKnownHashLength(candidate)) continue;
+    const threshold = /^[A-Fa-f0-9]+$/.test(candidate) ? 3.2 : 4.5;
+    if (shannonEntropy(candidate) < threshold) continue;
+    const index = match.index ?? 0;
+    if (isExemptHighEntropyContext(text, index, candidate.length, lineStarts, backtickSpans)) continue;
+    return { index };
+  }
+  return undefined;
+}
+
+type LineBacktickSpans = readonly (readonly (readonly [number, number])[])[];
+
+/**
+ * One O(text length) pass, computed once per findBareHighEntropyCredential
+ * call: per line (0-based), the backtick-delimited spans on that line,
+ * pairing backticks left to right (1st with 2nd, 3rd with 4th, ...; a
+ * trailing unpaired backtick opens no span). Each pair is `[openIndex,
+ * closeIndex]`; a value is "inside" a span only when it lies strictly
+ * between a matched pair, not merely somewhere after an earlier backtick and
+ * before a later, unrelated one on the same line.
+ */
+function buildLineBacktickSpans(text: string, lineStarts: readonly number[]): LineBacktickSpans {
+  const perLine: (readonly [number, number])[][] = Array.from({ length: lineStarts.length }, () => []);
+  let lineIndex = 0;
+  let pendingOpen: number | undefined;
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (char === "\n") {
+      lineIndex += 1;
+      pendingOpen = undefined; // a span does not cross a line break
+      continue;
+    }
+    if (char === "`") {
+      if (pendingOpen === undefined) {
+        pendingOpen = i;
+      } else {
+        perLine[lineIndex]!.push([pendingOpen, i]);
+        pendingOpen = undefined;
+      }
+    }
+  }
+  return perLine;
+}
+
+/**
+ * Binary search over one line's spans (ascending by open index, by
+ * construction) for the last span opening before `index`, then checks
+ * whether the candidate's whole span [index, index+length) closes at or
+ * before that span's close index.
+ */
+function isWithinBacktickSpan(
+  spans: readonly (readonly [number, number])[],
+  index: number,
+  length: number,
+): boolean {
+  let low = 0;
+  let high = spans.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (spans[mid]![0] < index) low = mid + 1;
+    else high = mid;
+  }
+  if (low === 0) return false;
+  const [openIndex, closeIndex] = spans[low - 1]!;
+  return openIndex < index && index + length <= closeIndex;
+}
+
+// Fixed, small lookback bound (not the file, not the line) for the
+// paren/label/URL exemptions below, so each stays O(1) per candidate
+// regardless of file or line size.
+const HIGH_ENTROPY_EXEMPTION_LOOKBACK_CHARS = 64;
+
+function isExemptHighEntropyContext(
+  text: string,
+  index: number,
+  length: number,
+  lineStarts: readonly number[],
+  backtickSpans: LineBacktickSpans,
+): boolean {
+  const lineIndex = lineNumberForIndex(lineStarts, index) - 1;
+  if (isWithinBacktickSpan(backtickSpans[lineIndex] ?? [], index, length)) return true;
+
+  const before = text.slice(Math.max(0, index - HIGH_ENTROPY_EXEMPTION_LOOKBACK_CHARS), index);
+  const afterChar = index + length < text.length ? text[index + length] : undefined;
+
+  // Markdown link target ("...](value)").
+  if (/\($/.test(before) && afterChar === ")") return true;
+
+  // A URL immediately adjacent to the candidate, within the same URL span
+  // (contiguity required; excludes the delimiters a URL is commonly wrapped
+  // in, so a closed "<...>"/quote/paren correctly ends the span).
+  if (/https?:\/\/[^\s<>"'()]*$/i.test(before)) return true;
+
+  // A content-hash or commit reference labeled immediately before the value.
+  if (/(?:sha256:|sha1:|md5:|commit[: ])$/i.test(before)) return true;
+
   return false;
 }
 

@@ -66,6 +66,10 @@ export interface ClaudeCodeMemorySkip {
   /** SdwValidationError category, e.g. "classifier_reject". */
   readonly reason: string;
   readonly detail: string;
+  /** SdwValidationError.detector; populated only when reason is "classifier_reject". */
+  readonly detector?: string;
+  /** SdwValidationError.line; the 1-based line the detector matched, when known. */
+  readonly line?: number;
 }
 
 export interface IngestClaudeCodeMemoryResult {
@@ -212,19 +216,24 @@ export async function ingestClaudeCodeMemorySnapshot(
         entry.source_path,
       ),
     };
-    const screen = adapter.screenPassage(input, CLAUDE_CODE_MEMORY_TAINT);
+    // applyBareCredentialFallback=true: a raw Claude Code memory file has no
+    // other backstop (both this ingest and the write below tag it
+    // "user_content").
+    const screen = adapter.screenPassage(input, CLAUDE_CODE_MEMORY_TAINT, true);
     if (!screen.ok) {
       skipped.push({
         source_path: entry.source_path,
         reason: screen.category,
         detail: screen.message,
+        detector: screen.detector,
+        line: screen.line,
       });
       continue;
     }
     accepted.push(input);
   }
 
-  const ingested = await adapter.putPassages(accepted, CLAUDE_CODE_MEMORY_TAINT);
+  const ingested = await adapter.putPassages(accepted, CLAUDE_CODE_MEMORY_TAINT, true);
   return {
     ingested,
     skipped,

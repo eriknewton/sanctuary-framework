@@ -48,11 +48,22 @@ secret. Known, deliberate false negatives (documented, not bugs):
   a hash length may pass even when a secret-ish keyword is nearby.
 - The split-marker reassembly covers PEM private-key markers; it does not attempt
   to reassemble arbitrary secrets fragmented across fields.
-- Keyword-gated entropy is evaluated within each string field (and within each
-  metadata key/value pair), not across the canonical record. This prevents a
-  prose word such as `secret` from turning an unrelated generated record ID
-  into a false positive. Generic secret material split across unrelated fields
-  may pass unless provenance or another high-signal detector rejects it.
+- Keyword-gated entropy requires the keyword and a high-entropy candidate to
+  be near each other (the same line, or a bounded proximity window), not
+  anywhere in the whole scanned text. A keyword and a genuine secret farther
+  apart, or split across unrelated fields, may pass unless provenance,
+  another detector, or the bare-credential fallback below rejects it.
+- A bare high-entropy value with no keyword nearby is additionally checked
+  against a narrow, opt-in fallback. The classifier recognizes a small set
+  of concrete shapes as not themselves the secret (for example, a value
+  written inside a markdown code span); a value in one of those shapes is a
+  stated residual, and a value that is neither near a keyword nor in one of
+  those shapes still passes this fallback, with provenance and the other
+  detectors as the remaining backstops. This fallback runs only for
+  harness-mirrored memory-file text, where the classifier is the sole
+  backstop; every other SDW record kind and memory-passage caller
+  legitimately carries system-generated content this fallback would
+  otherwise misclassify, so it stays off there by default.
 - Names such as `principal_policy`, `recovery key`, `SANCTUARY_RECOVERY_KEY`,
   and `Ed25519 private key` are allowed in ordinary prose. Policy and key
   provenance remains fail-closed, while the classifier rejects labeled key
@@ -63,6 +74,17 @@ secret. Known, deliberate false negatives (documented, not bugs):
 Free text that never passes through a source minter is covered **only** by this
 heuristic backstop. Closing these gaps fully is the consumer-integration
 follow-on (route real sources through provenance), not a stronger classifier.
+
+**Known, deliberate false positive (documented, not a bug):** the
+keyword-gated entropy check's keyword boundary treats punctuation
+(including `_` and `=`) as a delimiter. This correctly catches an
+assignment-shaped secret line, but a keyword that is itself the prefix of a
+longer identifier named in ordinary prose can also gate, with no secret
+present, when a high-entropy value sits nearby. This is the deliberately
+chosen behavior: correctness on the assignment shape outweighs the prose
+false positive, which the operator resolves the same way as any other
+classifier refusal — edit the file, or keep it outside the mirrored
+directory.
 
 ## Out of scope by design
 
