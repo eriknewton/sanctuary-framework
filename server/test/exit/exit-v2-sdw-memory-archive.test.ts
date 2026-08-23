@@ -1,3 +1,4 @@
+// fail-before-exempt: this branch's ONLY net diff in this file relative to origin/main, after the independent gate on #1303 (2026-08-23, item 5) reverted the earlier in-place EXIT_BUNDLE_ARTIFACT_KINDS widening, is an explanatory comment above an assertion whose expected value is byte-identical to origin/main's - it holds under both pre-fix and post-fix source by construction. The actual new behavior (the separate known-signers manifest version + its own exact artifact-set contract) is covered fail-before by test/exit/exit-known-signers.test.ts and test/exit/exit-bundle.test.ts.
 import { ed25519 } from "@noble/curves/ed25519";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
