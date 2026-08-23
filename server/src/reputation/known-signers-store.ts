@@ -18,14 +18,27 @@
  * single source of truth - so it is refused to every external read/write/
  * import path the same way `_reputation` is.
  *
- * GROWTH BOUND (AGENTS.md rule 8): entries are written only for DIDs that
- * appear as an attestation signer in a bundle that has already passed
- * `ReputationStore.importBundle`'s own quota check
- * (`assertRecordQuotaForCount`, MAX_REPUTATION_RECORDS /
- * MAX_REPUTATION_RECORDS_PER_ORIGIN) - one entry per unique signer DID, never
- * more entries than admitted attestations in a single import, and a DID
- * already recorded is never rewritten (first-seen wins), so repeated imports
- * of overlapping attestation sets do not grow this namespace further.
+ * GROWTH BOUND (AGENTS.md rule 8; HARDENED - independent gate on #1303,
+ * 2026-08-23, item 4, HIGH: a per-IMPORT bound alone is not a STORE-WIDE
+ * bound. Each import individually stays under
+ * `ReputationStore.importBundle`'s own quota
+ * (`assertRecordQuotaForCount`), but a caller-controlled attestation_id and
+ * fresh signer DIDs mean a sequence of otherwise-legitimate, individually
+ * quota-respecting imports over time could still grow `_known_signers`
+ * without limit - each hop of a re-export chain can also carry the SAME
+ * signer DIDs forward, so unbounded growth is reachable indirectly through
+ * repeated import, not only through one oversized import): `persistIfAbsent`
+ * now enforces an explicit STORE-WIDE cap (`MAX_KNOWN_SIGNERS`, derived from
+ * `MAX_REPUTATION_RECORDS`) computed from NET-NEW keys (entries already
+ * present cost nothing) and checked BEFORE any write in the batch - the
+ * whole batch is refused, atomically, with NOTHING written, if it would
+ * push the store over the cap. This store has exactly one writer today
+ * (the exit-import path, server/src/exit/bundle.ts), which already runs the
+ * WHOLE persist call inside the fortress-wide exit-admission lock
+ * (`withExitAdmissionLock`), so the check-then-write here is race-free
+ * against every OTHER exit-import/rotation/recovery operation without a
+ * second lock of its own; a future second writer would need to either
+ * share that lock or add one here.
  */
 
 import type { StorageBackend } from "../storage/interface.js";
@@ -38,16 +51,62 @@ import {
   fromBase64url,
 } from "../core/encoding.js";
 import { hashToString } from "../core/hashing.js";
+import { MAX_REPUTATION_RECORDS } from "./reputation-store.js";
 
 /** Reserved namespace for persisted known-signer entries. CONTRACT PIN: must match the `"_known_signers"` literal in `RESERVED_NAMESPACE_PREFIXES` (server/src/cognitive/state-store.ts). */
 export const KNOWN_SIGNERS_NAMESPACE = "_known_signers";
+
+/**
+ * Independent gate on #1303 (2026-08-23), item 4: the store-wide ceiling on
+ * total persisted `_known_signers` records, checked by `persistIfAbsent`
+ * before every write batch. Equal to `MAX_REPUTATION_RECORDS` (not a
+ * fraction of it, unlike the global/per-origin 10x ratio elsewhere in this
+ * file family): in the worst case every one of up to `MAX_REPUTATION_RECORDS`
+ * admitted attestations names a DISTINCT signer DID, so a known-signers
+ * store that must be able to represent that worst case needs the SAME
+ * ceiling as the attestation store it derives from, not a smaller one.
+ */
+export const MAX_KNOWN_SIGNERS = MAX_REPUTATION_RECORDS;
+
+/**
+ * Thrown by `persistIfAbsent` when persisting the given batch would push
+ * `_known_signers` over `MAX_KNOWN_SIGNERS`. The whole batch is refused -
+ * nothing is written, including entries that would themselves have fit -
+ * so a caller never has to reason about a partially-admitted batch.
+ */
+export class KnownSignersQuotaError extends Error {
+  readonly currentCount: number;
+  readonly netNewCount: number;
+  readonly limit: number;
+
+  constructor(currentCount: number, netNewCount: number, limit: number) {
+    super(
+      `_known_signers is at ${currentCount} record(s); persisting ${netNewCount} ` +
+        `net-new signer(s) would exceed the ${limit}-record store-wide cap. ` +
+        "Refusing the whole batch; nothing was written."
+    );
+    this.name = "KnownSignersQuotaError";
+    this.currentCount = currentCount;
+    this.netNewCount = netNewCount;
+    this.limit = limit;
+  }
+}
 
 /** One persisted, previously-verified signer DID -> public key mapping. */
 export interface StoredKnownSigner {
   did: string;
   /** base64url raw Ed25519 public key. */
   public_key: string;
-  /** The `_exit_imports` import id at which this fortress first verified this signer. */
+  /**
+   * The `_exit_imports` import id at which THIS fortress first verified
+   * this signer. MEDIUM-3 (independent gate on #1303, 2026-08-23):
+   * informational and diagnostic ONLY - see the matching field doc on
+   * `KnownSignersEntry` (exit/verifier.ts) for the full hearsay-bound
+   * statement. Once this value crosses a re-export hop it is the relaying
+   * fortress's own self-report about ITS import history, not this
+   * fortress's, and is never treated as verified provenance by any
+   * consumer here.
+   */
   first_seen_import_id: string;
 }
 
@@ -73,16 +132,44 @@ export function knownSignerStorageKey(did: string): string {
 export class KnownSignersStore {
   private readonly storage: StorageBackend;
   private readonly encryptionKey: Uint8Array;
+  private readonly maxKnownSigners: number;
 
-  constructor(storage: StorageBackend, masterKey: Uint8Array) {
+  /**
+   * `testOverrides.maxKnownSigners` mirrors
+   * `ReputationStoreTestOverrides.maxReputationRecords` (reputation-store.ts)
+   * - production call sites never set this. It exists solely so a
+   * capacity-refusal test can drive a small cap instead of performing
+   * thousands of real writes to reach the production ceiling.
+   */
+  constructor(
+    storage: StorageBackend,
+    masterKey: Uint8Array,
+    testOverrides?: { maxKnownSigners?: number }
+  ) {
     this.storage = storage;
     this.encryptionKey = derivePurposeKey(masterKey, "l4-known-signers");
+    this.maxKnownSigners = testOverrides?.maxKnownSigners ?? MAX_KNOWN_SIGNERS;
   }
 
   /**
    * Persist every `(did, publicKey)` pair not already recorded. `importId`
    * is stamped as `first_seen_import_id` on every NEWLY written record only
    * - an already-persisted DID keeps its original import id.
+   *
+   * Independent gate on #1303 (2026-08-23), item 4: the STORE-WIDE cap
+   * (`MAX_KNOWN_SIGNERS`) is checked ONCE, atomically, before any write in
+   * this batch - `currentCount` (a single `storage.list` call) plus the
+   * NET-NEW count (candidates not already present; an already-persisted DID
+   * costs nothing) is compared against the cap, and the WHOLE batch is
+   * refused (`KnownSignersQuotaError`, nothing written) if it would exceed
+   * it. This two-phase shape (count net-new first, THEN write) is what
+   * makes "nothing written" true even for the entries that would
+   * individually have fit under the cap - a caller never has to reconcile
+   * a partially-admitted batch. Race-free against every OTHER writer of
+   * this fortress because the sole caller (server/src/exit/bundle.ts)
+   * already runs this whole method inside the exit-admission lock - see
+   * this file's module-level doc comment for the bound that statement
+   * relies on.
    *
    * `recordPostImage`, when supplied, is called synchronously with the
    * exact on-disk bytes each new write persists - the same post-image
@@ -100,10 +187,33 @@ export class KnownSignersStore {
       bytes: Uint8Array
     ) => Promise<void>
   ): Promise<void> {
+    // Phase 1: determine which candidates are NET-NEW (dedupe by storage
+    // key too - the caller's `entries` array is not itself guaranteed
+    // deduplicated) without writing anything yet.
+    const netNew = new Map<string, { did: string; publicKey: Uint8Array }>();
     for (const { did, publicKey } of entries) {
       const key = knownSignerStorageKey(did);
+      if (netNew.has(key)) continue;
       const existing = await this.storage.read(KNOWN_SIGNERS_NAMESPACE, key);
       if (existing !== null) continue;
+      netNew.set(key, { did, publicKey });
+    }
+    if (netNew.size === 0) return;
+
+    // Phase 2: the store-wide cap check, BEFORE any write.
+    const currentCount = (await this.storage.list(KNOWN_SIGNERS_NAMESPACE))
+      .length;
+    if (currentCount + netNew.size > this.maxKnownSigners) {
+      throw new KnownSignersQuotaError(
+        currentCount,
+        netNew.size,
+        this.maxKnownSigners
+      );
+    }
+
+    // Phase 3: write. Nothing above this point wrote anything, so a thrown
+    // KnownSignersQuotaError above always leaves the store byte-unchanged.
+    for (const [key, { did, publicKey }] of netNew) {
       const stored: StoredKnownSigner = {
         did,
         public_key: toBase64url(publicKey),

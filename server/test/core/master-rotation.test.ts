@@ -207,6 +207,22 @@ async function buildFortress(): Promise<Fortress> {
       )
     )
   );
+  // …and a second purpose-keyed store without AAD (known-signer keys,
+  // Exit V2 drill F2 - HIGH-2, independent gate on #1303, 2026-08-23:
+  // `_known_signers` had no rotation recipe, so rotation preflight refused
+  // on any fortress that had ever imported foreign reputation).
+  await storage.write(
+    "_known_signers",
+    "signer-1",
+    stringToBytes(
+      JSON.stringify(
+        encrypt(
+          stringToBytes(JSON.stringify({ known_signer: "fixture" })),
+          derivePurposeKey(master, "l4-known-signers")
+        )
+      )
+    )
+  );
   // …and one WITH a per-record AAD (sentinel findings: aad = finding id).
   await storage.write(
     "_sentinel_findings",
@@ -367,6 +383,20 @@ async function verifyRotated(
   ).toThrow();
   const repPlain = decrypt(rep, derivePurposeKey(newMaster, "l4-reputation"));
   expect(JSON.parse(bytesToString(repPlain)).attestation).toBe("fixture");
+
+  const knownSigner = JSON.parse(
+    bytesToString((await storage.read("_known_signers", "signer-1"))!)
+  ) as EncryptedPayload;
+  expect(() =>
+    decrypt(knownSigner, derivePurposeKey(fortress.master, "l4-known-signers"))
+  ).toThrow();
+  const knownSignerPlain = decrypt(
+    knownSigner,
+    derivePurposeKey(newMaster, "l4-known-signers")
+  );
+  expect(JSON.parse(bytesToString(knownSignerPlain)).known_signer).toBe(
+    "fixture"
+  );
 
   const finding = JSON.parse(
     bytesToString((await storage.read("_sentinel_findings", "finding-1"))!)
@@ -641,11 +671,11 @@ describe("master rotation — Tier-1 gate and capture rules", () => {
       passphrase: PASSPHRASE,
     });
     // MEDIUM-D (Codex gate, 2026-08-22): exact, not >= 0 (vacuously true) -
-    // 8 is buildFortress's own fixed fixture count (identity, castle pin,
-    // two state entries, audit epoch bookkeeping, etc.); a regression that
-    // drops a namespace from the walk silently would still pass a >= 0
-    // assertion.
-    expect(result.converted_entries).toBe(8);
+    // 9 is buildFortress's own fixed fixture count (identity, castle pin,
+    // two state entries, audit epoch bookkeeping, the _known_signers
+    // fixture added for HIGH-2 on #1303, etc.); a regression that drops a
+    // namespace from the walk silently would still pass a >= 0 assertion.
+    expect(result.converted_entries).toBe(9);
   });
 });
 

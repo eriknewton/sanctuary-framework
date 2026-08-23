@@ -35,8 +35,8 @@ import type { PrincipalPolicy } from "../principal-policy/types.js";
 import type { SanctuaryConfig } from "../config.js";
 import { defaultConfig, SANCTUARY_VERSION } from "../config.js";
 import {
-  EXIT_BUNDLE_ARTIFACT_KINDS,
-  EXIT_BUNDLE_MANIFEST_VERSION,
+  EXIT_BUNDLE_ARTIFACT_KINDS_V1_KNOWN_SIGNERS,
+  EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS,
   SIGNATURE_SCHEME_V1,
   type ExitBundleArtifactKind,
 } from "../contracts/v1.1/constants.js";
@@ -79,6 +79,7 @@ import {
   sign as identitySign,
   verify as identityVerify,
   publicKeyToDid,
+  publicKeyBytesEqual,
   type StoredIdentity,
 } from "../core/identity.js";
 import {
@@ -1416,7 +1417,7 @@ export async function exportExitBundle(
     opts.exportApprovalAuditId ?? `exit-export-${exportedAtDate.getTime()}`;
   void opts.auditLog.append("l1", "exit_bundle_export", identity.identity_id, {
     approval_id: exportApprovalAuditId,
-    manifest_version: EXIT_BUNDLE_MANIFEST_VERSION,
+    manifest_version: EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS,
   });
 
   const reputationStore =
@@ -1530,8 +1531,16 @@ export async function exportExitBundle(
 
   // `didWebBinding` was validated at the top of this function, before the
   // first side effect (A9), and is embedded here unchanged.
+  // Independent gate on #1303 (2026-08-23), item 5: this export ALWAYS
+  // carries the known_signers artifact (built above), so the manifest
+  // declares the KNOWN_SIGNERS version literal, never the frozen V1 one -
+  // see EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS's doc comment
+  // (contracts/v1.1/constants.ts). A pre-this-change verifier, which only
+  // recognizes the original literal, refuses this export cleanly via
+  // manifest_unknown_version instead of choking on an artifact kind it
+  // does not understand.
   const body: ExitBundleManifestBody = {
-    manifest_version: EXIT_BUNDLE_MANIFEST_VERSION,
+    manifest_version: EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS,
     exported_at: exportedAt,
     identity_binding: {
       identity_id: identity.identity_id,
@@ -3448,7 +3457,17 @@ export async function importExitBundle(
     // specific ENCRYPTED_STATE_ENTRIES_UNREADABLE throw below, once
     // `encryptedState` is loaded, instead of a bare "not verified" that gives
     // the operator no named cause. Import stays fail-closed either way.
-    verification.failure_class !== "encrypted_state_entries_unreadable"
+    verification.failure_class !== "encrypted_state_entries_unreadable" &&
+    // Independent gate on #1303 (2026-08-23), item 6: same "fall through
+    // to the specific throw" shape as the three siblings above -
+    // known_signers_invalid must NOT short to the generic not-verified
+    // result here. Falling through preserves the specific, typed
+    // KNOWN_SIGNERS_INVALID throw below (once identityArtifact/
+    // knownSignersArtifact are loaded), instead of a bare "not verified"
+    // that omits the actual cause. Import stays fail-closed either way -
+    // this changes ONLY which shape the refusal takes (a named error vs a
+    // generic result), never whether it refuses.
+    verification.failure_class !== "known_signers_invalid"
   ) {
     return notVerifiedResult(
       0,
@@ -3543,16 +3562,28 @@ export async function importExitBundle(
       identityArtifact.json.bundle.did,
       publicKeys.chain.current_public_key
     );
-    if (knownSignersResolution.ok) {
-      for (const [did, key] of knownSignersResolution.signers) {
-        if (!mergedByDid.has(did)) mergedByDid.set(did, key);
-      }
+    // Independent gate on #1303 (2026-08-23), item 6: a PRESENT table that
+    // cannot be trusted is a typed HARD FAILURE, thrown here BEFORE any
+    // staging write begins - defense in depth mirroring
+    // `verifyExitBundle`'s SAME hard-fail (verifier.ts), which already
+    // makes `verification.passed` false for this exact bundle and would
+    // reach the `!verification.passed` refusal below regardless; this
+    // throw makes the refusal explicit and typed at the point the
+    // decision is actually made, rather than relying solely on a verdict
+    // computed earlier in the function.
+    if (!knownSignersResolution.ok) {
+      throw new ExitBundleImportError(
+        "KNOWN_SIGNERS_INVALID",
+        `This bundle's known_signers artifact could not be trusted ` +
+          `(${knownSignersResolution.problem}` +
+          (knownSignersResolution.detail ? `: ${knownSignersResolution.detail}` : "") +
+          `). Refusing before any staging write. Re-export from the source ` +
+          `fortress.`
+      );
     }
-    // A table that fails to resolve (wrong signature, malformed, duplicate
-    // conflicting DID) contributes nothing - the affected attestations stay
-    // unverifiable and `reputationStore.verifyBundle`/`importBundle` refuse
-    // the whole bundle below exactly as they would with no known_signers
-    // artifact at all. Never partially trust a table that failed to verify.
+    for (const [did, key] of knownSignersResolution.signers) {
+      if (!mergedByDid.has(did)) mergedByDid.set(did, key);
+    }
   }
 
   // LD2-01 (verify/import parity aggregator, class fix), extended by
@@ -4200,7 +4231,33 @@ export async function importExitBundle(
       const knownSignersToPersist: Array<{ did: string; publicKey: Uint8Array }> = [];
       for (const did of foreignSignerDids) {
         const key = mergedByDid.get(did);
-        if (key) knownSignersToPersist.push({ did, publicKey: key });
+        if (!key) continue;
+        // MEDIUM-4 (independent gate on #1303, 2026-08-23): never persist,
+        // and therefore never later RE-VOUCH FOR, a key the source
+        // fortress's own rotation chain marks `compromised` - persisting it
+        // here would let THIS fortress launder trust in a key its own
+        // exporter has disclaimed, presenting it to a THIRD fortress on a
+        // later re-export as though it were an ordinary verified signer.
+        // Cross-referenced by KEY BYTES (not DID) against every candidate
+        // in `publicKeys.byIdentityId` - the SAME structure
+        // `compromisedRetiredSignatureUse` (above) already uses for the
+        // parallel state-entry check - because the compromised flag lives
+        // on the rotation-chain CANDIDATE, not on the known_signers table
+        // entry itself. Gated by the SAME `--accept-compromised-rotation-keys`
+        // opt-in the state-entry path uses, so an operator who has already
+        // accepted that risk for this import is not asked to accept it
+        // twice under a different flag.
+        const isCompromisedCandidate = [...publicKeys.byIdentityId.values()].some(
+          (candidates) =>
+            candidates.some(
+              (candidate) =>
+                candidate.compromised && publicKeyBytesEqual(candidate.publicKey, key)
+            )
+        );
+        if (isCompromisedCandidate && opts.acceptCompromisedRotationKeys !== true) {
+          continue;
+        }
+        knownSignersToPersist.push({ did, publicKey: key });
       }
       if (knownSignersToPersist.length > 0) {
         await new KnownSignersStore(opts.storage, opts.masterKey).persistIfAbsent(
@@ -4483,9 +4540,15 @@ export async function importExitBundle(
 }
 
 export function exitBundleManifestShape(): Record<string, unknown> {
+  // Independent gate on #1303 (2026-08-23), item 5: this reflects what a
+  // CURRENT export actually produces (the known_signers-carrying version
+  // and its 8-kind set) - the frozen original V1 shape
+  // (EXIT_BUNDLE_MANIFEST_VERSION + EXIT_BUNDLE_ARTIFACT_KINDS) still
+  // exists and still verifies unchanged, but is no longer what this build
+  // exports.
   return {
-    manifest_version: EXIT_BUNDLE_MANIFEST_VERSION,
-    artifacts: [...EXIT_BUNDLE_ARTIFACT_KINDS],
+    manifest_version: EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS,
+    artifacts: [...EXIT_BUNDLE_ARTIFACT_KINDS_V1_KNOWN_SIGNERS],
     hash_alg: "sha256",
     signature_scheme: SIGNATURE_SCHEME_V1,
     required_top_level_file: "manifest.json",

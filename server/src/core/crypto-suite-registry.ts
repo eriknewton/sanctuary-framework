@@ -29,6 +29,19 @@ export const ED25519_SIGNATURE_SUITE_ID = "ed25519-v1";
 export const ML_DSA_65_COMPONENT_ALG = "ml-dsa-65-v1";
 export const HYBRID_SIGNATURE_SUITE_ID = "ed25519+ml-dsa-v1";
 
+/**
+ * MEDIUM-6 (independent gate on #1303, 2026-08-23): domain-separation label
+ * for the Exit V2 known_signers table (Exit V2 drill F2,
+ * server/src/exit/verifier.ts `knownSignersSigningBytes`). Included as a
+ * field INSIDE the canonicalized signed structure, so a signature produced
+ * for a known_signers table can never be replayed as a valid signature over
+ * a different signed structure that happens to canonicalize to the same
+ * `{version, signers}` shape (or vice versa) - the same cross-protocol-
+ * confusion defense every other domain label in this file provides. Bump
+ * the version suffix (never reuse `.v1`) if the signed shape ever changes.
+ */
+export const EXIT_KNOWN_SIGNERS_DOMAIN = "sanctuary.exit-known-signers.v1";
+
 // ── Wire byte lengths ───────────────────────────────────────────────────
 // Every literal below is a fixed property of the algorithm, not a tunable.
 // They are grouped here so a length check anywhere in the tree reads as the

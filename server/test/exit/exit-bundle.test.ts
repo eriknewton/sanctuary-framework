@@ -127,7 +127,14 @@ describe("SANCTUARY_EXIT_BUNDLE_V1", () => {
       keySource: "recovery-key",
     });
 
-    expect(exported.manifest.body.manifest_version).toBe("SANCTUARY_EXIT_BUNDLE_V1");
+    // Independent gate item 5 (2026-08-23): a current export always carries
+    // known_signers, so it declares the SEPARATE known-signers manifest
+    // version - the original frozen V1 literal stays reserved for bundles
+    // that carry exactly V1's original 7-kind set (see
+    // contracts/v1.1/constants.ts).
+    expect(exported.manifest.body.manifest_version).toBe(
+      "SANCTUARY_EXIT_BUNDLE_V1_KNOWN_SIGNERS"
+    );
     expect(exported.manifest.body.artifacts.map((a) => a.kind).sort()).toEqual([
       "audit_receipts",
       "commitments",
@@ -258,7 +265,7 @@ describe("SANCTUARY_EXIT_BUNDLE_V1", () => {
   it("reports the stable manifest shape for dashboard/API consumers", () => {
     const shape = exitBundleManifestShape();
     expect(shape).toMatchObject({
-      manifest_version: "SANCTUARY_EXIT_BUNDLE_V1",
+      manifest_version: "SANCTUARY_EXIT_BUNDLE_V1_KNOWN_SIGNERS",
       hash_alg: "sha256",
       signature_scheme: "ed25519-v1",
       required_top_level_file: "manifest.json",

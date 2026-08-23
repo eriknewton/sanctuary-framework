@@ -19,12 +19,14 @@ export class InvalidExitBundleError extends Error {
   }
 }
 
-import { lstat, realpath } from "node:fs/promises";
-import { dirname, join, resolve, sep } from "node:path";
+import { lstat, readdir, realpath } from "node:fs/promises";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519";
 import {
   EXIT_BUNDLE_ARTIFACT_KINDS,
+  EXIT_BUNDLE_ARTIFACT_KINDS_V1_KNOWN_SIGNERS,
   EXIT_BUNDLE_MANIFEST_VERSION,
+  EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS,
   SIGNATURE_SCHEME_V1,
   type ExitBundleArtifactKind,
 } from "../contracts/v1.1/constants.js";
@@ -41,7 +43,8 @@ import {
   SUPPORTED_PAYLOAD_ALG,
   PAYLOAD_IV_BYTE_LENGTH,
 } from "../core/encryption.js";
-import { publicKeyToDid } from "../core/identity.js";
+import { publicKeyToDid, publicKeyBytesEqual } from "../core/identity.js";
+import { EXIT_KNOWN_SIGNERS_DOMAIN } from "../core/crypto-suite-registry.js";
 import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 import { isReservedNamespace } from "../cognitive/state-store.js";
 import {
@@ -321,7 +324,11 @@ function fail(
 }
 
 function isKnownKind(kind: string): kind is ExitBundleArtifactKind {
-  return (EXIT_BUNDLE_ARTIFACT_KINDS as readonly string[]).includes(kind);
+  // Syntactic recognition only, across every manifest version - see
+  // ExitBundleArtifactKind's doc comment (constants.ts). The exact
+  // per-version SET (which kinds a given manifest_version must carry, no
+  // more, no fewer) is enforced separately below.
+  return (EXIT_BUNDLE_ARTIFACT_KINDS_V1_KNOWN_SIGNERS as readonly string[]).includes(kind);
 }
 
 function validateArtifactPath(path: string): "ok" | "unsafe" {
@@ -358,6 +365,68 @@ async function assertDescendant(root: string, candidate: string): Promise<boolea
   const candidateDir = await realpath(dirname(candidate));
   const rootWithSep = rootReal.endsWith(sep) ? rootReal : rootReal + sep;
   return candidateDir === rootReal || candidateDir.startsWith(rootWithSep);
+}
+
+/**
+ * Bound on how many files `listBundleFiles` will enumerate before refusing
+ * (AGENTS.md rule 8: attacker-controlled input - an imported bundle - gets
+ * an explicit per-request work cap, never unbounded recursion). 10,000 is
+ * generous over any legitimate bundle (today's largest manifest carries 8
+ * artifacts plus manifest.json); a directory this large is refused outright
+ * rather than walked to completion.
+ */
+const MAX_BUNDLE_DIRECTORY_ENTRIES = 10_000;
+
+/**
+ * Recursively list every FILE (not directory) under `root`, as paths
+ * relative to `root` in POSIX form - independent gate on #1303, item 5:
+ * verification must see what is actually on disk, not only what the
+ * manifest claims is there. A symlink is recorded too (never followed) so
+ * an unlisted symlink is caught by the same "unlisted" check the caller
+ * runs, rather than silently skipped. Returns `"too_many"` instead of a
+ * partial list if the walk would exceed `maxEntries` - a truncated list
+ * could let files past the cap hide as "not found", which is the opposite
+ * of fail-closed.
+ */
+async function listBundleFiles(
+  root: string,
+  maxEntries: number
+): Promise<string[] | "too_many"> {
+  const out: string[] = [];
+  async function walk(dir: string, relPrefix: string): Promise<boolean> {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      // Unreadable directory: no files to report from here. Defensive only
+      // - every directory this walk descends into was itself just listed
+      // by readdir a moment earlier.
+      return true;
+    }
+    for (const entry of entries) {
+      if (out.length >= maxEntries) return false;
+      const relPath = relPrefix
+        ? `${relPrefix}/${entry.name}`
+        : entry.name;
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        const ok = await walk(fullPath, relPath);
+        if (!ok) return false;
+        continue;
+      }
+      // Files AND symlinks are both recorded (never followed) - an
+      // unlisted symlink is exactly as unaccountable as an unlisted
+      // regular file, and the manifest's declared artifact paths are
+      // never expected to name a symlink at all (a LISTED symlink is
+      // refused separately, at the per-artifact hash/read loop, via
+      // `archive_contains_symlink`).
+      out.push(relative(root, fullPath).split(sep).join("/"));
+    }
+    return true;
+  }
+  const complete = await walk(root, "");
+  if (!complete) return "too_many";
+  return out;
 }
 
 function findPrivateMaterial(value: unknown, path = "$"): string[] {
@@ -958,6 +1027,21 @@ export interface KnownSignersEntry {
   did: string;
   /** base64url raw Ed25519 public key. */
   public_key: string;
+  /**
+   * MEDIUM-3 (independent gate on #1303, 2026-08-23): the LOCAL `_exit_imports`
+   * id of the import at which the ORIGINAL exporting fortress first verified
+   * this signer - informational and diagnostic ONLY, never a trust input.
+   * With HIGH-1 fixed (did:key self-certification), the property this table
+   * actually needs to prove - "this key derives this DID" - is carried
+   * entirely by the structural check plus the table's own signature; this
+   * field carries none of that weight. It is the EXPORTER's self-report,
+   * unverifiable by a receiving fortress (which cannot confirm when, or
+   * whether, the claimed import genuinely happened), and after N re-export
+   * hops it is hearsay relayed and re-signed N times, never independently
+   * re-derived. No consumer in this codebase reads its VALUE for any
+   * security decision - required non-empty purely so a malformed or
+   * truncated entry is still caught by the element-level structural check.
+   */
   first_seen_import_id: string;
 }
 
@@ -1004,6 +1088,7 @@ export function isWellFormedKnownSignersEntry(
 export type KnownSignersStructureProblem =
   | "signers_unreadable"
   | "signers_malformed_elements"
+  | "signers_did_key_mismatch"
   | "signers_duplicate_did_conflict"
   | "signers_version_unsupported";
 
@@ -1055,6 +1140,36 @@ export function checkKnownSignersStructure(record: {
           "a signers element is missing or has a wrong-typed did/public_key/first_seen_import_id",
       };
     }
+    // HIGH-1 (independent gate on #1303, 2026-08-23, key-substitution
+    // REPRODUCED): `did:key` is SELF-CERTIFYING - the DID is a deterministic
+    // encoding of the public key (publicKeyToDid, core/identity.ts) - so an
+    // entry whose declared `did` does not derive from its declared
+    // `public_key` is not a differently-encoded truth, it is a FORGED
+    // mapping: the exporter can name ANY did on this table and pair it with
+    // a key it controls, then sign attestations under that fabricated
+    // pairing with `signer` set to the victim DID. Checked BEFORE the
+    // duplicate-DID check below so a forged entry is refused on its own
+    // demerits, not conflated with a legitimate re-assertion. `publicKeyToDid`
+    // never throws here - `isWellFormedKnownSignersEntry` above already
+    // proved `public_key` decodes to exactly `ED25519_PUBLIC_KEY_BYTES`,
+    // the one precondition `publicKeyToDid`/`assertEd25519PublicKey` require.
+    let derivedDid: string;
+    try {
+      derivedDid = publicKeyToDid(fromBase64urlStrict(item.public_key));
+    } catch {
+      return {
+        ok: false,
+        problem: "signers_did_key_mismatch",
+        detail: `signers element for DID ${item.did} has an undecodable public_key`,
+      };
+    }
+    if (derivedDid !== item.did) {
+      return {
+        ok: false,
+        problem: "signers_did_key_mismatch",
+        detail: `signers element claims DID ${item.did} but its public_key derives DID ${derivedDid}`,
+      };
+    }
     const existing = byDid.get(item.did);
     if (existing !== undefined && existing !== item.public_key) {
       return {
@@ -1072,17 +1187,36 @@ export function checkKnownSignersStructure(record: {
  * Canonical signing bytes for a `known_signers` table. The `signature`
  * field is deliberately excluded (it signs everything ELSE), mirroring
  * `reputationBundleSigningBytes`'s shape.
+ *
+ * MEDIUM-6 (independent gate on #1303, 2026-08-23): `EXIT_KNOWN_SIGNERS_DOMAIN`
+ * (core/crypto-suite-registry.ts) is included as a field inside the
+ * canonicalized structure - domain separation, so a signature over a
+ * known_signers table can never be confused with a signature over some
+ * OTHER structure that happens to canonicalize to the same
+ * `{version, signers}` shape.
  */
 export function knownSignersSigningBytes(table: {
   version: 1;
   signers: KnownSignersEntry[];
 }): Uint8Array {
-  return canonicalizeToBytes({ version: table.version, signers: table.signers });
+  return canonicalizeToBytes({
+    domain: EXIT_KNOWN_SIGNERS_DOMAIN,
+    version: table.version,
+    signers: table.signers,
+  });
 }
 
 export type KnownSignersResolution =
   | { ok: true; signers: Map<string, Uint8Array> }
-  | { ok: false; problem: KnownSignersStructureProblem | "signature_invalid" | "artifact_shape_invalid"; detail?: string };
+  | {
+      ok: false;
+      problem:
+        | KnownSignersStructureProblem
+        | "signature_invalid"
+        | "artifact_shape_invalid"
+        | "signers_self_entry_present";
+      detail?: string;
+    };
 
 /**
  * Resolve a parsed `known_signers` artifact into a DID -> public key map,
@@ -1103,12 +1237,36 @@ export type KnownSignersResolution =
  * unattributed.
  *
  * INVARIANT (drill F2 ruling, "the table can never introduce a signer for
- * the exporting fortress's own DID"): an entry whose `did` equals
- * `exportingDid` is dropped from the resolved map even when the table
- * otherwise parses and verifies cleanly - the exporting identity's own key
- * is established by the bundle's public_identity artifact and rotation
- * chain, never by this auxiliary table, so this table can never be used to
- * shadow or override it.
+ * the exporting fortress's own DID"; HARDENED to a whole-table REJECTION,
+ * independent gate on #1303, 2026-08-23, item 6 - a prior revision merely
+ * dropped the one offending entry, which is the wrong shape: it lets a
+ * forger probe which entries get silently discarded): an entry whose `did`
+ * equals `exportingDid`, OR whose `public_key` byte-equals
+ * `exportingPublicKey` (checked independently of the DID string - HIGH-1,
+ * same gate: a self-consistent did:key entry could otherwise carry the
+ * exporter's OWN key under a DID string that does not textually match
+ * `exportingDid`, e.g. a legacy encoding or a future non-did:key scheme),
+ * REJECTS THE ENTIRE TABLE (`signers_self_entry_present`) even when the
+ * table otherwise parses and verifies cleanly - the exporting identity's
+ * own key is established by the bundle's public_identity artifact and
+ * rotation chain, never by this auxiliary table, so this table can never be
+ * used to shadow or override it, and a well-formed table never needs to
+ * name its own exporter in the first place.
+ *
+ * WHAT THIS DOES NOT PROVE (HIGH-1 finding, stated so a future caller does
+ * not over-read the return value): `checkKnownSignersStructure`'s did:key
+ * check proves an entry's `(did, public_key)` pair is SELF-CONSISTENT -
+ * that `did` is the deterministic encoding of `public_key` - never that the
+ * EXPORTING fortress genuinely verified an attestation from that signer at
+ * some earlier legitimate import. Self-consistency is necessary (it rules
+ * out the key-substitution forgery this fix closes) but not sufficient: the
+ * exporter could still mint a brand-new keypair, label its DID as a
+ * "known signer," and sign fabricated attestations under it. This table is
+ * therefore no stronger a trust primitive than a first-hop bundle's own
+ * self-certified identity always was - a receiving fortress trusts it
+ * exactly that much, no more (MEDIUM-3, same gate: each hop re-derives its
+ * own trust from what its own signature chain proves, never from an
+ * upstream fortress's unverifiable claim to have "checked" a signer).
  */
 export function resolveKnownSigners(
   artifact: unknown,
@@ -1143,14 +1301,37 @@ export function resolveKnownSigners(
   }
   const resolved = new Map<string, Uint8Array>();
   for (const entry of signers) {
-    if (entry.did === exportingDid) continue;
+    let entryKey: Uint8Array;
     try {
-      resolved.set(entry.did, fromBase64urlStrict(entry.public_key));
+      entryKey = fromBase64urlStrict(entry.public_key);
     } catch {
       // Unreachable: isWellFormedKnownSignersEntry already decoded this
-      // exact field successfully. Defensive only - never populate a
-      // partially-resolved entry.
+      // exact field successfully. Defensive only.
+      return {
+        ok: false,
+        problem: "signers_malformed_elements",
+        detail: `signers element for DID ${entry.did} has an undecodable public_key`,
+      };
     }
+    // Independent gate on #1303 (2026-08-23), item 6: an entry naming the
+    // exporting fortress's own DID OR own key bytes (checked independently
+    // of the DID string, so an equivalent legacy encoding of the SAME key
+    // is caught the same way - core/identity.ts `legacyPublicKeyToDid`) is
+    // a HARD REJECTION of the WHOLE table, never a silent per-entry skip. A
+    // well-formed table never needs to name its own exporter - the
+    // exporter's own key is established by the bundle's public_identity
+    // artifact and rotation chain - so an entry that does is itself
+    // evidence of malformed or adversarial construction, and admitting the
+    // REST of an otherwise-plausible table while quietly dropping only this
+    // one entry would let a forger probe which entries were rejected.
+    if (entry.did === exportingDid || publicKeyBytesEqual(entryKey, exportingPublicKey)) {
+      return {
+        ok: false,
+        problem: "signers_self_entry_present",
+        detail: `signers element claims the exporting fortress's own identity (DID ${entry.did})`,
+      };
+    }
+    resolved.set(entry.did, entryKey);
   }
   return { ok: true, signers: resolved };
 }
@@ -1290,7 +1471,20 @@ export async function verifyExitBundle(
   const warnings: string[] = [];
   const unsupportedArtifacts: string[] = [];
   const body = manifest.body;
-  if (!body || body.manifest_version !== EXIT_BUNDLE_MANIFEST_VERSION) {
+  // Independent gate on #1303 (2026-08-23), item 5: TWO manifest_version
+  // literals are valid - the original frozen V1 and the known-signers
+  // revision - never a widened single value. See
+  // EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS's doc comment (constants.ts)
+  // for why a bundle that carries known_signers declares a DIFFERENT
+  // literal rather than silently widening what "V1" means: a pre-this-
+  // change verifier refuses it through this SAME, already-existing
+  // manifest_unknown_version path instead of hitting an "unknown artifact
+  // kind" it has no way to interpret.
+  if (
+    !body ||
+    (body.manifest_version !== EXIT_BUNDLE_MANIFEST_VERSION &&
+      body.manifest_version !== EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS)
+  ) {
     return fail(root, manifest, "manifest_unknown_version", warnings, unsupportedArtifacts);
   }
   if (body.signature_scheme !== SIGNATURE_SCHEME_V1) {
@@ -1304,6 +1498,7 @@ export async function verifyExitBundle(
   }
 
   const seenPaths = new Set<string>();
+  const seenKinds = new Set<string>();
   for (const artifact of body.artifacts) {
     if (!isKnownKind(artifact.kind)) {
       return fail(root, manifest, "other", [`unknown artifact kind: ${describeUntrusted(artifact.kind)}`]);
@@ -1312,9 +1507,55 @@ export async function verifyExitBundle(
       return fail(root, manifest, "artifact_path_duplicate", warnings, unsupportedArtifacts);
     }
     seenPaths.add(artifact.path);
+    // Independent gate, item 5: a kind repeated at a DIFFERENT path is not
+    // caught by the path-duplicate check above, and every artifact kind in
+    // this format is singular by design (loadExitArtifact resolves the
+    // FIRST manifest entry matching a kind) - a second, differently-pathed
+    // entry under the same kind is either a malformed export or an attempt
+    // to smuggle a shadow artifact past whichever consumer looks it up by
+    // kind.
+    if (seenKinds.has(artifact.kind)) {
+      return fail(root, manifest, "artifact_kind_duplicate", warnings, unsupportedArtifacts);
+    }
+    seenKinds.add(artifact.kind);
     if (validateArtifactPath(artifact.path) !== "ok") {
       return fail(root, manifest, "artifact_path_unsafe", warnings, unsupportedArtifacts);
     }
+  }
+
+  // Independent gate, item 5: the artifact SET must be EXACTLY the
+  // contract for this manifest_version - not "a subset of recognized
+  // kinds". A V1 bundle missing a required artifact, or (impossible today
+  // given the isKnownKind gate above, but checked anyway as the
+  // authoritative per-version boundary) carrying one outside V1's 7-kind
+  // contract, is refused here.
+  const expectedKindSet: readonly string[] =
+    body.manifest_version === EXIT_BUNDLE_MANIFEST_VERSION_KNOWN_SIGNERS
+      ? EXIT_BUNDLE_ARTIFACT_KINDS_V1_KNOWN_SIGNERS
+      : EXIT_BUNDLE_ARTIFACT_KINDS;
+  if (
+    seenKinds.size !== expectedKindSet.length ||
+    !expectedKindSet.every((kind) => seenKinds.has(kind))
+  ) {
+    return fail(root, manifest, "artifact_set_invalid", warnings, unsupportedArtifacts);
+  }
+
+  // Independent gate, item 5: verification must WALK the artifact
+  // directory, not only trust the manifest's own declared list - a file
+  // present on disk but never listed in the signed manifest is outside the
+  // signature's coverage entirely (the manifest signs `artifacts[]` and the
+  // aggregate hash over it, never "what happens to be on disk"), so its
+  // presence is unaccountable, whatever it contains. `manifest.json` at the
+  // bundle root is the one expected non-artifact file.
+  const bundleFiles = await listBundleFiles(root, MAX_BUNDLE_DIRECTORY_ENTRIES);
+  if (bundleFiles === "too_many") {
+    return fail(root, manifest, "artifact_directory_unlisted_file", warnings, unsupportedArtifacts);
+  }
+  const unlisted = bundleFiles.filter(
+    (relPath) => relPath !== "manifest.json" && !seenPaths.has(relPath)
+  );
+  if (unlisted.length > 0) {
+    return fail(root, manifest, "artifact_directory_unlisted_file", warnings, unsupportedArtifacts);
   }
 
   const identityBindingVerification =
@@ -1592,33 +1833,43 @@ export async function verifyExitBundle(
   // attestations can resolve through it. VERSION-GATED: a bundle exported
   // before this change carries no "known_signers" artifact kind,
   // `loadExitArtifact` returns null, and this block is a no-op - verify
-  // behaves exactly as it did before this change. A table that fails to
-  // resolve (wrong signature, malformed, absent identity binding) simply
-  // contributes no entries; it does not fail the bundle outright - the
-  // attestations that would have needed it fall through to the EXISTING
-  // `unverifiable_attestations` accounting below, the same as any other
-  // unknown-signer attestation.
+  // behaves exactly as it did before this change.
+  //
+  // Independent gate on #1303 (2026-08-23), item 6: a PRESENT table that
+  // cannot be trusted is a typed HARD FAILURE (`known_signers_invalid`)
+  // returned immediately, before any further check - never a warning that
+  // lets the bundle still pass when, by coincidence, no attestation in
+  // this particular bundle happened to need the table. A tampered or
+  // forged known_signers artifact is evidence of tampering in its own
+  // right and must never be silently absorbed.
   const knownSignersArtifact = await loadExitArtifact(root, manifest, "known_signers");
-  if (
-    knownSignersArtifact &&
-    identityVerification?.did !== undefined &&
-    identityVerification.public_key !== undefined
-  ) {
+  if (knownSignersArtifact) {
+    if (
+      identityVerification?.did === undefined ||
+      identityVerification.public_key === undefined
+    ) {
+      // Unreachable in practice - the identity-binding gate above already
+      // returned a failed result before this line whenever the identity
+      // artifact/binding does not verify. Fail closed rather than silently
+      // skip resolution if that invariant is ever violated by a future
+      // change.
+      return fail(root, manifest, "known_signers_invalid", warnings, unsupportedArtifacts);
+    }
     const knownSignersResolution = resolveKnownSigners(
       knownSignersArtifact.json,
       identityVerification.did,
       fromBase64url(identityVerification.public_key)
     );
-    if (knownSignersResolution.ok) {
-      for (const [did, key] of knownSignersResolution.signers) {
-        if (!publicKeysByDid.has(did)) publicKeysByDid.set(did, key);
-      }
-    } else {
+    if (!knownSignersResolution.ok) {
       warnings.push(
         `known_signers table could not be trusted (${knownSignersResolution.problem}` +
           (knownSignersResolution.detail ? `: ${knownSignersResolution.detail}` : "") +
-          "); any attestation signed by a DID only this table would have resolved stays unverifiable"
+          ")"
       );
+      return fail(root, manifest, "known_signers_invalid", warnings, unsupportedArtifacts);
+    }
+    for (const [did, key] of knownSignersResolution.signers) {
+      if (!publicKeysByDid.has(did)) publicKeysByDid.set(did, key);
     }
   }
 
@@ -1787,6 +2038,10 @@ export async function verifyExitBundle(
     manifest_unknown_version: false, // early-returned at the manifest_version gate above
     manifest_signature_scheme_invalid: false, // early-returned at the signature_scheme gate above
     artifact_path_duplicate: false, // early-returned in the per-artifact path-validation loop above
+    artifact_kind_duplicate: false, // early-returned in the per-artifact path-validation loop above (independent gate, item 5)
+    artifact_set_invalid: false, // early-returned by the per-manifest_version exact-set check above (independent gate, item 5)
+    artifact_directory_unlisted_file: false, // early-returned by the directory-walk check above (independent gate, item 5)
+    known_signers_invalid: false, // early-returned by the known_signers resolution block above (independent gate, item 6)
     artifact_path_unsafe: false, // early-returned in the per-artifact path-validation loop above
     identity_binding_mismatch: false, // early-returned by verifyIdentityBindingBeforeManifestKeyUse above
     manifest_signature_invalid: false, // early-returned at the manifest fortress-master signature gate above

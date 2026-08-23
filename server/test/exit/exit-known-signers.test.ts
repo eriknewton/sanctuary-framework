@@ -29,11 +29,12 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import type { StorageEntryMeta } from "../../src/storage/interface.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
+import { fromBase64url, stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { hash } from "../../src/core/hashing.js";
-import { sign as identitySign } from "../../src/core/identity.js";
+import { sign as identitySign, publicKeyToDid } from "../../src/core/identity.js";
 import { canonicalize, canonicalizeToBytes } from "../../src/mesh/canonical-json.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
@@ -44,6 +45,7 @@ import { defaultConfig } from "../../src/config.js";
 import {
   exportExitBundle,
   importExitBundle,
+  ExitBundleImportError,
   type ExportExitBundleResult,
 } from "../../src/exit/index.js";
 import {
@@ -52,6 +54,7 @@ import {
   type KnownSignersEntry,
 } from "../../src/exit/verifier.js";
 import type { ExitBundleManifest } from "../../src/contracts/v1.1/exit-bundle-manifest.js";
+import { EXIT_BUNDLE_MANIFEST_VERSION } from "../../src/contracts/v1.1/constants.js";
 
 interface ToolDef {
   name: string;
@@ -191,7 +194,7 @@ async function resignManifest(bundleDir: string, signer: Harness): Promise<void>
 
 async function updateArtifactHashAndSize(
   bundleDir: string,
-  kind: "known_signers",
+  kind: "known_signers" | "reputation_bundle",
   artifactBytes: Uint8Array
 ): Promise<void> {
   const manifestPath = join(bundleDir, "manifest.json");
@@ -250,8 +253,39 @@ async function removeKnownSignersArtifact(
   manifest.body.artifacts = manifest.body.artifacts.filter(
     (a) => a.kind !== "known_signers"
   );
+  // Independent gate item 5 (2026-08-23): a bundle without the
+  // known_signers artifact must declare the ORIGINAL frozen V1 manifest
+  // version, not the known-signers one - the per-version exact-artifact-set
+  // check (verifier.ts) refuses a known-signers-version manifest whose
+  // artifact set does not include known_signers. This is exactly what makes
+  // the resulting bundle a faithful stand-in for a genuinely pre-this-change
+  // export, not merely "the same bytes with one artifact missing."
+  manifest.body.manifest_version = EXIT_BUNDLE_MANIFEST_VERSION;
   await writeFile(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
   await resignManifest(bundleDir, manifestSigner);
+}
+
+/**
+ * Full-content snapshot of a MemoryStorage's every namespace EXCEPT
+ * `_audit*` (audit entries carry a real timestamp and always differ across
+ * two points in time even across a genuine no-op). MEDIUM-5 (independent
+ * gate on #1303, 2026-08-23): every refusal fixture below proves not just
+ * `activated: false`/a thrown error, but that the destination's storage is
+ * BYTE-IDENTICAL before and after the refused import attempt - zero
+ * staging writes, not merely zero *successful* writes.
+ */
+async function snapshotAll(storage: MemoryStorage): Promise<string> {
+  const namespaces = await storage.listNamespaces();
+  const rows: string[] = [];
+  for (const ns of namespaces) {
+    if (ns.startsWith("_audit")) continue;
+    const entries: StorageEntryMeta[] = await storage.list(ns);
+    for (const entry of entries) {
+      const data = await storage.read(ns, entry.key);
+      rows.push(`${ns}/${entry.key}:${data ? toBase64url(data) : "null"}`);
+    }
+  }
+  return rows.sort().join("\n");
 }
 
 describe("Exit V2 known_signers (drill F2)", () => {
@@ -349,121 +383,340 @@ describe("Exit V2 known_signers (drill F2)", () => {
     expect(importedBC.reputation.invalid_attestations).toBe(0);
   });
 
-  it("a malformed known_signers element resolves to zero trusted signers; the affected attestation stays unverifiable and the bundle fails closed", async () => {
+  it("independent gate item 4 (MEDIUM-4): a signer key retired for a COMPROMISED reason is never persisted into known_signers by default, only under --accept-compromised-rotation-keys", async () => {
     const fortressA = await makeHarness();
-    const aIdentityId = await createIdentity(fortressA, "mal-a");
-    await recordAttestation(fortressA, aIdentityId, "mal-ix-a1", "mal-ctx");
-    const bundleAB = await newBundleDir("sanctuary-known-signers-mal-ab-");
-    await exportBundle(fortressA, bundleAB);
-    const fortressB = await makeHarness();
-    const bIdentityId = await createIdentity(fortressB, "mal-b");
-    await importInto(fortressB, bIdentityId, bundleAB);
+    const aIdentityId = await createIdentity(fortressA, "compromise-a");
+    // Attestation signed by A's CURRENT key, BEFORE rotation - after
+    // rotation this key becomes a COMPROMISED retired candidate on A's own
+    // rotation chain, but the attestation's signature (over the ORIGINAL
+    // signing key) never changes.
+    await recordAttestation(fortressA, aIdentityId, "compromise-ix-a1", "compromise-ctx");
+    await callTool(fortressA.tools, "identity_rotate", {
+      identity_id: aIdentityId,
+      reason: "compromised",
+    });
 
-    const bundleBC = await newBundleDir("sanctuary-known-signers-mal-bc-");
-    await exportBundle(fortressB, bundleBC);
-    await rewriteKnownSigners(
-      bundleBC,
-      fortressB,
-      (parsed) => ({
+    const bundleAB = await newBundleDir("sanctuary-known-signers-compromise-ab-");
+    await exportBundle(fortressA, bundleAB);
+    const verifiedAB = await verifyExitBundle(bundleAB);
+    // The attestation signature itself verifies fine (the compromised flag
+    // gates PERSISTENCE into known_signers, MEDIUM-4's scope, not signature
+    // validity - a retired key, compromised or not, is still the key that
+    // actually produced this signature).
+    expect(verifiedAB.passed).toBe(true);
+    expect(verifiedAB.reputation?.unverifiable_attestations).toBe(0);
+
+    // Default (no opt-in): import succeeds (no STATE entry here to trip the
+    // separate COMPROMISED_ROTATION_KEY_REFUSED gate - this fortress never
+    // wrote any state), but the compromised signer's key is EXCLUDED from
+    // what gets persisted into _known_signers.
+    const refusedDestination = await makeHarness();
+    const refusedDestinationId = await createIdentity(refusedDestination, "compromise-b-default");
+    const importedDefault = await importInto(refusedDestination, refusedDestinationId, bundleAB);
+    expect(importedDefault.activated).toBe(true);
+    expect(importedDefault.reputation.imported_attestations).toBe(1);
+    expect((await refusedDestination.storage.list("_known_signers")).length).toBe(0);
+
+    // With the explicit opt-in: the SAME compromised-signer key IS
+    // persisted - an operator who has already accepted the compromised-key
+    // risk is not silently denied the portability this table exists for.
+    const acceptedDestination = await makeHarness();
+    const acceptedDestinationId = await createIdentity(acceptedDestination, "compromise-b-accepted");
+    const importedAccepted = await importExitBundle({
+      bundleDir: bundleAB,
+      storage: acceptedDestination.storage,
+      masterKey: acceptedDestination.masterKey,
+      identityManager: acceptedDestination.identityManager,
+      auditLog: acceptedDestination.auditLog,
+      reputationStore: acceptedDestination.reputationStore,
+      activate: true,
+      forceRebind: true,
+      destinationSignerIdentityId: acceptedDestinationId,
+      acceptCompromisedRotationKeys: true,
+    });
+    expect(importedAccepted.activated).toBe(true);
+    expect(importedAccepted.reputation.imported_attestations).toBe(1);
+    expect((await acceptedDestination.storage.list("_known_signers")).length).toBe(1);
+  });
+
+  it("independent gate item 4: a four-hop chain (A -> B -> C -> D) keeps known_signers COUNTS exact - no duplication, no loss, across repeated re-export", async () => {
+    const fortressA = await makeHarness();
+    const aIdentityId = await createIdentity(fortressA, "chain-a");
+    await recordAttestation(fortressA, aIdentityId, "chain-ix-a1", "chain-ctx");
+    const aDid = fortressA.identityManager.getDefault()?.did;
+    if (!aDid) throw new Error("missing A did");
+
+    const bundleAB = await newBundleDir("sanctuary-known-signers-chain-ab-");
+    await exportBundle(fortressA, bundleAB);
+
+    const fortressB = await makeHarness();
+    const bIdentityId = await createIdentity(fortressB, "chain-b");
+    const importedAB = await importInto(fortressB, bIdentityId, bundleAB);
+    expect(importedAB.activated).toBe(true);
+    expect((await fortressB.storage.list("_known_signers")).length).toBe(1);
+
+    const bundleBC = await newBundleDir("sanctuary-known-signers-chain-bc-");
+    const exportedBC = await exportBundle(fortressB, bundleBC);
+    const knownSignersBC = JSON.parse(
+      await readFile(join(bundleBC, "artifacts/known_signers.json"), "utf8")
+    ) as { signers: KnownSignersEntry[] };
+    // Exactly ONE entry (A) - not duplicated, and B's own DID never appears
+    // (INVARIANT: the table can never introduce a signer for the exporting
+    // fortress's own DID).
+    expect(knownSignersBC.signers).toHaveLength(1);
+    expect(knownSignersBC.signers[0]!.did).toBe(aDid);
+    expect(exportedBC.manifest.body.artifacts.map((a) => a.kind)).toContain(
+      "known_signers"
+    );
+
+    const fortressC = await makeHarness();
+    const cIdentityId = await createIdentity(fortressC, "chain-c");
+    const importedBC = await importInto(fortressC, cIdentityId, bundleBC);
+    expect(importedBC.activated).toBe(true);
+    expect(importedBC.reputation.imported_attestations).toBe(1);
+    expect(importedBC.reputation.unverifiable_attestations).toBe(0);
+    // C now persists A's key too (learned via B's known_signers table),
+    // still exactly one net-new entry - never duplicated across hops.
+    expect((await fortressC.storage.list("_known_signers")).length).toBe(1);
+
+    const bundleCD = await newBundleDir("sanctuary-known-signers-chain-cd-");
+    const exportedCD = await exportBundle(fortressC, bundleCD);
+    const knownSignersCD = JSON.parse(
+      await readFile(join(bundleCD, "artifacts/known_signers.json"), "utf8")
+    ) as { signers: KnownSignersEntry[] };
+    // Still exactly ONE entry after a THIRD hop - the table does not grow
+    // with hop count, only with the number of DISTINCT foreign signers ever
+    // actually admitted (here, always just A).
+    expect(knownSignersCD.signers).toHaveLength(1);
+    expect(knownSignersCD.signers[0]!.did).toBe(aDid);
+
+    const verifiedCD = await verifyExitBundle(bundleCD);
+    expect(verifiedCD.passed).toBe(true);
+    expect(verifiedCD.reputation?.attestation_count).toBe(1);
+    expect(verifiedCD.reputation?.verified_attestations).toBe(1);
+    expect(verifiedCD.reputation?.unverifiable_attestations).toBe(0);
+
+    const fortressD = await makeHarness();
+    const dIdentityId = await createIdentity(fortressD, "chain-d");
+    const importedCD = await importInto(fortressD, dIdentityId, bundleCD);
+    expect(importedCD.activated).toBe(true);
+    expect(importedCD.reputation.imported_attestations).toBe(1);
+    expect(importedCD.reputation.unverifiable_attestations).toBe(0);
+    expect(importedCD.reputation.invalid_attestations).toBe(0);
+    expect((await fortressD.storage.list("_known_signers")).length).toBe(1);
+  });
+
+  /**
+   * Independent gate on #1303 (2026-08-23), items 5/6: every refusal
+   * fixture below is driven through the SAME shape - build a legitimate
+   * B->C bundle, corrupt its known_signers table one way, and assert ALL
+   * FOUR of: verify reports FAIL with failure_class "known_signers_invalid"
+   * (never a soft warning, never a different failure_class); import THROWS
+   * a typed ExitBundleImportError with code "KNOWN_SIGNERS_INVALID"; C's
+   * storage is BYTE-IDENTICAL before and after the refused import attempt
+   * (MEDIUM-5: zero staging writes, not merely zero successful writes);
+   * and the pre-corruption bundle (proving the harness itself is sound)
+   * verifies and imports cleanly. Each case names the ONE corruption it
+   * applies.
+   */
+  const refusalCases: Array<{
+    name: string;
+    corrupt: (
+      parsed: { version: number; signers: KnownSignersEntry[]; signature: string },
+      ctx: { bIdentity: { did: string; public_key: string } }
+    ) => { version: number; signers: KnownSignersEntry[]; signature: string };
+    resignWith: "b" | "forger";
+  }> = [
+    {
+      name: "a malformed element (undecodable public_key)",
+      corrupt: (parsed) => ({
         ...parsed,
         signers: parsed.signers.map((entry) => ({
           ...entry,
           public_key: "not-a-valid-base64url-key",
         })),
       }),
-      fortressB
-    );
+      resignWith: "b",
+    },
+    {
+      name: "a duplicate DID with two conflicting keys",
+      corrupt: (parsed, ctx) => ({
+        ...parsed,
+        signers: [
+          ...parsed.signers,
+          {
+            did: parsed.signers[0]!.did,
+            public_key: ctx.bIdentity.public_key,
+            first_seen_import_id: parsed.signers[0]!.first_seen_import_id,
+          },
+        ],
+      }),
+      resignWith: "b",
+    },
+    {
+      name: "a table signed by an identity other than the bundle's own exporter",
+      corrupt: (parsed) => parsed,
+      resignWith: "forger",
+    },
+    {
+      name: "an entry naming the exporting fortress's own DID (own-DID entry, HIGH item 6: rejected, not merely skipped)",
+      corrupt: (parsed, ctx) => ({
+        ...parsed,
+        signers: [
+          ...parsed.signers,
+          {
+            did: ctx.bIdentity.did,
+            public_key: ctx.bIdentity.public_key,
+            first_seen_import_id: "self-entry-probe",
+          },
+        ],
+      }),
+      resignWith: "b",
+    },
+  ];
 
-    const verifiedBC = await verifyExitBundle(bundleBC);
-    expect(verifiedBC.passed).toBe(false);
-    expect(verifiedBC.failure_class).toBe("reputation_unverifiable_attestations");
-    expect(verifiedBC.reputation?.unverifiable_attestations).toBe(1);
-    expect(
-      verifiedBC.warnings.some((w) => w.includes("known_signers table could not be trusted"))
-    ).toBe(true);
+  for (const refusalCase of refusalCases) {
+    it(`refuses closed on ${refusalCase.name}: verify FAILS (known_signers_invalid), import THROWS, zero staging writes`, async () => {
+      const fortressA = await makeHarness();
+      const aIdentityId = await createIdentity(fortressA, "ref-a");
+      await recordAttestation(fortressA, aIdentityId, "ref-ix-a1", "ref-ctx");
+      const bundleAB = await newBundleDir("sanctuary-known-signers-ref-ab-");
+      await exportBundle(fortressA, bundleAB);
+      const fortressB = await makeHarness();
+      const bIdentityId = await createIdentity(fortressB, "ref-b");
+      const importedAB = await importInto(fortressB, bIdentityId, bundleAB);
+      // Sanity: the harness setup itself must succeed before this fixture's
+      // OWN corruption is applied, or a later refusal would be meaningless.
+      expect(importedAB.activated).toBe(true);
+      const bIdentity = fortressB.identityManager.getDefault();
+      if (!bIdentity) throw new Error("missing B identity");
 
-    const fortressC = await makeHarness();
-    const cIdentityId = await createIdentity(fortressC, "mal-c");
-    const importedBC = await importInto(fortressC, cIdentityId, bundleBC);
-    expect(importedBC.activated).toBe(false);
-    expect(importedBC.reputation.imported_attestations).toBe(0);
-  });
+      const bundleBC = await newBundleDir("sanctuary-known-signers-ref-bc-");
+      await exportBundle(fortressB, bundleBC);
 
-  it("a known_signers table with two conflicting keys for one DID resolves to zero trusted signers", async () => {
+      let resigner = fortressB;
+      if (refusalCase.resignWith === "forger") {
+        const forger = await makeHarness();
+        await createIdentity(forger, "ref-forger");
+        resigner = forger;
+      }
+      await rewriteKnownSigners(
+        bundleBC,
+        fortressB,
+        (parsed) => refusalCase.corrupt(parsed, { bIdentity }),
+        resigner
+      );
+
+      const verifiedBC = await verifyExitBundle(bundleBC);
+      expect(verifiedBC.passed).toBe(false);
+      expect(verifiedBC.failure_class).toBe("known_signers_invalid");
+      expect(
+        verifiedBC.warnings.some((w) => w.includes("known_signers table could not be trusted"))
+      ).toBe(true);
+
+      const fortressC = await makeHarness();
+      const cIdentityId = await createIdentity(fortressC, "ref-c");
+      const cStorage = fortressC.storage;
+      const beforeSnapshot = await snapshotAll(cStorage);
+
+      let thrown: unknown;
+      try {
+        await importInto(fortressC, cIdentityId, bundleBC);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(ExitBundleImportError);
+      expect((thrown as ExitBundleImportError).code).toBe("KNOWN_SIGNERS_INVALID");
+
+      const afterSnapshot = await snapshotAll(cStorage);
+      expect(afterSnapshot).toBe(beforeSnapshot);
+    });
+  }
+
+  it("HIGH-1 must-fail fixture: key substitution (map a foreign DID to the exporter's own key) is refused, not merely 'unverifiable' - reproduces the independent-gate finding at C", async () => {
     const fortressA = await makeHarness();
-    const aIdentityId = await createIdentity(fortressA, "dup-a");
-    await recordAttestation(fortressA, aIdentityId, "dup-ix-a1", "dup-ctx");
-    const bundleAB = await newBundleDir("sanctuary-known-signers-dup-ab-");
+    const aIdentityId = await createIdentity(fortressA, "sub-a");
+    await recordAttestation(fortressA, aIdentityId, "sub-ix-a1", "sub-ctx");
+    const bundleAB = await newBundleDir("sanctuary-known-signers-sub-ab-");
     await exportBundle(fortressA, bundleAB);
-    const fortressB = await makeHarness();
-    const bIdentityId = await createIdentity(fortressB, "dup-b");
-    await importInto(fortressB, bIdentityId, bundleAB);
+    const aDid = fortressA.identityManager.getDefault()?.did;
+    if (!aDid) throw new Error("missing A did");
 
-    const bundleBC = await newBundleDir("sanctuary-known-signers-dup-bc-");
-    await exportBundle(fortressB, bundleBC);
-    // A second, differently-keyed entry for the SAME DID as the existing
-    // (legitimate) entry - the conflicting-DID shape rule 11 rules out.
+    const fortressB = await makeHarness();
+    const bIdentityId = await createIdentity(fortressB, "sub-b");
+    await importInto(fortressB, bIdentityId, bundleAB);
+    // B records an attestation of its own - this is the SIGNATURE B will
+    // reuse, unmodified, to forge a claim "signed by A". The signature
+    // covers only `attestation.data`, never the top-level `signer` field,
+    // so overwriting `signer` alone (leaving `data` and `signature`
+    // byte-identical) is the EXACT minimal forgery the finding describes:
+    // "signer = A.did signed by [B's] own key."
+    await recordAttestation(fortressB, bIdentityId, "sub-ix-b1", "sub-ctx");
     const bIdentity = fortressB.identityManager.getDefault();
     if (!bIdentity) throw new Error("missing B identity");
+
+    const bundleBC = await newBundleDir("sanctuary-known-signers-sub-bc-");
+    await exportBundle(fortressB, bundleBC);
+
+    // Forge the attestation: same signature and data, claimed signer = A.
+    const reputationPath = join(bundleBC, "artifacts/reputation_bundle.json");
+    const reputationRaw = JSON.parse(await readFile(reputationPath, "utf8")) as {
+      attestations: Array<{ signer: string; data: { participant_did: string } }>;
+    };
+    let forged = false;
+    reputationRaw.attestations = reputationRaw.attestations.map((attestation) => {
+      if (attestation.data.participant_did === bIdentity.did && !forged) {
+        forged = true;
+        return { ...attestation, signer: aDid };
+      }
+      return attestation;
+    });
+    expect(forged).toBe(true);
+    const reputationBytes = stringToBytes(JSON.stringify(reputationRaw, null, 2) + "\n");
+    await writeFile(reputationPath, reputationBytes);
+    await updateArtifactHashAndSize(bundleBC, "reputation_bundle", reputationBytes);
+    await resignManifest(bundleBC, fortressB);
+
+    // Substitute the known_signers table: claim A's DID resolves to B's own
+    // key (the attacker controls B and can sign anything with B's key).
     await rewriteKnownSigners(
       bundleBC,
       fortressB,
       (parsed) => ({
         ...parsed,
         signers: [
-          ...parsed.signers,
-          {
-            did: parsed.signers[0]!.did,
-            public_key: bIdentity.public_key,
-            first_seen_import_id: parsed.signers[0]!.first_seen_import_id,
-          },
+          { did: aDid, public_key: bIdentity.public_key, first_seen_import_id: "forged-substitution" },
+          ...parsed.signers.filter((entry) => entry.did !== aDid),
         ],
       }),
       fortressB
     );
 
-    const verifiedBC = await verifyExitBundle(bundleBC);
-    expect(verifiedBC.passed).toBe(false);
-    expect(verifiedBC.failure_class).toBe("reputation_unverifiable_attestations");
-    expect(verifiedBC.reputation?.unverifiable_attestations).toBe(1);
-
-    const fortressC = await makeHarness();
-    const cIdentityId = await createIdentity(fortressC, "dup-c");
-    const importedBC = await importInto(fortressC, cIdentityId, bundleBC);
-    expect(importedBC.activated).toBe(false);
-  });
-
-  it("a known_signers table signed by an identity other than the bundle's own exporter resolves to zero trusted signers", async () => {
-    const fortressA = await makeHarness();
-    const aIdentityId = await createIdentity(fortressA, "wrong-a");
-    await recordAttestation(fortressA, aIdentityId, "wrong-ix-a1", "wrong-ctx");
-    const bundleAB = await newBundleDir("sanctuary-known-signers-wrong-ab-");
-    await exportBundle(fortressA, bundleAB);
-    const fortressB = await makeHarness();
-    const bIdentityId = await createIdentity(fortressB, "wrong-b");
-    await importInto(fortressB, bIdentityId, bundleAB);
-
-    const bundleBC = await newBundleDir("sanctuary-known-signers-wrong-bc-");
-    await exportBundle(fortressB, bundleBC);
-    // An unrelated third identity signs the table instead of B (the
-    // bundle's actual, manifest-bound exporter).
-    const forger = await makeHarness();
-    await createIdentity(forger, "wrong-forger");
-    await rewriteKnownSigners(
-      bundleBC,
-      fortressB,
-      (parsed) => parsed,
-      forger
-    );
+    // HIGH-1 (did:key self-certification, checkKnownSignersStructure): the
+    // substituted entry's public_key does NOT derive DID `aDid` under
+    // publicKeyToDid, so the table is structurally refused before its
+    // signature is even checked.
+    expect(publicKeyToDid(fromBase64url(bIdentity.public_key))).not.toBe(aDid);
 
     const verifiedBC = await verifyExitBundle(bundleBC);
     expect(verifiedBC.passed).toBe(false);
-    expect(verifiedBC.failure_class).toBe("reputation_unverifiable_attestations");
-    expect(verifiedBC.reputation?.unverifiable_attestations).toBe(1);
+    expect(verifiedBC.failure_class).toBe("known_signers_invalid");
 
     const fortressC = await makeHarness();
-    const cIdentityId = await createIdentity(fortressC, "wrong-c");
-    const importedBC = await importInto(fortressC, cIdentityId, bundleBC);
-    expect(importedBC.activated).toBe(false);
+    const cIdentityId = await createIdentity(fortressC, "sub-c");
+    const cStorage = fortressC.storage;
+    const beforeSnapshot = await snapshotAll(cStorage);
+
+    let thrown: unknown;
+    try {
+      await importInto(fortressC, cIdentityId, bundleBC);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(ExitBundleImportError);
+    expect((thrown as ExitBundleImportError).code).toBe("KNOWN_SIGNERS_INVALID");
+
+    const afterSnapshot = await snapshotAll(cStorage);
+    expect(afterSnapshot).toBe(beforeSnapshot);
   });
 });
