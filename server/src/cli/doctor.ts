@@ -35,7 +35,7 @@ import {
   verifyAuditChainRecords,
   type ExportRecord,
 } from "./audit-chain-verify.js";
-import { flagValue } from "./argv.js";
+import { flagValue, shellQuoteSingleArg } from "./argv.js";
 
 // Canonical version source. A bare `require("../../package.json")` resolves to
 // the repo-root package.json (no `version`) when bundled to server/dist/; the
@@ -262,7 +262,11 @@ async function checkInterruptedExitImport(storagePath: string): Promise<DoctorCh
       // interpolates the ACTUAL `storagePath` this check already has -
       // the one hint site in the codebase that can, since every other
       // site throws from inside library code with no path string handy.
-      `run \`sanctuary exit ${EXIT_RECOVERY_VERB} --fortress ${storagePath}\` ` +
+      // Round-4 fix (independent gate on #1304, P2): shell-quoted - an
+      // unquoted path containing a space (e.g. `/tmp/My Fortress`) would
+      // otherwise render a suggested command that splits into two
+      // arguments and fails, or does something the operator never typed.
+      `run \`sanctuary exit ${EXIT_RECOVERY_VERB} --fortress ${shellQuoteSingleArg(storagePath)}\` ` +
         "to recover. If that itself reports the journal could not be " +
         "safely rolled back, this needs operator intervention: inspect " +
         "the journal entries directly " +

@@ -40,7 +40,7 @@ import type {
 import { verifyExitBundle, InvalidExitBundleError } from "./verifier.js";
 import { inspectExitBundle, inspectExitCode } from "./inspect.js";
 import { loadFortressDidWebRecord } from "../recognition/did-web.js";
-import { flagValue, flagValues } from "../cli/argv.js";
+import { flagValue, flagValues, consumeFlagValue } from "../cli/argv.js";
 
 const EXIT_EXPORT_ABORTED_EXIT_CODE = 78;
 
@@ -400,7 +400,21 @@ async function openFortressForRecoveryOnly(
   const passphrase =
     flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
   const recoveryKey = env.SANCTUARY_RECOVERY_KEY;
-  const storagePath = flagValue(argv, "--fortress");
+  // Round-4 fix (independent gate on #1304, P2): `flagValue` is
+  // permissive - `--fortress --json` reads `--json` AS the path (it never
+  // checks whether the "value" it captured looks like another flag), so
+  // `sanctuary exit recover --fortress --json` silently searched
+  // `./--json` and refused with a confusing "No fortress found at
+  // --json". `consumeFlagValue` (cli/argv.ts) is the fail-closed parser
+  // every other verb in this codebase uses for a required single-value
+  // flag: it refuses BY NAME (a distinct "--fortress requires a value"
+  // error) when the value is missing entirely OR the next token itself
+  // starts with `--`.
+  const fortressResult = consumeFlagValue(argv, "--fortress");
+  if (fortressResult.error !== undefined) {
+    throw new Error(fortressResult.error);
+  }
+  const storagePath = fortressResult.value;
   if (!storagePath) {
     throw new ExitRecoverFortressPathRequiredError();
   }

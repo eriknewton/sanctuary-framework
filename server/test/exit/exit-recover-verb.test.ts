@@ -74,6 +74,7 @@ import {
   printExitHelp,
 } from "../../src/exit/cli.js";
 import { EXIT_IMPORT_JOURNAL_NAMESPACE, EXIT_RECOVERY_VERB } from "../../src/exit/bundle.js";
+import { InterruptedExitImportPendingError } from "../../src/storage/exit-import-journal.js";
 import { createTempFortress, TEST_PASSPHRASE } from "../helpers/temp-fortress.js";
 
 class StringWritable extends Writable {
@@ -196,6 +197,60 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
       expect(err.text).toContain(`sanctuary exit ${EXIT_RECOVERY_VERB} requires --fortress <path>`);
       expect(err.text).toContain("never reads sanctuary.json");
       expect(err.text).toContain("never consults SANCTUARY_STORAGE_PATH");
+    } finally {
+      await tempFortress.cleanup();
+    }
+  });
+
+  it("HIGH fix (round 4, independent gate on #1304, P2): refuses when --fortress is present with NO value (end of argv), rather than the permissive flagValue silently reading undefined, and creates NOTHING on disk (no-diff)", async () => {
+    const tempFortress = await createTempFortress("sanctuary-recover-fortress-no-value-nodiff");
+    try {
+      await bootstrapFortress(tempFortress.storagePath);
+      const before = await snapshotTree(tempFortress.storagePath);
+
+      const out = new StringWritable();
+      const err = new StringWritable();
+      const code = await runExitCommand({
+        argv: [EXIT_RECOVERY_VERB, "--fortress"], // no value follows
+        out,
+        err,
+        env: {
+          SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
+        },
+      });
+      const after = await snapshotTree(tempFortress.storagePath);
+      expect(after).toBe(before);
+      expect(code).not.toBe(0);
+      expect(err.text).toContain("--fortress requires a value");
+    } finally {
+      await tempFortress.cleanup();
+    }
+  });
+
+  it("HIGH fix (round 4, independent gate on #1304, P2): refuses when --fortress is immediately followed by another option, never consuming --json (or any --flag) AS the path, and creates NOTHING on disk (no-diff)", async () => {
+    const tempFortress = await createTempFortress("sanctuary-recover-fortress-next-option-nodiff");
+    try {
+      await bootstrapFortress(tempFortress.storagePath);
+      const before = await snapshotTree(tempFortress.storagePath);
+
+      const out = new StringWritable();
+      const err = new StringWritable();
+      const code = await runExitCommand({
+        // Pre-fix (permissive flagValue): this read "--json" AS the
+        // fortress path and refused with the confusing
+        // "No fortress found at --json".
+        argv: [EXIT_RECOVERY_VERB, "--fortress", "--json"],
+        out,
+        err,
+        env: {
+          SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
+        },
+      });
+      const after = await snapshotTree(tempFortress.storagePath);
+      expect(after).toBe(before);
+      expect(code).not.toBe(0);
+      expect(err.text).toContain("--fortress requires a value");
+      expect(err.text).not.toContain("No fortress found at --json");
     } finally {
       await tempFortress.cleanup();
     }
@@ -529,26 +584,50 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
     expect(out.text).toContain("REQUIRED");
   });
 
-  it("STRUCTURAL PIN (parity): every known recovery-hint source file interpolates EXIT_RECOVERY_VERB, names the required --fortress flag, and none hardcodes the stale 'sanctuary exit verify ... to recover' literal", async () => {
+  it("WIRED CONSUMER (round-4 fix, independent gate on #1304, P2): InterruptedExitImportPendingError emits the exact 'sanctuary exit recover --fortress <fortress path>' text - not a source grep, the REAL constructed message", () => {
+    const err = new InterruptedExitImportPendingError("test-context");
+    expect(err.message).toContain(
+      `Run \`sanctuary exit ${EXIT_RECOVERY_VERB} --fortress <fortress path>\` to recover, then retry.`
+    );
+  });
+
+  // ExitAdmissionLockError's exact "--fortress <fortress path>" text is
+  // already proven behaviorally (a REAL planted lock file, a REAL thrown
+  // error, an exact-text regex) by
+  // test/exit/exit-import-atomic-activation.test.ts's
+  // "a held admission lock refuses recovery ..." test - not duplicated
+  // here.
+
+  it("STRUCTURAL PIN (round-4 fix, independent gate on #1304, P2 - tightened): every recovery-hint source file's CODE (not comment) interpolates EXIT_RECOVERY_VERB immediately adjacent to --fortress, and none hardcodes the stale 'sanctuary exit verify ... to recover' literal", async () => {
+    // Round-4 finding: the PREVIOUS version of this test independently
+    // checked "does EXIT_RECOVERY_VERB appear anywhere in the file" and
+    // "does --fortress appear anywhere in the file" - both satisfied by
+    // this file's OWN invariant comments (which name EXIT_RECOVERY_VERB
+    // and quote the "--fortress <fortress path>" form in prose right next
+    // to the code, exactly per AGENTS.md's invariant-comment convention),
+    // so a regression that broke the ACTUAL interpolation while leaving
+    // the comment untouched would have passed. `${EXIT_RECOVERY_VERB}` -
+    // the literal template-literal interpolation syntax, `$`, `{`, `}` -
+    // appears ONLY in real code in every file this codebase's style
+    // produces (a comment states the bare identifier as prose, never as
+    // an interpolation); requiring it immediately adjacent to `--fortress`
+    // targets the actual emitted text and cannot be satisfied by a
+    // neighboring comment, however similarly worded.
     const HINT_FILES = [
       "src/storage/exit-import-journal.ts",
       "src/cli/doctor.ts",
       "src/exit/bundle.ts",
       "src/core/master-rotation.ts",
     ];
+    const INTERPOLATION_ADJACENT_TO_FLAG_RE = /\$\{EXIT_RECOVERY_VERB\}\s*--fortress\b/;
     const SERVER_ROOT = join(__dirname, "../..");
     for (const relPath of HINT_FILES) {
       const source = await readFile(join(SERVER_ROOT, relPath), "utf8");
-      expect(source, `${relPath} must import/reference EXIT_RECOVERY_VERB`).toContain(
-        "EXIT_RECOVERY_VERB"
-      );
-      // Round-3 parity: the hint text and the dispatch must agree that
-      // --fortress is required - a hint naming the verb without the flag
-      // sends an operator to a command that will itself refuse.
+      const matches = source.match(new RegExp(INTERPOLATION_ADJACENT_TO_FLAG_RE, "g")) ?? [];
       expect(
-        source,
-        `${relPath} must name the required --fortress flag in its recovery hint`
-      ).toContain("--fortress");
+        matches.length,
+        `${relPath} must interpolate \${EXIT_RECOVERY_VERB} immediately adjacent to --fortress in its recovery hint CODE (found ${matches.length} occurrences)`
+      ).toBeGreaterThan(0);
       expect(
         source,
         `${relPath} must not hardcode the stale "sanctuary exit verify ... to recover" hint`
@@ -556,16 +635,17 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
     }
   });
 
-  it("STRUCTURAL PIN (parity): doctor's hint interpolates the ACTUAL storagePath it already has, not a placeholder", async () => {
+  it("STRUCTURAL PIN (round-4 fix, independent gate on #1304, P2 - tightened): doctor's hint interpolates the ACTUAL storagePath (shell-quoted) it already has, not the literal placeholder every other hint site uses", async () => {
     const source = await readFile(
       join(__dirname, "../../src/cli/doctor.ts"),
       "utf8"
     );
-    // The one hint site with a real path in scope substitutes it; every
-    // other hint site (deep library code with no path string handy) uses
-    // the literal placeholder "<fortress path>" instead (checked via the
-    // behavioral no-diff/refusal tests above, which read the real error
-    // text those sites produce).
-    expect(source).toContain("--fortress ${storagePath}");
+    // The one hint site with a real path in scope substitutes it
+    // (shell-quoted per the P2 quoting fix - a bare interpolation here
+    // was itself a round-4 finding); every other hint site (deep library
+    // code with no path string handy) uses the literal placeholder
+    // "<fortress path>" instead, proven by the shared parity test above.
+    expect(source).toMatch(/\$\{EXIT_RECOVERY_VERB\}\s*--fortress\s*\$\{shellQuoteSingleArg\(storagePath\)\}/);
+    expect(source).not.toContain("--fortress <fortress path>");
   });
 });

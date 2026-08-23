@@ -6,6 +6,7 @@ import {
   flagValue,
   flagValues,
   hasFlag,
+  shellQuoteSingleArg,
   unknownFlagWithPrefix,
 } from "../../src/cli/argv.js";
 import { parseExportArgs } from "../../src/cli/audit-chain-export.js";
@@ -181,5 +182,31 @@ describe("shared CLI argv flag parser", () => {
       since: "2026-08-08T00:00:00.000Z",
       limit: 25,
     });
+  });
+});
+
+describe("shellQuoteSingleArg (round-4 fix, independent gate on #1304, P2)", () => {
+  it("wraps a plain path in single quotes", () => {
+    expect(shellQuoteSingleArg("/tmp/fortress")).toBe("'/tmp/fortress'");
+  });
+
+  it("wraps a path containing a space so it survives as ONE shell argument", () => {
+    expect(shellQuoteSingleArg("/tmp/My Fortress")).toBe("'/tmp/My Fortress'");
+  });
+
+  it("escapes an embedded single quote (close-quote, escaped quote, reopen-quote)", () => {
+    expect(shellQuoteSingleArg("/tmp/O'Brien's Fortress")).toBe(
+      "'/tmp/O'\\''Brien'\\''s Fortress'",
+    );
+  });
+
+  it("round-trips through a real shell: the quoted form evaluates back to the original string", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const tricky = '/tmp/My Fortress\'s Data "quoted" $HOME `cmd`';
+    const quoted = shellQuoteSingleArg(tricky);
+    const output = execFileSync("/bin/sh", ["-c", `printf '%s' ${quoted}`], {
+      encoding: "utf8",
+    });
+    expect(output).toBe(tricky);
   });
 });
