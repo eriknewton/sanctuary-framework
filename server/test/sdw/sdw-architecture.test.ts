@@ -24,6 +24,8 @@ import {
 } from "../../src/sdw/records.js";
 import { SdwValidationError } from "../../src/sdw/errors.js";
 import {
+  deriveClassifierOverrideAuthorization,
+  mintClassifierOverrideAuthorization,
   mintPersistable,
   prepareSdwBackendWrite,
 } from "../../src/sdw/write-gate.js";
@@ -330,10 +332,43 @@ ${VALID_TXN_WRITE}
       expect(offenders).toEqual([]);
     });
 
-    it("mintRestoredPersistable is referenced ONLY by document-corpus-store.ts and write-gate.ts", async () => {
+    it("restoreRawSdwBackendWrite is referenced ONLY by document-corpus-store.ts and write-gate.ts", async () => {
       const offenders = await findUnauthorizedReferences(
-        "mintRestoredPersistable",
+        "restoreRawSdwBackendWrite",
         new Set([join("sdw", "write-gate.ts"), join("sdw", "document-corpus-store.ts")]),
+      );
+      expect(offenders).toEqual([]);
+    });
+
+    it("deriveClassifierOverrideAuthorization is referenced ONLY by write-gate.ts and sdw-memory-backend.ts (MEDIUM-1 fix round)", async () => {
+      const offenders = await findUnauthorizedReferences(
+        "deriveClassifierOverrideAuthorization",
+        new Set([
+          join("sdw", "write-gate.ts"),
+          join("sdw", "adapters", "sdw-memory-backend.ts"),
+        ]),
+      );
+      expect(offenders).toEqual([]);
+    });
+
+    it("restorePriorChunk is referenced ONLY by document-corpus-store.ts and sdw-memory-backend.ts (MEDIUM-2 fix round)", async () => {
+      const offenders = await findUnauthorizedReferences(
+        "restorePriorChunk",
+        new Set([
+          join("sdw", "document-corpus-store.ts"),
+          join("sdw", "adapters", "sdw-memory-backend.ts"),
+        ]),
+      );
+      expect(offenders).toEqual([]);
+    });
+
+    it("restorePriorDocument is referenced ONLY by document-corpus-store.ts and sdw-memory-backend.ts (MEDIUM-2 fix round)", async () => {
+      const offenders = await findUnauthorizedReferences(
+        "restorePriorDocument",
+        new Set([
+          join("sdw", "document-corpus-store.ts"),
+          join("sdw", "adapters", "sdw-memory-backend.ts"),
+        ]),
       );
       expect(offenders).toEqual([]);
     });
@@ -350,10 +385,11 @@ ${VALID_TXN_WRITE}
     });
 
     it("SdwMemoryBackendAdapter.putPassages refuses genuinely-refused content even when the input carries a hand-built fake authorization object", async () => {
-      // HIGH-C1's core property: an object that merely LOOKS like
-      // ClassifierOverrideAuthorization (same shape, even the SAME content
-      // hash) but was never returned by mintClassifierOverrideAuthorization is
-      // not in the module-private WeakSet, so it must never verify.
+      // The core property: an object that merely LOOKS like a
+      // ClassifierOverrideAuthorization (any shape at all -- the type has no
+      // real fields to imitate) but was never returned by
+      // mintClassifierOverrideAuthorization has no entry in the
+      // module-private WeakMap, so it must never verify.
       const storage = new MemoryStorage();
       const masterKey = new Uint8Array(32).fill(9);
       const adapter = new SdwMemoryBackendAdapter({
@@ -363,7 +399,7 @@ ${VALID_TXN_WRITE}
         ownerRef: "fleet-self",
       });
       const text = "SANCTUARY_RECOVERY_KEY=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE";
-      const fakeToken = { contentHash: passageContentHash(text) };
+      const fakeToken = {} as unknown as ReturnType<typeof mintClassifierOverrideAuthorization>;
       await expect(
         adapter.putPassages(
           [
@@ -377,6 +413,55 @@ ${VALID_TXN_WRITE}
           true,
         ),
       ).rejects.toMatchObject({ category: "classifier_reject" });
+    });
+
+    it("deriveClassifierOverrideAuthorization refuses a derived token for text not contained in the parent (MEDIUM-1 fix round: a verified parent is not a mint oracle)", () => {
+      const parentText = "the operator allow-listed exactly this refused file's text";
+      const parentToken = mintClassifierOverrideAuthorization(passageContentHash(parentText));
+
+      // A real chunk (a genuine substring of parentText) verifies.
+      const realChunk = "allow-listed exactly this";
+      expect(deriveClassifierOverrideAuthorization(parentToken, parentText, realChunk)).toBeDefined();
+
+      // Unrelated text, even innocuous-looking text with no relationship to
+      // the allow-listed passage, must NOT verify just because the parent
+      // token is genuine and WeakSet-registered -- proves the containment
+      // check, not only the WeakSet check, is load-bearing.
+      const unrelatedText = "a totally different secret living somewhere else entirely";
+      expect(
+        deriveClassifierOverrideAuthorization(parentToken, parentText, unrelatedText),
+      ).toBeUndefined();
+
+      // A fake (never-minted) parent refuses regardless of containment.
+      const fakeParent = {} as unknown as ReturnType<typeof mintClassifierOverrideAuthorization>;
+      expect(
+        deriveClassifierOverrideAuthorization(fakeParent, parentText, realChunk),
+      ).toBeUndefined();
+    });
+
+    it("mutating a token object never changes what it authorizes (the hash lives in a module-private WeakMap, never a token field)", () => {
+      const textA = "the text this token genuinely authorizes";
+      const textB = "a completely different text the token must never authorize";
+      const token = mintClassifierOverrideAuthorization(passageContentHash(textA));
+
+      expect(Object.isFrozen(token)).toBe(true);
+      // Every plausible mutation vector against a frozen, field-less object:
+      // all must fail to change anything, and the attempt itself must throw
+      // (ES modules run in strict mode).
+      const mutable = token as unknown as Record<string, unknown>;
+      expect(() => {
+        mutable.contentHash = passageContentHash(textB);
+      }).toThrow();
+      expect(() => {
+        Object.defineProperty(token, "contentHash", { value: passageContentHash(textB) });
+      }).toThrow();
+
+      // Whichever mutation attempt above ran, verification is unaffected: the
+      // token still authorizes ONLY the text it was minted for. A
+      // property-based design (token.contentHash) would have let the FIRST
+      // mutation attempt silently relabel this token to authorize textB.
+      expect(deriveClassifierOverrideAuthorization(token, textA, textA)).toBeDefined();
+      expect(deriveClassifierOverrideAuthorization(token, textB, textB)).toBeUndefined();
     });
   });
 });

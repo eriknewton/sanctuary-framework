@@ -135,10 +135,10 @@ export function screenMemoryFileEntries(
         detector: screen.detector,
         line: screen.line,
       });
-      // Mint the ROOT authorization bound to THIS passage's exact text (HIGH-C1
-      // fix round): preparePassage (sdw-memory-backend.ts) re-verifies this
-      // against the same hash before deriving any per-record authorization
-      // from it, so pairing this token with different content never verifies.
+      // Mint the ROOT authorization bound to THIS passage's exact text:
+      // preparePassage (sdw-memory-backend.ts) re-verifies this against the
+      // same hash before deriving any per-record authorization from it, so
+      // pairing this token with different content never verifies.
       const authorization = mintClassifierOverrideAuthorization(
         passageContentHash(entry.input.text),
       );

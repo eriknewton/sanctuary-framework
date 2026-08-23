@@ -90,7 +90,7 @@ export async function runMemoryIngestCommand(
 
   try {
     let sourceFileCount = 0;
-    // Preflight-only (HIGH-C2 fix round): screen decides accept / skip /
+    // Preflight-only: screen decides accept / skip /
     // override and validates allow_files (assertAllowFilesKnown, inside
     // screenMemoryFileEntries) WITHOUT writing anything to the vault. The
     // override audit records below are durably appended, and can abort the
@@ -122,8 +122,8 @@ export async function runMemoryIngestCommand(
     // `_started` because nothing is committed yet and the count is only what
     // was read. allow_files is included here (not only on the post-commit
     // record and the per-file override record below) because it is a
-    // PRE-WRITE WITNESS too, cheap insurance on top of the HIGH-C2 ordering
-    // below.
+    // PRE-WRITE WITNESS too, cheap insurance on top of the screen-then-audit-
+    // then-commit ordering below.
     await boot.auditLog.appendCritical({
       layer: "l1",
       operation: "memory_ingest_started",
@@ -139,7 +139,7 @@ export async function runMemoryIngestCommand(
     });
 
     // One record per overridden file (Rung-1 point 3), durably appended
-    // BEFORE any vault write (HIGH-C2 fix round): the operator waived the
+    // BEFORE any vault write: the operator waived the
     // classifier for this exact path, so the audit trail names it
     // individually rather than folding it into the aggregate outcome record
     // below. The refusal metadata the classifier would have reported is

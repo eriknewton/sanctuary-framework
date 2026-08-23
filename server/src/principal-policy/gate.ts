@@ -78,7 +78,7 @@ const FORCED_TIER1_OPERATIONS = [
 ] as const;
 
 /**
- * Rung-1 point 3 TIGHTEN (2026-08-22): a memory_ingest call that names at
+ * Rung-1 point 3 (2026-08-22): a memory_ingest call that names at
  * least one allow_files path waives the secret classifier for that file, so
  * it must ALWAYS require operator approval, even when a hand-authored policy
  * relaxed the "memory_ingest" operation itself to Tier 3 (memory_ingest is in

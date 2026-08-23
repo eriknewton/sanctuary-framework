@@ -234,7 +234,7 @@ export async function ingestClaudeCodeMemoryDirectory(
  * failing on its own previous run.
  */
 /**
- * Preflight-only phase (HIGH-C2 fix round, 2026-08-22): resolve accept /
+ * Preflight-only phase (2026-08-22): resolve accept /
  * skip / override for every entry WITHOUT writing anything to the vault. The
  * CLI/MCP callers durably audit each override BEFORE calling
  * commitClaudeCodeMemorySnapshot below, so a crash between screening and
@@ -271,7 +271,7 @@ export function screenClaudeCodeMemorySnapshot(
 
 /**
  * Commit phase: persist the ALREADY-screened batch. Callers that need the
- * override-record-before-commit ordering (HIGH-C2) call
+ * override-record-before-commit ordering call
  * screenClaudeCodeMemorySnapshot, durably audit `screened.outcome.overridden`
  * themselves, and only then call this.
  */

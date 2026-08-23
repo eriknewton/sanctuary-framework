@@ -678,6 +678,42 @@ describe("SDW memory file tools", () => {
       expect(overrideIndex).toBeGreaterThanOrEqual(0);
       expect(denialIndex).toBeGreaterThan(overrideIndex);
     });
+
+    it("LOW-3: a throwing audit log commits NOTHING to the vault, on the MCP surface", async () => {
+      const storage = new FilesystemStorage(await tempDir("cc-memory-tool-audit-throws"));
+      const adapter = new SdwMemoryBackendAdapter({
+        storage,
+        masterKey: MASTER_KEY,
+        fortressId: "fortress:audit-throws",
+        ownerRef: "fleet-self",
+        now: () => NOW,
+      });
+      // Every appendCritical call throws, starting with the very first one
+      // (memory_ingest_started) -- the handler must deny before ever reaching
+      // the commit phase, and nothing should land in the vault.
+      const auditLog = {
+        async appendCritical(): Promise<void> {
+          throw new Error("LOW-3 injected failure: audit log unavailable");
+        },
+      } as unknown as AuditLog;
+      const tools = new Map(
+        createSdwMemoryFileTools({ adapter, auditLog }).map((tool) => [tool.name, tool]),
+      );
+      const source = await refusedFixture("cc-memory-tool-audit-throws-source");
+
+      // A fully unavailable audit log is not a graceful denial (this tool's
+      // own catch-block appendFailure call itself throws, propagating past
+      // the handler); the property under test is narrower and unconditional:
+      // whatever the caller sees, nothing reaches the vault.
+      await expect(
+        tools.get("memory_ingest")!.handler({
+          harness: "claude-code",
+          dir: source,
+          allow_files: ["note-with-secret.md"],
+        }),
+      ).rejects.toThrow();
+      expect(await adapter.listPassages()).toEqual([]);
+    });
   });
 
   it("names the bare_high_entropy_credential detector for Claude Code, without leaking the value (Rung-1 fix-round-2)", async () => {

@@ -27,7 +27,9 @@ import {
   runMemoryTranscodeRestoreCommand,
 } from "../../src/cli/memory-file.js";
 import { resolveCliMasterKey } from "../../src/core/master-custody.js";
+import { fortressIdFromStoragePath } from "../../src/dashboard/v1_1/wiring.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
+import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 
 const FIXTURE_ROOT = fileURLToPath(
@@ -603,6 +605,91 @@ describe("memory file CLI: fortress-backed round trip", () => {
       const operations = (await auditOperations()).filter((op) => op.startsWith("memory_ingest"));
       expect(operations).toContain("memory_ingest_denied");
       expect(operations).not.toContain("memory_ingest_classifier_override");
+    }, 60_000);
+
+    async function fortressAdapterForCheckOnly(): Promise<SdwMemoryBackendAdapter> {
+      const storage = new FilesystemStorage(join(fortress, "state"));
+      const masterKey = await resolveCliMasterKey(storage, {
+        passphrase: PASSPHRASE,
+        storagePathHint: fortress,
+      });
+      return new SdwMemoryBackendAdapter({
+        storage,
+        masterKey,
+        fortressId: fortressIdFromStoragePath(fortress),
+        ownerRef: "fleet-self",
+      });
+    }
+
+    it("LOW-3 CLI mirror: writes the override audit record BEFORE the first corpus write, even when the corpus write then fails", async () => {
+      const source = await refusedFixture("memfile-cli-high-c2-source");
+      // Pre-occupy the corpus namespace as a plain FILE instead of a
+      // directory: every corpus write inside it fails (ENOTDIR/EEXIST-class),
+      // while the SEPARATE _audit namespace directory is untouched, so audit
+      // writes still land normally. This fails EVERY corpus write, a
+      // strictly stronger injection than "only the first" and still proves
+      // the required property: the override record is durable even though
+      // the commit phase never lands anything.
+      await writeFile(join(fortress, "state", "_sdw_document_corpus"), "occupied");
+
+      const out = makeSink();
+      const err = makeSink();
+      const code = await runMemoryIngestCommand({
+        argv: [
+          "--harness", "claude-code",
+          "--dir", source,
+          "--fortress", fortress,
+          "--allow-file", "note-with-secret.md",
+        ],
+        out: out.stream,
+        err: err.stream,
+        env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      });
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("memory_ingest failed");
+
+      const entries = await auditEntries();
+      const overrideIndex = entries.findIndex(
+        (entry) => entry.operation === "memory_ingest_classifier_override",
+      );
+      const denialIndex = entries.findIndex((entry) => entry.operation === "memory_ingest_denied");
+      expect(overrideIndex).toBeGreaterThanOrEqual(0);
+      expect(entries[overrideIndex]!.details).toMatchObject({
+        source_path: "note-with-secret.md",
+        detector: "labeled_recovery_key",
+      });
+      expect(denialIndex).toBeGreaterThan(overrideIndex);
+      expect(JSON.stringify(entries)).not.toContain(SECRET_VALUE);
+    }, 60_000);
+
+    it("LOW-3: a throwing audit log commits NOTHING to the vault, on the CLI surface", async () => {
+      const source = await refusedFixture("memfile-cli-audit-throws-source");
+      // Pre-occupy the _audit namespace as a file: every audit write fails
+      // from the very first one (memory_ingest_started), so the command must
+      // deny before ever reaching the commit phase.
+      await writeFile(join(fortress, "state", "_audit"), "occupied");
+
+      const out = makeSink();
+      const err = makeSink();
+      const code = await runMemoryIngestCommand({
+        argv: [
+          "--harness", "claude-code",
+          "--dir", source,
+          "--fortress", fortress,
+          "--allow-file", "note-with-secret.md",
+        ],
+        out: out.stream,
+        err: err.stream,
+        env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      });
+
+      // The command itself fails closed (it cannot even durably record the
+      // attempt); nothing reaches the vault.
+      expect(code).not.toBe(0);
+      await rm(join(fortress, "state", "_audit"), { force: true });
+      const adapter = await fortressAdapterForCheckOnly();
+      expect(await adapter.listPassages()).toEqual([]);
     }, 60_000);
   });
 

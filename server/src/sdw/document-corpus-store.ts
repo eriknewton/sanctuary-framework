@@ -9,8 +9,7 @@ import {
 } from "./records.js";
 import {
   mintPersistable,
-  mintRestoredPersistable,
-  restoreSdwBackendWrite,
+  restoreRawSdwBackendWrite,
   sdwBackendWrite,
   type MintPersistableOptions,
   type Persistable,
@@ -110,44 +109,32 @@ export class SdwDocumentCorpusStore {
   }
 
   /**
-   * HIGH-C3 fix round (2026-08-22): restore-only counterpart of putDocument,
-   * used ONLY by SdwMemoryBackendAdapter.restoreAndVerifyPriorPassages to
-   * replay a record that was already durably persisted before the failed
-   * batch began. NEVER re-classifies (mintRestoredPersistable/
-   * restoreSdwBackendWrite never call the classifier at all): see those
-   * functions' doc comments in write-gate.ts. No transactional (`txn`) form
-   * exists because this path is only ever reached from the NON-transactional
-   * rollback branch (a transactional batch's failure discards the whole
-   * staged overlay atomically, so there is nothing to roll back to).
+   * Restore-only counterpart of putDocument, used ONLY by
+   * SdwMemoryBackendAdapter.restoreAndVerifyPriorPassages to replay the
+   * EXACT ciphertext bytes already read out of the SAME encrypted store
+   * before the failed batch began (getDocumentRaw, called by
+   * capturePriorPassages) -- never a fresh re-encryption. `raw` is decoded
+   * once here (decrypt + parse, the same identity checks getDocument runs)
+   * to prove it is genuinely valid ciphertext for THIS fortress/key, and
+   * `expectedContentHash` must equal the decoded record's own content_hash:
+   * `raw` and `expectedContentHash` are two independent things the caller
+   * supplies, so a mismatched pairing (a mixup bug, or a caller passing
+   * bytes from a different document with an unrelated hash) is refused
+   * before the write, not trusted on the caller's say-so. Only after both
+   * checks pass are the ORIGINAL bytes written back unchanged
+   * (restoreRawSdwBackendWrite never re-encrypts). No transactional (`txn`)
+   * form exists because this path is only ever reached from the
+   * NON-transactional rollback branch (a transactional batch's failure
+   * discards the whole staged overlay atomically, so there is nothing to
+   * roll back to).
    */
-  async restorePriorDocument(record: SdwDocumentRecord, taint: Taint): Promise<void> {
-    const persistable = mintRestoredPersistable(
-      record,
-      taint,
-      SDW_DOCUMENT_CORPUS_NAMESPACE,
-      documentKey(record.document_id),
-      this.fortressId,
-    );
-    await restoreSdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId);
-  }
-
-  /** Chunk counterpart of {@link restorePriorDocument}. */
-  async restorePriorChunk(record: SdwDocumentChunkRecord, taint: Taint): Promise<void> {
-    const persistable = mintRestoredPersistable(
-      record,
-      taint,
-      SDW_DOCUMENT_CORPUS_NAMESPACE,
-      documentChunkStorageKey(record),
-      this.fortressId,
-    );
-    await restoreSdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId);
-  }
-
-  async getDocument(documentId: string, txn?: SdwCorpusTxn): Promise<SdwDocumentRecord | null> {
+  async restorePriorDocument(
+    documentId: string,
+    raw: Uint8Array,
+    expectedContentHash: string,
+  ): Promise<void> {
     const storageKey = documentKey(documentId);
-    const raw = await (txn ?? this.storage).read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
-    if (raw === null) return null;
-    return decodeSdwRecord<SdwDocumentRecord>(raw, {
+    const decoded = decodeSdwRecord<SdwDocumentRecord>(raw, {
       namespace: SDW_DOCUMENT_CORPUS_NAMESPACE,
       storageKey,
       fortressId: this.fortressId,
@@ -155,13 +142,24 @@ export class SdwDocumentCorpusStore {
       expectedKind: "document",
       verifyIdentity: (record) => record.document_id === documentId,
     });
+    if (decoded.content_hash !== expectedContentHash) {
+      throw new Error(
+        "Refusing to restore a document whose decoded content_hash does not match the captured prior hash",
+      );
+    }
+    await restoreRawSdwBackendWrite(this.storage, SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey, raw);
   }
 
-  async getChunk(documentId: string, chunkOrdinal: number, chunkId: string): Promise<SdwDocumentChunkRecord | null> {
+  /** Chunk counterpart of {@link restorePriorDocument}, same verify-then-write-verbatim discipline. */
+  async restorePriorChunk(
+    documentId: string,
+    chunkOrdinal: number,
+    chunkId: string,
+    raw: Uint8Array,
+    expectedContentHash: string,
+  ): Promise<void> {
     const storageKey = documentChunkKey(documentId, padChunkOrdinal(chunkOrdinal), chunkId);
-    const raw = await this.storage.read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
-    if (raw === null) return null;
-    return decodeSdwRecord<SdwDocumentChunkRecord>(raw, {
+    const decoded = decodeSdwRecord<SdwDocumentChunkRecord>(raw, {
       namespace: SDW_DOCUMENT_CORPUS_NAMESPACE,
       storageKey,
       fortressId: this.fortressId,
@@ -172,6 +170,68 @@ export class SdwDocumentCorpusStore {
         record.chunk_id === chunkId &&
         record.chunk_ordinal === chunkOrdinal,
     });
+    if (decoded.content_hash !== expectedContentHash) {
+      throw new Error(
+        "Refusing to restore a chunk whose decoded content_hash does not match the captured prior hash",
+      );
+    }
+    await restoreRawSdwBackendWrite(this.storage, SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey, raw);
+  }
+
+  async getDocument(documentId: string, txn?: SdwCorpusTxn): Promise<SdwDocumentRecord | null> {
+    return (await this.getDocumentRaw(documentId, txn))?.record ?? null;
+  }
+
+  /**
+   * Raw-plus-decoded counterpart of {@link getDocument}: returns the exact
+   * still-encrypted bytes alongside the decoded record. Used by
+   * SdwMemoryBackendAdapter.capturePriorPassages to capture prior state for
+   * a byte-verbatim restore; getDocument's plain
+   * `| null` shape stays the normal read path everyone else uses.
+   */
+  async getDocumentRaw(
+    documentId: string,
+    txn?: SdwCorpusTxn,
+  ): Promise<{ readonly raw: Uint8Array; readonly record: SdwDocumentRecord } | null> {
+    const storageKey = documentKey(documentId);
+    const raw = await (txn ?? this.storage).read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
+    if (raw === null) return null;
+    const record = decodeSdwRecord<SdwDocumentRecord>(raw, {
+      namespace: SDW_DOCUMENT_CORPUS_NAMESPACE,
+      storageKey,
+      fortressId: this.fortressId,
+      encryptionKey: this.encryptionKey,
+      expectedKind: "document",
+      verifyIdentity: (record) => record.document_id === documentId,
+    });
+    return { raw, record };
+  }
+
+  async getChunk(documentId: string, chunkOrdinal: number, chunkId: string): Promise<SdwDocumentChunkRecord | null> {
+    return (await this.getChunkRaw(documentId, chunkOrdinal, chunkId))?.record ?? null;
+  }
+
+  /** Raw-plus-decoded counterpart of {@link getChunk}; see {@link getDocumentRaw}. */
+  async getChunkRaw(
+    documentId: string,
+    chunkOrdinal: number,
+    chunkId: string,
+  ): Promise<{ readonly raw: Uint8Array; readonly record: SdwDocumentChunkRecord } | null> {
+    const storageKey = documentChunkKey(documentId, padChunkOrdinal(chunkOrdinal), chunkId);
+    const raw = await this.storage.read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
+    if (raw === null) return null;
+    const record = decodeSdwRecord<SdwDocumentChunkRecord>(raw, {
+      namespace: SDW_DOCUMENT_CORPUS_NAMESPACE,
+      storageKey,
+      fortressId: this.fortressId,
+      encryptionKey: this.encryptionKey,
+      expectedKind: "document_chunk",
+      verifyIdentity: (record) =>
+        record.document_id === documentId &&
+        record.chunk_id === chunkId &&
+        record.chunk_ordinal === chunkOrdinal,
+    });
+    return { raw, record };
   }
 }
 

@@ -2,7 +2,7 @@ import type { StorageBackend } from "../storage/interface.js";
 import { encrypt } from "../core/encryption.js";
 import { bytesToString, stringToBytes, toBase64url } from "../core/encoding.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
-import { hashToString, hmacSha256 } from "../core/hashing.js";
+import { hash, hashToString, hmacSha256 } from "../core/hashing.js";
 import { sdwAad, assertSdwIdentifier } from "./grammar.js";
 import { assertTainted, type Tainted } from "./provenance.js";
 import {
@@ -81,25 +81,36 @@ interface AuthorizedSdwPayload {
 
 const authorizedSdwPayloads = new WeakMap<Uint8Array, AuthorizedSdwPayload>();
 
+declare const CLASSIFIER_OVERRIDE_BRAND: unique symbol;
+
 /**
- * Rung-1 point 3 fix round (2026-08-22, HIGH-C1): an unforgeable,
- * content-bound capability to skip the secret classifier for ONE record,
- * minted ONLY by `mintClassifierOverrideAuthorization` below. `contentHash`
- * is public (it is not the secret; it is a locator), but membership in the
- * module-private `CLASSIFIER_OVERRIDE_TOKENS` WeakSet below is NOT
- * reconstructible from outside this file -- a caller cannot build an object
- * literal shaped like this interface and have it verify, because
- * `isAuthorizedClassifierOverride` checks WeakSet membership, not merely the
- * shape of the value. This replaces a plain `classifierOverride: boolean`
- * that any caller constructing a `MintPersistableOptions` (or, one layer up,
- * a `MemoryPassageInput`) could set to `true` with zero verification.
+ * Unforgeable, content-bound capability to skip the secret classifier for
+ * ONE record, minted ONLY by `mintClassifierOverrideAuthorization` below.
+ *
+ * Carries NO real runtime data, not even the content hash: an earlier
+ * version stored `contentHash` as a plain field on the token, but a plain
+ * field is a plain field -- a holder could mutate it (`token.contentHash =
+ * somethingElse`) and the object would still pass a WeakSet membership
+ * check, silently re-authorizing whatever the mutated value claimed. The
+ * bound hash instead lives in the module-private `CLASSIFIER_OVERRIDE_CONTENT_HASHES`
+ * WeakMap below (token identity -> hash), which nothing outside this file can
+ * read or write, and every minted token is `Object.freeze`d on top of that so
+ * there is not even a spare property to attach a lie to. The `[CLASSIFIER_OVERRIDE_BRAND]`
+ * member is TYPE-ONLY (the symbol is `declare`d, never assigned at runtime):
+ * it makes TypeScript refuse a hand-built object literal at compile time, on
+ * top of the WeakMap-based runtime check that is the actual security
+ * boundary a caller cannot route around.
  */
 export interface ClassifierOverrideAuthorization {
-  readonly contentHash: string;
+  readonly [CLASSIFIER_OVERRIDE_BRAND]: true;
 }
 
-/** Module-private: the ONLY registry of genuinely-minted authorizations. Never exported. */
-const CLASSIFIER_OVERRIDE_TOKENS = new WeakSet<object>();
+/**
+ * Module-private: token identity -> the exact content hash it authorizes.
+ * Never exported, and never read via a property on the token itself -- this
+ * WeakMap IS the authorization; the token is just an opaque key into it.
+ */
+const CLASSIFIER_OVERRIDE_CONTENT_HASHES = new WeakMap<ClassifierOverrideAuthorization, string>();
 
 /**
  * Mint the ROOT classifier-override authorization for one passage's exact
@@ -117,8 +128,11 @@ const CLASSIFIER_OVERRIDE_TOKENS = new WeakSet<object>();
 export function mintClassifierOverrideAuthorization(
   contentHash: string,
 ): ClassifierOverrideAuthorization {
-  const token: ClassifierOverrideAuthorization = { contentHash };
-  CLASSIFIER_OVERRIDE_TOKENS.add(token);
+  // Object.freeze on a genuinely empty object: there is no field on this
+  // object, or any object, that mutation could use to change what this
+  // token authorizes. The ONLY authority is the WeakMap entry set below.
+  const token = Object.freeze({}) as ClassifierOverrideAuthorization;
+  CLASSIFIER_OVERRIDE_CONTENT_HASHES.set(token, contentHash);
   return token;
 }
 
@@ -126,33 +140,64 @@ function isAuthorizedClassifierOverride(
   token: ClassifierOverrideAuthorization | undefined,
   expectedContentHash: string,
 ): boolean {
-  return (
-    token !== undefined &&
-    CLASSIFIER_OVERRIDE_TOKENS.has(token) &&
-    token.contentHash === expectedContentHash
-  );
+  if (token === undefined) return false;
+  const boundHash = CLASSIFIER_OVERRIDE_CONTENT_HASHES.get(token);
+  return boundHash !== undefined && boundHash === expectedContentHash;
+}
+
+/**
+ * FROZEN content-hash function for passage/document/chunk text (moved here
+ * 2026-08-22 from sdw-memory-backend.ts, which re-exports it unchanged so
+ * existing importers are unaffected). Lives here
+ * now because deriveClassifierOverrideAuthorization below must compute it
+ * independently of any caller-supplied value; importing it FROM
+ * sdw-memory-backend.ts would also create an import cycle (that file already
+ * imports deriveClassifierOverrideAuthorization from here).
+ */
+export function passageContentHash(text: string): string {
+  const domain = stringToBytes("sdw-memory-passage-content-v1\n");
+  const body = stringToBytes(text);
+  const bytes = new Uint8Array(domain.length + body.length);
+  bytes.set(domain, 0);
+  bytes.set(body, domain.length);
+  return toBase64url(hash(bytes));
 }
 
 /**
  * Narrow an already-verified PASSAGE-level authorization to ONE record (the
- * document record or a single chunk record) derived from that passage,
- * re-bound to that record's own content hash -- a passage's document
- * content_hash covers the whole text, but each chunk's content_hash covers
- * only its substring, so the write-gate below (which classifies one record
- * at a time) needs a token matching THAT record, not the whole passage.
+ * document record itself, or a single chunk) derived from that passage.
+ *
+ * A genuine, verified parent token used to be a MINT ORACLE for arbitrary
+ * content -- the caller supplied
+ * `recordContentHash` directly, so once the parent verified, ANY hash
+ * (matching ANY unrelated text elsewhere) got a fresh authorized token.
+ * Closed by taking the actual RECORD TEXT and the actual PARENT TEXT and
+ * computing both hashes internally: mints only when `recordText` is a
+ * literal, contiguous substring of `parentText` -- true for the document's
+ * own full text (recordText === parentText) and for every chunk (chunking is
+ * a contiguous slice, sdw-memory-backend.ts's chunkText), so a derived token
+ * can only ever authorize bytes that were genuinely part of the SAME passage
+ * the operator allow-listed, never unrelated content smuggled in through a
+ * hash collision or a caller-supplied claim.
+ *
  * Returns `undefined`, never a token, when `parent` does not verify against
- * `parentContentHash`; safe to export broadly (unlike the mint function
- * above) because it can only RE-SCOPE authorization that already exists, it
- * can never manufacture authorization for content that was never
- * legitimately allow-listed and refused.
+ * `parentText`'s hash, OR when `recordText` is not contained in `parentText`.
+ * Safe to export broadly (unlike the mint function above) because it can
+ * only RE-SCOPE authorization that already exists to text that was already
+ * covered by it; it can never manufacture authorization for content that was
+ * never legitimately allow-listed and refused. Structurally pinned to
+ * write-gate.ts and sdw-memory-backend.ts (its only caller, preparePassage)
+ * by the same src/-wide reference scan that pins the mint function above.
  */
 export function deriveClassifierOverrideAuthorization(
   parent: ClassifierOverrideAuthorization | undefined,
-  parentContentHash: string,
-  recordContentHash: string,
+  parentText: string,
+  recordText: string,
 ): ClassifierOverrideAuthorization | undefined {
+  const parentContentHash = passageContentHash(parentText);
   if (!isAuthorizedClassifierOverride(parent, parentContentHash)) return undefined;
-  return mintClassifierOverrideAuthorization(recordContentHash);
+  if (!parentText.includes(recordText)) return undefined;
+  return mintClassifierOverrideAuthorization(passageContentHash(recordText));
 }
 
 /** Read `.content_hash` off a record generically, when the record kind carries one. */
@@ -275,89 +320,36 @@ export function prepareSdwBackendWrite<T extends SdwRecord>(
 }
 
 /**
- * HIGH-C3 fix round (2026-08-22): restore-only write path for a rollback
- * compensating-undo (SdwMemoryBackendAdapter.restoreAndVerifyPriorPassages).
- * NEVER calls classifyRecord, anywhere in this function or the two below it:
- * the classifier's job is to keep NEW content out of the vault, and a
- * restore carries no new content, only prior plaintext this SAME process
- * already read back out of the SAME encrypted store under the SAME master
- * key (capturePriorPassages) before this batch began touching it. Restoring
- * bytes that were already durably at rest adds no exposure the classifier
- * could have caught differently the first time.
+ * Restore-only write path for a rollback compensating-undo
+ * (SdwMemoryBackendAdapter.restoreAndVerifyPriorPassages). Writes back the
+ * EXACT ciphertext bytes this SAME process already read out of the SAME
+ * encrypted store under the SAME master key (capturePriorPassages) before
+ * the failed batch began touching it -- never a fresh encryption of
+ * decrypted plaintext. No encrypt() call anywhere in this function: these
+ * bytes are not new content, so there is nothing to encrypt and nothing for
+ * classifyRecord to be asked about; restoring bytes that were already
+ * durably at rest adds no exposure the classifier could have caught
+ * differently the first time, and re-encrypting a byte-identical plaintext
+ * with a fresh nonce/AAD would still not be the SAME bytes that were at
+ * rest, which is the property being restored.
  *
- * Deliberately a SEPARATE function from mintPersistable/prepareSdwBackendWrite
- * rather than a boolean toggle on them: `classifierOverride` above authorizes
- * ONE explicitly-refused, explicitly allow-listed NEW passage and needs a
- * verified token; this authorizes replaying OLD bytes and needs no token at
- * all, by construction, because it never asks the classifier a question in
- * the first place. Structurally reachable ONLY from SdwDocumentCorpusStore's
- * restorePriorChunk/restorePriorDocument -- pinned by the structural test
- * `mintRestoredPersistable is referenced ONLY by document-corpus-store.ts` in
- * test/sdw/sdw-architecture.test.ts, mirroring the classifierOverride
- * containment above. NEVER call this for content whose prior-persisted
- * status the caller cannot prove.
+ * Deliberately a SEPARATE function from mintPersistable/prepareSdwBackendWrite:
+ * `classifierOverride` above authorizes ONE explicitly-refused, explicitly
+ * allow-listed NEW passage and needs a verified token; this authorizes
+ * replaying OLD bytes verbatim and needs no token, no classify call, and no
+ * encrypt call at all, by construction. Structurally reachable ONLY from the
+ * two restore-only methods SdwDocumentCorpusStore declares for this purpose
+ * -- pinned by a structural test in test/sdw/sdw-architecture.test.ts,
+ * mirroring the classifierOverride containment above. NEVER call this for
+ * bytes the caller cannot prove came from THIS store's own prior state.
  */
-export function mintRestoredPersistable<T extends SdwRecord>(
-  value: T,
-  taint: Taint,
+export async function restoreRawSdwBackendWrite(
+  backend: StorageBackend,
   namespace: SdwNamespace,
   storageKey: string,
-  fortressId: string,
-): Persistable<T> {
-  assertAllowedTaint(taint);
-  validateRecord(value);
-  assertNamespaceForRecord(namespace, value);
-  assertSdwIdentifier(namespace, "namespace");
-  assertSdwIdentifier(storageKey, "storage_key");
-  const aad = sdwAad(fortressId, namespace, storageKey);
-  return {
-    [PERSISTABLE_BRAND]: true,
-    record: value,
-    namespace,
-    storageKey,
-    aad,
-    taint,
-  };
-}
-
-export function prepareRestoredSdwBackendWrite<T extends SdwRecord>(
-  persistable: Persistable<T>,
-  encryptionKey: Uint8Array,
-  fortressId: string,
-): PreparedSdwWrite {
-  assertRuntimePersistable(persistable);
-  const namespace = persistable.namespace;
-  const storageKey = persistable.storageKey;
-  assertSdwNamespace(namespace);
-  assertSdwIdentifier(namespace, "namespace");
-  assertSdwIdentifier(storageKey, "storage_key");
-  assertSdwIdentifier(fortressId, "fortress_id");
-  assertAllowedTaint(persistable.taint);
-  assertSdwRecord(persistable.record);
-  validateRecord(persistable.record);
-  assertNamespaceForRecord(namespace, persistable.record);
-  // No classifyRecord call: see mintRestoredPersistable's doc comment above.
-  const aad = sdwAad(fortressId, namespace, storageKey);
-  const envelope = encrypt(
-    stringToBytes(JSON.stringify(persistable.record)),
-    encryptionKey,
-    aad,
-  );
-  const data = stringToBytes(JSON.stringify(envelope));
-  return authorizePreparedSdwPayload({
-    namespace,
-    storageKey,
-    data: new Uint8Array(data),
-  });
-}
-
-export async function restoreSdwBackendWrite<T extends SdwRecord>(
-  backend: StorageBackend,
-  persistable: Persistable<T>,
-  encryptionKey: Uint8Array,
-  fortressId: string,
+  data: Uint8Array,
 ): Promise<void> {
-  const prepared = prepareRestoredSdwBackendWrite(persistable, encryptionKey, fortressId);
+  const prepared = authorizePreparedSdwPayload({ namespace, storageKey, data });
   await backend.write(prepared.namespace, prepared.storageKey, prepared.data);
 }
 

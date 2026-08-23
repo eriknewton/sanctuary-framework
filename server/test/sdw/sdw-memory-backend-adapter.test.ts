@@ -475,9 +475,22 @@ describe("SDW memory-backend adapter: write-gate enforcement", () => {
     const beforeKeys = await ownerScopeCorpusKeys(storage);
     await expect(adapter.getPassage(passageId)).resolves.toMatchObject({ text: waivedText });
 
+    // Snapshot the RAW, still-encrypted bytes for every key belonging to this
+    // passage, taken straight from the storage backend's own map -- this is
+    // the AT-REST ciphertext, not anything decrypted. Copied (not just
+    // referenced) because the failing write below overwrites some of these
+    // same keys' underlying Uint8Array objects before rollback restores them.
+    const compositeKey = (key: string): string => `${SDW_DOCUMENT_CORPUS_NAMESPACE}\0${key}`;
+    const rawBefore = new Map(
+      beforeKeys.map((key) => [key, new Uint8Array(storage.data.get(compositeKey(key))!)]),
+    );
+
     // A LATER batch write for the SAME passage id fails partway (no override
     // this time -- an ordinary re-ingest), forcing restoreAndVerifyPriorPassages
-    // to replay the WAIVED prior bytes captured above.
+    // to replay the WAIVED prior bytes captured above. Chunk writes land
+    // (with NEW content) before the document write, which is the one
+    // configured to fail, so this also proves the chunk bytes specifically
+    // get restored, not just left alone.
     storage.writeFailureKey = documentKey(documentId);
     await expect(
       adapter.putPassages(
@@ -492,7 +505,15 @@ describe("SDW memory-backend adapter: write-gate enforcement", () => {
     // partial_scope, not the plain simulated-failure message, since a second,
     // DIFFERENT thrown error during the rollback attempt is what partial_scope
     // reports).
-    expect(await ownerScopeCorpusKeys(storage)).toEqual(beforeKeys);
+    const afterKeys = await ownerScopeCorpusKeys(storage);
+    expect(afterKeys).toEqual(beforeKeys);
+    for (const key of afterKeys) {
+      // toEqual on Uint8Array does a real byte-value comparison, not
+      // reference identity -- a semantically-equivalent RE-ENCRYPTION (same
+      // plaintext, fresh nonce/AAD) would fail this even though
+      // getPassage()'s decrypted text would still match.
+      expect(storage.data.get(compositeKey(key))).toEqual(rawBefore.get(key));
+    }
     await expect(adapter.getPassage(passageId)).resolves.toMatchObject({ text: waivedText });
   });
 

@@ -17,8 +17,8 @@
 import { randomBytes } from "node:crypto";
 import type { StorageBackend } from "../../storage/interface.js";
 import { withCrossProcessLock } from "../../storage/cross-process-lock.js";
-import { stringToBytes, toBase64url } from "../../core/encoding.js";
-import { hash, hmacSha256 } from "../../core/hashing.js";
+import { constantTimeEqual, stringToBytes, toBase64url } from "../../core/encoding.js";
+import { hmacSha256 } from "../../core/hashing.js";
 import { derivePurposeKey } from "../../core/key-derivation.js";
 import {
   SdwDocumentCorpusStore,
@@ -43,6 +43,7 @@ import type { PersistableTaint } from "../provenance.js";
 import {
   assertSdwClassifierCleanText,
   deriveClassifierOverrideAuthorization,
+  passageContentHash,
   type ClassifierOverrideAuthorization,
   type MintPersistableOptions,
 } from "../write-gate.js";
@@ -120,7 +121,7 @@ interface PreparedPassage {
   readonly documentRecord: SdwDocumentRecord;
   readonly chunkRecords: readonly SdwDocumentChunkRecord[];
   /**
-   * Per-record authorizations derived (HIGH-C1 fix round) from the source
+   * Per-record authorizations derived from the source
    * MemoryPassageInput.classifierOverrideAuthorization (Rung-1 point 3), one
    * per record because a passage's document content_hash covers the whole
    * text while each chunk's content_hash covers only its own substring --
@@ -158,10 +159,24 @@ function chunkMintOptions(
 }
 
 /** The prior state of one passage, captured so a failed batch can restore it. */
+/** One still-encrypted record captured verbatim for a byte-for-byte restore. */
+interface PriorRawRecord {
+  readonly raw: Uint8Array;
+  readonly contentHash: string;
+}
+
+/**
+ * The prior state of one passage, captured so a failed batch can restore it.
+ * `rawDocument`/`rawChunks` carry the EXACT ciphertext bytes read out of
+ * storage before the batch began, for a verbatim restore -- `record` is kept
+ * ONLY for bookkeeping (chunk_count, orphan-chunk deletion range), never
+ * re-encrypted or written back itself.
+ */
 interface PriorPassage {
   readonly documentId: string;
   readonly record: SdwDocumentRecord | null;
-  readonly text: string | null;
+  readonly rawDocument: PriorRawRecord | null;
+  readonly rawChunks: readonly PriorRawRecord[];
 }
 
 interface OwnerScopeSnapshot {
@@ -433,7 +448,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
                 );
               }
             } catch (error) {
-              await this.restoreAndVerifyPriorPassages(prepared, prior, taint, beforeOwnerScope);
+              await this.restoreAndVerifyPriorPassages(prepared, prior, beforeOwnerScope);
               throw error;
             }
             // Post-commit only. A replaced passage that shrank leaves chunks
@@ -536,7 +551,6 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
             await this.restoreAndVerifyPriorPassages(
               prepared,
               prior,
-              taint,
               beforeOwnerScope,
             );
             throw error;
@@ -672,17 +686,19 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     const metadata = input.metadata ?? [];
     validatePassageText(input.text);
     validatePassageDecorators(tags, metadata);
-    // Rung-1 point 3 (hardened in the fix round for HIGH-C1): the passage-level
-    // hash this input's authorization must verify against BEFORE anything
-    // downstream trusts it -- computed once, reused for both this pre-check
-    // and the per-record derivation below, so a token bound to different text
-    // (a different hash) never verifies here even if it is genuinely a real,
-    // WeakSet-registered token.
+    // Rung-1 point 3: the document record's own authorization, verified
+    // against input.text itself BEFORE anything downstream trusts it.
+    // deriveClassifierOverrideAuthorization independently recomputes the
+    // parent's content hash from parentText and requires recordText to be a
+    // literal substring of it, so a token bound to different text (or a
+    // caller-supplied hash with no matching text) never verifies here even
+    // if it is genuinely a real, registered token -- a verified parent is
+    // never a mint oracle for an arbitrary, unrelated hash.
     const passageHash = passageContentHash(input.text);
     const documentClassifierOverride = deriveClassifierOverrideAuthorization(
       input.classifierOverrideAuthorization,
-      passageHash,
-      passageHash,
+      input.text,
+      input.text,
     );
     // classifierOverrideAuthorization skips ONLY this one check, for this one
     // passage, and only once it has verified above. It is set exclusively by
@@ -722,15 +738,18 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       metadata,
     };
     // Re-scope the SAME verified passage-level authorization to each CHUNK's
-    // own content hash (a chunk's content_hash is over its substring, not the
-    // whole passage, so the document-level token above cannot itself
-    // authorize a chunk write). Undefined for every chunk when there was no
-    // valid parent authorization, exactly mirroring documentClassifierOverride.
+    // own text (a chunk's content_hash is over its substring, not the whole
+    // passage, so the document-level token above cannot itself authorize a
+    // chunk write; deriveClassifierOverrideAuthorization verifies chunkRecord.text
+    // is literally contained in input.text, which chunkText's contiguous
+    // slicing guarantees for every real chunk). Undefined for every chunk
+    // when there was no valid parent authorization, exactly mirroring
+    // documentClassifierOverride.
     const chunkClassifierOverrides = chunkRecords.map((chunkRecord) =>
       deriveClassifierOverrideAuthorization(
         input.classifierOverrideAuthorization,
-        passageHash,
-        chunkRecord.content_hash,
+        input.text,
+        chunkRecord.text,
       ),
     );
     return {
@@ -762,20 +781,37 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
 
   /**
    * Read the pre-write state of every batch target so a failed non-transactional
-   * batch can be undone. Decrypted plaintext is captured, not raw ciphertext:
-   * restoring goes back through the minted write path, which is the only
-   * authorized way into an SDW namespace.
+   * batch can be undone. Captures the EXACT still-encrypted bytes
+   * (getDocumentRaw/getChunkRaw), not decrypted plaintext -- restore writes
+   * these SAME bytes back unchanged rather than re-encrypting a decrypted
+   * copy (see restorePriorChunk/restorePriorDocument below).
    */
   private async capturePriorPassages(
     prepared: readonly PreparedPassage[],
   ): Promise<readonly PriorPassage[]> {
     const prior: PriorPassage[] = [];
     for (const item of prepared) {
-      const record = await this.corpus.getDocument(item.documentId);
+      const documentRaw = await this.corpus.getDocumentRaw(item.documentId);
+      if (documentRaw === null) {
+        prior.push({ documentId: item.documentId, record: null, rawDocument: null, rawChunks: [] });
+        continue;
+      }
+      const rawChunks: PriorRawRecord[] = [];
+      for (let ordinal = 0; ordinal < documentRaw.record.chunk_count; ordinal++) {
+        const chunkRaw = await this.corpus.getChunkRaw(item.documentId, ordinal, chunkId(ordinal));
+        if (chunkRaw === null) {
+          throw new SdwValidationError(
+            "passage_incomplete",
+            "SDW memory passage chunk missing during rollback capture",
+          );
+        }
+        rawChunks.push({ raw: chunkRaw.raw, contentHash: chunkRaw.record.content_hash });
+      }
       prior.push({
         documentId: item.documentId,
-        record,
-        text: record === null ? null : await this.readPassageText(record),
+        record: documentRaw.record,
+        rawDocument: { raw: documentRaw.raw, contentHash: documentRaw.record.content_hash },
+        rawChunks,
       });
     }
     return prior;
@@ -791,7 +827,6 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   private async restoreAndVerifyPriorPassages(
     prepared: readonly PreparedPassage[],
     prior: readonly PriorPassage[],
-    taint: PersistableTaint,
     beforeOwnerScope: OwnerScopeSnapshot,
   ): Promise<void> {
     const failures: unknown[] = [];
@@ -813,7 +848,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         continue;
       }
 
-      if (item.record === null || item.text === null) {
+      if (item.record === null || item.rawDocument === null) {
         for (const chunkRecord of [...preparedItem.chunkRecords].reverse()) {
           const key = documentChunkStorageKey(chunkRecord);
           await attempt(async () => {
@@ -830,21 +865,33 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         continue;
       }
 
-      // HIGH-C3 fix round (2026-08-22): restore through restorePriorChunk /
-      // restorePriorDocument, NEVER through putChunk/putDocument. These prior
-      // bytes were already durably persisted before this batch began (read
-      // back by capturePriorPassages out of the SAME encrypted store), so
-      // re-running them through the classifying write path would re-trip the
-      // classifier for a PREVIOUSLY-waived passage and turn a rollback into a
-      // second, unrecoverable failure. Restoring bytes already at rest adds
-      // no new exposure the classifier could have caught differently.
-      for (const chunkRecord of this.rebuildChunkRecords(item.record, item.text)) {
+      // Restore through restorePriorChunk / restorePriorDocument,
+      // NEVER through putChunk/putDocument, and with the EXACT captured raw
+      // ciphertext bytes, never a re-encrypted copy of decrypted plaintext.
+      // These prior bytes were already durably persisted before this batch
+      // began (read back by capturePriorPassages out of the SAME encrypted
+      // store), so re-running them through the classifying write path would
+      // re-trip the classifier for a PREVIOUSLY-waived passage and turn a
+      // rollback into a second, unrecoverable failure; and re-encrypting a
+      // byte-identical plaintext would still not be the SAME bytes that were
+      // at rest, which is the property being restored.
+      for (const [ordinal, rawChunk] of item.rawChunks.entries()) {
         await attempt(async () => {
-          await this.corpus.restorePriorChunk(chunkRecord, taint);
+          await this.corpus.restorePriorChunk(
+            item.documentId,
+            ordinal,
+            chunkId(ordinal),
+            rawChunk.raw,
+            rawChunk.contentHash,
+          );
         });
       }
       await attempt(async () => {
-        await this.corpus.restorePriorDocument(item.record!, taint);
+        await this.corpus.restorePriorDocument(
+          item.documentId,
+          item.rawDocument!.raw,
+          item.rawDocument!.contentHash,
+        );
       });
 
       for (
@@ -868,23 +915,6 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     } catch (error) {
       throw partialScopeError(error);
     }
-  }
-
-  private rebuildChunkRecords(
-    record: SdwDocumentRecord,
-    text: string,
-  ): readonly SdwDocumentChunkRecord[] {
-    const parts = chunkText(text, this.maxChunkChars);
-    return parts.map((chunk, ordinal) => ({
-      kind: "document_chunk" as const,
-      version: 1 as const,
-      chunk_id: chunkId(ordinal),
-      document_id: record.document_id,
-      chunk_ordinal: ordinal,
-      text: chunk,
-      content_hash: passageContentHash(chunk),
-      created_at: record.created_at,
-    }));
   }
 
   private async pruneOrphanChunks(
@@ -914,6 +944,13 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     return { keys: await this.ownerScopeCorpusKeys() };
   }
 
+  /**
+   * Verifies BYTE-FOR-BYTE that the restored ciphertext matches what
+   * capturePriorPassages actually captured -- not merely that the DECRYPTED
+   * content is equivalent (a re-encryption could satisfy that while
+   * producing genuinely different at-rest bytes, which is exactly what this
+   * restore path is designed to avoid).
+   */
   private async verifyPriorPassagesRestored(
     beforeOwnerScope: OwnerScopeSnapshot,
     prior: readonly PriorPassage[],
@@ -923,21 +960,33 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       throw new Error("SDW memory rollback owner-scope key listing mismatch");
     }
     for (const item of prior) {
-      const document = await this.corpus.getDocument(item.documentId);
-      if (item.record === null || item.text === null) {
-        if (document !== null) {
+      const documentRaw = await this.corpus.getDocumentRaw(item.documentId);
+      if (item.record === null || item.rawDocument === null) {
+        if (documentRaw !== null) {
           throw new Error(`SDW memory rollback left unexpected document ${item.documentId}`);
         }
         continue;
       }
-      if (document === null) {
+      if (documentRaw === null) {
         throw new Error(`SDW memory rollback did not restore document ${item.documentId}`);
       }
-      if (JSON.stringify(document) !== JSON.stringify(item.record)) {
-        throw new Error(`SDW memory rollback restored wrong document ${item.documentId}`);
+      if (!constantTimeEqual(documentRaw.raw, item.rawDocument.raw)) {
+        throw new Error(
+          `SDW memory rollback restored the wrong document bytes for ${item.documentId}`,
+        );
       }
-      if ((await this.readPassageText(document)) !== item.text) {
-        throw new Error(`SDW memory rollback restored wrong text ${item.documentId}`);
+      for (const [ordinal, rawChunk] of item.rawChunks.entries()) {
+        const chunkRaw = await this.corpus.getChunkRaw(item.documentId, ordinal, chunkId(ordinal));
+        if (chunkRaw === null) {
+          throw new Error(
+            `SDW memory rollback did not restore chunk ${String(ordinal)} of ${item.documentId}`,
+          );
+        }
+        if (!constantTimeEqual(chunkRaw.raw, rawChunk.raw)) {
+          throw new Error(
+            `SDW memory rollback restored the wrong chunk ${String(ordinal)} bytes for ${item.documentId}`,
+          );
+        }
       }
     }
   }
@@ -1129,14 +1178,11 @@ export function chunkText(text: string, maxChunkChars: number): readonly string[
   return chunks;
 }
 
-export function passageContentHash(text: string): string {
-  const domain = stringToBytes("sdw-memory-passage-content-v1\n");
-  const body = stringToBytes(text);
-  const bytes = new Uint8Array(domain.length + body.length);
-  bytes.set(domain, 0);
-  bytes.set(body, domain.length);
-  return toBase64url(hash(bytes));
-}
+// Moved to write-gate.ts (2026-08-22), imported above and
+// re-exported here (the local binding, not a second module fetch) so every
+// existing importer of passageContentHash from THIS module keeps working
+// without an import-path change.
+export { passageContentHash };
 
 function chunkId(ordinal: number): string {
   return `c${padChunkOrdinal(ordinal)}`;

@@ -49,7 +49,7 @@ export interface MemoryPassageInput {
   /** Optional caller-supplied creation timestamp (ISO 8601). */
   readonly created_at?: string;
   /**
-   * Rung-1 point 3 (2026-08-22, hardened in the fix round for HIGH-C1):
+   * Rung-1 point 3 (2026-08-22):
    * bypasses ONLY the secret-classifier detector step for this one passage;
    * grammar, size, and taint checks still run. Every other check in the
    * write gate still applies, so this can never turn an otherwise-invalid

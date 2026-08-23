@@ -304,7 +304,7 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
       let fileCount = 0;
       const ingestedAt = now();
       try {
-        // Preflight-only (HIGH-C2 fix round): screen decides accept / skip /
+        // Preflight-only: screen decides accept / skip /
         // override and validates allow_files (assertAllowFilesKnown, inside
         // screenMemoryFileEntries) WITHOUT writing anything to the vault. The
         // override audit records below are durably appended, and can abort
@@ -338,7 +338,7 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
         // point nothing has been committed. allow_files is included here (not
         // only on the post-commit record and the per-file override record
         // below) because it is a PRE-WRITE WITNESS too, cheap insurance on
-        // top of the HIGH-C2 ordering below.
+        // top of the screen-then-audit-then-commit ordering below.
         await auditSuccess("memory_ingest_started", {
           harness,
           source_dir: dir,
@@ -348,7 +348,7 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
         });
 
         // One record per overridden file (Rung-1 point 3), durably appended
-        // BEFORE any vault write (HIGH-C2 fix round): the operator waived the
+        // BEFORE any vault write: the operator waived the
         // classifier for this exact path, so it is named individually rather
         // than folded into the aggregate outcome record below. Carries the
         // refusal metadata the classifier would have reported (detector,

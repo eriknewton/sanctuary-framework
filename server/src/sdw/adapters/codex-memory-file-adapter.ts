@@ -202,7 +202,7 @@ export async function ingestCodexMemoryDirectory(
 }
 
 /**
- * Preflight-only phase (HIGH-C2 fix round, 2026-08-22): see
+ * Preflight-only phase (2026-08-22): see
  * screenClaudeCodeMemorySnapshot's doc comment for the ordering rationale.
  */
 export interface CodexMemoryScreenResult {
