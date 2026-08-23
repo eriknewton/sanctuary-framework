@@ -35,7 +35,12 @@ import {
   type ExitBundleManifest,
   type ExitBundleVerifierResult,
 } from "../contracts/v1.1/exit-bundle-manifest.js";
-import { fromBase64url, stringToBytes } from "../core/encoding.js";
+import { fromBase64url, fromBase64urlStrict, stringToBytes } from "../core/encoding.js";
+import {
+  SUPPORTED_PAYLOAD_VERSION,
+  SUPPORTED_PAYLOAD_ALG,
+  PAYLOAD_IV_BYTE_LENGTH,
+} from "../core/encryption.js";
 import { publicKeyToDid } from "../core/identity.js";
 import { isReservedNamespace } from "../cognitive/state-store.js";
 import {
@@ -437,15 +442,33 @@ export function isWellFormedExitStateEntryElement(
   if (payload === null || typeof payload !== "object") return false;
   const payloadRecord = payload as Record<string, unknown>;
   if (typeof payloadRecord.ct !== "string") return false;
-  // `decrypt()` reads `payload.v`/`payload.alg` for its own named,
-  // caught version/algorithm-mismatch refusal (never a crash) once they
-  // are the RIGHT TYPE; a wrong-TYPE value (not merely a wrong, still
-  // well-typed, version number) is the structural case this predicate
-  // exists to catch. `payload.iv` is read by `fromBase64url` with no type
-  // guard of its own - a non-string here is the raw-TypeError crash risk.
-  if (typeof payloadRecord.v !== "number") return false;
-  if (typeof payloadRecord.alg !== "string") return false;
+  // MEDIUM-B (coordinator gate, 2026-08-22): pinned to the EXACT values
+  // `decrypt()` (core/encryption.ts) accepts, not merely their type - a
+  // well-typed WRONG value (`v: 2`, `alg: "aes-128-gcm"`) used to pass
+  // this check, verify PASS, and only fail post-staging inside rekeyState's
+  // bare per-entry catch, misread as a signature failure rather than a
+  // structural one. `SUPPORTED_PAYLOAD_VERSION`/`SUPPORTED_PAYLOAD_ALG` are
+  // the SAME constants `decrypt()` checks against - CONTRACT PIN, must
+  // match if either changes.
+  if (payloadRecord.v !== SUPPORTED_PAYLOAD_VERSION) return false;
+  if (payloadRecord.alg !== SUPPORTED_PAYLOAD_ALG) return false;
+  // `payload.iv` is read by `fromBase64url` with no type guard of its own
+  // (a non-string is the raw-TypeError crash risk EXIT-STRUCT-02 covers),
+  // and `decrypt()`'s GCM cipher requires the DECODED iv to be exactly
+  // `PAYLOAD_IV_BYTE_LENGTH` bytes - a string that is technically base64url
+  // but decodes to the wrong length reaches the cipher and throws there
+  // instead of failing this structural check. `fromBase64urlStrict`
+  // rejects any non-canonical encoding (so a lenient-decoder quirk cannot
+  // hide a length mismatch), and the byte-length check pins to what the
+  // cipher actually requires.
   if (typeof payloadRecord.iv !== "string") return false;
+  try {
+    if (fromBase64urlStrict(payloadRecord.iv).length !== PAYLOAD_IV_BYTE_LENGTH) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
   // EXIT-STRUCT-02 fix-round (Codex family, confirmed by probe: predicate:true
   // then TypeError): `rekeyState` (server/src/exit/bundle.ts write site) reads
   // `entry.metadata.content_type`/`.ttl_seconds` and SPREADS `entry.metadata.tags`

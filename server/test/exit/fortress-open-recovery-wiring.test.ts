@@ -17,10 +17,10 @@
  */
 
 import { describe, expect, it, afterEach } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Writable } from "node:stream";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -62,37 +62,135 @@ class StringWritable extends Writable {
   }
 }
 
-describe("structural pin: every named fortress-open call site routes through recoverInterruptedExitImportsOrThrow", () => {
-  /**
-   * Expected count of `recoverInterruptedExitImportsOrThrow(` calls per
-   * file, one entry per file named in that function's own doc comment
-   * (server/src/exit/bundle.ts). A file dropping below its count means a
-   * call site was removed without a documented reason; this test fails
-   * loud rather than silently losing coverage. `cli/doctor.ts` is
-   * DELIBERATELY absent - see its own "STATED BOUND" comment
-   * (server/src/cli/doctor.ts, `resolveMasterKeyIfAvailable`) for why.
-   */
-  const EXPECTED: Array<{ file: string; count: number }> = [
-    { file: "src/index.ts", count: 1 },
-    { file: "src/dashboard-standalone.ts", count: 1 },
-    { file: "src/cli/distress.ts", count: 1 },
-    { file: "src/cli/transparency.ts", count: 4 },
-    { file: "src/cli/anomaly.ts", count: 2 },
-    { file: "src/exit/cli.ts", count: 1 },
-  ];
-
-  for (const { file, count } of EXPECTED) {
-    it(`${file} calls recoverInterruptedExitImportsOrThrow at least ${count} time(s)`, () => {
-      const source = readFileSync(join(SERVER_ROOT, file), "utf8");
-      const matches = source.match(/recoverInterruptedExitImportsOrThrow\(/g) ?? [];
-      expect(matches.length).toBeGreaterThanOrEqual(count);
-    });
+/**
+ * MEDIUM-C (coordinator gate, 2026-08-22): the candidate set below is
+ * MECHANICALLY DERIVED (every `src/**\/*.ts` file whose text contains both
+ * `new FilesystemStorage(` and `new AuditLog(`), not hand-listed - a
+ * hand-listed table cannot catch a NEW file added later that builds the
+ * same pattern (18 such files existed, unlisted, when this was a
+ * hand-listed table of 6). Every candidate must be either WIRED (calls
+ * `recoverInterruptedExitImportsOrThrow`) or explicitly ALLOWLISTED with a
+ * one-line reason below; `expect(...).toEqual(...)` on the full candidate
+ * set (not `toBeGreaterThanOrEqual`) means a 19th (or Nth) site trips this
+ * test the moment it exists, wired or not.
+ */
+function listTsFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...listTsFiles(full));
+    } else if (entry.isFile() && /\.tsx?$/.test(entry.name)) {
+      out.push(full);
+    }
   }
+  return out;
+}
 
-  it("cli/doctor.ts states its recovery bound explicitly (deliberately NOT wired)", () => {
+function toRelSrcPath(absPath: string): string {
+  return "src/" + relative(join(SERVER_ROOT, "src"), absPath).split(sep).join("/");
+}
+
+/**
+ * ALLOWLIST (MEDIUM-C): every mechanically-derived candidate NOT wired
+ * this fix round, with a one-line reason. Each entry is checked against
+ * the LIVE candidate set below, so a stale entry (the file no longer
+ * matches, or was wired since) fails loud rather than rotting silently.
+ */
+const ALLOWLIST: Record<string, string> = {
+  "src/disclosure/broker/open.ts": "L3 secret-broker open helper; not wired this fix round, scope bounded to the named sites plus low-risk additions found while auditing.",
+  "src/cli/erc8004.ts": "erc8004 verb; not wired this fix round, same bounded-scope reason.",
+  "src/cli/sentinel.ts": "sentinel verb family, multiple AuditLog sites across many verbs; not wired this fix round.",
+  "src/cli/concierge.ts": "concierge verb; not wired this fix round, same bounded-scope reason.",
+  "src/cli/auto-trigger.ts": "auto-trigger verb family, multiple AuditLog sites across many verbs; not wired this fix round.",
+  "src/cli/audit-chain-repair-plan.ts": "read-only repair-PLAN verb (proposes a plan, does not apply one); not wired this fix round.",
+  "src/cli/memory-file.ts": "memory-file verb; not wired this fix round, same bounded-scope reason.",
+  "src/cli/did-web.ts": "did-web verb family, multiple AuditLog sites; not wired this fix round.",
+  "src/cli/file-grant.ts": "read-only file-grant verb; not wired this fix round.",
+  "src/cli/cortex-export.ts": "cortex-export verb; not wired this fix round, same bounded-scope reason.",
+  "src/cli/audit.ts": "read-only audit verb; not wired this fix round.",
+  "src/cli/castle-wall-boot.ts": "castle-wall boot-install verb; not wired this fix round, same bounded-scope reason.",
+  "src/cli/castle-wall-observe.ts": "read-only castle-wall observe verb, multiple AuditLog sites; not wired this fix round.",
+  "src/cli/policy.ts": "policy verb family, multiple AuditLog sites; not wired this fix round.",
+  "src/cli/checkpoint.ts": "checkpoint verb; not wired this fix round, same bounded-scope reason.",
+  "src/cli/castle-wall.ts": "Castle Wall CLI, many AuditLog sites across many verbs; not wired this fix round.",
+  "src/cli/state-disclose.ts": "state-disclose verb; not wired this fix round, same bounded-scope reason.",
+  "src/cli/restore-attest.ts": "restore-attest verb; not wired this fix round, same bounded-scope reason.",
+  "src/cli/agents/cli.ts": "agents verb; not wired this fix round, same bounded-scope reason.",
+  "src/dashboard/v1_1/dispatch.ts": "shared dashboard dispatch helper used by many routes; not wired this fix round.",
+  "src/wrap/custody-flow.ts": "wrap custody-establishment flow; not wired this fix round, same bounded-scope reason.",
+  "src/wrap/init.ts": "fortress first-run init; not wired this fix round, same bounded-scope reason.",
+  "src/wrap/cli.ts": "wrap CLI, multiple AuditLog sites; not wired this fix round.",
+  "src/templates/cli.ts": "templates verb; not wired this fix round, same bounded-scope reason.",
+};
+
+describe("structural pin: every named fortress-open call site routes through recoverInterruptedExitImportsOrThrow", () => {
+  const srcDir = join(SERVER_ROOT, "src");
+  const candidates = listTsFiles(srcDir)
+    .map(toRelSrcPath)
+    .filter((relPath) => {
+      const source = readFileSync(join(SERVER_ROOT, relPath), "utf8");
+      return (
+        source.includes("new FilesystemStorage(") && source.includes("new AuditLog(")
+      );
+    })
+    .sort();
+
+  it("every mechanically-derived candidate is wired or explicitly allowlisted, with no stale allowlist entries", () => {
+    const wired: string[] = [];
+    const unaccounted: string[] = [];
+    for (const relPath of candidates) {
+      const source = readFileSync(join(SERVER_ROOT, relPath), "utf8");
+      const isWired = source.includes("recoverInterruptedExitImportsOrThrow(");
+      const isAllowlisted = Object.prototype.hasOwnProperty.call(ALLOWLIST, relPath);
+      if (isWired && isAllowlisted) {
+        unaccounted.push(`${relPath}: both wired AND allowlisted - remove the stale allowlist entry`);
+        continue;
+      }
+      if (isWired) {
+        wired.push(relPath);
+        continue;
+      }
+      if (isAllowlisted) {
+        continue;
+      }
+      unaccounted.push(`${relPath}: neither wired nor allowlisted`);
+    }
+    // Every allowlist entry must correspond to a LIVE candidate - a file
+    // that no longer matches the mechanical pattern (or was wired) leaves
+    // a stale entry that silently stops meaning anything.
+    for (const allowlistedPath of Object.keys(ALLOWLIST)) {
+      if (!candidates.includes(allowlistedPath)) {
+        unaccounted.push(`${allowlistedPath}: allowlisted but is no longer a candidate (stale entry - remove it)`);
+      }
+    }
+    expect(unaccounted).toEqual([]);
+    // Named-list pin: the wired set is expected to be EXACTLY this list.
+    // A file dropping recovery silently is caught here; a NEW candidate
+    // (wired or not) is already caught by the loop above regardless.
+    expect(wired.sort()).toEqual(
+      [
+        "src/cli/anomaly.ts",
+        "src/cli/distress.ts",
+        "src/cli/memory-archive.ts",
+        "src/cli/transparency.ts",
+        "src/dashboard-standalone.ts",
+        "src/exit/cli.ts",
+        "src/index.ts",
+      ].sort()
+    );
+  });
+
+  it("cli/doctor.ts states its recovery bound explicitly (deliberately NOT wired to the throwing recovery path)", () => {
     const source = readFileSync(join(SERVER_ROOT, "src/cli/doctor.ts"), "utf8");
     expect(source).toContain("STATED BOUND (HIGH-2, coordinator gate, 2026-08-22)");
     expect(source).not.toContain("recoverInterruptedExitImportsOrThrow(");
+    // Codex gate net-new (2026-08-22): doctor.ts DOES derive a master key
+    // when credentials are present (resolveMasterKeyIfAvailable) - the
+    // bound is about never calling the WRITING/THROWING recovery path,
+    // not about never touching a master key at all. Pin the read-only
+    // journal-presence check exists instead.
+    expect(source).toContain("checkInterruptedExitImport");
   });
 
   it("importExitBundle's own top-of-function recovery uses the throwing wrapper, not the bare function", () => {
@@ -326,7 +424,6 @@ describe("recovery through the REAL fortress-open path, not a direct call", () =
       identity_id: targetIdentityManager.getPrimaryIdentityId() ?? "unknown",
       started_at: new Date().toISOString(),
       snapshots: [],
-      namespace_snapshots: [],
     };
     await targetStorage.write(
       EXIT_IMPORT_JOURNAL_NAMESPACE,

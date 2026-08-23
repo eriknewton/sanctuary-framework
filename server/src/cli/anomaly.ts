@@ -243,15 +243,17 @@ async function cmdSubscribe(
     return 0;
   }
   subscribed.push({ detector_id: detectorId, classifier_id: classifierId });
-  await saveAnomalySubscriptions(storagePath, subscribed);
   const masterKey = await deriveFortressMasterKey(ctx);
   const storage = new FilesystemStorage(`${storagePath}/state`);
   const fortressId = fortressIdFromStoragePath(storagePath);
   const auditLog = new AuditLog(storage, masterKey);
-  // HIGH-2 (coordinator gate, 2026-08-22): roll back any exit-import left
-  // interrupted by a prior hard kill before this verb touches storage
-  // further. See index.ts's matching call site for the full rationale.
+  // LOW-G (coordinator gate, 2026-08-22): moved BEFORE
+  // saveAnomalySubscriptions - the file below is not itself encrypted
+  // fortress state, but recovery must still run before ANY further write
+  // this verb makes, not only before the audit append that used to follow
+  // it. See index.ts's matching call site for the full rationale.
   await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+  await saveAnomalySubscriptions(storagePath, subscribed);
   await auditLog.append("l2", "anomaly.subscribe", `fortress:${fortressId}`, {
     detector_id: detectorId,
     classifier_id: classifierId,
@@ -293,13 +295,14 @@ async function cmdUnsubscribe(
     );
     return 0;
   }
-  await saveAnomalySubscriptions(storagePath, filtered);
   const masterKey = await deriveFortressMasterKey(ctx);
   const storage = new FilesystemStorage(`${storagePath}/state`);
   const fortressId = fortressIdFromStoragePath(storagePath);
   const auditLog = new AuditLog(storage, masterKey);
-  // HIGH-2 (coordinator gate, 2026-08-22): see cmdSubscribe's matching call.
+  // LOW-G (coordinator gate, 2026-08-22): moved BEFORE
+  // saveAnomalySubscriptions; see cmdSubscribe's matching call.
   await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+  await saveAnomalySubscriptions(storagePath, filtered);
   await auditLog.append("l2", "anomaly.unsubscribe", `fortress:${fortressId}`, {
     detector_id: detectorId,
     classifier_id: classifierId,
@@ -327,6 +330,10 @@ async function cmdFindings(
   const storagePath = await resolveStoragePath(ctx.args);
   const storage = new FilesystemStorage(`${storagePath}/state`);
   const fortressId = fortressIdFromStoragePath(storagePath);
+  // Codex gate net-new (2026-08-22): a read verb, but it derives a master
+  // key, so it was missed by the mechanical fortress-open recovery pin.
+  // An AuditLog constructed for this sole purpose is cheap.
+  await recoverInterruptedExitImportsOrThrow(storage, new AuditLog(storage, masterKey));
   const store = new SentinelFindingStore({
     storage,
     masterKey,
@@ -386,6 +393,7 @@ async function cmdFindingsShow(
   const storagePath = await resolveStoragePath(ctx.args);
   const storage = new FilesystemStorage(`${storagePath}/state`);
   const fortressId = fortressIdFromStoragePath(storagePath);
+  await recoverInterruptedExitImportsOrThrow(storage, new AuditLog(storage, masterKey));
   const store = new SentinelFindingStore({ storage, masterKey, fortressId });
   const finding = await store.loadFinding(findingId);
   if (!finding) {
@@ -431,6 +439,7 @@ async function cmdClassifierState(
   const storagePath = await resolveStoragePath(ctx.args);
   const storage = new FilesystemStorage(`${storagePath}/state`);
   const fortressId = fortressIdFromStoragePath(storagePath);
+  await recoverInterruptedExitImportsOrThrow(storage, new AuditLog(storage, masterKey));
   const stateStore = new ClassifierStateStore({
     storage,
     masterKey,

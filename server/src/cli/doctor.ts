@@ -17,6 +17,7 @@ import { resolveCliMasterKey } from "../core/master-custody.js";
 import { detectCustodyFactorOrphan } from "../wrap/orphan-detection.js";
 import { getPlatformPaths } from "../wrap/config-reader.js";
 import { hermesConfigYamlPath, hermesSanctuaryEntryEnvValue } from "../wrap/hermes-yaml.js";
+import { EXIT_IMPORT_JOURNAL_NAMESPACE } from "../exit/bundle.js";
 import {
   describePyYamlCandidateFailure,
   probePyYamlCandidates,
@@ -142,6 +143,7 @@ export async function runDoctorChecks(opts: {
   checks.push(await checkPolicy(opts.storagePath));
   checks.push(await checkAuditChain(opts.storagePath, masterKey ?? undefined));
   checks.push(await checkCustodyFactors(opts.storagePath));
+  checks.push(await checkInterruptedExitImport(opts.storagePath));
   checks.push(checkRuntime());
   checks.push(await checkHermesConfigParser(opts));
   checks.push(await checkCastleWall(opts));
@@ -226,6 +228,43 @@ async function checkHermesConfigParser(opts: {
  * (no GUI / SSH) and reports OK rather than a false alarm; no enrolled keychain
  * factor is OK (nothing to orphan). Read-only; never unlocks anything.
  */
+/**
+ * MEDIUM-D (coordinator gate, 2026-08-22), Codex-tightened: a fortress
+ * left with an interrupted exit-import is genuinely BROKEN (a real risk
+ * of the LATER data-loss reconciliation `recoverInterruptedExitImportsOrThrow`
+ * exists to prevent), not a benign degraded state - so this is FAIL, not
+ * WARN, unlike the other checks in this file. Read-only: `storage.list()`
+ * does not require a master key, so this check runs unconditionally
+ * (never gated on credential availability), matching doctor's
+ * never-abort, always-diagnose contract while still surfacing something
+ * an operator must act on.
+ */
+async function checkInterruptedExitImport(storagePath: string): Promise<DoctorCheck> {
+  const storage = new FilesystemStorage(join(storagePath, "state"));
+  let entries;
+  try {
+    entries = await storage.list(EXIT_IMPORT_JOURNAL_NAMESPACE);
+  } catch (error) {
+    return warn(
+      "exit import recovery",
+      `could not check for an interrupted exit import: ${error instanceof Error ? error.message : String(error)}`,
+      "re-run after confirming the fortress storage path is reachable",
+    );
+  }
+  if (entries.length > 0) {
+    return fail(
+      "exit import recovery",
+      "interrupted exit import pending recovery",
+      "run any `sanctuary exit` verb (for example `sanctuary exit verify`) to recover",
+    );
+  }
+  return ok(
+    "exit import recovery",
+    "no interrupted exit import pending",
+    "n/a",
+  );
+}
+
 async function checkCustodyFactors(storagePath: string): Promise<DoctorCheck> {
   const storage = new FilesystemStorage(join(storagePath, "state"));
   let result;

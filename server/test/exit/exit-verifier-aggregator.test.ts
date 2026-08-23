@@ -1248,6 +1248,111 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
     );
   });
 
+  // ---- MEDIUM-B (coordinator gate, 2026-08-22): a WELL-TYPED but WRONG
+  // ---- value for payload.v/alg/iv used to pass the (type-only) check
+  // ---- above and only fail post-staging, misread as a signature failure.
+  // ---- Pinned to the EXACT values decrypt() accepts.
+
+  it("an entries element whose `entry.payload.alg` is a well-typed but wrong value (aes-128-gcm) fails verify closed, and import refuses with a NAMED error", async () => {
+    const source = await makeSource("aggregator-cryptofield-algvalue-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      const payload = { ...(entry.payload as Record<string, unknown>), alg: "aes-128-gcm" };
+      artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload } }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
+  it("an entries element whose `entry.payload.v` is a well-typed but wrong value (2) fails verify closed, and import refuses with a NAMED error", async () => {
+    const source = await makeSource("aggregator-cryptofield-vvalue-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      const payload = { ...(entry.payload as Record<string, unknown>), v: 2 };
+      artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload } }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
+  it("an entries element whose `entry.payload.iv` decodes to the wrong byte length fails verify closed, and import refuses with a NAMED error", async () => {
+    const source = await makeSource("aggregator-cryptofield-ivlength-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      // "AAAA" base64url-decodes to 3 bytes, not the 12 the cipher requires.
+      const payload = { ...(entry.payload as Record<string, unknown>), iv: "AAAA" };
+      artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload } }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
   // ---- F3/F4 (Exit V2 drill D1, 2026-08-22): two structural checks that
   // ---- used to be absent from BOTH verify and import (F3) or present only
   // ---- in import, AFTER staging (F4). Both now route through the same
@@ -1352,7 +1457,10 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
       kid: "kid",
       sig: "sig",
       integrity_hash: "hash",
-      payload: { v: 1, alg: "aes-256-gcm", iv: "iv", ct: "ct" },
+      // "AAAAAAAAAAAAAAAA" is a canonical base64url encoding of 12 zero
+      // bytes - the exact IV byte length decrypt() requires (MEDIUM-B,
+      // coordinator gate, 2026-08-22).
+      payload: { v: 1, alg: "aes-256-gcm", iv: "AAAAAAAAAAAAAAAA", ct: "ct" },
       metadata: {},
     };
     expect(

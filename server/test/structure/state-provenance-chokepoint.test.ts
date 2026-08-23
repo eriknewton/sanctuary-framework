@@ -124,7 +124,7 @@ function isAllowedDynamicWrite(call: WriteCall): boolean {
     },
     {
       path: "server/src/exit/bundle.ts",
-      context: "for (const snapshot of allSnapshots)",
+      context: "for (const snapshot of snapshots)",
       reason:
         "exit activation rollback (restoreStorageSnapshots) restores byte-identical pre-activation snapshots that already carry their original Slice-2 provenance; routing through StateStore.write would re-mint and corrupt the byte-for-byte rollback the atomicity guarantee requires",
     },

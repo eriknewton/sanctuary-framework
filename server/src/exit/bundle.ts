@@ -48,6 +48,7 @@ import { hash, hashToString } from "../core/hashing.js";
 import {
   bytesToString,
   fromBase64url,
+  fromBase64urlStrict,
   stringToBytes,
   toBase64url,
 } from "../core/encoding.js";
@@ -160,7 +161,7 @@ const PRIVACY_PLACEHOLDER_NAMESPACE = "_privacy_placeholder_vault";
  * interrupted before it finished either way." See
  * `recoverInterruptedExitImports` for the read side.
  */
-const EXIT_IMPORT_JOURNAL_NAMESPACE = "_exit_import_journal";
+export const EXIT_IMPORT_JOURNAL_NAMESPACE = "_exit_import_journal";
 
 /**
  * Custody-envelope re-key block (post-#496). Carries a wrap of the SOURCE
@@ -2056,11 +2057,6 @@ interface StorageSnapshot extends StagedLocation {
   data: Uint8Array | null;
 }
 
-interface StorageNamespaceSnapshot {
-  namespace: string;
-  entries: StorageSnapshot[];
-}
-
 function locationDedupeKey(loc: StagedLocation): string {
   return `${loc.namespace.length}:${loc.namespace}${loc.key}`;
 }
@@ -2091,19 +2087,18 @@ async function snapshotStorageLocations(
   return snapshots;
 }
 
-// `snapshotStorageNamespace` (whole-namespace snapshot) was removed
-// (coordinator gate HIGH finding, 2026-08-22): its restore path deletes
-// every key present at restore time that was absent from the snapshot,
-// which is imprecise for a durable, possibly-days-later replay - see the
-// "PRECISE `_meta` LOCATIONS" comment in `activationSnapshotLocations`.
-// `StorageNamespaceSnapshot` / `namespaceSnapshots` plumbing stays in
-// `restoreStorageSnapshots` below (always called with `[]` today) so a
-// future genuinely-namespace-scoped need does not have to rebuild it.
+// `snapshotStorageNamespace` (whole-namespace snapshot) and the
+// namespace-delete-list restore path were REMOVED entirely (register id
+// EXIT-JOURNAL-NSDEL-01). The precise per-key `_meta` snapshot in
+// `activationSnapshotLocations` already replaced this mechanism's only
+// legitimate job; this is a subtraction, not a guard added on top of a
+// kept capability. `restoreStorageSnapshots` now restores EXACTLY the
+// precise `{namespace, key}` locations it is given - it never lists or
+// deletes an entire namespace.
 
 async function restoreStorageSnapshots(
   storage: StorageBackend,
-  snapshots: StorageSnapshot[],
-  namespaceSnapshots: StorageNamespaceSnapshot[] = []
+  snapshots: StorageSnapshot[]
 ): Promise<{
   removed: number;
   restored: number;
@@ -2112,36 +2107,7 @@ async function restoreStorageSnapshots(
   let removed = 0;
   let restored = 0;
   const failed: StagedLocation[] = [];
-  for (const namespaceSnapshot of namespaceSnapshots) {
-    const originalKeys = new Set(
-      namespaceSnapshot.entries.map((entry) => entry.key)
-    );
-    try {
-      for (const current of await storage.list(namespaceSnapshot.namespace)) {
-        if (originalKeys.has(current.key)) continue;
-        try {
-          const ok = await storage.delete(
-            namespaceSnapshot.namespace,
-            current.key
-          );
-          if (ok) removed++;
-        } catch {
-          failed.push({
-            namespace: namespaceSnapshot.namespace,
-            key: current.key,
-          });
-        }
-      }
-    } catch {
-      failed.push({ namespace: namespaceSnapshot.namespace, key: "*" });
-    }
-  }
-
-  const allSnapshots = [
-    ...snapshots,
-    ...namespaceSnapshots.flatMap((snapshot) => snapshot.entries),
-  ];
-  for (const snapshot of allSnapshots) {
+  for (const snapshot of snapshots) {
     try {
       if (snapshot.data) {
         await storage.write(snapshot.namespace, snapshot.key, snapshot.data);
@@ -2164,19 +2130,21 @@ interface SerializedStorageSnapshot {
   data: string | null;
 }
 
-interface SerializedStorageNamespaceSnapshot {
-  namespace: string;
-  entries: SerializedStorageSnapshot[];
-}
-
 /**
  * F1 (Exit V2 drill D1, 2026-08-22): the durable record `writeImportJournal`
- * persists and `recoverInterruptedExitImports` replays. Its `snapshots` /
- * `namespace_snapshots` fields are byte-for-byte what `importExitBundle`
- * already computes as `activationSnapshots` / `activationNamespaceSnapshots`
- * before it starts writing - this record is just that same data made
- * durable, so a hard kill and a caught exception roll back through the
- * exact same `restoreStorageSnapshots` call with the exact same input.
+ * persists and `recoverInterruptedExitImports` replays. Its `snapshots`
+ * field is byte-for-byte what `importExitBundle` already computes as
+ * `activationSnapshots` before it starts writing - this record is just
+ * that same data made durable, so a hard kill and a caught exception roll
+ * back through the exact same `restoreStorageSnapshots` call with the
+ * exact same input. `snapshots` names PRECISE `{namespace, key}` locations
+ * only - there is deliberately no whole-namespace form (a prior
+ * `namespace_snapshots` field was REMOVED; register id
+ * EXIT-JOURNAL-NSDEL-01; see `restoreStorageSnapshots`'s doc comment). A
+ * parsed record carrying that field is rejected by
+ * `isWellFormedExitImportJournalRecord` below, not silently ignored, so a
+ * legacy or crafted journal in the old shape routes to `failed` rather
+ * than being partially trusted.
  *
  * UNCONDITIONAL RESTORE (coordinator gate finding, 2026-08-22): recovery
  * writes every snapshotted byte back verbatim with no check that the
@@ -2200,20 +2168,14 @@ interface ExitImportJournalRecord {
   identity_id: string;
   started_at: string;
   snapshots: SerializedStorageSnapshot[];
-  namespace_snapshots: SerializedStorageNamespaceSnapshot[];
 }
 
 /**
- * CONTRACT PIN (AGENTS.md rule 11 / coordinator gate MEDIUM-4, 2026-08-22):
- * `recoverInterruptedExitImports` used to cast a bare `JSON.parse` result
- * straight to `ExitImportJournalRecord` with no shape check - a journal
- * entry that was itself corrupted (`{}`, a non-string `data` field, a
- * missing array) threw a raw TypeError out of `recoverInterruptedExitImports`,
- * which every fortress-open call site awaits directly, so a single
- * malformed journal entry would have crashed fortress open entirely rather
- * than routing to the named, fail-closed `failed` list. This is the ONE
- * shape check every journal entry passes through before its bytes are
- * trusted.
+ * CONTRACT PIN (AGENTS.md rule 11; register id EXIT-JOURNAL-SHAPE-01): the
+ * ONE shape check every journal entry passes through before its bytes are
+ * trusted. A journal entry this function cannot fully vouch for is routed
+ * to the caller's `failed` list - never a crash, and never a silent
+ * partial trust.
  */
 function isWellFormedSerializedStorageSnapshot(
   value: unknown
@@ -2222,43 +2184,39 @@ function isWellFormedSerializedStorageSnapshot(
   const record = value as Record<string, unknown>;
   if (typeof record.namespace !== "string") return false;
   if (typeof record.key !== "string") return false;
-  if (record.data !== null && typeof record.data !== "string") return false;
+  // Codex gate finding (2026-08-22): a `data` string that merely TYPE-checks
+  // is not enough - the lenient `fromBase64url` decoder silently accepts
+  // non-canonical input (stray characters skipped, odd padding tolerated),
+  // so a corrupted or crafted `data` field would decode to SOMETHING rather
+  // than being caught here. Round-trip through the STRICT decoder
+  // (`fromBase64urlStrict`, core/encoding.ts) so any non-canonical string
+  // routes this whole record to `failed`, not a best-effort decode.
+  // `null` (explicit absence - the pre-image did not exist) is distinct
+  // from `""` (the pre-image existed and was zero-length) and both are
+  // valid; only `null` skips the decode check.
+  if (record.data !== null) {
+    if (typeof record.data !== "string") return false;
+    try {
+      fromBase64urlStrict(record.data);
+    } catch {
+      return false;
+    }
+  }
   return true;
 }
 
-function isWellFormedSerializedStorageNamespaceSnapshot(
-  value: unknown
-): value is SerializedStorageNamespaceSnapshot {
-  if (value === null || typeof value !== "object") return false;
-  const record = value as Record<string, unknown>;
-  if (typeof record.namespace !== "string") return false;
-  if (!Array.isArray(record.entries)) return false;
-  return record.entries.every(isWellFormedSerializedStorageSnapshot);
-}
-
 /**
- * CONFINEMENT (Codex gate HIGH finding, 2026-08-22): a journal entry is
- * only ever TRUSTED if every location it names is one `activationSnapshotLocations`
- * could actually have produced for SOME import - the exit staging
- * namespaces (keyed by import id or identity id), `_reputation` (keyed by
- * attestation id), the two named `_meta` keys `StateStore.write` touches,
- * or a non-reserved state namespace (the operator's own data, any key). A
- * journal is read from disk and, short of a MAC, is only as trustworthy as
- * the filesystem it lives on; without this confinement a corrupted or
- * adversarially-written journal entry naming an UNRELATED sensitive
- * location (`_meta/custody-envelope-v1`, an `_audit` entry) would be
- * blindly "restored" by `restoreStorageSnapshots`, which is exactly the
- * kind of write this recovery path must never be tricked into making.
+ * CONFINEMENT (register id EXIT-JOURNAL-CONFINE-01): a journal entry is
+ * only ever trusted if every location it names is one the exit-import
+ * path could actually have produced for SOME import - the exit staging
+ * namespaces, the reputation namespace, the two named `_meta` keys a
+ * state re-key touches, or the operator's own non-reserved state.
  *
- * BOUND: this is a shape/membership check, not an authenticator - it
- * proves a location is the RIGHT KIND of thing an import writes, not that
- * THIS SPECIFIC journal is the one `importExitBundle` actually wrote. A
- * MAC over the journal record, keyed from the master key (mirroring
- * `state-store.ts`'s version-anchor MAC), would close that gap and is not
- * implemented this PR - a filesystem-level write to `_exit_import_journal`
- * already requires the same access an attacker would need to tamper with
- * every other `_exit_*`/`_reputation`/state file this confinement allows
- * touching anyway, so the bound is narrow, but it is a bound, not zero.
+ * CAPABILITY BOUND: this is a shape/membership check, not an
+ * authenticator - it proves a location is the RIGHT KIND of thing an
+ * import writes, not that THIS SPECIFIC journal is the one an import
+ * actually wrote. There is no cryptographic authenticator (MAC) over the
+ * journal record itself; that is not implemented this change.
  */
 function isLocationWithinImportWriteSet(
   namespace: string,
@@ -2294,6 +2252,13 @@ function isWellFormedExitImportJournalRecord(
   if (typeof record.import_id !== "string") return false;
   if (typeof record.identity_id !== "string") return false;
   if (typeof record.started_at !== "string") return false;
+  // HIGH-A (coordinator gate, 2026-08-22): `namespace_snapshots` is no
+  // longer part of this schema (see ExitImportJournalRecord's doc
+  // comment) - a record carrying the key at all, in any shape, is
+  // rejected outright rather than partially trusted or silently ignored.
+  // "in" (not just a truthy/array check) so an explicit `null` or `[]`
+  // value still trips this.
+  if ("namespace_snapshots" in record) return false;
   if (!Array.isArray(record.snapshots)) return false;
   if (!record.snapshots.every(isWellFormedSerializedStorageSnapshot)) return false;
   if (
@@ -2306,24 +2271,6 @@ function isWellFormedExitImportJournalRecord(
   ) {
     return false;
   }
-  if (!Array.isArray(record.namespace_snapshots)) return false;
-  if (
-    !record.namespace_snapshots.every(
-      isWellFormedSerializedStorageNamespaceSnapshot
-    )
-  ) {
-    return false;
-  }
-  if (
-    !record.namespace_snapshots.every((ns) => {
-      const namespaceSnapshot = ns as SerializedStorageNamespaceSnapshot;
-      return namespaceSnapshot.entries.every((entry) =>
-        isLocationWithinImportWriteSet(entry.namespace, entry.key)
-      );
-    })
-  ) {
-    return false;
-  }
   return true;
 }
 
@@ -2333,7 +2280,18 @@ function serializeStorageSnapshot(
   return {
     namespace: snapshot.namespace,
     key: snapshot.key,
-    data: snapshot.data ? toBase64url(snapshot.data) : null,
+    // Codex gate finding (2026-08-22): `!== null`, not truthiness. A
+    // zero-length pre-image (`snapshot.data` is an empty-but-non-null
+    // Uint8Array) base64url-encodes to `""`; a bare `snapshot.data ? ... :
+    // null` ternary here would still take this branch (a Uint8Array
+    // object is always truthy regardless of length), but the SYMMETRIC
+    // deserialize side used to test the resulting `""` string with the
+    // same truthy-style check and collapse it back to `null` - silently
+    // conflating "the pre-image was empty" with "the pre-image was
+    // absent", two different restore actions (write zero bytes vs.
+    // delete the key). Explicit `!== null` on both sides keeps the
+    // distinction intact end to end.
+    data: snapshot.data !== null ? toBase64url(snapshot.data) : null,
   };
 }
 
@@ -2343,16 +2301,12 @@ function deserializeStorageSnapshot(
   return {
     namespace: record.namespace,
     key: record.key,
-    data: record.data ? fromBase64url(record.data) : null,
-  };
-}
-
-function deserializeStorageNamespaceSnapshot(
-  record: SerializedStorageNamespaceSnapshot
-): StorageNamespaceSnapshot {
-  return {
-    namespace: record.namespace,
-    entries: record.entries.map(deserializeStorageSnapshot),
+    // `fromBase64urlStrict`, not the lenient decoder: this is the SAME
+    // string `isWellFormedSerializedStorageSnapshot` already round-tripped
+    // through the strict decoder above, so re-decoding leniently here
+    // would silently reopen the non-canonical-input gap that guard exists
+    // to close.
+    data: record.data !== null ? fromBase64urlStrict(record.data) : null,
   };
 }
 
@@ -2372,18 +2326,13 @@ async function writeImportJournal(
   storage: StorageBackend,
   importId: string,
   identityId: string,
-  snapshots: StorageSnapshot[],
-  namespaceSnapshots: StorageNamespaceSnapshot[]
+  snapshots: StorageSnapshot[]
 ): Promise<void> {
   const record: ExitImportJournalRecord = {
     import_id: importId,
     identity_id: identityId,
     started_at: new Date().toISOString(),
     snapshots: snapshots.map(serializeStorageSnapshot),
-    namespace_snapshots: namespaceSnapshots.map((ns) => ({
-      namespace: ns.namespace,
-      entries: ns.entries.map(serializeStorageSnapshot),
-    })),
   };
   await stageArtifact(storage, EXIT_IMPORT_JOURNAL_NAMESPACE, importId, record);
 }
@@ -2402,12 +2351,12 @@ async function writeImportJournal(
  * syscall: from a crash-consistency standpoint it either fully happens or
  * it doesn't, so the file is always either the last complete journal or
  * gone entirely; there is no third, corrupted state. This is safe because
- * a journal entry's `data` fields are exact copies of bytes this function's
- * caller already read from the fortress's own encrypted-at-rest storage
- * (state entries, reputation attestations, staged identity/policy
- * artifacts are all ciphertext on disk before the journal ever copies
- * them) - the journal introduces no NEW plaintext secret exposure that
- * secure overwrite-on-delete would otherwise protect.
+ * a journal entry's `data` fields are exact copies of bytes already
+ * present at rest in this fortress, in whatever form they are stored
+ * (encrypted for state entries and reputation attestations; plaintext
+ * JSON for the staged exit artifacts, same as they are written by
+ * `stageArtifact` itself) - the journal introduces no NEW exposure beyond
+ * what already sits on disk at those same locations.
  */
 async function deleteImportJournal(
   storage: StorageBackend,
@@ -2460,7 +2409,16 @@ export async function recoverInterruptedExitImports(
   const failed: string[] = [];
   for (const entry of entries) {
     const raw = await storage.read(EXIT_IMPORT_JOURNAL_NAMESPACE, entry.key);
-    if (!raw) continue;
+    // LOW-H (coordinator gate, 2026-08-22): a journal entry `list()`
+    // reports but that reads back `null` (deleted between the list and
+    // the read, or an impossible-but-observed storage inconsistency) is
+    // itself unrecoverable evidence, not "nothing to do" - route it to
+    // `failed` like any other entry this function cannot vouch for,
+    // rather than silently skipping it.
+    if (!raw) {
+      failed.push(entry.key);
+      continue;
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(bytesToString(raw));
@@ -2522,14 +2480,7 @@ export async function recoverInterruptedExitImports(
       continue;
     }
     const snapshots = record.snapshots.map(deserializeStorageSnapshot);
-    const namespaceSnapshots = record.namespace_snapshots.map(
-      deserializeStorageNamespaceSnapshot
-    );
-    const cleanup = await restoreStorageSnapshots(
-      storage,
-      snapshots,
-      namespaceSnapshots
-    );
+    const cleanup = await restoreStorageSnapshots(storage, snapshots);
     if (cleanup.failed.length > 0) {
       failed.push(entry.key);
       continue;
@@ -3446,14 +3397,11 @@ export async function importExitBundle(
       placeholderMetadata ?? null
     )
   );
-  // (coordinator gate HIGH finding, 2026-08-22): NOT a namespace-wide
-  // `_meta` snapshot any more - see the "PRECISE `_meta` LOCATIONS" comment
-  // in `activationSnapshotLocations` above for why. `activationSnapshots`
-  // already carries the two precise `_meta` locations this import can
-  // touch; there is nothing left for a namespace-level snapshot to add, and
-  // keeping it empty is what removes the "delete every unrelated key
-  // written since" imprecision from restore.
-  const activationNamespaceSnapshots: StorageNamespaceSnapshot[] = [];
+  // (coordinator gate HIGH finding, 2026-08-22): there is no
+  // namespace-wide `_meta` snapshot - see the "PRECISE `_meta` LOCATIONS"
+  // comment in `activationSnapshotLocations` above, and the removal note
+  // on `ExitImportJournalRecord`'s doc comment, for why that mechanism was
+  // subtracted entirely rather than kept alongside a guard.
   // F1 (Exit V2 drill D1): make the pre-import snapshot durable BEFORE the
   // `try` block below writes anything. See `writeImportJournal`'s doc
   // comment - this is what lets a hard-killed import be rolled back on the
@@ -3463,8 +3411,7 @@ export async function importExitBundle(
     opts.storage,
     importId,
     manifest.body.identity_binding.identity_id,
-    activationSnapshots,
-    activationNamespaceSnapshots
+    activationSnapshots
   );
   // Track every staged storage location for result telemetry and cleanup
   // accounting. Snapshot restoration below is what preserves overwritten
@@ -3721,8 +3668,7 @@ export async function importExitBundle(
   } catch (err) {
     const cleanup = await restoreStorageSnapshots(
       opts.storage,
-      activationSnapshots,
-      activationNamespaceSnapshots
+      activationSnapshots
     );
     // F1 (Exit V2 drill D1): only clear the durable journal once the
     // in-memory restore above actually finished cleanly. A partial restore
@@ -3750,7 +3696,6 @@ export async function importExitBundle(
         restored_total: cleanup.restored,
         cleanup_failed_count: cleanup.failed.length,
         original_error: err instanceof Error ? err.message : String(err),
-        meta_namespace_snapshotted: true,
       },
       "failure"
     );
@@ -3772,7 +3717,6 @@ export async function importExitBundle(
       `Exit-bundle ${failureKind} failed: ${originalMessage}. ` +
         `Cleanup removed ${cleanup.removed} and restored ${cleanup.restored} of ` +
         `${activationSnapshots.length} snapshotted paths ` +
-        `plus ${activationNamespaceSnapshots.length} snapshotted namespaces ` +
         `(${importedRekeyEntries.length} re-keyed entries plus ${stagedLocations.length} staged artifacts; ` +
         `${cleanup.failed.length} cleanup writes/deletes failed).`;
     if (err instanceof ExitBundleStateImportIncompleteError) {

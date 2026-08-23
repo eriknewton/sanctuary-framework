@@ -19,6 +19,21 @@ import { toBase64url, fromBase64url } from "./encoding.js";
 // diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
 import { describeUntrusted } from "../errors/index.js";
 
+/**
+ * CONTRACT PIN (coordinator gate MEDIUM-B, 2026-08-22): the exact payload
+ * version, algorithm, and IV byte length `decrypt()` below accepts.
+ * Exported so a caller validating an EncryptedPayload BEFORE calling
+ * decrypt() (server/src/exit/verifier.ts `isWellFormedExitStateEntryElement`)
+ * can pin to these SAME values, rather than checking only that a field has
+ * the right TYPE - a well-typed WRONG value (`alg: "aes-128-gcm"`) passed
+ * that check and only failed later, post-staging, misread as a signature
+ * failure. Must match `decrypt()`'s own checks below if either changes.
+ */
+export const SUPPORTED_PAYLOAD_VERSION = 1;
+export const SUPPORTED_PAYLOAD_ALG = "aes-256-gcm" as const;
+/** Exact IV byte length `generateIV()` (core/random.ts) produces and the GCM cipher requires. */
+export const PAYLOAD_IV_BYTE_LENGTH = 12;
+
 /** Encrypted payload structure stored on disk */
 export interface EncryptedPayload {
   /** Format version */
@@ -62,8 +77,8 @@ export function encrypt(
   const ciphertext = cipher.encrypt(plaintext);
 
   return {
-    v: 1,
-    alg: "aes-256-gcm",
+    v: SUPPORTED_PAYLOAD_VERSION,
+    alg: SUPPORTED_PAYLOAD_ALG,
     iv: toBase64url(iv),
     ct: toBase64url(ciphertext),
     ts: new Date().toISOString(),
@@ -89,10 +104,10 @@ export function decrypt(
   if (key.length !== 32) {
     throw new Error("Key must be exactly 32 bytes (256 bits)");
   }
-  if (payload.v !== 1) {
+  if (payload.v !== SUPPORTED_PAYLOAD_VERSION) {
     throw new Error(`Unsupported payload version: ${describeUntrusted(payload.v)}`);
   }
-  if (payload.alg !== "aes-256-gcm") {
+  if (payload.alg !== SUPPORTED_PAYLOAD_ALG) {
     throw new Error(`Unsupported algorithm: ${describeUntrusted(payload.alg)}`);
   }
 

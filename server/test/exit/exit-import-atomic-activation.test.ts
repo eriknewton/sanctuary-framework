@@ -43,7 +43,7 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { toBase64url } from "../../src/core/encoding.js";
+import { toBase64url, stringToBytes } from "../../src/core/encoding.js";
 import { resolveCliMasterKey } from "../../src/core/master-custody.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
 import { createL1Tools } from "../../src/cognitive/tools.js";
@@ -57,6 +57,7 @@ import {
   ExitBundleImportError,
   ExitBundleStateImportIncompleteError,
   recoverInterruptedExitImports,
+  recoverInterruptedExitImportsOrThrow,
   type ExportExitBundleResult,
 } from "../../src/exit/bundle.js";
 
@@ -435,6 +436,62 @@ describe("F1: durable rollback journal - in-process fault injection at each stag
     expect(await destinationStorage.list("atomic-midrekey-ns")).toHaveLength(0);
   });
 
+  it("HIGH-A (coordinator gate, 2026-08-22): a journal carrying namespace_snapshots is rejected outright, never replayed - _meta/_identities stay untouched", async () => {
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+    // Plant real data in _meta and _identities so a wipe would be
+    // directly observable, not just inferred from a count.
+    await destinationStorage.write("_meta", "canary-meta-key", stringToBytes("canary-meta-value"));
+    await destinationStorage.write(
+      "_identities",
+      "canary-identity-key",
+      stringToBytes("canary-identity-value")
+    );
+
+    // The EXACT shape the coordinator's gate reproduced: an empty-entries
+    // namespace_snapshots list naming _meta and _identities.
+    const maliciousRecord = {
+      import_id: "crafted-import",
+      identity_id: "crafted-identity",
+      started_at: new Date().toISOString(),
+      snapshots: [],
+      namespace_snapshots: [
+        { namespace: "_meta", entries: [] },
+        { namespace: "_identities", entries: [] },
+      ],
+    };
+    await destinationStorage.write(
+      EXIT_IMPORT_JOURNAL_NAMESPACE,
+      "crafted-import",
+      stringToBytes(JSON.stringify(maliciousRecord))
+    );
+    // Snapshot AFTER the malicious journal is written, so "before" and
+    // "after" are apples to apples: recovery is expected to leave a
+    // FAILED entry's journal in place (discoverable, not silently
+    // dropped), not remove it.
+    const before = await snapshotAll(destinationStorage);
+
+    const result = await recoverInterruptedExitImports(
+      destinationStorage,
+      destination.auditLog
+    );
+    expect(result.recovered).toBe(0);
+    expect(result.failed).toEqual(["crafted-import"]);
+
+    const after = await snapshotAll(destinationStorage);
+    expect(after).toBe(before);
+    expect(await destinationStorage.read("_meta", "canary-meta-key")).not.toBeNull();
+    expect(
+      await destinationStorage.read("_identities", "canary-identity-key")
+    ).not.toBeNull();
+
+    // The open path stops with the named error rather than silently
+    // proceeding against a fortress it could not fully recover.
+    await expect(
+      recoverInterruptedExitImportsOrThrow(destinationStorage, destination.auditLog)
+    ).rejects.toMatchObject({ code: "INTERRUPTED_IMPORT_RECOVERY_FAILED" });
+  });
+
   it("recoverInterruptedExitImports is a no-op on a fortress with no interrupted import", async () => {
     const destination = await makeDestination();
     const destinationStorage = destination.storage as MemoryStorage;
@@ -755,13 +812,17 @@ describe("F1: a real child-process SIGKILL mid-import leaves the target unable t
       }
       const exitInfo = await exited;
       expect(journalSeen).toBe(true);
-      // MEDIUM (coordinator gate, 2026-08-22): prove the kill actually
-      // used SIGKILL (not, say, a normal exit racing the poll loop) - a
-      // `signal` of anything else means this run's "interrupted" evidence
-      // below is not about a hard kill at all.
-      if (stillRunning) {
-        expect(exitInfo.signal).toBe("SIGKILL");
-      }
+      // LOW-F (coordinator gate, 2026-08-22): unconditional, not gated on
+      // `stillRunning` - if the process had already exited before this
+      // point, everything downstream ("interrupted mid-flight", "SIGKILL
+      // landed") would be an unproven assumption the test was silently
+      // passing on anyway. Asserting `stillRunning` itself is true makes
+      // that assumption a checked precondition, not an implicit one.
+      expect(stillRunning).toBe(true);
+      // Prove the kill actually used SIGKILL (not, say, a normal exit
+      // racing the poll loop) - a `signal` of anything else means this
+      // run's "interrupted" evidence below is not about a hard kill at all.
+      expect(exitInfo.signal).toBe("SIGKILL");
       // MEDIUM (coordinator gate, 2026-08-22): prove REPUTATION writes -
       // not just the journal write - had begun before the kill, so the
       // rollback this test exercises is undoing real per-attestation

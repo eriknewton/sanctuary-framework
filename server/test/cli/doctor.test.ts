@@ -335,6 +335,49 @@ approval_channel:
     expect(out.text()).not.toContain("OK   audit chain");
   });
 
+  it("MEDIUM-D (coordinator gate, 2026-08-22): FAILs with \"interrupted exit import pending recovery\" when a leftover exit-import journal exists", async () => {
+    const fortress = await makeFortress({ identity: true, policy: "valid" });
+    const storage = new FilesystemStorage(join(fortress, "state"));
+    // Read-only check needs no master key; plant a raw journal entry
+    // directly, matching how the exit-import path itself would leave one.
+    await storage.write(
+      "_exit_import_journal",
+      "planted-doctor-import",
+      new TextEncoder().encode(
+        JSON.stringify({
+          import_id: "planted-doctor-import",
+          identity_id: "unknown",
+          started_at: new Date().toISOString(),
+          snapshots: [],
+        }),
+      ),
+    );
+    const out = new Capture();
+    const code = await runDoctorCommand({
+      argv: ["--fortress", fortress],
+      out,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+      platform: "linux",
+    });
+    expect(code).not.toBe(0);
+    expect(out.text()).toContain("FAIL exit import recovery");
+    expect(out.text()).toContain("interrupted exit import pending recovery");
+    expect(out.text()).toContain("recover");
+  });
+
+  it("MEDIUM-D (coordinator gate, 2026-08-22): reports OK for exit import recovery when no journal exists", async () => {
+    const fortress = await makeFortress({ identity: true, policy: "valid", audit: true });
+    const out = new Capture();
+    const code = await runDoctorCommand({
+      argv: ["--fortress", fortress],
+      out,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+      platform: "linux",
+    });
+    expect(code).toBe(0);
+    expect(out.text()).toContain("OK   exit import recovery");
+  });
+
   it("emits JSON shape and exits non-zero when checks fail", async () => {
     const fortress = await makeFortress({ policy: "invalid" });
     const out = new Capture();

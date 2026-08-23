@@ -184,6 +184,12 @@ async function runAnchorCommand(
       // Status needs the master key only to AUTHENTICATE the config; a
       // tampered config must be reported, not summarized.
       masterKey = await resolveMasterKey(storage, opts.values["--passphrase"], env);
+      // Codex gate net-new (2026-08-22): this verb derives a master key
+      // and reads storage but never constructed an AuditLog, so it was
+      // missed by the mechanical fortress-open recovery pin. Construct one
+      // here (cheap) so recovery can run before the read below.
+      const statusAuditLog = new AuditLog(storage, masterKey);
+      await recoverInterruptedExitImportsOrThrow(storage, statusAuditLog);
       const state = await readAnchorConfig({ storage, masterKey });
       const receipts =
         state.status === "absent" ? [] : await readAnchorReceipts(storage);
