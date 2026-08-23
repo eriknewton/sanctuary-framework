@@ -257,10 +257,15 @@ async function checkInterruptedExitImport(storagePath: string): Promise<DoctorCh
       // this FAIL stayed). The internal tracking fragment ("ITEM-3
       // (coordinator gate, 2026-08-22)") that used to prefix this text is
       // removed per the same finding: it is not guidance, just noise on
-      // an operator's screen.
-      `run \`sanctuary exit ${EXIT_RECOVERY_VERB}\` to recover. If that ` +
-        "itself reports the journal could not be safely rolled back, this " +
-        "needs operator intervention: inspect the journal entries directly " +
+      // an operator's screen. Round-3: `recover` takes a REQUIRED
+      // `--fortress <path>` with no ambient fallback, so this hint
+      // interpolates the ACTUAL `storagePath` this check already has -
+      // the one hint site in the codebase that can, since every other
+      // site throws from inside library code with no path string handy.
+      `run \`sanctuary exit ${EXIT_RECOVERY_VERB} --fortress ${storagePath}\` ` +
+        "to recover. If that itself reports the journal could not be " +
+        "safely rolled back, this needs operator intervention: inspect " +
+        "the journal entries directly " +
         "under <fortress state path>/_exit_import_journal, confirm which " +
         "value at the affected location is the one you want to keep, and " +
         "only then remove the journal entry - do not remove it first.",

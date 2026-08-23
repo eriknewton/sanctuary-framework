@@ -80,9 +80,12 @@ export class InterruptedExitImportPendingError extends Error {
     super(
       `Refusing to write (${context}): an exit-import rollback journal exists ` +
         "for this fortress, meaning an import is in progress or pending " +
-        // F1: must name EXIT_RECOVERY_VERB, defined above in this same file.
-        `recovery. Run \`sanctuary exit ${EXIT_RECOVERY_VERB}\` to recover, ` +
-        "then retry."
+        // F1/round-3: must name EXIT_RECOVERY_VERB (defined above in this
+        // same file) AND the exact "--fortress <fortress path>" form -
+        // recover takes no ambient path (exit/cli.ts's
+        // ExitRecoverFortressPathRequiredError).
+        `recovery. Run \`sanctuary exit ${EXIT_RECOVERY_VERB} --fortress ` +
+        "<fortress path>` to recover, then retry."
     );
     this.name = "InterruptedExitImportPendingError";
   }
@@ -169,9 +172,12 @@ export async function withExitAdmissionLock<T>(
       throw new ExitAdmissionLockError(
         `refusing to proceed (${owner}): another exit-import or master-rotation ` +
           "operation holds the admission lock for this fortress, or a prior " +
-          // F1: must name EXIT_RECOVERY_VERB, defined above in this same file.
-          `holder crashed while holding it. Run \`sanctuary exit ${EXIT_RECOVERY_VERB}\` ` +
-          "to recover, then retry. If no other " +
+          // F1/round-3: must name EXIT_RECOVERY_VERB (defined above in
+          // this same file) AND the exact "--fortress <fortress path>"
+          // form - recover takes no ambient path (exit/cli.ts's
+          // ExitRecoverFortressPathRequiredError).
+          `holder crashed while holding it. Run \`sanctuary exit ${EXIT_RECOVERY_VERB} ` +
+          "--fortress <fortress path>` to recover, then retry. If no other " +
           "Sanctuary operation is actually running against this fortress, " +
           "inspect the lock directly under <fortress state path>/" +
           `${EXIT_IMPORT_JOURNAL_NAMESPACE}/${EXIT_ADMISSION_LOCK_FILE} before ` +

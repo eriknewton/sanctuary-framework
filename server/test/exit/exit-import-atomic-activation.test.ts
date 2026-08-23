@@ -1670,8 +1670,10 @@ describe("HIGH-B (coordinator gate, 2026-08-22): fortress-wide exit-admission lo
     // `sanctuary exit recover` (EXIT_RECOVERY_VERB), not `sanctuary exit
     // verify` - verify never opened the local fortress, so the old hint
     // sent an operator to a verb that could not clear this condition.
+    // Round-3: also names the required `--fortress <fortress path>` form
+    // (recover takes no ambient path).
     await expect(recoverInterruptedExitImports(storage, auditLog)).rejects.toThrow(
-      /Run `sanctuary exit recover` to recover, then retry\. If no other Sanctuary operation is actually running .* inspect the lock directly .* before removing it - do not remove it first/
+      /Run `sanctuary exit recover --fortress <fortress path>` to recover, then retry\. If no other Sanctuary operation is actually running .* inspect the lock directly .* before removing it - do not remove it first/
     );
 
     // The lock file itself is untouched by the failed acquire attempt (no

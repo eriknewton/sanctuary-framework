@@ -4139,10 +4139,13 @@ export async function importExitBundle(
   if (await hasInterruptedExitImport(opts.storage)) {
     throw new ExitBundleImportError(
       "CONCURRENT_IMPORT_IN_PROGRESS",
-      // F1: must match EXIT_RECOVERY_VERB, imported above from
-      // storage/exit-import-journal.ts (re-exported by this file).
+      // F1/round-3: must match EXIT_RECOVERY_VERB, imported above from
+      // storage/exit-import-journal.ts (re-exported by this file), AND
+      // the exact "--fortress <fortress path>" form - recover takes no
+      // ambient path (exit/cli.ts's ExitRecoverFortressPathRequiredError).
       `another exit-import journal already exists for this fortress; run ` +
-        `\`sanctuary exit ${EXIT_RECOVERY_VERB}\` to recover, then retry`
+        `\`sanctuary exit ${EXIT_RECOVERY_VERB} --fortress <fortress path>\` ` +
+        "to recover, then retry"
     );
   }
   await writeImportJournal(

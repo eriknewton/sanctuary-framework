@@ -6,7 +6,7 @@
  */
 
 import { createReadStream, openSync } from "node:fs";
-import { access, readFile as fsReadFile, mkdir } from "node:fs/promises";
+import { access, readFile as fsReadFile, mkdir, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { FilesystemStorage } from "../storage/filesystem.js";
@@ -15,7 +15,6 @@ import { StateStore } from "../cognitive/state-store.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { ReputationStore } from "../reputation/reputation-store.js";
 import { loadConfig } from "../config.js";
-import { resolveStoragePath } from "../paths.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "../principal-policy/loader.js";
 import {
   resolveCliMasterKey,
@@ -31,6 +30,7 @@ import {
   ExitBundleStateImportIncompleteError,
   recoverInterruptedExitImportsOrThrow,
   EXIT_RECOVERY_VERB,
+  EXIT_IMPORT_JOURNAL_NAMESPACE,
   type ImportExitBundleResult,
 } from "./bundle.js";
 import type {
@@ -327,6 +327,25 @@ export class ExitRecoverLegacyMigrationRequiredError extends Error {
 }
 
 /**
+ * Round-3 fix (independent gate on #1304, HIGH). `--fortress` is the ONLY
+ * source of the path `recover` operates against, and it is REQUIRED - no
+ * ambient fallback of any kind. Same flag name `sanctuary doctor` uses.
+ */
+export class ExitRecoverFortressPathRequiredError extends Error {
+  constructor() {
+    super(
+      `sanctuary exit ${EXIT_RECOVERY_VERB} requires --fortress <path>: ` +
+        "the path to the fortress to check. This verb never reads " +
+        "sanctuary.json and never consults SANCTUARY_STORAGE_PATH; name " +
+        "the fortress explicitly, the same way `sanctuary doctor " +
+        "--fortress <path>` does. Example: `sanctuary exit " +
+        `${EXIT_RECOVERY_VERB} --fortress ~/.sanctuary\``
+    );
+    this.name = "ExitRecoverFortressPathRequiredError";
+  }
+}
+
+/**
  * F1 fix-round (independent gate on #1304, HIGH): `recover`'s OWN open
  * path, deliberately NOT `openExitContext` above. `openExitContext` always
  * passes `bootstrap: true` to `resolveCliMasterKey`, and `establishMaster`
@@ -354,6 +373,19 @@ export class ExitRecoverLegacyMigrationRequiredError extends Error {
  * above `recoverInterruptedExitImportsOrThrow` performs a write, so the
  * admission lock it acquires genuinely gates every possible one.
  *
+ * Round-3 fix (independent gate on #1304, HIGH): the path itself is now
+ * `--fortress` ONLY (see `ExitRecoverFortressPathRequiredError` above) -
+ * the round-2 fix's `resolveStoragePath(env)` (SANCTUARY_STORAGE_PATH,
+ * else the default `~/.sanctuary`) still diverged from what other `exit`
+ * verbs resolve to whenever the operator's fortress path lives ONLY in
+ * `sanctuary.json`'s own `storage_path` key, since those verbs' shared
+ * `loadConfig()` DOES read that key. Removing the ambient resolution
+ * entirely (rather than trying to replicate that one config field
+ * read-only) means there is no path source left to diverge from, and the
+ * round-2 fix (never triggering `quarantineConfigFile`) now holds by
+ * construction - there is no `sanctuary.json` read anywhere in this
+ * function to regress.
+ *
  * Deliberately does NOT load IdentityManager or construct ReputationStore:
  * `recover` needs neither, and skipping them removes any question of
  * whether their own load paths could write (see
@@ -368,23 +400,10 @@ async function openFortressForRecoveryOnly(
   const passphrase =
     flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
   const recoveryKey = env.SANCTUARY_RECOVERY_KEY;
-  // Round-2 fix (independent gate on #1304, HIGH): deliberately NOT
-  // `loadConfig()`. `loadConfig` reads and parses `sanctuary.json`, and on
-  // a malformed or schema-incompatible file it calls `quarantineConfigFile`
-  // (config.ts), which RENAMES that file - a write, reachable before any
-  // lock, even while another process holds the admission lock this
-  // function is supposed to defer to. `resolveStoragePath` (paths.ts) is
-  // the same SANCTUARY_STORAGE_PATH-then-default precedence every `exit`
-  // verb resolves to in the common case (no verb passes an explicit
-  // config path), and it never touches `sanctuary.json` at all - the
-  // config file's OTHER settings (dashboard port, etc.) are irrelevant to
-  // rolling back a journal, so this function has no legitimate reason to
-  // read it. BOUND: an operator whose sanctuary.json declares a
-  // storage_path different from the directory the file itself lives in
-  // (an unusual, self-referential setup) resolves to a different fortress
-  // here than other verbs would - the read-only envelope peek below still
-  // fails safe in that case (refuses by name; never guesses).
-  const storagePath = resolveStoragePath(env);
+  const storagePath = flagValue(argv, "--fortress");
+  if (!storagePath) {
+    throw new ExitRecoverFortressPathRequiredError();
+  }
   const stateStoragePath = join(storagePath, "state");
   const storage = new FilesystemStorage(stateStoragePath);
 
@@ -418,6 +437,38 @@ async function openFortressForRecoveryOnly(
       throw new ExitRecoverLegacyMigrationRequiredError();
     }
     throw new ExitRecoverNoFortressError(storagePath);
+  }
+
+  // LOW (round-3 fix, independent gate on #1304): `withPathLock`
+  // (storage/cross-process-lock.ts) mkdirs the lock's namespace directory
+  // BEFORE attempting the O_EXCL acquire, so even a lock attempt that
+  // immediately releases (a no-op recovery) leaves a brand-new, empty
+  // `_exit_import_journal` directory behind on a fortress that never had
+  // one - a tree change from a command whose entire point is "did
+  // anything need rolling back". Checked here, read-only, BEFORE
+  // resolving a master key at all: a journal-set write is the ONLY thing
+  // that ever creates this directory (`writeImportJournal`,
+  // exit/bundle.ts; the admission lock file itself also lives inside it,
+  // so a fortress with no directory cannot have a held lock either), so
+  // its absence means there is genuinely nothing to recover and nothing
+  // to contend with - skip locking entirely rather than create-then-
+  // release it. BOUND: this covers only the empty-namespace case; once
+  // the directory exists (any journal-set write ever happened here),
+  // `withPathLock`'s own mkdir may still create files inside an
+  // already-existing tree on a no-op recovery. That machinery belongs to
+  // cross-process-lock.ts and is not touched here.
+  const journalDir = storage.namespacePath(EXIT_IMPORT_JOURNAL_NAMESPACE);
+  try {
+    await stat(journalDir);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return { recovered: 0 };
+    }
+    throw error;
   }
 
   let masterKey: Uint8Array;
@@ -456,17 +507,22 @@ Commands:
   inspect <dir>               Read-only: what the bundle carries and WHICH
                               credential it DECLARES it needs. No passphrase,
                               no writes, and no import is attempted.
-  recover                     Open THIS fortress (not a bundle directory) and
+  recover --fortress <path>   Open THIS fortress (not a bundle directory) and
                               roll back any interrupted exit-import journal
                               entry left by a killed import, rotation, or
-                              resume. Needs fortress credentials same as
-                              export/import. Mutates nothing beyond finishing
-                              that rollback; safe to run when there is
-                              nothing to recover. Refuses (never creates or
-                              migrates custody) if no fortress exists yet,
-                              or if the fortress still uses pre-envelope
-                              legacy custody - run export/import or a normal
-                              Sanctuary operation first in either case.
+                              resume. --fortress is REQUIRED: this verb
+                              never reads sanctuary.json and never
+                              consults SANCTUARY_STORAGE_PATH (the same
+                              flag "sanctuary doctor --fortress <path>"
+                              uses). Also needs fortress credentials same
+                              as export/import. Mutates nothing beyond
+                              finishing that rollback; safe to run when
+                              there is nothing to recover. Refuses (never
+                              creates or migrates custody) if no fortress
+                              exists at that path, or if it still uses
+                              pre-envelope legacy custody - run
+                              export/import or a normal Sanctuary
+                              operation first in either case.
 
 Options:
   --passphrase <value>              Current destination/source passphrase
@@ -701,7 +757,9 @@ export async function runExitCommand(args: ExitCommandArgs): Promise<number> {
     // already exists, so the exit-admission lock it acquires internally
     // (recoverInterruptedExitImportsOrThrow -> withExitAdmissionLock) gates
     // every possible write, not just the ones after mkdir/master-key
-    // resolution.
+    // resolution. Round-3 fix: `--fortress <path>` is REQUIRED (no
+    // SANCTUARY_STORAGE_PATH/sanctuary.json fallback of any kind) - see
+    // ExitRecoverFortressPathRequiredError above for why.
     if (command === EXIT_RECOVERY_VERB) {
       const { recovered } = await openFortressForRecoveryOnly(argv, env);
       if (json) {

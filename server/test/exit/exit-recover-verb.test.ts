@@ -11,20 +11,28 @@
  * interrupted import stayed on disk (transcript: verify printed PASS
  * twice, the journal entry stayed on disk, doctor still failed).
  *
- * HIGH fix round (independent gate on #1304): the first cut of `recover`
- * opened via `openExitContext`, which always passed `bootstrap: true` to
- * `resolveCliMasterKey`. `establishMaster` can mint a brand-new custody
- * envelope on a virgin fortress via that flag, or migrate a legacy
- * (pre-envelope) fortress to an envelope regardless of that flag (the
- * legacy branches key off `_meta` markers, not `firstRun`) - both real
- * writes, and both happened before the exit-admission lock was ever
- * acquired. `recover` now opens through a dedicated
- * `openFortressForRecoveryOnly` that peeks at custody read-only first and
- * refuses by name - never bootstrapping or migrating - when no envelope is
- * present. This file's no-diff tests below snapshot the fortress directory
- * tree before and after a refused `recover` attempt and assert
- * byte-identical, which is what actually exercises this distinction - a
- * plain "did it print the right message" assertion alone would not.
+ * Round-3 fix (independent gate on #1304, HIGH; a SUBTRACTION, not a
+ * patch): the round-1/round-2 cuts of `recover` resolved the fortress
+ * path AMBIENTLY (`openExitContext`'s `loadConfig()`, then round 2's
+ * `resolveStoragePath(env)`), and every ambient resolver diverges from
+ * what OTHER `exit` verbs resolve to whenever the operator's fortress
+ * path lives ONLY in `sanctuary.json`'s own `storage_path` key (proven
+ * generally by test/unit/config-storage-path-divergence.test.ts). `recover`
+ * now takes a REQUIRED `--fortress <path>` (the same flag name `sanctuary
+ * doctor` uses) and reads no config file and no env var for the path at
+ * all - there is no ambient source left to diverge from. This file's
+ * no-diff tests snapshot the fortress directory tree before and after a
+ * refused `recover` attempt and assert byte-identical, which is what
+ * actually exercises "refuses without mutating" - a plain "did it print
+ * the right message" assertion alone would not.
+ *
+ * Round-3 fix (LOW): `withPathLock` (storage/cross-process-lock.ts) mkdirs
+ * the lock's namespace directory before attempting the O_EXCL acquire, so
+ * even a no-op recovery used to leave a brand-new, empty
+ * `_exit_import_journal` directory behind. `recover` now checks (read-only)
+ * whether that directory exists before resolving a master key or locking
+ * at all; if it does not, there is genuinely nothing to recover and it
+ * returns without touching the lock machinery.
  *
  * This file proves the fix is actually WIRED, not just documented:
  *  - `recover` is dispatched by `runExitCommand` and opens THIS fortress
@@ -32,6 +40,9 @@
  *    `recoverInterruptedExitImportsOrThrow` runs with the standard
  *    admission-lock handling (a real planted journal entry is rolled
  *    back, not just a documented promise that it would be);
+ *  - it refuses when `--fortress` is missing, even when
+ *    SANCTUARY_STORAGE_PATH points at a real fortress (proving the flag is
+ *    the ONLY path source, not merely an additional one);
  *  - it refuses while a live admission lock is held, exactly like
  *    export/import already do (same lock, same file), with NOTHING new
  *    on disk across the attempt;
@@ -41,10 +52,13 @@
  *  - it refuses on a legacy (pre-envelope) fortress rather than silently
  *    migrating it, naming the verb that legitimately performs that
  *    migration, with NOTHING new on disk;
+ *  - it reports "nothing to recover" on a fortress with no journal
+ *    directory at all, with NOTHING new on disk (the LOW fix);
  *  - every hint that used to hardcode `sanctuary exit verify` as the
  *    recovery verb now interpolates the ONE shared `EXIT_RECOVERY_VERB`
- *    constant, so this file also greps the known hint sites for the
- *    stale literal and fails if it ever reappears.
+ *    constant AND the exact `--fortress <fortress path>` form, so this
+ *    file also greps the known hint sites for both the stale literal and
+ *    the required flag.
  */
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -136,11 +150,10 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
       const out = new StringWritable();
       const err = new StringWritable();
       const code = await runExitCommand({
-        argv: [EXIT_RECOVERY_VERB],
+        argv: [EXIT_RECOVERY_VERB, "--fortress", tempFortress.storagePath],
         out,
         err,
         env: {
-          SANCTUARY_STORAGE_PATH: tempFortress.storagePath,
           SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
         },
       });
@@ -153,7 +166,42 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
     }
   });
 
-  it("HIGH fix (independent gate on #1304): refuses on a fresh/virgin fortress (no custody envelope, no legacy markers) and creates NOTHING on disk (no-diff)", async () => {
+  it("HIGH fix (round 3, independent gate on #1304): refuses when --fortress is missing, ignoring SANCTUARY_STORAGE_PATH even when it names a real fortress, and creates NOTHING on disk (no-diff)", async () => {
+    const tempFortress = await createTempFortress("sanctuary-recover-missing-flag-nodiff");
+    try {
+      // A REAL, bootstrapped fortress at the ambient path - so a pass
+      // here can only be explained by --fortress genuinely being the
+      // sole path source, not by there merely being nothing to find.
+      await bootstrapFortress(tempFortress.storagePath);
+      const before = await snapshotTree(tempFortress.storagePath);
+
+      const out = new StringWritable();
+      const err = new StringWritable();
+      const code = await runExitCommand({
+        argv: [EXIT_RECOVERY_VERB], // no --fortress
+        out,
+        err,
+        env: {
+          // Deliberately present and pointed at a REAL fortress: this
+          // must be ignored. The round-2 cut would have used it via
+          // resolveStoragePath(env) and this test would then observe
+          // "nothing to recover" (code 0) instead of a refusal.
+          SANCTUARY_STORAGE_PATH: tempFortress.storagePath,
+          SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
+        },
+      });
+      const after = await snapshotTree(tempFortress.storagePath);
+      expect(after).toBe(before);
+      expect(code).not.toBe(0);
+      expect(err.text).toContain(`sanctuary exit ${EXIT_RECOVERY_VERB} requires --fortress <path>`);
+      expect(err.text).toContain("never reads sanctuary.json");
+      expect(err.text).toContain("never consults SANCTUARY_STORAGE_PATH");
+    } finally {
+      await tempFortress.cleanup();
+    }
+  });
+
+  it("HIGH fix: refuses on a fresh/virgin fortress (no custody envelope, no legacy markers) and creates NOTHING on disk (no-diff)", async () => {
     const tempFortress = await createTempFortress("sanctuary-recover-fresh-nodiff");
     try {
       const before = await snapshotTree(tempFortress.storagePath);
@@ -162,11 +210,10 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
       const out = new StringWritable();
       const err = new StringWritable();
       const code = await runExitCommand({
-        argv: [EXIT_RECOVERY_VERB],
+        argv: [EXIT_RECOVERY_VERB, "--fortress", tempFortress.storagePath],
         out,
         err,
         env: {
-          SANCTUARY_STORAGE_PATH: tempFortress.storagePath,
           SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
         },
       });
@@ -203,11 +250,10 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
       const out = new StringWritable();
       const err = new StringWritable();
       const code = await runExitCommand({
-        argv: [EXIT_RECOVERY_VERB],
+        argv: [EXIT_RECOVERY_VERB, "--fortress", tempFortress.storagePath],
         out,
         err,
         env: {
-          SANCTUARY_STORAGE_PATH: tempFortress.storagePath,
           SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
         },
       });
@@ -257,11 +303,10 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
       const out = new StringWritable();
       const err = new StringWritable();
       const code = await runExitCommand({
-        argv: [EXIT_RECOVERY_VERB],
+        argv: [EXIT_RECOVERY_VERB, "--fortress", tempFortress.storagePath],
         out,
         err,
         env: {
-          SANCTUARY_STORAGE_PATH: tempFortress.storagePath,
           SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
         },
       });
@@ -294,17 +339,19 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
       await handle.close();
 
       // Snapshot AFTER bootstrap/lock-plant setup - the window under test
-      // is only the recover ATTEMPT itself.
+      // is only the recover ATTEMPT itself. The journal directory already
+      // exists here (the lock plant created it), so the LOW fix's
+      // no-journal-dir fast path does not apply - this exercises the
+      // ordinary lock-contention refusal.
       const before = await snapshotTree(tempFortress.storagePath);
 
       const out = new StringWritable();
       const err = new StringWritable();
       const code = await runExitCommand({
-        argv: [EXIT_RECOVERY_VERB],
+        argv: [EXIT_RECOVERY_VERB, "--fortress", tempFortress.storagePath],
         out,
         err,
         env: {
-          SANCTUARY_STORAGE_PATH: tempFortress.storagePath,
           SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
         },
       });
@@ -326,11 +373,11 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
 
       // `loadConfig` (server/src/config.ts) renames a malformed
       // sanctuary.json to `<path>.corrupted.<timestamp>` via
-      // `quarantineConfigFile` - a write `recover` must never trigger,
-      // whether or not it also happens to refuse for another reason
-      // (here: a held admission lock). Deliberately invalid JSON, not a
-      // schema mismatch, so the OLD (pre-round-2) code would have hit
-      // `loadConfig`'s SyntaxError->quarantine branch specifically.
+      // `quarantineConfigFile` - a write `recover` must never trigger.
+      // Round 3 removed the only call to `loadConfig` (and to
+      // `resolveStoragePath`) from `openFortressForRecoveryOnly`
+      // entirely, so this is now true by construction rather than by an
+      // ordering argument; this test remains as the regression pin.
       await writeFile(
         join(tempFortress.storagePath, "sanctuary.json"),
         "{ this is not valid json"
@@ -355,11 +402,10 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
       const out = new StringWritable();
       const err = new StringWritable();
       const code = await runExitCommand({
-        argv: [EXIT_RECOVERY_VERB],
+        argv: [EXIT_RECOVERY_VERB, "--fortress", tempFortress.storagePath],
         out,
         err,
         env: {
-          SANCTUARY_STORAGE_PATH: tempFortress.storagePath,
           SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
         },
       });
@@ -378,21 +424,31 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
     }
   });
 
-  it("reports 'nothing to recover' on an already-bootstrapped fortress with no interrupted import", async () => {
-    const tempFortress = await createTempFortress("sanctuary-recover-bootstrapped-empty");
+  it("LOW fix (round 3, independent gate on #1304): reports 'nothing to recover' on a bootstrapped fortress with NO journal directory at all, and creates NOTHING new on disk (no-diff)", async () => {
+    const tempFortress = await createTempFortress("sanctuary-recover-no-journal-dir-nodiff");
     try {
       await bootstrapFortress(tempFortress.storagePath);
+      // Custody establishment touches only `_meta`; the exit-import
+      // journal namespace directory genuinely does not exist yet.
+      const before = await snapshotTree(tempFortress.storagePath);
+      expect(before).not.toContain("_exit_import_journal");
 
       const out = new StringWritable();
       const code = await runExitCommand({
-        argv: [EXIT_RECOVERY_VERB],
+        argv: [EXIT_RECOVERY_VERB, "--fortress", tempFortress.storagePath],
         out,
         err: new StringWritable(),
         env: {
-          SANCTUARY_STORAGE_PATH: tempFortress.storagePath,
           SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
         },
       });
+      // Tree-diff FIRST; see the fresh-fortress test above for why. This
+      // is the LOW fix's own proof: withPathLock's mkdir-before-O_EXCL
+      // would otherwise leave a new, empty `_exit_import_journal`
+      // directory behind on exactly this fortress shape.
+      const after = await snapshotTree(tempFortress.storagePath);
+      expect(after).toBe(before);
+      expect(after).not.toContain("_exit_import_journal");
       expect(code).toBe(0);
       expect(out.text).toContain("nothing to recover");
     } finally {
@@ -400,18 +456,17 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
     }
   });
 
-  it("--json mode: 'nothing to recover' reports {recovered: 0}", async () => {
-    const tempFortress = await createTempFortress("sanctuary-recover-bootstrapped-empty-json");
+  it("--json mode: 'nothing to recover' (no journal directory) reports {recovered: 0}", async () => {
+    const tempFortress = await createTempFortress("sanctuary-recover-no-journal-dir-json");
     try {
       await bootstrapFortress(tempFortress.storagePath);
 
       const out = new StringWritable();
       const code = await runExitCommand({
-        argv: [EXIT_RECOVERY_VERB, "--json"],
+        argv: [EXIT_RECOVERY_VERB, "--fortress", tempFortress.storagePath, "--json"],
         out,
         err: new StringWritable(),
         env: {
-          SANCTUARY_STORAGE_PATH: tempFortress.storagePath,
           SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
         },
       });
@@ -431,7 +486,9 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
       // EMPTY snapshot list, so restoring it is a trivial no-op success
       // (recovered++, no actual data to roll back) - this test's property
       // is that `recover` REACHES and CLEARS the journal, not the
-      // snapshot-restore machinery itself (covered elsewhere).
+      // snapshot-restore machinery itself (covered elsewhere). Writing
+      // the entry also creates the journal directory, so the LOW fix's
+      // no-journal-dir fast path does not short-circuit this test.
       const importId = "planted-recover-verb-import";
       const journalRecord = {
         import_id: importId,
@@ -448,11 +505,10 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
 
       const out = new StringWritable();
       const code = await runExitCommand({
-        argv: [EXIT_RECOVERY_VERB],
+        argv: [EXIT_RECOVERY_VERB, "--fortress", tempFortress.storagePath],
         out,
         err: new StringWritable(),
         env: {
-          SANCTUARY_STORAGE_PATH: tempFortress.storagePath,
           SANCTUARY_PASSPHRASE: TEST_PASSPHRASE,
         },
       });
@@ -466,13 +522,14 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
     }
   });
 
-  it("printExitHelp documents the recover verb", () => {
+  it("printExitHelp documents the recover verb and its required --fortress flag", () => {
     const out = new StringWritable();
     printExitHelp(out);
-    expect(out.text).toContain(`  ${EXIT_RECOVERY_VERB}`);
+    expect(out.text).toContain(`  ${EXIT_RECOVERY_VERB} --fortress <path>`);
+    expect(out.text).toContain("REQUIRED");
   });
 
-  it("STRUCTURAL PIN: every known recovery-hint source file interpolates EXIT_RECOVERY_VERB and none hardcodes the stale 'sanctuary exit verify ... to recover' literal", async () => {
+  it("STRUCTURAL PIN (parity): every known recovery-hint source file interpolates EXIT_RECOVERY_VERB, names the required --fortress flag, and none hardcodes the stale 'sanctuary exit verify ... to recover' literal", async () => {
     const HINT_FILES = [
       "src/storage/exit-import-journal.ts",
       "src/cli/doctor.ts",
@@ -485,10 +542,30 @@ describe("sanctuary exit recover (F1, Exit V2 D1 operator finding, 2026-08-23)",
       expect(source, `${relPath} must import/reference EXIT_RECOVERY_VERB`).toContain(
         "EXIT_RECOVERY_VERB"
       );
+      // Round-3 parity: the hint text and the dispatch must agree that
+      // --fortress is required - a hint naming the verb without the flag
+      // sends an operator to a command that will itself refuse.
+      expect(
+        source,
+        `${relPath} must name the required --fortress flag in its recovery hint`
+      ).toContain("--fortress");
       expect(
         source,
         `${relPath} must not hardcode the stale "sanctuary exit verify ... to recover" hint`
       ).not.toMatch(/sanctuary exit verify[\s\S]{0,40}to recover/);
     }
+  });
+
+  it("STRUCTURAL PIN (parity): doctor's hint interpolates the ACTUAL storagePath it already has, not a placeholder", async () => {
+    const source = await readFile(
+      join(__dirname, "../../src/cli/doctor.ts"),
+      "utf8"
+    );
+    // The one hint site with a real path in scope substitutes it; every
+    // other hint site (deep library code with no path string handy) uses
+    // the literal placeholder "<fortress path>" instead (checked via the
+    // behavioral no-diff/refusal tests above, which read the real error
+    // text those sites produce).
+    expect(source).toContain("--fortress ${storagePath}");
   });
 });
