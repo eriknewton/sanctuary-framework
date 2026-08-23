@@ -478,6 +478,134 @@ describe("memory file CLI: fortress-backed round trip", () => {
     ]);
   }, 60_000);
 
+  describe("Rung-1 point 3: --allow-file classifier override", () => {
+    const SECRET_VALUE = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE";
+
+    async function refusedFixture(prefix: string): Promise<string> {
+      const source = await copyFixtureSet("basic", prefix);
+      await writeFile(
+        join(source, "note-with-secret.md"),
+        `# Ops note\n\nSANCTUARY_RECOVERY_KEY=${SECRET_VALUE}\n`,
+      );
+      return source;
+    }
+
+    it("refuses without the flag and ingests with it, naming the audited override", async () => {
+      const refusedSource = await refusedFixture("memfile-cli-allow-file-baseline");
+      const refusedOut = makeSink();
+      const refusedErr = makeSink();
+      const refusedCode = await runMemoryIngestCommand({
+        argv: ["--harness", "claude-code", "--dir", refusedSource, "--fortress", fortress],
+        out: refusedOut.stream,
+        err: refusedErr.stream,
+        env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      });
+      expect(refusedCode).toBe(0);
+      expect(refusedOut.text()).toContain("ingested 3 of 4 Claude Code memory files");
+      expect(refusedErr.text()).toContain("the mirror is INCOMPLETE");
+
+      const overriddenSource = await refusedFixture("memfile-cli-allow-file-overridden");
+      const out = makeSink();
+      const err = makeSink();
+      const code = await runMemoryIngestCommand({
+        argv: [
+          "--harness", "claude-code",
+          "--dir", overriddenSource,
+          "--fortress", fortress,
+          "--allow-file", "note-with-secret.md",
+        ],
+        out: out.stream,
+        err: err.stream,
+        env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      });
+
+      expect(code).toBe(0);
+      expect(out.text()).toContain("ingested 4 of 4 Claude Code memory files");
+      // Reported as overridden, never as a refusal, and the mirror is complete.
+      expect(err.text()).not.toContain("the mirror is INCOMPLETE");
+      expect(out.text()).toContain("1 file(s) were overridden");
+      expect(out.text()).toContain(
+        "overridden note-with-secret.md: looks like a labeled Sanctuary recovery key value (line 3)",
+      );
+      // F2/MUST-NEVER #9 discipline: the secret never appears anywhere printed.
+      expect(out.text()).not.toContain(SECRET_VALUE);
+      expect(err.text()).not.toContain(SECRET_VALUE);
+
+      const entries = await auditEntries();
+      const overrideEntry = entries.find(
+        (entry) => entry.operation === "memory_ingest_classifier_override",
+      );
+      expect(overrideEntry).toBeDefined();
+      expect(overrideEntry!.details).toMatchObject({
+        harness: "claude-code",
+        source_path: "note-with-secret.md",
+        reason: "classifier_reject",
+        detector: "labeled_recovery_key",
+        line: 3,
+      });
+      expect(JSON.stringify(entries)).not.toContain(SECRET_VALUE);
+
+      const outcomeEntry = entries.find((entry) => entry.operation === "memory_ingest" && entry.details.source_dir === overriddenSource)!;
+      expect(outcomeEntry.details).toMatchObject({
+        committed_file_count: 4,
+        skipped_file_count: 0,
+        overridden_file_count: 1,
+        unused_allow_files: [],
+        complete: true,
+      });
+    }, 60_000);
+
+    it("reports an allow-listed path the classifier never refused as unused", async () => {
+      const source = await copyFixtureSet("basic", "memfile-cli-allow-file-unused");
+      const out = makeSink();
+      const err = makeSink();
+      const code = await runMemoryIngestCommand({
+        argv: [
+          "--harness", "claude-code",
+          "--dir", source,
+          "--fortress", fortress,
+          "--allow-file", "concise-updates.md",
+        ],
+        out: out.stream,
+        err: err.stream,
+        env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      });
+
+      expect(code).toBe(0);
+      expect(err.text()).toContain(
+        "--allow-file named 1 path(s) the classifier never refused (nothing was waived): concise-updates.md",
+      );
+      const entries = await auditEntries();
+      expect(
+        entries.some((entry) => entry.operation === "memory_ingest_classifier_override"),
+      ).toBe(false);
+    }, 60_000);
+
+    it("fails closed with a denial when an allow-listed path is absent from the source directory", async () => {
+      const source = await copyFixtureSet("basic", "memfile-cli-allow-file-unknown");
+      const out = makeSink();
+      const err = makeSink();
+      const code = await runMemoryIngestCommand({
+        argv: [
+          "--harness", "claude-code",
+          "--dir", source,
+          "--fortress", fortress,
+          "--allow-file", "does-not-exist.md",
+        ],
+        out: out.stream,
+        err: err.stream,
+        env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      });
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("memory_ingest failed");
+      expect(out.text()).toBe("");
+      const operations = (await auditOperations()).filter((op) => op.startsWith("memory_ingest"));
+      expect(operations).toContain("memory_ingest_denied");
+      expect(operations).not.toContain("memory_ingest_classifier_override");
+    }, 60_000);
+  });
+
   it("names the bare_high_entropy_credential detector for Claude Code, without leaking the value (Rung-1 fix-round-2)", async () => {
     const BARE_CREDENTIAL_VALUE = "Rk2Nc9Wp5Ju1Vd8Sy3Ma6Ib0Ge7Tn4Ox1Cl9Aq3Fy6Un8x";
     const source = await copyFixtureSet("basic", "memfile-cli-bare-cred-source");

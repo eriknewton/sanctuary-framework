@@ -1,10 +1,16 @@
-// fail-before-exempt: this file is the SDW architecture GATE, not a test of a
+// fail-before-exempt: this file is the SDW architecture GATE (re-asserted 2026-08-22 for Rung-1 point 3, --allow-file classifier override), not a test of a
 // behavior change. Widening it to recognize an additional compliant shape
 // cannot fail against the base ref, because the base's source already passes
 // the narrower rule; "fails before the fix" has no meaning for a gate
 // widening. The widening is given its own teeth instead: the recognizer has
 // direct unit tests below covering both directions, including the exact
-// laundering case (a real write slipped in ahead of the refusal).
+// laundering case (a real write slipped in ahead of the refusal). This time
+// the widening is the txnPersistable extraction regex and
+// persistableBlockUsesPreparedAuthority accepting an optional trailing
+// `options` argument on writePersistable/prepareSdwBackendWrite, proven both
+// directions by the new "transactional persistable-write recognizer" describe
+// block below (accepts 3-arg AND 4-arg compliant shapes, still rejects a
+// bypass and a missing implementation).
 import { readFile, readdir } from "node:fs/promises";
 import { relative, join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -171,6 +177,128 @@ describe("SDW architecture write gate", () => {
       ).toBe(false);
     });
   });
+
+  describe("transactional persistable-write recognizer (Rung-1 point 3 widening)", () => {
+    // Rung-1 point 3 (2026-08-22) added an optional trailing `options`
+    // parameter to writePersistable/prepareSdwBackendWrite so ONE narrow,
+    // per-passage classifier override can reach the LMDB transactional write
+    // path. Widening the recognizer to accept it must not lose its ability to
+    // reject a genuine bypass; both directions are proven here rather than
+    // trusted from the recognizer's own source, same discipline as the
+    // unconditional-refusal recognizer above.
+    const VALID_PUBLIC_WRITE = `
+  async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+    this.db.putSync(compositeKey(namespace, key), checkedData);
+  }
+`;
+    const VALID_TXN_WRITE = `
+        write: async (namespace, key, data) => {
+          const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+          overlay.set(compositeKey(namespace, key), checkedData);
+        },
+`;
+    const COMPLIANT_PERSISTABLE_BODY = `
+          const prepared = prepareSdwBackendWrite(persistable, encryptionKey, fortressId, options);
+          const checkedData = assertSdwRawWriteAuthorized(
+            prepared.namespace,
+            prepared.storageKey,
+            prepared.data,
+          );
+          overlay.set(
+            compositeKey(prepared.namespace, prepared.storageKey),
+            new Uint8Array(checkedData),
+          );
+`;
+
+    function sourceWithPersistableWriter(paramList: string, body: string): string {
+      return `
+class FakeLmdbBackend {
+${VALID_PUBLIC_WRITE}
+  async sdwTransaction<T>(fn: (txn: unknown) => Promise<T>): Promise<T> {
+    const overlay = new Map();
+    const txn = {
+${VALID_TXN_WRITE}
+      writePersistable: async (${paramList}) => {
+${body}
+      },
+    };
+    const result = await fn(txn);
+    for (const [composite, value] of overlay) {
+      this.db.putSync(composite, this.lmdb.asBinary(value));
+    }
+    return result;
+  }
+}
+`;
+    }
+
+    it("accepts the widened 4-arg (options) compliant shape", () => {
+      const offenders = findLmdbWriteGateOffenders(
+        sourceWithPersistableWriter(
+          "persistable, encryptionKey, fortressId, options",
+          COMPLIANT_PERSISTABLE_BODY,
+        ),
+        "sdw/lmdb-backend.ts",
+      );
+      expect(offenders).toEqual([]);
+    });
+
+    it("still accepts the original 3-arg compliant shape (backward compatible)", () => {
+      const offenders = findLmdbWriteGateOffenders(
+        sourceWithPersistableWriter(
+          "persistable, encryptionKey, fortressId",
+          // The 3-arg body legitimately omits `options` from the call too.
+          COMPLIANT_PERSISTABLE_BODY.replace(", options)", ")"),
+        ),
+        "sdw/lmdb-backend.ts",
+      );
+      expect(offenders).toEqual([]);
+    });
+
+    it("rejects a 4-arg shape that drops the guard (options did not smuggle in a bypass)", () => {
+      const offenders = findLmdbWriteGateOffenders(
+        sourceWithPersistableWriter(
+          "persistable, encryptionKey, fortressId, options",
+          // No prepareSdwBackendWrite/assertSdwRawWriteAuthorized at all: a
+          // raw write straight from the caller-supplied persistable.
+          `
+          overlay.set(
+            compositeKey(persistable.namespace, persistable.storageKey),
+            options?.classifierOverride ? persistable.record : null,
+          );
+`,
+        ),
+        "sdw/lmdb-backend.ts",
+      );
+      expect(offenders).toContain(
+        "sdw/lmdb-backend.ts: transactional persistable write does not use the SDW prepare/authority path",
+      );
+    });
+
+    it("rejects a missing writePersistable implementation entirely", () => {
+      const source = `
+class FakeLmdbBackend {
+${VALID_PUBLIC_WRITE}
+  async sdwTransaction<T>(fn: (txn: unknown) => Promise<T>): Promise<T> {
+    const overlay = new Map();
+    const txn = {
+${VALID_TXN_WRITE}
+    };
+    const result = await fn(txn);
+    for (const [composite, value] of overlay) {
+      this.db.putSync(composite, this.lmdb.asBinary(value));
+    }
+    return result;
+  }
+}
+`;
+      const offenders = findLmdbWriteGateOffenders(source, "sdw/lmdb-backend.ts");
+      expect(offenders).toContain(
+        "sdw/lmdb-backend.ts: missing transactional persistable write implementation",
+      );
+    });
+  });
 });
 
 function callsSdwRawWrite(source: string, aliases = new Set<string>()): boolean {
@@ -257,9 +385,16 @@ function findLmdbWriteGateOffenders(source: string, path: string): string[] {
     offenders.push(`${path}: transactional raw write can reach LMDB without the raw SDW guard`);
   }
 
+  // Rung-1 point 3 (2026-08-22, memory-file ingest --allow-file override)
+  // widened this to accept an optional trailing `options` parameter
+  // (`MintPersistableOptions`, threaded through so ONE narrow, per-passage
+  // classifier override can reach the LMDB transactional write path too).
+  // The widening is proven both directions below rather than trusted from
+  // its own source, same discipline as the unconditional-refusal recognizer
+  // above: it still rejects a shape that drops the guard.
   const txnPersistable = extractBalancedBlock(
     source,
-    /writePersistable:\s*async\s*\(\s*persistable,\s*encryptionKey,\s*fortressId\s*\)\s*=>/,
+    /writePersistable:\s*async\s*\(\s*persistable,\s*encryptionKey,\s*fortressId(?:,\s*options)?\s*\)\s*=>/,
   );
   if (txnPersistable === null) {
     offenders.push(`${path}: missing transactional persistable write implementation`);
@@ -386,7 +521,14 @@ function writeBlockChecksBeforeRawPut(block: string): boolean {
 }
 
 function persistableBlockUsesPreparedAuthority(block: string): boolean {
-  const prepareIndex = block.indexOf("prepareSdwBackendWrite(persistable, encryptionKey, fortressId)");
+  // Same optional-trailing-`options` widening as the txnPersistable extraction
+  // regex above, and for the same reason: prepareSdwBackendWrite now takes an
+  // optional 4th MintPersistableOptions argument. A regex search (not a fixed
+  // indexOf) so both the 3-arg and 4-arg call shapes are recognized.
+  const prepareMatch = block.match(
+    /prepareSdwBackendWrite\(\s*persistable,\s*encryptionKey,\s*fortressId(?:,\s*options)?\s*\)/,
+  );
+  const prepareIndex = prepareMatch === null ? -1 : (prepareMatch.index ?? -1);
   const guardIndex = block.indexOf("assertSdwRawWriteAuthorized(");
   const checkedDataIndex = block.indexOf("checkedData");
   // Direct guarded LMDB put, or guarded write into the sdwTransaction

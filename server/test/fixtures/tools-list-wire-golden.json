@@ -1868,6 +1868,13 @@
           "dir": {
             "type": "string",
             "description": "Path to the harness memory directory to read"
+          },
+          "allow_files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Exact source paths (bare filenames relative to dir, no globs or directories) to ingest as-is even if the secret classifier refuses them. Each use is audited by path; a listed path the classifier never refused is reported as unused."
           }
         },
         "required": [

@@ -25,6 +25,7 @@ import {
   readCodexMemoryDirectory,
 } from "./adapters/codex-memory-file-adapter.js";
 import { SdwValidationError, sdwClassifierReasonText } from "./errors.js";
+import { MEMORY_INGEST_CLASSIFIER_OVERRIDE } from "./memory-file-audit-ops.js";
 import {
   createMultiAgentIsolationGuard,
   type MultiAgentIsolationGuard,
@@ -77,7 +78,11 @@ export const RUNG1_MEMORY_TOOL_DESCRIPTIONS = {
     "reads plaintext source files and leaves them untouched; the encrypted " +
     "copy lives in the vault. Files the secret classifier refuses are " +
     "skipped and named in the result, so check skipped_file_count before " +
-    "treating the mirror as complete. This does not sync, watch, or replace " +
+    "treating the mirror as complete. Optional allow_files names exact source " +
+    "paths to ingest as-is even though the classifier refuses them; each use " +
+    "is audited by path and reported under overridden, and a listed path the " +
+    "classifier never refused is reported as unused, not silently accepted. " +
+    "This does not sync, watch, or replace " +
     "the harness write path, and memory later sent to a model vendor is " +
     "exposed to that vendor at inference.",
   memory_emit:
@@ -128,6 +133,16 @@ export function memoryFileApprovalArgs(
   if (typeof args.mode === "string") projected.mode = args.mode;
   if (typeof args.archive_id === "string") projected.archive_id = args.archive_id;
   if (typeof args.dir === "string") projected.dir = args.dir;
+  // Rung-1 point 3: memory_ingest's allow_files waives the secret classifier
+  // for exactly these paths, so the operator approving the call must see
+  // which paths are waived, the same reasoning as the owner_ref/agent_id
+  // projection below for WHOSE memory moves.
+  if (Array.isArray(args.allow_files)) {
+    const allowFiles = args.allow_files.filter(
+      (item): item is string => typeof item === "string",
+    );
+    if (allowFiles.length > 0) projected.allow_files = allowFiles;
+  }
   if (context !== undefined) {
     projected.owner_ref = context.ownerRef;
     projected.agent_id = context.agentId ?? null;
@@ -144,6 +159,25 @@ function asSupportedHarness(value: unknown): SupportedMemoryHarness | null {
 
 function asDirectory(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+/** No paths allow-listed: the default when the caller omits allow_files. */
+const EMPTY_ALLOW_FILES: ReadonlySet<string> = new Set();
+
+/**
+ * `allow_files` is optional; when supplied it must be an array of non-empty
+ * strings (the exact source paths to waive the classifier for). Anything else
+ * is invalid_args, same as a malformed harness or dir.
+ */
+function asAllowFiles(value: unknown): ReadonlySet<string> | null {
+  if (value === undefined) return EMPTY_ALLOW_FILES;
+  if (!Array.isArray(value)) return null;
+  const allowFiles = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string" || item.trim().length === 0) return null;
+    allowFiles.add(item);
+  }
+  return allowFiles;
 }
 
 function asArchiveId(value: unknown): string | null {
@@ -240,13 +274,23 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
           type: "string",
           description: "Path to the harness memory directory to read",
         },
+        allow_files: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Exact source paths (bare filenames relative to dir, no globs or " +
+            "directories) to ingest as-is even if the secret classifier " +
+            "refuses them. Each use is audited by path; a listed path the " +
+            "classifier never refused is reported as unused.",
+        },
       },
       required: ["harness", "dir"],
     },
     handler: async (args) => {
       const harness = asSupportedHarness(args.harness);
       const dir = asDirectory(args.dir);
-      if (harness === null || dir === null) {
+      const allowFiles = asAllowFiles(args.allow_files);
+      if (harness === null || dir === null || allowFiles === null) {
         await auditFailure("memory_ingest_denied", { denial_class: "invalid_args" });
         return deny("memory_ingest");
       }
@@ -259,11 +303,11 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
         if (harness === CLAUDE_CODE_MEMORY_HARNESS) {
           const snapshot = await readClaudeCodeMemoryDirectory(dir, { ingestedAt });
           fileCount = snapshot.entries.length;
-          ingestSnapshot = () => ingestClaudeCodeMemorySnapshot(adapter, snapshot);
+          ingestSnapshot = () => ingestClaudeCodeMemorySnapshot(adapter, snapshot, { allowFiles });
         } else {
           const snapshot = await readCodexMemoryDirectory(dir, { ingestedAt });
           fileCount = snapshot.entries.length;
-          ingestSnapshot = () => ingestCodexMemorySnapshot(adapter, snapshot);
+          ingestSnapshot = () => ingestCodexMemorySnapshot(adapter, snapshot, { allowFiles });
         }
         // Write-ahead INTENT, not an outcome. The durable record precedes the
         // vault mutation so a crash mid-ingest still leaves evidence that an
@@ -284,12 +328,30 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
           source_file_count: result.source_file_count,
           committed_file_count: result.ingested.length,
           skipped_file_count: result.skipped.length,
+          overridden_file_count: result.overridden.length,
+          unused_allow_files: result.unused_allow_files,
           complete: result.complete,
           skipped: result.skipped.map((skip) => ({
             source_path: skip.source_path,
             reason: skip.reason,
           })),
         });
+        // One record per overridden file (Rung-1 point 3): the operator waived
+        // the classifier for this exact path, so it is named individually
+        // rather than folded into the aggregate outcome record above. Carries
+        // the refusal metadata the classifier would have reported (detector,
+        // line), never the matched content.
+        for (const override of result.overridden) {
+          await auditSuccess(MEMORY_INGEST_CLASSIFIER_OVERRIDE, {
+            harness,
+            source_dir: dir,
+            owner_ref: adapter.ownerRef,
+            source_path: override.source_path,
+            reason: override.reason,
+            detector: override.detector,
+            line: override.line,
+          });
+        }
         return toolResult({
           ingested: true,
           harness,
@@ -309,6 +371,16 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
             // only, never the matched content.
             reason_text: sdwClassifierReasonText(skip.reason, skip.detector),
           })),
+          overridden_file_count: result.overridden.length,
+          overridden: result.overridden.map((override) => ({
+            source_path: override.source_path,
+            reason: override.reason,
+            detail: override.detail,
+            detector: override.detector,
+            line: override.line,
+            reason_text: sdwClassifierReasonText(override.reason, override.detector),
+          })),
+          unused_allow_files: result.unused_allow_files,
           passages: result.ingested.map((passage) => ({
             passage_id: passage.passage_id,
             content_hash: passage.content_hash,

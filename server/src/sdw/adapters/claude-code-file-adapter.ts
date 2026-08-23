@@ -20,6 +20,14 @@ import type {
   MemoryPassage,
   MemoryPassageInput,
 } from "./memory-backend.js";
+import {
+  screenMemoryFileEntries,
+  type MemoryFileOverride,
+  type MemoryFileSkip,
+} from "./memory-file-allow-list.js";
+
+/** No paths allow-listed: every call site that omits `allowFiles` gets this. */
+const EMPTY_ALLOW_FILES: ReadonlySet<string> = new Set();
 
 export const CLAUDE_CODE_MEMORY_HARNESS = "claude-code" as const;
 export const CLAUDE_CODE_MEMORY_INGRESS = "file_import" as const;
@@ -61,16 +69,13 @@ export interface ReadClaudeCodeMemoryOptions {
 }
 
 /** One source file the write gate refused, named so the operator can act on it. */
-export interface ClaudeCodeMemorySkip {
-  readonly source_path: string;
-  /** SdwValidationError category, e.g. "classifier_reject". */
-  readonly reason: string;
-  readonly detail: string;
-  /** SdwValidationError.detector; populated only when reason is "classifier_reject". */
-  readonly detector?: string;
-  /** SdwValidationError.line; the 1-based line the detector matched, when known. */
-  readonly line?: number;
-}
+export type ClaudeCodeMemorySkip = MemoryFileSkip;
+
+/**
+ * One source file the classifier would have refused, ingested anyway because
+ * the operator named it on `--allow-file` / `allow_files` (Rung-1 point 3).
+ */
+export type ClaudeCodeMemoryOverride = MemoryFileOverride;
 
 export interface IngestClaudeCodeMemoryResult {
   readonly ingested: readonly MemoryPassage[];
@@ -80,9 +85,21 @@ export interface IngestClaudeCodeMemoryResult {
    * than report a file count that looks like success.
    */
   readonly skipped: readonly ClaudeCodeMemorySkip[];
+  /**
+   * Files the classifier refused but that WERE mirrored because the operator
+   * allow-listed that exact path. Disjoint from `skipped`: an overridden file
+   * is not also counted as skipped, and `complete` below does not count it as
+   * incomplete.
+   */
+  readonly overridden: readonly ClaudeCodeMemoryOverride[];
+  /**
+   * Allow-listed paths that were never a classifier refusal (nothing was
+   * waived for them) -- surfaced so a stale allow-file entry is visible.
+   */
+  readonly unused_allow_files: readonly string[];
   /** Markdown files found in the source directory (ingested + skipped). */
   readonly source_file_count: number;
-  /** True only when every source file was mirrored. */
+  /** True only when every source file was mirrored (overrides count as mirrored). */
   readonly complete: boolean;
 }
 
@@ -166,13 +183,24 @@ export async function readClaudeCodeMemoryDirectory(
   return { root_dir: rootDir, entries };
 }
 
+export interface IngestClaudeCodeMemoryOptions {
+  /**
+   * Rung-1 point 3: source paths (bare filenames, exact match, no globs or
+   * directories) the operator explicitly named to ingest as-is even if the
+   * secret classifier would refuse them. Unknown paths are a thrown error, not
+   * a silent no-op (see assertAllowFilesKnown). Never a global switch: a path
+   * absent from this set is screened exactly as before.
+   */
+  readonly allowFiles?: ReadonlySet<string>;
+}
+
 export async function ingestClaudeCodeMemoryDirectory(
   adapter: MemoryBackendAdapter,
   memoryDir: string,
-  options: ReadClaudeCodeMemoryOptions = {},
+  options: ReadClaudeCodeMemoryOptions & IngestClaudeCodeMemoryOptions = {},
 ): Promise<IngestClaudeCodeMemoryResult> {
   const snapshot = await readClaudeCodeMemoryDirectory(memoryDir, options);
-  return ingestClaudeCodeMemorySnapshot(adapter, snapshot);
+  return ingestClaudeCodeMemorySnapshot(adapter, snapshot, options);
 }
 
 /**
@@ -189,8 +217,12 @@ export async function ingestClaudeCodeMemoryDirectory(
  * MEMORY.md. The measurement collected counts and detector classes only.
  *
  *  - A refused file is a REPORTED SKIP, never a whole-run abort. It is also
- *    never an exemption: the same gate still runs on everything written, and
- *    the refused bytes never reach the vault.
+ *    never an implicit exemption: the same gate still runs on everything
+ *    written, and the refused bytes never reach the vault UNLESS the operator
+ *    named that exact source path on `options.allowFiles` (Rung-1 point 3),
+ *    in which case it is a REPORTED OVERRIDE, not a skip, and the refusal
+ *    metadata (detector, line) is retained in the result and the caller's
+ *    audit record rather than discarded.
  *  - A thrown storage failure must either restore the owner scope to its
  *    pre-write state or surface partial_scope. A run that committed a prefix
  *    and then threw left a vault that could not be re-imported (every committed
@@ -203,42 +235,33 @@ export async function ingestClaudeCodeMemoryDirectory(
 export async function ingestClaudeCodeMemorySnapshot(
   adapter: MemoryBackendAdapter,
   snapshot: ClaudeCodeMemorySnapshot,
+  options: IngestClaudeCodeMemoryOptions = {},
 ): Promise<IngestClaudeCodeMemoryResult> {
-  const accepted: MemoryPassageInput[] = [];
-  const skipped: ClaudeCodeMemorySkip[] = [];
-
-  for (const entry of snapshot.entries) {
-    const input: MemoryPassageInput = {
+  const allowFiles = options.allowFiles ?? EMPTY_ALLOW_FILES;
+  const entries = snapshot.entries.map((entry) => ({
+    sourcePath: entry.source_path,
+    input: {
       ...entry.passage_input,
       passage_id: passageIdForClaudeCodeMemoryFile(
         adapter,
         entry.source_class,
         entry.source_path,
       ),
-    };
-    // applyBareCredentialFallback=true: a raw Claude Code memory file has no
-    // other backstop (both this ingest and the write below tag it
-    // "user_content").
-    const screen = adapter.screenPassage(input, CLAUDE_CODE_MEMORY_TAINT, true);
-    if (!screen.ok) {
-      skipped.push({
-        source_path: entry.source_path,
-        reason: screen.category,
-        detail: screen.message,
-        detector: screen.detector,
-        line: screen.line,
-      });
-      continue;
-    }
-    accepted.push(input);
-  }
+    },
+  }));
+  // applyBareCredentialFallback=true (threaded through screenMemoryFileEntries):
+  // a raw Claude Code memory file has no other backstop (both this ingest and
+  // the write below tag it "user_content").
+  const screened = screenMemoryFileEntries(adapter, entries, CLAUDE_CODE_MEMORY_TAINT, allowFiles);
 
-  const ingested = await adapter.putPassages(accepted, CLAUDE_CODE_MEMORY_TAINT, true);
+  const ingested = await adapter.putPassages(screened.accepted, CLAUDE_CODE_MEMORY_TAINT, true);
   return {
     ingested,
-    skipped,
+    skipped: screened.skipped,
+    overridden: screened.overridden,
+    unused_allow_files: screened.unused_allow_files,
     source_file_count: snapshot.entries.length,
-    complete: skipped.length === 0,
+    complete: screened.skipped.length === 0,
   };
 }
 

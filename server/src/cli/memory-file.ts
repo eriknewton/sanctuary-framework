@@ -29,13 +29,14 @@ import {
 } from "../sdw/adapters/codex-memory-file-adapter.js";
 import { SdwValidationError, sdwClassifierReasonText } from "../sdw/errors.js";
 import { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
+import { MEMORY_INGEST_CLASSIFIER_OVERRIDE } from "../sdw/memory-file-audit-ops.js";
 import {
   MEMORY_TRANSCODE_MODE,
   restoreMemoryTranscodeArchive,
   transcodeMemoryDirectory,
 } from "../sdw/memory-transcode.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { flagValue, hasFlag } from "./argv.js";
+import { flagValue, flagValues, hasFlag } from "./argv.js";
 
 export interface MemoryFileCommandArgs {
   readonly argv: string[];
@@ -75,6 +76,12 @@ export async function runMemoryIngestCommand(
 
   const parsed = parseCommonArgs(args.argv, "memory_ingest", err);
   if (!parsed) return 2;
+  // Rung-1 point 3: an explicit, named, per-file escape hatch, never a global
+  // force flag. Each path is exact-match only (no globs, no directories) and
+  // is checked against the actual source directory listing below; an unknown
+  // path is an error (see assertAllowFilesKnown in memory-file-allow-list.ts),
+  // not a silently ignored one.
+  const allowFiles: ReadonlySet<string> = new Set(flagValues(args.argv, "--allow-file"));
 
   const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin);
   if (!boot) return 1;
@@ -85,11 +92,11 @@ export async function runMemoryIngestCommand(
     if (parsed.harness === CLAUDE_CODE_MEMORY_HARNESS) {
       const snapshot = await readClaudeCodeMemoryDirectory(parsed.dir);
       sourceFileCount = snapshot.entries.length;
-      ingestSnapshot = () => ingestClaudeCodeMemorySnapshot(boot.adapter, snapshot);
+      ingestSnapshot = () => ingestClaudeCodeMemorySnapshot(boot.adapter, snapshot, { allowFiles });
     } else {
       const snapshot = await readCodexMemoryDirectory(parsed.dir);
       sourceFileCount = snapshot.entries.length;
-      ingestSnapshot = () => ingestCodexMemorySnapshot(boot.adapter, snapshot);
+      ingestSnapshot = () => ingestCodexMemorySnapshot(boot.adapter, snapshot, { allowFiles });
     }
     // Write-ahead INTENT, durable before any vault write. If appendCritical
     // throws, the command aborts with no ingested memory files. It is labelled
@@ -120,6 +127,8 @@ export async function runMemoryIngestCommand(
         source_file_count: result.source_file_count,
         committed_file_count: result.ingested.length,
         skipped_file_count: result.skipped.length,
+        overridden_file_count: result.overridden.length,
+        unused_allow_files: result.unused_allow_files,
         complete: result.complete,
         skipped: result.skipped.map((skip) => ({
           source_path: skip.source_path,
@@ -127,10 +136,47 @@ export async function runMemoryIngestCommand(
         })),
       },
     });
+    // One record per overridden file (Rung-1 point 3): the operator waived the
+    // classifier for this exact path, so the audit trail names it individually
+    // rather than folding it into the aggregate outcome record above. The
+    // refusal metadata the classifier would have reported is retained here,
+    // never the matched content.
+    for (const override of result.overridden) {
+      await boot.auditLog.appendCritical({
+        layer: "l1",
+        operation: MEMORY_INGEST_CLASSIFIER_OVERRIDE,
+        identity_id: "principal",
+        result: "success",
+        details: {
+          harness: parsed.harness,
+          source_dir: parsed.dir,
+          owner_ref: parsed.ownerRef,
+          source_path: override.source_path,
+          reason: override.reason,
+          detector: override.detector,
+          line: override.line,
+        },
+      });
+    }
     write(
       out,
       `memory_ingest: ingested ${String(result.ingested.length)} of ${String(result.source_file_count)} ${harnessLabel(parsed.harness)} memory files into owner_ref ${parsed.ownerRef}\n`,
     );
+    if (result.overridden.length > 0) {
+      write(
+        out,
+        `memory_ingest: ${String(result.overridden.length)} file(s) were overridden (classifier refusal waived by --allow-file):\n`,
+      );
+      for (const override of result.overridden) {
+        write(out, `  overridden ${override.source_path}: ${describeMemorySkipReason(override)}\n`);
+      }
+    }
+    if (result.unused_allow_files.length > 0) {
+      write(
+        err,
+        `memory_ingest: WARNING - --allow-file named ${String(result.unused_allow_files.length)} path(s) the classifier never refused (nothing was waived): ${result.unused_allow_files.join(", ")}\n`,
+      );
+    }
     if (!result.complete) {
       // Loud, on stderr, and named per file: a partial mirror that reports only
       // a count reads exactly like a complete one.
@@ -642,6 +688,14 @@ Options:
   --harness <name>       Required: claude-code or codex.
   --dir <path>           Harness memory directory to read. Codex also accepts
                          the parent Codex home containing memories/.
+  --allow-file <path>    Repeatable. Ingest this ONE file as-is even if the
+                         secret classifier would refuse it: an exact bare
+                         filename relative to --dir, never a glob or a
+                         directory. Records an audited override naming the
+                         path and the detector that would have fired. A path
+                         the classifier never refused is reported as unused,
+                         and an unknown path is an error. There is no flag
+                         that waives the classifier for every file.
   --owner-ref <id>       SDW owner_ref scope (default: fleet-self).
   --fortress <path>      Override the fortress path.
   --passphrase-stdin     Read the fortress passphrase from stdin (preferred).

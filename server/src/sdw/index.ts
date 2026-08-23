@@ -19,6 +19,7 @@ export {
   mintPersistable,
   prepareSdwBackendWrite,
   sdwBackendWrite,
+  type MintPersistableOptions,
   type Persistable,
   type Taint,
   type Untrusted,

@@ -174,6 +174,50 @@ describe("SDW memory file tools", () => {
     });
   });
 
+  it("approval projection names the allow-listed paths a memory_ingest call would waive the classifier for", () => {
+    // Rung-1 point 3: the operator approving a Tier-1 memory_ingest call must
+    // see WHICH paths are waived, not just that an ingest is happening.
+    expect(
+      memoryFileApprovalArgs(
+        {
+          harness: "claude-code",
+          dir: "/tmp/source",
+          allow_files: ["note-with-secret.md", "another.md"],
+        },
+        { ownerRef: "fleet-self", agentId: "agent-alpha" },
+      ),
+    ).toEqual({
+      harness: "claude-code",
+      dir: "/tmp/source",
+      allow_files: ["note-with-secret.md", "another.md"],
+      owner_ref: "fleet-self",
+      agent_id: "agent-alpha",
+    });
+
+    // No allow_files at all: the key is simply absent, not an empty array.
+    expect(
+      memoryFileApprovalArgs({ harness: "claude-code", dir: "/tmp/source" }),
+    ).toEqual({ harness: "claude-code", dir: "/tmp/source" });
+
+    // A malformed (non-array, or array of non-strings) allow_files projects
+    // nothing rather than passing agent-controlled junk into the approval
+    // channel; the handler itself still denies the call as invalid_args.
+    expect(
+      memoryFileApprovalArgs({
+        harness: "claude-code",
+        dir: "/tmp/source",
+        allow_files: "not-an-array",
+      }),
+    ).toEqual({ harness: "claude-code", dir: "/tmp/source" });
+    expect(
+      memoryFileApprovalArgs({
+        harness: "claude-code",
+        dir: "/tmp/source",
+        allow_files: [123, null],
+      }),
+    ).toEqual({ harness: "claude-code", dir: "/tmp/source" });
+  });
+
   it("the wired approval projection names the owner scope and the calling agent", async () => {
     const { tools } = await makeTools({
       ownerIdentity: () => "agent-alpha",
@@ -349,6 +393,211 @@ describe("SDW memory file tools", () => {
     expect(outcome.details.skipped).toEqual([
       { source_path: "note-with-secret.md", reason: "classifier_reject" },
     ]);
+  });
+
+  describe("Rung-1 point 3: --allow-file / allow_files classifier override", () => {
+    const SECRET_VALUE = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE";
+
+    async function refusedFixture(prefix: string): Promise<string> {
+      const source = await copyFixtureSet("basic", prefix);
+      await writeFile(
+        join(source, "note-with-secret.md"),
+        `# Ops note\n\nSANCTUARY_RECOVERY_KEY=${SECRET_VALUE}\n`,
+      );
+      return source;
+    }
+
+    it("refuses without the flag and ingests with it, on the same fixture", async () => {
+      const { tools: withoutFlag } = await makeTools();
+      const source = await refusedFixture("cc-memory-tool-allow-file-baseline");
+
+      const refused = parse(
+        await withoutFlag.get("memory_ingest")!.handler({ harness: "claude-code", dir: source }),
+      );
+      expect(refused.complete).toBe(false);
+      expect(refused.skipped_file_count).toBe(1);
+      expect(refused.overridden_file_count).toBe(0);
+
+      const { tools: withFlag, auditCalls } = await makeTools({ ownerRef: "fleet-self-2" });
+      const overridden = parse(
+        await withFlag.get("memory_ingest")!.handler({
+          harness: "claude-code",
+          dir: source,
+          allow_files: ["note-with-secret.md"],
+        }),
+      );
+
+      expect(overridden.complete).toBe(true);
+      expect(overridden.skipped_file_count).toBe(0);
+      expect(overridden.skipped).toEqual([]);
+      expect(overridden.file_count).toBe(4);
+      expect(overridden.overridden_file_count).toBe(1);
+      expect(overridden.overridden).toEqual([
+        {
+          source_path: "note-with-secret.md",
+          reason: "classifier_reject",
+          detail: expect.stringContaining("classifier"),
+          detector: "labeled_recovery_key",
+          line: 3,
+          reason_text: "looks like a labeled Sanctuary recovery key value",
+        },
+      ]);
+      expect(overridden.unused_allow_files).toEqual([]);
+      // The override audit record names the file, the detector, and the line,
+      // and the SECRET NEVER appears anywhere in the result or the audit trail.
+      expect(JSON.stringify(overridden)).not.toContain(SECRET_VALUE);
+      expect(JSON.stringify(auditCalls)).not.toContain(SECRET_VALUE);
+
+      const overrideAudit = auditCalls.find(
+        (call) => call.operation === "memory_ingest_classifier_override",
+      );
+      expect(overrideAudit).toBeDefined();
+      expect(overrideAudit!.result).toBe("success");
+      expect(overrideAudit!.details).toMatchObject({
+        harness: "claude-code",
+        source_path: "note-with-secret.md",
+        reason: "classifier_reject",
+        detector: "labeled_recovery_key",
+        line: 3,
+      });
+
+      const outcomeAudit = auditCalls.find((call) => call.operation === "memory_ingest")!;
+      expect(outcomeAudit.details).toMatchObject({
+        committed_file_count: 4,
+        skipped_file_count: 0,
+        overridden_file_count: 1,
+        unused_allow_files: [],
+        complete: true,
+      });
+    });
+
+    it("reports an allow-listed path the classifier never refused as unused, with no override audit", async () => {
+      const { tools, auditCalls } = await makeTools();
+      const source = await copyFixtureSet("basic", "cc-memory-tool-allow-file-unused");
+
+      const ingested = parse(
+        await tools.get("memory_ingest")!.handler({
+          harness: "claude-code",
+          dir: source,
+          allow_files: ["concise-updates.md"],
+        }),
+      );
+
+      expect(ingested.complete).toBe(true);
+      expect(ingested.overridden).toEqual([]);
+      expect(ingested.overridden_file_count).toBe(0);
+      expect(ingested.unused_allow_files).toEqual(["concise-updates.md"]);
+      expect(
+        auditCalls.some((call) => call.operation === "memory_ingest_classifier_override"),
+      ).toBe(false);
+      const outcomeAudit = auditCalls.find((call) => call.operation === "memory_ingest")!;
+      expect(outcomeAudit.details.unused_allow_files).toEqual(["concise-updates.md"]);
+    });
+
+    it("denies with invalid_args on an allow-listed path absent from the source directory", async () => {
+      const { tools, auditCalls } = await makeTools();
+      const source = await copyFixtureSet("basic", "cc-memory-tool-allow-file-unknown");
+
+      const result = await tools.get("memory_ingest")!.handler({
+        harness: "claude-code",
+        dir: source,
+        allow_files: ["does-not-exist.md"],
+      });
+
+      // The unknown path throws inside the adapter (assertAllowFilesKnown), so
+      // this denies via the ingest_failed catch path, not the invalid_args
+      // pre-check; either way nothing is committed and the failure is audited.
+      const parsed = parse(result);
+      expect(parsed.denied).toBe(true);
+      expect(
+        auditCalls.some(
+          (call) => call.operation === "memory_ingest_denied" && call.result === "failure",
+        ),
+      ).toBe(true);
+      expect(
+        auditCalls.some((call) => call.operation === "memory_ingest_classifier_override"),
+      ).toBe(false);
+      expect(
+        auditCalls.some((call) => call.operation === "memory_ingest" && call.result === "success"),
+      ).toBe(false);
+    });
+
+    it("overrides only the allow-listed file, leaving a second refused file skipped", async () => {
+      const { tools, auditCalls } = await makeTools();
+      const source = await refusedFixture("cc-memory-tool-allow-file-partial");
+      const BARE_CREDENTIAL_VALUE = "Rk2Nc9Wp5Ju1Vd8Sy3Ma6Ib0Ge7Tn4Ox1Cl9Aq3Fy6Un8x";
+      await writeFile(
+        join(source, "note-with-bare-id.md"),
+        `# Notes\n\nUnrelated identifier: ${BARE_CREDENTIAL_VALUE}\n`,
+      );
+
+      const ingested = parse(
+        await tools.get("memory_ingest")!.handler({
+          harness: "claude-code",
+          dir: source,
+          allow_files: ["note-with-secret.md"],
+        }),
+      );
+
+      expect(ingested.complete).toBe(false);
+      const overridden = ingested.overridden as Array<{ source_path: string }>;
+      const stillSkipped = ingested.skipped as Array<{ source_path: string }>;
+      expect(overridden.map((o) => o.source_path)).toEqual(["note-with-secret.md"]);
+      expect(stillSkipped.map((s) => s.source_path)).toEqual(["note-with-bare-id.md"]);
+      expect(ingested.unused_allow_files).toEqual([]);
+
+      const overrideAudits = auditCalls.filter(
+        (call) => call.operation === "memory_ingest_classifier_override",
+      );
+      expect(overrideAudits).toHaveLength(1);
+      expect(overrideAudits[0]!.details.source_path).toBe("note-with-secret.md");
+    });
+
+    it("overrides a refused Codex file the same way as Claude Code", async () => {
+      const { tools, auditCalls } = await makeTools();
+      const codexHome = await tempDir("codex-memory-tool-allow-file");
+      const memories = join(codexHome, "memories");
+      await mkdir(memories, { recursive: true });
+      for (const filename of ["MEMORY.md", "memory_summary.md", "raw_memories.md"]) {
+        await writeFile(
+          join(memories, filename),
+          await readFile(join(CODEX_FIXTURE_ROOT, "unicode", filename)),
+        );
+      }
+      await writeFile(
+        join(memories, "raw_memories.md"),
+        `# Raw Memories\n\nSANCTUARY_RECOVERY_KEY=${SECRET_VALUE}\n`,
+      );
+
+      const ingested = parse(
+        await tools.get("memory_ingest")!.handler({
+          harness: "codex",
+          dir: codexHome,
+          allow_files: ["raw_memories.md"],
+        }),
+      );
+
+      expect(ingested.complete).toBe(true);
+      expect(ingested.overridden).toEqual([
+        {
+          source_path: "raw_memories.md",
+          reason: "classifier_reject",
+          detail: expect.stringContaining("classifier"),
+          detector: "labeled_recovery_key",
+          line: 3,
+          reason_text: "looks like a labeled Sanctuary recovery key value",
+        },
+      ]);
+      expect(JSON.stringify(ingested)).not.toContain(SECRET_VALUE);
+      expect(JSON.stringify(auditCalls)).not.toContain(SECRET_VALUE);
+      expect(
+        auditCalls.some(
+          (call) =>
+            call.operation === "memory_ingest_classifier_override" &&
+            call.details.source_path === "raw_memories.md",
+        ),
+      ).toBe(true);
+    });
   });
 
   it("names the bare_high_entropy_credential detector for Claude Code, without leaking the value (Rung-1 fix-round-2)", async () => {

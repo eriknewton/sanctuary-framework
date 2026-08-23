@@ -19,6 +19,14 @@ import type {
   MemoryPassage,
   MemoryPassageInput,
 } from "./memory-backend.js";
+import {
+  screenMemoryFileEntries,
+  type MemoryFileOverride,
+  type MemoryFileSkip,
+} from "./memory-file-allow-list.js";
+
+/** No paths allow-listed: every call site that omits `allowFiles` gets this. */
+const EMPTY_ALLOW_FILES: ReadonlySet<string> = new Set();
 
 export const CODEX_MEMORY_HARNESS = "codex" as const;
 export const CODEX_MEMORY_INGRESS = "file_import" as const;
@@ -58,20 +66,41 @@ export interface ReadCodexMemoryOptions {
   readonly readFile?: (path: string) => Promise<Uint8Array>;
 }
 
-export interface CodexMemorySkip {
-  readonly source_path: string;
-  readonly reason: string;
-  readonly detail: string;
-  /** SdwValidationError.detector; populated only when reason is "classifier_reject". */
-  readonly detector?: string;
-  /** SdwValidationError.line; the 1-based line the detector matched, when known. */
-  readonly line?: number;
+export type CodexMemorySkip = MemoryFileSkip;
+
+/**
+ * One source file the classifier would have refused, ingested anyway because
+ * the operator named it on `--allow-file` / `allow_files` (Rung-1 point 3).
+ */
+export type CodexMemoryOverride = MemoryFileOverride;
+
+export interface IngestCodexMemoryOptions {
+  /**
+   * Rung-1 point 3: source paths (bare filenames, exact match, no globs or
+   * directories) the operator explicitly named to ingest as-is even if the
+   * secret classifier would refuse them. Unknown paths are a thrown error, not
+   * a silent no-op (see assertAllowFilesKnown). Never a global switch: a path
+   * absent from this set is screened exactly as before.
+   */
+  readonly allowFiles?: ReadonlySet<string>;
 }
 
 export interface IngestCodexMemoryResult {
   readonly ingested: readonly MemoryPassage[];
   readonly skipped: readonly CodexMemorySkip[];
+  /**
+   * Files the classifier refused but that WERE mirrored because the operator
+   * allow-listed that exact path. Disjoint from `skipped`; `complete` below
+   * does not count an override as incomplete.
+   */
+  readonly overridden: readonly CodexMemoryOverride[];
+  /**
+   * Allow-listed paths that were never a classifier refusal (nothing was
+   * waived for them) -- surfaced so a stale allow-file entry is visible.
+   */
+  readonly unused_allow_files: readonly string[];
   readonly source_file_count: number;
+  /** True only when every source file was mirrored (overrides count as mirrored). */
   readonly complete: boolean;
 }
 
@@ -162,50 +191,45 @@ export async function readCodexMemoryDirectory(
 export async function ingestCodexMemoryDirectory(
   adapter: MemoryBackendAdapter,
   memoryDir: string,
-  options: ReadCodexMemoryOptions = {},
+  options: ReadCodexMemoryOptions & IngestCodexMemoryOptions = {},
 ): Promise<IngestCodexMemoryResult> {
-  return ingestCodexMemorySnapshot(adapter, await readCodexMemoryDirectory(memoryDir, options));
+  return ingestCodexMemorySnapshot(
+    adapter,
+    await readCodexMemoryDirectory(memoryDir, options),
+    options,
+  );
 }
 
 export async function ingestCodexMemorySnapshot(
   adapter: MemoryBackendAdapter,
   snapshot: CodexMemorySnapshot,
+  options: IngestCodexMemoryOptions = {},
 ): Promise<IngestCodexMemoryResult> {
-  const accepted: MemoryPassageInput[] = [];
-  const skipped: CodexMemorySkip[] = [];
-
-  for (const entry of snapshot.entries) {
-    const input: MemoryPassageInput = {
+  const allowFiles = options.allowFiles ?? EMPTY_ALLOW_FILES;
+  const entries = snapshot.entries.map((entry) => ({
+    sourcePath: entry.source_path,
+    input: {
       ...entry.passage_input,
       passage_id: passageIdForCodexMemoryFile(
         adapter,
         entry.source_class,
         entry.source_path,
       ),
-    };
-    // applyBareCredentialFallback=true: a raw Codex memory file has no
-    // other backstop (both this ingest and the write below tag it
-    // "user_content").
-    const screen = adapter.screenPassage(input, CODEX_MEMORY_TAINT, true);
-    if (!screen.ok) {
-      skipped.push({
-        source_path: entry.source_path,
-        reason: screen.category,
-        detail: screen.message,
-        detector: screen.detector,
-        line: screen.line,
-      });
-      continue;
-    }
-    accepted.push(input);
-  }
+    },
+  }));
+  // applyBareCredentialFallback=true (threaded through screenMemoryFileEntries):
+  // a raw Codex memory file has no other backstop (both this ingest and the
+  // write below tag it "user_content").
+  const screened = screenMemoryFileEntries(adapter, entries, CODEX_MEMORY_TAINT, allowFiles);
 
-  const ingested = await adapter.putPassages(accepted, CODEX_MEMORY_TAINT, true);
+  const ingested = await adapter.putPassages(screened.accepted, CODEX_MEMORY_TAINT, true);
   return {
     ingested,
-    skipped,
+    skipped: screened.skipped,
+    overridden: screened.overridden,
+    unused_allow_files: screened.unused_allow_files,
     source_file_count: snapshot.entries.length,
-    complete: skipped.length === 0,
+    complete: screened.skipped.length === 0,
   };
 }
 

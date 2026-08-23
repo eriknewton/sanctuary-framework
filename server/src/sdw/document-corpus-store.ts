@@ -7,7 +7,13 @@ import {
   type SdwDocumentChunkRecord,
   type SdwDocumentRecord,
 } from "./records.js";
-import { mintPersistable, sdwBackendWrite, type Persistable, type Taint } from "./write-gate.js";
+import {
+  mintPersistable,
+  sdwBackendWrite,
+  type MintPersistableOptions,
+  type Persistable,
+  type Taint,
+} from "./write-gate.js";
 import { decodeSdwRecord } from "./store-codec.js";
 
 export interface SdwDocumentCorpusStoreOptions {
@@ -21,6 +27,7 @@ export interface SdwCorpusTxn {
     persistable: Persistable<T>,
     encryptionKey: Uint8Array,
     fortressId: string,
+    options?: MintPersistableOptions,
   ): Promise<void>;
   read(namespace: string, key: string): Promise<Uint8Array | null>;
 }
@@ -43,41 +50,61 @@ export class SdwDocumentCorpusStore {
    * rather than reimplement the checks; a reimplementation is free to drift
    * from the enforced gate, this cannot.
    */
-  mintDocument(record: SdwDocumentRecord, taint: Taint): Persistable<SdwDocumentRecord> {
+  mintDocument(
+    record: SdwDocumentRecord,
+    taint: Taint,
+    options?: MintPersistableOptions,
+  ): Persistable<SdwDocumentRecord> {
     return mintPersistable(
       { value: record, taint },
       SDW_DOCUMENT_CORPUS_NAMESPACE,
       documentKey(record.document_id),
       this.fortressId,
+      options,
     );
   }
 
   /** Chunk counterpart of {@link mintDocument}: same gate, no side effects. */
-  mintChunk(record: SdwDocumentChunkRecord, taint: Taint): Persistable<SdwDocumentChunkRecord> {
+  mintChunk(
+    record: SdwDocumentChunkRecord,
+    taint: Taint,
+    options?: MintPersistableOptions,
+  ): Persistable<SdwDocumentChunkRecord> {
     return mintPersistable(
       { value: record, taint },
       SDW_DOCUMENT_CORPUS_NAMESPACE,
       documentChunkStorageKey(record),
       this.fortressId,
+      options,
     );
   }
 
-  async putDocument(record: SdwDocumentRecord, taint: Taint, txn?: SdwCorpusTxn): Promise<void> {
-    const persistable = this.mintDocument(record, taint);
+  async putDocument(
+    record: SdwDocumentRecord,
+    taint: Taint,
+    txn?: SdwCorpusTxn,
+    options?: MintPersistableOptions,
+  ): Promise<void> {
+    const persistable = this.mintDocument(record, taint, options);
     if (txn !== undefined) {
-      await txn.writePersistable(persistable, this.encryptionKey, this.fortressId);
+      await txn.writePersistable(persistable, this.encryptionKey, this.fortressId, options);
       return;
     }
-    await sdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId);
+    await sdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId, options);
   }
 
-  async putChunk(record: SdwDocumentChunkRecord, taint: Taint, txn?: SdwCorpusTxn): Promise<void> {
-    const persistable = this.mintChunk(record, taint);
+  async putChunk(
+    record: SdwDocumentChunkRecord,
+    taint: Taint,
+    txn?: SdwCorpusTxn,
+    options?: MintPersistableOptions,
+  ): Promise<void> {
+    const persistable = this.mintChunk(record, taint, options);
     if (txn !== undefined) {
-      await txn.writePersistable(persistable, this.encryptionKey, this.fortressId);
+      await txn.writePersistable(persistable, this.encryptionKey, this.fortressId, options);
       return;
     }
-    await sdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId);
+    await sdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId, options);
   }
 
   async getDocument(documentId: string, txn?: SdwCorpusTxn): Promise<SdwDocumentRecord | null> {

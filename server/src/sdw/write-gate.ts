@@ -81,11 +81,32 @@ interface AuthorizedSdwPayload {
 
 const authorizedSdwPayloads = new WeakMap<Uint8Array, AuthorizedSdwPayload>();
 
+/**
+ * Rung-1 point 3 (2026-08-22, memory-file ingest --allow-file override): the
+ * ONLY caller permitted to pass `classifierOverride: true` is
+ * SdwDocumentCorpusStore's mintDocument/mintChunk (and, downstream,
+ * putDocument/putChunk/writePersistable/sdwBackendWrite/prepareSdwBackendWrite
+ * below), and only for a record whose source `MemoryPassageInput` carried
+ * `classifierOverride: true` -- itself set only when an operator named that
+ * exact source file on an explicit `--allow-file` / `allow_files` list (see
+ * `MemoryPassageInput.classifierOverride` in `sdw/adapters/memory-backend.ts`).
+ * Every other SDW store (catalog, working-state, query-history, vector-memory,
+ * replay-anchor) never passes this option, so their classify pass is
+ * unaffected. It is not a general escape hatch: `classifyRecord` runs at TWO
+ * independent chokepoints for a real write (here, in mintPersistable, and
+ * again in prepareSdwBackendWrite below); an override must be threaded
+ * through BOTH or the second pass still rejects.
+ */
+export interface MintPersistableOptions {
+  readonly classifierOverride?: boolean;
+}
+
 export function mintPersistable<T extends SdwRecord>(
   input: Untrusted<T>,
   namespace: SdwNamespace,
   storageKey: string,
   fortressId: string,
+  options?: MintPersistableOptions,
 ): Persistable<T> {
   assertAllowedTaint(input.taint);
   validateRecord(input.value);
@@ -93,7 +114,9 @@ export function mintPersistable<T extends SdwRecord>(
   assertSdwIdentifier(namespace, "namespace");
   assertSdwIdentifier(storageKey, "storage_key");
   const aad = sdwAad(fortressId, namespace, storageKey);
-  classifyRecord(input.value);
+  if (options?.classifierOverride !== true) {
+    classifyRecord(input.value);
+  }
   return {
     [PERSISTABLE_BRAND]: true,
     record: input.value,
@@ -124,8 +147,9 @@ export async function sdwBackendWrite<T extends SdwRecord>(
   persistable: Persistable<T>,
   encryptionKey: Uint8Array,
   fortressId: string,
+  options?: MintPersistableOptions,
 ): Promise<void> {
-  const prepared = prepareSdwBackendWrite(persistable, encryptionKey, fortressId);
+  const prepared = prepareSdwBackendWrite(persistable, encryptionKey, fortressId, options);
   await backend.write(prepared.namespace, prepared.storageKey, prepared.data);
 }
 
@@ -133,6 +157,7 @@ export function prepareSdwBackendWrite<T extends SdwRecord>(
   persistable: Persistable<T>,
   encryptionKey: Uint8Array,
   fortressId: string,
+  options?: MintPersistableOptions,
 ): PreparedSdwWrite {
   assertRuntimePersistable(persistable);
   const namespace = persistable.namespace;
@@ -145,7 +170,14 @@ export function prepareSdwBackendWrite<T extends SdwRecord>(
   assertSdwRecord(persistable.record);
   validateRecord(persistable.record);
   assertNamespaceForRecord(namespace, persistable.record);
-  classifyRecord(persistable.record);
+  // Second independent classify pass (see MintPersistableOptions doc above):
+  // this function is reachable even when the Persistable did not come through
+  // mintPersistable in this same call stack (e.g. the LMDB transaction stages
+  // via prepareSdwBackendWrite directly), so it re-classifies rather than
+  // trusting the first pass. Same narrow override, same source of truth.
+  if (options?.classifierOverride !== true) {
+    classifyRecord(persistable.record);
+  }
   const aad = sdwAad(fortressId, namespace, storageKey);
   const envelope = encrypt(
     stringToBytes(JSON.stringify(persistable.record)),
