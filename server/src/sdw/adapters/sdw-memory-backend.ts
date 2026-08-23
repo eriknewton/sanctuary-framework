@@ -40,7 +40,12 @@ import {
   type SdwDocumentRecord,
 } from "../records.js";
 import type { PersistableTaint } from "../provenance.js";
-import { assertSdwClassifierCleanText, type MintPersistableOptions } from "../write-gate.js";
+import {
+  assertSdwClassifierCleanText,
+  deriveClassifierOverrideAuthorization,
+  type ClassifierOverrideAuthorization,
+  type MintPersistableOptions,
+} from "../write-gate.js";
 import type {
   MemoryBackendAdapter,
   MemoryListOptions,
@@ -115,22 +120,41 @@ interface PreparedPassage {
   readonly documentRecord: SdwDocumentRecord;
   readonly chunkRecords: readonly SdwDocumentChunkRecord[];
   /**
-   * Mirrors the source MemoryPassageInput.classifierOverride (Rung-1 point 3).
-   * Every write site below (insertPassage, putPassages, putPassagesIfAbsent)
-   * must thread this into mintDocument/mintChunk/putDocument/putChunk, because
-   * the classify pass those call lives one level deeper than preparePassage's
-   * own assertSdwClassifierCleanText check.
+   * Per-record authorizations derived (HIGH-C1 fix round) from the source
+   * MemoryPassageInput.classifierOverrideAuthorization (Rung-1 point 3), one
+   * per record because a passage's document content_hash covers the whole
+   * text while each chunk's content_hash covers only its own substring --
+   * the write gate verifies a token against the ONE record it is about to
+   * classify, so a whole-passage token cannot itself authorize a chunk.
+   * `undefined` per slot when there was no valid parent authorization (the
+   * ordinary, non-waiving case). Every write site below (insertPassage,
+   * putPassages, putPassagesIfAbsent) must thread the matching slot into
+   * mintDocument/mintChunk/putDocument/putChunk via documentMintOptions /
+   * chunkMintOptions, because the classify pass those call lives one level
+   * deeper than preparePassage's own assertSdwClassifierCleanText check.
    */
-  readonly classifierOverride: boolean;
+  readonly documentClassifierOverride: ClassifierOverrideAuthorization | undefined;
+  readonly chunkClassifierOverrides: readonly (ClassifierOverrideAuthorization | undefined)[];
 }
 
 /**
- * `undefined` (not `{ classifierOverride: false }`) for the common case, so
- * every OTHER call site's mintDocument/mintChunk/putDocument/putChunk options
+ * `undefined` (not `{ classifierOverride: <token> }` unconditionally) for the
+ * common case, so every OTHER call site's mintDocument/putDocument options
  * argument is exactly what it was before Rung-1 point 3 existed.
  */
-function mintOptionsFor(item: PreparedPassage): MintPersistableOptions | undefined {
-  return item.classifierOverride ? { classifierOverride: true } : undefined;
+function documentMintOptions(item: PreparedPassage): MintPersistableOptions | undefined {
+  return item.documentClassifierOverride === undefined
+    ? undefined
+    : { classifierOverride: item.documentClassifierOverride };
+}
+
+/** Chunk counterpart of {@link documentMintOptions}, indexed to match `item.chunkRecords`. */
+function chunkMintOptions(
+  item: PreparedPassage,
+  chunkIndex: number,
+): MintPersistableOptions | undefined {
+  const token = item.chunkClassifierOverrides[chunkIndex];
+  return token === undefined ? undefined : { classifierOverride: token };
 }
 
 /** The prior state of one passage, captured so a failed batch can restore it. */
@@ -258,27 +282,36 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   ): Promise<MemoryPassage> {
     const prepared = this.preparePassage(input);
     const { documentId, documentRecord, chunkRecords } = prepared;
-    const mintOptions = prepared.classifierOverride ? { classifierOverride: true } : undefined;
 
     const transactional = asSdwTransactional(this.storage);
     if (transactional !== null) {
       await transactional.sdwTransaction(async (txn) => {
         await this.assertDocumentAbsent(documentId, txn);
-        for (const chunkRecord of chunkRecords) {
-          await this.corpus.putChunk(chunkRecord, taint, txn, mintOptions);
+        for (const [index, chunkRecord] of chunkRecords.entries()) {
+          await this.corpus.putChunk(chunkRecord, taint, txn, chunkMintOptions(prepared, index));
         }
-        await this.corpus.putDocument(documentRecord, taint, txn, mintOptions);
+        await this.corpus.putDocument(documentRecord, taint, txn, documentMintOptions(prepared));
       });
     } else {
       await this.withDocumentLock(documentId, async () => {
         await this.assertDocumentAbsent(documentId);
         const writtenChunkKeys: string[] = [];
         try {
-          for (const chunkRecord of chunkRecords) {
+          for (const [index, chunkRecord] of chunkRecords.entries()) {
             writtenChunkKeys.push(documentChunkStorageKey(chunkRecord));
-            await this.corpus.putChunk(chunkRecord, taint, undefined, mintOptions);
+            await this.corpus.putChunk(
+              chunkRecord,
+              taint,
+              undefined,
+              chunkMintOptions(prepared, index),
+            );
           }
-          await this.corpus.putDocument(documentRecord, taint, undefined, mintOptions);
+          await this.corpus.putDocument(
+            documentRecord,
+            taint,
+            undefined,
+            documentMintOptions(prepared),
+          );
         } catch (error) {
           await this.rollbackInsert(documentId, writtenChunkKeys);
           throw error;
@@ -294,21 +327,26 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     applyBareCredentialFallback = false,
   ): MemoryPassageScreen {
     try {
-      const prepared = this.preparePassage(input, applyBareCredentialFallback);
-      const mintOptions = prepared.classifierOverride ? { classifierOverride: true } : undefined;
+      // screenPassage NEVER sets or reads classifierOverrideAuthorization (see
+      // the interface doc in memory-backend.ts): the dry run always reports
+      // the UN-WAIVED verdict, even when the caller's input already carries a
+      // genuine authorization token. A caller cannot get a false "ok" out of a
+      // screen by pre-setting the field on the input it screens with; only
+      // putPassages/insertPassage/putPassagesIfAbsent honor it, and only for
+      // the exact input object it was set on.
+      const unwaived: MemoryPassageInput = {
+        ...input,
+        classifierOverrideAuthorization: undefined,
+      };
+      const prepared = this.preparePassage(unwaived, applyBareCredentialFallback);
       // Mint (and discard) every record the real write would persist. Minting
       // is the enforcement point for the grammar checks and the fail-closed
       // secret classifier and has no side effects, so this screen cannot drift
-      // from the gate putPassages re-runs on the same records. mintOptions
-      // mirrors input.classifierOverride so an already-overridden input
-      // screens ok here exactly as putPassages would accept it; in practice
-      // the Rung-1 ingest path never screens an already-overridden input (it
-      // screens the base input first to learn what the classifier WOULD say,
-      // then decides whether to override), so this only matters for a future
-      // caller that screens a pre-overridden MemoryPassageInput directly.
-      this.corpus.mintDocument(prepared.documentRecord, taint, mintOptions);
+      // from the gate putPassages re-runs on the same records (absent an
+      // override, which this screen never applies).
+      this.corpus.mintDocument(prepared.documentRecord, taint);
       for (const chunkRecord of prepared.chunkRecords) {
-        this.corpus.mintChunk(chunkRecord, taint, mintOptions);
+        this.corpus.mintChunk(chunkRecord, taint);
       }
       return { ok: true };
     } catch (error) {
@@ -361,11 +399,10 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         const prior = await this.capturePriorPassages(prepared);
         await transactional.sdwTransaction(async (txn) => {
           for (const item of prepared) {
-            const mintOptions = mintOptionsFor(item);
-            for (const chunkRecord of item.chunkRecords) {
-              await this.corpus.putChunk(chunkRecord, taint, txn, mintOptions);
+            for (const [index, chunkRecord] of item.chunkRecords.entries()) {
+              await this.corpus.putChunk(chunkRecord, taint, txn, chunkMintOptions(item, index));
             }
-            await this.corpus.putDocument(item.documentRecord, taint, txn, mintOptions);
+            await this.corpus.putDocument(item.documentRecord, taint, txn, documentMintOptions(item));
           }
         });
         await this.pruneOrphanChunks(prepared, prior);
@@ -380,11 +417,20 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
             const beforeOwnerScope = await this.captureOwnerScopeSnapshot();
             try {
               for (const item of prepared) {
-                const mintOptions = mintOptionsFor(item);
-                for (const chunkRecord of item.chunkRecords) {
-                  await this.corpus.putChunk(chunkRecord, taint, undefined, mintOptions);
+                for (const [index, chunkRecord] of item.chunkRecords.entries()) {
+                  await this.corpus.putChunk(
+                    chunkRecord,
+                    taint,
+                    undefined,
+                    chunkMintOptions(item, index),
+                  );
                 }
-                await this.corpus.putDocument(item.documentRecord, taint, undefined, mintOptions);
+                await this.corpus.putDocument(
+                  item.documentRecord,
+                  taint,
+                  undefined,
+                  documentMintOptions(item),
+                );
               }
             } catch (error) {
               await this.restoreAndVerifyPriorPassages(prepared, prior, taint, beforeOwnerScope);
@@ -448,11 +494,10 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
             }
           }
           for (const item of prepared) {
-            const mintOptions = mintOptionsFor(item);
-            for (const chunkRecord of item.chunkRecords) {
-              await this.corpus.putChunk(chunkRecord, taint, txn, mintOptions);
+            for (const [index, chunkRecord] of item.chunkRecords.entries()) {
+              await this.corpus.putChunk(chunkRecord, taint, txn, chunkMintOptions(item, index));
             }
-            await this.corpus.putDocument(item.documentRecord, taint, txn, mintOptions);
+            await this.corpus.putDocument(item.documentRecord, taint, txn, documentMintOptions(item));
           }
           return prepared.map((item) => this.toPassage(item.documentRecord, item.text));
         });
@@ -472,11 +517,20 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
           const beforeOwnerScope = await this.captureOwnerScopeSnapshot();
           try {
             for (const item of prepared) {
-              const mintOptions = mintOptionsFor(item);
-              for (const chunkRecord of item.chunkRecords) {
-                await this.corpus.putChunk(chunkRecord, taint, undefined, mintOptions);
+              for (const [index, chunkRecord] of item.chunkRecords.entries()) {
+                await this.corpus.putChunk(
+                  chunkRecord,
+                  taint,
+                  undefined,
+                  chunkMintOptions(item, index),
+                );
               }
-              await this.corpus.putDocument(item.documentRecord, taint, undefined, mintOptions);
+              await this.corpus.putDocument(
+                item.documentRecord,
+                taint,
+                undefined,
+                documentMintOptions(item),
+              );
             }
           } catch (error) {
             await this.restoreAndVerifyPriorPassages(
@@ -618,14 +672,27 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     const metadata = input.metadata ?? [];
     validatePassageText(input.text);
     validatePassageDecorators(tags, metadata);
-    // Rung-1 point 3: classifierOverride skips ONLY this one check, for this
-    // one passage. It is set exclusively by the memory-file ingest path, and
-    // only for a source file the operator named on an explicit --allow-file /
-    // allow_files list AFTER a prior classifier run already reported what it
-    // would have refused (see MemoryPassageInput.classifierOverride). Every
-    // other input in the same batch, and every other check for THIS input
-    // (grammar, size, taint), is unaffected.
-    if (input.classifierOverride !== true) {
+    // Rung-1 point 3 (hardened in the fix round for HIGH-C1): the passage-level
+    // hash this input's authorization must verify against BEFORE anything
+    // downstream trusts it -- computed once, reused for both this pre-check
+    // and the per-record derivation below, so a token bound to different text
+    // (a different hash) never verifies here even if it is genuinely a real,
+    // WeakSet-registered token.
+    const passageHash = passageContentHash(input.text);
+    const documentClassifierOverride = deriveClassifierOverrideAuthorization(
+      input.classifierOverrideAuthorization,
+      passageHash,
+      passageHash,
+    );
+    // classifierOverrideAuthorization skips ONLY this one check, for this one
+    // passage, and only once it has verified above. It is set exclusively by
+    // the memory-file ingest path, and only for a source file the operator
+    // named on an explicit --allow-file / allow_files list AFTER a prior
+    // classifier run already reported what it would have refused (see
+    // MemoryPassageInput.classifierOverrideAuthorization). Every other input
+    // in the same batch, and every other check for THIS input (grammar, size,
+    // taint), is unaffected.
+    if (documentClassifierOverride === undefined) {
       assertSdwClassifierCleanText(input.text, applyBareCredentialFallback);
     }
     const chunks = chunkText(input.text, this.maxChunkChars);
@@ -646,7 +713,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       version: 1,
       document_id: documentId,
       source: { kind: "internal" },
-      content_hash: passageContentHash(input.text),
+      content_hash: passageHash,
       chunk_count: chunks.length,
       byte_length: stringToBytes(input.text).length,
       created_at: createdAt,
@@ -654,12 +721,25 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       tags,
       metadata,
     };
+    // Re-scope the SAME verified passage-level authorization to each CHUNK's
+    // own content hash (a chunk's content_hash is over its substring, not the
+    // whole passage, so the document-level token above cannot itself
+    // authorize a chunk write). Undefined for every chunk when there was no
+    // valid parent authorization, exactly mirroring documentClassifierOverride.
+    const chunkClassifierOverrides = chunkRecords.map((chunkRecord) =>
+      deriveClassifierOverrideAuthorization(
+        input.classifierOverrideAuthorization,
+        passageHash,
+        chunkRecord.content_hash,
+      ),
+    );
     return {
       documentId,
       text: input.text,
       documentRecord,
       chunkRecords,
-      classifierOverride: input.classifierOverride === true,
+      documentClassifierOverride,
+      chunkClassifierOverrides,
     };
   }
 
@@ -750,13 +830,21 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         continue;
       }
 
+      // HIGH-C3 fix round (2026-08-22): restore through restorePriorChunk /
+      // restorePriorDocument, NEVER through putChunk/putDocument. These prior
+      // bytes were already durably persisted before this batch began (read
+      // back by capturePriorPassages out of the SAME encrypted store), so
+      // re-running them through the classifying write path would re-trip the
+      // classifier for a PREVIOUSLY-waived passage and turn a rollback into a
+      // second, unrecoverable failure. Restoring bytes already at rest adds
+      // no new exposure the classifier could have caught differently.
       for (const chunkRecord of this.rebuildChunkRecords(item.record, item.text)) {
         await attempt(async () => {
-          await this.corpus.putChunk(chunkRecord, taint);
+          await this.corpus.restorePriorChunk(chunkRecord, taint);
         });
       }
       await attempt(async () => {
-        await this.corpus.putDocument(item.record!, taint);
+        await this.corpus.restorePriorDocument(item.record!, taint);
       });
 
       for (

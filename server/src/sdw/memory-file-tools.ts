@@ -14,18 +14,20 @@ import { fixedDenial } from "../agent-native/safety-base.js";
 import type { MemoryBackendAdapter } from "./adapters/memory-backend.js";
 import {
   CLAUDE_CODE_MEMORY_HARNESS,
+  commitClaudeCodeMemorySnapshot,
   emitClaudeCodeMemoryDirectory,
-  ingestClaudeCodeMemorySnapshot,
   readClaudeCodeMemoryDirectory,
+  screenClaudeCodeMemorySnapshot,
 } from "./adapters/claude-code-file-adapter.js";
 import {
   CODEX_MEMORY_HARNESS,
+  commitCodexMemorySnapshot,
   emitCodexMemoryDirectory,
-  ingestCodexMemorySnapshot,
   readCodexMemoryDirectory,
+  screenCodexMemorySnapshot,
 } from "./adapters/codex-memory-file-adapter.js";
 import { SdwValidationError, sdwClassifierReasonText } from "./errors.js";
-import { MEMORY_INGEST_CLASSIFIER_OVERRIDE } from "./memory-file-audit-ops.js";
+import { MEMORY_INGEST_CLASSIFIER_OVERRIDE } from "./adapters/memory-file-allow-list.js";
 import {
   createMultiAgentIsolationGuard,
   type MultiAgentIsolationGuard,
@@ -82,7 +84,8 @@ export const RUNG1_MEMORY_TOOL_DESCRIPTIONS = {
     "paths to ingest as-is even though the classifier refuses them; each use " +
     "is audited by path and reported under overridden, and a listed path the " +
     "classifier never refused is reported as unused, not silently accepted. " +
-    "This does not sync, watch, or replace " +
+    "A call naming allow_files always requires operator approval, even if a " +
+    "custom policy relaxed memory_ingest itself. This does not sync, watch, or replace " +
     "the harness write path, and memory later sent to a model vendor is " +
     "exposed to that vendor at inference.",
   memory_emit:
@@ -278,9 +281,11 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
           type: "array",
           items: { type: "string" },
           description:
-            "Exact source paths (bare filenames relative to dir, no globs or " +
-            "directories) to ingest as-is even if the secret classifier " +
-            "refuses them. Each use is audited by path; a listed path the " +
+            "Exact source paths to ingest as-is even if the secret classifier " +
+            "refuses them: each must be the source filename exactly as the " +
+            "ingest result's skipped/overridden entries name it (e.g. Codex " +
+            "raw_memories.md, not memories/raw_memories.md), never a glob or " +
+            "a directory. Each use is audited by path; a listed path the " +
             "classifier never refused is reported as unused.",
         },
       },
@@ -299,28 +304,75 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
       let fileCount = 0;
       const ingestedAt = now();
       try {
-        let ingestSnapshot: () => ReturnType<typeof ingestClaudeCodeMemorySnapshot>;
+        // Preflight-only (HIGH-C2 fix round): screen decides accept / skip /
+        // override and validates allow_files (assertAllowFilesKnown, inside
+        // screenMemoryFileEntries) WITHOUT writing anything to the vault. The
+        // override audit records below are durably appended, and can abort
+        // the whole ingest, BEFORE commitClaudeCodeMemorySnapshot /
+        // commitCodexMemorySnapshot ever runs, so a crash after this point
+        // can only crash AFTER the waiver is already on the record, never
+        // before.
+        let screened:
+          | { readonly kind: "claude-code"; readonly value: Awaited<ReturnType<typeof screenClaudeCodeMemorySnapshot>> }
+          | { readonly kind: "codex"; readonly value: Awaited<ReturnType<typeof screenCodexMemorySnapshot>> };
         if (harness === CLAUDE_CODE_MEMORY_HARNESS) {
           const snapshot = await readClaudeCodeMemoryDirectory(dir, { ingestedAt });
           fileCount = snapshot.entries.length;
-          ingestSnapshot = () => ingestClaudeCodeMemorySnapshot(adapter, snapshot, { allowFiles });
+          screened = {
+            kind: "claude-code",
+            value: screenClaudeCodeMemorySnapshot(adapter, snapshot, { allowFiles }),
+          };
         } else {
           const snapshot = await readCodexMemoryDirectory(dir, { ingestedAt });
           fileCount = snapshot.entries.length;
-          ingestSnapshot = () => ingestCodexMemorySnapshot(adapter, snapshot, { allowFiles });
+          screened = {
+            kind: "codex",
+            value: screenCodexMemorySnapshot(adapter, snapshot, { allowFiles }),
+          };
         }
+        const outcome = screened.value.outcome;
+
         // Write-ahead INTENT, not an outcome. The durable record precedes the
         // vault mutation so a crash mid-ingest still leaves evidence that an
-        // ingest was attempted; it is labelled `_started` because at this point
-        // nothing has been committed and the file count is only what was READ.
-        // The outcome record below carries what actually landed.
+        // ingest was attempted; it is labelled `_started` because at this
+        // point nothing has been committed. allow_files is included here (not
+        // only on the post-commit record and the per-file override record
+        // below) because it is a PRE-WRITE WITNESS too, cheap insurance on
+        // top of the HIGH-C2 ordering below.
         await auditSuccess("memory_ingest_started", {
           harness,
           source_dir: dir,
           owner_ref: adapter.ownerRef,
           source_file_count: fileCount,
+          allow_files: [...allowFiles].sort(),
         });
-        const result = await ingestSnapshot();
+
+        // One record per overridden file (Rung-1 point 3), durably appended
+        // BEFORE any vault write (HIGH-C2 fix round): the operator waived the
+        // classifier for this exact path, so it is named individually rather
+        // than folded into the aggregate outcome record below. Carries the
+        // refusal metadata the classifier would have reported (detector,
+        // line), never the matched content. If ANY of these audit writes
+        // throws, the catch block below denies the whole ingest and NOTHING
+        // is committed -- the ordering test in test/sdw/memory-file-tools.test.ts
+        // proves this by injecting a failure at the first putPassages call and
+        // asserting the override record is present anyway.
+        for (const override of outcome.overridden) {
+          await auditSuccess(MEMORY_INGEST_CLASSIFIER_OVERRIDE, {
+            harness,
+            source_dir: dir,
+            owner_ref: adapter.ownerRef,
+            source_path: override.source_path,
+            reason: override.reason,
+            detector: override.detector,
+            line: override.line,
+          });
+        }
+
+        const result =
+          screened.kind === "claude-code"
+            ? await commitClaudeCodeMemorySnapshot(adapter, screened.value)
+            : await commitCodexMemorySnapshot(adapter, screened.value);
         await auditSuccess("memory_ingest", {
           harness,
           source_dir: dir,
@@ -336,22 +388,6 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
             reason: skip.reason,
           })),
         });
-        // One record per overridden file (Rung-1 point 3): the operator waived
-        // the classifier for this exact path, so it is named individually
-        // rather than folded into the aggregate outcome record above. Carries
-        // the refusal metadata the classifier would have reported (detector,
-        // line), never the matched content.
-        for (const override of result.overridden) {
-          await auditSuccess(MEMORY_INGEST_CLASSIFIER_OVERRIDE, {
-            harness,
-            source_dir: dir,
-            owner_ref: adapter.ownerRef,
-            source_path: override.source_path,
-            reason: override.reason,
-            detector: override.detector,
-            line: override.line,
-          });
-        }
         return toolResult({
           ingested: true,
           harness,

@@ -23,6 +23,7 @@ import type {
 import {
   screenMemoryFileEntries,
   type MemoryFileOverride,
+  type MemoryFileScreenOutcome,
   type MemoryFileSkip,
 } from "./memory-file-allow-list.js";
 
@@ -232,11 +233,23 @@ export async function ingestClaudeCodeMemoryDirectory(
  * are derived from the source path, so the mirror tracks the source instead of
  * failing on its own previous run.
  */
-export async function ingestClaudeCodeMemorySnapshot(
+/**
+ * Preflight-only phase (HIGH-C2 fix round, 2026-08-22): resolve accept /
+ * skip / override for every entry WITHOUT writing anything to the vault. The
+ * CLI/MCP callers durably audit each override BEFORE calling
+ * commitClaudeCodeMemorySnapshot below, so a crash between screening and
+ * commit leaves no committed content whose waiver was never recorded.
+ */
+export interface ClaudeCodeMemoryScreenResult {
+  readonly outcome: MemoryFileScreenOutcome;
+  readonly source_file_count: number;
+}
+
+export function screenClaudeCodeMemorySnapshot(
   adapter: MemoryBackendAdapter,
   snapshot: ClaudeCodeMemorySnapshot,
   options: IngestClaudeCodeMemoryOptions = {},
-): Promise<IngestClaudeCodeMemoryResult> {
+): ClaudeCodeMemoryScreenResult {
   const allowFiles = options.allowFiles ?? EMPTY_ALLOW_FILES;
   const entries = snapshot.entries.map((entry) => ({
     sourcePath: entry.source_path,
@@ -252,17 +265,46 @@ export async function ingestClaudeCodeMemorySnapshot(
   // applyBareCredentialFallback=true (threaded through screenMemoryFileEntries):
   // a raw Claude Code memory file has no other backstop (both this ingest and
   // the write below tag it "user_content").
-  const screened = screenMemoryFileEntries(adapter, entries, CLAUDE_CODE_MEMORY_TAINT, allowFiles);
+  const outcome = screenMemoryFileEntries(adapter, entries, CLAUDE_CODE_MEMORY_TAINT, allowFiles);
+  return { outcome, source_file_count: snapshot.entries.length };
+}
 
-  const ingested = await adapter.putPassages(screened.accepted, CLAUDE_CODE_MEMORY_TAINT, true);
+/**
+ * Commit phase: persist the ALREADY-screened batch. Callers that need the
+ * override-record-before-commit ordering (HIGH-C2) call
+ * screenClaudeCodeMemorySnapshot, durably audit `screened.outcome.overridden`
+ * themselves, and only then call this.
+ */
+export async function commitClaudeCodeMemorySnapshot(
+  adapter: MemoryBackendAdapter,
+  screened: ClaudeCodeMemoryScreenResult,
+): Promise<IngestClaudeCodeMemoryResult> {
+  const ingested = await adapter.putPassages(screened.outcome.accepted, CLAUDE_CODE_MEMORY_TAINT, true);
   return {
     ingested,
-    skipped: screened.skipped,
-    overridden: screened.overridden,
-    unused_allow_files: screened.unused_allow_files,
-    source_file_count: snapshot.entries.length,
-    complete: screened.skipped.length === 0,
+    skipped: screened.outcome.skipped,
+    overridden: screened.outcome.overridden,
+    unused_allow_files: screened.outcome.unused_allow_files,
+    source_file_count: screened.source_file_count,
+    complete: screened.outcome.skipped.length === 0,
   };
+}
+
+/**
+ * Convenience composition of screen + commit for callers that do not need
+ * the override-record-before-commit ordering (e.g. direct adapter-level
+ * tests). The CLI and MCP memory_ingest surfaces do NOT use this: see
+ * screenClaudeCodeMemorySnapshot/commitClaudeCodeMemorySnapshot above.
+ */
+export async function ingestClaudeCodeMemorySnapshot(
+  adapter: MemoryBackendAdapter,
+  snapshot: ClaudeCodeMemorySnapshot,
+  options: IngestClaudeCodeMemoryOptions = {},
+): Promise<IngestClaudeCodeMemoryResult> {
+  return commitClaudeCodeMemorySnapshot(
+    adapter,
+    screenClaudeCodeMemorySnapshot(adapter, snapshot, options),
+  );
 }
 
 /**

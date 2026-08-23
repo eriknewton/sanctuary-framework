@@ -18,10 +18,29 @@
  */
 
 import type { PersistableTaint } from "../provenance.js";
+import { mintClassifierOverrideAuthorization } from "../write-gate.js";
 import type {
   MemoryBackendAdapter,
   MemoryPassageInput,
 } from "./memory-backend.js";
+import { passageContentHash } from "./sdw-memory-backend.js";
+
+/**
+ * DISTINCT local audit operation string for the Rung-1 memory-file ingest
+ * classifier-override lifecycle (point 3, ratified 2026-08-22:
+ * Wiki/decisions/rung1-classifier-refusal-ux-explain-never-redact-2026-08-22.md).
+ * Lives alongside the decision this op name records (screenMemoryFileEntries'
+ * `overridden` outcome, below) so the two cannot drift apart.
+ *
+ * Sole source for this op name, imported by both `cli/memory-file.ts` and
+ * `sdw/memory-file-tools.ts` (cross-file pin: keep both in sync with this
+ * constant, never re-type the string literal) so the CLI and MCP surfaces
+ * cannot drift on what the override audit record is called.
+ *
+ * This is a LOCAL string, not a widened shared enum: `AuditLog.operation` is
+ * `string`, and adding a new local op here fans out to nothing else.
+ */
+export const MEMORY_INGEST_CLASSIFIER_OVERRIDE = "memory_ingest_classifier_override" as const;
 
 /** One source file the write gate refused, named so the operator can act on it. */
 export interface MemoryFileSkip {
@@ -116,7 +135,14 @@ export function screenMemoryFileEntries(
         detector: screen.detector,
         line: screen.line,
       });
-      accepted.push({ ...entry.input, classifierOverride: true });
+      // Mint the ROOT authorization bound to THIS passage's exact text (HIGH-C1
+      // fix round): preparePassage (sdw-memory-backend.ts) re-verifies this
+      // against the same hash before deriving any per-record authorization
+      // from it, so pairing this token with different content never verifies.
+      const authorization = mintClassifierOverrideAuthorization(
+        passageContentHash(entry.input.text),
+      );
+      accepted.push({ ...entry.input, classifierOverrideAuthorization: authorization });
       continue;
     }
     skipped.push({

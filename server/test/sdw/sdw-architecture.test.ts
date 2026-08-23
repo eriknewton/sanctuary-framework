@@ -27,6 +27,10 @@ import {
   mintPersistable,
   prepareSdwBackendWrite,
 } from "../../src/sdw/write-gate.js";
+import {
+  passageContentHash,
+  SdwMemoryBackendAdapter,
+} from "../../src/sdw/adapters/sdw-memory-backend.js";
 
 const FORTRESS_ID = "fortress:test";
 const MASTER_KEY = new Uint8Array(32).fill(7);
@@ -299,7 +303,114 @@ ${VALID_TXN_WRITE}
       );
     });
   });
+
+  describe("classifier-override / restore capability containment (HIGH-C1, HIGH-C3 fix round, 2026-08-22)", () => {
+    // NOTE (not a fail-before-exempt marker -- too far from the file top to
+    // register as one, and deliberately so): this describe block is a
+    // STRUCTURAL containment scan over the real src/ tree, not a behavior
+    // test with a pre-fix/post-fix shape. The two functions it pins
+    // (mintClassifierOverrideAuthorization, mintRestoredPersistable) and
+    // their sole legitimate callers were BOTH introduced in the same change,
+    // so there is no earlier "unfixed" source state for these two assertions
+    // to fail against; "fails before the fix" has no meaning when the
+    // capability being contained did not exist before this change. Proven
+    // correct instead by the synthetic-violation case below (a real
+    // reference to the real symbol name from a file deliberately left off
+    // the allowlist), which DOES fail without the scan and pass with it, and
+    // by the fake-token unit test, which proves the runtime side
+    // independently of the static scan.
+    it("mintClassifierOverrideAuthorization is referenced ONLY by memory-file-allow-list.ts and write-gate.ts", async () => {
+      const offenders = await findUnauthorizedReferences(
+        "mintClassifierOverrideAuthorization",
+        new Set([
+          join("sdw", "write-gate.ts"),
+          join("sdw", "adapters", "memory-file-allow-list.ts"),
+        ]),
+      );
+      expect(offenders).toEqual([]);
+    });
+
+    it("mintRestoredPersistable is referenced ONLY by document-corpus-store.ts and write-gate.ts", async () => {
+      const offenders = await findUnauthorizedReferences(
+        "mintRestoredPersistable",
+        new Set([join("sdw", "write-gate.ts"), join("sdw", "document-corpus-store.ts")]),
+      );
+      expect(offenders).toEqual([]);
+    });
+
+    it("the containment scanner actually catches a reference from an unauthorized file", async () => {
+      // Proves findUnauthorizedReferences is not vacuously passing: a real
+      // reference to the real symbol name, in a file NOT on the allowlist,
+      // must be reported.
+      const offenders = await findUnauthorizedReferences(
+        "mintClassifierOverrideAuthorization",
+        new Set([join("sdw", "write-gate.ts")]), // deliberately omits memory-file-allow-list.ts
+      );
+      expect(offenders).toContain(join("sdw", "adapters", "memory-file-allow-list.ts"));
+    });
+
+    it("SdwMemoryBackendAdapter.putPassages refuses genuinely-refused content even when the input carries a hand-built fake authorization object", async () => {
+      // HIGH-C1's core property: an object that merely LOOKS like
+      // ClassifierOverrideAuthorization (same shape, even the SAME content
+      // hash) but was never returned by mintClassifierOverrideAuthorization is
+      // not in the module-private WeakSet, so it must never verify.
+      const storage = new MemoryStorage();
+      const masterKey = new Uint8Array(32).fill(9);
+      const adapter = new SdwMemoryBackendAdapter({
+        storage,
+        masterKey,
+        fortressId: "fortress:fake-token-test",
+        ownerRef: "fleet-self",
+      });
+      const text = "SANCTUARY_RECOVERY_KEY=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE";
+      const fakeToken = { contentHash: passageContentHash(text) };
+      await expect(
+        adapter.putPassages(
+          [
+            {
+              passage_id: "fake-token-attempt",
+              text,
+              classifierOverrideAuthorization: fakeToken,
+            },
+          ],
+          "user_content",
+          true,
+        ),
+      ).rejects.toMatchObject({ category: "classifier_reject" });
+    });
+  });
 });
+
+/**
+ * Scan the real src/ tree for source-level references to `symbolName`
+ * (import specifier, call, or bare identifier) outside `allowedPaths`
+ * (relative to src/). Used to pin the two capability-minting functions
+ * (mintClassifierOverrideAuthorization, mintRestoredPersistable) to their
+ * sole legitimate callers -- the runtime unforgeability comes from a
+ * module-private WeakSet (see write-gate.ts), and this scan is the
+ * complementary STATIC containment check: even a caller with legitimate
+ * reasons to think it needs the function should not be able to reach it and
+ * ship, because CI fails on the reference alone.
+ */
+async function findUnauthorizedReferences(
+  symbolName: string,
+  allowedPaths: ReadonlySet<string>,
+): Promise<string[]> {
+  const root = join(process.cwd(), "src");
+  const offenders: string[] = [];
+  for (const file of await listTsFiles(root)) {
+    const relativePath = relative(root, file);
+    if (allowedPaths.has(relativePath)) continue;
+    const source = await readFile(file, "utf8");
+    // A fresh RegExp per file (not hoisted outside the loop): a shared
+    // instance across the whole scan is unnecessary here and risks exactly
+    // the kind of subtle cross-call reuse this scan must never suffer from.
+    if (new RegExp(symbolName).test(source)) {
+      offenders.push(relativePath);
+    }
+  }
+  return offenders;
+}
 
 function callsSdwRawWrite(source: string, aliases = new Set<string>()): boolean {
   const namespaceTargets = [

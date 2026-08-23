@@ -494,7 +494,7 @@ describe("SDW memory file tools", () => {
       expect(outcomeAudit.details.unused_allow_files).toEqual(["concise-updates.md"]);
     });
 
-    it("denies with invalid_args on an allow-listed path absent from the source directory", async () => {
+    it("denies (ingest_failed, not invalid_args) on an allow-listed path absent from the source directory, before any intent record", async () => {
       const { tools, auditCalls } = await makeTools();
       const source = await copyFixtureSet("basic", "cc-memory-tool-allow-file-unknown");
 
@@ -504,19 +504,22 @@ describe("SDW memory file tools", () => {
         allow_files: ["does-not-exist.md"],
       });
 
-      // The unknown path throws inside the adapter (assertAllowFilesKnown), so
-      // this denies via the ingest_failed catch path, not the invalid_args
-      // pre-check; either way nothing is committed and the failure is audited.
+      // The unknown path throws inside the handler's own pre-write
+      // assertAllowFilesKnown call (Rung-1 fix-round LOW-3), which runs BEFORE
+      // memory_ingest_started, so this denies via the ingest_failed catch path
+      // with NO intent record at all -- not the invalid_args pre-check (that
+      // is reserved for a malformed harness/dir/allow_files shape), and not a
+      // "_started" record with no matching outcome.
       const parsed = parse(result);
       expect(parsed.denied).toBe(true);
+      const opsForThisCall = auditCalls.map((call) => call.operation);
+      expect(opsForThisCall).not.toContain("memory_ingest_started");
+      expect(opsForThisCall).not.toContain("memory_ingest_classifier_override");
       expect(
         auditCalls.some(
           (call) => call.operation === "memory_ingest_denied" && call.result === "failure",
         ),
       ).toBe(true);
-      expect(
-        auditCalls.some((call) => call.operation === "memory_ingest_classifier_override"),
-      ).toBe(false);
       expect(
         auditCalls.some((call) => call.operation === "memory_ingest" && call.result === "success"),
       ).toBe(false);
@@ -597,6 +600,83 @@ describe("SDW memory file tools", () => {
             call.details.source_path === "raw_memories.md",
         ),
       ).toBe(true);
+    });
+
+    it("HIGH-C2: writes the override audit record BEFORE the first corpus write, even when that write then fails", async () => {
+      // Injects a failure at the very first storage write the commit phase
+      // performs, then proves the override record is already durable -- the
+      // override audit is NOT a side effect of a successful commit.
+      class FailFirstWriteStorage extends FilesystemStorage {
+        private writeCount = 0;
+        override async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+          this.writeCount += 1;
+          if (this.writeCount === 1) {
+            throw new Error("HIGH-C2 injected failure: first corpus write");
+          }
+          return super.write(namespace, key, data);
+        }
+      }
+      const storage = new FailFirstWriteStorage(await tempDir("cc-memory-tool-high-c2"));
+      const adapter = new SdwMemoryBackendAdapter({
+        storage,
+        masterKey: MASTER_KEY,
+        fortressId: "fortress:high-c2",
+        ownerRef: "fleet-self",
+        now: () => NOW,
+      });
+      const auditCalls: AuditCall[] = [];
+      const auditLog = {
+        async appendCritical(entry: {
+          readonly operation: string;
+          readonly result: "success" | "failure";
+          readonly details?: Record<string, unknown>;
+        }): Promise<void> {
+          auditCalls.push({
+            operation: entry.operation,
+            result: entry.result,
+            details: entry.details ?? {},
+          });
+        },
+      } as unknown as AuditLog;
+      const tools = new Map(
+        createSdwMemoryFileTools({ adapter, auditLog }).map((tool) => [tool.name, tool]),
+      );
+      const source = await refusedFixture("cc-memory-tool-high-c2-source");
+
+      const result = parse(
+        await tools.get("memory_ingest")!.handler({
+          harness: "claude-code",
+          dir: source,
+          allow_files: ["note-with-secret.md"],
+        }),
+      );
+
+      // The whole ingest denies (the injected failure propagates), and
+      // nothing was committed.
+      expect(result.denied).toBe(true);
+      expect((await adapter.listPassages()).length).toBe(0);
+
+      // But the override record for the waived file exists anyway: it was
+      // written during the preflight phase, before commitClaudeCodeMemorySnapshot
+      // (and therefore the failing storage.write) ever ran.
+      const overrideAudit = auditCalls.find(
+        (call) => call.operation === "memory_ingest_classifier_override",
+      );
+      expect(overrideAudit).toBeDefined();
+      expect(overrideAudit!.details).toMatchObject({
+        source_path: "note-with-secret.md",
+        detector: "labeled_recovery_key",
+        line: 3,
+      });
+      // And the ordering itself: the override record precedes any record
+      // that could only exist after a commit attempt (memory_ingest_denied,
+      // appended from the catch block once the failing write propagates).
+      const overrideIndex = auditCalls.findIndex(
+        (call) => call.operation === "memory_ingest_classifier_override",
+      );
+      const denialIndex = auditCalls.findIndex((call) => call.operation === "memory_ingest_denied");
+      expect(overrideIndex).toBeGreaterThanOrEqual(0);
+      expect(denialIndex).toBeGreaterThan(overrideIndex);
     });
   });
 

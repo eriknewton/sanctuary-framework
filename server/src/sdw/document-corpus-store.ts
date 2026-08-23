@@ -9,6 +9,8 @@ import {
 } from "./records.js";
 import {
   mintPersistable,
+  mintRestoredPersistable,
+  restoreSdwBackendWrite,
   sdwBackendWrite,
   type MintPersistableOptions,
   type Persistable,
@@ -105,6 +107,40 @@ export class SdwDocumentCorpusStore {
       return;
     }
     await sdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId, options);
+  }
+
+  /**
+   * HIGH-C3 fix round (2026-08-22): restore-only counterpart of putDocument,
+   * used ONLY by SdwMemoryBackendAdapter.restoreAndVerifyPriorPassages to
+   * replay a record that was already durably persisted before the failed
+   * batch began. NEVER re-classifies (mintRestoredPersistable/
+   * restoreSdwBackendWrite never call the classifier at all): see those
+   * functions' doc comments in write-gate.ts. No transactional (`txn`) form
+   * exists because this path is only ever reached from the NON-transactional
+   * rollback branch (a transactional batch's failure discards the whole
+   * staged overlay atomically, so there is nothing to roll back to).
+   */
+  async restorePriorDocument(record: SdwDocumentRecord, taint: Taint): Promise<void> {
+    const persistable = mintRestoredPersistable(
+      record,
+      taint,
+      SDW_DOCUMENT_CORPUS_NAMESPACE,
+      documentKey(record.document_id),
+      this.fortressId,
+    );
+    await restoreSdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId);
+  }
+
+  /** Chunk counterpart of {@link restorePriorDocument}. */
+  async restorePriorChunk(record: SdwDocumentChunkRecord, taint: Taint): Promise<void> {
+    const persistable = mintRestoredPersistable(
+      record,
+      taint,
+      SDW_DOCUMENT_CORPUS_NAMESPACE,
+      documentChunkStorageKey(record),
+      this.fortressId,
+    );
+    await restoreSdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId);
   }
 
   async getDocument(documentId: string, txn?: SdwCorpusTxn): Promise<SdwDocumentRecord | null> {

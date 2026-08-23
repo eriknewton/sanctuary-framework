@@ -1874,7 +1874,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Exact source paths (bare filenames relative to dir, no globs or directories) to ingest as-is even if the secret classifier refuses them. Each use is audited by path; a listed path the classifier never refused is reported as unused."
+            "description": "Exact source paths to ingest as-is even if the secret classifier refuses them: each must be the source filename exactly as the ingest result's skipped/overridden entries name it (e.g. Codex raw_memories.md, not memories/raw_memories.md), never a glob or a directory. Each use is audited by path; a listed path the classifier never refused is reported as unused."
           }
         },
         "required": [

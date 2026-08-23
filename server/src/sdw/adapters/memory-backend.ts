@@ -18,6 +18,7 @@
 
 import type { SdwDocumentMetadata } from "../records.js";
 import type { PersistableTaint } from "../provenance.js";
+import type { ClassifierOverrideAuthorization } from "../write-gate.js";
 
 /** A passage as stored in, and returned from, the sovereign backend. */
 export interface MemoryPassage {
@@ -48,23 +49,30 @@ export interface MemoryPassageInput {
   /** Optional caller-supplied creation timestamp (ISO 8601). */
   readonly created_at?: string;
   /**
-   * Rung-1 point 3 (2026-08-22): bypasses ONLY the secret-classifier detector
-   * step for this one passage; grammar, size, and taint checks still run.
-   * Every other check in the write gate still applies, so this can never turn
-   * an otherwise-invalid write into a valid one, only a classifier_reject into
-   * an accepted one.
+   * Rung-1 point 3 (2026-08-22, hardened in the fix round for HIGH-C1):
+   * bypasses ONLY the secret-classifier detector step for this one passage;
+   * grammar, size, and taint checks still run. Every other check in the
+   * write gate still applies, so this can never turn an otherwise-invalid
+   * write into a valid one, only a classifier_reject into an accepted one.
    *
-   * This field exists for exactly one caller shape: a memory-file ingest that
-   * already ran the classifier once (via screenPassage, with this flag unset),
-   * recorded what it would have refused (detector, line), and is now
-   * re-submitting the SAME text because the operator named this exact source
-   * file on an explicit, per-file `--allow-file` / `allow_files` list. It is
-   * never set from directly-deserialized caller args (every construction site
-   * builds this object as an explicit literal), and there is deliberately no
-   * batch-wide or global equivalent: `putPassages`/`screenPassage` re-run the
-   * classifier on every OTHER passage in the same call exactly as before.
+   * Deliberately an OPAQUE, unforgeable token (`ClassifierOverrideAuthorization`
+   * from write-gate.ts), not a plain boolean: a boolean here was a
+   * true/false switch any caller constructing a MemoryPassageInput could
+   * flip with zero verification. A token can only be produced by the ROOT
+   * minting function write-gate.ts declares for this purpose, which ONLY
+   * sdw/adapters/memory-file-allow-list.ts may call (structurally pinned by
+   * a test), after the classifier genuinely refused this exact text (via
+   * screenPassage, which never mints or honors this field) and the operator
+   * named this exact source file on an explicit, per-file `--allow-file` /
+   * `allow_files` list. preparePassage (sdw-memory-backend.ts) re-verifies
+   * this token against the passage's own content hash before deriving any
+   * per-record authorization from it, so a token bound to different text
+   * cannot be reused here. There is deliberately no batch-wide or global
+   * equivalent: `putPassages`/`screenPassage` re-run the classifier on every
+   * OTHER passage in the same call exactly as before, and `screenPassage`
+   * never reads this field on ANY passage (see its doc below).
    */
-  readonly classifierOverride?: boolean;
+  readonly classifierOverrideAuthorization?: ClassifierOverrideAuthorization;
 }
 
 /**
@@ -179,9 +187,9 @@ export interface MemoryBackendAdapter {
    * rejected input does not abort a whole mirror. It NEVER relaxes the gate:
    * putPassages re-runs the real gate on everything it writes, with the one
    * narrow, explicit exception a caller opts a SPECIFIC input into via
-   * `MemoryPassageInput.classifierOverride` (see that field's doc); screenPassage
-   * itself never sets or reads that flag, so the dry run always reports what the
-   * classifier would say absent an override.
+   * `MemoryPassageInput.classifierOverrideAuthorization` (see that field's
+   * doc); screenPassage itself never sets or reads that field, so the dry run
+   * always reports what the classifier would say absent an override.
    *
    * `applyBareCredentialFallback`: see putPassages above; a screen and the
    * real write it is deciding for must pass the SAME value or the dry run

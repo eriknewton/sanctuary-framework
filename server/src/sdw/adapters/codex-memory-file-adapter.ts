@@ -22,6 +22,7 @@ import type {
 import {
   screenMemoryFileEntries,
   type MemoryFileOverride,
+  type MemoryFileScreenOutcome,
   type MemoryFileSkip,
 } from "./memory-file-allow-list.js";
 
@@ -200,11 +201,20 @@ export async function ingestCodexMemoryDirectory(
   );
 }
 
-export async function ingestCodexMemorySnapshot(
+/**
+ * Preflight-only phase (HIGH-C2 fix round, 2026-08-22): see
+ * screenClaudeCodeMemorySnapshot's doc comment for the ordering rationale.
+ */
+export interface CodexMemoryScreenResult {
+  readonly outcome: MemoryFileScreenOutcome;
+  readonly source_file_count: number;
+}
+
+export function screenCodexMemorySnapshot(
   adapter: MemoryBackendAdapter,
   snapshot: CodexMemorySnapshot,
   options: IngestCodexMemoryOptions = {},
-): Promise<IngestCodexMemoryResult> {
+): CodexMemoryScreenResult {
   const allowFiles = options.allowFiles ?? EMPTY_ALLOW_FILES;
   const entries = snapshot.entries.map((entry) => ({
     sourcePath: entry.source_path,
@@ -220,17 +230,37 @@ export async function ingestCodexMemorySnapshot(
   // applyBareCredentialFallback=true (threaded through screenMemoryFileEntries):
   // a raw Codex memory file has no other backstop (both this ingest and the
   // write below tag it "user_content").
-  const screened = screenMemoryFileEntries(adapter, entries, CODEX_MEMORY_TAINT, allowFiles);
+  const outcome = screenMemoryFileEntries(adapter, entries, CODEX_MEMORY_TAINT, allowFiles);
+  return { outcome, source_file_count: snapshot.entries.length };
+}
 
-  const ingested = await adapter.putPassages(screened.accepted, CODEX_MEMORY_TAINT, true);
+export async function commitCodexMemorySnapshot(
+  adapter: MemoryBackendAdapter,
+  screened: CodexMemoryScreenResult,
+): Promise<IngestCodexMemoryResult> {
+  const ingested = await adapter.putPassages(screened.outcome.accepted, CODEX_MEMORY_TAINT, true);
   return {
     ingested,
-    skipped: screened.skipped,
-    overridden: screened.overridden,
-    unused_allow_files: screened.unused_allow_files,
-    source_file_count: snapshot.entries.length,
-    complete: screened.skipped.length === 0,
+    skipped: screened.outcome.skipped,
+    overridden: screened.outcome.overridden,
+    unused_allow_files: screened.outcome.unused_allow_files,
+    source_file_count: screened.source_file_count,
+    complete: screened.outcome.skipped.length === 0,
   };
+}
+
+/**
+ * Convenience composition of screen + commit for callers that do not need
+ * the override-record-before-commit ordering. The CLI and MCP memory_ingest
+ * surfaces do NOT use this: see screenCodexMemorySnapshot/
+ * commitCodexMemorySnapshot above.
+ */
+export async function ingestCodexMemorySnapshot(
+  adapter: MemoryBackendAdapter,
+  snapshot: CodexMemorySnapshot,
+  options: IngestCodexMemoryOptions = {},
+): Promise<IngestCodexMemoryResult> {
+  return commitCodexMemorySnapshot(adapter, screenCodexMemorySnapshot(adapter, snapshot, options));
 }
 
 export async function emitCodexMemoryDirectory(

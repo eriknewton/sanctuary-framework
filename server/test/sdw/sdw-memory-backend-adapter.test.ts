@@ -15,6 +15,7 @@ import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
 import {
   assertSdwRawWriteAuthorized,
   encryptedEnvelopeContains,
+  mintClassifierOverrideAuthorization,
 } from "../../src/sdw/write-gate.js";
 import { SdwValidationError } from "../../src/sdw/errors.js";
 import { CrossProcessLockError } from "../../src/storage/cross-process-lock.js";
@@ -447,6 +448,52 @@ describe("SDW memory-backend adapter: write-gate enforcement", () => {
         text: row.before,
       });
     }
+  });
+
+  it("HIGH-C3: restores a previously-waived (classifier-overridden) passage byte-for-byte when a later batch write fails, without re-tripping the classifier", async () => {
+    const passageId = "waived-rollback-1";
+    const documentId = `mem.letta-archive-1.${passageId}`;
+    const waivedText = "remember this: -----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2Vw";
+    const storage = new ConfigurableWriteFailureStorage();
+    const adapter = makeAdapter(storage) as SdwMemoryBackendAdapter;
+
+    // Commit the WAIVED passage first, exactly as the Rung-1 ingest path
+    // would: a genuine authorization minted for this exact text, so the
+    // classifier is skipped for this one insert.
+    await adapter.putPassages(
+      [
+        {
+          passage_id: passageId,
+          text: waivedText,
+          classifierOverrideAuthorization: mintClassifierOverrideAuthorization(
+            passageContentHash(waivedText),
+          ),
+        },
+      ],
+      "user_content",
+    );
+    const beforeKeys = await ownerScopeCorpusKeys(storage);
+    await expect(adapter.getPassage(passageId)).resolves.toMatchObject({ text: waivedText });
+
+    // A LATER batch write for the SAME passage id fails partway (no override
+    // this time -- an ordinary re-ingest), forcing restoreAndVerifyPriorPassages
+    // to replay the WAIVED prior bytes captured above.
+    storage.writeFailureKey = documentKey(documentId);
+    await expect(
+      adapter.putPassages(
+        [{ passage_id: passageId, text: "a completely different, unrelated replacement" }],
+        "user_content",
+      ),
+    ).rejects.toThrow("simulated document write failure");
+
+    // Byte-for-byte restoration: the classifier was never asked to reclassify
+    // the restored secret-shaped text (if it had been, this assertion would
+    // never be reached -- the promise above would have rejected with
+    // partial_scope, not the plain simulated-failure message, since a second,
+    // DIFFERENT thrown error during the rollback attempt is what partial_scope
+    // reports).
+    expect(await ownerScopeCorpusKeys(storage)).toEqual(beforeKeys);
+    await expect(adapter.getPassage(passageId)).resolves.toMatchObject({ text: waivedText });
   });
 
   it("maps verification read failures to partial_scope with the original cause", async () => {
