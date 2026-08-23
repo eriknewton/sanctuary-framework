@@ -77,7 +77,7 @@ import {
   verifySdwExportManifest,
   SdwImportVerificationError,
 } from "../../src/sdw/import.js";
-import { createSdwTools, type SdwToolsOptions } from "../../src/sdw/tools.js";
+import { createSdwExportDeleteTool, createSdwTools, type SdwToolsOptions } from "../../src/sdw/tools.js";
 
 const SOURCE_FORTRESS = "fortress:source";
 const TARGET_FORTRESS = "fortress:target";
@@ -399,7 +399,7 @@ async function makeExportHarness(
   await seedSourceVault(source);
   const signing = makeSigning();
   const exportDir = await makeExportDir();
-  const tools = createSdwTools({
+  const toolOptions: SdwToolsOptions = {
     storage: source.vault,
     inventory: source.vault,
     auditLog: source.auditLog,
@@ -410,7 +410,10 @@ async function makeExportHarness(
     resolveSourceMasterKey: () => null,
     targetMasterKey: source.masterKey,
     ...overrides,
-  });
+  };
+  // sdw_export_delete is NOT a shipped surface (see tools.ts); the D2 suite
+  // still exercises it through its own factory.
+  const tools = [...createSdwTools(toolOptions), createSdwExportDeleteTool(toolOptions)];
   return {
     source,
     signing,

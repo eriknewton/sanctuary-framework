@@ -86,6 +86,23 @@ export async function createTempHome(prefix = "sanctuary-test-home"): Promise<{
   const home = await mkdtemp(join(tmpdir(), `${prefix}-`));
   const originalHome = process.env.HOME;
   process.env.HOME = home;
+  // The operator's machine is not a fixture: moving HOME alone still leaves an
+  // ambient SANCTUARY_STORAGE_PATH / SANCTUARY_FORTRESS_PATH pointing at the
+  // real fortress, and an ambient passphrase or recovery key able to unlock
+  // it. Clear every path and credential variable for the life of the temp
+  // home (the default-resolution branch this helper exists for still resolves
+  // to `<tempHome>/.sanctuary`), and restore them on cleanup.
+  const AMBIENT_FORTRESS_ENV = [
+    "SANCTUARY_STORAGE_PATH",
+    "SANCTUARY_FORTRESS_PATH",
+    "SANCTUARY_PASSPHRASE",
+    "SANCTUARY_RECOVERY_KEY",
+  ] as const;
+  const originalAmbient = new Map<string, string | undefined>();
+  for (const key of AMBIENT_FORTRESS_ENV) {
+    originalAmbient.set(key, process.env[key]);
+    delete process.env[key];
+  }
 
   let cleanedUp = false;
   const cleanup = async (): Promise<void> => {
@@ -93,6 +110,10 @@ export async function createTempHome(prefix = "sanctuary-test-home"): Promise<{
     cleanedUp = true;
     if (originalHome === undefined) delete process.env.HOME;
     else process.env.HOME = originalHome;
+    for (const [key, value] of originalAmbient) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     try {
       await rm(home, { recursive: true, force: true });
     } catch {

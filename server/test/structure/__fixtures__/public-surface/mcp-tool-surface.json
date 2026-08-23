@@ -2054,6 +2054,56 @@
     }
   },
   {
+    "name": "sdw_export",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "export_name": {
+          "type": "string",
+          "description": "Bundle filename stem inside the operator-configured export directory"
+        },
+        "namespaces": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional subset of exportable SDW namespaces (default: all)"
+        }
+      },
+      "required": [
+        "export_name"
+      ]
+    }
+  },
+  {
+    "name": "sdw_import",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "bundle": {
+          "type": "string",
+          "description": "Base64url-encoded SDW export bundle"
+        },
+        "source_key_ref": {
+          "type": "string",
+          "description": "Opaque reference to operator-configured source key material"
+        },
+        "conflict_resolution": {
+          "type": "string",
+          "enum": [
+            "skip",
+            "overwrite"
+          ],
+          "default": "skip"
+        }
+      },
+      "required": [
+        "bundle",
+        "source_key_ref"
+      ]
+    }
+  },
+  {
     "name": "sdw_memory_provenance",
     "inputSchema": {
       "type": "object",

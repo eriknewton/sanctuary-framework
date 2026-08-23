@@ -15,6 +15,8 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { detectCustodyFactorOrphan } from "../wrap/orphan-detection.js";
+import { getPlatformPaths } from "../wrap/config-reader.js";
+import { hermesConfigYamlPath, hermesSanctuaryEntryEnvValue } from "../wrap/hermes-yaml.js";
 import {
   describePyYamlCandidateFailure,
   probePyYamlCandidates,
@@ -143,6 +145,8 @@ export async function runDoctorChecks(opts: {
   checks.push(checkRuntime());
   checks.push(await checkHermesConfigParser(opts));
   checks.push(await checkCastleWall(opts));
+  const harnessIds = await collectWrappedHarnessAgentIds();
+  checks.push(checkWrappedHarnessAgentIds(harnessIds));
   if (masterKey) masterKey.fill(0);
   return checks;
 }
@@ -426,6 +430,91 @@ async function checkAuditChain(
     );
   }
   return fail("audit chain", `${report.findings.length} integrity finding(s)`, "run sanctuary audit-chain export and verify for details");
+}
+
+/**
+ * Wrapped-harness agent identity (IC-16 follow-through). `sanctuary wrap`
+ * writes `SANCTUARY_AGENT_ID` into the harness's `sanctuary` MCP entry; the
+ * server's multi-agent isolation guard keys on it. A wrap performed before
+ * that landed has a `sanctuary` entry with no such variable, so the server it
+ * spawns resolves no identity and the guard pins the "unconfigured" caller.
+ * Read-only: reports the entries that need `sanctuary wrap` re-run. Failure
+ * mode from the outside: two harnesses wrapped before the upgrade both look
+ * isolated in the docs and are not, and nothing else says so.
+ */
+interface WrappedHarnessEntry {
+  readonly platform: string;
+  readonly path: string;
+  readonly agentId: string | null;
+}
+
+async function collectWrappedHarnessAgentIds(): Promise<WrappedHarnessEntry[]> {
+  const found: WrappedHarnessEntry[] = [];
+  for (const [platform, paths] of Object.entries(getPlatformPaths())) {
+    for (const path of paths) {
+      let raw: string;
+      try {
+        raw = await readFile(path, "utf-8");
+      } catch {
+        continue;
+      }
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      const entry = sanctuaryMcpEntry(parsed);
+      if (entry === null) continue;
+      const env = entry.env as Record<string, unknown> | undefined;
+      const agentId = env?.SANCTUARY_AGENT_ID;
+      found.push({
+        platform,
+        path,
+        agentId: typeof agentId === "string" && agentId.length > 0 ? agentId : null,
+      });
+    }
+  }
+  // Hermes loads its MCP surface from config.yaml, not from the JSON paths
+  // above; read it through the wrap writer's own block scanner.
+  const yamlPath = hermesConfigYamlPath();
+  let yaml: string | null;
+  try {
+    yaml = await readFile(yamlPath, "utf-8");
+  } catch {
+    yaml = null;
+  }
+  const hermesId = hermesSanctuaryEntryEnvValue(yaml, "SANCTUARY_AGENT_ID");
+  if (hermesId !== undefined) {
+    found.push({ platform: "hermes", path: yamlPath, agentId: hermesId });
+  }
+  return found;
+}
+
+function checkWrappedHarnessAgentIds(entries: readonly WrappedHarnessEntry[]): DoctorCheck {
+  const missing = entries.filter((e) => e.agentId === null).map((e) => `${e.platform}: ${e.path}`);
+  if (entries.length === 0) return ok("wrapped harness ids", "no wrapped harness config found", "n/a");
+  if (missing.length === 0) {
+    return ok("wrapped harness ids", `${entries.length} wrapped harness entr${entries.length === 1 ? "y" : "ies"} carry SANCTUARY_AGENT_ID`, "n/a");
+  }
+  return warn(
+    "wrapped harness ids",
+    `${missing.length} wrapped harness entr${missing.length === 1 ? "y" : "ies"} without SANCTUARY_AGENT_ID (${missing.join("; ")})`,
+    "re-run sanctuary wrap on each harness so the multi-agent isolation guard has an identity to pin",
+  );
+}
+
+/** The `sanctuary` MCP entry in any of the harness config shapes wrap writes. */
+function sanctuaryMcpEntry(parsed: Record<string, unknown>): Record<string, unknown> | null {
+  const candidates = [
+    (parsed.mcpServers as Record<string, unknown> | undefined)?.sanctuary,
+    ((parsed.mcp as Record<string, unknown> | undefined)?.servers as Record<string, unknown> | undefined)?.sanctuary,
+    (parsed.mcp_servers as Record<string, unknown> | undefined)?.sanctuary,
+  ];
+  for (const candidate of candidates) {
+    if (candidate !== null && typeof candidate === "object") return candidate as Record<string, unknown>;
+  }
+  return null;
 }
 
 function checkRuntime(): DoctorCheck {

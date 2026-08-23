@@ -20,7 +20,8 @@
  *   happens exclusively inside an approved import). Export never decrypts.
  */
 
-import { rename, unlink, writeFile } from "node:fs/promises";
+import { lstat, open, rename, unlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import type { EncryptedPayload } from "../core/encryption.js";
 import { bytesToString, stringToBytes, toBase64url } from "../core/encoding.js";
@@ -42,9 +43,13 @@ import { SdwValidationError } from "./errors.js";
 // rotation events, and checkpoints. Every D2 artifact hash/signature input is
 // domain-prefixed so an export manifest can never be confused with (or replayed
 // as) any other signed payload, and vice versa.
-const SDW_EXPORT_RECORD_HASH_DOMAIN = "sanctuary.sdw-export-record-hash.v1\n";
-const SDW_EXPORT_SCOPE_DIGEST_DOMAIN = "sanctuary.sdw-export-scope-digest.v1\n";
-const SDW_EXPORT_MANIFEST_SIGNING_DOMAIN = "sanctuary.sdw-export-manifest.v1\n";
+// Declared in core/signing-domains.ts so the raw `identity_sign` surface can
+// refuse payloads carrying them (must match that list; never re-declare here).
+import {
+  SDW_EXPORT_MANIFEST_SIGNING_DOMAIN,
+  SDW_EXPORT_RECORD_HASH_DOMAIN,
+  SDW_EXPORT_SCOPE_DIGEST_DOMAIN,
+} from "../core/signing-domains.js";
 
 /**
  * Namespaces eligible for export. `_sdw_catalog` and `_sdw_meta` are
@@ -78,6 +83,61 @@ export interface SdwExportInventorySource {
   listNamespaceSync(
     namespace: SdwExportableNamespace,
   ): readonly SdwInventoryEntry[];
+  /**
+   * Optional: re-read the live store before the next synchronous enumeration.
+   * A source whose backing store is asynchronous (the shipped filesystem
+   * fortress) exposes this; the tool layer awaits it immediately before EVERY
+   * enumeration (gate-time freeze, assembly-time drift recheck, delete-time
+   * recheck) so the scope digest is always computed over current bytes.
+   */
+  refresh?(): Promise<void>;
+}
+
+/**
+ * Inventory source over any async `StorageBackend` (the shipped fortress is a
+ * `FilesystemStorage`, which has no synchronous listing). `refresh()` reads the
+ * exportable namespaces into a snapshot; `listNamespaceSync` serves the
+ * snapshot.
+ *
+ * Fail closed on a never-refreshed namespace: an empty answer here would read
+ * as "nothing to export" (silently shipping nothing) or "nothing listed in
+ * the manifest is still present" (silently deleting nothing) rather than as
+ * the programming error it is.
+ */
+export class StorageSnapshotSdwInventorySource implements SdwExportInventorySource {
+  private readonly snapshot = new Map<SdwExportableNamespace, readonly SdwInventoryEntry[]>();
+
+  constructor(
+    private readonly storage: {
+      list(namespace: string, prefix?: string): Promise<readonly { key: string }[]>;
+      read(namespace: string, key: string): Promise<Uint8Array | null>;
+    },
+  ) {}
+
+  async refresh(): Promise<void> {
+    for (const namespace of SDW_EXPORTABLE_NAMESPACES) {
+      const entries: SdwInventoryEntry[] = [];
+      for (const meta of await this.storage.list(namespace)) {
+        const data = await this.storage.read(namespace, meta.key);
+        // A record deleted between list and read is simply absent from this
+        // snapshot; the drift recheck at assembly time catches it if it
+        // matters to an approval already shown.
+        if (data !== null) entries.push({ key: meta.key, data });
+      }
+      this.snapshot.set(namespace, entries);
+    }
+  }
+
+  listNamespaceSync(namespace: SdwExportableNamespace): readonly SdwInventoryEntry[] {
+    const entries = this.snapshot.get(namespace);
+    if (entries === undefined) {
+      throw new SdwValidationError(
+        "namespace_mismatch",
+        "SDW export inventory was enumerated before refresh()",
+      );
+    }
+    return entries;
+  }
 }
 
 export interface SdwInventoryEntry {
@@ -453,6 +513,52 @@ const defaultFs: SdwExportFs = {
  * A crash or failure at any point leaves NO partial bundle at the destination
  * path; the temp file is best-effort cleaned on failure.
  */
+/**
+ * fd-based write inside a fresh per-export directory (see tools.ts
+ * prepareExportDestination). `hooks.verify` is the caller's bounded
+ * containment recheck; it runs immediately before the O_CREAT|O_EXCL open
+ * and immediately after the rename, and on any failure whatever was written
+ * is unlinked and the error propagates. The temp name is unpredictable, a
+ * planted symlink at it is refused by O_EXCL rather than followed, the bytes
+ * are written and fsynced through the handle, and the final path's inode must
+ * equal the handle's. RESIDUAL: the window between a check returning and the
+ * next syscall is not covered (Node has no openat/renameat).
+ */
+export async function writeSdwExportBundleInFreshDir(
+  bundle: SdwStateExportBundle,
+  freshDir: string,
+  destinationPath: string,
+  hooks: { verify: () => Promise<void>; afterRename?: () => Promise<void> },
+): Promise<void> {
+  const tempPath = join(freshDir, `.tmp-${randomBytes(8).toString("hex")}`);
+  await hooks.verify();
+  const handle = await open(tempPath, "wx", 0o600);
+  let inode: bigint;
+  try {
+    await handle.writeFile(JSON.stringify(bundle));
+    await handle.sync();
+    inode = (await handle.stat({ bigint: true })).ino;
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    await unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
+  await handle.close();
+  try {
+    await rename(tempPath, destinationPath);
+    await hooks.afterRename?.();
+    await hooks.verify();
+    const final = await lstat(destinationPath, { bigint: true });
+    if (final.isSymbolicLink() || final.ino !== inode) {
+      throw new Error("export destination is not the file this export wrote");
+    }
+  } catch (error) {
+    await unlink(tempPath).catch(() => undefined);
+    await unlink(destinationPath).catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function writeSdwExportBundleAtomic(
   bundle: SdwStateExportBundle,
   destinationPath: string,

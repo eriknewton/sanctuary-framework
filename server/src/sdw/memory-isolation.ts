@@ -30,6 +30,28 @@
  * two distinct identities and is refused: a configured agent must not share
  * the unconfigured coordinator's scope.
  */
+/**
+ * The production identity resolver every guard instance in index.ts is built
+ * over. It reads `SANCTUARY_AGENT_ID` from the SERVER's own process
+ * environment, which `sanctuary wrap` writes into the harness's `sanctuary`
+ * MCP entry at wrap time (must match `SANCTUARY_AGENT_ID` in
+ * `wrap/cli.ts:buildSanctuaryEnv`; the value is `wrappedAgentId(...)`).
+ *
+ * INVARIANT: the guard keys on this wrap-time, operator-bound identity and
+ * NEVER on a value the agent asserts in a tool argument or mints for itself.
+ *
+ * BOUND (stated, not softened): the pin below lives in THIS process. The
+ * guard separates distinct identities that reach ONE server process; two
+ * harnesses wrapped over one fortress each spawn their own server process
+ * and are NOT separated by it (IC-16 stays open; a cross-process design needs
+ * a create-if-absent pin plus a true compare-and-swap). The value is also
+ * plaintext in the harness-controlled config, so an agent that rewrites its
+ * own harness config is not what this guard defends against.
+ */
+export function wrappedAgentIdentityFromEnv(): string | undefined {
+  return process.env.SANCTUARY_AGENT_ID;
+}
+
 export type MultiAgentIsolationGuard = (
   operation: string,
 ) => { allowed: true } | { allowed: false };

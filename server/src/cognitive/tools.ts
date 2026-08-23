@@ -29,7 +29,8 @@ import {
   type PublicIdentity,
   type RotationEvent,
 } from "../core/identity.js";
-import { derivePurposeKey } from "../core/key-derivation.js";
+import { derivePurposeKey, IDENTITY_ENCRYPTION_PURPOSE } from "../core/key-derivation.js";
+import { startsWithInternalSigningDomain } from "../core/signing-domains.js";
 import {
   toBase64url,
   fromBase64url,
@@ -50,6 +51,8 @@ import {
 // STORE-ERRMSG-INTERP-01).
 import { describeUntrusted } from "../errors/index.js";
 
+// Must match AUDIT_EVENT_SIGNING_DOMAIN_PREFIX / INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX
+// in core/signing-domains.ts (the identity_sign refusal list).
 export const AUDIT_EVENT_SIGNING_DOMAIN = "sanctuary.audit.v1";
 export const INTERNAL_RECEIPT_SIGNING_DOMAIN = "sanctuary.receipt.v1";
 
@@ -464,7 +467,8 @@ export class IdentityManager {
   }
 
   private get encryptionKey(): Uint8Array {
-    return derivePurposeKey(this.masterKey, "identity-encryption");
+    // Must match IDENTITY_ENCRYPTION_PURPOSE consumers in index.ts (SDW export signing).
+    return derivePurposeKey(this.masterKey, IDENTITY_ENCRYPTION_PURPOSE);
   }
 
   /**
@@ -1071,6 +1075,16 @@ export function createCognitiveTools(
           payload = fromBase64url(payloadStr);
         } catch {
           payload = stringToBytes(payloadStr);
+        }
+
+        // The raw signer must never mint an INTERNAL artifact: a payload that
+        // begins with one of the internal signing-domain prefixes (the SDW
+        // export manifest domain among them) would verify as that artifact,
+        // so an agent could hand-build a manifest that sdw_export_delete
+        // accepts. Refused before the key is touched, with the fixed denial.
+        if (startsWithInternalSigningDomain(payload)) {
+          await recordCriticalAudit(auditLog, "l1", "identity_sign_denied", identity.identity_id);
+          return toolResult(fixedDenial("audit:identity_sign"));
         }
 
         const signature = identitySign(

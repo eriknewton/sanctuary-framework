@@ -109,6 +109,8 @@ approval_channel:
       "memory_archive_export",
       "memory_archive_import",
       "state_disclose_unattributed",
+      "sdw_export",
+      "sdw_import",
     ]);
     expect(policy.approval_channel.type).toBe("stderr");
   });
@@ -139,6 +141,8 @@ approval_channel:
       "memory_archive_export",
       "memory_archive_import",
       "state_disclose_unattributed",
+      "sdw_export",
+      "sdw_import",
     ]);
   });
 

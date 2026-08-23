@@ -157,7 +157,7 @@ negotiator = Agent(
 )
 ```
 
-Each agent gets its own cryptographic identity, encrypted state store, and reputation history. Same-host isolation between wrapped agents remains partial until **IC-16** closes.
+Each agent gets its own cryptographic identity, encrypted state store, and reputation history. Same-host isolation between wrapped agents is partial: the sovereign memory store is one shared scope per fortress, and the guard over it separates distinct wrapped-agent identities only within one server process. Two harnesses wrapped over one fortress run separate server processes and are not separated by it (tracked as **IC-16**, open).
 
 ### Context Gating for Inference Calls
 

@@ -25,6 +25,7 @@ import {
   extractSovereigntyAuditShape,
   extractExportedNames,
 } from "./public-surface-extract.js";
+import { createTempHome } from "../helpers/temp-fortress.js";
 
 const FIXTURES = join(
   fileURLToPath(import.meta.url),
@@ -41,7 +42,16 @@ function writeJson(name: string, value: unknown): void {
 
 async function main(): Promise<void> {
   mkdirSync(FIXTURES, { recursive: true });
-  writeJson("mcp-tool-surface.json", await extractToolSurface());
+  // The operator's machine is not a fixture (AGENTS.md): extractToolSurface
+  // boots the real composition root, and outside vitest nothing else redirects
+  // HOME, so without this the generator rewrites ~/.sanctuary/sanctuary.json
+  // on the operator's own fortress (it did, on 2026-08-22).
+  const home = await createTempHome("sanctuary-public-surface-gen");
+  try {
+    writeJson("mcp-tool-surface.json", await extractToolSurface());
+  } finally {
+    await home.cleanup();
+  }
   writeJson("shr-shape.json", extractShrShape());
   writeJson("sovereignty-audit-shape.json", extractSovereigntyAuditShape());
   writeJson("exported-names.json", extractExportedNames());

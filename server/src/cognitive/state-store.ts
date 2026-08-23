@@ -59,6 +59,7 @@ import {
 const LEGACY_STATE_ENVELOPE_SCHEMA_VERSION = 2;
 const STATE_ENVELOPE_SCHEMA_VERSION = 3;
 const LEGACY_STATE_ENVELOPE_SIGNING_DOMAIN = "sanctuary.state-envelope.v1\n";
+// Must match STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX in core/signing-domains.ts (identity_sign refusal list).
 const STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX = "sanctuary.state-envelope.v";
 const STATE_ENVELOPE_PUBLIC_KEYS_KEY = "state-envelope-public-keys-v1";
 const STATE_ENVELOPE_VERSION_ANCHORS_KEY = "state-envelope-version-anchors-v1";

@@ -686,7 +686,12 @@ describe("SDW memory file tools", () => {
     const guardConstructions = indexSource.match(/createMultiAgentIsolationGuard\(/g) ?? [];
     expect(guardConstructions).toHaveLength(1);
 
-    for (const factory of ["createSdwMemoryTools", "createSdwMemoryFileTools"]) {
+    for (const factory of [
+      "createSdwMemoryTools",
+      "createSdwMemoryFileTools",
+      "createSdwMemoryProvenanceTool",
+      "createSdwTools",
+    ]) {
       const call = new RegExp(`${factory}\\(\\{[\\s\\S]*?\\n  \\}\\)`).exec(indexSource);
       expect(call, `${factory} call not found in index.ts`).not.toBeNull();
       expect(call![0], `${factory} must receive the shared isolation guard`).toContain(

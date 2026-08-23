@@ -174,6 +174,18 @@ export const NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS = [
  * importing operator-carried state must never become silently allowable via
  * a hand-authored policy.
  */
+/**
+ * SDW vault export / import move or replace the whole sovereign vault.
+ * Force-pinned so a hand-authored policy can never relax them to Tier 3. Must
+ * match the tool names registered in `sdw/tools.ts` (createSdwTools) and the
+ * spread in `gate.ts`'s FORCED_TIER1_OPERATIONS; a drift test pins both.
+ * (`sdw_export_delete` is not a shipped surface and is not listed.)
+ */
+export const NON_RELAXABLE_SDW_VAULT_TIER1_OPERATIONS = [
+  "sdw_export",
+  "sdw_import",
+] as const;
+
 export const NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS = [
   "memory_archive_export",
   "memory_archive_import",
@@ -236,6 +248,7 @@ const FORCED_TIER1_OPERATIONS = [
   ...NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS,
   ...NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS,
   ...NON_RELAXABLE_STATE_DISCLOSURE_TIER1_OPERATIONS,
+  ...NON_RELAXABLE_SDW_VAULT_TIER1_OPERATIONS,
 ] as const;
 
 /**
