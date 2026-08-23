@@ -5,6 +5,7 @@ import type { SdwRecord } from "./records.js";
 import {
   assertSdwRawWriteAuthorized,
   prepareSdwBackendWrite,
+  type MintPersistableOptions,
   type Persistable,
 } from "./write-gate.js";
 
@@ -14,6 +15,7 @@ export interface SdwTxn {
     persistable: Persistable<T>,
     encryptionKey: Uint8Array,
     fortressId: string,
+    options?: MintPersistableOptions,
   ): Promise<void>;
   read(namespace: string, key: string): Promise<Uint8Array | null>;
   delete(namespace: string, key: string): Promise<boolean>;
@@ -159,8 +161,8 @@ export class LmdbStorageBackend implements StorageBackend, SdwTransactional {
           const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
           overlay.set(compositeKey(namespace, key), new Uint8Array(checkedData));
         },
-        writePersistable: async (persistable, encryptionKey, fortressId) => {
-          const prepared = prepareSdwBackendWrite(persistable, encryptionKey, fortressId);
+        writePersistable: async (persistable, encryptionKey, fortressId, options) => {
+          const prepared = prepareSdwBackendWrite(persistable, encryptionKey, fortressId, options);
           const checkedData = assertSdwRawWriteAuthorized(
             prepared.namespace,
             prepared.storageKey,

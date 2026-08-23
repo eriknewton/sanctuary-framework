@@ -78,6 +78,30 @@ const FORCED_TIER1_OPERATIONS = [
 ] as const;
 
 /**
+ * Rung-1 point 3 (2026-08-22): a memory_ingest call that names at
+ * least one allow_files path waives the secret classifier for that file, so
+ * it must ALWAYS require operator approval, even when a hand-authored policy
+ * relaxed the "memory_ingest" operation itself to Tier 3 (memory_ingest is in
+ * DEFAULT_POLICY.tier1_always_approve but, unlike memory_delete above, is NOT
+ * in FORCED_TIER1_OPERATIONS, so an operator who wants unattended plain
+ * ingest can legitimately relax it). A waiver is never unattended: this is an
+ * ARGUMENT-sensitive forced tier, deliberately separate from
+ * FORCED_TIER1_OPERATIONS (an operation-name-only list) so a memory_ingest
+ * call with no allow_files stays relaxable while one that carries allow_files
+ * cannot be. Args here are the raw wire args (pre-handler-validation); a
+ * malformed allow_files is treated as absent, since asAllowFiles in
+ * memory-file-tools.ts denies the call before any write regardless of tier.
+ */
+function isForcedTier1MemoryIngestWaiver(
+  operation: string,
+  args: Record<string, unknown>,
+): boolean {
+  if (operation !== "memory_ingest") return false;
+  const allowFiles = args.allow_files;
+  return Array.isArray(allowFiles) && allowFiles.length > 0;
+}
+
+/**
  * Approval-lifecycle callback. Wired in v1.3 Upsilon-1 by the Cross-
  * Harness Approval Inbox aggregator. The gate fires this callback before
  * `channel.requestApproval()` (phase = "requested") and after the channel
@@ -463,6 +487,15 @@ export class ApprovalGate {
       return {
         tier: 1,
         reason: `"${operation}" is a forced Tier 1 operation (always requires approval)`,
+      };
+    }
+
+    if (isForcedTier1MemoryIngestWaiver(operation, args)) {
+      return {
+        tier: 1,
+        reason:
+          `"${operation}" names at least one allow_files path (a secret-classifier ` +
+          `waiver) and is always Tier 1 regardless of policy (always requires approval)`,
       };
     }
 

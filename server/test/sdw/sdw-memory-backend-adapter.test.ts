@@ -15,6 +15,7 @@ import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
 import {
   assertSdwRawWriteAuthorized,
   encryptedEnvelopeContains,
+  mintClassifierOverrideAuthorization,
 } from "../../src/sdw/write-gate.js";
 import { SdwValidationError } from "../../src/sdw/errors.js";
 import { CrossProcessLockError } from "../../src/storage/cross-process-lock.js";
@@ -447,6 +448,73 @@ describe("SDW memory-backend adapter: write-gate enforcement", () => {
         text: row.before,
       });
     }
+  });
+
+  it("restores a previously-waived (classifier-overridden) passage byte-for-byte when a later batch write fails, without re-tripping the classifier", async () => {
+    const passageId = "waived-rollback-1";
+    const documentId = `mem.letta-archive-1.${passageId}`;
+    const waivedText = "remember this: -----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2Vw";
+    const storage = new ConfigurableWriteFailureStorage();
+    const adapter = makeAdapter(storage) as SdwMemoryBackendAdapter;
+
+    // Commit the WAIVED passage first, exactly as the Rung-1 ingest path
+    // would: a genuine authorization minted for this exact text, so the
+    // classifier is skipped for this one insert.
+    await adapter.putPassages(
+      [
+        {
+          passage_id: passageId,
+          text: waivedText,
+          classifierOverrideAuthorization: mintClassifierOverrideAuthorization(
+            passageContentHash(waivedText),
+          ),
+        },
+      ],
+      "user_content",
+    );
+    const beforeKeys = await ownerScopeCorpusKeys(storage);
+    await expect(adapter.getPassage(passageId)).resolves.toMatchObject({ text: waivedText });
+
+    // Snapshot the RAW, still-encrypted bytes for every key belonging to this
+    // passage, taken straight from the storage backend's own map -- this is
+    // the AT-REST ciphertext, not anything decrypted. Copied (not just
+    // referenced) because the failing write below overwrites some of these
+    // same keys' underlying Uint8Array objects before rollback restores them.
+    const compositeKey = (key: string): string => `${SDW_DOCUMENT_CORPUS_NAMESPACE}\0${key}`;
+    const rawBefore = new Map(
+      beforeKeys.map((key) => [key, new Uint8Array(storage.data.get(compositeKey(key))!)]),
+    );
+
+    // A LATER batch write for the SAME passage id fails partway (no override
+    // this time -- an ordinary re-ingest), forcing restoreAndVerifyPriorPassages
+    // to replay the WAIVED prior bytes captured above. Chunk writes land
+    // (with NEW content) before the document write, which is the one
+    // configured to fail, so this also proves the chunk bytes specifically
+    // get restored, not just left alone.
+    storage.writeFailureKey = documentKey(documentId);
+    await expect(
+      adapter.putPassages(
+        [{ passage_id: passageId, text: "a completely different, unrelated replacement" }],
+        "user_content",
+      ),
+    ).rejects.toThrow("simulated document write failure");
+
+    // Byte-for-byte restoration: the classifier was never asked to reclassify
+    // the restored secret-shaped text (if it had been, this assertion would
+    // never be reached -- the promise above would have rejected with
+    // partial_scope, not the plain simulated-failure message, since a second,
+    // DIFFERENT thrown error during the rollback attempt is what partial_scope
+    // reports).
+    const afterKeys = await ownerScopeCorpusKeys(storage);
+    expect(afterKeys).toEqual(beforeKeys);
+    for (const key of afterKeys) {
+      // toEqual on Uint8Array does a real byte-value comparison, not
+      // reference identity -- a semantically-equivalent RE-ENCRYPTION (same
+      // plaintext, fresh nonce/AAD) would fail this even though
+      // getPassage()'s decrypted text would still match.
+      expect(storage.data.get(compositeKey(key))).toEqual(rawBefore.get(key));
+    }
+    await expect(adapter.getPassage(passageId)).resolves.toMatchObject({ text: waivedText });
   });
 
   it("maps verification read failures to partial_scope with the original cause", async () => {

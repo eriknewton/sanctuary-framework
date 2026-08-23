@@ -18,6 +18,7 @@
 
 import type { SdwDocumentMetadata } from "../records.js";
 import type { PersistableTaint } from "../provenance.js";
+import type { ClassifierOverrideAuthorization } from "../write-gate.js";
 
 /** A passage as stored in, and returned from, the sovereign backend. */
 export interface MemoryPassage {
@@ -47,6 +48,32 @@ export interface MemoryPassageInput {
   readonly metadata?: readonly SdwDocumentMetadata[];
   /** Optional caller-supplied creation timestamp (ISO 8601). */
   readonly created_at?: string;
+  /**
+   * Rung-1 point 3 (2026-08-22):
+   * bypasses ONLY the secret-classifier detector step for this one passage;
+   * grammar, size, and taint checks still run. Every other check in the
+   * write gate still applies, so this can never turn an otherwise-invalid
+   * write into a valid one, only a classifier_reject into an accepted one.
+   *
+   * Deliberately an OPAQUE, unforgeable token (`ClassifierOverrideAuthorization`
+   * from write-gate.ts), not a plain boolean: authorization is a value only
+   * the root minting function can produce, verified against module-private
+   * state that only that function can set, so a value the caller merely
+   * constructs here can never satisfy it. A token can only be produced by the
+   * ROOT minting function write-gate.ts declares for this purpose, which ONLY
+   * sdw/adapters/memory-file-allow-list.ts may call (structurally pinned by
+   * a test), after the classifier genuinely refused this exact text (via
+   * screenPassage, which never mints or honors this field) and the operator
+   * named this exact source file on an explicit, per-file `--allow-file` /
+   * `allow_files` list. preparePassage (sdw-memory-backend.ts) re-verifies
+   * this token against the passage's own content hash before deriving any
+   * per-record authorization from it, so a token bound to different text
+   * cannot be reused here. There is deliberately no batch-wide or global
+   * equivalent: `putPassages`/`screenPassage` re-run the classifier on every
+   * OTHER passage in the same call exactly as before, and `screenPassage`
+   * never reads this field on ANY passage (see its doc below).
+   */
+  readonly classifierOverrideAuthorization?: ClassifierOverrideAuthorization;
 }
 
 /**
@@ -159,7 +186,11 @@ export interface MemoryBackendAdapter {
    *
    * A batch caller uses this to decide per input whether to include it, so one
    * rejected input does not abort a whole mirror. It NEVER relaxes the gate:
-   * putPassages re-runs the real gate on everything it writes.
+   * putPassages re-runs the real gate on everything it writes, with the one
+   * narrow, explicit exception a caller opts a SPECIFIC input into via
+   * `MemoryPassageInput.classifierOverrideAuthorization` (see that field's
+   * doc); screenPassage itself never sets or reads that field, so the dry run
+   * always reports what the classifier would say absent an override.
    *
    * `applyBareCredentialFallback`: see putPassages above; a screen and the
    * real write it is deciding for must pass the SAME value or the dry run

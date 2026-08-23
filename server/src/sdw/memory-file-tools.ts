@@ -14,17 +14,20 @@ import { fixedDenial } from "../agent-native/safety-base.js";
 import type { MemoryBackendAdapter } from "./adapters/memory-backend.js";
 import {
   CLAUDE_CODE_MEMORY_HARNESS,
+  commitClaudeCodeMemorySnapshot,
   emitClaudeCodeMemoryDirectory,
-  ingestClaudeCodeMemorySnapshot,
   readClaudeCodeMemoryDirectory,
+  screenClaudeCodeMemorySnapshot,
 } from "./adapters/claude-code-file-adapter.js";
 import {
   CODEX_MEMORY_HARNESS,
+  commitCodexMemorySnapshot,
   emitCodexMemoryDirectory,
-  ingestCodexMemorySnapshot,
   readCodexMemoryDirectory,
+  screenCodexMemorySnapshot,
 } from "./adapters/codex-memory-file-adapter.js";
 import { SdwValidationError, sdwClassifierReasonText } from "./errors.js";
+import { MEMORY_INGEST_CLASSIFIER_OVERRIDE } from "./adapters/memory-file-allow-list.js";
 import {
   createMultiAgentIsolationGuard,
   type MultiAgentIsolationGuard,
@@ -77,7 +80,12 @@ export const RUNG1_MEMORY_TOOL_DESCRIPTIONS = {
     "reads plaintext source files and leaves them untouched; the encrypted " +
     "copy lives in the vault. Files the secret classifier refuses are " +
     "skipped and named in the result, so check skipped_file_count before " +
-    "treating the mirror as complete. This does not sync, watch, or replace " +
+    "treating the mirror as complete. Optional allow_files names exact source " +
+    "paths to ingest as-is even though the classifier refuses them; each use " +
+    "is audited by path and reported under overridden, and a listed path the " +
+    "classifier never refused is reported as unused, not silently accepted. " +
+    "A call naming allow_files always requires operator approval, even if a " +
+    "custom policy relaxed memory_ingest itself. This does not sync, watch, or replace " +
     "the harness write path, and memory later sent to a model vendor is " +
     "exposed to that vendor at inference.",
   memory_emit:
@@ -128,6 +136,16 @@ export function memoryFileApprovalArgs(
   if (typeof args.mode === "string") projected.mode = args.mode;
   if (typeof args.archive_id === "string") projected.archive_id = args.archive_id;
   if (typeof args.dir === "string") projected.dir = args.dir;
+  // Rung-1 point 3: memory_ingest's allow_files waives the secret classifier
+  // for exactly these paths, so the operator approving the call must see
+  // which paths are waived, the same reasoning as the owner_ref/agent_id
+  // projection below for WHOSE memory moves.
+  if (Array.isArray(args.allow_files)) {
+    const allowFiles = args.allow_files.filter(
+      (item): item is string => typeof item === "string",
+    );
+    if (allowFiles.length > 0) projected.allow_files = allowFiles;
+  }
   if (context !== undefined) {
     projected.owner_ref = context.ownerRef;
     projected.agent_id = context.agentId ?? null;
@@ -144,6 +162,25 @@ function asSupportedHarness(value: unknown): SupportedMemoryHarness | null {
 
 function asDirectory(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+/** No paths allow-listed: the default when the caller omits allow_files. */
+const EMPTY_ALLOW_FILES: ReadonlySet<string> = new Set();
+
+/**
+ * `allow_files` is optional; when supplied it must be an array of non-empty
+ * strings (the exact source paths to waive the classifier for). Anything else
+ * is invalid_args, same as a malformed harness or dir.
+ */
+function asAllowFiles(value: unknown): ReadonlySet<string> | null {
+  if (value === undefined) return EMPTY_ALLOW_FILES;
+  if (!Array.isArray(value)) return null;
+  const allowFiles = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string" || item.trim().length === 0) return null;
+    allowFiles.add(item);
+  }
+  return allowFiles;
 }
 
 function asArchiveId(value: unknown): string | null {
@@ -240,13 +277,25 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
           type: "string",
           description: "Path to the harness memory directory to read",
         },
+        allow_files: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Exact source paths to ingest as-is even if the secret classifier " +
+            "refuses them: each must be the source filename exactly as the " +
+            "ingest result's skipped/overridden entries name it (e.g. Codex " +
+            "raw_memories.md, not memories/raw_memories.md), never a glob or " +
+            "a directory. Each use is audited by path; a listed path the " +
+            "classifier never refused is reported as unused.",
+        },
       },
       required: ["harness", "dir"],
     },
     handler: async (args) => {
       const harness = asSupportedHarness(args.harness);
       const dir = asDirectory(args.dir);
-      if (harness === null || dir === null) {
+      const allowFiles = asAllowFiles(args.allow_files);
+      if (harness === null || dir === null || allowFiles === null) {
         await auditFailure("memory_ingest_denied", { denial_class: "invalid_args" });
         return deny("memory_ingest");
       }
@@ -255,28 +304,75 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
       let fileCount = 0;
       const ingestedAt = now();
       try {
-        let ingestSnapshot: () => ReturnType<typeof ingestClaudeCodeMemorySnapshot>;
+        // Preflight-only: screen decides accept / skip /
+        // override and validates allow_files (assertAllowFilesKnown, inside
+        // screenMemoryFileEntries) WITHOUT writing anything to the vault. The
+        // override audit records below are durably appended, and can abort
+        // the whole ingest, BEFORE commitClaudeCodeMemorySnapshot /
+        // commitCodexMemorySnapshot ever runs, so a crash after this point
+        // can only crash AFTER the waiver is already on the record, never
+        // before.
+        let screened:
+          | { readonly kind: "claude-code"; readonly value: Awaited<ReturnType<typeof screenClaudeCodeMemorySnapshot>> }
+          | { readonly kind: "codex"; readonly value: Awaited<ReturnType<typeof screenCodexMemorySnapshot>> };
         if (harness === CLAUDE_CODE_MEMORY_HARNESS) {
           const snapshot = await readClaudeCodeMemoryDirectory(dir, { ingestedAt });
           fileCount = snapshot.entries.length;
-          ingestSnapshot = () => ingestClaudeCodeMemorySnapshot(adapter, snapshot);
+          screened = {
+            kind: "claude-code",
+            value: screenClaudeCodeMemorySnapshot(adapter, snapshot, { allowFiles }),
+          };
         } else {
           const snapshot = await readCodexMemoryDirectory(dir, { ingestedAt });
           fileCount = snapshot.entries.length;
-          ingestSnapshot = () => ingestCodexMemorySnapshot(adapter, snapshot);
+          screened = {
+            kind: "codex",
+            value: screenCodexMemorySnapshot(adapter, snapshot, { allowFiles }),
+          };
         }
+        const outcome = screened.value.outcome;
+
         // Write-ahead INTENT, not an outcome. The durable record precedes the
         // vault mutation so a crash mid-ingest still leaves evidence that an
-        // ingest was attempted; it is labelled `_started` because at this point
-        // nothing has been committed and the file count is only what was READ.
-        // The outcome record below carries what actually landed.
+        // ingest was attempted; it is labelled `_started` because at this
+        // point nothing has been committed. allow_files is included here (not
+        // only on the post-commit record and the per-file override record
+        // below) because it is a PRE-WRITE WITNESS too, cheap insurance on
+        // top of the screen-then-audit-then-commit ordering below.
         await auditSuccess("memory_ingest_started", {
           harness,
           source_dir: dir,
           owner_ref: adapter.ownerRef,
           source_file_count: fileCount,
+          allow_files: [...allowFiles].sort(),
         });
-        const result = await ingestSnapshot();
+
+        // One record per overridden file (Rung-1 point 3), durably appended
+        // BEFORE any vault write: the operator waived the
+        // classifier for this exact path, so it is named individually rather
+        // than folded into the aggregate outcome record below. Carries the
+        // refusal metadata the classifier would have reported (detector,
+        // line), never the matched content. If ANY of these audit writes
+        // throws, the catch block below denies the whole ingest and NOTHING
+        // is committed -- the ordering test in test/sdw/memory-file-tools.test.ts
+        // proves this by injecting a failure at the first putPassages call and
+        // asserting the override record is present anyway.
+        for (const override of outcome.overridden) {
+          await auditSuccess(MEMORY_INGEST_CLASSIFIER_OVERRIDE, {
+            harness,
+            source_dir: dir,
+            owner_ref: adapter.ownerRef,
+            source_path: override.source_path,
+            reason: override.reason,
+            detector: override.detector,
+            line: override.line,
+          });
+        }
+
+        const result =
+          screened.kind === "claude-code"
+            ? await commitClaudeCodeMemorySnapshot(adapter, screened.value)
+            : await commitCodexMemorySnapshot(adapter, screened.value);
         await auditSuccess("memory_ingest", {
           harness,
           source_dir: dir,
@@ -284,6 +380,8 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
           source_file_count: result.source_file_count,
           committed_file_count: result.ingested.length,
           skipped_file_count: result.skipped.length,
+          overridden_file_count: result.overridden.length,
+          unused_allow_files: result.unused_allow_files,
           complete: result.complete,
           skipped: result.skipped.map((skip) => ({
             source_path: skip.source_path,
@@ -309,6 +407,16 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
             // only, never the matched content.
             reason_text: sdwClassifierReasonText(skip.reason, skip.detector),
           })),
+          overridden_file_count: result.overridden.length,
+          overridden: result.overridden.map((override) => ({
+            source_path: override.source_path,
+            reason: override.reason,
+            detail: override.detail,
+            detector: override.detector,
+            line: override.line,
+            reason_text: sdwClassifierReasonText(override.reason, override.detector),
+          })),
+          unused_allow_files: result.unused_allow_files,
           passages: result.ingested.map((passage) => ({
             passage_id: passage.passage_id,
             content_hash: passage.content_hash,

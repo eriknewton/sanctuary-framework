@@ -1,10 +1,16 @@
-// fail-before-exempt: this file is the SDW architecture GATE, not a test of a
+// fail-before-exempt: this file is the SDW architecture GATE (re-asserted 2026-08-22 for Rung-1 point 3, --allow-file classifier override), not a test of a
 // behavior change. Widening it to recognize an additional compliant shape
 // cannot fail against the base ref, because the base's source already passes
 // the narrower rule; "fails before the fix" has no meaning for a gate
 // widening. The widening is given its own teeth instead: the recognizer has
 // direct unit tests below covering both directions, including the exact
-// laundering case (a real write slipped in ahead of the refusal).
+// laundering case (a real write slipped in ahead of the refusal). This time
+// the widening is the txnPersistable extraction regex and
+// persistableBlockUsesPreparedAuthority accepting an optional trailing
+// `options` argument on writePersistable/prepareSdwBackendWrite, proven both
+// directions by the new "transactional persistable-write recognizer" describe
+// block below (accepts 3-arg AND 4-arg compliant shapes, still rejects a
+// bypass and a missing implementation).
 import { readFile, readdir } from "node:fs/promises";
 import { relative, join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -18,9 +24,15 @@ import {
 } from "../../src/sdw/records.js";
 import { SdwValidationError } from "../../src/sdw/errors.js";
 import {
+  deriveClassifierOverrideAuthorization,
+  mintClassifierOverrideAuthorization,
   mintPersistable,
   prepareSdwBackendWrite,
 } from "../../src/sdw/write-gate.js";
+import {
+  passageContentHash,
+  SdwMemoryBackendAdapter,
+} from "../../src/sdw/adapters/sdw-memory-backend.js";
 
 const FORTRESS_ID = "fortress:test";
 const MASTER_KEY = new Uint8Array(32).fill(7);
@@ -171,7 +183,319 @@ describe("SDW architecture write gate", () => {
       ).toBe(false);
     });
   });
+
+  describe("transactional persistable-write recognizer (Rung-1 point 3 widening)", () => {
+    // Rung-1 point 3 (2026-08-22) added an optional trailing `options`
+    // parameter to writePersistable/prepareSdwBackendWrite so ONE narrow,
+    // per-passage classifier override can reach the LMDB transactional write
+    // path. Widening the recognizer to accept it must not lose its ability to
+    // reject a genuine bypass; both directions are proven here rather than
+    // trusted from the recognizer's own source, same discipline as the
+    // unconditional-refusal recognizer above.
+    const VALID_PUBLIC_WRITE = `
+  async write(namespace: string, key: string, data: Uint8Array): Promise<void> {
+    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+    this.db.putSync(compositeKey(namespace, key), checkedData);
+  }
+`;
+    const VALID_TXN_WRITE = `
+        write: async (namespace, key, data) => {
+          const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+          overlay.set(compositeKey(namespace, key), checkedData);
+        },
+`;
+    const COMPLIANT_PERSISTABLE_BODY = `
+          const prepared = prepareSdwBackendWrite(persistable, encryptionKey, fortressId, options);
+          const checkedData = assertSdwRawWriteAuthorized(
+            prepared.namespace,
+            prepared.storageKey,
+            prepared.data,
+          );
+          overlay.set(
+            compositeKey(prepared.namespace, prepared.storageKey),
+            new Uint8Array(checkedData),
+          );
+`;
+
+    function sourceWithPersistableWriter(paramList: string, body: string): string {
+      return `
+class FakeLmdbBackend {
+${VALID_PUBLIC_WRITE}
+  async sdwTransaction<T>(fn: (txn: unknown) => Promise<T>): Promise<T> {
+    const overlay = new Map();
+    const txn = {
+${VALID_TXN_WRITE}
+      writePersistable: async (${paramList}) => {
+${body}
+      },
+    };
+    const result = await fn(txn);
+    for (const [composite, value] of overlay) {
+      this.db.putSync(composite, this.lmdb.asBinary(value));
+    }
+    return result;
+  }
+}
+`;
+    }
+
+    it("accepts the widened 4-arg (options) compliant shape", () => {
+      const offenders = findLmdbWriteGateOffenders(
+        sourceWithPersistableWriter(
+          "persistable, encryptionKey, fortressId, options",
+          COMPLIANT_PERSISTABLE_BODY,
+        ),
+        "sdw/lmdb-backend.ts",
+      );
+      expect(offenders).toEqual([]);
+    });
+
+    it("still accepts the original 3-arg compliant shape (backward compatible)", () => {
+      const offenders = findLmdbWriteGateOffenders(
+        sourceWithPersistableWriter(
+          "persistable, encryptionKey, fortressId",
+          // The 3-arg body legitimately omits `options` from the call too.
+          COMPLIANT_PERSISTABLE_BODY.replace(", options)", ")"),
+        ),
+        "sdw/lmdb-backend.ts",
+      );
+      expect(offenders).toEqual([]);
+    });
+
+    it("rejects a 4-arg shape that drops the guard (options did not smuggle in a bypass)", () => {
+      const offenders = findLmdbWriteGateOffenders(
+        sourceWithPersistableWriter(
+          "persistable, encryptionKey, fortressId, options",
+          // No prepareSdwBackendWrite/assertSdwRawWriteAuthorized at all: a
+          // raw write straight from the caller-supplied persistable.
+          `
+          overlay.set(
+            compositeKey(persistable.namespace, persistable.storageKey),
+            options?.classifierOverride ? persistable.record : null,
+          );
+`,
+        ),
+        "sdw/lmdb-backend.ts",
+      );
+      expect(offenders).toContain(
+        "sdw/lmdb-backend.ts: transactional persistable write does not use the SDW prepare/authority path",
+      );
+    });
+
+    it("rejects a missing writePersistable implementation entirely", () => {
+      const source = `
+class FakeLmdbBackend {
+${VALID_PUBLIC_WRITE}
+  async sdwTransaction<T>(fn: (txn: unknown) => Promise<T>): Promise<T> {
+    const overlay = new Map();
+    const txn = {
+${VALID_TXN_WRITE}
+    };
+    const result = await fn(txn);
+    for (const [composite, value] of overlay) {
+      this.db.putSync(composite, this.lmdb.asBinary(value));
+    }
+    return result;
+  }
+}
+`;
+      const offenders = findLmdbWriteGateOffenders(source, "sdw/lmdb-backend.ts");
+      expect(offenders).toContain(
+        "sdw/lmdb-backend.ts: missing transactional persistable write implementation",
+      );
+    });
+  });
+
+  describe("classifier-override / restore capability containment (2026-08-22)", () => {
+    // NOTE (not a fail-before-exempt marker -- too far from the file top to
+    // register as one, and deliberately so): this describe block is a
+    // STRUCTURAL containment scan over the real src/ tree, not a behavior
+    // test with a pre-fix/post-fix shape. The two functions it pins
+    // (mintClassifierOverrideAuthorization, restoreRawSdwBackendWrite) and
+    // their sole legitimate callers were BOTH introduced in the same change,
+    // so there is no earlier "unfixed" source state for these two assertions
+    // to fail against; "fails before the fix" has no meaning when the
+    // capability being contained did not exist before this change. Proven
+    // correct instead by the synthetic-violation case below (a real
+    // reference to the real symbol name from a file deliberately left off
+    // the allowlist), which DOES fail without the scan and pass with it, and
+    // by the fake-token unit test, which proves the runtime side
+    // independently of the static scan.
+    it("mintClassifierOverrideAuthorization is referenced ONLY by memory-file-allow-list.ts and write-gate.ts", async () => {
+      const offenders = await findUnauthorizedReferences(
+        "mintClassifierOverrideAuthorization",
+        new Set([
+          join("sdw", "write-gate.ts"),
+          join("sdw", "adapters", "memory-file-allow-list.ts"),
+        ]),
+      );
+      expect(offenders).toEqual([]);
+    });
+
+    it("restoreRawSdwBackendWrite is referenced ONLY by document-corpus-store.ts and write-gate.ts", async () => {
+      const offenders = await findUnauthorizedReferences(
+        "restoreRawSdwBackendWrite",
+        new Set([join("sdw", "write-gate.ts"), join("sdw", "document-corpus-store.ts")]),
+      );
+      expect(offenders).toEqual([]);
+    });
+
+    it("deriveClassifierOverrideAuthorization is referenced ONLY by write-gate.ts and sdw-memory-backend.ts", async () => {
+      const offenders = await findUnauthorizedReferences(
+        "deriveClassifierOverrideAuthorization",
+        new Set([
+          join("sdw", "write-gate.ts"),
+          join("sdw", "adapters", "sdw-memory-backend.ts"),
+        ]),
+      );
+      expect(offenders).toEqual([]);
+    });
+
+    it("restorePriorChunk is referenced ONLY by document-corpus-store.ts and sdw-memory-backend.ts", async () => {
+      const offenders = await findUnauthorizedReferences(
+        "restorePriorChunk",
+        new Set([
+          join("sdw", "document-corpus-store.ts"),
+          join("sdw", "adapters", "sdw-memory-backend.ts"),
+        ]),
+      );
+      expect(offenders).toEqual([]);
+    });
+
+    it("restorePriorDocument is referenced ONLY by document-corpus-store.ts and sdw-memory-backend.ts", async () => {
+      const offenders = await findUnauthorizedReferences(
+        "restorePriorDocument",
+        new Set([
+          join("sdw", "document-corpus-store.ts"),
+          join("sdw", "adapters", "sdw-memory-backend.ts"),
+        ]),
+      );
+      expect(offenders).toEqual([]);
+    });
+
+    it("the containment scanner actually catches a reference from an unauthorized file", async () => {
+      // Proves findUnauthorizedReferences is not vacuously passing: a real
+      // reference to the real symbol name, in a file NOT on the allowlist,
+      // must be reported.
+      const offenders = await findUnauthorizedReferences(
+        "mintClassifierOverrideAuthorization",
+        new Set([join("sdw", "write-gate.ts")]), // deliberately omits memory-file-allow-list.ts
+      );
+      expect(offenders).toContain(join("sdw", "adapters", "memory-file-allow-list.ts"));
+    });
+
+    it("SdwMemoryBackendAdapter.putPassages refuses genuinely-refused content even when the input carries a hand-built fake authorization object", async () => {
+      // The core property: an object that merely LOOKS like a
+      // ClassifierOverrideAuthorization (any shape at all -- the type has no
+      // real fields to imitate) but was never returned by
+      // mintClassifierOverrideAuthorization has no entry in the
+      // module-private WeakMap, so it must never verify.
+      const storage = new MemoryStorage();
+      const masterKey = new Uint8Array(32).fill(9);
+      const adapter = new SdwMemoryBackendAdapter({
+        storage,
+        masterKey,
+        fortressId: "fortress:fake-token-test",
+        ownerRef: "fleet-self",
+      });
+      const text = "SANCTUARY_RECOVERY_KEY=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE";
+      const fakeToken = {} as unknown as ReturnType<typeof mintClassifierOverrideAuthorization>;
+      await expect(
+        adapter.putPassages(
+          [
+            {
+              passage_id: "fake-token-attempt",
+              text,
+              classifierOverrideAuthorization: fakeToken,
+            },
+          ],
+          "user_content",
+          true,
+        ),
+      ).rejects.toMatchObject({ category: "classifier_reject" });
+    });
+
+    it("deriveClassifierOverrideAuthorization refuses a derived token for text not contained in the parent (a verified parent is not a mint oracle)", () => {
+      const parentText = "the operator allow-listed exactly this refused file's text";
+      const parentToken = mintClassifierOverrideAuthorization(passageContentHash(parentText));
+
+      // A real chunk (a genuine substring of parentText) verifies.
+      const realChunk = "allow-listed exactly this";
+      expect(deriveClassifierOverrideAuthorization(parentToken, parentText, realChunk)).toBeDefined();
+
+      // Unrelated text, even innocuous-looking text with no relationship to
+      // the allow-listed passage, must NOT verify just because the parent
+      // token is genuine and WeakMap-registered -- proves the containment
+      // check, not only the WeakMap check, is load-bearing.
+      const unrelatedText = "a totally different secret living somewhere else entirely";
+      expect(
+        deriveClassifierOverrideAuthorization(parentToken, parentText, unrelatedText),
+      ).toBeUndefined();
+
+      // A fake (never-minted) parent refuses regardless of containment.
+      const fakeParent = {} as unknown as ReturnType<typeof mintClassifierOverrideAuthorization>;
+      expect(
+        deriveClassifierOverrideAuthorization(fakeParent, parentText, realChunk),
+      ).toBeUndefined();
+    });
+
+    it("mutating a token object never changes what it authorizes (the hash lives in a module-private WeakMap, never a token field)", () => {
+      const textA = "the text this token genuinely authorizes";
+      const textB = "a completely different text the token must never authorize";
+      const token = mintClassifierOverrideAuthorization(passageContentHash(textA));
+
+      expect(Object.isFrozen(token)).toBe(true);
+      // Every plausible mutation vector against a frozen, field-less object:
+      // all must fail to change anything, and the attempt itself must throw
+      // (ES modules run in strict mode).
+      const mutable = token as unknown as Record<string, unknown>;
+      expect(() => {
+        mutable.contentHash = passageContentHash(textB);
+      }).toThrow();
+      expect(() => {
+        Object.defineProperty(token, "contentHash", { value: passageContentHash(textB) });
+      }).toThrow();
+
+      // Whichever mutation attempt above ran, verification is unaffected: the
+      // token still authorizes ONLY the text it was minted for. A
+      // property-based design (token.contentHash) would have let the FIRST
+      // mutation attempt silently relabel this token to authorize textB.
+      expect(deriveClassifierOverrideAuthorization(token, textA, textA)).toBeDefined();
+      expect(deriveClassifierOverrideAuthorization(token, textB, textB)).toBeUndefined();
+    });
+  });
 });
+
+/**
+ * Scan the real src/ tree for source-level references to `symbolName`
+ * (import specifier, call, or bare identifier) outside `allowedPaths`
+ * (relative to src/). Used to pin the two capability-minting functions
+ * (mintClassifierOverrideAuthorization, restoreRawSdwBackendWrite) to their
+ * sole legitimate callers -- the runtime unforgeability comes from a
+ * module-private WeakMap (see write-gate.ts), and this scan is the
+ * complementary STATIC containment check: even a caller with legitimate
+ * reasons to think it needs the function should not be able to reach it and
+ * ship, because CI fails on the reference alone.
+ */
+async function findUnauthorizedReferences(
+  symbolName: string,
+  allowedPaths: ReadonlySet<string>,
+): Promise<string[]> {
+  const root = join(process.cwd(), "src");
+  const offenders: string[] = [];
+  for (const file of await listTsFiles(root)) {
+    const relativePath = relative(root, file);
+    if (allowedPaths.has(relativePath)) continue;
+    const source = await readFile(file, "utf8");
+    // A fresh RegExp per file (not hoisted outside the loop): a shared
+    // instance across the whole scan is unnecessary here and risks exactly
+    // the kind of subtle cross-call reuse this scan must never suffer from.
+    if (new RegExp(symbolName).test(source)) {
+      offenders.push(relativePath);
+    }
+  }
+  return offenders;
+}
 
 function callsSdwRawWrite(source: string, aliases = new Set<string>()): boolean {
   const namespaceTargets = [
@@ -257,9 +581,16 @@ function findLmdbWriteGateOffenders(source: string, path: string): string[] {
     offenders.push(`${path}: transactional raw write can reach LMDB without the raw SDW guard`);
   }
 
+  // Rung-1 point 3 (2026-08-22, memory-file ingest --allow-file override)
+  // widened this to accept an optional trailing `options` parameter
+  // (`MintPersistableOptions`, threaded through so ONE narrow, per-passage
+  // classifier override can reach the LMDB transactional write path too).
+  // The widening is proven both directions below rather than trusted from
+  // its own source, same discipline as the unconditional-refusal recognizer
+  // above: it still rejects a shape that drops the guard.
   const txnPersistable = extractBalancedBlock(
     source,
-    /writePersistable:\s*async\s*\(\s*persistable,\s*encryptionKey,\s*fortressId\s*\)\s*=>/,
+    /writePersistable:\s*async\s*\(\s*persistable,\s*encryptionKey,\s*fortressId(?:,\s*options)?\s*\)\s*=>/,
   );
   if (txnPersistable === null) {
     offenders.push(`${path}: missing transactional persistable write implementation`);
@@ -386,7 +717,14 @@ function writeBlockChecksBeforeRawPut(block: string): boolean {
 }
 
 function persistableBlockUsesPreparedAuthority(block: string): boolean {
-  const prepareIndex = block.indexOf("prepareSdwBackendWrite(persistable, encryptionKey, fortressId)");
+  // Same optional-trailing-`options` widening as the txnPersistable extraction
+  // regex above, and for the same reason: prepareSdwBackendWrite now takes an
+  // optional 4th MintPersistableOptions argument. A regex search (not a fixed
+  // indexOf) so both the 3-arg and 4-arg call shapes are recognized.
+  const prepareMatch = block.match(
+    /prepareSdwBackendWrite\(\s*persistable,\s*encryptionKey,\s*fortressId(?:,\s*options)?\s*\)/,
+  );
+  const prepareIndex = prepareMatch === null ? -1 : (prepareMatch.index ?? -1);
   const guardIndex = block.indexOf("assertSdwRawWriteAuthorized(");
   const checkedDataIndex = block.indexOf("checkedData");
   // Direct guarded LMDB put, or guarded write into the sdwTransaction

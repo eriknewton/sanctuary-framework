@@ -19,6 +19,8 @@ export {
   mintPersistable,
   prepareSdwBackendWrite,
   sdwBackendWrite,
+  type ClassifierOverrideAuthorization,
+  type MintPersistableOptions,
   type Persistable,
   type Taint,
   type Untrusted,
