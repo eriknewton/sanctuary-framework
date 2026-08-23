@@ -40,6 +40,7 @@ import type { StorageBackend } from "../storage/interface.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { bytesToString } from "../core/encoding.js";
 import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
+import { InterruptedExitImportPendingError } from "../storage/exit-import-journal.js";
 import {
   fixedDenial,
   OpaqueNamespaceRegistry,
@@ -1310,22 +1311,45 @@ export function createCognitiveTools(
           key: args.key,
         });
 
-        const result = await stateStore.write(
-          args.namespace as string,
-          args.key as string,
-          args.value as string,
-          identity.identity_id,
-          identity.encrypted_private_key,
-          identityEncKey,
-          {
-            content_type: metadata?.content_type,
-            ttl_seconds: metadata?.ttl_seconds,
-            tags: metadata?.tags,
-            provenance: {
-              origin_actor: stateWriteOriginActor(identity.identity_id),
-            },
+        // N4 (coordinator gate, 2026-08-22): StateStore.write refuses
+        // while an exit-import journal exists (cognitive/state-store.ts);
+        // catch that SPECIFIC error here to audit the refusal and return
+        // a clean tool-result error, rather than an unhandled throw.
+        let result;
+        try {
+          result = await stateStore.write(
+            args.namespace as string,
+            args.key as string,
+            args.value as string,
+            identity.identity_id,
+            identity.encrypted_private_key,
+            identityEncKey,
+            {
+              content_type: metadata?.content_type,
+              ttl_seconds: metadata?.ttl_seconds,
+              tags: metadata?.tags,
+              provenance: {
+                origin_actor: stateWriteOriginActor(identity.identity_id),
+              },
+            }
+          );
+        } catch (err) {
+          if (err instanceof InterruptedExitImportPendingError) {
+            await recordCriticalAudit(
+              auditLog,
+              "l1",
+              "state_write_refused_pending_exit_import_recovery",
+              identity.identity_id,
+              { namespace: args.namespace, key: args.key },
+              "failure"
+            );
+            return toolResult({
+              error: "exit_import_pending_recovery",
+              message: err.message,
+            });
           }
-        );
+          throw err;
+        }
 
         return toolResult(result);
       },
@@ -1619,10 +1643,32 @@ export function createCognitiveTools(
           reason: args.reason,
         });
 
-        const result = await stateStore.delete(
-          args.namespace as string,
-          args.key as string
-        );
+        // N4 (coordinator gate, 2026-08-22): StateStore.delete refuses
+        // while an exit-import journal exists; catch that SPECIFIC error
+        // to audit the refusal and return a clean tool-result error.
+        let result;
+        try {
+          result = await stateStore.delete(
+            args.namespace as string,
+            args.key as string
+          );
+        } catch (err) {
+          if (err instanceof InterruptedExitImportPendingError) {
+            await recordCriticalAudit(
+              auditLog,
+              "l1",
+              "state_delete_refused_pending_exit_import_recovery",
+              "principal",
+              { namespace: args.namespace, key: args.key },
+              "failure"
+            );
+            return toolResult({
+              error: "exit_import_pending_recovery",
+              message: err.message,
+            });
+          }
+          throw err;
+        }
 
         return toolResult(result);
       },
@@ -1722,13 +1768,35 @@ export function createCognitiveTools(
           namespaces: targetNamespaces,
         });
 
-        const result = await stateStore.import(
-          args.bundle as string,
-          (args.conflict_resolution as "skip" | "overwrite" | "version") ??
-            "skip",
-          publicKeyResolver,
-          { allowUnverifiedLegacy: args.allow_unverified_legacy === true }
-        );
+        // N4 (coordinator gate, 2026-08-22): StateStore.import refuses
+        // while an exit-import journal exists; catch that SPECIFIC error
+        // to audit the refusal and return a clean tool-result error.
+        let result;
+        try {
+          result = await stateStore.import(
+            args.bundle as string,
+            (args.conflict_resolution as "skip" | "overwrite" | "version") ??
+              "skip",
+            publicKeyResolver,
+            { allowUnverifiedLegacy: args.allow_unverified_legacy === true }
+          );
+        } catch (err) {
+          if (err instanceof InterruptedExitImportPendingError) {
+            await recordCriticalAudit(
+              auditLog,
+              "l1",
+              "state_import_refused_pending_exit_import_recovery",
+              "principal",
+              { namespaces: targetNamespaces },
+              "failure"
+            );
+            return toolResult({
+              error: "exit_import_pending_recovery",
+              message: err.message,
+            });
+          }
+          throw err;
+        }
 
         return toolResult(result);
       },

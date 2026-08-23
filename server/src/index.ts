@@ -242,7 +242,7 @@ export async function createSanctuaryServer(options?: {
   // 5. Initialize audit log
   const auditLog = new AuditLog(storage, masterKey);
 
-  // 5b. HIGH-2 (coordinator gate, 2026-08-22): roll back any exit-import
+  // 5b. G-2 (coordinator gate, 2026-08-22): roll back any exit-import
   // left interrupted by a prior hard kill on THIS fortress BEFORE any other
   // subsystem below reads or writes storage - including before the
   // anti-rollback cross-check right after this, so that check evaluates

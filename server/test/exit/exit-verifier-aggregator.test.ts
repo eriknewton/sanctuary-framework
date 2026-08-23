@@ -484,6 +484,29 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
     expect(result.activated).toBe(false);
   }
 
+  /**
+   * Codex gate net-new (2026-08-22): a "structural" throw at the
+   * pre-staging gate must be proven, not just named - assert NO staging
+   * artifact ever appeared under any of the exit-reserved namespaces on a
+   * fresh (pristine) destination. These namespace literals must match the
+   * `EXIT_*_NAMESPACE` constants in src/exit/bundle.ts.
+   */
+  async function assertNoStagingWrites(
+    destinationStorage: MemoryStorage
+  ): Promise<void> {
+    for (const ns of [
+      "_exit_public_identities",
+      "_exit_policy_sets",
+      "_exit_audit_receipts",
+      "_exit_commitments",
+      "_exit_placeholder_metadata",
+      "_exit_imports",
+      "_exit_import_journal",
+    ]) {
+      expect(await destinationStorage.list(ns)).toHaveLength(0);
+    }
+  }
+
   it("control: a healthy bundle verifies PASS and activates cleanly", async () => {
     const source = await makeSource("aggregator-control-source");
     const bundleDir = await newBundleDir();
@@ -1284,6 +1307,8 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
         }),
       { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
     );
+
+    await assertNoStagingWrites(destination.storage as MemoryStorage);
   });
 
   it("an entries element whose `entry.payload.v` is a well-typed but wrong value (2) fails verify closed, and import refuses with a NAMED error", async () => {
@@ -1317,6 +1342,8 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
         }),
       { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
     );
+
+    await assertNoStagingWrites(destination.storage as MemoryStorage);
   });
 
   it("an entries element whose `entry.payload.iv` decodes to the wrong byte length fails verify closed, and import refuses with a NAMED error", async () => {
@@ -1326,7 +1353,10 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
     await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
       const entries = artifact.entries as Array<Record<string, unknown>>;
       const entry = entries[0]!.entry as Record<string, unknown>;
-      // "AAAA" base64url-decodes to 3 bytes, not the 12 the cipher requires.
+      // "AAAA" base64url-decodes to 3 bytes, not the 12 a legitimate
+      // export always emits (N3, coordinator gate, 2026-08-22: the cipher
+      // itself accepts other nonce sizes; this predicate deliberately
+      // pins to the one length an export actually produces).
       const payload = { ...(entry.payload as Record<string, unknown>), iv: "AAAA" };
       artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload } }];
     });
@@ -1351,6 +1381,8 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
         }),
       { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
     );
+
+    await assertNoStagingWrites(destination.storage as MemoryStorage);
   });
 
   // ---- F3/F4 (Exit V2 drill D1, 2026-08-22): two structural checks that

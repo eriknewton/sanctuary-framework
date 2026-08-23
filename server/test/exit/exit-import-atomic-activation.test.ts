@@ -436,7 +436,7 @@ describe("F1: durable rollback journal - in-process fault injection at each stag
     expect(await destinationStorage.list("atomic-midrekey-ns")).toHaveLength(0);
   });
 
-  it("HIGH-A (coordinator gate, 2026-08-22): a journal carrying namespace_snapshots is rejected outright, never replayed - _meta/_identities stay untouched", async () => {
+  it("HIGH-A (coordinator gate, 2026-08-22, register id EXIT-JOURNAL-CONFINE-01): a journal carrying an unsupported key is rejected outright, never replayed - _meta/_identities stay untouched", async () => {
     const destination = await makeDestination();
     const destinationStorage = destination.storage as MemoryStorage;
     // Plant real data in _meta and _identities so a wipe would be
@@ -448,14 +448,16 @@ describe("F1: durable rollback journal - in-process fault injection at each stag
       stringToBytes("canary-identity-value")
     );
 
-    // The EXACT shape the coordinator's gate reproduced: an empty-entries
-    // namespace_snapshots list naming _meta and _identities.
+    // A journal carrying a key outside the exact allowlisted set (N7,
+    // coordinator gate, 2026-08-22) - the shape guard rejects it by
+    // key-set equality regardless of what the extra key is named or
+    // contains.
     const maliciousRecord = {
       import_id: "crafted-import",
       identity_id: "crafted-identity",
       started_at: new Date().toISOString(),
       snapshots: [],
-      namespace_snapshots: [
+      unsupported_field: [
         { namespace: "_meta", entries: [] },
         { namespace: "_identities", entries: [] },
       ],
@@ -914,4 +916,174 @@ describe("F1: a real child-process SIGKILL mid-import leaves the target unable t
     },
     90_000
   );
+});
+
+describe("N4 (coordinator gate, 2026-08-22): write chokepoints refuse while an exit-import journal exists", () => {
+  it("state_write refuses with the named error and audits when a journal is present, then succeeds once it is removed", async () => {
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+
+    // A well-formed journal (matches the exact key-set schema, N7) with no
+    // snapshots - the point of this test is the WRITE REFUSAL, not the
+    // journal's own content.
+    const journalRecord = {
+      import_id: "planted-n4-import",
+      identity_id: destination.identityId,
+      started_at: new Date().toISOString(),
+      snapshots: [],
+    };
+    await destinationStorage.write(
+      EXIT_IMPORT_JOURNAL_NAMESPACE,
+      "planted-n4-import",
+      stringToBytes(JSON.stringify(journalRecord))
+    );
+
+    const refused = await callTool(destination.tools, "state_write", {
+      namespace: "n4-test-ns",
+      key: "k",
+      value: "should not be written",
+      identity_id: destination.identityId,
+    });
+    expect(refused.error).toBe("exit_import_pending_recovery");
+    expect(await destinationStorage.exists("n4-test-ns", "k")).toBe(false);
+
+    const audited = await destination.auditLog.query({
+      operation_type: "state_write_refused_pending_exit_import_recovery",
+    });
+    expect(audited.entries.length).toBeGreaterThan(0);
+    expect(audited.entries[0]!.result).toBe("failure");
+
+    // Journal removed: the SAME write now succeeds.
+    await destinationStorage.delete(EXIT_IMPORT_JOURNAL_NAMESPACE, "planted-n4-import");
+    const succeeded = await callTool(destination.tools, "state_write", {
+      namespace: "n4-test-ns",
+      key: "k",
+      value: "written after recovery",
+      identity_id: destination.identityId,
+    });
+    expect(succeeded.error).toBeUndefined();
+    expect(await destinationStorage.exists("n4-test-ns", "k")).toBe(true);
+  });
+
+  it("reputation_record refuses with the named error and audits when a journal is present, then succeeds once it is removed", async () => {
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+
+    const journalRecord = {
+      import_id: "planted-n4-reputation-import",
+      identity_id: destination.identityId,
+      started_at: new Date().toISOString(),
+      snapshots: [],
+    };
+    await destinationStorage.write(
+      EXIT_IMPORT_JOURNAL_NAMESPACE,
+      "planted-n4-reputation-import",
+      stringToBytes(JSON.stringify(journalRecord))
+    );
+
+    const refused = await callTool(destination.tools, "reputation_record", {
+      interaction_id: "n4-test-ix",
+      counterparty_did: "did:key:z6MkN4TestCounterparty",
+      outcome: { type: "negotiation", result: "success" },
+      context: "n4-test-ctx",
+      identity_id: destination.identityId,
+    });
+    expect(refused.error).toBe("exit_import_pending_recovery");
+
+    const audited = await destination.auditLog.query({
+      operation_type: "reputation_record_refused_pending_exit_import_recovery",
+    });
+    expect(audited.entries.length).toBeGreaterThan(0);
+    expect(audited.entries[0]!.result).toBe("failure");
+
+    await destinationStorage.delete(EXIT_IMPORT_JOURNAL_NAMESPACE, "planted-n4-reputation-import");
+    const succeeded = await callTool(destination.tools, "reputation_record", {
+      interaction_id: "n4-test-ix",
+      counterparty_did: "did:key:z6MkN4TestCounterparty",
+      outcome: { type: "negotiation", result: "success" },
+      context: "n4-test-ctx",
+      identity_id: destination.identityId,
+    });
+    expect(succeeded.error).toBeUndefined();
+  });
+
+  it("state_delete refuses with the named error when a journal is present, then succeeds once it is removed", async () => {
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+
+    await callTool(destination.tools, "state_write", {
+      namespace: "n4-delete-ns",
+      key: "k",
+      value: "value to protect from a stale restore",
+      identity_id: destination.identityId,
+    });
+    expect(await destinationStorage.exists("n4-delete-ns", "k")).toBe(true);
+
+    const journalRecord = {
+      import_id: "planted-n4-delete-import",
+      identity_id: destination.identityId,
+      started_at: new Date().toISOString(),
+      snapshots: [],
+    };
+    await destinationStorage.write(
+      EXIT_IMPORT_JOURNAL_NAMESPACE,
+      "planted-n4-delete-import",
+      stringToBytes(JSON.stringify(journalRecord))
+    );
+
+    const refused = await callTool(destination.tools, "state_delete", {
+      namespace: "n4-delete-ns",
+      key: "k",
+    });
+    expect(refused.error).toBe("exit_import_pending_recovery");
+    expect(await destinationStorage.exists("n4-delete-ns", "k")).toBe(true);
+
+    await destinationStorage.delete(EXIT_IMPORT_JOURNAL_NAMESPACE, "planted-n4-delete-import");
+    const succeeded = await callTool(destination.tools, "state_delete", {
+      namespace: "n4-delete-ns",
+      key: "k",
+    });
+    expect(succeeded.error).toBeUndefined();
+    expect(await destinationStorage.exists("n4-delete-ns", "k")).toBe(false);
+  });
+
+  it("state_import refuses with the named error when a journal is present, then succeeds once it is removed", async () => {
+    const destination = await makeDestination();
+    const destinationStorage = destination.storage as MemoryStorage;
+
+    await callTool(destination.tools, "state_write", {
+      namespace: "n4-import-ns",
+      key: "k",
+      value: "exported for re-import",
+      identity_id: destination.identityId,
+    });
+    const exported = (await callTool(destination.tools, "state_export", {
+      namespace: "n4-import-ns",
+    })) as { bundle: string };
+
+    const journalRecord = {
+      import_id: "planted-n4-import-bundle",
+      identity_id: destination.identityId,
+      started_at: new Date().toISOString(),
+      snapshots: [],
+    };
+    await destinationStorage.write(
+      EXIT_IMPORT_JOURNAL_NAMESPACE,
+      "planted-n4-import-bundle",
+      stringToBytes(JSON.stringify(journalRecord))
+    );
+
+    const refused = await callTool(destination.tools, "state_import", {
+      bundle: exported.bundle,
+      conflict_resolution: "overwrite",
+    });
+    expect(refused.error).toBe("exit_import_pending_recovery");
+
+    await destinationStorage.delete(EXIT_IMPORT_JOURNAL_NAMESPACE, "planted-n4-import-bundle");
+    const succeeded = await callTool(destination.tools, "state_import", {
+      bundle: exported.bundle,
+      conflict_resolution: "overwrite",
+    });
+    expect(succeeded.error).toBeUndefined();
+  });
 });

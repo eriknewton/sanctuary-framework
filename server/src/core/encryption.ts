@@ -20,18 +20,23 @@ import { toBase64url, fromBase64url } from "./encoding.js";
 import { describeUntrusted } from "../errors/index.js";
 
 /**
- * CONTRACT PIN (coordinator gate MEDIUM-B, 2026-08-22): the exact payload
- * version, algorithm, and IV byte length `decrypt()` below accepts.
- * Exported so a caller validating an EncryptedPayload BEFORE calling
- * decrypt() (server/src/exit/verifier.ts `isWellFormedExitStateEntryElement`)
- * can pin to these SAME values, rather than checking only that a field has
- * the right TYPE - a well-typed WRONG value (`alg: "aes-128-gcm"`) passed
- * that check and only failed later, post-staging, misread as a signature
- * failure. Must match `decrypt()`'s own checks below if either changes.
+ * CONTRACT PIN (coordinator gate G-B, 2026-08-22): the exact payload
+ * version and algorithm `decrypt()` below explicitly checks, plus the IV
+ * byte length `encrypt()` below always emits (N3, coordinator gate,
+ * 2026-08-22: decrypt()'s cipher does NOT itself require this length -
+ * @noble/ciphers' `gcm()` accepts other nonce sizes - this is the one
+ * length a legitimate export ever produces, pinned so a caller can treat
+ * any other length as malformed). Exported so a caller validating an
+ * EncryptedPayload BEFORE calling decrypt() (server/src/exit/verifier.ts
+ * `isWellFormedExitStateEntryElement`) can pin to these SAME values,
+ * rather than checking only that a field has the right TYPE - a
+ * well-typed WRONG value (`alg: "aes-128-gcm"`) passed that check and
+ * only failed later, post-staging, misread as a signature failure. Must
+ * match `decrypt()`'s own checks below if either changes.
  */
 export const SUPPORTED_PAYLOAD_VERSION = 1;
 export const SUPPORTED_PAYLOAD_ALG = "aes-256-gcm" as const;
-/** Exact IV byte length `generateIV()` (core/random.ts) produces and the GCM cipher requires. */
+/** Exact IV byte length `generateIV()` (core/random.ts) always produces; decrypt()'s cipher itself accepts other lengths, this pins to the one an export actually emits. */
 export const PAYLOAD_IV_BYTE_LENGTH = 12;
 
 /** Encrypted payload structure stored on disk */

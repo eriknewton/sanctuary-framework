@@ -16,6 +16,10 @@
  */
 
 import type { StorageBackend } from "../storage/interface.js";
+import {
+  hasInterruptedExitImport,
+  InterruptedExitImportPendingError,
+} from "../storage/exit-import-journal.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import {
@@ -1272,6 +1276,13 @@ export class ReputationStore {
     additionalQuotaCheck?: () => Promise<void>,
     emitAudit?: ReputationInLockAuditEmit
   ): Promise<StoredAttestation> {
+    // N4 (coordinator gate, 2026-08-22): refuse while a durable exit-import
+    // journal exists - see state-store.ts write() for the full rationale.
+    // No legitimate caller of `record()` runs during an active exit-import
+    // (that path uses `importBundle` below), so this check is unconditional.
+    if (await hasInterruptedExitImport(this.storage)) {
+      throw new InterruptedExitImportPendingError(`reputation_record:${context}`);
+    }
     const resolvedOrigin = ReputationStore.resolveOrigin(origin);
     // LD6 BP-DEADLINE-03: content-derived id from the tuple identifying THIS
     // logical operation (`participant_did` = the SIGNER, `identity.did` --
@@ -2034,6 +2045,14 @@ export class ReputationStore {
     publicKeys: Map<string, Uint8Array>,
     options: {
       allowUnverifiedLegacy?: boolean;
+      /**
+       * N4 (coordinator gate, 2026-08-22): bypasses the pending-exit-import
+       * write refusal below. The one legitimate caller is the exit-import
+       * module's own bundle-activation path, which calls this while its
+       * own not-yet-cleaned-up journal is present on disk - see the
+       * matching WriteOptions doc comment on the state store's write path.
+       */
+      allowDuringOwnExitImportActivation?: boolean;
     } = {},
     origin?: string
   ): Promise<{
@@ -2043,6 +2062,14 @@ export class ReputationStore {
     contexts: string[];
     completeness_verification: ReputationBundleCompletenessVerification;
   }> {
+    // N4 (coordinator gate, 2026-08-22): see record()'s matching check
+    // above and state-store.ts write() for the full rationale.
+    if (
+      !options.allowDuringOwnExitImportActivation &&
+      (await hasInterruptedExitImport(this.storage))
+    ) {
+      throw new InterruptedExitImportPendingError("reputation_import_bundle");
+    }
     // Two-factor custody floor (I4/F6): reputation is trust-bearing state.
     // Enforced in the core so no CLI/SDK path can bypass it.
     const { enforceCustodyFloor } = await import("../core/master-custody.js");

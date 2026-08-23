@@ -7,6 +7,7 @@
 
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
+import { InterruptedExitImportPendingError } from "../storage/exit-import-journal.js";
 import {
   ReputationBundleVerificationError,
   ReputationStore,
@@ -427,6 +428,20 @@ export function createReputationTools(
               "failure"
             );
             return toolResult({ error: err.message });
+          } else if (err instanceof InterruptedExitImportPendingError) {
+            // N4 (coordinator gate, 2026-08-22): reputationStore.record
+            // refuses while an exit-import journal exists (reputation-store.ts).
+            void auditLog.append(
+              "l4",
+              "reputation_record_refused_pending_exit_import_recovery",
+              identity.identity_id,
+              { interaction_id: args.interaction_id, context },
+              "failure"
+            );
+            return toolResult({
+              error: "exit_import_pending_recovery",
+              message: err.message,
+            });
           } else {
             throw err;
           }

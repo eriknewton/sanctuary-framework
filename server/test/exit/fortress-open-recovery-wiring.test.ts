@@ -110,7 +110,7 @@ const ALLOWLIST: Record<string, string> = {
   "src/cli/cortex-export.ts": "cortex-export verb; not wired this fix round, same bounded-scope reason.",
   "src/cli/audit.ts": "read-only audit verb; not wired this fix round.",
   "src/cli/castle-wall-boot.ts": "castle-wall boot-install verb; not wired this fix round, same bounded-scope reason.",
-  "src/cli/castle-wall-observe.ts": "read-only castle-wall observe verb, multiple AuditLog sites; not wired this fix round.",
+  "src/cli/castle-wall-observe.ts": "N2 (coordinator gate, 2026-08-22): writes observe-store state and critical audit entries (auditLog.appendCritical, observeStore.setState, removeCandidateAfterReview) - NOT read-only, corrected from an earlier false claim; not wired this fix round.",
   "src/cli/policy.ts": "policy verb family, multiple AuditLog sites; not wired this fix round.",
   "src/cli/checkpoint.ts": "checkpoint verb; not wired this fix round, same bounded-scope reason.",
   "src/cli/castle-wall.ts": "Castle Wall CLI, many AuditLog sites across many verbs; not wired this fix round.",
@@ -122,16 +122,29 @@ const ALLOWLIST: Record<string, string> = {
   "src/wrap/init.ts": "fortress first-run init; not wired this fix round, same bounded-scope reason.",
   "src/wrap/cli.ts": "wrap CLI, multiple AuditLog sites; not wired this fix round.",
   "src/templates/cli.ts": "templates verb; not wired this fix round, same bounded-scope reason.",
+  "src/cli/identity.ts": "N1 (coordinator gate, 2026-08-22): derives a master key (identity create/import) with no local AuditLog; not wired this fix round, same bounded-scope reason.",
+  "src/cli/federation-operator-signing.ts": "N1 (coordinator gate, 2026-08-22): derives a master key with no local AuditLog; not wired this fix round, same bounded-scope reason.",
+  "src/cli/custody-unlock.ts": "N1 (coordinator gate, 2026-08-22): derives a master key with no local AuditLog; not wired this fix round, same bounded-scope reason.",
+  "src/cli/doctor.ts": "deliberate exception, documented at resolveMasterKeyIfAvailable's own STATED BOUND comment: every check in this file is read-only and never-aborting by design, so it never calls the writing recovery path even where it derives a master key. Its own journal-presence check (checkInterruptedExitImport) is read-only and needs no credential.",
 };
 
 describe("structural pin: every named fortress-open call site routes through recoverInterruptedExitImportsOrThrow", () => {
   const srcDir = join(SERVER_ROOT, "src");
+  // N1 (coordinator gate, 2026-08-22): the predicate also catches a file
+  // that constructs a fortress storage backend and derives a master key
+  // WITHOUT ever constructing an AuditLog - the earlier `new AuditLog(`
+  // requirement missed exactly this shape (cli/identity.ts, doctor.ts,
+  // federation-operator-signing.ts, custody-unlock.ts all derive a master
+  // key with no local AuditLog).
+  const MASTER_KEY_DERIVATION_RE =
+    /resolveCliMasterKey\(|deriveFortressMasterKey\(|resolveMasterKey\(/;
   const candidates = listTsFiles(srcDir)
     .map(toRelSrcPath)
     .filter((relPath) => {
       const source = readFileSync(join(SERVER_ROOT, relPath), "utf8");
+      if (!source.includes("new FilesystemStorage(")) return false;
       return (
-        source.includes("new FilesystemStorage(") && source.includes("new AuditLog(")
+        source.includes("new AuditLog(") || MASTER_KEY_DERIVATION_RE.test(source)
       );
     })
     .sort();
@@ -416,8 +429,8 @@ describe("recovery through the REAL fortress-open path, not a direct call", () =
 
     // Directly plant a well-formed but interrupted-looking journal entry
     // (no real import needed for THIS half - the point is proving
-    // openExitContext's own recovery call fires on ANY subcommand, not
-    // reproducing an import interruption again).
+    // openExitContext's own recovery call fires on ANY subcommand, using
+    // the same planted-journal setup as the other cases in this file).
     const importId = "planted-openctx-recovery-import";
     const journalRecord = {
       import_id: importId,

@@ -16,6 +16,10 @@
  */
 
 import type { StorageBackend } from "../storage/interface.js";
+import {
+  hasInterruptedExitImport,
+  InterruptedExitImportPendingError,
+} from "../storage/exit-import-journal.js";
 import { ed25519 } from "@noble/curves/ed25519";
 import {
   encrypt,
@@ -660,6 +664,18 @@ export interface WriteOptions {
     lineage_id?: string;
     derived_from?: readonly DerivedFromEdge[];
   };
+  /**
+   * N4 (coordinator gate, 2026-08-22): bypasses the pending-exit-import
+   * write refusal below. Not for general use - the only legitimate caller
+   * is the exit-import module's own state-rekey path, which writes state
+   * entries while its own not-yet-cleaned-up journal is present on disk
+   * (the journal is written before staging and deleted only after
+   * activation fully succeeds, so it exists for the entire duration of
+   * the import that owns it). Every other caller is refused while any
+   * journal exists, including a journal left by a different, interrupted
+   * import.
+   */
+  allowDuringOwnExitImportActivation?: boolean;
 }
 
 /** Cached namespace key with TTL */
@@ -1619,6 +1635,21 @@ export class StateStore {
     identityEncryptionKey: Uint8Array,
     options: WriteOptions = {}
   ): Promise<WriteResult> {
+    // N4 (coordinator gate, 2026-08-22): while a durable exit-import
+    // journal exists, refuse THIS write rather than let it land and then
+    // possibly be silently reverted by a LATER recovery replay - the
+    // unconditional restore in restoreStorageSnapshots (exit/bundle.ts)
+    // has no way to tell "this write happened after the kill" from "this
+    // is the pre-import byte the journal itself remembers". `rekeyState`
+    // (exit/bundle.ts) is the one legitimate caller that writes while its
+    // OWN journal is present and passes `allowDuringOwnExitImportActivation`
+    // to skip this; every other caller is refused while ANY journal exists.
+    if (
+      !options.allowDuringOwnExitImportActivation &&
+      (await hasInterruptedExitImport(this.storage))
+    ) {
+      throw new InterruptedExitImportPendingError(`state_write:${namespace}/${key}`);
+    }
     const namespaceKey = this.getNamespaceKey(namespace);
     const plaintext = stringToBytes(value);
 
@@ -2281,8 +2312,18 @@ export class StateStore {
     // predicate every durable effect below already gates on, is what makes the
     // "no write but the audit entry" claim structural rather than a review
     // note: a durable effect added later inherits both halves.
+    // N4-READ (coordinator gate, 2026-08-22): a read's durable side effects
+    // (the legacy-schema migration write and the version-anchor raise below)
+    // touch the same `_meta` keys and state entries the write() chokepoint
+    // above guards - reaching them through a read bypassed that guard
+    // entirely before this line existed. Folded into the SAME predicate every
+    // durable effect already gates on, so a read still returns its value
+    // while a journal is pending; it just stops persisting the migration or
+    // raising the anchor until recovery clears it.
     const durableSideEffectsPermitted =
-      signatureVerified && options.unattributedDisclosure !== true;
+      signatureVerified &&
+      options.unattributedDisclosure !== true &&
+      !(await hasInterruptedExitImport(this.storage));
 
     // Decrypt
     const namespaceKey = this.getNamespaceKey(namespace);
@@ -2543,6 +2584,12 @@ export class StateStore {
 
   /**
    * Securely delete state (overwrite with random bytes before removal).
+   *
+   * N4-DELETE (coordinator gate, 2026-08-22): a secure delete is
+   * irreversible by design (AGENTS.md MUST-NEVER #3) - it must never be
+   * silently undone by a later journal replay restoring the pre-delete
+   * bytes at this same namespace/key. Refuse while a journal is pending,
+   * same as write().
    */
   async delete(
     namespace: string,
@@ -2554,6 +2601,9 @@ export class StateStore {
     new_merkle_root: string;
     deleted_at: string;
   }> {
+    if (await hasInterruptedExitImport(this.storage)) {
+      throw new InterruptedExitImportPendingError(`state_delete:${namespace}/${key}`);
+    }
     const deleted = await this.storage.delete(namespace, key, true);
 
     // Update caches
@@ -2713,6 +2763,16 @@ export class StateStore {
     imported_at: string;
     completeness_verification: StateExportCompletenessVerification;
   }> {
+    // N4-STATE-IMPORT (coordinator gate, 2026-08-22): this state-bundle
+    // import feature writes directly via `this.storage.write` below,
+    // outside the write() chokepoint above - a distinct entry point from
+    // the exit-import module's own activation, but one that can touch the
+    // exact same non-reserved-namespace locations an exit-import journal
+    // can restore. Refuse it the same way write() does; there is no
+    // legitimate reason to run this while a journal is pending recovery.
+    if (await hasInterruptedExitImport(this.storage)) {
+      throw new InterruptedExitImportPendingError("state_import");
+    }
     const bundle = parseExportBundleObject(bundleBase64);
     assertSupportedExportBundleSchema(bundle);
     const data = readExportData(bundle);

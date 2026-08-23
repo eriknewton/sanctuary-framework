@@ -166,7 +166,7 @@ export interface ExitEncryptedStateSummary {
    */
   entries_malformed: boolean;
   /**
-   * LOW-6 (coordinator gate, 2026-08-22): WHICH problem `checkEncryptedStateStructure`
+   * G-6 (coordinator gate, 2026-08-22): WHICH problem `checkEncryptedStateStructure`
    * found, so a caller can name it (a stale `total_keys`, a reserved
    * namespace entry, an unreadable/malformed entry) instead of a single
    * generic "malformed" message that cannot distinguish them. `undefined`
@@ -380,7 +380,7 @@ function findPrivateMaterial(value: unknown, path = "$"): string[] {
 }
 
 /**
- * TYPED PARSE RESULT (Codex gate HIGH finding, 2026-08-22; rule 11,
+ * TYPED PARSE RESULT (Codex gate finding, 2026-08-22; rule 11,
  * AGENTS.md): the exact shape import's state-rekey path reads BEFORE (and
  * immediately after) decrypting an entry - namespace/key/kid/sig/metadata
  * (safe-dereference fields, EXIT-STRUCT-02) PLUS the crypto-payload fields
@@ -414,16 +414,16 @@ export interface WellFormedExitStateEntryElement {
 }
 
 /**
- * CONTRACT PIN (server/src/exit/bundle.ts): the encrypted-state entries
- * guards in `resolveSourceMasterKey` and `importExitBundle` both call this
- * SAME function (via `checkEncryptedStateStructure` for the pre-staging
- * gate, and directly for the defense-in-depth callers) on every element, so
- * "malformed" here means exactly what makes import throw or silently skip
- * - a hand-mirrored second check was the whack-a-mole shape AGENTS.md
- * rule 5 rules out. A TYPE PREDICATE (`item is WellFormedExitStateEntryElement`),
- * not a bare boolean, so every caller gets real type narrowing from the
- * SAME check it ran, rather than a separately-hand-written cast that could
- * drift from what this function actually verified.
+ * CONTRACT PIN (the exit-import module): the encrypted-state entries
+ * guards on the import side both call this same function (via
+ * `checkEncryptedStateStructure` for the pre-staging gate, and directly
+ * for the defense-in-depth callers) on every element, so "malformed" here
+ * means exactly what import checks for - a hand-mirrored second check
+ * was the shape AGENTS.md rule 5 rules out. A type predicate
+ * (`item is WellFormedExitStateEntryElement`), not a bare boolean, so
+ * every caller gets real type narrowing from the same check it ran,
+ * rather than a separately-hand-written cast that could drift from what
+ * this function actually verified.
  */
 export function isWellFormedExitStateEntryElement(
   item: unknown
@@ -442,7 +442,7 @@ export function isWellFormedExitStateEntryElement(
   if (payload === null || typeof payload !== "object") return false;
   const payloadRecord = payload as Record<string, unknown>;
   if (typeof payloadRecord.ct !== "string") return false;
-  // MEDIUM-B (coordinator gate, 2026-08-22): pinned to the EXACT values
+  // G-B (coordinator gate, 2026-08-22): pinned to the EXACT values
   // `decrypt()` (core/encryption.ts) accepts, not merely their type - a
   // well-typed WRONG value (`v: 2`, `alg: "aes-128-gcm"`) used to pass
   // this check, verify PASS, and only fail post-staging inside rekeyState's
@@ -453,14 +453,17 @@ export function isWellFormedExitStateEntryElement(
   if (payloadRecord.v !== SUPPORTED_PAYLOAD_VERSION) return false;
   if (payloadRecord.alg !== SUPPORTED_PAYLOAD_ALG) return false;
   // `payload.iv` is read by `fromBase64url` with no type guard of its own
-  // (a non-string is the raw-TypeError crash risk EXIT-STRUCT-02 covers),
-  // and `decrypt()`'s GCM cipher requires the DECODED iv to be exactly
-  // `PAYLOAD_IV_BYTE_LENGTH` bytes - a string that is technically base64url
-  // but decodes to the wrong length reaches the cipher and throws there
-  // instead of failing this structural check. `fromBase64urlStrict`
-  // rejects any non-canonical encoding (so a lenient-decoder quirk cannot
-  // hide a length mismatch), and the byte-length check pins to what the
-  // cipher actually requires.
+  // (a non-string is the raw-TypeError crash risk EXIT-STRUCT-02 covers).
+  // N3 (coordinator gate, 2026-08-22): `PAYLOAD_IV_BYTE_LENGTH` is the
+  // exact length `encrypt()` (core/encryption.ts) always emits, not a
+  // length decrypt()'s cipher itself requires - @noble/ciphers' `gcm()`
+  // accepts other nonce sizes (varSizeNonce). This structural check
+  // deliberately pins to the ONE length a legitimate export ever produces,
+  // so a decodable-but-off-length IV is refused here as malformed rather
+  // than accepted by the cipher under a nonce size this fortress never
+  // actually uses. `fromBase64urlStrict` rejects any non-canonical
+  // encoding first, so a lenient-decoder quirk cannot hide a length
+  // mismatch from the check that follows it.
   if (typeof payloadRecord.iv !== "string") return false;
   try {
     if (fromBase64urlStrict(payloadRecord.iv).length !== PAYLOAD_IV_BYTE_LENGTH) {
@@ -1242,7 +1245,7 @@ export async function verifyExitBundle(
     );
   }
   if (stateSummary?.entries_malformed === true) {
-    // LOW-6 (coordinator gate, 2026-08-22): name the ACTUAL problem
+    // G-6 (coordinator gate, 2026-08-22): name the ACTUAL problem
     // (structural_problem, populated from the same checkEncryptedStateStructure
     // call that set entries_malformed) rather than a single generic message
     // that could not distinguish a stale total_keys header, a

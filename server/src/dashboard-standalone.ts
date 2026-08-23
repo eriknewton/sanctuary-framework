@@ -923,7 +923,7 @@ async function wireUnlockedDeps(args: {
   // 5. Initialize audit log (for reading historical entries)
   const auditLog = new AuditLog(storage, masterKey);
 
-  // HIGH-2 (coordinator gate, 2026-08-22): roll back any exit-import left
+  // G-2 (coordinator gate, 2026-08-22): roll back any exit-import left
   // interrupted by a prior hard kill on THIS fortress before the dashboard
   // reads or serves anything from storage. See index.ts's matching call
   // site for the full rationale (createSanctuaryServer, step 5b).
