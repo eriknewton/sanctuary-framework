@@ -976,12 +976,22 @@ const KEYWORD_ENTROPY_PROXIMITY_CODE_POINTS = KEYWORD_ENTROPY_CANDIDATE_MAX_CHAR
 // no word boundary between two word characters (Rung-1 fix-round HIGH-A2:
 // this silently dropped the keyword gate for exactly the
 // UPPER_SNAKE_CASE=value shape most secret-bearing environment/config lines
-// use, with no backstop left after F1 removed the whole-file scope). A
-// lookaround anchor treats ANY non-alphanumeric character, including `_` and
-// `=`, as a delimiter, while still requiring a full-word match (no partial
-// hit inside "tokenize" or "mytoken").
+// use, with no backstop left after F1 removed the whole-file scope). The
+// lookahead below is a two-way choice, not a single "not alnum" negative
+// lookahead (Rung-1 fix-round-2, N3): a bare `(?![A-Za-z0-9])` treats a
+// trailing underscore as a delimiter too, so it also matched "authorization"
+// inside "authorization_code" and "auth" inside "auth_service" — ordinary
+// snake_case identifiers named IN PROSE, not an assignment, refusing text
+// like "The authorization_code flow is documented here." with no secret
+// present. A match now succeeds when the keyword is followed by a true
+// delimiter (not alnum, not underscore — "=", ":", whitespace, punctuation,
+// end of string) OR by an underscore-joined identifier CONTINUATION that
+// itself resolves to "=" or ":" before hitting a non-identifier character
+// (so "DATABASE_PASSWORD_HASH=" still gates on "PASSWORD", and
+// "OPENAI_API_KEY=" still gates, but "authorization_code " and
+// "auth_service " — continuations that trail off into more prose — do not).
 const KEYWORD_GATE_PATTERN =
-  /(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?key|auth|authorization|bearer|credential|password|private[_-]?key|secret|token)(?![A-Za-z0-9])/gi;
+  /(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?key|auth|authorization|bearer|credential|password|private[_-]?key|secret|token)(?:(?![A-Za-z0-9_])|(?=_[A-Za-z0-9]*[=:]))/gi;
 
 function findKeywordGatedHighEntropySecret(text: string): ClassifierHit | undefined {
   const keywordIndices = [...text.matchAll(KEYWORD_GATE_PATTERN)].map((m) => m.index ?? 0);
@@ -1008,17 +1018,15 @@ function findKeywordGatedHighEntropySecret(text: string): ClassifierHit | undefi
 
 /**
  * AGENTS.md rule 8 (adversarial-complexity bound): a linear scan of every
- * keyword per candidate is O(candidates * keywords), unbounded work for one
- * screenPassage call on attacker-influenced text — Rung-1 fix-round HIGH-A1
- * measured 5.9s at 100 KB, 75s at 400 KB, and a 1 MB input killed at the 10
- * minute mark, reachable via memory_emit/screenPassage under the SDW 1 MiB
- * record cap. keywordIndices is ascending (matchAll on a non-overlapping
- * global pattern yields matches in text order), so ONE binary search finds
- * the nearest keyword at-or-before and at-or-after the candidate; testing
- * only those two neighbors is sufficient because a keyword sharing the
- * candidate's line is, by construction, closer in character index than any
- * keyword on an earlier or later line, so it is always one of these two.
- * This is O(candidates * log keywords) instead.
+ * keyword per candidate is O(candidates * keywords) — unbounded work per
+ * call on attacker-influenced text (Rung-1 fix-round HIGH-A1; reproduction
+ * detail is not published here, MUST-NEVER #9). keywordIndices is ascending
+ * (matchAll on a non-overlapping global pattern yields matches in text
+ * order), so ONE binary search finds the nearest keyword at-or-before and
+ * at-or-after the candidate; testing only those two neighbors is sufficient
+ * because a keyword sharing the candidate's line is, by construction, closer
+ * in character index than any keyword on an earlier or later line, so it is
+ * always one of these two. This is O(candidates * log keywords) instead.
  */
 function hasNearbyKeyword(
   text: string,
@@ -1068,7 +1076,12 @@ function isKeywordNear(
  * understanding of the algorithm, not the shipped one's. Not part of the
  * classifier's public contract; production code must never import this.
  */
-export const rung1ClassifierTestOnly = { hasNearbyKeyword, buildLineIndex };
+export const rung1ClassifierTestOnly = {
+  hasNearbyKeyword,
+  buildLineIndex,
+  buildLineBacktickFeatures,
+  isExemptHighEntropyContext,
+};
 
 /**
  * Whether two UTF-16 offsets are within `windowCodePoints` Unicode code
@@ -1109,21 +1122,20 @@ function countCodePoints(text: string, start: number, end: number): number {
 }
 
 /**
- * Rung-1 fix-round (Codex HIGH-1): a bare credential-shaped value farther
- * than the keyword-entropy proximity window from any keyword still passed
- * every other detector after F1 removed whole-file scope, and for a
- * memory-file mirror the classifier is the ONLY backstop (both harness
- * adapters tag mirrored files "user_content", so no provenance/taint check
- * catches it either). This is a NARROW, deliberately conservative file-scope
- * fallback: it refuses a bare high-entropy run only when it also looks like
- * a raw credential (base64url or hex charset, no keyword required), and
- * isExemptHighEntropyContext below carves out the shapes measurement against
- * a real 487-file corpus showed produce false positives: a hex/decimal
- * content digest (isKnownHashLength, unchanged), a markdown link target or
- * URL path/query segment, an explicit hash/commit label, and a backticked
- * inline code span (the corpus's one bare candidate was a file path inside
- * backticks). This is a bound, not a closed gap: a bare secret with none of
- * those shapes, farther than the window from any keyword, still passes (see
+ * Rung-1 fix-round (Codex HIGH-1): for a harness-mirrored memory file, the
+ * classifier is the ONLY backstop (both adapters tag mirrored files
+ * "user_content", so no provenance/taint check catches it either), and a
+ * bare credential-shaped value with no keyword nearby otherwise passed every
+ * detector. This is a NARROW, deliberately conservative fallback: it refuses
+ * a bare high-entropy run that looks like a raw credential (base64url or hex
+ * charset, no keyword required) UNLESS isExemptHighEntropyContext below
+ * places it in one of four contexts measurement against a real 487-file
+ * corpus showed produce false positives: a hex/decimal content digest
+ * (isKnownHashLength, unchanged), a markdown link target or a contiguous URL
+ * path/query segment, an explicit hash/commit label, or a value written
+ * between backticks (the corpus's one bare candidate was a file path written
+ * that way). This is a capability bound, not a closed gap: a genuine secret
+ * that happens to be written in one of those four shapes still passes (see
  * server/src/sdw/README.md's known false-negatives list).
  */
 function findBareHighEntropyCredential(text: string): ClassifierHit | undefined {
@@ -1131,44 +1143,100 @@ function findBareHighEntropyCredential(text: string): ClassifierHit | undefined 
     ...text.matchAll(/\b[A-Fa-f0-9]{32,128}\b/g),
     ...text.matchAll(/\b[A-Za-z0-9_-]{32,128}\b/g),
   ];
+  if (candidates.length === 0) return undefined;
+  // Precomputed ONCE per call, not per candidate (Rung-1 fix-round-2, N1):
+  // isExemptHighEntropyContext used to rebuild the candidate's line on every
+  // call (lastIndexOf/indexOf/slice/includes), each O(line length); on a
+  // single-line adversarial input every candidate re-scanned the same huge
+  // line, an unbounded-per-call cost with the same shape as HIGH-A1. A line
+  // index plus one first/last-backtick-per-line pass gives O(log n) line
+  // lookup and O(1) checks per candidate below.
+  const lineStarts = buildLineIndex(text);
+  const backtickFeatures = buildLineBacktickFeatures(text, lineStarts);
   for (const match of candidates) {
     const candidate = match[0];
     if (isAllowedPlaceholder(candidate) || isKnownHashLength(candidate)) continue;
     const threshold = /^[A-Fa-f0-9]+$/.test(candidate) ? 3.2 : 4.5;
     if (shannonEntropy(candidate) < threshold) continue;
     const index = match.index ?? 0;
-    if (isExemptHighEntropyContext(text, index, candidate.length)) continue;
+    if (isExemptHighEntropyContext(text, index, candidate.length, lineStarts, backtickFeatures)) continue;
     return { index };
   }
   return undefined;
 }
 
+interface LineBacktickFeatures {
+  /** Per line (0-based), the absolute text index of its FIRST backtick, or -1. */
+  readonly firstBacktick: readonly number[];
+  /** Per line (0-based), the absolute text index of its LAST backtick, or -1. */
+  readonly lastBacktick: readonly number[];
+}
+
+/**
+ * One O(text length) pass, computed once per findBareHighEntropyCredential
+ * call. "A backtick exists before index X on this line" is exactly
+ * "firstBacktick[line] < X" (the earliest backtick is before X iff any is),
+ * and "a backtick exists after X" is exactly "lastBacktick[line] > X" (the
+ * latest is after X iff any is) — so isExemptHighEntropyContext below never
+ * has to re-scan the line's content per candidate.
+ */
+function buildLineBacktickFeatures(
+  text: string,
+  lineStarts: readonly number[],
+): LineBacktickFeatures {
+  const firstBacktick = new Array<number>(lineStarts.length).fill(-1);
+  const lastBacktick = new Array<number>(lineStarts.length).fill(-1);
+  let lineIndex = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === "\n") {
+      lineIndex += 1;
+      continue;
+    }
+    if (text[i] === "`") {
+      if (firstBacktick[lineIndex] === -1) firstBacktick[lineIndex] = i;
+      lastBacktick[lineIndex] = i;
+    }
+  }
+  return { firstBacktick, lastBacktick };
+}
+
 // Fixed, small lookback bound (not the file, not the line) for the
-// paren/label exemptions below, so this stays O(1) per candidate regardless
-// of file size.
+// paren/label/URL exemptions below, so each stays O(1) per candidate
+// regardless of file or line size.
 const HIGH_ENTROPY_EXEMPTION_LOOKBACK_CHARS = 64;
 
-function isExemptHighEntropyContext(text: string, index: number, length: number): boolean {
-  const lineStart = index === 0 ? 0 : text.lastIndexOf("\n", index - 1) + 1;
-  const nextNewline = text.indexOf("\n", index + length);
-  const lineEnd = nextNewline === -1 ? text.length : nextNewline;
-  const linePrefix = text.slice(lineStart, index);
-  const lineSuffix = text.slice(index + length, lineEnd);
-
-  // Backticked inline code span: a backtick opens before the candidate and
-  // closes after it, on the same line (markdown inline code / file paths).
-  // Broad by design — any backtick on either side of the candidate's line
-  // exempts it, which can also exempt an unrelated real secret that happens
-  // to share a line with backticked prose; documented as a known
-  // false-negative rather than tightened, per the narrow-fallback ruling.
-  if (linePrefix.includes("`") && lineSuffix.includes("`")) return true;
+function isExemptHighEntropyContext(
+  text: string,
+  index: number,
+  length: number,
+  lineStarts: readonly number[],
+  backtickFeatures: LineBacktickFeatures,
+): boolean {
+  // A value written between backticks (markdown inline code, commonly used
+  // for file paths and identifiers) is exempt: a backtick exists earlier on
+  // the line and a backtick exists later. The known residual (documented in
+  // server/src/sdw/README.md, not tightened here per the narrow-fallback
+  // ruling) is a genuine secret pasted the same way, inside backticks.
+  const lineIndex = lineNumberForIndex(lineStarts, index) - 1;
+  const firstBacktick = backtickFeatures.firstBacktick[lineIndex] ?? -1;
+  const lastBacktick = backtickFeatures.lastBacktick[lineIndex] ?? -1;
+  if (firstBacktick !== -1 && firstBacktick < index && lastBacktick > index + length - 1) {
+    return true;
+  }
 
   const before = text.slice(Math.max(0, index - HIGH_ENTROPY_EXEMPTION_LOOKBACK_CHARS), index);
+  const afterChar = index + length < text.length ? text[index + length] : undefined;
 
-  // Markdown link target ("...](value)"), or any URL already opened earlier
-  // on this line (a path or query segment of it).
-  if (/\($/.test(before) && lineSuffix.startsWith(")")) return true;
-  if (/https?:\/\//i.test(linePrefix)) return true;
+  // Markdown link target ("...](value)").
+  if (/\($/.test(before) && afterChar === ")") return true;
+
+  // A URL immediately adjacent to the candidate with no whitespace break
+  // (Rung-1 fix-round-2, N2): the candidate is itself a path/query segment
+  // of that URL. Requires CONTIGUITY — an unrelated URL mentioned earlier on
+  // the same line, with a gap before the candidate, no longer exempts it
+  // (it previously did: "See https://docs.test/setup then paste <key> here"
+  // was wrongly exempt).
+  if (/https?:\/\/\S*$/i.test(before)) return true;
 
   // A content-hash or commit reference labeled immediately before the value.
   if (/(?:sha256:|sha1:|md5:|commit[: ])$/i.test(before)) return true;

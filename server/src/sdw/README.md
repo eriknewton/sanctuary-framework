@@ -61,33 +61,30 @@ secret. Known, deliberate false negatives (documented, not bugs):
   unrelated fields, or farther apart than the window within one field, may
   pass unless provenance, another high-signal detector, or the bare-credential
   fallback below rejects it.
-- A bare high-entropy value farther than the keyword-entropy window from any
-  keyword is additionally checked against a narrow fallback
-  (`bare_high_entropy_credential`, added in the Rung-1 fix-round after
-  measurement against a real 487-file corpus): it refuses a base64url- or
-  hex-shaped run of 32+ characters at or above the entropy threshold UNLESS it
-  sits in one of four exempted contexts — a canonical hash length (32/40/64
-  hex chars, already covered above), a markdown link target or URL path/query
-  segment, an explicit `sha256:`/`sha1:`/`md5:`/`commit` label, or a
-  backticked inline code span. The backtick exemption is intentionally broad
-  (any backtick before AND after the candidate on its line exempts it, not
-  only an immediately-adjacent pair), so a real secret that happens to share a
-  line with unrelated backticked prose can still pass. A bare secret with none
-  of those four shapes, farther than the window from any keyword, still
-  passes this detector; provenance and the other high-signal detectors are
-  the remaining backstops for that case. **This fallback is opt-in
-  (`applyBareCredentialFallback`), not the classifier's default**:
-  `claude-code-file-adapter.ts`/`codex-memory-file-adapter.ts` turn it on for
-  harness memory-file text specifically, because the classifier is the ONLY
-  backstop there (both tag mirrored files `user_content`, so no
-  provenance/taint check catches it either). It is deliberately OFF for every
-  other SDW record kind and for every other memory-passage caller (archive
-  import/restore, memory-transcode's own archive bookkeeping, the
-  general-purpose agent-memory MCP tool) — those legitimately carry
+- A bare high-entropy value with no keyword nearby is additionally checked
+  against a narrow fallback (`bare_high_entropy_credential`): a base64url- or
+  hex-shaped run of 32+ characters at or above the entropy threshold is
+  refused unless it sits in one of four exempted contexts — a canonical hash
+  length (32/40/64 hex chars, already covered above), a markdown link target
+  or a URL path/query segment written contiguously against it (no
+  whitespace break — an unrelated URL earlier on the same line does not
+  exempt a later, separate value), an explicit `sha256:`/`sha1:`/`md5:`/
+  `commit` label immediately before it, or a value written between
+  backticks (an inline code span, e.g. a key pasted as `` `<value>` ``,
+  which markdown authoring commonly does for file paths and identifiers).
+  Those four are the capability's bound, not an exhaustive defense: a value
+  in one of those four shapes passes even when it is a genuine secret. This
+  fallback is opt-in (`applyBareCredentialFallback`), not the classifier's
+  default — `claude-code-file-adapter.ts`/`codex-memory-file-adapter.ts` turn
+  it on for harness memory-file text specifically, because the classifier is
+  the ONLY backstop there (both tag mirrored files `user_content`, so no
+  provenance/taint check catches it either). It is deliberately OFF for
+  every other SDW record kind and for every other memory-passage caller
+  (archive import/restore, memory-transcode's own archive bookkeeping, the
+  general-purpose agent-memory MCP tool), which legitimately carry
   system-generated ids, signatures, and content hashes that are high-entropy
   by construction and are not the false-positive class this fallback exists
-  to catch (measured while building it: turning it on unconditionally broke
-  138 unrelated tests across this repo's own SDW stores).
+  to catch.
 - Names such as `principal_policy`, `recovery key`, `SANCTUARY_RECOVERY_KEY`,
   and `Ed25519 private key` are allowed in ordinary prose. Policy and key
   provenance remains fail-closed, while the classifier rejects labeled key

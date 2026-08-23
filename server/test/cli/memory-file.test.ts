@@ -478,6 +478,70 @@ describe("memory file CLI: fortress-backed round trip", () => {
     ]);
   }, 60_000);
 
+  it("names the bare_high_entropy_credential detector for Claude Code, without leaking the value (Rung-1 fix-round-2)", async () => {
+    const BARE_CREDENTIAL_VALUE = "Rk2Nc9Wp5Ju1Vd8Sy3Ma6Ib0Ge7Tn4Ox1Cl9Aq3Fy6Un8x";
+    const source = await copyFixtureSet("basic", "memfile-cli-bare-cred-source");
+    await writeFile(
+      join(source, "note-with-bare-id.md"),
+      `# Notes
+
+Unrelated identifier: ${BARE_CREDENTIAL_VALUE}
+`,
+    );
+
+    const out = makeSink();
+    const err = makeSink();
+    const code = await runMemoryIngestCommand({
+      argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
+      out: out.stream,
+      err: err.stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+    });
+
+    expect(code).toBe(0);
+    expect(err.text()).toContain(
+      "refused note-with-bare-id.md: a high-entropy value elsewhere in the file looks like a raw credential (line 3)",
+    );
+    expect(out.text()).not.toContain(BARE_CREDENTIAL_VALUE);
+    expect(err.text()).not.toContain(BARE_CREDENTIAL_VALUE);
+  }, 60_000);
+
+  it("names the bare_high_entropy_credential detector for Codex, without leaking the value (Rung-1 fix-round-2)", async () => {
+    const BARE_CREDENTIAL_VALUE = "Bt3Qm7Xd1Kj5Rw9Vc2Ny6Ha0If4Ge8Ou1Sp3Lz6Wk9Tr2x";
+    const codexHome = await tempDir("memfile-cli-bare-cred-codex-home");
+    const memories = join(codexHome, "memories");
+    await mkdir(memories, { recursive: true });
+    for (const filename of ["MEMORY.md", "memory_summary.md", "raw_memories.md"]) {
+      await writeFile(
+        join(memories, filename),
+        await readFile(join(CODEX_FIXTURE_ROOT, "unicode", filename)),
+      );
+    }
+    await writeFile(
+      join(memories, "raw_memories.md"),
+      `# Raw Memories
+
+Unrelated identifier: ${BARE_CREDENTIAL_VALUE}
+`,
+    );
+
+    const out = makeSink();
+    const err = makeSink();
+    const code = await runMemoryIngestCommand({
+      argv: ["--harness", "codex", "--dir", codexHome, "--fortress", fortress],
+      out: out.stream,
+      err: err.stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+    });
+
+    expect(code).toBe(0);
+    expect(err.text()).toContain(
+      "refused raw_memories.md: a high-entropy value elsewhere in the file looks like a raw credential (line 3)",
+    );
+    expect(out.text()).not.toContain(BARE_CREDENTIAL_VALUE);
+    expect(err.text()).not.toContain(BARE_CREDENTIAL_VALUE);
+  }, 60_000);
+
   it("warns when emit cannot produce a re-ingestable Claude Code memory tree", async () => {
     const source = await copyFixtureSet("basic", "memfile-cli-index-skip-source");
     await writeFile(

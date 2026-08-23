@@ -226,6 +226,42 @@ describe("SDW classifier: bare high-entropy value far from any keyword (Rung-1 f
     const passed = results.filter((entry) => entry.result.ok);
     expect(passed.map((entry) => entry.fixture.label)).toEqual(EXEMPT_FIXTURES.map((f) => f.label));
   });
+
+  it("refuses a decoy URL earlier on the line followed by a separate bare value (Rung-1 fix-round-2, N2)", () => {
+    // Pre-fix-round-2, the URL exemption was "any URL earlier on the line",
+    // so a URL mentioned once and a wholly separate value later on the same
+    // line was wrongly exempt. The fix requires CONTIGUITY: the value must
+    // itself be an unbroken continuation of the URL, no whitespace between.
+    const text = `See https://docs.test/setup then paste ${FAR_IDENTIFIER} here
+`;
+    const result = classifierResult(text);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.detector).toBe("bare_high_entropy_credential");
+      expect(result.error.message).not.toContain(FAR_IDENTIFIER);
+    }
+  });
+});
+
+describe("SDW classifier: keyword boundary does not over-match snake_case continuations (Rung-1 fix-round-2, N3)", () => {
+  // The HIGH-A2 lookahead fix (delimit on `_`/`=`) also matched "authorization"
+  // inside "authorization_code" and "auth" inside "auth_service" — ordinary
+  // identifiers named in prose, not an assignment — refusing text with no
+  // secret present. Fixture text uses the fallback OFF explicitly
+  // (classifyRecord's default for every SDW record kind other than harness
+  // memory-file text), so only the keyword-boundary behavior is exercised,
+  // not the bare-credential fallback.
+  it("passes 'authorization_code' and 'auth_service' named in prose near a high-entropy value, fallback off", () => {
+    const text = `The authorization_code flow is documented in \`${FAR_IDENTIFIER}\` notes. The auth_service handles refresh separately.
+`;
+    expect(() => assertSdwClassifierCleanText(text, false)).not.toThrow();
+  });
+
+  it("still refuses a genuine UPPER_SNAKE_CASE=value assignment, fallback off", () => {
+    const text = `DATABASE_PASSWORD=${SAME_LINE_IDENTIFIER}
+`;
+    expect(() => assertSdwClassifierCleanText(text, false)).toThrow(SdwValidationError);
+  });
 });
 
 describe("SDW classifier: known_secret_token stays whole-record (Rung-1 F1 carve-out)", () => {
@@ -388,15 +424,13 @@ describe("SDW classifier: refusal names the detector and line, never the content
 
 describe("SDW classifier: O(candidates * log keywords), not O(candidates * keywords) (Rung-1 fix-round HIGH-A1)", () => {
   it("performs a bounded number of keyword-array reads per candidate on an adversarial input", () => {
-    // Rung-1 fix-round HIGH-A1 measured the pre-fix linear-scan shape at
-    // 5.9s for 100 KB, 75s for 400 KB, and killed at the 10-minute mark for
-    // 1 MB, reachable via memory_emit/screenPassage under the SDW 1 MiB
-    // record cap, with the classifier returning `ok: true` (no refusal), so
-    // nothing about the slowdown was logged. This exercises the REAL shipped
-    // hasNearbyKeyword (via rung1ClassifierTestOnly), not a reimplementation,
-    // and counts actual array reads via a counting Proxy rather than wall
-    // time, which cannot tell "still O(K), just under a small K today" apart
-    // from a real fix.
+    // Rung-1 fix-round HIGH-A1: the pre-fix linear-scan shape was unbounded
+    // per call on attacker-influenced text, with the classifier returning
+    // `ok: true` (no refusal), so nothing about the slowdown was logged.
+    // This exercises the REAL shipped hasNearbyKeyword (via
+    // rung1ClassifierTestOnly), not a reimplementation, and counts actual
+    // array reads via a counting Proxy rather than wall time, which cannot
+    // tell "still O(K), just under a small K today" apart from a real fix.
     const { hasNearbyKeyword, buildLineIndex } = rung1ClassifierTestOnly;
 
     const KEYWORD_COUNT = 4000;
@@ -407,8 +441,15 @@ describe("SDW classifier: O(candidates * log keywords), not O(candidates * keywo
     // char-window nor the same-line leg trivially short-circuits the search.
     const keywordIndices = Array.from({ length: KEYWORD_COUNT }, (_, i) => i * STRIDE);
     const candidateIndices = Array.from({ length: CANDIDATE_COUNT }, (_, i) => i * STRIDE + Math.floor(STRIDE / 2));
-    // A real (large, single-line) text and real lineStarts so the same-line
-    // leg of isKeywordNear runs against genuine data, not a stub.
+    // A real (large, single-line) text and real lineStarts so isKeywordNear
+    // runs against genuine data, not a stub. Every candidate here sits
+    // within the code-point proximity window of its nearest keyword, so
+    // isKeywordNear resolves via the distance check for all of them — this
+    // is deliberate: the property under test is the READ COUNT the binary
+    // search performs on keywordIndices, which is identical regardless of
+    // which branch inside isKeywordNear ultimately returns true or false
+    // (neither branch touches keywordIndices again), so which one resolves
+    // a given candidate does not change what is being measured here.
     const text = "x".repeat(KEYWORD_COUNT * STRIDE + STRIDE);
     const lineStarts = buildLineIndex(text);
 
@@ -432,5 +473,57 @@ describe("SDW classifier: O(candidates * log keywords), not O(candidates * keywo
     const perCandidateBound = 20;
     expect(accessCount).toBeLessThanOrEqual(CANDIDATE_COUNT * perCandidateBound);
     expect(accessCount).toBeGreaterThan(0); // the search does read the array; this is not a vacuous no-op count.
+  });
+});
+
+describe("SDW classifier: bare-credential exemption check is O(1) per candidate, not O(line length) (Rung-1 fix-round-2, N1)", () => {
+  it("performs a bounded number of backtick-feature array reads per candidate on a single-line adversarial input", () => {
+    // Pre-fix-round-2, isExemptHighEntropyContext rebuilt the candidate's
+    // line (lastIndexOf/indexOf/slice/includes) on every call — O(line
+    // length) work per candidate. On a single huge line, every candidate
+    // re-scanned the same line, reproducing HIGH-A1's unbounded-per-call
+    // shape at the exemption-check layer instead of the keyword-search
+    // layer. This exercises the REAL shipped isExemptHighEntropyContext (via
+    // rung1ClassifierTestOnly), counting actual array reads via a counting
+    // Proxy rather than wall time.
+    const { buildLineIndex, buildLineBacktickFeatures, isExemptHighEntropyContext } = rung1ClassifierTestOnly;
+
+    const LINE_LENGTH = 1_000_000;
+    const text = "x".repeat(LINE_LENGTH);
+    const lineStarts = buildLineIndex(text);
+    const backtickFeatures = buildLineBacktickFeatures(text, lineStarts);
+
+    let firstReads = 0;
+    let lastReads = 0;
+    const countingBacktickFeatures = {
+      firstBacktick: new Proxy(backtickFeatures.firstBacktick as number[], {
+        get(target, prop, receiver) {
+          if (typeof prop === "string" && /^\d+$/.test(prop)) firstReads += 1;
+          return Reflect.get(target, prop, receiver);
+        },
+      }),
+      lastBacktick: new Proxy(backtickFeatures.lastBacktick as number[], {
+        get(target, prop, receiver) {
+          if (typeof prop === "string" && /^\d+$/.test(prop)) lastReads += 1;
+          return Reflect.get(target, prop, receiver);
+        },
+      }),
+    };
+
+    const CANDIDATE_COUNT = 4000;
+    const STRIDE = Math.floor(LINE_LENGTH / (CANDIDATE_COUNT + 1));
+    for (let i = 0; i < CANDIDATE_COUNT; i += 1) {
+      isExemptHighEntropyContext(text, i * STRIDE + 10, 40, lineStarts, countingBacktickFeatures);
+    }
+
+    // O(1) array reads per candidate: one firstBacktick[line] and one
+    // lastBacktick[line] lookup, generously bounded at 4 reads/candidate
+    // each. The pre-fix shape re-scanned the whole line's characters per
+    // candidate — on this 1,000,000-character single line, orders of
+    // magnitude more than this bound.
+    expect(firstReads).toBeLessThanOrEqual(CANDIDATE_COUNT * 4);
+    expect(lastReads).toBeLessThanOrEqual(CANDIDATE_COUNT * 4);
+    expect(firstReads).toBeGreaterThan(0);
+    expect(lastReads).toBeGreaterThan(0);
   });
 });
