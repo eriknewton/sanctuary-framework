@@ -183,9 +183,9 @@ export async function ingestCodexMemorySnapshot(
         entry.source_path,
       ),
     };
-    // applyBareCredentialFallback=true (Rung-1 fix-round DESIGN, Codex
-    // HIGH-1): a raw Codex memory file has no other backstop (both
-    // this ingest and the write below tag it "user_content").
+    // applyBareCredentialFallback=true: a raw Codex memory file has no
+    // other backstop (both this ingest and the write below tag it
+    // "user_content").
     const screen = adapter.screenPassage(input, CODEX_MEMORY_TAINT, true);
     if (!screen.ok) {
       skipped.push({

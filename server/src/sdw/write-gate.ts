@@ -161,10 +161,9 @@ export function prepareSdwBackendWrite<T extends SdwRecord>(
 }
 
 /**
- * `applyBareCredentialFallback` defaults to false (unchanged pre-fix-round
- * behavior for every caller that does not opt in). Rung-1 fix-round DESIGN
- * (Codex HIGH-1): the classifier is the ONLY backstop for a harness memory
- * file mirrored by CLAUDE_CODE_MEMORY_TAINT/CODEX_MEMORY_TAINT-labeled
+ * `applyBareCredentialFallback` defaults to false for every caller that does
+ * not opt in. The classifier is the ONLY backstop for a harness memory file
+ * mirrored by CLAUDE_CODE_MEMORY_TAINT/CODEX_MEMORY_TAINT-labeled
  * "user_content" (no provenance/taint check catches it either), so
  * claude-code-file-adapter.ts and codex-memory-file-adapter.ts opt in via
  * SdwMemoryBackendAdapter.screenPassage/putPassages. Every OTHER caller of
@@ -172,10 +171,9 @@ export function prepareSdwBackendWrite<T extends SdwRecord>(
  * receipts, memory-transcode's own encrypted-archive bookkeeping, the
  * general-purpose agent-memory MCP tool) legitimately writes
  * system-generated or already-once-classified content shaped like a
- * credential (signatures, public keys, content hashes) and must NOT opt in
- * — turning this on unconditionally reproduced false refusals across every
- * one of those (measured while building this fix: memory-transcode,
- * v2-memory-archive, and multiple sdw-memory-backend-adapter tests broke).
+ * credential (signatures, public keys, content hashes) and must NOT opt in:
+ * turning this on unconditionally for those callers misclassifies their
+ * content.
  */
 export function assertSdwClassifierCleanText(
   text: string,
@@ -530,7 +528,7 @@ function classifyRecord(record: SdwRecord): void {
   // in one field and a "KEY" in another and defeat the compact PRIVATEKEY match. The
   // values-only compact reassembles a marker fragmented across non-adjacent fields.
   const views = collectClassifierTextViews(record);
-  // applyBareCredentialFallback defaults to false here (Rung-1 fix-round):
+  // applyBareCredentialFallback defaults to false here:
   // every OTHER SDW record kind (query-history, document chunks, working
   // state, catalog) legitimately carries system-generated ids, content
   // hashes, and chunk metadata that are base64url/hex-shaped and
@@ -579,19 +577,16 @@ function classifyText(
 
 /**
  * Run the classifier checks in order and return the first hit, named by
- * detector so a refusal can tell an operator which one fired (Rung-1 F2).
- * The first nine match the boolean chain this replaced, so which detector
- * wins when more than one would match is unchanged. The tenth,
- * bare_high_entropy_credential, is new (Rung-1 fix-round, Codex HIGH-1),
+ * detector so a refusal can tell an operator which one fired. The first
+ * nine match a fixed evaluation order, so which detector wins when more
+ * than one would match is stable. The tenth, bare_high_entropy_credential,
  * runs last (after every other check has had a chance to name a more
  * specific detector), and runs ONLY when `applyBareCredentialFallback` is
  * true — the memory-file ingest path (assertSdwClassifierCleanText) sets
  * it; classifyRecord (every other SDW record kind) does not, because those
  * records legitimately carry system-generated ids/hashes/chunk metadata
  * that are high-entropy by construction and are not the false-positive
- * class this fallback exists to catch (measured: turning it on for every
- * record kind reproduced 138 test failures across this repo's own SDW
- * stores).
+ * class this fallback exists to catch.
  */
 function findClassifierHit(
   text: string,
@@ -689,10 +684,10 @@ function lineNumberAt(text: string, index: number): number {
  * "key\nvalue" metadata pairing at collectClassifierTextViews below) that
  * does not appear verbatim in `text`, since no reliable offset exists to map
  * back to; the caller reports no location for that hit rather than a wrong one.
- * Bound (Rung-1 fix-round, LOW): `text.indexOf(context)` finds the FIRST
- * occurrence, so if the same string value repeats as more than one field, a
- * hit in a LATER occurrence is misattributed to the first one's line — the
- * line reported is then a plausible but not necessarily correct location.
+ * Bound: `text.indexOf(context)` finds the FIRST occurrence, so if the same
+ * string value repeats as more than one field, a hit in a LATER occurrence
+ * is misattributed to the first one's line — the line reported is then a
+ * plausible but not necessarily correct location.
  */
 function locateInSourceText(text: string, context: string, indexInContext: number): number | undefined {
   if (context === text) return indexInContext;
@@ -823,7 +818,7 @@ function collectClassifierTextViews(value: SdwRecord): ClassifierTextViews {
       // boundary intentionally lets a label such as `credential` gate the
       // candidate stored in its paired value. Individual strings are also
       // retained below so their self-contained signals remain detectable.
-      // Edge case (Rung-1 fix-round, Codex MEDIUM): SDW identifiers, which
+      // Edge case: SDW identifiers, which
       // metadata keys satisfy (grammar.ts, SDW_IDENTIFIER_PATTERN), allow up
       // to 256 characters, so a maximal-length key can itself push a keyword
       // near its start outside the proximity window from a candidate near
@@ -970,28 +965,21 @@ const KEYWORD_ENTROPY_CANDIDATE_MAX_CHARS = 128;
  */
 const KEYWORD_ENTROPY_PROXIMITY_CODE_POINTS = KEYWORD_ENTROPY_CANDIDATE_MAX_CHARS * 2;
 
-// `_` and `=` are common secret-assignment punctuation (DATABASE_PASSWORD=,
-// OPENAI_API_KEY=), but `_` is a \w character, so a `\b...\b`-anchored
-// alternation never matches "PASSWORD" inside "DATABASE_PASSWORD" — there is
-// no word boundary between two word characters (Rung-1 fix-round HIGH-A2:
-// this silently dropped the keyword gate for exactly the
-// UPPER_SNAKE_CASE=value shape most secret-bearing environment/config lines
-// use, with no backstop left after F1 removed the whole-file scope). The
-// lookahead below is a two-way choice, not a single "not alnum" negative
-// lookahead (Rung-1 fix-round-2, N3): a bare `(?![A-Za-z0-9])` treats a
-// trailing underscore as a delimiter too, so it also matched "authorization"
-// inside "authorization_code" and "auth" inside "auth_service" — ordinary
-// snake_case identifiers named IN PROSE, not an assignment, refusing text
-// like "The authorization_code flow is documented here." with no secret
-// present. A match now succeeds when the keyword is followed by a true
-// delimiter (not alnum, not underscore — "=", ":", whitespace, punctuation,
-// end of string) OR by an underscore-joined identifier CONTINUATION that
-// itself resolves to "=" or ":" before hitting a non-identifier character
-// (so "DATABASE_PASSWORD_HASH=" still gates on "PASSWORD", and
-// "OPENAI_API_KEY=" still gates, but "authorization_code " and
-// "auth_service " — continuations that trail off into more prose — do not).
+// `_` and `=` are common secret-assignment punctuation, but `_` is a \w
+// character, so a `\b...\b`-anchored alternation never matches a keyword
+// immediately preceded or followed by an underscore — there is no word
+// boundary between two word characters. The lookaround below treats ANY
+// non-alphanumeric character, including `_` and `=`, as a delimiter, while
+// still requiring a full-word match (no partial hit inside "tokenize" or
+// "mytoken"). This is a plain delimiter rule, not a continuation-aware one,
+// by deliberate choice (see server/src/sdw/README.md's known false-positive
+// entry): correctness on the assignment shape outweighs a prose false
+// positive when a keyword is itself the prefix of a longer identifier. Do
+// not replace this with a lookahead that special-cases an underscore-joined
+// continuation — that shape was tried and reverted; it silently widened the
+// class of assignment lines this check fails to catch.
 const KEYWORD_GATE_PATTERN =
-  /(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?key|auth|authorization|bearer|credential|password|private[_-]?key|secret|token)(?:(?![A-Za-z0-9_])|(?=_[A-Za-z0-9]*[=:]))/gi;
+  /(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?key|auth|authorization|bearer|credential|password|private[_-]?key|secret|token)(?![A-Za-z0-9])/gi;
 
 function findKeywordGatedHighEntropySecret(text: string): ClassifierHit | undefined {
   const keywordIndices = [...text.matchAll(KEYWORD_GATE_PATTERN)].map((m) => m.index ?? 0);
@@ -1019,13 +1007,12 @@ function findKeywordGatedHighEntropySecret(text: string): ClassifierHit | undefi
 /**
  * AGENTS.md rule 8 (adversarial-complexity bound): a linear scan of every
  * keyword per candidate is O(candidates * keywords) — unbounded work per
- * call on attacker-influenced text (Rung-1 fix-round HIGH-A1; reproduction
- * detail is not published here, MUST-NEVER #9). keywordIndices is ascending
- * (matchAll on a non-overlapping global pattern yields matches in text
- * order), so ONE binary search finds the nearest keyword at-or-before and
- * at-or-after the candidate; testing only those two neighbors is sufficient
- * because a keyword sharing the candidate's line is, by construction, closer
- * in character index than any keyword on an earlier or later line, so it is
+ * call on attacker-influenced text. keywordIndices is ascending (matchAll
+ * on a non-overlapping global pattern yields matches in text order), so ONE
+ * binary search finds the nearest keyword at-or-before and at-or-after the
+ * candidate; testing only those two neighbors is sufficient because a
+ * keyword sharing the candidate's line is, by construction, closer in
+ * character index than any keyword on an earlier or later line, so it is
  * always one of these two. This is O(candidates * log keywords) instead.
  */
 function hasNearbyKeyword(
@@ -1067,7 +1054,7 @@ function isKeywordNear(
 }
 
 /**
- * Exposed ONLY so the Rung-1 fix-round HIGH-A1 adversarial-complexity test
+ * Exposed ONLY so the adversarial-complexity test
  * (test/sdw/sdw-classifier-proximity.test.ts) can wrap `keywordIndices` in a
  * counting Proxy and prove the REAL shipped function performs O(log K) array
  * reads per candidate, not O(K) — a wall-clock timing assertion cannot
@@ -1079,13 +1066,14 @@ function isKeywordNear(
 export const rung1ClassifierTestOnly = {
   hasNearbyKeyword,
   buildLineIndex,
-  buildLineBacktickFeatures,
+  buildLineBacktickSpans,
   isExemptHighEntropyContext,
+  findBareHighEntropyCredential,
 };
 
 /**
  * Whether two UTF-16 offsets are within `windowCodePoints` Unicode code
- * points of each other (Rung-1 fix-round, Codex MEDIUM). `.index` from a
+ * points of each other. `.index` from a
  * regex match is a UTF-16 code-UNIT offset; a non-BMP character (most emoji,
  * some CJK extension characters) is ONE code point but TWO UTF-16 units, so
  * comparing raw index deltas against a "character" window over/under-counts
@@ -1122,82 +1110,98 @@ function countCodePoints(text: string, start: number, end: number): number {
 }
 
 /**
- * Rung-1 fix-round (Codex HIGH-1): for a harness-mirrored memory file, the
- * classifier is the ONLY backstop (both adapters tag mirrored files
- * "user_content", so no provenance/taint check catches it either), and a
- * bare credential-shaped value with no keyword nearby otherwise passed every
- * detector. This is a NARROW, deliberately conservative fallback: it refuses
- * a bare high-entropy run that looks like a raw credential (base64url or hex
- * charset, no keyword required) UNLESS isExemptHighEntropyContext below
- * places it in one of four contexts measurement against a real 487-file
- * corpus showed produce false positives: a hex/decimal content digest
- * (isKnownHashLength, unchanged), a markdown link target or a contiguous URL
- * path/query segment, an explicit hash/commit label, or a value written
- * between backticks (the corpus's one bare candidate was a file path written
- * that way). This is a capability bound, not a closed gap: a genuine secret
- * that happens to be written in one of those four shapes still passes (see
- * server/src/sdw/README.md's known false-negatives list).
+ * For a harness-mirrored memory file the classifier is the ONLY backstop,
+ * and a bare credential-shaped value with no keyword nearby otherwise
+ * passed every detector. Fails closed on a bare base64url/hex run at or
+ * above the entropy threshold, with a small set of exemptions for shapes
+ * that are not themselves the secret (see server/src/sdw/README.md's
+ * capability bound). This is defense in depth, not a closed gap: it does
+ * not replace provenance as the enforced boundary. `buildFeatures` is
+ * injectable so a test can count how many times feature construction runs
+ * per call, defaulting to the real production builder.
  */
-function findBareHighEntropyCredential(text: string): ClassifierHit | undefined {
+function findBareHighEntropyCredential(
+  text: string,
+  buildFeatures: (text: string, lineStarts: readonly number[]) => LineBacktickSpans = buildLineBacktickSpans,
+): ClassifierHit | undefined {
   const candidates = [
     ...text.matchAll(/\b[A-Fa-f0-9]{32,128}\b/g),
     ...text.matchAll(/\b[A-Za-z0-9_-]{32,128}\b/g),
   ];
   if (candidates.length === 0) return undefined;
-  // Precomputed ONCE per call, not per candidate (Rung-1 fix-round-2, N1):
-  // isExemptHighEntropyContext used to rebuild the candidate's line on every
-  // call (lastIndexOf/indexOf/slice/includes), each O(line length); on a
-  // single-line adversarial input every candidate re-scanned the same huge
-  // line, an unbounded-per-call cost with the same shape as HIGH-A1. A line
-  // index plus one first/last-backtick-per-line pass gives O(log n) line
-  // lookup and O(1) checks per candidate below.
+  // Precomputed ONCE per call, not per candidate: an O(line length) rescan
+  // per candidate reproduces unbounded per-call work on attacker-influenced
+  // text. A line index plus one backtick-span pass per call gives O(log n)
+  // line lookup and O(1)-to-O(log spans) checks per candidate below.
   const lineStarts = buildLineIndex(text);
-  const backtickFeatures = buildLineBacktickFeatures(text, lineStarts);
+  const backtickSpans = buildFeatures(text, lineStarts);
   for (const match of candidates) {
     const candidate = match[0];
     if (isAllowedPlaceholder(candidate) || isKnownHashLength(candidate)) continue;
     const threshold = /^[A-Fa-f0-9]+$/.test(candidate) ? 3.2 : 4.5;
     if (shannonEntropy(candidate) < threshold) continue;
     const index = match.index ?? 0;
-    if (isExemptHighEntropyContext(text, index, candidate.length, lineStarts, backtickFeatures)) continue;
+    if (isExemptHighEntropyContext(text, index, candidate.length, lineStarts, backtickSpans)) continue;
     return { index };
   }
   return undefined;
 }
 
-interface LineBacktickFeatures {
-  /** Per line (0-based), the absolute text index of its FIRST backtick, or -1. */
-  readonly firstBacktick: readonly number[];
-  /** Per line (0-based), the absolute text index of its LAST backtick, or -1. */
-  readonly lastBacktick: readonly number[];
-}
+type LineBacktickSpans = readonly (readonly (readonly [number, number])[])[];
 
 /**
  * One O(text length) pass, computed once per findBareHighEntropyCredential
- * call. "A backtick exists before index X on this line" is exactly
- * "firstBacktick[line] < X" (the earliest backtick is before X iff any is),
- * and "a backtick exists after X" is exactly "lastBacktick[line] > X" (the
- * latest is after X iff any is) — so isExemptHighEntropyContext below never
- * has to re-scan the line's content per candidate.
+ * call: per line (0-based), the backtick-delimited spans on that line,
+ * pairing backticks left to right (1st with 2nd, 3rd with 4th, ...; a
+ * trailing unpaired backtick opens no span). Each pair is `[openIndex,
+ * closeIndex]`; a value is "inside" a span only when it lies strictly
+ * between a matched pair, not merely somewhere after an earlier backtick and
+ * before a later, unrelated one on the same line.
  */
-function buildLineBacktickFeatures(
-  text: string,
-  lineStarts: readonly number[],
-): LineBacktickFeatures {
-  const firstBacktick = new Array<number>(lineStarts.length).fill(-1);
-  const lastBacktick = new Array<number>(lineStarts.length).fill(-1);
+function buildLineBacktickSpans(text: string, lineStarts: readonly number[]): LineBacktickSpans {
+  const perLine: (readonly [number, number])[][] = Array.from({ length: lineStarts.length }, () => []);
   let lineIndex = 0;
+  let pendingOpen: number | undefined;
   for (let i = 0; i < text.length; i += 1) {
-    if (text[i] === "\n") {
+    const char = text[i];
+    if (char === "\n") {
       lineIndex += 1;
+      pendingOpen = undefined; // a span does not cross a line break
       continue;
     }
-    if (text[i] === "`") {
-      if (firstBacktick[lineIndex] === -1) firstBacktick[lineIndex] = i;
-      lastBacktick[lineIndex] = i;
+    if (char === "`") {
+      if (pendingOpen === undefined) {
+        pendingOpen = i;
+      } else {
+        perLine[lineIndex]!.push([pendingOpen, i]);
+        pendingOpen = undefined;
+      }
     }
   }
-  return { firstBacktick, lastBacktick };
+  return perLine;
+}
+
+/**
+ * Binary search over one line's spans (ascending by open index, by
+ * construction) for the last span opening before `index`, then checks
+ * whether the candidate's whole span [index, index+length) closes at or
+ * before that span's close index.
+ */
+function isWithinBacktickSpan(
+  spans: readonly (readonly [number, number])[],
+  index: number,
+  length: number,
+): boolean {
+  let low = 0;
+  let high = spans.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (spans[mid]![0] < index) low = mid + 1;
+    else high = mid;
+  }
+  if (low === 0) return false;
+  const [openIndex, closeIndex] = spans[low - 1]!;
+  return openIndex < index && index + length <= closeIndex;
 }
 
 // Fixed, small lookback bound (not the file, not the line) for the
@@ -1210,19 +1214,10 @@ function isExemptHighEntropyContext(
   index: number,
   length: number,
   lineStarts: readonly number[],
-  backtickFeatures: LineBacktickFeatures,
+  backtickSpans: LineBacktickSpans,
 ): boolean {
-  // A value written between backticks (markdown inline code, commonly used
-  // for file paths and identifiers) is exempt: a backtick exists earlier on
-  // the line and a backtick exists later. The known residual (documented in
-  // server/src/sdw/README.md, not tightened here per the narrow-fallback
-  // ruling) is a genuine secret pasted the same way, inside backticks.
   const lineIndex = lineNumberForIndex(lineStarts, index) - 1;
-  const firstBacktick = backtickFeatures.firstBacktick[lineIndex] ?? -1;
-  const lastBacktick = backtickFeatures.lastBacktick[lineIndex] ?? -1;
-  if (firstBacktick !== -1 && firstBacktick < index && lastBacktick > index + length - 1) {
-    return true;
-  }
+  if (isWithinBacktickSpan(backtickSpans[lineIndex] ?? [], index, length)) return true;
 
   const before = text.slice(Math.max(0, index - HIGH_ENTROPY_EXEMPTION_LOOKBACK_CHARS), index);
   const afterChar = index + length < text.length ? text[index + length] : undefined;
@@ -1230,13 +1225,10 @@ function isExemptHighEntropyContext(
   // Markdown link target ("...](value)").
   if (/\($/.test(before) && afterChar === ")") return true;
 
-  // A URL immediately adjacent to the candidate with no whitespace break
-  // (Rung-1 fix-round-2, N2): the candidate is itself a path/query segment
-  // of that URL. Requires CONTIGUITY — an unrelated URL mentioned earlier on
-  // the same line, with a gap before the candidate, no longer exempts it
-  // (it previously did: "See https://docs.test/setup then paste <key> here"
-  // was wrongly exempt).
-  if (/https?:\/\/\S*$/i.test(before)) return true;
+  // A URL immediately adjacent to the candidate, within the same URL span
+  // (contiguity required; excludes the delimiters a URL is commonly wrapped
+  // in, so a closed "<...>"/quote/paren correctly ends the span).
+  if (/https?:\/\/[^\s<>"'()]*$/i.test(before)) return true;
 
   // A content-hash or commit reference labeled immediately before the value.
   if (/(?:sha256:|sha1:|md5:|commit[: ])$/i.test(before)) return true;

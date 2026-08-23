@@ -1,19 +1,13 @@
 /**
- * Rung-1 F1/F2 plus the 2026-08-22 fix-round: the keyword-gated entropy
- * check is scoped to a proximity window (same line, or within a bounded
- * Unicode code-point distance) instead of the whole scanned text; a
- * classifier_reject names the detector and line; the keyword boundary
- * matches UPPER_SNAKE_CASE=value shapes; the proximity check is O(candidates
- * * log keywords), not O(candidates * keywords); and a bare, unexempted
- * high-entropy value farther than the window from any keyword is still
- * caught by a narrow file-scope fallback.
- *
- * Fixtures here are shaped after the real refusals in the 2026-08-22
- * round-trip drill (Review/Sanctuary/drill-rung1-roundtrip-2026-08-22/RESULTS.md,
- * finding F1) and after the two independent adversarial gates that returned
- * UNSOUND on the first Rung-1 F1/F2 PR (HIGH-A1: unbounded per-candidate
- * keyword scan; HIGH-A2: `_`/`=`-adjacent keywords never matched; DESIGN:
- * a bare far-apart secret had no backstop).
+ * SDW classifier coverage for the keyword-gated entropy check and the
+ * bare-credential fallback: the keyword-gated entropy check is scoped to a
+ * proximity window (same line, or within a bounded Unicode code-point
+ * distance) instead of the whole scanned text; a classifier_reject names
+ * the detector and line; the keyword boundary matches UPPER_SNAKE_CASE=value
+ * shapes; the proximity check and the bare-credential fallback are bounded
+ * work per candidate, not per-candidate work proportional to file or line
+ * length; and a bare, unexempted high-entropy value farther than the window
+ * from any keyword is caught by a narrow, opt-in fallback.
  */
 import { describe, expect, it } from "vitest";
 import { assertSdwClassifierCleanText, rung1ClassifierTestOnly } from "../../src/sdw/write-gate.js";
@@ -194,16 +188,11 @@ describe("SDW classifier: proximity window measured in Unicode code points (Rung
   });
 });
 
-describe("SDW classifier: bare high-entropy value far from any keyword (Rung-1 fix-round DESIGN, Codex HIGH-1)", () => {
-  // For a memory-file mirror the classifier is the ONLY backstop (both
-  // harness adapters tag mirrored files "user_content"), so a bare
-  // credential-shaped value with no keyword nearby needs a narrow file-scope
-  // fallback rather than passing outright. Measured against a read-only copy
-  // of a real 487-file Claude Code memory corpus (never modified, counts and
-  // classes only): before this fallback, 480 accepted / 7 refused, MEMORY.md
-  // accepted; after, IDENTICAL counts — the corpus's one bare candidate (a
-  // backticked file-path reference in MEMORY.md) is exempt, and the
-  // fallback adds zero refusals across the rest of the corpus.
+describe("SDW classifier: bare high-entropy value far from any keyword", () => {
+  // For a memory-file mirror the classifier is the ONLY backstop. A bare
+  // credential-shaped value with no keyword nearby is refused unless it
+  // sits in one of a small set of exempted contexts (see
+  // server/src/sdw/README.md's capability bound).
   it("refuses a bare unexempted high-entropy value with no keyword anywhere nearby", () => {
     const text = `Some filler prose about weather.\n\n${FAR_IDENTIFIER}\n\nmore filler prose here.\n`;
     const result = classifierResult(text);
@@ -227,11 +216,11 @@ describe("SDW classifier: bare high-entropy value far from any keyword (Rung-1 f
     expect(passed.map((entry) => entry.fixture.label)).toEqual(EXEMPT_FIXTURES.map((f) => f.label));
   });
 
-  it("refuses a decoy URL earlier on the line followed by a separate bare value (Rung-1 fix-round-2, N2)", () => {
-    // Pre-fix-round-2, the URL exemption was "any URL earlier on the line",
-    // so a URL mentioned once and a wholly separate value later on the same
-    // line was wrongly exempt. The fix requires CONTIGUITY: the value must
-    // itself be an unbroken continuation of the URL, no whitespace between.
+  it("refuses a decoy URL earlier on the line followed by a separate bare value", () => {
+    // The URL exemption requires CONTIGUITY: the value must itself be an
+    // unbroken continuation of the URL, no whitespace between. An unrelated
+    // URL mentioned earlier on the line does not exempt a later, separate
+    // value.
     const text = `See https://docs.test/setup then paste ${FAR_IDENTIFIER} here
 `;
     const result = classifierResult(text);
@@ -241,26 +230,94 @@ describe("SDW classifier: bare high-entropy value far from any keyword (Rung-1 f
       expect(result.error.message).not.toContain(FAR_IDENTIFIER);
     }
   });
+
+  it("refuses a value sitting between two unrelated backtick-paired spans (decoy spans)", () => {
+    // The backtick exemption pairs backticks left to right into real spans;
+    // a value merely somewhere after one span's close and before an
+    // UNRELATED later span's open is not "inside" either span.
+    const text = `run \`npm test\` then ${FAR_IDENTIFIER} then \`npm build\`\n`;
+    const result = classifierResult(text);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.detector).toBe("bare_high_entropy_credential");
+      expect(result.error.message).not.toContain(FAR_IDENTIFIER);
+    }
+  });
+
+  it("passes a value genuinely inside a backtick-paired span even with other spans on the same line", () => {
+    const text = `run \`npm test\` then \`${FAR_IDENTIFIER}\` then \`npm build\`\n`;
+    expect(classifierResult(text)).toEqual({ ok: true });
+  });
 });
 
-describe("SDW classifier: keyword boundary does not over-match snake_case continuations (Rung-1 fix-round-2, N3)", () => {
-  // The HIGH-A2 lookahead fix (delimit on `_`/`=`) also matched "authorization"
-  // inside "authorization_code" and "auth" inside "auth_service" — ordinary
-  // identifiers named in prose, not an assignment — refusing text with no
-  // secret present. Fixture text uses the fallback OFF explicitly
-  // (classifyRecord's default for every SDW record kind other than harness
-  // memory-file text), so only the keyword-boundary behavior is exercised,
-  // not the bare-credential fallback.
-  it("passes 'authorization_code' and 'auth_service' named in prose near a high-entropy value, fallback off", () => {
-    const text = `The authorization_code flow is documented in \`${FAR_IDENTIFIER}\` notes. The auth_service handles refresh separately.
+describe("SDW classifier: keyword boundary is a plain non-alphanumeric delimiter (Rung-1 fix-round-3, subtracting fix-round-2's N3 attempt)", () => {
+  // Fix-round-2 tried a two-way lookahead so a keyword followed by an
+  // underscore-joined snake_case continuation ("authorization_code",
+  // "auth_service") would not gate, while an assignment shape still would.
+  // That attempt was itself a HIGH regression: it allows only ONE
+  // underscore-joined segment before the required "="/":", so a keyword
+  // followed by MORE than one segment before the assignment silently
+  // passed. Fix-round-3 SUBTRACTS that attempt back to the plain
+  // "(?<![A-Za-z0-9])...(?![A-Za-z0-9])" delimiter (do not reintroduce a
+  // continuation-aware variant): `_`, `=`, `:`, quotes, and whitespace all
+  // count as a boundary, with no exception for a longer identifier chain.
+  // The accepted, documented trade-off (server/src/sdw/README.md) is that a
+  // keyword named in ordinary prose, as the PREFIX of a longer snake_case
+  // identifier, still gates when a high-entropy value is nearby — this is
+  // fail-closed, not a defect, and is asserted as MUST-FAIL below rather
+  // than engineered around with another lookahead. Fixture text uses the
+  // fallback OFF explicitly (classifyRecord's default for every SDW record
+  // kind other than harness memory-file text), so only the keyword-boundary
+  // behavior is exercised, not the bare-credential fallback.
+  it("refuses 'authorization_code' named in prose near a high-entropy value, fallback off (accepted false positive)", () => {
+    const text = `The authorization_code flow is documented in \`${FAR_IDENTIFIER}\` notes.
 `;
-    expect(() => assertSdwClassifierCleanText(text, false)).not.toThrow();
+    expect(() => assertSdwClassifierCleanText(text, false)).toThrow(SdwValidationError);
   });
 
   it("still refuses a genuine UPPER_SNAKE_CASE=value assignment, fallback off", () => {
     const text = `DATABASE_PASSWORD=${SAME_LINE_IDENTIFIER}
 `;
     expect(() => assertSdwClassifierCleanText(text, false)).toThrow(SdwValidationError);
+  });
+
+  // The fix-round-2 regression class, named explicitly: each of these has a
+  // keyword followed by MORE than one underscore-joined segment before the
+  // assignment (or a quoted-key JSON/Python-literal shape), which the
+  // two-way lookahead silently passed. All must refuse, fallback off.
+  const MULTI_SEGMENT_ASSIGNMENT_FIXTURES: readonly { readonly label: string; readonly text: string; readonly value: string }[] = [
+    { label: "SECRET_KEY_BASE=", text: `SECRET_KEY_BASE=${SAME_LINE_IDENTIFIER}
+`, value: SAME_LINE_IDENTIFIER },
+    { label: "STRIPE_SECRET_KEY_LIVE=", text: `STRIPE_SECRET_KEY_LIVE=${FAR_IDENTIFIER}
+`, value: FAR_IDENTIFIER },
+    { label: "MY_TOKEN_VALUE_PROD=", text: `MY_TOKEN_VALUE_PROD=${LONG_LINE_IDENTIFIER}
+`, value: LONG_LINE_IDENTIFIER },
+    { label: "GITHUB_TOKEN_READ_ONLY=", text: `GITHUB_TOKEN_READ_ONLY=${SAME_LINE_IDENTIFIER}
+`, value: SAME_LINE_IDENTIFIER },
+    { label: "PASSWORD_HASH = (spaced)", text: `PASSWORD_HASH = ${FAR_IDENTIFIER}
+`, value: FAR_IDENTIFIER },
+    { label: '"token_value": "..." (JSON)', text: `"token_value": "${LONG_LINE_IDENTIFIER}"
+`, value: LONG_LINE_IDENTIFIER },
+    { label: "'api_key_live': '...' (Python/JS literal)", text: `'api_key_live': '${SAME_LINE_IDENTIFIER}'
+`, value: SAME_LINE_IDENTIFIER },
+  ];
+
+  it("refuses every multi-segment assignment shape, counted, fallback off, with no leaked content", () => {
+    const outcomes = MULTI_SEGMENT_ASSIGNMENT_FIXTURES.map((fixture) => {
+      try {
+        assertSdwClassifierCleanText(fixture.text, false);
+        return { fixture, error: undefined as SdwValidationError | undefined };
+      } catch (error) {
+        if (error instanceof SdwValidationError) return { fixture, error };
+        throw error;
+      }
+    });
+    const refused = outcomes.filter((entry) => entry.error !== undefined);
+    expect(refused).toHaveLength(MULTI_SEGMENT_ASSIGNMENT_FIXTURES.length);
+    for (const entry of refused) {
+      expect(entry.error!.detector, entry.fixture.label).toBe("keyword_gated_high_entropy");
+      expect(entry.error!.message, entry.fixture.label).not.toContain(entry.fixture.value);
+    }
   });
 });
 
@@ -476,54 +533,98 @@ describe("SDW classifier: O(candidates * log keywords), not O(candidates * keywo
   });
 });
 
-describe("SDW classifier: bare-credential exemption check is O(1) per candidate, not O(line length) (Rung-1 fix-round-2, N1)", () => {
-  it("performs a bounded number of backtick-feature array reads per candidate on a single-line adversarial input", () => {
-    // Pre-fix-round-2, isExemptHighEntropyContext rebuilt the candidate's
-    // line (lastIndexOf/indexOf/slice/includes) on every call — O(line
-    // length) work per candidate. On a single huge line, every candidate
-    // re-scanned the same line, reproducing HIGH-A1's unbounded-per-call
-    // shape at the exemption-check layer instead of the keyword-search
-    // layer. This exercises the REAL shipped isExemptHighEntropyContext (via
-    // rung1ClassifierTestOnly), counting actual array reads via a counting
-    // Proxy rather than wall time.
-    const { buildLineIndex, buildLineBacktickFeatures, isExemptHighEntropyContext } = rung1ClassifierTestOnly;
+describe("SDW classifier: bare-credential fallback stays bounded work per candidate, not O(candidates * line length) (fix-round-3)", () => {
+  it("builds line-backtick-span features exactly once per call, not once per candidate", () => {
+    // Feature construction is injectable specifically so this test can prove
+    // the REAL shipped findBareHighEntropyCredential builds it once per
+    // call, not once per candidate: moving the call back inside the
+    // per-candidate loop would be invisible to a test that only exercises
+    // the per-candidate check function in isolation.
+    const { findBareHighEntropyCredential, buildLineBacktickSpans } = rung1ClassifierTestOnly;
 
-    const LINE_LENGTH = 1_000_000;
-    const text = "x".repeat(LINE_LENGTH);
-    const lineStarts = buildLineIndex(text);
-    const backtickFeatures = buildLineBacktickFeatures(text, lineStarts);
-
-    let firstReads = 0;
-    let lastReads = 0;
-    const countingBacktickFeatures = {
-      firstBacktick: new Proxy(backtickFeatures.firstBacktick as number[], {
-        get(target, prop, receiver) {
-          if (typeof prop === "string" && /^\d+$/.test(prop)) firstReads += 1;
-          return Reflect.get(target, prop, receiver);
-        },
-      }),
-      lastBacktick: new Proxy(backtickFeatures.lastBacktick as number[], {
-        get(target, prop, receiver) {
-          if (typeof prop === "string" && /^\d+$/.test(prop)) lastReads += 1;
-          return Reflect.get(target, prop, receiver);
-        },
-      }),
+    let buildCalls = 0;
+    const countingBuildFeatures = (t: string, lineStarts: readonly number[]) => {
+      buildCalls += 1;
+      return buildLineBacktickSpans(t, lineStarts);
     };
 
-    const CANDIDATE_COUNT = 4000;
-    const STRIDE = Math.floor(LINE_LENGTH / (CANDIDATE_COUNT + 1));
-    for (let i = 0; i < CANDIDATE_COUNT; i += 1) {
-      isExemptHighEntropyContext(text, i * STRIDE + 10, 40, lineStarts, countingBacktickFeatures);
-    }
+    const text = `line one \`${FAR_IDENTIFIER}\` end
+line two, no candidate here
+line three \`${SAME_LINE_IDENTIFIER}\` also
+`;
+    findBareHighEntropyCredential(text, countingBuildFeatures);
 
-    // O(1) array reads per candidate: one firstBacktick[line] and one
-    // lastBacktick[line] lookup, generously bounded at 4 reads/candidate
-    // each. The pre-fix shape re-scanned the whole line's characters per
-    // candidate — on this 1,000,000-character single line, orders of
-    // magnitude more than this bound.
-    expect(firstReads).toBeLessThanOrEqual(CANDIDATE_COUNT * 4);
-    expect(lastReads).toBeLessThanOrEqual(CANDIDATE_COUNT * 4);
-    expect(firstReads).toBeGreaterThan(0);
-    expect(lastReads).toBeGreaterThan(0);
+    expect(buildCalls).toBe(1);
+  });
+
+  it("performs a bounded number of text-characters-scanned per candidate on a single-line adversarial input", () => {
+    // Drives the COMPLETE shipped findBareHighEntropyCredential (not the
+    // per-candidate check function in isolation) with the real default
+    // feature builder, wrapping `text` in a proxy that accumulates an
+    // estimate of characters scanned by every slice/indexOf/lastIndexOf/
+    // includes call made against it. Single-character indexed reads and
+    // `.length` are not counted (both are legitimately O(1) and are exactly
+    // what the one-time, whole-text backtick-span pass uses), so this bound
+    // targets per-candidate cost specifically, not the expected one-time
+    // O(text length) preprocessing.
+    //
+    // Every candidate here is the SAME token, labeled "sha256:" (an exempt
+    // context reached only through the text-slicing checks, not the
+    // backtick-span check, which resolves without touching `text` at all —
+    // exercising a backtick-only fixture here would silently measure zero).
+    const { findBareHighEntropyCredential } = rung1ClassifierTestOnly;
+
+    const CANDIDATE_COUNT = 4000;
+    const unit = `sha256:${FAR_IDENTIFIER} ${"filler word ".repeat(15)}`;
+    const realText = unit.repeat(CANDIDATE_COUNT);
+    expect(realText).not.toContain("\n"); // single line, as intended.
+
+    let charsScanned = 0;
+    const countingText = new Proxy(Object(realText) as object, {
+      get(target, prop, receiver) {
+        if (prop === "slice") {
+          return (start?: number, end?: number) => {
+            const from = Math.max(0, Math.min(start ?? 0, realText.length));
+            const to = Math.max(from, Math.min(end ?? realText.length, realText.length));
+            charsScanned += to - from;
+            return realText.slice(start, end);
+          };
+        }
+        if (prop === "indexOf" || prop === "includes") {
+          return (needle: string, fromIndex?: number) => {
+            const from = fromIndex ?? 0;
+            const found = realText.indexOf(needle, from);
+            charsScanned += found === -1 ? Math.max(0, realText.length - from) : found - from + needle.length;
+            return prop === "includes" ? found !== -1 : found;
+          };
+        }
+        if (prop === "lastIndexOf") {
+          return (needle: string, fromIndex?: number) => {
+            const from = fromIndex ?? realText.length;
+            const found = realText.lastIndexOf(needle, from);
+            charsScanned += found === -1 ? from + 1 : from - found + needle.length;
+            return found;
+          };
+        }
+        // matchAll's ToString(this) needs these to resolve to the real
+        // primitive string; delegating them is not itself counted (a
+        // one-time ToString, not a per-candidate scan).
+        if (prop === "toString" || prop === "valueOf") return () => realText;
+        if (prop === Symbol.toPrimitive) return () => realText;
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as unknown as string;
+
+    const result = findBareHighEntropyCredential(countingText);
+    expect(result).toBeUndefined(); // every candidate is exempt (labeled sha256:); none refused.
+
+    // <= 65 characters scanned per candidate: the lookback window
+    // (HIGH_ENTROPY_EXEMPTION_LOOKBACK_CHARS = 64) bounds the one `slice`
+    // call the current implementation makes against `text` per candidate
+    // that reaches the exemption check, plus a small margin. On this
+    // ~936,000-character line, an O(line length) regression would scan
+    // orders of magnitude more than this bound.
+    expect(charsScanned).toBeGreaterThan(0);
+    expect(charsScanned / CANDIDATE_COUNT).toBeLessThanOrEqual(65);
   });
 });

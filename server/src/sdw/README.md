@@ -48,43 +48,22 @@ secret. Known, deliberate false negatives (documented, not bugs):
   a hash length may pass even when a secret-ish keyword is nearby.
 - The split-marker reassembly covers PEM private-key markers; it does not attempt
   to reassemble arbitrary secrets fragmented across fields.
-- Keyword-gated entropy requires the keyword and the high-entropy candidate to
-  co-occur on the SAME LINE, or within a bounded proximity window (measured in
-  Unicode code points, not raw UTF-16 offsets), not anywhere in the whole
-  scanned text (Rung-1 F1, 2026-08-22). Pre-fix, a keyword anywhere in a large
-  file and an unrelated high-entropy identifier anywhere else in the same file
-  were treated as one secret; the round-trip drill measured this refusing a
-  real memory-file index that mentioned "token" once and held one unrelated
-  identifier hundreds of lines away. This also prevents a prose word such as
-  `secret` from turning an unrelated generated record ID elsewhere in the same
-  field into a false positive. A keyword and a genuine secret split across
-  unrelated fields, or farther apart than the window within one field, may
-  pass unless provenance, another high-signal detector, or the bare-credential
-  fallback below rejects it.
+- Keyword-gated entropy requires the keyword and a high-entropy candidate to
+  be near each other (the same line, or a bounded proximity window), not
+  anywhere in the whole scanned text. A keyword and a genuine secret farther
+  apart, or split across unrelated fields, may pass unless provenance,
+  another detector, or the bare-credential fallback below rejects it.
 - A bare high-entropy value with no keyword nearby is additionally checked
-  against a narrow fallback (`bare_high_entropy_credential`): a base64url- or
-  hex-shaped run of 32+ characters at or above the entropy threshold is
-  refused unless it sits in one of four exempted contexts — a canonical hash
-  length (32/40/64 hex chars, already covered above), a markdown link target
-  or a URL path/query segment written contiguously against it (no
-  whitespace break — an unrelated URL earlier on the same line does not
-  exempt a later, separate value), an explicit `sha256:`/`sha1:`/`md5:`/
-  `commit` label immediately before it, or a value written between
-  backticks (an inline code span, e.g. a key pasted as `` `<value>` ``,
-  which markdown authoring commonly does for file paths and identifiers).
-  Those four are the capability's bound, not an exhaustive defense: a value
-  in one of those four shapes passes even when it is a genuine secret. This
-  fallback is opt-in (`applyBareCredentialFallback`), not the classifier's
-  default — `claude-code-file-adapter.ts`/`codex-memory-file-adapter.ts` turn
-  it on for harness memory-file text specifically, because the classifier is
-  the ONLY backstop there (both tag mirrored files `user_content`, so no
-  provenance/taint check catches it either). It is deliberately OFF for
-  every other SDW record kind and for every other memory-passage caller
-  (archive import/restore, memory-transcode's own archive bookkeeping, the
-  general-purpose agent-memory MCP tool), which legitimately carry
-  system-generated ids, signatures, and content hashes that are high-entropy
-  by construction and are not the false-positive class this fallback exists
-  to catch.
+  against a narrow, opt-in fallback. The classifier recognizes a small set
+  of concrete shapes as not themselves the secret (for example, a value
+  written inside a markdown code span); a value in one of those shapes is a
+  stated residual, and a value that is neither near a keyword nor in one of
+  those shapes still passes this fallback, with provenance and the other
+  detectors as the remaining backstops. This fallback runs only for
+  harness-mirrored memory-file text, where the classifier is the sole
+  backstop; every other SDW record kind and memory-passage caller
+  legitimately carries system-generated content this fallback would
+  otherwise misclassify, so it stays off there by default.
 - Names such as `principal_policy`, `recovery key`, `SANCTUARY_RECOVERY_KEY`,
   and `Ed25519 private key` are allowed in ordinary prose. Policy and key
   provenance remains fail-closed, while the classifier rejects labeled key
@@ -95,6 +74,17 @@ secret. Known, deliberate false negatives (documented, not bugs):
 Free text that never passes through a source minter is covered **only** by this
 heuristic backstop. Closing these gaps fully is the consumer-integration
 follow-on (route real sources through provenance), not a stronger classifier.
+
+**Known, deliberate false positive (documented, not a bug):** the
+keyword-gated entropy check's keyword boundary treats punctuation
+(including `_` and `=`) as a delimiter. This correctly catches an
+assignment-shaped secret line, but a keyword that is itself the prefix of a
+longer identifier named in ordinary prose can also gate, with no secret
+present, when a high-entropy value sits nearby. This is the deliberately
+chosen behavior: correctness on the assignment shape outweighs the prose
+false positive, which the operator resolves the same way as any other
+classifier refusal — edit the file, or keep it outside the mirrored
+directory.
 
 ## Out of scope by design
 

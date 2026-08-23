@@ -123,7 +123,7 @@ export interface MemoryBackendAdapter {
    * implementation MUST fail with a partial_scope category so the caller and
    * audit trail do not report the run as a clean all-or-nothing failure.
    *
-   * `applyBareCredentialFallback` (Rung-1 fix-round, default false) opts
+   * `applyBareCredentialFallback` (default false) opts
    * every input in this batch into the extra bare-high-entropy-credential
    * classifier check (see write-gate.ts's `assertSdwClassifierCleanText`).
    * Only a caller mirroring RAW HARNESS MEMORY FILES (where the classifier

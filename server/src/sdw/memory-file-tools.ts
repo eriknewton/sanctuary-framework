@@ -303,7 +303,7 @@ export function createSdwMemoryFileTools(options: SdwMemoryFileToolsOptions): To
             detail: skip.detail,
             detector: skip.detector,
             line: skip.line,
-            // Rung-1 fix-round (Codex MEDIUM): the same plain-English text the
+            // The same plain-English text the
             // CLI prints, resolved from the shared table so an MCP caller does
             // not have to re-derive it from `detector`. Class and location
             // only, never the matched content.

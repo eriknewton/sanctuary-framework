@@ -216,9 +216,9 @@ export async function ingestClaudeCodeMemorySnapshot(
         entry.source_path,
       ),
     };
-    // applyBareCredentialFallback=true (Rung-1 fix-round DESIGN, Codex
-    // HIGH-1): a raw Claude Code memory file has no other backstop (both
-    // this ingest and the write below tag it "user_content").
+    // applyBareCredentialFallback=true: a raw Claude Code memory file has no
+    // other backstop (both this ingest and the write below tag it
+    // "user_content").
     const screen = adapter.screenPassage(input, CLAUDE_CODE_MEMORY_TAINT, true);
     if (!screen.ok) {
       skipped.push({
