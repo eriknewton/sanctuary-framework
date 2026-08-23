@@ -1,0 +1,3 @@
+[audit-log] cross-process file locking enabled: /private/tmp/claude-501/-Users-eriknewton-Code-Claude-Sanctuary/8ef117a4-5ce8-4d87-8b66-afc70dd717cd/scratchpad/drill-rung1-redrill/fortress-1-a/state/_audit/.audit-write.lock
+memory_transcode: projected 481 Claude Code source files into 3 Codex plaintext files at /private/tmp/claude-501/-Users-eriknewton-Code-Claude-Sanctuary/8ef117a4-5ce8-4d87-8b66-afc70dd717cd/scratchpad/drill-rung1-redrill/transcode-1-out
+memory_transcode: exact source recovery archive_id d33c2092eda5a03152ed52064ea9d2c4

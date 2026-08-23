@@ -1,0 +1,11 @@
+[audit-log] cross-process file locking enabled: /private/tmp/claude-501/-Users-eriknewton-Code-Claude-Sanctuary/8ef117a4-5ce8-4d87-8b66-afc70dd717cd/scratchpad/drill-rung1-redrill/fortress-1-a/state/_audit/.audit-write.lock
+memory_ingest: ingested 481 of 488 Claude Code memory files into owner_ref fleet-self
+memory_ingest: WARNING - the mirror is INCOMPLETE. 7 file(s) were refused by the secret classifier and are NOT in the vault:
+  refused chris-pryor-patient-advocate-memo.md: a security-sensitive keyword appears near a high-entropy value that looks like a secret (line 14)
+  refused macos-signed-release-never-shipped-from-ci.md: looks like a known vendor secret token (API key, access token, or similar) (line 17)
+  refused npm-publish-from-server-via-gh-oidc-workflow.md: looks like a known vendor secret token (API key, access token, or similar) (line 13)
+  refused npm-trusted-publishing-setup-checklist.md: looks like a known vendor secret token (API key, access token, or similar) (line 3)
+  refused release-prep-vocab-and-publish-mechanics.md: looks like a known vendor secret token (API key, access token, or similar) (line 14)
+  refused release-signing-key-activated-2026-07-01.md: a security-sensitive keyword appears near a high-entropy value that looks like a secret (line 13)
+  refused ultracode-exhaustive-convergence-for-edge-case-tail.md: a security-sensitive keyword appears near a high-entropy value that looks like a secret (line 22)
+memory_ingest: remove the sensitive material from those files or keep them outside the mirrored directory, then re-run.

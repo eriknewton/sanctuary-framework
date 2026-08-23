@@ -1,0 +1,72 @@
+PASSPHRASE_A_SET
+
+  Sanctuary init
+  Fortress: /private/tmp/claude-501/-Users-eriknewton-Code-Claude-Sanctuary/8ef117a4-5ce8-4d87-8b66-afc70dd717cd/scratchpad/drill-rung1-redrill/fortress-3-a
+
+
+╔═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+║ SANCTUARY: First Run, Recovery Key Generated                                                                                                                        ║
+║                                                                                                                                                                     ║
+║ Recovery Key: rMT8S9zlvM9jrBn6TQ4yjCJ-Oo7v26sZxtIOcTwsEQI                                                                                                           ║
+║                                                                                                                                                                     ║
+║ SAVE THIS KEY. It will not be shown again.                                                                                                                          ║
+║ Without it, your encrypted state is unrecoverable.                                                                                                                  ║
+║                                                                                                                                                                     ║
+║ Plaintext copy written to:                                                                                                                                          ║
+║   /private/tmp/claude-501/-Users-eriknewton-Code-Claude-Sanctuary/8ef117a4-5ce8-4d87-8b66-afc70dd717cd/scratchpad/drill-rung1-redrill/fortress-3-a/recovery-key.txt ║
+║ Move it off-host (password manager, encrypted backup),                                                                                                              ║
+║ then delete the file from the fortress directory.                                                                                                                   ║
+╚═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+[audit-log] cross-process file locking enabled: /private/tmp/claude-501/-Users-eriknewton-Code-Claude-Sanctuary/8ef117a4-5ce8-4d87-8b66-afc70dd717cd/scratchpad/drill-rung1-redrill/fortress-3-a/state/_audit/.audit-write.lock
+
+  Sanctuary init: global Castle Wall pin NOT provisioned (--no-pin).
+  This fortress did NOT touch the machine-wide enforcement anchor at
+    /Library/Application Support/Sanctuary/castle-pinned-pubkey.bin
+  Run `sanctuary castle-wall provision-pin` against this fortress when ready.
+
+=== ingest cycle 3 ===
+[audit-log] cross-process file locking enabled: /private/tmp/claude-501/-Users-eriknewton-Code-Claude-Sanctuary/8ef117a4-5ce8-4d87-8b66-afc70dd717cd/scratchpad/drill-rung1-redrill/fortress-3-a/state/_audit/.audit-write.lock
+memory_ingest: ingested 481 of 488 Claude Code memory files into owner_ref fleet-self
+memory_ingest: WARNING - the mirror is INCOMPLETE. 7 file(s) were refused by the secret classifier and are NOT in the vault:
+  refused chris-pryor-patient-advocate-memo.md: a security-sensitive keyword appears near a high-entropy value that looks like a secret (line 14)
+  refused macos-signed-release-never-shipped-from-ci.md: looks like a known vendor secret token (API key, access token, or similar) (line 17)
+  refused npm-publish-from-server-via-gh-oidc-workflow.md: looks like a known vendor secret token (API key, access token, or similar) (line 13)
+  refused npm-trusted-publishing-setup-checklist.md: looks like a known vendor secret token (API key, access token, or similar) (line 3)
+  refused release-prep-vocab-and-publish-mechanics.md: looks like a known vendor secret token (API key, access token, or similar) (line 14)
+  refused release-signing-key-activated-2026-07-01.md: a security-sensitive keyword appears near a high-entropy value that looks like a secret (line 13)
+  refused ultracode-exhaustive-convergence-for-edge-case-tail.md: a security-sensitive keyword appears near a high-entropy value that looks like a secret (line 22)
+memory_ingest: remove the sensitive material from those files or keep them outside the mirrored directory, then re-run.
+=== emit cycle 3 ===
+[audit-log] cross-process file locking enabled: /private/tmp/claude-501/-Users-eriknewton-Code-Claude-Sanctuary/8ef117a4-5ce8-4d87-8b66-afc70dd717cd/scratchpad/drill-rung1-redrill/fortress-3-a/state/_audit/.audit-write.lock
+memory_emit: emitted 481 Claude Code memory files to /private/tmp/claude-501/-Users-eriknewton-Code-Claude-Sanctuary/8ef117a4-5ce8-4d87-8b66-afc70dd717cd/scratchpad/drill-rung1-redrill/emit-3-a (index_present: yes)
+
+  Sanctuary init
+  Fortress: /private/tmp/claude-501/-Users-eriknewton-Code-Claude-Sanctuary/8ef117a4-5ce8-4d87-8b66-afc70dd717cd/scratchpad/drill-rung1-redrill/fortress-3-b
+
+
+╔═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+║ SANCTUARY: First Run, Recovery Key Generated                                                                                                                        ║
+║                                                                                                                                                                     ║
+║ Recovery Key: XT9bt4mX-xU58z_LQEzUJ-HF232Nn0-YyPA7wwnQcHI                                                                                                           ║
+║                                                                                                                                                                     ║
+║ SAVE THIS KEY. It will not be shown again.                                                                                                                          ║
+║ Without it, your encrypted state is unrecoverable.                                                                                                                  ║
+║                                                                                                                                                                     ║
+║ Plaintext copy written to:                                                                                                                                          ║
+║   /private/tmp/claude-501/-Users-eriknewton-Code-Claude-Sanctuary/8ef117a4-5ce8-4d87-8b66-afc70dd717cd/scratchpad/drill-rung1-redrill/fortress-3-b/recovery-key.txt ║
+║ Move it off-host (password manager, encrypted backup),                                                                                                              ║
+║ then delete the file from the fortress directory.                                                                                                                   ║
+╚═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+[audit-log] cross-process file locking enabled: /private/tmp/claude-501/-Users-eriknewton-Code-Claude-Sanctuary/8ef117a4-5ce8-4d87-8b66-afc70dd717cd/scratchpad/drill-rung1-redrill/fortress-3-b/state/_audit/.audit-write.lock
+
+  Sanctuary init: global Castle Wall pin NOT provisioned (--no-pin).
+  This fortress did NOT touch the machine-wide enforcement anchor at
+    /Library/Application Support/Sanctuary/castle-pinned-pubkey.bin
+  Run `sanctuary castle-wall provision-pin` against this fortress when ready.
+
+=== re-ingest cycle 3 ===
+[audit-log] cross-process file locking enabled: /private/tmp/claude-501/-Users-eriknewton-Code-Claude-Sanctuary/8ef117a4-5ce8-4d87-8b66-afc70dd717cd/scratchpad/drill-rung1-redrill/fortress-3-b/state/_audit/.audit-write.lock
+memory_ingest: ingested 481 of 481 Claude Code memory files into owner_ref fleet-self
+CYCLE 3 DONE
