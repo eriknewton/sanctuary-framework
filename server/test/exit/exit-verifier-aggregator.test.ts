@@ -43,7 +43,7 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { deriveMasterKey, derivePurposeKey } from "../../src/core/key-derivation.js";
-import { hash } from "../../src/core/hashing.js";
+import { hash, hashToString } from "../../src/core/hashing.js";
 import { sign as identitySign } from "../../src/core/identity.js";
 import { canonicalize, canonicalizeToBytes } from "../../src/mesh/canonical-json.js";
 import { StateStore } from "../../src/cognitive/state-store.js";
@@ -71,6 +71,7 @@ import {
 import {
   verifyExitBundle,
   encryptedStateSubVerdictFailed,
+  checkEncryptedStateStructure,
 } from "../../src/exit/verifier.js";
 import type { ExitBundleArtifactEntry } from "../../src/contracts/v1.1/exit-bundle-manifest.js";
 
@@ -481,6 +482,55 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
     expect(expectedVerifyPassed).toBe(false);
     const result = await runImport();
     expect(result.activated).toBe(false);
+  }
+
+  /**
+   * Codex gate net-new (2026-08-22): whole-destination-tree hash, not just
+   * the exit-reserved namespaces - proves the refusal touched NOTHING, not
+   * only that it left the exit-staging namespaces empty. Excludes `_audit*`
+   * (timestamped, expected to differ run to run for reasons unrelated to
+   * staging).
+   */
+  async function destinationTreeHash(
+    destinationStorage: MemoryStorage
+  ): Promise<string> {
+    const namespaces = await destinationStorage.listNamespaces();
+    const rows: string[] = [];
+    for (const ns of namespaces) {
+      if (ns.startsWith("_audit")) continue;
+      const entries = await destinationStorage.list(ns);
+      for (const entry of entries) {
+        const data = await destinationStorage.read(ns, entry.key);
+        rows.push(`${ns}/${entry.key}:${data ? toBase64url(data) : "null"}`);
+      }
+    }
+    return hashToString(stringToBytes(rows.sort().join("\n")));
+  }
+
+  /**
+   * Codex gate net-new (2026-08-22): a "structural" throw at the
+   * pre-staging gate must be proven, not just named - assert NO staging
+   * artifact ever appeared under any of the exit-reserved namespaces on a
+   * fresh (pristine) destination, AND that the whole destination tree hash
+   * is unchanged from before the refused call. These namespace literals
+   * must match the `EXIT_*_NAMESPACE` constants in src/exit/bundle.ts.
+   */
+  async function assertNoStagingWrites(
+    destinationStorage: MemoryStorage,
+    treeHashBefore: string
+  ): Promise<void> {
+    for (const ns of [
+      "_exit_public_identities",
+      "_exit_policy_sets",
+      "_exit_audit_receipts",
+      "_exit_commitments",
+      "_exit_placeholder_metadata",
+      "_exit_imports",
+      "_exit_import_journal",
+    ]) {
+      expect(await destinationStorage.list(ns)).toHaveLength(0);
+    }
+    expect(await destinationTreeHash(destinationStorage)).toBe(treeHashBefore);
   }
 
   it("control: a healthy bundle verifies PASS and activates cleanly", async () => {
@@ -1105,6 +1155,399 @@ describe("exit verify/import parity aggregator (LD2-01 class fix)", () => {
         }),
       { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
     );
+  });
+
+  // ---- Coordinator gate HIGH finding (2026-08-22): the crypto-payload
+  // ---- fields decrypt()/the integrity check read, which the container +
+  // ---- element-shape checks above did NOT cover before this fix. Each of
+  // ---- these fixtures removes exactly one such field; before the fix a
+  // ---- missing `payload.iv` reached a raw TypeError inside rekeyState's
+  // ---- bare per-entry catch (swallowed, not a crash out of importExitBundle,
+  // ---- but still a "verify PASS, import refuses after staging" gap this
+  // ---- predicate now closes at the SAME pre-staging gate as F3/F4).
+
+  it("an entries element missing `entry.integrity_hash` fails verify closed, and import refuses with a NAMED error, never a crash", async () => {
+    const source = await makeSource("aggregator-cryptofield-hash-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const { integrity_hash: _hash, ...entryWithoutHash } = entries[0]!.entry as Record<string, unknown>;
+      artifact.entries = [{ ...entries[0]!, entry: entryWithoutHash }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
+  it("an entries element missing `entry.payload.v` fails verify closed, and import refuses with a NAMED error, never a crash", async () => {
+    const source = await makeSource("aggregator-cryptofield-v-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      const { v: _v, ...payloadWithoutV } = entry.payload as Record<string, unknown>;
+      artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload: payloadWithoutV } }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
+  it("an entries element missing `entry.payload.alg` fails verify closed, and import refuses with a NAMED error, never a crash", async () => {
+    const source = await makeSource("aggregator-cryptofield-alg-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      const { alg: _alg, ...payloadWithoutAlg } = entry.payload as Record<string, unknown>;
+      artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload: payloadWithoutAlg } }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
+  it("an entries element missing `entry.payload.iv` fails verify closed, and import refuses with a NAMED error, never a crash (a raw TypeError before this fix)", async () => {
+    const source = await makeSource("aggregator-cryptofield-iv-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      const { iv: _iv, ...payloadWithoutIv } = entry.payload as Record<string, unknown>;
+      artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload: payloadWithoutIv } }];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+  });
+
+  // ---- MEDIUM-B (coordinator gate, 2026-08-22): a WELL-TYPED but WRONG
+  // ---- value for payload.v/alg/iv used to pass the (type-only) check
+  // ---- above and only fail post-staging, misread as a signature failure.
+  // ---- Pinned to the EXACT values decrypt() accepts.
+
+  it("an entries element whose `entry.payload.alg` is a well-typed but wrong value (aes-128-gcm) fails verify closed, and import refuses with a NAMED error", async () => {
+    const source = await makeSource("aggregator-cryptofield-algvalue-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      const payload = { ...(entry.payload as Record<string, unknown>), alg: "aes-128-gcm" };
+      artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload } }];
+    });
+    const destination = await makeDestination();
+    const treeHashBefore = await destinationTreeHash(destination.storage as MemoryStorage);
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+
+    await assertNoStagingWrites(destination.storage as MemoryStorage, treeHashBefore);
+  });
+
+  it("an entries element whose `entry.payload.v` is a well-typed but wrong value (2) fails verify closed, and import refuses with a NAMED error", async () => {
+    const source = await makeSource("aggregator-cryptofield-vvalue-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      const payload = { ...(entry.payload as Record<string, unknown>), v: 2 };
+      artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload } }];
+    });
+    const destination = await makeDestination();
+    const treeHashBefore = await destinationTreeHash(destination.storage as MemoryStorage);
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+
+    await assertNoStagingWrites(destination.storage as MemoryStorage, treeHashBefore);
+  });
+
+  it("an entries element whose `entry.payload.iv` decodes to the wrong byte length fails verify closed, and import refuses with a NAMED error", async () => {
+    const source = await makeSource("aggregator-cryptofield-ivlength-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      const entry = entries[0]!.entry as Record<string, unknown>;
+      // "AAAA" base64url-decodes to 3 bytes, not the 12 a legitimate
+      // export always emits (N3, coordinator gate, 2026-08-22: the cipher
+      // itself accepts other nonce sizes; this predicate deliberately
+      // pins to the one length an export actually produces).
+      const payload = { ...(entry.payload as Record<string, unknown>), iv: "AAAA" };
+      artifact.entries = [{ ...entries[0]!, entry: { ...entry, payload } }];
+    });
+    const destination = await makeDestination();
+    const treeHashBefore = await destinationTreeHash(destination.storage as MemoryStorage);
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_ENTRIES_UNREADABLE", reason: "structural" }
+    );
+
+    await assertNoStagingWrites(destination.storage as MemoryStorage, treeHashBefore);
+  });
+
+  // ---- F3/F4 (Exit V2 drill D1, 2026-08-22): two structural checks that
+  // ---- used to be absent from BOTH verify and import (F3) or present only
+  // ---- in import, AFTER staging (F4). Both now route through the same
+  // ---- `checkEncryptedStateStructure` (verifier.ts) that
+  // ---- entries-malformed uses above, so they share its
+  // ---- `encrypted_state_entries_unreadable` failure_class on the verify
+  // ---- side, with their own named import error for a diagnosable cause.
+
+  it("F3: a source-signed artifact whose total_keys was left stale after entries were truncated fails verify closed, and import refuses with a NAMED error", async () => {
+    const source = await makeSource("aggregator-f3-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      // total_keys stays at its pre-truncation value (1, from makeSource's
+      // single state entry); entries is truncated to 0. A hand-crafted
+      // bundle could not otherwise produce this: only a bundle re-signed by
+      // the SOURCE's own key (like this test does) can carry a
+      // self-declared total_keys that disagrees with its own entries.
+      artifact.total_keys = 1;
+      artifact.entries = [];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_TOTAL_KEYS_MISMATCH", reason: "structural" }
+    );
+  });
+
+  it("F4: a reserved-namespace entry fails verify closed (not just import), and import refuses BEFORE staging any artifact", async () => {
+    const source = await makeSource("aggregator-f4-source");
+    const bundleDir = await newBundleDir();
+    await exportBundle(source, bundleDir, { mint: true });
+    await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
+      const entries = artifact.entries as Array<Record<string, unknown>>;
+      artifact.entries = [{ ...entries[0], namespace: "_injected" }];
+      artifact.namespaces = ["_injected"];
+    });
+    const destination = await makeDestination();
+
+    await assertVerifyImportInvariant(
+      bundleDir,
+      false,
+      "encrypted_state_entries_unreadable",
+      () =>
+        importExitBundle({
+          bundleDir,
+          storage: destination.storage,
+          masterKey: destination.masterKey,
+          identityManager: destination.identityManager,
+          auditLog: destination.auditLog,
+          reputationStore: destination.reputationStore,
+          activate: true,
+          forceRebind: true,
+          sourceMasterKey: source.masterKey,
+          destinationSignerIdentityId: destination.identityId,
+        }),
+      { kind: "throws", code: "ENCRYPTED_STATE_RESERVED_NAMESPACE_ENTRY", reason: "structural" }
+    );
+
+    // The whole point of F4's fix: the refusal happens BEFORE any staging
+    // write, not after (the drill's pre-fix behavior staged 6 `_exit_*`
+    // artifacts, THEN refused on the incomplete-state rollback). These
+    // namespace literals must match the `EXIT_*_NAMESPACE` constants in
+    // src/exit/bundle.ts.
+    for (const ns of [
+      "_exit_public_identities",
+      "_exit_policy_sets",
+      "_exit_audit_receipts",
+      "_exit_commitments",
+      "_exit_placeholder_metadata",
+      "_exit_imports",
+      "_exit_import_journal",
+      "_injected",
+    ]) {
+      expect(await destination.storage.list(ns)).toHaveLength(0);
+    }
+  });
+
+  it("checkEncryptedStateStructure: total_keys_mismatch and reserved_namespace_entry are computed directly, not folded into entries_malformed_elements", () => {
+    // A complete, otherwise well-formed entry (every field
+    // isWellFormedExitStateEntryElement now checks, coordinator gate HIGH
+    // finding 2026-08-22: integrity_hash/payload.v/alg/iv), so these two
+    // assertions exercise ONLY the total_keys/reserved-namespace checks,
+    // not the element-shape check.
+    const wellFormedEntry = {
+      kid: "kid",
+      sig: "sig",
+      integrity_hash: "hash",
+      // "AAAAAAAAAAAAAAAA" is a canonical base64url encoding of 12 zero
+      // bytes - the exact IV byte length decrypt() requires (MEDIUM-B,
+      // coordinator gate, 2026-08-22).
+      payload: { v: 1, alg: "aes-256-gcm", iv: "AAAAAAAAAAAAAAAA", ct: "ct" },
+      metadata: {},
+    };
+    expect(
+      checkEncryptedStateStructure({ entries: [], total_keys: 1 })
+    ).toMatchObject({ ok: false, problem: "total_keys_mismatch" });
+    expect(
+      checkEncryptedStateStructure({ entries: [], total_keys: 0 })
+    ).toMatchObject({ ok: true });
+    expect(
+      checkEncryptedStateStructure({
+        entries: [
+          {
+            namespace: "_reserved",
+            key: "k",
+            entry: wellFormedEntry,
+          },
+        ],
+        total_keys: 1,
+      })
+    ).toMatchObject({ ok: false, problem: "reserved_namespace_entry" });
+    expect(
+      checkEncryptedStateStructure({
+        entries: [{ namespace: "ns", key: "k", entry: wellFormedEntry }],
+        total_keys: 1,
+      })
+    ).toMatchObject({ ok: true });
   });
 
   // ---- Artifact 1's OTHER mutation-provable half: the fail-closed default ---

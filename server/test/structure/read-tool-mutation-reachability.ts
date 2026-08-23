@@ -309,6 +309,12 @@ const STORAGE_READ_ONLY: ReadonlySet<string> = new Set([
   "readTransientError",
   "throwModeRejected",
   "sleep",
+  // N4 (coordinator gate, 2026-08-22, src/storage/exit-import-journal.ts):
+  // a pure predicate over `storage.list()` (already read-only above), no
+  // write of its own - calling it from a read handler's path (the N4-READ
+  // durable-side-effect gate in cognitive/state-store.ts) does not add a
+  // mutation to that handler's reach.
+  "hasInterruptedExitImport",
   // Caller-supplied observation hooks. Treating the hook itself as a sink would
   // misattribute the site: the callback is what runs, and the callback IS
   // walked, whether it is written inline at the call site or passed by name.

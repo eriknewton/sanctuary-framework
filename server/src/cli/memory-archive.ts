@@ -35,6 +35,7 @@ import {
   verifyExitV2SdwMemoryArchive,
 } from "../exit/v2-memory-archive.js";
 import { AuditLog } from "../operational/audit-log.js";
+import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
 import type { ApprovalChannel } from "../principal-policy/approval-channel.js";
 import { BaselineTracker } from "../principal-policy/baseline.js";
 import { ApprovalGate } from "../principal-policy/gate.js";
@@ -476,11 +477,17 @@ async function bootstrap(
     const signingKey = derivePurposeKey(masterKey, "identity-encryption");
     identityKey = signingKey;
     const fortressId = fortressIdFromStoragePath(parsed.fortressPath);
+    // MEDIUM-C (coordinator gate, 2026-08-22): this verb is part of the
+    // Exit V2 memory-archive carriage family, so it is directly in scope
+    // for the fortress-open recovery wiring, not just structurally
+    // discovered by the mechanical pin.
+    const memoryArchiveAuditLog = new AuditLog(storage, masterKey);
+    await recoverInterruptedExitImportsOrThrow(storage, memoryArchiveAuditLog);
     return {
       storage,
       masterKey,
       identityKey,
-      auditLog: new AuditLog(storage, masterKey),
+      auditLog: memoryArchiveAuditLog,
       baseline: new BaselineTracker(storage, masterKey),
       adapter: new SdwMemoryBackendAdapter({
         storage,

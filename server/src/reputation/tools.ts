@@ -7,6 +7,7 @@
 
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
+import { InterruptedExitImportPendingError } from "../storage/exit-import-journal.js";
 import {
   ReputationBundleVerificationError,
   ReputationStore,
@@ -427,6 +428,20 @@ export function createReputationTools(
               "failure"
             );
             return toolResult({ error: err.message });
+          } else if (err instanceof InterruptedExitImportPendingError) {
+            // N4 (coordinator gate, 2026-08-22): reputationStore.record
+            // refuses while an exit-import journal exists (reputation-store.ts).
+            void auditLog.append(
+              "l4",
+              "reputation_record_refused_pending_exit_import_recovery",
+              identity.identity_id,
+              { interaction_id: args.interaction_id, context },
+              "failure"
+            );
+            return toolResult({
+              error: "exit_import_pending_recovery",
+              message: err.message,
+            });
           } else {
             throw err;
           }
@@ -684,6 +699,28 @@ export function createReputationTools(
             callerIdentity
           );
         } catch (err) {
+          // ITEM-5 (coordinator gate, 2026-08-22): same named-error branch
+          // as state_write/state_delete/state_import/reputation_record -
+          // ReputationStore.importBundle refuses while an exit-import
+          // journal exists (N4).
+          if (err instanceof InterruptedExitImportPendingError) {
+            await auditLog.appendCritical({
+              layer: "l4",
+              operation: "reputation_import_refused_pending_exit_import_recovery",
+              identity_id: "system",
+              result: "failure",
+              details: {},
+            });
+            return toolResult({
+              error: "exit_import_pending_recovery",
+              message: err.message,
+              imported_attestations: 0,
+              invalid_attestations: 0,
+              contexts: [],
+              completeness_verification: "failed",
+              imported_at: new Date().toISOString(),
+            });
+          }
           const invalid =
             err instanceof ReputationBundleVerificationError
               ? err.invalidAttestations

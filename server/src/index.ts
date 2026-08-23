@@ -17,6 +17,7 @@ import { readDistressConfig } from "./distress/config.js";
 import { deliverDistressLocally } from "./distress/local-delivery.js";
 import { loadOrCreateLocalListenerSecret } from "./distress/local-secret.js";
 import { AuditLog } from "./operational/audit-log.js";
+import { recoverInterruptedExitImportsOrThrow } from "./exit/bundle.js";
 import { createDisclosureTools } from "./disclosure/tools.js";
 import { createReputationTools } from "./reputation/tools.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "./principal-policy/loader.js";
@@ -240,6 +241,12 @@ export async function createSanctuaryServer(options?: {
 
   // 5. Initialize audit log
   const auditLog = new AuditLog(storage, masterKey);
+
+  // 5b. G-2 (coordinator gate, 2026-08-22): roll back any interrupted
+  // exit-import BEFORE any other subsystem below reads or writes storage,
+  // and refuse to boot if that rollback cannot be confirmed complete
+  // (register id EXIT-JOURNAL-DIVERGE-01).
+  await recoverInterruptedExitImportsOrThrow(storage, auditLog);
 
   // 5rb. Anti-rollback Stage 1 boot cross-check. Compare the on-disk custody
   // epoch against the surviving on-disk witnesses (the #501 rotation epoch

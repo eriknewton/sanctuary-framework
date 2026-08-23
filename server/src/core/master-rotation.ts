@@ -70,6 +70,11 @@ import { join, resolve } from "node:path";
 
 import type { StorageBackend } from "../storage/interface.js";
 import {
+  hasInterruptedExitImport,
+  EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
+  withExitAdmissionLock,
+} from "../storage/exit-import-journal.js";
+import {
   encrypt,
   decrypt,
   type EncryptedPayload,
@@ -474,6 +479,29 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
     reason:
       "castle-wall IPC frames are runtime artifacts; stop the daemon and " +
       "clear the namespace before rotating. " + UNSUPPORTED_DEFERRAL,
+  },
+  // N4-ROTATE (coordinator gate, 2026-08-22): explicit, not the underscore
+  // fallback below - this namespace holds the exit-import writer guard's
+  // own rollback records. The preflight refusal above
+  // (hasInterruptedExitImport) is what stops rotation while it exists;
+  // this entry keeps rotation from treating the journal's own bytes as
+  // ordinary state independently of that check.
+  _exit_import_journal: {
+    kind: "unsupported",
+    reason:
+      "holds the exit-import writer guard's own rollback journal; rotation " +
+      "is refused outright while one exists (see the preflight check), " +
+      "never partially applied to it. " + UNSUPPORTED_DEFERRAL,
+  },
+  // MEDIUM-C (Codex gate, 2026-08-22): the writer guard's per-location
+  // post-image records; same reasoning and same preflight refusal as the
+  // main journal namespace above.
+  [EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE]: {
+    kind: "unsupported",
+    reason:
+      "holds the exit-import writer guard's per-location post-image " +
+      "records; rotation is refused outright while an import journal " +
+      "exists (see the preflight check). " + UNSUPPORTED_DEFERRAL,
   },
 };
 
@@ -1656,6 +1684,21 @@ export async function rotateMaster(
     );
   }
 
+  // N4-ROTATE (coordinator gate, 2026-08-22): rotation re-encrypts every
+  // "state"-classified namespace and re-stamps `_meta` MAC records by
+  // writing directly to storage (the writer guard's chokepoints - the state
+  // and reputation stores' write paths - are not on this path at all).
+  // Those are exactly the journal-set locations a pending exit-import
+  // journal can later restore, so run this the same way the two mutual-
+  // exclusion checks above do: refuse before any conversion begins.
+  if (await hasInterruptedExitImport(storage)) {
+    throw new RotationPreflightError(
+      "an exit-import rollback journal exists for this fortress, meaning an " +
+        "import is in progress or pending recovery; run any `sanctuary exit` " +
+        "verb (for example `sanctuary exit verify`) to recover, then retry"
+    );
+  }
+
   // Mutual exclusion with the federation rotate-root journal (Slice 3a). A
   // federation signing-master rotation re-keys the _federation/trust-root-v1
   // payload; running a custody rotation concurrently could re-encrypt a
@@ -1877,24 +1920,42 @@ export async function rotateMaster(
       old_wrap_ids: oldEnvelope.wraps.map((w) => w.id),
       new_wrap_ids: stagedEnvelope.wraps.map((w) => w.id),
     };
-    await writeJournal(storage, journal, newMaster);
-    failpoint("journal-converting-written");
+    // HIGH-1 (Codex gate, 2026-08-22): the admission lock now spans the
+    // re-check, the journal publish, AND the whole conversion/finalize
+    // that follows - not just the publish step. A short lock left the
+    // conversion writes reachable by a concurrent exit-import's own
+    // recovery-lock-holding pass in the SAME way a short import-side lock
+    // did (see importExitBundle's matching comment, exit/bundle.ts): a
+    // concurrent open must wait this lock's bound and refuse, never
+    // observe or act on a rotation that is still in progress.
+    return await withExitAdmissionLock(storage, "rotate", async () => {
+      if (await hasInterruptedExitImport(storage)) {
+        throw new RotationPreflightError(
+          "an exit-import rollback journal exists for this fortress, meaning " +
+            "an import started after this rotation's preflight passed; run " +
+            "any `sanctuary exit` verb (for example `sanctuary exit verify`) " +
+            "to recover, then retry the rotation"
+        );
+      }
+      await writeJournal(storage, journal, newMaster);
+      failpoint("journal-converting-written");
 
-    log("Converting: re-encrypting fortress data under the new master...");
-    const convertResult = await walkFortress(ctx, false);
-    await convertAuditEpochs(ctx);
-    await convertCastlePin(ctx, false);
-    failpoint("convert-complete");
+      log("Converting: re-encrypting fortress data under the new master...");
+      const convertResult = await walkFortress(ctx, false);
+      await convertAuditEpochs(ctx);
+      await convertCastlePin(ctx, false);
+      failpoint("convert-complete");
 
-    log("Finalizing: promoting the new custody envelope...");
-    await finalize(ctx, journal);
+      log("Finalizing: promoting the new custody envelope...");
+      await finalize(ctx, journal);
 
-    return {
-      rotation_id: rotationId,
-      old_wrap_ids: journal.old_wrap_ids,
-      new_wrap_ids: journal.new_wrap_ids,
-      converted_entries: convertResult.converted,
-    };
+      return {
+        rotation_id: rotationId,
+        old_wrap_ids: journal.old_wrap_ids,
+        new_wrap_ids: journal.new_wrap_ids,
+        converted_entries: convertResult.converted,
+      };
+    });
   } finally {
     zeroizeWriterCache(ctx);
     oldMaster.fill(0);
@@ -1921,6 +1982,18 @@ export async function resumeRotation(
 ): Promise<RotateMasterResult> {
   const storage = opts.storage;
   const log = opts.log ?? (() => {});
+
+  // N4-ROTATE (coordinator gate, 2026-08-22): same refusal as rotateMaster's
+  // preflight - a resume also converts and writes journal-set locations
+  // directly, outside the writer guard's chokepoints.
+  if (await hasInterruptedExitImport(storage)) {
+    throw new RotationResumeError(
+      "an exit-import rollback journal exists for this fortress, meaning an " +
+        "import is in progress or pending recovery; run any `sanctuary exit` " +
+        "verb (for example `sanctuary exit verify`) to recover, then retry"
+    );
+  }
+
   const rawJournal = await storage.read("_meta", ROTATION_JOURNAL_KEY);
   if (!rawJournal) {
     throw new RotationResumeError(
@@ -1979,21 +2052,40 @@ export async function resumeRotation(
     writerCache: new Map(),
   };
   try {
-    let converted = 0;
-    if (journal.phase === "converting") {
-      log("Resuming: converting remaining fortress data...");
-      converted = (await walkFortress(ctx, false)).converted;
-      await convertAuditEpochs(ctx);
-      await convertCastlePin(ctx, false);
-    }
-    log("Resuming: finalizing...");
-    await finalize(ctx, journal);
-    return {
-      rotation_id: journal.rotation_id,
-      old_wrap_ids: journal.old_wrap_ids,
-      new_wrap_ids: journal.new_wrap_ids,
-      converted_entries: converted,
-    };
+    // F1 (coordinator gate, 2026-08-22): re-check immediately before
+    // resuming conversion, not only the top-of-function preflight above -
+    // an exit-import can start and journal between resumeRotation being
+    // invoked and reaching this point. HIGH-1 (Codex gate, 2026-08-22):
+    // the admission lock now spans the re-check AND the whole remaining
+    // conversion/finalize, not only the check - same reason as
+    // rotateMaster's matching widened lock (a short lock left the
+    // conversion writes reachable by a concurrent exit-import's own
+    // recovery pass).
+    return await withExitAdmissionLock(storage, "resume", async () => {
+      if (await hasInterruptedExitImport(storage)) {
+        throw new RotationResumeError(
+          "an exit-import rollback journal exists for this fortress, " +
+            "meaning an import started after this resume began; run any " +
+            "`sanctuary exit` verb (for example `sanctuary exit verify`) " +
+            "to recover, then retry the resume"
+        );
+      }
+      let converted = 0;
+      if (journal.phase === "converting") {
+        log("Resuming: converting remaining fortress data...");
+        converted = (await walkFortress(ctx, false)).converted;
+        await convertAuditEpochs(ctx);
+        await convertCastlePin(ctx, false);
+      }
+      log("Resuming: finalizing...");
+      await finalize(ctx, journal);
+      return {
+        rotation_id: journal.rotation_id,
+        old_wrap_ids: journal.old_wrap_ids,
+        new_wrap_ids: journal.new_wrap_ids,
+        converted_entries: converted,
+      };
+    });
   } finally {
     zeroizeWriterCache(ctx);
     oldMaster.fill(0);

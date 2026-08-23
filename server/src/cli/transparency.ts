@@ -28,6 +28,7 @@ import {
   AuditIntegrityError,
   AuditLog,
 } from "../operational/audit-log.js";
+import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { bytesToString, fromBase64url, toBase64url } from "../core/encoding.js";
 import { resolveStoragePath } from "../paths.js";
@@ -183,6 +184,12 @@ async function runAnchorCommand(
       // Status needs the master key only to AUTHENTICATE the config; a
       // tampered config must be reported, not summarized.
       masterKey = await resolveMasterKey(storage, opts.values["--passphrase"], env);
+      // Codex gate net-new (2026-08-22): this verb derives a master key
+      // and reads storage but never constructed an AuditLog, so it was
+      // missed by the mechanical fortress-open recovery pin. Construct one
+      // here (cheap) so recovery can run before the read below.
+      const statusAuditLog = new AuditLog(storage, masterKey);
+      await recoverInterruptedExitImportsOrThrow(storage, statusAuditLog);
       const state = await readAnchorConfig({ storage, masterKey });
       const receipts =
         state.status === "absent" ? [] : await readAnchorReceipts(storage);
@@ -238,6 +245,10 @@ async function runAnchorCommand(
 
     masterKey = await resolveMasterKey(storage, opts.values["--passphrase"], env);
     const auditLog = new AuditLog(storage, masterKey);
+    // HIGH-2 (coordinator gate, 2026-08-22): roll back any exit-import left
+    // interrupted by a prior hard kill before this verb touches storage
+    // further. See index.ts's matching call site for the full rationale.
+    await recoverInterruptedExitImportsOrThrow(storage, auditLog);
     const fortressId = fortressIdFromStoragePath(storagePath);
 
     if (verb === "export") {
@@ -409,6 +420,9 @@ async function runCheckpoint(
     const storage = new FilesystemStorage(join(storagePath, "state"));
     masterKey = await resolveMasterKey(storage, opts.values["--passphrase"], env);
     const auditLog = new AuditLog(storage, masterKey);
+    // HIGH-2 (coordinator gate, 2026-08-22): see the anchor-verb call site
+    // above for the full rationale.
+    await recoverInterruptedExitImportsOrThrow(storage, auditLog);
     const signer = await resolveTransparencySigner({
       fortressPath: storagePath,
       masterKey,
@@ -660,9 +674,19 @@ export async function runVerifyTransparencyCommand(
           opts.values["--passphrase"],
           env
         );
-        auditLog = new AuditLog(storage, masterKey);
       } catch {
-        auditLog = undefined;
+        masterKey = undefined;
+      }
+      if (masterKey) {
+        // HIGH-2 (coordinator gate, 2026-08-22): once a master key IS
+        // available, roll back any interrupted exit-import BEFORE trusting
+        // this fortress's audit log for a counter recount. Deliberately
+        // OUTSIDE the credential-resolution try/catch above: a resolved
+        // master key with a FAILED recovery must stop this operation
+        // (rule 5, AGENTS.md), never silently fall into the
+        // "no credential available" degraded path below.
+        auditLog = new AuditLog(storage, masterKey);
+        await recoverInterruptedExitImportsOrThrow(storage, auditLog);
       }
       const records = extractRecords(parsed);
       hostResult = await verifyAgainstLog({
@@ -814,6 +838,9 @@ export async function runVerifyTransparencyCommand(
       }
       const fortressId = fortressIdFromStoragePath(storagePath);
       const auditLog = new AuditLog(storage, masterKey);
+      // HIGH-2 (coordinator gate, 2026-08-22): see the anchor-verb call
+      // site above for the full rationale.
+      await recoverInterruptedExitImportsOrThrow(storage, auditLog);
       const { evaluateAndEnforceRekorCounterFloor } = await import(
         "../core/anti-rollback.js"
       );

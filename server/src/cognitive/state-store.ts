@@ -16,6 +16,10 @@
  */
 
 import type { StorageBackend } from "../storage/interface.js";
+import {
+  hasInterruptedExitImport,
+  InterruptedExitImportPendingError,
+} from "../storage/exit-import-journal.js";
 import { ed25519 } from "@noble/curves/ed25519";
 import {
   encrypt,
@@ -61,8 +65,16 @@ const STATE_ENVELOPE_SCHEMA_VERSION = 3;
 const LEGACY_STATE_ENVELOPE_SIGNING_DOMAIN = "sanctuary.state-envelope.v1\n";
 // Must match STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX in core/signing-domains.ts (identity_sign refusal list).
 const STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX = "sanctuary.state-envelope.v";
-const STATE_ENVELOPE_PUBLIC_KEYS_KEY = "state-envelope-public-keys-v1";
-const STATE_ENVELOPE_VERSION_ANCHORS_KEY = "state-envelope-version-anchors-v1";
+// CONTRACT PIN (coordinator gate, 2026-08-22): exported so
+// server/src/exit/bundle.ts can snapshot these two exact `_meta` keys by
+// PRECISE location before an exit-import's state re-key runs, instead of a
+// namespace-wide `_meta` snapshot (which deletes any unrelated `_meta` key
+// written between the snapshot and a later replay - see
+// `activationSnapshotLocations` in bundle.ts). If `write()` below starts
+// touching a different or additional `_meta` key, update that call site in
+// the SAME change.
+export const STATE_ENVELOPE_PUBLIC_KEYS_KEY = "state-envelope-public-keys-v1";
+export const STATE_ENVELOPE_VERSION_ANCHORS_KEY = "state-envelope-version-anchors-v1";
 // F1: domain-separated MAC over the version-anchor record (the rollback floor),
 // which is stored plaintext. Without authentication a filesystem adversary could
 // silently EDIT/LOWER a key's floor to defeat the #391 leapfrog gate; the MAC
@@ -637,6 +649,71 @@ type DisclosureWithoutVerifiedReadFields = [
   ? UnattributedStateDisclosure
   : never;
 
+/**
+ * HIGH (Codex gate, 2026-08-22): a caller-supplied box letting a BATCH of
+ * writes (the exit-import module's rekeyState loop is the only caller
+ * today) reuse ONE loaded+parsed+MAC-verified version-anchors record
+ * across every write in the batch, instead of each write reloading the
+ * record from scratch - the record grows by one entry per distinct
+ * namespace/key ever written, so N writes each reloading it is O(N^2)
+ * work for an N-entry import. `anchors` is `null` until the first write
+ * in the batch populates it; `dirty` is set whenever a write raises the
+ * floor and cleared by flushVersionAnchorsCache. The cache is scoped to
+ * ONE caller's batch (never shared across callers) - `write()` and
+ * `flushVersionAnchorsCache` are the only two places that touch it.
+ * Another in-process StateStore instance reading the on-disk version
+ * anchors while this cache is dirty (pre-flush) sees a stale floor for
+ * the entries this batch has touched so far; that is safe because an
+ * ordinary write from that other instance is refused outright while this
+ * import's journal exists (N4 above), and the read-side anchor-mismatch
+ * raise is gated off for the exit-import module's own reads for the same
+ * reason - there is no write or read in that window that would act on
+ * the stale floor.
+ */
+export interface VersionAnchorsCache {
+  anchors: Record<string, unknown> | null;
+  dirty: boolean;
+}
+
+/**
+ * HIGH-A (Codex gate, 2026-08-22, register id EXIT-JOURNAL-DIVERGE-01):
+ * called synchronously with the EXACT bytes a raw storage write is about
+ * to persist, for a location this write touches (the main entry, or
+ * a `_meta` side effect). The exit-import module's own writer uses this to
+ * record its post-image from what it KNOWS it wrote, never from a re-read
+ * of storage after the fact - a re-read cannot tell this write's own bytes
+ * from a different writer's bytes landing in the same instant.
+ */
+type RawWriteObserver = (
+  namespace: string,
+  key: string,
+  bytes: Uint8Array
+) => Promise<void>;
+
+/**
+ * F4 (coordinator gate, 2026-08-22): a failure recording a post-image must
+ * NEVER turn "the entry/`_meta` bytes landed" into "this write failed" -
+ * that would be an availability regression (a fortress that actually
+ * finished its work refuses to open because BOOKKEEPING about that work
+ * failed). A swallowed failure here is not a silent data-loss risk: the
+ * one thing an unrecorded post-image can cause is a later recovery
+ * treating this location as unconfirmed (safe-noop or diverged) rather
+ * than confirmed-safe-to-restore - never a wrong restore.
+ */
+async function runRawWriteObserver(
+  onRawWrite: RawWriteObserver | undefined,
+  namespace: string,
+  key: string,
+  bytes: Uint8Array
+): Promise<void> {
+  if (!onRawWrite) return;
+  try {
+    await onRawWrite(namespace, key, bytes);
+  } catch {
+    // Intentionally swallowed - see the doc comment above.
+  }
+}
+
 /** Options for state write */
 export interface WriteOptions {
   content_type?: string;
@@ -652,6 +729,35 @@ export interface WriteOptions {
     lineage_id?: string;
     derived_from?: readonly DerivedFromEdge[];
   };
+  /**
+   * N4 (coordinator gate, 2026-08-22): a scoped opt-out of the
+   * pending-exit-import write refusal below, for the one call path that
+   * legitimately writes while its own journal exists. CAPABILITY BOUND
+   * (Codex gate MEDIUM, 2026-08-22): this is a plain boolean, not an
+   * authenticator - any in-process caller can pass it, so it narrows the
+   * refusal's guarantee to "an external caller cannot forge this without
+   * also being trusted to construct WriteOptions in the first place," not
+   * a cryptographic proof of which module is calling.
+   */
+  allowDuringOwnExitImportActivation?: boolean;
+  /**
+   * HIGH-A (Codex gate, 2026-08-22): paired with
+   * allowDuringOwnExitImportActivation - lets the exit-import module
+   * capture the exact bytes THIS write persists (the main entry and any
+   * `_meta` side effect), for its own post-image recording. Not for
+   * general use; same in-process-forgeable bound as the option above.
+   */
+  onRawWrite?: RawWriteObserver;
+  /**
+   * HIGH (Codex gate, 2026-08-22): see {@link VersionAnchorsCache}'s doc
+   * comment - a batch caller reuses one loaded record across every write
+   * in the batch instead of paying an O(record size) reload per write.
+   * Not for general use; the record is NOT durably flushed by write()
+   * itself when this is set (call flushVersionAnchorsCache when the batch
+   * finishes) - a caller that sets this and never flushes leaves the
+   * floor raise unpersisted.
+   */
+  versionAnchorsCache?: VersionAnchorsCache;
 }
 
 /** Cached namespace key with TTL */
@@ -1261,9 +1367,12 @@ export class StateStore {
 
   private async saveJsonRecord(
     key: string,
-    record: Record<string, unknown>
+    record: Record<string, unknown>,
+    onRawWrite?: RawWriteObserver
   ): Promise<void> {
-    await this.storage.write("_meta", key, stringToBytes(JSON.stringify(record)));
+    const bytes = stringToBytes(JSON.stringify(record));
+    await this.storage.write("_meta", key, bytes);
+    await runRawWriteObserver(onRawWrite, "_meta", key, bytes);
   }
 
   /**
@@ -1382,7 +1491,8 @@ export class StateStore {
 
   /** Persist the version-anchor record in a MAC-authenticated envelope (F1). */
   private async saveVersionAnchors(
-    record: Record<string, unknown>
+    record: Record<string, unknown>,
+    onRawWrite?: RawWriteObserver
   ): Promise<void> {
     const envelope = {
       [STATE_META_MAC_MARKER]: true,
@@ -1391,23 +1501,27 @@ export class StateStore {
         this.metaRecordMacBytes(STATE_ENVELOPE_VERSION_ANCHORS_KEY, record)
       ),
     };
-    await this.storage.write(
+    const bytes = stringToBytes(JSON.stringify(envelope));
+    await this.storage.write("_meta", STATE_ENVELOPE_VERSION_ANCHORS_KEY, bytes);
+    await runRawWriteObserver(
+      onRawWrite,
       "_meta",
       STATE_ENVELOPE_VERSION_ANCHORS_KEY,
-      stringToBytes(JSON.stringify(envelope))
+      bytes
     );
   }
 
   private async rememberWriterPublicKey(
     kid: string,
-    publicKey: Uint8Array
+    publicKey: Uint8Array,
+    onRawWrite?: RawWriteObserver
   ): Promise<void> {
     const registry = await this.loadJsonRecord(STATE_ENVELOPE_PUBLIC_KEYS_KEY);
     const publicKeyString = toBase64url(publicKey);
     if (registry[kid] === publicKeyString) return;
 
     registry[kid] = publicKeyString;
-    await this.saveJsonRecord(STATE_ENVELOPE_PUBLIC_KEYS_KEY, registry);
+    await this.saveJsonRecord(STATE_ENVELOPE_PUBLIC_KEYS_KEY, registry, onRawWrite);
   }
 
   private async resolveStoredIdentity(kid: string): Promise<StoredIdentity | null> {
@@ -1463,15 +1577,51 @@ export class StateStore {
     return keys;
   }
 
+  /**
+   * HIGH (Codex gate, 2026-08-22): the cache-aware load - populates
+   * `cache.anchors` on first use within a batch, then reuses it for every
+   * later call in the SAME batch instead of reloading. No cache supplied
+   * (every caller except rekeyState's batch) behaves exactly as
+   * loadVersionAnchors() always has - a fresh load every call.
+   */
+  private async loadVersionAnchorsCached(
+    cache?: VersionAnchorsCache
+  ): Promise<Record<string, unknown>> {
+    if (!cache) return this.loadVersionAnchors();
+    if (cache.anchors === null) {
+      cache.anchors = await this.loadVersionAnchors();
+    }
+    return cache.anchors;
+  }
+
   private async getAnchoredVersion(
     namespace: string,
-    key: string
+    key: string,
+    cache?: VersionAnchorsCache
   ): Promise<number> {
-    const anchors = await this.loadVersionAnchors();
+    const anchors = await this.loadVersionAnchorsCached(cache);
     const anchored = anchors[this.versionKey(namespace, key)];
     return typeof anchored === "number" && Number.isSafeInteger(anchored)
       ? anchored
       : 0;
+  }
+
+  /**
+   * HIGH (Codex gate, 2026-08-22): flushes a batch's cached, in-memory
+   * anchor raises to durable storage in ONE write, instead of one write
+   * per raise. Call once a batch (rekeyState's loop) finishes; a no-op if
+   * nothing in the batch actually raised the floor. `onRawWrite` fires for
+   * this ONE flush write with the FINAL bytes, so the exit-import
+   * module's post-image record reflects what is actually on disk when the
+   * batch completes - never an intermediate, unflushed value.
+   */
+  async flushVersionAnchorsCache(
+    cache: VersionAnchorsCache,
+    onRawWrite?: RawWriteObserver
+  ): Promise<void> {
+    if (!cache.dirty || cache.anchors === null) return;
+    await this.saveVersionAnchors(cache.anchors, onRawWrite);
+    cache.dirty = false;
   }
 
   /**
@@ -1500,13 +1650,14 @@ export class StateStore {
   private async assertNotBelowVersionFloor(
     namespace: string,
     key: string,
-    version: number
+    version: number,
+    cache?: VersionAnchorsCache
   ): Promise<{
     anchors: Record<string, unknown>;
     vk: string;
     lastSeen: number;
   }> {
-    const anchors = await this.loadVersionAnchors();
+    const anchors = await this.loadVersionAnchorsCached(cache);
     const vk = this.versionKey(namespace, key);
     const anchored = anchors[vk];
     const lastSeen =
@@ -1536,17 +1687,28 @@ export class StateStore {
   private async observeVersion(
     namespace: string,
     key: string,
-    version: number
+    version: number,
+    onRawWrite?: RawWriteObserver,
+    cache?: VersionAnchorsCache
   ): Promise<void> {
     const { anchors, vk, lastSeen } = await this.assertNotBelowVersionFloor(
       namespace,
       key,
-      version
+      version,
+      cache
     );
 
     if (version > lastSeen) {
       anchors[vk] = version;
-      await this.saveVersionAnchors(anchors);
+      // HIGH (Codex gate, 2026-08-22): with a cache, defer the durable
+      // write to flushVersionAnchorsCache - `anchors` IS `cache.anchors`
+      // (same object, mutated in place above), so this raise is already
+      // visible to every later call in the SAME batch without a save.
+      if (cache) {
+        cache.dirty = true;
+      } else {
+        await this.saveVersionAnchors(anchors, onRawWrite);
+      }
     }
   }
 
@@ -1611,6 +1773,53 @@ export class StateStore {
     identityEncryptionKey: Uint8Array,
     options: WriteOptions = {}
   ): Promise<WriteResult> {
+    // N4 (coordinator gate, 2026-08-22): while a durable exit-import
+    // journal exists, refuse THIS write - F6 (coordinator gate,
+    // 2026-08-22): restore is now post-image-confirmed, not unconditional
+    // (HIGH-1/HIGH-A, Codex gate, register id EXIT-JOURNAL-DIVERGE-01:
+    // restoreStorageSnapshots restores a location only when its current
+    // bytes match the import's own recorded post-image, otherwise it
+    // reports diverged and leaves it untouched); this refusal stays the
+    // first line of defense so a legitimate write is never even put in
+    // that position. The exit-import module's own state-rekey path is the
+    // one legitimate caller that writes while its OWN journal is present
+    // and passes `allowDuringOwnExitImportActivation` to skip this; every
+    // other caller is refused while ANY journal exists. RESIDUAL BOUND:
+    // the check-then-write gap this refusal itself has is closed by the
+    // fortress-wide admission lock the exit-import module now holds for
+    // its whole import / rotation / recovery (HIGH-1/HIGH-B, Codex gate,
+    // 2026-08-22), for the rotation/import ordering race specifically; a
+    // lock-acquire timeout still fails this operation closed rather than
+    // proceeding, which is an availability, not a correctness, trade-off.
+    // A DIFFERENT residual is deliberately NOT closed by widening this
+    // lock: an ordinary writer that reads this check as false (no journal
+    // yet), then does async work, while an import's own check/lock/
+    // snapshot/publish runs and completes, then finally commits its write
+    // - a writer that races journal publication is detected at recovery,
+    // not prevented. That writer's committed bytes can never match the
+    // import's own recorded post-image for that location (post-images are
+    // hashed from the import's own KNOWN written bytes, never a re-read of
+    // storage, per HIGH-1/HIGH-A above), so restoreStorageSnapshots
+    // classifies the location diverged and leaves it untouched on both the
+    // in-process exception-path rollback and the separate-process recovery
+    // path (recoverInterruptedExitImportsInner) - they share ONE
+    // classifyRestoreSafety implementation. Proven deterministically by
+    // "Codex gate HIGH (2026-08-23): an ordinary writer racing journal
+    // publication..." in test/exit/exit-import-atomic-activation.test.ts -
+    // that test writes the racing bytes directly through the storage
+    // backend, not through this method's own guard check, so it proves
+    // the divergence-detection outcome for ANY write landing on the same
+    // location after the import's own write; the guard-check-then-
+    // async-gap interleaving described in this paragraph is covered by
+    // that same detection mechanism (post-image hashing does not care
+    // HOW the racing write arrived), not separately re-simulated end to
+    // end by that test.
+    if (
+      !options.allowDuringOwnExitImportActivation &&
+      (await hasInterruptedExitImport(this.storage))
+    ) {
+      throw new InterruptedExitImportPendingError(`state_write:${namespace}/${key}`);
+    }
     const namespaceKey = this.getNamespaceKey(namespace);
     const plaintext = stringToBytes(value);
 
@@ -1633,7 +1842,11 @@ export class StateStore {
     // Determine version number (monotonically increasing)
     const vk = this.versionKey(namespace, key);
     const currentVersion = this.versionCache.get(vk) ?? 0;
-    const anchoredVersion = await this.getAnchoredVersion(namespace, key);
+    const anchoredVersion = await this.getAnchoredVersion(
+      namespace,
+      key,
+      options.versionAnchorsCache
+    );
     const newVersion = Math.max(currentVersion, anchoredVersion) + 1;
 
     const now = new Date().toISOString();
@@ -1699,8 +1912,15 @@ export class StateStore {
     // Serialize and write to storage
     const serialized = stringToBytes(JSON.stringify(stateEntry));
     await this.storage.write(namespace, key, serialized);
-    await this.rememberWriterPublicKey(identityId, writerPublicKey);
-    await this.observeVersion(namespace, key, newVersion);
+    await runRawWriteObserver(options.onRawWrite, namespace, key, serialized);
+    await this.rememberWriterPublicKey(identityId, writerPublicKey, options.onRawWrite);
+    await this.observeVersion(
+      namespace,
+      key,
+      newVersion,
+      options.onRawWrite,
+      options.versionAnchorsCache
+    );
 
     // Update caches
     this.versionCache.set(vk, newVersion);
@@ -2273,8 +2493,30 @@ export class StateStore {
     // predicate every durable effect below already gates on, is what makes the
     // "no write but the audit entry" claim structural rather than a review
     // note: a durable effect added later inherits both halves.
+    // N4-READ (coordinator gate, 2026-08-22): a read's durable side effects
+    // (the legacy-schema migration write and the version-anchor raise below)
+    // touch the same `_meta` keys and state entries the write() chokepoint
+    // above guards - reaching them through a read bypassed that guard
+    // entirely before this line existed. Folded into the SAME predicate every
+    // durable effect already gates on, so a read still returns its value
+    // while a journal is pending; it just stops persisting the migration or
+    // raising the anchor until recovery clears it.
+    //
+    // Codex gate MEDIUM (2026-08-22): a read must never fail BECAUSE this
+    // check itself could not run - a `storage.list()` error here skips the
+    // durable side effect (the safe default) rather than throwing out of
+    // read(), which would turn "the guard couldn't confirm" into "the read
+    // failed."
+    let journalMaybePending: boolean;
+    try {
+      journalMaybePending = await hasInterruptedExitImport(this.storage);
+    } catch {
+      journalMaybePending = true;
+    }
     const durableSideEffectsPermitted =
-      signatureVerified && options.unattributedDisclosure !== true;
+      signatureVerified &&
+      options.unattributedDisclosure !== true &&
+      !journalMaybePending;
 
     // Decrypt
     const namespaceKey = this.getNamespaceKey(namespace);
@@ -2535,6 +2777,12 @@ export class StateStore {
 
   /**
    * Securely delete state (overwrite with random bytes before removal).
+   *
+   * N4-DELETE (coordinator gate, 2026-08-22): a secure delete is
+   * irreversible by design (AGENTS.md MUST-NEVER #3) - it must never be
+   * silently undone by a later journal replay restoring the pre-delete
+   * bytes at this same namespace/key. Refuse while a journal is pending,
+   * same as write().
    */
   async delete(
     namespace: string,
@@ -2546,6 +2794,9 @@ export class StateStore {
     new_merkle_root: string;
     deleted_at: string;
   }> {
+    if (await hasInterruptedExitImport(this.storage)) {
+      throw new InterruptedExitImportPendingError(`state_delete:${namespace}/${key}`);
+    }
     const deleted = await this.storage.delete(namespace, key, true);
 
     // Update caches
@@ -2705,6 +2956,16 @@ export class StateStore {
     imported_at: string;
     completeness_verification: StateExportCompletenessVerification;
   }> {
+    // N4-STATE-IMPORT (coordinator gate, 2026-08-22): this state-bundle
+    // import feature writes directly via `this.storage.write` below,
+    // outside the write() chokepoint above - a distinct entry point from
+    // the exit-import module's own activation, but one that can touch the
+    // exact same non-reserved-namespace locations an exit-import journal
+    // can restore. Refuse it the same way write() does; there is no
+    // legitimate reason to run this while a journal is pending recovery.
+    if (await hasInterruptedExitImport(this.storage)) {
+      throw new InterruptedExitImportPendingError("state_import");
+    }
     const bundle = parseExportBundleObject(bundleBase64);
     assertSupportedExportBundleSchema(bundle);
     const data = readExportData(bundle);
@@ -2832,6 +3093,19 @@ export class StateStore {
           // conflictResolution === "overwrite" falls through
         }
 
+        // Codex gate finding (2026-08-22): re-check per write, not once at
+        // the top of import() for the whole loop - a bulk import can run
+        // long enough for a journal to appear after the top-level check
+        // already passed.
+        //
+        // F7 (coordinator gate, 2026-08-22), pre-existing behavior: a
+        // mid-loop refusal here leaves every entry this SAME import() call
+        // already wrote earlier in the loop in place - import() has never
+        // rolled back its own partial progress on any refusal, and this
+        // check does not change that.
+        if (await hasInterruptedExitImport(this.storage)) {
+          throw new InterruptedExitImportPendingError(`state_import:${ns}/${key}`);
+        }
         // Write the entry
         const serialized = stringToBytes(JSON.stringify(entry));
         await this.storage.write(ns, key, serialized);
@@ -2860,6 +3134,11 @@ export class StateStore {
           !importedNamespaceSet.has(markerRecord.namespace)
         ) {
           continue;
+        }
+        if (await hasInterruptedExitImport(this.storage)) {
+          throw new InterruptedExitImportPendingError(
+            `state_import_facade_marker:${record.key}`
+          );
         }
         await this.storage.write(
           FACADE_HIDDEN_MARKER_NAMESPACE,

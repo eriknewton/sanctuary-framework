@@ -35,8 +35,14 @@ import {
   type ExitBundleManifest,
   type ExitBundleVerifierResult,
 } from "../contracts/v1.1/exit-bundle-manifest.js";
-import { fromBase64url, stringToBytes } from "../core/encoding.js";
+import { fromBase64url, fromBase64urlStrict, stringToBytes } from "../core/encoding.js";
+import {
+  SUPPORTED_PAYLOAD_VERSION,
+  SUPPORTED_PAYLOAD_ALG,
+  PAYLOAD_IV_BYTE_LENGTH,
+} from "../core/encryption.js";
 import { publicKeyToDid } from "../core/identity.js";
+import { isReservedNamespace } from "../cognitive/state-store.js";
 import {
   verifyRotationChain,
   type RotationChainInvalidReason,
@@ -159,6 +165,17 @@ export interface ExitEncryptedStateSummary {
    * import ever runs.
    */
   entries_malformed: boolean;
+  /**
+   * G-6 (coordinator gate, 2026-08-22): WHICH problem `checkEncryptedStateStructure`
+   * found, so a caller can name it (a stale `total_keys`, a reserved
+   * namespace entry, an unreadable/malformed entry) instead of a single
+   * generic "malformed" message that cannot distinguish them. `undefined`
+   * when the artifact is structurally sound. Additive/diagnostic only -
+   * `entries_malformed` and `entry_count === null` remain the gating
+   * signals; this field never changes what fails closed, only what the
+   * operator is told about why.
+   */
+  structural_problem?: EncryptedStateStructureProblem;
   legacy_kdf_params: "absent" | "valid" | "malformed";
   /**
    * The same three-state read of `source_custody` the import gate performs.
@@ -363,29 +380,54 @@ function findPrivateMaterial(value: unknown, path = "$"): string[] {
 }
 
 /**
- * True IFF `item` has the exact minimal shape import's state-rekey path
- * dereferences BEFORE any other validation runs: an object with string
- * `namespace` and `key`, and an `entry` object carrying string `kid` and
- * `sig`, plus a `payload` object carrying string `ct`
- * (server/src/exit/bundle.ts `compromisedRetiredSignatureUse`,
- * `conflictReport`, `activationSnapshotLocations`, `rekeyState`, all of
- * which read `item.namespace`/`item.key`/`item.entry.kid`/
- * `item.entry.payload.ct`/`item.entry.sig` unconditionally at the top of
- * their loop body). Deliberately NOT the full `StateEntry` shape
- * (server/src/cognitive/state-store.ts) - a value that passes this check can
- * still fail AEAD decryption or signature verification later; those are
- * import's OWN job. This predicate exists only to close the gap between
- * "the container is a readable array" (LD2-01) and "every element in it is
- * safe to dereference the way import's first pass does" (EXIT-STRUCT-02),
- * one level deeper.
- *
- * CONTRACT PIN (server/src/exit/bundle.ts): the encrypted-state entries
- * guards in `resolveSourceMasterKey` and `importExitBundle` both call this
- * SAME function on every element, so "malformed" here means exactly what
- * makes import throw - a hand-mirrored second check was the whack-a-mole
- * shape AGENTS.md rule 5 rules out.
+ * TYPED PARSE RESULT (Codex gate finding, 2026-08-22; rule 11,
+ * AGENTS.md): the exact shape import's state-rekey path reads BEFORE (and
+ * immediately after) decrypting an entry - namespace/key/kid/sig/metadata
+ * (safe-dereference fields, EXIT-STRUCT-02) PLUS the crypto-payload fields
+ * `decrypt()` (server/src/core/encryption.ts) and the post-decrypt
+ * integrity check both read: `payload.v`, `payload.alg`, `payload.iv`,
+ * `entry.integrity_hash`. A missing `payload.iv` used to reach
+ * `fromBase64url(undefined)` (a raw TypeError, swallowed only by
+ * `rekeyState`'s bare per-entry `catch`); a missing `integrity_hash` made
+ * `hashToString(plaintext) !== undefined` unconditionally true, silently
+ * treating a structurally-damaged entry as a signature failure. Both
+ * outcomes skip the entry, which then fails the whole import CLOSED after
+ * staging (the same "verify PASS, import refuses post-staging" shape
+ * F3/F4 close for `total_keys`/reserved-namespace). Deliberately NOT the
+ * full `StateEntry` shape (server/src/cognitive/state-store.ts): a
+ * value that passes this check can still fail AEAD decryption/signature
+ * verification for a VALUE reason (wrong key, tampered ciphertext,
+ * unsupported version/alg) - that stays import's own, separately-named,
+ * credential-shaped refusal, never a crash and never silently absorbed
+ * into "invalid signature".
  */
-export function isWellFormedExitStateEntryElement(item: unknown): boolean {
+export interface WellFormedExitStateEntryElement {
+  namespace: string;
+  key: string;
+  entry: {
+    kid: string;
+    sig: string;
+    integrity_hash: string;
+    payload: { v: number; alg: string; iv: string; ct: string };
+    metadata: { tags?: string[] };
+  };
+}
+
+/**
+ * CONTRACT PIN (the exit-import module): the encrypted-state entries
+ * guards on the import side both call this same function (via
+ * `checkEncryptedStateStructure` for the pre-staging gate, and directly
+ * for the defense-in-depth callers) on every element, so "malformed" here
+ * means exactly what import checks for - a hand-mirrored second check
+ * was the shape AGENTS.md rule 5 rules out. A type predicate
+ * (`item is WellFormedExitStateEntryElement`), not a bare boolean, so
+ * every caller gets real type narrowing from the same check it ran,
+ * rather than a separately-hand-written cast that could drift from what
+ * this function actually verified.
+ */
+export function isWellFormedExitStateEntryElement(
+  item: unknown
+): item is WellFormedExitStateEntryElement {
   if (item === null || typeof item !== "object") return false;
   const record = item as Record<string, unknown>;
   if (typeof record.namespace !== "string") return false;
@@ -395,9 +437,41 @@ export function isWellFormedExitStateEntryElement(item: unknown): boolean {
   const entryRecord = entry as Record<string, unknown>;
   if (typeof entryRecord.kid !== "string") return false;
   if (typeof entryRecord.sig !== "string") return false;
+  if (typeof entryRecord.integrity_hash !== "string") return false;
   const payload = entryRecord.payload;
   if (payload === null || typeof payload !== "object") return false;
-  if (typeof (payload as Record<string, unknown>).ct !== "string") return false;
+  const payloadRecord = payload as Record<string, unknown>;
+  if (typeof payloadRecord.ct !== "string") return false;
+  // G-B (coordinator gate, 2026-08-22): pinned to the EXACT values
+  // `decrypt()` (core/encryption.ts) accepts, not merely their type - a
+  // well-typed WRONG value (`v: 2`, `alg: "aes-128-gcm"`) used to pass
+  // this check, verify PASS, and only fail post-staging inside rekeyState's
+  // bare per-entry catch, misread as a signature failure rather than a
+  // structural one. `SUPPORTED_PAYLOAD_VERSION`/`SUPPORTED_PAYLOAD_ALG` are
+  // the SAME constants `decrypt()` checks against - CONTRACT PIN, must
+  // match if either changes.
+  if (payloadRecord.v !== SUPPORTED_PAYLOAD_VERSION) return false;
+  if (payloadRecord.alg !== SUPPORTED_PAYLOAD_ALG) return false;
+  // `payload.iv` is read by `fromBase64url` with no type guard of its own
+  // (a non-string is the raw-TypeError crash risk EXIT-STRUCT-02 covers).
+  // N3 (coordinator gate, 2026-08-22): `PAYLOAD_IV_BYTE_LENGTH` is the
+  // exact length `encrypt()` (core/encryption.ts) always emits, not a
+  // length decrypt()'s cipher itself requires - @noble/ciphers' `gcm()`
+  // accepts other nonce sizes (varSizeNonce). This structural check
+  // deliberately pins to the ONE length a legitimate export ever produces,
+  // so a decodable-but-off-length IV is refused here as malformed rather
+  // than accepted by the cipher under a nonce size this fortress never
+  // actually uses. `fromBase64urlStrict` rejects any non-canonical
+  // encoding first, so a lenient-decoder quirk cannot hide a length
+  // mismatch from the check that follows it.
+  if (typeof payloadRecord.iv !== "string") return false;
+  try {
+    if (fromBase64urlStrict(payloadRecord.iv).length !== PAYLOAD_IV_BYTE_LENGTH) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
   // EXIT-STRUCT-02 fix-round (Codex family, confirmed by probe: predicate:true
   // then TypeError): `rekeyState` (server/src/exit/bundle.ts write site) reads
   // `entry.metadata.content_type`/`.ttl_seconds` and SPREADS `entry.metadata.tags`
@@ -415,6 +489,100 @@ export function isWellFormedExitStateEntryElement(item: unknown): boolean {
   const tags = (metadata as Record<string, unknown>).tags;
   if (tags !== undefined && !Array.isArray(tags)) return false;
   return true;
+}
+
+/**
+ * The four ways an `encrypted_state` artifact's `entries`/`total_keys`
+ * declaration can fail to describe itself honestly, in the order
+ * {@link checkEncryptedStateStructure} checks them.
+ */
+export type EncryptedStateStructureProblem =
+  | "entries_unreadable"
+  | "entries_malformed_elements"
+  | "total_keys_mismatch"
+  | "reserved_namespace_entry";
+
+export interface EncryptedStateStructureCheck {
+  ok: boolean;
+  problem?: EncryptedStateStructureProblem;
+  detail?: string;
+}
+
+/**
+ * CONTRACT PIN (AGENTS.md rule 11): the ONE structural-soundness check for
+ * an encrypted_state artifact's `entries` container and `total_keys`
+ * declaration, consumed by BOTH `summarizeEncryptedState` (verify, right
+ * below) AND `importExitBundle`'s pre-staging gate
+ * (server/src/exit/bundle.ts - search "checkEncryptedStateStructure" there)
+ * so neither stage can accept an artifact the other refuses. Must match
+ * that call site if this function's signature or problem set changes.
+ *
+ * Four checks make up the problem set: an unreadable `entries` container
+ * (LD2-01), a malformed element (EXIT-STRUCT-02), a source-signed artifact
+ * whose `total_keys` disagrees with its own readable `entries` length
+ * (F3), and a reserved-namespace entry (F4). All four are gated HERE,
+ * before any write, so `exit verify` and `exit import` always agree on
+ * whether a bundle is sound. Fail closed: an artifact this function
+ * cannot fully vouch for is `ok: false`, never a default `ok: true`.
+ */
+export function checkEncryptedStateStructure(record: {
+  entries?: unknown;
+  total_keys?: unknown;
+}): EncryptedStateStructureCheck {
+  if (!Array.isArray(record.entries)) {
+    return {
+      ok: false,
+      problem: "entries_unreadable",
+      detail: "the `entries` field is absent or is not an array",
+    };
+  }
+  const entries = record.entries;
+  for (const item of entries) {
+    if (!isWellFormedExitStateEntryElement(item)) {
+      return {
+        ok: false,
+        problem: "entries_malformed_elements",
+        detail:
+          "an entries element is missing or has a wrong-typed " +
+          "namespace/key/entry field",
+      };
+    }
+  }
+  // F3: `total_keys` must be PRESENT as a number and agree with the
+  // readable entries length. A bundle's own export always sets
+  // `total_keys: entries.length` (bundle.ts exportEncryptedState); a
+  // hand-crafted or truncated-then-resigned artifact is the only way this
+  // can disagree.
+  if (
+    typeof record.total_keys !== "number" ||
+    record.total_keys !== entries.length
+  ) {
+    return {
+      ok: false,
+      problem: "total_keys_mismatch",
+      detail:
+        `declared total_keys (${JSON.stringify(record.total_keys)}) does ` +
+        `not match the readable entries count (${entries.length})`,
+    };
+  }
+  // F4: the SAME predicate import's rekeyState (bundle.ts) uses to skip a
+  // reserved-namespace entry, checked here BEFORE any write so verify and
+  // import agree before staging, not after.
+  const reserved = entries.find(
+    (item) =>
+      isWellFormedExitStateEntryElement(item) &&
+      isReservedNamespace((item as { namespace: string }).namespace)
+  );
+  if (reserved) {
+    return {
+      ok: false,
+      problem: "reserved_namespace_entry",
+      detail:
+        `entry namespace '${(reserved as { namespace: string }).namespace}' ` +
+        "is a reserved namespace",
+    };
+  }
+  return { ok: true };
 }
 
 /**
@@ -441,19 +609,22 @@ export function summarizeEncryptedState(
   const entries: unknown[] | null = Array.isArray(record.entries)
     ? record.entries
     : null;
-  // INVARIANT (EXIT-STRUCT-02, one level deeper than the LD2-01 check above):
-  // `entries` being a non-null array only proves the CONTAINER is readable.
-  // A `null` element, or one missing/wrong-typed `namespace`/`entry`/
-  // `entry.kid`/`entry.payload.ct`/`entry.sig`, passes that container check
-  // and then throws a raw TypeError at import's first per-element
-  // dereference (`compromisedRetiredSignatureUse` in bundle.ts). Checked
-  // with the SAME predicate import's own container guards use
-  // (`isWellFormedExitStateEntryElement` above), so "malformed" here means
-  // exactly what makes import throw. `entries === null` short-circuits this
+  // INVARIANT (EXIT-STRUCT-02, one level deeper than the LD2-01 check above;
+  // extended by F3/F4, Exit V2 drill D1): `entries` being a non-null array
+  // only proves the CONTAINER is readable. A `null` element, a
+  // missing/wrong-typed `namespace`/`entry`/`entry.kid`/`entry.payload.ct`/
+  // `entry.sig`, a stale self-declared `total_keys`, or a reserved-namespace
+  // entry all pass a bare container check and either crash import
+  // (`compromisedRetiredSignatureUse` in bundle.ts) or get silently applied
+  // partially. Routed through `checkEncryptedStateStructure`, the SAME
+  // function import's pre-staging gate uses, so "malformed" here means
+  // exactly what makes import refuse. `entries === null` short-circuits this
   // to `false`: an unreadable container is the already-covered LD2-01 case,
   // not this one.
-  const entriesMalformed =
-    entries !== null && entries.some((item) => !isWellFormedExitStateEntryElement(item));
+  const structureCheck = checkEncryptedStateStructure(record);
+  const entriesMalformed = entries !== null && !structureCheck.ok;
+  const structuralProblem: EncryptedStateStructureProblem | undefined =
+    entries !== null && !structureCheck.ok ? structureCheck.problem : undefined;
   const namespaces = Array.isArray(record.namespaces)
     ? record.namespaces.filter((n): n is string => typeof n === "string")
     : [];
@@ -504,6 +675,9 @@ export function summarizeEncryptedState(
     ...(emptyReason !== undefined ? { empty_reason: emptyReason } : {}),
     empty_reason_missing: entries?.length === 0 && emptyReason === undefined,
     entries_malformed: entriesMalformed,
+    ...(structuralProblem !== undefined
+      ? { structural_problem: structuralProblem }
+      : {}),
     legacy_kdf_params: legacyKdfParams,
     source_custody: sourceCustody,
     declared_rekey_material: declared,
@@ -1071,12 +1245,30 @@ export async function verifyExitBundle(
     );
   }
   if (stateSummary?.entries_malformed === true) {
+    // G-6 (coordinator gate, 2026-08-22): name the ACTUAL problem
+    // (structural_problem, populated from the same checkEncryptedStateStructure
+    // call that set entries_malformed) rather than a single generic message
+    // that could not distinguish a stale total_keys header, a
+    // reserved-namespace entry, or a genuinely malformed element.
+    const problemText: Record<EncryptedStateStructureProblem, string> = {
+      entries_unreadable:
+        "the entries list itself cannot be read (this is the entries === null " +
+        "case and should not reach this branch; reported defensively)",
+      entries_malformed_elements:
+        "contains a malformed entry (missing or wrong-typed namespace/key/" +
+        "entry/payload fields)",
+      total_keys_mismatch:
+        "declares a total_keys count that does not match its readable entries",
+      reserved_namespace_entry:
+        "carries an entry under a reserved namespace, which is never a " +
+        "legitimate export",
+    };
+    const problem = stateSummary.structural_problem ?? "entries_malformed_elements";
     warnings.push(
-      "encrypted state entries list is readable but contains a malformed " +
-        "entry (missing or wrong-typed namespace/key/entry fields): this " +
-        "artifact is signed and hash-verified but structurally damaged one " +
-        "level deeper than an unreadable list, and import would refuse it " +
-        "rather than skip it - re-export from the source fortress"
+      `encrypted state entries list ${problemText[problem]}: this artifact ` +
+        "is signed and hash-verified but structurally damaged, and import " +
+        "would refuse it before (total_keys/reserved-namespace) or after " +
+        "(a malformed element) staging - re-export from the source fortress"
     );
   }
   if (stateSummary?.empty_reason_missing === true) {

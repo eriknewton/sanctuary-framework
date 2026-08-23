@@ -23,6 +23,7 @@ import {
   exitBundleManifestShape,
   ExitBundleImportError,
   ExitBundleStateImportIncompleteError,
+  recoverInterruptedExitImportsOrThrow,
   type ImportExitBundleResult,
 } from "./bundle.js";
 import type {
@@ -180,6 +181,18 @@ async function openExitContext(
   }
 
   const auditLog = new AuditLog(storage, masterKey);
+
+  // F1 (Exit V2 drill D1, 2026-08-22): "fortress open" for every `sanctuary
+  // exit` subcommand, run BEFORE identityManager.load() or any other
+  // reader below touches storage (LOW-G, coordinator gate, 2026-08-22:
+  // moved earlier in this function - a killed import can leave identity
+  // or state data mid-write, and the checks below should see the
+  // RECOVERED fortress, not the half-applied one). `...OrThrow` (MEDIUM-3,
+  // coordinator gate, 2026-08-22) so a partial/unparseable rollback stops
+  // fortress open instead of silently proceeding against a possibly
+  // half-applied target.
+  await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+
   const stateStore = new StateStore(storage, masterKey);
   const identityManager = new IdentityManager(storage, masterKey);
   await identityManager.load();

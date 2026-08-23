@@ -1,3 +1,4 @@
+// fail-before-exempt: this PR's only edit here is a fixture consistency fix (total_keys=0 on the "genuinely empty bundle" case, F3/Exit V2 drill D1 2026-08-22) that holds under both pre-fix and post-fix source; the new F3/F4 behavior itself is covered fail-before by test/exit/exit-verifier-aggregator.test.ts and test/cli/import-state-warning.test.ts
 /**
  * `sanctuary exit inspect` (exit-cluster item A5, 2026-08-05).
  *
@@ -415,6 +416,13 @@ describe("exit inspect: what the bundle declares, never what an import will do",
     await exportBundle(source, bundleDir, { mint: true });
     await patchEncryptedStateAndResign(bundleDir, source, (artifact) => {
       artifact.entries = [];
+      // F3 (Exit V2 drill D1): total_keys must agree with the readable
+      // entries count, or checkEncryptedStateStructure now reports
+      // total_keys_mismatch instead of a genuinely empty, internally
+      // consistent bundle - which is exactly this test's point. makeSource
+      // seeds one state entry, so the pre-truncation export set
+      // total_keys: 1; a genuinely empty bundle must also zero this out.
+      artifact.total_keys = 0;
       artifact.empty_reason = "fortress_state_empty";
     });
 

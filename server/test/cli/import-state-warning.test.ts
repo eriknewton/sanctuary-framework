@@ -130,6 +130,34 @@ async function addReservedStateEntryAndResign(
   });
 }
 
+/**
+ * Codex gate finding (2026-08-22): distinct from
+ * addReservedStateEntryAndResign - THIS entry is structurally well-formed
+ * (passes the pre-staging gate), it just carries a `kid` no public-identity
+ * artifact key resolves. rekeyState's per-entry loop skips it and counts it
+ * (skipped_unknown_kid), which is the post-staging, all-or-nothing
+ * "state import incomplete" path the reserved-namespace test above no
+ * longer exercises (F4 moved reserved-namespace to the pre-staging gate).
+ */
+async function addUnknownKidStateEntryAndResign(
+  bundleDir: string,
+  source: Fortress,
+): Promise<void> {
+  await patchArtifactAndResign(bundleDir, source, "encrypted_state", (artifact) => {
+    const entries = artifact.entries as Array<Record<string, unknown>>;
+    const first = entries[0];
+    if (!first) throw new Error("expected encrypted_state entry");
+    const firstEntry = first.entry as Record<string, unknown>;
+    entries.push({
+      ...first,
+      key: "crafted-unknown-kid-entry",
+      entry: { ...firstEntry, kid: "did:key:z6MkUnknownKidNeverIssued" },
+    });
+    artifact.total_keys = entries.length;
+    return artifact;
+  });
+}
+
 async function addRotationHistoryAndResign(
   bundleDir: string,
   source: Fortress,
@@ -395,7 +423,7 @@ describe("exit import state warning", () => {
     expect(freeze.frozen).toBe(false);
   });
 
-  it("refuses and prints skipped counters when state import drops an entry", async () => {
+  it("refuses a reserved-namespace entry BEFORE staging, with a named error (F4, Exit V2 drill D1, 2026-08-22)", async () => {
     const source = await bootstrapFortress(SOURCE_PASSPHRASE, "source");
     cleanup.push(source.storagePath);
     const stateStore = new StateStore(source.storage, source.masterKey);
@@ -437,11 +465,74 @@ describe("exit import state warning", () => {
       env: { SANCTUARY_PASSPHRASE: DESTINATION_PASSPHRASE },
     });
 
+    // F4 (Exit V2 drill D1): before the fix, this scenario staged every
+    // artifact, hit the reserved-namespace entry inside `rekeyState`, and
+    // only THEN reported `state_skipped_keys: 1` / "state import
+    // incomplete" and rolled back. The fix moves the SAME refusal to the
+    // shared pre-staging gate (checkEncryptedStateStructure,
+    // verifier.ts/bundle.ts), so it never gets that far: a NAMED error, not
+    // a late-stage skip counter.
+    expect(code).toBe(1);
+    expect(out.text).not.toContain("verdict: PASS");
+    expect(err.text).toContain("ENCRYPTED_STATE_RESERVED_NAMESPACE_ENTRY");
+    expect(err.text).toContain("reserved namespace");
+    expect(err.text).not.toContain("state_skipped_keys");
+
+    const destinationState = new StateStore(
+      destination.storage,
+      destination.masterKey,
+    );
+    const imported = await destinationState.read("agent-memory", "handoff");
+    expect(imported).toBeNull();
+  });
+
+  it("Codex gate finding (2026-08-22): an unknown-kid entry is skipped post-staging, reports skip counters, and reports state import incomplete", async () => {
+    const source = await bootstrapFortress(SOURCE_PASSPHRASE, "source");
+    cleanup.push(source.storagePath);
+    const stateStore = new StateStore(source.storage, source.masterKey);
+    await stateStore.write(
+      "agent-memory",
+      "handoff",
+      "partial imports must not look successful",
+      source.identity.identity_id,
+      source.identity.encrypted_private_key,
+      source.identityEncryptionKey,
+    );
+    const bundleDir = await exportBundle(source, ["agent-memory"]);
+    await addUnknownKidStateEntryAndResign(bundleDir, source);
+
+    const destination = await bootstrapFortress(
+      DESTINATION_PASSPHRASE,
+      "destination",
+    );
+    cleanup.push(destination.storagePath);
+    process.env.SANCTUARY_STORAGE_PATH = destination.storagePath;
+
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runExitCommand({
+      argv: [
+        "import",
+        bundleDir,
+        "--activate",
+        "--import-state",
+        "--source-passphrase",
+        SOURCE_PASSPHRASE,
+        "--destination-identity-id",
+        destination.identity.identity_id,
+        "--force-rebind",
+        "--yes",
+      ],
+      out,
+      err,
+      env: { SANCTUARY_PASSPHRASE: DESTINATION_PASSPHRASE },
+    });
+
     expect(code).toBe(1);
     expect(out.text).not.toContain("verdict: PASS");
     expect(err.text).toContain("state_skipped_keys: 1");
     expect(err.text).toContain("state_skipped_invalid_sig: 0");
-    expect(err.text).toContain("state_skipped_unknown_kid: 0");
+    expect(err.text).toContain("state_skipped_unknown_kid: 1");
     expect(err.text).toContain("state import incomplete");
 
     const destinationState = new StateStore(

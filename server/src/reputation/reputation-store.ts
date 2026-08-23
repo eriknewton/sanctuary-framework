@@ -16,6 +16,10 @@
  */
 
 import type { StorageBackend } from "../storage/interface.js";
+import {
+  hasInterruptedExitImport,
+  InterruptedExitImportPendingError,
+} from "../storage/exit-import-journal.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import {
@@ -1272,6 +1276,13 @@ export class ReputationStore {
     additionalQuotaCheck?: () => Promise<void>,
     emitAudit?: ReputationInLockAuditEmit
   ): Promise<StoredAttestation> {
+    // N4 (coordinator gate, 2026-08-22): refuse while a durable exit-import
+    // journal exists - see state-store.ts write() for the full rationale.
+    // No legitimate caller of `record()` runs during an active exit-import
+    // (that path uses `importBundle` below), so this check is unconditional.
+    if (await hasInterruptedExitImport(this.storage)) {
+      throw new InterruptedExitImportPendingError(`reputation_record:${context}`);
+    }
     const resolvedOrigin = ReputationStore.resolveOrigin(origin);
     // LD6 BP-DEADLINE-03: content-derived id from the tuple identifying THIS
     // logical operation (`participant_did` = the SIGNER, `identity.did` --
@@ -2034,8 +2045,27 @@ export class ReputationStore {
     publicKeys: Map<string, Uint8Array>,
     options: {
       allowUnverifiedLegacy?: boolean;
+      /**
+       * N4 (coordinator gate, 2026-08-22): a scoped opt-out of the
+       * pending-exit-import write refusal below - see the matching
+       * WriteOptions field on the state store's write path, including its
+       * CAPABILITY BOUND note (Codex gate MEDIUM, 2026-08-22): a plain
+       * boolean, not an authenticator.
+       */
+      allowDuringOwnExitImportActivation?: boolean;
     } = {},
-    origin?: string
+    origin?: string,
+    /**
+     * HIGH-1 (Codex gate, 2026-08-22): called synchronously with the EXACT
+     * bytes each attestation write just persisted, so the exit-import
+     * module's journal can durably record what THIS call wrote before the
+     * next one. HIGH-A (Codex gate, 2026-08-22): the bytes are handed over
+     * directly, never re-read from storage - a re-read after the write
+     * cannot distinguish this write's own bytes from a different writer's
+     * bytes landing in the same instant. The one legitimate caller is the
+     * exit-import module's own activation path.
+     */
+    recordPostImage?: (namespace: string, key: string, bytes: Uint8Array) => Promise<void>
   ): Promise<{
     imported: number;
     invalid: number;
@@ -2043,6 +2073,14 @@ export class ReputationStore {
     contexts: string[];
     completeness_verification: ReputationBundleCompletenessVerification;
   }> {
+    // N4 (coordinator gate, 2026-08-22): see record()'s matching check
+    // above and state-store.ts write() for the full rationale.
+    if (
+      !options.allowDuringOwnExitImportActivation &&
+      (await hasInterruptedExitImport(this.storage))
+    ) {
+      throw new InterruptedExitImportPendingError("reputation_import_bundle");
+    }
     // Two-factor custody floor (I4/F6): reputation is trust-bearing state.
     // Enforced in the core so no CLI/SDK path can bypass it.
     const { enforceCustodyFloor } = await import("../core/master-custody.js");
@@ -2090,13 +2128,44 @@ export class ReputationStore {
           origin: resolvedOrigin,
         };
 
+        // Codex gate finding (2026-08-22): re-check per attestation, not
+        // once at the top of importBundle for the whole loop - a large
+        // bundle can run long enough for a journal to appear after the
+        // top-level check already passed. Respects the SAME bypass the
+        // top-level check does: the exit-import module's own activation
+        // call (allowDuringOwnExitImportActivation) always skips this,
+        // since a journal legitimately exists for its entire duration.
+        if (
+          !options.allowDuringOwnExitImportActivation &&
+          (await hasInterruptedExitImport(this.storage))
+        ) {
+          throw new InterruptedExitImportPendingError(
+            `reputation_import_bundle:${attestation.attestation_id}`
+          );
+        }
         const serialized = stringToBytes(JSON.stringify(stored));
         const encrypted = encrypt(serialized, this.encryptionKey);
+        const onDiskBytes = stringToBytes(JSON.stringify(encrypted));
         await this.storage.write(
           "_reputation",
           attestation.attestation_id,
-          stringToBytes(JSON.stringify(encrypted))
+          onDiskBytes
         );
+        // HIGH-A (Codex gate, 2026-08-22): pass the EXACT bytes just
+        // written, never re-read from storage - a re-read cannot tell
+        // this write's own bytes from a different writer's bytes landing
+        // in the same instant.
+        // F4 (coordinator gate, 2026-08-22): a failed post-image record
+        // must never turn "the attestation landed" into "this write
+        // failed" - see the matching wrapper's doc comment in
+        // cognitive/state-store.ts.
+        if (recordPostImage) {
+          try {
+            await recordPostImage("_reputation", attestation.attestation_id, onDiskBytes);
+          } catch {
+            // Intentionally swallowed.
+          }
+        }
 
         count++;
         contexts.add(attestation.data.context);

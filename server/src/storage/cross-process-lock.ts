@@ -66,6 +66,14 @@ export interface CrossProcessLockOptions {
   /** Poll interval while a lock is held (default {@link CROSS_PROCESS_LOCK_RETRY_MS}). */
   retryMs?: number;
   /**
+   * HIGH-B (Codex gate, 2026-08-22): merged into the lockfile's own JSON
+   * alongside `pid`/`acquired_at`, purely for a human reading the file
+   * during the manual-recovery path this module's header describes (there
+   * is no auto-stale-break) - never read back or interpreted by this
+   * module itself.
+   */
+  metadata?: Record<string, unknown>;
+  /**
    * Observability seam: invoked each time an acquire OBSERVES the lock already
    * held (an `EEXIST` on the O_EXCL create) and is about to sleep and retry.
    * `attempt` counts observed contentions, starting at 1.
@@ -109,6 +117,23 @@ export async function withCrossProcessLock<T>(
 }
 
 /**
+ * HIGH-B (Codex gate, 2026-08-22): the SAME contention error a caller sees
+ * from withCrossProcessLock/withPathLock, reworded to name the exit-import
+ * writer guard's own remediation instead of a generic manual-`rm` hint -
+ * for lock names where the holder set is exactly {import, rotate, resume,
+ * recovery} and the fix is the same "run `sanctuary exit verify`, or
+ * inspect before removing" text those callers already use elsewhere. Not a
+ * different lock mechanism; a different message on the SAME
+ * CrossProcessLockError shape, thrown from the SAME no-auto-break path.
+ */
+export class ExitAdmissionLockError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ExitAdmissionLockError";
+  }
+}
+
+/**
  * Lower-level path-keyed variant of {@link withCrossProcessLock}: serialize
  * `operation` under an O_EXCL lockfile at `<lockDir>/<lockFileName>`, with the
  * SAME discipline as the storage-backed helper -- bounded wait, NO
@@ -139,19 +164,72 @@ export async function withPathLock<T>(
   for (;;) {
     try {
       const handle = await open(lockPath, "wx", 0o600);
+      // MEDIUM (Codex gate, 2026-08-22 / 2026-08-23): the O_EXCL create
+      // SUCCEEDED at this point, so this process (uniquely) owns the lock
+      // file - a failure writing/syncing its metadata, OR a failure in
+      // handle.close() itself (even after a clean write/sync), is NOT a
+      // contention signal (that is the outer catch's EEXIST branch) and
+      // must not leave an empty or orphaned lock file wedging every
+      // future acquire. Both stages are tried independently (never a bare
+      // try/finally around close, which would let a close() throw
+      // silently discard an earlier write/sync error) so the unlink runs
+      // whichever stage failed, and BOTH errors are preserved in the
+      // thrown message when both occur.
+      //
+      // COOPERATIVE-OWNER ASSUMPTION: the unlink below trusts that nothing
+      // else has replaced this exact path between this process's own
+      // O_EXCL create and this cleanup - true here because O_EXCL makes
+      // this process the unique owner of the path until it unlinks (this
+      // module has no auto-stale-break, so no contender can have taken
+      // over in between); a lock primitive that DID stale-break would need
+      // a liveness re-check here before unlinking.
+      let writeSyncErr: unknown;
       try {
         await handle.writeFile(
           JSON.stringify({
             pid: process.pid,
             acquired_at: new Date().toISOString(),
+            ...options.metadata,
           }),
         );
         await handle.sync();
-      } finally {
+      } catch (err) {
+        writeSyncErr = err;
+      }
+      let closeErr: unknown;
+      try {
         await handle.close();
+      } catch (err) {
+        closeErr = err;
+      }
+      if (writeSyncErr !== undefined || closeErr !== undefined) {
+        let unlinkErr: unknown;
+        try {
+          await rm(lockPath, { force: true });
+        } catch (err) {
+          unlinkErr = err;
+        }
+        const causes = [
+          writeSyncErr !== undefined
+            ? `metadata write/sync: ${errorMessage(writeSyncErr)}`
+            : null,
+          closeErr !== undefined ? `handle close: ${errorMessage(closeErr)}` : null,
+        ].filter((cause): cause is string => cause !== null);
+        throw new CrossProcessLockError(
+          `cross-process lock (${lockPath}) was created but could not be ` +
+            `finalized (${causes.join("; ")}), so the lock file was ` +
+            (unlinkErr === undefined
+              ? `removed rather than left stuck.`
+              : `ALSO left behind - a follow-up removal attempt failed too ` +
+                `(${errorMessage(unlinkErr)}); remove it manually: rm '${lockPath}'.`),
+        );
       }
       break;
     } catch (err) {
+      // The finalize branch above (write/sync/close) already unlinked its
+      // own orphan and threw a fully-formed CrossProcessLockError - pass
+      // it straight through instead of re-wrapping it a second time.
+      if (err instanceof CrossProcessLockError) throw err;
       const code =
         err instanceof Error && "code" in err
           ? String((err as NodeJS.ErrnoException).code)

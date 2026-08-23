@@ -28,6 +28,7 @@ import {
   createInternalIdentitySigningHelpers,
 } from "../cognitive/tools.js";
 import { AuditLog } from "../operational/audit-log.js";
+import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig } from "../config.js";
 import { readDistressConfig } from "../distress/config.js";
@@ -209,6 +210,12 @@ async function cmdSend(
     });
 
     const auditLog = new AuditLog(storage, masterKey);
+
+    // HIGH-2 (coordinator gate, 2026-08-22): roll back any exit-import
+    // left interrupted by a prior hard kill before this verb reads or
+    // writes anything else. See index.ts's matching call site for the
+    // full rationale.
+    await recoverInterruptedExitImportsOrThrow(storage, auditLog);
 
     // Load identities so the emission is signed when an identity exists. A
     // fresh fortress with no identity still emits (signing_unavailable: true) —
