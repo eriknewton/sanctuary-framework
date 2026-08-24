@@ -97,6 +97,7 @@ import { createOperationalHardeningTools } from "./operational/hardening-tools.j
 import { SovereigntyProfileStore } from "./sovereignty-profile.js";
 import { createSovereigntyProfileTools } from "./sovereignty-profile-tools.js";
 import { InjectionDetector } from "./security/injection-detector.js";
+import { createDispatcherWiredCompiledContextScanner } from "./compiled-context/runtime.js";
 import { ClientManager } from "./proxy/client-manager.js";
 import { ProxyRouter } from "./proxy/proxy-router.js";
 import {
@@ -1334,6 +1335,19 @@ export async function createSanctuaryServer(options?: {
     if (event.type !== "finding") return;
     void autoTriggerDispatcher.handleFinding(event.finding, "sentinel");
   });
+  // Memory Integrity Slice B: every typed selector invocation now screens its
+  // fully assembled artifact before local or remote substrate selection. Route
+  // findings through this SAME dispatcher so durable store, critical audit,
+  // dashboard subscribers, and the auto-trigger ladder all observe them.
+  if (intelligenceSelector) {
+    intelligenceSelector.setCompiledContextScanner(
+      createDispatcherWiredCompiledContextScanner({
+        detector: injectionDetector,
+        detectorEnabled: true,
+        dispatcher: sentinelDispatcher,
+      }),
+    );
+  }
   if (dashboard) {
     dashboard.setSentinelDispatcher(sentinelDispatcher);
     dashboard.setAutoTrigger({

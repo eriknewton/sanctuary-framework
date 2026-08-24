@@ -130,6 +130,32 @@ const HEX_ENCODED_PATTERN = /(?:0x)?[0-9a-fA-F]{20,}/g;
 const HTML_ENTITY_PATTERN = /&#(?:x[0-9a-fA-F]{2,4}|[0-9]{2,5});/g;
 const URL_ENCODED_PATTERN = /(?:%[0-9a-fA-F]{2}){4,}/g;
 
+/**
+ * Hard cap for decoded payload candidates inspected during one string scan.
+ * Compiled-context screening supplies an outer byte bound; this inner cap
+ * prevents an attacker from turning that bounded corpus into an unbounded
+ * collection of base64/hex/url decode attempts.
+ */
+export const INJECTION_MAX_DECODED_RESCANS = 64;
+
+function boundedRegexMatches(
+  value: string,
+  pattern: RegExp,
+  limit: number,
+): string[] {
+  if (limit <= 0) return [];
+  const regex = new RegExp(pattern.source, pattern.flags.includes("g")
+    ? pattern.flags
+    : `${pattern.flags}g`);
+  const matches: string[] = [];
+  let match: RegExpExecArray | null;
+  while (matches.length < limit && (match = regex.exec(value)) !== null) {
+    matches.push(match[0]);
+    if (match[0].length === 0) regex.lastIndex++;
+  }
+  return matches;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SEC-035: Outbound content scanning patterns
 // ─────────────────────────────────────────────────────────────────────────────
@@ -654,27 +680,38 @@ export class InjectionDetector {
     signals: InjectionSignal[]
   ): void {
     const decodedParts: string[] = [];
+    const retainDecoded = (decoded: string | null): void => {
+      if (
+        decoded !== null &&
+        decodedParts.length < INJECTION_MAX_DECODED_RESCANS
+      ) {
+        decodedParts.push(decoded);
+      }
+    };
 
     // Extract and decode inline base64 blocks (not the whole-string check, which
     // is already in detectEncodingEvasion — this handles embedded blocks)
-    const base64Matches = value.match(BASE64_BLOCK_PATTERN);
-    if (base64Matches) {
+    const base64Matches = boundedRegexMatches(
+      value,
+      BASE64_BLOCK_PATTERN,
+      INJECTION_MAX_DECODED_RESCANS,
+    );
+    if (base64Matches.length > 0) {
       for (const match of base64Matches) {
-        const decoded = this.safeBase64Decode(match);
-        if (decoded !== null) {
-          decodedParts.push(decoded);
-        }
+        retainDecoded(this.safeBase64Decode(match));
       }
     }
 
     // Decode hex-encoded strings
-    const hexMatches = value.match(HEX_ENCODED_PATTERN);
-    if (hexMatches) {
-      for (const match of hexMatches) {
-        const decoded = this.safeHexDecode(match);
-        if (decoded !== null) {
-          decodedParts.push(decoded);
-        }
+    const hexMatches = boundedRegexMatches(
+      value,
+      HEX_ENCODED_PATTERN,
+      INJECTION_MAX_DECODED_RESCANS - decodedParts.length,
+    );
+    if (hexMatches.length > 0) {
+      const remaining = INJECTION_MAX_DECODED_RESCANS - decodedParts.length;
+      for (const match of hexMatches.slice(0, remaining)) {
+        retainDecoded(this.safeHexDecode(match));
       }
     }
 
@@ -682,17 +719,18 @@ export class InjectionDetector {
     if (HTML_ENTITY_PATTERN.test(value)) {
       const decoded = this.decodeHtmlEntities(value);
       if (decoded !== value) {
-        decodedParts.push(decoded);
+        retainDecoded(decoded);
       }
     }
 
     // Decode URL-encoded sequences
-    const urlMatches = value.match(URL_ENCODED_PATTERN);
-    if (urlMatches) {
+    const remaining = INJECTION_MAX_DECODED_RESCANS - decodedParts.length;
+    const urlMatches = boundedRegexMatches(value, URL_ENCODED_PATTERN, remaining);
+    if (urlMatches.length > 0) {
       for (const match of urlMatches) {
         const decoded = this.safeUrlDecode(match);
         if (decoded !== null && decoded !== match) {
-          decodedParts.push(decoded);
+          retainDecoded(decoded);
         }
       }
     }

@@ -1,7 +1,7 @@
 # server/src - Module Map
 
 This is the first thing to read before you touch the Sanctuary server. `server/src` is the
-TypeScript MCP server: 60 module directories plus a small set of root files. It is the in-process
+TypeScript MCP server: 61 module directories plus a small set of root files. It is the in-process
 "fortress" runtime - crypto core, the four sovereignty layers, enforcement surfaces, networking,
 identity, and the operator CLI. The native OS-level enforcers (Rust/Swift) live OUTSIDE this tree
 (see "Adjacent out-of-scope systems").
@@ -34,13 +34,13 @@ edit the wire token.
 
 ---
 
-## MODULE INDEX TABLE (60 modules)
+## MODULE INDEX TABLE (61 modules)
 
-All 60 module directories under `server/src` are listed. Status legend: **canonical** = a real,
+All 61 module directories under `server/src` are listed. Status legend: **canonical** = a real,
 wired subsystem; **thin/utility** = honestly one or two files; **default-off-allocated** = real code,
 deliberately unwired or off by default (not dead, not shipped-as-enforcing); **versioned-frozen** =
 a versioned wire/route surface that is frozen. "Barrel?" = does the dir expose a thin re-export
-`index.ts` (52 of 60 do today).
+`index.ts` (53 of 61 do today).
 
 | Module | Subject area | Status | What it owns | Distinct from | Barrel? | Do-not-touch |
 |--------|-------------|--------|--------------|---------------|---------|--------------|
@@ -49,6 +49,7 @@ a versioned wire/route surface that is frozen. "Barrel?" = does the dir expose a
 | memory-checkpoint | Cognitive | canonical | Local encrypted, content-addressed checkpoints of the StateStore exportable namespace bundle: `createCheckpoint`, `MemoryCheckpointStore`, retention pruning, optional scheduler, and `sanctuary checkpoint create, list, show, prune, restore`. Restore verifies the harness is parked, seals current exportable state as a forensic checkpoint, prints the poison map, and reconstructs exportable state from a chosen checkpoint. Persists encrypted bundle bytes plus plaintext non-secret metadata under `<fortress>/checkpoints/<id>/`; creation and restore never open a network or fleet-sync path | the four "audit" things (audit posture, audit-log storage, audit/chain hashing, transparency anchoring); castle-wall/export enforcement-event exporter; transparency checkpoints; state_export MCP tool | Yes | HKDF label `memory-checkpoint-v1`; audit ops `memory_checkpoint_created`/`memory_checkpoint_pruned`/`memory_checkpoint_restore`; source `forensic_quarantine`; Tier-1 op `memory_checkpoint_restore`; on-disk `<fortress>/checkpoints/`; CLI verb `checkpoint` |
 | policy-engine | Cognitive (declarative authoring) | canonical | English-to-rules compiler (authoring-time) + automated machine gates: slot/egress/budget/commitment-boundary + signed gate-receipts, no human prompt | principal-policy (the human gate) | Yes | tool `soft_warn`; 4 PolicySlot tokens `memory/credentials/plans/outputs`; `COMPILED_POLICY_SCHEMA_VERSION`; egress/budget `event_class` tokens; `GATE_REASON_CODES`; `is_sentinel` flag; gates forbid network/LLM imports (structural test) |
 | sentinel | Operational (Sentinels) | canonical | Rule-based behavioral-watcher framework: base class + per-fortress dispatcher + encrypted finding store + registry + concrete watchers under `sentinel/sentinels/` | anomaly-detection (learned drift); `policy-engine/sentinel-role.ts` (a capability flag) | Yes | route `/api/sentinels` (+`/subscribed`,`/findings`); `sentinel_id` tokens (egress-volume, credential-usage, etc.); audit ops `sentinel_finding_emitted`/`_evaluation_failed`; `sentinel-subscriptions.json`. Inner `sentinels/ebpf/*.rs` is a placeholder, NOT the daemon |
+| compiled-context | Enforcement-surface (memory integrity) | canonical | Slice B final-artifact screening contract: bounded compiler adapters, exact-byte/policy cache, typed future provenance-clustering handoff, and dispatcher-wired scan outcomes before local or remote intelligence providers | security/InjectionDetector (detection primitives); intelligence selector (sole production assembler); sentinel/auto-trigger (finding consumers) | Yes | `COMPILED_CONTEXT_CONTRACT_VERSION`; `COMPILED_CONTEXT_SENTINEL_ID`; six `CompiledContextOutcome` tokens; hard byte/contributor/metadata/signal/cache bounds; exact authoritative assembler inventory frozen by `compiled-context-structural.test.ts`; findings persist hashes + bounded metadata only, never raw context |
 | auto-trigger | Operational (Sentinels) | canonical | Nu-1 escalation ladder: routes findings through a 3-rung escalation (inbox / auto+cancel / fire-now); persists tuned thresholds; promotion recommendations | sentinel/anomaly/honeypot (they detect; this decides) | Yes | route `/api/auto-trigger`; rule-id wire format `sentinel__`/`anomaly__`/`honeypot__` (this IS the AAD); HKDF `l2-auto-trigger-rules-v1`; `AUTO_TRIGGER_AUDIT_OPS` |
 | anomaly-detection | Operational (Sentinels) | canonical | Chi-1 statistical pipeline: per-fortress feature extractors, classifiers (rolling-baseline/CUSUM/PSI), encrypted classifier-state store; emits drift findings | sentinel (hand-written rules); the `anomaly-trigger` watcher inside sentinel | Yes | route `/api/anomaly`; HKDF `l2-anomaly-classifier-state-v1`; `anomaly-subscriptions.json`; `anomaly_*` audit ops; numeric-only feature-vector invariant |
 | honeypot | Operational (Sentinels) | canonical | Pi-1+ honeypot authoring + runtime: English->TrapSpec compiler, registers bait (http/filesystem/tool_call/credential), fires findings into the sentinel finding store | sentinel (passive observer; honeypot plants active bait) | Yes | route `/api/honeypot` (+`/compile`,`/deploy`,`/traps`,`/tool-traps`,`/credential-traps`,`/traps/<id>`); `TrapClass` tokens; `honeypot_*` audit ops |

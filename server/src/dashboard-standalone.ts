@@ -79,6 +79,7 @@ import {
 import { readPersistedLocalAgents } from "./hub/agent-registry-persistence.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
 import { installConsentGatedRedactor } from "./intelligence/privacy-tier2-redactor.js";
+import { createCompiledContextRuntime } from "./compiled-context/runtime.js";
 import { DistressInbox } from "./distress/inbox.js";
 import { DistressListener } from "./distress/listener.js";
 import {
@@ -1273,6 +1274,13 @@ async function wireUnlockedDeps(args: {
   const hubIdentityId =
     identityManager.getPrimaryIdentityId() ??
     `fortress:${config.storage_path}`;
+  const compiledContextRuntime = createCompiledContextRuntime({
+    storage,
+    masterKey,
+    auditLog,
+    fortressId: fortressIdFromStoragePath(config.storage_path),
+    identityId: hubIdentityId,
+  });
   // WP-V1.2-5: construct + load the Intelligence Substrate Selector against
   // the unlocked fortress so the v1.1 dashboard's Intelligence panel has
   // a live config to render. Best-effort: any failure degrades to a
@@ -1288,6 +1296,7 @@ async function wireUnlockedDeps(args: {
       masterKey,
       auditLog,
       identityId: hubIdentityId,
+      compiledContextScanner: compiledContextRuntime.scanner,
     });
     await intelligenceSelector.load();
     // Rho-2.5: install the consent-gated Tier B PII redactor via THE
@@ -1328,6 +1337,7 @@ async function wireUnlockedDeps(args: {
     identityManager,
     policy,
     config,
+    sentinelFindingStore: compiledContextRuntime.findingStore,
     // Rho-2.5: report the truthful `effective_tier_b_enabled` on the
     // /api/query-anonymity/pii route.
     tierBPiiRedactorInstalled,

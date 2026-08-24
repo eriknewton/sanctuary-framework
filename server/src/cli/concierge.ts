@@ -20,6 +20,7 @@ import {
 } from "../concierge/index.js";
 import { SubstrateSelector } from "../intelligence/index.js";
 import { consumeFlagValue, unknownFlagWithPrefix } from "./argv.js";
+import { createCompiledContextRuntime } from "../compiled-context/runtime.js";
 
 export interface ConciergeCliArgs {
   argv: string[];
@@ -180,11 +181,19 @@ async function createLocalService(env: NodeJS.ProcessEnv): Promise<ConciergeServ
   if (!identity) throw new ConciergeReadError("no primary identity found");
   const stateStore = new StateStore(storage, masterKey);
   const auditLog = new AuditLog(storage, masterKey, { integrityMode: "strict" });
+  const compiledContextRuntime = createCompiledContextRuntime({
+    storage,
+    masterKey,
+    auditLog,
+    fortressId: config.storage_path,
+    identityId: identity.identity_id,
+  });
   const selector = new SubstrateSelector({
     storage,
     masterKey,
     auditLog,
     identityId: identity.identity_id,
+    compiledContextScanner: compiledContextRuntime.scanner,
   });
   await selector.load();
   const taskService = new TaskService({

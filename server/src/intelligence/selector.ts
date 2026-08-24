@@ -106,6 +106,11 @@ import type {
   IntelligenceSubstrateInvokedPayload,
   IntelligenceTier2BindingPinnedPayload,
 } from "../contracts/v1.2/intelligence-events.js";
+import { compileSubstrateContext } from "../compiled-context/compiler.js";
+import {
+  createUnwiredCompiledContextScanner,
+  type CompiledContextScanner,
+} from "../compiled-context/scanner.js";
 
 const DISABLED_CAPABILITY: SubstrateCapability = {
   summarize: false,
@@ -189,6 +194,12 @@ export interface SelectorConfig {
    * (Property 1) only.
    */
   tier3?: Tier3TransportConfig;
+  /**
+   * Shared final-artifact screening boundary. Production constructors must
+   * supply the dispatcher-wired scanner; the fallback still scans clean test
+   * traffic and fails closed if a finding needs the absent reporter.
+   */
+  compiledContextScanner?: CompiledContextScanner;
 }
 
 export class SubstrateSelector {
@@ -207,6 +218,7 @@ export class SubstrateSelector {
    * Drives the operator-visible degrade in `getOperatorVisibleStatus()`.
    */
   private recentFailures = new Map<Surface, RecentFailureEntry[]>();
+  private compiledContextScanner: CompiledContextScanner;
 
   /**
    * One-time-per-process latch for the tier-2 pin override audit event
@@ -218,6 +230,8 @@ export class SubstrateSelector {
     this.store = new IntelligenceConfigStore(cfg.storage, cfg.masterKey);
     this.auditLog = cfg.auditLog;
     this.identityId = cfg.identityId;
+    this.compiledContextScanner =
+      cfg.compiledContextScanner ?? createUnwiredCompiledContextScanner();
     this.redactor = cfg.redactor ?? IDENTITY_REDACTOR;
     // Rho-1 (WP-V1.x-QUERY-LAYER-ANONYMITY foundation): wrap the
     // substrate-client fetch with the Tier A header-strip transform.
@@ -271,6 +285,11 @@ export class SubstrateSelector {
       );
     });
     this.config = buildDefaultConfig();
+  }
+
+  /** Install the production dispatcher-wired scanner before any invocation. */
+  setCompiledContextScanner(scanner: CompiledContextScanner): void {
+    this.compiledContextScanner = scanner;
   }
 
   /**
@@ -775,6 +794,19 @@ export class SubstrateSelector {
     req: SummarizeRequest | ClassifyRequest | RedactRequest,
   ): Promise<SubstrateResponse> {
     await this.ensureLoaded();
+    const screened = await this.compiledContextScanner.screen(
+      compileSubstrateContext(surface, req),
+    );
+    if (
+      screened.outcome !== "clean" &&
+      screened.outcome !== "detector_disabled_by_policy"
+    ) {
+      return failureResponse(
+        "disabled",
+        "internal_error",
+        `compiled-context screening refused provider invocation (${screened.outcome})`,
+      );
+    }
     const startedAt = Date.now();
     const choice = this.effectiveChoice(surface);
     const handle = this.buildHandle(surface, choice);
