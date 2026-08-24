@@ -123,7 +123,20 @@ export {
   OllamaClient,
   LOCAL_CAPABILITY,
   type OllamaClientConfig,
+  type OllamaMutationResult,
+  type OllamaShowResult,
 } from "./substrates/local.js";
+
+export {
+  MODEL_REGISTRY_PROVIDER_CATEGORY,
+  renderLocalProvisioningPlan,
+  runLocalIntelligenceProvisioning,
+  type LocalProvisioningAuditEvent,
+  type LocalProvisioningOps,
+  type LocalProvisioningRefusalReason,
+  type LocalProvisioningResult,
+  type VerifiedProvisioningCommit,
+} from "./provisioning.js";
 
 export {
   VeniceClient,

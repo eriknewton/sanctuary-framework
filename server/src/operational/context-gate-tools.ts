@@ -229,7 +229,7 @@ export function createContextGateTools(
           rules: {
             type: "array",
             description:
-              "Array of rules. Each rule has: provider (inference|tool-api|logging|" +
+              "Array of rules. Each rule has: provider (inference|model-registry|tool-api|logging|" +
               "analytics|peer-agent|custom|*), allow (fields to pass through), " +
               "redact (fields to remove — highest priority), hash (fields to " +
               "replace with SHA-256 hash), summarize (fields to flag for compression).",
@@ -239,7 +239,7 @@ export function createContextGateTools(
                 provider: {
                   type: "string",
                   description:
-                    "Provider category: inference, tool-api, logging, analytics, " +
+                    "Provider category: inference, model-registry, tool-api, logging, analytics, " +
                     "peer-agent, custom, or * for all",
                 },
                 allow: {

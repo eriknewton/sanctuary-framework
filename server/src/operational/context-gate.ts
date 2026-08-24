@@ -41,6 +41,7 @@ import { hashToString } from "../core/hashing.js";
 /** Provider categories that context may flow to */
 export type ProviderCategory =
   | "inference"    // Remote LLM API calls (Claude, GPT, etc.)
+  | "model-registry" // Signed model-manifest-approved weight downloads
   | "tool-api"     // External tool/API calls (web search, database, etc.)
   | "logging"      // Telemetry and logging services
   | "analytics"    // Usage analytics and metrics

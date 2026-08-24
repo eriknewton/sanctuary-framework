@@ -95,6 +95,7 @@ import {
   runAutoProvisionForWrap,
   type AutoProvisionSummary,
 } from "./auto-provision.js";
+import { runLocalIntelligenceSetup } from "./local-intelligence.js";
 import {
   protectPreflightExitCode,
   renderProtectPreflightJson,
@@ -584,6 +585,8 @@ export interface WrapOptions {
    * flag passed) leaves the interactive prompt as the sole decision point.
    */
   provisionAgentAccount?: boolean;
+  /** Pre-answer local-model setup; a positive answer still requires a TTY confirm. */
+  provisionLocalIntelligence?: boolean;
   /**
    * Unified Protect Slice 5 S5-6: provision in FINE-GRAINED (exclusive-
    * egress) mode -- the agent's only sanctioned egress path becomes the
@@ -2484,6 +2487,43 @@ async function maybeRunAutoProvisionForWrap(
   return { summary, deferredSignal };
 }
 
+/**
+ * Run the same additive P1 ceremony used by `sanctuary init`. Any refusal is
+ * loud but cannot undo or fail the cooperative wrap that already completed.
+ */
+async function maybeRunLocalIntelligenceForWrap(
+  storage: FilesystemStorage,
+  masterKey: Uint8Array,
+  auditLog: AuditLog,
+  identityId: string,
+  options: WrapOptions,
+  deps: RunWrapDeps,
+): Promise<void> {
+  try {
+    const runner = deps.runLocalIntelligenceSetup ?? runLocalIntelligenceSetup;
+    const outcome = await runner({
+      storage,
+      masterKey,
+      auditLog,
+      identityId,
+      preAnswered: options.provisionLocalIntelligence,
+      isTty: process.stdin.isTTY === true,
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      print: (line) => console.error(`  ${line}`),
+    });
+    if (outcome.kind === "refused") {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(`  Local intelligence remains DEGRADED (${outcome.reason}).`);
+    }
+  } catch (err) {
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+    console.error(
+      `  Note: local intelligence setup did not complete (${err instanceof Error ? err.message : String(err)}); ` +
+        `the harness remains wrapped and local surfaces remain DEGRADED.`,
+    );
+  }
+}
+
 async function exitAfterDeferredAutoProvisionSignal(
   deferredSignal: NodeJS.Signals | undefined,
 ): Promise<void> {
@@ -2846,6 +2886,8 @@ export interface RunWrapDeps {
    * daemon-install / arm side effects.
    */
   runAutoProvisionForWrap?: typeof runAutoProvisionForWrap;
+  /** Override the shared P1 local-intelligence ceremony for tests. */
+  runLocalIntelligenceSetup?: typeof runLocalIntelligenceSetup;
   /**
    * Override the resolved OS platform used by the `--exclusive-egress` /
    * `--provision-agent-account` darwin-only refusal (for tests). Production
@@ -4630,6 +4672,17 @@ export async function runWrap(
     // arm the wall. Runs AFTER, never blocking, the cooperative wrap: a
     // decline / non-TTY skip / mid-flow abort here never reverts anything
     // already done above (fix H4 -- the cooperative wrap always completes).
+    if (ndAuditStorage && ndAuditMasterKey && ndAuditLog) {
+      await maybeRunLocalIntelligenceForWrap(
+        ndAuditStorage,
+        ndAuditMasterKey,
+        ndAuditLog,
+        localAgentRecord.agent_id,
+        options,
+        deps,
+      );
+      await ndAuditLog.flush();
+    }
     const autoProvisionRun = await maybeRunAutoProvisionForWrap(
       agentConfig,
       options,
@@ -4893,6 +4946,16 @@ export async function runWrap(
   // Auto-provision Step 2 (Build 1): see the matching call + comment in the
   // --no-dashboard branch above. Runs after the cooperative wrap (config +
   // identity + dashboard) has fully completed; never reverts it.
+  if (wrapAuditStorage && wrapAuditMasterKey && wrapAuditLog) {
+    await maybeRunLocalIntelligenceForWrap(
+      wrapAuditStorage,
+      wrapAuditMasterKey,
+      wrapAuditLog,
+      localAgentRecord.agent_id,
+      options,
+      deps,
+    );
+  }
   const autoProvisionRun = await maybeRunAutoProvisionForWrap(
     agentConfig,
     options,
@@ -6321,6 +6384,8 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--operator-custody",
   "--provision-agent-account",
   "--no-provision-agent-account",
+  "--provision-local-intelligence",
+  "--no-provision-local-intelligence",
   "--exclusive-egress",
   "--overwrite-destination",
   "--repair-egress-gate",
@@ -6441,6 +6506,12 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         break;
       case "--no-provision-agent-account":
         options.provisionAgentAccount = false;
+        break;
+      case "--provision-local-intelligence":
+        options.provisionLocalIntelligence = true;
+        break;
+      case "--no-provision-local-intelligence":
+        options.provisionLocalIntelligence = false;
         break;
       case "--exclusive-egress":
         options.exclusiveEgress = true;

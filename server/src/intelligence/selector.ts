@@ -300,6 +300,13 @@ export class SubstrateSelector {
   async load(): Promise<void> {
     const outcome = await this.store.load();
     this.config = outcome.config;
+    this.recentFailures.clear();
+    for (const surface of SURFACES) {
+      const persisted = this.config.provisioningFailures?.[surface] ?? [];
+      if (persisted.length > 0) {
+        this.recentFailures.set(surface, persisted.slice(-RECENT_FAILURES_CAP));
+      }
+    }
     this.loaded = true;
 
     const overriddenSurfaceCount = countOverriddenSurfaces(this.config);
@@ -632,6 +639,62 @@ export class SubstrateSelector {
    */
   getConfig(): SubstrateConfig {
     return this.config;
+  }
+
+  /**
+   * Persist a bounded, operator-safe provisioning refusal without changing
+   * the configured substrate. A failed local setup must remain local and
+   * visibly degraded; it never authorizes a Venice/frontier fallback.
+   */
+  async recordLocalProvisioningFailure(
+    surfaces: readonly Surface[],
+    failureClass: SubstrateFailureClass,
+    snippet: string,
+  ): Promise<void> {
+    await this.ensureLoaded();
+    const next = { ...(this.config.provisioningFailures ?? {}) };
+    const ts = new Date().toISOString();
+    for (const surface of surfaces) {
+      const entry: RecentFailureEntry = {
+        ts,
+        failureClass,
+        snippet: snippet.slice(0, FAILURE_SNIPPET_MAX_LEN),
+      };
+      const entries = [...(next[surface] ?? []), entry].slice(-RECENT_FAILURES_CAP);
+      next[surface] = entries;
+      this.recentFailures.set(surface, entries.slice());
+    }
+    this.config = { ...this.config, provisioningFailures: next };
+    await this.store.save(this.config);
+  }
+
+  /**
+   * Commit verified runtime tags only after the provisioning digest gate has
+   * passed for every referenced model. This mutates model bindings only; the
+   * operator's per-surface substrate choices remain byte-for-byte unchanged.
+   */
+  async markLocalModelsProvisioned(
+    runtimeTags: Readonly<Partial<Record<Surface, string>>>,
+  ): Promise<void> {
+    await this.ensureLoaded();
+    const customLocalModelTags = { ...(this.config.customLocalModelTags ?? {}) };
+    const provisioningFailures = { ...(this.config.provisioningFailures ?? {}) };
+    for (const surface of SURFACES) {
+      const runtimeTag = runtimeTags[surface];
+      if (runtimeTag === undefined) continue;
+      // The digest gate may bind only surfaces whose effective substrate is
+      // already local; verification never grants authority to change choice.
+      if (this.effectiveChoice(surface) !== "local") continue;
+      customLocalModelTags[surface] = runtimeTag;
+      delete provisioningFailures[surface];
+      this.recentFailures.delete(surface);
+    }
+    this.config = {
+      ...this.config,
+      customLocalModelTags,
+      provisioningFailures,
+    };
+    await this.store.save(this.config);
   }
 
   /**
