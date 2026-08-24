@@ -18,6 +18,7 @@
 import { describe, expect, it } from "vitest";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 import { assertSdwRawWriteAuthorized } from "../../src/sdw/write-gate.js";
 import { SdwValidationError } from "../../src/sdw/errors.js";
 
@@ -62,7 +63,7 @@ class MemoryStorage implements StorageBackend {
 }
 
 function makeAdapter(storage: MemoryStorage, ownerRef = "drill-archive"): SdwMemoryBackendAdapter {
-  return new SdwMemoryBackendAdapter({
+  return new TestSdwMemoryBackendAdapter({
     storage,
     masterKey: MASTER_KEY,
     fortressId: FORTRESS_ID,

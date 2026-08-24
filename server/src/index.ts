@@ -22,6 +22,10 @@ import { createDisclosureTools } from "./disclosure/tools.js";
 import { createReputationTools } from "./reputation/tools.js";
 import { loadPrincipalPolicy, MalformedPrincipalPolicyError } from "./principal-policy/loader.js";
 import type { IdentityManager } from "./cognitive/tools.js";
+import {
+  createPrimaryMemoryProvenancePublicKeyResolver,
+  createPrimaryMemoryProvenanceSigningHandleResolver,
+} from "./sdw/memory-provenance-signing.js";
 import type {
   ApprovalRequest,
   ApprovalResponse,
@@ -1526,6 +1530,8 @@ export async function createSanctuaryServer(options?: {
     masterKey,
     fortressId: fortressIdFromStoragePath(config.storage_path),
     ownerRef: "fleet-self",
+    resolvePrimarySigningHandle: createPrimaryMemoryProvenanceSigningHandleResolver(identityManager, masterKey),
+    resolveSignerPublicKey: createPrimaryMemoryProvenancePublicKeyResolver(identityManager),
   });
   // Fail-closed multi-agent isolation guard: the adapter above is bound to ONE
   // shared `fleet-self` owner scope reused for every caller, so SDW memory has
@@ -1554,6 +1560,7 @@ export async function createSanctuaryServer(options?: {
     adapter: sdwMemoryAdapter,
     auditLog,
     isolationGuard: sdwMemoryIsolationGuard,
+    currentAgentId: sdwMemoryIdentity,
   }).map((tool) =>
     tool.name === "memory_insert"
       ? {

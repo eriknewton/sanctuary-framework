@@ -40,6 +40,7 @@ import type {
   MemoryPassageInput,
 } from "../../src/sdw/adapters/memory-backend.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "../sdw/test-memory-backend.js";
 import {
   restoreMemoryTranscodeArchive,
   transcodeMemoryDirectory,
@@ -70,7 +71,7 @@ async function makeAdapter(input: {
   readonly storageRoot?: string;
 }): Promise<SdwMemoryBackendAdapter> {
   const root = input.storageRoot ?? await tempDir(input.prefix);
-  return new SdwMemoryBackendAdapter({
+  return new TestSdwMemoryBackendAdapter({
     storage: new FilesystemStorage(root),
     masterKey: new Uint8Array(32).fill(input.masterByte),
     fortressId: input.fortressId,
@@ -259,6 +260,22 @@ describe("Exit V2 SDW memory archive", () => {
     expect(putCalls).toBe(1);
     expect(capturedInputs).toHaveLength(5); // three files + completed manifest + signed lineage
     expect(capturedInputs.some((input) => input.tags?.includes("memory_transcode_lineage"))).toBe(true);
+    for (const input of capturedInputs) {
+      const provenance = await destination.getPassageProvenance(input.passage_id!);
+      expect(provenance.status).toBe("verified");
+      if (provenance.status !== "verified") throw new Error("expected verified V1 import provenance");
+      expect(provenance.companion.origin.body).toMatchObject({
+        author_agent_id: "unknown_legacy",
+        ingress_channel: "legacy_unknown",
+        source_class: "legacy_unattested",
+      });
+      expect(provenance.companion.admission.body).toMatchObject({
+        admission_channel: "exit_v2_import",
+        origin_trust_tier: "legacy_unattested",
+        verification_basis: "exit_v2_legacy_v1",
+      });
+      expect(provenance.companion.admission.body.origin_trust_tier).not.toBe("local_attested");
+    }
 
     const restoredParent = await tempDir("exit-v2-restored");
     const restoredDir = join(restoredParent, "source");

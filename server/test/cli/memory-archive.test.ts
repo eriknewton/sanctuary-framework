@@ -41,6 +41,7 @@ import type {
   ApprovalResponse,
 } from "../../src/principal-policy/types.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../../src/sdw/memory-provenance-signing.js";
 import { ingestClaudeCodeMemoryDirectory } from "../../src/sdw/adapters/claude-code-file-adapter.js";
 import { transcodeMemoryDirectory } from "../../src/sdw/memory-transcode.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
@@ -167,12 +168,7 @@ async function fortress(prefix: string, ownerRef: string, withArchive: boolean):
   await waitForPrimaryIdentityPointer(storage);
   if (!withArchive) return { path, storage, masterKey };
 
-  const adapter = new SdwMemoryBackendAdapter({
-    storage,
-    masterKey,
-    fortressId: fortressId(path),
-    ownerRef,
-  });
+  const adapter = await productionAdapter(storage, masterKey, fortressId(path), ownerRef);
   await ingestClaudeCodeMemoryDirectory(adapter, FIXTURE_ROOT);
   const projectionParent = await tempDir(`${prefix}-projection`);
   const transcoded = await transcodeMemoryDirectory(
@@ -182,6 +178,24 @@ async function fortress(prefix: string, ownerRef: string, withArchive: boolean):
     join(projectionParent, "projection"),
   );
   return { path, storage, masterKey, archiveId: transcoded.archive_id };
+}
+
+async function productionAdapter(
+  storage: FilesystemStorage,
+  masterKey: Uint8Array,
+  boundFortressId: string,
+  ownerRef: string,
+): Promise<SdwMemoryBackendAdapter> {
+  const identities = new IdentityManager(storage, masterKey);
+  await identities.load();
+  return new SdwMemoryBackendAdapter({
+    storage,
+    masterKey,
+    fortressId: boundFortressId,
+    ownerRef,
+    resolvePrimarySigningHandle: createPrimaryMemoryProvenanceSigningHandleResolver(identities, masterKey),
+    resolveSignerPublicKey: createPrimaryMemoryProvenancePublicKeyResolver(identities),
+  });
 }
 
 async function waitForPrimaryIdentityPointer(storage: FilesystemStorage): Promise<void> {
@@ -405,18 +419,8 @@ describe("Exit V2 memory archive CLI", () => {
       approval_audit_id: importApprovalAuditId,
       normalized_args_hash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
     });
-    const otherOwner = new SdwMemoryBackendAdapter({
-      storage: destination.storage,
-      masterKey: destination.masterKey,
-      fortressId: fortressId(destination.path),
-      ownerRef: "owner-b",
-    });
-    const destinationOwner = new SdwMemoryBackendAdapter({
-      storage: destination.storage,
-      masterKey: destination.masterKey,
-      fortressId: fortressId(destination.path),
-      ownerRef: "owner-a",
-    });
+    const otherOwner = await productionAdapter(destination.storage, destination.masterKey, fortressId(destination.path), "owner-b");
+    const destinationOwner = await productionAdapter(destination.storage, destination.masterKey, fortressId(destination.path), "owner-a");
     expect(await destinationOwner.countPassages()).toBeGreaterThan(0);
     expect(await otherOwner.countPassages()).toBe(0);
   }, 60_000);
@@ -438,12 +442,7 @@ describe("Exit V2 memory archive CLI", () => {
     expect(code).toBe(1);
     expect(out.text()).toBe("");
     expect(err.text()).toContain("local OS approval dialog");
-    const adapter = new SdwMemoryBackendAdapter({
-      storage: destination.storage,
-      masterKey: destination.masterKey,
-      fortressId: fortressId(destination.path),
-      ownerRef: "owner-a",
-    });
+    const adapter = await productionAdapter(destination.storage, destination.masterKey, fortressId(destination.path), "owner-a");
     expect(await adapter.countPassages()).toBe(0);
   }, 60_000);
 
@@ -468,12 +467,7 @@ describe("Exit V2 memory archive CLI", () => {
       expect(`${out.text()}${err.text()}`).not.toContain(
         Buffer.from(terminal.hiddenValue).toString("ascii"),
       );
-      const adapter = new SdwMemoryBackendAdapter({
-        storage: destination.storage,
-        masterKey: destination.masterKey,
-        fortressId: fortressId(destination.path),
-        ownerRef,
-      });
+      const adapter = await productionAdapter(destination.storage, destination.masterKey, fortressId(destination.path), ownerRef);
       expect(await adapter.countPassages()).toBe(0);
       expect(await treeSnapshot(destination.path)).toEqual(destinationBefore);
     }
@@ -499,12 +493,7 @@ describe("Exit V2 memory archive CLI", () => {
       });
       expect(code).toBe(1);
       expect(terminal.hiddenReads).toBe(1);
-      const adapter = new SdwMemoryBackendAdapter({
-        storage: deniedDestination.storage,
-        masterKey: deniedDestination.masterKey,
-        fortressId: fortressId(deniedDestination.path),
-        ownerRef: "owner-a",
-      });
+      const adapter = await productionAdapter(deniedDestination.storage, deniedDestination.masterKey, fortressId(deniedDestination.path), "owner-a");
       expect(await adapter.countPassages()).toBe(0);
     }
   }, 60_000);
@@ -540,12 +529,7 @@ describe("Exit V2 memory archive CLI", () => {
     // The import itself must have durably committed despite the later
     // failure, proving this exercised the post-commit branch and not a
     // pre-commit failure that happens to share the same exit code.
-    const adapter = new SdwMemoryBackendAdapter({
-      storage: destination.storage,
-      masterKey: destination.masterKey,
-      fortressId: fortressId(destination.path),
-      ownerRef: "owner-a",
-    });
+    const adapter = await productionAdapter(destination.storage, destination.masterKey, fortressId(destination.path), "owner-a");
     expect(await adapter.countPassages()).toBeGreaterThan(0);
   }, 60_000);
 

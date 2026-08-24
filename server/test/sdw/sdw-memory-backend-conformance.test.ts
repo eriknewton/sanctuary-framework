@@ -2,6 +2,7 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { conformanceKitForMemoryBackendAdapter } from "./memory-backend-conformance.js";
 
@@ -13,7 +14,7 @@ conformanceKitForMemoryBackendAdapter(
   async () => {
     const storagePath = await mkdtemp(join(tmpdir(), "sdw-memory-conformance-"));
     const storage = new FilesystemStorage(storagePath);
-    const adapter = new SdwMemoryBackendAdapter({
+    const adapter = new TestSdwMemoryBackendAdapter({
       storage,
       masterKey: MASTER_KEY,
       fortressId: FORTRESS_ID,

@@ -33,6 +33,7 @@ import {
   passageContentHash,
   SdwMemoryBackendAdapter,
 } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 
 const FORTRESS_ID = "fortress:test";
 const MASTER_KEY = new Uint8Array(32).fill(7);
@@ -392,7 +393,7 @@ ${VALID_TXN_WRITE}
       // module-private WeakMap, so it must never verify.
       const storage = new MemoryStorage();
       const masterKey = new Uint8Array(32).fill(9);
-      const adapter = new SdwMemoryBackendAdapter({
+      const adapter = new TestSdwMemoryBackendAdapter({
         storage,
         masterKey,
         fortressId: "fortress:fake-token-test",
