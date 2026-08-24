@@ -152,14 +152,19 @@ export const MODEL_PRESETS = {
   }),
 
   /**
-   * Qwen 3.5 via local inference (open weights, proprietary training)
+   * Qwen 3.5 via local inference (open weights, exact license unverified).
+   *
+   * This preset does not identify an upstream artifact precisely enough to
+   * prove which size-specific Qwen terms apply. `unknown` is deliberately
+   * narrower than the previous blanket Apache-2.0 assertion; a verified model
+   * manifest supplies the exact upstream license for provisioned models.
    */
   qwen35Local: (): ModelProvenance => ({
     model_id: "qwen-3.5-35b",
     model_name: "Qwen 3.5 35B",
     model_version: "3.5",
     provider: "Alibaba Cloud",
-    license: "Apache-2.0",
+    license: "unknown",
     open_weights: true,
     open_source: false,
     local_inference: true,
@@ -167,16 +172,16 @@ export const MODEL_PRESETS = {
   }),
 
   /**
-   * Llama 3.3 70B via local inference (open weights and code)
+   * Llama 3.3 70B via local inference (open weights, not OSI open-source).
    */
   llama33Local: (): ModelProvenance => ({
     model_id: "llama-3.3-70b-instruct",
     model_name: "Llama 3.3 70B Instruct",
     model_version: "3.3",
     provider: "Meta",
-    license: "Apache-2.0",
+    license: "Llama Community License",
     open_weights: true,
-    open_source: true,
+    open_source: false,
     local_inference: true,
     declared_at: new Date().toISOString(),
   }),
