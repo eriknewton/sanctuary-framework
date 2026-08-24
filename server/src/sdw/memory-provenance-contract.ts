@@ -37,7 +37,11 @@ export const MEMORY_ORIGIN_FORMAT =
   "SANCTUARY_SDW_MEMORY_ORIGIN_V1" as const;
 export const MEMORY_ADMISSION_FORMAT =
   "SANCTUARY_SDW_MEMORY_ADMISSION_V1" as const;
+export const MEMORY_EXTERNAL_SOURCE_REF_FORMAT =
+  "SANCTUARY_SDW_MEMORY_EXTERNAL_SOURCE_REF_V1" as const;
 export const MEMORY_SIGNATURE_SCHEME = "ed25519-v1" as const;
+export const DISCLOSURE_CAPSULE_RETURN_AUTHOR_AGENT_ID =
+  "system:disclosure-capsule-return" as const;
 
 /** Must match the two entries in core/signing-domains.ts exactly. */
 export const MEMORY_ORIGIN_SIGNING_DOMAIN =
@@ -140,6 +144,7 @@ export const MEMORY_INGRESS_CHANNELS = [
   "legacy_migration",
   "legacy_unknown",
   "fleet_sync",
+  "disclosure_capsule_return",
 ] as const;
 export type MemoryIngressChannel = (typeof MEMORY_INGRESS_CHANNELS)[number];
 
@@ -157,6 +162,9 @@ export const MEMORY_SOURCE_CLASSES = [
   "exit_lineage",
   "legacy_unattested",
   "fleet_sync_lineage",
+  "provider_return_locally_observed",
+  "tool_return_locally_observed",
+  "peer_return_signed",
 ] as const;
 export type MemorySourceClass = (typeof MEMORY_SOURCE_CLASSES)[number];
 
@@ -182,10 +190,94 @@ export const MEMORY_INGRESS_SOURCE_PAIRS = {
   legacy_migration: ["legacy_unattested"],
   legacy_unknown: ["legacy_unattested"],
   fleet_sync: ["fleet_sync_lineage"],
+  disclosure_capsule_return: [
+    "provider_return_locally_observed",
+    "tool_return_locally_observed",
+    "peer_return_signed",
+  ],
 } as const satisfies Record<
   MemoryIngressChannel,
   readonly MemorySourceClass[]
 >;
+
+export const MEMORY_EXTERNAL_DESTINATION_CLASSES = [
+  "provider_inference",
+  "external_tool",
+  "peer_agent",
+] as const;
+export type MemoryExternalDestinationClass =
+  (typeof MEMORY_EXTERNAL_DESTINATION_CLASSES)[number];
+
+export const MEMORY_EXTERNAL_EVIDENCE_BASES = [
+  "local_tls_transport_observation",
+  "destination_signature",
+  "peer_signature",
+] as const;
+export type MemoryExternalEvidenceBasis =
+  (typeof MEMORY_EXTERNAL_EVIDENCE_BASES)[number];
+
+interface MemoryExternalSourceRefBaseV1 {
+  readonly format: typeof MEMORY_EXTERNAL_SOURCE_REF_FORMAT;
+  readonly capsule_artifact_id: `dcap1_${string}`;
+  readonly capsule_return_artifact_id: `dcret1_${string}`;
+  readonly destination_id: string;
+  /** Lowercase SHA-256 of the exact transport or verified-signature evidence object. */
+  readonly evidence_sha256: string;
+}
+
+export type MemoryExternalSourceRefV1 =
+  | (MemoryExternalSourceRefBaseV1 & {
+      readonly destination_class: "provider_inference" | "external_tool";
+      readonly evidence_basis: "local_tls_transport_observation";
+      readonly remote_signer_did?: never;
+    })
+  | (MemoryExternalSourceRefBaseV1 & {
+      readonly destination_class: "provider_inference" | "external_tool";
+      readonly evidence_basis: "destination_signature";
+      readonly remote_signer_did: string;
+    })
+  | (MemoryExternalSourceRefBaseV1 & {
+      readonly destination_class: "peer_agent";
+      readonly evidence_basis: "peer_signature";
+      readonly remote_signer_did: string;
+    });
+
+export interface MemoryExternalSourceTriple {
+  readonly source_class:
+    | "provider_return_locally_observed"
+    | "tool_return_locally_observed"
+    | "peer_return_signed";
+  readonly destination_class: MemoryExternalDestinationClass;
+  readonly evidence_basis: MemoryExternalEvidenceBasis;
+}
+
+export const MEMORY_EXTERNAL_SOURCE_TRIPLES: readonly MemoryExternalSourceTriple[] = [
+  {
+    source_class: "provider_return_locally_observed",
+    destination_class: "provider_inference",
+    evidence_basis: "local_tls_transport_observation",
+  },
+  {
+    source_class: "provider_return_locally_observed",
+    destination_class: "provider_inference",
+    evidence_basis: "destination_signature",
+  },
+  {
+    source_class: "tool_return_locally_observed",
+    destination_class: "external_tool",
+    evidence_basis: "local_tls_transport_observation",
+  },
+  {
+    source_class: "tool_return_locally_observed",
+    destination_class: "external_tool",
+    evidence_basis: "destination_signature",
+  },
+  {
+    source_class: "peer_return_signed",
+    destination_class: "peer_agent",
+    evidence_basis: "peer_signature",
+  },
+] as const;
 
 /**
  * Rule-7 credibility contract. Consumers may make these conclusions and no
@@ -198,6 +290,10 @@ export const MEMORY_PROVENANCE_CREDIBILITY = Object.freeze({
     "The origin fortress says the record crossed the named code-owned ingress; this does not authenticate upstream data.",
   source_class:
     "The origin fortress says its adapter or classifier selected the named closed class; this does not prove the class is true or the content is safe.",
+  locally_observed_return:
+    "A *_locally_observed source class means only that the local fortress observed these bytes through the configured adapter; it is not proof of remote authorship, content truth, inference, retention behavior, or safety.",
+  external_source_ref:
+    "The signed external reference binds the capsule, return, destination, and exact evidence digest; it does not upgrade locally observed evidence into remote authorship or content truth.",
   recorded_at:
     "The origin fortress key holder asserted this time; freshness and clock accuracy remain relying-party policy.",
   origin_subject:
@@ -208,21 +304,68 @@ export const MEMORY_PROVENANCE_CREDIBILITY = Object.freeze({
     "A valid Ed25519 signature proves only that the holder of the resolved key signed these exact bytes.",
 } as const);
 
-export interface MemoryOriginBody {
+interface MemoryOriginBodyBase {
   readonly format: typeof MEMORY_ORIGIN_FORMAT;
   readonly origin_fortress_id: string;
   readonly owner_ref: string;
   readonly passage_id: string;
   readonly content_hash: string;
   readonly chunk_count: number;
-  readonly author_agent_id: string;
-  readonly ingress_channel: MemoryIngressChannel;
-  readonly source_class: MemorySourceClass;
   readonly recorded_at: string;
   readonly signer_identity_id: string;
   readonly signer_did: string;
   readonly signature_scheme: typeof MEMORY_SIGNATURE_SCHEME;
 }
+
+type ExistingMemoryIngressChannel = Exclude<
+  MemoryIngressChannel,
+  "disclosure_capsule_return"
+>;
+type ExistingMemorySourceClass = Exclude<
+  MemorySourceClass,
+  | "provider_return_locally_observed"
+  | "tool_return_locally_observed"
+  | "peer_return_signed"
+>;
+
+export type MemoryOriginBody =
+  | (MemoryOriginBodyBase & {
+      readonly author_agent_id: string;
+      readonly ingress_channel: ExistingMemoryIngressChannel;
+      readonly source_class: ExistingMemorySourceClass;
+      readonly external_source_ref?: never;
+    })
+  | (MemoryOriginBodyBase & {
+      readonly author_agent_id: typeof DISCLOSURE_CAPSULE_RETURN_AUTHOR_AGENT_ID;
+      readonly ingress_channel: "disclosure_capsule_return";
+      readonly source_class: "provider_return_locally_observed";
+      readonly external_source_ref: MemoryExternalSourceRefV1 & {
+        readonly destination_class: "provider_inference";
+        readonly evidence_basis:
+          | "local_tls_transport_observation"
+          | "destination_signature";
+      };
+    })
+  | (MemoryOriginBodyBase & {
+      readonly author_agent_id: typeof DISCLOSURE_CAPSULE_RETURN_AUTHOR_AGENT_ID;
+      readonly ingress_channel: "disclosure_capsule_return";
+      readonly source_class: "tool_return_locally_observed";
+      readonly external_source_ref: MemoryExternalSourceRefV1 & {
+        readonly destination_class: "external_tool";
+        readonly evidence_basis:
+          | "local_tls_transport_observation"
+          | "destination_signature";
+      };
+    })
+  | (MemoryOriginBodyBase & {
+      readonly author_agent_id: typeof DISCLOSURE_CAPSULE_RETURN_AUTHOR_AGENT_ID;
+      readonly ingress_channel: "disclosure_capsule_return";
+      readonly source_class: "peer_return_signed";
+      readonly external_source_ref: MemoryExternalSourceRefV1 & {
+        readonly destination_class: "peer_agent";
+        readonly evidence_basis: "peer_signature";
+      };
+    });
 
 export interface SignedMemoryOrigin {
   readonly body: MemoryOriginBody;
@@ -278,6 +421,7 @@ export type MemoryProvenanceFailureCode =
   | "invalid_public_key_length"
   | "invalid_signature_length"
   | "ingress_source_pair_invalid"
+  | "external_source_ref_invalid"
   | "admission_triple_invalid"
   | "transfer_lineage_invalid"
   | "signer_did_key_mismatch"
@@ -309,17 +453,40 @@ export interface MemoryProvenanceSigningHandle {
   sign(bytes: Uint8Array): Uint8Array;
 }
 
-export interface MemoryOriginInput {
+interface MemoryOriginInputBase {
   readonly origin_fortress_id: string;
   readonly owner_ref: string;
   readonly passage_id: string;
   readonly content_hash: string;
   readonly chunk_count: number;
-  readonly author_agent_id: string;
-  readonly ingress_channel: MemoryIngressChannel;
-  readonly source_class: MemorySourceClass;
   readonly recorded_at: string;
 }
+
+export type MemoryOriginInput =
+  | (MemoryOriginInputBase & {
+      readonly author_agent_id: string;
+      readonly ingress_channel: ExistingMemoryIngressChannel;
+      readonly source_class: ExistingMemorySourceClass;
+      readonly external_source_ref?: never;
+    })
+  | (MemoryOriginInputBase & {
+      readonly author_agent_id: typeof DISCLOSURE_CAPSULE_RETURN_AUTHOR_AGENT_ID;
+      readonly ingress_channel: "disclosure_capsule_return";
+      readonly source_class: "provider_return_locally_observed";
+      readonly external_source_ref: Extract<MemoryOriginBody, { readonly source_class: "provider_return_locally_observed" }>["external_source_ref"];
+    })
+  | (MemoryOriginInputBase & {
+      readonly author_agent_id: typeof DISCLOSURE_CAPSULE_RETURN_AUTHOR_AGENT_ID;
+      readonly ingress_channel: "disclosure_capsule_return";
+      readonly source_class: "tool_return_locally_observed";
+      readonly external_source_ref: Extract<MemoryOriginBody, { readonly source_class: "tool_return_locally_observed" }>["external_source_ref"];
+    })
+  | (MemoryOriginInputBase & {
+      readonly author_agent_id: typeof DISCLOSURE_CAPSULE_RETURN_AUTHOR_AGENT_ID;
+      readonly ingress_channel: "disclosure_capsule_return";
+      readonly source_class: "peer_return_signed";
+      readonly external_source_ref: Extract<MemoryOriginBody, { readonly source_class: "peer_return_signed" }>["external_source_ref"];
+    });
 
 export interface MemoryAdmissionInput {
   readonly origin_provenance_digest: string;
@@ -369,10 +536,21 @@ const ORIGIN_BODY_KEYS = [
   "author_agent_id",
   "ingress_channel",
   "source_class",
+  "external_source_ref",
   "recorded_at",
   "signer_identity_id",
   "signer_did",
   "signature_scheme",
+] as const;
+const EXTERNAL_SOURCE_REF_KEYS = [
+  "format",
+  "capsule_artifact_id",
+  "capsule_return_artifact_id",
+  "destination_class",
+  "destination_id",
+  "evidence_basis",
+  "remote_signer_did",
+  "evidence_sha256",
 ] as const;
 const ADMISSION_BODY_KEYS = [
   "format",
@@ -457,6 +635,21 @@ function parseDid(value: unknown, path: string): MemoryProvenanceResult<string> 
   return { ok: true, value };
 }
 
+function parseRemoteDid(
+  value: unknown,
+  path: string,
+): MemoryProvenanceResult<string> {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 256 ||
+    !/^did:[a-z0-9]+:[A-Za-z0-9._:%-]+(?::[A-Za-z0-9._:%-]+)*$/.test(value)
+  ) {
+    return failure("invalid_identifier", path, "Expected a bounded remote DID");
+  }
+  return { ok: true, value };
+}
+
 function decodeFixedBase64url(
   value: unknown,
   byteLength: number,
@@ -495,6 +688,24 @@ function parseProvenanceDigest(
     );
   }
   return { ok: true, value };
+}
+
+function parsePrefixedSha256ArtifactId<Prefix extends "dcap1_" | "dcret1_">(
+  value: unknown,
+  prefix: Prefix,
+  path: string,
+): MemoryProvenanceResult<`${Prefix}${string}`> {
+  if (typeof value !== "string" || !value.startsWith(prefix)) {
+    return failure("invalid_identifier", path, `Expected a ${prefix} SHA-256 artifact id`);
+  }
+  const digest = decodeFixedBase64url(
+    value.slice(prefix.length),
+    32,
+    path,
+    "invalid_hash",
+  );
+  if (!digest.ok) return digest;
+  return { ok: true, value: value as `${Prefix}${string}` };
 }
 
 function parseTimestamp(
@@ -542,8 +753,123 @@ export function isAllowedMemoryAdmissionTriple(
   );
 }
 
+export function isAllowedMemoryExternalSourceTriple(
+  triple: MemoryExternalSourceTriple,
+): boolean {
+  return MEMORY_EXTERNAL_SOURCE_TRIPLES.some(
+    (allowed) =>
+      allowed.source_class === triple.source_class &&
+      allowed.destination_class === triple.destination_class &&
+      allowed.evidence_basis === triple.evidence_basis,
+  );
+}
+
+function parseMemoryExternalSourceRef(
+  value: unknown,
+): MemoryProvenanceResult<MemoryExternalSourceRefV1> {
+  const object = exactObject(
+    value,
+    EXTERNAL_SOURCE_REF_KEYS,
+    "origin.body.external_source_ref",
+    ["remote_signer_did"],
+  );
+  if (!object.ok) return object;
+  const record = object.value;
+  if (record.format !== MEMORY_EXTERNAL_SOURCE_REF_FORMAT) {
+    return failure(
+      "invalid_literal",
+      "origin.body.external_source_ref.format",
+      "Unsupported external source reference format",
+    );
+  }
+  const capsuleId = parsePrefixedSha256ArtifactId(
+    record.capsule_artifact_id,
+    "dcap1_",
+    "origin.body.external_source_ref.capsule_artifact_id",
+  );
+  if (!capsuleId.ok) return capsuleId;
+  const returnId = parsePrefixedSha256ArtifactId(
+    record.capsule_return_artifact_id,
+    "dcret1_",
+    "origin.body.external_source_ref.capsule_return_artifact_id",
+  );
+  if (!returnId.ok) return returnId;
+  if (!includesLiteral(MEMORY_EXTERNAL_DESTINATION_CLASSES, record.destination_class)) {
+    return failure(
+      "invalid_literal",
+      "origin.body.external_source_ref.destination_class",
+      "Unknown external destination class",
+    );
+  }
+  const destination = parseIdentifier(
+    record.destination_id,
+    "origin.body.external_source_ref.destination_id",
+  );
+  if (!destination.ok) return destination;
+  if (!includesLiteral(MEMORY_EXTERNAL_EVIDENCE_BASES, record.evidence_basis)) {
+    return failure(
+      "invalid_literal",
+      "origin.body.external_source_ref.evidence_basis",
+      "Unknown external evidence basis",
+    );
+  }
+  const evidenceDigest = parseProvenanceDigest(
+    record.evidence_sha256,
+    "origin.body.external_source_ref.evidence_sha256",
+  );
+  if (!evidenceDigest.ok) return evidenceDigest;
+  const signatureEvidence =
+    record.evidence_basis === "destination_signature" ||
+    record.evidence_basis === "peer_signature";
+  if (signatureEvidence) {
+    const signer = parseRemoteDid(
+      record.remote_signer_did,
+      "origin.body.external_source_ref.remote_signer_did",
+    );
+    if (!signer.ok) {
+      return failure(
+        "external_source_ref_invalid",
+        "origin.body.external_source_ref.remote_signer_did",
+        "Signature evidence requires a bounded remote signer DID",
+      );
+    }
+  } else if (Object.hasOwn(record, "remote_signer_did")) {
+    return failure(
+      "external_source_ref_invalid",
+      "origin.body.external_source_ref.remote_signer_did",
+      "Local transport observation must not claim a remote signer",
+    );
+  }
+  if (
+    record.destination_class === "peer_agent" &&
+    record.evidence_basis !== "peer_signature"
+  ) {
+    return failure(
+      "external_source_ref_invalid",
+      "origin.body.external_source_ref",
+      "Peer destinations require peer-signature evidence",
+    );
+  }
+  if (
+    record.destination_class !== "peer_agent" &&
+    record.evidence_basis === "peer_signature"
+  ) {
+    return failure(
+      "external_source_ref_invalid",
+      "origin.body.external_source_ref",
+      "Provider and tool destinations cannot claim peer-signature evidence",
+    );
+  }
+  return { ok: true, value: record as unknown as MemoryExternalSourceRefV1 };
+}
+
 function parseOriginBody(value: unknown): MemoryProvenanceResult<MemoryOriginBody> {
-  const object = exactObject(value, ORIGIN_BODY_KEYS, "origin.body");
+  const object = exactObject(
+    value,
+    ORIGIN_BODY_KEYS,
+    "origin.body",
+    ["external_source_ref"],
+  );
   if (!object.ok) return object;
   const record = object.value;
   if (record.format !== MEMORY_ORIGIN_FORMAT) {
@@ -583,6 +909,46 @@ function parseOriginBody(value: unknown): MemoryProvenanceResult<MemoryOriginBod
       "origin.body",
       "Ingress channel and source class are not an allowed pair",
     );
+  }
+  const isExternalReturn = record.ingress_channel === "disclosure_capsule_return";
+  if (!isExternalReturn) {
+    if (Object.hasOwn(record, "external_source_ref")) {
+      return failure(
+        "external_source_ref_invalid",
+        "origin.body.external_source_ref",
+        "Existing ingress/source rows must not carry an external source reference",
+      );
+    }
+  } else {
+    if (record.author_agent_id !== DISCLOSURE_CAPSULE_RETURN_AUTHOR_AGENT_ID) {
+      return failure(
+        "external_source_ref_invalid",
+        "origin.body.author_agent_id",
+        "Disclosure-capsule returns require the code-owned author literal",
+      );
+    }
+    if (!Object.hasOwn(record, "external_source_ref")) {
+      return failure(
+        "external_source_ref_invalid",
+        "origin.body.external_source_ref",
+        "Disclosure-capsule returns require a signed external source reference",
+      );
+    }
+    const externalRef = parseMemoryExternalSourceRef(record.external_source_ref);
+    if (!externalRef.ok) return externalRef;
+    if (
+      !isAllowedMemoryExternalSourceTriple({
+        source_class: record.source_class as MemoryExternalSourceTriple["source_class"],
+        destination_class: externalRef.value.destination_class,
+        evidence_basis: externalRef.value.evidence_basis,
+      })
+    ) {
+      return failure(
+        "external_source_ref_invalid",
+        "origin.body.external_source_ref",
+        "Source class, destination class, and evidence basis are not an allowed triple",
+      );
+    }
   }
   const recordedAt = parseTimestamp(record.recorded_at, "origin.body.recorded_at");
   if (!recordedAt.ok) return recordedAt;
@@ -874,7 +1240,7 @@ export function signMemoryOrigin(
 ): MemoryProvenanceResult<SignedMemoryOrigin> {
   const handle = validateSigningHandle(signer);
   if (!handle.ok) return handle;
-  const bodyCandidate: MemoryOriginBody = {
+  const bodyCandidate = {
     format: MEMORY_ORIGIN_FORMAT,
     ...input,
     signer_identity_id: signer.identity_id,

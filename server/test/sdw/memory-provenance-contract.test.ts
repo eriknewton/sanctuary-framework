@@ -14,8 +14,11 @@ import { hash } from "../../src/core/hashing.js";
 import { canonicalizeToBytes } from "../../src/mesh/canonical-json.js";
 import {
   MAX_MEMORY_PROVENANCE_COMPANION_BYTES,
+  DISCLOSURE_CAPSULE_RETURN_AUTHOR_AGENT_ID,
   MEMORY_ADMISSION_CHANNELS,
   MEMORY_ADMISSION_SIGNING_DOMAIN,
+  MEMORY_EXTERNAL_DESTINATION_CLASSES,
+  MEMORY_EXTERNAL_EVIDENCE_BASES,
   MEMORY_INGRESS_CHANNELS,
   MEMORY_ORIGIN_SIGNING_DOMAIN,
   MEMORY_ORIGIN_TRUST_TIERS,
@@ -25,6 +28,7 @@ import {
   createBoundedMemoryProvenanceSignerResolver,
   createMemoryProvenanceCompanion,
   isAllowedMemoryAdmissionTriple,
+  isAllowedMemoryExternalSourceTriple,
   isAllowedMemoryIngressSourcePair,
   memoryAdmissionSigningBytes,
   memoryOriginSigningBytes,
@@ -39,6 +43,7 @@ import {
   type MemoryProvenanceSigningHandle,
   type MemoryAdmissionInput,
   type MemoryOriginInput,
+  type MemoryExternalSourceRefV1,
 } from "../../src/sdw/memory-provenance-contract.js";
 
 const ORIGIN_SEED = new Uint8Array(32).fill(1);
@@ -62,6 +67,8 @@ function signer(
 const originSigner = signer("origin-signer", ORIGIN_SEED);
 const admissionSigner = signer("admission-signer", ADMISSION_SEED);
 const contentHash = toBase64url(new Uint8Array(32).fill(3));
+const capsuleArtifactId = `dcap1_${toBase64url(new Uint8Array(32).fill(4))}` as const;
+const capsuleReturnArtifactId = `dcret1_${toBase64url(new Uint8Array(32).fill(5))}` as const;
 
 const EXPECTED_INGRESS_SOURCE_PAIRS = new Set([
   "memory_insert/user_content",
@@ -81,6 +88,17 @@ const EXPECTED_INGRESS_SOURCE_PAIRS = new Set([
   "legacy_migration/legacy_unattested",
   "legacy_unknown/legacy_unattested",
   "fleet_sync/fleet_sync_lineage",
+  "disclosure_capsule_return/provider_return_locally_observed",
+  "disclosure_capsule_return/tool_return_locally_observed",
+  "disclosure_capsule_return/peer_return_signed",
+]);
+
+const EXPECTED_EXTERNAL_SOURCE_TRIPLES = new Set([
+  "provider_return_locally_observed/provider_inference/local_tls_transport_observation",
+  "provider_return_locally_observed/provider_inference/destination_signature",
+  "tool_return_locally_observed/external_tool/local_tls_transport_observation",
+  "tool_return_locally_observed/external_tool/destination_signature",
+  "peer_return_signed/peer_agent/peer_signature",
 ]);
 
 const EXPECTED_ADMISSION_TRIPLES = new Set([
@@ -146,6 +164,51 @@ function buildCompanion(): MemoryProvenanceCompanion {
       admissionSigner,
     ),
   );
+}
+
+function externalRef(
+  destination_class: "provider_inference" | "external_tool" | "peer_agent",
+  evidence_basis:
+    | "local_tls_transport_observation"
+    | "destination_signature"
+    | "peer_signature",
+): MemoryExternalSourceRefV1 {
+  return {
+    format: "SANCTUARY_SDW_MEMORY_EXTERNAL_SOURCE_REF_V1",
+    capsule_artifact_id: capsuleArtifactId,
+    capsule_return_artifact_id: capsuleReturnArtifactId,
+    destination_class,
+    destination_id: "destination-001",
+    evidence_basis,
+    ...(evidence_basis === "local_tls_transport_observation"
+      ? {}
+      : { remote_signer_did: originSigner.did }),
+    evidence_sha256: "06".repeat(32),
+  } as MemoryExternalSourceRefV1;
+}
+
+function validExternalInput(
+  source_class:
+    | "provider_return_locally_observed"
+    | "tool_return_locally_observed"
+    | "peer_return_signed",
+): MemoryOriginInput {
+  const destination = source_class === "provider_return_locally_observed"
+    ? "provider_inference"
+    : source_class === "tool_return_locally_observed"
+      ? "external_tool"
+      : "peer_agent";
+  const basis = source_class === "peer_return_signed"
+    ? "peer_signature"
+    : "local_tls_transport_observation";
+  return {
+    ...expected.origin,
+    author_agent_id: DISCLOSURE_CAPSULE_RETURN_AUTHOR_AGENT_ID,
+    ingress_channel: "disclosure_capsule_return",
+    source_class,
+    external_source_ref: externalRef(destination, basis),
+    recorded_at: "2026-08-24T12:34:56Z",
+  } as MemoryOriginInput;
 }
 
 function resolverForFixture() {
@@ -295,16 +358,21 @@ describe("C1 memory-provenance canonical contract", () => {
         expect(actual, `${channel}/${source}`).toBe(
           EXPECTED_INGRESS_SOURCE_PAIRS.has(`${channel}/${source}`),
         );
-        const constructed = signMemoryOrigin(
-          {
-            ...expected.origin,
-            author_agent_id: "agent-claude",
-            ingress_channel: channel,
-            source_class: source,
-            recorded_at: "2026-08-24T12:34:56Z",
-          },
-          originSigner,
-        );
+        const isValidExternalPair =
+          channel === "disclosure_capsule_return" &&
+          (source === "provider_return_locally_observed" ||
+            source === "tool_return_locally_observed" ||
+            source === "peer_return_signed");
+        const candidate = isValidExternalPair
+          ? validExternalInput(source)
+          : {
+              ...expected.origin,
+              author_agent_id: "agent-claude",
+              ingress_channel: channel,
+              source_class: source,
+              recorded_at: "2026-08-24T12:34:56Z",
+            } as MemoryOriginInput;
+        const constructed = signMemoryOrigin(candidate, originSigner);
         expect(constructed.ok, `constructor ${channel}/${source}`).toBe(actual);
         if (!actual && !constructed.ok) {
           expect(constructed.error.code).toBe("ingress_source_pair_invalid");
@@ -312,7 +380,174 @@ describe("C1 memory-provenance canonical contract", () => {
         if (actual) observedAllowed += 1;
       }
     }
-    expect(observedAllowed).toBe(17);
+    expect(observedAllowed).toBe(20);
+  });
+
+  it("exhaustively enforces external source/destination/evidence triples", () => {
+    const sources = [
+      "provider_return_locally_observed",
+      "tool_return_locally_observed",
+      "peer_return_signed",
+    ] as const;
+    let observedAllowed = 0;
+    for (const source_class of sources) {
+      for (const destination_class of MEMORY_EXTERNAL_DESTINATION_CLASSES) {
+        for (const evidence_basis of MEMORY_EXTERNAL_EVIDENCE_BASES) {
+          const label = `${source_class}/${destination_class}/${evidence_basis}`;
+          const actual = isAllowedMemoryExternalSourceTriple({
+            source_class,
+            destination_class,
+            evidence_basis,
+          });
+          expect(actual, label).toBe(EXPECTED_EXTERNAL_SOURCE_TRIPLES.has(label));
+          const candidate = {
+            ...expected.origin,
+            author_agent_id: DISCLOSURE_CAPSULE_RETURN_AUTHOR_AGENT_ID,
+            ingress_channel: "disclosure_capsule_return",
+            source_class,
+            external_source_ref: externalRef(destination_class, evidence_basis),
+            recorded_at: "2026-08-24T12:34:56Z",
+          } as unknown as MemoryOriginInput;
+          const constructed = signMemoryOrigin(candidate, originSigner);
+          expect(constructed.ok, label).toBe(actual);
+          if (!actual && !constructed.ok) {
+            expect(constructed.error.code).toBe("external_source_ref_invalid");
+          }
+          if (actual) observedAllowed += 1;
+        }
+      }
+    }
+    expect(observedAllowed).toBe(5);
+  });
+
+  it("requires exact external-reference keys and the code-owned return author", () => {
+    const provider = validExternalInput("provider_return_locally_observed");
+    expect(signMemoryOrigin(provider, originSigner).ok).toBe(true);
+    expectFailure(
+      signMemoryOrigin(
+        { ...provider, author_agent_id: "provider-name" } as unknown as MemoryOriginInput,
+        originSigner,
+      ),
+      "external_source_ref_invalid",
+    );
+    const missingRef = { ...provider } as unknown as Record<string, unknown>;
+    delete missingRef.external_source_ref;
+    expectFailure(
+      signMemoryOrigin(missingRef as unknown as MemoryOriginInput, originSigner),
+      "external_source_ref_invalid",
+    );
+    const extraRef = {
+      ...provider,
+      external_source_ref: {
+        ...provider.external_source_ref,
+        caller_claimed_safe: true,
+      },
+    };
+    expectFailure(
+      signMemoryOrigin(extraRef as unknown as MemoryOriginInput, originSigner),
+      "unknown_key",
+    );
+    const existingWithRef = {
+      ...expected.origin,
+      author_agent_id: "agent-claude",
+      ingress_channel: "memory_insert",
+      source_class: "user_content",
+      external_source_ref: provider.external_source_ref,
+      recorded_at: "2026-08-24T12:34:56Z",
+    };
+    expectFailure(
+      signMemoryOrigin(existingWithRef as unknown as MemoryOriginInput, originSigner),
+      "external_source_ref_invalid",
+    );
+    for (const external_source_ref of [
+      { ...provider.external_source_ref, capsule_artifact_id: "dcap1_short" },
+      { ...provider.external_source_ref, capsule_return_artifact_id: `${capsuleReturnArtifactId}=` },
+      { ...provider.external_source_ref, evidence_sha256: "AB".repeat(32) },
+      { ...provider.external_source_ref, destination_id: "unsafe destination" },
+    ]) {
+      expect(
+        signMemoryOrigin(
+          { ...provider, external_source_ref } as unknown as MemoryOriginInput,
+          originSigner,
+        ).ok,
+      ).toBe(false);
+    }
+    const signed = requireOk(signMemoryOrigin(provider, originSigner));
+    const companion = requireOk(createMemoryProvenanceCompanion(
+      signed,
+      {
+        ...expected.destination,
+        admission_channel: "local_write",
+        origin_trust_tier: "local_attested",
+        verification_basis: "local_primary_identity",
+        admitted_at: "2026-08-24T12:35:01Z",
+      },
+      admissionSigner,
+    ));
+    const duplicateNestedJson = JSON.stringify(companion).replace(
+      `"destination_id":"destination-001"`,
+      `"destination_id":"destination-001","destination_id":"swapped"`,
+    );
+    expectFailure(parseMemoryProvenanceCompanionJson(duplicateNestedJson), "duplicate_key");
+  });
+
+  it("enforces signature-evidence signer presence and local-observation signer absence", () => {
+    const provider = validExternalInput("provider_return_locally_observed");
+    const observedWithSigner = {
+      ...provider,
+      external_source_ref: {
+        ...provider.external_source_ref,
+        remote_signer_did: originSigner.did,
+      },
+    };
+    expectFailure(
+      signMemoryOrigin(observedWithSigner as unknown as MemoryOriginInput, originSigner),
+      "external_source_ref_invalid",
+    );
+    const signed = {
+      ...provider,
+      external_source_ref: {
+        ...externalRef("provider_inference", "destination_signature"),
+        remote_signer_did: "did:web:provider.example",
+      },
+    };
+    const signedWithoutDid = structuredClone(signed) as unknown as {
+      external_source_ref: Record<string, unknown>;
+    };
+    delete signedWithoutDid.external_source_ref.remote_signer_did;
+    expectFailure(
+      signMemoryOrigin(signedWithoutDid as unknown as MemoryOriginInput, originSigner),
+      "external_source_ref_invalid",
+    );
+    expect(signMemoryOrigin(signed as MemoryOriginInput, originSigner).ok).toBe(true);
+  });
+
+  it("binds every external-reference field under the existing origin domain", () => {
+    const origin = requireOk(
+      signMemoryOrigin(validExternalInput("peer_return_signed"), originSigner),
+    );
+    const companion = requireOk(
+      createMemoryProvenanceCompanion(
+        origin,
+        {
+          ...expected.destination,
+          admission_channel: "local_write",
+          origin_trust_tier: "local_attested",
+          verification_basis: "local_primary_identity",
+          admitted_at: "2026-08-24T12:35:01Z",
+        },
+        admissionSigner,
+      ),
+    );
+    expect(verifyMemoryProvenanceCompanion(companion, resolverForFixture(), expected).ok).toBe(true);
+    const mutated = structuredClone(companion) as unknown as {
+      origin: { body: { external_source_ref: { destination_id: string } } };
+    };
+    mutated.origin.body.external_source_ref.destination_id = "peer-swapped";
+    expectFailure(
+      verifyMemoryProvenanceCompanion(mutated, resolverForFixture(), expected),
+      "signature_invalid",
+    );
   });
 
   it("enumerates every allowed and forbidden admission triple", () => {
