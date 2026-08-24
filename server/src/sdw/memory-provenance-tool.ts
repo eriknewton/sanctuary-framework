@@ -1,33 +1,15 @@
 /**
  * SDW memory provenance MCP tool: `sdw_memory_provenance`.
  *
- * Returns the provenance that the SHIPPED machinery actually carries for a
- * stored passage, and HONESTLY reports what it does NOT yet carry. This is the
- * read-time-provenance SEAM for the memory-poisoning controls (the per-writer
- * signing + trust-tier + promotion design), not a claim that authorship is
- * already cryptographically proven.
- *
- * NEVER-OVERCLAIM (the load-bearing design constraint): the shipped
- * `MemoryPassage` surface carries `passage_id` / `owner_ref` / `content_hash`
- * / `created_at` / `chunk_count`. It does NOT carry a per-writer signature, and
- * the persistable taint asserted at write time is consumed by the write-gate
- * but is NOT stored retrievably on the passage. A passage insert also does not
- * automatically append a signer-bound audit/query-history record today (the
- * pre-existing optional `memory_attest` tool is manual after-the-fact
- * attestation, not automatic passage provenance). So this tool reports:
- *   - what IS provable today: the entry exists, its content hash, and that the
- *     content hash is re-verified on read (fail closed on mismatch);
- *   - what is NOT bound today: per-writer signing, a retrievable taint, an
- *     automatic provenance event - each surfaced as an explicit field so a
- *     reader is never misled into trusting unproven authorship.
- *
- * This is the never-overclaim ethos applied to the tool itself: the CISO value
- * is tamper-EVIDENCE of what we actually record, plus an honest map of the gap
- * the future per-writer-signing control fills.
+ * Returns the per-record provenance the shipped machinery carries. C2 rows
+ * expose a verified fortress-recorded origin/admission binding; legacy rows
+ * remain explicitly unsigned in PRE_MIGRATION. A valid signature proves only
+ * that the resolved fortress key signed the exact origin/admission bytes; it
+ * does not prove true authorship, content truth, safety, or a remote identity.
  *
  * PUBLIC-SAFE PROJECTION (MUST-NEVER #7): the response carries only the
- * passage's own non-sensitive provenance. It does NOT leak redacted audit
- * internals, identity ids, policy detail, or the passage body. Failures return
+ * passage's own bounded provenance. It does NOT leak signatures, key bytes,
+ * redacted audit internals, policy detail, or the passage body. Failures return
  * the fixed-denial schema; details go to the audit log only.
  */
 
@@ -35,10 +17,11 @@ import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import { fixedDenial } from "../agent-native/safety-base.js";
-import type { MemoryBackendAdapter } from "./adapters/memory-backend.js";
+import type { MemoryBackendAdapter, MemoryPassage } from "./adapters/memory-backend.js";
 import { SdwValidationError } from "./errors.js";
 import type { MultiAgentIsolationGuard } from "./memory-isolation.js";
 import { SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS } from "./memory-tools.js";
+import type { MemoryProvenanceCompanion } from "./memory-provenance-contract.js";
 
 export interface SdwMemoryProvenanceToolOptions {
   /** The shipped sovereign passage backend, scoped to one owner_ref. */
@@ -52,28 +35,66 @@ export interface SdwMemoryProvenanceToolOptions {
   readonly isolationGuard?: MultiAgentIsolationGuard;
 }
 
-/**
- * The honest "what is NOT bound yet" block. Stable shape so the future
- * per-writer-signing control populates these fields rather than the reader
- * silently assuming authorship is proven.
- */
-function provenanceGaps(): Record<string, unknown> {
+/** Stable bounded projection of verified binding facts and legacy gaps. */
+function provenanceGaps(
+  status: "verified" | "unsigned",
+  companion?: MemoryProvenanceCompanion,
+): Record<string, unknown> {
+  if (status === "verified") {
+    if (companion === undefined) throw new Error("verified memory provenance companion missing");
+    const origin = companion.origin.body;
+    const admission = companion.admission.body;
+    return {
+      per_writer_signature: "verified",
+      signing_status: "verified",
+      ingress_channel: origin.ingress_channel,
+      source_class: origin.source_class,
+      recorded_at: origin.recorded_at,
+      admission_channel: admission.admission_channel,
+      origin_trust_tier: admission.origin_trust_tier,
+      verification_basis: admission.verification_basis,
+      admitted_at: admission.admitted_at,
+      taint_retrievable: false,
+      automatic_provenance_event: true,
+      note: "The fortress-recorded origin and admission bindings verify for this exact passage. This does not prove true authorship, content truth, safety, or a remote identity.",
+    };
+  }
   return {
-    // Per-writer cryptographic signing is the future Crux-5 control; it is not
-    // bound at write time today.
+    // PRE_MIGRATION legacy compatibility: no companion was attached.
     per_writer_signature: null,
     signing_status: "not_bound",
     // The persistable taint is enforced by the write-gate at write time but is
     // not stored retrievably on the passage, so it cannot be reported here.
     taint_retrievable: false,
-    // A passage insert does not automatically append a signer-bound provenance
-    // event today (memory_attest is a separate, manual attestation).
+    // PRE_MIGRATION legacy rows predate automatic C2 companion attachment.
     automatic_provenance_event: false,
     note:
       "Tamper-evidence today is the re-verified content hash. Per-writer signer " +
-      "identity, a retrievable taint, and an automatic provenance event are the " +
-      "future controls this tool is the seam for; they are not yet bound.",
+      "identity and retrievable taint are not bound on this PRE_MIGRATION legacy row.",
   };
+}
+
+function sameProvenanceSnapshot(
+  first: Awaited<ReturnType<MemoryBackendAdapter["getPassageProvenance"]>>,
+  second: Awaited<ReturnType<MemoryBackendAdapter["getPassageProvenance"]>>,
+): boolean {
+  if (first.status !== second.status) return false;
+  if (first.status !== "verified" || second.status !== "verified") return true;
+  return JSON.stringify(first.companion) === JSON.stringify(second.companion);
+}
+
+function companionBindsPublicPassage(
+  companion: MemoryProvenanceCompanion,
+  passage: MemoryPassage,
+): boolean {
+  const origin = companion.origin.body;
+  const admission = companion.admission.body;
+  return origin.passage_id === passage.passage_id &&
+    origin.owner_ref === passage.owner_ref &&
+    origin.content_hash === passage.content_hash &&
+    origin.chunk_count === passage.chunk_count &&
+    admission.passage_id === passage.passage_id &&
+    admission.destination_owner_ref === passage.owner_ref;
 }
 
 /**
@@ -130,12 +151,10 @@ export function createSdwMemoryProvenanceTool(
   return {
     name: "sdw_memory_provenance",
     description:
-      "Show what is provable about a stored memory passage: whether it exists, " +
-      "its content hash (re-verified on read, fails closed on mismatch), when it " +
-      "was created, and how many encrypted chunks it spans. It also reports, " +
-      "honestly, what is NOT yet bound: per-writer signer identity, a retrievable " +
-      "taint, and an automatic provenance event. Use it to judge a passage before " +
-      "trusting it; it does not claim to prove who wrote it.",
+      "Show per-record SDW memory integrity status. Verified rows expose the " +
+      "bounded fortress-recorded origin/admission classes; unsigned PRE_MIGRATION " +
+      "rows are explicit. Verification does not prove true authorship, content " +
+      "truth, safety, or a remote identity.",
     tool_class: "read",
     inputSchema: {
       type: "object",
@@ -172,10 +191,25 @@ export function createSdwMemoryProvenanceTool(
         return deny();
       }
       try {
-        const passage = await adapter.getPassage(passageId);
-        if (passage === null) {
+        const recordProvenance = await adapter.getPassageProvenance(passageId);
+        if (recordProvenance.status === "unresolved") {
           await auditRead({ passage_id: passageId, found: false });
-          return toolResult({ found: false });
+          return toolResult({ found: false, provenance_status: "unresolved" });
+        }
+        if (recordProvenance.status === "quarantined") {
+          await auditRead({ passage_id: passageId, found: true });
+          return toolResult({ found: true, provenance_status: "quarantined" });
+        }
+        const passage = await adapter.getPassage(passageId);
+        if (passage === null) throw new Error("passage disappeared during provenance inspection");
+        const confirmedProvenance = await adapter.getPassageProvenance(passageId);
+        if (!sameProvenanceSnapshot(recordProvenance, confirmedProvenance) ||
+            (recordProvenance.status === "verified" &&
+              !companionBindsPublicPassage(recordProvenance.companion, passage))) {
+          throw new SdwValidationError(
+            "auth_failed",
+            "SDW memory passage changed during provenance inspection; retry",
+          );
         }
         await auditRead({ passage_id: passageId, found: true });
         // Public-safe provenance: the passage's own non-sensitive facts plus
@@ -183,6 +217,7 @@ export function createSdwMemoryProvenanceTool(
         // beyond the caller's own passage/owner refs.
         return toolResult({
           found: true,
+          provenance_status: recordProvenance.status,
           provenance: {
             passage_id: passage.passage_id,
             owner_ref: passage.owner_ref,
@@ -192,7 +227,10 @@ export function createSdwMemoryProvenanceTool(
             chunk_count: passage.chunk_count,
             tags: [...passage.tags],
           },
-          provenance_gaps: provenanceGaps(),
+          provenance_gaps: provenanceGaps(
+            recordProvenance.status,
+            recordProvenance.status === "verified" ? recordProvenance.companion : undefined,
+          ),
         });
       } catch (error) {
         const category = error instanceof SdwValidationError ? error.category : "provenance_failed";

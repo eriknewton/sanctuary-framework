@@ -23,6 +23,7 @@ import {
   readClaudeCodeMemoryDirectory,
 } from "../../src/sdw/adapters/claude-code-file-adapter.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
 import { encryptedEnvelopeContains } from "../../src/sdw/write-gate.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
@@ -57,7 +58,7 @@ function makeAdapter(
   storage: StorageBackend | string,
   ownerRef = OWNER_REF,
 ): SdwMemoryBackendAdapter {
-  return new SdwMemoryBackendAdapter({
+  return new TestSdwMemoryBackendAdapter({
     storage: typeof storage === "string" ? new FilesystemStorage(storage) : storage,
     masterKey: MASTER_KEY,
     fortressId: "fortress:cc-file-adapter",
@@ -376,7 +377,7 @@ describe("Claude Code memory-file adapter", () => {
       passageIdForClaudeCodeMemoryFile(adapter, "fact", "rung-one-scope.md"),
     );
     // Different fortress key, different id: the digest is keyed, not public.
-    const otherKeyAdapter = new SdwMemoryBackendAdapter({
+    const otherKeyAdapter = new TestSdwMemoryBackendAdapter({
       storage: new FilesystemStorage(await tempDir("cc-memory-opacity-other")),
       masterKey: new Uint8Array(32).fill(99),
       fortressId: "fortress:cc-file-adapter",

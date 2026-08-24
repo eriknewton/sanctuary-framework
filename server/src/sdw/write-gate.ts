@@ -577,6 +577,21 @@ function validateRecord(record: SdwRecord): void {
       if (record.token_count !== undefined) assertNonNegativeInteger(record.token_count, "token_count");
       for (const ref of record.vector_refs ?? []) assertSdwIdentifier(ref, "vector_ref");
       return;
+    case "memory_provenance":
+      assertVersion(record.version);
+      assertSdwIdentifier(record.document_id, "document_id");
+      if (record.companion.format !== "SANCTUARY_SDW_MEMORY_PROVENANCE_V1") {
+        throw new SdwValidationError("schema_mismatch", "Invalid SDW memory provenance companion");
+      }
+      return;
+    case "memory_provenance_status":
+      assertVersion(record.version);
+      assertSdwIdentifier(record.document_id, "document_id");
+      assertOneOf(record.status, ["quarantined"], "memory_provenance_status.status");
+      assertSdwIdentifier(record.reason, "memory_provenance_status.reason");
+      assertHashString(record.observed_content_hash, "memory_provenance_status.observed_content_hash");
+      assertHashString(record.observed_provenance_sha256, "memory_provenance_status.observed_provenance_sha256");
+      return;
     case "vector_record":
       assertVersion(record.version);
       assertSdwIdentifier(record.vector_id, "vector_id");
@@ -639,7 +654,8 @@ function assertNamespaceForRecord(namespace: SdwNamespace, record: SdwRecord): v
     (record.kind === "working_state" && namespace === SDW_WORKING_STATE_NAMESPACE) ||
     ((record.kind === "query_history" || record.kind === "query_history_chain_head") &&
       namespace === SDW_QUERY_HISTORY_NAMESPACE) ||
-    ((record.kind === "document" || record.kind === "document_chunk") &&
+    ((record.kind === "document" || record.kind === "document_chunk" ||
+      record.kind === "memory_provenance" || record.kind === "memory_provenance_status") &&
       namespace === SDW_DOCUMENT_CORPUS_NAMESPACE) ||
     ((record.kind === "vector_record" ||
       record.kind === "vector_label_map" ||

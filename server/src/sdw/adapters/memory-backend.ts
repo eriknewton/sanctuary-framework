@@ -19,6 +19,8 @@
 import type { SdwDocumentMetadata } from "../records.js";
 import type { PersistableTaint } from "../provenance.js";
 import type { ClassifierOverrideAuthorization } from "../write-gate.js";
+import type { MemoryProvenanceIngressContext } from "../memory-provenance-ingress.js";
+import type { MemoryProvenanceCompanion } from "../memory-provenance-contract.js";
 
 /** A passage as stored in, and returned from, the sovereign backend. */
 export interface MemoryPassage {
@@ -37,6 +39,8 @@ export interface MemoryPassage {
   readonly chunk_count: number;
   /** Hash over the full passage text; verified on read (fail closed). */
   readonly content_hash: string;
+  /** Slice C four-state compatibility status for this record. */
+  readonly provenance_status: "verified" | "unsigned";
 }
 
 /** Input for inserting a passage. */
@@ -74,6 +78,8 @@ export interface MemoryPassageInput {
    * never reads this field on ANY passage (see its doc below).
    */
   readonly classifierOverrideAuthorization?: ClassifierOverrideAuthorization;
+  /** Opaque code-owned ingress authority; object literals never verify. */
+  readonly provenanceContext?: MemoryProvenanceIngressContext;
 }
 
 /**
@@ -233,4 +239,12 @@ export interface MemoryBackendAdapter {
 
   /** Number of passages in this adapter's owner scope. */
   countPassages(): Promise<number>;
+
+  /** Per-record provenance state used by the public-safe inspection tool. */
+  getPassageProvenance(passageId: string): Promise<
+    | { readonly status: "unresolved" }
+    | { readonly status: "unsigned" }
+    | { readonly status: "quarantined"; readonly reason: string }
+    | { readonly status: "verified"; readonly companion: MemoryProvenanceCompanion }
+  >;
 }

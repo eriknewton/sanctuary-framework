@@ -172,6 +172,24 @@ export interface SdwDocumentChunkRecord {
   readonly created_at: string;
 }
 
+export interface SdwMemoryProvenanceRecord {
+  readonly kind: "memory_provenance";
+  readonly version: 1;
+  readonly document_id: string;
+  readonly companion: import("./memory-provenance-contract.js").MemoryProvenanceCompanion;
+}
+
+export interface SdwMemoryProvenanceStatusRecord {
+  readonly kind: "memory_provenance_status";
+  readonly version: 1;
+  readonly document_id: string;
+  readonly status: "quarantined";
+  readonly reason: string;
+  readonly observed_content_hash: string;
+  readonly observed_provenance_sha256: string;
+  readonly updated_at: string;
+}
+
 export interface SdwDocumentMetadata {
   readonly key: string;
   readonly value: string;
@@ -229,6 +247,8 @@ export type SdwRecord =
   | SdwQueryHistoryChainHeadRecord
   | SdwDocumentRecord
   | SdwDocumentChunkRecord
+  | SdwMemoryProvenanceRecord
+  | SdwMemoryProvenanceStatusRecord
   | SdwVectorRecord
   | SdwVectorLabelMapRecord
   | SdwHnswIndexManifestRecord

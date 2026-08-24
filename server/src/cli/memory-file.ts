@@ -38,6 +38,8 @@ import {
   transcodeMemoryDirectory,
 } from "../sdw/memory-transcode.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import { IdentityManager } from "../cognitive/tools.js";
+import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../sdw/memory-provenance-signing.js";
 import { consumeFlagValues, flagValue, hasFlag } from "./argv.js";
 
 export interface MemoryFileCommandArgs {
@@ -662,11 +664,20 @@ async function bootstrap(
     return null;
   }
   const auditLog = new AuditLog(storage, masterKey);
+  const identityManager = new IdentityManager(storage, masterKey);
+  const loaded = await identityManager.load();
+  if (loaded.loaded === 0 || identityManager.getDefault() === undefined) {
+    masterKey.fill(0);
+    write(err, "Error: fortress primary identity is unavailable.\n");
+    return null;
+  }
   const adapter = new SdwMemoryBackendAdapter({
     storage,
     masterKey,
     fortressId: fortressIdFromStoragePath(config.storage_path),
     ownerRef: args.ownerRef,
+    resolvePrimarySigningHandle: createPrimaryMemoryProvenanceSigningHandleResolver(identityManager, masterKey),
+    resolveSignerPublicKey: createPrimaryMemoryProvenancePublicKeyResolver(identityManager),
   });
   return { adapter, auditLog };
 }

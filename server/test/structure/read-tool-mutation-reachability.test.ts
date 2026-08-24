@@ -72,6 +72,7 @@ import {
   sinksForTool,
   walkForSinks,
 } from "./read-tool-mutation-reachability.js";
+import type { SinkHit } from "./read-tool-mutation-reachability.js";
 
 interface ReviewedSite {
   /** Must equal `SinkHit.primitive` exactly. */
@@ -120,6 +121,20 @@ const L2_PROBE_WHY =
   "process, so no analysis here can prove what it did — the justification rests " +
   "on the commands being fixed literals, which is why they are enumerated above " +
   "and why a new one at a new site reds this test.";
+
+const SDW_QUARANTINE_WHY =
+  "These read tools may discover an invalid provenance companion while the " +
+  "fortress is already in an integrity incident, so making them write-classed " +
+  "would remove the operator's ability to inspect the affected memory. The " +
+  "maintenance is denial/quarantine only: it can neither admit a passage nor " +
+  "make one visible. It replaces one bounded status row for an already-present, " +
+  "already-counted candidate; the reason, document-content hash and provenance-" +
+  "ciphertext digest come from verified stored bytes rather than caller input, " +
+  "and the exact document plus companion are rechecked under the corpus lock " +
+  "before the digest-bound status is written. The storage write is pinned only " +
+  "through putProvenanceStatus and the lock only through getPassageProvenance, " +
+  "for each named tool, so a new primitive, site or immediate caller remains " +
+  "unreviewed and reds this test.";
 
 /**
  * Read-path maintenance that is reviewed and allowed to stay in the read set.
@@ -228,6 +243,78 @@ const REVIEWED_READ_PATH_MAINTENANCE: ReadonlyMap<
     },
   ],
   [
+    "memory_get",
+    {
+      sites: [
+        {
+          primitive: "storage.write",
+          site: "sdwBackendWrite@src/sdw/write-gate.ts",
+          through: "putProvenanceStatus@src/sdw/document-corpus-store.ts",
+        },
+        {
+          primitive: "storage.withCrossProcessLock",
+          site: "quarantine@src/sdw/adapters/sdw-memory-backend.ts",
+          through: "getPassageProvenance@src/sdw/adapters/sdw-memory-backend.ts",
+        },
+      ],
+      why: SDW_QUARANTINE_WHY,
+    },
+  ],
+  [
+    "memory_list",
+    {
+      sites: [
+        {
+          primitive: "storage.write",
+          site: "sdwBackendWrite@src/sdw/write-gate.ts",
+          through: "putProvenanceStatus@src/sdw/document-corpus-store.ts",
+        },
+        {
+          primitive: "storage.withCrossProcessLock",
+          site: "quarantine@src/sdw/adapters/sdw-memory-backend.ts",
+          through: "getPassageProvenance@src/sdw/adapters/sdw-memory-backend.ts",
+        },
+      ],
+      why: SDW_QUARANTINE_WHY,
+    },
+  ],
+  [
+    "memory_search",
+    {
+      sites: [
+        {
+          primitive: "storage.write",
+          site: "sdwBackendWrite@src/sdw/write-gate.ts",
+          through: "putProvenanceStatus@src/sdw/document-corpus-store.ts",
+        },
+        {
+          primitive: "storage.withCrossProcessLock",
+          site: "quarantine@src/sdw/adapters/sdw-memory-backend.ts",
+          through: "getPassageProvenance@src/sdw/adapters/sdw-memory-backend.ts",
+        },
+      ],
+      why: SDW_QUARANTINE_WHY,
+    },
+  ],
+  [
+    "sdw_memory_provenance",
+    {
+      sites: [
+        {
+          primitive: "storage.write",
+          site: "sdwBackendWrite@src/sdw/write-gate.ts",
+          through: "putProvenanceStatus@src/sdw/document-corpus-store.ts",
+        },
+        {
+          primitive: "storage.withCrossProcessLock",
+          site: "quarantine@src/sdw/adapters/sdw-memory-backend.ts",
+          through: "getPassageProvenance@src/sdw/adapters/sdw-memory-backend.ts",
+        },
+      ],
+      why: SDW_QUARANTINE_WHY,
+    },
+  ],
+  [
     "l2_hardening_status",
     {
       sites: l2ProbeSites(),
@@ -242,6 +329,17 @@ const REVIEWED_READ_PATH_MAINTENANCE: ReadonlyMap<
     },
   ],
 ]);
+
+function isReviewedReadPathMaintenance(tool: string, hit: SinkHit): boolean {
+  return (
+    REVIEWED_READ_PATH_MAINTENANCE.get(tool)?.sites.some(
+      (entry) =>
+        entry.primitive === hit.primitive &&
+        entry.site === hit.site &&
+        entry.through === hit.caller
+    ) === true
+  );
+}
 
 
 /**
@@ -1411,15 +1509,8 @@ describe("read-classified MCP tools and durable-state mutation", () => {
     for (const [tool, hits] of report.hits) {
       const gated = hits.filter((hit) => GATED_KINDS.has(hit.kind));
       if (gated.length === 0) continue;
-      const reviewed = REVIEWED_READ_PATH_MAINTENANCE.get(tool);
       for (const hit of gated) {
-        const allowed = reviewed?.sites.some(
-          (entry) =>
-            entry.primitive === hit.primitive &&
-            entry.site === hit.site &&
-            entry.through === hit.caller
-        );
-        if (allowed === true) continue;
+        if (isReviewedReadPathMaintenance(tool, hit)) continue;
         unreviewed.push(
           `${tool}: ${hit.primitive} at ${hit.site} (via ${hit.caller ?? "<handler>"})\n` +
             `    via ${hit.via.join(" -> ")}`
@@ -1427,6 +1518,30 @@ describe("read-classified MCP tools and durable-state mutation", () => {
       }
     }
     expect(unreviewed).toEqual([]);
+  });
+
+  it("keeps each reviewed quarantine triple exact across primitive, site, and caller", () => {
+    const reviewedHit = (report.hits.get("sdw_memory_provenance") ?? []).find(
+      (hit) =>
+        hit.primitive === "storage.write" &&
+        hit.site === "sdwBackendWrite@src/sdw/write-gate.ts" &&
+        hit.caller === "putProvenanceStatus@src/sdw/document-corpus-store.ts"
+    );
+    if (reviewedHit === undefined) throw new Error("reviewed quarantine write disappeared");
+    expect(isReviewedReadPathMaintenance("sdw_memory_provenance", reviewedHit)).toBe(true);
+
+    const unreviewedVariants: readonly SinkHit[] = [
+      { ...reviewedHit, primitive: "storage.delete" },
+      { ...reviewedHit, site: "anotherSite@src/sdw/write-gate.ts" },
+      { ...reviewedHit, caller: "anotherCaller@src/sdw/document-corpus-store.ts" },
+    ];
+    // These are the three dimensions used by the shipping assertion above: a
+    // new primitive, site, or immediate caller must remain an unreviewed red.
+    expect(
+      unreviewedVariants.map((hit) =>
+        isReviewedReadPathMaintenance("sdw_memory_provenance", hit)
+      )
+    ).toEqual([false, false, false]);
   });
 
   it("keeps the reviewed list free of entries that no longer apply", () => {

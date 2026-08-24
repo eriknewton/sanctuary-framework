@@ -58,6 +58,7 @@ import {
   createSdwMemoryTools,
 } from "../../src/sdw/memory-tools.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 import {
   createMultiAgentIsolationGuard,
   wrappedAgentIdentityFromEnv,
@@ -257,7 +258,7 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
   });
 
   it("provenance: the gate-time projection refuses a foreign identity before the approval gate, and the handler rechecks", async () => {
-    const adapter = new SdwMemoryBackendAdapter({
+    const adapter = new TestSdwMemoryBackendAdapter({
       storage: new MemoryStorage(),
       masterKey: new Uint8Array(32).fill(3),
       fortressId: "fortress:prov-gate",
@@ -277,7 +278,7 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
   });
 
   it("two ids reaching one guard instance: the second cannot read the first's passages", async () => {
-    const adapter = new SdwMemoryBackendAdapter({
+    const adapter = new TestSdwMemoryBackendAdapter({
       storage: new MemoryStorage(),
       masterKey: new Uint8Array(32).fill(3),
       fortressId: "fortress:shared-host",

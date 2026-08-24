@@ -45,6 +45,7 @@ import type {
   ApprovalResponse,
 } from "../principal-policy/types.js";
 import { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
+import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../sdw/memory-provenance-signing.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { getSanctuaryVersion } from "../version.js";
 import { consumeFlagValue } from "./argv.js";
@@ -494,6 +495,8 @@ async function bootstrap(
         masterKey,
         fortressId,
         ownerRef: parsed.ownerRef,
+        resolvePrimarySigningHandle: createPrimaryMemoryProvenanceSigningHandleResolver(identityManager, masterKey),
+        resolveSignerPublicKey: createPrimaryMemoryProvenancePublicKeyResolver(identityManager),
       }),
       signer: {
         identity_id: primary.identity_id,

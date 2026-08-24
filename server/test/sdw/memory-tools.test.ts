@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 import { createSdwMemoryTools } from "../../src/sdw/memory-tools.js";
 import { assertSdwRawWriteAuthorized } from "../../src/sdw/write-gate.js";
 import { COOPERATIVE_DENIAL_DISCOVERY_HINT } from "../../src/agent-native/safety-base.js";
@@ -72,6 +73,7 @@ function makeTools(
   options: {
     failAuditOperations?: readonly string[];
     ownerIdentity?: () => string | undefined;
+    currentAgentId?: () => string | undefined;
   } = {},
 ): {
   tools: Map<string, ToolDefinition>;
@@ -80,7 +82,7 @@ function makeTools(
   calls: AuditCall[];
 } {
   const storage = new MemoryStorage();
-  const adapter = new SdwMemoryBackendAdapter({
+  const adapter = new TestSdwMemoryBackendAdapter({
     storage,
     masterKey: MASTER_KEY,
     fortressId: FORTRESS_ID,
@@ -92,6 +94,7 @@ function makeTools(
     adapter,
     auditLog: log,
     ownerIdentity: options.ownerIdentity,
+    currentAgentId: options.currentAgentId,
   });
   return { tools: new Map(defs.map((tool) => [tool.name, tool])), storage, adapter, calls };
 }
@@ -139,6 +142,55 @@ describe("SDW memory tools: surface + tier classification", () => {
 });
 
 describe("SDW memory tools: end-to-end loop", () => {
+  it("signs the code-owned current caller and ignores a forged author argument", async () => {
+    const { tools, adapter } = makeTools({ currentAgentId: () => "wrapped-agent-a" });
+    await tools.get("memory_insert")!.handler({
+      text: "caller-bound",
+      taint: "user_content",
+      passage_id: "caller-bound",
+      author_agent_id: "forged-agent",
+    });
+    const provenance = await adapter.getPassageProvenance("caller-bound");
+    expect(provenance.status).toBe("verified");
+    if (provenance.status !== "verified") throw new Error("expected verified provenance");
+    expect(provenance.companion.origin.body.author_agent_id).toBe("wrapped-agent-a");
+  });
+
+  it("freezes the current caller before audit latency can change the environment", async () => {
+    let currentAgent = "wrapped-agent-before";
+    const storage = new MemoryStorage();
+    const adapter = new TestSdwMemoryBackendAdapter({
+      storage, masterKey: MASTER_KEY, fortressId: FORTRESS_ID,
+      ownerRef: "tools-archive", now: () => NOW,
+    });
+    const auditLog = {
+      async appendCritical(entry: AuditCall): Promise<void> {
+        if (entry.operation === "memory_insert") currentAgent = "wrapped-agent-after";
+      },
+    } as unknown as AuditLog;
+    const tools = new Map(createSdwMemoryTools({
+      adapter, auditLog, currentAgentId: () => currentAgent,
+    }).map((tool) => [tool.name, tool]));
+    await tools.get("memory_insert")!.handler({
+      text: "snapshot", taint: "user_content", passage_id: "snapshot",
+    });
+    const provenance = await adapter.getPassageProvenance("snapshot");
+    expect(provenance.status).toBe("verified");
+    if (provenance.status !== "verified") throw new Error("expected verified provenance");
+    expect(provenance.companion.origin.body.author_agent_id).toBe("wrapped-agent-before");
+  });
+
+  it("uses the honest unknown-local author when no wrapped caller is configured", async () => {
+    const { tools, adapter } = makeTools();
+    await tools.get("memory_insert")!.handler({
+      text: "local coordinator", taint: "user_content", passage_id: "unknown-local",
+    });
+    const provenance = await adapter.getPassageProvenance("unknown-local");
+    expect(provenance.status).toBe("verified");
+    if (provenance.status !== "verified") throw new Error("expected verified provenance");
+    expect(provenance.companion.origin.body.author_agent_id).toBe("unknown_local");
+  });
+
   it("insert -> get -> search -> list -> count -> delete", async () => {
     const { tools } = makeTools();
 

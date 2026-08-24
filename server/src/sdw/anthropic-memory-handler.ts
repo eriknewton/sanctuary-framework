@@ -37,6 +37,8 @@
 import { createHash } from "node:crypto";
 import type { MemoryBackendAdapter, MemoryPassage } from "./adapters/memory-backend.js";
 import { isSdwIdentifier } from "./grammar.js";
+import { anthropicMemoryToolIngress } from "./memory-provenance-ingress.js";
+import type { CurrentMemoryAgentId } from "./memory-provenance-ingress.js";
 
 /** The six Memory-tool commands (the stable file-shaped contract). */
 export type AnthropicMemoryCommand =
@@ -109,7 +111,12 @@ function fail(error_code: string, content: string): AnthropicMemoryResult {
 export async function applyAnthropicMemoryCommand(
   adapter: MemoryBackendAdapter,
   command: AnthropicMemoryCommand,
+  currentAgentId?: CurrentMemoryAgentId,
 ): Promise<AnthropicMemoryResult> {
+  // Snapshot before any asynchronous read/write in the command. The opaque
+  // context retains this ingress observation even if the environment changes.
+  const observedAgentId = currentAgentId?.();
+  const ingressAgent = () => observedAgentId;
   switch (command.command) {
     case "view": {
       const passage = await safeGet(adapter, command.path);
@@ -131,7 +138,8 @@ export async function applyAnthropicMemoryCommand(
       }
       try {
         await adapter.insertPassage(
-          { passage_id: id, text: command.file_text },
+          { passage_id: id, text: command.file_text,
+            provenanceContext: anthropicMemoryToolIngress(ingressAgent, "user_content") },
           MEMORY_TOOL_TAINT,
         );
       } catch (error) {
@@ -152,7 +160,7 @@ export async function applyAnthropicMemoryCommand(
       // content (the original is then securely overwritten -> irreversible).
       const next = passage.text.replace(command.old_str, () => command.new_str);
       // NON-ATOMIC on the insert/delete-only backend: delete then re-insert.
-      return mutateByReplace(adapter, command.path, next);
+      return mutateByReplace(adapter, command.path, next, ingressAgent);
     }
 
     case "insert": {
@@ -165,7 +173,7 @@ export async function applyAnthropicMemoryCommand(
       }
       lines.splice(at, 0, command.insert_text);
       // NON-ATOMIC: mid-file insert requires mutation -> delete then re-insert.
-      return mutateByReplace(adapter, command.path, lines.join("\n"));
+      return mutateByReplace(adapter, command.path, lines.join("\n"), ingressAgent);
     }
 
     case "delete": {
@@ -186,7 +194,8 @@ export async function applyAnthropicMemoryCommand(
       // NON-ATOMIC: read old -> insert new -> delete old.
       try {
         await adapter.insertPassage(
-          { passage_id: newId, text: passage.text },
+          { passage_id: newId, text: passage.text,
+            provenanceContext: anthropicMemoryToolIngress(ingressAgent, "user_content") },
           MEMORY_TOOL_TAINT,
         );
       } catch (error) {
@@ -223,6 +232,7 @@ async function mutateByReplace(
   adapter: MemoryBackendAdapter,
   path: string,
   nextText: string,
+  currentAgentId?: CurrentMemoryAgentId,
 ): Promise<AnthropicMemoryResult> {
   if (!fitsMemoryFileCap(nextText)) {
     return fail("too_large", "Memory file is too large");
@@ -230,7 +240,8 @@ async function mutateByReplace(
   const id = passageIdForPath(path);
   await adapter.deletePassage(id);
   try {
-    await adapter.insertPassage({ passage_id: id, text: nextText }, MEMORY_TOOL_TAINT);
+    await adapter.insertPassage({ passage_id: id, text: nextText,
+      provenanceContext: anthropicMemoryToolIngress(currentAgentId, "user_content") }, MEMORY_TOOL_TAINT);
   } catch (error) {
     // The old content is already deleted; surface the failure honestly rather
     // than leaving a half-applied edit silently.

@@ -10,6 +10,7 @@ import type { AuditLog } from "../../src/operational/audit-log.js";
 import type { ToolDefinition } from "../../src/router.js";
 import type { MemoryBackendAdapter } from "../../src/sdw/adapters/memory-backend.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 import { SdwValidationError } from "../../src/sdw/errors.js";
 import { createSdwMemoryFileTools, memoryFileApprovalArgs } from "../../src/sdw/memory-file-tools.js";
 import { createMultiAgentIsolationGuard } from "../../src/sdw/memory-isolation.js";
@@ -70,7 +71,7 @@ async function makeTools(
   } = {},
 ): Promise<Harness> {
   const storage = new FilesystemStorage(await tempDir("cc-memory-tool-vault"));
-  const adapter = new SdwMemoryBackendAdapter({
+  const adapter = new TestSdwMemoryBackendAdapter({
     storage,
     masterKey: MASTER_KEY,
     fortressId: "fortress:memory-file-tools",
@@ -617,7 +618,7 @@ describe("SDW memory file tools", () => {
         }
       }
       const storage = new FailFirstWriteStorage(await tempDir("cc-memory-tool-high-c2"));
-      const adapter = new SdwMemoryBackendAdapter({
+      const adapter = new TestSdwMemoryBackendAdapter({
         storage,
         masterKey: MASTER_KEY,
         fortressId: "fortress:high-c2",
@@ -681,7 +682,7 @@ describe("SDW memory file tools", () => {
 
     it("a throwing audit log commits NOTHING to the vault, on the MCP surface", async () => {
       const storage = new FilesystemStorage(await tempDir("cc-memory-tool-audit-throws"));
-      const adapter = new SdwMemoryBackendAdapter({
+      const adapter = new TestSdwMemoryBackendAdapter({
         storage,
         masterKey: MASTER_KEY,
         fortressId: "fortress:audit-throws",
@@ -830,6 +831,7 @@ Unrelated identifier: ${BARE_CREDENTIAL_VALUE}
         throw new Error("not used");
       },
       getPassage: async () => null,
+      getPassageProvenance: async () => ({ status: "unresolved" }),
       searchPassages: async () => [],
       listPassages: async () => [],
       deletePassage: async () => false,
@@ -892,6 +894,7 @@ Unrelated identifier: ${BARE_CREDENTIAL_VALUE}
         throw new Error("not used");
       },
       getPassage: async () => null,
+      getPassageProvenance: async () => ({ status: "unresolved" }),
       searchPassages: async () => [],
       listPassages: async () => {
         throw lockError;
@@ -1072,7 +1075,7 @@ Unrelated identifier: ${BARE_CREDENTIAL_VALUE}
     // memory_get is the FIRST caller of memory_emit and dumps the whole shared
     // corpus as plaintext. One guard instance closes it.
     const storage = new FilesystemStorage(await tempDir("cc-memory-shared-guard-vault"));
-    const adapter = new SdwMemoryBackendAdapter({
+    const adapter = new TestSdwMemoryBackendAdapter({
       storage,
       masterKey: MASTER_KEY,
       fortressId: "fortress:memory-file-tools",

@@ -29,6 +29,7 @@ import {
   passageIdForClaudeCodeMemoryFile,
 } from "../../src/sdw/adapters/claude-code-file-adapter.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
 import { encryptedEnvelopeContains } from "../../src/sdw/write-gate.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
@@ -55,7 +56,7 @@ async function tempDir(prefix: string): Promise<string> {
 }
 
 function makeAdapter(storagePath: string, ownerRef: string): SdwMemoryBackendAdapter {
-  return new SdwMemoryBackendAdapter({
+  return new TestSdwMemoryBackendAdapter({
     storage: new FilesystemStorage(storagePath),
     masterKey: MASTER_KEY,
     fortressId: "fortress:codex-file-adapter",

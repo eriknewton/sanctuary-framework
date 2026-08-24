@@ -47,6 +47,7 @@ import type {
 } from "./adapters/memory-backend.js";
 import { SdwValidationError } from "./errors.js";
 import { isSdwIdentifier } from "./grammar.js";
+import { memoryInsertIngress } from "./memory-provenance-ingress.js";
 import {
   createMultiAgentIsolationGuard,
   type MultiAgentIsolationGuard,
@@ -89,6 +90,8 @@ export interface SdwMemoryToolsOptions {
    * here would still be the first caller of the other family.
    */
   readonly isolationGuard?: MultiAgentIsolationGuard;
+  /** Code-owned current-agent resolver used for signed caller attribution. */
+  readonly currentAgentId?: () => string | undefined;
 }
 
 /** Full body view, reserved for explicit single-passage retrieval. */
@@ -198,6 +201,7 @@ export const SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS =
  */
 export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefinition[] {
   const { adapter, auditLog } = options;
+  const currentAgentId = options.currentAgentId ?? options.ownerIdentity;
   const isolationGuard =
     options.isolationGuard ?? createMultiAgentIsolationGuard(options.ownerIdentity);
 
@@ -276,6 +280,9 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       required: ["text", "taint"],
     },
     handler: async (args) => {
+      // Snapshot before the first await. Audit latency or a later environment
+      // change cannot relabel the origin that this call ultimately signs.
+      const observedAgentId = currentAgentId?.();
       const isolationDenied = await isolationDenialOrNull("memory_insert");
       if (isolationDenied) return isolationDenied;
       const text = args.text;
@@ -326,7 +333,12 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       let passage: MemoryPassage;
       try {
         passage = await adapter.insertPassage(
-          { text, tags, passage_id: auditedPassageId },
+          {
+            text,
+            tags,
+            passage_id: auditedPassageId,
+            provenanceContext: memoryInsertIngress(() => observedAgentId, taint),
+          },
           taint,
         );
       } catch (error) {

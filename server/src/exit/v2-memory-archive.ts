@@ -43,6 +43,7 @@ import type {
   MemoryPassage,
   MemoryPassageInput,
 } from "../sdw/adapters/memory-backend.js";
+import { legacyExitV1ImportIngress } from "../sdw/memory-provenance-ingress.js";
 import {
   buildMemoryTranscodeArchivePassages,
   MEMORY_TRANSCODE_VERSION,
@@ -290,7 +291,10 @@ export async function importExitV2SdwMemoryArchive(
     destinationArchiveId,
     validated.logicalArchive,
     createdAt,
-  );
+  ).map((input) => ({
+    ...input,
+    provenanceContext: legacyExitV1ImportIngress(validated.payload.source_archive_lineage_ref),
+  }));
   for (const input of archiveInputs) {
     if (input.passage_id === undefined) {
       throw new Error("Exit V2 SDW memory import produced an unbound destination passage");
@@ -336,6 +340,7 @@ export async function importExitV2SdwMemoryArchive(
       { key: LINEAGE_DESTINATION_ARCHIVE_KEY, value: destinationArchiveId },
     ],
     created_at: createdAt,
+    provenanceContext: legacyExitV1ImportIngress(validated.payload.source_archive_lineage_ref),
   };
 
   // Files, completed manifest, and signed lineage share this one atomic batch;

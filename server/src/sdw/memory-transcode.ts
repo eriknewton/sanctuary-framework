@@ -28,6 +28,7 @@ import type {
   MemoryPassage,
   MemoryPassageInput,
 } from "./adapters/memory-backend.js";
+import { memoryTranscodeIngress } from "./memory-provenance-ingress.js";
 import { CLAUDE_CODE_MEMORY_HARNESS } from "./adapters/claude-code-file-adapter.js";
 import {
   CODEX_MEMORY_FILES,
@@ -572,6 +573,7 @@ function archiveFileInput(
       { key: SOURCE_SIZE_KEY, value: String(bytes.length) },
     ],
     created_at: createdAt,
+    provenanceContext: memoryTranscodeIngress("system:memory-transcode", "transcode_source_file"),
   };
 }
 
@@ -607,6 +609,7 @@ function archiveManifestInput(input: {
         : [{ key: PROJECTION_FILE_COUNT_KEY, value: String(input.projectionFileCount) }]),
     ],
     created_at: input.createdAt,
+    provenanceContext: memoryTranscodeIngress("system:memory-transcode", "transcode_manifest"),
   };
 }
 

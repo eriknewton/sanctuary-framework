@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 import {
   applyAnthropicMemoryCommand,
   passageIdForPath,
@@ -48,7 +49,7 @@ function makeAdapterWithStorage(): { adapter: SdwMemoryBackendAdapter; storage: 
   const storage = new MemoryStorage();
   return {
     storage,
-    adapter: new SdwMemoryBackendAdapter({
+    adapter: new TestSdwMemoryBackendAdapter({
       storage,
       masterKey: MASTER_KEY,
       fortressId: FORTRESS_ID,
@@ -67,6 +68,19 @@ function parseResultTextSize(text: string): number {
 }
 
 describe("Anthropic Memory-tool -> SDW handler (local, synthetic)", () => {
+  it("binds the code-owned wrapped caller rather than a system-author literal", async () => {
+    const adapter = makeAdapter();
+    const path = "/memories/caller.md";
+    await applyAnthropicMemoryCommand(adapter, {
+      command: "create", path, file_text: "caller-originated text",
+    }, () => "wrapped-anthropic-agent");
+    const provenance = await adapter.getPassageProvenance(passageIdForPath(path));
+    expect(provenance.status).toBe("verified");
+    if (provenance.status !== "verified") throw new Error("expected verified provenance");
+    expect(provenance.companion.origin.body.author_agent_id).toBe("wrapped-anthropic-agent");
+    expect(provenance.companion.origin.body.author_agent_id).not.toBe("system:anthropic-memory-tool");
+  });
+
   it("path -> passage_id is deterministic and SDW-identifier-safe", () => {
     const a = passageIdForPath("/memories/project.md");
     const b = passageIdForPath("/memories/project.md");
@@ -135,7 +149,7 @@ describe("Anthropic Memory-tool -> SDW handler (local, synthetic)", () => {
  */
 describe("Anthropic Memory-tool -> SDW handler operations", () => {
   function makeAdapter(): SdwMemoryBackendAdapter {
-    return new SdwMemoryBackendAdapter({
+    return new TestSdwMemoryBackendAdapter({
       storage: new MemoryStorage(),
       masterKey: MASTER_KEY,
       fortressId: FORTRESS_ID,

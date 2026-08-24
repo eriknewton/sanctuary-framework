@@ -14,6 +14,7 @@ import { link, lstat, mkdir, open, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 
 import type { SdwDocumentMetadata } from "../records.js";
+import { fileImportIngress } from "../memory-provenance-ingress.js";
 import type {
   MemoryBackendAdapter,
   MemoryPassage,
@@ -220,6 +221,11 @@ export function screenCodexMemorySnapshot(
     sourcePath: entry.source_path,
     input: {
       ...entry.passage_input,
+      provenanceContext: fileImportIngress(
+        "system:codex-memory-import",
+        entry.source_class === "index" ? "codex_index" :
+          entry.source_class === "summary" ? "codex_summary" : "codex_raw",
+      ),
       passage_id: passageIdForCodexMemoryFile(
         adapter,
         entry.source_class,
