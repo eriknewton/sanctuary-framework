@@ -522,6 +522,40 @@ describe("C1 memory-provenance canonical contract", () => {
     expect(signMemoryOrigin(signed as MemoryOriginInput, originSigner).ok).toBe(true);
   });
 
+  it("parses bounded multi-segment remote DIDs in linear time without colon ambiguity", () => {
+    const provider = validExternalInput("provider_return_locally_observed");
+    const withRemoteDid = (remote_signer_did: string): MemoryOriginInput => ({
+      ...provider,
+      external_source_ref: {
+        ...externalRef("provider_inference", "destination_signature"),
+        remote_signer_did,
+      },
+    } as MemoryOriginInput);
+    expect(
+      signMemoryOrigin(
+        withRemoteDid("did:web:provider.example:keys:Primary-1"),
+        originSigner,
+      ).ok,
+    ).toBe(true);
+    const adversarialTrailingSeparator = `did:0:${"%:".repeat(124)}`;
+    expect(adversarialTrailingSeparator.length).toBeLessThanOrEqual(256);
+    expectFailure(
+      signMemoryOrigin(withRemoteDid(adversarialTrailingSeparator), originSigner),
+      "external_source_ref_invalid",
+    );
+    for (const invalid of [
+      "did:Web:provider.example",
+      "did:web::provider.example",
+      "did:web:provider/example",
+      "did:web:",
+    ]) {
+      expectFailure(
+        signMemoryOrigin(withRemoteDid(invalid), originSigner),
+        "external_source_ref_invalid",
+      );
+    }
+  });
+
   it("binds every external-reference field under the existing origin domain", () => {
     const origin = requireOk(
       signMemoryOrigin(validExternalInput("peer_return_signed"), originSigner),

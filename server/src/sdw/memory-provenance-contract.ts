@@ -639,12 +639,51 @@ function parseRemoteDid(
   value: unknown,
   path: string,
 ): MemoryProvenanceResult<string> {
-  if (
-    typeof value !== "string" ||
-    value.length === 0 ||
-    value.length > 256 ||
-    !/^did:[a-z0-9]+:[A-Za-z0-9._:%-]+(?::[A-Za-z0-9._:%-]+)*$/.test(value)
-  ) {
+  if (typeof value !== "string" || value.length > 256 || !value.startsWith("did:")) {
+    return failure("invalid_identifier", path, "Expected a bounded remote DID");
+  }
+  let index = "did:".length;
+  const methodStart = index;
+  while (index < value.length) {
+    const code = value.charCodeAt(index);
+    const isLowercaseAscii = code >= 0x61 && code <= 0x7a;
+    const isAsciiDigit = code >= 0x30 && code <= 0x39;
+    if (!isLowercaseAscii && !isAsciiDigit) break;
+    index += 1;
+  }
+  if (index === methodStart || value[index] !== ":") {
+    return failure("invalid_identifier", path, "Expected a bounded remote DID");
+  }
+  index += 1;
+  let segmentLength = 0;
+  for (; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code === 0x3a) {
+      if (segmentLength === 0) {
+        return failure("invalid_identifier", path, "Expected a bounded remote DID");
+      }
+      segmentLength = 0;
+      continue;
+    }
+    const isUppercaseAscii = code >= 0x41 && code <= 0x5a;
+    const isLowercaseAscii = code >= 0x61 && code <= 0x7a;
+    const isAsciiDigit = code >= 0x30 && code <= 0x39;
+    const isAllowedPunctuation =
+      code === 0x2e || // .
+      code === 0x5f || // _
+      code === 0x25 || // %
+      code === 0x2d; // -
+    if (
+      !isUppercaseAscii &&
+      !isLowercaseAscii &&
+      !isAsciiDigit &&
+      !isAllowedPunctuation
+    ) {
+      return failure("invalid_identifier", path, "Expected a bounded remote DID");
+    }
+    segmentLength += 1;
+  }
+  if (segmentLength === 0) {
     return failure("invalid_identifier", path, "Expected a bounded remote DID");
   }
   return { ok: true, value };
