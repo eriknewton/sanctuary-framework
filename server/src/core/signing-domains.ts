@@ -46,6 +46,12 @@ export const STATE_ENVELOPE_SIGNING_DOMAIN_PREFIX = "sanctuary.state-envelope.v"
 export const AUDIT_EVENT_SIGNING_DOMAIN_PREFIX = "sanctuary.audit.v1";
 export const INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX = "sanctuary.receipt.v1";
 export const AUDIT_CHECKPOINT_SIGNING_DOMAIN_PREFIX = "sanctuary.audit-checkpoint.v1\n";
+/** Must match MEMORY_ORIGIN_SIGNING_DOMAIN in sdw/memory-provenance-contract.ts. */
+export const MEMORY_ORIGIN_SIGNING_DOMAIN_PREFIX =
+  "sanctuary.sdw.memory-origin.v1\n";
+/** Must match MEMORY_ADMISSION_SIGNING_DOMAIN in sdw/memory-provenance-contract.ts. */
+export const MEMORY_ADMISSION_SIGNING_DOMAIN_PREFIX =
+  "sanctuary.sdw.memory-admission.v1\n";
 
 /**
  * Prefixes the raw `identity_sign` surface refuses: the domains enumerated
@@ -65,6 +71,8 @@ export const INTERNAL_SIGNING_DOMAIN_PREFIXES: readonly string[] = [
   AUDIT_EVENT_SIGNING_DOMAIN_PREFIX,
   INTERNAL_RECEIPT_SIGNING_DOMAIN_PREFIX,
   AUDIT_CHECKPOINT_SIGNING_DOMAIN_PREFIX,
+  MEMORY_ORIGIN_SIGNING_DOMAIN_PREFIX,
+  MEMORY_ADMISSION_SIGNING_DOMAIN_PREFIX,
 ];
 
 const encoder = new TextEncoder();
