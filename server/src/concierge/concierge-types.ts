@@ -2,6 +2,15 @@ import type { AuditEntry } from "../operational/audit-log.js";
 import type { PublicIdentity } from "../core/identity.js";
 import type { HubInboxItem } from "../contracts/v1.1/hub-events.js";
 import type { Task, TaskStatus } from "../operational/task-coordination/index.js";
+import type {
+  FallbackBehavior,
+  SubstrateChoice,
+  SubstrateConfig,
+  SubstrateHandle,
+  SubstrateResponse,
+  SubstrateStatusReport,
+  SummarizeRequest,
+} from "../intelligence/types.js";
 
 export const CONCIERGE_PROMPT_DOMAIN = "sanctuary.concierge.v1\n";
 
@@ -27,18 +36,18 @@ export interface ConciergeAskRequest {
 export interface ConciergeAskResponse {
   answer: string;
   model: string;
-  provider: "venice";
+  provider: SubstrateChoice | "deterministic";
   read_surfaces: ConciergeReadSurface[];
   context: ConciergeContextBundle;
 }
 
 export interface ConciergeStatus {
-  provider: "venice";
+  provider: SubstrateChoice;
   configured: boolean;
   reachable: boolean;
   model: string;
   read_surfaces: ConciergeReadSurface[];
-  fallback: "none";
+  fallback: FallbackBehavior;
   message: string;
 }
 
@@ -125,22 +134,24 @@ export interface StateStoreContext {
   }>;
 }
 
-export interface VeniceMessage {
+export interface ConciergePromptMessage {
   role: "system" | "user" | "assistant";
   content: string;
 }
 
-export interface VeniceCompleteRequest {
-  messages: VeniceMessage[];
-  model?: string;
-  stream?: boolean;
-  onToken?: (token: string) => void;
-}
-
-export interface VeniceClientLike {
-  complete(request: VeniceCompleteRequest): Promise<string>;
-  checkStatus(): Promise<ConciergeStatus>;
-  model(): string;
+/**
+ * The minimum selector authority the stateless concierge needs. Keeping
+ * this interface narrower than SubstrateSelector makes the shared service
+ * easy to exercise without giving any route a provider-construction seam.
+ */
+export interface ConciergeSelectorLike {
+  getSubstrate(surface: "concierge"): Promise<SubstrateHandle>;
+  invokeSummarize(
+    surface: "concierge",
+    request: SummarizeRequest,
+  ): Promise<SubstrateResponse>;
+  getOperatorVisibleStatus(): Promise<SubstrateStatusReport>;
+  getConfig(): Pick<SubstrateConfig, "fallback">;
 }
 
 export class ConciergeUnavailableError extends Error {
