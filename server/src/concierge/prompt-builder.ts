@@ -1,7 +1,7 @@
 import {
   CONCIERGE_PROMPT_DOMAIN,
   type ConciergeContextBundle,
-  type VeniceMessage,
+  type ConciergePromptMessage,
 } from "./concierge-types.js";
 
 /**
@@ -31,7 +31,7 @@ export function isSummarizationQuery(question: string): boolean {
 export function buildConciergePrompt(args: {
   question: string;
   context: ConciergeContextBundle;
-}): VeniceMessage[] {
+}): ConciergePromptMessage[] {
   const safeContext = scrubSensitive(args.context);
   const isSummarization = isSummarizationQuery(args.question);
 

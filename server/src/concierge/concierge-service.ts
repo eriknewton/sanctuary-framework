@@ -5,8 +5,8 @@ import {
   type ConciergeAskRequest,
   type ConciergeAskResponse,
   type ConciergeContextBundle,
+  type ConciergeSelectorLike,
   type ConciergeStatus,
-  type VeniceClientLike,
 } from "./concierge-types.js";
 import { buildConciergePrompt, isSummarizationQuery } from "./prompt-builder.js";
 
@@ -16,18 +16,18 @@ export interface ConciergeContextReaderLike {
 
 export interface ConciergeServiceOptions {
   reader: ConciergeContextReaderLike;
-  venice: VeniceClientLike;
+  selector: ConciergeSelectorLike;
   onReadObserved?: (surface: string, question: string) => Promise<void> | void;
 }
 
 export class ConciergeService {
   private readonly reader: ConciergeContextReaderLike;
-  private readonly venice: VeniceClientLike;
+  private readonly selector: ConciergeSelectorLike;
   private readonly onReadObserved?: (surface: string, question: string) => Promise<void> | void;
 
   constructor(options: ConciergeServiceOptions) {
     this.reader = options.reader;
-    this.venice = options.venice;
+    this.selector = options.selector;
     this.onReadObserved = options.onReadObserved;
   }
 
@@ -63,22 +63,36 @@ export class ConciergeService {
       return {
         answer,
         model: "deterministic",
-        provider: "venice",
+        provider: "deterministic",
         read_surfaces: context.read_surfaces,
         context,
       };
     }
 
     try {
-      const answer = await this.venice.complete({
-        messages: buildConciergePrompt({ question, context }),
-        stream: request.stream !== false,
-        onToken,
+      const handle = await this.selector.getSubstrate("concierge");
+      if (!handle.capability.summarize) {
+        throw new ConciergeUnavailableError(
+          "concierge substrate is disabled or does not support summarization",
+        );
+      }
+      const response = await this.selector.invokeSummarize("concierge", {
+        kind: "summarize",
+        context: JSON.stringify(buildConciergePrompt({ question, context })),
+        query: question,
+        maxTokens: 512,
       });
+      if (response.failureClass || response.body.kind !== "summarize") {
+        throw new ConciergeUnavailableError(
+          `concierge substrate unavailable: ${response.failureClass ?? "invalid_response"}`,
+        );
+      }
+      const answer = response.body.text;
+      onToken?.(answer);
       return {
         answer,
-        model: this.venice.model(),
-        provider: "venice",
+        model: response.servedBy === handle.substrate ? handle.displayLabel : response.servedBy,
+        provider: response.servedBy,
         read_surfaces: context.read_surfaces,
         context,
       };
@@ -89,7 +103,26 @@ export class ConciergeService {
   }
 
   async status(): Promise<ConciergeStatus> {
-    return this.venice.checkStatus();
+    const [handle, report] = await Promise.all([
+      this.selector.getSubstrate("concierge"),
+      this.selector.getOperatorVisibleStatus(),
+    ]);
+    const surface = report.surfaces.find((entry) => entry.surface === "concierge");
+    if (!surface) {
+      throw new ConciergeUnavailableError("concierge selector status is unavailable");
+    }
+    return {
+      provider: handle.substrate,
+      configured: handle.substrate !== "disabled",
+      reachable: surface.health !== "unavailable",
+      model: handle.displayLabel,
+      read_surfaces: [...CONCIERGE_READ_SURFACES],
+      fallback: this.selector.getConfig().fallback.concierge,
+      message:
+        surface.health === "ok"
+          ? `Concierge ready via ${handle.displayLabel}`
+          : `Concierge ${surface.health}: ${surface.failureClass ?? "unknown"}`,
+    };
   }
 
   configuredReadSurfaces(): string[] {
