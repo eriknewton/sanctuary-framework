@@ -32,7 +32,11 @@ import { StateStore } from "../../src/cognitive/state-store.js";
 import { encrypt } from "../../src/core/encryption.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { derivePurposeKey, IDENTITY_ENCRYPTION_PURPOSE } from "../../src/core/key-derivation.js";
-import { SDW_EXPORT_MANIFEST_SIGNING_DOMAIN } from "../../src/core/signing-domains.js";
+import {
+  MEMORY_ADMISSION_SIGNING_DOMAIN_PREFIX,
+  MEMORY_ORIGIN_SIGNING_DOMAIN_PREFIX,
+  SDW_EXPORT_MANIFEST_SIGNING_DOMAIN,
+} from "../../src/core/signing-domains.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
@@ -470,6 +474,19 @@ describe("MEDIUM-2: the raw identity_sign surface cannot mint an internal artifa
         await sign.handler({ identity_id: storedIdentity.identity_id, payload: toBase64url(stringToBytes(`${prefix}forged`)) }),
       );
       expect(out.denied, prefix).toBe(true);
+    }
+    for (const domain of [
+      MEMORY_ORIGIN_SIGNING_DOMAIN_PREFIX,
+      MEMORY_ADMISSION_SIGNING_DOMAIN_PREFIX,
+    ]) {
+      const out = parse(
+        await sign.handler({
+          identity_id: storedIdentity.identity_id,
+          payload: toBase64url(stringToBytes(`${domain}{"forged":true}`)),
+        }),
+      );
+      expect(out.denied, domain).toBe(true);
+      expect(out.signature).toBeUndefined();
     }
     const plain = parse(
       await sign.handler({ identity_id: storedIdentity.identity_id, payload: toBase64url(stringToBytes("an ordinary commitment")) }),
