@@ -49,6 +49,9 @@ export interface ModelProvenance {
   /** True if inference runs on the local agent's hardware (not delegated to cloud API) */
   local_inference: boolean;
 
+  /** Closed intelligence surface names served by this verified local artifact. */
+  serving_surfaces?: readonly string[];
+
   /** ISO 8601 timestamp when this provenance was declared */
   declared_at: string;
 }

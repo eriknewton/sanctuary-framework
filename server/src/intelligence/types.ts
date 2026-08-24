@@ -243,6 +243,11 @@ export interface SubstrateConfig {
   localModelPicks: Partial<Record<Surface, LocalModelPick>>;
   /** Custom Ollama model tag override per surface (overrides localModelPicks if set). */
   customLocalModelTags?: Partial<Record<Surface, string>>;
+  /**
+   * Durable provisioning refusals surfaced through the existing bounded
+   * `RecentFailureEntry` status shape. No request/model content is retained.
+   */
+  provisioningFailures?: Partial<Record<Surface, RecentFailureEntry[]>>;
   /** Ollama HTTP endpoint; defaults to http://localhost:11434. */
   ollamaEndpoint?: string;
   /** Venice API key, if 'venice' chosen for any surface. Encrypted at rest. */

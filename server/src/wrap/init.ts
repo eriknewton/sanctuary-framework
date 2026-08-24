@@ -66,6 +66,7 @@ import {
 } from "../paths.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
 import { mkdirSafeUnderRoot } from "./config-reader.js";
+import { runLocalIntelligenceSetup } from "./local-intelligence.js";
 
 /**
  * Operator-facing display path of the machine-wide Castle Wall enforcement
@@ -109,6 +110,8 @@ export interface InitOptions {
    * later when ready. Mirrors --no-pin. Default behavior (no flag) is to seed.
    */
   noIdentity?: boolean;
+  /** Pre-answer the local-intelligence setup choice; TTY confirm still gates mutation. */
+  provisionLocalIntelligence?: boolean;
 }
 
 /**
@@ -227,6 +230,7 @@ export interface RunInitDeps {
   recoveryKeychain?: KeychainCustodyOptions;
   /** Test seam: simulate a race after preflight but before O_EXCL capture. */
   beforeRecoveryKeyOutputWrite?: (filePath: string) => void | Promise<void>;
+  runLocalIntelligenceSetup?: typeof runLocalIntelligenceSetup;
 }
 
 export async function runInit(
@@ -608,6 +612,33 @@ export async function runInit(
       });
     }
   }
+
+  // P1 local intelligence is additive to fortress creation. It shares one
+  // ceremony with `protect`; refusal or adapter failure is recorded loudly
+  // but never invalidates the custody/identity work that already succeeded.
+  try {
+    const localSetup = deps.runLocalIntelligenceSetup ?? runLocalIntelligenceSetup;
+    const outcome = await localSetup({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: fortressId,
+      preAnswered: options.provisionLocalIntelligence,
+      isTty: process.stdin.isTTY === true,
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      print: (line) => console.error(`  ${line}`),
+    });
+    if (outcome.kind === "refused") {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(`  Local intelligence remains DEGRADED (${outcome.reason}).`);
+    }
+  } catch (err) {
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+    console.error(
+      `  Note: local intelligence setup did not complete (${err instanceof Error ? err.message : String(err)}); ` +
+        `the fortress remains initialized and local surfaces remain DEGRADED.`,
+    );
+  }
   // Castle Wall global-pin provisioning. By default init writes the
   // machine-wide enforcement anchor; --no-pin (or SANCTUARY_INIT_NO_PIN)
   // skips it so a test/isolated fortress never silently touches the
@@ -680,6 +711,12 @@ export function parseInitArgs(argv: string[]): ParsedInitArgs {
       case "--no-identity":
         opts.noIdentity = true;
         break;
+      case "--provision-local-intelligence":
+        opts.provisionLocalIntelligence = true;
+        break;
+      case "--no-provision-local-intelligence":
+        opts.provisionLocalIntelligence = false;
+        break;
       case "--recovery-out":
         opts.recoveryOut = readRequiredPathArg(argv, i, "--recovery-out");
         i++;
@@ -741,6 +778,11 @@ Options:
                        fortress and add an identity later with
                        \`sanctuary identity create\`. Also settable via
                        SANCTUARY_INIT_NO_IDENTITY=1.
+  --provision-local-intelligence
+                       Enter the disclosed local-model setup ceremony. The
+                       plan and TTY confirmation still precede any mutation.
+  --no-provision-local-intelligence
+                       Decline local-model setup without printing a plan.
   --help, -h           Show this help.
 
 What init does:

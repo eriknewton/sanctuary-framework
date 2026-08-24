@@ -1841,7 +1841,7 @@ function renderIntelligencePicker() {
     const presentModels = hardware.ollamaModels || [];
     const ollamaLine = hardware.ollamaReachable
       ? 'Ollama reachable. Models present: ' + (presentModels.length ? presentModels.join(", ") : "(none)")
-      : 'Ollama not reachable at ' + (config.ollama_endpoint || "http://localhost:11434") + '. Install Ollama and run "ollama pull gemma2:2b".';
+      : 'Ollama not reachable at ' + (config.ollama_endpoint || "http://localhost:11434") + '. Re-run sanctuary protect or sanctuary init interactively to review the signed local-intelligence setup plan. Until a signed model manifest is available and every pulled digest verifies, local surfaces remain DEGRADED.';
     sub = '<div class="intel-suboptions">' +
       '<label>Pick a local model:</label>' +
       ['gemma-2-2b','phi-4-mini','llama-3.1-8b'].map(function (m) {

@@ -53,11 +53,25 @@ export interface OllamaClientConfig {
 export interface OllamaTagsResponse {
   models: Array<{
     name: string;
+    model?: string;
+    digest?: string;
     /** ISO8601 timestamp; not consumed by the selector. */
     modified_at?: string;
     size?: number;
   }>;
 }
+
+export interface OllamaMutationResult {
+  ok: boolean;
+  failureClass: SubstrateResponse["failureClass"];
+}
+
+export interface OllamaShowResult extends OllamaMutationResult {
+  /** Lowercase SHA-256 hex observed from Ollama, or null on refusal. */
+  digest: string | null;
+}
+
+const SHA256_DIGEST = /^(?:sha256:)?([0-9a-f]{64})$/;
 
 export class OllamaClient {
   private endpoint: string;
@@ -91,6 +105,89 @@ export class OllamaClient {
       }
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Pull one manifest-approved runtime tag. `stream:false` bounds the response
+   * to one JSON object; callers still verify `/api/show` before trusting it.
+   */
+  async pull(model: string): Promise<OllamaMutationResult> {
+    return this.runMutation("/api/pull", { model, stream: false });
+  }
+
+  /**
+   * Observe one exact installed runtime tag, then return its registry digest.
+   * Current Ollama `/api/show` proves the model exists but exposes the digest
+   * through `/api/tags`; older/future compatible digest fields are accepted
+   * directly. A missing or malformed SHA-256 is always a refusal.
+   */
+  async show(model: string): Promise<OllamaShowResult> {
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), this.timeoutMs);
+      try {
+        const res = await this.fetchImpl(`${this.endpoint}/api/show`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model }),
+          signal: ctl.signal,
+        });
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          return {
+            ok: false,
+            failureClass: classifyHttpError(res.status, text),
+            digest: null,
+          };
+        }
+        const body = (await res.json()) as {
+          digest?: unknown;
+          details?: { digest?: unknown };
+        };
+        const raw = typeof body.digest === "string"
+          ? body.digest
+          : typeof body.details?.digest === "string"
+            ? body.details.digest
+            : null;
+        let match = raw?.toLowerCase().match(SHA256_DIGEST) ?? null;
+        if (!match) {
+          const tagsResponse = await this.fetchImpl(`${this.endpoint}/api/tags`, {
+            method: "GET",
+            signal: ctl.signal,
+          });
+          if (!tagsResponse.ok) {
+            const text = await tagsResponse.text().catch(() => "");
+            return {
+              ok: false,
+              failureClass: classifyHttpError(tagsResponse.status, text),
+              digest: null,
+            };
+          }
+          const tags = (await tagsResponse.json()) as OllamaTagsResponse;
+          const installed = tags.models?.find(
+            (entry) => entry.name === model || entry.model === model,
+          );
+          match = installed?.digest?.toLowerCase().match(SHA256_DIGEST) ?? null;
+        }
+        if (!match) {
+          return {
+            ok: false,
+            failureClass: "substrate_misconfigured",
+            digest: null,
+          };
+        }
+        return { ok: true, failureClass: null, digest: match[1]! };
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (err) {
+      const aborted = err instanceof Error && err.name === "AbortError";
+      return {
+        ok: false,
+        failureClass: aborted ? "substrate_timeout" : "substrate_unavailable",
+        digest: null,
+      };
     }
   }
 
@@ -149,6 +246,41 @@ export class OllamaClient {
         class: aborted ? "substrate_timeout" : "substrate_unavailable",
         message: aborted ? "ollama timeout" : "ollama unreachable",
       });
+    }
+  }
+
+  private async runMutation(
+    path: string,
+    body: Readonly<Record<string, unknown>>,
+  ): Promise<OllamaMutationResult> {
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), this.timeoutMs);
+      try {
+        const res = await this.fetchImpl(`${this.endpoint}${path}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: ctl.signal,
+        });
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          return {
+            ok: false,
+            failureClass: classifyHttpError(res.status, text),
+          };
+        }
+        await res.json().catch(() => null);
+        return { ok: true, failureClass: null };
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (err) {
+      const aborted = err instanceof Error && err.name === "AbortError";
+      return {
+        ok: false,
+        failureClass: aborted ? "substrate_timeout" : "substrate_unavailable",
+      };
     }
   }
 }
