@@ -214,6 +214,19 @@ export class SentinelDispatcher {
   }
 
   /**
+   * Route a synchronous security-boundary finding through the exact same
+   * durable store, critical audit append, and subscriber fan-out used by
+   * timer-driven sentinels. Compiled-context screening uses this ingress so
+   * its findings cannot become an audit-only shadow signal.
+   */
+  async reportFinding(
+    sentinelId: string,
+    finding: SentinelFinding,
+  ): Promise<SentinelFinding> {
+    return this.routeFinding(sentinelId, finding);
+  }
+
+  /**
    * Start the auto-tick loop. No-op when tickIntervalMs is 0 or when
    * already started. Tests typically leave auto-tick off and call
    * `tick()` directly.

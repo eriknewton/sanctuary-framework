@@ -49,6 +49,7 @@ import { resolveStoragePath } from "../paths.js";
 import { loadConfig } from "../config.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
+import { createCompiledContextRuntime } from "../compiled-context/runtime.js";
 
 export interface PolicyArgs {
   argv: string[];
@@ -195,11 +196,19 @@ async function tryLoadSubstrateSelector(storagePath: string): Promise<{
 
     const fortressId = `fortress:${storagePath}`;
     const auditLog = new AuditLog(storage, masterKey);
+    const compiledContextRuntime = createCompiledContextRuntime({
+      storage,
+      masterKey,
+      auditLog,
+      fortressId: fortressIdFromStoragePath(storagePath),
+      identityId: fortressId,
+    });
     const selector = new SubstrateSelector({
       storage,
       masterKey,
       auditLog,
       identityId: fortressId,
+      compiledContextScanner: compiledContextRuntime.scanner,
     });
     await selector.load();
     // Rho-2.5 (privacy-leak class fix): the English-policy compile path
