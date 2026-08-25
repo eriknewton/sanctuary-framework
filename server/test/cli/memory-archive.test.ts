@@ -32,6 +32,7 @@ import {
   MacOsLocalHumanInteraction,
   runMemoryArchiveExportCommand,
   runMemoryArchiveImportCommand,
+  runMemoryProvenancePruneSignersCommand,
   type MemoryArchiveDialogRunner,
   type PrivateMemoryArchiveInteraction,
 } from "../../src/cli/memory-archive.js";
@@ -386,6 +387,29 @@ describe("Exit V2 memory archive CLI", () => {
       expect(code).toBe(1);
       await expect(stat(bundle)).rejects.toMatchObject({ code: "ENOENT" });
     }
+  }, 60_000);
+
+  it("binds the signer-prune CLI to the real Tier-1 approval decision before signer mutation", async () => {
+    const target = await fortress("signer-prune-cli-denied", "fleet-self", false);
+    const approval = new RecordingApprovalChannel({
+      decision: "deny",
+      decided_at: "2026-08-25T00:00:00.000Z",
+      decided_by: "human",
+    });
+    const before = await target.storage.list("_known_signers");
+    const { out, err } = sinkPair();
+    expect(await runMemoryProvenancePruneSignersCommand({
+      argv: ["--fortress", target.path, "--json"],
+      out,
+      err,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      interaction: new TestTerminal(),
+      approvalChannel: approval,
+    })).toBe(1);
+    expect(approval.requests).toHaveLength(1);
+    expect(approval.requests[0]!.operation).toBe("memory_provenance_prune_signers");
+    expect(await target.storage.list("_known_signers")).toEqual(before);
+    expect(out.text()).toBe("");
   }, 60_000);
 
   it("imports only a hidden local-dialog key, ignores env and ordinary stdin, and preserves destination-local identity", async () => {
@@ -758,11 +782,12 @@ describe("Exit V2 memory archive CLI", () => {
   }, 60_000);
 
   it("wires the memory archive and bad-signer CLI routes and keeps the V1 manifest surface unchanged", async () => {
-    const [exportHelp, importHelp, markHelp, clearHelp] = await Promise.all([
+    const [exportHelp, importHelp, markHelp, clearHelp, pruneHelp] = await Promise.all([
       runCli("memory_archive_export", "--help"),
       runCli("memory_archive_import", "--help"),
       runCli("memory_provenance_mark_bad_signer", "--help"),
       runCli("memory_provenance_clear_bad_signer", "--help"),
+      runCli("memory_provenance_prune_signers", "--help"),
     ]);
     expect(exportHelp).toMatchObject({ code: 0, stderr: "" });
     expect(exportHelp.stdout).toContain("Usage: sanctuary memory_archive_export");
@@ -772,6 +797,8 @@ describe("Exit V2 memory archive CLI", () => {
     expect(markHelp.stdout).toContain("Usage: sanctuary memory_provenance_mark_bad_signer");
     expect(clearHelp).toMatchObject({ code: 0, stderr: "" });
     expect(clearHelp.stdout).toContain("Usage: sanctuary memory_provenance_clear_bad_signer");
+    expect(pruneHelp).toMatchObject({ code: 0, stderr: "" });
+    expect(pruneHelp.stdout).toContain("Usage: sanctuary memory_provenance_prune_signers");
     expect(exportHelp.stdout).not.toContain("--passphrase");
     expect(importHelp.stdout).not.toContain("--passphrase");
 

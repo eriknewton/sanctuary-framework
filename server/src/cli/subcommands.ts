@@ -38,6 +38,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "memory_archive_import",
   "memory_provenance_mark_bad_signer",
   "memory_provenance_clear_bad_signer",
+  "memory_provenance_prune_signers",
   "memory_emit",
   "memory_ingest",
   "memory_transcode",

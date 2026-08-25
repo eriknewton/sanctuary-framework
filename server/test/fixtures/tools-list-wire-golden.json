@@ -1,5 +1,5 @@
 {
-  "tool_count": 110,
+  "tool_count": 111,
   "tools": [
     {
       "name": "identity_create",
@@ -1931,6 +1931,15 @@
           "signer_did",
           "public_key_sha256"
         ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "memory_provenance_prune_signers",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
         "additionalProperties": false
       }
     },

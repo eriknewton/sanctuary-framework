@@ -11,6 +11,7 @@ import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { MAX_MEMORY_PROVENANCE_SIGNERS } from "../../src/reputation/known-signers-store.js";
 import { MEMORY_PROVENANCE_SIGNER_PREFIX } from "../../src/reputation/known-signers-store.js";
 import { EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT_V2, EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2 } from "../../src/contracts/v1.2/exit-bundle-manifest.js";
+import { MEMORY_PROVENANCE_SIGNER_PRUNE_COMPLETION_KEY } from "../../src/exit/bundle.js";
 import {
   DISCLOSURE_CAPSULE_RETURN_AUTHOR_AGENT_ID,
   MAX_MEMORY_PROVENANCE_COMPANION_BYTES,
@@ -35,6 +36,11 @@ import {
   memoryOriginSigningBytes,
   type MemoryOriginBody,
 } from "../../src/sdw/memory-provenance-contract.js";
+import {
+  MEMORY_PROVENANCE_SIGNER_PRUNE_COMPLETE_AUDIT,
+  MEMORY_PROVENANCE_SIGNER_PRUNE_OPERATION,
+  MEMORY_PROVENANCE_SIGNER_PRUNE_PLAN_AUDIT,
+} from "../../src/sdw/memory-provenance-signer-prune.js";
 
 const memoryAttestSource = fileURLToPath(
   new URL("../../src/cognitive/memory-attest.ts", import.meta.url),
@@ -74,6 +80,17 @@ describe("C1 frozen memory-provenance surfaces", () => {
     expect(MAX_MEMORY_PROVENANCE_COMPANION_BYTES).toBe(16 * 1024);
     expect(MAX_MEMORY_PROVENANCE_SIGNER_ENTRIES).toBe(MAX_MEMORY_PROVENANCE_SIGNERS);
     expect(MEMORY_PROVENANCE_SIGNER_PREFIX).toBe("memprov.");
+    expect([
+      MEMORY_PROVENANCE_SIGNER_PRUNE_OPERATION,
+      MEMORY_PROVENANCE_SIGNER_PRUNE_PLAN_AUDIT,
+      MEMORY_PROVENANCE_SIGNER_PRUNE_COMPLETE_AUDIT,
+      MEMORY_PROVENANCE_SIGNER_PRUNE_COMPLETION_KEY,
+    ]).toEqual([
+      "memory_provenance_prune_signers",
+      "MEMORY_PROVENANCE_SIGNER_PRUNE_PLAN",
+      "MEMORY_PROVENANCE_SIGNER_PRUNE_COMPLETE",
+      "memory-provenance-signer-prune-v1",
+    ]);
     expect([EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT_V2, EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2]).toEqual([
       "SANCTUARY_EXIT_V2_SDW_MEMORY_ARCHIVE_V2",
       "SANCTUARY_EXIT_V2_SDW_MEMORY_LOGICAL_ARCHIVE_V2",

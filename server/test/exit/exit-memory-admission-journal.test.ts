@@ -2,11 +2,23 @@ import { describe, expect, it } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { stringToBytes, bytesToString } from "../../src/core/encoding.js";
+import { stringToBytes, bytesToString, toBase64url } from "../../src/core/encoding.js";
+import { hashToString } from "../../src/core/hashing.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
-import { createExitAdmissionWriteGuard, runJournaledExitMemoryAdmission } from "../../src/exit/bundle.js";
-import { withExitAdmissionLock } from "../../src/storage/exit-import-journal.js";
+import {
+  createExitAdmissionWriteGuard,
+  MEMORY_PROVENANCE_SIGNER_PRUNE_COMPLETION_KEY,
+  recoverInterruptedExitImports,
+  runJournaledExitMemoryAdmission,
+  runJournaledMemoryProvenanceSignerPrune,
+} from "../../src/exit/bundle.js";
+import {
+  EXIT_IMPORT_JOURNAL_NAMESPACE,
+  EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
+  withExitAdmissionLock,
+} from "../../src/storage/exit-import-journal.js";
 
 describe("C4 shared Exit memory-admission journal", () => {
   it("restores exact pre-images in reverse failure handling after a recorded write", async () => {
@@ -122,13 +134,136 @@ describe("C4 shared Exit memory-admission journal", () => {
       await Promise.resolve();
       active--;
     });
+    const runSignerPrune = () => withExitAdmissionLock(base, "memory_signer_prune", async () => {
+      active++;
+      maximum = Math.max(maximum, active);
+      await Promise.resolve();
+      active--;
+    });
     try {
       // Memory-archive admission and the established reputation Exit import
       // owner share the same cross-process admission lock.
-      await Promise.all([run("race-memory"), runReputationImport()]);
+      await Promise.all([run("race-memory"), runReputationImport(), runSignerPrune()]);
       expect(maximum).toBe(1);
     } finally {
       await rm(raceRoot, { recursive: true, force: true });
     }
+  });
+
+  it("restores exact signer bytes at every prune post-image and delete boundary", async () => {
+    for (const boundary of ["before-postimage", "after-postimage", "after-delete"] as const) {
+      const storage = new MemoryStorage();
+      const key = `memprov.${boundary}`;
+      const before = stringToBytes(`before-${boundary}`);
+      await storage.write("_known_signers", key, before);
+      await expect(runJournaledMemoryProvenanceSignerPrune({
+        storage,
+        identityId: "identity",
+        locations: [{ namespace: "_known_signers", key }],
+        operation: async ({ recordPostImage }) => {
+          if (boundary === "before-postimage") throw new Error(boundary);
+          await recordPostImage("_known_signers", key, null);
+          if (boundary === "after-postimage") throw new Error(boundary);
+          await storage.delete("_known_signers", key, true);
+          throw new Error(boundary);
+        },
+      })).rejects.toThrow(boundary);
+      expect(await storage.read("_known_signers", key)).toEqual(before);
+      expect(await storage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
+      expect(await storage.list(EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE)).toHaveLength(0);
+    }
+  });
+
+  it("recovers an interrupted prune as rollback before activation and commit after activation", async () => {
+    const importId = MEMORY_PROVENANCE_SIGNER_PRUNE_COMPLETION_KEY;
+    const signerKey = "memprov.crash";
+    const before = stringToBytes("exact-before-crash");
+    const journal = (data: string | null) => ({
+      import_id: importId,
+      identity_id: "identity",
+      started_at: "2026-08-25T00:00:00.000Z",
+      snapshots: [
+        { namespace: "_known_signers", key: signerKey, data },
+        { namespace: "_exit_imports", key: importId, data: null },
+      ],
+    });
+    const postImageKey = `${importId}:${hashToString(stringToBytes(
+      `${"_known_signers".length}:_known_signers${signerKey}`,
+    ))}`;
+
+    const rollbackStorage = new MemoryStorage();
+    await rollbackStorage.write("_known_signers", signerKey, before);
+    await rollbackStorage.write(
+      EXIT_IMPORT_JOURNAL_NAMESPACE,
+      importId,
+      stringToBytes(JSON.stringify(journal(toBase64url(before)))),
+    );
+    await rollbackStorage.write(
+      EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
+      postImageKey,
+      stringToBytes(JSON.stringify({ deleted: true })),
+    );
+    await rollbackStorage.delete("_known_signers", signerKey, true);
+    const rollback = await recoverInterruptedExitImports(
+      rollbackStorage,
+      new AuditLog(rollbackStorage, new Uint8Array(32).fill(17)),
+    );
+    expect(rollback).toMatchObject({ recovered: 1, failed: [] });
+    expect(await rollbackStorage.read("_known_signers", signerKey)).toEqual(before);
+
+    const committedStorage = new MemoryStorage();
+    await committedStorage.write(
+      EXIT_IMPORT_JOURNAL_NAMESPACE,
+      importId,
+      stringToBytes(JSON.stringify(journal(toBase64url(before)))),
+    );
+    await committedStorage.write(
+      EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
+      postImageKey,
+      stringToBytes(JSON.stringify({ deleted: true })),
+    );
+    await committedStorage.write("_exit_imports", importId, stringToBytes(JSON.stringify({
+      import_id: importId,
+      activated_at: "2026-08-25T00:00:01.000Z",
+    })));
+    const committed = await recoverInterruptedExitImports(
+      committedStorage,
+      new AuditLog(committedStorage, new Uint8Array(32).fill(18)),
+    );
+    expect(committed).toMatchObject({ recovered: 1, failed: [] });
+    expect(await committedStorage.read("_known_signers", signerKey)).toBeNull();
+    expect(await committedStorage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(0);
+    expect(await committedStorage.list(EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE)).toHaveLength(0);
+
+    // The next bounded prune clears the disposable fixed witness before
+    // publishing its journal and leaves no per-run completion accumulation.
+    await committedStorage.write("_known_signers", signerKey, before);
+    await runJournaledMemoryProvenanceSignerPrune({
+      storage: committedStorage,
+      identityId: "identity",
+      locations: [{ namespace: "_known_signers", key: signerKey }],
+      operation: async () => "ok",
+    });
+    expect(await committedStorage.list("_exit_imports")).toHaveLength(0);
+  });
+
+  it("retains recovery evidence and surfaces partial_scope on prune divergence", async () => {
+    const storage = new MemoryStorage();
+    const key = "memprov.diverged";
+    await storage.write("_known_signers", key, stringToBytes("before"));
+    await expect(runJournaledMemoryProvenanceSignerPrune({
+      storage,
+      identityId: "identity",
+      locations: [{ namespace: "_known_signers", key }],
+      operation: async ({ recordPostImage }) => {
+        await recordPostImage("_known_signers", key, null);
+        await storage.delete("_known_signers", key, true);
+        await storage.write("_known_signers", key, stringToBytes("racer"));
+        throw new Error("fault after divergence");
+      },
+    })).rejects.toMatchObject({ name: "MemoryProvenanceSignerPrunePartialScopeError" });
+    expect(bytesToString((await storage.read("_known_signers", key))!)).toBe("racer");
+    expect(await storage.list(EXIT_IMPORT_JOURNAL_NAMESPACE)).toHaveLength(1);
+    expect(await storage.list(EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE)).toHaveLength(1);
   });
 });

@@ -54,6 +54,7 @@ import { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
 import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../sdw/memory-provenance-signing.js";
 import { SdwMemoryProvenanceMigration } from "../sdw/memory-provenance-migration.js";
 import { MemoryProvenanceBadSignerStore } from "../sdw/memory-provenance-bad-signers.js";
+import { MemoryProvenanceSignerPruner } from "../sdw/memory-provenance-signer-prune.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import type { StorageBackend } from "../storage/interface.js";
 import { KnownSignersStore } from "../reputation/known-signers-store.js";
@@ -122,6 +123,12 @@ interface ParsedBadSigner {
   readonly json: boolean;
 }
 
+interface ParsedSignerPrune {
+  readonly ownerRef: string;
+  readonly fortressPath: string;
+  readonly json: boolean;
+}
+
 interface ParsedExport {
   readonly archiveId: string;
   readonly outputPath: string;
@@ -148,6 +155,7 @@ interface Bootstrapped {
   readonly adapter: SdwMemoryBackendAdapter;
   readonly memoryProvenanceSigners: KnownSignersStore;
   readonly badSignerStore: MemoryProvenanceBadSignerStore;
+  readonly signerPruner: MemoryProvenanceSignerPruner;
   readonly resolveProvenanceSigner: (identityId: string, did: string) => Uint8Array | undefined;
   readonly rememberProvenanceSigner: (did: string, publicKey: Uint8Array) => void;
   readonly signer: {
@@ -517,6 +525,51 @@ export async function runMemoryProvenanceClearBadSignerCommand(
   return runMemoryProvenanceBadSignerCommand("clear", args);
 }
 
+export async function runMemoryProvenancePruneSignersCommand(
+  args: MemoryArchiveCommandArgs,
+): Promise<number> {
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const operation = "memory_provenance_prune_signers";
+  if (args.argv.includes("--help") || args.argv.includes("-h")) {
+    write(out, "Usage: sanctuary memory_provenance_prune_signers --fortress <path> [--owner-ref <id>] [--json]\n");
+    return 0;
+  }
+  const parsed = parseSignerPrune(args.argv, err);
+  if (parsed === null) return 2;
+  const interaction = resolveInteraction(args.interaction, args.dialogRunner, err);
+  if (interaction === null) return 1;
+  let boot: Bootstrapped | null = null;
+  try {
+    boot = await bootstrap(parsed, args.env ?? process.env, err);
+    if (boot === null) return 1;
+    const gate = new ApprovalGate(
+      await loadPrincipalPolicy(parsed.fortressPath),
+      boot.baseline,
+      args.approvalChannel ?? interaction,
+      boot.auditLog,
+    );
+    const decision = await gate.evaluate(operation, { agent_id: null });
+    if (!decision.allowed || decision.approval_audit_id === undefined) {
+      write(err, `Denied: ${operation} was not approved.\n`);
+      return 1;
+    }
+    const result = await boot.signerPruner.prune({
+      approvalAuditId: decision.approval_audit_id,
+    });
+    write(out, parsed.json
+      ? JSON.stringify({ pruned: true, ...result }) + "\n"
+      : `${operation}: deleted ${String(result.deleted.length)} unreachable signer mapping(s)\n`);
+    return 0;
+  } catch {
+    write(err, `${operation} failed\n`);
+    return 1;
+  } finally {
+    await dispose(boot);
+    interaction.close();
+  }
+}
+
 async function runMemoryProvenanceBadSignerCommand(
   action: "mark" | "clear",
   args: MemoryArchiveCommandArgs,
@@ -669,6 +722,15 @@ async function bootstrap(
       resolveMemoryIntegrityState: () => migration.getState(),
       badSignerAuthority: badSignerStore,
     });
+    const signerPruner = new MemoryProvenanceSignerPruner({
+      storage,
+      masterKey,
+      fortressId,
+      knownSignersStore: memoryProvenanceSigners,
+      resolveSignerPublicKey: resolveProvenanceSigner,
+      forgetSigner: (did) => { persistedByDid.delete(did); },
+      auditLog: memoryArchiveAuditLog,
+    });
     return {
       storage,
       journalStorage,
@@ -680,6 +742,7 @@ async function bootstrap(
       adapter,
       memoryProvenanceSigners,
       badSignerStore,
+      signerPruner,
       resolveProvenanceSigner,
       rememberProvenanceSigner,
       signer: {
@@ -1078,6 +1141,22 @@ function parseBadSigner(
     signerDid,
     publicKeySha256,
     ...(reason === undefined ? {} : { reason }),
+    ownerRef,
+    fortressPath: resolve(fortressPath),
+    json: parsed.switches.has("--json"),
+  };
+}
+
+function parseSignerPrune(argv: string[], err: Writable): ParsedSignerPrune | null {
+  const parsed = parseFlags(argv, ["--owner-ref", "--fortress"]);
+  const ownerRef = parsed?.values.get("--owner-ref") ?? "fleet-self";
+  const fortressPath = parsed?.values.get("--fortress");
+  if (parsed === null || parsed.unknown.length > 0 || fortressPath === undefined ||
+      !SAFE_OWNER_REF.test(ownerRef)) {
+    write(err, "Usage: sanctuary memory_provenance_prune_signers --fortress <path> [--owner-ref <id>] [--json]\n");
+    return null;
+  }
+  return {
     ownerRef,
     fortressPath: resolve(fortressPath),
     json: parsed.switches.has("--json"),

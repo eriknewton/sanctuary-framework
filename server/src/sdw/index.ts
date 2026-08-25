@@ -8,6 +8,8 @@ export * from "./memory-file-tools.js";
 export * from "./memory-provenance-contract.js";
 export * from "./memory-provenance-migration.js";
 export * from "./memory-provenance-migration-tools.js";
+export * from "./memory-provenance-signer-prune.js";
+export * from "./memory-provenance-signer-prune-tools.js";
 export * from "./tools.js";
 export * from "./grammar.js";
 export * from "./lmdb-backend.js";

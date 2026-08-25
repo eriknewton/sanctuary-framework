@@ -56,6 +56,7 @@ describe("memory integrity restore non-relaxable Tier 1", () => {
       "sdw_memory_provenance_repair_completion_marker",
       "memory_provenance_mark_bad_signer",
       "memory_provenance_clear_bad_signer",
+      "memory_provenance_prune_signers",
     ]);
   });
 

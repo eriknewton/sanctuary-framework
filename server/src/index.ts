@@ -125,6 +125,8 @@ import { SdwMemoryProvenanceMigration } from "./sdw/memory-provenance-migration.
 import { createSdwMemoryProvenanceMigrationTools } from "./sdw/memory-provenance-migration-tools.js";
 import { MemoryProvenanceBadSignerStore } from "./sdw/memory-provenance-bad-signers.js";
 import { createMemoryProvenanceBadSignerTools } from "./sdw/memory-provenance-bad-signer-tools.js";
+import { MemoryProvenanceSignerPruner } from "./sdw/memory-provenance-signer-prune.js";
+import { createMemoryProvenanceSignerPruneTool } from "./sdw/memory-provenance-signer-prune-tools.js";
 import { KnownSignersStore } from "./reputation/known-signers-store.js";
 import { StorageSnapshotSdwInventorySource } from "./sdw/export.js";
 import { fromBase64url } from "./core/encoding.js";
@@ -1628,6 +1630,19 @@ export async function createSanctuaryServer(options?: {
     auditLog,
     isolationGuard: sdwMemoryIsolationGuard,
   });
+  const sdwMemorySignerPruneTool = createMemoryProvenanceSignerPruneTool({
+    pruner: new MemoryProvenanceSignerPruner({
+      storage,
+      masterKey,
+      fortressId: sdwFortressId,
+      knownSignersStore: memoryProvenanceSigners,
+      resolveSignerPublicKey: resolveSdwMemorySignerPublicKey,
+      forgetSigner: (did) => { persistedMemoryProvenanceSigners.delete(did); },
+      auditLog,
+    }),
+    auditLog,
+    isolationGuard: sdwMemoryIsolationGuard,
+  });
   const sdwMemoryFileTools = createSdwMemoryFileTools({
     adapter: sdwMemoryAdapter,
     auditLog,
@@ -1882,6 +1897,7 @@ export async function createSanctuaryServer(options?: {
     sdwMemoryProvenanceTool,
     ...sdwMemoryProvenanceMigrationTools,
     ...sdwMemoryBadSignerTools,
+    sdwMemorySignerPruneTool,
     ...sdwMemoryFileTools,
     ...sdwVaultTools,
     ...complianceTools,
@@ -2136,6 +2152,7 @@ const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([
   "sdw_memory_provenance_repair_completion_marker",
   "memory_provenance_mark_bad_signer",
   "memory_provenance_clear_bad_signer",
+  "memory_provenance_prune_signers",
   "shr_gateway_export",
   "shr_generate",
   "state_delete",
