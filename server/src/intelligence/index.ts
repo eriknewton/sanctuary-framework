@@ -104,6 +104,27 @@ export {
 } from "./model-manifest-v2.js";
 
 export {
+  LIGHT_RUNTIME_SINGLE_FLIGHT_MAX_ENTRIES,
+  OLLAMA_RUNTIME_EVIDENCE_DEFAULT_TIMEOUT_MS,
+  OLLAMA_RUNTIME_EVIDENCE_MAX_MODELS,
+  OLLAMA_RUNTIME_EVIDENCE_MAX_RESPONSE_BYTES,
+  OLLAMA_RUNTIME_TAG_MAX_CHARS,
+  RUNTIME_LIGHT_PROTOCOL_STATES,
+  OllamaRuntimeEvidenceClient,
+  createSingleFlightLightRuntimeVerifier,
+  inspectOllamaShowPayload,
+  inspectOllamaTagsDigest,
+  type OllamaRuntimeEvidenceClientConfig,
+  type OllamaShowInspectionResult,
+  type OllamaTagsDigestInspectionResult,
+  type RuntimeLightProtocolState,
+  type RuntimeLightRefusalReason,
+  type RuntimeLightVerificationRequest,
+  type RuntimeLightVerificationResult,
+  type RuntimeLightVerifier,
+} from "./runtime-light-verifier.js";
+
+export {
   BADGE_LABEL_KEYS,
   BADGE_TRADEOFF_KEYS,
   BACKEND_FALLBACK_STRINGS,
