@@ -72,6 +72,10 @@ import type { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend
 import { passageContentHash } from "../sdw/write-gate.js";
 import { isMemoryProvenanceOutboundSyncEligible } from "../sdw/memory-provenance-routing.js";
 import {
+  evaluateMemoryProvenanceSignerEligibility,
+  type MemoryProvenanceBadSignerAuthority,
+} from "../sdw/memory-provenance-bad-signers.js";
+import {
   buildMemoryTranscodeArchivePassages,
   MEMORY_TRANSCODE_VERSION,
   readMemoryTranscodeArchive,
@@ -163,6 +167,7 @@ export interface ImportExitV2SdwMemoryArchiveOptions
   readonly now?: () => string;
   readonly knownSignersStore?: KnownSignersStore;
   readonly onProvenanceSignerPersisted?: (did: string, publicKey: Uint8Array) => void;
+  readonly badSignerAuthority?: MemoryProvenanceBadSignerAuthority;
 }
 
 export interface ImportExitV2SdwMemoryArchiveResult {
@@ -216,8 +221,10 @@ export async function planExitV2SdwMemoryAdmission(options: {
   readonly signer: ExitV2MemorySigner;
   /** Exact commit timestamp the paired import will use. */
   readonly importedAt?: string;
+  readonly badSignerAuthority?: MemoryProvenanceBadSignerAuthority;
 }): Promise<ExitV2SdwMemoryAdmissionPlan> {
   const validated = validateAndDecrypt(options);
+  await assertArchiveBadSignersEligible(validated, options.badSignerAuthority);
   if (validated.payload.format === EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2 &&
       await options.adapter.getMemoryIntegrityState() !== "state_COMPLETE") {
     throw new Error("Exit V2 signed-memory admission preflight requires completed provenance migration");
@@ -371,6 +378,7 @@ export async function importExitV2SdwMemoryArchive(
   options: ImportExitV2SdwMemoryArchiveOptions,
 ): Promise<ImportExitV2SdwMemoryArchiveResult> {
   const validated = validateAndDecrypt(options);
+  await assertArchiveBadSignersEligible(validated, options.badSignerAuthority);
   assertSigner(options.signer);
   if (validated.payload.format === EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2) {
     const resolveState = (options.adapter as MemoryBackendAdapter &
@@ -540,6 +548,32 @@ export async function importExitV2SdwMemoryArchive(
     lineage_signature: signedLineage.signature,
     lineage_signed_by: options.signer.public_key,
   };
+}
+
+async function assertArchiveBadSignersEligible(
+  validated: ValidatedArchive,
+  authority: MemoryProvenanceBadSignerAuthority | undefined,
+): Promise<void> {
+  if (validated.payload.format !== EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2 ||
+      validated.v2Origins === undefined) return;
+  for (let index = 0; index < validated.payload.files.length; index++) {
+    const companion = validated.payload.files[index]!.provenance;
+    const origin = validated.v2Origins[index];
+    if (origin === undefined) throw new Error("Exit V2 signed-memory origin resolution is incomplete");
+    const eligibility = await evaluateMemoryProvenanceSignerEligibility({
+      companion,
+      resolveSignerPublicKey: (identityId, did) =>
+        identityId === companion.origin.body.signer_identity_id &&
+        did === companion.origin.body.signer_did
+          ? origin.publicKey
+          : undefined,
+      badSignerAuthority: authority,
+      foreignAdmission: true,
+    });
+    if (!eligibility.eligible) {
+      throw new Error("Exit V2 signed-memory import refuses a quarantined foreign signer");
+    }
+  }
 }
 
 /** Metadata-only receipt for the conservative participant-Exit split. */

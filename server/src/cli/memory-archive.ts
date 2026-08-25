@@ -53,6 +53,7 @@ import type {
 import { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
 import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../sdw/memory-provenance-signing.js";
 import { SdwMemoryProvenanceMigration } from "../sdw/memory-provenance-migration.js";
+import { MemoryProvenanceBadSignerStore } from "../sdw/memory-provenance-bad-signers.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import type { StorageBackend } from "../storage/interface.js";
 import { KnownSignersStore } from "../reputation/known-signers-store.js";
@@ -112,6 +113,15 @@ export interface MemoryArchiveCommandArgs {
   readonly approvalChannel?: ApprovalChannel;
 }
 
+interface ParsedBadSigner {
+  readonly signerDid: string;
+  readonly publicKeySha256: string;
+  readonly reason?: string;
+  readonly ownerRef: string;
+  readonly fortressPath: string;
+  readonly json: boolean;
+}
+
 interface ParsedExport {
   readonly archiveId: string;
   readonly outputPath: string;
@@ -137,6 +147,7 @@ interface Bootstrapped {
   readonly baseline: BaselineTracker;
   readonly adapter: SdwMemoryBackendAdapter;
   readonly memoryProvenanceSigners: KnownSignersStore;
+  readonly badSignerStore: MemoryProvenanceBadSignerStore;
   readonly resolveProvenanceSigner: (identityId: string, did: string) => Uint8Array | undefined;
   readonly rememberProvenanceSigner: (did: string, publicKey: Uint8Array) => void;
   readonly signer: {
@@ -413,6 +424,7 @@ export async function runMemoryArchiveImportCommand(
       artifactBytes: bundle.artifactBytes,
       transferKey: new Uint8Array(transferKey),
       importedAt,
+      badSignerAuthority: boot.badSignerStore,
     });
     const receipt = await runJournaledExitMemoryAdmission({
       storage: boot.journalStorage,
@@ -430,6 +442,7 @@ export async function runMemoryArchiveImportCommand(
             artifactBytes: bundle.artifactBytes,
             transferKey: transferKey!,
             now: () => importedAt,
+            badSignerAuthority: boot!.badSignerStore,
           });
         } finally {
           boot!.admissionWriteGuard.deactivate();
@@ -487,6 +500,84 @@ export async function runMemoryArchiveImportCommand(
   } finally {
     transferKey?.fill(0);
     hiddenBytes?.fill(0);
+    await dispose(boot);
+    interaction.close();
+  }
+}
+
+export async function runMemoryProvenanceMarkBadSignerCommand(
+  args: MemoryArchiveCommandArgs,
+): Promise<number> {
+  return runMemoryProvenanceBadSignerCommand("mark", args);
+}
+
+export async function runMemoryProvenanceClearBadSignerCommand(
+  args: MemoryArchiveCommandArgs,
+): Promise<number> {
+  return runMemoryProvenanceBadSignerCommand("clear", args);
+}
+
+async function runMemoryProvenanceBadSignerCommand(
+  action: "mark" | "clear",
+  args: MemoryArchiveCommandArgs,
+): Promise<number> {
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const operation = action === "mark"
+    ? "memory_provenance_mark_bad_signer"
+    : "memory_provenance_clear_bad_signer";
+  if (args.argv.includes("--help") || args.argv.includes("-h")) {
+    write(out, `Usage: sanctuary ${operation} --signer-did <did> --public-key-sha256 <hex> ${action === "mark" ? "--reason <text> " : ""}--owner-ref <id> --fortress <path>\n`);
+    return 0;
+  }
+  const parsed = parseBadSigner(args.argv, action, err);
+  if (parsed === null) return 2;
+  const interaction = resolveInteraction(args.interaction, args.dialogRunner, err);
+  if (interaction === null) return 1;
+  let boot: Bootstrapped | null = null;
+  try {
+    boot = await bootstrap(parsed, args.env ?? process.env, err);
+    if (boot === null) return 1;
+    const gateArgs = {
+      agent_id: null,
+      signer_did: parsed.signerDid,
+      public_key_sha256: parsed.publicKeySha256,
+      ...(parsed.reason === undefined ? {} : { reason: parsed.reason }),
+    };
+    const gate = new ApprovalGate(
+      await loadPrincipalPolicy(parsed.fortressPath),
+      boot.baseline,
+      args.approvalChannel ?? interaction,
+      boot.auditLog,
+    );
+    const decision = await gate.evaluate(operation, gateArgs);
+    if (!decision.allowed || decision.approval_audit_id === undefined) {
+      write(err, `Denied: ${operation} was not approved.\n`);
+      return 1;
+    }
+    if (action === "mark") {
+      const record = await boot.badSignerStore.mark({
+        signerDid: parsed.signerDid,
+        publicKeySha256: parsed.publicKeySha256,
+        reason: parsed.reason!,
+        approvalAuditId: decision.approval_audit_id,
+      }, boot.auditLog);
+      write(out, parsed.json ? JSON.stringify({ marked: true, ...record }) + "\n" :
+        `memory_provenance_mark_bad_signer: marked ${record.signer_did}\n`);
+    } else {
+      const scan = await boot.badSignerStore.clear({
+        signerDid: parsed.signerDid,
+        publicKeySha256: parsed.publicKeySha256,
+        approvalAuditId: decision.approval_audit_id,
+      }, boot.auditLog);
+      write(out, parsed.json ? JSON.stringify({ cleared: true, ...scan }) + "\n" :
+        `memory_provenance_clear_bad_signer: cleared after ${scan.affected} re-verification(s)\n`);
+    }
+    return 0;
+  } catch {
+    write(err, `${operation} failed\n`);
+    return 1;
+  } finally {
     await dispose(boot);
     interaction.close();
   }
@@ -556,6 +647,28 @@ async function bootstrap(
       resolvePrimarySigningHandle: signingHandle,
       resolveSignerPublicKey: signerPublicKey,
     });
+    const badSignerStore: MemoryProvenanceBadSignerStore = new MemoryProvenanceBadSignerStore({
+      storage,
+      masterKey,
+      fortressId,
+      resolveSignerPublicKey: (did) => persistedByDid.get(did)?.slice(),
+      isLocallyRootedSigner: (did, publicKey) => {
+        if (primary.did !== did) return false;
+        return Buffer.from(primary.public_key, "base64url").equals(Buffer.from(publicKey));
+      },
+      scanForeignDependencies: (did, fingerprint) =>
+        adapter.scanForeignSignerDependencies(did, fingerprint),
+    });
+    const adapter: SdwMemoryBackendAdapter = new SdwMemoryBackendAdapter({
+      storage,
+      masterKey,
+      fortressId,
+      ownerRef: parsed.ownerRef,
+      resolvePrimarySigningHandle: signingHandle,
+      resolveSignerPublicKey: resolveProvenanceSigner,
+      resolveMemoryIntegrityState: () => migration.getState(),
+      badSignerAuthority: badSignerStore,
+    });
     return {
       storage,
       journalStorage,
@@ -564,16 +677,9 @@ async function bootstrap(
       identityKey,
       auditLog: memoryArchiveAuditLog,
       baseline: new BaselineTracker(storage, masterKey),
-      adapter: new SdwMemoryBackendAdapter({
-        storage,
-        masterKey,
-        fortressId,
-        ownerRef: parsed.ownerRef,
-        resolvePrimarySigningHandle: signingHandle,
-        resolveSignerPublicKey: resolveProvenanceSigner,
-        resolveMemoryIntegrityState: () => migration.getState(),
-      }),
+      adapter,
       memoryProvenanceSigners,
+      badSignerStore,
       resolveProvenanceSigner,
       rememberProvenanceSigner,
       signer: {
@@ -942,6 +1048,36 @@ function parseImport(argv: string[], err: Writable): ParsedImport | null {
   }
   return {
     inputPath: resolve(inputPath),
+    ownerRef,
+    fortressPath: resolve(fortressPath),
+    json: parsed.switches.has("--json"),
+  };
+}
+
+function parseBadSigner(
+  argv: string[],
+  action: "mark" | "clear",
+  err: Writable,
+): ParsedBadSigner | null {
+  const parsed = parseFlags(argv, [
+    "--signer-did", "--public-key-sha256", "--reason", "--owner-ref", "--fortress",
+  ]);
+  const signerDid = parsed?.values.get("--signer-did");
+  const publicKeySha256 = parsed?.values.get("--public-key-sha256");
+  const reason = parsed?.values.get("--reason");
+  const ownerRef = parsed?.values.get("--owner-ref");
+  const fortressPath = parsed?.values.get("--fortress");
+  if (parsed === null || parsed.unknown.length > 0 || signerDid === undefined ||
+      publicKeySha256 === undefined || ownerRef === undefined || fortressPath === undefined ||
+      !SAFE_OWNER_REF.test(ownerRef) || (action === "mark" && reason === undefined) ||
+      (action === "clear" && reason !== undefined)) {
+    write(err, `Usage: sanctuary memory_provenance_${action === "mark" ? "mark" : "clear"}_bad_signer --signer-did <did> --public-key-sha256 <hex> ${action === "mark" ? "--reason <text> " : ""}--owner-ref <id> --fortress <path>\n`);
+    return null;
+  }
+  return {
+    signerDid,
+    publicKeySha256,
+    ...(reason === undefined ? {} : { reason }),
     ownerRef,
     fortressPath: resolve(fortressPath),
     json: parsed.switches.has("--json"),

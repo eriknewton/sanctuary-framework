@@ -24,6 +24,8 @@
     "memory_emit",
     "memory_ingest",
     "memory_insert",
+    "memory_provenance_clear_bad_signer",
+    "memory_provenance_mark_bad_signer",
     "memory_transcode",
     "memory_transcode_restore",
     "operator_cloud_provision",

@@ -123,6 +123,9 @@ import { SdwMemoryBackendAdapter } from "./sdw/adapters/sdw-memory-backend.js";
 import { createSdwTools } from "./sdw/tools.js";
 import { SdwMemoryProvenanceMigration } from "./sdw/memory-provenance-migration.js";
 import { createSdwMemoryProvenanceMigrationTools } from "./sdw/memory-provenance-migration-tools.js";
+import { MemoryProvenanceBadSignerStore } from "./sdw/memory-provenance-bad-signers.js";
+import { createMemoryProvenanceBadSignerTools } from "./sdw/memory-provenance-bad-signer-tools.js";
+import { KnownSignersStore } from "./reputation/known-signers-store.js";
 import { StorageSnapshotSdwInventorySource } from "./sdw/export.js";
 import { fromBase64url } from "./core/encoding.js";
 import { join as joinPath } from "node:path";
@@ -1539,14 +1542,36 @@ export async function createSanctuaryServer(options?: {
     resolvePrimarySigningHandle: sdwMemorySigningHandle,
     resolveSignerPublicKey: sdwMemorySignerPublicKey,
   });
-  const sdwMemoryAdapter = new SdwMemoryBackendAdapter({
+  const memoryProvenanceSigners = new KnownSignersStore(storage, masterKey, {
+    partition: "memory_provenance",
+  });
+  const persistedMemoryProvenanceSigners = new Map(
+    (await memoryProvenanceSigners.loadAll()).map((entry) => [entry.did, entry.publicKey]),
+  );
+  const resolveSdwMemorySignerPublicKey = (identityId: string, did: string) =>
+    sdwMemorySignerPublicKey(identityId, did) ?? persistedMemoryProvenanceSigners.get(did)?.slice();
+  const sdwMemoryBadSignerStore: MemoryProvenanceBadSignerStore = new MemoryProvenanceBadSignerStore({
+    storage,
+    masterKey,
+    fortressId: sdwFortressId,
+    resolveSignerPublicKey: (did) => persistedMemoryProvenanceSigners.get(did)?.slice(),
+    isLocallyRootedSigner: (did, publicKey) => {
+      const primary = identityManager.getDefault();
+      if (primary === null || primary === undefined || primary.did !== did) return false;
+      return Buffer.from(fromBase64url(primary.public_key)).equals(Buffer.from(publicKey));
+    },
+    scanForeignDependencies: (did, fingerprint) =>
+      sdwMemoryAdapter.scanForeignSignerDependencies(did, fingerprint),
+  });
+  const sdwMemoryAdapter: SdwMemoryBackendAdapter = new SdwMemoryBackendAdapter({
     storage,
     masterKey,
     fortressId: sdwFortressId,
     ownerRef: "fleet-self",
     resolvePrimarySigningHandle: sdwMemorySigningHandle,
-    resolveSignerPublicKey: sdwMemorySignerPublicKey,
+    resolveSignerPublicKey: resolveSdwMemorySignerPublicKey,
     resolveMemoryIntegrityState: () => sdwMemoryMigration.getState(),
+    badSignerAuthority: sdwMemoryBadSignerStore,
   });
   // Fail-closed multi-agent isolation guard: the adapter above is bound to ONE
   // shared `fleet-self` owner scope reused for every caller, so SDW memory has
@@ -1595,6 +1620,11 @@ export async function createSanctuaryServer(options?: {
   });
   const sdwMemoryProvenanceMigrationTools = createSdwMemoryProvenanceMigrationTools({
     migration: sdwMemoryMigration,
+    auditLog,
+    isolationGuard: sdwMemoryIsolationGuard,
+  });
+  const sdwMemoryBadSignerTools = createMemoryProvenanceBadSignerTools({
+    store: sdwMemoryBadSignerStore,
     auditLog,
     isolationGuard: sdwMemoryIsolationGuard,
   });
@@ -1851,6 +1881,7 @@ export async function createSanctuaryServer(options?: {
     ...sdwMemoryTools,
     sdwMemoryProvenanceTool,
     ...sdwMemoryProvenanceMigrationTools,
+    ...sdwMemoryBadSignerTools,
     ...sdwMemoryFileTools,
     ...sdwVaultTools,
     ...complianceTools,
@@ -2103,6 +2134,8 @@ const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([
   "sdw_memory_provenance_migrate",
   "sdw_memory_provenance_abort_migration",
   "sdw_memory_provenance_repair_completion_marker",
+  "memory_provenance_mark_bad_signer",
+  "memory_provenance_clear_bad_signer",
   "shr_gateway_export",
   "shr_generate",
   "state_delete",

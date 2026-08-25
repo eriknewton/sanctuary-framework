@@ -21,7 +21,7 @@ import { Readable, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
-// fail-before-exempt: C3 fixture-wiring only — this existing Exit V2 archive suite supplies the newly required durable memory-integrity-state resolver, but changes no assertion; C3 behavior is covered by memory-provenance-attachment, memory-provenance-migration, memory-provenance-migration-tools, memory-integrity-tier1, policy-loader, loader-required-keys, and the migration contract suite, all of which fail against pre-C3 source.
+// fail-before-exempt: C4 adds subprocess help assertions that execute the already-built dist/cli.js, which source-only reversal intentionally leaves in place; live C4 admission, authority, Tier-1, and structural tests fail against pre-C4 source. This file also retains its C3 fixture-only durable-state resolver wiring, covered by the C3 migration and contract suites.
 import { afterEach, describe, expect, it } from "vitest";
 
 import { IdentityManager } from "../../src/cognitive/tools.js";
@@ -757,15 +757,21 @@ describe("Exit V2 memory archive CLI", () => {
     expect(interruptedOutput.every((byte) => byte === 0)).toBe(true);
   }, 60_000);
 
-  it("wires both shipping CLI routes and keeps the V1 manifest surface unchanged", async () => {
-    const [exportHelp, importHelp] = await Promise.all([
+  it("wires the memory archive and bad-signer CLI routes and keeps the V1 manifest surface unchanged", async () => {
+    const [exportHelp, importHelp, markHelp, clearHelp] = await Promise.all([
       runCli("memory_archive_export", "--help"),
       runCli("memory_archive_import", "--help"),
+      runCli("memory_provenance_mark_bad_signer", "--help"),
+      runCli("memory_provenance_clear_bad_signer", "--help"),
     ]);
     expect(exportHelp).toMatchObject({ code: 0, stderr: "" });
     expect(exportHelp.stdout).toContain("Usage: sanctuary memory_archive_export");
     expect(importHelp).toMatchObject({ code: 0, stderr: "" });
     expect(importHelp.stdout).toContain("Usage: sanctuary memory_archive_import");
+    expect(markHelp).toMatchObject({ code: 0, stderr: "" });
+    expect(markHelp.stdout).toContain("Usage: sanctuary memory_provenance_mark_bad_signer");
+    expect(clearHelp).toMatchObject({ code: 0, stderr: "" });
+    expect(clearHelp.stdout).toContain("Usage: sanctuary memory_provenance_clear_bad_signer");
     expect(exportHelp.stdout).not.toContain("--passphrase");
     expect(importHelp.stdout).not.toContain("--passphrase");
 

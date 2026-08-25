@@ -1220,6 +1220,56 @@
     }
   },
   {
+    "name": "memory_provenance_clear_bad_signer",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "signer_did": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 256
+        },
+        "public_key_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "required": [
+        "signer_did",
+        "public_key_sha256"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "memory_provenance_mark_bad_signer",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "signer_did": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 256
+        },
+        "public_key_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "required": [
+        "signer_did",
+        "public_key_sha256",
+        "reason"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "memory_search",
     "inputSchema": {
       "type": "object",
