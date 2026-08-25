@@ -151,7 +151,7 @@ describe("signed local-model manifest contract", () => {
       model_name: FLOOR_MODEL.model_name,
       model_version: FLOOR_MODEL.model_version,
       provider: FLOOR_MODEL.provider,
-      weights_hash: `sha256:${FLOOR_HASH}`,
+      runtime_manifest_hash: `sha256:${FLOOR_HASH}`,
       license: "Apache-2.0",
       open_weights: true,
       open_source: false,

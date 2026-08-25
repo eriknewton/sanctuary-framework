@@ -135,7 +135,8 @@ describe("local intelligence provisioning ceremony", () => {
     });
     expect(ops.commitVerified).toHaveBeenCalledOnce();
     const commits = vi.mocked(ops.commitVerified).mock.calls[0]![0];
-    expect(commits[0]?.provenance.weights_hash).toBe(`sha256:${HASH}`);
+    expect(commits[0]?.provenance.runtime_manifest_hash).toBe(`sha256:${HASH}`);
+    expect(commits[0]?.provenance.weights_hash).toBeUndefined();
     expect(commits[0]?.provenance.serving_surfaces).toEqual(LOCAL_SURFACES);
     expect(commits[0]?.surfaces).toEqual(LOCAL_SURFACES);
   });

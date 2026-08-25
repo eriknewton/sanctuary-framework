@@ -125,6 +125,7 @@ const FROZEN_SURFACES: ReadonlyArray<string> = [
   // cross-cutting crypto labels + signing domains:
   "intelligence-substrate-config",
   "sanctuary.model-manifest.v1",
+  "sanctuary.model-manifest.v2",
   "sanctuary-fed-v0.1-transport",
   // mesh (Sanctuary Federation Protocol v0.1) libp2p transport wire contract +
   // the remaining federation HKDF domain-separation labels. The transport is

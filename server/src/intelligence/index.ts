@@ -75,6 +75,35 @@ export {
 } from "./model-manifest.js";
 
 export {
+  IMMUNE_MODEL_LOAD_SURFACES,
+  MODEL_LOAD_INTEGRITY_ASSURANCES,
+  MODEL_MANIFEST_V2_DELIMITER,
+  MODEL_MANIFEST_V2_DOMAIN,
+  MODEL_MANIFEST_V2_REGISTRY,
+  MODEL_MANIFEST_V2_SCHEMA_VERSION,
+  PINNED_MODEL_MANIFEST_V2_SIGNING_PUBLIC_KEY_B64URL,
+  buildModelManifestV2Message,
+  computeModelManifestV2BodyDigest,
+  deriveOllamaManifestRelativePath,
+  deriveOllamaRuntimeTag,
+  parseModelManifestV2Json,
+  validateLocalIntegrityStateV2,
+  verifyModelManifestV2WithKey,
+  type LocalIntegrityStateV2,
+  type LocalIntegrityStateV2ValidationResult,
+  type ModelLoadIntegrityAssurance,
+  type ModelManifestBodyV2,
+  type ModelManifestModelV2,
+  type ModelManifestSurfaceDefaultsV2,
+  type ModelManifestTierBundlesV2,
+  type ModelManifestV2RefusalReason,
+  type ModelManifestV2VerificationResult,
+  type SignedModelManifestV2,
+  type SignedOllamaIdentityV2,
+  type VerifiedLocalBindingV2,
+} from "./model-manifest-v2.js";
+
+export {
   BADGE_LABEL_KEYS,
   BADGE_TRADEOFF_KEYS,
   BACKEND_FALLBACK_STRINGS,

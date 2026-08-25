@@ -34,6 +34,21 @@ export interface ModelProvenance {
   /** SHA-256 of model weights file, if available and verifiable */
   weights_hash?: string;
 
+  /** SHA-256 of the runtime's exact model-manifest bytes, when verified. */
+  runtime_manifest_hash?: string;
+
+  /** Authenticated config/layer artifact digests, only after real byte hashing. */
+  verified_artifact_hashes?: readonly string[];
+
+  /** Exact load-integrity evidence class; never a model-safety verdict. */
+  load_integrity_assurance?: "runtime-manifest" | "on-disk-all-layers";
+
+  /** ISO 8601 timestamp of the named load-integrity verification. */
+  load_integrity_verified_at?: string;
+
+  /** Signed Sanctuary model-catalog version that authorized the evidence. */
+  model_manifest_version?: number;
+
   /** SHA-256 of training data manifest or metadata, if available */
   training_data_hash?: string;
 
