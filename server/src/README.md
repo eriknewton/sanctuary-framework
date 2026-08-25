@@ -129,6 +129,13 @@ upgrade. C2+C3 remain one populated-fortress deployment unit; this adds no
 Exit V2 carriage, foreign tiers, fleet sync, capsule runtime, release, or
 public capability claim.
 
+Memory Integrity C4 also provides the operator-invoked, force-pinned Tier-1
+`memory_provenance_prune_signers` maintenance path in
+`sdw/memory-provenance-signer-prune.ts` and its focused MCP facade. The CLI
+reuses the same bounded authenticated mark-and-sweep of the separately capped
+`memprov.` signer partition under the shared Exit/corpus locks and durable Exit
+journal. It does not run automatically and introduces no new HKDF label.
+
 ## Confusable clusters - read these if a name confuses you
 
 The confusion in this tree is overwhelmingly LEXICAL, not structural. Cross-imports were verified;

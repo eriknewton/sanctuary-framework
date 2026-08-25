@@ -1,3 +1,4 @@
+// fail-before-exempt: reconciliation-only for this PR — the full suite exposed that the new runtime-named signer-prune tool file needed an entry in REVIEWED_RUNTIME_NAMED_TOOL_FILES. That allowlist entry correctly still passes against pre-fix source because the new tool file is absent there; the actual signer-prune behavior and authority changes fail before in memory-provenance-signer-prune, Exit journal, CLI, principal-policy, migration-contract, and frozen-surface tests.
 /**
  * CAPABILITY: an MCP tool classified `read` runs even when the audit chain
  * reports integrity findings, so an operator can still introspect a fortress in
@@ -344,7 +345,7 @@ function isReviewedReadPathMaintenance(tool: string, hit: SinkHit): boolean {
 
 /**
  * Files whose tool-shaped object literals are named at runtime, so the analyzer
- * cannot resolve them. Both are reviewed: neither can receive the read bypass.
+ * cannot resolve them. Each is reviewed and cannot receive the read bypass.
  */
 const REVIEWED_RUNTIME_NAMED_TOOL_FILES: ReadonlyMap<string, string> = new Map([
   [
@@ -362,6 +363,14 @@ const REVIEWED_RUNTIME_NAMED_TOOL_FILES: ReadonlyMap<string, string> = new Map([
       "call is dispatched by `invokeIfTrap`), and the literal's own handler is " +
       "an inert `async () => ({ content: [] })`. So they cannot be classified " +
       "read and cannot reach the bypass.",
+  ],
+  [
+    "src/sdw/memory-provenance-signer-prune-tools.ts",
+    "The tool name is the imported frozen `memory_provenance_prune_signers` " +
+      "operation constant. The literal declares `tool_class: write`, the " +
+      "composition root includes the exact name in `WRITE_MCP_TOOLS`, and the " +
+      "principal-policy loader force-pins it to Tier 1, so it cannot receive " +
+      "the read bypass.",
   ],
 ]);
 

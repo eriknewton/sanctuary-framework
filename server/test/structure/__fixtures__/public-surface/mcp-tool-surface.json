@@ -1270,6 +1270,15 @@
     }
   },
   {
+    "name": "memory_provenance_prune_signers",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "memory_search",
     "inputSchema": {
       "type": "object",
