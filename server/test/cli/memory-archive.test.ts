@@ -21,6 +21,7 @@ import { Readable, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
+// fail-before-exempt: C3 fixture-wiring only — this existing Exit V2 archive suite supplies the newly required durable memory-integrity-state resolver, but changes no assertion; C3 behavior is covered by memory-provenance-attachment, memory-provenance-migration, memory-provenance-migration-tools, memory-integrity-tier1, policy-loader, loader-required-keys, and the migration contract suite, all of which fail against pre-C3 source.
 import { afterEach, describe, expect, it } from "vitest";
 
 import { IdentityManager } from "../../src/cognitive/tools.js";

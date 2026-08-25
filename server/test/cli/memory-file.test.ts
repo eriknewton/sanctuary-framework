@@ -1,3 +1,4 @@
+// fail-before-exempt: C3 fixture-wiring only — this existing CLI suite supplies the newly required durable memory-integrity-state resolver, but changes no assertion; C3 behavior is covered by memory-provenance-attachment, memory-provenance-migration, memory-provenance-migration-tools, memory-integrity-tier1, policy-loader, loader-required-keys, and the migration contract suite, all of which fail against pre-C3 source.
 /**
  * `sanctuary memory_ingest` / `sanctuary memory_emit` CLI tests.
  *
