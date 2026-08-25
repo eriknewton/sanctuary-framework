@@ -7,6 +7,8 @@
  */
 
 import type { EncryptedPayload } from "../../core/encryption.js";
+import type { MemoryProvenanceCompanion } from "../../sdw/memory-provenance-contract.js";
+import type { KnownSignersArtifact } from "../../exit/verifier.js";
 
 export const EXIT_V2_MANIFEST_VERSION = "SANCTUARY_EXIT_BUNDLE_V2" as const;
 export const SDW_MEMORY_ARCHIVE_ARTIFACT_KIND = "sdw_memory_archive" as const;
@@ -16,6 +18,10 @@ export const EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT =
   "SANCTUARY_EXIT_V2_SDW_MEMORY_ARCHIVE_V1" as const;
 export const EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT =
   "SANCTUARY_EXIT_V2_SDW_MEMORY_LOGICAL_ARCHIVE_V1" as const;
+export const EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT_V2 =
+  "SANCTUARY_EXIT_V2_SDW_MEMORY_ARCHIVE_V2" as const;
+export const EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2 =
+  "SANCTUARY_EXIT_V2_SDW_MEMORY_LOGICAL_ARCHIVE_V2" as const;
 export const EXIT_V2_SDW_MEMORY_AAD_VERSION =
   "sanctuary.exit-v2.sdw-memory-archive.aad.v1" as const;
 export const EXIT_V2_SDW_MEMORY_LINEAGE_VERSION =
@@ -91,6 +97,26 @@ export interface ExitV2SdwMemoryArtifact {
   readonly aad: ExitV2SdwMemoryAad;
   readonly encrypted_payload: EncryptedPayload;
 }
+
+export interface ExitV2SdwMemoryLogicalFileV2 extends ExitV2SdwMemoryLogicalFile {
+  readonly source_passage_id: string;
+  readonly provenance: MemoryProvenanceCompanion;
+}
+
+export interface ExitV2SdwMemoryLogicalPayloadV2
+  extends Omit<ExitV2SdwMemoryLogicalPayload, "format" | "files"> {
+  readonly format: typeof EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2;
+  readonly files: readonly ExitV2SdwMemoryLogicalFileV2[];
+  readonly known_signers: KnownSignersArtifact;
+}
+
+export interface ExitV2SdwMemoryArtifactV2
+  extends Omit<ExitV2SdwMemoryArtifact, "format"> {
+  readonly format: typeof EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT_V2;
+}
+
+export type ExitV2SdwMemoryArtifactUnion = ExitV2SdwMemoryArtifact | ExitV2SdwMemoryArtifactV2;
+export type ExitV2SdwMemoryLogicalPayloadUnion = ExitV2SdwMemoryLogicalPayload | ExitV2SdwMemoryLogicalPayloadV2;
 
 export interface ExitV2SdwMemoryLineageBody {
   readonly version: typeof EXIT_V2_SDW_MEMORY_LINEAGE_VERSION;

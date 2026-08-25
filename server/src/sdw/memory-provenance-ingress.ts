@@ -11,6 +11,7 @@ import type {
   MemoryOriginTrustTier,
   MemorySourceClass,
   MemoryVerificationBasis,
+  SignedMemoryOrigin,
 } from "./memory-provenance-contract.js";
 
 declare const INGRESS_CONTEXT: unique symbol;
@@ -26,6 +27,8 @@ export interface ResolvedMemoryProvenanceIngress {
   readonly origin_trust_tier: MemoryOriginTrustTier;
   readonly verification_basis: MemoryVerificationBasis;
   readonly transfer_lineage_ref?: string;
+  readonly preserved_origin?: SignedMemoryOrigin;
+  readonly preserved_origin_public_key?: Uint8Array;
 }
 
 const contexts = new WeakMap<object, ResolvedMemoryProvenanceIngress>();
@@ -97,6 +100,35 @@ export function legacyExitV1ImportIngress(transferLineageRef: string): MemoryPro
     origin_trust_tier: "legacy_unattested",
     verification_basis: "exit_v2_legacy_v1",
     transfer_lineage_ref: transferLineageRef,
+  });
+}
+
+/** C4-only capability: preserves a verified foreign origin byte-for-byte. */
+export function exitV2ForeignImportIngress(input: {
+  readonly origin: SignedMemoryOrigin;
+  readonly originPublicKey: Uint8Array;
+  readonly trustTier: "foreign_direct" | "foreign_relayed";
+  readonly transferLineageRef: string;
+}): MemoryProvenanceIngressContext {
+  if (input.origin.body.ingress_channel === "legacy_migration" ||
+      input.origin.body.ingress_channel === "fleet_sync" ||
+      input.origin.body.ingress_channel === "disclosure_capsule_return" ||
+      input.origin.body.source_class === "legacy_unattested" ||
+      input.origin.body.source_class === "fleet_sync_lineage") {
+    throw new Error("Origin is not eligible for C4 Exit V2 foreign admission");
+  }
+  return mint({
+    author_agent_id: input.origin.body.author_agent_id,
+    ingress_channel: input.origin.body.ingress_channel,
+    source_class: input.origin.body.source_class,
+    admission_channel: "exit_v2_import",
+    origin_trust_tier: input.trustTier,
+    verification_basis: input.trustTier === "foreign_direct"
+      ? "exit_v2_manifest_key"
+      : "exit_v2_known_signers",
+    transfer_lineage_ref: input.transferLineageRef,
+    preserved_origin: input.origin,
+    preserved_origin_public_key: new Uint8Array(input.originPublicKey),
   });
 }
 

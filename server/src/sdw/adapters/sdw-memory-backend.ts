@@ -61,7 +61,6 @@ import type {
   MemorySearchResult,
 } from "./memory-backend.js";
 import {
-  createBoundedMemoryProvenanceSignerResolver,
   createMemoryProvenanceCompanion,
   signMemoryOrigin,
   verifyMemoryProvenanceCompanion,
@@ -69,6 +68,7 @@ import {
   type MemoryProvenanceSigningHandle,
 } from "../memory-provenance-contract.js";
 import { resolveMemoryProvenanceIngress, type MemoryProvenanceIngressContext } from "../memory-provenance-ingress.js";
+import { MAX_MEMORY_PROVENANCE_CANDIDATES } from "../memory-provenance-limits.js";
 
 /** Document ids minted by this adapter are namespaced under this prefix. */
 export const MEMORY_PASSAGE_DOCUMENT_PREFIX = "mem";
@@ -118,7 +118,7 @@ const MEMORY_CORPUS_SCAN_CAP = 2000;
  * assertion below) so a scan never stops before filling a full page.
  */
 const MEMORY_LIST_MAX_LIMIT = 500;
-export const MEMORY_PROVENANCE_QUARANTINE_CANDIDATE_CAP = 2000;
+export const MEMORY_PROVENANCE_QUARANTINE_CANDIDATE_CAP = MAX_MEMORY_PROVENANCE_CANDIDATES;
 export { SDW_MEMORY_INTEGRITY_STATE } from "../records.js";
 
 if (MEMORY_CORPUS_SCAN_CAP < MEMORY_LIST_MAX_LIMIT) {
@@ -691,6 +691,45 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     });
   }
 
+  /**
+   * Complete raw write-set for a conditional passage batch. C4 admission
+   * snapshots this exact set before enabling its write guard; the guard then
+   * refuses any late location that was not declared here.
+   */
+  planPassageWriteSet(inputs: readonly MemoryPassageInput[]): readonly {
+    namespace: string;
+    key: string;
+  }[] {
+    const locations: Array<{ namespace: string; key: string }> = [];
+    const seen = new Set<string>();
+    for (const input of inputs) {
+      if (input.passage_id === undefined) {
+        throw new SdwValidationError("invalid_identifier", "SDW memory write-set planning requires explicit passage ids");
+      }
+      const documentId = this.documentId(input.passage_id);
+      const keys = [
+        ...chunkText(input.text, this.maxChunkChars).map((_chunk, ordinal) =>
+          documentChunkKey(documentId, padChunkOrdinal(ordinal), chunkId(ordinal))),
+        documentProvenanceKey(documentId),
+        documentProvenanceStatusKey(documentId),
+        documentKey(documentId),
+      ];
+      for (const key of keys) {
+        const dedupe = `${SDW_DOCUMENT_CORPUS_NAMESPACE}\u0000${key}`;
+        if (!seen.has(dedupe)) {
+          seen.add(dedupe);
+          locations.push({ namespace: SDW_DOCUMENT_CORPUS_NAMESPACE, key });
+        }
+      }
+    }
+    return locations;
+  }
+
+  /** Durable C3 state used by the C4 export/import eligibility boundary. */
+  getMemoryIntegrityState(): Promise<SdwMemoryIntegrityState> {
+    return this.resolveMemoryIntegrityState();
+  }
+
   derivePassageId(domain: string, label: string): string {
     assertSdwIdentifier(domain, "passage_id_domain");
     const mac = hmacSha256(
@@ -991,9 +1030,11 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       origin_trust_tier,
       verification_basis,
       transfer_lineage_ref,
+      preserved_origin,
+      preserved_origin_public_key,
       ...originIngress
     } = ingress;
-    const origin = signMemoryOrigin({
+    const origin = preserved_origin === undefined ? signMemoryOrigin({
       origin_fortress_id: this.fortressId,
       owner_ref: this.ownerRef,
       passage_id: passageId,
@@ -1001,7 +1042,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       chunk_count: chunks.length,
       recorded_at: createdAt,
       ...originIngress,
-    }, signer);
+    }, signer) : { ok: true as const, value: preserved_origin };
     if (!origin.ok) throw new SdwValidationError("auth_failed", `Memory origin signing failed: ${origin.error.code}`);
     const companion = createMemoryProvenanceCompanion(origin.value, {
       destination_fortress_id: this.fortressId,
@@ -1014,15 +1055,23 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       admitted_at: createdAt,
     }, signer);
     if (!companion.ok) throw new SdwValidationError("auth_failed", `Memory admission signing failed: ${companion.error.code}`);
-    const resolver = createBoundedMemoryProvenanceSignerResolver([{
-      signer_identity_id: signer.identity_id,
-      signer_did: signer.did,
-      public_key: toBase64url(signer.public_key),
-    }]);
-    if (!resolver.ok) throw new SdwValidationError("auth_failed", "Memory signer resolver construction failed");
-    const verified = verifyMemoryProvenanceCompanion(companion.value, resolver.value, {
-      origin: { origin_fortress_id: this.fortressId, owner_ref: this.ownerRef,
-        passage_id: passageId, content_hash: passageHash, chunk_count: chunks.length },
+    // Identity ids are fortress-local labels, so a foreign origin may reuse
+    // the destination's label without sharing its DID/key. Resolve the exact
+    // pair rather than imposing cross-fortress identity-id uniqueness.
+    const resolver = {
+      size: preserved_origin === undefined ? 1 : 2,
+      resolve: (identityId: string, did: string): Uint8Array | undefined => {
+        if (identityId === signer.identity_id && did === signer.did) return signer.public_key.slice();
+        if (preserved_origin !== undefined && preserved_origin_public_key !== undefined &&
+            identityId === preserved_origin.body.signer_identity_id &&
+            did === preserved_origin.body.signer_did) return preserved_origin_public_key.slice();
+        return undefined;
+      },
+    };
+    const verified = verifyMemoryProvenanceCompanion(companion.value, resolver, {
+      origin: { origin_fortress_id: origin.value.body.origin_fortress_id,
+        owner_ref: origin.value.body.owner_ref, passage_id: origin.value.body.passage_id,
+        content_hash: passageHash, chunk_count: chunks.length },
       destination: { destination_fortress_id: this.fortressId,
         destination_owner_ref: this.ownerRef, passage_id: passageId },
     });
@@ -1621,14 +1670,19 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   }
 
   private verifyCompanion(document: SdwDocumentRecord, companion: MemoryProvenanceCompanion) {
+    if (companion.origin.body.content_hash !== document.content_hash ||
+        companion.origin.body.chunk_count !== document.chunk_count) {
+      return { ok: false as const, error: { code: "origin_subject_mismatch" as const,
+        path: "origin.body", message: "Origin content binding does not match destination passage" } };
+    }
     return verifyMemoryProvenanceCompanion(companion, {
       size: 1,
       resolve: (identityId, did) => this.resolveSignerPublicKey(identityId, did),
     }, {
       origin: {
-        origin_fortress_id: this.fortressId,
-        owner_ref: this.ownerRef,
-        passage_id: this.passageIdOf(document.document_id),
+        origin_fortress_id: companion.origin.body.origin_fortress_id,
+        owner_ref: companion.origin.body.owner_ref,
+        passage_id: companion.origin.body.passage_id,
         content_hash: document.content_hash,
         chunk_count: document.chunk_count,
       },

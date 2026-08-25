@@ -50,9 +50,11 @@ export interface CompiledContextContributor {
  */
 export interface CompiledContextProvenanceClustering {
   version: string;
+  primaryGrouping: "admission_lineage";
   clusterCount: number;
   largestClusterSize: number;
   distinctOriginCount: number;
+  quarantinedVectorCount: number;
 }
 
 export interface CompiledContextMetadata {

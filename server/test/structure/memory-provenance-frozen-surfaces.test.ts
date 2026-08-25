@@ -8,7 +8,9 @@ import {
   startsWithInternalSigningDomain,
 } from "../../src/core/signing-domains.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
-import { MAX_KNOWN_SIGNERS } from "../../src/reputation/known-signers-store.js";
+import { MAX_MEMORY_PROVENANCE_SIGNERS } from "../../src/reputation/known-signers-store.js";
+import { MEMORY_PROVENANCE_SIGNER_PREFIX } from "../../src/reputation/known-signers-store.js";
+import { EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT_V2, EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2 } from "../../src/contracts/v1.2/exit-bundle-manifest.js";
 import {
   DISCLOSURE_CAPSULE_RETURN_AUTHOR_AGENT_ID,
   MAX_MEMORY_PROVENANCE_COMPANION_BYTES,
@@ -70,7 +72,12 @@ describe("C1 frozen memory-provenance surfaces", () => {
       "ed25519-v1",
     ]);
     expect(MAX_MEMORY_PROVENANCE_COMPANION_BYTES).toBe(16 * 1024);
-    expect(MAX_MEMORY_PROVENANCE_SIGNER_ENTRIES).toBe(MAX_KNOWN_SIGNERS);
+    expect(MAX_MEMORY_PROVENANCE_SIGNER_ENTRIES).toBe(MAX_MEMORY_PROVENANCE_SIGNERS);
+    expect(MEMORY_PROVENANCE_SIGNER_PREFIX).toBe("memprov.");
+    expect([EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT_V2, EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2]).toEqual([
+      "SANCTUARY_EXIT_V2_SDW_MEMORY_ARCHIVE_V2",
+      "SANCTUARY_EXIT_V2_SDW_MEMORY_LOGICAL_ARCHIVE_V2",
+    ]);
     expect(MEMORY_ADMISSION_CHANNELS).toEqual([
       "local_write",
       "legacy_migration",

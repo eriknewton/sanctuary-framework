@@ -77,6 +77,7 @@ export interface MemoryTranscodeRestoreResult {
 }
 
 interface SourceFile {
+  readonly passageId?: string;
   readonly path: string;
   readonly sourceClass: string;
   readonly text: string;
@@ -100,6 +101,7 @@ export interface MemoryTranscodeLogicalArchive {
   readonly projection_file_count: number;
   readonly projection_set_sha256: string;
   readonly files: readonly {
+    readonly source_passage_id?: string;
     readonly path: string;
     readonly source_class: string;
     readonly text: string;
@@ -348,6 +350,7 @@ export async function readMemoryTranscodeArchive(
     files: source.map((file) => {
       const bytes = Buffer.from(file.text, "utf8");
       return {
+        source_passage_id: file.passageId!,
         path: file.path,
         source_class: file.sourceClass,
         text: file.text,
@@ -653,6 +656,7 @@ function archiveFileFromPassage(
     throw new Error(`memory transcode archive digest mismatch for ${path}`);
   }
   return {
+    passageId: passage.passage_id,
     path,
     sourceClass: requiredMetadata(passage, SOURCE_CLASS_KEY),
     text: passage.text,

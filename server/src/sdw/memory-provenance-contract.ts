@@ -26,7 +26,7 @@ import {
 } from "../core/identity.js";
 import { parseIsoInstantWithOffset } from "../core/time.js";
 import { canonicalizeToBytes } from "../mesh/canonical-json.js";
-import { MAX_KNOWN_SIGNERS } from "../reputation/known-signers-store.js";
+import { MAX_MEMORY_PROVENANCE_SIGNERS } from "../reputation/known-signers-store.js";
 import { SubstrateError } from "../substrate/errors.js";
 import { parseStrictJson } from "../substrate/strict-json.js";
 import { isSdwIdentifier } from "./grammar.js";
@@ -53,7 +53,7 @@ export const MEMORY_ADMISSION_SIGNING_DOMAIN =
 /** 16 KiB, fixed by the Slice C design and checked before JSON parsing. */
 export const MAX_MEMORY_PROVENANCE_COMPANION_BYTES = 16 * 1024;
 /** Existing bounded Exit known-signers ceiling; checked before iteration. */
-export const MAX_MEMORY_PROVENANCE_SIGNER_ENTRIES = MAX_KNOWN_SIGNERS;
+export const MAX_MEMORY_PROVENANCE_SIGNER_ENTRIES = MAX_MEMORY_PROVENANCE_SIGNERS;
 
 export const MEMORY_ADMISSION_CHANNELS = [
   "local_write",

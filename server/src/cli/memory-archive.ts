@@ -32,10 +32,16 @@ import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   exportExitV2SdwMemoryArchive,
   importExitV2SdwMemoryArchive,
+  planExitV2SdwMemoryAdmission,
   verifyExitV2SdwMemoryArchive,
 } from "../exit/v2-memory-archive.js";
 import { AuditLog } from "../operational/audit-log.js";
-import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
+import {
+  createExitAdmissionWriteGuard,
+  recoverInterruptedExitImportsOrThrow,
+  runJournaledExitMemoryAdmission,
+  type ExitAdmissionWriteGuard,
+} from "../exit/bundle.js";
 import type { ApprovalChannel } from "../principal-policy/approval-channel.js";
 import { BaselineTracker } from "../principal-policy/baseline.js";
 import { ApprovalGate } from "../principal-policy/gate.js";
@@ -48,6 +54,8 @@ import { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
 import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../sdw/memory-provenance-signing.js";
 import { SdwMemoryProvenanceMigration } from "../sdw/memory-provenance-migration.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import type { StorageBackend } from "../storage/interface.js";
+import { KnownSignersStore } from "../reputation/known-signers-store.js";
 import { getSanctuaryVersion } from "../version.js";
 import { consumeFlagValue } from "./argv.js";
 
@@ -120,12 +128,17 @@ interface ParsedImport {
 }
 
 interface Bootstrapped {
-  readonly storage: FilesystemStorage;
+  readonly storage: StorageBackend;
+  readonly journalStorage: FilesystemStorage;
+  readonly admissionWriteGuard: ExitAdmissionWriteGuard;
   readonly masterKey: Uint8Array;
   readonly identityKey: Uint8Array;
   readonly auditLog: AuditLog;
   readonly baseline: BaselineTracker;
   readonly adapter: SdwMemoryBackendAdapter;
+  readonly memoryProvenanceSigners: KnownSignersStore;
+  readonly resolveProvenanceSigner: (identityId: string, did: string) => Uint8Array | undefined;
+  readonly rememberProvenanceSigner: (did: string, publicKey: Uint8Array) => void;
   readonly signer: {
     readonly identity_id: string;
     readonly fortress_id: string;
@@ -205,6 +218,8 @@ export async function runMemoryArchiveExportCommand(
       exportApprovalAuditId: approvalAuditId,
       sourceSanctuaryVersion: getSanctuaryVersion(),
       signer: boot.signer,
+      formatVersion: 2,
+      resolveProvenanceSigner: boot.resolveProvenanceSigner,
     });
     transferKey = exported.transfer_key;
 
@@ -390,17 +405,47 @@ export async function runMemoryArchiveImportCommand(
       result: "success",
       details: approvedArgs,
     });
-    const receipt = await importExitV2SdwMemoryArchive({
+    const importedAt = new Date().toISOString();
+    const plan = await planExitV2SdwMemoryAdmission({
       adapter: boot.adapter,
       signer: boot.signer,
       manifest: bundle.manifest,
       artifactBytes: bundle.artifactBytes,
-      transferKey,
+      transferKey: new Uint8Array(transferKey),
+      importedAt,
+    });
+    const receipt = await runJournaledExitMemoryAdmission({
+      storage: boot.journalStorage,
+      importId: plan.importId,
+      identityId: boot.signer.identity_id,
+      locations: plan.locations,
+      operation: async (journal) => {
+        boot!.admissionWriteGuard.activate(plan.locations, journal.recordPostImage);
+        try {
+          return await importExitV2SdwMemoryArchive({
+            adapter: boot!.adapter,
+            signer: boot!.signer,
+            knownSignersStore: boot!.memoryProvenanceSigners,
+            manifest: bundle.manifest,
+            artifactBytes: bundle.artifactBytes,
+            transferKey: transferKey!,
+            now: () => importedAt,
+          });
+        } finally {
+          boot!.admissionWriteGuard.deactivate();
+        }
+      },
     });
     // The destination archive is durably written by the call above; anything
     // that fails from this point on is a post-commit step, not an import
     // failure, and must be reported as such (see the `committed` comment).
     committed = true;
+    // Publish resolver state only after the journal has committed. A failed
+    // admission may have its signer rows rolled back and must not leave a
+    // process-local trust residue.
+    for (const entry of await boot.memoryProvenanceSigners.loadAll()) {
+      boot.rememberProvenanceSigner(entry.did, entry.publicKey);
+    }
     // Import consumes and clears its caller-owned key buffer.
     transferKey = undefined;
     await boot.auditLog.appendCritical({
@@ -462,7 +507,9 @@ async function bootstrap(
   let identityKey: Uint8Array | undefined;
   try {
     await access(parsed.fortressPath);
-    const storage = new FilesystemStorage(join(parsed.fortressPath, "state"));
+    const journalStorage = new FilesystemStorage(join(parsed.fortressPath, "state"));
+    const admissionWriteGuard = createExitAdmissionWriteGuard(journalStorage);
+    const storage = admissionWriteGuard.storage;
     masterKey = await resolveCliMasterKey(storage, {
       ...(passphrase !== undefined ? { passphrase } : {}),
       ...(recoveryKey !== undefined ? { recoveryKey } : {}),
@@ -487,6 +534,20 @@ async function bootstrap(
     await recoverInterruptedExitImportsOrThrow(storage, memoryArchiveAuditLog);
     const signingHandle = createPrimaryMemoryProvenanceSigningHandleResolver(identityManager, masterKey);
     const signerPublicKey = createPrimaryMemoryProvenancePublicKeyResolver(identityManager);
+    const memoryProvenanceSigners = new KnownSignersStore(storage, masterKey, {
+      partition: "memory_provenance",
+    });
+    const persistedMemorySigners = await memoryProvenanceSigners.loadAll();
+    const persistedByDid = new Map(persistedMemorySigners.map((entry) => [entry.did, entry.publicKey]));
+    const resolveProvenanceSigner = (identityId: string, did: string) =>
+      signerPublicKey(identityId, did) ?? persistedByDid.get(did)?.slice();
+    const rememberProvenanceSigner = (did: string, publicKey: Uint8Array) => {
+      const prior = persistedByDid.get(did);
+      if (prior !== undefined && !Buffer.from(prior).equals(Buffer.from(publicKey))) {
+        throw new Error("Persisted memory-provenance signer conflicts with the runtime resolver");
+      }
+      persistedByDid.set(did, publicKey.slice());
+    };
     const migration = new SdwMemoryProvenanceMigration({
       storage,
       masterKey,
@@ -497,6 +558,8 @@ async function bootstrap(
     });
     return {
       storage,
+      journalStorage,
+      admissionWriteGuard,
       masterKey,
       identityKey,
       auditLog: memoryArchiveAuditLog,
@@ -507,9 +570,12 @@ async function bootstrap(
         fortressId,
         ownerRef: parsed.ownerRef,
         resolvePrimarySigningHandle: signingHandle,
-        resolveSignerPublicKey: signerPublicKey,
+        resolveSignerPublicKey: resolveProvenanceSigner,
         resolveMemoryIntegrityState: () => migration.getState(),
       }),
+      memoryProvenanceSigners,
+      resolveProvenanceSigner,
+      rememberProvenanceSigner,
       signer: {
         identity_id: primary.identity_id,
         fortress_id: fortressId,
