@@ -69,6 +69,12 @@ import {
 } from "../memory-provenance-contract.js";
 import { resolveMemoryProvenanceIngress, type MemoryProvenanceIngressContext } from "../memory-provenance-ingress.js";
 import { MAX_MEMORY_PROVENANCE_CANDIDATES } from "../memory-provenance-limits.js";
+import {
+  evaluateMemoryProvenanceSignerEligibility,
+  memoryProvenancePublicKeyFingerprint,
+  type MemoryProvenanceBadSignerAuthority,
+  type MemoryProvenanceForeignDependencyScan,
+} from "../memory-provenance-bad-signers.js";
 
 /** Document ids minted by this adapter are namespaced under this prefix. */
 export const MEMORY_PASSAGE_DOCUMENT_PREFIX = "mem";
@@ -274,6 +280,8 @@ export interface SdwMemoryBackendAdapterOptions {
   readonly testOnlyDefaultProvenanceContext?: MemoryProvenanceIngressContext;
   /** Durable C3 state resolver. Production construction must fail closed if it is absent. */
   readonly resolveMemoryIntegrityState: () => Promise<SdwMemoryIntegrityState>;
+  /** Authenticated foreign-key quarantine authority, wired by production composition. */
+  readonly badSignerAuthority?: MemoryProvenanceBadSignerAuthority;
 }
 
 export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
@@ -291,6 +299,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   private readonly resolveSignerPublicKey: (identityId: string, did: string) => Uint8Array | undefined;
   private readonly testOnlyDefaultProvenanceContext: MemoryProvenanceIngressContext | undefined;
   private readonly resolveMemoryIntegrityState: () => Promise<SdwMemoryIntegrityState>;
+  private readonly badSignerAuthority: MemoryProvenanceBadSignerAuthority | undefined;
   /**
    * Process-local duplicate-insert guard for non-transactional backends. This
    * does not coordinate with another Sanctuary process pointed at the same
@@ -380,6 +389,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     this.resolveSignerPublicKey = options.resolveSignerPublicKey;
     this.testOnlyDefaultProvenanceContext = options.testOnlyDefaultProvenanceContext;
     this.resolveMemoryIntegrityState = options.resolveMemoryIntegrityState;
+    this.badSignerAuthority = options.badSignerAuthority;
   }
 
   async insertPassage(
@@ -947,8 +957,60 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       await this.assertIntegrityStateAfterProvenanceRead("quarantined");
       return { status: "quarantined", reason: result.error.code };
     }
+    const signerEligibility = await evaluateMemoryProvenanceSignerEligibility({
+      companion: result.value,
+      resolveSignerPublicKey: (identityId, did) => this.resolveSignerPublicKey(identityId, did),
+      badSignerAuthority: this.badSignerAuthority,
+    });
+    if (!signerEligibility.eligible) {
+      await this.assertIntegrityStateAfterProvenanceRead("quarantined");
+      return { status: "quarantined", reason: signerEligibility.reason };
+    }
     await this.assertIntegrityStateAfterProvenanceRead("verified");
     return { status: "verified", companion: result.value };
+  }
+
+  /**
+   * Bounded clear-time scan. It bypasses only the dynamic bad-signer mark,
+   * never signature, subject, chunk, status, owner, or corpus-size checks.
+   */
+  async scanForeignSignerDependencies(
+    signerDid: string,
+    publicKeySha256: string,
+  ): Promise<MemoryProvenanceForeignDependencyScan> {
+    const { documents, truncated } = await this.listDocuments(this.corpusScanCap);
+    if (truncated) return { complete: false, scanned: documents.length, affected: 0 };
+    let affected = 0;
+    for (const document of documents) {
+      const documentId = document.document_id;
+      const persistedStatus = await this.corpus.getProvenanceStatusRaw(documentId);
+      let provenance;
+      try {
+        provenance = await this.corpus.getProvenanceRaw(documentId);
+      } catch {
+        return { complete: false, scanned: documents.length, affected };
+      }
+      if (provenance === null) continue;
+      const companion = provenance.record.companion;
+      const tier = companion.admission.body.origin_trust_tier;
+      if (tier !== "foreign_direct" && tier !== "foreign_relayed") continue;
+      const origin = companion.origin.body;
+      if (origin.signer_did !== signerDid) continue;
+      const key = this.resolveSignerPublicKey(origin.signer_identity_id, origin.signer_did);
+      if (key === undefined || memoryProvenancePublicKeyFingerprint(key) !== publicKeySha256) {
+        return { complete: false, scanned: documents.length, affected };
+      }
+      if (persistedStatus !== null) {
+        return { complete: false, scanned: documents.length, affected };
+      }
+      const verified = this.verifyCompanion(document, companion);
+      if (!verified.ok) return { complete: false, scanned: documents.length, affected };
+      // Reconstruct every affected passage so clear cannot bless a companion
+      // whose document hash is valid while a chunk is absent or corrupted.
+      await this.readPassageText(document);
+      affected++;
+    }
+    return { complete: true, scanned: documents.length, affected };
   }
 
   /**

@@ -169,6 +169,8 @@ export const NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS = [
   "sdw_memory_provenance_migrate",
   "sdw_memory_provenance_abort_migration",
   "sdw_memory_provenance_repair_completion_marker",
+  "memory_provenance_mark_bad_signer",
+  "memory_provenance_clear_bad_signer",
 ] as const;
 
 /**

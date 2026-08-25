@@ -398,6 +398,23 @@ describe("Exit V2 SDW memory archive", () => {
       resolveMemoryIntegrityState: async () => "state_COMPLETE",
     });
     let bAdapter = makeBAdapter();
+    const markedA = {
+      isMarked: async (did: string, rawPublicKey: Uint8Array) =>
+        did === a.handle.did && Buffer.from(rawPublicKey).equals(Buffer.from(a.handle.public_key)),
+    };
+    await expect(planExitV2SdwMemoryAdmission({
+      adapter: bAdapter, signer: b.signer, manifest: exportA.manifest,
+      artifactBytes: exportA.artifact_bytes, transferKey: exportA.transfer_key.slice(),
+      badSignerAuthority: markedA,
+    })).rejects.toThrow(/quarantined foreign signer/);
+    await expect(importExitV2SdwMemoryArchive({
+      adapter: bAdapter, signer: b.signer, knownSignersStore: bKnown,
+      manifest: exportA.manifest, artifactBytes: exportA.artifact_bytes,
+      transferKey: exportA.transfer_key.slice(), now: () => NOW,
+      badSignerAuthority: markedA,
+    })).rejects.toThrow(/quarantined foreign signer/);
+    expect(await bAdapter.countPassages()).toBe(0);
+    expect(await bKnown.lookup(a.handle.did)).toBeNull();
     const importedB = await importExitV2SdwMemoryArchive({
       adapter: bAdapter, signer: b.signer, knownSignersStore: bKnown,
       manifest: exportA.manifest, artifactBytes: exportA.artifact_bytes,
@@ -434,6 +451,23 @@ describe("Exit V2 SDW memory archive", () => {
         ? c.handle.public_key : cRuntime.get(did),
       resolveMemoryIntegrityState: async () => "state_COMPLETE",
     });
+    const markedRelayedA = {
+      isMarked: async (did: string, rawPublicKey: Uint8Array) =>
+        did === a.handle.did && Buffer.from(rawPublicKey).equals(Buffer.from(a.handle.public_key)),
+    };
+    await expect(planExitV2SdwMemoryAdmission({
+      adapter: cAdapter, signer: c.signer, manifest: exportB.manifest,
+      artifactBytes: exportB.artifact_bytes, transferKey: exportB.transfer_key.slice(),
+      badSignerAuthority: markedRelayedA,
+    })).rejects.toThrow(/quarantined foreign signer/);
+    await expect(importExitV2SdwMemoryArchive({
+      adapter: cAdapter, signer: c.signer, knownSignersStore: cKnown,
+      manifest: exportB.manifest, artifactBytes: exportB.artifact_bytes,
+      transferKey: exportB.transfer_key.slice(), now: () => NOW,
+      badSignerAuthority: markedRelayedA,
+    })).rejects.toThrow(/quarantined foreign signer/);
+    expect(await cAdapter.countPassages()).toBe(0);
+    expect(await cKnown.lookup(a.handle.did)).toBeNull();
     await importExitV2SdwMemoryArchive({
       adapter: cAdapter, signer: c.signer, knownSignersStore: cKnown,
       manifest: exportB.manifest, artifactBytes: exportB.artifact_bytes,
