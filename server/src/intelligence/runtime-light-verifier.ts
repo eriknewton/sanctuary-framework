@@ -4,6 +4,8 @@
  * This module performs bounded `/api/show` and `/api/tags` reads only when an
  * explicit caller invokes it. It is not wired to provisioning, the selector,
  * generation, config persistence, audit, or host-file inspection.
+ * Design section 5.3 loopback-endpoint enforcement is the caller's obligation;
+ * this inert slice does not implement it.
  */
 
 import { timingSafeEqual } from "node:crypto";
@@ -15,6 +17,7 @@ import {
 } from "./model-manifest-v2.js";
 
 const KIBIBYTE_BYTES = 1_024;
+// Must match IDENTITY_COMPONENT `{0,63}` in server/src/intelligence/model-manifest-v2.ts.
 const OLLAMA_IDENTITY_COMPONENT_MAX_CHARS = 64;
 const RUNTIME_TAG_SEPARATORS = 2;
 const SHA256_BYTES = 32;
@@ -28,6 +31,7 @@ export const OLLAMA_RUNTIME_EVIDENCE_MAX_MODELS = 256;
 export const OLLAMA_RUNTIME_TAG_MAX_CHARS =
   3 * OLLAMA_IDENTITY_COMPONENT_MAX_CHARS + RUNTIME_TAG_SEPARATORS;
 export const OLLAMA_RUNTIME_EVIDENCE_DEFAULT_TIMEOUT_MS = 5_000;
+/** Design section 7.3 caps pending per-tuple single-flight entries at 32. */
 export const LIGHT_RUNTIME_SINGLE_FLIGHT_MAX_ENTRIES = 32;
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
@@ -60,6 +64,8 @@ export type RuntimeLightProtocolState =
   (typeof RUNTIME_LIGHT_PROTOCOL_STATES)[number];
 
 export type RuntimeLightRefusalReason =
+  | "binding_mismatch"
+  | "model_root_invalid"
   | "runtime_model_absent"
   | "runtime_manifest_digest_invalid"
   | "runtime_manifest_digest_mismatch"
@@ -166,7 +172,10 @@ function constantTimeDigestEqual(left: string, right: string): boolean {
   return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"));
 }
 
-/** `/api/show` is existence evidence only; every digest-like field is ignored. */
+/**
+ * `/api/show` is existence evidence only; every digest-like field is ignored.
+ * A 200 error object still establishes existence because tags is the sole digest authority.
+ */
 export function inspectOllamaShowPayload(
   payload: unknown,
 ): OllamaShowInspectionResult {
@@ -283,19 +292,21 @@ export class OllamaRuntimeEvidenceClient implements RuntimeLightVerifier {
     const runtimeTag = deriveOllamaRuntimeTag(request.binding.ollama_identity);
     const expectedManifestDigest =
       request.binding.ollama_identity.ollama_manifest_sha256;
+    if (!isAbsolute(request.rootReal)) {
+      return refusal("request_invalid", "model_root_invalid", runtimeTag || null);
+    }
     if (
-      !isAbsolute(request.rootReal) ||
       request.binding.runtime_tag !== runtimeTag ||
       runtimeTag.length === 0 ||
-      runtimeTag.length > OLLAMA_RUNTIME_TAG_MAX_CHARS ||
+      runtimeTag.length > OLLAMA_RUNTIME_TAG_MAX_CHARS
+    ) {
+      return refusal("request_invalid", "binding_mismatch", runtimeTag || null);
+    }
+    if (
       !SHA256_HEX.test(expectedManifestDigest) ||
       expectedManifestDigest === ALL_ZERO_SHA256
     ) {
-      return refusal(
-        "request_invalid",
-        "runtime_manifest_digest_invalid",
-        runtimeTag || null,
-      );
+      return refusal("request_invalid", "runtime_manifest_digest_invalid", runtimeTag);
     }
 
     const show = await this.fetchJson(
@@ -331,6 +342,7 @@ export class OllamaRuntimeEvidenceClient implements RuntimeLightVerifier {
       { method: "GET" },
     );
     if (!tags.ok) {
+      // Show shapes stay retryable because show carries no digest authority; identical tags shapes are content failures because tags is the sole digest evidence.
       return refusal(
         tags.state,
         tags.state === "tags_response_too_large" ||
@@ -380,6 +392,7 @@ export class OllamaRuntimeEvidenceClient implements RuntimeLightVerifier {
       try {
         response = await this.fetchImpl(url, {
           ...init,
+          redirect: "error",
           signal: controller.signal,
         });
       } catch {

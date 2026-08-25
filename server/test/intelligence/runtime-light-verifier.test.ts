@@ -105,12 +105,13 @@ describe("Q5B runtime-reported light verifier", () => {
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ model: RUNTIME_TAG }),
+        redirect: "error",
       }),
     );
     expect(fetchImpl).toHaveBeenNthCalledWith(
       2,
       "http://127.0.0.1:11434/api/tags",
-      expect.objectContaining({ method: "GET" }),
+      expect.objectContaining({ method: "GET", redirect: "error" }),
     );
   });
 
@@ -293,13 +294,29 @@ describe("Q5B runtime-reported light verifier", () => {
     });
   });
 
-  it("refuses a binding whose runtime tag diverges from its signed identity", async () => {
+  it("refuses invalid requests with taxonomy-specific reasons", async () => {
     const fetchImpl = evidenceFetch({}, { models: [] });
+
+    await expect(client(fetchImpl).verify(request({ rootReal: "models" }))).resolves.toMatchObject({
+      ok: false,
+      state: "request_invalid",
+      reason: "model_root_invalid",
+    });
+
     const divergent = request();
     divergent.binding.runtime_tag = "attacker:latest";
     await expect(client(fetchImpl).verify(divergent)).resolves.toMatchObject({
       ok: false,
       state: "request_invalid",
+      reason: "binding_mismatch",
+    });
+
+    const invalidDigest = request();
+    invalidDigest.binding.ollama_identity.ollama_manifest_sha256 = "0".repeat(64);
+    await expect(client(fetchImpl).verify(invalidDigest)).resolves.toMatchObject({
+      ok: false,
+      state: "request_invalid",
+      reason: "runtime_manifest_digest_invalid",
     });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
@@ -329,22 +346,40 @@ describe("Q5B runtime-reported light verifier", () => {
     expect(delegate.verify).toHaveBeenCalledTimes(2);
   });
 
+  it("re-runs the delegate after a settled success", async () => {
+    const success: RuntimeLightVerificationResult = {
+      ok: true,
+      state: "runtime_manifest_match",
+      runtimeTag: RUNTIME_TAG,
+      observedManifestDigest: EXPECTED_DIGEST,
+    };
+    const delegate: RuntimeLightVerifier = {
+      verify: vi.fn(async () => success),
+    };
+    const verifier = createSingleFlightLightRuntimeVerifier(delegate);
+
+    await verifier.verify(request());
+    await verifier.verify(request());
+
+    expect(delegate.verify).toHaveBeenCalledTimes(2);
+  });
+
   it("caps pending single-flight tuples without evicting an unsettled gate", async () => {
     const delegate: RuntimeLightVerifier = {
       verify: vi.fn((_request): Promise<RuntimeLightVerificationResult> =>
         new Promise(() => undefined)),
     };
     const verifier = createSingleFlightLightRuntimeVerifier(delegate);
-    const pending = Array.from(
+    Array.from(
       { length: LIGHT_RUNTIME_SINGLE_FLIGHT_MAX_ENTRIES },
       (_unused, index) => verifier.verify(request({ rootReal: `/models/${index}` })),
     );
-    expect(pending).toHaveLength(LIGHT_RUNTIME_SINGLE_FLIGHT_MAX_ENTRIES);
     await expect(
       verifier.verify(request({ rootReal: "/models/overflow" })),
     ).resolves.toMatchObject({
       ok: false,
       state: "single_flight_capacity_refused",
+      reason: "integrity_io_unavailable",
     });
     expect(delegate.verify).toHaveBeenCalledTimes(LIGHT_RUNTIME_SINGLE_FLIGHT_MAX_ENTRIES);
   });
