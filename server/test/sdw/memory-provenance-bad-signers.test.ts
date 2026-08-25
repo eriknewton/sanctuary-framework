@@ -214,6 +214,30 @@ describe("C4 foreign bad-signer quarantine", () => {
     expect(await f.store.isMarked(f.direct.did, f.direct.publicKey)).toBe(true);
   });
 
+  it("refuses a noncanonical authenticated mark timestamp without changing eligibility", async () => {
+    const f = await fixture();
+    const audit = new AuditLog(f.storage, MASTER);
+    const noncanonical = new MemoryProvenanceBadSignerStore({
+      storage: f.storage,
+      masterKey: MASTER,
+      fortressId: "fortress-local",
+      resolveSignerPublicKey: (did) => f.keys.get(did)?.slice(),
+      isLocallyRootedSigner: () => false,
+      scanForeignDependencies: (did, fingerprint) =>
+        f.adapter.scanForeignSignerDependencies(did, fingerprint),
+      now: () => "2026-08-24T22:00:00+00:00",
+    });
+    const fingerprint = memoryProvenancePublicKeyFingerprint(f.direct.publicKey);
+    await expect(noncanonical.mark({
+      signerDid: f.direct.did,
+      publicKeySha256: fingerprint,
+      reason: "compromise",
+      approvalAuditId: "gate-approval-noncanonical-time",
+    }, audit)).rejects.toThrow(/invalid authenticated bad-signer state/);
+    expect(await noncanonical.isMarked(f.direct.did, f.direct.publicKey)).toBe(false);
+    expect((await f.adapter.getPassageProvenance(f.direct.id)).status).toBe("verified");
+  });
+
   it("bounds attacker strings before scans and refuses local or unknown mappings", async () => {
     const f = await fixture();
     const audit = new AuditLog(f.storage, MASTER);

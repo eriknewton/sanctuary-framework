@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { decrypt, encrypt, type EncryptedPayload } from "../core/encryption.js";
 import { stringToBytes } from "../core/encoding.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
+import { parseIsoInstantWithOffset } from "../core/time.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import type { StorageBackend } from "../storage/interface.js";
 import { withExitAdmissionLock } from "../storage/exit-import-journal.js";
@@ -315,10 +316,11 @@ function validateRecord(value: MemoryProvenanceBadSignerMark, did: string, finge
     reason: value.reason,
     approvalAuditId: value.approval_audit_id,
   });
+  const markedAtMs = parseIsoInstantWithOffset(value.marked_at);
   if (value.version !== 1 || value.signer_did !== did ||
       value.public_key_sha256 !== fingerprint ||
-      !Number.isFinite(Date.parse(value.marked_at)) ||
-      new Date(value.marked_at).toISOString() !== value.marked_at) {
+      markedAtMs === undefined ||
+      new Date(markedAtMs).toISOString() !== value.marked_at) {
     throw new Error("invalid authenticated bad-signer state");
   }
 }
