@@ -632,9 +632,10 @@ export function resolveModelForSurface(
 }
 
 /**
- * Convert a verified release-signer assertion into the existing provenance
- * contract. The signed license identifier and openness booleans are repeated
- * exactly; verification proves who asserted them, not independent legal truth.
+ * Convert the historical V1 release-signer assertion into provenance. V1's
+ * digest was sourced from Ollama's model-manifest identity, not a weights file;
+ * Q5A therefore records it under the corrected evidence name. This does not arm
+ * Q5 or claim that constituent layer bytes were hashed.
  */
 export function provenanceFromVerifiedModelManifest(
   model: ModelManifestModel,
@@ -645,7 +646,7 @@ export function provenanceFromVerifiedModelManifest(
     model_name: model.model_name,
     model_version: model.model_version,
     provider: model.provider,
-    weights_hash: `sha256:${model.weights_sha256}`,
+    runtime_manifest_hash: `sha256:${model.weights_sha256}`,
     license: model.license.identifier,
     open_weights: model.open_weights,
     open_source: model.open_source,
