@@ -121,7 +121,7 @@ export async function withCrossProcessLock<T>(
  * from withCrossProcessLock/withPathLock, reworded to name the exit-import
  * writer guard's own remediation instead of a generic manual-`rm` hint -
  * for lock names where the holder set is exactly {import, rotate, resume,
- * recovery} and the fix is the same "run `sanctuary exit recover` (F1,
+ * recovery, memory_migration} and the fix is the same "run `sanctuary exit recover` (F1,
  * Exit V2 D1 operator finding, 2026-08-23), or inspect before removing"
  * text those callers already use elsewhere. Not a
  * different lock mechanism; a different message on the SAME

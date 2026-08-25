@@ -669,6 +669,7 @@ describe("memory file CLI: fortress-backed round trip", () => {
         ownerRef: "fleet-self",
         resolvePrimarySigningHandle: createPrimaryMemoryProvenanceSigningHandleResolver(identities, masterKey),
         resolveSignerPublicKey: createPrimaryMemoryProvenancePublicKeyResolver(identities),
+        resolveMemoryIntegrityState: async () => "state_PRE_MIGRATION",
       });
     }
 

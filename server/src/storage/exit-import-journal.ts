@@ -110,11 +110,13 @@ export class InterruptedExitImportPendingError extends Error {
  * makes that impossible: a concurrent open cannot even acquire the lock
  * until the live operation releases it.
  *
- * Four owners share ONE lock file under the exit-import journal's own
+ * Five owners share ONE lock file under the exit-import journal's own
  * namespace: `import` (from the pre-image snapshot through
  * deleteImportJournal, exit/bundle.ts), `rotate`/`resume` (from the
  * journal re-check through finalize, core/master-rotation.ts), and
- * `recovery` (for the whole of recoverInterruptedExitImports).
+ * `recovery` (for the whole of recoverInterruptedExitImports), plus the
+ * bounded C3 `memory_migration` page/abort/repair transaction. This keeps a
+ * page from observing split-key or half-imported corpus state.
  *
  * NO AUTO-STALE-BREAK: inherited unchanged from withCrossProcessLock (see
  * that module's header for the #871 TOCTOU lesson this deliberately does
@@ -137,7 +139,12 @@ export class InterruptedExitImportPendingError extends Error {
  * fortress behind any in-flight import/rotation/recovery for no
  * correctness gain the post-image check does not already provide.
  */
-export type ExitAdmissionOwner = "import" | "rotate" | "resume" | "recovery";
+export type ExitAdmissionOwner =
+  | "import"
+  | "rotate"
+  | "resume"
+  | "recovery"
+  | "memory_migration";
 
 const EXIT_ADMISSION_LOCK_FILE = "admission.lock";
 
@@ -170,7 +177,7 @@ export async function withExitAdmissionLock<T>(
   } catch (err) {
     if (err instanceof CrossProcessLockError) {
       throw new ExitAdmissionLockError(
-        `refusing to proceed (${owner}): another exit-import or master-rotation ` +
+        `refusing to proceed (${owner}): another exit-import, master-rotation, or memory-migration ` +
           "operation holds the admission lock for this fortress, or a prior " +
           // F1/round-3: must name EXIT_RECOVERY_VERB (defined above in
           // this same file) AND the exact "--fortress <fortress path>"

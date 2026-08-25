@@ -118,6 +118,17 @@ a SNAPSHOT and drift with every merge - run `npm run refresh-reorg-evidence` for
 
 ---
 
+### Deployment-held SDW memory provenance migration
+
+Memory Integrity C3 adds the operator-invoked, force-pinned Tier-1
+`MI_C_SDW_MEMORY_PROVENANCE_V1` migration inside the existing `sdw` module. It
+uses a bounded encrypted journal, honest `legacy_unattested` companions,
+replace-in-place quarantine, replay-anchored completion/repair, and
+completed-state unsigned refusal. It never auto-starts on boot, reads, or
+upgrade. C2+C3 remain one populated-fortress deployment unit; this adds no
+Exit V2 carriage, foreign tiers, fleet sync, capsule runtime, release, or
+public capability claim.
+
 ## Confusable clusters - read these if a name confuses you
 
 The confusion in this tree is overwhelmingly LEXICAL, not structural. Cross-imports were verified;

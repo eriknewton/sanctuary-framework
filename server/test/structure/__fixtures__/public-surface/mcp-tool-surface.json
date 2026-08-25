@@ -2126,6 +2126,38 @@
     }
   },
   {
+    "name": "sdw_memory_provenance_abort_migration",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "sdw_memory_provenance_migrate",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "sdw_memory_provenance_migration_status",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "sdw_memory_provenance_repair_completion_marker",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "shr_gateway_export",
     "inputSchema": {
       "type": "object",

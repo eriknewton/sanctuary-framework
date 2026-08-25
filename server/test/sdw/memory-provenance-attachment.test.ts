@@ -6,7 +6,10 @@ import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interfa
 import { assertSdwRawWriteAuthorized, prepareSdwBackendWrite, type Persistable } from "../../src/sdw/write-gate.js";
 import type { SdwRecord } from "../../src/sdw/records.js";
 import { SdwMemoryBackendAdapter, SDW_MEMORY_INTEGRITY_STATE } from "../../src/sdw/adapters/sdw-memory-backend.js";
-import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
+import {
+  TestSdwMemoryBackendAdapter,
+  testMemoryProvenanceDependencies,
+} from "./test-memory-backend.js";
 import { memoryInsertIngress } from "../../src/sdw/memory-provenance-ingress.js";
 import { documentChunkKey, documentKey, documentProvenanceKey, documentProvenanceStatusKey } from "../../src/sdw/grammar.js";
 import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
@@ -311,6 +314,11 @@ describe("Memory Integrity C2 encrypted attachment", () => {
         storage: new RecordingStorage(), masterKey: MASTER_KEY,
         fortressId: "fortress:test", ownerRef: "fleet-self",
       } as never)).toThrow("requires primary-identity provenance signing wiring");
+      expect(() => new SdwMemoryBackendAdapter({
+        storage: new RecordingStorage(), masterKey: MASTER_KEY,
+        fortressId: "fortress:test", ownerRef: "fleet-self",
+        ...testMemoryProvenanceDependencies(MASTER_KEY),
+      } as never)).toThrow("requires durable memory-integrity state wiring");
     } finally {
       if (prior === undefined) delete process.env.VITEST;
       else process.env.VITEST = prior;
@@ -413,6 +421,7 @@ describe("Memory Integrity C2 encrypted attachment", () => {
         : [];
       expect(names).toContain("resolvePrimarySigningHandle");
       expect(names).toContain("resolveSignerPublicKey");
+      expect(names).toContain("resolveMemoryIntegrityState");
     }
     const adapterAst = sourceFiles.get("sdw/adapters/sdw-memory-backend.ts")!;
     let vitestAccesses = 0;

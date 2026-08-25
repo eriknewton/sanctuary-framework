@@ -46,6 +46,7 @@ import type {
 } from "../principal-policy/types.js";
 import { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
 import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../sdw/memory-provenance-signing.js";
+import { SdwMemoryProvenanceMigration } from "../sdw/memory-provenance-migration.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { getSanctuaryVersion } from "../version.js";
 import { consumeFlagValue } from "./argv.js";
@@ -484,6 +485,16 @@ async function bootstrap(
     // discovered by the mechanical pin.
     const memoryArchiveAuditLog = new AuditLog(storage, masterKey);
     await recoverInterruptedExitImportsOrThrow(storage, memoryArchiveAuditLog);
+    const signingHandle = createPrimaryMemoryProvenanceSigningHandleResolver(identityManager, masterKey);
+    const signerPublicKey = createPrimaryMemoryProvenancePublicKeyResolver(identityManager);
+    const migration = new SdwMemoryProvenanceMigration({
+      storage,
+      masterKey,
+      fortressId,
+      ownerRef: parsed.ownerRef,
+      resolvePrimarySigningHandle: signingHandle,
+      resolveSignerPublicKey: signerPublicKey,
+    });
     return {
       storage,
       masterKey,
@@ -495,8 +506,9 @@ async function bootstrap(
         masterKey,
         fortressId,
         ownerRef: parsed.ownerRef,
-        resolvePrimarySigningHandle: createPrimaryMemoryProvenanceSigningHandleResolver(identityManager, masterKey),
-        resolveSignerPublicKey: createPrimaryMemoryProvenancePublicKeyResolver(identityManager),
+        resolvePrimarySigningHandle: signingHandle,
+        resolveSignerPublicKey: signerPublicKey,
+        resolveMemoryIntegrityState: () => migration.getState(),
       }),
       signer: {
         identity_id: primary.identity_id,

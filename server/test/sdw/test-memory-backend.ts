@@ -11,14 +11,18 @@ import type { MemoryProvenanceSigningHandle } from "../../src/sdw/memory-provena
 
 /** Explicit test fixture. Production code never imports this test-tree module. */
 export class TestSdwMemoryBackendAdapter extends SdwMemoryBackendAdapter {
-  constructor(options: Omit<
-    SdwMemoryBackendAdapterOptions,
-    "resolvePrimarySigningHandle" | "resolveSignerPublicKey" | "testOnlyDefaultProvenanceContext"
-  >) {
+  constructor(options: Omit<SdwMemoryBackendAdapterOptions,
+    "resolvePrimarySigningHandle" | "resolveSignerPublicKey" |
+    "resolveMemoryIntegrityState" | "testOnlyDefaultProvenanceContext"
+  > & {
+    readonly resolveMemoryIntegrityState?: SdwMemoryBackendAdapterOptions["resolveMemoryIntegrityState"];
+  }) {
     const deps = testMemoryProvenanceDependencies(options.masterKey);
     super({
       ...options,
       ...deps,
+      resolveMemoryIntegrityState: options.resolveMemoryIntegrityState ??
+        (async () => "state_PRE_MIGRATION"),
       testOnlyDefaultProvenanceContext: memoryInsertIngress(() => "system:test", "system_generated"),
     });
   }

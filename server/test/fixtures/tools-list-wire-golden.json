@@ -1,5 +1,5 @@
 {
-  "tool_count": 104,
+  "tool_count": 108,
   "tools": [
     {
       "name": "identity_create",
@@ -1850,6 +1850,38 @@
         "required": [
           "passage_id"
         ]
+      }
+    },
+    {
+      "name": "sdw_memory_provenance_migration_status",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "sdw_memory_provenance_migrate",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "sdw_memory_provenance_abort_migration",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "sdw_memory_provenance_repair_completion_marker",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
       }
     },
     {

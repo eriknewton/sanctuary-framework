@@ -121,6 +121,8 @@ import {
 import { createSdwMemoryProvenanceTool } from "./sdw/memory-provenance-tool.js";
 import { SdwMemoryBackendAdapter } from "./sdw/adapters/sdw-memory-backend.js";
 import { createSdwTools } from "./sdw/tools.js";
+import { SdwMemoryProvenanceMigration } from "./sdw/memory-provenance-migration.js";
+import { createSdwMemoryProvenanceMigrationTools } from "./sdw/memory-provenance-migration-tools.js";
 import { StorageSnapshotSdwInventorySource } from "./sdw/export.js";
 import { fromBase64url } from "./core/encoding.js";
 import { join as joinPath } from "node:path";
@@ -1525,13 +1527,26 @@ export async function createSanctuaryServer(options?: {
   // stable scope. memory_insert/memory_delete are Tier-1 in DEFAULT_POLICY
   // (the delete additionally force-pinned, un-relaxable); memory_insert's body
   // is redacted from the approval channel below (Hard Constraint #1).
+  const sdwMemoryIdentity = wrappedAgentIdentityFromEnv;
+  const sdwFortressId = fortressIdFromStoragePath(config.storage_path);
+  const sdwMemorySigningHandle = createPrimaryMemoryProvenanceSigningHandleResolver(identityManager, masterKey);
+  const sdwMemorySignerPublicKey = createPrimaryMemoryProvenancePublicKeyResolver(identityManager);
+  const sdwMemoryMigration = new SdwMemoryProvenanceMigration({
+    storage,
+    masterKey,
+    fortressId: sdwFortressId,
+    ownerRef: "fleet-self",
+    resolvePrimarySigningHandle: sdwMemorySigningHandle,
+    resolveSignerPublicKey: sdwMemorySignerPublicKey,
+  });
   const sdwMemoryAdapter = new SdwMemoryBackendAdapter({
     storage,
     masterKey,
-    fortressId: fortressIdFromStoragePath(config.storage_path),
+    fortressId: sdwFortressId,
     ownerRef: "fleet-self",
-    resolvePrimarySigningHandle: createPrimaryMemoryProvenanceSigningHandleResolver(identityManager, masterKey),
-    resolveSignerPublicKey: createPrimaryMemoryProvenancePublicKeyResolver(identityManager),
+    resolvePrimarySigningHandle: sdwMemorySigningHandle,
+    resolveSignerPublicKey: sdwMemorySignerPublicKey,
+    resolveMemoryIntegrityState: () => sdwMemoryMigration.getState(),
   });
   // Fail-closed multi-agent isolation guard: the adapter above is bound to ONE
   // shared `fleet-self` owner scope reused for every caller, so SDW memory has
@@ -1553,8 +1568,6 @@ export async function createSanctuaryServer(options?: {
   // agent-asserted value. BOUND: the pin lives in this process; two harnesses
   // over one fortress run separate server processes and are not separated
   // (IC-16 stays open).
-  const sdwMemoryIdentity = wrappedAgentIdentityFromEnv;
-  const sdwFortressId = fortressIdFromStoragePath(config.storage_path);
   const sdwMemoryIsolationGuard = createMultiAgentIsolationGuard(sdwMemoryIdentity);
   const sdwMemoryTools = createSdwMemoryTools({
     adapter: sdwMemoryAdapter,
@@ -1578,6 +1591,11 @@ export async function createSanctuaryServer(options?: {
     adapter: sdwMemoryAdapter,
     auditLog,
     // Same guard instance: provenance reveals existence, owner ref, hashes.
+    isolationGuard: sdwMemoryIsolationGuard,
+  });
+  const sdwMemoryProvenanceMigrationTools = createSdwMemoryProvenanceMigrationTools({
+    migration: sdwMemoryMigration,
+    auditLog,
     isolationGuard: sdwMemoryIsolationGuard,
   });
   const sdwMemoryFileTools = createSdwMemoryFileTools({
@@ -1832,6 +1850,7 @@ export async function createSanctuaryServer(options?: {
     ...memoryAttestTools,
     ...sdwMemoryTools,
     sdwMemoryProvenanceTool,
+    ...sdwMemoryProvenanceMigrationTools,
     ...sdwMemoryFileTools,
     ...sdwVaultTools,
     ...complianceTools,
@@ -2081,6 +2100,9 @@ const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([
   "sanctuary_sign_challenge",
   "sdw_export",
   "sdw_import",
+  "sdw_memory_provenance_migrate",
+  "sdw_memory_provenance_abort_migration",
+  "sdw_memory_provenance_repair_completion_marker",
   "shr_gateway_export",
   "shr_generate",
   "state_delete",
@@ -2163,6 +2185,7 @@ const READ_MCP_TOOLS: ReadonlySet<string> = new Set([
   "reputation_query_weighted",
   "sanctuary_policy_status",
   "sdw_memory_provenance",
+  "sdw_memory_provenance_migration_status",
   "shr_verify",
   "sovereignty_audit",
   "sovereignty_profile_get",
