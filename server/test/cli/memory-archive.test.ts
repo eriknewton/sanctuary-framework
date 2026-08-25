@@ -45,6 +45,7 @@ import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backe
 import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../../src/sdw/memory-provenance-signing.js";
 import { ingestClaudeCodeMemoryDirectory } from "../../src/sdw/adapters/claude-code-file-adapter.js";
 import { transcodeMemoryDirectory } from "../../src/sdw/memory-transcode.js";
+import { SdwMemoryProvenanceMigration } from "../../src/sdw/memory-provenance-migration.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { runExitCommand } from "../../src/exit/cli.js";
 import {
@@ -167,7 +168,10 @@ async function fortress(prefix: string, ownerRef: string, withArchive: boolean):
   );
   await identityManager.save(storedIdentity);
   await waitForPrimaryIdentityPointer(storage);
-  if (!withArchive) return { path, storage, masterKey };
+  if (!withArchive) {
+    await completeMemoryMigration(storage, masterKey, path, ownerRef);
+    return { path, storage, masterKey };
+  }
 
   const adapter = await productionAdapter(storage, masterKey, fortressId(path), ownerRef);
   await ingestClaudeCodeMemoryDirectory(adapter, FIXTURE_ROOT);
@@ -178,7 +182,28 @@ async function fortress(prefix: string, ownerRef: string, withArchive: boolean):
     "codex",
     join(projectionParent, "projection"),
   );
+  await completeMemoryMigration(storage, masterKey, path, ownerRef);
   return { path, storage, masterKey, archiveId: transcoded.archive_id };
+}
+
+async function completeMemoryMigration(
+  storage: FilesystemStorage,
+  masterKey: Uint8Array,
+  path: string,
+  ownerRef: string,
+): Promise<void> {
+  const identities = new IdentityManager(storage, masterKey);
+  await identities.load();
+  const migration = new SdwMemoryProvenanceMigration({
+    storage, masterKey, fortressId: fortressId(path), ownerRef,
+    resolvePrimarySigningHandle: createPrimaryMemoryProvenanceSigningHandleResolver(identities, masterKey),
+    resolveSignerPublicKey: createPrimaryMemoryProvenancePublicKeyResolver(identities),
+  });
+  for (let page = 0; page < 20; page++) {
+    const progress = await migration.migratePage();
+    if (progress.completed) break;
+    if (page === 19) throw new Error("disposable memory provenance migration did not complete");
+  }
 }
 
 async function productionAdapter(
@@ -297,6 +322,10 @@ describe("Exit V2 memory archive CLI", () => {
     const manifest = JSON.parse(
       await readFile(join(result.bundle, "manifest.json"), "utf8"),
     ) as { body: { export_approval_audit_id: string } };
+    const artifact = JSON.parse(
+      await readFile(join(result.bundle, "artifacts", "sdw-memory-archive.json"), "utf8"),
+    ) as { format: string };
+    expect(artifact.format).toBe("SANCTUARY_EXIT_V2_SDW_MEMORY_ARCHIVE_V2");
     const gateEvents = await new AuditLog(source.storage, source.masterKey).query({
       operation_type: "gate_approve:memory_archive_export",
       limit: 10,

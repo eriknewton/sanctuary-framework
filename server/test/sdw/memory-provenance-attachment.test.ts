@@ -3,14 +3,17 @@ import { readFile, readdir } from "node:fs/promises";
 import { join, relative } from "node:path";
 import ts from "typescript";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
-import { assertSdwRawWriteAuthorized, prepareSdwBackendWrite, type Persistable } from "../../src/sdw/write-gate.js";
+import { assertSdwRawWriteAuthorized, passageContentHash, prepareSdwBackendWrite, type Persistable } from "../../src/sdw/write-gate.js";
 import type { SdwRecord } from "../../src/sdw/records.js";
 import { SdwMemoryBackendAdapter, SDW_MEMORY_INTEGRITY_STATE } from "../../src/sdw/adapters/sdw-memory-backend.js";
 import {
   TestSdwMemoryBackendAdapter,
   testMemoryProvenanceDependencies,
 } from "./test-memory-backend.js";
-import { memoryInsertIngress } from "../../src/sdw/memory-provenance-ingress.js";
+import { exitV2ForeignImportIngress, memoryInsertIngress } from "../../src/sdw/memory-provenance-ingress.js";
+import { signMemoryOrigin } from "../../src/sdw/memory-provenance-contract.js";
+import { ed25519 } from "@noble/curves/ed25519";
+import { publicKeyToDid } from "../../src/core/identity.js";
 import { documentChunkKey, documentKey, documentProvenanceKey, documentProvenanceStatusKey } from "../../src/sdw/grammar.js";
 import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
 
@@ -129,6 +132,40 @@ function input() {
 }
 
 describe("Memory Integrity C2 encrypted attachment", () => {
+  it("C4 preserves a verified foreign origin signature and mints only destination admission", async () => {
+    const storage = new RecordingStorage();
+    const local = testMemoryProvenanceDependencies(MASTER_KEY);
+    const foreignSeed = new Uint8Array(32).fill(77);
+    const foreignKey = ed25519.getPublicKey(foreignSeed);
+    const foreignDid = publicKeyToDid(foreignKey);
+    const origin = signMemoryOrigin({
+      origin_fortress_id: "foreign-fortress", owner_ref: "source-owner",
+      passage_id: "source-passage", content_hash: passageContentHash("abcdefgh"),
+      chunk_count: 2, author_agent_id: "foreign-agent", ingress_channel: "memory_insert",
+      source_class: "user_content", recorded_at: NOW,
+    }, { identity_id: "foreign-id", did: foreignDid, public_key: foreignKey,
+      sign: (bytes) => ed25519.sign(bytes, foreignSeed) });
+    if (!origin.ok) throw new Error(JSON.stringify(origin.error));
+    const subject = new SdwMemoryBackendAdapter({
+      storage, masterKey: MASTER_KEY, fortressId: "fortress:test", ownerRef: "fleet-self",
+      maxChunkChars: 4, now: () => NOW, resolvePrimarySigningHandle: local.resolvePrimarySigningHandle,
+      resolveSignerPublicKey: (identityId, did) => identityId === "foreign-id" && did === foreignDid
+        ? foreignKey : local.resolveSignerPublicKey(identityId, did),
+      resolveMemoryIntegrityState: async () => "state_PRE_MIGRATION",
+    });
+    await subject.insertPassage({ passage_id: "p1", text: "abcdefgh",
+      provenanceContext: exitV2ForeignImportIngress({ origin: origin.value,
+        originPublicKey: foreignKey, trustTier: "foreign_direct",
+        transferLineageRef: "a".repeat(64) }) }, "user_content");
+    const admitted = await subject.getPassageProvenance("p1");
+    expect(admitted).toMatchObject({ status: "verified" });
+    if (admitted.status !== "verified") return;
+    expect(admitted.companion.origin).toEqual(origin.value);
+    expect(admitted.companion.admission.body).toMatchObject({
+      origin_trust_tier: "foreign_direct", verification_basis: "exit_v2_manifest_key",
+      destination_fortress_id: "fortress:test", passage_id: "p1",
+    });
+  });
   it("freezes PRE_MIGRATION and writes chunks, provenance, then the visibility document", async () => {
     const storage = new RecordingStorage();
     await adapter(storage).insertPassage(input(), "user_content");
@@ -401,7 +438,9 @@ describe("Memory Integrity C2 encrypted attachment", () => {
     expect(factoryProperties("sdw/adapters/codex-memory-file-adapter.ts", "screenCodexMemorySnapshot", "fileImportIngress")).toBe(1);
     expect(factoryProperties("sdw/memory-transcode.ts", "archiveFileInput", "memoryTranscodeIngress")).toBe(1);
     expect(factoryProperties("sdw/memory-transcode.ts", "archiveManifestInput", "memoryTranscodeIngress")).toBe(1);
-    expect(factoryProperties("exit/v2-memory-archive.ts", "importExitV2SdwMemoryArchive", "legacyExitV1ImportIngress")).toBe(2);
+    expect(factoryProperties("exit/v2-memory-archive.ts", "importExitV2SdwMemoryArchive", "legacyExitV1ImportIngress")).toBe(1);
+    expect(factoryProperties("exit/v2-memory-archive.ts", "importExitV2SdwMemoryArchive", "exitV2ForeignImportIngress")).toBe(1);
+    expect(factoryProperties("exit/v2-memory-archive.ts", "importExitV2SdwMemoryArchive", "memoryTranscodeIngress")).toBe(1);
 
     const constructors: ts.NewExpression[] = [];
     for (const sourceFile of sourceFiles.values()) {

@@ -17,6 +17,7 @@ import {
   KnownSignersStore,
   KnownSignersQuotaError,
   KNOWN_SIGNERS_NAMESPACE,
+  MEMORY_PROVENANCE_SIGNER_PREFIX,
 } from "../../src/reputation/known-signers-store.js";
 
 /** A fresh, syntactically valid Ed25519 keypair, for constructing distinct DIDs cheaply. */
@@ -116,5 +117,40 @@ describe("KnownSignersStore quota (independent gate item 4)", () => {
     // later re-assertion is not treated as a fresh write.
     const first = await store.lookup(entries[0]!.did);
     expect(first?.first_seen_import_id).toBe("import-1");
+  });
+});
+
+describe("KnownSignersStore partition isolation (C4)", () => {
+  it("keeps reputation and memory-provenance headroom independent", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const reputation = new KnownSignersStore(storage, masterKey, {
+      maxKnownSigners: 2,
+      partition: "reputation",
+    });
+    const memory = new KnownSignersStore(storage, masterKey, {
+      maxKnownSigners: 2,
+      partition: "memory_provenance",
+    });
+    await reputation.persistIfAbsent([freshEntry("r1"), freshEntry("r2")], "rep-import");
+    expect((await memory.wouldExceedCapacity([freshEntry("m1")])).exceeds).toBe(false);
+    await memory.persistIfAbsent([freshEntry("m1"), freshEntry("m2")], "memory-import");
+    expect((await reputation.wouldExceedCapacity([freshEntry("r3")])).exceeds).toBe(true);
+    expect((await memory.wouldExceedCapacity([freshEntry("m3")])).exceeds).toBe(true);
+    const keys = (await storage.list(KNOWN_SIGNERS_NAMESPACE)).map((entry) => entry.key);
+    expect(keys.filter((key) => key.startsWith(MEMORY_PROVENANCE_SIGNER_PREFIX))).toHaveLength(2);
+    expect(keys.filter((key) => !key.startsWith(MEMORY_PROVENANCE_SIGNER_PREFIX))).toHaveLength(2);
+
+    const reverseStorage = new MemoryStorage();
+    const reverseMemory = new KnownSignersStore(reverseStorage, masterKey, {
+      maxKnownSigners: 2, partition: "memory_provenance",
+    });
+    const reverseReputation = new KnownSignersStore(reverseStorage, masterKey, {
+      maxKnownSigners: 2, partition: "reputation",
+    });
+    await reverseMemory.persistIfAbsent([freshEntry("mx1"), freshEntry("mx2")], "memory-full");
+    expect((await reverseReputation.wouldExceedCapacity([freshEntry("rx1")])).exceeds).toBe(false);
+    await reverseReputation.persistIfAbsent([freshEntry("rx1")], "rep-after-memory-full");
+    expect((await reverseStorage.list(KNOWN_SIGNERS_NAMESPACE)).length).toBe(3);
   });
 });

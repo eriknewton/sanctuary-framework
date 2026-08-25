@@ -144,7 +144,8 @@ export type ExitAdmissionOwner =
   | "rotate"
   | "resume"
   | "recovery"
-  | "memory_migration";
+  | "memory_migration"
+  | "memory_archive_import";
 
 const EXIT_ADMISSION_LOCK_FILE = "admission.lock";
 
