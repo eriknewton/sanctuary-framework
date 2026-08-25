@@ -38,6 +38,7 @@ import {
 } from "../grammar.js";
 import {
   SDW_DOCUMENT_CORPUS_NAMESPACE,
+  type SdwMemoryIntegrityState,
   type SdwDocumentChunkRecord,
   type SdwDocumentRecord,
   type SdwMemoryProvenanceRecord,
@@ -84,9 +85,9 @@ const MEMORY_PASSAGE_ID_MAC_DOMAIN = "sanctuary.sdw-memory-passage-id.v1";
 // 32 hex chars = 128 bits of the SHA-256 MAC. Hex (not base64url) because the
 // SDW identifier grammar excludes "_", which base64url emits.
 const MEMORY_PASSAGE_ID_HEX_CHARS = 32;
-const MEMORY_BATCH_LOCK_NAMESPACE = "sdw_memory_locks";
-const MEMORY_BATCH_LOCK_FILE = "batch-replace.lock";
-const MEMORY_BATCH_LOCK_TIMEOUT_MS = 30_000;
+export const MEMORY_BATCH_LOCK_NAMESPACE = "sdw_memory_locks";
+export const MEMORY_BATCH_LOCK_FILE = "batch-replace.lock";
+export const MEMORY_BATCH_LOCK_TIMEOUT_MS = 30_000;
 
 const DEFAULT_MAX_CHUNK_CHARS = 8192;
 const MAX_CONFIGURABLE_CHUNK_CHARS = 100_000;
@@ -118,7 +119,7 @@ const MEMORY_CORPUS_SCAN_CAP = 2000;
  */
 const MEMORY_LIST_MAX_LIMIT = 500;
 export const MEMORY_PROVENANCE_QUARANTINE_CANDIDATE_CAP = 2000;
-export const SDW_MEMORY_INTEGRITY_STATE = "state_PRE_MIGRATION" as const;
+export { SDW_MEMORY_INTEGRITY_STATE } from "../records.js";
 
 if (MEMORY_CORPUS_SCAN_CAP < MEMORY_LIST_MAX_LIMIT) {
   // Invariant listPassages relies on to tell "short page" from "capped scan"
@@ -215,6 +216,30 @@ interface DeletePreimage {
 /** One process-local corpus mutation chain per shared backend object. */
 const corpusMutationTails = new WeakMap<StorageBackend, Promise<void>>();
 
+/** Must match every C2 writer and the C3 migration lock acquisition. */
+export function sdwMemoryCorpusBatchLockFile(): string {
+  return `${MEMORY_PASSAGE_DOCUMENT_PREFIX}.corpus.${MEMORY_BATCH_LOCK_FILE}`;
+}
+
+/** Shared in-process half of the owner-scope corpus mutation boundary. */
+export async function withSdwMemoryCorpusMutationLock<T>(
+  storage: StorageBackend,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (typeof (storage as StorageBackend & { namespacePath?: unknown }).namespacePath === "function") {
+    return fn();
+  }
+  const previous = corpusMutationTails.get(storage) ?? Promise.resolve();
+  const run = previous.catch(() => {}).then(fn);
+  const tail = run.then(() => undefined, () => undefined);
+  corpusMutationTails.set(storage, tail);
+  try {
+    return await run;
+  } finally {
+    if (corpusMutationTails.get(storage) === tail) corpusMutationTails.delete(storage);
+  }
+}
+
 export interface SdwMemoryBackendAdapterOptions {
   readonly storage: StorageBackend;
   readonly masterKey: Uint8Array;
@@ -247,6 +272,8 @@ export interface SdwMemoryBackendAdapterOptions {
   readonly resolveSignerPublicKey: (identityId: string, did: string) => Uint8Array | undefined;
   /** Explicitly test-only compatibility for old fixtures; production writers pass per-input contexts. */
   readonly testOnlyDefaultProvenanceContext?: MemoryProvenanceIngressContext;
+  /** Durable C3 state resolver. Production construction must fail closed if it is absent. */
+  readonly resolveMemoryIntegrityState: () => Promise<SdwMemoryIntegrityState>;
 }
 
 export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
@@ -263,6 +290,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   private readonly resolvePrimarySigningHandle: () => MemoryProvenanceSigningHandle;
   private readonly resolveSignerPublicKey: (identityId: string, did: string) => Uint8Array | undefined;
   private readonly testOnlyDefaultProvenanceContext: MemoryProvenanceIngressContext | undefined;
+  private readonly resolveMemoryIntegrityState: () => Promise<SdwMemoryIntegrityState>;
   /**
    * Process-local duplicate-insert guard for non-transactional backends. This
    * does not coordinate with another Sanctuary process pointed at the same
@@ -345,9 +373,13 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
         typeof options.resolveSignerPublicKey !== "function") {
       throw new Error("SDW memory adapter requires primary-identity provenance signing wiring");
     }
+    if (typeof options.resolveMemoryIntegrityState !== "function") {
+      throw new Error("SDW memory adapter requires durable memory-integrity state wiring");
+    }
     this.resolvePrimarySigningHandle = options.resolvePrimarySigningHandle;
     this.resolveSignerPublicKey = options.resolveSignerPublicKey;
     this.testOnlyDefaultProvenanceContext = options.testOnlyDefaultProvenanceContext;
+    this.resolveMemoryIntegrityState = options.resolveMemoryIntegrityState;
   }
 
   async insertPassage(
@@ -679,6 +711,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     if (provenance === "quarantined") {
       throw new SdwValidationError("auth_failed", "SDW memory passage provenance is quarantined");
     }
+    await this.assertUnsignedCompatibilityAllowed(provenance);
     const text = await this.readPassageText(document);
     return this.toPassage(document, text, provenance);
   }
@@ -709,6 +742,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       }
       const provenance = await this.verifyOrQuarantineProvenance(document);
       if (provenance === "quarantined") continue;
+      await this.assertUnsignedCompatibilityAllowed(provenance);
       const text = await this.readPassageText(document);
       const matchCount = needle.length === 0 ? 0 : countOccurrences(text.toLowerCase(), needle);
       if (matchCount === 0) continue;
@@ -745,6 +779,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     for (const document of documents) {
       const provenance = await this.verifyOrQuarantineProvenance(document);
       if (provenance === "quarantined") continue;
+      await this.assertUnsignedCompatibilityAllowed(provenance);
       passages.push(this.toPassage(document, await this.readPassageText(document), provenance));
       if (passages.length >= limit) break;
     }
@@ -816,9 +851,19 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     | { readonly status: "verified"; readonly companion: MemoryProvenanceCompanion }
   > {
     assertSdwIdentifier(passageId, "passage_id");
+    const integrityState = await this.resolveMemoryIntegrityState();
+    if (integrityState === "state_MARKER_ABSENT_POST_COMPLETE") {
+      throw new SdwValidationError(
+        "auth_failed",
+        "SDW memory provenance completion marker is absent after completion",
+      );
+    }
     const documentId = this.documentId(passageId);
     const document = await this.corpus.getDocument(documentId);
-    if (document === null) return { status: "unresolved" };
+    if (document === null) {
+      await this.assertIntegrityStateAfterProvenanceRead("unresolved");
+      return { status: "unresolved" };
+    }
     const rawProvenanceBytes = await this.storage.read(
       SDW_DOCUMENT_CORPUS_NAMESPACE,
       documentProvenanceKey(documentId),
@@ -832,6 +877,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       existingStatus.record.observed_content_hash === document.content_hash &&
       existingStatus.record.observed_provenance_sha256 === observedProvenanceSha256
     ) {
+      await this.assertIntegrityStateAfterProvenanceRead("quarantined");
       return { status: "quarantined", reason: existingStatus.record.reason };
     }
     let provenance;
@@ -841,16 +887,28 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
       if (!await this.quarantine(documentId, "auth_failed", document.content_hash, observedProvenanceSha256)) {
         throw new SdwValidationError("auth_failed", "SDW memory provenance changed during quarantine decision; retry");
       }
+      await this.assertIntegrityStateAfterProvenanceRead("quarantined");
       return { status: "quarantined", reason: "auth_failed" };
     }
-    if (provenance === null) return { status: "unsigned" };
+    if (provenance === null) {
+      if (integrityState === "state_COMPLETE") {
+        throw new SdwValidationError(
+          "auth_failed",
+          "SDW memory passage is unsigned after provenance migration completion",
+        );
+      }
+      await this.assertIntegrityStateAfterProvenanceRead("unsigned");
+      return { status: "unsigned" };
+    }
     const result = this.verifyCompanion(document, provenance.record.companion);
     if (!result.ok) {
       if (!await this.quarantine(documentId, result.error.code, document.content_hash, observedProvenanceSha256)) {
         throw new SdwValidationError("auth_failed", "SDW memory provenance changed during quarantine decision; retry");
       }
+      await this.assertIntegrityStateAfterProvenanceRead("quarantined");
       return { status: "quarantined", reason: result.error.code };
     }
+    await this.assertIntegrityStateAfterProvenanceRead("verified");
     return { status: "verified", companion: result.value };
   }
 
@@ -1393,7 +1451,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     // The lock spans every passage in this owner scope because rollback verifies
     // the whole raw owner-scope key listing. A narrower lock could treat another
     // process's committed passage as rollback damage.
-    return `${MEMORY_PASSAGE_DOCUMENT_PREFIX}.corpus.${MEMORY_BATCH_LOCK_FILE}`;
+    return sdwMemoryCorpusBatchLockFile();
   }
 
   private async assertCandidateCapacity(
@@ -1461,18 +1519,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
     // the nested O_EXCL lock. Let contenders reach that bounded fail-closed
     // primitive (and its operator-visible timeout) instead of queueing them
     // indefinitely behind an in-process promise chain.
-    if (typeof (this.storage as StorageBackend & { namespacePath?: unknown }).namespacePath === "function") {
-      return fn();
-    }
-    const previous = corpusMutationTails.get(this.storage) ?? Promise.resolve();
-    const run = previous.catch(() => {}).then(fn);
-    const tail = run.then(() => undefined, () => undefined);
-    corpusMutationTails.set(this.storage, tail);
-    try {
-      return await run;
-    } finally {
-      if (corpusMutationTails.get(this.storage) === tail) corpusMutationTails.delete(this.storage);
-    }
+    return withSdwMemoryCorpusMutationLock(this.storage, fn);
   }
 
   private async rollbackInsert(documentId: string, writtenChunkKeys: readonly string[]): Promise<void> {
@@ -1598,6 +1645,32 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   ): Promise<"verified" | "unsigned" | "quarantined"> {
     const status = await this.getPassageProvenance(this.passageIdOf(document.document_id));
     return status.status === "unresolved" ? "quarantined" : status.status;
+  }
+
+  private async assertUnsignedCompatibilityAllowed(
+    status: "verified" | "unsigned" | "quarantined",
+  ): Promise<void> {
+    if (status !== "unsigned") return;
+    const state = await this.resolveMemoryIntegrityState();
+    if (state === "state_COMPLETE" || state === "state_MARKER_ABSENT_POST_COMPLETE") {
+      throw new SdwValidationError(
+        "auth_failed",
+        "SDW memory passage is unsigned outside the migration compatibility states",
+      );
+    }
+  }
+
+  private async assertIntegrityStateAfterProvenanceRead(
+    status: "verified" | "unsigned" | "quarantined" | "unresolved",
+  ): Promise<void> {
+    const state = await this.resolveMemoryIntegrityState();
+    if (state === "state_MARKER_ABSENT_POST_COMPLETE" ||
+        (status === "unsigned" && state === "state_COMPLETE")) {
+      throw new SdwValidationError(
+        "auth_failed",
+        "SDW memory integrity state changed during provenance verification",
+      );
+    }
   }
 
   private async quarantine(

@@ -123,6 +123,13 @@ export function documentProvenanceStatusKey(documentId: string): string {
   return `prov-status.${documentId}`;
 }
 
+export const SDW_MEMORY_PROVENANCE_MIGRATION_ACTIVE_KEY =
+  "memory-provenance-migration.active-v1" as const;
+export const SDW_MEMORY_PROVENANCE_MIGRATION_JOURNAL_KEY =
+  "memory-provenance-migration.journal-v1" as const;
+export const SDW_MEMORY_PROVENANCE_COMPLETION_KEY =
+  "memory-provenance-migration.completion-v1" as const;
+
 export function documentChunkKey(
   documentId: string,
   chunkOrdinalPadded: string,

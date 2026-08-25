@@ -12,6 +12,16 @@ export const SDW_DOCUMENT_CORPUS_HKDF_INFO = "sdw-document-corpus-v1";
 export const SDW_VECTOR_MEMORY_HKDF_INFO = "sdw-vector-memory-v1";
 export const SDW_REPLAY_ANCHOR_KEY = "sdw-replay-anchors-v1";
 
+export const SDW_MEMORY_INTEGRITY_STATES = [
+  "state_PRE_MIGRATION",
+  "state_MIGRATING",
+  "state_COMPLETE",
+  "state_MARKER_ABSENT_POST_COMPLETE",
+] as const;
+export type SdwMemoryIntegrityState = typeof SDW_MEMORY_INTEGRITY_STATES[number];
+/** C2 compatibility default; C3 production wiring resolves durable state. */
+export const SDW_MEMORY_INTEGRITY_STATE = "state_PRE_MIGRATION" as const;
+
 export type SdwNamespace =
   | typeof SDW_CATALOG_NAMESPACE
   | typeof SDW_META_NAMESPACE
@@ -42,6 +52,8 @@ export interface SdwReplayAnchorData {
   readonly manifests: readonly ReplayAnchorCounter[];
   readonly tombstones: readonly ReplayAnchorCounter[];
   readonly export_state: number;
+  /** C3 completion epoch; absent on pre-C3 anchors and read as an empty set. */
+  readonly memory_provenance_completion?: readonly ReplayAnchorCounter[];
 }
 
 export interface ReplayAnchorCounter {
@@ -190,6 +202,43 @@ export interface SdwMemoryProvenanceStatusRecord {
   readonly updated_at: string;
 }
 
+export interface SdwMemoryProvenanceMigrationActiveRecord {
+  readonly kind: "memory_provenance_migration_active";
+  readonly version: 1;
+  readonly migration_id: "MI_C_SDW_MEMORY_PROVENANCE_V1";
+  readonly run_id: string;
+  readonly updated_at: string;
+}
+
+export interface SdwMemoryProvenanceMigrationJournalRecord {
+  readonly kind: "memory_provenance_migration_journal";
+  readonly version: 1;
+  readonly migration_id: "MI_C_SDW_MEMORY_PROVENANCE_V1";
+  readonly run_id: string;
+  readonly status: "active" | "abandoned" | "completed" | "partial_scope";
+  readonly started_at: string;
+  readonly observation_time: string;
+  readonly source_signer_identity_id: string;
+  readonly source_signer_did: string;
+  readonly cursor: string | null;
+  readonly scanned: number;
+  readonly migrated: number;
+  readonly verified: number;
+  readonly quarantined: number;
+  readonly unsigned: number;
+  readonly updated_at: string;
+  readonly failure_code?: string;
+}
+
+export interface SdwMemoryProvenanceCompletionRecord {
+  readonly kind: "memory_provenance_completion";
+  readonly version: 1;
+  readonly migration_id: "MI_C_SDW_MEMORY_PROVENANCE_V1";
+  readonly completion_epoch: number;
+  readonly candidate_count: number;
+  readonly completed_at: string;
+}
+
 export interface SdwDocumentMetadata {
   readonly key: string;
   readonly value: string;
@@ -249,6 +298,9 @@ export type SdwRecord =
   | SdwDocumentChunkRecord
   | SdwMemoryProvenanceRecord
   | SdwMemoryProvenanceStatusRecord
+  | SdwMemoryProvenanceMigrationActiveRecord
+  | SdwMemoryProvenanceMigrationJournalRecord
+  | SdwMemoryProvenanceCompletionRecord
   | SdwVectorRecord
   | SdwVectorLabelMapRecord
   | SdwHnswIndexManifestRecord
