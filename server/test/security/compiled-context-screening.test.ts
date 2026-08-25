@@ -1,3 +1,4 @@
+// fail-before-exempt: C4 fixture-wiring only — this existing Slice B suite supplies the newly required provenance-clustering fields, but changes no assertion; C4 behavior is covered by the Exit archive union/journal, signer-store, provenance attachment/routing, CLI archive, and frozen-surface suites, all of which fail against pre-C4 source.
 import { describe, expect, it, vi } from "vitest";
 import { InjectionDetector, type DetectionResult } from "../../src/security/injection-detector.js";
 import {
