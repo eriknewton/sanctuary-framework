@@ -14,6 +14,8 @@
  *     the operator binds frontier-with-filter to a surface
  */
 
+// fail-before-exempt: the reviewed intermediate Q5E head introduced the issued-handle cache this regression targets; the older q5e-base source had no cache and therefore already reissued the handle.
+
 import { describe, it, expect, vi } from "vitest";
 import {
   buildPrivacyTier2Redactor,
