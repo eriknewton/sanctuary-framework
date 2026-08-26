@@ -186,6 +186,21 @@ export interface CastleWallCommandContext {
   /** Override running-app handling for LaunchServices tests. */
   runningAppController?: RunningAppController;
   /**
+   * Override the launchd session-manager probe used to pick the disarm-path
+   * invoker (tests). Defaults to `launchctl managername`: "Aqua" in a console
+   * GUI session, "Background" over SSH, "System" in root/daemon contexts.
+   * Returns null when the probe itself failed (fail-safe: LaunchServices, the
+   * shipped primary, is used). Ignored when `hostAppInvoke` is supplied.
+   */
+  sessionManagerNameProbe?: () => Promise<string | null>;
+  /**
+   * Override the direct-exec host-app invoker used by the disarm-path
+   * no-GUI-session fallback (tests). Defaults to {@link makeHostAppInvoke}
+   * with the same per-action timeout as the LaunchServices invoker. Ignored
+   * when `hostAppInvoke` is supplied.
+   */
+  directHostAppInvoke?: HostAppInvoker;
+  /**
    * Override the system-extension state probe used by the enable gate (tests).
    * Defaults to `systemextensionsctl list | grep castle-wall`.
    */
@@ -3902,9 +3917,92 @@ function makeDefaultOpenRunner(timeoutMs: number): OpenRunner {
 const ARM_INVOKE_TIMEOUT_MS = 90_000;
 const DISARM_INVOKE_TIMEOUT_MS = 7_000;
 const DEACTIVATE_SYSTEM_EXTENSION_TIMEOUT_MS = 90_000;
+
+/**
+ * `launchctl managername` output naming the console GUI (Aqua) session.
+ * Must match the value the probe in defaultSessionManagerNameProbe compares
+ * against; any other manager ("Background" over SSH, "System" in root/daemon
+ * contexts) means there is no Aqua domain for LaunchServices to launch into.
+ */
+const LAUNCHD_GUI_SESSION_MANAGER = "Aqua";
+/**
+ * `launchctl managername` is a local, non-network read of the calling
+ * session's launchd manager; 2s matches the pgrep/pkill probe budget in
+ * makeDefaultRunningAppController (same class of local process query).
+ */
+const SESSION_MANAGER_PROBE_TIMEOUT_MS = 2_000;
+
+function defaultSessionManagerNameProbe(): Promise<string | null> {
+  return new Promise((resolvePromise) => {
+    nodeExecFile(
+      "/bin/launchctl",
+      ["managername"],
+      { encoding: "utf8", timeout: SESSION_MANAGER_PROBE_TIMEOUT_MS },
+      (error, stdout) => {
+        if (error) {
+          resolvePromise(null);
+          return;
+        }
+        const name = (stdout ?? "").trim();
+        resolvePromise(name.length > 0 ? name : null);
+      },
+    );
+  });
+}
+
+/**
+ * Session-aware invoker for the protection-DECREASING host-app verbs (disable
+ * and deactivate-system-extension) only; the enable/arm path stays purely
+ * LaunchServices-routed and is deliberately untouched.
+ *
+ * LaunchServices stays primary in a console GUI (Aqua) session: on macOS Tahoe
+ * a directly-exec'd binary's `NEFilterManager.loadFromPreferences` hangs there
+ * (Mini1 Tahoe drill 2026-06-10, finding 1; see OpenRunner). With NO GUI
+ * session there is no Aqua domain at all, so `open -n -W` fails before the
+ * host app ever runs (observed on hardware: RBSRequestErrorDomain 5 /
+ * OSLaunchdErrorDomain 125, D5 drill 2026-08-25) and the shipped disarm and
+ * uninstall could never complete from an SSH/agent session. In that case this
+ * falls back to direct exec of the SAME resolved signed binary with the SAME
+ * argv, whose output flows through the same parseHeadlessReport +
+ * validateHeadlessBuildIdentity checks as the LaunchServices round-trip, so
+ * the trust chain is unchanged - only the launch transport differs. Direct
+ * exec was proven to reach NE preferences headlessly on hardware in the same
+ * D5 drill. Fail-safe: a failed or empty probe keeps LaunchServices (the
+ * shipped primary), whose failure output the callers surface verbatim.
+ */
+function makeSessionAwareDisarmInvoke(
+  ctx: CastleWallCommandContext,
+  timeoutMs: number,
+): HostAppInvoker {
+  const launchServicesInvoke = makeLaunchServicesHostAppInvoke({
+    timeoutMs,
+    ...(ctx.openRunner ? { openRunner: ctx.openRunner } : {}),
+    ...(ctx.reportPathFactory ? { reportPathFactory: ctx.reportPathFactory } : {}),
+    ...(ctx.runningAppController
+      ? { runningAppController: ctx.runningAppController }
+      : {}),
+  });
+  const directInvoke = ctx.directHostAppInvoke ?? makeHostAppInvoke(timeoutMs);
+  const probe = ctx.sessionManagerNameProbe ?? defaultSessionManagerNameProbe;
+  return async (binaryPath, args) => {
+    const managerName = await probe();
+    // The fallback engages only on a POSITIVE non-Aqua determination; an
+    // indeterminate probe must not reroute the shipped primary transport.
+    if (managerName !== null && managerName.trim() !== LAUNCHD_GUI_SESSION_MANAGER) {
+      return directInvoke(binaryPath, args);
+    }
+    return launchServicesInvoke(binaryPath, args);
+  };
+}
+
 function defaultArmInvoke(ctx: CastleWallCommandContext, action: "enable" | "disable"): HostAppInvoker {
+  if (action === "disable") {
+    // Disarm is the dead-man recovery lever and must work from a headless
+    // (SSH/agent) session, where LaunchServices cannot launch anything.
+    return makeSessionAwareDisarmInvoke(ctx, DISARM_INVOKE_TIMEOUT_MS);
+  }
   return makeLaunchServicesHostAppInvoke({
-    timeoutMs: action === "disable" ? DISARM_INVOKE_TIMEOUT_MS : ARM_INVOKE_TIMEOUT_MS,
+    timeoutMs: ARM_INVOKE_TIMEOUT_MS,
     ...(ctx.openRunner ? { openRunner: ctx.openRunner } : {}),
     ...(ctx.reportPathFactory ? { reportPathFactory: ctx.reportPathFactory } : {}),
     ...(ctx.runningAppController
@@ -3939,16 +4037,14 @@ export async function requestSystemExtensionDeactivation(
     return { kind: "failed", detail: resolved.error };
   }
 
+  // Session-aware for the same reason as disarm: headlessly there is no Aqua
+  // domain, so a LaunchServices launch fails before the deactivation request
+  // is even submitted, and the host app's real answer (including
+  // needs_user_approval) never reaches the operator. Direct exec of the same
+  // signed binary surfaces it (D5 drill 2026-08-25).
   const invoke =
     ctx.hostAppInvoke ??
-    makeLaunchServicesHostAppInvoke({
-      timeoutMs: DEACTIVATE_SYSTEM_EXTENSION_TIMEOUT_MS,
-      ...(ctx.openRunner ? { openRunner: ctx.openRunner } : {}),
-      ...(ctx.reportPathFactory ? { reportPathFactory: ctx.reportPathFactory } : {}),
-      ...(ctx.runningAppController
-        ? { runningAppController: ctx.runningAppController }
-        : {}),
-    });
+    makeSessionAwareDisarmInvoke(ctx, DEACTIVATE_SYSTEM_EXTENSION_TIMEOUT_MS);
   const cliGitSha = resolveCliBuildSha(env, ctx);
 
   // The signed host refuses deactivation while the filter is enabled too,
@@ -4953,9 +5049,16 @@ async function runArmDisarmInner(
       result.stderr.trim() ||
       `host app exited with code ${result.exitCode}`;
     if (action === "disable" && leaseRevoked) {
+      // This warning is the ONLY place the lease-ratchet disclosure and the
+      // underlying invoke failure detail are rendered; realUninstallOps.disarm
+      // in cli/uninstall.ts surfaces both by capturing this stream (must match
+      // the capture there). The label alone ("fail_open_deadman") masked the
+      // real cause on hardware (D5 drill 2026-08-25: a LaunchServices launch
+      // failure read as a filter-observation problem), and the revoked lease
+      // was observed there as FULL DENY for the protected uid, not fail-open.
       write(
         err,
-        `Warning: best-effort NE preference disable did not complete (${detail}); the authenticated dead-man lease was revoked, so the provider fail-open path is active.\n`,
+        `Warning: NE preference disable did not complete (${detail}); the authenticated dead-man lease was already revoked, so the protected uid is fully denied until a later successful disable or re-enable.\n`,
       );
       await appendArmAuditBestEffort(
         action,
@@ -4966,11 +5069,14 @@ async function runArmDisarmInner(
         err,
       );
       write(out, "Castle Wall disarmed: provider dead-man lease revoked (NE preference disable best-effort did not complete).\n");
-      // Bug B P1 (case A): the provider is fail-OPEN now (lease revoked), but the
-      // NE preference disable did NOT complete -- it may STILL be enabled. This
-      // is NOT a confirmed filter-off; a caller must not treat it as safe to
-      // remove the policy daemon (reboot could come up enabled + no daemon =
-      // deny-all).
+      // Bug B P1 (case A): the lease is revoked but the NE preference disable
+      // did NOT complete -- the filter may STILL be enabled. This is NOT a
+      // confirmed filter-off; a caller must not treat it as safe to remove the
+      // policy daemon (reboot could come up enabled + no daemon = deny-all).
+      // The revoked-lease state was DESIGNED as the provider's fail-open path,
+      // but on hardware it was observed as full deny for the protected uid (D5
+      // drill 2026-08-25, allow-under-revoked-lease evidence); the operator
+      // warning above discloses the observed behavior, not the design intent.
       ctx.onDisableNePreferenceOutcome?.("fail_open_deadman");
       return 0;
     }

@@ -121,6 +121,33 @@ function nullWritable(): Writable {
   });
 }
 
+/**
+ * One uninstall report row renders on a single line for a human operator; an
+ * unbounded multi-line disable transcript would break the row format and bury
+ * the report. 600 chars holds the full two-sentence disable warning (the
+ * lease-ratchet disclosure plus a long LaunchServices error is ~450 chars)
+ * with headroom; longer transcripts keep the TAIL, because the disable verb
+ * writes its diagnosis last, and the truncation is marked, never silent.
+ */
+const DISARM_FAILURE_DETAIL_MAX_CHARS = 600;
+
+function collectingWritable(): { stream: Writable; text(): string } {
+  const chunks: string[] = [];
+  const stream = new Writable({
+    write(chunk, _encoding, callback) {
+      chunks.push(String(chunk));
+      callback();
+    },
+  });
+  return { stream, text: () => chunks.join("") };
+}
+
+function flattenDisarmDetail(raw: string): string {
+  const flat = raw.trim().replace(/\s*\n\s*/g, " | ");
+  if (flat.length <= DISARM_FAILURE_DETAIL_MAX_CHARS) return flat;
+  return `…${flat.slice(flat.length - DISARM_FAILURE_DETAIL_MAX_CHARS)}`;
+}
+
 async function statFootprint(path: string): Promise<FootprintStatus> {
   try {
     await lstat(path);
@@ -141,19 +168,34 @@ function realUninstallOps(ctx: UninstallCommandContext): UninstallOps {
       if (platform !== "darwin") return "corroborated_off";
       const { runDisable } = await import("./castle-wall.js");
       let observed: DisableNePreferenceOutcome | undefined;
+      // The disable verb writes its diagnosis (the underlying invoke failure
+      // AND, on the fail_open_deadman path, the lease-ratchet full-deny
+      // disclosure) to stderr; capturing instead of null-writing is what keeps
+      // this row truthful. Must match the warning rendered in the
+      // fail_open_deadman branch of runDisable in cli/castle-wall.ts - the
+      // disclosure is captured from there, never re-rendered here, so the two
+      // surfaces can never disagree. Null-writing this stream was how a
+      // hardware LaunchServices launch failure reached the operator as a bare
+      // "fail_open_deadman" label (D5 drill 2026-08-25).
+      const errCapture = collectingWritable();
       const code = await runDisable(["--fortress", fortressPath], {
         out: nullWritable(),
-        err: nullWritable(),
+        err: errCapture.stream,
         env,
         platform,
         onDisableNePreferenceOutcome: (outcome) => {
           observed = outcome;
         },
       });
-      if (code !== 0) throw new Error(`castle-wall disable exited ${code}`);
+      const detail = flattenDisarmDetail(errCapture.text());
+      if (code !== 0) {
+        throw new Error(
+          `castle-wall disable exited ${code}${detail ? ` (${detail})` : ""}`,
+        );
+      }
       if (observed !== "corroborated_off") {
         throw new Error(
-          `castle-wall disable did not positively observe the filter off (${observed ?? "no outcome"})`,
+          `castle-wall disable did not positively observe the filter off (${observed ?? "no outcome"})${detail ? `; underlying: ${detail}` : ""}`,
         );
       }
       return observed;
