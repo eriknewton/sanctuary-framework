@@ -29,30 +29,9 @@
  */
 
 import type { LocalIntegrityStateV2 } from "./model-manifest-v2.js";
+import type { Surface } from "./surfaces.js";
 
-/**
- * The set of intelligence-layer surfaces the selector routes for.
- *
- * The enum is closed. Adding a surface requires updating the selector's
- * default-config builder, the audit emission shape registry, and the
- * transparency UI in the same PR.
- */
-export type Surface =
-  | "concierge"
-  | "direct-agent-gate-advisor"
-  | "sentinel-scoring"
-  | "gate-explanation"
-  | "privacy-filter-tier-2"
-  | "template-suggestion";
-
-export const SURFACES: readonly Surface[] = [
-  "concierge",
-  "direct-agent-gate-advisor",
-  "sentinel-scoring",
-  "gate-explanation",
-  "privacy-filter-tier-2",
-  "template-suggestion",
-] as const;
+export { SURFACES, type Surface } from "./surfaces.js";
 
 /**
  * The substrate choice an operator may bind to a surface.

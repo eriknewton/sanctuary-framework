@@ -188,7 +188,6 @@ export type {
   SubstrateResponse,
   SubstrateStatusReport,
   SummarizeRequest,
-  Surface,
   SurfaceStatus,
 } from "./types.js";
 
@@ -196,12 +195,13 @@ export {
   FRONTIER_PROVIDERS,
   LOCAL_MODEL_TAGS,
   SUBSTRATE_CHOICES,
-  SURFACES,
   TIER2_PINNED_SURFACE,
   TIER2_PIN_ALLOWED_CHOICES,
   Tier2BindingPinnedError,
   isTier2PinViolation,
 } from "./types.js";
+
+export { SURFACES, type Surface } from "./surfaces.js";
 
 export {
   LocalSubstrate,

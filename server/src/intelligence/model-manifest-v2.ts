@@ -35,7 +35,7 @@ import {
   type ModelLicenseRedistribution,
   type ModelManifestTier,
 } from "./model-manifest.js";
-import { SURFACES, type Surface } from "./types.js";
+import { SURFACES, type Surface } from "./surfaces.js";
 
 export const MODEL_MANIFEST_V2_DOMAIN = "sanctuary.model-manifest.v2";
 export const MODEL_MANIFEST_V2_DELIMITER = "\n";
