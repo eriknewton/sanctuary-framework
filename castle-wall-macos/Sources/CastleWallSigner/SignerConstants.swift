@@ -18,6 +18,9 @@ public enum SignerConstants {
     /// Apple Developer Team ID (the OU on our Developer-ID leaf cert). This is
     /// the same team the sysext + host app are signed under; the XPC caller
     /// check pins to it so only our binaries can request a signature.
+    /// Must match CASTLE_WALL_SYSTEM_EXTENSION_TEAM_ID in
+    /// server/src/cli/castle-wall.ts and CASTLE_WALL_TEAM_ID in
+    /// server/src/cli/install.ts.
     public static let teamID = "YFQSWQ9BJN"
 
     /// Designated code-signing identifier of the shim the TS daemon spawns.

@@ -642,6 +642,16 @@ final class HeadlessFilterCLITests: XCTestCase {
             )
         )
 
+        // Contradictory extra tokens are ambiguous; ambiguity reads
+        // NOT-listed, never as a positive observation (exact SET equality).
+        let contradictory =
+            "*\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1421)\tCastle Wall\t[activated enabled deactivated]"
+        XCTAssertFalse(
+            HeadlessFilterCLI.isExtensionListedActivatedEnabled(
+                inListOutput: contradictory
+            )
+        )
+
         // A single fused token is not the two required whole tokens.
         let fusedToken =
             "*\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1421)\tCastle Wall\t[activated_enabled]"

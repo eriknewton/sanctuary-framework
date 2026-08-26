@@ -799,6 +799,16 @@ describe("parseActivatedCastleWallBundleVersions", () => {
     ).toEqual([]);
   });
 
+  it("rejects a row whose state carries contradictory extra tokens", () => {
+    // "activated enabled deactivated" is ambiguous; ambiguity contributes
+    // nothing (exact SET equality, mirroring the Swift probe).
+    expect(
+      parseActivatedCastleWallBundleVersions(
+        "*\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1421)\tCastle Wall\t[activated enabled deactivated]",
+      ),
+    ).toEqual([]);
+  });
+
   it("rejects a row where our bundle id appears only in the name column", () => {
     // The id sitting in the name column proves nothing about the bundleID
     // column; without the column bind this row contributed version 7.

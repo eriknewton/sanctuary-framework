@@ -616,7 +616,19 @@ enum HeadlessFilterCLI {
                 interior.split(whereSeparator: { $0 == " " || $0 == "\t" })
                     .map(String.init)
             )
-            guard tokens.contains("activated"), tokens.contains("enabled") else {
+            // Both required tokens must be present, and every token must be
+            // a known-benign state word: an unknown or contradictory token
+            // (e.g. "activated enabled deactivated") is ambiguous, and
+            // ambiguity must read NOT-listed, never as a positive
+            // observation. Allowlist, not a contradiction denylist, so the
+            // unknown case fails safe. (Must stay in agreement with
+            // KNOWN_STATE_TOKENS in parseActivatedCastleWallBundleVersions,
+            // server/src/cli/castle-wall.ts.)
+            let knownStateTokens: Set<String> = [
+                "activated", "enabled", "waiting", "for", "user",
+            ]
+            guard tokens.contains("activated"), tokens.contains("enabled"),
+                  tokens.isSubset(of: knownStateTokens) else {
                 return false
             }
             return true

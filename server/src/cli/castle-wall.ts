@@ -4171,7 +4171,16 @@ export function parseActivatedCastleWallBundleVersions(stdout: string): string[]
     if (!state.startsWith("[") || !state.endsWith("]") || state.length < 2) continue;
     const interior = state.slice(1, -1);
     if (interior.includes("[") || interior.includes("]")) continue;
-    if (!interior.split(/\s+/).includes("activated")) continue;
+    // "activated" must be present as a whole token, and every token must be
+    // a known-benign state word: an unknown or contradictory token (e.g.
+    // "activated enabled deactivated") is ambiguous and contributes nothing.
+    // Allowlist, not a contradiction denylist, so the unknown case fails
+    // safe. (Must stay in agreement with knownStateTokens in
+    // isExtensionListedActivatedEnabled, HeadlessFilterCLI.swift.)
+    const KNOWN_STATE_TOKENS = new Set(["activated", "enabled", "waiting", "for", "user"]);
+    const stateTokens = interior.split(/\s+/).filter((t) => t.length > 0);
+    if (!stateTokens.includes("activated")) continue;
+    if (!stateTokens.every((t) => KNOWN_STATE_TOKENS.has(t))) continue;
     // Version only from the bundleID column's own parenthesized field; a
     // malformed cell contributes nothing rather than a garbage version.
     const match = /^\(([^()/]*)\/([^()]*)\)$/.exec(bundleTokens.slice(1).join(" "));
