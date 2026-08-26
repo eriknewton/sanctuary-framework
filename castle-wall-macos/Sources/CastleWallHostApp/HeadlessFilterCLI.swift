@@ -20,8 +20,24 @@ import SystemExtensions
 /// console click for that, once per install.
 enum HeadlessFilterCLI {
     static let headlessFlag = "--headless"
+    /// Must match CASTLE_WALL_HEADLESS_CONTRACT_VERSION in
+    /// server/src/cli/castle-wall.ts (the CLI hard-fails on inequality). Bump
+    /// only when an existing report field changes meaning or a REQUIRED field
+    /// is added/removed; purely additive optional fields (error_domain,
+    /// error_code, recovery, 2026-08-26) do not bump it, because the CLI's
+    /// parser requires only `ok` and `state` and ignores unknown keys.
     static let headlessContractVersion = "3"
+    /// Must match extensionIdentifier in SystemExtensionManager.swift and the
+    /// CASTLE_WALL_SYSTEM_EXTENSION_ID constants in server/src/cli/uninstall.ts
+    /// and server/src/cli/castle-wall.ts: every activation/deactivation request
+    /// and every presence probe must name the same extension.
+    static let systemExtensionIdentifier = "ai.sanctuaryprotocol.macos.castle-wall"
     private static let defaultTimeoutSeconds = 30.0
+    /// `systemextensionsctl list` is a local, fast read; this bound only keeps
+    /// a wedged sysextd from hanging the teardown recovery gate. A probe that
+    /// times out reads as NOT-listed, which fail-safes the recovery to "do not
+    /// submit an activation" (never the reverse).
+    private static let extensionListProbeTimeoutSeconds = 5.0
 
     enum Action: String {
         case enable
@@ -100,6 +116,21 @@ enum HeadlessFilterCLI {
         /// "deactivated" | "will_complete_after_reboot" | "failed".
         let state: String
         let error: String?
+        /// Machine-readable identity of a failure: the NSError domain/code the
+        /// OS returned (e.g. OSSystemExtensionErrorDomain / 4). `error` alone
+        /// collapses these into prose a caller cannot branch on; these fields
+        /// are ADDITIVE alongside it and never change its meaning. Wire names
+        /// must match the optional error_domain/error_code fields of
+        /// HeadlessReport in server/src/cli/castle-wall.ts.
+        let errorDomain: String?
+        let errorCode: Int?
+        /// Disclosure that a recovery mutation ran inside this verb (currently
+        /// only "activate_replace_then_deactivate"). A teardown verb that
+        /// silently submitted an activation would hide a host mutation from the
+        /// operator, so the recovery may run ONLY if it is named here. Wire
+        /// name must match the optional recovery field of HeadlessReport in
+        /// server/src/cli/castle-wall.ts.
+        let recovery: String?
         let build: Build
 
         init(
@@ -107,13 +138,30 @@ enum HeadlessFilterCLI {
             action: String,
             state: String,
             error: String?,
+            errorDomain: String? = nil,
+            errorCode: Int? = nil,
+            recovery: String? = nil,
             build: Build = .current()
         ) {
             self.ok = ok
             self.action = action
             self.state = state
             self.error = error
+            self.errorDomain = errorDomain
+            self.errorCode = errorCode
+            self.recovery = recovery
             self.build = build
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case ok
+            case action
+            case state
+            case error
+            case errorDomain = "error_domain"
+            case errorCode = "error_code"
+            case recovery
+            case build
         }
     }
 
@@ -216,8 +264,8 @@ enum HeadlessFilterCLI {
     static func run(
         _ invocation: Invocation,
         manager: NEFilterManager = .shared(),
-        deactivateSystemExtension: (Double) -> SystemExtensionDeactivationResult =
-            runSystemExtensionDeactivation,
+        deactivateSystemExtension: (Double) -> SystemExtensionTeardownOutcome =
+            runSystemExtensionTeardown,
         output: (String) -> Void = { print($0) }
     ) -> ExitCode {
         let action = invocation.action.rawValue
@@ -311,13 +359,19 @@ enum HeadlessFilterCLI {
     }
 
     static func reportForSystemExtensionDeactivation(
-        _ result: SystemExtensionDeactivationResult,
+        _ outcome: SystemExtensionTeardownOutcome,
         action: String = Action.deactivateSystemExtension.rawValue
     ) -> (report: Report, exitCode: ExitCode) {
-        switch result {
+        // Every branch threads outcome.recovery through: the recovery
+        // disclosure must survive into the report on SUCCESS paths too, or a
+        // recovered teardown would hide its activation submission behind a
+        // clean "deactivated".
+        let recovery = outcome.recovery
+        switch outcome.result {
             case .deactivated:
                 return (
-                    Report(ok: true, action: action, state: "deactivated", error: nil),
+                    Report(ok: true, action: action, state: "deactivated",
+                           error: nil, recovery: recovery),
                     .success
                 )
             case .willCompleteAfterReboot:
@@ -326,7 +380,8 @@ enum HeadlessFilterCLI {
                         ok: true,
                         action: action,
                         state: "will_complete_after_reboot",
-                        error: nil
+                        error: nil,
+                        recovery: recovery
                     ),
                     .success
                 )
@@ -336,13 +391,18 @@ enum HeadlessFilterCLI {
                         ok: false,
                         action: action,
                         state: "needs_user_approval",
-                        error: "macOS requires operator approval to deactivate the system extension"
+                        error: "macOS requires operator approval to deactivate the system extension",
+                        recovery: recovery
                     ),
                     .needsUserApproval
                 )
-            case let .failed(message):
+            case let .failed(failure):
                 return (
-                    Report(ok: false, action: action, state: "unknown", error: message),
+                    Report(ok: false, action: action, state: "unknown",
+                           error: failure.message,
+                           errorDomain: failure.domain,
+                           errorCode: failure.code,
+                           recovery: recovery),
                     .failure
                 )
             case .timedOut:
@@ -351,28 +411,293 @@ enum HeadlessFilterCLI {
                         ok: false,
                         action: action,
                         state: "unknown",
-                        error: "system-extension deactivation timed out"
+                        error: "system-extension deactivation timed out",
+                        recovery: recovery
                     ),
                     .timeout
                 )
         }
     }
 
+    /// Machine-readable identity of a system-extension request failure.
+    /// `domain`/`code` are the NSError values the OS delegate delivered; nil
+    /// only for failures that never came from an NSError (e.g. an unknown
+    /// delegate result). Downstream branching (the error-4 recovery gate)
+    /// compares BOTH domain and code, never the prose message.
+    struct SystemExtensionFailure: Equatable {
+        let message: String
+        let domain: String?
+        let code: Int?
+    }
+
     enum SystemExtensionDeactivationResult: Equatable {
         case deactivated
         case willCompleteAfterReboot
         case needsUserApproval
-        case failed(String)
+        case failed(SystemExtensionFailure)
         case timedOut
     }
 
-    private static func runSystemExtensionDeactivation(
-        timeoutSeconds: Double
+    /// Outcome of one system-extension request (activation or deactivation),
+    /// before the deactivation-specific naming is applied.
+    enum SystemExtensionRequestOutcome: Equatable {
+        case completed
+        case willCompleteAfterReboot
+        case needsUserApproval
+        case failed(SystemExtensionFailure)
+        case timedOut
+    }
+
+    /// The deactivation verb's full result: the terminal request result plus
+    /// the disclosure of any recovery mutation the verb performed. The two
+    /// travel together so no caller can observe the result without the
+    /// disclosure.
+    struct SystemExtensionTeardownOutcome: Equatable {
+        let result: SystemExtensionDeactivationResult
+        /// Non-nil iff a recovery activation (replace) request was submitted;
+        /// see teardownRecoveryDisclosure.
+        let recovery: String?
+    }
+
+    /// The only recovery this verb ever performs: one activation (replacement)
+    /// request to re-bind the OS activation record to the installed app's
+    /// embedded extension version, then one re-submitted deactivation.
+    static let teardownRecoveryDisclosure = "activate_replace_then_deactivate"
+
+    static func systemExtensionFailureDetail(from error: Error) -> SystemExtensionFailure {
+        let nsError = error as NSError
+        return SystemExtensionFailure(
+            message: error.localizedDescription,
+            domain: nsError.domain,
+            code: nsError.code
+        )
+    }
+
+    /// True only for the exact failure the skew recovery is allowed to answer:
+    /// OSSystemExtensionErrorDomain / extensionNotFound (code 4). Matching on
+    /// the structured domain+code (never the prose message) is what keeps the
+    /// recovery from firing on any other failure class.
+    static func isExtensionNotFoundFailure(
+        _ result: SystemExtensionDeactivationResult
+    ) -> Bool {
+        guard case let .failed(failure) = result else { return false }
+        return failure.domain == OSSystemExtensionErrorDomain
+            && failure.code == OSSystemExtensionError.extensionNotFound.rawValue
+    }
+
+    static func deactivationResult(
+        from outcome: SystemExtensionRequestOutcome
     ) -> SystemExtensionDeactivationResult {
-        // OSSystemExtensionRequest.delegate is weak, so keep the bridge alive
-        // for the entire bounded run-loop wait.
-        let deactivator = HeadlessSystemExtensionDeactivator()
-        return deactivator.run(timeoutSeconds: timeoutSeconds)
+        switch outcome {
+        case .completed: return .deactivated
+        case .willCompleteAfterReboot: return .willCompleteAfterReboot
+        case .needsUserApproval: return .needsUserApproval
+        case let .failed(failure): return .failed(failure)
+        case .timedOut: return .timedOut
+        }
+    }
+
+    /// Deactivation with single-shot skew recovery.
+    ///
+    /// A host app redeployed at a newer bundle version than the activated
+    /// extension record can be refused deactivation with extensionNotFound
+    /// even while `systemextensionsctl list` still shows the extension
+    /// activated. The arm path already re-submits activation on a version diff
+    /// (ContentView.armProtectionAfterProbe); this gives the teardown path the
+    /// same replace-first awareness: activate (replacement) once to re-bind
+    /// the record to the installed bundle - the standard app-update path - and
+    /// then re-submit the deactivation once.
+    ///
+    /// Bounds, in order of enforcement:
+    /// - The recovery gate requires the exact error-4 failure AND a positive
+    ///   "still listed activated" observation from the OS's own list output;
+    ///   an unreadable or negative probe means NO recovery (fail-safe: never
+    ///   mutate the host on an unconfirmed premise).
+    /// - Exactly one activation and one re-deactivation, no loops: a second
+    ///   error 4 is reported truthfully, never retried.
+    /// - Every stage spends only the time remaining under the single
+    ///   invocation deadline, so recovery can never stretch the verb past the
+    ///   timeout its caller relied on.
+    /// - The content filter was already verified off before any teardown
+    ///   request (see the deactivateSystemExtension guard in run), so the
+    ///   transient replacement activation opens no enforcement window.
+    static func orchestrateSystemExtensionTeardown(
+        timeoutSeconds: Double,
+        deactivate: (Double) -> SystemExtensionDeactivationResult,
+        isExtensionListedActivated: () -> Bool,
+        activateReplacement: (Double) -> SystemExtensionRequestOutcome,
+        now: () -> Date = Date.init
+    ) -> SystemExtensionTeardownOutcome {
+        let deadline = now().addingTimeInterval(timeoutSeconds)
+        let first = deactivate(timeoutSeconds)
+        guard isExtensionNotFoundFailure(first) else {
+            return SystemExtensionTeardownOutcome(result: first, recovery: nil)
+        }
+        guard case let .failed(firstFailure) = first else {
+            return SystemExtensionTeardownOutcome(result: first, recovery: nil)
+        }
+        guard isExtensionListedActivated() else {
+            return SystemExtensionTeardownOutcome(result: first, recovery: nil)
+        }
+
+        let activationBudget = deadline.timeIntervalSince(now())
+        guard activationBudget > 0 else {
+            return SystemExtensionTeardownOutcome(
+                result: .failed(SystemExtensionFailure(
+                    message: firstFailure.message
+                        + " (skew recovery not attempted: deactivation deadline exhausted)",
+                    domain: firstFailure.domain,
+                    code: firstFailure.code
+                )),
+                recovery: nil
+            )
+        }
+
+        // From here on an activation request HAS been submitted, so every
+        // return path below must carry the recovery disclosure.
+        let activation = activateReplacement(activationBudget)
+        switch activation {
+        case .completed:
+            break
+        case .needsUserApproval:
+            // The replacement itself is parked on operator approval; that is
+            // the truthful terminal state for this run.
+            return SystemExtensionTeardownOutcome(
+                result: .needsUserApproval,
+                recovery: teardownRecoveryDisclosure
+            )
+        case .willCompleteAfterReboot:
+            return SystemExtensionTeardownOutcome(
+                result: .failed(SystemExtensionFailure(
+                    message: firstFailure.message
+                        + "; recovery activation completes only after reboot - reboot, then re-run deactivation",
+                    domain: firstFailure.domain,
+                    code: firstFailure.code
+                )),
+                recovery: teardownRecoveryDisclosure
+            )
+        case let .failed(activationFailure):
+            return SystemExtensionTeardownOutcome(
+                result: .failed(SystemExtensionFailure(
+                    message: "deactivation failed (\(firstFailure.message)); "
+                        + "recovery activation failed: \(activationFailure.message)",
+                    domain: activationFailure.domain,
+                    code: activationFailure.code
+                )),
+                recovery: teardownRecoveryDisclosure
+            )
+        case .timedOut:
+            return SystemExtensionTeardownOutcome(
+                result: .failed(SystemExtensionFailure(
+                    message: firstFailure.message + "; recovery activation timed out",
+                    domain: firstFailure.domain,
+                    code: firstFailure.code
+                )),
+                recovery: teardownRecoveryDisclosure
+            )
+        }
+
+        let retryBudget = deadline.timeIntervalSince(now())
+        guard retryBudget > 0 else {
+            return SystemExtensionTeardownOutcome(
+                result: .failed(SystemExtensionFailure(
+                    message: firstFailure.message
+                        + "; recovery activation completed but the deactivation deadline "
+                        + "was exhausted before the re-submitted deactivation",
+                    domain: firstFailure.domain,
+                    code: firstFailure.code
+                )),
+                recovery: teardownRecoveryDisclosure
+            )
+        }
+        // Second failure (any code, including another error 4) is reported
+        // truthfully with its own domain/code; the single-shot cap means it is
+        // never retried.
+        let second = deactivate(retryBudget)
+        return SystemExtensionTeardownOutcome(
+            result: second,
+            recovery: teardownRecoveryDisclosure
+        )
+    }
+
+    /// True iff `systemextensionsctl list` output shows the identified
+    /// extension in any `[activated ...]` state. Row matching mirrors
+    /// parseInstallSystemExtensionState in server/src/cli/install.ts (every
+    /// matching row participates; list order must never hide a live record)
+    /// and the `[activated` states enumerated by parseCastleWallState in
+    /// server/src/cli/castle-wall.ts.
+    static func isExtensionListedActivated(
+        inListOutput output: String,
+        identifier: String = systemExtensionIdentifier
+    ) -> Bool {
+        output.split(separator: "\n").contains { line in
+            line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+                .contains(Substring(identifier))
+                && line.contains("[activated")
+        }
+    }
+
+    /// Production presence probe behind the recovery gate. Fail-safe: any
+    /// probe failure (spawn error, timeout, nonzero exit, undecodable output)
+    /// reads as NOT listed, which forbids the recovery activation - a
+    /// diagnostic failure must never authorize a host mutation.
+    private static func defaultExtensionListedActivated() -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/systemextensionsctl")
+        process.arguments = ["list"]
+        let stdout = Pipe()
+        process.standardOutput = stdout
+        process.standardError = Pipe()
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
+        // Read concurrently with the bounded wait: `list` output is small, but
+        // reading only after exit could deadlock if it ever exceeded the pipe
+        // buffer. LockedDataBox formally synchronizes the reader-thread write
+        // with the post-wait read (same pattern as LockedErrorBox below).
+        let captured = LockedDataBox()
+        let reader = Thread {
+            captured.store(stdout.fileHandleForReading.readDataToEndOfFile())
+        }
+        reader.start()
+        let deadline = Date().addingTimeInterval(extensionListProbeTimeoutSeconds)
+        while process.isRunning, Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        if process.isRunning {
+            process.terminate()
+            return false
+        }
+        while captured.load() == nil, Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        guard process.terminationStatus == 0,
+              let data = captured.load(),
+              let text = String(data: data, encoding: .utf8) else {
+            return false
+        }
+        return isExtensionListedActivated(inListOutput: text)
+    }
+
+    private static func runSystemExtensionTeardown(
+        timeoutSeconds: Double
+    ) -> SystemExtensionTeardownOutcome {
+        orchestrateSystemExtensionTeardown(
+            timeoutSeconds: timeoutSeconds,
+            deactivate: { seconds in
+                // OSSystemExtensionRequest.delegate is weak, so the runner
+                // stays alive for the entire bounded run-loop wait.
+                let runner = HeadlessSystemExtensionRequestRunner(kind: .deactivation)
+                return deactivationResult(from: runner.run(timeoutSeconds: seconds))
+            },
+            isExtensionListedActivated: defaultExtensionListedActivated,
+            activateReplacement: { seconds in
+                let runner = HeadlessSystemExtensionRequestRunner(kind: .activation)
+                return runner.run(timeoutSeconds: seconds)
+            }
+        )
     }
 
     private static func save(
@@ -452,22 +777,41 @@ enum HeadlessFilterCLI {
     }
 }
 
-/// Bounded delegate bridge for the signed host app's deactivation request.
-/// Node cannot own this request: macOS binds it to the app identity that owns
-/// the bundled system extension.
-private final class HeadlessSystemExtensionDeactivator: NSObject,
+/// Bounded delegate bridge for the signed host app's system-extension
+/// requests (deactivation, and the single-shot skew-recovery activation).
+/// Node cannot own these requests: macOS binds them to the app identity that
+/// owns the bundled system extension.
+private final class HeadlessSystemExtensionRequestRunner: NSObject,
     OSSystemExtensionRequestDelegate
 {
-    private static let extensionIdentifier = "ai.sanctuaryprotocol.macos.castle-wall"
+    enum Kind {
+        case activation
+        case deactivation
+    }
+
+    private let kind: Kind
     private let lock = NSLock()
-    private var result: HeadlessFilterCLI.SystemExtensionDeactivationResult?
+    private var result: HeadlessFilterCLI.SystemExtensionRequestOutcome?
     private var approvalNeeded = false
 
-    func run(timeoutSeconds: Double) -> HeadlessFilterCLI.SystemExtensionDeactivationResult {
-        let request = OSSystemExtensionRequest.deactivationRequest(
-            forExtensionWithIdentifier: Self.extensionIdentifier,
-            queue: .main
-        )
+    init(kind: Kind) {
+        self.kind = kind
+    }
+
+    func run(timeoutSeconds: Double) -> HeadlessFilterCLI.SystemExtensionRequestOutcome {
+        let request: OSSystemExtensionRequest
+        switch kind {
+        case .activation:
+            request = OSSystemExtensionRequest.activationRequest(
+                forExtensionWithIdentifier: HeadlessFilterCLI.systemExtensionIdentifier,
+                queue: .main
+            )
+        case .deactivation:
+            request = OSSystemExtensionRequest.deactivationRequest(
+                forExtensionWithIdentifier: HeadlessFilterCLI.systemExtensionIdentifier,
+                queue: .main
+            )
+        }
         request.delegate = self
         OSSystemExtensionManager.shared.submitRequest(request)
 
@@ -484,13 +828,13 @@ private final class HeadlessSystemExtensionDeactivator: NSObject,
         return loadApprovalNeeded() ? .needsUserApproval : .timedOut
     }
 
-    private func storeResult(_ value: HeadlessFilterCLI.SystemExtensionDeactivationResult) {
+    private func storeResult(_ value: HeadlessFilterCLI.SystemExtensionRequestOutcome) {
         lock.lock()
         result = value
         lock.unlock()
     }
 
-    private func loadResult() -> HeadlessFilterCLI.SystemExtensionDeactivationResult? {
+    private func loadResult() -> HeadlessFilterCLI.SystemExtensionRequestOutcome? {
         lock.lock()
         defer { lock.unlock() }
         return result
@@ -514,11 +858,16 @@ private final class HeadlessSystemExtensionDeactivator: NSObject,
     ) {
         switch result {
         case .completed:
-            storeResult(.deactivated)
+            storeResult(.completed)
         case .willCompleteAfterReboot:
             storeResult(.willCompleteAfterReboot)
         @unknown default:
-            storeResult(.failed("unknown system-extension deactivation result"))
+            // Not from an NSError, so there is no domain/code to preserve.
+            storeResult(.failed(HeadlessFilterCLI.SystemExtensionFailure(
+                message: "unknown system-extension request result",
+                domain: nil,
+                code: nil
+            )))
         }
     }
 
@@ -526,7 +875,10 @@ private final class HeadlessSystemExtensionDeactivator: NSObject,
         _ request: OSSystemExtensionRequest,
         didFailWithError error: Error
     ) {
-        storeResult(.failed(error.localizedDescription))
+        // Preserve the NSError domain/code, not only the prose: the error-4
+        // recovery gate and the CLI's report consumers branch on the
+        // structured identity (RCA defect.sysext-deactivation-extension-not-found).
+        storeResult(.failed(HeadlessFilterCLI.systemExtensionFailureDetail(from: error)))
     }
 
     func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
@@ -540,7 +892,32 @@ private final class HeadlessSystemExtensionDeactivator: NSObject,
         actionForReplacingExtension existing: OSSystemExtensionProperties,
         withExtension ext: OSSystemExtensionProperties
     ) -> OSSystemExtensionRequest.ReplacementAction {
+        // Answering .replace is what lets the recovery activation re-bind the
+        // stale activated record to this bundle's embedded extension version
+        // (the standard app-update path); must match
+        // SystemExtensionManager.replacementAction.
         .replace
+    }
+}
+
+/// Lock-guarded capture of the systemextensionsctl reader thread's output so
+/// the cross-thread write/read is formally synchronized (same rationale as
+/// LockedErrorBox). `nil` means "not read yet"; a completed read stores the
+/// (possibly empty) data.
+private final class LockedDataBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Data?
+
+    func store(_ data: Data) {
+        lock.lock()
+        value = data
+        lock.unlock()
+    }
+
+    func load() -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }
 

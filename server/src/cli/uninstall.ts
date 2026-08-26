@@ -486,28 +486,44 @@ export async function runUninstallCommand(ctx: UninstallCommandContext = {}): Pr
       });
     } else {
       const deactivation = await ops.deactivateSystemExtension();
+      // The host app disclosed a recovery mutation inside the teardown verb
+      // (a single activate-replace before re-deactivating, clearing an
+      // app-version skew). That disclosure must reach the operator row on
+      // every outcome, success included: the verb submitted an activation the
+      // operator did not directly ask for.
+      const recoveryNote =
+        deactivation.recovery === undefined
+          ? ""
+          : `; disclosed recovery ran (${deactivation.recovery})`;
       if (deactivation.kind === "reboot-required") {
         rows.push({
           label: "system-extension",
           status: "cannot-remove",
           detail:
-            "deactivation accepted by macOS but requires reboot; reboot, then rerun uninstall to observe absence",
+            "deactivation accepted by macOS but requires reboot; reboot, then rerun uninstall to observe absence" +
+            recoveryNote,
         });
       } else if (deactivation.kind === "needs-user-approval") {
         rows.push({
           label: "system-extension",
           status: "cannot-remove",
-          detail: `${deactivation.detail}; approve at the console, then rerun uninstall`,
+          detail: `${deactivation.detail}; approve at the console, then rerun uninstall${recoveryNote}`,
         });
       } else if (deactivation.kind === "failed") {
-        rows.push({ label: "system-extension", status: "failed", detail: deactivation.detail });
+        rows.push({
+          label: "system-extension",
+          status: "failed",
+          detail: `${deactivation.detail}${recoveryNote}`,
+        });
       } else {
         const observedAfter = await ops.systemExtensionStatus();
         if (observedAfter === "absent") {
           rows.push({
             label: "system-extension",
             status: "removed",
-            detail: "deactivation completed and the Castle Wall system extension is observed absent",
+            detail:
+              "deactivation completed and the Castle Wall system extension is observed absent" +
+              recoveryNote,
           });
         } else {
           rows.push({

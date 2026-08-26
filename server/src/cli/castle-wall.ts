@@ -205,6 +205,22 @@ export interface CastleWallCommandContext {
    * Defaults to `systemextensionsctl list | grep castle-wall`.
    */
   sysextProbe?: () => Promise<SysextState>;
+  /**
+   * Override the installed-app embedded-sysext CFBundleVersion read used by
+   * the deactivation skew-notice preflight (tests). Resolves null whenever the
+   * version cannot be read; the preflight then stays silent. Defaults to
+   * `plutil -extract CFBundleVersion raw` on the embedded extension's
+   * Info.plist inside the resolved app bundle.
+   */
+  embeddedSysextVersionProbe?: (appBundlePath: string) => Promise<string | null>;
+  /**
+   * Override the activated-record bundle-version read used by the deactivation
+   * skew-notice preflight (tests). Resolves the CFBundleVersions of every
+   * activated Castle Wall record in `systemextensionsctl list` (empty when
+   * none, or when the probe fails). Defaults to
+   * {@link parseActivatedCastleWallBundleVersions} over the real list output.
+   */
+  activatedSysextVersionsProbe?: () => Promise<string[]>;
   /** Override the boot-token custody path (F1 safe-mode; tests). */
   bootTokenPath?: string;
   /**
@@ -458,6 +474,15 @@ interface HeadlessReport {
     | "needs_user_approval"
     | "unknown";
   error?: string;
+  /**
+   * Machine-readable failure identity (NSError domain/code) and the host
+   * app's recovery-mutation disclosure. Additive optional fields; wire names
+   * must match the Report CodingKeys in
+   * castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift.
+   */
+  error_domain?: string;
+  error_code?: number;
+  recovery?: string;
   build?: HeadlessBuildIdentity;
 }
 
@@ -565,6 +590,15 @@ async function readEnforcementAvailabilityForStatus(
 
 /** Exit-code contract with HeadlessFilterCLI.ExitCode (Swift side). */
 const HEADLESS_EXIT_NEEDS_APPROVAL = 3;
+/**
+ * Must match headlessContractVersion in
+ * castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift
+ * (validateHeadlessBuildIdentity hard-fails on inequality). Bump only when an
+ * existing report field changes meaning or a REQUIRED field is added/removed;
+ * additive optional report fields (error_domain, error_code, recovery,
+ * 2026-08-26) do not bump it, because parseHeadlessReport requires only `ok`
+ * and `state` and ignores unknown keys.
+ */
 export const CASTLE_WALL_HEADLESS_CONTRACT_VERSION = "3";
 
 interface HeadlessBuildIdentity {
@@ -4054,10 +4088,140 @@ function defaultArmInvoke(ctx: CastleWallCommandContext, action: "enable" | "dis
 }
 
 export type SystemExtensionDeactivationRequestOutcome =
-  | { kind: "request-completed" }
-  | { kind: "reboot-required" }
-  | { kind: "needs-user-approval"; detail: string }
-  | { kind: "failed"; detail: string };
+  | { kind: "request-completed"; recovery?: string }
+  | { kind: "reboot-required"; recovery?: string }
+  | { kind: "needs-user-approval"; detail: string; recovery?: string }
+  | {
+      kind: "failed";
+      detail: string;
+      /**
+       * Machine-readable failure identity passed through from the host app's
+       * report (error_domain/error_code), so callers can branch on a specific
+       * OS error class instead of parsing prose. Absent when the failure did
+       * not come from a host-app report.
+       */
+      error_domain?: string;
+      error_code?: number;
+      recovery?: string;
+    };
+
+/**
+ * Must match systemExtensionIdentifier in
+ * castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift and
+ * CASTLE_WALL_SYSTEM_EXTENSION_ID in server/src/cli/uninstall.ts: probes and
+ * requests on every side must name the same extension.
+ */
+const CASTLE_WALL_SYSTEM_EXTENSION_BUNDLE_ID =
+  "ai.sanctuaryprotocol.macos.castle-wall";
+
+/**
+ * Bundle versions (CFBundleVersion, the `/`-suffixed half of the parenthesized
+ * `(short/bundle)` pair) of every ACTIVATED Castle Wall record in
+ * `systemextensionsctl list` output. Row matching mirrors
+ * parseInstallSystemExtensionState in server/src/cli/install.ts: every
+ * matching row participates, so a terminated old version beside its active
+ * replacement never hides the live record.
+ */
+export function parseActivatedCastleWallBundleVersions(stdout: string): string[] {
+  const versions: string[] = [];
+  for (const line of stdout.split("\n")) {
+    if (!line.trim().split(/\s+/).includes(CASTLE_WALL_SYSTEM_EXTENSION_BUNDLE_ID)) {
+      continue;
+    }
+    // Same activated-state family parseCastleWallState enumerates; a
+    // terminated or uninstalling record is not an activated record.
+    if (!line.includes("[activated")) continue;
+    const match = /\(([^()/]*)\/([^()]*)\)/.exec(line);
+    if (match?.[2]) versions.push(match[2]);
+  }
+  return versions;
+}
+
+function execFileTrimmed(
+  command: string,
+  args: string[],
+  timeoutMs: number,
+): Promise<string | null> {
+  return new Promise((resolvePromise) => {
+    nodeExecFile(
+      command,
+      args,
+      { encoding: "utf8", timeout: timeoutMs },
+      (error, stdout) => {
+        if (error) {
+          resolvePromise(null);
+          return;
+        }
+        resolvePromise((stdout ?? "").trim());
+      },
+    );
+  });
+}
+
+async function defaultEmbeddedSysextVersionProbe(
+  appBundlePath: string,
+): Promise<string | null> {
+  const plistPath = join(
+    appBundlePath,
+    "Contents/Library/SystemExtensions",
+    `${CASTLE_WALL_SYSTEM_EXTENSION_BUNDLE_ID}.systemextension`,
+    "Contents/Info.plist",
+  );
+  // plutil handles both XML and binary plists; a missing bundle or key reads
+  // as null and the notice stays silent (never a teardown failure).
+  const version = await execFileTrimmed(
+    "/usr/bin/plutil",
+    ["-extract", "CFBundleVersion", "raw", "-o", "-", plistPath],
+    SESSION_MANAGER_PROBE_TIMEOUT_MS,
+  );
+  return version ? version : null;
+}
+
+async function defaultActivatedSysextVersionsProbe(): Promise<string[]> {
+  const stdout = await execFileTrimmed(
+    "/usr/bin/systemextensionsctl",
+    ["list"],
+    STATUS_PROBE_TIMEOUT_MS,
+  );
+  if (stdout === null) return [];
+  return parseActivatedCastleWallBundleVersions(stdout);
+}
+
+/**
+ * Skew-notice preflight for the deactivation verb (graph row
+ * defect.sysext-deactivation-extension-not-found): when the installed app's
+ * embedded extension version differs from every activated record's version,
+ * say so before submitting the request, because the host app's recovery path
+ * (a disclosed activate-replace, then re-deactivate) can raise the macOS
+ * approval prompt twice. NOTICE ONLY: any probe failure degrades to silence,
+ * never to a block - a diagnostic preflight must not add a failure mode to
+ * teardown.
+ */
+async function emitSysextVersionSkewNotice(
+  ctx: CastleWallCommandContext,
+  appBundlePath: string,
+): Promise<void> {
+  const err = ctx.err ?? process.stderr;
+  try {
+    const embedded = await (
+      ctx.embeddedSysextVersionProbe ?? defaultEmbeddedSysextVersionProbe
+    )(appBundlePath);
+    if (embedded === null) return;
+    const activated = await (
+      ctx.activatedSysextVersionsProbe ?? defaultActivatedSysextVersionsProbe
+    )();
+    if (activated.length === 0) return;
+    if (activated.includes(embedded)) return;
+    write(
+      err,
+      `Notice: the installed Castle Wall app embeds system-extension version ${embedded} ` +
+        `but the activated record is ${activated.join(", ")}. Deactivation proceeds; ` +
+        `its recovery path may prompt for approval twice.\n`,
+    );
+  } catch {
+    // Notice-only: see the invariant above.
+  }
+}
 
 /**
  * Ask the deployed signed host app to deactivate its bundled system
@@ -4113,6 +4277,11 @@ export async function requestSystemExtensionDeactivation(
     };
   }
 
+  // Skew notice fires only when a deactivation request is actually about to
+  // be submitted (after the disabled-state gate), so it can never claim a
+  // request that the gates then refused.
+  await emitSysextVersionSkewNotice(ctx, resolveAppBundlePath(resolved.path));
+
   const result = await invoke(resolved.path, [
     "--headless",
     "deactivate-system-extension",
@@ -4131,30 +4300,51 @@ export async function requestSystemExtensionDeactivation(
   if (buildMismatch) {
     return { kind: "failed", detail: buildMismatch };
   }
+  // The host app's recovery disclosure must survive into every outcome
+  // (success included): a teardown that silently performed an activation
+  // would hide a host mutation from the operator.
+  const recovery =
+    typeof report.recovery === "string" && report.recovery.length > 0
+      ? { recovery: report.recovery }
+      : {};
   if (report.state === "needs_user_approval") {
     return {
       kind: "needs-user-approval",
       detail: report.error ?? "macOS requires operator approval",
+      ...recovery,
     };
   }
   if (!report.ok || result.exitCode !== 0) {
+    // Pass the machine-readable failure identity through unchanged so callers
+    // can branch on the OS error class instead of parsing prose.
+    const failureIdentity = {
+      ...(typeof report.error_domain === "string"
+        ? { error_domain: report.error_domain }
+        : {}),
+      ...(typeof report.error_code === "number"
+        ? { error_code: report.error_code }
+        : {}),
+    };
     return {
       kind: "failed",
       detail:
         report.error ??
         (result.stderr.trim() ||
           `host app deactivation exited with code ${result.exitCode}`),
+      ...failureIdentity,
+      ...recovery,
     };
   }
   if (report.state === "will_complete_after_reboot") {
-    return { kind: "reboot-required" };
+    return { kind: "reboot-required", ...recovery };
   }
   if (report.state === "deactivated") {
-    return { kind: "request-completed" };
+    return { kind: "request-completed", ...recovery };
   }
   return {
     kind: "failed",
     detail: `host app returned unexpected deactivation state '${report.state}'`,
+    ...recovery,
   };
 }
 

@@ -157,6 +157,60 @@ describe("sanctuary uninstall", () => {
     expect(out.text()).toContain("observed absent");
   });
 
+  it("surfaces the host app's disclosed teardown recovery in the system-extension row", async () => {
+    // The deactivation verb can perform ONE disclosed recovery activation
+    // (activate-replace, then re-deactivate) to clear an app-version skew.
+    // That host mutation must reach the operator row on success AND failure;
+    // a clean "removed" that hid it would hide the mutation.
+    const removedOut = new Capture();
+    let removedStatusReads = 0;
+    const removedCode = await runUninstallCommand({
+      argv: ["--fortress", "/tmp/fortress"],
+      out: removedOut,
+      err: new Capture(),
+      platform: "darwin",
+      getuid: () => 0,
+      ops: ops({
+        systemExtensionStatus: async () => {
+          removedStatusReads++;
+          return removedStatusReads === 1 ? "present" : "absent";
+        },
+        deactivateSystemExtension: async () => ({
+          kind: "request-completed",
+          recovery: "activate_replace_then_deactivate",
+        }),
+      }),
+    });
+    expect(removedCode).toBe(0);
+    expect(removedOut.text()).toContain(
+      "disclosed recovery ran (activate_replace_then_deactivate)",
+    );
+
+    const failedOut = new Capture();
+    const failedCode = await runUninstallCommand({
+      argv: ["--fortress", "/tmp/fortress"],
+      out: failedOut,
+      err: new Capture(),
+      platform: "darwin",
+      getuid: () => 0,
+      ops: ops({
+        systemExtensionStatus: async () => "present",
+        deactivateSystemExtension: async () => ({
+          kind: "failed",
+          detail: "OSSystemExtensionErrorDomain error 4.",
+          error_domain: "OSSystemExtensionErrorDomain",
+          error_code: 4,
+          recovery: "activate_replace_then_deactivate",
+        }),
+      }),
+    });
+    expect(failedCode).toBe(1);
+    expect(failedOut.text()).toContain("OSSystemExtensionErrorDomain error 4.");
+    expect(failedOut.text()).toContain(
+      "disclosed recovery ran (activate_replace_then_deactivate)",
+    );
+  });
+
   it("keeps reboot-deferred deactivation non-clean until absence is observed", async () => {
     const out = new Capture();
     const code = await runUninstallCommand({

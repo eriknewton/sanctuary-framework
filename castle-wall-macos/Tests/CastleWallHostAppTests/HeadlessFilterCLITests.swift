@@ -1,3 +1,4 @@
+import SystemExtensions
 import XCTest
 
 @testable import CastleWallHostApp
@@ -201,28 +202,374 @@ final class HeadlessFilterCLITests: XCTestCase {
     }
 
     func testSystemExtensionDeactivationReportsKeepCompletedAndRebootDeferredDistinct() {
-        let completed = HeadlessFilterCLI.reportForSystemExtensionDeactivation(.deactivated)
+        let completed = HeadlessFilterCLI.reportForSystemExtensionDeactivation(
+            .init(result: .deactivated, recovery: nil)
+        )
         XCTAssertEqual(completed.exitCode, .success)
         XCTAssertTrue(completed.report.ok)
         XCTAssertEqual(completed.report.state, "deactivated")
 
-        let deferred = HeadlessFilterCLI.reportForSystemExtensionDeactivation(.willCompleteAfterReboot)
+        let deferred = HeadlessFilterCLI.reportForSystemExtensionDeactivation(
+            .init(result: .willCompleteAfterReboot, recovery: nil)
+        )
         XCTAssertEqual(deferred.exitCode, .success)
         XCTAssertTrue(deferred.report.ok)
         XCTAssertEqual(deferred.report.state, "will_complete_after_reboot")
     }
 
     func testSystemExtensionDeactivationFailureStatesStayNonSuccess() {
-        let approval = HeadlessFilterCLI.reportForSystemExtensionDeactivation(.needsUserApproval)
+        let approval = HeadlessFilterCLI.reportForSystemExtensionDeactivation(
+            .init(result: .needsUserApproval, recovery: nil)
+        )
         XCTAssertEqual(approval.exitCode, .needsUserApproval)
         XCTAssertFalse(approval.report.ok)
 
-        let timeout = HeadlessFilterCLI.reportForSystemExtensionDeactivation(.timedOut)
+        let timeout = HeadlessFilterCLI.reportForSystemExtensionDeactivation(
+            .init(result: .timedOut, recovery: nil)
+        )
         XCTAssertEqual(timeout.exitCode, .timeout)
         XCTAssertFalse(timeout.report.ok)
 
-        let failure = HeadlessFilterCLI.reportForSystemExtensionDeactivation(.failed("boom"))
+        let failure = HeadlessFilterCLI.reportForSystemExtensionDeactivation(
+            .init(
+                result: .failed(.init(message: "boom", domain: nil, code: nil)),
+                recovery: nil
+            )
+        )
         XCTAssertEqual(failure.exitCode, .failure)
         XCTAssertEqual(failure.report.error, "boom")
+    }
+
+    // MARK: - failure identity (error_domain / error_code)
+
+    func testDelegateFailureMapsNSErrorDomainAndCodeIntoFailureDetail() {
+        // The exact defect shape: sysextd answers extensionNotFound (code 4)
+        // while the extension is still listed. The detail must preserve the
+        // structured identity, not only the prose.
+        let error = NSError(
+            domain: OSSystemExtensionErrorDomain,
+            code: OSSystemExtensionError.extensionNotFound.rawValue,
+            userInfo: [NSLocalizedDescriptionKey: "OSSystemExtensionErrorDomain error 4."]
+        )
+        let detail = HeadlessFilterCLI.systemExtensionFailureDetail(from: error)
+        XCTAssertEqual(detail.domain, OSSystemExtensionErrorDomain)
+        XCTAssertEqual(detail.code, OSSystemExtensionError.extensionNotFound.rawValue)
+        XCTAssertEqual(detail.message, "OSSystemExtensionErrorDomain error 4.")
+    }
+
+    func testFailedReportCarriesMachineReadableDomainAndCode() throws {
+        let failure = HeadlessFilterCLI.reportForSystemExtensionDeactivation(
+            .init(
+                result: .failed(.init(
+                    message: "OSSystemExtensionErrorDomain error 4.",
+                    domain: OSSystemExtensionErrorDomain,
+                    code: OSSystemExtensionError.extensionNotFound.rawValue
+                )),
+                recovery: nil
+            )
+        )
+        XCTAssertEqual(failure.report.errorDomain, OSSystemExtensionErrorDomain)
+        XCTAssertEqual(failure.report.errorCode, 4)
+
+        let encoded = HeadlessFilterCLI.encode(failure.report)
+        XCTAssertTrue(encoded.contains(#""error_domain":"OSSystemExtensionErrorDomain""#))
+        XCTAssertTrue(encoded.contains(#""error_code":4"#))
+    }
+
+    func testReportOmitsAdditiveFieldsWhenAbsentSoTheWireShapeIsUnchanged() {
+        // Additive-only contract: a report with no failure identity and no
+        // recovery must serialize byte-identically to the pre-change shape,
+        // which is why headlessContractVersion stays "3".
+        let report = HeadlessFilterCLI.Report(
+            ok: true, action: "deactivate-system-extension", state: "deactivated",
+            error: nil,
+            build: .init(gitSha: "abc1234", headlessContractVersion: "3")
+        )
+        let encoded = HeadlessFilterCLI.encode(report)
+        XCTAssertFalse(encoded.contains("error_domain"))
+        XCTAssertFalse(encoded.contains("error_code"))
+        XCTAssertFalse(encoded.contains("recovery"))
+    }
+
+    func testRecoveryDisclosureSurvivesIntoSuccessAndFailureReports() {
+        let recovered = HeadlessFilterCLI.reportForSystemExtensionDeactivation(
+            .init(
+                result: .deactivated,
+                recovery: HeadlessFilterCLI.teardownRecoveryDisclosure
+            )
+        )
+        XCTAssertEqual(recovered.report.recovery, "activate_replace_then_deactivate")
+        XCTAssertTrue(
+            HeadlessFilterCLI.encode(recovered.report)
+                .contains(#""recovery":"activate_replace_then_deactivate""#)
+        )
+
+        let stillFailed = HeadlessFilterCLI.reportForSystemExtensionDeactivation(
+            .init(
+                result: .failed(.init(
+                    message: "second failure",
+                    domain: OSSystemExtensionErrorDomain,
+                    code: OSSystemExtensionError.extensionNotFound.rawValue
+                )),
+                recovery: HeadlessFilterCLI.teardownRecoveryDisclosure
+            )
+        )
+        XCTAssertEqual(stillFailed.report.recovery, "activate_replace_then_deactivate")
+        XCTAssertEqual(stillFailed.report.errorCode, 4)
+    }
+
+    // MARK: - skew-recovery orchestration
+
+    private static func error4Failure() -> HeadlessFilterCLI.SystemExtensionFailure {
+        .init(
+            message: "OSSystemExtensionErrorDomain error 4.",
+            domain: OSSystemExtensionErrorDomain,
+            code: OSSystemExtensionError.extensionNotFound.rawValue
+        )
+    }
+
+    /// Drives the orchestrator with counting fakes. Returns the outcome plus
+    /// the observed submission counts so every test can assert the exact
+    /// number of host mutations, not just the terminal state.
+    private func orchestrate(
+        firstDeactivation: HeadlessFilterCLI.SystemExtensionDeactivationResult,
+        listed: Bool,
+        activation: HeadlessFilterCLI.SystemExtensionRequestOutcome = .completed,
+        secondDeactivation: HeadlessFilterCLI.SystemExtensionDeactivationResult = .deactivated,
+        timeoutSeconds: Double = 60
+    ) -> (
+        outcome: HeadlessFilterCLI.SystemExtensionTeardownOutcome,
+        deactivations: Int,
+        activations: Int,
+        presenceProbes: Int
+    ) {
+        var deactivations = 0
+        var activations = 0
+        var presenceProbes = 0
+        let outcome = HeadlessFilterCLI.orchestrateSystemExtensionTeardown(
+            timeoutSeconds: timeoutSeconds,
+            deactivate: { _ in
+                deactivations += 1
+                return deactivations == 1 ? firstDeactivation : secondDeactivation
+            },
+            isExtensionListedActivated: {
+                presenceProbes += 1
+                return listed
+            },
+            activateReplacement: { _ in
+                activations += 1
+                return activation
+            }
+        )
+        return (outcome, deactivations, activations, presenceProbes)
+    }
+
+    func testRecoveryRunsExactlyOnceOnErrorFourWhileListed() {
+        let run = orchestrate(
+            firstDeactivation: .failed(Self.error4Failure()),
+            listed: true,
+            activation: .completed,
+            secondDeactivation: .deactivated
+        )
+        XCTAssertEqual(run.outcome.result, .deactivated)
+        XCTAssertEqual(
+            run.outcome.recovery,
+            HeadlessFilterCLI.teardownRecoveryDisclosure
+        )
+        XCTAssertEqual(run.deactivations, 2)
+        XCTAssertEqual(run.activations, 1)
+        XCTAssertEqual(run.presenceProbes, 1)
+    }
+
+    func testRecoveryNeverFiresOnOtherFailureCodes() {
+        // Same domain, different codes (13 = authorizationRequired, 8 =
+        // codeSignatureInvalid): the recovery mutation must not fire even
+        // though the extension is listed.
+        for code in [13, 8, 9, 3] {
+            let run = orchestrate(
+                firstDeactivation: .failed(.init(
+                    message: "OSSystemExtensionErrorDomain error \(code).",
+                    domain: OSSystemExtensionErrorDomain,
+                    code: code
+                )),
+                listed: true
+            )
+            XCTAssertEqual(run.activations, 0, "recovery fired on code \(code)")
+            XCTAssertEqual(run.deactivations, 1, "re-deactivation fired on code \(code)")
+            XCTAssertNil(run.outcome.recovery)
+        }
+    }
+
+    func testRecoveryNeverFiresOnForeignDomainOrMissingIdentity() {
+        // A code-4 NSError from a DIFFERENT domain, and a prose-only failure
+        // with no identity at all: both must be inert.
+        for failure in [
+            HeadlessFilterCLI.SystemExtensionFailure(
+                message: "some other error 4", domain: "NSCocoaErrorDomain", code: 4
+            ),
+            HeadlessFilterCLI.SystemExtensionFailure(
+                message: "unknown system-extension request result", domain: nil, code: nil
+            ),
+        ] {
+            let run = orchestrate(firstDeactivation: .failed(failure), listed: true)
+            XCTAssertEqual(run.activations, 0)
+            XCTAssertEqual(run.deactivations, 1)
+            XCTAssertNil(run.outcome.recovery)
+        }
+    }
+
+    func testRecoveryNeverFiresOnNonFailureResults() {
+        for result in [
+            HeadlessFilterCLI.SystemExtensionDeactivationResult.deactivated,
+            .willCompleteAfterReboot,
+            .needsUserApproval,
+            .timedOut,
+        ] {
+            let run = orchestrate(firstDeactivation: result, listed: true)
+            XCTAssertEqual(run.activations, 0)
+            XCTAssertEqual(run.deactivations, 1)
+            XCTAssertNil(run.outcome.recovery)
+            XCTAssertEqual(run.outcome.result, result)
+        }
+    }
+
+    func testRecoveryRequiresPositiveListedObservation() {
+        // Fail-safe direction: an unlisted (or unreadable, which the probe
+        // reports as unlisted) extension forbids the recovery activation.
+        let run = orchestrate(
+            firstDeactivation: .failed(Self.error4Failure()),
+            listed: false
+        )
+        XCTAssertEqual(run.activations, 0)
+        XCTAssertEqual(run.deactivations, 1)
+        XCTAssertNil(run.outcome.recovery)
+        XCTAssertEqual(run.outcome.result, .failed(Self.error4Failure()))
+    }
+
+    func testSecondErrorFourIsReportedTruthfullyAndNeverRetried() {
+        let run = orchestrate(
+            firstDeactivation: .failed(Self.error4Failure()),
+            listed: true,
+            activation: .completed,
+            secondDeactivation: .failed(Self.error4Failure())
+        )
+        // Single-shot cap: a second error 4 does not loop back into recovery.
+        XCTAssertEqual(run.deactivations, 2)
+        XCTAssertEqual(run.activations, 1)
+        XCTAssertEqual(run.outcome.result, .failed(Self.error4Failure()))
+        XCTAssertEqual(
+            run.outcome.recovery,
+            HeadlessFilterCLI.teardownRecoveryDisclosure
+        )
+    }
+
+    func testFailedRecoveryActivationIsDisclosedAndStopsTheSequence() {
+        let run = orchestrate(
+            firstDeactivation: .failed(Self.error4Failure()),
+            listed: true,
+            activation: .failed(.init(
+                message: "activation refused",
+                domain: OSSystemExtensionErrorDomain,
+                code: 9
+            ))
+        )
+        // The activation WAS submitted, so the disclosure must survive even
+        // though the recovery did not reach the re-deactivation.
+        XCTAssertEqual(run.activations, 1)
+        XCTAssertEqual(run.deactivations, 1)
+        XCTAssertEqual(
+            run.outcome.recovery,
+            HeadlessFilterCLI.teardownRecoveryDisclosure
+        )
+        guard case let .failed(failure) = run.outcome.result else {
+            return XCTFail("expected failed, got \(run.outcome.result)")
+        }
+        XCTAssertTrue(failure.message.contains("recovery activation failed"))
+        XCTAssertEqual(failure.code, 9)
+    }
+
+    func testRecoveryActivationParkedOnApprovalReportsNeedsUserApproval() {
+        let run = orchestrate(
+            firstDeactivation: .failed(Self.error4Failure()),
+            listed: true,
+            activation: .needsUserApproval
+        )
+        XCTAssertEqual(run.outcome.result, .needsUserApproval)
+        XCTAssertEqual(
+            run.outcome.recovery,
+            HeadlessFilterCLI.teardownRecoveryDisclosure
+        )
+        XCTAssertEqual(run.deactivations, 1)
+    }
+
+    func testRecoveryIsSkippedWhenTheDeadlineIsAlreadyExhausted() {
+        // Inject a clock whose second reading is past the deadline: the
+        // orchestrator must skip the recovery mutation, disclose why in the
+        // message, and set no recovery marker (nothing was submitted).
+        var deactivations = 0
+        var activations = 0
+        var clockReads = 0
+        let start = Date(timeIntervalSince1970: 1_000)
+        let outcome = HeadlessFilterCLI.orchestrateSystemExtensionTeardown(
+            timeoutSeconds: 60,
+            deactivate: { _ in
+                deactivations += 1
+                return .failed(Self.error4Failure())
+            },
+            isExtensionListedActivated: { true },
+            activateReplacement: { _ in
+                activations += 1
+                return .completed
+            },
+            now: {
+                clockReads += 1
+                // First read anchors the deadline; later reads are past it.
+                return clockReads == 1 ? start : start.addingTimeInterval(61)
+            }
+        )
+        XCTAssertEqual(deactivations, 1)
+        XCTAssertEqual(activations, 0)
+        XCTAssertNil(outcome.recovery)
+        guard case let .failed(failure) = outcome.result else {
+            return XCTFail("expected failed, got \(outcome.result)")
+        }
+        XCTAssertTrue(failure.message.contains("recovery not attempted"))
+        XCTAssertEqual(failure.code, 4)
+    }
+
+    // MARK: - systemextensionsctl list parsing
+
+    func testListedActivatedMatchesActivatedRowsForTheExactIdentifier() {
+        // Realistic `systemextensionsctl list` shape from the Mini1 capture.
+        let listed = """
+        1 extension(s)
+        --- com.apple.system_extension.network_extension
+        enabled\tactive\tteamID\tbundleID (version)\tname\t[state]
+        *\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1421)\tCastle Wall\t[activated enabled]
+        """
+        XCTAssertTrue(HeadlessFilterCLI.isExtensionListedActivated(inListOutput: listed))
+
+        // Terminated-old-beside-active: any activated row counts.
+        let replaced = """
+        \t\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1421)\tCastle Wall\t[terminated waiting to uninstall on reboot]
+        *\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1472)\tCastle Wall\t[activated waiting for user]
+        """
+        XCTAssertTrue(HeadlessFilterCLI.isExtensionListedActivated(inListOutput: replaced))
+    }
+
+    func testListedActivatedRejectsOtherIdentifiersAndNonActivatedStates() {
+        // A different extension's activated row must not read as ours, and a
+        // terminated-only history must not read as present.
+        let foreign =
+            "*\t*\tTEAMID\tcom.example.other-extension (1.0/7)\tOther\t[activated enabled]"
+        XCTAssertFalse(HeadlessFilterCLI.isExtensionListedActivated(inListOutput: foreign))
+
+        let terminatedOnly =
+            "\t\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1421)\tCastle Wall\t[terminated waiting to uninstall on reboot]"
+        XCTAssertFalse(
+            HeadlessFilterCLI.isExtensionListedActivated(inListOutput: terminatedOnly)
+        )
+
+        XCTAssertFalse(HeadlessFilterCLI.isExtensionListedActivated(inListOutput: ""))
     }
 }
