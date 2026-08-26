@@ -677,6 +677,13 @@ describe("system-extension deactivation failure identity, remediation hint, and 
     expect(err.text()).toContain("system-extension version 1472");
     expect(err.text()).toContain("activated record is 1421");
     expect(err.text()).toContain("re-registers the extension");
+    // Honesty: launch alone only re-registers when the background signer
+    // helper is enabled, so the guidance must name the helper approval and
+    // the wait before the re-run.
+    expect(err.text()).toContain(
+      "approve or re-enable the Sanctuary background helper if macOS prompts " +
+        "for it, wait for re-registration to complete, then re-run this command",
+    );
     expect(outcome).toEqual({ kind: "request-completed" });
     expect(calls.map((call) => call[2])).toEqual([
       "status",
@@ -779,5 +786,26 @@ describe("parseActivatedCastleWallBundleVersions", () => {
       "*\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1472)\tCastle Wall\t[activated waiting for user]",
     ].join("\n");
     expect(parseActivatedCastleWallBundleVersions(stdout)).toEqual(["1421", "1472"]);
+  });
+
+  it("rejects a foreign-team row that reuses our bundle id", () => {
+    // A foreign-team extension may reuse the bundle id; without the teamID
+    // column bind, this row contributed version 666 and could drive a false
+    // skew diagnosis. The notice must degrade to silence instead.
+    expect(
+      parseActivatedCastleWallBundleVersions(
+        "*\t*\tZZOTHERTEAM\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/666)\tCastle Wall\t[activated enabled]",
+      ),
+    ).toEqual([]);
+  });
+
+  it("rejects a row where our bundle id appears only in the name column", () => {
+    // The id sitting in the name column proves nothing about the bundleID
+    // column; without the column bind this row contributed version 7.
+    expect(
+      parseActivatedCastleWallBundleVersions(
+        "*\t*\tYFQSWQ9BJN\tcom.example.other (1.0/7)\tai.sanctuaryprotocol.macos.castle-wall\t[activated enabled]",
+      ),
+    ).toEqual([]);
   });
 });

@@ -392,6 +392,14 @@ final class HeadlessFilterCLITests: XCTestCase {
         XCTAssertEqual(failure.code, 4)
         XCTAssertTrue(failure.message.hasPrefix("OSSystemExtensionErrorDomain error 4."))
         XCTAssertTrue(failure.message.contains("re-registers the extension"))
+        // Honesty: launch alone only re-registers when the background signer
+        // helper is enabled, so the guidance must name the helper approval
+        // and the wait before the re-run.
+        XCTAssertTrue(failure.message.contains(
+            "approve or re-enable the Sanctuary background helper if macOS "
+            + "prompts for it, wait for re-registration to complete, then "
+            + "re-run the deactivation"
+        ))
     }
 
     func testSkewDetectionNeverFiresOnOtherFailureCodes() {
@@ -611,5 +619,36 @@ final class HeadlessFilterCLITests: XCTestCase {
         )
 
         XCTAssertFalse(HeadlessFilterCLI.isExtensionListedActivatedEnabled(inListOutput: ""))
+    }
+
+    func testListedActivatedEnabledRequiresExactWholeTokenStateMatch() {
+        // "deactivated" CONTAINS "activated": a substring match would read
+        // this row as activated. Exact whole-token matching must reject it.
+        let deactivated =
+            "*\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1421)\tCastle Wall\t[deactivated enabled]"
+        XCTAssertFalse(
+            HeadlessFilterCLI.isExtensionListedActivatedEnabled(
+                inListOutput: deactivated
+            )
+        )
+
+        // Text outside the final bracketed group makes the row unparseable
+        // (NOT-listed), never a positive observation.
+        let trailingText =
+            "*\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1421)\tCastle Wall\t[activated enabled] trailing"
+        XCTAssertFalse(
+            HeadlessFilterCLI.isExtensionListedActivatedEnabled(
+                inListOutput: trailingText
+            )
+        )
+
+        // A single fused token is not the two required whole tokens.
+        let fusedToken =
+            "*\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1421)\tCastle Wall\t[activated_enabled]"
+        XCTAssertFalse(
+            HeadlessFilterCLI.isExtensionListedActivatedEnabled(
+                inListOutput: fusedToken
+            )
+        )
     }
 }

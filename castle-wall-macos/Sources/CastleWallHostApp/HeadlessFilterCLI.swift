@@ -469,12 +469,21 @@ enum HeadlessFilterCLI {
 
     /// Operator guidance appended to the failure message on skew detection.
     /// Describes the attended remediation only; it must never promise an
-    /// automated one, because this verb performs none.
+    /// automated one, because this verb performs none. Launching the app
+    /// only re-registers the extension when the background signer helper is
+    /// enabled; with the helper unregistered, launch first lands in an
+    /// approval-gated state, so the guidance names the helper approval and
+    /// the wait honestly. The remediation sentence from "launch" through
+    /// "then re-run"/"then rerun" is mirrored wire text: must stay in
+    /// agreement with emitSysextVersionSkewNotice in
+    /// server/src/cli/castle-wall.ts and the remediation note in
+    /// server/src/cli/uninstall.ts.
     static let extensionVersionSkewGuidance =
         "the installed app's registration no longer matches the activated "
         + "system extension; launch Sanctuary-CastleWall.app at the console so "
-        + "its normal activation flow re-registers the extension, then re-run "
-        + "the deactivation"
+        + "its normal activation flow re-registers the extension, approve or "
+        + "re-enable the Sanctuary background helper if macOS prompts for it, "
+        + "wait for re-registration to complete, then re-run the deactivation"
 
     static func systemExtensionFailureDetail(from error: Error) -> SystemExtensionFailure {
         let nsError = error as NSError
@@ -559,8 +568,9 @@ enum HeadlessFilterCLI {
     /// columns positively identify our extension as activated and enabled:
     /// the bundle id in the bundleID column, our team id in the teamID column
     /// (a foreign-team extension may reuse the bundle id, so a substring hit
-    /// anywhere on the line proves nothing), and a state field that actually
-    /// contains both "activated" and "enabled". Anything unparseable,
+    /// anywhere on the line proves nothing), and a single-bracket state field
+    /// whose whitespace-separated tokens include exactly "activated" and
+    /// "enabled" as whole tokens. Anything unparseable,
     /// localized, or ambiguous reads as NOT-listed, which under this design
     /// merely suppresses the skew remediation hint - never a wrong claim.
     /// Column layout follows the observed header
@@ -585,8 +595,28 @@ enum HeadlessFilterCLI {
             // exact first token, not a substring of a longer identifier.
             guard fields[3].split(separator: " ").first.map(String.init)
                 == identifier else { return false }
+            // The state field must be exactly one bracketed group with
+            // nothing outside it; trailing text after `]` (or a second
+            // bracket) makes the row unparseable and reads as NOT-listed.
             guard let state = fields.last, state.hasPrefix("["),
-                  state.contains("activated"), state.contains("enabled") else {
+                  state.hasSuffix("]"), state.count >= 2 else {
+                return false
+            }
+            let interior = state.dropFirst().dropLast()
+            guard !interior.contains("["), !interior.contains("]") else {
+                return false
+            }
+            // Exact-token match: substring matching accepts the deactivated
+            // state, because "deactivated" contains "activated". Both words
+            // must appear as whole whitespace-separated tokens. (Must stay in
+            // agreement with the column/state binding of
+            // parseActivatedCastleWallBundleVersions in
+            // server/src/cli/castle-wall.ts.)
+            let tokens = Set(
+                interior.split(whereSeparator: { $0 == " " || $0 == "\t" })
+                    .map(String.init)
+            )
+            guard tokens.contains("activated"), tokens.contains("enabled") else {
                 return false
             }
             return true

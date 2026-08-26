@@ -4127,23 +4127,54 @@ const CASTLE_WALL_SYSTEM_EXTENSION_BUNDLE_ID =
   "ai.sanctuaryprotocol.macos.castle-wall";
 
 /**
+ * Apple Developer team id the Castle Wall extension is signed under. Must
+ * match CASTLE_WALL_TEAM_ID in server/src/cli/install.ts and
+ * SignerConstants.teamID on the Swift side: a foreign-team extension may
+ * reuse our bundle id, so the team column is part of the row's identity.
+ */
+const CASTLE_WALL_SYSTEM_EXTENSION_TEAM_ID = "YFQSWQ9BJN";
+
+/**
  * Bundle versions (CFBundleVersion, the `/`-suffixed half of the parenthesized
  * `(short/bundle)` pair) of every ACTIVATED Castle Wall record in
- * `systemextensionsctl list` output. Row matching mirrors
- * parseInstallSystemExtensionState in server/src/cli/install.ts: every
- * matching row participates, so a terminated old version beside its active
- * replacement never hides the live record.
+ * `systemextensionsctl list` output. Every matching row participates, so a
+ * terminated old version beside its active replacement never hides the live
+ * record.
+ *
+ * Row matching parses tab-separated columns and binds each identifier to ITS
+ * column (must stay in agreement with the binding discipline of
+ * isExtensionListedActivatedEnabled in
+ * castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift): the
+ * bundle id must lead the bundleID column, the team id must fill the teamID
+ * column, the version comes only from the bundleID column's parenthesized
+ * field, and "activated" must appear as a whole token of a single-bracket
+ * state field. Anything ambiguous contributes nothing: this feeds a
+ * NOTICE-ONLY preflight, and silence is always safe while a false skew
+ * diagnosis is not.
  */
 export function parseActivatedCastleWallBundleVersions(stdout: string): string[] {
   const versions: string[] = [];
   for (const line of stdout.split("\n")) {
-    if (!line.trim().split(/\s+/).includes(CASTLE_WALL_SYSTEM_EXTENSION_BUNDLE_ID)) {
-      continue;
-    }
-    // Same activated-state family parseCastleWallState enumerates; a
-    // terminated or uninstalling record is not an activated record.
-    if (!line.includes("[activated")) continue;
-    const match = /\(([^()/]*)\/([^()]*)\)/.exec(line);
+    const fields = line.split("\t").map((field) => field.trim());
+    // 6 = the columns of the observed header row (enabled, active, teamID,
+    // bundleID (version), name, [state]); fewer means a banner/header/unknown
+    // row and contributes nothing.
+    if (fields.length < 6) continue;
+    if (fields[2] !== CASTLE_WALL_SYSTEM_EXTENSION_TEAM_ID) continue;
+    // The bundleID column is `<id> (<versions>)`; the id must be the exact
+    // first token, not a substring hit or an id sitting in the name column.
+    const bundleTokens = fields[3]!.split(/\s+/);
+    if (bundleTokens[0] !== CASTLE_WALL_SYSTEM_EXTENSION_BUNDLE_ID) continue;
+    // The state field must be exactly one bracketed group; "activated" must
+    // be a whole token (substring matching would accept "deactivated").
+    const state = fields[fields.length - 1]!;
+    if (!state.startsWith("[") || !state.endsWith("]") || state.length < 2) continue;
+    const interior = state.slice(1, -1);
+    if (interior.includes("[") || interior.includes("]")) continue;
+    if (!interior.split(/\s+/).includes("activated")) continue;
+    // Version only from the bundleID column's own parenthesized field; a
+    // malformed cell contributes nothing rather than a garbage version.
+    const match = /^\(([^()/]*)\/([^()]*)\)$/.exec(bundleTokens.slice(1).join(" "));
     if (match?.[2]) versions.push(match[2]);
   }
   return versions;
@@ -4225,12 +4256,22 @@ async function emitSysextVersionSkewNotice(
     )();
     if (activated.length === 0) return;
     if (activated.includes(embedded)) return;
+    // Launch alone only re-registers when the background signer helper is
+    // enabled; with the helper unregistered, launch first lands in an
+    // approval-gated state, so the guidance names the helper approval and the
+    // wait honestly. The remediation sentence from "launch" through "then
+    // re-run" is mirrored wire text: must stay in agreement with
+    // extensionVersionSkewGuidance in
+    // castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift and
+    // the remediation note in server/src/cli/uninstall.ts.
     write(
       err,
       `Notice: the installed Castle Wall app embeds system-extension version ${embedded} ` +
         `but the activated record is ${activated.join(", ")}. Deactivation proceeds; ` +
         `if macOS refuses it, launch Sanctuary-CastleWall.app at the console so its ` +
-        `activation flow re-registers the extension, then re-run this command.\n`,
+        `activation flow re-registers the extension, approve or re-enable the ` +
+        `Sanctuary background helper if macOS prompts for it, wait for ` +
+        `re-registration to complete, then re-run this command.\n`,
     );
   } catch {
     // Notice-only: see the invariant above.

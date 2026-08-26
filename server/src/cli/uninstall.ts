@@ -497,12 +497,22 @@ export async function runUninstallCommand(ctx: UninstallCommandContext = {}): Pr
       // reach the operator row on EVERY branch, including the
       // completed-but-still-present and unreadable-post-probe ones: this row
       // is the only place the operator learns why a rerun needs the console.
+      // Launch alone only re-registers when the background signer helper is
+      // enabled; with the helper unregistered, launch first lands in an
+      // approval-gated state, so the guidance names the helper approval and
+      // the wait honestly. The remediation sentence from "launch" through
+      // "then rerun" is mirrored wire text: must stay in agreement with
+      // extensionVersionSkewGuidance in
+      // castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift
+      // and emitSysextVersionSkewNotice in server/src/cli/castle-wall.ts.
       const remediationNote =
         deactivation.remediation === undefined
           ? ""
           : `; remediation required (${deactivation.remediation}): launch ` +
             "Sanctuary-CastleWall.app at the console so its activation flow " +
-            "re-registers the extension, then rerun uninstall";
+            "re-registers the extension, approve or re-enable the Sanctuary " +
+            "background helper if macOS prompts for it, wait for " +
+            "re-registration to complete, then rerun uninstall";
       if (deactivation.kind === "reboot-required") {
         rows.push({
           label: "system-extension",

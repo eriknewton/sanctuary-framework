@@ -189,6 +189,13 @@ describe("sanctuary uninstall", () => {
     expect(failedOut.text()).toContain("OSSystemExtensionErrorDomain error 4.");
     expect(failedOut.text()).toContain(remediationText);
     expect(failedOut.text()).toContain("launch Sanctuary-CastleWall.app at the console");
+    // Honesty: launch alone only re-registers when the background signer
+    // helper is enabled, so the guidance must name the helper approval and
+    // the wait before the rerun.
+    expect(failedOut.text()).toContain(
+      "approve or re-enable the Sanctuary background helper if macOS prompts " +
+        "for it, wait for re-registration to complete, then rerun uninstall",
+    );
 
     const removedOut = new Capture();
     let removedStatusReads = 0;
