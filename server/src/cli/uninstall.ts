@@ -180,15 +180,24 @@ export function flattenDisarmDetail(raw: string): string {
   // marker 1 keeps the failure detail that follows it, marker 2 is a constant
   // sentence kept verbatim. Remaining budget carries the transcript tail;
   // truncation stays marked, never silent.
+  // Matching runs on a whitespace-normalized view so a marker split across
+  // lines (or flattened into " | " separators) still matches - the documented
+  // wrapping-immunity contract; windows are extracted from the same view.
+  const normalized = raw.trim().replace(/\s+/g, " ");
   const windows: string[] = [];
-  const idx1 = flat.indexOf(DISARM_DETAIL_PRIORITY_MARKERS[0]);
+  const idx1 = normalized.indexOf(DISARM_DETAIL_PRIORITY_MARKERS[0]);
   if (idx1 >= 0) {
-    const window = flat.slice(idx1, idx1 + DISARM_DETAIL_MARKER_WINDOW_CHARS);
+    const window = normalized.slice(idx1, idx1 + DISARM_DETAIL_MARKER_WINDOW_CHARS);
     windows.push(
       window.length < DISARM_DETAIL_MARKER_WINDOW_CHARS ? window : `${window}…`,
     );
   }
-  if (flat.includes(DISARM_DETAIL_PRIORITY_MARKERS[1])) {
+  if (
+    normalized.includes(DISARM_DETAIL_PRIORITY_MARKERS[1]) &&
+    // Marker 2 already inside marker 1's window: appending it again would
+    // repeat the disclosure verbatim.
+    !windows.some((window) => window.includes(DISARM_DETAIL_PRIORITY_MARKERS[1]))
+  ) {
     windows.push(DISARM_DETAIL_PRIORITY_MARKERS[1]);
   }
   const priority = windows.join(" | ");
