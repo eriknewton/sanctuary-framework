@@ -21,6 +21,11 @@ function buildSelector(storage = new MemoryStorage(), masterKey = generateRandom
 }
 
 describe("selector provisioning state", () => {
+  it("exposes no legacy provisioning tag writer outside the atomic Q5 commit", () => {
+    const { selector } = buildSelector();
+    expect("markLocalModelsProvisioned" in selector).toBe(false);
+  });
+
   it("persists refusals into operator-visible DEGRADED status", async () => {
     const { selector, storage, masterKey, auditLog, fetchImpl } = buildSelector();
     await selector.load();
