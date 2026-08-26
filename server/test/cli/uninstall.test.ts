@@ -157,6 +157,115 @@ describe("sanctuary uninstall", () => {
     expect(out.text()).toContain("observed absent");
   });
 
+  it("surfaces the host app's remediation hint in the system-extension row on every outcome branch", async () => {
+    // The deactivation verb never mutates; when it detects an app-version
+    // skew it attaches a machine-readable remediation id. That hint must
+    // reach the operator row on EVERY branch - success, failure, and the two
+    // post-request probe branches (still-present and unreadable) - because
+    // the row is the only place the operator learns why a rerun needs the
+    // console.
+    const remediationText =
+      "remediation required (extension_version_skew_reregister_required)";
+
+    const failedOut = new Capture();
+    const failedCode = await runUninstallCommand({
+      argv: ["--fortress", "/tmp/fortress"],
+      out: failedOut,
+      err: new Capture(),
+      platform: "darwin",
+      getuid: () => 0,
+      ops: ops({
+        systemExtensionStatus: async () => "present",
+        deactivateSystemExtension: async () => ({
+          kind: "failed",
+          detail: "OSSystemExtensionErrorDomain error 4.",
+          error_domain: "OSSystemExtensionErrorDomain",
+          error_code: 4,
+          remediation: "extension_version_skew_reregister_required",
+        }),
+      }),
+    });
+    expect(failedCode).toBe(1);
+    expect(failedOut.text()).toContain("OSSystemExtensionErrorDomain error 4.");
+    expect(failedOut.text()).toContain(remediationText);
+    expect(failedOut.text()).toContain("launch Sanctuary-CastleWall.app at the console");
+    // Honesty: launch alone only re-registers when the background signer
+    // helper is enabled, so the guidance must name the helper approval and
+    // the wait before the rerun.
+    expect(failedOut.text()).toContain(
+      "approve or re-enable the Sanctuary background helper if macOS prompts " +
+        "for it, wait for re-registration to complete, then rerun uninstall",
+    );
+
+    const removedOut = new Capture();
+    let removedStatusReads = 0;
+    const removedCode = await runUninstallCommand({
+      argv: ["--fortress", "/tmp/fortress"],
+      out: removedOut,
+      err: new Capture(),
+      platform: "darwin",
+      getuid: () => 0,
+      ops: ops({
+        systemExtensionStatus: async () => {
+          removedStatusReads++;
+          return removedStatusReads === 1 ? "present" : "absent";
+        },
+        deactivateSystemExtension: async () => ({
+          kind: "request-completed",
+          remediation: "extension_version_skew_reregister_required",
+        }),
+      }),
+    });
+    expect(removedCode).toBe(0);
+    expect(removedOut.text()).toContain(remediationText);
+
+    // request-completed but the extension is STILL PRESENT: the hint must
+    // survive into this branch too, not only the clean ones.
+    const stillPresentOut = new Capture();
+    const stillPresentCode = await runUninstallCommand({
+      argv: ["--fortress", "/tmp/fortress"],
+      out: stillPresentOut,
+      err: new Capture(),
+      platform: "darwin",
+      getuid: () => 0,
+      ops: ops({
+        systemExtensionStatus: async () => "present",
+        deactivateSystemExtension: async () => ({
+          kind: "request-completed",
+          remediation: "extension_version_skew_reregister_required",
+        }),
+      }),
+    });
+    expect(stillPresentCode).toBe(1);
+    expect(stillPresentOut.text()).toContain("still present");
+    expect(stillPresentOut.text()).toContain(remediationText);
+
+    // request-completed but the post-request probe could not read state:
+    // the unreadable branch keeps the hint as well.
+    const unreadableOut = new Capture();
+    let unreadableStatusReads = 0;
+    const unreadableCode = await runUninstallCommand({
+      argv: ["--fortress", "/tmp/fortress"],
+      out: unreadableOut,
+      err: new Capture(),
+      platform: "darwin",
+      getuid: () => 0,
+      ops: ops({
+        systemExtensionStatus: async () => {
+          unreadableStatusReads++;
+          return unreadableStatusReads === 1 ? "present" : "unknown";
+        },
+        deactivateSystemExtension: async () => ({
+          kind: "request-completed",
+          remediation: "extension_version_skew_reregister_required",
+        }),
+      }),
+    });
+    expect(unreadableCode).toBe(1);
+    expect(unreadableOut.text()).toContain("absence could not be observed");
+    expect(unreadableOut.text()).toContain(remediationText);
+  });
+
   it("keeps reboot-deferred deactivation non-clean until absence is observed", async () => {
     const out = new Capture();
     const code = await runUninstallCommand({

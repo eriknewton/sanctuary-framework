@@ -8,6 +8,7 @@ import { Writable } from "node:stream";
 import {
   CASTLE_WALL_HEADLESS_CONTRACT_VERSION,
   makeIdentityIndependentHostAppInvoke,
+  parseActivatedCastleWallBundleVersions,
   requestSystemExtensionDeactivation,
   runDisable,
   runEnable,
@@ -50,7 +51,13 @@ class CaptureStream extends Writable {
   }
 }
 
-function reportLine(action: string, state: string, ok: boolean, error?: string): string {
+function reportLine(
+  action: string,
+  state: string,
+  ok: boolean,
+  error?: string,
+  extraFields: Record<string, unknown> = {},
+): string {
   return (
     JSON.stringify({
       action,
@@ -61,6 +68,8 @@ function reportLine(action: string, state: string, ok: boolean, error?: string):
       error,
       ok,
       state,
+      // Additive host-app report fields (error_domain / error_code / remediation).
+      ...extraFields,
     }) + "\n"
   );
 }
@@ -496,5 +505,317 @@ describe("disarm detail truncation", () => {
       "the protected uid is fully denied until a later successful disable or re-enable",
     );
     expect(flat).toContain("…");
+  });
+});
+
+// Graph row defect.sysext-deactivation-extension-not-found: the host app now
+// reports the NSError domain/code of a deactivation failure machine-readably,
+// attaches a remediation hint when it detects an app-version skew (it never
+// mutates - the teardown verb submits deactivation only), and the CLI adds a
+// notice-only version-skew preflight. These tests pin the CLI half of that
+// contract.
+describe("system-extension deactivation failure identity, remediation hint, and skew notice", () => {
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of tempDirs.splice(0)) {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  async function makeFixture() {
+    const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-deact-"));
+    tempDirs.push(fortressPath);
+    const hostAppPath = join(fortressPath, "CastleWallHostApp");
+    await writeFile(hostAppPath, "#!/bin/sh\n", { mode: 0o755 });
+    const env = {
+      SANCTUARY_STORAGE_PATH: fortressPath,
+      SANCTUARY_CASTLE_BUILD_SHA: TEST_BUILD_SHA,
+    };
+    return { fortressPath, hostAppPath, env };
+  }
+
+  // Silent-by-default skew probes: version data is unavailable, so the
+  // notice-only preflight stays quiet and never shells out on test hosts.
+  const noSkewData = {
+    embeddedSysextVersionProbe: async () => null,
+    activatedSysextVersionsProbe: async () => [],
+  };
+
+  it("passes the host report's error_domain/error_code through the failed outcome unchanged", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const { invoke } = makeInvoker({
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+      "deactivate-system-extension": {
+        stdout: reportLine(
+          "deactivate-system-extension",
+          "unknown",
+          false,
+          "OSSystemExtensionErrorDomain error 4.",
+          { error_domain: "OSSystemExtensionErrorDomain", error_code: 4 },
+        ),
+        exitCode: 1,
+      },
+    });
+
+    const outcome = await requestSystemExtensionDeactivation({
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      ...noSkewData,
+    });
+
+    // The structured identity travels beside the prose, so a caller can
+    // branch on the OS error class without parsing localizedDescription text.
+    expect(outcome).toEqual({
+      kind: "failed",
+      detail: "OSSystemExtensionErrorDomain error 4.",
+      error_domain: "OSSystemExtensionErrorDomain",
+      error_code: 4,
+    });
+  });
+
+  it("carries the host app's remediation hint beside the failure identity", async () => {
+    // The skew-detection shape: the host app reports the error-4 refusal
+    // (its own identity, untouched) plus the machine-readable remediation id.
+    // The CLI must pass BOTH through, or the operator is stranded with prose.
+    const { hostAppPath, env } = await makeFixture();
+    const { invoke } = makeInvoker({
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+      "deactivate-system-extension": {
+        stdout: reportLine(
+          "deactivate-system-extension",
+          "unknown",
+          false,
+          "OSSystemExtensionErrorDomain error 4.; the installed app's registration no longer matches the activated system extension",
+          {
+            error_domain: "OSSystemExtensionErrorDomain",
+            error_code: 4,
+            remediation: "extension_version_skew_reregister_required",
+          },
+        ),
+        exitCode: 1,
+      },
+    });
+
+    const outcome = await requestSystemExtensionDeactivation({
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      ...noSkewData,
+    });
+
+    expect(outcome).toEqual({
+      kind: "failed",
+      detail:
+        "OSSystemExtensionErrorDomain error 4.; the installed app's registration no longer matches the activated system extension",
+      error_domain: "OSSystemExtensionErrorDomain",
+      error_code: 4,
+      remediation: "extension_version_skew_reregister_required",
+    });
+  });
+
+  it("passes a remediation hint through every non-failure outcome shape too", async () => {
+    // The passthrough is variant-agnostic by design: outcome mapping must not
+    // be able to drop a hint whatever state the report carries.
+    for (const [state, expected] of [
+      ["deactivated", { kind: "request-completed" }],
+      ["will_complete_after_reboot", { kind: "reboot-required" }],
+    ] as const) {
+      const { hostAppPath, env } = await makeFixture();
+      const { invoke } = makeInvoker({
+        status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+        "deactivate-system-extension": {
+          stdout: reportLine("deactivate-system-extension", state, true, undefined, {
+            remediation: "extension_version_skew_reregister_required",
+          }),
+          exitCode: 0,
+        },
+      });
+
+      const outcome = await requestSystemExtensionDeactivation({
+        env,
+        platform: "darwin",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+        ...noSkewData,
+      });
+
+      expect(outcome).toEqual({
+        ...expected,
+        remediation: "extension_version_skew_reregister_required",
+      });
+    }
+  });
+
+  it("prints the skew notice before submitting deactivation when the embedded version is not among the activated records", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+      "deactivate-system-extension": {
+        stdout: reportLine("deactivate-system-extension", "deactivated", true),
+        exitCode: 0,
+      },
+    });
+
+    const outcome = await requestSystemExtensionDeactivation({
+      env,
+      err,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      embeddedSysextVersionProbe: async () => "1472",
+      activatedSysextVersionsProbe: async () => ["1421"],
+    });
+
+    // Notice only: the skew is named truthfully AND the deactivation is still
+    // submitted (the notice must never block the teardown). The guidance
+    // names the attended remediation, never an automated one.
+    expect(err.text()).toContain("system-extension version 1472");
+    expect(err.text()).toContain("activated record is 1421");
+    expect(err.text()).toContain("re-registers the extension");
+    // Honesty: launch alone only re-registers when the background signer
+    // helper is enabled, so the guidance must name the helper approval and
+    // the wait before the re-run.
+    expect(err.text()).toContain(
+      "approve or re-enable the Sanctuary background helper if macOS prompts " +
+        "for it, wait for re-registration to complete, then re-run this command",
+    );
+    expect(outcome).toEqual({ kind: "request-completed" });
+    expect(calls.map((call) => call[2])).toEqual([
+      "status",
+      "deactivate-system-extension",
+    ]);
+  });
+
+  it("stays silent when the embedded version matches an activated record", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+      "deactivate-system-extension": {
+        stdout: reportLine("deactivate-system-extension", "deactivated", true),
+        exitCode: 0,
+      },
+    });
+
+    const outcome = await requestSystemExtensionDeactivation({
+      env,
+      err,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      embeddedSysextVersionProbe: async () => "1472",
+      activatedSysextVersionsProbe: async () => ["1472"],
+    });
+
+    expect(err.text()).toBe("");
+    expect(outcome).toEqual({ kind: "request-completed" });
+  });
+
+  it("degrades to silence and still proceeds when a skew probe fails", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+      "deactivate-system-extension": {
+        stdout: reportLine("deactivate-system-extension", "deactivated", true),
+        exitCode: 0,
+      },
+    });
+
+    const outcome = await requestSystemExtensionDeactivation({
+      env,
+      err,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      embeddedSysextVersionProbe: async () => {
+        throw new Error("plutil unavailable");
+      },
+      activatedSysextVersionsProbe: async () => ["1421"],
+    });
+
+    // A diagnostic preflight must never add a failure mode to teardown.
+    expect(err.text()).toBe("");
+    expect(outcome).toEqual({ kind: "request-completed" });
+    expect(calls.map((call) => call[2])).toEqual([
+      "status",
+      "deactivate-system-extension",
+    ]);
+  });
+});
+
+describe("parseActivatedCastleWallBundleVersions", () => {
+  it("extracts bundle versions from activated rows only, across replacements", () => {
+    // Realistic `systemextensionsctl list` shape (tab-separated, Mini1
+    // capture): a terminated old record beside the activated one must not
+    // contribute, and every ACTIVATED row must.
+    const stdout = [
+      "1 extension(s)",
+      "--- com.apple.system_extension.network_extension",
+      "enabled\tactive\tteamID\tbundleID (version)\tname\t[state]",
+      "\t\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1400)\tCastle Wall\t[terminated waiting to uninstall on reboot]",
+      "*\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1421)\tCastle Wall\t[activated enabled]",
+    ].join("\n");
+    expect(parseActivatedCastleWallBundleVersions(stdout)).toEqual(["1421"]);
+  });
+
+  it("ignores other extensions and non-activated output", () => {
+    expect(
+      parseActivatedCastleWallBundleVersions(
+        "*\t*\tTEAMID\tcom.example.other (1.0/7)\tOther\t[activated enabled]",
+      ),
+    ).toEqual([]);
+    expect(parseActivatedCastleWallBundleVersions("")).toEqual([]);
+    // An activated row whose version cell is malformed contributes nothing
+    // rather than a garbage version.
+    expect(
+      parseActivatedCastleWallBundleVersions(
+        "*\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall\tCastle Wall\t[activated enabled]",
+      ),
+    ).toEqual([]);
+  });
+
+  it("reports every activated version when macOS lists multiple activated records", () => {
+    const stdout = [
+      "*\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1421)\tCastle Wall\t[activated enabled]",
+      "*\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1472)\tCastle Wall\t[activated waiting for user]",
+    ].join("\n");
+    expect(parseActivatedCastleWallBundleVersions(stdout)).toEqual(["1421", "1472"]);
+  });
+
+  it("rejects a foreign-team row that reuses our bundle id", () => {
+    // A foreign-team extension may reuse the bundle id; without the teamID
+    // column bind, this row contributed version 666 and could drive a false
+    // skew diagnosis. The notice must degrade to silence instead.
+    expect(
+      parseActivatedCastleWallBundleVersions(
+        "*\t*\tZZOTHERTEAM\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/666)\tCastle Wall\t[activated enabled]",
+      ),
+    ).toEqual([]);
+  });
+
+  it("rejects a row whose state carries contradictory extra tokens", () => {
+    // "activated enabled deactivated" is ambiguous; ambiguity contributes
+    // nothing (closed allowlist, mirroring the Swift probe).
+    expect(
+      parseActivatedCastleWallBundleVersions(
+        "*\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1421)\tCastle Wall\t[activated enabled deactivated]",
+      ),
+    ).toEqual([]);
+  });
+
+  it("rejects a row where our bundle id appears only in the name column", () => {
+    // The id sitting in the name column proves nothing about the bundleID
+    // column; without the column bind this row contributed version 7.
+    expect(
+      parseActivatedCastleWallBundleVersions(
+        "*\t*\tYFQSWQ9BJN\tcom.example.other (1.0/7)\tai.sanctuaryprotocol.macos.castle-wall\t[activated enabled]",
+      ),
+    ).toEqual([]);
   });
 });
