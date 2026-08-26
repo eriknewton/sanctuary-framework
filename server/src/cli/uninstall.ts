@@ -185,6 +185,7 @@ export function flattenDisarmDetail(raw: string): string {
   // wrapping-immunity contract; windows are extracted from the same view.
   const normalized = raw.trim().replace(/\s+/g, " ");
   const windows: string[] = [];
+  // cli-argv-indexof-allowed: scans a captured stderr transcript string, not CLI argv tokens.
   const idx1 = normalized.indexOf(DISARM_DETAIL_PRIORITY_MARKERS[0]);
   if (idx1 >= 0) {
     const window = normalized.slice(idx1, idx1 + DISARM_DETAIL_MARKER_WINDOW_CHARS);
