@@ -142,10 +142,41 @@ function collectingWritable(): { stream: Writable; text(): string } {
   return { stream, text: () => chunks.join("") };
 }
 
-function flattenDisarmDetail(raw: string): string {
+/**
+ * The two sentences an operator must never lose from a truncated transcript:
+ * the disable warning naming the underlying invoke failure, and the
+ * lease-ratchet full-deny disclosure. Must match the warning rendered in the
+ * fail_open_deadman branch of runDisable in cli/castle-wall.ts; matched by
+ * substring so wording extensions around them cannot silently defeat the
+ * priority retention.
+ */
+const DISARM_DETAIL_PRIORITY_MARKERS = [
+  "NE preference disable did not complete",
+  "the protected uid is fully denied",
+] as const;
+
+export function flattenDisarmDetail(raw: string): string {
   const flat = raw.trim().replace(/\s*\n\s*/g, " | ");
   if (flat.length <= DISARM_FAILURE_DETAIL_MAX_CHARS) return flat;
-  return `…${flat.slice(flat.length - DISARM_FAILURE_DETAIL_MAX_CHARS)}`;
+  // A plain keep-the-tail truncation can evict the diagnosis when later
+  // output (audit failure text, custody normalization) follows the warning.
+  // Retain the priority lines FIRST, then fill what budget remains with the
+  // transcript tail; truncation stays marked, never silent.
+  const priorityLines = raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) =>
+      DISARM_DETAIL_PRIORITY_MARKERS.some((marker) => line.includes(marker)),
+    );
+  const priority = [...new Set(priorityLines)].join(" | ");
+  if (priority.length === 0) {
+    return `…${flat.slice(flat.length - DISARM_FAILURE_DETAIL_MAX_CHARS)}`;
+  }
+  if (priority.length >= DISARM_FAILURE_DETAIL_MAX_CHARS) {
+    return `${priority.slice(0, DISARM_FAILURE_DETAIL_MAX_CHARS)}…`;
+  }
+  const remaining = DISARM_FAILURE_DETAIL_MAX_CHARS - priority.length;
+  return `${priority} | …${flat.slice(flat.length - remaining)}`;
 }
 
 async function statFootprint(path: string): Promise<FootprintStatus> {

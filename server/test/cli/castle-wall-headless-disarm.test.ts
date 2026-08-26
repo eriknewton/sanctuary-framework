@@ -7,13 +7,14 @@ import { Writable } from "node:stream";
 
 import {
   CASTLE_WALL_HEADLESS_CONTRACT_VERSION,
+  makeIdentityIndependentHostAppInvoke,
   requestSystemExtensionDeactivation,
   runDisable,
   runEnable,
   type HostAppInvoker,
   type OpenRunner,
 } from "../../src/cli/castle-wall.js";
-import { runUninstallCommand, type UninstallOps } from "../../src/cli/uninstall.js";
+import { flattenDisarmDetail, runUninstallCommand, type UninstallOps } from "../../src/cli/uninstall.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { toBase64url } from "../../src/core/encoding.js";
 
@@ -187,10 +188,13 @@ describe("headless (no-GUI-session) disarm fallback", () => {
     expect(code).toBe(0);
     expect(outcomes).toEqual(["corroborated_off"]);
     expect(open.calls).toEqual([]);
-    expect(direct.calls.map((call) => call[2])).toEqual(["disable", "status"]);
-    // Same resolved signed binary, same argv shape as the LaunchServices path.
-    expect(direct.calls[0]![0]).toBe(hostAppPath);
-    expect(direct.calls[0]!.slice(1, 3)).toEqual(["--headless", "disable"]);
+    // Same resolved signed binary, same COMPLETE argv as the LaunchServices
+    // path - including the host-app deadline; a partial argv assertion would
+    // let the fallback silently drop or change a flag.
+    expect(direct.calls).toEqual([
+      [hostAppPath, "--headless", "disable", "--timeout=3"],
+      [hostAppPath, "--headless", "status"],
+    ]);
   });
 
   it.each([
@@ -325,9 +329,11 @@ describe("headless (no-GUI-session) disarm fallback", () => {
       detail: "OSSystemExtensionErrorDomain error 13: authorization required",
     });
     expect(open.calls).toEqual([]);
-    expect(direct.calls.map((call) => call[2])).toEqual([
-      "status",
-      "deactivate-system-extension",
+    // Complete call arrays: same signed binary and the full argv including the
+    // deactivation deadline, not just the action names.
+    expect(direct.calls).toEqual([
+      [hostAppPath, "--headless", "status"],
+      [hostAppPath, "--headless", "deactivate-system-extension", "--timeout=60"],
     ]);
   });
 
@@ -408,5 +414,69 @@ describe("headless (no-GUI-session) disarm fallback", () => {
     // The row names the underlying cause (here: the host-app resolution
     // refusal), not just an exit code or outcome label.
     expect(out.text()).toContain("does not point at a trusted executable");
+  });
+});
+
+describe("identity-independent direct invoker", () => {
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of tempDirs.splice(0)) {
+      await rm(dir, { recursive: true, force: true });
+    }
+    delete process.env.SANCTUARY_CASTLE_BUILD_SHA;
+  });
+
+  it("strips SANCTUARY_CASTLE_BUILD_SHA from the child environment so the host app cannot echo the CLI's own expectation back", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-cw-envstrip-"));
+    tempDirs.push(dir);
+    const scriptPath = join(dir, "echo-env.sh");
+    // The fixture reports the variable the REAL host app echoes back when
+    // present (must match currentBuildGitSha in HeadlessFilterCLI.swift):
+    // an inherited value here is exactly the self-attestation the invoker
+    // exists to prevent.
+    await writeFile(
+      scriptPath,
+      '#!/bin/sh\nprintf "sha=%s" "${SANCTUARY_CASTLE_BUILD_SHA:-ABSENT}"\n',
+      { mode: 0o755 },
+    );
+    process.env.SANCTUARY_CASTLE_BUILD_SHA = "attacker-controlled-expectation";
+    // Constructed AFTER the env var is set: the sanitized snapshot must still
+    // exclude it.
+    const invoke = makeIdentityIndependentHostAppInvoke(5_000);
+    const result = await invoke(scriptPath, []);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("sha=ABSENT");
+  });
+});
+
+describe("disarm detail truncation", () => {
+  const WARNING_LINE =
+    "Warning: NE preference disable did not complete (LSOpenURLsWithCompletionHandler() failed with error -10826); " +
+    "the authenticated dead-man lease was already revoked, so the protected uid is fully denied until a later successful disable or re-enable.";
+
+  it("retains the disable warning and full-deny disclosure when long later output would otherwise evict them", () => {
+    // The eviction shape the gate named: audit failure text and custody
+    // normalization output FOLLOW the warning, so a plain keep-the-tail
+    // truncation would drop the diagnosis.
+    const trailing = Array.from(
+      { length: 40 },
+      (_, i) => `[castle-wall] audit chain append retry ${i}: producer unreachable at socket; will retry`,
+    ).join("\n");
+    const flat = flattenDisarmDetail(`${WARNING_LINE}\n${trailing}`);
+    expect(flat).toContain("NE preference disable did not complete");
+    expect(flat).toContain(
+      "the protected uid is fully denied until a later successful disable or re-enable",
+    );
+    // Truncation is marked, never silent, and the tail is still represented.
+    expect(flat).toContain("…");
+    expect(flat).toContain("will retry");
+  });
+
+  it("keeps plain tail behavior when no priority line is present", () => {
+    const longOther = Array.from({ length: 80 }, (_, i) => `line ${i}`).join("\n");
+    const flat = flattenDisarmDetail(longOther);
+    expect(flat.startsWith("…")).toBe(true);
+    expect(flat).toContain("line 79");
   });
 });

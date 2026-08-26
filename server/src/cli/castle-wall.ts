@@ -3701,6 +3701,47 @@ async function resolveHostAppBinary(
   };
 }
 
+/**
+ * Direct-exec invoker for the no-GUI-session disarm fallback. Unlike plain
+ * makeHostAppInvoke it strips SANCTUARY_CASTLE_BUILD_SHA from the child
+ * environment: the host app echoes that variable back as its own build sha
+ * when present (must match currentBuildGitSha in
+ * castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift), so an
+ * inherited value would turn validateHeadlessBuildIdentity into
+ * self-attestation on this path - the CLI would be comparing its own
+ * expectation against its own environment rather than against the deployed
+ * binary's embedded identity. The LaunchServices transport never inherits the
+ * CLI's environment, and this fallback must offer the same property: the
+ * child reports only its Info.plist-embedded sha.
+ */
+export function makeIdentityIndependentHostAppInvoke(timeoutMs: number): HostAppInvoker {
+  const childEnv: NodeJS.ProcessEnv = { ...process.env };
+  delete childEnv.SANCTUARY_CASTLE_BUILD_SHA;
+  return (binaryPath, args) =>
+    new Promise((resolvePromise) => {
+      nodeExecFile(
+        binaryPath,
+        args,
+        { encoding: "utf8", timeout: timeoutMs, env: childEnv },
+        (error, stdout, stderr) => {
+          let exitCode = 0;
+          let stderrOut = stderr ?? "";
+          if (error) {
+            exitCode =
+              typeof error.code === "number"
+                ? error.code
+                : // Spawn failure (ENOENT/EACCES/timeout kill): no exit code exists.
+                  -1;
+            if (error.killed && !stderrOut.trim()) {
+              stderrOut = `host app did not respond within ${timeoutMs}ms`;
+            }
+          }
+          resolvePromise({ stdout: stdout ?? "", stderr: stderrOut, exitCode });
+        },
+      );
+    });
+}
+
 function makeHostAppInvoke(timeoutMs: number): HostAppInvoker {
   return (binaryPath, args) =>
     new Promise((resolvePromise) => {
@@ -3982,7 +4023,8 @@ function makeSessionAwareDisarmInvoke(
       ? { runningAppController: ctx.runningAppController }
       : {}),
   });
-  const directInvoke = ctx.directHostAppInvoke ?? makeHostAppInvoke(timeoutMs);
+  const directInvoke =
+    ctx.directHostAppInvoke ?? makeIdentityIndependentHostAppInvoke(timeoutMs);
   const probe = ctx.sessionManagerNameProbe ?? defaultSessionManagerNameProbe;
   return async (binaryPath, args) => {
     const managerName = await probe();
