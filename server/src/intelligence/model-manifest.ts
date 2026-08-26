@@ -22,7 +22,7 @@ import {
 import type { ModelProvenance } from "../operational/model-provenance.js";
 import { SubstrateError } from "../substrate/errors.js";
 import { parseStrictJson } from "../substrate/strict-json.js";
-import { SURFACES, type Surface } from "./types.js";
+import { SURFACES, type Surface } from "./surfaces.js";
 
 /** Frozen signing domain. A future schema uses a new domain, never this one. */
 export const MODEL_MANIFEST_DOMAIN = "sanctuary.model-manifest.v1";

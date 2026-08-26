@@ -14,6 +14,7 @@ describe("audit operation name constants", () => {
       CONFIG_RESET: "intelligence_config_reset",
       MODEL_PULL: "intelligence_model_pull",
       MODEL_PROVISION_REFUSED: "intelligence_model_provision_refused",
+      LOAD_INTEGRITY: "intelligence_load_integrity",
       BULK_SUBSTRATE_CHOSEN: "intelligence_bulk_substrate_chosen",
       TIER2_BINDING_PINNED: "query_anonymity_tier2_binding_pinned",
     });

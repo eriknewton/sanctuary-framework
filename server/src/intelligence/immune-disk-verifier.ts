@@ -98,6 +98,7 @@ export type ImmuneVerificationRefusalReason =
 
 export type ImmuneVerificationCheckpoint =
   | "selector_load"
+  | "provisioning"
   | "first_invocation"
   | "cadence";
 
@@ -439,7 +440,12 @@ async function state_PATH_COMPONENTS(
     if (!rootStat.isDirectory) refuse("model_root_invalid");
   } catch (error) {
     if (error instanceof ImmuneRefusal) throw error;
-    refuse("model_root_invalid");
+    if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") {
+      // A vanished/non-directory persisted root is structurally invalid; other
+      // re-lstat failures are retryable I/O and must not occupy that slot.
+      refuse("model_root_invalid");
+    }
+    refuse("integrity_io_unavailable");
   }
   let candidate = rootReal;
   let finalStat: ImmuneFileStat | undefined;

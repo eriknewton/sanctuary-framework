@@ -4,26 +4,35 @@ import {
   MODEL_REGISTRY_PROVIDER_CATEGORY,
   renderLocalProvisioningPlan,
   runLocalIntelligenceProvisioning,
+  type AtomicLocalProvisioningCommit,
   type LocalProvisioningOps,
 } from "../../src/intelligence/provisioning.js";
 import type {
-  ModelManifestBody,
-  ModelManifestModel,
-  ModelManifestRefusalReason,
-} from "../../src/intelligence/model-manifest.js";
+  LocalIntegrityStateV2,
+  ModelManifestBodyV2,
+  ModelManifestModelV2,
+  SignedModelManifestV2,
+} from "../../src/intelligence/model-manifest-v2.js";
 import type { HardwareCapabilityReport, Surface } from "../../src/intelligence/types.js";
+import { LocalIntegrityStateLoadError } from "../../src/intelligence/policy-store.js";
+import { CrossProcessLockError } from "../../src/storage/cross-process-lock.js";
 
 const HASH = "1".repeat(64);
-const OTHER_HASH = "2".repeat(64);
-const MODEL: ModelManifestModel = {
+const ROOT = "/var/lib/ollama/models";
+const COMMITTED_AT = "2026-08-25T12:00:00.000Z";
+const MODEL: ModelManifestModelV2 = {
   model_id: "qwen2.5-1.5b",
   model_name: "Qwen2.5 1.5B",
   model_version: "2.5",
   provider: "Alibaba Cloud",
   runtime: "ollama",
-  runtime_tag: "qwen2.5:1.5b",
-  registry_source: "ollama://qwen2.5:1.5b",
-  weights_sha256: HASH,
+  ollama_identity: {
+    registry: "registry.ollama.ai",
+    namespace: "library",
+    model: "qwen2.5",
+    tag: "1.5b",
+    ollama_manifest_sha256: HASH,
+  },
   params_b: 1.5,
   license: {
     identifier: "Apache-2.0",
@@ -41,18 +50,14 @@ const LOCAL_SURFACES = Object.entries(DEFAULT_PER_SURFACE)
   .map(([surface]) => surface as Surface);
 
 const defaults = Object.fromEntries(
-  ["baseline", "mid", "pro"].map((tier) => [
-    tier,
-    Object.fromEntries(
-      Object.keys(DEFAULT_PER_SURFACE).map((surface) => [
-        surface,
-        surface === "gate-explanation" ? null : MODEL.model_id,
-      ]),
-    ),
+  Object.keys(DEFAULT_PER_SURFACE).map((surface) => [
+    surface,
+    surface === "gate-explanation" ? null : MODEL.model_id,
   ]),
-) as ModelManifestBody["surface_defaults"];
+) as Record<Surface, string | null>;
 
-const BODY: ModelManifestBody = {
+const BODY: ModelManifestBodyV2 = {
+  schema_version: 2,
   manifest_version: 9,
   models: { [MODEL.model_id]: MODEL },
   tiers: {
@@ -60,19 +65,54 @@ const BODY: ModelManifestBody = {
     mid: [MODEL.model_id],
     pro: [MODEL.model_id],
   },
-  surface_defaults: defaults,
+  surface_defaults: {
+    baseline: defaults,
+    mid: defaults,
+    pro: defaults,
+  },
 };
+
+const MANIFEST: SignedModelManifestV2 = { body: BODY, signature: "fixture-signature" };
+
+function runtimeSuccess() {
+  return {
+    ok: true as const,
+    state: "runtime_manifest_match" as const,
+    runtimeTag: "qwen2.5:1.5b",
+    observedManifestDigest: HASH,
+  };
+}
+
+function immuneSuccess() {
+  return {
+    ok: true as const,
+    state: "immune_verified" as const,
+    runtimeTag: "qwen2.5:1.5b",
+    expectedManifestDigest: HASH,
+    descriptorCount: 2,
+    bytesHashed: 123,
+    verifiedArtifactDigests: ["2".repeat(64), "3".repeat(64)],
+    completedAtMonotonicMs: 42,
+    cached: false,
+  };
+}
 
 function makeOps(overrides: Partial<LocalProvisioningOps> = {}) {
   const sequence: string[] = [];
-  const failures: Array<{ surfaces: readonly Surface[]; snippet: string }> = [];
-  let showCalls = 0;
+  const commits: AtomicLocalProvisioningCommit[] = [];
   const ops: LocalProvisioningOps = {
     isTty: true,
     platform: "darwin",
-    manifestText: "signed fixture",
-    configuredChoices: { ...DEFAULT_PER_SURFACE },
-    verifyManifest: () => ({ ok: true, body: BODY }),
+    manifestText: "signed V2 fixture",
+    initialConfiguredChoices: { ...DEFAULT_PER_SURFACE },
+    reloadAuthority: vi.fn(async () => ({
+      configVersion: 1 as const,
+      configuredChoices: { ...DEFAULT_PER_SURFACE },
+    })),
+    verifyManifest: (_text, floor) =>
+      floor !== undefined && BODY.manifest_version < floor
+        ? { ok: false, reason: "rollback" }
+        : { ok: true, body: BODY, manifest: MANIFEST },
     probeHardware: vi.fn(async () => ({
       totalRamGb: 16,
       cpuArch: "apple-silicon-m2",
@@ -81,255 +121,348 @@ function makeOps(overrides: Partial<LocalProvisioningOps> = {}) {
       ollamaReachable: true,
       ollamaModels: [],
     } satisfies HardwareCapabilityReport)),
-    installRuntime: vi.fn(async () => {
-      sequence.push("install");
-      return true;
-    }),
+    resolveModelsRoot: vi.fn(async () => ROOT),
+    runtimeVerifier: { verify: vi.fn(async () => runtimeSuccess()) },
+    immuneVerifier: { verify: vi.fn(async () => immuneSuccess()) },
+    withProvisioningLock: async (operation) => {
+      sequence.push("lock-acquired");
+      try {
+        return await operation();
+      } finally {
+        sequence.push("lock-released");
+      }
+    },
+    installRuntime: vi.fn(async () => true),
     pull: vi.fn(async () => {
       sequence.push("pull");
       return { ok: true, failureClass: null };
-    }),
-    show: vi.fn(async () => {
-      showCalls += 1;
-      sequence.push(`show-${showCalls}`);
-      return {
-        ok: true,
-        failureClass: null,
-        digest: showCalls === 1 ? OTHER_HASH : HASH,
-      };
     }),
     confirm: vi.fn(async () => {
       sequence.push("confirm");
       return true;
     }),
     print: vi.fn(() => sequence.push("print")),
-    commitVerified: vi.fn(async () => {
+    commitVerified: vi.fn(async (commit) => {
       sequence.push("commit");
+      commits.push(commit);
     }),
-    recordFailure: vi.fn(async (surfaces, _failureClass, snippet) => {
-      failures.push({ surfaces, snippet });
+    projectProvenance: vi.fn(async () => {
+      sequence.push("project");
     }),
+    recordFailure: vi.fn(async () => undefined),
     audit: vi.fn(async () => undefined),
+    now: () => new Date(COMMITTED_AT),
     ...overrides,
   };
-  return { ops, sequence, failures };
+  return { ops, sequence, commits };
 }
 
-describe("local intelligence provisioning ceremony", () => {
-  it("prints the complete verified plan before the first mutation", async () => {
-    const { ops, sequence } = makeOps();
-    const result = await runLocalIntelligenceProvisioning(ops);
-    expect(result.kind).toBe("provisioned");
-    expect(sequence.indexOf("print")).toBeLessThan(sequence.indexOf("confirm"));
-    expect(sequence.indexOf("confirm")).toBeLessThan(sequence.indexOf("pull"));
-    expect(sequence.at(-1)).toBe("commit");
-    expect(ops.print).toHaveBeenCalledWith(expect.stringContaining("license Apache-2.0"));
-  });
+function absentThenPresentVerifier() {
+  return {
+    verify: vi.fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        state: "tags_model_absent",
+        reason: "runtime_model_absent",
+        runtimeTag: "qwen2.5:1.5b",
+      })
+      .mockResolvedValue(runtimeSuccess()),
+  };
+}
 
-  it("commits provenance and surface tags only after an exact digest match", async () => {
-    const { ops } = makeOps();
+describe("Q5D atomic local intelligence provisioning", () => {
+  it("verifies every model, commits one complete record, then projects provenance", async () => {
+    const { ops, sequence, commits } = makeOps({
+      runtimeVerifier: absentThenPresentVerifier(),
+    });
     await expect(runLocalIntelligenceProvisioning(ops)).resolves.toMatchObject({
       kind: "provisioned",
       surfaces: LOCAL_SURFACES,
       models: [MODEL.model_id],
+      provenanceProjection: "projected",
     });
-    expect(ops.commitVerified).toHaveBeenCalledOnce();
-    const commits = vi.mocked(ops.commitVerified).mock.calls[0]![0];
-    expect(commits[0]?.provenance.runtime_manifest_hash).toBe(`sha256:${HASH}`);
-    expect(commits[0]?.provenance.weights_hash).toBeUndefined();
-    expect(commits[0]?.provenance.serving_surfaces).toEqual(LOCAL_SURFACES);
-    expect(commits[0]?.surfaces).toEqual(LOCAL_SURFACES);
+    expect(sequence.indexOf("confirm")).toBeLessThan(sequence.indexOf("pull"));
+    expect(sequence.indexOf("commit")).toBeLessThan(sequence.indexOf("project"));
+    expect(sequence.at(-1)).toBe("lock-released");
+    expect(commits).toHaveLength(1);
+    const commit = commits[0]!;
+    expect(commit.integrityState).toMatchObject({
+      state: "armed",
+      schema_version: 2,
+      manifest_version_floor: 9,
+      signed_manifest: MANIFEST,
+      ollama_models_root: ROOT,
+      committed_at: COMMITTED_AT,
+    });
+    expect(Object.keys(commit.integrityState.bindings).sort()).toEqual(
+      [...LOCAL_SURFACES].sort(),
+    );
+    expect(commit.runtimeTags.concierge).toBe("qwen2.5:1.5b");
+    expect(commit.provenance[0]?.provenance).toMatchObject({
+      runtime_manifest_hash: `sha256:${HASH}`,
+      load_integrity_assurance: "on-disk-all-layers",
+      model_manifest_version: 9,
+    });
+    expect(commit.provenance[0]?.provenance.weights_hash).toBeUndefined();
   });
 
-  it("refuses a digest mismatch without provenance, fallback, or provisioned state", async () => {
-    const { ops, failures } = makeOps({
-      show: vi.fn(async () => ({ ok: true, failureClass: null, digest: OTHER_HASH })),
+  it("already-present exact matches skip consent and pull but perform the same atomic commit", async () => {
+    const { ops, commits } = makeOps();
+    await expect(runLocalIntelligenceProvisioning(ops)).resolves.toMatchObject({
+      kind: "already-provisioned",
+      provenanceProjection: "projected",
+    });
+    expect(ops.print).not.toHaveBeenCalled();
+    expect(ops.confirm).not.toHaveBeenCalled();
+    expect(ops.pull).not.toHaveBeenCalled();
+    expect(ops.commitVerified).toHaveBeenCalledOnce();
+    expect(ops.projectProvenance).toHaveBeenCalledWith(commits[0]!.provenance);
+    expect(commits[0]!.integrityState.bindings.concierge?.runtime_tag)
+      .toBe("qwen2.5:1.5b");
+  });
+
+  it("preserves old authority when the first verification crashes", async () => {
+    const { ops } = makeOps({
+      runtimeVerifier: { verify: vi.fn(async () => { throw new Error("crash-before-verify"); }) },
     });
     await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
       kind: "refused",
-      reason: "digest_mismatch",
+      reason: "integrity_io_unavailable",
     });
+    expect(ops.pull).not.toHaveBeenCalled();
     expect(ops.commitVerified).not.toHaveBeenCalled();
-    expect(failures[0]?.snippet).toContain("did not match");
-    expect(ops.configuredChoices).toEqual(DEFAULT_PER_SURFACE);
+    expect(ops.projectProvenance).not.toHaveBeenCalled();
+  });
+
+  it("preserves old authority when verification crashes after one required model", async () => {
+    const second = structuredClone(MODEL);
+    second.model_id = "qwen2.5-1.5b-second";
+    second.ollama_identity = {
+      ...second.ollama_identity,
+      model: "qwen2.5-second",
+      ollama_manifest_sha256: "4".repeat(64),
+    };
+    const body = structuredClone(BODY);
+    body.models[second.model_id] = second;
+    for (const tier of ["baseline", "mid", "pro"] as const) {
+      (body.tiers[tier] as string[]).push(second.model_id);
+      body.surface_defaults[tier]["template-suggestion"] = second.model_id;
+    }
+    const runtimeVerifier = {
+      verify: vi.fn()
+        .mockResolvedValueOnce(runtimeSuccess())
+        .mockRejectedValueOnce(new Error("crash-mid-verify")),
+    };
+    const { ops } = makeOps({
+      verifyManifest: () => ({
+        ok: true,
+        body,
+        manifest: { body, signature: "fixture" },
+      }),
+      runtimeVerifier,
+    });
+    await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
+      kind: "refused",
+      reason: "integrity_io_unavailable",
+    });
+    expect(runtimeVerifier.verify).toHaveBeenCalledTimes(2);
+    expect(ops.pull).not.toHaveBeenCalled();
+    expect(ops.commitVerified).not.toHaveBeenCalled();
   });
 
   it.each([
-    "bad_signature",
-    "malformed_json",
-    "zero_signature",
-    "zero_pinned_key",
-  ] satisfies ModelManifestRefusalReason[])(
-    "refuses %s before probe, plan, or pull",
-    async (reason) => {
-      const { ops } = makeOps({
-        verifyManifest: () => ({ ok: false, reason }),
-      });
-      await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
-        kind: "refused",
-        reason: "manifest_invalid",
-      });
-      expect(ops.probeHardware).not.toHaveBeenCalled();
-      expect(ops.pull).not.toHaveBeenCalled();
-      expect(ops.print).not.toHaveBeenCalled();
-    },
-  );
-
-  it("treats an absent manifest as a quiet fail-closed refusal", async () => {
-    const { ops, failures } = makeOps({
-      verifyManifest: () => ({ ok: false, reason: "absent" }),
-    });
-    await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
-      kind: "refused",
-      reason: "manifest_unavailable",
-    });
-    expect(ops.print).not.toHaveBeenCalled();
-    expect(ops.pull).not.toHaveBeenCalled();
-    expect(failures[0]?.snippet).toContain("unavailable");
-  });
-
-  it("refuses below-baseline hardware before pull", async () => {
+    [new LocalIntegrityStateLoadError("manifest_rollback"), "manifest_rollback"],
+    [new LocalIntegrityStateLoadError("binding_mismatch"), "binding_mismatch"],
+    [new LocalIntegrityStateLoadError("integrity_state_invalid"), "integrity_state_invalid"],
+    [new Error("atomic rename failed"), "integrity_io_unavailable"],
+  ] as const)("surfaces authoritative commit refusal %s as %s", async (error, reason) => {
     const { ops } = makeOps({
-      probeHardware: vi.fn(async () => ({
-        totalRamGb: 4,
-        cpuArch: "x86_64",
-        tier: "below-baseline",
-        recommendedLocalModel: null,
-        ollamaReachable: false,
-        ollamaModels: [],
-      } satisfies HardwareCapabilityReport)),
+      commitVerified: vi.fn(async () => { throw error; }),
     });
     await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
       kind: "refused",
-      reason: "below_baseline",
+      reason,
     });
-    expect(ops.pull).not.toHaveBeenCalled();
+    expect(ops.commitVerified).toHaveBeenCalledOnce();
+    expect(ops.projectProvenance).not.toHaveBeenCalled();
+    expect(ops.recordFailure).not.toHaveBeenCalled();
   });
 
-  it("explicit decline prints no plan and mutates no runtime", async () => {
-    const { ops } = makeOps({ preAnswered: false });
+  it("keeps committed Q5 authority when projection crashes and a later rerun repairs it", async () => {
+    const first = makeOps({
+      projectProvenance: vi.fn(async () => { throw new Error("projection crash"); }),
+    });
+    await expect(runLocalIntelligenceProvisioning(first.ops)).resolves.toMatchObject({
+      kind: "already-provisioned",
+      provenanceProjection: "degraded",
+    });
+    expect(first.ops.commitVerified).toHaveBeenCalledOnce();
+    const recoveryAudit = vi.fn(async () => undefined);
+    const recovery = makeOps({
+      projectProvenance: vi.fn(async () => "repaired" as const),
+      audit: recoveryAudit,
+    });
+    await expect(runLocalIntelligenceProvisioning(recovery.ops)).resolves.toMatchObject({
+      kind: "already-provisioned",
+      provenanceProjection: "projected",
+    });
+    expect(recovery.ops.projectProvenance).toHaveBeenCalledOnce();
+    expect(recoveryAudit).toHaveBeenCalledWith(expect.objectContaining({
+      operation: "intelligence_load_integrity",
+      outcome: "success",
+      details: expect.objectContaining({ stage: "provenance_projection_recovery" }),
+    }));
+  });
+
+  it("reloads the floor under the lock before refusing a lower V2 input", async () => {
+    const oldState = {
+      manifest_version_floor: 10,
+      ollama_models_root: ROOT,
+    } as LocalIntegrityStateV2;
+    const lockSpy = vi.fn();
+    const withProvisioningLock: LocalProvisioningOps["withProvisioningLock"] =
+      async (operation) => {
+        lockSpy();
+        return operation();
+      };
+    const { ops } = makeOps({
+      reloadAuthority: vi.fn(async () => ({
+        configVersion: 2 as const,
+        configuredChoices: { ...DEFAULT_PER_SURFACE },
+        existingIntegrityState: oldState,
+      })),
+      withProvisioningLock,
+    });
     await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
       kind: "refused",
-      reason: "declined",
+      reason: "manifest_rollback",
     });
-    expect(ops.print).not.toHaveBeenCalled();
-    expect(ops.installRuntime).not.toHaveBeenCalled();
+    expect(lockSpy).toHaveBeenCalledOnce();
+    expect(ops.commitVerified).not.toHaveBeenCalled();
+    expect(ops.recordFailure).not.toHaveBeenCalled();
+  });
+
+  it("treats V1 input as rollback once an armed V2 floor exists", async () => {
+    const oldState = {
+      manifest_version_floor: 9,
+      ollama_models_root: ROOT,
+    } as LocalIntegrityStateV2;
+    const { ops } = makeOps({
+      reloadAuthority: vi.fn(async () => ({
+        configVersion: 2 as const,
+        configuredChoices: { ...DEFAULT_PER_SURFACE },
+        existingIntegrityState: oldState,
+      })),
+      verifyManifest: () => ({ ok: false, reason: "downgrade" }),
+    });
+    await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
+      kind: "refused",
+      reason: "manifest_rollback",
+    });
+    expect(ops.commitVerified).not.toHaveBeenCalled();
+    expect(ops.recordFailure).not.toHaveBeenCalled();
+  });
+
+  it("keeps the persisted root authoritative after the environment resolver changes", async () => {
+    const existingIntegrityState = {
+      manifest_version_floor: 9,
+      ollama_models_root: ROOT,
+    } as LocalIntegrityStateV2;
+    const resolveModelsRoot = vi.fn(async () => "/changed/by/environment");
+    const runtimeVerifier = { verify: vi.fn(async () => runtimeSuccess()) };
+    const { ops, commits } = makeOps({
+      reloadAuthority: vi.fn(async () => ({
+        configVersion: 2 as const,
+        configuredChoices: { ...DEFAULT_PER_SURFACE },
+        existingIntegrityState,
+      })),
+      resolveModelsRoot,
+      runtimeVerifier,
+    });
+    await runLocalIntelligenceProvisioning(ops);
+    expect(resolveModelsRoot).not.toHaveBeenCalled();
+    expect(runtimeVerifier.verify).toHaveBeenCalledWith(
+      expect.objectContaining({ rootReal: ROOT }),
+    );
+    expect(commits[0]!.integrityState.ollama_models_root).toBe(ROOT);
+  });
+
+  it("a lock contender refuses before verify, pull, or authoritative mutation", async () => {
+    const lockError = new CrossProcessLockError(
+      "cross-process lock /fortress/_intelligence/.q5-provisioning.lock held; clear it manually",
+    );
+    const { ops } = makeOps({
+      withProvisioningLock: vi.fn(async () => { throw lockError; }),
+    });
+    await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
+      kind: "refused",
+      reason: "integrity_io_unavailable",
+    });
+    expect(ops.runtimeVerifier.verify).not.toHaveBeenCalled();
     expect(ops.pull).not.toHaveBeenCalled();
     expect(ops.commitVerified).not.toHaveBeenCalled();
+    expect(ops.recordFailure).not.toHaveBeenCalled();
+    expect(ops.print).toHaveBeenCalledWith(lockError.message);
+    expect(ops.audit).toHaveBeenCalledWith(expect.objectContaining({
+      details: {
+        reason: "integrity_io_unavailable",
+        affected_surfaces: LOCAL_SURFACES,
+      },
+    }));
   });
 
-  it("a positive flag cannot authorize non-TTY mutation", async () => {
-    const { ops } = makeOps({ isTty: false, preAnswered: true });
+  it("records an honest failure when an unexpected crash follows a successful pull", async () => {
+    const runtimeVerifier = {
+      verify: vi.fn()
+        .mockResolvedValueOnce({
+          ok: false,
+          state: "tags_model_absent",
+          reason: "runtime_model_absent",
+          runtimeTag: "qwen2.5:1.5b",
+        })
+        .mockRejectedValueOnce(new Error("crash-after-pull")),
+    };
+    const { ops } = makeOps({ runtimeVerifier });
     await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
+      kind: "refused",
+      reason: "integrity_io_unavailable",
+    });
+    expect(ops.pull).toHaveBeenCalledOnce();
+    expect(ops.commitVerified).not.toHaveBeenCalled();
+    expect(ops.recordFailure).toHaveBeenCalledOnce();
+  });
+
+  it("keeps production-null and non-TTY paths inert before root or registry inspection", async () => {
+    const absent = makeOps({
+      manifestText: null,
+      verifyManifest: () => ({ ok: false, reason: "absent" }),
+    });
+    await expect(runLocalIntelligenceProvisioning(absent.ops)).resolves.toEqual({
+      kind: "refused",
+      reason: "integrity_state_absent",
+    });
+    expect(absent.ops.probeHardware).not.toHaveBeenCalled();
+    expect(absent.ops.resolveModelsRoot).not.toHaveBeenCalled();
+
+    const headless = makeOps({ isTty: false, preAnswered: true });
+    await expect(runLocalIntelligenceProvisioning(headless.ops)).resolves.toEqual({
       kind: "refused",
       reason: "non_tty",
     });
-    expect(ops.probeHardware).not.toHaveBeenCalled();
-    expect(ops.installRuntime).not.toHaveBeenCalled();
-    expect(ops.pull).not.toHaveBeenCalled();
+    expect(headless.ops.probeHardware).not.toHaveBeenCalled();
   });
 
-  it("a negative confirmation preserves local choices and performs no mutation", async () => {
-    const { ops } = makeOps({ confirm: vi.fn(async () => false) });
-    await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
-      kind: "refused",
-      reason: "declined",
-    });
-    expect(ops.installRuntime).not.toHaveBeenCalled();
-    expect(ops.pull).not.toHaveBeenCalled();
-    expect(ops.configuredChoices["privacy-filter-tier-2"]).toBe("local");
-  });
-
-  it("an install failure leaves no provisioned state", async () => {
-    const { ops } = makeOps({
-      probeHardware: vi.fn(async () => ({
-        totalRamGb: 16,
-        cpuArch: "apple-silicon-m2",
-        tier: "baseline",
-        recommendedLocalModel: "gemma-2-2b",
-        ollamaReachable: false,
-        ollamaModels: [],
-      } satisfies HardwareCapabilityReport)),
-      installRuntime: vi.fn(async () => false),
-    });
-    await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
-      kind: "refused",
-      reason: "install_failed",
-    });
-    expect(ops.pull).not.toHaveBeenCalled();
-    expect(ops.commitVerified).not.toHaveBeenCalled();
-  });
-
-  it("prints manual Windows guidance without confirming or installing", async () => {
-    const { ops } = makeOps({
-      platform: "win32",
-      probeHardware: vi.fn(async () => ({
-        totalRamGb: 16,
-        cpuArch: "x86_64",
-        tier: "baseline",
-        recommendedLocalModel: "gemma-2-2b",
-        ollamaReachable: false,
-        ollamaModels: [],
-      } satisfies HardwareCapabilityReport)),
-    });
-    await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
-      kind: "refused",
-      reason: "manual_install_required",
-    });
-    expect(ops.print).toHaveBeenCalledWith(expect.stringContaining("manually on Windows"));
-    expect(ops.confirm).not.toHaveBeenCalled();
-    expect(ops.installRuntime).not.toHaveBeenCalled();
-    expect(ops.pull).not.toHaveBeenCalled();
-  });
-
-  it("pull, show, and commit failures each leave no provisioned state", async () => {
-    for (const [override, reason] of [
-      [{ pull: vi.fn(async () => ({ ok: false, failureClass: "substrate_unavailable" as const })) }, "pull_failed"],
-      [{ show: vi.fn(async () => ({ ok: false, failureClass: "substrate_unavailable" as const, digest: null })) }, "show_failed"],
-      [{ commitVerified: vi.fn(async () => { throw new Error("persist failed"); }) }, "commit_failed"],
-    ] as const) {
-      const { ops } = makeOps(override);
-      await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
-        kind: "refused",
-        reason,
-      });
-      expect(ops.commitVerified).toHaveBeenCalledTimes(reason === "commit_failed" ? 1 : 0);
-    }
-  });
-
-  it("is idempotent when every installed digest already matches", async () => {
-    const { ops } = makeOps({
-      show: vi.fn(async () => ({ ok: true, failureClass: null, digest: HASH })),
-    });
-    await expect(runLocalIntelligenceProvisioning(ops)).resolves.toMatchObject({
-      kind: "already-provisioned",
-    });
-    expect(ops.print).not.toHaveBeenCalled();
-    expect(ops.confirm).not.toHaveBeenCalled();
-    expect(ops.pull).not.toHaveBeenCalled();
-    expect(ops.commitVerified).not.toHaveBeenCalled();
-  });
-
-  it("cannot escape the verified tier/surface references", async () => {
-    const closedBody = structuredClone(BODY);
-    closedBody.surface_defaults.baseline.concierge = null;
-    const { ops } = makeOps({
-      verifyManifest: () => ({ ok: true, body: closedBody }),
-    });
-    await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
-      kind: "refused",
-      reason: "manifest_invalid",
-    });
-    expect(ops.pull).not.toHaveBeenCalled();
-  });
-
-  it("classifies registry egress and renders only manifest-sourced values", () => {
+  it("renders V2 manifest semantics and never calls the root a weights hash", () => {
     expect(MODEL_REGISTRY_PROVIDER_CATEGORY).toBe("model-registry");
-    expect(renderLocalProvisioningPlan({ installRuntime: true, platform: "darwin", models: [MODEL] })).toEqual([
+    expect(renderLocalProvisioningPlan({
+      installRuntime: true,
+      platform: "darwin",
+      models: [MODEL],
+    })).toEqual([
       "Local intelligence setup plan (no changes have been made):",
       "- Install Ollama using the platform adapter after confirmation.",
-      "- Pull qwen2.5:1.5b from ollama://qwen2.5:1.5b (1.5B parameters; license Apache-2.0).",
-      "- Verify its observed SHA-256 against the signed model manifest before use.",
+      "- Pull qwen2.5:1.5b from registry.ollama.ai (1.5B parameters; license Apache-2.0).",
+      "- Verify its signed Ollama manifest root and required on-disk artifacts before binding.",
     ]);
   });
 });

@@ -1,21 +1,40 @@
-/** Shared `protect` / `init` adapter for the P1 provisioning ceremony. */
+/** Shared `protect` / `init` adapter for the Q5D provisioning ceremony. */
 
+import { lstat, realpath } from "node:fs/promises";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 import type { AuditLog } from "../operational/audit-log.js";
 import type { StorageBackend } from "../storage/interface.js";
 import {
   InMemoryModelProvenanceStore,
+  type ModelProvenance,
   type ModelProvenanceStore,
 } from "../operational/model-provenance.js";
 import {
   OllamaClient,
+  OllamaRuntimeEvidenceClient,
+  Q5_PROVISIONING_LOCK_FILE,
+  LocalModelsRootResolutionError,
   SubstrateSelector,
   TIER2_PINNED_SURFACE,
+  createNodeImmuneFileSystemAdapter,
+  createOnDiskImmuneVerifier,
+  isTier2PinViolation,
   runLocalIntelligenceProvisioning,
+  verifyModelManifestV2WithKey,
+  type ImmuneDiskVerifier,
+  type HardwareCapabilityReport,
   type LocalProvisioningResult,
+  type ProvenanceProjectionOutcome,
+  type RuntimeLightVerifier,
+  type SubstrateChoice,
+  type SubstrateConfig,
   type Surface,
 } from "../intelligence/index.js";
+import { INTELLIGENCE_NAMESPACE } from "../intelligence/policy-store.js";
+import { withCrossProcessLock, type CrossProcessLockOptions } from "../storage/cross-process-lock.js";
 
 export interface RunLocalIntelligenceSetupInput {
   storage: StorageBackend;
@@ -32,12 +51,113 @@ export interface RunLocalIntelligenceSetupInput {
 export interface RunLocalIntelligenceSetupDeps {
   /** Future bounded fetch path; deliberately null until a signed asset ships. */
   loadManifest?: () => Promise<string | null>;
-  /** Host installer adapter; no installer mutation is implemented in P1. */
+  /** Host installer adapter; the production default performs no mutation. */
   installRuntime?: () => Promise<boolean>;
   modelStore?: ModelProvenanceStore;
   client?: OllamaClient;
   confirm?: (prompt: string) => Promise<boolean>;
   platform?: NodeJS.Platform;
+  modelManifestV2PublicKey?: Uint8Array;
+  runtimeVerifier?: RuntimeLightVerifier;
+  immuneVerifier?: ImmuneDiskVerifier;
+  resolveModelsRoot?: () => Promise<string>;
+  probeHardware?: () => Promise<HardwareCapabilityReport>;
+  lockOptions?: CrossProcessLockOptions;
+}
+
+/**
+ * Resolve and validate the one root that Q5 persists. This is called only
+ * after an injected V2 catalog verifies; the null-default production path
+ * never reads `OLLAMA_MODELS` or the host model store.
+ */
+export async function resolveOllamaModelsRoot(
+  platform: NodeJS.Platform,
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+  homeDirectory = homedir(),
+): Promise<string> {
+  if (platform === "win32") {
+    throw new LocalModelsRootResolutionError("immune_platform_unsupported");
+  }
+  const configured = environment.OLLAMA_MODELS;
+  const rawCandidate = configured !== undefined && configured.length > 0
+    ? configured
+    : join(homeDirectory, ".ollama", "models");
+  if (!isAbsolute(rawCandidate) || rawCandidate.includes("\0")) {
+    throw new LocalModelsRootResolutionError("model_root_invalid");
+  }
+  const candidate = resolve(rawCandidate);
+  let lexical: Awaited<ReturnType<typeof lstat>>;
+  try {
+    lexical = await lstat(candidate);
+  } catch (error) {
+    const code = errorCode(error);
+    throw new LocalModelsRootResolutionError(
+      code === "ENOENT" || code === "ENOTDIR"
+        ? "model_root_invalid"
+        : "integrity_io_unavailable",
+    );
+  }
+  if (lexical.isSymbolicLink() || !lexical.isDirectory()) {
+    throw new LocalModelsRootResolutionError(
+      lexical.isSymbolicLink() ? "symlink_refused" : "model_root_invalid",
+    );
+  }
+  let resolved: string;
+  try {
+    resolved = await realpath(candidate);
+  } catch (error) {
+    const code = errorCode(error);
+    throw new LocalModelsRootResolutionError(
+      code === "ENOENT" || code === "ENOTDIR"
+        ? "model_root_invalid"
+        : "integrity_io_unavailable",
+    );
+  }
+  // A persisted alias would let later process/environment changes redirect
+  // verification, so the accepted spelling must already be its real path.
+  if (resolved !== candidate) {
+    throw new LocalModelsRootResolutionError("model_root_invalid");
+  }
+  return resolved;
+}
+
+function errorCode(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null && "code" in error &&
+      typeof (error as { code?: unknown }).code === "string"
+    ? (error as { code: string }).code
+    : undefined;
+}
+
+function provisioningChoices(
+  config: SubstrateConfig,
+): Readonly<Record<Surface, SubstrateChoice>> {
+  const configuredChoices = { ...config.perSurface };
+  // Invoke-time posture already pins this surface local. Provisioning uses
+  // the same effective choice without rewriting a tampered persisted choice.
+  if (isTier2PinViolation(
+    TIER2_PINNED_SURFACE,
+    configuredChoices[TIER2_PINNED_SURFACE],
+  )) {
+    configuredChoices[TIER2_PINNED_SURFACE] = "local";
+  }
+  return configuredChoices;
+}
+
+function timestampStableProvenance(provenance: ModelProvenance): unknown {
+  const {
+    declared_at: _declaredAt,
+    load_integrity_verified_at: _verifiedAt,
+    ...stable
+  } = provenance;
+  return stable;
+}
+
+function provenanceMatchesStableContent(
+  left: ModelProvenance,
+  right: ModelProvenance,
+): boolean {
+  return JSON.stringify(timestampStableProvenance(left)) ===
+    JSON.stringify(timestampStableProvenance(right));
 }
 
 /**
@@ -53,13 +173,14 @@ export async function runLocalIntelligenceSetup(
     masterKey: input.masterKey,
     auditLog: input.auditLog,
     identityId: input.identityId,
+    ...(deps.modelManifestV2PublicKey === undefined
+      ? {}
+      : { modelManifestV2PublicKey: deps.modelManifestV2PublicKey }),
   });
   await selector.load();
   const config = selector.getConfig();
-  const configuredChoices = { ...config.perSurface };
-  // Invoke-time posture already pins this surface local. Provisioning uses
-  // the same effective choice without rewriting a tampered persisted choice.
-  configuredChoices[TIER2_PINNED_SURFACE] = "local";
+  let authorityConfig = config;
+  const initialConfiguredChoices = provisioningChoices(config);
   const client = deps.client ?? new OllamaClient({
     endpoint: config.ollamaEndpoint ?? "http://localhost:11434",
   });
@@ -85,27 +206,78 @@ export async function runLocalIntelligenceSetup(
   const manifestText = input.preAnswered === false || !isTty
     ? null
     : await (deps.loadManifest ?? (async () => null))();
+  const runtimeVerifier = deps.runtimeVerifier ?? new OllamaRuntimeEvidenceClient({
+    endpoint: config.ollamaEndpoint ?? "http://localhost:11434",
+  });
+  const immuneVerifier = deps.immuneVerifier ?? createOnDiskImmuneVerifier({
+    fs: createNodeImmuneFileSystemAdapter(),
+  });
   return runLocalIntelligenceProvisioning({
     isTty,
     platform: deps.platform ?? process.platform,
     preAnswered: input.preAnswered,
     manifestText,
-    configuredChoices,
-    probeHardware: () => selector.probeHardware(),
+    initialConfiguredChoices,
+    // Must match `reloadLocalProvisioningAuthority` in selector.ts; this
+    // callback is invoked only from inside the provisioning lock.
+    reloadAuthority: async () => {
+      authorityConfig = await selector.reloadLocalProvisioningAuthority();
+      return {
+        configVersion: authorityConfig.version,
+        configuredChoices: provisioningChoices(authorityConfig),
+        ...(authorityConfig.version === 2
+          ? { existingIntegrityState: authorityConfig.localIntegrityState }
+          : {}),
+      };
+    },
+    ...(deps.modelManifestV2PublicKey === undefined
+      ? {}
+      : {
+        verifyManifest: (text, manifestVersionFloor) =>
+          verifyModelManifestV2WithKey(
+            text,
+            deps.modelManifestV2PublicKey!,
+            manifestVersionFloor === undefined ? {} : { manifestVersionFloor },
+          ),
+      }),
+    probeHardware: deps.probeHardware ?? (() => selector.probeHardware()),
+    resolveModelsRoot: deps.resolveModelsRoot ?? (() =>
+      resolveOllamaModelsRoot(deps.platform ?? process.platform)),
+    runtimeVerifier,
+    immuneVerifier,
+    withProvisioningLock: (operation) => withCrossProcessLock(
+      input.storage,
+      INTELLIGENCE_NAMESPACE,
+      Q5_PROVISIONING_LOCK_FILE,
+      operation,
+      {
+        ...deps.lockOptions,
+        metadata: { purpose: "q5-local-integrity-provisioning" },
+      },
+    ),
     installRuntime: deps.installRuntime ?? (async () => false),
     pull: (runtimeTag) => client.pull(runtimeTag),
-    show: (runtimeTag) => client.show(runtimeTag),
     confirm,
     print,
-    commitVerified: async (commits) => {
-      const runtimeTags: Partial<Record<Surface, string>> = {};
-      for (const commit of commits) {
-        modelStore.declare(commit.provenance);
-        for (const surface of commit.surfaces) {
-          runtimeTags[surface] = commit.model.runtime_tag;
-        }
+    commitVerified: (commit) => selector.commitLocalIntegrityProvisioning(
+      commit.integrityState,
+      commit.runtimeTags,
+    ),
+    projectProvenance: async (projection) => {
+      let outcome: ProvenanceProjectionOutcome = authorityConfig.version === 2
+        ? "unchanged"
+        : "projected";
+      if (
+        authorityConfig.version === 2 && projection.some((entry) => {
+          const prior = modelStore.get(entry.model.model_id);
+          return prior === undefined ||
+            !provenanceMatchesStableContent(prior, entry.provenance);
+        })
+      ) {
+        outcome = "repaired";
       }
-      await selector.markLocalModelsProvisioned(runtimeTags);
+      for (const entry of projection) modelStore.declare(entry.provenance);
+      return outcome;
     },
     recordFailure: (surfaces, failureClass, snippet) =>
       selector.recordLocalProvisioningFailure(surfaces, failureClass, snippet),

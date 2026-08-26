@@ -53,7 +53,12 @@ import type { AuditLog } from "../operational/audit-log.js";
 import { INTEL_OPS } from "./audit-events.js";
 import { tradeoffTextHash, BACKEND_FALLBACK_STRINGS, BADGE_LABEL_KEYS, BADGE_TRADEOFF_KEYS, LOCAL_MODEL_LABELS } from "./templates.js";
 import { DEFAULT_OLLAMA_ENDPOINT, buildDefaultConfig, DEFAULT_PER_SURFACE, DEFAULT_LOCAL_MODEL_PICKS } from "./defaults.js";
-import { IntelligenceConfigStore, type LoadOutcome } from "./policy-store.js";
+import {
+  IntelligenceConfigStore,
+  LocalIntegrityStateLoadError,
+  type LoadOutcome,
+} from "./policy-store.js";
+import type { LocalIntegrityStateV2 } from "./model-manifest-v2.js";
 import {
   LOCAL_MODEL_TAGS,
   SURFACES,
@@ -200,6 +205,8 @@ export interface SelectorConfig {
    * traffic and fails closed if a finding needs the absent reporter.
    */
   compiledContextScanner?: CompiledContextScanner;
+  /** Fixture seam for Q5D; production revalidates with the pinned release key. */
+  modelManifestV2PublicKey?: Uint8Array;
 }
 
 export class SubstrateSelector {
@@ -227,7 +234,11 @@ export class SubstrateSelector {
   private tier2PinOverrideAudited = false;
 
   constructor(cfg: SelectorConfig) {
-    this.store = new IntelligenceConfigStore(cfg.storage, cfg.masterKey);
+    this.store = new IntelligenceConfigStore(cfg.storage, cfg.masterKey, {
+      ...(cfg.modelManifestV2PublicKey === undefined
+        ? {}
+        : { modelManifestV2PublicKey: cfg.modelManifestV2PublicKey }),
+    });
     this.auditLog = cfg.auditLog;
     this.identityId = cfg.identityId;
     this.compiledContextScanner =
@@ -299,6 +310,11 @@ export class SubstrateSelector {
    */
   async load(): Promise<void> {
     const outcome = await this.store.load();
+    if (outcome.kind === "integrity-state-invalid") {
+      // An armed record is one indivisible authority. Falling back to defaults
+      // here would reinterpret a stripped/tampered record as legacy-unarmed.
+      throw new LocalIntegrityStateLoadError(outcome.reason);
+    }
     this.config = outcome.config;
     this.recentFailures.clear();
     for (const surface of SURFACES) {
@@ -324,6 +340,25 @@ export class SubstrateSelector {
   }
 
   /**
+   * Re-read the durable config for a provisioning ceremony that already owns
+   * the cross-process lock. This intentionally bypasses the loaded snapshot.
+   * Must match the `reloadAuthority` adapter in `wrap/local-intelligence.ts`.
+   */
+  async reloadLocalProvisioningAuthority(): Promise<SubstrateConfig> {
+    const config = await this.store.loadAuthoritative() ?? buildDefaultConfig();
+    this.config = config;
+    this.recentFailures.clear();
+    for (const surface of SURFACES) {
+      const persisted = config.provisioningFailures?.[surface] ?? [];
+      if (persisted.length > 0) {
+        this.recentFailures.set(surface, persisted.slice(-RECENT_FAILURES_CAP));
+      }
+    }
+    this.loaded = true;
+    return config;
+  }
+
+  /**
    * Operator picked (or re-picked) a substrate for a surface. Persists the
    * change and emits `intelligence_substrate_chosen`. The picker modal
    * surfaces the tradeoff text BEFORE invoking this method; the audit
@@ -341,11 +376,11 @@ export class SubstrateSelector {
     const prior = this.config.perSurface[surface];
     const wasDefault = prior === DEFAULT_PER_SURFACE[surface];
 
-    this.config = {
+    const next: SubstrateConfig = {
       ...this.config,
       perSurface: { ...this.config.perSurface, [surface]: substrate },
     };
-    await this.store.save(this.config);
+    await this.persistNext(next);
 
     // Finding ZZ (v1.2.0-rc.2): when the operator changes a surface's
     // substrate, prior failure entries no longer describe the new binding.
@@ -416,13 +451,13 @@ export class SubstrateSelector {
       }
     }
 
-    this.config = {
+    const next: SubstrateConfig = {
       ...this.config,
       perSurface: nextPerSurface,
       localModelPicks: nextLocalPicks,
       applyToAllSurfaces: true,
     };
-    await this.store.save(this.config);
+    await this.persistNext(next);
 
     // Finding ZZ (v1.2.0-rc.2): bulk re-binding is a global configuration
     // gesture; prior per-surface failure entries no longer describe the
@@ -462,8 +497,7 @@ export class SubstrateSelector {
    */
   async setApplyToAllPreference(value: boolean): Promise<void> {
     await this.ensureLoaded();
-    this.config = { ...this.config, applyToAllSurfaces: value };
-    await this.store.save(this.config);
+    await this.persistNext({ ...this.config, applyToAllSurfaces: value });
   }
 
   /**
@@ -479,8 +513,7 @@ export class SubstrateSelector {
     const next = { ...this.config.localModelPicks };
     if (pick === null) delete next[surface];
     else next[surface] = pick;
-    this.config = { ...this.config, localModelPicks: next };
-    await this.store.save(this.config);
+    await this.persistNext({ ...this.config, localModelPicks: next });
   }
 
   /**
@@ -503,8 +536,7 @@ export class SubstrateSelector {
     const next: SubstrateConfig = { ...this.config };
     if (apiKey === null) delete next.veniceApiKey;
     else next.veniceApiKey = apiKey;
-    this.config = next;
-    await this.store.save(this.config);
+    await this.persistNext(next);
 
     if (apiKey !== null) {
       await this.validateVeniceAndRecord(apiKey);
@@ -568,8 +600,7 @@ export class SubstrateSelector {
     const next = { ...this.config.frontierConfig };
     if (apiKey === null) delete next[provider];
     else next[provider] = apiKey;
-    this.config = { ...this.config, frontierConfig: next };
-    await this.store.save(this.config);
+    await this.persistNext({ ...this.config, frontierConfig: next });
   }
 
   /**
@@ -591,8 +622,7 @@ export class SubstrateSelector {
     if (!validation.ok) {
       throw new Error(`invalid hybrid rules: ${validation.reason}`);
     }
-    this.config = { ...this.config, hybridRules: rules };
-    await this.store.save(this.config);
+    await this.persistNext({ ...this.config, hybridRules: rules });
   }
 
   /**
@@ -602,11 +632,11 @@ export class SubstrateSelector {
    */
   async setFallbackBehavior(surface: Surface, fallback: FallbackBehavior): Promise<void> {
     await this.ensureLoaded();
-    this.config = {
+    const next: SubstrateConfig = {
       ...this.config,
       fallback: { ...this.config.fallback, [surface]: fallback },
     };
-    await this.store.save(this.config);
+    await this.persistNext(next);
   }
 
   /**
@@ -617,9 +647,18 @@ export class SubstrateSelector {
   async resetToDefaults(): Promise<void> {
     await this.ensureLoaded();
     const overridden = countOverriddenSurfaces(this.config);
-    const fresh = buildDefaultConfig();
-    this.config = fresh;
-    await this.store.save(fresh);
+    const legacyFresh = buildDefaultConfig();
+    const fresh: SubstrateConfig = this.config.version === 2
+      ? {
+        ...legacyFresh,
+        version: 2,
+        // Resetting operator choices is not a reviewed Q5 disarm ceremony;
+        // the armed record survives and the save refuses if choices diverge.
+        localIntegrityState: this.config.localIntegrityState,
+        customLocalModelTags: this.config.customLocalModelTags,
+      }
+      : legacyFresh;
+    await this.persistNext(fresh);
 
     const payload: IntelligenceConfigResetPayload = {
       version: "1.2",
@@ -662,39 +701,62 @@ export class SubstrateSelector {
       };
       const entries = [...(next[surface] ?? []), entry].slice(-RECENT_FAILURES_CAP);
       next[surface] = entries;
-      this.recentFailures.set(surface, entries.slice());
     }
-    this.config = { ...this.config, provisioningFailures: next };
-    await this.store.save(this.config);
+    await this.persistNext({ ...this.config, provisioningFailures: next });
+    for (const surface of surfaces) {
+      const entries = next[surface];
+      if (entries !== undefined) this.recentFailures.set(surface, entries.slice());
+    }
   }
 
   /**
-   * Commit verified runtime tags only after the provisioning digest gate has
-   * passed for every referenced model. This mutates model bindings only; the
-   * operator's per-surface substrate choices remain byte-for-byte unchanged.
+   * Commit runtime tags, cleared failures, and the complete Q5 record in one
+   * encrypted config write. The in-process view changes only after save wins,
+   * so a thrown/failed save leaves both memory and durable authority old.
    */
-  async markLocalModelsProvisioned(
+  async commitLocalIntegrityProvisioning(
+    integrityState: LocalIntegrityStateV2,
     runtimeTags: Readonly<Partial<Record<Surface, string>>>,
   ): Promise<void> {
     await this.ensureLoaded();
+    if (
+      this.config.version === 2 &&
+      integrityState.manifest_version_floor <
+        this.config.localIntegrityState.manifest_version_floor
+    ) {
+      throw new LocalIntegrityStateLoadError("manifest_rollback");
+    }
     const customLocalModelTags = { ...(this.config.customLocalModelTags ?? {}) };
     const provisioningFailures = { ...(this.config.provisioningFailures ?? {}) };
     for (const surface of SURFACES) {
+      const binding = integrityState.bindings[surface];
       const runtimeTag = runtimeTags[surface];
-      if (runtimeTag === undefined) continue;
-      // The digest gate may bind only surfaces whose effective substrate is
-      // already local; verification never grants authority to change choice.
-      if (this.effectiveChoice(surface) !== "local") continue;
+      if (binding === undefined && runtimeTag === undefined) continue;
+      if (
+        binding === undefined || runtimeTag === undefined ||
+        binding.runtime_tag !== runtimeTag || this.effectiveChoice(surface) !== "local"
+      ) {
+        throw new LocalIntegrityStateLoadError("binding_mismatch");
+      }
       customLocalModelTags[surface] = runtimeTag;
       delete provisioningFailures[surface];
-      this.recentFailures.delete(surface);
     }
-    this.config = {
+    const next: SubstrateConfig = {
       ...this.config,
+      version: 2,
       customLocalModelTags,
       provisioningFailures,
+      localIntegrityState: integrityState,
     };
-    await this.store.save(this.config);
+    await this.persistNext(next);
+    for (const surface of Object.keys(integrityState.bindings) as Surface[]) {
+      this.recentFailures.delete(surface);
+    }
+  }
+
+  private async persistNext(next: SubstrateConfig): Promise<void> {
+    const saved = await this.store.save(next);
+    this.config = saved;
   }
 
   /**
