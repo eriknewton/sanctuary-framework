@@ -21,6 +21,11 @@ function buildSelector(storage = new MemoryStorage(), masterKey = generateRandom
 }
 
 describe("selector provisioning state", () => {
+  it("exposes no legacy provisioning tag writer outside the atomic Q5 commit", () => {
+    const { selector } = buildSelector();
+    expect("markLocalModelsProvisioned" in selector).toBe(false);
+  });
+
   it("persists refusals into operator-visible DEGRADED status", async () => {
     const { selector, storage, masterKey, auditLog, fetchImpl } = buildSelector();
     await selector.load();
@@ -42,20 +47,5 @@ describe("selector provisioning state", () => {
     expect(concierge?.health).toBe("degraded");
     expect(concierge?.recentFailures.at(-1)?.snippet).toBe("signed manifest unavailable");
     expect(reloaded.getConfig().perSurface.concierge).toBe("local");
-  });
-
-  it("commits verified tags without changing choices and clears refusal state", async () => {
-    const { selector } = buildSelector();
-    await selector.load();
-    await selector.recordLocalProvisioningFailure(
-      ["concierge"],
-      "substrate_misconfigured",
-      "digest mismatch",
-    );
-    const choicesBefore = { ...selector.getConfig().perSurface };
-    await selector.markLocalModelsProvisioned({ concierge: "qwen2.5:1.5b" });
-    expect(selector.getConfig().customLocalModelTags?.concierge).toBe("qwen2.5:1.5b");
-    expect(selector.getConfig().provisioningFailures?.concierge).toBeUndefined();
-    expect(selector.getConfig().perSurface).toEqual(choicesBefore);
   });
 });
