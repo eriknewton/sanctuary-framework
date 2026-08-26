@@ -64,7 +64,25 @@ describe("Memory Integrity Slice B — frozen production assembler inventory", (
     const selector = readFileSync(join(SRC_ROOT, "intelligence/selector.ts"), "utf8");
     const invoke = selector.slice(selector.indexOf("  private async invoke("), selector.indexOf("  /**\n   * Append a failure entry"));
     expect(invoke.indexOf("compileSubstrateContext(surface, req)")).toBeGreaterThan(-1);
-    expect(invoke.indexOf("compileSubstrateContext(surface, req)")).toBeLessThan(invoke.indexOf("this.buildHandle(surface, choice)"));
+    expect(invoke.indexOf("compileSubstrateContext(surface, req)")).toBeLessThan(
+      invoke.indexOf("this.getOrIssueHandle(surface, choice)"),
+    );
+    expect(invoke.indexOf("this.getOrIssueHandle(surface, choice)")).toBeLessThan(
+      invoke.indexOf("this.invokeHandle(surface, handle, method, req)"),
+    );
+
+    // `getOrIssueHandle` creates provider handles but is not a context assembler:
+    // production callers use getSubstrate only for capability/display metadata,
+    // while every provider-reaching invocation remains in the frozen invoke*
+    // inventory above and crosses this post-assembly screen first.
+    const directHandleInvocations = sourceFiles()
+      .filter((path) => rel(path) !== "intelligence/selector.ts")
+      .filter((path) => /\bhandle\.(?:summarize|classify|redact)\s*\(/.test(
+        readFileSync(path, "utf8"),
+      ))
+      .map(rel)
+      .sort();
+    expect(directHandleInvocations).toEqual([]);
 
     const concierge = readFileSync(join(SRC_ROOT, "concierge/concierge-service.ts"), "utf8");
     expect(concierge).toContain(

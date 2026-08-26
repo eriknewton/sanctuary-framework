@@ -506,3 +506,50 @@ describe("Tier 2 redactor — audit emission discipline", () => {
     expect(serialized).not.toContain("private.example.com");
   });
 });
+
+describe("SubstrateSelector.installRedactor — cached handle invalidation", () => {
+  it("reissues a cached frontier handle with the installed consent-gated redactor", async () => {
+    const bodies: string[] = [];
+    const fetchImpl = vi.fn(async (
+      _input: Parameters<typeof fetch>[0],
+      init?: RequestInit,
+    ) => {
+      bodies.push(String(init?.body ?? ""));
+      return new Response(
+        JSON.stringify({ content: [{ type: "text", text: "summary" }] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const selector = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog: new AuditLog(storage, masterKey),
+      identityId: "redactor-cache-test",
+      fetchImpl,
+    });
+    await selector.load();
+    await selector.setPerSurfaceChoice("concierge", "frontier-with-filter");
+    await selector.setFrontierApiKey("anthropic", "test-key");
+    const identityHandle = await selector.getSubstrate("concierge");
+
+    const installedRedactor = vi.fn(async () => ({
+      redacted: "[CONSENT-GATED]",
+      matchCount: 1,
+    }));
+    selector.installRedactor(installedRedactor);
+    const consentGatedHandle = await selector.getSubstrate("concierge");
+    expect(consentGatedHandle).not.toBe(identityHandle);
+
+    await consentGatedHandle.summarize!({
+      kind: "summarize",
+      context: "alice@example.com",
+      query: "summarize",
+    });
+    expect(installedRedactor).toHaveBeenCalledTimes(2);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain("[CONSENT-GATED]");
+    expect(bodies[0]).not.toContain("alice@example.com");
+  });
+});

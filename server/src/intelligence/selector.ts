@@ -905,12 +905,12 @@ export class SubstrateSelector {
    * (selector needs redactor; redactor needs selector for emit).
    *
    * Subsequent calls to getSubstrate("...frontier-with-filter") will use
-   * the installed redactor; already-issued handles continue to use the
-   * redactor that was installed at handle-issue time. Consumers that
-   * cache handles SHOULD re-issue after installRedactor.
+   * the installed redactor; already-held handles remain snapshots, but the
+   * selector never serves a pre-install handle from its issuance cache.
    */
   installRedactor(redactor: FrontierRedactor): void {
     this.redactor = redactor;
+    this.invalidateIssuedIntegrityHandles();
   }
 
   /**
@@ -1237,6 +1237,15 @@ export class SubstrateSelector {
   ): Promise<{ response: SubstrateResponse; methodAvailable: boolean }> {
     const fn = handle[method] as SubstrateInvoker | undefined;
     if (!fn) {
+      const integrityFailure = handle.substrate === "local"
+        ? this.integrityFailures.get(surface)
+        : undefined;
+      if (integrityFailure !== undefined) {
+        return {
+          response: integrityFailureResponse(integrityFailure.reason),
+          methodAvailable: true,
+        };
+      }
       return {
         response: disabledResponse(
           handle.substrate,
@@ -1271,6 +1280,14 @@ export class SubstrateSelector {
   } | null> {
     if (this.config.fallback[surface] !== "degrade-silent") return null;
     if (primary === "disabled" || primary === "hybrid") return null;
+    // An immune integrity refusal is a terminal local denial: operator fallback
+    // preferences may route ordinary substrate failures, never failed model
+    // identity evidence from the reviewed closed immune-surface set.
+    if (
+      primary === "local" &&
+      IMMUNE_SURFACE_SET.has(surface) &&
+      this.integrityFailures.has(surface)
+    ) return null;
     // Ratified 2026-07-23: the pinned tier-2 surface never escapes
     // local via the fallback chain (local -> venice -> frontier would
     // be a remote egress of PII-residual-bearing text). The pin means
@@ -1313,7 +1330,15 @@ export class SubstrateSelector {
     const epoch = this.integrityConfigEpoch;
     const promise = this.issueHandle(surface, choice, epoch);
     this.issuedHandles.set(key, { epoch, promise });
-    const issued = await promise;
+    let issued: HandleIssueResult;
+    try {
+      issued = await promise;
+    } catch (error) {
+      if (this.issuedHandles.get(key)?.promise === promise) {
+        this.issuedHandles.delete(key);
+      }
+      throw error;
+    }
     const current = this.issuedHandles.get(key);
     if (
       !issued.cacheable || epoch !== this.integrityConfigEpoch ||
@@ -1451,6 +1476,19 @@ export class SubstrateSelector {
         return result;
       }
 
+      // A held handle never outranks current V2 authority: epoch, exact binding,
+      // assurance class, and loopback endpoint remain reuse terminators even
+      // while the light six-hour verification result is otherwise reusable.
+      if (!this.integrityAuthorityMatches(surface, binding, epoch)) {
+        await this.recordIntegrityRefusal(
+          surface,
+          "binding_mismatch",
+          "runtime_invocation",
+          binding,
+        );
+        return { ok: false, reason: "binding_mismatch" };
+      }
+
       if (binding.assurance === "immune") {
         const result = await this.runIntegrityGate({
           surface,
@@ -1552,17 +1590,16 @@ export class SubstrateSelector {
     diskCheckpoint?: ImmuneVerificationCheckpoint;
   }): Promise<IntegrityGateResult> {
     const { surface, binding, epoch, stage } = args;
+    if (!this.integrityAuthorityMatches(surface, binding, epoch)) {
+      await this.recordIntegrityRefusal(surface, "binding_mismatch", stage, binding);
+      return { ok: false, reason: "binding_mismatch" };
+    }
     const integrityState = this.config.version === 2
       ? this.config.localIntegrityState
       : undefined;
-    const currentBinding = integrityState?.bindings[surface];
-    const expectedAssurance = IMMUNE_SURFACE_SET.has(surface) ? "immune" : "light";
-    if (
-      integrityState === undefined ||
-      epoch !== this.integrityConfigEpoch || currentBinding !== binding ||
-      binding.assurance !== expectedAssurance ||
-      !isLoopbackOllamaEndpoint(this.config.ollamaEndpoint ?? DEFAULT_OLLAMA_ENDPOINT)
-    ) {
+    // `integrityAuthorityMatches` proved the V2 authority above; this guard
+    // keeps the narrowing explicit if its implementation is later refactored.
+    if (integrityState === undefined) {
       await this.recordIntegrityRefusal(surface, "binding_mismatch", stage, binding);
       return { ok: false, reason: "binding_mismatch" };
     }
@@ -1669,6 +1706,21 @@ export class SubstrateSelector {
       );
     }
     return completed;
+  }
+
+  private integrityAuthorityMatches(
+    surface: Surface,
+    binding: VerifiedLocalBindingV2,
+    epoch: number,
+  ): boolean {
+    if (this.config.version !== 2) return false;
+    const expectedAssurance = IMMUNE_SURFACE_SET.has(surface) ? "immune" : "light";
+    return epoch === this.integrityConfigEpoch &&
+      this.config.localIntegrityState.bindings[surface] === binding &&
+      binding.assurance === expectedAssurance &&
+      isLoopbackOllamaEndpoint(
+        this.config.ollamaEndpoint ?? DEFAULT_OLLAMA_ENDPOINT,
+      );
   }
 
   private completedIntegrityGate(): IntegrityGateResult {

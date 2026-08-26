@@ -361,6 +361,10 @@ export class OllamaRuntimeEvidenceClient implements RuntimeLightVerifier {
       return refusal(tagsInspection.state, reason, runtimeTag);
     }
 
+    // Rule 7 trust semantics: the subject is this exact runtime tag; expected
+    // evidence comes from the release-key-verified V2 binding, observed evidence
+    // comes only from the bounded exact-name `/api/tags` inspector, and this
+    // verifier's equality authorizes runtime-manifest identity (not disk bytes).
     if (!constantTimeDigestEqual(
       tagsInspection.observedManifestDigest,
       expectedManifestDigest,

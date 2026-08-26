@@ -277,6 +277,61 @@ describe("Q5E selector activation", () => {
     expect(recorder.generated).toHaveLength(1);
   });
 
+  it("refuses a previously invoked light handle immediately after its authority epoch changes", async () => {
+    const fixture = await armedFixture();
+    const recorder = fetchRecorder();
+    const results = [
+      runtimeSuccess(),
+      runtimeSuccess(),
+      runtimeFailure("runtime_manifest_digest_mismatch"),
+    ];
+    const runtime = { verify: vi.fn(async () => results.shift()!) };
+    const selector = activatedSelector(fixture, { runtime, fetchImpl: recorder.fetchImpl });
+    const heldHandle = await selector.getSubstrate("concierge");
+
+    const first = await heldHandle.summarize!({
+      kind: "summarize",
+      context: "before config change",
+      query: "allowed",
+    });
+    expect(first.failureClass).toBeNull();
+    expect(recorder.generated).toHaveLength(1);
+    expect(runtime.verify).toHaveBeenCalledTimes(2);
+
+    await selector.setFallbackBehavior("concierge", "conservative-deny");
+    const refusedHeld = await heldHandle.summarize!({
+      kind: "summarize",
+      context: "after config change",
+      query: "must refuse",
+    });
+
+    expect(refusedHeld).toMatchObject({
+      failureClass: "substrate_misconfigured",
+      body: { kind: "failure", message: "local load refused: binding_mismatch" },
+    });
+    expect(recorder.generated).toHaveLength(1);
+    expect(runtime.verify).toHaveBeenCalledTimes(2);
+  });
+
+  it("evicts a rejected handle-issuance promise so a later gate can recover", async () => {
+    const fixture = await armedFixture();
+    const runtime = {
+      verify: vi.fn()
+        .mockRejectedValueOnce(new Error("transient verifier exception"))
+        .mockResolvedValue(runtimeSuccess()),
+    };
+    const selector = activatedSelector(fixture, { runtime });
+
+    await expect(selector.getSubstrate("concierge")).rejects.toThrow(
+      "transient verifier exception",
+    );
+    await expect(selector.getSubstrate("concierge")).resolves.toMatchObject({
+      substrate: "local",
+      capability: { summarize: true },
+    });
+    expect(runtime.verify).toHaveBeenCalledTimes(2);
+  });
+
   it("refuses an armed local binding when the configured Ollama endpoint is not loopback", async () => {
     const fixture = await armedFixture();
     const store = new IntelligenceConfigStore(fixture.storage, fixture.masterKey, {
@@ -454,6 +509,33 @@ describe("Q5E selector activation", () => {
     } else {
       await selector.invokeRedact(surface as Surface, { kind: "redact", text: "name" });
     }
+    expect(recorder.generated).toHaveLength(0);
+    expect(recorder.remote).toHaveLength(0);
+  });
+
+  it("keeps an immune integrity refusal out of remote fallback under degrade-silent", async () => {
+    const fixture = await armedFixture({ veniceKey: true });
+    const recorder = fetchRecorder();
+    const runtime = {
+      verify: vi.fn(async () => runtimeFailure("runtime_manifest_digest_mismatch")),
+    };
+    const selector = activatedSelector(fixture, { runtime, fetchImpl: recorder.fetchImpl });
+    await selector.setFallbackBehavior("sentinel-scoring", "degrade-silent");
+
+    const response = await selector.invokeClassify("sentinel-scoring", {
+      kind: "classify",
+      items: ["tool"],
+      categories: ["deny"],
+    });
+
+    expect(response).toMatchObject({
+      servedBy: "local",
+      failureClass: "substrate_misconfigured",
+      body: {
+        kind: "failure",
+        message: "local load refused: runtime_manifest_digest_mismatch",
+      },
+    });
     expect(recorder.generated).toHaveLength(0);
     expect(recorder.remote).toHaveLength(0);
   });

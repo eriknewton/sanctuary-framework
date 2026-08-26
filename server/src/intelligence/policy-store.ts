@@ -269,7 +269,9 @@ export class IntelligenceConfigStore {
   /**
    * Serialize an authority read plus its eventual config save. Provisioning
    * acquires its own lock first and then this lock, while routine writers take
-   * only this lock; no path may reverse that fixed order.
+   * only this lock; no path may reverse that fixed order. Provisioning holds
+   * this lock across its interactive confirmation, model pulls, verification,
+   * authority reload, and commit, so a live ceremony may own it for minutes.
    */
   async withSaveLock<T>(operation: () => Promise<T>): Promise<T> {
     return withCrossProcessLock(

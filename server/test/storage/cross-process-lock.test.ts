@@ -117,14 +117,16 @@ describe("withCrossProcessLock", () => {
 
     // Track the contender too: its rejection is asserted inline here, but
     // registering it guarantees no unhandled rejection can outlive the test.
-    await expect(
-      track(
-        withCrossProcessLock(storage, NS, LOCK, async () => undefined, {
-          timeoutMs: 80,
-          retryMs: 10,
-        }),
-      ),
-    ).rejects.toBeInstanceOf(CrossProcessLockError);
+    const contention = track(
+      withCrossProcessLock(storage, NS, LOCK, async () => undefined, {
+        timeoutMs: 80,
+        retryMs: 10,
+      }),
+    );
+    await expect(contention).rejects.toBeInstanceOf(CrossProcessLockError);
+    await expect(contention).rejects.toThrow(
+      "Never remove this lock while a holder may still be alive; some ceremonies hold it for minutes.",
+    );
 
     release();
     await holder;
