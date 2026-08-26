@@ -643,7 +643,7 @@ final class HeadlessFilterCLITests: XCTestCase {
         )
 
         // Contradictory extra tokens are ambiguous; ambiguity reads
-        // NOT-listed, never as a positive observation (exact SET equality).
+        // NOT-listed, never as a positive observation (closed allowlist).
         let contradictory =
             "*\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1421)\tCastle Wall\t[activated enabled deactivated]"
         XCTAssertFalse(

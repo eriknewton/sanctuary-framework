@@ -801,7 +801,7 @@ describe("parseActivatedCastleWallBundleVersions", () => {
 
   it("rejects a row whose state carries contradictory extra tokens", () => {
     // "activated enabled deactivated" is ambiguous; ambiguity contributes
-    // nothing (exact SET equality, mirroring the Swift probe).
+    // nothing (closed allowlist, mirroring the Swift probe).
     expect(
       parseActivatedCastleWallBundleVersions(
         "*\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1421)\tCastle Wall\t[activated enabled deactivated]",
