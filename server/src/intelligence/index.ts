@@ -125,6 +125,37 @@ export {
 } from "./runtime-light-verifier.js";
 
 export {
+  IMMUNE_FULL_VERIFICATION_CADENCE_MS,
+  IMMUNE_HASH_BUFFER_BYTES,
+  IMMUNE_HASH_MAX_BUFFER_BYTES,
+  IMMUNE_OCI_MANIFEST_MAX_BYTES,
+  IMMUNE_OCI_MANIFEST_OVERFLOW_READ_BYTES,
+  IMMUNE_OCI_MAX_DESCRIPTOR_BYTES,
+  IMMUNE_OCI_MAX_LAYERS,
+  IMMUNE_OCI_MAX_MEDIA_TYPE_CHARS,
+  IMMUNE_OCI_MAX_TOTAL_DESCRIPTOR_BYTES,
+  IMMUNE_VERIFICATION_CACHE_MAX_ENTRIES,
+  createCadencedImmuneDiskVerifier,
+  createNodeImmuneFileSystemAdapter,
+  createOnDiskImmuneVerifier,
+  parseBoundedOciManifest,
+  type CadencedImmuneDiskVerifier,
+  type CadencedImmuneVerifierOptions,
+  type ImmuneDiskVerifier,
+  type ImmuneFileHandle,
+  type ImmuneFileStat,
+  type ImmuneFileSystemAdapter,
+  type ImmuneVerificationCheckpoint,
+  type ImmuneVerificationClock,
+  type ImmuneVerificationRefusalReason,
+  type ImmuneVerificationRequest,
+  type ImmuneVerificationResult,
+  type OciDescriptor,
+  type OnDiskImmuneVerifierOptions,
+  type ParsedOciManifest,
+} from "./immune-disk-verifier.js";
+
+export {
   BADGE_LABEL_KEYS,
   BADGE_TRADEOFF_KEYS,
   BACKEND_FALLBACK_STRINGS,

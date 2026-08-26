@@ -17,7 +17,7 @@ import {
 } from "./model-manifest-v2.js";
 
 const KIBIBYTE_BYTES = 1_024;
-// Must match IDENTITY_COMPONENT `{0,63}` in server/src/intelligence/model-manifest-v2.ts.
+// Must match IDENTITY_COMPONENT `{0,63}` in model-manifest-v2.ts and OLLAMA_IDENTITY_COMPONENT_MAX_CHARS in immune-disk-verifier.ts.
 const OLLAMA_IDENTITY_COMPONENT_MAX_CHARS = 64;
 const RUNTIME_TAG_SEPARATORS = 2;
 const SHA256_BYTES = 32;
@@ -31,7 +31,7 @@ export const OLLAMA_RUNTIME_EVIDENCE_MAX_MODELS = 256;
 export const OLLAMA_RUNTIME_TAG_MAX_CHARS =
   3 * OLLAMA_IDENTITY_COMPONENT_MAX_CHARS + RUNTIME_TAG_SEPARATORS;
 export const OLLAMA_RUNTIME_EVIDENCE_DEFAULT_TIMEOUT_MS = 5_000;
-/** Design section 7.3 caps pending per-tuple single-flight entries at 32. */
+/** Design section 7.3 caps pending per-tuple single-flight entries at 32; must match IMMUNE_VERIFICATION_CACHE_MAX_ENTRIES in immune-disk-verifier.ts. */
 export const LIGHT_RUNTIME_SINGLE_FLIGHT_MAX_ENTRIES = 32;
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
