@@ -15,6 +15,7 @@ import { SURFACES } from "../../src/intelligence/types.js";
 import {
   resolveOllamaModelsRoot,
   runLocalIntelligenceSetup,
+  type RunLocalIntelligenceSetupDeps,
 } from "../../src/wrap/local-intelligence.js";
 import type { OllamaClient } from "../../src/intelligence/substrates/local.js";
 import { canonicalJson } from "../../src/v1/operator-signed.js";
@@ -23,7 +24,7 @@ const PRIVATE_KEY = new Uint8Array(32).fill(27);
 const PUBLIC_KEY = ed25519.getPublicKey(PRIVATE_KEY);
 const DIGEST = "1".repeat(64);
 
-function signedV2Fixture(): string {
+function signedV2Fixture(manifestVersion = 9): string {
   const modelId = "qwen2.5-1.5b";
   const defaults = Object.fromEntries(SURFACES.map((surface) => [
     surface,
@@ -31,7 +32,7 @@ function signedV2Fixture(): string {
   ]));
   const body: ModelManifestBodyV2 = {
     schema_version: 2,
-    manifest_version: 9,
+    manifest_version: manifestVersion,
     models: {
       [modelId]: {
         model_id: modelId,
@@ -171,14 +172,7 @@ describe("shared protect/init local-intelligence adapter", () => {
   it("completes the injected V2 fixture path through atomic state and provenance", async () => {
     const { storage, masterKey, auditLog, client } = fixture();
     const modelStore = new InMemoryModelProvenanceStore();
-    await expect(runLocalIntelligenceSetup({
-      storage,
-      masterKey,
-      auditLog,
-      identityId: "test-fortress",
-      isTty: true,
-      print: vi.fn(),
-    }, {
+    const deps = {
       client,
       loadManifest: async () => signedV2Fixture(),
       modelManifestV2PublicKey: PUBLIC_KEY,
@@ -186,24 +180,24 @@ describe("shared protect/init local-intelligence adapter", () => {
       resolveModelsRoot: async () => "/var/lib/ollama/models",
       probeHardware: async () => ({
         totalRamGb: 16,
-        cpuArch: "apple-silicon-m2",
-        tier: "baseline",
-        recommendedLocalModel: "gemma-2-2b",
+        cpuArch: "apple-silicon-m2" as const,
+        tier: "baseline" as const,
+        recommendedLocalModel: "gemma-2-2b" as const,
         ollamaReachable: true,
         ollamaModels: [],
       }),
       runtimeVerifier: {
         verify: async () => ({
-          ok: true,
-          state: "runtime_manifest_match",
+          ok: true as const,
+          state: "runtime_manifest_match" as const,
           runtimeTag: "qwen2.5:1.5b",
           observedManifestDigest: DIGEST,
         }),
       },
       immuneVerifier: {
         verify: async () => ({
-          ok: true,
-          state: "immune_verified",
+          ok: true as const,
+          state: "immune_verified" as const,
           runtimeTag: "qwen2.5:1.5b",
           expectedManifestDigest: DIGEST,
           descriptorCount: 2,
@@ -214,7 +208,15 @@ describe("shared protect/init local-intelligence adapter", () => {
         }),
       },
       confirm: vi.fn(),
-    })).resolves.toMatchObject({
+    } satisfies RunLocalIntelligenceSetupDeps;
+    await expect(runLocalIntelligenceSetup({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "test-fortress",
+      isTty: true,
+      print: vi.fn(),
+    }, deps)).resolves.toMatchObject({
       kind: "already-provisioned",
       provenanceProjection: "projected",
     });
@@ -232,9 +234,120 @@ describe("shared protect/init local-intelligence adapter", () => {
         localIntegrityState: { manifest_version_floor: 9 },
       },
     });
-    expect(modelStore.get("qwen2.5-1.5b")).toMatchObject({
+    const projected = modelStore.get("qwen2.5-1.5b")!;
+    expect(projected).toMatchObject({
       runtime_manifest_hash: `sha256:${DIGEST}`,
       load_integrity_assurance: "on-disk-all-layers",
+    });
+    modelStore.declare({
+      ...projected,
+      declared_at: "2000-01-01T00:00:00.000Z",
+      load_integrity_verified_at: "2000-01-01T00:00:00.000Z",
+    });
+    await expect(runLocalIntelligenceSetup({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "test-fortress-rerun",
+      isTty: true,
+      print: vi.fn(),
+    }, deps)).resolves.toMatchObject({ kind: "already-provisioned" });
+    const integrityEvents = await auditLog.query({
+      operation_type: INTEL_OPS.LOAD_INTEGRITY,
+    });
+    expect(integrityEvents.entries.filter(
+      (entry) => entry.details?.stage === "provenance_projection_recovery",
+    )).toHaveLength(0);
+  });
+
+  it("reloads durable authority inside the lock before a stale-view ceremony can regress the floor", async () => {
+    const { storage, masterKey, auditLog } = fixture();
+    let resumeStaleCeremony!: (manifest: string) => void;
+    const staleManifest = new Promise<string>((resolve) => {
+      resumeStaleCeremony = resolve;
+    });
+    let staleLoadCompleted!: () => void;
+    const staleLoad = new Promise<void>((resolve) => {
+      staleLoadCompleted = resolve;
+    });
+    const commonDeps = {
+      modelManifestV2PublicKey: PUBLIC_KEY,
+      resolveModelsRoot: async () => "/var/lib/ollama/models",
+      probeHardware: async () => ({
+        totalRamGb: 16,
+        cpuArch: "apple-silicon-m2" as const,
+        tier: "baseline" as const,
+        recommendedLocalModel: "gemma-2-2b" as const,
+        ollamaReachable: true,
+        ollamaModels: [],
+      }),
+      runtimeVerifier: {
+        verify: async () => ({
+          ok: true as const,
+          state: "runtime_manifest_match" as const,
+          runtimeTag: "qwen2.5:1.5b",
+          observedManifestDigest: DIGEST,
+        }),
+      },
+      immuneVerifier: {
+        verify: async () => ({
+          ok: true as const,
+          state: "immune_verified" as const,
+          runtimeTag: "qwen2.5:1.5b",
+          expectedManifestDigest: DIGEST,
+          descriptorCount: 2,
+          bytesHashed: 10,
+          verifiedArtifactDigests: ["2".repeat(64)],
+          completedAtMonotonicMs: 1,
+          cached: false,
+        }),
+      },
+      confirm: vi.fn(),
+    };
+    const staleCeremony = runLocalIntelligenceSetup({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "stale-floor-ceremony",
+      isTty: true,
+      print: vi.fn(),
+    }, {
+      ...commonDeps,
+      loadManifest: async () => {
+        staleLoadCompleted();
+        return staleManifest;
+      },
+    });
+
+    await staleLoad;
+    await expect(runLocalIntelligenceSetup({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "newer-floor-ceremony",
+      isTty: true,
+      print: vi.fn(),
+    }, {
+      ...commonDeps,
+      loadManifest: async () => signedV2Fixture(9),
+    })).resolves.toMatchObject({ kind: "already-provisioned" });
+
+    resumeStaleCeremony(signedV2Fixture(8));
+    await expect(staleCeremony).resolves.toEqual({
+      kind: "refused",
+      reason: "manifest_rollback",
+    });
+    const durable = await new IntelligenceConfigStore(
+      storage,
+      masterKey,
+      { modelManifestV2PublicKey: PUBLIC_KEY },
+    ).load();
+    expect(durable).toMatchObject({
+      kind: "loaded",
+      config: {
+        version: 2,
+        localIntegrityState: { manifest_version_floor: 9 },
+      },
     });
   });
 });

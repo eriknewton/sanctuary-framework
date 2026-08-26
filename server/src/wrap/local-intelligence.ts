@@ -9,6 +9,7 @@ import type { AuditLog } from "../operational/audit-log.js";
 import type { StorageBackend } from "../storage/interface.js";
 import {
   InMemoryModelProvenanceStore,
+  type ModelProvenance,
   type ModelProvenanceStore,
 } from "../operational/model-provenance.js";
 import {
@@ -28,6 +29,9 @@ import {
   type LocalProvisioningResult,
   type ProvenanceProjectionOutcome,
   type RuntimeLightVerifier,
+  type SubstrateChoice,
+  type SubstrateConfig,
+  type Surface,
 } from "../intelligence/index.js";
 import { INTELLIGENCE_NAMESPACE } from "../intelligence/policy-store.js";
 import { withCrossProcessLock, type CrossProcessLockOptions } from "../storage/cross-process-lock.js";
@@ -124,6 +128,38 @@ function errorCode(error: unknown): string | undefined {
     : undefined;
 }
 
+function provisioningChoices(
+  config: SubstrateConfig,
+): Readonly<Record<Surface, SubstrateChoice>> {
+  const configuredChoices = { ...config.perSurface };
+  // Invoke-time posture already pins this surface local. Provisioning uses
+  // the same effective choice without rewriting a tampered persisted choice.
+  if (isTier2PinViolation(
+    TIER2_PINNED_SURFACE,
+    configuredChoices[TIER2_PINNED_SURFACE],
+  )) {
+    configuredChoices[TIER2_PINNED_SURFACE] = "local";
+  }
+  return configuredChoices;
+}
+
+function timestampStableProvenance(provenance: ModelProvenance): unknown {
+  const {
+    declared_at: _declaredAt,
+    load_integrity_verified_at: _verifiedAt,
+    ...stable
+  } = provenance;
+  return stable;
+}
+
+function provenanceMatchesStableContent(
+  left: ModelProvenance,
+  right: ModelProvenance,
+): boolean {
+  return JSON.stringify(timestampStableProvenance(left)) ===
+    JSON.stringify(timestampStableProvenance(right));
+}
+
 /**
  * Production remains honestly inert while the signed asset/fetch path is
  * absent. Tests inject every side effect and exercise the complete ceremony.
@@ -143,15 +179,8 @@ export async function runLocalIntelligenceSetup(
   });
   await selector.load();
   const config = selector.getConfig();
-  const configuredChoices = { ...config.perSurface };
-  // Invoke-time posture already pins this surface local. Provisioning uses
-  // the same effective choice without rewriting a tampered persisted choice.
-  if (isTier2PinViolation(
-    TIER2_PINNED_SURFACE,
-    configuredChoices[TIER2_PINNED_SURFACE],
-  )) {
-    configuredChoices[TIER2_PINNED_SURFACE] = "local";
-  }
+  let authorityConfig = config;
+  const initialConfiguredChoices = provisioningChoices(config);
   const client = deps.client ?? new OllamaClient({
     endpoint: config.ollamaEndpoint ?? "http://localhost:11434",
   });
@@ -188,10 +217,19 @@ export async function runLocalIntelligenceSetup(
     platform: deps.platform ?? process.platform,
     preAnswered: input.preAnswered,
     manifestText,
-    configuredChoices,
-    ...(config.version === 2
-      ? { existingIntegrityState: config.localIntegrityState }
-      : {}),
+    initialConfiguredChoices,
+    // Must match `reloadLocalProvisioningAuthority` in selector.ts; this
+    // callback is invoked only from inside the provisioning lock.
+    reloadAuthority: async () => {
+      authorityConfig = await selector.reloadLocalProvisioningAuthority();
+      return {
+        configVersion: authorityConfig.version,
+        configuredChoices: provisioningChoices(authorityConfig),
+        ...(authorityConfig.version === 2
+          ? { existingIntegrityState: authorityConfig.localIntegrityState }
+          : {}),
+      };
+    },
     ...(deps.modelManifestV2PublicKey === undefined
       ? {}
       : {
@@ -226,13 +264,14 @@ export async function runLocalIntelligenceSetup(
       commit.runtimeTags,
     ),
     projectProvenance: async (projection) => {
-      let outcome: ProvenanceProjectionOutcome = config.version === 2
+      let outcome: ProvenanceProjectionOutcome = authorityConfig.version === 2
         ? "unchanged"
         : "projected";
       if (
-        config.version === 2 && projection.some((entry) => {
+        authorityConfig.version === 2 && projection.some((entry) => {
           const prior = modelStore.get(entry.model.model_id);
-          return prior === undefined || JSON.stringify(prior) !== JSON.stringify(entry.provenance);
+          return prior === undefined ||
+            !provenanceMatchesStableContent(prior, entry.provenance);
         })
       ) {
         outcome = "repaired";

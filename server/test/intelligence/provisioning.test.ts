@@ -14,6 +14,8 @@ import type {
   SignedModelManifestV2,
 } from "../../src/intelligence/model-manifest-v2.js";
 import type { HardwareCapabilityReport, Surface } from "../../src/intelligence/types.js";
+import { LocalIntegrityStateLoadError } from "../../src/intelligence/policy-store.js";
+import { CrossProcessLockError } from "../../src/storage/cross-process-lock.js";
 
 const HASH = "1".repeat(64);
 const ROOT = "/var/lib/ollama/models";
@@ -102,7 +104,11 @@ function makeOps(overrides: Partial<LocalProvisioningOps> = {}) {
     isTty: true,
     platform: "darwin",
     manifestText: "signed V2 fixture",
-    configuredChoices: { ...DEFAULT_PER_SURFACE },
+    initialConfiguredChoices: { ...DEFAULT_PER_SURFACE },
+    reloadAuthority: vi.fn(async () => ({
+      configVersion: 1 as const,
+      configuredChoices: { ...DEFAULT_PER_SURFACE },
+    })),
     verifyManifest: (_text, floor) =>
       floor !== undefined && BODY.manifest_version < floor
         ? { ok: false, reason: "rollback" }
@@ -264,13 +270,18 @@ describe("Q5D atomic local intelligence provisioning", () => {
     expect(ops.commitVerified).not.toHaveBeenCalled();
   });
 
-  it("save failure and crash-during-save publish neither tags, record, nor provenance", async () => {
+  it.each([
+    [new LocalIntegrityStateLoadError("manifest_rollback"), "manifest_rollback"],
+    [new LocalIntegrityStateLoadError("binding_mismatch"), "binding_mismatch"],
+    [new LocalIntegrityStateLoadError("integrity_state_invalid"), "integrity_state_invalid"],
+    [new Error("atomic rename failed"), "integrity_io_unavailable"],
+  ] as const)("surfaces authoritative commit refusal %s as %s", async (error, reason) => {
     const { ops } = makeOps({
-      commitVerified: vi.fn(async () => { throw new Error("atomic rename failed"); }),
+      commitVerified: vi.fn(async () => { throw error; }),
     });
     await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
       kind: "refused",
-      reason: "integrity_io_unavailable",
+      reason,
     });
     expect(ops.commitVerified).toHaveBeenCalledOnce();
     expect(ops.projectProvenance).not.toHaveBeenCalled();
@@ -303,7 +314,7 @@ describe("Q5D atomic local intelligence provisioning", () => {
     }));
   });
 
-  it("refuses a lower V2 input against the old floor without acquiring or saving", async () => {
+  it("reloads the floor under the lock before refusing a lower V2 input", async () => {
     const oldState = {
       manifest_version_floor: 10,
       ollama_models_root: ROOT,
@@ -315,14 +326,18 @@ describe("Q5D atomic local intelligence provisioning", () => {
         return operation();
       };
     const { ops } = makeOps({
-      existingIntegrityState: oldState,
+      reloadAuthority: vi.fn(async () => ({
+        configVersion: 2 as const,
+        configuredChoices: { ...DEFAULT_PER_SURFACE },
+        existingIntegrityState: oldState,
+      })),
       withProvisioningLock,
     });
     await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
       kind: "refused",
       reason: "manifest_rollback",
     });
-    expect(lockSpy).not.toHaveBeenCalled();
+    expect(lockSpy).toHaveBeenCalledOnce();
     expect(ops.commitVerified).not.toHaveBeenCalled();
     expect(ops.recordFailure).not.toHaveBeenCalled();
   });
@@ -333,7 +348,11 @@ describe("Q5D atomic local intelligence provisioning", () => {
       ollama_models_root: ROOT,
     } as LocalIntegrityStateV2;
     const { ops } = makeOps({
-      existingIntegrityState: oldState,
+      reloadAuthority: vi.fn(async () => ({
+        configVersion: 2 as const,
+        configuredChoices: { ...DEFAULT_PER_SURFACE },
+        existingIntegrityState: oldState,
+      })),
       verifyManifest: () => ({ ok: false, reason: "downgrade" }),
     });
     await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
@@ -352,7 +371,11 @@ describe("Q5D atomic local intelligence provisioning", () => {
     const resolveModelsRoot = vi.fn(async () => "/changed/by/environment");
     const runtimeVerifier = { verify: vi.fn(async () => runtimeSuccess()) };
     const { ops, commits } = makeOps({
-      existingIntegrityState,
+      reloadAuthority: vi.fn(async () => ({
+        configVersion: 2 as const,
+        configuredChoices: { ...DEFAULT_PER_SURFACE },
+        existingIntegrityState,
+      })),
       resolveModelsRoot,
       runtimeVerifier,
     });
@@ -365,8 +388,11 @@ describe("Q5D atomic local intelligence provisioning", () => {
   });
 
   it("a lock contender refuses before verify, pull, or authoritative mutation", async () => {
+    const lockError = new CrossProcessLockError(
+      "cross-process lock /fortress/_intelligence/.q5-provisioning.lock held; clear it manually",
+    );
     const { ops } = makeOps({
-      withProvisioningLock: vi.fn(async () => { throw new Error("held O_EXCL lock"); }),
+      withProvisioningLock: vi.fn(async () => { throw lockError; }),
     });
     await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
       kind: "refused",
@@ -376,6 +402,34 @@ describe("Q5D atomic local intelligence provisioning", () => {
     expect(ops.pull).not.toHaveBeenCalled();
     expect(ops.commitVerified).not.toHaveBeenCalled();
     expect(ops.recordFailure).not.toHaveBeenCalled();
+    expect(ops.print).toHaveBeenCalledWith(lockError.message);
+    expect(ops.audit).toHaveBeenCalledWith(expect.objectContaining({
+      details: {
+        reason: "integrity_io_unavailable",
+        affected_surfaces: LOCAL_SURFACES,
+      },
+    }));
+  });
+
+  it("records an honest failure when an unexpected crash follows a successful pull", async () => {
+    const runtimeVerifier = {
+      verify: vi.fn()
+        .mockResolvedValueOnce({
+          ok: false,
+          state: "tags_model_absent",
+          reason: "runtime_model_absent",
+          runtimeTag: "qwen2.5:1.5b",
+        })
+        .mockRejectedValueOnce(new Error("crash-after-pull")),
+    };
+    const { ops } = makeOps({ runtimeVerifier });
+    await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
+      kind: "refused",
+      reason: "integrity_io_unavailable",
+    });
+    expect(ops.pull).toHaveBeenCalledOnce();
+    expect(ops.commitVerified).not.toHaveBeenCalled();
+    expect(ops.recordFailure).toHaveBeenCalledOnce();
   });
 
   it("keeps production-null and non-TTY paths inert before root or registry inspection", async () => {

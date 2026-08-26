@@ -98,6 +98,7 @@ export type ImmuneVerificationRefusalReason =
 
 export type ImmuneVerificationCheckpoint =
   | "selector_load"
+  | "provisioning"
   | "first_invocation"
   | "cadence";
 

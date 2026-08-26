@@ -340,6 +340,25 @@ export class SubstrateSelector {
   }
 
   /**
+   * Re-read the durable config for a provisioning ceremony that already owns
+   * the cross-process lock. This intentionally bypasses the loaded snapshot.
+   * Must match the `reloadAuthority` adapter in `wrap/local-intelligence.ts`.
+   */
+  async reloadLocalProvisioningAuthority(): Promise<SubstrateConfig> {
+    const config = await this.store.loadAuthoritative() ?? buildDefaultConfig();
+    this.config = config;
+    this.recentFailures.clear();
+    for (const surface of SURFACES) {
+      const persisted = config.provisioningFailures?.[surface] ?? [];
+      if (persisted.length > 0) {
+        this.recentFailures.set(surface, persisted.slice(-RECENT_FAILURES_CAP));
+      }
+    }
+    this.loaded = true;
+    return config;
+  }
+
+  /**
    * Operator picked (or re-picked) a substrate for a surface. Persists the
    * change and emits `intelligence_substrate_chosen`. The picker modal
    * surfaces the tradeoff text BEFORE invoking this method; the audit
@@ -691,37 +710,6 @@ export class SubstrateSelector {
   }
 
   /**
-   * Commit verified runtime tags only after the provisioning digest gate has
-   * passed for every referenced model. This mutates model bindings only; the
-   * operator's per-surface substrate choices remain byte-for-byte unchanged.
-   */
-  async markLocalModelsProvisioned(
-    runtimeTags: Readonly<Partial<Record<Surface, string>>>,
-  ): Promise<void> {
-    await this.ensureLoaded();
-    const customLocalModelTags = { ...(this.config.customLocalModelTags ?? {}) };
-    const provisioningFailures = { ...(this.config.provisioningFailures ?? {}) };
-    for (const surface of SURFACES) {
-      const runtimeTag = runtimeTags[surface];
-      if (runtimeTag === undefined) continue;
-      // The digest gate may bind only surfaces whose effective substrate is
-      // already local; verification never grants authority to change choice.
-      if (this.effectiveChoice(surface) !== "local") continue;
-      customLocalModelTags[surface] = runtimeTag;
-      delete provisioningFailures[surface];
-    }
-    const next: SubstrateConfig = {
-      ...this.config,
-      customLocalModelTags,
-      provisioningFailures,
-    };
-    await this.persistNext(next);
-    for (const surface of Object.keys(runtimeTags) as Surface[]) {
-      this.recentFailures.delete(surface);
-    }
-  }
-
-  /**
    * Commit runtime tags, cleared failures, and the complete Q5 record in one
    * encrypted config write. The in-process view changes only after save wins,
    * so a thrown/failed save leaves both memory and durable authority old.
@@ -736,7 +724,7 @@ export class SubstrateSelector {
       integrityState.manifest_version_floor <
         this.config.localIntegrityState.manifest_version_floor
     ) {
-      throw new LocalIntegrityStateLoadError("rollback");
+      throw new LocalIntegrityStateLoadError("manifest_rollback");
     }
     const customLocalModelTags = { ...(this.config.customLocalModelTags ?? {}) };
     const provisioningFailures = { ...(this.config.provisioningFailures ?? {}) };

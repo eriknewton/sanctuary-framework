@@ -26,7 +26,10 @@
  * `LocalIntegrityStateV2`; a partial V2 is never salvaged as legacy.
  */
 
-import type { StorageBackend } from "../storage/interface.js";
+import type {
+  FilesystemStorageCapabilities,
+  StorageBackend,
+} from "../storage/interface.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { stringToBytes, bytesToString } from "../core/encoding.js";
@@ -61,12 +64,20 @@ export type LoadOutcome =
   | {
     kind: "integrity-state-invalid";
     reason: ModelManifestV2RefusalReason;
+    /**
+     * Convenience defaults only, never a reinterpretation of the invalid
+     * durable V2 record as legacy-unarmed authority. Callers must branch on
+     * `kind` before consuming this field; security-sensitive reads use
+     * `loadAuthoritative()` and throw instead.
+     */
     config: SubstrateConfig;
   }
   | { kind: "corrupt"; config: SubstrateConfig };
 
 export class LocalIntegrityStateLoadError extends Error {
-  constructor(readonly reason: ModelManifestV2RefusalReason) {
+  constructor(
+    readonly reason: ModelManifestV2RefusalReason | "manifest_rollback",
+  ) {
     super(`Q5 integrity state refused: ${reason}`);
     this.name = "LocalIntegrityStateLoadError";
   }
@@ -141,6 +152,26 @@ export class IntelligenceConfigStore {
       return { kind: "default", config: buildDefaultConfig() };
     }
 
+    return this.decode(raw);
+  }
+
+  /**
+   * Read the durable config as security authority rather than as a boot-time
+   * convenience. Missing is represented by null; unreadable or invalid state
+   * throws so a writer can never reinterpret indeterminate bytes as legacy V1.
+   */
+  async loadAuthoritative(): Promise<SubstrateConfig | null> {
+    const raw = await this.storage.read(INTELLIGENCE_NAMESPACE, SUBSTRATE_CONFIG_KEY);
+    if (raw === null) return null;
+    const outcome = this.decode(raw);
+    if (outcome.kind === "loaded") return outcome.config;
+    if (outcome.kind === "integrity-state-invalid") {
+      throw new LocalIntegrityStateLoadError(outcome.reason);
+    }
+    throw new LocalIntegrityStateLoadError("integrity_state_invalid");
+  }
+
+  private decode(raw: Uint8Array): LoadOutcome {
     let parsedValue: unknown;
     try {
       const encrypted = parseStrictJson(bytesToString(raw)) as EncryptedPayload;
@@ -212,6 +243,20 @@ export class IntelligenceConfigStore {
       ...config,
       updatedAt: new Date().toISOString(),
     };
+    const durable = await this.loadAuthoritative();
+    if (durable?.version === 2) {
+      // INVARIANT: the durable record, not any in-memory snapshot, is the
+      // rollback authority; every config writer converges on this chokepoint.
+      if (stamped.version !== 2) {
+        throw new LocalIntegrityStateLoadError("integrity_state_invalid");
+      }
+      if (
+        stamped.localIntegrityState.manifest_version_floor <
+          durable.localIntegrityState.manifest_version_floor
+      ) {
+        throw new LocalIntegrityStateLoadError("manifest_rollback");
+      }
+    }
     if (stamped.version === 2) {
       if (this.modelManifestV2PublicKey === null) {
         throw new LocalIntegrityStateLoadError("integrity_state_invalid");
@@ -227,10 +272,16 @@ export class IntelligenceConfigStore {
     }
     const serialized = stringToBytes(JSON.stringify(stamped));
     const encrypted = encrypt(serialized, this.encryptionKey);
-    await this.storage.write(
+    const durableWrite = (
+      this.storage as Partial<FilesystemStorageCapabilities>
+    ).writeDurable;
+    // A reported authoritative save must survive the power-loss window after
+    // rename; non-filesystem single-process backends retain the base contract.
+    await (durableWrite === undefined ? this.storage.write : durableWrite).call(
+      this.storage,
       INTELLIGENCE_NAMESPACE,
       SUBSTRATE_CONFIG_KEY,
-      stringToBytes(JSON.stringify(encrypted))
+      stringToBytes(JSON.stringify(encrypted)),
     );
     return stamped;
   }
@@ -243,12 +294,11 @@ export class IntelligenceConfigStore {
     const current = await this.load();
     // Deleting an armed or unreadable record could silently manufacture
     // legacy-unarmed state; Q5 has no reviewed disarm/reset ceremony.
-    if (current.kind === "integrity-state-invalid" || current.config.version === 2) {
-      throw new LocalIntegrityStateLoadError(
-        current.kind === "integrity-state-invalid"
-          ? current.reason
-          : "integrity_state_invalid",
-      );
+    if (current.kind === "integrity-state-invalid") {
+      throw new LocalIntegrityStateLoadError(current.reason);
+    }
+    if (current.config.version === 2) {
+      throw new LocalIntegrityStateLoadError("integrity_state_invalid");
     }
     try {
       await this.storage.delete(INTELLIGENCE_NAMESPACE, SUBSTRATE_CONFIG_KEY);

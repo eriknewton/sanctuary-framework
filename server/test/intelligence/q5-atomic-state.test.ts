@@ -112,7 +112,9 @@ function binding(surface: Surface, manifestVersion = 9): VerifiedLocalBindingV2 
 function integrityState(manifestBody = body()): LocalIntegrityStateV2 {
   const bindings = Object.create(null) as Partial<Record<Surface, VerifiedLocalBindingV2>>;
   for (const surface of SURFACES) {
-    if (surface !== "gate-explanation") bindings[surface] = binding(surface);
+    if (surface !== "gate-explanation") {
+      bindings[surface] = binding(surface, manifestBody.manifest_version);
+    }
   }
   return {
     state: "armed",
@@ -343,6 +345,76 @@ describe("Q5D persisted atomic state", () => {
     await expect(selector.resetToDefaults()).resolves.toBeUndefined();
     expect(selector.getConfig().version).toBe(2);
     expect(selector.getConfig().localIntegrityState).toEqual(state);
+  });
+
+  it("refuses a stale routine selector write from replacing durable armed V2 with V1", async () => {
+    const { storage, masterKey, auditLog, selector: staleWriter } = selectorFixture();
+    await staleWriter.load();
+    expect(staleWriter.getConfig().version).toBe(1);
+
+    const armingWriter = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "q5-arming-writer",
+      modelManifestV2PublicKey: PUBLIC_KEY,
+    });
+    await armingWriter.load();
+    const state = integrityState(body(9));
+    await armingWriter.commitLocalIntegrityProvisioning(state, runtimeTags(state));
+
+    await expect(staleWriter.setFallbackBehavior(
+      "concierge",
+      "disable-surface",
+    )).rejects.toMatchObject({ reason: "integrity_state_invalid" });
+    const durable = await new IntelligenceConfigStore(
+      storage,
+      masterKey,
+      { modelManifestV2PublicKey: PUBLIC_KEY },
+    ).load();
+    expect(durable).toMatchObject({
+      kind: "loaded",
+      config: {
+        version: 2,
+        localIntegrityState: { manifest_version_floor: 9 },
+      },
+    });
+  });
+
+  it("uses the durable V2 floor at save even when a provisioning selector holds stale V1", async () => {
+    const { storage, masterKey, auditLog, selector: staleProvisioner } = selectorFixture();
+    await staleProvisioner.load();
+    const newerProvisioner = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "q5-newer-provisioner",
+      modelManifestV2PublicKey: PUBLIC_KEY,
+    });
+    await newerProvisioner.load();
+    const floorNine = integrityState(body(9));
+    await newerProvisioner.commitLocalIntegrityProvisioning(
+      floorNine,
+      runtimeTags(floorNine),
+    );
+
+    const staleFloorEight = integrityState(body(8));
+    await expect(staleProvisioner.commitLocalIntegrityProvisioning(
+      staleFloorEight,
+      runtimeTags(staleFloorEight),
+    )).rejects.toMatchObject({ reason: "manifest_rollback" });
+    const durable = await new IntelligenceConfigStore(
+      storage,
+      masterKey,
+      { modelManifestV2PublicKey: PUBLIC_KEY },
+    ).load();
+    expect(durable).toMatchObject({
+      kind: "loaded",
+      config: {
+        version: 2,
+        localIntegrityState: { manifest_version_floor: 9 },
+      },
+    });
   });
 });
 

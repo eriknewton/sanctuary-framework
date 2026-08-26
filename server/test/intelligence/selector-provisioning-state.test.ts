@@ -43,19 +43,4 @@ describe("selector provisioning state", () => {
     expect(concierge?.recentFailures.at(-1)?.snippet).toBe("signed manifest unavailable");
     expect(reloaded.getConfig().perSurface.concierge).toBe("local");
   });
-
-  it("commits verified tags without changing choices and clears refusal state", async () => {
-    const { selector } = buildSelector();
-    await selector.load();
-    await selector.recordLocalProvisioningFailure(
-      ["concierge"],
-      "substrate_misconfigured",
-      "digest mismatch",
-    );
-    const choicesBefore = { ...selector.getConfig().perSurface };
-    await selector.markLocalModelsProvisioned({ concierge: "qwen2.5:1.5b" });
-    expect(selector.getConfig().customLocalModelTags?.concierge).toBe("qwen2.5:1.5b");
-    expect(selector.getConfig().provisioningFailures?.concierge).toBeUndefined();
-    expect(selector.getConfig().perSurface).toEqual(choicesBefore);
-  });
 });

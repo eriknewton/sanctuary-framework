@@ -37,6 +37,8 @@ import { SURFACES } from "./types.js";
 import type { ModelProvenance } from "../operational/model-provenance.js";
 import type { OllamaMutationResult } from "./substrates/local.js";
 import { localProvisioningPreflightRefusal } from "./provisioning-consent.js";
+import { LocalIntegrityStateLoadError } from "./policy-store.js";
+import { CrossProcessLockError } from "../storage/cross-process-lock.js";
 
 export const MODEL_REGISTRY_PROVIDER_CATEGORY = "model-registry" as const;
 export const Q5_PROVISIONING_LOCK_FILE = ".q5-provisioning.lock";
@@ -111,8 +113,17 @@ export interface LocalProvisioningOps {
   /** false is an explicit decline; true still cannot bypass the TTY confirm. */
   preAnswered?: boolean;
   manifestText: string | null;
-  configuredChoices: Readonly<Record<Surface, SubstrateChoice>>;
-  existingIntegrityState?: LocalIntegrityStateV2;
+  /** Pre-lock snapshot used only to describe an early consent refusal. */
+  initialConfiguredChoices: Readonly<Record<Surface, SubstrateChoice>>;
+  /**
+   * Must execute inside `withProvisioningLock` and return the durable config
+   * view that verification, root selection, and commit construction consume.
+   */
+  reloadAuthority: () => Promise<{
+    configVersion: 1 | 2;
+    configuredChoices: Readonly<Record<Surface, SubstrateChoice>>;
+    existingIntegrityState?: LocalIntegrityStateV2;
+  }>;
   verifyManifest?: (
     text: string | null,
     manifestVersionFloor?: number,
@@ -173,7 +184,7 @@ const FAILURE_COPY: Record<LocalProvisioningRefusalReason, string> = {
   layer_size_mismatch: "An authenticated model artifact size mismatched; no Q5 state was committed.",
   layer_digest_mismatch: "An authenticated model artifact digest mismatched; no Q5 state was committed.",
   unstable_file: "A model artifact changed while being verified; no Q5 state was committed.",
-  integrity_io_unavailable: "Integrity I/O or authoritative state save is unavailable; old state was retained.",
+  integrity_io_unavailable: "Integrity I/O or authoritative state save is unavailable; durable state may have advanced, so inspect it before retrying.",
   immune_platform_unsupported: "This platform cannot provide reviewed immune verification; no Q5 state was committed.",
 };
 
@@ -289,7 +300,7 @@ async function verifyEveryModel(
       const disk = await ops.immuneVerifier.verify({
         rootReal,
         binding: immuneBinding,
-        checkpoint: "selector_load",
+        checkpoint: "provisioning",
       });
       if (!disk.ok) return { ok: false, reason: disk.reason };
       immune = disk;
@@ -377,56 +388,63 @@ function buildAtomicCommit(
 export async function runLocalIntelligenceProvisioning(
   ops: LocalProvisioningOps,
 ): Promise<LocalProvisioningResult> {
-  const localSurfaces = SURFACES.filter(
-    (surface) => ops.configuredChoices[surface] === "local",
+  let affectedSurfaces = SURFACES.filter(
+    (surface) => ops.initialConfiguredChoices[surface] === "local",
   );
   const preflightRefusal = localProvisioningPreflightRefusal(ops.isTty, ops.preAnswered);
   if (preflightRefusal !== null) {
     return refuse(
       ops,
-      localSurfaces,
+      affectedSurfaces,
       preflightRefusal,
       preflightRefusal === "non_tty" ? "substrate_unavailable" : "substrate_misconfigured",
     );
   }
 
-  const floor = ops.existingIntegrityState?.manifest_version_floor;
-  const verifyManifest = ops.verifyManifest ?? defaultVerifyManifest;
-  const verified = verifyManifest(ops.manifestText, floor);
-  if (!verified.ok) {
-    const reason = manifestRefusal(verified);
-    return refuse(ops, localSurfaces, reason, "substrate_misconfigured", {
-      recordFailure: reason !== "manifest_rollback",
-    });
-  }
-
-  const hardware = await ops.probeHardware();
-  if (hardware.tier === "below-baseline") {
-    return refuse(ops, localSurfaces, "below_baseline", "substrate_unavailable");
-  }
-  const models = requiredModels(verified.body, hardware.tier, localSurfaces);
-  if (models === null || models.size === 0) {
-    return refuse(ops, localSurfaces, "binding_mismatch", "substrate_misconfigured");
-  }
-
-  let rootReal: string;
-  try {
-    // Once armed, the persisted root remains authoritative even if the process
-    // environment changes between provisioning runs.
-    rootReal = ops.existingIntegrityState?.ollama_models_root ??
-      await ops.resolveModelsRoot();
-  } catch (error) {
-    const reason = error instanceof LocalModelsRootResolutionError
-      ? error.reason
-      : "integrity_io_unavailable";
-    return refuse(ops, localSurfaces, reason, "substrate_misconfigured");
-  }
-  if (!isAbsolute(rootReal)) {
-    return refuse(ops, localSurfaces, "model_root_invalid", "substrate_misconfigured");
-  }
-
   try {
     return await ops.withProvisioningLock(async () => {
+      // Must match `reloadLocalProvisioningAuthority` in selector.ts: the
+      // authority read and every verification/mutation stay under one lock.
+      const authority = await ops.reloadAuthority();
+      const localSurfaces = SURFACES.filter(
+        (surface) => authority.configuredChoices[surface] === "local",
+      );
+      affectedSurfaces = localSurfaces;
+      const floor = authority.existingIntegrityState?.manifest_version_floor;
+      const verifyManifest = ops.verifyManifest ?? defaultVerifyManifest;
+      const verified = verifyManifest(ops.manifestText, floor);
+      if (!verified.ok) {
+        const reason = manifestRefusal(verified);
+        return refuse(ops, localSurfaces, reason, "substrate_misconfigured", {
+          recordFailure: reason !== "manifest_rollback",
+        });
+      }
+
+      const hardware = await ops.probeHardware();
+      if (hardware.tier === "below-baseline") {
+        return refuse(ops, localSurfaces, "below_baseline", "substrate_unavailable");
+      }
+      const models = requiredModels(verified.body, hardware.tier, localSurfaces);
+      if (models === null || models.size === 0) {
+        return refuse(ops, localSurfaces, "binding_mismatch", "substrate_misconfigured");
+      }
+
+      let rootReal: string;
+      try {
+        // Once armed, the just-reloaded durable root remains authoritative even
+        // if the process environment changed before this lock was acquired.
+        rootReal = authority.existingIntegrityState?.ollama_models_root ??
+          await ops.resolveModelsRoot();
+      } catch (error) {
+        const reason = error instanceof LocalModelsRootResolutionError
+          ? error.reason
+          : "integrity_io_unavailable";
+        return refuse(ops, localSurfaces, reason, "substrate_misconfigured");
+      }
+      if (!isAbsolute(rootReal)) {
+        return refuse(ops, localSurfaces, "model_root_invalid", "substrate_misconfigured");
+      }
+
       let sweep = await verifyEveryModel(
         ops,
         models,
@@ -508,12 +526,12 @@ export async function runLocalIntelligenceProvisioning(
       );
       try {
         await ops.commitVerified(commit);
-      } catch {
+      } catch (error) {
         // A second config mutation here would destroy save-failure preservation.
         return refuse(
           ops,
           localSurfaces,
-          "integrity_io_unavailable",
+          commitRefusalReason(error),
           "substrate_misconfigured",
           { recordFailure: false },
         );
@@ -570,15 +588,51 @@ export async function runLocalIntelligenceProvisioning(
         provenanceProjection,
       };
     });
-  } catch {
-    // A contended/failed O_EXCL acquire refuses before pull or config mutation.
+  } catch (error) {
+    if (error instanceof CrossProcessLockError) {
+      // The operator channel may name the lockfile and its manual-removal path;
+      // audit fields remain on the closed reason taxonomy below.
+      ops.print(error.message);
+      return refuse(
+        ops,
+        affectedSurfaces,
+        "integrity_io_unavailable",
+        "substrate_unavailable",
+        { recordFailure: false },
+      );
+    }
+    if (error instanceof LocalIntegrityStateLoadError) {
+      return refuse(
+        ops,
+        affectedSurfaces,
+        commitRefusalReason(error),
+        "substrate_misconfigured",
+        { recordFailure: false },
+      );
+    }
+    // The critical section may already have pulled or even committed before an
+    // unexpected crash; persist a bounded failure instead of claiming no change.
     return refuse(
       ops,
-      localSurfaces,
+      affectedSurfaces,
       "integrity_io_unavailable",
       "substrate_unavailable",
-      { recordFailure: false },
     );
+  }
+}
+
+function commitRefusalReason(error: unknown): LocalProvisioningRefusalReason {
+  if (!(error instanceof LocalIntegrityStateLoadError)) {
+    return "integrity_io_unavailable";
+  }
+  switch (error.reason) {
+    case "manifest_rollback":
+    case "integrity_state_invalid":
+    case "binding_mismatch":
+    case "model_root_invalid":
+      return error.reason;
+    default:
+      return manifestRefusal({ ok: false, reason: error.reason });
   }
 }
 
