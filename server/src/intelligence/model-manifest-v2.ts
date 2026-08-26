@@ -53,6 +53,32 @@ export const IMMUNE_MODEL_LOAD_SURFACES = [
   "privacy-filter-tier-2",
 ] as const satisfies readonly Surface[];
 
+/** Design section 9.1 is a closed audit/status reason taxonomy. */
+export const MODEL_LOAD_INTEGRITY_FAILURE_REASONS = [
+  "integrity_state_absent",
+  "integrity_state_invalid",
+  "manifest_signature_invalid",
+  "manifest_rollback",
+  "binding_mismatch",
+  "runtime_model_absent",
+  "runtime_manifest_digest_invalid",
+  "runtime_manifest_digest_mismatch",
+  "model_root_invalid",
+  "path_escape",
+  "symlink_refused",
+  "disk_manifest_invalid",
+  "disk_manifest_digest_mismatch",
+  "descriptor_bounds_exceeded",
+  "layer_missing",
+  "layer_size_mismatch",
+  "layer_digest_mismatch",
+  "unstable_file",
+  "integrity_io_unavailable",
+  "immune_platform_unsupported",
+] as const;
+export type ModelLoadIntegrityFailureReason =
+  (typeof MODEL_LOAD_INTEGRITY_FAILURE_REASONS)[number];
+
 const IMMUNE_SURFACE_SET = new Set<Surface>(IMMUNE_MODEL_LOAD_SURFACES);
 // The `{0,63}` bound must match OLLAMA_IDENTITY_COMPONENT_MAX_CHARS in runtime-light-verifier.ts and immune-disk-verifier.ts.
 const IDENTITY_COMPONENT = /^[a-z0-9][a-z0-9._-]{0,63}$/;

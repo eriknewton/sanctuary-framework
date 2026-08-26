@@ -120,7 +120,6 @@ export interface LocalProvisioningOps {
    * view that verification, root selection, and commit construction consume.
    */
   reloadAuthority: () => Promise<{
-    configVersion: 1 | 2;
     configuredChoices: Readonly<Record<Surface, SubstrateChoice>>;
     existingIntegrityState?: LocalIntegrityStateV2;
   }>;
@@ -625,15 +624,7 @@ function commitRefusalReason(error: unknown): LocalProvisioningRefusalReason {
   if (!(error instanceof LocalIntegrityStateLoadError)) {
     return "integrity_io_unavailable";
   }
-  switch (error.reason) {
-    case "manifest_rollback":
-    case "integrity_state_invalid":
-    case "binding_mismatch":
-    case "model_root_invalid":
-      return error.reason;
-    default:
-      return manifestRefusal({ ok: false, reason: error.reason });
-  }
+  return error.reason;
 }
 
 export function renderLocalProvisioningPlan(input: {
