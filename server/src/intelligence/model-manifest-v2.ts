@@ -54,7 +54,7 @@ export const IMMUNE_MODEL_LOAD_SURFACES = [
 ] as const satisfies readonly Surface[];
 
 const IMMUNE_SURFACE_SET = new Set<Surface>(IMMUNE_MODEL_LOAD_SURFACES);
-// The `{0,63}` bound must match OLLAMA_IDENTITY_COMPONENT_MAX_CHARS in server/src/intelligence/runtime-light-verifier.ts.
+// The `{0,63}` bound must match OLLAMA_IDENTITY_COMPONENT_MAX_CHARS in runtime-light-verifier.ts and immune-disk-verifier.ts.
 const IDENTITY_COMPONENT = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const MODEL_ID = /^[a-z0-9][a-z0-9._-]{0,255}$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
