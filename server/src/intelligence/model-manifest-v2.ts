@@ -623,11 +623,19 @@ function parseBinding(
   const runtimeTag = boundedString(value.runtime_tag);
   const identity = parseOllamaIdentity(value.ollama_identity);
   const expectedModel = modelId === null ? undefined : body.models[modelId];
+  const modelIsDerivedForSurface = modelId !== null &&
+    MODEL_MANIFEST_TIERS.some((tier) =>
+      body.tiers[tier].includes(modelId) &&
+      body.surface_defaults[tier][surface] === modelId
+    );
   const expectedAssurance: ModelLoadIntegrityAssurance = IMMUNE_SURFACE_SET.has(surface)
     ? "immune"
     : "light";
   if (
     modelId === null || runtimeTag === null || !identity.ok || expectedModel === undefined ||
+    // A signed model existing somewhere in the catalog is not authority for
+    // another surface; rederive the surface/model edge on every state load.
+    !modelIsDerivedForSurface ||
     value.assurance !== expectedAssurance ||
     value.manifest_version !== body.manifest_version ||
     runtimeTag !== deriveOllamaRuntimeTag(expectedModel.ollama_identity) ||

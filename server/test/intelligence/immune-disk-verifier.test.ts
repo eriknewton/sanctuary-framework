@@ -416,6 +416,33 @@ describe("Q5C descriptor-based on-disk verification", () => {
     expectReason(await verifier(fs).verify(store.request), "integrity_io_unavailable");
   });
 
+  it.each([
+    ["ENOENT", "model_root_invalid"],
+    ["ENOTDIR", "model_root_invalid"],
+    ["EIO", "integrity_io_unavailable"],
+    ["EACCES", "integrity_io_unavailable"],
+  ] as const)(
+    "maps root re-lstat %s to %s after initial root validation",
+    async (errno, reason) => {
+      const store = await fixture();
+      const base = createNodeImmuneFileSystemAdapter();
+      let rootLstatCalls = 0;
+      const fs = wrapFs(base, {
+        async lstat(path) {
+          if (path === store.root) {
+            rootLstatCalls += 1;
+            // state_ROOT performs two successful checks; this is the
+            // state_PATH_COMPONENTS root re-lstat named by the residual.
+            if (rootLstatCalls === 3) throw fsError(errno);
+          }
+          return base.lstat(path);
+        },
+      });
+      expectReason(await verifier(fs).verify(store.request), reason);
+      expect(rootLstatCalls).toBe(3);
+    },
+  );
+
   it("refuses a light binding before any disk read", async () => {
     const store = await fixture();
     const base = createNodeImmuneFileSystemAdapter();
@@ -655,6 +682,26 @@ describe("Q5C descriptor-based on-disk verification", () => {
       },
     });
     expectReason(await verifier(fs).verify(store.request), "layer_digest_mismatch");
+  });
+
+  it("refuses a clean verification when its successful descriptor close fails", async () => {
+    const store = await fixture();
+    const target = store.blobPaths.get(digest(LAYER_A_BYTES))!;
+    const base = createNodeImmuneFileSystemAdapter();
+    const fs = wrapFs(base, {
+      async open(path, flags) {
+        const handle = await base.open(path, flags);
+        if (path !== target) return handle;
+        return {
+          ...handle,
+          async close() {
+            await handle.close();
+            throw fsError("EIO");
+          },
+        } satisfies ImmuneFileHandle;
+      },
+    });
+    expectReason(await verifier(fs).verify(store.request), "integrity_io_unavailable");
   });
 });
 

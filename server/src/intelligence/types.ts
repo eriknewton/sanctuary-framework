@@ -28,6 +28,8 @@
  *   - template-suggestion:             same as concierge by default
  */
 
+import type { LocalIntegrityStateV2 } from "./model-manifest-v2.js";
+
 /**
  * The set of intelligence-layer surfaces the selector routes for.
  *
@@ -230,13 +232,11 @@ export interface FrontierProviderConfig {
  * Operator-overridable substrate config. Persisted encrypted under the
  * fortress master key in storage namespace `_intelligence`.
  *
- * v1.0 of this shape (`version: 1`) is the only shape this PR ships. Future
- * v1.x extensions (per-query sensitivity classifier, MLX runtime pick,
- * per-patron substrate scoping) MUST bump this version and provide a
- * forward-compat migration in the selector.
+ * Version 1 is legacy-unarmed. Q5D creates version 2 only as part of the
+ * injected signed-V2 provisioning commit, so ordinary production loads do
+ * not silently arm or migrate legacy fortresses without a live catalog.
  */
-export interface SubstrateConfig {
-  version: 1;
+interface SubstrateConfigFields {
   /** Operator's per-surface choice. Defaults from position paper §5. */
   perSurface: Record<Surface, SubstrateChoice>;
   /** Operator's local-model picks per surface, when 'local' is chosen. */
@@ -271,6 +271,20 @@ export interface SubstrateConfig {
   /** ISO8601 timestamp of last operator change. */
   updatedAt: string;
 }
+
+export interface SubstrateConfigV1 extends SubstrateConfigFields {
+  version: 1;
+  /** A V1 config is unarmed by construction; V1 can never carry Q5 authority. */
+  localIntegrityState?: never;
+}
+
+export interface SubstrateConfigV2 extends SubstrateConfigFields {
+  version: 2;
+  /** The complete Q5 record is mandatory so a stripped V2 cannot read as legacy. */
+  localIntegrityState: LocalIntegrityStateV2;
+}
+
+export type SubstrateConfig = SubstrateConfigV1 | SubstrateConfigV2;
 
 /**
  * Per-surface invocation request shape. Surfaces share the request envelope

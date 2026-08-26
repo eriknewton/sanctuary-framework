@@ -21,7 +21,9 @@ export {
 export {
   IntelligenceConfigStore,
   INTELLIGENCE_NAMESPACE,
+  LocalIntegrityStateLoadError,
   SUBSTRATE_CONFIG_KEY,
+  type IntelligenceConfigStoreOptions,
   type LoadOutcome,
 } from "./policy-store.js";
 
@@ -177,6 +179,8 @@ export type {
   SubstrateCapability,
   SubstrateChoice,
   SubstrateConfig,
+  SubstrateConfigV1,
+  SubstrateConfigV2,
   SubstrateFailureClass,
   SubstrateHandle,
   SubstrateInvocation,
@@ -210,13 +214,17 @@ export {
 
 export {
   MODEL_REGISTRY_PROVIDER_CATEGORY,
+  LocalModelsRootResolutionError,
+  Q5_PROVISIONING_LOCK_FILE,
   renderLocalProvisioningPlan,
   runLocalIntelligenceProvisioning,
+  type AtomicLocalProvisioningCommit,
   type LocalProvisioningAuditEvent,
   type LocalProvisioningOps,
   type LocalProvisioningRefusalReason,
   type LocalProvisioningResult,
-  type VerifiedProvisioningCommit,
+  type ProvenanceProjectionOutcome,
+  type VerifiedProvisioningProjection,
 } from "./provisioning.js";
 
 export {
