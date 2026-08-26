@@ -10,6 +10,11 @@
  *   - clear() removes the record and subsequent load returns defaults
  */
 
+// fail-before-exempt: hosted-CI fixture correction replaces a root-anchored fake lock path with an isolated temp directory; it intentionally changes no production behavior.
+
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it, expect, vi } from "vitest";
 import {
   IntelligenceConfigStore,
@@ -72,6 +77,7 @@ describe("Intelligence Substrate Config Store", () => {
 
   it("uses the durable storage primitive for the authoritative config when available", async () => {
     const base = new MemoryStorage();
+    const root = await mkdtemp(join(tmpdir(), "sanctuary-policy-store-"));
     const write = vi.fn((...args: Parameters<MemoryStorage["write"]>) =>
       base.write(...args));
     const writeDurable = vi.fn((...args: Parameters<MemoryStorage["write"]>) =>
@@ -85,14 +91,17 @@ describe("Intelligence Substrate Config Store", () => {
       exists: (...args: Parameters<MemoryStorage["exists"]>) => base.exists(...args),
       totalSize: () => base.totalSize(),
       listNamespaces: () => base.listNamespaces(),
-      namespacePath: () => "/in-memory-fixture",
+      namespacePath: (namespace: string) => join(root, namespace),
     };
     const store = new IntelligenceConfigStore(storage, generateRandomKey());
+    try {
+      await store.save(buildDefaultConfig());
 
-    await store.save(buildDefaultConfig());
-
-    expect(writeDurable).toHaveBeenCalledOnce();
-    expect(write).not.toHaveBeenCalled();
+      expect(writeDurable).toHaveBeenCalledOnce();
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("on-disk payload is encrypted (no plaintext API key on disk)", async () => {

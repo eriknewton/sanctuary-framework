@@ -223,7 +223,6 @@ export async function runLocalIntelligenceSetup(
     reloadAuthority: async () => {
       authorityConfig = await selector.reloadLocalProvisioningAuthority();
       return {
-        configVersion: authorityConfig.version,
         configuredChoices: provisioningChoices(authorityConfig),
         ...(authorityConfig.version === 2
           ? { existingIntegrityState: authorityConfig.localIntegrityState }
@@ -249,7 +248,9 @@ export async function runLocalIntelligenceSetup(
       input.storage,
       INTELLIGENCE_NAMESPACE,
       Q5_PROVISIONING_LOCK_FILE,
-      operation,
+      // Lock order is provisioning then config-save; routine writers take only
+      // config-save, so reload-through-commit cannot interleave or deadlock.
+      () => selector.withLocalIntegrityConfigSaveLock(operation),
       {
         ...deps.lockOptions,
         metadata: { purpose: "q5-local-integrity-provisioning" },

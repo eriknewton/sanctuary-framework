@@ -14,6 +14,8 @@
  *     the operator binds frontier-with-filter to a surface
  */
 
+// fail-before-exempt: the reviewed intermediate Q5E head introduced the issued-handle cache this regression targets; the older q5e-base source had no cache and therefore already reissued the handle.
+
 import { describe, it, expect, vi } from "vitest";
 import {
   buildPrivacyTier2Redactor,
@@ -504,5 +506,52 @@ describe("Tier 2 redactor — audit emission discipline", () => {
     const serialized = JSON.stringify(details);
     expect(serialized).not.toContain("totally-secret-email-address");
     expect(serialized).not.toContain("private.example.com");
+  });
+});
+
+describe("SubstrateSelector.installRedactor — cached handle invalidation", () => {
+  it("reissues a cached frontier handle with the installed consent-gated redactor", async () => {
+    const bodies: string[] = [];
+    const fetchImpl = vi.fn(async (
+      _input: Parameters<typeof fetch>[0],
+      init?: RequestInit,
+    ) => {
+      bodies.push(String(init?.body ?? ""));
+      return new Response(
+        JSON.stringify({ content: [{ type: "text", text: "summary" }] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+    const storage = new MemoryStorage();
+    const masterKey = generateRandomKey();
+    const selector = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog: new AuditLog(storage, masterKey),
+      identityId: "redactor-cache-test",
+      fetchImpl,
+    });
+    await selector.load();
+    await selector.setPerSurfaceChoice("concierge", "frontier-with-filter");
+    await selector.setFrontierApiKey("anthropic", "test-key");
+    const identityHandle = await selector.getSubstrate("concierge");
+
+    const installedRedactor = vi.fn(async () => ({
+      redacted: "[CONSENT-GATED]",
+      matchCount: 1,
+    }));
+    selector.installRedactor(installedRedactor);
+    const consentGatedHandle = await selector.getSubstrate("concierge");
+    expect(consentGatedHandle).not.toBe(identityHandle);
+
+    await consentGatedHandle.summarize!({
+      kind: "summarize",
+      context: "alice@example.com",
+      query: "summarize",
+    });
+    expect(installedRedactor).toHaveBeenCalledTimes(2);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain("[CONSENT-GATED]");
+    expect(bodies[0]).not.toContain("alice@example.com");
   });
 });

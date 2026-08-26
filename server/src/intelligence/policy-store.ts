@@ -40,6 +40,7 @@ import {
 } from "./model-manifest.js";
 import {
   validateLocalIntegrityStateV2,
+  type ModelLoadIntegrityFailureReason,
   type ModelManifestV2RefusalReason,
 } from "./model-manifest-v2.js";
 import {
@@ -48,9 +49,12 @@ import {
   type SubstrateConfig,
   type SubstrateConfigV2,
 } from "./types.js";
+import { withCrossProcessLock } from "../storage/cross-process-lock.js";
 
 export const INTELLIGENCE_NAMESPACE = "_intelligence";
 export const SUBSTRATE_CONFIG_KEY = "substrate-config";
+/** Distinct from the provisioning lock: every config writer shares this save chokepoint. */
+export const Q5_CONFIG_SAVE_LOCK_FILE = ".q5-config-save.lock";
 const HKDF_INFO = "intelligence-substrate-config";
 
 /**
@@ -63,7 +67,7 @@ export type LoadOutcome =
   | { kind: "version-too-new"; persistedVersion: number; config: SubstrateConfig }
   | {
     kind: "integrity-state-invalid";
-    reason: ModelManifestV2RefusalReason;
+    reason: ModelLoadIntegrityFailureReason;
     /**
      * Convenience defaults only, never a reinterpretation of the invalid
      * durable V2 record as legacy-unarmed authority. Callers must branch on
@@ -76,7 +80,7 @@ export type LoadOutcome =
 
 export class LocalIntegrityStateLoadError extends Error {
   constructor(
-    readonly reason: ModelManifestV2RefusalReason | "manifest_rollback",
+    readonly reason: ModelLoadIntegrityFailureReason,
   ) {
     super(`Q5 integrity state refused: ${reason}`);
     this.name = "LocalIntegrityStateLoadError";
@@ -90,6 +94,25 @@ export interface IntelligenceConfigStoreOptions {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function loadRefusalReason(
+  reason: ModelManifestV2RefusalReason,
+): ModelLoadIntegrityFailureReason {
+  if (reason === "binding_mismatch" || reason === "model_root_invalid") {
+    return reason;
+  }
+  if (reason === "rollback" || reason === "downgrade") {
+    return "manifest_rollback";
+  }
+  if (
+    reason === "bad_signature" || reason === "bad_signature_encoding" ||
+    reason === "bad_signature_length" || reason === "zero_signature" ||
+    reason === "bad_pinned_key_length" || reason === "zero_pinned_key"
+  ) {
+    return "manifest_signature_invalid";
+  }
+  return "integrity_state_invalid";
 }
 
 function configBindingsMatch(config: SubstrateConfigV2): boolean {
@@ -123,6 +146,7 @@ export class IntelligenceConfigStore {
   private storage: StorageBackend;
   private encryptionKey: Uint8Array;
   private modelManifestV2PublicKey: Uint8Array | null;
+  private saveLockDepth = 0;
 
   constructor(
     storage: StorageBackend,
@@ -210,7 +234,7 @@ export class IntelligenceConfigStore {
       if (!validated.ok) {
         return {
           kind: "integrity-state-invalid",
-          reason: validated.reason,
+          reason: loadRefusalReason(validated.reason),
           config: buildDefaultConfig(),
         };
       }
@@ -239,6 +263,43 @@ export class IntelligenceConfigStore {
    * fortress master key via the HKDF-derived purpose key.
    */
   async save(config: SubstrateConfig): Promise<SubstrateConfig> {
+    return this.withSaveLock(() => this.saveWhileLocked(config));
+  }
+
+  /**
+   * Serialize an authority read plus its eventual config save. Provisioning
+   * acquires its own lock first and then this lock, while routine writers take
+   * only this lock; no path may reverse that fixed order. Provisioning holds
+   * this lock across its interactive confirmation, model pulls, verification,
+   * authority reload, and commit, so a live ceremony may own it for minutes.
+   */
+  async withSaveLock<T>(operation: () => Promise<T>): Promise<T> {
+    return withCrossProcessLock(
+      this.storage,
+      INTELLIGENCE_NAMESPACE,
+      Q5_CONFIG_SAVE_LOCK_FILE,
+      async () => {
+        this.saveLockDepth += 1;
+        try {
+          return await operation();
+        } finally {
+          this.saveLockDepth -= 1;
+        }
+      },
+      { metadata: { purpose: "q5-intelligence-config-save" } },
+    );
+  }
+
+  /**
+   * Save while the caller already owns {@link Q5_CONFIG_SAVE_LOCK_FILE}.
+   * This is deliberately separate because the O_EXCL primitive is not
+   * reentrant and provisioning holds the save lock across reload-through-commit.
+   */
+  async saveWhileLocked(config: SubstrateConfig): Promise<SubstrateConfig> {
+    if (this.saveLockDepth <= 0) {
+      // The unlocked form would reopen the check-then-write lost-update window.
+      throw new LocalIntegrityStateLoadError("integrity_io_unavailable");
+    }
     const stamped: SubstrateConfig = {
       ...config,
       updatedAt: new Date().toISOString(),
@@ -265,7 +326,9 @@ export class IntelligenceConfigStore {
         stamped.localIntegrityState,
         this.modelManifestV2PublicKey,
       );
-      if (!validated.ok) throw new LocalIntegrityStateLoadError(validated.reason);
+      if (!validated.ok) {
+        throw new LocalIntegrityStateLoadError(loadRefusalReason(validated.reason));
+      }
       if (!configBindingsMatch({ ...stamped, localIntegrityState: validated.state })) {
         throw new LocalIntegrityStateLoadError("binding_mismatch");
       }

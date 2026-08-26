@@ -369,10 +369,10 @@ test/integration/gate-integration.test.ts(49,9): error TS2322: Type '"auto-deny"
 test/integration/shr-generation.test.ts(136,39): error TS2345: Argument of type '"test-recovery-key"' is not assignable to parameter of type '"passphrase" | "hardware-key" | "recovery-key"'.
 test/integration/shr-generation.test.ts(55,39): error TS2345: Argument of type '"test-recovery-key"' is not assignable to parameter of type '"passphrase" | "hardware-key" | "recovery-key"'.
 test/integration/siem-export-integration.test.ts(108,22): error TS7006: Parameter 'line' implicitly has an 'any' type.
-test/intelligence/privacy-tier2-redactor.test.ts(157,38): error TS2304: Cannot find name 'RequestInfo'.
-test/intelligence/privacy-tier2-redactor.test.ts(279,14): error TS2304: Cannot find name 'RequestInfo'.
-test/intelligence/privacy-tier2-redactor.test.ts(368,15): error TS2304: Cannot find name 'RequestInfo'.
-test/intelligence/privacy-tier2-redactor.test.ts(426,15): error TS2304: Cannot find name 'RequestInfo'.
+test/intelligence/privacy-tier2-redactor.test.ts(159,38): error TS2304: Cannot find name 'RequestInfo'.
+test/intelligence/privacy-tier2-redactor.test.ts(281,14): error TS2304: Cannot find name 'RequestInfo'.
+test/intelligence/privacy-tier2-redactor.test.ts(370,15): error TS2304: Cannot find name 'RequestInfo'.
+test/intelligence/privacy-tier2-redactor.test.ts(428,15): error TS2304: Cannot find name 'RequestInfo'.
 test/intelligence/selector.test.ts(1015,38): error TS2304: Cannot find name 'RequestInfo'.
 test/intelligence/selector.test.ts(1048,38): error TS2304: Cannot find name 'RequestInfo'.
 test/intelligence/selector.test.ts(30,25): error TS2304: Cannot find name 'RequestInfo'.

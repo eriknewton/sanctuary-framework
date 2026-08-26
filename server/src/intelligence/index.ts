@@ -22,6 +22,7 @@ export {
   IntelligenceConfigStore,
   INTELLIGENCE_NAMESPACE,
   LocalIntegrityStateLoadError,
+  Q5_CONFIG_SAVE_LOCK_FILE,
   SUBSTRATE_CONFIG_KEY,
   type IntelligenceConfigStoreOptions,
   type LoadOutcome,
@@ -78,6 +79,7 @@ export {
 
 export {
   IMMUNE_MODEL_LOAD_SURFACES,
+  MODEL_LOAD_INTEGRITY_FAILURE_REASONS,
   MODEL_LOAD_INTEGRITY_ASSURANCES,
   MODEL_MANIFEST_V2_DELIMITER,
   MODEL_MANIFEST_V2_DOMAIN,
@@ -94,6 +96,7 @@ export {
   type LocalIntegrityStateV2,
   type LocalIntegrityStateV2ValidationResult,
   type ModelLoadIntegrityAssurance,
+  type ModelLoadIntegrityFailureReason,
   type ModelManifestBodyV2,
   type ModelManifestModelV2,
   type ModelManifestSurfaceDefaultsV2,
