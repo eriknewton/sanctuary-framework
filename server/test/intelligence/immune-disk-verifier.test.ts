@@ -157,6 +157,10 @@ function wrapFs(
   };
 }
 
+function fsError(code: string): Error & { code: string } {
+  return Object.assign(new Error(`injected ${code}`), { code });
+}
+
 describe("Q5C bounded OCI manifest parser", () => {
   it("exports the inert Q5C surface through the intelligence barrel", () => {
     expect(intelligence.createOnDiskImmuneVerifier).toBe(createOnDiskImmuneVerifier);
@@ -388,6 +392,30 @@ describe("Q5C descriptor-based on-disk verification", () => {
     expectReason(await verifier().verify({ ...store.request, rootReal: "relative/root" }), "model_root_invalid");
   });
 
+  it("maps a missing root to model_root_invalid", async () => {
+    const store = await fixture();
+    const base = createNodeImmuneFileSystemAdapter();
+    const fs = wrapFs(base, {
+      async lstat(path) {
+        if (path === store.root) throw fsError("ENOENT");
+        return base.lstat(path);
+      },
+    });
+    expectReason(await verifier(fs).verify(store.request), "model_root_invalid");
+  });
+
+  it("maps a non-missing root errno to integrity_io_unavailable", async () => {
+    const store = await fixture();
+    const base = createNodeImmuneFileSystemAdapter();
+    const fs = wrapFs(base, {
+      async lstat(path) {
+        if (path === store.root) throw fsError("EACCES");
+        return base.lstat(path);
+      },
+    });
+    expectReason(await verifier(fs).verify(store.request), "integrity_io_unavailable");
+  });
+
   it("refuses a light binding before any disk read", async () => {
     const store = await fixture();
     const base = createNodeImmuneFileSystemAdapter();
@@ -439,6 +467,45 @@ describe("Q5C descriptor-based on-disk verification", () => {
       },
     });
     expectReason(await verifier(fs).verify(store.request), "path_escape");
+  });
+
+  it("classifies a realpath prefix collision as an escape without symlinks", async () => {
+    const store = await fixture();
+    const base = createNodeImmuneFileSystemAdapter();
+    const fs = wrapFs(base, {
+      async realpath(path) {
+        if (path === store.manifestPath) {
+          return join(`${store.root}-evil`, "manifests", "prefix-collision");
+        }
+        return base.realpath(path);
+      },
+    });
+    expectReason(await verifier(fs).verify(store.request), "path_escape");
+  });
+
+  it("refuses an in-root realpath change caused by a symlink replacement race", async () => {
+    const store = await fixture();
+    const base = createNodeImmuneFileSystemAdapter();
+    const aliasTarget = join(store.root, "in-root-manifest-alias");
+    const original = `${store.manifestPath}.original`;
+    await writeFile(aliasTarget, store.manifestBytes);
+    let replaced = false;
+    const fs = wrapFs(base, {
+      async realpath(path) {
+        if (path !== store.manifestPath || replaced) return base.realpath(path);
+        replaced = true;
+        await rename(store.manifestPath, original);
+        await symlink(aliasTarget, store.manifestPath);
+        try {
+          return await base.realpath(path);
+        } finally {
+          await unlink(store.manifestPath);
+          await rename(original, store.manifestPath);
+        }
+      },
+    });
+    expectReason(await verifier(fs).verify(store.request), "path_escape");
+    expect(replaced).toBe(true);
   });
 
   it("retries once and then refuses repeated final-file replacement as unstable", async () => {
@@ -567,6 +634,27 @@ describe("Q5C descriptor-based on-disk verification", () => {
       if (mode === "timeout") expectReason(result, "integrity_io_unavailable");
       expect(closed, mode).toBe(opened);
     }
+  });
+
+  it("preserves a layer digest refusal when descriptor close also fails", async () => {
+    const store = await fixture();
+    const target = store.blobPaths.get(digest(LAYER_A_BYTES))!;
+    await writeFile(target, "substituted-layer-aaa");
+    const base = createNodeImmuneFileSystemAdapter();
+    const fs = wrapFs(base, {
+      async open(path, flags) {
+        const handle = await base.open(path, flags);
+        if (path !== target) return handle;
+        return {
+          ...handle,
+          async close() {
+            await handle.close();
+            throw fsError("EIO");
+          },
+        } satisfies ImmuneFileHandle;
+      },
+    });
+    expectReason(await verifier(fs).verify(store.request), "layer_digest_mismatch");
   });
 });
 

@@ -4,6 +4,9 @@
  * No production composition root imports or invokes this module. A caller must
  * explicitly supply a Q5A-validated immune binding, an absolute persisted root,
  * and an injected filesystem adapter before any filesystem read can occur.
+ * Residual: real Ollama layer descriptors may carry a `from` key, which this
+ * strict parser refuses as `disk_manifest_invalid`; the Q5E disposable-host
+ * drill must watch for this as a false-refusal source.
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
@@ -409,7 +412,10 @@ async function state_ROOT(
     return rootReal;
   } catch (error) {
     if (error instanceof ImmuneRefusal) throw error;
-    refuse("model_root_invalid");
+    if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") {
+      refuse("model_root_invalid");
+    }
+    refuse("integrity_io_unavailable");
   }
 }
 
@@ -469,13 +475,16 @@ async function state_PATH_COMPONENTS(
     refuse("integrity_io_unavailable");
   }
   // Realpath containment catches mount/alias surprises after the lexical component walk.
-  if (!contained(rootReal, candidateReal)) refuse("path_escape");
-  if (candidateReal !== candidate || finalStat === undefined) refuse("path_escape");
+  if (!contained(rootReal, candidateReal)) {
+    refuse("path_escape");
+  } else if (candidateReal !== candidate || finalStat === undefined) {
+    // Once contained, a different real path still identifies a symlink/alias race.
+    refuse("path_escape");
+  }
   return { path: candidate, pathStat: finalStat };
 }
 
 interface StableRead {
-  readonly digestHex: string;
   readonly bytesRead: number;
   readonly bytes?: Uint8Array;
 }
@@ -483,6 +492,10 @@ interface StableRead {
 interface StableReadOptions {
   readonly components: readonly string[];
   readonly missingReason: "disk_manifest_invalid" | "layer_missing";
+  readonly expectedDigest: string;
+  readonly digestMismatchReason:
+    | "disk_manifest_digest_mismatch"
+    | "layer_digest_mismatch";
   readonly expectedSize?: number;
   readonly maxBytes: number;
   readonly collectBytes: boolean;
@@ -500,6 +513,7 @@ async function readCandidateOnce(
     options.missingReason,
   );
   let handle: ImmuneFileHandle;
+  let pendingRefusal: ImmuneRefusal | undefined;
   try {
     // O_NOFOLLOW closes the final-component replacement gap left by the lstat walk.
     handle = await fs.open(
@@ -592,12 +606,24 @@ async function readCandidateOnce(
         offset += chunk.byteLength;
       }
     }
+    const digestHex = hash.digest("hex");
+    if (!constantTimeDigestEqual(digestHex, options.expectedDigest)) {
+      refuse(options.digestMismatchReason);
+    }
     return bytes === undefined
-      ? { digestHex: hash.digest("hex"), bytesRead: position }
-      : { digestHex: hash.digest("hex"), bytesRead: position, bytes };
+      ? { bytesRead: position }
+      : { bytesRead: position, bytes };
+  } catch (error) {
+    if (error instanceof ImmuneRefusal) pendingRefusal = error;
+    throw error;
   } finally {
     // Descriptor ownership stays local so every success and refusal attempts closure.
-    await handle.close().catch(() => refuse("integrity_io_unavailable"));
+    try {
+      await handle.close();
+    } catch {
+      // Invariant: never let close put the wrong failure in the refusal slot.
+      if (pendingRefusal === undefined) refuse("integrity_io_unavailable");
+    }
   }
 }
 
@@ -621,8 +647,7 @@ function constantTimeDigestEqual(left: string, right: string): boolean {
 function manifestComponents(identity: SignedOllamaIdentityV2): readonly string[] {
   const derived = deriveOllamaManifestRelativePath(identity);
   const components = derived.split("/");
-  // The shared Q5A derivation is authoritative; a separator in signed input must not widen it.
-  if (components.join("/") !== derived) refuse("path_escape");
+  // state_PATH_COMPONENTS enforces every component from the shared Q5A derivation.
   return components;
 }
 
@@ -644,15 +669,11 @@ export function createOnDiskImmuneVerifier(
         const manifest = await state_STABLE_FILE(options.fs, rootReal, {
           components: manifestComponents(request.binding.ollama_identity),
           missingReason: "disk_manifest_invalid",
+          expectedDigest: request.binding.ollama_identity.ollama_manifest_sha256,
+          digestMismatchReason: "disk_manifest_digest_mismatch",
           maxBytes: IMMUNE_OCI_MANIFEST_OVERFLOW_READ_BYTES,
           collectBytes: true,
         });
-        if (!constantTimeDigestEqual(
-          manifest.digestHex,
-          request.binding.ollama_identity.ollama_manifest_sha256,
-        )) {
-          refuse("disk_manifest_digest_mismatch");
-        }
         if (manifest.bytes === undefined) refuse("disk_manifest_invalid");
         const parsed = parseBoundedOciManifest(manifest.bytes);
         let bytesHashed = manifest.bytesRead;
@@ -661,13 +682,12 @@ export function createOnDiskImmuneVerifier(
           const artifact = await state_STABLE_FILE(options.fs, rootReal, {
             components: ["blobs", `sha256-${descriptor.digestHex}`],
             missingReason: "layer_missing",
+            expectedDigest: descriptor.digestHex,
+            digestMismatchReason: "layer_digest_mismatch",
             expectedSize: descriptor.size,
             maxBytes: descriptor.size,
             collectBytes: false,
           });
-          if (!constantTimeDigestEqual(artifact.digestHex, descriptor.digestHex)) {
-            refuse("layer_digest_mismatch");
-          }
           bytesHashed += artifact.bytesRead;
           verifiedArtifactDigests.push(descriptor.digestHex);
         }
