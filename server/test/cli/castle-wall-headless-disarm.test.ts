@@ -479,4 +479,22 @@ describe("disarm detail truncation", () => {
     expect(flat.startsWith("…")).toBe(true);
     expect(flat).toContain("line 79");
   });
+
+  it("retains the full-deny disclosure even when the warning's own failure detail is very long (re-gate counterexample)", () => {
+    // Both markers live in ONE warning sentence; a 700-char host error between
+    // them defeats any head-truncation of that line. The per-marker windows
+    // must keep marker 1 (with the start of the detail) AND the constant
+    // full-deny sentence verbatim.
+    const hugeDetail = "LaunchServices cascade: " + "x".repeat(700);
+    const warning =
+      `Warning: NE preference disable did not complete (${hugeDetail}); ` +
+      "the authenticated dead-man lease was already revoked, so the protected uid is fully denied until a later successful disable or re-enable.";
+    const flat = flattenDisarmDetail(warning);
+    expect(flat).toContain("NE preference disable did not complete");
+    expect(flat).toContain("LaunchServices cascade:");
+    expect(flat).toContain(
+      "the protected uid is fully denied until a later successful disable or re-enable",
+    );
+    expect(flat).toContain("…");
+  });
 });

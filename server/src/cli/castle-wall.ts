@@ -5093,11 +5093,16 @@ async function runArmDisarmInner(
     if (action === "disable" && leaseRevoked) {
       // This warning is the ONLY place the lease-ratchet disclosure and the
       // underlying invoke failure detail are rendered; realUninstallOps.disarm
-      // in cli/uninstall.ts surfaces both by capturing this stream (must match
-      // the capture there). The label alone ("fail_open_deadman") masked the
-      // real cause on hardware (D5 drill 2026-08-25: a LaunchServices launch
-      // failure read as a filter-observation problem), and the revoked lease
-      // was observed there as FULL DENY for the protected uid, not fail-open.
+      // in cli/uninstall.ts surfaces both by capturing this stream. The two
+      // load-bearing substrings below - "NE preference disable did not
+      // complete" and the full-deny sentence - must match
+      // DISARM_DETAIL_PRIORITY_MARKERS in cli/uninstall.ts, whose truncation
+      // retains them by these exact substrings; rewording either side breaks
+      // the retention silently. The label alone ("fail_open_deadman") masked
+      // the real cause on hardware (D5 drill 2026-08-25: a LaunchServices
+      // launch failure read as a filter-observation problem), and the revoked
+      // lease was observed there as FULL DENY for the protected uid, not
+      // fail-open.
       write(
         err,
         `Warning: NE preference disable did not complete (${detail}); the authenticated dead-man lease was already revoked, so the protected uid is fully denied until a later successful disable or re-enable.\n`,

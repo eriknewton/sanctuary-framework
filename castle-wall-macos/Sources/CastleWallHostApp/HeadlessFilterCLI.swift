@@ -182,6 +182,12 @@ enum HeadlessFilterCLI {
     }
 
     private static func currentBuildGitSha() -> String {
+        // This env read echoes the caller's value back as the reported build
+        // identity, which is why the CLI's direct-exec disarm fallback
+        // (makeIdentityIndependentHostAppInvoke in server/src/cli/castle-wall.ts,
+        // must match) strips SANCTUARY_CASTLE_BUILD_SHA from the child
+        // environment: an inherited value would let the CLI validate its own
+        // expectation against itself instead of the embedded plist identity.
         if let envSha = ProcessInfo.processInfo.environment["SANCTUARY_CASTLE_BUILD_SHA"],
            !envSha.isEmpty {
             return envSha

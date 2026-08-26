@@ -143,39 +143,60 @@ function collectingWritable(): { stream: Writable; text(): string } {
 }
 
 /**
- * The two sentences an operator must never lose from a truncated transcript:
- * the disable warning naming the underlying invoke failure, and the
- * lease-ratchet full-deny disclosure. Must match the warning rendered in the
- * fail_open_deadman branch of runDisable in cli/castle-wall.ts; matched by
- * substring so wording extensions around them cannot silently defeat the
- * priority retention.
+ * The two sentences an operator must never lose from a truncated transcript.
+ * Must match the warning rendered in the fail_open_deadman branch of
+ * runDisable in cli/castle-wall.ts (the producer side carries the reciprocal
+ * pin naming DISARM_DETAIL_PRIORITY_MARKERS). Matched by substring on the
+ * newline-flattened RAW transcript, so line wrapping or wording extensions
+ * around the markers cannot silently defeat the retention.
+ *
+ * Marker 1 opens the warning and is followed by the VARIABLE failure detail
+ * (the underlying invoke error), so its retained window extends past the
+ * marker. Marker 2 is a CONSTANT complete sentence - the full-deny
+ * lease-ratchet disclosure - so the marker text is itself the retained
+ * content and can never be cut mid-sentence, however long the warning line
+ * that carries both markers grows.
  */
 const DISARM_DETAIL_PRIORITY_MARKERS = [
   "NE preference disable did not complete",
-  "the protected uid is fully denied",
+  "the protected uid is fully denied until a later successful disable or re-enable",
 ] as const;
+
+/**
+ * Window kept from marker 1's start: the marker (38 chars) plus enough of the
+ * parenthesized failure detail to identify the cause. 300 = half the 600-char
+ * row budget, leaving room for marker 2 (79 chars) plus transcript tail.
+ */
+const DISARM_DETAIL_MARKER_WINDOW_CHARS = 300;
 
 export function flattenDisarmDetail(raw: string): string {
   const flat = raw.trim().replace(/\s*\n\s*/g, " | ");
   if (flat.length <= DISARM_FAILURE_DETAIL_MAX_CHARS) return flat;
   // A plain keep-the-tail truncation can evict the diagnosis when later
-  // output (audit failure text, custody normalization) follows the warning.
-  // Retain the priority lines FIRST, then fill what budget remains with the
-  // transcript tail; truncation stays marked, never silent.
-  const priorityLines = raw
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) =>
-      DISARM_DETAIL_PRIORITY_MARKERS.some((marker) => line.includes(marker)),
+  // output (audit failure text, custody normalization) follows the warning,
+  // and a keep-the-head truncation can evict the SECOND marker when the
+  // warning line itself is long (both markers live in one sentence). Each
+  // marker therefore gets its own bounded window from the flattened raw text:
+  // marker 1 keeps the failure detail that follows it, marker 2 is a constant
+  // sentence kept verbatim. Remaining budget carries the transcript tail;
+  // truncation stays marked, never silent.
+  const windows: string[] = [];
+  const idx1 = flat.indexOf(DISARM_DETAIL_PRIORITY_MARKERS[0]);
+  if (idx1 >= 0) {
+    const window = flat.slice(idx1, idx1 + DISARM_DETAIL_MARKER_WINDOW_CHARS);
+    windows.push(
+      window.length < DISARM_DETAIL_MARKER_WINDOW_CHARS ? window : `${window}…`,
     );
-  const priority = [...new Set(priorityLines)].join(" | ");
+  }
+  if (flat.includes(DISARM_DETAIL_PRIORITY_MARKERS[1])) {
+    windows.push(DISARM_DETAIL_PRIORITY_MARKERS[1]);
+  }
+  const priority = windows.join(" | ");
   if (priority.length === 0) {
     return `…${flat.slice(flat.length - DISARM_FAILURE_DETAIL_MAX_CHARS)}`;
   }
-  if (priority.length >= DISARM_FAILURE_DETAIL_MAX_CHARS) {
-    return `${priority.slice(0, DISARM_FAILURE_DETAIL_MAX_CHARS)}…`;
-  }
   const remaining = DISARM_FAILURE_DETAIL_MAX_CHARS - priority.length;
+  if (remaining <= 1) return priority;
   return `${priority} | …${flat.slice(flat.length - remaining)}`;
 }
 
