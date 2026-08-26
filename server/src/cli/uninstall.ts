@@ -121,6 +121,95 @@ function nullWritable(): Writable {
   });
 }
 
+/**
+ * One uninstall report row renders on a single line for a human operator; an
+ * unbounded multi-line disable transcript would break the row format and bury
+ * the report. 600 chars holds the full two-sentence disable warning (the
+ * lease-ratchet disclosure plus a long LaunchServices error is ~450 chars)
+ * with headroom; longer transcripts keep the TAIL, because the disable verb
+ * writes its diagnosis last, and the truncation is marked, never silent.
+ */
+const DISARM_FAILURE_DETAIL_MAX_CHARS = 600;
+
+function collectingWritable(): { stream: Writable; text(): string } {
+  const chunks: string[] = [];
+  const stream = new Writable({
+    write(chunk, _encoding, callback) {
+      chunks.push(String(chunk));
+      callback();
+    },
+  });
+  return { stream, text: () => chunks.join("") };
+}
+
+/**
+ * The two sentences an operator must never lose from a truncated transcript.
+ * Must match the warning rendered in the fail_open_deadman branch of
+ * runDisable in cli/castle-wall.ts (the producer side carries the reciprocal
+ * pin naming DISARM_DETAIL_PRIORITY_MARKERS). Matched by substring on the
+ * newline-flattened RAW transcript, so line wrapping or wording extensions
+ * around the markers cannot silently defeat the retention.
+ *
+ * Marker 1 opens the warning and is followed by the VARIABLE failure detail
+ * (the underlying invoke error), so its retained window extends past the
+ * marker. Marker 2 is a CONSTANT complete sentence - the full-deny
+ * lease-ratchet disclosure - so the marker text is itself the retained
+ * content and can never be cut mid-sentence, however long the warning line
+ * that carries both markers grows.
+ */
+const DISARM_DETAIL_PRIORITY_MARKERS = [
+  "NE preference disable did not complete",
+  "the protected uid is fully denied until a later successful disable or re-enable",
+] as const;
+
+/**
+ * Window kept from marker 1's start: the marker (38 chars) plus enough of the
+ * parenthesized failure detail to identify the cause. 300 = half the 600-char
+ * row budget, leaving room for marker 2 (79 chars) plus transcript tail.
+ */
+const DISARM_DETAIL_MARKER_WINDOW_CHARS = 300;
+
+export function flattenDisarmDetail(raw: string): string {
+  const flat = raw.trim().replace(/\s*\n\s*/g, " | ");
+  if (flat.length <= DISARM_FAILURE_DETAIL_MAX_CHARS) return flat;
+  // A plain keep-the-tail truncation can evict the diagnosis when later
+  // output (audit failure text, custody normalization) follows the warning,
+  // and a keep-the-head truncation can evict the SECOND marker when the
+  // warning line itself is long (both markers live in one sentence). Each
+  // marker therefore gets its own bounded window from the flattened raw text:
+  // marker 1 keeps the failure detail that follows it, marker 2 is a constant
+  // sentence kept verbatim. Remaining budget carries the transcript tail;
+  // truncation stays marked, never silent.
+  // Matching runs on a whitespace-normalized view so a marker split across
+  // lines (or flattened into " | " separators) still matches - the documented
+  // wrapping-immunity contract; windows are extracted from the same view.
+  const normalized = raw.trim().replace(/\s+/g, " ");
+  const windows: string[] = [];
+  // cli-argv-indexof-allowed: scans a captured stderr transcript string, not CLI argv tokens.
+  const idx1 = normalized.indexOf(DISARM_DETAIL_PRIORITY_MARKERS[0]);
+  if (idx1 >= 0) {
+    const window = normalized.slice(idx1, idx1 + DISARM_DETAIL_MARKER_WINDOW_CHARS);
+    windows.push(
+      window.length < DISARM_DETAIL_MARKER_WINDOW_CHARS ? window : `${window}…`,
+    );
+  }
+  if (
+    normalized.includes(DISARM_DETAIL_PRIORITY_MARKERS[1]) &&
+    // Marker 2 already inside marker 1's window: appending it again would
+    // repeat the disclosure verbatim.
+    !windows.some((window) => window.includes(DISARM_DETAIL_PRIORITY_MARKERS[1]))
+  ) {
+    windows.push(DISARM_DETAIL_PRIORITY_MARKERS[1]);
+  }
+  const priority = windows.join(" | ");
+  if (priority.length === 0) {
+    return `…${flat.slice(flat.length - DISARM_FAILURE_DETAIL_MAX_CHARS)}`;
+  }
+  const remaining = DISARM_FAILURE_DETAIL_MAX_CHARS - priority.length;
+  if (remaining <= 1) return priority;
+  return `${priority} | …${flat.slice(flat.length - remaining)}`;
+}
+
 async function statFootprint(path: string): Promise<FootprintStatus> {
   try {
     await lstat(path);
@@ -141,19 +230,34 @@ function realUninstallOps(ctx: UninstallCommandContext): UninstallOps {
       if (platform !== "darwin") return "corroborated_off";
       const { runDisable } = await import("./castle-wall.js");
       let observed: DisableNePreferenceOutcome | undefined;
+      // The disable verb writes its diagnosis (the underlying invoke failure
+      // AND, on the fail_open_deadman path, the lease-ratchet full-deny
+      // disclosure) to stderr; capturing instead of null-writing is what keeps
+      // this row truthful. Must match the warning rendered in the
+      // fail_open_deadman branch of runDisable in cli/castle-wall.ts - the
+      // disclosure is captured from there, never re-rendered here, so the two
+      // surfaces can never disagree. Null-writing this stream was how a
+      // hardware LaunchServices launch failure reached the operator as a bare
+      // "fail_open_deadman" label (D5 drill 2026-08-25).
+      const errCapture = collectingWritable();
       const code = await runDisable(["--fortress", fortressPath], {
         out: nullWritable(),
-        err: nullWritable(),
+        err: errCapture.stream,
         env,
         platform,
         onDisableNePreferenceOutcome: (outcome) => {
           observed = outcome;
         },
       });
-      if (code !== 0) throw new Error(`castle-wall disable exited ${code}`);
+      const detail = flattenDisarmDetail(errCapture.text());
+      if (code !== 0) {
+        throw new Error(
+          `castle-wall disable exited ${code}${detail ? ` (${detail})` : ""}`,
+        );
+      }
       if (observed !== "corroborated_off") {
         throw new Error(
-          `castle-wall disable did not positively observe the filter off (${observed ?? "no outcome"})`,
+          `castle-wall disable did not positively observe the filter off (${observed ?? "no outcome"})${detail ? `; underlying: ${detail}` : ""}`,
         );
       }
       return observed;

@@ -1404,7 +1404,13 @@ describe("castle-wall enable/disable CLI verbs", () => {
       });
 
       expect(code).toBe(0);
-      expect(err.text()).toContain("fail-open path is active");
+      // The disclosure must state the drill-observed behavior (full deny for
+      // the protected uid), the underlying failure detail, and the ratchet's
+      // exit path - not the designed-but-unobserved "fail-open" claim.
+      expect(err.text()).toContain("NE save timed out");
+      expect(err.text()).toContain(
+        "the protected uid is fully denied until a later successful disable or re-enable",
+      );
       expect(out.text()).toContain("provider dead-man lease revoked");
       expect(outcomes).toEqual(["fail_open_deadman"]);
     } finally {
