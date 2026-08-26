@@ -135,9 +135,12 @@ final class SystemExtensionManager: NSObject, ObservableObject {
     }
 
     func replacementAction() -> OSSystemExtensionRequest.ReplacementAction {
-        // Must match the .replace answer in HeadlessSystemExtensionRequestRunner
-        // (HeadlessFilterCLI.swift): replacement is how a newer bundled
-        // extension re-binds a stale activated record on both paths.
+        // Replacement is how a newer bundled extension re-binds a stale
+        // activated record during the GUI app's attended activation flow (the
+        // ONLY path that submits activation requests). Must match the .replace
+        // answer in HeadlessSystemExtensionRequestRunner (HeadlessFilterCLI.swift),
+        // whose delegate carries the same policy even though a deactivation
+        // request never consults it.
         return .replace
     }
 }

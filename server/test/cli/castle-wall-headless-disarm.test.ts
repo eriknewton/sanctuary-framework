@@ -68,7 +68,7 @@ function reportLine(
       error,
       ok,
       state,
-      // Additive host-app report fields (error_domain / error_code / recovery).
+      // Additive host-app report fields (error_domain / error_code / remediation).
       ...extraFields,
     }) + "\n"
   );
@@ -510,9 +510,11 @@ describe("disarm detail truncation", () => {
 
 // Graph row defect.sysext-deactivation-extension-not-found: the host app now
 // reports the NSError domain/code of a deactivation failure machine-readably,
-// discloses its single-shot skew recovery, and the CLI adds a notice-only
-// version-skew preflight. These tests pin the CLI half of that contract.
-describe("system-extension deactivation failure identity, recovery disclosure, and skew notice", () => {
+// attaches a remediation hint when it detects an app-version skew (it never
+// mutates - the teardown verb submits deactivation only), and the CLI adds a
+// notice-only version-skew preflight. These tests pin the CLI half of that
+// contract.
+describe("system-extension deactivation failure identity, remediation hint, and skew notice", () => {
   const tempDirs: string[] = [];
 
   afterEach(async () => {
@@ -574,35 +576,10 @@ describe("system-extension deactivation failure identity, recovery disclosure, a
     });
   });
 
-  it("carries the host app's recovery disclosure through a successful outcome", async () => {
-    const { hostAppPath, env } = await makeFixture();
-    const { invoke } = makeInvoker({
-      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
-      "deactivate-system-extension": {
-        stdout: reportLine("deactivate-system-extension", "deactivated", true, undefined, {
-          recovery: "activate_replace_then_deactivate",
-        }),
-        exitCode: 0,
-      },
-    });
-
-    const outcome = await requestSystemExtensionDeactivation({
-      env,
-      platform: "darwin",
-      hostAppCandidates: [hostAppPath],
-      hostAppInvoke: invoke,
-      ...noSkewData,
-    });
-
-    // A clean "request-completed" that hid the recovery activation would hide
-    // a host mutation; the disclosure must survive success.
-    expect(outcome).toEqual({
-      kind: "request-completed",
-      recovery: "activate_replace_then_deactivate",
-    });
-  });
-
-  it("carries both the recovery disclosure and the second failure identity when the recovered deactivation still fails", async () => {
+  it("carries the host app's remediation hint beside the failure identity", async () => {
+    // The skew-detection shape: the host app reports the error-4 refusal
+    // (its own identity, untouched) plus the machine-readable remediation id.
+    // The CLI must pass BOTH through, or the operator is stranded with prose.
     const { hostAppPath, env } = await makeFixture();
     const { invoke } = makeInvoker({
       status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
@@ -611,11 +588,11 @@ describe("system-extension deactivation failure identity, recovery disclosure, a
           "deactivate-system-extension",
           "unknown",
           false,
-          "OSSystemExtensionErrorDomain error 4.",
+          "OSSystemExtensionErrorDomain error 4.; the installed app's registration no longer matches the activated system extension",
           {
             error_domain: "OSSystemExtensionErrorDomain",
             error_code: 4,
-            recovery: "activate_replace_then_deactivate",
+            remediation: "extension_version_skew_reregister_required",
           },
         ),
         exitCode: 1,
@@ -632,11 +609,45 @@ describe("system-extension deactivation failure identity, recovery disclosure, a
 
     expect(outcome).toEqual({
       kind: "failed",
-      detail: "OSSystemExtensionErrorDomain error 4.",
+      detail:
+        "OSSystemExtensionErrorDomain error 4.; the installed app's registration no longer matches the activated system extension",
       error_domain: "OSSystemExtensionErrorDomain",
       error_code: 4,
-      recovery: "activate_replace_then_deactivate",
+      remediation: "extension_version_skew_reregister_required",
     });
+  });
+
+  it("passes a remediation hint through every non-failure outcome shape too", async () => {
+    // The passthrough is variant-agnostic by design: outcome mapping must not
+    // be able to drop a hint whatever state the report carries.
+    for (const [state, expected] of [
+      ["deactivated", { kind: "request-completed" }],
+      ["will_complete_after_reboot", { kind: "reboot-required" }],
+    ] as const) {
+      const { hostAppPath, env } = await makeFixture();
+      const { invoke } = makeInvoker({
+        status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+        "deactivate-system-extension": {
+          stdout: reportLine("deactivate-system-extension", state, true, undefined, {
+            remediation: "extension_version_skew_reregister_required",
+          }),
+          exitCode: 0,
+        },
+      });
+
+      const outcome = await requestSystemExtensionDeactivation({
+        env,
+        platform: "darwin",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+        ...noSkewData,
+      });
+
+      expect(outcome).toEqual({
+        ...expected,
+        remediation: "extension_version_skew_reregister_required",
+      });
+    }
   });
 
   it("prints the skew notice before submitting deactivation when the embedded version is not among the activated records", async () => {
@@ -661,10 +672,11 @@ describe("system-extension deactivation failure identity, recovery disclosure, a
     });
 
     // Notice only: the skew is named truthfully AND the deactivation is still
-    // submitted (the notice must never block the teardown).
+    // submitted (the notice must never block the teardown). The guidance
+    // names the attended remediation, never an automated one.
     expect(err.text()).toContain("system-extension version 1472");
     expect(err.text()).toContain("activated record is 1421");
-    expect(err.text()).toContain("may prompt for approval twice");
+    expect(err.text()).toContain("re-registers the extension");
     expect(outcome).toEqual({ kind: "request-completed" });
     expect(calls.map((call) => call[2])).toEqual([
       "status",

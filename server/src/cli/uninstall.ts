@@ -14,6 +14,10 @@ import type { DisableNePreferenceOutcome, SystemExtensionDeactivationRequestOutc
 export const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = "/Library/Application Support/Sanctuary/castle-pinned-pubkey.bin";
 
 type FootprintStatus = "absent" | "present" | "unknown" | "not-applicable";
+// Must match systemExtensionIdentifier in
+// castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift and
+// CASTLE_WALL_SYSTEM_EXTENSION_BUNDLE_ID in server/src/cli/castle-wall.ts:
+// probes and requests on every side must name the same extension.
 const CASTLE_WALL_SYSTEM_EXTENSION_ID = "ai.sanctuaryprotocol.macos.castle-wall";
 const execFileAsync = promisify(nodeExecFile);
 
@@ -486,34 +490,38 @@ export async function runUninstallCommand(ctx: UninstallCommandContext = {}): Pr
       });
     } else {
       const deactivation = await ops.deactivateSystemExtension();
-      // The host app disclosed a recovery mutation inside the teardown verb
-      // (a single activate-replace before re-deactivating, clearing an
-      // app-version skew). That disclosure must reach the operator row on
-      // every outcome, success included: the verb submitted an activation the
-      // operator did not directly ask for.
-      const recoveryNote =
-        deactivation.recovery === undefined
+      // The host app can attach a machine-readable remediation hint to any
+      // outcome (today: extension_version_skew_reregister_required, meaning
+      // the installed app's registration no longer matches the activated
+      // extension and an attended re-registration is required). The hint must
+      // reach the operator row on EVERY branch, including the
+      // completed-but-still-present and unreadable-post-probe ones: this row
+      // is the only place the operator learns why a rerun needs the console.
+      const remediationNote =
+        deactivation.remediation === undefined
           ? ""
-          : `; disclosed recovery ran (${deactivation.recovery})`;
+          : `; remediation required (${deactivation.remediation}): launch ` +
+            "Sanctuary-CastleWall.app at the console so its activation flow " +
+            "re-registers the extension, then rerun uninstall";
       if (deactivation.kind === "reboot-required") {
         rows.push({
           label: "system-extension",
           status: "cannot-remove",
           detail:
             "deactivation accepted by macOS but requires reboot; reboot, then rerun uninstall to observe absence" +
-            recoveryNote,
+            remediationNote,
         });
       } else if (deactivation.kind === "needs-user-approval") {
         rows.push({
           label: "system-extension",
           status: "cannot-remove",
-          detail: `${deactivation.detail}; approve at the console, then rerun uninstall${recoveryNote}`,
+          detail: `${deactivation.detail}; approve at the console, then rerun uninstall${remediationNote}`,
         });
       } else if (deactivation.kind === "failed") {
         rows.push({
           label: "system-extension",
           status: "failed",
-          detail: `${deactivation.detail}${recoveryNote}`,
+          detail: `${deactivation.detail}${remediationNote}`,
         });
       } else {
         const observedAfter = await ops.systemExtensionStatus();
@@ -523,16 +531,17 @@ export async function runUninstallCommand(ctx: UninstallCommandContext = {}): Pr
             status: "removed",
             detail:
               "deactivation completed and the Castle Wall system extension is observed absent" +
-              recoveryNote,
+              remediationNote,
           });
         } else {
           rows.push({
             label: "system-extension",
             status: "cannot-remove",
             detail:
-              observedAfter === "present"
+              (observedAfter === "present"
                 ? "deactivation request completed but the system extension is still present; reboot and rerun uninstall"
-                : "deactivation request completed but absence could not be observed; rerun after reboot",
+                : "deactivation request completed but absence could not be observed; rerun after reboot") +
+              remediationNote,
           });
         }
       }

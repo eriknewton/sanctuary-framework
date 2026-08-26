@@ -476,13 +476,16 @@ interface HeadlessReport {
   error?: string;
   /**
    * Machine-readable failure identity (NSError domain/code) and the host
-   * app's recovery-mutation disclosure. Additive optional fields; wire names
-   * must match the Report CodingKeys in
+   * app's remediation hint (currently only
+   * "extension_version_skew_reregister_required": the installed app's
+   * registration no longer matches the activated extension, so an attended
+   * re-registration is required; the host app never mutates - it detects).
+   * Additive optional fields; wire names must match the Report CodingKeys in
    * castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift.
    */
   error_domain?: string;
   error_code?: number;
-  recovery?: string;
+  remediation?: string;
   build?: HeadlessBuildIdentity;
 }
 
@@ -595,7 +598,7 @@ const HEADLESS_EXIT_NEEDS_APPROVAL = 3;
  * castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift
  * (validateHeadlessBuildIdentity hard-fails on inequality). Bump only when an
  * existing report field changes meaning or a REQUIRED field is added/removed;
- * additive optional report fields (error_domain, error_code, recovery,
+ * additive optional report fields (error_domain, error_code, remediation,
  * 2026-08-26) do not bump it, because parseHeadlessReport requires only `ok`
  * and `state` and ignores unknown keys.
  */
@@ -4087,10 +4090,18 @@ function defaultArmInvoke(ctx: CastleWallCommandContext, action: "enable" | "dis
   });
 }
 
+/**
+ * `remediation` on every variant is the host app's machine-readable hint
+ * passed through verbatim (today it is only ever set beside an error-4
+ * failure: "extension_version_skew_reregister_required", meaning the
+ * installed app's registration no longer matches the activated extension and
+ * an attended re-registration is required). The passthrough is deliberately
+ * variant-agnostic so a hint can never be dropped by outcome mapping.
+ */
 export type SystemExtensionDeactivationRequestOutcome =
-  | { kind: "request-completed"; recovery?: string }
-  | { kind: "reboot-required"; recovery?: string }
-  | { kind: "needs-user-approval"; detail: string; recovery?: string }
+  | { kind: "request-completed"; remediation?: string }
+  | { kind: "reboot-required"; remediation?: string }
+  | { kind: "needs-user-approval"; detail: string; remediation?: string }
   | {
       kind: "failed";
       detail: string;
@@ -4098,11 +4109,12 @@ export type SystemExtensionDeactivationRequestOutcome =
        * Machine-readable failure identity passed through from the host app's
        * report (error_domain/error_code), so callers can branch on a specific
        * OS error class instead of parsing prose. Absent when the failure did
-       * not come from a host-app report.
+       * not come from a host-app report. Always the identity of the
+       * deactivation attempt itself, never of a probe or any other request.
        */
       error_domain?: string;
       error_code?: number;
-      recovery?: string;
+      remediation?: string;
     };
 
 /**
@@ -4191,11 +4203,12 @@ async function defaultActivatedSysextVersionsProbe(): Promise<string[]> {
  * Skew-notice preflight for the deactivation verb (graph row
  * defect.sysext-deactivation-extension-not-found): when the installed app's
  * embedded extension version differs from every activated record's version,
- * say so before submitting the request, because the host app's recovery path
- * (a disclosed activate-replace, then re-deactivate) can raise the macOS
- * approval prompt twice. NOTICE ONLY: any probe failure degrades to silence,
- * never to a block - a diagnostic preflight must not add a failure mode to
- * teardown.
+ * say so before submitting the request, so an operator who then sees a
+ * refusal already knows the attended remediation (launch the app at the
+ * console so its activation flow re-registers the extension, then re-run).
+ * NOTICE ONLY: any probe failure degrades to silence, never to a block - a
+ * diagnostic preflight must not add a failure mode to teardown, and the
+ * notice never blocks or mutates anything.
  */
 async function emitSysextVersionSkewNotice(
   ctx: CastleWallCommandContext,
@@ -4216,7 +4229,8 @@ async function emitSysextVersionSkewNotice(
       err,
       `Notice: the installed Castle Wall app embeds system-extension version ${embedded} ` +
         `but the activated record is ${activated.join(", ")}. Deactivation proceeds; ` +
-        `its recovery path may prompt for approval twice.\n`,
+        `if macOS refuses it, launch Sanctuary-CastleWall.app at the console so its ` +
+        `activation flow re-registers the extension, then re-run this command.\n`,
     );
   } catch {
     // Notice-only: see the invariant above.
@@ -4300,18 +4314,18 @@ export async function requestSystemExtensionDeactivation(
   if (buildMismatch) {
     return { kind: "failed", detail: buildMismatch };
   }
-  // The host app's recovery disclosure must survive into every outcome
-  // (success included): a teardown that silently performed an activation
-  // would hide a host mutation from the operator.
-  const recovery =
-    typeof report.recovery === "string" && report.recovery.length > 0
-      ? { recovery: report.recovery }
+  // The host app's remediation hint must survive into every outcome: it is
+  // the only machine-readable signal that an attended re-registration is
+  // required, and dropping it would strand the operator with bare prose.
+  const remediation =
+    typeof report.remediation === "string" && report.remediation.length > 0
+      ? { remediation: report.remediation }
       : {};
   if (report.state === "needs_user_approval") {
     return {
       kind: "needs-user-approval",
       detail: report.error ?? "macOS requires operator approval",
-      ...recovery,
+      ...remediation,
     };
   }
   if (!report.ok || result.exitCode !== 0) {
@@ -4332,19 +4346,19 @@ export async function requestSystemExtensionDeactivation(
         (result.stderr.trim() ||
           `host app deactivation exited with code ${result.exitCode}`),
       ...failureIdentity,
-      ...recovery,
+      ...remediation,
     };
   }
   if (report.state === "will_complete_after_reboot") {
-    return { kind: "reboot-required", ...recovery };
+    return { kind: "reboot-required", ...remediation };
   }
   if (report.state === "deactivated") {
-    return { kind: "request-completed", ...recovery };
+    return { kind: "request-completed", ...remediation };
   }
   return {
     kind: "failed",
     detail: `host app returned unexpected deactivation state '${report.state}'`,
-    ...recovery,
+    ...remediation,
   };
 }
 
