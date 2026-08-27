@@ -206,6 +206,17 @@ export function createBridgeCommitment(
   const payloadBytes = stringToBytes(stableStringify(commitmentPayload));
   const signature = sign(payloadBytes, identity.encrypted_private_key, identityEncryptionKey);
 
+  // Signature coverage boundary: `signature` covers exactly `commitmentPayload`
+  // above (bridge_commitment_id, session_id, sha256_commitment, terms_hash,
+  // committer_did, committed_at, bridge_version). `blinding_factor` and
+  // `pedersen_commitment` below are opening/blinding data that ride OUTSIDE
+  // that signed region — a consumer must not treat their presence as
+  // signature-backed. This does not open a forgery path: verifyBridgeCommitment
+  // recomputes sha256_commitment from canonical(outcome) + blinding_factor
+  // rather than trusting a claimed hash, so a tampered blinding_factor or
+  // pedersen_commitment only breaks that recompute (or drops the optional
+  // ZK-range check); it cannot make a false outcome verify against the signed
+  // sha256_commitment.
   return {
     bridge_commitment_id: commitmentId,
     session_id: outcome.session_id,
