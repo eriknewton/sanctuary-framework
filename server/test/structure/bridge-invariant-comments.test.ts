@@ -23,6 +23,18 @@ function expectNear(source: string, anchor: string, snippets: readonly string[])
 }
 
 describe("Bridge invariant comment hygiene", () => {
+  it("keeps the signature coverage boundary pinned at the commitment construction site", () => {
+    const source = read("server/src/bridge/bridge.ts");
+
+    expectNear(source, "// Signature coverage boundary:", [
+      "covers exactly `commitmentPayload`",
+      "ride OUTSIDE",
+      "must not treat their presence as",
+      "recomputes sha256_commitment",
+    ]);
+  });
+
+
   it("keeps the caller-supplied public-key trust boundary at the signature verifier", () => {
     const source = read("server/src/bridge/bridge.ts");
 
