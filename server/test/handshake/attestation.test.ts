@@ -74,6 +74,9 @@ function resignAttestation(
   attestation: SignedAttestation,
   agent: ReturnType<typeof makeAgent>
 ): void {
+  attestation.summary = attestation.summary
+    .replace(/^Attested: .*$/m, `Attested: ${attestation.body.attested_at}`)
+    .replace(/^Expires:  .*$/m, `Expires:  ${attestation.body.expires_at}`);
   const identity = agent.identityManager.getDefault();
   if (!identity) throw new Error("test identity missing");
   const encryptionKey = derivePurposeKey(agent.masterKey, "identity-encryption");
@@ -381,6 +384,34 @@ describe("Sovereignty Attestation Artifacts", () => {
 
       expect(result.valid).toBe(false);
       expect(result.errors.some(e => e.includes("signature is invalid"))).toBe(true);
+    });
+
+    it("rejects a summary rewritten outside the signed body", () => {
+      const agentA = makeAgent();
+      const agentB = makeAgent();
+
+      const shrA = agentSHR(agentA);
+      const shrB = agentSHR(agentB);
+      const verification = verifySHR(shrB);
+
+      const attestation = generateAttestation({
+        attesterSHR: shrA,
+        subjectSHR: shrB,
+        verificationResult: verification,
+        identityManager: agentA.identityManager as any,
+        masterKey: agentA.masterKey,
+      });
+
+      if ("error" in attestation) throw new Error(attestation.error);
+
+      attestation.summary = "Verified Sovereign: rewritten by an intermediary";
+
+      const result = verifyAttestation(attestation);
+
+      expect(result.valid).toBe(false);
+      expect(result.errors).toContain(
+        "Attestation summary does not match signed body"
+      );
     });
 
     it("detects tampered signature", () => {
