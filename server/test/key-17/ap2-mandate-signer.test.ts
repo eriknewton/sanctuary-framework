@@ -70,6 +70,32 @@ describe("ap2-mandate-signer", () => {
   });
 
   describe("verification rejects tampering", () => {
+    it("rejects a mutated signature algorithm label", () => {
+      const signed = signAp2Mandate(masterKey, operatorId, makeMandate());
+      const tampered = { ...signed, algorithm: "RS256" as never };
+
+      expect(
+        verifyAp2Mandate(tampered, { trustedPublicKey: signed.public_key })
+      ).toMatchObject({
+        valid: false,
+        signature_basis: "none",
+        reason: "signature_invalid",
+      });
+    });
+
+    it("rejects a non-string signature algorithm label", () => {
+      const signed = signAp2Mandate(masterKey, operatorId, makeMandate());
+      const malformed = { ...signed, algorithm: 7 as never };
+
+      expect(
+        verifyAp2Mandate(malformed, { trustedPublicKey: signed.public_key })
+      ).toMatchObject({
+        valid: false,
+        signature_basis: "none",
+        reason: "signature_invalid",
+      });
+    });
+
     it("rejects if mandate_type is modified", () => {
       const mandate = makeMandate();
       const signed = signAp2Mandate(masterKey, operatorId, mandate);

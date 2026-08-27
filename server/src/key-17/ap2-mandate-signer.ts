@@ -138,6 +138,18 @@ export function verifyAp2Mandate(
   signed: SignedAp2Mandate,
   opts: VerifyAp2MandateOptions = {}
 ): Ap2MandateVerificationResult {
+  // The algorithm label selects the verification contract. It is excluded
+  // from the signed mandate bytes, so accept only the one canonical suite
+  // this verifier implements before choosing a key or checking a signature.
+  if (signed.algorithm !== "EdDSA") {
+    return {
+      valid: false,
+      signature_basis: "none",
+      freshness: "not_checked",
+      reason: "signature_invalid",
+    };
+  }
+
   const { signature, algorithm: _algorithm, public_key, ...unsigned } = signed;
   const bytes = canonicalizeToBytes(unsigned);
   const freshness = "not_checked";
