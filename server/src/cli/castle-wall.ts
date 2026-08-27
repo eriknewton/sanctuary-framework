@@ -5,9 +5,9 @@ import {
 } from "node:child_process";
 import { createConnection } from "node:net";
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
-import { chmod, lstat, mkdir, readFile, readdir, realpath, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
 import { establishMaster } from "../core/master-custody.js";
@@ -206,11 +206,13 @@ export interface CastleWallCommandContext {
    */
   sysextProbe?: () => Promise<SysextState>;
   /**
-   * Override the installed-app embedded-sysext CFBundleVersion read used by
-   * the deactivation skew-notice preflight (tests). Resolves null whenever the
-   * version cannot be read; the preflight then stays silent. Defaults to
+   * Override the embedded-sysext CFBundleVersion read used by the
+   * deactivation skew-notice preflight (which probes the INSTALLED app
+   * bundle) and the deploy-preflight check (which probes the INCOMING
+   * bundle) (tests). Resolves null whenever the version cannot be read; the
+   * notice then stays silent and deploy-preflight warns. Defaults to
    * `plutil -extract CFBundleVersion raw` on the embedded extension's
-   * Info.plist inside the resolved app bundle.
+   * Info.plist inside the given app bundle.
    */
   embeddedSysextVersionProbe?: (appBundlePath: string) => Promise<string | null>;
   /**
@@ -222,26 +224,15 @@ export interface CastleWallCommandContext {
    */
   activatedSysextVersionsProbe?: () => Promise<string[]>;
   /**
-   * Override the raw `systemextensionsctl list` read used by the deploy-app
-   * tripwire (tests). Resolves the raw stdout, or null when the list itself
-   * could not be read; null (unreadable) is distinct from parseable output
-   * with no activated Castle Wall row (no record), because the tripwire
-   * warns on the first and stays silent on the second. Parsing is always
-   * {@link parseActivatedCastleWallBundleVersions}; overriding this seam
-   * never substitutes a different parser.
+   * Override the raw `systemextensionsctl list` read used by the
+   * deploy-preflight check (tests). Resolves the raw stdout, or null when
+   * the list itself could not be read; null (unreadable) is distinct from
+   * parseable output with no activated Castle Wall row (no record), because
+   * the check warns on the first and reports no-record on the second.
+   * Parsing is always {@link parseActivatedCastleWallBundleVersions};
+   * overriding this seam never substitutes a different parser.
    */
   sysextListRawProbe?: () => Promise<string | null>;
-  /**
-   * Override the deploy-app copy step (tests). Defaults to
-   * {@link stageAndSwapDeployAppCopy} (stage into a sibling bundle, then
-   * rename-swap). Receives the resolved absolute source and destination
-   * bundle paths and resolves the subprocess-style exit code plus stderr,
-   * plus the truthful previous-install disposition on failure.
-   */
-  deployAppCopyRunner?: (
-    sourceApp: string,
-    destApp: string,
-  ) => Promise<DeployAppCopyResult>;
   /** Override the boot-token custody path (F1 safe-mode; tests). */
   bootTokenPath?: string;
   /**
@@ -343,15 +334,17 @@ export interface CastleWallParsedArgs {
   parseError?: string;
   scope?: "once" | "session" | "always";
   requestId?: string;
-  /** `deploy-app --app <path>`: the signed .app bundle to deploy (source). */
+  /** `deploy-preflight --app <path>`: the incoming .app bundle to check. */
   app?: string;
   /**
-   * `deploy-app --dest <path>`: destination bundle path. Defaults to the
-   * canonical install location (see DEFAULT_DEPLOY_DEST_APP).
+   * `deploy-preflight --dest <path>`: the installed bundle path the check
+   * reports against. Defaults to the canonical install location (see
+   * DEFAULT_DEPLOY_DEST_APP). Never touched: the verb reads nothing from and
+   * writes nothing to this path.
    */
   dest?: string;
   /**
-   * `deploy-app --allow-extension-skew`: explicit override for the
+   * `deploy-preflight --allow-extension-skew`: explicit override for the
    * extension-version tripwire. The override path always prints exactly what
    * it is overriding; it is never implied by any other flag.
    */
@@ -4266,7 +4259,7 @@ async function defaultEmbeddedSysextVersionProbe(
 /**
  * Raw `systemextensionsctl list` stdout, or null when the list could not be
  * read at all. Shared by the deactivation skew notice (via the versions probe
- * below) and the deploy-app tripwire, which needs the unreadable/empty
+ * below) and the deploy-preflight check, which needs the unreadable/empty
  * distinction the parsed form erases.
  */
 async function defaultSysextListRawProbe(): Promise<string | null> {
@@ -4288,17 +4281,20 @@ async function defaultActivatedSysextVersionsProbe(): Promise<string[]> {
  * Launch alone only re-registers when the background signer helper is
  * enabled; with the helper unregistered, launch first lands in an
  * approval-gated state, so the guidance names the helper approval and the
- * wait honestly. Mirrored wire text: must stay in agreement with
+ * wait honestly. Single server-side source: every CLI surface that tells the
+ * operator how to re-register (the deactivation skew notice, the uninstall
+ * remediation note in server/src/cli/uninstall.ts, and the deploy-preflight
+ * refusal/override text) reads THIS constant, so the supported order cannot
+ * drift per surface. Mirrored wire text across languages: the value must
+ * stay byte-identical to the launch-through-complete span of
+ * SYSEXT_REREGISTRATION_GUIDANCE's Swift twin, the constant
  * extensionVersionSkewGuidance in
- * castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift and
- * the remediation note in server/src/cli/uninstall.ts. Every CLI surface
- * that tells the operator how to re-register (the deactivation skew notice,
- * and the deploy-app refusal/override/success text) reads THIS constant, so
- * the supported order cannot drift per surface.
+ * castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift (the
+ * merged #1323 sentence), whose comment pins this constant by name.
  */
-const SYSEXT_REREGISTRATION_GUIDANCE =
-  "launch Sanctuary-CastleWall.app at the console so its activation flow " +
-  "re-registers the extension, approve or re-enable the Sanctuary " +
+export const SYSEXT_REREGISTRATION_GUIDANCE =
+  "launch Sanctuary-CastleWall.app at the console so its normal activation " +
+  "flow re-registers the extension, approve or re-enable the Sanctuary " +
   "background helper if macOS prompts for it, wait for re-registration to " +
   "complete";
 
@@ -4307,8 +4303,8 @@ const SYSEXT_REREGISTRATION_GUIDANCE =
  * defect.sysext-deactivation-extension-not-found): when the installed app's
  * embedded extension version differs from every activated record's version,
  * say so before submitting the request, so an operator who then sees a
- * refusal already knows the attended remediation (launch the app at the
- * console so its activation flow re-registers the extension, then re-run).
+ * refusal already knows the attended remediation (the supported order in
+ * SYSEXT_REREGISTRATION_GUIDANCE; never paraphrased here, so it cannot drift).
  * NOTICE ONLY: any probe failure degrades to silence, never to a block - a
  * diagnostic preflight must not add a failure mode to teardown, and the
  * notice never blocks or mutates anything.
@@ -4349,252 +4345,29 @@ async function emitSysextVersionSkewNotice(
 const DEFAULT_DEPLOY_DEST_APP = "/Applications/Sanctuary-CastleWall.app";
 
 /**
- * Ceiling for one deploy copy/remove subprocess. 10 minutes = a generous
- * bound for ditto over a multi-hundred-MB wrapped bundle onto a slow local
- * disk; the deploy is local and operator-attended, so a loud timeout beats a
- * silent hang.
- */
-const DEPLOY_APP_COPY_TIMEOUT_MS = 10 * 60_000;
-
-function execFileResult(
-  command: string,
-  args: string[],
-  timeoutMs: number,
-): Promise<{ code: number; stderr: string }> {
-  return new Promise((resolvePromise) => {
-    nodeExecFile(
-      command,
-      args,
-      { encoding: "utf8", timeout: timeoutMs },
-      (error, _stdout, stderr) => {
-        if (error) {
-          const rawCode = (error as { code?: unknown }).code;
-          // A killed/timed-out subprocess reports no numeric code; anything
-          // non-zero-ish must surface as failure, never as success.
-          const code =
-            typeof rawCode === "number" && rawCode !== 0 ? rawCode : 1;
-          resolvePromise({
-            code,
-            stderr: (stderr ?? "").trim() || error.message,
-          });
-          return;
-        }
-        resolvePromise({ code: 0, stderr: "" });
-      },
-    );
-  });
-}
-
-/**
- * Result of one deploy-app copy/swap attempt. `previousInstall` is the
- * truthful disposition of whatever bundle was installed at the destination
- * before the attempt, so a failure message can state exactly what the
- * failure left behind: the default runner reports it on every failure path;
- * on success it is absent (the previous bundle was replaced).
- */
-export interface DeployAppCopyResult {
-  code: number;
-  stderr: string;
-  previousInstall?: "none" | "intact" | "restored" | "gone";
-}
-
-/**
- * Subprocess seam for {@link stageAndSwapDeployAppCopy} (tests fake ONLY
- * this, so the real stat/staging/swap/rollback/cleanup sequencing is what
- * the tests exercise). Defaults to {@link execFileResult}.
- */
-export type DeploySubprocessRunner = (
-  command: string,
-  args: string[],
-  timeoutMs: number,
-) => Promise<{ code: number; stderr: string }>;
-
-/**
- * Replace, never merge: `ditto src dst` MERGES into an existing tree, and a
- * merged bundle keeps stale files the new signature does not cover, so the
- * previous bundle is always swapped out whole. The ".app"-suffix and
- * source/destination-disjointness guards live in runDeployApp, before this
- * runner is reached.
- *
- * Swap sequencing invariant: the previous install is never DELETED until the
- * new bundle is fully in place. The incoming bundle is copied to a sibling
- * staging bundle first (same parent directory, so the renames below are
- * same-volume metadata operations, not copies), the old bundle is renamed
- * aside, the staging bundle is renamed into place, and only then is the
- * old bundle deleted. Remove-then-copy would widen the no-app window to the
- * whole copy duration and leave no restore path on a failed copy; with this
- * order every failure before the final rename keeps the previous install
- * either untouched or restorable by a single rename back.
- */
-export async function stageAndSwapDeployAppCopy(
-  sourceApp: string,
-  destApp: string,
-  runSubprocess: DeploySubprocessRunner = execFileResult,
-): Promise<DeployAppCopyResult> {
-  const destParent = dirname(destApp);
-  const stagingApp = join(
-    destParent,
-    `.sanctuary-deploy-staging-${process.pid}.app`,
-  );
-  const oldAsideApp = join(
-    destParent,
-    `.sanctuary-deploy-old-${process.pid}.app`,
-  );
-  const pathExists = (p: string) =>
-    lstat(p).then(
-      () => true,
-      () => false,
-    );
-  // Best-effort: every failure exit below runs this, so a failed deploy
-  // never strands a hidden staging bundle in the destination's parent.
-  const removeStaging = () =>
-    runSubprocess("/bin/rm", ["-rf", stagingApp], DEPLOY_APP_COPY_TIMEOUT_MS);
-
-  const destExists = await pathExists(destApp);
-  const previousOnUntouchedFailure = destExists ? "intact" : "none";
-
-  // A stale staging or moved-aside bundle (a crashed earlier run reusing this
-  // pid) must be cleared first: ditto would MERGE into a stale staging tree,
-  // and mv would move a bundle INTO a stale aside directory instead of
-  // renaming over it.
-  for (const stale of [stagingApp, oldAsideApp]) {
-    if (!(await pathExists(stale))) continue;
-    const cleared = await runSubprocess(
-      "/bin/rm",
-      ["-rf", stale],
-      DEPLOY_APP_COPY_TIMEOUT_MS,
-    );
-    if (cleared.code !== 0) {
-      return {
-        code: cleared.code,
-        stderr: `could not clear stale deploy artifact ${stale}: ${cleared.stderr}`,
-        previousInstall: previousOnUntouchedFailure,
-      };
-    }
-  }
-
-  // Stage the full copy BEFORE the previous install is touched: a copy
-  // failure (disk full, unreadable source) must leave the installed bundle
-  // exactly as it was.
-  const staged = await runSubprocess(
-    "/usr/bin/ditto",
-    [sourceApp, stagingApp],
-    DEPLOY_APP_COPY_TIMEOUT_MS,
-  );
-  if (staged.code !== 0) {
-    await removeStaging();
-    return { ...staged, previousInstall: previousOnUntouchedFailure };
-  }
-
-  if (destExists) {
-    const movedAside = await runSubprocess(
-      "/bin/mv",
-      [destApp, oldAsideApp],
-      DEPLOY_APP_COPY_TIMEOUT_MS,
-    );
-    if (movedAside.code !== 0) {
-      await removeStaging();
-      return { ...movedAside, previousInstall: "intact" };
-    }
-  }
-
-  const swappedIn = await runSubprocess(
-    "/bin/mv",
-    [stagingApp, destApp],
-    DEPLOY_APP_COPY_TIMEOUT_MS,
-  );
-  if (swappedIn.code !== 0) {
-    await removeStaging();
-    if (!destExists) {
-      return { ...swappedIn, previousInstall: "none" };
-    }
-    // The old bundle was already renamed aside; a single rename back is the
-    // restore path the sequencing above preserved. Only if that rename ALSO
-    // fails is the previous install truthfully reported gone.
-    const restored = await runSubprocess(
-      "/bin/mv",
-      [oldAsideApp, destApp],
-      DEPLOY_APP_COPY_TIMEOUT_MS,
-    );
-    if (restored.code === 0) {
-      return { ...swappedIn, previousInstall: "restored" };
-    }
-    return {
-      code: swappedIn.code,
-      stderr:
-        `${swappedIn.stderr}; restoring the previous bundle from ` +
-        `${oldAsideApp} also failed: ${restored.stderr}`,
-      previousInstall: "gone",
-    };
-  }
-
-  if (destExists) {
-    const removedOld = await runSubprocess(
-      "/bin/rm",
-      ["-rf", oldAsideApp],
-      DEPLOY_APP_COPY_TIMEOUT_MS,
-    );
-    if (removedOld.code !== 0) {
-      // The swap itself succeeded: the new bundle is in place, so this is a
-      // success with a loud leftover, never a failure of a completed deploy.
-      return {
-        code: 0,
-        stderr:
-          `deployed, but could not remove the superseded bundle moved ` +
-          `aside at ${oldAsideApp}; remove it manually (${removedOld.stderr})`,
-      };
-    }
-  }
-  return { code: 0, stderr: "" };
-}
-
-/**
- * Canonical (symlink-resolved) form of a destination path that may not exist
- * yet: realpath of the deepest existing ancestor with the not-yet-existing
- * suffix re-appended. Symlinks must be resolved BEFORE the disjointness
- * check in runDeployApp, because an alias can hide in any existing
- * component (e.g. a symlinked parent directory pointing back into the
- * source tree), and a literal string comparison would call two spellings of
- * the same bundle distinct.
- */
-async function canonicalizeDeployDestination(destPath: string): Promise<string> {
-  let existing = destPath;
-  const suffix: string[] = [];
-  for (;;) {
-    try {
-      const real = await realpath(existing);
-      return suffix.length === 0 ? real : join(real, ...suffix);
-    } catch {
-      const parent = dirname(existing);
-      // Filesystem root reached and still unresolvable: nothing left to
-      // resolve, so re-assemble the path as given.
-      if (parent === existing) return join(existing, ...suffix);
-      suffix.unshift(basename(existing));
-      existing = parent;
-    }
-  }
-}
-
-/**
- * `sanctuary castle-wall deploy-app --app <bundle> [--dest <path>]
- * [--allow-extension-skew]`: copy a signed Castle Wall app bundle into place
- * with a version tripwire in front of the overwrite (graph row
- * defect.sysext-deactivation-extension-not-found).
+ * `sanctuary castle-wall deploy-preflight --app <bundle> [--dest <path>]
+ * [--allow-extension-skew]`: CHECK-ONLY preflight for replacing the signed
+ * Castle Wall app bundle (graph row
+ * defect.sysext-deactivation-extension-not-found). The verb performs no
+ * filesystem mutation of any kind - it never removes, renames, creates, or
+ * writes any file; copying the bundle into place stays with the operator's
+ * own deploy tooling. This verb only answers whether that copy would leave
+ * the app and the OS activated extension in step.
  *
  * The tripwire: when the OS holds an activated Castle Wall extension record
  * whose CFBundleVersion differs from the version embedded in the INCOMING
  * bundle, replacing the app on disk without a follow-up re-activation leaves
- * the activated record describing an extension the deployed app no longer
- * carries, and the OS can then refuse that app's own later system-extension
- * requests. The refusal here keeps the app and the activated record in step
- * by making the operator choose a supported order explicitly.
+ * the activated record describing an extension the app no longer carries,
+ * and the OS can then refuse that app's own later system-extension requests
+ * (including deactivation). The exit-2 refusal makes the operator choose a
+ * supported order explicitly before their tooling copies anything.
  *
  * ADVISORY-STRICT, not fail-closed: deploying the app is not a security
  * boundary (the wall's enforcement gates live in the activation and arm
- * paths), so an unreadable probe degrades to a loud warning and the deploy
- * proceeds; only a POSITIVELY OBSERVED skew refuses.
+ * paths), so an unreadable probe degrades to a loud warning and exit 0;
+ * only a POSITIVELY OBSERVED skew exits non-zero.
  */
-export async function runDeployApp(
+export async function runDeployPreflight(
   argv: string[] = [],
   ctx: CastleWallCommandContext = {},
 ): Promise<number> {
@@ -4604,14 +4377,14 @@ export async function runDeployApp(
   const parsed = parseCastleWallArgs(argv);
   if (writeCastleWallParseError(parsed, err)) return 2;
   if (platform !== "darwin") {
-    write(err, "Error: castle-wall deploy-app is macOS-only.\n");
+    write(err, "Error: castle-wall deploy-preflight is macOS-only.\n");
     return 2;
   }
   if (!parsed.app) {
     write(
       err,
-      "Usage: sanctuary castle-wall deploy-app --app <signed .app bundle> " +
-        "[--dest <path>] [--allow-extension-skew]\n",
+      "Usage: sanctuary castle-wall deploy-preflight --app <signed .app " +
+        "bundle> [--dest <installed app path>] [--allow-extension-skew]\n",
     );
     return 2;
   }
@@ -4623,46 +4396,14 @@ export async function runDeployApp(
       ? parsed.dest
       : resolve(process.cwd(), parsed.dest)
     : DEFAULT_DEPLOY_DEST_APP;
-  // The copy runner swaps destApp out (rename aside, then delete); requiring
-  // the ".app" suffix keeps a mistyped --dest (e.g. /Applications) from
-  // turning "replace the bundle" into "remove the directory".
-  if (!destApp.endsWith(".app")) {
-    write(err, `Error: --dest must name a .app bundle path, got '${destApp}'.\n`);
-    return 2;
-  }
+  // A missing incoming bundle is a usage-class error, never an "unreadable
+  // probe": a typo'd --app must refuse loudly, not warn and exit 0.
   const sourceIsDir = await stat(sourceApp).then(
     (info) => info.isDirectory(),
     () => false,
   );
   if (!sourceIsDir) {
     write(err, `Error: no app bundle at ${sourceApp}.\n`);
-    return 2;
-  }
-  const canonicalSource = await realpath(sourceApp).catch(() => null);
-  if (canonicalSource === null) {
-    write(err, `Error: could not resolve the source bundle path ${sourceApp}.\n`);
-    return 2;
-  }
-  const canonicalDest = await canonicalizeDeployDestination(destApp);
-  const withTrailingSep = (p: string) => (p.endsWith(sep) ? p : p + sep);
-  const destAliasesSource =
-    canonicalDest === canonicalSource ||
-    canonicalDest.startsWith(withTrailingSep(canonicalSource)) ||
-    canonicalSource.startsWith(withTrailingSep(canonicalDest));
-  if (destAliasesSource) {
-    // Alias-refusal invariant: the copy runner renames the destination aside
-    // and deletes it, so it may only ever run on a destination proven
-    // DISTINCT FROM and DISJOINT WITH the source AFTER symlink resolution.
-    // Equality, or ancestry in either direction, turns "replace the install"
-    // into "destroy the source before it can be copied".
-    write(
-      err,
-      `Error: refusing to deploy: --dest ${destApp} resolves to ` +
-        `${canonicalDest}, which is not disjoint with the source bundle at ` +
-        `${canonicalSource}. Replacing that destination would destroy the ` +
-        `source before it could be copied; choose a destination outside the ` +
-        `source bundle.\n`,
-    );
     return 2;
   }
 
@@ -4672,100 +4413,76 @@ export async function runDeployApp(
   const rawList = await (ctx.sysextListRawProbe ?? defaultSysextListRawProbe)();
   if (embedded === null || rawList === null) {
     // Advisory-strict (see the verb doc): an unreadable probe warns and
-    // proceeds. Refusing here would add a failure mode to deploy that the
-    // tripwire cannot justify, and silently skipping the check would hide
-    // that it never ran.
+    // exits 0. Refusing here would add a failure mode the tripwire cannot
+    // justify, and silently skipping the check would hide that it never ran;
+    // the warning names WHICH probe was unreadable so the operator can judge
+    // the gap.
     const which =
       embedded === null
         ? `the embedded extension version in ${sourceApp}`
         : "the OS activated-extension list";
     write(
       err,
-      `Warning: could not read ${which}; the extension-version tripwire ` +
-        `cannot run, proceeding with deploy.\n`,
+      `Warning: could not read ${which}; the extension-version preflight ` +
+        `cannot decide, and no skew was positively observed.\n`,
     );
-  } else {
-    // Version identity comes only from the column/team-bound parser shipped
-    // with the deactivation skew notice; a weaker ad-hoc grep here would let
-    // a foreign-team or ambiguous row manufacture (or mask) a skew verdict.
-    const activated = parseActivatedCastleWallBundleVersions(rawList);
-    if (activated.length > 0 && !activated.includes(embedded)) {
-      if (parsed.allowExtensionSkew) {
-        // The override discloses exactly what it is overriding: the skew and
-        // its consequence, so a scripted override still leaves the truth in
-        // the transcript.
-        write(
-          err,
-          `Overriding the extension-version tripwire: deploying an app that ` +
-            `embeds system-extension version ${embedded} while the OS ` +
-            `activated record is ${activated.join(", ")}. Until ` +
-            `re-registration completes, macOS can refuse the deployed app's ` +
-            `system-extension requests against the older activated record; ` +
-            `to re-register, ${SYSEXT_REREGISTRATION_GUIDANCE}.\n`,
-        );
-      } else {
-        // Refusal invariant: an app replaced at a different embedded-extension
-        // version without re-activation leaves the OS activation record
-        // describing the OLD extension, and the OS can then refuse the new
-        // app's own system-extension requests (including deactivation), so
-        // the overwrite is refused unless the operator names a supported
-        // order explicitly.
-        write(
-          err,
-          `Refusing to replace ${destApp}: the incoming app embeds ` +
-            `system-extension version ${embedded} but the OS activated ` +
-            `record is ${activated.join(", ")}. Deploying without ` +
-            `re-activation leaves the activated extension out of step with ` +
-            `the app. Supported orders: (a) re-run with ` +
-            `--allow-extension-skew, then ${SYSEXT_REREGISTRATION_GUIDANCE}; ` +
-            `or (b) deactivate the extension first (sanctuary uninstall), ` +
-            `then re-run this deploy.\n`,
-        );
-        return 1;
-      }
-    }
+    return 0;
   }
-
-  const copy = await (ctx.deployAppCopyRunner ?? stageAndSwapDeployAppCopy)(
-    sourceApp,
-    destApp,
-  );
-  if (copy.code !== 0) {
-    // Every failure message states exactly what the failure left behind: an
-    // operator who just watched a deploy fail must not have to inspect the
-    // destination to learn whether an app is still installed there.
-    const disclosure =
-      copy.previousInstall === "intact"
-        ? `The previously installed bundle at ${destApp} is intact.`
-        : copy.previousInstall === "restored"
-          ? `The previously installed bundle at ${destApp} was moved aside ` +
-            `and has been restored.`
-          : copy.previousInstall === "gone"
-            ? `The previously installed bundle at ${destApp} was removed ` +
-              `and could NOT be restored; no app is installed there now.`
-            : copy.previousInstall === "none"
-              ? `No previous install existed at ${destApp}; nothing was removed.`
-              : `The copy runner did not report the state of any previous ` +
-                `install at ${destApp}.`;
+  // Version identity comes only from the column/team-bound parser shared
+  // with the deactivation skew notice; a weaker ad-hoc grep here would let a
+  // foreign-team or ambiguous row manufacture (or mask) a skew verdict.
+  const activated = parseActivatedCastleWallBundleVersions(rawList);
+  if (activated.length === 0) {
+    write(
+      out,
+      `Preflight OK: the OS holds no activated Castle Wall system-extension ` +
+        `record, so no version skew is possible; this check does not ` +
+        `constrain replacing ${destApp}.\n`,
+    );
+    return 0;
+  }
+  if (activated.includes(embedded)) {
+    write(
+      out,
+      `Preflight OK: the incoming bundle embeds system-extension version ` +
+        `${embedded}, matching the OS activated record; replacing ${destApp} ` +
+        `keeps the app and the activated extension in step.\n`,
+    );
+    return 0;
+  }
+  if (parsed.allowExtensionSkew) {
+    // The override discloses exactly what it is overriding: the skew and its
+    // consequence, so a scripted override still leaves the truth in the
+    // transcript.
     write(
       err,
-      `Error: deploy copy failed (${copy.stderr || `exit ${copy.code}`}). ` +
-        `${disclosure}\n`,
+      `Overriding the extension-version tripwire: accepting an incoming ` +
+        `bundle that embeds system-extension version ${embedded} while the ` +
+        `OS activated record is ${activated.join(", ")}. Until ` +
+        `re-registration completes, macOS can refuse that app's ` +
+        `system-extension requests against the older activated record; ` +
+        `after replacing the bundle, ${SYSEXT_REREGISTRATION_GUIDANCE}.\n`,
     );
-    return 1;
+    return 0;
   }
-  if (copy.stderr) {
-    // Success with a leftover (e.g. the superseded bundle moved aside could
-    // not be deleted): the deploy stands, the residue is surfaced loudly.
-    write(err, `Warning: ${copy.stderr}\n`);
-  }
-  write(out, `Deployed ${sourceApp} -> ${destApp}.\n`);
+  // Refusal invariant: an app replaced at a different embedded-extension
+  // version without re-activation leaves the OS activation record describing
+  // the OLD extension, and the OS can then refuse the new app's own
+  // system-extension requests (including deactivation), so a positively
+  // observed skew exits 2 unless the operator names a supported order
+  // explicitly.
   write(
-    out,
-    `If the system extension is not yet activated at this version, ` +
-      `${SYSEXT_REREGISTRATION_GUIDANCE}.\n`,
+    err,
+    `Extension-version skew: the incoming bundle at ${sourceApp} embeds ` +
+      `system-extension version ${embedded} but the OS activated record is ` +
+      `${activated.join(", ")}. Replacing ${destApp} without re-activation ` +
+      `leaves the activated extension out of step with the app. Supported ` +
+      `orders: (a) re-run with --allow-extension-skew to accept the skew, ` +
+      `replace the bundle with your deploy tooling, then ` +
+      `${SYSEXT_REREGISTRATION_GUIDANCE}; or (b) deactivate the extension ` +
+      `first (sanctuary uninstall), then re-run this preflight.\n`,
   );
-  return 0;
+  return 2;
 }
 
 /**
@@ -6070,9 +5787,9 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
   const since = consumeFlagValue(fortress.argv, "--since");
   if (since.error !== undefined) return { ...parsed, parseError: since.error };
   if (since.value !== undefined) parsed.since = since.value;
-  // deploy-app value flags ride the same consumeFlagValue chokepoint as
+  // deploy-preflight value flags ride the same consumeFlagValue chokepoint as
   // --fortress/--since (never a per-verb hand parser): a dropped value must
-  // refuse loudly, not silently deploy to a default destination.
+  // refuse loudly, not silently check against a default path.
   const app = consumeFlagValue(since.argv, "--app");
   if (app.error !== undefined) return { ...parsed, parseError: app.error };
   if (app.value !== undefined) parsed.app = app.value;
