@@ -30,6 +30,9 @@ declare const __SANCTUARY_SOURCE_SHA__: string;
 const execFileAsync = promisify(nodeExecFile);
 
 export const AGENT_INSTALL_CONTRACT = "sanctuary.agent-install.v1";
+// Must match DEFAULT_DEPLOY_DEST_APP in server/src/cli/castle-wall.ts (that
+// module cannot import this one without a cycle): install observation and the
+// deploy-app verb must name the same canonical bundle path.
 export const DEFAULT_CASTLE_WALL_APP = "/Applications/Sanctuary-CastleWall.app";
 export const DEFAULT_CASTLE_WALL_NODE = join(
   DEFAULT_CASTLE_WALL_APP,
