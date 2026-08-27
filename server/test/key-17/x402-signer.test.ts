@@ -144,6 +144,32 @@ describe("x402-signer", () => {
   });
 
   describe("verification rejects tampering", () => {
+    it("rejects a mutated signature algorithm label", () => {
+      const signed = signX402Request(masterKey, operatorId, makeRequest());
+      const tampered = { ...signed, algorithm: "RS256" as never };
+
+      expect(
+        verifyX402Request(tampered, { trustedPublicKey: signed.public_key })
+      ).toMatchObject({
+        valid: false,
+        signature_basis: "none",
+        reason: "signature_invalid",
+      });
+    });
+
+    it("rejects a non-string signature algorithm label", () => {
+      const signed = signX402Request(masterKey, operatorId, makeRequest());
+      const malformed = { ...signed, algorithm: 7 as never };
+
+      expect(
+        verifyX402Request(malformed, { trustedPublicKey: signed.public_key })
+      ).toMatchObject({
+        valid: false,
+        signature_basis: "none",
+        reason: "signature_invalid",
+      });
+    });
+
     it("rejects if amount is modified after signing", () => {
       const request = makeRequest();
       const signed = signX402Request(masterKey, operatorId, request);
