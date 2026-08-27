@@ -16,6 +16,7 @@ import {
 } from "../../src/sdw/adapters/claude-code-file-adapter.js";
 import { ingestCodexMemoryDirectory } from "../../src/sdw/adapters/codex-memory-file-adapter.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 import {
   restoreMemoryTranscodeArchive,
   transcodeMemoryDirectory,
@@ -50,7 +51,7 @@ async function makeAdapter(prefix: string): Promise<{
   const vaultRoot = await tempDir(prefix);
   return {
     vaultRoot,
-    adapter: new SdwMemoryBackendAdapter({
+    adapter: new TestSdwMemoryBackendAdapter({
       storage: new FilesystemStorage(vaultRoot),
       masterKey: MASTER_KEY,
       fortressId: "fortress:memory-transcode",
@@ -151,6 +152,25 @@ describe("manual reversible memory transcode", () => {
     expect(await allRawStorageText(vaultRoot)).not.toContain(
       "Prefer brief status notes with concrete next steps",
     );
+    const archiveRecords = (await adapter.listPassages()).filter((passage) =>
+      passage.passage_id === result.archive_id ||
+      metadataValue(passage, "memory_transcode_archive_id") === result.archive_id
+    );
+    expect(archiveRecords.length).toBeGreaterThan(1);
+    for (const passage of archiveRecords) {
+      const provenance = await adapter.getPassageProvenance(passage.passage_id);
+      expect(provenance.status).toBe("verified");
+      if (provenance.status !== "verified") throw new Error("expected verified transcode provenance");
+      expect(provenance.companion.origin.body).toMatchObject({
+        author_agent_id: "system:memory-transcode",
+        ingress_channel: "memory_transcode",
+      });
+      expect(provenance.companion.admission.body).toMatchObject({
+        admission_channel: "local_write",
+        origin_trust_tier: "local_attested",
+        verification_basis: "local_primary_identity",
+      });
+    }
 
     const restored = join(parent, "restored-source");
     await expect(

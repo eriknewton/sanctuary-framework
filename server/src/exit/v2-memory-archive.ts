@@ -13,18 +13,37 @@ import {
   EXIT_V2_MANIFEST_VERSION,
   EXIT_V2_SDW_MEMORY_AAD_VERSION,
   EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT,
+  EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT_V2,
   EXIT_V2_SDW_MEMORY_LINEAGE_VERSION,
   EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT,
+  EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2,
   EXIT_V2_SIGNATURE_SCHEME,
   SDW_MEMORY_ARCHIVE_ARTIFACT_KIND,
   type ExitV2SdwMemoryAad,
   type ExitV2SdwMemoryArtifact,
+  type ExitV2SdwMemoryArtifactUnion,
   type ExitV2SdwMemoryLineageBody,
   type ExitV2SdwMemoryLogicalFile,
   type ExitV2SdwMemoryLogicalPayload,
+  type ExitV2SdwMemoryLogicalPayloadUnion,
+  type ExitV2SdwMemoryLogicalPayloadV2,
   type ExitV2SdwMemoryManifest,
   type ExitV2SdwMemorySignedLineage,
 } from "../contracts/v1.2/exit-bundle-manifest.js";
+import {
+  checkKnownSignersStructure,
+  knownSignersSigningBytes,
+  resolveKnownSigners,
+  type KnownSignersArtifact,
+  type KnownSignersEntry,
+} from "./verifier.js";
+import {
+  createBoundedMemoryProvenanceSignerResolver,
+  parseMemoryProvenanceCompanionValue,
+  verifyMemoryProvenanceCompanion,
+  type MemoryProvenanceCompanion,
+  MAX_MEMORY_PROVENANCE_SIGNER_ENTRIES,
+} from "../sdw/memory-provenance-contract.js";
 import { decrypt, encrypt, type EncryptedPayload } from "../core/encryption.js";
 import {
   fromBase64urlStrict,
@@ -43,6 +62,19 @@ import type {
   MemoryPassage,
   MemoryPassageInput,
 } from "../sdw/adapters/memory-backend.js";
+import { exitV2ForeignImportIngress, legacyExitV1ImportIngress, memoryTranscodeIngress } from "../sdw/memory-provenance-ingress.js";
+import {
+  KNOWN_SIGNERS_NAMESPACE,
+  KnownSignersStore,
+  knownSignerStorageKey,
+} from "../reputation/known-signers-store.js";
+import type { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
+import { passageContentHash } from "../sdw/write-gate.js";
+import { isMemoryProvenanceOutboundSyncEligible } from "../sdw/memory-provenance-routing.js";
+import {
+  evaluateMemoryProvenanceSignerEligibility,
+  type MemoryProvenanceBadSignerAuthority,
+} from "../sdw/memory-provenance-bad-signers.js";
 import {
   buildMemoryTranscodeArchivePassages,
   MEMORY_TRANSCODE_VERSION,
@@ -89,13 +121,16 @@ export interface ExitV2MemorySigner {
 }
 
 export interface ExportExitV2SdwMemoryArchiveOptions {
-  readonly adapter: MemoryBackendAdapter;
+  readonly adapter: MemoryBackendAdapter & Pick<SdwMemoryBackendAdapter,
+    "getPassageProvenance" | "getMemoryIntegrityState">;
   readonly archiveId: string;
   readonly sourceFortressId: string;
   readonly exportApprovalAuditId: string;
   readonly sourceSanctuaryVersion: string;
   readonly signer: ExitV2MemorySigner;
   readonly now?: () => string;
+  readonly formatVersion?: 1 | 2;
+  readonly resolveProvenanceSigner?: (identityId: string, did: string) => Uint8Array | undefined;
 }
 
 export interface ExportExitV2SdwMemoryArchiveResult {
@@ -130,6 +165,9 @@ export interface ImportExitV2SdwMemoryArchiveOptions
   readonly adapter: MemoryBackendAdapter;
   readonly signer: ExitV2MemorySigner;
   readonly now?: () => string;
+  readonly knownSignersStore?: KnownSignersStore;
+  readonly onProvenanceSignerPersisted?: (did: string, publicKey: Uint8Array) => void;
+  readonly badSignerAuthority?: MemoryProvenanceBadSignerAuthority;
 }
 
 export interface ImportExitV2SdwMemoryArchiveResult {
@@ -141,6 +179,96 @@ export interface ImportExitV2SdwMemoryArchiveResult {
   readonly lineage_signed_by: string;
 }
 
+export interface ExitV2SdwMemoryAdmissionPlan {
+  readonly importId: string;
+  readonly locations: readonly { namespace: string; key: string }[];
+}
+
+function buildDestinationLineageBody(options: {
+  readonly validated: ValidatedArchive;
+  readonly adapter: MemoryBackendAdapter;
+  readonly signer: ExitV2MemorySigner;
+  readonly destinationArchiveId: string;
+  readonly importedAt: string;
+}): ExitV2SdwMemoryLineageBody {
+  return {
+    version: EXIT_V2_SDW_MEMORY_LINEAGE_VERSION,
+    signature_scheme: EXIT_V2_SIGNATURE_SCHEME,
+    source_fortress_id: options.validated.sourceFortressId,
+    source_archive_lineage_ref: options.validated.payload.source_archive_lineage_ref,
+    source_artifact_sha256: options.validated.artifactSha256,
+    destination_fortress_id: options.signer.fortress_id,
+    destination_owner_ref: options.adapter.ownerRef,
+    destination_archive_id: options.destinationArchiveId,
+    source_harness: options.validated.payload.source_harness,
+    destination_harness: options.validated.payload.destination_harness,
+    source_set_sha256: options.validated.payload.source_set_sha256,
+    imported_at: options.importedAt,
+    destination_signer_identity_id: options.signer.identity_id,
+    destination_signer_public_key: options.signer.public_key,
+    ...(options.signer.did === undefined
+      ? {}
+      : { destination_signer_did: options.signer.did }),
+  };
+}
+
+/** Read-only complete write-set preflight; its caller supplies a key copy. */
+export async function planExitV2SdwMemoryAdmission(options: {
+  readonly manifest: ExitV2SdwMemoryManifest;
+  readonly artifactBytes: Uint8Array;
+  readonly transferKey: Uint8Array;
+  readonly adapter: SdwMemoryBackendAdapter;
+  readonly signer: ExitV2MemorySigner;
+  /** Exact commit timestamp the paired import will use. */
+  readonly importedAt?: string;
+  readonly badSignerAuthority?: MemoryProvenanceBadSignerAuthority;
+}): Promise<ExitV2SdwMemoryAdmissionPlan> {
+  const validated = validateAndDecrypt(options);
+  await assertArchiveBadSignersEligible(validated, options.badSignerAuthority);
+  if (validated.payload.format === EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2 &&
+      await options.adapter.getMemoryIntegrityState() !== "state_COMPLETE") {
+    throw new Error("Exit V2 signed-memory admission preflight requires completed provenance migration");
+  }
+  const destinationArchiveId = options.adapter.derivePassageId(
+    DESTINATION_ARCHIVE_ID_DOMAIN, validated.artifactSha256,
+  );
+  const lineagePassageId = options.adapter.derivePassageId(
+    DESTINATION_LINEAGE_ID_DOMAIN, validated.payload.source_archive_lineage_ref,
+  );
+  const archiveInputs = buildMemoryTranscodeArchivePassages(
+    options.adapter, destinationArchiveId, validated.logicalArchive,
+    "2000-01-01T00:00:00.000Z",
+  );
+  // Ed25519 signatures have a fixed encoded length. Using a same-length
+  // placeholder and a fixed-width ISO timestamp therefore plans the exact
+  // lineage chunk count without performing a signature during preflight.
+  const plannedLineageBody = buildDestinationLineageBody({
+    validated,
+    adapter: options.adapter,
+    signer: options.signer,
+    destinationArchiveId,
+    importedAt: options.importedAt ?? "2000-01-01T00:00:00.000Z",
+  });
+  const plannedLineageText = canonicalize({
+    body: plannedLineageBody,
+    signature: toBase64url(new Uint8Array(ED25519_SIGNATURE_BYTES)),
+  } satisfies ExitV2SdwMemorySignedLineage);
+  const passageLocations = options.adapter.planPassageWriteSet([
+    ...archiveInputs,
+    { passage_id: lineagePassageId, text: plannedLineageText },
+  ]);
+  const signerLocations = validated.payload.format === EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2
+    ? validated.payload.files.map((file) => ({
+        namespace: KNOWN_SIGNERS_NAMESPACE,
+        key: knownSignerStorageKey(file.provenance.origin.body.signer_did, "memory_provenance"),
+      }))
+    : [];
+  return {
+    importId: validated.artifactSha256,
+    locations: [...signerLocations, ...passageLocations],
+  };
+}
+
 export interface ParticipantExitSdwMemoryRetentionReceipt {
   readonly memory_portability_complete: boolean;
   readonly retained_sdw_archive_count: number;
@@ -150,8 +278,12 @@ export interface ParticipantExitSdwMemoryRetentionReceipt {
 interface ValidatedArchive {
   readonly artifactSha256: string;
   readonly sourceFortressId: string;
-  readonly payload: ExitV2SdwMemoryLogicalPayload;
+  readonly payload: ExitV2SdwMemoryLogicalPayloadUnion;
   readonly logicalArchive: MemoryTranscodeLogicalArchive;
+  readonly v2Origins?: readonly {
+    readonly publicKey: Uint8Array;
+    readonly trustTier: "foreign_direct" | "foreign_relayed";
+  }[];
 }
 
 /** Export reads and validates the encrypted source vault without staging plaintext. */
@@ -168,7 +300,9 @@ export async function exportExitV2SdwMemoryArchive(
     archive.archive_id,
     archive.source_set_sha256,
   );
-  const payload = logicalPayload(archive, sourceLineageRef);
+  const payload = options.formatVersion === 2
+    ? await logicalPayloadV2(archive, sourceLineageRef, options)
+    : logicalPayload(archive, sourceLineageRef);
   const payloadBytes = canonicalizeToBytes(payload);
   if (payloadBytes.byteLength > MAX_ARTIFACT_BYTES) {
     throw new Error("Exit V2 SDW memory logical payload exceeds its size bound");
@@ -182,8 +316,10 @@ export async function exportExitV2SdwMemoryArchive(
   };
   const transferKey = generateRandomKey();
   try {
-    const artifact: ExitV2SdwMemoryArtifact = {
-      format: EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT,
+    const artifact: ExitV2SdwMemoryArtifactUnion = {
+      format: options.formatVersion === 2
+        ? EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT_V2
+        : EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT,
       aad,
       encrypted_payload: encrypt(payloadBytes, transferKey, canonicalizeToBytes(aad)),
     };
@@ -242,7 +378,16 @@ export async function importExitV2SdwMemoryArchive(
   options: ImportExitV2SdwMemoryArchiveOptions,
 ): Promise<ImportExitV2SdwMemoryArchiveResult> {
   const validated = validateAndDecrypt(options);
+  await assertArchiveBadSignersEligible(validated, options.badSignerAuthority);
   assertSigner(options.signer);
+  if (validated.payload.format === EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2) {
+    const resolveState = (options.adapter as MemoryBackendAdapter &
+      Partial<Pick<SdwMemoryBackendAdapter, "getMemoryIntegrityState">>).getMemoryIntegrityState;
+    if (typeof resolveState !== "function" ||
+        await resolveState.call(options.adapter) !== "state_COMPLETE") {
+      throw new Error("Exit V2 signed-memory import requires completed provenance migration");
+    }
+  }
   const destinationArchiveId = options.adapter.derivePassageId(
     DESTINATION_ARCHIVE_ID_DOMAIN,
     validated.artifactSha256,
@@ -260,6 +405,24 @@ export async function importExitV2SdwMemoryArchive(
       destinationArchiveId,
       options.signer,
     );
+  }
+
+  if (validated.payload.format === EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2) {
+    if (options.knownSignersStore === undefined || validated.v2Origins === undefined) {
+      throw new Error("Exit V2 signed-memory import requires provenance signer persistence");
+    }
+    const entries = validated.payload.files.map((file, index) => ({
+      did: file.provenance.origin.body.signer_did,
+      publicKey: validated.v2Origins![index]!.publicKey,
+    }));
+    const capacity = await options.knownSignersStore.wouldExceedCapacity(entries);
+    if (capacity.exceeds) {
+      throw new Error("Exit V2 signed-memory signer capacity is exhausted");
+    }
+    await options.knownSignersStore.persistIfAbsent(entries, validated.artifactSha256);
+    for (const entry of entries) {
+      options.onProvenanceSignerPersisted?.(entry.did, entry.publicKey.slice());
+    }
   }
 
   // A source lineage may map to one artifact digest only. The scan is bounded
@@ -285,12 +448,29 @@ export async function importExitV2SdwMemoryArchive(
   }
 
   const createdAt = options.now?.() ?? new Date().toISOString();
-  const archiveInputs = buildMemoryTranscodeArchivePassages(
+  const builtArchiveInputs = buildMemoryTranscodeArchivePassages(
     options.adapter,
     destinationArchiveId,
     validated.logicalArchive,
     createdAt,
   );
+  const archiveInputs = builtArchiveInputs.map((input, index) => {
+    if (validated.payload.format === EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT) {
+      return { ...input, provenanceContext: legacyExitV1ImportIngress(validated.payload.source_archive_lineage_ref) };
+    }
+    if (index >= validated.payload.files.length) {
+      return { ...input, provenanceContext: memoryTranscodeIngress("system:memory-transcode", "transcode_manifest") };
+    }
+    const file = validated.payload.files[index]!;
+    const origin = validated.v2Origins?.[index];
+    if (origin === undefined) throw new Error("Exit V2 signed-memory origin resolution is incomplete");
+    return { ...input, provenanceContext: exitV2ForeignImportIngress({
+      origin: file.provenance.origin,
+      originPublicKey: origin.publicKey,
+      trustTier: origin.trustTier,
+      transferLineageRef: validated.payload.source_archive_lineage_ref,
+    }) };
+  });
   for (const input of archiveInputs) {
     if (input.passage_id === undefined) {
       throw new Error("Exit V2 SDW memory import produced an unbound destination passage");
@@ -300,25 +480,13 @@ export async function importExitV2SdwMemoryArchive(
     }
   }
 
-  const lineageBody: ExitV2SdwMemoryLineageBody = {
-    version: EXIT_V2_SDW_MEMORY_LINEAGE_VERSION,
-    signature_scheme: EXIT_V2_SIGNATURE_SCHEME,
-    source_fortress_id: validated.sourceFortressId,
-    source_archive_lineage_ref: validated.payload.source_archive_lineage_ref,
-    source_artifact_sha256: validated.artifactSha256,
-    destination_fortress_id: options.signer.fortress_id,
-    destination_owner_ref: options.adapter.ownerRef,
-    destination_archive_id: destinationArchiveId,
-    source_harness: validated.payload.source_harness,
-    destination_harness: validated.payload.destination_harness,
-    source_set_sha256: validated.payload.source_set_sha256,
-    imported_at: createdAt,
-    destination_signer_identity_id: options.signer.identity_id,
-    destination_signer_public_key: options.signer.public_key,
-    ...(options.signer.did === undefined
-      ? {}
-      : { destination_signer_did: options.signer.did }),
-  };
+  const lineageBody = buildDestinationLineageBody({
+    validated,
+    adapter: options.adapter,
+    signer: options.signer,
+    destinationArchiveId,
+    importedAt: createdAt,
+  });
   const lineageBytes = lineageSigningBytes(lineageBody);
   const lineageSignature = await options.signer.sign(lineageBytes);
   assertSignature(lineageSignature, options.signer.public_key, lineageBytes);
@@ -336,7 +504,19 @@ export async function importExitV2SdwMemoryArchive(
       { key: LINEAGE_DESTINATION_ARCHIVE_KEY, value: destinationArchiveId },
     ],
     created_at: createdAt,
+    provenanceContext: validated.payload.format === EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT
+      ? legacyExitV1ImportIngress(validated.payload.source_archive_lineage_ref)
+      : memoryTranscodeIngress("system:memory-transcode", "exit_lineage"),
   };
+
+  if (validated.payload.format === EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2) {
+    const resolveState = (options.adapter as MemoryBackendAdapter &
+      Partial<Pick<SdwMemoryBackendAdapter, "getMemoryIntegrityState">>).getMemoryIntegrityState;
+    if (typeof resolveState !== "function" ||
+        await resolveState.call(options.adapter) !== "state_COMPLETE") {
+      throw new Error("Exit V2 signed-memory migration state changed before visibility commit");
+    }
+  }
 
   // Files, completed manifest, and signed lineage share this one atomic batch;
   // no committed archive can exist without its destination lineage record.
@@ -368,6 +548,32 @@ export async function importExitV2SdwMemoryArchive(
     lineage_signature: signedLineage.signature,
     lineage_signed_by: options.signer.public_key,
   };
+}
+
+async function assertArchiveBadSignersEligible(
+  validated: ValidatedArchive,
+  authority: MemoryProvenanceBadSignerAuthority | undefined,
+): Promise<void> {
+  if (validated.payload.format !== EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2 ||
+      validated.v2Origins === undefined) return;
+  for (let index = 0; index < validated.payload.files.length; index++) {
+    const companion = validated.payload.files[index]!.provenance;
+    const origin = validated.v2Origins[index];
+    if (origin === undefined) throw new Error("Exit V2 signed-memory origin resolution is incomplete");
+    const eligibility = await evaluateMemoryProvenanceSignerEligibility({
+      companion,
+      resolveSignerPublicKey: (identityId, did) =>
+        identityId === companion.origin.body.signer_identity_id &&
+        did === companion.origin.body.signer_did
+          ? origin.publicKey
+          : undefined,
+      badSignerAuthority: authority,
+      foreignAdmission: true,
+    });
+    if (!eligibility.eligible) {
+      throw new Error("Exit V2 signed-memory import refuses a quarantined foreign signer");
+    }
+  }
 }
 
 /** Metadata-only receipt for the conservative participant-Exit split. */
@@ -422,7 +628,7 @@ function validateAndDecrypt(
     if (canonicalize(parsedArtifact) !== Buffer.from(options.artifactBytes).toString("utf8")) {
       throw new Error("Exit V2 SDW memory artifact is not valid canonical JSON");
     }
-    const artifact = validateArtifact(parsedArtifact);
+    const artifact = parseExitV2SdwMemoryArtifactUnion(parsedArtifact);
     const expectedAad: ExitV2SdwMemoryAad = {
       version: EXIT_V2_SDW_MEMORY_AAD_VERSION,
       source_fortress_id: body.identity_binding.fortress_id,
@@ -456,18 +662,22 @@ function validateAndDecrypt(
       if (canonicalize(parsedPayload) !== Buffer.from(plaintext).toString("utf8")) {
         throw new Error("Exit V2 SDW memory logical payload is not canonical");
       }
-      const payload = validateLogicalPayload(parsedPayload);
+      const payload = parseExitV2SdwMemoryLogicalPayloadUnion(parsedPayload);
       if (
         payload.source_archive_lineage_ref !== expectedAad.source_archive_lineage_ref ||
         payload.source_set_sha256 !== expectedAad.source_set_sha256
       ) {
         throw new Error("Exit V2 SDW memory logical payload binding is invalid");
       }
+      const v2Origins = payload.format === EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2
+        ? verifyV2PayloadProvenance(payload, body)
+        : undefined;
       return {
         artifactSha256: artifactSha,
         sourceFortressId: body.identity_binding.fortress_id,
         payload,
         logicalArchive: payloadToLogicalArchive(payload),
+        ...(v2Origins === undefined ? {} : { v2Origins }),
       };
     } finally {
       plaintext.fill(0);
@@ -476,6 +686,69 @@ function validateAndDecrypt(
     transferKey.fill(0);
     callerKey.fill(0);
   }
+}
+
+function verifyV2PayloadProvenance(
+  payload: ExitV2SdwMemoryLogicalPayloadV2,
+  manifestBody: ExitV2SdwMemoryManifest["body"],
+): readonly { publicKey: Uint8Array; trustTier: "foreign_direct" | "foreign_relayed" }[] {
+  const exportingDid = manifestBody.identity_binding.did;
+  if (exportingDid === undefined) {
+    throw new Error("Exit V2 signed-memory manifest lacks an exporter DID");
+  }
+  const exportingKey = fromBase64urlStrict(manifestBody.identity_binding.fortress_master_pubkey);
+  const known = resolveKnownSigners(payload.known_signers, exportingDid, exportingKey);
+  if (!known.ok) throw new Error(`Exit V2 signed-memory known_signers is invalid: ${known.problem}`);
+  const signerRows = new Map<string, { signer_identity_id: string; signer_did: string; public_key: string }>();
+  const add = (identityId: string, did: string, key: Uint8Array) => {
+    const prior = signerRows.get(did);
+    if (prior !== undefined && (prior.signer_identity_id !== identityId ||
+        prior.public_key !== toBase64url(key))) {
+      throw new Error("Exit V2 signed-memory signer evidence conflicts");
+    }
+    signerRows.set(did, { signer_identity_id: identityId, signer_did: did, public_key: toBase64url(key) });
+  };
+  const origins: Array<{ publicKey: Uint8Array; trustTier: "foreign_direct" | "foreign_relayed" }> = [];
+  for (const file of payload.files) {
+    for (const signed of [file.provenance.origin, file.provenance.admission]) {
+      const did = signed.body.signer_did;
+      const key = did === exportingDid ? exportingKey : known.signers.get(did);
+      if (key === undefined) throw new Error("Exit V2 signed-memory provenance signer is unknown");
+      add(signed.body.signer_identity_id, did, key);
+    }
+  }
+  const resolver = createBoundedMemoryProvenanceSignerResolver([...signerRows.values()]);
+  if (!resolver.ok) throw new Error(`Exit V2 signed-memory signer resolver is invalid: ${resolver.error.code}`);
+  for (const file of payload.files) {
+    const companion = file.provenance;
+    const result = verifyMemoryProvenanceCompanion(companion, resolver.value, {
+      origin: {
+        origin_fortress_id: companion.origin.body.origin_fortress_id,
+        owner_ref: companion.origin.body.owner_ref,
+        passage_id: companion.origin.body.passage_id,
+        content_hash: passageContentHash(Buffer.from(fromBase64urlStrict(file.bytes_base64url)).toString("utf8")),
+        chunk_count: companion.origin.body.chunk_count,
+      },
+      destination: {
+        destination_fortress_id: manifestBody.identity_binding.fortress_id,
+        destination_owner_ref: payload.source_owner_ref,
+        passage_id: file.source_passage_id,
+      },
+    });
+    if (!result.ok) throw new Error(`Exit V2 signed-memory provenance verification failed: ${result.error.code}`);
+    const originKey = resolver.value.resolve(
+      companion.origin.body.signer_identity_id,
+      companion.origin.body.signer_did,
+    );
+    if (originKey === undefined) throw new Error("Exit V2 signed-memory origin signer is unknown");
+    origins.push({
+      publicKey: originKey,
+      trustTier: Buffer.from(originKey).equals(Buffer.from(exportingKey))
+        ? "foreign_direct"
+        : "foreign_relayed",
+    });
+  }
+  return origins;
 }
 
 function validateManifest(
@@ -578,6 +851,25 @@ function validateArtifact(value: unknown): ExitV2SdwMemoryArtifact {
   assertSafeIdentifier(asString(value.aad.export_approval_audit_id), "export approval audit id");
   validateEncryptedPayload(value.encrypted_payload);
   return value as unknown as ExitV2SdwMemoryArtifact;
+}
+
+/** Exact outer-format union whose frozen V1 leg calls the shipped parser. */
+export function parseExitV2SdwMemoryArtifactUnion(
+  value: unknown,
+): ExitV2SdwMemoryArtifactUnion {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Exit V2 SDW memory artifact shape is invalid");
+  }
+  const format = (value as Record<string, unknown>).format;
+  if (format === EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT) return validateArtifact(value);
+  if (format !== EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT_V2) {
+    throw new Error("Exit V2 SDW memory artifact format is unsupported");
+  }
+  const parsed = validateArtifact({
+    ...(value as Record<string, unknown>),
+    format: EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT,
+  });
+  return { ...parsed, format: EXIT_V2_SDW_MEMORY_ARTIFACT_FORMAT_V2 };
 }
 
 function validateEncryptedPayload(value: unknown): asserts value is EncryptedPayload {
@@ -693,6 +985,64 @@ function validateLogicalPayload(value: unknown): ExitV2SdwMemoryLogicalPayload {
   return value as unknown as ExitV2SdwMemoryLogicalPayload;
 }
 
+/** Exact-format union. V2 can never become V1 by omitting a V2 field. */
+export function parseExitV2SdwMemoryLogicalPayloadUnion(
+  value: unknown,
+): ExitV2SdwMemoryLogicalPayloadUnion {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Exit V2 SDW memory logical payload shape is invalid");
+  }
+  const record = value as Record<string, unknown>;
+  if (record.format === EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT) {
+    // The frozen V1 leg is the shipped parser itself, never a mirror.
+    return validateLogicalPayload(value);
+  }
+  if (record.format !== EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2) {
+    throw new Error("Exit V2 SDW memory logical payload format is unsupported");
+  }
+  assertExactKeys(record, [
+    "destination_harness", "files", "format", "known_signers",
+    "projection_file_count", "projection_set_sha256",
+    "source_archive_lineage_ref", "source_file_count", "source_harness",
+    "source_owner_ref", "source_set_sha256", "state", "transcode_version",
+  ], "logical payload v2");
+  if (!Array.isArray(record.files)) {
+    throw new Error("Exit V2 SDW memory logical payload v2 files are invalid");
+  }
+  const v1Files: unknown[] = [];
+  for (const raw of record.files) {
+    assertExactKeys(raw, [
+      "bytes_base64url", "path", "provenance", "sha256", "size_bytes",
+      "source_class", "source_passage_id",
+    ], "logical file v2");
+    assertSafeIdentifier(asString(raw.source_passage_id), "source passage id");
+    const provenance = parseMemoryProvenanceCompanionValue(raw.provenance);
+    if (!provenance.ok) {
+      throw new Error(`Exit V2 SDW memory logical payload v2 provenance is invalid: ${provenance.error.code}`);
+    }
+    v1Files.push({
+      bytes_base64url: raw.bytes_base64url, path: raw.path, sha256: raw.sha256,
+      size_bytes: raw.size_bytes, source_class: raw.source_class,
+    });
+  }
+  const rawKnownSigners = record.known_signers as { version?: unknown; signers?: unknown };
+  if (Array.isArray(rawKnownSigners?.signers) &&
+      rawKnownSigners.signers.length > MAX_MEMORY_PROVENANCE_SIGNER_ENTRIES) {
+    throw new Error("Exit V2 SDW memory logical payload v2 known_signers exceeds its memory-provenance bound");
+  }
+  const signerCheck = checkKnownSignersStructure(rawKnownSigners);
+  if (!signerCheck.ok || record.known_signers === null ||
+      typeof record.known_signers !== "object" ||
+      typeof (record.known_signers as Record<string, unknown>).signature !== "string") {
+    throw new Error("Exit V2 SDW memory logical payload v2 known_signers is invalid");
+  }
+  // Reuse V1 validation for every unchanged logical field and file binding.
+  const { known_signers: _knownSigners, ...sharedFields } = record;
+  validateLogicalPayload({ ...sharedFields,
+    format: EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT, files: v1Files });
+  return value as ExitV2SdwMemoryLogicalPayloadV2;
+}
+
 function logicalPayload(
   archive: MemoryTranscodeLogicalArchive,
   sourceLineageRef: string,
@@ -719,8 +1069,79 @@ function logicalPayload(
   };
 }
 
+async function logicalPayloadV2(
+  archive: MemoryTranscodeLogicalArchive,
+  sourceLineageRef: string,
+  options: ExportExitV2SdwMemoryArchiveOptions,
+): Promise<ExitV2SdwMemoryLogicalPayloadV2> {
+  if (options.signer.did === undefined || options.resolveProvenanceSigner === undefined) {
+    throw new Error("Exit V2 signed-memory export requires a DID and provenance signer resolver");
+  }
+  const integrityState = await options.adapter.getMemoryIntegrityState();
+  if (integrityState !== "state_COMPLETE") {
+    throw new Error("Exit V2 signed-memory export requires completed provenance migration");
+  }
+  const companions: MemoryProvenanceCompanion[] = [];
+  const signerEntries = new Map<string, Uint8Array>();
+  for (const file of archive.files) {
+    if (file.source_passage_id === undefined) {
+      throw new Error("Exit V2 signed-memory export lacks a source passage binding");
+    }
+    const status = await options.adapter.getPassageProvenance(file.source_passage_id);
+    if (status.status !== "verified") {
+      throw new Error("Exit V2 signed-memory export refuses an unsigned or quarantined passage");
+    }
+    const companion = status.companion;
+    if (!isMemoryProvenanceOutboundSyncEligible({
+      state: integrityState, companionVerified: true, companion, quarantined: false,
+    })) {
+      throw new Error("Exit V2 signed-memory export refuses legacy-unattested provenance");
+    }
+    for (const signed of [companion.origin, companion.admission]) {
+      const publicKey = options.resolveProvenanceSigner(
+        signed.body.signer_identity_id,
+        signed.body.signer_did,
+      );
+      if (publicKey === undefined) {
+        throw new Error("Exit V2 signed-memory export cannot resolve a provenance signer");
+      }
+      const ownKey = fromBase64urlStrict(options.signer.public_key);
+      if (signed.body.signer_did === options.signer.did &&
+          !Buffer.from(publicKey).equals(Buffer.from(ownKey))) {
+        throw new Error("Exit V2 signed-memory exporter DID resolves to a conflicting key");
+      }
+      // Exclude only the manifest's exact exporter DID. A legacy DID can
+      // legitimately name the same Ed25519 key and still needs its own row.
+      if (signed.body.signer_did !== options.signer.did) {
+        const prior = signerEntries.get(signed.body.signer_did);
+        if (prior !== undefined && !Buffer.from(prior).equals(Buffer.from(publicKey))) {
+          throw new Error("Exit V2 signed-memory export found a conflicting provenance signer");
+        }
+        signerEntries.set(signed.body.signer_did, publicKey);
+      }
+    }
+    companions.push(companion);
+  }
+  const signers: KnownSignersEntry[] = [...signerEntries]
+    .map(([did, publicKey]) => ({ did, public_key: toBase64url(publicKey) }))
+    .sort((a, b) => a.did.localeCompare(b.did));
+  const signature = await options.signer.sign(knownSignersSigningBytes({ version: 1, signers }));
+  const knownSigners: KnownSignersArtifact = { version: 1, signers, signature: toBase64url(signature) };
+  const base = logicalPayload(archive, sourceLineageRef);
+  return {
+    ...base,
+    format: EXIT_V2_SDW_MEMORY_PAYLOAD_FORMAT_V2,
+    files: base.files.map((file, index) => ({
+      ...file,
+      source_passage_id: archive.files[index]!.source_passage_id!,
+      provenance: companions[index]!,
+    })),
+    known_signers: knownSigners,
+  };
+}
+
 function payloadToLogicalArchive(
-  payload: ExitV2SdwMemoryLogicalPayload,
+  payload: ExitV2SdwMemoryLogicalPayloadUnion,
 ): MemoryTranscodeLogicalArchive {
   return {
     // Source opaque archive ids are intentionally absent from the artifact.

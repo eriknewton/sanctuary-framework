@@ -1,3 +1,4 @@
+// fail-before-exempt: C3 fixture-wiring only — this existing CLI suite supplies the newly required durable memory-integrity-state resolver, but changes no assertion; C3 behavior is covered by memory-provenance-attachment, memory-provenance-migration, memory-provenance-migration-tools, memory-integrity-tier1, policy-loader, loader-required-keys, and the migration contract suite, all of which fail against pre-C3 source.
 /**
  * `sanctuary memory_ingest` / `sanctuary memory_emit` CLI tests.
  *
@@ -27,9 +28,13 @@ import {
   runMemoryTranscodeRestoreCommand,
 } from "../../src/cli/memory-file.js";
 import { resolveCliMasterKey } from "../../src/core/master-custody.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import { createIdentity } from "../../src/core/identity.js";
+import { IdentityManager } from "../../src/cognitive/tools.js";
 import { fortressIdFromStoragePath } from "../../src/dashboard/v1_1/wiring.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../../src/sdw/memory-provenance-signing.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 
 const FIXTURE_ROOT = fileURLToPath(
@@ -239,11 +244,19 @@ describe("memory file CLI: fortress-backed round trip", () => {
     // Bootstrap a real passphrase-mode fortress so the CLI's unbootstrapped
     // resolveCliMasterKey unlocks an existing custody envelope. Failure mode if
     // this is skipped: the command fails on unlock, which looks like a CLI bug.
-    await resolveCliMasterKey(new FilesystemStorage(join(fortress, "state")), {
+    const storage = new FilesystemStorage(join(fortress, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
       passphrase: PASSPHRASE,
       bootstrap: true,
       storagePathHint: fortress,
     });
+    const identities = new IdentityManager(storage, masterKey);
+    const { storedIdentity } = createIdentity(
+      "memory-file-cli-test",
+      derivePurposeKey(masterKey, "identity-encryption"),
+      "passphrase",
+    );
+    await identities.save(storedIdentity);
   });
 
   afterEach(async () => {
@@ -648,11 +661,16 @@ describe("memory file CLI: fortress-backed round trip", () => {
         passphrase: PASSPHRASE,
         storagePathHint: fortress,
       });
+      const identities = new IdentityManager(storage, masterKey);
+      await identities.load();
       return new SdwMemoryBackendAdapter({
         storage,
         masterKey,
         fortressId: fortressIdFromStoragePath(fortress),
         ownerRef: "fleet-self",
+        resolvePrimarySigningHandle: createPrimaryMemoryProvenanceSigningHandleResolver(identities, masterKey),
+        resolveSignerPublicKey: createPrimaryMemoryProvenancePublicKeyResolver(identities),
+        resolveMemoryIntegrityState: async () => "state_PRE_MIGRATION",
       });
     }
 

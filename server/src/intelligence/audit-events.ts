@@ -16,6 +16,12 @@ export const INTEL_OPS = {
   PII_REDACTION_EVENT: "intelligence_pii_redaction_event",
   CONFIG_LOADED: "intelligence_config_loaded",
   CONFIG_RESET: "intelligence_config_reset",
+  /** A consented pull from the signed manifest's closed model registry. */
+  MODEL_PULL: "intelligence_model_pull",
+  /** A fail-closed provisioning outcome before any surface is marked ready. */
+  MODEL_PROVISION_REFUSED: "intelligence_model_provision_refused",
+  /** Stable Q5 verification/commit/projection evidence operation. */
+  LOAD_INTEGRITY: "intelligence_load_integrity",
   /**
    * Operator picked a substrate and applied it to every surface at once
    * via the "Apply to all surfaces" affordance (Finding SS,

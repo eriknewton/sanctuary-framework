@@ -1,3 +1,4 @@
+import CastleWallSigner
 import Foundation
 import NetworkExtension
 import SystemExtensions
@@ -20,8 +21,26 @@ import SystemExtensions
 /// console click for that, once per install.
 enum HeadlessFilterCLI {
     static let headlessFlag = "--headless"
+    /// Must match CASTLE_WALL_HEADLESS_CONTRACT_VERSION in
+    /// server/src/cli/castle-wall.ts (the CLI hard-fails on inequality). Bump
+    /// only when an existing report field changes meaning or a REQUIRED field
+    /// is added/removed; purely additive optional fields (error_domain,
+    /// error_code, remediation, 2026-08-26) do not bump it, because the CLI's
+    /// parser requires only `ok` and `state` and ignores unknown keys.
     static let headlessContractVersion = "3"
+    /// Must match extensionIdentifier in SystemExtensionManager.swift,
+    /// CASTLE_WALL_SYSTEM_EXTENSION_BUNDLE_ID in server/src/cli/castle-wall.ts,
+    /// and CASTLE_WALL_SYSTEM_EXTENSION_ID in server/src/cli/uninstall.ts:
+    /// every deactivation request and every presence probe must name the same
+    /// extension.
+    static let systemExtensionIdentifier = "ai.sanctuaryprotocol.macos.castle-wall"
     private static let defaultTimeoutSeconds = 30.0
+    /// `systemextensionsctl list` is a local, fast read; this bound only keeps
+    /// a wedged sysextd from hanging the post-failure skew-detection probe. A
+    /// probe that times out reads as NOT-listed, which merely suppresses the
+    /// remediation hint (never the reverse: an unreadable probe can never
+    /// manufacture a positive observation).
+    static let extensionListProbeTimeoutSeconds = 5.0
 
     enum Action: String {
         case enable
@@ -100,6 +119,22 @@ enum HeadlessFilterCLI {
         /// "deactivated" | "will_complete_after_reboot" | "failed".
         let state: String
         let error: String?
+        /// Machine-readable identity of a failure: the NSError domain/code the
+        /// OS returned (e.g. OSSystemExtensionErrorDomain / 4). `error` alone
+        /// collapses these into prose a caller cannot branch on; these fields
+        /// are ADDITIVE alongside it and never change its meaning. Wire names
+        /// must match the optional error_domain/error_code fields of
+        /// HeadlessReport in server/src/cli/castle-wall.ts.
+        let errorDomain: String?
+        let errorCode: Int?
+        /// Machine-readable remediation id (currently only
+        /// "extension_version_skew_reregister_required"). This verb never
+        /// mutates the host beyond the deactivation request itself; when the
+        /// OS refuses that request and the extension is positively observed
+        /// still activated, this field names the attended remediation the
+        /// operator must perform. Wire name must match the optional
+        /// remediation field of HeadlessReport in server/src/cli/castle-wall.ts.
+        let remediation: String?
         let build: Build
 
         init(
@@ -107,13 +142,30 @@ enum HeadlessFilterCLI {
             action: String,
             state: String,
             error: String?,
+            errorDomain: String? = nil,
+            errorCode: Int? = nil,
+            remediation: String? = nil,
             build: Build = .current()
         ) {
             self.ok = ok
             self.action = action
             self.state = state
             self.error = error
+            self.errorDomain = errorDomain
+            self.errorCode = errorCode
+            self.remediation = remediation
             self.build = build
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case ok
+            case action
+            case state
+            case error
+            case errorDomain = "error_domain"
+            case errorCode = "error_code"
+            case remediation
+            case build
         }
     }
 
@@ -182,6 +234,12 @@ enum HeadlessFilterCLI {
     }
 
     private static func currentBuildGitSha() -> String {
+        // This env read echoes the caller's value back as the reported build
+        // identity, which is why the CLI's direct-exec disarm fallback
+        // (makeIdentityIndependentHostAppInvoke in server/src/cli/castle-wall.ts,
+        // must match) strips SANCTUARY_CASTLE_BUILD_SHA from the child
+        // environment: an inherited value would let the CLI validate its own
+        // expectation against itself instead of the embedded plist identity.
         if let envSha = ProcessInfo.processInfo.environment["SANCTUARY_CASTLE_BUILD_SHA"],
            !envSha.isEmpty {
             return envSha
@@ -210,8 +268,8 @@ enum HeadlessFilterCLI {
     static func run(
         _ invocation: Invocation,
         manager: NEFilterManager = .shared(),
-        deactivateSystemExtension: (Double) -> SystemExtensionDeactivationResult =
-            runSystemExtensionDeactivation,
+        deactivateSystemExtension: (Double) -> SystemExtensionTeardownOutcome =
+            runSystemExtensionTeardown,
         output: (String) -> Void = { print($0) }
     ) -> ExitCode {
         let action = invocation.action.rawValue
@@ -305,13 +363,17 @@ enum HeadlessFilterCLI {
     }
 
     static func reportForSystemExtensionDeactivation(
-        _ result: SystemExtensionDeactivationResult,
+        _ outcome: SystemExtensionTeardownOutcome,
         action: String = Action.deactivateSystemExtension.rawValue
     ) -> (report: Report, exitCode: ExitCode) {
-        switch result {
+        // Every branch threads outcome.remediation through so the hint can
+        // never be dropped between detection and the report the CLI parses.
+        let remediation = outcome.remediation
+        switch outcome.result {
             case .deactivated:
                 return (
-                    Report(ok: true, action: action, state: "deactivated", error: nil),
+                    Report(ok: true, action: action, state: "deactivated",
+                           error: nil, remediation: remediation),
                     .success
                 )
             case .willCompleteAfterReboot:
@@ -320,7 +382,8 @@ enum HeadlessFilterCLI {
                         ok: true,
                         action: action,
                         state: "will_complete_after_reboot",
-                        error: nil
+                        error: nil,
+                        remediation: remediation
                     ),
                     .success
                 )
@@ -330,43 +393,307 @@ enum HeadlessFilterCLI {
                         ok: false,
                         action: action,
                         state: "needs_user_approval",
-                        error: "macOS requires operator approval to deactivate the system extension"
+                        error: "macOS requires operator approval to deactivate the system extension",
+                        remediation: remediation
                     ),
                     .needsUserApproval
                 )
-            case let .failed(message):
+            case let .failed(failure):
+                // error_domain/error_code are the identity of THIS deactivation
+                // failure (the NSError the OS delegate delivered), never of any
+                // other request or probe.
                 return (
-                    Report(ok: false, action: action, state: "unknown", error: message),
+                    Report(ok: false, action: action, state: "unknown",
+                           error: failure.message,
+                           errorDomain: failure.domain,
+                           errorCode: failure.code,
+                           remediation: remediation),
                     .failure
                 )
             case .timedOut:
+                // A timeout has no NSError identity; the report carries no
+                // error_domain/error_code rather than a stale one.
                 return (
                     Report(
                         ok: false,
                         action: action,
                         state: "unknown",
-                        error: "system-extension deactivation timed out"
+                        error: "system-extension deactivation timed out",
+                        remediation: remediation
                     ),
                     .timeout
                 )
         }
     }
 
+    /// Machine-readable identity of a system-extension request failure.
+    /// `domain`/`code` are the NSError values the OS delegate delivered; nil
+    /// only for failures that never came from an NSError (e.g. an unknown
+    /// delegate result). Downstream branching (the skew-detection gate)
+    /// compares BOTH domain and code, never the prose message.
+    struct SystemExtensionFailure: Equatable {
+        let message: String
+        let domain: String?
+        let code: Int?
+    }
+
     enum SystemExtensionDeactivationResult: Equatable {
         case deactivated
         case willCompleteAfterReboot
         case needsUserApproval
-        case failed(String)
+        case failed(SystemExtensionFailure)
         case timedOut
     }
 
-    private static func runSystemExtensionDeactivation(
+    /// The deactivation verb's full result: the terminal request result plus
+    /// any remediation hint the verb detected. The two travel together so no
+    /// caller can observe the result without the hint.
+    struct SystemExtensionTeardownOutcome: Equatable {
+        let result: SystemExtensionDeactivationResult
+        /// Non-nil iff the deactivation failed with the exact skew signature
+        /// AND the extension was positively observed still activated; see
+        /// extensionVersionSkewRemediation.
+        let remediation: String?
+    }
+
+    /// Remediation id for the version-skew refusal: the installed app's
+    /// registration no longer matches the activated extension record, so an
+    /// attended re-registration (launch the app at the console so its normal
+    /// activation flow re-registers, then re-run deactivation) is required.
+    /// This verb only ever DETECTS the condition; it never submits an
+    /// activation of any kind. Value must match the remediation ids the
+    /// server-side tests pin (server/test/cli/castle-wall-headless-disarm.test.ts,
+    /// server/test/cli/uninstall.test.ts).
+    static let extensionVersionSkewRemediation =
+        "extension_version_skew_reregister_required"
+
+    /// Operator guidance appended to the failure message on skew detection.
+    /// Describes the attended remediation only; it must never promise an
+    /// automated one, because this verb performs none. Launching the app
+    /// only re-registers the extension when the background signer helper is
+    /// enabled; with the helper unregistered, launch first lands in an
+    /// approval-gated state, so the guidance names the helper approval and
+    /// the wait honestly. The remediation sentence from "launch" through
+    /// "then re-run"/"then rerun" is mirrored wire text: must stay in
+    /// agreement with emitSysextVersionSkewNotice in
+    /// server/src/cli/castle-wall.ts and the remediation note in
+    /// server/src/cli/uninstall.ts.
+    static let extensionVersionSkewGuidance =
+        "the installed app's registration no longer matches the activated "
+        + "system extension; launch Sanctuary-CastleWall.app at the console so "
+        + "its normal activation flow re-registers the extension, approve or "
+        + "re-enable the Sanctuary background helper if macOS prompts for it, "
+        + "wait for re-registration to complete, then re-run the deactivation"
+
+    static func systemExtensionFailureDetail(from error: Error) -> SystemExtensionFailure {
+        let nsError = error as NSError
+        return SystemExtensionFailure(
+            message: error.localizedDescription,
+            domain: nsError.domain,
+            code: nsError.code
+        )
+    }
+
+    /// True only for the exact failure the skew detection is allowed to
+    /// answer: OSSystemExtensionErrorDomain / extensionNotFound (code 4).
+    /// Matching on the structured domain+code (never the prose message) is
+    /// what keeps the hint from firing on any other failure class.
+    static func isExtensionNotFoundFailure(
+        _ result: SystemExtensionDeactivationResult
+    ) -> Bool {
+        guard case let .failed(failure) = result else { return false }
+        return failure.domain == OSSystemExtensionErrorDomain
+            && failure.code == OSSystemExtensionError.extensionNotFound.rawValue
+    }
+
+    /// Deactivation with version-skew DETECTION (never mutation).
+    ///
+    /// A host app redeployed at a newer bundle version than the activated
+    /// extension record can be refused deactivation with extensionNotFound
+    /// even while `systemextensionsctl list` still shows the extension
+    /// activated. This verb submits deactivation ONLY. There is no automated
+    /// re-registration here by design: macOS offers no cancellation API for a
+    /// submitted activation and no durable resume marker, so any
+    /// activate-then-deactivate sequence has failure modes that end with the
+    /// extension MORE active than before the teardown started. Detection plus
+    /// truthful guidance is the whole mechanism.
+    ///
+    /// Bounds:
+    /// - The hint requires the exact error-4 failure AND a positive "still
+    ///   listed activated+enabled" observation from the OS's own list output;
+    ///   an unreadable, ambiguous, or negative probe merely suppresses the
+    ///   hint (fail-safe in the harmless direction: no hint, never a wrong
+    ///   report state).
+    /// - The probe spends only what remains of the verb's declared timeout
+    ///   (capped at extensionListProbeTimeoutSeconds), so detection can never
+    ///   stretch the verb past the deadline its caller relied on.
+    /// - The failure's error_domain/error_code stay the identity of the
+    ///   deactivation attempt; detection appends guidance to the message and
+    ///   never rewrites the identity.
+    static func performSystemExtensionTeardown(
+        timeoutSeconds: Double,
+        deactivate: (Double) -> SystemExtensionDeactivationResult,
+        isExtensionListedActivated: (Double) -> Bool,
+        now: () -> Date = Date.init
+    ) -> SystemExtensionTeardownOutcome {
+        let deadline = now().addingTimeInterval(timeoutSeconds)
+        let result = deactivate(timeoutSeconds)
+        guard isExtensionNotFoundFailure(result),
+              case let .failed(failure) = result else {
+            return SystemExtensionTeardownOutcome(result: result, remediation: nil)
+        }
+        let probeBudget = min(
+            extensionListProbeTimeoutSeconds,
+            deadline.timeIntervalSince(now())
+        )
+        guard probeBudget > 0, isExtensionListedActivated(probeBudget) else {
+            return SystemExtensionTeardownOutcome(result: result, remediation: nil)
+        }
+        return SystemExtensionTeardownOutcome(
+            result: .failed(SystemExtensionFailure(
+                message: failure.message + "; " + extensionVersionSkewGuidance,
+                domain: failure.domain,
+                code: failure.code
+            )),
+            remediation: extensionVersionSkewRemediation
+        )
+    }
+
+    /// Apple Developer team id the Castle Wall extension is signed under.
+    /// SignerConstants.teamID is the shared source (must stay equal to the
+    /// codesign requirements in server/src/cli/castle-wall-boot-runtime.ts).
+    static let systemExtensionTeamIdentifier = SignerConstants.teamID
+
+    /// True iff `systemextensionsctl list` output contains a row whose PARSED
+    /// columns positively identify our extension as activated and enabled:
+    /// the bundle id in the bundleID column, our team id in the teamID column
+    /// (a foreign-team extension may reuse the bundle id, so a substring hit
+    /// anywhere on the line proves nothing), and a single-bracket state field
+    /// whose whitespace-separated tokens include exactly "activated" and
+    /// "enabled" as whole tokens. Anything unparseable,
+    /// localized, or ambiguous reads as NOT-listed, which under this design
+    /// merely suppresses the skew remediation hint - never a wrong claim.
+    /// Column layout follows the observed header
+    /// `enabled\tactive\tteamID\tbundleID (version)\tname\t[state]`
+    /// (tab-separated; Mini1 capture).
+    static func isExtensionListedActivatedEnabled(
+        inListOutput output: String,
+        identifier: String = systemExtensionIdentifier,
+        teamID: String = systemExtensionTeamIdentifier
+    ) -> Bool {
+        output.split(separator: "\n").contains { line in
+            let fields = line.split(
+                separator: "\t",
+                omittingEmptySubsequences: false
+            ).map { $0.trimmingCharacters(in: .whitespaces) }
+            // 6 = the columns of the observed header row (enabled, active,
+            // teamID, bundleID (version), name, [state]); fewer means a
+            // banner/header/unknown row and reads as NOT-listed.
+            guard fields.count >= 6 else { return false }
+            guard fields[2] == teamID else { return false }
+            // The bundleID column is `<id> (<versions>)`; the id must be the
+            // exact first token, not a substring of a longer identifier.
+            guard fields[3].split(separator: " ").first.map(String.init)
+                == identifier else { return false }
+            // The state field must be exactly one bracketed group with
+            // nothing outside it; trailing text after `]` (or a second
+            // bracket) makes the row unparseable and reads as NOT-listed.
+            guard let state = fields.last, state.hasPrefix("["),
+                  state.hasSuffix("]"), state.count >= 2 else {
+                return false
+            }
+            let interior = state.dropFirst().dropLast()
+            guard !interior.contains("["), !interior.contains("]") else {
+                return false
+            }
+            // Exact-token match: substring matching accepts the deactivated
+            // state, because "deactivated" contains "activated". Both words
+            // must appear as whole whitespace-separated tokens. (Must stay in
+            // agreement with the column/state binding of
+            // parseActivatedCastleWallBundleVersions in
+            // server/src/cli/castle-wall.ts.)
+            let tokens = Set(
+                interior.split(whereSeparator: { $0 == " " || $0 == "\t" })
+                    .map(String.init)
+            )
+            // Both required tokens must be present, and every token must be
+            // a known-benign state word: an unknown or contradictory token
+            // (e.g. "activated enabled deactivated") is ambiguous, and
+            // ambiguity must read NOT-listed, never as a positive
+            // observation. Allowlist, not a contradiction denylist, so the
+            // unknown case fails safe. (Must stay in agreement with
+            // KNOWN_STATE_TOKENS in parseActivatedCastleWallBundleVersions,
+            // server/src/cli/castle-wall.ts.)
+            let knownStateTokens: Set<String> = [
+                "activated", "enabled", "waiting", "for", "user",
+            ]
+            guard tokens.contains("activated"), tokens.contains("enabled"),
+                  tokens.isSubset(of: knownStateTokens) else {
+                return false
+            }
+            return true
+        }
+    }
+
+    /// Production presence probe behind the skew-detection gate. Fail-safe:
+    /// any probe failure (spawn error, timeout, nonzero exit, undecodable
+    /// output) reads as NOT listed, which suppresses the remediation hint - a
+    /// diagnostic failure must never manufacture a positive observation.
+    private static func defaultExtensionListedActivated(
         timeoutSeconds: Double
-    ) -> SystemExtensionDeactivationResult {
-        // OSSystemExtensionRequest.delegate is weak, so keep the bridge alive
-        // for the entire bounded run-loop wait.
-        let deactivator = HeadlessSystemExtensionDeactivator()
-        return deactivator.run(timeoutSeconds: timeoutSeconds)
+    ) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/systemextensionsctl")
+        process.arguments = ["list"]
+        let stdout = Pipe()
+        process.standardOutput = stdout
+        process.standardError = Pipe()
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
+        // Read concurrently with the bounded wait: `list` output is small, but
+        // reading only after exit could deadlock if it ever exceeded the pipe
+        // buffer. LockedDataBox formally synchronizes the reader-thread write
+        // with the post-wait read (same pattern as LockedErrorBox below).
+        let captured = LockedDataBox()
+        let reader = Thread {
+            captured.store(stdout.fileHandleForReading.readDataToEndOfFile())
+        }
+        reader.start()
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while process.isRunning, Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        if process.isRunning {
+            process.terminate()
+            return false
+        }
+        while captured.load() == nil, Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        guard process.terminationStatus == 0,
+              let data = captured.load(),
+              let text = String(data: data, encoding: .utf8) else {
+            return false
+        }
+        return isExtensionListedActivatedEnabled(inListOutput: text)
+    }
+
+    private static func runSystemExtensionTeardown(
+        timeoutSeconds: Double
+    ) -> SystemExtensionTeardownOutcome {
+        performSystemExtensionTeardown(
+            timeoutSeconds: timeoutSeconds,
+            deactivate: { seconds in
+                // OSSystemExtensionRequest.delegate is weak, so the runner
+                // stays alive for the entire bounded run-loop wait.
+                let runner = HeadlessSystemExtensionRequestRunner()
+                return runner.run(timeoutSeconds: seconds)
+            },
+            isExtensionListedActivated: defaultExtensionListedActivated
+        )
     }
 
     private static func save(
@@ -446,20 +773,22 @@ enum HeadlessFilterCLI {
     }
 }
 
-/// Bounded delegate bridge for the signed host app's deactivation request.
-/// Node cannot own this request: macOS binds it to the app identity that owns
-/// the bundled system extension.
-private final class HeadlessSystemExtensionDeactivator: NSObject,
+/// Bounded delegate bridge for the signed host app's system-extension
+/// DEACTIVATION request - the only request kind the headless teardown verb
+/// ever submits (the activation path lives solely in the GUI app's
+/// SystemExtensionManager, where the operator is present to answer prompts).
+/// Node cannot own these requests: macOS binds them to the app identity that
+/// owns the bundled system extension.
+private final class HeadlessSystemExtensionRequestRunner: NSObject,
     OSSystemExtensionRequestDelegate
 {
-    private static let extensionIdentifier = "ai.sanctuaryprotocol.macos.castle-wall"
     private let lock = NSLock()
     private var result: HeadlessFilterCLI.SystemExtensionDeactivationResult?
     private var approvalNeeded = false
 
     func run(timeoutSeconds: Double) -> HeadlessFilterCLI.SystemExtensionDeactivationResult {
         let request = OSSystemExtensionRequest.deactivationRequest(
-            forExtensionWithIdentifier: Self.extensionIdentifier,
+            forExtensionWithIdentifier: HeadlessFilterCLI.systemExtensionIdentifier,
             queue: .main
         )
         request.delegate = self
@@ -512,7 +841,12 @@ private final class HeadlessSystemExtensionDeactivator: NSObject,
         case .willCompleteAfterReboot:
             storeResult(.willCompleteAfterReboot)
         @unknown default:
-            storeResult(.failed("unknown system-extension deactivation result"))
+            // Not from an NSError, so there is no domain/code to preserve.
+            storeResult(.failed(HeadlessFilterCLI.SystemExtensionFailure(
+                message: "unknown system-extension request result",
+                domain: nil,
+                code: nil
+            )))
         }
     }
 
@@ -520,7 +854,10 @@ private final class HeadlessSystemExtensionDeactivator: NSObject,
         _ request: OSSystemExtensionRequest,
         didFailWithError error: Error
     ) {
-        storeResult(.failed(error.localizedDescription))
+        // Preserve the NSError domain/code, not only the prose: the error-4
+        // skew-detection gate and the CLI's report consumers branch on the
+        // structured identity (RCA defect.sysext-deactivation-extension-not-found).
+        storeResult(.failed(HeadlessFilterCLI.systemExtensionFailureDetail(from: error)))
     }
 
     func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
@@ -534,7 +871,32 @@ private final class HeadlessSystemExtensionDeactivator: NSObject,
         actionForReplacingExtension existing: OSSystemExtensionProperties,
         withExtension ext: OSSystemExtensionProperties
     ) -> OSSystemExtensionRequest.ReplacementAction {
+        // Required by OSSystemExtensionRequestDelegate but never consulted for
+        // a deactivation request (this runner submits nothing else). Answer
+        // .replace, the same policy as SystemExtensionManager.replacementAction,
+        // so the two delegates cannot diverge if macOS ever consults it.
         .replace
+    }
+}
+
+/// Lock-guarded capture of the systemextensionsctl reader thread's output so
+/// the cross-thread write/read is formally synchronized (same rationale as
+/// LockedErrorBox). `nil` means "not read yet"; a completed read stores the
+/// (possibly empty) data.
+private final class LockedDataBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Data?
+
+    func store(_ data: Data) {
+        lock.lock()
+        value = data
+        lock.unlock()
+    }
+
+    func load() -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }
 

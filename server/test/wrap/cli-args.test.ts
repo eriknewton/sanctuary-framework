@@ -80,6 +80,15 @@ describe("Wrap CLI", () => {
       expect(opts.dryRun).toBe(true);
     });
 
+    it("parses both local-intelligence pre-answer flags", () => {
+      expect(
+        parseWrapArgs(["--provision-local-intelligence"]).provisionLocalIntelligence,
+      ).toBe(true);
+      expect(
+        parseWrapArgs(["--no-provision-local-intelligence"]).provisionLocalIntelligence,
+      ).toBe(false);
+    });
+
     it("parses --dev-dist with path (dogfood path)", () => {
       const opts = parseWrapArgs(["--dev-dist", "/abs/path/to/dist/cli.js"]);
       expect(opts.devDist).toBe("/abs/path/to/dist/cli.js");

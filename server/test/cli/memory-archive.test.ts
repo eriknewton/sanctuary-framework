@@ -21,6 +21,7 @@ import { Readable, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
+// fail-before-exempt: C4 adds subprocess help assertions that execute the already-built dist/cli.js, which source-only reversal intentionally leaves in place; live C4 admission, authority, Tier-1, and structural tests fail against pre-C4 source. This file also retains its C3 fixture-only durable-state resolver wiring, covered by the C3 migration and contract suites.
 import { afterEach, describe, expect, it } from "vitest";
 
 import { IdentityManager } from "../../src/cognitive/tools.js";
@@ -31,6 +32,7 @@ import {
   MacOsLocalHumanInteraction,
   runMemoryArchiveExportCommand,
   runMemoryArchiveImportCommand,
+  runMemoryProvenancePruneSignersCommand,
   type MemoryArchiveDialogRunner,
   type PrivateMemoryArchiveInteraction,
 } from "../../src/cli/memory-archive.js";
@@ -41,8 +43,10 @@ import type {
   ApprovalResponse,
 } from "../../src/principal-policy/types.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../../src/sdw/memory-provenance-signing.js";
 import { ingestClaudeCodeMemoryDirectory } from "../../src/sdw/adapters/claude-code-file-adapter.js";
 import { transcodeMemoryDirectory } from "../../src/sdw/memory-transcode.js";
+import { SdwMemoryProvenanceMigration } from "../../src/sdw/memory-provenance-migration.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { runExitCommand } from "../../src/exit/cli.js";
 import {
@@ -165,14 +169,12 @@ async function fortress(prefix: string, ownerRef: string, withArchive: boolean):
   );
   await identityManager.save(storedIdentity);
   await waitForPrimaryIdentityPointer(storage);
-  if (!withArchive) return { path, storage, masterKey };
+  if (!withArchive) {
+    await completeMemoryMigration(storage, masterKey, path, ownerRef);
+    return { path, storage, masterKey };
+  }
 
-  const adapter = new SdwMemoryBackendAdapter({
-    storage,
-    masterKey,
-    fortressId: fortressId(path),
-    ownerRef,
-  });
+  const adapter = await productionAdapter(storage, masterKey, fortressId(path), ownerRef);
   await ingestClaudeCodeMemoryDirectory(adapter, FIXTURE_ROOT);
   const projectionParent = await tempDir(`${prefix}-projection`);
   const transcoded = await transcodeMemoryDirectory(
@@ -181,7 +183,47 @@ async function fortress(prefix: string, ownerRef: string, withArchive: boolean):
     "codex",
     join(projectionParent, "projection"),
   );
+  await completeMemoryMigration(storage, masterKey, path, ownerRef);
   return { path, storage, masterKey, archiveId: transcoded.archive_id };
+}
+
+async function completeMemoryMigration(
+  storage: FilesystemStorage,
+  masterKey: Uint8Array,
+  path: string,
+  ownerRef: string,
+): Promise<void> {
+  const identities = new IdentityManager(storage, masterKey);
+  await identities.load();
+  const migration = new SdwMemoryProvenanceMigration({
+    storage, masterKey, fortressId: fortressId(path), ownerRef,
+    resolvePrimarySigningHandle: createPrimaryMemoryProvenanceSigningHandleResolver(identities, masterKey),
+    resolveSignerPublicKey: createPrimaryMemoryProvenancePublicKeyResolver(identities),
+  });
+  for (let page = 0; page < 20; page++) {
+    const progress = await migration.migratePage();
+    if (progress.completed) break;
+    if (page === 19) throw new Error("disposable memory provenance migration did not complete");
+  }
+}
+
+async function productionAdapter(
+  storage: FilesystemStorage,
+  masterKey: Uint8Array,
+  boundFortressId: string,
+  ownerRef: string,
+): Promise<SdwMemoryBackendAdapter> {
+  const identities = new IdentityManager(storage, masterKey);
+  await identities.load();
+  return new SdwMemoryBackendAdapter({
+    storage,
+    masterKey,
+    fortressId: boundFortressId,
+    ownerRef,
+    resolvePrimarySigningHandle: createPrimaryMemoryProvenanceSigningHandleResolver(identities, masterKey),
+    resolveSignerPublicKey: createPrimaryMemoryProvenancePublicKeyResolver(identities),
+    resolveMemoryIntegrityState: async () => "state_PRE_MIGRATION",
+  });
 }
 
 async function waitForPrimaryIdentityPointer(storage: FilesystemStorage): Promise<void> {
@@ -281,6 +323,10 @@ describe("Exit V2 memory archive CLI", () => {
     const manifest = JSON.parse(
       await readFile(join(result.bundle, "manifest.json"), "utf8"),
     ) as { body: { export_approval_audit_id: string } };
+    const artifact = JSON.parse(
+      await readFile(join(result.bundle, "artifacts", "sdw-memory-archive.json"), "utf8"),
+    ) as { format: string };
+    expect(artifact.format).toBe("SANCTUARY_EXIT_V2_SDW_MEMORY_ARCHIVE_V2");
     const gateEvents = await new AuditLog(source.storage, source.masterKey).query({
       operation_type: "gate_approve:memory_archive_export",
       limit: 10,
@@ -341,6 +387,29 @@ describe("Exit V2 memory archive CLI", () => {
       expect(code).toBe(1);
       await expect(stat(bundle)).rejects.toMatchObject({ code: "ENOENT" });
     }
+  }, 60_000);
+
+  it("binds the signer-prune CLI to the real Tier-1 approval decision before signer mutation", async () => {
+    const target = await fortress("signer-prune-cli-denied", "fleet-self", false);
+    const approval = new RecordingApprovalChannel({
+      decision: "deny",
+      decided_at: "2026-08-25T00:00:00.000Z",
+      decided_by: "human",
+    });
+    const before = await target.storage.list("_known_signers");
+    const { out, err } = sinkPair();
+    expect(await runMemoryProvenancePruneSignersCommand({
+      argv: ["--fortress", target.path, "--json"],
+      out,
+      err,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      interaction: new TestTerminal(),
+      approvalChannel: approval,
+    })).toBe(1);
+    expect(approval.requests).toHaveLength(1);
+    expect(approval.requests[0]!.operation).toBe("memory_provenance_prune_signers");
+    expect(await target.storage.list("_known_signers")).toEqual(before);
+    expect(out.text()).toBe("");
   }, 60_000);
 
   it("imports only a hidden local-dialog key, ignores env and ordinary stdin, and preserves destination-local identity", async () => {
@@ -405,18 +474,8 @@ describe("Exit V2 memory archive CLI", () => {
       approval_audit_id: importApprovalAuditId,
       normalized_args_hash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
     });
-    const otherOwner = new SdwMemoryBackendAdapter({
-      storage: destination.storage,
-      masterKey: destination.masterKey,
-      fortressId: fortressId(destination.path),
-      ownerRef: "owner-b",
-    });
-    const destinationOwner = new SdwMemoryBackendAdapter({
-      storage: destination.storage,
-      masterKey: destination.masterKey,
-      fortressId: fortressId(destination.path),
-      ownerRef: "owner-a",
-    });
+    const otherOwner = await productionAdapter(destination.storage, destination.masterKey, fortressId(destination.path), "owner-b");
+    const destinationOwner = await productionAdapter(destination.storage, destination.masterKey, fortressId(destination.path), "owner-a");
     expect(await destinationOwner.countPassages()).toBeGreaterThan(0);
     expect(await otherOwner.countPassages()).toBe(0);
   }, 60_000);
@@ -438,12 +497,7 @@ describe("Exit V2 memory archive CLI", () => {
     expect(code).toBe(1);
     expect(out.text()).toBe("");
     expect(err.text()).toContain("local OS approval dialog");
-    const adapter = new SdwMemoryBackendAdapter({
-      storage: destination.storage,
-      masterKey: destination.masterKey,
-      fortressId: fortressId(destination.path),
-      ownerRef: "owner-a",
-    });
+    const adapter = await productionAdapter(destination.storage, destination.masterKey, fortressId(destination.path), "owner-a");
     expect(await adapter.countPassages()).toBe(0);
   }, 60_000);
 
@@ -468,12 +522,7 @@ describe("Exit V2 memory archive CLI", () => {
       expect(`${out.text()}${err.text()}`).not.toContain(
         Buffer.from(terminal.hiddenValue).toString("ascii"),
       );
-      const adapter = new SdwMemoryBackendAdapter({
-        storage: destination.storage,
-        masterKey: destination.masterKey,
-        fortressId: fortressId(destination.path),
-        ownerRef,
-      });
+      const adapter = await productionAdapter(destination.storage, destination.masterKey, fortressId(destination.path), ownerRef);
       expect(await adapter.countPassages()).toBe(0);
       expect(await treeSnapshot(destination.path)).toEqual(destinationBefore);
     }
@@ -499,12 +548,7 @@ describe("Exit V2 memory archive CLI", () => {
       });
       expect(code).toBe(1);
       expect(terminal.hiddenReads).toBe(1);
-      const adapter = new SdwMemoryBackendAdapter({
-        storage: deniedDestination.storage,
-        masterKey: deniedDestination.masterKey,
-        fortressId: fortressId(deniedDestination.path),
-        ownerRef: "owner-a",
-      });
+      const adapter = await productionAdapter(deniedDestination.storage, deniedDestination.masterKey, fortressId(deniedDestination.path), "owner-a");
       expect(await adapter.countPassages()).toBe(0);
     }
   }, 60_000);
@@ -540,12 +584,7 @@ describe("Exit V2 memory archive CLI", () => {
     // The import itself must have durably committed despite the later
     // failure, proving this exercised the post-commit branch and not a
     // pre-commit failure that happens to share the same exit code.
-    const adapter = new SdwMemoryBackendAdapter({
-      storage: destination.storage,
-      masterKey: destination.masterKey,
-      fortressId: fortressId(destination.path),
-      ownerRef: "owner-a",
-    });
+    const adapter = await productionAdapter(destination.storage, destination.masterKey, fortressId(destination.path), "owner-a");
     expect(await adapter.countPassages()).toBeGreaterThan(0);
   }, 60_000);
 
@@ -742,15 +781,24 @@ describe("Exit V2 memory archive CLI", () => {
     expect(interruptedOutput.every((byte) => byte === 0)).toBe(true);
   }, 60_000);
 
-  it("wires both shipping CLI routes and keeps the V1 manifest surface unchanged", async () => {
-    const [exportHelp, importHelp] = await Promise.all([
+  it("wires the memory archive and bad-signer CLI routes and keeps the V1 manifest surface unchanged", async () => {
+    const [exportHelp, importHelp, markHelp, clearHelp, pruneHelp] = await Promise.all([
       runCli("memory_archive_export", "--help"),
       runCli("memory_archive_import", "--help"),
+      runCli("memory_provenance_mark_bad_signer", "--help"),
+      runCli("memory_provenance_clear_bad_signer", "--help"),
+      runCli("memory_provenance_prune_signers", "--help"),
     ]);
     expect(exportHelp).toMatchObject({ code: 0, stderr: "" });
     expect(exportHelp.stdout).toContain("Usage: sanctuary memory_archive_export");
     expect(importHelp).toMatchObject({ code: 0, stderr: "" });
     expect(importHelp.stdout).toContain("Usage: sanctuary memory_archive_import");
+    expect(markHelp).toMatchObject({ code: 0, stderr: "" });
+    expect(markHelp.stdout).toContain("Usage: sanctuary memory_provenance_mark_bad_signer");
+    expect(clearHelp).toMatchObject({ code: 0, stderr: "" });
+    expect(clearHelp.stdout).toContain("Usage: sanctuary memory_provenance_clear_bad_signer");
+    expect(pruneHelp).toMatchObject({ code: 0, stderr: "" });
+    expect(pruneHelp.stdout).toContain("Usage: sanctuary memory_provenance_prune_signers");
     expect(exportHelp.stdout).not.toContain("--passphrase");
     expect(importHelp.stdout).not.toContain("--passphrase");
 

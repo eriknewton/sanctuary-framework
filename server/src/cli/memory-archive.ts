@@ -32,10 +32,16 @@ import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   exportExitV2SdwMemoryArchive,
   importExitV2SdwMemoryArchive,
+  planExitV2SdwMemoryAdmission,
   verifyExitV2SdwMemoryArchive,
 } from "../exit/v2-memory-archive.js";
 import { AuditLog } from "../operational/audit-log.js";
-import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
+import {
+  createExitAdmissionWriteGuard,
+  recoverInterruptedExitImportsOrThrow,
+  runJournaledExitMemoryAdmission,
+  type ExitAdmissionWriteGuard,
+} from "../exit/bundle.js";
 import type { ApprovalChannel } from "../principal-policy/approval-channel.js";
 import { BaselineTracker } from "../principal-policy/baseline.js";
 import { ApprovalGate } from "../principal-policy/gate.js";
@@ -45,7 +51,13 @@ import type {
   ApprovalResponse,
 } from "../principal-policy/types.js";
 import { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
+import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../sdw/memory-provenance-signing.js";
+import { SdwMemoryProvenanceMigration } from "../sdw/memory-provenance-migration.js";
+import { MemoryProvenanceBadSignerStore } from "../sdw/memory-provenance-bad-signers.js";
+import { MemoryProvenanceSignerPruner } from "../sdw/memory-provenance-signer-prune.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import type { StorageBackend } from "../storage/interface.js";
+import { KnownSignersStore } from "../reputation/known-signers-store.js";
 import { getSanctuaryVersion } from "../version.js";
 import { consumeFlagValue } from "./argv.js";
 
@@ -102,6 +114,21 @@ export interface MemoryArchiveCommandArgs {
   readonly approvalChannel?: ApprovalChannel;
 }
 
+interface ParsedBadSigner {
+  readonly signerDid: string;
+  readonly publicKeySha256: string;
+  readonly reason?: string;
+  readonly ownerRef: string;
+  readonly fortressPath: string;
+  readonly json: boolean;
+}
+
+interface ParsedSignerPrune {
+  readonly ownerRef: string;
+  readonly fortressPath: string;
+  readonly json: boolean;
+}
+
 interface ParsedExport {
   readonly archiveId: string;
   readonly outputPath: string;
@@ -118,12 +145,19 @@ interface ParsedImport {
 }
 
 interface Bootstrapped {
-  readonly storage: FilesystemStorage;
+  readonly storage: StorageBackend;
+  readonly journalStorage: FilesystemStorage;
+  readonly admissionWriteGuard: ExitAdmissionWriteGuard;
   readonly masterKey: Uint8Array;
   readonly identityKey: Uint8Array;
   readonly auditLog: AuditLog;
   readonly baseline: BaselineTracker;
   readonly adapter: SdwMemoryBackendAdapter;
+  readonly memoryProvenanceSigners: KnownSignersStore;
+  readonly badSignerStore: MemoryProvenanceBadSignerStore;
+  readonly signerPruner: MemoryProvenanceSignerPruner;
+  readonly resolveProvenanceSigner: (identityId: string, did: string) => Uint8Array | undefined;
+  readonly rememberProvenanceSigner: (did: string, publicKey: Uint8Array) => void;
   readonly signer: {
     readonly identity_id: string;
     readonly fortress_id: string;
@@ -203,6 +237,8 @@ export async function runMemoryArchiveExportCommand(
       exportApprovalAuditId: approvalAuditId,
       sourceSanctuaryVersion: getSanctuaryVersion(),
       signer: boot.signer,
+      formatVersion: 2,
+      resolveProvenanceSigner: boot.resolveProvenanceSigner,
     });
     transferKey = exported.transfer_key;
 
@@ -388,17 +424,49 @@ export async function runMemoryArchiveImportCommand(
       result: "success",
       details: approvedArgs,
     });
-    const receipt = await importExitV2SdwMemoryArchive({
+    const importedAt = new Date().toISOString();
+    const plan = await planExitV2SdwMemoryAdmission({
       adapter: boot.adapter,
       signer: boot.signer,
       manifest: bundle.manifest,
       artifactBytes: bundle.artifactBytes,
-      transferKey,
+      transferKey: new Uint8Array(transferKey),
+      importedAt,
+      badSignerAuthority: boot.badSignerStore,
+    });
+    const receipt = await runJournaledExitMemoryAdmission({
+      storage: boot.journalStorage,
+      importId: plan.importId,
+      identityId: boot.signer.identity_id,
+      locations: plan.locations,
+      operation: async (journal) => {
+        boot!.admissionWriteGuard.activate(plan.locations, journal.recordPostImage);
+        try {
+          return await importExitV2SdwMemoryArchive({
+            adapter: boot!.adapter,
+            signer: boot!.signer,
+            knownSignersStore: boot!.memoryProvenanceSigners,
+            manifest: bundle.manifest,
+            artifactBytes: bundle.artifactBytes,
+            transferKey: transferKey!,
+            now: () => importedAt,
+            badSignerAuthority: boot!.badSignerStore,
+          });
+        } finally {
+          boot!.admissionWriteGuard.deactivate();
+        }
+      },
     });
     // The destination archive is durably written by the call above; anything
     // that fails from this point on is a post-commit step, not an import
     // failure, and must be reported as such (see the `committed` comment).
     committed = true;
+    // Publish resolver state only after the journal has committed. A failed
+    // admission may have its signer rows rolled back and must not leave a
+    // process-local trust residue.
+    for (const entry of await boot.memoryProvenanceSigners.loadAll()) {
+      boot.rememberProvenanceSigner(entry.did, entry.publicKey);
+    }
     // Import consumes and clears its caller-owned key buffer.
     transferKey = undefined;
     await boot.auditLog.appendCritical({
@@ -445,6 +513,129 @@ export async function runMemoryArchiveImportCommand(
   }
 }
 
+export async function runMemoryProvenanceMarkBadSignerCommand(
+  args: MemoryArchiveCommandArgs,
+): Promise<number> {
+  return runMemoryProvenanceBadSignerCommand("mark", args);
+}
+
+export async function runMemoryProvenanceClearBadSignerCommand(
+  args: MemoryArchiveCommandArgs,
+): Promise<number> {
+  return runMemoryProvenanceBadSignerCommand("clear", args);
+}
+
+export async function runMemoryProvenancePruneSignersCommand(
+  args: MemoryArchiveCommandArgs,
+): Promise<number> {
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const operation = "memory_provenance_prune_signers";
+  if (args.argv.includes("--help") || args.argv.includes("-h")) {
+    write(out, "Usage: sanctuary memory_provenance_prune_signers --fortress <path> [--owner-ref <id>] [--json]\n");
+    return 0;
+  }
+  const parsed = parseSignerPrune(args.argv, err);
+  if (parsed === null) return 2;
+  const interaction = resolveInteraction(args.interaction, args.dialogRunner, err);
+  if (interaction === null) return 1;
+  let boot: Bootstrapped | null = null;
+  try {
+    boot = await bootstrap(parsed, args.env ?? process.env, err);
+    if (boot === null) return 1;
+    const gate = new ApprovalGate(
+      await loadPrincipalPolicy(parsed.fortressPath),
+      boot.baseline,
+      args.approvalChannel ?? interaction,
+      boot.auditLog,
+    );
+    const decision = await gate.evaluate(operation, { agent_id: null });
+    if (!decision.allowed || decision.approval_audit_id === undefined) {
+      write(err, `Denied: ${operation} was not approved.\n`);
+      return 1;
+    }
+    const result = await boot.signerPruner.prune({
+      approvalAuditId: decision.approval_audit_id,
+    });
+    write(out, parsed.json
+      ? JSON.stringify({ pruned: true, ...result }) + "\n"
+      : `${operation}: deleted ${String(result.deleted.length)} unreachable signer mapping(s)\n`);
+    return 0;
+  } catch {
+    write(err, `${operation} failed\n`);
+    return 1;
+  } finally {
+    await dispose(boot);
+    interaction.close();
+  }
+}
+
+async function runMemoryProvenanceBadSignerCommand(
+  action: "mark" | "clear",
+  args: MemoryArchiveCommandArgs,
+): Promise<number> {
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const operation = action === "mark"
+    ? "memory_provenance_mark_bad_signer"
+    : "memory_provenance_clear_bad_signer";
+  if (args.argv.includes("--help") || args.argv.includes("-h")) {
+    write(out, `Usage: sanctuary ${operation} --signer-did <did> --public-key-sha256 <hex> ${action === "mark" ? "--reason <text> " : ""}--owner-ref <id> --fortress <path>\n`);
+    return 0;
+  }
+  const parsed = parseBadSigner(args.argv, action, err);
+  if (parsed === null) return 2;
+  const interaction = resolveInteraction(args.interaction, args.dialogRunner, err);
+  if (interaction === null) return 1;
+  let boot: Bootstrapped | null = null;
+  try {
+    boot = await bootstrap(parsed, args.env ?? process.env, err);
+    if (boot === null) return 1;
+    const gateArgs = {
+      agent_id: null,
+      signer_did: parsed.signerDid,
+      public_key_sha256: parsed.publicKeySha256,
+      ...(parsed.reason === undefined ? {} : { reason: parsed.reason }),
+    };
+    const gate = new ApprovalGate(
+      await loadPrincipalPolicy(parsed.fortressPath),
+      boot.baseline,
+      args.approvalChannel ?? interaction,
+      boot.auditLog,
+    );
+    const decision = await gate.evaluate(operation, gateArgs);
+    if (!decision.allowed || decision.approval_audit_id === undefined) {
+      write(err, `Denied: ${operation} was not approved.\n`);
+      return 1;
+    }
+    if (action === "mark") {
+      const record = await boot.badSignerStore.mark({
+        signerDid: parsed.signerDid,
+        publicKeySha256: parsed.publicKeySha256,
+        reason: parsed.reason!,
+        approvalAuditId: decision.approval_audit_id,
+      }, boot.auditLog);
+      write(out, parsed.json ? JSON.stringify({ marked: true, ...record }) + "\n" :
+        `memory_provenance_mark_bad_signer: marked ${record.signer_did}\n`);
+    } else {
+      const scan = await boot.badSignerStore.clear({
+        signerDid: parsed.signerDid,
+        publicKeySha256: parsed.publicKeySha256,
+        approvalAuditId: decision.approval_audit_id,
+      }, boot.auditLog);
+      write(out, parsed.json ? JSON.stringify({ cleared: true, ...scan }) + "\n" :
+        `memory_provenance_clear_bad_signer: cleared after ${scan.affected} re-verification(s)\n`);
+    }
+    return 0;
+  } catch {
+    write(err, `${operation} failed\n`);
+    return 1;
+  } finally {
+    await dispose(boot);
+    interaction.close();
+  }
+}
+
 async function bootstrap(
   parsed: Pick<ParsedExport, "fortressPath" | "ownerRef">,
   env: NodeJS.ProcessEnv,
@@ -460,7 +651,9 @@ async function bootstrap(
   let identityKey: Uint8Array | undefined;
   try {
     await access(parsed.fortressPath);
-    const storage = new FilesystemStorage(join(parsed.fortressPath, "state"));
+    const journalStorage = new FilesystemStorage(join(parsed.fortressPath, "state"));
+    const admissionWriteGuard = createExitAdmissionWriteGuard(journalStorage);
+    const storage = admissionWriteGuard.storage;
     masterKey = await resolveCliMasterKey(storage, {
       ...(passphrase !== undefined ? { passphrase } : {}),
       ...(recoveryKey !== undefined ? { recoveryKey } : {}),
@@ -483,18 +676,75 @@ async function bootstrap(
     // discovered by the mechanical pin.
     const memoryArchiveAuditLog = new AuditLog(storage, masterKey);
     await recoverInterruptedExitImportsOrThrow(storage, memoryArchiveAuditLog);
+    const signingHandle = createPrimaryMemoryProvenanceSigningHandleResolver(identityManager, masterKey);
+    const signerPublicKey = createPrimaryMemoryProvenancePublicKeyResolver(identityManager);
+    const memoryProvenanceSigners = new KnownSignersStore(storage, masterKey, {
+      partition: "memory_provenance",
+    });
+    const persistedMemorySigners = await memoryProvenanceSigners.loadAll();
+    const persistedByDid = new Map(persistedMemorySigners.map((entry) => [entry.did, entry.publicKey]));
+    const resolveProvenanceSigner = (identityId: string, did: string) =>
+      signerPublicKey(identityId, did) ?? persistedByDid.get(did)?.slice();
+    const rememberProvenanceSigner = (did: string, publicKey: Uint8Array) => {
+      const prior = persistedByDid.get(did);
+      if (prior !== undefined && !Buffer.from(prior).equals(Buffer.from(publicKey))) {
+        throw new Error("Persisted memory-provenance signer conflicts with the runtime resolver");
+      }
+      persistedByDid.set(did, publicKey.slice());
+    };
+    const migration = new SdwMemoryProvenanceMigration({
+      storage,
+      masterKey,
+      fortressId,
+      ownerRef: parsed.ownerRef,
+      resolvePrimarySigningHandle: signingHandle,
+      resolveSignerPublicKey: signerPublicKey,
+    });
+    const badSignerStore: MemoryProvenanceBadSignerStore = new MemoryProvenanceBadSignerStore({
+      storage,
+      masterKey,
+      fortressId,
+      resolveSignerPublicKey: (did) => persistedByDid.get(did)?.slice(),
+      isLocallyRootedSigner: (did, publicKey) => {
+        if (primary.did !== did) return false;
+        return Buffer.from(primary.public_key, "base64url").equals(Buffer.from(publicKey));
+      },
+      scanForeignDependencies: (did, fingerprint) =>
+        adapter.scanForeignSignerDependencies(did, fingerprint),
+    });
+    const adapter: SdwMemoryBackendAdapter = new SdwMemoryBackendAdapter({
+      storage,
+      masterKey,
+      fortressId,
+      ownerRef: parsed.ownerRef,
+      resolvePrimarySigningHandle: signingHandle,
+      resolveSignerPublicKey: resolveProvenanceSigner,
+      resolveMemoryIntegrityState: () => migration.getState(),
+      badSignerAuthority: badSignerStore,
+    });
+    const signerPruner = new MemoryProvenanceSignerPruner({
+      storage,
+      masterKey,
+      fortressId,
+      knownSignersStore: memoryProvenanceSigners,
+      resolveSignerPublicKey: resolveProvenanceSigner,
+      forgetSigner: (did) => { persistedByDid.delete(did); },
+      auditLog: memoryArchiveAuditLog,
+    });
     return {
       storage,
+      journalStorage,
+      admissionWriteGuard,
       masterKey,
       identityKey,
       auditLog: memoryArchiveAuditLog,
       baseline: new BaselineTracker(storage, masterKey),
-      adapter: new SdwMemoryBackendAdapter({
-        storage,
-        masterKey,
-        fortressId,
-        ownerRef: parsed.ownerRef,
-      }),
+      adapter,
+      memoryProvenanceSigners,
+      badSignerStore,
+      signerPruner,
+      resolveProvenanceSigner,
+      rememberProvenanceSigner,
       signer: {
         identity_id: primary.identity_id,
         fortress_id: fortressId,
@@ -861,6 +1111,52 @@ function parseImport(argv: string[], err: Writable): ParsedImport | null {
   }
   return {
     inputPath: resolve(inputPath),
+    ownerRef,
+    fortressPath: resolve(fortressPath),
+    json: parsed.switches.has("--json"),
+  };
+}
+
+function parseBadSigner(
+  argv: string[],
+  action: "mark" | "clear",
+  err: Writable,
+): ParsedBadSigner | null {
+  const parsed = parseFlags(argv, [
+    "--signer-did", "--public-key-sha256", "--reason", "--owner-ref", "--fortress",
+  ]);
+  const signerDid = parsed?.values.get("--signer-did");
+  const publicKeySha256 = parsed?.values.get("--public-key-sha256");
+  const reason = parsed?.values.get("--reason");
+  const ownerRef = parsed?.values.get("--owner-ref");
+  const fortressPath = parsed?.values.get("--fortress");
+  if (parsed === null || parsed.unknown.length > 0 || signerDid === undefined ||
+      publicKeySha256 === undefined || ownerRef === undefined || fortressPath === undefined ||
+      !SAFE_OWNER_REF.test(ownerRef) || (action === "mark" && reason === undefined) ||
+      (action === "clear" && reason !== undefined)) {
+    write(err, `Usage: sanctuary memory_provenance_${action === "mark" ? "mark" : "clear"}_bad_signer --signer-did <did> --public-key-sha256 <hex> ${action === "mark" ? "--reason <text> " : ""}--owner-ref <id> --fortress <path>\n`);
+    return null;
+  }
+  return {
+    signerDid,
+    publicKeySha256,
+    ...(reason === undefined ? {} : { reason }),
+    ownerRef,
+    fortressPath: resolve(fortressPath),
+    json: parsed.switches.has("--json"),
+  };
+}
+
+function parseSignerPrune(argv: string[], err: Writable): ParsedSignerPrune | null {
+  const parsed = parseFlags(argv, ["--owner-ref", "--fortress"]);
+  const ownerRef = parsed?.values.get("--owner-ref") ?? "fleet-self";
+  const fortressPath = parsed?.values.get("--fortress");
+  if (parsed === null || parsed.unknown.length > 0 || fortressPath === undefined ||
+      !SAFE_OWNER_REF.test(ownerRef)) {
+    write(err, "Usage: sanctuary memory_provenance_prune_signers --fortress <path> [--owner-ref <id>] [--json]\n");
+    return null;
+  }
+  return {
     ownerRef,
     fortressPath: resolve(fortressPath),
     json: parsed.switches.has("--json"),

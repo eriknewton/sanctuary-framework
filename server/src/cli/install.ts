@@ -59,6 +59,8 @@ export const DEFAULT_CASTLE_WALL_RUNTIME_MANIFEST = join(
   "cli-runtime-manifest.json",
 );
 const INSTALLER_VERSION = getSanctuaryVersion();
+// Must match CASTLE_WALL_SYSTEM_EXTENSION_TEAM_ID in castle-wall.ts and
+// SignerConstants.teamID in castle-wall-macos/Sources/CastleWallSigner/SignerConstants.swift.
 const CASTLE_WALL_TEAM_ID = "YFQSWQ9BJN";
 const CASTLE_WALL_APP_IDENTIFIER = "ai.sanctuaryprotocol.macos";
 const CASTLE_WALL_LAUNCHER_IDENTIFIER =

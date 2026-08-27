@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import type { MemoryBackendAdapter } from "../../src/sdw/adapters/memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 import {
   SDW_MEMORY_PROVENANCE_AUDIT_OPS,
   createSdwMemoryProvenanceTool,
 } from "../../src/sdw/memory-provenance-tool.js";
 import { assertSdwRawWriteAuthorized } from "../../src/sdw/write-gate.js";
 import type { AuditLog } from "../../src/operational/audit-log.js";
+import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
+import { documentProvenanceKey } from "../../src/sdw/grammar.js";
 
 const FORTRESS_ID = "fortress:prov";
 const MASTER_KEY = new Uint8Array(32).fill(5);
@@ -62,7 +66,7 @@ function makeAuditLog(failOn?: string): { log: AuditLog; calls: AuditCall[] } {
 
 function setup(failOn?: string) {
   const storage = new MemoryStorage();
-  const adapter = new SdwMemoryBackendAdapter({
+  const adapter = new TestSdwMemoryBackendAdapter({
     storage,
     masterKey: MASTER_KEY,
     fortressId: FORTRESS_ID,
@@ -71,7 +75,7 @@ function setup(failOn?: string) {
   });
   const { log, calls } = makeAuditLog(failOn);
   const tool = createSdwMemoryProvenanceTool({ adapter, auditLog: log });
-  return { adapter, tool, calls };
+  return { adapter, tool, calls, storage };
 }
 
 function parse(result: { content: Array<{ type: "text"; text: string }> }): Record<string, unknown> {
@@ -84,11 +88,14 @@ describe("sdw_memory_provenance: honesty + public-safety", () => {
     expect(tool.name).toBe("sdw_memory_provenance");
     expect(tool.tool_class).toBe("read");
     const desc = tool.description.toLowerCase();
-    expect(desc).toContain("not claim to prove who wrote");
+    expect(desc).toContain("does not prove true authorship");
+    expect(desc).toContain("content truth");
+    expect(desc).toContain("safety");
+    expect(desc).toContain("remote identity");
     expect(desc).not.toContain("signer-bound");
   });
 
-  it("returns the shipped provenance plus an HONEST gaps block (no overclaim)", async () => {
+  it("returns verified per-record provenance without overclaiming truth or safety", async () => {
     const { adapter, tool } = setup();
     await adapter.insertPassage(
       { passage_id: "e1", text: "company brain note" },
@@ -104,14 +111,92 @@ describe("sdw_memory_provenance: honesty + public-safety", () => {
     expect(prov.content_hash_verified_on_read).toBe(true);
     expect(prov.created_at).toBe(NOW);
 
-    // The honest gaps block: per-writer signing is NOT bound, taint is NOT
-    // retrievable, and there is NO automatic provenance event. These must be
-    // present so a reader is never misled into trusting unproven authorship.
+    // C2 populates only the bounded, public-safe binding projection.
     const gaps = out.provenance_gaps as Record<string, unknown>;
-    expect(gaps.per_writer_signature).toBeNull();
-    expect(gaps.signing_status).toBe("not_bound");
+    expect(out.provenance_status).toBe("verified");
+    expect(gaps.per_writer_signature).toBe("verified");
+    expect(gaps.signing_status).toBe("verified");
     expect(gaps.taint_retrievable).toBe(false);
-    expect(gaps.automatic_provenance_event).toBe(false);
+    expect(gaps.automatic_provenance_event).toBe(true);
+    expect(gaps).toMatchObject({
+      ingress_channel: "memory_insert",
+      source_class: "system_generated",
+      recorded_at: NOW,
+      admission_channel: "local_write",
+      origin_trust_tier: "local_attested",
+      verification_basis: "local_primary_identity",
+      admitted_at: NOW,
+    });
+    expect(Object.keys(gaps).sort()).toEqual([
+      "admission_channel",
+      "admitted_at",
+      "automatic_provenance_event",
+      "ingress_channel",
+      "note",
+      "origin_trust_tier",
+      "per_writer_signature",
+      "recorded_at",
+      "signing_status",
+      "source_class",
+      "taint_retrievable",
+      "verification_basis",
+    ]);
+    for (const forbidden of [
+      "author_agent_id", "identity_id", "signer_did", "destination_fortress_id",
+      "destination_owner_ref", "signature", "companion",
+    ]) expect(gaps).not.toHaveProperty(forbidden);
+    expect(JSON.stringify(out)).not.toContain("test-primary");
+    expect(JSON.stringify(out)).not.toContain("did:key:");
+  });
+
+  it("keeps PRE_MIGRATION unsigned output explicit and does not synthesize verified fields", async () => {
+    const { adapter, tool, storage } = setup();
+    await adapter.insertPassage({ passage_id: "legacy", text: "unsigned legacy" }, "agent_derived_clean");
+    storage.data.delete(`${SDW_DOCUMENT_CORPUS_NAMESPACE}\0${documentProvenanceKey("mem.prov-archive.legacy")}`);
+    const out = parse(await tool.handler({ passage_id: "legacy" }));
+    expect(out.provenance_status).toBe("unsigned");
+    const gaps = out.provenance_gaps as Record<string, unknown>;
+    expect(Object.keys(gaps).sort()).toEqual([
+      "automatic_provenance_event", "note", "per_writer_signature", "signing_status", "taint_retrievable",
+    ]);
+    expect(gaps).toMatchObject({
+      per_writer_signature: null,
+      signing_status: "not_bound",
+      taint_retrievable: false,
+      automatic_provenance_event: false,
+    });
+    expect(String(gaps.note)).toContain("PRE_MIGRATION");
+  });
+
+  it("denies rather than mixing old provenance with a replacement passage", async () => {
+    const { adapter } = setup();
+    await adapter.insertPassage({ passage_id: "racing", text: "old version" }, "agent_derived_clean");
+    let provenanceReads = 0;
+    const racingAdapter = new Proxy(adapter, {
+      get(target, property, receiver): unknown {
+        if (property === "getPassageProvenance") {
+          return async (passageId: string) => {
+            const observed = await target.getPassageProvenance(passageId);
+            provenanceReads++;
+            if (provenanceReads === 1) {
+              await target.putPassages(
+                [{ passage_id: passageId, text: "replacement version" }],
+                "agent_derived_clean",
+              );
+            }
+            return observed;
+          };
+        }
+        const value = Reflect.get(target, property, receiver) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as MemoryBackendAdapter;
+    const { log } = makeAuditLog();
+    const tool = createSdwMemoryProvenanceTool({ adapter: racingAdapter, auditLog: log });
+    const out = parse(await tool.handler({ passage_id: "racing" }));
+    expect(provenanceReads).toBe(2);
+    expect(out.denied).toBe(true);
+    expect(out).not.toHaveProperty("provenance");
   });
 
   it("does NOT leak the passage body or any sensitive field in the provenance (MUST-NEVER #7)", async () => {

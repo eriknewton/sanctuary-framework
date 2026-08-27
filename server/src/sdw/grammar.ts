@@ -111,6 +111,25 @@ export function documentKey(documentId: string): string {
   return `doc.${documentId}`;
 }
 
+/** Frozen Slice-C companion key: one encrypted record beside each document. */
+export function documentProvenanceKey(documentId: string): string {
+  assertSdwIdentifier(documentId, "document_id");
+  return `prov.${documentId}`;
+}
+
+/** Replace-in-place quarantine status; never an attacker-growable event log. */
+export function documentProvenanceStatusKey(documentId: string): string {
+  assertSdwIdentifier(documentId, "document_id");
+  return `prov-status.${documentId}`;
+}
+
+export const SDW_MEMORY_PROVENANCE_MIGRATION_ACTIVE_KEY =
+  "memory-provenance-migration.active-v1" as const;
+export const SDW_MEMORY_PROVENANCE_MIGRATION_JOURNAL_KEY =
+  "memory-provenance-migration.journal-v1" as const;
+export const SDW_MEMORY_PROVENANCE_COMPLETION_KEY =
+  "memory-provenance-migration.completion-v1" as const;
+
 export function documentChunkKey(
   documentId: string,
   chunkOrdinalPadded: string,

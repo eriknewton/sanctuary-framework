@@ -10,7 +10,12 @@
  *   - clear() removes the record and subsequent load returns defaults
  */
 
-import { describe, it, expect } from "vitest";
+// fail-before-exempt: hosted-CI fixture correction replaces a root-anchored fake lock path with an isolated temp directory; it intentionally changes no production behavior.
+
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, it, expect, vi } from "vitest";
 import {
   IntelligenceConfigStore,
   INTELLIGENCE_NAMESPACE,
@@ -68,6 +73,35 @@ describe("Intelligence Substrate Config Store", () => {
     expect(outcome.kind).toBe("loaded");
     expect(outcome.config.updatedAt >= before).toBe(true);
     expect(outcome.config.updatedAt <= after).toBe(true);
+  });
+
+  it("uses the durable storage primitive for the authoritative config when available", async () => {
+    const base = new MemoryStorage();
+    const root = await mkdtemp(join(tmpdir(), "sanctuary-policy-store-"));
+    const write = vi.fn((...args: Parameters<MemoryStorage["write"]>) =>
+      base.write(...args));
+    const writeDurable = vi.fn((...args: Parameters<MemoryStorage["write"]>) =>
+      base.write(...args));
+    const storage = {
+      write,
+      writeDurable,
+      read: (...args: Parameters<MemoryStorage["read"]>) => base.read(...args),
+      delete: (...args: Parameters<MemoryStorage["delete"]>) => base.delete(...args),
+      list: (...args: Parameters<MemoryStorage["list"]>) => base.list(...args),
+      exists: (...args: Parameters<MemoryStorage["exists"]>) => base.exists(...args),
+      totalSize: () => base.totalSize(),
+      listNamespaces: () => base.listNamespaces(),
+      namespacePath: (namespace: string) => join(root, namespace),
+    };
+    const store = new IntelligenceConfigStore(storage, generateRandomKey());
+    try {
+      await store.save(buildDefaultConfig());
+
+      expect(writeDurable).toHaveBeenCalledOnce();
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("on-disk payload is encrypted (no plaintext API key on disk)", async () => {

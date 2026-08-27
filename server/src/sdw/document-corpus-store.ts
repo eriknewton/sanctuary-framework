@@ -1,11 +1,27 @@
 import type { StorageBackend } from "../storage/interface.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
-import { documentChunkKey, documentKey } from "./grammar.js";
+import {
+  SDW_MEMORY_PROVENANCE_COMPLETION_KEY,
+  SDW_MEMORY_PROVENANCE_MIGRATION_ACTIVE_KEY,
+  SDW_MEMORY_PROVENANCE_MIGRATION_JOURNAL_KEY,
+  documentChunkKey,
+  documentKey,
+  documentProvenanceKey,
+  documentProvenanceStatusKey,
+} from "./grammar.js";
 import {
   SDW_DOCUMENT_CORPUS_HKDF_INFO,
   SDW_DOCUMENT_CORPUS_NAMESPACE,
+  SDW_META_NAMESPACE,
+  SDW_REPLAY_ANCHOR_KEY,
   type SdwDocumentChunkRecord,
   type SdwDocumentRecord,
+  type SdwMemoryProvenanceCompletionRecord,
+  type SdwMemoryProvenanceMigrationActiveRecord,
+  type SdwMemoryProvenanceMigrationJournalRecord,
+  type SdwMemoryProvenanceRecord,
+  type SdwMemoryProvenanceStatusRecord,
+  type SdwRecord,
 } from "./records.js";
 import {
   mintPersistable,
@@ -16,6 +32,7 @@ import {
   type Taint,
 } from "./write-gate.js";
 import { decodeSdwRecord } from "./store-codec.js";
+import { readReplayAnchor } from "./replay-anchor.js";
 
 export interface SdwDocumentCorpusStoreOptions {
   readonly storage: StorageBackend;
@@ -24,22 +41,26 @@ export interface SdwDocumentCorpusStoreOptions {
 }
 
 export interface SdwCorpusTxn {
-  writePersistable<T extends SdwDocumentRecord | SdwDocumentChunkRecord>(
+  write(namespace: string, key: string, data: Uint8Array): Promise<void>;
+  writePersistable<T extends SdwRecord>(
     persistable: Persistable<T>,
     encryptionKey: Uint8Array,
     fortressId: string,
     options?: MintPersistableOptions,
   ): Promise<void>;
   read(namespace: string, key: string): Promise<Uint8Array | null>;
+  delete(namespace: string, key: string): Promise<boolean>;
 }
 
 export class SdwDocumentCorpusStore {
   private readonly storage: StorageBackend;
+  private readonly masterKey: Uint8Array;
   private readonly encryptionKey: Uint8Array;
   private readonly fortressId: string;
 
   constructor(options: SdwDocumentCorpusStoreOptions) {
     this.storage = options.storage;
+    this.masterKey = options.masterKey;
     this.encryptionKey = derivePurposeKey(options.masterKey, SDW_DOCUMENT_CORPUS_HKDF_INFO);
     this.fortressId = options.fortressId;
   }
@@ -80,6 +101,16 @@ export class SdwDocumentCorpusStore {
     );
   }
 
+  mintProvenance(record: SdwMemoryProvenanceRecord, taint: Taint): Persistable<SdwMemoryProvenanceRecord> {
+    return mintPersistable({ value: record, taint }, SDW_DOCUMENT_CORPUS_NAMESPACE,
+      documentProvenanceKey(record.document_id), this.fortressId);
+  }
+
+  mintProvenanceStatus(record: SdwMemoryProvenanceStatusRecord, taint: Taint): Persistable<SdwMemoryProvenanceStatusRecord> {
+    return mintPersistable({ value: record, taint }, SDW_DOCUMENT_CORPUS_NAMESPACE,
+      documentProvenanceStatusKey(record.document_id), this.fortressId);
+  }
+
   async putDocument(
     record: SdwDocumentRecord,
     taint: Taint,
@@ -106,6 +137,24 @@ export class SdwDocumentCorpusStore {
       return;
     }
     await sdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId, options);
+  }
+
+  async putProvenance(record: SdwMemoryProvenanceRecord, taint: Taint, txn?: SdwCorpusTxn): Promise<void> {
+    const persistable = this.mintProvenance(record, taint);
+    if (txn !== undefined) {
+      await txn.writePersistable(persistable, this.encryptionKey, this.fortressId);
+      return;
+    }
+    await sdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId);
+  }
+
+  async putProvenanceStatus(record: SdwMemoryProvenanceStatusRecord, taint: Taint, txn?: SdwCorpusTxn): Promise<void> {
+    const persistable = this.mintProvenanceStatus(record, taint);
+    if (txn !== undefined) {
+      await txn.writePersistable(persistable, this.encryptionKey, this.fortressId);
+      return;
+    }
+    await sdwBackendWrite(this.storage, persistable, this.encryptionKey, this.fortressId);
   }
 
   /**
@@ -178,6 +227,103 @@ export class SdwDocumentCorpusStore {
     await restoreRawSdwBackendWrite(this.storage, SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey, raw);
   }
 
+  async restorePriorProvenance(documentId: string, raw: Uint8Array): Promise<void> {
+    const storageKey = documentProvenanceKey(documentId);
+    decodeSdwRecord<SdwMemoryProvenanceRecord>(raw, {
+      namespace: SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey, fortressId: this.fortressId,
+      encryptionKey: this.encryptionKey, expectedKind: "memory_provenance",
+      verifyIdentity: (record) => record.document_id === documentId,
+    });
+    await restoreRawSdwBackendWrite(this.storage, SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey, raw);
+  }
+
+  async restorePriorProvenanceStatus(documentId: string, raw: Uint8Array): Promise<void> {
+    const storageKey = documentProvenanceStatusKey(documentId);
+    decodeSdwRecord<SdwMemoryProvenanceStatusRecord>(raw, {
+      namespace: SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey, fortressId: this.fortressId,
+      encryptionKey: this.encryptionKey, expectedKind: "memory_provenance_status",
+      verifyIdentity: (record) => record.document_id === documentId,
+    });
+    await restoreRawSdwBackendWrite(this.storage, SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey, raw);
+  }
+
+  /**
+   * C3 rollback restores the exact captured companion pre-image even when the
+   * whole reason for quarantine was that those ciphertext bytes do not decode.
+   * Scope stays fixed to one reconstructed `prov.<document_id>` key; callers
+   * cannot select a namespace or arbitrary storage key.
+   */
+  async restoreMemoryMigrationProvenancePreimage(
+    documentId: string,
+    raw: Uint8Array,
+  ): Promise<void> {
+    await restoreRawSdwBackendWrite(
+      this.storage,
+      SDW_DOCUMENT_CORPUS_NAMESPACE,
+      documentProvenanceKey(documentId),
+      raw,
+    );
+  }
+
+  /** Status counterpart of {@link restoreMemoryMigrationProvenancePreimage}. */
+  async restoreMemoryMigrationProvenanceStatusPreimage(
+    documentId: string,
+    raw: Uint8Array,
+  ): Promise<void> {
+    await restoreRawSdwBackendWrite(
+      this.storage,
+      SDW_DOCUMENT_CORPUS_NAMESPACE,
+      documentProvenanceStatusKey(documentId),
+      raw,
+    );
+  }
+
+  /**
+   * C3 rollback boundary for the three exact encrypted migration metadata
+   * records. The caller cannot use this to replay arbitrary `_sdw_meta` bytes:
+   * the key selects a fixed kind and the ciphertext is authenticated for that
+   * exact namespace/key/fortress before the original bytes are restored.
+   */
+  async restorePriorMemoryMigrationMetadata(
+    storageKey: string,
+    raw: Uint8Array,
+  ): Promise<void> {
+    if (storageKey === SDW_MEMORY_PROVENANCE_MIGRATION_ACTIVE_KEY) {
+      decodeSdwRecord<SdwMemoryProvenanceMigrationActiveRecord>(raw, {
+        namespace: SDW_META_NAMESPACE, storageKey, fortressId: this.fortressId,
+        encryptionKey: this.encryptionKey, expectedKind: "memory_provenance_migration_active",
+        verifyIdentity: (record) => record.migration_id === "MI_C_SDW_MEMORY_PROVENANCE_V1",
+      });
+    } else if (storageKey === SDW_MEMORY_PROVENANCE_MIGRATION_JOURNAL_KEY) {
+      decodeSdwRecord<SdwMemoryProvenanceMigrationJournalRecord>(raw, {
+        namespace: SDW_META_NAMESPACE, storageKey, fortressId: this.fortressId,
+        encryptionKey: this.encryptionKey, expectedKind: "memory_provenance_migration_journal",
+        verifyIdentity: (record) => record.migration_id === "MI_C_SDW_MEMORY_PROVENANCE_V1",
+      });
+    } else if (storageKey === SDW_MEMORY_PROVENANCE_COMPLETION_KEY) {
+      decodeSdwRecord<SdwMemoryProvenanceCompletionRecord>(raw, {
+        namespace: SDW_META_NAMESPACE, storageKey, fortressId: this.fortressId,
+        encryptionKey: this.encryptionKey, expectedKind: "memory_provenance_completion",
+        verifyIdentity: (record) => record.migration_id === "MI_C_SDW_MEMORY_PROVENANCE_V1",
+      });
+    } else {
+      throw new Error("Refusing to restore an unrecognized SDW memory migration metadata key");
+    }
+    await restoreRawSdwBackendWrite(this.storage, SDW_META_NAMESPACE, storageKey, raw);
+  }
+
+  /** C3 exact replay-anchor pre-image restore, after authenticating its MAC. */
+  async restorePriorReplayAnchor(raw: Uint8Array): Promise<void> {
+    const anchor = await readReplayAnchor({
+      read: async (namespace: string, key: string) =>
+        namespace === SDW_META_NAMESPACE && key === SDW_REPLAY_ANCHOR_KEY ? raw : null,
+    }, this.masterKey);
+    if (anchor.status !== "valid") {
+      throw new Error("Refusing to restore an unauthenticated SDW replay anchor");
+    }
+    await restoreRawSdwBackendWrite(this.storage, SDW_META_NAMESPACE, SDW_REPLAY_ANCHOR_KEY, raw);
+  }
+
   async getDocument(documentId: string, txn?: SdwCorpusTxn): Promise<SdwDocumentRecord | null> {
     return (await this.getDocumentRaw(documentId, txn))?.record ?? null;
   }
@@ -207,8 +353,8 @@ export class SdwDocumentCorpusStore {
     return { raw, record };
   }
 
-  async getChunk(documentId: string, chunkOrdinal: number, chunkId: string): Promise<SdwDocumentChunkRecord | null> {
-    return (await this.getChunkRaw(documentId, chunkOrdinal, chunkId))?.record ?? null;
+  async getChunk(documentId: string, chunkOrdinal: number, chunkId: string, txn?: SdwCorpusTxn): Promise<SdwDocumentChunkRecord | null> {
+    return (await this.getChunkRaw(documentId, chunkOrdinal, chunkId, txn))?.record ?? null;
   }
 
   /** Raw-plus-decoded counterpart of {@link getChunk}; see {@link getDocumentRaw}. */
@@ -216,9 +362,10 @@ export class SdwDocumentCorpusStore {
     documentId: string,
     chunkOrdinal: number,
     chunkId: string,
+    txn?: SdwCorpusTxn,
   ): Promise<{ readonly raw: Uint8Array; readonly record: SdwDocumentChunkRecord } | null> {
     const storageKey = documentChunkKey(documentId, padChunkOrdinal(chunkOrdinal), chunkId);
-    const raw = await this.storage.read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
+    const raw = await (txn ?? this.storage).read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
     if (raw === null) return null;
     const record = decodeSdwRecord<SdwDocumentChunkRecord>(raw, {
       namespace: SDW_DOCUMENT_CORPUS_NAMESPACE,
@@ -230,6 +377,30 @@ export class SdwDocumentCorpusStore {
         record.document_id === documentId &&
         record.chunk_id === chunkId &&
         record.chunk_ordinal === chunkOrdinal,
+    });
+    return { raw, record };
+  }
+
+  async getProvenanceRaw(documentId: string, txn?: SdwCorpusTxn): Promise<{ readonly raw: Uint8Array; readonly record: SdwMemoryProvenanceRecord } | null> {
+    const storageKey = documentProvenanceKey(documentId);
+    const raw = await (txn ?? this.storage).read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
+    if (raw === null) return null;
+    const record = decodeSdwRecord<SdwMemoryProvenanceRecord>(raw, {
+      namespace: SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey, fortressId: this.fortressId,
+      encryptionKey: this.encryptionKey, expectedKind: "memory_provenance",
+      verifyIdentity: (candidate) => candidate.document_id === documentId,
+    });
+    return { raw, record };
+  }
+
+  async getProvenanceStatusRaw(documentId: string, txn?: SdwCorpusTxn): Promise<{ readonly raw: Uint8Array; readonly record: SdwMemoryProvenanceStatusRecord } | null> {
+    const storageKey = documentProvenanceStatusKey(documentId);
+    const raw = await (txn ?? this.storage).read(SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey);
+    if (raw === null) return null;
+    const record = decodeSdwRecord<SdwMemoryProvenanceStatusRecord>(raw, {
+      namespace: SDW_DOCUMENT_CORPUS_NAMESPACE, storageKey, fortressId: this.fortressId,
+      encryptionKey: this.encryptionKey, expectedKind: "memory_provenance_status",
+      verifyIdentity: (candidate) => candidate.document_id === documentId,
     });
     return { raw, record };
   }

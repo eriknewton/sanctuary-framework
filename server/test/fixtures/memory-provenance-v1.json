@@ -1,0 +1,45 @@
+{
+  "origin_public_key": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+  "admission_public_key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+  "origin_signing_bytes_base64url": "c2FuY3R1YXJ5LnNkdy5tZW1vcnktb3JpZ2luLnYxCnsiYXV0aG9yX2FnZW50X2lkIjoiYWdlbnQtY2xhdWRlIiwiY2h1bmtfY291bnQiOjIsImNvbnRlbnRfaGFzaCI6IkF3TURBd01EQXdNREF3TURBd01EQXdNREF3TURBd01EQXdNREF3TURBd00iLCJmb3JtYXQiOiJTQU5DVFVBUllfU0RXX01FTU9SWV9PUklHSU5fVjEiLCJpbmdyZXNzX2NoYW5uZWwiOiJtZW1vcnlfaW5zZXJ0Iiwib3JpZ2luX2ZvcnRyZXNzX2lkIjoiZm9ydHJlc3Mtb3JpZ2luIiwib3duZXJfcmVmIjoib3duZXItb3JpZ2luIiwicGFzc2FnZV9pZCI6InBhc3NhZ2UtMDAxIiwicmVjb3JkZWRfYXQiOiIyMDI2LTA4LTI0VDEyOjM0OjU2Ljc4OS0wNjowMCIsInNpZ25hdHVyZV9zY2hlbWUiOiJlZDI1NTE5LXYxIiwic2lnbmVyX2RpZCI6ImRpZDprZXk6ejZNa29uM05lY2Q2TmtreWZvR29IeGlkMnpuR2M1OUxVM0s3bXViYVJjRmJMZkxYIiwic2lnbmVyX2lkZW50aXR5X2lkIjoib3JpZ2luLXNpZ25lciIsInNvdXJjZV9jbGFzcyI6InVzZXJfY29udGVudCJ9",
+  "admission_signing_bytes_base64url": "c2FuY3R1YXJ5LnNkdy5tZW1vcnktYWRtaXNzaW9uLnYxCnsiYWRtaXNzaW9uX2NoYW5uZWwiOiJsb2NhbF93cml0ZSIsImFkbWl0dGVkX2F0IjoiMjAyNi0wOC0yNFQxMjozNTowMS4xMjMtMDY6MDAiLCJkZXN0aW5hdGlvbl9mb3J0cmVzc19pZCI6ImZvcnRyZXNzLWRlc3RpbmF0aW9uIiwiZGVzdGluYXRpb25fb3duZXJfcmVmIjoib3duZXItZGVzdGluYXRpb24iLCJmb3JtYXQiOiJTQU5DVFVBUllfU0RXX01FTU9SWV9BRE1JU1NJT05fVjEiLCJvcmlnaW5fcHJvdmVuYW5jZV9kaWdlc3QiOiI3YTA1OGRhMTU2NjhhYWFkNmU3NzI4OWRiYjEwOWJiZDVlOTNjMjJmNWM1MTIzYjZmZTUyYmExODZhY2Y5YjJlIiwib3JpZ2luX3RydXN0X3RpZXIiOiJsb2NhbF9hdHRlc3RlZCIsInBhc3NhZ2VfaWQiOiJwYXNzYWdlLTAwMSIsInNpZ25hdHVyZV9zY2hlbWUiOiJlZDI1NTE5LXYxIiwic2lnbmVyX2RpZCI6ImRpZDprZXk6ejZNa285aFRnZ013alNURWFKYVBVZkU2dHFjeTJ4dlU2Qm5OcTNlM284cVZCaXlIIiwic2lnbmVyX2lkZW50aXR5X2lkIjoiYWRtaXNzaW9uLXNpZ25lciIsInZlcmlmaWNhdGlvbl9iYXNpcyI6ImxvY2FsX3ByaW1hcnlfaWRlbnRpdHkifQ",
+  "companion": {
+    "format": "SANCTUARY_SDW_MEMORY_PROVENANCE_V1",
+    "origin": {
+      "body": {
+        "format": "SANCTUARY_SDW_MEMORY_ORIGIN_V1",
+        "origin_fortress_id": "fortress-origin",
+        "owner_ref": "owner-origin",
+        "passage_id": "passage-001",
+        "content_hash": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+        "chunk_count": 2,
+        "author_agent_id": "agent-claude",
+        "ingress_channel": "memory_insert",
+        "source_class": "user_content",
+        "recorded_at": "2026-08-24T12:34:56.789-06:00",
+        "signer_identity_id": "origin-signer",
+        "signer_did": "did:key:z6Mkon3Necd6NkkyfoGoHxid2znGc59LU3K7mubaRcFbLfLX",
+        "signature_scheme": "ed25519-v1"
+      },
+      "signature": "a8KMMjf6rXS10YVW5jwnhPDkxU4oZ8fthhhiDPdV1vRHOYaPAuPjhezeIbQyaBLnlSO3lgST9Q5cu7sLcrwVDA"
+    },
+    "origin_provenance_digest": "7a058da15668aaad6e77289dbb109bbd5e93c22f5c5123b6fe52ba186acf9b2e",
+    "admission": {
+      "body": {
+        "format": "SANCTUARY_SDW_MEMORY_ADMISSION_V1",
+        "destination_fortress_id": "fortress-destination",
+        "destination_owner_ref": "owner-destination",
+        "passage_id": "passage-001",
+        "admission_channel": "local_write",
+        "origin_trust_tier": "local_attested",
+        "verification_basis": "local_primary_identity",
+        "admitted_at": "2026-08-24T12:35:01.123-06:00",
+        "origin_provenance_digest": "7a058da15668aaad6e77289dbb109bbd5e93c22f5c5123b6fe52ba186acf9b2e",
+        "signer_identity_id": "admission-signer",
+        "signer_did": "did:key:z6Mko9hTggMwjSTEaJaPUfE6tqcy2xvU6BnNq3e3o8qVBiyH",
+        "signature_scheme": "ed25519-v1"
+      },
+      "signature": "f6UYmNmMhU9xn8QY2Xp2SyH1wDPyjbkPdzcozssRWSt6mhWdF1FZaOIJEZlQPKM1_syxrOtxwOOdeCCP2cljCg"
+    }
+  }
+}

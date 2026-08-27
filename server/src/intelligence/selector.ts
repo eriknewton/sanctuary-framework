@@ -46,6 +46,7 @@
 
 import os from "node:os";
 import { randomBytes } from "node:crypto";
+import { isIP } from "node:net";
 import { sha256 } from "@noble/hashes/sha256";
 import { hashToString } from "../core/hashing.js";
 import { stringToBytes, toBase64url } from "../core/encoding.js";
@@ -53,7 +54,33 @@ import type { AuditLog } from "../operational/audit-log.js";
 import { INTEL_OPS } from "./audit-events.js";
 import { tradeoffTextHash, BACKEND_FALLBACK_STRINGS, BADGE_LABEL_KEYS, BADGE_TRADEOFF_KEYS, LOCAL_MODEL_LABELS } from "./templates.js";
 import { DEFAULT_OLLAMA_ENDPOINT, buildDefaultConfig, DEFAULT_PER_SURFACE, DEFAULT_LOCAL_MODEL_PICKS } from "./defaults.js";
-import { IntelligenceConfigStore, type LoadOutcome } from "./policy-store.js";
+import {
+  IntelligenceConfigStore,
+  LocalIntegrityStateLoadError,
+  type LoadOutcome,
+} from "./policy-store.js";
+import {
+  IMMUNE_MODEL_LOAD_SURFACES,
+  type LocalIntegrityStateV2,
+  type ModelLoadIntegrityFailureReason,
+  type VerifiedLocalBindingV2,
+} from "./model-manifest-v2.js";
+import {
+  OllamaRuntimeEvidenceClient,
+  createSingleFlightLightRuntimeVerifier,
+  type RuntimeLightVerificationResult,
+  type RuntimeLightVerifier,
+} from "./runtime-light-verifier.js";
+import {
+  IMMUNE_FULL_VERIFICATION_CADENCE_MS,
+  createCadencedImmuneDiskVerifier,
+  createNodeImmuneFileSystemAdapter,
+  createOnDiskImmuneVerifier,
+  type CadencedImmuneDiskVerifier,
+  type ImmuneVerificationCheckpoint,
+  type ImmuneVerificationClock,
+  type ImmuneVerificationResult,
+} from "./immune-disk-verifier.js";
 import {
   LOCAL_MODEL_TAGS,
   SURFACES,
@@ -106,6 +133,11 @@ import type {
   IntelligenceSubstrateInvokedPayload,
   IntelligenceTier2BindingPinnedPayload,
 } from "../contracts/v1.2/intelligence-events.js";
+import { compileSubstrateContext } from "../compiled-context/compiler.js";
+import {
+  createUnwiredCompiledContextScanner,
+  type CompiledContextScanner,
+} from "../compiled-context/scanner.js";
 
 const DISABLED_CAPABILITY: SubstrateCapability = {
   summarize: false,
@@ -138,6 +170,49 @@ const FALLBACK_CHAIN = ["local", "venice", "frontier-with-filter"] as const;
 type InvocationMethod = "summarize" | "classify" | "redact";
 type SubstrateInvoker = (arg: SummarizeRequest | ClassifyRequest | RedactRequest) => Promise<SubstrateResponse>;
 type FallbackTaken = IntelligenceSubstrateFailurePayload["fallback_taken"];
+type IntegrityGateStage =
+  | "selector_load"
+  | "first_invocation"
+  | "runtime_invocation"
+  | "cadence";
+
+interface HandleIssueResult {
+  handle: SubstrateHandle;
+  cacheable: boolean;
+}
+
+interface IntegrityFailureState {
+  reason: ModelLoadIntegrityFailureReason;
+  observedAt: string;
+  contentMismatchLatched: boolean;
+}
+
+interface IntegrityGateSuccess {
+  ok: true;
+  completedMonotonicMs: number;
+  completedWallMs: number;
+}
+
+interface IntegrityGateFailure {
+  ok: false;
+  reason: ModelLoadIntegrityFailureReason;
+}
+
+type IntegrityGateResult = IntegrityGateSuccess | IntegrityGateFailure;
+
+const CONTENT_MISMATCH_REASONS = new Set<ModelLoadIntegrityFailureReason>([
+  "manifest_signature_invalid",
+  "binding_mismatch",
+  "runtime_manifest_digest_invalid",
+  "runtime_manifest_digest_mismatch",
+  "disk_manifest_invalid",
+  "disk_manifest_digest_mismatch",
+  "descriptor_bounds_exceeded",
+  "layer_size_mismatch",
+  "layer_digest_mismatch",
+]);
+
+const IMMUNE_SURFACE_SET = new Set<Surface>(IMMUNE_MODEL_LOAD_SURFACES);
 
 /**
  * Identity redactor used as the default for the frontier-with-filter
@@ -189,6 +264,20 @@ export interface SelectorConfig {
    * (Property 1) only.
    */
   tier3?: Tier3TransportConfig;
+  /**
+   * Shared final-artifact screening boundary. Production constructors must
+   * supply the dispatcher-wired scanner; the fallback still scans clean test
+   * traffic and fails closed if a finding needs the absent reporter.
+   */
+  compiledContextScanner?: CompiledContextScanner;
+  /** Fixture seam for Q5D; production revalidates with the pinned release key. */
+  modelManifestV2PublicKey?: Uint8Array;
+  /** Q5E test seam; production builds the bounded single-flight runtime verifier. */
+  runtimeIntegrityVerifier?: RuntimeLightVerifier;
+  /** Q5E test seam; production builds the bounded cadenced on-disk verifier. */
+  immuneIntegrityVerifier?: CadencedImmuneDiskVerifier;
+  /** Monotonic/wall clock seam for deterministic six-hour cadence tests. */
+  integrityClock?: ImmuneVerificationClock;
 }
 
 export class SubstrateSelector {
@@ -199,6 +288,7 @@ export class SubstrateSelector {
   private fetchImpl: typeof fetch | undefined;
   private config: SubstrateConfig;
   private loaded = false;
+  private loadPromise: Promise<void> | null = null;
   /**
    * Per-surface ring buffer of recent runtime + validation failures. See
    * `RECENT_FAILURES_CAP` and `RECENT_FAILURES_WINDOW_MS`. Populated by
@@ -207,6 +297,20 @@ export class SubstrateSelector {
    * Drives the operator-visible degrade in `getOperatorVisibleStatus()`.
    */
   private recentFailures = new Map<Surface, RecentFailureEntry[]>();
+  private compiledContextScanner: CompiledContextScanner;
+  private localIntegrityConfigSaveLockDepth = 0;
+  private readonly runtimeIntegrityVerifierOverride?: RuntimeLightVerifier;
+  private runtimeIntegrityVerifier: RuntimeLightVerifier | null = null;
+  private runtimeIntegrityVerifierEndpoint: string | null = null;
+  private readonly immuneIntegrityVerifier: CadencedImmuneDiskVerifier;
+  private readonly integrityClock: ImmuneVerificationClock;
+  private integrityConfigEpoch = 0;
+  private readonly issuedHandles = new Map<string, {
+    epoch: number;
+    promise: Promise<HandleIssueResult>;
+  }>();
+  private readonly auditedIntegrityPromises = new WeakSet<object>();
+  private readonly integrityFailures = new Map<Surface, IntegrityFailureState>();
 
   /**
    * One-time-per-process latch for the tier-2 pin override audit event
@@ -215,9 +319,15 @@ export class SubstrateSelector {
   private tier2PinOverrideAudited = false;
 
   constructor(cfg: SelectorConfig) {
-    this.store = new IntelligenceConfigStore(cfg.storage, cfg.masterKey);
+    this.store = new IntelligenceConfigStore(cfg.storage, cfg.masterKey, {
+      ...(cfg.modelManifestV2PublicKey === undefined
+        ? {}
+        : { modelManifestV2PublicKey: cfg.modelManifestV2PublicKey }),
+    });
     this.auditLog = cfg.auditLog;
     this.identityId = cfg.identityId;
+    this.compiledContextScanner =
+      cfg.compiledContextScanner ?? createUnwiredCompiledContextScanner();
     this.redactor = cfg.redactor ?? IDENTITY_REDACTOR;
     // Rho-1 (WP-V1.x-QUERY-LAYER-ANONYMITY foundation): wrap the
     // substrate-client fetch with the Tier A header-strip transform.
@@ -270,7 +380,25 @@ export class SubstrateSelector {
         },
       );
     });
+    this.integrityClock = cfg.integrityClock ?? {
+      monotonicNow: () => performance.now(),
+      wallNow: () => Date.now(),
+    };
+    this.runtimeIntegrityVerifierOverride = cfg.runtimeIntegrityVerifier;
+    this.immuneIntegrityVerifier = cfg.immuneIntegrityVerifier ??
+      createCadencedImmuneDiskVerifier(
+        createOnDiskImmuneVerifier({
+          fs: createNodeImmuneFileSystemAdapter(),
+          clock: this.integrityClock,
+        }),
+        { clock: this.integrityClock },
+      );
     this.config = buildDefaultConfig();
+  }
+
+  /** Install the production dispatcher-wired scanner before any invocation. */
+  setCompiledContextScanner(scanner: CompiledContextScanner): void {
+    this.compiledContextScanner = scanner;
   }
 
   /**
@@ -280,7 +408,35 @@ export class SubstrateSelector {
    */
   async load(): Promise<void> {
     const outcome = await this.store.load();
+    if (outcome.kind === "integrity-state-invalid") {
+      // An armed record is one indivisible authority. Falling back to defaults
+      // here would reinterpret a stripped/tampered record as legacy-unarmed.
+      try {
+        await this.auditLog.append(
+          "l2",
+          INTEL_OPS.LOAD_INTEGRITY,
+          this.identityId,
+          {
+            stage: "state_validation",
+            reason: outcome.reason,
+            generation_refused: true,
+          },
+          "failure",
+        );
+      } catch {
+        // Invalid authority still refuses when its derived audit cannot persist.
+      }
+      throw new LocalIntegrityStateLoadError(outcome.reason);
+    }
     this.config = outcome.config;
+    this.invalidateIssuedIntegrityHandles();
+    this.recentFailures.clear();
+    for (const surface of SURFACES) {
+      const persisted = this.config.provisioningFailures?.[surface] ?? [];
+      if (persisted.length > 0) {
+        this.recentFailures.set(surface, persisted.slice(-RECENT_FAILURES_CAP));
+      }
+    }
     this.loaded = true;
 
     const overriddenSurfaceCount = countOverriddenSurfaces(this.config);
@@ -295,6 +451,44 @@ export class SubstrateSelector {
       overridden_surface_count: overriddenSurfaceCount,
     };
     this.emit(INTEL_OPS.CONFIG_LOADED, payload, outcome.kind === "loaded" ? "success" : "failure");
+  }
+
+  /**
+   * Re-read the durable config for a provisioning ceremony that already owns
+   * the cross-process lock. This intentionally bypasses the loaded snapshot.
+   * Must match the `reloadAuthority` adapter in `wrap/local-intelligence.ts`.
+   */
+  async reloadLocalProvisioningAuthority(): Promise<SubstrateConfig> {
+    const config = await this.store.loadAuthoritative() ?? buildDefaultConfig();
+    this.config = config;
+    this.invalidateIssuedIntegrityHandles();
+    this.recentFailures.clear();
+    for (const surface of SURFACES) {
+      const persisted = config.provisioningFailures?.[surface] ?? [];
+      if (persisted.length > 0) {
+        this.recentFailures.set(surface, persisted.slice(-RECENT_FAILURES_CAP));
+      }
+    }
+    this.loaded = true;
+    return config;
+  }
+
+  /**
+   * Hold the distinct Q5 config-save lock across provisioning's authority
+   * reload through its one commit. The outer provisioning lock is acquired
+   * first by the composition root; this method never acquires it in reverse.
+   */
+  async withLocalIntegrityConfigSaveLock<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    return this.store.withSaveLock(async () => {
+      this.localIntegrityConfigSaveLockDepth += 1;
+      try {
+        return await operation();
+      } finally {
+        this.localIntegrityConfigSaveLockDepth -= 1;
+      }
+    });
   }
 
   /**
@@ -315,11 +509,11 @@ export class SubstrateSelector {
     const prior = this.config.perSurface[surface];
     const wasDefault = prior === DEFAULT_PER_SURFACE[surface];
 
-    this.config = {
+    const next: SubstrateConfig = {
       ...this.config,
       perSurface: { ...this.config.perSurface, [surface]: substrate },
     };
-    await this.store.save(this.config);
+    await this.persistNext(next);
 
     // Finding ZZ (v1.2.0-rc.2): when the operator changes a surface's
     // substrate, prior failure entries no longer describe the new binding.
@@ -390,13 +584,13 @@ export class SubstrateSelector {
       }
     }
 
-    this.config = {
+    const next: SubstrateConfig = {
       ...this.config,
       perSurface: nextPerSurface,
       localModelPicks: nextLocalPicks,
       applyToAllSurfaces: true,
     };
-    await this.store.save(this.config);
+    await this.persistNext(next);
 
     // Finding ZZ (v1.2.0-rc.2): bulk re-binding is a global configuration
     // gesture; prior per-surface failure entries no longer describe the
@@ -436,8 +630,7 @@ export class SubstrateSelector {
    */
   async setApplyToAllPreference(value: boolean): Promise<void> {
     await this.ensureLoaded();
-    this.config = { ...this.config, applyToAllSurfaces: value };
-    await this.store.save(this.config);
+    await this.persistNext({ ...this.config, applyToAllSurfaces: value });
   }
 
   /**
@@ -453,8 +646,7 @@ export class SubstrateSelector {
     const next = { ...this.config.localModelPicks };
     if (pick === null) delete next[surface];
     else next[surface] = pick;
-    this.config = { ...this.config, localModelPicks: next };
-    await this.store.save(this.config);
+    await this.persistNext({ ...this.config, localModelPicks: next });
   }
 
   /**
@@ -477,8 +669,7 @@ export class SubstrateSelector {
     const next: SubstrateConfig = { ...this.config };
     if (apiKey === null) delete next.veniceApiKey;
     else next.veniceApiKey = apiKey;
-    this.config = next;
-    await this.store.save(this.config);
+    await this.persistNext(next);
 
     if (apiKey !== null) {
       await this.validateVeniceAndRecord(apiKey);
@@ -542,8 +733,7 @@ export class SubstrateSelector {
     const next = { ...this.config.frontierConfig };
     if (apiKey === null) delete next[provider];
     else next[provider] = apiKey;
-    this.config = { ...this.config, frontierConfig: next };
-    await this.store.save(this.config);
+    await this.persistNext({ ...this.config, frontierConfig: next });
   }
 
   /**
@@ -565,8 +755,7 @@ export class SubstrateSelector {
     if (!validation.ok) {
       throw new Error(`invalid hybrid rules: ${validation.reason}`);
     }
-    this.config = { ...this.config, hybridRules: rules };
-    await this.store.save(this.config);
+    await this.persistNext({ ...this.config, hybridRules: rules });
   }
 
   /**
@@ -576,11 +765,11 @@ export class SubstrateSelector {
    */
   async setFallbackBehavior(surface: Surface, fallback: FallbackBehavior): Promise<void> {
     await this.ensureLoaded();
-    this.config = {
+    const next: SubstrateConfig = {
       ...this.config,
       fallback: { ...this.config.fallback, [surface]: fallback },
     };
-    await this.store.save(this.config);
+    await this.persistNext(next);
   }
 
   /**
@@ -591,9 +780,18 @@ export class SubstrateSelector {
   async resetToDefaults(): Promise<void> {
     await this.ensureLoaded();
     const overridden = countOverriddenSurfaces(this.config);
-    const fresh = buildDefaultConfig();
-    this.config = fresh;
-    await this.store.save(fresh);
+    const legacyFresh = buildDefaultConfig();
+    const fresh: SubstrateConfig = this.config.version === 2
+      ? {
+        ...legacyFresh,
+        version: 2,
+        // Resetting operator choices is not a reviewed Q5 disarm ceremony;
+        // the armed record survives and the save refuses if choices diverge.
+        localIntegrityState: this.config.localIntegrityState,
+        customLocalModelTags: this.config.customLocalModelTags,
+      }
+      : legacyFresh;
+    await this.persistNext(fresh);
 
     const payload: IntelligenceConfigResetPayload = {
       version: "1.2",
@@ -616,6 +814,88 @@ export class SubstrateSelector {
   }
 
   /**
+   * Persist a bounded, operator-safe provisioning refusal without changing
+   * the configured substrate. A failed local setup must remain local and
+   * visibly degraded; it never authorizes a Venice/frontier fallback.
+   */
+  async recordLocalProvisioningFailure(
+    surfaces: readonly Surface[],
+    failureClass: SubstrateFailureClass,
+    snippet: string,
+  ): Promise<void> {
+    await this.ensureLoaded();
+    const next = { ...(this.config.provisioningFailures ?? {}) };
+    const ts = new Date().toISOString();
+    for (const surface of surfaces) {
+      const entry: RecentFailureEntry = {
+        ts,
+        failureClass,
+        snippet: snippet.slice(0, FAILURE_SNIPPET_MAX_LEN),
+      };
+      const entries = [...(next[surface] ?? []), entry].slice(-RECENT_FAILURES_CAP);
+      next[surface] = entries;
+    }
+    await this.persistNext({ ...this.config, provisioningFailures: next });
+    for (const surface of surfaces) {
+      const entries = next[surface];
+      if (entries !== undefined) this.recentFailures.set(surface, entries.slice());
+    }
+  }
+
+  /**
+   * Commit runtime tags, cleared failures, and the complete Q5 record in one
+   * encrypted config write. The in-process view changes only after save wins,
+   * so a thrown/failed save leaves both memory and durable authority old.
+   */
+  async commitLocalIntegrityProvisioning(
+    integrityState: LocalIntegrityStateV2,
+    runtimeTags: Readonly<Partial<Record<Surface, string>>>,
+  ): Promise<void> {
+    await this.ensureLoaded();
+    if (
+      this.config.version === 2 &&
+      integrityState.manifest_version_floor <
+        this.config.localIntegrityState.manifest_version_floor
+    ) {
+      throw new LocalIntegrityStateLoadError("manifest_rollback");
+    }
+    const customLocalModelTags = { ...(this.config.customLocalModelTags ?? {}) };
+    const provisioningFailures = { ...(this.config.provisioningFailures ?? {}) };
+    for (const surface of SURFACES) {
+      const binding = integrityState.bindings[surface];
+      const runtimeTag = runtimeTags[surface];
+      if (binding === undefined && runtimeTag === undefined) continue;
+      if (
+        binding === undefined || runtimeTag === undefined ||
+        binding.runtime_tag !== runtimeTag || this.effectiveChoice(surface) !== "local"
+      ) {
+        throw new LocalIntegrityStateLoadError("binding_mismatch");
+      }
+      customLocalModelTags[surface] = runtimeTag;
+      delete provisioningFailures[surface];
+    }
+    const next: SubstrateConfig = {
+      ...this.config,
+      version: 2,
+      customLocalModelTags,
+      provisioningFailures,
+      localIntegrityState: integrityState,
+    };
+    await this.persistNext(next);
+    for (const surface of Object.keys(integrityState.bindings) as Surface[]) {
+      this.recentFailures.delete(surface);
+    }
+  }
+
+  private async persistNext(next: SubstrateConfig): Promise<void> {
+    const saved = this.localIntegrityConfigSaveLockDepth > 0
+      ? await this.store.saveWhileLocked(next)
+      : await this.store.save(next);
+    this.config = saved;
+    this.invalidateIssuedIntegrityHandles();
+  }
+
+  /**
    * Install (or replace) the redactor used by the frontier-with-filter
    * substrate. Bootstrap code calls this after constructing the selector
    * with the default IDENTITY_REDACTOR; the Privacy Filter Tier 2
@@ -625,12 +905,12 @@ export class SubstrateSelector {
    * (selector needs redactor; redactor needs selector for emit).
    *
    * Subsequent calls to getSubstrate("...frontier-with-filter") will use
-   * the installed redactor; already-issued handles continue to use the
-   * redactor that was installed at handle-issue time. Consumers that
-   * cache handles SHOULD re-issue after installRedactor.
+   * the installed redactor; already-held handles remain snapshots, but the
+   * selector never serves a pre-install handle from its issuance cache.
    */
   installRedactor(redactor: FrontierRedactor): void {
     this.redactor = redactor;
+    this.invalidateIssuedIntegrityHandles();
   }
 
   /**
@@ -652,7 +932,7 @@ export class SubstrateSelector {
    */
   async getSubstrate(surface: Surface): Promise<SubstrateHandle> {
     await this.ensureLoaded();
-    return this.buildHandle(surface, this.effectiveChoice(surface));
+    return this.getOrIssueHandle(surface, this.effectiveChoice(surface));
   }
 
   /**
@@ -766,7 +1046,14 @@ export class SubstrateSelector {
   // ── internal ──────────────────────────────────────────────────────────
 
   private async ensureLoaded(): Promise<void> {
-    if (!this.loaded) await this.load();
+    if (this.loaded) return;
+    const pending = this.loadPromise ?? this.load();
+    this.loadPromise = pending;
+    try {
+      await pending;
+    } finally {
+      if (this.loadPromise === pending) this.loadPromise = null;
+    }
   }
 
   private async invoke(
@@ -775,9 +1062,24 @@ export class SubstrateSelector {
     req: SummarizeRequest | ClassifyRequest | RedactRequest,
   ): Promise<SubstrateResponse> {
     await this.ensureLoaded();
+    const screened = await this.compiledContextScanner.screen(
+      compileSubstrateContext(surface, req),
+    );
+    if (
+      screened.outcome !== "clean" &&
+      screened.outcome !== "detector_disabled_by_policy"
+    ) {
+      return failureResponse(
+        "disabled",
+        "internal_error",
+        `compiled-context screening refused provider invocation (${screened.outcome})`,
+      );
+    }
     const startedAt = Date.now();
     const choice = this.effectiveChoice(surface);
-    const handle = this.buildHandle(surface, choice);
+    // All local generation reaches the async selector-load chokepoint; a
+    // direct synchronous local-handle construction would bypass Q5E.
+    const handle = await this.getOrIssueHandle(surface, choice);
     const requestHash = hashOfRequest(req);
     const primary = await this.invokeHandle(surface, handle, method, req);
     let response = primary.response;
@@ -935,6 +1237,15 @@ export class SubstrateSelector {
   ): Promise<{ response: SubstrateResponse; methodAvailable: boolean }> {
     const fn = handle[method] as SubstrateInvoker | undefined;
     if (!fn) {
+      const integrityFailure = handle.substrate === "local"
+        ? this.integrityFailures.get(surface)
+        : undefined;
+      if (integrityFailure !== undefined) {
+        return {
+          response: integrityFailureResponse(integrityFailure.reason),
+          methodAvailable: true,
+        };
+      }
       return {
         response: disabledResponse(
           handle.substrate,
@@ -969,6 +1280,14 @@ export class SubstrateSelector {
   } | null> {
     if (this.config.fallback[surface] !== "degrade-silent") return null;
     if (primary === "disabled" || primary === "hybrid") return null;
+    // An immune integrity refusal is a terminal local denial: operator fallback
+    // preferences may route ordinary substrate failures, never failed model
+    // identity evidence from the reviewed closed immune-surface set.
+    if (
+      primary === "local" &&
+      IMMUNE_SURFACE_SET.has(surface) &&
+      this.integrityFailures.has(surface)
+    ) return null;
     // Ratified 2026-07-23: the pinned tier-2 surface never escapes
     // local via the fallback chain (local -> venice -> frontier would
     // be a remote egress of PII-residual-bearing text). The pin means
@@ -980,7 +1299,7 @@ export class SubstrateSelector {
 
     let lastFailure: { handle: SubstrateHandle; response: SubstrateResponse } | null = null;
     for (const choice of FALLBACK_CHAIN.slice(primaryIndex + 1)) {
-      const handle = this.buildHandle(surface, choice);
+      const handle = await this.getOrIssueHandle(surface, choice);
       if (handle.substrate !== choice) continue;
       const fn = handle[method] as SubstrateInvoker | undefined;
       if (!fn) continue;
@@ -999,17 +1318,57 @@ export class SubstrateSelector {
    * doesn't pre-spawn HTTP clients for substrates the operator never
    * touches.
    */
-  private buildHandle(surface: Surface, choice: SubstrateChoice): SubstrateHandle {
-    if (choice === "disabled") return this.disabledHandle(surface);
-    if (choice === "local") return this.localHandle(surface);
-    if (choice === "venice") return this.veniceHandle(surface);
-    if (choice === "frontier-with-filter") return this.frontierHandle(surface);
+  private async getOrIssueHandle(
+    surface: Surface,
+    choice: SubstrateChoice,
+  ): Promise<SubstrateHandle> {
+    const key = `${surface}:${choice}`;
+    const existing = this.issuedHandles.get(key);
+    if (existing !== undefined && existing.epoch === this.integrityConfigEpoch) {
+      return (await existing.promise).handle;
+    }
+    const epoch = this.integrityConfigEpoch;
+    const promise = this.issueHandle(surface, choice, epoch);
+    this.issuedHandles.set(key, { epoch, promise });
+    let issued: HandleIssueResult;
+    try {
+      issued = await promise;
+    } catch (error) {
+      if (this.issuedHandles.get(key)?.promise === promise) {
+        this.issuedHandles.delete(key);
+      }
+      throw error;
+    }
+    const current = this.issuedHandles.get(key);
+    if (
+      !issued.cacheable || epoch !== this.integrityConfigEpoch ||
+      current?.promise !== promise
+    ) {
+      if (current?.promise === promise) this.issuedHandles.delete(key);
+    }
+    return issued.handle;
+  }
+
+  private async issueHandle(
+    surface: Surface,
+    choice: SubstrateChoice,
+    epoch: number,
+  ): Promise<HandleIssueResult> {
+    if (choice === "disabled") {
+      return { handle: this.disabledHandle(surface), cacheable: true };
+    }
+    if (choice === "local") return this.issueLocalHandle(surface, epoch);
+    if (choice === "venice") {
+      return { handle: this.veniceHandle(surface), cacheable: true };
+    }
+    if (choice === "frontier-with-filter") {
+      return { handle: this.frontierHandle(surface), cacheable: true };
+    }
     if (choice === "hybrid") {
       const sub = resolveHybridChoice(this.config.hybridRules, surface);
-      if (sub) return this.buildHandle(surface, sub);
-      return this.disabledHandle(surface);
+      if (sub) return this.issueHandle(surface, sub, epoch);
     }
-    return this.disabledHandle(surface);
+    return { handle: this.disabledHandle(surface), cacheable: true };
   }
 
   private disabledHandle(surface: Surface): SubstrateHandle {
@@ -1022,7 +1381,58 @@ export class SubstrateSelector {
     };
   }
 
-  private localHandle(surface: Surface): SubstrateHandle {
+  private async issueLocalHandle(
+    surface: Surface,
+    epoch: number,
+  ): Promise<HandleIssueResult> {
+    if (this.config.version === 1) {
+      return {
+        handle: this.gatedLocalHandle(surface, undefined, epoch),
+        cacheable: true,
+      };
+    }
+    const binding = this.config.localIntegrityState.bindings[surface];
+    if (binding === undefined) {
+      await this.recordIntegrityRefusal(
+        surface,
+        "integrity_state_invalid",
+        "selector_load",
+        undefined,
+      );
+      return {
+        handle: this.integrityRefusalHandle(surface),
+        cacheable: false,
+      };
+    }
+    const gate = await this.runIntegrityGate({
+      surface,
+      binding,
+      epoch,
+      stage: "selector_load",
+      diskCheckpoint: "selector_load",
+    });
+    if (!gate.ok) {
+      return {
+        handle: this.integrityRefusalHandle(surface),
+        cacheable: false,
+      };
+    }
+    return {
+      handle: this.gatedLocalHandle(surface, binding, epoch, gate),
+      cacheable: true,
+    };
+  }
+
+  /**
+   * The sole local-generation handle constructor. Structural tests prohibit
+   * LocalSubstrate construction anywhere else in production selector code.
+   */
+  private gatedLocalHandle(
+    surface: Surface,
+    binding: VerifiedLocalBindingV2 | undefined,
+    epoch: number,
+    selectorLoadGate?: IntegrityGateSuccess,
+  ): SubstrateHandle {
     const pick = this.config.localModelPicks[surface] ?? DEFAULT_LOCAL_MODEL_PICKS[surface] ?? "gemma-2-2b";
     const customTag = this.config.customLocalModelTags?.[surface];
     const endpoint = this.config.ollamaEndpoint ?? DEFAULT_OLLAMA_ENDPOINT;
@@ -1030,16 +1440,404 @@ export class SubstrateSelector {
     const sub = LocalSubstrate.fromPick(client, pick, customTag);
     const labelBase = BACKEND_FALLBACK_STRINGS[BADGE_LABEL_KEYS.local] ?? "Local model";
     const modelLabel = LOCAL_MODEL_LABELS[pick] ?? customTag ?? LOCAL_MODEL_TAGS[pick];
+    let firstInvocationPassed = false;
+    let lastFullMonotonicMs = selectorLoadGate?.completedMonotonicMs;
+    let lastFullWallMs = selectorLoadGate?.completedWallMs;
+
+    const beforeInvocation = async (): Promise<IntegrityGateResult> => {
+      if (binding === undefined) {
+        if (epoch !== this.integrityConfigEpoch && this.config.version === 2) {
+          await this.recordIntegrityRefusal(
+            surface,
+            "binding_mismatch",
+            "first_invocation",
+            undefined,
+          );
+          return { ok: false, reason: "binding_mismatch" };
+        }
+        const completedMonotonicMs = this.integrityClock.monotonicNow();
+        const completedWallMs = this.integrityClock.wallNow();
+        return { ok: true, completedMonotonicMs, completedWallMs };
+      }
+
+      if (!firstInvocationPassed) {
+        const result = await this.runIntegrityGate({
+          surface,
+          binding,
+          epoch,
+          stage: "first_invocation",
+          diskCheckpoint: "first_invocation",
+        });
+        if (result.ok) {
+          firstInvocationPassed = true;
+          lastFullMonotonicMs = result.completedMonotonicMs;
+          lastFullWallMs = result.completedWallMs;
+        }
+        return result;
+      }
+
+      // A held handle never outranks current V2 authority: epoch, exact binding,
+      // assurance class, and loopback endpoint remain reuse terminators even
+      // while the light six-hour verification result is otherwise reusable.
+      if (!this.integrityAuthorityMatches(surface, binding, epoch)) {
+        await this.recordIntegrityRefusal(
+          surface,
+          "binding_mismatch",
+          "runtime_invocation",
+          binding,
+        );
+        return { ok: false, reason: "binding_mismatch" };
+      }
+
+      if (binding.assurance === "immune") {
+        const result = await this.runIntegrityGate({
+          surface,
+          binding,
+          epoch,
+          stage: "runtime_invocation",
+          diskCheckpoint: "cadence",
+        });
+        if (result.ok) {
+          lastFullMonotonicMs = result.completedMonotonicMs;
+          lastFullWallMs = result.completedWallMs;
+        }
+        return result;
+      }
+
+      const monotonicNow = this.integrityClock.monotonicNow();
+      const wallNow = this.integrityClock.wallNow();
+      if (!lightVerificationIsDue(
+        lastFullMonotonicMs,
+        lastFullWallMs,
+        monotonicNow,
+        wallNow,
+      )) {
+        return {
+          ok: true,
+          completedMonotonicMs: monotonicNow,
+          completedWallMs: wallNow,
+        };
+      }
+      const result = await this.runIntegrityGate({
+        surface,
+        binding,
+        epoch,
+        stage: "cadence",
+      });
+      if (result.ok) {
+        lastFullMonotonicMs = result.completedMonotonicMs;
+        lastFullWallMs = result.completedWallMs;
+      }
+      return result;
+    };
+
+    const invokeGated = async (invoke: () => Promise<SubstrateResponse>) => {
+      const gate = await beforeInvocation();
+      if (!gate.ok) return integrityFailureResponse(gate.reason);
+      // There is no application-controlled await after this final gate. This
+      // closes the selector-to-first-invoke gap, but not a malicious-runtime
+      // race after the final check; only the HTTP client's own scheduling remains.
+      return invoke();
+    };
     return {
       surface,
       substrate: "local",
       badge: this.makeBadge(surface, "local", "green"),
       capability: LOCAL_CAPABILITY,
       displayLabel: `${labelBase} — ${modelLabel}`,
-      summarize: (r) => sub.summarize(r),
-      classify: (r) => sub.classify(r),
-      redact: (r) => sub.redact(r),
+      summarize: (r) => invokeGated(() => sub.summarize(r)),
+      classify: (r) => invokeGated(() => sub.classify(r)),
+      redact: (r) => invokeGated(() => sub.redact(r)),
     };
+  }
+
+  private integrityRefusalHandle(surface: Surface): SubstrateHandle {
+    const labelBase = BACKEND_FALLBACK_STRINGS[BADGE_LABEL_KEYS.local] ?? "Local model";
+    return {
+      surface,
+      substrate: "local",
+      badge: this.makeBadge(surface, "local", "yellow"),
+      capability: DISABLED_CAPABILITY,
+      displayLabel: labelBase,
+    };
+  }
+
+  private runtimeVerifierForCurrentEndpoint(): RuntimeLightVerifier {
+    if (this.runtimeIntegrityVerifierOverride !== undefined) {
+      return this.runtimeIntegrityVerifierOverride;
+    }
+    const endpoint = this.config.ollamaEndpoint ?? DEFAULT_OLLAMA_ENDPOINT;
+    if (
+      this.runtimeIntegrityVerifier === null ||
+      this.runtimeIntegrityVerifierEndpoint !== endpoint
+    ) {
+      this.runtimeIntegrityVerifier = createSingleFlightLightRuntimeVerifier(
+        new OllamaRuntimeEvidenceClient({
+          endpoint,
+          fetchImpl: this.fetchImpl,
+        }),
+      );
+      this.runtimeIntegrityVerifierEndpoint = endpoint;
+    }
+    return this.runtimeIntegrityVerifier;
+  }
+
+  private async runIntegrityGate(args: {
+    surface: Surface;
+    binding: VerifiedLocalBindingV2;
+    epoch: number;
+    stage: IntegrityGateStage;
+    diskCheckpoint?: ImmuneVerificationCheckpoint;
+  }): Promise<IntegrityGateResult> {
+    const { surface, binding, epoch, stage } = args;
+    if (!this.integrityAuthorityMatches(surface, binding, epoch)) {
+      await this.recordIntegrityRefusal(surface, "binding_mismatch", stage, binding);
+      return { ok: false, reason: "binding_mismatch" };
+    }
+    const integrityState = this.config.version === 2
+      ? this.config.localIntegrityState
+      : undefined;
+    // `integrityAuthorityMatches` proved the V2 authority above; this guard
+    // keeps the narrowing explicit if its implementation is later refactored.
+    if (integrityState === undefined) {
+      await this.recordIntegrityRefusal(surface, "binding_mismatch", stage, binding);
+      return { ok: false, reason: "binding_mismatch" };
+    }
+
+    const request = {
+      rootReal: integrityState.ollama_models_root,
+      binding,
+    };
+    const runtimePromise = this.runtimeVerifierForCurrentEndpoint().verify(request);
+    const runtime = await runtimePromise;
+    if (!runtime.ok) {
+      await this.recordIntegrityRefusal(
+        surface,
+        runtime.reason,
+        stage,
+        binding,
+        runtimePromise,
+        runtime,
+      );
+      return { ok: false, reason: runtime.reason };
+    }
+    if (epoch !== this.integrityConfigEpoch) {
+      await this.recordIntegrityRefusal(surface, "binding_mismatch", stage, binding);
+      return { ok: false, reason: "binding_mismatch" };
+    }
+
+    if (binding.assurance === "light") {
+      const completed = this.completedIntegrityGate();
+      if (!completed.ok) {
+        await this.recordIntegrityRefusal(
+          surface,
+          completed.reason,
+          stage,
+          binding,
+          runtimePromise,
+          runtime,
+        );
+        return completed;
+      }
+      this.integrityFailures.delete(surface);
+      if (stage === "selector_load" || stage === "cadence") {
+        await this.recordIntegritySuccess(
+          surface,
+          stage,
+          binding,
+          runtimePromise,
+          runtime,
+        );
+      }
+      return completed;
+    }
+
+    const diskCheckpoint = args.diskCheckpoint ?? "cadence";
+    const diskPromise = this.immuneIntegrityVerifier.verify({
+      ...request,
+      checkpoint: diskCheckpoint,
+    });
+    const disk = await diskPromise;
+    const diskStage: IntegrityGateStage = diskCheckpoint === "cadence"
+      ? "cadence"
+      : stage;
+    if (!disk.ok) {
+      await this.recordIntegrityRefusal(
+        surface,
+        disk.reason,
+        diskStage,
+        binding,
+        diskPromise,
+        undefined,
+        disk,
+      );
+      return { ok: false, reason: disk.reason };
+    }
+    if (epoch !== this.integrityConfigEpoch) {
+      await this.recordIntegrityRefusal(surface, "binding_mismatch", diskStage, binding);
+      return { ok: false, reason: "binding_mismatch" };
+    }
+
+    const completed = this.completedIntegrityGate();
+    if (!completed.ok) {
+      await this.recordIntegrityRefusal(
+        surface,
+        completed.reason,
+        diskStage,
+        binding,
+        diskPromise,
+        runtime,
+        disk,
+      );
+      return completed;
+    }
+    this.integrityFailures.delete(surface);
+    if (
+      stage === "selector_load" ||
+      (diskCheckpoint === "cadence" && !disk.cached)
+    ) {
+      await this.recordIntegritySuccess(
+        surface,
+        diskStage,
+        binding,
+        diskPromise,
+        runtime,
+        disk,
+      );
+    }
+    return completed;
+  }
+
+  private integrityAuthorityMatches(
+    surface: Surface,
+    binding: VerifiedLocalBindingV2,
+    epoch: number,
+  ): boolean {
+    if (this.config.version !== 2) return false;
+    const expectedAssurance = IMMUNE_SURFACE_SET.has(surface) ? "immune" : "light";
+    return epoch === this.integrityConfigEpoch &&
+      this.config.localIntegrityState.bindings[surface] === binding &&
+      binding.assurance === expectedAssurance &&
+      isLoopbackOllamaEndpoint(
+        this.config.ollamaEndpoint ?? DEFAULT_OLLAMA_ENDPOINT,
+      );
+  }
+
+  private completedIntegrityGate(): IntegrityGateResult {
+    const completedMonotonicMs = this.integrityClock.monotonicNow();
+    const completedWallMs = this.integrityClock.wallNow();
+    if (
+      !Number.isFinite(completedMonotonicMs) || completedMonotonicMs < 0 ||
+      !Number.isFinite(completedWallMs) || completedWallMs < 0
+    ) {
+      return { ok: false, reason: "integrity_io_unavailable" };
+    }
+    return { ok: true, completedMonotonicMs, completedWallMs };
+  }
+
+  private async recordIntegritySuccess(
+    surface: Surface,
+    stage: IntegrityGateStage,
+    binding: VerifiedLocalBindingV2,
+    gatePromise: object,
+    runtime: Extract<RuntimeLightVerificationResult, { ok: true }>,
+    disk?: Extract<ImmuneVerificationResult, { ok: true }>,
+  ): Promise<void> {
+    if (this.auditedIntegrityPromises.has(gatePromise)) return;
+    this.auditedIntegrityPromises.add(gatePromise);
+    const details: Record<string, string | number | boolean> = {
+      surface,
+      model_id: binding.model_id,
+      manifest_version: binding.manifest_version,
+      assurance: binding.assurance,
+      stage,
+      expected_manifest_digest: binding.ollama_identity.ollama_manifest_sha256,
+      observed_manifest_digest: runtime.observedManifestDigest,
+      generation_refused: false,
+    };
+    if (disk !== undefined) {
+      details.descriptor_count = disk.descriptorCount;
+      details.bytes_hashed = disk.bytesHashed;
+    }
+    try {
+      await this.auditLog.append(
+        "l2",
+        INTEL_OPS.LOAD_INTEGRITY,
+        this.identityId,
+        details,
+        "success",
+      );
+    } catch {
+      // Verification authority is the signed state plus gate result; audit is derived evidence.
+    }
+  }
+
+  private async recordIntegrityRefusal(
+    surface: Surface,
+    reason: ModelLoadIntegrityFailureReason,
+    stage: IntegrityGateStage,
+    binding?: VerifiedLocalBindingV2,
+    gatePromise?: object,
+    runtime?: RuntimeLightVerificationResult,
+    disk?: ImmuneVerificationResult,
+  ): Promise<void> {
+    const prior = this.integrityFailures.get(surface);
+    const incomingContentMismatch = CONTENT_MISMATCH_REASONS.has(reason);
+    // A transient outage cannot erase the last content mismatch; only a later
+    // complete successful verification clears this process's degraded latch.
+    if (!(prior?.contentMismatchLatched && !incomingContentMismatch)) {
+      this.integrityFailures.set(surface, {
+        reason,
+        observedAt: new Date().toISOString(),
+        contentMismatchLatched: incomingContentMismatch,
+      });
+    }
+    if (gatePromise !== undefined) {
+      if (this.auditedIntegrityPromises.has(gatePromise)) return;
+      this.auditedIntegrityPromises.add(gatePromise);
+    }
+    const details: Record<string, string | number | boolean> = {
+      surface,
+      stage,
+      reason,
+      generation_refused: true,
+    };
+    if (binding !== undefined) {
+      details.model_id = binding.model_id;
+      details.manifest_version = binding.manifest_version;
+      details.assurance = binding.assurance;
+      details.expected_manifest_digest =
+        binding.ollama_identity.ollama_manifest_sha256;
+    }
+    if (
+      runtime !== undefined && "observedManifestDigest" in runtime &&
+      typeof runtime.observedManifestDigest === "string"
+    ) {
+      details.observed_manifest_digest = runtime.observedManifestDigest;
+    }
+    if (disk?.ok) {
+      details.descriptor_count = disk.descriptorCount;
+      details.bytes_hashed = disk.bytesHashed;
+    }
+    try {
+      await this.auditLog.append(
+        "l2",
+        INTEL_OPS.LOAD_INTEGRITY,
+        this.identityId,
+        details,
+        "failure",
+      );
+    } catch {
+      // Refusal remains fail-closed even when derived audit persistence is unavailable.
+    }
+  }
+
+  private invalidateIssuedIntegrityHandles(): void {
+    this.integrityConfigEpoch += 1;
+    this.issuedHandles.clear();
+    this.runtimeIntegrityVerifier = null;
+    this.runtimeIntegrityVerifierEndpoint = null;
+    this.immuneIntegrityVerifier.invalidate();
   }
 
   private veniceHandle(surface: Surface): SubstrateHandle {
@@ -1148,6 +1946,19 @@ export class SubstrateSelector {
     // whose static probe found nothing wrong but whose runtime path keeps
     // failing (the operator-visible problem this finding closes).
     const recentFailures = this.recentFailuresFor(surface);
+    const integrityFailure = this.integrityFailures.get(surface);
+    if (integrityFailure !== undefined) {
+      health = "degraded";
+      failureClass = integrityFailure.reason === "integrity_io_unavailable"
+        ? "substrate_unavailable"
+        : "substrate_misconfigured";
+      recentFailures.push({
+        ts: integrityFailure.observedAt,
+        failureClass,
+        snippet: `local load refused: ${integrityFailure.reason}`,
+      });
+      while (recentFailures.length > RECENT_FAILURES_CAP) recentFailures.shift();
+    }
     if (recentFailures.length > 0) {
       if (health === "ok") {
         health = "degraded";
@@ -1292,6 +2103,57 @@ function failureResponse(
     completedAt: new Date().toISOString(),
     latencyMs: 0,
   };
+}
+
+function integrityFailureResponse(
+  reason: ModelLoadIntegrityFailureReason,
+): SubstrateResponse {
+  return failureResponse(
+    "local",
+    reason === "integrity_io_unavailable"
+      ? "substrate_unavailable"
+      : "substrate_misconfigured",
+    `local load refused: ${reason}`,
+  );
+}
+
+function lightVerificationIsDue(
+  completedMonotonicMs: number | undefined,
+  completedWallMs: number | undefined,
+  monotonicNow: number,
+  wallNow: number,
+): boolean {
+  if (
+    completedMonotonicMs === undefined || completedWallMs === undefined ||
+    !Number.isFinite(completedMonotonicMs) ||
+    !Number.isFinite(completedWallMs) ||
+    !Number.isFinite(monotonicNow) || !Number.isFinite(wallNow)
+  ) {
+    return true;
+  }
+  const elapsed = monotonicNow - completedMonotonicMs;
+  // Design sections 7.1/7.3: performance.now() owns the six-hour cache;
+  // wall-clock rollback can only make verification due, never extend trust.
+  return elapsed < 0 || wallNow < completedWallMs ||
+    elapsed >= IMMUNE_FULL_VERIFICATION_CADENCE_MS;
+}
+
+function isLoopbackOllamaEndpoint(endpoint: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(endpoint);
+  } catch {
+    return false;
+  }
+  if (parsed.username.length > 0 || parsed.password.length > 0) return false;
+  const rawHost = parsed.hostname.toLowerCase();
+  const host = rawHost.startsWith("[") && rawHost.endsWith("]")
+    ? rawHost.slice(1, -1)
+    : rawHost;
+  if (host === "localhost" || host === "::1") return true;
+  if (isIP(host) !== 4) return false;
+  // Design section 5.3 accepts the complete IPv4 127.0.0.0/8 loopback block.
+  return host.split(".")[0] === "127";
 }
 
 function withTotalLatency(resp: SubstrateResponse, startedAt: number): SubstrateResponse {

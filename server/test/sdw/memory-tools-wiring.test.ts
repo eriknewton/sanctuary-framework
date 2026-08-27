@@ -31,11 +31,11 @@ import {
 } from "../../src/sdw/memory-tools.js";
 import { createSdwMemoryProvenanceTool } from "../../src/sdw/memory-provenance-tool.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 import { assertSdwRawWriteAuthorized } from "../../src/sdw/write-gate.js";
 import { assertToolClasses } from "../../src/router.js";
 import type { StorageBackend, StorageEntryMeta } from "../../src/storage/interface.js";
 import type { ToolDefinition } from "../../src/router.js";
-
 const FORTRESS_ID = "fortress:memwiring";
 const MASTER_KEY = new Uint8Array(32).fill(7);
 
@@ -87,7 +87,7 @@ function buildWiredTools(failAuditOperations: readonly string[] = []): {
   adapter: SdwMemoryBackendAdapter;
 } {
   const storage = new WiringStorage();
-  const adapter = new SdwMemoryBackendAdapter({
+  const adapter = new TestSdwMemoryBackendAdapter({
     storage,
     masterKey: MASTER_KEY,
     fortressId: FORTRESS_ID,
@@ -287,7 +287,7 @@ describe("company-brain wiring: audit-before-commit holds against the shipped ad
     // First seed a real passage with a working audit sink, then re-wire the
     // SAME shipped adapter behind a sink that throws only on memory_delete.
     const storage = new WiringStorage();
-    const adapter = new SdwMemoryBackendAdapter({
+    const adapter = new TestSdwMemoryBackendAdapter({
       storage,
       masterKey: MASTER_KEY,
       fortressId: FORTRESS_ID,

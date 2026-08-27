@@ -1,5 +1,5 @@
 {
-  "tool_count": 104,
+  "tool_count": 111,
   "tools": [
     {
       "name": "identity_create",
@@ -1850,6 +1850,97 @@
         "required": [
           "passage_id"
         ]
+      }
+    },
+    {
+      "name": "sdw_memory_provenance_migration_status",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "sdw_memory_provenance_migrate",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "sdw_memory_provenance_abort_migration",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "sdw_memory_provenance_repair_completion_marker",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "memory_provenance_mark_bad_signer",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "signer_did": {
+            "type": "string",
+            "minLength": 5,
+            "maxLength": 256
+          },
+          "public_key_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "required": [
+          "signer_did",
+          "public_key_sha256",
+          "reason"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "memory_provenance_clear_bad_signer",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "signer_did": {
+            "type": "string",
+            "minLength": 5,
+            "maxLength": 256
+          },
+          "public_key_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        },
+        "required": [
+          "signer_did",
+          "public_key_sha256"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "memory_provenance_prune_signers",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
       }
     },
     {

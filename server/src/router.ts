@@ -47,8 +47,14 @@ const PKG_VERSION = getSanctuaryVersion();
  */
 export type ToolHandler = (
   args: Record<string, unknown>,
-  callerIdentity?: string
+  callerIdentity?: string,
+  context?: ToolExecutionContext,
 ) => Promise<{ content: Array<{ type: "text"; text: string }> }>;
+
+export interface ToolExecutionContext {
+  /** Gate-minted durable id for the exact approved, normalized arguments. */
+  readonly approvalAuditId?: string;
+}
 
 /** Tool definition for registration */
 export interface ToolDefinition {
@@ -216,6 +222,7 @@ export function createServer(
     // Approval Gate
     // If a gate is configured, every tool call must pass through it.
     // Denied calls return the fixed coarse schema; details stay in audit.
+    let approvalAuditId: string | undefined;
     if (gate) {
       let gateArgs: Record<string, unknown>;
       try {
@@ -259,6 +266,7 @@ export function createServer(
           isError: true,
         };
       }
+      approvalAuditId = result.approval_audit_id;
     }
 
     try {
@@ -314,7 +322,7 @@ export function createServer(
         // ToolHandler's doc) — this is what lets handshake/federation
         // per-origin quotas bind to a value the calling agent cannot mint
         // more of, instead of a caller-supplied identity_id.
-        return tool.handler(handlerArgs, callerIdentity);
+        return tool.handler(handlerArgs, callerIdentity, { approvalAuditId });
       };
 
       // Read tools bypass the audit-integrity gate unconditionally (an

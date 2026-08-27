@@ -14,6 +14,7 @@ import { link, mkdir, open, readdir, stat, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 import { isSdwIdentifier } from "../grammar.js";
+import { fileImportIngress } from "../memory-provenance-ingress.js";
 import type { SdwDocumentMetadata } from "../records.js";
 import type {
   MemoryBackendAdapter,
@@ -255,6 +256,10 @@ export function screenClaudeCodeMemorySnapshot(
     sourcePath: entry.source_path,
     input: {
       ...entry.passage_input,
+      provenanceContext: fileImportIngress(
+        "system:claude-code-memory-import",
+        entry.source_class === "index" ? "claude_code_index" : "claude_code_fact",
+      ),
       passage_id: passageIdForClaudeCodeMemoryFile(
         adapter,
         entry.source_class,

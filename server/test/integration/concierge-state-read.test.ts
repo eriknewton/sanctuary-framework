@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ConciergeService, SanctuaryContextReader } from "../../src/concierge/index.js";
 
 describe("concierge state read integration", () => {
-  it("answers pending approval questions from inbox context passed to Venice", async () => {
+  it("answers pending approval questions from inbox context passed to the selector", async () => {
     const reader = new SanctuaryContextReader({
       auditLog: {
         query: async () => ({
@@ -80,23 +80,40 @@ describe("concierge state read integration", () => {
     });
     const service = new ConciergeService({
       reader,
-      venice: {
-        model: () => "venice-test",
-        checkStatus: async () => ({
-          provider: "venice",
-          configured: true,
-          reachable: true,
-          model: "venice-test",
-          read_surfaces: ["audit_log", "identity_registry", "approval_inbox", "sovereignty_profile", "task_state", "state_store"],
-          fallback: "none",
-          message: "ok",
+      selector: {
+        getSubstrate: async () => ({
+          surface: "concierge",
+          substrate: "local",
+          badge: { surface: "concierge", substrate: "local", labelKey: "local", tradeoffKey: "local", status: "green" },
+          capability: { summarize: true, classify: true, redact: true },
+          displayLabel: "Local model - test",
         }),
-        complete: async ({ messages }) => {
-          const raw = JSON.stringify(messages);
-          return raw.includes('\\"pending_count\\": 2')
+        invokeSummarize: async (_surface, request) => {
+          const text = request.context.includes('\\"pending_count\\": 2')
             ? "There are 2 pending approvals."
             : "I do not know.";
+          return {
+            servedBy: "local",
+            failureClass: null,
+            body: { kind: "summarize" as const, text },
+            completedAt: new Date().toISOString(),
+            latencyMs: 1,
+          };
         },
+        getOperatorVisibleStatus: async () => ({
+          version: "1.2",
+          generatedAt: new Date().toISOString(),
+          surfaces: [],
+          hardware: { totalRamGb: 16, cpuArch: "other", tier: "mid", recommendedLocalModel: "phi-4-mini", ollamaReachable: true, ollamaModels: ["test"] },
+        }),
+        getConfig: () => ({ fallback: {
+          concierge: "degrade-silent",
+          "direct-agent-gate-advisor": "conservative-deny",
+          "sentinel-scoring": "conservative-deny",
+          "gate-explanation": "degrade-silent",
+          "privacy-filter-tier-2": "degrade-silent",
+          "template-suggestion": "degrade-silent",
+        } }),
       },
     });
 

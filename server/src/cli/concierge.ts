@@ -15,17 +15,20 @@ import {
   ConciergeService,
   ConciergeUnavailableError,
   SanctuaryContextReader,
-  VeniceClient,
   type ConciergeAskResponse,
   type ConciergeStatus,
 } from "../concierge/index.js";
+import { SubstrateSelector } from "../intelligence/index.js";
 import { consumeFlagValue, unknownFlagWithPrefix } from "./argv.js";
+import { createCompiledContextRuntime } from "../compiled-context/runtime.js";
 
 export interface ConciergeCliArgs {
   argv: string[];
   out?: Writable;
   err?: Writable;
   env?: NodeJS.ProcessEnv;
+  /** Test seam; production always constructs the fortress selector below. */
+  localServiceFactory?: (env: NodeJS.ProcessEnv) => Promise<ConciergeService>;
 }
 
 interface ConciergeCliContext {
@@ -48,8 +51,8 @@ export async function runConciergeCommand(args: ConciergeCliArgs): Promise<numbe
       printUsage(out);
       return 0;
     }
-    if (sub === "ask") return ask(rest, out, err, env, ctx);
-    if (sub === "status") return status(rest, out, err, env, ctx);
+    if (sub === "ask") return ask(rest, out, err, env, ctx, args.localServiceFactory);
+    if (sub === "status") return status(rest, out, err, env, ctx, args.localServiceFactory);
     err.write(`Unknown concierge subcommand: ${sub}\n`);
     printUsage(err);
     return 2;
@@ -74,7 +77,7 @@ Options:
   --no-stream            Return the full answer at the end.
   --include-payloads     Include state-store payloads in local read context.
 
-Env: VENICE_API_KEY, VENICE_MODEL, SANCTUARY_DASHBOARD_URL, SANCTUARY_DASHBOARD_AUTH_TOKEN, SANCTUARY_PASSPHRASE, SANCTUARY_RECOVERY_KEY
+Env: SANCTUARY_DASHBOARD_URL, SANCTUARY_DASHBOARD_AUTH_TOKEN, SANCTUARY_PASSPHRASE, SANCTUARY_RECOVERY_KEY
 `);
 }
 
@@ -84,6 +87,7 @@ async function ask(
   err: Writable,
   env: NodeJS.ProcessEnv,
   ctx: ConciergeCliContext,
+  localServiceFactory?: (env: NodeJS.ProcessEnv) => Promise<ConciergeService>,
 ): Promise<number> {
   const question = firstPositional(argv);
   if (!question) {
@@ -99,7 +103,7 @@ async function ask(
   };
   const response = ctx.dashboardUrl || env.SANCTUARY_DASHBOARD_URL
     ? await askViaHub(payload, ctx)
-    : await askLocal(payload, out, env);
+    : await askLocal(payload, out, env, localServiceFactory);
 
   if (json) {
     out.write(JSON.stringify(response, null, 2) + "\n");
@@ -117,11 +121,12 @@ async function status(
   _err: Writable,
   env: NodeJS.ProcessEnv,
   ctx: ConciergeCliContext,
+  localServiceFactory?: (env: NodeJS.ProcessEnv) => Promise<ConciergeService>,
 ): Promise<number> {
   const json = hasFlag(ctx.argv, "--json");
   const result = ctx.dashboardUrl || env.SANCTUARY_DASHBOARD_URL
     ? await statusViaHub(ctx)
-    : await new VeniceClient({ apiKey: env.VENICE_API_KEY, model: env.VENICE_MODEL }).checkStatus();
+    : await (await (localServiceFactory ?? createLocalService)(env)).status();
   if (json) {
     out.write(JSON.stringify(result, null, 2) + "\n");
   } else {
@@ -156,8 +161,9 @@ async function askLocal(
   payload: { question: string; stream: boolean; includePayloads: boolean },
   out: Writable,
   env: NodeJS.ProcessEnv,
+  localServiceFactory?: (env: NodeJS.ProcessEnv) => Promise<ConciergeService>,
 ): Promise<ConciergeAskResponse> {
-  const service = await createLocalService(env);
+  const service = await (localServiceFactory ?? createLocalService)(env);
   return service.ask(payload, payload.stream ? (token) => out.write(token) : undefined);
 }
 
@@ -175,6 +181,21 @@ async function createLocalService(env: NodeJS.ProcessEnv): Promise<ConciergeServ
   if (!identity) throw new ConciergeReadError("no primary identity found");
   const stateStore = new StateStore(storage, masterKey);
   const auditLog = new AuditLog(storage, masterKey, { integrityMode: "strict" });
+  const compiledContextRuntime = createCompiledContextRuntime({
+    storage,
+    masterKey,
+    auditLog,
+    fortressId: config.storage_path,
+    identityId: identity.identity_id,
+  });
+  const selector = new SubstrateSelector({
+    storage,
+    masterKey,
+    auditLog,
+    identityId: identity.identity_id,
+    compiledContextScanner: compiledContextRuntime.scanner,
+  });
+  await selector.load();
   const taskService = new TaskService({
     stateStore,
     auditLog,
@@ -197,7 +218,7 @@ async function createLocalService(env: NodeJS.ProcessEnv): Promise<ConciergeServ
   });
   return new ConciergeService({
     reader,
-    venice: new VeniceClient({ apiKey: env.VENICE_API_KEY, model: env.VENICE_MODEL }),
+    selector,
   });
 }
 

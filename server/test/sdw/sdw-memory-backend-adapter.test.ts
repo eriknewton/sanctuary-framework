@@ -9,6 +9,7 @@ import {
   passageContentHash,
   SdwMemoryBackendAdapter,
 } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 import type { MemoryBackendAdapter } from "../../src/sdw/adapters/memory-backend.js";
 import { documentChunkKey, documentKey } from "../../src/sdw/grammar.js";
 import { SDW_DOCUMENT_CORPUS_NAMESPACE } from "../../src/sdw/records.js";
@@ -164,7 +165,7 @@ function makeAdapter(
     listMaxLimit?: number;
   } = {},
 ): MemoryBackendAdapter {
-  return new SdwMemoryBackendAdapter({
+  return new TestSdwMemoryBackendAdapter({
     storage,
     masterKey: MASTER_KEY,
     fortressId: FORTRESS_ID,
@@ -364,7 +365,15 @@ describe("SDW memory-backend adapter: write-gate enforcement", () => {
       adapter.insertPassage({ passage_id: "rollback-1", text: "abcdef" }, "user_content"),
     ).rejects.toMatchObject({ category: "partial_scope" });
 
-    expect(storage.deleteCalls).toEqual([chunk2, chunk1, chunk0, docKey]);
+    expect(storage.deleteCalls).toEqual([
+      `prov-status.${documentId}`,
+      `prov-status.${documentId}`,
+      `prov.${documentId}`,
+      chunk2,
+      chunk1,
+      chunk0,
+      docKey,
+    ]);
     expect(storage.data.has(`${SDW_DOCUMENT_CORPUS_NAMESPACE}\0${chunk0}`)).toBe(false);
     expect(storage.data.has(`${SDW_DOCUMENT_CORPUS_NAMESPACE}\0${chunk1}`)).toBe(true);
     expect(storage.data.has(`${SDW_DOCUMENT_CORPUS_NAMESPACE}\0${chunk2}`)).toBe(false);
@@ -520,7 +529,7 @@ describe("SDW memory-backend adapter: write-gate enforcement", () => {
   it("maps verification read failures to partial_scope with the original cause", async () => {
     const documentId = "mem.letta-archive-1.batch-list-fail";
     const docKey = documentKey(documentId);
-    const storage = new FailVerificationListStorage(2);
+    const storage = new FailVerificationListStorage(4);
     storage.writeFailureKey = docKey;
     const adapter = makeAdapter(storage, { maxChunkChars: 2 });
 
@@ -566,7 +575,7 @@ describe("SDW memory-backend adapter: write-gate enforcement", () => {
       const lockDir = join(lockRoot, "sdw_memory_locks");
       await mkdir(lockDir, { recursive: true, mode: 0o700 });
       await writeFile(
-        join(lockDir, "mem.letta-archive-1.batch-replace.lock"),
+        join(lockDir, "mem.corpus.batch-replace.lock"),
         JSON.stringify({ pid: process.pid, acquired_at: NOW }),
       );
 
@@ -818,11 +827,12 @@ describe("SDW memory-backend adapter: delete + integrity", () => {
     const storage = new MemoryStorage();
     const adapter = makeAdapter(storage, { maxChunkChars: 4 });
     await adapter.insertPassage({ passage_id: "d-1", text: "0123456789" }, "user_content");
-    expect(storage.data.size).toBe(4);
+    expect(storage.data.size).toBe(5);
+    storage.secureDeletes.length = 0;
 
     await expect(adapter.deletePassage("d-1")).resolves.toBe(true);
     expect(storage.data.size).toBe(0);
-    expect(storage.secureDeletes).toHaveLength(4);
+    expect(storage.secureDeletes).toHaveLength(6);
     await expect(adapter.getPassage("d-1")).resolves.toBeNull();
     await expect(adapter.deletePassage("d-1")).resolves.toBe(false);
   });

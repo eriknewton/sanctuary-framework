@@ -361,6 +361,21 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "memory_provenance_mark_bad_signer") {
+    const { runMemoryProvenanceMarkBadSignerCommand } = await import("./cli/memory-archive.js");
+    return drainAndExit(await runMemoryProvenanceMarkBadSignerCommand({ argv: args.slice(1) }));
+  }
+
+  if (args[0] === "memory_provenance_clear_bad_signer") {
+    const { runMemoryProvenanceClearBadSignerCommand } = await import("./cli/memory-archive.js");
+    return drainAndExit(await runMemoryProvenanceClearBadSignerCommand({ argv: args.slice(1) }));
+  }
+
+  if (args[0] === "memory_provenance_prune_signers") {
+    const { runMemoryProvenancePruneSignersCommand } = await import("./cli/memory-archive.js");
+    return drainAndExit(await runMemoryProvenancePruneSignersCommand({ argv: args.slice(1) }));
+  }
+
   if (args[0] === "state_disclose_unattributed") {
     const { runStateDiscloseUnattributedCommand } = await import(
       "./cli/state-disclose.js"

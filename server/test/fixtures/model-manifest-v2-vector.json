@@ -1,0 +1,68 @@
+{
+  "domain": "sanctuary.model-manifest.v2",
+  "delimiter_hex": "0a",
+  "body": {
+    "schema_version": 2,
+    "manifest_version": 9,
+    "models": {
+      "qwen2.5-1.5b": {
+        "model_id": "qwen2.5-1.5b",
+        "model_name": "Qwen2.5 1.5B Instruct",
+        "model_version": "2.5",
+        "provider": "Alibaba Cloud",
+        "runtime": "ollama",
+        "ollama_identity": {
+          "registry": "registry.ollama.ai",
+          "namespace": "library",
+          "model": "qwen2.5",
+          "tag": "1.5b",
+          "ollama_manifest_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "params_b": 1.5,
+        "license": {
+          "identifier": "Apache-2.0",
+          "name": "Apache License 2.0",
+          "url": "https://www.apache.org/licenses/LICENSE-2.0",
+          "osi_approved": true,
+          "redistribution": "permitted"
+        },
+        "open_weights": true,
+        "open_source": false
+      }
+    },
+    "tiers": {
+      "baseline": ["qwen2.5-1.5b"],
+      "mid": ["qwen2.5-1.5b"],
+      "pro": ["qwen2.5-1.5b"]
+    },
+    "surface_defaults": {
+      "baseline": {
+        "concierge": "qwen2.5-1.5b",
+        "direct-agent-gate-advisor": "qwen2.5-1.5b",
+        "gate-explanation": "qwen2.5-1.5b",
+        "sentinel-scoring": "qwen2.5-1.5b",
+        "privacy-filter-tier-2": "qwen2.5-1.5b",
+        "template-suggestion": "qwen2.5-1.5b"
+      },
+      "mid": {
+        "concierge": "qwen2.5-1.5b",
+        "direct-agent-gate-advisor": "qwen2.5-1.5b",
+        "gate-explanation": "qwen2.5-1.5b",
+        "sentinel-scoring": "qwen2.5-1.5b",
+        "privacy-filter-tier-2": "qwen2.5-1.5b",
+        "template-suggestion": "qwen2.5-1.5b"
+      },
+      "pro": {
+        "concierge": "qwen2.5-1.5b",
+        "direct-agent-gate-advisor": "qwen2.5-1.5b",
+        "gate-explanation": "qwen2.5-1.5b",
+        "sentinel-scoring": "qwen2.5-1.5b",
+        "privacy-filter-tier-2": "qwen2.5-1.5b",
+        "template-suggestion": "qwen2.5-1.5b"
+      }
+    }
+  },
+  "body_sha256": "882abedac993c6e59827cfc4c151ba5a3e4e0522c347acff5effb383ec456f41",
+  "public_key_b64url": "Zs1gi5KLiOUODv6qM_rxxDzv4HKUsLh-n-CrpqPPdjM",
+  "signature_b64url": "qWYOE3IBc0rY8PRIRQyazR3ulMkaNIXQLrwDJ8mcmpLycC9i94H36PK13uv3lkc8pafROu9uxLRQI2G7MCS0Dw"
+}

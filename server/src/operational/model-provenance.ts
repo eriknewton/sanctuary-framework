@@ -34,6 +34,21 @@ export interface ModelProvenance {
   /** SHA-256 of model weights file, if available and verifiable */
   weights_hash?: string;
 
+  /** SHA-256 of the runtime's exact model-manifest bytes, when verified. */
+  runtime_manifest_hash?: string;
+
+  /** Authenticated config/layer artifact digests, only after real byte hashing. */
+  verified_artifact_hashes?: readonly string[];
+
+  /** Exact load-integrity evidence class; never a model-safety verdict. */
+  load_integrity_assurance?: "runtime-manifest" | "on-disk-all-layers";
+
+  /** ISO 8601 timestamp of the named load-integrity verification. */
+  load_integrity_verified_at?: string;
+
+  /** Signed Sanctuary model-catalog version that authorized the evidence. */
+  model_manifest_version?: number;
+
   /** SHA-256 of training data manifest or metadata, if available */
   training_data_hash?: string;
 
@@ -48,6 +63,9 @@ export interface ModelProvenance {
 
   /** True if inference runs on the local agent's hardware (not delegated to cloud API) */
   local_inference: boolean;
+
+  /** Closed intelligence surface names served by this verified local artifact. */
+  serving_surfaces?: readonly string[];
 
   /** ISO 8601 timestamp when this provenance was declared */
   declared_at: string;
@@ -152,14 +170,19 @@ export const MODEL_PRESETS = {
   }),
 
   /**
-   * Qwen 3.5 via local inference (open weights, proprietary training)
+   * Qwen 3.5 via local inference (open weights, exact license unverified).
+   *
+   * This preset does not identify an upstream artifact precisely enough to
+   * prove which size-specific Qwen terms apply. `unknown` is deliberately
+   * narrower than the previous blanket Apache-2.0 assertion; a verified model
+   * manifest supplies the exact upstream license for provisioned models.
    */
   qwen35Local: (): ModelProvenance => ({
     model_id: "qwen-3.5-35b",
     model_name: "Qwen 3.5 35B",
     model_version: "3.5",
     provider: "Alibaba Cloud",
-    license: "Apache-2.0",
+    license: "unknown",
     open_weights: true,
     open_source: false,
     local_inference: true,
@@ -167,16 +190,16 @@ export const MODEL_PRESETS = {
   }),
 
   /**
-   * Llama 3.3 70B via local inference (open weights and code)
+   * Llama 3.3 70B via local inference (open weights, not OSI open-source).
    */
   llama33Local: (): ModelProvenance => ({
     model_id: "llama-3.3-70b-instruct",
     model_name: "Llama 3.3 70B Instruct",
     model_version: "3.3",
     provider: "Meta",
-    license: "Apache-2.0",
+    license: "Llama Community License",
     open_weights: true,
-    open_source: true,
+    open_source: false,
     local_inference: true,
     declared_at: new Date().toISOString(),
   }),

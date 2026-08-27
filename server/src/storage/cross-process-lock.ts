@@ -28,12 +28,12 @@
  * conditional on the inode still being the exact stale one, so the race cannot be
  * closed while keeping the auto-break. Per the #871 resolution
  * (`anti-rollback-durability-and-lock-simplify`), the convergent CORRECT fix for a
- * millisecond-duration single-operator write path is to DELETE the auto-break and
- * FAIL CLOSED: a crashed holder wedging the path until a one-time manual `rm` is a
- * fail-SAFE tradeoff, strictly better than a fail-OPEN double-acquire on
- * security-critical state (revocation-list push, federation sync-state). The
- * thrown error names the exact lockfile so an operator can clear a genuinely-dead
- * holder with a single `rm`.
+ * single-operator write path is to DELETE the auto-break and FAIL CLOSED: a
+ * crashed holder wedging the path until a one-time manual `rm` is a fail-SAFE
+ * tradeoff, strictly better than a fail-OPEN double-acquire on security-critical
+ * state (revocation-list push, federation sync-state). Some callers deliberately
+ * hold the lock for minutes; the thrown error therefore forbids removal while a
+ * holder may be alive and names the exact lockfile only for a confirmed-dead one.
  *
  * Non-filesystem backends (single-process in-memory rigs and tests) have no
  * cross-process surface, so the lock degrades to running the operation directly.
@@ -121,7 +121,7 @@ export async function withCrossProcessLock<T>(
  * from withCrossProcessLock/withPathLock, reworded to name the exit-import
  * writer guard's own remediation instead of a generic manual-`rm` hint -
  * for lock names where the holder set is exactly {import, rotate, resume,
- * recovery} and the fix is the same "run `sanctuary exit recover` (F1,
+ * recovery, memory_migration} and the fix is the same "run `sanctuary exit recover` (F1,
  * Exit V2 D1 operator finding, 2026-08-23), or inspect before removing"
  * text those callers already use elsewhere. Not a
  * different lock mechanism; a different message on the SAME
@@ -249,7 +249,9 @@ export async function withPathLock<T>(
       if (Date.now() - started >= timeoutMs) {
         throw new CrossProcessLockError(
           `cross-process lock ${lockPath} held >${timeoutMs}ms; refusing to proceed ` +
-            `concurrently. If no other Sanctuary process is running, a prior holder ` +
+            `concurrently. Never remove this lock while a holder may still be alive; ` +
+            `some ceremonies hold it for minutes. If no other Sanctuary process is ` +
+            `running, a prior holder ` +
             `crashed while holding it; clear it with: rm '${lockPath}'`,
         );
       }

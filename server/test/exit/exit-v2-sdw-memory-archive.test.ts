@@ -28,6 +28,7 @@ import {
 import {
   exportExitV2SdwMemoryArchive,
   importExitV2SdwMemoryArchive,
+  planExitV2SdwMemoryAdmission,
   participantExitSdwMemoryRetention,
   verifyExitV2SdwMemoryArchive,
   type ExitV2MemorySigner,
@@ -40,11 +41,16 @@ import type {
   MemoryPassageInput,
 } from "../../src/sdw/adapters/memory-backend.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "../sdw/test-memory-backend.js";
 import {
   restoreMemoryTranscodeArchive,
   transcodeMemoryDirectory,
 } from "../../src/sdw/memory-transcode.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { KnownSignersStore } from "../../src/reputation/known-signers-store.js";
+import { testMemoryProvenanceDependencies } from "../sdw/test-memory-backend.js";
+import type { MemoryProvenanceSigningHandle } from "../../src/sdw/memory-provenance-contract.js";
 
 const CLAUDE_FIXTURE = fileURLToPath(
   new URL("../../src/sdw/__fixtures__/claude-code-memory/basic/", import.meta.url),
@@ -68,14 +74,16 @@ async function makeAdapter(input: {
   readonly masterByte: number;
   readonly fortressId: string;
   readonly storageRoot?: string;
+  readonly integrityState?: "state_PRE_MIGRATION" | "state_COMPLETE";
 }): Promise<SdwMemoryBackendAdapter> {
   const root = input.storageRoot ?? await tempDir(input.prefix);
-  return new SdwMemoryBackendAdapter({
+  return new TestSdwMemoryBackendAdapter({
     storage: new FilesystemStorage(root),
     masterKey: new Uint8Array(32).fill(input.masterByte),
     fortressId: input.fortressId,
     ownerRef: input.ownerRef,
     now: () => NOW,
+    resolveMemoryIntegrityState: async () => input.integrityState ?? "state_PRE_MIGRATION",
   });
 }
 
@@ -90,7 +98,24 @@ function makeSigner(fortressId: string): ExitV2MemorySigner {
   };
 }
 
-async function makeSourceArchive(ownerRef = "owner-a"): Promise<{
+function signingFixture(seedByte: number, fortressId: string): {
+  signer: ExitV2MemorySigner;
+  handle: MemoryProvenanceSigningHandle;
+} {
+  const privateKey = new Uint8Array(32).fill(seedByte);
+  const publicKey = ed25519.getPublicKey(privateKey);
+  const did = publicKeyToDid(publicKey);
+  const identityId = `identity-${fortressId}`;
+  return {
+    signer: { identity_id: identityId, fortress_id: fortressId,
+      public_key: toBase64url(publicKey), did,
+      sign: (bytes) => ed25519.sign(bytes, privateKey) },
+    handle: { identity_id: identityId, did, public_key: publicKey,
+      sign: (bytes) => ed25519.sign(bytes, privateKey) },
+  };
+}
+
+async function makeSourceArchive(ownerRef = "owner-a", integrityState: "state_PRE_MIGRATION" | "state_COMPLETE" = "state_PRE_MIGRATION"): Promise<{
   readonly adapter: SdwMemoryBackendAdapter;
   readonly archiveId: string;
 }> {
@@ -99,6 +124,7 @@ async function makeSourceArchive(ownerRef = "owner-a"): Promise<{
     ownerRef,
     masterByte: ownerRef === "owner-a" ? 41 : 42,
     fortressId: "fortress-source",
+    integrityState,
   });
   await ingestClaudeCodeMemoryDirectory(adapter, CLAUDE_FIXTURE, { ingestedAt: NOW });
   const outputParent = await tempDir(`exit-v2-source-projection-${ownerRef}`);
@@ -183,7 +209,7 @@ describe("Exit V2 SDW memory archive", () => {
   });
 
   it("exports only ciphertext/public bindings under a fresh 32-byte transfer key", async () => {
-    const source = await makeSourceArchive();
+    const source = await makeSourceArchive("owner-a", "state_COMPLETE");
     const sourceCount = await source.adapter.countPassages();
     const first = await exportArchive(source);
     const second = await exportArchive(source);
@@ -259,6 +285,22 @@ describe("Exit V2 SDW memory archive", () => {
     expect(putCalls).toBe(1);
     expect(capturedInputs).toHaveLength(5); // three files + completed manifest + signed lineage
     expect(capturedInputs.some((input) => input.tags?.includes("memory_transcode_lineage"))).toBe(true);
+    for (const input of capturedInputs) {
+      const provenance = await destination.getPassageProvenance(input.passage_id!);
+      expect(provenance.status).toBe("verified");
+      if (provenance.status !== "verified") throw new Error("expected verified V1 import provenance");
+      expect(provenance.companion.origin.body).toMatchObject({
+        author_agent_id: "unknown_legacy",
+        ingress_channel: "legacy_unknown",
+        source_class: "legacy_unattested",
+      });
+      expect(provenance.companion.admission.body).toMatchObject({
+        admission_channel: "exit_v2_import",
+        origin_trust_tier: "legacy_unattested",
+        verification_basis: "exit_v2_legacy_v1",
+      });
+      expect(provenance.companion.admission.body.origin_trust_tier).not.toBe("local_attested");
+    }
 
     const restoredParent = await tempDir("exit-v2-restored");
     const restoredDir = join(restoredParent, "source");
@@ -266,6 +308,214 @@ describe("Exit V2 SDW memory archive", () => {
     for (const path of ["MEMORY.md", "concise-updates.md", "rung-one-scope.md"]) {
       expect(await readFile(join(restoredDir, path))).toEqual(await readFile(join(CLAUDE_FIXTURE, path)));
     }
+  });
+
+  it("carries signed origins through a relayed second hop without laundering them as local", async () => {
+    const source = await makeSourceArchive("owner-a", "state_COMPLETE");
+    const sourceSigner = makeSigner("fortress-source");
+    const sourceDeps = testMemoryProvenanceDependencies(new Uint8Array(32).fill(41));
+    const firstExport = await exportExitV2SdwMemoryArchive({
+      adapter: source.adapter, archiveId: source.archiveId,
+      sourceFortressId: "fortress-source", exportApprovalAuditId: "audit-v2",
+      sourceSanctuaryVersion: "1.7.2", signer: sourceSigner, formatVersion: 2,
+      resolveProvenanceSigner: sourceDeps.resolveSignerPublicKey, now: () => NOW,
+    });
+    const destinationRoot = await tempDir("exit-v2-provenance-destination");
+    const destinationMaster = new Uint8Array(32).fill(77);
+    const destinationDeps = testMemoryProvenanceDependencies(destinationMaster);
+    const importedSignerKeys = new Map<string, Uint8Array>();
+    const destination = new SdwMemoryBackendAdapter({
+      storage: new FilesystemStorage(destinationRoot), masterKey: destinationMaster,
+      ownerRef: "owner-a", fortressId: "fortress-destination", now: () => NOW,
+      resolvePrimarySigningHandle: destinationDeps.resolvePrimarySigningHandle,
+      resolveSignerPublicKey: (identityId, did) =>
+        destinationDeps.resolveSignerPublicKey(identityId, did) ?? importedSignerKeys.get(did),
+      resolveMemoryIntegrityState: async () => "state_COMPLETE",
+    });
+    const destinationSigner = makeSigner("fortress-destination");
+    const signerStore = new KnownSignersStore(
+      new FilesystemStorage(destinationRoot), destinationMaster,
+      { partition: "memory_provenance" },
+    );
+    const receipt = await importExitV2SdwMemoryArchive({
+      adapter: destination, signer: destinationSigner,
+      knownSignersStore: signerStore, manifest: firstExport.manifest,
+      artifactBytes: firstExport.artifact_bytes,
+      transferKey: firstExport.transfer_key.slice(), now: () => NOW,
+      onProvenanceSignerPersisted: (did, publicKey) => importedSignerKeys.set(did, publicKey),
+    });
+    const imported = await destination.listPassages({});
+    const importedFiles = imported.filter((passage) =>
+      passage.tags.includes("memory_transcode_file"));
+    expect(importedFiles).toHaveLength(3);
+    for (const passage of importedFiles) {
+      const provenance = await destination.getPassageProvenance(passage.passage_id);
+      expect(provenance.status).toBe("verified");
+      if (provenance.status !== "verified") continue;
+      expect(provenance.companion.origin.body.origin_fortress_id).toBe("fortress-source");
+      expect(provenance.companion.origin.body.signer_did).toBe(sourceDeps.handle.did);
+      expect(provenance.companion.admission.body.origin_trust_tier).toBe("foreign_relayed");
+      expect(provenance.companion.admission.body.destination_fortress_id)
+        .toBe("fortress-destination");
+    }
+    expect(receipt.replayed).toBe(false);
+    expect(await signerStore.lookup(sourceDeps.handle.did)).not.toBeNull();
+  });
+
+  it("keeps a direct origin byte-stable across restart and classifies the second hop as relayed", async () => {
+    const a = signingFixture(11, "fortress-a");
+    const aStorage = new MemoryStorage();
+    const aMaster = new Uint8Array(32).fill(12);
+    const aAdapter = new SdwMemoryBackendAdapter({
+      storage: aStorage, masterKey: aMaster, fortressId: "fortress-a", ownerRef: "owner-a",
+      now: () => NOW, resolvePrimarySigningHandle: () => a.handle,
+      resolveSignerPublicKey: (identityId, did) => identityId === a.handle.identity_id && did === a.handle.did
+        ? a.handle.public_key : undefined,
+      resolveMemoryIntegrityState: async () => "state_COMPLETE",
+    });
+    await ingestClaudeCodeMemoryDirectory(aAdapter, CLAUDE_FIXTURE, { ingestedAt: NOW });
+    const projection = await tempDir("exit-v2-direct-source");
+    const archive = await transcodeMemoryDirectory(aAdapter, "claude-code", "codex",
+      join(projection, "projection"), { now: () => NOW });
+    const exportA = await exportExitV2SdwMemoryArchive({
+      adapter: aAdapter, archiveId: archive.archive_id, sourceFortressId: "fortress-a",
+      exportApprovalAuditId: "audit-a", sourceSanctuaryVersion: "1.7.2",
+      signer: a.signer, formatVersion: 2,
+      resolveProvenanceSigner: (_identityId, did) => did === a.handle.did ? a.handle.public_key : undefined,
+      now: () => NOW,
+    });
+
+    const b = signingFixture(21, "fortress-b");
+    const bStorage = new MemoryStorage();
+    const bMaster = new Uint8Array(32).fill(22);
+    const bKnown = new KnownSignersStore(bStorage, bMaster, { partition: "memory_provenance" });
+    const bRuntime = new Map<string, Uint8Array>();
+    const makeBAdapter = () => new SdwMemoryBackendAdapter({
+      storage: bStorage, masterKey: bMaster, fortressId: "fortress-b", ownerRef: "owner-a",
+      now: () => NOW, resolvePrimarySigningHandle: () => b.handle,
+      resolveSignerPublicKey: (identityId, did) => identityId === b.handle.identity_id && did === b.handle.did
+        ? b.handle.public_key : bRuntime.get(did),
+      resolveMemoryIntegrityState: async () => "state_COMPLETE",
+    });
+    let bAdapter = makeBAdapter();
+    const markedA = {
+      isMarked: async (did: string, rawPublicKey: Uint8Array) =>
+        did === a.handle.did && Buffer.from(rawPublicKey).equals(Buffer.from(a.handle.public_key)),
+    };
+    await expect(planExitV2SdwMemoryAdmission({
+      adapter: bAdapter, signer: b.signer, manifest: exportA.manifest,
+      artifactBytes: exportA.artifact_bytes, transferKey: exportA.transfer_key.slice(),
+      badSignerAuthority: markedA,
+    })).rejects.toThrow(/quarantined foreign signer/);
+    await expect(importExitV2SdwMemoryArchive({
+      adapter: bAdapter, signer: b.signer, knownSignersStore: bKnown,
+      manifest: exportA.manifest, artifactBytes: exportA.artifact_bytes,
+      transferKey: exportA.transfer_key.slice(), now: () => NOW,
+      badSignerAuthority: markedA,
+    })).rejects.toThrow(/quarantined foreign signer/);
+    expect(await bAdapter.countPassages()).toBe(0);
+    expect(await bKnown.lookup(a.handle.did)).toBeNull();
+    const importedB = await importExitV2SdwMemoryArchive({
+      adapter: bAdapter, signer: b.signer, knownSignersStore: bKnown,
+      manifest: exportA.manifest, artifactBytes: exportA.artifact_bytes,
+      transferKey: exportA.transfer_key.slice(), now: () => NOW,
+      onProvenanceSignerPersisted: (did, key) => bRuntime.set(did, key),
+    });
+    const bFiles = (await bAdapter.listPassages({})).filter((p) => p.tags.includes("memory_transcode_file"));
+    const directOrigins = await Promise.all(bFiles.map((p) => bAdapter.getPassageProvenance(p.passage_id)));
+    expect(directOrigins.every((p) => p.status === "verified" &&
+      p.companion.admission.body.origin_trust_tier === "foreign_direct")).toBe(true);
+    const originalSignatures = directOrigins.map((p) => p.status === "verified" ? p.companion.origin.signature : "");
+
+    // Restart: rebuild the synchronous resolver solely from bounded persisted state.
+    bRuntime.clear();
+    for (const row of await bKnown.loadAll()) bRuntime.set(row.did, row.publicKey);
+    bAdapter = makeBAdapter();
+    const exportB = await exportExitV2SdwMemoryArchive({
+      adapter: bAdapter, archiveId: importedB.destination_archive_id,
+      sourceFortressId: "fortress-b", exportApprovalAuditId: "audit-b",
+      sourceSanctuaryVersion: "1.7.2", signer: b.signer, formatVersion: 2,
+      resolveProvenanceSigner: (identityId, did) => identityId === b.handle.identity_id && did === b.handle.did
+        ? b.handle.public_key : bRuntime.get(did), now: () => NOW,
+    });
+
+    const c = signingFixture(31, "fortress-c");
+    const cStorage = new MemoryStorage();
+    const cMaster = new Uint8Array(32).fill(32);
+    const cKnown = new KnownSignersStore(cStorage, cMaster, { partition: "memory_provenance" });
+    const cRuntime = new Map<string, Uint8Array>();
+    const cAdapter = new SdwMemoryBackendAdapter({
+      storage: cStorage, masterKey: cMaster, fortressId: "fortress-c", ownerRef: "owner-a",
+      now: () => NOW, resolvePrimarySigningHandle: () => c.handle,
+      resolveSignerPublicKey: (identityId, did) => identityId === c.handle.identity_id && did === c.handle.did
+        ? c.handle.public_key : cRuntime.get(did),
+      resolveMemoryIntegrityState: async () => "state_COMPLETE",
+    });
+    const markedRelayedA = {
+      isMarked: async (did: string, rawPublicKey: Uint8Array) =>
+        did === a.handle.did && Buffer.from(rawPublicKey).equals(Buffer.from(a.handle.public_key)),
+    };
+    await expect(planExitV2SdwMemoryAdmission({
+      adapter: cAdapter, signer: c.signer, manifest: exportB.manifest,
+      artifactBytes: exportB.artifact_bytes, transferKey: exportB.transfer_key.slice(),
+      badSignerAuthority: markedRelayedA,
+    })).rejects.toThrow(/quarantined foreign signer/);
+    await expect(importExitV2SdwMemoryArchive({
+      adapter: cAdapter, signer: c.signer, knownSignersStore: cKnown,
+      manifest: exportB.manifest, artifactBytes: exportB.artifact_bytes,
+      transferKey: exportB.transfer_key.slice(), now: () => NOW,
+      badSignerAuthority: markedRelayedA,
+    })).rejects.toThrow(/quarantined foreign signer/);
+    expect(await cAdapter.countPassages()).toBe(0);
+    expect(await cKnown.lookup(a.handle.did)).toBeNull();
+    await importExitV2SdwMemoryArchive({
+      adapter: cAdapter, signer: c.signer, knownSignersStore: cKnown,
+      manifest: exportB.manifest, artifactBytes: exportB.artifact_bytes,
+      transferKey: exportB.transfer_key.slice(), now: () => NOW,
+      onProvenanceSignerPersisted: (did, key) => cRuntime.set(did, key),
+    });
+    const cFiles = (await cAdapter.listPassages({})).filter((p) => p.tags.includes("memory_transcode_file"));
+    const relayed = await Promise.all(cFiles.map((p) => cAdapter.getPassageProvenance(p.passage_id)));
+    expect(relayed.every((p) => p.status === "verified" &&
+      p.companion.admission.body.origin_trust_tier === "foreign_relayed")).toBe(true);
+    expect(relayed.map((p) => p.status === "verified" ? p.companion.origin.signature : "").sort())
+      .toEqual(originalSignatures.sort());
+  });
+
+  it("blocks signed-memory export and both admission gates until C3 is COMPLETE", async () => {
+    const incomplete = await makeSourceArchive();
+    const sourceDeps = testMemoryProvenanceDependencies(new Uint8Array(32).fill(41));
+    await expect(exportExitV2SdwMemoryArchive({
+      adapter: incomplete.adapter, archiveId: incomplete.archiveId,
+      sourceFortressId: "fortress-source", exportApprovalAuditId: "audit-incomplete",
+      sourceSanctuaryVersion: "1.7.2", signer: makeSigner("fortress-source"),
+      formatVersion: 2, resolveProvenanceSigner: sourceDeps.resolveSignerPublicKey,
+    })).rejects.toThrow(/requires completed provenance migration/);
+
+    const complete = await makeSourceArchive("owner-a", "state_COMPLETE");
+    const exported = await exportExitV2SdwMemoryArchive({
+      adapter: complete.adapter, archiveId: complete.archiveId,
+      sourceFortressId: "fortress-source", exportApprovalAuditId: "audit-complete",
+      sourceSanctuaryVersion: "1.7.2", signer: makeSigner("fortress-source"),
+      formatVersion: 2, resolveProvenanceSigner: sourceDeps.resolveSignerPublicKey,
+    });
+    const destination = await makeAdapter({
+      prefix: "exit-v2-incomplete-destination", ownerRef: "owner-a", masterByte: 99,
+      fortressId: "fortress-destination", integrityState: "state_PRE_MIGRATION",
+    });
+    const destinationSigner = makeSigner("fortress-destination");
+    await expect(planExitV2SdwMemoryAdmission({
+      adapter: destination, signer: destinationSigner, manifest: exported.manifest,
+      artifactBytes: exported.artifact_bytes, transferKey: exported.transfer_key.slice(),
+    })).rejects.toThrow(/preflight requires completed provenance migration/);
+    await expect(importExitV2SdwMemoryArchive({
+      adapter: destination, signer: destinationSigner,
+      knownSignersStore: new KnownSignersStore(new MemoryStorage(), new Uint8Array(32).fill(99),
+        { partition: "memory_provenance" }),
+      manifest: exported.manifest, artifactBytes: exported.artifact_bytes,
+      transferKey: exported.transfer_key.slice(),
+    })).rejects.toThrow(/requires completed provenance migration/);
+    expect(await destination.countPassages()).toBe(0);
   });
 
   it("fails wrong-key, tamper, and AAD mutations before any destination write", async () => {

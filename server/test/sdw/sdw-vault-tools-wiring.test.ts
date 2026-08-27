@@ -32,7 +32,11 @@ import { StateStore } from "../../src/cognitive/state-store.js";
 import { encrypt } from "../../src/core/encryption.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { derivePurposeKey, IDENTITY_ENCRYPTION_PURPOSE } from "../../src/core/key-derivation.js";
-import { SDW_EXPORT_MANIFEST_SIGNING_DOMAIN } from "../../src/core/signing-domains.js";
+import {
+  MEMORY_ADMISSION_SIGNING_DOMAIN_PREFIX,
+  MEMORY_ORIGIN_SIGNING_DOMAIN_PREFIX,
+  SDW_EXPORT_MANIFEST_SIGNING_DOMAIN,
+} from "../../src/core/signing-domains.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
@@ -54,6 +58,7 @@ import {
   createSdwMemoryTools,
 } from "../../src/sdw/memory-tools.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
+import { TestSdwMemoryBackendAdapter } from "./test-memory-backend.js";
 import {
   createMultiAgentIsolationGuard,
   wrappedAgentIdentityFromEnv,
@@ -253,7 +258,7 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
   });
 
   it("provenance: the gate-time projection refuses a foreign identity before the approval gate, and the handler rechecks", async () => {
-    const adapter = new SdwMemoryBackendAdapter({
+    const adapter = new TestSdwMemoryBackendAdapter({
       storage: new MemoryStorage(),
       masterKey: new Uint8Array(32).fill(3),
       fortressId: "fortress:prov-gate",
@@ -273,7 +278,7 @@ describe("IC-16: the isolation guard fires from the production-written SANCTUARY
   });
 
   it("two ids reaching one guard instance: the second cannot read the first's passages", async () => {
-    const adapter = new SdwMemoryBackendAdapter({
+    const adapter = new TestSdwMemoryBackendAdapter({
       storage: new MemoryStorage(),
       masterKey: new Uint8Array(32).fill(3),
       fortressId: "fortress:shared-host",
@@ -470,6 +475,19 @@ describe("MEDIUM-2: the raw identity_sign surface cannot mint an internal artifa
         await sign.handler({ identity_id: storedIdentity.identity_id, payload: toBase64url(stringToBytes(`${prefix}forged`)) }),
       );
       expect(out.denied, prefix).toBe(true);
+    }
+    for (const domain of [
+      MEMORY_ORIGIN_SIGNING_DOMAIN_PREFIX,
+      MEMORY_ADMISSION_SIGNING_DOMAIN_PREFIX,
+    ]) {
+      const out = parse(
+        await sign.handler({
+          identity_id: storedIdentity.identity_id,
+          payload: toBase64url(stringToBytes(`${domain}{"forged":true}`)),
+        }),
+      );
+      expect(out.denied, domain).toBe(true);
+      expect(out.signature).toBeUndefined();
     }
     const plain = parse(
       await sign.handler({ identity_id: storedIdentity.identity_id, payload: toBase64url(stringToBytes("an ordinary commitment")) }),

@@ -166,6 +166,12 @@ export const NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS = [
  */
 export const NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS = [
   "memory_checkpoint_restore",
+  "sdw_memory_provenance_migrate",
+  "sdw_memory_provenance_abort_migration",
+  "sdw_memory_provenance_repair_completion_marker",
+  "memory_provenance_mark_bad_signer",
+  "memory_provenance_clear_bad_signer",
+  "memory_provenance_prune_signers",
 ] as const;
 
 /**
@@ -635,6 +641,12 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     // NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS so a hand-authored policy
     // cannot relax it out of Tier 1.
     "memory_checkpoint_restore",
+    "sdw_memory_provenance_migrate",
+    "sdw_memory_provenance_abort_migration",
+    "sdw_memory_provenance_repair_completion_marker",
+    "memory_provenance_mark_bad_signer",
+    "memory_provenance_clear_bad_signer",
+    "memory_provenance_prune_signers",
     // Operator unattributed-disclosure surface: discloses the content of an
     // entry whose writer could not be established. ALSO force-pinned via
     // NON_RELAXABLE_STATE_DISCLOSURE_TIER1_OPERATIONS, which is what makes it

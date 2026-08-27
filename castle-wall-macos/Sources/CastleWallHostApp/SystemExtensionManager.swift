@@ -43,6 +43,8 @@ final class SystemExtensionManager: NSObject, ObservableObject {
         case deactivation
     }
 
+    /// Must match HeadlessFilterCLI.systemExtensionIdentifier (the headless
+    /// teardown path submits requests for the same extension).
     private let extensionIdentifier = "ai.sanctuaryprotocol.macos.castle-wall"
     private var pendingOperation: PendingOperation?
 
@@ -133,6 +135,12 @@ final class SystemExtensionManager: NSObject, ObservableObject {
     }
 
     func replacementAction() -> OSSystemExtensionRequest.ReplacementAction {
+        // Replacement is how a newer bundled extension re-binds a stale
+        // activated record during the GUI app's attended activation flow (the
+        // ONLY path that submits activation requests). Must match the .replace
+        // answer in HeadlessSystemExtensionRequestRunner (HeadlessFilterCLI.swift),
+        // whose delegate carries the same policy even though a deactivation
+        // request never consults it.
         return .replace
     }
 }

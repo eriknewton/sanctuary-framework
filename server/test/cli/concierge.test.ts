@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runConciergeCommand } from "../../src/cli/concierge.js";
 import { writeTenantRuntime } from "../../src/cli/agents/runtime.js";
+import { ConciergeService, type ConciergeContextBundle } from "../../src/concierge/index.js";
 
 class CaptureStream extends Writable {
   value = "";
@@ -132,5 +133,49 @@ describe("sanctuary concierge CLI", () => {
       }
       await rm(scopedFortress, { recursive: true, force: true });
     }
+  });
+
+  it("routes local mode through the selector-backed concierge service", async () => {
+    const invokeSummarize = vi.fn(async () => ({
+      servedBy: "local" as const,
+      failureClass: null,
+      body: { kind: "summarize" as const, text: "Local selector answered." },
+      completedAt: new Date().toISOString(),
+      latencyMs: 1,
+    }));
+    const localContext: ConciergeContextBundle = {
+      generated_at: new Date().toISOString(),
+      read_surfaces: ["audit_log", "identity_registry", "approval_inbox", "sovereignty_profile", "task_state", "state_store"],
+      audit_log: { total_matching: 0, entries: [], integrity_findings: [] },
+      identity_registry: { identities: [] },
+      approval_inbox: { pending_count: 1, items: [] },
+      sovereignty_profile: { fortress_id: "local", tier_policy: "local", context_gating_state: "local", castle_wall: { dashboard_enabled: false } },
+      task_state: { total: 0, status_counts: { pending: 0, in_progress: 0, blocked: 0, ready_for_review: 0, completed: 0, cancelled: 0 }, tasks: [], recent_activity: [] },
+      state_store: { include_payloads: false, namespaces: [] },
+    };
+    const service = new ConciergeService({
+      reader: { readContext: async () => localContext },
+      selector: {
+        getSubstrate: async () => ({ surface: "concierge", substrate: "local", badge: { surface: "concierge", substrate: "local", labelKey: "local", tradeoffKey: "local", status: "green" }, capability: { summarize: true, classify: true, redact: true }, displayLabel: "Local model - test" }),
+        invokeSummarize,
+        getOperatorVisibleStatus: async () => ({ version: "1.2", generatedAt: new Date().toISOString(), surfaces: [], hardware: { totalRamGb: 16, cpuArch: "other", tier: "mid", recommendedLocalModel: "phi-4-mini", ollamaReachable: true, ollamaModels: ["test"] } }),
+        getConfig: () => ({ fallback: { concierge: "degrade-silent", "direct-agent-gate-advisor": "conservative-deny", "sentinel-scoring": "conservative-deny", "gate-explanation": "degrade-silent", "privacy-filter-tier-2": "degrade-silent", "template-suggestion": "degrade-silent" } }),
+      },
+    });
+    const out = new CaptureStream();
+
+    const code = await runConciergeCommand({
+      argv: ["ask", "local status?", "--no-stream"],
+      out,
+      err: new CaptureStream(),
+      localServiceFactory: async () => service,
+    });
+
+    expect(code).toBe(0);
+    expect(out.value).toContain("Local selector answered.");
+    expect(invokeSummarize).toHaveBeenCalledWith(
+      "concierge",
+      expect.objectContaining({ query: "local status?" }),
+    );
   });
 });

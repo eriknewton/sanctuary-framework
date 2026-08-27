@@ -9,7 +9,7 @@
 
 import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { StorageBackend } from "../storage/interface.js";
+import type { FilesystemStorageCapabilities, StorageBackend } from "../storage/interface.js";
 import {
   EXIT_IMPORT_JOURNAL_NAMESPACE,
   EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
@@ -2244,13 +2244,248 @@ function emptyStateWarning(encryptedState: ExitEncryptedStateBundle): string {
  * undo partial imports when the re-key handler fails partway through.
  * Hardening wave 6 finding #78.
  */
-interface StagedLocation {
+export interface StagedLocation {
   namespace: string;
   key: string;
 }
 
 interface StorageSnapshot extends StagedLocation {
   data: Uint8Array | null;
+}
+
+export interface JournaledExitAdmissionContext {
+  readonly importId: string;
+  recordPostImage(namespace: string, key: string, bytes: Uint8Array | null): Promise<void>;
+}
+
+export interface ExitAdmissionWriteGuard {
+  readonly storage: StorageBackend;
+  activate(
+    locations: readonly StagedLocation[],
+    record: JournaledExitAdmissionContext["recordPostImage"],
+  ): void;
+  deactivate(): void;
+}
+
+/**
+ * Storage-bound exact post-image hook for C4. While active, every mutation is
+ * checked against the predeclared set before delegation, and every write's
+ * exact caller-owned bytes are journaled before the next mutation can start.
+ */
+export function createExitAdmissionWriteGuard(base: StorageBackend): ExitAdmissionWriteGuard {
+  let declared: Set<string> | null = null;
+  let record: JournaledExitAdmissionContext["recordPostImage"] | null = null;
+  const locationKey = (namespace: string, key: string) => `${namespace.length}:${namespace}${key}`;
+  const assertDeclared = (namespace: string, key: string) => {
+    if (declared !== null && !declared.has(locationKey(namespace, key))) {
+      throw new Error("Exit memory admission attempted an undeclared late write");
+    }
+  };
+  const storage: StorageBackend & Partial<FilesystemStorageCapabilities> = {
+    write: async (namespace, key, bytes) => {
+      assertDeclared(namespace, key);
+      await base.write(namespace, key, bytes);
+      if (record !== null) await record(namespace, key, bytes);
+    },
+    read: (namespace, key) => base.read(namespace, key),
+    delete: async (namespace, key, secureOverwrite) => {
+      assertDeclared(namespace, key);
+      const existed = await base.exists(namespace, key);
+      const deleted = await base.delete(namespace, key, secureOverwrite);
+      if (record !== null && existed && deleted) await record(namespace, key, null);
+      return deleted;
+    },
+    list: (namespace, prefix) => base.list(namespace, prefix),
+    exists: (namespace, key) => base.exists(namespace, key),
+    totalSize: () => base.totalSize(),
+    ...(base.listNamespaces === undefined ? {} : { listNamespaces: () => base.listNamespaces!() }),
+  };
+  const filesystem = base as StorageBackend & Partial<FilesystemStorageCapabilities>;
+  if (typeof filesystem.namespacePath === "function") {
+    storage.namespacePath = (namespace) => filesystem.namespacePath!(namespace);
+  }
+  if (typeof filesystem.writeDurable === "function") {
+    storage.writeDurable = async (namespace, key, bytes) => {
+      assertDeclared(namespace, key);
+      await filesystem.writeDurable!(namespace, key, bytes);
+      if (record !== null) await record(namespace, key, bytes);
+    };
+  }
+  return {
+    storage,
+    activate(locations, nextRecord) {
+      if (declared !== null) throw new Error("Exit memory admission write guard is already active");
+      declared = new Set(locations.map((loc) => locationKey(loc.namespace, loc.key)));
+      record = nextRecord;
+    },
+    deactivate() { declared = null; record = null; },
+  };
+}
+
+/**
+ * Shared C4 admission coordinator using the shipped Exit journal protocol.
+ * Every location is snapshotted before the callback starts; each callback
+ * write must record its exact bytes before beginning the next write.
+ */
+export async function runJournaledExitMemoryAdmission<T>(options: {
+  readonly storage: StorageBackend;
+  readonly importId: string;
+  readonly identityId: string;
+  readonly locations: readonly StagedLocation[];
+  readonly operation: (context: JournaledExitAdmissionContext) => Promise<T>;
+}): Promise<T> {
+  if (options.locations.length > MAX_EXIT_IMPORT_JOURNAL_LOCATIONS) {
+    throw new Error("Exit memory admission journal exceeds its location bound");
+  }
+  return withExitAdmissionLock(options.storage, "memory_archive_import", async () => {
+    if (await hasInterruptedExitImport(options.storage)) {
+      throw new Error("An interrupted Exit import must be recovered before memory admission");
+    }
+    const completionLocation = { namespace: EXIT_IMPORT_NAMESPACE, key: options.importId };
+    const snapshots = await snapshotStorageLocations(options.storage, [
+      ...options.locations,
+      completionLocation,
+    ]);
+    await writeImportJournal(
+      options.storage,
+      options.importId,
+      options.identityId,
+      snapshots,
+    );
+    try {
+      const result = await options.operation({
+        importId: options.importId,
+        recordPostImage: (namespace, key, bytes) =>
+          recordPostImage(options.storage, options.importId, namespace, key, bytes),
+      });
+      // Completion is last: every declared location must still equal either
+      // its exact pre-image (not written) or this admission's recorded
+      // post-image. A racing writer can never be blessed by completion.
+      for (const snapshot of snapshots) {
+        if (!locationNeedsPostImageDivergenceCheck(snapshot.namespace)) continue;
+        const current = await options.storage.read(snapshot.namespace, snapshot.key);
+        const postImage = await readPostImageHash(
+          options.storage, options.importId, snapshot,
+        );
+        if (classifyRestoreSafety(current, snapshot.data, postImage) === "diverged") {
+          throw new Error("Exit memory admission post-image verification diverged");
+        }
+      }
+      const completionBytes = stringToBytes(JSON.stringify({
+        import_id: options.importId,
+        identity_id: options.identityId,
+        activated_at: new Date().toISOString(),
+        kind: "sdw_memory_archive_v2",
+      }));
+      await options.storage.write(EXIT_IMPORT_NAMESPACE, options.importId, completionBytes);
+      await deleteImportJournal(options.storage, options.importId);
+      return result;
+    } catch (error) {
+      const rollback = await restoreStorageSnapshots(options.storage, options.importId, snapshots);
+      if (rollback.failed.length > 0 || rollback.diverged.length > 0) {
+        const partial = new Error("Exit memory admission rollback could not be verified; partial_scope");
+        partial.name = "ExitMemoryAdmissionPartialScopeError";
+        throw partial;
+      }
+      await deleteImportJournal(options.storage, options.importId);
+      throw error;
+    }
+  });
+}
+
+export const MEMORY_PROVENANCE_SIGNER_PRUNE_COMPLETION_KEY =
+  "memory-provenance-signer-prune-v1";
+
+/**
+ * Specialized Exit-journal runner for the bounded memory-provenance signer
+ * sweep. The fixed completion key is disposable: recovery uses its
+ * `activated_at` field to distinguish rollback from commit, and a normal
+ * success removes it after the journal and post-images are gone.
+ *
+ * The caller already holds the shared Exit admission lock. Keeping lock
+ * acquisition outside this helper preserves the required lock order:
+ * Exit admission -> SDW corpus mutation -> SDW filesystem batch lock.
+ */
+export async function runJournaledMemoryProvenanceSignerPrune<T>(options: {
+  readonly storage: StorageBackend;
+  readonly identityId: string;
+  readonly locations: readonly StagedLocation[];
+  readonly operation: (context: JournaledExitAdmissionContext) => Promise<T>;
+}): Promise<T> {
+  const importId = MEMORY_PROVENANCE_SIGNER_PRUNE_COMPLETION_KEY;
+  if (options.locations.length > MAX_EXIT_IMPORT_JOURNAL_LOCATIONS) {
+    throw new Error("Memory-provenance signer prune journal exceeds its location bound");
+  }
+  if (await hasInterruptedExitImport(options.storage)) {
+    throw new Error("An interrupted Exit import must be recovered before signer pruning");
+  }
+
+  // A crash after activation but before normal cleanup may leave this fixed,
+  // disposable witness behind. Under the shared admission lock it is safe to
+  // clear before publishing the next journal, keeping `_exit_imports` bounded.
+  await options.storage.delete(EXIT_IMPORT_NAMESPACE, importId, false);
+  if (await options.storage.read(EXIT_IMPORT_NAMESPACE, importId) !== null) {
+    throw new Error("Could not clear stale signer-prune completion marker");
+  }
+
+  const completionLocation = { namespace: EXIT_IMPORT_NAMESPACE, key: importId };
+  const snapshots = await snapshotStorageLocations(options.storage, [
+    ...options.locations,
+    completionLocation,
+  ]);
+  await writeImportJournal(options.storage, importId, options.identityId, snapshots);
+  let activated = false;
+  try {
+    const result = await options.operation({
+      importId,
+      recordPostImage: (namespace, key, bytes) =>
+        recordPostImage(options.storage, importId, namespace, key, bytes),
+    });
+    for (const snapshot of snapshots) {
+      if (!locationNeedsPostImageDivergenceCheck(snapshot.namespace)) continue;
+      const current = await options.storage.read(snapshot.namespace, snapshot.key);
+      const postImage = await readPostImageHash(options.storage, importId, snapshot);
+      if (classifyRestoreSafety(current, snapshot.data, postImage) === "diverged") {
+        throw new Error("Memory-provenance signer prune post-image verification diverged");
+      }
+    }
+    const completionBytes = stringToBytes(JSON.stringify({
+      import_id: importId,
+      identity_id: options.identityId,
+      activated_at: new Date().toISOString(),
+      kind: "memory_provenance_signer_prune_v1",
+    }));
+    await options.storage.write(EXIT_IMPORT_NAMESPACE, importId, completionBytes);
+    activated = true;
+    await deleteImportJournal(options.storage, importId);
+    await options.storage.delete(EXIT_IMPORT_NAMESPACE, importId, false);
+    if (await options.storage.read(EXIT_IMPORT_NAMESPACE, importId) !== null) {
+      throw new Error("Memory-provenance signer prune completion marker cleanup failed");
+    }
+    return result;
+  } catch (error) {
+    // Once activation is durable, recovery must interpret the mutation as
+    // committed. A cleanup fault may leave bounded recovery evidence, but it
+    // must never roll back an already-activated prune.
+    if (activated) {
+      const partial = new Error(
+        "Memory-provenance signer prune committed but cleanup was incomplete; partial_scope",
+        { cause: error },
+      );
+      partial.name = "MemoryProvenanceSignerPrunePartialScopeError";
+      throw partial;
+    }
+    const rollback = await restoreStorageSnapshots(options.storage, importId, snapshots);
+    if (rollback.failed.length > 0 || rollback.diverged.length > 0) {
+      const partial = new Error(
+        "Memory-provenance signer prune rollback could not be verified; partial_scope",
+      );
+      partial.name = "MemoryProvenanceSignerPrunePartialScopeError";
+      throw partial;
+    }
+    await deleteImportJournal(options.storage, importId);
+    throw error;
+  }
 }
 
 function locationDedupeKey(loc: StagedLocation): string {
@@ -2324,13 +2559,13 @@ async function recordPostImage(
   importId: string,
   namespace: string,
   key: string,
-  bytes: Uint8Array
+  bytes: Uint8Array | null
 ): Promise<void> {
   const postImageKey = postImageRecordKey(importId, { namespace, key });
   await storage.write(
     EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
     postImageKey,
-    stringToBytes(JSON.stringify({ hash: hashToString(bytes) }))
+    stringToBytes(JSON.stringify(bytes === null ? { deleted: true } : { hash: hashToString(bytes) }))
   );
 }
 
@@ -2345,12 +2580,13 @@ async function readPostImageHash(
   storage: StorageBackend,
   importId: string,
   loc: StagedLocation
-): Promise<string | null> {
+): Promise<string | typeof DELETED_POST_IMAGE | null> {
   const postImageKey = postImageRecordKey(importId, loc);
   const raw = await storage.read(EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE, postImageKey);
   if (!raw) return null;
   try {
     const parsed = JSON.parse(bytesToString(raw)) as Record<string, unknown>;
+    if (parsed.deleted === true) return DELETED_POST_IMAGE;
     return typeof parsed.hash === "string" ? parsed.hash : null;
   } catch {
     return null;
@@ -2412,6 +2648,7 @@ function hashOfNullable(bytes: Uint8Array | null): string | null {
 }
 
 type RestoreSafety = "safe-noop" | "safe-restore" | "diverged";
+const DELETED_POST_IMAGE = "__sanctuary_deleted_post_image__" as const;
 
 /**
  * HIGH-1 (Codex gate, 2026-08-22, register id EXIT-JOURNAL-DIVERGE-01): the
@@ -2423,11 +2660,12 @@ type RestoreSafety = "safe-noop" | "safe-restore" | "diverged";
 function classifyRestoreSafety(
   currentBytes: Uint8Array | null,
   preImageBytes: Uint8Array | null,
-  postImageHash: string | null
+  postImageHash: string | typeof DELETED_POST_IMAGE | null
 ): RestoreSafety {
   const currentHash = hashOfNullable(currentBytes);
   const preImageHash = hashOfNullable(preImageBytes);
   if (currentHash === preImageHash) return "safe-noop";
+  if (postImageHash === DELETED_POST_IMAGE && currentBytes === null) return "safe-restore";
   if (postImageHash !== null && currentHash === postImageHash) {
     return "safe-restore";
   }
@@ -2592,6 +2830,7 @@ function isLocationWithinImportWriteSet(
     // see `activationSnapshotLocations`'s known_signers loop (bundle.ts).
     // falls through
     case KNOWN_SIGNERS_NAMESPACE:
+    case "_sdw_document_corpus":
       return true;
     case "_meta":
       return (

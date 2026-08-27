@@ -496,6 +496,7 @@ function validateRecord(record: SdwRecord): void {
         ...record.data.chain_head,
         ...record.data.manifests,
         ...record.data.tombstones,
+        ...(record.data.memory_provenance_completion ?? []),
       ]) {
         assertSdwIdentifier(counter.id, "replay_counter.id");
         assertNonNegativeInteger(counter.seq, "replay_counter.seq");
@@ -577,6 +578,48 @@ function validateRecord(record: SdwRecord): void {
       if (record.token_count !== undefined) assertNonNegativeInteger(record.token_count, "token_count");
       for (const ref of record.vector_refs ?? []) assertSdwIdentifier(ref, "vector_ref");
       return;
+    case "memory_provenance":
+      assertVersion(record.version);
+      assertSdwIdentifier(record.document_id, "document_id");
+      if (record.companion.format !== "SANCTUARY_SDW_MEMORY_PROVENANCE_V1") {
+        throw new SdwValidationError("schema_mismatch", "Invalid SDW memory provenance companion");
+      }
+      return;
+    case "memory_provenance_status":
+      assertVersion(record.version);
+      assertSdwIdentifier(record.document_id, "document_id");
+      assertOneOf(record.status, ["quarantined"], "memory_provenance_status.status");
+      assertSdwIdentifier(record.reason, "memory_provenance_status.reason");
+      assertHashString(record.observed_content_hash, "memory_provenance_status.observed_content_hash");
+      assertHashString(record.observed_provenance_sha256, "memory_provenance_status.observed_provenance_sha256");
+      return;
+    case "memory_provenance_migration_active":
+      assertVersion(record.version);
+      assertOneOf(record.migration_id, ["MI_C_SDW_MEMORY_PROVENANCE_V1"], "migration_id");
+      assertSdwIdentifier(record.run_id, "run_id");
+      return;
+    case "memory_provenance_migration_journal":
+      assertVersion(record.version);
+      assertOneOf(record.migration_id, ["MI_C_SDW_MEMORY_PROVENANCE_V1"], "migration_id");
+      assertSdwIdentifier(record.run_id, "run_id");
+      assertOneOf(record.status, ["active", "abandoned", "completed", "partial_scope"], "migration_status");
+      if (record.cursor !== null) assertSdwIdentifier(record.cursor, "migration_cursor");
+      for (const [label, value] of [
+        ["scanned", record.scanned], ["migrated", record.migrated],
+        ["verified", record.verified], ["quarantined", record.quarantined],
+        ["unsigned", record.unsigned],
+      ] as const) assertNonNegativeInteger(value, label);
+      if (record.failure_code !== undefined) assertSdwIdentifier(record.failure_code, "failure_code");
+      return;
+    case "memory_provenance_completion":
+      assertVersion(record.version);
+      assertOneOf(record.migration_id, ["MI_C_SDW_MEMORY_PROVENANCE_V1"], "migration_id");
+      assertNonNegativeInteger(record.completion_epoch, "completion_epoch");
+      if (record.completion_epoch < 1) {
+        throw new SdwValidationError("schema_mismatch", "Invalid SDW completion epoch");
+      }
+      assertNonNegativeInteger(record.candidate_count, "candidate_count");
+      return;
     case "vector_record":
       assertVersion(record.version);
       assertSdwIdentifier(record.vector_id, "vector_id");
@@ -636,10 +679,14 @@ function assertNamespaceForRecord(namespace: SdwNamespace, record: SdwRecord): v
   const valid =
     (record.kind === "catalog" && namespace === SDW_CATALOG_NAMESPACE) ||
     (record.kind === "replay_anchor" && namespace === SDW_META_NAMESPACE) ||
+    ((record.kind === "memory_provenance_migration_active" ||
+      record.kind === "memory_provenance_migration_journal" ||
+      record.kind === "memory_provenance_completion") && namespace === SDW_META_NAMESPACE) ||
     (record.kind === "working_state" && namespace === SDW_WORKING_STATE_NAMESPACE) ||
     ((record.kind === "query_history" || record.kind === "query_history_chain_head") &&
       namespace === SDW_QUERY_HISTORY_NAMESPACE) ||
-    ((record.kind === "document" || record.kind === "document_chunk") &&
+    ((record.kind === "document" || record.kind === "document_chunk" ||
+      record.kind === "memory_provenance" || record.kind === "memory_provenance_status") &&
       namespace === SDW_DOCUMENT_CORPUS_NAMESPACE) ||
     ((record.kind === "vector_record" ||
       record.kind === "vector_label_map" ||
@@ -683,6 +730,10 @@ function assertReplayAnchorDataShape(value: unknown): asserts value is SdwReplay
         throw new SdwValidationError("schema_mismatch", `Invalid SDW replay-anchor data: ${label}`);
       }
     }
+  }
+  const memoryCompletion = data.memory_provenance_completion;
+  if (memoryCompletion !== undefined && !Array.isArray(memoryCompletion)) {
+    throw new SdwValidationError("schema_mismatch", "Invalid SDW replay-anchor data: memory_provenance_completion");
   }
 }
 

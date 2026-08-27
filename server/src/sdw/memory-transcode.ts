@@ -28,6 +28,7 @@ import type {
   MemoryPassage,
   MemoryPassageInput,
 } from "./adapters/memory-backend.js";
+import { memoryTranscodeIngress } from "./memory-provenance-ingress.js";
 import { CLAUDE_CODE_MEMORY_HARNESS } from "./adapters/claude-code-file-adapter.js";
 import {
   CODEX_MEMORY_FILES,
@@ -76,6 +77,7 @@ export interface MemoryTranscodeRestoreResult {
 }
 
 interface SourceFile {
+  readonly passageId?: string;
   readonly path: string;
   readonly sourceClass: string;
   readonly text: string;
@@ -99,6 +101,7 @@ export interface MemoryTranscodeLogicalArchive {
   readonly projection_file_count: number;
   readonly projection_set_sha256: string;
   readonly files: readonly {
+    readonly source_passage_id?: string;
     readonly path: string;
     readonly source_class: string;
     readonly text: string;
@@ -347,6 +350,7 @@ export async function readMemoryTranscodeArchive(
     files: source.map((file) => {
       const bytes = Buffer.from(file.text, "utf8");
       return {
+        source_passage_id: file.passageId!,
         path: file.path,
         source_class: file.sourceClass,
         text: file.text,
@@ -572,6 +576,7 @@ function archiveFileInput(
       { key: SOURCE_SIZE_KEY, value: String(bytes.length) },
     ],
     created_at: createdAt,
+    provenanceContext: memoryTranscodeIngress("system:memory-transcode", "transcode_source_file"),
   };
 }
 
@@ -607,6 +612,7 @@ function archiveManifestInput(input: {
         : [{ key: PROJECTION_FILE_COUNT_KEY, value: String(input.projectionFileCount) }]),
     ],
     created_at: input.createdAt,
+    provenanceContext: memoryTranscodeIngress("system:memory-transcode", "transcode_manifest"),
   };
 }
 
@@ -650,6 +656,7 @@ function archiveFileFromPassage(
     throw new Error(`memory transcode archive digest mismatch for ${path}`);
   }
   return {
+    passageId: passage.passage_id,
     path,
     sourceClass: requiredMetadata(passage, SOURCE_CLASS_KEY),
     text: passage.text,

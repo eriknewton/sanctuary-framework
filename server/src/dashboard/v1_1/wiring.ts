@@ -40,6 +40,7 @@ import {
   type ProducerKeyLoad,
 } from "../../castle-wall/runtime/producer-signature.js";
 import { IdentityManager } from "../../cognitive/tools.js";
+import { StateStore } from "../../cognitive/state-store.js";
 import {
   HubService,
   InMemoryLocalAgentRegistry,
@@ -62,6 +63,10 @@ import type { ReputationStore } from "../../reputation/reputation-store.js";
 import { loadPrincipalPolicy } from "../../principal-policy/loader.js";
 import type { PrincipalPolicy } from "../../principal-policy/types.js";
 import type { StorageBackend } from "../../storage/interface.js";
+import {
+  ConciergeService,
+  SanctuaryContextReader,
+} from "../../concierge/index.js";
 import {
   ConciergeMemoryStore,
   AgentContextCache,
@@ -642,6 +647,48 @@ export function buildV11Bindings(
     defaultOperatorId: inputs.identityId,
   };
 
+  const inboxSources = {
+    listPendingApprovals: () => [],
+    listRecentBlockedEgress: () => [],
+    listRecentPrivacyEvents: () => [],
+    listActiveBudgetWarnings: () => [],
+    listActiveRecoveryPrompts: () => [],
+    listRecentAgentErrors: () => [],
+  };
+  const policyBudgetSources = {
+    listPolicySummaries: () => [],
+    listBudgetSummaries: () => [],
+  };
+
+  // P3 concierge unification: the frozen stateless hub routes keep their
+  // request/response envelope, but their only inference authority is the
+  // same selector instance used by persisted operator chat. Construction is
+  // deliberately conditional on the full unlocked-fortress graph; a missing
+  // dependency keeps the existing honest capability error instead of
+  // inventing a provider fallback.
+  let statelessConcierge: ConciergeService | undefined;
+  if (
+    inputs.intelligenceSelector &&
+    inputs.storage &&
+    inputs.masterKey &&
+    inputs.identityManager
+  ) {
+    statelessConcierge = new ConciergeService({
+      reader: new SanctuaryContextReader({
+        auditLog: inputs.auditLog,
+        identityManager: inputs.identityManager,
+        stateStore: new StateStore(inputs.storage, inputs.masterKey),
+        config: inputs.config,
+        storagePath: inputs.storagePath,
+        fortressId: inputs.fortressId,
+        identityId: inputs.identityId,
+        inboxSources,
+        policyBudgetSources,
+      }),
+      selector: inputs.intelligenceSelector,
+    });
+  }
+
   const hubService = new HubService({
     identityId: inputs.identityId,
     fortressId: inputs.fortressId,
@@ -649,24 +696,14 @@ export function buildV11Bindings(
     readPersistedLocalAgents: readPersisted,
     writePersistedLocalAgents: writePersisted,
     storagePath: inputs.storagePath,
-    inboxSources: {
-      listPendingApprovals: () => [],
-      listRecentBlockedEgress: () => [],
-      listRecentPrivacyEvents: () => [],
-      listActiveBudgetWarnings: () => [],
-      listActiveRecoveryPrompts: () => [],
-      listRecentAgentErrors: () => [],
-    },
+    inboxSources,
     activitySources: {
       auditLog: inputs.auditLog,
       identityId: inputs.identityId,
       subjectFortressId: inputs.fortressId,
       resolveAuditAttribution,
     },
-    policyBudgetSources: {
-      listPolicySummaries: () => [],
-      listBudgetSummaries: () => [],
-    },
+    policyBudgetSources,
     agentController: new CastleWallAgentController({
       storagePath: inputs.storagePath,
       fortressPath: inputs.storagePath,
@@ -750,6 +787,7 @@ export function buildV11Bindings(
         }
       : {}),
     ...(operatorChatService ? { operatorChat: operatorChatService } : {}),
+    ...(statelessConcierge ? { concierge: statelessConcierge } : {}),
   });
   return {
     hubService,

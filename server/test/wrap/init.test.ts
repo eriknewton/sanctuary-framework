@@ -1061,7 +1061,7 @@ describe("--no-identity (default operator-identity seed)", () => {
 });
 
 describe("parseInitArgs", () => {
-  it("recognizes --fortress, --force, --no-confirm, --no-pin, --no-identity, --recovery-out, --help", () => {
+  it("recognizes fortress, custody, and local-intelligence setup flags", () => {
     const opts = parseInitArgs([
       "--fortress",
       "/tmp/x",
@@ -1069,6 +1069,7 @@ describe("parseInitArgs", () => {
       "--no-confirm",
       "--no-pin",
       "--no-identity",
+      "--provision-local-intelligence",
       "--recovery-out",
       "/tmp/recovery-key.txt",
     ]);
@@ -1077,6 +1078,7 @@ describe("parseInitArgs", () => {
     expect(opts.noConfirm).toBe(true);
     expect(opts.noPin).toBe(true);
     expect(opts.noIdentity).toBe(true);
+    expect(opts.provisionLocalIntelligence).toBe(true);
     expect(opts.recoveryOut).toBe("/tmp/recovery-key.txt");
 
     const helpOpts = parseInitArgs(["--help"]);
@@ -1084,6 +1086,12 @@ describe("parseInitArgs", () => {
 
     const shortHelp = parseInitArgs(["-h"]);
     expect(shortHelp.helpRequested).toBe(true);
+  });
+
+  it("parses an explicit local-intelligence decline", () => {
+    expect(
+      parseInitArgs(["--no-provision-local-intelligence"]).provisionLocalIntelligence,
+    ).toBe(false);
   });
 
   it("rejects --recovery-out without a path value", () => {

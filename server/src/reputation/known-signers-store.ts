@@ -48,15 +48,18 @@ import {
   stringToBytes,
   toBase64url,
   fromBase64url,
+  fromBase64urlStrict,
 } from "../core/encoding.js";
 import { hashToString } from "../core/hashing.js";
 import { MAX_REPUTATION_RECORDS } from "./reputation-store.js";
+import { MAX_MEMORY_PROVENANCE_CANDIDATES } from "../sdw/memory-provenance-limits.js";
+import { legacyPublicKeyToDid, publicKeyToDid } from "../core/identity.js";
 
 /** Reserved namespace for persisted known-signer entries. CONTRACT PIN: must match the `"_known_signers"` literal in `RESERVED_NAMESPACE_PREFIXES` (server/src/cognitive/state-store.ts). */
 export const KNOWN_SIGNERS_NAMESPACE = "_known_signers";
 
 /**
- * The store-wide ceiling on total persisted `_known_signers` records,
+ * The store-wide ceiling on the unprefixed reputation partition only,
  * checked by `persistIfAbsent`
  * before every write batch. Equal to `MAX_REPUTATION_RECORDS` (not a
  * fraction of it, unlike the global/per-origin 10x ratio elsewhere in this
@@ -64,8 +67,27 @@ export const KNOWN_SIGNERS_NAMESPACE = "_known_signers";
  * admitted attestations names a DISTINCT signer DID, so a known-signers
  * store that must be able to represent that worst case needs the SAME
  * ceiling as the attestation store it derives from, not a smaller one.
+ * `memprov.` entries are excluded and use MAX_MEMORY_PROVENANCE_SIGNERS.
  */
 export const MAX_KNOWN_SIGNERS = MAX_REPUTATION_RECORDS;
+export const MEMORY_PROVENANCE_SIGNER_PREFIX = "memprov." as const;
+export const MAX_MEMORY_PROVENANCE_SIGNERS = MAX_MEMORY_PROVENANCE_CANDIDATES;
+export type KnownSignerPartition = "reputation" | "memory_provenance";
+
+function partitionPrefix(partition: KnownSignerPartition): string {
+  return partition === "memory_provenance" ? MEMORY_PROVENANCE_SIGNER_PREFIX : "";
+}
+
+function partitionLimit(partition: KnownSignerPartition): number {
+  return partition === "memory_provenance" ? MAX_MEMORY_PROVENANCE_SIGNERS : MAX_KNOWN_SIGNERS;
+}
+
+async function listPartitionEntries(storage: StorageBackend, partition: KnownSignerPartition) {
+  const entries = await storage.list(KNOWN_SIGNERS_NAMESPACE, partitionPrefix(partition));
+  return partition === "memory_provenance"
+    ? entries
+    : entries.filter((entry) => !entry.key.startsWith(MEMORY_PROVENANCE_SIGNER_PREFIX));
+}
 
 /**
  * Thrown by `persistIfAbsent` when persisting the given batch would push
@@ -116,8 +138,8 @@ export interface StoredKnownSigner {
  * and an unbounded raw key risks a filesystem path-component limit whose
  * ENAMETOOLONG failure would otherwise be misread as "never persisted".
  */
-export function knownSignerStorageKey(did: string): string {
-  return hashToString(stringToBytes(did));
+export function knownSignerStorageKey(did: string, partition: KnownSignerPartition = "reputation"): string {
+  return partitionPrefix(partition) + hashToString(stringToBytes(did));
 }
 
 /**
@@ -132,6 +154,7 @@ export class KnownSignersStore {
   private readonly storage: StorageBackend;
   private readonly encryptionKey: Uint8Array;
   private readonly maxKnownSigners: number;
+  private readonly partition: KnownSignerPartition;
 
   /**
    * `testOverrides.maxKnownSigners` mirrors
@@ -143,11 +166,12 @@ export class KnownSignersStore {
   constructor(
     storage: StorageBackend,
     masterKey: Uint8Array,
-    testOverrides?: { maxKnownSigners?: number }
+    testOverrides?: { maxKnownSigners?: number; partition?: KnownSignerPartition }
   ) {
     this.storage = storage;
     this.encryptionKey = derivePurposeKey(masterKey, "l4-known-signers");
-    this.maxKnownSigners = testOverrides?.maxKnownSigners ?? MAX_KNOWN_SIGNERS;
+    this.partition = testOverrides?.partition ?? "reputation";
+    this.maxKnownSigners = testOverrides?.maxKnownSigners ?? partitionLimit(this.partition);
   }
 
   /**
@@ -189,7 +213,7 @@ export class KnownSignersStore {
   ): Promise<Map<string, { did: string; publicKey: Uint8Array }>> {
     const netNew = new Map<string, { did: string; publicKey: Uint8Array }>();
     for (const { did, publicKey } of entries) {
-      const key = knownSignerStorageKey(did);
+      const key = knownSignerStorageKey(did, this.partition);
       if (netNew.has(key)) continue;
       const existing = await this.storage.read(KNOWN_SIGNERS_NAMESPACE, key);
       if (existing !== null) continue;
@@ -232,8 +256,7 @@ export class KnownSignersStore {
         limit: this.maxKnownSigners,
       };
     }
-    const currentCount = (await this.storage.list(KNOWN_SIGNERS_NAMESPACE))
-      .length;
+    const currentCount = (await listPartitionEntries(this.storage, this.partition)).length;
     return {
       exceeds: currentCount + netNew.size > this.maxKnownSigners,
       currentCount,
@@ -260,8 +283,7 @@ export class KnownSignersStore {
     // already preflighted with `wouldExceedCapacity` before doing anything
     // else that would need rolling back, but this method never trusts that
     // they did.
-    const currentCount = (await this.storage.list(KNOWN_SIGNERS_NAMESPACE))
-      .length;
+    const currentCount = (await listPartitionEntries(this.storage, this.partition)).length;
     if (currentCount + netNew.size > this.maxKnownSigners) {
       throw new KnownSignersQuotaError(
         currentCount,
@@ -300,7 +322,7 @@ export class KnownSignersStore {
   async lookup(did: string): Promise<StoredKnownSigner | null> {
     const raw = await this.storage.read(
       KNOWN_SIGNERS_NAMESPACE,
-      knownSignerStorageKey(did)
+      knownSignerStorageKey(did, this.partition)
     );
     if (!raw) return null;
     try {
@@ -357,5 +379,47 @@ export class KnownSignersStore {
       }
     }
     return resolved;
+  }
+
+  /** Load the bounded persisted partition for a synchronous runtime resolver. */
+  async loadAll(): Promise<readonly { did: string; publicKey: Uint8Array; first_seen_import_id: string }[]> {
+    const entries = await listPartitionEntries(this.storage, this.partition);
+    if (entries.length > this.maxKnownSigners) {
+      throw new KnownSignersQuotaError(entries.length, 0, this.maxKnownSigners);
+    }
+    const resolved: Array<{ did: string; publicKey: Uint8Array; first_seen_import_id: string }> = [];
+    const seen = new Map<string, string>();
+    for (const entry of entries) {
+      const raw = await this.lookupByStorageKey(entry.key);
+      if (raw === null) throw new Error("Persisted known-signer entry is invalid");
+      if (entry.key !== knownSignerStorageKey(raw.did, this.partition)) {
+        throw new Error("Persisted known-signer storage key does not match its DID");
+      }
+      const publicKey = fromBase64urlStrict(raw.public_key);
+      if (publicKey.byteLength !== 32 ||
+          (raw.did !== publicKeyToDid(publicKey) && raw.did !== legacyPublicKeyToDid(publicKey))) {
+        throw new Error("Persisted known-signer DID/key binding is invalid");
+      }
+      const prior = seen.get(raw.did);
+      if (prior !== undefined && prior !== raw.public_key) {
+        throw new Error("Persisted known-signer DID has conflicting keys");
+      }
+      seen.set(raw.did, raw.public_key);
+      resolved.push({ did: raw.did, publicKey, first_seen_import_id: raw.first_seen_import_id });
+    }
+    return resolved;
+  }
+
+  private async lookupByStorageKey(key: string): Promise<StoredKnownSigner | null> {
+    const raw = await this.storage.read(KNOWN_SIGNERS_NAMESPACE, key);
+    if (!raw) return null;
+    try {
+      const decrypted = decrypt(JSON.parse(bytesToString(raw)) as EncryptedPayload, this.encryptionKey);
+      const parsed = JSON.parse(bytesToString(decrypted)) as Record<string, unknown>;
+      return typeof parsed.did === "string" && typeof parsed.public_key === "string" &&
+        typeof parsed.first_seen_import_id === "string"
+        ? { did: parsed.did, public_key: parsed.public_key, first_seen_import_id: parsed.first_seen_import_id }
+        : null;
+    } catch { return null; }
   }
 }
