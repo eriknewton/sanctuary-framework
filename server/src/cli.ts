@@ -1359,6 +1359,11 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runSetupSharedDir();
   }
 
+  if (command === "deploy-preflight") {
+    const { runDeployPreflight } = await import("./cli/castle-wall.js");
+    return runDeployPreflight(args.slice(1));
+  }
+
   if (command === "reload") {
     const { runReload } = await import("./cli/castle-wall.js");
     return runReload(args.slice(1));
@@ -1586,6 +1591,17 @@ function printCastleWallHelp(): void {
                                       --force (use 'configure-origin' first, or pass --agent-uid).
     disable          Disarm the content filter headlessly (macOS; unconditional dead-man lever).
     setup-shared-dir Create the privileged shared dir for the pinned key (run with sudo, macOS).
+    deploy-preflight Check whether replacing the installed Castle Wall app would
+                     leave the OS activated extension out of step (macOS).
+                     CHECK ONLY: reads the incoming bundle's embedded extension
+                     version and the OS activated record, changes nothing on
+                     disk; copying the bundle stays with your own tooling.
+                     --app <path>     Incoming .app bundle to check (required).
+                     --dest <path>    Installed bundle the report names (defaults
+                                      to /Applications/Sanctuary-CastleWall.app).
+                     Exits 2 when the versions positively skew;
+                     --allow-extension-skew accepts the skew and says what it
+                     overrode.
     reload           Reload policy in the running fortress daemon.
                      Exits 0 even when no daemon was reachable to reload (a
                      fresh fortress has nothing to reload; this is intentional).

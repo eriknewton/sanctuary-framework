@@ -8,7 +8,11 @@ import { scrubProvisionedEgressRules, type ScrubProvisionedEgressResult } from "
 import { resolveStoragePath } from "../paths.js";
 import { consumeFlagValue } from "./argv.js";
 import { CASTLE_WALL_BOOT_PLIST_PATH, runUninstallBoot } from "./castle-wall-boot.js";
-import type { DisableNePreferenceOutcome, SystemExtensionDeactivationRequestOutcome } from "./castle-wall.js";
+import {
+  SYSEXT_REREGISTRATION_GUIDANCE,
+  type DisableNePreferenceOutcome,
+  type SystemExtensionDeactivationRequestOutcome,
+} from "./castle-wall.js";
 
 // Must match CASTLE_GLOBAL_PINNED_PUBKEY_PATH in server/src/cli/castle-wall.ts.
 export const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = "/Library/Application Support/Sanctuary/castle-pinned-pubkey.bin";
@@ -497,22 +501,16 @@ export async function runUninstallCommand(ctx: UninstallCommandContext = {}): Pr
       // reach the operator row on EVERY branch, including the
       // completed-but-still-present and unreadable-post-probe ones: this row
       // is the only place the operator learns why a rerun needs the console.
-      // Launch alone only re-registers when the background signer helper is
-      // enabled; with the helper unregistered, launch first lands in an
-      // approval-gated state, so the guidance names the helper approval and
-      // the wait honestly. The remediation sentence from "launch" through
-      // "then rerun" is mirrored wire text: must stay in agreement with
-      // extensionVersionSkewGuidance in
-      // castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift
-      // and emitSysextVersionSkewNotice in server/src/cli/castle-wall.ts.
+      // The re-registration order comes from SYSEXT_REREGISTRATION_GUIDANCE
+      // in server/src/cli/castle-wall.ts, the single server-side source of
+      // the mirrored #1323 wire text (its Swift twin,
+      // extensionVersionSkewGuidance in HeadlessFilterCLI.swift, pins that
+      // constant by name); only the verb tail is written here.
       const remediationNote =
         deactivation.remediation === undefined
           ? ""
-          : `; remediation required (${deactivation.remediation}): launch ` +
-            "Sanctuary-CastleWall.app at the console so its activation flow " +
-            "re-registers the extension, approve or re-enable the Sanctuary " +
-            "background helper if macOS prompts for it, wait for " +
-            "re-registration to complete, then rerun uninstall";
+          : `; remediation required (${deactivation.remediation}): ` +
+            `${SYSEXT_REREGISTRATION_GUIDANCE}, then rerun uninstall`;
       if (deactivation.kind === "reboot-required") {
         rows.push({
           label: "system-extension",

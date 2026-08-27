@@ -474,10 +474,11 @@ enum HeadlessFilterCLI {
     /// enabled; with the helper unregistered, launch first lands in an
     /// approval-gated state, so the guidance names the helper approval and
     /// the wait honestly. The remediation sentence from "launch" through
-    /// "then re-run"/"then rerun" is mirrored wire text: must stay in
-    /// agreement with emitSysextVersionSkewNotice in
-    /// server/src/cli/castle-wall.ts and the remediation note in
-    /// server/src/cli/uninstall.ts.
+    /// "wait for re-registration to complete" is mirrored wire text: it must
+    /// stay byte-identical to the constant SYSEXT_REREGISTRATION_GUIDANCE in
+    /// server/src/cli/castle-wall.ts, the single server-side source that the
+    /// deactivation notice, the uninstall remediation note, and the
+    /// deploy-preflight verb all read; only the verb tail after it may vary.
     static let extensionVersionSkewGuidance =
         "the installed app's registration no longer matches the activated "
         + "system extension; launch Sanctuary-CastleWall.app at the console so "

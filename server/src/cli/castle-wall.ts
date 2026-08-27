@@ -206,11 +206,13 @@ export interface CastleWallCommandContext {
    */
   sysextProbe?: () => Promise<SysextState>;
   /**
-   * Override the installed-app embedded-sysext CFBundleVersion read used by
-   * the deactivation skew-notice preflight (tests). Resolves null whenever the
-   * version cannot be read; the preflight then stays silent. Defaults to
+   * Override the embedded-sysext CFBundleVersion read used by the
+   * deactivation skew-notice preflight (which probes the INSTALLED app
+   * bundle) and the deploy-preflight check (which probes the INCOMING
+   * bundle) (tests). Resolves null whenever the version cannot be read; the
+   * notice then stays silent and deploy-preflight warns. Defaults to
    * `plutil -extract CFBundleVersion raw` on the embedded extension's
-   * Info.plist inside the resolved app bundle.
+   * Info.plist inside the given app bundle.
    */
   embeddedSysextVersionProbe?: (appBundlePath: string) => Promise<string | null>;
   /**
@@ -221,6 +223,16 @@ export interface CastleWallCommandContext {
    * {@link parseActivatedCastleWallBundleVersions} over the real list output.
    */
   activatedSysextVersionsProbe?: () => Promise<string[]>;
+  /**
+   * Override the raw `systemextensionsctl list` read used by the
+   * deploy-preflight check (tests). Resolves the raw stdout, or null when
+   * the list itself could not be read; null (unreadable) is distinct from
+   * parseable output with no activated Castle Wall row (no record), because
+   * the check warns on the first and reports no-record on the second.
+   * Parsing is always {@link parseActivatedCastleWallBundleVersions};
+   * overriding this seam never substitutes a different parser.
+   */
+  sysextListRawProbe?: () => Promise<string | null>;
   /** Override the boot-token custody path (F1 safe-mode; tests). */
   bootTokenPath?: string;
   /**
@@ -322,6 +334,21 @@ export interface CastleWallParsedArgs {
   parseError?: string;
   scope?: "once" | "session" | "always";
   requestId?: string;
+  /** `deploy-preflight --app <path>`: the incoming .app bundle to check. */
+  app?: string;
+  /**
+   * `deploy-preflight --dest <path>`: the installed bundle path the check
+   * reports against. Defaults to the canonical install location (see
+   * DEFAULT_DEPLOY_DEST_APP). Never touched: the verb reads nothing from and
+   * writes nothing to this path.
+   */
+  dest?: string;
+  /**
+   * `deploy-preflight --allow-extension-skew`: explicit override for the
+   * extension-version tripwire. The override path always prints exactly what
+   * it is overriding; it is never implied by any other flag.
+   */
+  allowExtensionSkew?: boolean;
   force?: boolean;
   acceptBrokenChain?: boolean;
   ttlSeconds?: number;
@@ -4229,23 +4256,55 @@ async function defaultEmbeddedSysextVersionProbe(
   return version ? version : null;
 }
 
-async function defaultActivatedSysextVersionsProbe(): Promise<string[]> {
-  const stdout = await execFileTrimmed(
+/**
+ * Raw `systemextensionsctl list` stdout, or null when the list could not be
+ * read at all. Shared by the deactivation skew notice (via the versions probe
+ * below) and the deploy-preflight check, which needs the unreadable/empty
+ * distinction the parsed form erases.
+ */
+async function defaultSysextListRawProbe(): Promise<string | null> {
+  return execFileTrimmed(
     "/usr/bin/systemextensionsctl",
     ["list"],
     STATUS_PROBE_TIMEOUT_MS,
   );
+}
+
+async function defaultActivatedSysextVersionsProbe(): Promise<string[]> {
+  const stdout = await defaultSysextListRawProbe();
   if (stdout === null) return [];
   return parseActivatedCastleWallBundleVersions(stdout);
 }
+
+/**
+ * The one attended re-registration order that is actually supported (#1323).
+ * Launch alone only re-registers when the background signer helper is
+ * enabled; with the helper unregistered, launch first lands in an
+ * approval-gated state, so the guidance names the helper approval and the
+ * wait honestly. Single server-side source: every CLI surface that tells the
+ * operator how to re-register (the deactivation skew notice, the uninstall
+ * remediation note in server/src/cli/uninstall.ts, and the deploy-preflight
+ * refusal/override text) reads THIS constant, so the supported order cannot
+ * drift per surface. Mirrored wire text across languages: the value must
+ * stay byte-identical to the launch-through-complete span of
+ * SYSEXT_REREGISTRATION_GUIDANCE's Swift twin, the constant
+ * extensionVersionSkewGuidance in
+ * castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift (the
+ * merged #1323 sentence), whose comment pins this constant by name.
+ */
+export const SYSEXT_REREGISTRATION_GUIDANCE =
+  "launch Sanctuary-CastleWall.app at the console so its normal activation " +
+  "flow re-registers the extension, approve or re-enable the Sanctuary " +
+  "background helper if macOS prompts for it, wait for re-registration to " +
+  "complete";
 
 /**
  * Skew-notice preflight for the deactivation verb (graph row
  * defect.sysext-deactivation-extension-not-found): when the installed app's
  * embedded extension version differs from every activated record's version,
  * say so before submitting the request, so an operator who then sees a
- * refusal already knows the attended remediation (launch the app at the
- * console so its activation flow re-registers the extension, then re-run).
+ * refusal already knows the attended remediation (the supported order in
+ * SYSEXT_REREGISTRATION_GUIDANCE; never paraphrased here, so it cannot drift).
  * NOTICE ONLY: any probe failure degrades to silence, never to a block - a
  * diagnostic preflight must not add a failure mode to teardown, and the
  * notice never blocks or mutates anything.
@@ -4265,26 +4324,182 @@ async function emitSysextVersionSkewNotice(
     )();
     if (activated.length === 0) return;
     if (activated.includes(embedded)) return;
-    // Launch alone only re-registers when the background signer helper is
-    // enabled; with the helper unregistered, launch first lands in an
-    // approval-gated state, so the guidance names the helper approval and the
-    // wait honestly. The remediation sentence from "launch" through "then
-    // re-run" is mirrored wire text: must stay in agreement with
-    // extensionVersionSkewGuidance in
-    // castle-wall-macos/Sources/CastleWallHostApp/HeadlessFilterCLI.swift and
-    // the remediation note in server/src/cli/uninstall.ts.
+    // The remediation sentence is mirrored wire text; see the pins on
+    // SYSEXT_REREGISTRATION_GUIDANCE.
     write(
       err,
       `Notice: the installed Castle Wall app embeds system-extension version ${embedded} ` +
         `but the activated record is ${activated.join(", ")}. Deactivation proceeds; ` +
-        `if macOS refuses it, launch Sanctuary-CastleWall.app at the console so its ` +
-        `activation flow re-registers the extension, approve or re-enable the ` +
-        `Sanctuary background helper if macOS prompts for it, wait for ` +
-        `re-registration to complete, then re-run this command.\n`,
+        `if macOS refuses it, ${SYSEXT_REREGISTRATION_GUIDANCE}, then re-run this command.\n`,
     );
   } catch {
     // Notice-only: see the invariant above.
   }
+}
+
+/**
+ * Canonical deploy destination for the signed Castle Wall app. Must match
+ * DEFAULT_CASTLE_WALL_APP in server/src/cli/install.ts (importing it here
+ * would cycle: install.ts imports this module).
+ */
+const DEFAULT_DEPLOY_DEST_APP = "/Applications/Sanctuary-CastleWall.app";
+
+/**
+ * `sanctuary castle-wall deploy-preflight --app <bundle> [--dest <path>]
+ * [--allow-extension-skew]`: CHECK-ONLY preflight for replacing the signed
+ * Castle Wall app bundle (graph row
+ * defect.sysext-deactivation-extension-not-found). The verb performs no
+ * filesystem mutation of any kind - it never removes, renames, creates, or
+ * writes any file; copying the bundle into place stays with the operator's
+ * own deploy tooling. This verb only answers whether that copy would leave
+ * the app and the OS activated extension in step.
+ *
+ * The tripwire: when the OS holds an activated Castle Wall extension record
+ * whose CFBundleVersion differs from the version embedded in the INCOMING
+ * bundle, replacing the app on disk without a follow-up re-activation leaves
+ * the activated record describing an extension the app no longer carries,
+ * and the OS can then refuse that app's own later system-extension requests
+ * (including deactivation). The exit-2 refusal makes the operator choose a
+ * supported order explicitly before their tooling copies anything.
+ *
+ * ADVISORY-STRICT, not fail-closed: deploying the app is not a security
+ * boundary (the wall's enforcement gates live in the activation and arm
+ * paths), so an unreadable probe degrades to a loud warning and exit 0;
+ * only a POSITIVELY OBSERVED skew exits non-zero.
+ */
+export async function runDeployPreflight(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {},
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const platform = ctx.platform ?? process.platform;
+  const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
+  if (platform !== "darwin") {
+    write(err, "Error: castle-wall deploy-preflight is macOS-only.\n");
+    return 2;
+  }
+  if (!parsed.app) {
+    write(
+      err,
+      "Usage: sanctuary castle-wall deploy-preflight --app <signed .app " +
+        "bundle> [--dest <installed app path>] [--allow-extension-skew]\n",
+    );
+    return 2;
+  }
+  const sourceApp = isAbsolute(parsed.app)
+    ? parsed.app
+    : resolve(process.cwd(), parsed.app);
+  const destApp = parsed.dest
+    ? isAbsolute(parsed.dest)
+      ? parsed.dest
+      : resolve(process.cwd(), parsed.dest)
+    : DEFAULT_DEPLOY_DEST_APP;
+  // A missing incoming bundle is a usage-class error, never an "unreadable
+  // probe": a typo'd --app must refuse loudly, not warn and exit 0.
+  const sourceIsDir = await stat(sourceApp).then(
+    (info) => info.isDirectory(),
+    () => false,
+  );
+  if (!sourceIsDir) {
+    write(err, `Error: no app bundle at ${sourceApp}.\n`);
+    return 2;
+  }
+
+  const embedded = await (
+    ctx.embeddedSysextVersionProbe ?? defaultEmbeddedSysextVersionProbe
+  )(sourceApp);
+  const rawList = await (ctx.sysextListRawProbe ?? defaultSysextListRawProbe)();
+  if (embedded === null || rawList === null) {
+    // Advisory-strict (see the verb doc): an unreadable probe warns and
+    // exits 0. Refusing here would add a failure mode the tripwire cannot
+    // justify, and silently skipping the check would hide that it never ran;
+    // the warning names WHICH probe was unreadable so the operator can judge
+    // the gap.
+    const which =
+      embedded === null
+        ? `the embedded extension version in ${sourceApp}`
+        : "the OS activated-extension list";
+    write(
+      err,
+      `Warning: could not read ${which}; the extension-version preflight ` +
+        `cannot decide, and no skew was positively observed.\n`,
+    );
+    return 0;
+  }
+  // Version identity comes only from the column/team-bound parser shared
+  // with the deactivation skew notice; a weaker ad-hoc grep here would let a
+  // foreign-team or ambiguous row manufacture (or mask) a skew verdict.
+  const activated = parseActivatedCastleWallBundleVersions(rawList);
+  if (activated.length === 0) {
+    // An AFFIRMATIVE "no activated record" claim needs more than the strict
+    // parser returning nothing: that parser deliberately lets an ambiguous or
+    // malformed row contribute nothing (right for the advisory skew notice,
+    // where silence is the safe direction). Here silence would become a false
+    // positive claim of absence. So when the raw list still carries our
+    // bundle-id token, the outcome is INDETERMINATE and reported as an
+    // unreadable-record warning, never as absence.
+    if (rawList.includes(CASTLE_WALL_SYSTEM_EXTENSION_BUNDLE_ID)) {
+      write(
+        out,
+        `Warning: the OS activated-extension list mentions ` +
+          `${CASTLE_WALL_SYSTEM_EXTENSION_BUNDLE_ID} but the record could not ` +
+          `be strictly parsed; the extension-version preflight cannot decide, ` +
+          `and no skew was positively observed.\n`,
+      );
+      return 0;
+    }
+    write(
+      out,
+      `Preflight OK: the OS holds no activated Castle Wall system-extension ` +
+        `record, so no version skew is possible; this check does not ` +
+        `constrain replacing ${destApp}.\n`,
+    );
+    return 0;
+  }
+  if (activated.includes(embedded)) {
+    write(
+      out,
+      `Preflight OK: the incoming bundle embeds system-extension version ` +
+        `${embedded}, matching the OS activated record; replacing ${destApp} ` +
+        `keeps the app and the activated extension in step.\n`,
+    );
+    return 0;
+  }
+  if (parsed.allowExtensionSkew) {
+    // The override discloses exactly what it is overriding: the skew and its
+    // consequence, so a scripted override still leaves the truth in the
+    // transcript.
+    write(
+      err,
+      `Overriding the extension-version tripwire: accepting an incoming ` +
+        `bundle that embeds system-extension version ${embedded} while the ` +
+        `OS activated record is ${activated.join(", ")}. Until ` +
+        `re-registration completes, macOS can refuse that app's ` +
+        `system-extension requests against the older activated record; ` +
+        `after replacing the bundle, ${SYSEXT_REREGISTRATION_GUIDANCE}.\n`,
+    );
+    return 0;
+  }
+  // Refusal invariant: an app replaced at a different embedded-extension
+  // version without re-activation leaves the OS activation record describing
+  // the OLD extension, and the OS can then refuse the new app's own
+  // system-extension requests (including deactivation), so a positively
+  // observed skew exits 2 unless the operator names a supported order
+  // explicitly.
+  write(
+    err,
+    `Extension-version skew: the incoming bundle at ${sourceApp} embeds ` +
+      `system-extension version ${embedded} but the OS activated record is ` +
+      `${activated.join(", ")}. Replacing ${destApp} without re-activation ` +
+      `leaves the activated extension out of step with the app. Supported ` +
+      `orders: (a) re-run with --allow-extension-skew to accept the skew, ` +
+      `replace the bundle with your deploy tooling, then ` +
+      `${SYSEXT_REREGISTRATION_GUIDANCE}; or (b) deactivate the extension ` +
+      `first (sanctuary uninstall), then re-run this preflight.\n`,
+  );
+  return 2;
 }
 
 /**
@@ -5589,9 +5804,19 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
   const since = consumeFlagValue(fortress.argv, "--since");
   if (since.error !== undefined) return { ...parsed, parseError: since.error };
   if (since.value !== undefined) parsed.since = since.value;
+  // deploy-preflight value flags ride the same consumeFlagValue chokepoint as
+  // --fortress/--since (never a per-verb hand parser): a dropped value must
+  // refuse loudly, not silently check against a default path.
+  const app = consumeFlagValue(since.argv, "--app");
+  if (app.error !== undefined) return { ...parsed, parseError: app.error };
+  if (app.value !== undefined) parsed.app = app.value;
+  const dest = consumeFlagValue(app.argv, "--dest");
+  if (dest.error !== undefined) return { ...parsed, parseError: dest.error };
+  if (dest.value !== undefined) parsed.dest = dest.value;
+  const remaining = dest.argv;
 
-  for (let i = 0; i < since.argv.length; i++) {
-    const arg = since.argv[i]!;
+  for (let i = 0; i < remaining.length; i++) {
+    const arg = remaining[i]!;
     if (arg === "--ttl") {
       // Route through parseError rather than letting the parser throw: this loop
       // runs inside parseCastleWallArgs, the single chokepoint every castle-wall
@@ -5599,7 +5824,7 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
       // would skip writeCastleWallParseError and land in the top-level
       // `main().catch` handler instead (wrong exit code, "failed to start"
       // instead of a usage error).
-      const ttl = parseLeaseTtlSeconds(since.argv[++i]);
+      const ttl = parseLeaseTtlSeconds(remaining[++i]);
       if ("error" in ttl) return { ...parsed, parseError: ttl.error };
       parsed.ttlSeconds = ttl.value;
     } else if (arg.startsWith("--ttl=")) {
@@ -5613,11 +5838,13 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
       if ("error" in scope) return { ...parsed, parseError: scope.error };
       parsed.scope = scope.value;
     } else if (arg === "--scope") {
-      const scope = parseScope(since.argv[++i]);
+      const scope = parseScope(remaining[++i]);
       if ("error" in scope) return { ...parsed, parseError: scope.error };
       parsed.scope = scope.value;
     } else if (arg === "--force") {
       parsed.force = true;
+    } else if (arg === "--allow-extension-skew") {
+      parsed.allowExtensionSkew = true;
     } else if (arg === "--require-daemon") {
       parsed.requireDaemon = true;
     } else if (arg === "--allow-no-egress") {
@@ -5635,14 +5862,14 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
     } else if (arg.startsWith("--producer-pub-key=")) {
       parsed.producerPubKey = arg.slice("--producer-pub-key=".length);
     } else if (arg === "--producer-pub-key") {
-      parsed.producerPubKey = since.argv[++i];
+      parsed.producerPubKey = remaining[++i];
     } else if (arg.startsWith("--rule=")) {
       parsed.rule = arg.slice("--rule=".length);
     } else if (arg === "--rule") {
       // `--rule` requires a value. If the next token is missing or is itself a
       // flag, do NOT consume it - flag the omission so the caller emits a usage
       // error rather than silently falling back to the raw audit dump.
-      const next = since.argv[i + 1];
+      const next = remaining[i + 1];
       if (next === undefined || next.startsWith("-")) {
         parsed.ruleMissingValue = true;
       } else {
