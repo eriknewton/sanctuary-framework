@@ -139,6 +139,28 @@ describe("castle-wall deploy-preflight extension-version check", () => {
     expect(h.errText()).toBe("");
   });
 
+  it("warns (never claims absence) when our row exists but cannot be strictly parsed", async () => {
+    await makeBundles();
+    // A malformed Castle Wall row makes the strict parser contribute nothing.
+    // For the notice, silence is the safe direction; for an AFFIRMATIVE
+    // "no activated record" claim it would be a false disclosure - the
+    // preflight must report indeterminate instead.
+    const h = makeHarness({
+      embedded: "1472",
+      rawList: [
+        LIST_HEADER,
+        "*\t*\tYFQSWQ9BJN\tai.sanctuaryprotocol.macos.castle-wall (0.1.0/1421)\tCastle Wall\t[activated enabled deactivated]",
+      ].join("\n"),
+    });
+    const code = await runDeployPreflight(
+      ["--app", sourceApp, "--dest", destApp],
+      h.ctx,
+    );
+    expect(code).toBe(0);
+    expect(h.outText()).toContain("could not be strictly parsed");
+    expect(h.outText()).not.toContain("no activated Castle Wall system-extension record");
+  });
+
   it("--allow-extension-skew exits 0 through a skew and prints what it overrode", async () => {
     await makeBundles();
     const h = makeHarness({

@@ -4433,6 +4433,23 @@ export async function runDeployPreflight(
   // foreign-team or ambiguous row manufacture (or mask) a skew verdict.
   const activated = parseActivatedCastleWallBundleVersions(rawList);
   if (activated.length === 0) {
+    // An AFFIRMATIVE "no activated record" claim needs more than the strict
+    // parser returning nothing: that parser deliberately lets an ambiguous or
+    // malformed row contribute nothing (right for the advisory skew notice,
+    // where silence is the safe direction). Here silence would become a false
+    // positive claim of absence. So when the raw list still carries our
+    // bundle-id token, the outcome is INDETERMINATE and reported as an
+    // unreadable-record warning, never as absence.
+    if (rawList.includes(CASTLE_WALL_SYSTEM_EXTENSION_BUNDLE_ID)) {
+      write(
+        out,
+        `Warning: the OS activated-extension list mentions ` +
+          `${CASTLE_WALL_SYSTEM_EXTENSION_BUNDLE_ID} but the record could not ` +
+          `be strictly parsed; the extension-version preflight cannot decide, ` +
+          `and no skew was positively observed.\n`,
+      );
+      return 0;
+    }
     write(
       out,
       `Preflight OK: the OS holds no activated Castle Wall system-extension ` +
