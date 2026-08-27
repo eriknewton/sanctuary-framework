@@ -82,7 +82,7 @@ export interface SignedAttestation {
   signed_by: string;
   /** Ed25519 signature over canonical body (base64url) */
   signature: string;
-  /** Human-readable summary for social posting */
+  /** Presentation-only summary derived from body; verifiers reject any mismatch. */
   summary: string;
 }
 
@@ -382,6 +382,16 @@ export function verifyAttestation(
     }
   } catch (e: unknown) {
     errors.push(`Signature verification error: ${(e as Error).message}`);
+  }
+
+  // The shareable text is outside the signed region, so relying parties must
+  // derive it from the authenticated body rather than trust intermediary bytes.
+  try {
+    if (attestation.summary !== generateSummary(attestation.body)) {
+      errors.push("Attestation summary does not match signed body");
+    }
+  } catch (e: unknown) {
+    errors.push(`Attestation summary verification error: ${(e as Error).message}`);
   }
 
   // Refuse to surface a verified tier unless the signed body explicitly proves
