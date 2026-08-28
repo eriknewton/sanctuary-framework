@@ -74,6 +74,7 @@ import {
   flagValue,
   FORTRESS_FLAG_USAGE_EXIT_CODE,
   fortressFlagRefusalText,
+  hasFlag,
 } from "./argv.js";
 
 /**
@@ -92,16 +93,42 @@ const KNOWN_FEATURES = new Set<string>(ALL_ENTITLEMENT_FEATURE_FLAGS);
  * any of these alongside `--plan` is REFUSED (never silently overridden) —
  * fail-closed on ambiguous operator intent, mirroring AGENTS.md WHAT THESE
  * TOOLS MUST NEVER DO #5 (never silently degrade / pick a behavior the
- * operator didn't ask for). */
-const PLAN_FILLED_RAW_FLAGS = ["--tier", "--nodes", "--features", "--pricing-unit"] as const;
+ * operator didn't ask for). `--grace-days` is in this set: the preset fills
+ * it from the template's `defaultGraceDays`, so a raw `--grace-days` beside
+ * `--plan` is exactly as ambiguous as a raw `--tier` beside it, and must
+ * refuse the same way (previously this list omitted it, so `--grace-days`
+ * silently overrode the catalog default instead of refusing). `--period`
+ * deliberately stays OUT of this set: every plan supports the full
+ * `monthly | annual` range today, so it stays an explicit per-issuance
+ * choice, not catalog-filled data (see `PlanClaimTemplate`'s doc comment). */
+const PLAN_FILLED_RAW_FLAGS = [
+  "--tier",
+  "--nodes",
+  "--features",
+  "--pricing-unit",
+  "--grace-days",
+] as const;
 const SECONDS_PER_DAY = 86_400;
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
 }
 
-function hasFlag(argv: string[], name: string): boolean {
-  return argv.includes(name);
+/**
+ * Strict decimal-integer parser for operator-supplied counts. Matches ONLY
+ * canonical decimal syntax (no leading '+', no leading zeros besides a bare
+ * "0", no surrounding whitespace, no exponent notation, no decimal point)
+ * and then requires the parsed value to be a SAFE integer. `Number("1e3")`,
+ * `Number(" 5 ")`, and `Number("9007199254740993")` (an unsafe integer that
+ * silently rounds) would all pass a naive `Number.isInteger(Number(s))`
+ * check; this closes that gap so an operator-controlled string can never
+ * smuggle a non-canonical numeric form into a value that gets SIGNED into a
+ * license claim.
+ */
+function parseStrictNonNegativeInteger(value: string): number | null {
+  if (!/^(0|[1-9]\d*)$/.test(value)) return null;
+  const n = Number(value);
+  return Number.isSafeInteger(n) ? n : null;
 }
 
 /** Parse an ISO-8601 or Unix-seconds string to Unix seconds, or null if invalid. */
@@ -190,6 +217,11 @@ async function runIssue(
       return 1;
     }
     const planName: PlanName = flags.plan;
+    // Uses argv.ts's prefix-aware `hasFlag` (handles BOTH `--tier value` and
+    // `--tier=value`, in either order relative to `--plan`), NOT a bare
+    // `argv.includes(name)` — the `=` form parses fine via `flagValue` above,
+    // so a naive `includes` check would miss `--tier=fleet` and let a
+    // conflicting flag silently pass through unrefused.
     const conflicting = PLAN_FILLED_RAW_FLAGS.filter((name) => hasFlag(argv, name));
     if (conflicting.length > 0) {
       write(
@@ -200,20 +232,27 @@ async function runIssue(
       );
       return 1;
     }
+    const template = getPlanClaimTemplate(planName);
     let extraNodes = 0;
     if (flags.extraNodes !== undefined) {
-      const n = Number(flags.extraNodes);
-      if (!Number.isInteger(n) || n < 0) {
-        write(err, "issue: --extra-nodes must be a non-negative integer\n");
+      const n = parseStrictNonNegativeInteger(flags.extraNodes);
+      if (n === null || n > template.maxExtraNodes) {
+        write(
+          err,
+          `issue: --extra-nodes must be a non-negative integer up to ${template.maxExtraNodes}\n`,
+        );
         return 1;
       }
       extraNodes = n;
     }
-    const template = getPlanClaimTemplate(planName);
     flags.tier = template.tier;
     flags.nodes = String(template.entitledCount(extraNodes));
     flags.features = template.featureFlags.join(",");
     flags.pricingUnit = template.pricingUnit;
+    // D1: grace default stays the shipped default; filled explicitly from the
+    // catalog (not left to the CLI's own DEFAULT_GRACE_DAYS fallback below)
+    // so a future plan with a DIFFERENT defaultGraceDays is honored correctly.
+    flags.graceDays = String(template.defaultGraceDays);
   } else if (flags.extraNodes !== undefined) {
     // --extra-nodes has no meaning without --plan; refuse rather than
     // silently ignore an operator flag that looks like it should do something.
@@ -291,7 +330,7 @@ async function runIssue(
     if (!KNOWN_FEATURES.has(f)) {
       write(
         err,
-        `issue: unknown feature '${f}' (known: roster, policy-dist, kill-safety, console)\n`,
+        `issue: unknown feature '${f}' (known: ${ALL_ENTITLEMENT_FEATURE_FLAGS.join(", ")})\n`,
       );
       return 1;
     }
@@ -688,17 +727,21 @@ async function runRevoke(
   }
 }
 
+// USAGE renders --grace-days's default and the known --features list FROM the
+// catalog constants (not hand-mirrored literals) so this help text cannot
+// drift from ALL_ENTITLEMENT_FEATURE_FLAGS / DEFAULT_GRACE_DAYS in
+// plan-catalog.ts the way the pre-fix text did.
 const USAGE = `sanctuary license  -  fleet license issuance (Erik-operated)
 
 Usage:
   sanctuary license issue --tier <team|fleet|enterprise> --subject <id> \\
       --nodes <N|unlimited> --period <monthly|annual> --expires <ISO8601-or-unix> \\
-      [--grace-days 14] [--features roster,policy-dist,kill-safety,console] \\
+      [--grace-days ${DEFAULT_GRACE_DAYS}] [--features ${ALL_ENTITLEMENT_FEATURE_FLAGS.join(",")}] \\
       [--pricing-unit node|seat|fleet]
   sanctuary license issue --plan team --extra-nodes <N> --subject <id> \\
-      --period <monthly|annual> --expires <ISO8601-or-unix> [--grace-days 14]
-      (fills --tier/--nodes/--features/--pricing-unit from the plan; refuses
-       loudly if combined with any of those raw flags)
+      --period <monthly|annual> --expires <ISO8601-or-unix> [--grace-days ${DEFAULT_GRACE_DAYS}]
+      (fills --tier/--nodes/--features/--pricing-unit/--grace-days from the
+       plan; refuses loudly if combined with any of those raw flags)
   sanctuary license list [--json]
   sanctuary license revoke <licenseId> [--reason <text>]
 

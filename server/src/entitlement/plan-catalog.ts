@@ -58,6 +58,20 @@ export const ALL_ENTITLEMENT_FEATURE_FLAGS: readonly EntitlementFeatureFlag[] =
 export const TEAM_INCLUDED_NODES = 10;
 
 /**
+ * The largest `--extra-nodes` purchase the Team plan will accept. DERIVED,
+ * not a bare literal: the resulting `entitledCount` is signed into a v2
+ * license claim (`entitlement/token.ts`) and persisted in the tamper-evident
+ * issuance ledger, so `TEAM_INCLUDED_NODES + extraNodes` must never exceed
+ * `Number.MAX_SAFE_INTEGER` -- past that boundary a double can represent an
+ * integer VALUE that is not the unique representable integer any more (two
+ * different mathematical counts can round to the same float64, or a value
+ * can round-trip differently through JSON on a different engine), which
+ * would let an operator-supplied `--extra-nodes` produce a claim whose
+ * signed node count is not the count the operator actually typed.
+ */
+export const TEAM_MAX_EXTRA_NODES = Number.MAX_SAFE_INTEGER - TEAM_INCLUDED_NODES;
+
+/**
  * Default grace-period length in days when neither `--grace-days` nor a plan
  * fills it. 14 = the shipped grace default, UNCHANGED by this slice (Slice-0
  * note D1: "grace default stays the shipped 14-day default"). Single-sourced
@@ -98,20 +112,32 @@ export interface PlanClaimTemplate {
   readonly pricingUnit: PricingUnit;
   readonly featureFlags: readonly EntitlementFeatureFlag[];
   readonly defaultGraceDays: number;
+  /** The largest `--extra-nodes` this plan will accept (see
+   * `TEAM_MAX_EXTRA_NODES`'s derivation comment for why this bound exists).
+   * A caller (the CLI) validates against this BEFORE calling
+   * `entitledCount`, so the operator sees the bound in the refusal message
+   * rather than a generic overflow error. */
+  readonly maxExtraNodes: number;
   /**
    * Overage math: the total entitled node count for a given `--extra-nodes`
-   * purchase past the plan's included floor. Throws on a negative or
-   * non-integer input — a caller (the CLI) validates `extraNodes` first, so
-   * reaching this with a bad value is a caller bug that must fail loud, not
-   * silently coerce to a wrong node count.
+   * purchase past the plan's included floor. Throws on a non-safe-integer,
+   * negative, or over-`maxExtraNodes` input — a caller (the CLI) validates
+   * `extraNodes` first, so reaching this with a bad value is a caller bug
+   * that must fail loud, never silently coerce to a wrong (or unsafely
+   * rounded) node count that then gets SIGNED into a license claim.
    */
   entitledCount(extraNodes: number): number;
 }
 
 function teamEntitledCount(extraNodes: number): number {
-  if (!Number.isInteger(extraNodes) || extraNodes < 0) {
+  if (
+    !Number.isSafeInteger(extraNodes) ||
+    extraNodes < 0 ||
+    extraNodes > TEAM_MAX_EXTRA_NODES
+  ) {
     throw new RangeError(
-      `extraNodes must be a non-negative integer, got ${extraNodes}`,
+      `extraNodes must be a safe non-negative integer no greater than ` +
+        `${TEAM_MAX_EXTRA_NODES}, got ${extraNodes}`,
     );
   }
   return TEAM_INCLUDED_NODES + extraNodes;
@@ -130,6 +156,7 @@ export const PLAN_CATALOG: Readonly<Record<PlanName, PlanClaimTemplate>> =
       pricingUnit: "node",
       featureFlags: ALL_ENTITLEMENT_FEATURE_FLAGS,
       defaultGraceDays: DEFAULT_GRACE_DAYS,
+      maxExtraNodes: TEAM_MAX_EXTRA_NODES,
       entitledCount: teamEntitledCount,
     }),
   });

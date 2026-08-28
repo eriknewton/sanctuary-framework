@@ -15,6 +15,7 @@ import {
   PLAN_CATALOG,
   PLAN_NAMES,
   TEAM_INCLUDED_NODES,
+  TEAM_MAX_EXTRA_NODES,
   getPlanClaimTemplate,
   isPlanName,
 } from "../../src/entitlement/plan-catalog.js";
@@ -79,6 +80,30 @@ describe("plan-catalog — overage math (entitledCount)", () => {
     expect(() => template.entitledCount(1.5)).toThrow(RangeError);
     expect(() => template.entitledCount(Number.NaN)).toThrow(RangeError);
   });
+
+  it("TEAM_MAX_EXTRA_NODES is DERIVED as MAX_SAFE_INTEGER - TEAM_INCLUDED_NODES, not a bare literal (round-2 finding, register id EFC-01)", () => {
+    expect(TEAM_MAX_EXTRA_NODES).toBe(Number.MAX_SAFE_INTEGER - TEAM_INCLUDED_NODES);
+    expect(getPlanClaimTemplate("team").maxExtraNodes).toBe(TEAM_MAX_EXTRA_NODES);
+    // The bound exists so the SUM never exceeds MAX_SAFE_INTEGER.
+    expect(TEAM_INCLUDED_NODES + TEAM_MAX_EXTRA_NODES).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it("entitledCount accepts extraNodes exactly AT maxExtraNodes (inclusive bound, sum is the safe-integer ceiling)", () => {
+    const template = getPlanClaimTemplate("team");
+    expect(template.entitledCount(TEAM_MAX_EXTRA_NODES)).toBe(Number.MAX_SAFE_INTEGER);
+    expect(Number.isSafeInteger(template.entitledCount(TEAM_MAX_EXTRA_NODES))).toBe(true);
+  });
+
+  it("entitledCount rejects extraNodes one past maxExtraNodes and rejects an unsafe-integer input outright", () => {
+    const template = getPlanClaimTemplate("team");
+    expect(() => template.entitledCount(TEAM_MAX_EXTRA_NODES + 1)).toThrow(RangeError);
+    // Number.MAX_SAFE_INTEGER + 1 is still `Number.isInteger`-true but NOT
+    // `Number.isSafeInteger`-true — this is exactly the class the finding
+    // named (an unsafe integer that a naive isInteger check would accept).
+    expect(Number.isInteger(Number.MAX_SAFE_INTEGER + 1)).toBe(true);
+    expect(Number.isSafeInteger(Number.MAX_SAFE_INTEGER + 1)).toBe(false);
+    expect(() => template.entitledCount(Number.MAX_SAFE_INTEGER + 1)).toThrow(RangeError);
+  });
 });
 
 describe("plan-catalog — immutability (catalog snapshot)", () => {
@@ -110,6 +135,7 @@ describe("plan-catalog — barrel parity (server/src/entitlement/index.ts)", () 
       ALL_ENTITLEMENT_FEATURE_FLAGS,
     );
     expect(entitlementBarrel.TEAM_INCLUDED_NODES).toBe(TEAM_INCLUDED_NODES);
+    expect(entitlementBarrel.TEAM_MAX_EXTRA_NODES).toBe(TEAM_MAX_EXTRA_NODES);
     expect(entitlementBarrel.DEFAULT_GRACE_DAYS).toBe(DEFAULT_GRACE_DAYS);
   });
 });
