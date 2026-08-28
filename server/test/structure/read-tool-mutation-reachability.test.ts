@@ -413,12 +413,12 @@ const GATED_KINDS = new Set(["mutation", "subprocess"]);
 // measurement and this corpus's count has been restated twice. Method: run the
 // corpus against a resolver with the expanded-set classification pass disabled,
 // and count the must-fail fixtures (those with a non-empty `expect`) whose
-// resolved primitive set becomes empty. Re-measured after the wrapper and
-// numeric-key repair, on the corpus as it stands: 40 of 52 must-fail fixtures
-// flip; all 8 must-stay-clean fixtures remain clean. Survivors resolve through
-// another independent route to the same primitive and remain useful pins: a
-// shape closed by one mechanism is exactly the shape a refactor of another
-// mechanism can reopen.
+// resolved primitive set becomes empty. Re-measured after the nested
+// reflective-argument repair, on the corpus as it stands: 40 of 53 must-fail
+// fixtures flip; all 9 must-stay-clean fixtures remain clean. Survivors resolve
+// through another independent route to the same primitive and remain useful
+// pins: a shape closed by one mechanism is exactly the shape a refactor of
+// another mechanism can reopen.
 //
 // They drive the SHIPPING resolver (`createCalleeResolver`) over a synthetic
 // program, not a copy of it, so a resolver change cannot pass here and regress
@@ -1114,6 +1114,34 @@ import { execSync } from "node:child_process";
 type Invoke = (target: unknown, thisArg: unknown, command: unknown) => unknown;
 export function launder(command: string): void {
   (Function.prototype.call as unknown as Invoke)(execSync, null, command);
+}
+`,
+  },
+  {
+    what: "a nested reflective call with a literal invoked-argument vector",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+export function launder(command: string): void {
+  Reflect.apply(
+    Function.prototype.call,
+    Function.prototype.call,
+    ([execSync, null, command] as const),
+  );
+}
+`,
+  },
+  {
+    what: "a nested reflective call over a read-only primitive (must stay clean)",
+    expect: [],
+    code: `
+import { readFileSync } from "node:fs";
+export function launder(path: string): void {
+  Reflect.apply(
+    Function.prototype.call,
+    Function.prototype.call,
+    ([readFileSync, null, path, "utf8"] as const),
+  );
 }
 `,
   },
