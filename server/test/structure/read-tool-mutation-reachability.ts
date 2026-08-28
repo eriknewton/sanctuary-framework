@@ -161,9 +161,10 @@
  *     access on a namespace import; a callee the call site does not name at
  *     all; an optional call; the five type-only wrappers (`as`, `satisfies`,
  *     parentheses, `!`, and the angle-bracket assertion) on an initializer AND
- *     at the call site; `.call`; `.apply`; `Reflect.apply`; a function handed
- *     over as a VALUE at a call site rather than called at it; and those
- *     composed with any receiver shape above.
+ *     at the call site; `.call`; `.apply`; `Reflect.apply`; nested reflection
+ *     carrying a wrapper-unwrapped, spread-free literal argument vector; a
+ *     function handed over as a VALUE at a call site rather than called at it;
+ *     and those composed with any receiver shape above.
  *
  *     TWO MORE INVOCATION SITES ARE NOW VISITED, and they are reach rather than
  *     resolution, so they are not fixture-pinnable in the corpus (which
@@ -965,29 +966,69 @@ function unwrapTypeOnly(
  *      in no sink set and lives outside `src`, so the primitive underneath goes
  *      unclassified AND unwalked: `execSync.call(null, "id")` spawns a
  *      subprocess and reports nothing at all. The receiver, or for
- *      `Reflect.apply` the first argument, is where the target survives.
+ *      `Reflect.apply` the first argument, is where the target survives. When
+ *      that target is itself reflective, its invoked arguments are propagated
+ *      only when they are statically present: direct spread-free `.call`
+ *      arguments, or a wrapper-unwrapped, spread-free literal array for either
+ *      apply form. No dynamic argument inference is attempted.
  *
  * The receiver is passed on AS WRITTEN. Its own wrappers are stripped by rule 1
  * when this function runs again on it, which is also what keeps the `!` case
- * above working.
+ * above working. Nested targets consume the same reflective-hop budget, and a
+ * refused next hop remains a `reflective_hops` truncation.
  */
+interface IndirectTarget {
+  readonly callee: ts.Expression;
+  readonly args: readonly ts.Expression[];
+}
+
+function literalArgumentVector(
+  expression: ts.Expression | undefined,
+  onTruncation?: TruncationRecorder,
+): readonly ts.Expression[] | undefined {
+  if (expression === undefined) return undefined;
+  const unwrapped = unwrapTypeOnly(expression, onTruncation);
+  if (!ts.isArrayLiteralExpression(unwrapped)) return undefined;
+  if (
+    unwrapped.elements.some(
+      (element) => ts.isSpreadElement(element) || ts.isOmittedExpression(element),
+    )
+  ) {
+    return undefined;
+  }
+  return unwrapped.elements as readonly ts.Expression[];
+}
+
 function indirectTargets(
   callee: ts.Expression,
   args: readonly ts.Expression[],
   onTruncation?: TruncationRecorder,
-): ts.Expression[] {
-  const out: ts.Expression[] = [];
+): IndirectTarget[] {
+  const out: IndirectTarget[] = [];
   const stripped = unwrapTypeOnly(callee, onTruncation);
-  if (stripped !== callee) out.push(stripped);
+  if (stripped !== callee) out.push({ callee: stripped, args });
   if (ts.isPropertyAccessExpression(callee) || ts.isPropertyAccessChain(callee)) {
     const member = callee.name.text;
     const receiver = unwrapTypeOnly(callee.expression, onTruncation);
     const isReflect = ts.isIdentifier(receiver) && receiver.text === "Reflect";
     if (member === "apply" && isReflect) {
       const first = args[0];
-      if (first !== undefined) out.push(first);
-    } else if (member === "call" || member === "apply") {
-      out.push(callee.expression);
+      if (first !== undefined) {
+        out.push({
+          callee: first,
+          args: literalArgumentVector(args[2], onTruncation) ?? [],
+        });
+      }
+    } else if (member === "apply") {
+      out.push({
+        callee: callee.expression,
+        args: literalArgumentVector(args[1], onTruncation) ?? [],
+      });
+    } else if (member === "call") {
+      out.push({
+        callee: callee.expression,
+        args: args.slice(1).some(ts.isSpreadElement) ? [] : args.slice(1),
+      });
     }
   }
   return out;
@@ -1572,9 +1613,12 @@ export function createCalleeResolver(
     const functionValues = functionValuedArguments(args);
     if (hop < MAX_REFLECTIVE_HOPS) {
       for (const target of indirect) {
-        // An indirect target is the FUNCTION being invoked, not another call
-        // expression, so it carries no arguments of its own to pass down.
-        const nested = resolveAt(target, calleeName(target), [], hop + 1);
+        const nested = resolveAt(
+          target.callee,
+          calleeName(target.callee),
+          target.args,
+          hop + 1,
+        );
         sinks.push(...nested.sinks);
         if (nested.classified) classified = true;
         walkTargets.push(...nested.walkTargets.filter((decl) => !walkTargets.includes(decl)));
