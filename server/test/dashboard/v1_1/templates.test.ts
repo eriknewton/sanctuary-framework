@@ -16,16 +16,20 @@ import {
 import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
 
 /**
- * Extracts the key set of the client's `TEMPLATES` mirror map by parsing
- * the embedded client script string (the client is plain TS-as-string;
- * there is no importable client TEMPLATES export to compare against
- * directly). Matches top-level `"key.name": (` / `"key.name": ()` entries
- * inside the `const TEMPLATES = { ... };` block, the same shape every
- * entry in that map uses.
+ * Extracts the key set of the client's `TEMPLATES` mirror map by
+ * EVALUATING the map literal from the embedded client script (the client
+ * is plain TS-as-string; there is no importable client TEMPLATES export).
+ * Evaluating the real object literal, rather than regex-matching entry
+ * spellings, means any entry syntax that parses contributes its key, so a
+ * differently-written entry cannot evade the parity check. The entry
+ * VALUES are arrow functions that are never invoked here, so no client
+ * helper stubs are needed; slicing failures throw rather than returning
+ * an empty set (fail-loud, never a vacuous pass).
  */
 function extractClientTemplateIds(): string[] {
   const script = getClientScript();
-  const start = script.indexOf("const TEMPLATES = {");
+  const marker = "const TEMPLATES = {";
+  const start = script.indexOf(marker);
   if (start === -1) {
     throw new Error("client TEMPLATES map not found in embedded script");
   }
@@ -33,12 +37,15 @@ function extractClientTemplateIds(): string[] {
   if (end === -1) {
     throw new Error("client TEMPLATES map close brace not found");
   }
-  const block = script.slice(start, end);
-  const ids: string[] = [];
-  const re = /^\s*"([a-zA-Z0-9_.]+)":\s*\(/gm;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(block))) {
-    ids.push(m[1]);
+  // Reconstruct the full object literal and evaluate it. The block text
+  // between the marker and the close brace is the literal's body.
+  const objectLiteral =
+    "{" + script.slice(start + marker.length, end) + "\n}";
+  const evaluated = new Function(`"use strict"; return (${objectLiteral});`)() as
+    Record<string, unknown>;
+  const ids = Object.keys(evaluated);
+  if (ids.length === 0) {
+    throw new Error("client TEMPLATES map evaluated to an empty object");
   }
   return ids.sort();
 }
