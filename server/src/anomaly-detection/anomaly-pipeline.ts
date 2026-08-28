@@ -358,11 +358,16 @@ export class AnomalyPipelineDispatcher {
    * detector. Emits ANOMALY_CLASSIFIER_SUBSCRIBED on success. The
    * factory is called with the fortress AnomalyContext so the
    * classifier can build its own state-store binding. Idempotent: a
-   * second call with the same classifierId returns false.
+   * second call with the same classifierId returns false. The factory
+   * may be async (IC-29: the CUSUM entry reads persisted threshold
+   * overrides before construction), so its result is always awaited
+   * even when the factory itself is synchronous.
    */
   async addClassifierToDetector(
     detectorId: string,
-    factory: (context: AnomalyContext) => AnomalyClassifier,
+    factory: (
+      context: AnomalyContext,
+    ) => AnomalyClassifier | Promise<AnomalyClassifier>,
   ): Promise<boolean> {
     const detector = this.detectors.get(detectorId);
     if (!detector) return false;
@@ -373,7 +378,7 @@ export class AnomalyPipelineDispatcher {
       masterKey: this.masterKey,
       now: this.now,
     };
-    const classifier = factory(context);
+    const classifier = await factory(context);
     const added = detector.addClassifier(classifier);
     if (!added) return false;
     void this.auditLog.append(

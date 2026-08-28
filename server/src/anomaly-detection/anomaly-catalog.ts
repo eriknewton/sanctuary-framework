@@ -58,6 +58,8 @@ import { CUSUM_CLASSIFIER_ID, CusumClassifier } from "./classifiers/cusum.js";
 import { PSI_CLASSIFIER_ID, PsiClassifier } from "./classifiers/psi.js";
 import { ClassifierStateStore } from "./classifier-state-store.js";
 import type { AnomalyClassifier, AnomalyContext, AnomalyDetector } from "./types.js";
+import { ThresholdConfigStore } from "../auto-trigger/threshold-config-store.js";
+import { anomalyRuleId } from "../auto-trigger/types.js";
 
 /**
  * One detector + classifier combination. The detectorId + classifierId
@@ -75,9 +77,52 @@ export interface AnomalyCatalogEntry {
   factory: () => AnomalyDetector;
   /**
    * Factory for classifier-specific subscriptions when the detector is
-   * already active under another classifier tuple.
+   * already active under another classifier tuple. May return a
+   * Promise: constructing a classifier can require reading the
+   * operator's persisted `ThresholdOverrides` for this rule first (see
+   * the CUSUM entry below), which is an async storage read.
    */
-  classifierFactory?: (context: AnomalyContext) => AnomalyClassifier;
+  classifierFactory?: (
+    context: AnomalyContext,
+  ) => AnomalyClassifier | Promise<AnomalyClassifier>;
+}
+
+/**
+ * Read this rule's persisted `warn_sigma`/`alert_sigma` overrides (if
+ * any) and validate them to finite positive numbers -- an absent,
+ * malformed, or non-positive override is dropped so the caller falls
+ * back to the classifier's own compiled-in default rather than ever
+ * widening detection (IC-29: "an absent/partial override never widens
+ * detection, fail toward the existing defaults, never toward
+ * silence"). `ThresholdConfigStore.get()` itself already resolves a
+ * corrupt/undecryptable record to `null`, so a storage or crypto
+ * failure here also falls through to "no override" rather than
+ * throwing.
+ */
+async function loadValidatedSigmaOverrides(
+  context: AnomalyContext,
+  detectorId: string,
+  classifierId: string,
+): Promise<{ warnSigma?: number; alertSigma?: number }> {
+  const store = new ThresholdConfigStore({
+    storage: context.storage,
+    masterKey: context.masterKey,
+    fortressId: context.fortressId,
+    now: context.now,
+  });
+  const config = await store.get(anomalyRuleId(detectorId, classifierId));
+  const overrides = config?.threshold_overrides;
+  if (!overrides) return {};
+  const warnSigma = positiveFiniteOrUndefined(overrides.warn_sigma);
+  const alertSigma = positiveFiniteOrUndefined(overrides.alert_sigma);
+  return {
+    ...(warnSigma !== undefined ? { warnSigma } : {}),
+    ...(alertSigma !== undefined ? { alertSigma } : {}),
+  };
+}
+
+function positiveFiniteOrUndefined(n: number | undefined): number | undefined {
+  return n !== undefined && Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
 /**
@@ -102,15 +147,37 @@ export const ANOMALY_CATALOG: AnomalyCatalogEntry[] = [
     description:
       "Per-agent CUSUM drift detector over the same per-agent activity feature stream. Catches slow mean shifts that single-sample baselines may miss.",
     factory: () => new PerAgentActivityDetector(),
-    classifierFactory: (context) =>
-      new CusumClassifier({
+    // Mapping derivation (IC-29): CusumClassifierOptions exposes exactly
+    // two sigma-unit knobs, `k` ("sensitivity slack, in sigma units")
+    // and `h` ("decision threshold, in sigma units"), and the class doc
+    // itself names h as the alert boundary verbatim -- "Alert fires
+    // when max(C+, C-) crosses h*sigma" -- so `alert_sigma` maps to `h`
+    // by a direct terminology match. `k` is the only remaining
+    // sigma-unit knob, governing how much a sample must deviate before
+    // it starts accumulating toward that alert boundary (the
+    // "early-warning" slack), so `warn_sigma` maps to `k` by
+    // elimination + unit match. This side (the catalog, not the CLI or
+    // the classifier) owns the mapping; CusumClassifier still owns the
+    // `?? DEFAULT_CUSUM_K` / `?? DEFAULT_CUSUM_H` fallback, so an
+    // absent or invalid override reaches the constructor as `undefined`
+    // and never overrides the default.
+    classifierFactory: async (context) => {
+      const { warnSigma, alertSigma } = await loadValidatedSigmaOverrides(
+        context,
+        PER_AGENT_ACTIVITY_DETECTOR_ID,
+        CUSUM_CLASSIFIER_ID,
+      );
+      return new CusumClassifier({
         stateStore: new ClassifierStateStore({
           storage: context.storage,
           masterKey: context.masterKey,
           fortressId: context.fortressId,
           now: context.now,
         }),
-      }),
+        ...(warnSigma !== undefined ? { k: warnSigma } : {}),
+        ...(alertSigma !== undefined ? { h: alertSigma } : {}),
+      });
+    },
   },
   {
     detectorId: PER_AGENT_ACTIVITY_DETECTOR_ID,
