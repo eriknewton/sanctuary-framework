@@ -369,9 +369,17 @@ function arg(args, kind, fallback) {
   return fallback;
 }
 
+// Cross-file contract: every key here must have a matching key in the
+// server TEMPLATES registry in templates.ts (this map is a mirror of that
+// registry). Enforced by the full-set parity test in
+// test/dashboard/v1_1/templates.test.ts; a key present only here is a
+// client orphan, a key present only in templates.ts falls through to
+// "[unrecognized template: ...]" on a live operator-facing card.
 const TEMPLATES = {
   "approval_pending.tier1.lockdown": (a) => "Cut agent " + arg(a,"agent_id") + "'s network access. The agent keeps running and keeps local access; it stops reaching anything off this machine.",
   "approval_pending.tier1.fortress_lockdown": () => "Lockdown approval pending. Approving revokes network access for confined agents. Agents keep running and keep local access; off-machine reachability is cut when Castle Wall reloads.",
+  // Must match "approval_pending.tier1.fortress_exit_bundle_export" in templates.ts.
+  "approval_pending.tier1.fortress_exit_bundle_export": () => "Export the entire fortress as a portable exit bundle.",
   "approval_pending.tier1.unwrap": (a) => "Unwrap request for agent " + arg(a,"agent_id") + ". This build refuses unsupported unwraps before approval is queued.",
   "approval_pending.tier1.policy_change": (a) => "Bind agent " + arg(a,"agent_id") + " to policy " + arg(a,"policy_id") + ".",
   "approval_pending.tier1.policy_change_template": (a) => "Bind agent " + arg(a,"agent_id") + " to template " + arg(a,"policy_id") + ".",

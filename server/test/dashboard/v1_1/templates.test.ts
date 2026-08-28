@@ -13,6 +13,35 @@ import {
   renderTemplate,
   listRegisteredTemplateIds,
 } from "../../../src/dashboard/v1_1/templates.js";
+import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
+
+/**
+ * Extracts the key set of the client's `TEMPLATES` mirror map by parsing
+ * the embedded client script string (the client is plain TS-as-string;
+ * there is no importable client TEMPLATES export to compare against
+ * directly). Matches top-level `"key.name": (` / `"key.name": ()` entries
+ * inside the `const TEMPLATES = { ... };` block, the same shape every
+ * entry in that map uses.
+ */
+function extractClientTemplateIds(): string[] {
+  const script = getClientScript();
+  const start = script.indexOf("const TEMPLATES = {");
+  if (start === -1) {
+    throw new Error("client TEMPLATES map not found in embedded script");
+  }
+  const end = script.indexOf("\n};", start);
+  if (end === -1) {
+    throw new Error("client TEMPLATES map close brace not found");
+  }
+  const block = script.slice(start, end);
+  const ids: string[] = [];
+  const re = /^\s*"([a-zA-Z0-9_.]+)":\s*\(/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(block))) {
+    ids.push(m[1]);
+  }
+  return ids.sort();
+}
 
 describe("v1.1 dashboard template registry", () => {
   it("renders a known template with typed args", () => {
@@ -130,6 +159,30 @@ describe("v1.1 dashboard template registry", () => {
       { kind: "agent_id", value: "secret-agent-xyz" },
     ]);
     expect(out).not.toContain("secret-agent-xyz");
+  });
+
+  it("keeps the client TEMPLATES mirror (client.ts) in full-set parity with the server registry (IC-24)", () => {
+    // Full-set equality in BOTH directions: a server template with no
+    // client mirror falls through to "[unrecognized template: ...]" on a
+    // live operator-facing approval or activity card (the IC-24 shape);
+    // a client-only orphan is dead code masquerading as a live template.
+    // A test that only samples a handful of ids (as the rest of this file
+    // deliberately does, per rule 5 in AGENTS.md) cannot catch a single
+    // missing entry in a 60-entry registry; only a full-set diff can.
+    const serverIds = listRegisteredTemplateIds();
+    const clientIds = extractClientTemplateIds();
+
+    const missingFromClient = serverIds.filter((id) => !clientIds.includes(id));
+    const orphanedInClient = clientIds.filter((id) => !serverIds.includes(id));
+
+    expect(
+      missingFromClient,
+      `template ids registered on the server but missing from the client mirror: ${missingFromClient.join(", ")}`,
+    ).toEqual([]);
+    expect(
+      orphanedInClient,
+      `template ids in the client mirror with no server registry entry: ${orphanedInClient.join(", ")}`,
+    ).toEqual([]);
   });
 
   it("renders the fortress lockdown approval template with consequences", () => {

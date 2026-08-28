@@ -88,6 +88,11 @@ function shortTime(iso: string | null): string {
 // Template registry
 // ─────────────────────────────────────────────────────────────────────────
 
+// Cross-file contract: every key in this registry must have a matching key
+// in the client TEMPLATES map in client.ts (mirror of server templates.ts,
+// ~line 372). Enforced by the full-set parity test in templates.test.ts;
+// a key present here but absent there falls through to
+// "[unrecognized template: ...]" on a live operator-facing card.
 const TEMPLATES: Record<string, TemplateRenderer> = {
   // ── approval_pending.tier1.* ─────────────────────────────────────────
   "approval_pending.tier1.lockdown": (a) =>
