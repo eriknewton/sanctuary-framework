@@ -13,6 +13,42 @@ import {
   renderTemplate,
   listRegisteredTemplateIds,
 } from "../../../src/dashboard/v1_1/templates.js";
+import { getClientScript } from "../../../src/dashboard/v1_1/client.js";
+
+/**
+ * Extracts the key set of the client's `TEMPLATES` mirror map by
+ * EVALUATING the map literal from the embedded client script (the client
+ * is plain TS-as-string; there is no importable client TEMPLATES export).
+ * Evaluating the real object literal, rather than regex-matching entry
+ * spellings, means any entry syntax that parses contributes its key, so a
+ * differently-written entry cannot evade the parity check. The entry
+ * VALUES are arrow functions that are never invoked here, so no client
+ * helper stubs are needed; slicing failures throw rather than returning
+ * an empty set (fail-loud, never a vacuous pass).
+ */
+function extractClientTemplateIds(): string[] {
+  const script = getClientScript();
+  const marker = "const TEMPLATES = {";
+  const start = script.indexOf(marker);
+  if (start === -1) {
+    throw new Error("client TEMPLATES map not found in embedded script");
+  }
+  const end = script.indexOf("\n};", start);
+  if (end === -1) {
+    throw new Error("client TEMPLATES map close brace not found");
+  }
+  // Reconstruct the full object literal and evaluate it. The block text
+  // between the marker and the close brace is the literal's body.
+  const objectLiteral =
+    "{" + script.slice(start + marker.length, end) + "\n}";
+  const evaluated = new Function(`"use strict"; return (${objectLiteral});`)() as
+    Record<string, unknown>;
+  const ids = Object.keys(evaluated);
+  if (ids.length === 0) {
+    throw new Error("client TEMPLATES map evaluated to an empty object");
+  }
+  return ids.sort();
+}
 
 describe("v1.1 dashboard template registry", () => {
   it("renders a known template with typed args", () => {
@@ -130,6 +166,30 @@ describe("v1.1 dashboard template registry", () => {
       { kind: "agent_id", value: "secret-agent-xyz" },
     ]);
     expect(out).not.toContain("secret-agent-xyz");
+  });
+
+  it("keeps the client TEMPLATES mirror (client.ts) in full-set parity with the server registry (IC-24)", () => {
+    // Full-set equality in BOTH directions: a server template with no
+    // client mirror falls through to "[unrecognized template: ...]" on a
+    // live operator-facing approval or activity card (the IC-24 shape);
+    // a client-only orphan is dead code masquerading as a live template.
+    // A test that only samples a handful of ids (as the rest of this file
+    // deliberately does, per rule 5 in AGENTS.md) cannot catch a single
+    // missing entry in a 60-entry registry; only a full-set diff can.
+    const serverIds = listRegisteredTemplateIds();
+    const clientIds = extractClientTemplateIds();
+
+    const missingFromClient = serverIds.filter((id) => !clientIds.includes(id));
+    const orphanedInClient = clientIds.filter((id) => !serverIds.includes(id));
+
+    expect(
+      missingFromClient,
+      `template ids registered on the server but missing from the client mirror: ${missingFromClient.join(", ")}`,
+    ).toEqual([]);
+    expect(
+      orphanedInClient,
+      `template ids in the client mirror with no server registry entry: ${orphanedInClient.join(", ")}`,
+    ).toEqual([]);
   });
 
   it("renders the fortress lockdown approval template with consequences", () => {
