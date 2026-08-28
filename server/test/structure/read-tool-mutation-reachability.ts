@@ -109,9 +109,10 @@
  *     is used, the number is unchanged by the laundering closure below: it is a
  *     different class and closing one does not touch the other.
  *   - An interface OR base-class member call IS followed into matching members
- *     on every source-local class below it in the heritage graph. Heritage
- *     edges are keyed by checker symbols rather than bare names, so unrelated
- *     declarations named `Base` cannot contaminate one another; the walk is
+ *     on every source-local named class declaration below it in the heritage
+ *     graph. Heritage edges are keyed by checker symbols rather than bare
+ *     names, so unrelated declarations named `Base` cannot contaminate one
+ *     another; the walk is
  *     transitive and includes every subclass rather than choosing one concrete
  *     target. Both method signatures (`save(x): void`) and function-typed
  *     property signatures (`save: (x) => void`) are covered. THE INTERFACE
@@ -1640,8 +1641,8 @@ export function walkForSinks(
 }
 
 /**
- * Build the source-local lookup used to expand interface and base-class
- * members into every syntactic override beneath them.
+ * Build the source-local lookup used to expand members of named interface and
+ * class declarations into every syntactic override beneath them.
  *
  * Heritage edges are keyed by checker symbols, never by the text of the
  * heritage expression. Two modules can each declare `Base`, and an override of
