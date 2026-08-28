@@ -15,6 +15,7 @@ import {
 } from "../operational/audit-log.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { resolveStoragePath } from "../paths.js";
+import { consumeFlagValue } from "./argv.js";
 
 export interface AuditCommandArgs {
   argv: string[];
@@ -169,12 +170,22 @@ export function parseSearchOptions(argv: string[]): SearchOptions {
   let fortress: string | undefined;
   let passphrase: string | undefined;
 
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i]!;
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; a search run against
+  // the wrong fortress is a constraint-5 violation, not merely a UX papercut.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    throw new Error(consumedFortress.error);
+  }
+  fortress = consumedFortress.value;
+  const filteredArgv = consumedFortress.argv;
+
+  for (let i = 0; i < filteredArgv.length; i++) {
+    const arg = filteredArgv[i]!;
     if (arg === "--json") {
       json = true;
     } else if (arg === "--type") {
-      for (const type of requireValue(argv, ++i, "--type").split(",")) {
+      for (const type of requireValue(filteredArgv, ++i, "--type").split(",")) {
         if (type.trim()) types.push(type.trim());
       }
     } else if (arg.startsWith("--type=")) {
@@ -182,31 +193,27 @@ export function parseSearchOptions(argv: string[]): SearchOptions {
         if (type.trim()) types.push(type.trim());
       }
     } else if (arg === "--since") {
-      since = parseTimeExpression(requireValue(argv, ++i, "--since"));
+      since = parseTimeExpression(requireValue(filteredArgv, ++i, "--since"));
     } else if (arg.startsWith("--since=")) {
       since = parseTimeExpression(arg.slice("--since=".length));
     } else if (arg === "--until") {
-      until = parseTimeExpression(requireValue(argv, ++i, "--until"));
+      until = parseTimeExpression(requireValue(filteredArgv, ++i, "--until"));
     } else if (arg.startsWith("--until=")) {
       until = parseTimeExpression(arg.slice("--until=".length));
     } else if (arg === "--actor") {
-      actor = requireValue(argv, ++i, "--actor");
+      actor = requireValue(filteredArgv, ++i, "--actor");
     } else if (arg.startsWith("--actor=")) {
       actor = arg.slice("--actor=".length);
     } else if (arg === "--request-id") {
-      requestId = requireValue(argv, ++i, "--request-id");
+      requestId = requireValue(filteredArgv, ++i, "--request-id");
     } else if (arg.startsWith("--request-id=")) {
       requestId = arg.slice("--request-id=".length);
     } else if (arg === "--limit") {
-      limit = parseLimit(requireValue(argv, ++i, "--limit"));
+      limit = parseLimit(requireValue(filteredArgv, ++i, "--limit"));
     } else if (arg.startsWith("--limit=")) {
       limit = parseLimit(arg.slice("--limit=".length));
-    } else if (arg === "--fortress") {
-      fortress = requireValue(argv, ++i, "--fortress");
-    } else if (arg.startsWith("--fortress=")) {
-      fortress = arg.slice("--fortress=".length);
     } else if (arg === "--passphrase") {
-      passphrase = requireValue(argv, ++i, "--passphrase");
+      passphrase = requireValue(filteredArgv, ++i, "--passphrase");
     } else if (arg.startsWith("--passphrase=")) {
       passphrase = arg.slice("--passphrase=".length);
     } else {

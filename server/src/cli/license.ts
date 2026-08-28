@@ -55,7 +55,7 @@ import {
   writeLedgerGenerationAnchor,
 } from "../entitlement/ledger-antirollback.js";
 import { openIssuer, openVerifier } from "./custody-unlock.js";
-import { flagValue } from "./argv.js";
+import { consumeFlagValue, flagValue } from "./argv.js";
 
 /** Default feature set for the standard Team offering (sold set, not tier-implied). */
 const DEFAULT_TEAM_FEATURES = ["roster", "policy-dist"] as const;
@@ -102,7 +102,11 @@ interface IssueFlags {
   fortressPath?: string;
 }
 
-function parseIssueFlags(argv: string[], env: NodeJS.ProcessEnv): IssueFlags {
+function parseIssueFlags(
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+  fortressPath: string | undefined,
+): IssueFlags {
   return {
     tier: flagValue(argv, "--tier"),
     subject: flagValue(argv, "--subject"),
@@ -114,7 +118,7 @@ function parseIssueFlags(argv: string[], env: NodeJS.ProcessEnv): IssueFlags {
     pricingUnit: flagValue(argv, "--pricing-unit"),
     passphrase: flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE,
     recoveryKey: env.SANCTUARY_RECOVERY_KEY,
-    fortressPath: flagValue(argv, "--fortress"),
+    fortressPath,
   };
 }
 
@@ -124,7 +128,15 @@ async function runIssue(
   err: Writable,
   env: NodeJS.ProcessEnv,
 ): Promise<number> {
-  const flags = parseIssueFlags(argv, env);
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; issuing a license
+  // against the wrong fortress is a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `issue: ${consumedFortress.error}\n`);
+    return 1;
+  }
+  const flags = parseIssueFlags(consumedFortress.argv, env, consumedFortress.value);
 
   // Validate flags BEFORE any custody unlock (cheap, no crypto, no secret).
   if (!flags.tier || !isEntitlementTier(flags.tier) || flags.tier === "community") {
@@ -348,7 +360,15 @@ async function runList(
   err: Writable,
   env: NodeJS.ProcessEnv,
 ): Promise<number> {
-  const fortress = flagValue(argv, "--fortress");
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; listing the wrong
+  // fortress's licenses is a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `list: ${consumedFortress.error}\n`);
+    return 1;
+  }
+  const fortress = consumedFortress.value;
   const asJson = hasFlag(argv, "--json");
   const passphrase = flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
   const recoveryKey = env.SANCTUARY_RECOVERY_KEY;
@@ -491,15 +511,26 @@ async function runRevoke(
   err: Writable,
   env: NodeJS.ProcessEnv,
 ): Promise<number> {
-  const licenseId = argv.find((a) => !a.startsWith("--"));
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; revoking against the
+  // wrong fortress is a constraint-5 violation. Consumed before the
+  // positional-argument scan below so a --fortress <path> pair can never be
+  // mistaken for the <licenseId> positional.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `revoke: ${consumedFortress.error}\n`);
+    return 1;
+  }
+  const filteredArgv = consumedFortress.argv;
+  const licenseId = filteredArgv.find((a) => !a.startsWith("--"));
   if (!licenseId) {
     write(err, "revoke: a <licenseId> argument is required\n");
     return 1;
   }
-  const reason = flagValue(argv, "--reason") ?? null;
-  const passphrase = flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
+  const reason = flagValue(filteredArgv, "--reason") ?? null;
+  const passphrase = flagValue(filteredArgv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
   const recoveryKey = env.SANCTUARY_RECOVERY_KEY;
-  const fortressPath = flagValue(argv, "--fortress");
+  const fortressPath = consumedFortress.value;
 
   let issuer: Awaited<ReturnType<typeof openIssuer>>;
   try {

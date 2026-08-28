@@ -30,6 +30,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { resolveStoragePath } from "../paths.js";
+import { consumeFlagValue } from "./argv.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
@@ -63,12 +64,19 @@ interface ParsedArgs {
 
 function parseArgs(argv: string[]): ParsedArgs {
   const out: ParsedArgs = { help: false };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress/--storage value must refuse, never silently resolve the default fortress; wrong-fortress custody-restore attestation is a constraint-5 violation.
+  const fortress = consumeFlagValue(argv, "--fortress");
+  if (fortress.error !== undefined) throw new Error(fortress.error);
+  const storage = consumeFlagValue(fortress.argv, "--storage");
+  if (storage.error !== undefined) throw new Error(storage.error);
+  if (storage.value !== undefined || fortress.value !== undefined) {
+    out.storage = storage.value ?? fortress.value;
+  }
+
+  for (let i = 0; i < storage.argv.length; i++) {
+    const a = storage.argv[i];
     if (a === "--help" || a === "-h") out.help = true;
-    else if ((a === "--fortress" || a === "--storage") && argv[i + 1]) {
-      out.storage = argv[++i];
-    } else if (a && a.startsWith("--")) {
+    else if (a && a.startsWith("--")) {
       throw new Error(`Unknown flag: ${a}`);
     }
   }

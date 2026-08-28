@@ -9,7 +9,7 @@
 import { resolve } from "node:path";
 import { existsSync, readdirSync } from "node:fs";
 import { BACKEND_FALLBACK_STRINGS } from "../intelligence/templates.js";
-import { flagValue } from "./argv.js";
+import { consumeFlagValue } from "./argv.js";
 
 /**
  * Print the model-choice privacy tradeoff to the operator-facing CLI channel.
@@ -112,7 +112,26 @@ Examples:
 
 async function runDiagnose(argv: string[] = []): Promise<number> {
   const json = hasFlag(argv, "--json");
-  const fortressFlag = flagValue(argv, "--fortress") ?? flagValue(argv, "--fortress-path");
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress/
+  // --fortress-path value must refuse, never silently resolve the default
+  // fortress; diagnosing the wrong fortress's intelligence config is a
+  // constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(`Error: ${consumedFortress.error}`);
+    return 1;
+  }
+  const consumedFortressPath = consumeFlagValue(
+    consumedFortress.argv,
+    "--fortress-path",
+  );
+  if (consumedFortressPath.error !== undefined) {
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(`Error: ${consumedFortressPath.error}`);
+    return 1;
+  }
+  const fortressFlag = consumedFortress.value ?? consumedFortressPath.value;
   const storagePath = resolve(
     fortressFlag ??
       process.env.SANCTUARY_STORAGE_PATH ??

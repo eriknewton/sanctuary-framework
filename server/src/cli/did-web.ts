@@ -51,7 +51,7 @@ import {
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 import { readStoredPassphrase } from "../wrap/passphrase.js";
 import { resolveStoragePath } from "../paths.js";
-import { flagValue } from "./argv.js";
+import { consumeFlagValue, flagValue } from "./argv.js";
 
 export interface DidWebCommandArgs {
   argv: string[];
@@ -204,9 +204,16 @@ async function loadFortressIdentity(
   env: NodeJS.ProcessEnv,
   err: Writable,
 ): Promise<IdentitySnapshot | null> {
-  const fortressFlag = flagValue(argv, "--fortress");
-  if (fortressFlag) {
-    process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; wrong-fortress
+  // did-web operations are a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `Error: ${consumedFortress.error}\n`);
+    return null;
+  }
+  if (consumedFortress.value !== undefined) {
+    process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;
   }
   // Resolve to a CONCRETE path here rather than passing
   // `fortressFlag ?? undefined` down. The old form was right only by
@@ -387,9 +394,16 @@ async function cmdShow(
   _env: NodeJS.ProcessEnv,
 ): Promise<number> {
   const json = hasFlag(argv, "--json");
-  const fortressFlag = flagValue(argv, "--fortress");
-  if (fortressFlag) {
-    process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; wrong-fortress
+  // did-web operations are a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `Error: ${consumedFortress.error}\n`);
+    return 1;
+  }
+  if (consumedFortress.value !== undefined) {
+    process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;
   }
   const config = await loadConfig();
   const lockdown_status = await readLockdownStatus(config.storage_path);
@@ -549,9 +563,16 @@ async function cmdKeyHistory(
   _env: NodeJS.ProcessEnv,
 ): Promise<number> {
   const json = hasFlag(argv, "--json");
-  const fortressFlag = flagValue(argv, "--fortress");
-  if (fortressFlag) {
-    process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; wrong-fortress
+  // did-web operations are a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `Error: ${consumedFortress.error}\n`);
+    return 1;
+  }
+  if (consumedFortress.value !== undefined) {
+    process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;
   }
   const config = await loadConfig();
   const record = await loadFortressDidWebRecord(config.storage_path);

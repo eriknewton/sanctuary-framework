@@ -109,7 +109,7 @@ import {
   type VerifiedEmpty,
 } from "../claim-witness.js";
 import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
-import { flagValue, flagValues } from "./argv.js";
+import { consumeFlagValue, flagValue, flagValues } from "./argv.js";
 
 /** Same on-disk filenames `runProvisionPin` (cli/castle-wall.ts) establishes under the fortress root. Re-declared here (that module keeps them private) rather than reused, since they are plain filename literals, not secret material. */
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
@@ -302,7 +302,15 @@ async function bootstrap(
   err: Writable,
   env: NodeJS.ProcessEnv,
 ): Promise<Bootstrapped | null> {
-  const fortressPath = resolveFortressArg(flagValue(argv, "--fortress"), env);
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; observing the wrong
+  // fortress's Castle Wall state is a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `Error: ${consumedFortress.error}\n`);
+    return null;
+  }
+  const fortressPath = resolveFortressArg(consumedFortress.value, env);
 
   const passphrase = flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
   const recoveryKey = env.SANCTUARY_RECOVERY_KEY;

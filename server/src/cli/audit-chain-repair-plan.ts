@@ -92,7 +92,7 @@ import {
   totalRecordsSkipped,
   type AuditChainExportSummary,
 } from "./audit-chain-export.js";
-import { flagValue } from "./argv.js";
+import { consumeFlagValue, flagValue } from "./argv.js";
 
 // ---- Exit codes -------------------------------------------------------------
 //
@@ -599,8 +599,22 @@ export function parseRepairPlanArgs(
   env: NodeJS.ProcessEnv = process.env,
   homeFallback?: string
 ): RepairPlanParseResult {
-  const fortressFlag =
-    flagValue(argv, "--fortress") ?? flagValue(argv, "--fortress-path");
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress/
+  // --fortress-path value must refuse, never silently resolve the default
+  // fortress; repairing the wrong fortress's audit chain is a constraint-5
+  // violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    return { error: consumedFortress.error };
+  }
+  const consumedFortressPath = consumeFlagValue(
+    consumedFortress.argv,
+    "--fortress-path"
+  );
+  if (consumedFortressPath.error !== undefined) {
+    return { error: consumedFortressPath.error };
+  }
+  const fortressFlag = consumedFortress.value ?? consumedFortressPath.value;
   const storageFlag = flagValue(argv, "--storage-path");
   // Same precedence as `audit-chain export`, so the two verbs can never be
   // pointed at different fortresses by the same invocation.

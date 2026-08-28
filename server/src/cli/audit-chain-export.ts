@@ -34,7 +34,7 @@ import {
 } from "../audit/checkpoint-shape.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 import { homeFortressPath } from "../paths.js";
-import { flagValue } from "./argv.js";
+import { consumeFlagValue, flagValue } from "./argv.js";
 
 export const AUDIT_EXPORT_NAMESPACE = "_audit";
 export const AUDIT_EXPORT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
@@ -336,18 +336,37 @@ export interface ExportArgs {
   operatorOnly?: boolean;
   argv: string[];
   env?: NodeJS.ProcessEnv;
+  /** Set when --fortress/--fortress-path was malformed; runExport refuses rather than silently resolving the default fortress. */
+  error?: string;
 }
 
 export function parseExportArgs(argv: string[], env?: NodeJS.ProcessEnv): ExportArgs {
   const output = flagValue(argv, "--output") ?? flagValue(argv, "-o");
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress/
+  // --fortress-path value must refuse, never silently resolve the default
+  // fortress; exporting the wrong fortress's audit chain is a constraint-5
+  // violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  const consumedFortressPath = consumedFortress.error === undefined
+    ? consumeFlagValue(consumedFortress.argv, "--fortress-path")
+    : undefined;
+  const error = consumedFortress.error ?? consumedFortressPath?.error;
   const fortressPath =
-    flagValue(argv, "--fortress") ??
-    flagValue(argv, "--fortress-path") ??
+    consumedFortress.value ??
+    consumedFortressPath?.value ??
     env?.SANCTUARY_STORAGE_PATH ??
     env?.SANCTUARY_FORTRESS_PATH;
   const storagePath = flagValue(argv, "--storage-path");
   const operatorOnly = argv.includes("--operator-only");
-  return { output, storagePath, fortressPath, operatorOnly, argv, env };
+  return {
+    output,
+    storagePath,
+    fortressPath,
+    operatorOnly,
+    argv,
+    env,
+    ...(error !== undefined ? { error } : {}),
+  };
 }
 
 /**
@@ -389,6 +408,9 @@ async function daemonAuditChainPresent(
 }
 
 export async function runExport(args: ExportArgs): Promise<void> {
+  if (args.error !== undefined) {
+    throw new Error(args.error);
+  }
   const fortressPath =
     args.fortressPath ??
     process.env.SANCTUARY_FORTRESS_PATH ??

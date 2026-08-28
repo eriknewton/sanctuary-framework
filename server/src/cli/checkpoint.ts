@@ -51,7 +51,7 @@ import {
   type CheckpointPoisonMap,
   type MemoryCheckpointRecord,
 } from "../memory-checkpoint/index.js";
-import { flagValue } from "./argv.js";
+import { consumeFlagValue, flagValue } from "./argv.js";
 
 export interface CheckpointCommandArgs {
   argv: string[];
@@ -273,9 +273,16 @@ async function bootstrap(
   err: Writable,
   env: NodeJS.ProcessEnv,
 ): Promise<Bootstrapped | null> {
-  const fortressFlag = flagValue(argv, "--fortress");
-  if (fortressFlag) {
-    process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; wrong-fortress
+  // checkpoint operations are a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `Error: ${consumedFortress.error}\n`);
+    return null;
+  }
+  if (consumedFortress.value !== undefined) {
+    process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;
   }
 
   const passphrase = flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;

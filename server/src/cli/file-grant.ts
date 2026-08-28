@@ -38,7 +38,7 @@ import type { ApprovalRequest, ApprovalResponse } from "../principal-policy/type
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { loadConfig, type SanctuaryConfig } from "../config.js";
-import { flagValue } from "./argv.js";
+import { consumeFlagValue, flagValue } from "./argv.js";
 import {
   FILE_GRANT_DEFAULTS,
   FileGrantStore,
@@ -237,9 +237,16 @@ async function bootstrap(
   err: Writable,
   env: NodeJS.ProcessEnv
 ): Promise<Bootstrapped | null> {
-  const fortressFlag = flagValue(argv, "--fortress");
-  if (fortressFlag) {
-    process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; a file-grant issued
+  // against the wrong fortress is a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `Error: ${consumedFortress.error}\n`);
+    return null;
+  }
+  if (consumedFortress.value !== undefined) {
+    process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;
   }
 
   const passphrase = flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;

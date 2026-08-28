@@ -32,6 +32,7 @@ import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { bytesToString, fromBase64url, toBase64url } from "../core/encoding.js";
 import { resolveStoragePath } from "../paths.js";
+import { consumeFlagValue } from "./argv.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   TRANSPARENCY_BUNDLE_FORMAT,
@@ -163,12 +164,19 @@ async function runAnchorCommand(
 
   let masterKey: Uint8Array | undefined;
   try {
+    // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+    // refuse, never silently resolve the default fortress; anchoring against
+    // the wrong fortress is a constraint-5 violation.
+    const consumedFortress = consumeFlagValue(rest, "--fortress");
+    if (consumedFortress.error !== undefined) {
+      throw new Error(consumedFortress.error);
+    }
     const opts = parseFlags(
-      rest,
-      ["--fortress", "--passphrase", "--rekor-url", "--output"],
+      consumedFortress.argv,
+      ["--passphrase", "--rekor-url", "--output"],
       ["--yes", "--json", "--allow-unsafe-rekor-url"]
     );
-    const storagePath = opts.values["--fortress"] ?? resolveStoragePath(env);
+    const storagePath = consumedFortress.value ?? resolveStoragePath(env);
     const storage = new FilesystemStorage(join(storagePath, "state"));
     const {
       ANCHOR_CONSENT_TEXT,
@@ -411,12 +419,18 @@ async function runCheckpoint(
 ): Promise<number> {
   let masterKey: Uint8Array | undefined;
   try {
-    const opts = parseFlags(argv, [
-      "--fortress",
+    // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+    // refuse, never silently resolve the default fortress; a checkpoint emitted
+    // against the wrong fortress is a constraint-5 violation.
+    const consumedFortress = consumeFlagValue(argv, "--fortress");
+    if (consumedFortress.error !== undefined) {
+      throw new Error(consumedFortress.error);
+    }
+    const opts = parseFlags(consumedFortress.argv, [
       "--passphrase",
       "--binary",
     ], ["--local-sign", "--json"]);
-    const storagePath = opts.values["--fortress"] ?? resolveStoragePath(env);
+    const storagePath = consumedFortress.value ?? resolveStoragePath(env);
     const storage = new FilesystemStorage(join(storagePath, "state"));
     masterKey = await resolveMasterKey(storage, opts.values["--passphrase"], env);
     const auditLog = new AuditLog(storage, masterKey);
@@ -531,8 +545,15 @@ async function runBundleExport(
   env: NodeJS.ProcessEnv
 ): Promise<number> {
   try {
-    const opts = parseFlags(argv, ["--fortress", "--output"], []);
-    const storagePath = opts.values["--fortress"] ?? resolveStoragePath(env);
+    // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+    // refuse, never silently resolve the default fortress; exporting the wrong
+    // fortress's checkpoints is a constraint-5 violation.
+    const consumedFortress = consumeFlagValue(argv, "--fortress");
+    if (consumedFortress.error !== undefined) {
+      throw new Error(consumedFortress.error);
+    }
+    const opts = parseFlags(consumedFortress.argv, ["--output"], []);
+    const storagePath = consumedFortress.value ?? resolveStoragePath(env);
     const storage = new FilesystemStorage(join(storagePath, "state"));
     const checkpoints = await readPersistedCheckpoints(storage);
     if (checkpoints.length === 0) {
@@ -591,13 +612,19 @@ export async function runVerifyTransparencyCommand(
 
   let masterKey: Uint8Array | undefined;
   try {
+    // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+    // refuse, never silently resolve the default fortress; verifying against
+    // the wrong fortress's pinned key/anchors is a constraint-5 violation.
+    const consumedFortress = consumeFlagValue(argv, "--fortress");
+    if (consumedFortress.error !== undefined) {
+      throw new Error(consumedFortress.error);
+    }
     const opts = parseFlags(
-      argv,
+      consumedFortress.argv,
       [
         "--input",
         "--public-key",
         "--public-key-file",
-        "--fortress",
         "--passphrase",
         "--check-anchors",
         "--rekor-public-key-file",
@@ -653,7 +680,7 @@ export async function runVerifyTransparencyCommand(
       return 1;
     }
 
-    const key = await resolveVerificationKey(opts, env, err);
+    const key = await resolveVerificationKey(opts, consumedFortress.value, env, err);
     if (key.status === "error") return 1;
 
     const report = verifyTransparencyCheckpoints(parsed, {
@@ -664,7 +691,7 @@ export async function runVerifyTransparencyCommand(
 
     let hostResult = null;
     if (opts.flags["--against-log"] && report.checkpoints_verified > 0) {
-      const storagePath = opts.values["--fortress"] ?? resolveStoragePath(env);
+      const storagePath = consumedFortress.value ?? resolveStoragePath(env);
       const storage = new FilesystemStorage(join(storagePath, "state"));
       // Counter recount needs decryption; optional, honestly noted when absent.
       let auditLog: AuditLog | undefined;
@@ -821,7 +848,7 @@ export async function runVerifyTransparencyCommand(
         }
       | null = null;
     if (opts.flags["--check-counter-floor"]) {
-      const storagePath = opts.values["--fortress"] ?? resolveStoragePath(env);
+      const storagePath = consumedFortress.value ?? resolveStoragePath(env);
       const storage = new FilesystemStorage(join(storagePath, "state"));
       try {
         masterKey =
@@ -1025,6 +1052,10 @@ interface ResolvedKey {
  */
 async function resolveVerificationKey(
   opts: ParsedFlags,
+  // --fortress is consumed by the caller via consumeFlagValue before opts is
+  // built (see runVerifyTransparencyCommand), so it is passed explicitly here
+  // rather than read off opts.values, which no longer carries it.
+  fortressPath: string | undefined,
   env: NodeJS.ProcessEnv,
   err: Writable
 ): Promise<ResolvedKey> {
@@ -1055,7 +1086,7 @@ async function resolveVerificationKey(
   if (!opts.flags["--trust-embedded"]) {
     for (const candidate of [
       CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
-      join(opts.values["--fortress"] ?? resolveStoragePath(env), "castle-pinned-pubkey.bin"),
+      join(fortressPath ?? resolveStoragePath(env), "castle-pinned-pubkey.bin"),
     ]) {
       try {
         const bytes = await readFile(candidate);
