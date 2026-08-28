@@ -53,10 +53,13 @@ import {
 } from "../approval-aggregator.js";
 
 /**
- * Resolver returned by the wire-up: reads the live policy at request time
- * so a `sanctuary agents config --approval-redirect=...` flip lands without
- * a server restart on the next request. Returns `null` to mean
- * "off/passthrough" (delegate to underlying channel unchanged).
+ * Resolver returned by the wire-up: reads the in-process policy object at
+ * request time. AGENTS.md MUST-NEVER #7 freezes the Principal Policy at
+ * boot, so that object never changes after startup — a
+ * `sanctuary agents config --approval-redirect=...` edit is written to disk
+ * immediately but only takes effect once the server process is restarted
+ * and re-loads the file. Returns `null` to mean "off/passthrough" (delegate
+ * to underlying channel unchanged).
  */
 export interface ApprovalRedirectResolver {
   (request: ApprovalRequest): {
@@ -72,8 +75,10 @@ export interface AggregatorBackedChannelOptions {
   aggregator: ApprovalAggregator;
   /**
    * Reads the current redirect config per request. Called once per
-   * `requestApproval()` so policy edits take effect on the next request
-   * without process restart.
+   * `requestApproval()` against the frozen in-process policy object — this
+   * makes per-request reads of that object consistent, it does NOT make a
+   * `sanctuary agents config` file edit take effect without a process
+   * restart (AGENTS.md MUST-NEVER #7: the policy is loaded once at boot).
    */
   resolveRedirect: ApprovalRedirectResolver;
   /**
@@ -308,9 +313,11 @@ export class AggregatorBackedChannel implements ApprovalChannel {
 }
 
 /**
- * Wire-up helper for the boot path. Reads the live policy each call so
- * an in-flight `sanctuary agents config` edit is reflected on the next
- * approval (within the running server's policy reload semantics).
+ * Wire-up helper for the boot path. Reads the supplied policy object each
+ * call, but the object itself is frozen for the process lifetime (AGENTS.md
+ * MUST-NEVER #7) — a `sanctuary agents config` edit is written to disk
+ * immediately and is reflected here only after the server process restarts
+ * and re-loads the file, not on the next approval of the current process.
  *
  * If the policy lacks `approval_redirect`, returns `{ enabled: false }`
  * which short-circuits the wrapper to underlying-passthrough (zero
