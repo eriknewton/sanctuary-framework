@@ -37,17 +37,17 @@ const AGGREGATOR_CHANNEL_PATH =
 const INDEX_PATH = "server/src/index.ts";
 
 describe("IC-26: agents config restart-required message is honest", () => {
-  it("prints the restart-required message, not the next-request claim, at the CLI call site", () => {
+  it("prints the next-start message, not the next-request claim, at the CLI call site", () => {
     const source = read(CLI_PATH);
     expect(source).toContain(
-      "Persisted. Takes effect after this tenant's Sanctuary server process is stopped and started again",
+      "Persisted. Takes effect the next time this tenant's Sanctuary server starts",
     );
     expect(source).toContain("a running server keeps the policy it booted with");
   });
 
   it("carries the MUST-NEVER #7 invariant comment at the CLI message site", () => {
     const source = read(CLI_PATH);
-    const anchor = "Persisted. Takes effect after this tenant";
+    const anchor = "Persisted. Takes effect the next time this tenant";
     const index = source.indexOf(anchor);
     expect(index).toBeGreaterThanOrEqual(0);
     const window = source.slice(Math.max(0, index - 700), index);

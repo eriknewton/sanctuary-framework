@@ -534,7 +534,7 @@ async function cmdConfig(argv: string[], ctx: ResolvedCtx): Promise<number> {
     // was the defect (IC-26): the write above lands on disk immediately,
     // but a running server will not see it until it restarts.
     ctx.out.write(
-      `  Persisted. Takes effect after this tenant's Sanctuary server process is stopped and started again: a running server keeps the policy it booted with.\n`,
+      `  Persisted. Takes effect the next time this tenant's Sanctuary server starts: a running server keeps the policy it booted with until it is restarted.\n`,
     );
   }
   return 0;
