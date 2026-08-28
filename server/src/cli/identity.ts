@@ -23,7 +23,12 @@ import { createIdentity } from "../core/identity.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig } from "../config.js";
-import { consumeFlagValue, flagValue } from "./argv.js";
+import {
+  consumeFlagValue,
+  flagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 export interface IdentityCommandArgs {
   argv: string[];
@@ -186,8 +191,8 @@ async function cmdShow(
   // identity operations are a constraint-5 violation.
   const consumedFortress = consumeFlagValue(argv, "--fortress");
   if (consumedFortress.error !== undefined) {
-    write(err, `Error: ${consumedFortress.error}\n`);
-    return 1;
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
   if (consumedFortress.value !== undefined) {
     process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;
@@ -291,8 +296,8 @@ async function cmdCreate(
   // identity operations are a constraint-5 violation.
   const consumedFortress = consumeFlagValue(argv, "--fortress");
   if (consumedFortress.error !== undefined) {
-    write(err, `Error: ${consumedFortress.error}\n`);
-    return 1;
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
   if (consumedFortress.value !== undefined) {
     process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;

@@ -30,7 +30,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { resolveStoragePath } from "../paths.js";
-import { consumeFlagValue } from "./argv.js";
+import {
+  aliasConflictMessage,
+  consumeFlagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
@@ -69,6 +74,18 @@ function parseArgs(argv: string[]): ParsedArgs {
   if (fortress.error !== undefined) throw new Error(fortress.error);
   const storage = consumeFlagValue(fortress.argv, "--storage");
   if (storage.error !== undefined) throw new Error(storage.error);
+  // IC-30 fix-round finding #3: --fortress and --storage are ALIASES for the
+  // same value, not independent flags. Before this check, giving both
+  // silently picked whichever alias `consumeFlagValue` happened to check
+  // second (--storage), regardless of argv order -- a change from this
+  // module's PRE-fix-round hand-rolled parser, where the LAST occurrence in
+  // argv order won, so `--fortress /a --storage /b` kept working (storage
+  // wins either way) but `--storage /b --fortress /a` silently flipped from
+  // /a to /b. An operator who typed both, in either order, gets a refusal
+  // naming the ambiguity instead of a guess.
+  if (fortress.value !== undefined && storage.value !== undefined) {
+    throw new Error(aliasConflictMessage("--fortress", "--storage"));
+  }
   if (storage.value !== undefined || fortress.value !== undefined) {
     out.storage = storage.value ?? fortress.value;
   }
@@ -162,8 +179,14 @@ export async function runRestoreAttestCommand(
   try {
     parsed = parseArgs(args.argv);
   } catch (e) {
-    err.write(`${e instanceof Error ? e.message : String(e)}\n`);
-    return 1;
+    // IC-30 fix-round finding #4: parseArgs only ever throws for a
+    // malformed flag (missing/duplicate/aliased --fortress or --storage, or
+    // an unknown flag), so every path through this catch is a usage error --
+    // render it with the same canonical shape + exit code every other
+    // migrated verb uses, instead of the raw, unprefixed message this used
+    // to print with exit 1.
+    err.write(`${fortressFlagRefusalText(e instanceof Error ? e.message : String(e))}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
   if (parsed.help) {
     printUsage(out);

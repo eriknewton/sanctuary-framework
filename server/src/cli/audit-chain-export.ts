@@ -34,7 +34,7 @@ import {
 } from "../audit/checkpoint-shape.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 import { homeFortressPath } from "../paths.js";
-import { consumeFlagValue, flagValue } from "./argv.js";
+import { aliasConflictMessage, consumeFlagValue, flagValue } from "./argv.js";
 
 export const AUDIT_EXPORT_NAMESPACE = "_audit";
 export const AUDIT_EXPORT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
@@ -350,7 +350,15 @@ export function parseExportArgs(argv: string[], env?: NodeJS.ProcessEnv): Export
   const consumedFortressPath = consumedFortress.error === undefined
     ? consumeFlagValue(consumedFortress.argv, "--fortress-path")
     : undefined;
-  const error = consumedFortress.error ?? consumedFortressPath?.error;
+  // IC-30 fix-round finding #3: --fortress and --fortress-path are ALIASES
+  // for the same value; giving both must refuse rather than let `??` below
+  // silently pick --fortress over --fortress-path regardless of which one
+  // the operator meant.
+  const aliasConflict =
+    consumedFortress.value !== undefined && consumedFortressPath?.value !== undefined
+      ? aliasConflictMessage("--fortress", "--fortress-path")
+      : undefined;
+  const error = consumedFortress.error ?? consumedFortressPath?.error ?? aliasConflict;
   const fortressPath =
     consumedFortress.value ??
     consumedFortressPath?.value ??

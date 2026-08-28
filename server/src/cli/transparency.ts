@@ -32,7 +32,11 @@ import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { bytesToString, fromBase64url, toBase64url } from "../core/encoding.js";
 import { resolveStoragePath } from "../paths.js";
-import { consumeFlagValue } from "./argv.js";
+import {
+  consumeFlagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   TRANSPARENCY_BUNDLE_FORMAT,
@@ -169,7 +173,8 @@ async function runAnchorCommand(
     // the wrong fortress is a constraint-5 violation.
     const consumedFortress = consumeFlagValue(rest, "--fortress");
     if (consumedFortress.error !== undefined) {
-      throw new Error(consumedFortress.error);
+      write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+      return FORTRESS_FLAG_USAGE_EXIT_CODE;
     }
     const opts = parseFlags(
       consumedFortress.argv,
@@ -424,7 +429,8 @@ async function runCheckpoint(
     // against the wrong fortress is a constraint-5 violation.
     const consumedFortress = consumeFlagValue(argv, "--fortress");
     if (consumedFortress.error !== undefined) {
-      throw new Error(consumedFortress.error);
+      write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+      return FORTRESS_FLAG_USAGE_EXIT_CODE;
     }
     const opts = parseFlags(consumedFortress.argv, [
       "--passphrase",
@@ -550,7 +556,8 @@ async function runBundleExport(
     // fortress's checkpoints is a constraint-5 violation.
     const consumedFortress = consumeFlagValue(argv, "--fortress");
     if (consumedFortress.error !== undefined) {
-      throw new Error(consumedFortress.error);
+      write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+      return FORTRESS_FLAG_USAGE_EXIT_CODE;
     }
     const opts = parseFlags(consumedFortress.argv, ["--output"], []);
     const storagePath = consumedFortress.value ?? resolveStoragePath(env);
@@ -617,7 +624,8 @@ export async function runVerifyTransparencyCommand(
     // the wrong fortress's pinned key/anchors is a constraint-5 violation.
     const consumedFortress = consumeFlagValue(argv, "--fortress");
     if (consumedFortress.error !== undefined) {
-      throw new Error(consumedFortress.error);
+      write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+      return FORTRESS_FLAG_USAGE_EXIT_CODE;
     }
     const opts = parseFlags(
       consumedFortress.argv,

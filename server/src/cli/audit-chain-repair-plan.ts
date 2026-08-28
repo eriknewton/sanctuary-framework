@@ -92,7 +92,12 @@ import {
   totalRecordsSkipped,
   type AuditChainExportSummary,
 } from "./audit-chain-export.js";
-import { consumeFlagValue, flagValue } from "./argv.js";
+import {
+  aliasConflictMessage,
+  consumeFlagValue,
+  flagValue,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 // ---- Exit codes -------------------------------------------------------------
 //
@@ -614,6 +619,13 @@ export function parseRepairPlanArgs(
   if (consumedFortressPath.error !== undefined) {
     return { error: consumedFortressPath.error };
   }
+  // IC-30 fix-round finding #3: --fortress and --fortress-path are ALIASES
+  // for the same value; giving both must refuse rather than let `??` below
+  // silently pick --fortress over --fortress-path regardless of which one
+  // the operator meant.
+  if (consumedFortress.value !== undefined && consumedFortressPath.value !== undefined) {
+    return { error: aliasConflictMessage("--fortress", "--fortress-path") };
+  }
   const fortressFlag = consumedFortress.value ?? consumedFortressPath.value;
   const storageFlag = flagValue(argv, "--storage-path");
   // Same precedence as `audit-chain export`, so the two verbs can never be
@@ -654,7 +666,10 @@ export async function runAuditChainRepairPlan(
 
   const parsed = parseRepairPlanArgs(argv, env, ctx.homeFallback);
   if (parsed.error || !parsed.args) {
-    err.write(`Error: ${parsed.error}\n`);
+    // Already the canonical fortress-flag-refusal shape (Error: <message>,
+    // exit 2 === FORTRESS_FLAG_USAGE_EXIT_CODE); routed through the shared
+    // renderer so the two can never drift apart independently.
+    err.write(`${fortressFlagRefusalText(parsed.error ?? "usage error")}\n`);
     return REPAIR_PLAN_EXIT_USAGE;
   }
   const { fortressPath, statePath } = parsed.args;

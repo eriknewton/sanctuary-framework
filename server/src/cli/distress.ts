@@ -40,7 +40,12 @@ import {
   type DistressReason,
   type DistressSeverity,
 } from "../distress/tools.js";
-import { consumeFlagValue, flagValue } from "./argv.js";
+import {
+  consumeFlagValue,
+  flagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 export interface DistressCommandArgs {
   argv: string[];
@@ -185,8 +190,8 @@ async function cmdSend(
   // distress-signal sends are a constraint-5 violation.
   const consumedFortress = consumeFlagValue(argv, "--fortress");
   if (consumedFortress.error !== undefined) {
-    write(err, `Error: ${consumedFortress.error}\n`);
-    return 1;
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
   if (consumedFortress.value !== undefined) {
     process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;

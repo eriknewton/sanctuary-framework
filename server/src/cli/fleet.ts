@@ -60,7 +60,12 @@ import { revocationVerifiability } from "../entitlement/revocation-antirollback.
 import { openIssuer } from "./custody-unlock.js";
 import { dashboardRequest, DashboardRequestError } from "./dashboard-request.js";
 import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
-import { consumeFlagValue, flagValue } from "./argv.js";
+import {
+  consumeFlagValue,
+  flagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
@@ -248,8 +253,8 @@ async function runExport(
   // attestation for the wrong fortress is a constraint-5 violation.
   const consumedFortress = consumeFlagValue(argv, "--fortress");
   if (consumedFortress.error !== undefined) {
-    write(err, `attest export: ${consumedFortress.error}\n`);
-    return 1;
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
   const flags = parseExportFlags(consumedFortress.argv, env, consumedFortress.value);
 

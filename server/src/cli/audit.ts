@@ -15,7 +15,11 @@ import {
 } from "../operational/audit-log.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { resolveStoragePath } from "../paths.js";
-import { consumeFlagValue } from "./argv.js";
+import {
+  consumeFlagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 export interface AuditCommandArgs {
   argv: string[];
@@ -68,6 +72,19 @@ export async function runAuditCommand(args: AuditCommandArgs): Promise<number> {
   if (rest.includes("--help") || rest.includes("-h")) {
     printSearchUsage(out);
     return 0;
+  }
+
+  // IC-30 fix-round finding #4: peek the --fortress result BEFORE entering
+  // the try block below, so this verb renders the SAME canonical usage-error
+  // shape + exit code as every other migrated verb, instead of falling
+  // through to this function's generic catch (which prefixes "sanctuary
+  // audit search: " and always exits 1). parseSearchOptions performs the
+  // identical consumeFlagValue call again internally when this check
+  // passes; that is a harmless redundant parse, not a behavior change.
+  const consumedFortressPeek = consumeFlagValue(rest, "--fortress");
+  if (consumedFortressPeek.error !== undefined) {
+    write(err, `${fortressFlagRefusalText(consumedFortressPeek.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
 
   let opts: SearchOptions | undefined;
@@ -167,7 +184,6 @@ export function parseSearchOptions(argv: string[]): SearchOptions {
   let requestId: string | undefined;
   let limit = 50;
   let json = false;
-  let fortress: string | undefined;
   let passphrase: string | undefined;
 
   // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
@@ -177,7 +193,11 @@ export function parseSearchOptions(argv: string[]): SearchOptions {
   if (consumedFortress.error !== undefined) {
     throw new Error(consumedFortress.error);
   }
-  fortress = consumedFortress.value;
+  // Assigned once from the strict parse above and never reassigned; `const`
+  // (not `let`) so a future edit that tried to reassign it would be a lint
+  // error, not a silent second write this function's control flow does not
+  // expect. IC-30 fix-round finding #5.
+  const fortress = consumedFortress.value;
   const filteredArgv = consumedFortress.argv;
 
   for (let i = 0; i < filteredArgv.length; i++) {

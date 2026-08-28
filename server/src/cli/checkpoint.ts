@@ -51,7 +51,12 @@ import {
   type CheckpointPoisonMap,
   type MemoryCheckpointRecord,
 } from "../memory-checkpoint/index.js";
-import { consumeFlagValue, flagValue } from "./argv.js";
+import {
+  consumeFlagValue,
+  flagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 export interface CheckpointCommandArgs {
   argv: string[];
@@ -268,18 +273,28 @@ interface Bootstrapped {
  * loads the primary identity, and wires the StateStore, AuditLog, and real
  * checkpoint FsOps over `<fortress>/checkpoints/`.
  */
+/**
+ * A number return means "the caller should exit with this code without
+ * running anything else" (a usage error or an operational failure that
+ * short-circuits bootstrap); `Bootstrapped` is always an object, so
+ * `typeof result === "number"` is a safe discriminant at call sites. This
+ * lets a --fortress parse refusal exit with the canonical
+ * `FORTRESS_FLAG_USAGE_EXIT_CODE` (2) while every other bootstrap failure
+ * here keeps its existing exit 1 (an operation that ran and failed, not a
+ * malformed invocation).
+ */
 async function bootstrap(
   argv: string[],
   err: Writable,
   env: NodeJS.ProcessEnv,
-): Promise<Bootstrapped | null> {
+): Promise<Bootstrapped | number> {
   // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
   // refuse, never silently resolve the default fortress; wrong-fortress
   // checkpoint operations are a constraint-5 violation.
   const consumedFortress = consumeFlagValue(argv, "--fortress");
   if (consumedFortress.error !== undefined) {
-    write(err, `Error: ${consumedFortress.error}\n`);
-    return null;
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
   if (consumedFortress.value !== undefined) {
     process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;
@@ -293,7 +308,7 @@ async function bootstrap(
       err,
       "Error: sanctuary checkpoint requires SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY.\n",
     );
-    return null;
+    return 1;
   }
 
   const config = await loadConfig();
@@ -316,12 +331,12 @@ async function bootstrap(
         ? "Error: identity files found but none could be decrypted. Wrong passphrase?\n"
         : "No identities found in this fortress. Run `sanctuary identity create` first.\n",
     );
-    return null;
+    return 1;
   }
   const primary = identityManager.getDefault();
   if (!primary) {
     write(err, "No primary identity set.\n");
-    return null;
+    return 1;
   }
 
   const stateStore = new StateStore(storage, masterKey);
@@ -488,7 +503,7 @@ async function cmdCreate(
   env: NodeJS.ProcessEnv,
 ): Promise<number> {
   const boot = await bootstrap(argv, err, env);
-  if (!boot) return 1;
+  if (typeof boot === "number") return boot;
 
   try {
     const record = await createCheckpoint({
@@ -524,7 +539,7 @@ async function cmdRestore(
   }
 
   const boot = await bootstrap(argv, err, env);
-  if (!boot) return 1;
+  if (typeof boot === "number") return boot;
 
   const policy = await loadPrincipalPolicy(boot.config.storage_path);
   const baseline = new BaselineTracker(boot.storage, boot.masterKey);
@@ -597,7 +612,7 @@ async function cmdList(
 ): Promise<number> {
   const json = hasFlag(argv, "--json");
   const boot = await bootstrap(argv, err, env);
-  if (!boot) return 1;
+  if (typeof boot === "number") return boot;
 
   try {
     const records = await boot.checkpointStore.list();
@@ -638,7 +653,7 @@ async function cmdShow(
   }
 
   const boot = await bootstrap(argv, err, env);
-  if (!boot) return 1;
+  if (typeof boot === "number") return boot;
 
   try {
     const record = await boot.checkpointStore.get(id);
@@ -664,7 +679,7 @@ async function cmdPrune(
   env: NodeJS.ProcessEnv,
 ): Promise<number> {
   const boot = await bootstrap(argv, err, env);
-  if (!boot) return 1;
+  if (typeof boot === "number") return boot;
 
   try {
     const prunedIds = await pruneExpiredCheckpoints({

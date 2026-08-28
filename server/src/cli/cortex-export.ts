@@ -63,7 +63,12 @@ import {
   type VerifiedChainSource,
 } from "../castle-wall/export/index.js";
 import { loadFortressProducerKey } from "../castle-wall/runtime/producer-signature.js";
-import { consumeFlagValue, flagValue } from "./argv.js";
+import {
+  consumeFlagValue,
+  flagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 export interface CortexExportCommandArgs {
   argv: string[];
@@ -344,8 +349,8 @@ async function cmdRun(
   // cortex-export runs are a constraint-5 violation.
   const consumedFortress = consumeFlagValue(argv, "--fortress");
   if (consumedFortress.error !== undefined) {
-    write(err, `Error: ${consumedFortress.error}\n`);
-    return 1;
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
   const fortressFlag = consumedFortress.value;
   if (fortressFlag !== undefined) {

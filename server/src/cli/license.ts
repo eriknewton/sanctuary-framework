@@ -55,7 +55,12 @@ import {
   writeLedgerGenerationAnchor,
 } from "../entitlement/ledger-antirollback.js";
 import { openIssuer, openVerifier } from "./custody-unlock.js";
-import { consumeFlagValue, flagValue } from "./argv.js";
+import {
+  consumeFlagValue,
+  flagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 /** Default feature set for the standard Team offering (sold set, not tier-implied). */
 const DEFAULT_TEAM_FEATURES = ["roster", "policy-dist"] as const;
@@ -133,8 +138,8 @@ async function runIssue(
   // against the wrong fortress is a constraint-5 violation.
   const consumedFortress = consumeFlagValue(argv, "--fortress");
   if (consumedFortress.error !== undefined) {
-    write(err, `issue: ${consumedFortress.error}\n`);
-    return 1;
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
   const flags = parseIssueFlags(consumedFortress.argv, env, consumedFortress.value);
 
@@ -365,8 +370,8 @@ async function runList(
   // fortress's licenses is a constraint-5 violation.
   const consumedFortress = consumeFlagValue(argv, "--fortress");
   if (consumedFortress.error !== undefined) {
-    write(err, `list: ${consumedFortress.error}\n`);
-    return 1;
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
   const fortress = consumedFortress.value;
   const asJson = hasFlag(argv, "--json");
@@ -518,8 +523,8 @@ async function runRevoke(
   // mistaken for the <licenseId> positional.
   const consumedFortress = consumeFlagValue(argv, "--fortress");
   if (consumedFortress.error !== undefined) {
-    write(err, `revoke: ${consumedFortress.error}\n`);
-    return 1;
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
   const filteredArgv = consumedFortress.argv;
   const licenseId = filteredArgv.find((a) => !a.startsWith("--"));

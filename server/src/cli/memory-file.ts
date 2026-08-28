@@ -41,7 +41,13 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../sdw/memory-provenance-signing.js";
 import { SdwMemoryProvenanceMigration } from "../sdw/memory-provenance-migration.js";
-import { consumeFlagValue, consumeFlagValues, flagValue, hasFlag } from "./argv.js";
+import {
+  consumeFlagValue,
+  consumeFlagValues,
+  flagValue,
+  fortressFlagRefusalText,
+  hasFlag,
+} from "./argv.js";
 
 export interface MemoryFileCommandArgs {
   readonly argv: string[];
@@ -528,7 +534,7 @@ function parseCommonArgs(
   // memory ingest/emit operations are a constraint-5 violation.
   const consumedFortress = consumeFlagValue([...argv], "--fortress");
   if (consumedFortress.error !== undefined) {
-    write(err, `${command}: ${consumedFortress.error}\n`);
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
     return null;
   }
   return {
@@ -590,7 +596,7 @@ function parseVaultArgs(
   // vault operations are a constraint-5 violation.
   const consumedFortress = consumeFlagValue([...argv], "--fortress");
   if (consumedFortress.error !== undefined) {
-    write(err, `${command}: ${consumedFortress.error}\n`);
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
     return null;
   }
   return {

@@ -9,7 +9,12 @@
 import { resolve } from "node:path";
 import { existsSync, readdirSync } from "node:fs";
 import { BACKEND_FALLBACK_STRINGS } from "../intelligence/templates.js";
-import { consumeFlagValue } from "./argv.js";
+import {
+  aliasConflictMessage,
+  consumeFlagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 /**
  * Print the model-choice privacy tradeoff to the operator-facing CLI channel.
@@ -119,8 +124,8 @@ async function runDiagnose(argv: string[] = []): Promise<number> {
   const consumedFortress = consumeFlagValue(argv, "--fortress");
   if (consumedFortress.error !== undefined) {
     // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(`Error: ${consumedFortress.error}`);
-    return 1;
+    console.error(fortressFlagRefusalText(consumedFortress.error));
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
   const consumedFortressPath = consumeFlagValue(
     consumedFortress.argv,
@@ -128,8 +133,19 @@ async function runDiagnose(argv: string[] = []): Promise<number> {
   );
   if (consumedFortressPath.error !== undefined) {
     // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(`Error: ${consumedFortressPath.error}`);
-    return 1;
+    console.error(fortressFlagRefusalText(consumedFortressPath.error));
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
+  }
+  // IC-30 fix-round finding #3: --fortress and --fortress-path are ALIASES
+  // for the same value; giving both must refuse rather than let `??` below
+  // silently pick --fortress over --fortress-path regardless of which one
+  // the operator meant.
+  if (consumedFortress.value !== undefined && consumedFortressPath.value !== undefined) {
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      fortressFlagRefusalText(aliasConflictMessage("--fortress", "--fortress-path")),
+    );
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
   const fortressFlag = consumedFortress.value ?? consumedFortressPath.value;
   const storagePath = resolve(
