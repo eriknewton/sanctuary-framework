@@ -10,8 +10,8 @@
  *   - `status`  one-line-per-tenant summary (running / stopped + counts).
  *   - `config <tenant> --approval-redirect=<bool>` (v1.3 Upsilon-2)
  *               Writes principal-policy.yaml on disk for the tenant.
- *               Takes effect only after the tenant's Sanctuary server
- *               process is stopped and started again. AGENTS.md MUST-NEVER
+ *               Takes effect the next time the tenant's Sanctuary server
+ *               starts. AGENTS.md MUST-NEVER
  *               #7 freezes the Principal Policy at boot: it is loaded once
  *               and never re-read, so a running server keeps enforcing the
  *               policy it booted with no matter how many times this verb

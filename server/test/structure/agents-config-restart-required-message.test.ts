@@ -55,10 +55,10 @@ describe("IC-26: agents config restart-required message is honest", () => {
     expect(window).toContain("IC-26");
   });
 
-  it("states the restart requirement in the config verb's doc-comment header", () => {
+  it("states the next-start effect timing in the config verb's doc-comment header", () => {
     const source = read(CLI_PATH);
     expect(source).toContain(
-      "Takes effect only after the tenant's Sanctuary server",
+      "Takes effect the next time the tenant's Sanctuary server",
     );
     expect(source).toContain("MUST-NEVER");
   });
