@@ -49,6 +49,7 @@ import {
   type AutoTriggerRuleType,
   type ThresholdOverrides,
 } from "../auto-trigger/types.js";
+import { CUSUM_ANOMALY_RULE_ID } from "../anomaly-detection/anomaly-catalog.js";
 
 export interface AutoTriggerArgs {
   argv: string[];
@@ -394,6 +395,17 @@ async function cmdRulesSetThreshold(
     return 2;
   }
   const warnSigma = parseNumberFlag(argv, "--warn-sigma");
+  // The CUSUM per-agent-activity rule has exactly one configurable
+  // threshold (alert_sigma); it has no warning boundary a warn_sigma
+  // value can safely bind to (see the mapping-derivation comment on its
+  // ANOMALY_CATALOG entry). Refuse here rather than persist a value
+  // the read path (anomaly-catalog.ts) will only ever refuse to honor.
+  if (warnSigma !== undefined && ruleId === CUSUM_ANOMALY_RULE_ID) {
+    ctx.err.write(
+      `set-threshold: rule ${ruleId} (per-agent-activity + cusum) has no configurable warning boundary; only --alert-sigma is supported for this rule\n`,
+    );
+    return 2;
+  }
   const alertSigma = parseNumberFlag(argv, "--alert-sigma");
   const promotionFireCount = parseNumberFlag(argv, "--promotion-fire-count");
   const promotionWindowDays = parseNumberFlag(argv, "--promotion-window-days");

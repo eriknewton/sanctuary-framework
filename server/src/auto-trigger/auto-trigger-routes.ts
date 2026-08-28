@@ -55,6 +55,7 @@ import {
   type RuleThresholdConfig,
   type ThresholdOverrides,
 } from "./types.js";
+import { CUSUM_ANOMALY_RULE_ID } from "../anomaly-detection/anomaly-catalog.js";
 
 export const AUTO_TRIGGER_API_PREFIX = "/api/auto-trigger";
 
@@ -320,6 +321,23 @@ export async function handleAutoTriggerRoute(
           return true;
         }
         const overrides = sanitizeOverrides(body.threshold_overrides);
+        // Mirrors the CLI's `set-threshold` guard (cli/auto-trigger.ts):
+        // the CUSUM per-agent-activity rule has no configurable warning
+        // boundary -- see the mapping-derivation comment on its
+        // ANOMALY_CATALOG entry. Refuse rather than persist a value the
+        // read path will only ever refuse to honor.
+        if (
+          overrides &&
+          Object.prototype.hasOwnProperty.call(overrides, "warn_sigma") &&
+          match.ruleId === CUSUM_ANOMALY_RULE_ID
+        ) {
+          writeJSON(res, 400, {
+            ok: false,
+            error: "no_warning_boundary",
+            detail: `rule ${match.ruleId} (per-agent-activity + cusum) has no configurable warning boundary; only alert_sigma is supported for this rule`,
+          });
+          return true;
+        }
         const cancelWindow = sanitizeCancelWindow(body.cancel_window_seconds);
         const patch: Parameters<ActionDispatcher["updateThresholds"]>[2] = {};
         if (overrides) patch.threshold_overrides = overrides;

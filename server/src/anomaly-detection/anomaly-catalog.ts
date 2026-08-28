@@ -59,7 +59,7 @@ import { PSI_CLASSIFIER_ID, PsiClassifier } from "./classifiers/psi.js";
 import { ClassifierStateStore } from "./classifier-state-store.js";
 import type { AnomalyClassifier, AnomalyContext, AnomalyDetector } from "./types.js";
 import { ThresholdConfigStore } from "../auto-trigger/threshold-config-store.js";
-import { anomalyRuleId } from "../auto-trigger/types.js";
+import { anomalyRuleId, type ThresholdOverrides } from "../auto-trigger/types.js";
 
 /**
  * One detector + classifier combination. The detectorId + classifierId
@@ -88,41 +88,103 @@ export interface AnomalyCatalogEntry {
 }
 
 /**
- * Read this rule's persisted `warn_sigma`/`alert_sigma` overrides (if
- * any) and validate them to finite positive numbers -- an absent,
- * malformed, or non-positive override is dropped so the caller falls
- * back to the classifier's own compiled-in default rather than ever
- * widening detection (IC-29: "an absent/partial override never widens
- * detection, fail toward the existing defaults, never toward
- * silence"). `ThresholdConfigStore.get()` itself already resolves a
- * corrupt/undecryptable record to `null`, so a storage or crypto
- * failure here also falls through to "no override" rather than
- * throwing.
+ * The rule_id the CUSUM per-agent-activity entry's overrides are
+ * persisted under -- the exact key `sanctuary auto-trigger rules
+ * set-threshold` and the PATCH route write to. Exported as a single
+ * source of truth so the CLI/route write-time guard (which must refuse
+ * `warn_sigma` for this specific rule; see `loadCusumSigmaOverride`
+ * below) and this read path never drift apart on what "this rule"
+ * means.
  */
-async function loadValidatedSigmaOverrides(
+export const CUSUM_ANOMALY_RULE_ID = anomalyRuleId(
+  PER_AGENT_ACTIVITY_DETECTOR_ID,
+  CUSUM_CLASSIFIER_ID,
+);
+
+/**
+ * Raised when this rule's persisted `threshold_overrides` cannot be
+ * safely honored: a real store read failure, or a row shape that is
+ * unsupported or internally invalid for the CUSUM classifier. The
+ * catalog refuses the subscription in every such case rather than
+ * silently substituting the classifier's compiled default, because a
+ * silent substitution is indistinguishable, from the operator's side,
+ * from the override being honored.
+ */
+export class AnomalyThresholdOverrideError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AnomalyThresholdOverrideError";
+  }
+}
+
+/**
+ * Read + validate this rule's persisted override for `h` (see the
+ * mapping note on the CUSUM catalog entry below for why only
+ * `alert_sigma` has a home here). Three failure classes all refuse via
+ * `AnomalyThresholdOverrideError` rather than falling back to the
+ * compiled default, because a fallback here is indistinguishable from
+ * the override being honored:
+ *
+ *  1. `ThresholdConfigStore.getResult` reports `"error"` -- the row
+ *     exists but could not be read back as written.
+ *  2. The row's `threshold_overrides` carries a `warn_sigma` key at
+ *     all (any value) -- this classifier has no field that key can
+ *     safely bind to.
+ *  3. The row's `alert_sigma` key is present but not a finite positive
+ *     number.
+ *
+ * `"absent"` (no row for this rule_id yet) and a row whose
+ * `threshold_overrides` touches neither key both return `{}`, which is
+ * the one shape that means "compiled defaults apply" -- never a
+ * partially-applied row.
+ */
+async function loadCusumSigmaOverride(
   context: AnomalyContext,
-  detectorId: string,
-  classifierId: string,
-): Promise<{ warnSigma?: number; alertSigma?: number }> {
+): Promise<{ alertSigma?: number }> {
   const store = new ThresholdConfigStore({
     storage: context.storage,
     masterKey: context.masterKey,
     fortressId: context.fortressId,
     now: context.now,
   });
-  const config = await store.get(anomalyRuleId(detectorId, classifierId));
-  const overrides = config?.threshold_overrides;
+  const result = await store.getResult(CUSUM_ANOMALY_RULE_ID);
+  if (result.status === "error") {
+    throw new AnomalyThresholdOverrideError(
+      `rule ${CUSUM_ANOMALY_RULE_ID}: threshold overrides could not be read (${describeError(result.error)}); refusing the subscription`,
+    );
+  }
+  if (result.status === "absent") return {};
+  const overrides = result.config.threshold_overrides;
   if (!overrides) return {};
-  const warnSigma = positiveFiniteOrUndefined(overrides.warn_sigma);
-  const alertSigma = positiveFiniteOrUndefined(overrides.alert_sigma);
-  return {
-    ...(warnSigma !== undefined ? { warnSigma } : {}),
-    ...(alertSigma !== undefined ? { alertSigma } : {}),
-  };
+  return validateCusumOverrideRow(overrides);
 }
 
-function positiveFiniteOrUndefined(n: number | undefined): number | undefined {
-  return n !== undefined && Number.isFinite(n) && n > 0 ? n : undefined;
+function validateCusumOverrideRow(
+  overrides: ThresholdOverrides,
+): { alertSigma?: number } {
+  if (Object.prototype.hasOwnProperty.call(overrides, "warn_sigma")) {
+    throw new AnomalyThresholdOverrideError(
+      `rule ${CUSUM_ANOMALY_RULE_ID}: warn_sigma is set but the CUSUM classifier has no configurable warning boundary for this rule (only alert_sigma); refusing the subscription`,
+    );
+  }
+  if (!Object.prototype.hasOwnProperty.call(overrides, "alert_sigma")) {
+    return {};
+  }
+  const alertSigma = overrides.alert_sigma;
+  if (
+    typeof alertSigma !== "number" ||
+    !Number.isFinite(alertSigma) ||
+    alertSigma <= 0
+  ) {
+    throw new AnomalyThresholdOverrideError(
+      `rule ${CUSUM_ANOMALY_RULE_ID}: alert_sigma is set but is not a finite positive number; refusing the subscription`,
+    );
+  }
+  return { alertSigma };
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /**
@@ -147,26 +209,39 @@ export const ANOMALY_CATALOG: AnomalyCatalogEntry[] = [
     description:
       "Per-agent CUSUM drift detector over the same per-agent activity feature stream. Catches slow mean shifts that single-sample baselines may miss.",
     factory: () => new PerAgentActivityDetector(),
-    // Mapping derivation (IC-29): CusumClassifierOptions exposes exactly
-    // two sigma-unit knobs, `k` ("sensitivity slack, in sigma units")
-    // and `h` ("decision threshold, in sigma units"), and the class doc
-    // itself names h as the alert boundary verbatim -- "Alert fires
-    // when max(C+, C-) crosses h*sigma" -- so `alert_sigma` maps to `h`
-    // by a direct terminology match. `k` is the only remaining
-    // sigma-unit knob, governing how much a sample must deviate before
-    // it starts accumulating toward that alert boundary (the
-    // "early-warning" slack), so `warn_sigma` maps to `k` by
-    // elimination + unit match. This side (the catalog, not the CLI or
-    // the classifier) owns the mapping; CusumClassifier still owns the
-    // `?? DEFAULT_CUSUM_K` / `?? DEFAULT_CUSUM_H` fallback, so an
-    // absent or invalid override reaches the constructor as `undefined`
-    // and never overrides the default.
+    // Mapping derivation (IC-29, revised in fix-round 2): only
+    // `alert_sigma -> h` is wired. `h` ("decision threshold, in sigma
+    // units") is a direct terminology match: the classifier's own class
+    // doc names h the alert boundary verbatim -- "Alert fires when
+    // max(C+, C-) crosses h*sigma".
+    //
+    // `warn_sigma` was previously mapped to `k` ("sensitivity slack, in
+    // sigma units") "by elimination" -- that mapping was wrong and is
+    // NOT restored. `k` is subtracted from every observation BEFORE
+    // accumulation (cusum.ts observe(): `c_plus + devFromOldMean -
+    // kScaled`); a `k` at or above the true drift magnitude prevents
+    // the accumulator from ever growing, so a larger "warning" value
+    // there would suppress detection rather than add an earlier
+    // warning -- the opposite of what an operator setting a warning
+    // knob would expect.
+    //
+    // The alternative -- wiring warn_sigma into `severityFromAnomalyScore`
+    // (types.ts), the shared info/warn/alert cutover at score 3 -- was
+    // also considered and rejected: that function is one fixed
+    // classifier-agnostic scale shared by rolling-baseline, CUSUM, and
+    // PSI, and CUSUM's own `anomaly_score` is already normalized to `h`
+    // (1.0 == the alert crossing), not raw sigma units, so a "warn at
+    // score >= 3" cutover means something different per classifier and
+    // reinterpreting it per-rule is a materially larger, separate
+    // architectural change, not a safe narrow mapping.
+    //
+    // CUSUM therefore has no configurable warning boundary today.
+    // `loadCusumSigmaOverride` refuses (throws) rather than silently
+    // drops a persisted `warn_sigma` for this rule, and the CLI /
+    // PATCH-route write paths refuse `--warn-sigma`/`warn_sigma` for
+    // this rule_id up front (see `CUSUM_ANOMALY_RULE_ID` importers).
     classifierFactory: async (context) => {
-      const { warnSigma, alertSigma } = await loadValidatedSigmaOverrides(
-        context,
-        PER_AGENT_ACTIVITY_DETECTOR_ID,
-        CUSUM_CLASSIFIER_ID,
-      );
+      const { alertSigma } = await loadCusumSigmaOverride(context);
       return new CusumClassifier({
         stateStore: new ClassifierStateStore({
           storage: context.storage,
@@ -174,7 +249,6 @@ export const ANOMALY_CATALOG: AnomalyCatalogEntry[] = [
           fortressId: context.fortressId,
           now: context.now,
         }),
-        ...(warnSigma !== undefined ? { k: warnSigma } : {}),
         ...(alertSigma !== undefined ? { h: alertSigma } : {}),
       });
     },
