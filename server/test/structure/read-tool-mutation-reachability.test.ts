@@ -1480,6 +1480,106 @@ class ConcreteRunner implements Runner { run(): void { execSync("id"); } }
 export function handler(value: Runner): void { value.run(); }
 `,
   },
+  {
+    what: "a direct type alias preserves interface dispatch",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+interface Runner { run(): void; }
+type Alias = Runner;
+class ConcreteRunner implements Alias { run(): void { execSync("id"); } }
+export function handler(value: Runner): void { value.run(); }
+`,
+  },
+  {
+    what: "a chained type alias preserves interface dispatch",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+interface Runner { run(): void; }
+type FirstAlias = Runner;
+type SecondAlias = FirstAlias;
+class ConcreteRunner implements SecondAlias { run(): void { execSync("id"); } }
+export function handler(value: Runner): void { value.run(); }
+`,
+  },
+  {
+    what: "an intersection alias indexes each named interface constituent",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+interface Runner { run(): void; }
+interface Labelled { readonly label: string; }
+type Alias = Runner & Labelled;
+class ConcreteRunner implements Alias {
+  readonly label = "concrete";
+  run(): void { execSync("id"); }
+}
+export function handler(value: Runner): void { value.run(); }
+`,
+  },
+  {
+    what: "a renamed imported type alias preserves interface dispatch",
+    expect: ["child_process.execSync"],
+    siblings: {
+      model: `
+export interface Runner { run(): void; }
+export type Alias = Runner;
+`,
+    },
+    code: `
+import { execSync } from "node:child_process";
+import { Alias as ImportedAlias, Runner } from "./model.js";
+class ConcreteRunner implements ImportedAlias { run(): void { execSync("id"); } }
+export function handler(value: Runner): void { value.run(); }
+`,
+  },
+  {
+    what: "a namespace-qualified type alias preserves interface dispatch",
+    expect: ["child_process.execSync"],
+    siblings: {
+      model: `
+export interface Runner { run(): void; }
+export type Alias = Runner;
+`,
+    },
+    code: `
+import { execSync } from "node:child_process";
+import * as model from "./model.js";
+class ConcreteRunner implements model.Alias { run(): void { execSync("id"); } }
+export function handler(value: model.Runner): void { value.run(); }
+`,
+  },
+  {
+    what: "a static base member does not match a subclass instance member",
+    expect: [],
+    code: `
+import { execSync } from "node:child_process";
+class Base { static run(): void {} }
+class Child extends Base { run(): void { execSync("id"); } }
+export function handler(): void { Base.run(); }
+`,
+  },
+  {
+    what: "an instance base member does not match a subclass static member",
+    expect: [],
+    code: `
+import { execSync } from "node:child_process";
+class Base { run(): void {} }
+class Child extends Base { static run(): void { execSync("id"); } }
+export function handler(value: Base): void { value.run(); }
+`,
+  },
+  {
+    what: "a static member dispatches to a static subclass override",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+class Base { static run(): void {} }
+class Child extends Base { static override run(): void { execSync("id"); } }
+export function handler(value: typeof Base): void { value.run(); }
+`,
+  },
 ];
 
 function resolveClassDispatchFixtures(): Map<string, string[]> {
@@ -1524,6 +1624,17 @@ function resolveClassDispatchFixtures(): Map<string, string[]> {
 
   const program = ts.createProgram([...virtual.keys()], options, host);
   const checker = program.getTypeChecker();
+  const diagnostics = [
+    ...program.getSyntacticDiagnostics(),
+    ...program.getSemanticDiagnostics(),
+  ].filter((diagnostic) => diagnostic.file !== undefined && virtual.has(diagnostic.file.fileName));
+  if (diagnostics.length > 0) {
+    throw new Error(
+      `invalid class-dispatch fixture:\n${diagnostics
+        .map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"))
+        .join("\n")}`
+    );
+  }
   const sources = program.getSourceFiles().filter((source) => virtual.has(source.fileName));
   const resolver = createCalleeResolver(checker, createImplementationLookup(checker, sources));
   const resolved = new Map<string, string[]>();

@@ -112,10 +112,16 @@
  *     on every source-local named class declaration below it in the heritage
  *     graph. Heritage edges are keyed by checker symbols rather than bare
  *     names, so unrelated declarations named `Base` cannot contaminate one
- *     another; the walk is
- *     transitive and includes every subclass rather than choosing one concrete
- *     target. Both method signatures (`save(x): void`) and function-typed
- *     property signatures (`save: (x) => void`) are covered. THE INTERFACE
+ *     another; type aliases are resolved to the named class/interface types
+ *     they denote, including each named constituent of an intersection. Union
+ *     aliases are deliberately not indexed: TypeScript rejects a union in an
+ *     `extends`/`implements` clause, so no valid source relies on one and this
+ *     analyzer claims none. The walk is transitive and includes every subclass
+ *     rather than choosing one concrete target. A descendant member must match
+ *     both name and staticness, so an instance member cannot stand in for a
+ *     static member or vice versa. Both method signatures (`save(x): void`)
+ *     and function-typed property signatures (`save: (x) => void`) are
+ *     covered. THE INTERFACE
  *     PROPERTY-SIGNATURE SPELLING IS INERT TODAY and is not claimed otherwise:
  *     of 685 function-typed property-signature members across 363 interfaces in
  *     `src`, the heritage index resolves 0, so that branch fixes no call site.
@@ -1663,12 +1669,37 @@ export function createImplementationLookup(
   type HeritageOwner = ts.ClassDeclaration | ts.InterfaceDeclaration;
   const children = new Map<ts.Symbol, HeritageOwner[]>();
 
-  const canonicalSymbolAt = (node: ts.Node): ts.Symbol | undefined => {
-    let symbol = checker.getSymbolAtLocation(node);
+  const canonicalSymbol = (input: ts.Symbol | undefined): ts.Symbol | undefined => {
+    let symbol = input;
     if (symbol !== undefined && (symbol.flags & ts.SymbolFlags.Alias) !== 0) {
       symbol = checker.getAliasedSymbol(symbol);
     }
     return symbol;
+  };
+  const canonicalSymbolAt = (node: ts.Node): ts.Symbol | undefined =>
+    canonicalSymbol(checker.getSymbolAtLocation(node));
+
+  /**
+   * Resolve one legal heritage type to the named declarations it denotes.
+   * Ordinary and chained type aliases collapse through the checker's type;
+   * intersections contribute every named class/interface constituent. A union
+   * contributes none because TypeScript does not permit unions as heritage
+   * types, and indexing one would claim behavior no valid program can use.
+   */
+  const heritageTargetSymbols = (heritage: ts.ExpressionWithTypeArguments): ts.Symbol[] => {
+    const resolved = checker.getTypeAtLocation(heritage);
+    if (resolved.isUnion()) return [];
+    const types = resolved.isIntersection() ? resolved.types : [resolved];
+    const out: ts.Symbol[] = [];
+    for (const type of types) {
+      const symbol = canonicalSymbol(type.getSymbol());
+      if (symbol === undefined || out.includes(symbol)) continue;
+      const isNamedHeritageDeclaration = (symbol.getDeclarations() ?? []).some(
+        (decl) => ts.isClassDeclaration(decl) || ts.isInterfaceDeclaration(decl)
+      );
+      if (isNamedHeritageDeclaration) out.push(symbol);
+    }
+    return out;
   };
 
   for (const sf of sources) {
@@ -1676,9 +1707,9 @@ export function createImplementationLookup(
       if (ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node)) {
         for (const clause of node.heritageClauses ?? []) {
           for (const type of clause.types) {
-            const parent = canonicalSymbolAt(type.expression);
-            if (parent === undefined) continue;
-            children.set(parent, [...(children.get(parent) ?? []), node]);
+            for (const parent of heritageTargetSymbols(type)) {
+              children.set(parent, [...(children.get(parent) ?? []), node]);
+            }
           }
         }
       }
@@ -1698,6 +1729,8 @@ export function createImplementationLookup(
         ? signature.name.text
         : undefined;
     if (memberName === undefined) return [];
+    const signatureIsStatic =
+      (ts.getCombinedModifierFlags(signature) & ts.ModifierFlags.Static) !== 0;
     const out: ts.Declaration[] = [];
     const seen = new Set<ts.Symbol>([ownerSymbol]);
     const pending = [...(children.get(ownerSymbol) ?? [])];
@@ -1712,7 +1745,11 @@ export function createImplementationLookup(
         for (const member of child.members) {
           if (!ts.isMethodDeclaration(member) && !ts.isPropertyDeclaration(member)) continue;
           if (!ts.isIdentifier(member.name) && !ts.isStringLiteral(member.name)) continue;
-          if (member.name.text === memberName) out.push(member);
+          const memberIsStatic =
+            (ts.getCombinedModifierFlags(member) & ts.ModifierFlags.Static) !== 0;
+          if (member.name.text === memberName && memberIsStatic === signatureIsStatic) {
+            out.push(member);
+          }
         }
       }
       pending.push(...(children.get(childSymbol) ?? []));
