@@ -71,10 +71,15 @@ import {
   analyzeReadToolMutationReachability,
   createCalleeResolver,
   createImplementationLookup,
+  deduplicateTraversalTruncations,
   sinksForTool,
   walkForSinks,
 } from "./read-tool-mutation-reachability.js";
-import type { SinkHit } from "./read-tool-mutation-reachability.js";
+import type {
+  SinkHit,
+  TraversalTruncation,
+  TraversalTruncationKind,
+} from "./read-tool-mutation-reachability.js";
 
 interface ReviewedSite {
   /** Must equal `SinkHit.primitive` exactly. */
@@ -1669,6 +1674,126 @@ function resolveClassDispatchFixtures(): Map<string, string[]> {
   return resolved;
 }
 
+interface TraversalFixtureResult {
+  readonly sinks: readonly string[];
+  readonly truncations: readonly TraversalTruncationKind[];
+}
+
+function resolveTraversalFixture(code: string): TraversalFixtureResult {
+  const options: ts.CompilerOptions = {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    lib: ["lib.es2022.d.ts"],
+    strict: true,
+    noEmit: true,
+    skipLibCheck: true,
+  };
+  const fileName = join(TEST_STRUCTURE_DIR, "traversal-cap.virtual.ts");
+  const host = ts.createCompilerHost(options, true);
+  const baseGetSourceFile = host.getSourceFile.bind(host);
+  const baseFileExists = host.fileExists.bind(host);
+  const baseReadFile = host.readFile.bind(host);
+  host.getSourceFile = (candidate, languageVersion, onError, shouldCreate) =>
+    candidate === fileName
+      ? ts.createSourceFile(candidate, code, languageVersion, true, ts.ScriptKind.TS)
+      : baseGetSourceFile(candidate, languageVersion, onError, shouldCreate);
+  host.fileExists = (candidate) => candidate === fileName || baseFileExists(candidate);
+  host.readFile = (candidate) => candidate === fileName ? code : baseReadFile(candidate);
+  host.getCurrentDirectory = () => FIXTURE_SERVER_DIR;
+
+  const program = ts.createProgram([fileName], options, host);
+  const diagnostics = [
+    ...program.getSyntacticDiagnostics(),
+    ...program.getSemanticDiagnostics(),
+  ].filter((diagnostic) => diagnostic.file?.fileName === fileName);
+  if (diagnostics.length > 0) {
+    throw new Error(
+      `invalid traversal fixture:\n${diagnostics
+        .map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"))
+        .join("\n")}`
+    );
+  }
+
+  const source = program.getSourceFile(fileName);
+  if (source === undefined) throw new Error("traversal fixture did not load");
+  let handler: ts.FunctionDeclaration | undefined;
+  const findHandler = (node: ts.Node): void => {
+    if (ts.isFunctionDeclaration(node) && node.name?.text === "handler") handler = node;
+    ts.forEachChild(node, findHandler);
+  };
+  findHandler(source);
+  if (handler === undefined) throw new Error("traversal fixture has no handler");
+
+  const rawTruncations: TraversalTruncation[] = [];
+  const record = (kind: TraversalTruncationKind, node: ts.Node): void => {
+    const line = node.getSourceFile().getLineAndCharacterOfPosition(node.getStart()).line + 1;
+    rawTruncations.push({ kind, tool: "fixture", site: `traversal-cap.virtual.ts:${line}` });
+  };
+  const checker = program.getTypeChecker();
+  const resolver = createCalleeResolver(checker, () => [], record);
+  const sinks: string[] = [];
+  walkForSinks(
+    handler,
+    checker,
+    resolver,
+    TEST_STRUCTURE_DIR,
+    (_node, primitive) => { sinks.push(primitive); },
+    new Set<string>(),
+    0,
+    ["handler"],
+    [],
+    undefined,
+    record,
+  );
+  return {
+    sinks: [...new Set(sinks)].sort(),
+    truncations: deduplicateTraversalTruncations(rawTruncations).map(({ kind }) => kind),
+  };
+}
+
+function callDepthFixture(depth: number): string {
+  const functions = Array.from({ length: depth }, (_, index) => {
+    const name = `f${index + 1}`;
+    const body = index + 1 === depth ? `execSync("id");` : `f${index + 2}();`;
+    return `function ${name}(): void { ${body} }`;
+  }).join("\n");
+  return `
+import { execSync } from "node:child_process";
+${functions}
+export function handler(): void { f1(); }
+`;
+}
+
+function aliasFixture(aliases: number): string {
+  const declarations: string[] = [];
+  for (let index = aliases - 1; index >= 0; index -= 1) {
+    const target = index === aliases - 1 ? "execSync" : `a${index + 1}`;
+    declarations.push(`const a${index}: (command: string) => unknown = ${target};`);
+  }
+  return `
+import { execSync } from "node:child_process";
+${declarations.join("\n")}
+export function handler(): void { void a0("id"); }
+`;
+}
+
+function castFixture(wrappers: number): string {
+  return `
+import { execSync } from "node:child_process";
+const f: (command: string) => unknown = execSync${"!".repeat(wrappers)};
+export function handler(): void { void f("id"); }
+`;
+}
+
+function reflectiveFixture(hops: number): string {
+  return `
+import { execSync } from "node:child_process";
+function noop(): void {}
+export function handler(): void { void execSync${".call".repeat(hops)}(noop, null, "id"); }
+`;
+}
+
 describe("read-classified MCP tools and durable-state mutation", () => {
   const report = analyzeReadToolMutationReachability();
   let resolvedLaunderingFixtures: Map<string, string[]>;
@@ -1734,6 +1859,34 @@ describe("read-classified MCP tools and durable-state mutation", () => {
     // as clean. Absent must not read as passing: it fails here instead.
     expect(report.unresolvedHandlers).toEqual([]);
     expect(report.handlerLocations.size).toBe(report.readTools.length);
+  });
+
+  it("completes the shipping-tree analysis without traversal truncation", () => {
+    expect(report.truncations).toEqual([]);
+  });
+
+  it.each([
+    ["call depth boundary", callDepthFixture(60), ["child_process.execSync"], []],
+    ["call depth boundary plus one", callDepthFixture(61), [], ["call_depth"]],
+    ["explicit depth 65", callDepthFixture(65), [], ["call_depth"]],
+    ["four alias hops", aliasFixture(4), ["child_process.execSync"], []],
+    ["five alias hops", aliasFixture(5), [], ["alias_hops"]],
+    ["explicit seven alias hops", aliasFixture(7), [], ["alias_hops"]],
+    ["ten cast wrappers", castFixture(10), ["child_process.execSync"], []],
+    ["eleven cast wrappers", castFixture(11), [], ["cast_hops"]],
+    ["four reflective hops", reflectiveFixture(4), ["child_process.execSync"], []],
+    ["five reflective hops", reflectiveFixture(5), [], ["reflective_hops"]],
+  ] as const)("fails loud at traversal cap: %s", (_what, code, sinks, truncations) => {
+    expect(resolveTraversalFixture(code)).toEqual({ sinks, truncations });
+  });
+
+  it("deduplicates stable truncation records", () => {
+    const record: TraversalTruncation = {
+      kind: "alias_hops",
+      tool: "fixture",
+      site: "test/structure/traversal-cap.virtual.ts:1",
+    };
+    expect(deduplicateTraversalTruncations([record, record])).toEqual([record]);
   });
 
   it("analyzed every inline tool literal it found", () => {
@@ -1926,8 +2079,8 @@ describe("read-classified MCP tools and durable-state mutation", () => {
     // refused still claimed its triple, and a later SHORTER route to the same
     // pair was skipped as already-walked. The observable effect was a sink two
     // hops from a handler going unreported because an unrelated deep traversal
-    // touched the same pair first: a cap that fails open locally silently
-    // blanking an unrelated shallow path.
+    // touched the same pair first: a truncated deep path silently blanking an
+    // unrelated shallow path. Exhaustion now records a separate loud finding.
     //
     // The ceiling is `MAX_CALL_DEPTH`, so a childDepth of `Number.MAX_SAFE_INTEGER`
     // is refused under any value of it and this case never needs editing when

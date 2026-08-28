@@ -226,17 +226,13 @@
  *     also not total over the ways one declaration stands in for another; the
  *     dispatch residual is stated separately and resolves in the same register
  *     entry.
- *   - THE FOUR TRAVERSAL CAPS FAIL OPEN, THOUGH NO LONGER SILENTLY BEYOND
- *     THEMSELVES. Call depth, alias hops, cast hops, and reflective hops each
- *     stop on exhaustion with nothing recorded, so exhausting one is
- *     indistinguishable from finding nothing ALONG THAT PATH. It can no longer
- *     do worse than that: a descent refused by the depth ceiling leaves the
+ *   - THE FOUR TRAVERSAL CAPS FAIL LOUD. Call depth, alias hops, cast hops, and
+ *     reflective hops still bound pathological source, but each records a typed
+ *     truncation when traversable work remains beyond its ceiling. The shipping
+ *     guard asserts that no such record exists, so exhaustion cannot read as a
+ *     clean analysis. A descent refused by the depth ceiling also leaves the
  *     walk's memo untouched (`admitDescent`), so exhaustion cannot suppress a
- *     sink on a shorter, unrelated path that reaches the same pair. It could,
- *     until this revision. This remains the file's own exception to its thesis,
- *     which is why it is stated at the claim rather than left to a reader of
- *     the constants. Recording a truncation and asserting there are none is the
- *     remaining fix; it is not built here.
+ *     sink on a shorter, unrelated path that reaches the same pair.
  *   - THE LAUNDERING CLOSURE HAS NO REAL-TREE WITNESS. With the expanded-set
  *     classification disabled, every real-tree assertion in the test still
  *     passes and only the synthetic corpus reds. The corpus is that closure's
@@ -505,14 +501,8 @@ const PRIMITIVE_DISPATCH_FUNCTIONS: ReadonlySet<string> = new Set(["callPrimitiv
  * memoizes each function body per tool, so it terminates on its own. This only
  * bounds a pathological chain.
  *
- * IT FAILS OPEN, and an earlier version of this comment claimed the opposite —
- * that it "keeps a stack overflow from reading as a pass". Exhausting it IS a
- * pass: the walk returns with nothing recorded and the result is
- * indistinguishable from a clean one. The same is true of the three hop
- * ceilings below. The bound is stated in the header rather than only here,
- * because a cap that fails open in a file whose thesis is that absent must not
- * read as passing is the file's own exception and has to be visible from the
- * claim, not just from the constant.
+ * Exhaustion is reported when a walkable body remains beyond the ceiling; the
+ * shipping guard requires an empty truncation report.
  */
 const MAX_CALL_DEPTH = 60;
 
@@ -541,6 +531,33 @@ const MAX_CAST_HOPS = 10;
 const MAX_REFLECTIVE_HOPS = 4;
 
 export type SinkKind = "mutation" | "subprocess" | "audit_append";
+
+export type TraversalTruncationKind =
+  | "call_depth"
+  | "alias_hops"
+  | "cast_hops"
+  | "reflective_hops";
+
+export interface TraversalTruncation {
+  readonly kind: TraversalTruncationKind;
+  /** Read-classified tool whose analysis exhausted the bound. */
+  readonly tool: string;
+  /** Stable `<enclosingFunction>@<path>` frame of the refused work. */
+  readonly site: string;
+}
+
+export function deduplicateTraversalTruncations(
+  truncations: readonly TraversalTruncation[],
+): TraversalTruncation[] {
+  const unique = new Map<string, TraversalTruncation>();
+  for (const truncation of truncations) {
+    const key = `${truncation.kind}|${truncation.tool}|${truncation.site}`;
+    if (!unique.has(key)) unique.set(key, truncation);
+  }
+  return [...unique.values()];
+}
+
+type TruncationRecorder = (kind: TraversalTruncationKind, node: ts.Node) => void;
 
 export interface SinkHit {
   /** "mutation"/"subprocess" gate the guard; "audit_append" is only reported. */
@@ -645,6 +662,8 @@ export interface ReachabilityReport {
   };
   /** tool name -> sink hits, for every read-classified tool that has any. */
   hits: Map<string, SinkHit[]>;
+  /** Any bounded traversal that stopped while traversable work remained. */
+  truncations: TraversalTruncation[];
 }
 
 interface Analyzer {
@@ -657,6 +676,7 @@ interface Analyzer {
   /** False when the handler literal exists but resolves to no walkable body. */
   handlerWalkable(tool: string): boolean;
   sinksFor(tool: string): SinkHit[];
+  analyzeFor(tool: string): { hits: SinkHit[]; truncations: TraversalTruncation[] };
 }
 
 let cached: Analyzer | undefined;
@@ -888,7 +908,10 @@ function isFunctionLike(decl: ts.Declaration): boolean {
  * analyzer exists to refuse. Stripping is safe here because none of the five
  * can change WHICH function is called.
  */
-function unwrapTypeOnly(expr: ts.Expression): ts.Expression {
+function unwrapTypeOnly(
+  expr: ts.Expression,
+  onTruncation?: TruncationRecorder,
+): ts.Expression {
   let current = expr;
   for (let hop = 0; hop < MAX_CAST_HOPS; hop += 1) {
     if (
@@ -902,6 +925,15 @@ function unwrapTypeOnly(expr: ts.Expression): ts.Expression {
       continue;
     }
     return current;
+  }
+  if (
+    ts.isAsExpression(current) ||
+    ts.isSatisfiesExpression(current) ||
+    ts.isParenthesizedExpression(current) ||
+    ts.isNonNullExpression(current) ||
+    ts.isTypeAssertionExpression(current)
+  ) {
+    onTruncation?.("cast_hops", current);
   }
   return current;
 }
@@ -935,14 +967,15 @@ function unwrapTypeOnly(expr: ts.Expression): ts.Expression {
  */
 function indirectTargets(
   callee: ts.Expression,
-  args: readonly ts.Expression[]
+  args: readonly ts.Expression[],
+  onTruncation?: TruncationRecorder,
 ): ts.Expression[] {
   const out: ts.Expression[] = [];
-  const stripped = unwrapTypeOnly(callee);
+  const stripped = unwrapTypeOnly(callee, onTruncation);
   if (stripped !== callee) out.push(stripped);
   if (ts.isPropertyAccessExpression(callee) || ts.isPropertyAccessChain(callee)) {
     const member = callee.name.text;
-    const receiver = unwrapTypeOnly(callee.expression);
+    const receiver = unwrapTypeOnly(callee.expression, onTruncation);
     const isReflect = ts.isIdentifier(receiver) && receiver.text === "Reflect";
     if (member === "apply" && isReflect) {
       const first = args[0];
@@ -1147,7 +1180,8 @@ export function createCalleeResolver(
       | ts.PropertySignature
       | ts.MethodDeclaration
       | ts.PropertyDeclaration
-  ) => readonly ts.Declaration[]
+  ) => readonly ts.Declaration[],
+  onTruncation?: TruncationRecorder,
 ): {
   resolve(
     callee: ts.Expression,
@@ -1243,13 +1277,16 @@ export function createCalleeResolver(
   }
 
   function initializerReferences(decl: ts.Declaration, depth: number): ts.Declaration[] {
-    if (depth > MAX_ALIAS_HOPS) return [];
     const out: ts.Declaration[] = [];
     for (const expression of referenceExpressions(decl)) {
-      const init = unwrapTypeOnly(expression);
+      const init = unwrapTypeOnly(expression, onTruncation);
       if (!ts.isIdentifier(init) && !ts.isPropertyAccessExpression(init)) continue;
-      for (const target of calleeDeclarations(init)) {
-        if (target === decl) continue;
+      const targets = calleeDeclarations(init).filter((target) => target !== decl);
+      if (depth >= MAX_ALIAS_HOPS) {
+        if (targets.length > 0) onTruncation?.("alias_hops", init);
+        continue;
+      }
+      for (const target of targets) {
         out.push(target, ...initializerReferences(target, depth + 1));
       }
     }
@@ -1382,7 +1419,7 @@ export function createCalleeResolver(
   function functionValuedArguments(args: readonly ts.Expression[]): ts.Expression[] {
     const out: ts.Expression[] = [];
     for (const arg of args) {
-      const value = unwrapTypeOnly(arg);
+      const value = unwrapTypeOnly(arg, onTruncation);
       if (ts.isArrowFunction(value) || ts.isFunctionExpression(value)) continue;
       if (checker.getTypeAtLocation(value).getCallSignatures().length === 0) continue;
       out.push(value);
@@ -1460,8 +1497,10 @@ export function createCalleeResolver(
     // declaration outside `src`.
     const walkTargets = [...expanded];
     const valueTargets: ts.Declaration[] = [];
+    const indirect = indirectTargets(callee, args, onTruncation);
+    const functionValues = functionValuedArguments(args);
     if (hop < MAX_REFLECTIVE_HOPS) {
-      for (const target of indirectTargets(callee, args)) {
+      for (const target of indirect) {
         // An indirect target is the FUNCTION being invoked, not another call
         // expression, so it carries no arguments of its own to pass down.
         const nested = resolveAt(target, calleeName(target), [], hop + 1);
@@ -1476,13 +1515,15 @@ export function createCalleeResolver(
       // about whether the CALLEE was recognized, and setting it here would stop
       // the walk from descending into a `src`-local higher-order helper that
       // happened to be handed a function.
-      for (const argument of functionValuedArguments(args)) {
+      for (const argument of functionValues) {
         const nested = resolveAt(argument, calleeName(argument), [], hop + 1);
         sinks.push(...nested.sinks);
         for (const decl of [...nested.walkTargets, ...nested.valueTargets]) {
           if (!valueTargets.includes(decl)) valueTargets.push(decl);
         }
       }
+    } else if (indirect.length > 0 || functionValues.length > 0) {
+      onTruncation?.("reflective_hops", callee);
     }
 
     return { sinks, classified, walkTargets, valueTargets };
@@ -1504,8 +1545,8 @@ export function createCalleeResolver(
  * after the call, so a truncated descent CLAIMED the triple: any later route to
  * the same pair — including a two-hop route straight from the handler — was
  * then skipped as already-walked, and a sink that the walk would otherwise have
- * found went unreported. That turns a cap which fails open locally into one
- * that suppresses results on unrelated shorter paths, which is the failure this
+ * found went unreported. That turned a bounded deep-path miss into suppression
+ * of results on unrelated shorter paths, which is the failure this
  * whole file exists to prevent. Pinned by "a descent refused by the depth
  * ceiling does not claim the memo" in the test file.
  *
@@ -1526,12 +1567,26 @@ export function admitDescent(
   childDepth: number
 ): boolean {
   // Truncation leaves the memo untouched: nothing was entered, so nothing is
-  // known. Exhausting the ceiling still fails open for THIS path (see the
-  // bound stated in the header); it must not also blank another one.
+  // known. The caller records a fail-loud truncation for the refused body; this
+  // helper must not also blank a shorter route to the same pair.
   if (childDepth > MAX_CALL_DEPTH) return false;
   if (walked.has(key)) return false;
   walked.add(key);
   return true;
+}
+
+function admitRecordedDescent(
+  walked: Set<string>,
+  key: string,
+  childDepth: number,
+  target: ts.Declaration,
+  onTruncation?: TruncationRecorder,
+): boolean {
+  if (childDepth > MAX_CALL_DEPTH) {
+    onTruncation?.("call_depth", target);
+    return false;
+  }
+  return admitDescent(walked, key, childDepth);
 }
 
 /**
@@ -1576,6 +1631,7 @@ export function walkForSinks(
     frames: readonly string[],
     chain: readonly string[],
   ) => void,
+  onTruncation?: TruncationRecorder,
 ): void {
   // Backstop: every descent edge is admitted by `admitDescent`, which is the
   // authoritative ceiling test. Kept so a future descent site that forgets the
@@ -1590,10 +1646,11 @@ export function walkForSinks(
     if (body === undefined) return;
     const frame = declarationFrame(decl);
     const key = `${body.pos}|${currentFrameKey}|${frame}`;
-    if (!admitDescent(walked, key, depth + 1)) return;
+    if (!admitRecordedDescent(walked, key, depth + 1, decl, onTruncation)) return;
     walkForSinks(
       body, checker, resolver, srcRoot, onSink, walked, depth + 1,
       [...frames, frame], [...chain, newChainEntry], onExplicitCall,
+      onTruncation,
     );
   };
 
@@ -1860,7 +1917,17 @@ function buildAnalyzer(): Analyzer {
     ...classification.inlineWrite,
   ]);
 
-  const resolver = createCalleeResolver(checker, createImplementationLookup(checker, sources));
+  let activeTruncations: TraversalTruncation[] | undefined;
+  let activeTool: string | undefined;
+  const recordTruncation: TruncationRecorder = (kind, node) => {
+    if (activeTruncations === undefined || activeTool === undefined) return;
+    activeTruncations.push({ kind, tool: activeTool, site: frameOf(node) });
+  };
+  const resolver = createCalleeResolver(
+    checker,
+    createImplementationLookup(checker, sources),
+    recordTruncation,
+  );
 
   /**
    * Where a handler walk STARTS, and why that is not simply the `handler`
@@ -1887,11 +1954,7 @@ function buildAnalyzer(): Analyzer {
     readonly sinks: readonly { readonly primitive: string; readonly sinkKind: SinkKind }[];
   }
 
-  const handlerEntries = new Map<string, HandlerEntry>();
-
   function handlerEntry(tool: string): HandlerEntry {
-    const memo = handlerEntries.get(tool);
-    if (memo !== undefined) return memo;
     const entry = handlers.get(tool);
     let resolved: HandlerEntry = { walkFrom: [], sinks: [] };
     if (entry !== undefined) {
@@ -1906,7 +1969,7 @@ function buildAnalyzer(): Analyzer {
         resolved = { walkFrom: [node], sinks: [] };
       } else {
         // Everything else a `handler:` property can hold is an expression.
-        const expression = unwrapTypeOnly(node as ts.Expression);
+        const expression = unwrapTypeOnly(node as ts.Expression, recordTruncation);
         const resolution = resolver.resolve(expression, calleeName(expression), []);
         const walkFrom: ts.Node[] = [];
         for (const decl of [...resolution.walkTargets, ...resolution.valueTargets]) {
@@ -1917,14 +1980,15 @@ function buildAnalyzer(): Analyzer {
         resolved = { walkFrom, sinks: resolution.sinks };
       }
     }
-    handlerEntries.set(tool, resolved);
     return resolved;
   }
 
-  function sinksFor(tool: string): SinkHit[] {
+  function analyzeFor(tool: string): { hits: SinkHit[]; truncations: TraversalTruncation[] } {
     const entry = handlers.get(tool);
-    if (entry === undefined) return [];
+    if (entry === undefined) return { hits: [], truncations: [] };
     const found: SinkHit[] = [];
+    activeTool = tool;
+    activeTruncations = [];
     // Memoized per (body, immediate caller). Keying on the body alone would let
     // the FIRST path to a shared helper claim it and drop every later caller,
     // which is exactly the distinction a per-caller residual pin depends on.
@@ -1986,13 +2050,20 @@ function buildAnalyzer(): Analyzer {
           targetHandler.node.getSourceFile().fileName
         )}`;
         const key = `${targetHandler.node.pos}|${currentFrameKey}|${frame}`;
-        if (admitDescent(walked, key, depth + 1)) {
+        if (admitRecordedDescent(
+          walked,
+          key,
+          depth + 1,
+          targetHandler.node as ts.Declaration,
+          recordTruncation,
+        )) {
           walkForSinks(
             targetHandler.node, checker, resolver, SRC_DIR,
             onSink, walked, depth + 1,
             [...callFrames, frame],
             [...callChain, `callPrimitive("${target}")@${locate(node)}`],
             onExplicitCall,
+            recordTruncation,
           );
         }
       }
@@ -2016,6 +2087,7 @@ function buildAnalyzer(): Analyzer {
         [`${tool} handler@${relPath(node.getSourceFile().fileName)}`],
         [`${tool}@${entry.location}`],
         onExplicitCall,
+        recordTruncation,
       );
     }
 
@@ -2024,7 +2096,17 @@ function buildAnalyzer(): Analyzer {
       const key = `${hit.kind}|${hit.primitive}|${hit.site}|${hit.caller ?? ""}`;
       if (!unique.has(key)) unique.set(key, hit);
     }
-    return [...unique.values()];
+    const uniqueTruncations = deduplicateTraversalTruncations(activeTruncations);
+    activeTool = undefined;
+    activeTruncations = undefined;
+    return {
+      hits: [...unique.values()],
+      truncations: uniqueTruncations,
+    };
+  }
+
+  function sinksFor(tool: string): SinkHit[] {
+    return analyzeFor(tool).hits;
   }
 
   return {
@@ -2041,6 +2123,7 @@ function buildAnalyzer(): Analyzer {
     resolvedToolLiteralNames,
     handlerWalkable: (tool) => handlerEntry(tool).walkFrom.length > 0,
     sinksFor,
+    analyzeFor,
   };
 }
 
@@ -2069,7 +2152,7 @@ export function analyzeReadToolMutationReachability(): ReachabilityReport {
     inlineAntiVacuity,
     resolvedToolLiteralNames,
     handlerWalkable,
-    sinksFor,
+    analyzeFor,
   } = analyzer();
   const readTools = [
     ...new Set([...classification.readTable, ...classification.inlineRead]),
@@ -2078,6 +2161,7 @@ export function analyzeReadToolMutationReachability(): ReachabilityReport {
   const handlerLocations = new Map<string, string>();
   const unresolvedHandlers: string[] = [];
   const hits = new Map<string, SinkHit[]>();
+  const truncations: TraversalTruncation[] = [];
 
   for (const tool of readTools) {
     const entry = handlers.get(tool);
@@ -2093,8 +2177,9 @@ export function analyzeReadToolMutationReachability(): ReachabilityReport {
       continue;
     }
     handlerLocations.set(tool, entry.location);
-    const sinks = sinksFor(tool);
-    if (sinks.length > 0) hits.set(tool, sinks);
+    const analysis = analyzeFor(tool);
+    if (analysis.hits.length > 0) hits.set(tool, analysis.hits);
+    truncations.push(...analysis.truncations);
   }
 
   return {
@@ -2105,5 +2190,6 @@ export function analyzeReadToolMutationReachability(): ReachabilityReport {
     resolvedToolLiteralNames,
     inlineAntiVacuity,
     hits,
+    truncations,
   };
 }
