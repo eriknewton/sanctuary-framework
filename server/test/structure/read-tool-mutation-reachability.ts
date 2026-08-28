@@ -146,8 +146,10 @@
  *     shapes closed, each pinned as a must-fail fixture in the test file, are
  *     exactly: a destructured namespace import; a bare aliased `const`; an
  *     annotated `const` whose annotation erases the target; an object-literal
- *     property; an interface-typed inline-object property; an exact string-
- *     literal element lookup on an inline `Record`; a getter handing the
+ *     property; an interface-typed inline-object property, including harmless
+ *     wrappers around its receiver and initializer; an exact string- or
+ *     numeric-literal element lookup on an inline `Record`, including a
+ *     harmless wrapper around the key; a getter handing the
  *     function back; a getter returning it behind a cast; a class field; a
  *     default parameter; a default parameter carrying a cast; a destructure
  *     out of an array; a destructured dynamic
@@ -1193,19 +1195,42 @@ export function createCalleeResolver(
     args: readonly ts.Expression[]
   ): CalleeResolution;
 } {
+  /** A literal expression normalized to the string key JavaScript will use. */
+  function staticPropertyKey(expression: ts.Expression): string | undefined {
+    const literal = unwrapTypeOnly(expression, onTruncation);
+    if (ts.isStringLiteralLike(literal)) return literal.text;
+    if (ts.isNumericLiteral(literal)) return String(Number(literal.text));
+    return undefined;
+  }
+
   /** A direct, statically named member access and the receiver it selects from. */
   function staticMemberAccess(
     callee: ts.Expression,
   ): { receiver: ts.Expression; key: string } | undefined {
     if (ts.isPropertyAccessExpression(callee) || ts.isPropertyAccessChain(callee)) {
-      return { receiver: callee.expression, key: callee.name.text };
+      return {
+        receiver: unwrapTypeOnly(callee.expression, onTruncation),
+        key: callee.name.text,
+      };
     }
     if (ts.isElementAccessExpression(callee)) {
       const argument = callee.argumentExpression;
-      if (argument !== undefined && ts.isStringLiteralLike(argument)) {
-        return { receiver: callee.expression, key: argument.text };
-      }
+      if (argument === undefined) return undefined;
+      const key = staticPropertyKey(argument);
+      if (key === undefined) return undefined;
+      return {
+        receiver: unwrapTypeOnly(callee.expression, onTruncation),
+        key,
+      };
     }
+    return undefined;
+  }
+
+  function propertyAssignmentKey(property: ts.PropertyAssignment): string | undefined {
+    const name = property.name;
+    if (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) return name.text;
+    if (ts.isNumericLiteral(name)) return String(Number(name.text));
+    if (ts.isComputedPropertyName(name)) return staticPropertyKey(name.expression);
     return undefined;
   }
 
@@ -1222,16 +1247,13 @@ export function createCalleeResolver(
       if (decl.getSourceFile() !== callee.getSourceFile()) continue;
       if (!ts.isVariableDeclarationList(decl.parent)) continue;
       if ((decl.parent.flags & ts.NodeFlags.Const) === 0) continue;
-      if (decl.initializer === undefined || !ts.isObjectLiteralExpression(decl.initializer)) continue;
+      if (decl.initializer === undefined) continue;
+      const initializer = unwrapTypeOnly(decl.initializer, onTruncation);
+      if (!ts.isObjectLiteralExpression(initializer)) continue;
 
-      for (const property of decl.initializer.properties) {
+      for (const property of initializer.properties) {
         if (!ts.isPropertyAssignment(property)) continue;
-        const name = property.name;
-        const key =
-          ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)
-            ? name.text
-            : undefined;
-        if (key === access.key) out.push(property);
+        if (propertyAssignmentKey(property) === access.key) out.push(property);
       }
     }
     return out;
