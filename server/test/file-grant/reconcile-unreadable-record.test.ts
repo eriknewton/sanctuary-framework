@@ -20,7 +20,11 @@ import { describe, expect, it } from "vitest";
 
 import { mintFileGrant } from "../../src/file-grant/mint.js";
 import { reconcileFileGrantTree } from "../../src/file-grant/reconcile.js";
-import { FileGrantUnreadableEntriesError } from "../../src/file-grant/types.js";
+import {
+  FILE_GRANT_NAMESPACE,
+  FileGrantUnreadableEntriesError,
+  type FileGrant,
+} from "../../src/file-grant/types.js";
 import { FakeFsOps, failReadFor, makeFileGrantTestStore } from "./fixtures.js";
 
 const MINTED_AT = new Date("2026-07-07T00:00:00.000Z");
@@ -42,6 +46,73 @@ async function mintGrant(
     { fsOps: deps.fsOps, store: deps.store, now: MINTED_AT, auditLog: deps.auditLog },
   );
   return grant;
+}
+
+/**
+ * Keep the real signed StateStore row and replace only the plaintext returned
+ * for one grant. The key therefore remains enumerable and every sibling still
+ * traverses the production read/decode fan-out.
+ */
+function substituteGrantRead(
+  stateStore: Awaited<ReturnType<typeof makeFileGrantTestStore>>["stateStore"],
+  grantId: string,
+  record: unknown,
+): void {
+  const realRead = stateStore.read.bind(stateStore);
+  stateStore.read = (async (
+    namespace: string,
+    key: string,
+    ...rest: Parameters<typeof stateStore.read> extends [string, string, ...infer Tail]
+      ? Tail
+      : never
+  ) => {
+    const result = await realRead(namespace, key, ...rest);
+    if (namespace !== FILE_GRANT_NAMESPACE || key !== grantId || result === null) {
+      return result;
+    }
+    return { ...result, value: JSON.stringify(record) };
+  }) as typeof stateStore.read;
+}
+
+async function reconcileErrorForMalformedGrant(
+  malformed: (grant: FileGrant) => unknown,
+): Promise<{
+  error: FileGrantUnreadableEntriesError;
+  malformedGrant: FileGrant;
+  readableGrant: FileGrant;
+  fsOps: FakeFsOps;
+}> {
+  const { grantStore, stateStore, auditLog } = await makeFileGrantTestStore();
+  const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
+  const readableGrant = await mintGrant(
+    { fsOps, store: grantStore, auditLog },
+    "agent-readable",
+    "/tmp/readable.txt",
+  );
+  const malformedGrant = await mintGrant(
+    { fsOps, store: grantStore, auditLog },
+    "agent-malformed",
+    "/tmp/malformed.txt",
+  );
+  substituteGrantRead(stateStore, malformedGrant.grant_id, malformed(malformedGrant));
+
+  const error = await reconcileFileGrantTree({
+    store: grantStore,
+    fsOps,
+    now: PAST_TTL,
+    auditLog,
+  }).then(
+    () => null,
+    (err: unknown) => err,
+  );
+
+  expect(error).toBeInstanceOf(FileGrantUnreadableEntriesError);
+  return {
+    error: error as FileGrantUnreadableEntriesError,
+    malformedGrant,
+    readableGrant,
+    fsOps,
+  };
 }
 
 describe("file-grant reconcile: one unread record never holds another grant's access open", () => {
@@ -238,5 +309,60 @@ describe("file-grant reconcile: one unread record never holds another grant's ac
 
     expect(result.expired).toContain(expiring.grant_id);
     expect(result.scrubbed).toContain(expiring.tree_entry);
+  });
+});
+
+describe("file-grant reconcile: every access-decision decode field is independently required", () => {
+  // This block closes only the four decode-field coverage arms of
+  // defect.fg-reconcile-decode-untested-01. The separate `if (flipped)`
+  // observability arm remains open: a failed status write makes reconcile throw
+  // before its internal `expired` result is observable.
+
+  it("quarantines a record whose grant_id alone is missing", async () => {
+    const result = await reconcileErrorForMalformedGrant((grant) => ({
+      ...grant,
+      grant_id: undefined,
+    }));
+
+    expect(result.error.grantIds).toEqual([result.malformedGrant.grant_id]);
+    expect((result.error.cause as Error).message).toContain("carries no grant_id");
+    expect(result.fsOps.scrubbed).toContain(result.readableGrant.tree_entry);
+    expect(result.fsOps.scrubbed).not.toContain(result.malformedGrant.tree_entry);
+  });
+
+  it("quarantines a record whose tree_entry alone is empty", async () => {
+    const result = await reconcileErrorForMalformedGrant((grant) => ({
+      ...grant,
+      tree_entry: "",
+    }));
+
+    expect(result.error.grantIds).toEqual([result.malformedGrant.grant_id]);
+    expect((result.error.cause as Error).message).toContain("carries no tree_entry");
+    expect(result.fsOps.scrubbed).toContain(result.readableGrant.tree_entry);
+    expect(result.fsOps.scrubbed).not.toContain(result.malformedGrant.tree_entry);
+  });
+
+  it("quarantines a record whose status alone is unrecognized", async () => {
+    const result = await reconcileErrorForMalformedGrant((grant) => ({
+      ...grant,
+      status: "pending",
+    }));
+
+    expect(result.error.grantIds).toEqual([result.malformedGrant.grant_id]);
+    expect((result.error.cause as Error).message).toContain("carries no recognized status");
+    expect(result.fsOps.scrubbed).toContain(result.readableGrant.tree_entry);
+    expect(result.fsOps.scrubbed).not.toContain(result.malformedGrant.tree_entry);
+  });
+
+  it("quarantines a record whose expires_at alone has a non-string value", async () => {
+    const result = await reconcileErrorForMalformedGrant((grant) => ({
+      ...grant,
+      expires_at: 1,
+    }));
+
+    expect(result.error.grantIds).toEqual([result.malformedGrant.grant_id]);
+    expect((result.error.cause as Error).message).toContain("carries no usable expires_at");
+    expect(result.fsOps.scrubbed).toContain(result.readableGrant.tree_entry);
+    expect(result.fsOps.scrubbed).not.toContain(result.malformedGrant.tree_entry);
   });
 });
