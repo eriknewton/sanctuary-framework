@@ -134,16 +134,29 @@ export function computeExpiresAt(
  * branch a `JSON.parse` failure is not caught per record, so the listing aborts
  * and EVERY entry is left untouched, which is the fail-open outcome again and
  * at a wider blast radius than one record.
+ *
+ * Cause-preserving expiry classification for internal lifecycle consumers.
+ * Deliberately omitted from the file-grant barrel: callers that only decide
+ * access keep using `isGrantExpired`, while reconcile retains the cause needed
+ * for an honest audit row.
  */
-export function isGrantExpired(grant: FileGrant, now: Date): boolean {
-  if (grant.status === "revoked") return false;
-  if (grant.expires_at === null) return false;
+export function classifyGrantExpiry(
+  grant: FileGrant,
+  now: Date
+): "not_expired" | "expired_ttl" | "invalid_expiry" {
+  if (grant.status === "revoked") return "not_expired";
+  if (grant.expires_at === null) return "not_expired";
   const expiresAt =
     typeof grant.expires_at === "string"
       ? parseIsoInstantWithOffset(grant.expires_at)
       : undefined;
-  if (expiresAt === undefined) return true;
-  return expiresAt <= now.getTime();
+  if (expiresAt === undefined) return "invalid_expiry";
+  return expiresAt <= now.getTime() ? "expired_ttl" : "not_expired";
+}
+
+/** Boolean access decision retained for existing lifecycle consumers. */
+export function isGrantExpired(grant: FileGrant, now: Date): boolean {
+  return classifyGrantExpiry(grant, now) !== "not_expired";
 }
 
 /**

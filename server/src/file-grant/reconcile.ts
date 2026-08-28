@@ -71,7 +71,7 @@
  */
 
 import type { AuditLog } from "../operational/audit-log.js";
-import { isGrantExpired, reviseGrantForExpiry } from "./lifecycle.js";
+import { classifyGrantExpiry, reviseGrantForExpiry } from "./lifecycle.js";
 import { planGrantTree } from "./planner.js";
 import {
   FileGrantUnreadableEntriesError,
@@ -253,13 +253,19 @@ export async function reconcileFileGrantTree(
   // failed access reduction is the survivable direction, silence is not.
   const expiryAuditedGrantIds = new Set<string>();
   for (const grant of grants) {
-    const shouldExpire = grant.status === "active" && isGrantExpired(grant, deps.now);
+    const classifiedExpiry = classifyGrantExpiry(grant, deps.now);
+    // Preserve the cause at the decision point: collapsing this to a boolean
+    // makes a corrupt record indistinguishable from a TTL that genuinely elapsed.
+    const expiryCause =
+      grant.status === "active" && classifiedExpiry !== "not_expired"
+        ? classifiedExpiry
+        : undefined;
     const shouldClearAce =
       confirmedScrubbedGrantIds.has(grant.grant_id) && grant.granted_read_ace != null;
     let flipped = true;
     let writeError: unknown | undefined;
-    if (shouldExpire || shouldClearAce) {
-      let revised = shouldExpire ? reviseGrantForExpiry(grant, deps.now) : grant;
+    if (expiryCause !== undefined || shouldClearAce) {
+      let revised = expiryCause !== undefined ? reviseGrantForExpiry(grant, deps.now) : grant;
       if (shouldClearAce) {
         revised = { ...revised, granted_read_ace: null };
       }
@@ -305,7 +311,7 @@ export async function reconcileFileGrantTree(
     // duplicate above and picking a canonical row is a consumer-visible
     // decision, so it is tracked (FG-RECONCILE-ACL-DOUBLE-01) and pinned by a
     // test rather than changed here.
-    if (shouldExpire) {
+    if (expiryCause !== undefined) {
       // Only a flip that actually landed is reported as one; `expired` names
       // the records whose PERSISTED status changed.
       if (flipped) expired.push(grant.grant_id);
@@ -321,6 +327,7 @@ export async function reconcileFileGrantTree(
       const expiryRowLanded = await appendExpiryAudit(
         deps,
         grant,
+        expiryCause,
         aclFailureByGrantId.get(grant.grant_id),
         flipped,
         writeError,
@@ -581,6 +588,7 @@ async function appendStatusWriteFailureAudit(
 async function appendExpiryAudit(
   deps: ReconcileFileGrantDeps,
   grant: FileGrant,
+  expiryCause: "expired_ttl" | "invalid_expiry",
   aclFailure?: FileGrantAclRemovalResult,
   statusFlipped: boolean = true,
   writeError?: unknown,
@@ -591,8 +599,9 @@ async function appendExpiryAudit(
     // Auto-expiry reuses the `file_grant_revoke` audit operation (not a new
     // op string): TTL expiry, like revoke, is a safe-direction access
     // REDUCTION, and reusing the op keeps the CLI audit-write inventory small.
-    // The distinct `reason: "expired_ttl_scrub"` (vs revoke's absence of it)
-    // disambiguates an auto-expiry from an operator revoke in the trail.
+    // The reason prefix distinguishes an elapsed TTL or invalid expiry from an
+    // operator revoke without changing the shared safe-direction operation.
+    const reasonPrefix = expiryCause === "invalid_expiry" ? "invalid_expiry" : "expired_ttl";
     await deps.auditLog.appendCritical({
       layer: "l1",
       operation: "file_grant_revoke",
@@ -603,12 +612,12 @@ async function appendExpiryAudit(
         grant_id: grant.grant_id,
         subject_agent_id: grant.subject_agent_id,
         reason: aclFailure
-          ? "expired_ttl_acl_removal_failed"
+          ? `${reasonPrefix}_acl_removal_failed`
           : !scrubConfirmed
-            ? "expired_ttl_scrub_did_not_complete"
+            ? `${reasonPrefix}_scrub_did_not_complete`
             : statusFlipped
-              ? "expired_ttl_scrub"
-              : "expired_ttl_status_write_failed",
+              ? `${reasonPrefix}_scrub`
+              : `${reasonPrefix}_status_write_failed`,
         ...(aclFailure ? { acl_removal: aclFailure } : {}),
         // Stated on every row rather than only the failing one, so an operator
         // reading the trail never has to infer durability from a reason string.
