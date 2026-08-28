@@ -70,6 +70,7 @@ import {
   admitDescent,
   analyzeReadToolMutationReachability,
   createCalleeResolver,
+  createImplementationLookup,
   sinksForTool,
   walkForSinks,
 } from "./read-tool-mutation-reachability.js";
@@ -1408,9 +1409,270 @@ function resolveImplicitInvocationFixtures(): Map<string, string[]> {
   return byFile;
 }
 
+interface ClassDispatchFixture {
+  readonly what: string;
+  readonly expect: readonly string[];
+  readonly code: string;
+  readonly siblings?: Readonly<Record<string, string>>;
+}
+
+const CLASS_DISPATCH_FIXTURES: readonly ClassDispatchFixture[] = [
+  {
+    what: "an abstract base method dispatches to its concrete override",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+abstract class Runner { abstract run(command: string): void; }
+class ShellRunner extends Runner { run(command: string): void { execSync(command); } }
+export function handler(runner: Runner): void { runner.run("id"); }
+`,
+  },
+  {
+    what: "unrelated same-named base classes do not collide",
+    expect: [],
+    siblings: {
+      clean: `
+export abstract class Base { abstract run(): void; }
+export class Reader extends Base { run(): void {} }
+`,
+      other: `
+import { execSync } from "node:child_process";
+abstract class Base { abstract run(): void; }
+export class Writer extends Base { run(): void { execSync("id"); } }
+`,
+    },
+    code: `
+import { Base } from "./clean.js";
+import "./other.js";
+export function handler(value: Base): void { value.run(); }
+`,
+  },
+  {
+    what: "a base method expands across multiple subclasses",
+    expect: ["child_process.execSync", "fs.rmSync"],
+    code: `
+import { execSync } from "node:child_process";
+import { rmSync } from "node:fs";
+abstract class Action { abstract apply(value: string): void; }
+class ShellAction extends Action { apply(value: string): void { execSync(value); } }
+class DeleteAction extends Action { apply(value: string): void { rmSync(value); } }
+export function handler(action: Action): void { action.apply("target"); }
+`,
+  },
+  {
+    what: "an abstract method expands through transitive inheritance",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+abstract class Root { abstract run(): void; }
+abstract class Middle extends Root {}
+class Leaf extends Middle { run(): void { execSync("id"); } }
+export function handler(value: Root): void { value.run(); }
+`,
+  },
+  {
+    what: "interface dispatch keeps resolving implementing class members",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+interface Runner { run(): void; }
+class ConcreteRunner implements Runner { run(): void { execSync("id"); } }
+export function handler(value: Runner): void { value.run(); }
+`,
+  },
+  {
+    what: "a direct type alias preserves interface dispatch",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+interface Runner { run(): void; }
+type Alias = Runner;
+class ConcreteRunner implements Alias { run(): void { execSync("id"); } }
+export function handler(value: Runner): void { value.run(); }
+`,
+  },
+  {
+    what: "a chained type alias preserves interface dispatch",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+interface Runner { run(): void; }
+type FirstAlias = Runner;
+type SecondAlias = FirstAlias;
+class ConcreteRunner implements SecondAlias { run(): void { execSync("id"); } }
+export function handler(value: Runner): void { value.run(); }
+`,
+  },
+  {
+    what: "an intersection alias indexes each named interface constituent",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+interface Runner { run(): void; }
+interface Labelled { readonly label: string; }
+type Alias = Runner & Labelled;
+class ConcreteRunner implements Alias {
+  readonly label = "concrete";
+  run(): void { execSync("id"); }
+}
+export function handler(value: Runner): void { value.run(); }
+`,
+  },
+  {
+    what: "a renamed imported type alias preserves interface dispatch",
+    expect: ["child_process.execSync"],
+    siblings: {
+      model: `
+export interface Runner { run(): void; }
+export type Alias = Runner;
+`,
+    },
+    code: `
+import { execSync } from "node:child_process";
+import { Alias as ImportedAlias, Runner } from "./model.js";
+class ConcreteRunner implements ImportedAlias { run(): void { execSync("id"); } }
+export function handler(value: Runner): void { value.run(); }
+`,
+  },
+  {
+    what: "a namespace-qualified type alias preserves interface dispatch",
+    expect: ["child_process.execSync"],
+    siblings: {
+      model: `
+export interface Runner { run(): void; }
+export type Alias = Runner;
+`,
+    },
+    code: `
+import { execSync } from "node:child_process";
+import * as model from "./model.js";
+class ConcreteRunner implements model.Alias { run(): void { execSync("id"); } }
+export function handler(value: model.Runner): void { value.run(); }
+`,
+  },
+  {
+    what: "a static base member does not match a subclass instance member",
+    expect: [],
+    code: `
+import { execSync } from "node:child_process";
+class Base { static run(): void {} }
+class Child extends Base { run(): void { execSync("id"); } }
+export function handler(): void { Base.run(); }
+`,
+  },
+  {
+    what: "an instance base member does not match a subclass static member",
+    expect: [],
+    code: `
+import { execSync } from "node:child_process";
+class Base { run(): void {} }
+class Child extends Base { static run(): void { execSync("id"); } }
+export function handler(value: Base): void { value.run(); }
+`,
+  },
+  {
+    what: "a static member dispatches to a static subclass override",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+class Base { static run(): void {} }
+class Child extends Base { static override run(): void { execSync("id"); } }
+export function handler(value: typeof Base): void { value.run(); }
+`,
+  },
+];
+
+function resolveClassDispatchFixtures(): Map<string, string[]> {
+  const options: ts.CompilerOptions = {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    lib: ["lib.es2022.d.ts"],
+    strict: true,
+    noEmit: true,
+    skipLibCheck: true,
+  };
+  const virtual = new Map<string, string>();
+  const mainFiles: string[] = [];
+  CLASS_DISPATCH_FIXTURES.forEach((fixture, index) => {
+    const scope = (bare: string): string =>
+      join(TEST_STRUCTURE_DIR, `class-dispatch-${index}-${bare}.virtual.ts`);
+    for (const [bare, text] of Object.entries(fixture.siblings ?? {})) {
+      virtual.set(scope(bare), text);
+    }
+    const main = scope("main");
+    virtual.set(
+      main,
+      fixture.code.replace(/"\.\/([\w-]+)\.js"/g, `"./class-dispatch-${index}-$1.virtual.js"`)
+    );
+    mainFiles.push(main);
+  });
+
+  const host = ts.createCompilerHost(options, true);
+  const baseGetSourceFile = host.getSourceFile.bind(host);
+  const baseFileExists = host.fileExists.bind(host);
+  const baseReadFile = host.readFile.bind(host);
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreate) => {
+    const source = virtual.get(fileName);
+    return source === undefined
+      ? baseGetSourceFile(fileName, languageVersion, onError, shouldCreate)
+      : ts.createSourceFile(fileName, source, languageVersion, true, ts.ScriptKind.TS);
+  };
+  host.fileExists = (fileName) => virtual.has(fileName) || baseFileExists(fileName);
+  host.readFile = (fileName) => virtual.get(fileName) ?? baseReadFile(fileName);
+  host.getCurrentDirectory = () => FIXTURE_SERVER_DIR;
+
+  const program = ts.createProgram([...virtual.keys()], options, host);
+  const checker = program.getTypeChecker();
+  const diagnostics = [
+    ...program.getSyntacticDiagnostics(),
+    ...program.getSemanticDiagnostics(),
+  ].filter((diagnostic) => diagnostic.file !== undefined && virtual.has(diagnostic.file.fileName));
+  if (diagnostics.length > 0) {
+    throw new Error(
+      `invalid class-dispatch fixture:\n${diagnostics
+        .map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"))
+        .join("\n")}`
+    );
+  }
+  const sources = program.getSourceFiles().filter((source) => virtual.has(source.fileName));
+  const resolver = createCalleeResolver(checker, createImplementationLookup(checker, sources));
+  const resolved = new Map<string, string[]>();
+
+  mainFiles.forEach((fileName, index) => {
+    const source = program.getSourceFile(fileName);
+    if (source === undefined) throw new Error(`fixture did not load: ${fileName}`);
+    let handler: ts.FunctionDeclaration | undefined;
+    const findHandler = (node: ts.Node): void => {
+      if (ts.isFunctionDeclaration(node) && node.name?.text === "handler") handler = node;
+      ts.forEachChild(node, findHandler);
+    };
+    findHandler(source);
+    if (handler === undefined) throw new Error(`fixture has no handler: ${fileName}`);
+
+    const found: string[] = [];
+    walkForSinks(
+      handler,
+      checker,
+      resolver,
+      TEST_STRUCTURE_DIR,
+      (_node, primitive) => { found.push(primitive); },
+      new Set<string>(),
+      0,
+      ["handler"],
+      [],
+    );
+    const fixture = CLASS_DISPATCH_FIXTURES[index];
+    if (fixture === undefined) throw new Error(`fixture ${index} disappeared`);
+    resolved.set(fixture.what, [...new Set(found)].sort());
+  });
+  return resolved;
+}
+
 describe("read-classified MCP tools and durable-state mutation", () => {
   const report = analyzeReadToolMutationReachability();
   let resolvedLaunderingFixtures: Map<string, string[]>;
+  let resolvedClassDispatchFixtures: Map<string, string[]>;
 
   beforeAll(() => {
     // Resolve the synthetic program once so splitting the corpus into
@@ -1422,6 +1684,11 @@ describe("read-classified MCP tools and durable-state mutation", () => {
       LAUNDERING_FIXTURES.length
     );
     expect(resolvedLaunderingFixtures.size).toBe(LAUNDERING_FIXTURES.length);
+    resolvedClassDispatchFixtures = resolveClassDispatchFixtures();
+    expect(new Set(CLASS_DISPATCH_FIXTURES.map((fixture) => fixture.what))).toHaveLength(
+      CLASS_DISPATCH_FIXTURES.length
+    );
+    expect(resolvedClassDispatchFixtures.size).toBe(CLASS_DISPATCH_FIXTURES.length);
   });
 
   it("parsed the shipping classification tables", () => {
@@ -1640,6 +1907,12 @@ describe("read-classified MCP tools and durable-state mutation", () => {
     }
     expect(actual).toEqual(expected);
     expect(Object.keys(actual)).toHaveLength(IMPLICIT_INVOCATION_FIXTURES.length);
+  });
+
+  it.each(CLASS_DISPATCH_FIXTURES)("walks class dispatch: $what", (fixture) => {
+    const actual = resolvedClassDispatchFixtures.get(fixture.what);
+    expect(actual, `fixture disappeared: ${fixture.what}`).toBeDefined();
+    expect(actual).toEqual([...fixture.expect].sort());
   });
 
   it("a descent refused by the depth ceiling does not claim the memo", () => {
