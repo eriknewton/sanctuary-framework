@@ -92,7 +92,9 @@
  *     result below should be read as covering it. Neither the mechanism that
  *     defeats the lookup nor a spelling of it is written out here, because the
  *     class is open and this file ships in a public repository; the register
- *     entry carries the detail.
+ *     entry carries the detail. A direct same-file const initialized with an
+ *     inline object literal is the narrower syntactic case and IS recovered;
+ *     arbitrary construction and injection sites remain outside that bound.
  *
  *     THE COUNT IS STATED WITH ITS METHOD, because it moves by a factor of four
  *     with the method and a bare number here was wrong twice. Counting UNIQUE
@@ -144,9 +146,13 @@
  *     shapes closed, each pinned as a must-fail fixture in the test file, are
  *     exactly: a destructured namespace import; a bare aliased `const`; an
  *     annotated `const` whose annotation erases the target; an object-literal
- *     property; a getter handing the function back; a getter returning it
- *     behind a cast; a class field; a default parameter; a default parameter
- *     carrying a cast; a destructure out of an array; a destructured dynamic
+ *     property; an interface-typed inline-object property, including harmless
+ *     wrappers around its receiver and initializer; an exact string- or
+ *     numeric-literal element lookup on an inline `Record`, including a
+ *     harmless wrapper around the key; a getter handing the
+ *     function back; a getter returning it behind a cast; a class field; a
+ *     default parameter; a default parameter carrying a cast; a destructure
+ *     out of an array; a destructured dynamic
  *     `import`; a destructure of a cast namespace; a re-export chain; a
  *     wildcard re-export; a `.bind()`; a conditional selecting between two
  *     functions; a factory return; a generic identity function; an `await`ed
@@ -1189,6 +1195,70 @@ export function createCalleeResolver(
     args: readonly ts.Expression[]
   ): CalleeResolution;
 } {
+  /** A literal expression normalized to the string key JavaScript will use. */
+  function staticPropertyKey(expression: ts.Expression): string | undefined {
+    const literal = unwrapTypeOnly(expression, onTruncation);
+    if (ts.isStringLiteralLike(literal)) return literal.text;
+    if (ts.isNumericLiteral(literal)) return String(Number(literal.text));
+    return undefined;
+  }
+
+  /** A direct, statically named member access and the receiver it selects from. */
+  function staticMemberAccess(
+    callee: ts.Expression,
+  ): { receiver: ts.Expression; key: string } | undefined {
+    if (ts.isPropertyAccessExpression(callee) || ts.isPropertyAccessChain(callee)) {
+      return {
+        receiver: unwrapTypeOnly(callee.expression, onTruncation),
+        key: callee.name.text,
+      };
+    }
+    if (ts.isElementAccessExpression(callee)) {
+      const argument = callee.argumentExpression;
+      if (argument === undefined) return undefined;
+      const key = staticPropertyKey(argument);
+      if (key === undefined) return undefined;
+      return {
+        receiver: unwrapTypeOnly(callee.expression, onTruncation),
+        key,
+      };
+    }
+    return undefined;
+  }
+
+  function propertyAssignmentKey(property: ts.PropertyAssignment): string | undefined {
+    const name = property.name;
+    if (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) return name.text;
+    if (ts.isNumericLiteral(name)) return String(Number(name.text));
+    if (ts.isComputedPropertyName(name)) return staticPropertyKey(name.expression);
+    return undefined;
+  }
+
+  /** The exact direct property selected from a same-file inline-object const. */
+  function inlineObjectMemberDeclarations(callee: ts.Expression): ts.PropertyAssignment[] {
+    const access = staticMemberAccess(callee);
+    if (access === undefined) return [];
+    const receiverSymbol = checker.getSymbolAtLocation(access.receiver);
+    if (receiverSymbol === undefined) return [];
+
+    const out: ts.PropertyAssignment[] = [];
+    for (const decl of receiverSymbol.getDeclarations() ?? []) {
+      if (!ts.isVariableDeclaration(decl)) continue;
+      if (decl.getSourceFile() !== callee.getSourceFile()) continue;
+      if (!ts.isVariableDeclarationList(decl.parent)) continue;
+      if ((decl.parent.flags & ts.NodeFlags.Const) === 0) continue;
+      if (decl.initializer === undefined) continue;
+      const initializer = unwrapTypeOnly(decl.initializer, onTruncation);
+      if (!ts.isObjectLiteralExpression(initializer)) continue;
+
+      for (const property of initializer.properties) {
+        if (!ts.isPropertyAssignment(property)) continue;
+        if (propertyAssignmentKey(property) === access.key) out.push(property);
+      }
+    }
+    return out;
+  }
+
   function calleeDeclarations(callee: ts.Expression): ts.Declaration[] {
     let symbol = checker.getSymbolAtLocation(callee);
     if (
@@ -1197,12 +1267,13 @@ export function createCalleeResolver(
     ) {
       symbol = checker.getSymbolAtLocation(callee.name);
     }
-    if (symbol === undefined) return [];
-    if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+    if (symbol !== undefined && (symbol.flags & ts.SymbolFlags.Alias) !== 0) {
       const aliased = checker.getAliasedSymbol(symbol);
       if (aliased.getDeclarations() !== undefined) symbol = aliased;
     }
-    return symbol.getDeclarations() ?? [];
+    const direct = symbol?.getDeclarations() ?? [];
+    const inlineMembers = inlineObjectMemberDeclarations(callee);
+    return [...direct, ...inlineMembers.filter((decl) => !direct.includes(decl))];
   }
 
   /**

@@ -413,23 +413,12 @@ const GATED_KINDS = new Set(["mutation", "subprocess"]);
 // measurement and this corpus's count has been restated twice. Method: run the
 // corpus against a resolver with the expanded-set classification pass disabled,
 // and count the must-fail fixtures (those with a non-empty `expect`) whose
-// resolved primitive set becomes empty. Re-measured after the fourth attack
-// round, on the corpus as it stands: 32 of 44 must-fail fixtures flip, and of
-// the first nineteen, 16 flip.
-//
-// The three survivors among the first nineteen are "a re-export chain through
-// two hops", "a wildcard re-export", and "an object spread of a namespace
-// import", all of which resolve straight back to the imported symbol through
-// the pre-existing `getAliasedSymbol` alias-following in `calleeDeclarations`.
-// They are kept anyway, since a shape closed by one mechanism is exactly the
-// shape a refactor of a different mechanism reopens.
-//
-// The whole-corpus figure MOVED DOWN as the resolver got wider (an earlier
-// measurement on 41 must-fail fixtures gave 34), and that is the expected
-// direction rather than a regression: two fixtures that used to depend on the
-// expanded-set pass alone now also resolve through the function-valued-argument
-// path, so disabling one pass no longer blanks them. A fixture with two
-// independent routes to its primitive is a stronger pin, not a weaker one.
+// resolved primitive set becomes empty. Re-measured after the wrapper and
+// numeric-key repair, on the corpus as it stands: 40 of 52 must-fail fixtures
+// flip; all 8 must-stay-clean fixtures remain clean. Survivors resolve through
+// another independent route to the same primitive and remain useful pins: a
+// shape closed by one mechanism is exactly the shape a refactor of another
+// mechanism can reopen.
 //
 // They drive the SHIPPING resolver (`createCalleeResolver`) over a synthetic
 // program, not a copy of it, so a resolver change cannot pass here and regress
@@ -495,6 +484,147 @@ import { execSync } from "node:child_process";
 const shell = { run: execSync };
 export function launder(command: string): void {
   shell.run(command);
+}
+`,
+  },
+  {
+    what: "an interface-typed inline object property",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+interface Shell { run: (command: string) => unknown }
+const shell: Shell = { run: execSync };
+export function launder(command: string): void {
+  void shell.run(command);
+}
+`,
+  },
+  {
+    // Exact member selection is the false-positive boundary. The mutating
+    // sibling must not contaminate the safe property that is actually called.
+    // A later reassignment of `shell.run` remains deliberately untracked: this
+    // bounded syntactic recovery reads the initializer and does no dataflow.
+    what: "a safe interface property beside an unrelated mutating sibling (must stay clean)",
+    expect: [],
+    code: `
+import { execSync } from "node:child_process";
+type Fn = (command: string) => unknown;
+interface Shell { run: Fn; dangerous: Fn }
+function safe(command: string): string { return command; }
+const shell: Shell = { run: safe, dangerous: execSync };
+export function launder(command: string): void {
+  void shell.run(command);
+}
+`,
+  },
+  {
+    what: "a Record string-literal lookup into an inline object",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+type Fn = (command: string) => unknown;
+const shell: Record<string, Fn> = { run: execSync };
+export function launder(command: string): void {
+  void shell["run"](command);
+}
+`,
+  },
+  {
+    // As above, selecting every property would manufacture a subprocess hit.
+    what: "a safe Record key beside an unrelated mutating key (must stay clean)",
+    expect: [],
+    code: `
+import { execSync } from "node:child_process";
+type Fn = (command: string) => unknown;
+function safe(command: string): string { return command; }
+const shell: Record<string, Fn> = { run: safe, dangerous: execSync };
+export function launder(command: string): void {
+  void shell["run"](command);
+}
+`,
+  },
+  {
+    what: "a parenthesized receiver with an interface-erased property",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+interface Shell { run: (command: string) => unknown }
+const shell: Shell = { run: execSync };
+export function launder(command: string): void {
+  void (shell).run(command);
+}
+`,
+  },
+  {
+    what: "a parenthesized exact element key on an annotated Record",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+type Fn = (command: string) => unknown;
+const shell: Record<string, Fn> = { run: execSync };
+export function launder(command: string): void {
+  void shell[("run")](command);
+}
+`,
+  },
+  {
+    what: "a parenthesized inline-object initializer behind an interface",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+interface Shell { run: (command: string) => unknown }
+const shell: Shell = ({ run: execSync });
+export function launder(command: string): void {
+  void shell.run(command);
+}
+`,
+  },
+  {
+    what: "an as-wrapped inline-object initializer behind an interface",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+interface Shell { run: (command: string) => unknown }
+const shell: Shell = ({ run: execSync } as Shell);
+export function launder(command: string): void {
+  void shell.run(command);
+}
+`,
+  },
+  {
+    what: "a satisfies-wrapped inline-object initializer behind an interface",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+interface Shell { run: (command: string) => unknown }
+const shell: Shell = ({ run: execSync } satisfies Shell);
+export function launder(command: string): void {
+  void shell.run(command);
+}
+`,
+  },
+  {
+    what: "an exact numeric element key on an annotated Record",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+type Fn = (command: string) => unknown;
+const shell: Record<number, Fn> = { 1: execSync };
+export function launder(command: string): void {
+  void shell[1](command);
+}
+`,
+  },
+  {
+    what: "a safe numeric Record key beside an unrelated mutating key (must stay clean)",
+    expect: [],
+    code: `
+import { execSync } from "node:child_process";
+type Fn = (command: string) => unknown;
+function safe(command: string): string { return command; }
+const shell: Record<number, Fn> = { 1: safe, 2: execSync };
+export function launder(command: string): void {
+  void shell[1](command);
 }
 `,
   },
@@ -1056,8 +1186,11 @@ export function launder(value: string): string {
     expect: [],
     code: `
 import { readFileSync } from "node:fs";
-export function launder(paths: string[]): void {
-  paths.forEach(readFileSync);
+function acceptReader(reader: typeof readFileSync): void {
+  void reader;
+}
+export function launder(): void {
+  acceptReader(readFileSync);
 }
 `,
   },
@@ -1120,6 +1253,17 @@ function resolveLaunderingFixtures(): Map<string, string[]> {
   host.getCurrentDirectory = () => FIXTURE_SERVER_DIR;
 
   const program = ts.createProgram(fileNames, options, host);
+  const diagnostics = [
+    ...program.getSyntacticDiagnostics(),
+    ...program.getSemanticDiagnostics(),
+  ].filter((diagnostic) => diagnostic.file !== undefined && virtual.has(diagnostic.file.fileName));
+  if (diagnostics.length > 0) {
+    throw new Error(
+      `invalid laundering fixture:\n${diagnostics
+        .map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"))
+        .join("\n")}`
+    );
+  }
   const checker = program.getTypeChecker();
   // No interface-to-class index: none of these shapes goes through one, and
   // supplying an empty one keeps the fixture's resolution path honest.
