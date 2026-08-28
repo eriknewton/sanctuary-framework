@@ -167,7 +167,22 @@ describe("reconcile over a record whose expiry cannot be parsed", () => {
         auditLog: store.auditLog,
       }
     );
-    expect(fsOps.placed).toHaveLength(1);
+    const { grant: elapsedGrant } = await mintFileGrant(
+      {
+        subjectAgentId: "agent-2",
+        scope: { kind: "file", path: "/tmp/y.txt" },
+        mode: "read",
+        ttlSeconds: 3600,
+        createdBy: "operator-1",
+      },
+      {
+        fsOps,
+        store: store.grantStore,
+        now: new Date("2026-08-01T00:00:00.000Z"),
+        auditLog: store.auditLog,
+      }
+    );
+    expect(fsOps.placed).toHaveLength(2);
 
     // Round-tripped through JSON, which is the only way a stored record is ever
     // read back, so the value under test is the value a real fortress holds.
@@ -190,15 +205,29 @@ describe("reconcile over a record whose expiry cannot be parsed", () => {
     const after = await store.grantStore.get(grant.grant_id);
     expect(after!.status).toBe("expired");
     expect(result.expired).toContain(grant.grant_id);
-    // The pass leaves a durable trace rather than reducing access silently.
+    expect((await store.grantStore.get(elapsedGrant.grant_id))!.status).toBe("expired");
+    expect(result.expired).toContain(elapsedGrant.grant_id);
+    // The pass leaves one honest durable trace for each cause. A corrupt expiry
+    // must not be described as a TTL that genuinely elapsed, while the clean
+    // sibling pins the existing TTL vocabulary against a broad relabel.
     const audit = await store.auditLog.query({
       operation_type: "file_grant_revoke",
       limit: 50,
     });
-    expect(
+    const rowsFor = (grantId: string) =>
       audit.entries.filter(
-        (e) => (e.details as { grant_id?: string } | undefined)?.grant_id === grant.grant_id
-      ).length
-    ).toBeGreaterThan(0);
+        (entry) =>
+          (entry.details as { grant_id?: string } | undefined)?.grant_id === grantId
+      );
+    const corruptRows = rowsFor(grant.grant_id);
+    const elapsedRows = rowsFor(elapsedGrant.grant_id);
+    expect(corruptRows).toHaveLength(1);
+    expect(elapsedRows).toHaveLength(1);
+    expect((corruptRows[0]!.details as { reason?: string }).reason).toBe(
+      "invalid_expiry_scrub"
+    );
+    expect((elapsedRows[0]!.details as { reason?: string }).reason).toBe(
+      "expired_ttl_scrub"
+    );
   });
 });
