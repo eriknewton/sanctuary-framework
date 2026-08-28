@@ -108,17 +108,19 @@
  *     callable", which drops the optional `f?: () => void` members. Whichever
  *     is used, the number is unchanged by the laundering closure below: it is a
  *     different class and closing one does not touch the other.
- *   - An interface member call IS followed into the classes that syntactically
- *     `implements` that interface in `src`, for both method signatures
- *     (`save(x): void`) and function-typed property signatures
- *     (`save: (x) => void`). THE PROPERTY-SIGNATURE SPELLING IS INERT TODAY and
- *     is not claimed otherwise: of 685 function-typed property-signature
- *     members across 363 interfaces in `src`, the implements-index resolves 0,
- *     so that branch fixes no call site. It is wired so that adding such an
- *     implementation fails closed rather than going silently unwalked. It does
- *     not touch the injected-dependency gap above, because an injected property
- *     is supplied by an object literal rather than by a class declaring
- *     `implements`.
+ *   - An interface OR base-class member call IS followed into matching members
+ *     on every source-local class below it in the heritage graph. Heritage
+ *     edges are keyed by checker symbols rather than bare names, so unrelated
+ *     declarations named `Base` cannot contaminate one another; the walk is
+ *     transitive and includes every subclass rather than choosing one concrete
+ *     target. Both method signatures (`save(x): void`) and function-typed
+ *     property signatures (`save: (x) => void`) are covered. THE INTERFACE
+ *     PROPERTY-SIGNATURE SPELLING IS INERT TODAY and is not claimed otherwise:
+ *     of 685 function-typed property-signature members across 363 interfaces in
+ *     `src`, the heritage index resolves 0, so that branch fixes no call site.
+ *     It is wired so adding such an implementation fails closed. It does not
+ *     touch the injected-dependency gap above, because an injected property is
+ *     supplied by an object literal rather than by a class heritage edge.
  *   - A `new X()` IS followed into `X`'s own constructor. A base-class
  *     constructor reached only through an implicit `super()` is not followed.
  *   - AN INTERPOSED SOURCE-LOCAL BINDING NO LONGER LAUNDERS A BUILTIN SINK.
@@ -1119,8 +1121,9 @@ export interface CalleeResolution {
  * exercises the shipping resolution path instead of a copy of it that could
  * drift from it.
  *
- * `implementationsOf` is injected because it needs the interface-to-class index
- * built from the analyzed program; a fixture program supplies an empty one.
+ * `implementationsOf` is injected because it needs the interface/base-class
+ * heritage index built from the analyzed program; a fixture program can supply
+ * its own index or an empty one.
  *
  * `args` is REQUIRED rather than optional on `resolve`, because the reflective
  * spellings need them: `Reflect.apply(execSync, null, [cmd])` carries its
@@ -1132,7 +1135,11 @@ export interface CalleeResolution {
 export function createCalleeResolver(
   checker: ts.TypeChecker,
   implementationsOf: (
-    signature: ts.MethodSignature | ts.PropertySignature
+    signature:
+      | ts.MethodSignature
+      | ts.PropertySignature
+      | ts.MethodDeclaration
+      | ts.PropertyDeclaration
   ) => readonly ts.Declaration[]
 ): {
   resolve(
@@ -1161,7 +1168,8 @@ export function createCalleeResolver(
    * The declaration set after expanding the three shapes whose own symbol
    * declaration carries no body:
    *
-   *   1. an interface member  -> the implementing class members in `src`;
+   *   1. an interface or base-class member -> matching members on source-local
+   *      implementing/derived classes, transitively;
    *   2. `new X()`            -> `X`'s own constructor (the symbol resolves to
    *      the class, whose `functionBody` is undefined, so without this the
    *      constructor branch below could never fire at all);
@@ -1248,7 +1256,12 @@ export function createCalleeResolver(
     const expanded: ts.Declaration[] = [];
     for (const decl of declarations) {
       expanded.push(decl);
-      if (ts.isMethodSignature(decl) || isCallablePropertySignature(decl)) {
+      if (
+        ts.isMethodSignature(decl) ||
+        isCallablePropertySignature(decl) ||
+        ts.isMethodDeclaration(decl) ||
+        ts.isPropertyDeclaration(decl)
+      ) {
         expanded.push(...implementationsOf(decl));
       }
       if (ts.isClassDeclaration(decl)) {
@@ -1626,6 +1639,87 @@ export function walkForSinks(
   visit(root);
 }
 
+/**
+ * Build the source-local lookup used to expand interface and base-class
+ * members into every syntactic override beneath them.
+ *
+ * Heritage edges are keyed by checker symbols, never by the text of the
+ * heritage expression. Two modules can each declare `Base`, and an override of
+ * one must not become a target of a call through the other. Walking the edge
+ * graph rather than only its first generation covers both interface extension
+ * and transitive class inheritance.
+ */
+export function createImplementationLookup(
+  checker: ts.TypeChecker,
+  sources: readonly ts.SourceFile[]
+): (
+  signature:
+    | ts.MethodSignature
+    | ts.PropertySignature
+    | ts.MethodDeclaration
+    | ts.PropertyDeclaration
+) => readonly ts.Declaration[] {
+  type HeritageOwner = ts.ClassDeclaration | ts.InterfaceDeclaration;
+  const children = new Map<ts.Symbol, HeritageOwner[]>();
+
+  const canonicalSymbolAt = (node: ts.Node): ts.Symbol | undefined => {
+    let symbol = checker.getSymbolAtLocation(node);
+    if (symbol !== undefined && (symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      symbol = checker.getAliasedSymbol(symbol);
+    }
+    return symbol;
+  };
+
+  for (const sf of sources) {
+    const visit = (node: ts.Node): void => {
+      if (ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node)) {
+        for (const clause of node.heritageClauses ?? []) {
+          for (const type of clause.types) {
+            const parent = canonicalSymbolAt(type.expression);
+            if (parent === undefined) continue;
+            children.set(parent, [...(children.get(parent) ?? []), node]);
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+  }
+
+  return (signature): ts.Declaration[] => {
+    const owner = signature.parent;
+    if (!ts.isInterfaceDeclaration(owner) && !ts.isClassDeclaration(owner)) return [];
+    if (owner.name === undefined) return [];
+    const ownerSymbol = canonicalSymbolAt(owner.name);
+    if (ownerSymbol === undefined) return [];
+    const memberName =
+      ts.isIdentifier(signature.name) || ts.isStringLiteral(signature.name)
+        ? signature.name.text
+        : undefined;
+    if (memberName === undefined) return [];
+    const out: ts.Declaration[] = [];
+    const seen = new Set<ts.Symbol>([ownerSymbol]);
+    const pending = [...(children.get(ownerSymbol) ?? [])];
+    while (pending.length > 0) {
+      const child = pending.shift();
+      if (child === undefined || child.name === undefined) continue;
+      const childSymbol = canonicalSymbolAt(child.name);
+      if (childSymbol === undefined || seen.has(childSymbol)) continue;
+      seen.add(childSymbol);
+
+      if (ts.isClassDeclaration(child)) {
+        for (const member of child.members) {
+          if (!ts.isMethodDeclaration(member) && !ts.isPropertyDeclaration(member)) continue;
+          if (!ts.isIdentifier(member.name) && !ts.isStringLiteral(member.name)) continue;
+          if (member.name.text === memberName) out.push(member);
+        }
+      }
+      pending.push(...(children.get(childSymbol) ?? []));
+    }
+    return out;
+  };
+}
+
 function buildAnalyzer(): Analyzer {
   const configFile = ts.readConfigFile(join(SERVER_DIR, "tsconfig.json"), ts.sys.readFile);
   const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, SERVER_DIR);
@@ -1728,69 +1822,7 @@ function buildAnalyzer(): Analyzer {
     ...classification.inlineWrite,
   ]);
 
-  // ---- interface -> implementing classes ---------------------------------
-  // A call on an interface-typed value resolves to a signature with no body.
-  // Without this index the walk would stop at every injected adapter and report
-  // a clean graph for a handler that in fact reaches a mutation through one.
-  const implementers = new Map<string, ts.ClassDeclaration[]>();
-  for (const sf of sources) {
-    const visit = (node: ts.Node): void => {
-      if (ts.isClassDeclaration(node)) {
-        for (const clause of node.heritageClauses ?? []) {
-          for (const type of clause.types) {
-            if (!ts.isIdentifier(type.expression)) continue;
-            const key = type.expression.text;
-            implementers.set(key, [...(implementers.get(key) ?? []), node]);
-          }
-        }
-      }
-      ts.forEachChild(node, visit);
-    };
-    visit(sf);
-  }
-
-  /**
-   * Members of `src` classes that implement an interface member. Covers BOTH
-   * spellings an interface can use for a function member: a method signature
-   * (`save(x): void`) and a function-typed property signature
-   * (`save: (x) => void`).
-   *
-   * THE PROPERTY-SIGNATURE BRANCH IS WIRED AND CURRENTLY INERT, stated plainly
-   * because a branch carrying an unearned claim is worse than an absent one. It
-   * resolves nothing in this tree as it stands: of the 685 function-typed
-   * property-signature members across 363 interfaces, not one is implemented by
-   * a class that syntactically `implements` its interface, so this branch's own
-   * resolution count is zero. It exists so that adding such an implementation
-   * fails closed rather than going silently unwalked. It fixes no call site
-   * today and none should be attributed to it. The real unresolved gap is the
-   * injected-dependency class measured in the header, which this branch does
-   * not touch, because an injected function-typed property is supplied by an
-   * object literal at a construction site rather than by a class that declares
-   * `implements`.
-   */
-  function implementationsOf(
-    signature: ts.MethodSignature | ts.PropertySignature
-  ): ts.Declaration[] {
-    const iface = signature.parent;
-    if (!ts.isInterfaceDeclaration(iface)) return [];
-    const memberName =
-      ts.isIdentifier(signature.name) || ts.isStringLiteral(signature.name)
-        ? signature.name.text
-        : undefined;
-    if (memberName === undefined) return [];
-    const out: ts.Declaration[] = [];
-    for (const cls of implementers.get(iface.name.text) ?? []) {
-      for (const member of cls.members) {
-        if (!ts.isMethodDeclaration(member) && !ts.isPropertyDeclaration(member)) continue;
-        if (!ts.isIdentifier(member.name) && !ts.isStringLiteral(member.name)) continue;
-        if (member.name.text !== memberName) continue;
-        out.push(member);
-      }
-    }
-    return out;
-  }
-
-  const resolver = createCalleeResolver(checker, implementationsOf);
+  const resolver = createCalleeResolver(checker, createImplementationLookup(checker, sources));
 
   /**
    * Where a handler walk STARTS, and why that is not simply the `handler`
