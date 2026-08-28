@@ -64,7 +64,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import ts from "typescript";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 import {
   admitDescent,
@@ -1119,8 +1119,8 @@ function resolveLaunderingFixtures(): Map<string, string[]> {
   // supplying an empty one keeps the fixture's resolution path honest.
   const resolver = createCalleeResolver(checker, () => []);
 
-  const byFile = new Map<string, string[]>();
-  for (const fileName of fileNames) {
+  const byDescription = new Map<string, string[]>();
+  for (const [index, fileName] of fileNames.entries()) {
     const source = program.getSourceFile(fileName);
     if (source === undefined) throw new Error(`fixture did not load: ${fileName}`);
     const found: string[] = [];
@@ -1140,9 +1140,11 @@ function resolveLaunderingFixtures(): Map<string, string[]> {
       ts.forEachChild(node, visit);
     };
     visit(source);
-    byFile.set(fileName, [...new Set(found)].sort());
+    const fixture = LAUNDERING_FIXTURES[index];
+    if (fixture === undefined) throw new Error(`fixture ${index} disappeared`);
+    byDescription.set(fixture.what, [...new Set(found)].sort());
   }
-  return byFile;
+  return byDescription;
 }
 
 // ---------------------------------------------------------------------------
@@ -1408,6 +1410,19 @@ function resolveImplicitInvocationFixtures(): Map<string, string[]> {
 
 describe("read-classified MCP tools and durable-state mutation", () => {
   const report = analyzeReadToolMutationReachability();
+  let resolvedLaunderingFixtures: Map<string, string[]>;
+
+  beforeAll(() => {
+    // Resolve the synthetic program once so splitting the corpus into
+    // independently counted tests does not multiply the compiler work. These
+    // assertions keep duplicate descriptions or a partial result map from
+    // laundering a missing case into a green parameterized run.
+    resolvedLaunderingFixtures = resolveLaunderingFixtures();
+    expect(new Set(LAUNDERING_FIXTURES.map((fixture) => fixture.what))).toHaveLength(
+      LAUNDERING_FIXTURES.length
+    );
+    expect(resolvedLaunderingFixtures.size).toBe(LAUNDERING_FIXTURES.length);
+  });
 
   it("parsed the shipping classification tables", () => {
     // A parser that matched nothing would produce an empty target set and pass
@@ -1579,31 +1594,21 @@ describe("read-classified MCP tools and durable-state mutation", () => {
     expect(stale).toEqual([]);
   });
 
-  it("classifies a laundered sink, whatever the indirection", () => {
-    // One program for the whole corpus, so a fixture cannot pass by loading a
-    // different `@types/node` than its neighbours.
-    //
-    // THE WHOLE CORPUS IS ONE TEST, which is a known weakness of this shape and
-    // is recorded rather than left for a reader to notice: a regression that
-    // blanks most of the corpus moves the repo-wide passing-test floor in
-    // `.test-baseline` by exactly one, so that floor is nearly blind to it. The
-    // whole-map equality below is what carries the signal instead. Splitting
-    // this into a case per fixture would put the corpus into the floor, at the
-    // cost of churning the floor whenever a fixture is added.
-    const resolved = resolveLaunderingFixtures();
-    const actual: Record<string, readonly string[]> = {};
-    const expected: Record<string, readonly string[]> = {};
-    [...resolved.values()].forEach((primitives, index) => {
-      const fixture = LAUNDERING_FIXTURES[index];
-      if (fixture === undefined) throw new Error(`fixture ${index} disappeared`);
-      actual[fixture.what] = primitives;
-      expected[fixture.what] = [...fixture.expect].sort();
-    });
-    // Whole-map equality, not per-fixture: a per-fixture loop that stopped
-    // iterating would pass on the fixtures it never reached.
-    expect(actual).toEqual(expected);
-    expect(Object.keys(actual)).toHaveLength(LAUNDERING_FIXTURES.length);
-  });
+  it.each(LAUNDERING_FIXTURES)(
+    "classifies a laundered sink: $what",
+    (fixture) => {
+      // One program for the whole corpus, so a fixture cannot pass by loading a
+      // different `@types/node` than its neighbours.
+      //
+      // Every corpus entry is a distinct Vitest case, so removing or breaking one
+      // changes the repository-wide passing-test floor by one. The shared
+      // beforeAll keeps the compiler cost constant while its cardinality checks
+      // retain the former whole-map anti-vacuity guarantee.
+      const actual = resolvedLaunderingFixtures.get(fixture.what);
+      expect(actual, `fixture disappeared: ${fixture.what}`).toBeDefined();
+      expect(actual).toEqual([...fixture.expect].sort());
+    }
+  );
 
   it("walks implicit invocations: getter reads, setter assignments, and iterator protocol", () => {
     // GATE-A-R5 regression and negative-control corpus. Three implicit
