@@ -7,6 +7,12 @@
  * This barrel is the module surface consumers import; do not reach into the
  * internal files. Layers:
  *   - verify/resolve core + tier model (`token.ts`, `tier.ts`).
+ *   - plan catalog (`plan-catalog.ts`) - pure data + a pure lookup mapping a
+ *     purchasable plan name (currently just `team`) onto a claim template
+ *     (`tier`/`pricingUnit`/`featureFlags`/`defaultGraceDays` + the
+ *     overage-math `entitledCount(extraNodes)`) that `cli/license.ts`'s
+ *     `--plan` preset fills into the SAME `issueLicense` path a raw-flag
+ *     issuance uses. No schema change, no new tier token.
  *   - issuer license ledger (`ledger.ts`, `ledger-io.ts`, `ledger-antirollback.ts`)
  *     - the Erik-operated sell side (PR-1).
  *   - activation + enforcement (`activation.ts`, `fleet-cap.ts`) - the operator
@@ -164,6 +170,18 @@ export {
   type CapTransition,
   type ReResolveResult,
 } from "./re-resolve.js";
+
+export {
+  ALL_ENTITLEMENT_FEATURE_FLAGS,
+  TEAM_INCLUDED_NODES,
+  DEFAULT_GRACE_DAYS,
+  PLAN_NAMES,
+  isPlanName,
+  PLAN_CATALOG,
+  getPlanClaimTemplate,
+  type PlanName,
+  type PlanClaimTemplate,
+} from "./plan-catalog.js";
 
 export {
   COMPLIANCE_ATTESTATION_SCHEMA,
