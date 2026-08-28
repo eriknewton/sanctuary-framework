@@ -499,6 +499,62 @@ export function launder(command: string): void {
 `,
   },
   {
+    what: "an interface-typed inline object property",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+interface Shell { run: (command: string) => unknown }
+const shell: Shell = { run: execSync };
+export function launder(command: string): void {
+  void shell.run(command);
+}
+`,
+  },
+  {
+    // Exact member selection is the false-positive boundary. The mutating
+    // sibling must not contaminate the safe property that is actually called.
+    // A later reassignment of `shell.run` remains deliberately untracked: this
+    // bounded syntactic recovery reads the initializer and does no dataflow.
+    what: "a safe interface property beside an unrelated mutating sibling (must stay clean)",
+    expect: [],
+    code: `
+import { execSync } from "node:child_process";
+type Fn = (command: string) => unknown;
+interface Shell { run: Fn; dangerous: Fn }
+function safe(command: string): string { return command; }
+const shell: Shell = { run: safe, dangerous: execSync };
+export function launder(command: string): void {
+  void shell.run(command);
+}
+`,
+  },
+  {
+    what: "a Record string-literal lookup into an inline object",
+    expect: ["child_process.execSync"],
+    code: `
+import { execSync } from "node:child_process";
+type Fn = (command: string) => unknown;
+const shell: Record<string, Fn> = { run: execSync };
+export function launder(command: string): void {
+  void shell["run"](command);
+}
+`,
+  },
+  {
+    // As above, selecting every property would manufacture a subprocess hit.
+    what: "a safe Record key beside an unrelated mutating key (must stay clean)",
+    expect: [],
+    code: `
+import { execSync } from "node:child_process";
+type Fn = (command: string) => unknown;
+function safe(command: string): string { return command; }
+const shell: Record<string, Fn> = { run: safe, dangerous: execSync };
+export function launder(command: string): void {
+  void shell["run"](command);
+}
+`,
+  },
+  {
     what: "a bare const bound to the imported function, subprocess family",
     expect: ["child_process.spawnSync"],
     code: `
@@ -1056,8 +1112,11 @@ export function launder(value: string): string {
     expect: [],
     code: `
 import { readFileSync } from "node:fs";
-export function launder(paths: string[]): void {
-  paths.forEach(readFileSync);
+function acceptReader(reader: typeof readFileSync): void {
+  void reader;
+}
+export function launder(): void {
+  acceptReader(readFileSync);
 }
 `,
   },
@@ -1120,6 +1179,17 @@ function resolveLaunderingFixtures(): Map<string, string[]> {
   host.getCurrentDirectory = () => FIXTURE_SERVER_DIR;
 
   const program = ts.createProgram(fileNames, options, host);
+  const diagnostics = [
+    ...program.getSyntacticDiagnostics(),
+    ...program.getSemanticDiagnostics(),
+  ].filter((diagnostic) => diagnostic.file !== undefined && virtual.has(diagnostic.file.fileName));
+  if (diagnostics.length > 0) {
+    throw new Error(
+      `invalid laundering fixture:\n${diagnostics
+        .map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"))
+        .join("\n")}`
+    );
+  }
   const checker = program.getTypeChecker();
   // No interface-to-class index: none of these shapes goes through one, and
   // supplying an empty one keeps the fixture's resolution path honest.
