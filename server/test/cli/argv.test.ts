@@ -85,19 +85,21 @@ describe("shared CLI argv flag parser", () => {
     // single-dash short flag like `-h` was silently consumed as the value:
     // `sanctuary identity show --fortress -h` ran against a fortress
     // literally named "-h" instead of printing help.
+    const DASH_HINTED =
+      '--fortress requires a value (for a value beginning with "-", use the --fortress=<value> form)';
     expect(consumeFlagValue(["--fortress", "-h"], "--fortress")).toEqual({
       argv: ["--fortress", "-h"],
-      error: "--fortress requires a value",
+      error: DASH_HINTED,
     });
     expect(consumeFlagValue(["--fortress", "-x"], "--fortress")).toEqual({
       argv: ["--fortress", "-x"],
-      error: "--fortress requires a value",
+      error: DASH_HINTED,
     });
     // A `--`-prefixed next token (the original, narrower check) still
     // refuses too.
     expect(consumeFlagValue(["--fortress", "--json"], "--fortress")).toEqual({
       argv: ["--fortress", "--json"],
-      error: "--fortress requires a value",
+      error: DASH_HINTED,
     });
     // The documented escape hatch: a dash-leading value stays expressible
     // through the unambiguous `--fortress=<path>` equals form.

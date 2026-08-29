@@ -129,7 +129,13 @@ describe("IC-30: strict --fortress parity across migrated verbs", () => {
       const { out, err } = streams();
       const code = await runIdentityCommand({ argv: ["show", "--fortress", "-x"], out, err });
       expect(code).toBe(FORTRESS_FLAG_USAGE_EXIT_CODE);
-      expect(err.text).toBe(expectedLine(MISSING_VALUE));
+      // The dash-leading refusal carries the equals-form escape hint so the
+      // legitimate dash-leading path stays discoverable at the rejection.
+      expect(err.text).toBe(
+        expectedLine(
+          `${MISSING_VALUE} (for a value beginning with "-", use the --fortress=<value> form)`,
+        ),
+      );
     });
   });
 

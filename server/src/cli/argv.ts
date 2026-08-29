@@ -29,8 +29,17 @@ export function consumeFlagValue(argv: string[], name: string): ConsumedFlagValu
       // legitimately begins with `-` (a dash-leading directory name) stays
       // expressible via the unambiguous `--fortress=<path>` equals form,
       // which has no "is this the next flag?" question to answer.
-      if (next === undefined || next.length === 0 || next.startsWith("-")) {
+      if (next === undefined || next.length === 0) {
         return { argv, error: `${name} requires a value` };
+      }
+      if (next.startsWith("-")) {
+        // The refusal itself teaches the escape hatch, so a dash-leading
+        // path is discoverable exactly where an operator first hits the
+        // rejection, not only in a comment.
+        return {
+          argv,
+          error: `${name} requires a value (for a value beginning with "-", use the ${name}=<value> form)`,
+        };
       }
       if (value !== undefined) {
         return { argv, error: `${name} may only be provided once` };

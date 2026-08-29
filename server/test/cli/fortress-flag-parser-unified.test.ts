@@ -109,7 +109,10 @@ function listTsFiles(dir: string): string[] {
 
 /** True for a relative import specifier that resolves to this tree's `argv.ts` (`./argv.js`, `../argv.js`, `../../argv.js`, ...). */
 function isArgvModuleSpecifier(specifier: string): boolean {
-  return /^(\.\.\/)*\.\/argv\.js$/.test(specifier);
+  // `./argv.js` from siblings, or one-or-more `../` hops from nested dirs.
+  // The prior form required a literal `./` before `argv.js`, which missed
+  // real nested imports like `../argv.js` entirely.
+  return /^(\.\/|(\.\.\/)+)argv\.js$/.test(specifier);
 }
 
 const PERMISSIVE_EXPORT_NAMES = new Set(["flagValue", "flagValues"]);
