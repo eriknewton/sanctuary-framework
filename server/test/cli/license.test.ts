@@ -220,6 +220,328 @@ describe("sanctuary license — help + arg validation (no fortress needed)", () 
     expect(err.text).toContain("--nodes");
   });
 
+  it("issue with an unknown --plan → exit 1, no secret", async () => {
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runLicenseCommand({
+      argv: ["issue", "--plan", "pro", "--subject", "x", "--expires", FUTURE],
+      out,
+      err,
+      env: {},
+    });
+    expect(code).toBe(1);
+    expect(err.text).toContain("unknown --plan");
+    expect(out.text).toBe("");
+  });
+
+  it("issue with --extra-nodes but no --plan → exit 1 (ambiguous flag, refuses rather than ignoring it)", async () => {
+    const err = new StringWritable();
+    const code = await runLicenseCommand({
+      argv: [
+        "issue", "--extra-nodes", "3", "--subject", "x",
+        "--nodes", "5", "--tier", "fleet", "--expires", FUTURE,
+      ],
+      out: new StringWritable(),
+      err,
+      env: {},
+    });
+    expect(code).toBe(1);
+    expect(err.text).toContain("--extra-nodes requires --plan");
+  });
+
+  it("issue with a negative --extra-nodes → exit 1", async () => {
+    const err = new StringWritable();
+    const code = await runLicenseCommand({
+      argv: [
+        "issue", "--plan", "team", "--extra-nodes", "-1",
+        "--subject", "x", "--expires", FUTURE,
+      ],
+      out: new StringWritable(),
+      err,
+      env: {},
+    });
+    expect(code).toBe(1);
+    expect(err.text).toContain("--extra-nodes must be a non-negative integer");
+  });
+
+  it("THE NEGATIVE TEST (mandatory): --plan combined with a conflicting raw flag REFUSES loudly, never silently overrides", async () => {
+    const err = new StringWritable();
+    const code = await runLicenseCommand({
+      argv: [
+        "issue", "--plan", "team", "--extra-nodes", "0", "--tier", "fleet",
+        "--subject", "x", "--expires", FUTURE,
+      ],
+      out: new StringWritable(),
+      err,
+      env: {},
+    });
+    expect(code).toBe(1);
+    expect(err.text).toContain("--plan team conflicts with explicit --tier");
+  });
+
+  it("--plan combined with --nodes, --features, AND --pricing-unit all together lists every conflicting flag", async () => {
+    const err = new StringWritable();
+    const code = await runLicenseCommand({
+      argv: [
+        "issue", "--plan", "team", "--nodes", "5", "--features", "roster",
+        "--pricing-unit", "seat", "--subject", "x", "--expires", FUTURE,
+      ],
+      out: new StringWritable(),
+      err,
+      env: {},
+    });
+    expect(code).toBe(1);
+    expect(err.text).toContain("--nodes");
+    expect(err.text).toContain("--features");
+    expect(err.text).toContain("--pricing-unit");
+    // The refusal path must never reach the raw-flag validators (e.g. it
+    // does not report "unknown feature 'roster'" — 'roster' is valid; the
+    // point is the refusal happens BEFORE any raw-flag value is inspected).
+    expect(err.text).not.toContain("unknown feature");
+  });
+
+  describe("--extra-nodes strict integer parsing (round-2 finding, register id EFC-01)", () => {
+    const REFUSAL = /--extra-nodes must be a non-negative integer up to \d+/;
+
+    it.each([
+      ["exponent notation", "1e3"],
+      ["leading plus", "+5"],
+      ["leading zero", "05"],
+      ["decimal point", "5.5"],
+      ["surrounding whitespace", " 5"],
+      ["trailing whitespace", "5 "],
+      ["hex-looking literal", "0x5"],
+      ["empty string", ""],
+      ["Infinity keyword", "Infinity"],
+      ["NaN keyword", "NaN"],
+      ["thousands separator", "1,000"],
+      // Number("9007199254740993") is NOT the safe integer it names — it
+      // silently rounds to 9007199254740992 (MAX_SAFE_INTEGER + 1), the exact
+      // class of "unsafe entitledCount signed into the ledger" the finding
+      // named. Canonical decimal syntax alone (the regex) does not catch
+      // this — only Number.isSafeInteger does.
+      ["unsafe integer beyond MAX_SAFE_INTEGER", "9007199254740993"],
+    ])("rejects --extra-nodes with %s ('%s')", async (_label, value) => {
+      const err = new StringWritable();
+      const code = await runLicenseCommand({
+        argv: ["issue", "--plan", "team", "--extra-nodes", value, "--subject", "x", "--expires", FUTURE],
+        out: new StringWritable(),
+        err,
+        env: {},
+      });
+      expect(code).toBe(1);
+      expect(err.text).toMatch(REFUSAL);
+    });
+
+    it("accepts --extra-nodes exactly AT the plan's maxExtraNodes bound but refuses one past it", async () => {
+      const { TEAM_MAX_EXTRA_NODES } = await import("../../src/entitlement/plan-catalog.js");
+
+      const overErr = new StringWritable();
+      const overCode = await runLicenseCommand({
+        argv: [
+          "issue", "--plan", "team", "--extra-nodes", String(TEAM_MAX_EXTRA_NODES + 1),
+          "--subject", "x", "--expires", FUTURE,
+        ],
+        out: new StringWritable(),
+        err: overErr,
+        env: {},
+      });
+      expect(overCode).toBe(1);
+      expect(overErr.text).toMatch(REFUSAL);
+
+      // AT the bound: passes extra-nodes validation and proceeds to the next
+      // fail-closed gate (no fortress unlockable) — proves the bound is
+      // inclusive, not off-by-one, without needing a real fortress.
+      const atErr = new StringWritable();
+      const atCode = await runLicenseCommand({
+        argv: [
+          "issue", "--plan", "team", "--extra-nodes", String(TEAM_MAX_EXTRA_NODES),
+          "--subject", "x", "--expires", FUTURE,
+        ],
+        out: new StringWritable(),
+        err: atErr,
+        env: {},
+      });
+      expect(atCode).toBe(1);
+      expect(atErr.text).not.toMatch(REFUSAL);
+      expect(atErr.text).toMatch(/unlocked operator identity is required|keychain/);
+    });
+  });
+
+  describe("--plan conflict detection covers both `--flag value` and `--flag=value` syntax, in both orders (round-2 finding, register id EFC-02)", () => {
+    const PLAN_FILLED = ["--tier", "--nodes", "--features", "--pricing-unit", "--grace-days"] as const;
+    const RAW_VALUE: Record<(typeof PLAN_FILLED)[number], string> = {
+      "--tier": "fleet",
+      "--nodes": "5",
+      "--features": "roster",
+      "--pricing-unit": "seat",
+      "--grace-days": "30",
+    };
+
+    for (const flag of PLAN_FILLED) {
+      const value = RAW_VALUE[flag];
+
+      it(`refuses '${flag} ${value}' (space form) BEFORE --plan`, async () => {
+        const err = new StringWritable();
+        const code = await runLicenseCommand({
+          argv: [
+            "issue", flag, value, "--plan", "team",
+            "--subject", "x", "--expires", FUTURE,
+          ],
+          out: new StringWritable(),
+          err,
+          env: {},
+        });
+        expect(code).toBe(1);
+        expect(err.text).toContain(`--plan team conflicts with explicit ${flag}`);
+      });
+
+      it(`refuses '${flag} ${value}' (space form) AFTER --plan`, async () => {
+        const err = new StringWritable();
+        const code = await runLicenseCommand({
+          argv: [
+            "issue", "--plan", "team", flag, value,
+            "--subject", "x", "--expires", FUTURE,
+          ],
+          out: new StringWritable(),
+          err,
+          env: {},
+        });
+        expect(code).toBe(1);
+        expect(err.text).toContain(`--plan team conflicts with explicit ${flag}`);
+      });
+
+      it(`refuses '${flag}=${value}' (equals form) BEFORE --plan`, async () => {
+        const err = new StringWritable();
+        const code = await runLicenseCommand({
+          argv: [
+            "issue", `${flag}=${value}`, "--plan", "team",
+            "--subject", "x", "--expires", FUTURE,
+          ],
+          out: new StringWritable(),
+          err,
+          env: {},
+        });
+        expect(code).toBe(1);
+        expect(err.text).toContain(`--plan team conflicts with explicit ${flag}`);
+      });
+
+      it(`refuses '${flag}=${value}' (equals form) AFTER --plan — THE FINDING'S EXACT REPRO ('--plan=team --tier=fleet' shape`, async () => {
+        const err = new StringWritable();
+        const code = await runLicenseCommand({
+          argv: [
+            "issue", "--plan", "team", `${flag}=${value}`,
+            "--subject", "x", "--expires", FUTURE,
+          ],
+          out: new StringWritable(),
+          err,
+          env: {},
+        });
+        expect(code).toBe(1);
+        expect(err.text).toContain(`--plan team conflicts with explicit ${flag}`);
+      });
+    }
+
+    it("THE FINDING'S LITERAL REPRO: '--plan=team --tier=fleet' (both flags in equals form) refuses, never silently overrides", async () => {
+      const err = new StringWritable();
+      const out = new StringWritable();
+      const code = await runLicenseCommand({
+        argv: ["issue", "--plan=team", "--tier=fleet", "--subject", "x", "--expires", FUTURE],
+        out,
+        err,
+        env: {},
+      });
+      expect(code).toBe(1);
+      expect(err.text).toContain("--plan team conflicts with explicit --tier");
+      expect(out.text).toBe("");
+    });
+  });
+
+  it("--grace-days default: --plan team fills grace from the catalog's defaultGraceDays (round-2 finding, register id EFC-03)", async () => {
+    let tmp: string | undefined;
+    try {
+      tmp = await mkdtemp(join(tmpdir(), "sanctuary-license-grace-fill-"));
+      const fortressPath = join(tmp, "f");
+      const recoveryKey = await seedFortressWithIdentity(fortressPath);
+      delete process.env.SANCTUARY_STORAGE_PATH;
+
+      const out = new StringWritable();
+      const code = await runLicenseCommand({
+        argv: [
+          "issue", "--fortress", fortressPath, "--plan", "team",
+          "--subject", "grace-co", "--expires", FUTURE,
+        ],
+        out,
+        err: new StringWritable(),
+        env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      });
+      expect(code).toBe(0);
+
+      const token = decodeLicense(out.text);
+      // graceUntil = notAfter + 14 days (the catalog's defaultGraceDays), not
+      // some other value — proves the preset FILLS it from the template
+      // rather than relying on the CLI's separate DEFAULT_GRACE_DAYS fallback
+      // happening to match today.
+      const claims = token.claims as { notAfter: number; graceUntil: number | null };
+      expect(claims.graceUntil).not.toBeNull();
+      expect(claims.graceUntil! - claims.notAfter).toBe(14 * 86_400);
+    } finally {
+      delete process.env.SANCTUARY_STORAGE_PATH;
+      delete process.env.SANCTUARY_RECOVERY_KEY;
+      if (tmp) await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("USAGE and the unknown-feature error render the known-features list and grace default FROM the catalog constants, not a hand-mirrored literal (round-2 finding, register id EFC-04)", async () => {
+    const { ALL_ENTITLEMENT_FEATURE_FLAGS, DEFAULT_GRACE_DAYS, PLAN_NAMES } = await import(
+      "../../src/entitlement/plan-catalog.js"
+    );
+    // Independent oracle (finding EFC-04's own instruction): assert against
+    // literal expected values, NOT by re-importing the same constant the
+    // production code renders from — a bug in the constant itself must still
+    // be caught by a test that does not share its source.
+    expect([...ALL_ENTITLEMENT_FEATURE_FLAGS]).toEqual([
+      "roster", "policy-dist", "kill-safety", "console",
+    ]);
+    expect(DEFAULT_GRACE_DAYS).toBe(14);
+    expect([...PLAN_NAMES]).toEqual(["team"]);
+
+    const usageOut = new StringWritable();
+    await runLicenseCommand({ argv: ["--help"], out: usageOut, err: new StringWritable(), env: {} });
+    expect(usageOut.text).toContain("roster,policy-dist,kill-safety,console");
+    expect(usageOut.text).toContain("--grace-days 14");
+    // Plan-name drift guard: USAGE's --plan example must contain EVERY name
+    // PLAN_NAMES knows (a newly catalogued plan automatically shows up in
+    // help text with no separate edit), and the example's --plan segment
+    // must contain NO plan-shaped token absent from PLAN_NAMES (a catalog
+    // rename or removal is caught here before it can mislead an operator).
+    // Scoped to the `--plan <...>` segment specifically, not the whole
+    // USAGE string, because `--tier <team|fleet|enterprise>` uses the
+    // unrelated EntitlementTier vocabulary and legitimately contains
+    // "team" as a TIER name even if "team" were ever removed from PLAN_NAMES.
+    const planSegment = usageOut.text.match(/--plan <([^>]+)>/);
+    expect(planSegment).not.toBeNull();
+    const renderedPlanNames = planSegment![1].split("|");
+    for (const name of PLAN_NAMES) {
+      expect(renderedPlanNames).toContain(name);
+    }
+    for (const rendered of renderedPlanNames) {
+      expect(PLAN_NAMES as readonly string[]).toContain(rendered);
+    }
+
+    const featErr = new StringWritable();
+    await runLicenseCommand({
+      argv: [
+        "issue", "--tier", "fleet", "--subject", "x", "--nodes", "5",
+        "--expires", FUTURE, "--features", "roster,bogus",
+      ],
+      out: new StringWritable(),
+      err: featErr,
+      env: {},
+    });
+    expect(featErr.text).toContain("known: roster, policy-dist, kill-safety, console");
+  });
+
   it("issue with an unknown feature → exit 1", async () => {
     const err = new StringWritable();
     const code = await runLicenseCommand({
@@ -355,6 +677,45 @@ describe("sanctuary license — end-to-end (keychain-free fortress)", () => {
     expect(resolved.entitledCount).toBe(25);
     expect(resolved.period).toBe("annual");
     expect(resolved.featureFlags).toEqual(["console", "policy-dist", "roster"]);
+  });
+
+  it("--plan team --extra-nodes 3 issues a license that independently resolves the catalog's D1/D2 claim (10+3 nodes, full feature set, node pricing)", async () => {
+    const fortressPath = join(tmp, "f-plan");
+    const recoveryKey = await seedFortressWithIdentity(fortressPath);
+    delete process.env.SANCTUARY_STORAGE_PATH;
+
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runLicenseCommand({
+      argv: [
+        "issue", "--fortress", fortressPath,
+        "--plan", "team", "--extra-nodes", "3",
+        "--subject", "plan-co", "--period", "annual", "--expires", FUTURE,
+      ],
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+    });
+    expect(code).toBe(0);
+    expect(err.text).toBe("");
+
+    const token = decodeLicense(out.text);
+    const pub = await issuerPublicKey(fortressPath, recoveryKey);
+    const resolved = resolveEntitlement({
+      token,
+      issuerPublicKey: pub,
+      now: Math.floor(Date.parse(FUTURE) / 1000) - 86_400,
+    });
+    expect(resolved.granted).toBe(true);
+    expect(resolved.tier).toBe("team");
+    expect(resolved.entitledCount).toBe(13); // 10 included + 3 extra (D1)
+    expect(resolved.pricingUnit).toBe("node");
+    expect(resolved.period).toBe("annual");
+    // D2: the plan preset grants the FULL feature set, unlike the raw
+    // --tier team default (which stays roster+policy-dist only).
+    expect([...(resolved.featureFlags ?? [])].sort()).toEqual(
+      ["console", "kill-safety", "policy-dist", "roster"].sort(),
+    );
   });
 
   it("list reflects an issued license, and revoke marks it revoked", async () => {
