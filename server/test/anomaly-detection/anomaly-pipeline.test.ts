@@ -625,6 +625,200 @@ describe("WP-V1.3-2 Chi-1 AnomalyPipelineDispatcher", () => {
   });
 });
 
+describe("AnomalyPipelineDispatcher per-detector serialization", () => {
+  // Registry mutation for one detector id is serialized at the
+  // dispatcher chokepoint (register id:
+  // ic-sweep-auto-trigger-thresholds-consumed). These tests hold the
+  // in-flight operations open at controlled await points and assert the
+  // registry invariants that must survive the overlap.
+
+  /** Stub whose subscribe() stays in flight until open() is called. */
+  class GatedSubscribeDetector extends StubDetector {
+    subscribeCalls = 0;
+    private release!: () => void;
+    private readonly gate = new Promise<void>((resolve) => {
+      this.release = resolve;
+    });
+    open(): void {
+      this.release();
+    }
+    override async subscribe(context: AnomalyContext): Promise<void> {
+      this.subscribeCalls += 1;
+      await this.gate;
+      await super.subscribe(context);
+    }
+  }
+
+  /** Stub whose unsubscribe() stays in flight until open() is called. */
+  class GatedUnsubscribeDetector extends StubDetector {
+    private release!: () => void;
+    private readonly gate = new Promise<void>((resolve) => {
+      this.release = resolve;
+    });
+    open(): void {
+      this.release();
+    }
+    override async unsubscribe(): Promise<void> {
+      await this.gate;
+      await super.unsubscribe();
+    }
+  }
+
+  /** Minimal standalone classifier with a caller-chosen id. */
+  function makeStandaloneClassifier(classifierId: string): AnomalyClassifier {
+    return {
+      classifierId,
+      observe: async () => {},
+      predict: async () => ({
+        anomaly_score: 0,
+        explanation: [],
+        feature_contributions: [],
+        baseline_ready: false,
+      }),
+      train: async () => ({
+        trained_at: new Date(0).toISOString(),
+        sample_count: 0,
+        agent_count: 0,
+      }),
+    };
+  }
+
+  it("two in-flight same-id registrations settle on one live instance", async () => {
+    const rig = makeRig();
+    const first = new GatedSubscribeDetector("stub");
+    const second = new GatedSubscribeDetector("stub");
+    const firstRegistration = rig.dispatcher.registerDetector(first);
+    const secondRegistration = rig.dispatcher.registerDetector(second);
+    first.open();
+    second.open();
+    const [firstOutcome, secondOutcome] = await Promise.all([
+      firstRegistration,
+      secondRegistration,
+    ]);
+    // The documented idempotency (a second same-id register returns the
+    // already-registered instance) holds while both calls are in
+    // flight: both callers receive the one live instance, the second
+    // instance is never subscribed, and the registry carries a single
+    // entry for the id.
+    expect(firstOutcome).toBe(first);
+    expect(secondOutcome).toBe(first);
+    expect(first.subscribeCalls).toBe(1);
+    expect(second.subscribeCalls).toBe(0);
+    expect(rig.dispatcher.listDetectors()).toEqual(["stub"]);
+  });
+
+  it("a classifier attach overlapping a same-id teardown resolves against the live registry", async () => {
+    const rig = makeRig();
+    await rig.dispatcher.registerDetector(new StubDetector("stub"));
+    const extraClassifier = makeStandaloneClassifier("stub-extra");
+    let releaseFactory!: () => void;
+    const factoryGate = new Promise<void>((resolve) => {
+      releaseFactory = resolve;
+    });
+    const teardown = rig.dispatcher.unregisterDetector("stub");
+    const attach = rig.dispatcher.addClassifierToDetector(
+      "stub",
+      async () => {
+        await factoryGate;
+        return extraClassifier;
+      },
+    );
+    releaseFactory();
+    const [removed, attached] = await Promise.all([teardown, attach]);
+    expect(removed).toBe(true);
+    // An attach that overlaps the teardown reports false: a true result
+    // means the classifier is live on the registered detector, never on
+    // an instance the registry no longer holds.
+    expect(attached).toBe(false);
+    expect(rig.dispatcher.listDetectors()).toEqual([]);
+    expect(rig.dispatcher.listDetectorClassifiers("stub")).toEqual([]);
+  });
+
+  it("a detach queued behind an in-flight attach observes the committed classifier set", async () => {
+    const rig = makeRig();
+    await rig.dispatcher.registerDetector(new StubDetector("stub"));
+    const extraClassifier = makeStandaloneClassifier("stub-extra");
+    let releaseFactory!: () => void;
+    const factoryGate = new Promise<void>((resolve) => {
+      releaseFactory = resolve;
+    });
+    const attach = rig.dispatcher.addClassifierToDetector(
+      "stub",
+      async () => {
+        await factoryGate;
+        return extraClassifier;
+      },
+    );
+    const detach = rig.dispatcher.removeClassifierFromDetector(
+      "stub",
+      "stub-extra",
+    );
+    releaseFactory();
+    const [attached, removed] = await Promise.all([attach, detach]);
+    expect(attached).toBe(true);
+    // The detach runs only after the in-flight attach commits, so it
+    // removes the classifier the attach added rather than reporting it
+    // absent while the attach is still building the set.
+    expect(removed).toBe(true);
+    expect(rig.dispatcher.listDetectorClassifiers("stub")).toEqual([
+      "stub-classifier",
+    ]);
+  });
+
+  it("a primary detach queued behind an in-flight dependent attach decides on the committed classifier set", async () => {
+    const rig = makeRig();
+    await rig.dispatcher.registerDetector(new StubDetector("stub"));
+    const extraClassifier = makeStandaloneClassifier("stub-extra");
+    let releaseFactory!: () => void;
+    const factoryGate = new Promise<void>((resolve) => {
+      releaseFactory = resolve;
+    });
+    const attach = rig.dispatcher.addClassifierToDetector(
+      "stub",
+      async () => {
+        await factoryGate;
+        return extraClassifier;
+      },
+    );
+    const primaryDetach = rig.dispatcher.removeClassifierOrUnregisterDetector(
+      "stub",
+      "stub-classifier",
+    );
+    releaseFactory();
+    const [attached, outcome] = await Promise.all([attach, primaryDetach]);
+    expect(attached).toBe(true);
+    // The unsubscribe policy decides and mutates in one lock hold, so
+    // the primary-with-dependents refusal fires on the classifier set as
+    // committed by the attach queued ahead, and the attach's
+    // registration survives the refused teardown.
+    expect(outcome).toEqual({ outcome: "primary_has_dependents" });
+    expect(rig.dispatcher.listDetectors()).toEqual(["stub"]);
+    expect(rig.dispatcher.listDetectorClassifiers("stub")).toEqual([
+      "stub-classifier",
+      "stub-extra",
+    ]);
+  });
+
+  it("a settled classifier read joins the chain behind an in-flight teardown", async () => {
+    const rig = makeRig();
+    const detector = new GatedUnsubscribeDetector("stub");
+    await rig.dispatcher.registerDetector(detector);
+    const teardown = rig.dispatcher.unregisterDetector("stub");
+    // The instantaneous list still names the primary classifier while
+    // the teardown's unsubscribe is in flight; the settled read reports
+    // only ids a live registration backs.
+    expect(rig.dispatcher.listDetectorClassifiers("stub")).toEqual([
+      "stub-classifier",
+    ]);
+    const settledRead = rig.dispatcher.getSettledDetectorClassifiers("stub");
+    detector.open();
+    const [removed, settledIds] = await Promise.all([teardown, settledRead]);
+    expect(removed).toBe(true);
+    expect(settledIds).toEqual([]);
+    expect(rig.dispatcher.listDetectors()).toEqual([]);
+  });
+});
+
 describe("WP-V1.3-2 Chi-1 local-only invariant", () => {
   it("classifier-state ciphertext does not contain plaintext feature names", async () => {
     const storage = new MemoryStorage();

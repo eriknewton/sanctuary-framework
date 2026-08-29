@@ -63,6 +63,12 @@ export interface ThresholdConfigStoreOptions {
   now?: () => Date;
 }
 
+/** Discriminated read outcome for `getResult`; see its doc comment. */
+export type RuleConfigReadResult =
+  | { status: "found"; config: RuleThresholdConfig }
+  | { status: "absent" }
+  | { status: "error"; error: unknown };
+
 /**
  * Per-fortress threshold-config store. One instance per fortress; all
  * writes are AAD-bound to (rule_id, fortress_id).
@@ -80,17 +86,48 @@ export class ThresholdConfigStore {
     this.now = opts.now ?? (() => new Date());
   }
 
-  /** Read a rule config. Returns null when absent. */
+  /**
+   * Read a rule config, collapsing every non-success shape (no row
+   * persisted, and every read/decode failure -- see `getResult`) to
+   * `null`. This is the right contract for `getOrInit` and the
+   * rung/history callers below: they treat "absent" and "unreadable"
+   * identically (both trigger a fresh Rung-1 default write). A caller
+   * that must tell "no row" apart from "a row exists but could not be
+   * read" -- because substituting a default for a real read failure
+   * would be an unannounced fail-open -- uses `getResult` instead.
+   */
   async get(ruleId: string): Promise<RuleThresholdConfig | null> {
+    const result = await this.getResult(ruleId);
+    return result.status === "found" ? result.config : null;
+  }
+
+  /**
+   * Read a rule config with the failure mode preserved: `"found"` (a
+   * valid row), `"absent"` (no row persisted for this rule_id -- safe
+   * to fall back to compiled defaults), or `"error"` (a row exists at
+   * this key but could not be read back as-written: storage I/O
+   * failure, an oversized record, or a decode/identity check that
+   * failed). `get()` above collapses `"absent"` and `"error"` together
+   * for its established callers; this method exists for a caller that
+   * must not.
+   */
+  async getResult(ruleId: string): Promise<RuleConfigReadResult> {
     const key = ruleStorageKey(ruleId);
     let raw: Uint8Array | null;
     try {
       raw = await this.storage.read(AUTO_TRIGGER_RULES_NAMESPACE, key);
-    } catch {
-      return null;
+    } catch (error) {
+      return { status: "error", error };
     }
-    if (!raw) return null;
-    if (raw.length > MAX_RULE_BYTES) return null;
+    if (!raw) return { status: "absent" };
+    if (raw.length > MAX_RULE_BYTES) {
+      return {
+        status: "error",
+        error: new Error(
+          `rule ${ruleId}: persisted record exceeds ${MAX_RULE_BYTES} bytes`,
+        ),
+      };
+    }
     try {
       const aad = stringToBytes(aadFor(ruleId, this.fortressId));
       const envelope: EncryptedPayload = JSON.parse(bytesToString(raw));
@@ -98,12 +135,28 @@ export class ThresholdConfigStore {
       const persisted = JSON.parse(
         bytesToString(plaintext),
       ) as PersistedRule;
-      if (persisted.version !== 1) return null;
-      if (persisted.rule_id !== ruleId) return null;
-      if (persisted.fortress_id !== this.fortressId) return null;
-      return persisted.config;
-    } catch {
-      return null;
+      if (persisted.version !== 1) {
+        return {
+          status: "error",
+          error: new Error(
+            `rule ${ruleId}: unsupported persisted schema version ${String(persisted.version)}`,
+          ),
+        };
+      }
+      if (
+        persisted.rule_id !== ruleId ||
+        persisted.fortress_id !== this.fortressId
+      ) {
+        return {
+          status: "error",
+          error: new Error(
+            `rule ${ruleId}: persisted record identity mismatch`,
+          ),
+        };
+      }
+      return { status: "found", config: persisted.config };
+    } catch (error) {
+      return { status: "error", error };
     }
   }
 

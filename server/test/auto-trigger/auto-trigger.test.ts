@@ -1018,6 +1018,185 @@ describe("Nu-1: HTTP routes", () => {
     }
   });
 
+  it("PATCH with a malformed threshold_overrides field refuses (400) and leaves an existing row byte-identical", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      const seedRes = await fetch(
+        `${base}${AUTO_TRIGGER_API_PREFIX}/rules/r-malformed`,
+        {
+          method: "PATCH",
+          headers: jsonAuth(),
+          body: JSON.stringify({
+            rule_type: "anomaly",
+            threshold_overrides: { warn_sigma: 2.5, alert_sigma: 5.0 },
+            cancel_window_seconds: 45,
+          }),
+        },
+      );
+      expect(seedRes.status).toBe(200);
+      const before = await rig.store.get("r-malformed");
+
+      // Raw-storage evidence: a decrypted read-back comparison alone
+      // cannot distinguish "row untouched" from "row rewritten with equal
+      // content", so the refusal must also show zero writes reaching the
+      // rules namespace (register id:
+      // ic-sweep-auto-trigger-thresholds-consumed).
+      const originalWrite = rig.storage.write.bind(rig.storage);
+      let rulesNamespaceWrites = 0;
+      rig.storage.write = async (
+        namespace: string,
+        key: string,
+        data: Uint8Array,
+      ) => {
+        if (namespace === AUTO_TRIGGER_RULES_NAMESPACE) {
+          rulesNamespaceWrites += 1;
+        }
+        return originalWrite(namespace, key, data);
+      };
+
+      const malformedRes = await fetch(
+        `${base}${AUTO_TRIGGER_API_PREFIX}/rules/r-malformed`,
+        {
+          method: "PATCH",
+          headers: jsonAuth(),
+          body: JSON.stringify({
+            rule_type: "anomaly",
+            threshold_overrides: { warn_sigma: "not-a-number" },
+          }),
+        },
+      );
+      expect(malformedRes.status).toBe(400);
+      const malformedBody = (await malformedRes.json()) as {
+        ok: boolean;
+        error: string;
+      };
+      expect(malformedBody.ok).toBe(false);
+      expect(malformedBody.error).toBe("invalid_threshold_overrides");
+
+      expect(rulesNamespaceWrites).toBe(0);
+      const after = await rig.store.get("r-malformed");
+      expect(after).toEqual(before);
+    } finally {
+      await close();
+    }
+  });
+
+  it("PATCH with an explicit {} threshold_overrides clears every override (200)", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      const seedRes = await fetch(
+        `${base}${AUTO_TRIGGER_API_PREFIX}/rules/r-clear`,
+        {
+          method: "PATCH",
+          headers: jsonAuth(),
+          body: JSON.stringify({
+            rule_type: "anomaly",
+            threshold_overrides: { warn_sigma: 2.5, alert_sigma: 5.0 },
+          }),
+        },
+      );
+      expect(seedRes.status).toBe(200);
+      const seeded = await rig.store.get("r-clear");
+      expect(seeded?.threshold_overrides).toEqual({
+        warn_sigma: 2.5,
+        alert_sigma: 5.0,
+      });
+
+      // `{}` is the one body shape that means "clear every override";
+      // the store persists it as a full replacement of the row.
+      const clearRes = await fetch(
+        `${base}${AUTO_TRIGGER_API_PREFIX}/rules/r-clear`,
+        {
+          method: "PATCH",
+          headers: jsonAuth(),
+          body: JSON.stringify({
+            rule_type: "anomaly",
+            threshold_overrides: {},
+          }),
+        },
+      );
+      expect(clearRes.status).toBe(200);
+      const clearBody = (await clearRes.json()) as {
+        ok: boolean;
+        data: { rule: RuleThresholdConfig };
+      };
+      expect(clearBody.ok).toBe(true);
+      expect(clearBody.data.rule.threshold_overrides).toEqual({});
+      const cleared = await rig.store.get("r-clear");
+      expect(cleared?.threshold_overrides).toEqual({});
+    } finally {
+      await close();
+    }
+  });
+
+  it("PATCH refuses every malformed threshold_overrides shape (400) and persists nothing", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      // Each shape must refuse atomically: no partial acceptance, no
+      // sanitized-down remainder reaching the store.
+      const malformedShapes: Array<{ label: string; overrides: unknown }> = [
+        { label: "null field", overrides: null },
+        { label: "array", overrides: [3, 4] },
+        {
+          label: "nested object garbage",
+          overrides: { alert_sigma: { nested: true } },
+        },
+        {
+          label: "prototype-pollution-shaped key",
+          overrides: JSON.parse('{"__proto__": {"alert_sigma": 1}}'),
+        },
+      ];
+      for (const shape of malformedShapes) {
+        const res = await fetch(
+          `${base}${AUTO_TRIGGER_API_PREFIX}/rules/r-shape-matrix`,
+          {
+            method: "PATCH",
+            headers: jsonAuth(),
+            body: JSON.stringify({
+              rule_type: "anomaly",
+              threshold_overrides: shape.overrides,
+            }),
+          },
+        );
+        expect(res.status, shape.label).toBe(400);
+        const body = (await res.json()) as { ok: boolean; error: string };
+        expect(body.ok, shape.label).toBe(false);
+        expect(body.error, shape.label).toBe("invalid_threshold_overrides");
+        expect(await rig.store.get("r-shape-matrix"), shape.label).toBeNull();
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  it("PATCH with an unrecognized threshold_overrides key refuses (400) and persists nothing new", async () => {
+    const rig = makeRig();
+    const { base, close } = await makeServer(rig);
+    try {
+      const res = await fetch(
+        `${base}${AUTO_TRIGGER_API_PREFIX}/rules/r-unknown-key`,
+        {
+          method: "PATCH",
+          headers: jsonAuth(),
+          body: JSON.stringify({
+            rule_type: "anomaly",
+            threshold_overrides: { not_a_real_field: 1 },
+          }),
+        },
+      );
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { ok: boolean; error: string };
+      expect(body.ok).toBe(false);
+      expect(body.error).toBe("invalid_threshold_overrides");
+      expect(await rig.store.get("r-unknown-key")).toBeNull();
+    } finally {
+      await close();
+    }
+  });
+
   it("POST /api/auto-trigger/rules/:id/promote + /demote round-trip; ceiling/floor return 409", async () => {
     const rig = makeRig();
     const { base, close } = await makeServer(rig);

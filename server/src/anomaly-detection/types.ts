@@ -186,7 +186,12 @@ export abstract class AnomalyDetector {
     return this.additionalClassifiers.delete(classifierId);
   }
 
-  /** List every classifier id attached: primary first, then additionals. */
+  /**
+   * List every classifier id attached: primary first, then additionals.
+   * Ordering is a contract: must match the primary-first read in
+   * `removeClassifierOrUnregisterDetector` in `anomaly-pipeline.ts`, which
+   * takes element 0 as the primary when applying its removal policy.
+   */
   listClassifierIds(): string[] {
     return [
       this.classifier.classifierId,
