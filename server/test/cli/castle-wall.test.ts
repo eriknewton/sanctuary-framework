@@ -630,8 +630,10 @@ describe("castle-wall CLI verbs", () => {
     expect(parseCastleWallArgs(["daemon", "--fortress"]).parseError).toBe(
       "--fortress requires a value",
     );
+    // A dash-leading next token gets the equals-form hint (the strict parser
+    // refuses to consume "--json" as --since's value and says how to pass one).
     expect(parseCastleWallArgs(["audit-dump", "--since", "--json"]).parseError).toBe(
-      "--since requires a value",
+      '--since requires a value (for a value beginning with "-", use the --since=<value> form)',
     );
   });
 

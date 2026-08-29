@@ -310,6 +310,31 @@ function readFortress(argv: string[]) {
     expect(violations).toHaveLength(1);
   });
 
+  // Positive fixture for the nested-specifier arm of isArgvModuleSpecifier:
+  // every other self-test imports via "./argv.js", so without these two cases
+  // a regression back to the literal-"./" matcher would still pass the suite.
+  it("catches a permissive import reached through a nested `../argv.js` specifier", () => {
+    const source = `
+import { flagValue } from "../argv.js";
+function readFortress(argv: string[]) {
+  return flagValue(argv, "--fortress");
+}
+`;
+    const violations = findFortressFlagViolations(source, "synthetic.ts");
+    expect(violations).toHaveLength(1);
+  });
+
+  it("catches a permissive import reached through a multi-hop `../../argv.js` specifier", () => {
+    const source = `
+import { flagValue } from "../../argv.js";
+function readFortress(argv: string[]) {
+  return flagValue(argv, "--fortress");
+}
+`;
+    const violations = findFortressFlagViolations(source, "synthetic.ts");
+    expect(violations).toHaveLength(1);
+  });
+
   it("catches a wrapper nested arbitrarily deep in the SAME file", () => {
     const source = `
 import { flagValue } from "./argv.js";
