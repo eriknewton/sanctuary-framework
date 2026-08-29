@@ -1268,9 +1268,13 @@ export async function createSanctuaryServer(options?: {
   // v1.3 WP-V1.3-10 Upsilon-2: wrap the approval channel with the
   // aggregator-backed channel. When `approval_redirect.enabled` is false
   // (default), the wrapper short-circuits to underlying-passthrough; the
-  // wire-up is unconditional so operators can flip the toggle via
-  // `sanctuary agents config --approval-redirect=true` without restarting
-  // the server. Mode `replace` bypasses the underlying channel; mode
+  // wire-up is unconditional so the code needs no boot-time branch on the
+  // toggle's current value (the per-request resolver check is cheap in the
+  // disabled-default state). `policy` here is the same frozen object loaded
+  // once at boot (AGENTS.md MUST-NEVER #7): a
+  // `sanctuary agents config --approval-redirect=true` edit is written to
+  // disk immediately but only takes effect once this server process is
+  // restarted. Mode `replace` bypasses the underlying channel; mode
   // `notify` races both paths (Mastra-class fallback).
   const wrappedApprovalChannel = new AggregatorBackedChannel({
     underlying: approvalChannel,

@@ -112,6 +112,14 @@ describe("sanctuary agents config --approval-redirect (Upsilon-2)", () => {
       enabled: true,
       mode: "replace",
     });
+    // Execution-time pin of the effect-timing guidance (not just source
+    // text): the running CLI must state next-start semantics and must not
+    // claim next-request effect. Must match the message in
+    // src/cli/agents/cli.ts (structure pin: agents-config-restart-required-message.test.ts).
+    expect(out.text).toContain(
+      "Persisted. Takes effect the next time this tenant's Sanctuary server starts",
+    );
+    expect(out.text).not.toMatch(/next gate request/i);
   });
 
   it("config <tenant> --approval-redirect=true --approval-redirect-mode=notify persists mode", async () => {

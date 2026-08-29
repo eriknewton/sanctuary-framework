@@ -10,9 +10,12 @@
  *   - `status`  one-line-per-tenant summary (running / stopped + counts).
  *   - `config <tenant> --approval-redirect=<bool>` (v1.3 Upsilon-2)
  *               Writes principal-policy.yaml on disk for the tenant.
- *               Takes effect on the tenant's next gate request (no
- *               restart required for running servers because the policy
- *               supplier is consulted per request).
+ *               Takes effect the next time the tenant's Sanctuary server
+ *               starts. AGENTS.md MUST-NEVER
+ *               #7 freezes the Principal Policy at boot: it is loaded once
+ *               and never re-read, so a running server keeps enforcing the
+ *               policy it booted with no matter how many times this verb
+ *               rewrites the file on disk.
  *
  * Everything here is derivable from the filesystem + optional runtime.json
  * files. No tenant secrets or identity private keys are ever decrypted.
@@ -522,8 +525,16 @@ async function cmdConfig(argv: string[], ctx: ResolvedCtx): Promise<number> {
     ctx.out.write(
       `sanctuary agents config: tenant "${tenant.name}" approval_redirect=${next.enabled ? `on (${next.mode})` : "off"}\n`,
     );
+    // INVARIANT: the Principal Policy is loaded exactly once at boot and
+    // frozen for the process lifetime (AGENTS.md MUST-NEVER #7; enforced at
+    // server/src/index.ts's Principal Policy load site and captured as a
+    // fixed constructor field in server/src/principal-policy/gate.ts). A
+    // live-reload path is prohibited, so this message must never be
+    // "improved" back to next-request/no-restart phrasing: that phrasing
+    // was the defect (IC-26): the write above lands on disk immediately,
+    // but a running server will not see it until it restarts.
     ctx.out.write(
-      `  Takes effect on the next gate request for the running server.\n`,
+      `  Persisted. Takes effect the next time this tenant's Sanctuary server starts: a running server keeps the policy it booted with until it is restarted.\n`,
     );
   }
   return 0;
