@@ -288,6 +288,9 @@ describe("auto-trigger sigma overrides via the production anomaly-subscribe path
       expect(rig.dispatcher.listDetectorClassifiers(PER_AGENT_ACTIVITY_DETECTOR_ID)).not.toContain(
         CUSUM_CLASSIFIER_ID,
       );
+      // Refusal invariant (anomaly-routes.ts): a refused subscribe leaves
+      // the dispatcher's detector list exactly as it was -- here, empty.
+      expect(rig.dispatcher.listDetectors()).toEqual([]);
     } finally {
       await close();
     }
@@ -312,6 +315,7 @@ describe("auto-trigger sigma overrides via the production anomaly-subscribe path
       expect(rig.dispatcher.listDetectorClassifiers(PER_AGENT_ACTIVITY_DETECTOR_ID)).not.toContain(
         CUSUM_CLASSIFIER_ID,
       );
+      expect(rig.dispatcher.listDetectors()).toEqual([]);
     } finally {
       await close();
     }
@@ -336,6 +340,7 @@ describe("auto-trigger sigma overrides via the production anomaly-subscribe path
       expect(rig.dispatcher.listDetectorClassifiers(PER_AGENT_ACTIVITY_DETECTOR_ID)).not.toContain(
         CUSUM_CLASSIFIER_ID,
       );
+      expect(rig.dispatcher.listDetectors()).toEqual([]);
     } finally {
       await close();
     }
@@ -354,6 +359,7 @@ describe("auto-trigger sigma overrides via the production anomaly-subscribe path
       expect(rig.dispatcher.listDetectorClassifiers(PER_AGENT_ACTIVITY_DETECTOR_ID)).not.toContain(
         CUSUM_CLASSIFIER_ID,
       );
+      expect(rig.dispatcher.listDetectors()).toEqual([]);
     } finally {
       await close();
     }

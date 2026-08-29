@@ -63,6 +63,7 @@ import {
   type AnomalyCatalogEntry,
 } from "./anomaly-catalog.js";
 import { ANOMALY_SENTINEL_ID_PREFIX } from "./types.js";
+import type { AnomalyClassifier, AnomalyContext } from "./types.js";
 import { ClassifierStateStore } from "./classifier-state-store.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import type { StorageBackend } from "../storage/interface.js";
@@ -374,32 +375,133 @@ export async function handleAnomalyRoute(
         return true;
       }
       if (method === "POST") {
+        // Refusal invariant: a refused or failed subscribe leaves the
+        // dispatcher's detector list exactly as it was. Enforced by
+        // ordering, not compensation: every input read and classifier
+        // construction that can refuse or throw completes BEFORE the
+        // first dispatcher mutation, so there is never partial state to
+        // undo (register id: ic-sweep-auto-trigger-thresholds-consumed).
         try {
-          let classifierIds = deps.dispatcher.listDetectorClassifiers(entry.detectorId);
-          if (classifierIds.length === 0) {
-            await deps.dispatcher.registerDetector(entry.factory());
-            classifierIds = deps.dispatcher.listDetectorClassifiers(entry.detectorId);
+          // The already-live decision reads through the dispatcher's
+          // settled-state chokepoint: it joins the detector's mutation
+          // chain, so an in-flight teardown or attach completes before
+          // this snapshot is taken and `subscribed: true` is never
+          // reported from a mid-mutation registry state (register id:
+          // ic-sweep-auto-trigger-thresholds-consumed).
+          const preSubscribeClassifierIds =
+            await deps.dispatcher.getSettledDetectorClassifiers(
+              entry.detectorId,
+            );
+          if (preSubscribeClassifierIds.includes(entry.classifierId)) {
+            // Idempotent re-subscribe: already live, nothing to mutate.
+            writeJSON(res, 200, {
+              ok: true,
+              data: {
+                detector_id: entry.detectorId,
+                classifier_id: entry.classifierId,
+                subscribed: true,
+                subscribed_classifiers: preSubscribeClassifierIds,
+              },
+            });
+            return true;
           }
-          if (!classifierIds.includes(entry.classifierId)) {
-            if (!entry.classifierFactory) {
+          const detectorLive = preSubscribeClassifierIds.length > 0;
+          if (detectorLive && !entry.classifierFactory) {
+            // A live detector can gain the requested classifier only
+            // through the entry's classifierFactory; without one the
+            // subscribe is refused before any mutation.
+            writeJSON(res, 409, {
+              ok: false,
+              error: "classifier_not_attachable",
+            });
+            return true;
+          }
+          // Construct the requested classifier before registering
+          // anything: the catalog's classifierFactory is the fallible
+          // step (it reads the operator's persisted threshold overrides
+          // and refuses an unsupported or unreadable row), so a throw
+          // here reaches the catch below with the detector list
+          // untouched.
+          let prevalidatedClassifier: AnomalyClassifier | undefined;
+          if (entry.classifierFactory) {
+            const context: AnomalyContext = {
+              fortressId: deps.fortressId,
+              auditLog: deps.auditLog,
+              storage: deps.storage,
+              masterKey: deps.masterKey,
+              now: deps.now ?? (() => new Date()),
+            };
+            prevalidatedClassifier = await entry.classifierFactory(context);
+          }
+          // Every fallible input read and construction has succeeded;
+          // mutations start here. An entry without a classifierFactory
+          // names its detector's own primary classifier (catalog
+          // contract), so the fresh registration below attaches the
+          // requested classifier itself. registerDetector is idempotent,
+          // so a concurrent subscribe racing this one keeps the winner's
+          // live registration.
+          if (!detectorLive) {
+            await deps.dispatcher.registerDetector(entry.factory());
+          }
+          if (prevalidatedClassifier !== undefined) {
+            // The factory handed to the dispatcher returns the instance
+            // validated above, so the attach step itself has no remaining
+            // input read that can throw.
+            const classifierInstance = prevalidatedClassifier;
+            const attached = await deps.dispatcher.addClassifierToDetector(
+              entry.detectorId,
+              () => classifierInstance,
+            );
+            if (!attached) {
+              // `subscribed: true` is only reported for a classifier that
+              // is verifiably live on the detector, so a declined attach
+              // is resolved against settled dispatcher state instead of
+              // being assumed successful (register id:
+              // ic-sweep-auto-trigger-thresholds-consumed).
+              const liveClassifierIds =
+                await deps.dispatcher.getSettledDetectorClassifiers(
+                  entry.detectorId,
+                );
+              if (liveClassifierIds.includes(entry.classifierId)) {
+                // The requested classifier is live (a concurrent subscribe
+                // attached it): the same idempotent-200 shape as the
+                // pre-mutation already-live path above.
+                writeJSON(res, 200, {
+                  ok: true,
+                  data: {
+                    detector_id: entry.detectorId,
+                    classifier_id: entry.classifierId,
+                    subscribed: true,
+                    subscribed_classifiers: liveClassifierIds,
+                  },
+                });
+                return true;
+              }
+              // Not live and not attached. Every registered detector
+              // carries at least its primary classifier, so an empty list
+              // means the detector holds no live registration (e.g. a
+              // concurrent unsubscribe removed it); a non-empty list means
+              // the live detector declined the attach. Both are live-state
+              // conflicts, refused with this route's 409 convention.
               writeJSON(res, 409, {
                 ok: false,
-                error: "classifier_not_attachable",
+                error:
+                  liveClassifierIds.length === 0
+                    ? "detector_not_subscribed"
+                    : "classifier_not_attachable",
               });
               return true;
             }
-            await deps.dispatcher.addClassifierToDetector(
-              entry.detectorId,
-              entry.classifierFactory,
-            );
-            classifierIds = deps.dispatcher.listDetectorClassifiers(entry.detectorId);
           }
+          const classifierIds = deps.dispatcher.listDetectorClassifiers(
+            entry.detectorId,
+          );
           writeJSON(res, 200, {
             ok: true,
             data: {
               detector_id: entry.detectorId,
               classifier_id: entry.classifierId,
-              subscribed: true,
+              subscribed: classifierIds.includes(entry.classifierId),
               subscribed_classifiers: classifierIds,
             },
           });
@@ -412,26 +514,28 @@ export async function handleAnomalyRoute(
         return true;
       }
       if (method === "DELETE") {
-        const classifierIds = deps.dispatcher.listDetectorClassifiers(entry.detectorId);
-        let removed = false;
-        if (classifierIds.includes(entry.classifierId)) {
-          const primaryClassifierId = classifierIds[0];
-          if (entry.classifierId === primaryClassifierId) {
-            if (classifierIds.length > 1) {
-              writeJSON(res, 409, {
-                ok: false,
-                error: "primary_classifier_has_dependents",
-              });
-              return true;
-            }
-            removed = await deps.dispatcher.unregisterDetector(entry.detectorId);
-          } else {
-            removed = await deps.dispatcher.removeClassifierFromDetector(
-              entry.detectorId,
-              entry.classifierId,
-            );
-          }
+        // Decision and mutation are ONE atomic dispatcher operation:
+        // the primary/dependents policy fires on the same registry
+        // state the selected mutation applies to, including state
+        // committed by operations queued ahead of this one (register
+        // id: ic-sweep-auto-trigger-thresholds-consumed). This route
+        // only translates the outcome into its response shapes.
+        const detachOutcome =
+          await deps.dispatcher.removeClassifierOrUnregisterDetector(
+            entry.detectorId,
+            entry.classifierId,
+          );
+        if (detachOutcome.outcome === "primary_has_dependents") {
+          writeJSON(res, 409, {
+            ok: false,
+            error: "primary_classifier_has_dependents",
+          });
+          return true;
         }
+        const removed =
+          detachOutcome.outcome === "not_subscribed"
+            ? false
+            : detachOutcome.removed;
         writeJSON(res, 200, {
           ok: true,
           data: {

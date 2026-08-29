@@ -22,7 +22,12 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createServer, type Server } from "node:http";
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
 import type { AddressInfo } from "node:net";
 import { randomUUID } from "node:crypto";
 import { Writable } from "node:stream";
@@ -39,6 +44,7 @@ import {
   AnomalyPipelineDispatcher,
   ANOMALY_AUDIT_OPS,
   ANOMALY_SENTINEL_ID_PREFIX,
+  type AnomalyClassifier,
 } from "../../src/anomaly-detection/anomaly-pipeline.js";
 import {
   ANOMALY_CATALOG,
@@ -55,12 +61,16 @@ import {
   loadAnomalySubscriptions,
   saveAnomalySubscriptions,
 } from "../../src/anomaly-detection/anomaly-subscription-store.js";
-import { PER_AGENT_ACTIVITY_DETECTOR_ID } from "../../src/anomaly-detection/detectors/per-agent-activity-detector.js";
+import {
+  PerAgentActivityDetector,
+  PER_AGENT_ACTIVITY_DETECTOR_ID,
+} from "../../src/anomaly-detection/detectors/per-agent-activity-detector.js";
 import {
   DEFAULT_MIN_SAMPLES_FOR_PREDICTION,
   ROLLING_BASELINE_CLASSIFIER_ID,
 } from "../../src/anomaly-detection/classifiers/rolling-baseline.js";
 import { CUSUM_CLASSIFIER_ID } from "../../src/anomaly-detection/classifiers/cusum.js";
+import { PSI_CLASSIFIER_ID } from "../../src/anomaly-detection/classifiers/psi.js";
 import {
   CrossAgentTimingDetector,
   CROSS_AGENT_TIMING_DETECTOR_ID,
@@ -156,6 +166,70 @@ async function makeServer(rig: ReturnType<typeof makeRig>): Promise<{
         }),
       ),
   };
+}
+
+/**
+ * Invoke the anomaly route handler in-process, without a socket. HTTP
+ * transport delivers one request event per event-loop turn, so two
+ * handlers only overlap across macrotask awaits; invocations started
+ * together in-process interleave at EVERY await point of the handler,
+ * which is the scheduling the concurrency assertions below must hold
+ * under (register id: ic-sweep-auto-trigger-thresholds-consumed).
+ */
+function invokeSubscribeInProcess(
+  rig: ReturnType<typeof makeRig>,
+  detectorId: string,
+  classifierId: string,
+  method: "POST" | "DELETE" = "POST",
+): Promise<{
+  status: number;
+  body: {
+    ok: boolean;
+    error?: string;
+    data?: { subscribed?: boolean; removed?: boolean };
+  };
+}> {
+  const req = {
+    method,
+    url: `${ANOMALY_API_PREFIX}/${detectorId}/subscribe?classifier=${classifierId}`,
+    headers: {
+      host: "127.0.0.1",
+      authorization: `Bearer ${ANOMALY_AUTH_TOKEN}`,
+    },
+    socket: { remoteAddress: "127.0.0.1" },
+  } as unknown as IncomingMessage;
+  let status = 0;
+  let payload = "";
+  const res = {
+    writeHead(code: number): ServerResponse {
+      status = code;
+      return this as unknown as ServerResponse;
+    },
+    end(chunk?: unknown): void {
+      if (typeof chunk === "string") payload = chunk;
+    },
+  } as unknown as ServerResponse;
+  return handleAnomalyRoute(
+    {
+      authConfig: { loopbackAutoAuth: true, authToken: ANOMALY_AUTH_TOKEN },
+      dispatcher: rig.dispatcher,
+      findingStore: rig.findingStore,
+      auditLog: rig.auditLog,
+      identityId: IDENTITY,
+      storage: rig.storage,
+      masterKey: rig.masterKey,
+      fortressId: rig.fortressId,
+    },
+    req,
+    res,
+  ).then(() => ({
+    status,
+    body: JSON.parse(payload) as {
+      ok: boolean;
+      error?: string;
+      data?: { subscribed?: boolean; removed?: boolean };
+    },
+  }));
 }
 
 class CollectStream extends Writable {
@@ -400,6 +474,171 @@ describe("Chi-3 — HTTP routes", () => {
     }
   });
 
+  // ── Concurrency capability: subscribes in flight together on one ─────────
+  // detector converge on a single live registration that carries every
+  // classifier the callers were told is subscribed. The dispatcher
+  // serializes registry mutation per detector id (register id:
+  // ic-sweep-auto-trigger-thresholds-consumed). Both invocations are
+  // started synchronously via invokeSubscribeInProcess so their handlers
+  // interleave at every await point.
+  it("concurrent fresh subscribes for two classifier tuples on one detector both take effect", async () => {
+    const rig = makeRig();
+    const [psi, cusum] = await Promise.all([
+      invokeSubscribeInProcess(
+        rig,
+        PER_AGENT_ACTIVITY_DETECTOR_ID,
+        PSI_CLASSIFIER_ID,
+      ),
+      invokeSubscribeInProcess(
+        rig,
+        PER_AGENT_ACTIVITY_DETECTOR_ID,
+        CUSUM_CLASSIFIER_ID,
+      ),
+    ]);
+    expect(psi.status).toBe(200);
+    expect(cusum.status).toBe(200);
+    expect(psi.body.data?.subscribed).toBe(true);
+    expect(cusum.body.data?.subscribed).toBe(true);
+    // Both classifiers the callers were told are subscribed are live on
+    // the detector.
+    const live = rig.dispatcher.listDetectorClassifiers(
+      PER_AGENT_ACTIVITY_DETECTOR_ID,
+    );
+    expect(live).toContain(PSI_CLASSIFIER_ID);
+    expect(live).toContain(CUSUM_CLASSIFIER_ID);
+    // Single registration: the detector list holds exactly one entry for
+    // the id.
+    expect(rig.dispatcher.listDetectors()).toEqual([
+      PER_AGENT_ACTIVITY_DETECTOR_ID,
+    ]);
+  });
+
+  it("concurrent same-classifier subscribes converge on one live classifier instance", async () => {
+    const rig = makeRig();
+    const [first, second] = await Promise.all([
+      invokeSubscribeInProcess(
+        rig,
+        PER_AGENT_ACTIVITY_DETECTOR_ID,
+        CUSUM_CLASSIFIER_ID,
+      ),
+      invokeSubscribeInProcess(
+        rig,
+        PER_AGENT_ACTIVITY_DETECTOR_ID,
+        CUSUM_CLASSIFIER_ID,
+      ),
+    ]);
+    // Idempotent outcome: both callers get the subscribed-200 shape.
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(first.body.data?.subscribed).toBe(true);
+    expect(second.body.data?.subscribed).toBe(true);
+    // Exactly one live CUSUM instance on exactly one registration.
+    const live = rig.dispatcher.listDetectorClassifiers(
+      PER_AGENT_ACTIVITY_DETECTOR_ID,
+    );
+    expect(live.filter((id) => id === CUSUM_CLASSIFIER_ID)).toHaveLength(1);
+    expect(rig.dispatcher.listDetectors()).toEqual([
+      PER_AGENT_ACTIVITY_DETECTOR_ID,
+    ]);
+  });
+
+  it("a subscribe overlapping an in-flight unsubscribe settles against a live registration", async () => {
+    const rig = makeRig();
+    // Detector whose teardown stays in flight until open() is called,
+    // holding the registry mid-teardown while the subscribe arrives.
+    class GatedTeardownDetector extends PerAgentActivityDetector {
+      private release!: () => void;
+      private readonly gate = new Promise<void>((resolve) => {
+        this.release = resolve;
+      });
+      open(): void {
+        this.release();
+      }
+      override async unsubscribe(): Promise<void> {
+        await this.gate;
+        await super.unsubscribe();
+      }
+    }
+    const detector = new GatedTeardownDetector();
+    await rig.dispatcher.registerDetector(detector);
+    const teardown = rig.dispatcher.unregisterDetector(
+      PER_AGENT_ACTIVITY_DETECTOR_ID,
+    );
+    const post = invokeSubscribeInProcess(
+      rig,
+      PER_AGENT_ACTIVITY_DETECTOR_ID,
+      ROLLING_BASELINE_CLASSIFIER_ID,
+    );
+    detector.open();
+    const [removed, res] = await Promise.all([teardown, post]);
+    expect(removed).toBe(true);
+    expect(res.status).toBe(200);
+    expect(res.body.data?.subscribed).toBe(true);
+    // `subscribed: true` is backed by a live registration: the subscribe
+    // settles after the teardown completes and registers afresh, so the
+    // detector and its classifier are live once both calls resolve.
+    expect(rig.dispatcher.listDetectors()).toEqual([
+      PER_AGENT_ACTIVITY_DETECTOR_ID,
+    ]);
+    expect(
+      rig.dispatcher.listDetectorClassifiers(PER_AGENT_ACTIVITY_DETECTOR_ID),
+    ).toEqual([ROLLING_BASELINE_CLASSIFIER_ID]);
+  });
+
+  it("a primary unsubscribe overlapping an in-flight dependent subscribe refuses on the settled classifier set", async () => {
+    const rig = makeRig();
+    await rig.dispatcher.registerDetector(new PerAgentActivityDetector());
+    // Dependent classifier whose attach stays in flight until released,
+    // so the primary DELETE arrives while the attach is queued ahead of
+    // it on the detector's mutation chain.
+    const dependentClassifier: AnomalyClassifier = {
+      classifierId: CUSUM_CLASSIFIER_ID,
+      observe: async () => {},
+      predict: async () => ({
+        anomaly_score: 0,
+        explanation: [],
+        feature_contributions: [],
+        baseline_ready: false,
+      }),
+      train: async () => ({
+        trained_at: new Date(0).toISOString(),
+        sample_count: 0,
+        agent_count: 0,
+      }),
+    };
+    let releaseFactory!: () => void;
+    const factoryGate = new Promise<void>((resolve) => {
+      releaseFactory = resolve;
+    });
+    const attach = rig.dispatcher.addClassifierToDetector(
+      PER_AGENT_ACTIVITY_DETECTOR_ID,
+      async () => {
+        await factoryGate;
+        return dependentClassifier;
+      },
+    );
+    const primaryDelete = invokeSubscribeInProcess(
+      rig,
+      PER_AGENT_ACTIVITY_DETECTOR_ID,
+      ROLLING_BASELINE_CLASSIFIER_ID,
+      "DELETE",
+    );
+    releaseFactory();
+    const [attached, res] = await Promise.all([attach, primaryDelete]);
+    expect(attached).toBe(true);
+    // The primary-with-dependents refusal fires on the classifier set as
+    // committed by the attach queued ahead of the DELETE, so the
+    // attach's registration survives.
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("primary_classifier_has_dependents");
+    expect(rig.dispatcher.listDetectors()).toEqual([
+      PER_AGENT_ACTIVITY_DETECTOR_ID,
+    ]);
+    expect(
+      rig.dispatcher.listDetectorClassifiers(PER_AGENT_ACTIVITY_DETECTOR_ID),
+    ).toEqual([ROLLING_BASELINE_CLASSIFIER_ID, CUSUM_CLASSIFIER_ID]);
+  });
+
   it("subscribe without ?classifier= returns 400", async () => {
     const rig = makeRig();
     const { base, close } = await makeServer(rig);
@@ -409,6 +648,7 @@ describe("Chi-3 — HTTP routes", () => {
         { method: "POST", headers: MUTATION_AUTH },
       );
       expect(res.status).toBe(400);
+      expect(rig.dispatcher.listDetectors()).toEqual([]);
     } finally {
       await close();
     }
@@ -423,6 +663,55 @@ describe("Chi-3 — HTTP routes", () => {
         { method: "POST", headers: MUTATION_AUTH },
       );
       expect(res.status).toBe(404);
+      expect(rig.dispatcher.listDetectors()).toEqual([]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("subscribe refuses classifier_not_attachable (409) and leaves the live detector and its classifiers unchanged", async () => {
+    const rig = makeRig();
+    // A detector live under an explicit non-default classifier: the
+    // rolling-baseline tuple's catalog entry carries no classifierFactory,
+    // so the route has no way to attach it to this detector and must
+    // refuse before touching the dispatcher.
+    const explicitCusum: AnomalyClassifier = {
+      classifierId: CUSUM_CLASSIFIER_ID,
+      observe: async () => {},
+      predict: async () => ({
+        anomaly_score: 0,
+        explanation: [],
+        feature_contributions: [],
+        baseline_ready: false,
+      }),
+      train: async () => ({
+        trained_at: new Date(0).toISOString(),
+        sample_count: 0,
+        agent_count: 0,
+      }),
+    };
+    await rig.dispatcher.registerDetector(
+      new PerAgentActivityDetector({ classifier: explicitCusum }),
+    );
+    const { base, close } = await makeServer(rig);
+    try {
+      const res = await fetch(
+        `${base}${ANOMALY_API_PREFIX}/${PER_AGENT_ACTIVITY_DETECTOR_ID}/subscribe?classifier=${ROLLING_BASELINE_CLASSIFIER_ID}`,
+        { method: "POST", headers: MUTATION_AUTH },
+      );
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { ok: boolean; error: string };
+      expect(body.ok).toBe(false);
+      expect(body.error).toBe("classifier_not_attachable");
+      // Refusal invariant (anomaly-routes.ts): a refused subscribe leaves
+      // the detector list and its attached classifiers exactly as they
+      // were -- the live registration survives, nothing new attaches.
+      expect(rig.dispatcher.listDetectors()).toEqual([
+        PER_AGENT_ACTIVITY_DETECTOR_ID,
+      ]);
+      expect(
+        rig.dispatcher.listDetectorClassifiers(PER_AGENT_ACTIVITY_DETECTOR_ID),
+      ).toEqual([CUSUM_CLASSIFIER_ID]);
     } finally {
       await close();
     }

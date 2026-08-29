@@ -82,6 +82,17 @@ export type AnomalyDispatcherAnyEmit =
   | AnomalyDispatcherEmit
   | AnomalyDispatcherFailureEmit;
 
+/**
+ * Outcome of removeClassifierOrUnregisterDetector. Consumers branch on
+ * `outcome`; `removed` reports whether the selected mutation removed an
+ * active registration or classifier.
+ */
+export type RemoveClassifierOrUnregisterOutcome =
+  | { outcome: "not_subscribed" }
+  | { outcome: "primary_has_dependents" }
+  | { outcome: "detector_unregistered"; removed: boolean }
+  | { outcome: "classifier_removed"; removed: boolean };
+
 export interface AnomalyPipelineDispatcherDeps {
   findingStore: SentinelFindingStore;
   auditLog: AuditLog;
@@ -115,6 +126,11 @@ export class AnomalyPipelineDispatcher {
   >();
   private tickTimer: NodeJS.Timeout | null = null;
   private tickInFlight = false;
+  /**
+   * Per-detector-id serialization chains for registry mutations. See
+   * withDetectorMutationLock for the invariant this map enforces.
+   */
+  private readonly detectorMutationChains = new Map<string, Promise<void>>();
 
   constructor(deps: AnomalyPipelineDispatcherDeps) {
     this.findingStore = deps.findingStore;
@@ -135,29 +151,71 @@ export class AnomalyPipelineDispatcher {
   }
 
   /**
+   * Run one registry operation for a detector id after every earlier
+   * operation for the same id has settled. Registration and every
+   * classifier mutation (attach and detach) for one detector id are
+   * serialized here because each verb is a check-then-await-then-commit
+   * sequence over the live registry, and those sequences are only
+   * correct when they cannot interleave; settled reads join the same
+   * chain so an already-live decision observes only committed state
+   * (register id: ic-sweep-auto-trigger-thresholds-consumed).
+   * Serialization is per detector id: operations for distinct detectors
+   * never wait on each other. The map entry is deleted once its chain
+   * drains, so retired detector ids do not accumulate.
+   */
+  private withDetectorMutationLock<T>(
+    detectorId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const tail =
+      this.detectorMutationChains.get(detectorId) ?? Promise.resolve();
+    // The stored tail settles to undefined on both arms, so a failed
+    // operation surfaces only to its own caller and never poisons later
+    // operations queued on the same detector id.
+    const run = tail.then(operation);
+    const settled: Promise<void> = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.detectorMutationChains.set(detectorId, settled);
+    void settled.then(() => {
+      if (this.detectorMutationChains.get(detectorId) === settled) {
+        this.detectorMutationChains.delete(detectorId);
+      }
+    });
+    return run;
+  }
+
+  /**
    * Register + subscribe a detector to this fortress. Idempotent: a
    * second call with the same detectorId returns the already-
    * registered instance without re-subscribing.
    */
   async registerDetector(detector: AnomalyDetector): Promise<AnomalyDetector> {
-    const existing = this.detectors.get(detector.detectorId);
-    if (existing) return existing;
-    const context: AnomalyContext = {
-      fortressId: this.fortressId,
-      auditLog: this.auditLog,
-      storage: this.storage,
-      masterKey: this.masterKey,
-      now: this.now,
-    };
-    await detector.subscribe(context);
-    this.detectors.set(detector.detectorId, detector);
-    void this.auditLog.append(
-      "l2",
-      ANOMALY_AUDIT_OPS.DETECTOR_REGISTERED,
-      this.identityId,
-      { detector_id: detector.detectorId, fortress_id: this.fortressId },
-    );
-    return detector;
+    // Serialized per detector id: the fresh-registration check and the
+    // commit below bracket an await, and the idempotency contract (a
+    // second same-id call returns the already-registered instance) holds
+    // only when same-id sequences run one at a time.
+    return this.withDetectorMutationLock(detector.detectorId, async () => {
+      const existing = this.detectors.get(detector.detectorId);
+      if (existing) return existing;
+      const context: AnomalyContext = {
+        fortressId: this.fortressId,
+        auditLog: this.auditLog,
+        storage: this.storage,
+        masterKey: this.masterKey,
+        now: this.now,
+      };
+      await detector.subscribe(context);
+      this.detectors.set(detector.detectorId, detector);
+      void this.auditLog.append(
+        "l2",
+        ANOMALY_AUDIT_OPS.DETECTOR_REGISTERED,
+        this.identityId,
+        { detector_id: detector.detectorId, fortress_id: this.fortressId },
+      );
+      return detector;
+    });
   }
 
   /**
@@ -165,6 +223,22 @@ export class AnomalyPipelineDispatcher {
    * an active registration was removed.
    */
   async unregisterDetector(detectorId: string): Promise<boolean> {
+    // Serialized per detector id: teardown must observe the registration
+    // a completed register committed, never a half-registered one.
+    return this.withDetectorMutationLock(detectorId, () =>
+      this.unregisterDetectorHoldingLock(detectorId),
+    );
+  }
+
+  /**
+   * Teardown body. Callers MUST already hold this detector id's
+   * mutation lock (the public wrapper above, or a compound operation
+   * that decides and mutates in one hold); acquiring it here again
+   * would queue behind the caller's own hold.
+   */
+  private async unregisterDetectorHoldingLock(
+    detectorId: string,
+  ): Promise<boolean> {
     const detector = this.detectors.get(detectorId);
     if (!detector) return false;
     try {
@@ -187,6 +261,21 @@ export class AnomalyPipelineDispatcher {
 
   listDetectorClassifiers(detectorId: string): string[] {
     return this.detectors.get(detectorId)?.listClassifierIds() ?? [];
+  }
+
+  /**
+   * Live classifier ids for a detector id, read after every in-flight
+   * operation for that id has settled. A snapshot taken mid-mutation
+   * can name classifier ids no live registration backs (a teardown
+   * still holds its registry entry while its unsubscribe is in flight),
+   * so a caller deciding "already subscribed" reads through this
+   * chokepoint rather than the instantaneous list (register id:
+   * ic-sweep-auto-trigger-thresholds-consumed).
+   */
+  async getSettledDetectorClassifiers(detectorId: string): Promise<string[]> {
+    return this.withDetectorMutationLock(detectorId, async () =>
+      this.listDetectorClassifiers(detectorId),
+    );
   }
 
   /** Run one evaluation pass over every registered detector. */
@@ -369,29 +458,35 @@ export class AnomalyPipelineDispatcher {
       context: AnomalyContext,
     ) => AnomalyClassifier | Promise<AnomalyClassifier>,
   ): Promise<boolean> {
-    const detector = this.detectors.get(detectorId);
-    if (!detector) return false;
-    const context: AnomalyContext = {
-      fortressId: this.fortressId,
-      auditLog: this.auditLog,
-      storage: this.storage,
-      masterKey: this.masterKey,
-      now: this.now,
-    };
-    const classifier = await factory(context);
-    const added = detector.addClassifier(classifier);
-    if (!added) return false;
-    void this.auditLog.append(
-      "l2",
-      ANOMALY_AUDIT_OPS.CLASSIFIER_SUBSCRIBED,
-      this.identityId,
-      {
-        detector_id: detectorId,
-        classifier_id: classifier.classifierId,
-        fortress_id: this.fortressId,
-      },
-    );
-    return true;
+    // Serialized per detector id: the detector instance captured before
+    // the awaited factory call must still be the live registration when
+    // the classifier attaches, which holds only when same-id mutations
+    // run one at a time.
+    return this.withDetectorMutationLock(detectorId, async () => {
+      const detector = this.detectors.get(detectorId);
+      if (!detector) return false;
+      const context: AnomalyContext = {
+        fortressId: this.fortressId,
+        auditLog: this.auditLog,
+        storage: this.storage,
+        masterKey: this.masterKey,
+        now: this.now,
+      };
+      const classifier = await factory(context);
+      const added = detector.addClassifier(classifier);
+      if (!added) return false;
+      void this.auditLog.append(
+        "l2",
+        ANOMALY_AUDIT_OPS.CLASSIFIER_SUBSCRIBED,
+        this.identityId,
+        {
+          detector_id: detectorId,
+          classifier_id: classifier.classifierId,
+          fortress_id: this.fortressId,
+        },
+      );
+      return true;
+    });
   }
 
   /**
@@ -400,6 +495,24 @@ export class AnomalyPipelineDispatcher {
    * primary classifier cannot be detached (returns false).
    */
   async removeClassifierFromDetector(
+    detectorId: string,
+    classifierId: string,
+  ): Promise<boolean> {
+    // Serialized per detector id: the detach must observe the classifier
+    // set as committed by completed mutations, never a set another
+    // in-flight operation is still building.
+    return this.withDetectorMutationLock(detectorId, () =>
+      this.removeClassifierHoldingLock(detectorId, classifierId),
+    );
+  }
+
+  /**
+   * Detach body. Callers MUST already hold this detector id's mutation
+   * lock (the public wrapper above, or a compound operation that
+   * decides and mutates in one hold); acquiring it here again would
+   * queue behind the caller's own hold.
+   */
+  private async removeClassifierHoldingLock(
     detectorId: string,
     classifierId: string,
   ): Promise<boolean> {
@@ -418,6 +531,45 @@ export class AnomalyPipelineDispatcher {
       },
     );
     return true;
+  }
+
+  /**
+   * Unsubscribe policy decided and applied in ONE lock hold: an
+   * unsubscribed classifier id is a no-op; the primary classifier with
+   * dependents attached is refused; the primary alone tears down the
+   * whole detector; a non-primary classifier detaches alone. The
+   * decision reads the live classifier set and the mutation it selects
+   * runs before the hold is released, because the policy is only
+   * correct against the state it mutates — a decision taken in one
+   * hold and applied in another can act on a set that an operation
+   * queued between them has changed (register id:
+   * ic-sweep-auto-trigger-thresholds-consumed).
+   */
+  async removeClassifierOrUnregisterDetector(
+    detectorId: string,
+    classifierId: string,
+  ): Promise<RemoveClassifierOrUnregisterOutcome> {
+    return this.withDetectorMutationLock(detectorId, async () => {
+      const classifierIds = this.listDetectorClassifiers(detectorId);
+      if (!classifierIds.includes(classifierId)) {
+        return { outcome: "not_subscribed" as const };
+      }
+      // The primary classifier occupies the first position; must match
+      // the primary-first ordering of listClassifierIds in types.ts.
+      const primaryClassifierId = classifierIds[0];
+      if (classifierId === primaryClassifierId) {
+        if (classifierIds.length > 1) {
+          return { outcome: "primary_has_dependents" as const };
+        }
+        const removed = await this.unregisterDetectorHoldingLock(detectorId);
+        return { outcome: "detector_unregistered" as const, removed };
+      }
+      const removed = await this.removeClassifierHoldingLock(
+        detectorId,
+        classifierId,
+      );
+      return { outcome: "classifier_removed" as const, removed };
+    });
   }
 
   private emit(event: AnomalyDispatcherAnyEmit): void {

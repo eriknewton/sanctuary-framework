@@ -320,7 +320,24 @@ export async function handleAutoTriggerRoute(
           });
           return true;
         }
-        const overrides = sanitizeOverrides(body.threshold_overrides);
+        // `threshold_overrides` is validated atomically before any of it
+        // is applied: `updateConfig` (threshold-config-store.ts) treats a
+        // present `threshold_overrides` as a full replacement of the
+        // persisted row, never a merge, so only a body that validates in
+        // full may reach it. A validation failure refuses the request and
+        // persists nothing (register id:
+        // ic-sweep-auto-trigger-thresholds-consumed).
+        const overridesResult = validateOverrides(body.threshold_overrides);
+        if (overridesResult.status === "invalid") {
+          writeJSON(res, 400, {
+            ok: false,
+            error: "invalid_threshold_overrides",
+            detail: overridesResult.detail,
+          });
+          return true;
+        }
+        const overrides =
+          overridesResult.status === "ok" ? overridesResult.overrides : null;
         // Mirrors the CLI's `set-threshold` guard (cli/auto-trigger.ts):
         // the CUSUM per-agent-activity rule has no configurable warning
         // boundary -- see the mapping-derivation comment on its
@@ -482,41 +499,112 @@ export async function handleAutoTriggerRoute(
   }
 }
 
-function sanitizeOverrides(raw: unknown): ThresholdOverrides | null {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+// The only fields `ThresholdOverrides` (types.ts) declares -- must match
+// that interface's field list, since an unrecognized key here is exactly
+// the "malformed field" `validateOverrides` refuses on rather than drops.
+const THRESHOLD_OVERRIDE_KEYS = [
+  "warn_sigma",
+  "alert_sigma",
+  "promotion_fire_count",
+  "promotion_window_days",
+  "demotion_cancel_count",
+] as const;
+
+/**
+ * Validate a PATCH body's `threshold_overrides` atomically: every key
+ * present in `raw` must be a recognized `ThresholdOverrides` field with
+ * a valid value before ANY of it is accepted; the first invalid or
+ * unrecognized key refuses the whole request. No key is ever dropped,
+ * so an `"ok"` result always mirrors exactly the keys the caller sent
+ * -- the call site persists it as a full replacement of the row
+ * (register id: ic-sweep-auto-trigger-thresholds-consumed).
+ *
+ * `"absent"` means the field was omitted -- the caller leaves the
+ * persisted overrides untouched. `"ok"` with an explicit `{}` is the
+ * one shape that means "clear every override"; it is returned only
+ * when `raw` itself was `{}`.
+ */
+function validateOverrides(
+  raw: unknown,
+):
+  | { status: "absent" }
+  | { status: "invalid"; detail: string }
+  | { status: "ok"; overrides: ThresholdOverrides } {
+  if (raw === undefined) return { status: "absent" };
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return {
+      status: "invalid",
+      detail: "threshold_overrides must be an object",
+    };
+  }
   const obj = raw as Record<string, unknown>;
+  for (const key of Object.keys(obj)) {
+    if (!(THRESHOLD_OVERRIDE_KEYS as readonly string[]).includes(key)) {
+      return {
+        status: "invalid",
+        detail: `unknown threshold_overrides field: ${key}`,
+      };
+    }
+  }
   const out: ThresholdOverrides = {};
-  if (typeof obj["warn_sigma"] === "number" && Number.isFinite(obj["warn_sigma"])) {
+  if (obj["warn_sigma"] !== undefined) {
+    if (
+      typeof obj["warn_sigma"] !== "number" ||
+      !Number.isFinite(obj["warn_sigma"])
+    ) {
+      return { status: "invalid", detail: "warn_sigma must be a finite number" };
+    }
     out.warn_sigma = obj["warn_sigma"];
   }
-  if (
-    typeof obj["alert_sigma"] === "number" &&
-    Number.isFinite(obj["alert_sigma"])
-  ) {
+  if (obj["alert_sigma"] !== undefined) {
+    if (
+      typeof obj["alert_sigma"] !== "number" ||
+      !Number.isFinite(obj["alert_sigma"])
+    ) {
+      return { status: "invalid", detail: "alert_sigma must be a finite number" };
+    }
     out.alert_sigma = obj["alert_sigma"];
   }
-  if (
-    typeof obj["promotion_fire_count"] === "number" &&
-    Number.isFinite(obj["promotion_fire_count"]) &&
-    obj["promotion_fire_count"] >= 1
-  ) {
+  if (obj["promotion_fire_count"] !== undefined) {
+    if (
+      typeof obj["promotion_fire_count"] !== "number" ||
+      !Number.isFinite(obj["promotion_fire_count"]) ||
+      obj["promotion_fire_count"] < 1
+    ) {
+      return {
+        status: "invalid",
+        detail: "promotion_fire_count must be a number >= 1",
+      };
+    }
     out.promotion_fire_count = Math.floor(obj["promotion_fire_count"]);
   }
-  if (
-    typeof obj["promotion_window_days"] === "number" &&
-    Number.isFinite(obj["promotion_window_days"]) &&
-    obj["promotion_window_days"] >= 1
-  ) {
+  if (obj["promotion_window_days"] !== undefined) {
+    if (
+      typeof obj["promotion_window_days"] !== "number" ||
+      !Number.isFinite(obj["promotion_window_days"]) ||
+      obj["promotion_window_days"] < 1
+    ) {
+      return {
+        status: "invalid",
+        detail: "promotion_window_days must be a number >= 1",
+      };
+    }
     out.promotion_window_days = Math.floor(obj["promotion_window_days"]);
   }
-  if (
-    typeof obj["demotion_cancel_count"] === "number" &&
-    Number.isFinite(obj["demotion_cancel_count"]) &&
-    obj["demotion_cancel_count"] >= 1
-  ) {
+  if (obj["demotion_cancel_count"] !== undefined) {
+    if (
+      typeof obj["demotion_cancel_count"] !== "number" ||
+      !Number.isFinite(obj["demotion_cancel_count"]) ||
+      obj["demotion_cancel_count"] < 1
+    ) {
+      return {
+        status: "invalid",
+        detail: "demotion_cancel_count must be a number >= 1",
+      };
+    }
     out.demotion_cancel_count = Math.floor(obj["demotion_cancel_count"]);
   }
-  return out;
+  return { status: "ok", overrides: out };
 }
 
 function sanitizeCancelWindow(raw: unknown): number | undefined {
