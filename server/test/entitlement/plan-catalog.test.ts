@@ -20,6 +20,47 @@ import {
   isPlanName,
 } from "../../src/entitlement/plan-catalog.js";
 
+/**
+ * The catalog-shape a `PLAN_CATALOG` entry must satisfy, expressed as a plain
+ * (non-frozen, non-branded) VALUE shape rather than the real `PlanClaimTemplate`
+ * type, so the invariant checker below can run against a deliberately
+ * tampered clone as well as the real frozen catalog, and the tamper test can
+ * prove the checker REJECTS a bad value (freeze-blocking is a separate,
+ * independently tested property).
+ */
+interface PlanCatalogInvariantShape {
+  readonly tier: string;
+  readonly pricingUnit: string;
+  readonly featureFlags: readonly string[];
+  readonly defaultGraceDays: number;
+  readonly maxExtraNodes: number;
+}
+
+/**
+ * Runs the plan-catalog's structural invariants (D1: team's tier/pricingUnit/
+ * feature-set/grace-default, and the safe-integer node-count derivation)
+ * against a catalog-SHAPED value and throws (via `expect`) on the first
+ * violation. Shared by the real-catalog correctness test below and the
+ * tamper-rejection test in the immutability block: both consumers run the
+ * SAME checks, so the acceptance of the live catalog and the rejection of a
+ * tampered clone are evidence about one checker, not two forks.
+ */
+function assertPlanCatalogInvariants(
+  catalog: Readonly<Record<string, PlanCatalogInvariantShape>>,
+): void {
+  for (const name of PLAN_NAMES) {
+    expect(Object.keys(catalog)).toContain(name);
+  }
+  const team = catalog.team;
+  expect(team.tier).toBe("team");
+  expect(team.pricingUnit).toBe("node");
+  expect(team.defaultGraceDays).toBe(DEFAULT_GRACE_DAYS);
+  expect([...team.featureFlags].sort()).toEqual(
+    [...ALL_ENTITLEMENT_FEATURE_FLAGS].sort(),
+  );
+  expect(team.maxExtraNodes).toBe(TEAM_MAX_EXTRA_NODES);
+}
+
 describe("plan-catalog — catalog mapping correctness", () => {
   it("PLAN_NAMES contains exactly 'team' (Pro is deferred, D4)", () => {
     expect(PLAN_NAMES).toEqual(["team"]);
@@ -51,6 +92,10 @@ describe("plan-catalog — catalog mapping correctness", () => {
       "kill-safety",
       "console",
     ]);
+  });
+
+  it("assertPlanCatalogInvariants accepts the real, live PLAN_CATALOG with zero violations (shared with the tamper-rejection test below)", () => {
+    expect(() => assertPlanCatalogInvariants(PLAN_CATALOG)).not.toThrow();
   });
 
   it("getPlanClaimTemplate throws on a name outside the closed PlanName set (defense in depth past isPlanName)", () => {
@@ -116,12 +161,44 @@ describe("plan-catalog — immutability (catalog snapshot)", () => {
   });
 
   it("mutating the frozen team template throws (ESM strict mode) and never corrupts the live catalog", () => {
+    // Scope note: this test proves ONLY that `Object.freeze` blocks a
+    // runtime write to the live catalog object — a property distinct from
+    // whether a WRONG catalog value would be caught. That second property
+    // is proven separately below by feeding tampered clones through
+    // `assertPlanCatalogInvariants`, never by attempting a write.
     const before = getPlanClaimTemplate("team").pricingUnit;
     expect(() => {
       // @ts-expect-error — intentionally attempting a forbidden mutation.
       PLAN_CATALOG.team.pricingUnit = "seat";
     }).toThrow(TypeError);
     expect(getPlanClaimTemplate("team").pricingUnit).toBe(before);
+  });
+
+  it("assertPlanCatalogInvariants REJECTS a tampered clone (wrong max, wrong grace default, missing plan name) without ever touching the frozen live catalog", () => {
+    // The checker must actually FAIL on bad data, not merely pass on good
+    // data — a checker that always passes would make the previous test's
+    // "not corrupted" claim meaningless. Each clone below is a plain,
+    // unfrozen object built from the real template's own values via spread,
+    // so only the ONE named field under test is wrong.
+    const wrongMax: Record<string, PlanCatalogInvariantShape> = {
+      team: { ...PLAN_CATALOG.team, maxExtraNodes: TEAM_MAX_EXTRA_NODES - 1 },
+    };
+    expect(() => assertPlanCatalogInvariants(wrongMax)).toThrow();
+
+    const wrongGraceDefault: Record<string, PlanCatalogInvariantShape> = {
+      team: { ...PLAN_CATALOG.team, defaultGraceDays: DEFAULT_GRACE_DAYS + 1 },
+    };
+    expect(() => assertPlanCatalogInvariants(wrongGraceDefault)).toThrow();
+
+    const missingPlanName: Record<string, PlanCatalogInvariantShape> = {};
+    expect(() => assertPlanCatalogInvariants(missingPlanName)).toThrow();
+
+    // None of the tampered clones above ever wrote through to PLAN_CATALOG
+    // itself (each is an independent object built with `...` spread) — the
+    // live catalog's values are unchanged.
+    expect(PLAN_CATALOG.team.maxExtraNodes).toBe(TEAM_MAX_EXTRA_NODES);
+    expect(PLAN_CATALOG.team.defaultGraceDays).toBe(DEFAULT_GRACE_DAYS);
+    expect(Object.keys(PLAN_CATALOG)).toEqual([...PLAN_NAMES]);
   });
 });
 

@@ -727,10 +727,10 @@ async function runRevoke(
   }
 }
 
-// USAGE renders --grace-days's default and the known --features list FROM the
-// catalog constants (not hand-mirrored literals) so this help text cannot
-// drift from ALL_ENTITLEMENT_FEATURE_FLAGS / DEFAULT_GRACE_DAYS in
-// plan-catalog.ts the way the pre-fix text did.
+// USAGE renders --grace-days's default, the known --features list, AND the
+// known --plan names FROM the catalog constants, so this help text cannot
+// drift from ALL_ENTITLEMENT_FEATURE_FLAGS / DEFAULT_GRACE_DAYS / PLAN_NAMES
+// in plan-catalog.ts (a hand-mirrored literal here would).
 const USAGE = `sanctuary license  -  fleet license issuance (Erik-operated)
 
 Usage:
@@ -738,7 +738,7 @@ Usage:
       --nodes <N|unlimited> --period <monthly|annual> --expires <ISO8601-or-unix> \\
       [--grace-days ${DEFAULT_GRACE_DAYS}] [--features ${ALL_ENTITLEMENT_FEATURE_FLAGS.join(",")}] \\
       [--pricing-unit node|seat|fleet]
-  sanctuary license issue --plan team --extra-nodes <N> --subject <id> \\
+  sanctuary license issue --plan <${PLAN_NAMES.join("|")}> --extra-nodes <N> --subject <id> \\
       --period <monthly|annual> --expires <ISO8601-or-unix> [--grace-days ${DEFAULT_GRACE_DAYS}]
       (fills --tier/--nodes/--features/--pricing-unit/--grace-days from the
        plan; refuses loudly if combined with any of those raw flags)

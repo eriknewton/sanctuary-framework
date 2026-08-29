@@ -493,7 +493,7 @@ describe("sanctuary license — help + arg validation (no fortress needed)", () 
   });
 
   it("USAGE and the unknown-feature error render the known-features list and grace default FROM the catalog constants, not a hand-mirrored literal (round-2 finding, register id EFC-04)", async () => {
-    const { ALL_ENTITLEMENT_FEATURE_FLAGS, DEFAULT_GRACE_DAYS } = await import(
+    const { ALL_ENTITLEMENT_FEATURE_FLAGS, DEFAULT_GRACE_DAYS, PLAN_NAMES } = await import(
       "../../src/entitlement/plan-catalog.js"
     );
     // Independent oracle (finding EFC-04's own instruction): assert against
@@ -504,11 +504,30 @@ describe("sanctuary license — help + arg validation (no fortress needed)", () 
       "roster", "policy-dist", "kill-safety", "console",
     ]);
     expect(DEFAULT_GRACE_DAYS).toBe(14);
+    expect([...PLAN_NAMES]).toEqual(["team"]);
 
     const usageOut = new StringWritable();
     await runLicenseCommand({ argv: ["--help"], out: usageOut, err: new StringWritable(), env: {} });
     expect(usageOut.text).toContain("roster,policy-dist,kill-safety,console");
     expect(usageOut.text).toContain("--grace-days 14");
+    // Plan-name drift guard: USAGE's --plan example must contain EVERY name
+    // PLAN_NAMES knows (a newly catalogued plan automatically shows up in
+    // help text with no separate edit), and the example's --plan segment
+    // must contain NO plan-shaped token absent from PLAN_NAMES (a catalog
+    // rename or removal is caught here before it can mislead an operator).
+    // Scoped to the `--plan <...>` segment specifically, not the whole
+    // USAGE string, because `--tier <team|fleet|enterprise>` uses the
+    // unrelated EntitlementTier vocabulary and legitimately contains
+    // "team" as a TIER name even if "team" were ever removed from PLAN_NAMES.
+    const planSegment = usageOut.text.match(/--plan <([^>]+)>/);
+    expect(planSegment).not.toBeNull();
+    const renderedPlanNames = planSegment![1].split("|");
+    for (const name of PLAN_NAMES) {
+      expect(renderedPlanNames).toContain(name);
+    }
+    for (const rendered of renderedPlanNames) {
+      expect(PLAN_NAMES as readonly string[]).toContain(rendered);
+    }
 
     const featErr = new StringWritable();
     await runLicenseCommand({
