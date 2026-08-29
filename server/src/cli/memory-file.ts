@@ -41,7 +41,13 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../sdw/memory-provenance-signing.js";
 import { SdwMemoryProvenanceMigration } from "../sdw/memory-provenance-migration.js";
-import { consumeFlagValues, flagValue, hasFlag } from "./argv.js";
+import {
+  consumeFlagValue,
+  consumeFlagValues,
+  flagValue,
+  fortressFlagRefusalText,
+  hasFlag,
+} from "./argv.js";
 
 export interface MemoryFileCommandArgs {
   readonly argv: string[];
@@ -523,11 +529,19 @@ function parseCommonArgs(
     // the operator learns to stop, not to pretend the leak was prevented.
     write(err, PASSPHRASE_ARGV_WARNING);
   }
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; wrong-fortress
+  // memory ingest/emit operations are a constraint-5 violation.
+  const consumedFortress = consumeFlagValue([...argv], "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return null;
+  }
   return {
     harness,
     dir,
     ownerRef: flagValue([...argv], "--owner-ref") ?? DEFAULT_OWNER_REF,
-    fortress: flagValue([...argv], "--fortress"),
+    fortress: consumedFortress.value,
     passphrase,
     passphraseFromStdin: hasFlag([...argv], "--passphrase-stdin"),
   };
@@ -577,10 +591,18 @@ function parseVaultArgs(
   }
   const passphrase = flagValue([...argv], "--passphrase");
   if (passphrase !== undefined) write(err, PASSPHRASE_ARGV_WARNING);
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; wrong-fortress
+  // vault operations are a constraint-5 violation.
+  const consumedFortress = consumeFlagValue([...argv], "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return null;
+  }
   return {
     dir,
     ownerRef: flagValue([...argv], "--owner-ref") ?? DEFAULT_OWNER_REF,
-    fortress: flagValue([...argv], "--fortress"),
+    fortress: consumedFortress.value,
     passphrase,
     passphraseFromStdin: hasFlag([...argv], "--passphrase-stdin"),
   };

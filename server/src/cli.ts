@@ -552,7 +552,25 @@ Examples:
         process.exit(0);
       }
       const { parseExportArgs, runExport } = await import("./cli/audit-chain-export.js");
+      const { fortressFlagRefusalText, FORTRESS_FLAG_USAGE_EXIT_CODE } = await import(
+        "./cli/argv.js"
+      );
       const opts = parseExportArgs(subArgs, process.env);
+      // IC-30 fix-round finding #4: check the --fortress/--fortress-path
+      // parse result HERE, before calling runExport, so this verb renders
+      // the SAME canonical usage-error shape + exit code as every other
+      // migrated verb. Without this check, the malformed-flag case fell
+      // through to runExport's throw and then to this file's top-level
+      // `main().catch(...)`, which prints an unrelated "Sanctuary MCP
+      // Server failed to start" message and always exits 1. runExport
+      // still throws on `args.error` too (defense in depth for any caller
+      // that skips this check), so that fallback text is never actually
+      // reached through the real CLI dispatch.
+      if (opts.error !== undefined) {
+        // SAFETY: stderr is the operator-facing CLI channel; no logger module in scope.
+        console.error(fortressFlagRefusalText(opts.error));
+        process.exit(FORTRESS_FLAG_USAGE_EXIT_CODE);
+      }
       await runExport(opts);
       process.exit(0);
     } else if (verb === "verify") {

@@ -23,7 +23,12 @@ import { createIdentity } from "../core/identity.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { loadConfig } from "../config.js";
-import { flagValue } from "./argv.js";
+import {
+  consumeFlagValue,
+  flagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 export interface IdentityCommandArgs {
   argv: string[];
@@ -181,9 +186,16 @@ async function cmdShow(
 
   // Resolve fortress path: --fortress flag > env > default.
   // loadConfig() reads process.env.SANCTUARY_STORAGE_PATH directly.
-  const fortressFlag = flagValue(argv, "--fortress");
-  if (fortressFlag) {
-    process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; wrong-fortress
+  // identity operations are a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
+  }
+  if (consumedFortress.value !== undefined) {
+    process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;
   }
 
   const passphrase = flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
@@ -279,9 +291,16 @@ async function cmdCreate(
 
   // Resolve fortress path: --fortress flag > env > default.
   // loadConfig() reads process.env.SANCTUARY_STORAGE_PATH directly.
-  const fortressFlag = flagValue(argv, "--fortress");
-  if (fortressFlag) {
-    process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; wrong-fortress
+  // identity operations are a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
+  }
+  if (consumedFortress.value !== undefined) {
+    process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;
   }
 
   const passphrase = flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;

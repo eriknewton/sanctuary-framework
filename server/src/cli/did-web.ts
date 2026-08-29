@@ -51,7 +51,12 @@ import {
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 import { readStoredPassphrase } from "../wrap/passphrase.js";
 import { resolveStoragePath } from "../paths.js";
-import { flagValue } from "./argv.js";
+import {
+  consumeFlagValue,
+  flagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 export interface DidWebCommandArgs {
   argv: string[];
@@ -199,14 +204,29 @@ interface IdentitySnapshot {
   identityManager: IdentityManager;
 }
 
+/**
+ * A number return means "the caller should exit with this code without
+ * running anything else"; `IdentitySnapshot` is always an object, so
+ * `typeof result === "number"` is a safe discriminant at call sites. This
+ * lets a --fortress parse refusal exit with the canonical
+ * `FORTRESS_FLAG_USAGE_EXIT_CODE` (2) while every other failure here keeps
+ * its existing exit 1.
+ */
 async function loadFortressIdentity(
   argv: string[],
   env: NodeJS.ProcessEnv,
   err: Writable,
-): Promise<IdentitySnapshot | null> {
-  const fortressFlag = flagValue(argv, "--fortress");
-  if (fortressFlag) {
-    process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
+): Promise<IdentitySnapshot | number> {
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; wrong-fortress
+  // did-web operations are a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
+  }
+  if (consumedFortress.value !== undefined) {
+    process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;
   }
   // Resolve to a CONCRETE path here rather than passing
   // `fortressFlag ?? undefined` down. The old form was right only by
@@ -240,7 +260,7 @@ async function loadFortressIdentity(
         "Error: sanctuary did-web requires SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY.\n" +
         "       Keychain auto-discovery also failed. Ensure the fortress passphrase is stored in your OS keychain.\n",
       );
-      return null;
+      return 1;
     }
   }
   const config = await loadConfig();
@@ -249,7 +269,7 @@ async function loadFortressIdentity(
   const storage = new FilesystemStorage(stateStoragePath);
 
   if (!passphrase && !recoveryKey) {
-    return null;
+    return 1;
   }
   // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
   let masterKey: Uint8Array;
@@ -261,7 +281,7 @@ async function loadFortressIdentity(
     });
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
-    return null;
+    return 1;
   }
 
   const identityManager = new IdentityManager(storage, masterKey);
@@ -273,12 +293,12 @@ async function loadFortressIdentity(
         ? "Error: identity files found but none could be decrypted. Wrong passphrase?\n"
         : "Error: no identities on this fortress yet. Run sanctuary wrap first.\n",
     );
-    return null;
+    return 1;
   }
   const primary = identityManager.getDefault();
   if (!primary) {
     write(err, "Error: no primary identity on this fortress yet. Run sanctuary wrap first.\n");
-    return null;
+    return 1;
   }
   return {
     publicKey: fromBase64url(primary.public_key),
@@ -305,7 +325,7 @@ async function cmdIssue(
     return 1;
   }
   const snapshot = await loadFortressIdentity(argv, env, err);
-  if (!snapshot) return 1;
+  if (typeof snapshot === "number") return snapshot;
 
   let identifier: DidWebIdentifier;
   try {
@@ -387,9 +407,16 @@ async function cmdShow(
   _env: NodeJS.ProcessEnv,
 ): Promise<number> {
   const json = hasFlag(argv, "--json");
-  const fortressFlag = flagValue(argv, "--fortress");
-  if (fortressFlag) {
-    process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; wrong-fortress
+  // did-web operations are a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
+  }
+  if (consumedFortress.value !== undefined) {
+    process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;
   }
   const config = await loadConfig();
   const lockdown_status = await readLockdownStatus(config.storage_path);
@@ -475,7 +502,7 @@ async function cmdRotateKey(
   }
 
   const snapshot = await loadFortressIdentity(argv, env, err);
-  if (!snapshot) return 1;
+  if (typeof snapshot === "number") return snapshot;
   const record = await loadFortressDidWebRecord(snapshot.storagePath);
   if (!record) {
     write(
@@ -549,9 +576,16 @@ async function cmdKeyHistory(
   _env: NodeJS.ProcessEnv,
 ): Promise<number> {
   const json = hasFlag(argv, "--json");
-  const fortressFlag = flagValue(argv, "--fortress");
-  if (fortressFlag) {
-    process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; wrong-fortress
+  // did-web operations are a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
+  }
+  if (consumedFortress.value !== undefined) {
+    process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;
   }
   const config = await loadConfig();
   const record = await loadFortressDidWebRecord(config.storage_path);
@@ -611,7 +645,7 @@ async function cmdRegisterHosted(
   }
 
   const snapshot = await loadFortressIdentity(argv, env, err);
-  if (!snapshot) return 1;
+  if (typeof snapshot === "number") return snapshot;
 
   let identifier: DidWebIdentifier;
   try {

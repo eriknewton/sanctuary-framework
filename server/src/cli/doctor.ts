@@ -35,7 +35,12 @@ import {
   verifyAuditChainRecords,
   type ExportRecord,
 } from "./audit-chain-verify.js";
-import { flagValue, shellQuoteSingleArg } from "./argv.js";
+import {
+  consumeFlagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+  shellQuoteSingleArg,
+} from "./argv.js";
 
 // Canonical version source. A bare `require("../../package.json")` resolves to
 // the repo-root package.json (no `version`) when bundled to server/dist/; the
@@ -80,8 +85,16 @@ export async function runDoctorCommand(
 
   const json = argv.includes("--json");
   const env = args.env ?? process.env;
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; running doctor
+  // checks against the wrong fortress is a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
+  }
   const storagePath =
-    flagValue(argv, "--fortress") ??
+    consumedFortress.value ??
     args.storagePath ??
     env.SANCTUARY_FORTRESS_PATH ??
     resolveStoragePath(env);

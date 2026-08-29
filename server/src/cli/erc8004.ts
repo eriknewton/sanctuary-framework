@@ -35,7 +35,12 @@ import type { Erc8004Registration } from "../key-17/erc8004-identity-signer.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 import { readStoredPassphrase } from "../wrap/passphrase.js";
 import { resolveStoragePath } from "../paths.js";
-import { flagValue } from "./argv.js";
+import {
+  consumeFlagValue,
+  flagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 export interface Erc8004CommandArgs {
   argv: string[];
@@ -122,14 +127,29 @@ interface FortressSnapshot {
   masterKey: Uint8Array;
 }
 
+/**
+ * A number return means "the caller should exit with this code without
+ * running anything else"; `FortressSnapshot` is always an object, so
+ * `typeof result === "number"` is a safe discriminant at call sites. This
+ * lets a --fortress parse refusal exit with the canonical
+ * `FORTRESS_FLAG_USAGE_EXIT_CODE` (2) while every other failure here keeps
+ * its existing exit 1.
+ */
 async function loadFortressIdentity(
   argv: string[],
   env: NodeJS.ProcessEnv,
   err: Writable,
-): Promise<FortressSnapshot | null> {
-  const fortressFlag = flagValue(argv, "--fortress");
-  if (fortressFlag) {
-    process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
+): Promise<FortressSnapshot | number> {
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; wrong-fortress
+  // ERC-8004 operations are a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
+  }
+  if (consumedFortress.value !== undefined) {
+    process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;
   }
   // Resolve to a CONCRETE path here rather than passing
   // `fortressFlag ?? undefined` down. The old form was right only by
@@ -161,7 +181,7 @@ async function loadFortressIdentity(
         "Error: sanctuary erc8004 requires SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY.\n" +
           "       Keychain auto-discovery also failed.\n",
       );
-      return null;
+      return 1;
     }
   }
   const config = await loadConfig();
@@ -170,7 +190,7 @@ async function loadFortressIdentity(
   const storage = new FilesystemStorage(stateStoragePath);
 
   if (!passphrase && !recoveryKey) {
-    return null;
+    return 1;
   }
   // Unified custody (master-custody.ts): never derive a fortress master verb-locally.
   let masterKey: Uint8Array;
@@ -182,7 +202,7 @@ async function loadFortressIdentity(
     });
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
-    return null;
+    return 1;
   }
 
   const identityManager = new IdentityManager(storage, masterKey);
@@ -194,7 +214,7 @@ async function loadFortressIdentity(
         ? "Error: identity files found but none could be decrypted. Wrong passphrase?\n"
         : "Error: no identities on this fortress yet. Run sanctuary wrap first.\n",
     );
-    return null;
+    return 1;
   }
   const primary = identityManager.getDefault();
   if (!primary) {
@@ -202,7 +222,7 @@ async function loadFortressIdentity(
       err,
       "Error: no primary identity on this fortress yet. Run sanctuary wrap first.\n",
     );
-    return null;
+    return 1;
   }
   return {
     identityId: primary.identity_id,
@@ -261,7 +281,7 @@ async function cmdRegister(
   }
 
   const snapshot = await loadFortressIdentity(argv, env, err);
-  if (!snapshot) return 1;
+  if (typeof snapshot === "number") return snapshot;
 
   const lockdownStatus = await readLockdownStatus(snapshot.storagePath);
 

@@ -60,7 +60,12 @@ import { revocationVerifiability } from "../entitlement/revocation-antirollback.
 import { openIssuer } from "./custody-unlock.js";
 import { dashboardRequest, DashboardRequestError } from "./dashboard-request.js";
 import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
-import { flagValue } from "./argv.js";
+import {
+  consumeFlagValue,
+  flagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
@@ -222,11 +227,15 @@ interface ExportFlags {
   recoveryKey?: string;
 }
 
-function parseExportFlags(argv: string[], env: NodeJS.ProcessEnv): ExportFlags {
+function parseExportFlags(
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+  fortressPath: string | undefined,
+): ExportFlags {
   return {
     json: hasFlag(argv, "--json"),
     out: flagValue(argv, "--out"),
-    fortressPath: flagValue(argv, "--fortress"),
+    fortressPath,
     passphrase: flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE,
     recoveryKey: env.SANCTUARY_RECOVERY_KEY,
   };
@@ -239,7 +248,15 @@ async function runExport(
   env: NodeJS.ProcessEnv,
   fetchPosture: PostureFetcher,
 ): Promise<number> {
-  const flags = parseExportFlags(argv, env);
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; exporting fleet
+  // attestation for the wrong fortress is a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
+  }
+  const flags = parseExportFlags(consumedFortress.argv, env, consumedFortress.value);
 
   let issuer: Awaited<ReturnType<typeof openIssuer>>;
   try {

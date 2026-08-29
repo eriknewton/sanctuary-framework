@@ -72,7 +72,12 @@ import type {
 } from "../principal-policy/types.js";
 import { verifyDirectoryCustodyWithinBase } from "../storage/custody-fs.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { flagValue } from "./argv.js";
+import {
+  consumeFlagValue,
+  flagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 /**
  * Maximum RENDERED length of one untrusted metadata value on the receipt, in
@@ -457,9 +462,16 @@ export async function runStateDiscloseUnattributedCommand(
     return 2;
   }
 
-  const fortressFlag = flagValue(argv, "--fortress");
-  if (fortressFlag) {
-    process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; wrong-fortress
+  // disclosure runs are a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
+  }
+  if (consumedFortress.value !== undefined) {
+    process.env.SANCTUARY_STORAGE_PATH = consumedFortress.value;
   }
   const passphrase = flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
   const recoveryKey = env.SANCTUARY_RECOVERY_KEY;

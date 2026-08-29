@@ -80,6 +80,35 @@ describe("shared CLI argv flag parser", () => {
     });
   });
 
+  it("IC-30 fix round: rejects ANY dash-leading split-form value, not only a `--`-prefixed one", () => {
+    // Pre-fix, only a `--`-prefixed next token was rejected, so a
+    // single-dash short flag like `-h` was silently consumed as the value:
+    // `sanctuary identity show --fortress -h` ran against a fortress
+    // literally named "-h" instead of printing help.
+    const DASH_HINTED =
+      '--fortress requires a value (for a value beginning with "-", use the --fortress=<value> form)';
+    expect(consumeFlagValue(["--fortress", "-h"], "--fortress")).toEqual({
+      argv: ["--fortress", "-h"],
+      error: DASH_HINTED,
+    });
+    expect(consumeFlagValue(["--fortress", "-x"], "--fortress")).toEqual({
+      argv: ["--fortress", "-x"],
+      error: DASH_HINTED,
+    });
+    // A `--`-prefixed next token (the original, narrower check) still
+    // refuses too.
+    expect(consumeFlagValue(["--fortress", "--json"], "--fortress")).toEqual({
+      argv: ["--fortress", "--json"],
+      error: DASH_HINTED,
+    });
+    // The documented escape hatch: a dash-leading value stays expressible
+    // through the unambiguous `--fortress=<path>` equals form.
+    expect(consumeFlagValue(["--fortress=-weird-but-explicit"], "--fortress")).toEqual({
+      argv: [],
+      value: "-weird-but-explicit",
+    });
+  });
+
   it("consumeFlagValues collects every occurrence, split and equals forms, in argv order", () => {
     expect(
       consumeFlagValues(

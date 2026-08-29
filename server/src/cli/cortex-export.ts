@@ -63,7 +63,12 @@ import {
   type VerifiedChainSource,
 } from "../castle-wall/export/index.js";
 import { loadFortressProducerKey } from "../castle-wall/runtime/producer-signature.js";
-import { flagValue } from "./argv.js";
+import {
+  consumeFlagValue,
+  flagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 export interface CortexExportCommandArgs {
   argv: string[];
@@ -339,8 +344,16 @@ async function cmdRun(
 ): Promise<number> {
   const json = hasFlag(argv, "--json");
 
-  const fortressFlag = flagValue(argv, "--fortress");
-  if (fortressFlag) {
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; wrong-fortress
+  // cortex-export runs are a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
+  }
+  const fortressFlag = consumedFortress.value;
+  if (fortressFlag !== undefined) {
     process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
   }
 

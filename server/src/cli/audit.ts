@@ -15,6 +15,11 @@ import {
 } from "../operational/audit-log.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { resolveStoragePath } from "../paths.js";
+import {
+  consumeFlagValue,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 export interface AuditCommandArgs {
   argv: string[];
@@ -67,6 +72,19 @@ export async function runAuditCommand(args: AuditCommandArgs): Promise<number> {
   if (rest.includes("--help") || rest.includes("-h")) {
     printSearchUsage(out);
     return 0;
+  }
+
+  // IC-30 fix-round finding #4: peek the --fortress result BEFORE entering
+  // the try block below, so this verb renders the SAME canonical usage-error
+  // shape + exit code as every other migrated verb, instead of falling
+  // through to this function's generic catch (which prefixes "sanctuary
+  // audit search: " and always exits 1). parseSearchOptions performs the
+  // identical consumeFlagValue call again internally when this check
+  // passes; that is a harmless redundant parse, not a behavior change.
+  const consumedFortressPeek = consumeFlagValue(rest, "--fortress");
+  if (consumedFortressPeek.error !== undefined) {
+    write(err, `${fortressFlagRefusalText(consumedFortressPeek.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
 
   let opts: SearchOptions | undefined;
@@ -166,15 +184,28 @@ export function parseSearchOptions(argv: string[]): SearchOptions {
   let requestId: string | undefined;
   let limit = 50;
   let json = false;
-  let fortress: string | undefined;
   let passphrase: string | undefined;
 
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i]!;
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; a search run against
+  // the wrong fortress is a constraint-5 violation, not merely a UX papercut.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    throw new Error(consumedFortress.error);
+  }
+  // Assigned once from the strict parse above and never reassigned; `const`
+  // (not `let`) so a future edit that tried to reassign it would be a lint
+  // error, not a silent second write this function's control flow does not
+  // expect. IC-30 fix-round finding #5.
+  const fortress = consumedFortress.value;
+  const filteredArgv = consumedFortress.argv;
+
+  for (let i = 0; i < filteredArgv.length; i++) {
+    const arg = filteredArgv[i]!;
     if (arg === "--json") {
       json = true;
     } else if (arg === "--type") {
-      for (const type of requireValue(argv, ++i, "--type").split(",")) {
+      for (const type of requireValue(filteredArgv, ++i, "--type").split(",")) {
         if (type.trim()) types.push(type.trim());
       }
     } else if (arg.startsWith("--type=")) {
@@ -182,31 +213,27 @@ export function parseSearchOptions(argv: string[]): SearchOptions {
         if (type.trim()) types.push(type.trim());
       }
     } else if (arg === "--since") {
-      since = parseTimeExpression(requireValue(argv, ++i, "--since"));
+      since = parseTimeExpression(requireValue(filteredArgv, ++i, "--since"));
     } else if (arg.startsWith("--since=")) {
       since = parseTimeExpression(arg.slice("--since=".length));
     } else if (arg === "--until") {
-      until = parseTimeExpression(requireValue(argv, ++i, "--until"));
+      until = parseTimeExpression(requireValue(filteredArgv, ++i, "--until"));
     } else if (arg.startsWith("--until=")) {
       until = parseTimeExpression(arg.slice("--until=".length));
     } else if (arg === "--actor") {
-      actor = requireValue(argv, ++i, "--actor");
+      actor = requireValue(filteredArgv, ++i, "--actor");
     } else if (arg.startsWith("--actor=")) {
       actor = arg.slice("--actor=".length);
     } else if (arg === "--request-id") {
-      requestId = requireValue(argv, ++i, "--request-id");
+      requestId = requireValue(filteredArgv, ++i, "--request-id");
     } else if (arg.startsWith("--request-id=")) {
       requestId = arg.slice("--request-id=".length);
     } else if (arg === "--limit") {
-      limit = parseLimit(requireValue(argv, ++i, "--limit"));
+      limit = parseLimit(requireValue(filteredArgv, ++i, "--limit"));
     } else if (arg.startsWith("--limit=")) {
       limit = parseLimit(arg.slice("--limit=".length));
-    } else if (arg === "--fortress") {
-      fortress = requireValue(argv, ++i, "--fortress");
-    } else if (arg.startsWith("--fortress=")) {
-      fortress = arg.slice("--fortress=".length);
     } else if (arg === "--passphrase") {
-      passphrase = requireValue(argv, ++i, "--passphrase");
+      passphrase = requireValue(filteredArgv, ++i, "--passphrase");
     } else if (arg.startsWith("--passphrase=")) {
       passphrase = arg.slice("--passphrase=".length);
     } else {

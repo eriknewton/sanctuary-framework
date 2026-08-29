@@ -109,7 +109,13 @@ import {
   type VerifiedEmpty,
 } from "../claim-witness.js";
 import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
-import { flagValue, flagValues } from "./argv.js";
+import {
+  consumeFlagValue,
+  flagValue,
+  flagValues,
+  FORTRESS_FLAG_USAGE_EXIT_CODE,
+  fortressFlagRefusalText,
+} from "./argv.js";
 
 /** Same on-disk filenames `runProvisionPin` (cli/castle-wall.ts) establishes under the fortress root. Re-declared here (that module keeps them private) rather than reused, since they are plain filename literals, not secret material. */
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
@@ -296,13 +302,29 @@ interface Bootstrapped {
   primary: { identity_id: string; encrypted_private_key: EncryptedPayload };
 }
 
-/** Shared bootstrap for every observe subcommand. Mirrors `cli/file-grant.ts`'s bootstrap byte-for-byte in shape. Returns null (having already written an operator-facing error) when bootstrap cannot proceed. */
+/**
+ * Shared bootstrap for every observe subcommand. Mirrors `cli/file-grant.ts`'s
+ * bootstrap byte-for-byte in shape. A number return means "the caller should
+ * exit with this code without running anything else"; `Bootstrapped` is
+ * always an object, so `typeof result === "number"` is a safe discriminant at
+ * call sites. This lets a --fortress parse refusal exit with the canonical
+ * `FORTRESS_FLAG_USAGE_EXIT_CODE` (2) while every other bootstrap failure
+ * here keeps its existing exit 1.
+ */
 async function bootstrap(
   argv: string[],
   err: Writable,
   env: NodeJS.ProcessEnv,
-): Promise<Bootstrapped | null> {
-  const fortressPath = resolveFortressArg(flagValue(argv, "--fortress"), env);
+): Promise<Bootstrapped | number> {
+  // Must match consumeFlagValue in ./argv.ts: a dropped --fortress value must
+  // refuse, never silently resolve the default fortress; observing the wrong
+  // fortress's Castle Wall state is a constraint-5 violation.
+  const consumedFortress = consumeFlagValue(argv, "--fortress");
+  if (consumedFortress.error !== undefined) {
+    write(err, `${fortressFlagRefusalText(consumedFortress.error)}\n`);
+    return FORTRESS_FLAG_USAGE_EXIT_CODE;
+  }
+  const fortressPath = resolveFortressArg(consumedFortress.value, env);
 
   const passphrase = flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
   const recoveryKey = env.SANCTUARY_RECOVERY_KEY;
@@ -311,7 +333,7 @@ async function bootstrap(
       err,
       "Error: sanctuary castle-wall observe requires SANCTUARY_PASSPHRASE, --passphrase, or SANCTUARY_RECOVERY_KEY.\n",
     );
-    return null;
+    return 1;
   }
 
   await mkdir(fortressPath, { recursive: true, mode: 0o700 });
@@ -333,12 +355,12 @@ async function bootstrap(
         ? "Error: identity files found but none could be decrypted. Wrong passphrase?\n"
         : "No identities found in this fortress. Run `sanctuary identity create` first.\n",
     );
-    return null;
+    return 1;
   }
   const primary = identityManager.getDefault();
   if (!primary) {
     write(err, "No primary identity set.\n");
-    return null;
+    return 1;
   }
 
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
@@ -521,7 +543,7 @@ export async function runObserveStart(
   const env = ctx.env ?? process.env;
 
   const boot = await bootstrap(argv, err, env);
-  if (!boot) return 1;
+  if (typeof boot === "number") return boot;
 
   const now = new Date();
   const prior = await boot.observeStore.getState();
@@ -559,7 +581,7 @@ export async function runObserveStatus(
   const json = hasFlag(argv, "--json");
 
   const boot = await bootstrap(argv, err, env);
-  if (!boot) return 1;
+  if (typeof boot === "number") return boot;
 
   const stateRead = await observeSourceState(boot.observeStore);
   if (stateRead.source.status !== "read-and-verified") {
@@ -637,7 +659,7 @@ export async function runObserveCandidates(
   const noRefresh = hasFlag(argv, "--no-refresh");
 
   const boot = await bootstrap(argv, err, env);
-  if (!boot) return 1;
+  if (typeof boot === "number") return boot;
 
   let sourceReads: ObserveAuditSourceReadOutcome[] = [];
   let quarantinedSources: ObserveQuarantinedSourceState[] = [];
@@ -1676,7 +1698,7 @@ export async function runObservePromote(
   }
 
   const boot = await bootstrap(argv, err, env);
-  if (!boot) return 1;
+  if (typeof boot === "number") return boot;
 
   // Resolve the scope routing FIRST (before even looking at the selection): a
   // malformed exclusive-routing marker refuses the promote outright. The
@@ -2012,7 +2034,7 @@ export async function runObserveDiscard(
   }
 
   const boot = await bootstrap(argv, err, env);
-  if (!boot) return 1;
+  if (typeof boot === "number") return boot;
 
   const candidatesByKey = await boot.observeStore.listCandidates();
   const keysToRemove = all
