@@ -1495,6 +1495,206 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(calls.map((call) => call[2])).toEqual(["status"]);
   });
 
+  // Build-identity resolution for the recovery path
+  // (defect.disable-recovery-guard-reads-sha-from-git-cwd-near-brick).
+  // A dev CLI has no SANCTUARY_CASTLE_BUILD_SHA override, so the resolved CLI
+  // identity comes from git-in-cwd (or, sealed, from the bundle). These tests
+  // pin the recovery-path behavior when that identity is indeterminate or does
+  // not match the deployed app.
+  const NON_SEALED_SELF_PATH = "/usr/local/bin/node";
+  const SEALED_SELF_PATH =
+    "/Applications/Sanctuary-CastleWall.app/Contents/Resources/boot-runtime/node";
+  // 40-hex source_sha as written into the bundle's cli-runtime manifest; the
+  // deployed app reports its 12-hex prefix as report.build.git_sha.
+  const SEALED_SOURCE_SHA = "a375792ba6ef0123456789abcdef0123456789ab";
+  const SEALED_GIT_SHA = SEALED_SOURCE_SHA.slice(0, 12);
+
+  function envWithoutBuildSha(
+    env: Record<string, string>,
+  ): Record<string, string> {
+    const copy = { ...env };
+    delete copy.SANCTUARY_CASTLE_BUILD_SHA;
+    return copy;
+  }
+
+  it("disable proceeds when the CLI build identity is indeterminate (no git repo)", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      disable: { stdout: reportLine("disable", "disabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+    });
+
+    const code = await runDisable([], {
+      out,
+      err,
+      env: envWithoutBuildSha(env),
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      cliSelfPath: NON_SEALED_SELF_PATH,
+      execSyncFn: () => {
+        throw new Error("fatal: not a git repository");
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("Castle Wall disarmed");
+    expect(err.text()).toContain(
+      "disable proceeding despite an unverifiable build identity",
+    );
+  });
+
+  it("disable proceeds when the CLI build identity does not match the deployed app", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      disable: { stdout: reportLine("disable", "disabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+    });
+
+    const code = await runDisable([], {
+      out,
+      err,
+      env: envWithoutBuildSha(env),
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      cliSelfPath: NON_SEALED_SELF_PATH,
+      execSyncFn: () => "deadbeefdead",
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("Castle Wall disarmed");
+    expect(err.text()).toContain(
+      "disable proceeding despite an unverifiable build identity",
+    );
+  });
+
+  it("enable still refuses on a genuine build-identity mismatch resolved from git", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--force", "--no-ttl"], {
+      out: new CaptureStream(),
+      err,
+      env: envWithoutBuildSha(env),
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+      cliSelfPath: NON_SEALED_SELF_PATH,
+      execSyncFn: () => "deadbeefdead",
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("deployed app test-build-sha != CLI deadbeefdead");
+    expect(err.text()).not.toContain("proceeding despite");
+    expect(calls.map((call) => call[2])).toEqual(["status"]);
+  });
+
+  it("a sealed-bundle CLI resolves its build SHA from the embedded manifest, not git", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const appReport = {
+      git_sha: SEALED_GIT_SHA,
+      headless_contract_version: CASTLE_WALL_HEADLESS_CONTRACT_VERSION,
+    };
+    const { invoke } = makeInvoker({
+      disable: {
+        stdout: reportLine("disable", "disabled", true, undefined, appReport),
+        exitCode: 0,
+      },
+      status: {
+        stdout: reportLine("status", "disabled", true, undefined, appReport),
+        exitCode: 0,
+      },
+    });
+
+    let gitCalled = false;
+    const readPaths: string[] = [];
+
+    const code = await runDisable([], {
+      out,
+      err,
+      env: envWithoutBuildSha(env),
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      cliSelfPath: SEALED_SELF_PATH,
+      readFileSyncFn: (path: string) => {
+        readPaths.push(path);
+        return JSON.stringify({ source_sha: SEALED_SOURCE_SHA });
+      },
+      execSyncFn: () => {
+        gitCalled = true;
+        throw new Error("git must not be consulted for a sealed CLI");
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(gitCalled).toBe(false);
+    expect(readPaths).toContain(
+      "/Applications/Sanctuary-CastleWall.app/Contents/Resources/cli-runtime-manifest.json",
+    );
+    // Identity matches (sealed SHA == app SHA), so the disarm is clean: no
+    // unverifiable-identity warning.
+    expect(out.text()).toContain("Castle Wall disarmed");
+    expect(err.text()).not.toContain("unverifiable build identity");
+  });
+
+  it("enable resolves a sealed CLI's identity from its bundle, not the env override, so a mismatch still refuses (defect.disable-recovery-guard-reads-sha-from-git-cwd-near-brick)", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const err = new CaptureStream();
+    // Sealed CLI identity (manifest source_sha, build A) is authoritative and is
+    // not substituted by the env override (set to the deployed build B here);
+    // the resolved identity therefore does not match the deployed app and enable
+    // refuses after only `status`.
+    const APP_B_GIT_SHA = "deadbeefdead";
+    const { invoke, calls } = makeInvoker({
+      status: {
+        stdout: reportLine("status", "disabled", true, undefined, {
+          git_sha: APP_B_GIT_SHA,
+          headless_contract_version: CASTLE_WALL_HEADLESS_CONTRACT_VERSION,
+        }),
+        exitCode: 0,
+      },
+    });
+
+    let gitCalled = false;
+    const code = await runEnable(["--force", "--no-ttl"], {
+      out: new CaptureStream(),
+      err,
+      env: { ...env, SANCTUARY_CASTLE_BUILD_SHA: APP_B_GIT_SHA },
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+      cliSelfPath: SEALED_SELF_PATH,
+      readFileSyncFn: () => JSON.stringify({ source_sha: SEALED_SOURCE_SHA }),
+      execSyncFn: () => {
+        gitCalled = true;
+        throw new Error("git must not be consulted for a sealed CLI");
+      },
+    });
+
+    expect(code).toBe(1);
+    expect(gitCalled).toBe(false);
+    expect(err.text()).toContain(
+      `deployed app ${APP_B_GIT_SHA} != CLI ${SEALED_GIT_SHA}`,
+    );
+    expect(err.text()).not.toContain("proceeding despite");
+    expect(calls.map((call) => call[2])).toEqual(["status"]);
+  });
+
   it("requests sysext deactivation only after disabled state and exact build identity", async () => {
     const { hostAppPath, env } = await makeFixture();
     const { invoke, calls } = makeInvoker({

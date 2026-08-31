@@ -6,6 +6,7 @@ import {
 import { createConnection } from "node:net";
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
 import { chmod, lstat, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { readFileSync as nodeReadFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -126,6 +127,20 @@ export interface CastleWallCommandContext {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   execSyncFn?: (command: string) => string;
+  /**
+   * Override the path used to detect whether this CLI is the copy sealed inside
+   * the signed app bundle and to locate that bundle's embedded build identity
+   * (tests drive the sealed-bundle branch without a real /Applications install).
+   * Defaults to `process.execPath` (the node interpreter, which for the sealed
+   * CLI lives at <App>.app/Contents/Resources/boot-runtime/node).
+   */
+  cliSelfPath?: string;
+  /**
+   * Override the synchronous read of the bundle's embedded CLI-runtime manifest
+   * used to resolve the sealed CLI's own build SHA (tests). Defaults to
+   * `readFileSync(path, "utf8")`.
+   */
+  readFileSyncFn?: (path: string) => string;
   getuid?: () => number;
   /** Path to the signer-client shim (re-pin). Defaults to env. */
   signerClientPath?: string;
@@ -4653,10 +4668,94 @@ function parseHeadlessReport(stdout: string): HeadlessReport | null {
   }
 }
 
+/**
+ * Length of the short git SHA the deployed app stamps into Info.plist
+ * SanctuaryCastleWallGitSHA and reports as report.build.git_sha. The sealed
+ * runtime manifest carries the full 40-hex source_sha, of which this is the
+ * prefix (install.ts asserts `source_sha.startsWith(buildSha)` where buildSha
+ * matches `/^[a-f0-9]{12}$/`), so slicing the manifest sha to this length
+ * reproduces the exact value validateHeadlessBuildIdentity compares against.
+ */
+const CASTLE_WALL_SHORT_SHA_LENGTH = 12;
+
+/**
+ * Substring that marks a path as living inside a macOS `.app` bundle. Detecting
+ * it in the running CLI's own interpreter path is how the CLI knows it is the
+ * copy sealed inside the signed app rather than a dev checkout.
+ */
+const SEALED_BUNDLE_CONTENTS_MARKER = ".app/Contents/";
+
+/**
+ * Basename of the manifest carrying the sealed CLI runtime's `source_sha`. Must
+ * match DEFAULT_CASTLE_WALL_RUNTIME_MANIFEST in cli/install.ts, which writes and
+ * verifies it at <App>.app/Contents/Resources/cli-runtime-manifest.json.
+ */
+const SEALED_BUNDLE_RUNTIME_MANIFEST_BASENAME = "cli-runtime-manifest.json";
+
+/**
+ * If `selfPath` points inside a `.app` bundle, return that bundle's `Contents`
+ * directory; otherwise null. Used to decide whether the CLI is sealed and where
+ * its embedded build identity lives.
+ */
+function resolveSealedBundleContentsDir(selfPath: string): string | null {
+  // cli-argv-indexof-allowed: scans a filesystem path string, not CLI argv tokens.
+  const idx = selfPath.indexOf(SEALED_BUNDLE_CONTENTS_MARKER);
+  if (idx === -1) return null;
+  // Keep everything up to and including "<...>.app/Contents", dropping the
+  // trailing slash the marker carries so join() below composes cleanly.
+  return selfPath.slice(0, idx + SEALED_BUNDLE_CONTENTS_MARKER.length - 1);
+}
+
+/**
+ * Read the sealed CLI's own build SHA from the bundle it ships in, or null when
+ * the embedded manifest is absent/unreadable/malformed. The sealed CLI's
+ * identity is a property of the binary, so it comes from the bundle, never from
+ * ambient git in the cwd.
+ */
+function resolveSealedBundleBuildSha(
+  contentsDir: string,
+  ctx: CastleWallCommandContext,
+): string | null {
+  const manifestPath = join(
+    contentsDir,
+    "Resources",
+    SEALED_BUNDLE_RUNTIME_MANIFEST_BASENAME,
+  );
+  const readFileSyncFn =
+    ctx.readFileSyncFn ?? ((path: string) => nodeReadFileSync(path, "utf8"));
+  try {
+    const parsed = JSON.parse(readFileSyncFn(manifestPath)) as {
+      source_sha?: unknown;
+    };
+    const sourceSha =
+      typeof parsed.source_sha === "string" ? parsed.source_sha.trim() : "";
+    if (!/^[a-f0-9]{40}$/.test(sourceSha)) return null;
+    return sourceSha.slice(0, CASTLE_WALL_SHORT_SHA_LENGTH);
+  } catch {
+    return null;
+  }
+}
+
 function resolveCliBuildSha(
   env: NodeJS.ProcessEnv,
   ctx: CastleWallCommandContext,
 ): string {
+  // Sealed identity is authoritative and is resolved FIRST, before the env
+  // override is even consulted. A CLI sealed inside the signed app derives its
+  // identity solely from the bundle it ships in; neither SANCTUARY_CASTLE_BUILD_SHA
+  // nor `git rev-parse` in the cwd may substitute it, because the enable-side
+  // pairing guard's strict property depends on the sealed CLI's identity being
+  // its own true build, not an operator-supplied value. A sealed bundle whose embedded
+  // manifest cannot be read reports "unknown", which is already safe (disable
+  // warns and proceeds, enable refuses). The env override and the git fallback
+  // below are legitimate ONLY for a non-sealed dev CLI running from a source
+  // checkout, where no bundle manifest exists.
+  const selfPath = ctx.cliSelfPath ?? process.execPath;
+  const sealedContentsDir = resolveSealedBundleContentsDir(selfPath);
+  if (sealedContentsDir !== null) {
+    return resolveSealedBundleBuildSha(sealedContentsDir, ctx) ?? "unknown";
+  }
+
   const envSha =
     env.SANCTUARY_CASTLE_BUILD_SHA ?? env.SANCTUARY_CASTLE_CLI_BUILD_SHA;
   if (envSha?.trim()) return envSha.trim();
@@ -4702,9 +4801,10 @@ function validateHeadlessBuildIdentity(
   if (appBuild.git_sha !== cliGitSha) {
     return (
       `deployed app ${appBuild.git_sha} != CLI ${cliGitSha} - rebuild + redeploy the signed app. ` +
-      `(The CLI SHA comes from SANCTUARY_CASTLE_BUILD_SHA or, if unset, 'git rev-parse HEAD' in the ` +
-      `current working directory - NOT the binary. If you are running from a git worktree whose HEAD ` +
-      `differs from the deployed app, run outside a repo or 'export SANCTUARY_CASTLE_BUILD_SHA=${appBuild.git_sha}'.)`
+      `(A sealed CLI reads its own SHA from the app bundle's cli-runtime manifest, so a mismatch here ` +
+      `means the installed app and the sealed CLI are from different builds - reinstall the matching ` +
+      `signed app; the SANCTUARY_CASTLE_BUILD_SHA override is IGNORED for a sealed CLI and cannot paper ` +
+      `over this. Only a non-sealed dev CLI derives its SHA from that override or 'git rev-parse HEAD'.)`
     );
   }
   return null;
@@ -5545,8 +5645,21 @@ async function runArmDisarmInner(
   if (report) {
     const buildMismatch = validateHeadlessBuildIdentity(report, cliGitSha);
     if (buildMismatch) {
-      write(err, `castle-wall ${action} failed: ${buildMismatch}\n`);
-      return 1;
+      if (action === "enable") {
+        // Arming with a mismatched CLI/app pairing is unsafe: fail closed.
+        write(err, `castle-wall ${action} failed: ${buildMismatch}\n`);
+        return 1;
+      }
+      // Recovery must never fail-closed on the check that fails exactly when
+      // recovery is needed. In a filter-on/daemon-down near-brick the CLI's own
+      // identity is routinely indeterminate ("unknown"), and disarm is the one
+      // lever that drops the wall; refusing here would strand the operator with
+      // the wall up. Disarm is the opposite risk from arm, so an indeterminate
+      // or mismatched identity downgrades to a warning and the disarm proceeds.
+      write(
+        err,
+        `Warning: castle-wall disable proceeding despite an unverifiable build identity (${buildMismatch})\n`,
+      );
     }
   }
 
@@ -5613,8 +5726,19 @@ async function runArmDisarmInner(
       cliGitSha,
     );
     if (verifyBuildMismatch) {
-      write(err, `castle-wall ${action} failed: ${verifyBuildMismatch}\n`);
-      return 1;
+      if (action === "enable") {
+        // Same arm-side invariant as the mutation-path check: never claim armed
+        // against a mismatched pairing.
+        write(err, `castle-wall ${action} failed: ${verifyBuildMismatch}\n`);
+        return 1;
+      }
+      // Same recovery invariant as the mutation-path check above: an
+      // unverifiable identity on the disarm corroboration read must not flip a
+      // real recovery into a reported failure.
+      write(
+        err,
+        `Warning: castle-wall disable corroboration proceeding despite an unverifiable build identity (${verifyBuildMismatch})\n`,
+      );
     }
   }
   const expectedState = action === "enable" ? "enabled" : "disabled";
