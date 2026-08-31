@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,6 +27,12 @@ import {
   __resetProcessShutdownStateForTest,
   runWrap,
 } from "../../src/wrap/cli.js";
+import type { AutoProvisionSummary } from "../../src/wrap/auto-provision.js";
+import {
+  agreeingHermesParity,
+  clearHermesParityHook,
+  installHermesParityHook,
+} from "../helpers/hermes-parity.js";
 import {
   CLI_SUBPROCESS_TEST_TIMEOUT_MS,
   runCliRaw,
@@ -835,6 +842,97 @@ describe("protect preflight", () => {
       expect(warnings[0]).toContain("could not be verified");
     });
 
+    // fail-before: gate finding P1 (carve-out broader than "reachable but
+    // credential-unverifiable"). Before the fix, ANY non-success outcome on
+    // the discrimination probe (5xx, timeout, TLS failure) set
+    // reachableUnverifiable: true merely because the configured credential's
+    // own request had returned 2xx first -- so a provider that is actually
+    // DOWN, or whose discrimination probe failed transiently, passed strict.
+    // The carve-out must fire only when the discrimination probe itself
+    // returns a SUCCESS status that cannot distinguish a valid credential
+    // from an invalid one; any other outcome on that probe is not evidence
+    // of non-discrimination and must block.
+    it("(g) strict still refuses when the discrimination probe returns a non-success, non-rejection status (5xx), even though the configured credential's own request returned 2xx", async () => {
+      let calls = 0;
+      const report = await runProtectPreflight({
+        ops: fixtureOps({
+          env: baseEnv({ OPENAI_API_KEY: "", VENICE_API_KEY: "clearly-not-a-real-venice-key-0000" }),
+          fetch: async () => {
+            calls += 1;
+            // First call is the configured credential (2xx: provider is up).
+            // Second call is the invalid-credential discrimination probe,
+            // which returns 503: the endpoint's own health, not a rejection
+            // of the bad credential, so it proves nothing about validity.
+            return calls === 1 ? { status: 200 } : { status: 503 };
+          },
+        }),
+      });
+
+      const providerRow = row(report, "provider_liveness");
+      expect(providerRow.status).toBe("UNDETERMINED");
+      expect(providerRow.providers?.[0]).toMatchObject({
+        status: "UNDETERMINED",
+        reachableUnverifiable: false,
+      });
+      expect(protectPreflightExitCode(report, true)).toBe(2);
+      expect(describeProtectPreflightBlockers(report, true)).toContain("provider liveness");
+      expect(describeProtectPreflightStrictWarnings(report, true)).toEqual([]);
+    });
+
+    it("(h) strict still refuses when the discrimination probe cannot complete at all (network error/timeout/TLS failure), even though the configured credential's own request returned 2xx", async () => {
+      let calls = 0;
+      const report = await runProtectPreflight({
+        ops: fixtureOps({
+          env: baseEnv({ OPENAI_API_KEY: "", VENICE_API_KEY: "clearly-not-a-real-venice-key-0000" }),
+          fetch: async () => {
+            calls += 1;
+            if (calls === 1) return { status: 200 };
+            throw new Error("ETIMEDOUT");
+          },
+        }),
+      });
+
+      const providerRow = row(report, "provider_liveness");
+      expect(providerRow.status).toBe("UNDETERMINED");
+      expect(providerRow.providers?.[0]).toMatchObject({
+        status: "UNDETERMINED",
+        reachableUnverifiable: false,
+      });
+      expect(protectPreflightExitCode(report, true)).toBe(2);
+      expect(describeProtectPreflightBlockers(report, true)).toContain("provider liveness");
+      expect(describeProtectPreflightStrictWarnings(report, true)).toEqual([]);
+    });
+
+    // fail-before: gate finding P1 (redirect masquerade). Production fetch
+    // follows redirects by default and keeps only the final status, so a
+    // provider-origin request that redirects to an unrelated 200 would look
+    // like a genuine provider success and enter the carve-out. Exercises the
+    // real `defaultFetch` behind `createProtectPreflightOps()` against a
+    // local server, not a mock, so the assertion is about the actual fetch
+    // call shape (redirect: "error"), not a restated intent.
+    it("provider probe fetch refuses to follow a redirect (an unrelated 200 at a different origin is never evidence of a provider success)", async () => {
+      const server = createServer((req, res) => {
+        if (req.url === "/redirect-to-unrelated") {
+          res.writeHead(302, { Location: "/unrelated-200" });
+          res.end();
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("unrelated success, not the provider's own endpoint");
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      try {
+        const ops = createProtectPreflightOps();
+        await expect(
+          ops.fetch(`http://127.0.0.1:${port}/redirect-to-unrelated`, { method: "GET" }),
+        ).rejects.toThrow();
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+
     it("(b) strict still refuses on an unreachable provider", async () => {
       const report = await runProtectPreflight({
         ops: fixtureOps({
@@ -877,26 +975,46 @@ describe("protect preflight", () => {
       expect(describeProtectPreflightStrictWarnings(report, true)).toEqual([]);
     });
 
-    it("(d) strict still refuses on an UNDETERMINED row from a non-provider check, even with a healthy provider", async () => {
-      // Linux has no darwin-only surfaces to probe, so several checks read
-      // "not_darwin" UNDETERMINED while provider_liveness (which never
-      // gates on platform) resolves cleanly with OpenAI's real rejection of
-      // an invalid credential.
+    it("(d) strict still refuses on an UNDETERMINED row from a non-provider check, even when the SAME report also carries a carve-out-eligible reachable-unverifiable provider row", async () => {
+      // Deliberately combines BOTH shapes in one report: a provider row that
+      // genuinely qualifies for the carve-out (Venice, reachable but
+      // credential-unverifiable) AND an unrelated non-provider UNDETERMINED
+      // row (Linux has no darwin-only surfaces to probe, so castle_sock_holder
+      // reads "not_darwin"). A prior version of this test used a PASS
+      // provider, which could not catch a regression that suppresses EVERY
+      // UNDETERMINED row whenever the carve-out fires anywhere in the report;
+      // asserting strict still blocks here, with the carve-out row present,
+      // proves the carve-out is scoped to its own row and never bleeds into
+      // an unrelated blocking row.
       const report = await runProtectPreflight({
-        ops: fixtureOps({ platform: "linux" }),
+        ops: fixtureOps({
+          platform: "linux",
+          env: baseEnv({ OPENAI_API_KEY: "", VENICE_API_KEY: "clearly-not-a-real-venice-key-0000" }),
+          fetch: async () => ({ status: 200 }),
+        }),
       });
 
       const providerRow = row(report, "provider_liveness");
-      expect(providerRow.status).toBe("PASS");
+      expect(providerRow.status).toBe("UNDETERMINED");
+      expect(providerRow.providers?.[0]).toMatchObject({
+        status: "UNDETERMINED",
+        reachableUnverifiable: true,
+      });
       expect(row(report, "castle_sock_holder")).toMatchObject({
         status: "UNDETERMINED",
         state: "not_darwin",
       });
+      // The non-provider row still blocks even though the provider row alone
+      // would have been carved out.
       expect(protectPreflightExitCode(report, true)).toBe(2);
-      expect(describeProtectPreflightBlockers(report, true)).toContain("castle.sock holder");
-      // No provider triggered the carve-out, so there is nothing to warn
-      // about even though strict still refuses for an unrelated reason.
-      expect(describeProtectPreflightStrictWarnings(report, true)).toEqual([]);
+      const blockers = describeProtectPreflightBlockers(report, true);
+      expect(blockers).toContain("castle.sock holder");
+      expect(blockers).not.toContain("provider liveness");
+      // The carve-out row still warns on its own, independent of the
+      // unrelated row also blocking the overall run.
+      const warnings = describeProtectPreflightStrictWarnings(report, true);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("Venice");
     });
 
     it("(e) non-strict behavior is unchanged: a reachable-unverifiable provider never blocked and still doesn't", async () => {
@@ -961,6 +1079,97 @@ describe("protect preflight", () => {
         exitSpy.mockRestore();
         stderrSpy.mockRestore();
         consoleErrorSpy.mockRestore();
+      }
+    });
+
+    // fail-before: gate finding P2 (the "arming proceeds" test only proved
+    // --preflight itself exits 0, never that the guided installer actually
+    // CONTINUES into its install path). This drives the real protect+hermes
+    // install flow (protectInstallFlow, not the standalone --preflight verb)
+    // with a report whose ONLY row is the reachable-unverifiable carve-out,
+    // and asserts a downstream installation seam -- runAutoProvisionForWrap,
+    // the sole caller of the privileged account-creation/re-home/daemon
+    // -install/arm side effects -- is actually reached, not merely that the
+    // preflight computation itself returned 0.
+    it("CLI: the guided install CONTINUES past the automatic preflight gate into auto-provision when the carve-out is the only thing that would have blocked", async () => {
+      const tmpHome = await mkdtemp(join(tmpdir(), "sanctuary-strict-arm-continue-"));
+      const originalHome = process.env.HOME;
+      const originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+      const originalIsTty = process.stdin.isTTY;
+      Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+      process.env.HOME = tmpHome;
+      process.env.SANCTUARY_STORAGE_PATH = join(tmpHome, ".sanctuary");
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      installHermesParityHook(agreeingHermesParity);
+      const reachableUnverifiableReport: ProtectPreflightReport = {
+        command: "sanctuary protect preflight",
+        generated_at: PRETEND_TIME.toISOString(),
+        strict: true,
+        summary: { pass: 0, fail: 0, undetermined: 1 },
+        rows: [
+          {
+            id: "provider_liveness",
+            check: "provider liveness",
+            status: "UNDETERMINED",
+            state: "provider_probe_unknown",
+            detail: "Venice: credential_not_verifiable",
+            remedy: "Verify each configured provider from the operator account before arming Castle Wall.",
+            findings: ["F-12"],
+            providers: [
+              {
+                provider: "Venice",
+                source: "env:VENICE_API_KEY",
+                status: "UNDETERMINED",
+                state: "credential_not_verifiable",
+                detail: "provider endpoint reachable; credential validity not verifiable at the available endpoint",
+                reachableUnverifiable: true,
+              },
+            ],
+          },
+        ],
+      };
+      const runAutoProvisionForWrap = vi.fn(
+        async (): Promise<AutoProvisionSummary> => ({ ran: true }),
+      );
+      try {
+        await mkdir(join(tmpHome, ".hermes"), { recursive: true });
+        await cp(
+          fileURLToPath(new URL("../harness/fixtures/hermes.json", import.meta.url)),
+          join(tmpHome, ".hermes", "cli-config.json"),
+        );
+        await runWrap(
+          {
+            protectCommand: true,
+            hermes: true,
+            preflightStrict: true,
+            noOpen: true,
+            noDashboard: true,
+          },
+          {
+            runProtectPreflight: async () => reachableUnverifiableReport,
+            runAutoProvisionForWrap,
+            resolvePassphrase: async () => ({
+              value: "test-passphrase",
+              location: "test-keychain",
+              source: "generated" as const,
+            }),
+          },
+        );
+        // The carve-out alone would have exited 0 for a bare --preflight
+        // check; the real assertion is that the flow was never gated off at
+        // all and reached the privileged install seam beyond it.
+        expect(protectPreflightExitCode(reachableUnverifiableReport, true)).toBe(0);
+        expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1);
+      } finally {
+        __resetProcessShutdownStateForTest();
+        consoleErrorSpy.mockRestore();
+        clearHermesParityHook();
+        if (originalHome === undefined) delete process.env.HOME;
+        else process.env.HOME = originalHome;
+        if (originalStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+        else process.env.SANCTUARY_STORAGE_PATH = originalStoragePath;
+        Object.defineProperty(process.stdin, "isTTY", { value: originalIsTty, configurable: true });
+        await rm(tmpHome, { recursive: true, force: true });
       }
     });
   });

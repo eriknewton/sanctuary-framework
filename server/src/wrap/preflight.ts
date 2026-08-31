@@ -401,13 +401,22 @@ interface ProtectPreflightBlockingRows {
  * to blocking until it explicitly proves reachability through the typed
  * field.
  *
+ * The per-provider check requires `status === "UNDETERMINED"` alongside the
+ * flag, not the flag alone: `reachableUnverifiable` only means anything on
+ * an UNDETERMINED provider, and a FAIL-status provider carrying the flag
+ * (a malformed/defensive shape, never produced by probeProvider today) must
+ * never be read as carve-out-eligible -- a FAIL row always blocks under
+ * strict regardless of what any boolean field on it claims.
+ *
  * defect.strict-arm-blocks-on-reachable-unverifiable-provider
  */
 function isProviderLivenessReachableUnverifiable(row: ProtectPreflightRow): boolean {
   if (row.id !== "provider_liveness" || row.status !== "UNDETERMINED") return false;
   if (row.providers === undefined || row.providers.length === 0) return false;
   return row.providers.every(
-    (provider) => provider.status === "PASS" || provider.reachableUnverifiable,
+    (provider) =>
+      provider.status === "PASS" ||
+      (provider.status === "UNDETERMINED" && provider.reachableUnverifiable === true),
   );
 }
 
@@ -676,6 +685,13 @@ async function defaultFetch(
       method: request.method,
       headers: request.headers,
       signal: controller.signal,
+      // A followed redirect keeps only the FINAL response's status, which
+      // may be an unrelated 200 at a different origin -- that is not
+      // evidence the provider's own endpoint responded at all, let alone
+      // that it did or didn't discriminate a credential. Refusing to follow
+      // makes a redirect surface as a thrown error here, which the caller's
+      // catch already treats as unreachable/probe-failed (never a success).
+      redirect: "error",
     };
     const response = await fetch(url, init);
     return { status: response.status };
@@ -1642,9 +1658,14 @@ async function probeProvider(
           state: "credential_not_verifiable",
           detail:
             "provider endpoint reachable; credential validity not verifiable at the available endpoint (it accepted an invalid credential too)",
-          // The 2xx above already proved this endpoint is reachable; the
-          // endpoint itself, not a probe failure, is why validity can't be
-          // proven -- the reachable-unverifiable shape strict-arm allows.
+          // `reachableUnverifiable` means the discrimination probe itself
+          // returned a SUCCESS status that accepted the known-wrong
+          // credential exactly as it accepted the configured one -- that is
+          // demonstrated non-discrimination, never merely "we reached the
+          // host". This is the only outcome of probeCredentialDiscrimination
+          // that proves it; a non-success on that probe (5xx, timeout, TLS
+          // failure) proves nothing about the endpoint's discrimination
+          // behavior and must not set this flag (see the two branches below).
           reachableUnverifiable: true,
         };
       }
@@ -1656,7 +1677,13 @@ async function probeProvider(
           state: "credential_discrimination_inconclusive",
           detail:
             "provider endpoint reachable; credential validity not verifiable at the available endpoint (the invalid-credential probe did not return a recognized rejection)",
-          reachableUnverifiable: true,
+          // A non-success, non-rejection status on the discrimination probe
+          // (e.g. 5xx, 429) is not evidence the endpoint fails to
+          // discriminate -- it may simply be down or rate-limited while the
+          // configured-credential request happened to land first. Without
+          // demonstrated non-discrimination this must block under strict,
+          // the same as an unreachable or provably-bad provider.
+          reachableUnverifiable: false,
         };
       }
       return {
@@ -1665,10 +1692,12 @@ async function probeProvider(
         status: "UNDETERMINED",
         state: "credential_discrimination_probe_failed",
         detail: `provider endpoint reachable; credential validity not verifiable at the available endpoint (the follow-up probe could not complete: ${discrimination.reason})`,
-        // The configured credential's own request already returned 2xx, so
-        // the endpoint is proven reachable even though the follow-up probe
-        // itself could not run.
-        reachableUnverifiable: true,
+        // The follow-up probe never completed (network error, timeout, TLS
+        // failure) -- it produced no evidence either way about whether the
+        // endpoint discriminates. The earlier 2xx on the configured
+        // credential's own request is not a substitute for that evidence, so
+        // this must block under strict rather than carve out.
+        reachableUnverifiable: false,
       };
     }
     if (response.status === 402) {
