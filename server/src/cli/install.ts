@@ -224,6 +224,20 @@ export type InstallObservation =
   | "mismatch"
   | "unknown"
   | "not-applicable";
+// The trust-anchor verdict as `castle-wall status` reports it. `broken` is
+// produced ONLY by the signer-helper-authoritative verdict line; the softer
+// local-key comparison (a non-authoritative fallback that can differ after a
+// legitimate re-pin or when the helper is momentarily unavailable) reads as
+// `unknown` and never drives the Tier-1 re-pin remedy.
+// `unknown` is the honest fallback when the pin is unreadable or no comparison
+// key is reachable; the planner never treats `unknown` as broken (no fabricated
+// remedy) or as consistent.
+export type TrustAnchorObservation =
+  | "consistent"
+  | "broken"
+  | "unprovisioned"
+  | "unknown"
+  | "not-applicable";
 
 export interface AgentInstallAction {
   id: string;
@@ -260,6 +274,15 @@ export interface AgentInstallPlan {
     boot_service: InstallObservation;
     content_filter: "enabled" | "disabled" | "unknown" | "not-applicable";
     enforcement: "live" | "unavailable" | "undetermined" | "not-applicable";
+    // Consistency of the root-owned global enforcement pin against the live
+    // signer-helper key, parsed from `castle-wall status`. ONLY the
+    // signer-helper-authoritative verdict yields `broken`/`consistent`; the
+    // softer fortress-local comparison is not definitive and reads as `unknown`.
+    // `broken` is the fresh-install crash-loop cause (pin != helper key; the boot
+    // daemon cannot sign a manifest and KeepAlive restarts it forever), and the
+    // planner names re-pin as the remedy instead of leaving only the crash-loop
+    // observable.
+    trust_anchor: TrustAnchorObservation;
     operator_twin: InstallObservation;
   };
   next_action: AgentInstallAction | null;
@@ -289,6 +312,7 @@ export interface InstallProbeResult {
   bootService: InstallObservation;
   contentFilter: "enabled" | "disabled" | "unknown" | "not-applicable";
   enforcement: "live" | "unavailable" | "undetermined" | "not-applicable";
+  trustAnchor: TrustAnchorObservation;
   operatorTwin: InstallObservation;
 }
 
@@ -627,14 +651,59 @@ async function probeSystemExtension(): Promise<SysextState | "unknown"> {
   }
 }
 
+// The COMPLETE authoritative verdict lines `reportGlobalPinAndVerdict` in
+// castle-wall.ts emits from the live signer-helper `get-pubkey` comparison. Must
+// match those two lines byte-for-byte (trimmed): the whole point is that only the
+// helper-authoritative verdict is definitive, so a bare `.includes("BROKEN")`
+// would be wrong — a non-authoritative line that merely CONTAINS the token (e.g.
+// "Trust anchor: BROKEN against local fortress key (non-authoritative fallback)")
+// must NOT drive the Tier-1 re-pin remedy. Pinned on both sides: a drift in the
+// producer's wording downgrades every read to `unknown` (a silent no-remedy),
+// never a false `broken`/`consistent`.
+const TRUST_ANCHOR_AUTHORITATIVE_CONSISTENT =
+  "Trust anchor: CONSISTENT (global pin == signer-helper key)";
+const TRUST_ANCHOR_AUTHORITATIVE_BROKEN =
+  "Trust anchor: BROKEN (global pin != signer-helper key; box cannot arm until re-pinned)";
+const TRUST_ANCHOR_UNPROVISIONED =
+  "Trust anchor: no global pin provisioned (run 'sanctuary castle-wall re-pin' to install it)";
+
+// ONLY the signer-helper-authoritative verdict is definitive. The softer
+// `global pin DIFFERS/matches from local fortress key` lines are the
+// NON-AUTHORITATIVE fallback castle-wall.ts prints when the helper query is
+// unreachable; they compare the retained fortress-local key, not the helper's
+// key, and are not safe to act on: a legitimate re-pin makes the fortress-local
+// key legitimately differ from the helper-owned global pin, so `DIFFERS` on a
+// momentarily-unreachable helper would falsely accuse a healthy box, and
+// `matches` could falsely assert consistency. Both soft lines therefore fall
+// through to `unknown` so the planner never fabricates a Tier-1 re-pin remedy
+// from a non-authoritative comparison. Match is against COMPLETE trimmed lines,
+// not substrings, so a decorated near-collision cannot impersonate the verdict.
+export function parseTrustAnchor(text: string): TrustAnchorObservation {
+  const lines = text.split("\n").map((line) => line.trim());
+  if (lines.includes(TRUST_ANCHOR_AUTHORITATIVE_BROKEN)) {
+    return "broken";
+  }
+  if (lines.includes(TRUST_ANCHOR_AUTHORITATIVE_CONSISTENT)) {
+    return "consistent";
+  }
+  if (lines.includes(TRUST_ANCHOR_UNPROVISIONED)) {
+    return "unprovisioned";
+  }
+  // Non-authoritative fallback (`global pin DIFFERS/matches local fortress key`),
+  // "cannot verify", "unreadable" (root-owned pin, no elevation), or an absent
+  // verdict line: the AUTHORITATIVE helper==pin check is not observable from here,
+  // so report the honest unknown rather than driving a remedy off a soft signal.
+  return "unknown";
+}
+
 async function probeWallStatus(
   env: NodeJS.ProcessEnv,
-): Promise<Pick<InstallProbeResult, "contentFilter" | "enforcement">> {
+): Promise<Pick<InstallProbeResult, "contentFilter" | "enforcement" | "trustAnchor">> {
   const chunks: string[] = [];
   try {
     await runStatus([], { out: captureWritable(chunks), env, platform: "darwin" });
   } catch {
-    return { contentFilter: "unknown", enforcement: "undetermined" };
+    return { contentFilter: "unknown", enforcement: "undetermined", trustAnchor: "unknown" };
   }
   const text = chunks.join("");
   const contentFilter = text.includes("Content filter: enabled")
@@ -647,7 +716,7 @@ async function probeWallStatus(
     : text.includes("Enforcement availability: unavailable")
       ? "unavailable"
       : "undetermined";
-  return { contentFilter, enforcement };
+  return { contentFilter, enforcement, trustAnchor: parseTrustAnchor(text) };
 }
 
 async function probeOperatorTwin(
@@ -710,6 +779,7 @@ function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
           bootService: "not-applicable",
           contentFilter: "not-applicable",
           enforcement: "not-applicable",
+          trustAnchor: "not-applicable",
           operatorTwin: "not-applicable",
         };
       }
@@ -780,6 +850,7 @@ function basePlan(
       boot_service: observed.bootService,
       content_filter: observed.contentFilter,
       enforcement: observed.enforcement,
+      trust_anchor: observed.trustAnchor,
       operator_twin: observed.operatorTwin,
     },
     next_action: null,
@@ -998,6 +1069,47 @@ export function buildAgentInstallPlan(input: {
     );
     return plan;
   }
+  // Finding B: a fresh install can provision a root-owned global pin that does
+  // not match the live signer-helper key, so the boot daemon cannot sign a
+  // manifest and KeepAlive crash-loops it forever (observed as
+  // boot_service=mismatch with no named remedy). Re-pin is the fix and MUST be
+  // named before any further mutating retry: re-running the privileged protect
+  // flow does not migrate the anchor, so leaving install_full_surface as the
+  // only action would loop the operator through the crash-loop. Keyed on the
+  // authoritative `trust_anchor=broken` verdict; `unknown` (pin unreadable, no
+  // reachable comparison key) is never treated as broken, so no remedy is
+  // fabricated when the mismatch cannot actually be observed from here. Re-pin
+  // is a Tier-1 operator-present migration and is never agent-triggerable, so
+  // this is a human action naming the exact command (no sudo: the root signer
+  // helper writes the pin, the CLI only asks it to).
+  if (input.observed.trustAnchor === "broken") {
+    const repinCliPath = input.observed.persistentCliPath;
+    if (repinCliPath === null) {
+      plan.notes.push("The trust anchor is broken but the persistent CLI path disappeared after it was observed; refusing to construct a re-pin command.");
+      return plan;
+    }
+    plan.status = "human_action";
+    plan.next_action = {
+      id: "repin_trust_anchor",
+      actor: "human",
+      description:
+        "The Castle Wall boot daemon is crash-looping: the root-owned global enforcement pin does not match the live signer-helper key, so it cannot sign a policy manifest and macOS keeps restarting it. Run this exact 'castle-wall re-pin' command in a private local Terminal to migrate the trust anchor to the signer helper, then rerun the planner. Arming cannot proceed until this is repaired.",
+      argv: [
+        "/usr/bin/env",
+        `SANCTUARY_STORAGE_PATH=${input.fortress}`,
+        `SANCTUARY_CASTLE_SIGNER_CLIENT=${CASTLE_WALL_SIGNER_CLIENT}`,
+        input.observed.nodePath,
+        ...(sealedFullRuntime ? [] : [repinCliPath]),
+        "castle-wall",
+        "re-pin",
+      ],
+      completion:
+        "A rerun observes trust_anchor consistent and the boot service stable (no longer crash-looping).",
+      secret_boundary:
+        "Re-pin is operator-present and never agent-triggerable. The agent must not run it, retry it, or automate the operator's approval of the signer helper.",
+    };
+    return plan;
+  }
   const fullMechanicsComplete =
     input.observed.cooperativeWrap === "present" &&
     input.observed.systemExtension === "[activated enabled]" &&
@@ -1023,35 +1135,62 @@ export function buildAgentInstallPlan(input: {
     plan.notes.push("The persistent CLI path disappeared after it was observed; refusing to construct a privileged command.");
     return plan;
   }
+  const privilegedInstallArgv = [
+    "sudo",
+    "/usr/bin/env",
+    `SANCTUARY_CASTLE_BUILD_SHA=${input.observed.castleWallBuildSha}`,
+    `SANCTUARY_CASTLE_SIGNER_CLIENT=${CASTLE_WALL_SIGNER_CLIENT}`,
+    input.observed.nodePath,
+    ...(sealedFullRuntime ? [] : [persistentCliPath]),
+    "--fortress",
+    input.fortress,
+    "protect",
+    "--hermes",
+    "--no-open",
+    "--provision-agent-account",
+    "--agent-guided",
+    "--strict",
+    "--sealed-launcher",
+    DEFAULT_CASTLE_WALL_LAUNCHER,
+  ];
   plan.status = "human_action";
-  plan.next_action = {
-    id: "install_full_surface",
-    actor: "human",
-    description:
-      "Run this exact command in a private local Terminal and authorize sudo there. The agent must not execute it or receive a reusable sudo timestamp.",
-    argv: [
-      "sudo",
-      "/usr/bin/env",
-      `SANCTUARY_CASTLE_BUILD_SHA=${input.observed.castleWallBuildSha}`,
-      `SANCTUARY_CASTLE_SIGNER_CLIENT=${CASTLE_WALL_SIGNER_CLIENT}`,
-      input.observed.nodePath,
-      ...(sealedFullRuntime ? [] : [persistentCliPath]),
-      "--fortress",
-      input.fortress,
-      "protect",
-      "--hermes",
-      "--no-open",
-      "--provision-agent-account",
-      "--agent-guided",
-      "--strict",
-      "--sealed-launcher",
-      DEFAULT_CASTLE_WALL_LAUNCHER,
-    ],
-    completion:
-      "A rerun observes the cooperative wrap and boot service present, the content filter enabled, and enforcement live.",
-    secret_boundary:
-      "The operator enters the administrator password directly into sudo. The agent must not request, store, relay, or automate that password or the resulting authorization.",
-  };
+  // Finding A: this privileged flow arms the content filter, and the FIRST arm
+  // on a host raises a one-time macOS "would like to filter network content"
+  // approval dialog inside saveToPreferences. Unapproved, the arm blocks until
+  // it times out (observed live: two silent timeouts before the operator clicked
+  // Allow). The dialog is only raised WHILE the arm runs, and the approval is not
+  // separately observable from here: `castle-wall status` collapses the
+  // pre-approval state to content_filter=disabled/unknown, indistinguishable
+  // from a filter that is simply not armed yet. So the honest signal for "the
+  // arm has not yet succeeded on this host" is content_filter != enabled, and the
+  // named action both runs the arm and tells the operator to expect and approve
+  // the dialog (rather than a bare command that appears to hang). Once approved,
+  // a rerun observes content_filter=enabled and advances. When the filter is
+  // already armed, no dialog is pending and the plain privileged action stands.
+  const contentFilterArmPending = input.observed.contentFilter !== "enabled";
+  plan.next_action = contentFilterArmPending
+    ? {
+        id: "approve_content_filter",
+        actor: "human",
+        description:
+          "Run this exact command in a private local Terminal and authorize sudo there. The FIRST time the content filter arms, macOS raises a one-time 'Sanctuary-CastleWall would like to filter network content' dialog (also reachable at System Settings > General > Login Items & Extensions > Network Extensions). Click Allow. Until you do, the command appears to hang and will time out. The agent must not execute the command or receive a reusable sudo timestamp.",
+        argv: privilegedInstallArgv,
+        completion:
+          "A rerun observes the cooperative wrap and boot service present, the content filter enabled, and enforcement live.",
+        secret_boundary:
+          "The operator enters the administrator password directly into sudo and clicks Allow on the macOS filter dialog. The agent must not request, store, relay, or automate that password, the dialog approval, or the resulting authorization.",
+      }
+    : {
+        id: "install_full_surface",
+        actor: "human",
+        description:
+          "Run this exact command in a private local Terminal and authorize sudo there. The agent must not execute it or receive a reusable sudo timestamp.",
+        argv: privilegedInstallArgv,
+        completion:
+          "A rerun observes the cooperative wrap and boot service present, the content filter enabled, and enforcement live.",
+        secret_boundary:
+          "The operator enters the administrator password directly into sudo. The agent must not request, store, relay, or automate that password or the resulting authorization.",
+      };
   return plan;
 }
 
