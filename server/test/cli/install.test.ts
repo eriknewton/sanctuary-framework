@@ -11,6 +11,7 @@ import {
   AGENT_INSTALL_CONTRACT,
   buildAgentInstallPlan,
   parseInstallSystemExtensionState,
+  parseTrustAnchor,
   runInstallCommand,
   verifyCastleWallRuntimeManifest,
   type AgentInstallOps,
@@ -73,6 +74,7 @@ function observed(overrides: Partial<InstallProbeResult> = {}): InstallProbeResu
     bootService: "not-applicable",
     contentFilter: "not-applicable",
     enforcement: "not-applicable",
+    trustAnchor: "not-applicable",
     operatorTwin: "not-applicable",
     ...overrides,
   };
@@ -86,6 +88,9 @@ function fullObserved(overrides: Partial<InstallProbeResult> = {}): InstallProbe
     nodePath: "/Applications/Sanctuary-CastleWall.app/Contents/MacOS/sanctuary",
     castleWallApp: "present",
     operatorTwin: "absent",
+    // A verified full-profile host has a consistent trust anchor by default;
+    // the broken-anchor crash-loop path is exercised by opting in explicitly.
+    trustAnchor: "consistent",
     ...overrides,
   });
 }
@@ -838,6 +843,173 @@ describe("sanctuary install agent contract", () => {
     const protectIndex = argv.indexOf("protect");
     expect(protectIndex).toBeGreaterThan(-1);
     expect(parseWrapArgs(argv.slice(protectIndex + 1)).preflightStrict).toBe(true);
+  });
+
+  // Finding A (defect.arm-filter-approval-not-a-guided-human-step): the first
+  // content-filter arm blocks on a one-time macOS approval dialog that the
+  // planner never named, so a cold operator saw only a timeout.
+  it("names the first-run content-filter approval instead of arming into a timeout", () => {
+    const plan = buildAgentInstallPlan({
+      profile: "full",
+      harness: "hermes",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: fullObserved({
+        cooperativeWrap: "present",
+        castleWallApp: "present",
+        systemExtension: "[activated enabled]",
+        bootService: "present",
+        // The filter has not yet been armed on this host, so the next arm will
+        // raise the "Allow to filter network content" dialog.
+        contentFilter: "disabled",
+        enforcement: "unavailable",
+        trustAnchor: "consistent",
+      }),
+    });
+
+    expect(plan.status).toBe("human_action");
+    expect(plan.next_action?.actor).toBe("human");
+    expect(plan.next_action?.id).toBe("approve_content_filter");
+    const description = plan.next_action?.description ?? "";
+    expect(description).toContain("filter network content");
+    expect(description).toContain("Allow");
+    expect(description).toContain("System Settings");
+    expect(description.toLowerCase()).toContain("time out");
+    // The named approval still carries the exact arm command so the operator can
+    // both trigger and approve the dialog in one place.
+    expect(plan.next_action?.argv).toContain("protect");
+    expect(plan.next_action?.completion).toContain("content filter enabled");
+  });
+
+  it("keeps the plain privileged action once the content filter is already armed", () => {
+    const plan = buildAgentInstallPlan({
+      profile: "full",
+      harness: "hermes",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: fullObserved({
+        cooperativeWrap: "present",
+        castleWallApp: "present",
+        systemExtension: "[activated enabled]",
+        bootService: "present",
+        contentFilter: "enabled",
+        // Only enforcement is not yet live, so no approval dialog is pending.
+        enforcement: "undetermined",
+        trustAnchor: "consistent",
+      }),
+    });
+
+    expect(plan.status).toBe("human_action");
+    expect(plan.next_action?.id).toBe("install_full_surface");
+    expect(plan.next_action?.description ?? "").not.toContain("filter network content");
+  });
+
+  // Finding B (defect.fresh-install-daemon-needs-manual-repin-on-first-arm): a
+  // fresh install can leave the root-owned global pin mismatched against the
+  // signer-helper key, crash-looping the boot daemon; the operator had to run
+  // re-pin by hand with no remedy surfaced.
+  it("names re-pin as the remedy for a broken trust anchor instead of a bare crash-loop", () => {
+    const plan = buildAgentInstallPlan({
+      profile: "full",
+      harness: "hermes",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: fullObserved({
+        cooperativeWrap: "present",
+        castleWallApp: "present",
+        systemExtension: "[activated enabled]",
+        // The daemon is installed but crash-looping (never a stable PID).
+        bootService: "mismatch",
+        contentFilter: "disabled",
+        enforcement: "unavailable",
+        trustAnchor: "broken",
+      }),
+    });
+
+    expect(plan.status).toBe("human_action");
+    expect(plan.next_action?.actor).toBe("human");
+    expect(plan.next_action?.id).toBe("repin_trust_anchor");
+    const argv = plan.next_action?.argv ?? [];
+    expect(argv).toContain("castle-wall");
+    expect(argv).toContain("re-pin");
+    // Re-pin is not a sudo/root step: the root signer helper writes the pin.
+    expect(argv).not.toContain("sudo");
+    expect(argv).toContain("SANCTUARY_STORAGE_PATH=/tmp/fortress");
+    expect((plan.next_action?.description ?? "").toLowerCase()).toContain("re-pin");
+  });
+
+  // Finding B (defect.fresh-install-daemon-needs-manual-repin-on-first-arm):
+  // only the signer-helper-authoritative verdict may drive the Tier-1 re-pin
+  // remedy; the non-authoritative fortress-local comparison must not, because a
+  // legitimate re-pin makes the local key legitimately differ from the pin.
+  it("treats only the signer-helper-authoritative verdict as definitive", () => {
+    // Exact strings emitted by reportGlobalPinAndVerdict in castle-wall.ts.
+    expect(
+      parseTrustAnchor("Trust anchor: CONSISTENT (global pin == signer-helper key)\n"),
+    ).toBe("consistent");
+    expect(
+      parseTrustAnchor(
+        "Trust anchor: BROKEN (global pin != signer-helper key; box cannot arm until re-pinned)\n",
+      ),
+    ).toBe("broken");
+    // Non-authoritative local-key fallback: never definitive.
+    expect(
+      parseTrustAnchor(
+        "Trust anchor: global pin DIFFERS from local fortress key (run re-pin or check the signer helper)\n",
+      ),
+    ).toBe("unknown");
+    expect(
+      parseTrustAnchor("Trust anchor: global pin matches local fortress key\n"),
+    ).toBe("unknown");
+    // No provisioned pin is its own state; unreadable/cannot-verify/absent all
+    // degrade to unknown so no remedy is fabricated.
+    expect(
+      parseTrustAnchor(
+        "Trust anchor: no global pin provisioned (run 'sanctuary castle-wall re-pin' to install it)\n",
+      ),
+    ).toBe("unprovisioned");
+    expect(
+      parseTrustAnchor(
+        "Trust anchor: cannot verify (no local fortress key on disk; the authoritative pin==signer-helper check needs the running daemon/signer helper)\n",
+      ),
+    ).toBe("unknown");
+    expect(
+      parseTrustAnchor("Global pin (enforcement anchor): unreadable (root-owned; re-run with elevation to inspect)\n"),
+    ).toBe("unknown");
+    expect(parseTrustAnchor("")).toBe("unknown");
+    // Near-collision: a non-authoritative line that merely CONTAINS the verdict
+    // token must not impersonate the authoritative verdict (exact-line match, not
+    // a substring), so it can never reach the Tier-1 re-pin branch.
+    expect(
+      parseTrustAnchor("Trust anchor: BROKEN against local fortress key (non-authoritative fallback)\n"),
+    ).toBe("unknown");
+    expect(
+      parseTrustAnchor("Trust anchor: CONSISTENT with local fortress key only (non-authoritative fallback)\n"),
+    ).toBe("unknown");
+  });
+
+  it("does not fabricate a re-pin remedy when the trust anchor is unobservable", () => {
+    const plan = buildAgentInstallPlan({
+      profile: "full",
+      harness: "hermes",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: fullObserved({
+        cooperativeWrap: "present",
+        castleWallApp: "present",
+        systemExtension: "[activated enabled]",
+        bootService: "absent",
+        contentFilter: "disabled",
+        enforcement: "unavailable",
+        // The root-owned pin was unreadable / no comparison key reachable.
+        trustAnchor: "unknown",
+      }),
+    });
+
+    // Unknown is honest: the planner advances to the guided arm, never inventing
+    // a re-pin the mismatch evidence does not support.
+    expect(plan.next_action?.id).not.toBe("repin_trust_anchor");
+    expect(plan.next_action?.id).toBe("approve_content_filter");
   });
 
   it("requires every full-profile enforcement observation before completion", () => {

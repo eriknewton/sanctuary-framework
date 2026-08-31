@@ -1576,6 +1576,10 @@ async function reportGlobalPinAndVerdict(
       const helperPub = await client.getPublicKey();
       const helperFingerprint = fingerprintFromPublicKey(helperPub);
       if (helperFingerprint === globalFingerprint) {
+        // These two authoritative verdict lines are parsed byte-for-byte by
+        // TRUST_ANCHOR_AUTHORITATIVE_CONSISTENT / _BROKEN in cli/install.ts;
+        // must match those constants. A wording drift there downgrades every
+        // read to `unknown` (a silent no-remedy), never a false verdict.
         write(out, "Trust anchor: CONSISTENT (global pin == signer-helper key)\n");
       } else {
         write(

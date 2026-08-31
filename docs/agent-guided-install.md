@@ -92,6 +92,19 @@ bounded authorization. The returned privileged argument vector is therefore a
 human action to run in a private local Terminal. The agent resumes by observing
 the resulting state.
 
+Apple consent on the full profile is more than the system-extension toggle. The
+first time the content filter arms, macOS raises a one-time "would like to filter
+network content" approval; the planner returns an `approve_content_filter` human
+action that names this dialog and the System Settings pane, because the arm
+otherwise appears to hang until the operator approves it. Separately, if a fresh
+install leaves the root-owned enforcement pin inconsistent with the signer helper,
+the boot service cannot come up cleanly; the planner then returns a
+`repin_trust_anchor` human action naming the exact `castle-wall re-pin` command
+rather than leaving the operator with an unexplained boot loop. The trust-anchor
+verdict is read from `castle-wall status`; when the pin is not readable from the
+planner's context, the observation is reported as unknown and no remedy is
+invented.
+
 ### Root boot-runtime custody
 
 The Castle Wall boot service runs as root, so none of its executable inputs may
