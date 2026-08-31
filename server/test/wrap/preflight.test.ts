@@ -1029,6 +1029,46 @@ describe("protect preflight", () => {
       expect(describeProtectPreflightStrictWarnings(report, false)).toEqual([]);
     });
 
+    it("(f) strict BLOCKS a malformed FAIL-status provider that carries reachableUnverifiable:true (the predicate must require UNDETERMINED, not the flag alone)", () => {
+      // Regression pin for the predicate at preflight.ts isProviderLivenessReachableUnverifiable:
+      // probeProvider never produces this shape today, but if the predicate is
+      // reverted to trust the flag alone, a FAIL provider carrying a stray
+      // reachableUnverifiable:true would slip past strict. This synthetic report
+      // constructs exactly that shape and asserts strict still refuses (exit 2,
+      // no warning). Fail-before: reverting the predicate to a flag-only check
+      // turns this exit code to 0.
+      // defect.strict-arm-blocks-on-reachable-unverifiable-provider
+      const malformedFailWithFlag: ProtectPreflightReport = {
+        command: "sanctuary protect preflight",
+        generated_at: PRETEND_TIME.toISOString(),
+        strict: true,
+        summary: { pass: 0, fail: 0, undetermined: 1 },
+        rows: [
+          {
+            id: "provider_liveness",
+            check: "provider liveness",
+            status: "UNDETERMINED",
+            state: "provider_probe_unknown",
+            detail: "Venice: a malformed FAIL provider carrying the carve-out flag",
+            remedy: "Verify each configured provider from the operator account before arming Castle Wall.",
+            findings: ["F-12"],
+            providers: [
+              {
+                provider: "Venice",
+                source: "env:VENICE_API_KEY",
+                status: "FAIL",
+                state: "network_error",
+                detail: "a FAIL provider must block regardless of any boolean field on it",
+                reachableUnverifiable: true,
+              },
+            ],
+          },
+        ],
+      };
+      expect(protectPreflightExitCode(malformedFailWithFlag, true)).toBe(2);
+      expect(describeProtectPreflightStrictWarnings(malformedFailWithFlag, true)).toEqual([]);
+    });
+
     it("CLI: --strict arm proceeds (exit 0) and prints a WARN naming the provider, instead of refusing", async () => {
       const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
         throw new Error(`process.exit:${code ?? 0}`);
