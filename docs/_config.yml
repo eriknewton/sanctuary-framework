@@ -29,6 +29,11 @@ exclude:
   - audit/MERGE_GATE_REPORT.md
   - audit/DELTA_REVIEW_REPORT.md
   - audit/KNOWN_ISSUES.md
+  # Detailed internal security-posture page (branch-protection specifics,
+  # dependency-debt board, maintainer decisions). Owner-directed takedown
+  # 2026-08-31 (INC-009): unpublished pending a review of whether the
+  # open-security-debt board says more than a public page should.
+  - audit/SECURITY_POSTURE.md
 
 # Defaults
 defaults:
