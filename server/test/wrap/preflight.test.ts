@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   createProtectPreflightOps,
+  describeProtectPreflightBlockers,
   protectPreflightExitCode,
   renderProtectPreflightJson,
   renderProtectPreflightReport,
@@ -37,6 +38,36 @@ const ROOT_SANCTUARY = "/usr/local/bin/sanctuary";
 const FDA_PROBE = `${OPERATOR_HOME}/Library/Caches/com.apple.containermanagerd`;
 const HERMES_GATEWAY_PLIST = `${OPERATOR_HOME}/Library/LaunchAgents/ai.hermes.gateway.plist`;
 const PRETEND_TIME = new Date("2026-07-29T12:00:00.000Z");
+
+// One row per check id, in the order runProtectPreflight emits them. Expected
+// pass/fail/undetermined counts in an all-one-status fixture are derived from
+// this list's length rather than a bare number, so adding or removing a
+// check id cannot silently desync from what the assertions expect.
+const ALL_PREFLIGHT_CHECK_IDS: ProtectPreflightCheckId[] = [
+  "castle_sock_holder",
+  "fortress_custody",
+  "root_path_sanctuary",
+  "signer_client",
+  "sysext_approval",
+  "full_disk_access",
+  "provider_liveness",
+  "operator_twin_services",
+  "boot_runtime_devtools",
+];
+
+// Must match XCODE_SELECT_PATH / OTOOL_PATH / OTOOL_PROBE_TARGET in
+// ../../src/wrap/preflight.ts. Pinning the exact executable AND args (not
+// just "the command name ends with xcode-select") means a regression that
+// starts passing different or mutating args (e.g. `xcode-select --install`)
+// fails these fixtures instead of silently matching a permissive stub.
+const XCODE_SELECT_CMD = "/usr/bin/xcode-select";
+const XCODE_SELECT_ARGS = ["-p"];
+const OTOOL_CMD = "/usr/bin/otool";
+const OTOOL_ARGS = ["-L", "/bin/ls"];
+
+function isExactCall(cmd: string, args: string[], expectedCmd: string, expectedArgs: string[]): boolean {
+  return cmd === expectedCmd && args.length === expectedArgs.length && args.every((arg, index) => arg === expectedArgs[index]);
+}
 
 type OwnerResult =
   | { ok: true; uid: number; gid: number }
@@ -89,7 +120,11 @@ function baseEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     PATH: "/usr/bin:/usr/local/bin",
     SANCTUARY_STORAGE_PATH: FORTRESS,
     SANCTUARY_CASTLE_SIGNER_CLIENT: SIGNER,
-    VENICE_API_KEY: "test-venice-key",
+    // OpenAI, not Venice: OpenAI's endpoint genuinely rejects an invalid
+    // credential (see PROVIDER_INVALID_CREDENTIAL_RESPONSE below), so a
+    // generic "healthy host" fixture can honestly reach PASS. Venice's
+    // endpoint cannot, and is exercised only where a test says so by name.
+    OPENAI_API_KEY: "test-openai-key",
     ...overrides,
   };
 }
@@ -126,6 +161,15 @@ function fixtureOps(input: FixtureOpsInput = {}): ProtectPreflightOps {
           return execResult(113, "", "Could not find service");
         }
         if (cmd.endsWith("ps")) return execResult(0, "UID PID COMMAND\n");
+        if (isExactCall(cmd, args, XCODE_SELECT_CMD, XCODE_SELECT_ARGS)) {
+          return execResult(0, "/Library/Developer/CommandLineTools\n");
+        }
+        if (isExactCall(cmd, args, OTOOL_CMD, OTOOL_ARGS)) {
+          return execResult(
+            0,
+            `${OTOOL_ARGS[1]}:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)\n`,
+          );
+        }
         return execResult(1, "", `unexpected exec ${cmd} ${joined}`);
       }),
     entry: async (path) => entries.get(path) ?? absentEntry(),
@@ -148,7 +192,35 @@ function fixtureOps(input: FixtureOpsInput = {}): ProtectPreflightOps {
     readFileSample:
       async (path) =>
         readFileSample.get(path) ?? { ok: false, reason: "ENOENT", code: "ENOENT" },
-    fetch: input.fetch ?? (async () => ({ status: 200 })),
+    fetch:
+      input.fetch ??
+      (async (url, request) => {
+        // A fixture-realistic default: only the credential(s) actually
+        // configured in this fixture's env count as "valid", so PASS
+        // assertions exercise the preflight's real/invalid-credential
+        // discrimination probe instead of every request trivially
+        // succeeding regardless of what credential was presented.
+        //
+        // defect.preflight-provider-liveness-probe-not-authenticated
+        const validCredentials = new Set(
+          [
+            env.VENICE_API_KEY,
+            env.OPENAI_API_KEY,
+            env.ANTHROPIC_API_KEY,
+            env.GEMINI_API_KEY,
+            env.GOOGLE_API_KEY,
+            env.TELEGRAM_BOT_TOKEN,
+          ].filter((value): value is string => typeof value === "string" && value.length > 0),
+        );
+        const presented =
+          request.headers?.Authorization?.replace(/^Bearer\s+/, "") ??
+          request.headers?.["x-api-key"] ??
+          request.headers?.["x-goog-api-key"] ??
+          /\/bot([^/]+)\//.exec(url)?.[1];
+        return presented !== undefined && validCredentials.has(presented)
+          ? { status: 200 }
+          : { status: 401 };
+      }),
   };
 }
 
@@ -192,23 +264,18 @@ describe("protect preflight", () => {
       ops: fixtureOps(),
     });
 
-    expect(report.summary).toEqual({ pass: 8, fail: 0, undetermined: 0 });
+    expect(report.summary).toEqual({ pass: ALL_PREFLIGHT_CHECK_IDS.length, fail: 0, undetermined: 0 });
     expect(protectPreflightExitCode(report)).toBe(0);
-    expect(report.rows.map((candidate) => candidate.status)).toEqual([
-      "PASS",
-      "PASS",
-      "PASS",
-      "PASS",
-      "PASS",
-      "PASS",
-      "PASS",
-      "PASS",
-    ]);
+    expect(report.rows.map((candidate) => candidate.id)).toEqual(ALL_PREFLIGHT_CHECK_IDS);
+    expect(report.rows.map((candidate) => candidate.status)).toEqual(
+      ALL_PREFLIGHT_CHECK_IDS.map(() => "PASS"),
+    );
     expect(row(report, "fortress_custody").state).toBe("operator_owned");
     expect(row(report, "provider_liveness").providers?.[0]?.state).toBe("live");
+    expect(row(report, "boot_runtime_devtools").state).toBe("developer_tools_present");
     expect(JSON.parse(renderProtectPreflightJson(report))).toMatchObject({
       command: "sanctuary protect preflight",
-      summary: { pass: 8, fail: 0, undetermined: 0 },
+      summary: { pass: ALL_PREFLIGHT_CHECK_IDS.length, fail: 0, undetermined: 0 },
     });
     expect(renderProtectPreflightReport(report)).toContain("| PASS");
   });
@@ -325,6 +392,7 @@ describe("protect preflight", () => {
         env: baseEnv({
           PATH: "/missing",
           SANCTUARY_CASTLE_SIGNER_CLIENT: "",
+          OPENAI_API_KEY: "",
           VENICE_API_KEY: "billing-dead",
         }),
         executable: new Set(),
@@ -358,13 +426,26 @@ describe("protect preflight", () => {
           if (cmd.endsWith("ps")) {
             return execResult(0, "UID PID COMMAND\n501 88 python -m hermes_cli.main gateway\n");
           }
+          if (isExactCall(cmd, args, XCODE_SELECT_CMD, XCODE_SELECT_ARGS)) {
+            // The real xcode-select -p exit shape when Command Line Tools
+            // are not installed: nonzero exit, no spawn-level error.
+            return execResult(
+              2,
+              "",
+              "xcode-select: error: unable to get active developer directory, use `sudo xcode-select --switch path/to/Xcode.app` to specify one",
+            );
+          }
           return execResult(1, "", `unexpected ${cmd} ${joined}`);
         },
         fetch: async () => ({ status: 402 }),
       }),
     });
 
-    expect(report.summary).toEqual({ pass: 0, fail: 8, undetermined: 0 });
+    expect(report.summary).toEqual({ pass: 0, fail: ALL_PREFLIGHT_CHECK_IDS.length, undetermined: 0 });
+    expect(row(report, "boot_runtime_devtools")).toMatchObject({
+      status: "FAIL",
+      state: "developer_tools_missing",
+    });
     expect(row(report, "castle_sock_holder")).toMatchObject({
       status: "FAIL",
       state: "launchd_safe_mode_boot_daemon",
@@ -469,35 +550,48 @@ describe("protect preflight", () => {
     });
   });
 
-  it("sends Gemini preflight credentials in the x-goog-api-key header, not the URL", async () => {
+  it("sends Gemini preflight credentials in the x-goog-api-key header, not the URL, and reads UNDETERMINED (Gemini's endpoint does not return a recognized rejection)", async () => {
     const requests: Array<{ url: string; request: ProviderHttpRequest }> = [];
     const report = await runProtectPreflight({
       ops: fixtureOps({
         env: baseEnv({
+          OPENAI_API_KEY: "",
           VENICE_API_KEY: "",
           GEMINI_API_KEY: "gemini-secret",
           GOOGLE_API_KEY: "",
         }),
+        // "gemini-secret" succeeds; any other credential (including the
+        // invalid-credential probe) gets Gemini's real invalid-credential
+        // status (see PROVIDER_INVALID_CREDENTIAL_RESPONSE below) so this
+        // exercises the second (invalid-credential) request honestly.
         fetch: async (url, request) => {
           requests.push({ url, request });
-          return { status: 200 };
+          return { status: request.headers?.["x-goog-api-key"] === "gemini-secret" ? 200 : 400 };
         },
       }),
     });
 
     expect(row(report, "provider_liveness")).toMatchObject({
-      status: "PASS",
-      state: "all_configured_providers_live",
+      status: "UNDETERMINED",
+      state: "provider_probe_unknown",
     });
-    expect(requests).toEqual([
-      {
-        url: "https://generativelanguage.googleapis.com/v1beta/models",
-        request: {
-          method: "GET",
-          headers: { "x-goog-api-key": "gemini-secret" },
-        },
+    expect(row(report, "provider_liveness").providers?.[0]).toMatchObject({
+      status: "UNDETERMINED",
+      state: "credential_discrimination_inconclusive",
+    });
+    expect(requests).toHaveLength(2);
+    expect(requests[0]).toEqual({
+      url: "https://generativelanguage.googleapis.com/v1beta/models",
+      request: {
+        method: "GET",
+        headers: { "x-goog-api-key": "gemini-secret" },
       },
-    ]);
+    });
+    // The discrimination probe reuses the same URL/method with a credential
+    // guaranteed not to be "gemini-secret".
+    expect(requests[1]?.url).toBe(requests[0]?.url);
+    expect(requests[1]?.request.method).toBe("GET");
+    expect(requests[1]?.request.headers?.["x-goog-api-key"]).not.toBe("gemini-secret");
   });
 
   it("reports UNDETERMINED instead of passing by omission when probes cannot establish facts", async () => {
@@ -506,6 +600,7 @@ describe("protect preflight", () => {
         env: baseEnv({
           PATH: "/mystery",
           SANCTUARY_CASTLE_SIGNER_CLIENT: "/mystery/signer-client",
+          OPENAI_API_KEY: "",
           VENICE_API_KEY: "",
         }),
         executable: new Set(),
@@ -530,7 +625,7 @@ describe("protect preflight", () => {
       }),
     });
 
-    expect(report.summary).toEqual({ pass: 0, fail: 0, undetermined: 8 });
+    expect(report.summary).toEqual({ pass: 0, fail: 0, undetermined: ALL_PREFLIGHT_CHECK_IDS.length });
     expect(report.rows.every((candidate) => candidate.status === "UNDETERMINED")).toBe(true);
     expect(protectPreflightExitCode(report)).toBe(0);
     expect(protectPreflightExitCode(report, true)).toBe(2);
@@ -672,21 +767,462 @@ describe("protect preflight", () => {
       expect([0, 2]).toContain(result.code);
       const parsed = JSON.parse(result.stdout) as ProtectPreflightReport;
       expect(parsed.command).toBe("sanctuary protect preflight");
-      expect(parsed.rows.map((candidate) => candidate.id)).toEqual([
-        "castle_sock_holder",
-        "fortress_custody",
-        "root_path_sanctuary",
-        "signer_client",
-        "sysext_approval",
-        "full_disk_access",
-        "provider_liveness",
-        "operator_twin_services",
-      ]);
+      expect(parsed.rows.map((candidate) => candidate.id)).toEqual(ALL_PREFLIGHT_CHECK_IDS);
       expect(result.stderr).not.toContain("Bootstrapped");
     } finally {
       await rm(tmp, { recursive: true, force: true });
     }
   }, CLI_SUBPROCESS_TEST_TIMEOUT_MS);
+
+  // defect.preflight-provider-liveness-probe-not-authenticated
+  it("does not PASS provider liveness when the endpoint returns HTTP 2xx regardless of the credential presented", async () => {
+    // A placeholder credential is not on normalizeCredential's literal
+    // denylist, so it is treated as configured.
+    const fetch = vi.fn(async () => ({ status: 200 }));
+    const report = await runProtectPreflight({
+      ops: fixtureOps({
+        env: baseEnv({ OPENAI_API_KEY: "", VENICE_API_KEY: "clearly-not-a-real-venice-key-0000" }),
+        fetch,
+      }),
+    });
+
+    const providerRow = row(report, "provider_liveness");
+    expect(providerRow.status).toBe("UNDETERMINED");
+    expect(providerRow.state).toBe("provider_probe_unknown");
+    expect(providerRow.providers?.[0]).toMatchObject({
+      status: "UNDETERMINED",
+      state: "credential_not_verifiable",
+    });
+    // The configured credential AND the invalid-credential discrimination
+    // probe both hit the endpoint; only a genuine status difference between
+    // the two would have justified a PASS.
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(protectPreflightExitCode(report)).toBe(0);
+    expect(protectPreflightExitCode(report, true)).toBe(2);
+  });
+
+  it("still PASSes provider liveness when the endpoint genuinely rejects an invalid credential", async () => {
+    const report = await runProtectPreflight({
+      // OpenAI is baseEnv's default provider precisely because its endpoint
+      // genuinely rejects an invalid credential; fixtureOps' default fetch
+      // only accepts the exact configured credential, so this proves the
+      // discrimination probe does not regress a genuinely credential
+      // -checking endpoint to UNDETERMINED.
+      ops: fixtureOps(),
+    });
+
+    const providerRow = row(report, "provider_liveness");
+    expect(providerRow.status).toBe("PASS");
+    expect(providerRow.providers?.[0]).toMatchObject({
+      status: "PASS",
+      state: "live",
+    });
+    expect(providerRow.providers?.[0]?.detail).toContain("rejected an invalid credential");
+  });
+
+  // defect.preflight-provider-liveness-probe-not-authenticated
+  it("does not PASS provider liveness when the invalid-credential probe returns a status that is not a recognized rejection", async () => {
+    // The configured credential succeeds; the invalid-credential probe hits
+    // an unrelated failure class that is not a genuine authentication
+    // rejection and not a success. That ambiguity alone must never resolve
+    // to PASS.
+    const fetch = vi.fn(async (_url: string, request: ProviderHttpRequest) => ({
+      status: request.headers?.Authorization === "Bearer test-venice-key" ? 200 : 503,
+    }));
+    const report = await runProtectPreflight({
+      ops: fixtureOps({
+        env: baseEnv({ OPENAI_API_KEY: "", VENICE_API_KEY: "test-venice-key" }),
+        fetch,
+      }),
+    });
+
+    const providerRow = row(report, "provider_liveness");
+    expect(providerRow.status).toBe("UNDETERMINED");
+    expect(providerRow.providers?.[0]).toMatchObject({
+      status: "UNDETERMINED",
+      state: "credential_discrimination_inconclusive",
+    });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  function extractPresentedCredential(url: string, request: ProviderHttpRequest): string | undefined {
+    const fromUrl = /\/bot([^/]+)\//.exec(url)?.[1];
+    return (
+      request.headers?.Authorization?.replace(/^Bearer\s+/, "") ??
+      request.headers?.["x-api-key"] ??
+      request.headers?.["x-goog-api-key"] ??
+      (fromUrl === undefined ? undefined : decodeURIComponent(fromUrl))
+    );
+  }
+
+  // Each provider's own response to an invalid-but-well-formed credential:
+  // some endpoints answer with a genuine authentication rejection, others
+  // do not, and the row's status must reflect exactly which is true for
+  // that provider rather than assume the same outcome everywhere.
+  const PROVIDER_INVALID_CREDENTIAL_RESPONSE: Record<string, number> = {
+    openai: 401,
+    anthropic: 401,
+    telegram: 401,
+    venice: 200,
+    google_gemini: 400,
+  };
+
+  // The aggregate provider_liveness row state for each outcome class (see
+  // checkProviderLiveness): a lone UNDETERMINED provider reads
+  // "provider_probe_unknown"; all-PASS reads "all_configured_providers_live".
+  const AGGREGATE_STATE_FOR_STATUS: Record<"PASS" | "UNDETERMINED", string> = {
+    PASS: "all_configured_providers_live",
+    UNDETERMINED: "provider_probe_unknown",
+  };
+
+  // defect.preflight-provider-liveness-probe-not-authenticated
+  it.each([
+    [
+      "openai",
+      "OPENAI_API_KEY",
+      "PASS",
+      "live",
+      "rejected an invalid credential at this endpoint",
+    ],
+    [
+      "anthropic",
+      "ANTHROPIC_API_KEY",
+      "PASS",
+      "live",
+      "rejected an invalid credential at this endpoint",
+    ],
+    [
+      "telegram",
+      "TELEGRAM_BOT_TOKEN",
+      "PASS",
+      "live",
+      "rejected an invalid credential at this endpoint",
+    ],
+    [
+      "venice",
+      "VENICE_API_KEY",
+      "UNDETERMINED",
+      "credential_not_verifiable",
+      "accepted an invalid credential too",
+    ],
+    [
+      "google_gemini",
+      "GEMINI_API_KEY",
+      "UNDETERMINED",
+      "credential_discrimination_inconclusive",
+      "did not return a recognized rejection",
+    ],
+  ] as const)(
+    "%s's row reads %s/%s (%s), matching that provider's own invalid-credential response",
+    async (providerId, envName, expectedStatus, expectedState, expectedDetailSubstring) => {
+      const realCredential = "the-configured-real-credential";
+      const fetch = vi.fn(async (url: string, request: ProviderHttpRequest) => {
+        const presented = extractPresentedCredential(url, request);
+        return {
+          status:
+            presented === realCredential ? 200 : PROVIDER_INVALID_CREDENTIAL_RESPONSE[providerId],
+        };
+      });
+
+      const report = await runProtectPreflight({
+        ops: fixtureOps({
+          env: baseEnv({ OPENAI_API_KEY: "", VENICE_API_KEY: "", [envName]: realCredential }),
+          fetch,
+        }),
+      });
+
+      const providerRow = row(report, "provider_liveness");
+      expect(providerRow.status).toBe(expectedStatus);
+      expect(providerRow.state).toBe(AGGREGATE_STATE_FOR_STATUS[expectedStatus]);
+      expect(providerRow.providers?.[0]).toMatchObject({ status: expectedStatus, state: expectedState });
+      expect(providerRow.providers?.[0]?.detail).toContain(expectedDetailSubstring);
+    },
+  );
+
+  // Shared scaffolding for the boot_runtime_devtools row tests below: every
+  // command except xcode-select/otool resolves the way the "healthy" fixture
+  // does, so each test only has to vary the xcode-select/otool outcome it is
+  // actually exercising.
+  function devtoolsFixtureExecFile(
+    respond: (cmd: string, args: string[]) => ExecFileResult | undefined,
+  ): (cmd: string, args: string[]) => Promise<ExecFileResult> {
+    return async (cmd, args) => {
+      const overridden = respond(cmd, args);
+      if (overridden !== undefined) return overridden;
+      const joined = args.join(" ");
+      if (cmd.endsWith("lsof")) return execResult(1);
+      if (cmd === "systemextensionsctl") {
+        return execResult(
+          0,
+          "1 extension(s)\n--- com.apple.system_extension.network_extension\n[activated enabled] ai.sanctuaryprotocol.castlewall\n",
+        );
+      }
+      if (cmd === "launchctl" && joined.includes("system/ai.sanctuaryprotocol.castle-wall.daemon")) {
+        return execResult(113, "", "Could not find service");
+      }
+      if (cmd === "launchctl" && joined.includes("gui/501/ai.hermes.gateway")) {
+        return execResult(113, "", "Could not find service");
+      }
+      if (cmd.endsWith("ps")) return execResult(0, "UID PID COMMAND\n");
+      return execResult(1, "", `unexpected exec ${cmd} ${joined}`);
+    };
+  }
+
+  // defect.boot-installer-requires-devtools-unchecked-by-preflight
+  it("FAILs the boot runtime devtools row when Command Line Tools are absent", async () => {
+    const report = await runProtectPreflight({
+      ops: fixtureOps({
+        execFile: devtoolsFixtureExecFile((cmd, args) => {
+          if (isExactCall(cmd, args, XCODE_SELECT_CMD, XCODE_SELECT_ARGS)) {
+            // The real xcode-select -p exit shape when Command Line Tools
+            // are not installed: nonzero exit, no spawn-level error.
+            return execResult(
+              2,
+              "",
+              "xcode-select: error: unable to get active developer directory, use `sudo xcode-select --switch path/to/Xcode.app` to specify one",
+            );
+          }
+          return undefined;
+        }),
+      }),
+    });
+
+    expect(row(report, "boot_runtime_devtools")).toMatchObject({
+      status: "FAIL",
+      state: "developer_tools_missing",
+    });
+    expect(row(report, "boot_runtime_devtools").remedy).toContain("xcode-select --install");
+    expect(protectPreflightExitCode(report)).toBe(2);
+  });
+
+  it("reports the devtools row as UNDETERMINED, not FAIL, when the xcode-select probe itself cannot run", async () => {
+    const report = await runProtectPreflight({
+      ops: fixtureOps({
+        execFile: devtoolsFixtureExecFile((cmd, args) => {
+          if (isExactCall(cmd, args, XCODE_SELECT_CMD, XCODE_SELECT_ARGS)) {
+            return execResult(1, "", "blocked", "EIO");
+          }
+          return undefined;
+        }),
+      }),
+    });
+
+    expect(row(report, "boot_runtime_devtools")).toMatchObject({
+      status: "UNDETERMINED",
+      state: "developer_tools_probe_unknown",
+    });
+  });
+
+  it("reports the devtools row as UNDETERMINED, not FAIL, when the xcode-select probe times out (code:null, signal, killed)", async () => {
+    const report = await runProtectPreflight({
+      ops: fixtureOps({
+        execFile: devtoolsFixtureExecFile((cmd, args) => {
+          if (isExactCall(cmd, args, XCODE_SELECT_CMD, XCODE_SELECT_ARGS)) {
+            // A timed-out/killed subprocess has no errorCode (Node reports
+            // code:null there, which the exec wrapper coerces to 1) --
+            // signal/killed are what actually distinguish this from a
+            // genuine nonzero exit.
+            return { code: 1, stdout: "", stderr: "", signal: "SIGTERM", killed: true };
+          }
+          return undefined;
+        }),
+      }),
+    });
+
+    expect(row(report, "boot_runtime_devtools")).toMatchObject({
+      status: "UNDETERMINED",
+      state: "developer_tools_probe_unknown",
+    });
+  });
+
+  it("FAILs the devtools row when xcode-select reports present but otool -L does not work (stale/partial toolchain)", async () => {
+    const report = await runProtectPreflight({
+      ops: fixtureOps({
+        execFile: devtoolsFixtureExecFile((cmd, args) => {
+          if (isExactCall(cmd, args, XCODE_SELECT_CMD, XCODE_SELECT_ARGS)) {
+            return execResult(0, "/Library/Developer/CommandLineTools\n");
+          }
+          if (isExactCall(cmd, args, OTOOL_CMD, OTOOL_ARGS)) {
+            return execResult(1, "", "otool: error: unable to load libLTO.dylib");
+          }
+          return undefined;
+        }),
+      }),
+    });
+
+    expect(row(report, "boot_runtime_devtools")).toMatchObject({
+      status: "FAIL",
+      state: "developer_tools_broken",
+    });
+    expect(row(report, "boot_runtime_devtools").remedy).toContain("xcode-select --install");
+    expect(protectPreflightExitCode(report)).toBe(2);
+  });
+
+  it("reports the devtools row as UNDETERMINED when xcode-select reports present but the otool probe itself cannot run", async () => {
+    const report = await runProtectPreflight({
+      ops: fixtureOps({
+        execFile: devtoolsFixtureExecFile((cmd, args) => {
+          if (isExactCall(cmd, args, XCODE_SELECT_CMD, XCODE_SELECT_ARGS)) {
+            return execResult(0, "/Library/Developer/CommandLineTools\n");
+          }
+          if (isExactCall(cmd, args, OTOOL_CMD, OTOOL_ARGS)) {
+            return execResult(1, "", "blocked", "EIO");
+          }
+          return undefined;
+        }),
+      }),
+    });
+
+    expect(row(report, "boot_runtime_devtools")).toMatchObject({
+      status: "UNDETERMINED",
+      state: "otool_probe_unknown",
+    });
+  });
+
+  it("reports the devtools row as UNDETERMINED, not FAIL, when the otool probe times out (code:null, signal, killed)", async () => {
+    const report = await runProtectPreflight({
+      ops: fixtureOps({
+        execFile: devtoolsFixtureExecFile((cmd, args) => {
+          if (isExactCall(cmd, args, XCODE_SELECT_CMD, XCODE_SELECT_ARGS)) {
+            return execResult(0, "/Library/Developer/CommandLineTools\n");
+          }
+          if (isExactCall(cmd, args, OTOOL_CMD, OTOOL_ARGS)) {
+            return { code: 1, stdout: "", stderr: "", signal: "SIGTERM", killed: true };
+          }
+          return undefined;
+        }),
+      }),
+    });
+
+    expect(row(report, "boot_runtime_devtools")).toMatchObject({
+      status: "UNDETERMINED",
+      state: "otool_probe_unknown",
+    });
+  });
+
+  it("does not PASS the devtools row for a mutating xcode-select invocation (e.g. --install) that the fixture does not model", async () => {
+    // isExactCall only matches the literal ["-p"] read probe, so any other
+    // arg vector falls through to the fixture's generic "unexpected exec"
+    // branch rather than silently matching a permissive stub.
+    const report = await runProtectPreflight({
+      ops: fixtureOps({
+        execFile: devtoolsFixtureExecFile((cmd, args) => {
+          if (cmd === XCODE_SELECT_CMD && args[0] === "--install") {
+            return execResult(0, "");
+          }
+          return undefined;
+        }),
+      }),
+    });
+
+    expect(row(report, "boot_runtime_devtools").status).not.toBe("PASS");
+  });
+
+  // defect.protect-preflight-refusal-copy-wrong-under-strict
+  it("protectPreflightExitCode and describeProtectPreflightBlockers agree on the blocking set for the same explicit strict value, even when it differs from report.strict", () => {
+    const undeterminedOnlyReport: ProtectPreflightReport = {
+      command: "sanctuary protect preflight",
+      generated_at: PRETEND_TIME.toISOString(),
+      // Deliberately built non-strict; the loop below still passes an
+      // explicit strict flag to both functions, the way cli.ts does.
+      strict: false,
+      summary: { pass: 0, fail: 0, undetermined: 1 },
+      rows: [
+        {
+          id: "provider_liveness",
+          check: "provider liveness",
+          status: "UNDETERMINED",
+          state: "credential_not_verifiable",
+          detail: "cannot prove the credential is valid",
+          remedy: "Verify manually.",
+          findings: ["F-12"],
+        },
+      ],
+    };
+
+    for (const strict of [false, true]) {
+      const exitCode = protectPreflightExitCode(undeterminedOnlyReport, strict);
+      const blockers = describeProtectPreflightBlockers(undeterminedOnlyReport, strict);
+      expect(exitCode === 2).toBe(blockers.length > 0);
+    }
+  });
+
+  // defect.protect-preflight-refusal-copy-wrong-under-strict
+  it("names the actual blocking status classes, including --strict-blocking UNDETERMINED rows, in describeProtectPreflightBlockers", () => {
+    const undeterminedOnlyStrict: ProtectPreflightReport = {
+      command: "sanctuary protect preflight",
+      generated_at: PRETEND_TIME.toISOString(),
+      strict: true,
+      summary: { pass: 0, fail: 0, undetermined: 1 },
+      rows: [
+        {
+          id: "provider_liveness",
+          check: "provider liveness",
+          status: "UNDETERMINED",
+          state: "credential_not_verifiable",
+          detail: "cannot prove the credential is valid",
+          remedy: "Verify manually.",
+          findings: ["F-12"],
+        },
+      ],
+    };
+
+    const message = describeProtectPreflightBlockers(undeterminedOnlyStrict);
+    expect(message).toContain("provider liveness");
+    expect(message).toContain("--strict");
+    expect(message).not.toContain("FAIL:");
+
+    // The same UNDETERMINED row is not named when --strict is off, since it
+    // does not block a non-strict run.
+    expect(
+      describeProtectPreflightBlockers({ ...undeterminedOnlyStrict, strict: false }),
+    ).toBe("");
+  });
+
+  // defect.protect-preflight-refusal-copy-wrong-under-strict
+  it("CLI refusal names the UNDETERMINED row under --strict instead of claiming FAIL rows exist", async () => {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit:${code ?? 0}`);
+    }) as never);
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const undeterminedOnlyStrictReport: ProtectPreflightReport = {
+      command: "sanctuary protect preflight",
+      generated_at: PRETEND_TIME.toISOString(),
+      strict: true,
+      summary: { pass: 0, fail: 0, undetermined: 1 },
+      rows: [
+        {
+          id: "provider_liveness",
+          check: "provider liveness",
+          status: "UNDETERMINED",
+          state: "credential_not_verifiable",
+          detail: "cannot prove the credential is valid",
+          remedy: "Verify manually.",
+          findings: ["F-12"],
+        },
+      ],
+    };
+    try {
+      await expect(
+        runWrap(
+          { protectCommand: true, hermes: true, preflightStrict: true },
+          { runProtectPreflight: async () => undeterminedOnlyStrictReport },
+        ),
+      ).rejects.toThrow("process.exit:2");
+      expect(exitSpy).toHaveBeenCalledWith(2);
+      const message = consoleErrorSpy.mock.calls.map((call) => String(call[0])).join("");
+      expect(message).toContain("Sanctuary protect refused before any host mutation");
+      // The refusal names only the rows that actually block.
+      expect(message).toContain("provider liveness");
+      expect(message).toContain("--strict");
+      expect(message).not.toContain("Fix the FAIL rows");
+    } finally {
+      exitSpy.mockRestore();
+      stderrSpy.mockRestore();
+      consoleErrorSpy.mockRestore();
+    }
+  });
 
   it("protect refuses before config detection or bootstrap when preflight fails", async () => {
     const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {

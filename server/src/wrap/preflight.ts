@@ -24,7 +24,8 @@ export type ProtectPreflightCheckId =
   | "sysext_approval"
   | "full_disk_access"
   | "provider_liveness"
-  | "operator_twin_services";
+  | "operator_twin_services"
+  | "boot_runtime_devtools";
 
 export interface ProtectPreflightProviderDetail {
   provider: string;
@@ -65,6 +66,13 @@ export interface ExecFileResult {
   stderr: string;
   errorCode?: string;
   signal?: string;
+  /**
+   * True when the subprocess was killed (timeout, maxBuffer, or an explicit
+   * signal) rather than exiting on its own. A killed process proves nothing
+   * about the command's own outcome, so a consumer must check this (and
+   * `signal`) before treating a nonzero `code` as a confirmed result.
+   */
+  killed?: boolean;
 }
 
 export type AccessKind = "read" | "execute";
@@ -162,6 +170,16 @@ interface ProviderDefinition {
   label: string;
   envNames: string[];
   buildRequest: (credential: string) => { url: string; request: ProviderHttpRequest };
+  /**
+   * A credential matching this provider's documented format (prefix and
+   * length), so it reaches the provider's own credential check rather than
+   * being rejected earlier on shape alone. Never a real secret; never
+   * derived from operator input; never logged or persisted -- it exists
+   * only to be presented to the provider and rejected.
+   *
+   * defect.preflight-provider-liveness-probe-not-authenticated
+   */
+  invalidCredentialProbe: string;
 }
 
 interface ConfiguredProvider {
@@ -193,6 +211,11 @@ const PROVIDER_CONFIG_RELPATHS = [
 ];
 
 const BILLING_DEAD_STATE = "billing_dead";
+// A provider's liveness probe must prove the *credential* was checked, not
+// merely that the endpoint is reachable. See ProviderDefinition.invalidCredentialProbe
+// and probeCredentialDiscrimination.
+//
+// defect.preflight-provider-liveness-probe-not-authenticated
 
 const PROVIDERS: ProviderDefinition[] = [
   {
@@ -206,6 +229,9 @@ const PROVIDERS: ProviderDefinition[] = [
         headers: { Authorization: `Bearer ${credential}` },
       },
     }),
+    // No fixed public key-length spec; length matches an opaque bearer
+    // token of typical size so it is at least plausible in shape.
+    invalidCredentialProbe: "preflight0preflight0preflight0preflight0preflight0preflight0pref",
   },
   {
     id: "openai",
@@ -218,6 +244,8 @@ const PROVIDERS: ProviderDefinition[] = [
         headers: { Authorization: `Bearer ${credential}` },
       },
     }),
+    // 51 = "sk-" (3) + 48-char body, the documented classic key length.
+    invalidCredentialProbe: "sk-preflight0preflight0preflight0preflight0prefligh",
   },
   {
     id: "anthropic",
@@ -233,6 +261,9 @@ const PROVIDERS: ProviderDefinition[] = [
         },
       },
     }),
+    // 108 = "sk-ant-api03-" (13) + 95-char body, matching the documented key length.
+    invalidCredentialProbe:
+      "sk-ant-api03-preflight0preflight0preflight0preflight0preflight0preflight0preflight0preflight0preflight0prefl",
   },
   {
     id: "google_gemini",
@@ -245,6 +276,11 @@ const PROVIDERS: ProviderDefinition[] = [
         headers: { "x-goog-api-key": credential },
       },
     }),
+    // 39 = "AIza" (4) + 35-char body, the documented fixed key length. This
+    // provider's endpoint does not distinguish an invalid credential from
+    // any other unregistered one, so this shape does not make the provider
+    // verifiable; see probeCredentialDiscrimination.
+    invalidCredentialProbe: "AIzapreflight0preflight0preflight0prefl", // gitleaks:allow — deliberately-invalid non-secret preflight sentinel
   },
   {
     id: "telegram",
@@ -254,6 +290,8 @@ const PROVIDERS: ProviderDefinition[] = [
       url: `https://api.telegram.org/bot${encodeURIComponent(credential)}/getMe`,
       request: { method: "GET" },
     }),
+    // 46 = 10-digit bot id + ":" (11) + 35-char secret, the documented shape.
+    invalidCredentialProbe: "0000000000:preflight0preflight0preflight0prefl",
   },
 ];
 
@@ -322,6 +360,7 @@ export async function runProtectPreflight(
     await checkFullDiskAccess(context),
     await checkProviderLiveness(context),
     await checkOperatorTwinServices(context),
+    await checkBootRuntimeDevTools(context),
   ];
   const summary = summarizeRows(rows);
 
@@ -334,13 +373,65 @@ export async function runProtectPreflight(
   };
 }
 
+interface ProtectPreflightBlockingRows {
+  failRows: ProtectPreflightRow[];
+  undeterminedBlockingRows: ProtectPreflightRow[];
+}
+
+/**
+ * The single source of truth for "which rows are why this preflight
+ * blocks". protectPreflightExitCode and describeProtectPreflightBlockers
+ * both call this instead of each independently recomputing the blocking
+ * set, so an exit code and a refusal message can never disagree about why a
+ * run refused. `strict` is taken as an explicit parameter rather than read
+ * off `report.strict` internally, so a caller cannot accidentally compute
+ * the exit code with one strict value and the message with another; cli.ts
+ * resolves `strict` once and passes that same value to both.
+ *
+ * defect.protect-preflight-refusal-copy-wrong-under-strict
+ */
+function protectPreflightBlockingRows(
+  report: ProtectPreflightReport,
+  strict: boolean,
+): ProtectPreflightBlockingRows {
+  return {
+    failRows: report.rows.filter((candidate) => candidate.status === "FAIL"),
+    undeterminedBlockingRows: strict
+      ? report.rows.filter((candidate) => candidate.status === "UNDETERMINED")
+      : [],
+  };
+}
+
 export function protectPreflightExitCode(
   report: ProtectPreflightReport,
   strict = report.strict,
 ): number {
-  if (report.summary.fail > 0) return 2;
-  if (strict && report.summary.undetermined > 0) return 2;
-  return 0;
+  const { failRows, undeterminedBlockingRows } = protectPreflightBlockingRows(report, strict);
+  return failRows.length > 0 || undeterminedBlockingRows.length > 0 ? 2 : 0;
+}
+
+/**
+ * Names the rows actually responsible for a nonzero protectPreflightExitCode:
+ * under --strict an UNDETERMINED row blocks exactly like a FAIL row, so a
+ * refusal message that only ever says "Fix the FAIL rows" is actively wrong
+ * on a FAIL-0/UNDETERMINED-1 strict refusal -- the operator sees no FAIL row
+ * and no instruction that matches what is on screen.
+ */
+export function describeProtectPreflightBlockers(
+  report: ProtectPreflightReport,
+  strict = report.strict,
+): string {
+  const { failRows, undeterminedBlockingRows } = protectPreflightBlockingRows(report, strict);
+  const parts: string[] = [];
+  if (failRows.length > 0) {
+    parts.push(`FAIL: ${failRows.map((candidate) => candidate.check).join(", ")}`);
+  }
+  if (undeterminedBlockingRows.length > 0) {
+    parts.push(
+      `UNDETERMINED, which --strict also blocks on: ${undeterminedBlockingRows.map((candidate) => candidate.check).join(", ")}`,
+    );
+  }
+  return parts.join("; ");
 }
 
 export function renderProtectPreflightJson(report: ProtectPreflightReport): string {
@@ -389,6 +480,7 @@ async function defaultExecFile(cmd: string, args: string[]): Promise<ExecFileRes
       stdout?: unknown;
       stderr?: unknown;
       signal?: unknown;
+      killed?: unknown;
     };
     return {
       code: typeof error.code === "number" ? error.code : 1,
@@ -396,6 +488,10 @@ async function defaultExecFile(cmd: string, args: string[]): Promise<ExecFileRes
       stderr: String(error.stderr ?? error.message ?? ""),
       errorCode: typeof error.code === "string" ? error.code : undefined,
       signal: typeof error.signal === "string" ? error.signal : undefined,
+      // A timeout/maxBuffer kill reports code:null (neither a number nor a
+      // string), so it falls through to code:1 above with no errorCode --
+      // `killed` is what actually distinguishes it from a genuine exit 1.
+      killed: typeof error.killed === "boolean" ? error.killed : undefined,
     };
   }
 }
@@ -1438,6 +1534,13 @@ function extractCredential(raw: string, key: string): string | undefined {
   return raw.match(pattern)?.[1];
 }
 
+// rule 7: a row may claim only what the evidence proves. Reachability alone
+// (a success response to the configured credential) is not evidence of
+// validity; only a genuine rejection of a known-wrong credential at the same
+// endpoint is. Where an endpoint cannot produce that evidence, the honest
+// bound is UNDETERMINED -- "reachable, not verifiable" -- never a PASS.
+//
+// defect.preflight-provider-liveness-probe-not-authenticated
 async function probeProvider(
   ops: ProtectPreflightOps,
   configured: ConfiguredProvider,
@@ -1446,12 +1549,45 @@ async function probeProvider(
     const request = configured.definition.buildRequest(configured.credential);
     const response = await ops.fetch(request.url, request.request);
     if (response.status >= 200 && response.status < 300) {
+      const discrimination = await probeCredentialDiscrimination(
+        ops,
+        configured.definition,
+      );
+      if (discrimination.kind === "rejected") {
+        return {
+          provider: configured.definition.label,
+          source: configured.source,
+          status: "PASS",
+          state: "live",
+          detail: "the provider rejected an invalid credential at this endpoint, so the configured credential's success reflects a real check",
+        };
+      }
+      if (discrimination.kind === "not_discriminating") {
+        return {
+          provider: configured.definition.label,
+          source: configured.source,
+          status: "UNDETERMINED",
+          state: "credential_not_verifiable",
+          detail:
+            "provider endpoint reachable; credential validity not verifiable at the available endpoint (it accepted an invalid credential too)",
+        };
+      }
+      if (discrimination.kind === "inconclusive") {
+        return {
+          provider: configured.definition.label,
+          source: configured.source,
+          status: "UNDETERMINED",
+          state: "credential_discrimination_inconclusive",
+          detail:
+            "provider endpoint reachable; credential validity not verifiable at the available endpoint (the invalid-credential probe did not return a recognized rejection)",
+        };
+      }
       return {
         provider: configured.definition.label,
         source: configured.source,
-        status: "PASS",
-        state: "live",
-        detail: "authenticated liveness probe returned HTTP 2xx",
+        status: "UNDETERMINED",
+        state: "credential_discrimination_probe_failed",
+        detail: `provider endpoint reachable; credential validity not verifiable at the available endpoint (the follow-up probe could not complete: ${discrimination.reason})`,
       };
     }
     if (response.status === 402) {
@@ -1482,6 +1618,41 @@ async function probeProvider(
       state: "network_error",
       detail: `operator-side provider probe failed (${safeProviderError(err)})`,
     };
+  }
+}
+
+type CredentialDiscrimination =
+  | { kind: "rejected"; status: number }
+  | { kind: "not_discriminating" }
+  | { kind: "inconclusive"; status: number }
+  | { kind: "probe_failed"; reason: string };
+
+/**
+ * Re-probe the same provider endpoint with a credential guaranteed to be
+ * wrong, applied uniformly to every provider descriptor so an unverified
+ * provider degrades to UNDETERMINED rather than a false PASS. Only a
+ * genuine authentication-rejection status counts as proof the credential
+ * was checked; any other non-success status is not evidence of that and is
+ * treated as inconclusive.
+ *
+ * defect.preflight-provider-liveness-probe-not-authenticated
+ */
+async function probeCredentialDiscrimination(
+  ops: ProtectPreflightOps,
+  definition: ProviderDefinition,
+): Promise<CredentialDiscrimination> {
+  try {
+    const probeRequest = definition.buildRequest(definition.invalidCredentialProbe);
+    const response = await ops.fetch(probeRequest.url, probeRequest.request);
+    if (response.status >= 200 && response.status < 300) {
+      return { kind: "not_discriminating" };
+    }
+    if (response.status === 401 || response.status === 403) {
+      return { kind: "rejected", status: response.status };
+    }
+    return { kind: "inconclusive", status: response.status };
+  } catch (err) {
+    return { kind: "probe_failed", reason: safeProviderError(err) };
   }
 }
 
@@ -1618,6 +1789,121 @@ function launchctlMissingService(result: ExecFileResult): boolean {
   );
 }
 
+const XCODE_SELECT_PATH = "/usr/bin/xcode-select";
+const OTOOL_PATH = "/usr/bin/otool";
+// A binary guaranteed present on any macOS host, safe to inspect read-only
+// (no side effects), used only as an otool target -- never executed.
+const OTOOL_PROBE_TARGET = "/bin/ls";
+// Must match the developer-tools dependency in castle-wall-boot-runtime.ts:
+// installBootRuntimeSnapshot() calls verifySystemOnlyDynamicLibraries(),
+// which shells out to otool -L.
+//
+// defect.boot-installer-requires-devtools-unchecked-by-preflight
+const XCODE_CLT_REMEDY = "Run: xcode-select --install";
+
+/**
+ * FAIL when the Castle Wall boot-runtime install's otool-based
+ * dynamic-library inspection would hit a missing or broken Command Line
+ * Tools dependency, so a cold operator learns the gap here (read-only)
+ * instead of mid-install. This preflight only detects the gap; removing the
+ * otool dependency from the installer is a separate, larger change.
+ */
+async function checkBootRuntimeDevTools(
+  context: ProtectPreflightContext,
+): Promise<ProtectPreflightRow> {
+  if (context.platform !== "darwin") {
+    return row({
+      id: "boot_runtime_devtools",
+      check: "boot runtime devtools",
+      status: "UNDETERMINED",
+      state: "not_darwin",
+      detail: "The Castle Wall boot-runtime install's otool dependency is only meaningful on macOS.",
+      remedy: "Run this preflight on the macOS host that will install the boot runtime.",
+      findings: ["F-14"],
+    });
+  }
+
+  const xcodeSelect = await context.ops.execFile(XCODE_SELECT_PATH, ["-p"]);
+  if (!(xcodeSelect.code === 0 && xcodeSelect.stdout.trim().length > 0)) {
+    // xcode-select ran and reported no active developer directory (its real
+    // exit shape when Command Line Tools are absent) -- a genuine, confirmed
+    // FAIL, distinct from the probe itself failing to run OR being killed
+    // (a timeout/maxBuffer kill reports no errorCode but sets signal/killed,
+    // and proves nothing about xcode-select's own outcome).
+    if (!execProbeWasInconclusive(xcodeSelect)) {
+      return row({
+        id: "boot_runtime_devtools",
+        check: "boot runtime devtools",
+        status: "FAIL",
+        state: "developer_tools_missing",
+        detail:
+          `Command Line Tools are not installed (xcode-select -p: ${formatExecFailure(xcodeSelect)}); ` +
+          "the Castle Wall boot-runtime install shells out to otool -L and will fail mid-mutation without them.",
+        remedy: XCODE_CLT_REMEDY,
+        findings: ["F-14"],
+      });
+    }
+    // The probe itself could not run (e.g. xcode-select missing or blocked
+    // outright) -- this preflight cannot distinguish "absent" from
+    // "blocked", so it reports UNDETERMINED rather than a FAIL it cannot
+    // back up.
+    return row({
+      id: "boot_runtime_devtools",
+      check: "boot runtime devtools",
+      status: "UNDETERMINED",
+      state: "developer_tools_probe_unknown",
+      detail: `Could not run xcode-select -p to check for Command Line Tools: ${formatExecFailure(xcodeSelect)}.`,
+      remedy: "Run `xcode-select -p` manually and install Command Line Tools if it reports none.",
+      findings: ["F-14"],
+    });
+  }
+
+  // xcode-select reporting an active developer directory does not prove the
+  // exact tool the boot-runtime install invokes still works: a partial or
+  // stale toolchain can leave xcode-select pointed at a directory whose
+  // otool is broken. Exercise otool -L itself, read-only, against a stable
+  // system binary, before this row can PASS.
+  const otoolProbe = await context.ops.execFile(OTOOL_PATH, ["-L", OTOOL_PROBE_TARGET]);
+  const otoolProducedDependencyOutput =
+    otoolProbe.code === 0 && /\(compatibility version/.test(otoolProbe.stdout);
+  if (otoolProducedDependencyOutput) {
+    return row({
+      id: "boot_runtime_devtools",
+      check: "boot runtime devtools",
+      status: "PASS",
+      state: "developer_tools_present",
+      detail:
+        `Command Line Tools are installed (active developer directory: ${xcodeSelect.stdout.trim()}) ` +
+        `and otool -L ${OTOOL_PROBE_TARGET} produced dependency output; the boot-runtime install's otool dependency will resolve.`,
+      remedy: NO_REMEDY,
+      findings: ["F-14"],
+    });
+  }
+  if (!execProbeWasInconclusive(otoolProbe)) {
+    return row({
+      id: "boot_runtime_devtools",
+      check: "boot runtime devtools",
+      status: "FAIL",
+      state: "developer_tools_broken",
+      detail:
+        `xcode-select reports an active developer directory (${xcodeSelect.stdout.trim()}), but ` +
+        `otool -L ${OTOOL_PROBE_TARGET} did not produce usable dependency output (${formatExecFailure(otoolProbe)}); ` +
+        "the Castle Wall boot-runtime install shells out to this exact command and would fail mid-mutation.",
+      remedy: XCODE_CLT_REMEDY,
+      findings: ["F-14"],
+    });
+  }
+  return row({
+    id: "boot_runtime_devtools",
+    check: "boot runtime devtools",
+    status: "UNDETERMINED",
+    state: "otool_probe_unknown",
+    detail: `xcode-select reports an active developer directory, but otool -L could not be run to confirm it works: ${formatExecFailure(otoolProbe)}.`,
+    remedy: `Run \`otool -L ${OTOOL_PROBE_TARGET}\` manually and reinstall Command Line Tools if it fails.`,
+    findings: ["F-14"],
+  });
+}
+
 function row(input: ProtectPreflightRow): ProtectPreflightRow {
   return input;
 }
@@ -1647,6 +1933,18 @@ function safeProviderError(error: unknown): string {
   const code = errorCode(error);
   const name = error instanceof Error ? error.name : "unknown_error";
   return code === undefined ? name : `${name}:${code}`;
+}
+
+/**
+ * True when a subprocess result cannot be read as the command's own
+ * outcome: a spawn-level error (errorCode), a signal, or an explicit
+ * `killed` flag all mean something outside the command's own logic ended
+ * it (a timeout kill is exactly this shape: no errorCode, `signal` set).
+ * A consumer must treat this as "the probe didn't run to a real result"
+ * (UNDETERMINED), never as a confirmed pass or fail.
+ */
+function execProbeWasInconclusive(result: ExecFileResult): boolean {
+  return result.errorCode !== undefined || result.signal !== undefined || result.killed === true;
 }
 
 function formatExecFailure(result: ExecFileResult): string {
