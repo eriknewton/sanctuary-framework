@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import {
   createProtectPreflightOps,
   describeProtectPreflightBlockers,
+  describeProtectPreflightStrictWarnings,
   protectPreflightExitCode,
   renderProtectPreflightJson,
   renderProtectPreflightReport,
@@ -798,7 +799,170 @@ describe("protect preflight", () => {
     // the two would have justified a PASS.
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(protectPreflightExitCode(report)).toBe(0);
-    expect(protectPreflightExitCode(report, true)).toBe(2);
+    // Reachable-but-credential-unverifiable is the honest-UNDETERMINED
+    // shape strict-arm allows through (see the block below): the 2xx to the
+    // configured credential already proved the endpoint reachable, so
+    // strict no longer blocks on this specific row.
+    //
+    // defect.strict-arm-blocks-on-reachable-unverifiable-provider
+    expect(protectPreflightExitCode(report, true)).toBe(0);
+  });
+
+  // defect.strict-arm-blocks-on-reachable-unverifiable-provider
+  describe("strict-arm and the reachable-unverifiable provider", () => {
+    it("(a)+(f) strict allows arming with a WARN when a provider is reachable but credential-unverifiable, and the row stays honestly UNDETERMINED", async () => {
+      const report = await runProtectPreflight({
+        ops: fixtureOps({
+          env: baseEnv({ OPENAI_API_KEY: "", VENICE_API_KEY: "clearly-not-a-real-venice-key-0000" }),
+          fetch: async () => ({ status: 200 }),
+        }),
+      });
+
+      const providerRow = row(report, "provider_liveness");
+      // (f) honesty preserved: never relabeled PASS.
+      expect(providerRow.status).toBe("UNDETERMINED");
+      expect(providerRow.providers?.[0]).toMatchObject({
+        status: "UNDETERMINED",
+        state: "credential_not_verifiable",
+        reachableUnverifiable: true,
+      });
+      // (a) strict no longer blocks on this row alone.
+      expect(protectPreflightExitCode(report, true)).toBe(0);
+      expect(describeProtectPreflightBlockers(report, true)).toBe("");
+      const warnings = describeProtectPreflightStrictWarnings(report, true);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("Venice");
+      expect(warnings[0]).toContain("could not be verified");
+    });
+
+    it("(b) strict still refuses on an unreachable provider", async () => {
+      const report = await runProtectPreflight({
+        ops: fixtureOps({
+          env: baseEnv({ OPENAI_API_KEY: "", VENICE_API_KEY: "test-venice-key" }),
+          fetch: async () => {
+            throw new Error("ECONNREFUSED");
+          },
+        }),
+      });
+
+      const providerRow = row(report, "provider_liveness");
+      expect(providerRow.status).toBe("FAIL");
+      expect(providerRow.providers?.[0]).toMatchObject({
+        status: "FAIL",
+        state: "network_error",
+        reachableUnverifiable: false,
+      });
+      expect(protectPreflightExitCode(report, true)).toBe(2);
+      expect(protectPreflightExitCode(report, false)).toBe(2);
+      expect(describeProtectPreflightStrictWarnings(report, true)).toEqual([]);
+    });
+
+    it("(c) strict still refuses on a provably-bad credential (a real 401)", async () => {
+      const report = await runProtectPreflight({
+        ops: fixtureOps({
+          env: baseEnv({ OPENAI_API_KEY: "test-openai-key" }),
+          fetch: async () => ({ status: 401 }),
+        }),
+      });
+
+      const providerRow = row(report, "provider_liveness");
+      expect(providerRow.status).toBe("FAIL");
+      expect(providerRow.providers?.[0]).toMatchObject({
+        status: "FAIL",
+        state: "auth_failed",
+        reachableUnverifiable: false,
+      });
+      expect(protectPreflightExitCode(report, true)).toBe(2);
+      expect(protectPreflightExitCode(report, false)).toBe(2);
+      expect(describeProtectPreflightStrictWarnings(report, true)).toEqual([]);
+    });
+
+    it("(d) strict still refuses on an UNDETERMINED row from a non-provider check, even with a healthy provider", async () => {
+      // Linux has no darwin-only surfaces to probe, so several checks read
+      // "not_darwin" UNDETERMINED while provider_liveness (which never
+      // gates on platform) resolves cleanly with OpenAI's real rejection of
+      // an invalid credential.
+      const report = await runProtectPreflight({
+        ops: fixtureOps({ platform: "linux" }),
+      });
+
+      const providerRow = row(report, "provider_liveness");
+      expect(providerRow.status).toBe("PASS");
+      expect(row(report, "castle_sock_holder")).toMatchObject({
+        status: "UNDETERMINED",
+        state: "not_darwin",
+      });
+      expect(protectPreflightExitCode(report, true)).toBe(2);
+      expect(describeProtectPreflightBlockers(report, true)).toContain("castle.sock holder");
+      // No provider triggered the carve-out, so there is nothing to warn
+      // about even though strict still refuses for an unrelated reason.
+      expect(describeProtectPreflightStrictWarnings(report, true)).toEqual([]);
+    });
+
+    it("(e) non-strict behavior is unchanged: a reachable-unverifiable provider never blocked and still doesn't", async () => {
+      const report = await runProtectPreflight({
+        ops: fixtureOps({
+          env: baseEnv({ OPENAI_API_KEY: "", VENICE_API_KEY: "clearly-not-a-real-venice-key-0000" }),
+          fetch: async () => ({ status: 200 }),
+        }),
+      });
+
+      expect(protectPreflightExitCode(report, false)).toBe(0);
+      expect(describeProtectPreflightStrictWarnings(report, false)).toEqual([]);
+    });
+
+    it("CLI: --strict arm proceeds (exit 0) and prints a WARN naming the provider, instead of refusing", async () => {
+      const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+        throw new Error(`process.exit:${code ?? 0}`);
+      }) as never);
+      const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const reachableUnverifiableReport: ProtectPreflightReport = {
+        command: "sanctuary protect preflight",
+        generated_at: PRETEND_TIME.toISOString(),
+        strict: true,
+        summary: { pass: 0, fail: 0, undetermined: 1 },
+        rows: [
+          {
+            id: "provider_liveness",
+            check: "provider liveness",
+            status: "UNDETERMINED",
+            state: "provider_probe_unknown",
+            detail: "Venice: credential_not_verifiable (provider endpoint reachable; credential validity not verifiable at the available endpoint; source env:VENICE_API_KEY)",
+            remedy: "Verify each configured provider from the operator account before arming Castle Wall.",
+            findings: ["F-12"],
+            providers: [
+              {
+                provider: "Venice",
+                source: "env:VENICE_API_KEY",
+                status: "UNDETERMINED",
+                state: "credential_not_verifiable",
+                detail:
+                  "provider endpoint reachable; credential validity not verifiable at the available endpoint (it accepted an invalid credential too)",
+                reachableUnverifiable: true,
+              },
+            ],
+          },
+        ],
+      };
+      try {
+        await expect(
+          runWrap(
+            { protectCommand: true, hermes: true, preflight: true, preflightStrict: true },
+            { runProtectPreflight: async () => reachableUnverifiableReport },
+          ),
+        ).rejects.toThrow("process.exit:0");
+        expect(exitSpy).toHaveBeenCalledWith(0);
+        const message = consoleErrorSpy.mock.calls.map((call) => String(call[0])).join("");
+        expect(message).toContain("WARNING");
+        expect(message).toContain("Venice");
+        expect(message).toContain("could not be verified");
+      } finally {
+        exitSpy.mockRestore();
+        stderrSpy.mockRestore();
+        consoleErrorSpy.mockRestore();
+      }
+    });
   });
 
   it("still PASSes provider liveness when the endpoint genuinely rejects an invalid credential", async () => {
