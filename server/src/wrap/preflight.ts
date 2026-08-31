@@ -33,6 +33,19 @@ export interface ProtectPreflightProviderDetail {
   status: ProtectPreflightStatus;
   state: string;
   detail: string;
+  /**
+   * True exactly when this provider's own endpoint returned a genuine 2xx
+   * to the CONFIGURED credential (proving the endpoint is reachable) and
+   * the only reason `status` is UNDETERMINED is that the endpoint cannot
+   * independently prove the credential's validity. Required (not derived
+   * from `state` strings or `detail` prose) so a strict-arm consumer has
+   * one explicit fact to key on instead of enumerating state names; every
+   * call site must set it, so a new UNDETERMINED cause defaults to
+   * non-reachable rather than silently becoming non-blocking.
+   *
+   * defect.strict-arm-blocks-on-reachable-unverifiable-provider
+   */
+  reachableUnverifiable: boolean;
 }
 
 export interface ProtectPreflightRow {
@@ -379,6 +392,35 @@ interface ProtectPreflightBlockingRows {
 }
 
 /**
+ * True only for the provider_liveness row's specific reachable-but-
+ * credential-unverifiable shape: every provider the row reports is either
+ * PASS or an UNDETERMINED whose own `reachableUnverifiable` flag is set (a
+ * row with no `providers` array, e.g. no_configured_provider, never proved
+ * reachability and cannot qualify). Strict-arm reads this instead of the
+ * row's `state` string or `check` name so a new UNDETERMINED cause defaults
+ * to blocking until it explicitly proves reachability through the typed
+ * field.
+ *
+ * The per-provider check requires `status === "UNDETERMINED"` alongside the
+ * flag, not the flag alone: `reachableUnverifiable` only means anything on
+ * an UNDETERMINED provider, and a FAIL-status provider carrying the flag
+ * (a malformed/defensive shape, never produced by probeProvider today) must
+ * never be read as carve-out-eligible -- a FAIL row always blocks under
+ * strict regardless of what any boolean field on it claims.
+ *
+ * defect.strict-arm-blocks-on-reachable-unverifiable-provider
+ */
+function isProviderLivenessReachableUnverifiable(row: ProtectPreflightRow): boolean {
+  if (row.id !== "provider_liveness" || row.status !== "UNDETERMINED") return false;
+  if (row.providers === undefined || row.providers.length === 0) return false;
+  return row.providers.every(
+    (provider) =>
+      provider.status === "PASS" ||
+      (provider.status === "UNDETERMINED" && provider.reachableUnverifiable === true),
+  );
+}
+
+/**
  * The single source of truth for "which rows are why this preflight
  * blocks". protectPreflightExitCode and describeProtectPreflightBlockers
  * both call this instead of each independently recomputing the blocking
@@ -397,9 +439,45 @@ function protectPreflightBlockingRows(
   return {
     failRows: report.rows.filter((candidate) => candidate.status === "FAIL"),
     undeterminedBlockingRows: strict
-      ? report.rows.filter((candidate) => candidate.status === "UNDETERMINED")
+      ? report.rows.filter(
+          (candidate) =>
+            candidate.status === "UNDETERMINED" &&
+            // A reachable-but-credential-unverifiable provider is proven
+            // reachable and never proven bad; strict blocks on unreachable
+            // or provably-bad, not on an honest bound the endpoint itself
+            // cannot resolve. Every other UNDETERMINED cause still blocks.
+            !isProviderLivenessReachableUnverifiable(candidate),
+        )
       : [],
   };
+}
+
+/**
+ * Operator-facing WARN lines for provider_liveness rows that strict allowed
+ * through specifically because of the reachable-unverifiable carve-out
+ * above -- printed only under strict, since that is the only mode in which
+ * this state would otherwise have blocked and the operator needs to know
+ * arming proceeded on an unverified credential.
+ *
+ * defect.strict-arm-blocks-on-reachable-unverifiable-provider
+ */
+export function describeProtectPreflightStrictWarnings(
+  report: ProtectPreflightReport,
+  strict: boolean,
+): string[] {
+  if (!strict) return [];
+  const warnings: string[] = [];
+  for (const candidate of report.rows) {
+    if (!isProviderLivenessReachableUnverifiable(candidate)) continue;
+    for (const provider of candidate.providers ?? []) {
+      if (provider.status === "UNDETERMINED" && provider.reachableUnverifiable) {
+        warnings.push(
+          `${provider.provider}: credential could not be verified at this endpoint (${provider.detail}); --strict is allowing arming to proceed because the endpoint is reachable.`,
+        );
+      }
+    }
+  }
+  return warnings;
 }
 
 export function protectPreflightExitCode(
@@ -412,10 +490,12 @@ export function protectPreflightExitCode(
 
 /**
  * Names the rows actually responsible for a nonzero protectPreflightExitCode:
- * under --strict an UNDETERMINED row blocks exactly like a FAIL row, so a
- * refusal message that only ever says "Fix the FAIL rows" is actively wrong
- * on a FAIL-0/UNDETERMINED-1 strict refusal -- the operator sees no FAIL row
- * and no instruction that matches what is on screen.
+ * under --strict an UNDETERMINED row blocks like a FAIL row (except the
+ * provider_liveness reachable-unverifiable carve-out in
+ * protectPreflightBlockingRows), so a refusal message that only ever says
+ * "Fix the FAIL rows" is actively wrong on a FAIL-0/UNDETERMINED-1 strict
+ * refusal -- the operator sees no FAIL row and no instruction that matches
+ * what is on screen.
  */
 export function describeProtectPreflightBlockers(
   report: ProtectPreflightReport,
@@ -605,6 +685,13 @@ async function defaultFetch(
       method: request.method,
       headers: request.headers,
       signal: controller.signal,
+      // A followed redirect keeps only the FINAL response's status, which
+      // may be an unrelated 200 at a different origin -- that is not
+      // evidence the provider's own endpoint responded at all, let alone
+      // that it did or didn't discriminate a credential. Refusing to follow
+      // makes a redirect surface as a thrown error here, which the caller's
+      // catch already treats as unreachable/probe-failed (never a success).
+      redirect: "error",
     };
     const response = await fetch(url, init);
     return { status: response.status };
@@ -1560,6 +1647,7 @@ async function probeProvider(
           status: "PASS",
           state: "live",
           detail: "the provider rejected an invalid credential at this endpoint, so the configured credential's success reflects a real check",
+          reachableUnverifiable: false,
         };
       }
       if (discrimination.kind === "not_discriminating") {
@@ -1570,6 +1658,15 @@ async function probeProvider(
           state: "credential_not_verifiable",
           detail:
             "provider endpoint reachable; credential validity not verifiable at the available endpoint (it accepted an invalid credential too)",
+          // `reachableUnverifiable` means the discrimination probe itself
+          // returned a SUCCESS status that accepted the known-wrong
+          // credential exactly as it accepted the configured one -- that is
+          // demonstrated non-discrimination, never merely "we reached the
+          // host". This is the only outcome of probeCredentialDiscrimination
+          // that proves it; a non-success on that probe (5xx, timeout, TLS
+          // failure) proves nothing about the endpoint's discrimination
+          // behavior and must not set this flag (see the two branches below).
+          reachableUnverifiable: true,
         };
       }
       if (discrimination.kind === "inconclusive") {
@@ -1580,6 +1677,13 @@ async function probeProvider(
           state: "credential_discrimination_inconclusive",
           detail:
             "provider endpoint reachable; credential validity not verifiable at the available endpoint (the invalid-credential probe did not return a recognized rejection)",
+          // A non-success, non-rejection status on the discrimination probe
+          // (e.g. 5xx, 429) is not evidence the endpoint fails to
+          // discriminate -- it may simply be down or rate-limited while the
+          // configured-credential request happened to land first. Without
+          // demonstrated non-discrimination this must block under strict,
+          // the same as an unreachable or provably-bad provider.
+          reachableUnverifiable: false,
         };
       }
       return {
@@ -1588,6 +1692,12 @@ async function probeProvider(
         status: "UNDETERMINED",
         state: "credential_discrimination_probe_failed",
         detail: `provider endpoint reachable; credential validity not verifiable at the available endpoint (the follow-up probe could not complete: ${discrimination.reason})`,
+        // The follow-up probe never completed (network error, timeout, TLS
+        // failure) -- it produced no evidence either way about whether the
+        // endpoint discriminates. The earlier 2xx on the configured
+        // credential's own request is not a substitute for that evidence, so
+        // this must block under strict rather than carve out.
+        reachableUnverifiable: false,
       };
     }
     if (response.status === 402) {
@@ -1597,6 +1707,7 @@ async function probeProvider(
         status: "FAIL",
         state: BILLING_DEAD_STATE,
         detail: "provider returned HTTP 402 billing_dead",
+        reachableUnverifiable: false,
       };
     }
     const state =
@@ -1609,6 +1720,7 @@ async function probeProvider(
       status: "FAIL",
       state,
       detail: `provider returned HTTP ${response.status}`,
+      reachableUnverifiable: false,
     };
   } catch (err) {
     return {
@@ -1617,6 +1729,9 @@ async function probeProvider(
       status: "FAIL",
       state: "network_error",
       detail: `operator-side provider probe failed (${safeProviderError(err)})`,
+      // The request itself never completed, so this is the unreachable
+      // case, not the reachable-but-unverifiable one.
+      reachableUnverifiable: false,
     };
   }
 }

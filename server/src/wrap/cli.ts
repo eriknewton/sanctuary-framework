@@ -98,6 +98,7 @@ import {
 import { runLocalIntelligenceSetup } from "./local-intelligence.js";
 import {
   describeProtectPreflightBlockers,
+  describeProtectPreflightStrictWarnings,
   protectPreflightExitCode,
   renderProtectPreflightJson,
   renderProtectPreflightReport,
@@ -3127,6 +3128,15 @@ export async function runWrap(
       process.stdout.write(renderProtectPreflightJson(preflight));
     } else {
       process.stderr.write(`\n${renderProtectPreflightReport(preflight)}`);
+      for (const warning of describeProtectPreflightStrictWarnings(preflight, preflightStrict)) {
+        // SAFETY: stderr is the operator-facing CLI channel; names only the
+        // provider label and its own honest UNDETERMINED detail, never a
+        // credential value. Printed only in the human-readable path so the
+        // JSON report (already carrying providers[].reachableUnverifiable)
+        // stays the single machine-readable source.
+        // defect.strict-arm-blocks-on-reachable-unverifiable-provider
+        console.error(`  WARNING: ${warning}\n`);
+      }
     }
     if (options.preflight === true) {
       process.exit(preflightCode);
