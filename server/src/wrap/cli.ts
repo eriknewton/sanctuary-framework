@@ -97,6 +97,7 @@ import {
 } from "./auto-provision.js";
 import { runLocalIntelligenceSetup } from "./local-intelligence.js";
 import {
+  describeProtectPreflightBlockers,
   protectPreflightExitCode,
   renderProtectPreflightJson,
   renderProtectPreflightReport,
@@ -3109,16 +3110,19 @@ export async function runWrap(
     options.repairEgressGate !== true &&
     options.unprotectEgressGate !== true;
   if (options.protectCommand === true && (options.preflight === true || protectInstallFlow)) {
+    // Resolved once and passed explicitly to both the exit-code and the
+    // refusal-message computation below, so the two can never be handed
+    // different strict values.
+    //
+    // defect.protect-preflight-refusal-copy-wrong-under-strict
+    const preflightStrict = options.preflightStrict === true;
     const preflight = await (deps.runProtectPreflight ?? runProtectPreflight)({
-      strict: options.preflightStrict === true,
+      strict: preflightStrict,
       sealedLauncherPath: options.sealedLauncher,
       allowMatchingBootDaemon:
         protectInstallFlow && options.preflight !== true,
     });
-    const preflightCode = protectPreflightExitCode(
-      preflight,
-      options.preflightStrict === true,
-    );
+    const preflightCode = protectPreflightExitCode(preflight, preflightStrict);
     if (options.preflightJson === true) {
       process.stdout.write(renderProtectPreflightJson(preflight));
     } else {
@@ -3128,9 +3132,14 @@ export async function runWrap(
       process.exit(preflightCode);
     }
     if (preflightCode !== 0) {
-      // SAFETY: stderr is the operator-facing CLI channel; this fixed text names only preflight status.
+      // SAFETY: stderr is the operator-facing CLI channel; this names only
+      // the blocking rows' check names and status class (FAIL vs.
+      // strict-blocking UNDETERMINED), never row detail/remedy text. It is
+      // computed from the same rows protectPreflightExitCode used, so the
+      // message can't name a status class that isn't why we refused.
+      // defect.protect-preflight-refusal-copy-wrong-under-strict
       console.error(
-        "  Sanctuary protect refused before any host mutation. Fix the FAIL rows and re-run.\n",
+        `  Sanctuary protect refused before any host mutation: ${describeProtectPreflightBlockers(preflight, preflightStrict)}. Fix the named rows and re-run.\n`,
       );
       process.exit(preflightCode);
     }
