@@ -7,13 +7,13 @@ layout: null
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sanctuary. The open source standard for secure, private AI.</title>
-<meta name="description" content="Your agent will know you better than you know yourself. Make sure that stays between you. Sanctuary is the open source standard for secure, private AI: operating-system enforcement is live on macOS today; Linux and Windows are not live enforcement yet, and your data stays under your own keys with current portability bounds called out in the Assurance Matrix.">
+<meta name="description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level with keys only you hold. Live today on macOS; Linux and Windows coming soon.">
 <meta name="author" content="Erik Newton">
 <meta name="theme-color" content="#0b1326">
 
 <!-- Open Graph -->
 <meta property="og:title" content="Sanctuary. The open source standard for secure, private AI.">
-<meta property="og:description" content="Your agent will know you better than you know yourself. Make sure that stays between you. Operating-system enforcement is live on macOS today; Linux and Windows are not live enforcement yet, and your data stays under your own keys with current portability bounds called out in the Assurance Matrix. Any agent, local or cloud, solo or fleet. Apache-2.0. Install with npx.">
+<meta property="og:description" content="Your agent knows a lot about you. Sanctuary keeps that information private. A firewall for your AI agent that runs on your own Mac, enforcing what it can reach at the operating-system level with keys only you hold. Live today on macOS; Linux and Windows coming soon. Apache-2.0. Install with npx.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://sanctuaryprotocol.ai/">
 <meta property="og:site_name" content="Sanctuary Protocol">
@@ -61,21 +61,23 @@ layout: null
   <section class="hero container" aria-labelledby="hero-title">
     <div class="hero__eyebrow">
       <span class="hero__eyebrow-dot" aria-hidden="true"></span>
-      <span class="eyebrow">Open source · Apache-2.0 · v1.6.1 stable on npm</span>
+      <span class="eyebrow">Open source · Apache-2.0 · v1.7.2 stable on npm</span>
     </div>
 
     <h1 id="hero-title" class="hero__title">
-      Your agent will know you<br>
-      better than you know yourself.<br>
-      <span class="text-gradient">Make sure that stays between you.</span>
+      Your agent knows a lot about you.<br>
+      <span class="text-gradient">Sanctuary keeps that information private.</span>
     </h1>
 
     <p class="hero__sub">
-      Sanctuary is the open source standard for secure, private AI: operating-system enforcement
-      is live on macOS today; Linux and Windows are not live enforcement yet, and your data stays
-      under your own keys with current portability bounds called out in the Assurance Matrix.
-      Any agent, local or cloud, solo or fleet. One command to get started.
-      One dashboard to secure them all.
+      Sanctuary is a firewall for your AI agent that runs on your own Mac. It enforces what the
+      agent is allowed to reach at the operating-system level, with keys only you hold, so a
+      prompt-injected or jailbroken agent cannot route around it or shut it off. The enforcement
+      lives below the agent, inside the operating system itself.
+    </p>
+
+    <p class="hero__sub" style="opacity:0.66;margin-top:-0.75rem;">
+      Live today on macOS. Linux and Windows coming soon.
     </p>
 
     <!-- Install block -->
@@ -101,7 +103,7 @@ layout: null
     </div>
 
     <div class="hero__stats" aria-label="Project stats">
-      <div class="hero__stat"><strong>5</strong><span>Castle layers</span></div>
+      <div class="hero__stat"><strong>4</strong><span>Castle layers</span></div>
       <div class="hero__stat"><strong>0</strong><span>Harness changes</span></div>
     </div>
   </section>
@@ -115,7 +117,7 @@ layout: null
         <p>
           Sanctuary runs on your hardware with your keys. Policy-gated calls route through local
           approval surfaces, and Castle Wall enforcement follows the platform bounds in the
-          Assurance Matrix. Point any MCP-compatible agent at it and the cooperative substrate is live.
+          Assurance Matrix. Point a supported MCP-compatible agent at it, and the cooperative substrate is live.
         </p>
       </div>
 
@@ -154,9 +156,8 @@ layout: null
               <p class="provisioning__body">
                 On macOS today, the Castle Wall blocks unauthorized outbound calls at the
                 operating system. A prompt-injected agent cannot route around that path within
-                the proven scope because the kernel itself enforces.
-                Live on macOS: the wall enforces a signed operator policy, with a clean
-                per-account allow/deny demonstration and 5/5 attended reboot survival behind the claim.
+                the proven scope because the kernel itself enforces. It enforces a signed
+                operator policy, per account, and re-establishes itself after a restart.
                 On Linux the nftables, cgroup, and NFQUEUE modules are tested against a real
                 kernel, DNS, DoH, DoT and raw sockets included, and the shipped daemon does not
                 install that path yet, so Linux is source coverage today rather than live
@@ -197,11 +198,12 @@ layout: null
         <span class="eyebrow">Architecture</span>
         <h2 id="layers-title">The Castle Architecture.</h2>
         <p>
-          Five layers, each with a distinct contract. Operating-system enforcement is live on
-          macOS today; Linux and Windows are not live enforcement yet,
-          observation inside, an encrypted state surface for compliant agents, receipts and reputation
-          across vendors, and an install-time substrate that binds it all to the operator.
-          The layers compose. None of them substitute for another.
+          Four layers, each with a distinct contract: operating-system egress enforcement
+          (live on macOS today, with Linux and Windows coming soon), behavioral observation
+          inside the box, an encrypted state surface for cooperative agents, and receipts and
+          reputation that travel across vendors. Underneath them, an install-time mechanism
+          called Mantle binds all four to your machine. The layers compose, and none of them
+          substitutes for another.
         </p>
       </div>
 
@@ -534,7 +536,7 @@ sanctuary = MCPTool.from_stdio(
       <div>© 2026 Erik Newton. Apache-2.0 (code) / CC-BY-4.0 (specification).</div>
       <div class="footer__status">
         <span class="footer__status-dot" aria-hidden="true"></span>
-        <span>v1.6.1 stable on npm</span>
+        <span>v1.7.2 stable on npm</span>
       </div>
     </div>
   </div>
