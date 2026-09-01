@@ -5,10 +5,12 @@ Publish intent is separate from tag intent. Tag pushes do not publish; manual wo
 ## Procedure
 
 1. Land the release commit on `main`. `server/package.json` must be at the exact version string being published (example `1.0.0-rc.3` or `1.0.1`).
-2. Tag the SHA locally and push the tag, for example `git tag v1.0.1 && git push origin v1.0.1`. The tag is for git history; it does not trigger publish.
-3. Open the repo on GitHub, go to Actions, select the "Publish (manual)" workflow, click "Run workflow".
-4. Type the version string from `server/package.json` into the `version` input (do not prefix with `v`). The workflow always checks out the immutable matching tag (`v<version>`); publishing an arbitrary branch or SHA is intentionally unsupported.
-5. Click "Run workflow". The pipeline verifies the input, runs the release gates, packs one tarball, signs those exact bytes in an isolated job, stages a draft GitHub Release, publishes that tarball through npm Trusted Publishing, and only then makes the GitHub Release visible. Pre-release versions publish under `next`; plain versions publish under `latest`.
+2. Commit the approved public notes at `docs/releases/v<version>.md` in that same release commit. Both release workflows refuse a tag without this exact notes file.
+3. Tag the SHA locally and push the tag, for example `git tag v1.0.1 && git push origin v1.0.1`. The tag is for git history; it does not trigger publish.
+4. Open the repo on GitHub, go to Actions, select "Castle Wall macOS Release Build", and run it with the full `v<version>` tag. This workflow checks out that exact tag, verifies the package version and tag commit, signs and notarizes the app in a read-only job, then uses a separate repository-write job to stage the verified app on a private draft GitHub Release.
+5. Confirm the macOS workflow is green and the draft release contains `Sanctuary-CastleWall.app.zip`. Do not start npm publication first: the publish workflow refuses to proceed without that exact app asset.
+6. Select the "Publish (manual)" workflow and type the version string from `server/package.json` into the `version` input without the `v` prefix. The workflow checks out the immutable matching tag, verifies the approved notes and pre-staged app, runs the release gates, packs one tarball, signs those exact bytes in an isolated job, publishes that tarball through npm Trusted Publishing, and only then makes the three-asset GitHub Release visible. Pre-release versions publish under `next`; plain versions publish under `latest`.
+7. Verify the public release body, all three assets, npm integrity and provenance, and the installed app as described below.
 
 ## Required repo secrets
 
@@ -16,13 +18,15 @@ Publish intent is separate from tag intent. Tag pushes do not publish; manual wo
 
 npm authentication uses Trusted Publishing (GitHub Actions OIDC). There is no static `NPM_TOKEN` repository secret. The OIDC-authorized job receives neither the release-signing secret nor repository-write permission, checks out no source, and publishes the prebuilt tarball with lifecycle scripts disabled.
 
-The workflow checks the release tag against the exact built commit before and after draft staging and immediately before making the release public. Git and the GitHub Releases API do not offer a cross-service transaction, so repository tag-protection rules remain the final control against a maintainer force-moving a release tag between adjacent API calls.
+Both workflows check the release tag against the exact built commit before and after their draft-staging operations. The npm workflow checks it again immediately before making the release public. Git and the GitHub Releases API do not offer a cross-service transaction, so repository tag-protection rules remain the final control against a maintainer force-moving a release tag between adjacent API calls.
 
 ## Failure modes and what to do
 
 - Input version empty or does not match `server/package.json` at ref: job fails at the verify step. Fix the input or the ref, rerun.
 - Signing fails because `RELEASE_SIGNING_KEY` is empty, malformed, or derives the wrong public key: nothing was published. Restore the correct escrowed seed and rerun; do not change the expected public key to make an unknown seed pass.
-- Draft staging fails: nothing was published to npm. Correct the GitHub Release/tag problem and rerun.
+- macOS app staging fails: nothing was published to npm. Correct the tag, signing, notarization, app digest, or draft-release problem and rerun the macOS workflow.
+- npm draft validation reports the app is missing: run the exact-tag macOS workflow first and wait for its staging job to finish. Do not bypass the three-asset requirement.
+- Draft staging fails after the app is present: nothing was published to npm. Correct the GitHub Release/tag problem and rerun.
 - npm Trusted Publishing fails: the signed tarball may remain on a draft GitHub Release, but no public GitHub Release is announced. Correct the npm trusted-publisher configuration and rerun. npm versions are immutable, so if npm reports that the exact version already exists, verify its integrity before deciding how to finalize; never overwrite or silently substitute bytes.
 - Finalization fails after npm publication: the workflow remains red and the GitHub Release remains a draft. Verify the npm package matches the manifest, then rerun or publish the existing draft. Do not create a different tarball for the same version.
 - Tests or typecheck fail: treat as a real failure, do not bypass. Fix on a branch, merge, rerun dispatch.
