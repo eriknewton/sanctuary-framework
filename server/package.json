@@ -2,7 +2,7 @@
   "name": "@sanctuary-framework/mcp-server",
   "version": "1.7.2",
   "mcpName": "ai.sanctuaryprotocol/sanctuary",
-  "description": "The open source standard for secure, private AI: operating-system enforcement is live on macOS today; Linux and Windows are not live enforcement yet, and your data stays under your own keys with current portability bounds called out in the Assurance Matrix. Any agent, local or cloud, solo or fleet.",
+  "description": "The open source standard for secure, private AI: operating-system enforcement is live on macOS today; Linux and Windows are not live enforcement yet, and your data stays under your own keys with current portability bounds called out in the Assurance Matrix. Any agent, local or cloud, one machine or many.",
   "type": "module",
   "main": "dist/index.cjs",
   "module": "dist/index.js",
