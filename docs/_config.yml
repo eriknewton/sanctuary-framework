@@ -14,6 +14,26 @@ exclude:
   - Gemfile
   - Gemfile.lock
   - README.md
+  # Internal March-2026 security-review sprint artifacts. These carry SEC-finding
+  # registers with file:line anchors into product code, attack scenarios, and
+  # remediation recipes; publishing any of them violates the absolute
+  # non-disclosure rule (AGENTS.md MUST-NEVER #9). They stay in the tree because
+  # some are internal references, but they must never be web-served. Do not
+  # remove an entry without confirming the file no longer carries defect detail.
+  - audit/SECURITY_AUDIT.md
+  - audit/BUG_REPORT.md
+  - audit/REMEDIATION_PLAN.md
+  - audit/SPRINT_EVAL.md
+  - audit/SPRINT_CONTRACT.md
+  - audit/SPRINT_RESULT.md
+  - audit/MERGE_GATE_REPORT.md
+  - audit/DELTA_REVIEW_REPORT.md
+  - audit/KNOWN_ISSUES.md
+  # Detailed internal security-posture page (branch-protection specifics,
+  # dependency-debt board, maintainer decisions). Owner-directed takedown
+  # 2026-08-31 (INC-009): unpublished pending a review of whether the
+  # open-security-debt board says more than a public page should.
+  - audit/SECURITY_POSTURE.md
 
 # Defaults
 defaults:
