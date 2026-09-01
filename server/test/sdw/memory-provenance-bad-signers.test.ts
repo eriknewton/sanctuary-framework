@@ -254,7 +254,7 @@ describe("C4 foreign bad-signer quarantine", () => {
     const [mark] = createMemoryProvenanceBadSignerTools({
       store: f.store,
       auditLog: audit,
-      isolationGuard: () => ({ allowed: true }),
+      isolationGuard: async () => ({ allowed: true }),
     });
     const args = {
       signer_did: f.direct.did,

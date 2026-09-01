@@ -157,7 +157,7 @@ negotiator = Agent(
 )
 ```
 
-Each agent gets its own cryptographic identity, encrypted state store, and reputation history. Same-host isolation between wrapped agents is partial: the sovereign memory store is one shared scope per fortress, and the guard over it separates distinct wrapped-agent identities only within one server process. Two harnesses wrapped over one fortress run separate server processes and are not separated by it (tracked as **IC-16**, open).
+Each agent gets its own cryptographic identity, encrypted state store, and reputation history. The sovereign memory scope is bound to one wrapped-agent identity by an authenticated fortress-persisted owner pin, so a second correctly wrapped server process over the same fortress is refused. Existing unpinned memory must be assigned explicitly with the interactive `sanctuary sdw-owner claim` command; it is never inherited by the first process to arrive. Cooperative-mode bound: this does not defend against an agent that can rewrite and relaunch another harness's complete MCP configuration.
 
 ### Context Gating for Inference Calls
 

@@ -108,6 +108,10 @@ import {
   FEDERATION_REISSUE_CHALLENGE_STORE_HKDF_INFO,
 } from "../../src/v1/federation-reissue-challenge-store.js";
 import { rotateKeys, type StoredIdentity } from "../../src/core/identity.js";
+import {
+  readSdwOwnerPin,
+  writeSdwOwnerPin,
+} from "../../src/sdw/write-gate.js";
 
 const PASSPHRASE = "rotation-test-passphrase";
 const KID = "agent-rotate-1";
@@ -465,6 +469,30 @@ describe("master rotation — happy path", () => {
     expect(before?.signature_verified).toBe(true);
     expect(after?.value).toBe("written after identity rotation");
     expect(after?.signature_verified).toBe(true);
+  });
+
+  it("restamps the durable SDW owner pin under the new master", async () => {
+    const fortress = await buildFortress();
+    await writeSdwOwnerPin(fortress.storage, fortress.master, {
+      version: 1,
+      fortress_id: FORTRESS_ID,
+      owner_ref: "fleet-self",
+      agent_id: "claude_code:fortress-rotation-test",
+      pinned_at: "2026-09-01T00:00:00.000Z",
+    });
+    await rotateMaster(rotateOpts(fortress));
+    const established = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    expect((await readSdwOwnerPin(fortress.storage, fortress.master)).status).toBe(
+      "invalid",
+    );
+    const pin = await readSdwOwnerPin(fortress.storage, established.masterKey);
+    expect(pin.status).toBe("valid");
+    if (pin.status === "valid") {
+      expect(pin.data.agent_id).toBe("claude_code:fortress-rotation-test");
+    }
   });
 
   it("re-encrypts the castle pin file in place", async () => {

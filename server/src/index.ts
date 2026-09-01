@@ -115,7 +115,7 @@ import { createMemoryAttestTools } from "./cognitive/memory-attest.js";
 import { createSdwMemoryTools, memoryInsertApprovalArgs } from "./sdw/memory-tools.js";
 import { createSdwMemoryFileTools } from "./sdw/memory-file-tools.js";
 import {
-  createMultiAgentIsolationGuard,
+  createPersistentMultiAgentIsolationGuard,
   wrappedAgentIdentityFromEnv,
 } from "./sdw/memory-isolation.js";
 import { createSdwMemoryProvenanceTool } from "./sdw/memory-provenance-tool.js";
@@ -1579,13 +1579,11 @@ export async function createSanctuaryServer(options?: {
     resolveMemoryIntegrityState: () => sdwMemoryMigration.getState(),
     badSignerAuthority: sdwMemoryBadSignerStore,
   });
-  // Fail-closed multi-agent isolation guard: the adapter above is bound to ONE
-  // shared `fleet-self` owner scope reused for every caller, so SDW memory has
-  // no per-agent custody isolation yet. Resolving the SAME caller identity the
-  // router uses (`SANCTUARY_AGENT_ID`) lets the guard pin the single identity
-  // the shared scope serves and REFUSE any second, distinct wrapped-agent
-  // identity until real per-agent isolation lands. For single-coordinator use
-  // this resolves a stable value (or stable undefined) and is a strict NO-OP.
+  // One-owner-per-fortress SDW boundary. Every harness launches a separate
+  // stdio server, so a process-local first-caller pin is insufficient. The
+  // guard below authenticates a fortress-persisted owner record on every call;
+  // a fresh scope is atomically claimed and a used legacy scope without a pin
+  // refuses until the operator explicitly assigns it.
   //
   // ONE guard instance is shared by every tool family that reaches this scope
   // (read/write tools AND the memory-file transcode tools). A per-family guard
@@ -1593,13 +1591,16 @@ export async function createSanctuaryServer(options?: {
   // would be the FIRST caller of memory_emit and could dump the whole shared
   // corpus as plaintext files.
   //
-  // The resolver is the production one from memory-isolation.ts: it reads the
-  // wrap-time `SANCTUARY_AGENT_ID` that `sanctuary wrap` writes into the
-  // harness's MCP entry (wrap/cli.ts:buildSanctuaryEnv), never an
-  // agent-asserted value. BOUND: the pin lives in this process; two harnesses
-  // over one fortress run separate server processes and are not separated
-  // (IC-16 stays open).
-  const sdwMemoryIsolationGuard = createMultiAgentIsolationGuard(sdwMemoryIdentity);
+  // The identity is the wrap-time SANCTUARY_AGENT_ID, never a tool argument.
+  // Cooperative-mode bound: the harness config remains user-writable; full
+  // deployments add the dedicated OS-account boundary.
+  const sdwMemoryIsolationGuard = createPersistentMultiAgentIsolationGuard({
+    storage,
+    masterKey,
+    fortressId: sdwFortressId,
+    ownerRef: "fleet-self",
+    ownerIdentity: sdwMemoryIdentity,
+  });
   const sdwMemoryTools = createSdwMemoryTools({
     adapter: sdwMemoryAdapter,
     auditLog,

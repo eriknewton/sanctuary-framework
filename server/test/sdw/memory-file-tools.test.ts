@@ -1116,13 +1116,14 @@ Unrelated identifier: ${BARE_CREDENTIAL_VALUE}
   it("index.ts wires ONE guard instance into both memory tool families", async () => {
     // The behavioral test above builds the shared guard itself, so it proves the
     // mechanism works but not that production uses it. This reads the real
-    // wiring: a second `createMultiAgentIsolationGuard(` call in index.ts, or a
+    // wiring: a second persistent-guard construction in index.ts, or a
     // factory call without the shared guard, re-opens the memory_emit hole.
     const indexSource = await readFile(
       fileURLToPath(new URL("../../src/index.ts", import.meta.url)),
       "utf8",
     );
-    const guardConstructions = indexSource.match(/createMultiAgentIsolationGuard\(/g) ?? [];
+    const guardConstructions =
+      indexSource.match(/createPersistentMultiAgentIsolationGuard\(/g) ?? [];
     expect(guardConstructions).toHaveLength(1);
 
     for (const factory of [

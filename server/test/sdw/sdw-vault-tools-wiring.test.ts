@@ -12,8 +12,8 @@
  *     harness MCP entry, the server resolves it through
  *     `wrappedAgentIdentityFromEnv`, and two distinct ids reaching ONE server
  *     process are separated (memory reads, provenance AND the vault tools).
- *     BOUND: the guard is per process; two harnesses over one fortress run
- *     separate processes and are not separated (IC-16 stays open);
+ *     the production guard persists an authenticated owner pin in the fortress,
+ *     so two harnesses over one fortress are separated across server processes;
  *   - that on the SHIPPED filesystem backend `sdw_import` fails closed with
  *     `storage_not_transactional` before touching the store (IC-27).
  */

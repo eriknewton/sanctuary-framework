@@ -322,7 +322,7 @@ describe("C4 memory-provenance signer mark-and-sweep", () => {
     const tool = createMemoryProvenanceSignerPruneTool({
       pruner: f.pruner,
       auditLog: f.audit,
-      isolationGuard: () => ({ allowed: true }),
+      isolationGuard: async () => ({ allowed: true }),
     });
     const denied = await tool.handler({});
     expect(JSON.parse(denied.content[0]!.text)).toMatchObject({ denied: true });

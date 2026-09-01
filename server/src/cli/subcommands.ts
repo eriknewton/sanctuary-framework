@@ -50,6 +50,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "reset-passphrase",
   "restore-attest",
   "rotate-master",
+  "sdw-owner",
   "secrets",
   "sentinel",
   "state_disclose_unattributed",

@@ -143,7 +143,7 @@ export function createSdwMemoryProvenanceTool(
 
   const refusedForeignIdentity = async (): Promise<boolean> => {
     if (options.isolationGuard === undefined) return false;
-    if (options.isolationGuard("sdw_memory_provenance").allowed) return false;
+    if ((await options.isolationGuard("sdw_memory_provenance")).allowed) return false;
     await auditFailure({ denial_class: SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS });
     return true;
   };

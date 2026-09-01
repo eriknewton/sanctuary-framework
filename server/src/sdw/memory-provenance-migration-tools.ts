@@ -50,7 +50,7 @@ export function createSdwMemoryProvenanceMigrationTools(
     operation: string,
     action: () => Promise<SdwMemoryMigrationProgress>,
   ) => {
-    if (!options.isolationGuard(operation).allowed) {
+    if (!(await options.isolationGuard(operation)).allowed) {
       await audit(`${operation}_denied`, "failure", { denial_class: "multi_agent_isolation" });
       return deny(operation);
     }
@@ -84,7 +84,7 @@ export function createSdwMemoryProvenanceMigrationTools(
       tool_class: "read",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       handler: async () => {
-        if (!options.isolationGuard(SDW_MEMORY_PROVENANCE_MIGRATION_AUDIT_OPS.status).allowed) {
+        if (!(await options.isolationGuard(SDW_MEMORY_PROVENANCE_MIGRATION_AUDIT_OPS.status)).allowed) {
           return deny(SDW_MEMORY_PROVENANCE_MIGRATION_AUDIT_OPS.status);
         }
         try {

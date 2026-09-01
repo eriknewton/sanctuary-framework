@@ -41,7 +41,7 @@ export function createMemoryProvenanceBadSignerTools(options: {
       },
       handler: async (args, _caller, context) => {
         const operation = MEMORY_PROVENANCE_BAD_SIGNER_TOOL_OPS.mark;
-        if (!options.isolationGuard(operation).allowed || context?.approvalAuditId === undefined) {
+        if (!(await options.isolationGuard(operation)).allowed || context?.approvalAuditId === undefined) {
           return deny(operation);
         }
         try {
@@ -76,7 +76,7 @@ export function createMemoryProvenanceBadSignerTools(options: {
       },
       handler: async (args, _caller, context) => {
         const operation = MEMORY_PROVENANCE_BAD_SIGNER_TOOL_OPS.clear;
-        if (!options.isolationGuard(operation).allowed || context?.approvalAuditId === undefined) {
+        if (!(await options.isolationGuard(operation)).allowed || context?.approvalAuditId === undefined) {
           return deny(operation);
         }
         try {

@@ -73,6 +73,8 @@ export const READ_ONLY_STORAGE_MUTATING_METHODS = [
   "write",
   "delete",
   "writeDurable",
+  "writeIfAbsent",
+  "replaceIfEquals",
 ] as const;
 
 /**
@@ -144,6 +146,23 @@ export class ReadOnlyStorageGuard
     _data: Uint8Array
   ): Promise<void> {
     throw new ReadOnlyStorageViolationError("writeDurable", namespace, key);
+  }
+
+  async writeIfAbsent(
+    namespace: string,
+    key: string,
+    _data: Uint8Array,
+  ): Promise<boolean> {
+    throw new ReadOnlyStorageViolationError("writeIfAbsent", namespace, key);
+  }
+
+  async replaceIfEquals(
+    namespace: string,
+    key: string,
+    _expected: Uint8Array,
+    _data: Uint8Array,
+  ): Promise<boolean> {
+    throw new ReadOnlyStorageViolationError("replaceIfEquals", namespace, key);
   }
 
   async delete(
