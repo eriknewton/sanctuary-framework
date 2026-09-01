@@ -36,10 +36,6 @@
 3	announcements/hackernews-submission.md
 9	announcements/linkedin-post.md
 8	announcements/x-twitter-thread.md
-4	castle-wall-vmm/README.md
-2	docs/DID_ENCODING.md
-45	docs/OWASP_AGENTIC_AI.md
-23	docs/SHR_SPEC.md
 7	docs/assets/css/site.css
 46	docs/audit/BUG_REPORT.md
 14	docs/audit/DELTA_REVIEW_REPORT.md
@@ -53,9 +49,6 @@
 26	docs/audit/branch-protection-setup.md
 10	docs/audit/commit-4ac95830-postmortem.md
 16	docs/audit/test-baseline-hardening-plan.md
-29	docs/compliance/eu_ai_act_bundle.md
-7	docs/releases/v1.3.2.md
-42	docs/research/RESEARCH_ZK_UPGRADE_L3.md
 67	examples/eu_ai_act_bundle_example/01_annex_iv_technical_documentation.md
 29	examples/eu_ai_act_bundle_example/02_article_26_deployer_log.md
 15	examples/eu_ai_act_bundle_example/03_article_12_automatic_logs.md
@@ -63,9 +56,6 @@
 15	examples/eu_ai_act_bundle_example/05_human_oversight_statement.md
 6	examples/eu_ai_act_bundle_example/06_cryptographic_attestations.md
 6	examples/eu_ai_act_bundle_example/07_annex_iii_classification.md
-10	examples/eu_ai_act_bundle_example/README.md
-14	integrations/ping-identity/README.md
-4	quickstart/README.md
 40	rfcs/RFC-0001-sanctuary-mcp-server.md
 8	rfcs/RFC-0002-principal-policy-operational-approval.md
 163	sanctuary_framework.md
@@ -126,7 +116,7 @@
 1	server/src/federation/tools.ts
 2	server/src/handshake/protocol.ts
 2	server/src/handshake/tools.ts
-5	server/src/index.ts
+4	server/src/index.ts
 2	server/src/intelligence/selector.ts
 3	server/src/mesh/audit-batch.ts
 2	server/src/mesh/envelope.ts
@@ -151,7 +141,7 @@
 1	server/src/principal-policy/webhook.ts
 3	server/src/sanctuary-tools.ts
 1	server/src/shr/decommission-verifier.ts
-12	server/src/shr/gateway-adapter.ts
+8	server/src/shr/gateway-adapter.ts
 3	server/src/shr/verifier.ts
 2	server/src/substrate/verdict.ts
 8	server/src/system-prompt-generator.ts

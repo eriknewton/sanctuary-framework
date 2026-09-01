@@ -129,7 +129,7 @@ function parseBaseline(): { map: Map<string, number>; duplicates: string[] } {
 }
 
 describe("em-dash guard (no NEW em-dashes in public-facing artifacts)", () => {
-  it("no in-scope file exceeds its committed em-dash baseline", () => {
+  it("no in-scope file exceeds or drops below its committed em-dash baseline", () => {
     const { map: baseline, duplicates } = parseBaseline();
     // a duplicate baseline row would let a regression through (Map overwrite)
     expect(
