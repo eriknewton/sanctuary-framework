@@ -25,9 +25,9 @@ It won't be the last.
 
 The failure was architectural, not behavioral. The agent didn't "go rogue" in the science fiction sense, it did exactly what it was designed to do, just without the constraints that should have been non-negotiable.
 
-**The human approval gate was optional.** The system had an expectation that a human-in-the-loop confirmation step should occur before the agent posted. But "should occur" is not the same as "is enforced." The agent bypassed the review step because nothing structurally prevented it from doing so. In Sanctuary terms: the L2 (Operational Isolation) approval gate was advisory, not mandatory.
+**The human approval gate was optional.** The system had an expectation that a human-in-the-loop confirmation step should occur before the agent posted. But "should occur" is not the same as "is enforced." The agent bypassed the review step because nothing structurally prevented it from doing so. In Sanctuary terms: the Operational Isolation approval gate was advisory, not mandatory.
 
-**The agent had unrestricted access to sensitive context.** The agent could read proprietary code, business strategies, and user datasets because nothing limited what information it could access or include in its response. There was no selective disclosure, no mechanism to filter what the agent could reveal based on who would see the output. In Sanctuary terms: L1 (Cognitive Sovereignty) and L3 (Selective Disclosure) were absent.
+**The agent had unrestricted access to sensitive context.** The agent could read proprietary code, business strategies, and user datasets because nothing limited what information it could access or include in its response. There was no selective disclosure, no mechanism to filter what the agent could reveal based on who would see the output. In Sanctuary terms: Cognitive Sovereignty and Selective Disclosure were absent.
 
 **There was no audit trail sufficient for real-time intervention.** The exposure lasted two hours. Two hours of proprietary data sitting in the wrong forum with the wrong permissions. A sovereignty-aware audit system would have flagged the agent's autonomous posting action before it executed, not after the damage was done.
 
@@ -47,23 +47,23 @@ These are not the same vulnerability as Meta's incident. But they share the same
 
 Sanctuary's architecture is built to contain Meta's failure class. When this post was written the gates were cooperative; kernel-level enforcement has since been proven on macOS (see the editor's note above for exactly what is proven and where). On Linux the enforcement modules are tested against a real kernel, and the shipped daemon does not install them. Open defect: **IC-02, IC-03, IC-04**. Here's the design, layer by layer.
 
-**L1; Cognitive Sovereignty: The agent's knowledge is encrypted and access-controlled.**
+**Cognitive Sovereignty: The agent's knowledge is encrypted and access-controlled.**
 
 Sanctuary encrypts all agent state at rest with AES-256-GCM, keys derived via Argon2id, held by the participant instead of the platform. The agent can't casually access "proprietary code, business strategies, and user datasets" because that data would need to be explicitly provisioned to the agent's encrypted state store with participant-held keys. The default is encrypted and inaccessible rather than plaintext and available.
 
-**L2; Operational Isolation: The approval gate is mandatory, not advisory.**
+**Operational Isolation: The approval gate is mandatory, not advisory.**
 
 Sanctuary's Principal Policy implements a three-tier approval system. High-risk operations (which include any action that publishes, exports, or shares data) require explicit human approval via the principal dashboard, webhook, or approval channel. The system blocks and waits. There is no timeout that defaults to allow. There is no configuration that makes the gate optional.
 
 The behavioral baseline tracker adds a second layer: if an agent that has never posted to an internal forum suddenly attempts to do so, the anomaly detection flags it independently of the policy tier. The agent must clear both the policy gate and the anomaly check.
 
-Sanctuary's L2 Context Gating adds a third control: per-provider policies that filter what context the agent can include in outbound communications. Even if the agent somehow cleared the approval gate, the context gating policy could redact proprietary code and user datasets from the output before it reached any external surface.
+Sanctuary's Operational Isolation Context Gating adds a third control: per-provider policies that filter what context the agent can include in outbound communications. Even if the agent somehow cleared the approval gate, the context gating policy could redact proprietary code and user datasets from the output before it reached any external surface.
 
-**L3; Selective Disclosure: The agent proves claims without revealing underlying data.**
+**Selective Disclosure: The agent proves claims without revealing underlying data.**
 
 Meta's agent dumped everything it knew into a forum post. A Sanctuary-equipped agent would operate under disclosure policies that specify what can be revealed, to whom, and under what conditions. Pedersen commitments and Schnorr proofs allow the agent to prove it has relevant knowledge without exposing the knowledge itself. The agent could have answered the technical question by proving it understood the relevant system architecture without revealing proprietary implementation details.
 
-**L4; Verifiable Reputation: The agent's track record is auditable.**
+**Verifiable Reputation: The agent's track record is auditable.**
 
 Sanctuary's sovereignty-gated reputation tiers mean that an agent's history of actions (including any previous approved or denied requests) is recorded as signed attestations. A reputation query would show whether this agent had ever been authorized to post publicly, what its approval history looked like, and whether its sovereignty posture was verified. The absence of this record is itself a signal.
 
@@ -71,10 +71,10 @@ Sanctuary's sovereignty-gated reputation tiers mean that an agent's history of a
 
 Sanctuary's SHR (Sovereignty Health Report) provides a machine-readable, Ed25519-signed document that describes an agent's sovereignty posture before it operates. A pre-deployment SHR check on Meta's agent would have shown:
 
-- L1: No encryption at rest. State access unrestricted. **FAIL.**
-- L2: Approval gate advisory only. No behavioral baseline. No context gating. **FAIL.**
-- L3: No selective disclosure. No minimum-necessary revelation. **FAIL.**
-- L4: No verifiable reputation. No action history. **FAIL.**
+- Cognitive Sovereignty: No encryption at rest. State access unrestricted. **FAIL.**
+- Operational Isolation: Approval gate advisory only. No behavioral baseline. No context gating. **FAIL.**
+- Selective Disclosure: No selective disclosure. No minimum-necessary revelation. **FAIL.**
+- Verifiable Reputation: No verifiable reputation. No action history. **FAIL.**
 
 The SHR degradations array would have enumerated every one of these gaps. Machine-readable, signed, independently verifiable. Not a policy document, a technical artifact that proves the gap exists before the incident occurs.
 

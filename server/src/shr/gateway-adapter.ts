@@ -428,7 +428,7 @@ function generateAuthorizationConstraints(
   if (!layers.l1.state_portable) {
     constraints.push({
       type: "location_bound",
-      description: "Agent state is not portable — restrict to home environment",
+      description: "Agent state is not portable: restrict to home environment",
       rationale: "State cannot be safely migrated across boundaries",
       priority: "medium",
     });
@@ -457,7 +457,7 @@ function generateAuthorizationConstraints(
   if (layers.l3.status === "degraded" || !layers.l3.selective_disclosure) {
     constraints.push({
       type: "restricted_scope",
-      description: "Limit data sharing to minimal required scope — no selective disclosure",
+      description: "Limit data sharing to minimal required scope: no selective disclosure",
       rationale: "Agent cannot redact data or prove predicates without revealing all context",
       priority: "high",
     });
@@ -479,7 +479,7 @@ function generateAuthorizationConstraints(
   if (!layers.l4.reputation_portable) {
     constraints.push({
       type: "location_bound",
-      description: "Reputation is not portable — restrict to home environment",
+      description: "Reputation is not portable: restrict to home environment",
       rationale: "Cannot present reputation to external parties",
       priority: "low",
     });
@@ -492,7 +492,7 @@ function generateAuthorizationConstraints(
   if (overallScore < 40) {
     constraints.push({
       type: "restricted_scope",
-      description: "Overall sovereignty score below threshold — restrict to non-sensitive operations",
+      description: "Overall sovereignty score below threshold: restrict to non-sensitive operations",
       rationale: `Overall sovereignty score is ${overallScore}/100`,
       priority: "high",
     });

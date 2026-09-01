@@ -8,7 +8,7 @@ encoding with the `z` prefix**, which is a deliberate departure from the
 W3C `did:key` specification (which mandates base58btc under multibase
 `z`). If you are integrating Sanctuary agent DIDs into a registry or
 verifier that was built against strict `did:key`, you must decode them
-using the procedure described below — a stock `did:key` resolver will
+using the procedure described below. A stock `did:key` resolver will
 **not** recognise them.
 
 This document describes the exact format Sanctuary emits, shows how to
@@ -51,7 +51,7 @@ did:key:z7QFhX... (44-47 characters after the z prefix)
 ```
 
 The exact byte length depends on base64url encoding of 34 bytes (no
-padding), which is always 46 characters — so the full DID is
+padding), which is always 46 characters, so the full DID is
 `did:key:z` (9 chars) + 46 chars = **55 characters** total.
 
 ---

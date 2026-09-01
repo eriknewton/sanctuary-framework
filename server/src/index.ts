@@ -684,7 +684,7 @@ export async function createSanctuaryServer(options?: {
 
     {
       name: "monitor_audit_log",
-      description: "Query your OWN identity's sovereignty audit entries, filtered by since, layer (l1-l4), operation_type, and limit (default 50). Use to inspect operations you performed. Read-only; only your own entries are visible (system/gate entries are never returned), and each entry is reduced to a fixed safe view ({ timestamp, operation, result, has_details }) — no details, identity, or policy attribution.",
+      description: "Query your OWN identity's sovereignty audit entries, filtered by since, layer (l1-l4), operation_type, and limit (default 50). Use to inspect operations you performed. Read-only; only your own entries are visible (system/gate entries are never returned), and each entry is reduced to a fixed safe view ({ timestamp, operation, result, has_details }): no details, identity, or policy attribution.",
       inputSchema: {
         type: "object",
         properties: {

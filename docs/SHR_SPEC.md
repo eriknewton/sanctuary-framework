@@ -12,9 +12,9 @@
 
 A Sovereignty Health Report (SHR) is a machine-readable, cryptographically signed document that describes an agent's sovereignty posture across four layers. It serves three functions:
 
-1. **Capability advertisement** — An agent presents its SHR to counterparties to prove what sovereignty guarantees it provides.
-2. **Mutual verification** — Two agents exchange SHRs during a sovereignty handshake to establish trust before transacting.
-3. **Compliance artifact** — An SHR provides auditable evidence of an agent's data protection, isolation, disclosure, and reputation capabilities for regulatory purposes (e.g., EU AI Act Article 22, Article 42).
+1. **Capability advertisement**: An agent presents its SHR to counterparties to prove what sovereignty guarantees it provides.
+2. **Mutual verification**: Two agents exchange SHRs during a sovereignty handshake to establish trust before transacting.
+3. **Compliance artifact**: An SHR provides auditable evidence of an agent's data protection, isolation, disclosure, and reputation capabilities for regulatory purposes (e.g., EU AI Act Article 22, Article 42).
 
 An SHR is not a certification. It is a self-attested, cryptographically signed report. Consumers of an SHR verify the signature and assess the reported capabilities against their own trust requirements. Sovereignty-gated reputation tiers (Section 7) provide a mechanism for weighting trust based on verified posture.
 
@@ -147,10 +147,10 @@ Describes the agent's ability to prove claims without full revelation.
 | Field | Description |
 |-------|-------------|
 | `status` | "active" = ZK proofs available; "degraded" = proof system present but limited; "inactive" = no disclosure capability |
-| `proof_system` | System in use. Values: "schnorr-pedersen" (Schnorr + Pedersen + range proofs — genuine ZK), "groth16", "plonk", "none". Legacy value "commitment-only" is accepted as an alias for "schnorr-pedersen". |
+| `proof_system` | System in use. Values: "schnorr-pedersen" (Schnorr + Pedersen + range proofs, genuine ZK), "groth16", "plonk", "none". Legacy value "commitment-only" is accepted as an alias for "schnorr-pedersen". |
 | `selective_disclosure` | Whether the agent can produce zero-knowledge proofs of specific claims |
 
-Note: The reference implementation uses "schnorr-pedersen" — Pedersen commitments on Ristretto255, Schnorr proofs of knowledge, and bit-decomposition range proofs. These are genuine zero-knowledge proofs with selective disclosure capability. L3 status is "active" with this proof system. SNARK-based systems (Groth16, PLONK) are specified for future implementation but are not required for full L3 status.
+Note: The reference implementation uses "schnorr-pedersen": Pedersen commitments on Ristretto255, Schnorr proofs of knowledge, and bit-decomposition range proofs. These are genuine zero-knowledge proofs with selective disclosure capability. L3 status is "active" with this proof system. SNARK-based systems (Groth16, PLONK) are specified for future implementation but are not required for full L3 status.
 
 ### 3.5 Layer 4: Verifiable Reputation
 
@@ -223,7 +223,7 @@ An array of known limitations. Each degradation documents a specific gap between
 | `SELF_REPORTED_ATTESTATION` | l2 | warning | Environment attestation is self-reported, not hardware-backed |
 | `COMMITMENT_ONLY` | l3 | info | Proof system supports commitments and Schnorr proofs but not full ZK-SNARKs |
 | `NO_ZK_PROOFS` | l3 | warning | No zero-knowledge proof capability available |
-| `NO_SELECTIVE_DISCLOSURE` | l3 | critical | Agent cannot selectively disclose — all-or-nothing revelation only |
+| `NO_SELECTIVE_DISCLOSURE` | l3 | critical | Agent cannot selectively disclose: all-or-nothing revelation only |
 | `BASIC_SYBIL_ONLY` | l4 | info | Sybil detection uses heuristic signals only, not formal proofs |
 | `NO_REPUTATION` | l4 | warning | No reputation system available |
 | `PLATFORM_KEY_CUSTODY` | l1 | critical | Keys are held by the hosting platform, not the agent/principal |
@@ -238,11 +238,11 @@ Implementations MAY define additional codes prefixed with `x-` for custom degrad
 
 An SHR consumer performs the following checks:
 
-1. **Schema validation** — All required fields present and correctly typed.
-2. **Version check** — `shr_version` is "1.0" (or a version the consumer supports).
-3. **Temporal validation** — `generated_at` is in the past (with clock skew tolerance of 60 seconds). `expires_at` is in the future.
-4. **Signature verification** — `Ed25519_Verify(signed_by, canonical_bytes(body), signature)` returns true.
-5. **Sovereignty assessment** — Consumer evaluates reported layers against its own trust requirements.
+1. **Schema validation**: All required fields present and correctly typed.
+2. **Version check**: `shr_version` is "1.0" (or a version the consumer supports).
+3. **Temporal validation**: `generated_at` is in the past (with clock skew tolerance of 60 seconds). `expires_at` is in the future.
+4. **Signature verification**: `Ed25519_Verify(signed_by, canonical_bytes(body), signature)` returns true.
+5. **Sovereignty assessment**: Consumer evaluates reported layers against its own trust requirements.
 
 ### 4.1 Sovereignty Levels
 
@@ -290,7 +290,7 @@ Agent A                          Agent B
   [counterparty SHR + nonce proof  ]
 ```
 
-The nonce signatures prove liveness — the counterparty generated the SHR for this specific interaction, not a replay of a previous SHR.
+The nonce signatures prove liveness: the counterparty generated the SHR for this specific interaction, not a replay of a previous SHR.
 
 After a successful handshake, both agents have:
 - Verified counterparty SHR (signed, schema-valid, temporally valid, signature-checked)
@@ -382,7 +382,7 @@ In February 2026, NIST's Center for AI Standards and Innovation (CAISI) launched
 
 NIST explicitly references the Model Context Protocol (MCP) as a candidate integration point for agent security controls. Sanctuary operates as an MCP server, making it directly compatible with NIST's protocol-level recommendations.
 
-The NIST initiative's emphasis on treating AI agents as identifiable entities within enterprise identity systems — rather than anonymous automation under shared credentials — aligns directly with Sanctuary's L1 identity model. An agent running Sanctuary holds its own Ed25519 keypair, generates and signs its own SHR, and can participate in sovereignty handshakes with counterparties. The identity is not delegated from a platform; it is self-custodied.
+The NIST initiative's emphasis on treating AI agents as identifiable entities within enterprise identity systems, rather than anonymous automation under shared credentials, aligns directly with Sanctuary's L1 identity model. An agent running Sanctuary holds its own Ed25519 keypair, generates and signs its own SHR, and can participate in sovereignty handshakes with counterparties. The identity is not delegated from a platform; it is self-custodied.
 
 An enterprise deploying Sanctuary can demonstrate alignment with both the EU AI Act (Section 8) and the NIST AI Agent Standards Initiative from a single agent infrastructure.
 
@@ -392,10 +392,10 @@ An enterprise deploying Sanctuary can demonstrate alignment with both the EU AI 
 
 The SHR specification is designed for extension:
 
-- **Custom degradation codes** — Prefix with `x-` (e.g., `x-no-fips-validation`).
-- **Additional layers** — Future versions may add layers (e.g., L5 for governance, L6 for consciousness attestation). The `layers` object is extensible.
-- **Additional capabilities** — The `capabilities` object accepts additional boolean flags.
-- **Domain-specific metadata** — Implementations may add fields to the body. Unknown fields MUST be preserved during canonicalization and signature verification.
+- **Custom degradation codes**: Prefix with `x-` (e.g., `x-no-fips-validation`).
+- **Additional layers**: Future versions may add layers (e.g., L5 for governance, L6 for consciousness attestation). The `layers` object is extensible.
+- **Additional capabilities**: The `capabilities` object accepts additional boolean flags.
+- **Domain-specific metadata**: Implementations may add fields to the body. Unknown fields MUST be preserved during canonicalization and signature verification.
 
 ---
 
@@ -403,11 +403,11 @@ The SHR specification is designed for extension:
 
 The reference implementation is published as part of `@sanctuary-framework/mcp-server` (npm, v0.3.1):
 
-- **Generator:** `server/src/shr/generator.ts` — SHR generation with automatic degradation detection
-- **Verifier:** `server/src/shr/verifier.ts` — Schema validation, temporal checks, signature verification
-- **Types:** `server/src/shr/types.ts` — TypeScript type definitions and canonical serialization
-- **Tools:** `server/src/shr/tools.ts` — MCP tool wrappers (`sanctuary/shr_generate`, `sanctuary/shr_verify`)
-- **Tests:** `server/test/shr/shr.test.ts` — 11 tests covering generation, verification, tampering, expiry, and sovereignty assessment
+- **Generator:** `server/src/shr/generator.ts`: SHR generation with automatic degradation detection
+- **Verifier:** `server/src/shr/verifier.ts`: Schema validation, temporal checks, signature verification
+- **Types:** `server/src/shr/types.ts`: TypeScript type definitions and canonical serialization
+- **Tools:** `server/src/shr/tools.ts`: MCP tool wrappers (`sanctuary/shr_generate`, `sanctuary/shr_verify`)
+- **Tests:** `server/test/shr/shr.test.ts`: 11 tests covering generation, verification, tampering, expiry, and sovereignty assessment
 
 Source: [github.com/eriknewton/sanctuary-framework](https://github.com/eriknewton/sanctuary-framework)
 

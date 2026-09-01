@@ -106,7 +106,7 @@ agent supports sovereignty handshakes, negotiation, and reputation verification.
     {
       "id": "sovereignty-handshake",
       "name": "Sovereignty Handshake",
-      "description": "Exchange and verify Sovereignty Health Reports (SHR) with peer agents. Proves L1-L4 sovereignty posture with cryptographic evidence.",
+      "description": "Exchange and verify Sovereignty Health Reports (SHR) with peer agents. Proves Castle Wall, Sentinels, Charter, and Heralds posture with cryptographic evidence.",
       "examples": [
         "Verify my sovereignty status",
         "Exchange sovereignty handshake with did:key:z6Mk..."

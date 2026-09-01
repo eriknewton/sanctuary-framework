@@ -24,7 +24,7 @@ Each section includes:
 
 ---
 
-## AAI01 — Memory Poisoning
+## AAI01: Memory Poisoning
 
 **Risk.** Untrusted data injected into an agent's persistent memory
 corrupts future decisions.
@@ -41,7 +41,7 @@ corrupts future decisions.
 - State integrity is Merkle-tree verified on read (`state_read` returns
   a proof). Tampering is detected, not silently accepted.
 - The Operational-layer injection detector (`security/injection-detector.ts`) scans
-  every tool call — including memory writes — for prompt-injection
+  every tool call, including memory writes, for prompt-injection
   signals before the call is executed.
 - Operational Context Gating (5 tools: `context_gate_set_policy`,
   `context_gate_filter`, etc.) restricts what enters an LLM inference
@@ -56,9 +56,9 @@ corrupts future decisions.
 
 ---
 
-## AAI02 — Tool Misuse
+## AAI02: Tool Misuse
 
-**Risk.** An agent invokes a legitimate tool in a harmful way — excess
+**Risk.** An agent invokes a legitimate tool in a harmful way: excess
 scope, wrong context, or under adversarial prompt influence.
 
 **Sanctuary layer(s):** Operational Isolation
@@ -68,7 +68,7 @@ scope, wrong context, or under adversarial prompt influence.
 **Mechanism.**
 - Every tool call passes through the three-tier Principal Policy
   **ApprovalGate** (`principal-policy/gate.ts`). The gate cannot be
-  bypassed — it wraps every handler.
+  bypassed: it wraps every handler.
 - Tier 1 operations (export, import, key rotation, identity delete,
   bootstrap, etc.) always require human approval via an
   out-of-band channel (stderr, dashboard SSE, or HMAC-signed webhook).
@@ -89,7 +89,7 @@ scope, wrong context, or under adversarial prompt influence.
 
 ---
 
-## AAI03 — Privilege Compromise
+## AAI03: Privilege Compromise
 
 **Risk.** An agent acquires or keeps privileges beyond its intended scope.
 
@@ -101,10 +101,10 @@ scope, wrong context, or under adversarial prompt influence.
 - **Identity keys are self-custodied and encrypted at rest** (Cognitive Sovereignty).
   Private keys never appear in any MCP response, log entry, or error
   message (`test/security/key-never-in-response.test.ts`).
-- **Principal Policy is loaded once at startup and frozen** — no
+- **Principal Policy is loaded once at startup and frozen:** no
   runtime MCP tool can modify it. Denial responses never reveal
   policy content.
-- **Identity rotation produces a signed rotation event** — the new key
+- **Identity rotation produces a signed rotation event:** the new key
   is authorized by a signature under the old key
   (`core/identity.ts: rotateKeys`), establishing a verifiable
   provenance chain.
@@ -119,7 +119,7 @@ scope, wrong context, or under adversarial prompt influence.
 
 ---
 
-## AAI04 — Resource Overload
+## AAI04: Resource Overload
 
 **Risk.** An agent (or adversary impersonating one) exhausts compute,
 token budget, memory, or rate quotas.
@@ -145,7 +145,7 @@ token budget, memory, or rate quotas.
 
 ---
 
-## AAI05 — Cascading Hallucination
+## AAI05: Cascading Hallucination
 
 **Risk.** A mistake in one agent becomes ground truth for another,
 compounding errors across an agent mesh.
@@ -173,7 +173,7 @@ compounding errors across an agent mesh.
 
 **Gap.**
 - No semantic cross-checking of claims between agents.
-- No content-truthfulness scoring — Sanctuary scores **provenance**,
+- No content-truthfulness scoring. Sanctuary scores **provenance**,
   not **truth**.
 - Every stored or imported attestation's self-declared sovereignty tier is
   clamped at the storage layer, unconditionally, regardless of how it
@@ -185,7 +185,7 @@ compounding errors across an agent mesh.
 
 ---
 
-## AAI06 — Intent Manipulation / Goal Drift
+## AAI06: Intent Manipulation / Goal Drift
 
 **Risk.** An agent's effective goal is shifted by adversarial inputs,
 corrupted planning steps, or manipulated context.
@@ -209,7 +209,7 @@ corrupted planning steps, or manipulated context.
   operations until baseline is established.
 
 **Gap.**
-- Sanctuary cannot detect subtle, semantics-level goal drift — an
+- Sanctuary cannot detect subtle, semantics-level goal drift: an
   injection that stays within a single tier-3 tool surface may
   succeed.
 - Planning-graph integrity is the agent framework's responsibility,
@@ -217,7 +217,7 @@ corrupted planning steps, or manipulated context.
 
 ---
 
-## AAI07 — Misaligned / Deceptive Behaviors
+## AAI07: Misaligned / Deceptive Behaviors
 
 **Risk.** An agent takes actions that serve a hidden goal, misleads
 the user, or conceals relevant information.
@@ -244,7 +244,7 @@ the user, or conceals relevant information.
 
 ---
 
-## AAI08 — Repudiation
+## AAI08: Repudiation
 
 **Risk.** An agent (or its principal) denies taking an action it
 actually took.
@@ -273,7 +273,7 @@ actually took.
 
 ---
 
-## AAI09 — Identity Spoofing & Masquerading
+## AAI09: Identity Spoofing & Masquerading
 
 **Risk.** An agent impersonates a different agent, user, or
 organizational entity.
@@ -296,7 +296,7 @@ organizational entity.
 - **Handshake attestations** are signed artifacts that can be
   independently verified later.
 - **Verascore publish** (`reputation_publish`) requires a signed
-  payload — the publishing agent must control its own key.
+  payload: the publishing agent must control its own key.
 
 **Gap.**
 - If a principal's passphrase (and therefore master key) is
@@ -305,7 +305,7 @@ organizational entity.
 
 ---
 
-## AAI10 — Overreliance on Agent
+## AAI10: Overreliance on Agent
 
 **Risk.** Principals delegate decisions they should not delegate
 because they over-trust the agent.
@@ -315,7 +315,7 @@ because they over-trust the agent.
 **Coverage:** not-addressed (Sanctuary is not a UX layer)
 
 **Mechanism.**
-- **Tier 1 operations ALWAYS require human approval** — the agent
+- **Tier 1 operations ALWAYS require human approval:** the agent
   cannot unilaterally export state, import state, delete identities,
   rotate keys, bootstrap new identities, or decommission itself.
 - **First-session policy** escalates unknowns to the human until a
@@ -335,16 +335,16 @@ because they over-trust the agent.
 
 | Risk                                  | Cognitive | Operational | Selective Disclosure | Verifiable Reputation |
 |---------------------------------------|-----------|-------------|----------------------|-----------------------|
-| AAI01 Memory Poisoning                | partial  | partial  | —        | —        |
-| AAI02 Tool Misuse                     | —        | full     | —        | —        |
-| AAI03 Privilege Compromise            | partial  | partial  | —        | —        |
-| AAI04 Resource Overload               | —        | partial  | —        | —        |
-| AAI05 Cascading Hallucination         | —        | —        | —        | partial  |
-| AAI06 Intent Manipulation             | partial  | partial  | —        | —        |
-| AAI07 Misaligned Behavior             | —        | partial  | —        | partial  |
-| AAI08 Repudiation                     | full     | full     | —        | full     |
-| AAI09 Identity Spoofing               | full     | —        | —        | full     |
-| AAI10 Overreliance                    | —        | partial  | —        | —        |
+| AAI01 Memory Poisoning                | partial  | partial  | n/a       | n/a       |
+| AAI02 Tool Misuse                     | n/a       | full     | n/a       | n/a       |
+| AAI03 Privilege Compromise            | partial  | partial  | n/a       | n/a       |
+| AAI04 Resource Overload               | n/a       | partial  | n/a       | n/a       |
+| AAI05 Cascading Hallucination         | n/a       | n/a       | n/a       | partial  |
+| AAI06 Intent Manipulation             | partial  | partial  | n/a       | n/a       |
+| AAI07 Misaligned Behavior             | n/a       | partial  | n/a       | partial  |
+| AAI08 Repudiation                     | full     | full     | n/a       | full     |
+| AAI09 Identity Spoofing               | full     | n/a       | n/a       | full     |
+| AAI10 Overreliance                    | n/a       | partial  | n/a       | n/a       |
 
 **Selective Disclosure** does not map directly to the OWASP
 Top 10 because the OWASP list focuses on operational and identity
@@ -369,7 +369,7 @@ To set honest expectations:
   Secret management, dependency auditing, network policy, and host
   hardening remain the operator's responsibility.
 - **Sanctuary is not a SNARK-based ZK system** (yet). Selective Disclosure uses Schnorr
-  proofs and Pedersen commitments over Ristretto255 — genuine ZK
+  proofs and Pedersen commitments over Ristretto255, genuine ZK
   primitives, but not Groth16/PLONK. See `config.ts` validation.
 
 ---
@@ -380,7 +380,7 @@ To set honest expectations:
 - OWASP Top 10 for LLM Applications (2023, 2025 revision)
 - Sanctuary [`SECURITY_AUDIT.md`](../SECURITY_AUDIT.md)
 - Sanctuary [`KNOWN_ISSUES.md`](../KNOWN_ISSUES.md)
-- Sanctuary [`SHR_SPEC.md`](SHR_SPEC.md) — sovereignty health report format
+- Sanctuary [`SHR_SPEC.md`](SHR_SPEC.md): sovereignty health report format
 
 ---
 

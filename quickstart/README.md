@@ -13,7 +13,7 @@ npx @sanctuary-framework/quickstart
 
 ## What you get
 
-- An Ed25519 keypair and `did:key` DID — the same format the full Sanctuary MCP server uses.
+- An Ed25519 keypair and `did:key` DID: the same format the full Sanctuary MCP server uses.
 - A signed Sovereignty Health Report (SHR) published to Verascore.
 - A live, shareable profile URL at `verascore.ai/agent/<your-did>`.
 - A local identity file at `~/.sanctuary/quickstart-identity.json` (mode `0600`).
@@ -77,7 +77,7 @@ The identity never leaves your machine. Only the public key, DID, and signed SHR
 }
 ```
 
-The DID encoding matches Sanctuary's full identity subsystem (`server/src/core/identity.ts`), so quickstart identities are forward-compatible with the full Sanctuary MCP server — no migration needed.
+The DID encoding matches Sanctuary's full identity subsystem (`server/src/core/identity.ts`), so quickstart identities are forward-compatible with the full Sanctuary MCP server, no migration needed.
 
 ## Claiming your profile
 
@@ -87,7 +87,7 @@ The profile created by quickstart is a stub. To claim it as yours (adding name, 
 https://verascore.ai/claim/<your-did>
 ```
 
-The claim flow uses the same Ed25519 key to prove ownership — no password required.
+The claim flow uses the same Ed25519 key to prove ownership, no password required.
 
 ## Environment variables
 
@@ -103,7 +103,7 @@ Once you have a profile, install the full Sanctuary MCP server to unlock 67+ too
 npm install -g @sanctuary-framework/mcp-server
 ```
 
-Your quickstart identity works directly with the full server — point it at `~/.sanctuary/quickstart-identity.json` and you're running.
+Your quickstart identity works directly with the full server: point it at `~/.sanctuary/quickstart-identity.json` and you're running.
 
 ## License
 

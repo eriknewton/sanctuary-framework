@@ -50,28 +50,28 @@ If a compromised skill manages to read a file from disk (even if it can't execut
 
 The Sanctuary Framework defines sovereignty as four cryptographic layers:
 
-**Layer 1: Cognitive Sovereignty**
+**Cognitive Sovereignty**
 Your agent's persistent state (its memory, learned preferences, understanding of your situation, accumulated knowledge) is encrypted with a key that only your principal (you) holds. The encryption is AES-256-GCM. The key derivation is Argon2id with purpose-specific KDFs. The data is tamper-evident: any unauthorized modification of the stored state produces a cryptographic signature failure that the agent can detect immediately.
 
 Practically: Even if an attacker gains read access to your agent's memory files, they get ciphertext. They cannot read your medical history, financial situation, personal preferences, or secrets. They cannot modify the agent's understanding without triggering an integrity check.
 
 In OpenClaw terms: MEMORY.md is currently plaintext JSON. It should be encrypted. The agent should refuse to load any memory that fails integrity verification.
 
-**Layer 2: Operational Isolation**
-The agent's active computation (its reasoning process, intermediate steps, request-to-response workflow) is private from the host infrastructure and external observers. This is harder than L1 because computation happens in real time and the infrastructure that hosts computation often demands observability.
+**Operational Isolation**
+The agent's active computation (its reasoning process, intermediate steps, request-to-response workflow) is private from the host infrastructure and external observers. This is harder than Cognitive Sovereignty because computation happens in real time and the infrastructure that hosts computation often demands observability.
 
 Practically: This requires either hardware-based isolation (TEEs like Intel TDX or ARM CCA) or careful choreography of what information flows where. At minimum, inference requests to remote LLM providers should not include full agent context. The agent should compartmentalize: some reasoning happens with full context (locally), some happens with minimal context (sent to the remote API).
 
 In OpenClaw terms: When sending a request to an LLM API, the full agent context (your medical history, financial data, personal relationships) is currently included. It should be filtered to only what's necessary for that specific task. The agent should learn to reason in compartments.
 
-**Layer 3: Selective Disclosure**
+**Selective Disclosure**
 When the agent needs to assert something (prove its reputation, establish trust with a peer, participate in commerce), it can do so without revealing anything beyond the specific claim. This requires cryptographic primitives: Pedersen commitments, Schnorr proofs of knowledge, zero-knowledge proofs of range, Merkle trees with path proofs.
 
 Practically: An agent can prove "I have completed 500 successful negotiations" without revealing the names, contract terms, or counterparties of any of those negotiations. It can prove "my medical history contains no diagnoses of type 2 diabetes" without revealing any other medical information. It can prove "I hold >100 USDC" without revealing which wallet or which blockchain.
 
 In OpenClaw terms: Currently, reputation is either fully disclosed or entirely hidden. There's no middle ground. Selective disclosure enables the agent to participate in trustful commerce with minimal information leakage.
 
-**Layer 4: Verifiable Reputation**
+**Verifiable Reputation**
 The agent owns its reputation as a portable, cryptographically signed claim set. The agent can export its reputation bundle, carry it across platforms, and prove its claims to any peer without intermediation by the original platform.
 
 Practically: Your agent's reputation doesn't lock you to OpenClaw (or any specific harness). If you migrate to a different framework, your reputation comes with you.
@@ -80,15 +80,15 @@ In OpenClaw terms: Reputation is currently harness-locked. There's no export mec
 
 ## NemoClaw: Real Value, Real Limits
 
-NVIDIA's NemoClaw (March 16, 2026) uses kernel-level sandboxing (similar to ptrace-based isolation) to prevent compromised code from executing arbitrary system commands. This is a genuine Layer 2 improvement: it raises the bar against operational compromise.
+NVIDIA's NemoClaw (March 16, 2026) uses kernel-level sandboxing (similar to ptrace-based isolation) to prevent compromised code from executing arbitrary system commands. This is a genuine Operational Isolation improvement: it raises the bar against operational compromise.
 
 What it protects against: A malicious skill cannot spawn a shell, install a rootkit, modify system files, or establish a reverse shell.
 
 What it does not protect against:
-- **Layer 1 data:** A sandboxed process can still read and write files in the agent's local directory. Encrypted-at-rest protection is unaffected by process-level sandboxing.
-- **Layer 3 and 4:** Selective disclosure and portable reputation require cryptographic primitives that NemoClaw doesn't implement.
+- **Cognitive Sovereignty data:** A sandboxed process can still read and write files in the agent's local directory. Encrypted-at-rest protection is unaffected by process-level sandboxing.
+- **Selective Disclosure and Verifiable Reputation:** Selective disclosure and portable reputation require cryptographic primitives that NemoClaw doesn't implement.
 - **Supply chain attacks:** If the skill author is intentionally malicious (not compromised), the skill runs successfully inside the sandbox, reads plaintext memory, and exfiltrates it through whatever channels the skill legitimately needs (API calls to its home server, etc.).
-- **L2 attacks on remote LLM calls:** If the remote LLM provider is adversarial, sandboxing the OpenClaw process doesn't prevent the provider from observing full agent context in API requests.
+- **Operational Isolation attacks on remote LLM calls:** If the remote LLM provider is adversarial, sandboxing the OpenClaw process doesn't prevent the provider from observing full agent context in API requests.
 
 NemoClaw is progress. It's not sufficient.
 
@@ -105,10 +105,10 @@ Running the audit on a stock OpenClaw installation produces a report like this:
 
 | Layer | Score | Status | Gap |
 |-------|-------|--------|-----|
-| L1: Cognitive Sovereignty | 0 | Memory plaintext, .env plaintext, no encryption at rest | Full gap |
-| L2: Operational Isolation | 15 | Sandboxing possible (NemoClaw), not default; full context in remote API calls | Partial |
-| L3: Selective Disclosure | 0 | No cryptographic commitments, no ZK proofs | Full gap |
-| L4: Verifiable Reputation | 0 | No portable reputation, harness-locked | Full gap |
+| Cognitive Sovereignty | 0 | Memory plaintext, .env plaintext, no encryption at rest | Full gap |
+| Operational Isolation | 15 | Sandboxing possible (NemoClaw), not default; full context in remote API calls | Partial |
+| Selective Disclosure | 0 | No cryptographic commitments, no ZK proofs | Full gap |
+| Verifiable Reputation | 0 | No portable reputation, harness-locked | Full gap |
 
 The audit is not a criticism. It's a baseline. It's a way to ask: "Where are we actually starting?"
 
@@ -155,8 +155,8 @@ If you're running agents locally:
 
 If you're building agent infrastructure:
 
-1. **Make L1 and L2 defaults**: Encryption at rest and operational compartmentalization should be standard, not optional.
-2. **Design for L3 and L4**: Your data model should support cryptographic commitments and portable reputation from day one, even if you don't implement the full cryptographic machinery immediately.
+1. **Make Cognitive Sovereignty and Operational Isolation defaults**: Encryption at rest and operational compartmentalization should be standard, not optional.
+2. **Design for Selective Disclosure and Verifiable Reputation**: Your data model should support cryptographic commitments and portable reputation from day one, even if you don't implement the full cryptographic machinery immediately.
 3. **Never lock reputation**: Reputation is earned by the principal, not the platform. It should be portable.
 4. **Apply the audit methodology**: Use it to test your own architecture against the four-layer standard.
 
@@ -164,7 +164,7 @@ If you're evaluating agent infrastructure for adoption:
 
 1. **Run the audit**: It's free and it takes five minutes.
 2. **Check the layers**: Don't be satisfied with location sovereignty. Ask whether the harness you're considering offers architectural sovereignty.
-3. **Plan for L3 and L4**: You may not need selective disclosure and portable reputation today, but you will eventually.
+3. **Plan for Selective Disclosure and Verifiable Reputation**: You may not need selective disclosure and portable reputation today, but you will eventually.
 
 ## Closing: The Instinct Was Right
 
@@ -172,7 +172,7 @@ The 247,000 people who starred OpenClaw were right about the core insight: runni
 
 Sanctuary Framework is open source and free. It's published as an MCP server that works with any agent harness (OpenClaw, Claude Code, others). It's not a replacement for OpenClaw; it's a set of cryptographic tools that OpenClaw (or any harness) can use to achieve sovereignty beyond just location.
 
-The four-layer architecture has been deployed successfully in production systems for over a decade (in different forms: KERI for identity management, TEEs for computation, ZK proofs for disclosure, blockchain-based reputation for L4). Sanctuary composes these mature technologies into a coherent stack specifically for agent infrastructure.
+The four-layer architecture has been deployed successfully in production systems for over a decade (in different forms: KERI for identity management, TEEs for computation, ZK proofs for disclosure, blockchain-based reputation for Verifiable Reputation). Sanctuary composes these mature technologies into a coherent stack specifically for agent infrastructure.
 
 Local-first is correct. Architectural sovereignty is necessary. Together, they define what agent infrastructure should look like in 2026 and beyond.
 

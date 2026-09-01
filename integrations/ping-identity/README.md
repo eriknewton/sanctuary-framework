@@ -6,9 +6,9 @@ This integration demonstrates how to use Sanctuary's Sovereignty Health Reports 
 
 Ping Identity's "Identity for AI" (GA March 2026) includes an Agent Gateway that evaluates contextual authorization decisions for AI agents. This integration bridges Sanctuary's sovereignty framework with Ping's identity infrastructure by:
 
-1. **Generating SHRs** — Sanctuary agents produce signed SHRs describing their sovereignty posture
-2. **Transforming for the Gateway** — The adapter formats SHRs into a Ping-compatible authorization context
-3. **Enabling Runtime Decisions** — The Gateway uses sovereignty signals to adjust authorization constraints
+1. **Generating SHRs**: Sanctuary agents produce signed SHRs describing their sovereignty posture
+2. **Transforming for the Gateway**: The adapter formats SHRs into a Ping-compatible authorization context
+3. **Enabling Runtime Decisions**: The Gateway uses sovereignty signals to adjust authorization constraints
 
 ## Architecture
 
@@ -66,7 +66,7 @@ The authorization context contains:
 
 - **overall_score** (0-100): Weighted average of all four layer scores
 - **recommended_trust_level**: "full", "elevated", "standard", or "restricted"
-- **layer_scores**: Individual scores for L1 (cognitive), L2 (operational), L3 (disclosure), L4 (reputation)
+- **layer_scores**: Individual scores for the four layers: Cognitive, Operational, Disclosure (Charter), Reputation (Heralds)
 - **authorization_signals**: Boolean flags for capability availability
 - **recommended_constraints**: Suggested restrictions based on sovereignty gaps
 
@@ -77,8 +77,8 @@ Based on the context, the Gateway applies constraints:
 | Sovereignty Posture | Recommended Constraint | Rationale |
 |---|---|---|
 | Score ≥ 80, all layers active | Full autonomous operation | Complete sovereignty across all layers |
-| Score 60-79, some L2 degradation | Elevated (read-only writes) | Process isolation only, TEE unavailable |
-| Score 40-59, L3 degraded | Standard (no selective disclosure) | Cannot prove privacy-preserving predicates |
+| Score 60-79, some Operational Isolation degradation | Elevated (read-only writes) | Process isolation only, TEE unavailable |
+| Score 40-59, Selective Disclosure degraded | Standard (no selective disclosure) | Cannot prove privacy-preserving predicates |
 | Score < 40, multiple layers degraded | Restricted (identity verification required, human approval) | Multiple sovereignty gaps, high risk |
 
 ## Authorization Context Schema
@@ -182,9 +182,9 @@ if (gatewayResponse.constraints.includes('read_only')) {
 
 This integration demonstrates Sanctuary's composition principle: sovereignty remains **identity-standard-agnostic**. The same SHR can be formatted for:
 
-- **Ping Identity** (`format="ping"`) — Ping-specific authorization context
-- **Generic identity systems** (`format="generic"`) — Standard capability advertisement
-- **Future identity providers** — Add new transformers without modifying SHR
+- **Ping Identity** (`format="ping"`): Ping-specific authorization context
+- **Generic identity systems** (`format="generic"`): Standard capability advertisement
+- **Future identity providers**: Add new transformers without modifying SHR
 
 The SHR itself is immutable; only the presentation layer changes.
 
@@ -196,7 +196,7 @@ The adapter maps real-world sovereignty gaps to authorization constraints:
 |---|---|---|
 | No TEE, process isolation only | `read_only` | "Restrict to read-only operations until TEE available" |
 | Self-reported attestation only | `requires_approval` | "Human approval required for writes" |
-| Commitment-only proofs, no ZK | `restricted_scope` | "Limit data sharing scope — cannot prove privacy-preserving predicates" |
+| Commitment-only proofs, no ZK | `restricted_scope` | "Limit data sharing scope: cannot prove privacy-preserving predicates" |
 | Non-portable reputation | `known_agents_only` | "Restrict to interactions with pre-approved agents" |
 | Multiple degradations | `identity_verification_required` | "Additional identity verification required" |
 
@@ -218,17 +218,17 @@ Tests cover:
 
 ## Specification Reference
 
-- **SHR Specification**: `docs/SHR_SPEC.md` — Machine-readable sovereignty posture
-- **Sanctuary Framework**: `server/src/shr/generator.ts` — SHR generation
-- **Gateway Adapter**: `server/src/shr/gateway-adapter.ts` — Transformation logic
+- **SHR Specification**: `docs/SHR_SPEC.md`, machine-readable sovereignty posture
+- **Sanctuary Framework**: `server/src/shr/generator.ts`, SHR generation
+- **Gateway Adapter**: `server/src/shr/gateway-adapter.ts`, transformation logic
 - **Ping Identity Pathway**: Submitted via Nexus Technology Innovation pathway
 
 ## Next Steps
 
-1. **Pre-meeting POC** — Deploy to test Sanctuary instance, demonstrate SHR → Gateway flow
-2. **SHR→Agent Gateway Adapter** — Build lightweight format converter for other identity systems
-3. **Non-TEE L2 Hardening** — Develop process-isolation + memory-protection path that moves L2 from "Degraded" to "Hardened" (most common constraint agents will encounter)
-4. **Authorization Policy as-Code** — Enable agents to express authorization preferences alongside sovereignty posture
+1. **Pre-meeting POC**: Deploy to test Sanctuary instance, demonstrate SHR → Gateway flow
+2. **SHR→Agent Gateway Adapter**: Build lightweight format converter for other identity systems
+3. **Non-TEE Operational Isolation Hardening**: Develop process-isolation + memory-protection path that moves Operational Isolation from "Degraded" to "Hardened" (most common constraint agents will encounter)
+4. **Authorization Policy as-Code**: Enable agents to express authorization preferences alongside sovereignty posture
 
 ## Author
 

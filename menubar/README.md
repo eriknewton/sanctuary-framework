@@ -6,7 +6,7 @@ This is the **Sprint Piece 1** foundation. Approve / deny buttons land in Sprint
 
 ## Castle Architecture position
 
-The menubar lives at **Castle Layer 3** (Cooperative MCP capability surface). It watches your fortress and shows you what is happening. It does **not** enforce: enforcement is the job of Castle Layer 1 (the Castle Wall, OS-level egress filter, ships separately as WP-V1.x-CASTLE-WALL) and the Cooperative MCP gate inside the fortress. The menubar is the daily-driver UX that makes the substrate visible to the operator.
+The menubar lives at the **Charter** layer (Cooperative MCP capability surface). It watches your fortress and shows you what is happening. It does **not** enforce: enforcement is the job of the **Castle Wall** layer (OS-level egress filter, ships separately as WP-V1.x-CASTLE-WALL) and the Cooperative MCP gate inside the fortress. The menubar is the daily-driver UX that makes the substrate visible to the operator.
 
 See `server/rfcs/RFC-0003-castle-architecture.md` for the canonical four-layer model.
 

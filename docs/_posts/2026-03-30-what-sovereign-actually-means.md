@@ -44,7 +44,7 @@ Sovereignty (real sovereignty, for any participant) requires four things:
 
 **Portable reputation.** When you move agents, switch platforms, or interact with new counterparties, your track record should follow you. Not locked to a platform. Not dependent on a provider's goodwill. Signed attestations you own, that you can present anywhere, that anyone can verify independently.
 
-These four layers aren't arbitrary. They map to specific threats: state exfiltration (L1), computation observation (L2), over-disclosure (L3), and platform lock-in (L4). Miss any one of them and you have a gap that collapses the whole promise.
+These four layers aren't arbitrary. They map to specific threats: state exfiltration (Cognitive Sovereignty), computation observation (Operational Isolation), over-disclosure (Selective Disclosure), and platform lock-in (Verifiable Reputation). Miss any one of them and you have a gap that collapses the whole promise.
 
 ## The structural identity
 
@@ -62,7 +62,7 @@ Three forces are converging that make this urgent rather than theoretical.
 
 The local-first agent community just demonstrated what happens when you confuse location with sovereignty. Running code on your own machine is necessary but not sufficient. Without encrypted state, policy enforcement, and integrity verification, "local" gives you custody without protection, like storing cash under a mattress and calling it a bank vault.
 
-The EU AI Act reaches full enforcement on August 2, 2026, four months from now. The Act requires transparency, accountability, and auditability for high-risk AI systems. A Sovereignty Health Report that documents an agent's cryptographic posture across all four layers becomes a compliance artifact, not an aspiration. Enterprises that can demonstrate L1-L4 coverage will have a regulatory advantage. Those that can't will face enforcement risk.
+The EU AI Act reaches full enforcement on August 2, 2026, four months from now. The Act requires transparency, accountability, and auditability for high-risk AI systems. A Sovereignty Health Report that documents an agent's cryptographic posture across all four layers becomes a compliance artifact, not an aspiration. Enterprises that can demonstrate coverage across all four layers will have a regulatory advantage. Those that can't will face enforcement risk.
 
 And the agent protocol stack is crystallizing. MCP for tools. A2A for communication. ACP and x402 for payments. But nobody has defined the sovereignty guarantees that must hold across all of these layers. Nobody is asking: would this architecture be adequate if the participant were a conscious being?
 
