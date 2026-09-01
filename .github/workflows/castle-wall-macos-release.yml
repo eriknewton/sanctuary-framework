@@ -7,8 +7,6 @@ on:
         description: "Version tag (e.g., v1.4.0)"
         required: true
         type: string
-  release:
-    types: [created]
 
 permissions:
   contents: read
@@ -22,6 +20,9 @@ jobs:
     # the macOS 26 SDK, regardless of an installed toolchain. Matches the
     # PR-check workflow (castle-wall-macos.yml, PR #376) and COWORK lesson #78.
     runs-on: macos-26
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      artifact_sha256: ${{ steps.artifact.outputs.sha256 }}
     steps:
       # Full history is REQUIRED: build-signed.sh derives CFBundleVersion from
       # `git rev-list --count HEAD`, and macOS only replaces an activated system
@@ -35,7 +36,9 @@ jobs:
       # job.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/tags/${{ inputs.version_tag }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Show toolchain
         run: |
@@ -50,10 +53,32 @@ jobs:
           cache: npm
           cache-dependency-path: server/package-lock.json
 
+      - name: Bind build to the requested immutable release tag
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.version_tag }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+(\.[A-Za-z0-9]+)*)?$ ]]; then
+            echo "::error::version_tag must be canonical semver with a v prefix"
+            exit 1
+          fi
+          package_version=$(node -p "require('./server/package.json').version")
+          if [[ "v${package_version}" != "$RELEASE_TAG" ]]; then
+            echo "::error::version_tag ($RELEASE_TAG) does not match server/package.json ($package_version)"
+            exit 1
+          fi
+          source_sha=$(git rev-parse HEAD)
+          tag_sha=$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")
+          if [[ "$source_sha" != "$tag_sha" ]]; then
+            echo "::error::checkout source ($source_sha) does not match $RELEASE_TAG ($tag_sha)"
+            exit 1
+          fi
+          echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "SANCTUARY_SOURCE_SHA=$source_sha" >> "$GITHUB_ENV"
+
       - name: Build self-contained Castle Wall and CLI runtimes
         working-directory: server
-        env:
-          SANCTUARY_SOURCE_SHA: ${{ github.sha }}
         run: |
           npm ci --ignore-scripts
           npm run build
@@ -339,7 +364,7 @@ jobs:
 
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")" = "$EXPECTED_VERSION"
           test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCliRuntimeVersion' "$APP/Contents/Info.plist")" = "$EXPECTED_VERSION"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCastleWallSourceSHA' "$APP/Contents/Info.plist")" = "$GITHUB_SHA"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCastleWallSourceSHA' "$APP/Contents/Info.plist")" = "$SANCTUARY_SOURCE_SHA"
           test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCliRuntimeNodeVersion' "$APP/Contents/Info.plist")" = "$("$NODE" --version)"
           test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCliRuntimeManifestSHA256' "$APP/Contents/Info.plist")" = "$(shasum -a 256 "$MANIFEST" | awk '{print $1}')"
 
@@ -554,7 +579,7 @@ jobs:
           test "$ARTIFACT_MACH_O_COUNT" -ge 2
           test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCliRuntimeManifestSHA256' "$ARTIFACT_APP/Contents/Info.plist")" = "$(shasum -a 256 "$ARTIFACT_MANIFEST" | awk '{print $1}')"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ARTIFACT_APP/Contents/Info.plist")" = "$EXPECTED_VERSION"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCastleWallSourceSHA' "$ARTIFACT_APP/Contents/Info.plist")" = "$GITHUB_SHA"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCastleWallSourceSHA' "$ARTIFACT_APP/Contents/Info.plist")" = "$SANCTUARY_SOURCE_SHA"
           test "$(/usr/libexec/PlistBuddy -c 'Print :SanctuaryCliRuntimeNodeVersion' "$ARTIFACT_APP/Contents/Info.plist")" = "$("$ARTIFACT_RUNTIME/node" --version)"
           /usr/bin/env -i PATH=/usr/bin:/bin NODE_OPTIONS='--require=/definitely/missing' NODE_PATH=/definitely/missing \
             "$ARTIFACT_LAUNCHER" --version \
@@ -700,15 +725,113 @@ jobs:
       - name: Upload signed artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: Sanctuary-CastleWall-${{ inputs.version_tag || github.event.release.tag_name }}
+          name: Sanctuary-CastleWall-${{ inputs.version_tag }}
           path: |
             castle-wall-macos/build/Sanctuary-CastleWall.app.zip
           retention-days: 90
 
       - name: SHA-256
+        id: artifact
         working-directory: castle-wall-macos
-        run: shasum -a 256 build/Sanctuary-CastleWall.app.zip | tee build/sha256.txt
+        run: |
+          set -euo pipefail
+          artifact_sha256=$(shasum -a 256 build/Sanctuary-CastleWall.app.zip | awk '{print $1}')
+          printf '%s  %s\n' "$artifact_sha256" "build/Sanctuary-CastleWall.app.zip" | tee build/sha256.txt
+          echo "sha256=$artifact_sha256" >> "$GITHUB_OUTPUT"
 
       - name: Cleanup signing keychain
         if: always()
         run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
+  stage-app-release:
+    name: stage exact app on private GitHub release
+    needs: build-sign-notarize
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.version_tag }}
+      SOURCE_SHA: ${{ needs.build-sign-notarize.outputs.source_sha }}
+      ARTIFACT_SHA256: ${{ needs.build-sign-notarize.outputs.artifact_sha256 }}
+    steps:
+      - name: Checkout exact-tag release notes
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.version_tag }}
+          persist-credentials: false
+          sparse-checkout: docs/releases
+
+      - name: Download exact signed app
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: Sanctuary-CastleWall-${{ inputs.version_tag }}
+          path: release
+
+      - name: Verify and stage the exact app on a draft release
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ARTIFACT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          notes_file="docs/releases/${TAG}.md"
+          app_zip="release/Sanctuary-CastleWall.app.zip"
+          test -s "$notes_file"
+          test -f "$app_zip"
+          actual_sha256=$(sha256sum "$app_zip" | awk '{print $1}')
+          if [[ "$actual_sha256" != "$ARTIFACT_SHA256" ]]; then
+            echo "::error::downloaded app digest differs from the build job"
+            exit 1
+          fi
+
+          resolve_remote_tag() {
+            local tag_object object_type resolved
+            tag_object=$(gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha') || {
+              echo "::error::GitHub API failed to resolve $TAG"
+              return 1
+            }
+            read -r object_type resolved <<< "$tag_object"
+            for _ in {1..16}; do
+              [[ "$object_type" == tag ]] || break
+              tag_object=$(gh api "repos/${GH_REPO}/git/tags/${resolved}" --jq '.object.type + " " + .object.sha') || {
+                echo "::error::GitHub API failed while peeling $TAG"
+                return 1
+              }
+              read -r object_type resolved <<< "$tag_object"
+            done
+            [[ "$object_type" == commit && "$resolved" =~ ^[0-9a-f]{40}$ ]]
+            printf '%s' "$resolved"
+          }
+
+          resolved=$(resolve_remote_tag)
+          if [[ "$resolved" != "$SOURCE_SHA" ]]; then
+            echo "::error::$TAG does not name the app source (built $SOURCE_SHA, now $resolved)"
+            exit 1
+          fi
+
+          if gh release view "$TAG" --json isDraft --jq .isDraft > draft-state 2>/dev/null; then
+            if [[ "$(cat draft-state)" != "true" ]]; then
+              echo "::error::release $TAG is already public; refusing to overwrite it"
+              exit 1
+            fi
+            gh release edit "$TAG" --title "$TAG" --notes-file "$notes_file"
+          else
+            if [[ "$TAG" == *-* ]]; then prerelease_flag=--prerelease; else prerelease_flag=; fi
+            gh release create "$TAG" --draft $prerelease_flag --verify-tag --target "$SOURCE_SHA" --title "$TAG" --notes-file "$notes_file"
+          fi
+          gh release upload "$TAG" "$app_zip" --clobber
+
+          uploaded_digest=$(gh release view "$TAG" --json assets --jq '.assets[] | select(.name == "Sanctuary-CastleWall.app.zip") | .digest')
+          if [[ "$uploaded_digest" != "sha256:${ARTIFACT_SHA256}" ]]; then
+            echo "::error::GitHub release app digest differs from the verified build artifact"
+            exit 1
+          fi
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]]; then
+            echo "::error::release $TAG became public while the app was being staged"
+            exit 1
+          fi
+          resolved=$(resolve_remote_tag)
+          if [[ "$resolved" != "$SOURCE_SHA" ]]; then
+            echo "::error::$TAG moved while the app was being staged"
+            exit 1
+          fi

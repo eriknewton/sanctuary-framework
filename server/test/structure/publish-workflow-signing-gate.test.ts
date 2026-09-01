@@ -109,13 +109,18 @@ describe("publish workflow trust zones", () => {
     expect(publish).toContain(exactTarball);
     expect(workflow).not.toMatch(/needs\.build-release\.outputs\.(?:tarball|version|dist_tag)/);
     expect(occurrences(workflow, "needs.build-release.outputs.source_sha")).toBe(2);
+    expect(build).toContain('notes_file="docs/releases/v${RELEASE_VERSION}.md"');
+    expect(build).toContain("server/release-notes.md");
+    expect(stage).toContain("release/release-notes.md");
   });
 
   it("stages privately before npm and finalizes only after npm", () => {
-    expect(stage).toMatch(/gh release create "\$TAG" --draft .*--verify-tag/);
-    expect(stage).toContain('--target "$SOURCE_SHA"');
+    expect(stage).not.toContain("gh release create");
+    expect(stage).toContain("run the exact-tag Castle Wall macOS release workflow first");
+    expect(stage).toContain('gh release edit "$TAG" --title "$TAG" --notes-file release/release-notes.md');
     expect(stage).toContain("release/release-manifest.json");
     expect(stage).toContain('release/sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz');
+    expect(stage).toContain("Sanctuary-CastleWall.app.zip");
     expect(finalize).toContain("gh release edit \"$TAG\" --draft=false");
     expect(finalize).toContain("gh release edit \"$TAG\" --draft=false --latest");
     expect(stage).toContain("expected_assets=");
@@ -123,6 +128,7 @@ describe("publish workflow trust zones", () => {
     expect(stage).toContain("Use pinned Node.js for staged artifact verification");
     expect(stage).toContain("node-version: 24.14.0");
     expect(finalize).toContain("expected_assets=");
+    expect(finalize).toContain("Sanctuary-CastleWall.app.zip");
     expect(finalize).toContain("gh release download \"$TAG\"");
     expect(finalize).toContain("Use pinned Node.js for final artifact verification");
     expect(finalize).toContain("node-version: 24.14.0");

@@ -92,6 +92,12 @@ jobs:
             echo "::error::input version ($RELEASE_VERSION) does not match server/package.json ($package_version)"
             exit 1
           fi
+          notes_file="docs/releases/v${RELEASE_VERSION}.md"
+          if [[ ! -s "$notes_file" ]]; then
+            echo "::error::approved release notes are missing at $notes_file"
+            exit 1
+          fi
+          cp "$notes_file" server/release-notes.md
 
       # These stdlib-only checks run before npm or pip lifecycle code can
       # mutate the checkout. The inline comparison binds the currently
@@ -156,7 +162,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: unsigned-release-${{ github.run_id }}
-          path: server/sanctuary-framework-mcp-server-${{ inputs.version }}.tgz
+          path: |
+            server/sanctuary-framework-mcp-server-${{ inputs.version }}.tgz
+            server/release-notes.md
           if-no-files-found: error
           overwrite: true
           retention-days: 2
@@ -284,30 +292,27 @@ jobs:
             --version "$RELEASE_VERSION" \
             --expected-public-key "$RELEASE_PUBLIC_KEY_B64URL"
 
-      - name: Create or reuse draft release and upload signed set
+      - name: Require app-staged draft release and upload signed set
         run: |
           set -euo pipefail
-          if gh release view "$TAG" --json isDraft --jq .isDraft > draft-state 2>/dev/null; then
-            if [[ "$(cat draft-state)" != "true" ]]; then
-              echo "::error::release $TAG is already public; refusing to overwrite it"
-              exit 1
-            fi
-          else
-            if [[ "$RELEASE_VERSION" == *-* ]]; then
-              prerelease_flag=--prerelease
-            else
-              prerelease_flag=
-            fi
-            gh release create "$TAG" --draft $prerelease_flag --verify-tag --target "$SOURCE_SHA" --title "$TAG" --notes "Release staged by the hardened publish workflow."
+          if ! gh release view "$TAG" --json isDraft --jq .isDraft > draft-state 2>/dev/null; then
+            echo "::error::draft release $TAG is missing; run the exact-tag Castle Wall macOS release workflow first"
+            exit 1
           fi
+          if [[ "$(cat draft-state)" != "true" ]]; then
+            echo "::error::release $TAG is already public; refusing to overwrite it"
+            exit 1
+          fi
+          test -s release/release-notes.md
+          gh release edit "$TAG" --title "$TAG" --notes-file release/release-notes.md
           gh release upload "$TAG" \
             release/release-manifest.json \
             "release/sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz" \
             --clobber
-          expected_assets="release-manifest.json,sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz"
+          expected_assets="Sanctuary-CastleWall.app.zip,release-manifest.json,sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz"
           actual_assets=$(gh release view "$TAG" --json assets --jq '[.assets[].name] | sort | join(",")')
           if [[ "$actual_assets" != "$expected_assets" ]]; then
-            echo "::error::draft release assets are not the exact two-file signed release set (got: $actual_assets)"
+            echo "::error::draft release assets are not the exact three-asset release set (got: $actual_assets)"
             exit 1
           fi
           if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]]; then
@@ -465,7 +470,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" == "true" ]]
-          expected_assets="release-manifest.json,sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz"
+          expected_assets="Sanctuary-CastleWall.app.zip,release-manifest.json,sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz"
           actual_assets=$(gh release view "$TAG" --json assets --jq '[.assets[].name] | sort | join(",")')
           [[ "$actual_assets" == "$expected_assets" ]]
           tag_object=$(gh api "repos/${GH_REPO}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha') || {
