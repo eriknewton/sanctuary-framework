@@ -6,7 +6,7 @@
 //!
 //! The verdict loop is the bridge between the kernel and the daemon's
 //! policy evaluator: for each packet the kernel delivers via NFQUEUE,
-//! the loop calls `DaemonHandle::evaluate_attempt()`, converts the
+//! the loop calls `DecisionEngine::evaluate_attempt()`, converts the
 //! `Verdict` into an NFQUEUE verdict (Accept/Drop), and emits the
 //! audit event via the WalWriter.
 //!
@@ -401,16 +401,19 @@ pub fn run_verdict_loop(
     Err(NfqueueError::NotAvailableOnPlatform)
 }
 
-/// Build a verdict callback that routes through the daemon's evaluate_attempt
+/// Build a verdict callback that routes through the shared decision engine's
+/// evaluate_attempt
 /// path. This is the glue between the kernel NFQUEUE and the in-process
 /// policy evaluator from Checkpoint 3.
 ///
 /// The callback:
 /// 1. Constructs an EvaluationRequest from the PendingPacket.
-/// 2. Calls evaluate_attempt on the shared DaemonHandle.
+/// 2. Calls evaluate_attempt on the shared DecisionEngine.
 /// 3. Maps Verdict::Allow -> NfVerdict::Accept, all else -> NfVerdict::Drop.
 /// 4. The audit event is emitted inside evaluate_attempt (WAL + ring buffer).
-pub fn build_verdict_callback(daemon_handle: Arc<crate::daemon::DaemonHandle>) -> VerdictCallback {
+pub fn build_verdict_callback(
+    decision_engine: Arc<crate::decision::DecisionEngine>,
+) -> VerdictCallback {
     Box::new(move |packet: &PendingPacket| {
         let Some(agent_id) = packet.source_agent_id.clone() else {
             return NfVerdict::Drop;
@@ -432,7 +435,7 @@ pub fn build_verdict_callback(daemon_handle: Arc<crate::daemon::DaemonHandle>) -
             opaque: true,
         };
 
-        match daemon_handle.evaluate_attempt(&request) {
+        match decision_engine.evaluate_attempt(&request) {
             Ok(outcome) => match outcome.verdict {
                 crate::policy::Verdict::Allow { .. } => NfVerdict::Accept,
                 crate::policy::Verdict::PromptRequired { .. } => NfVerdict::Drop,
