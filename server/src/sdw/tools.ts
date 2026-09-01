@@ -276,7 +276,7 @@ function buildSdwTools(
   // refused with the fixed denial and an audit record.
   const refusedForeignIdentity = async (operation: string): Promise<boolean> => {
     if (options.isolationGuard === undefined) return false;
-    if (options.isolationGuard(operation).allowed) return false;
+    if ((await options.isolationGuard(operation)).allowed) return false;
     // Same denial class as the memory families (must match
     // SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS in memory-tools.ts).
     await auditFailure(`${operation}_denied`, { denial_class: SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS });

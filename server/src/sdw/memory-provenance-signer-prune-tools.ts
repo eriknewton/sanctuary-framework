@@ -25,7 +25,7 @@ export function createMemoryProvenanceSignerPruneTool(options: {
       additionalProperties: false,
     },
     handler: async (_args, _caller, context) => {
-      if (!options.isolationGuard(MEMORY_PROVENANCE_SIGNER_PRUNE_OPERATION).allowed ||
+      if (!(await options.isolationGuard(MEMORY_PROVENANCE_SIGNER_PRUNE_OPERATION)).allowed ||
           context?.approvalAuditId === undefined) {
         return toolResult(fixedDenial(
           `audit:${MEMORY_PROVENANCE_SIGNER_PRUNE_OPERATION}`,

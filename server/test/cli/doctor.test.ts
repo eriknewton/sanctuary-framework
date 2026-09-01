@@ -483,6 +483,49 @@ approval_channel:
     expect(out.text()).toContain("OK   exit admission lock");
   });
 
+  it("IC-16: FAILs with exact recovery guidance when an SDW owner transfer lock remains", async () => {
+    const fortress = await makeFortress({ identity: true, policy: "valid" });
+    const lockDir = join(fortress, "state", "_sdw_meta");
+    await mkdir(lockDir, { recursive: true, mode: 0o700 });
+    const lockPath = join(lockDir, ".sdw-owner-pin-v1.enc.compare-replace.lock");
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: 999_999,
+        acquired_at: "2026-09-01T00:00:00.000Z",
+        operation: "storage_compare_and_replace",
+      }),
+      { mode: 0o600 },
+    );
+
+    const out = new Capture();
+    const code = await runDoctorCommand({
+      argv: ["--fortress", fortress],
+      out,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+      platform: "linux",
+    });
+    expect(code).not.toBe(0);
+    expect(out.text()).toContain("FAIL sdw owner transfer lock");
+    expect(out.text()).toContain("pid=999999");
+    expect(out.text()).toContain("process not found");
+    expect(out.text()).toContain(lockPath);
+    expect(out.text()).toContain("never remove it while any Sanctuary process may be running");
+  });
+
+  it("IC-16: reports OK when no SDW owner transfer lock exists", async () => {
+    const fortress = await makeFortress({ identity: true, policy: "valid", audit: true });
+    const out = new Capture();
+    const code = await runDoctorCommand({
+      argv: ["--fortress", fortress],
+      out,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+      platform: "linux",
+    });
+    expect(code).toBe(0);
+    expect(out.text()).toContain("OK   sdw owner transfer lock");
+  });
+
   it("emits JSON shape and exits non-zero when checks fail", async () => {
     const fortress = await makeFortress({ policy: "invalid" });
     const out = new Capture();

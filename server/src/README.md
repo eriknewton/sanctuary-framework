@@ -36,6 +36,8 @@ edit the wire token.
 
 ## MODULE INDEX TABLE (61 modules)
 
+> **IC-16 correction (2026-09-01):** the SDW owner pin is no longer process-local. Production persists a master-MAC-authenticated one-owner-per-fortress record in `_sdw_meta`, atomically claims only a fresh empty store, authenticates it on every SDW route, and uses compare-and-replace for explicit operator transfer. Existing unpinned SDW data refuses until an operator claims it. This closes distinct correctly wrapped cross-process isolation; the cooperative harness-configuration rewrite bound remains. This correction supersedes the older process-local bound still embedded in the historical `sdw` row below.
+
 All 61 module directories under `server/src` are listed. Status legend: **canonical** = a real,
 wired subsystem; **thin/utility** = honestly one or two files; **default-off-allocated** = real code,
 deliberately unwired or off by default (not dead, not shipped-as-enforcing); **versioned-frozen** =

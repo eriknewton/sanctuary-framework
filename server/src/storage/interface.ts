@@ -66,6 +66,31 @@ export interface StorageBackend {
   totalSize(): Promise<number>;
 
   /**
+   * OPTIONAL atomic create. Returns true only when this call created the
+   * entry; false means an entry already existed and nothing changed.
+   * Security-sensitive callers must fail closed when the capability is
+   * absent instead of degrading to read-then-write.
+   */
+  writeIfAbsent?(
+    namespace: string,
+    key: string,
+    data: Uint8Array,
+  ): Promise<boolean>;
+
+  /**
+   * OPTIONAL compare-and-replace. Replaces the entry only when its current
+   * bytes exactly equal `expected`; false means absent or changed and nothing
+   * was written. Implementations must serialize the compare and replacement
+   * across processes -- a read followed by an atomic rename is not enough.
+   */
+  replaceIfEquals?(
+    namespace: string,
+    key: string,
+    expected: Uint8Array,
+    data: Uint8Array,
+  ): Promise<boolean>;
+
+  /**
    * Enumerate every namespace that currently holds at least one entry.
    * OPTIONAL capability: master-key rotation requires it (the rotation
    * walker must be able to prove it visited the WHOLE fortress and fails

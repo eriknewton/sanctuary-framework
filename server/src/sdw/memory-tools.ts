@@ -237,7 +237,7 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
   const isolationDenialOrNull = async (
     operation: string,
   ): Promise<ReturnType<typeof deny> | null> => {
-    if (isolationGuard(operation).allowed) return null;
+    if ((await isolationGuard(operation)).allowed) return null;
     await auditFailure(`${operation}_denied`, {
       denial_class: SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS,
     });

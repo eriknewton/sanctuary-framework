@@ -46,9 +46,9 @@ function fixture(allowed = true) {
     createSdwMemoryProvenanceMigrationTools({
       migration,
       auditLog,
-      isolationGuard: () => allowed
+      isolationGuard: async () => allowed
         ? { allowed: true }
-        : { allowed: false, denial: "multi_agent_isolation" },
+        : { allowed: false, reason: "owner_scope_conflict" },
     }).map((tool) => [tool.name, tool]),
   );
   return { tools, migration, calls };

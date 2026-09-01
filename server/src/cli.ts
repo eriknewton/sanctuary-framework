@@ -439,6 +439,12 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "sdw-owner") {
+    const { runSdwOwnerCommand } = await import("./cli/sdw-owner.js");
+    const code = await runSdwOwnerCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "restore-attest") {
     const { runRestoreAttestCommand } = await import(
       "./cli/restore-attest.js"
@@ -1150,6 +1156,8 @@ Subcommands:
   reset-passphrase     Recover a fortress whose passphrase has been lost
   rotate-master        Rotate the fortress master key (re-encrypts all data;
                        interactive-only; "sanctuary rotate-master --help")
+  sdw-owner            Inspect, explicitly claim, or atomically transfer the
+                       one-owner-per-fortress SDW binding.
                        or corrupted. Three modes: shares (M-of-N
                        reconstruction), guardian (federation quorum), or
                        nuke (destroys all state, fresh start).

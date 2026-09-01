@@ -17,6 +17,10 @@ import { resolveCliMasterKey } from "../core/master-custody.js";
 import { detectCustodyFactorOrphan } from "../wrap/orphan-detection.js";
 import { getPlatformPaths } from "../wrap/config-reader.js";
 import { hermesConfigYamlPath, hermesSanctuaryEntryEnvValue } from "../wrap/hermes-yaml.js";
+import { readSdwOwnerPin } from "../sdw/memory-isolation.js";
+import { SDW_OWNER_PIN_KEY } from "../sdw/write-gate.js";
+import { SDW_META_NAMESPACE } from "../sdw/records.js";
+import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { EXIT_IMPORT_JOURNAL_NAMESPACE, EXIT_RECOVERY_VERB } from "../exit/bundle.js";
 import {
   describePyYamlCandidateFailure,
@@ -163,6 +167,8 @@ export async function runDoctorChecks(opts: {
   checks.push(await checkCastleWall(opts));
   const harnessIds = await collectWrappedHarnessAgentIds();
   checks.push(checkWrappedHarnessAgentIds(harnessIds));
+  checks.push(await checkSdwOwnerTransferLock(opts.storagePath));
+  checks.push(await checkSdwOwnerPin(opts.storagePath, masterKey, harnessIds));
   if (masterKey) masterKey.fill(0);
   return checks;
 }
@@ -596,7 +602,7 @@ async function checkAuditChain(
  * writes `SANCTUARY_AGENT_ID` into the harness's `sanctuary` MCP entry; the
  * server's multi-agent isolation guard keys on it. A wrap performed before
  * that landed has a `sanctuary` entry with no such variable, so the server it
- * spawns resolves no identity and the guard pins the "unconfigured" caller.
+ * spawns resolves no identity and the durable guard refuses it.
  * Read-only: reports the entries that need `sanctuary wrap` re-run. Failure
  * mode from the outside: two harnesses wrapped before the upgrade both look
  * isolated in the docs and are not, and nothing else says so.
@@ -660,6 +666,122 @@ function checkWrappedHarnessAgentIds(entries: readonly WrappedHarnessEntry[]): D
     "wrapped harness ids",
     `${missing.length} wrapped harness entr${missing.length === 1 ? "y" : "ies"} without SANCTUARY_AGENT_ID (${missing.join("; ")})`,
     "re-run sanctuary wrap on each harness so the multi-agent isolation guard has an identity to pin",
+  );
+}
+
+async function checkSdwOwnerPin(
+  storagePath: string,
+  masterKey: Uint8Array | null,
+  entries: readonly WrappedHarnessEntry[],
+): Promise<DoctorCheck> {
+  if (masterKey === null) {
+    return warn(
+      "sdw owner pin",
+      "not checked because no custody key was available",
+      "set SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY",
+    );
+  }
+  const storage = new FilesystemStorage(join(storagePath, "state"));
+  try {
+    const pin = await readSdwOwnerPin(storage, masterKey);
+    if (pin.status === "absent") {
+      return warn(
+        "sdw owner pin",
+        "unassigned; a fresh empty SDW will be claimed on first wrapped use, while an existing SDW will refuse",
+        "for an existing SDW, stop all Sanctuary processes and run 'sanctuary sdw-owner claim --agent-id <wrapped-agent-id>'",
+      );
+    }
+    if (pin.status === "invalid") {
+      return fail(
+        "sdw owner pin",
+        "present but failed authentication",
+        "do not overwrite it; inspect custody and restore history before attempting recovery",
+      );
+    }
+    if (
+      pin.data.fortress_id !== fortressIdFromStoragePath(storagePath) ||
+      pin.data.owner_ref !== "fleet-self"
+    ) {
+      return fail(
+        "sdw owner pin",
+        "authenticated but bound to a different fortress or owner scope",
+        "do not run claim or transfer; investigate a copied or mismatched state directory",
+      );
+    }
+    const ids = entries
+      .map((entry) => entry.agentId)
+      .filter((id): id is string => id !== null);
+    if (!ids.includes(pin.data.agent_id)) {
+      return warn(
+        "sdw owner pin",
+        `pinned to ${pin.data.agent_id}, which matches no wrapped harness entry on this host`,
+        "re-wrap the owning harness, or use the interactive sdw-owner transfer command after verifying the intended new owner",
+      );
+    }
+    return ok(
+      "sdw owner pin",
+      `pinned to ${pin.data.agent_id}, a wrapped harness on this host`,
+      "none",
+    );
+  } catch (error) {
+    return fail(
+      "sdw owner pin",
+      `could not be read: ${error instanceof Error ? error.message : String(error)}`,
+      "inspect fortress state-directory permissions",
+    );
+  }
+}
+
+/**
+ * Owner transfer uses the filesystem backend's fail-closed CAS lock. It is
+ * intentionally never auto-broken because doing so can create two concurrent
+ * owners. Surface the exact lock and its holder here so crash recovery does
+ * not require filesystem archaeology or an unsafe guessed unlink.
+ */
+async function checkSdwOwnerTransferLock(storagePath: string): Promise<DoctorCheck> {
+  const lockPath = join(
+    storagePath,
+    "state",
+    SDW_META_NAMESPACE,
+    `.${SDW_OWNER_PIN_KEY}.enc.compare-replace.lock`,
+  );
+  let raw: string;
+  try {
+    raw = await readFile(lockPath, "utf8");
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return ok("sdw owner transfer lock", "no transfer lock held", "n/a");
+    }
+    return warn(
+      "sdw owner transfer lock",
+      `could not check the transfer lock: ${error instanceof Error ? error.message : String(error)}`,
+      "re-run after confirming the fortress storage path is reachable",
+    );
+  }
+
+  let pid: number | undefined;
+  let acquiredAt: string | undefined;
+  try {
+    const candidate = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof candidate.pid === "number") pid = candidate.pid;
+    if (typeof candidate.acquired_at === "string") acquiredAt = candidate.acquired_at;
+  } catch {
+    // Missing or malformed metadata is handled below. Presence alone is
+    // enough to fail: a transfer cannot safely proceed while this path exists.
+  }
+  const holder =
+    pid === undefined || acquiredAt === undefined
+      ? "metadata unreadable"
+      : `pid=${pid} acquired_at=${acquiredAt} (process ${isPidAlive(pid) ? "alive" : "not found"})`;
+  return fail(
+    "sdw owner transfer lock",
+    `transfer lock present, ${holder}`,
+    "never remove it while any Sanctuary process may be running; stop all " +
+      `Sanctuary processes, confirm the holder is dead, then remove exactly ${lockPath}`,
   );
 }
 

@@ -41,10 +41,11 @@
  */
 
 import { constants as fsConstants } from "node:fs";
-import { open, unlink, readdir, stat, lstat } from "node:fs/promises";
+import { link, open, unlink, readdir, stat, lstat } from "node:fs/promises";
 import type { Stats } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { randomBytes } from "../core/random.js";
+import { constantTimeEqual } from "../core/encoding.js";
 import {
   assertSdwRawWriteAuthorized,
   isSdwNamespace,
@@ -55,6 +56,7 @@ import type {
   StorageEntryMeta,
 } from "./interface.js";
 import { readFileCustody, writeFileCustody } from "./custody-fs.js";
+import { withPathLock } from "./cross-process-lock.js";
 
 const SAFE_CHARS = /[^A-Za-z0-9_.-]/g;
 
@@ -132,6 +134,81 @@ export class FilesystemStorage implements StorageBackend, FilesystemStorageCapab
     const filePath = this.entryPath(namespace, key);
 
     await this.atomicWriteFile(filePath, checkedData, false);
+  }
+
+  async writeIfAbsent(
+    namespace: string,
+    key: string,
+    data: Uint8Array,
+  ): Promise<boolean> {
+    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+    const filePath = this.entryPath(namespace, key);
+    const dirPath = dirname(filePath);
+    const stagedPath = join(
+      dirPath,
+      `.${basename(filePath)}.${process.pid}.${Buffer.from(randomBytes(8)).toString("hex")}.claim`,
+    );
+
+    // Stage bytes with the backend's normal custody discipline, then publish
+    // them with link(2). Creating the destination hard link is atomic and
+    // fails with EEXIST when another process won; unlike rename it never
+    // overwrites the winner. The random staging name does not end in `.enc`,
+    // so an interrupted claim is never enumerated as a storage record.
+    await writeFileCustody(stagedPath, checkedData, {
+      mode: 0o600,
+      parentMode: 0o700,
+      ...(this.owner !== undefined
+        ? { owner: this.owner, ownerBase: this.basePath }
+        : {}),
+    });
+    try {
+      try {
+        await link(stagedPath, filePath);
+      } catch (err: unknown) {
+        if (
+          err instanceof Error &&
+          "code" in err &&
+          (err as NodeJS.ErrnoException).code === "EEXIST"
+        ) {
+          return false;
+        }
+        throw err;
+      }
+      await this.fsyncDirectory(dirPath);
+      return true;
+    } finally {
+      await unlink(stagedPath).catch(() => undefined);
+    }
+  }
+
+  async replaceIfEquals(
+    namespace: string,
+    key: string,
+    expected: Uint8Array,
+    data: Uint8Array,
+  ): Promise<boolean> {
+    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+    const filePath = this.entryPath(namespace, key);
+    const dirPath = dirname(filePath);
+    const lockName = `.${basename(filePath)}.compare-replace.lock`;
+
+    // The lock covers the complete read -> compare -> atomic replacement
+    // window. A plain read followed by rename is not CAS: two processes can
+    // both observe `expected` and both overwrite. The O_EXCL lock makes the
+    // second process re-read only after the winner has committed. A crashed
+    // holder leaves a visible stale lock and future calls fail closed rather
+    // than auto-breaking it with a racy unlink.
+    return withPathLock(
+      dirPath,
+      lockName,
+      async () => {
+        const current = await this.readAtPath(filePath);
+        if (current === null || !constantTimeEqual(current, expected)) return false;
+        await this.atomicWriteFile(filePath, checkedData, true);
+        return true;
+      },
+      { metadata: { operation: "storage_compare_and_replace" } },
+    );
   }
 
   async writeDurable(

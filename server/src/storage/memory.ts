@@ -6,6 +6,7 @@
  */
 
 import type { StorageBackend, StorageEntryMeta } from "./interface.js";
+import { constantTimeEqual } from "../core/encoding.js";
 import { assertSdwRawWriteAuthorized } from "../sdw/write-gate.js";
 
 export class MemoryStorage implements StorageBackend {
@@ -17,6 +18,48 @@ export class MemoryStorage implements StorageBackend {
 
   private storageKey(namespace: string, key: string): string {
     return `${namespace}/${key}`;
+  }
+
+  async writeIfAbsent(
+    namespace: string,
+    key: string,
+    data: Uint8Array,
+  ): Promise<boolean> {
+    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+    const storageKey = this.storageKey(namespace, key);
+    // Deliberately no await between the check and set: this is the in-memory
+    // backend's atomic create-if-absent critical section.
+    if (this.store.has(storageKey)) return false;
+    this.namespaceCounts.set(
+      namespace,
+      (this.namespaceCounts.get(namespace) ?? 0) + 1,
+    );
+    this.store.set(storageKey, {
+      data: new Uint8Array(checkedData),
+      modified_at: new Date().toISOString(),
+    });
+    return true;
+  }
+
+  async replaceIfEquals(
+    namespace: string,
+    key: string,
+    expected: Uint8Array,
+    data: Uint8Array,
+  ): Promise<boolean> {
+    const checkedData = assertSdwRawWriteAuthorized(namespace, key, data);
+    const storageKey = this.storageKey(namespace, key);
+    const current = this.store.get(storageKey);
+    // Deliberately no await between the compare and set: this is the
+    // in-memory backend's atomic compare-and-replace critical section.
+    if (current === undefined || !constantTimeEqual(current.data, expected)) {
+      return false;
+    }
+    this.store.set(storageKey, {
+      data: new Uint8Array(checkedData),
+      modified_at: new Date().toISOString(),
+    });
+    return true;
   }
 
   async write(
