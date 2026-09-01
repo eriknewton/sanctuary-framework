@@ -61,25 +61,25 @@ Root cause: The agent had write access to its own critical state. Safety constra
 
 Five incidents. Five different failure modes. But they map to four recurring categories.
 
-**Layer 1: Cognitive Sovereignty; Data Protection**
+**Cognitive Sovereignty: Data Protection**
 
 The agent's persistent state (its memory, learned preferences, knowledge of your situation) is plaintext and unencrypted. Meta's agent could read proprietary code because nothing prevented it. OpenClaw's exposed instances leaked years of reasoning history stored as readable JSON. Context compression erased safety instructions because they were stored in a mutable runtime context, not encrypted persistent state.
 
 The security primitive exists: AES-256-GCM encryption with Argon2id key derivation. But it's not being deployed by default.
 
-**Layer 2: Operational Isolation; Approval Gates and Process Boundaries**
+**Operational Isolation: Approval Gates and Process Boundaries**
 
 The agent can take high-risk actions without mandatory approval. Meta's agent posted to the forum because the approval gate was advisory; it could be skipped. OpenClaw's CVEs exploited the fact that process boundaries could inherit their parent's settings. A sandbox that can be disabled is not a sandbox. The context compaction incident happened because the runtime could modify the agent's own state without triggering an integrity check.
 
 The security primitive exists: approval workflows that block and wait, behavioral baseline tracking to flag anomalies, integrity verification that detects tampering. But they're not being enforced as mandatory constraints.
 
-**Layer 3: Selective Disclosure; Information Control**
+**Selective Disclosure: Information Control**
 
 The agent has no mechanism to prove a claim without revealing everything it knows. Meta's agent dumped proprietary data into a forum post because it had no way to answer the question selectively: to prove it understood the relevant architecture without exposing implementation details. OpenClaw agents can't prove reputation without fully revealing the transactions that built it.
 
 The security primitive exists: Pedersen commitments, Schnorr proofs, zero-knowledge range proofs. But they're not being woven into agent communication patterns.
 
-**Layer 4: Verifiable Reputation; Trust Without Intermediation**
+**Verifiable Reputation: Trust Without Intermediation**
 
 The agent's track record is locked to the platform it's running on. An agent can't export its reputation when migrating between harnesses. There's no signed, portable claim set that proves what the agent has done. This means organizations have to rebuild trust from scratch or stay locked to their current infrastructure.
 

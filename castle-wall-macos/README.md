@@ -2,8 +2,8 @@
 
 Trust claims for macOS egress enforcement are tracked in [../ASSURANCE_MATRIX.md](../ASSURANCE_MATRIX.md).
 
-Phase 1 foundation of WP-V1.x-CASTLE-WALL on macOS. Castle Architecture
-Layer 1 lives at the OS-level egress filter; on macOS the
+Phase 1 foundation of WP-V1.x-CASTLE-WALL on macOS. Castle Architecture's
+Castle Wall layer lives at the OS-level egress filter; on macOS the
 `com.apple.developer.networking.networkextension` `content-filter-provider-systemextension`
 entitlement gates the kernel-attached chokepoint.
 

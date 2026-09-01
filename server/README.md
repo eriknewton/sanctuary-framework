@@ -28,23 +28,23 @@ See `Wiki/concepts/seven-principles-of-sovereignty.md` for the canonical lookup.
 
 Sanctuary's enforcement model is the Castle Architecture. Four layers, each with a distinct enforcement contract.
 
-**Layer 1, Castle Wall.** OS-level egress filtering at the operator-external boundary. Phase 1 ships as live enforcement on macOS only in v1.x: the signed Network Extension or pf path enforces when installed and armed. The Linux netfilter / NFQUEUE modules are tested against a real kernel, but the shipped daemon does not install them, so the Assurance Matrix row is `not_implemented` (open defect: **IC-02, IC-03, IC-04**, see). Windows Filtering Platform is roadmap. Where the macOS wall is installed and armed within the proven scope, the kernel blocks unauthorized cross-boundary calls and a prompt-injected agent cannot bypass it.
+**Castle Wall: the perimeter.** OS-level egress filtering at the operator-external boundary. Phase 1 ships as live enforcement on macOS only in v1.x: the signed Network Extension or pf path enforces when installed and armed. The Linux netfilter / NFQUEUE modules are tested against a real kernel, but the shipped daemon does not install them, so the Assurance Matrix row is `not_implemented` (open defect: **IC-02, IC-03, IC-04**, see). Windows Filtering Platform is roadmap. Where the macOS wall is installed and armed within the proven scope, the kernel blocks unauthorized cross-boundary calls and a prompt-injected agent cannot bypass it.
 
-**Layer 2, Sentinels.** Internal observation, not enforcement. Behavioral baselining via process introspection, auditd-tail fallback, and an eBPF watcher scaffold that currently falls back to stub mode because the real probe loader is not implemented. Anomalies surface to the operator via menubar and OS notifications. Sentinels watch internal patterns the wall cannot see (file access, internal LLM calls, cross-agent coordination); they observe and surface; they do not block. Sentinels ship in v1.3.
+**Sentinels: the nerves.** Internal observation, not enforcement. Behavioral baselining via process introspection, auditd-tail fallback, and an eBPF watcher scaffold that currently falls back to stub mode because the real probe loader is not implemented. Anomalies surface to the operator via menubar and OS notifications. Sentinels watch internal patterns the wall cannot see (file access, internal LLM calls, cross-agent coordination); they observe and surface; they do not block. Sentinels ship in v1.3.
 
-**Layer 3, Cooperative MCP.** Additive sovereignty surface for compliant agents. Encrypted state at rest, hash-chained audit with current checkpoint-signing bounds, mandate primitives, four canonical policy slots (memory, credentials, plans, outputs), substrate selector, Concordia receipt integration, Verascore reputation hooks. Compliant agents that voluntarily route through Sanctuary's MCP get the full sovereignty surface. Non-compliant agents still hit Layer 1 at the macOS wall where it is installed and armed, and Layer 2 inside the castle.
+**Charter: the will.** Additive sovereignty surface for compliant agents, exposed as Cooperative MCP. Encrypted state at rest, hash-chained audit with current checkpoint-signing bounds, mandate primitives, four canonical policy slots (memory, credentials, plans, outputs), substrate selector, Concordia receipt integration, Verascore reputation hooks. Compliant agents that voluntarily route through Sanctuary's MCP get the full sovereignty surface. Non-compliant agents still hit the Castle Wall at the macOS wall where it is installed and armed, and Sentinels inside the castle.
 
-**Layer 4, Cryptographic Receipts and Reputation.** Concordia receipts on cross-castle transactions. Verascore reputation aggregating across operators. Cross-castle accountability post-action. Portable reputation across vendor churn.
+**Heralds: the voice.** Concordia receipts on cross-castle transactions. Verascore reputation aggregating across operators. Cross-castle accountability post-action. Portable reputation across vendor churn.
 
 The castle MUST be both real AND delightful. Hard enforcement at the wall AND approval response under 2 seconds when prompted. Default-deny outbound AND smart always-allow rules with learning. Sentinels observe AND do not surface noise. Cooperative MCP path remains additive and fully usable. Composition with agent runtimes is preserved because the runtime sees a normal operating environment with constrained egress; nothing internal is sandboxed.
 
 ## Capability surfaces
 
-Within the Cooperative MCP layer (Castle Layer 3), Sanctuary exposes four capability surfaces. These are the tool-level primitives compliant agents call.
+Within the Cooperative MCP layer (Charter), Sanctuary exposes four capability surfaces. These are the tool-level primitives compliant agents call.
 
 **Cognitive Sovereignty.** All agent state encrypted at rest with AES-256-GCM. Keys are participant-held. Identity is Ed25519-based with DID support. Merkle tree integrity verification detects tampering and rollback.
 
-**Operational Isolation.** Environment attestation, encrypted audit log, and Principal Policy: a human-controlled, agent-immutable approval system that gates high-risk operations. The Sentinels layer (Castle Layer 2, v1.3+) extends this with behavioral baselining and anomaly detection.
+**Operational Isolation.** Environment attestation, encrypted audit log, and Principal Policy: a human-controlled, agent-immutable approval system that gates high-risk operations. The Sentinels layer (v1.3+) extends this with behavioral baselining and anomaly detection.
 
 **Selective Disclosure.** SHA-256 commitments, Pedersen commitments on Ristretto255, zero-knowledge proofs of knowledge (Schnorr/Fiat-Shamir), and ZK range proofs (bit-decomposition with CDS OR-proofs). Disclosure policies define what information flows where.
 
@@ -109,7 +109,7 @@ Sanctuary supports three key protection modes:
 
 ## MCP tools
 
-Once connected, your agent has access to these tools, organized by capability surface within Cooperative MCP (Castle Layer 3).
+Once connected, your agent has access to these tools, organized by capability surface within Cooperative MCP (Charter).
 
 ### Cognitive Sovereignty
 | Tool | Description |
@@ -205,7 +205,7 @@ Environment variables:
 
 ## Running alongside another MCP server
 
-Sanctuary is designed to run as a parallel MCP server. It adds the substrate underneath your agent without replacing any of its existing tools. Both servers appear in the same session as independent tool providers. Castle Wall enforcement (Layer 1) operates at the OS level regardless of which MCP servers the agent uses; the wall sees egress, not MCP routing.
+Sanctuary is designed to run as a parallel MCP server. It adds the substrate underneath your agent without replacing any of its existing tools. Both servers appear in the same session as independent tool providers. Castle Wall enforcement operates at the OS level regardless of which MCP servers the agent uses; the wall sees egress, not MCP routing.
 
 For the full setup guide (installation options, passphrase management, bootstrap, rollback), see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
@@ -213,7 +213,7 @@ For a reference MCP config, see [`docs/examples/parallel-mcp-config.json`](docs/
 
 For always-on agents with latency constraints, use the `persistent-agent` Principal Policy template which auto-allows routine operations and only gates destructive actions. See [`src/principal-policy/templates/persistent-agent.yaml`](src/principal-policy/templates/persistent-agent.yaml).
 
-## Principal Policy (cooperative gate, Castle Layer 3)
+## Principal Policy (cooperative gate, Charter)
 
 The Principal Policy is the human-controlled, agent-immutable configuration that gates operations through a three-tier approval system within the Cooperative MCP layer. It sits between the MCP router and every tool handler. No tool call routed through Sanctuary can bypass it.
 
@@ -223,7 +223,7 @@ The Principal Policy is the human-controlled, agent-immutable configuration that
 
 **Tier 3: Always allowed (audit only).** Standard read/write/sign operations pass through without interruption, but every operation is audit-logged.
 
-The policy file lives at `~/.sanctuary/principal-policy.yaml`. It is loaded once at startup and frozen; no MCP tool can modify it. The agent cannot see the policy rules in denial responses (preventing attacker learning). Approval requests flow through OS notifications (Castle Layer 1 surface), the menubar dashboard, or external webhooks (Slack, Discord, etc., with HMAC-SHA256 signatures).
+The policy file lives at `~/.sanctuary/principal-policy.yaml`. It is loaded once at startup and frozen; no MCP tool can modify it. The agent cannot see the policy rules in denial responses (preventing attacker learning). Approval requests flow through OS notifications (Castle Wall surface), the menubar dashboard, or external webhooks (Slack, Discord, etc., with HMAC-SHA256 signatures).
 
 On first session, non-Tier-3 operations require approval (no baseline exists yet). As the system learns normal patterns, approval fatigue decreases; you only get asked about genuinely unusual behavior.
 
@@ -233,19 +233,19 @@ See [`rfcs/RFC-0002-principal-policy-operational-approval.md`](../rfcs/RFC-0002-
 
 Sanctuary's security claims are structural, not cooperative-only.
 
-**Layer 1 enforcement (Castle Wall, macOS live; Linux not implemented; Windows roadmap):**
+**Castle Wall enforcement (macOS live; Linux not implemented; Windows roadmap):**
 - macOS Network Extension or pf rules intercept outbound calls before leaving the operator's machine when the signed extension is installed and armed
 - Linux netfilter / NFQUEUE is source-tested but not wired into the shipped daemon boot path; Windows Filtering Platform is roadmap
 - Per-process policy with per-agent-template defaults
 - Default-deny outbound with first-run wizard pre-allowing common developer endpoints where the macOS wall is armed
 - A prompt-injected agent cannot bypass the macOS wall within the proven scope: one host, one OS version, signed extension installed and armed
 
-**Layer 2 observation (Sentinels; ships in v1.3):**
+**Sentinels observation (ships in v1.3):**
 - Process introspection via auditd-tail fallback and syscall-observation scaffolding; the eBPF probe loader is a placeholder today
 - Behavioral baselining with anomaly detection
 - Anomalies surface via OS notifications, not blocks
 
-**Layer 3 cooperative primitives (Cooperative MCP additive surface):**
+**Charter cooperative primitives (Cooperative MCP additive surface):**
 - AES-256-GCM authenticated encryption with unique 12-byte IVs (NIST SP 800-38D)
 - Ed25519 keypairs for identity and signing
 - Argon2id key derivation (m=64MB, t=3, p=4) for passphrase protection
@@ -258,7 +258,7 @@ Sanctuary's security claims are structural, not cooperative-only.
 - Behavioral baseline detects anomalous agent behavior
 - Approval channel (stderr) is outside MCP protocol; agent cannot intercept
 
-**Layer 4 cross-castle accountability:**
+**Heralds cross-castle accountability:**
 - Concordia receipts for cross-castle commitments
 - Verascore reputation aggregating across operators
 - Portable reputation bundles for cross-platform portability
@@ -276,7 +276,7 @@ npm test
 
 ## Architecture (source tree)
 
-The directory layout below reflects v1.2 shipped reality plus annotated v1.x and v1.3 placeholders for the Castle Wall and Sentinels work packages. Capability-surface directory names are the plain capability names (`cognitive/`, `operational/`, `disclosure/`, `reputation/`), renamed from the legacy `l1`-`l4` prefixes so the prefixes do not collide with Castle Layer numbering. Crypto domain-separation labels that embed a legacy token (e.g. the HKDF info string `l4-reputation`) are deliberately frozen and were NOT renamed.
+The directory layout below reflects v1.2 shipped reality plus annotated v1.x and v1.3 placeholders for the Castle Wall and Sentinels work packages. Capability-surface directory names are the plain capability names (`cognitive/`, `operational/`, `disclosure/`, `reputation/`), renamed from the legacy `l1`-`l4` prefixes so the prefixes do not collide with the named Castle layers (Castle Wall, Sentinels, Charter, Heralds). Crypto domain-separation labels that embed a legacy token (e.g. the HKDF info string `l4-reputation`) are deliberately frozen and were NOT renamed.
 
 ```
 src/
@@ -287,23 +287,23 @@ src/
 │   ├── key-derivation.ts  # Argon2id, HKDF
 │   ├── encoding.ts        # Base64url, constant-time compare
 │   └── random.ts          # CSPRNG
-├── castle-wall/           # Castle Layer 1: OS-level egress enforcement (planned, ships with WP-V1.x-CASTLE-WALL)
-├── sentinels/             # Castle Layer 2: internal observation (planned, ships with v1.3 WP-V1.3-1, -2)
+├── castle-wall/           # Castle Wall: OS-level egress enforcement (planned, ships with WP-V1.x-CASTLE-WALL)
+├── sentinels/             # Sentinels: internal observation (planned, ships with v1.3 WP-V1.3-1, -2)
 ├── storage/               # Pluggable storage backends
 │   ├── interface.ts       # Abstract StorageBackend
 │   ├── filesystem.ts      # Encrypted filesystem (default)
 │   └── memory.ts          # In-memory (testing)
-├── cognitive/          # Capability surface 1 (Castle Layer 3): encrypted state plus identity
+├── cognitive/          # Capability surface 1 (Charter): encrypted state plus identity
 │   ├── state-store.ts     # StateStore with Merkle verification
 │   └── tools.ts           # MCP tool definitions
-├── operational/        # Capability surface 2 (Castle Layer 3): attestation plus monitoring
+├── operational/        # Capability surface 2 (Charter): attestation plus monitoring
 │   └── audit-log.ts       # Encrypted append-only audit log
-├── disclosure/         # Capability surface 3 (Castle Layer 3): commitments plus ZK proofs plus policies
+├── disclosure/         # Capability surface 3 (Charter): commitments plus ZK proofs plus policies
 │   ├── commitments.ts     # SHA-256 commitment schemes
 │   ├── zk-proofs.ts       # Pedersen/Ristretto255, Schnorr proofs, range proofs
 │   ├── policies.ts        # Disclosure policy engine
 │   └── tools.ts           # MCP tool definitions
-├── reputation/         # Capability surface 4 (Castle Layer 3): reputation plus bootstrap plus tiers
+├── reputation/         # Capability surface 4 (Charter): reputation plus bootstrap plus tiers
 │   ├── reputation-store.ts # Signed attestations, escrow, guarantees
 │   ├── tiers.ts           # Sovereignty-gated reputation tiers
 │   └── tools.ts           # MCP tool definitions
@@ -314,7 +314,7 @@ src/
 │   ├── types.ts           # Interface contract
 │   ├── bridge.ts          # Core: canonicalize, commit, verify
 │   └── tools.ts           # MCP tools plus BridgeStore
-├── principal-policy/      # Principal Policy (Cooperative MCP gate, Castle Layer 3)
+├── principal-policy/      # Principal Policy (Cooperative MCP gate, Charter)
 │   ├── types.ts           # Policy, gate, baseline type definitions
 │   ├── loader.ts          # YAML/JSON policy parser plus defaults
 │   ├── baseline.ts        # Behavioral baseline tracker (encrypted)

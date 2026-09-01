@@ -9,7 +9,7 @@ This package was split out of `castle-wall-macos` on 2026-06-04. Apple's
 [Containerization](https://github.com/apple/containerization) library requires
 **macOS 26** and Swift tools **6.2**. SwiftPM has no per-target deployment
 floor, so while the VM lived in the `castle-wall-macos` package it forced the
-whole package — including the **system extension and host app** — up to a
+whole package, including the **system extension and host app**, up to a
 macOS-26 floor. That made the released sysext refuse to install on the macOS
 13/14/15 Macs most operators run (a latent product bug caught by the A1
 acceptance drill).
@@ -33,6 +33,6 @@ swift test
 
 ## Targets
 
-- `SanctuaryVMM` — library: Containerization-based VM launcher + image
+- `SanctuaryVMM`, library: Containerization-based VM launcher + image
   integrity + vsock egress config.
-- `sanctuary-vmm` — CLI entry point.
+- `sanctuary-vmm`, CLI entry point.

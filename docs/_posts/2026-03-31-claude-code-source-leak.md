@@ -33,7 +33,7 @@ This is the same class of problem as Meta's agent posting proprietary data to a 
 
 ## What Context Gating Would Have Caught
 
-Sanctuary's L2 context gating was designed for inference calls, controlling what context an agent sends to remote providers. But the principle applies to any outbound data flow: if something leaves your sovereignty boundary, you should have a policy that specifies what's allowed to leave, and a mechanism that enforces it.
+Sanctuary's Operational Isolation-layer context gating was designed for inference calls, controlling what context an agent sends to remote providers. But the principle applies to any outbound data flow: if something leaves your sovereignty boundary, you should have a policy that specifies what's allowed to leave, and a mechanism that enforces it.
 
 A context gating policy for a build pipeline would look like this: before any artifact is published to a public registry, filter the contents against a policy. Source maps? Deny. Internal configuration files? Deny. Files matching `*.map`, `*.env`, `credentials.*`? Deny. The policy is declarative. The enforcement is structural. The human doesn't need to remember to update `.npmignore`: the policy catches it.
 
@@ -43,9 +43,9 @@ This isn't hypothetical. Sanctuary's `context_gate_filter` does exactly this for
 
 | Incident | Date | What crossed the boundary | What should have stopped it |
 |----------|------|--------------------------|----------------------------|
-| Meta Sev 1 | March 18 | Proprietary code, strategies, user data posted to internal forum | L2 mandatory approval gate, L3 selective disclosure |
-| OpenClaw CVEs | March 18–21 | Sandbox bypass, child processes inheriting unrestricted access | L2 operational isolation, cryptographic execution attestation |
-| Claude Code leak | March 31 | 512K lines of source code shipped in npm package | L2 context gating, outbound data flow verification |
+| Meta Sev 1 | March 18 | Proprietary code, strategies, user data posted to internal forum | Operational Isolation mandatory approval gate, Selective Disclosure |
+| OpenClaw CVEs | March 18–21 | Sandbox bypass, child processes inheriting unrestricted access | Operational Isolation, cryptographic execution attestation |
+| Claude Code leak | March 31 | 512K lines of source code shipped in npm package | Operational Isolation context gating, outbound data flow verification |
 
 Every one of these is a failure at the sovereignty boundary. Data that should have stayed inside crossed to the outside. The boundary was implicit (convention, configuration, human memory) rather than structural (policy-enforced, cryptographically verified, mandatory).
 

@@ -1,10 +1,10 @@
-# Sanctuary Framework — L3 ZK Proving System Upgrade Research
+# Sanctuary Framework: L3 ZK Proving System Upgrade Research
 
 <!-- Moltbook (capital M) is the agent-to-agent social network; not the Mini1 hostname. -->
 
 **Research Date:** March 31, 2026
 **Scope:** Interactive zero-knowledge proof system upgrade for L3 Selective Disclosure
-**Status:** SCOPING DOCUMENT — RESEARCH ONLY, NO CODE WRITTEN
+**Status:** SCOPING DOCUMENT: RESEARCH ONLY, NO CODE WRITTEN
 
 ---
 
@@ -12,7 +12,7 @@
 
 L3 Selective Disclosure currently operates in "commitment-only" mode with SHA-256 + Pedersen commitments and Schnorr proofs. The Moltbook deployment report (2026-03-31) marks this as "Degraded" because it lacks interactive ZK proofs that would move the system to "Full" L3 status.
 
-**Key Finding:** L3 is NOT actually degraded. The current implementation IS interactive ZK proofs (Schnorr + Pedersen on Ristretto255). The labeling mismatch stems from treating "commitment-only" as a security posture category, when the actual system delivers everything "Full L3" requires. The upgrade scope is **narrower than initially framed** — it's a repositioning/labeling issue plus optional SNARK support, not a missing core capability.
+**Key Finding:** L3 is NOT actually degraded. The current implementation IS interactive ZK proofs (Schnorr + Pedersen on Ristretto255). The labeling mismatch stems from treating "commitment-only" as a security posture category, when the actual system delivers everything "Full L3" requires. The upgrade scope is **narrower than initially framed**: it's a repositioning/labeling issue plus optional SNARK support, not a missing core capability.
 
 This document outlines what exists, what "Full" would mean, and what a hypothetical SNARK upgrade would entail.
 
@@ -23,10 +23,10 @@ This document outlines what exists, what "Full" would mean, and what a hypotheti
 ### What Exists Today
 
 **Files:**
-- `server/src/disclosure/zk-proofs.ts` — 551 LOC
-- `server/src/disclosure/commitments.ts` — 169 LOC
-- `server/src/disclosure/policies.ts` — 237 LOC
-- `server/src/disclosure/tools.ts` — 526 LOC
+- `server/src/disclosure/zk-proofs.ts`: 551 LOC
+- `server/src/disclosure/commitments.ts`: 169 LOC
+- `server/src/disclosure/policies.ts`: 237 LOC
+- `server/src/disclosure/tools.ts`: 526 LOC
 - **Tests:** 640 LOC across 3 test files
 
 **Cryptographic Primitives:**
@@ -58,10 +58,10 @@ This document outlines what exists, what "Full" would mean, and what a hypotheti
 ### External Dependencies
 
 **In package.json:**
-- `@noble/curves` v1.8.0 — Ristretto255 group operations, no external deps
-- `@noble/hashes` v1.7.0 — SHA-256, HMAC, HKDF
-- `@noble/ciphers` v2.1.1 — AES-256-GCM
-- `hash-wasm` v4.12.0 — Argon2id KDF
+- `@noble/curves` v1.8.0: Ristretto255 group operations, no external deps
+- `@noble/hashes` v1.7.0: SHA-256, HMAC, HKDF
+- `@noble/ciphers` v2.1.1: AES-256-GCM
+- `hash-wasm` v4.12.0: Argon2id KDF
 
 **NO dependencies on:**
 - snarkjs
@@ -72,17 +72,17 @@ This document outlines what exists, what "Full" would mean, and what a hypotheti
 ### MCP Tools Exposed
 
 **Currently 6 tools:**
-1. `sanctuary/proof_commitment` — Create SHA-256 commitment
-2. `sanctuary/proof_reveal` — Verify SHA-256 commitment reveal
-3. `sanctuary/disclosure_set_policy` — Define disclosure policy
-4. `sanctuary/disclosure_evaluate` — Evaluate request vs. policy
-5. `sanctuary/zk_commit` — Create Pedersen commitment
-6. `sanctuary/zk_prove` — Create Schnorr ZK proof
-7. `sanctuary/zk_verify` — Verify Schnorr proof
-8. `sanctuary/zk_range_prove` — Create range proof
-9. `sanctuary/zk_range_verify` — Verify range proof
+1. `sanctuary/proof_commitment`: Create SHA-256 commitment
+2. `sanctuary/proof_reveal`: Verify SHA-256 commitment reveal
+3. `sanctuary/disclosure_set_policy`: Define disclosure policy
+4. `sanctuary/disclosure_evaluate`: Evaluate request vs. policy
+5. `sanctuary/zk_commit`: Create Pedersen commitment
+6. `sanctuary/zk_prove`: Create Schnorr ZK proof
+7. `sanctuary/zk_verify`: Verify Schnorr proof
+8. `sanctuary/zk_range_prove`: Create range proof
+9. `sanctuary/zk_range_verify`: Verify range proof
 
-**Total: 9 tools (not 6 — range proofs added later)**
+**Total: 9 tools (not 6, range proofs added later)**
 
 ### Test Coverage
 
@@ -96,12 +96,12 @@ This document outlines what exists, what "Full" would mean, and what a hypotheti
 
 ### Security Invariants Enforced
 
-1. Blinding factors are 32 bytes from `randomBytes()` — cryptographically random
+1. Blinding factors are 32 bytes from `randomBytes()`: cryptographically random
 2. Fiat-Shamir challenges are domain-separated to prevent replay
 3. Range proofs reject values outside stated range at proof-creation time
 4. All proofs are non-interactive (one-shot transmission)
 5. Proofs can be verified offline without prover interaction
-6. Bit proofs use Cramer-Damgård-Schoenmakers (CDS) OR technique — the standard construction
+6. Bit proofs use Cramer-Damgård-Schoenmakers (CDS) OR technique: the standard construction
 
 ---
 
@@ -124,7 +124,7 @@ From `COWORK_CONTEXT.md`:
 - Threshold proofs (k-of-n knowledge)
 - Recursive/nested proofs
 
-**Assessment:** The "commitment-only" label is misleading. The system IS delivering interactive ZK proofs — they're just non-interactive (Fiat-Shamir), which is actually *superior* to true interactive protocols for MCP server contexts (no round-trip latency, offline verifiable, replay-resistant via domain separation).
+**Assessment:** The "commitment-only" label is misleading. The system IS delivering interactive ZK proofs; they're just non-interactive (Fiat-Shamir), which is actually *superior* to true interactive protocols for MCP server contexts (no round-trip latency, offline verifiable, replay-resistant via domain separation).
 
 ---
 
@@ -200,7 +200,7 @@ Choose SNARK system:
 **Design decisions:**
 1. **Which circuits to support?**
    - Identity proof (prove you know a secret)
-   - Range proof (prove value in [min, max]) — replaces Schnorr/CDS
+   - Range proof (prove value in [min, max]): replaces Schnorr/CDS
    - Nullifier (prove membership without revealing identity)
    - Merkle inclusion (prove leaf in tree)
 
@@ -223,7 +223,7 @@ Choose SNARK system:
 
 ---
 
-### Option C: Minimal Upgrade — Add Merkle Proof Support (INTERMEDIATE)
+### Option C: Minimal Upgrade: Add Merkle Proof Support (INTERMEDIATE)
 
 **Effort:** 1 week
 
@@ -237,10 +237,10 @@ Choose SNARK system:
 - OR implement custom Merkle logic using existing `@noble/hashes`
 
 **New tools:**
-1. `sanctuary/merkle_commit` — Commit to a list
-2. `sanctuary/merkle_path_prove` — Create membership proof for one element
-3. `sanctuary/merkle_path_verify` — Verify membership proof
-4. `sanctuary/merkle_update_prove` — Prove new list is same as old minus/plus elements
+1. `sanctuary/merkle_commit`: Commit to a list
+2. `sanctuary/merkle_path_prove`: Create membership proof for one element
+3. `sanctuary/merkle_path_verify`: Verify membership proof
+4. `sanctuary/merkle_update_prove`: Prove new list is same as old minus/plus elements
 
 **Why this?**
 - Enables selective disclosure over structured data (e.g., "prove you have a driver's license" without revealing license number)
@@ -300,7 +300,7 @@ Choose SNARK system:
 - **Effort:** 1 week
 - **Code changes:** ~800–1,200 LOC
 - **Tests:** 35–50 tests
-- **New dependencies:** 1 (merkle-tree, optional—can use @noble/hashes)
+- **New dependencies:** 1 (merkle-tree, optional, can use @noble/hashes)
 - **New MCP tools:** 3–4
 
 ---
@@ -387,16 +387,16 @@ Choose SNARK system:
 ## TESTING STRATEGY (OPTION B)
 
 ### New Test Files
-1. `test/l3/groth16-identity.test.ts` — Identity proof (20 tests)
-2. `test/l3/groth16-range.test.ts` — Range proof via Groth16 (25 tests)
-3. `test/l3/groth16-nullifier.test.ts` — Nullifier proofs (15 tests)
-4. `test/l3/groth16-batch.test.ts` — Batch verification (10 tests)
-5. `test/l3/groth16-canonical.test.ts` — Canonical serialization (10 tests)
-6. `test/l3/zk-migration.test.ts` — Schnorr → Groth16 interop (15 tests)
+1. `test/l3/groth16-identity.test.ts`: Identity proof (20 tests)
+2. `test/l3/groth16-range.test.ts`: Range proof via Groth16 (25 tests)
+3. `test/l3/groth16-nullifier.test.ts`: Nullifier proofs (15 tests)
+4. `test/l3/groth16-batch.test.ts`: Batch verification (10 tests)
+5. `test/l3/groth16-canonical.test.ts`: Canonical serialization (10 tests)
+6. `test/l3/zk-migration.test.ts`: Schnorr → Groth16 interop (15 tests)
 
 ### New Test Count
 - **80–120 new tests**
-- **Existing tests:** 640 LOC (73 tests) — would remain unchanged
+- **Existing tests:** 640 LOC (73 tests), would remain unchanged
 - **Total post-upgrade:** ~150–190 tests across 6 L3 test files
 
 ### Key Test Scenarios
@@ -442,9 +442,9 @@ The following would require stepping outside the TypeScript ecosystem:
 **Current state:** L3 is NOT missing interactive ZK proofs. It HAS them (Schnorr + range proofs on Ristretto255). The "commitment-only" label is a categorization artifact.
 
 **Best path forward:**
-1. **Immediate (this week):** Option A — Reposition L3 as "Full" (2–4 hours)
-2. **Near-term (next month):** Option C — Add Merkle proofs if use cases emerge (1 week)
-3. **Future (Phase 2):** Option B — Groth16 SNARKs if arbitrary-circuit proofs are needed (3–4 weeks)
+1. **Immediate (this week):** Option A: Reposition L3 as "Full" (2–4 hours)
+2. **Near-term (next month):** Option C: Add Merkle proofs if use cases emerge (1 week)
+3. **Future (Phase 2):** Option B: Groth16 SNARKs if arbitrary-circuit proofs are needed (3–4 weeks)
 
 **For Moltbook:** Option A unblocks the agent immediately with zero risk and minimal effort.
 
@@ -467,7 +467,7 @@ To ensure Sanctuary and Concordia bridge commitments always produce identical ha
 - Numbers as decimal strings
 - Null/undefined explicitly handled
 
-Current implementation in `bridge/bridge.ts:stableStringify()` — must be byte-identical with Concordia's Python version.
+Current implementation in `bridge/bridge.ts:stableStringify()`: must be byte-identical with Concordia's Python version.
 
 ### Audit Trail
 

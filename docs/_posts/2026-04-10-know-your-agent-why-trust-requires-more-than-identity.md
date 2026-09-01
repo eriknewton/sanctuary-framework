@@ -13,6 +13,13 @@ claims_era_note: true
 > Terminology here may use earlier language for install-time substrate-binding concepts.
 > Current canonical vocabulary lives at [Mantle Phase 1](https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md).
 
+> **Archive note (layer numbering):** This post predates the 2026-05-24 layer-numbering
+> retirement and uses the L1/L2/L3/L4 numbering throughout, including two tables keyed
+> on the numbers. The current canonical names are Castle Wall (Cognitive Sovereignty),
+> Sentinels (Operational Isolation), Charter (Selective Disclosure), and Heralds
+> (Verifiable Reputation). The body below is left as a historical record and has not
+> been re-keyed to the current naming.
+
 
 "Know Your Customer" changed banking. Now the industry is converging on "Know Your Agent."
 

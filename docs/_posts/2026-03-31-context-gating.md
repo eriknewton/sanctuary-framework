@@ -24,7 +24,7 @@ Today we're shipping the tools.
 
 ## Five New MCP Tools
 
-Sanctuary v0.3.1 now includes five L2 Context Gating tools that give agents and their human principals fine-grained control over what crosses the sovereignty boundary:
+Sanctuary v0.3.1 now includes five Operational Isolation Context Gating tools that give agents and their human principals fine-grained control over what crosses the sovereignty boundary:
 
 **`sanctuary/context_gate_set_policy`** creates a per-provider gating policy. You define which fields are allowed, which are redacted, which are hashed (preserving correlation without revealing values), and which should be summarized (compressed to reduce exposure). One policy can cover multiple provider categories (inference, tool-api, logging, analytics) with different rules for each.
 
@@ -80,4 +80,4 @@ The full source is at [github.com/eriknewton/sanctuary-framework](https://github
 
 ---
 
-*Sanctuary defines sovereignty infrastructure for the agentic economy. Context gating is one piece of a four-layer architecture that includes cognitive sovereignty (L1), operational isolation (L2), selective disclosure (L3), and verifiable reputation (L4). The framework is open-source under Apache-2.0.*
+*Sanctuary defines sovereignty infrastructure for the agentic economy. Context gating is one piece of a four-layer architecture that includes cognitive sovereignty, operational isolation, selective disclosure, and verifiable reputation. The framework is open-source under Apache-2.0.*

@@ -20,13 +20,13 @@ Version 1.0 of the SHR specification is now published. The full spec is availabl
 
 An SHR is a JSON document signed with Ed25519 over canonical form (sorted keys, compact representation). It reports on four sovereignty layers:
 
-**L1; Cognitive Sovereignty.** What encryption protects state at rest? Who holds the master key? Is the state portable? The reference implementation reports AES-256-GCM encryption with self-custodied keys derived via Argon2id.
+**Cognitive Sovereignty.** What encryption protects state at rest? Who holds the master key? Is the state portable? The reference implementation reports AES-256-GCM encryption with self-custodied keys derived via Argon2id.
 
-**L2 (Operational Isolation.** What computational boundaries exist? Is hardware attestation available? Today, most agents report process-level isolation only) no TEE. The SHR makes this visible instead of assumed.
+**Operational Isolation.** What computational boundaries exist? Is hardware attestation available? Today, most agents report process-level isolation only, no TEE. The SHR makes this visible instead of assumed.
 
-**L3 (Selective Disclosure.** Can the agent prove claims without full revelation? The reference implementation supports Pedersen commitments, Schnorr proofs, and bit-decomposition range proofs) genuine zero-knowledge primitives, though not yet SNARKs.
+**Selective Disclosure.** Can the agent prove claims without full revelation? The reference implementation supports Pedersen commitments, Schnorr proofs, and bit-decomposition range proofs, genuine zero-knowledge primitives, though not yet SNARKs.
 
-**L4; Verifiable Reputation.** Is the agent's reputation portable and verifiable? What attestation format does it use? The reference implementation uses EAS-compatible signed attestations with sovereignty-gated weighting.
+**Verifiable Reputation.** Is the agent's reputation portable and verifiable? What attestation format does it use? The reference implementation uses EAS-compatible signed attestations with sovereignty-gated weighting.
 
 Every SHR also includes a **degradations array**: an honest accounting of known limitations. If an agent reports "process-level isolation only (no TEE)," that's a degradation. If it reports "commitment schemes only (no SNARKs)," that's a degradation. Honest over optimistic.
 
@@ -47,7 +47,7 @@ SHRs integrate with Sanctuary's reputation system through sovereignty tiers. Att
 | Tier | Requirement | Weight |
 |------|------------|--------|
 | `verified-sovereign` | Handshake complete, all layers active | 1.0 |
-| `verified-degraded` | Handshake complete, L1 active, others degraded | 0.8 |
+| `verified-degraded` | Handshake complete, Cognitive Sovereignty active, others degraded | 0.8 |
 | `self-attested` | SHR presented, no handshake | 0.5 |
 | `unverified` | No SHR | 0.2 |
 

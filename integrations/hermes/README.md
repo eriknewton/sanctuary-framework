@@ -6,7 +6,7 @@ Use Sanctuary's sovereignty infrastructure with Hermes Agent, the open-source se
 
 Hermes Agent has native MCP support - Sanctuary's 80+ MCP tools work seamlessly via Hermes's configuration layer. Hermes's multi-level memory, subagent isolation, and scheduled automations compose naturally with Sanctuary's four sovereignty layers.
 
-What you get: encrypted state (L1), process isolation with Sanctuary attestation (L2), selective disclosure (L3), and verifiable reputation (L4) - plus Hermes's native features like memory encryption, subagent sandboxing, and automated sovereignty audits on a cron schedule.
+What you get: encrypted state (Cognitive Sovereignty), process isolation with Sanctuary attestation (Operational Isolation), selective disclosure (Selective Disclosure), and verifiable reputation (Verifiable Reputation) - plus Hermes's native features like memory encryption, subagent sandboxing, and automated sovereignty audits on a cron schedule.
 
 **New in v0.5.16:** Proxy mode turns Sanctuary into an MCP proxy that wraps all upstream MCP servers through an enforcement chain (injection scan → gate → context gate → governor → forward → audit). Hermes agents can route all their MCP traffic through Sanctuary for runtime governance without changing any upstream server configs.
 
@@ -160,7 +160,7 @@ Monitor and manage the Call Governor at runtime:
 
 ## Sovereignty-Aware Patterns
 
-### Memory Sovereignty (L1 + Hermes Encryption)
+### Memory Sovereignty (Cognitive Sovereignty + Hermes Encryption)
 
 Hermes's multi-level memory system stores working context, task history, and learned patterns. Layer it with Sanctuary's state encryption:
 
@@ -180,7 +180,7 @@ agent:
         encryption: true
         backend: "disk"
 
-  # Additionally use Sanctuary L1 for sensitive findings
+  # Additionally use Sanctuary's Cognitive Sovereignty layer for sensitive findings
   # Example task will call sanctuary/state_write for each research result
 ```
 
@@ -188,7 +188,7 @@ agent:
 - Hermes memory: working context, intermediate reasoning, task tracking
 - Sanctuary state: sensitive findings, secrets, data that might be shared with other agents
 
-### Subagent Isolation with Sovereign Boundaries (L2)
+### Subagent Isolation with Sovereign Boundaries (Operational Isolation)
 
 Hermes supports spawning isolated subagents for parallel or specialized work. Give each subagent its own Sanctuary identity:
 
@@ -227,8 +227,8 @@ agent:
 Each subagent:
 - Runs in its own process (Hermes backend isolation)
 - Holds a separate Ed25519 keypair (Sanctuary identity)
-- Has encrypted state isolation (Sanctuary L1)
-- Can be attested independently (Sanctuary L2)
+- Has encrypted state isolation (Sanctuary Cognitive Sovereignty)
+- Can be attested independently (Sanctuary Operational Isolation)
 
 The coordinator uses `sanctuary/handshake_initiate` to establish trust with subagents and `sanctuary/reputation_record` to track their work quality.
 
@@ -249,7 +249,7 @@ agent:
       schedule: "0 2 * * *"  # 2 AM every day
       task: |
         Run a comprehensive sovereignty audit:
-        1. Call sanctuary/sovereignty_audit to assess L1-L4 posture
+        1. Call sanctuary/sovereignty_audit to assess Cognitive Sovereignty, Operational Isolation, Selective Disclosure, and Verifiable Reputation posture
         2. Call sanctuary/shr_generate to produce a Sovereignty Health Report
         3. Store the audit result in sanctuary/state_write with key 'audit_latest'
         4. If audit score < 0.8, trigger an alert via sanctuary/principal_policy_view
@@ -272,9 +272,9 @@ agent:
         3. Store status in sanctuary/state_write with key 'governor_latest'
 ```
 
-### Container Hardening + Sanctuary (L2 Enhanced)
+### Container Hardening + Sanctuary (Operational Isolation Enhanced)
 
-Run Hermes in a hardened container and layer Sanctuary's L2 attestation:
+Run Hermes in a hardened container and layer Sanctuary's Operational Isolation attestation:
 
 ```bash
 # Build a hardened Hermes container
@@ -321,9 +321,9 @@ docker run \
   hermes:latest
 ```
 
-After the container starts, the Hermes agent can call `sanctuary/exec_attest` to generate a signed attestation of its runtime environment, providing L2 evidence that it's running in a hardened container.
+After the container starts, the Hermes agent can call `sanctuary/exec_attest` to generate a signed attestation of its runtime environment, providing Operational Isolation evidence that it's running in a hardened container.
 
-### Context Gating for Inference Calls (L3)
+### Context Gating for Inference Calls (Selective Disclosure)
 
 Hermes sends prompts to LLM providers for inference. Protect your reasoning with context gating:
 
@@ -345,7 +345,7 @@ agent:
 
 All inference calls from the agent will then pass through Sanctuary's gating layer, removing secrets before they reach the LLM API.
 
-### Verascore Reputation Publishing (L4)
+### Verascore Reputation Publishing (Verifiable Reputation)
 
 Publish your agent's Sovereignty Health Report to [Verascore](https://verascore.ai), the public reputation registry for AI agents:
 
@@ -363,7 +363,7 @@ Publish your agent's Sovereignty Health Report to [Verascore](https://verascore.
 
 This gives your Hermes agent a public reputation profile that other agents and humans can verify - the "LinkedIn for agents" layer.
 
-### Portable Reputation Across Subagents (L4)
+### Portable Reputation Across Subagents (Verifiable Reputation)
 
 Build trust networks between Hermes subagents using Sanctuary's verifiable reputation:
 
@@ -399,14 +399,14 @@ Hermes supports six backends. Each maps to different deployment scenarios:
 
 | Backend | Use Case | Sanctuary Mapping |
 |---------|----------|------------------|
-| `local` | Development, low-risk tasks | L1 full, L2 degraded (no isolation) |
-| `docker` | Production hardened agents | L1 full, L2 hardened (container isolation) |
-| `ssh` | Distributed agents across machines | L1 full, L2 hardened (network + SSH keys) |
-| `daytona` | Cloud development environments | L1 full, L2 variable (vendor-dependent) |
-| `singularity` | HPC environments, reproducible containers | L1 full, L2 hardened (strict isolation) |
-| `modal` | Serverless elastic scaling | L1 full, L2 degraded (ephemeral, vendor-mediated) |
+| `local` | Development, low-risk tasks | Cognitive Sovereignty full, Operational Isolation degraded (no isolation) |
+| `docker` | Production hardened agents | Cognitive Sovereignty full, Operational Isolation hardened (container isolation) |
+| `ssh` | Distributed agents across machines | Cognitive Sovereignty full, Operational Isolation hardened (network + SSH keys) |
+| `daytona` | Cloud development environments | Cognitive Sovereignty full, Operational Isolation variable (vendor-dependent) |
+| `singularity` | HPC environments, reproducible containers | Cognitive Sovereignty full, Operational Isolation hardened (strict isolation) |
+| `modal` | Serverless elastic scaling | Cognitive Sovereignty full, Operational Isolation degraded (ephemeral, vendor-mediated) |
 
-For the highest sovereignty score, use `docker` or `ssh` with Sanctuary's L2 attestation.
+For the highest sovereignty score, use `docker` or `ssh` with Sanctuary's Operational Isolation attestation.
 
 ### 2. Protocol-Level MCP Support
 
@@ -433,7 +433,7 @@ agent:
     - "anthropic:claude-sonnet-4-6"
     - "openai:gpt-3.5-turbo"
 
-  # Pair with Sanctuary's L3 (selective disclosure)
+  # Pair with Sanctuary's Selective Disclosure layer
   # to control what information each model receives
   context_gates:
     "openai:gpt-4": "inference-standard"           # Full access
@@ -478,17 +478,17 @@ Sanctuary and Concordia compose but neither depends on the other. Use either alo
 
 All Sanctuary tools are exposed as Hermes capabilities. Key categories:
 
-**L1 - Cognitive Sovereignty:** `state_read`, `state_write`, `state_list`, `state_export`, `state_import`, `state_delete`
+**Cognitive Sovereignty:** `state_read`, `state_write`, `state_list`, `state_export`, `state_import`, `state_delete`
 
-**L1 - Identity:** `identity_create`, `identity_list`, `identity_sign`, `identity_verify`, `identity_rotate`
+**Cognitive Sovereignty - Identity:** `identity_create`, `identity_list`, `identity_sign`, `identity_verify`, `identity_rotate`
 
-**L2 - Operational Isolation:** `exec_attest`, `principal_policy_view`, `principal_baseline_view`, `monitor_health`, `monitor_audit_log`
+**Operational Isolation:** `exec_attest`, `principal_policy_view`, `principal_baseline_view`, `monitor_health`, `monitor_audit_log`
 
-**L2 - Context Gating:** `context_gate_set_policy`, `context_gate_apply_template`, `context_gate_recommend`, `context_gate_filter`, `context_gate_list_policies`
+**Operational Isolation - Context Gating:** `context_gate_set_policy`, `context_gate_apply_template`, `context_gate_recommend`, `context_gate_filter`, `context_gate_list_policies`
 
-**L3 - Selective Disclosure:** `proof_commitment`, `proof_reveal`, `disclosure_set_policy`, `disclosure_evaluate`, `zk_commit`, `zk_prove`, `zk_verify`, `zk_range_prove`, `zk_range_verify`
+**Selective Disclosure:** `proof_commitment`, `proof_reveal`, `disclosure_set_policy`, `disclosure_evaluate`, `zk_commit`, `zk_prove`, `zk_verify`, `zk_range_prove`, `zk_range_verify`
 
-**L4 - Verifiable Reputation:** `reputation_record`, `reputation_query`, `reputation_query_weighted`, `reputation_export`, `reputation_import`, `reputation_publish`, `bootstrap_create_escrow`, `bootstrap_provide_guarantee`
+**Verifiable Reputation:** `reputation_record`, `reputation_query`, `reputation_query_weighted`, `reputation_export`, `reputation_import`, `reputation_publish`, `bootstrap_create_escrow`, `bootstrap_provide_guarantee`
 
 **Sovereignty Health:** `shr_generate`, `shr_verify`, `sovereignty_audit`
 

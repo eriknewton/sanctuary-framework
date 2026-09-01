@@ -131,15 +131,15 @@ Sanctuary and Concordia compose but neither depends on the other. Use either alo
 
 All 80+ Sanctuary tools are exposed as LangChain tools. Key categories:
 
-**L1 - Cognitive Sovereignty:** `state_read`, `state_write`, `state_list`, `state_export`, `state_import`, `state_delete`
+**Cognitive Sovereignty:** `state_read`, `state_write`, `state_list`, `state_export`, `state_import`, `state_delete`
 
-**L1 - Identity:** `identity_create`, `identity_list`, `identity_sign`, `identity_verify`, `identity_rotate`
+**Identity:** `identity_create`, `identity_list`, `identity_sign`, `identity_verify`, `identity_rotate`
 
-**L2 - Operational Isolation:** `exec_attest`, `principal_policy_view`, `principal_baseline_view`, `monitor_health`, `monitor_audit_log`
+**Operational Isolation:** `exec_attest`, `principal_policy_view`, `principal_baseline_view`, `monitor_health`, `monitor_audit_log`
 
-**L3 - Selective Disclosure:** `proof_commitment`, `proof_reveal`, `disclosure_set_policy`, `disclosure_evaluate`, `zk_commit`, `zk_prove`, `zk_verify`, `zk_range_prove`, `zk_range_verify`
+**Selective Disclosure:** `proof_commitment`, `proof_reveal`, `disclosure_set_policy`, `disclosure_evaluate`, `zk_commit`, `zk_prove`, `zk_verify`, `zk_range_prove`, `zk_range_verify`
 
-**L4 - Verifiable Reputation:** `reputation_record`, `reputation_query`, `reputation_query_weighted`, `reputation_export`, `reputation_import`, `bootstrap_create_escrow`, `bootstrap_provide_guarantee`
+**Verifiable Reputation:** `reputation_record`, `reputation_query`, `reputation_query_weighted`, `reputation_export`, `reputation_import`, `bootstrap_create_escrow`, `bootstrap_provide_guarantee`
 
 **Cross-Cutting:** `shr_generate`, `shr_verify`, `handshake_initiate`, `handshake_respond`, `handshake_complete`, `handshake_status`, `federation_peers`, `federation_trust_evaluate`, `federation_status`, `manifest`
 

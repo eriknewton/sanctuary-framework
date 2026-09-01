@@ -33,9 +33,9 @@ The EU AI Act Compliance Artifact Generator is a Sanctuary MCP tool (and matchin
 
 The generator does **not** invent evidence. Every piece of auto-filled content is pulled from the live Sanctuary instance (SHR, audit log, Principal Policy, context gating, identity manager) and every claim is traceable to a specific MCP tool call that an auditor can reproduce independently.
 
-Fields that Sanctuary cannot know — the agent's intended purpose, the enterprise's legal name, the Annex III classification, training data lineage, operator training records, and so on — are left as explicit `[MANUAL INPUT REQUIRED: hint]` markers in the generated Markdown. The enterprise replaces these markers with their business facts before filing.
+Fields that Sanctuary cannot know (the agent's intended purpose, the enterprise's legal name, the Annex III classification, training data lineage, operator training records, and so on) are left as explicit `[MANUAL INPUT REQUIRED: hint]` markers in the generated Markdown. The enterprise replaces these markers with their business facts before filing.
 
-## Phase 2 additions — classification, delta, publish, PDF
+## Phase 2 additions: classification, delta, publish, PDF
 
 Four optional capabilities extend the Phase 1 bundle generator. All four respect the non-dependency principle: none of them is required for bundle generation, and failure in any Phase 2 layer never prevents the core Markdown bundle from landing locally.
 
@@ -43,7 +43,7 @@ Four optional capabilities extend the Phase 1 bundle generator. All four respect
 
 The generator ships with a rule-based Annex III classifier that reads the `deployment_context.intended_purpose` field and scores it against all eight Annex III high-risk categories (and their sub-points) of Regulation (EU) 2024/1689. Matching keywords come from a structured catalog in `server/src/compliance/eu_ai_act/annex_iii.ts` with coarse discrete weights (1.0 / 0.6 / 0.3), and candidates clearing a 0.4 minimum threshold are reported in document `07_annex_iii_classification.md` ordered by `rule_based_confidence` descending.
 
-**The confidence field is deliberately named `rule_based_confidence`, not `confidence` or `probability`**, so downstream consumers cannot mistake it for a machine-learning model prediction. The classifier is keyword-weighted, fully auditable against the catalog, and makes no claims of statistical calibration. An empty result does **not** mean the agent is out of scope of the EU AI Act — it means the keyword catalog found no clear match and the deployer must perform manual review.
+**The confidence field is deliberately named `rule_based_confidence`, not `confidence` or `probability`**, so downstream consumers cannot mistake it for a machine-learning model prediction. The classifier is keyword-weighted, fully auditable against the catalog, and makes no claims of statistical calibration. An empty result does **not** mean the agent is out of scope of the EU AI Act. It means the keyword catalog found no clear match and the deployer must perform manual review.
 
 The classifier is also exposed as a standalone MCP tool:
 
@@ -68,13 +68,13 @@ Supply `--delta-from <path>` on the CLI, or `delta_from_bundle_path` on the MCP 
 
 ### Verascore publish hook
 
-Supply `--publish-to-verascore` on the CLI, or `publish_to_verascore: true` on the MCP tool, to POST the signed manifest to Verascore as a post-generation side effect. This publishes only the manifest — the document bodies never leave the local filesystem. The publish uses the same wire format and signing path as the existing `reputation_publish` tool: allow-listed Verascore hosts only (HTTPS, `verascore.ai` / `www.verascore.ai` / `api.verascore.ai`), canonical JSON of the manifest signed with the provider's primary Ed25519 identity via the existing `core/identity.js` sign primitive.
+Supply `--publish-to-verascore` on the CLI, or `publish_to_verascore: true` on the MCP tool, to POST the signed manifest to Verascore as a post-generation side effect. This publishes only the manifest: the document bodies never leave the local filesystem. The publish uses the same wire format and signing path as the existing `reputation_publish` tool: allow-listed Verascore hosts only (HTTPS, `verascore.ai` / `www.verascore.ai` / `api.verascore.ai`), canonical JSON of the manifest signed with the provider's primary Ed25519 identity via the existing `core/identity.js` sign primitive.
 
 **Publish failure never fails bundle generation.** If the network is unreachable, Verascore returns a non-2xx status, or the URL fails SSRF validation, the publish outcome is captured in `publish_result` on the returned bundle and the bundle is returned in the same shape. Sanctuary never starts requiring Verascore to be online. This is the non-dependency principle applied to the publish layer.
 
 ### PDF render
 
-Supply `--pdf` on the CLI to additionally render the Markdown bundle into a single `bundle.pdf` file in the output directory. The PDF is produced by a hand-rolled minimal PDF writer (zero new dependencies) using the Courier and Courier-Bold standard PDF Type1 fonts — no font embedding, no font metric tables, no Puppeteer/Chromium. The output is clean monospace typography with a cover page, per-document page breaks, and a footer on every page showing the manifest SHA-256 identifier prefix and page number.
+Supply `--pdf` on the CLI to additionally render the Markdown bundle into a single `bundle.pdf` file in the output directory. The PDF is produced by a hand-rolled minimal PDF writer (zero new dependencies) using the Courier and Courier-Bold standard PDF Type1 fonts: no font embedding, no font metric tables, no Puppeteer/Chromium. The output is clean monospace typography with a cover page, per-document page breaks, and a footer on every page showing the manifest SHA-256 identifier prefix and page number.
 
 **The PDF is NOT cryptographically signed.** Integrity verification remains with the Markdown files and the JSON manifest. The PDF is a human-readable render of those already-signed artifacts. See `examples/eu_ai_act_bundle_example/bundle.pdf` for a visual reference.
 
@@ -90,13 +90,13 @@ The coverage matrix classifies every row of the regulation into one of three fla
 
 **Total: 46 rows across Annex IV + Articles 12, 13, 14, 15, 19(1), and 26.**
 
-The full row list — the load-bearing spine of the bundle — is:
+The full row list, the core rows of the bundle, is:
 
-1. Annex IV §2(h) — Cybersecurity measures (description)
-2. Article 12(1) — Automatic logging of events over lifetime
-3. Article 12(2)(a) — Logs enable post-market monitoring per Article 72
-4. Article 12(2)(b) — Logs facilitate operation monitoring per Article 26(5)
-5. Article 15(5) first subparagraph — Resilience against unauthorised third-party alteration
+1. Annex IV §2(h): Cybersecurity measures (description)
+2. Article 12(1): Automatic logging of events over lifetime
+3. Article 12(2)(a): Logs enable post-market monitoring per Article 72
+4. Article 12(2)(b): Logs facilitate operation monitoring per Article 26(5)
+5. Article 15(5) first subparagraph: Resilience against unauthorised third-party alteration
 
 Every other row is either partial or manual-only. If you see a claim of "full coverage" that does not match this list, the coverage matrix has been modified and the claim needs re-verification.
 
@@ -152,10 +152,10 @@ The same functionality is exposed as an MCP tool for agent-initiated compliance 
 Tool: compliance_generate_eu_ai_act_bundle
 
 Input:
-  agent_did:          string    — DID of the agent
-  deployment_context: object    — enterprise-supplied facts
-  period_start:       string    — ISO 8601
-  period_end:         string    — ISO 8601
+  agent_did:          string   : DID of the agent
+  deployment_context: object   : enterprise-supplied facts
+  period_start:       string   : ISO 8601
+  period_end:         string   : ISO 8601
 
 Output:
   bundle_version, matrix_version, regulation_version,
@@ -166,7 +166,7 @@ Output:
   _bundle_content.{manifest, files[{filename, content}]}
 ```
 
-The tool is classified Tier 3 (auto-allow with audit logging) in the default Principal Policy — it is read-only and emits documents from existing state without modifying anything.
+The tool is classified Tier 3 (auto-allow with audit logging) in the default Principal Policy: it is read-only and emits documents from existing state without modifying anything.
 
 ## Verifying a generated bundle
 
@@ -189,15 +189,15 @@ To verify Ed25519 signatures, use any Ed25519 library with the `signer.public_ke
 
 These are specific to Sanctuary v0.7.0+ and are documented per-row in the coverage matrix:
 
-1. **Audit log entries are not Ed25519-signed** — authenticated encryption (AES-256-GCM) provides integrity against third-party tampering but not non-repudiation against a compromised-master-key insider.
+1. **Audit log entries are not Ed25519-signed**: authenticated encryption (AES-256-GCM) provides integrity against third-party tampering but not non-repudiation against a compromised-master-key insider.
 
-2. **Audit log persistence is fire-and-forget** — if disk write fails, the entry lives only in memory and is lost at process exit. Mitigation: run Sanctuary on reliable storage and monitor for write failures.
+2. **Audit log persistence is fire-and-forget**: if disk write fails, the entry lives only in memory and is lost at process exit. Mitigation: run Sanctuary on reliable storage and monitor for write failures.
 
-3. **Injection detector configuration state is not directly queryable** — the detector runs in the Principal Policy gate but has no MCP status tool in v0.7.0. Its activity is evidenced indirectly via `injection_detected:*` entries in the audit log.
+3. **Injection detector configuration state is not directly queryable**: the detector runs in the Principal Policy gate but has no MCP status tool in v0.7.0. Its activity is evidenced indirectly via `injection_detected:*` entries in the audit log.
 
-4. **No TEE attestation** — Sanctuary self-reports its execution environment. The SHR degradation flag `NO_TEE` is set automatically. Mitigation: deploy on TEE-capable hardware where the deployment context demands it.
+4. **No TEE attestation**: Sanctuary self-reports its execution environment. The SHR degradation flag `NO_TEE` is set automatically. Mitigation: deploy on TEE-capable hardware where the deployment context demands it.
 
-5. **Log retention is deployer-declared** — Sanctuary captures indefinitely by default; the deployer configures archival to meet the Article 19(1) six-month minimum.
+5. **Log retention is deployer-declared**: Sanctuary captures indefinitely by default; the deployer configures archival to meet the Article 19(1) six-month minimum.
 
 The Article 12 document in every bundle discloses these caveats in a "Known Caveats and Residual Risk" section for audit transparency.
 
@@ -206,14 +206,14 @@ The Article 12 document in every bundle discloses these caveats in a "Known Cave
 The coverage matrix is versioned (`v1`) and aligned to the OJ-published text of Regulation (EU) 2024/1689. Every row carries:
 
 - `last_reviewed_date` and `last_reviewed_by` (per-row freshness)
-- `review_notes` with the classification rationale (load-bearing for future maintainers)
-- `evidence_emitter[]` listing the exact MCP tool names that emit the evidence — every name verified against the v0.7.0 registered tool set at matrix creation time
+- `review_notes` with the classification rationale (important for future maintainers)
+- `evidence_emitter[]` listing the exact MCP tool names that emit the evidence, every name verified against the v0.7.0 registered tool set at matrix creation time
 
 When the European Commission publishes implementing acts or delegated acts that modify the applicable requirements, the matrix must be re-reviewed. The `next_review_due` field at the top of the matrix forward-commits the review cadence. Bumping `REGULATION_VERSION` is the signal that the aligned regulation text has changed; the matrix `matrix_version` bumps only when the schema or row set changes structurally.
 
 ## Relationship to legal signatures
 
-The cryptographic signatures in the bundle are **runtime authenticity attestations**, not legal signatures. They prove the bundle was emitted by the named Sanctuary instance and has not been altered since generation. The EU declaration of conformity under Article 47 requires a legal signature from the provider's legal representative — the Sanctuary signature is complementary, not a substitute.
+The cryptographic signatures in the bundle are **runtime authenticity attestations**, not legal signatures. They prove the bundle was emitted by the named Sanctuary instance and has not been altered since generation. The EU declaration of conformity under Article 47 requires a legal signature from the provider's legal representative: the Sanctuary signature is complementary, not a substitute.
 
 A typical filing workflow:
 
@@ -228,10 +228,10 @@ A typical filing workflow:
 
 ## Related documents
 
-- [`docs/compliance/eu_ai_act_coverage_matrix_v1.md`](./eu_ai_act_coverage_matrix_v1.md) — complete row-by-row coverage mapping
-- [`examples/eu_ai_act_bundle_example/`](../../examples/eu_ai_act_bundle_example/) — fictional Fortune 2000 HR screening bundle
-- [`examples/eu_ai_act_bundle_example/README.md`](../../examples/eu_ai_act_bundle_example/README.md) — how to read the example
-- [`examples/eu_ai_act_bundle_example/verify.sh`](../../examples/eu_ai_act_bundle_example/verify.sh) — SHA-256 verification script
+- [`docs/compliance/eu_ai_act_coverage_matrix_v1.md`](./eu_ai_act_coverage_matrix_v1.md): complete row-by-row coverage mapping
+- [`examples/eu_ai_act_bundle_example/`](../../examples/eu_ai_act_bundle_example/): fictional Fortune 2000 HR screening bundle
+- [`examples/eu_ai_act_bundle_example/README.md`](../../examples/eu_ai_act_bundle_example/README.md): how to read the example
+- [`examples/eu_ai_act_bundle_example/verify.sh`](../../examples/eu_ai_act_bundle_example/verify.sh): SHA-256 verification script
 
 ---
 

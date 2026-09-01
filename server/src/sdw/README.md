@@ -11,14 +11,14 @@ material is **routed through the SDW provenance minters** (`taintFromPolicy`,
 `taintRecordFromFields`, its forbidding taint is carried with the value. The
 join uses the monotone SDW lattice (most-restrictive wins; no rank descends from
 a forbidden taint to a persistable one), and `mintPersistableFromProvenance`
-admits only the three persistable taints — so a record carrying any forbidding
+admits only the three persistable taints, so a record carrying any forbidding
 field taint is rejected before encryption.
 
 **Precondition (honest boundary).** This guarantee holds for values that *enter
 the SDW through the provenance path*. It is NOT retroactive: a caller that
-unwraps `carrier.value` and re-mints it as clean — via `taintClean(value,
+unwraps `carrier.value` and re-mints it as clean, via `taintClean(value,
 "user_content")` or via the legacy caller-asserted `mintPersistable` path that
-stores still use for their own already-clean typed records — can launder it past
+stores still use for their own already-clean typed records, can launder it past
 the structural gate (the classifier is then the only backstop). The provenance
 minters therefore assume callers do not deliberately re-mint source-derived
 values as clean. **Forcing every crown-jewel source through the provenance path
@@ -32,7 +32,7 @@ reach the store."
 
 The classifier in `write-gate.ts` is a heuristic backstop, **not** the guarantee.
 It canonicalizes the whole record (fields + nested values + metadata) before
-scanning and *flags* several common high-signal shapes — PEM/private-key markers
+scanning and *flags* several common high-signal shapes: PEM/private-key markers
 (including split across non-adjacent fields), encoded or explicitly labeled
 Ed25519 key material, explicitly labeled Sanctuary recovery-key material,
 checksum-valid GitHub tokens, common provider token prefixes, JWTs, URL-embedded
@@ -83,7 +83,7 @@ longer identifier named in ordinary prose can also gate, with no secret
 present, when a high-entropy value sits nearby. This is the deliberately
 chosen behavior: correctness on the assignment shape outweighs the prose
 false positive, which the operator resolves the same way as any other
-classifier refusal — edit the file, or keep it outside the mirrored
+classifier refusal: edit the file, or keep it outside the mirrored
 directory.
 
 ## Out of scope by design

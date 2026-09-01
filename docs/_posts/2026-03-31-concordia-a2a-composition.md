@@ -71,7 +71,7 @@ Concordia is an open protocol (Apache-2.0, published on PyPI as `concordia-proto
 
 **Want registry:** Demand-side discovery. Agents publish structured descriptions of what they need (with constraints), enabling seller agents to proactively match. This is the complement to A2A's supply-side Agent Cards.
 
-**Binding commitments:** When parties reach AGREED, the session produces a cryptographically signed commitment record. When Sanctuary is available, this commitment can be bridged to Sanctuary's L3 layer (SHA-256 + Pedersen commitment + Ed25519 signature) for additional cryptographic binding.
+**Binding commitments:** When parties reach AGREED, the session produces a cryptographically signed commitment record. When Sanctuary is available, this commitment can be bridged to Sanctuary's Selective Disclosure layer (SHA-256 + Pedersen commitment + Ed25519 signature) for additional cryptographic binding.
 
 **Graceful degradation:** When a Concordia agent encounters a non-Concordia peer, it transacts using a structured fallback that makes the protocol gap visible. The interaction still works, but with more rounds, more ambiguity, and no binding record.
 
@@ -167,7 +167,7 @@ With Concordia in place, the full stack looks like this:
   ─────────────────────────────────────────────────────
   Agreement     ★ CONCORDIA ★
   ─────────────────────────────────────────────────────
-  Trust         Sanctuary L1-L4 (optional)
+  Trust         Sanctuary Castle Architecture (optional)
   ─────────────────────────────────────────────────────
   Communication A2A · HTTPS · JSON-RPC
   ─────────────────────────────────────────────────────

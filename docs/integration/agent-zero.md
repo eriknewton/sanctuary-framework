@@ -65,7 +65,7 @@ with identity_set_primary.
 ## Step 4: Run a Sovereignty Health Report
 
 ```
-Run sovereignty_health_report and show me the L1-L4 status.
+Run sovereignty_health_report and show me the Castle Wall, Sentinels, Charter, and Heralds status.
 ```
 
 See the [verification checklist](./_verification-checklist.md) for expected results.
@@ -86,7 +86,7 @@ Visit `https://verascore.ai/agent/{did}` to see the live profile.
 | Default logging | Encrypted, tamper-evident hash-chained audit trail; production audit checkpoints are currently unsigned until **IC-05** closes |
 | No reputation | Verifiable Verascore profile |
 | Platform-locked trust | Portable across any runtime |
-| No sovereignty proof | L1-L4 Sovereignty Health Report |
+| No sovereignty proof | Castle Wall, Sentinels, Charter, Heralds Sovereignty Health Report |
 
 ## Agent Zero-Specific Notes
 

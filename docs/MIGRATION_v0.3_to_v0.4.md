@@ -16,7 +16,7 @@ No breaking changes to:
 | Category | New tools | Count |
 |----------|-----------|-------|
 | Decommissioning | `decommission_certificate`, `decommission_verify` | 2 |
-| L2 Hardening | `l2_hardening_status`, `l2_verify_isolation` | 2 |
+| Operational Isolation Hardening | `l2_hardening_status`, `l2_verify_isolation` | 2 |
 | SHR Gateway | `shr_gateway_export` | 1 |
 | Context Gating | `context_gate_set_policy`, `context_gate_filter`, `context_gate_apply_template`, `context_gate_list_policies`, `context_gate_recommend` | 5 |
 
@@ -201,7 +201,7 @@ claude -p "Generate a context gating policy using context_gate_apply_template:
 
 ## What did NOT change
 
-- **All L1–L4 tools:** Same names, same parameters, same behavior
+- **All Castle Wall / Sentinels / Charter / Heralds tools:** same names, same parameters, same behavior
   - Example: `sanctuary/shr_generate`, `sanctuary/handshake_initiate`, `sanctuary/reputation_export` all work identically
 - **SHR format:** Still v1.0, same schema, same signature verification
 - **Identity system:** Same Ed25519 keys, same DID format, same recovery paths

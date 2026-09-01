@@ -14,16 +14,16 @@ confirms a layer of the sovereignty stack is operational.
 
 Call `manifest` and verify the response lists the full Sanctuary tool surface across these categories:
 
-- L1: Cognitive Sovereignty (state, identity, encryption)
-- L2: Operational Isolation (principal policy, context gating, call governor)
-- L3: Selective Disclosure (commitments, proofs, attestations)
-- L4: Verifiable Reputation (reputation, federation, handshake)
+- Cognitive Sovereignty (state, identity, encryption)
+- Operational Isolation (principal policy, context gating, call governor)
+- Selective Disclosure (commitments, proofs, attestations)
+- Verifiable Reputation (reputation, federation, handshake)
 - Concordia Bridge, Dashboard, Sovereignty Audit, SIEM Export, etc.
 
 If you see 0 tools, the MCP server failed to start. Check the runtime-specific
 troubleshooting section.
 
-### 2. Identity (confirms L1)
+### 2. Identity (confirms Cognitive Sovereignty)
 
 ```
 Call: identity_create
@@ -36,23 +36,23 @@ Expect: Confirmation that this identity is now the default for signing.
 
 The private key is encrypted at rest and never appears in tool responses.
 
-### 3. Sovereignty Health Report (confirms L1-L4)
+### 3. Sovereignty Health Report (confirms Cognitive Sovereignty, Operational Isolation, Selective Disclosure, and Verifiable Reputation)
 
 ```
 Call: sovereignty_health_report
 Expect: A structured report with four layers:
 
-  L1 (Cognitive Sovereignty):   FULL or DEGRADED
-  L2 (Operational Isolation):   FULL or DEGRADED
-  L3 (Selective Disclosure):    FULL or DEGRADED
-  L4 (Verifiable Reputation):   FULL or DEGRADED
+  Cognitive Sovereignty:   FULL or DEGRADED
+  Operational Isolation:   FULL or DEGRADED
+  Selective Disclosure:    FULL or DEGRADED
+  Verifiable Reputation:   FULL or DEGRADED
 ```
 
 Typical first-run results:
-- L1: FULL (identity created, state encrypted)
-- L2: DEGRADED (no TEE, which is normal for local/cloud deployments)
-- L3: FULL (Schnorr + Pedersen proofs available)
-- L4: FULL after publishing to Verascore; DEGRADED before
+- Cognitive Sovereignty: FULL (identity created, state encrypted)
+- Operational Isolation: DEGRADED (no TEE, which is normal for local/cloud deployments)
+- Selective Disclosure: FULL (Schnorr + Pedersen proofs available)
+- Verifiable Reputation: FULL after publishing to Verascore; DEGRADED before
 
 ### 4. Audit Trail (confirms logging)
 
@@ -64,7 +64,7 @@ Expect: Recent operations logged, including the identity_create
 
 All operations are logged to an encrypted, tamper-evident hash-chained audit trail. Production audit checkpoints are currently unsigned until **IC-05** closes.
 
-### 5. Verascore Publish (confirms L4 + external integration)
+### 5. Verascore Publish (confirms Verifiable Reputation + external integration)
 
 ```
 Call: reputation_publish
@@ -80,7 +80,7 @@ Visit the URL to verify:
 
 ```
 Call: shaking_hands_offer
-Expect: A signed SHR offer containing your L1-L4 status,
+Expect: A signed SHR offer containing your Cognitive Sovereignty, Operational Isolation, Selective Disclosure, and Verifiable Reputation status,
         ready for exchange with a peer agent.
 ```
 
