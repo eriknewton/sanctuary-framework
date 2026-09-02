@@ -169,9 +169,12 @@ function renderUntrusted(raw: string): string {
  * values JSON cannot represent; `String()` is then the last resort and is
  * labelled honest by being reachable only off the JSON path.
  */
-function metadataDisplayString(value: unknown): string {
+function metadataDisplayString(
+  value: unknown,
+  serialize: (value: unknown) => string | undefined = JSON.stringify,
+): string {
   if (typeof value === "string") return value;
-  const json = JSON.stringify(value);
+  const json = serialize(value);
   return json === undefined ? String(value) : json;
 }
 
@@ -186,16 +189,21 @@ const UNRENDERABLE_VALUE_PLACEHOLDER = "(unrenderable value)";
  * per-code-point chunks), so what IS shown still decodes unambiguously.
  *
  * TOTALITY INVARIANT: this function must return for ARBITRARY stored JSON and
- * never throw. `JSON.stringify` recurses, so a deeply nested but valid stored
- * value throws RangeError before any truncation can bound it; uncaught, that
- * throw escaped mid-receipt, suppressed the file-path line, and was
- * misreported as a fortress unlock failure. A value that defeats
- * serialization renders as a code-chosen placeholder instead.
+ * never throw. Serialization can itself fail on a stored value it cannot
+ * represent (a `toJSON` that throws, a `BigInt`, a circular structure);
+ * uncaught, such a throw escaped mid-receipt, suppressed the file-path line,
+ * and was misreported as a fortress unlock failure. A value that defeats
+ * serialization renders as a code-chosen placeholder instead. The serializer
+ * is injectable for tests and defaults to `JSON.stringify`; production always
+ * uses the default.
  */
-function renderUntrustedMetadata(value: unknown): string {
+function renderUntrustedMetadata(
+  value: unknown,
+  serialize?: (value: unknown) => string | undefined,
+): string {
   let raw: string;
   try {
-    raw = metadataDisplayString(value);
+    raw = metadataDisplayString(value, serialize ?? JSON.stringify);
   } catch {
     return UNRENDERABLE_VALUE_PLACEHOLDER;
   }
@@ -267,6 +275,17 @@ export interface StateDiscloseCommandArgs {
    * are all the shipped ones.
    */
   contentWriteSeam?: (body: string) => Promise<void>;
+  /**
+   * Test-only seam for the JSON serialization on the two fail-loud paths: the
+   * receipt's untrusted-metadata rendering and the `--json` payload. Absent
+   * (production, always) it is exactly `JSON.stringify`, so behaviour is
+   * unchanged. A test injects a serializer that throws deterministically to
+   * exercise the catch/fail-loud branches WITHOUT depending on any runtime's
+   * JSON recursion depth, which is not a stable cross-version property (Node 26
+   * serializes nesting earlier runtimes rejected). It never reaches the
+   * file-body writer, whose fidelity path is covered directly.
+   */
+  serializeSeam?: (value: unknown) => string | undefined;
 }
 
 function write(stream: Writable, text: string): void {
@@ -435,6 +454,10 @@ export async function runStateDiscloseUnattributedCommand(
   const err = args.err ?? process.stderr;
   const env = args.env ?? process.env;
   const argv = args.argv;
+  // Absent in production, so this is exactly `JSON.stringify`; a test injects a
+  // deterministic throw to drive the two fail-loud serialization branches
+  // below without leaning on a runtime's JSON recursion depth.
+  const serialize = args.serializeSeam ?? JSON.stringify;
 
   if (argv.includes("--help") || argv.includes("-h")) {
     printHelp(out);
@@ -633,12 +656,18 @@ export async function runStateDiscloseUnattributedCommand(
     if (json) {
       // Verbatim, and only here: the TTY refusal above already established
       // that a program, not a terminal, is reading this stream. The
-      // serialization can itself fail on a deeply nested stored value, and
-      // that failure must be named as what it is rather than falling through
-      // to the generic unlock diagnosis below.
+      // serialization can itself fail on a stored value it cannot represent,
+      // and that failure must be named as what it is rather than falling
+      // through to the generic unlock diagnosis below.
       let payload: string;
       try {
-        payload = JSON.stringify(disclosure);
+        const serialized = serialize(disclosure);
+        if (serialized === undefined) {
+          // JSON cannot represent the disclosure at all; treat it as the same
+          // fail-loud outcome a serialization throw produces.
+          throw new Error("disclosure has no JSON serialization");
+        }
+        payload = serialized;
       } catch {
         await auditDelivery("json_serialization_failed", "failure");
         write(
@@ -770,22 +799,22 @@ export async function runStateDiscloseUnattributedCommand(
       // never suppress the file-path line or misreport the disclosure.
       const receipt =
         `\n${UNATTRIBUTED_DISCLOSURE_NOTICE}\n\n` +
-        `namespace: ${renderUntrustedMetadata(disclosure.namespace)}\n` +
-        `key:       ${renderUntrustedMetadata(disclosure.key)}\n` +
+        `namespace: ${renderUntrustedMetadata(disclosure.namespace, serialize)}\n` +
+        `key:       ${renderUntrustedMetadata(disclosure.key, serialize)}\n` +
         // `version` IS attacker-controlled, despite its `number` type. The
         // stored entry is parsed from legacy JSON and cast to `StateEntry`
         // without runtime field validation, so `ver` can be any JSON value a
         // writer put there. The metadata renderer encodes it, carries a
         // faithful JSON display of a non-primitive, and is total, so nothing
         // here trusts the type.
-        `version:   ${renderUntrustedMetadata(disclosure.version)}\n` +
+        `version:   ${renderUntrustedMetadata(disclosure.version, serialize)}\n` +
         // `writer` is the one field this code chooses rather than reads: a
         // single-inhabitant literal set by the disclosure path itself.
         `writer:    ${disclosure.writer}\n` +
         `claimed_written_at: ${
           disclosure.claimed_written_at === undefined
             ? "(none recorded)"
-            : renderUntrustedMetadata(disclosure.claimed_written_at)
+            : renderUntrustedMetadata(disclosure.claimed_written_at, serialize)
         }\n` +
         // The identity to restore, printed so the remedy this command
         // advertises on every path names something the operator can act on.
@@ -797,7 +826,7 @@ export async function runStateDiscloseUnattributedCommand(
         `${
           disclosure.claimed_writer_id === undefined
             ? "(none recorded)"
-            : renderUntrustedMetadata(disclosure.claimed_writer_id)
+            : renderUntrustedMetadata(disclosure.claimed_writer_id, serialize)
         }\n` +
         `\ncontent written to: ${renderUntrusted(contentFilePath)}\n` +
         (fileBody.storedValueWasString
