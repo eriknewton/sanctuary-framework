@@ -23,6 +23,7 @@ pub mod cgroup;
 pub mod config;
 pub mod daemon;
 pub mod decision;
+pub mod enforcement;
 pub mod failure;
 pub mod habeas;
 pub(crate) mod identity;
@@ -37,6 +38,11 @@ pub mod policy;
 pub use config::DaemonConfig;
 pub use daemon::{boot, DaemonError, DaemonExitReport, DaemonHandle, DaemonRuntimeState};
 pub use decision::{AttemptError, DecisionEngine, EvaluationOutcome};
+pub use enforcement::{
+    derive_daemon_state, enforcement_status, AcquiredComponent, ComponentKind, ComponentProvider,
+    EnforcementError, EnforcementRuntime, EnforcementStartError, EnforcementStatus,
+    NotEnforcingReason,
+};
 pub use ipc::framing::{frame, parse_frame, ParseStep};
 pub use ipc::messages::{IpcMessage, MessageEnvelope};
 pub use manifest::verify::verify_manifest_signature;
