@@ -16,6 +16,7 @@ use crate::audit::{AuditRingBuffer, WalWriter};
 use crate::config::DaemonConfig;
 use crate::constants::{AUDIT_LAYER, SCHEMA_VERSION_V1};
 use crate::decision::{AttemptError, DecisionEngine, EvaluationOutcome};
+use crate::enforcement::EnforcementRuntime;
 use crate::failure::{FailureDisposition, FailureMode};
 use crate::ipc::auth::{load_pinned_public_key, AuthError};
 use crate::ipc::server::{IpcServer, IpcServerError};
@@ -65,7 +66,9 @@ pub fn mode_for_error(err: &DaemonError) -> FailureMode {
 /// scope-lock §7 F-1 / F-4 / F-8 message keys.
 pub fn refuse_to_start_message(disposition: &FailureDisposition, detail: &str) -> String {
     let key = match disposition {
-        FailureDisposition::RefuseToStart { operator_message_key } => *operator_message_key,
+        FailureDisposition::RefuseToStart {
+            operator_message_key,
+        } => *operator_message_key,
         _ => "refuse_to_start_unknown",
     };
     let body = match key {
@@ -87,7 +90,10 @@ pub fn refuse_to_start_message(disposition: &FailureDisposition, detail: &str) -
         }
         _ => "Sanctuary refuses to start. See systemctl status sanctuary-castle-wall.",
     };
-    format!("Sanctuary cannot start ({}).\n\n{}\n\nDetail: {}", key, body, detail)
+    format!(
+        "Sanctuary cannot start ({}).\n\n{}\n\nDetail: {}",
+        key, body, detail
+    )
 }
 
 /// Live daemon handle. Holding this guarantees the IPC server is bound and
@@ -98,19 +104,57 @@ pub struct DaemonHandle {
     audit_buffer: Arc<Mutex<AuditRingBuffer>>,
     /// Cloneable policy and audit surface used by kernel verdict callbacks.
     decision_engine: Arc<DecisionEngine>,
+    /// Lifecycle state (ControlPlaneOnly / Stopping / Degraded). `Enforcing` is
+    /// NEVER stored here; it is derived from `enforcement` so IPC/process
+    /// liveness cannot be presented as kernel enforcement.
     runtime_state: Arc<Mutex<DaemonRuntimeState>>,
+    /// Owned kernel-enforcement runtime, when the daemon holds one. `None` on
+    /// this slice's boot path: the Linux kernel adapter is not drill-verified
+    /// yet (ASSURANCE_MATRIX row 17), so the daemon reports ControlPlaneOnly.
+    enforcement: Option<EnforcementRuntime>,
+    /// Daemon shutdown-REQUEST flag. Signal handlers and [`request_stop`] set
+    /// ONLY this; it is what [`wait_for_shutdown`] / [`is_shutdown_requested`]
+    /// observe and what drives the daemon's DECISION to begin teardown. It is
+    /// deliberately NOT the IPC accept-loop stop flag: a shutdown request must
+    /// never tear the IPC control surface down before enforcement is released
+    /// (see [`teardown`]), so the accept loop is stopped by a distinct flag that
+    /// only [`IpcServer::stop_and_join`] sets, and only AFTER
+    /// `enforcement.shutdown()`.
+    ///
+    /// [`request_stop`]: Self::request_stop
+    /// [`wait_for_shutdown`]: Self::wait_for_shutdown
+    /// [`is_shutdown_requested`]: Self::is_shutdown_requested
+    /// [`teardown`]: Self::teardown
     shutdown_flag: Arc<AtomicBool>,
+    /// IPC-owned accept-loop stop flag, retained here only so tests can prove
+    /// the IPC server is still live (this flag observed `false`) at the instant
+    /// enforcement is released. It is set EXCLUSIVELY by
+    /// [`IpcServer::stop_and_join`] during `teardown`, AFTER enforcement
+    /// shutdown — never by a signal or `request_stop`. Test-gated because
+    /// production never reads it through the handle: the server owns its own
+    /// clone.
+    #[cfg(test)]
+    ipc_stop_flag: Arc<AtomicBool>,
     started_at: Instant,
 }
 
 impl DaemonHandle {
     /// Current enforcement truth. The existing boot path deliberately reports
     /// `ControlPlaneOnly` until L1 owns live nftables and NFQUEUE resources.
+    ///
+    /// `Enforcing` is DERIVED, never stored: it is returned only when an owned
+    /// [`EnforcementRuntime`] reports every required component ready. A poisoned
+    /// lifecycle lock reads as `Degraded` (and `Degraded` is never promoted to
+    /// `Enforcing`), and a runtime that has lost a component reads as
+    /// `ControlPlaneOnly` — so process/IPC liveness alone can never present as
+    /// kernel enforcement.
     pub fn runtime_state(&self) -> DaemonRuntimeState {
-        self.runtime_state
+        let lifecycle = self
+            .runtime_state
             .lock()
             .map(|state| *state)
-            .unwrap_or(DaemonRuntimeState::Degraded)
+            .unwrap_or(DaemonRuntimeState::Degraded);
+        crate::enforcement::derive_daemon_state(lifecycle, self.enforcement.as_ref())
     }
 
     /// Kernel enforcement is true only in the explicit enforcing state.
@@ -178,21 +222,78 @@ impl DaemonHandle {
         }
     }
 
-    /// Programmatically request shutdown. Used by tests and by the
+    /// Programmatically request shutdown. Sets ONLY the daemon
+    /// shutdown-request flag — so [`wait_for_shutdown`](Self::wait_for_shutdown)
+    /// returns and [`teardown`](Self::teardown) begins — and deliberately does
+    /// NOT stop the IPC accept loop. `teardown` stops IPC via
+    /// [`IpcServer::stop_and_join`] only AFTER enforcement is released, so a
+    /// programmatic (or signal-driven) stop can never terminate the control
+    /// surface before enforcement teardown. Used by tests and by the
     /// signal-handler thread.
     pub fn request_stop(&self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
     }
 
-    /// Stop the IPC server and wait for it to join.
-    pub fn stop(mut self) -> Result<DaemonExitReport, DaemonError> {
+    /// Test-only: attach an enforcement runtime so the `Enforcing` derivation
+    /// can be exercised without a real kernel. Never compiled into the shipped
+    /// daemon; the production boot path leaves `enforcement` `None`.
+    #[cfg(test)]
+    pub(crate) fn set_enforcement_for_test(&mut self, runtime: EnforcementRuntime) {
+        self.enforcement = Some(runtime);
+    }
+
+    /// Test-only: a clone of the IPC-owned accept-loop stop flag, so a test can
+    /// prove the IPC server is still live (flag `false`) at the instant
+    /// enforcement releases. Never compiled into the shipped daemon.
+    #[cfg(test)]
+    pub(crate) fn ipc_stop_flag_for_test(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.ipc_stop_flag)
+    }
+
+    /// Shared, idempotent teardown used by BOTH [`stop`](Self::stop) and
+    /// [`Drop`]. Tears kernel enforcement down BEFORE the IPC control surface:
+    /// the NFQUEUE verdict thread routes through the decision engine and reports
+    /// to the control surface, so it must stop (and be joined) before that
+    /// surface goes away. `shutdown()` releases every component in reverse
+    /// acquisition order and joins owned threads, so no resource-owning thread
+    /// outlives this handle.
+    ///
+    /// Idempotent via `Option::take`: a `stop()` whose returned handle is then
+    /// dropped, or any other double-invocation, does the enforcement/IPC
+    /// teardown exactly once. This is the ONE ordered teardown path, so the
+    /// enforcement-before-IPC invariant cannot drift between the explicit and
+    /// implicit shutdown routes.
+    fn teardown(&mut self) {
         if let Ok(mut state) = self.runtime_state.lock() {
             *state = DaemonRuntimeState::Stopping;
         }
+        // Set the daemon shutdown-REQUEST flag. This is NOT the IPC accept-loop
+        // stop flag, so it does not begin tearing the control surface down; it
+        // only records that a stop was requested (idempotent with a prior
+        // signal / request_stop).
         self.request_stop();
+        // Enforcement BEFORE IPC. The NFQUEUE verdict thread routes through the
+        // decision engine and reports to the IPC control surface, so it must
+        // stop (and be joined) while that surface is still live. `shutdown()`
+        // releases every component in reverse acquisition order and joins owned
+        // threads.
+        if let Some(mut enforcement) = self.enforcement.take() {
+            enforcement.shutdown();
+        }
+        // ONLY now stop the IPC control surface. `stop_and_join` is the sole
+        // setter of the IPC-owned accept-loop stop flag, so the accept loop was
+        // guaranteed live throughout the enforcement release above.
         if let Some(server) = self.ipc_server.take() {
             server.stop_and_join();
         }
+    }
+
+    /// Stop the IPC server and wait for it to join, then return the exit
+    /// report. Delegates the ordered enforcement-before-IPC teardown to the
+    /// shared [`teardown`](Self::teardown) path so it matches the `Drop` route
+    /// exactly.
+    pub fn stop(mut self) -> Result<DaemonExitReport, DaemonError> {
+        self.teardown();
         let buffer_overflow_count = self
             .audit_buffer
             .lock()
@@ -205,6 +306,22 @@ impl DaemonHandle {
             audit_remaining: buffer_remaining,
             socket_path: self.config.socket_path.clone(),
         })
+        // `self` drops here, running Drop -> teardown() again; idempotent, so
+        // the second pass is a no-op.
+    }
+}
+
+impl Drop for DaemonHandle {
+    fn drop(&mut self) {
+        // Last line of defense for the enforcement-before-IPC ordering: a caller
+        // that drops the handle WITHOUT calling stop() must still tear
+        // enforcement down before IPC. Rust's default field-declaration drop
+        // order would drop `ipc_server` (declared before `enforcement`) FIRST,
+        // inverting the required order and letting the verdict thread report to
+        // an already-gone control surface; this explicit teardown overrides
+        // that. After it, both fields are `None`, so the subsequent per-field
+        // drops are no-ops.
+        self.teardown();
     }
 }
 
@@ -283,7 +400,16 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         }
     }
 
+    // Daemon shutdown-REQUEST flag: set by signal handlers and request_stop,
+    // observed by wait_for_shutdown. It drives the DECISION to shut down.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+    // IPC-owned accept-loop stop flag, DISTINCT from the daemon request flag
+    // above. Only IpcServer::stop_and_join (called from teardown AFTER
+    // enforcement.shutdown) sets it, so a signal or request_stop can never stop
+    // the IPC control surface before enforcement is released. Must stay separate
+    // from `shutdown_flag`; conflating them reintroduces the premature-IPC-stop
+    // defect this separation fixes.
+    let ipc_stop_flag = Arc::new(AtomicBool::new(false));
 
     // Slice L1: load (or first-boot generate) the daemon-held audit-producer
     // key. The private half stays in this process / a root-owned 0600 file and
@@ -304,7 +430,10 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         pinned_public_key: pinned_key_bytes,
         prompt_timeout: config.prompt_timeout,
         audit_buffer: Arc::clone(&audit_buffer),
-        shutdown_flag: Arc::clone(&shutdown_flag),
+        // The IPC accept loop stops on the IPC-owned flag, NOT the daemon
+        // shutdown-request flag, so a signal/request_stop cannot terminate it
+        // before enforcement teardown.
+        shutdown_flag: Arc::clone(&ipc_stop_flag),
         fortress_id: config.fortress_id.clone(),
         manifest_store: Some(Arc::clone(&manifest_store)),
         wal_writer: Some(Arc::clone(&wal_writer)),
@@ -347,7 +476,16 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         audit_buffer,
         decision_engine,
         runtime_state,
+        // No kernel-enforcement runtime is started on this slice's boot path:
+        // the Linux adapter is not drill-verified (ASSURANCE_MATRIX row 17), so
+        // the daemon owns no runtime and reports ControlPlaneOnly. This is the
+        // seam where `EnforcementRuntime::start(linux_production_plan(..))` will
+        // attach once the Linux drill closes; until then it stays `None` rather
+        // than a stub that reports enforcement.
+        enforcement: None,
         shutdown_flag,
+        #[cfg(test)]
+        ipc_stop_flag,
         started_at: Instant::now(),
     })
 }
@@ -458,16 +596,183 @@ mod tests {
         let (config, _signing) = fresh_config_in(&dir);
         let handle = boot(config).expect("boot");
 
-        assert_eq!(
-            handle.runtime_state(),
-            DaemonRuntimeState::ControlPlaneOnly
-        );
+        assert_eq!(handle.runtime_state(), DaemonRuntimeState::ControlPlaneOnly);
         assert!(
             !handle.is_enforcing(),
             "IPC and policy liveness must never be presented as kernel enforcement"
         );
 
         handle.stop().expect("stop");
+    }
+
+    #[test]
+    fn runtime_state_reports_enforcing_only_with_a_fully_ready_runtime() {
+        let dir = TempDir::new().unwrap();
+        let (config, _signing) = fresh_config_in(&dir);
+        let mut handle = boot(config).expect("boot");
+
+        // Baseline: no runtime owned -> control plane only, never enforcing.
+        assert_eq!(handle.runtime_state(), DaemonRuntimeState::ControlPlaneOnly);
+        assert!(!handle.is_enforcing());
+
+        // Attach a fully-ready runtime: NOW the derived state is Enforcing.
+        handle.set_enforcement_for_test(EnforcementRuntime::all_ready_for_test());
+        assert_eq!(handle.runtime_state(), DaemonRuntimeState::Enforcing);
+        assert!(handle.is_enforcing());
+
+        // stop() tears the runtime down and reports Stopping, never Enforcing.
+        handle.stop().expect("stop");
+    }
+
+    /// What [`observe_ipc_liveness_at_enforcement_release`] captured. `_dir`
+    /// keeps the temp directory alive for the caller's post-teardown
+    /// socket-unlink assertion, so that assertion observes the daemon's unlink
+    /// rather than the temp dir's own cleanup.
+    struct ReleaseObservation {
+        /// The IPC-owned accept-loop stop flag at the instant enforcement was
+        /// released. `false` proves the control surface was still live.
+        ipc_stopped_at_release: bool,
+        /// Whether the IPC socket file existed at that same instant.
+        socket_present_at_release: bool,
+        /// A clone of the IPC stop flag, so the caller can assert it becomes
+        /// `true` after teardown completes.
+        ipc_stop_flag: Arc<AtomicBool>,
+        socket_path: PathBuf,
+        _dir: TempDir,
+    }
+
+    /// Boot a daemon, attach an all-ready enforcement runtime whose FIRST
+    /// released component (the very start of enforcement teardown) runs a probe
+    /// recording the IPC stop flag + socket existence at that instant, then run
+    /// the supplied `teardown` (explicit `stop()` or implicit `Drop`). Shared by
+    /// the stop() and Drop tests so the enforcement-before-IPC invariant is
+    /// proven identically on BOTH routes through `teardown`.
+    fn observe_ipc_liveness_at_enforcement_release(
+        teardown: impl FnOnce(DaemonHandle),
+    ) -> ReleaseObservation {
+        let dir = TempDir::new().unwrap();
+        let (config, _signing) = fresh_config_in(&dir);
+        let socket_path = config.socket_path.clone();
+        let mut handle = boot(config).expect("boot");
+        assert!(socket_path.exists(), "IPC socket is bound after boot");
+
+        let ipc_stop_flag = handle.ipc_stop_flag_for_test();
+        assert!(
+            !ipc_stop_flag.load(Ordering::SeqCst),
+            "IPC stop flag is false while the daemon runs"
+        );
+
+        // The probe records IPC liveness (accept-loop stop flag still false)
+        // and socket existence at the instant enforcement is released.
+        let observed = Arc::new(Mutex::new(None::<(bool, bool)>));
+        let cell = Arc::clone(&observed);
+        let probe_flag = Arc::clone(&ipc_stop_flag);
+        let probe_socket = socket_path.clone();
+        handle.set_enforcement_for_test(EnforcementRuntime::all_ready_with_release_probe(
+            Box::new(move || {
+                *cell.lock().unwrap() =
+                    Some((probe_flag.load(Ordering::SeqCst), probe_socket.exists()));
+            }),
+        ));
+
+        teardown(handle);
+        let (ipc_stopped_at_release, socket_present_at_release) = observed
+            .lock()
+            .unwrap()
+            .expect("probe ran during enforcement release");
+        ReleaseObservation {
+            ipc_stopped_at_release,
+            socket_present_at_release,
+            ipc_stop_flag,
+            socket_path,
+            _dir: dir,
+        }
+    }
+
+    #[test]
+    fn drop_without_stop_tears_down_enforcement_before_ipc() {
+        // The implicit Drop path must honor the enforcement-before-IPC ordering.
+        // Rust would otherwise drop `ipc_server` (declared before `enforcement`)
+        // first. The load-bearing assertion is the IPC-owned accept-loop stop
+        // flag: at the instant enforcement releases it must still be `false`, so
+        // the control surface the verdict thread reports to was provably live
+        // throughout enforcement teardown. Socket existence is checked too but
+        // is only corroborating — a lingering socket file could outlive a
+        // stopped server, so socket existence ALONE is insufficient.
+        let obs = observe_ipc_liveness_at_enforcement_release(drop);
+
+        assert!(
+            !obs.ipc_stopped_at_release,
+            "IPC server must still be live (stop flag false) when enforcement releases"
+        );
+        assert!(
+            obs.socket_present_at_release,
+            "IPC socket must still exist when enforcement releases (corroborating)"
+        );
+        // After teardown the IPC server was stopped (flag set) and unlinked its
+        // socket — proving IPC teardown ran, AFTER enforcement.
+        assert!(
+            obs.ipc_stop_flag.load(Ordering::SeqCst),
+            "IPC stop flag must be set after teardown"
+        );
+        assert!(
+            !obs.socket_path.exists(),
+            "IPC teardown (socket unlink) must have run during Drop"
+        );
+    }
+
+    #[test]
+    fn explicit_stop_tears_down_enforcement_before_ipc() {
+        // Same control-surface-liveness invariant as the Drop test, via the
+        // EXPLICIT stop() route. Both funnel through the shared teardown() path;
+        // proving it on stop() AND Drop guards the invariant against drift at
+        // either entry point.
+        let obs = observe_ipc_liveness_at_enforcement_release(|handle| {
+            handle.stop().expect("stop");
+        });
+
+        assert!(
+            !obs.ipc_stopped_at_release,
+            "IPC server must still be live (stop flag false) when enforcement releases under stop()"
+        );
+        assert!(
+            obs.socket_present_at_release,
+            "IPC socket must still exist when enforcement releases under stop() (corroborating)"
+        );
+        assert!(
+            obs.ipc_stop_flag.load(Ordering::SeqCst),
+            "IPC stop flag must be set after stop()"
+        );
+        assert!(
+            !obs.socket_path.exists(),
+            "IPC teardown (socket unlink) must have run during stop()"
+        );
+    }
+
+    #[test]
+    fn poisoned_state_lock_never_reads_as_enforcing() {
+        let dir = TempDir::new().unwrap();
+        let (config, _signing) = fresh_config_in(&dir);
+        let mut handle = boot(config).expect("boot");
+        // Even with a fully-ready runtime attached, a poisoned lifecycle lock
+        // must degrade rather than promote to Enforcing.
+        handle.set_enforcement_for_test(EnforcementRuntime::all_ready_for_test());
+
+        let state_lock = Arc::clone(&handle.runtime_state);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state_lock.lock().unwrap();
+            panic!("poison the lifecycle lock");
+        }));
+        assert!(state_lock.is_poisoned(), "lock should be poisoned");
+
+        // Derivation sees Degraded (poison fallback) and refuses to promote it.
+        assert_ne!(handle.runtime_state(), DaemonRuntimeState::Enforcing);
+        assert_eq!(handle.runtime_state(), DaemonRuntimeState::Degraded);
+        assert!(!handle.is_enforcing());
+
+        // The poisoned lock also blocks a clean stop()'s state write, but stop
+        // must still tear down without panicking.
+        let _ = handle.stop();
     }
 
     #[test]
@@ -617,8 +922,7 @@ mod tests {
                 },
             ],
         };
-        let canonical =
-            canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();
+        let canonical = canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();
         let sig = signing.sign(&canonical);
         let signed = SignedManifest {
             manifest,
@@ -693,11 +997,9 @@ mod tests {
         // The WAL seq monotonically increases past the daemon_started seq=0.
         assert!(outcome.wal_seq.expect("wal_seq present on success") >= 1);
         assert!(outcome.event_canonical_json.contains("\"egress_approved\""));
-        assert!(
-            outcome
-                .event_canonical_json
-                .contains("\"rule-allow-anthropic\"")
-        );
+        assert!(outcome
+            .event_canonical_json
+            .contains("\"rule-allow-anthropic\""));
         let _ = handle.stop();
     }
 
@@ -735,14 +1037,15 @@ mod tests {
         }
         assert!(outcome.event_canonical_json.contains("\"egress_blocked\""));
         assert!(outcome.event_canonical_json.contains("\"static_rule\""));
-        assert!(outcome.event_canonical_json.contains("\"rule-deny-pastebin\""));
+        assert!(outcome
+            .event_canonical_json
+            .contains("\"rule-deny-pastebin\""));
         let _ = handle.stop();
     }
 
     #[test]
     fn evaluate_attempt_writes_durable_wal_seq_visible_through_handle() {
-        let (handle, _dir) =
-            boot_with_single_rule("rule-allow", "api.anthropic.com", "allow");
+        let (handle, _dir) = boot_with_single_rule("rule-allow", "api.anthropic.com", "allow");
         let first = handle
             .evaluate_attempt(&req_for(Some("api.anthropic.com"), 443))
             .expect("evaluate");
@@ -809,7 +1112,11 @@ mod tests {
                 .len()
         };
         let baseline_next_seq = wal_arc.lock().unwrap().next_seq();
-        let baseline_chain = wal_arc.lock().unwrap().last_chain_hash_hex().map(|s| s.to_string());
+        let baseline_chain = wal_arc
+            .lock()
+            .unwrap()
+            .last_chain_hash_hex()
+            .map(|s| s.to_string());
 
         // Arm the injection: the next append_critical inside evaluate_attempt
         // will short-circuit with a synthesized WalError::Io.
@@ -828,9 +1135,7 @@ mod tests {
             Verdict::Deny {
                 reason: DeniedReason::AuditWalAppendFailed,
             } => {}
-            other => panic!(
-                "expected Verdict::Deny(AuditWalAppendFailed); got {other:?}"
-            ),
+            other => panic!("expected Verdict::Deny(AuditWalAppendFailed); got {other:?}"),
         }
 
         // 2) wal_seq is None: no durable record landed.
@@ -844,9 +1149,7 @@ mod tests {
         //    audit_wal_append_failed provenance), NOT the original
         //    egress_approved that would have been emitted on the Allow path.
         assert!(
-            outcome
-                .event_canonical_json
-                .contains("\"egress_blocked\""),
+            outcome.event_canonical_json.contains("\"egress_blocked\""),
             "fail-closed audit body must contain egress_blocked; got {}",
             outcome.event_canonical_json
         );
@@ -858,9 +1161,7 @@ mod tests {
             outcome.event_canonical_json
         );
         assert!(
-            !outcome
-                .event_canonical_json
-                .contains("\"egress_approved\""),
+            !outcome.event_canonical_json.contains("\"egress_approved\""),
             "fail-closed audit body must NOT contain egress_approved; got {}",
             outcome.event_canonical_json
         );
@@ -946,17 +1247,13 @@ mod tests {
             Verdict::Deny {
                 reason: DeniedReason::AuditWalAppendFailed,
             } => {}
-            other => panic!(
-                "expected Verdict::Deny(AuditWalAppendFailed); got {other:?}"
-            ),
+            other => panic!("expected Verdict::Deny(AuditWalAppendFailed); got {other:?}"),
         }
         assert!(outcome.wal_seq.is_none());
         // Provenance must be audit_wal_append_failed, NOT default_deny.
-        assert!(
-            outcome
-                .event_canonical_json
-                .contains("\"audit_wal_append_failed\"")
-        );
+        assert!(outcome
+            .event_canonical_json
+            .contains("\"audit_wal_append_failed\""));
         assert!(
             !outcome.event_canonical_json.contains("\"default_deny\""),
             "fail-closed dispatch must override the default_deny provenance"
@@ -967,8 +1264,7 @@ mod tests {
     #[test]
     fn evaluate_attempt_fail_closed_on_wal_failure_overrides_explicit_deny() {
         // Third companion: explicit-rule deny path also gets overridden.
-        let (handle, _dir) =
-            boot_with_single_rule("rule-deny-pastebin", "pastebin.com", "deny");
+        let (handle, _dir) = boot_with_single_rule("rule-deny-pastebin", "pastebin.com", "deny");
 
         let wal_arc = handle.wal_writer().expect("wal wired").clone();
         let injection = wal_arc.lock().unwrap().injection_handle();
@@ -984,20 +1280,18 @@ mod tests {
             Verdict::Deny {
                 reason: DeniedReason::AuditWalAppendFailed,
             } => {}
-            other => panic!(
-                "expected Verdict::Deny(AuditWalAppendFailed); got {other:?}"
-            ),
+            other => panic!("expected Verdict::Deny(AuditWalAppendFailed); got {other:?}"),
         }
         // The original deny would have stamped rule_id_matched and
         // decision_provenance="static_rule"; the dispatched shape clears
         // both in favor of the audit_wal_append_failed provenance.
+        assert!(outcome
+            .event_canonical_json
+            .contains("\"audit_wal_append_failed\""));
         assert!(
-            outcome
+            !outcome
                 .event_canonical_json
-                .contains("\"audit_wal_append_failed\"")
-        );
-        assert!(
-            !outcome.event_canonical_json.contains("\"rule-deny-pastebin\""),
+                .contains("\"rule-deny-pastebin\""),
             "fail-closed dispatch must drop the original rule_id_matched stamp"
         );
         let _ = handle.stop();
