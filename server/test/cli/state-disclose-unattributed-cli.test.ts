@@ -232,6 +232,7 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
     isTTY?: boolean;
     decision?: "approve" | "deny";
     fileNameSeam?: { now: Date; randomHex: string };
+    serializeSeam?: (value: unknown) => string | undefined;
   } = {}): Promise<{ code: number; out: string; err: string; channel: FixedChannel }> {
     process.env.SANCTUARY_RECOVERY_KEY = recoveryKey;
     const out = new StringWritable() as StringWritable & { isTTY?: boolean };
@@ -253,6 +254,9 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
       env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
       approvalChannel: channel,
       ...(options.fileNameSeam ? { fileNameSeam: options.fileNameSeam } : {}),
+      ...(options.serializeSeam
+        ? { serializeSeam: options.serializeSeam }
+        : {}),
     });
     return { code, out: out.text, err: err.text, channel };
   }
@@ -647,38 +651,32 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
   });
 
   it("completes the receipt, with the file path, when a stored field defeats JSON serialization", async () => {
-    // A deeply nested but VALID stored JSON value throws RangeError inside
-    // `JSON.stringify` during metadata rendering. Rendering must be TOTAL over
-    // arbitrary stored JSON: the throw may never surface as a partial receipt
-    // with no file-path line and a false unlock diagnosis, because the file has
-    // already been written and the operator has to be told where it is. The
-    // depth window is real: JSON.parse accepts 12,000 levels that
-    // JSON.stringify then refuses.
-    const DEPTH = 12000;
-    const deepValueJson = "[".repeat(DEPTH) + "]".repeat(DEPTH);
-    // The deep value sits in `metadata.written_at`, which flows to the
-    // receipt's `claimed_written_at` line untouched by the store. `plantEntry`
-    // cannot carry it (its own JSON.stringify would throw at plant time), so
-    // the entry JSON is assembled around a placeholder.
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
-      recoveryKey,
-      storagePathHint: fortressPath,
-    });
-    const plaintext = stringToBytes(CONTENT);
-    const entryJson = JSON.stringify({
-      v: 1,
-      payload: encrypt(plaintext, deriveNamespaceKey(masterKey, NAMESPACE)),
-      ver: 1,
-      sig: toBase64url(new Uint8Array(64)),
-      kid: "sanctuary-no-such-writer-identity",
-      integrity_hash: hashToString(plaintext),
-      metadata: { written_at: "DEEP_VALUE_PLACEHOLDER" },
-    }).replace('"DEEP_VALUE_PLACEHOLDER"', deepValueJson);
-    await storage.write(NAMESPACE, KEY, stringToBytes(entryJson));
-    masterKey.fill(0);
+    // A stored value that serialization cannot represent (a throwing `toJSON`,
+    // a `BigInt`, a circular structure) throws inside the metadata serializer.
+    // Rendering must be TOTAL over arbitrary stored JSON: the throw may never
+    // surface as a partial receipt with no file-path line and a false unlock
+    // diagnosis, because the file has already been written and the operator has
+    // to be told where it is. The failure is driven through the injectable
+    // serializer rather than a nesting depth, which is not a stable property
+    // across runtimes (Node 26 serializes depths earlier runtimes rejected).
+    const UNSERIALIZABLE = { defeatsSerialization: true };
+    // The value sits in `metadata.written_at`, which flows to the receipt's
+    // `claimed_written_at` line untouched by the store.
+    await plantEntry({ metadata: { written_at: UNSERIALIZABLE } });
+    // A controlled throw on exactly that value; every other value (the numeric
+    // `version`, say) still serializes normally through the real JSON path.
+    const serializeSeam = (value: unknown): string | undefined => {
+      if (
+        value !== null &&
+        typeof value === "object" &&
+        (value as Record<string, unknown>).defeatsSerialization === true
+      ) {
+        throw new RangeError("simulated: stored value defeats serialization");
+      }
+      return JSON.stringify(value);
+    };
 
-    const { code, out, err } = await runCommand();
+    const { code, out, err } = await runCommand({ serializeSeam });
     expect(code).toBe(0);
     // The unrenderable field is shown as a code-chosen placeholder...
     expect(out).toContain("claimed_written_at: (unrenderable value)");
@@ -692,30 +690,21 @@ describe("sanctuary state_disclose_unattributed (CLI)", () => {
   });
 
   it("fails loudly, without the unlock misdiagnosis, when --json cannot serialize the disclosure", async () => {
-    // The same depth window on the data channel: `JSON.stringify(disclosure)`
-    // throws, and the command must name the real fault rather than reporting a
-    // fortress unlock failure.
-    const DEPTH = 12000;
-    const deepValueJson = "[".repeat(DEPTH) + "]".repeat(DEPTH);
-    const storage = new FilesystemStorage(join(fortressPath, "state"));
-    const masterKey = await resolveCliMasterKey(storage, {
-      recoveryKey,
-      storagePathHint: fortressPath,
-    });
-    const plaintext = stringToBytes(CONTENT);
-    const entryJson = JSON.stringify({
-      v: 1,
-      payload: encrypt(plaintext, deriveNamespaceKey(masterKey, NAMESPACE)),
-      ver: 1,
-      sig: toBase64url(new Uint8Array(64)),
-      kid: "sanctuary-no-such-writer-identity",
-      integrity_hash: hashToString(plaintext),
-      metadata: { written_at: "DEEP_VALUE_PLACEHOLDER" },
-    }).replace('"DEEP_VALUE_PLACEHOLDER"', deepValueJson);
-    await storage.write(NAMESPACE, KEY, stringToBytes(entryJson));
-    masterKey.fill(0);
+    // The same fault on the data channel: serializing the disclosure throws,
+    // and the command must name the real fault rather than reporting a fortress
+    // unlock failure. The `--json` success path serializes exactly once (the
+    // whole disclosure), so an unconditional throw here targets that one call.
+    // Driven through the injectable serializer, not a nesting depth, which is
+    // not a stable property across runtimes.
+    const serializeSeam = (): string | undefined => {
+      throw new RangeError("simulated: disclosure defeats serialization");
+    };
 
-    const { code, out, err } = await runCommand({ json: true, isTTY: false });
+    const { code, out, err } = await runCommand({
+      json: true,
+      isTTY: false,
+      serializeSeam,
+    });
     expect(code).toBe(1);
     expect(out).toBe("");
     expect(err).toContain("could not serialize the disclosure as JSON");
