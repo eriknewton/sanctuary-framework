@@ -10,6 +10,103 @@ Sanctuary is the substrate that makes operator sovereignty structurally real in 
 
 The framework is open source and free always. Commercial extensions (managed hosting for sovereignty-bound enterprises, premium support, compliance-pack-as-a-service, container-isolation for highest-assurance deployments) ship on top.
 
+### Inert catalog-v3 verification API
+
+The package exposes the Rung 2 S1 verification contracts through
+`@sanctuary-framework/mcp-server/intelligence` in both module systems:
+
+```js
+// ESM
+import {
+  COMPILED_CATALOG_KEY_POLICY_DIGEST,
+  verifyAndParseSignedCatalogJsonV3,
+  verifyAndParseSignedCatalogV3,
+} from "@sanctuary-framework/mcp-server/intelligence";
+```
+
+```js
+// CJS
+const {
+  verifyAndParseSignedCatalogIndexJsonV1,
+} = require("@sanctuary-framework/mcp-server/intelligence");
+```
+
+The package also exports exact subpaths for five companion schemas plus their
+digest manifest under `./intelligence/catalog-v3/schemas/` and the byte-pinned
+Sanctuary SPDX-profile ABNF under `./intelligence/catalog-v3/spdx/`. The exact
+manifest bytes are independently pinned by the exported
+`CATALOG_V3_ASSET_DIGEST_MANIFEST_SHA256` code constant; the manifest then
+roots both the raw bytes and JCS form of every schema plus the ABNF. Raw-byte
+schema pins make duplicate-key or alternate-wire tampering visible before
+JSON parsing. The SPDX 3.28 identifier table is reproducibly derived at
+build/test time from a deterministic, fact-only identifier/deprecated-status
+projection. The full upstream `license-list-data` summaries are not committed
+or published. Refresh explicitly consumes separately downloaded v3.28.0 source
+files whose raw and canonical JSON hashes are pinned; the recorded tag object
+and source commit are provenance attestations, while those content hashes are
+the integrity roots. There is no executable SPDX dependency. The JSON Schemas are structural prefilters,
+not admission decisions. The signed-envelope schemas reference their body
+schemas and therefore must be co-registered with those body schemas before
+compilation; they are not standalone schema documents. Schema success MUST be followed by the appropriate
+runtime `verifyAndParse*` function and, for overlays,
+`validateCatalogOverlayCombination`. Untrusted wire bytes MUST enter through
+the string-taking `verifyAndParseSigned*Json*` functions; the object-taking
+variants are only for objects already produced by an equally strict,
+duplicate-key-rejecting decoder. The combined validator accepts only the
+exact authenticated envelope or body objects returned by the signature
+verifiers; a merely parsed or structurally valid body is refused. Callers must supply the expected
+fortress-binding id, last accepted overlay-version floor, catalog-keyring
+digest, and operator signer-key id. This binds the private runtime brand to the
+trust roots the caller actually pinned. A catalog epoch key authenticates both
+catalog bodies and catalog-index segments, under distinct domain-separated
+preimages; overlays use the separately pinned fortress operator key. A brand is deliberately local to one
+loaded module instance: passing an ESM-verified object to a distinct CJS/root
+module instance refuses as unauthenticated. The combined
+validator treats the catalog and overlay as one independent, bounded union:
+new overlay models are allowed, but model-id, full-identity, and runtime-tag
+collisions are refused in either update order, rollback is refused, and the
+operator's self-asserted assurance label for every authorized surface must
+clear both its catalog-default and compiled assurance floor. This is a label
+check against the signed overlay's declared tier, not independent evidence
+that the tier is true. A retired catalog-key epoch remains valid only for its closed historical
+version range; it cannot sign later versions. A revoked epoch is a compromise
+response and intentionally makes even historical signatures unverifiable.
+Runtime validation also enforces exact compiled tier/default tables,
+strict ascending surface order, cross-field invariants, key policy, and
+signatures. License evidence URLs require canonical HTTPS URLs on lowercase
+ASCII DNS-shaped names; numeric, shorthand-numeric, punycode, malformed-label,
+and path-traversal spellings refuse identically in the TypeScript and
+independent Python implementations, per the shared parity corpus both sides
+run. Credential (userinfo), query-string, and fragment spellings are refused
+by both implementations too, but that refusal is exercised only by each
+language's own unit tests today, not by a shared corpus row, so it is not
+included in the cross-language parity claim above.
+
+Public unknown-input entry points first copy one bounded, accessor-free JSON
+snapshot. Getters, exotic prototypes, cycles, sparse/decorated arrays, and
+throwing proxy traps refuse without entering signature or policy logic.
+
+The expression parser implements the deliberately narrower Sanctuary SPDX
+expression profile v1 documented in `spdx-expression-3.0.1.abnf`; it is not a
+claim to accept every SPDX 3.0.1 expression. Active listed identifiers are
+matched case-insensitively and normalized to SPDX list spelling, deprecated
+identifiers refuse, and signed catalog input must already equal the normalized
+form. Build-source provenance and
+refresh instructions are recorded in `THIRD_PARTY_NOTICES.md`. These are pure,
+fail-closed parsing and signature-verification contracts. There is no signer
+in this module, only verifiers; the verification canonicalizer performs
+internal RFC 8785-compatible canonicalization for this integer-only profile
+so a verifier can recompute the exact bytes a signature was taken over, and
+that helper is intentionally not a public API.
+The independent Python parity verifier checks wire bytes, hashes, signatures,
+and closed-value semantics; it does not model the TypeScript module's private
+in-process verification brand and is not an overlay-admission implementation.
+They do not discover models, fetch a catalog, persist continuity, enforce
+anti-rollback state, activate a model, or ship a real signed production
+catalog/index checkpoint yet. The compiled index record is only an all-null
+genesis sentinel. Issued-at freshness/monotonicity and model-to-surface
+hardware compatibility are admission policy deferred to S2.
+
 ## The seven principles of sovereignty
 
 These are the principles every external communication, every spec, every roadmap commitment is measured against. They are evergreen. The implementations that satisfy them in 2026 will look quaint in 2031, and the principles will not have changed.

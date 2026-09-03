@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:sanctuary:schema:overlay-body:v1",
+  "title": "Sanctuary Overlay Body V1",
+  "$comment": "Structural prefilter only. Admission requires verifyAndParseSignedOverlayV1 followed by validateCatalogOverlayCombination; runtime validation additionally enforces uniqueness, ascending surface order, binding, rollback, and no escalation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "overlay_version", "overlay_binding_id", "issued_at", "entries"],
+  "properties": {
+    "schema": { "const": "sanctuary.model-overlay.v1" },
+    "overlay_version": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "overlay_binding_id": { "type": "string", "pattern": "^(?!0{32}$)[0-9a-f]{32}$" },
+    "issued_at": { "type": "string", "pattern": "^(?:(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8])))|(?:(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29))T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$" },
+    "entries": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/entry" } }
+  },
+  "$defs": {
+    "component": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$" },
+    "identity": {
+      "type": "object", "additionalProperties": false, "required": ["registry", "namespace", "model", "tag", "ollama_manifest_sha256"],
+      "properties": { "registry": { "const": "registry.ollama.ai" }, "namespace": { "$ref": "#/$defs/component" }, "model": { "$ref": "#/$defs/component" }, "tag": { "$ref": "#/$defs/component" }, "ollama_manifest_sha256": { "type": "string", "pattern": "^(?!0{64}$)[0-9a-f]{64}$" } }
+    },
+    "surface": { "enum": ["concierge", "direct-agent-gate-advisor", "sentinel-scoring", "gate-explanation", "privacy-filter-tier-2", "template-suggestion"] },
+    "entry": {
+      "type": "object", "additionalProperties": false, "required": ["model_id", "identity", "assurance", "surface_authorization"],
+      "properties": { "model_id": { "$ref": "#/$defs/component" }, "identity": { "$ref": "#/$defs/identity" }, "assurance": { "enum": ["light", "immune"] }, "surface_authorization": { "type": "array", "minItems": 1, "maxItems": 6, "uniqueItems": true, "items": { "$ref": "#/$defs/surface" } } }
+    }
+  }
+}
