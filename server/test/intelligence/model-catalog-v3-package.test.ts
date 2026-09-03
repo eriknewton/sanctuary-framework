@@ -711,7 +711,13 @@ describe("catalog-v3 built and packed consumers", () => {
       expect(source.startsWith("{")).toBe(true);
       // JSON.parse keeps the later original title, so JCS alone would miss
       // this duplicate-key raw wire mutation. The raw schema root must refuse.
-      writeFileSync(path, source.replace("{", '{"title":"shadowed duplicate",'));
+      // Anchored `^{`: inject exactly once, right after the root opening brace
+      // (asserted above to be char 0). Not sanitization; a single deliberate
+      // mutation, so a global replace would be wrong here.
+      writeFileSync(
+        path,
+        source.replace(/^\{/, '{"title":"shadowed duplicate",'),
+      );
     });
     expect(duplicateSchemaKeyFailure.status).not.toBe(0);
     expect(duplicateSchemaKeyFailure.stderr)
