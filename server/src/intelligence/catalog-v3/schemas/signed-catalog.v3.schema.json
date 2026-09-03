@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:sanctuary:schema:signed-catalog:v3",
+  "title": "Sanctuary Signed Catalog V3",
+  "$comment": "Structural prefilter only. Admission requires verifyAndParseSignedCatalogV3 with the compiled or explicitly reviewed catalog keyring.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["body", "signature", "signing_key_id"],
+  "properties": {
+    "body": { "$ref": "urn:sanctuary:schema:catalog-body:v3" },
+    "signature": { "type": "string", "pattern": "^(?!A{86}(?![\\s\\S]))[A-Za-z0-9_-]{85}[AQgw](?![\\s\\S])" },
+    "signing_key_id": { "type": "string", "pattern": "^cat-epoch-[1-9][0-9]{0,8}(?![\\s\\S])" }
+  }
+}

@@ -13,6 +13,7 @@ if (!/^[a-f0-9]{40}$/.test(sourceSha)) {
 export default defineConfig({
   entry: {
     index: "src/index.ts",
+    "intelligence/index": "src/intelligence/index.ts",
     cli: "src/cli.ts",
     "verify-transparency": "src/transparency/offline-cli.ts",
   },
