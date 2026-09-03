@@ -1966,9 +1966,44 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
 
 // ── Public entry points ─────────────────────────────────────────────
 
+/**
+ * Federation rotate-root mutual exclusion (Slice 3a). A federation
+ * signing-master rotation re-keys the `_federation/trust-root-v1` payload;
+ * running a custody rotation concurrently could re-encrypt a half-rotated
+ * payload, so custody rotation refuses while the federation rotate-root journal
+ * exists. The namespace/key are the literal mesh constants (core must not import
+ * mesh -- the wrong layering direction): FEDERATION_TRUST_ROOT_NAMESPACE +
+ * FEDERATION_ROTATE_ROOT_JOURNAL_KEY in mesh/federation-rotate-root.ts. This is
+ * the single source for the check and its message; both the early diagnostic in
+ * `rotateMaster` and the authoritative in-lock preflight call it, so the two
+ * can never drift.
+ */
+async function assertNoFederationRotateRootInProgress(
+  storage: StorageBackend,
+): Promise<void> {
+  if (await storage.read("_federation", "rotate-root-journal")) {
+    throw new RotationPreflightError(
+      "a federation rotate-root is in progress on this fortress; finish it " +
+        "(`sanctuary federation rotate-root --resume`) before rotating the custody master"
+    );
+  }
+}
+
 export async function rotateMaster(
   opts: RotateMasterOptions
 ): Promise<RotateMasterResult> {
+  // Ordering invariant: surface the federation rotate-root refusal BEFORE the
+  // exclusive master-rotation barrier drains. The barrier waits for live writer
+  // sessions to close and, under a lingering or slow-to-reap reader socket,
+  // times out with a GENERIC "master rotation waited Nms for active writer
+  // session(s) to close" error that masks the real cause. The specific reason a
+  // custody rotate must give the operator (a federation rotate-root is mid-flight)
+  // would otherwise be non-deterministic, decided by barrier-reader timing that
+  // differs between a fast dev host and a slower CI runner. This is a diagnostic
+  // fast-path only; the authoritative check in rotateMasterLocked still runs
+  // under the barrier + custody lock and closes the process-start race, so the
+  // mutual-exclusion guarantee does not depend on this early read.
+  await assertNoFederationRotateRootInProgress(opts.storage);
   return withExclusiveMasterRotationBarrier(
     opts.storage,
     CUSTODY_WRITE_LOCK_NAMESPACE,
@@ -2038,19 +2073,13 @@ async function rotateMasterLocked(
     );
   }
 
-  // Mutual exclusion with the federation rotate-root journal (Slice 3a). A
-  // federation signing-master rotation re-keys the _federation/trust-root-v1
-  // payload; running a custody rotation concurrently could re-encrypt a
-  // half-rotated payload. Refuse until the federation rotation is resumed. The
-  // namespace/key are the literal mesh constants (core must not import mesh, the
-  // wrong layering direction): FEDERATION_TRUST_ROOT_NAMESPACE +
-  // FEDERATION_ROTATE_ROOT_JOURNAL_KEY in mesh/federation-rotate-root.ts.
-  if (await storage.read("_federation", "rotate-root-journal")) {
-    throw new RotationPreflightError(
-      "a federation rotate-root is in progress on this fortress; finish it " +
-        "(`sanctuary federation rotate-root --resume`) before rotating the custody master"
-    );
-  }
+  // Mutual exclusion with the federation rotate-root journal (Slice 3a). This
+  // is the AUTHORITATIVE check: it runs under the exclusive master-rotation
+  // barrier + custody mutation lock, so it closes the process-start race that
+  // the early diagnostic in `rotateMaster` cannot. Shares the one source
+  // (`assertNoFederationRotateRootInProgress`) with that diagnostic so the
+  // refusal message cannot drift between the two sites.
+  await assertNoFederationRotateRootInProgress(storage);
 
   // Unlock the OLD master. Envelope-format custody is required: rotation of
   // a pure-legacy fortress goes through `sanctuary wrap` migration first.

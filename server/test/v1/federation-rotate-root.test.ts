@@ -726,14 +726,15 @@ describe("rotate-root: mutual exclusion with custody rotation", () => {
     ).rejects.toThrow();
     expect(await federationRotateRootInProgress(storage)).toBe(true);
 
-    // Model rotateMaster as a SEPARATE invocation: release the shared
-    // master-rotation reader the seed's custody establishment holds in THIS
-    // process. A real crashed rotate-root process reaps its own socket, so a
-    // fresh rotate-master finds no live reader and reaches the federation
-    // preflight; without this release the same-process reader stays live and
-    // rotateMaster's exclusive drain times out on it instead of refusing on the
-    // journal. (Same pattern as master-rotation-barrier.test.ts / custody-fixture.)
-    await issuer.masterWriteBarrier?.release();
+    // Deliberately leave the seed's master-rotation reader LIVE (no
+    // `issuer.masterWriteBarrier?.release()`): this reproduces the condition
+    // that broke this test on Linux CI, where a lingering/slow-to-reap reader
+    // socket made rotateMaster's exclusive-barrier drain time out with the
+    // GENERIC "master rotation waited Nms for active writer session(s) to close"
+    // message and mask the real cause. The specific federation refusal must win
+    // regardless of barrier-reader timing, so rotateMaster now checks the
+    // federation rotate-root journal BEFORE the drain; this asserts that
+    // ordering. See src/core/master-rotation.ts `rotateMaster`.
 
     const { rotateMaster } = await import("../../src/core/master-rotation.js");
     await expect(
@@ -745,6 +746,7 @@ describe("rotate-root: mutual exclusion with custody rotation", () => {
         captureRecoveryKey: async () => true,
       }),
     ).rejects.toThrow(/federation rotate-root is in progress/i);
+    await issuer.masterWriteBarrier?.release();
     masterKey.fill(0);
   });
 });

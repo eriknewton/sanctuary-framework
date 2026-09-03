@@ -74,6 +74,17 @@ export const CROSS_PROCESS_LOCK_RETRY_MS = 100;
 /** Maximum wait for the process-owned Unix-domain listener to close. */
 export const KERNEL_LOCK_RELEASE_TIMEOUT_MS = 2_000;
 const KERNEL_SOCKET_PATH_MAX_BYTES = 100;
+// Descriptive leaf for the per-uid custody lock ROOT directory. Cross-file
+// contract: must match the leaf the resolver composes in
+// {@link resolveCustodyLockRoot} and the test corpus in
+// test/storage/custody-lock-root-resolver.test.ts.
+const CUSTODY_LOCK_ROOT_LEAF = "sanctuary-custody-locks";
+// Longest entry composed under the lock root is a reaper scaffold:
+// `${digest.slice(0, 40)}.reaper`. The socket entry (`.sock`) is 2 bytes
+// shorter, so bounding the reaper bounds every entry. 47 = 40-hex digest slice
+// + ".reaper".length (7). Used only to reject a root whose composed entry paths
+// would overflow KERNEL_SOCKET_PATH_MAX_BYTES; it is not a wire/at-rest value.
+const CUSTODY_LOCK_MAX_ENTRY_BYTES = 40 + ".reaper".length;
 const KERNEL_SOCKET_PROBE_TIMEOUT_MS = 500;
 const STALE_REAPER_TIMEOUT_MS = 2_000;
 // Round-2 (unbounded lock-dir growth): the shared runtime dir accumulates one
@@ -1826,12 +1837,148 @@ probe();`;
   });
 }
 
-async function ensureKernelSocketRuntimeDirectory(): Promise<string> {
+/** Injected inputs for {@link resolveCustodyLockRoot}; production passes the real environment. */
+export interface CustodyLockRootContext {
+  env: NodeJS.ProcessEnv;
+  platform: NodeJS.Platform;
+}
+
+/**
+ * Mirror of `node:os` `tmpdir()`'s POSIX branch (`TMPDIR||TMP||TEMP||'/tmp'`,
+ * one trailing separator stripped unless it is the filesystem root), computed
+ * from the INJECTED environment so the resolver stays pure and unit-testable.
+ * On macOS `$TMPDIR` is `DARWIN_USER_TEMP_DIR` (`/var/folders/.../T`), a
+ * per-user mode-0700 directory that is NOT world-writable.
+ */
+function darwinUserTempDir(env: NodeJS.ProcessEnv): string {
+  const raw = env.TMPDIR || env.TMP || env.TEMP || "/tmp";
+  if (raw.length > 1 && raw.endsWith("/")) return raw.slice(0, -1);
+  return raw;
+}
+
+/**
+ * A root is usable only if every entry we compose beneath it
+ * (`${root}/${40-hex}${suffix}`, longest suffix `.reaper`) stays within the
+ * kernel `sun_path` budget. This is a PURE length computation: `/run/user/<uid>`
+ * and `DARWIN_USER_TEMP_DIR` are longer than `/tmp`, so a runtime-dir root can
+ * overflow where `/tmp` would not. Must match the socket-path cap enforced at
+ * bind time (search KERNEL_SOCKET_PATH_MAX_BYTES).
+ */
+function custodyLockRootFits(root: string): boolean {
+  return (
+    Buffer.byteLength(root) + 1 + CUSTODY_LOCK_MAX_ENTRY_BYTES <=
+    KERNEL_SOCKET_PATH_MAX_BYTES
+  );
+}
+
+/**
+ * Resolve the custody kernel-lock ROOT directory deterministically from
+ * `(uid, env, platform)`.
+ *
+ * INVARIANT (load-bearing rendezvous): the kernel lock is a cross-process
+ * rendezvous keyed on uid; every cooperating same-uid process MUST resolve the
+ * SAME root, or two processes hold "exclusive" locks in different directories
+ * (a silent custody-safety break). This function therefore reads ONLY `env` and
+ * `platform` — never time, randomness, or any filesystem probe (existence,
+ * writability, ownership), any of which could differ between two same-uid
+ * processes. Selection is by presence + platform + a pure length computation.
+ * A non-override candidate that would overflow the socket-path cap falls through
+ * to the hardened fallback by that pure length rule (NOT by probing); an
+ * explicit operator override that overflows is a HARD ERROR (fail closed),
+ * never silently downgraded to a different root — downgrading it would break
+ * rendezvous with any peer that honored the override. A chosen root is never
+ * silently swapped for another once selected.
+ *
+ * Precedence (first usable wins):
+ *  1. `SANCTUARY_CUSTODY_LOCK_ROOT` override — the installer/systemd unit points
+ *     the root daemon at its own runtime path (e.g. `/run/sanctuary/locks`).
+ *  2. Linux `$XDG_RUNTIME_DIR` (`/run/user/<uid>`, per-user 0700 tmpfs).
+ *  3. macOS `os.tmpdir()` = `DARWIN_USER_TEMP_DIR` (per-user 0700) when it fits;
+ *     the `/var/folders/.../T` base is ~48 bytes, so the descriptive leaf can
+ *     overflow the cap, and then step 4 is used (a pure, per-uid-identical
+ *     length decision, never a probe).
+ *  4. Hardened `/tmp/sanctuary-custody-locks-<uid>` fallback (universal), which
+ *     keeps every existing hardening applied by the ensure path below.
+ *
+ * Hardening (mkdir 0700, owner/mode verification, local-filesystem assertion,
+ * O_NOFOLLOW, device/inode identity) is applied by callers to WHATEVER root this
+ * returns; this function only selects the path.
+ */
+export function resolveCustodyLockRoot(
+  uid: number,
+  context: CustodyLockRootContext,
+): string {
+  const { env, platform: host } = context;
+  const fallback = join("/tmp", `${CUSTODY_LOCK_ROOT_LEAF}-${uid}`);
+
+  // 1. Explicit override. Length is fixed by operator/installer intent, so an
+  //    overflow is a configuration error we refuse loudly rather than silently
+  //    swapping in a different root (which would break rendezvous with peers).
+  const override = env.SANCTUARY_CUSTODY_LOCK_ROOT?.trim();
+  if (override !== undefined && override.length > 0) {
+    if (!custodyLockRootFits(override)) {
+      throw new CrossProcessLockError(
+        `SANCTUARY_CUSTODY_LOCK_ROOT '${override}' composes a custody lock socket path ` +
+          `over the ${KERNEL_SOCKET_PATH_MAX_BYTES}-byte limit`,
+        "capability",
+      );
+    }
+    return override;
+  }
+
+  // 2. Linux user-session runtime dir. "Usable" is a PURE predicate (set,
+  //    non-empty, absolute) — never a stat, so two same-session processes agree.
+  if (host === "linux") {
+    const xdg = env.XDG_RUNTIME_DIR?.trim();
+    if (xdg !== undefined && xdg.length > 0 && xdg.startsWith("/")) {
+      const candidate = join(xdg, CUSTODY_LOCK_ROOT_LEAF);
+      if (custodyLockRootFits(candidate)) return candidate;
+      // Deterministic (length-only) fall-through to the hardened fallback.
+    }
+  }
+
+  // 3. macOS per-user temp dir. Deterministic length decision only; see note above.
+  if (host === "darwin") {
+    const candidate = join(
+      darwinUserTempDir(env),
+      `${CUSTODY_LOCK_ROOT_LEAF}-${uid}`,
+    );
+    if (custodyLockRootFits(candidate)) return candidate;
+  }
+
+  // 4. Hardened universal fallback. Fail closed if even this overflows.
+  if (!custodyLockRootFits(fallback)) {
+    throw new CrossProcessLockError(
+      `custody lock fallback path '${fallback}' exceeds the ` +
+        `${KERNEL_SOCKET_PATH_MAX_BYTES}-byte socket-path limit`,
+      "capability",
+    );
+  }
+  return fallback;
+}
+
+// Exported as a test seam: an injected `context` lets a unit test drive the
+// owner/mode hardening below onto a controllable (non-/tmp) branch and prove it
+// is carried regardless of which precedence branch selected the root. Production
+// callers pass no argument and use the real environment.
+export async function ensureKernelSocketRuntimeDirectory(
+  context?: CustodyLockRootContext,
+): Promise<string> {
   if (typeof process.getuid !== "function") {
     throw new Error("Unix process owner identity is unavailable");
   }
   const uid = process.getuid();
-  const path = join("/tmp", `sanctuary-custody-locks-${uid}`);
+  // Deterministic root selection (env + platform only). Production reads the
+  // real environment; tests inject a context to exercise the precedence table.
+  const path = resolveCustodyLockRoot(
+    uid,
+    context ?? { env: process.env, platform: platform() },
+  );
+  // Hardening carried onto WHATEVER root the resolver chose (not only /tmp):
+  // create it 0700, then refuse a pre-existing dir that is a symlink, a
+  // non-directory, foreign-owned, or group/other-accessible. An attacker who
+  // pre-creates the resolved root with the wrong owner or mode must be detected
+  // and refused here, on every precedence branch.
   await mkdir(path, { recursive: true, mode: 0o700 });
   const stats = await lstat(path);
   if (stats.isSymbolicLink() || !stats.isDirectory()) {
