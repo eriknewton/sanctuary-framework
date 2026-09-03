@@ -67,6 +67,9 @@ function observed(overrides: Partial<InstallProbeResult> = {}): InstallProbeResu
     persistentCliVersion: packageJson.version,
     packageManagerPath: "/opt/homebrew/bin/npm",
     existingCustody: "present",
+    custodyAccess: "usable",
+    custodyMutation: "available",
+    recoveryFactor: "present",
     nodePath: "/opt/homebrew/bin/node",
     castleWallApp: "not-applicable",
     castleWallBuildSha: "a61a7322ca80",
@@ -753,9 +756,17 @@ describe("sanctuary install agent contract", () => {
 
     expect(plan.status).toBe("complete");
     expect(plan.next_action).toBeNull();
-    expect(plan.operator_actions).toHaveLength(1);
+    // Recovery custody stays human-only (index 0); the Rung 1 restart-persistence
+    // acceptance is appended as a second human action.
+    expect(plan.operator_actions).toHaveLength(2);
     expect(plan.operator_actions[0]?.actor).toBe("human");
     expect(plan.operator_actions[0]?.secret_boundary).toContain("must not run");
+    expect(plan.operator_actions[1]?.id).toBe("restart_and_verify_rung1");
+    expect(plan.operator_actions[1]?.actor).toBe("human");
+    expect(plan.operator_actions[1]?.description).toContain("sdw_memory_provenance");
+    expect(plan.operator_actions[1]?.description).toContain(
+      "memory_get itself does not carry signer data",
+    );
   });
 
   it("refuses to guess or download a full-profile enforcement artifact", () => {

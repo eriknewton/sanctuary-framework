@@ -27,12 +27,21 @@
  *    migration leaves a pure-legacy fortress (no un-unlockable window).
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { hkdf } from "@noble/hashes/hkdf";
 import { sha256 } from "@noble/hashes/sha256";
 
 import type { StorageBackend } from "../storage/interface.js";
+import {
+  acquireMasterWriteBarrier,
+  CrossProcessLockError,
+  withRequiredCrossProcessLock,
+  type CrossProcessLockLease,
+  type MasterWriteBarrierLease,
+  type MasterWriteBarrierOptions,
+} from "../storage/cross-process-lock.js";
 import { encrypt, decrypt, type EncryptedPayload } from "./encryption.js";
 import {
   deriveMasterKey,
@@ -160,6 +169,90 @@ export const ROTATION_JOURNAL_KEY = "rotation-journal";
 export const STAGED_CUSTODY_ENVELOPE_KEY = "custody-envelope-next";
 export const STAGED_CUSTODY_SENTINEL_KEY = "custody-sentinel-next";
 
+/** One kernel-backed lock domain for every custody/master mutation. */
+export const CUSTODY_WRITE_LOCK_NAMESPACE = "_meta";
+export const CUSTODY_WRITE_LOCK_FILE = "custody-master.lock";
+/** Runtime-only shared/exclusive gate between unlocked writers and rotation. */
+export const MASTER_ROTATION_BARRIER_NAME = "custody-master-rotation";
+
+interface CustodyLockScope {
+  identity: string | StorageBackend;
+  storage: StorageBackend;
+  lease: CrossProcessLockLease;
+}
+
+const custodyLockScope = new AsyncLocalStorage<CustodyLockScope>();
+
+function custodyLockIdentity(storage: StorageBackend): string | StorageBackend {
+  const filesystem = storage as Partial<{ namespacePath(namespace: string): string }>;
+  return typeof filesystem.namespacePath === "function"
+    ? filesystem.namespacePath(CUSTODY_WRITE_LOCK_NAMESPACE)
+    : storage;
+}
+
+/**
+ * Serialize a complete custody read/modify/write ceremony. Re-entry for the
+ * same fortress is explicit and lease-checked; acquiring a second fortress
+ * while one custody lock is held is refused, which gives callers a single
+ * lock order and eliminates AB/BA deadlocks.
+ */
+export async function withCustodyWriteLock<T>(
+  storage: StorageBackend,
+  operation: (lease: CrossProcessLockLease) => Promise<T>,
+  options: {
+    metadata?: Record<string, unknown>;
+    timeoutMs?: number;
+    /** Test only: observe a deliberately non-owning helper process. */
+    __testAfterKernelHolderAcquired?: (pid: number) => void;
+    /** Test only: observe the process-owned lock socket for loss fencing. */
+    __testAfterKernelSocketAcquired?: (path: string) => void;
+  } = {},
+): Promise<T> {
+  const identity = custodyLockIdentity(storage);
+  const current = custodyLockScope.getStore();
+  if (current !== undefined) {
+    if (current.storage !== storage) {
+      throw new CrossProcessLockError(
+        current.identity === identity
+          ? "custody lock re-entry through a different storage instance is refused; " +
+              "the existing inode-bound capability belongs to the original instance"
+          : "custody lock-order violation: refusing to acquire a second fortress " +
+              "while another custody/master lock is held",
+      );
+    }
+    current.lease.assertHeld();
+    return operation(current.lease);
+  }
+  return withRequiredCrossProcessLock(
+    storage,
+    CUSTODY_WRITE_LOCK_NAMESPACE,
+    CUSTODY_WRITE_LOCK_FILE,
+    async (lease) => custodyLockScope.run(
+      { identity, storage, lease },
+      async () => {
+        lease.assertHeld();
+        return operation(lease);
+      },
+    ),
+    {
+      // The mutating process itself owns the kernel socket for the complete
+      // bounded callback. Every durable mutation crosses the live inode fence.
+      kernelBacked: true,
+      ...(options.metadata !== undefined ? { metadata: options.metadata } : {}),
+      ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      ...(options.__testAfterKernelHolderAcquired !== undefined
+        ? {
+            __testAfterKernelHolderAcquired:
+              options.__testAfterKernelHolderAcquired,
+          }
+        : {}),
+      ...(options.__testAfterKernelSocketAcquired !== undefined
+        ? { __testAfterKernelSocketAcquired: options.__testAfterKernelSocketAcquired }
+        : {}),
+    },
+  );
+}
+
 /** Verified-wrap count required before trust-bearing state may persist. */
 export const CUSTODY_FLOOR_WRAPS = 2;
 
@@ -182,6 +275,30 @@ export class CustodyUnlockError extends Error {
           "credential that does not verify."
     );
     this.name = "CustodyUnlockError";
+  }
+}
+
+/**
+ * Creating or migrating a filesystem fortress needs the crash-recoverable
+ * cross-process custody lock, which is only implemented on macOS and Linux.
+ * On other platforms (notably Windows) the low-level lock throws an opaque
+ * "unsupported host platform" capability error; this class replaces it at the
+ * custody boundary with a remediation the operator can act on (S6a / H2). It is
+ * deliberately NOT a CustodyUnlockError so callers never misreport it as a wrong
+ * credential.
+ */
+export class CustodyPlatformUnsupportedError extends Error {
+  constructor(storagePathHint?: string) {
+    super(
+      `Sanctuary cannot create or migrate a filesystem fortress${storagePathHint ? ` at ${storagePathHint}` : ""} ` +
+        "on this platform: custody creation and migration require a crash-recoverable " +
+        "cross-process lock that is implemented only on macOS and Linux.\n" +
+        "  - To open an EXISTING enveloped fortress for read/export here, supply its " +
+        "credential (SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY); reads do not need the lock.\n" +
+        "  - To create or migrate this fortress, run once on macOS or Linux, then copy it here.\n" +
+        "  - An embedding may inject its own in-memory storage backend, which does not use this lock.",
+    );
+    this.name = "CustodyPlatformUnsupportedError";
   }
 }
 
@@ -461,6 +578,16 @@ export class CustodyRotationInProgressError extends Error {
         "staging phase). Both require the fortress passphrase."
     );
     this.name = "CustodyRotationInProgressError";
+  }
+}
+
+/** The envelope changed or vanished during an optimistic read-only unlock. */
+export class CustodySnapshotChangedError extends Error {
+  constructor() {
+    super(
+      "Sanctuary: custody state changed while it was being unlocked. Retry after the concurrent custody operation completes."
+    );
+    this.name = "CustodySnapshotChangedError";
   }
 }
 
@@ -845,6 +972,21 @@ export async function writeCustodyEnvelope(
     sentinelKey?: string;
   }
 ): Promise<CustodyEnvelope> {
+  return withCustodyWriteLock(
+    storage,
+    (lease) => writeCustodyEnvelopeLocked(storage, envelope, master, opts, lease),
+    { metadata: { owner: "write-custody-envelope" } },
+  );
+}
+
+async function writeCustodyEnvelopeLocked(
+  storage: StorageBackend,
+  envelope: Omit<CustodyEnvelope, "mac"> | CustodyEnvelope,
+  master: Uint8Array,
+  opts: { envelopeKey?: string; sentinelKey?: string } | undefined,
+  lease: CrossProcessLockLease,
+): Promise<CustodyEnvelope> {
+  lease.assertHeld();
   assertMaster(master);
   const stamped: CustodyEnvelope = {
     v: envelope.v,
@@ -862,6 +1004,7 @@ export async function writeCustodyEnvelope(
     opts?.envelopeKey ?? CUSTODY_ENVELOPE_KEY,
     stringToBytes(JSON.stringify(stamped))
   );
+  lease.assertHeld();
   const sentinelKey = derivePurposeKey(master, "custody-sentinel");
   const sentinel = encrypt(
     stringToBytes(CUSTODY_SENTINEL_PLAINTEXT),
@@ -874,6 +1017,7 @@ export async function writeCustodyEnvelope(
     opts?.sentinelKey ?? CUSTODY_SENTINEL_KEY,
     stringToBytes(JSON.stringify(sentinel))
   );
+  lease.assertHeld();
   return stamped;
 }
 
@@ -1114,6 +1258,43 @@ export interface EstablishMasterOptions {
   };
   /** Storage-path hint for error messages only (never used for crypto). */
   storagePathHint?: string;
+  /**
+   * How to behave when the master-rotation barrier cannot be acquired for an
+   * ENVIRONMENTAL capability reason (non-owner invoking uid — a root daemon or
+   * `sudo` verb on an operator fortress; a non-local/unsupported filesystem;
+   * looser-than-0700 `state/_meta` perms). See
+   * `MasterWriteBarrierOptions.degradeOnEnvironmentalLoss`.
+   *   - undefined / "fail-closed" (default): throw. Direct callers that must
+   *     have a real write barrier keep the strict behavior.
+   *   - "read-only": open for reads; the first master-derived write fails
+   *     closed with the cause's remediation. Used by `resolveCliMasterKey` and
+   *     MCP boot so an existing fortress on a network/FUSE/exFAT volume, under
+   *     `sudo`, or with looser perms still opens instead of bricking (S5).
+   *   - "inert": pre-barrier behavior (reads AND writes proceed unbarriered).
+   *     ONLY for the launchd Castle Wall root daemon boot, whose reboot-survival
+   *     (N=5) is already proven and must not regress (S5b).
+   */
+  barrierDegradeMode?: "fail-closed" | "read-only" | "inert";
+  /**
+   * A shared master-rotation barrier the CALLER already holds. When present,
+   * establishMaster does NOT acquire its own barrier and does NOT release this
+   * one (the caller owns its lifetime); it only asserts the session is held on
+   * both sides of the authenticated snapshot. This is how a caller that must
+   * hold the barrier across a LONGER custody ceremony (wrap custody
+   * establishment) keeps the barrier -> custody-lock order and never lets
+   * establishMaster take a SECOND barrier under an already-held custody lock —
+   * the acquire that would deadlock a concurrent rotate-master (S2). Mutually
+   * exclusive in effect with `barrierDegradeMode` (a held barrier is not
+   * re-acquired, so there is nothing to degrade).
+   */
+  heldBarrier?: MasterWriteBarrierLease;
+  /** Test only: observe owned decoded/unwrapped buffers for zeroization tests. */
+  __testObserveSecretBuffer?: (
+    label: "master" | "recovery-key",
+    buffer: Uint8Array,
+  ) => void;
+  /** TEST ONLY: observe/control the process-owned shared rotation barrier. */
+  __testMasterWriteBarrierOptions?: MasterWriteBarrierOptions;
 }
 
 export interface EstablishMasterResult {
@@ -1136,6 +1317,12 @@ export interface EstablishMasterResult {
   keyProtection: "passphrase" | "recovery-key";
   /** Present only when a fresh recovery key was minted on this call. */
   mintedRecoveryKey?: string;
+  /**
+   * Filesystem callers retain this until their final master-derived write.
+   * It is non-enumerable at runtime so existing result serialization remains
+   * stable. Process death releases the underlying kernel socket automatically.
+   */
+  masterWriteBarrier?: MasterWriteBarrierLease;
 }
 
 function decodeRecoveryKey(recoveryKey: string): Uint8Array {
@@ -1152,6 +1339,7 @@ function decodeRecoveryKey(recoveryKey: string): Uint8Array {
   // above, and on the legacy virgin-init path it IS the master key, so this
   // width must satisfy `assertMaster` too.
   if (bytes.length !== 32) {
+    bytes.fill(0);
     throw new CustodyUnlockError(
       "Sanctuary: SANCTUARY_RECOVERY_KEY has incorrect length. " +
         "Use the exact recovery key captured at creation."
@@ -1170,6 +1358,129 @@ function decodeRecoveryKey(recoveryKey: string): Uint8Array {
 export async function establishMaster(
   opts: EstablishMasterOptions
 ): Promise<EstablishMasterResult> {
+  // A caller that already holds the shared barrier (wrap custody establishment)
+  // passes it in so establishMaster does NOT take a SECOND barrier under an
+  // already-held custody lock — the acquire that deadlocks a concurrent
+  // rotate-master (S2). We then neither own nor release it.
+  const ownBarrier = opts.heldBarrier === undefined;
+  // The degrade mode is a property of the barrier acquisition; a test override
+  // of the raw barrier options takes precedence so barrier-internals tests keep
+  // driving the seams directly.
+  const degradeMode =
+    opts.barrierDegradeMode !== undefined && opts.barrierDegradeMode !== "fail-closed"
+      ? opts.barrierDegradeMode
+      : undefined;
+  const barrier = opts.heldBarrier ?? (await acquireMasterWriteBarrier(
+    opts.storage,
+    CUSTODY_WRITE_LOCK_NAMESPACE,
+    MASTER_ROTATION_BARRIER_NAME,
+    {
+      ...(degradeMode !== undefined
+        ? { degradeOnEnvironmentalLoss: degradeMode }
+        : {}),
+      ...opts.__testMasterWriteBarrierOptions,
+    },
+  ));
+  try {
+    barrier.assertSessionHeld();
+    const result = await establishMasterUnderBarrier(opts);
+    barrier.assertSessionHeld();
+    if (ownBarrier) {
+      Object.defineProperty(result, "masterWriteBarrier", {
+        value: barrier,
+        enumerable: false,
+        configurable: false,
+        writable: false,
+      });
+    }
+    return result;
+  } catch (error) {
+    if (!ownBarrier) throw error; // caller owns the barrier's lifetime
+    try {
+      await barrier.release();
+    } catch (releaseError) {
+      throw new AggregateError(
+        [error, releaseError],
+        "master establishment failed and its shared rotation barrier did not release cleanly",
+        { cause: releaseError },
+      );
+    }
+    throw error;
+  }
+}
+
+async function establishMasterUnderBarrier(
+  opts: EstablishMasterOptions
+): Promise<EstablishMasterResult> {
+  // Existing-envelope unlock is a pure read, but the filesystem path already
+  // holds its long-lived SHARED rotation barrier. Check the journal on both
+  // sides of the authenticated snapshot as defense in depth. A rotator cannot
+  // acquire its EXCLUSIVE barrier until this returned session is released.
+  if (await opts.storage.read("_meta", ROTATION_JOURNAL_KEY)) {
+    throw new CustodyRotationInProgressError();
+  }
+  const existingEnvelope = await readCustodyEnvelope(opts.storage);
+  if (existingEnvelope) {
+    const unlocked = await unlockEnvelopeReadOnly(existingEnvelope, opts);
+    let transferred = false;
+    try {
+      opts.__testObserveSecretBuffer?.("master", unlocked.masterKey);
+      const envelopeAfterUnlock = await readCustodyEnvelope(opts.storage);
+      if (await opts.storage.read("_meta", ROTATION_JOURNAL_KEY)) {
+        throw new CustodyRotationInProgressError();
+      }
+      if (!sameCustodyEnvelopeSnapshot(existingEnvelope, envelopeAfterUnlock)) {
+        throw new CustodySnapshotChangedError();
+      }
+      transferred = true;
+      return {
+        masterKey: unlocked.masterKey,
+        envelope: existingEnvelope,
+        origin: "envelope",
+        keyProtection: unlocked.keyProtection,
+      };
+    } finally {
+      if (!transferred) unlocked.masterKey.fill(0);
+    }
+  }
+  // The no-envelope path is a custody MUTATION (first run or legacy migration),
+  // so it takes the kernel-backed custody write lock. On a platform without that
+  // lock (Windows) the lock throws an opaque "unsupported host platform"; S6a/H2
+  // replace it with an actionable remediation. Reads never reach here (existing
+  // envelope returned above), so a Windows read/export is unaffected.
+  try {
+    return await withCustodyWriteLock(
+      opts.storage,
+      () => establishMasterLocked(opts),
+      { metadata: { owner: "establish-master" } },
+    );
+  } catch (error) {
+    throw remediateUnsupportedFilesystemCustodyMutation(error, opts.storagePathHint);
+  }
+}
+
+/**
+ * Translate the low-level "unsupported host platform" custody-lock capability
+ * error into a {@link CustodyPlatformUnsupportedError} carrying a remediation.
+ * Any other error passes through unchanged.
+ */
+function remediateUnsupportedFilesystemCustodyMutation(
+  error: unknown,
+  storagePathHint?: string,
+): unknown {
+  if (
+    error instanceof CrossProcessLockError &&
+    error.kind === "capability" &&
+    error.message.includes("unsupported host platform")
+  ) {
+    return new CustodyPlatformUnsupportedError(storagePathHint);
+  }
+  return error;
+}
+
+async function establishMasterLocked(
+  opts: EstablishMasterOptions,
+): Promise<EstablishMasterResult> {
   const { storage } = opts;
   const now = new Date().toISOString();
 
@@ -1184,28 +1495,38 @@ export async function establishMaster(
 
   const envelope = await readCustodyEnvelope(storage);
   if (envelope) {
-    let masterKey: Uint8Array;
+    let masterKey: Uint8Array | undefined;
+    let recoveryKeyBytes: Uint8Array | undefined;
     let keyProtection: "passphrase" | "recovery-key";
-    if (opts.passphrase !== undefined) {
-      masterKey = await unwrapMaster(envelope, { passphrase: opts.passphrase });
-      keyProtection = "passphrase";
-    } else if (opts.recoveryKey !== undefined) {
-      masterKey = await unwrapMaster(envelope, {
-        recoveryKey: decodeRecoveryKey(opts.recoveryKey),
-      });
-      keyProtection = "recovery-key";
-    } else if (opts.keychainKey !== undefined) {
-      masterKey = await unwrapMaster(envelope, {
-        keychainKey: opts.keychainKey,
-      });
-      keyProtection = "passphrase";
-    } else {
-      throw new CustodyCredentialMissingError(opts.storagePathHint);
+    try {
+      if (opts.passphrase !== undefined) {
+        masterKey = await unwrapMaster(envelope, { passphrase: opts.passphrase });
+        keyProtection = "passphrase";
+      } else if (opts.recoveryKey !== undefined) {
+        recoveryKeyBytes = decodeRecoveryKey(opts.recoveryKey);
+        opts.__testObserveSecretBuffer?.("recovery-key", recoveryKeyBytes);
+        masterKey = await unwrapMaster(envelope, { recoveryKey: recoveryKeyBytes });
+        keyProtection = "recovery-key";
+      } else if (opts.keychainKey !== undefined) {
+        masterKey = await unwrapMaster(envelope, {
+          keychainKey: opts.keychainKey,
+        });
+        keyProtection = "passphrase";
+      } else {
+        throw new CustodyCredentialMissingError(opts.storagePathHint);
+      }
+      opts.__testObserveSecretBuffer?.("master", masterKey);
+      verifyEnvelopeMac(envelope, masterKey);
+      return { masterKey, envelope, origin: "envelope", keyProtection };
+    } catch (error) {
+      // unwrapMaster returns an owned live master before the independent MAC
+      // verification. A forged header/wrap list must not leave those bytes
+      // reachable on the rejected path.
+      masterKey?.fill(0);
+      throw error;
+    } finally {
+      recoveryKeyBytes?.fill(0);
     }
-    // Authenticate the envelope's policy metadata under the unwrapped
-    // master before anyone trusts install_mode / verified flags (H2).
-    verifyEnvelopeMac(envelope, masterKey);
-    return { masterKey, envelope, origin: "envelope", keyProtection };
   }
 
   // No envelope. If the custody sentinel exists, an envelope existed before
@@ -1226,102 +1547,131 @@ export async function establishMaster(
       bytesToString(legacyParamsRaw)
     ) as KeyDerivationParams;
     const { key: masterKey } = await deriveMasterKey(opts.passphrase, params);
+    let transferred = false;
+    try {
+      opts.__testObserveSecretBuffer?.("master", masterKey);
+      // Never lock in a wrong credential: verify against existing ciphertext.
+      const evidence = await checkMasterEvidence(storage, masterKey);
+      if (evidence === "contradicted") {
+        throw new CustodyMigrationRefusedError();
+      }
+      if (
+        evidence === "no-evidence" &&
+        (await fortressHasDataBeyondMarkers(storage))
+      ) {
+        // Data exists that the probe could not verify the master against
+        // (H3). Do NOT capture this master into an envelope — proceed
+        // legacy-style; migration retries once verifiable evidence exists.
+        transferred = true;
+        return {
+          masterKey,
+          envelope: null,
+          origin: "legacy-deferred",
+          keyProtection: "passphrase",
+        };
+      }
 
-    // Never lock in a wrong credential: verify against existing ciphertext.
-    const evidence = await checkMasterEvidence(storage, masterKey);
-    if (evidence === "contradicted") {
-      masterKey.fill(0);
-      throw new CustodyMigrationRefusedError();
-    }
-    if (
-      evidence === "no-evidence" &&
-      (await fortressHasDataBeyondMarkers(storage))
-    ) {
-      // Data exists that the probe could not verify the master against
-      // (H3). Do NOT capture this master into an envelope — proceed
-      // legacy-style; migration retries once verifiable evidence exists.
+      const wrap = await wrapMasterWithPassphrase(masterKey, opts.passphrase, {
+        verified: true,
+      });
+      // Invariant: this legacy→envelope migration WRITE is serialized by the
+      // shared master-rotation barrier that `establishMaster` acquired (this
+      // file, `acquireMasterWriteBarrier(..., MASTER_ROTATION_BARRIER_NAME)`)
+      // and holds unbroken through here — `establishMasterLocked` runs inside
+      // that same held session. `rotateMaster` takes the EXCLUSIVE side of that
+      // barrier and drains every shared reader before it re-encrypts, so a
+      // concurrent rotate cannot interleave with this read-verb migration; on an
+      // environmental barrier degrade the write instead fails closed at the
+      // storage write-barrier hook (AGENTS rule 12 / MUST-NEVER 5).
+      const migrated = await writeCustodyEnvelope(
+        storage,
+        {
+          v: 1,
+          install_mode: "legacy-migrated",
+          wraps: [wrap],
+          created_at: now,
+        },
+        masterKey
+      );
+      transferred = true;
       return {
         masterKey,
-        envelope: null,
-        origin: "legacy-deferred",
+        envelope: migrated,
+        origin: "migrated-passphrase",
         keyProtection: "passphrase",
       };
+    } finally {
+      if (!transferred) masterKey.fill(0);
     }
-
-    const wrap = await wrapMasterWithPassphrase(masterKey, opts.passphrase, {
-      verified: true,
-    });
-    const migrated = await writeCustodyEnvelope(
-      storage,
-      {
-        v: 1,
-        install_mode: "legacy-migrated",
-        wraps: [wrap],
-        created_at: now,
-      },
-      masterKey
-    );
-    return {
-      masterKey,
-      envelope: migrated,
-      origin: "migrated-passphrase",
-      keyProtection: "passphrase",
-    };
   }
 
   if (opts.recoveryKey !== undefined && legacyHashRaw) {
     // Legacy recovery-key fortress: the recovery key IS the master.
     const recoveryKeyBytes = decodeRecoveryKey(opts.recoveryKey);
-    const providedHash = stringToBytes(hashToString(recoveryKeyBytes));
-    const storedHash = stringToBytes(bytesToString(legacyHashRaw));
-    if (!constantTimeEqual(providedHash, storedHash)) {
-      throw new CustodyUnlockError(
-        "Sanctuary: recovery key does not match the stored key hash.\n" +
-          "The recovery key provided via SANCTUARY_RECOVERY_KEY is incorrect.\n" +
-          "Use the exact recovery key that was displayed at first run."
-      );
-    }
-    const masterKey = recoveryKeyBytes;
+    let transferred = false;
+    try {
+      opts.__testObserveSecretBuffer?.("recovery-key", recoveryKeyBytes);
+      opts.__testObserveSecretBuffer?.("master", recoveryKeyBytes);
+      const providedHash = stringToBytes(hashToString(recoveryKeyBytes));
+      const storedHash = stringToBytes(bytesToString(legacyHashRaw));
+      try {
+        if (!constantTimeEqual(providedHash, storedHash)) {
+          throw new CustodyUnlockError(
+            "Sanctuary: recovery key does not match the stored key hash.\n" +
+              "The recovery key provided via SANCTUARY_RECOVERY_KEY is incorrect.\n" +
+              "Use the exact recovery key that was displayed at first run."
+          );
+        }
+      } finally {
+        providedHash.fill(0);
+        storedHash.fill(0);
+      }
 
-    // The hash proves the key matches the marker, not the data — a fortress
-    // touched by both legacy paths can have data under the *other* master.
-    // Never lock in a master the evidence contradicts.
-    const evidence = await checkMasterEvidence(storage, masterKey);
-    if (evidence === "contradicted") {
-      masterKey.fill(0);
-      throw new CustodyMigrationRefusedError();
-    }
-    if (
-      evidence === "no-evidence" &&
-      (await fortressHasDataBeyondMarkers(storage))
-    ) {
+      // The hash proves the key matches the marker, not the data — a fortress
+      // touched by both legacy paths can have data under the other master.
+      const evidence = await checkMasterEvidence(storage, recoveryKeyBytes);
+      if (evidence === "contradicted") throw new CustodyMigrationRefusedError();
+      if (
+        evidence === "no-evidence" &&
+        (await fortressHasDataBeyondMarkers(storage))
+      ) {
+        transferred = true;
+        return {
+          masterKey: recoveryKeyBytes,
+          envelope: null,
+          origin: "legacy-deferred",
+          keyProtection: "recovery-key",
+        };
+      }
+
+      const wrap = wrapMasterWithRecoveryKey(recoveryKeyBytes, recoveryKeyBytes, {
+        verified: true,
+      });
+      // Invariant: same serialization as the passphrase-migration write above —
+      // this legacy→envelope migration WRITE runs under the shared
+      // master-rotation barrier `establishMaster` holds through here, which
+      // `rotateMaster` drains on its exclusive side, so a concurrent rotate
+      // cannot interleave with this read-verb migration (AGENTS rule 12).
+      const migrated = await writeCustodyEnvelope(
+        storage,
+        {
+          v: 1,
+          install_mode: "legacy-migrated",
+          wraps: [wrap],
+          created_at: now,
+        },
+        recoveryKeyBytes,
+      );
+      transferred = true;
       return {
-        masterKey,
-        envelope: null,
-        origin: "legacy-deferred",
+        masterKey: recoveryKeyBytes,
+        envelope: migrated,
+        origin: "migrated-recovery-key",
         keyProtection: "recovery-key",
       };
+    } finally {
+      if (!transferred) recoveryKeyBytes.fill(0);
     }
-
-    const wrap = wrapMasterWithRecoveryKey(masterKey, recoveryKeyBytes, {
-      verified: true,
-    });
-    const migrated = await writeCustodyEnvelope(
-      storage,
-      {
-        v: 1,
-        install_mode: "legacy-migrated",
-        wraps: [wrap],
-        created_at: now,
-      },
-      masterKey
-    );
-    return {
-      masterKey,
-      envelope: migrated,
-      origin: "migrated-recovery-key",
-      keyProtection: "recovery-key",
-    };
   }
 
   // Legacy markers exist but the matching credential was not supplied.
@@ -1367,72 +1717,86 @@ export async function establishMaster(
   if (opts.passphrase !== undefined) {
     masterKey = generateRandomKey();
     keyProtection = "passphrase";
-    wraps.push(
-      await wrapMasterWithPassphrase(masterKey, opts.passphrase, {
-        verified: true,
-      })
-    );
   } else if (opts.recoveryKey !== undefined) {
     // Operator-supplied recovery key on a virgin fortress (legacy `init`
     // compatibility): preserve the legacy semantics where that key IS the
     // master — it is operator-held, so it is a user-held factor.
     masterKey = decodeRecoveryKey(opts.recoveryKey);
     keyProtection = "recovery-key";
-    wraps.push(
-      wrapMasterWithRecoveryKey(masterKey, masterKey, { verified: true })
-    );
   } else {
     masterKey = generateRandomKey();
     keyProtection = "recovery-key";
   }
+  let transferred = false;
+  try {
+    if (opts.recoveryKey !== undefined) {
+      opts.__testObserveSecretBuffer?.("recovery-key", masterKey);
+    }
+    opts.__testObserveSecretBuffer?.("master", masterKey);
+    if (opts.passphrase !== undefined) {
+      wraps.push(
+        await wrapMasterWithPassphrase(masterKey, opts.passphrase, {
+          verified: true,
+        })
+      );
+    } else if (opts.recoveryKey !== undefined) {
+      wraps.push(
+        wrapMasterWithRecoveryKey(masterKey, masterKey, { verified: true })
+      );
+    }
 
-  if (opts.firstRun.mintRecoveryKey) {
-    const recoveryKeyBytes = generateRandomKey();
-    mintedRecoveryKey = toBase64url(recoveryKeyBytes);
-    wraps.push(
-      wrapMasterWithRecoveryKey(masterKey, recoveryKeyBytes, {
-        // Non-interactive callers cannot re-entry-verify; interactive
-        // callers upgrade this flag after the operator re-enters the key.
-        verified: false,
-      })
+    if (opts.firstRun.mintRecoveryKey) {
+      const recoveryKeyBytes = generateRandomKey();
+      try {
+        opts.__testObserveSecretBuffer?.("recovery-key", recoveryKeyBytes);
+        mintedRecoveryKey = toBase64url(recoveryKeyBytes);
+        wraps.push(
+          wrapMasterWithRecoveryKey(masterKey, recoveryKeyBytes, {
+            // Non-interactive callers cannot re-entry-verify; interactive
+            // callers upgrade this flag after the operator re-enters the key.
+            verified: false,
+          })
+        );
+      } finally {
+        recoveryKeyBytes.fill(0);
+      }
+    }
+
+    if (opts.keychainKey !== undefined) {
+      wraps.push(
+        wrapMasterWithKeychainKey(masterKey, opts.keychainKey, { verified: true })
+      );
+    }
+
+    if (wraps.length === 0) {
+      throw new SilentCustodyRefusedError("first run with no enrollable factor");
+    }
+
+    const fresh = await writeCustodyEnvelope(
+      storage,
+      {
+        v: 1,
+        install_mode: opts.firstRun.installMode,
+        wraps,
+        created_at: now,
+      },
+      masterKey
     );
-    recoveryKeyBytes.fill(0);
-  }
 
-  if (opts.keychainKey !== undefined) {
-    wraps.push(
-      wrapMasterWithKeychainKey(masterKey, opts.keychainKey, { verified: true })
-    );
+    const result: EstablishMasterResult = {
+      masterKey,
+      envelope: fresh,
+      origin: "first-run",
+      keyProtection,
+    };
+    if (mintedRecoveryKey !== undefined) {
+      result.mintedRecoveryKey = mintedRecoveryKey;
+    }
+    transferred = true;
+    return result;
+  } finally {
+    if (!transferred) masterKey.fill(0);
   }
-
-  if (wraps.length === 0) {
-    // No credential and no minting requested: there is nothing the user
-    // could ever present to unlock this fortress. Refuse (F3 spirit).
-    masterKey.fill(0);
-    throw new SilentCustodyRefusedError("first run with no enrollable factor");
-  }
-
-  const fresh = await writeCustodyEnvelope(
-    storage,
-    {
-      v: 1,
-      install_mode: opts.firstRun.installMode,
-      wraps,
-      created_at: now,
-    },
-    masterKey
-  );
-
-  const result: EstablishMasterResult = {
-    masterKey,
-    envelope: fresh,
-    origin: "first-run",
-    keyProtection,
-  };
-  if (mintedRecoveryKey !== undefined) {
-    result.mintedRecoveryKey = mintedRecoveryKey;
-  }
-  return result;
 }
 
 /**
@@ -1457,6 +1821,12 @@ export async function resolveCliMasterKey(
 ): Promise<Uint8Array> {
   const result = await establishMaster({
     storage,
+    // A CLI verb opening an EXISTING fortress must not brick on an environmental
+    // barrier loss (network/FUSE/exFAT volume, `sudo`, looser perms): open for
+    // reads and let the first master-derived write fail closed with the cause's
+    // remediation (S5). First-run/bootstrap writes on such a host still fail
+    // closed at the write, which is the correct refusal.
+    barrierDegradeMode: "read-only",
     ...(opts.passphrase !== undefined ? { passphrase: opts.passphrase } : {}),
     ...(opts.recoveryKey !== undefined ? { recoveryKey: opts.recoveryKey } : {}),
     ...(opts.bootstrap
@@ -1475,6 +1845,161 @@ export async function resolveCliMasterKey(
 }
 
 /**
+ * Acquire the fortress's shared master-rotation barrier for a WRITE session,
+ * bound to the same namespace/name `establishMaster` and `rotateMaster` use so
+ * every writer and the rotator coordinate on ONE barrier. The caller holds the
+ * returned lease from before its first master-derived write until after its
+ * last, then releases it. A concurrent `rotate-master` cannot acquire its
+ * exclusive gate until every such shared reader releases, so a memory verb can
+ * never commit old-master ciphertext into a fortress being re-encrypted
+ * (AGENTS rule 12). Fails CLOSED on an environmental capability loss (no
+ * degrade): a write verb must refuse rather than write unbarriered.
+ * Must pair with the constants in establishMaster (same file).
+ */
+export async function acquireFortressMasterWriteBarrier(
+  storage: StorageBackend,
+  options?: MasterWriteBarrierOptions,
+): Promise<MasterWriteBarrierLease> {
+  return acquireMasterWriteBarrier(
+    storage,
+    CUSTODY_WRITE_LOCK_NAMESPACE,
+    MASTER_ROTATION_BARRIER_NAME,
+    options ?? {},
+  );
+}
+
+/**
+ * Unlock an already-enveloped fortress without entering any custody mutation
+ * path. This is the read/export chokepoint: it never creates, migrates, or
+ * rewrites custody and therefore does not require the kernel write lock.
+ */
+export async function unlockExistingMasterReadOnly(
+  storage: StorageBackend,
+  opts: {
+    passphrase?: string;
+    recoveryKey?: string;
+    keychainKey?: Uint8Array;
+    storagePathHint?: string;
+    __testObserveSecretBuffer?: (
+      label: "master" | "recovery-key",
+      buffer: Uint8Array,
+    ) => void;
+  },
+): Promise<Uint8Array> {
+  if (await storage.read("_meta", ROTATION_JOURNAL_KEY)) {
+    throw new CustodyRotationInProgressError();
+  }
+  const envelope = await readCustodyEnvelope(storage);
+  if (!envelope) throw new CustodyCredentialMissingError(opts.storagePathHint);
+
+  const unlocked = await unlockEnvelopeReadOnly(envelope, opts);
+  let transferred = false;
+  try {
+    await verifyCustodySentinelReadOnly(storage, unlocked.masterKey);
+    const envelopeAfterUnlock = await readCustodyEnvelope(storage);
+    if (await storage.read("_meta", ROTATION_JOURNAL_KEY)) {
+      throw new CustodyRotationInProgressError();
+    }
+    if (!sameCustodyEnvelopeSnapshot(envelope, envelopeAfterUnlock)) {
+      throw new CustodySnapshotChangedError();
+    }
+    transferred = true;
+    return unlocked.masterKey;
+  } finally {
+    if (!transferred) unlocked.masterKey.fill(0);
+  }
+}
+
+async function verifyCustodySentinelReadOnly(
+  storage: StorageBackend,
+  master: Uint8Array,
+): Promise<void> {
+  const raw = await storage.read("_meta", CUSTODY_SENTINEL_KEY);
+  if (raw === null) {
+    throw new CustodyEnvelopeIntegrityError(
+      "Sanctuary: the custody sentinel is missing. It may have been deleted or hidden; refusing read-only unlock.",
+    );
+  }
+  const payload = parseEncryptedPayload(raw);
+  if (payload === null) {
+    throw new CustodyEnvelopeIntegrityError(
+      "Sanctuary: the custody sentinel is malformed; refusing read-only unlock.",
+    );
+  }
+  const key = derivePurposeKey(master, "custody-sentinel");
+  let plaintext: Uint8Array | undefined;
+  try {
+    plaintext = decrypt(
+      payload,
+      key,
+      stringToBytes(CUSTODY_SENTINEL_PLAINTEXT),
+    );
+    if (!constantTimeEqual(plaintext, stringToBytes(CUSTODY_SENTINEL_PLAINTEXT))) {
+      throw new Error("sentinel plaintext mismatch");
+    }
+  } catch {
+    throw new CustodyEnvelopeIntegrityError(
+      "Sanctuary: the custody sentinel failed authentication; refusing read-only unlock.",
+    );
+  } finally {
+    key.fill(0);
+    plaintext?.fill(0);
+  }
+}
+
+async function unlockEnvelopeReadOnly(
+  envelope: CustodyEnvelope,
+  opts: {
+    passphrase?: string;
+    recoveryKey?: string;
+    keychainKey?: Uint8Array;
+    storagePathHint?: string;
+    __testObserveSecretBuffer?: (
+      label: "master" | "recovery-key",
+      buffer: Uint8Array,
+    ) => void;
+  },
+): Promise<{
+  masterKey: Uint8Array;
+  keyProtection: "passphrase" | "recovery-key";
+}> {
+  let master: Uint8Array | undefined;
+  let recoveryKeyBytes: Uint8Array | undefined;
+  let keyProtection: "passphrase" | "recovery-key";
+  try {
+    if (opts.passphrase !== undefined) {
+      master = await unwrapMaster(envelope, { passphrase: opts.passphrase });
+      keyProtection = "passphrase";
+    } else if (opts.recoveryKey !== undefined) {
+      recoveryKeyBytes = decodeRecoveryKey(opts.recoveryKey);
+      opts.__testObserveSecretBuffer?.("recovery-key", recoveryKeyBytes);
+      master = await unwrapMaster(envelope, { recoveryKey: recoveryKeyBytes });
+      keyProtection = "recovery-key";
+    } else if (opts.keychainKey !== undefined) {
+      master = await unwrapMaster(envelope, { keychainKey: opts.keychainKey });
+      keyProtection = "passphrase";
+    } else {
+      throw new CustodyCredentialMissingError(opts.storagePathHint);
+    }
+    opts.__testObserveSecretBuffer?.("master", master);
+    verifyEnvelopeMac(envelope, master);
+    return { masterKey: master, keyProtection };
+  } catch (error) {
+    master?.fill(0);
+    throw error;
+  } finally {
+    recoveryKeyBytes?.fill(0);
+  }
+}
+
+function sameCustodyEnvelopeSnapshot(
+  before: CustodyEnvelope,
+  after: CustodyEnvelope | null,
+): boolean {
+  return after !== null && JSON.stringify(before) === JSON.stringify(after);
+}
+
+/**
  * Mark a recovery-key wrap as operator-verified (after re-entry). The
  * re-entered key is proven by unwrapping the master with it — an end-to-end
  * "the string the user saved unlocks everything" check, not a string
@@ -1487,11 +2012,35 @@ export async function verifyRecoveryWrapByReentry(
   reenteredKey: string,
   opts?: { envelopeKey?: string; sentinelKey?: string }
 ): Promise<CustodyEnvelope> {
-  const match = await unwrapMatchingWrap(
-    envelope.wraps,
-    { recoveryKey: decodeRecoveryKey(reenteredKey) },
-    "recovery-key"
+  return withCustodyWriteLock(
+    storage,
+    () => verifyRecoveryWrapByReentryLocked(
+      storage,
+      envelope,
+      reenteredKey,
+      opts,
+    ),
+    { metadata: { owner: "verify-recovery-wrap" } },
   );
+}
+
+async function verifyRecoveryWrapByReentryLocked(
+  storage: StorageBackend,
+  envelope: CustodyEnvelope,
+  reenteredKey: string,
+  opts?: { envelopeKey?: string; sentinelKey?: string },
+): Promise<CustodyEnvelope> {
+  const recoveryKeyBytes = decodeRecoveryKey(reenteredKey);
+  let match: Awaited<ReturnType<typeof unwrapMatchingWrap>> = null;
+  try {
+    match = await unwrapMatchingWrap(
+      envelope.wraps,
+      { recoveryKey: recoveryKeyBytes },
+      "recovery-key"
+    );
+  } finally {
+    recoveryKeyBytes.fill(0);
+  }
   if (!match) throw new CustodyUnlockError();
   try {
     const updated = await writeCustodyEnvelope(
@@ -1522,6 +2071,18 @@ export async function mintRecoveryWrap(
   envelope: CustodyEnvelope,
   masterKey: Uint8Array
 ): Promise<{ envelope: CustodyEnvelope; recoveryKey: string }> {
+  return withCustodyWriteLock(
+    storage,
+    () => mintRecoveryWrapLocked(storage, envelope, masterKey),
+    { metadata: { owner: "mint-recovery-wrap" } },
+  );
+}
+
+async function mintRecoveryWrapLocked(
+  storage: StorageBackend,
+  envelope: CustodyEnvelope,
+  masterKey: Uint8Array,
+): Promise<{ envelope: CustodyEnvelope; recoveryKey: string }> {
   const prepared = prepareRecoveryWrap(envelope, masterKey);
   const updated = await writeCustodyEnvelope(
     storage,
@@ -1542,8 +2103,8 @@ export function prepareRecoveryWrap(
   masterKey: Uint8Array
 ): { envelope: CustodyEnvelope; recoveryKey: string } {
   const recoveryKeyBytes = generateRandomKey();
-  const recoveryKey = toBase64url(recoveryKeyBytes);
   try {
+    const recoveryKey = toBase64url(recoveryKeyBytes);
     return prepareRecoveryWrapWithKey(envelope, masterKey, recoveryKey);
   } finally {
     recoveryKeyBytes.fill(0);

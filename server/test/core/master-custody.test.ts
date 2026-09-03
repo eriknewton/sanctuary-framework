@@ -26,6 +26,7 @@ import {
   verifyRecoveryWrapByReentry,
   verifyEnvelopeMac,
   enforceCustodyFloor,
+  unlockExistingMasterReadOnly,
   countVerifiedWraps,
   checkCastlePinCustody,
   CustodyUnlockError,
@@ -35,8 +36,10 @@ import {
   OrphanedFortressStateError,
   CustodyFloorError,
   CUSTODY_ENVELOPE_KEY,
+  CUSTODY_SENTINEL_KEY,
   type CustodyEnvelope,
 } from "../../src/core/master-custody.js";
+
 import {
   deriveMasterKey,
   derivePurposeKey,
@@ -49,6 +52,39 @@ import {
   stringToBytes,
   bytesToString,
 } from "../../src/core/encoding.js";
+
+describe("read-only custody sentinel", () => {
+  async function seeded(): Promise<MemoryStorage> {
+    const storage = new MemoryStorage();
+    const result = await establishMaster({
+      storage,
+      passphrase: "sentinel-read-only-passphrase",
+      firstRun: { installMode: "headless", mintRecoveryKey: false },
+    });
+    result.masterKey.fill(0);
+    return storage;
+  }
+
+  it("refuses read-only unlock when the custody sentinel was deleted", async () => {
+    const storage = await seeded();
+    await storage.delete("_meta", CUSTODY_SENTINEL_KEY);
+    await expect(unlockExistingMasterReadOnly(storage, {
+      passphrase: "sentinel-read-only-passphrase",
+    })).rejects.toBeInstanceOf(CustodyEnvelopeIntegrityError);
+  });
+
+  it("refuses read-only unlock when the custody sentinel was tampered", async () => {
+    const storage = await seeded();
+    await storage.write(
+      "_meta",
+      CUSTODY_SENTINEL_KEY,
+      stringToBytes('{"v":1,"alg":"aes-256-gcm","iv":"bad","ct":"bad"}'),
+    );
+    await expect(unlockExistingMasterReadOnly(storage, {
+      passphrase: "sentinel-read-only-passphrase",
+    })).rejects.toBeInstanceOf(CustodyEnvelopeIntegrityError);
+  });
+});
 
 function b64(bytes: Uint8Array): string {
   return toBase64url(bytes);
@@ -175,6 +211,83 @@ describe("establishMaster — first run", () => {
     expect(bytesToString(envelopeRaw!)).not.toContain(b64(result.masterKey));
     expect(await storage.read("_meta", "key-params")).toBeNull();
     expect(await storage.read("_meta", "recovery-key-hash")).toBeNull();
+  });
+
+  it("scrubs decoded recovery and unwrapped master bytes when the post-unlock snapshot read throws", async () => {
+    const storage = new MemoryStorage();
+    const first = await establishMaster({
+      storage,
+      passphrase: "snapshot-failure-passphrase",
+      firstRun: { installMode: "headless", mintRecoveryKey: true },
+    });
+    const recoveryKey = first.mintedRecoveryKey!;
+    first.masterKey.fill(0);
+
+    const originalRead = storage.read.bind(storage);
+    let envelopeReads = 0;
+    storage.read = async (namespace, key) => {
+      if (namespace === "_meta" && key === CUSTODY_ENVELOPE_KEY) {
+        envelopeReads++;
+        if (envelopeReads === 2) {
+          throw new Error("injected post-unlock snapshot read failure");
+        }
+      }
+      return originalRead(namespace, key);
+    };
+    const observed = new Map<string, Uint8Array[]>();
+
+    await expect(establishMaster({
+      storage,
+      recoveryKey,
+      __testObserveSecretBuffer: (label, buffer) => {
+        const buffers = observed.get(label) ?? [];
+        buffers.push(buffer);
+        observed.set(label, buffers);
+      },
+    })).rejects.toThrow("injected post-unlock snapshot read failure");
+
+    expect([...observed.keys()]).toEqual(expect.arrayContaining([
+      "recovery-key",
+      "master",
+    ]));
+    for (const buffers of observed.values()) {
+      for (const buffer of buffers) {
+        expect([...buffer].every((byte) => byte === 0)).toBe(true);
+      }
+    }
+  });
+
+  it("scrubs generated master and recovery bytes when first-run envelope persistence throws", async () => {
+    const storage = new MemoryStorage();
+    const originalWrite = storage.write.bind(storage);
+    storage.write = async (namespace, key, value) => {
+      if (namespace === "_meta" && key === CUSTODY_ENVELOPE_KEY) {
+        throw new Error("injected first-run envelope write failure");
+      }
+      return originalWrite(namespace, key, value);
+    };
+    const observed = new Map<string, Uint8Array[]>();
+
+    await expect(establishMaster({
+      storage,
+      passphrase: "first-run-write-failure-passphrase",
+      firstRun: { installMode: "headless", mintRecoveryKey: true },
+      __testObserveSecretBuffer: (label, buffer) => {
+        const buffers = observed.get(label) ?? [];
+        buffers.push(buffer);
+        observed.set(label, buffers);
+      },
+    })).rejects.toThrow("injected first-run envelope write failure");
+
+    expect([...observed.keys()]).toEqual(expect.arrayContaining([
+      "master",
+      "recovery-key",
+    ]));
+    for (const buffers of observed.values()) {
+      for (const buffer of buffers) {
+        expect([...buffer].every((byte) => byte === 0)).toBe(true);
+      }
+    }
   });
 
   it("refuses a first run over orphaned existing data (codex H1: no split-state)", async () => {

@@ -29,6 +29,7 @@
  */
 
 import { establishMaster } from "../../src/core/master-custody.js";
+import type { MasterWriteBarrierLease } from "../../src/storage/cross-process-lock.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { createIdentity } from "../../src/core/identity.js";
 import { fromBase64url } from "../../src/core/encoding.js";
@@ -63,8 +64,18 @@ export async function seedCustodyAndOperator(opts: {
   storage: StorageBackend;
   passphrase: string;
   operatorLabel?: string;
-}): Promise<{ masterKey: Uint8Array; operator: SeededOperatorIdentity }> {
-  const { masterKey } = await establishMaster({
+}): Promise<{
+  masterKey: Uint8Array;
+  operator: SeededOperatorIdentity;
+  // The shared master-rotation reader lease establishMaster now holds until its
+  // final write. A same-process caller that will later invoke a rotation (which
+  // drains this reader on its exclusive side) MUST release it first to model a
+  // separate rotate-master invocation; a real crashed process reaps its own
+  // socket, but an in-process test does not. Discarding it (the historical
+  // shape) leaks a live reader that a same-process rotateMaster then waits on.
+  masterWriteBarrier?: MasterWriteBarrierLease;
+}> {
+  const { masterKey, masterWriteBarrier } = await establishMaster({
     storage: opts.storage,
     passphrase: opts.passphrase,
     firstRun: { installMode: "headless", mintRecoveryKey: false },
@@ -88,6 +99,7 @@ export async function seedCustodyAndOperator(opts: {
       identityId: storedIdentity.identity_id,
       publicKey: fromBase64url(storedIdentity.public_key),
     },
+    masterWriteBarrier,
   };
 }
 
@@ -103,6 +115,13 @@ export interface SeededIssuerFortress {
   masterSecret: Uint8Array;
   /** The issuing principal cert (public). */
   issuingPrincipalCert: PrincipalCertificate;
+  /**
+   * The held shared master-rotation reader lease from custody establishment.
+   * A caller that will later invoke rotateMaster in the SAME process must
+   * release this first (see seedCustodyAndOperator's note); otherwise the
+   * rotation's exclusive drain waits on this still-live in-process reader.
+   */
+  masterWriteBarrier?: MasterWriteBarrierLease;
 }
 
 /**
@@ -116,7 +135,7 @@ export async function seedFederationIssuerFortress(opts: {
   nodeId: string;
   operatorLabel?: string;
 }): Promise<SeededIssuerFortress> {
-  const { masterKey, operator } = await seedCustodyAndOperator({
+  const { masterKey, operator, masterWriteBarrier } = await seedCustodyAndOperator({
     storage: opts.storage,
     passphrase: opts.passphrase,
     ...(opts.operatorLabel !== undefined ? { operatorLabel: opts.operatorLabel } : {}),
@@ -142,6 +161,7 @@ export async function seedFederationIssuerFortress(opts: {
     pinnedMaster: { ...trustRoot.record.pinned_master_pubkey },
     masterSecret: Uint8Array.from(trustRoot.record.master_secret),
     issuingPrincipalCert: { ...trustRoot.record.issuing_principal_cert },
+    masterWriteBarrier,
   };
 }
 

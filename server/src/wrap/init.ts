@@ -19,13 +19,17 @@
  * the shared helper at server/src/wrap/recovery-key-disclosure.ts.
  */
 
-import { mkdir, readdir } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join, isAbsolute, resolve } from "node:path";
+import { lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
+import { homedir, platform } from "node:os";
+import { dirname, join, isAbsolute, resolve } from "node:path";
 import { Writable } from "node:stream";
 
 import { tightenStoragePermissions } from "../storage/permissions.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import {
+  isFreshFortressOrExactLockScaffold,
+  isRecoveryKeyStageFileName,
+} from "../storage/fresh-fortress.js";
 import { generateRandomKey } from "../core/random.js";
 import { toBase64url } from "../core/encoding.js";
 import {
@@ -34,13 +38,20 @@ import {
   wrapMasterWithKeychainKey,
   writeCustodyEnvelope,
   verifyRecoveryWrapByReentry,
+  readCustodyEnvelope,
+  withCustodyWriteLock,
+  CUSTODY_SENTINEL_KEY,
+  ROTATION_JOURNAL_KEY,
+  CUSTODY_WRITE_LOCK_FILE,
   type CustodyEnvelope,
   type CustodyWrap,
 } from "../core/master-custody.js";
 import {
-  getOrCreateKeychainCustodyKey,
-  storeRecoveryKeyInKeychain,
+  getOrCreateKeychainCustodyKeyTransactional,
+  probeKeychainRecoveryKey,
+  storeRecoveryKeyInKeychainTransactional,
   type KeychainCustodyOptions,
+  type KeychainMutation,
 } from "./keychain-custody.js";
 import { AuditLog } from "../operational/audit-log.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
@@ -64,9 +75,14 @@ import {
   formatFortressPathWritableError,
   preflightFortressPathWritable,
 } from "../paths.js";
-import { runProvisionPin } from "../cli/castle-wall.js";
+import {
+  runProvisionPin,
+  runProvisionPinAlreadyLocked,
+} from "../cli/castle-wall.js";
 import { mkdirSafeUnderRoot } from "./config-reader.js";
 import { runLocalIntelligenceSetup } from "./local-intelligence.js";
+import type { CrossProcessLockLease } from "../storage/cross-process-lock.js";
+import { kernelBackedCrossProcessLockPlatformSupported } from "../storage/cross-process-lock.js";
 
 /**
  * Operator-facing display path of the machine-wide Castle Wall enforcement
@@ -209,13 +225,62 @@ export function resolveFortressPath(
   return join(home, DEFAULT_STORAGE_DIR);
 }
 
-async function isDirectoryEmpty(path: string): Promise<boolean> {
+/**
+ * Check a would-be fresh fortress while tolerating only the inert persistent
+ * scaffold created by the shared kernel custody lock: `state/_meta` and its
+ * regular lock path. The kernel releases ownership after normal exit or holder
+ * death, but intentionally leaves this file in place for future acquisitions.
+ * A missing root is fresh; non-ENOENT inspection failures propagate.
+ */
+const isEmptyExceptCustodyLockScaffold = (root: string): Promise<boolean> =>
+  isFreshFortressOrExactLockScaffold(root, CUSTODY_WRITE_LOCK_FILE);
+
+async function isEmptyOrPotentialRecoveryCrashResidue(root: string): Promise<boolean> {
+  if (await isEmptyExceptCustodyLockScaffold(root)) return true;
   try {
-    const entries = await readdir(path);
-    return entries.length === 0;
-  } catch {
-    // Path does not exist; treat as empty (we will mkdir).
-    return true;
+    const rootEntries = await readdir(root);
+    const candidates = rootEntries.filter((name) =>
+      name === "recovery-key.txt" || isRecoveryKeyStageFileName(name),
+    );
+    if (candidates.length !== 1) return false;
+    const candidate = candidates[0]!;
+    const residue = await lstat(join(root, candidate));
+    if (residue.isSymbolicLink() || !residue.isFile() || residue.nlink !== 1) {
+      return false;
+    }
+    return isFreshFortressOrExactLockScaffold(
+      root,
+      CUSTODY_WRITE_LOCK_FILE,
+      candidate,
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+/**
+ * Read-only early refusal for a pre-existing unsafe policy path. The same
+ * components are checked again by `mkdirSafeUnderRoot` while the custody lock
+ * is held; this preflight only avoids creating lock/state scaffolding for an
+ * input that is already known to be unsafe.
+ */
+async function preflightPolicyAncestors(root: string): Promise<void> {
+  let current = root;
+  for (const component of ["policy", "egress", "rules"]) {
+    current = join(current, component);
+    try {
+      const stat = await lstat(current);
+      if (stat.isSymbolicLink()) {
+        throw new Error(`symlink at ${current}; refusing to mkdir through it`);
+      }
+      if (!stat.isDirectory()) {
+        throw new Error(`non-directory policy ancestor at ${current}; refusing to mkdir through it`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
   }
 }
 
@@ -228,9 +293,37 @@ export interface RunInitDeps {
   provisionPin?: typeof runProvisionPin;
   /** Test seam: inject a mock OS-keyring backend for recovery-key storage. */
   recoveryKeychain?: KeychainCustodyOptions;
-  /** Test seam: simulate a race after preflight but before O_EXCL capture. */
+  /** Test seam: simulate a race immediately before recovery-file O_EXCL capture. */
   beforeRecoveryKeyOutputWrite?: (filePath: string) => void | Promise<void>;
+  /** Test seam: pause after unlocked preflight and mkdir, before custody lock. */
+  beforeCustodyLockAcquire?: () => void | Promise<void>;
   runLocalIntelligenceSetup?: typeof runLocalIntelligenceSetup;
+  /** Test seam for proving generated custody material is zeroed on every exit. */
+  observeSecretBuffer?: (
+    label: "master" | "recovery-key" | "keychain" | "local-setup-master",
+    buffer: Uint8Array,
+  ) => void;
+  /** Test only: observe the real kernel holder for holder-loss fencing. */
+  __testAfterKernelHolderAcquired?: (pid: number) => void;
+  /** Test only: pause after custody-key ownership transfers to init. */
+  __testAfterKeychainCustodyKeyResolved?: () => void | Promise<void>;
+  /** Test only: pause/throw after the pre-mutation lease fence. */
+  beforeDurableMutation?: (label: string) => void | Promise<void>;
+}
+
+/** Assert custody ownership before and after every durable init helper. */
+async function fencedInit<T>(
+  lease: CrossProcessLockLease,
+  deps: RunInitDeps,
+  label: string,
+  mutation: () => Promise<T>,
+): Promise<T> {
+  lease.assertHeld();
+  await deps.beforeDurableMutation?.(label);
+  lease.assertHeld();
+  const result = await mutation();
+  lease.assertHeld();
+  return result;
 }
 
 export async function runInit(
@@ -239,6 +332,13 @@ export async function runInit(
 ): Promise<InitResult> {
   const provisionPin = deps.provisionPin ?? runProvisionPin;
   const fortressPath = resolveFortressPath(options);
+  const host = platform();
+  if (!kernelBackedCrossProcessLockPlatformSupported(host)) {
+    throw new Error(
+      `Sanctuary init requires process-owned custody locking; unsupported host platform ${host}. ` +
+        "No fortress layout was created.",
+    );
+  }
   let recoveryKeyOutputPath: string | undefined;
   try {
     recoveryKeyOutputPath = resolveRecoveryKeyOutputPath({
@@ -273,7 +373,7 @@ export async function runInit(
   }
 
   if (!options.force) {
-    const empty = await isDirectoryEmpty(fortressPath);
+    const empty = await isEmptyOrPotentialRecoveryCrashResidue(fortressPath);
     if (!empty) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
@@ -296,7 +396,87 @@ export async function runInit(
   }
 
   await mkdir(fortressPath, { recursive: true, mode: 0o700 });
-  await tightenStoragePermissions(fortressPath);
+  await preflightPolicyAncestors(fortressPath);
+  await deps.beforeCustodyLockAcquire?.();
+
+  const storage = new FilesystemStorage(`${fortressPath}/state`);
+  let runPostLockLocalSetup: (() => Promise<void>) | undefined;
+  let localSetupMaster: Uint8Array | undefined;
+  const result = await withCustodyWriteLock(
+    storage,
+    async (lease) => {
+      lease.assertHeld();
+      const lockedFortressPath = lease.stableStorageParent;
+      if (!lockedFortressPath) {
+        throw new Error(
+          "custody lock did not provide a stable fortress-directory capability",
+        );
+      }
+      const keychainMutations: Array<Pick<KeychainMutation<unknown>, "rollback" | "commit">> = [];
+      const externalRollback: Array<() => Promise<void>> = [];
+      // The preflight emptiness check happened before the lock existed. Repeat
+      // both the broad filesystem check and custody-current-state reads now,
+      // under the same lock used by reset and rotation, so a concurrent winner
+      // can never be overwritten from a stale preflight observation.
+      if (!options.force) {
+        await lease.stableFortressFiles?.cleanupFreshInitRecoveryResidue(
+          CUSTODY_WRITE_LOCK_FILE,
+        );
+        const empty = lease.stableFortressCapability
+          ? await lease.stableFortressCapability.isFreshExceptLockScaffold(
+              CUSTODY_WRITE_LOCK_FILE,
+            )
+          : await isEmptyExceptCustodyLockScaffold(lockedFortressPath);
+        const [currentEnvelope, sentinel, rotationJournal] = await Promise.all([
+          readCustodyEnvelope(storage),
+          storage.read("_meta", CUSTODY_SENTINEL_KEY),
+          storage.read("_meta", ROTATION_JOURNAL_KEY),
+        ]);
+        if (!empty || currentEnvelope || sentinel || rotationJournal) {
+          // SAFETY: stderr is the operator-facing init channel; no logger exists yet.
+          console.error(
+            `\n  Sanctuary init: refusing because fortress state appeared after preflight:\n` +
+              `    ${fortressPath}\n\n` +
+              `  Another init, reset, or rotation may have completed. Nothing from this\n` +
+              `  init ceremony was written; inspect the current fortress or use --force\n` +
+              `  only when you intentionally accept destructive re-initialization.\n`,
+          );
+          throw new Error("fortress state changed during init preflight");
+        }
+      }
+      if (options.force) {
+        const existingRecoveryEscrow = await probeKeychainRecoveryKey(
+          fortressPath,
+          deps.recoveryKeychain,
+        );
+        if (existingRecoveryEscrow.status === "found") {
+          throw new Error(
+            `--force refused before fortress mutation because OS-keyring service ` +
+              `'${existingRecoveryEscrow.service}' already contains the prior ` +
+              "recovery escrow. Sanctuary will not overwrite or silently leave " +
+              "a stale canonical recovery copy. First preserve an independent " +
+              "recovery/export, deliberately remove that exact old keyring item, " +
+              "then rerun with --recovery-out <path outside the fortress>.",
+          );
+        }
+        if (existingRecoveryEscrow.status === "unreachable") {
+          throw new Error(
+            `--force refused before fortress mutation because OS-keyring service ` +
+              `'${existingRecoveryEscrow.service}' is unreachable and its ` +
+              "absence cannot be proven. Unlock the keyring and retry; an explicit " +
+              "--recovery-out does not make an unknown canonical escrow safe.",
+          );
+        }
+      }
+      // The freshness refusal above observes a concurrent winner and performs
+      // no mutation of its own. Keep it outside this attempt's rollback scope:
+      // rolling back after observing winner state would erase that winner.
+      try {
+      await fencedInit(lease, deps, "storage-permissions", () =>
+        lease.stableFortressCapability
+          ? lease.stableFortressCapability.tightenPermissions()
+          : tightenStoragePermissions(lockedFortressPath),
+      );
 
   // The root Castle Wall daemon intentionally refuses to recursively mkdir
   // through an operator-mutable policy tree: Node has no mkdirat/openat API
@@ -304,37 +484,49 @@ export async function runInit(
   // rule-source directory while init is still running as the fortress owner,
   // walking each component without following symlinks. A fresh fortress is
   // then boot-service-ready even before it contains any allow rules.
-  await mkdirSafeUnderRoot(
-    join(fortressPath, "policy", "egress", "rules"),
-    fortressPath,
-    0o700,
+  await fencedInit(lease, deps, "policy-directory", () =>
+    lease.stableFortressCapability
+      ? lease.stableFortressCapability.mkdir("policy/egress/rules", 0o700)
+      : mkdirSafeUnderRoot(
+          join(lockedFortressPath, "policy", "egress", "rules"),
+          lockedFortressPath,
+          0o700,
+        ),
   );
-
-  const storage = new FilesystemStorage(`${fortressPath}/state`);
 
   // Unified custody (master-custody.ts): one master per fortress, stored
   // only as wraps. The recovery key is a WRAP of the true master — never a
   // second, parallel master (the 2026-06-12 incident class).
   const masterKey = generateRandomKey();
-  const recoveryKeyBytes = generateRandomKey();
-  const recoveryKey = toBase64url(recoveryKeyBytes);
-  const fortressId = fortressIdFromStoragePath(fortressPath);
-
-  const wraps: CustodyWrap[] = [
-    wrapMasterWithRecoveryKey(masterKey, recoveryKeyBytes, {
+  let recoveryKeyBytes: Uint8Array | undefined;
+  try {
+  deps.observeSecretBuffer?.("master", masterKey);
+  recoveryKeyBytes = generateRandomKey();
+  deps.observeSecretBuffer?.("recovery-key", recoveryKeyBytes);
+  let recoveryKey: string;
+  const wraps: CustodyWrap[] = [];
+  try {
+    recoveryKey = toBase64url(recoveryKeyBytes);
+    wraps.push(wrapMasterWithRecoveryKey(masterKey, recoveryKeyBytes, {
       // Interactive installs verify by operator re-entry below; headless
       // installs stay unverified (the audited degraded mode records that).
       verified: false,
-    }),
-  ];
-  recoveryKeyBytes.fill(0);
+    }));
+  } finally {
+    recoveryKeyBytes.fill(0);
+    recoveryKeyBytes = undefined;
+  }
+  const fortressId = fortressIdFromStoragePath(fortressPath);
 
   if (!recoveryKeyOutputPath) {
-    await storeRecoveryKeyInKeychain(
-      fortressPath,
-      recoveryKey,
-      deps.recoveryKeychain
-    );
+    await fencedInit(lease, deps, "recovery-key-keychain", async () => {
+      const mutation = await storeRecoveryKeyInKeychainTransactional(
+        fortressPath,
+        recoveryKey,
+        deps.recoveryKeychain,
+      );
+      keychainMutations.push(mutation);
+    });
   }
 
   // Second factor. Interactive installs MUST enroll one (the two-factor
@@ -347,19 +539,40 @@ export async function runInit(
   if (passphrase) {
     wraps.push(await wrapMasterWithPassphrase(masterKey, passphrase, { verified: true }));
   } else if (interactive) {
-    const keychainKey = await getOrCreateKeychainCustodyKey(fortressPath);
-    if (keychainKey) {
-      wraps.push(wrapMasterWithKeychainKey(masterKey, keychainKey, { verified: true }));
-      keychainKey.fill(0);
-    } else {
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(
-        `\n  Sanctuary init: no OS keyring is available on this system, so the recovery\n` +
-          `  key would be the ONLY way to unlock this fortress — a single point of failure.\n` +
-          `  Supply a second custody factor via SANCTUARY_PASSPHRASE, or run with\n` +
-          `  --no-confirm to accept an audited single-factor headless install.\n`,
+    // Do not use generic fencedInit for a secret-returning provider. Its
+    // post-mutation assertion runs before the result reaches this scope, so a
+    // holder-loss throw there would strand the resolved key with no owner able
+    // to scrub it. Assign the key under this encompassing lifetime first, then
+    // run the post-fence inside the same try/finally that owns the buffer.
+    let keychainKey: Uint8Array | null | undefined;
+    try {
+      lease.assertHeld();
+      await deps.beforeDurableMutation?.("keychain-custody-key");
+      lease.assertHeld();
+      const mutation = await getOrCreateKeychainCustodyKeyTransactional(
+        fortressPath,
+        deps.recoveryKeychain,
       );
-      throw new Error("second custody factor required for interactive init");
+      keychainKey = mutation?.value;
+      if (mutation) keychainMutations.push(mutation);
+      if (keychainKey) deps.observeSecretBuffer?.("keychain", keychainKey);
+      await deps.__testAfterKeychainCustodyKeyResolved?.();
+      lease.assertHeld();
+      if (keychainKey) {
+        wraps.push(wrapMasterWithKeychainKey(masterKey, keychainKey, { verified: true }));
+        lease.assertHeld();
+      } else {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `\n  Sanctuary init: no OS keyring is available on this system, so the recovery\n` +
+            `  key would be the ONLY way to unlock this fortress — a single point of failure.\n` +
+            `  Supply a second custody factor via SANCTUARY_PASSPHRASE, or run with\n` +
+            `  --no-confirm to accept an audited single-factor headless install.\n`,
+        );
+        throw new Error("second custody factor required for interactive init");
+      }
+    } finally {
+      keychainKey?.fill(0);
     }
   }
 
@@ -369,29 +582,79 @@ export async function runInit(
   if (recoveryKeyOutputPath) {
     try {
       await deps.beforeRecoveryKeyOutputWrite?.(recoveryKeyOutputPath);
-      prewrittenRecoveryKeyFile = await writeRecoveryKeyFile({
-        storagePath: fortressPath,
-        recoveryKeyFilePath: recoveryKeyOutputPath,
-        recoveryKey,
-        fortressId,
-      });
+      prewrittenRecoveryKeyFile = await fencedInit(
+        lease,
+        deps,
+        "recovery-key-file",
+        () => writeRecoveryKeyFile({
+          storagePath: fortressPath,
+          recoveryKeyFilePath: recoveryKeyOutputPath,
+          recoveryKey,
+          fortressId,
+        }),
+      );
+      if (prewrittenRecoveryKeyFile.written) {
+        const writtenIdentity = await lstat(recoveryKeyOutputPath);
+        externalRollback.push(async () => {
+          let current: Awaited<ReturnType<typeof lstat>>;
+          try {
+            current = await lstat(recoveryKeyOutputPath);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+            throw error;
+          }
+          if (
+            current.isSymbolicLink() ||
+            current.dev !== writtenIdentity.dev ||
+            current.ino !== writtenIdentity.ino
+          ) {
+            throw new Error("recovery-key output changed before init rollback");
+          }
+          await unlink(recoveryKeyOutputPath);
+          const parent = await open(dirname(recoveryKeyOutputPath), "r");
+          try {
+            await parent.sync();
+          } finally {
+            await parent.close();
+          }
+        });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(`\n  Sanctuary init: recovery key output unavailable: ${message}\n`);
       throw err;
     }
+  } else if (lease.stableFortressCapability) {
+    const result = await fencedInit(
+      lease,
+      deps,
+      "recovery-key-file",
+      () => lease.stableFortressCapability!.writeRecoveryKey(
+        recoveryKey,
+        fortressId,
+      ),
+    );
+    prewrittenRecoveryKeyFile = {
+      filePath: join(fortressPath, "recovery-key.txt"),
+      written: result.written,
+    };
   }
 
-  let envelope: CustodyEnvelope = await writeCustodyEnvelope(
-    storage,
-    {
-      v: 1,
-      install_mode: interactive ? "interactive" : "headless",
-      wraps,
-      created_at: new Date().toISOString(),
-    },
-    masterKey
+  let envelope: CustodyEnvelope = await fencedInit(
+    lease,
+    deps,
+    "custody-envelope",
+    () => writeCustodyEnvelope(
+      storage,
+      {
+        v: 1,
+        install_mode: interactive ? "interactive" : "headless",
+        wraps,
+        created_at: new Date().toISOString(),
+      },
+      masterKey,
+    ),
   );
 
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -401,22 +664,44 @@ export async function runInit(
   // Disclose first (banner + recovery-key.txt), then force re-entry
   // verification on the interactive path. Verification is end-to-end: the
   // re-entered key must actually unwrap the master.
+  //
+  // Init phase boundary: this attended prompt remains inside the fresh-fortress
+  // custody claim because releasing it after writing an unverified envelope
+  // would let a competing init/reset mutate the exact envelope being verified.
+  // The operator's re-entry wait is intentionally unbounded and visible; the
+  // holder is therefore the crash-recoverable kernel lock (not an existence
+  // file), so process death releases ownership. No network/download work occurs
+  // in this phase. Potentially unbounded model download/local-intelligence work
+  // is deliberately deferred until AFTER this custody callback returns
+  // (runPostLockLocalSetup below).
   let disclosure: DiscloseRecoveryKeyResult;
   try {
     const disclosureOptions: Parameters<typeof discloseRecoveryKey>[0] = {
       recoveryKey,
-      storagePath: fortressPath,
+      storagePath: recoveryKeyOutputPath ? fortressPath : lockedFortressPath,
       fortressId,
       mode: "no-confirm", // capture/verification below replaces the Y/N prompt
     };
+    if (!recoveryKeyOutputPath && lockedFortressPath !== fortressPath) {
+      // Linux writes through the inode-bound /proc/self/fd capability, but that
+      // ephemeral descriptor path must never be disclosed as recovery guidance.
+      disclosureOptions.operatorFilePath = join(
+        fortressPath,
+        "recovery-key.txt",
+      );
+    }
     if (recoveryKeyOutputPath) {
       if (!prewrittenRecoveryKeyFile) {
         throw new Error("custom recovery-key output was not captured");
       }
       disclosureOptions.recoveryKeyFilePath = recoveryKeyOutputPath;
+    }
+    if (prewrittenRecoveryKeyFile) {
       disclosureOptions.prewrittenFile = prewrittenRecoveryKeyFile;
     }
-    disclosure = await discloseRecoveryKey(disclosureOptions);
+    disclosure = await fencedInit(lease, deps, "recovery-key-disclosure", () =>
+      discloseRecoveryKey(disclosureOptions),
+    );
     if (interactive && !recoveryKeyOutputPath && disclosure.fileWritten) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
@@ -440,7 +725,12 @@ export async function runInit(
       await verifyRecoveryKeyReentry({
         check: async (entered) => {
           try {
-            envelope = await verifyRecoveryWrapByReentry(storage, envelope, entered);
+            envelope = await fencedInit(
+              lease,
+              deps,
+              "recovery-wrap-verification",
+              () => verifyRecoveryWrapByReentry(storage, envelope, entered),
+            );
             return true;
           } catch {
             return false;
@@ -469,7 +759,7 @@ export async function runInit(
   // verify; init must still record its custody entries. Nothing is
   // repaired or deleted — the old chain stays on disk.
   const auditLog = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
-  await auditLog.appendCritical({
+  await fencedInit(lease, deps, "audit-custody-created", () => auditLog.appendCritical({
     layer: "l2",
     operation: "custody_envelope_created",
     identity_id: fortressId,
@@ -480,9 +770,9 @@ export async function runInit(
       verified_wraps: envelope.wraps.filter((w) => w.verified).length,
       origin: "init",
     },
-  });
+  }));
   if (!interactive) {
-    await auditLog.appendCritical({
+    await fencedInit(lease, deps, "audit-headless-install", () => auditLog.appendCritical({
       layer: "l2",
       operation: "custody_headless_install",
       identity_id: fortressId,
@@ -491,7 +781,7 @@ export async function runInit(
         source: "sanctuary-init",
         flag: "--no-confirm",
       },
-    });
+    }));
   }
 
   // Default operator identity seed. Every Tier-1 operator-signed surface
@@ -510,7 +800,7 @@ export async function runInit(
   // a fresh "operator" identity is minted under the new custody.
   const skipIdentity = resolveNoIdentity(options);
   if (skipIdentity) {
-    await auditLog.appendCritical({
+    await fencedInit(lease, deps, "audit-identity-skip", () => auditLog.appendCritical({
       layer: "l2",
       operation: "operator_identity_seed_skipped",
       identity_id: fortressId,
@@ -519,7 +809,7 @@ export async function runInit(
         source: "sanctuary-init",
         reason: options.noIdentity ? "--no-identity" : "SANCTUARY_INIT_NO_IDENTITY",
       },
-    });
+    }));
   } else {
     try {
       const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
@@ -535,7 +825,7 @@ export async function runInit(
           // `_identities` blobs cannot decrypt, so getDefault() returns
           // undefined), but this guards any future path that seeds under an
           // already-established master.
-          await auditLog.appendCritical({
+          await fencedInit(lease, deps, "audit-existing-identity", () => auditLog.appendCritical({
             layer: "l2",
             operation: "operator_identity_seed_skipped",
             identity_id: fortressId,
@@ -545,7 +835,7 @@ export async function runInit(
               reason: "default-operator-identity-already-exists",
               existing_identity_id: existing.identity_id,
             },
-          });
+          }));
           // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
           console.error(
             `\n  Sanctuary init: a default operator identity already exists` +
@@ -557,8 +847,10 @@ export async function runInit(
             identityEncKey,
             passphrase ? "passphrase" : "recovery-key",
           );
-          await identityManager.saveNew(storedIdentity);
-          await auditLog.appendCritical({
+          await fencedInit(lease, deps, "operator-identity", () =>
+            identityManager.saveNew(storedIdentity),
+          );
+          await fencedInit(lease, deps, "audit-identity-seeded", () => auditLog.appendCritical({
             layer: "l2",
             operation: "operator_identity_seeded",
             identity_id: fortressId,
@@ -568,7 +860,7 @@ export async function runInit(
               seeded_identity_id: storedIdentity.identity_id,
               label: "operator",
             },
-          });
+          }));
         }
       } finally {
         // Zero the symmetric key that wraps the new private key as soon as it
@@ -583,7 +875,7 @@ export async function runInit(
       // with custody but no operator identity when the operator did not opt
       // out. --no-identity is the only supported way to skip the seed.
       const message = err instanceof Error ? err.message : String(err);
-      await auditLog.flush();
+      await fencedInit(lease, deps, "audit-identity-failure-flush", () => auditLog.flush());
       masterKey.fill(0);
       // Honesty (Finding 2, 2026-06-25): the custody envelope and the recovery
       // key just shown are already written and INTACT at this point; only the
@@ -613,39 +905,52 @@ export async function runInit(
     }
   }
 
-  // P1 local intelligence is additive to fortress creation. It shares one
-  // ceremony with `protect`; refusal or adapter failure is recorded loudly
-  // but never invalidates the custody/identity work that already succeeded.
-  try {
-    const localSetup = deps.runLocalIntelligenceSetup ?? runLocalIntelligenceSetup;
-    const outcome = await localSetup({
-      storage,
-      masterKey,
-      auditLog,
-      identityId: fortressId,
-      preAnswered: options.provisionLocalIntelligence,
-      isTty: process.stdin.isTTY === true,
-      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
-      print: (line) => console.error(`  ${line}`),
-    });
-    if (outcome.kind === "refused") {
-      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
-      console.error(`  Local intelligence remains DEGRADED (${outcome.reason}).`);
+  // Local intelligence may prompt a human or download a runtime/model. Never
+  // hold the custody/master lock across that unbounded interaction. Transfer
+  // only an owned master copy into a post-lock closure and scrub it on every
+  // outcome; its own provisioning/config locks serialize the writes it makes.
+  const setupMaster = new Uint8Array(masterKey);
+  localSetupMaster = setupMaster;
+  deps.observeSecretBuffer?.("local-setup-master", setupMaster);
+  runPostLockLocalSetup = async () => {
+    const postLockAudit = new AuditLog(storage, setupMaster, { integrityMode: "lenient" });
+    try {
+      const localSetup = deps.runLocalIntelligenceSetup ?? runLocalIntelligenceSetup;
+      const outcome = await localSetup({
+        storage,
+        masterKey: setupMaster,
+        auditLog: postLockAudit,
+        identityId: fortressId,
+        preAnswered: options.provisionLocalIntelligence,
+        isTty: process.stdin.isTTY === true,
+        // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+        print: (line) => console.error(`  ${line}`),
+      });
+      if (outcome.kind === "refused") {
+        // SAFETY: stderr is the operator-facing init channel; no logger exists yet.
+        console.error(`  Local intelligence remains DEGRADED (${outcome.reason}).`);
+      }
+    } catch (err) {
+      // SAFETY: stderr is the operator-facing init channel; no logger exists yet.
+      console.error(
+        `  Note: local intelligence setup did not complete (${err instanceof Error ? err.message : String(err)}); ` +
+          `the fortress remains initialized and local surfaces remain DEGRADED.`,
+      );
+    } finally {
+      try {
+        await postLockAudit.flush();
+      } finally {
+        setupMaster.fill(0);
+      }
     }
-  } catch (err) {
-    // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
-    console.error(
-      `  Note: local intelligence setup did not complete (${err instanceof Error ? err.message : String(err)}); ` +
-        `the fortress remains initialized and local surfaces remain DEGRADED.`,
-    );
-  }
+  };
   // Castle Wall global-pin provisioning. By default init writes the
   // machine-wide enforcement anchor; --no-pin (or SANCTUARY_INIT_NO_PIN)
   // skips it so a test/isolated fortress never silently touches the
   // host-wide trust anchor. The skip is audited, not silent.
   const skipPin = resolveNoPin(options);
   if (skipPin) {
-    await auditLog.appendCritical({
+    await fencedInit(lease, deps, "audit-pin-skip", () => auditLog.appendCritical({
       layer: "l2",
       operation: "castle_pin_provision_skipped",
       identity_id: fortressId,
@@ -654,10 +959,9 @@ export async function runInit(
         source: "sanctuary-init",
         reason: options.noPin ? "--no-pin" : "SANCTUARY_INIT_NO_PIN",
       },
-    });
+    }));
   }
-  await auditLog.flush();
-  masterKey.fill(0);
+  await fencedInit(lease, deps, "audit-final-flush", () => auditLog.flush());
 
   if (skipPin) {
     const skipSource = options.noPin ? "--no-pin" : "SANCTUARY_INIT_NO_PIN";
@@ -669,23 +973,143 @@ export async function runInit(
         `  Run \`sanctuary castle-wall provision-pin\` against this fortress when ready.\n`,
     );
   } else {
-    const pinResult = await provisionPin([], {
-      out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
-      env: {
-        ...process.env,
-        SANCTUARY_STORAGE_PATH: fortressPath,
-        SANCTUARY_RECOVERY_KEY: recoveryKey,
+    type PinExecution = number | {
+      code: number;
+      stdout: string;
+      stderr: string;
+      warnings: string[];
+    };
+    const pinExecution = await fencedInit<PinExecution>(
+      lease,
+      deps,
+      "hostwide-castle-pin",
+      async () => {
+        // The injected implementation is a test seam and must remain observable
+        // in the parent. Production uses the inode-bound worker so its
+        // per-fortress pin write cannot be redirected by a root replacement.
+        if (deps.provisionPin) {
+          return provisionPin([], {
+            out: new Writable({
+              write(_chunk, _encoding, callback) {
+                callback();
+              },
+            }),
+            env: {
+              ...process.env,
+              SANCTUARY_STORAGE_PATH: lockedFortressPath,
+              SANCTUARY_RECOVERY_KEY: recoveryKey,
+            },
+          });
+        }
+        if (lease.stableFortressCapability) {
+          return lease.stableFortressCapability.provisionPin({
+            masterKey,
+          });
+        }
+        return runProvisionPinAlreadyLocked([], {
+          out: new Writable({
+            write(_chunk, _encoding, callback) {
+              callback();
+            },
+          }),
+          env: {
+            ...process.env,
+            SANCTUARY_STORAGE_PATH: lockedFortressPath,
+          },
+          __resolvedProvisionMasterKey: masterKey,
+        });
       },
-    });
+    );
+    const pinResult = typeof pinExecution === "number"
+      ? pinExecution
+      : pinExecution.code;
+    if (typeof pinExecution !== "number") {
+      // SAFETY: stderr is the operator-facing init channel; no logger exists yet.
+      if (pinExecution.stderr) console.error(pinExecution.stderr.trimEnd());
+      for (const warning of pinExecution.warnings) console.warn(warning);
+    }
     if (pinResult !== 0) {
       throw new Error("Castle Wall provision-pin auto-bootstrap failed");
     }
   }
 
+  masterKey.fill(0);
+  for (const mutation of keychainMutations) mutation.commit();
   return {
     fortressPath,
-    recoveryKeyDisclosurePath: disclosure.filePath,
+    recoveryKeyDisclosurePath:
+      recoveryKeyOutputPath ?? join(fortressPath, "recovery-key.txt"),
   };
+  } finally {
+    recoveryKeyBytes?.fill(0);
+    masterKey.fill(0);
+  }
+      } catch (error) {
+        if (!options.force) {
+          // A lost lease means another process may already own the namespace;
+          // never race its work with rollback. Ordinary failures retain the
+          // live lease and restore every external side effect plus the exact
+          // inert filesystem scaffold, making a plain retry safe.
+          lease.assertHeld();
+          let rollbackFailure: unknown;
+          for (const rollback of [...externalRollback].reverse()) {
+            try {
+              await rollback();
+            } catch (rollbackError) {
+              rollbackFailure ??= rollbackError;
+            }
+          }
+          for (const mutation of [...keychainMutations].reverse()) {
+            try {
+              await mutation.rollback();
+            } catch (rollbackError) {
+              rollbackFailure ??= rollbackError;
+            }
+          }
+          const files = lease.stableFortressFiles;
+          if (!files) {
+            throw new Error(
+              "fresh-init rollback requires an inode-bound fortress file capability",
+              { cause: error },
+            );
+          }
+          try {
+            await files.restoreFreshLockScaffold(CUSTODY_WRITE_LOCK_FILE);
+          } catch (rollbackError) {
+            rollbackFailure ??= rollbackError;
+          }
+          lease.assertHeld();
+          if (rollbackFailure) {
+            throw new AggregateError(
+              [error, rollbackFailure],
+              "fresh init failed and rollback did not complete",
+              { cause: error },
+            );
+          }
+        }
+        throw error;
+      }
+    },
+    {
+      metadata: { owner: "sanctuary-init" },
+      ...(deps.__testAfterKernelHolderAcquired !== undefined
+        ? { __testAfterKernelHolderAcquired: deps.__testAfterKernelHolderAcquired }
+        : {}),
+    },
+  ).catch((err: unknown) => {
+    // A late lock-phase failure can happen after the setup copy is created but
+    // before its post-lock closure is eligible to run.
+    localSetupMaster?.fill(0);
+    throw err;
+  });
+  try {
+    await runPostLockLocalSetup?.();
+    return result;
+  } finally {
+    // The post-lock closure normally owns this scrub. Keep an outer lifetime
+    // fence as well so every normal and exceptional completion is covered.
+    localSetupMaster?.fill(0);
+  }
 }
 
 export interface ParsedInitArgs extends InitOptions {

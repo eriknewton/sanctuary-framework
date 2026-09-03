@@ -2,6 +2,7 @@ import { constants as fsConstants, type Stats } from "node:fs";
 import { mkdir, open, rename, unlink, lstat } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
+import { isBenignDirectoryFsyncError } from "./directory-fsync.js";
 
 export type CustodyFsErrorCode =
   | "symlink_rejected"
@@ -133,6 +134,13 @@ export interface WriteFileCustodyOptions {
    * is the natural value.
    */
   ownerBase?: string;
+  /**
+   * Internal storage-backend capability: `path` and `ownerBase` are rooted at
+   * a live `/dev/fd/<n>` or `/proc/self/fd/<n>` directory descriptor. The
+   * descriptor, rather than a revalidated pathname, provides containment and
+   * rename resistance. Callers outside FilesystemStorage must never set this.
+   */
+  stableDirectoryCapability?: boolean;
 }
 
 const O_NOFOLLOW =
@@ -341,10 +349,7 @@ async function fsyncDirectory(dir: string): Promise<void> {
     handle = await open(dir, fsConstants.O_RDONLY);
     await handle.sync();
   } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (!["EINVAL", "ENOTSUP", "EISDIR", "EPERM"].includes(code ?? "")) {
-      throw err;
-    }
+    if (!isBenignDirectoryFsyncError(err)) throw err;
   } finally {
     await handle?.close().catch(() => undefined);
   }
@@ -681,7 +686,7 @@ export async function writeFileCustody(
 ): Promise<void> {
   const dir = dirname(path);
   let ownerGuard: NoFollowDirectoryGuard | undefined;
-  if (options.owner !== undefined) {
+  if (options.owner !== undefined && !options.stableDirectoryCapability) {
     // 2026-07-31 fix-round: verify containment BEFORE any recursive mkdir.
     // There is no mkdirat-style API here; creating missing parents by path as
     // root can be redirected by a symlinked ancestor before the later

@@ -22,10 +22,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   PASSPHRASE_ARGV_WARNING,
-  runMemoryEmitCommand,
-  runMemoryIngestCommand,
-  runMemoryTranscodeCommand,
-  runMemoryTranscodeRestoreCommand,
+  runMemoryEmitCommand as runMemoryEmitCommandProduction,
+  runMemoryIngestCommand as runMemoryIngestCommandProduction,
+  runMemoryTranscodeCommand as runMemoryTranscodeCommandProduction,
+  runMemoryTranscodeRestoreCommand as runMemoryTranscodeRestoreCommandProduction,
 } from "../../src/cli/memory-file.js";
 import { resolveCliMasterKey } from "../../src/core/master-custody.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
@@ -33,6 +33,10 @@ import { createIdentity } from "../../src/core/identity.js";
 import { IdentityManager } from "../../src/cognitive/tools.js";
 import { fortressIdFromStoragePath } from "../../src/dashboard/v1_1/wiring.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
+import {
+  persistUserProvidedPassphrase,
+  readStoredPassphrase,
+} from "../../src/wrap/passphrase.js";
 import { SdwMemoryBackendAdapter } from "../../src/sdw/adapters/sdw-memory-backend.js";
 import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../../src/sdw/memory-provenance-signing.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
@@ -44,6 +48,35 @@ const CODEX_FIXTURE_ROOT = fileURLToPath(
   new URL("../../src/sdw/__fixtures__/codex-memory/", import.meta.url),
 );
 const PASSPHRASE = "memory-file-cli-test-passphrase-v1";
+const APPROVE_DIALOG = () => ({
+  status: 0,
+  signal: null,
+  stdout: Buffer.from("approve\n"),
+});
+
+// memory_ingest is Tier-1 (S4): it now passes the human ApprovalGate like the
+// other memory verbs, so default the local-operator dialog to APPROVE unless a
+// test supplies its own (the deny-path tests pass a denying runner explicitly).
+const runMemoryIngestCommand: typeof runMemoryIngestCommandProduction = (args) =>
+  runMemoryIngestCommandProduction({
+    ...args,
+    dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
+  });
+const runMemoryEmitCommand: typeof runMemoryEmitCommandProduction = (args) =>
+  runMemoryEmitCommandProduction({
+    ...args,
+    dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
+  });
+const runMemoryTranscodeCommand: typeof runMemoryTranscodeCommandProduction = (args) =>
+  runMemoryTranscodeCommandProduction({
+    ...args,
+    dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
+  });
+const runMemoryTranscodeRestoreCommand: typeof runMemoryTranscodeRestoreCommandProduction = (args) =>
+  runMemoryTranscodeRestoreCommandProduction({
+    ...args,
+    dialogRunner: args.dialogRunner ?? APPROVE_DIALOG,
+  });
 
 function makeSink(): { stream: Writable; text: () => string } {
   const chunks: string[] = [];
@@ -191,17 +224,31 @@ describe("memory file CLI: credential gate", () => {
     while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
   });
 
-  it("refuses (exit 1) when no passphrase or recovery key is supplied", async () => {
+  it("refuses (exit 1) when no credential is supplied and the keyring is empty", async () => {
     const out = makeSink();
     const err = makeSink();
+    // Point at a hermetic temp fortress so resolution never touches the
+    // operator's real fortress. With no argv/stdin/env credential and the
+    // per-test in-memory keyring empty, the exact-fortress unwrap finds nothing
+    // and the command refuses (absent) rather than generating a passphrase.
+    const fortress = join(await tempDir("memfile-nocred"), "fortress");
     const code = await runMemoryIngestCommand({
-      argv: ["--harness", "claude-code", "--dir", join(FIXTURE_ROOT, "basic")],
+      argv: [
+        "--harness",
+        "claude-code",
+        "--dir",
+        join(FIXTURE_ROOT, "basic"),
+        "--fortress",
+        fortress,
+      ],
       out: out.stream,
       err: err.stream,
       env: {},
     });
     expect(code).toBe(1);
-    expect(err.text()).toContain("require SANCTUARY_PASSPHRASE");
+    expect(err.text()).toContain("could not unlock the fortress");
+    // The remediation still names the supported credential sources.
+    expect(err.text()).toContain("SANCTUARY_PASSPHRASE");
     expect(out.text()).toBe("");
   });
 
@@ -283,6 +330,31 @@ describe("memory file CLI: fortress-backed round trip", () => {
   async function auditOperations(): Promise<string[]> {
     return (await auditEntries()).map((entry) => entry.operation);
   }
+
+  it("writes no plaintext when the local human denies memory_emit", async () => {
+    const source = await copyFixtureSet("basic", "memfile-deny-source");
+    expect(await runMemoryIngestCommand({
+      argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
+      out: makeSink().stream,
+      err: makeSink().stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+    })).toBe(0);
+    const output = join(await tempDir("memfile-deny-parent"), "must-not-exist");
+    const err = makeSink();
+    expect(await runMemoryEmitCommandProduction({
+      argv: ["--harness", "claude-code", "--dir", output, "--fortress", fortress],
+      out: makeSink().stream,
+      err: err.stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      dialogRunner: () => ({
+        status: 0,
+        signal: null,
+        stdout: Buffer.from("deny\n"),
+      }),
+    })).toBe(1);
+    expect(err.text()).toContain("not approved");
+    await expect(readdir(output)).rejects.toMatchObject({ code: "ENOENT" });
+  });
 
   it("ingests, emits, and records the intent BEFORE and the outcome AFTER each operation", async () => {
     const source = await copyFixtureSet("basic", "memfile-cli-source");
@@ -445,6 +517,72 @@ describe("memory file CLI: fortress-backed round trip", () => {
       "memory_transcode_restore_started",
       "memory_transcode_restore",
     ]);
+  }, 60_000);
+
+  it("denies transcode before intent or plaintext output when local-human approval is denied", async () => {
+    const source = await copyFixtureSet("unicode", "memfile-cli-transcode-denied-source");
+    const projection = await tempDir("memfile-cli-transcode-denied-output");
+    expect(await runMemoryIngestCommand({
+      argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
+      out: makeSink().stream,
+      err: makeSink().stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+    })).toBe(0);
+    const err = makeSink();
+    expect(await runMemoryTranscodeCommandProduction({
+      argv: [
+        "--from-harness", "claude-code",
+        "--to-harness", "codex",
+        "--mode", "reversible",
+        "--dir", projection,
+        "--fortress", fortress,
+      ],
+      out: makeSink().stream,
+      err: err.stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      dialogRunner: () => ({ status: 0, signal: null, stdout: Buffer.from("deny\n") }),
+    })).toBe(1);
+    expect(await readdir(projection)).toEqual([]);
+    expect(err.text()).toContain("was not approved");
+    expect((await auditOperations()).filter((op) => op === "memory_transcode_started")).toEqual([]);
+  }, 60_000);
+
+  it("denies transcode restore before intent or plaintext output when local-human approval is denied", async () => {
+    const source = await copyFixtureSet("unicode", "memfile-cli-restore-denied-source");
+    const projection = await tempDir("memfile-cli-restore-denied-projection");
+    const restored = await tempDir("memfile-cli-restore-denied-output");
+    expect(await runMemoryIngestCommand({
+      argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
+      out: makeSink().stream,
+      err: makeSink().stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+    })).toBe(0);
+    const transcodeOut = makeSink();
+    expect(await runMemoryTranscodeCommand({
+      argv: [
+        "--from-harness", "claude-code",
+        "--to-harness", "codex",
+        "--mode", "reversible",
+        "--dir", projection,
+        "--fortress", fortress,
+      ],
+      out: transcodeOut.stream,
+      err: makeSink().stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+    })).toBe(0);
+    const archiveId = /archive_id ([a-f0-9]+)/.exec(transcodeOut.text())?.[1];
+    expect(archiveId).toBeDefined();
+    const err = makeSink();
+    expect(await runMemoryTranscodeRestoreCommandProduction({
+      argv: ["--archive-id", archiveId!, "--dir", restored, "--fortress", fortress],
+      out: makeSink().stream,
+      err: err.stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      dialogRunner: () => ({ status: 0, signal: null, stdout: Buffer.from("deny\n") }),
+    })).toBe(1);
+    expect(await readdir(restored)).toEqual([]);
+    expect(err.text()).toContain("was not approved");
+    expect((await auditOperations()).filter((op) => op === "memory_transcode_restore_started")).toEqual([]);
   }, 60_000);
 
   it("accepts the passphrase on stdin instead of argv", async () => {
@@ -875,4 +1013,186 @@ Unrelated identifier: ${BARE_CREDENTIAL_VALUE}
     expect(operations).toContain("memory_ingest_denied");
     expect(operations).not.toContain("memory_ingest");
   }, 60_000);
+});
+
+describe("Rung 1 memory-file stored-custody wiring + zeroization (F6/F4)", () => {
+  let prevStoragePath: string | undefined;
+
+  beforeEach(() => {
+    prevStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+  });
+  afterEach(async () => {
+    if (prevStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+    else process.env.SANCTUARY_STORAGE_PATH = prevStoragePath;
+    while (cleanupTasks.length > 0) await cleanupTasks.pop()!();
+  });
+
+  async function seedFortressWithStoredCustody(prefix: string): Promise<string> {
+    const fortress = join(await tempDir(prefix), ".sanctuary");
+    await mkdir(join(fortress, "state"), { recursive: true, mode: 0o700 });
+    const storage = new FilesystemStorage(join(fortress, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
+      passphrase: PASSPHRASE,
+      bootstrap: true,
+      storagePathHint: fortress,
+    });
+    const identities = new IdentityManager(storage, masterKey);
+    const { storedIdentity } = createIdentity(
+      "memfile-f6-identity",
+      derivePurposeKey(masterKey, "identity-encryption"),
+      "passphrase",
+    );
+    await identities.save(storedIdentity);
+    masterKey.fill(0);
+    // Store the passphrase in this host's (in-memory) keyring for the EXACT
+    // fortress — exactly what `sanctuary protect` does.
+    await persistUserProvidedPassphrase(PASSPHRASE, { storagePath: fortress });
+    return fortress;
+  }
+
+  it("opens the EXACT fortress via stored custody for all four verbs with NO argv/env secret", async () => {
+    const fortress = await seedFortressWithStoredCustody("memfile-f6-stored");
+    const source = await copyFixtureSet("basic", "memfile-f6-source");
+    const projection = await tempDir("memfile-f6-projection");
+    const restored = await tempDir("memfile-f6-restored");
+    const output = await tempDir("memfile-f6-output");
+
+    // 1) ingest via stored custody
+    const ingest = makeSink();
+    expect(
+      await runMemoryIngestCommand({
+        argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
+        out: ingest.stream,
+        err: makeSink().stream,
+        env: {}, // no SANCTUARY_PASSPHRASE / SANCTUARY_RECOVERY_KEY
+      }),
+    ).toBe(0);
+    expect(ingest.text()).not.toContain("could not unlock the fortress");
+    expect(ingest.text()).not.toContain(PASSPHRASE);
+
+    // 2) transcode via stored custody
+    const transcode = makeSink();
+    expect(
+      await runMemoryTranscodeCommand({
+        argv: [
+          "--from-harness", "claude-code",
+          "--to-harness", "codex",
+          "--mode", "reversible",
+          "--dir", projection,
+          "--fortress", fortress,
+        ],
+        out: transcode.stream,
+        err: makeSink().stream,
+        env: {},
+      }),
+    ).toBe(0);
+    const archiveId = /archive_id ([a-f0-9]+)/.exec(transcode.text())?.[1];
+    expect(archiveId).toMatch(/^[a-f0-9]+$/);
+
+    // 3) transcode-restore via stored custody
+    expect(
+      await runMemoryTranscodeRestoreCommand({
+        argv: ["--archive-id", archiveId!, "--dir", restored, "--fortress", fortress],
+        out: makeSink().stream,
+        err: makeSink().stream,
+        env: {},
+      }),
+    ).toBe(0);
+
+    // 4) emit via stored custody
+    const emit = makeSink();
+    expect(
+      await runMemoryEmitCommand({
+        argv: ["--harness", "claude-code", "--dir", output, "--fortress", fortress],
+        out: emit.stream,
+        err: makeSink().stream,
+        env: {},
+      }),
+    ).toBe(0);
+    expect(emit.text()).toContain("emitted 3 Claude Code memory files");
+    expect(emit.text()).not.toContain(PASSPHRASE);
+  }, 60_000);
+
+  it("no generation: a fortress with no stored credential and no argv/env secret refuses and never mints one", async () => {
+    const fortress = join(await tempDir("memfile-f6-nocred"), ".sanctuary");
+    await mkdir(join(fortress, "state"), { recursive: true, mode: 0o700 });
+    // Bootstrap custody but store NO credential in the keyring.
+    const storage = new FilesystemStorage(join(fortress, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
+      passphrase: PASSPHRASE,
+      bootstrap: true,
+      storagePathHint: fortress,
+    });
+    masterKey.fill(0);
+    const err = makeSink();
+    const code = await runMemoryEmitCommand({
+      argv: ["--harness", "claude-code", "--dir", await tempDir("memfile-f6-nocred-out"), "--fortress", fortress],
+      out: makeSink().stream,
+      err: err.stream,
+      env: {},
+    });
+    expect(code).toBe(1);
+    expect(err.text()).toContain("could not unlock the fortress");
+    // No credential was minted for this fortress.
+    expect(await readStoredPassphrase({ storagePath: fortress, readOnly: true })).toBeNull();
+  });
+
+  it("mismatch: a stored credential that does not open the fortress is refused", async () => {
+    const fortress = join(await tempDir("memfile-f6-mismatch"), ".sanctuary");
+    await mkdir(join(fortress, "state"), { recursive: true, mode: 0o700 });
+    const storage = new FilesystemStorage(join(fortress, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
+      passphrase: PASSPHRASE,
+      bootstrap: true,
+      storagePathHint: fortress,
+    });
+    masterKey.fill(0);
+    await persistUserProvidedPassphrase("not-the-fortress-passphrase", { storagePath: fortress });
+    const err = makeSink();
+    const code = await runMemoryEmitCommand({
+      argv: ["--harness", "claude-code", "--dir", await tempDir("memfile-f6-mismatch-out"), "--fortress", fortress],
+      out: makeSink().stream,
+      err: err.stream,
+      env: {},
+    });
+    expect(code).toBe(1);
+    expect(err.text()).toContain("could not unlock the fortress");
+  });
+
+  it("F4: the owned master is zeroed on the success path", async () => {
+    const fortress = await seedFortressWithStoredCustody("memfile-f4-ok");
+    const source = await copyFixtureSet("basic", "memfile-f4-ok-source");
+    const captured: Uint8Array[] = [];
+    const code = await runMemoryIngestCommand({
+      argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
+      out: makeSink().stream,
+      err: makeSink().stream,
+      env: {},
+      observeMasterKey: (buf) => captured.push(buf),
+    });
+    expect(code).toBe(0);
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.every((b) => b === 0)).toBe(true);
+  });
+
+  it("F4: the owned master is zeroed even when the verb body errors after unlock", async () => {
+    const fortress = await seedFortressWithStoredCustody("memfile-f4-err");
+    const captured: Uint8Array[] = [];
+    // A nonexistent source dir fails AFTER bootstrap (post-unlock), driving the
+    // verb through its catch + finally; the master must still be zeroed.
+    const code = await runMemoryIngestCommand({
+      argv: [
+        "--harness", "claude-code",
+        "--dir", join(await tempDir("memfile-f4-err-missing"), "does-not-exist"),
+        "--fortress", fortress,
+      ],
+      out: makeSink().stream,
+      err: makeSink().stream,
+      env: {},
+      observeMasterKey: (buf) => captured.push(buf),
+    });
+    expect(code).toBe(1);
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.every((b) => b === 0)).toBe(true);
+  });
 });

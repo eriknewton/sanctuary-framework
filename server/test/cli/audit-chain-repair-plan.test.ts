@@ -56,6 +56,7 @@ import {
   runAuditChainRepairPlan,
   type AuditChainRepairPlan,
 } from "../../src/cli/audit-chain-repair-plan.js";
+import { initializeTestCustody } from "../helpers/custody-fixture.js";
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -142,10 +143,12 @@ describe("audit-chain repair-plan", () => {
   async function seededFortress(entries = 4): Promise<string> {
     const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-repair-plan-"));
     tempDirs.push(fortressPath);
+    await initializeTestCustody(fortressPath, { passphrase: PASSPHRASE });
     const code = await runProvisionPin([], {
       out: new CaptureStream(),
       err: new CaptureStream(),
       env: ENV(fortressPath),
+      globalPinnedPublicKeyPath: join(fortressPath, "global-pin.bin"),
     });
     expect(code).toBe(0);
 
@@ -484,13 +487,12 @@ describe("audit-chain repair-plan", () => {
     }
   });
 
-  it("exits 1 without mutating when the guard refuses a custody migration on a legacy fortress", async () => {
-    // The `ReadOnlyStorageViolationError` exit path over an EXISTING fortress:
-    // a pure-legacy custody layout (key-params + evidence, no envelope) makes
-    // `establishMaster` attempt the in-place envelope migration, which the
-    // guard refuses. The verb must report the refusal as ITS OWN defect
-    // class, exit 1, and leave the fortress byte-identical — never render the
-    // refusal as a verdict about the chain.
+  it("exits 1 without mutating or attempting custody migration on a legacy fortress", async () => {
+    // A pure-legacy custody layout (key-params + evidence, no envelope) would
+    // make the old establishMaster path attempt an in-place migration. The
+    // read-only unlock path must instead report unreadable state and leave the
+    // fortress byte-identical — never render failed authentication as a chain
+    // verdict.
     const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-repair-plan-legacy-"));
     tempDirs.push(fortressPath);
     const storage = new FilesystemStorage(join(fortressPath, "state"));
@@ -500,8 +502,7 @@ describe("audit-chain repair-plan", () => {
       "key-params",
       stringToBytes(JSON.stringify(params))
     );
-    // One decryptable identity = the migration evidence that pushes
-    // establishMaster past its defer branch and INTO the envelope write.
+    // One decryptable identity would trigger migration in the mutating path.
     const idKey = derivePurposeKey(legacyMaster, "identity-encryption");
     await storage.write(
       "_identities",
@@ -524,11 +525,22 @@ describe("audit-chain repair-plan", () => {
 
     expect(code).toBe(REPAIR_PLAN_EXIT_STATE_UNREADABLE);
     expect(out.text()).toBe("");
-    // The message blames the COMMAND, not the fortress, and states nothing
-    // changed — the operator holding a damaged fortress must not read this as
-    // one more damage verdict.
-    expect(err.text()).toContain("was refused");
-    expect(err.text()).toContain("nothing was changed");
+    // ENV() DOES supply SANCTUARY_PASSPHRASE here — this fortress is
+    // credentialed, not credential-less. The message still reads "no
+    // credentials provided" because unlockExistingMasterReadOnly
+    // (server/src/core/master-custody.ts) checks for an existing custody
+    // envelope before it ever tries a supplied credential against anything;
+    // a pure-legacy layout has no envelope, so it throws
+    // CustodyCredentialMissingError unconditionally. That class's wording
+    // means "no envelope to apply a credential against," not "no credential
+    // was given" — do not read this assertion as testing the no-credential
+    // case. Pinning the envelope-specific "existing encrypted data found"
+    // phrase (unique to that error class) proves this exact path fired,
+    // rather than merely matching a substring that another message could
+    // also coincidentally contain.
+    expect(err.text()).toContain("no verdict was produced");
+    expect(err.text()).toContain("existing encrypted data found");
+    expect(err.text()).toContain("no credentials provided");
 
     expect(await fortressTreeHash(fortressPath)).toBe(before);
   });

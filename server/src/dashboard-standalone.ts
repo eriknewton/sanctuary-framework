@@ -756,6 +756,8 @@ export async function startStandaloneDashboard(
         // The credential WAS valid but dependency wiring failed (e.g. a
         // malformed baseline). Stay parked, release the guard for a retry, and
         // fail closed generically rather than serving a half-wired surface.
+        await unlockCustody.masterWriteBarrier?.release().catch(() => undefined);
+        unlockCustody.masterKey.fill(0);
         unlockInFlightOrDone = false;
         return false;
       }
@@ -789,18 +791,33 @@ export async function startStandaloneDashboard(
   }
 
   // ── Unlocked boot path (credential present): wire the master deps now ────
-  await wireUnlockedDeps({
-    dashboard,
-    custody,
-    storage,
-    config,
-    policy,
-    options,
-    dashboardHost,
-    dashboardPort,
-    passphrase,
-    passphraseSource,
-  });
+  try {
+    await wireUnlockedDeps({
+      dashboard,
+      custody,
+      storage,
+      config,
+      policy,
+      options,
+      dashboardHost,
+      dashboardPort,
+      passphrase,
+      passphraseSource,
+    });
+  } catch (error) {
+    try {
+      await custody.masterWriteBarrier?.release();
+    } catch (releaseError) {
+      custody.masterKey.fill(0);
+      throw new AggregateError(
+        [error, releaseError],
+        "dashboard dependency wiring failed and its master-write barrier did not release cleanly",
+        { cause: releaseError },
+      );
+    }
+    custody.masterKey.fill(0);
+    throw error;
+  }
 
   // Fix round 1, F3 (dashboard fold): `wireUnlockedDeps` above wrote this
   // tenant's runtime.json BEFORE the listener binds. If the bind FAILS
@@ -1577,6 +1594,12 @@ async function wireUnlockedDeps(args: {
       await baseline.save();
     } catch {
       /* best-effort: a shutdown cleanup must not throw out of the signal handler */
+    } finally {
+      try {
+        await custody.masterWriteBarrier?.release();
+      } catch {
+        /* process death is the final crash-recoverable barrier release */
+      }
     }
   };
   registerStandaloneProcessCleanup(saveBaseline);

@@ -678,7 +678,7 @@ describe("rotate-root --resume: atomicity (no half-rotated corrupt state)", () =
     ).rejects.toThrow(/fortress_id.*non-empty string/);
     await expect(identityFirst).rejects.toBeInstanceOf(FederationRotateRootResumeError);
     masterKey.fill(0);
-  });
+  }, 60_000); // heavy table-driven atomicity; full-suite load can exceed the 30s default
 });
 
 describe("rotate-root: mutual exclusion with custody rotation", () => {
@@ -713,7 +713,7 @@ describe("rotate-root: mutual exclusion with custody rotation", () => {
   });
 
   it("the reverse: a custody rotateMaster refuses while a federation rotate-root journal exists", async () => {
-    const { masterKey } = await seedIssuer();
+    const { masterKey, issuer } = await seedIssuer();
     // Plant a federation rotate-root journal via a mid-stage crash.
     await expect(
       rotateFederationRootRenew({
@@ -725,6 +725,15 @@ describe("rotate-root: mutual exclusion with custody rotation", () => {
       }),
     ).rejects.toThrow();
     expect(await federationRotateRootInProgress(storage)).toBe(true);
+
+    // Model rotateMaster as a SEPARATE invocation: release the shared
+    // master-rotation reader the seed's custody establishment holds in THIS
+    // process. A real crashed rotate-root process reaps its own socket, so a
+    // fresh rotate-master finds no live reader and reaches the federation
+    // preflight; without this release the same-process reader stays live and
+    // rotateMaster's exclusive drain times out on it instead of refusing on the
+    // journal. (Same pattern as master-rotation-barrier.test.ts / custody-fixture.)
+    await issuer.masterWriteBarrier?.release();
 
     const { rotateMaster } = await import("../../src/core/master-rotation.js");
     await expect(

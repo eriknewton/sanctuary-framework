@@ -65,10 +65,15 @@
  * Coverage can only grow by registering recipes; drift can never corrupt.
  */
 
-import { readFile, writeFile } from "node:fs/promises";
+import { access } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import type { StorageBackend } from "../storage/interface.js";
+import {
+  withExclusiveMasterRotationBarrier,
+  type CrossProcessLockLease,
+  type MasterWriteBarrierOptions,
+} from "../storage/cross-process-lock.js";
 import {
   hasInterruptedExitImport,
   EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
@@ -82,7 +87,7 @@ import {
 } from "./encryption.js";
 import { deriveNamespaceKey, derivePurposeKey } from "./key-derivation.js";
 import { generateRandomKey } from "./random.js";
-import { hmacSha256 } from "./hashing.js";
+import { hashToString, hmacSha256 } from "./hashing.js";
 import {
   toBase64url,
   fromBase64url,
@@ -106,7 +111,10 @@ import {
   STAGED_CUSTODY_ENVELOPE_KEY,
   STAGED_CUSTODY_SENTINEL_KEY,
   CUSTODY_FLOOR_WRAPS,
+  CUSTODY_WRITE_LOCK_NAMESPACE,
+  MASTER_ROTATION_BARRIER_NAME,
   envelopeEpochOf,
+  withCustodyWriteLock,
 } from "./master-custody.js";
 import { canonicalJson } from "../audit/chain.js";
 import {
@@ -145,6 +153,23 @@ export class RotationPreflightError extends Error {
   }
 }
 
+async function runtimeMarkerExists(fortressPath: string | undefined): Promise<boolean> {
+  if (fortressPath === undefined) return false;
+  try {
+    await access(join(fortressPath, "runtime.json"));
+    return true;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return false;
+    }
+    throw error;
+  }
+}
+
 export class RotationResumeError extends Error {
   constructor(message: string) {
     super(message);
@@ -156,8 +181,135 @@ export class RotationResumeError extends Error {
 
 const JOURNAL_MAC_DOMAIN = "sanctuary.custody-rotation-journal.v1\n";
 const JOURNAL_MAC_PURPOSE = "custody-rotation-journal-mac";
+export const PENDING_RECOVERY_KEY = "rotation-recovery-pending";
+const PENDING_RECOVERY_MAC_DOMAIN = "sanctuary.custody-rotation-recovery-pending.v1\n";
+const PENDING_RECOVERY_MAC_PURPOSE = "custody-rotation-recovery-pending-mac";
 
 export type RotationPhase = "converting" | "finalizing";
+
+/**
+ * Non-secret durable authority needed to recover a recovery-key escrow after
+ * the rotation journal's point of no return. The identifiers are authenticated
+ * by the journal MAC; the platform adapter must still prove they are the
+ * deterministic services for this fortress and rotation before adopting them.
+ */
+export interface RotationRecoveryEscrowAuthority {
+  kind: "os-keyring";
+  canonical_service: string;
+  staging_service: string;
+}
+
+export interface RotationRecoveryEscrowMutation {
+  captured: true;
+  authority: RotationRecoveryEscrowAuthority;
+  commit(): Promise<void>;
+  rollback(): Promise<void>;
+}
+
+export interface RotationRecoveryFileAuthority {
+  kind: "recovery-file";
+  path: string;
+  parent_dev: string;
+  parent_ino: string;
+  file_dev: string | null;
+  file_ino: string | null;
+}
+
+export type RotationPendingRecoveryAuthority =
+  | RotationRecoveryEscrowAuthority
+  | RotationRecoveryFileAuthority;
+
+export interface RotationPendingRecoveryData {
+  v: 1;
+  rotation_id: string;
+  created_at: string;
+  staged_envelope_sha256: string;
+  authorities: RotationPendingRecoveryAuthority[];
+}
+
+function pendingRecoveryMac(
+  data: RotationPendingRecoveryData,
+  oldMaster: Uint8Array,
+): string {
+  const macKey = derivePurposeKey(oldMaster, PENDING_RECOVERY_MAC_PURPOSE);
+  const mac = hmacSha256(
+    macKey,
+    stringToBytes(PENDING_RECOVERY_MAC_DOMAIN + canonicalJson(data)),
+  );
+  macKey.fill(0);
+  return toBase64url(mac);
+}
+
+async function writePendingRecovery(
+  storage: StorageBackend,
+  data: RotationPendingRecoveryData,
+  oldMaster: Uint8Array,
+): Promise<void> {
+  await storage.write(
+    "_meta",
+    PENDING_RECOVERY_KEY,
+    stringToBytes(JSON.stringify({ data, mac: pendingRecoveryMac(data, oldMaster) })),
+  );
+}
+
+function validPendingAuthority(value: unknown): value is RotationPendingRecoveryAuthority {
+  if (value === null || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.kind === "os-keyring") {
+    return typeof candidate.canonical_service === "string"
+      && candidate.canonical_service.length > 0
+      && typeof candidate.staging_service === "string"
+      && candidate.staging_service.length > 0;
+  }
+  return candidate.kind === "recovery-file"
+    && typeof candidate.path === "string" && candidate.path.startsWith("/")
+    && typeof candidate.parent_dev === "string" && /^\d+$/.test(candidate.parent_dev)
+    && typeof candidate.parent_ino === "string" && /^\d+$/.test(candidate.parent_ino)
+    && (candidate.file_dev === null || typeof candidate.file_dev === "string")
+    && (candidate.file_ino === null || typeof candidate.file_ino === "string")
+    && ((candidate.file_dev === null) === (candidate.file_ino === null))
+    && (candidate.file_dev === null || /^\d+$/.test(candidate.file_dev))
+    && (candidate.file_ino === null || /^\d+$/.test(candidate.file_ino));
+}
+
+async function readPendingRecovery(
+  storage: StorageBackend,
+  oldMaster: Uint8Array,
+): Promise<RotationPendingRecoveryData | null> {
+  const raw = await storage.read("_meta", PENDING_RECOVERY_KEY);
+  if (!raw) return null;
+  let parsed: { data?: RotationPendingRecoveryData; mac?: string };
+  try {
+    parsed = JSON.parse(bytesToString(raw));
+  } catch {
+    throw new RotationPreflightError(
+      "the pending recovery-escrow record is malformed; restore _meta from backup",
+    );
+  }
+  const data = parsed.data;
+  if (
+    !data || data.v !== 1 || !/^[A-Za-z0-9_-]{16}$/.test(data.rotation_id)
+    || typeof data.created_at !== "string"
+    || !/^[A-Za-z0-9_-]{43}$/.test(data.staged_envelope_sha256)
+    || !Array.isArray(data.authorities) || data.authorities.length > 2
+    || !data.authorities.every(validPendingAuthority)
+    || new Set(data.authorities.map((authority) =>
+      authority.kind === "os-keyring"
+        ? `keyring:${authority.staging_service}`
+        : `file:${authority.path}`,
+    )).size !== data.authorities.length
+    || typeof parsed.mac !== "string"
+    || !constantTimeEqual(
+      stringToBytes(parsed.mac),
+      stringToBytes(pendingRecoveryMac(data, oldMaster)),
+    )
+  ) {
+    throw new RotationPreflightError(
+      "the pending recovery-escrow record failed authentication or shape validation",
+    );
+  }
+  return data;
+}
 
 interface RotationJournalData {
   v: 1;
@@ -168,6 +320,8 @@ interface RotationJournalData {
   /** Envelope/wrap identifiers only — NEVER key material. */
   old_wrap_ids: string[];
   new_wrap_ids: string[];
+  /** Non-secret authority for a staged, crash-adoptable recovery escrow. */
+  recovery_escrow?: RotationRecoveryEscrowAuthority;
 }
 
 function journalMac(data: RotationJournalData, newMaster: Uint8Array): string {
@@ -545,7 +699,8 @@ type MetaKeyClass =
   | "epoch-witness" // anti-rollback witness → finalize re-stamps (advanced)
   | "rollback-freeze" // anti-rollback freeze marker → restamp under new master
   | "federation-guardian-antirollback" // {marker,data,mac} anchor → restamp
-  | "federation-guardian-established"; // dataless MAC sentinel → inline re-derive
+  | "federation-guardian-established" // dataless MAC sentinel → inline re-derive
+  | "rekey-journal-pending"; // interrupted recovery-key rekey → refuse with a remedy
 
 // Duplicated marker/MAC constants (see the recipe-table drift note above —
 // the verify-before-write rule makes drift refuse, never corrupt).
@@ -621,6 +776,7 @@ function classifyMetaKey(key: string): MetaKeyClass | null {
     case CUSTODY_SENTINEL_KEY:
       return "custody";
     case ROTATION_JOURNAL_KEY:
+    case PENDING_RECOVERY_KEY:
     case STAGED_CUSTODY_ENVELOPE_KEY:
     case STAGED_CUSTODY_SENTINEL_KEY:
       return "rotation";
@@ -642,6 +798,13 @@ function classifyMetaKey(key: string): MetaKeyClass | null {
       return "federation-guardian-antirollback";
     case FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_META_KEY:
       return "federation-guardian-established";
+    // Must match REKEY_JOURNAL_KEY in server/src/cli/reset-passphrase.ts: the
+    // authenticated journal a `reset-passphrase --mode recovery-key` writes and
+    // deletes on completion. Its presence means an interrupted rekey left custody
+    // mid-transition; rotation must refuse with a heal remedy, not the opaque
+    // "unrecognized record" abort (S7).
+    case "custody-rekey-journal":
+      return "rekey-journal-pending";
     default:
       return null; // Unknown → preflight aborts (fail closed).
   }
@@ -860,12 +1023,48 @@ export interface RotateMasterOptions {
    */
   captureRecoveryKey: (
     recoveryKey: string,
-    verify: (entered: string) => Promise<boolean>
-  ) => Promise<boolean>;
+    verify: (entered: string) => Promise<boolean>,
+    rotationId: string,
+    registerPendingAuthority: (
+      authority: RotationPendingRecoveryAuthority,
+    ) => Promise<void>,
+  ) => Promise<
+    | boolean
+    | RotationRecoveryEscrowMutation
+    | {
+        captured: true;
+        commit(): Promise<void>;
+        rollback(): Promise<void>;
+      }
+  >;
+  /**
+   * Crash reconciliation for authenticated pre-journal escrow authorities.
+   * The adapter must verify each candidate against the staged envelope before
+   * deleting the exact keyring item or inode it owns.
+   */
+  reconcilePendingRecoveryEscrow?: (
+    pending: Readonly<RotationPendingRecoveryData>,
+    verify: (candidate: string) => Promise<boolean>,
+  ) => Promise<void>;
   /** Test seam: crash injection. Throw inside to simulate a hard kill. */
   failpoint?: (point: string) => void;
   /** Operator-facing progress lines (CLI: stderr). */
   log?: (line: string) => void;
+  /** Test only: observe the real kernel holder and kill it to prove fencing. */
+  __testAfterKernelHolderAcquired?: (pid: number) => void;
+  /** Test only: observe the process-owned lock socket for loss fencing. */
+  __testAfterKernelSocketAcquired?: (path: string) => void;
+  /** Test only: pause after durable Castle-pin publish but before the lease fence. */
+  __testAfterCastlePinPublished?: () => void | Promise<void>;
+  /** Test only: storage-only fixtures may inject an isolated file capability. */
+  __testFortressFiles?: NonNullable<CrossProcessLockLease["stableFortressFiles"]>;
+  /** Test only: observe owned secret buffers for exception-path zeroization. */
+  __testObserveSecretBuffer?: (
+    label: "old-master" | "new-master" | "recovery-key",
+    buffer: Uint8Array,
+  ) => void;
+  /** Test only: observe/control the shared/exclusive rotation barrier. */
+  __testMasterRotationBarrierOptions?: MasterWriteBarrierOptions;
 }
 
 export interface RotationPlanSummary {
@@ -899,6 +1098,9 @@ interface Ctx {
   failpoint: (point: string) => void;
   log: (line: string) => void;
   writerCache: Map<string, RotationWriterMaterial | null>;
+  lease: CrossProcessLockLease;
+  __testAfterCastlePinPublished?: () => void | Promise<void>;
+  __testFortressFiles?: NonNullable<CrossProcessLockLease["stableFortressFiles"]>;
 }
 
 const PIN_FILE = "castle-pinned-privkey.enc";
@@ -918,6 +1120,14 @@ function zeroizeWriterCache(ctx: Ctx): void {
     material?.identityEncryptionKey.fill(0);
   }
   ctx.writerCache.clear();
+}
+
+/** Fence every durable rotation helper/mutation on both sides of its await. */
+async function fenced<T>(ctx: Ctx, mutation: () => Promise<T>): Promise<T> {
+  ctx.lease.assertHeld();
+  const result = await mutation();
+  ctx.lease.assertHeld();
+  return result;
 }
 
 // ── Conversion walkers (all idempotent: new key first, then old) ────
@@ -1006,10 +1216,12 @@ async function convertIdentities(ctx: Ctx, verifyOnly: boolean): Promise<number>
         encrypted_private_key: encrypt(innerSeed, newKey),
       };
       innerSeed.fill(0);
-      await ctx.storage.write(
-        "_identities",
-        key,
-        stringToBytes(encryptToJson(rotated, newKey))
+      await fenced(ctx, () =>
+        ctx.storage.write(
+          "_identities",
+          key,
+          stringToBytes(encryptToJson(rotated, newKey)),
+        ),
       );
       converted++;
       ctx.failpoint(`converted:_identities/${key}`);
@@ -1055,7 +1267,7 @@ async function convertStateNamespace(
         );
       }
       if (result.status === "converted") {
-        await ctx.storage.write(namespace, key, result.bytes);
+        await fenced(ctx, () => ctx.storage.write(namespace, key, result.bytes));
         converted++;
         ctx.failpoint(`converted:${namespace}/${key}`);
       }
@@ -1134,10 +1346,12 @@ async function convertPurposeNamespace(
       try {
         if (verifyOnly) continue;
         const next = encrypt(plaintext, newKeys[matched.index]!, matched.aad);
-        await ctx.storage.write(
-          namespace,
-          key,
-          stringToBytes(JSON.stringify(next))
+        await fenced(ctx, () =>
+          ctx.storage.write(
+            namespace,
+            key,
+            stringToBytes(JSON.stringify(next)),
+          ),
         );
         converted++;
         ctx.failpoint(`converted:${namespace}/${key}`);
@@ -1174,6 +1388,19 @@ async function convertMeta(ctx: Ctx, verifyOnly: boolean): Promise<number> {
       throw new RotationPreflightError(
         `_meta/${key} is not a record this rotation engine recognizes; ` +
           "refusing to rotate around it"
+      );
+    }
+    if (cls === "rekey-journal-pending") {
+      // S7: an interrupted `reset-passphrase --mode recovery-key` left its
+      // authenticated journal, so custody is mid-transition. Rotating around it
+      // is unsafe; name the exact heal step (re-running the rekey completes and
+      // deletes the journal) instead of the generic unrecognized-record abort.
+      throw new RotationPreflightError(
+        `_meta/${key}: an interrupted recovery-key passphrase rekey left its ` +
+          "custody journal in place, so master rotation is refused until it heals. " +
+          "Re-run `sanctuary reset-passphrase --mode recovery-key --fortress <path>`; " +
+          "it resumes and clears the journal without changing anything else, then " +
+          "rotation can proceed."
       );
     }
     if (
@@ -1254,7 +1481,7 @@ async function convertMeta(ctx: Ctx, verifyOnly: boolean): Promise<number> {
     }
     if (next === "leave" || next === "already-new") continue;
     if (!verifyOnly && next instanceof Uint8Array) {
-      await ctx.storage.write("_meta", key, next);
+      await fenced(ctx, () => ctx.storage.write("_meta", key, next));
       converted++;
       ctx.failpoint(`converted:_meta/${key}`);
     }
@@ -1286,12 +1513,13 @@ async function convertSdwMeta(ctx: Ctx, verifyOnly: boolean): Promise<number> {
     }
     let outcome: "absent" | "already-new" | "converted";
     try {
-      outcome = await restampSdwOwnerPinForRotation({
+      const restamp = () => restampSdwOwnerPinForRotation({
         storage: ctx.storage,
         oldMaster: ctx.oldMaster,
         newMaster: ctx.newMaster,
         verifyOnly,
       });
+      outcome = verifyOnly ? await restamp() : await fenced(ctx, restamp);
     } catch (err) {
       throw new RotationPreflightError(
         `_sdw_meta/${SDW_OWNER_PIN_KEY}: ${err instanceof Error ? err.message : String(err)}`,
@@ -1361,7 +1589,9 @@ async function convertAuditAnchors(ctx: Ctx, verifyOnly: boolean): Promise<numbe
       });
       if (next === "leave" || next === "already-new") continue;
       if (!verifyOnly) {
-        await ctx.storage.write("_audit_checkpoints", key, next);
+        await fenced(ctx, () =>
+          ctx.storage.write("_audit_checkpoints", key, next),
+        );
         converted++;
         ctx.failpoint(`converted:_audit_checkpoints/${key}`);
       }
@@ -1448,7 +1678,7 @@ async function convertAuditEpochs(ctx: Ctx): Promise<void> {
     const retiringAuditKey = derivePurposeKey(ctx.oldMaster, "audit-log");
     const rotatedAt = new Date().toISOString();
     try {
-      await writeAuditEpochRecord(ctx.storage, newEpochKeys, [
+      await fenced(ctx, () => writeAuditEpochRecord(ctx.storage, newEpochKeys, [
         ...prior.map((e) => ({
           rotation_id: e.entry.rotation_id,
           rotated_at: e.entry.rotated_at,
@@ -1459,7 +1689,7 @@ async function convertAuditEpochs(ctx: Ctx): Promise<void> {
           rotated_at: rotatedAt,
           key: retiringAuditKey,
         },
-      ]);
+      ]));
     } finally {
       retiringAuditKey.fill(0);
       for (const e of prior) e.key.fill(0);
@@ -1479,14 +1709,15 @@ async function convertCastlePin(
   verifyOnly: boolean
 ): Promise<"ok" | "absent" | "mismatch"> {
   if (!ctx.fortressPath) return "absent";
-  const pinPath = join(ctx.fortressPath, PIN_FILE);
-  let raw: string;
-  try {
-    raw = await readFile(pinPath, "utf-8");
-  } catch {
-    return "absent";
+  const files = ctx.lease.stableFortressFiles ?? ctx.__testFortressFiles;
+  if (!files) {
+    throw new RotationPreflightError(
+      "Castle pin rotation requires an inode-bound fortress file capability",
+    );
   }
-  const payload = parseEncryptedPayload(stringToBytes(raw));
+  const raw = await files.read(PIN_FILE);
+  if (raw === null) return "absent";
+  const payload = parseEncryptedPayload(raw);
   if (!payload) return "mismatch";
   try {
     decrypt(payload, ctx.newMaster).fill(0);
@@ -1505,8 +1736,17 @@ async function convertCastlePin(
   }
   try {
     if (verifyOnly) return "ok";
-    await writeFile(pinPath, JSON.stringify(encrypt(seed, ctx.newMaster)), {
-      mode: 0o600,
+    await fenced(ctx, async () => {
+      await files.write(
+        PIN_FILE,
+        stringToBytes(JSON.stringify(encrypt(seed, ctx.newMaster))),
+        0o600,
+      );
+      // Atomic publish is already durable here. A crash or holder loss at this
+      // boundary leaves either the old valid pin or the new valid pin; resume
+      // authenticates both possibilities and converges forward.
+      ctx.failpoint("castle-pin-published");
+      await ctx.__testAfterCastlePinPublished?.();
     });
     ctx.failpoint("converted:castle-pin");
     return "ok";
@@ -1620,11 +1860,11 @@ async function readNewEpochCount(ctx: Ctx): Promise<number> {
 
 async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
   if (journal.phase !== "finalizing") {
-    await writeJournal(
+    await fenced(ctx, () => writeJournal(
       ctx.storage,
       { ...journal, phase: "finalizing", updated_at: new Date().toISOString() },
-      ctx.newMaster
-    );
+      ctx.newMaster,
+    ));
     ctx.failpoint("journal-finalizing-written");
   }
 
@@ -1646,14 +1886,18 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
   });
   if (staged) {
     verifyEnvelopeMac(staged, ctx.newMaster);
-    await writeCustodyEnvelope(
+    await fenced(ctx, () => writeCustodyEnvelope(
       ctx.storage,
       { ...staged, epoch: newEpoch, epoch_id: ctx.rotationId },
-      ctx.newMaster
-    );
+      ctx.newMaster,
+    ));
     ctx.failpoint("envelope-promoted");
-    await ctx.storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY);
-    await ctx.storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY);
+    await fenced(ctx, () =>
+      ctx.storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY),
+    );
+    await fenced(ctx, () =>
+      ctx.storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY),
+    );
     ctx.failpoint("staged-deleted");
   } else {
     // Late-finalize resume: the live envelope is already promoted but may
@@ -1661,18 +1905,18 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
     // promotion and witness-write still lands a consistent epoch.
     const live = await readCustodyEnvelope(ctx.storage);
     if (live && envelopeEpochOf(live) < newEpoch) {
-      await writeCustodyEnvelope(
+      await fenced(ctx, () => writeCustodyEnvelope(
         ctx.storage,
         { ...live, epoch: newEpoch, epoch_id: ctx.rotationId },
-        ctx.newMaster
-      );
+        ctx.newMaster,
+      ));
     }
   }
 
   // Advance the monotonic epoch witness to the new epoch (force: the rotation
   // is the authority on its own epoch; a concurrent stale witness must not
   // block a legitimate rotation from raising the floor).
-  await writeEpochWitness(
+  await fenced(ctx, () => writeEpochWitness(
     ctx.storage,
     ctx.newMaster,
     {
@@ -1680,14 +1924,14 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
       epoch_id: ctx.rotationId,
       witnessed_at: new Date().toISOString(),
     },
-    { force: true }
-  );
+    { force: true },
+  ));
   ctx.failpoint("epoch-witness-advanced");
 
   // Legacy markers would re-derive the OLD master — the dual-path divergence
   // generator this lane exists to kill. Delete them (audited below).
-  await ctx.storage.delete("_meta", "key-params");
-  await ctx.storage.delete("_meta", "recovery-key-hash");
+  await fenced(ctx, () => ctx.storage.delete("_meta", "key-params"));
+  await fenced(ctx, () => ctx.storage.delete("_meta", "recovery-key-hash"));
   ctx.failpoint("legacy-markers-deleted");
 
   // Audit the rotation under the NEW master (old entries decrypt via the
@@ -1701,7 +1945,7 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
   const auditLog = new AuditLog(ctx.storage, ctx.newMaster, {
     signingDetectionMode: "non-fortress",
   });
-  await auditLog.appendCritical({
+  await fenced(ctx, () => auditLog.appendCritical({
     layer: "l1",
     operation: "custody_master_rotated",
     identity_id: ctx.fortressId,
@@ -1712,11 +1956,12 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
       new_wrap_ids: journal.new_wrap_ids,
       legacy_markers_deleted: true,
     },
-  });
-  await auditLog.flush();
+  }));
+  await fenced(ctx, () => auditLog.flush());
   ctx.failpoint("rotation-audited");
 
-  await ctx.storage.delete("_meta", ROTATION_JOURNAL_KEY);
+  await fenced(ctx, () => ctx.storage.delete("_meta", PENDING_RECOVERY_KEY));
+  await fenced(ctx, () => ctx.storage.delete("_meta", ROTATION_JOURNAL_KEY));
 }
 
 // ── Public entry points ─────────────────────────────────────────────
@@ -1724,9 +1969,47 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
 export async function rotateMaster(
   opts: RotateMasterOptions
 ): Promise<RotateMasterResult> {
+  return withExclusiveMasterRotationBarrier(
+    opts.storage,
+    CUSTODY_WRITE_LOCK_NAMESPACE,
+    MASTER_ROTATION_BARRIER_NAME,
+    () => withCustodyWriteLock(
+      opts.storage,
+      (lease) => rotateMasterLocked(opts, lease),
+      {
+        metadata: { owner: "rotate-master" },
+        ...(opts.__testAfterKernelHolderAcquired !== undefined
+          ? {
+              __testAfterKernelHolderAcquired:
+                opts.__testAfterKernelHolderAcquired,
+            }
+          : {}),
+        ...(opts.__testAfterKernelSocketAcquired !== undefined
+          ? { __testAfterKernelSocketAcquired: opts.__testAfterKernelSocketAcquired }
+          : {}),
+      },
+    ),
+    opts.__testMasterRotationBarrierOptions,
+  );
+}
+
+async function rotateMasterLocked(
+  opts: RotateMasterOptions,
+  lease: CrossProcessLockLease,
+): Promise<RotateMasterResult> {
   const storage = opts.storage;
   const log = opts.log ?? (() => {});
   const failpoint = opts.failpoint ?? (() => {});
+
+  // Final runtime recheck under BOTH the exclusive master-session barrier and
+  // the custody mutation lock. The CLI's earlier diagnostic check is only an
+  // optimization; this is the authority that closes a process-start race.
+  if (await runtimeMarkerExists(opts.fortressPath)) {
+    throw new RotationPreflightError(
+      "runtime.json exists, indicating a Sanctuary writer may still be running; " +
+        "stop the dashboard and wrapped agents before rotating",
+    );
+  }
 
   if (await storage.read("_meta", ROTATION_JOURNAL_KEY)) {
     throw new RotationPreflightError(
@@ -1769,20 +2052,6 @@ export async function rotateMaster(
     );
   }
 
-  // Clean orphaned staged artifacts from a pre-journal crash (the fortress
-  // is fully old-keyed; the previously disclosed recovery key never became
-  // active). Loud, so a stale disclosure is never silently trusted.
-  if (await storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY)) {
-    log(
-      "Note: removing a stale staged custody envelope from an earlier rotation\n" +
-        "attempt that never began converting. Any recovery key disclosed during\n" +
-        "that attempt is DEAD and unlocks nothing — discard it; this run will\n" +
-        "mint and verify a fresh one."
-    );
-    await storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY);
-    await storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY);
-  }
-
   // Unlock the OLD master. Envelope-format custody is required: rotation of
   // a pure-legacy fortress goes through `sanctuary wrap` migration first.
   const oldEnvelope = await readCustodyEnvelope(storage);
@@ -1795,9 +2064,75 @@ export async function rotateMaster(
   const oldMaster = await unwrapMaster(oldEnvelope, {
     passphrase: opts.passphrase,
   });
-  verifyEnvelopeMac(oldEnvelope, oldMaster);
+  try {
+    opts.__testObserveSecretBuffer?.("old-master", oldMaster);
+    verifyEnvelopeMac(oldEnvelope, oldMaster);
+
+    // Reconcile an interrupted PRE-journal recovery handoff before minting a
+    // new rotation identity. The pending record is authenticated by the still-
+    // live old master and binds every external authority to the exact staged
+    // envelope bytes. External cleanup is delegated to the platform adapter,
+    // which must verify the candidate and delete only its recorded inode/item.
+    const pendingRecovery = await readPendingRecovery(storage, oldMaster);
+    const abandonedStagedEnvelope = await readCustodyEnvelope(storage, {
+      envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
+    });
+    if (pendingRecovery) {
+      if (!abandonedStagedEnvelope) {
+        throw new RotationPreflightError(
+          "an authenticated pending recovery handoff exists but its staged custody envelope is missing; refusing to guess which external recovery material is safe to remove",
+        );
+      }
+      const stagedBytes = await storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY);
+      const stagedDigestMatches = stagedBytes !== null
+        && hashToString(stagedBytes) === pendingRecovery.staged_envelope_sha256;
+      if (!stagedDigestMatches && pendingRecovery.authorities.length > 0) {
+        throw new RotationPreflightError(
+          "the pending recovery handoff does not bind the current staged custody envelope",
+        );
+      }
+      if (pendingRecovery.authorities.length > 0) {
+        if (!opts.reconcilePendingRecoveryEscrow) {
+          throw new RotationPreflightError(
+            "a prior pre-journal recovery handoff needs platform reconciliation; retry through the rotate-master CLI with the same fortress and --recovery-out path",
+          );
+        }
+        await opts.reconcilePendingRecoveryEscrow(
+          pendingRecovery,
+          (candidate) => recoveryCandidateAuthenticatesEnvelope(
+            abandonedStagedEnvelope,
+            candidate,
+          ),
+        );
+      }
+      lease.assertHeld();
+      await storage.delete("_meta", PENDING_RECOVERY_KEY);
+      lease.assertHeld();
+      await storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY);
+      lease.assertHeld();
+      await storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY);
+      lease.assertHeld();
+      log(
+        `Reconciled interrupted pre-journal recovery handoff ${pendingRecovery.rotation_id}; ` +
+          "its new recovery key never became active.",
+      );
+    } else if (abandonedStagedEnvelope) {
+      // Compatibility cleanup for v4 and for a crash after staging but before
+      // the first pending-record write: no external handoff was authorized.
+      log(
+        "Note: removing a staged custody envelope from an attempt that ended " +
+          "before recovery escrow was authorized; its recovery key is inactive.",
+      );
+      lease.assertHeld();
+      await storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY);
+      lease.assertHeld();
+      await storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY);
+      lease.assertHeld();
+    }
 
   const newMaster = generateRandomKey();
+  try {
+  opts.__testObserveSecretBuffer?.("new-master", newMaster);
   // 12 = 96 random bits taken from the 32-byte CSPRNG draw, chosen because 12
   // bytes is exactly 16 base64url characters with no padding. A rotation id is
   // an opaque log/journal label, not key material.
@@ -1813,8 +2148,24 @@ export async function rotateMaster(
     failpoint,
     log,
     writerCache: new Map(),
+    lease,
+    ...(opts.__testAfterCastlePinPublished
+      ? { __testAfterCastlePinPublished: opts.__testAfterCastlePinPublished }
+      : {}),
+    ...(opts.__testFortressFiles ? { __testFortressFiles: opts.__testFortressFiles } : {}),
   };
 
+  let recoveryCapture:
+    | {
+        commit(): Promise<void>;
+        rollback(): Promise<void>;
+        authority?: RotationRecoveryEscrowAuthority;
+      }
+    | undefined;
+  let journalDurable = false;
+  let rotationFailure: unknown;
+  const recoveryCleanupFailures: unknown[] = [];
+  let rotationResult: RotateMasterResult | undefined;
   try {
     // ── Preflight: verify EVERYTHING before mutating ANYTHING. ──
     log("Preflight: verifying every namespace converts cleanly...");
@@ -1878,22 +2229,33 @@ export async function rotateMaster(
 
     // ── Stage the new custody envelope (no data mutated yet). ──
     const wraps = [
-      await wrapMasterWithPassphrase(newMaster, opts.passphrase, {
-        verified: true,
-      }),
+      await fenced(ctx, () =>
+        wrapMasterWithPassphrase(newMaster, opts.passphrase, {
+          verified: true,
+        }),
+      ),
     ];
     const recoveryKeyBytes = generateRandomKey();
-    const recoveryKey = toBase64url(recoveryKeyBytes);
-    wraps.push(
-      wrapMasterWithRecoveryKey(newMaster, recoveryKeyBytes, { verified: false })
-    );
-    recoveryKeyBytes.fill(0);
+    let recoveryKey: string;
+    try {
+      opts.__testObserveSecretBuffer?.("recovery-key", recoveryKeyBytes);
+      recoveryKey = toBase64url(recoveryKeyBytes);
+      ctx.lease.assertHeld();
+      wraps.push(
+        wrapMasterWithRecoveryKey(newMaster, recoveryKeyBytes, { verified: false })
+      );
+      ctx.lease.assertHeld();
+    } finally {
+      recoveryKeyBytes.fill(0);
+    }
     if (opts.keychainKey) {
+      ctx.lease.assertHeld();
       wraps.push(
         wrapMasterWithKeychainKey(newMaster, opts.keychainKey, { verified: true })
       );
+      ctx.lease.assertHeld();
     }
-    let stagedEnvelope = await writeCustodyEnvelope(
+    let stagedEnvelope = await fenced(ctx, () => writeCustodyEnvelope(
       storage,
       {
         v: 1,
@@ -1905,30 +2267,122 @@ export async function rotateMaster(
       {
         envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
         sentinelKey: STAGED_CUSTODY_SENTINEL_KEY,
-      }
-    );
+      },
+    ));
     failpoint("staged-envelope-written");
 
+    let pendingRecovery: RotationPendingRecoveryData = {
+      v: 1,
+      rotation_id: rotationId,
+      created_at: new Date().toISOString(),
+      staged_envelope_sha256: hashToString(
+        stringToBytes(JSON.stringify(stagedEnvelope)),
+      ),
+      authorities: [],
+    };
+    await fenced(ctx, () => writePendingRecovery(storage, pendingRecovery, oldMaster));
+    failpoint("pending-recovery-written");
+    let recoveryReentryVerified = false;
+
+    const registerPendingAuthority = async (
+      authority: RotationPendingRecoveryAuthority,
+    ): Promise<void> => {
+      if (!recoveryReentryVerified) {
+        throw new RotationPreflightError(
+          "recovery escrow attempted publication before the staged recovery key was re-entry verified",
+        );
+      }
+      if (!validPendingAuthority(authority)) {
+        throw new RotationPreflightError("recovery escrow supplied an invalid pending authority");
+      }
+      if (
+        authority.kind === "os-keyring"
+          ? !authority.staging_service.endsWith(`:rotation:${rotationId}`)
+          : !authority.path.startsWith("/")
+            || !/^\d+$/.test(authority.parent_dev)
+            || !/^\d+$/.test(authority.parent_ino)
+            || (authority.file_dev !== null && !/^\d+$/.test(authority.file_dev))
+            || (authority.file_ino !== null && !/^\d+$/.test(authority.file_ino))
+      ) {
+        throw new RotationPreflightError(
+          "recovery escrow authority is not bound to this rotation and output parent",
+        );
+      }
+      const existingIndex = pendingRecovery.authorities.findIndex((existing) => (
+        (existing.kind === "os-keyring" && authority.kind === "os-keyring"
+          && existing.staging_service === authority.staging_service)
+        || (existing.kind === "recovery-file" && authority.kind === "recovery-file"
+          && existing.path === authority.path)
+      ));
+      const authorities = [...pendingRecovery.authorities];
+      if (existingIndex >= 0) {
+        const existing = authorities[existingIndex]!;
+        if (
+          existing.kind !== "recovery-file" || authority.kind !== "recovery-file"
+          || existing.parent_dev !== authority.parent_dev
+          || existing.parent_ino !== authority.parent_ino
+          || existing.file_dev !== null || existing.file_ino !== null
+          || authority.file_dev === null || authority.file_ino === null
+        ) {
+          throw new RotationPreflightError("recovery escrow authority was registered twice");
+        }
+        authorities[existingIndex] = authority;
+      } else {
+        authorities.push(authority);
+      }
+      const next: RotationPendingRecoveryData = {
+        ...pendingRecovery,
+        authorities,
+      };
+      await fenced(ctx, () => writePendingRecovery(storage, next, oldMaster));
+      pendingRecovery = next;
+    };
+
     // ── NEW recovery key: disclose + re-entry verify (#496 rules). ──
-    const captured = await opts.captureRecoveryKey(recoveryKey, async (entered) => {
+    const captureResult = await fenced(ctx, () =>
+      opts.captureRecoveryKey(recoveryKey, async (entered) => {
       try {
-        stagedEnvelope = await verifyRecoveryWrapByReentry(
+        if (recoveryReentryVerified) {
+          return recoveryCandidateAuthenticatesEnvelope(stagedEnvelope, entered);
+        }
+        stagedEnvelope = await fenced(ctx, () => verifyRecoveryWrapByReentry(
           storage,
           stagedEnvelope,
           entered,
           {
             envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
             sentinelKey: STAGED_CUSTODY_SENTINEL_KEY,
-          }
+          },
+        ));
+        const reboundBytes = await fenced(ctx, () =>
+          storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY),
         );
+        if (!reboundBytes) {
+          throw new Error("verified staged custody envelope disappeared before recovery binding");
+        }
+        pendingRecovery = {
+          ...pendingRecovery,
+          staged_envelope_sha256: hashToString(reboundBytes),
+        };
+        await fenced(ctx, () => writePendingRecovery(storage, pendingRecovery, oldMaster));
+        recoveryReentryVerified = true;
         return true;
       } catch {
         return false;
       }
-    });
+      }, rotationId, registerPendingAuthority),
+    );
+    const captured = typeof captureResult === "boolean"
+      ? captureResult
+      : captureResult.captured;
+    if (typeof captureResult !== "boolean") recoveryCapture = captureResult;
     if (!captured) {
-      await storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY);
-      await storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY);
+      await fenced(ctx, () =>
+        storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY),
+      );
+      await fenced(ctx, () =>
+        storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY),
+      );
       throw new RotationPreflightError(
         "recovery-key capture was not completed; rotation requires a " +
           "verified recovery wrap before any data is touched"
@@ -1937,8 +2391,12 @@ export async function rotateMaster(
 
     // Two-factor floor on the ROTATED fortress, enforced before conversion.
     if (countVerifiedWraps(stagedEnvelope) < CUSTODY_FLOOR_WRAPS) {
-      await storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY);
-      await storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY);
+      await fenced(ctx, () =>
+        storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY),
+      );
+      await fenced(ctx, () =>
+        storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY),
+      );
       throw new RotationPreflightError(
         `the rotated envelope would hold fewer than ${CUSTODY_FLOOR_WRAPS} verified ` +
           "factors; rotation must never weaken custody below the floor"
@@ -1952,7 +2410,7 @@ export async function rotateMaster(
     const oldAudit = new AuditLog(storage, oldMaster, {
       signingDetectionMode: "non-fortress",
     });
-    await oldAudit.appendCritical({
+    await fenced(ctx, () => oldAudit.appendCritical({
       layer: "l1",
       operation: "custody_rotation_started",
       identity_id: opts.fortressId,
@@ -1963,10 +2421,18 @@ export async function rotateMaster(
         new_wrap_ids: stagedEnvelope.wraps.map((w) => w.id),
         ...(warnings.length > 0 ? { warnings } : {}),
       },
-    });
-    await oldAudit.flush();
+    }));
+    await fenced(ctx, () => oldAudit.flush());
+    // Deterministic process-death boundary: pending recovery authority and its
+    // exact staged envelope are durable, while the conversion journal is not.
+    // A real SIGKILL here must be reconciled on the next rotation attempt.
+    failpoint("recovery-escrow-captured-pre-journal");
 
     // ── Point of no return: journal on, boots blocked, convert. ──
+    const recoveryEscrowAuthority = pendingRecovery.authorities.find(
+      (authority): authority is RotationRecoveryEscrowAuthority =>
+        authority.kind === "os-keyring",
+    );
     const journal: RotationJournalData = {
       v: 1,
       rotation_id: rotationId,
@@ -1975,6 +2441,9 @@ export async function rotateMaster(
       updated_at: new Date().toISOString(),
       old_wrap_ids: oldEnvelope.wraps.map((w) => w.id),
       new_wrap_ids: stagedEnvelope.wraps.map((w) => w.id),
+      ...(recoveryEscrowAuthority
+        ? { recovery_escrow: recoveryEscrowAuthority }
+        : {}),
     };
     // HIGH-1 (Codex gate, 2026-08-22): the admission lock now spans the
     // re-check, the journal publish, AND the whole conversion/finalize
@@ -1984,7 +2453,8 @@ export async function rotateMaster(
     // did (see importExitBundle's matching comment, exit/bundle.ts): a
     // concurrent open must wait this lock's bound and refuse, never
     // observe or act on a rotation that is still in progress.
-    return await withExitAdmissionLock(storage, "rotate", async () => {
+    ctx.lease.assertHeld();
+    rotationResult = await withExitAdmissionLock(storage, "rotate", async () => {
       if (await hasInterruptedExitImport(storage)) {
         throw new RotationPreflightError(
           // F1/round-3: must match EXIT_RECOVERY_VERB, imported above,
@@ -1997,17 +2467,31 @@ export async function rotateMaster(
             "path>` to recover, then retry the rotation"
         );
       }
-      await writeJournal(storage, journal, newMaster);
+      await fenced(ctx, () => writeJournal(storage, journal, newMaster));
+      // From this point every failure must preserve durable escrow authority:
+      // the fortress can only resume forward and the new recovery key may be
+      // the operator's sole durable off-host factor.
+      journalDurable = true;
       failpoint("journal-converting-written");
 
       log("Converting: re-encrypting fortress data under the new master...");
-      const convertResult = await walkFortress(ctx, false);
-      await convertAuditEpochs(ctx);
-      await convertCastlePin(ctx, false);
+      const convertResult = await fenced(ctx, () => walkFortress(ctx, false));
+      await fenced(ctx, () => convertAuditEpochs(ctx));
+      await fenced(ctx, () => convertCastlePin(ctx, false));
       failpoint("convert-complete");
 
+      // Promote machine escrow only after conversion has durably reached its
+      // commit boundary while the rotation journal still forces every reader to
+      // resume forward. A failure here leaves the journal and old canonical
+      // escrow intact; a hard crash cannot expose the staged key as canonical
+      // before the fortress has committed to the new master.
+      await fenced(ctx, async () => {
+        await recoveryCapture?.commit();
+      });
+      failpoint("recovery-key-escrow-committed");
+
       log("Finalizing: promoting the new custody envelope...");
-      await finalize(ctx, journal);
+      await fenced(ctx, () => finalize(ctx, journal));
 
       return {
         rotation_id: rotationId,
@@ -2016,10 +2500,42 @@ export async function rotateMaster(
         converted_entries: convertResult.converted,
       };
     });
+    ctx.lease.assertHeld();
+  } catch (error) {
+    rotationFailure = error;
   } finally {
+    if (!journalDurable) {
+      const cleanup = async (operation: () => Promise<unknown>): Promise<void> => {
+        try {
+          await operation();
+        } catch (error) {
+          recoveryCleanupFailures.push(error);
+        }
+      };
+      await cleanup(async () => recoveryCapture?.rollback());
+      await cleanup(() => fenced(ctx, () => storage.delete("_meta", PENDING_RECOVERY_KEY)));
+      await cleanup(() => fenced(ctx, () => storage.delete("_meta", STAGED_CUSTODY_ENVELOPE_KEY)));
+      await cleanup(() => fenced(ctx, () => storage.delete("_meta", STAGED_CUSTODY_SENTINEL_KEY)));
+    }
     zeroizeWriterCache(ctx);
-    oldMaster.fill(0);
+  }
+  if (recoveryCleanupFailures.length > 0) {
+    throw new AggregateError(
+      [
+        ...(rotationFailure === undefined ? [] : [rotationFailure]),
+        ...recoveryCleanupFailures,
+      ],
+      "master rotation failed and pre-journal recovery state did not roll back cleanly",
+      { cause: rotationFailure ?? recoveryCleanupFailures[0] },
+    );
+  }
+  if (rotationFailure !== undefined) throw rotationFailure;
+  return rotationResult!;
+  } finally {
     newMaster.fill(0);
+  }
+  } finally {
+    oldMaster.fill(0);
   }
 }
 
@@ -2030,6 +2546,30 @@ export interface ResumeRotationOptions {
   passphrase: string;
   failpoint?: (point: string) => void;
   log?: (line: string) => void;
+  /**
+   * Re-adopt a durable recovery escrow named by the authenticated journal.
+   * Required only when the interrupted rotation staged an OS-keyring escrow.
+   * The adapter must read the candidate back and call `verify` before it may
+   * return a mutation that promotes the candidate idempotently.
+   */
+  adoptRecoveryEscrow?: (
+    authority: RotationRecoveryEscrowAuthority,
+    verify: (candidate: string) => Promise<boolean>,
+    rotationId: string,
+  ) => Promise<{ commit(): Promise<void> }>;
+  /** Test only: observe the real kernel holder and kill it to prove fencing. */
+  __testAfterKernelHolderAcquired?: (pid: number) => void;
+  /** Test only: pause after durable Castle-pin publish but before the lease fence. */
+  __testAfterCastlePinPublished?: () => void | Promise<void>;
+  /** Test only: storage-only fixtures may inject an isolated file capability. */
+  __testFortressFiles?: NonNullable<CrossProcessLockLease["stableFortressFiles"]>;
+  /** Test only: observe owned secret buffers for exception-path zeroization. */
+  __testObserveSecretBuffer?: (
+    label: "old-master" | "new-master",
+    buffer: Uint8Array,
+  ) => void;
+  /** Test only: observe/control the shared/exclusive rotation barrier. */
+  __testMasterRotationBarrierOptions?: MasterWriteBarrierOptions;
 }
 
 /**
@@ -2040,8 +2580,77 @@ export interface ResumeRotationOptions {
 export async function resumeRotation(
   opts: ResumeRotationOptions
 ): Promise<RotateMasterResult> {
+  return withExclusiveMasterRotationBarrier(
+    opts.storage,
+    CUSTODY_WRITE_LOCK_NAMESPACE,
+    MASTER_ROTATION_BARRIER_NAME,
+    () => withCustodyWriteLock(
+      opts.storage,
+      (lease) => resumeRotationLocked(opts, lease),
+      {
+        metadata: { owner: "resume-master-rotation" },
+        ...(opts.__testAfterKernelHolderAcquired !== undefined
+          ? {
+              __testAfterKernelHolderAcquired:
+                opts.__testAfterKernelHolderAcquired,
+            }
+          : {}),
+      },
+    ),
+    opts.__testMasterRotationBarrierOptions,
+  );
+}
+
+async function recoveryCandidateAuthenticatesEnvelope(
+  envelope: NonNullable<Awaited<ReturnType<typeof readCustodyEnvelope>>>,
+  candidate: string,
+  expectedMaster?: Uint8Array,
+): Promise<boolean> {
+  let recoveryKeyBytes: Uint8Array | undefined;
+  let candidateMaster: Uint8Array | undefined;
+  try {
+    recoveryKeyBytes = fromBase64url(candidate);
+    if (recoveryKeyBytes.length !== 32) return false;
+    candidateMaster = await unwrapMaster(envelope, {
+      recoveryKey: recoveryKeyBytes,
+    });
+    verifyEnvelopeMac(envelope, candidateMaster);
+    return expectedMaster === undefined
+      ? true
+      : constantTimeEqual(candidateMaster, expectedMaster);
+  } catch {
+    return false;
+  } finally {
+    candidateMaster?.fill(0);
+    recoveryKeyBytes?.fill(0);
+  }
+}
+
+async function recoveryCandidateUnlocksRotationEnvelope(
+  envelope: NonNullable<Awaited<ReturnType<typeof readCustodyEnvelope>>>,
+  newMaster: Uint8Array,
+  candidate: string,
+): Promise<boolean> {
+  return recoveryCandidateAuthenticatesEnvelope(
+    envelope,
+    candidate,
+    newMaster,
+  );
+}
+
+async function resumeRotationLocked(
+  opts: ResumeRotationOptions,
+  lease: CrossProcessLockLease,
+): Promise<RotateMasterResult> {
   const storage = opts.storage;
   const log = opts.log ?? (() => {});
+
+  if (await runtimeMarkerExists(opts.fortressPath)) {
+    throw new RotationResumeError(
+      "runtime.json exists, indicating a Sanctuary writer may still be running; " +
+        "stop the dashboard and wrapped agents before resuming rotation",
+    );
+  }
 
   // N4-ROTATE (coordinator gate, 2026-08-22): same refusal as rotateMaster's
   // preflight - a resume also converts and writes journal-set locations
@@ -2080,30 +2689,64 @@ export async function resumeRotation(
   const newMaster = await unwrapMaster(staged ?? live, {
     passphrase: opts.passphrase,
   });
-  verifyEnvelopeMac(staged ?? live, newMaster);
-  const journal = await readJournal(storage, newMaster);
-  if (!journal) {
-    throw new RotationResumeError("Sanctuary: rotation journal vanished mid-read.");
-  }
-
-  // The OLD master is needed only while converting; the live envelope is
-  // still the old one until finalize promotes the staged copy.
-  let oldMaster: Uint8Array;
-  if (journal.phase === "converting") {
-    if (!staged) {
-      throw new RotationResumeError(
-        "Sanctuary: rotation journal says 'converting' but the staged envelope " +
-          "is missing. Restore _meta from backup before resuming."
-      );
+  try {
+    opts.__testObserveSecretBuffer?.("new-master", newMaster);
+    verifyEnvelopeMac(staged ?? live, newMaster);
+    const journal = await readJournal(storage, newMaster);
+    if (!journal) {
+      throw new RotationResumeError("Sanctuary: rotation journal vanished mid-read.");
     }
-    oldMaster = await unwrapMaster(live, { passphrase: opts.passphrase });
-    verifyEnvelopeMac(live, oldMaster);
-  } else {
-    // finalizing: all data is already under the new master.
-    oldMaster = new Uint8Array(newMaster); // placeholder; never matches old data
-  }
 
-  const ctx: Ctx = {
+    let recoveryEscrow: { commit(): Promise<void> } | undefined;
+    if (journal.recovery_escrow) {
+      if (!opts.adoptRecoveryEscrow) {
+        throw new RotationResumeError(
+          "Sanctuary: this interrupted rotation has a staged OS-keyring " +
+            "recovery escrow, but this caller cannot adopt it. Resume from the " +
+            "Sanctuary CLI on the original host with its OS keyring unlocked.",
+        );
+      }
+      const recoveryEnvelope = staged ?? live;
+      try {
+        recoveryEscrow = await opts.adoptRecoveryEscrow(
+          journal.recovery_escrow,
+          (candidate) => recoveryCandidateUnlocksRotationEnvelope(
+            recoveryEnvelope,
+            newMaster,
+            candidate,
+          ),
+          journal.rotation_id,
+        );
+      } catch (error) {
+        throw new RotationResumeError(
+          "Sanctuary: the staged OS-keyring recovery escrow could not be " +
+            "authenticated and adopted; refusing to resume without a durable " +
+            `new recovery factor (${error instanceof Error ? error.message : String(error)}).`,
+        );
+      }
+    }
+
+    // The OLD master is needed only while converting; the live envelope is
+    // still the old one until finalize promotes the staged copy.
+    let oldMaster: Uint8Array | undefined;
+    try {
+      if (journal.phase === "converting") {
+        if (!staged) {
+          throw new RotationResumeError(
+            "Sanctuary: rotation journal says 'converting' but the staged envelope " +
+              "is missing. Restore _meta from backup before resuming."
+          );
+        }
+        oldMaster = await unwrapMaster(live, { passphrase: opts.passphrase });
+        opts.__testObserveSecretBuffer?.("old-master", oldMaster);
+        verifyEnvelopeMac(live, oldMaster);
+      } else {
+        // finalizing: all data is already under the new master.
+        oldMaster = new Uint8Array(newMaster); // placeholder; never matches old data
+        opts.__testObserveSecretBuffer?.("old-master", oldMaster);
+      }
+
+      const ctx: Ctx = {
     storage,
     ...(opts.fortressPath !== undefined ? { fortressPath: opts.fortressPath } : {}),
     fortressId: opts.fortressId,
@@ -2114,8 +2757,13 @@ export async function resumeRotation(
     failpoint: opts.failpoint ?? (() => {}),
     log,
     writerCache: new Map(),
-  };
-  try {
+    lease,
+    ...(opts.__testAfterCastlePinPublished
+      ? { __testAfterCastlePinPublished: opts.__testAfterCastlePinPublished }
+      : {}),
+    ...(opts.__testFortressFiles ? { __testFortressFiles: opts.__testFortressFiles } : {}),
+      };
+      try {
     // F1 (coordinator gate, 2026-08-22): re-check immediately before
     // resuming conversion, not only the top-of-function preflight above -
     // an exit-import can start and journal between resumeRotation being
@@ -2125,7 +2773,8 @@ export async function resumeRotation(
     // rotateMaster's matching widened lock (a short lock left the
     // conversion writes reachable by a concurrent exit-import's own
     // recovery pass).
-    return await withExitAdmissionLock(storage, "resume", async () => {
+    ctx.lease.assertHeld();
+    const result = await withExitAdmissionLock(storage, "resume", async () => {
       if (await hasInterruptedExitImport(storage)) {
         throw new RotationResumeError(
           // F1/round-3: must match EXIT_RECOVERY_VERB, imported above,
@@ -2141,12 +2790,19 @@ export async function resumeRotation(
       let converted = 0;
       if (journal.phase === "converting") {
         log("Resuming: converting remaining fortress data...");
-        converted = (await walkFortress(ctx, false)).converted;
-        await convertAuditEpochs(ctx);
-        await convertCastlePin(ctx, false);
+        converted = (await fenced(ctx, () => walkFortress(ctx, false))).converted;
+        await fenced(ctx, () => convertAuditEpochs(ctx));
+        await fenced(ctx, () => convertCastlePin(ctx, false));
       }
+      // The authenticated journal keeps the staging authority durable across
+      // crashes. Promote it only after conversion is complete, and before the
+      // live envelope can become authoritative. The adapter handles both a
+      // still-present staging item and a prior crash after canonical promotion.
+      await fenced(ctx, async () => {
+        await recoveryEscrow?.commit();
+      });
       log("Resuming: finalizing...");
-      await finalize(ctx, journal);
+      await fenced(ctx, () => finalize(ctx, journal));
       return {
         rotation_id: journal.rotation_id,
         old_wrap_ids: journal.old_wrap_ids,
@@ -2154,9 +2810,15 @@ export async function resumeRotation(
         converted_entries: converted,
       };
     });
+    ctx.lease.assertHeld();
+    return result;
+      } finally {
+        zeroizeWriterCache(ctx);
+      }
+    } finally {
+      oldMaster?.fill(0);
+    }
   } finally {
-    zeroizeWriterCache(ctx);
-    oldMaster.fill(0);
     newMaster.fill(0);
   }
 }

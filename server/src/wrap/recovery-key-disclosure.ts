@@ -34,8 +34,9 @@ import {
   realpathSync,
   statSync,
 } from "node:fs";
-import { access, lstat, mkdir, open } from "node:fs/promises";
-import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
+import { randomBytes } from "node:crypto";
+import { access, link, lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline/promises";
 
 export const RECOVERY_KEY_FILENAME = "recovery-key.txt";
@@ -336,7 +337,26 @@ export async function preflightRecoveryKeyOutputFile(
   }
   const parent = dirname(filePath);
   await mkdir(parent, { recursive: true, mode: 0o700 });
+  await assertNoRecoveryOutputStages(filePath);
   await access(parent, constants.W_OK);
+}
+
+async function assertNoRecoveryOutputStages(filePath: string): Promise<void> {
+  const parent = dirname(filePath);
+  const stagePrefix = recoveryOutputStagePrefix(filePath);
+  const abandonedStages = (await readdir(parent)).filter((name) =>
+    name.startsWith(stagePrefix),
+  );
+  if (abandonedStages.length > 0) {
+    throw new Error(
+      `Recovery key output has ${abandonedStages.length} staged artifact(s) from another or interrupted issuance beside ${filePath}. ` +
+        `Refusing to overwrite or delete potentially authoritative recovery material; inspect and securely remove those files before retrying.`,
+    );
+  }
+}
+
+function recoveryOutputStagePrefix(filePath: string): string {
+  return `.${basename(filePath)}.sanctuary-recovery-stage-`;
 }
 
 function isMissingPathError(err: unknown): boolean {
@@ -383,27 +403,84 @@ async function throwAtomicCustomOutputError(
 
 async function writeCustomRecoveryOutputFile(
   filePath: string,
-  content: string
-): Promise<void> {
-  await mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
+  content: string,
+  faultAfter?: (stage: CustomRecoveryOutputStage) => void | Promise<void>,
+  failIfExists = true,
+): Promise<boolean> {
+  const parent = dirname(filePath);
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  await assertNoRecoveryOutputStages(filePath);
+  const stagePath = join(
+    parent,
+    `${recoveryOutputStagePrefix(filePath)}${process.pid}-${randomBytes(12).toString("hex")}`,
+  );
 
+  // Stage beside the destination, sync the complete plaintext, then use link(2)
+  // as an atomic no-replace publication primitive. A crash can therefore leave
+  // either a discoverable staging artifact or the complete final artifact, never
+  // a partially written final path. Preflight refuses both rather than deleting
+  // recovery material whose custody publication may not have completed.
+  //
   // Residual limitation: a parent directory can still be swapped for a symlink
-  // between parent creation and open. The final component and existence races
-  // are closed here with exclusive-create plus no-follow semantics.
+  // between validation and open. Final-component substitution and overwrite
+  // races are closed by O_NOFOLLOW/O_EXCL plus link's EEXIST behavior.
   const noFollow = constants.O_NOFOLLOW ?? 0;
   const flags =
     constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow;
   let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let stageCreated = false;
+  let finalPublished = false;
+  let publicationAttempted = false;
   try {
-    handle = await open(filePath, flags, 0o600);
+    handle = await open(stagePath, flags, 0o600);
+    stageCreated = true;
     await handle.writeFile(content, { encoding: "utf-8" });
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await faultAfter?.("stage-synced");
+
+    publicationAttempted = true;
+    await link(stagePath, filePath);
+    finalPublished = true;
+    await faultAfter?.("final-linked");
+    const directory = await open(parent, "r");
+    try {
+      await directory.sync();
+      await faultAfter?.("directory-synced");
+      await unlink(stagePath);
+      stageCreated = false;
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
   } catch (err) {
-    await throwAtomicCustomOutputError(err, filePath);
+    if (publicationAttempted && isErrnoCode(err, "EEXIST")) {
+      if (failIfExists) await throwAtomicCustomOutputError(err, filePath);
+      const existing = await lstat(filePath);
+      if (existing.isSymbolicLink() || !existing.isFile()) {
+        throw new Error(`Recovery key output path exists but is not a file: ${filePath}`, {
+          cause: err,
+        });
+      }
+      return false;
+    }
+    if (publicationAttempted && isErrnoCode(err, "ELOOP")) {
+      await throwAtomicCustomOutputError(err, filePath);
+    }
+    throw err;
   } finally {
     if (handle) {
       await handle.close();
     }
+    // Normal pre-publication failures do not strand partial plaintext. Once
+    // link(2) has published the final inode, retain any stage alias on failure:
+    // it is a crash-recovery signal and preflight will fail closed around it.
+    if (stageCreated && !finalPublished) {
+      await unlink(stagePath).catch(() => undefined);
+    }
   }
+  return true;
 }
 
 const RECOVERY_KEY_REENTRY_ATTEMPTS = 3;
@@ -595,6 +672,11 @@ async function writeSecretFile(opts: {
   now?: () => Date;
   failIfExists?: boolean;
   metadataLines?: readonly string[];
+  owner?: { uid: number; gid: number };
+  ownerBase?: string;
+  __testFaultAfterCustomOutputStage?: (
+    stage: CustomRecoveryOutputStage,
+  ) => void | Promise<void>;
 }): Promise<{ filePath: string; written: boolean }> {
   const filePath =
     opts.filePath !== undefined
@@ -619,54 +701,47 @@ async function writeSecretFile(opts: {
     "\n" +
     opts.copy.fileBody;
 
-  if (opts.failIfExists) {
-    await writeCustomRecoveryOutputFile(filePath, content);
-    return { filePath, written: true };
+  if (opts.owner) {
+    if (!opts.ownerBase) {
+      throw new Error("recovery output owner requires an ownerBase containment root");
+    }
+    const relativePath = relative(resolve(opts.ownerBase), filePath);
+    if (
+      relativePath === "" ||
+      relativePath === ".." ||
+      relativePath.startsWith(`..${sep}`) ||
+      isAbsolute(relativePath)
+    ) {
+      throw new Error("recovery output path escaped its ownerBase containment root");
+    }
   }
-
-  // Single-issuance, race-free create. O_CREAT|O_EXCL fails atomically with
-  // EEXIST if anything already occupies the path (a prior issuance or a planted
-  // symlink), and O_NOFOLLOW refuses a final-component symlink, so there is no
-  // check-then-use window an attacker could exploit to redirect the write. An
-  // existing regular file is a prior issuance the fortress must never overwrite.
-  await mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
-
-  const noFollow = constants.O_NOFOLLOW ?? 0;
-  const flags =
-    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow;
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    handle = await open(filePath, flags, 0o600);
-    await handle.writeFile(content, { encoding: "utf-8" });
-  } catch (err) {
-    if (isErrnoCode(err, "EEXIST")) {
-      let existingIsFile: boolean;
-      try {
-        existingIsFile = (await lstat(filePath)).isFile();
-      } catch {
-        existingIsFile = false;
-      }
-      if (!existingIsFile) {
-        throw new Error(
-          `Recovery key output path exists but is not a file: ${filePath}`,
-          { cause: err }
-        );
-      }
-      return { filePath, written: false };
-    }
-    if (isErrnoCode(err, "ELOOP")) {
-      throw new Error(
-        `Recovery key output path exists but is not a file: ${filePath}`,
-        { cause: err }
-      );
-    }
-    throw err;
-  } finally {
-    if (handle) {
+  const written = await writeCustomRecoveryOutputFile(
+    filePath,
+    content,
+    opts.__testFaultAfterCustomOutputStage,
+    opts.failIfExists === true,
+  );
+  if (written && opts.owner) {
+    // The stage and final path are hard links to the same inode. Chowning the
+    // published final therefore applies to the durable object created above.
+    const handle = await open(
+      filePath,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+    );
+    try {
+      await handle.chown(opts.owner.uid, opts.owner.gid);
+      await handle.sync();
+    } finally {
       await handle.close();
     }
+    const directory = await open(dirname(filePath), "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
   }
-  return { filePath, written: true };
+  return { filePath, written };
 }
 
 /**
@@ -679,7 +754,13 @@ export async function writeRecoveryKeyFile(opts: {
   fortressId?: string;
   /** Authenticated crash-resume receipt; not secret, but bound to this envelope. */
   recoveryReceipt?: string;
+  owner?: { uid: number; gid: number };
+  ownerBase?: string;
   now?: () => Date;
+  /** TEST ONLY: pause or fault at a durable custom-output boundary. */
+  __testFaultAfterCustomOutputStage?: (
+    stage: CustomRecoveryOutputStage,
+  ) => void | Promise<void>;
 }): Promise<{ filePath: string; written: boolean }> {
   if (opts.recoveryKeyFilePath !== undefined) {
     assertPathOutsideFortress(opts.recoveryKeyFilePath, opts.storagePath);
@@ -700,9 +781,257 @@ export async function writeRecoveryKeyFile(opts: {
       opts.recoveryReceipt,
     ];
   }
+  if (opts.owner !== undefined) writeOpts.owner = opts.owner;
+  if (opts.ownerBase !== undefined) writeOpts.ownerBase = opts.ownerBase;
   if (opts.now !== undefined) writeOpts.now = opts.now;
+  if (opts.__testFaultAfterCustomOutputStage !== undefined) {
+    writeOpts.__testFaultAfterCustomOutputStage =
+      opts.__testFaultAfterCustomOutputStage;
+  }
   return writeSecretFile(writeOpts);
 }
+
+export interface RotationRecoveryFileAuthority {
+  kind: "recovery-file";
+  path: string;
+  parent_dev: string;
+  parent_ino: string;
+  file_dev: string | null;
+  file_ino: string | null;
+}
+
+export interface RotationRecoveryFileMutation {
+  readonly authority: RotationRecoveryFileAuthority;
+  commit(): void;
+  rollback(): Promise<void>;
+}
+
+async function recoveryOutputParentIdentity(
+  filePath: string,
+): Promise<{ dev: string; ino: string }> {
+  const parent = dirname(filePath);
+  const stats = await lstat(parent, { bigint: true });
+  if (stats.isSymbolicLink() || !stats.isDirectory()) {
+    throw new Error(`Recovery key output parent is not a stable directory: ${parent}`);
+  }
+  return { dev: String(stats.dev), ino: String(stats.ino) };
+}
+
+function sameBigintIdentity(
+  stats: { dev: bigint; ino: bigint },
+  dev: string,
+  ino: string,
+): boolean {
+  return String(stats.dev) === dev && String(stats.ino) === ino;
+}
+
+function recoveryKeyFromOutput(bytes: Uint8Array): string {
+  if (bytes.byteLength > 64 * 1024) {
+    throw new Error("Recovery key output exceeds the reconciliation size bound");
+  }
+  const text = Buffer.from(bytes).toString("utf8");
+  const match = text.match(/(?:^|\n)Recovery key:\n([A-Za-z0-9_-]{43})\n/);
+  if (!match) throw new Error("Recovery key output has an invalid recovery-key record");
+  return match[1]!;
+}
+
+/**
+ * Reconcile only the exact inode family authorized before publication. A hard
+ * kill can leave the final name, its same-inode stage alias, or only the
+ * synced stage. Every surviving candidate must contain a key that actually
+ * unlocks the staged envelope before any unlink is allowed.
+ */
+export async function reconcileRotationRecoveryKeyFile(
+  authority: RotationRecoveryFileAuthority,
+  verify: (candidate: string) => Promise<boolean>,
+): Promise<void> {
+  const filePath = resolve(authority.path);
+  if (filePath !== authority.path) {
+    throw new Error("Pending recovery output path is not canonical and absolute");
+  }
+  const parent = dirname(filePath);
+  const parentIdentity = await recoveryOutputParentIdentity(filePath);
+  if (
+    parentIdentity.dev !== authority.parent_dev ||
+    parentIdentity.ino !== authority.parent_ino
+  ) {
+    throw new Error("Recovery output parent inode changed; refusing cleanup");
+  }
+  const names = [
+    basename(filePath),
+    ...(await readdir(parent)).filter((name) =>
+      name.startsWith(recoveryOutputStagePrefix(filePath)),
+    ),
+  ];
+  const candidates: Array<{
+    path: string;
+    dev: string;
+    ino: string;
+    recoveryKey: string;
+  }> = [];
+  for (const name of [...new Set(names)]) {
+    const path = join(parent, name);
+    const stats = await lstat(path, { bigint: true }).catch((error) => {
+      if (isMissingPathError(error)) return null;
+      throw error;
+    });
+    if (stats === null) continue;
+    if (
+      stats.isSymbolicLink() || !stats.isFile()
+      || Number(stats.mode) & 0o077
+      || (authority.file_dev !== null && String(stats.dev) !== authority.file_dev)
+      || (authority.file_ino !== null && String(stats.ino) !== authority.file_ino)
+    ) {
+      throw new Error(`Recovery output inode is not the authenticated pending file: ${path}`);
+    }
+    const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      const heldBefore = await handle.stat({ bigint: true });
+      if (!sameBigintIdentity(heldBefore, String(stats.dev), String(stats.ino))) {
+        throw new Error("Recovery output inode changed during open");
+      }
+      const bytes = await handle.readFile();
+      const heldAfter = await handle.stat({ bigint: true });
+      if (!sameBigintIdentity(heldAfter, String(stats.dev), String(stats.ino))) {
+        throw new Error("Recovery output inode changed during verification");
+      }
+      const recoveryKey = recoveryKeyFromOutput(bytes);
+      if (!(await verify(recoveryKey))) {
+        throw new Error("Recovery output does not unlock the authenticated staged envelope");
+      }
+      candidates.push({
+        path,
+        dev: String(stats.dev),
+        ino: String(stats.ino),
+        recoveryKey,
+      });
+    } finally {
+      await handle.close();
+    }
+  }
+  if (candidates.length === 0) return;
+  const [first] = candidates;
+  if (candidates.some((candidate) => (
+    candidate.dev !== first!.dev
+    || candidate.ino !== first!.ino
+    || candidate.recoveryKey !== first!.recoveryKey
+  ))) {
+    throw new Error("Recovery output aliases do not resolve to one authenticated inode");
+  }
+  for (const candidate of candidates) {
+    const named = await lstat(candidate.path, { bigint: true });
+    if (!sameBigintIdentity(named, candidate.dev, candidate.ino)) {
+      throw new Error("Recovery output inode changed before cleanup");
+    }
+    await unlink(candidate.path);
+  }
+  const parentAfter = await recoveryOutputParentIdentity(filePath);
+  if (
+    parentAfter.dev !== authority.parent_dev ||
+    parentAfter.ino !== authority.parent_ino
+  ) {
+    throw new Error("Recovery output parent inode changed during cleanup");
+  }
+  const directory = await open(parent, "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
+/** Write an explicit rotation output as a rollback-capable inode transaction. */
+export async function writeRotationRecoveryKeyFileTransactional(opts: {
+  storagePath: string;
+  recoveryKeyFilePath: string;
+  recoveryKey: string;
+  fortressId: string;
+  registerPendingAuthority: (
+    authority: RotationRecoveryFileAuthority,
+  ) => Promise<void>;
+  __testFaultAfterCustomOutputStage?: (
+    stage: CustomRecoveryOutputStage,
+  ) => void | Promise<void>;
+}): Promise<RotationRecoveryFileMutation> {
+  const filePath = resolve(opts.recoveryKeyFilePath);
+  assertPathOutsideFortress(filePath, opts.storagePath);
+  // Direct callers historically received parent creation and single-issuance
+  // validation from writeRecoveryKeyFile. Do it before capturing the parent
+  // inode so the authority binds the directory that will actually own the
+  // published file.
+  await preflightRecoveryKeyOutputFile(filePath);
+  const parentIdentity = await recoveryOutputParentIdentity(filePath);
+  const intended: RotationRecoveryFileAuthority = {
+    kind: "recovery-file",
+    path: filePath,
+    parent_dev: parentIdentity.dev,
+    parent_ino: parentIdentity.ino,
+    file_dev: null,
+    file_ino: null,
+  };
+  await opts.registerPendingAuthority(intended);
+  let authority = intended;
+  try {
+    await writeRecoveryKeyFile({
+      storagePath: opts.storagePath,
+      recoveryKeyFilePath: filePath,
+      recoveryKey: opts.recoveryKey,
+      fortressId: opts.fortressId,
+      ...(opts.__testFaultAfterCustomOutputStage
+        ? { __testFaultAfterCustomOutputStage: opts.__testFaultAfterCustomOutputStage }
+        : {}),
+    });
+    const parentAfter = await recoveryOutputParentIdentity(filePath);
+    if (
+      parentAfter.dev !== intended.parent_dev ||
+      parentAfter.ino !== intended.parent_ino
+    ) {
+      throw new Error("Recovery output parent inode changed during publication");
+    }
+    const published = await lstat(filePath, { bigint: true });
+    if (published.isSymbolicLink() || !published.isFile()) {
+      throw new Error("Recovery output publication did not produce a regular file");
+    }
+    authority = {
+      ...intended,
+      file_dev: String(published.dev),
+      file_ino: String(published.ino),
+    };
+    await opts.registerPendingAuthority(authority);
+  } catch (error) {
+    try {
+      await reconcileRotationRecoveryKeyFile(
+        intended,
+        async (candidate) => candidate === opts.recoveryKey,
+      );
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [error, rollbackError],
+        "Recovery output publication failed and its inode did not roll back cleanly",
+        { cause: rollbackError },
+      );
+    }
+    throw error;
+  }
+  let finished = false;
+  return {
+    get authority() { return authority; },
+    commit: () => { finished = true; },
+    rollback: async () => {
+      if (finished) return;
+      await reconcileRotationRecoveryKeyFile(
+        authority,
+        async (candidate) => candidate === opts.recoveryKey,
+      );
+      finished = true;
+    },
+  };
+}
+
+export type CustomRecoveryOutputStage =
+  | "stage-synced"
+  | "final-linked"
+  | "directory-synced";
 
 /**
  * Public entry point for passphrase backup file write (Finding X).
@@ -797,6 +1126,8 @@ interface DiscloseSecretInternalOptions {
   filePath?: string;
   /** File write completed by the caller before disclosure. */
   prewrittenFile?: { filePath: string; written: boolean };
+  /** Stable lexical path shown to the operator when I/O used a dirfd path. */
+  operatorFilePath?: string;
   /** Optional fortress identifier; embedded in the file content. */
   fortressId?: string;
   /** Confirmation policy. */
@@ -860,7 +1191,7 @@ async function discloseSecret(
 
   printSecretBanner(
     opts.secret,
-    fileResult.filePath,
+    opts.operatorFilePath ?? fileResult.filePath,
     copy,
     opts.io?.output,
     opts.filePath ? "custom" : "storage",
@@ -869,7 +1200,7 @@ async function discloseSecret(
 
   if (mode === "no-confirm" || mode === "stdio-server") {
     return {
-      filePath: fileResult.filePath,
+      filePath: opts.operatorFilePath ?? fileResult.filePath,
       fileWritten: fileResult.written,
       confirmed: false,
     };
@@ -877,7 +1208,7 @@ async function discloseSecret(
 
   await confirmSecretSaved(copy, declinedError, nonInteractiveError, opts.io);
   return {
-    filePath: fileResult.filePath,
+    filePath: opts.operatorFilePath ?? fileResult.filePath,
     fileWritten: fileResult.written,
     confirmed: true,
   };
@@ -892,6 +1223,8 @@ export interface DiscloseRecoveryKeyOptions {
   recoveryKeyFilePath?: string;
   /** File write completed by the caller before disclosure. */
   prewrittenFile?: { filePath: string; written: boolean };
+  /** Stable lexical path shown to the operator when writing through a dirfd. */
+  operatorFilePath?: string;
   /** Optional fortress identifier; embedded in the file content. */
   fortressId?: string;
   /** Confirmation policy. */
@@ -953,6 +1286,9 @@ export async function discloseRecoveryKey(
   }
   if (opts.prewrittenFile !== undefined) {
     internalOpts.prewrittenFile = opts.prewrittenFile;
+  }
+  if (opts.operatorFilePath !== undefined) {
+    internalOpts.operatorFilePath = opts.operatorFilePath;
   }
   if (opts.fortressId !== undefined) internalOpts.fortressId = opts.fortressId;
   if (opts.mode !== undefined) internalOpts.mode = opts.mode;
