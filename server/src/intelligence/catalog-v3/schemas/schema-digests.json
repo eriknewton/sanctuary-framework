@@ -1,0 +1,20 @@
+{
+  "schema": "sanctuary.catalog-schema-digests.v1",
+  "jcs_sha256": {
+    "catalog-body.v3.schema.json": "2e627353ebf55c1b265b33880293c205e0abc6485156d6630c06c2aa9d21f950",
+    "catalog-index.v1.schema.json": "4f41c54e2ec8d57748b8f77557565086a5a7f13376b4c6cbe2a97a75642d2dd9",
+    "overlay-body.v1.schema.json": "cca5963eed41e87da977d93e1b4358818c6313086f2ba2cad3b51233975c1800",
+    "signed-catalog.v3.schema.json": "8e3ed10df8b6a6bdf1972037a1e94fb7aac38bfdcc2802cca7e3d81e404d5cc1",
+    "signed-overlay.v1.schema.json": "365e5b7d8d0ead5939c4d8a056add798ebc3e4bd94e2e8275a0ec88987b563e0"
+  },
+  "raw_sha256": {
+    "catalog-body.v3.schema.json": "e6845174d8a2c50d93ca523ffd5a66a17989ccb80b0c75cd360ba3ce970aa505",
+    "catalog-index.v1.schema.json": "78ba023227bcae37443ef7a65d6d1cb108f55c6d5fa7f8f047c78d3c20b3f6c9",
+    "overlay-body.v1.schema.json": "0ba564888a1d40dbc5016c4c92c38eb91bbb323b5fffb7ff52341add7e76db06",
+    "signed-catalog.v3.schema.json": "423ebf97c5a4f84c0a7cb4ed94063541c47d0a7192ff0c1a4bb2661c377972d8",
+    "signed-overlay.v1.schema.json": "0135debe3a7b01d9dce38e09967551c2f08dd9da34c10f989f833c66be7c64bc"
+  },
+  "source_assets_sha256": {
+    "spdx-expression-3.0.1.abnf": "f449ffcf2e6d206442c11b77f8d47568a8ac5f0abeeb01eec16d68fceccb68fe"
+  }
+}

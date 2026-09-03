@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:sanctuary:schema:catalog-body:v3",
+  "title": "Sanctuary Catalog Body V3",
+  "$comment": "Structural prefilter only. Admission requires parseCatalogBodyV3 or verifyAndParseSignedCatalogV3; runtime validation additionally pins exact compiled tiers/defaults, SPDX-profile semantics, identity uniqueness, and ascending surface order.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "catalog_version", "issued_at", "source_commit", "previous_catalog_body_sha256", "models", "tiers", "surface_defaults"],
+  "properties": {
+    "schema": { "const": "sanctuary.model-catalog.v3" },
+    "catalog_version": { "$ref": "#/$defs/version" },
+    "issued_at": { "$ref": "#/$defs/timestamp" },
+    "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "previous_catalog_body_sha256": { "oneOf": [{ "$ref": "#/$defs/nonzeroDigest" }, { "type": "null" }] },
+    "models": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "$ref": "#/$defs/model" } },
+    "tiers": { "$ref": "#/$defs/tierTable" },
+    "surface_defaults": { "$ref": "#/$defs/surfaceDefaults" }
+  },
+  "allOf": [
+    { "if": { "properties": { "catalog_version": { "const": 1 } }, "required": ["catalog_version"] }, "then": { "properties": { "previous_catalog_body_sha256": { "type": "null" } } }, "else": { "properties": { "previous_catalog_body_sha256": { "$ref": "#/$defs/nonzeroDigest" } } } }
+  ],
+  "$defs": {
+    "version": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nonzeroDigest": { "type": "string", "pattern": "^(?!0{64}$)[0-9a-f]{64}$" },
+    "component": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$" },
+    "timestamp": { "type": "string", "pattern": "^(?:(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8])))|(?:(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29))T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$" },
+    "assurance": { "enum": ["light", "immune"] },
+    "tier": { "enum": ["baseline", "mid", "pro"] },
+    "identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["registry", "namespace", "model", "tag", "ollama_manifest_sha256"],
+      "properties": {
+        "registry": { "const": "registry.ollama.ai" },
+        "namespace": { "$ref": "#/$defs/component" },
+        "model": { "$ref": "#/$defs/component" },
+        "tag": { "$ref": "#/$defs/component" },
+        "ollama_manifest_sha256": { "$ref": "#/$defs/nonzeroDigest" }
+      }
+    },
+    "license": {
+      "type": "object", "additionalProperties": false,
+      "required": ["spdx", "source_url", "evidence_sha256"],
+      "properties": {
+        "spdx": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "custom_name": { "type": "string", "minLength": 1, "maxLength": 120, "pattern": "^[ -~]+$" },
+        "source_url": { "type": "string", "maxLength": 256, "pattern": "^https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?/[A-Za-z0-9._~%!$&'()*+,;=:@/-]{0,246}$" },
+        "evidence_sha256": { "$ref": "#/$defs/nonzeroDigest" }
+      },
+      "allOf": [
+        { "if": { "properties": { "spdx": { "const": "custom" } }, "required": ["spdx"] }, "then": { "properties": { "custom_name": {} }, "required": ["custom_name"] }, "else": { "not": { "required": ["custom_name"] } } }
+      ]
+    },
+    "model": {
+      "type": "object", "additionalProperties": false,
+      "required": ["model_id", "identity", "assurance", "license", "hardware_tier"],
+      "properties": {
+        "model_id": { "$ref": "#/$defs/component" },
+        "identity": { "$ref": "#/$defs/identity" },
+        "assurance": { "$ref": "#/$defs/assurance" },
+        "license": { "$ref": "#/$defs/license" },
+        "hardware_tier": { "$ref": "#/$defs/tier" }
+      }
+    },
+    "tierSpec": {
+      "type": "object", "additionalProperties": false, "required": ["min_ram_gib", "description"],
+      "properties": { "min_ram_gib": { "type": "integer", "minimum": 1, "maximum": 4096 }, "description": { "type": "string", "minLength": 1, "maxLength": 120, "pattern": "^[ -~]+$" } }
+    },
+    "tierTable": {
+      "type": "object", "additionalProperties": false, "required": ["schema", "tiers"],
+      "properties": {
+        "schema": { "const": "tier-table.v1" },
+        "tiers": { "type": "object", "additionalProperties": false, "required": ["baseline", "mid", "pro"], "properties": { "baseline": { "$ref": "#/$defs/tierSpec" }, "mid": { "$ref": "#/$defs/tierSpec" }, "pro": { "$ref": "#/$defs/tierSpec" } } }
+      }
+    },
+    "surfaceDefault": {
+      "type": "object", "additionalProperties": false, "required": ["tier", "assurance"],
+      "properties": { "tier": { "$ref": "#/$defs/tier" }, "assurance": { "$ref": "#/$defs/assurance" } }
+    },
+    "surfaceDefaults": {
+      "type": "object", "additionalProperties": false, "required": ["schema", "defaults"],
+      "properties": {
+        "schema": { "const": "surface-defaults.v1" },
+        "defaults": {
+          "type": "object", "additionalProperties": false,
+          "required": ["concierge", "direct-agent-gate-advisor", "sentinel-scoring", "gate-explanation", "privacy-filter-tier-2", "template-suggestion"],
+          "properties": {
+            "concierge": { "$ref": "#/$defs/surfaceDefault" }, "direct-agent-gate-advisor": { "$ref": "#/$defs/surfaceDefault" },
+            "sentinel-scoring": { "$ref": "#/$defs/surfaceDefault" }, "gate-explanation": { "$ref": "#/$defs/surfaceDefault" },
+            "privacy-filter-tier-2": { "$ref": "#/$defs/surfaceDefault" }, "template-suggestion": { "$ref": "#/$defs/surfaceDefault" }
+          }
+        }
+      }
+    }
+  }
+}
