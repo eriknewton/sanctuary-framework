@@ -47,7 +47,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { access, chmod, lstat, open, readdir, rm, statfs } from "node:fs/promises";
+import { access, chmod, lstat, open, readdir, realpath, rm, statfs } from "node:fs/promises";
 import { mkdir } from "node:fs/promises";
 import { constants, lstatSync } from "node:fs";
 import type { BigIntStats } from "node:fs";
@@ -58,7 +58,7 @@ import {
   type Server as NetServer,
 } from "node:net";
 import { platform } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 
 import type { StorageBackend } from "./interface.js";
 import type {
@@ -1857,6 +1857,23 @@ function darwinUserTempDir(env: NodeJS.ProcessEnv): string {
 }
 
 /**
+ * Per-user runtime base on Linux, DERIVED from the uid so every same-uid process
+ * computes the identical string regardless of whether `$XDG_RUNTIME_DIR` is set
+ * in its own environment. Reading `$XDG_RUNTIME_DIR` would split the rendezvous:
+ * a login-session process has it set (`/run/user/<uid>`) while a
+ * sudo/cron/systemd-system process of the same uid does not, so the two would
+ * pick different roots and each believe it held the exclusive lock. systemd /
+ * pam_systemd creates and owns `/run/user/<uid>` (0700 per-user tmpfs);
+ * {@link ensureKernelSocketRuntimeDirectory} fails CLOSED if it is absent rather
+ * than falling back to a world-writable base (a fallback would reintroduce the
+ * split). Cross-file contract: this derivation is asserted verbatim in
+ * test/storage/custody-lock-root-resolver.test.ts.
+ */
+function linuxUserRuntimeDir(uid: number): string {
+  return `/run/user/${uid}`;
+}
+
+/**
  * A root is usable only if every entry we compose beneath it
  * (`${root}/${40-hex}${suffix}`, longest suffix `.reaper`) stays within the
  * kernel `sun_path` budget. This is a PURE length computation: `/run/user/<uid>`
@@ -1878,44 +1895,62 @@ function custodyLockRootFits(root: string): boolean {
  * INVARIANT (load-bearing rendezvous): the kernel lock is a cross-process
  * rendezvous keyed on uid; every cooperating same-uid process MUST resolve the
  * SAME root, or two processes hold "exclusive" locks in different directories
- * (a silent custody-safety break). This function therefore reads ONLY `env` and
- * `platform` — never time, randomness, or any filesystem probe (existence,
- * writability, ownership), any of which could differ between two same-uid
- * processes. Selection is by presence + platform + a pure length computation.
- * A non-override candidate that would overflow the socket-path cap falls through
- * to the hardened fallback by that pure length rule (NOT by probing); an
- * explicit operator override that overflows is a HARD ERROR (fail closed),
- * never silently downgraded to a different root — downgrading it would break
- * rendezvous with any peer that honored the override. A chosen root is never
- * silently swapped for another once selected.
+ * (a silent custody-safety break). This function therefore reads ONLY the uid,
+ * `platform`, and the two env vars that are uniform across a same-uid cohort by
+ * construction (the operator/installer override and `$TMPDIR` on macOS) — never
+ * time, randomness, any filesystem probe, and NEVER `$XDG_RUNTIME_DIR` (which is
+ * set in a login session and unset under sudo/cron/systemd-system, so reading it
+ * would split the same-uid cohort into two roots). Every branch REQUIRES an
+ * ABSOLUTE path: a relative value resolves against each process's cwd, a hidden
+ * per-process input that splits the rendezvous, so it is a HARD ERROR, never
+ * used. A non-override candidate that would overflow the socket-path cap falls
+ * through only where that is a pure, per-uid-identical length decision (macOS ->
+ * the /tmp fallback); on Linux an overflow is a HARD ERROR rather than a /tmp
+ * downgrade, because that downgrade would split from any peer that fit. A chosen
+ * root is never silently swapped for another once selected.
  *
  * Precedence (first usable wins):
  *  1. `SANCTUARY_CUSTODY_LOCK_ROOT` override — the installer/systemd unit points
  *     the root daemon at its own runtime path (e.g. `/run/sanctuary/locks`).
- *  2. Linux `$XDG_RUNTIME_DIR` (`/run/user/<uid>`, per-user 0700 tmpfs).
- *  3. macOS `os.tmpdir()` = `DARWIN_USER_TEMP_DIR` (per-user 0700) when it fits;
- *     the `/var/folders/.../T` base is ~48 bytes, so the descriptive leaf can
- *     overflow the cap, and then step 4 is used (a pure, per-uid-identical
- *     length decision, never a probe).
- *  4. Hardened `/tmp/sanctuary-custody-locks-<uid>` fallback (universal), which
- *     keeps every existing hardening applied by the ensure path below.
+ *     Must be absolute and fit, else HARD ERROR.
+ *  2. Linux: `/run/user/<uid>/sanctuary-custody-locks`, DERIVED from the uid (not
+ *     from `$XDG_RUNTIME_DIR`), so every same-uid process agrees regardless of
+ *     its env. Existence + safety of `/run/user/<uid>` is enforced (fail closed,
+ *     no /tmp fallback) by {@link ensureKernelSocketRuntimeDirectory}; this stays
+ *     pure. An overflow here is a HARD ERROR, not a /tmp downgrade.
+ *  3. macOS `os.tmpdir()` = `DARWIN_USER_TEMP_DIR` (per-user 0700) when absolute
+ *     and it fits; the `/var/folders/.../T` base composes over the cap, so on a
+ *     real Mac step 4 is used (a pure, per-uid-identical length decision, never a
+ *     probe). A relative `$TMPDIR` is a HARD ERROR.
+ *  4. Hardened `/tmp/sanctuary-custody-locks-<uid>` fallback — the macOS length
+ *     fall-through and any other platform. Linux never reaches here (it fails
+ *     closed above rather than split onto a world-writable base).
  *
- * Hardening (mkdir 0700, owner/mode verification, local-filesystem assertion,
- * O_NOFOLLOW, device/inode identity) is applied by callers to WHATEVER root this
- * returns; this function only selects the path.
+ * Hardening (ancestor-chain safety, mkdir 0700, owner/mode verification,
+ * local-filesystem assertion, O_NOFOLLOW, device/inode identity) is applied by
+ * {@link ensureKernelSocketRuntimeDirectory} to WHATEVER root this returns; this
+ * function only selects the path.
  */
 export function resolveCustodyLockRoot(
   uid: number,
   context: CustodyLockRootContext,
 ): string {
   const { env, platform: host } = context;
-  const fallback = join("/tmp", `${CUSTODY_LOCK_ROOT_LEAF}-${uid}`);
 
-  // 1. Explicit override. Length is fixed by operator/installer intent, so an
-  //    overflow is a configuration error we refuse loudly rather than silently
-  //    swapping in a different root (which would break rendezvous with peers).
+  // 1. Explicit override. MUST be absolute (a relative value resolves against
+  //    each process's cwd and would split the rendezvous) and MUST fit; either
+  //    failure is refused loudly rather than silently swapping in a different
+  //    root, which would break rendezvous with peers that honored the override.
   const override = env.SANCTUARY_CUSTODY_LOCK_ROOT?.trim();
   if (override !== undefined && override.length > 0) {
+    if (!isAbsolute(override)) {
+      throw new CrossProcessLockError(
+        `SANCTUARY_CUSTODY_LOCK_ROOT '${override}' must be an absolute path; a ` +
+          `relative value resolves against each process's cwd and would split the ` +
+          `custody lock rendezvous`,
+        "capability",
+      );
+    }
     if (!custodyLockRootFits(override)) {
       throw new CrossProcessLockError(
         `SANCTUARY_CUSTODY_LOCK_ROOT '${override}' composes a custody lock socket path ` +
@@ -1926,27 +1961,42 @@ export function resolveCustodyLockRoot(
     return override;
   }
 
-  // 2. Linux user-session runtime dir. "Usable" is a PURE predicate (set,
-  //    non-empty, absolute) — never a stat, so two same-session processes agree.
+  // 2. Linux user-session runtime dir, DERIVED from the uid (never read from
+  //    `$XDG_RUNTIME_DIR`, which is present in a login session and absent under
+  //    sudo/cron/systemd-system, so reading it would split the same-uid cohort).
+  //    Absolute by construction. An overflow is a HARD ERROR, not a /tmp
+  //    downgrade — downgrading would reintroduce the split with a peer that fit.
   if (host === "linux") {
-    const xdg = env.XDG_RUNTIME_DIR?.trim();
-    if (xdg !== undefined && xdg.length > 0 && xdg.startsWith("/")) {
-      const candidate = join(xdg, CUSTODY_LOCK_ROOT_LEAF);
-      if (custodyLockRootFits(candidate)) return candidate;
-      // Deterministic (length-only) fall-through to the hardened fallback.
+    const candidate = join(linuxUserRuntimeDir(uid), CUSTODY_LOCK_ROOT_LEAF);
+    if (!custodyLockRootFits(candidate)) {
+      throw new CrossProcessLockError(
+        `custody lock runtime path '${candidate}' exceeds the ` +
+          `${KERNEL_SOCKET_PATH_MAX_BYTES}-byte socket-path limit`,
+        "capability",
+      );
     }
+    return candidate;
   }
 
-  // 3. macOS per-user temp dir. Deterministic length decision only; see note above.
+  // 3. macOS per-user temp dir. MUST be absolute; overflow is a deterministic
+  //    (length-only, never a probe) fall-through to the /tmp fallback below, so
+  //    all same-uid processes agree. On a real Mac the /var/folders base always
+  //    overflows, so the fallback is the production path.
   if (host === "darwin") {
-    const candidate = join(
-      darwinUserTempDir(env),
-      `${CUSTODY_LOCK_ROOT_LEAF}-${uid}`,
-    );
+    const dtemp = darwinUserTempDir(env);
+    if (!isAbsolute(dtemp)) {
+      throw new CrossProcessLockError(
+        `custody lock temp dir '${dtemp}' (from $TMPDIR) must be an absolute path`,
+        "capability",
+      );
+    }
+    const candidate = join(dtemp, `${CUSTODY_LOCK_ROOT_LEAF}-${uid}`);
     if (custodyLockRootFits(candidate)) return candidate;
   }
 
-  // 4. Hardened universal fallback. Fail closed if even this overflows.
+  // 4. Hardened universal fallback (macOS length fall-through + any non-Linux,
+  //    non-darwin platform). Fail closed if even this overflows.
+  const fallback = join("/tmp", `${CUSTODY_LOCK_ROOT_LEAF}-${uid}`);
   if (!custodyLockRootFits(fallback)) {
     throw new CrossProcessLockError(
       `custody lock fallback path '${fallback}' exceeds the ` +
@@ -1957,35 +2007,302 @@ export function resolveCustodyLockRoot(
   return fallback;
 }
 
+/**
+ * Verify every ancestor directory of the lock leaf, from its parent up to the
+ * filesystem root, is safe to sit above a 0700 lock dir. Throws (fail closed) on
+ * the first unsafe or absent ancestor; on success the caller creates ONLY the
+ * leaf non-recursively under the now-verified parent.
+ *
+ * Why (BUG 3, parent-swap surface): `mkdir(recursive)` would create and trust
+ * intermediate directories it neither owns nor checks, so an attacker-influenced
+ * absolute root (an override or, historically, an XDG value under a
+ * world-writable parent) could leave a world-writable ANCESTOR above the hardened
+ * 0700 leaf, from which the leaf could be renamed or swapped. Leaf hardening
+ * alone cannot see that. We instead refuse any unsafe ancestor and create only
+ * the leaf beneath a verified-safe parent.
+ *
+ * The parent is canonicalized with `realpath` FIRST so the check follows OS
+ * symlinks (on macOS `/tmp` -> `/private/tmp`, `/var` -> `/private/var`) and then
+ * walks a symlink-free chain; canonicalization is per-machine state identical for
+ * all same-uid processes at a given moment, so it does not affect the rendezvous
+ * (the leaf path the caller binds is still the resolver's output). An absent
+ * required ancestor (for example no `/run/user/<uid>` on Linux) is a HARD ERROR
+ * here: we refuse to create it or downgrade to a world-writable base (fail
+ * closed, no split), which is the documented Linux availability bound.
+ *
+ * Safe ancestor: a non-symlink directory that is NOT world-writable unless it
+ * carries the sticky bit (the `/tmp`, `/private/tmp` mitigation), is NOT
+ * group-writable unless its group is root or this uid's own group AND the sticky
+ * bit is set (a plain group-writable parent lets any group member host the
+ * component swap the fd binding below closes), and is owned by root or by this
+ * uid (rejecting a foreign-owned ancestor, e.g. `/run/sanctuary` must be
+ * root-owned, `/run/user/<uid>` uid-owned).
+ *
+ * Returns the realpath-canonical (symlink-free) parent and its verified inode
+ * identity so {@link ensureKernelSocketRuntimeDirectory} can bind leaf creation
+ * to the exact directory verified here, never re-resolving the original string.
+ */
+async function assertSafeCustodyLockAncestry(
+  leaf: string,
+  uid: number,
+  gid: number,
+): Promise<{ canonicalParent: string; parentDev: number; parentIno: number }> {
+  const parent = dirname(leaf);
+  let canonicalParent: string;
+  try {
+    canonicalParent = await realpath(parent);
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") {
+      throw new CrossProcessLockError(
+        `custody lock runtime parent '${parent}' is absent; refusing to create it ` +
+          `or fall back to a world-writable base (fail closed)`,
+        "capability",
+      );
+    }
+    throw error;
+  }
+
+  // Collect the canonical chain from the parent up to the filesystem root, then
+  // verify from the trusted root downward. dirname('/') === '/', the fixpoint
+  // that terminates the walk (and bounds it to the path depth).
+  const chain: string[] = [];
+  for (let cur = canonicalParent; ; cur = dirname(cur)) {
+    chain.push(cur);
+    if (dirname(cur) === cur) break;
+  }
+  let parentStats: Awaited<ReturnType<typeof lstat>> | undefined;
+  for (const dir of chain.reverse()) {
+    const stats = await lstat(dir);
+    if (stats.isSymbolicLink() || !stats.isDirectory()) {
+      // Post-realpath the chain is symlink-free; a symlink here means the tree
+      // was mutated under us mid-check, so refuse rather than race it.
+      throw new CrossProcessLockError(
+        `custody lock runtime ancestor '${dir}' is not a non-symlink directory`,
+        "capability",
+      );
+    }
+    const worldWritable = (stats.mode & 0o002) !== 0;
+    const groupWritable = (stats.mode & 0o020) !== 0;
+    const sticky = (stats.mode & 0o1000) !== 0;
+    if (worldWritable && !sticky) {
+      throw new CrossProcessLockError(
+        `custody lock runtime ancestor '${dir}' is world-writable without the ` +
+          `sticky bit (an attacker could swap the lock directory beneath it)`,
+        "capability",
+      );
+    }
+    // A group-writable ancestor lets any member of its group create/rename
+    // entries; without the sticky bit a non-owner member can host the swap the
+    // fd binding closes, so refuse it unless the group is root or this uid's own
+    // group AND the sticky bit prevents non-owner renames.
+    const trustedGroup = stats.gid === 0 || (gid >= 0 && stats.gid === gid);
+    if (groupWritable && !(trustedGroup && sticky)) {
+      throw new CrossProcessLockError(
+        `custody lock runtime ancestor '${dir}' is group-writable without a ` +
+          `trusted group and the sticky bit (a group member could swap the lock ` +
+          `directory beneath it)`,
+        "capability",
+      );
+    }
+    if (stats.uid !== 0 && stats.uid !== uid) {
+      throw new CrossProcessLockError(
+        `custody lock runtime ancestor '${dir}' is owned by neither root nor ` +
+          `uid ${uid} (foreign-owned ancestor is a hijack surface)`,
+        "capability",
+      );
+    }
+    if (dir === canonicalParent) parentStats = stats;
+  }
+  // The loop always visits canonicalParent (chain[0], the leaf's direct parent),
+  // so parentStats is defined; the guard is a type narrow, not a reachable state.
+  if (parentStats === undefined) {
+    throw new CrossProcessLockError(
+      `custody lock runtime parent '${canonicalParent}' was not verified`,
+      "capability",
+    );
+  }
+  return {
+    canonicalParent,
+    parentDev: Number(parentStats.dev),
+    parentIno: Number(parentStats.ino),
+  };
+}
+
 // Exported as a test seam: an injected `context` lets a unit test drive the
-// owner/mode hardening below onto a controllable (non-/tmp) branch and prove it
-// is carried regardless of which precedence branch selected the root. Production
-// callers pass no argument and use the real environment.
+// ancestor + owner/mode hardening below onto a controllable (non-/tmp) branch and
+// prove it is carried regardless of which precedence branch selected the root.
+// Production callers pass no argument and use the real environment.
 export async function ensureKernelSocketRuntimeDirectory(
   context?: CustodyLockRootContext,
+  hooks?: {
+    // Test-only seam: fired AFTER the ancestry is verified and the parent fd is
+    // pinned, but BEFORE the leaf is created, so a test can drive a symlink /
+    // inode swap into the check-then-use window and prove creation stays bound to
+    // the verified inode. Production callers pass nothing.
+    __testAfterAncestryVerified?: () => void | Promise<void>;
+  },
 ): Promise<string> {
   if (typeof process.getuid !== "function") {
     throw new Error("Unix process owner identity is unavailable");
   }
   const uid = process.getuid();
-  // Deterministic root selection (env + platform only). Production reads the
-  // real environment; tests inject a context to exercise the precedence table.
+  const gid = typeof process.getgid === "function" ? process.getgid() : -1;
+  // Deterministic root selection (uid + platform + uniform env only). Production
+  // reads the real environment; tests inject a context to exercise precedence.
   const path = resolveCustodyLockRoot(
     uid,
     context ?? { env: process.env, platform: platform() },
   );
-  // Hardening carried onto WHATEVER root the resolver chose (not only /tmp):
-  // create it 0700, then refuse a pre-existing dir that is a symlink, a
-  // non-directory, foreign-owned, or group/other-accessible. An attacker who
-  // pre-creates the resolved root with the wrong owner or mode must be detected
-  // and refused here, on every precedence branch.
-  await mkdir(path, { recursive: true, mode: 0o700 });
-  const stats = await lstat(path);
-  if (stats.isSymbolicLink() || !stats.isDirectory()) {
-    throw new Error(`custody lock runtime path is not a non-symlink directory (${path})`);
+  // BUG 3: verify the FULL ancestor chain up to '/' is safe BEFORE creating the
+  // leaf, so no world/group-writable or foreign ancestor sits above the 0700 lock
+  // dir, and an absent required ancestor (e.g. no /run/user/<uid>) fails closed
+  // here rather than being created by a recursive mkdir or downgraded to /tmp.
+  // Returns the realpath-canonical (symlink-free) parent and its verified inode.
+  const { canonicalParent, parentDev, parentIno } =
+    await assertSafeCustodyLockAncestry(path, uid, gid);
+
+  // BUG 3 (TOCTOU close): bind leaf creation to the VERIFIED parent inode instead
+  // of re-resolving the original (possibly symlinked) resolver string. Two bindings
+  // act together:
+  //  (a) We open `canonicalParent` (the realpath of the parent, symlink-free and
+  //      every ancestor just verified owned by root/this-uid and not
+  //      world/group-writable-without-sticky) by descriptor with
+  //      O_NOFOLLOW|O_DIRECTORY and pin its inode. Because canonicalParent already
+  //      resolved every symlink, repointing a symlink COMPONENT of the original
+  //      resolver string after the check cannot redirect the create at all.
+  //  (b) On Linux we then create and inspect the leaf THROUGH that descriptor
+  //      (`/proc/self/fd/<fd>/<leaf>`), so the mkdir is parent-fd-relative and a
+  //      swap of a canonicalParent component in the window cannot redirect it
+  //      (window fully closed). Darwin/other lack a traversable
+  //      `/dev/fd/<dirfd>/child` and Node exposes no mkdirat/openat, so we create
+  //      through the canonical path and bracket the mkdir with an inode-identity
+  //      recheck of the pinned parent, failing closed and removing anything we
+  //      created on a mismatch. Documented residual: on Darwin the mkdir syscall
+  //      still resolves the canonical path by name, so a swap of a canonicalParent
+  //      component (only possible for root or this uid, both trusted; a
+  //      non-privileged attacker cannot own or rename a verified component) inside
+  //      the sub-syscall window is DETECTED and cleaned up after the fact rather
+  //      than prevented. Production roots are immune regardless: macOS /tmp is a
+  //      root-owned sticky dir and Linux /run/user/<uid> is a 0700 uid-owned tmpfs
+  //      only root can replace.
+  const realHost = platform();
+  const leafName = basename(path);
+  if (leafName === "" || leafName === "." || leafName === "..") {
+    throw new CrossProcessLockError(
+      `custody lock runtime leaf name '${leafName}' is not a single path component`,
+      "capability",
+    );
   }
-  if (stats.uid !== uid || (stats.mode & 0o077) !== 0) {
-    throw new Error(`custody lock runtime directory must be owned by uid ${uid} with mode 0700 (${path})`);
+  // O_NOFOLLOW so a symlink AT canonicalParent (impossible post-realpath, but a
+  // race could re-create one) is refused rather than followed; O_DIRECTORY so a
+  // non-directory swap is refused at open.
+  const noFollow =
+    typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+  const directoryOnly =
+    typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
+  const parentHandle = await open(
+    canonicalParent,
+    constants.O_RDONLY | noFollow | directoryOnly,
+  );
+  try {
+    // Re-verify the OPENED descriptor is the exact directory verified above: same
+    // inode, still a directory. fstat reads the pinned inode, not the name, so a
+    // later path rebind cannot fool it.
+    const held = await parentHandle.stat();
+    if (
+      held.isSymbolicLink() ||
+      !held.isDirectory() ||
+      Number(held.dev) !== parentDev ||
+      Number(held.ino) !== parentIno
+    ) {
+      throw new CrossProcessLockError(
+        `custody lock runtime parent changed between verification and binding ` +
+          `(${canonicalParent})`,
+        "capability",
+      );
+    }
+
+    await hooks?.__testAfterAncestryVerified?.();
+
+    // Linux: create + inspect the leaf THROUGH the pinned parent descriptor, so no
+    // path re-resolution occurs (window fully closed). Darwin/other: the descriptor
+    // is not traversable, so create through the canonical path with a bracketing
+    // inode recheck (window reduced to a bounded, detected-and-cleaned residual).
+    const throughFd = realHost === "linux";
+    const descriptorParent = `/proc/self/fd/${parentHandle.fd}`;
+    const leafAccessPath = throughFd
+      ? join(descriptorParent, leafName)
+      : join(canonicalParent, leafName);
+
+    if (!throughFd) {
+      // Detect a canonicalParent-inode swap that already completed before create.
+      const before = await lstat(canonicalParent);
+      if (
+        before.isSymbolicLink() ||
+        Number(before.dev) !== parentDev ||
+        Number(before.ino) !== parentIno
+      ) {
+        throw new CrossProcessLockError(
+          `custody lock runtime parent path was rebound before leaf creation ` +
+            `(${canonicalParent})`,
+          "capability",
+        );
+      }
+    }
+
+    // Create ONLY the leaf, NON-recursively, bound to the verified parent. A
+    // pre-existing leaf is fine; recursive creation through untrusted intermediates
+    // is exactly the surface BUG 3 closes.
+    let created = false;
+    try {
+      await mkdir(leafAccessPath, { mode: 0o700 });
+      created = true;
+    } catch (error) {
+      if (errorCode(error) !== "EEXIST") throw error;
+    }
+
+    if (!throughFd) {
+      // Darwin residual close: re-verify canonicalParent still resolves to the
+      // pinned inode AFTER the create; on a mismatch a swap may have redirected the
+      // mkdir into attacker space, so remove what we created and fail closed.
+      const after = await lstat(canonicalParent);
+      if (
+        after.isSymbolicLink() ||
+        Number(after.dev) !== parentDev ||
+        Number(after.ino) !== parentIno
+      ) {
+        if (created) {
+          await rm(leafAccessPath, { recursive: true, force: true }).catch(
+            () => {},
+          );
+        }
+        throw new CrossProcessLockError(
+          `custody lock runtime parent path was rebound during leaf creation ` +
+            `(${canonicalParent})`,
+          "capability",
+        );
+      }
+    }
+
+    // Leaf hardening carried onto WHATEVER root the resolver chose (not only /tmp),
+    // inspected through the SAME binding (fd-relative on Linux, canonical path on
+    // Darwin) so it is never re-resolved through the original string: refuse a
+    // pre-existing leaf that is a symlink, a non-directory, foreign-owned, or
+    // group/other-accessible. lstat does not follow the final component, so a
+    // symlinked leaf is detected here on every branch.
+    const stats = await lstat(leafAccessPath);
+    if (stats.isSymbolicLink() || !stats.isDirectory()) {
+      throw new Error(
+        `custody lock runtime path is not a non-symlink directory (${path})`,
+      );
+    }
+    if (stats.uid !== uid || (stats.mode & 0o077) !== 0) {
+      throw new Error(
+        `custody lock runtime directory must be owned by uid ${uid} with mode 0700 (${path})`,
+      );
+    }
+  } finally {
+    await parentHandle.close().catch(() => {});
   }
   return path;
 }
