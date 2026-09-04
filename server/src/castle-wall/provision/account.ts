@@ -2,6 +2,7 @@ import { isAbsolute, normalize as normalizePath } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { RESERVED_ACCOUNT_NAMES, SAFE_SERVICE_ACCOUNT_RE } from "./account-name-policy.js";
+import { stripTrailingSlashes } from "../../strings.js";
 
 /**
  * Auto-provision Step 2 (Build 1): dedicated agent service-account plumbing.
@@ -258,7 +259,7 @@ export function parseServiceAccountIsHidden(value: string | undefined): boolean 
 function normalizeComparableHome(path: string): string {
   const normalized = normalizePath(path);
   if (normalized === "/") return normalized;
-  return normalized.replace(/\/+$/, "");
+  return stripTrailingSlashes(normalized);
 }
 
 function homeDirectoryShapeProblem(path: string, label: string): string | undefined {
