@@ -16,6 +16,7 @@ import {
   launchctlPrintWasNotLoaded,
   type HarnessDaemonStatus,
 } from "../../egress-gate/harness-daemon.js";
+import { stripTrailingSlashes } from "../../strings.js";
 
 type LaunchctlResult = { code: number; stdout: string; stderr: string };
 
@@ -77,7 +78,7 @@ export function hermesOperatorTwinDescriptor(input: {
   operatorHome: string;
   operatorUid: number;
 }): OperatorTwinDescriptor {
-  const home = input.operatorHome.replace(/\/+$/, "");
+  const home = stripTrailingSlashes(input.operatorHome);
   const label = "ai.hermes.gateway";
   return {
     domain: `gui/${input.operatorUid}`,

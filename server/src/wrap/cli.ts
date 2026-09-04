@@ -191,6 +191,7 @@ import {
 } from "./recovery-key-disclosure.js";
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
+import { stripTrailingSlashes } from "../strings.js";
 
 type ProcessShutdownCleanup = () => void | Promise<void>;
 
@@ -953,7 +954,7 @@ function normalizeRegistryUrl(
     parsed.username = "";
     parsed.password = "";
     return {
-      base: parsed.toString().replace(/\/+$/, ""),
+      base: stripTrailingSlashes(parsed.toString()),
       strippedCredentials,
     };
   } catch {
