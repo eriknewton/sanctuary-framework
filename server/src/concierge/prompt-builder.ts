@@ -104,12 +104,19 @@ const CONCIERGE_RECORD_BUDGET_CHARS = (PROMPT_STUFFING_LARGE_STRING_CHARS * 3) /
 const TRUNCATION_MARKER = "[truncated]";
 
 /**
- * Project a context bundle down to a bounded, agent-unsteerable SIZE.
+ * Project a context bundle down to a bounded, agent-unsteerable SIZE, and
+ * redact sensitive keys on the way through.
  *
  * Every string an agent can write into this fortress reaches the concierge
  * prompt through this function, so it is where the size of that text stops
  * being the agent's choice. Content is preserved as far as the caps allow;
- * only length is taken away.
+ * only length is taken away, and anything under a sensitive key is replaced
+ * rather than shortened.
+ *
+ * This is the ONLY walk of the bundle. Redaction was a separate, unbounded
+ * recursive pass in front of it, which meant the guarantees below described
+ * the second walk while the first could be handed anything; there is now no
+ * pass that an adversarial record reaches before the caps do.
  *
  * Failure mode if this is skipped or widened: nothing looks wrong. The prompt
  * still renders, the concierge still answers, and the only symptom is that a
@@ -219,20 +226,34 @@ function project(
   // engine's own key enumeration, which no code here can make sublinear;
   // the allocation, the recursion, and the output no longer are.
   for (const key in value as Record<string, unknown>) {
+    // INVARIANT: every ITERATION costs budget, including one that is about to
+    // be skipped. Charging only the iterations that produce output left a hole
+    // exactly the size of the skipped ones: an object carrying enumerable
+    // properties on its PROTOTYPE is walked property by property while the
+    // own-property check sends each one to `continue`, so the loop could run
+    // for as long as the prototype chain is wide without the budget noticing.
+    // Work is what the budget exists to bound, and a skipped property costs
+    // work.
+    if (budget.nodes <= 0) {
+      omitted = true;
+      break;
+    }
+    budget.nodes--;
     if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
-    if (kept >= CONCIERGE_MAX_OBJECT_KEYS || budget.nodes <= 0) {
+    if (kept >= CONCIERGE_MAX_OBJECT_KEYS) {
       omitted = true;
       break;
     }
     // The KEY is agent-steerable too (a state-store key becomes an object key
-    // in some projections), so it is capped exactly like a value. Capping it
-    // does not spend node budget: a key is not a subtree to descend into.
-    out[capString(key)] = project(
-      (value as Record<string, unknown>)[key],
-      arrayCap,
-      depth - 1,
-      budget,
-    );
+    // in some projections), so it is capped exactly like a value.
+    //
+    // Redaction happens HERE, on the ORIGINAL key, and short-circuits the
+    // subtree: a sensitive key never has its value walked at all. Testing the
+    // capped key instead would be a defect, because truncating a long key can
+    // cut off the very substring that marks it sensitive.
+    out[capString(key)] = isSensitiveKey(key)
+      ? REDACTED_MARKER
+      : project((value as Record<string, unknown>)[key], arrayCap, depth - 1, budget);
     kept++;
   }
   if (omitted) out["[keys-omitted]"] = true;
@@ -243,7 +264,13 @@ export function buildConciergePrompt(args: {
   question: string;
   context: ConciergeContextBundle;
 }): ConciergePromptMessage[] {
-  const safeContext = boundConciergeRecords(scrubSensitive(args.context));
+  // ONE bounded walk, redaction included. Redaction used to run first, as its
+  // own unbounded recursive pass over the whole bundle, and it therefore
+  // rebuilt every record before any cap applied: the caps below bounded the
+  // second walk while the first one was free to walk anything the reader
+  // returned. Fusing them means there is no longer a pass that an oversized or
+  // deeply nested record can reach before the bound does.
+  const safeContext = boundConciergeRecords(args.context);
   const isSummarization = isSummarizationQuery(args.question);
 
   // ZZZZ: summarization-specific anti-hallucination clause. Appended to
@@ -334,24 +361,13 @@ export function compileConciergePrompt(args: {
   };
 }
 
-export function scrubSensitive<T>(value: T): T {
-  return scrub(value) as T;
-}
-
-function scrub(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(scrub);
-  if (!value || typeof value !== "object") return value;
-  const record = value as Record<string, unknown>;
-  const out: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(record)) {
-    if (isSensitiveKey(key)) {
-      out[key] = "[redacted]";
-    } else {
-      out[key] = scrub(item);
-    }
-  }
-  return out;
-}
+/**
+ * Value written in place of anything under a sensitive key.
+ *
+ * ASCII only, for the same reason as {@link TRUNCATION_MARKER}: this string is
+ * scanned by the shared injection detector along with the records.
+ */
+const REDACTED_MARKER = "[redacted]";
 
 function isSensitiveKey(key: string): boolean {
   const normalized = key.toLowerCase();

@@ -239,6 +239,15 @@ async function tryLoadSubstrateSelector(storagePath: string): Promise<{
     // load checkpoint raises is typed, so it propagates and the caller reports
     // it, remedy verb included. Everything else (no fortress, no passphrase,
     // unreadable custody) stays the honest "not available here" null.
+    //
+    // ONE class covers both refusal families because
+    // `IntelligenceConfigUnreadableError` (corrupt or version-too-new record)
+    // EXTENDS `LocalIntegrityStateLoadError` (armed record failed Q5
+    // validation); see the declaration in `../intelligence/policy-store.ts`.
+    // If those classes are ever separated, this line silently stops covering
+    // the unreadable case and the swallow returns. The tripwire is
+    // "pins the inheritance the compile-preview rethrow depends on" in
+    // `test/policy-engine/english-policy-compiler.test.ts`.
     if (cause instanceof LocalIntegrityStateLoadError) throw cause;
     return null;
   }

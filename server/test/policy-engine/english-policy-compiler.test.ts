@@ -51,7 +51,11 @@ import {
 import { runPolicyCommand } from "../../src/cli/policy.js";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { INTELLIGENCE_CONFIG_RESET_VERB } from "../../src/intelligence/policy-store.js";
+import {
+  INTELLIGENCE_CONFIG_RESET_VERB,
+  IntelligenceConfigUnreadableError,
+  LocalIntegrityStateLoadError,
+} from "../../src/intelligence/policy-store.js";
 import { establishMaster } from "../../src/core/master-custody.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import type { SubstrateSelector } from "../../src/intelligence/selector.js";
@@ -486,6 +490,23 @@ describe("Xi-1 — CLI subcommands", () => {
    * the operator's next move (trusting a preview built without the substrate
    * they think they configured) is made on a false premise.
    */
+  it("pins the inheritance the compile-preview rethrow depends on", () => {
+    // `tryLoadSubstrateSelector` rethrows on `LocalIntegrityStateLoadError`
+    // alone, and that single check is only sufficient because the unreadable
+    // -record error is a SUBCLASS of it. Nothing in that catch says so, and
+    // nothing would fail to compile if the two classes were ever separated:
+    // an unreadable record would go straight back to being swallowed as
+    // "intelligence not configured", silently, which is the exact defect the
+    // rethrow exists to close. This assertion is the tripwire for that.
+    expect(new IntelligenceConfigUnreadableError("corrupt"))
+      .toBeInstanceOf(LocalIntegrityStateLoadError);
+    expect(new IntelligenceConfigUnreadableError("version-too-new", 99))
+      .toBeInstanceOf(LocalIntegrityStateLoadError);
+    // And the message an operator sees still names the one recovery verb.
+    expect(new IntelligenceConfigUnreadableError("corrupt").message)
+      .toContain(INTELLIGENCE_CONFIG_RESET_VERB);
+  });
+
   it("does not swallow an unreadable-record refusal as \"no substrate configured\"", async () => {
     // Bytes no key can open, in the record's exact on-disk location. Corrupt is
     // corrupt under any master key, so this needs no fortress key material.
