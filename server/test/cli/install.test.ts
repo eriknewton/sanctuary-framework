@@ -18,6 +18,10 @@ import {
   type AgentInstallPlan,
   type InstallProbeResult,
 } from "../../src/cli/install.js";
+import {
+  installerRequiredSealedCliRuntimeEntries,
+  sealedCliRuntimeManifestPath,
+} from "../../scripts/sealed-cli-runtime-entries.mjs";
 import { parseWrapArgs, runWrap, type WrapOptions } from "../../src/wrap/cli.js";
 import { TOP_LEVEL_SUBCOMMANDS } from "../../src/cli/subcommands.js";
 
@@ -139,10 +143,13 @@ describe("sanctuary install agent contract", () => {
   it("rejects a tampered sealed-runtime manifest payload", async () => {
     const contents = await mkdtemp(join(tmpdir(), "sanctuary-runtime-manifest-"));
     try {
+      // Every installer-required sealed-runtime entry (bundler entries as files,
+      // asset directories through their sentinel) comes from the shared contract.
+      const requiredRuntimePaths = installerRequiredSealedCliRuntimeEntries().map(sealedCliRuntimeManifestPath);
       const paths = [
         "MacOS/sanctuary",
         "Resources/boot-runtime/node",
-        "Resources/cli-runtime/dist/cli.js",
+        ...requiredRuntimePaths,
         "Resources/cli-runtime/package.json",
         "Resources/cli-runtime/node_modules/@lmdb/lmdb-darwin-arm64/node.napi.node",
         "Resources/cli-runtime/node_modules/@msgpackr-extract/msgpackr-extract-darwin-arm64/node.napi.glibc.node",
@@ -185,6 +192,30 @@ describe("sanctuary install agent contract", () => {
       await expect(verifyCastleWallRuntimeManifest(bytes, contents, {
         sourceSha: "a".repeat(40), nodeVersion: "v22.0.0",
       })).resolves.toBe(true);
+      // A runtime that is internally consistent but lacks one required entry
+      // (here the storage worker every fortress creation forks, then each other
+      // required entry in turn) is refused: the installer must never plan
+      // against a runtime that boots a fortress and cannot create one.
+      for (const absent of requiredRuntimePaths) {
+        const remaining = files.filter((entry) => entry.path !== absent);
+        const withoutEntry = {
+          ...manifest,
+          inventory: {
+            ...manifest.inventory,
+            file_count: remaining.length,
+            total_bytes: remaining.reduce((sum, entry) => sum + entry.size, 0),
+          },
+          files: remaining,
+        };
+        await expect(
+          verifyCastleWallRuntimeManifest(
+            Buffer.from(`${JSON.stringify(withoutEntry)}\n`),
+            contents,
+            { sourceSha: "a".repeat(40), nodeVersion: "v22.0.0" },
+          ),
+          `manifest without ${absent} must be refused`,
+        ).resolves.toBe(false);
+      }
       for (const invalid of [
         {
           ...manifest,

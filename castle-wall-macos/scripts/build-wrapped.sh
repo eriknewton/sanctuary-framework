@@ -66,6 +66,9 @@ CLI_RUNTIME_SRC="${SANCTUARY_CLI_RUNTIME_DIR:-${REPO_DIR}/server/dist}"
 CLI_RUNTIME_NODE_MODULES="${SANCTUARY_CLI_NODE_MODULES:-${REPO_DIR}/server/node_modules}"
 CLI_RUNTIME_PACKAGE_JSON="${SANCTUARY_CLI_PACKAGE_JSON:-${REPO_DIR}/server/package.json}"
 CLI_RUNTIME_MACH_O_SCANNER="${PKG_DIR}/scripts/list-cli-runtime-mach-o.mjs"
+# The single copy step for the sealed runtime (also invoked by the tests under
+# server/test/structure/); see the invariant at its call site below.
+CLI_RUNTIME_STAGER="${PKG_DIR}/scripts/stage-cli-runtime.sh"
 SANCTUARY_LAUNCHER_EXE_NAME="SanctuaryLauncher"
 SANCTUARY_LAUNCHER_DST="${WRAPPED_APP_DIR}/Contents/MacOS/sanctuary"
 
@@ -190,24 +193,20 @@ if [ -n "${BOOT_RUNTIME_NODE_SRC}" ] && [ -x "${BOOT_RUNTIME_NODE_SRC}" ] && [ -
     cp "${BOOT_RUNTIME_DAEMON_SRC}" "${BOOT_RUNTIME_DIR}/castle-wall-boot-daemon.js"
     chmod 0555 "${BOOT_RUNTIME_DIR}/node"
     chmod 0444 "${BOOT_RUNTIME_DIR}/castle-wall-boot-daemon.js"
-    if [ ! -f "${CLI_RUNTIME_SRC}/cli.js" ] \
-        || [ ! -d "${CLI_RUNTIME_SRC}/templates" ] \
-        || [ ! -d "${CLI_RUNTIME_SRC}/reference-plugin" ] \
-        || [ ! -d "${CLI_RUNTIME_NODE_MODULES}" ] \
-        || [ ! -f "${CLI_RUNTIME_PACKAGE_JSON}" ]; then
-        fail "signed build requires the built CLI runtime, templates, and reference plugins under ${CLI_RUNTIME_SRC}"
-    fi
     log "bundling signed-app CLI runtime for factory hosts without Node/npm"
-    mkdir -p "${CLI_RUNTIME_DIR}/dist"
-    cp "${CLI_RUNTIME_SRC}/cli.js" "${CLI_RUNTIME_DIR}/dist/cli.js"
-    cp "${CLI_RUNTIME_PACKAGE_JSON}" "${CLI_RUNTIME_DIR}/package.json"
-    cp -R "${CLI_RUNTIME_SRC}/templates" "${CLI_RUNTIME_DIR}/templates"
-    cp -R "${CLI_RUNTIME_SRC}/reference-plugin" "${CLI_RUNTIME_DIR}/reference-plugin"
-    mkdir -p "${CLI_RUNTIME_DIR}/node_modules"
-    rsync -a --exclude='.bin' "${CLI_RUNTIME_NODE_MODULES}/" "${CLI_RUNTIME_DIR}/node_modules/"
-    if find "${CLI_RUNTIME_DIR}" -type l -print -quit | grep -q .; then
-        fail "CLI runtime must not contain symbolic links"
-    fi
+    # INVARIANT: the sealed runtime is staged ONLY through stage-cli-runtime.sh,
+    # which ships the complete built dist tree and fails closed when a required
+    # entry is absent. dist/cli.js forks dist/directory-capability-worker.js on
+    # every fortress creation and reads dist/templates, dist/reference-plugin
+    # and dist/intelligence/* by path, so a hand-typed copy list here ships a
+    # runtime that boots an existing fortress and cannot create one. The same
+    # script stages the layout the structure/smoke tests exercise, so the tested
+    # layout and the shipped layout cannot diverge.
+    SANCTUARY_CLI_RUNTIME_DIR="${CLI_RUNTIME_SRC}" \
+    SANCTUARY_CLI_NODE_MODULES="${CLI_RUNTIME_NODE_MODULES}" \
+    SANCTUARY_CLI_PACKAGE_JSON="${CLI_RUNTIME_PACKAGE_JSON}" \
+        bash "${CLI_RUNTIME_STAGER}" "${CLI_RUNTIME_DIR}" \
+        || fail "signed build requires the complete built CLI runtime under ${CLI_RUNTIME_SRC} (run npm run build in server/)"
 elif [ "${REQUIRE_BOOT_RUNTIME}" = "1" ]; then
     fail "signed build requires SANCTUARY_BOOT_RUNTIME_NODE and built ${BOOT_RUNTIME_DAEMON_SRC}"
 else
