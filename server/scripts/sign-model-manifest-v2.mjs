@@ -51,7 +51,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { ed25519 } from "@noble/curves/ed25519";
@@ -399,6 +399,19 @@ function repin(repinRoot, digest) {
 async function main() {
   const options = parseArgs(process.argv);
   const registryOrigin = validateRegistryOrigin(options.registryOrigin);
+  if (options.testTrustRoot !== null) {
+    // A test root must never touch the compiled pins or the packaged asset:
+    // repinning to a test-key asset would make the build accept bytes the
+    // runtime pin can never verify. Test runs write and repin only in a
+    // staging root outside this checkout, or not at all.
+    if (options.repin && options.repinRoot === SERVER_DIR) {
+      die("--test-trust-root-b64url refuses to repin the compiled constants; pass --no-repin or a --repin-root outside the server checkout");
+    }
+    const packagedDir = join(SERVER_DIR, "src", "intelligence", "model-manifest");
+    if (options.out === DEFAULT_OUT || options.out.startsWith(`${packagedDir}${sep}`) || options.out.startsWith(`${join(SERVER_DIR, "src")}${sep}`)) {
+      die("--test-trust-root-b64url refuses to write under the packaged asset path; pass an --out outside the server checkout");
+    }
+  }
   const trustRoot = resolveTrustRoot(options.testTrustRoot);
   const seed = options.placeholder ? null : loadSeed(trustRoot);
   const source = readSource(options.source);

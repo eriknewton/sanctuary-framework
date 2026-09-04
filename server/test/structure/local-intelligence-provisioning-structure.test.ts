@@ -54,6 +54,20 @@ describe("local intelligence provisioning structural inventory", () => {
       expect(caller).toContain("--model-manifest");
       expect(caller).toContain("modelManifestPath: options.modelManifestPath");
     }
+    // Neither production caller passes a `deps` argument at all, so every
+    // test seam (including `modelManifestV2PublicKey`) is unreachable from
+    // production: the ceremony runs on its compiled defaults.
+    const callSite = (source: string, callee: string) => {
+      const match = new RegExp(`await ${callee}\\(\\{[\\s\\S]*?\\n\\s*\\}\\);`).exec(source);
+      expect(match, `${callee}({...}) call site present`).not.toBeNull();
+      return match![0];
+    };
+    for (const [source, callee] of [[wrap, "runner"], [init, "localSetup"]] as const) {
+      const call = callSite(source, callee);
+      expect(call).not.toMatch(/\}\s*,\s*\{/);
+      expect(call).not.toMatch(/\}\s*,\s*[A-Za-z_$][\w$]*\s*\)/);
+      expect(call).not.toContain("modelManifestV2PublicKey");
+    }
   });
 
   it("pins the packaged asset bytes at build, at load, and in the package exports", () => {
@@ -85,6 +99,7 @@ describe("local intelligence provisioning structural inventory", () => {
       "integrity_asset_unparseable",
       "integrity_asset_signature_invalid",
       "integrity_asset_pin_mismatch",
+      "integrity_asset_module_location_unavailable",
     ]) {
       expect(loader).toContain(`"${reason}"`);
       expect(provisioning).toContain(`${reason}:`);

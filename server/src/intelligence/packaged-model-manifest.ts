@@ -20,6 +20,12 @@
  * `INTEL_OPS.LOAD_INTEGRITY`; the ceremony then refuses with the same reason.
  * Absence, oversize, unparseable bytes, a bad signature, and a build-pin
  * mismatch are all refusals. None of them reads as "legacy" or "unverified".
+ *
+ * CJS BOUND: the packaged asset is located from this module's own URL. The
+ * CommonJS builds (`dist/index.cjs`, `dist/intelligence/index.cjs`) carry no
+ * `import.meta.url`, so a CommonJS consumer cannot locate the asset and gets
+ * the distinct refusal `integrity_asset_module_location_unavailable`; the ESM
+ * CLI (`sanctuary`) is the provisioning path.
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
@@ -77,6 +83,7 @@ export const PACKAGED_MODEL_MANIFEST_REFUSAL_REASONS = [
   "integrity_asset_unparseable",
   "integrity_asset_signature_invalid",
   "integrity_asset_pin_mismatch",
+  "integrity_asset_module_location_unavailable",
 ] as const;
 export type PackagedModelManifestRefusalReason =
   (typeof PACKAGED_MODEL_MANIFEST_REFUSAL_REASONS)[number];
@@ -125,6 +132,8 @@ export interface LoadPackagedModelManifestV2Options {
    * directory. See `resolvePackagedModelManifestV2AssetPath`.
    */
   moduleDir?: string;
+  /** Test seam for the CommonJS bound: the value `import.meta.url` would have. */
+  moduleUrl?: unknown;
   audit?: (event: PackagedModelManifestAuditEvent) => Promise<void> | void;
 }
 
@@ -141,11 +150,31 @@ export interface LoadPackagedModelManifestV2Options {
  * file is the `integrity_asset_absent` verdict.
  */
 export function resolvePackagedModelManifestV2AssetPath(
-  moduleDir: string = dirname(fileURLToPath(import.meta.url)),
+  moduleDir: string = resolveModuleDir(import.meta.url),
 ): string {
   const [segment] = PACKAGED_MODEL_MANIFEST_V2_ASSET_RELATIVE_PATH.split("/");
   const packageRoot = basename(moduleDir) === segment ? dirname(moduleDir) : moduleDir;
   return join(packageRoot, ...PACKAGED_MODEL_MANIFEST_V2_ASSET_RELATIVE_PATH.split("/"));
+}
+
+/**
+ * This module's own directory. `import.meta.url` is a `file:` URL in the ESM
+ * builds and unset in the CommonJS builds; the CommonJS case is the named
+ * bound, not a generic failure, so it throws a typed marker the loader maps
+ * to `integrity_asset_module_location_unavailable`.
+ */
+class ModuleLocationUnavailableError extends Error {
+  constructor() {
+    super("packaged asset cannot be located from a CommonJS entry; use the ESM CLI");
+    this.name = "ModuleLocationUnavailableError";
+  }
+}
+
+export function resolveModuleDir(url: unknown): string {
+  if (typeof url !== "string" || !url.startsWith("file:")) {
+    throw new ModuleLocationUnavailableError();
+  }
+  return dirname(fileURLToPath(url));
 }
 
 function sha256Hex(bytes: Uint8Array): string {
@@ -272,9 +301,14 @@ export async function loadPackagedModelManifestV2(
   } else {
     let canonicalPath: string;
     try {
-      canonicalPath = resolvePackagedModelManifestV2AssetPath(options.moduleDir);
-    } catch {
-      return refuse("integrity_asset_absent", "module_location_unavailable");
+      canonicalPath = resolvePackagedModelManifestV2AssetPath(
+        options.moduleDir ?? ("moduleUrl" in options ? resolveModuleDir(options.moduleUrl) : undefined),
+      );
+    } catch (error) {
+      return refuse(
+        "integrity_asset_module_location_unavailable",
+        error instanceof ModuleLocationUnavailableError ? "commonjs_entry" : ioCode(error),
+      );
     }
     read = await readBounded(canonicalPath);
   }

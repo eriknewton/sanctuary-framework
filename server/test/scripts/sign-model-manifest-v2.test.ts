@@ -227,6 +227,27 @@ describe("sign-model-manifest-v2 tool", () => {
     expect(oversizeFinished).toBe(false);
   }, TOOL_TIMEOUT_MS);
 
+  it("refuses to repin the compiled constants or write the packaged asset under a test trust root", async () => {
+    const repinDefault = await spawnTool(
+      ["--source", SOURCE, "--out", join(work, "guard-asset.json"), "--registry-origin", origin, "--placeholder", "--test-trust-root-b64url", PUBLIC_B64URL],
+      {},
+    );
+    expect(repinDefault.status).toBe(1);
+    expect(repinDefault.stderr).toContain("refuses to repin the compiled constants");
+    const packagedOut = join(SERVER_ROOT, "src", "intelligence", "model-manifest", "model-manifest.v2.json");
+    const before = readFileSync(packagedOut);
+    const writePackaged = await spawnTool(
+      ["--source", SOURCE, "--out", packagedOut, "--registry-origin", origin, "--placeholder", "--no-repin", "--test-trust-root-b64url", PUBLIC_B64URL],
+      {},
+    );
+    expect(writePackaged.status).toBe(1);
+    expect(writePackaged.stderr).toContain("refuses to write under the packaged asset path");
+    expect(readFileSync(packagedOut).equals(before)).toBe(true);
+    for (const [file, name] of PIN_FILES) {
+      expect(readPin(SERVER_ROOT, file, name)).toBe(createHash("sha256").update(before).digest("hex"));
+    }
+  }, TOOL_TIMEOUT_MS);
+
   it("refuses a non-loopback, non-production registry origin before any fetch", async () => {
     const result = await spawnTool(
       ["--source", SOURCE, "--out", join(work, "unused.json"), "--registry-origin", "https://example.invalid", "--placeholder"],

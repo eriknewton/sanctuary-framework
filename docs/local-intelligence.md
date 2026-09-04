@@ -1,10 +1,10 @@
 # Local intelligence: the model-provisioning ceremony
 
-> **Status:** the provisioning ceremony described here is in the unreleased
-> tree and ships with the next release. Sanctuary has code paths and tests for
-> signed model-manifest binding and bounded local layer verification;
-> production activation on a real host is pending host evidence, and this page
-> will say so in plain terms once that evidence exists.
+> **Status:** the provisioning ceremony described here ships in this release.
+> Sanctuary has code paths and tests for signed model-manifest binding and
+> bounded local layer verification; production activation on a real host is
+> pending host evidence, and this page will say so in plain terms once that
+> evidence exists.
 
 Local intelligence is Sanctuary's own cognition running on a local model
 through Ollama: the concierge, the sentinel scorer, the gate advisor, the
@@ -33,8 +33,7 @@ Each check defends against one thing, and it is worth being exact. The byte pin
 defends against an altered manifest file inside an otherwise intact package.
 The signature defends against a manifest signed by any other key. Neither
 defends against a package whose code has itself been rewritten; only the
-package's own release provenance (the signed release manifest you verify at
-install) covers that.
+package's own release provenance covers that.
 
 The first manifest lists the default models for the three hardware
 bands (8, 16, and 32 GiB of RAM) with their exact Ollama registry digests, so
@@ -54,3 +53,7 @@ the model that is pulled is the one that was signed.
   is not available there; install Ollama, then re-run the ceremony.
 - **Interactive only.** A headless run refuses before touching the host or the
   manifest.
+- **ESM entry only.** The packaged manifest is located from the module's own
+  file URL, which the CommonJS builds of the library do not carry; a CommonJS
+  consumer gets a named refusal, and the `sanctuary` CLI is the provisioning
+  path.

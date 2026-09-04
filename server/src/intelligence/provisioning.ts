@@ -179,6 +179,7 @@ const FAILURE_COPY: Record<LocalProvisioningRefusalReason, string> = {
   integrity_asset_unparseable: "The signed model manifest is not a valid V2 envelope; no model pull was attempted.",
   integrity_asset_signature_invalid: "The signed model manifest does not verify under the pinned catalog root; no model pull was attempted.",
   integrity_asset_pin_mismatch: "The packaged model manifest does not match the build-time byte pin; no model pull was attempted.",
+  integrity_asset_module_location_unavailable: "The packaged model manifest cannot be located from a CommonJS entry point; run the ESM CLI (sanctuary) to provision. No model pull was attempted.",
   integrity_state_absent: "The signed V2 model catalog is unavailable; no model pull was attempted.",
   integrity_state_invalid: "The signed V2 model catalog or armed record is invalid; no model pull was attempted.",
   manifest_signature_invalid: "The V2 model catalog signature is invalid; no model pull was attempted.",

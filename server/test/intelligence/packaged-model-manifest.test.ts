@@ -7,7 +7,8 @@
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 import { INTEL_OPS } from "../../src/intelligence/audit-events.js";
@@ -20,6 +21,7 @@ import {
   PACKAGED_MODEL_MANIFEST_V2_MAX_BYTES,
   loadPackagedModelManifestV2,
   mapModelManifestV2RefusalToAssetRefusal,
+  resolveModuleDir,
   resolvePackagedModelManifestV2AssetPath,
   type PackagedModelManifestAuditEvent,
 } from "../../src/intelligence/packaged-model-manifest.js";
@@ -292,7 +294,27 @@ describe("packaged model manifest loader", () => {
       "integrity_asset_unparseable",
       "integrity_asset_signature_invalid",
       "integrity_asset_pin_mismatch",
+      "integrity_asset_module_location_unavailable",
     ]);
+  });
+
+  it("names the CommonJS bound when the module cannot locate itself", async () => {
+    // The ESM test runner has a file: URL; the seam supplies what the CommonJS
+    // builds see (no import.meta.url), which is a distinct named refusal.
+    expect(() => resolveModuleDir(undefined)).toThrow(/CommonJS entry/);
+    expect(() => resolveModuleDir("")).toThrow(/CommonJS entry/);
+    expect(resolveModuleDir(import.meta.url)).toBe(dirname(fileURLToPath(import.meta.url)));
+    await expect(loadPackagedModelManifestV2({
+      moduleUrl: undefined,
+      publicKey: Q5E_PUBLIC_KEY,
+      audit,
+    })).resolves.toMatchObject({
+      ok: false,
+      source: "packaged",
+      reason: "integrity_asset_module_location_unavailable",
+      detail: "commonjs_entry",
+    });
+    expect(lastAudit()?.details).toMatchObject({ reason: "integrity_asset_module_location_unavailable" });
   });
 
   it("derives one canonical asset path from the module directory for every bundle layout", () => {

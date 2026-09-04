@@ -117,6 +117,7 @@ export {
   PACKAGED_MODEL_MANIFEST_V2_MAX_BYTES,
   loadPackagedModelManifestV2,
   mapModelManifestV2RefusalToAssetRefusal,
+  resolveModuleDir,
   resolvePackagedModelManifestV2AssetPath,
   type LoadPackagedModelManifestV2Options,
   type PackagedModelManifestAuditEvent,
