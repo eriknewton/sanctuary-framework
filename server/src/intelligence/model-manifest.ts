@@ -33,9 +33,41 @@ export const MODEL_MANIFEST_DOMAIN = "sanctuary.model-manifest.v1";
  */
 export const MODEL_MANIFEST_DELIMITER = "\n";
 
-/** The model contract reuses the current release-signing public key. */
+/**
+ * The HISTORICAL V1 model contract reused the release-signing public key. This
+ * constant stays on that key because two frozen surfaces still read it: the
+ * V1 verifier below (compatibility only; V1 never arms Q5) and the catalog v3
+ * epoch-1 bootstrap keyring in `model-catalog-v3.ts`, whose compiled
+ * key-policy digest is self-checked at import and must not move here.
+ */
 export const PINNED_MODEL_MANIFEST_SIGNING_PUBLIC_KEY_B64URL =
   PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL;
+
+/**
+ * The PINNED Sanctuary model-catalog root public key, base64url-encoded.
+ *
+ * LIVE PRODUCTION TRUST ROOT for `sanctuary.model-manifest.v2` bodies (the
+ * signed model manifest the provisioning ceremony verifies before any pull).
+ * Dedicated Ed25519 key, minted 2026-09-03 under owner ruling 2
+ * (`Wiki/decisions/rung2-catalog-publish-rulings-2026-09-03.md`): the catalog
+ * root is deliberately NOT the release-signing key, so compromise of one
+ * signing capability does not grant the other. Custody of the private half is
+ * the operator's, off-host and outside this repo; the register row is
+ * "Model-catalog root seed" in the private `FORTRESS_KEYS.md`. Signing reads
+ * the seed only from the `SANCTUARY_MODEL_CATALOG_ROOT_SEED_B64URL`
+ * environment variable at run time (`scripts/sign-model-manifest-v2.mjs`).
+ *
+ * Must match the public half recorded in
+ * `model-catalog-root-public-2026-09-03.txt` in the operator's off-host key
+ * backup (hex fa4a6406022dae5b61362be587fa5f8d66eba5c40f11ed733ddc7a1b0b5cb36c).
+ * Rotation is a signed release: replace this constant, re-sign the packaged
+ * manifest with the successor seed, and ship both in the same version.
+ *
+ * `loadPinnedModelManifestKey` rejects an all-zero or wrong-length value, so a
+ * blanked constant fails closed instead of admitting a universal forgery.
+ */
+export const PINNED_MODEL_CATALOG_ROOT_PUBLIC_KEY_B64URL =
+  "-kpkBgItrlthNivlh_pfjWbrpcQPEe1zPdx6Gwtcs2w";
 
 export const MODEL_MANIFEST_TIERS = ["baseline", "mid", "pro"] as const;
 export type ModelManifestTier = (typeof MODEL_MANIFEST_TIERS)[number];
@@ -609,15 +641,35 @@ export function verifyModelManifestWithKey(
   return { ok: true, body: parsed.value.body };
 }
 
+/**
+ * The compiled trust root for the LIVE V2 model-manifest path. Every V2
+ * consumer (the provisioning verifier, the armed-state validator in
+ * `policy-store.ts`, and the packaged-asset loader) takes its key from here, so
+ * there is exactly one production decision about which key signs model
+ * manifests. Returns null for a wrong-length or all-zero constant: the all-zero
+ * key is the Ed25519 identity point and verifies an all-zero signature for ANY
+ * message, so a blanked pin must refuse rather than admit a universal forgery.
+ */
 export function loadPinnedModelManifestKey(): Uint8Array | null {
-  return loadPinnedReleaseKey();
+  try {
+    const key = fromBase64urlStrict(PINNED_MODEL_CATALOG_ROOT_PUBLIC_KEY_B64URL);
+    if (key.length !== ED25519_PUBLIC_KEY_BYTES) return null;
+    if (isAllZero(key)) return null;
+    return key;
+  } catch {
+    return null;
+  }
 }
 
+/**
+ * Historical V1 verification stays on the release-signing key its constant
+ * names; V1 cannot arm Q5, so it never inherits the catalog root above.
+ */
 export function verifyModelManifest(
   text: string | null | undefined,
   options: ModelManifestVerificationOptions = {},
 ): ModelManifestVerificationResult {
-  const key = loadPinnedModelManifestKey();
+  const key = loadPinnedReleaseKey();
   if (key === null) return { ok: false, reason: "bad_pinned_key_length" };
   return verifyModelManifestWithKey(text, key, options);
 }

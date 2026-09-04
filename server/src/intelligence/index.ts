@@ -65,6 +65,7 @@ export {
   MODEL_MANIFEST_MIN_PARAMS_B,
   MODEL_MANIFEST_RUNTIMES,
   MODEL_MANIFEST_TIERS,
+  PINNED_MODEL_CATALOG_ROOT_PUBLIC_KEY_B64URL,
   PINNED_MODEL_MANIFEST_SIGNING_PUBLIC_KEY_B64URL,
   buildModelManifestMessage,
   loadPinnedModelManifestKey,
@@ -117,6 +118,23 @@ export {
   type SignedOllamaIdentityV2,
   type VerifiedLocalBindingV2,
 } from "./model-manifest-v2.js";
+
+export {
+  PACKAGED_MODEL_MANIFEST_AUDIT_STAGE,
+  PACKAGED_MODEL_MANIFEST_REFUSAL_REASONS,
+  PACKAGED_MODEL_MANIFEST_V2_ASSET_RELATIVE_PATH,
+  PACKAGED_MODEL_MANIFEST_V2_ASSET_SHA256,
+  PACKAGED_MODEL_MANIFEST_V2_MAX_BYTES,
+  loadPackagedModelManifestV2,
+  mapModelManifestV2RefusalToAssetRefusal,
+  resolveModuleDir,
+  resolvePackagedModelManifestV2AssetPath,
+  type LoadPackagedModelManifestV2Options,
+  type PackagedModelManifestAuditEvent,
+  type PackagedModelManifestLoadResult,
+  type PackagedModelManifestRefusalReason,
+  type PackagedModelManifestSource,
+} from "./packaged-model-manifest.js";
 
 export {
   ASSURANCES,

@@ -593,6 +593,12 @@ export interface WrapOptions {
   /** Pre-answer local-model setup; a positive answer still requires a TTY confirm. */
   provisionLocalIntelligence?: boolean;
   /**
+   * `--model-manifest <path>`: verify an operator-supplied signed model
+   * manifest instead of the one packaged with this release. Same loader,
+   * parser, byte cap, and pinned catalog root; nothing is fetched.
+   */
+  modelManifestPath?: string;
+  /**
    * Unified Protect Slice 5 S5-6: provision in FINE-GRAINED (exclusive-
    * egress) mode -- the agent's only sanctioned egress path becomes the
    * loopback policy gate; the harness is PARK-installed and released only
@@ -2512,6 +2518,9 @@ async function maybeRunLocalIntelligenceForWrap(
       auditLog,
       identityId,
       preAnswered: options.provisionLocalIntelligence,
+      ...(options.modelManifestPath === undefined
+        ? {}
+        : { modelManifestPath: options.modelManifestPath }),
       isTty: process.stdin.isTTY === true,
       // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
       print: (line) => console.error(`  ${line}`),
@@ -6402,6 +6411,7 @@ const WRAP_VALUE_FLAGS = new Set([
   "--dev-dist",
   "--sealed-launcher",
   "--write-passphrase-backup",
+  "--model-manifest",
 ]);
 
 /** Known boolean flags. */
@@ -6581,6 +6591,14 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--fortress":
         options.fortress = argv[++i];
         break;
+      case "--model-manifest": {
+        const value = argv[++i];
+        if (value === undefined || value.startsWith("-")) {
+          throw new Error("--model-manifest requires a path value");
+        }
+        options.modelManifestPath = value;
+        break;
+      }
       case "--dev-dist":
         options.devDist = argv[++i];
         break;
@@ -6652,6 +6670,11 @@ function printWrapHelp(): void {
                        SANCTUARY_FORTRESS_PATH env var when the flag is
                        absent. Use to keep multiple fortresses isolated
                        on one host.
+    --model-manifest <path>
+                       With --provision-local-intelligence: verify an
+                       operator-supplied signed model manifest instead of
+                       the one packaged with this release. Same pinned
+                       catalog root, parser, and byte cap; nothing fetched.
     --port <port>      Preferred dashboard port (default: 3501)
     --dashboard-port <port>
                        Preferred dashboard port (1024-65535). Overrides
