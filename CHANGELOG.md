@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-09-04
+
+### Fixed
+
+- **Local intelligence setup completes its own model download on a machine that has never run Ollama.** The model pull streams progress from the runtime instead of running under a fixed request timeout, so a multi-gigabyte download finishes rather than being cut off part-way; it is bounded by a stall deadline and an overall ceiling, with per-line and whole-response byte caps, and only the runtime's own completion signal counts as a finished pull. Any error, stall, or truncated response refuses and commits nothing. Setup prints the download's progress as it goes, and recognizes a host where Ollama is present but has no models yet, so it shows the plan and asks for consent instead of stopping early. A model directory that is unreadable, not owned by the operator, writable by others, or one an operator named explicitly that does not exist, is still refused, and the directory is re-checked in full after the download before anything is recorded.
+- **Local-intelligence integrity is checked at every startup.** Sanctuary verifies its stored local-intelligence configuration as part of coming up, on every fortress, whichever approval channel the operator has chosen; previously this check ran only under the dashboard channel. A fortress whose stored local-model state does not verify, or cannot be read, now refuses to start with a message naming the condition and the `sanctuary intelligence config-reset` recovery command, rather than starting quietly with local intelligence switched off. A fortress that never armed local intelligence starts as before.
+- **The concierge answers questions on an active fortress, and the prompt it builds is bounded.** Asking the concierge about a busy fortress could be refused before any model was contacted, because the briefing Sanctuary compiles from its own records was measured as if an outside caller had sent it. The briefing is now compiled in two parts: the instructions Sanctuary writes for itself, and the fortress records, which are screened as untrusted like any other input. The record half is capped, so how much of the prompt a stored record can occupy is Sanctuary's decision rather than the writer's. Injection, evasion, and the hard size ceiling still apply to every character. A prompt held back by screening is reported and audited as a screening decision, not as a provider outage.
+- **Local intelligence is set up only when asked.** A `sanctuary protect` or `sanctuary init` run with no terminal and no `--provision-local-intelligence` flag leaves local intelligence alone: it reads no configuration, records nothing, and marks no surface degraded; it prints one line saying how to opt in. Passing the flag on a machine with no terminal still refuses out loud.
+- **The armed state is visible.** `sanctuary intelligence diagnose` reports whether the fortress is armed, which signed model manifest version it verified, which model each surface is bound to and the digests behind those bindings, in both the human and `--json` views, using the same classification the running system uses. When the record cannot be verified, cannot be read, or the fortress credential is not available on this machine, it says which, and names the command that clears it where one exists. Setting local intelligence up confirms on screen that the signed manifest verified against the pinned catalog key and names the model it armed. `sanctuary concierge status` reports the model actually bound once a fortress is armed.
+
+### Bounds (unchanged)
+
+Ollama is installed by the operator on every platform; light assurance verifies the runtime-reported digest against the signed manifest at the documented checkpoints; there is no network discovery of newer signed manifests.
+
 ## [1.8.0] - 2026-09-04
 
 ### Added
