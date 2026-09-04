@@ -24,6 +24,7 @@ import { establishMaster } from "../../src/core/master-custody.js";
 import { INTEL_OPS } from "../../src/intelligence/audit-events.js";
 import { buildDefaultConfig } from "../../src/intelligence/defaults.js";
 import {
+  classifyLocalIntelligenceState,
   INTELLIGENCE_CONFIG_RESET_VERB,
   INTELLIGENCE_NAMESPACE,
   IntelligenceConfigStore,
@@ -335,7 +336,17 @@ describe.skipIf(!supported)("sanctuary intelligence config-reset", () => {
       configResetDeps: d.configResetDeps,
     });
     expect(code).toBe(CONFIG_RESET_EXIT.OK);
-    expect(d.output()).toContain("unreadable record: does not decrypt or parse (corrupt)");
+    // Derived from the shared classifier rather than re-typing the sentence:
+    // this test is about the boot-refuses / reset-clears SPLIT, and a second
+    // hand-copied snapshot of the prose only creates a second thing to drift.
+    // It already did: the wording moved when `describeOutcome` was rederived
+    // from `classifyLocalIntelligenceState`, and this line was the copy nobody
+    // updated. The literal snapshot is pinned once, by the sibling quarantine
+    // test above, which is the test that is actually about the wording.
+    const classified = classifyLocalIntelligenceState({ kind: "corrupt", config: buildDefaultConfig() });
+    expect(d.output()).toContain(`${classified.state}: ${classified.detail}`);
+    // The record really was read as unreadable, not merely described.
+    expect(d.output()).toContain("Quarantined ");
 
     // And the fortress starts again afterwards, now genuinely unarmed.
     await expect(new SubstrateSelector(selectorOptions).load()).resolves.toBeUndefined();
