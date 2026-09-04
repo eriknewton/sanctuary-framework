@@ -310,17 +310,27 @@ function sha256Hex(value: string): string {
  * field, so a malformed request can only tighten screening, never loosen it.
  *
  * Residual, stated rather than hidden: grouping splits one scanned string into
- * two, so a pattern that straddles the boundary between a first-party
- * contributor and an untrusted one is no longer adjacent to the pattern
- * matcher. Do NOT read that as "the attacker controls only one side."
- * `first_party_runtime` is a claim about who ASSEMBLED the bytes, not about
- * who authored them: a concierge briefing is compiled from this fortress's own
- * records, and those records quote agent-authored strings (audit detail lines,
- * identity labels, task titles), so an adversary can influence text in BOTH
- * groups. The actual residual is exactly the lost adjacency across the group
- * boundary, for a pattern whose halves are each individually benign. Every
- * byte is still scanned, contributor order inside each group is preserved, and
- * no pattern that fits within either group is lost.
+ * two, so a pattern that straddles the boundary between the first-party
+ * segment and the untrusted one is no longer adjacent to the pattern matcher.
+ * Every character still reaches the detector in one group or the other, and
+ * order within each group is preserved, so no pattern that fits inside a
+ * single group is lost. The residual is exactly that lost adjacency, for a
+ * pattern whose halves are each individually benign.
+ *
+ * The two groups are NOT scanned identically, and no comment here should imply
+ * they are: the first-party field is exempt from the prompt-stuffing size and
+ * repetition heuristic, which is the entire purpose of the split. Every other
+ * heuristic (role override, security bypass, Unicode and homoglyph, encoded
+ * payload, exfiltration) runs on both groups, and the hard artifact-size
+ * refusal counts both.
+ *
+ * What the exemption rests on is AUTHORSHIP, not assembly. The assembler
+ * verifies that the claimed prefix really is a prefix of the context it was
+ * handed, and the single production minting site names only its own fixed
+ * template text. Bytes this fortress merely assembled out of local records,
+ * which quote agent-authored strings such as audit detail lines, identity
+ * labels and task titles, fall outside that prefix and are screened as
+ * untrusted like any other input.
  */
 function detectorPayload(
   request: CompiledContextScanRequest,

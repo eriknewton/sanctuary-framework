@@ -49,6 +49,11 @@ import {
   handleEnglishPolicyRoute,
 } from "../../src/policy-engine/english-policy-routes.js";
 import { runPolicyCommand } from "../../src/cli/policy.js";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { INTELLIGENCE_CONFIG_RESET_VERB } from "../../src/intelligence/policy-store.js";
+import { establishMaster } from "../../src/core/master-custody.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import type { SubstrateSelector } from "../../src/intelligence/selector.js";
 
 const FORTRESS_A = "fortress_a";
@@ -467,6 +472,57 @@ describe("Xi-1 — CLI subcommands", () => {
         process.env["SANCTUARY_PASSPHRASE"] = savedPassphrase;
       }
     }
+  });
+
+  /**
+   * "Intelligence is not configured here" and "this fortress refused to load
+   * its intelligence state" are opposite facts, and the compile preview used
+   * to report both as the first.
+   *
+   * `tryLoadSubstrateSelector` wrapped its whole body in `catch { return null }`,
+   * which is right for a missing fortress or an absent passphrase and wrong for
+   * a typed load refusal: an unreadable or tampered record turned into a quiet
+   * deterministic-only compile that never said why. That is a silent unarm, and
+   * the operator's next move (trusting a preview built without the substrate
+   * they think they configured) is made on a false premise.
+   */
+  it("does not swallow an unreadable-record refusal as \"no substrate configured\"", async () => {
+    // Bytes no key can open, in the record's exact on-disk location. Corrupt is
+    // corrupt under any master key, so this needs no fortress key material.
+    // A real custody envelope, so the CLI's own master resolution succeeds and
+    // the run actually reaches the load checkpoint rather than bailing earlier.
+    const statePath = join(fortress.storagePath, "state");
+    await mkdir(statePath, { recursive: true, mode: 0o700 });
+    const established = await establishMaster({
+      storage: new FilesystemStorage(statePath),
+      passphrase: process.env["SANCTUARY_PASSPHRASE"]!,
+      firstRun: { installMode: "headless", mintRecoveryKey: false },
+    });
+    await established.masterWriteBarrier?.release();
+    established.masterKey.fill(0);
+
+    const intelligenceDir = join(statePath, "_intelligence");
+    await mkdir(intelligenceDir, { recursive: true, mode: 0o700 });
+    await writeFile(
+      join(intelligenceDir, "substrate-config.enc"),
+      '{"v":1,"alg":"aes-256-gcm","iv":"AAAA","ct":"AAAA"}',
+    );
+
+    const out = new CollectStream();
+    const err = new CollectStream();
+    const code = await runPolicyCommand({
+      argv: ["compile", "always require approval for state_export"],
+      out,
+      err,
+      storagePath: fortress.storagePath,
+    });
+
+    // Refused, not quietly downgraded, and the message names the remedy.
+    expect(code).toBe(1);
+    expect(err.text).toContain(INTELLIGENCE_CONFIG_RESET_VERB);
+    // The tell of the old behavior: a confident compiled result produced as if
+    // the substrate had simply not been configured.
+    expect(out.text).not.toContain("compile_confidence");
   });
 
   it("deterministic templates still return high confidence without substrate (BBBBB regression)", async () => {

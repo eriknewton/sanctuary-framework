@@ -44,6 +44,9 @@ import {
   type CompiledPolicy,
 } from "../policy-engine/english-policy-compiler.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
+// A typed load refusal must not be swallowed as "intelligence not configured";
+// see the catch in `tryLoadSubstrateSelector`.
+import { LocalIntegrityStateLoadError } from "../intelligence/policy-store.js";
 import { installConsentGatedRedactor } from "../intelligence/privacy-tier2-redactor.js";
 import { resolveStoragePath } from "../paths.js";
 import { loadConfig } from "../config.js";
@@ -227,7 +230,16 @@ async function tryLoadSubstrateSelector(storagePath: string): Promise<{
       fortressId: fortressIdFromStoragePath(storagePath),
     });
     return { selector, auditLog, fortressId };
-  } catch {
+  } catch (cause) {
+    // NOT a blanket swallow. "Intelligence is not configured here" and "this
+    // fortress refused to load its intelligence state" are opposite facts, and
+    // returning null for both turned a refusal into a silent unarm: the
+    // compile preview would quietly proceed without LLM assist and never say
+    // that a tampered or unreadable record was the reason. Every refusal the
+    // load checkpoint raises is typed, so it propagates and the caller reports
+    // it, remedy verb included. Everything else (no fortress, no passphrase,
+    // unreadable custody) stays the honest "not available here" null.
+    if (cause instanceof LocalIntegrityStateLoadError) throw cause;
     return null;
   }
 }

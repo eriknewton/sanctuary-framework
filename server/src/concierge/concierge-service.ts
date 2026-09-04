@@ -93,9 +93,16 @@ export class ConciergeService {
       //
       // The claim is a branded object, not a string: this is the one code path
       // that compiles the fortress briefing, so it is the one call site that
-      // may mint one. MUST MATCH the check in `compiled-context/compiler.ts`,
-      // which re-verifies the prefix against the context it is handed and also
-      // requires the surface to be in `FIRST_PARTY_CONTEXT_SURFACES`.
+      // may mint one.
+      //
+      // MUST MATCH `claimFirstPartyContext` in `../intelligence/types.js`,
+      // which carries the reciprocal pin, and the check in
+      // `compiled-context/compiler.ts`, which re-verifies the prefix against
+      // the context it is handed and requires the surface to be in
+      // `FIRST_PARTY_CONTEXT_SURFACES`. THIS FILE IS THE ONLY PRODUCTION
+      // MINTING SITE, asserted as a full set by "freezes the set of modules
+      // allowed to mint a first-party context claim" in
+      // `test/security/compiled-context-structural.test.ts`.
       const compiled = compileConciergePrompt({ question, context });
       const response = await this.selector.invokeSummarize("concierge", {
         kind: "summarize",

@@ -341,9 +341,15 @@ export interface FirstPartyContextClaim {
  * This function is exported, so the brand alone does not answer "which module
  * may claim." Two further checks do: the assembler honors a claim only on the
  * surfaces in `FIRST_PARTY_CONTEXT_SURFACES` (see
- * `../compiled-context/compiler.ts`), and a structural test pins the set of
- * `server/src` files allowed to call this function, so widening the set is a
- * visible edit rather than a quiet import.
+ * `../compiled-context/compiler.ts`), and the production caller set is pinned.
+ *
+ * MUST MATCH the single production call site in
+ * `../concierge/concierge-service.ts`, which carries the reciprocal pin, and
+ * the full-set assertion "freezes the set of modules allowed to mint a
+ * first-party context claim" in
+ * `test/security/compiled-context-structural.test.ts`. Adding a caller means
+ * editing that assertion, which is the point: a new minting site is a new
+ * claim about authorship and has to be argued for, not imported.
  */
 export function claimFirstPartyContext(
   firstPartyPrefix: string,

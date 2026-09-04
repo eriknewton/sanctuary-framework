@@ -1153,13 +1153,18 @@ export async function createSanctuaryServer(options?: {
   // the boot-path persistence work in Pi-2 needs the selector in scope
   // alongside the trap registry + trap store, so the declaration moves
   // here and the dashboard branch only assigns to it.
-  let intelligenceSelector: SubstrateSelector | undefined;
+  let intelligenceSelector: SubstrateSelector;
   // Rho-2.5: whether the consent-gated Tier B redactor was installed on
   // the selector above. Threaded into the v1.1 PII binding so the
   // `/api/query-anonymity/pii` route reports the truthful
-  // `effective_tier_b_enabled`. Stays false when the selector failed to
-  // construct (the route then honestly reports inactive).
-  let tierBPiiRedactorInstalled = false;
+  // `effective_tier_b_enabled`.
+  //
+  // No `= false` seed, and that is deliberate: the wiring block below either
+  // completes or throws, so a boot that reaches this point always installed
+  // the redactor. The old seed described a third state, "booted with the
+  // redactor absent and the route reporting inactive", which no longer exists
+  // and must not be implied by a dead initializer.
+  let tierBPiiRedactorInstalled: boolean;
 
   // Identity binding for every intelligence-layer construction below. Pure
   // function of state already resolved above, so computing it here rather

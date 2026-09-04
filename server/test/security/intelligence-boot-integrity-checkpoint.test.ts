@@ -252,6 +252,103 @@ describe("local-intelligence load integrity is checked on the default approval c
 });
 
 /**
+ * A record that EXISTS and cannot be read is indeterminate, and indeterminate
+ * is not absent.
+ *
+ * The loader used to return a default config for a `corrupt` or
+ * `version-too-new` record and the selector fell through to it, so a fortress
+ * whose armed record had been damaged, or written by a newer build, started
+ * clean and audited `was_default: true`. Absence claims nobody armed this
+ * fortress; unreadability cannot claim that, because the evidence either way
+ * is exactly what is missing. Both now refuse, and both name the one command
+ * that clears the record.
+ */
+describe("an unreadable local-intelligence record refuses the boot, and names the remedy", () => {
+  it("refuses a corrupt record and audits the classification", async () => {
+    const storage = new MemoryStorage();
+    const first = await createSanctuaryServer({ storage, passphrase: PASSPHRASE });
+    const masterKey = first.masterKey;
+
+    // Ciphertext this fortress's key cannot open: the shape an on-disk bit-rot
+    // or a partial write leaves behind. It decrypts to nothing, so the loader
+    // can say only that a record is there.
+    await storage.write(
+      INTELLIGENCE_NAMESPACE,
+      SUBSTRATE_CONFIG_KEY,
+      stringToBytes(JSON.stringify({ v: 1, alg: "xchacha20poly1305", n: "AAAA", ct: "AAAA" })),
+    );
+
+    await expect(
+      createSanctuaryServer({ storage, passphrase: PASSPHRASE }),
+    ).rejects.toThrow(new RegExp(INTELLIGENCE_CONFIG_RESET_VERB));
+
+    const auditLog = new AuditLog(storage, masterKey);
+    const audited = await auditLog.query({
+      operation_type: INTEL_OPS.LOAD_INTEGRITY,
+      limit: 20,
+    });
+    const refusals = audited.entries.filter(
+      (entry) => entry.details?.stage === "record_readability",
+    );
+    expect(refusals.length).toBeGreaterThan(0);
+    expect(refusals[0]!.result).toBe("failure");
+    expect(refusals[0]!.details?.classification).toBe("corrupt");
+    expect(refusals[0]!.details?.generation_refused).toBe(true);
+    expect(String(refusals[0]!.details?.remedy)).toContain(INTELLIGENCE_CONFIG_RESET_VERB);
+  });
+
+  it("refuses a record written by a newer build and audits its version", async () => {
+    const storage = new MemoryStorage();
+    const first = await createSanctuaryServer({ storage, passphrase: PASSPHRASE });
+    const masterKey = first.masterKey;
+
+    // 99 = a schema version far past anything this build parses; the record
+    // decrypts cleanly, so this exercises the version branch and not corrupt.
+    await plantIntelligenceRecord(storage, masterKey, { version: 99 });
+
+    await expect(
+      createSanctuaryServer({ storage, passphrase: PASSPHRASE }),
+    ).rejects.toThrow(new RegExp(INTELLIGENCE_CONFIG_RESET_VERB));
+
+    const auditLog = new AuditLog(storage, masterKey);
+    const audited = await auditLog.query({
+      operation_type: INTEL_OPS.LOAD_INTEGRITY,
+      limit: 20,
+    });
+    const refusals = audited.entries.filter(
+      (entry) => entry.details?.stage === "record_readability",
+    );
+    expect(refusals.length).toBeGreaterThan(0);
+    expect(refusals[0]!.details?.classification).toBe("version-too-new");
+    expect(refusals[0]!.details?.persisted_version).toBe(99);
+  });
+
+  it("PLANTED DIVERGENCE: neither refusal is reported as an absent record", async () => {
+    // The specific misreport this closes: `was_default: true` on a config-load
+    // row asserts that nobody had armed this fortress. An unreadable record
+    // must produce no such row at all, because the load did not complete.
+    const storage = new MemoryStorage();
+    const first = await createSanctuaryServer({ storage, passphrase: PASSPHRASE });
+    const masterKey = first.masterKey;
+    const before = await new AuditLog(storage, masterKey).query({
+      operation_type: INTEL_OPS.CONFIG_LOADED,
+      limit: 50,
+    });
+
+    await plantIntelligenceRecord(storage, masterKey, { version: 99 });
+    await expect(
+      createSanctuaryServer({ storage, passphrase: PASSPHRASE }),
+    ).rejects.toThrow();
+
+    const after = await new AuditLog(storage, masterKey).query({
+      operation_type: INTEL_OPS.CONFIG_LOADED,
+      limit: 50,
+    });
+    expect(after.entries.length).toBe(before.entries.length);
+  });
+});
+
+/**
  * The boot catch is an ALLOWLIST of degradable conditions, and that allowlist
  * is empty.
  *

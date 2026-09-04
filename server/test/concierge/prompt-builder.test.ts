@@ -3,7 +3,11 @@ import {
   CONCIERGE_PROMPT_DOMAIN,
   type ConciergeContextBundle,
 } from "../../src/concierge/index.js";
-import { buildConciergePrompt, isSummarizationQuery } from "../../src/concierge/prompt-builder.js";
+import {
+  boundConciergeRecords,
+  buildConciergePrompt,
+  isSummarizationQuery,
+} from "../../src/concierge/prompt-builder.js";
 
 describe("concierge prompt builder", () => {
   it("uses the concierge domain separator and redacts sensitive fields", () => {
@@ -125,5 +129,71 @@ describe("concierge prompt builder — ZZZZ summarization hardening", () => {
     const messages = buildConciergePrompt({ question: "any open approvals?", context: emptyContext });
     const systemPrompt = messages[0]!.content;
     expect(systemPrompt).not.toContain("Do not invent activities");
+  });
+});
+
+/**
+ * Adversarial-complexity coverage for the bounded record projection
+ * (AGENTS.md rule 8, and rule 12's standing fault-schedule class).
+ *
+ * Output size and WORK are different quantities, and capping the first does
+ * not cap the second. The per-level caps compose multiplicatively: 24 keys at
+ * each of 6 levels admits 24^6, roughly 191 million nodes, so a record shaped
+ * as a wide tree could cost minutes of CPU while every individual cap was
+ * respected and the rendered bundle stayed small. These fixtures are built
+ * from SHARED subtree references, which is exactly how an attacker gets
+ * enormous logical fan-out out of a small stored record, and they hang a naive
+ * walk rather than merely slowing it.
+ */
+describe("the concierge record projection is bounded in work, not only in output", () => {
+  // A generous ceiling, not a benchmark: the assertion that matters is
+  // "terminates in human time", and the unbounded walk did not terminate at
+  // all. A tight bound here would flake on a loaded CI runner.
+  const WALL_CLOCK_CEILING_MS = 2_000;
+
+  it("bounds a single record object with 200k keys", () => {
+    const wide: Record<string, string> = {};
+    for (let index = 0; index < 200_000; index++) {
+      wide[`agent-authored-key-${index}`] = `value-${index}`;
+    }
+    const started = Date.now();
+    const projected = boundConciergeRecords({ audit_log: { details: wide } });
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(WALL_CLOCK_CEILING_MS);
+    const rendered = JSON.stringify(projected);
+    expect(rendered.length).toBeLessThan(10_240);
+    // Kept a bounded sample and said so, rather than silently dropping.
+    expect(rendered).toContain("[keys-omitted]");
+  });
+
+  it("bounds a 200-wide, 6-deep tree that a naive walk would never finish", () => {
+    // Built by sharing one subtree per level: cheap to construct, and 200^6
+    // (6.4e13) nodes if expanded. Depth and width caps alone do not save the
+    // walk here; only the node budget does.
+    let level: unknown = { leaf: "agent-authored-leaf-value" };
+    for (let depth = 0; depth < 6; depth++) {
+      const wide: Record<string, unknown> = {};
+      for (let index = 0; index < 200; index++) wide[`child-${index}`] = level;
+      level = wide;
+    }
+
+    const started = Date.now();
+    const projected = boundConciergeRecords({ task_state: level });
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(WALL_CLOCK_CEILING_MS);
+    expect(JSON.stringify(projected).length).toBeLessThan(10_240);
+  });
+
+  it("still renders an ordinary bundle in full, so the bound is not just truncation", () => {
+    const ordinary = {
+      audit_log: {
+        entries: [
+          { operation: "state_write", identity_id: "operator", result: "success" },
+        ],
+      },
+    };
+    expect(boundConciergeRecords(ordinary)).toEqual(ordinary);
   });
 });

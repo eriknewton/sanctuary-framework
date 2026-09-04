@@ -51,27 +51,42 @@ const CONCIERGE_MAX_DEPTH = 6;
 /**
  * Ceiling on the rendered record bundle, in UTF-16 code units.
  *
+ * WHAT THIS BOUNDS, EXACTLY, because the two quantities are easy to conflate.
+ * The detector scores a whole FIELD. The untrusted field the compiled-context
+ * scanner builds for a concierge invocation is:
+ *
+ *   the user message  =  JSON envelope + the operator's question + this bundle
+ *   the query part    =  the operator's question again
+ *
+ * This constant bounds the rendered `{question, context}` envelope with an
+ * EMPTY question (see `renderBundle`), which is the envelope plus the bundle
+ * and nothing else. It therefore bounds the record-derived share of the field
+ * and no other share.
+ *
  * Derivation, from the shared detector's own threshold rather than a copy of
  * it: `PROMPT_STUFFING_LARGE_STRING_CHARS` (10240) is the length at which a
- * scanned field is reported as `large_string`. The concierge's UNTRUSTED
- * contributor is the rendered record bundle plus the operator's question plus
- * the JSON scaffolding around both, so the bundle takes three quarters of that
- * threshold and leaves the remaining quarter (2560 characters) to the question
- * and the scaffolding:
+ * scanned field is reported as `large_string`. Three quarters of it goes to
+ * the records; the remaining quarter is headroom for the question, which
+ * appears twice in the field:
  *
- *   10240 * 3 / 4 = 7680
+ *   10240 * 3 / 4 = 7680 for the envelope + records
+ *   10240 - 7680  = 2560 of headroom, holding two copies of the question
+ *
+ * So a question up to 1280 characters is guaranteed inside the threshold, and
+ * a longer one can carry the field over it. That is DELIBERATE and is not a
+ * hole in the bound: the question is the operator's own text typed at their own
+ * prompt, an operator who pastes 40 KB into it has genuinely stuffed the
+ * prompt, and the detector should say so rather than be talked out of it. The
+ * property being defended is narrower and is the one that was broken: no agent
+ * writing into this fortress's records can push the field over the threshold,
+ * however long or numerous the strings it writes, because the record share is
+ * capped independently of them.
  *
  * INVARIANT (rule 8: state grown from untrusted input carries an explicit cap):
  * this ceiling is ENFORCED by measuring the rendered output and shrinking until
  * it fits, not merely estimated from the per-field caps above. An arithmetic
  * worst case computed from the caps would silently stop being true the first
  * time a field is added to `ConciergeContextBundle`.
- *
- * The guarantee this buys is bounded and worth stating exactly: the RECORDS
- * cannot push the untrusted contributor into the stuffing band, whatever an
- * agent writes into them. The operator's own question is not covered, and must
- * not be: an operator who pastes 40 KB into the question really has stuffed the
- * prompt, and the detector should say so.
  */
 const CONCIERGE_RECORD_BUDGET_CHARS = (PROMPT_STUFFING_LARGE_STRING_CHARS * 3) / 4;
 
@@ -109,7 +124,12 @@ const TRUNCATION_MARKER = "[truncated]";
  */
 export function boundConciergeRecords(value: unknown): unknown {
   for (const arrayCap of [CONCIERGE_MAX_ARRAY_ITEMS, 10, 5, 2, 1, 0]) {
-    const projected = project(value, arrayCap, CONCIERGE_MAX_DEPTH);
+    // A fresh budget per attempt: each attempt is independently bounded, so the
+    // retry ladder costs at most six times the node ceiling rather than being
+    // able to compound.
+    const projected = project(value, arrayCap, CONCIERGE_MAX_DEPTH, {
+      nodes: CONCIERGE_MAX_NODES_VISITED,
+    });
     if (renderBundle(projected).length <= CONCIERGE_RECORD_BUDGET_CHARS) {
       return projected;
     }
@@ -135,32 +155,87 @@ function renderBundle(value: unknown): string {
   return JSON.stringify({ question: "", context: value }, null, 2) ?? "";
 }
 
-function project(value: unknown, arrayCap: number, depth: number): unknown {
-  if (typeof value === "string") {
-    return value.length <= CONCIERGE_MAX_STRING_CHARS
-      ? value
-      : value.slice(0, CONCIERGE_MAX_STRING_CHARS) + TRUNCATION_MARKER;
-  }
+/**
+ * Nodes one projection attempt may visit before it stops and says so.
+ *
+ * INVARIANT: this is the bound that makes the walk safe, and the per-level
+ * caps alone were NOT it. Depth and width compose multiplicatively: a cap of
+ * 24 keys at each of 6 levels still admits 24^6, about 191 million nodes, so a
+ * record shaped as a wide shallow tree could cost minutes of CPU while every
+ * individual cap was respected and the OUTPUT stayed small. Output size and
+ * work are different quantities and only the first was bounded before.
+ *
+ * Derivation: the rendered budget is 7680 characters and the cheapest node
+ * that survives rendering still costs several characters, so no projection
+ * that fits in the budget can need anywhere near 5000 nodes. The ceiling is
+ * therefore slack for every honest bundle and binding only for an adversarial
+ * one, which is what a complexity bound should be.
+ */
+const CONCIERGE_MAX_NODES_VISITED = 5_000;
+
+/** Marker left where the node budget ran out, so a cut is never silent. */
+const NODE_BUDGET_MARKER = "[budget-exhausted]";
+
+/** Mutable walk budget for ONE projection attempt. */
+interface ProjectionBudget {
+  nodes: number;
+}
+
+/** Cap one agent-steerable string. Keys get this too; see the object branch. */
+function capString(value: string): string {
+  return value.length <= CONCIERGE_MAX_STRING_CHARS
+    ? value
+    : value.slice(0, CONCIERGE_MAX_STRING_CHARS) + TRUNCATION_MARKER;
+}
+
+function project(
+  value: unknown,
+  arrayCap: number,
+  depth: number,
+  budget: ProjectionBudget,
+): unknown {
+  if (budget.nodes <= 0) return NODE_BUDGET_MARKER;
+  budget.nodes--;
+  if (typeof value === "string") return capString(value);
   if (value === null || typeof value !== "object") return value;
   if (depth <= 0) return "[depth-capped]";
   if (Array.isArray(value)) {
-    const kept = value.slice(0, arrayCap).map((item) => project(item, arrayCap, depth - 1));
+    // `slice` before `map`: the slice allocates at most `arrayCap` elements, so
+    // a 200k-element array costs one bounded copy rather than 200k projections.
+    const kept = value
+      .slice(0, arrayCap)
+      .map((item) => project(item, arrayCap, depth - 1, budget));
     return value.length > arrayCap
       ? [...kept, `[${value.length - arrayCap} more omitted]`]
       : kept;
   }
   const out: Record<string, unknown> = {};
   let kept = 0;
-  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    if (kept >= CONCIERGE_MAX_OBJECT_KEYS) {
-      out["[keys-omitted]"] = true;
+  let omitted = false;
+  // `for...in` with an early break, NOT `Object.entries`: `Object.entries`
+  // materializes one [key, value] pair per property before the loop can break,
+  // so an object with 200k keys allocated 200k pairs to keep 24 of them, once
+  // per retry attempt. What remains linear in the property count is the
+  // engine's own key enumeration, which no code here can make sublinear;
+  // the allocation, the recursion, and the output no longer are.
+  for (const key in value as Record<string, unknown>) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+    if (kept >= CONCIERGE_MAX_OBJECT_KEYS || budget.nodes <= 0) {
+      omitted = true;
       break;
     }
     // The KEY is agent-steerable too (a state-store key becomes an object key
-    // in some projections), so it is capped exactly like a value.
-    out[project(key, arrayCap, depth) as string] = project(item, arrayCap, depth - 1);
+    // in some projections), so it is capped exactly like a value. Capping it
+    // does not spend node budget: a key is not a subtree to descend into.
+    out[capString(key)] = project(
+      (value as Record<string, unknown>)[key],
+      arrayCap,
+      depth - 1,
+      budget,
+    );
     kept++;
   }
+  if (omitted) out["[keys-omitted]"] = true;
   return out;
 }
 

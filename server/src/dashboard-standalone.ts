@@ -1305,14 +1305,18 @@ async function wireUnlockedDeps(args: {
   // the unlocked fortress so the v1.1 dashboard's Intelligence panel has
   // a live config to render. `load()` is also the local-intelligence load-
   // integrity checkpoint, so this entrypoint classifies the persisted record
-  // exactly as `index.ts` does: an integrity refusal stops the process, and
-  // only a non-integrity failure (storage hiccup) degrades to a selector-less
-  // binding (panel surfaces "not configured").
-  let intelligenceSelector: SubstrateSelector | undefined;
+  // exactly as `index.ts` does.
+  //
+  // Neither binding carries a "not configured" initial value any more, and
+  // that is the point rather than a tidy-up: this block now either completes
+  // or throws, so there is no third state in which the dashboard runs with a
+  // selector-less binding. A `= false` seed here would be unreachable and
+  // would read as though a degraded start were still possible.
+  let intelligenceSelector: SubstrateSelector;
   // Rho-2.5: whether the consent-gated Tier B redactor was installed on
   // the selector below. Threaded into the v1.1 PII binding so the
   // /api/query-anonymity/pii route reports the truthful effective state.
-  let tierBPiiRedactorInstalled = false;
+  let tierBPiiRedactorInstalled: boolean;
   try {
     intelligenceSelector = new SubstrateSelector({
       storage,

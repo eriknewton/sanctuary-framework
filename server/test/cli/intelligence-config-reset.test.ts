@@ -24,11 +24,13 @@ import { establishMaster } from "../../src/core/master-custody.js";
 import { INTEL_OPS } from "../../src/intelligence/audit-events.js";
 import { buildDefaultConfig } from "../../src/intelligence/defaults.js";
 import {
+  INTELLIGENCE_CONFIG_RESET_VERB,
   INTELLIGENCE_NAMESPACE,
   IntelligenceConfigStore,
   SUBSTRATE_CONFIG_KEY,
   SUBSTRATE_CONFIG_QUARANTINE_PREFIX,
 } from "../../src/intelligence/policy-store.js";
+import { SubstrateSelector } from "../../src/intelligence/selector.js";
 import type { SubstrateConfig } from "../../src/intelligence/types.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
@@ -292,5 +294,50 @@ describe.skipIf(!supported)("sanctuary intelligence config-reset", () => {
         bytes: GARBAGE_RECORD.length,
       },
     });
+  });
+
+  /**
+   * The recovery verb and the boot checkpoint read the SAME record through
+   * deliberately different paths, and this pins that split.
+   *
+   * `SubstrateSelector.load()` refuses an unreadable record, because a
+   * fortress must not start as though nobody had ever armed it. `config-reset`
+   * reads the record through `IntelligenceConfigStore.load`, which still
+   * returns the outcome rather than throwing, because the one command whose
+   * whole job is to clear the record cannot be gated on being able to read it.
+   *
+   * Failure mode if that split is ever collapsed by moving the refusal down
+   * into the store: the product deadlocks. Boot refuses and names
+   * `config-reset` as the remedy, and `config-reset` then refuses for the same
+   * reason, so the operator is told to run the one command that cannot run.
+   */
+  it("refuses the boot checkpoint on the same record config-reset can still clear", async () => {
+    const { root, masterKey } = await seedFortress((storage) =>
+      storage.write(INTELLIGENCE_NAMESPACE, SUBSTRATE_CONFIG_KEY, GARBAGE_RECORD));
+    const storage = new FilesystemStorage(join(root, "state"));
+    const auditLog = new AuditLog(storage, masterKey);
+    const selectorOptions = {
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "fortress:config-reset-split",
+    };
+
+    // The checkpoint refuses, and the refusal names the verb.
+    await expect(
+      new SubstrateSelector(selectorOptions).load(),
+    ).rejects.toThrow(new RegExp(INTELLIGENCE_CONFIG_RESET_VERB));
+
+    // The verb the refusal named still runs against that exact record.
+    const d = deps();
+    const code = await runIntelligenceCommand({
+      argv: ["config-reset", "--fortress", root],
+      configResetDeps: d.configResetDeps,
+    });
+    expect(code).toBe(CONFIG_RESET_EXIT.OK);
+    expect(d.output()).toContain("unreadable record: does not decrypt or parse (corrupt)");
+
+    // And the fortress starts again afterwards, now genuinely unarmed.
+    await expect(new SubstrateSelector(selectorOptions).load()).resolves.toBeUndefined();
   });
 });

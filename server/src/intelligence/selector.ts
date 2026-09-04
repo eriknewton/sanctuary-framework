@@ -56,6 +56,7 @@ import { tradeoffTextHash, BACKEND_FALLBACK_STRINGS, BADGE_LABEL_KEYS, BADGE_TRA
 import { DEFAULT_OLLAMA_ENDPOINT, buildDefaultConfig, DEFAULT_PER_SURFACE, DEFAULT_LOCAL_MODEL_PICKS } from "./defaults.js";
 import {
   IntelligenceConfigStore,
+  IntelligenceConfigUnreadableError,
   LocalIntegrityStateLoadError,
   type LoadOutcome,
 } from "./policy-store.js";
@@ -406,9 +407,22 @@ export class SubstrateSelector {
   }
 
   /**
-   * Load (or initialize) the operator's substrate config. Emits the
-   * `intelligence_config_loaded` audit event regardless of branch so the
-   * audit chain shows config-load activity on boot.
+   * Load (or initialize) the operator's substrate config, and act as the
+   * boot-time local-intelligence load checkpoint.
+   *
+   * THE CLASSIFICATION THIS MAKES, and it is the whole point of the method:
+   * a durable record is ABSENT, READABLE, or INDETERMINATE, and only the first
+   * two may start a fortress. Absent loads the honest legacy-unarmed default
+   * and emits `intelligence_config_loaded` with `was_default: true`. Readable
+   * loads as authority. Indeterminate covers an armed record that fails Q5
+   * validation, a record that does not decrypt or parse, and a record written
+   * by a newer build: each refuses with a typed error and its own audited
+   * `intelligence_load_integrity` row naming which classification refused it.
+   *
+   * `intelligence_config_loaded` is emitted on every branch that RETURNS, so
+   * the audit chain shows config-load activity on boot; a branch that refuses
+   * emits the load-integrity row instead, because a load that did not complete
+   * must not appear in the chain as one that did.
    */
   async load(): Promise<void> {
     const outcome = await this.store.load();
@@ -432,6 +446,52 @@ export class SubstrateSelector {
       }
       throw new LocalIntegrityStateLoadError(outcome.reason);
     }
+    if (outcome.kind === "corrupt" || outcome.kind === "version-too-new") {
+      // A durable record EXISTS and this build cannot read it. That is
+      // indeterminate, not absent, and the two must never collapse into one
+      // another: absent means no operator ever armed this fortress, while
+      // unreadable means an operator may have armed it and the evidence is
+      // unavailable. Falling through to `outcome.config` here reported the
+      // second as the first, so a fortress whose armed record had been
+      // corrupted or written by a newer build started clean, audited
+      // `was_default: true`, and told nobody that anything was wrong.
+      //
+      // The refusal carries the recovery verb because there IS a remedy and it
+      // is not obvious: `IntelligenceConfigUnreadableError.message` names
+      // `INTELLIGENCE_CONFIG_RESET_VERB`, which quarantines the bytes and
+      // reinitializes the config. `config-reset` itself reads the record
+      // through `IntelligenceConfigStore.load` rather than through this
+      // selector, so this refusal never blocks the one command that clears it.
+      const refusal = new IntelligenceConfigUnreadableError(
+        outcome.kind,
+        outcome.kind === "version-too-new" ? outcome.persistedVersion : null,
+      );
+      try {
+        await this.auditLog.append(
+          "l2",
+          INTEL_OPS.LOAD_INTEGRITY,
+          this.identityId,
+          {
+            // Distinct from the armed-record `state_validation` stage above:
+            // an operator reading this row must be able to tell "the record
+            // failed its integrity check" from "the record could not be read
+            // at all", because the two have different remedies.
+            stage: "record_readability",
+            classification: outcome.kind,
+            reason: refusal.reason,
+            ...(outcome.kind === "version-too-new"
+              ? { persisted_version: outcome.persistedVersion }
+              : {}),
+            remedy: refusal.remedy,
+            generation_refused: true,
+          },
+          "failure",
+        );
+      } catch {
+        // An unreadable record still refuses when its derived audit cannot persist.
+      }
+      throw refusal;
+    }
     this.config = outcome.config;
     this.invalidateIssuedIntegrityHandles();
     this.recentFailures.clear();
@@ -444,7 +504,12 @@ export class SubstrateSelector {
     this.loaded = true;
 
     const overriddenSurfaceCount = countOverriddenSurfaces(this.config);
-    const wasDefault = outcome.kind !== "loaded";
+    // INVARIANT: `was_default` means the record was genuinely ABSENT. Only
+    // `loaded` and `default` can reach this line now, so the flag no longer
+    // doubles as a bucket for records that exist but could not be read; those
+    // refuse above. A reader of this audit row may treat `was_default: true`
+    // as "nobody had armed this fortress", which is the claim it makes.
+    const wasDefault = outcome.kind === "default";
     const payload: IntelligenceConfigLoadedPayload = {
       version: "1.2",
       event_id: makeEventId(),
