@@ -31,7 +31,10 @@ const KNOWN_STATUSES: readonly AssuranceStatus[] = [
   "in_flight",
   "unknown",
 ];
-const EXPECTED_ASSURANCE_ROW_COUNT = 23;
+// 26 = the 23 rows pinned when this harness landed plus the three rows appended
+// 2026-09-03 (Rung 1 memory custody, catalog v3 verification, fleet licensing).
+// Rows are appended at the END of the table so fixture row IDs stay stable.
+const EXPECTED_ASSURANCE_ROW_COUNT = 26;
 
 export interface AssuranceRow {
   id: string;
