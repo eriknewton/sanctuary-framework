@@ -148,6 +148,24 @@ export function boundConciergeRecords(value: unknown): unknown {
 }
 
 /**
+ * Run ONE projection attempt against an explicit node budget.
+ *
+ * Exported for the budget-accounting tests only; production always enters
+ * through {@link boundConciergeRecords}, which fixes the budget at
+ * `CONCIERGE_MAX_NODES_VISITED` and runs the retry ladder. It exists because
+ * the charging rule is exact ("every key costs exactly one, and `project`
+ * charges the node it is entered on"), and an exact rule can only be pinned by
+ * a test that can set the budget to a small number and count. Asserting it
+ * against the production 5000 would mean building a 5000-node fixture and would
+ * pass just as happily against an off-by-one.
+ */
+export function projectWithBudgetForTest(value: unknown, maxNodes: number): unknown {
+  return project(value, CONCIERGE_MAX_ARRAY_ITEMS, CONCIERGE_MAX_DEPTH, {
+    nodes: maxNodes,
+  });
+}
+
+/**
  * Render exactly the shape the user message will carry, so the measurement is
  * of the real output and not of a smaller stand-in.
  *
@@ -218,7 +236,8 @@ function project(
   }
   const out: Record<string, unknown> = {};
   let kept = 0;
-  let omitted = false;
+  let ownKeysOmitted = false;
+  let budgetExhausted = false;
   // `for...in` with an early break, NOT `Object.entries`: `Object.entries`
   // materializes one [key, value] pair per property before the loop can break,
   // so an object with 200k keys allocated 200k pairs to keep 24 of them, once
@@ -226,22 +245,33 @@ function project(
   // engine's own key enumeration, which no code here can make sublinear;
   // the allocation, the recursion, and the output no longer are.
   for (const key in value as Record<string, unknown>) {
-    // INVARIANT: every ITERATION costs budget, including one that is about to
-    // be skipped. Charging only the iterations that produce output left a hole
-    // exactly the size of the skipped ones: an object carrying enumerable
-    // properties on its PROTOTYPE is walked property by property while the
-    // own-property check sends each one to `continue`, so the loop could run
-    // for as long as the prototype chain is wide without the budget noticing.
-    // Work is what the budget exists to bound, and a skipped property costs
-    // work.
     if (budget.nodes <= 0) {
-      omitted = true;
+      budgetExhausted = true;
       break;
     }
-    budget.nodes--;
-    if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+    // THE CHARGING RULE, stated once here because it is the only place both
+    // halves of it are visible: `project` charges exactly one unit for the node
+    // it is entered on, so a key that DESCENDS pays through that call and must
+    // not be charged again here. A key that does NOT descend still costs a
+    // loop iteration, so it charges itself. Every key therefore costs exactly
+    // one, whichever branch it takes.
+    //
+    // Charging in both places was a real defect and not a rounding error: own
+    // keys paid twice, so the budget bought half the nodes it names and the
+    // last key before exhaustion could be reported as truncated when it had
+    // been projected in full.
+    //
+    // An inherited property is the reason the loop charges at all. `for...in`
+    // walks the prototype chain, so an object carrying enumerable properties
+    // on its prototype is iterated property by property with every one of them
+    // reaching this `continue`; uncharged, that is unbounded work the budget
+    // never sees.
+    if (!Object.prototype.hasOwnProperty.call(value, key)) {
+      budget.nodes--;
+      continue;
+    }
     if (kept >= CONCIERGE_MAX_OBJECT_KEYS) {
-      omitted = true;
+      ownKeysOmitted = true;
       break;
     }
     // The KEY is agent-steerable too (a state-store key becomes an object key
@@ -250,13 +280,31 @@ function project(
     // Redaction happens HERE, on the ORIGINAL key, and short-circuits the
     // subtree: a sensitive key never has its value walked at all. Testing the
     // capped key instead would be a defect, because truncating a long key can
-    // cut off the very substring that marks it sensitive.
-    out[capString(key)] = isSensitiveKey(key)
-      ? REDACTED_MARKER
-      : project((value as Record<string, unknown>)[key], arrayCap, depth - 1, budget);
+    // cut off the very substring that marks it sensitive. Because it does not
+    // descend, it charges itself under the rule above.
+    if (isSensitiveKey(key)) {
+      budget.nodes--;
+      out[capString(key)] = REDACTED_MARKER;
+    } else {
+      out[capString(key)] = project(
+        (value as Record<string, unknown>)[key],
+        arrayCap,
+        depth - 1,
+        budget,
+      );
+    }
     kept++;
   }
-  if (omitted) out["[keys-omitted]"] = true;
+  // TWO DISTINCT MARKERS, because they are two different facts and a reader of
+  // the prompt acts on them differently. `[keys-omitted]` can only be set by
+  // the key-cap break, which fires on an own key this projection refused to
+  // keep, so it always means at least one own key was dropped by design.
+  // `[budget-exhausted]` means the walk stopped early and claims nothing about
+  // own keys: when inherited properties drain the budget there may be no own
+  // key missing at all, and saying otherwise would report a policy decision
+  // where a resource limit occurred.
+  if (ownKeysOmitted) out["[keys-omitted]"] = true;
+  if (budgetExhausted) out[NODE_BUDGET_MARKER] = true;
   return out;
 }
 

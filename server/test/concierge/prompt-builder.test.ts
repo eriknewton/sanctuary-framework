@@ -7,6 +7,7 @@ import {
   boundConciergeRecords,
   buildConciergePrompt,
   isSummarizationQuery,
+  projectWithBudgetForTest,
 } from "../../src/concierge/prompt-builder.js";
 
 describe("concierge prompt builder", () => {
@@ -270,6 +271,97 @@ describe("the concierge record projection is bounded in work, not only in output
       { details: { api_token: unknown } };
     expect(Date.now() - started).toBeLessThan(WALL_CLOCK_CEILING_MS);
     expect(projected.details.api_token).toBe("[redacted]");
+  });
+
+  /**
+   * The charging rule is exact: `project` charges one unit for the node it is
+   * entered on, and a key that does not descend charges itself, so every key
+   * costs exactly one. These tests are the only thing that can hold it to that,
+   * because an off-by-one is invisible at the production budget of 5000: the
+   * walk still terminates, still bounds work, and simply buys fewer nodes than
+   * the constant claims while sometimes marking a fully projected object as
+   * truncated.
+   */
+  describe("charges exactly one unit per key", () => {
+    const OWN_KEYS = 10;
+
+    function scalarKeys(count: number): Record<string, number> {
+      return Object.fromEntries(
+        Array.from({ length: count }, (_, index) => [`k${index}`, index]),
+      );
+    }
+
+    it("projects N keys fully under a budget of N plus the root", () => {
+      const projected = projectWithBudgetForTest(
+        scalarKeys(OWN_KEYS),
+        OWN_KEYS + 1,
+      ) as Record<string, unknown>;
+
+      expect(Object.keys(projected)).toHaveLength(OWN_KEYS);
+      expect(projected["[budget-exhausted]"]).toBeUndefined();
+      expect(projected["[keys-omitted]"]).toBeUndefined();
+      expect(projected["k9"]).toBe(9);
+    });
+
+    it("drops exactly one key at N+1 under the same budget, and says the budget did it", () => {
+      const projected = projectWithBudgetForTest(
+        scalarKeys(OWN_KEYS + 1),
+        OWN_KEYS + 1,
+      ) as Record<string, unknown>;
+
+      // OWN_KEYS projected, one refused, plus the marker naming why.
+      expect(projected["[budget-exhausted]"]).toBe(true);
+      expect(projected["[keys-omitted]"]).toBeUndefined();
+      expect(
+        Object.keys(projected).filter((key) => !key.startsWith("[")),
+      ).toHaveLength(OWN_KEYS);
+    });
+
+    it("charges a redacted key once, though it never descends", () => {
+      // A sensitive key short-circuits the subtree, so it does not pay through
+      // `project`; it must still pay for its own iteration or the exemption
+      // becomes a free pass.
+      const projected = projectWithBudgetForTest(
+        { api_token: { anything: "unwalked" }, a: 1, b: 2 },
+        3,
+      ) as Record<string, unknown>;
+
+      expect(projected["api_token"]).toBe("[redacted]");
+      expect(projected["a"]).toBe(1);
+      expect(projected["[budget-exhausted]"]).toBe(true);
+      expect(projected["b"]).toBeUndefined();
+    });
+  });
+
+  describe("names the two reasons a projection is incomplete, separately", () => {
+    it("reports the key cap as keys-omitted, not as budget exhaustion", () => {
+      const wide = Object.fromEntries(
+        Array.from({ length: 40 }, (_, index) => [`k${index}`, index]),
+      );
+      const projected = projectWithBudgetForTest(wide, 1_000) as Record<string, unknown>;
+
+      expect(projected["[keys-omitted]"]).toBe(true);
+      expect(projected["[budget-exhausted]"]).toBeUndefined();
+    });
+
+    it("reports inherited properties draining the budget as budget exhaustion, with no own key missing", () => {
+      // The regression this separates out: inherited enumerables can drain the
+      // budget while every own key was projected, and reporting that as
+      // `[keys-omitted]` would claim a policy decision where a resource limit
+      // occurred.
+      const polluted = Object.create(
+        Object.fromEntries(
+          Array.from({ length: 200 }, (_, index) => [`inherited-${index}`, index]),
+        ),
+      ) as Record<string, unknown>;
+      polluted["own"] = "kept";
+
+      const projected = projectWithBudgetForTest(polluted, 20) as Record<string, unknown>;
+
+      expect(projected["own"]).toBe("kept");
+      expect(projected["[budget-exhausted]"]).toBe(true);
+      expect(projected["[keys-omitted]"]).toBeUndefined();
+    });
   });
 
   it("still renders an ordinary bundle in full, so the bound is not just truncation", () => {
