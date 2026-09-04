@@ -65,6 +65,41 @@ export const MEMORY_ADMISSION_CHANNELS = [
 export type MemoryAdmissionChannel =
   (typeof MEMORY_ADMISSION_CHANNELS)[number];
 
+/**
+ * Admission channels whose origin companion was recorded by ANOTHER fortress.
+ * On these channels the origin body's `passage_id` and `owner_ref` are the
+ * SOURCE fortress's, so the local passage is bound through the destination-
+ * signed admission (its `passage_id`, `origin_provenance_digest`, and the
+ * required `transfer_lineage_ref`), never through the origin's own subject.
+ * One source for two consumers: `parseAdmissionBody` below (lineage required
+ * exactly here) and `companionBindsPublicPassage` in memory-provenance-tool.ts
+ * (subject binding branches exactly here). Must match the transport rows of
+ * MEMORY_ADMISSION_TRIPLES (test/sdw/memory-provenance-contract.test.ts
+ * asserts full-set equality). Bound: `fleet_sync` has no producer in
+ * server/src today; only `exit_v2_import` is reachable from a shipped path.
+ */
+export const MEMORY_TRANSPORT_ADMISSION_CHANNELS = [
+  "exit_v2_import",
+  "fleet_sync",
+] as const satisfies readonly MemoryAdmissionChannel[];
+
+export function isMemoryTransportAdmissionChannel(
+  channel: MemoryAdmissionChannel,
+): boolean {
+  return (MEMORY_TRANSPORT_ADMISSION_CHANNELS as readonly string[]).includes(channel);
+}
+
+/**
+ * The ONE predicate for a valid `transfer_lineage_ref`: a bounded SDW
+ * identifier. `parseAdmissionBody` applies it when a transport admission is
+ * parsed, and `companionBindsPublicPassage` in memory-provenance-tool.ts
+ * applies the same predicate when it re-checks the companion it was handed,
+ * so the parser and the wrapper cannot disagree on what a lineage reference is.
+ */
+export function isMemoryTransferLineageRef(value: unknown): value is string {
+  return typeof value === "string" && isSdwIdentifier(value);
+}
+
 export const MEMORY_ORIGIN_TRUST_TIERS = [
   "local_attested",
   "legacy_unattested",
@@ -1062,14 +1097,14 @@ function parseAdmissionBody(
   if (!admittedAt.ok) return admittedAt;
   const signerDid = parseDid(record.signer_did, "admission.body.signer_did");
   if (!signerDid.ok) return signerDid;
-  const needsLineage =
-    record.admission_channel === "exit_v2_import" || record.admission_channel === "fleet_sync";
+  // Transport admissions are the ONLY channels that carry a foreign origin
+  // subject; the same set gates the provenance tool's subject binding, so a
+  // channel added here without a lineage requirement would let an origin from
+  // another passage bind with no import-time mapping behind it.
+  const needsLineage = isMemoryTransportAdmissionChannel(record.admission_channel);
   if (needsLineage) {
-    const lineage = parseIdentifier(
-      record.transfer_lineage_ref,
-      "admission.body.transfer_lineage_ref",
-    );
-    if (!lineage.ok) {
+    // Same predicate as the provenance tool's re-check (isMemoryTransferLineageRef).
+    if (!isMemoryTransferLineageRef(record.transfer_lineage_ref)) {
       return failure(
         "transfer_lineage_invalid",
         "admission.body.transfer_lineage_ref",
