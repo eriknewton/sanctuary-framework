@@ -169,6 +169,21 @@ describe("shared protect/init local-intelligence adapter", () => {
           ollamaReachable: true,
           ollamaModels: [],
         }),
+        // After the loader verifies, the ceremony sweeps the runtime BEFORE the
+        // operator confirm. The production runtime verifier talks to the local
+        // Ollama endpoint; on a host without one, its connection failure is
+        // `integrity_io_unavailable`, which is not repairable by a pull and
+        // ends the ceremony before the decline. Inject the deterministic
+        // "signed model not yet pulled" evidence so every platform reaches the
+        // plan and the decline. The loader path under test is unchanged.
+        runtimeVerifier: {
+          verify: async (request) => ({
+            ok: false as const,
+            state: "tags_model_absent" as const,
+            reason: "runtime_model_absent" as const,
+            runtimeTag: request.binding.runtime_tag,
+          }),
+        },
       });
     } finally {
       if (previousModelsEnv === undefined) delete process.env.OLLAMA_MODELS;
