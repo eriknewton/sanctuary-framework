@@ -65,6 +65,28 @@ export const MEMORY_ADMISSION_CHANNELS = [
 export type MemoryAdmissionChannel =
   (typeof MEMORY_ADMISSION_CHANNELS)[number];
 
+/**
+ * Admission channels whose origin companion was recorded by ANOTHER fortress.
+ * On these channels the origin body's `passage_id` and `owner_ref` are the
+ * SOURCE fortress's, so the local passage is bound through the destination-
+ * signed admission (its `passage_id`, `origin_provenance_digest`, and the
+ * required `transfer_lineage_ref`), never through the origin's own subject.
+ * One source for two consumers: `parseAdmissionBody` below (lineage required
+ * exactly here) and `companionBindsPublicPassage` in memory-provenance-tool.ts
+ * (subject binding branches exactly here). Must match the transport rows of
+ * MEMORY_ADMISSION_TRIPLES.
+ */
+export const MEMORY_TRANSPORT_ADMISSION_CHANNELS = [
+  "exit_v2_import",
+  "fleet_sync",
+] as const satisfies readonly MemoryAdmissionChannel[];
+
+export function isMemoryTransportAdmissionChannel(
+  channel: MemoryAdmissionChannel,
+): boolean {
+  return (MEMORY_TRANSPORT_ADMISSION_CHANNELS as readonly string[]).includes(channel);
+}
+
 export const MEMORY_ORIGIN_TRUST_TIERS = [
   "local_attested",
   "legacy_unattested",
@@ -1062,8 +1084,11 @@ function parseAdmissionBody(
   if (!admittedAt.ok) return admittedAt;
   const signerDid = parseDid(record.signer_did, "admission.body.signer_did");
   if (!signerDid.ok) return signerDid;
-  const needsLineage =
-    record.admission_channel === "exit_v2_import" || record.admission_channel === "fleet_sync";
+  // Transport admissions are the ONLY channels that carry a foreign origin
+  // subject; the same set gates the provenance tool's subject binding, so a
+  // channel added here without a lineage requirement would let an origin from
+  // another passage bind with no import-time mapping behind it.
+  const needsLineage = isMemoryTransportAdmissionChannel(record.admission_channel);
   if (needsLineage) {
     const lineage = parseIdentifier(
       record.transfer_lineage_ref,
