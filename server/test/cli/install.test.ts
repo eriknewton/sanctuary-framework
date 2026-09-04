@@ -143,6 +143,7 @@ describe("sanctuary install agent contract", () => {
         "MacOS/sanctuary",
         "Resources/boot-runtime/node",
         "Resources/cli-runtime/dist/cli.js",
+        "Resources/cli-runtime/dist/directory-capability-worker.js",
         "Resources/cli-runtime/package.json",
         "Resources/cli-runtime/node_modules/@lmdb/lmdb-darwin-arm64/node.napi.node",
         "Resources/cli-runtime/node_modules/@msgpackr-extract/msgpackr-extract-darwin-arm64/node.napi.glibc.node",

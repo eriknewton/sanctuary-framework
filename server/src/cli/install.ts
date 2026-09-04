@@ -147,10 +147,16 @@ export async function verifyCastleWallRuntimeManifest(
     !Array.isArray(manifest.inventory.packages) ||
     !Array.isArray(manifest.inventory.mach_o)
   ) return false;
+  // The dist entries here must match the `kind: "file"` rows of
+  // server/scripts/sealed-cli-runtime-entries.mjs (reconciled by
+  // test/structure/sealed-cli-runtime-contents.test.ts). The worker is required
+  // because a runtime without it boots an existing fortress and cannot create
+  // one; the installer must refuse such a runtime rather than plan against it.
   const required = new Set([
     "MacOS/sanctuary",
     "Resources/boot-runtime/node",
     "Resources/cli-runtime/dist/cli.js",
+    "Resources/cli-runtime/dist/directory-capability-worker.js",
   ]);
   const filePaths = new Set<string>();
   let totalBytes = 0;

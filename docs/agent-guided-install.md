@@ -20,7 +20,12 @@ full-profile planner from the CLI runtime sealed inside that app:
 
 The planner and the Hermes MCP configuration both continue to use that absolute
 signed launcher. It clears Node preload/search overrides before entering the
-app-sealed runtime and does not require a separate Node/npm installation. For
+app-sealed runtime and does not require a separate Node/npm installation. The
+sealed runtime carries the complete built CLI: every compiled entry point
+(including the storage worker that fortress creation starts), the agent
+templates, the first-party reference plugins, the catalog schemas, and the
+production dependency closure, so `sanctuary protect` and `sanctuary init` work
+on a Mac with no repository checkout and no Node of its own. For
 profiles without a verified signed app, an absent package manager is reported
 as `blocked`; the agent must not invent a download or installer outside the
 returned action contract.

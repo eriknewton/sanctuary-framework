@@ -12,6 +12,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join, relative } from "node:path";
+// Must match castle-wall-macos/scripts/stage-cli-runtime.sh (the copy step) and
+// server/src/cli/install.ts `required` (the installer's verifier); this is the
+// same list the stage script gates on, re-checked here over the manifest walk.
+import {
+  SEALED_CLI_RUNTIME_DIST_ENTRIES,
+  missingSealedCliRuntimeManifestEntries,
+} from "./sealed-cli-runtime-entries.mjs";
 
 const [app, sourceSha, cliVersion] = process.argv.slice(2);
 if (!app || !/^[a-f0-9]{40}$/.test(sourceSha ?? "") || !cliVersion) {
@@ -81,6 +88,15 @@ function walk(path) {
 for (const root of roots) walk(root);
 files.sort((a, b) => a.path.localeCompare(b.path));
 packages.sort((a, b) => a.path.localeCompare(b.path));
+// INVARIANT: the manifest describes a runtime that can CREATE a fortress, not
+// only boot one. Every entry dist/cli.js reaches by path (the forked storage
+// worker, templates, reference plugins, catalog assets) must be in the walk;
+// a runtime that is missing one is refused a manifest, so the signed build
+// fails here rather than on the first `sanctuary protect` of an installed Mac.
+const missingDistEntries = missingSealedCliRuntimeManifestEntries(files.map((entry) => entry.path));
+if (missingDistEntries.length > 0) {
+  throw new Error(`sealed CLI runtime is incomplete; missing dist entries: ${missingDistEntries.join(", ")}`);
+}
 const packageJsonCount = files.filter((entry) => entry.path.endsWith("/package.json")).length;
 const nestedPackageCount = packages.filter(
   (entry) => entry.path.split("/node_modules/").length > 2,
@@ -114,6 +130,13 @@ const manifest = {
     packages,
     mach_o_count: machO.length,
     mach_o: machO,
+    // The required dist entries this runtime was verified to carry (paths
+    // relative to Resources/cli-runtime/dist), so an installer or doctor can
+    // check presence without re-deriving the set from the build inputs.
+    dist_entries: SEALED_CLI_RUNTIME_DIST_ENTRIES.map((entry) => ({
+      path: entry.path,
+      kind: entry.kind,
+    })),
   },
   files,
 };

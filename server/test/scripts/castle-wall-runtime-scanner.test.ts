@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { SEALED_CLI_RUNTIME_DIST_ENTRIES } from "../../scripts/sealed-cli-runtime-entries.mjs";
 
 const scanner = fileURLToPath(new URL(
   "../../../castle-wall-macos/scripts/list-cli-runtime-mach-o.mjs",
@@ -28,6 +29,24 @@ const releaseWorkflow = fileURLToPath(new URL(
   import.meta.url,
 ));
 const roots: string[] = [];
+
+/**
+ * Plant every required sealed-runtime dist entry (from the single source of
+ * truth) under a fake `dist/` so the manifest builder's presence gate passes;
+ * `skip` names entries the caller has already written or wants absent.
+ */
+function writeSealedDistEntries(distDir: string, skip: string[] = []): void {
+  for (const entry of SEALED_CLI_RUNTIME_DIST_ENTRIES) {
+    if (skip.includes(entry.path)) continue;
+    if (entry.kind === "file") {
+      mkdirSync(join(distDir, entry.path, ".."), { recursive: true });
+      writeFileSync(join(distDir, entry.path), entry.path);
+    } else {
+      mkdirSync(join(distDir, entry.path), { recursive: true });
+      writeFileSync(join(distDir, entry.path, "asset.json"), "{}");
+    }
+  }
+}
 
 function sealedRuntimeAssertion(): string {
   const workflow = readFileSync(releaseWorkflow, "utf8");
@@ -360,6 +379,9 @@ describe("Castle Wall CLI-runtime Mach-O scanner", () => {
     writeFileSync(node, "#!/bin/sh\necho v22.0.0\n");
     chmodSync(node, 0o755);
     writeFileSync(join(contents, "Resources/cli-runtime/dist/cli.js"), "cli");
+    // The builder refuses a runtime missing any required dist entry; plant the
+    // whole required set so this fixture exercises the inventory, not the gate.
+    writeSealedDistEntries(join(contents, "Resources/cli-runtime/dist"), ["cli.js"]);
     writeFileSync(join(contents, "Resources/cli-runtime/package.json"), JSON.stringify({ name: "cli", version: "1" }));
     writeFileSync(join(contents, "Resources/cli-runtime/node_modules/a/package.json"), JSON.stringify({ name: "a", version: "1" }));
     writeFileSync(join(contents, "Resources/cli-runtime/node_modules/a/node_modules/@scope/b/package.json"), JSON.stringify({ name: "@scope/b", version: "2" }));
@@ -383,6 +405,7 @@ describe("Castle Wall CLI-runtime Mach-O scanner", () => {
       package_internal_json_count: number;
       nested_package_count: number;
       packages: Array<{ path: string }>;
+      dist_entries: Array<{ path: string; kind: string }>;
     } };
     expect(manifest.inventory.package_count).toBe(3);
     expect(manifest.inventory.package_json_count).toBe(4);
@@ -393,5 +416,39 @@ describe("Castle Wall CLI-runtime Mach-O scanner", () => {
       "Resources/cli-runtime/node_modules/a/package.json",
       "Resources/cli-runtime/package.json",
     ]);
+    expect(manifest.inventory.dist_entries.map((entry) => entry.path))
+      .toEqual(SEALED_CLI_RUNTIME_DIST_ENTRIES.map((entry) => entry.path));
+  });
+
+  it("refuses to write a manifest for a runtime missing a required dist entry", () => {
+    // A runtime that ships cli.js alone boots an existing fortress and fails on
+    // the first fortress creation; the builder must refuse it at build time.
+    for (const absent of ["directory-capability-worker.js", "templates"]) {
+      const root = mkdtempSync(join(tmpdir(), "sanctuary-runtime-incomplete-"));
+      roots.push(root);
+      const contents = join(root, "Sanctuary-CastleWall.app", "Contents");
+      mkdirSync(join(contents, "MacOS"), { recursive: true });
+      mkdirSync(join(contents, "Resources/boot-runtime"), { recursive: true });
+      mkdirSync(join(contents, "Resources/cli-runtime/node_modules/a"), { recursive: true });
+      writeFileSync(join(contents, "MacOS/sanctuary"), "launcher");
+      const node = join(contents, "Resources/boot-runtime/node");
+      writeFileSync(node, "#!/bin/sh\necho v22.0.0\n");
+      chmodSync(node, 0o755);
+      writeFileSync(join(contents, "Resources/cli-runtime/package.json"), JSON.stringify({ name: "cli", version: "1" }));
+      writeFileSync(join(contents, "Resources/cli-runtime/node_modules/a/addon.bin"), "native");
+      writeSealedDistEntries(join(contents, "Resources/cli-runtime/dist"), [absent]);
+      const inventory = join(root, "mach-o.txt");
+      writeFileSync(inventory, "Resources/cli-runtime/node_modules/a/addon.bin\n");
+
+      const result = spawnSync(process.execPath, [
+        manifestBuilder,
+        join(root, "Sanctuary-CastleWall.app"),
+        "a".repeat(40),
+        "1.0.0",
+      ], { env: { ...process.env, SANCTUARY_MACH_O_INVENTORY_FILE: inventory }, encoding: "utf8" });
+      expect(result.status, result.stderr).not.toBe(0);
+      expect(result.stderr).toContain(`missing dist entries: ${absent}`);
+      expect(existsSync(join(contents, "Resources/cli-runtime-manifest.json"))).toBe(false);
+    }
   });
 });

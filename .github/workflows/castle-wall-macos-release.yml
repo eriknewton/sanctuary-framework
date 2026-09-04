@@ -280,8 +280,15 @@ jobs:
           test -x "$LAUNCHER"
           test -s "$MANIFEST"
           test -d "$CLI_RUNTIME/node_modules/@modelcontextprotocol/sdk"
-          test -d "$CLI_RUNTIME/templates"
-          test -d "$CLI_RUNTIME/reference-plugin"
+          # The sealed CLI reaches these by path from dist/cli.js; the worker is
+          # what every fortress creation forks. Same list the stage script and
+          # the manifest builder gate on (server/scripts/sealed-cli-runtime-entries.mjs).
+          test -s "$CLI_RUNTIME/dist/directory-capability-worker.js"
+          test -d "$CLI_RUNTIME/dist/templates"
+          test -d "$CLI_RUNTIME/dist/reference-plugin"
+          test -d "$CLI_RUNTIME/dist/intelligence/catalog-v3"
+          node ../server/scripts/sealed-cli-runtime-entries.mjs --assert "$CLI_RUNTIME/dist"
+          test -z "$(find "$CLI_RUNTIME/dist" -name '*.map' -print -quit)"
           test "$(stat -f '%Lp' "$NODE")" = 555
           test "$(stat -f '%Lp' "$DAEMON")" = 444
           test "$(stat -f '%Lp' "$CLI")" = 444
@@ -531,9 +538,12 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.cs.allow-jit' "$ARTIFACT_NODE_ENTITLEMENTS")" = true
           test "$(plutil -p "$ARTIFACT_NODE_ENTITLEMENTS" | grep -c ' => ')" = 1
           test -s "$ARTIFACT_CLI_RUNTIME/dist/cli.js"
+          test -s "$ARTIFACT_CLI_RUNTIME/dist/directory-capability-worker.js"
           test -s "$ARTIFACT_CLI_RUNTIME/package.json"
-          test -d "$ARTIFACT_CLI_RUNTIME/templates"
-          test -d "$ARTIFACT_CLI_RUNTIME/reference-plugin"
+          test -d "$ARTIFACT_CLI_RUNTIME/dist/templates"
+          test -d "$ARTIFACT_CLI_RUNTIME/dist/reference-plugin"
+          test -d "$ARTIFACT_CLI_RUNTIME/dist/intelligence/catalog-v3"
+          node ../server/scripts/sealed-cli-runtime-entries.mjs --assert "$ARTIFACT_CLI_RUNTIME/dist"
           test -d "$ARTIFACT_CLI_RUNTIME/node_modules/@modelcontextprotocol/sdk"
           test -x "$ARTIFACT_LAUNCHER"
           test -s "$ARTIFACT_MANIFEST"
