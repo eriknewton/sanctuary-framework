@@ -57,6 +57,7 @@ import {
 } from "../castle-wall/provision/fortress-custody.js";
 import { consumeFlagValue } from "./argv.js";
 import { appendCastleWallCliAuditBestEffort } from "./castle-wall.js";
+import { stripTrailingSlashes } from "../strings.js";
 
 const execFileAsync = promisify(nodeExecFile);
 
@@ -268,7 +269,7 @@ export async function runRepairCustody(
       );
       return REPAIR_CUSTODY_EXIT_REFUSED;
     }
-    fortressPath = `${home.replace(/\/+$/, "")}/.sanctuary`;
+    fortressPath = `${stripTrailingSlashes(home)}/.sanctuary`;
   }
   if (!isAbsolute(fortressPath)) {
     write(err, `Fortress path must be absolute (got: ${fortressPath}).\n`);

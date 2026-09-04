@@ -32,6 +32,7 @@ import type {
   SummarizeRequest,
 } from "../types.js";
 import { LOCAL_MODEL_TAGS } from "../types.js";
+import { stripTrailingSlashes } from "../../strings.js";
 
 export const LOCAL_CAPABILITY: SubstrateCapability = {
   summarize: true,
@@ -79,7 +80,7 @@ export class OllamaClient {
   private fetchImpl: typeof fetch;
 
   constructor(config: OllamaClientConfig) {
-    this.endpoint = config.endpoint.replace(/\/+$/, "");
+    this.endpoint = stripTrailingSlashes(config.endpoint);
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.fetchImpl = config.fetchImpl ?? fetch;
   }

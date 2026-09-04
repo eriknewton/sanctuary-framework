@@ -70,6 +70,7 @@
 import { dirname, normalize as normalizePath } from "node:path";
 
 import { harnessLaunchSpec, type HarnessLaunchSpec } from "../../egress-gate/harness-daemon.js";
+import { stripTrailingSlashes } from "../../strings.js";
 
 /** A CPython feature version, as reported by the interpreter itself. */
 export interface InterpreterVersion {
@@ -244,10 +245,6 @@ function sameVersion(a: InterpreterVersion, b: InterpreterVersion): boolean {
 
 function renderVersion(v: InterpreterVersion): string {
   return `${v.major}.${v.minor}`;
-}
-
-function stripTrailingSlashes(path: string): string {
-  return path.replace(/\/+$/, "");
 }
 
 function isPathAtOrWithin(path: string, base: string): boolean {
@@ -428,7 +425,7 @@ export async function resolveHermesGatewayArgv(
         "Refusing to install the harness daemon with an interpreter nothing measured the agent could execute.",
     );
   }
-  const agentHome = options.agentHome.replace(/\/+$/, "");
+  const agentHome = stripTrailingSlashes(options.agentHome);
   const hermesAgentDir = `${agentHome}/.hermes/hermes-agent`;
   const mainModule = `${hermesAgentDir}/hermes_cli/main.py`;
   const rehomedLayout = `${mainModule} plus ${hermesAgentDir}/${VENV_PYTHON_RELATIVE}`;
