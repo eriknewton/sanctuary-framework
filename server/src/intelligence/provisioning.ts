@@ -37,7 +37,7 @@ import type {
 import { SURFACES } from "./types.js";
 import type { ModelProvenance } from "../operational/model-provenance.js";
 import type { OllamaMutationResult } from "./substrates/local.js";
-import { localProvisioningPreflightRefusal } from "./provisioning-consent.js";
+import { localProvisioningPreflight } from "./provisioning-consent.js";
 import { LocalIntegrityStateLoadError } from "./policy-store.js";
 import { CrossProcessLockError } from "../storage/cross-process-lock.js";
 
@@ -169,6 +169,12 @@ export type LocalProvisioningResult =
     models: readonly string[];
     provenanceProjection: "projected" | "degraded";
   }
+  /**
+   * The run never asked for local intelligence (no flag, no terminal to ask).
+   * Distinct from `refused`: nothing was read, recorded, audited, or degraded,
+   * so a caller renders it as information, never as a failure.
+   */
+  | { kind: "not-requested" }
   | { kind: "refused"; reason: LocalProvisioningRefusalReason };
 
 const FAILURE_COPY: Record<LocalProvisioningRefusalReason, string> = {
@@ -409,13 +415,17 @@ export async function runLocalIntelligenceProvisioning(
   let affectedSurfaces = SURFACES.filter(
     (surface) => ops.initialConfiguredChoices[surface] === "local",
   );
-  const preflightRefusal = localProvisioningPreflightRefusal(ops.isTty, ops.preAnswered);
-  if (preflightRefusal !== null) {
+  const preflight = localProvisioningPreflight(ops.isTty, ops.preAnswered);
+  // INVARIANT: an unrequested run returns BEFORE `refuse`, so it writes no
+  // refusal audit row and no persisted provisioning failure. Reaching `refuse`
+  // here is what made a plain headless `protect` mark five surfaces degraded.
+  if (preflight.kind === "not-requested") return { kind: "not-requested" };
+  if (preflight.kind === "refused") {
     return refuse(
       ops,
       affectedSurfaces,
-      preflightRefusal,
-      preflightRefusal === "non_tty" ? "substrate_unavailable" : "substrate_misconfigured",
+      preflight.reason,
+      preflight.reason === "non_tty" ? "substrate_unavailable" : "substrate_misconfigured",
     );
   }
 
@@ -560,6 +570,14 @@ export async function runLocalIntelligenceProvisioning(
         );
       }
 
+      // The ceremony's only success output. Without it an armed fortress looks
+      // exactly like one that silently did nothing, which is why the armed
+      // state had to be inferred from an encrypted record.
+      ops.print(
+        `Verified signed model manifest v${verified.body.manifest_version} against the pinned catalog key.`,
+      );
+      ops.print(`Local intelligence armed: ${renderArmedBindings(commit)}`);
+
       let provenanceProjection: "projected" | "degraded" = "projected";
       try {
         const projectionOutcome = await ops.projectProvenance(commit.provenance);
@@ -649,6 +667,36 @@ function commitRefusalReason(error: unknown): LocalProvisioningRefusalReason {
     return "integrity_io_unavailable";
   }
   return error.reason;
+}
+
+/**
+ * Hex characters of a sha256 digest shown on an operator line. 12 hex chars =
+ * 48 bits, long enough for an operator to match the line against the manifest
+ * by eye and short enough that nobody mistakes it for the digest itself; the
+ * full digest is what `sanctuary intelligence diagnose` prints.
+ */
+export const ARMED_DIGEST_PREFIX_CHARS = 12;
+
+/**
+ * One line naming what this fortress is now bound to: each distinct runtime
+ * tag with the prefix of the signed Ollama manifest digest it was verified
+ * against. Never prints key material; the digest is public manifest content.
+ */
+function renderArmedBindings(commit: AtomicLocalProvisioningCommit): string {
+  const byTag = new Map<string, string>();
+  for (const binding of Object.values(commit.integrityState.bindings)) {
+    if (binding === undefined) continue;
+    byTag.set(
+      binding.runtime_tag,
+      binding.ollama_identity.ollama_manifest_sha256.slice(
+        0,
+        ARMED_DIGEST_PREFIX_CHARS,
+      ),
+    );
+  }
+  return [...byTag.entries()]
+    .map(([tag, digestPrefix]) => `${tag} (manifest sha256 ${digestPrefix})`)
+    .join(", ");
 }
 
 export function renderLocalProvisioningPlan(input: {

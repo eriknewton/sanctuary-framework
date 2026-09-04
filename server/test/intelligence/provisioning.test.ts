@@ -212,7 +212,16 @@ describe("Q5D atomic local intelligence provisioning", () => {
       kind: "already-provisioned",
       provenanceProjection: "projected",
     });
-    expect(ops.print).not.toHaveBeenCalled();
+    // The already-present path performs the same authoritative commit, so it
+    // owes the operator the same two success lines; what it must NOT print is
+    // the install/pull plan, which is what this assertion originally guarded.
+    const printed = (ops.print as ReturnType<typeof vi.fn>).mock.calls.map(
+      (call) => String(call[0]),
+    );
+    expect(printed).toEqual([
+      "Verified signed model manifest v9 against the pinned catalog key.",
+      "Local intelligence armed: qwen2.5:1.5b (manifest sha256 111111111111)",
+    ]);
     expect(ops.confirm).not.toHaveBeenCalled();
     expect(ops.pull).not.toHaveBeenCalled();
     expect(ops.commitVerified).toHaveBeenCalledOnce();

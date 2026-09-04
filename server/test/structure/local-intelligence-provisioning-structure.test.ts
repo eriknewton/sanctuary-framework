@@ -18,6 +18,25 @@ describe("local intelligence provisioning structural inventory", () => {
     expect(init).not.toContain('from "../intelligence/provisioning.js"');
   });
 
+  it("keeps the consent truth table in one shared predicate, with no second copy", () => {
+    const consent = source("intelligence/provisioning-consent.ts");
+    const adapter = source("wrap/local-intelligence.ts");
+    const sequencer = source("intelligence/provisioning.ts");
+    expect(consent).toContain("export function localProvisioningPreflight(");
+    // Both stages consume the predicate; neither re-derives "did the operator
+    // ask for this" from isTty/preAnswered, which is how "not requested" and
+    // "asked for and impossible" collapsed into one refusal.
+    for (const consumer of [adapter, sequencer]) {
+      expect(consumer).toContain("localProvisioningPreflight(");
+      expect(consumer).not.toMatch(/preAnswered\s*===\s*(false|true|undefined)/);
+    }
+    // The unrequested arm exists on the shared result and on both stages, so a
+    // headless run with no flag can end without a refusal.
+    expect(consent).toContain('kind: "not-requested"');
+    expect(adapter).toContain('kind: "not-requested"');
+    expect(sequencer).toContain('kind: "not-requested"');
+  });
+
   it("inventories both flags, both audit ops, and the registry provider category", () => {
     const wrap = source("wrap/cli.ts");
     const init = source("wrap/init.ts");

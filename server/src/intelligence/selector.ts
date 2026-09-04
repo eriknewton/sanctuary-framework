@@ -1439,7 +1439,13 @@ export class SubstrateSelector {
     const client = new OllamaClient({ endpoint, fetchImpl: this.fetchImpl });
     const sub = LocalSubstrate.fromPick(client, pick, customTag);
     const labelBase = BACKEND_FALLBACK_STRINGS[BADGE_LABEL_KEYS.local] ?? "Local model";
-    const modelLabel = LOCAL_MODEL_LABELS[pick] ?? customTag ?? LOCAL_MODEL_TAGS[pick];
+    // INVARIANT: a verified binding is what this surface actually invokes, so
+    // it names the label; the configured pick is only a default and would
+    // report the wrong model on an armed fortress. Each form says which it is,
+    // because "Gemma 2 2B" and "the armed binding" are different claims.
+    const modelLabel = binding === undefined
+      ? `${LOCAL_MODEL_LABELS[pick] ?? customTag ?? LOCAL_MODEL_TAGS[pick]} (default pick, not armed)`
+      : `${binding.runtime_tag} (armed binding)`;
     let firstInvocationPassed = false;
     let lastFullMonotonicMs = selectorLoadGate?.completedMonotonicMs;
     let lastFullWallMs = selectorLoadGate?.completedWallMs;

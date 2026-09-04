@@ -316,6 +316,13 @@ export {
 } from "./substrates/local.js";
 
 export {
+  LOCAL_INTELLIGENCE_OPT_IN_HINT,
+  localProvisioningPreflight,
+  type LocalProvisioningPreflight,
+} from "./provisioning-consent.js";
+
+export {
+  ARMED_DIGEST_PREFIX_CHARS,
   MODEL_REGISTRY_PROVIDER_CATEGORY,
   LocalModelsRootResolutionError,
   Q5_PROVISIONING_LOCK_FILE,

@@ -98,6 +98,10 @@ import {
   type AutoProvisionSummary,
 } from "./auto-provision.js";
 import { runLocalIntelligenceSetup } from "./local-intelligence.js";
+// The dependency-free consent leaf, not the `intelligence` barrel: this file
+// is on the CLI boot path and must not pull the selector graph in for one
+// string. Must match the flag names parsed below.
+import { LOCAL_INTELLIGENCE_OPT_IN_HINT } from "../intelligence/provisioning-consent.js";
 import {
   describeProtectPreflightBlockers,
   describeProtectPreflightStrictWarnings,
@@ -2525,7 +2529,14 @@ async function maybeRunLocalIntelligenceForWrap(
       // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
       print: (line) => console.error(`  ${line}`),
     });
-    if (outcome.kind === "refused") {
+    if (outcome.kind === "not-requested") {
+      // Nothing was read, recorded, or degraded: this run never asked. The
+      // line is informational, never a failure the operator must act on.
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `  Local intelligence was not set up; ${LOCAL_INTELLIGENCE_OPT_IN_HINT}.`,
+      );
+    } else if (outcome.kind === "refused") {
       // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
       console.error(`  Local intelligence remains DEGRADED (${outcome.reason}).`);
     }

@@ -62,7 +62,9 @@ import {
   isTier2PinViolation,
   type SubstrateConfig,
   type SubstrateConfigV2,
+  type Surface,
 } from "./types.js";
+import { LOCAL_INTELLIGENCE_OPT_IN_HINT } from "./provisioning-consent.js";
 import {
   withCrossProcessLock,
   type CrossProcessLockOptions,
@@ -113,6 +115,133 @@ export type LoadOutcome =
     config: SubstrateConfig;
   }
   | { kind: "corrupt"; config: SubstrateConfig };
+
+/**
+ * The operator-visible name for each durable-record state. There is exactly
+ * one of these per {@link LoadOutcome} branch, because the runtime's branch IS
+ * the classification: a diagnostic that re-derived the state from the bytes
+ * could disagree with the selector about whether this fortress is armed.
+ */
+export type LocalIntelligenceArmedState =
+  | "armed"
+  | "legacy-unarmed"
+  | "absent"
+  | "integrity_state_invalid"
+  | "corrupt"
+  | "version-too-new";
+
+/** One armed surface binding, flattened for display. Public manifest data only. */
+export interface LocalIntelligenceBindingReport {
+  surface: Surface;
+  model_id: string;
+  runtime_tag: string;
+  /** The signed Ollama manifest root this binding was verified against. */
+  ollama_manifest_sha256: string;
+  assurance: string;
+}
+
+/**
+ * What an operator surface may say about the durable record. Every field is
+ * either public manifest content or a local path; a master key, a passphrase,
+ * and the record's plaintext operator credentials never appear here.
+ */
+export interface LocalIntelligenceStateReport {
+  state: LocalIntelligenceArmedState;
+  /** Closed reason for a non-armed state, or null when there is nothing to add. */
+  detail: string | null;
+  manifest_version: number | null;
+  signed_body_sha256: string | null;
+  ollama_models_root: string | null;
+  committed_at: string | null;
+  bindings: readonly LocalIntelligenceBindingReport[];
+  /** The operator action that changes this state, or null when none applies. */
+  remedy: string | null;
+}
+
+/**
+ * Classify a durable-record load for display. Consumes the SAME
+ * {@link LoadOutcome} the selector and every config writer consume, so an
+ * operator report cannot claim a fortress is armed when the runtime refuses it.
+ */
+export function classifyLocalIntelligenceState(
+  outcome: LoadOutcome,
+): LocalIntelligenceStateReport {
+  const empty = {
+    detail: null,
+    manifest_version: null,
+    signed_body_sha256: null,
+    ollama_models_root: null,
+    committed_at: null,
+    bindings: [] as readonly LocalIntelligenceBindingReport[],
+  };
+  switch (outcome.kind) {
+    case "default":
+      return {
+        ...empty,
+        state: "absent",
+        detail: "no durable local-intelligence config record exists",
+        remedy: LOCAL_INTELLIGENCE_OPT_IN_HINT,
+      };
+    case "loaded": {
+      if (outcome.config.version !== 2) {
+        return {
+          ...empty,
+          state: "legacy-unarmed",
+          detail:
+            "a readable record exists but carries no verified model binding",
+          remedy: LOCAL_INTELLIGENCE_OPT_IN_HINT,
+        };
+      }
+      const integrity = outcome.config.localIntegrityState;
+      const bindings: LocalIntelligenceBindingReport[] = [];
+      for (const surface of SURFACES) {
+        const binding = integrity.bindings[surface];
+        if (binding === undefined) continue;
+        bindings.push({
+          surface,
+          model_id: binding.model_id,
+          runtime_tag: binding.runtime_tag,
+          ollama_manifest_sha256: binding.ollama_identity.ollama_manifest_sha256,
+          assurance: binding.assurance,
+        });
+      }
+      return {
+        state: "armed",
+        detail: null,
+        manifest_version: integrity.manifest_version_floor,
+        signed_body_sha256: integrity.signed_body_sha256,
+        ollama_models_root: integrity.ollama_models_root,
+        committed_at: integrity.committed_at,
+        bindings,
+        remedy: null,
+      };
+    }
+    case "integrity-state-invalid":
+      return {
+        ...empty,
+        state: "integrity_state_invalid",
+        detail: `the armed record failed Q5 integrity validation (${outcome.reason})`,
+        // config-reset refuses this case by design, so the honest remedy is to
+        // re-provision, never the quarantine verb.
+        remedy: LOCAL_INTELLIGENCE_OPT_IN_HINT,
+      };
+    case "corrupt":
+      return {
+        ...empty,
+        state: "corrupt",
+        detail: "the durable record does not decrypt or parse",
+        remedy: `run "${INTELLIGENCE_CONFIG_RESET_VERB}"`,
+      };
+    case "version-too-new":
+      return {
+        ...empty,
+        state: "version-too-new",
+        detail:
+          `the durable record is version ${outcome.persistedVersion}, newer than this build supports`,
+        remedy: `run "${INTELLIGENCE_CONFIG_RESET_VERB}"`,
+      };
+  }
+}
 
 export class LocalIntegrityStateLoadError extends Error {
   constructor(
