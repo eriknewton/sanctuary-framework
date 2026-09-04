@@ -18,6 +18,11 @@ export {
   type SelectorConfig,
 } from "./selector.js";
 
+// `IntelligenceConfigStore.quarantineUnreadable` travels with this export but
+// carries no consent gate of its own: any caller must repeat the CLI verb's
+// TTY, typed-word, and write-intent-unlock gates, and no MCP tool or HTTP
+// route may reach it. The structure test pins `cli/intelligence.ts` as the
+// only production call site.
 export {
   IntelligenceConfigStore,
   IntelligenceConfigUnreadableError,

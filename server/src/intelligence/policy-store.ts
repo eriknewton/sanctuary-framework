@@ -144,7 +144,8 @@ export class IntelligenceConfigUnreadableError extends LocalIntegrityStateLoadEr
     this.name = "IntelligenceConfigUnreadableError";
     this.remedy =
       `run "${INTELLIGENCE_CONFIG_RESET_VERB}" to quarantine the unreadable record ` +
-      "and reinitialize local-intelligence config";
+      "and reinitialize local-intelligence config to the default legacy-unarmed state " +
+      "(a fortress armed on that record is unarmed until re-provisioned)";
     const shape = kind === "version-too-new"
       ? `version ${persistedVersion} is newer than this build supports`
       : "the record does not decrypt or parse";
@@ -513,6 +514,15 @@ export class IntelligenceConfigStore {
    * crash after the delete leaves the sidecar; at no point is the record gone
    * with no copy of its bytes. Refuses a readable record (armed or legacy) and
    * an armed record that failed Q5 validation, because neither is unreadable.
+   *
+   * INVARIANT (consent): this method carries only the data-plane refusals
+   * above. It has no terminal check, no typed confirmation, and no unlock of
+   * its own, so EVERY caller must repeat the `config-reset` gates (interactive
+   * TTY, typed word, write-intent master unlock) before reaching it, and it
+   * must never be reachable from an MCP tool or an HTTP route. The result
+   * leaves a fortress that was armed on the unreadable record in the default
+   * legacy-unarmed state. `test/structure/q5e-config-reset-chokepoint.test.ts`
+   * pins the single production caller.
    */
   async quarantineUnreadable(
     options: { now?: () => Date } = {},

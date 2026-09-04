@@ -11,7 +11,9 @@
  * rotation barrier), classifies the record, prints the plan, requires a typed
  * confirmation on an interactive terminal (no flag bypasses it), and then
  * asks the store to quarantine the bytes to a sidecar and remove the record.
- * Readable records are refused; the verb never disarms Q5.
+ * Readable records and Q5 integrity refusals are refused, so the verb cannot
+ * disarm a working armed record; a fortress armed on the UNREADABLE record it
+ * quarantines is left in the default legacy-unarmed state until re-provisioned.
  */
 
 import { join, resolve } from "node:path";
@@ -380,6 +382,8 @@ export interface ConfigResetDeps {
   now?: () => Date;
   /** Operator-facing line sink (stderr by default). */
   print?: (line: string) => void;
+  /** Test seam for the store's catalog key pin; production uses the compiled key. */
+  modelManifestV2PublicKey?: Uint8Array;
 }
 
 export function printIntelligenceConfigResetHelp(print: (line: string) => void = defaultPrint): void {
@@ -400,12 +404,16 @@ Description:
   prints what it will do, and asks you to type "${CONFIG_RESET_CONFIRMATION_WORD}".
   It then copies the record's raw bytes to a timestamped sidecar file in the
   fortress's _intelligence state directory and removes the record. The next
-  load returns the default configuration; operator substrate choices and API
-  keys held inside the unreadable record are not recovered.
+  load returns the default legacy-unarmed configuration; operator substrate
+  choices and API keys held inside the unreadable record are not recovered.
+  A fortress that was Q5-armed on the quarantined record is unarmed afterward,
+  and local load-integrity verification does not apply until it is
+  re-provisioned.
 
   A readable record is refused, armed or not. An armed record that fails Q5
   integrity validation is refused too: that is an integrity refusal, not an
-  unreadable record, and this verb never disarms Q5.
+  unreadable record. Because of both refusals this verb cannot disarm a
+  working armed record; it only clears a record nothing can read.
 
   Requires an interactive terminal. There is no flag that skips the prompt.
 
@@ -487,7 +495,13 @@ export async function runIntelligenceConfigReset(
   const masterKey = unlocked.masterKey;
   const barrier: MasterWriteBarrierLease | undefined = unlocked.barrier;
   try {
-    const store = new IntelligenceConfigStore(storage, masterKey);
+    const store = new IntelligenceConfigStore(
+      storage,
+      masterKey,
+      deps.modelManifestV2PublicKey === undefined
+        ? {}
+        : { modelManifestV2PublicKey: deps.modelManifestV2PublicKey },
+    );
     const outcome = await store.load();
     print(`Fortress: ${storagePath}`);
     print(`Local-intelligence config record: ${describeOutcome(outcome)}`);
@@ -512,7 +526,8 @@ export async function runIntelligenceConfigReset(
     print("");
     print("Plan (no changes have been made):");
     print(`- Copy the record's raw bytes to a timestamped sidecar file in ${intelligenceDir}`);
-    print("- Remove the unreadable record; the next load returns the default configuration.");
+    print("- Remove the unreadable record; the next load returns the default legacy-unarmed configuration.");
+    print("- If this fortress was Q5-armed on that record it is unarmed afterward; load-integrity verification does not apply until you re-provision.");
     print("- Operator substrate choices and API keys inside the unreadable record are NOT recovered.");
     print("");
     const ask = deps.ask ?? defaultAsk;
@@ -524,6 +539,8 @@ export async function runIntelligenceConfigReset(
       return CONFIG_RESET_EXIT.REFUSED;
     }
 
+    // Consent gates satisfied above (TTY, typed word, write-intent unlock);
+    // this is the ONE production call site the structure test pins.
     const result = await store.quarantineUnreadable(
       deps.now === undefined ? {} : { now: deps.now },
     );
@@ -538,7 +555,8 @@ export async function runIntelligenceConfigReset(
     }
 
     print(`Quarantined ${result.bytes} bytes to ${result.quarantinePath}`);
-    print("The record was removed; the next load returns the default configuration.");
+    print("The record was removed; the next load returns the default legacy-unarmed configuration.");
+    print("If this fortress was Q5-armed on that record it is now unarmed; re-provision local intelligence before relying on load-integrity verification.");
     const auditLog = new AuditLog(storage, masterKey);
     try {
       await auditLog.append(

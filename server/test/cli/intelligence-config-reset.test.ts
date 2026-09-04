@@ -29,8 +29,14 @@ import {
   SUBSTRATE_CONFIG_KEY,
   SUBSTRATE_CONFIG_QUARANTINE_PREFIX,
 } from "../../src/intelligence/policy-store.js";
+import type { SubstrateConfig } from "../../src/intelligence/types.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import {
+  Q5E_PUBLIC_KEY,
+  q5eIntegrityState,
+  q5eRuntimeTags,
+} from "../intelligence/q5e-fixtures.js";
 
 const supported = process.platform === "darwin" || process.platform === "linux";
 const PASSPHRASE = "config-reset-fortress-passphrase-not-a-real-secret";
@@ -90,6 +96,22 @@ function deps(overrides: Partial<ConfigResetDeps> = {}) {
     ...overrides,
   };
   return { configResetDeps, lines, unlock, output: () => lines.join("\n") };
+}
+
+/** Plant a readable armed V2 record signed with the Q5E fixture key. */
+async function plantArmedRecord(storage: FilesystemStorage, masterKey: Uint8Array) {
+  const store = new IntelligenceConfigStore(storage, masterKey, {
+    modelManifestV2PublicKey: Q5E_PUBLIC_KEY,
+  });
+  const initial = await store.save(buildDefaultConfig());
+  const state = q5eIntegrityState("/var/lib/ollama/models");
+  const armed: SubstrateConfig = {
+    ...initial,
+    version: 2,
+    customLocalModelTags: q5eRuntimeTags(state),
+    localIntegrityState: state,
+  };
+  await store.save(armed);
 }
 
 async function readRecord(root: string): Promise<Uint8Array | null> {
@@ -175,6 +197,42 @@ describe.skipIf(!supported)("sanctuary intelligence config-reset", () => {
     expect(await sidecars(root)).toEqual([]);
   });
 
+  it("refuses a readable armed V2 record and quarantines nothing (cannot disarm a working record)", async () => {
+    const { root } = await seedFortress(plantArmedRecord);
+    const before = await readRecord(root);
+    const d = deps({ modelManifestV2PublicKey: Q5E_PUBLIC_KEY });
+    const code = await runIntelligenceCommand({
+      argv: ["config-reset", "--fortress", root],
+      configResetDeps: d.configResetDeps,
+    });
+    expect(code).toBe(CONFIG_RESET_EXIT.REFUSED);
+    expect(d.output()).toContain("readable record, version 2");
+    expect(d.output()).toContain(
+      "Refused: config-reset only quarantines an unreadable record; a readable record is never discarded here.",
+    );
+    expect(await readRecord(root)).toEqual(before);
+    expect(await sidecars(root)).toEqual([]);
+  });
+
+  it("refuses an armed record that fails Q5 integrity validation and quarantines nothing", async () => {
+    const { root } = await seedFortress(plantArmedRecord);
+    const before = await readRecord(root);
+    // The production catalog pin does not verify the fixture-signed record, so
+    // the verb sees an integrity refusal, never an unreadable record.
+    const d = deps();
+    const code = await runIntelligenceCommand({
+      argv: ["config-reset", "--fortress", root],
+      configResetDeps: d.configResetDeps,
+    });
+    expect(code).toBe(CONFIG_RESET_EXIT.REFUSED);
+    expect(d.output()).toContain("armed record failed Q5 integrity validation (");
+    expect(d.output()).toContain(
+      "Refused: an armed record that fails Q5 integrity validation is not an unreadable record, and there is no in-product disarm.",
+    );
+    expect(await readRecord(root)).toEqual(before);
+    expect(await sidecars(root)).toEqual([]);
+  });
+
   it("is a no-op when there is no durable record", async () => {
     const { root } = await seedFortress(async () => undefined);
     const d = deps();
@@ -200,6 +258,8 @@ describe.skipIf(!supported)("sanctuary intelligence config-reset", () => {
     expect(d.unlock.mock.calls[0]![0]).toMatchObject({ writeIntent: true, storagePath: root });
     expect(d.output()).toContain("unreadable record: does not decrypt or parse (corrupt)");
     expect(d.output()).toContain(`Quarantined ${GARBAGE_RECORD.length} bytes to `);
+    expect(d.output()).toContain("default legacy-unarmed configuration");
+    expect(d.output()).toContain("re-provision local intelligence before relying on load-integrity verification");
 
     const files = await sidecars(root);
     expect(files).toEqual([
