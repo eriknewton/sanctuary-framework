@@ -291,7 +291,10 @@ describe("sealed Castle Wall CLI runtime: whole-set parity", () => {
       "storage.test.js", "a/b.spec.ts", "fixtures/manifest.json", "intelligence/fixtures/x.json",
       "__fixtures__/k.json", "__tests__/t.js", "__snapshots__/s.snap",
       "keys/operator.pem", "a.key", "x.p12", "y.pfx", "id_ed25519", "id_rsa.pub",
-      "operator-private-key.json", "seed-phrase.txt", "client-secret.json", ".env", ".env.local",
+      "operator-private-key.json", "client-secret.json", "client-secret.key", "signing-secret.pem", "api.secret",
+      "wallet.seed", "operator-seed.txt", "fortress_seed.bin", "seed.b64url", "seed.txt", ".env", ".env.local",
+      // Case-folded: a shouted extension is the same shape.
+      "keys/operator.PEM", "Wallet.SEED", "SEED.B64URL", "Client-Secret.JSON", "cli.JS.MAP",
     ]) {
       expect(sealedCliRuntimeDenyMatch(denied), `${denied} should be denied`).not.toBeNull();
     }
@@ -300,6 +303,10 @@ describe("sealed Castle Wall CLI runtime: whole-set parity", () => {
       "templates/research-assistant/template.json", "reference-plugin/blocklist/governance.yaml",
       "reference-plugin/blocklist/SIGNATURE.json", "reference-plugin/blocklist/first-party-signer.json",
       "intelligence/catalog-v3/schemas/schema-digests.json", "intelligence/catalog-v3/spdx/spdx-expression-3.0.1.abnf",
+      // Legitimate code chunks whose names contain the words: the patterns are
+      // anchored to key/seed FILE shapes, not bare substrings.
+      "secret-classifier.js", "secret-classifier-Cd_seqRs.js", "sdw/secret-classifier.js",
+      "seed-data.js", "seeded-rng.js", "secrets.js", "reseed.js",
     ]) {
       expect(sealedCliRuntimeDenyMatch(allowed), `${allowed} should be allowed`).toBeNull();
     }
@@ -346,14 +353,18 @@ describe("sealed Castle Wall CLI runtime: whole-set parity", () => {
     expect(gateCalls).toHaveLength(2);
     for (const variable of ["CLI_RUNTIME", "ARTIFACT_CLI_RUNTIME"]) {
       expect(releaseWorkflow).toContain(`test -s "$${variable}/dist/directory-capability-worker.js"`);
+      // The stage script's link rejections, repeated on the built and the
+      // extracted artifact so both are checked identically.
       expect(releaseWorkflow).toContain(`test -z "$(find "$${variable}" -type f -links +1 -print -quit)"`);
+      expect(releaseWorkflow).toContain(`test -z "$(find "$${variable}" -type l -print -quit)"`);
+      expect(releaseWorkflow.match(new RegExp(`find "\\$${variable}" -type l -print -quit`, "g"))).toHaveLength(1);
       expect(releaseWorkflow).not.toContain(`test -d "$${variable}/templates"`);
       expect(releaseWorkflow).not.toContain(`test -d "$${variable}/reference-plugin"`);
       expect(releaseWorkflow).not.toContain(`test -d "$${variable}/dist/templates"`);
     }
   });
 
-  it("no ESM entry under dist/ loads a .cjs sibling (the .cjs exclusion stays justified)", () => {
+  it("no ESM entry under dist/ loads a .cjs sibling or the shared contract by path; the contract is bundled into cli.js", () => {
     const dist = join(serverRoot, "dist");
     expect(existsSync(join(dist, "cli.js")), "server/dist is not built").toBe(true);
     for (const file of tsupEntryOutputs()) {
@@ -361,6 +372,21 @@ describe("sealed Castle Wall CLI runtime: whole-set parity", () => {
       // A relative import or require of a .cjs path would reach a file the stage
       // script excludes; none may exist in the shipped ESM entries.
       expect(source, `${file} loads a .cjs sibling`).not.toMatch(/(?:from|import\(|require\()\s*["']\.{1,2}\/[^"']*\.cjs["']/);
+      // The shared contract lives in server/scripts, which the sealed runtime
+      // does not carry; a runtime import of it by path would fail on an
+      // installed Mac. tsup must have inlined it.
+      expect(source, `${file} imports sealed-cli-runtime-entries by path at run time`)
+        .not.toMatch(/(?:from|import\(|require\()\s*["'][^"']*sealed-cli-runtime-entries[^"']*["']/);
+    }
+    // And the names install.ts imports from the contract are present in the
+    // bundle (parsed from install.ts so the two cannot drift apart).
+    const importBlock = installTs.match(/import \{([^}]*)\} from "\.\.\/\.\.\/scripts\/sealed-cli-runtime-entries\.mjs";/);
+    expect(importBlock, "install.ts import of the shared contract not found").not.toBeNull();
+    const importedNames = importBlock![1].split(",").map((name) => name.trim()).filter(Boolean);
+    expect(importedNames.length).toBeGreaterThan(0);
+    const cli = readFileSync(join(dist, "cli.js"), "utf8");
+    for (const name of [...importedNames, "SEALED_CLI_RUNTIME_DIST_ENTRIES"]) {
+      expect(cli, `dist/cli.js does not carry ${name} from the shared contract`).toContain(name);
     }
   });
 

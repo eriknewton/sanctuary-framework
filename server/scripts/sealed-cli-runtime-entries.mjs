@@ -119,11 +119,23 @@ export const SEALED_CLI_RUNTIME_DIST_DENY = Object.freeze([
   "**/id_ed25519*",
   "**/*private-key*",
   "**/*private_key*",
-  "**/*secret*",
-  "**/*seed*",
+  // Anchored to FILE shapes, not bare substrings: a legitimate code chunk such
+  // as the SDW secret classifier (`secret-classifier*.js`) or a `seed-data.js`
+  // helper must not red the gate, while `client-secret.json`, `operator-seed.txt`,
+  // `seed.b64url`, or `wallet.seed` still do.
+  "**/*secret*.pem",
+  "**/*secret*.key",
+  "**/*secret*.json",
+  "**/*.secret",
+  "**/*.seed",
+  "**/*-seed.*",
+  "**/*_seed.*",
+  "**/seed.*",
   "**/.env",
   "**/.env.*",
 ]);
+// Matching is case-insensitive: `operator.PEM` is the same shape as `.pem`.
+const DENY_REGEXP_FLAGS = "i";
 
 function globToRegExp(glob) {
   const anchored = glob.startsWith("/");
@@ -153,7 +165,7 @@ function globToRegExp(glob) {
       source += char;
     }
   }
-  return new RegExp(`^${source}$`);
+  return new RegExp(`^${source}$`, DENY_REGEXP_FLAGS);
 }
 
 const DENY_MATCHERS = SEALED_CLI_RUNTIME_DIST_DENY.map((glob) => ({ glob, regex: globToRegExp(glob) }));
