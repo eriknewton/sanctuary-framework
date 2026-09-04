@@ -179,6 +179,10 @@ import {
 import { OperatorAuthorizationSpentStore } from "./v1/operator-authorization-spent-store.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
 import { installConsentGatedRedactor } from "./intelligence/privacy-tier2-redactor.js";
+// Boot refuses on this: an armed local-intelligence record that fails its
+// integrity checkpoint must stop the process, not degrade it (see the
+// checkpoint site below).
+import { LocalIntegrityStateLoadError } from "./intelligence/policy-store.js";
 // Agent-facing audit redaction (property #11, no-policy-inference). Single-sourced
 // in operational/agent-audit-redaction.ts so the redact-key set is shared by
 // the agent-facing audit READ here (monitor_audit_log) and the agent-facing audit
@@ -1158,6 +1162,73 @@ export async function createSanctuaryServer(options?: {
   // construct (the route then honestly reports inactive).
   let tierBPiiRedactorInstalled = false;
 
+  // Identity binding for every intelligence-layer construction below. Pure
+  // function of state already resolved above, so computing it here rather
+  // than inside the dashboard branch is value-identical.
+  const intelligenceIdentityId =
+    identityManager.getPrimaryIdentityId() ??
+    `fortress:${config.storage_path}`;
+
+  // WP-V1.2-5: construct the Intelligence Substrate Selector against the
+  // unlocked fortress. The selector reads / writes its config under the
+  // fortress storage namespace `_intelligence`, encrypted with the master
+  // key.
+  //
+  // INVARIANT: this runs ONCE, for EVERY approval channel, before the channel
+  // switch below. `selector.load()` IS the boot-time local-intelligence load-
+  // integrity checkpoint: it classifies the persisted record as armed, absent
+  // (the honest legacy-unarmed default), or integrity-invalid, and emits the
+  // audit row for what it found. Constructing it only on the dashboard branch
+  // meant a fortress on any other approval channel never ran the checkpoint,
+  // so a tampered armed record was neither refused nor audited and the boot
+  // printed a healthy startup line. The approval channel an operator picked
+  // has nothing to do with whether their armed model state is intact, so the
+  // checkpoint must not be reachable only through one of them.
+  try {
+    intelligenceSelector = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: intelligenceIdentityId,
+    });
+    await intelligenceSelector.load();
+    // Rho-2.5: install the consent-gated Tier B PII redactor on the
+    // production selector via THE shared chokepoint. The fortressId MUST
+    // match the one threaded into buildV11Bindings below so the route's
+    // PATCH and the live scrub read the same encrypted config.
+    tierBPiiRedactorInstalled = installConsentGatedRedactor({
+      selector: intelligenceSelector,
+      storage,
+      masterKey,
+      fortressId: fortressIdFromStoragePath(config.storage_path),
+    });
+  } catch (err) {
+    // An armed record that fails the integrity checkpoint is a tamper result,
+    // not a missing optional feature, so it fails the process closed rather
+    // than degrading to a fortress that runs with local intelligence quietly
+    // switched off. Absent state never reaches here: it loads as the honest
+    // legacy-unarmed default.
+    if (err instanceof LocalIntegrityStateLoadError) {
+      // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
+      console.error(
+        `\nSanctuary cannot start.\nLocal-intelligence state failed its boot ` +
+          `integrity check: ${err.message}\n`,
+      );
+      throw err;
+    }
+    // Any other failure (storage hiccup, backend without this namespace) is
+    // the pre-existing best-effort degrade: no selector, and every consumer
+    // surface reports intelligence as unconfigured rather than pretending.
+    // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
+    console.error(
+      `  Note: Intelligence panel unavailable (${(err as Error).message}). ` +
+        `Run \`sanctuary dashboard\` and pick a substrate.`,
+    );
+    intelligenceSelector = undefined;
+    // tierBPiiRedactorInstalled stays false (its initialized value): the
+    // install assignment above only completes when the try did not throw.
+  }
+
   const selectedApprovalChannel = selectApprovalChannelByPolicy({
     config,
     policy,
@@ -1189,44 +1260,11 @@ export async function createSanctuaryServer(options?: {
     // v1.1 surface whether they boot via `sanctuary --dashboard` or
     // `sanctuary dashboard` (standalone). Legacy routes at / continue
     // to serve.
-    const embeddedHubIdentityId =
-      identityManager.getPrimaryIdentityId() ??
-      `fortress:${config.storage_path}`;
-    // WP-V1.2-5: construct the Intelligence Substrate Selector against the
-    // unlocked fortress. The selector reads / writes its config under the
-    // fortress storage namespace `_intelligence`, encrypted with the
-    // master key. Best-effort: any construction failure degrades to a
-    // selector-less binding (Intelligence panel surfaces "not configured").
-    // Pi-2: the declaration moved to outer function scope so the honeypot
-    // wiring below can pick it up; the dashboard branch only constructs.
-    try {
-      intelligenceSelector = new SubstrateSelector({
-        storage,
-        masterKey,
-        auditLog,
-        identityId: embeddedHubIdentityId,
-      });
-      await intelligenceSelector.load();
-      // Rho-2.5: install the consent-gated Tier B PII redactor on the
-      // production selector via THE shared chokepoint. The fortressId MUST
-      // match the one threaded into buildV11Bindings below so the route's
-      // PATCH and the live scrub read the same encrypted config.
-      tierBPiiRedactorInstalled = installConsentGatedRedactor({
-        selector: intelligenceSelector,
-        storage,
-        masterKey,
-        fortressId: fortressIdFromStoragePath(config.storage_path),
-      });
-    } catch (err) {
-      // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
-      console.error(
-        `  Note: Intelligence panel unavailable (${(err as Error).message}). ` +
-          `Run \`sanctuary dashboard\` and pick a substrate.`,
-      );
-      intelligenceSelector = undefined;
-      // tierBPiiRedactorInstalled stays false (its initialized value): the
-      // install assignment above only completes when the try did not throw.
-    }
+    // The selector and its identity binding were constructed once above, for
+    // every approval channel; this branch consumes THAT instance so the
+    // dashboard, the honeypot wiring and the MCP tool graph all read and
+    // write the same `_intelligence` config through one object.
+    const embeddedHubIdentityId = intelligenceIdentityId;
     dashboard.setV11Bindings(
       buildV11Bindings({
         identityId: embeddedHubIdentityId,

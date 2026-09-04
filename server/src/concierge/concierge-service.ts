@@ -76,11 +76,22 @@ export class ConciergeService {
           "concierge substrate is disabled or does not support summarization",
         );
       }
+      // INVARIANT: `contextProvenance` may be claimed only while every byte of
+      // the compiled prompt is this runtime's own — its system template plus
+      // the bounded, structured summaries `SanctuaryContextReader` builds from
+      // local records. `includePayloads` is the one switch that embeds raw
+      // state-store payload bytes an agent authored, so it drops the claim and
+      // the whole artifact is sized as untrusted again. The operator's
+      // `question` rides in `query`, which is untrusted on every path.
+      const contextIsFirstPartyOnly = request.includePayloads !== true;
       const response = await this.selector.invokeSummarize("concierge", {
         kind: "summarize",
         context: JSON.stringify(buildConciergePrompt({ question, context })),
         query: question,
         maxTokens: 512,
+        ...(contextIsFirstPartyOnly
+          ? { contextProvenance: "first_party_runtime" as const }
+          : {}),
       });
       if (response.failureClass || response.body.kind !== "summarize") {
         throw new ConciergeUnavailableError(

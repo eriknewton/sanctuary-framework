@@ -283,6 +283,21 @@ export interface SummarizeRequest {
   context: string;
   query: string;
   maxTokens?: number;
+  /**
+   * Declares that `context` holds ONLY bytes this runtime assembled itself:
+   * its own prompt template plus this fortress's own local records. The
+   * compiled-context scanner uses it to size that contributor by trust class
+   * instead of counting a locally compiled fortress briefing against the
+   * untrusted prompt-stuffing budget.
+   *
+   * INVARIANT: a caller may set this only when it can prove every byte of
+   * `context`; the moment raw agent- or operator-authored payload text is
+   * embedded, the field must be omitted. `query` is never covered by it, and
+   * omitting it is always the safe choice, because absent reads as untrusted.
+   * It exempts nothing but the stuffing size heuristic: injection, evasion,
+   * exfiltration and the hard byte ceiling still apply to `context`.
+   */
+  contextProvenance?: "first_party_runtime";
 }
 
 export interface ClassifyRequest {
@@ -335,6 +350,14 @@ export type SubstrateFailureClass =
   | "substrate_timeout"
   | "substrate_capability_unsupported"
   | "substrate_disabled"
+  /**
+   * Compiled-context screening refused the assembled artifact before any
+   * substrate was selected. Distinct from `internal_error` because the two
+   * demand opposite operator responses: this one means the prompt was held
+   * back on purpose and nothing is wrong with the provider, so an operator
+   * who cannot tell them apart goes looking for an outage that is not there.
+   */
+  | "substrate_context_refused"
   | "internal_error";
 
 /**

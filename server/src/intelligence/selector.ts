@@ -1069,18 +1069,51 @@ export class SubstrateSelector {
     const screened = await this.compiledContextScanner.screen(
       compileSubstrateContext(surface, req),
     );
+    // Resolved once, before the screening branch, so the refusal row names the
+    // same substrate a served invocation would have named and the one-time
+    // tier-2 pin audit inside cannot fire twice for one invocation.
+    const choice = this.effectiveChoice(surface);
     if (
       screened.outcome !== "clean" &&
       screened.outcome !== "detector_disabled_by_policy"
     ) {
+      // The sentinel finding the scanner reports records WHAT was seen; this
+      // row records that an invocation was refused because of it, so the
+      // intelligence audit stream shows the refusal on the same op family an
+      // operator already reads for substrate outcomes rather than only in the
+      // sentinel stream.
+      const refusalPayload: IntelligenceSubstrateFailurePayload = {
+        version: "1.2",
+        event_id: makeEventId(),
+        emitted_at: new Date().toISOString(),
+        identity_id: this.identityId,
+        kind: "substrate_failure",
+        surface,
+        substrate: choice,
+        failure_class: "substrate_context_refused",
+        // No substrate was contacted and no fallback may be tried: a refused
+        // artifact is refused for every substrate, so falling through would
+        // hand the same bytes to the next provider.
+        fallback_taken: "deny",
+      };
+      try {
+        await this.auditLog.append(
+          "l2",
+          INTEL_OPS.SUBSTRATE_FAILURE,
+          this.identityId,
+          refusalPayload as unknown as Record<string, unknown>,
+          "failure",
+        );
+      } catch {
+        // A refusal still refuses when its derived audit cannot persist.
+      }
       return failureResponse(
         "disabled",
-        "internal_error",
+        "substrate_context_refused",
         `compiled-context screening refused provider invocation (${screened.outcome})`,
       );
     }
     const startedAt = Date.now();
-    const choice = this.effectiveChoice(surface);
     // All local generation reaches the async selector-load chokepoint; a
     // direct synchronous local-handle construction would bypass Q5E.
     const handle = await this.getOrIssueHandle(surface, choice);

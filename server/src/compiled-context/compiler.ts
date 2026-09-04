@@ -4,7 +4,10 @@ import type {
   SummarizeRequest,
   Surface,
 } from "../intelligence/types.js";
-import type { CompiledContextScanRequest } from "./types.js";
+import type {
+  CompiledContextScanRequest,
+  CompiledContextTrustClass,
+} from "./types.js";
 import { COMPILED_CONTEXT_LIMITS } from "./types.js";
 
 export function compileSubstrateContext(
@@ -13,14 +16,25 @@ export function compileSubstrateContext(
 ): CompiledContextScanRequest {
   if (request.kind === "summarize") {
     const compiled = boundedCompile([request.context, request.query]);
+    // INVARIANT: only `context` may carry a caller-proven provenance, and only
+    // the value this union accepts. `query` is the operator's or the calling
+    // agent's own text, so it stays untrusted on every surface; a caller that
+    // omits `contextProvenance` gets the untrusted default for both.
+    const contextTrust: CompiledContextTrustClass =
+      request.contextProvenance === "first_party_runtime"
+        ? "first_party_runtime"
+        : "untrusted";
     return {
       ...compiled,
+      ...(compiled.preflightOverLimit === true
+        ? {}
+        : { parts: [request.context, request.query] }),
       metadata: {
         assemblerId: "substrate-selector",
         surface,
         contributors: [
-          { kind: "request_context" },
-          { kind: "request_query" },
+          { kind: "request_context", trust: contextTrust },
+          { kind: "request_query", trust: "untrusted" },
         ],
       },
     };

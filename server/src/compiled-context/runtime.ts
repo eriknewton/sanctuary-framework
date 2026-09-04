@@ -12,8 +12,14 @@ import type { StorageBackend } from "../storage/interface.js";
 import { COMPILED_CONTEXT_SENTINEL_ID } from "./types.js";
 import { CompiledContextScanner } from "./scanner.js";
 
+// Cache-key input, not a contract version: every screening result the scanner
+// retains is keyed on this string, so ANY change to what the shared detector
+// does must move it or a result decided under the previous policy can be
+// replayed as a false hit. The `first-party-stuffing-exempt` term records the
+// trust-classed prompt-stuffing sizing added with
+// `FIRST_PARTY_RUNTIME_FIELD` in `../security/injection-detector.ts`.
 export const COMPILED_CONTEXT_DETECTOR_POLICY_FINGERPRINT =
-  "injection-detector:v1:enabled:medium:escalate:decoded-rescans-64";
+  "injection-detector:v1:enabled:medium:escalate:decoded-rescans-64:first-party-stuffing-exempt";
 
 /** Bind screening findings to the existing production dispatcher graph. */
 export function createDispatcherWiredCompiledContextScanner(options: {

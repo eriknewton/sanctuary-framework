@@ -21,6 +21,20 @@ export interface CompiledContextScannerOptions {
 type CompiledContextLimits = Record<keyof typeof COMPILED_CONTEXT_LIMITS, number>;
 
 /**
+ * Detector field name carrying the bytes this runtime assembled itself.
+ *
+ * MUST MATCH `FIRST_PARTY_RUNTIME_FIELD` in `../security/injection-detector.ts`,
+ * which exempts this ONE field name from the prompt-stuffing size and
+ * repetition heuristic and from nothing else. Only this scanner ever writes
+ * the field, and it writes it only from contributors an assembler labelled
+ * `first_party_runtime`, so untrusted bytes have no path to the exemption.
+ */
+const FIRST_PARTY_RUNTIME_FIELD = "compiled_payload_first_party_runtime";
+
+/** Detector field name carrying every contributor that is not first-party. */
+const UNTRUSTED_FIELD = "compiled_payload";
+
+/**
  * Safe construction default for tests and non-runtime embedders. Input is
  * still inspected and suspicious input is still refused; production
  * construction sites are structurally required to replace the no-op reporter
@@ -34,7 +48,9 @@ export function createUnwiredCompiledContextScanner(): CompiledContextScanner {
       on_detection: "escalate",
     }),
     detectorEnabled: true,
-    policyFingerprint: "default:enabled:medium:escalate",
+    // Moves with the shared detector policy, same reason as
+    // COMPILED_CONTEXT_DETECTOR_POLICY_FINGERPRINT in ./runtime.ts.
+    policyFingerprint: "default:enabled:medium:escalate:first-party-stuffing-exempt",
     reporter: {
       async report(): Promise<void> {},
     },
@@ -119,11 +135,12 @@ export class CompiledContextScanner {
     }
 
     try {
-      const detection = this.detector.scan("compiled_context", {
-        // `payload` tells the shared detector that JSON/XML structure is
-        // expected here; it does not skip role/bypass/Unicode/decoded scans.
-        compiled_payload: request.artifact,
-      });
+      // `payload` tells the shared detector that JSON/XML structure is
+      // expected here; it does not skip role/bypass/Unicode/decoded scans.
+      const detection = this.detector.scan(
+        "compiled_context",
+        detectorPayload(request),
+      );
       // The shared detector also reports generic inbound URLs/emails as
       // `data_exfiltration`. Those are not TM-SHARD injection evidence and,
       // for frontier-with-filter, must reach the existing PII redactor. Keep
@@ -247,4 +264,51 @@ export class CompiledContextScanner {
 
 function sha256Hex(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+/**
+ * Split the compiled artifact into the fields the shared detector scans.
+ *
+ * Default and fallback shape is the single `compiled_payload` field holding
+ * the whole artifact, exactly as before trust classes existed. The two-field
+ * shape is used ONLY when the assembler supplied per-contributor `parts` that
+ * align with its contributor list AND at least one contributor is labelled
+ * `first_party_runtime`. Every byte is still scanned in both shapes; the split
+ * exists so the size of the runtime's own template is not counted against the
+ * untrusted budget.
+ *
+ * INVARIANT: unusable provenance (missing, short, or long `parts`) falls back
+ * to the single untrusted field, so a malformed request can only tighten
+ * screening, never loosen it.
+ *
+ * Residual, stated rather than hidden: grouping means a pattern that straddles
+ * the boundary between a first-party contributor and an untrusted one is no
+ * longer adjacent to the pattern matcher. Both groups are still fully scanned,
+ * so this costs only a pattern whose halves are individually benign and which
+ * spans a trust boundary the attacker does not control on both sides.
+ */
+function detectorPayload(
+  request: CompiledContextScanRequest,
+): Record<string, unknown> {
+  const contributors = request.metadata.contributors;
+  const parts = request.parts;
+  if (parts === undefined || parts.length !== contributors.length) {
+    return { [UNTRUSTED_FIELD]: request.artifact };
+  }
+  const firstParty: string[] = [];
+  const untrusted: string[] = [];
+  for (let index = 0; index < parts.length; index++) {
+    // Absent trust reads as untrusted; see CompiledContextContributor.trust.
+    const group = contributors[index]!.trust === "first_party_runtime"
+      ? firstParty
+      : untrusted;
+    group.push(parts[index]!);
+  }
+  if (firstParty.length === 0) {
+    return { [UNTRUSTED_FIELD]: request.artifact };
+  }
+  return {
+    [UNTRUSTED_FIELD]: untrusted.join("\n"),
+    [FIRST_PARTY_RUNTIME_FIELD]: firstParty.join("\n"),
+  };
 }

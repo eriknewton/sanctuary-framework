@@ -78,6 +78,9 @@ import {
 } from "./dashboard/v1_1/wiring.js";
 import { readPersistedLocalAgents } from "./hub/agent-registry-persistence.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
+// Boot refuses on this: an armed local-intelligence record that fails its
+// integrity checkpoint must stop the process, not degrade it.
+import { LocalIntegrityStateLoadError } from "./intelligence/policy-store.js";
 import { installConsentGatedRedactor } from "./intelligence/privacy-tier2-redactor.js";
 import { createCompiledContextRuntime } from "./compiled-context/runtime.js";
 import { DistressInbox } from "./distress/inbox.js";
@@ -1300,8 +1303,11 @@ async function wireUnlockedDeps(args: {
   });
   // WP-V1.2-5: construct + load the Intelligence Substrate Selector against
   // the unlocked fortress so the v1.1 dashboard's Intelligence panel has
-  // a live config to render. Best-effort: any failure degrades to a
-  // selector-less binding (panel surfaces "not configured").
+  // a live config to render. `load()` is also the local-intelligence load-
+  // integrity checkpoint, so this entrypoint classifies the persisted record
+  // exactly as `index.ts` does: an integrity refusal stops the process, and
+  // only a non-integrity failure (storage hiccup) degrades to a selector-less
+  // binding (panel surfaces "not configured").
   let intelligenceSelector: SubstrateSelector | undefined;
   // Rho-2.5: whether the consent-gated Tier B redactor was installed on
   // the selector below. Threaded into the v1.1 PII binding so the
@@ -1326,6 +1332,19 @@ async function wireUnlockedDeps(args: {
       fortressId: fortressIdFromStoragePath(config.storage_path),
     });
   } catch (err) {
+    // An armed record that fails the integrity checkpoint is a tamper result,
+    // not a missing optional panel; degrading here would let a dashboard come
+    // up with local intelligence quietly switched off. MUST MATCH the same
+    // refusal in `index.ts`; the two entrypoints share one fortress, so a
+    // record either entrypoint refuses must not be startable through the other.
+    if (err instanceof LocalIntegrityStateLoadError) {
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `\nSanctuary cannot start.\nLocal-intelligence state failed its boot ` +
+          `integrity check: ${err.message}\n`,
+      );
+      throw err;
+    }
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `  Note: Intelligence panel unavailable (${(err as Error).message}).`,

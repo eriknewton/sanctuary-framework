@@ -1,0 +1,246 @@
+/**
+ * Wired-consumer test: the local-intelligence load-integrity checkpoint runs
+ * at boot on EVERY approval channel.
+ *
+ * The checkpoint is `SubstrateSelector.load()`. It classifies the persisted
+ * `_intelligence` record as armed, absent (the honest legacy-unarmed default),
+ * or integrity-invalid, and emits the `intelligence_load_integrity` audit row
+ * for what it found. The selector used to be constructed only inside the
+ * composition root's `dashboard` approval-channel branch, so a fortress on the
+ * default `stderr` channel never ran it: a tampered armed record produced no
+ * refusal and no audit row, and the boot reported a healthy start.
+ *
+ * The approval channel an operator picked says nothing about whether their
+ * armed model state is intact, so these tests drive the REAL composition root
+ * (`createSanctuaryServer`) on the default channel rather than the selector in
+ * isolation. A unit test of `load()` passes either way; only the boot graph
+ * shows whether anything calls it.
+ */
+
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
+import { createSanctuaryServer } from "../../src/index.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { encrypt } from "../../src/core/encryption.js";
+import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import { canonicalJson } from "../../src/v1/operator-signed.js";
+import {
+  INTELLIGENCE_NAMESPACE,
+  SUBSTRATE_CONFIG_KEY,
+} from "../../src/intelligence/policy-store.js";
+import { INTEL_OPS } from "../../src/intelligence/audit-events.js";
+import {
+  IMMUNE_MODEL_LOAD_SURFACES,
+  computeModelManifestV2BodyDigest,
+  type ModelManifestBodyV2,
+  type ModelManifestModelV2,
+} from "../../src/intelligence/model-manifest-v2.js";
+import { SURFACES, type Surface } from "../../src/intelligence/types.js";
+import type { StorageBackend } from "../../src/storage/interface.js";
+import { createTempHome } from "../helpers/temp-fortress.js";
+
+const PASSPHRASE = "r2-boot-integrity-checkpoint-passphrase";
+
+/**
+ * A key that is NOT the pinned model-catalog root. An armed record signed with
+ * it is exactly the shape the checkpoint must refuse: structurally complete,
+ * decrypting cleanly under the fortress master key, and asserting an armed
+ * posture no release signer ever attested.
+ */
+const FOREIGN_PRIVATE_KEY = new Uint8Array(32).fill(23);
+
+const MODEL: ModelManifestModelV2 = {
+  model_id: "qwen2.5-1.5b",
+  model_name: "Qwen2.5 1.5B",
+  model_version: "2.5",
+  provider: "Alibaba Cloud",
+  runtime: "ollama",
+  ollama_identity: {
+    registry: "registry.ollama.ai",
+    namespace: "library",
+    model: "qwen2.5",
+    tag: "1.5b",
+    // 64 = length in hex characters of a sha256 digest (32 bytes, 2 chars/byte).
+    ollama_manifest_sha256: "1".repeat(64),
+  },
+  params_b: 1.5,
+  license: {
+    identifier: "Apache-2.0",
+    name: "Apache License 2.0",
+    url: "https://www.apache.org/licenses/LICENSE-2.0",
+    osi_approved: true,
+    redistribution: "permitted",
+  },
+  open_weights: true,
+  open_source: false,
+};
+
+function manifestBody(): ModelManifestBodyV2 {
+  const defaults = Object.fromEntries(
+    SURFACES.map((surface) => [
+      surface,
+      surface === "gate-explanation" ? null : MODEL.model_id,
+    ]),
+  ) as Record<Surface, string | null>;
+  return {
+    schema_version: 2,
+    manifest_version: 9,
+    models: { [MODEL.model_id]: structuredClone(MODEL) },
+    tiers: {
+      baseline: [MODEL.model_id],
+      mid: [MODEL.model_id],
+      pro: [MODEL.model_id],
+    },
+    surface_defaults: {
+      baseline: structuredClone(defaults),
+      mid: structuredClone(defaults),
+      pro: structuredClone(defaults),
+    },
+  };
+}
+
+function armedConfigSignedByAForeignKey(): Record<string, unknown> {
+  const body = manifestBody();
+  const bindings: Record<string, unknown> = {};
+  for (const surface of SURFACES) {
+    if (surface === "gate-explanation") continue;
+    bindings[surface] = {
+      model_id: MODEL.model_id,
+      runtime_tag: "qwen2.5:1.5b",
+      ollama_identity: structuredClone(MODEL.ollama_identity),
+      assurance: IMMUNE_MODEL_LOAD_SURFACES.includes(
+        surface as (typeof IMMUNE_MODEL_LOAD_SURFACES)[number],
+      )
+        ? "immune"
+        : "light",
+      manifest_version: body.manifest_version,
+    };
+  }
+  // Must match MODEL_MANIFEST_V2_DOMAIN + its newline delimiter in
+  // intelligence/model-manifest-v2.ts; the signature is valid over these bytes
+  // and still fails, because the verifying key is pinned, not supplied.
+  const signature = toBase64url(
+    ed25519.sign(
+      new TextEncoder().encode(
+        `sanctuary.model-manifest.v2\n${canonicalJson(body)}`,
+      ),
+      FOREIGN_PRIVATE_KEY,
+    ),
+  );
+  return {
+    version: 2,
+    perSurface: Object.fromEntries(SURFACES.map((s) => [s, "local"])),
+    fallback: Object.fromEntries(SURFACES.map((s) => [s, "deny"])),
+    customLocalModelTags: Object.fromEntries(
+      Object.keys(bindings).map((s) => [s, "qwen2.5:1.5b"]),
+    ),
+    localIntegrityState: {
+      state: "armed",
+      schema_version: 2,
+      manifest_version_floor: body.manifest_version,
+      signed_manifest: { body, signature },
+      signed_body_sha256: computeModelManifestV2BodyDigest(body),
+      ollama_models_root: "/var/lib/ollama/models",
+      bindings,
+      committed_at: "2026-09-01T12:00:00.000Z",
+    },
+  };
+}
+
+/**
+ * Write the `_intelligence` record straight into the fortress, bypassing every
+ * writer-side check, the way an on-disk tamper would.
+ *
+ * Must match HKDF_INFO in intelligence/policy-store.ts. Failure mode if that
+ * label drifts: the record simply fails to decrypt and the loader classifies
+ * it as corrupt, so this test would exercise the wrong branch while still
+ * looking like it exercised something.
+ */
+async function plantIntelligenceRecord(
+  storage: StorageBackend,
+  masterKey: Uint8Array,
+  record: unknown,
+): Promise<void> {
+  const key = derivePurposeKey(masterKey, "intelligence-substrate-config");
+  const encrypted = encrypt(stringToBytes(JSON.stringify(record)), key);
+  await storage.write(
+    INTELLIGENCE_NAMESPACE,
+    SUBSTRATE_CONFIG_KEY,
+    stringToBytes(JSON.stringify(encrypted)),
+  );
+}
+
+let fortressHome: Awaited<ReturnType<typeof createTempHome>>;
+let savedPassphrase: string | undefined;
+
+beforeEach(async () => {
+  savedPassphrase = process.env.SANCTUARY_PASSPHRASE;
+  delete process.env.SANCTUARY_PASSPHRASE;
+  fortressHome = await createTempHome("sanctuary-r2-boot-integrity");
+});
+
+afterEach(async () => {
+  if (savedPassphrase !== undefined) {
+    process.env.SANCTUARY_PASSPHRASE = savedPassphrase;
+  } else {
+    delete process.env.SANCTUARY_PASSPHRASE;
+  }
+  await fortressHome.cleanup();
+});
+
+describe("local-intelligence load integrity is checked on the default approval channel", () => {
+  it("reaches the selector at boot and audits the load on a stderr-channel fortress", async () => {
+    const storage = new MemoryStorage();
+    const booted = await createSanctuaryServer({ storage, passphrase: PASSPHRASE });
+
+    // The default channel, not the dashboard: this is the configuration under
+    // which the checkpoint used to be skipped entirely.
+    expect(booted.policy.approval_channel.type).toBe("stderr");
+
+    const audited = await booted.auditLog.query({
+      operation_type: INTEL_OPS.CONFIG_LOADED,
+      limit: 20,
+    });
+    expect(audited.entries.length).toBeGreaterThan(0);
+    // Absent state is the honest legacy-unarmed default, and it is still a
+    // checkpoint result rather than a skipped checkpoint.
+    expect(audited.entries[0]!.details?.was_default).toBe(true);
+  });
+
+  it("refuses the boot and audits the refusal when the armed record is tampered", async () => {
+    const storage = new MemoryStorage();
+    const first = await createSanctuaryServer({ storage, passphrase: PASSPHRASE });
+    const masterKey = first.masterKey;
+
+    await plantIntelligenceRecord(
+      storage,
+      masterKey,
+      armedConfigSignedByAForeignKey(),
+    );
+
+    await expect(
+      createSanctuaryServer({ storage, passphrase: PASSPHRASE }),
+    ).rejects.toThrow(/integrity/i);
+
+    const auditLog = new AuditLog(storage, masterKey);
+    const audited = await auditLog.query({
+      operation_type: INTEL_OPS.LOAD_INTEGRITY,
+      limit: 20,
+    });
+    const refusals = audited.entries.filter(
+      (entry) => entry.details?.generation_refused === true,
+    );
+    expect(refusals.length).toBeGreaterThan(0);
+    expect(refusals[0]!.result).toBe("failure");
+    expect(refusals[0]!.details?.stage).toBe("state_validation");
+  });
+
+  it("PLANTED DIVERGENCE: an absent record still boots, so the refusal is about tampering", async () => {
+    const storage = new MemoryStorage();
+    await expect(
+      createSanctuaryServer({ storage, passphrase: PASSPHRASE }),
+    ).resolves.toBeDefined();
+  });
+});
