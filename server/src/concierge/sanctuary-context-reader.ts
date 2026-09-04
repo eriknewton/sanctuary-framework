@@ -234,12 +234,38 @@ export class SanctuaryContextReader {
   }
 }
 
+/**
+ * Hard ceiling on audit rows this reader will fetch for one question.
+ *
+ * Derivation, not a round number: the audit-focused default below is 50 rows,
+ * and this is that default doubled, so an operator who asks for more than the
+ * reader would ever choose on its own still gets a strictly better answer while
+ * the query stays a fixed, small cost. Nothing downstream benefits from more:
+ * the prompt projection in `prompt-builder.ts` caps the rendered bundle well
+ * below this, so rows past the cap are read from disk, decrypted, and then
+ * discarded before the model ever sees them.
+ *
+ * INVARIANT: `maxAuditEntries` arrives on `ConciergeAskRequest`, which is a
+ * caller-supplied DTO, so it is a request-shaped knob on how much work this
+ * fortress does per question. An unclamped limit made that work unbounded:
+ * one `ask` could drive an arbitrarily large audit query and decryption pass.
+ * Clamped, not rejected, because asking for too much is a clumsy request
+ * rather than an attack, and refusing the whole question would be a worse
+ * answer than a bounded one.
+ */
+const MAX_CONCIERGE_AUDIT_ENTRIES = 100;
+
 function inferAuditQuery(
   question: string,
   explicitLimit?: number,
 ): { since?: string; operation_type?: string; limit: number } {
   const lower = question.toLowerCase();
-  const limit = explicitLimit ?? (lower.includes("audit") ? 50 : 20);
+  const requested = explicitLimit ?? (lower.includes("audit") ? 50 : 20);
+  // A non-finite or non-positive request reads as "no useful limit given" and
+  // takes the floor of 1 rather than producing a negative or NaN query bound.
+  const limit = Number.isFinite(requested)
+    ? Math.min(Math.max(Math.floor(requested), 1), MAX_CONCIERGE_AUDIT_ENTRIES)
+    : Math.min(20, MAX_CONCIERGE_AUDIT_ENTRIES);
   const since = lower.includes("today")
     ? new Date(new Date().setHours(0, 0, 0, 0)).toISOString()
     : undefined;

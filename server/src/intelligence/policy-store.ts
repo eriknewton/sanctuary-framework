@@ -380,6 +380,58 @@ export class IntelligenceConfigUnreadableError extends LocalIntegrityStateLoadEr
   }
 }
 
+/**
+ * Operator-facing description of a local-intelligence failure that happened
+ * while a composition root was wiring the intelligence layer at boot.
+ *
+ * INVARIANT: THIS IS AN ALLOWLIST, AND THE ALLOWLIST OF DEGRADABLE CONDITIONS
+ * IS EMPTY. Every failure reaching a composition root's intelligence-wiring
+ * catch refuses startup; this function only chooses the sentence that names
+ * WHICH condition refused it. The shape it replaced asked whether the error
+ * was a {@link LocalIntegrityStateLoadError} and degraded when it was not, so
+ * an unfamiliar error class, or a tamper refusal wrapped by an intervening
+ * layer, booted a fortress with local intelligence quietly switched off. That
+ * is the silent-degrade shape MUST-NEVER #5 forbids, and a denylist gets it
+ * wrong by default: it has to recognize a danger to act, where an allowlist
+ * has to recognize a safety to relax.
+ *
+ * Why no condition is degradable today: absence is not a failure at all
+ * (`IntelligenceConfigStore.load` returns the honest legacy-unarmed default and
+ * a storage read error is already absorbed there), so everything that still
+ * reaches a caller's catch is either a refusal about record integrity or an
+ * error this build did not anticipate. Neither is safe to start on. Adding a
+ * degradable condition here means naming it, and naming it means arguing that
+ * a fortress running with intelligence off is the right answer for it.
+ *
+ * MUST MATCH usage in `../index.ts` and `../dashboard-standalone.ts`: both
+ * composition roots call this ONE function and both refuse, because the two
+ * entrypoints share a fortress and a record either refuses must not be
+ * startable through the other.
+ */
+export function describeIntelligenceBootFailure(err: unknown): string {
+  if (err instanceof IntelligenceConfigUnreadableError) {
+    // The subclass already spells out the remedy verb; repeating it here would
+    // be a second copy of INTELLIGENCE_CONFIG_RESET_VERB to keep in step.
+    return `Local-intelligence config cannot be read: ${err.message}`;
+  }
+  if (err instanceof LocalIntegrityStateLoadError) {
+    if (err.reason === "integrity_io_unavailable") {
+      return (
+        "Local-intelligence state could not be read (storage unavailable), so " +
+        "whether it is intact is indeterminate. Indeterminate is not the same " +
+        `as absent, so startup refuses rather than guess: ${err.message}`
+      );
+    }
+    return `Local-intelligence state failed its boot integrity check: ${err.message}`;
+  }
+  return (
+    "Local-intelligence wiring failed with an error this build does not " +
+    `classify, so startup refuses rather than run with it off: ${
+      err instanceof Error ? err.message : String(err)
+    }`
+  );
+}
+
 /** Result of {@link IntelligenceConfigStore.quarantineUnreadable}. */
 export type QuarantineOutcome =
   | {
