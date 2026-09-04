@@ -1,3 +1,4 @@
+// fail-before-exempt: test-isolation only. This file now stubs the local-intelligence ceremony so these wrap paths stop reading the HOST's Ollama runtime and waiting on a consent prompt no test can answer; no assertion changes, so it passes with or without the R2 source fix.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -37,6 +38,23 @@ import {
   CLI_SUBPROCESS_TEST_TIMEOUT_MS,
   runCliRaw,
 } from "../cli/helpers/run-cli.js";
+
+// TEST ISOLATION (AGENTS.md: the operator's machine is not a fixture). `runWrap`
+// runs the local-intelligence ceremony, which probes the HOST's Ollama runtime.
+// On a machine where Ollama is reachable but has no models for the signed
+// catalog, that ceremony correctly reaches an interactive consent prompt, and no
+// test here can answer it. These tests are about the wrap paths around it, so
+// the ceremony is stubbed out rather than read from the host.
+vi.mock("../../src/wrap/local-intelligence.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/wrap/local-intelligence.js")>()),
+  runLocalIntelligenceSetup: async () => ({
+    kind: "already-provisioned" as const,
+    surfaces: [],
+    models: [],
+    provenanceProjection: "projected" as const,
+  }),
+}));
+
 
 const OPERATOR_HOME = "/Users/operator";
 const FORTRESS = `${OPERATOR_HOME}/.sanctuary`;

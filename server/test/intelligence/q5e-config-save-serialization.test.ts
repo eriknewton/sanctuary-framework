@@ -88,7 +88,7 @@ describe("Q5E config-save serialization", () => {
     }, {
       loadManifest: async () => manifestText,
       modelManifestV2PublicKey: Q5E_PUBLIC_KEY,
-      resolveModelsRoot: async () => "/var/lib/ollama/models",
+      resolveModelsRoot: async () => ({ kind: "resolved" as const, rootReal: "/var/lib/ollama/models" }),
       probeHardware: async () => ({
         totalRamGb: 16,
         cpuArch: "apple-silicon-m2",

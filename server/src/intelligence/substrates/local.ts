@@ -43,12 +43,66 @@ export const LOCAL_CAPABILITY: SubstrateCapability = {
 const DEFAULT_TIMEOUT_MS = 30_000;
 const HARDWARE_PROBE_TIMEOUT_MS = 1_500;
 
+// A model pull moves gigabytes, so it is bounded by evidence of progress plus a
+// generous absolute ceiling, never by the per-invocation request timeout above:
+// a fixed wall clock aborts a healthy multi-gigabyte download mid-transfer and
+// leaves partial blobs behind.
+// 120_000 ms = 120 s x 1000 ms/s. Ollama emits a progress line several times a
+// second while a layer moves and recovers a stalled registry connection well
+// inside two minutes, so a longer silence means the transfer has stopped.
+const PULL_INACTIVITY_TIMEOUT_MS = 120_000;
+// 14_400_000 ms = 4 h x 60 min/h x 60 s/min x 1000 ms/s. The largest
+// signed-catalog model is on the order of 6 GB; at 0.5 MB/s (a 4 Mbit/s link)
+// that is about 3.4 h, so the ceiling clears the slowest link this ceremony is
+// meant to serve while still bounding a runtime that streams without ever
+// finishing.
+const PULL_ABSOLUTE_CEILING_MS = 4 * 60 * 60 * 1_000;
+// 65_536 bytes = 64 x 1024. An Ollama NDJSON status line is roughly 200 bytes;
+// the cap sits two orders of magnitude above that, so no legitimate line is
+// clipped, while a runtime that never emits a newline cannot grow the pending
+// buffer without bound.
+const PULL_PROGRESS_LINE_MAX_BYTES = 64 * 1024;
+// 67_108_864 bytes = 64 x 1024 x 1024, roughly 335_000 of the ~200-byte lines
+// above: far more than a full-ceiling pull produces, so the whole stream stays
+// bounded even when every individual line is well formed.
+const PULL_RESPONSE_MAX_BYTES = 64 * 1024 * 1024;
+
+const PULL_LINE_ENCODER = new TextEncoder();
+
 export interface OllamaClientConfig {
   endpoint: string;
-  /** Per-invocation timeout in ms; defaults to 30s. */
+  /** Per-invocation timeout in ms; defaults to 30s. Never bounds `pull`. */
   timeoutMs?: number;
+  /**
+   * Silence (no NDJSON progress line) that ends a streaming pull; defaults to
+   * `PULL_INACTIVITY_TIMEOUT_MS`.
+   */
+  pullInactivityTimeoutMs?: number;
+  /** Absolute ceiling for one streaming pull; defaults to `PULL_ABSOLUTE_CEILING_MS`. */
+  pullCeilingMs?: number;
   /** Optional fetch implementation override for tests. */
   fetchImpl?: typeof fetch;
+}
+
+/**
+ * One NDJSON line from `POST /api/pull`. Ollama reports a coarse `status`
+ * (`pulling manifest`, `pulling <digest>`, `verifying sha256 digest`,
+ * `success`) plus byte counters while a layer downloads.
+ */
+export interface OllamaPullProgress {
+  status: string;
+  digest?: string;
+  total?: number;
+  completed?: number;
+}
+
+export interface OllamaPullOptions {
+  /**
+   * Invoked once per NDJSON line, including the terminal `success` line, so a
+   * caller can report movement on its own operator channel. A throw from this
+   * callback is the caller's defect and is never allowed to abort the pull.
+   */
+  onProgress?: (progress: OllamaPullProgress) => void;
 }
 
 export interface OllamaTagsResponse {
@@ -77,12 +131,26 @@ const SHA256_DIGEST = /^(?:sha256:)?([0-9a-f]{64})$/;
 export class OllamaClient {
   private endpoint: string;
   private timeoutMs: number;
+  private pullInactivityTimeoutMs: number;
+  private pullCeilingMs: number;
   private fetchImpl: typeof fetch;
 
   constructor(config: OllamaClientConfig) {
     this.endpoint = stripTrailingSlashes(config.endpoint);
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.pullInactivityTimeoutMs = config.pullInactivityTimeoutMs ??
+      PULL_INACTIVITY_TIMEOUT_MS;
+    this.pullCeilingMs = config.pullCeilingMs ?? PULL_ABSOLUTE_CEILING_MS;
     this.fetchImpl = config.fetchImpl ?? fetch;
+    // A non-positive or non-finite pull bound would disable the deadline that
+    // keeps a stalled pull from hanging the ceremony forever; refuse the client
+    // rather than run one unbounded.
+    if (!Number.isFinite(this.pullInactivityTimeoutMs) || this.pullInactivityTimeoutMs <= 0) {
+      throw new Error("Ollama pull inactivity timeout must be positive");
+    }
+    if (!Number.isFinite(this.pullCeilingMs) || this.pullCeilingMs <= 0) {
+      throw new Error("Ollama pull ceiling must be positive");
+    }
   }
 
   /**
@@ -110,11 +178,119 @@ export class OllamaClient {
   }
 
   /**
-   * Pull one manifest-approved runtime tag. `stream:false` bounds the response
-   * to one JSON object; callers still verify `/api/show` before trusting it.
+   * Pull one manifest-approved runtime tag.
+   *
+   * `stream:true` is what makes a multi-gigabyte download completable: the
+   * request is bounded by silence between NDJSON progress lines and by an
+   * absolute ceiling, never by `timeoutMs`, which a healthy pull exceeds by
+   * orders of magnitude. The pull counts as done only when the runtime's own
+   * final line says `success`; an inline `error` line, a stream that ends
+   * without that line, a line or response past the reviewed byte caps, and a
+   * deadline are all refusals, because a half-finished download that reported
+   * "ok" would carry a partial blob into the digest check. Callers still verify
+   * `/api/show` against the signed manifest before trusting the result.
    */
-  async pull(model: string): Promise<OllamaMutationResult> {
-    return this.runMutation("/api/pull", { model, stream: false });
+  async pull(
+    model: string,
+    options: OllamaPullOptions = {},
+  ): Promise<OllamaMutationResult> {
+    const ctl = new AbortController();
+    const startedAt = Date.now();
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    try {
+      const res = await raceDeadline(
+        this.fetchImpl(`${this.endpoint}/api/pull`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model, stream: true }),
+          signal: ctl.signal,
+        }),
+        this.pullInactivityTimeoutMs,
+      );
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        return { ok: false, failureClass: classifyHttpError(res.status, text) };
+      }
+      if (res.body === null) {
+        // Without a body there can be no terminal `success` line, so there is no
+        // evidence the model landed; never report an unwitnessed pull as done.
+        return { ok: false, failureClass: "substrate_unavailable" };
+      }
+      reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let pending = "";
+      let responseBytes = 0;
+      let lastProgressAt = Date.now();
+      let sawSuccess = false;
+      for (;;) {
+        const now = Date.now();
+        const budgetMs = Math.min(
+          this.pullCeilingMs - (now - startedAt),
+          this.pullInactivityTimeoutMs - (now - lastProgressAt),
+        );
+        if (budgetMs <= 0) return { ok: false, failureClass: "substrate_timeout" };
+        const chunk = await raceDeadline(reader.read(), budgetMs);
+        if (chunk.done) break;
+        responseBytes += chunk.value.byteLength;
+        if (responseBytes > PULL_RESPONSE_MAX_BYTES) {
+          // A stream past the reviewed total is a runtime not speaking the
+          // protocol this client reviewed; refuse instead of reading on.
+          return { ok: false, failureClass: "substrate_misconfigured" };
+        }
+        pending += decoder.decode(chunk.value, { stream: true });
+        let newlineAt = pending.indexOf("\n");
+        while (newlineAt !== -1) {
+          const verdict = parsePullLine(pending.slice(0, newlineAt));
+          pending = pending.slice(newlineAt + 1);
+          if (verdict.kind === "refused") {
+            return { ok: false, failureClass: verdict.failureClass };
+          }
+          if (verdict.kind !== "blank") {
+            // Only a parsed line is evidence of progress, so only a parsed line
+            // refreshes the inactivity deadline; a drip of bytes carrying no
+            // line must not hold the pull open.
+            lastProgressAt = Date.now();
+            reportProgress(options.onProgress, verdict.progress);
+            if (verdict.kind === "success") sawSuccess = true;
+          }
+          newlineAt = pending.indexOf("\n");
+        }
+        if (PULL_LINE_ENCODER.encode(pending).length > PULL_PROGRESS_LINE_MAX_BYTES) {
+          return { ok: false, failureClass: "substrate_misconfigured" };
+        }
+      }
+      // Ollama terminates the stream with a newline, but a final line without
+      // one is still the runtime's verdict and is judged by the same parser.
+      if (pending.trim().length > 0) {
+        const verdict = parsePullLine(pending);
+        if (verdict.kind === "refused") {
+          return { ok: false, failureClass: verdict.failureClass };
+        }
+        if (verdict.kind !== "blank") {
+          reportProgress(options.onProgress, verdict.progress);
+          if (verdict.kind === "success") sawSuccess = true;
+        }
+      }
+      // A stream that ended without the runtime's own `success` line proves
+      // nothing about what is on disk, so it fails closed.
+      return sawSuccess
+        ? { ok: true, failureClass: null }
+        : { ok: false, failureClass: "substrate_unavailable" };
+    } catch (err) {
+      if (err instanceof PullDeadlineError) {
+        return { ok: false, failureClass: "substrate_timeout" };
+      }
+      const aborted = err instanceof Error && err.name === "AbortError";
+      return {
+        ok: false,
+        failureClass: aborted ? "substrate_timeout" : "substrate_unavailable",
+      };
+    } finally {
+      // Every exit path releases the connection, so a refused or deadlined pull
+      // cannot leave a download running behind the ceremony's back.
+      if (reader !== null) void reader.cancel().catch(() => undefined);
+      ctl.abort();
+    }
   }
 
   /**
@@ -250,39 +426,114 @@ export class OllamaClient {
     }
   }
 
-  private async runMutation(
-    path: string,
-    body: Readonly<Record<string, unknown>>,
-  ): Promise<OllamaMutationResult> {
-    try {
-      const ctl = new AbortController();
-      const timer = setTimeout(() => ctl.abort(), this.timeoutMs);
-      try {
-        const res = await this.fetchImpl(`${this.endpoint}${path}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-          signal: ctl.signal,
-        });
-        if (!res.ok) {
-          const text = await res.text().catch(() => "");
-          return {
-            ok: false,
-            failureClass: classifyHttpError(res.status, text),
-          };
-        }
-        await res.json().catch(() => null);
-        return { ok: true, failureClass: null };
-      } finally {
-        clearTimeout(timer);
-      }
-    } catch (err) {
-      const aborted = err instanceof Error && err.name === "AbortError";
-      return {
-        ok: false,
-        failureClass: aborted ? "substrate_timeout" : "substrate_unavailable",
-      };
-    }
+}
+
+/** Raised when a pull's inactivity or absolute deadline elapses first. */
+class PullDeadlineError extends Error {
+  constructor() {
+    super("ollama pull deadline");
+    this.name = "PullDeadlineError";
+  }
+}
+
+/**
+ * Bound `work` by `budgetMs` without depending on the fetch implementation to
+ * honor an abort signal: a runtime (or a seam) that ignores `signal` would
+ * otherwise let a stalled read hang the ceremony forever.
+ */
+async function raceDeadline<T>(work: Promise<T>, budgetMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // The losing side of the race still settles; this handler keeps its rejection
+  // from surfacing as an unhandled rejection after the deadline wins.
+  void work.catch(() => undefined);
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new PullDeadlineError()), budgetMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+type PullLineVerdict =
+  | { kind: "blank" }
+  | { kind: "progress"; progress: OllamaPullProgress }
+  | { kind: "success"; progress: OllamaPullProgress }
+  | { kind: "refused"; failureClass: SubstrateResponse["failureClass"] };
+
+/**
+ * Judge one NDJSON line. Every state is named here rather than defaulting to
+ * "keep going": a line this parser does not model is a refusal, so a runtime
+ * that stops speaking the reviewed protocol can never be read as progress.
+ */
+function parsePullLine(raw: string): PullLineVerdict {
+  const text = raw.trim();
+  if (text.length === 0) return { kind: "blank" };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { kind: "refused", failureClass: "substrate_misconfigured" };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { kind: "refused", failureClass: "substrate_misconfigured" };
+  }
+  const record = parsed as {
+    status?: unknown;
+    error?: unknown;
+    digest?: unknown;
+    total?: unknown;
+    completed?: unknown;
+  };
+  if (record.error !== undefined) {
+    // Ollama reports a registry or model failure inline on an HTTP 200 stream;
+    // failing closed here is what stops a refused pull from reaching the digest
+    // check as a success.
+    return {
+      kind: "refused",
+      failureClass: typeof record.error === "string"
+        ? classifyPullErrorLine(record.error)
+        : "substrate_misconfigured",
+    };
+  }
+  if (typeof record.status !== "string" || record.status.length === 0) {
+    return { kind: "refused", failureClass: "substrate_misconfigured" };
+  }
+  const progress: OllamaPullProgress = {
+    status: record.status,
+    ...(typeof record.digest === "string" ? { digest: record.digest } : {}),
+    ...(typeof record.total === "number" ? { total: record.total } : {}),
+    ...(typeof record.completed === "number" ? { completed: record.completed } : {}),
+  };
+  return record.status === "success"
+    ? { kind: "success", progress }
+    : { kind: "progress", progress };
+}
+
+/** Same intent as `classifyHttpError`, applied to an in-stream error string. */
+function classifyPullErrorLine(
+  message: string,
+): "substrate_misconfigured" | "substrate_rate_limited" | "substrate_unavailable" {
+  if (/rate limit|too many requests/i.test(message)) return "substrate_rate_limited";
+  if (/not found|does not exist|unknown model|no such/i.test(message)) {
+    return "substrate_misconfigured";
+  }
+  return "substrate_unavailable";
+}
+
+function reportProgress(
+  onProgress: OllamaPullOptions["onProgress"],
+  progress: OllamaPullProgress,
+): void {
+  if (onProgress === undefined) return;
+  try {
+    onProgress(progress);
+  } catch {
+    // Reporting is an operator-channel convenience; a reporter defect must never
+    // turn a live download into a refusal.
   }
 }
 

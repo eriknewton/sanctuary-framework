@@ -57,6 +57,18 @@ export class LocalModelsRootResolutionError extends Error {
   }
 }
 
+/**
+ * What the model-root resolver reports. `default_root_absent` is the one state
+ * that is not yet a verdict: the DEFAULT root does not exist because the runtime
+ * has never pulled, and Ollama creates it on its first pull. It deliberately
+ * carries no path, so an unvalidated root cannot enter the ceremony; the caller
+ * re-resolves strictly once the pull has created the directory. Must match
+ * `resolveOllamaModelsRootState` in `../wrap/local-intelligence.ts`.
+ */
+export type LocalModelsRootResolution =
+  | { kind: "resolved"; rootReal: string }
+  | { kind: "default_root_absent" };
+
 export type LocalProvisioningRefusalReason =
   | "declined"
   | "non_tty"
@@ -141,7 +153,13 @@ export interface LocalProvisioningOps {
     manifestVersionFloor?: number,
   ) => ModelManifestV2VerificationResult;
   probeHardware: () => Promise<HardwareCapabilityReport>;
-  resolveModelsRoot: () => Promise<string>;
+  /**
+   * Resolve the one root Q5 persists. A `default_root_absent` result means the
+   * host has a runtime but has never pulled; the ceremony defers to after the
+   * pull and calls this again, so only a strictly resolved root is ever
+   * verified against or committed.
+   */
+  resolveModelsRoot: () => Promise<LocalModelsRootResolution>;
   runtimeVerifier: RuntimeLightVerifier;
   immuneVerifier: ImmuneDiskVerifier;
   withProvisioningLock: <T>(operation: () => Promise<T>) => Promise<T>;
@@ -462,31 +480,52 @@ export async function runLocalIntelligenceProvisioning(
         return refuse(ops, localSurfaces, "binding_mismatch", "substrate_misconfigured");
       }
 
-      let rootReal: string;
-      try {
+      // state_ROOT_PENDING_PULL: `null` means the default model root does not
+      // exist yet because the reachable runtime has never pulled. Nothing is on
+      // disk to verify and nothing may be persisted from that state, so the
+      // strict resolution is deferred until the pull below has created it.
+      let rootReal: string | null = null;
+      const persistedRoot = authority.existingIntegrityState?.ollama_models_root;
+      if (persistedRoot !== undefined) {
         // Once armed, the just-reloaded durable root remains authoritative even
         // if the process environment changed before this lock was acquired.
-        rootReal = authority.existingIntegrityState?.ollama_models_root ??
-          await ops.resolveModelsRoot();
-      } catch (error) {
-        const reason = error instanceof LocalModelsRootResolutionError
-          ? error.reason
-          : "integrity_io_unavailable";
-        return refuse(ops, localSurfaces, reason, "substrate_misconfigured");
+        rootReal = persistedRoot;
+      } else {
+        let resolution: LocalModelsRootResolution;
+        try {
+          resolution = await ops.resolveModelsRoot();
+        } catch (error) {
+          return refuse(
+            ops,
+            localSurfaces,
+            rootResolutionRefusal(error),
+            "substrate_misconfigured",
+          );
+        }
+        if (resolution.kind === "resolved") {
+          rootReal = resolution.rootReal;
+        } else if (!hardware.ollamaReachable) {
+          // Without a reachable runtime nothing in this run can create the root,
+          // so an absent default root stays a refusal instead of becoming a wait
+          // for a pull that cannot happen.
+          return refuse(ops, localSurfaces, "model_root_invalid", "substrate_misconfigured");
+        }
       }
-      if (!isAbsolute(rootReal)) {
+      if (rootReal !== null && !isAbsolute(rootReal)) {
         return refuse(ops, localSurfaces, "model_root_invalid", "substrate_misconfigured");
       }
 
-      let sweep = await verifyEveryModel(
-        ops,
-        models,
-        rootReal,
-        verified.body.manifest_version,
-      );
-      const alreadyPresent = sweep.ok;
-      if (!sweep.ok) {
-        if (!repairableByPull(sweep.reason)) {
+      let sweep: VerificationSweep | null = rootReal === null
+        ? null
+        : await verifyEveryModel(
+          ops,
+          models,
+          rootReal,
+          verified.body.manifest_version,
+        );
+      const alreadyPresent = sweep !== null && sweep.ok;
+      if (sweep === null || !sweep.ok) {
+        if (sweep !== null && !repairableByPull(sweep.reason)) {
           return refuse(ops, localSurfaces, sweep.reason, "substrate_misconfigured");
         }
         for (const line of renderLocalProvisioningPlan({
@@ -538,6 +577,26 @@ export async function runLocalIntelligenceProvisioning(
             );
           }
         }
+        if (rootReal === null) {
+          // The pull has run, so the root must exist now and must clear exactly
+          // the same strict resolution a persisted root clears; a root that is
+          // still absent, aliased, or a symlink is refused here, never committed.
+          let resolution: LocalModelsRootResolution;
+          try {
+            resolution = await ops.resolveModelsRoot();
+          } catch (error) {
+            return refuse(
+              ops,
+              localSurfaces,
+              rootResolutionRefusal(error),
+              "substrate_misconfigured",
+            );
+          }
+          if (resolution.kind !== "resolved" || !isAbsolute(resolution.rootReal)) {
+            return refuse(ops, localSurfaces, "model_root_invalid", "substrate_misconfigured");
+          }
+          rootReal = resolution.rootReal;
+        }
         sweep = await verifyEveryModel(
           ops,
           models,
@@ -547,6 +606,11 @@ export async function runLocalIntelligenceProvisioning(
         if (!sweep.ok) {
           return refuse(ops, localSurfaces, sweep.reason, "substrate_misconfigured");
         }
+      }
+      if (rootReal === null || !sweep.ok) {
+        // Both hold on every path above; refusing rather than asserting keeps a
+        // future edit that breaks one of them from committing an unverified root.
+        return refuse(ops, localSurfaces, "model_root_invalid", "substrate_misconfigured");
       }
 
       const committedAt = (ops.now ?? (() => new Date()))().toISOString();
@@ -660,6 +724,12 @@ export async function runLocalIntelligenceProvisioning(
       "substrate_unavailable",
     );
   }
+}
+
+function rootResolutionRefusal(error: unknown): LocalProvisioningRefusalReason {
+  return error instanceof LocalModelsRootResolutionError
+    ? error.reason
+    : "integrity_io_unavailable";
 }
 
 function commitRefusalReason(error: unknown): LocalProvisioningRefusalReason {

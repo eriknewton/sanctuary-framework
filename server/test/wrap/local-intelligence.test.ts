@@ -17,7 +17,9 @@ import {
 } from "../../src/intelligence/packaged-model-manifest.js";
 import { SURFACES } from "../../src/intelligence/types.js";
 import {
+  formatPullProgress,
   resolveOllamaModelsRoot,
+  resolveOllamaModelsRootState,
   runLocalIntelligenceSetup,
   type RunLocalIntelligenceSetupDeps,
 } from "../../src/wrap/local-intelligence.js";
@@ -108,6 +110,41 @@ describe("shared protect/init local-intelligence adapter", () => {
       )).rejects.toMatchObject({ reason: "model_root_invalid" });
       await expect(resolveOllamaModelsRoot("win32", {}, parent))
         .rejects.toMatchObject({ reason: "immune_platform_unsupported" });
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("reports an absent default root as no-models-yet but refuses an absent configured one", async () => {
+    const parent = await realpath(
+      await mkdtemp(join(tmpdir(), "sanctuary-q5d-fresh-host-")),
+    );
+    try {
+      // A host where Ollama has never pulled has no ~/.ollama at all; the
+      // runtime creates it on the first pull, so this is a deferred resolution
+      // rather than a refusal.
+      await expect(resolveOllamaModelsRootState("darwin", {}, parent))
+        .resolves.toEqual({ kind: "default_root_absent" });
+      await expect(resolveOllamaModelsRootState("darwin", { OLLAMA_MODELS: "" }, parent))
+        .resolves.toEqual({ kind: "default_root_absent" });
+      // An operator who named OLLAMA_MODELS asserted that exact path exists.
+      await expect(resolveOllamaModelsRootState(
+        "darwin",
+        { OLLAMA_MODELS: join(parent, "explicit-missing") },
+        parent,
+      )).rejects.toMatchObject({ reason: "model_root_invalid" });
+      // A path component that exists but is not a directory is a real
+      // misconfiguration even under the default spelling.
+      const blocked = await realpath(
+        await mkdtemp(join(tmpdir(), "sanctuary-q5d-blocked-home-")),
+      );
+      await writeFile(join(blocked, ".ollama"), "not a directory");
+      await expect(resolveOllamaModelsRootState("darwin", {}, blocked))
+        .rejects.toMatchObject({ reason: "model_root_invalid" });
+      await rm(blocked, { recursive: true, force: true });
+      // The strict wrapper has nowhere to put "not yet", so it still refuses.
+      await expect(resolveOllamaModelsRoot("darwin", {}, parent))
+        .rejects.toMatchObject({ reason: "model_root_invalid" });
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
@@ -228,7 +265,7 @@ describe("shared protect/init local-intelligence adapter", () => {
       const deps = {
         client,
         modelManifestV2PublicKey: PUBLIC_KEY,
-        resolveModelsRoot: async () => "/var/lib/ollama/models",
+        resolveModelsRoot: async () => ({ kind: "resolved" as const, rootReal: "/var/lib/ollama/models" }),
         probeHardware: async () => ({
           totalRamGb: 16,
           cpuArch: "apple-silicon-m2" as const,
@@ -394,7 +431,7 @@ describe("shared protect/init local-intelligence adapter", () => {
       loadManifest: async () => signedV2Fixture(),
       modelManifestV2PublicKey: PUBLIC_KEY,
       modelStore,
-      resolveModelsRoot: async () => "/var/lib/ollama/models",
+      resolveModelsRoot: async () => ({ kind: "resolved" as const, rootReal: "/var/lib/ollama/models" }),
       probeHardware: async () => ({
         totalRamGb: 16,
         cpuArch: "apple-silicon-m2" as const,
@@ -477,6 +514,105 @@ describe("shared protect/init local-intelligence adapter", () => {
     )).toHaveLength(0);
   });
 
+  it("renders pull progress as one operator line per reported event", () => {
+    expect(formatPullProgress("qwen2.5:1.5b", {
+      status: "pulling 12345",
+      total: 400,
+      completed: 100,
+    })).toBe("Pulling qwen2.5:1.5b: pulling 12345 25%");
+    // No share is rendered when the runtime does not report both counters, or
+    // reports counters that cannot be a share of a download.
+    expect(formatPullProgress("qwen2.5:1.5b", { status: "pulling manifest" }))
+      .toBe("Pulling qwen2.5:1.5b: pulling manifest");
+    expect(formatPullProgress("qwen2.5:1.5b", { status: "x", total: 0, completed: 0 }))
+      .toBe("Pulling qwen2.5:1.5b: x");
+    expect(formatPullProgress("qwen2.5:1.5b", { status: "x", total: 10, completed: 11 }))
+      .toBe("Pulling qwen2.5:1.5b: x");
+  });
+
+  // WIRED-CONSUMER TEST (AGENTS.md rule 4): the ceremony's own pull seam must
+  // hand the client a progress reporter that reaches the operator channel, or a
+  // multi-gigabyte download reads as a hang no matter what the client emits.
+  it("feeds streaming pull progress into the ceremony's operator channel", async () => {
+    const { storage, masterKey, auditLog } = fixture();
+    const printed: string[] = [];
+    const client = {
+      show: vi.fn(),
+      pull: vi.fn(async (_tag: string, options?: {
+        onProgress?: (progress: { status: string; total?: number; completed?: number }) => void;
+      }) => {
+        options?.onProgress?.({ status: "pulling manifest" });
+        options?.onProgress?.({ status: "pulling 12345", total: 1000, completed: 500 });
+        options?.onProgress?.({ status: "success" });
+        return { ok: true as const, failureClass: null };
+      }),
+    } as unknown as OllamaClient;
+    const runtimeVerifier = {
+      verify: vi.fn()
+        .mockResolvedValueOnce({
+          ok: false,
+          state: "tags_model_absent",
+          reason: "runtime_model_absent",
+          runtimeTag: "qwen2.5:1.5b",
+        })
+        .mockResolvedValue({
+          ok: true,
+          state: "runtime_manifest_match",
+          runtimeTag: "qwen2.5:1.5b",
+          observedManifestDigest: DIGEST,
+        }),
+    };
+    await expect(runLocalIntelligenceSetup({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "pull-progress",
+      isTty: true,
+      print: (line) => printed.push(line),
+    }, {
+      client,
+      modelManifestV2PublicKey: PUBLIC_KEY,
+      loadManifest: async () => signedV2Fixture(9),
+      resolveModelsRoot: async () => ({
+        kind: "resolved" as const,
+        rootReal: "/var/lib/ollama/models",
+      }),
+      probeHardware: async () => ({
+        totalRamGb: 16,
+        cpuArch: "apple-silicon-m2" as const,
+        tier: "baseline" as const,
+        recommendedLocalModel: "gemma-2-2b" as const,
+        ollamaReachable: true,
+        ollamaModels: [],
+      }),
+      runtimeVerifier,
+      immuneVerifier: {
+        verify: async () => ({
+          ok: true as const,
+          state: "immune_verified" as const,
+          runtimeTag: "qwen2.5:1.5b",
+          expectedManifestDigest: DIGEST,
+          descriptorCount: 2,
+          bytesHashed: 10,
+          verifiedArtifactDigests: ["2".repeat(64)],
+          completedAtMonotonicMs: 1,
+          cached: false,
+        }),
+      },
+      confirm: async () => true,
+    })).resolves.toMatchObject({ kind: "provisioned" });
+    expect(client.pull).toHaveBeenCalledWith(
+      "qwen2.5:1.5b",
+      expect.objectContaining({ onProgress: expect.any(Function) }),
+    );
+    // The first event and the terminal one always reach the operator; the middle
+    // one is inside the rate-limit window, so it does not.
+    expect(printed.filter((line) => line.startsWith("Pulling "))).toEqual([
+      "Pulling qwen2.5:1.5b: pulling manifest",
+      "Pulling qwen2.5:1.5b: success",
+    ]);
+  });
+
   it("reloads durable authority inside the lock before a stale-view ceremony can regress the floor", async () => {
     const { storage, masterKey, auditLog } = fixture();
     let resumeStaleCeremony!: (manifest: string) => void;
@@ -489,7 +625,7 @@ describe("shared protect/init local-intelligence adapter", () => {
     });
     const commonDeps = {
       modelManifestV2PublicKey: PUBLIC_KEY,
-      resolveModelsRoot: async () => "/var/lib/ollama/models",
+      resolveModelsRoot: async () => ({ kind: "resolved" as const, rootReal: "/var/lib/ollama/models" }),
       probeHardware: async () => ({
         totalRamGb: 16,
         cpuArch: "apple-silicon-m2" as const,
