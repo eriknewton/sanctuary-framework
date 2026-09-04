@@ -40,8 +40,10 @@ runs through the same Tier gate and the same provenance signing as real use:
    provenance. For a passage id it reports the per-record signing status
    (`verified` vs a legacy unsigned row) and the fortress-recorded origin and
    admission bindings that verify for that exact passage (the `memory_provenance_*`
-   verbs manage the known-signer set). A record whose provenance does not verify
-   there is not trusted.
+   verbs manage the known-signer set). A passage that arrived through a memory
+   archive import reports `verified` with its origin-trust tier and the
+   transfer lineage reference named by the import that admitted it. A record whose
+   provenance does not verify there is not trusted.
 
 If `memory_insert`, then `memory_search`, then `memory_get` round-trips a record
 byte-faithfully and `sdw_memory_provenance` reports its provenance verified,
