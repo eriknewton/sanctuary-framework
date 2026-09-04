@@ -16,6 +16,14 @@ export const INTEL_OPS = {
   PII_REDACTION_EVENT: "intelligence_pii_redaction_event",
   CONFIG_LOADED: "intelligence_config_loaded",
   CONFIG_RESET: "intelligence_config_reset",
+  /**
+   * `sanctuary intelligence config-reset` quarantined an unreadable durable
+   * config record (corrupt or version-too-new) to a sidecar file and removed
+   * it. Distinct from CONFIG_RESET, which is the selector's operator-choice
+   * reset over a readable record; conflating them would make the audit claim
+   * the wrong event.
+   */
+  CONFIG_QUARANTINED: "intelligence_config_quarantined",
   /** A consented pull from the signed manifest's closed model registry. */
   MODEL_PULL: "intelligence_model_pull",
   /** A fail-closed provisioning outcome before any surface is marked ready. */

@@ -55,6 +55,12 @@ const cases: Array<{
     summary: "sanctuary intelligence diagnose.",
     flag: "--fortress",
   },
+  {
+    name: "intelligence config-reset",
+    args: ["intelligence", "config-reset", "--help"],
+    summary: "sanctuary intelligence config-reset.",
+    flag: "--fortress",
+  },
 ];
 
 describe("per-subcommand help routing (F-GA-3)", () => {

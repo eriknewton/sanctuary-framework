@@ -20,12 +20,17 @@ export {
 
 export {
   IntelligenceConfigStore,
+  IntelligenceConfigUnreadableError,
+  INTELLIGENCE_CONFIG_RESET_VERB,
   INTELLIGENCE_NAMESPACE,
   LocalIntegrityStateLoadError,
   Q5_CONFIG_SAVE_LOCK_FILE,
   SUBSTRATE_CONFIG_KEY,
+  SUBSTRATE_CONFIG_QUARANTINE_PREFIX,
   type IntelligenceConfigStoreOptions,
   type LoadOutcome,
+  type QuarantineOutcome,
+  type UnreadableConfigKind,
 } from "./policy-store.js";
 
 export {
