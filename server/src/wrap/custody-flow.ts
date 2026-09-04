@@ -22,6 +22,7 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 
 import { FilesystemStorage } from "../storage/filesystem.js";
+import type { CrossProcessLockLease } from "../storage/cross-process-lock.js";
 import { readFileCustody } from "../storage/custody-fs.js";
 import { AuditLog } from "../operational/audit-log.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
@@ -42,10 +43,13 @@ import {
   wrapMasterWithPassphrase,
   writeCustodyEnvelope,
   readCustodyEnvelope,
+  acquireFortressMasterWriteBarrier,
   CustodyUnlockError,
   type CustodyEnvelope,
   type EstablishMasterResult,
+  withCustodyWriteLock,
 } from "../core/master-custody.js";
+import type { MasterWriteBarrierLease } from "../storage/cross-process-lock.js";
 import {
   discloseRecoveryKey,
   preflightRecoveryKeyOutputFile,
@@ -68,6 +72,14 @@ export interface WrapCustodyOptions {
   beforeAgentRecoveryFileCreate?: () => void | Promise<void>;
   /** Test seam: simulate a crash after staging succeeds, before envelope commit. */
   afterAgentRecoveryFileCreate?: () => void | Promise<void>;
+  /**
+   * Persist an explicit operator-supplied passphrase only after custody has
+   * positively authenticated it and all envelope writes have completed.
+   * This callback runs while the custody write lock is still held.
+   */
+  persistAuthenticatedPassphrase?: (
+    value: string,
+  ) => Promise<{ location: string; source: string }>;
 }
 
 export function agentGuidedRecoveryOutputPath(
@@ -88,6 +100,8 @@ export interface WrapCustodyResult {
   /** Disclosed this run (newly minted recovery key), if any. */
   mintedRecoveryKey: boolean;
   origin: EstablishMasterResult["origin"] | "recovery-unlock-enroll";
+  /** Present only when persistAuthenticatedPassphrase completed successfully. */
+  persistedPassphrase?: { location: string; source: string };
 }
 
 const AGENT_RECOVERY_RECEIPT_PURPOSE = "agent-guided-recovery-staging-v1";
@@ -195,6 +209,32 @@ export async function establishWrapCustody(
   opts: WrapCustodyOptions
 ): Promise<WrapCustodyResult> {
   const storage = new FilesystemStorage(join(opts.storagePath, "state"));
+  // S2: acquire the shared master-rotation barrier BEFORE the custody write
+  // lock, matching rotateMaster's (barrier -> custody-lock) order, and hand it
+  // to establishMaster as `heldBarrier` so it never takes a SECOND barrier under
+  // the custody lock. Taking the custody lock first and letting establishMaster
+  // acquire the barrier under it is the opposing (custody-lock -> barrier) order
+  // that deadlocks a concurrent rotate-master until both bounded locks
+  // force-abort — which can knock rotation off its ceremony. Fail closed on an
+  // environmental barrier loss: establishing custody is a WRITE.
+  const barrier = await acquireFortressMasterWriteBarrier(storage);
+  try {
+    return await withCustodyWriteLock(
+      storage,
+      (lease) => establishWrapCustodyLocked(opts, storage, lease, barrier),
+      { metadata: { owner: "wrap-custody" } },
+    );
+  } finally {
+    await barrier.release();
+  }
+}
+
+async function establishWrapCustodyLocked(
+  opts: WrapCustodyOptions,
+  storage: FilesystemStorage,
+  lease: CrossProcessLockLease,
+  barrier: MasterWriteBarrierLease,
+): Promise<WrapCustodyResult> {
   const installMode = opts.interactive ? "interactive" : "headless";
 
   let result: EstablishMasterResult;
@@ -205,6 +245,8 @@ export async function establishWrapCustody(
       passphrase: opts.passphrase,
       firstRun: { installMode, mintRecoveryKey: false },
       storagePathHint: opts.storagePath,
+      // Reuse the caller-held barrier; do not acquire a second one (S2).
+      heldBarrier: barrier,
     });
     origin = result.origin;
   } catch (err) {
@@ -236,6 +278,8 @@ export async function establishWrapCustody(
       storage,
       recoveryKey: entered,
       storagePathHint: opts.storagePath,
+      // Reuse the caller-held barrier; do not acquire a second one (S2).
+      heldBarrier: barrier,
     });
     if (result.envelope) {
       const passphraseWrap = await wrapMasterWithPassphrase(
@@ -436,5 +480,20 @@ export async function establishWrapCustody(
   }
 
   await auditLog.flush();
-  return { masterKey, envelope, mintedRecoveryKey, origin };
+  lease.assertHeld();
+  let persistedPassphrase: { location: string; source: string } | undefined;
+  try {
+    persistedPassphrase = await opts.persistAuthenticatedPassphrase?.(
+      opts.passphrase,
+    );
+  } finally {
+    lease.assertHeld();
+  }
+  return {
+    masterKey,
+    envelope,
+    mintedRecoveryKey,
+    origin,
+    ...(persistedPassphrase === undefined ? {} : { persistedPassphrase }),
+  };
 }

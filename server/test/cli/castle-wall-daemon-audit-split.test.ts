@@ -35,6 +35,7 @@ import {
 } from "../../src/cli/castle-wall.js";
 import type { MacOSCastleWallDaemonInput } from "../../src/castle-wall/runtime/macos-daemon.js";
 import { AUDIT_DAEMON_NAMESPACE } from "../../src/operational/audit-store-split.js";
+import { initializeTestCustody } from "../helpers/custody-fixture.js";
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -67,10 +68,12 @@ describe("castle-wall daemon: F2 Option A audit-store split", () => {
   async function makeLocalFortress(): Promise<{ fortressPath: string }> {
     const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-audit-split-"));
     tempDirs.push(fortressPath);
+    await initializeTestCustody(fortressPath, { passphrase: PASSPHRASE });
     const code = await runProvisionPin([], {
       out: new CaptureStream(),
       err: new CaptureStream(),
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_PASSPHRASE: PASSPHRASE },
+      globalPinnedPublicKeyPath: join(fortressPath, "global-pin.bin"),
     });
     expect(code).toBe(0);
     return { fortressPath };
@@ -231,10 +234,12 @@ describe("castle-wall audit-store-status (CLI)", () => {
   async function makeLocalFortress(): Promise<{ fortressPath: string }> {
     const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-audit-status-"));
     tempDirs.push(fortressPath);
+    await initializeTestCustody(fortressPath, { passphrase: PASSPHRASE });
     const code = await runProvisionPin([], {
       out: new CaptureStream(),
       err: new CaptureStream(),
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_PASSPHRASE: PASSPHRASE },
+      globalPinnedPublicKeyPath: join(fortressPath, "global-pin.bin"),
     });
     expect(code).toBe(0);
     return { fortressPath };

@@ -20,15 +20,28 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
-    }
+    },
+    "./intelligence": {
+      "types": "./dist/intelligence/index.d.ts",
+      "import": "./dist/intelligence/index.js",
+      "require": "./dist/intelligence/index.cjs"
+    },
+    "./intelligence/catalog-v3/schemas/catalog-body.v3.schema.json": "./dist/intelligence/catalog-v3/schemas/catalog-body.v3.schema.json",
+    "./intelligence/catalog-v3/schemas/catalog-index.v1.schema.json": "./dist/intelligence/catalog-v3/schemas/catalog-index.v1.schema.json",
+    "./intelligence/catalog-v3/schemas/overlay-body.v1.schema.json": "./dist/intelligence/catalog-v3/schemas/overlay-body.v1.schema.json",
+    "./intelligence/catalog-v3/schemas/schema-digests.json": "./dist/intelligence/catalog-v3/schemas/schema-digests.json",
+    "./intelligence/catalog-v3/schemas/signed-catalog.v3.schema.json": "./dist/intelligence/catalog-v3/schemas/signed-catalog.v3.schema.json",
+    "./intelligence/catalog-v3/schemas/signed-overlay.v1.schema.json": "./dist/intelligence/catalog-v3/schemas/signed-overlay.v1.schema.json",
+    "./intelligence/catalog-v3/spdx/spdx-expression-3.0.1.abnf": "./dist/intelligence/catalog-v3/spdx/spdx-expression-3.0.1.abnf"
   },
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
-    "build": "node scripts/sign-reference-plugin.mjs && tsup && npm run build:boot-runtime && node scripts/copy-templates.js",
+    "build": "node scripts/copy-catalog-v3-assets.mjs --verify-only && node scripts/sign-reference-plugin.mjs && tsup && npm run build:boot-runtime && node scripts/copy-templates.js && node scripts/copy-catalog-v3-assets.mjs",
     "build:boot-runtime": "tsup --config tsup.boot-runtime.config.ts",
     "sign-reference-plugin": "node scripts/sign-reference-plugin.mjs",
     "sign-release": "tsx scripts/sign-release-manifest.mjs",
@@ -100,6 +113,7 @@
     "@types/node": "26.2.0",
     "@types/pg": "8.23.1",
     "@vitest/coverage-v8": "4.1.11",
+    "ajv": "8.20.0",
     "eslint": "10.8.1",
     "tsup": "8.5.1",
     "tsx": "4.23.12",

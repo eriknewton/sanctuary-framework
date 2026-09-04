@@ -40,6 +40,7 @@ import {
   saveBrokerPolicy,
 } from "../disclosure/broker/open.js";
 import { flagValue } from "./argv.js";
+import { promptHiddenLine, type RawModeStdin } from "./hidden-prompt.js";
 
 export interface SecretsArgs {
   argv: string[];
@@ -515,7 +516,10 @@ async function readValue(
   prompt: string
 ): Promise<string> {
   if (stdin.isTTY) {
-    return await promptSilently(stdin as unknown as NodeJS.ReadStream, prompt);
+    // Shared no-echo reader (cli/hidden-prompt.ts) — one source for every
+    // custody verb that must not echo a secret. Behavior is byte-identical to
+    // the private reader this replaced (prompt on stderr, Ctrl-C exits 130).
+    return await promptHiddenLine(stdin as unknown as RawModeStdin, prompt);
   }
   // Non-TTY: consume first line from stdin.
   return await readFirstLine(stdin);
@@ -546,38 +550,5 @@ async function readFirstLine(stdin: NodeJS.ReadableStream): Promise<string> {
       clearTimeout(deadline);
       reject(e);
     });
-  });
-}
-
-async function promptSilently(stdin: NodeJS.ReadStream, prompt: string): Promise<string> {
-  process.stderr.write(`${prompt}: `);
-  stdin.setRawMode?.(true);
-  stdin.resume();
-  return await new Promise<string>((resolve) => {
-    let buf = "";
-    const onData = (chunk: Buffer) => {
-      const s = chunk.toString("utf8");
-      for (const ch of s) {
-        if (ch === "\r" || ch === "\n") {
-          stdin.setRawMode?.(false);
-          stdin.pause();
-          stdin.off("data", onData);
-          process.stderr.write("\n");
-          resolve(buf);
-          return;
-        }
-        if (ch === "\u0003") {
-          // Ctrl-C
-          process.exit(130);
-        }
-        if (ch === "\u007f" || ch === "\b") {
-          // Backspace
-          buf = buf.slice(0, -1);
-        } else {
-          buf += ch;
-        }
-      }
-    };
-    stdin.on("data", onData);
   });
 }

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:sanctuary:schema:signed-overlay:v1",
+  "title": "Sanctuary Signed Overlay V1",
+  "$comment": "Structural prefilter only. Admission requires verifyAndParseSignedOverlayV1 with the operator public key, then validateCatalogOverlayCombination against the admitted catalog and rollback floor.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["body", "signature", "signer_key_id"],
+  "properties": {
+    "body": { "$ref": "urn:sanctuary:schema:overlay-body:v1" },
+    "signature": { "type": "string", "pattern": "^(?!A{86}(?![\\s\\S]))[A-Za-z0-9_-]{85}[AQgw](?![\\s\\S])" },
+    "signer_key_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048](?![\\s\\S])" }
+  }
+}

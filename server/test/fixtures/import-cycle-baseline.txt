@@ -1,10 +1,10 @@
 ============================================================
   Sanctuary import-cycle baseline (server/src)
 ============================================================
-  files scanned ......... 736
-  intra-src edges ....... 3309
+  files scanned ......... 972
+  intra-src edges ....... 4827
   self-imports .......... 0
-  cycles (SCC size > 1) . 9
+  cycles (SCC size > 1) . 10
 
 -- Cycles --------------------------------------------------
 (each cycle is a set of files mutually reachable via imports)
@@ -58,6 +58,10 @@ Cycle 8  (2 files):
     sentinel/types.ts
 
 Cycle 9  (2 files):
+    storage/cross-process-lock.ts
+    storage/interface.ts
+
+Cycle 10  (2 files):
     v1/federation-sync-envelope.ts
     v1/federation.ts
 

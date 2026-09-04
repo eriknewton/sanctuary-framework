@@ -37,6 +37,7 @@ import {
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { establishMaster } from "../../src/core/master-custody.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { initializeTestCustody } from "../helpers/custody-fixture.js";
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -78,10 +79,12 @@ describe("F2 re-gate repros (round 2)", () => {
   }) {
     const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-regate-"));
     tempDirs.push(fortressPath);
+    await initializeTestCustody(fortressPath, { passphrase: PASSPHRASE });
     const code = await runProvisionPin([], {
       out: new CaptureStream(),
       err: new CaptureStream(),
       env: ENV(fortressPath),
+      globalPinnedPublicKeyPath: join(fortressPath, "global-pin.bin"),
     });
     expect(code).toBe(0);
 

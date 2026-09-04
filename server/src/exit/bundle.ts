@@ -9,7 +9,15 @@
 
 import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { FilesystemStorageCapabilities, StorageBackend } from "../storage/interface.js";
+import type {
+  FilesystemStorageCapabilities,
+  NamespaceLockStorageCapabilities,
+  StorageBackend,
+} from "../storage/interface.js";
+import type {
+  CrossProcessLockLease,
+  CrossProcessLockOptions,
+} from "../storage/cross-process-lock.js";
 import {
   EXIT_IMPORT_JOURNAL_NAMESPACE,
   EXIT_IMPORT_JOURNAL_POSTIMAGE_NAMESPACE,
@@ -2281,7 +2289,7 @@ export function createExitAdmissionWriteGuard(base: StorageBackend): ExitAdmissi
       throw new Error("Exit memory admission attempted an undeclared late write");
     }
   };
-  const storage: StorageBackend & Partial<FilesystemStorageCapabilities> = {
+  const storage: StorageBackend & Partial<FilesystemStorageCapabilities & NamespaceLockStorageCapabilities> = {
     write: async (namespace, key, bytes) => {
       assertDeclared(namespace, key);
       await base.write(namespace, key, bytes);
@@ -2301,6 +2309,17 @@ export function createExitAdmissionWriteGuard(base: StorageBackend): ExitAdmissi
     ...(base.listNamespaces === undefined ? {} : { listNamespaces: () => base.listNamespaces!() }),
   };
   const filesystem = base as StorageBackend & Partial<FilesystemStorageCapabilities>;
+  const lockable = base as StorageBackend & Partial<NamespaceLockStorageCapabilities>;
+  if (typeof lockable.withNamespaceLock === "function") {
+    storage.withNamespaceLock = async function <T>(
+      namespace: string,
+      lockFileName: string,
+      operation: (lease: CrossProcessLockLease) => Promise<T>,
+      options?: CrossProcessLockOptions,
+    ): Promise<T> {
+      return lockable.withNamespaceLock!<T>(namespace, lockFileName, operation, options);
+    };
+  }
   if (typeof filesystem.namespacePath === "function") {
     storage.namespacePath = (namespace) => filesystem.namespacePath!(namespace);
   }

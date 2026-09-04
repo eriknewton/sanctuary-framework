@@ -31,6 +31,7 @@ import { generateRandomKey } from "../../../src/core/random.js";
 import { encrypt } from "../../../src/core/encryption.js";
 import { toBase64url, fromBase64url, stringToBytes } from "../../../src/core/encoding.js";
 import type { ShimInvoker } from "../../../src/castle-wall/runtime/helper-signer.js";
+import { initializeTestCustody } from "../../helpers/custody-fixture.js";
 
 const silent = new Writable({
   write(_chunk, _encoding, callback) {
@@ -113,7 +114,13 @@ describe("castle-wall re-pin : runRePin", () => {
         SANCTUARY_RECOVERY_KEY: recoveryKey,
       };
       // Provision K_old (local).
-      expect(await runProvisionPin([], { out: silent, err: silent, env })).toBe(0);
+      await initializeTestCustody(fortressPath, { recoveryKey });
+      expect(await runProvisionPin([], {
+        out: silent,
+        err: silent,
+        env,
+        globalPinnedPublicKeyPath: join(fortressPath, "global-pin.bin"),
+      })).toBe(0);
 
       const helper = makeMockHelper();
       const out = capture();
@@ -157,7 +164,15 @@ describe("castle-wall re-pin : runRePin", () => {
         SANCTUARY_STORAGE_PATH: fortressPath,
         SANCTUARY_RECOVERY_KEY: toBase64url(masterKey),
       };
-      expect(await runProvisionPin([], { out: silent, err: silent, env })).toBe(0);
+      await initializeTestCustody(fortressPath, {
+        recoveryKey: env.SANCTUARY_RECOVERY_KEY,
+      });
+      expect(await runProvisionPin([], {
+        out: silent,
+        err: silent,
+        env,
+        globalPinnedPublicKeyPath: join(fortressPath, "global-pin.bin"),
+      })).toBe(0);
       // Simulate a prior re-pin having retired the local private key.
       await unlink(join(fortressPath, "castle-pinned-privkey.enc"));
 

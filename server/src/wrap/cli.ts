@@ -74,10 +74,12 @@ import {
 } from "./hermes-yaml-parse-parity.js";
 import {
   getOrCreatePassphrase,
-  persistUserProvidedPassphrase,
+  persistAndConfirmUserProvidedPassphrase,
   isOsKeyringLocation,
   PassphraseUnreadableError,
   PassphraseKeyringUnreachableError,
+  PassphrasePathIdentityError,
+  PassphrasePersistenceError,
   probeExistingCustodyMaterial,
 } from "./passphrase.js";
 import { type DashboardHandle } from "../dashboard/index.js";
@@ -3045,6 +3047,22 @@ export async function runWrap(
     process.exit(2);
   }
 
+  // v1.1.1 hotfix (Finding T): honor --fortress and SANCTUARY_FORTRESS_PATH
+  // by promoting them onto SANCTUARY_STORAGE_PATH BEFORE any code calls
+  // resolveStoragePath(). Extracted so tests can pin the precedence
+  // without standing up the whole wrap flow.
+  //
+  // MUST run before the --unwrap dispatch below: unwrap() resolves its backup
+  // directory via resolveStoragePath() (config-reader.ts backupDir()), whose
+  // correctness rests on the precondition that every wrap-surface entry promotes
+  // --fortress first. Promoting after the early return silently ignored a
+  // non-default --fortress on unwrap and restored the DEFAULT fortress instead.
+  // It stays below the flag-shape validations above (which process.exit(2) on an
+  // invalid combo and must fire before any storage state is touched), and is a
+  // no-op when neither --fortress nor SANCTUARY_FORTRESS_PATH is set, so the
+  // ambient/default unwrap path is byte-identical.
+  promoteFortressToStoragePath(options);
+
   // D4 P2-2: --unwrap honors --dry-run too - pre-fix, the unwrap dispatch
   // sat above the dry-run gate, so `--unwrap --dry-run` restored backups
   // for real. The gate travels into unwrap() so it can report what WOULD
@@ -3053,12 +3071,6 @@ export async function runWrap(
     await unwrap(options.dryRun === true);
     return;
   }
-
-  // v1.1.1 hotfix (Finding T): honor --fortress and SANCTUARY_FORTRESS_PATH
-  // by promoting them onto SANCTUARY_STORAGE_PATH BEFORE any code calls
-  // resolveStoragePath(). Extracted so tests can pin the precedence
-  // without standing up the whole wrap flow.
-  promoteFortressToStoragePath(options);
 
   if (options.preflight === true && options.protectCommand !== true) {
     // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
@@ -3172,12 +3184,9 @@ export async function runWrap(
     }
   }
 
-  // Resolve/persist the passphrase before config detection/bootstrap and every
-  // fortress/recovery write on the agent-guided path. This is the real custody
-  // capability check: a read-only Keychain probe cannot prove writability (an
-  // SSH session may report item-not-found and then refuse the write). The
-  // resolved value is cached only in this process and consumed by the ordinary
-  // wrap flow below; it never reaches argv, config, or planner output.
+  // Resolve the passphrase before config detection/bootstrap on the
+  // agent-guided path. An explicit setter is deliberately NOT persisted here:
+  // it must first authenticate the fortress's existing custody below.
   let preResolvedAgentPassphrase:
     | { value: string; location: string; source: string }
     | undefined;
@@ -3199,14 +3208,10 @@ export async function runWrap(
       return;
     }
     if (options.passphrase !== undefined) {
-      const persist =
-        deps.persistPassphrase ??
-        ((value: string) => persistUserProvidedPassphrase(value, { storagePath: earlyStoragePath }));
-      const persisted = await persist(options.passphrase);
       preResolvedAgentPassphrase = {
         value: options.passphrase,
-        location: persisted.location,
-        source: persisted.source,
+        location: "",
+        source: "explicit-pending-authentication",
       };
     } else if (process.env.SANCTUARY_PASSPHRASE !== undefined) {
       preResolvedAgentPassphrase = {
@@ -3718,14 +3723,7 @@ export async function runWrap(
     passphraseLocation = preResolvedAgentPassphrase.location;
     passphraseSource = preResolvedAgentPassphrase.source;
     passphraseValue = preResolvedAgentPassphrase.value;
-    if (options.passphrase !== undefined) {
-      // SAFETY: destination description only; never the supplied value.
-      console.error(
-        `\n  \u{1F510} Persisted user-supplied passphrase (${passphraseLocation}).`,
-      );
-      // SAFETY: fixed backup instruction only; never the supplied value.
-      console.error("  Back up with: sanctuary export-passphrase");
-    } else if (passphraseSource === "generated") {
+    if (options.passphrase === undefined && passphraseSource === "generated") {
       // SAFETY: destination description only; never the generated value.
       console.error(
         `\n  \u{1F510} Generated and stored passphrase (${passphraseLocation}).`,
@@ -3734,29 +3732,9 @@ export async function runWrap(
       console.error("  Back up with: sanctuary export-passphrase");
     }
   } else if (options.passphrase) {
-    try {
-      const persist =
-        deps.persistPassphrase ??
-        ((value: string) => persistUserProvidedPassphrase(value, { storagePath }));
-      const persisted = await persist(options.passphrase);
-      passphraseLocation = persisted.location;
-      passphraseSource = persisted.source;
-      passphraseValue = options.passphrase;
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(
-        `\n  \u{1F510} Persisted user-supplied passphrase (${persisted.location}).`
-      );
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(
-        `  Back up with: sanctuary export-passphrase`
-      );
-    } catch (err) {
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(`\n  Sanctuary: Passphrase Persistence Failed`);
-      console.error(`  ${(err as Error).message}`);
-      console.error("");
-      process.exit(2);
-    }
+    passphraseLocation = "";
+    passphraseSource = "explicit-pending-authentication";
+    passphraseValue = options.passphrase;
   } else if (process.env.SANCTUARY_PASSPHRASE) {
     passphraseLocation = "SANCTUARY_PASSPHRASE";
     passphraseSource = "env";
@@ -3797,30 +3775,14 @@ export async function runWrap(
         console.error(`  ${err.message}\n`);
         process.exit(2);
       }
+      if (err instanceof PassphrasePathIdentityError) {
+        // SAFETY: stderr is the operator-facing CLI channel; no logger exists yet.
+        console.error(`\n  Sanctuary: Fortress Path Identity Unavailable`);
+        console.error(`  ${err.message}\n`);
+        process.exit(2);
+      }
       throw err;
     }
-  }
-
-  // Emit fallback-storage warning (SEC-063) when not using an OS keyring.
-  // One-time: only on first wrap (source === "generated") when the location
-  // is the fallback file, not when reading back a pre-existing fallback.
-  // Treats macOS Keychain and Linux Secret Service as equivalent OS-keyring
-  // destinations; the warning is about falling back to the machine-local
-  // encrypted file, which is weaker than either keyring.
-  const usingFallback = !isOsKeyringLocation(passphraseLocation);
-  const isFallbackGenerated = passphraseSource === "generated" && usingFallback;
-  const isFallbackUserProvided =
-    passphraseSource === "fallback-file" && usingFallback;
-  if (isFallbackGenerated || (options.passphrase && isFallbackUserProvided)) {
-    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(
-      `\n  \u26A0  Passphrase stored in encrypted fallback file (machine-local key).` +
-      `\n     This is protected only against off-machine access. On macOS, Sanctuary` +
-      `\n     uses Keychain; on Linux, Sanctuary uses Secret Service (D-Bus, via` +
-      `\n     libsecret) when available. To migrate: run \`sanctuary export-passphrase\`` +
-      `\n     on the current machine, then import into the OS keyring or pass via the` +
-      `\n     SANCTUARY_PASSPHRASE env var on the new machine.`
-    );
   }
 
   // Write sovereignty profile into the per-tenant storage path resolved
@@ -3842,7 +3804,31 @@ export async function runWrap(
         passphrase: passphraseValue,
         interactive: !options.noOpen && process.stdin.isTTY === true,
         agentGuided: options.agentGuided === true,
+        ...(options.passphrase === undefined
+          ? {}
+          : {
+              persistAuthenticatedPassphrase:
+                deps.persistPassphrase ??
+                ((value: string) =>
+                  persistAndConfirmUserProvidedPassphrase(value, { storagePath })),
+            }),
       });
+      if (options.passphrase !== undefined) {
+        const persisted = wrapCustody.persistedPassphrase;
+        if (persisted === undefined) {
+          throw new Error(
+            "Explicit passphrase was authenticated but not durably persisted",
+          );
+        }
+        passphraseLocation = persisted.location;
+        passphraseSource = persisted.source;
+        // SAFETY: destination description only; never the supplied value.
+        console.error(
+          `\n  \u{1F510} Persisted user-supplied passphrase (${persisted.location}).`,
+        );
+        // SAFETY: fixed backup instruction only; never the supplied value.
+        console.error("  Back up with: sanctuary export-passphrase");
+      }
     } catch (err) {
       if (err instanceof CustodyUnlockError) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -3850,8 +3836,35 @@ export async function runWrap(
         console.error(`  ${err.message}\n`);
         process.exit(2);
       }
+      if (
+        err instanceof PassphrasePersistenceError ||
+        err instanceof PassphrasePathIdentityError
+      ) {
+        // SAFETY: stderr is the operator-facing CLI channel; no logger exists yet.
+        console.error(`\n  Sanctuary wrap: Credential Persistence Failed`);
+        console.error(`  ${err.message}\n`);
+        process.exit(2);
+      }
       throw err;
     }
+  }
+
+  // Emit fallback-storage warning (SEC-063) only after an explicit setter has
+  // authenticated custody and its journaled persistence has succeeded.
+  const usingFallback = !isOsKeyringLocation(passphraseLocation);
+  const isFallbackGenerated = passphraseSource === "generated" && usingFallback;
+  const isFallbackUserProvided =
+    passphraseSource === "fallback-file" && usingFallback;
+  if (isFallbackGenerated || (options.passphrase && isFallbackUserProvided)) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  \u26A0  Passphrase stored in encrypted fallback file (machine-local key).` +
+      `\n     This is protected only against off-machine access. On macOS, Sanctuary` +
+      `\n     uses Keychain; on Linux, Sanctuary uses Secret Service (D-Bus, via` +
+      `\n     libsecret) when available. To migrate: run \`sanctuary export-passphrase\`` +
+      `\n     on the current machine, then import into the OS keyring or pass via the` +
+      `\n     SANCTUARY_PASSPHRASE env var on the new machine.`
+    );
   }
 
   if (passphraseValue !== undefined) {
@@ -4008,9 +4021,14 @@ export async function runWrap(
     mode: 0o600,
   });
 
-  // The args list is a constant - never inject `--passphrase`. The launcher
-  // re-resolves the stored passphrase at runtime from Keychain / fallback
-  // file / SANCTUARY_PASSPHRASE env var. See SEC-061. Env-block and
+  // The args list is a constant - never inject `--passphrase`. The launched
+  // MCP server re-resolves the credential at runtime: SANCTUARY_PASSPHRASE /
+  // SANCTUARY_RECOVERY_KEY env first, and when neither is set it reads the
+  // EXACT-fortress stored passphrase (OS keyring / namespaced fallback file)
+  // and then the machine-local custody key, READ-ONLY, in
+  // createSanctuaryServer's hands-free boot path (see
+  // resolveHandsFreeBootCredential in server/src/index.ts). That path never
+  // generates a passphrase and never mints custody. See SEC-061. Env-block and
   // command/args construction live in buildSanctuaryEnv /
   // resolveSanctuaryCommand so the dry-run reporter previews the exact
   // entry the real run writes.

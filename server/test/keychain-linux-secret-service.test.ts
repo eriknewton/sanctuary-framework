@@ -29,7 +29,7 @@ import {
   readStoredPassphrase,
   persistUserProvidedPassphrase,
   fallbackFilePath,
-  keychainServiceFor,
+  canonicalKeychainServiceFor,
   isOsKeyringLocation,
   OS_KEYRING_LOCATION_LINUX,
   PassphraseKeyringUnreachableError,
@@ -234,7 +234,7 @@ describe("Linux Secret Service keychain backend", () => {
     });
     expect(first.source).toBe("generated");
 
-    const expectedService = keychainServiceFor(tenantPath, home);
+    const expectedService = canonicalKeychainServiceFor(tenantPath, home);
     expect(expectedService).not.toBe("sanctuary-passphrase");
     expect(expectedService).toMatch(/^sanctuary-passphrase-[0-9a-f]{16}$/);
 
@@ -303,6 +303,20 @@ describe("Linux Secret Service keychain backend", () => {
     await access(fallbackFilePath(home));
     const raw = await readFile(fallbackFilePath(home));
     expect(raw.toString("utf-8")).not.toContain("user-held-linux-value");
+  });
+
+  it("keeps the public Linux custody claim aligned with fail-closed behavior", async () => {
+    const readme = await readFile(new URL("../../README.md", import.meta.url), "utf8");
+    expect(readme).toContain(
+      "On Linux, generation fails closed if Secret Service is absent, locked, or unreachable.",
+    );
+    expect(readme).toContain(
+      "it is neither hardware-backed nor cryptographically machine-bound",
+    );
+    expect(readme).not.toContain("machine-bound encrypted fallback on Linux");
+    expect(readme).not.toContain(
+      "On Linux, Sanctuary uses Secret Service when available and falls back",
+    );
   });
 
   it("fails closed (no clobber) when the D-Bus session bus is unavailable and no fallback exists", async () => {

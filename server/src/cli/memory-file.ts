@@ -12,9 +12,16 @@ import { createInterface } from "node:readline";
 import type { Writable } from "node:stream";
 
 import { loadConfig } from "../config.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { unlockLocalFortress } from "./local-fortress-unlock.js";
+import {
+  createLocalHumanApprovalInteraction,
+  type MemoryArchiveDialogRunner,
+} from "./memory-archive.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { AuditLog } from "../operational/audit-log.js";
+import { BaselineTracker } from "../principal-policy/baseline.js";
+import { ApprovalGate } from "../principal-policy/gate.js";
+import { loadPrincipalPolicy } from "../principal-policy/loader.js";
 import {
   CLAUDE_CODE_MEMORY_HARNESS,
   commitClaudeCodeMemorySnapshot,
@@ -38,6 +45,7 @@ import {
   transcodeMemoryDirectory,
 } from "../sdw/memory-transcode.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import type { MasterWriteBarrierLease } from "../storage/cross-process-lock.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { createPrimaryMemoryProvenancePublicKeyResolver, createPrimaryMemoryProvenanceSigningHandleResolver } from "../sdw/memory-provenance-signing.js";
 import { SdwMemoryProvenanceMigration } from "../sdw/memory-provenance-migration.js";
@@ -56,6 +64,14 @@ export interface MemoryFileCommandArgs {
   readonly env?: NodeJS.ProcessEnv;
   /** Stdin source for `--passphrase-stdin` (tests inject a Readable). */
   readonly stdin?: NodeJS.ReadableStream;
+  /**
+   * Test seam: receives a REFERENCE to the unlocked master buffer at bootstrap,
+   * so a test can assert the verb's `finally` zeroed it on every path — including
+   * when the body errors and when the audit flush throws — without printing the
+   * bytes. Production leaves it undefined.
+   */
+  readonly observeMasterKey?: (buf: Uint8Array) => void;
+  readonly dialogRunner?: MemoryArchiveDialogRunner;
 }
 
 const DEFAULT_OWNER_REF = "fleet-self";
@@ -103,10 +119,35 @@ export async function runMemoryIngestCommand(
   }
   const allowFiles: ReadonlySet<string> = new Set(allowFileFlags.values);
 
-  const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin);
+  // S4: memory_ingest is a Tier-1 operation in principal-policy (loader.ts), so
+  // it MUST pass the human ApprovalGate like emit/transcode/restore do. Without
+  // this a same-uid process could write operator-signed provenance records into
+  // the vault with no prompt — a claim/gate mismatch. The channel is built
+  // before unlock so a missing local approval interaction fails closed early.
+  const approvalChannel = createLocalHumanApprovalInteraction(args.dialogRunner, err);
+  if (!approvalChannel) return 1;
+
+  const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
   if (!boot) return 1;
 
   try {
+    // Tier-1 gate FIRST: no vault write, audit intent, or classifier override is
+    // recorded until the local operator approves this exact ingest.
+    const decision = await new ApprovalGate(
+      await loadPrincipalPolicy(boot.fortressPath),
+      boot.baseline,
+      approvalChannel,
+      boot.auditLog,
+    ).evaluate("memory_ingest", {
+      agent_id: null,
+      harness: parsed.harness,
+      source_dir: parsed.dir,
+      owner_ref: parsed.ownerRef,
+    });
+    if (!decision.allowed || !decision.approval_audit_id) {
+      write(err, "Denied: memory ingest was not approved by the local operator.\n");
+      return 1;
+    }
     let sourceFileCount = 0;
     // Preflight-only: screen decides accept / skip /
     // override and validates allow_files (assertAllowFilesKnown, inside
@@ -153,6 +194,7 @@ export async function runMemoryIngestCommand(
         owner_ref: parsed.ownerRef,
         source_file_count: sourceFileCount,
         allow_files: [...allowFiles].sort(),
+        approval_audit_id: decision.approval_audit_id,
       },
     });
 
@@ -205,6 +247,7 @@ export async function runMemoryIngestCommand(
           source_path: skip.source_path,
           reason: skip.reason,
         })),
+        approval_audit_id: decision.approval_audit_id,
       },
     });
     write(
@@ -252,7 +295,22 @@ export async function runMemoryIngestCommand(
     write(err, `memory_ingest failed: ${errorMessage(error)}\n`);
     return 1;
   } finally {
-    await boot.auditLog.flush();
+    // F4: zero the owned master even if the audit flush THROWS. The flush is the
+    // last consumer that needs the key, but a flush/write error must not skip the
+    // fill — so it runs in an inner `finally`, never a bare sequential statement.
+    // S1: the shared rotation barrier is released LAST, in its own `finally`, so
+    // a flush/zeroing throw can never strand the lease and block rotate-master.
+    // The flush above is this verb's final master-derived write, so releasing
+    // here is releasing after the last write (AGENTS rule 12).
+    try {
+      try {
+        await boot.auditLog.flush();
+      } finally {
+        boot.masterKey.fill(0);
+      }
+    } finally {
+      await boot.barrier?.release().catch(() => undefined);
+    }
   }
 }
 
@@ -270,10 +328,28 @@ export async function runMemoryEmitCommand(
   const parsed = parseCommonArgs(args.argv, "memory_emit", err);
   if (!parsed) return 2;
 
-  const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin);
+  const approvalChannel = createLocalHumanApprovalInteraction(args.dialogRunner, err);
+  if (!approvalChannel) return 1;
+
+  const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
   if (!boot) return 1;
 
   try {
+    const decision = await new ApprovalGate(
+      await loadPrincipalPolicy(boot.fortressPath),
+      boot.baseline,
+      approvalChannel,
+      boot.auditLog,
+    ).evaluate("memory_emit", {
+      agent_id: null,
+      harness: parsed.harness,
+      output_dir: parsed.dir,
+      owner_ref: parsed.ownerRef,
+    });
+    if (!decision.allowed || !decision.approval_audit_id) {
+      write(err, "Denied: plaintext memory emission was not approved by the local operator.\n");
+      return 1;
+    }
     // Write-ahead INTENT, durable before any plaintext file is materialized
     // from the vault. If appendCritical throws, emit aborts without writes.
     // Labelled `_started`: at this point no file exists on disk yet.
@@ -286,6 +362,7 @@ export async function runMemoryEmitCommand(
         harness: parsed.harness,
         output_dir: parsed.dir,
         owner_ref: parsed.ownerRef,
+        approval_audit_id: decision.approval_audit_id,
       },
     });
     const result = parsed.harness === CLAUDE_CODE_MEMORY_HARNESS
@@ -302,6 +379,7 @@ export async function runMemoryEmitCommand(
         owner_ref: parsed.ownerRef,
         emitted_file_count: result.emitted.length,
         index_present: result.index_present,
+        approval_audit_id: decision.approval_audit_id,
       },
     });
     write(
@@ -325,7 +403,22 @@ export async function runMemoryEmitCommand(
     write(err, `memory_emit failed: ${errorMessage(error)}\n`);
     return 1;
   } finally {
-    await boot.auditLog.flush();
+    // F4: zero the owned master even if the audit flush THROWS. The flush is the
+    // last consumer that needs the key, but a flush/write error must not skip the
+    // fill — so it runs in an inner `finally`, never a bare sequential statement.
+    // S1: the shared rotation barrier is released LAST, in its own `finally`, so
+    // a flush/zeroing throw can never strand the lease and block rotate-master.
+    // The flush above is this verb's final master-derived write, so releasing
+    // here is releasing after the last write (AGENTS rule 12).
+    try {
+      try {
+        await boot.auditLog.flush();
+      } finally {
+        boot.masterKey.fill(0);
+      }
+    } finally {
+      await boot.barrier?.release().catch(() => undefined);
+    }
   }
 }
 
@@ -341,10 +434,28 @@ export async function runMemoryTranscodeCommand(
   }
   const parsed = parseTranscodeArgs(args.argv, err);
   if (!parsed) return 2;
-  const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin);
+  const approvalChannel = createLocalHumanApprovalInteraction(args.dialogRunner, err);
+  if (!approvalChannel) return 1;
+  const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
   if (!boot) return 1;
 
   try {
+    const decision = await new ApprovalGate(
+      await loadPrincipalPolicy(boot.fortressPath),
+      boot.baseline,
+      approvalChannel,
+      boot.auditLog,
+    ).evaluate("memory_transcode", {
+      agent_id: null,
+      from_harness: parsed.fromHarness,
+      to_harness: parsed.toHarness,
+      output_dir: parsed.dir,
+      owner_ref: parsed.ownerRef,
+    });
+    if (!decision.allowed || !decision.approval_audit_id) {
+      write(err, "Denied: plaintext memory transcode was not approved by the local operator.\n");
+      return 1;
+    }
     await boot.auditLog.appendCritical({
       layer: "l1",
       operation: "memory_transcode_started",
@@ -356,6 +467,7 @@ export async function runMemoryTranscodeCommand(
         mode: MEMORY_TRANSCODE_MODE,
         output_dir: parsed.dir,
         owner_ref: parsed.ownerRef,
+        approval_audit_id: decision.approval_audit_id,
       },
     });
     const result = await transcodeMemoryDirectory(
@@ -381,6 +493,7 @@ export async function runMemoryTranscodeCommand(
           projection_file_count: result.projection_file_count,
           source_set_sha256: result.source_set_sha256,
           projection_set_sha256: result.projection_set_sha256,
+          approval_audit_id: decision.approval_audit_id,
         },
       });
     } catch (auditError) {
@@ -408,7 +521,22 @@ export async function runMemoryTranscodeCommand(
     write(err, `memory_transcode failed: ${errorMessage(error)}\n`);
     return 1;
   } finally {
-    await boot.auditLog.flush();
+    // F4: zero the owned master even if the audit flush THROWS. The flush is the
+    // last consumer that needs the key, but a flush/write error must not skip the
+    // fill — so it runs in an inner `finally`, never a bare sequential statement.
+    // S1: the shared rotation barrier is released LAST, in its own `finally`, so
+    // a flush/zeroing throw can never strand the lease and block rotate-master.
+    // The flush above is this verb's final master-derived write, so releasing
+    // here is releasing after the last write (AGENTS rule 12).
+    try {
+      try {
+        await boot.auditLog.flush();
+      } finally {
+        boot.masterKey.fill(0);
+      }
+    } finally {
+      await boot.barrier?.release().catch(() => undefined);
+    }
   }
 }
 
@@ -424,10 +552,27 @@ export async function runMemoryTranscodeRestoreCommand(
   }
   const parsed = parseRestoreArgs(args.argv, err);
   if (!parsed) return 2;
-  const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin);
+  const approvalChannel = createLocalHumanApprovalInteraction(args.dialogRunner, err);
+  if (!approvalChannel) return 1;
+  const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
   if (!boot) return 1;
 
   try {
+    const decision = await new ApprovalGate(
+      await loadPrincipalPolicy(boot.fortressPath),
+      boot.baseline,
+      approvalChannel,
+      boot.auditLog,
+    ).evaluate("memory_transcode_restore", {
+      agent_id: null,
+      archive_id: parsed.archiveId,
+      output_dir: parsed.dir,
+      owner_ref: parsed.ownerRef,
+    });
+    if (!decision.allowed || !decision.approval_audit_id) {
+      write(err, "Denied: plaintext memory transcode restore was not approved by the local operator.\n");
+      return 1;
+    }
     await boot.auditLog.appendCritical({
       layer: "l1",
       operation: "memory_transcode_restore_started",
@@ -437,6 +582,7 @@ export async function runMemoryTranscodeRestoreCommand(
         archive_id: parsed.archiveId,
         output_dir: parsed.dir,
         owner_ref: parsed.ownerRef,
+        approval_audit_id: decision.approval_audit_id,
       },
     });
     const result = await restoreMemoryTranscodeArchive(
@@ -457,6 +603,7 @@ export async function runMemoryTranscodeRestoreCommand(
           owner_ref: parsed.ownerRef,
           restored_file_count: result.source_file_count,
           source_set_sha256: result.source_set_sha256,
+          approval_audit_id: decision.approval_audit_id,
         },
       });
     } catch (auditError) {
@@ -481,7 +628,22 @@ export async function runMemoryTranscodeRestoreCommand(
     write(err, `memory_transcode_restore failed: ${errorMessage(error)}\n`);
     return 1;
   } finally {
-    await boot.auditLog.flush();
+    // F4: zero the owned master even if the audit flush THROWS. The flush is the
+    // last consumer that needs the key, but a flush/write error must not skip the
+    // fill — so it runs in an inner `finally`, never a bare sequential statement.
+    // S1: the shared rotation barrier is released LAST, in its own `finally`, so
+    // a flush/zeroing throw can never strand the lease and block rotate-master.
+    // The flush above is this verb's final master-derived write, so releasing
+    // here is releasing after the last write (AGENTS rule 12).
+    try {
+      try {
+        await boot.auditLog.flush();
+      } finally {
+        boot.masterKey.fill(0);
+      }
+    } finally {
+      await boot.barrier?.release().catch(() => undefined);
+    }
   }
 }
 
@@ -641,6 +803,26 @@ async function readPassphraseFromStdin(stdin: NodeJS.ReadableStream): Promise<st
 interface BootstrappedMemoryFileCommand {
   readonly adapter: SdwMemoryBackendAdapter;
   readonly auditLog: AuditLog;
+  readonly baseline: BaselineTracker;
+  readonly fortressPath: string;
+  /**
+   * The 32-byte fortress master key, OWNED by the caller: every verb must
+   * `masterKey.fill(0)` in its `finally` AFTER the audit flush (the flush is the
+   * last consumer that needs the key to encrypt/sign entries). The adapter,
+   * audit log, identity manager, and migration all hold this same buffer, so a
+   * single zeroing scrubs every reference.
+   */
+  readonly masterKey: Uint8Array;
+  /**
+   * The shared master-rotation barrier held for this write session (S1). Every
+   * memory verb here appends audit entries under the master, which are
+   * master-derived fortress WRITES, so the barrier is held from unlock and each
+   * verb MUST `await barrier.release()` in its `finally` AFTER the final audit
+   * flush. Releasing it lets a queued `rotate-master` proceed; holding it makes
+   * a concurrent rotation serialize behind this verb rather than commit
+   * old-master ciphertext (AGENTS rule 12).
+   */
+  readonly barrier?: MasterWriteBarrierLease;
 }
 
 async function bootstrap(
@@ -648,6 +830,7 @@ async function bootstrap(
   env: NodeJS.ProcessEnv,
   err: Writable,
   stdin: NodeJS.ReadableStream,
+  observeMasterKey?: (buf: Uint8Array) => void,
 ): Promise<BootstrappedMemoryFileCommand | null> {
   if (args.fortress !== undefined) {
     process.env.SANCTUARY_STORAGE_PATH = args.fortress;
@@ -656,65 +839,94 @@ async function bootstrap(
   const stdinPassphrase = args.passphraseFromStdin
     ? await readPassphraseFromStdin(stdin)
     : "";
-  const passphrase =
-    (stdinPassphrase.length > 0 ? stdinPassphrase : undefined) ??
-    args.passphrase ??
-    env.SANCTUARY_PASSPHRASE;
-  const recoveryKey = env.SANCTUARY_RECOVERY_KEY;
-  if (!passphrase && !recoveryKey) {
-    write(
-      err,
-      "Error: memory file commands require SANCTUARY_PASSPHRASE, --passphrase-stdin, --passphrase, or SANCTUARY_RECOVERY_KEY.\n",
-    );
-    return null;
-  }
 
   const config = await loadConfig();
   await mkdir(config.storage_path, { recursive: true, mode: 0o700 });
   const storage = new FilesystemStorage(join(config.storage_path, "state"));
-  let masterKey: Uint8Array;
+
+  // Unlock via the shared local-fortress chokepoint: argv/stdin/env credentials
+  // first (the pre-existing compatibility path), then the EXACT-fortress OS
+  // keyring so a fresh host whose passphrase is already stored by `protect` can
+  // run the first memory verb without re-typing a secret. `config.storage_path`
+  // is exact here: `--fortress` was promoted onto SANCTUARY_STORAGE_PATH above,
+  // so the keyring lookup is namespaced to THIS fortress. Never generates.
+  const unlocked = await unlockLocalFortress({
+    storage,
+    storagePath: config.storage_path,
+    ...(stdinPassphrase.length > 0
+      ? { passphraseFromStdin: stdinPassphrase }
+      : {}),
+    ...(args.passphrase !== undefined
+      ? { passphraseFromArgv: args.passphrase }
+      : {}),
+    env,
+    // Every memory verb here appends master-derived audit entries; hold the
+    // shared rotation barrier across the whole verb so a concurrent
+    // rotate-master serializes or the write fails closed (S1).
+    writeIntent: true,
+  });
+  if (!unlocked.ok) {
+    // Fail closed AND diagnosable, with a secret-free remediation. The message
+    // never carries credential bytes (CLAUDE.md #6).
+    write(err, `Error: could not unlock the fortress: ${unlocked.message}\n`);
+    return null;
+  }
+  const masterKey = unlocked.masterKey;
+  observeMasterKey?.(masterKey);
+  // Any failure between here and the successful return must zero the owned
+  // master before propagating, or a construction throw would leak the live key.
   try {
-    masterKey = await resolveCliMasterKey(storage, {
-      ...(passphrase !== undefined ? { passphrase } : {}),
-      ...(recoveryKey !== undefined ? { recoveryKey } : {}),
-      storagePathHint: config.storage_path,
+    const auditLog = new AuditLog(storage, masterKey);
+    const baseline = new BaselineTracker(storage, masterKey);
+    await baseline.load();
+    const identityManager = new IdentityManager(storage, masterKey);
+    const loaded = await identityManager.load();
+    if (loaded.loaded === 0 || identityManager.getDefault() === undefined) {
+      masterKey.fill(0);
+      // Release the writeIntent barrier on this early return too: it was acquired
+      // before the unlock and is transferred to the caller ONLY on the successful
+      // return below, so any bail-out here must release it itself or a stranded
+      // shared lease blocks a later rotate-master for the process lifetime (S1).
+      // An outer finally cannot own this — the success path must NOT release.
+      await unlocked.barrier?.release().catch(() => undefined);
+      write(err, "Error: fortress primary identity is unavailable.\n");
+      return null;
+    }
+    const fortressId = fortressIdFromStoragePath(config.storage_path);
+    const signingHandle = createPrimaryMemoryProvenanceSigningHandleResolver(identityManager, masterKey);
+    const signerPublicKey = createPrimaryMemoryProvenancePublicKeyResolver(identityManager);
+    const migration = new SdwMemoryProvenanceMigration({
+      storage,
+      masterKey,
+      fortressId,
+      ownerRef: args.ownerRef,
+      resolvePrimarySigningHandle: signingHandle,
+      resolveSignerPublicKey: signerPublicKey,
     });
-  } catch (error) {
-    // Fail closed AND diagnosable. Failure mode this guards: an unlock error
-    // thrown out of the command surfaces as an unhandled rejection, which reads
-    // as a crashed CLI rather than "this fortress is not unlocked".
-    write(err, `Error: could not unlock the fortress: ${errorMessage(error)}\n`);
-    return null;
-  }
-  const auditLog = new AuditLog(storage, masterKey);
-  const identityManager = new IdentityManager(storage, masterKey);
-  const loaded = await identityManager.load();
-  if (loaded.loaded === 0 || identityManager.getDefault() === undefined) {
+    const adapter = new SdwMemoryBackendAdapter({
+      storage,
+      masterKey,
+      fortressId,
+      ownerRef: args.ownerRef,
+      resolvePrimarySigningHandle: signingHandle,
+      resolveSignerPublicKey: signerPublicKey,
+      resolveMemoryIntegrityState: () => migration.getState(),
+    });
+    return {
+      adapter,
+      auditLog,
+      baseline,
+      fortressPath: config.storage_path,
+      masterKey,
+      ...(unlocked.barrier !== undefined ? { barrier: unlocked.barrier } : {}),
+    };
+  } catch (e) {
     masterKey.fill(0);
-    write(err, "Error: fortress primary identity is unavailable.\n");
-    return null;
+    // The construction failed AFTER the write barrier was acquired; release it
+    // so a stranded lease does not block a later rotate-master (S1).
+    await unlocked.barrier?.release().catch(() => undefined);
+    throw e;
   }
-  const fortressId = fortressIdFromStoragePath(config.storage_path);
-  const signingHandle = createPrimaryMemoryProvenanceSigningHandleResolver(identityManager, masterKey);
-  const signerPublicKey = createPrimaryMemoryProvenancePublicKeyResolver(identityManager);
-  const migration = new SdwMemoryProvenanceMigration({
-    storage,
-    masterKey,
-    fortressId,
-    ownerRef: args.ownerRef,
-    resolvePrimarySigningHandle: signingHandle,
-    resolveSignerPublicKey: signerPublicKey,
-  });
-  const adapter = new SdwMemoryBackendAdapter({
-    storage,
-    masterKey,
-    fortressId,
-    ownerRef: args.ownerRef,
-    resolvePrimarySigningHandle: signingHandle,
-    resolveSignerPublicKey: signerPublicKey,
-    resolveMemoryIntegrityState: () => migration.getState(),
-  });
-  return { adapter, auditLog };
 }
 
 async function appendFailure(
@@ -791,6 +1003,12 @@ Options:
                          any local user; prefer SANCTUARY_PASSPHRASE or
                          --passphrase-stdin.
   --help, -h             Show this help.
+
+Credential precedence: --passphrase-stdin, then --passphrase, then
+SANCTUARY_PASSPHRASE, then SANCTUARY_RECOVERY_KEY, then this fortress's stored
+passphrase in the OS keyring (the exact-fortress unwrap, so a host where
+'sanctuary protect' already stored the passphrase opens the fortress with no
+secret supplied). A locked keyring is reported; a passphrase is never generated.
 `,
   );
 }

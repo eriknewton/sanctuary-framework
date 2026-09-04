@@ -25,7 +25,6 @@
  * and it only re-baselines to the epoch that is already on disk.
  */
 
-import { createInterface, Interface as ReadlineInterface } from "node:readline";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -44,7 +43,10 @@ import {
   verifyEnvelopeMac,
   envelopeEpochOf,
   CustodyUnlockError,
+  withCustodyWriteLock,
 } from "../core/master-custody.js";
+import { fromBase64url } from "../core/encoding.js";
+import { promptHiddenLine, type RawModeStdin } from "./hidden-prompt.js";
 import {
   isRollbackFrozen,
   restoreAttest,
@@ -55,20 +57,40 @@ export interface RestoreAttestCliArgs {
   argv: string[];
   out?: NodeJS.WritableStream;
   err?: NodeJS.WritableStream;
-  stdin?: NodeJS.ReadableStream & { isTTY?: boolean };
+  /**
+   * Stdin source for prompts. Typed as {@link RawModeStdin} — the exact shape
+   * the hidden-prompt raw-mode reader needs — so it reaches `promptHiddenLine`
+   * with no cast.
+   */
+  stdin?: RawModeStdin;
   storagePath?: string;
   home?: string;
   /** Test seam: passphrase without the interactive prompt. */
   passphraseOverride?: string;
+  /**
+   * Test seam for `--recovery-key-prompt`: supplies the recovery key without a
+   * real TTY hidden prompt. Mirrors {@link passphraseOverride}; when set, the
+   * interactive-terminal requirement and hidden prompt are bypassed.
+   */
+  recoveryKeyOverride?: string;
+  /** Test seam: pause after under-lock authentication, before audit/attest. */
+  beforeAttestationCommit?: () => void | Promise<void>;
 }
 
 interface ParsedArgs {
   storage?: string;
   help: boolean;
+  /**
+   * Private `--recovery-key-prompt`: attest with the human-held RECOVERY KEY
+   * instead of the passphrase, read from a hidden interactive prompt. For the
+   * second-host / lost-passphrase case where the passphrase is not to hand but
+   * the recovery key is.
+   */
+  recoveryKeyPrompt: boolean;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
-  const out: ParsedArgs = { help: false };
+  const out: ParsedArgs = { help: false, recoveryKeyPrompt: false };
   // Must match consumeFlagValue in ./argv.ts: a dropped --fortress/--storage value must refuse, never silently resolve the default fortress; wrong-fortress custody-restore attestation is a constraint-5 violation.
   const fortress = consumeFlagValue(argv, "--fortress");
   if (fortress.error !== undefined) throw new Error(fortress.error);
@@ -93,6 +115,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   for (let i = 0; i < storage.argv.length; i++) {
     const a = storage.argv[i];
     if (a === "--help" || a === "-h") out.help = true;
+    else if (a === "--recovery-key-prompt") out.recoveryKeyPrompt = true;
     else if (a && a.startsWith("--")) {
       throw new Error(`Unknown flag: ${a}`);
     }
@@ -121,49 +144,19 @@ If you did NOT restore anything and do not recognize this rollback, treat it as 
 possible attack and rotate the master ('sanctuary rotate-master') BEFORE attesting.
 
 Options:
-  --fortress <path>   Override the fortress storage path.
-  --storage <path>    Alias for --fortress.
-  --help, -h          Show this help.
+  --fortress <path>       Override the fortress storage path.
+  --storage <path>        Alias for --fortress.
+  --recovery-key-prompt   Attest with your human-held RECOVERY KEY instead of the
+                          passphrase, read from a hidden interactive prompt (for
+                          the second-host / lost-passphrase case). Requires a
+                          terminal; never accepts the key from argv/env/pipe.
+  --help, -h              Show this help.
 
 The fortress passphrase is read from SANCTUARY_PASSPHRASE when set, otherwise
-prompted.
+read from a hidden interactive-terminal prompt. Piped passphrases are refused.
+With --recovery-key-prompt the recovery key is prompted instead, and
+SANCTUARY_PASSPHRASE is ignored.
 `);
-}
-
-class LineReader {
-  private readonly rl: ReadlineInterface;
-  private readonly queue: string[] = [];
-  private readonly waiters: Array<(line: string) => void> = [];
-  private closed = false;
-
-  constructor(stdin: NodeJS.ReadableStream) {
-    this.rl = createInterface({ input: stdin });
-    this.rl.on("line", (line) => {
-      const w = this.waiters.shift();
-      if (w) w(line);
-      else this.queue.push(line);
-    });
-    this.rl.on("close", () => {
-      this.closed = true;
-      while (this.waiters.length > 0) this.waiters.shift()!("");
-    });
-  }
-
-  next(): Promise<string> {
-    if (this.queue.length > 0) return Promise.resolve(this.queue.shift()!);
-    if (this.closed) return Promise.resolve("");
-    return new Promise((resolve) => this.waiters.push(resolve));
-  }
-
-  close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    try {
-      this.rl.close();
-    } catch {
-      // already closed
-    }
-  }
 }
 
 export async function runRestoreAttestCommand(
@@ -171,8 +164,9 @@ export async function runRestoreAttestCommand(
 ): Promise<number> {
   const out = args.out ?? process.stdout;
   const err = args.err ?? process.stderr;
-  const stdin =
-    args.stdin ?? (process.stdin as NodeJS.ReadableStream & { isTTY?: boolean });
+  // `process.stdin` (tty.ReadStream) structurally satisfies RawModeStdin, so no
+  // cast is needed to reach the hidden-prompt reader.
+  const stdin: RawModeStdin = args.stdin ?? process.stdin;
   const home = args.home ?? homedir();
 
   let parsed: ParsedArgs;
@@ -200,40 +194,97 @@ export async function runRestoreAttestCommand(
 
   out.write(`\nSanctuary restore-attest\nStorage: ${storagePath}\n\n`);
 
-  const lines = new LineReader(stdin);
-  const prompt = async (q: string): Promise<string> => {
-    err.write(q);
-    return lines.next();
-  };
-
   let master: Uint8Array | null = null;
+  // Function-scoped so the outer `finally` zeroes the decoded recovery key on
+  // EVERY path, including when `unwrapMaster` throws for a wrong key (the most
+  // common failure) before any inline scrub could run.
+  let recoveryKeyBytes: Uint8Array | null = null;
   try {
+    let passphrase: string | null = null;
+    // Prompt before acquiring the custody/master lock: a human can take an
+    // arbitrary amount of time, and no writer should be blocked while the
+    // command is merely waiting for input. The credential is authenticated
+    // only after the lock and a fresh envelope reread below.
+    if (parsed.recoveryKeyPrompt) {
+      // Private recovery-key attestation: the second-host / lost-passphrase
+      // case. The recovery key is read from a hidden interactive prompt only —
+      // never argv/env/pipe — so it cannot be scraped from a process list or a
+      // CI log.
+      if (!stdin.isTTY && args.recoveryKeyOverride === undefined) {
+        err.write(
+          "Refusing: --recovery-key-prompt requires an interactive terminal.\n" +
+            "The recovery key is read from a hidden prompt only.\n"
+        );
+        return 1;
+      }
+      const entered = (
+        args.recoveryKeyOverride ??
+        (await promptHiddenLine(stdin, "Recovery key", { err }))
+      ).trim();
+      if (!entered) {
+        err.write("Aborted: no recovery key entered.\n");
+        return 1;
+      }
+      try {
+        recoveryKeyBytes = fromBase64url(entered);
+      } catch {
+        err.write("Aborted: the recovery key is not valid base64url.\n");
+        return 1;
+      }
+      // 32 = the 256-bit recovery key width (see decodeRecoveryKey in
+      // core/master-custody.ts, the sibling check on the same value).
+      if (recoveryKeyBytes.length !== 32) {
+        err.write("Aborted: the recovery key has the wrong length.\n");
+        return 1;
+      }
+    } else {
+      // Passphrase: explicit test seam / env first, then a TTY-only hidden
+      // prompt. Never consume a custody credential from a pipe.
+      passphrase =
+        args.passphraseOverride ?? process.env.SANCTUARY_PASSPHRASE ?? "";
+      if (!passphrase) {
+        if (!stdin.isTTY) {
+          err.write(
+            "Refusing: a fortress passphrase requires an interactive terminal.\n" +
+              "The passphrase is read from a hidden prompt only.\n"
+          );
+          return 1;
+        }
+        passphrase = (
+          await promptHiddenLine(stdin, "Fortress passphrase", { err })
+        ).trim();
+      }
+      if (!passphrase) {
+        err.write("Aborted: no passphrase provided.\n");
+        return 1;
+      }
+
+    }
+
     const storage = new FilesystemStorage(statePath);
+    return await withCustodyWriteLock(
+      storage,
+      async (lease) => {
+        lease.assertHeld();
+        // Fresh under-lock reread: reset/init/rotation cannot replace custody
+        // between authentication and the audit+witness/freeze transaction.
+        const envelope = await readCustodyEnvelope(storage);
+        if (!envelope) {
+          err.write(
+            "This fortress does not have envelope-format custody; there is no epoch\n" +
+              "witness to attest. Nothing to do.\n"
+          );
+          return 1;
+        }
+        if (recoveryKeyBytes !== null) {
+          master = await unwrapMaster(envelope, { recoveryKey: recoveryKeyBytes });
+        } else {
+          master = await unwrapMaster(envelope, { passphrase: passphrase! });
+        }
+        verifyEnvelopeMac(envelope, master);
 
-    const envelope = await readCustodyEnvelope(storage);
-    if (!envelope) {
-      err.write(
-        "This fortress does not have envelope-format custody; there is no epoch\n" +
-          "witness to attest. Nothing to do.\n"
-      );
-      return 1;
-    }
-
-    // Passphrase: env first, then prompt.
-    let passphrase =
-      args.passphraseOverride ?? process.env.SANCTUARY_PASSPHRASE ?? "";
-    if (!passphrase) {
-      passphrase = (await prompt("Fortress passphrase: ")).trim();
-    }
-    if (!passphrase) {
-      err.write("Aborted: no passphrase provided.\n");
-      return 1;
-    }
-
-    // Unlock the master from a REAL credential (the gate) and authenticate the
-    // envelope under it before trusting the on-disk epoch.
-    master = await unwrapMaster(envelope, { passphrase });
-    verifyEnvelopeMac(envelope, master);
+        await args.beforeAttestationCommit?.();
+        lease.assertHeld();
 
     const frozen = await isRollbackFrozen(storage, master);
     if (!frozen.frozen) {
@@ -260,7 +311,9 @@ export async function runRestoreAttestCommand(
       currentEpoch,
       epochId,
       fortressId,
+      assertLockHeld: lease.assertHeld,
       recordAttestation: async (ctx) => {
+        lease.assertHeld();
         await auditLog.appendCritical({
           layer: "l2",
           operation: "custody_restore_attested",
@@ -280,7 +333,9 @@ export async function runRestoreAttestCommand(
               : {}),
           },
         });
+        lease.assertHeld();
         await auditLog.flush();
+        lease.assertHeld();
       },
     });
 
@@ -291,7 +346,11 @@ export async function runRestoreAttestCommand(
           : "No freeze was in effect; witness re-baselined.\n") +
         "A permanent audit entry (custody_restore_attested) records this restore.\n"
     );
-    return 0;
+        lease.assertHeld();
+        return 0;
+      },
+      { metadata: { owner: "restore-attest" } },
+    );
   } catch (e) {
     if (e instanceof CustodyUnlockError) {
       err.write(`${e.message}\n`);
@@ -302,7 +361,11 @@ export async function runRestoreAttestCommand(
     );
     return 1;
   } finally {
-    if (master) master.fill(0);
-    lines.close();
+    // TypeScript does not model assignments made inside the locked async
+    // callback above, but `master` is populated at runtime before any
+    // authenticated mutation. Preserve the outer finally as the single scrub
+    // point for both callback success and callback failure.
+    (master as Uint8Array | null)?.fill(0);
+    if (recoveryKeyBytes) recoveryKeyBytes.fill(0); // covers the unwrap-throw path
   }
 }

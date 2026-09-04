@@ -74,6 +74,35 @@ planner may return the ordinary single-shot agent action. Its `on_nonzero`
 transition still names the exact private-local-Terminal action; a failed agent
 attempt is never retried automatically.
 
+## Rung 1 memory onboarding
+
+For the fresh-host and second-machine walkthrough (first-use proof with the MCP
+tools, restart persistence, portability, archive transfer, the exact-fortress
+unwrap, recovery-key rekey, and `restore-attest`), see
+[Rung 1: fresh-host sovereign-memory onboarding](rung1-fresh-host.md).
+On a copied host or after a lost passphrase, guide the operator first to the
+private recovery-key rekey in that document. Never recommend nuke while a
+human-held recovery key (or configured share/guardian recovery) can preserve
+the fortress.
+
+The planner reports three ambient-env-blind daily-UX observations for the memory
+surface. Credential/envelope inspection is read-only; the separate lock-capability
+check uses a short-lived private runtime socket and refuses known shared/network
+filesystems. `custody_access`
+(`usable`, `absent`, `locked`, `mismatch`, `missing`, `unavailable`, or `unknown`)
+reports whether this host opens the fortress from its exact-fortress stored
+credential with no secret typed; `custody_mutation` (`available`, `unavailable`,
+or `unknown`) independently reports whether the reviewed process-owned mutation
+lock is usable; `recovery_factor` (`present`, `absent`, or `unknown`) reports a
+MAC-authenticated, operator-verified human-held recovery-key wrap. The planner
+reports `complete` only when access is `usable` and mutation is `available`.
+It then adds a
+`restart_and_verify_rung1` human action: restart the host and confirm memory
+survives via `memory_insert`, `memory_search`, and `memory_get` (which proves
+exact content: it decrypts and re-verifies the stored content hash, not signer
+data) with no ambient credential env. Verified provenance and signer fields come
+from `sdw_memory_provenance`, not `memory_get`.
+
 ## Profiles
 
 `memory` installs the sovereign encrypted memory/cooperative policy surface for

@@ -145,7 +145,18 @@ import {
   establishMaster,
   checkCastlePinCustody,
   readEnvelopeEpoch,
+  readCustodyEnvelope,
 } from "./core/master-custody.js";
+import {
+  readStoredPassphrase,
+  PassphraseKeyringUnreachableError,
+  PassphraseUnreadableError,
+  PassphrasePathIdentityError,
+} from "./wrap/passphrase.js";
+import {
+  readKeychainCustodyKeyStatus,
+  type KeychainReadResult,
+} from "./wrap/keychain-custody.js";
 import { decrypt } from "./core/encryption.js";
 import { derivePurposeKey, IDENTITY_ENCRYPTION_PURPOSE } from "./core/key-derivation.js";
 import {
@@ -191,6 +202,94 @@ export interface SanctuaryServer {
   policy: PrincipalPolicy;
 }
 
+/** Outcome of the hands-free boot credential resolution (H1). */
+type HandsFreeBootCredential =
+  | { kind: "passphrase"; value: string }
+  | { kind: "keychain-key"; key: Uint8Array }
+  | { kind: "virgin" }
+  | { kind: "fail-closed"; message: string };
+
+/**
+ * Resolve the exact-fortress stored credential for a hands-free MCP boot (H1),
+ * READ-ONLY. Mirrors the CLI memory verbs' final fallback: the stored
+ * passphrase (OS keyring / namespaced fallback file) first, then the
+ * machine-local custody key. NEVER generates a passphrase and NEVER mints
+ * custody. The envelope presence is what separates a virgin fortress (fall
+ * through to the audited first-run) from an existing one that must fail closed
+ * when no credential resolves, so a boot never mints a fresh master over data a
+ * stored-but-unreadable credential was meant to unlock.
+ */
+async function resolveHandsFreeBootCredential(args: {
+  storage: StorageBackend;
+  storagePath: string;
+  readStored: typeof readStoredPassphrase;
+  readCustody: typeof readKeychainCustodyKeyStatus;
+}): Promise<HandsFreeBootCredential> {
+  const envelope = await readCustodyEnvelope(args.storage);
+  const hasEnvelope = envelope !== null;
+
+  let keyringFailure: string | undefined;
+  try {
+    const stored = await args.readStored({
+      storagePath: args.storagePath,
+      // Read-only: boot must never rewrite the at-rest passphrase file; a
+      // legacy-format upgrade is deferred to a custody verb.
+      readOnly: true,
+    });
+    if (stored && stored.value.length > 0) {
+      return { kind: "passphrase", value: stored.value };
+    }
+  } catch (error) {
+    // A locked/unreachable keyring or an unreadable fallback is NOT "absent":
+    // record it so an existing fortress fails closed with the real cause rather
+    // than minting over data hidden behind a temporary outage.
+    if (
+      error instanceof PassphraseKeyringUnreachableError ||
+      error instanceof PassphraseUnreadableError ||
+      error instanceof PassphrasePathIdentityError
+    ) {
+      keyringFailure = error.message;
+    } else {
+      keyringFailure =
+        "the stored fortress passphrase could not be read; no secret detail was emitted";
+    }
+  }
+
+  let custody: KeychainReadResult;
+  try {
+    custody = await args.readCustody(args.storagePath, {});
+  } catch {
+    custody = {
+      status: "unreachable",
+      detail: "the stored custody-key identity could not be determined",
+    };
+  }
+  if (custody.status === "found" && custody.key) {
+    return { kind: "keychain-key", key: custody.key };
+  }
+
+  if (!hasEnvelope) return { kind: "virgin" };
+
+  const cause =
+    keyringFailure ??
+    (custody.status === "unreachable" && custody.detail
+      ? custody.detail
+      : undefined);
+  return {
+    kind: "fail-closed",
+    message:
+      `Refusing to start: the fortress at ${args.storagePath} exists but no credential ` +
+      `is available to open it hands-free` +
+      (cause ? ` (${cause})` : "") +
+      `.\nSupply one of:\n` +
+      `  - SANCTUARY_PASSPHRASE=<fortress passphrase>, or\n` +
+      `  - SANCTUARY_RECOVERY_KEY=<recovery key>, or\n` +
+      `  - store this fortress's passphrase in the OS keyring on this host by\n` +
+      `    running \`sanctuary protect\` for it, then restart (no secret is typed here).\n` +
+      `Refusing to generate a passphrase or mint a new master: that would strand the existing state.`,
+  };
+}
+
 /**
  * Initialize the Sanctuary MCP Server.
  *
@@ -207,6 +306,15 @@ export async function createSanctuaryServer(options?: {
    * without this hook is a startup error.
    */
   approvalCallback?: (request: ApprovalRequest) => Promise<ApprovalResponse>;
+  /**
+   * TEST ONLY: fake the exact-fortress stored-passphrase read used by the
+   * hands-free boot path (H1). Defaults to the real {@link readStoredPassphrase}.
+   * Injected so a wired-consumer test can boot with ONLY a stored keyring
+   * credential (in-memory keychain fake) and no credential env.
+   */
+  __testReadStoredPassphrase?: typeof readStoredPassphrase;
+  /** TEST ONLY: fake the machine-local custody-key read used by hands-free boot. */
+  __testReadKeychainCustody?: typeof readKeychainCustodyKeyStatus;
 }): Promise<SanctuaryServer> {
   // 1. Load configuration
   const config = await loadConfig(options?.configPath);
@@ -234,18 +342,63 @@ export async function createSanctuaryServer(options?: {
   const passphrase = options?.passphrase ?? process.env.SANCTUARY_PASSPHRASE;
   const envRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
 
-  const custody = await establishMaster({
-    storage,
-    ...(passphrase ? { passphrase } : {}),
-    ...(envRecoveryKey ? { recoveryKey: envRecoveryKey } : {}),
-    // The MCP server stdio boot is non-interactive by definition (the host
-    // harness owns stdin), so first runs here are a distinct, audited
-    // degraded install mode. A fresh recovery key — a wrap of the one true
-    // master — is minted and disclosed below regardless of credential mode,
-    // so the captured artifact always unlocks everything.
-    firstRun: { installMode: "stdio-server", mintRecoveryKey: true },
-    storagePathHint: config.storage_path,
-  });
+  // H1 (hands-free boot): when the operator supplied NO credential env, resolve
+  // the EXACT-fortress stored credential read-only — the same keyring/custody
+  // path the CLI memory verbs use — so a host whose passphrase is already in the
+  // OS keyring (put there by `sanctuary protect`) boots and reads memory without
+  // re-typing a secret. This NEVER generates a passphrase and NEVER mints
+  // custody (readOnly), so a virgin fortress still falls through to the audited
+  // first-run below, while an EXISTING fortress with no resolvable credential
+  // fails closed with a remediation instead of a bare "credential missing".
+  let bootPassphrase = passphrase;
+  let bootKeychainKey: Uint8Array | undefined;
+  if (passphrase === undefined && envRecoveryKey === undefined) {
+    const stored = await resolveHandsFreeBootCredential({
+      storage,
+      storagePath: config.storage_path,
+      readStored: options?.__testReadStoredPassphrase ?? readStoredPassphrase,
+      readCustody: options?.__testReadKeychainCustody ?? readKeychainCustodyKeyStatus,
+    });
+    if (stored.kind === "passphrase") {
+      bootPassphrase = stored.value;
+    } else if (stored.kind === "keychain-key") {
+      bootKeychainKey = stored.key;
+    } else if (stored.kind === "fail-closed") {
+      // An existing fortress that cannot be opened hands-free. Refuse with the
+      // secret-free remediation rather than minting a new master over data that
+      // the resolvable-but-absent credential was meant to unlock (MUST-NEVER 5).
+      throw new Error(stored.message);
+    }
+    // stored.kind === "virgin": no envelope; fall through to the first-run mint.
+  }
+
+  let custody: Awaited<ReturnType<typeof establishMaster>>;
+  try {
+    custody = await establishMaster({
+      storage,
+      ...(bootPassphrase ? { passphrase: bootPassphrase } : {}),
+      ...(bootKeychainKey ? { keychainKey: bootKeychainKey } : {}),
+      ...(envRecoveryKey ? { recoveryKey: envRecoveryKey } : {}),
+      // The MCP server stdio boot is non-interactive by definition (the host
+      // harness owns stdin), so first runs here are a distinct, audited
+      // degraded install mode. A fresh recovery key — a wrap of the one true
+      // master — is minted and disclosed below regardless of credential mode,
+      // so the captured artifact always unlocks everything.
+      firstRun: { installMode: "stdio-server", mintRecoveryKey: true },
+      storagePathHint: config.storage_path,
+      // An existing fortress on a network/FUSE/exFAT volume, under sudo, or with
+      // looser perms opens for reads (hands-free memory read) instead of bricking;
+      // a first-run/migration write on such a host still fails closed (S5).
+      barrierDegradeMode: "read-only",
+    });
+  } finally {
+    // Zero the OS-keyring-derived keychain factor on BOTH paths: a REJECTED
+    // establishment (wrong credential, rotation-in-progress, orphaned state)
+    // must not leave the keychain custody key live in memory (MUST-NEVER 6 —
+    // no key material lingers past the operation that needed it).
+    if (bootKeychainKey) bootKeychainKey.fill(0);
+  }
+  try {
   const masterKey = custody.masterKey;
   const keyProtection: "passphrase" | "hardware-key" | "recovery-key" =
     custody.keyProtection;
@@ -2096,6 +2249,23 @@ export async function createSanctuaryServer(options?: {
     auditLog,
     policy,
   };
+  } catch (error) {
+    // Startup never transferred the master session to a live server. Release
+    // its shared rotation barrier only after every attempted startup write has
+    // settled, then scrub the unowned master before surfacing the root cause.
+    try {
+      await custody.masterWriteBarrier?.release();
+    } catch (releaseError) {
+      custody.masterKey.fill(0);
+      throw new AggregateError(
+        [error, releaseError],
+        "Sanctuary startup failed and its master-write barrier did not release cleanly",
+        { cause: releaseError },
+      );
+    }
+    custody.masterKey.fill(0);
+    throw error;
+  }
 }
 
 const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([

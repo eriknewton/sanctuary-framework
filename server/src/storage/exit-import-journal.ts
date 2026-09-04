@@ -178,7 +178,16 @@ export async function withExitAdmissionLock<T>(
       }
     );
   } catch (err) {
-    if (err instanceof CrossProcessLockError) {
+    // Only acquisition/reaper failure is an admission refusal. A
+    // CrossProcessLockError thrown BY the protected operation (notably custody
+    // holder-loss during rotation) must retain its real classification instead
+    // of being rewritten as fictitious admission-lock contention.
+    if (
+      err instanceof CrossProcessLockError
+      && err.kind !== "holder-lost"
+      && err.kind !== "capability"
+      && err.kind !== "poisoned"
+    ) {
       throw new ExitAdmissionLockError(
         `refusing to proceed (${owner}): another exit-import, master-rotation, or memory-migration ` +
           "operation holds the admission lock for this fortress, or a prior " +
