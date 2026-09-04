@@ -191,7 +191,9 @@ describe.skipIf(!supported)("sanctuary intelligence config-reset", () => {
       configResetDeps: d.configResetDeps,
     });
     expect(code).toBe(CONFIG_RESET_EXIT.REFUSED);
-    expect(d.output()).toContain("readable record, version 1");
+    // The record line comes from the ONE classifier `diagnose` uses, so the two
+    // verbs cannot describe one record differently.
+    expect(d.output()).toContain("legacy-unarmed");
     expect(d.output()).toContain("Refused");
     expect(await readRecord(root)).toEqual(before);
     expect(await sidecars(root)).toEqual([]);
@@ -206,7 +208,7 @@ describe.skipIf(!supported)("sanctuary intelligence config-reset", () => {
       configResetDeps: d.configResetDeps,
     });
     expect(code).toBe(CONFIG_RESET_EXIT.REFUSED);
-    expect(d.output()).toContain("readable record, version 2");
+    expect(d.output()).toContain("armed");
     expect(d.output()).toContain(
       "Refused: config-reset only quarantines an unreadable record; a readable record is never discarded here.",
     );
@@ -225,7 +227,9 @@ describe.skipIf(!supported)("sanctuary intelligence config-reset", () => {
       configResetDeps: d.configResetDeps,
     });
     expect(code).toBe(CONFIG_RESET_EXIT.REFUSED);
-    expect(d.output()).toContain("armed record failed Q5 integrity validation (");
+    expect(d.output()).toContain(
+      "integrity_state_invalid: the armed record failed Q5 integrity validation (",
+    );
     expect(d.output()).toContain(
       "Refused: an armed record that fails Q5 integrity validation is not an unreadable record, and there is no in-product disarm.",
     );
@@ -256,7 +260,7 @@ describe.skipIf(!supported)("sanctuary intelligence config-reset", () => {
     expect(code).toBe(CONFIG_RESET_EXIT.OK);
     expect(d.unlock).toHaveBeenCalledOnce();
     expect(d.unlock.mock.calls[0]![0]).toMatchObject({ writeIntent: true, storagePath: root });
-    expect(d.output()).toContain("unreadable record: does not decrypt or parse (corrupt)");
+    expect(d.output()).toContain("corrupt: the durable record does not decrypt or parse");
     expect(d.output()).toContain(`Quarantined ${GARBAGE_RECORD.length} bytes to `);
     expect(d.output()).toContain("default legacy-unarmed configuration");
     expect(d.output()).toContain("re-provision local intelligence before relying on load-integrity verification");

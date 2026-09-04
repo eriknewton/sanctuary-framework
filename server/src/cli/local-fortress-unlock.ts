@@ -30,6 +30,9 @@
  *    entry read by mistake against a `--fortress` target.
  *  - It NEVER bootstraps: the master unlock runs without a first-run policy, so
  *    a virgin/absent fortress fails closed rather than inventing fresh custody.
+ *  - A `readOnly` session additionally refuses the one journaled pre-envelope
+ *    custody migration, which is the module's only write, so a diagnostic verb
+ *    can promise the fortress is unchanged on EVERY fortress shape.
  *  - The failure result carries a secret-free remediation string only — never a
  *    passphrase, recovery key, or key byte (CLAUDE.md #6).
  *  - Success returns ONLY the master key (and a non-secret source label); the
@@ -91,13 +94,21 @@ export type LocalFortressCredentialSource =
  *  - "other":      any other custody-establishment refusal (rotation in
  *                  progress, orphaned state); the underlying message is
  *                  already secret-free and is surfaced verbatim.
+ *  - "migration_required": NOT a credential problem. The credential resolved
+ *                  and is valid, but this fortress predates the custody
+ *                  envelope and the caller declared {@link
+ *                  LocalFortressUnlockOptions.readOnly}, so the one-time
+ *                  migration write was refused. A caller that renders this as
+ *                  "no credential available" tells the operator to fix a
+ *                  credential that is already correct.
  */
 export type LocalFortressUnlockFailure =
   | "absent"
   | "locked"
   | "unreadable"
   | "mismatch"
-  | "other";
+  | "other"
+  | "migration_required";
 
 export type LocalFortressUnlockResult =
   | {
@@ -172,6 +183,22 @@ export interface LocalFortressUnlockOptions {
    */
   writeIntent?: boolean;
   /**
+   * Declare a READ-ONLY session: this unlock must leave the fortress
+   * byte-for-byte unchanged. The ordinary read/export unlock is already
+   * lock-free and uses {@link unlockExistingMasterReadOnly}, but it retains ONE
+   * write path — the journaled pre-envelope custody migration below — which a
+   * diagnostic must never trigger on the operator's behalf. With this set that
+   * migration is refused instead of performed, so "this command wrote nothing"
+   * stays true on a legacy fortress too.
+   *
+   * Failure mode to expect: on a pre-envelope fortress a read-only caller gets
+   * a refusal where a write-capable caller would have succeeded. That is the
+   * point; the remedy is to run a custody verb first, not to drop this flag.
+   *
+   * Mutually exclusive with {@link writeIntent}.
+   */
+  readOnly?: boolean;
+  /**
    * The storage instance the write barrier binds to (writeIntent only). Defaults
    * to `storage`. Pass the RAW backend when `storage` is a wrapper that delegates
    * `write` to a base instance (e.g. the exit-admission write guard), because the
@@ -194,6 +221,14 @@ type KeychainCustodyOptions = Parameters<typeof readKeychainCustodyKeyStatus>[1]
 export async function unlockLocalFortress(
   opts: LocalFortressUnlockOptions,
 ): Promise<LocalFortressUnlockResult> {
+  if (opts.readOnly === true && opts.writeIntent === true) {
+    // A caller bug, not an operator condition: one session cannot both promise
+    // to write nothing and reserve the write barrier. Throwing fails the call
+    // closed rather than silently honoring whichever flag is checked first.
+    throw new Error(
+      "unlockLocalFortress: readOnly and writeIntent are mutually exclusive",
+    );
+  }
   if (!opts.writeIntent) {
     // Read/export unlock: pre-existing lock-free behavior, no barrier.
     return resolveLocalFortressMaster(opts);
@@ -398,6 +433,19 @@ async function resolveLocalFortressMaster(
             ok: false,
             failure: "absent",
             message: absentCredentialRemediation(opts.storagePath),
+          };
+        }
+        if (opts.readOnly === true) {
+          // INVARIANT: this is the ONLY write this module can perform, and a
+          // read-only caller (a diagnostic) may not perform it. Refusing here,
+          // rather than before the marker check above, keeps a virgin
+          // directory reporting "absent" and reserves this message for the one
+          // fortress shape that would actually have been migrated.
+          return {
+            ok: false,
+            failure: "migration_required",
+            message:
+              "this fortress still uses the pre-envelope custody format, and a read-only command will not migrate it; the credential is valid, so run `sanctuary protect` on this fortress once to perform the one-time custody migration, then retry",
           };
         }
         // Compatibility only: a pre-envelope fortress needs one journaled

@@ -23,6 +23,7 @@ import {
   createOnDiskImmuneVerifier,
   isTier2PinViolation,
   loadPackagedModelManifestV2,
+  localProvisioningPreflight,
   runLocalIntelligenceProvisioning,
   verifyModelManifestV2WithKey,
   type ImmuneDiskVerifier,
@@ -193,6 +194,18 @@ export async function runLocalIntelligenceSetup(
   input: RunLocalIntelligenceSetupInput,
   deps: RunLocalIntelligenceSetupDeps = {},
 ): Promise<LocalProvisioningResult> {
+  const isTty = input.isTty ?? process.stdin.isTTY === true;
+  // The ONE consent decision for this run; the sequencer re-runs the same
+  // predicate rather than either side re-deriving the table from isTty and
+  // preAnswered. Must match `localProvisioningPreflight` in
+  // `intelligence/provisioning-consent.ts`.
+  const preflight = localProvisioningPreflight(isTty, input.preAnswered);
+  // INVARIANT: a headless run that never asked for local intelligence returns
+  // before the selector is constructed, so it reads no durable config, writes
+  // no refusal audit row, and persists no provisioning failure. The early
+  // return is what keeps the untouched-fortress promise true for the config
+  // read as well, not only for the mutation.
+  if (preflight.kind === "not-requested") return { kind: "not-requested" };
   const selector = new SubstrateSelector({
     storage: input.storage,
     masterKey: input.masterKey,
@@ -225,7 +238,6 @@ export async function runLocalIntelligenceSetup(
     }
   });
 
-  const isTty = input.isTty ?? process.stdin.isTTY === true;
   const audit = async (event: {
     operation: LocalProvisioningAuditEvent["operation"];
     outcome: LocalProvisioningAuditEvent["outcome"];
@@ -258,7 +270,9 @@ export async function runLocalIntelligenceSetup(
   });
   // A headless run or explicit decline skips even reading the manifest;
   // neither path may touch the asset or the host while refusing mutation.
-  const loaded = input.preAnswered === false || !isTty ? null : await loadManifest();
+  // Only `proceed` reads it, so the manifest source is gated by the same
+  // predicate as the mutation, never by a second copy of the truth table.
+  const loaded = preflight.kind === "proceed" ? await loadManifest() : null;
   const manifestText = loaded === null
     ? null
     : typeof loaded === "string"

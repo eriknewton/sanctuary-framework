@@ -318,6 +318,55 @@ describe("shared protect/init local-intelligence adapter", () => {
     )).toHaveLength(0);
   });
 
+  it("leaves a headless run that never asked for local intelligence untouched", async () => {
+    const { storage, masterKey, auditLog, client } = fixture();
+    const loadManifest = vi.fn(async () => "must not load");
+    const print = vi.fn();
+    await expect(runLocalIntelligenceSetup({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "unrequested",
+      // A plain `sanctuary protect ...` in a script: no terminal, no flag.
+      isTty: false,
+      print,
+    }, { client, loadManifest, confirm: vi.fn() })).resolves.toEqual({
+      kind: "not-requested",
+    });
+    expect(loadManifest).not.toHaveBeenCalled();
+    expect(client.pull).not.toHaveBeenCalled();
+    expect(print).not.toHaveBeenCalled();
+    // No refusal row: the operator never asked, so there is nothing to refuse.
+    const refusals = await auditLog.query({
+      operation_type: INTEL_OPS.MODEL_PROVISION_REFUSED,
+    });
+    expect(refusals.entries).toHaveLength(0);
+    // And no durable record, so a later `intelligence diagnose` on a fresh
+    // fortress reports absent rather than a persisted provisioning failure.
+    expect(await storage.read("_intelligence", "substrate-config")).toBeNull();
+  });
+
+  it("still refuses non_tty out loud when the operator asked for the ceremony", async () => {
+    const { storage, masterKey, auditLog, client } = fixture();
+    await expect(runLocalIntelligenceSetup({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "asked",
+      isTty: false,
+      preAnswered: true,
+      print: vi.fn(),
+    }, { client, confirm: vi.fn() })).resolves.toEqual({
+      kind: "refused",
+      reason: "non_tty",
+    });
+    const refusals = await auditLog.query({
+      operation_type: INTEL_OPS.MODEL_PROVISION_REFUSED,
+    });
+    expect(refusals.entries.map((entry) => entry.details?.reason))
+      .toContain("non_tty");
+  });
+
   it("skips the future manifest loader on non-TTY even with a positive flag", async () => {
     const { storage, masterKey, auditLog, client } = fixture();
     const loadManifest = vi.fn(async () => "must not load");
