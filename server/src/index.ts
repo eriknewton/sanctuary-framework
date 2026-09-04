@@ -179,6 +179,9 @@ import {
 import { OperatorAuthorizationSpentStore } from "./v1/operator-authorization-spent-store.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
 import { installConsentGatedRedactor } from "./intelligence/privacy-tier2-redactor.js";
+// Boot refuses on every local-intelligence wiring failure; this names which
+// condition refused it (see the checkpoint site below).
+import { describeIntelligenceBootFailure } from "./intelligence/policy-store.js";
 // Agent-facing audit redaction (property #11, no-policy-inference). Single-sourced
 // in operational/agent-audit-redaction.ts so the redact-key set is shared by
 // the agent-facing audit READ here (monitor_audit_log) and the agent-facing audit
@@ -1150,13 +1153,71 @@ export async function createSanctuaryServer(options?: {
   // the boot-path persistence work in Pi-2 needs the selector in scope
   // alongside the trap registry + trap store, so the declaration moves
   // here and the dashboard branch only assigns to it.
-  let intelligenceSelector: SubstrateSelector | undefined;
+  let intelligenceSelector: SubstrateSelector;
   // Rho-2.5: whether the consent-gated Tier B redactor was installed on
   // the selector above. Threaded into the v1.1 PII binding so the
   // `/api/query-anonymity/pii` route reports the truthful
-  // `effective_tier_b_enabled`. Stays false when the selector failed to
-  // construct (the route then honestly reports inactive).
-  let tierBPiiRedactorInstalled = false;
+  // `effective_tier_b_enabled`.
+  //
+  // No `= false` seed, and that is deliberate: the wiring block below either
+  // completes or throws, so a boot that reaches this point always installed
+  // the redactor. The old seed described a third state, "booted with the
+  // redactor absent and the route reporting inactive", which no longer exists
+  // and must not be implied by a dead initializer.
+  let tierBPiiRedactorInstalled: boolean;
+
+  // Identity binding for every intelligence-layer construction below. Pure
+  // function of state already resolved above, so computing it here rather
+  // than inside the dashboard branch is value-identical.
+  const intelligenceIdentityId =
+    identityManager.getPrimaryIdentityId() ??
+    `fortress:${config.storage_path}`;
+
+  // WP-V1.2-5: construct the Intelligence Substrate Selector against the
+  // unlocked fortress. The selector reads / writes its config under the
+  // fortress storage namespace `_intelligence`, encrypted with the master
+  // key.
+  //
+  // INVARIANT: this runs ONCE, for EVERY approval channel, before the channel
+  // switch below. `selector.load()` IS the boot-time local-intelligence load-
+  // integrity checkpoint: it classifies the persisted record as armed, absent
+  // (the honest legacy-unarmed default), or integrity-invalid, and emits the
+  // audit row for what it found. Constructing it only on the dashboard branch
+  // meant a fortress on any other approval channel never ran the checkpoint,
+  // so a tampered armed record was neither refused nor audited and the boot
+  // printed a healthy startup line. The approval channel an operator picked
+  // has nothing to do with whether their armed model state is intact, so the
+  // checkpoint must not be reachable only through one of them.
+  try {
+    intelligenceSelector = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: intelligenceIdentityId,
+    });
+    await intelligenceSelector.load();
+    // Rho-2.5: install the consent-gated Tier B PII redactor on the
+    // production selector via THE shared chokepoint. The fortressId MUST
+    // match the one threaded into buildV11Bindings below so the route's
+    // PATCH and the live scrub read the same encrypted config.
+    tierBPiiRedactorInstalled = installConsentGatedRedactor({
+      selector: intelligenceSelector,
+      storage,
+      masterKey,
+      fortressId: fortressIdFromStoragePath(config.storage_path),
+    });
+  } catch (err) {
+    // ALLOWLIST, not denylist: `describeIntelligenceBootFailure` is the single
+    // classifier both composition roots share, and no condition in it is
+    // degradable, so every failure of this block refuses startup. The previous
+    // shape refused only `LocalIntegrityStateLoadError` and degraded on
+    // anything else, which meant an unknown or wrapped tamper error started a
+    // fortress with local intelligence quietly off. Absent state never reaches
+    // here at all: it loads as the honest legacy-unarmed default.
+    // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
+    console.error(`\nSanctuary cannot start.\n${describeIntelligenceBootFailure(err)}\n`);
+    throw err;
+  }
 
   const selectedApprovalChannel = selectApprovalChannelByPolicy({
     config,
@@ -1189,44 +1250,11 @@ export async function createSanctuaryServer(options?: {
     // v1.1 surface whether they boot via `sanctuary --dashboard` or
     // `sanctuary dashboard` (standalone). Legacy routes at / continue
     // to serve.
-    const embeddedHubIdentityId =
-      identityManager.getPrimaryIdentityId() ??
-      `fortress:${config.storage_path}`;
-    // WP-V1.2-5: construct the Intelligence Substrate Selector against the
-    // unlocked fortress. The selector reads / writes its config under the
-    // fortress storage namespace `_intelligence`, encrypted with the
-    // master key. Best-effort: any construction failure degrades to a
-    // selector-less binding (Intelligence panel surfaces "not configured").
-    // Pi-2: the declaration moved to outer function scope so the honeypot
-    // wiring below can pick it up; the dashboard branch only constructs.
-    try {
-      intelligenceSelector = new SubstrateSelector({
-        storage,
-        masterKey,
-        auditLog,
-        identityId: embeddedHubIdentityId,
-      });
-      await intelligenceSelector.load();
-      // Rho-2.5: install the consent-gated Tier B PII redactor on the
-      // production selector via THE shared chokepoint. The fortressId MUST
-      // match the one threaded into buildV11Bindings below so the route's
-      // PATCH and the live scrub read the same encrypted config.
-      tierBPiiRedactorInstalled = installConsentGatedRedactor({
-        selector: intelligenceSelector,
-        storage,
-        masterKey,
-        fortressId: fortressIdFromStoragePath(config.storage_path),
-      });
-    } catch (err) {
-      // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
-      console.error(
-        `  Note: Intelligence panel unavailable (${(err as Error).message}). ` +
-          `Run \`sanctuary dashboard\` and pick a substrate.`,
-      );
-      intelligenceSelector = undefined;
-      // tierBPiiRedactorInstalled stays false (its initialized value): the
-      // install assignment above only completes when the try did not throw.
-    }
+    // The selector and its identity binding were constructed once above, for
+    // every approval channel; this branch consumes THAT instance so the
+    // dashboard, the honeypot wiring and the MCP tool graph all read and
+    // write the same `_intelligence` config through one object.
+    const embeddedHubIdentityId = intelligenceIdentityId;
     dashboard.setV11Bindings(
       buildV11Bindings({
         identityId: embeddedHubIdentityId,

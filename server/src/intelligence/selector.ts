@@ -56,6 +56,7 @@ import { tradeoffTextHash, BACKEND_FALLBACK_STRINGS, BADGE_LABEL_KEYS, BADGE_TRA
 import { DEFAULT_OLLAMA_ENDPOINT, buildDefaultConfig, DEFAULT_PER_SURFACE, DEFAULT_LOCAL_MODEL_PICKS } from "./defaults.js";
 import {
   IntelligenceConfigStore,
+  IntelligenceConfigUnreadableError,
   LocalIntegrityStateLoadError,
   type LoadOutcome,
 } from "./policy-store.js";
@@ -406,9 +407,22 @@ export class SubstrateSelector {
   }
 
   /**
-   * Load (or initialize) the operator's substrate config. Emits the
-   * `intelligence_config_loaded` audit event regardless of branch so the
-   * audit chain shows config-load activity on boot.
+   * Load (or initialize) the operator's substrate config, and act as the
+   * boot-time local-intelligence load checkpoint.
+   *
+   * THE CLASSIFICATION THIS MAKES, and it is the whole point of the method:
+   * a durable record is ABSENT, READABLE, or INDETERMINATE, and only the first
+   * two may start a fortress. Absent loads the honest legacy-unarmed default
+   * and emits `intelligence_config_loaded` with `was_default: true`. Readable
+   * loads as authority. Indeterminate covers an armed record that fails Q5
+   * validation, a record that does not decrypt or parse, and a record written
+   * by a newer build: each refuses with a typed error and its own audited
+   * `intelligence_load_integrity` row naming which classification refused it.
+   *
+   * `intelligence_config_loaded` is emitted on every branch that RETURNS, so
+   * the audit chain shows config-load activity on boot; a branch that refuses
+   * emits the load-integrity row instead, because a load that did not complete
+   * must not appear in the chain as one that did.
    */
   async load(): Promise<void> {
     const outcome = await this.store.load();
@@ -432,6 +446,52 @@ export class SubstrateSelector {
       }
       throw new LocalIntegrityStateLoadError(outcome.reason);
     }
+    if (outcome.kind === "corrupt" || outcome.kind === "version-too-new") {
+      // A durable record EXISTS and this build cannot read it. That is
+      // indeterminate, not absent, and the two must never collapse into one
+      // another: absent means no operator ever armed this fortress, while
+      // unreadable means an operator may have armed it and the evidence is
+      // unavailable. Falling through to `outcome.config` here reported the
+      // second as the first, so a fortress whose armed record had been
+      // corrupted or written by a newer build started clean, audited
+      // `was_default: true`, and told nobody that anything was wrong.
+      //
+      // The refusal carries the recovery verb because there IS a remedy and it
+      // is not obvious: `IntelligenceConfigUnreadableError.message` names
+      // `INTELLIGENCE_CONFIG_RESET_VERB`, which quarantines the bytes and
+      // reinitializes the config. `config-reset` itself reads the record
+      // through `IntelligenceConfigStore.load` rather than through this
+      // selector, so this refusal never blocks the one command that clears it.
+      const refusal = new IntelligenceConfigUnreadableError(
+        outcome.kind,
+        outcome.kind === "version-too-new" ? outcome.persistedVersion : null,
+      );
+      try {
+        await this.auditLog.append(
+          "l2",
+          INTEL_OPS.LOAD_INTEGRITY,
+          this.identityId,
+          {
+            // Distinct from the armed-record `state_validation` stage above:
+            // an operator reading this row must be able to tell "the record
+            // failed its integrity check" from "the record could not be read
+            // at all", because the two have different remedies.
+            stage: "record_readability",
+            classification: outcome.kind,
+            reason: refusal.reason,
+            ...(outcome.kind === "version-too-new"
+              ? { persisted_version: outcome.persistedVersion }
+              : {}),
+            remedy: refusal.remedy,
+            generation_refused: true,
+          },
+          "failure",
+        );
+      } catch {
+        // An unreadable record still refuses when its derived audit cannot persist.
+      }
+      throw refusal;
+    }
     this.config = outcome.config;
     this.invalidateIssuedIntegrityHandles();
     this.recentFailures.clear();
@@ -444,7 +504,12 @@ export class SubstrateSelector {
     this.loaded = true;
 
     const overriddenSurfaceCount = countOverriddenSurfaces(this.config);
-    const wasDefault = outcome.kind !== "loaded";
+    // INVARIANT: `was_default` means the record was genuinely ABSENT. Only
+    // `loaded` and `default` can reach this line now, so the flag no longer
+    // doubles as a bucket for records that exist but could not be read; those
+    // refuse above. A reader of this audit row may treat `was_default: true`
+    // as "nobody had armed this fortress", which is the claim it makes.
+    const wasDefault = outcome.kind === "default";
     const payload: IntelligenceConfigLoadedPayload = {
       version: "1.2",
       event_id: makeEventId(),
@@ -454,7 +519,26 @@ export class SubstrateSelector {
       was_default: wasDefault,
       overridden_surface_count: overriddenSurfaceCount,
     };
-    this.emit(INTEL_OPS.CONFIG_LOADED, payload, outcome.kind === "loaded" ? "success" : "failure");
+    // INVARIANT: awaited, unlike the fire-and-forget `emit` used on the hot
+    // invocation paths. `load()` is a BOOT step and the composition root
+    // returns as soon as it resolves, so an unawaited append here outlives the
+    // call: the audit write lands in the fortress state directory after the
+    // caller believes startup finished. Failure mode from the outside, which
+    // is how this was found: a test or a CLI that tears its temp fortress down
+    // right after boot fails with `ENOTEMPTY` on a directory it just emptied,
+    // naming a file nothing in the test wrote. The refusal branch above awaits
+    // its append for the same reason; both must stay awaited.
+    try {
+      await this.auditLog.append(
+        "l2",
+        INTEL_OPS.CONFIG_LOADED,
+        this.identityId,
+        payload as unknown as Record<string, unknown>,
+        outcome.kind === "loaded" ? "success" : "failure",
+      );
+    } catch {
+      // A completed load is still complete when its derived audit cannot persist.
+    }
   }
 
   /**
@@ -1069,18 +1153,51 @@ export class SubstrateSelector {
     const screened = await this.compiledContextScanner.screen(
       compileSubstrateContext(surface, req),
     );
+    // Resolved once, before the screening branch, so the refusal row names the
+    // same substrate a served invocation would have named and the one-time
+    // tier-2 pin audit inside cannot fire twice for one invocation.
+    const choice = this.effectiveChoice(surface);
     if (
       screened.outcome !== "clean" &&
       screened.outcome !== "detector_disabled_by_policy"
     ) {
+      // The sentinel finding the scanner reports records WHAT was seen; this
+      // row records that an invocation was refused because of it, so the
+      // intelligence audit stream shows the refusal on the same op family an
+      // operator already reads for substrate outcomes rather than only in the
+      // sentinel stream.
+      const refusalPayload: IntelligenceSubstrateFailurePayload = {
+        version: "1.2",
+        event_id: makeEventId(),
+        emitted_at: new Date().toISOString(),
+        identity_id: this.identityId,
+        kind: "substrate_failure",
+        surface,
+        substrate: choice,
+        failure_class: "substrate_context_refused",
+        // No substrate was contacted and no fallback may be tried: a refused
+        // artifact is refused for every substrate, so falling through would
+        // hand the same bytes to the next provider.
+        fallback_taken: "deny",
+      };
+      try {
+        await this.auditLog.append(
+          "l2",
+          INTEL_OPS.SUBSTRATE_FAILURE,
+          this.identityId,
+          refusalPayload as unknown as Record<string, unknown>,
+          "failure",
+        );
+      } catch {
+        // A refusal still refuses when its derived audit cannot persist.
+      }
       return failureResponse(
         "disabled",
-        "internal_error",
+        "substrate_context_refused",
         `compiled-context screening refused provider invocation (${screened.outcome})`,
       );
     }
     const startedAt = Date.now();
-    const choice = this.effectiveChoice(surface);
     // All local generation reaches the async selector-load chokepoint; a
     // direct synchronous local-handle construction would bypass Q5E.
     const handle = await this.getOrIssueHandle(surface, choice);
