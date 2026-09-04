@@ -23,6 +23,7 @@ import type { MultiAgentIsolationGuard } from "./memory-isolation.js";
 import { SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS } from "./memory-tools.js";
 import {
   computeMemoryOriginProvenanceDigest,
+  isMemoryTransferLineageRef,
   isMemoryTransportAdmissionChannel,
   type MemoryProvenanceCompanion,
 } from "./memory-provenance-contract.js";
@@ -49,6 +50,11 @@ function provenanceGaps(
     const origin = companion.origin.body;
     const admission = companion.admission.body;
     const transport = isMemoryTransportAdmissionChannel(admission.admission_channel);
+    // Foreign vs locally recorded origin is decided by the ORIGIN FORTRESS,
+    // never by the channel: a transport channel also admits legacy V1 archive
+    // rows whose origin this fortress signed itself at import. Must match the
+    // same predicate in companionBindsPublicPassage below.
+    const foreignOrigin = origin.origin_fortress_id !== admission.destination_fortress_id;
     return {
       per_writer_signature: "verified",
       signing_status: "verified",
@@ -66,9 +72,11 @@ function provenanceGaps(
       ...(transport ? { transfer_lineage_ref: admission.transfer_lineage_ref } : {}),
       taint_retrievable: false,
       automatic_provenance_event: true,
-      note: transport
-        ? "The origin binding was recorded by another fortress and verifies under this fortress's signed admission for this exact passage through the named transfer lineage. This does not prove true authorship, content truth, safety, or a remote identity."
-        : "The fortress-recorded origin and admission bindings verify for this exact passage. This does not prove true authorship, content truth, safety, or a remote identity.",
+      note: foreignOrigin
+        ? "The origin binding was recorded by another fortress; this fortress's signed admission binds it to this exact passage and names the transfer lineage that admitted it. This does not prove true authorship, content truth, safety, or a remote identity."
+        : transport
+          ? "This fortress recorded the origin binding itself when it admitted this passage through a transfer; the admission names that transfer lineage and carries the admitted origin-trust tier. This does not prove true authorship, content truth, safety, or a remote identity."
+          : "The fortress-recorded origin and admission bindings verify for this exact passage. This does not prove true authorship, content truth, safety, or a remote identity.",
     };
   }
   return {
@@ -113,10 +121,14 @@ function sameProvenanceSnapshot(
  *    `operator_readmission`): this fortress signed the origin about THIS
  *    passage, so the origin's own subject (`passage_id`, `owner_ref`) must
  *    name the local passage.
- *  - Transport admissions (`MEMORY_TRANSPORT_ADMISSION_CHANNELS`): the origin
- *    was signed by the SOURCE fortress and legitimately carries the source's
- *    passage id and owner ref; the destination re-derived a local id at
- *    import. The mapping source-id -> local-id is the destination-signed
+ *  - Transport admissions (`MEMORY_TRANSPORT_ADMISSION_CHANNELS`) whose origin
+ *    fortress is NOT this fortress: the origin was signed by the SOURCE
+ *    fortress and legitimately carries the source's passage id and owner
+ *    ref; the destination re-derived a local id at import. (A transport
+ *    admission whose origin fortress IS this fortress, the legacy V1 archive
+ *    row, was origin-signed here at import about the local id, so it takes
+ *    the local branch's direct subject check as well as the digest binding.)
+ *    The mapping source-id -> local-id is the destination-signed
  *    admission written atomically with the passage at import: it names the
  *    local `passage_id` and `destination_owner_ref`, commits to the exact
  *    origin through `origin_provenance_digest`, and carries the import's
@@ -153,12 +165,22 @@ function companionBindsPublicPassage(
       originDigest !== admission.origin_provenance_digest) {
     return false;
   }
+  // Same predicate as provenanceGaps: the origin fortress, not the channel,
+  // decides whether the origin's own subject can be checked directly.
+  const foreignOrigin = origin.origin_fortress_id !== admission.destination_fortress_id;
   if (isMemoryTransportAdmissionChannel(admission.admission_channel)) {
     // Imported: the local binding is the import-time mapping above; the
     // lineage reference is what makes that mapping an import record rather
-    // than a bare re-labelling, so its absence fails closed.
-    return typeof admission.transfer_lineage_ref === "string" &&
-      admission.transfer_lineage_ref.length > 0;
+    // than a bare re-labelling, so its absence fails closed. Validity is the
+    // SAME predicate parseAdmissionBody applies (memory-provenance-contract.ts,
+    // isMemoryTransferLineageRef): one definition of a lineage reference.
+    if (!isMemoryTransferLineageRef(admission.transfer_lineage_ref)) return false;
+    if (foreignOrigin) return true;
+    // Locally origin-signed transport row (legacy V1 archive import): the
+    // direct subject check holds and is therefore required, not skipped.
+  } else if (foreignOrigin) {
+    // A non-transport channel never carries another fortress's origin.
+    return false;
   }
   // Locally recorded: the origin itself must name this passage.
   return origin.passage_id === passage.passage_id &&
@@ -221,7 +243,7 @@ export function createSdwMemoryProvenanceTool(
     description:
       "Show per-record SDW memory integrity status. Verified rows expose the " +
       "bounded fortress-recorded origin/admission classes; a passage admitted " +
-      "through a memory archive import reports its foreign origin-trust tier and " +
+      "through a memory archive import reports its origin-trust tier and " +
       "the transfer lineage reference; unsigned PRE_MIGRATION rows are explicit. " +
       "Verification does not prove true authorship, content truth, safety, or a " +
       "remote identity.",

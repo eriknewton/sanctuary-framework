@@ -74,7 +74,9 @@ export type MemoryAdmissionChannel =
  * One source for two consumers: `parseAdmissionBody` below (lineage required
  * exactly here) and `companionBindsPublicPassage` in memory-provenance-tool.ts
  * (subject binding branches exactly here). Must match the transport rows of
- * MEMORY_ADMISSION_TRIPLES.
+ * MEMORY_ADMISSION_TRIPLES (test/sdw/memory-provenance-contract.test.ts
+ * asserts full-set equality). Bound: `fleet_sync` has no producer in
+ * server/src today; only `exit_v2_import` is reachable from a shipped path.
  */
 export const MEMORY_TRANSPORT_ADMISSION_CHANNELS = [
   "exit_v2_import",
@@ -85,6 +87,17 @@ export function isMemoryTransportAdmissionChannel(
   channel: MemoryAdmissionChannel,
 ): boolean {
   return (MEMORY_TRANSPORT_ADMISSION_CHANNELS as readonly string[]).includes(channel);
+}
+
+/**
+ * The ONE predicate for a valid `transfer_lineage_ref`: a bounded SDW
+ * identifier. `parseAdmissionBody` applies it when a transport admission is
+ * parsed, and `companionBindsPublicPassage` in memory-provenance-tool.ts
+ * applies the same predicate when it re-checks the companion it was handed,
+ * so the parser and the wrapper cannot disagree on what a lineage reference is.
+ */
+export function isMemoryTransferLineageRef(value: unknown): value is string {
+  return typeof value === "string" && isSdwIdentifier(value);
 }
 
 export const MEMORY_ORIGIN_TRUST_TIERS = [
@@ -1090,11 +1103,8 @@ function parseAdmissionBody(
   // another passage bind with no import-time mapping behind it.
   const needsLineage = isMemoryTransportAdmissionChannel(record.admission_channel);
   if (needsLineage) {
-    const lineage = parseIdentifier(
-      record.transfer_lineage_ref,
-      "admission.body.transfer_lineage_ref",
-    );
-    if (!lineage.ok) {
+    // Same predicate as the provenance tool's re-check (isMemoryTransferLineageRef).
+    if (!isMemoryTransferLineageRef(record.transfer_lineage_ref)) {
       return failure(
         "transfer_lineage_invalid",
         "admission.body.transfer_lineage_ref",

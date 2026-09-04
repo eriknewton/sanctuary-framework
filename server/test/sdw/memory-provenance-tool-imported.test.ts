@@ -9,7 +9,10 @@
  * digest it commits to, the local passage id it names, and the lineage
  * reference it carries). A companion presented for a passage it does not
  * describe is refused in both the local and the imported case, and a locally
- * authored passage reports exactly what it reported before.
+ * authored passage reports exactly what it reported before. Both import
+ * shapes are covered end to end: a signed-memory (V2) archive whose origins
+ * another fortress signed, and a legacy V1 archive whose origins this fortress
+ * signed itself at import with the legacy-unattested tier.
  */
 import { ed25519 } from "@noble/curves/ed25519";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
@@ -35,6 +38,7 @@ import { documentProvenanceKey } from "../../src/sdw/grammar.js";
 import { memoryInsertIngress } from "../../src/sdw/memory-provenance-ingress.js";
 import {
   MEMORY_TRANSPORT_ADMISSION_CHANNELS,
+  computeMemoryOriginProvenanceDigest,
   type MemoryProvenanceCompanion,
   type MemoryProvenanceSigningHandle,
 } from "../../src/sdw/memory-provenance-contract.js";
@@ -162,8 +166,27 @@ describe("sdw_memory_provenance over passages admitted by a memory archive impor
   let destination: SdwMemoryBackendAdapter;
   let destinationStorage: TamperableStorage;
   let receipt: ImportExitV2SdwMemoryArchiveResult;
+  let v1Receipt: ImportExitV2SdwMemoryArchiveResult;
+  /** File passages whose origin fortress A signed (signed-memory V2 import). */
   let importedFiles: readonly MemoryPassage[];
+  /** File passages admitted from a legacy V1 archive (origin signed by B itself). */
+  let legacyFiles: readonly MemoryPassage[];
   const cleanup: Array<() => Promise<void>> = [];
+
+  /** Rebuilds a companion's digest fields around an altered origin, so only signatures disagree. */
+  function withOrigin(
+    companion: MemoryProvenanceCompanion,
+    body: MemoryProvenanceCompanion["origin"]["body"],
+  ): MemoryProvenanceCompanion {
+    const origin = { ...companion.origin, body };
+    const digest = computeMemoryOriginProvenanceDigest(origin);
+    return {
+      ...companion,
+      origin,
+      origin_provenance_digest: digest,
+      admission: { ...companion.admission, body: { ...companion.admission.body, origin_provenance_digest: digest } },
+    };
+  }
 
   beforeAll(async () => {
     const tempRoot = await realpath(await mkdtemp(join(tmpdir(), "prov-import-tool-")));
@@ -216,8 +239,44 @@ describe("sdw_memory_provenance over passages admitted by a memory archive impor
       transferKey: exported.transfer_key.slice(), now: () => NOW,
       onProvenanceSignerPersisted: (did, key) => bRuntime.set(did, key),
     });
-    importedFiles = (await destination.listPassages({})).filter((p) => p.tags.includes(FILE_TAG));
+
+    // Fortress C (pre-migration) exports the SAME fixture as a legacy V1
+    // archive; B admits it with origins it signs itself at import.
+    const c = signingFixture(31, "fortress-c");
+    const legacySource = new SdwMemoryBackendAdapter({
+      storage: new MemoryStorage(), masterKey: new Uint8Array(32).fill(32),
+      fortressId: "fortress-c", ownerRef: OWNER_REF, now: () => NOW,
+      resolvePrimarySigningHandle: () => c.handle,
+      resolveSignerPublicKey: (identityId, did) =>
+        identityId === c.handle.identity_id && did === c.handle.did ? c.handle.public_key : undefined,
+      resolveMemoryIntegrityState: async () => "state_PRE_MIGRATION",
+    });
+    await ingestClaudeCodeMemoryDirectory(legacySource, CLAUDE_FIXTURE, { ingestedAt: NOW });
+    const legacyArchive = await transcodeMemoryDirectory(
+      legacySource, "claude-code", "codex", join(tempRoot, "projection-c"), { now: () => NOW },
+    );
+    const legacyExport = await exportExitV2SdwMemoryArchive({
+      adapter: legacySource, archiveId: legacyArchive.archive_id, sourceFortressId: "fortress-c",
+      exportApprovalAuditId: "audit-c", sourceSanctuaryVersion: "1.7.2",
+      signer: c.signer, now: () => NOW,
+    });
+    v1Receipt = await importExitV2SdwMemoryArchive({
+      adapter: destination, signer: b.signer,
+      manifest: legacyExport.manifest, artifactBytes: legacyExport.artifact_bytes,
+      transferKey: legacyExport.transfer_key.slice(), now: () => NOW,
+    });
+
+    const files = (await destination.listPassages({})).filter((p) => p.tags.includes(FILE_TAG));
+    const foreign: MemoryPassage[] = [];
+    const legacy: MemoryPassage[] = [];
+    for (const passage of files) {
+      const companion = verifiedCompanion(await destination.getPassageProvenance(passage.passage_id));
+      (companion.origin.body.origin_fortress_id === "fortress-a" ? foreign : legacy).push(passage);
+    }
+    importedFiles = foreign;
+    legacyFiles = legacy;
     expect(importedFiles.length).toBeGreaterThanOrEqual(2);
+    expect(legacyFiles.length).toBeGreaterThanOrEqual(2);
   });
 
   afterAll(async () => {
@@ -234,6 +293,72 @@ describe("sdw_memory_provenance over passages admitted by a memory archive impor
       expect(MEMORY_TRANSPORT_ADMISSION_CHANNELS).toContain(companion.admission.body.admission_channel);
       expect(companion.admission.body.transfer_lineage_ref).toBe(receipt.source_lineage_ref);
     }
+  });
+
+  it("fixture carries the legacy V1 shape: a transport channel whose origin THIS fortress signed about the LOCAL id", async () => {
+    for (const passage of legacyFiles) {
+      const companion = verifiedCompanion(await destination.getPassageProvenance(passage.passage_id));
+      expect(companion.origin.body.origin_fortress_id).toBe("fortress-b");
+      expect(companion.origin.body.passage_id).toBe(passage.passage_id);
+      expect(companion.admission.body).toMatchObject({
+        passage_id: passage.passage_id,
+        admission_channel: "exit_v2_import",
+        origin_trust_tier: "legacy_unattested",
+        verification_basis: "exit_v2_legacy_v1",
+        transfer_lineage_ref: v1Receipt.source_lineage_ref,
+      });
+    }
+  });
+
+  it("(a-legacy) reports a legacy V1 import row verified with the legacy-unattested tier, its lineage, and a note that does not claim another fortress", async () => {
+    const { log, calls } = makeAuditLog();
+    const tool = createSdwMemoryProvenanceTool({ adapter: destination, auditLog: log });
+    for (const passage of legacyFiles) {
+      const out = parse(await tool.handler({ passage_id: passage.passage_id }));
+      expect(out.denied).toBeUndefined();
+      expect(out.provenance_status).toBe("verified");
+      const gaps = out.provenance_gaps as Record<string, unknown>;
+      expect(gaps).toMatchObject({
+        admission_channel: "exit_v2_import",
+        origin_trust_tier: "legacy_unattested",
+        verification_basis: "exit_v2_legacy_v1",
+        transfer_lineage_ref: v1Receipt.source_lineage_ref,
+      });
+      expect(String(gaps.note)).not.toContain("another fortress");
+      expect(String(gaps.note)).toContain("recorded the origin binding itself");
+      expect(String(gaps.note)).toContain("does not prove true authorship");
+    }
+    expect(calls.filter((c) => c.operation === SDW_MEMORY_PROVENANCE_AUDIT_OPS.denied)).toEqual([]);
+  });
+
+  it("(b-legacy) a legacy V1 row's origin re-pointed at another local id, digests made consistent, is refused: the direct subject check is applied on a transport channel when the origin is local", async () => {
+    const [l1, l2] = legacyFiles;
+    const genuine = verifiedCompanion(await destination.getPassageProvenance(l2!.passage_id));
+    const forged = withOrigin(genuine, { ...genuine.origin.body, passage_id: l1!.passage_id });
+    const { log, calls } = makeAuditLog();
+    const tool = createSdwMemoryProvenanceTool({
+      adapter: substitutingAdapter(destination, (id) => (id === l2!.passage_id ? forged : undefined)),
+      auditLog: log,
+    });
+    const out = parse(await tool.handler({ passage_id: l2!.passage_id }));
+    expect(out.denied).toBe(true);
+    expect(calls[0]!.details).toEqual({ denial_class: "auth_failed" });
+  });
+
+  it("(b) a local-channel companion whose origin claims another fortress, digests made consistent, is refused", async () => {
+    await destination.putPassages(
+      [{ passage_id: "local-z", text: "authored here, z", provenanceContext: memoryInsertIngress(() => "system:test", "system_generated") }],
+      "agent_derived_clean",
+    );
+    const genuine = verifiedCompanion(await destination.getPassageProvenance("local-z"));
+    const forged = withOrigin(genuine, { ...genuine.origin.body, origin_fortress_id: "fortress-elsewhere" });
+    const { log } = makeAuditLog();
+    const tool = createSdwMemoryProvenanceTool({
+      adapter: substitutingAdapter(destination, (id) => (id === "local-z" ? forged : undefined)),
+      auditLog: log,
+    });
+    const out = parse(await tool.handler({ passage_id: "local-z" }));
+    expect(out.denied).toBe(true);
   });
 
   it("(a) reports every imported passage verified with the foreign tier and the import lineage reference", async () => {
@@ -254,6 +379,8 @@ describe("sdw_memory_provenance over passages admitted by a memory archive impor
         transfer_lineage_ref: receipt.source_lineage_ref,
       });
       expect(String(gaps.note)).toContain("another fortress");
+      expect(String(gaps.note)).toContain("names the transfer lineage");
+      expect(String(gaps.note)).not.toContain("through the named transfer lineage");
       expect(String(gaps.note)).toContain("does not prove true authorship");
       // Public-safe projection holds for the imported case too.
       for (const forbidden of [
@@ -343,6 +470,23 @@ describe("sdw_memory_provenance over passages admitted by a memory archive impor
     const out = parse(await tool.handler({ passage_id: p1!.passage_id }));
     expect(out.denied).toBe(true);
     expect(calls[0]!.details).toEqual({ denial_class: "auth_failed" });
+  });
+
+  it("(c) an import mapping whose lineage reference is not a bounded identifier is refused (same predicate as the parser)", async () => {
+    const [p1] = importedFiles;
+    const genuine = verifiedCompanion(await destination.getPassageProvenance(p1!.passage_id));
+    const forged: MemoryProvenanceCompanion = {
+      ...genuine,
+      admission: { ...genuine.admission, body: { ...genuine.admission.body, transfer_lineage_ref: "not a valid ref" } },
+    };
+    const { log } = makeAuditLog();
+    const tool = createSdwMemoryProvenanceTool({
+      adapter: substitutingAdapter(destination, (id) => (id === p1!.passage_id ? forged : undefined)),
+      auditLog: log,
+    });
+    const out = parse(await tool.handler({ passage_id: p1!.passage_id }));
+    expect(out.denied).toBe(true);
+    expect(out).not.toHaveProperty("provenance");
   });
 
   it("(c) an import mapping whose claimed origin digest does not match the presented origin is refused", async () => {
