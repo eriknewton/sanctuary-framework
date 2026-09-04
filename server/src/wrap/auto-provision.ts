@@ -162,6 +162,7 @@ import {
 // are not established by any schema; diagnostics go through the untrusted-
 // diagnostic chokepoint (STATE-STORE-ERRMSG-INTERP-01).
 import { describeUntrusted } from "../errors/index.js";
+import { stripTrailingSlashes } from "../strings.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -175,7 +176,7 @@ export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 
 /** Dedicated harness daemon logs must be writable by the agent uid, not the operator-only fortress. */
 export function resolveHarnessDaemonLogDir(newAccountHome: string): string {
-  return `${newAccountHome.replace(/\/+$/, "")}/logs`;
+  return `${stripTrailingSlashes(newAccountHome)}/logs`;
 }
 
 /**
@@ -200,7 +201,7 @@ export function resolveWallFortressPath(
   if (override !== undefined && override.length > 0) {
     return override;
   }
-  return `${operatorHome.replace(/\/+$/, "")}/.sanctuary`;
+  return `${stripTrailingSlashes(operatorHome)}/.sanctuary`;
 }
 
 /**
@@ -645,7 +646,7 @@ export async function resolveCredentialDestPathsToVerify(input: {
   existsNoFollow: (path: string) => Promise<boolean>;
 }): Promise<string[]> {
   if (input.movedThisRun !== undefined) return input.movedThisRun;
-  const accountBase = input.newAccountHome.replace(/\/+$/, "");
+  const accountBase = stripTrailingSlashes(input.newAccountHome);
   const observed: string[] = [];
   for (const destRelativePath of allHermesCredentialDestPaths()) {
     if (await input.existsNoFollow(`${accountBase}/${destRelativePath}`)) {
@@ -2294,8 +2295,8 @@ export function hermesRuntimeRehomePaths(
   operatorHome: string,
   newAccountHome: string,
 ): { sourcePath: string; destPath: string } {
-  const operatorBase = operatorHome.replace(/\/+$/, "");
-  const accountBase = newAccountHome.replace(/\/+$/, "");
+  const operatorBase = stripTrailingSlashes(operatorHome);
+  const accountBase = stripTrailingSlashes(newAccountHome);
   return {
     sourcePath: `${operatorBase}/.hermes/hermes-agent`,
     destPath: `${accountBase}/.hermes/hermes-agent`,
@@ -2486,7 +2487,7 @@ export async function canonicalizeHomeDirectory(
   realpathFn: (path: string) => Promise<string> = realpath,
 ): Promise<string> {
   const normalized = normalizePath(rawPath);
-  const trimmed = normalized === "/" ? normalized : normalized.replace(/\/+$/, "");
+  const trimmed = normalized === "/" ? normalized : stripTrailingSlashes(normalized);
   const pendingSegments: string[] = [];
   let cursor = trimmed;
   while (true) {
@@ -2494,7 +2495,7 @@ export async function canonicalizeHomeDirectory(
       const resolvedPrefix = await realpathFn(cursor);
       const combined = pendingSegments.length === 0 ? resolvedPrefix : join(resolvedPrefix, ...pendingSegments);
       const normalizedCombined = normalizePath(combined);
-      return normalizedCombined === "/" ? normalizedCombined : normalizedCombined.replace(/\/+$/, "");
+      return normalizedCombined === "/" ? normalizedCombined : stripTrailingSlashes(normalizedCombined);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== "ENOENT" && code !== "ENOTDIR") throw err;

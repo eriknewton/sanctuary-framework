@@ -15,6 +15,7 @@ import {
   deriveOllamaRuntimeTag,
   type VerifiedLocalBindingV2,
 } from "./model-manifest-v2.js";
+import { stripTrailingSlashes } from "../strings.js";
 
 const KIBIBYTE_BYTES = 1_024;
 // Must match IDENTITY_COMPONENT `{0,63}` in model-manifest-v2.ts and OLLAMA_IDENTITY_COMPONENT_MAX_CHARS in immune-disk-verifier.ts.
@@ -277,7 +278,7 @@ export class OllamaRuntimeEvidenceClient implements RuntimeLightVerifier {
   private readonly fetchImpl: typeof fetch;
 
   constructor(config: OllamaRuntimeEvidenceClientConfig) {
-    this.endpoint = config.endpoint.replace(/\/+$/, "");
+    this.endpoint = stripTrailingSlashes(config.endpoint);
     this.timeoutMs = config.timeoutMs ?? OLLAMA_RUNTIME_EVIDENCE_DEFAULT_TIMEOUT_MS;
     this.fetchImpl = config.fetchImpl ?? fetch;
     if (this.endpoint.length === 0) throw new Error("Ollama endpoint is required");

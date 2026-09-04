@@ -362,7 +362,7 @@ This is the most onboarding-hostile collision.
 
 ## Intentional root surfaces
 
-Seven loose files legitimately stay at `server/src` root so root reads as a deliberate shared surface,
+Eight loose files legitimately stay at `server/src` root so root reads as a deliberate shared surface,
 not a junk drawer. Do not move these casually.
 
 | File | Why it stays at root |
@@ -372,6 +372,7 @@ not a junk drawer. Do not move these casually.
 | `router.ts` | MCP plumbing (`ToolDefinition`/`toolResult`). Imported as `../router.js` by nearly every module. |
 | `config.ts` | `SanctuaryConfig`. Imported widely as `../config.js`. |
 | `paths.ts` | `resolveStoragePath` + path constants. Also the INTENDED fortress-default chokepoint going forward: `homeFortressPath()` is where `<home>/.sanctuary` should be composed, and new code must not open-code that join. It is not yet the only one: roughly fifteen sites still compose it directly, including `config.ts` (deliberate, and documented there) and the `wrap/` keychain-naming helpers. `assertHermeticStoragePath()` fails a Vitest run closed when a resolution lands on the operator's own fortress, and `saveConfig` applies the same guard at the config write, so a test can no longer silently read real custody or write into `~/.sanctuary`. Escape hatch `SANCTUARY_ALLOW_OPERATOR_FORTRESS=1`; test-side fix is `test/helpers/temp-fortress.ts`. |
+| `strings.ts` | Small, dependency-free string helpers shared across modules that need identical trimming behavior for operator-configured values (endpoints, URLs, filesystem home paths); currently only `stripTrailingSlashes`. The chokepoint rationale: one linear-scan implementation so a copied trailing-slash regex cannot drift back into a call site, imported by `cli/`, `wrap/`, `castle-wall/provision/`, `egress-gate/`, `transparency/`, and `intelligence/`. |
 | `claim-witness.ts` | Structural-honesty witness brands and the `auditClaim` chokepoint for claim-bearing audit fields. Distinct from `egress-gate/claim-basis.ts`, which owns the literal ratchet/claim registry and does not mint witnesses or type audit records. |
 | `version.ts` | The version constant. |
 

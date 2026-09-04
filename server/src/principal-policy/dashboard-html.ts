@@ -3597,8 +3597,13 @@ export function generateFleetSwitcherHTML(options: {
         return;
       }
 
-      // Normalize: strip trailing slash
-      url = url.replace(/\\/+$/, '');
+      // Normalize: strip trailing slashes. A linear scan, not the equivalent
+      // regex, because this runs in the operator's browser on form input and
+      // a "/" quantifier anchored at the end can be super-linear on adversarial
+      // input shaped as a long run of slashes followed by a non-slash character;
+      // this mirrors stripTrailingSlashes() in server/src/strings.ts,
+      // duplicated here because embedded dashboard JS cannot import a server module.
+      { let end = url.length; while (end > 0 && url[end - 1] === '/') end -= 1; url = url.slice(0, end); }
 
       const machines = loadMachines();
       // Prevent duplicates by URL
