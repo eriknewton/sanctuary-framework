@@ -49,8 +49,11 @@ the model that is pulled is the one that was signed.
 - **Light assurance verifies the runtime-reported digest.** The check confirms
   that Ollama reports the signed manifest digest for each required model. It
   does not by itself prove that every model byte on disk was read.
-- **Windows requires a manual Ollama install.** Automatic runtime installation
-  is not available there; install Ollama, then re-run the ceremony.
+- **Ollama is installed by the operator on every platform in this release.**
+  Automatic runtime installation is not available yet; install Ollama, start
+  it once, then run the ceremony. Pulling the tier model with `ollama pull`
+  first is the reliable path on this release; the ceremony then verifies the
+  present model against the signed manifest and arms.
 - **Interactive only.** A headless run refuses before touching the host or the
   manifest.
 - **ESM entry only.** The packaged manifest is located from the module's own
