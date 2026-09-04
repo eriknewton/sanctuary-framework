@@ -95,9 +95,13 @@ export const MEMORY_BATCH_LOCK_NAMESPACE = "sdw_memory_locks";
 export const MEMORY_BATCH_LOCK_FILE = "batch-replace.lock";
 export const MEMORY_BATCH_LOCK_TIMEOUT_MS = 30_000;
 
-const DEFAULT_MAX_CHUNK_CHARS = 8192;
+// Exported: `sdw/memory-tools.ts` derives the memory_search needle byte cap
+// from this so the tool boundary and the store agree on "one chunk of text".
+export const DEFAULT_MAX_CHUNK_CHARS = 8192;
 const MAX_CONFIGURABLE_CHUNK_CHARS = 100_000;
-const DEFAULT_SEARCH_LIMIT = 10;
+// Exported: `sdw/memory-tools.ts` applies the same default at the tool
+// boundary so an unattended memory_search never reaches the adapter unbounded.
+export const MEMORY_SEARCH_DEFAULT_LIMIT = 10;
 
 /**
  * LD4 SDW-SEARCH-DOS-01 rule-8 bound: hard ceiling on the number of document
@@ -117,13 +121,15 @@ const MEMORY_CORPUS_SCAN_CAP = 2000;
 /**
  * Hard ceiling on the caller-supplied `limit` for search/list, and the
  * default when the caller supplies none (searchPassages keeps its own
- * smaller DEFAULT_SEARCH_LIMIT default; this is the max either can reach). A
+ * smaller MEMORY_SEARCH_DEFAULT_LIMIT default; this is the max either can reach). A
  * limit above this is clamped, never rejected: paging with `after`
  * (listPassages) or a narrower query (searchPassages tag/text) is how a
  * caller gets the rest. Deliberately well below MEMORY_CORPUS_SCAN_CAP (see
  * assertion below) so a scan never stops before filling a full page.
  */
-const MEMORY_LIST_MAX_LIMIT = 500;
+// Exported: `sdw/memory-tools.ts` clamps the memory_search limit to this
+// before the call reaches the adapter, so the two clamps cannot drift apart.
+export const MEMORY_LIST_MAX_LIMIT = 500;
 export const MEMORY_PROVENANCE_QUARANTINE_CANDIDATE_CAP = MAX_MEMORY_PROVENANCE_CANDIDATES;
 export { SDW_MEMORY_INTEGRITY_STATE } from "../records.js";
 
@@ -766,7 +772,7 @@ export class SdwMemoryBackendAdapter implements MemoryBackendAdapter {
   }
 
   async searchPassages(query: MemorySearchQuery): Promise<readonly MemorySearchResult[]> {
-    const rawLimit = query.limit ?? DEFAULT_SEARCH_LIMIT;
+    const rawLimit = query.limit ?? MEMORY_SEARCH_DEFAULT_LIMIT;
     if (!Number.isSafeInteger(rawLimit) || rawLimit < 1) {
       throw new SdwValidationError("invalid_identifier", "Invalid SDW memory search limit");
     }

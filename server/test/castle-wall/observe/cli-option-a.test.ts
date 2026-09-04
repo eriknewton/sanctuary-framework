@@ -54,6 +54,29 @@ import { hashToString } from "../../../src/core/hashing.js";
 import { stringToBytes, toBase64url } from "../../../src/core/encoding.js";
 import { FilesystemStorage } from "../../../src/storage/filesystem.js";
 
+// Force `loadFortressProducerKey` onto its fortress-relative Linux branch so
+// this test is deterministic on a macOS dev machine that happens to have a
+// real Sanctuary root helper publishing a host-wide key at
+// CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH; this fixture always owns the
+// fortress-relative key, never that host file. Do this through the option
+// `loadFortressProducerKey` was built to take (see
+// `src/castle-wall/runtime/producer-signature.ts`'s `ProducerKeyLoadOptions`)
+// rather than by spoofing `process.platform` globally: a global spoof also
+// flips `FilesystemStorage`'s descriptor-path strategy onto the Linux
+// `/proc/self/fd/<fd>` capability check, which does not exist on Darwin and
+// fails every call with ENOENT (the observe CLI's real refresh path opens a
+// namespace lock on every invocation this test exercises).
+vi.mock("../../../src/castle-wall/runtime/producer-signature.js", async (importOriginal) => {
+  const actual = await importOriginal<
+    typeof import("../../../src/castle-wall/runtime/producer-signature.js")
+  >();
+  return {
+    ...actual,
+    loadFortressProducerKey: (storagePath: string) =>
+      actual.loadFortressProducerKey(storagePath, { platform: "linux" }),
+  };
+});
+
 const SIGNED_AT_MS = 1_777_777_777_777;
 const AGENT_UID = 501;
 const GATE_UID = 602;
@@ -91,10 +114,6 @@ describe("observe candidates Option A CLI source enumeration", () => {
   });
 
   async function makeCliFortress(): Promise<CliFortress> {
-    // Keep the test deterministic on macOS machines that may have a host-wide
-    // producer key installed; this fixture owns the fortress-relative key.
-    vi.spyOn(process, "platform", "get").mockReturnValue("linux");
-
     const fortressPath = await mkdtemp(join(tmpdir(), "cw-observe-option-a-cli-"));
     tempDirs.push(fortressPath);
 

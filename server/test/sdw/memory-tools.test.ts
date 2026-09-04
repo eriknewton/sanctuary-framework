@@ -417,14 +417,17 @@ describe("SDW memory tools: custody + denial discipline", () => {
     expect(denial?.details?.denial_class).toBe("invalid_taint");
   });
 
-  it("an empty search string returns no results without throwing", async () => {
-    const { tools } = makeTools();
+  it("an empty search string is refused with the fixed denial (empty_text, audit-only)", async () => {
+    const { tools, calls } = makeTools();
     await tools.get("memory_insert")!.handler({
       text: "hello world",
       taint: "agent_derived_clean",
     });
     const searched = parse(await tools.get("memory_search")!.handler({ text: "" }));
-    expect((searched.results as unknown[]).length).toBe(0);
+    expect(searched.denied).toBe(true);
+    expect(searched).not.toHaveProperty("results");
+    const denial = calls.find((c) => c.operation === "memory_search_denied");
+    expect(denial?.details?.denial_class).toBe("empty_text");
   });
 
   it("memory_search returns metadata only by default, even for short matched bodies", async () => {

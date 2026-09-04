@@ -28,7 +28,14 @@ runs through the same Tier gate and the same provenance signing as real use:
 3. `memory_get` reads it back byte-faithfully and proves exact content: it
    decrypts on read and re-verifies the stored `content_hash`, failing closed on
    any integrity mismatch. `memory_get` proves the bytes; it does not surface
-   signer or signature fields.
+   signer or signature fields. `memory_search` and `memory_get` are Tier 3 by
+   default: hands-free reads with no approval prompt, while `memory_insert`
+   stays Tier 1. Every agent connected to one fortress shares one memory scope
+   today; per-agent memory isolation is not yet implemented. `memory_search`
+   returns 10 results unless you pass `limit`, and at most 500.
+   `sdw_memory_provenance`, `memory_list`, and `memory_count` stay Tier 1, so
+   the provenance step below asks for one approval on the fortress's
+   configured approval channel.
 4. Provenance: `sdw_memory_provenance` is the tool that proves verified
    provenance. For a passage id it reports the per-record signing status
    (`verified` vs a legacy unsigned row) and the fortress-recorded origin and
@@ -79,6 +86,15 @@ memory_archive_import` rematerializes it under destination-local identifiers wit
 signed lineage and atomic replay/conflict guards. Every transfer is encrypted
 with a fresh per-artifact key. Use this to move memory between two fortresses you
 control.
+
+## Key rotation and memory
+
+Master-key rotation does not yet cover the memory namespaces. While memory
+records are present, `rotate-master` refuses to start and changes nothing.
+There is no shipped procedure yet to rotate a fortress that holds memory
+records (`memory_emit` writes only harness-mirrored files, not records created
+with `memory_insert`), so plan any rotation before enabling memory on a
+fortress, or wait for the rotation follow-up.
 
 ## Exact-fortress unwrap on a second host
 
