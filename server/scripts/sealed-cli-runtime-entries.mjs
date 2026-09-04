@@ -80,7 +80,6 @@ export const SEALED_CLI_RUNTIME_DIST_ENTRIES = Object.freeze([
     kind: "dir",
     source: "copy-model-manifest-v2-asset.mjs",
     sentinel: "model-manifest.v2.json",
-    landsWith: "#1370",
   }),
 ]);
 
