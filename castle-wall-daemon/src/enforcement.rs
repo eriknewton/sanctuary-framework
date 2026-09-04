@@ -3,11 +3,25 @@
 //! The shipped daemon must never equate an authenticated IPC socket or a live
 //! process with kernel enforcement. This module owns the ordered acquisition,
 //! readiness gating, and reverse-order teardown of the runtime components that
-//! together constitute *enforcing*: the nftables table, the NFQUEUE handle and
-//! its verdict thread, and the manifest watcher. `DaemonRuntimeState::Enforcing`
-//! is DERIVED from an [`EnforcementRuntime`] that owns every required component
-//! and where every component still reports ready; it is never stored, so
-//! liveness alone can never present as enforcement.
+//! together constitute a live *kernel runtime*: the nftables table, the NFQUEUE
+//! handle and its verdict thread, and the manifest watcher.
+//! `DaemonRuntimeState::KernelRuntimeReady` is DERIVED from an
+//! [`EnforcementRuntime`] that owns every required component and where every
+//! component still reports ready; it is never stored, so liveness alone can
+//! never present as a ready kernel runtime.
+//!
+//! Kernel-runtime readiness is NOT the same claim as *enforcing*. A ready
+//! runtime means the kernel-side machinery (table, bound queue, watcher) is
+//! live and would gate a wrapped agent's egress; it does NOT mean any agent's
+//! traffic is actually being enforced, because this slice launches no protected
+//! agent and installs no per-agent cgroup jump rule (the base output chain is
+//! `policy accept`). `DaemonRuntimeState::Enforcing` — and therefore
+//! `DaemonHandle::is_enforcing()` — is reserved for the later slice that wraps a
+//! real agent and gates its cgroup; it is NEVER derived from kernel-runtime
+//! readiness here. Conflating the two is the exact "liveness read as
+//! enforcement" defect this module exists to prevent, one level up: an
+//! authenticated socket is not enforcement, and neither is a merely-ready
+//! kernel runtime with nothing wrapped behind it.
 //!
 //! The seam is expressed as two traits so startup ordering and cleanup can be
 //! driven by deterministic fakes on a host without a kernel (macOS CI):
@@ -27,7 +41,7 @@
 //! reference server CI/drill environment, but no Ubuntu-only behavior is baked
 //! in; a distro-specific concern belongs in the boot/install layer, not here.
 //! Server hardware is the first acceptance platform (Omarchy is not); Linux
-//! assurance stays `not_implemented` until captured hardware-drill evidence
+//! assurance stays `not_verified` until captured hardware-drill evidence
 //! exists.
 //!
 //! Scope boundary: this L1 slice owns the kernel-runtime lifecycle only. The
@@ -37,18 +51,21 @@
 //! [`ComponentKind`] set is this runtime's kernel components, not a finished
 //! fleet-egress design; a later slice extends it (see its docs).
 //!
-//! Production Linux wiring is deliberately narrow here: [`linux_production_plan`]
-//! names where the existing `nftables`/`nfqueue`/`manifest::watcher` modules
-//! plug in, but its providers return a typed not-ready today because a live
-//! kernel adapter is not drill-verified in this slice. A provider that cannot
-//! be proven on a real kernel returns [`EnforcementError::AdapterNotVerified`]
-//! rather than a stub that reports success (ASSURANCE_MATRIX row 17 / IC-02..04
-//! track the drill that gates activating it).
-
-use std::sync::Arc;
+//! The concrete production providers (real nftables install under the host
+//! ownership lock, real NFQUEUE bind + verdict thread, real manifest watcher)
+//! live in [`crate::runtime_providers`], and `boot()` drives them through
+//! [`EnforcementRuntime::start`]. This module keeps only the platform-neutral
+//! lifecycle CONTRACT — ordered acquisition, readiness gating, reverse-order
+//! teardown — so it stays testable with deterministic fakes on a host without a
+//! kernel. Activating the plan makes the daemon reach `KernelRuntimeReady` on a
+//! privileged Linux host. That base state alone is not `Enforcing`: a protected
+//! agent must also be wrapped. Linux egress enforcement stays `not_verified`
+//! (ASSURANCE_MATRIX row 17) until a captured hardware drill proves a wrapped
+//! agent is actually blocked.
+//! [`EnforcementError::AdapterNotVerified`] remains the vocabulary for a future
+//! provider that is wired but not yet drill-proven.
 
 use crate::daemon::DaemonRuntimeState;
-use crate::decision::DecisionEngine;
 
 /// The kernel-runtime components THIS L1 enforcement runtime owns, in
 /// acquisition order. `Enforcing` requires EVERY one of these acquired and
@@ -158,10 +175,41 @@ pub trait AcquiredComponent: Send {
     /// table, a verdict thread that exited — reports `false` here, and the
     /// runtime treats that as loss of `Enforcing`. Readiness is re-polled on
     /// every state query, never cached at acquisition.
+    ///
+    /// This is the TWO-valued gate used where indeterminate must fail closed
+    /// (the startup all-or-nothing readiness check). Where the difference
+    /// between "proven lost" and "no answer" matters — the supervision loop and
+    /// the status projection — use [`health`](Self::health) instead.
     fn is_ready(&self) -> bool;
+    /// Three-valued live health. The default derives from
+    /// [`is_ready`](Self::is_ready) for components whose check cannot be
+    /// indeterminate (an in-process flag, a thread liveness bit). A component
+    /// whose check can time out or contend — the nftables ownership proof forks
+    /// `nft` — overrides this so a momentary no-answer is reported as
+    /// [`ComponentHealth::ProbeUnavailable`] rather than manufacturing a loss.
+    ///
+    /// Every consumer must treat `ProbeUnavailable` as not-proven: it withholds
+    /// a readiness assertion but does not itself assert failure.
+    fn health(&self) -> ComponentHealth {
+        if self.is_ready() {
+            ComponentHealth::Ready
+        } else {
+            ComponentHealth::Lost
+        }
+    }
     /// Idempotent, panic-free teardown; joins owned threads before returning.
     /// Runs from `Drop`, so it must never unwrap a fallible join or lock.
     fn release(&mut self);
+}
+
+/// Three-valued component health. `ProbeUnavailable` is the indeterminate arm;
+/// it exists so contention or a probe deadline is never reported as a proven
+/// loss (which would restart a healthy daemon) and never as readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentHealth {
+    Ready,
+    Lost,
+    ProbeUnavailable,
 }
 
 /// A factory that yields exactly one acquired component or fails.
@@ -176,21 +224,31 @@ pub trait ComponentProvider: Send {
     fn acquire(self: Box<Self>) -> Result<Box<dyn AcquiredComponent>, EnforcementError>;
 }
 
-/// Whether the daemon holds live kernel enforcement, and if not, precisely why.
+/// Whether the daemon holds a live, ready kernel runtime, and if not, precisely
+/// why. This is a readiness claim about the kernel-side machinery, NOT an
+/// enforcement claim about any agent's traffic (see the module docs): a ready
+/// runtime is a precondition for enforcing a wrapped agent, never enforcement
+/// on its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnforcementStatus {
-    /// Every required component is owned and still reports ready.
-    Enforcing,
-    NotEnforcing {
-        reason: NotEnforcingReason,
+    /// Every required component is owned and still reports ready. The kernel
+    /// runtime is live; this is NOT `Enforcing` (no agent is wrapped in this
+    /// slice), so it never satisfies `DaemonHandle::is_enforcing()`.
+    KernelRuntimeReady,
+    NotReady {
+        reason: NotReadyReason,
     },
 }
 
-/// The specific reason a runtime is not enforcing. Every variant is a hard
-/// "not enforcing" — absent, indeterminate, and lost all read as not-proven,
+/// The specific reason a runtime is not ready. Every variant is a hard
+/// "not ready" — absent, indeterminate, and lost all read as not-proven,
 /// never as passing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NotEnforcingReason {
+///
+/// `Copy` because it is carried by value inside the published health
+/// observation ([`crate::runtime_health::RuntimeHealthState`]), which a reader
+/// copies out from under a briefly-held mutex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotReadyReason {
     /// No `EnforcementRuntime` is owned at all (the shipped path in this slice).
     NoRuntime,
     /// A required component was never acquired into the runtime.
@@ -200,6 +258,12 @@ pub enum NotEnforcingReason {
     /// The runtime has been shut down (or is mid-shutdown); teardown released
     /// its components.
     ShuttingDown,
+    /// The shared runtime health object could not be locked. Readiness probes
+    /// fail closed rather than returning the last cached healthy value.
+    HealthProbeUnavailable,
+    /// The audit WAL suffered an ambiguous durable mutation or its lock was
+    /// poisoned. Continuing could emit decisions without trustworthy evidence.
+    AuditWalPoisoned,
 }
 
 /// Failure returned by [`EnforcementRuntime::start`] when the daemon could not
@@ -385,14 +449,15 @@ impl EnforcementRuntime {
         })
     }
 
-    /// Current enforcement truth, re-polling each component's live readiness.
-    /// Returns `Enforcing` ONLY when every required component is present and
-    /// ready; a missing component, a lost component, or a shut-down runtime all
-    /// read as not-enforcing.
+    /// Current kernel-runtime readiness, re-polling each component's live
+    /// readiness. Returns `KernelRuntimeReady` ONLY when every required
+    /// component is present and ready; a missing component, a lost component, or
+    /// a shut-down runtime all read as not-ready. Readiness is a precondition
+    /// for enforcing a wrapped agent, never enforcement itself (module docs).
     pub fn status(&self) -> EnforcementStatus {
         if self.shutdown_done {
-            return EnforcementStatus::NotEnforcing {
-                reason: NotEnforcingReason::ShuttingDown,
+            return EnforcementStatus::NotReady {
+                reason: NotReadyReason::ShuttingDown,
             };
         }
         for required in ComponentKind::REQUIRED_IN_ORDER {
@@ -401,29 +466,42 @@ impl EnforcementRuntime {
                 // REQUIRED_IN_ORDER before constructing a runtime, so a runtime
                 // reached through `start` can never be missing a required kind.
                 // This arm still names an absent component rather than falling
-                // through to `Enforcing`, so a runtime built by any future path
-                // that bypasses `start` reads as not-enforcing, not enforcing.
+                // through to `KernelRuntimeReady`, so a runtime built by any
+                // future path that bypasses `start` reads as not-ready.
                 None => {
-                    return EnforcementStatus::NotEnforcing {
-                        reason: NotEnforcingReason::MissingComponent(required),
+                    return EnforcementStatus::NotReady {
+                        reason: NotReadyReason::MissingComponent(required),
                     }
                 }
                 // Live re-poll: a component that dropped its resource since
-                // acquisition invalidates Enforcing on the spot.
-                Some(component) if !component.is_ready() => {
-                    return EnforcementStatus::NotEnforcing {
-                        reason: NotEnforcingReason::ComponentLost(required),
+                // acquisition invalidates readiness on the spot. An
+                // INDETERMINATE reading is reported as `HealthProbeUnavailable`
+                // rather than `ComponentLost`, so a supervisor can retry a
+                // no-answer instead of restarting the daemon on it, while a
+                // status reader still gets no readiness assertion.
+                Some(component) => match component.health() {
+                    ComponentHealth::Ready => {}
+                    ComponentHealth::Lost => {
+                        return EnforcementStatus::NotReady {
+                            reason: NotReadyReason::ComponentLost(required),
+                        }
                     }
-                }
-                Some(_) => {}
+                    ComponentHealth::ProbeUnavailable => {
+                        return EnforcementStatus::NotReady {
+                            reason: NotReadyReason::HealthProbeUnavailable,
+                        }
+                    }
+                },
             }
         }
-        EnforcementStatus::Enforcing
+        EnforcementStatus::KernelRuntimeReady
     }
 
-    /// Convenience: true iff [`status`](Self::status) is `Enforcing`.
-    pub fn is_enforcing(&self) -> bool {
-        matches!(self.status(), EnforcementStatus::Enforcing)
+    /// Convenience: true iff [`status`](Self::status) is `KernelRuntimeReady`.
+    /// This is a kernel-runtime readiness predicate, NOT an enforcement one —
+    /// see the module docs and [`DaemonHandle::is_enforcing`].
+    pub fn is_kernel_runtime_ready(&self) -> bool {
+        matches!(self.status(), EnforcementStatus::KernelRuntimeReady)
     }
 
     /// Release every owned component in reverse acquisition order, joining owned
@@ -509,15 +587,16 @@ fn release_reverse(components: &mut Vec<Box<dyn AcquiredComponent>>) {
     }
 }
 
-/// Enforcement status for an optional runtime handle. A `None` runtime is the
-/// shipped path in this slice and reports `NotEnforcing { NoRuntime }`; a
-/// present runtime delegates to its live [`status`](EnforcementRuntime::status).
-/// This is the single mapping from "do we hold a runtime" to a status, so the
-/// `NoRuntime` reason is emitted here rather than being dead vocabulary.
+/// Kernel-runtime readiness for an optional runtime handle. A `None` runtime is
+/// the path taken when no runtime could be started and reports
+/// `NotReady { NoRuntime }`; a present runtime delegates to its live
+/// [`status`](EnforcementRuntime::status). This is the single mapping from "do
+/// we hold a runtime" to a status, so the `NoRuntime` reason is emitted here
+/// rather than being dead vocabulary.
 pub fn enforcement_status(enforcement: Option<&EnforcementRuntime>) -> EnforcementStatus {
     match enforcement {
-        None => EnforcementStatus::NotEnforcing {
-            reason: NotEnforcingReason::NoRuntime,
+        None => EnforcementStatus::NotReady {
+            reason: NotReadyReason::NoRuntime,
         },
         Some(runtime) => runtime.status(),
     }
@@ -526,88 +605,55 @@ pub fn enforcement_status(enforcement: Option<&EnforcementRuntime>) -> Enforceme
 /// Derive the operator-visible daemon state from the current lifecycle state
 /// and the (optional) enforcement runtime.
 ///
-/// `Enforcing` is returned ONLY when a runtime is present and every required
-/// component reports ready. A `Stopping` or `Degraded` lifecycle takes
-/// precedence and is never overridden to `Enforcing`; a missing runtime, a lost
-/// component, or a shutting-down runtime reads as `ControlPlaneOnly`. This is
-/// the structural guarantee that authenticated IPC and process liveness (which
-/// set `ControlPlaneOnly`) can never be presented as kernel enforcement.
+/// `KernelRuntimeReady` is returned ONLY when a runtime is present and every
+/// required component reports ready. A `Stopping` or `Degraded` lifecycle takes
+/// precedence and is never overridden; a missing runtime, a lost component, or a
+/// shutting-down runtime reads as `ControlPlaneOnly`. This is the structural
+/// guarantee that authenticated IPC and process liveness (which set
+/// `ControlPlaneOnly`) can never be presented as a ready kernel runtime.
+///
+/// `DaemonRuntimeState::Enforcing` is DELIBERATELY never produced here: it is
+/// reserved for the later slice that wraps a real agent and gates its cgroup.
+/// Kernel-runtime readiness is a strictly weaker claim than enforcement (module
+/// docs), so a ready runtime derives `KernelRuntimeReady`, never `Enforcing`,
+/// and `DaemonHandle::is_enforcing()` stays false throughout this slice.
 pub fn derive_daemon_state(
     lifecycle: DaemonRuntimeState,
     enforcement: Option<&EnforcementRuntime>,
 ) -> DaemonRuntimeState {
     match lifecycle {
         // A poisoned-lock caller passes Degraded here; Stopping is set on
-        // teardown. Neither is ever promoted to Enforcing.
+        // teardown. Neither is ever promoted.
         DaemonRuntimeState::Stopping | DaemonRuntimeState::Degraded => lifecycle,
-        DaemonRuntimeState::ControlPlaneOnly | DaemonRuntimeState::Enforcing => {
-            match enforcement_status(enforcement) {
-                EnforcementStatus::Enforcing => DaemonRuntimeState::Enforcing,
-                // No runtime, or a runtime that is not fully ready, is control
-                // plane only — never enforcing.
-                EnforcementStatus::NotEnforcing { .. } => DaemonRuntimeState::ControlPlaneOnly,
-            }
-        }
+        DaemonRuntimeState::ControlPlaneOnly
+        | DaemonRuntimeState::KernelRuntimeReady
+        | DaemonRuntimeState::Enforcing => match enforcement_status(enforcement) {
+            // A fully-ready runtime is KERNEL-RUNTIME-READY, not Enforcing:
+            // no agent is wrapped, so nothing is being enforced yet.
+            EnforcementStatus::KernelRuntimeReady => DaemonRuntimeState::KernelRuntimeReady,
+            // No runtime, or a runtime that is not fully ready, is control
+            // plane only.
+            EnforcementStatus::NotReady { .. } => DaemonRuntimeState::ControlPlaneOnly,
+        },
     }
 }
 
-// ---------------------------------------------------------------------------
-// Production Linux plan (seam only — not yet drill-verified).
-// ---------------------------------------------------------------------------
-//
-// These providers name where the existing kernel modules plug into the
-// lifecycle. They carry the real dependencies (the shared decision engine, the
-// NFQUEUE config, the policy dir) so the wiring shape is concrete, but their
-// `acquire()` returns `AdapterNotVerified` rather than touching the kernel:
-// per AGENTS.md rule 1, a `proven` enforcement claim needs a captured drill on
-// the platform that matters, which this slice does not have. Activating them
-// (having `acquire()` call `nftables::install_castle_table`,
-// `nfqueue::bind_queue` + a joined verdict thread, and `ManifestWatcher::start`)
-// is the drill-gated follow-up tracked by IC-02..04.
-
-/// A production component provider whose live kernel adapter is not yet
-/// drill-verified. It refuses to report success so the shipped daemon stays
-/// honestly non-enforcing.
-struct UnverifiedProvider {
-    kind: ComponentKind,
-}
-
-impl ComponentProvider for UnverifiedProvider {
-    fn kind(&self) -> ComponentKind {
-        self.kind
-    }
-    fn acquire(self: Box<Self>) -> Result<Box<dyn AcquiredComponent>, EnforcementError> {
-        // Honest not-ready: never a stub that returns Ok. The daemon that calls
-        // start() with this plan lands in the fail-before path and reports
-        // ControlPlaneOnly.
-        Err(EnforcementError::AdapterNotVerified(self.kind.as_str()))
-    }
-}
-
-/// The production Linux enforcement plan, in acquisition order. Each provider
-/// references the existing kernel modules as its intended backing but returns a
-/// typed not-ready today; `boot()` therefore owns no runtime and reports
-/// `ControlPlaneOnly`. Wiring `boot()` to `EnforcementRuntime::start` of this
-/// plan is gated on the Linux drill (ASSURANCE_MATRIX row 17 / IC-02..04); it
-/// is intentionally not activated in this slice.
-///
-/// `_decision_engine` is the consumer the future NFQUEUE verdict thread will
-/// drive (`nfqueue::build_verdict_callback`); it is threaded through now so the
-/// activation change is a body edit, not a signature change.
-pub fn linux_production_plan(
-    _decision_engine: Arc<DecisionEngine>,
-) -> Vec<Box<dyn ComponentProvider>> {
-    ComponentKind::REQUIRED_IN_ORDER
-        .into_iter()
-        .map(|kind| Box::new(UnverifiedProvider { kind }) as Box<dyn ComponentProvider>)
-        .collect()
-}
+// The production Linux enforcement plan (the concrete providers that acquire the
+// real nftables table under the host ownership lock, the bound NFQUEUE + its
+// verdict thread, and the manifest watcher thread) lives in
+// [`crate::runtime_providers`]. It is kept out of this module so the lifecycle
+// CONTRACT here (ordered acquisition, readiness gating, reverse-order teardown)
+// stays platform-neutral and testable with fakes, while the kernel-touching
+// acquisition bodies are `cfg(target_os = "linux")`-gated over there. `boot()`
+// drives that plan through [`EnforcementRuntime::start`].
 
 /// Test-only helpers shared with the daemon integration tests. Gated to
 /// `cfg(test)` so no fake ever compiles into the shipped daemon.
 #[cfg(test)]
 mod test_support {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     /// A component that is always ready and owns nothing to release.
     struct AlwaysReady(ComponentKind);
@@ -617,6 +663,24 @@ mod test_support {
         }
         fn is_ready(&self) -> bool {
             true
+        }
+        fn release(&mut self) {}
+    }
+
+    /// A component whose readiness is a shared, flippable atomic. Lets a
+    /// supervision test simulate a component dying AFTER the runtime came up
+    /// ready (verdict thread death, table clobbered, watcher exit) without a real
+    /// kernel, by flipping the returned handle to `false`.
+    struct Toggleable {
+        kind: ComponentKind,
+        ready: Arc<AtomicBool>,
+    }
+    impl AcquiredComponent for Toggleable {
+        fn kind(&self) -> ComponentKind {
+            self.kind
+        }
+        fn is_ready(&self) -> bool {
+            self.ready.load(Ordering::SeqCst)
         }
         fn release(&mut self) {}
     }
@@ -656,8 +720,8 @@ mod test_support {
 
     impl EnforcementRuntime {
         /// Build a runtime owning always-ready fakes of every required
-        /// component. Lets `daemon.rs` tests drive the `Enforcing` derivation
-        /// end-to-end without a real kernel.
+        /// component. Lets `daemon.rs` tests drive the `KernelRuntimeReady`
+        /// derivation end-to-end without a real kernel.
         pub(crate) fn all_ready_for_test() -> Self {
             let providers: Vec<Box<dyn ComponentProvider>> = ComponentKind::REQUIRED_IN_ORDER
                 .into_iter()
@@ -691,6 +755,37 @@ mod test_support {
                 shutdown_done: false,
             }
         }
+
+        /// Build an all-ready runtime in which `target`'s readiness is a shared
+        /// flippable atomic (all other required components are always-ready).
+        /// Returns the runtime plus the toggle handle: flipping it to `false`
+        /// simulates that one component dying after the runtime came up ready, so
+        /// a supervision test can prove the daemon detects a verdict/table/watcher
+        /// death and never keeps reporting a false active service. The owned set
+        /// stays exactly `REQUIRED_IN_ORDER`, in order.
+        pub(crate) fn all_ready_with_toggleable(target: ComponentKind) -> (Self, Arc<AtomicBool>) {
+            let toggle = Arc::new(AtomicBool::new(true));
+            let components: Vec<Box<dyn AcquiredComponent>> = ComponentKind::REQUIRED_IN_ORDER
+                .into_iter()
+                .map(|k| {
+                    if k == target {
+                        Box::new(Toggleable {
+                            kind: k,
+                            ready: Arc::clone(&toggle),
+                        }) as Box<dyn AcquiredComponent>
+                    } else {
+                        Box::new(AlwaysReady(k)) as Box<dyn AcquiredComponent>
+                    }
+                })
+                .collect();
+            (
+                Self {
+                    components,
+                    shutdown_done: false,
+                },
+                toggle,
+            )
+        }
     }
 }
 
@@ -698,7 +793,7 @@ mod test_support {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
 
     /// Ordered log of `release()` calls shared across a test's fake components,
@@ -1134,8 +1229,8 @@ mod tests {
             runtime.owned_kinds(),
             ComponentKind::REQUIRED_IN_ORDER.to_vec()
         );
-        assert!(runtime.is_enforcing());
-        assert_eq!(runtime.status(), EnforcementStatus::Enforcing);
+        assert!(runtime.is_kernel_runtime_ready());
+        assert_eq!(runtime.status(), EnforcementStatus::KernelRuntimeReady);
     }
 
     #[test]
@@ -1147,11 +1242,11 @@ mod tests {
         expected.reverse();
         assert_eq!(log.order(), expected);
         // Post-shutdown the runtime is not enforcing and owns nothing.
-        assert!(!runtime.is_enforcing());
+        assert!(!runtime.is_kernel_runtime_ready());
         assert_eq!(
             runtime.status(),
-            EnforcementStatus::NotEnforcing {
-                reason: NotEnforcingReason::ShuttingDown
+            EnforcementStatus::NotReady {
+                reason: NotReadyReason::ShuttingDown
             }
         );
         assert!(runtime.owned_kinds().is_empty());
@@ -1217,8 +1312,8 @@ mod tests {
         assert!(runtime.owned_kinds().is_empty());
         assert_eq!(
             runtime.status(),
-            EnforcementStatus::NotEnforcing {
-                reason: NotEnforcingReason::ShuttingDown
+            EnforcementStatus::NotReady {
+                reason: NotReadyReason::ShuttingDown
             }
         );
     }
@@ -1667,11 +1762,11 @@ mod tests {
         };
         assert_eq!(
             runtime.status(),
-            EnforcementStatus::NotEnforcing {
-                reason: NotEnforcingReason::MissingComponent(ComponentKind::Nfqueue)
+            EnforcementStatus::NotReady {
+                reason: NotReadyReason::MissingComponent(ComponentKind::Nfqueue)
             }
         );
-        assert!(!runtime.is_enforcing());
+        assert!(!runtime.is_kernel_runtime_ready());
     }
 
     // ---- no detached thread outlives the owner ------------------------------
@@ -1710,10 +1805,10 @@ mod tests {
         );
     }
 
-    // ---- readiness gating of Enforcing --------------------------------------
+    // ---- readiness gating of KernelRuntimeReady -----------------------------
 
     #[test]
-    fn lost_component_drops_out_of_enforcing() {
+    fn lost_component_drops_out_of_kernel_runtime_ready() {
         // Keep the nfqueue readiness handle so we can flip it after start.
         let nfqueue = FakeProvider::ready(ComponentKind::Nfqueue);
         let nfqueue_ready = nfqueue.ready_handle();
@@ -1723,27 +1818,34 @@ mod tests {
             Box::new(FakeProvider::ready(ComponentKind::ManifestWatcher)),
         ];
         let runtime = EnforcementRuntime::start(providers).expect("all ready");
-        assert!(runtime.is_enforcing());
+        assert!(runtime.is_kernel_runtime_ready());
         // Simulate the verdict thread dying / table clobbered.
         nfqueue_ready.store(false, Ordering::SeqCst);
         assert_eq!(
             runtime.status(),
-            EnforcementStatus::NotEnforcing {
-                reason: NotEnforcingReason::ComponentLost(ComponentKind::Nfqueue)
+            EnforcementStatus::NotReady {
+                reason: NotReadyReason::ComponentLost(ComponentKind::Nfqueue)
             }
         );
-        assert!(!runtime.is_enforcing());
+        assert!(!runtime.is_kernel_runtime_ready());
     }
 
     // ---- daemon-state derivation --------------------------------------------
 
     #[test]
-    fn derive_state_enforcing_only_when_runtime_fully_ready() {
+    fn derive_state_kernel_runtime_ready_only_when_runtime_fully_ready() {
         let log = ReleaseLog::default();
         let runtime = EnforcementRuntime::start(ready_plan(&log)).expect("all ready");
+        // A fully-ready runtime derives KernelRuntimeReady, NEVER Enforcing:
+        // this slice wraps no agent, so nothing is being enforced.
         assert_eq!(
             derive_daemon_state(DaemonRuntimeState::ControlPlaneOnly, Some(&runtime)),
-            DaemonRuntimeState::Enforcing
+            DaemonRuntimeState::KernelRuntimeReady
+        );
+        assert_ne!(
+            derive_daemon_state(DaemonRuntimeState::ControlPlaneOnly, Some(&runtime)),
+            DaemonRuntimeState::Enforcing,
+            "kernel-runtime readiness must never be presented as enforcement"
         );
     }
 
@@ -1761,19 +1863,19 @@ mod tests {
         // must name that explicitly rather than the reason being unreachable.
         assert_eq!(
             enforcement_status(None),
-            EnforcementStatus::NotEnforcing {
-                reason: NotEnforcingReason::NoRuntime
+            EnforcementStatus::NotReady {
+                reason: NotReadyReason::NoRuntime
             }
         );
     }
 
     #[test]
-    fn enforcement_status_ready_runtime_is_enforcing() {
+    fn enforcement_status_ready_runtime_is_kernel_runtime_ready() {
         let log = ReleaseLog::default();
         let runtime = EnforcementRuntime::start(ready_plan(&log)).expect("all ready");
         assert_eq!(
             enforcement_status(Some(&runtime)),
-            EnforcementStatus::Enforcing
+            EnforcementStatus::KernelRuntimeReady
         );
     }
 
@@ -1809,33 +1911,8 @@ mod tests {
         );
     }
 
-    // ---- production plan is honestly not-ready -------------------------------
-
-    #[test]
-    fn linux_production_plan_fails_before_and_never_enforces() {
-        // The shipped plan must not construct an enforcing runtime in this
-        // slice: its first provider returns a typed not-ready.
-        let engine = test_decision_engine();
-        let err = EnforcementRuntime::start(linux_production_plan(engine))
-            .expect_err("production plan is not drill-verified yet");
-        let (failed, reason) = expect_component(err);
-        assert_eq!(failed, ComponentKind::NftablesTable);
-        assert!(matches!(reason, EnforcementError::AdapterNotVerified(_)));
-    }
-
-    fn test_decision_engine() -> Arc<DecisionEngine> {
-        use crate::audit::AuditRingBuffer;
-        // A decision engine with nothing wired is sufficient: the production
-        // providers never dereference it in this slice.
-        let audit_buffer = Arc::new(Mutex::new(AuditRingBuffer::new(
-            1024,
-            std::time::Duration::from_secs(60),
-        )));
-        Arc::new(DecisionEngine::new(
-            "deadbeef".to_string(),
-            None,
-            None,
-            audit_buffer,
-        ))
-    }
+    // The production Linux plan and its "fails-before on a host without a
+    // drill-verified kernel path" behavior are tested in
+    // `crate::runtime_providers` (non-Linux) and the cfg-gated Linux integration
+    // test, since the plan now lives there.
 }

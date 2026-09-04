@@ -41,7 +41,9 @@ fn rust_reproduces_and_verifies_the_cross_lang_vector() {
 
     let pubkey_b64 = v["pubkey_b64url"].as_str().expect("pubkey_b64url");
     let canonical = v["canonical"].as_str().expect("canonical");
-    let ts = v["captured_at_unix_ms"].as_u64().expect("captured_at_unix_ms");
+    let ts = v["captured_at_unix_ms"]
+        .as_u64()
+        .expect("captured_at_unix_ms");
     let seq = v["seq"].as_u64().expect("seq");
     let sig_b64 = v["sig_b64url"].as_str().expect("sig_b64url");
 
@@ -80,7 +82,11 @@ fn rust_reproduces_and_verifies_the_cross_lang_vector() {
         .expect("committed signature must verify against committed key");
 
     // 3) A tampered body must NOT verify (binds exact bytes, no re-encode drift).
-    let tampered = producer_signing_bytes(&canonical.replace("egress_blocked", "egress_allowed"), ts, seq);
+    let tampered = producer_signing_bytes(
+        &canonical.replace("egress_blocked", "egress_allowed"),
+        ts,
+        seq,
+    );
     assert!(
         vk.verify(&tampered, &signature).is_err(),
         "a tampered body must not verify"

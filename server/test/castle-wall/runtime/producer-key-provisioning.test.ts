@@ -38,6 +38,7 @@ import { derivePurposeKey } from "../../../src/core/key-derivation.js";
 import {
   loadFortressProducerKey,
   resolveProducerPubKeyPath,
+  resolveLinuxSystemProducerPubKeyPath,
   producerKeyDaemonLaunchArgs,
   producerSigningBytes,
   CASTLE_WALL_PRODUCER_PUBKEY_RELPATH,
@@ -266,6 +267,12 @@ describe("Slice P — single-source loader (the path consumer + reader share)", 
     );
     expect(CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH).toBe(
       "/Library/Application Support/Sanctuary/castle-audit-producer.pub",
+    );
+    expect(resolveLinuxSystemProducerPubKeyPath("deadbeef")).toBe(
+      "/run/sanctuary/deadbeef/audit-producer.pub",
+    );
+    expect(() => resolveLinuxSystemProducerPubKeyPath("../unsafe")).toThrow(
+      /canonical lowercase-hex grammar/,
     );
   });
 

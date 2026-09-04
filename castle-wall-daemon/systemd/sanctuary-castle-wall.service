@@ -7,23 +7,92 @@ Wants=network-pre.target
 
 [Service]
 Type=notify
-ExecStart=/usr/local/libexec/sanctuary/castle-wall-daemon --fortress-id ${SANCTUARY_FORTRESS_ID}
+EnvironmentFile=/etc/sanctuary/castle-wall.env
+# `/run` is tmpfs and the fortress-specific directory does not survive reboot.
+# Recreate it as root:sanctuary before the daemon's strict path validation;
+# runtime activation itself remains attach-only and never writes `/etc`.
+ExecStartPre=/usr/bin/install -d -m 0750 -o root -g sanctuary /run/sanctuary/${SANCTUARY_FORTRESS_ID}
+ExecStart=/usr/local/libexec/sanctuary/castle-wall-daemon --fortress-id ${SANCTUARY_FORTRESS_ID} --trusted-service-uid ${SANCTUARY_TRUSTED_SERVICE_UID}
 Restart=on-failure
 RestartSec=2
 User=root
 Group=sanctuary
 
-# Capabilities. PR 2a does not bind any kernel resources; PR 2b adds the
-# specific CAP_NET_ADMIN bound required for nftables and NFQUEUE.
+# SANCTUARY_TRUSTED_SERVICE_UID is the numeric kernel UID of the Sanctuary main
+# service principal that possesses the pinned handshake key. It must be
+# provisioned explicitly in the root-owned 0600 EnvironmentFile; key-file owner
+# is deliberately not used as an identity proxy. Missing/invalid values make
+# daemon boot fail closed.
+
+# Bound startup at the PROCESS level. The daemon binds nftables/NFQUEUE and the
+# manifest watcher SYNCHRONOUSLY at boot (no in-process bind timeout); a wedged
+# kernel bind is bounded here by systemd, which kills and (per Restart) retries
+# the unit rather than leaving a stuck activating service. Must stay >= the sum
+# of the daemon's synchronous bind steps under load.
+TimeoutStartSec=30
+
+# Live nft ownership checks are isolated behind a one-second deadline. If the
+# underlying fork/netlink transaction remains wedged, shutdown still has a hard
+# bound and systemd kills every child in this service cgroup before restart.
+TimeoutStopSec=10
+KillMode=control-group
+
+# Runtime directory: systemd creates /run/sanctuary before ExecStart, owned by
+# the service user and cleaned up when the unit stops. It contains the ephemeral
+# IPC control socket and the republished audit-producer PUBLIC key only. The
+# persistent private seed stays in StateDirectory. The host-global nft lock deliberately lives in the
+# persistent StateDirectory below so daemon and stopped-unit recovery can hold
+# the exact same inode; putting that lock here would remove its rendezvous path
+# before last-resort recovery starts.
+RuntimeDirectory=sanctuary
+RuntimeDirectoryMode=0710
+
+# Durable state directory: systemd creates /var/lib/sanctuary before ExecStart,
+# root-owned and 0700, and — unlike RuntimeDirectory — does NOT delete it when the
+# unit stops or the host reboots. This is where the nftables ownership JOURNAL
+# lives (/var/lib/sanctuary/nft-ownership.json, see
+# ownership_journal::DEFAULT_OWNERSHIP_JOURNAL_PATH) together with its
+# machine-local MAC AUTHENTICATION KEY (/var/lib/sanctuary/nft-journal-auth.key,
+# 0600 root-owned, generated on first acquisition, never leaves this dir — see
+# ownership_journal::DEFAULT_JOURNAL_AUTH_KEY_PATH). It also contains the
+# non-secret persistent host lock inode
+# (/var/lib/sanctuary/castle-wall.nft.lock, see
+# runtime_lock::DEFAULT_HOST_LOCK_PATH). The journal must survive a
+# service restart (a crash/SIGKILL/TimeoutStartSec between atomic-create and
+# finalize) so the restart can RECLAIM this daemon's own interrupted acquisition
+# instead of refusing its own table forever, and it must NOT be an ephemeral
+# /run path or that reclaim record would vanish on restart.
+#
+# FAIL-CLOSED PRESERVATION: ordinary `systemctl stop` sends SIGTERM, and ordinary
+# shutdown NEVER deletes the owned nftables table or clears its ownership record —
+# it releases only process-local resources, so the acquired enforcement object and
+# its durable proof survive a stop or crash and the next start ADOPTS them.
+# Deleting the table is a SEPARATE, explicit recovery action (`castle-wall-daemon
+# --disarm`), never a side effect of stopping the unit. Deliberately NO ExecStop=
+# that disarms: systemd stop is not disarm.
+#
+# Failure-mode note: without this dir the durable journal/key write fails and the
+# daemon (correctly) FAILS-BEFORE — it refuses to start rather than run without a
+# crash-recovery record — so a missing /var/lib/sanctuary looks like a
+# restart-looping unit, not a quietly-degraded one. Provision it via
+# StateDirectory, do not hand-create it.
+StateDirectory=sanctuary
+StateDirectoryMode=0700
+
+# Capabilities. The daemon needs CAP_NET_ADMIN to install the nftables table and
+# bind NFQUEUE; nothing more is granted, and no new privileges can be acquired.
 CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=true
 
-# Filesystem hardening.
+# Filesystem hardening (safe mode consistent with a root daemon that owns kernel
+# egress state and a local IPC socket). ProtectSystem=strict makes the whole
+# filesystem read-only except the paths explicitly allowed below; RuntimeDirectory
+# already makes /run/sanctuary writable, so only the durable state dir is added.
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/run/sanctuary /var/lib/sanctuary
+ReadWritePaths=/var/lib/sanctuary
 
 # Process isolation.
 PrivateDevices=true

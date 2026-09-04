@@ -146,7 +146,9 @@ fn cidr_axis_covers(spec: &Option<Vec<String>>, address: &str) -> bool {
     let Ok(target) = address.parse::<std::net::IpAddr>() else {
         return false;
     };
-    cidrs.iter().any(|candidate| cidr_contains(candidate, &target))
+    cidrs
+        .iter()
+        .any(|candidate| cidr_contains(candidate, &target))
 }
 
 /// True iff `cidr` (an `addr/prefix` string) contains `target`, family-aware.
@@ -168,7 +170,11 @@ fn cidr_contains(cidr: &str, target: &std::net::IpAddr) -> bool {
             if prefix > 32 {
                 return false;
             }
-            let mask: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            let mask: u32 = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
             (u32::from(base) & mask) == (u32::from(*target) & mask)
         }
         (IpAddr::V6(base), IpAddr::V6(target)) => {
@@ -382,8 +388,7 @@ pub fn is_derived_habeas_rule(rule: &AllowlistRule) -> bool {
         // port exactly the habeas port; no host/pattern/cidr. Accepting "any
         // subset of loopback IPs" (codex round-2 MEDIUM) would wrongly exempt a
         // single-family or off-by-one (`127.0.0.2`) local rule.
-        let ip_ok = m.ip.as_deref()
-            == Some(&[String::from("127.0.0.1"), String::from("::1")]);
+        let ip_ok = m.ip.as_deref() == Some(&[String::from("127.0.0.1"), String::from("::1")]);
         let port_ok = m.port.as_deref() == Some(&[HABEAS_DISTRESS_PORT]);
         return ip_ok
             && port_ok
@@ -525,11 +530,7 @@ mod tests {
         }
     }
 
-    fn m(
-        host: Option<Vec<&str>>,
-        host_pattern: Option<&str>,
-        port: Option<Vec<u16>>,
-    ) -> RuleMatch {
+    fn m(host: Option<Vec<&str>>, host_pattern: Option<&str>, port: Option<Vec<u16>>) -> RuleMatch {
         RuleMatch {
             host: host.map(|h| h.into_iter().map(String::from).collect()),
             host_pattern: host_pattern.map(String::from),
@@ -552,7 +553,11 @@ mod tests {
     #[test]
     fn clean_allowlist_has_no_issues() {
         let rules = vec![
-            op("r1", RuleDisposition::Allow, m(Some(vec!["api.example.com"]), None, None)),
+            op(
+                "r1",
+                RuleDisposition::Allow,
+                m(Some(vec!["api.example.com"]), None, None),
+            ),
             op("r2", RuleDisposition::Allow, m(None, None, Some(vec![443]))),
         ];
         assert!(find_habeas_conflicts(&rules, None).is_empty());
@@ -565,10 +570,8 @@ mod tests {
             HABEAS_WEBHOOK_RULE_ID,
             "reserved_habeas_distress_imposter",
         ] {
-            let issues = find_habeas_conflicts(
-                &[op(id, RuleDisposition::Deny, m(None, None, None))],
-                None,
-            );
+            let issues =
+                find_habeas_conflicts(&[op(id, RuleDisposition::Deny, m(None, None, None))], None);
             assert_eq!(issues.len(), 1, "id {id}");
             assert!(issues[0].contains(HABEAS_RULE_ID_PREFIX));
         }
@@ -580,7 +583,11 @@ mod tests {
             &[op(
                 "block-loopback",
                 RuleDisposition::Deny,
-                m(Some(vec!["127.0.0.1"]), None, Some(vec![HABEAS_DISTRESS_PORT])),
+                m(
+                    Some(vec!["127.0.0.1"]),
+                    None,
+                    Some(vec![HABEAS_DISTRESS_PORT]),
+                ),
             )],
             None,
         );
@@ -631,7 +638,11 @@ mod tests {
                 op(
                     "block-other-port",
                     RuleDisposition::Deny,
-                    m(Some(vec!["127.0.0.1"]), None, Some(vec![HABEAS_DISTRESS_PORT + 1])),
+                    m(
+                        Some(vec!["127.0.0.1"]),
+                        None,
+                        Some(vec![HABEAS_DISTRESS_PORT + 1]),
+                    ),
                 ),
                 op(
                     "block-external",
@@ -651,19 +662,31 @@ mod tests {
             port: 443,
         };
         let by_host = find_habeas_conflicts(
-            &[op("h", RuleDisposition::Deny, m(Some(vec!["OPS.example.com"]), None, None))],
+            &[op(
+                "h",
+                RuleDisposition::Deny,
+                m(Some(vec!["OPS.example.com"]), None, None),
+            )],
             Some(&webhook),
         );
         assert_eq!(by_host.len(), 1);
 
         let by_pattern = find_habeas_conflicts(
-            &[op("p", RuleDisposition::Deny, m(None, Some("*.example.com"), None))],
+            &[op(
+                "p",
+                RuleDisposition::Deny,
+                m(None, Some("*.example.com"), None),
+            )],
             Some(&webhook),
         );
         assert_eq!(by_pattern.len(), 1);
 
         let by_any_port = find_habeas_conflicts(
-            &[op("q", RuleDisposition::Deny, m(None, None, Some(vec![443])))],
+            &[op(
+                "q",
+                RuleDisposition::Deny,
+                m(None, None, Some(vec![443])),
+            )],
             Some(&webhook),
         );
         assert_eq!(by_any_port.len(), 1);
@@ -719,7 +742,10 @@ mod tests {
     #[test]
     fn is_derived_recognizes_genuine_shapes() {
         assert!(is_derived_habeas_rule(&genuine_local()));
-        assert!(is_derived_habeas_rule(&genuine_webhook("ops.example.com", 443)));
+        assert!(is_derived_habeas_rule(&genuine_webhook(
+            "ops.example.com",
+            443
+        )));
     }
 
     #[test]
@@ -770,7 +796,11 @@ mod tests {
     fn composed_gate_rejects_reserved_id_without_emitter_scope() {
         // A rule reusing the reserved id but NOT emitter-scoped allow is not a
         // genuine derived rule; it must be rejected as an id claim.
-        let imposter = op(HABEAS_LOCAL_RULE_ID, RuleDisposition::Deny, m(None, None, None));
+        let imposter = op(
+            HABEAS_LOCAL_RULE_ID,
+            RuleDisposition::Deny,
+            m(None, None, None),
+        );
         let issues = find_habeas_conflicts_in_composed(&[imposter]);
         // Two issues: the id claim AND the missing genuine local lane.
         assert!(issues.iter().any(|i| i.contains(HABEAS_RULE_ID_PREFIX)));
@@ -914,7 +944,11 @@ mod tests {
             port: 443,
         };
         let issues = find_habeas_conflicts(
-            &[op("dot-pattern", RuleDisposition::Deny, m(None, Some(".example.com"), None))],
+            &[op(
+                "dot-pattern",
+                RuleDisposition::Deny,
+                m(None, Some(".example.com"), None),
+            )],
             Some(&webhook),
         );
         assert_eq!(issues.len(), 1);

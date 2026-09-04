@@ -3941,6 +3941,23 @@ export async function runWrap(
       if (outcome.activated) {
         castleWallDaemon = outcome.activation;
         registerCastleWallCleanup();
+        // OWNER RULING (2026-09-02): an activation against a pre-v2 daemon is
+        // LIVE but INCOMPLETE. It is already recorded durably in the audit log;
+        // this is the operator-facing half, so the weaker basis is never silent
+        // at the console either. Not fatal: the wall is operating.
+        if (outcome.activation.activationCompleteness() !== "full") {
+          // SAFETY: stderr is the operator-facing CLI channel; this fixed text
+          // names only the negotiated protocol shortfall and the posture it
+          // implies. It carries no fortress, agent, or key material.
+          console.error(
+            "Sanctuary: Castle Wall is ACTIVE but INCOMPLETE. The installed " +
+              "castle-wall-daemon does not confirm audit ACKs " +
+              "(audit_drain_ack_response), so reclaimed enforcement evidence " +
+              "cannot be proven truncated. Egress filtering is running; " +
+              "Sanctuary will report Castle Wall as degraded until the daemon " +
+              "binary is upgraded."
+          );
+        }
       }
       return;
     }

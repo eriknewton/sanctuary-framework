@@ -21,7 +21,7 @@ TARGETS=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl)
 
 for target in "${TARGETS[@]}"; do
   echo "==> building sanctuary-jail for ${target}"
-  cargo build --release --bin sanctuary-jail --target "${target}"
+  cargo build --locked --release --bin sanctuary-jail --target "${target}"
 
   bin="target/${target}/release/sanctuary-jail"
   [ -f "${bin}" ] || { echo "FAIL: ${bin} not produced" >&2; exit 1; }

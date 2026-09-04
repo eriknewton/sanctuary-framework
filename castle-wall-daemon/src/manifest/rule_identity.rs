@@ -18,14 +18,18 @@ pub enum RuleFilenameRelation {
 pub fn validate_rule_id(value: &str) -> Result<(), String> {
     let bytes = value.as_bytes();
     if bytes.is_empty() || bytes.len() > RULE_ID_MAX_LENGTH {
-        return Err(format!("rule id must be 1..={} ASCII characters", RULE_ID_MAX_LENGTH));
+        return Err(format!(
+            "rule id must be 1..={} ASCII characters",
+            RULE_ID_MAX_LENGTH
+        ));
     }
     if !bytes[0].is_ascii_alphanumeric() {
         return Err("rule id must begin with an ASCII alphanumeric character".to_string());
     }
-    if !bytes.iter().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b':' | b'-')
-    }) {
+    if !bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b':' | b'-'))
+    {
         return Err("rule id contains a character outside the ASCII contract".to_string());
     }
     Ok(())
@@ -52,10 +56,19 @@ pub fn classify_manifest_rule_filename(
     if filename == format!("{}{}", rule_id, RULE_FILENAME_SUFFIX) {
         return Ok(RuleFilenameRelation::LegacySafe);
     }
-    if filename.starts_with(ENCODED_RULE_FILENAME_PREFIX) && filename.ends_with(RULE_FILENAME_SUFFIX) {
-        let payload = &filename[ENCODED_RULE_FILENAME_PREFIX.len()..filename.len() - RULE_FILENAME_SUFFIX.len()];
-        if payload.is_empty() || !payload.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
-            return Err("encoded-v1 rule filename has a non-canonical base64url payload".to_string());
+    if filename.starts_with(ENCODED_RULE_FILENAME_PREFIX)
+        && filename.ends_with(RULE_FILENAME_SUFFIX)
+    {
+        let payload = &filename
+            [ENCODED_RULE_FILENAME_PREFIX.len()..filename.len() - RULE_FILENAME_SUFFIX.len()];
+        if payload.is_empty()
+            || !payload
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(
+                "encoded-v1 rule filename has a non-canonical base64url payload".to_string(),
+            );
         }
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(payload)
@@ -97,7 +110,11 @@ mod tests {
     use serde::Deserialize;
 
     #[derive(Deserialize)]
-    struct Vector { id: String, encoded_v1: String, legacy_safe: String }
+    struct Vector {
+        id: String,
+        encoded_v1: String,
+        legacy_safe: String,
+    }
     #[derive(Deserialize)]
     struct Fixture {
         valid: Vec<Vector>,
@@ -107,12 +124,19 @@ mod tests {
 
     #[test]
     fn shared_contract_vectors_match_exactly() {
-        let fixture: Fixture = serde_json::from_str(include_str!("../../test-vectors/rule-id-filename-v1.json")).unwrap();
+        let fixture: Fixture =
+            serde_json::from_str(include_str!("../../test-vectors/rule-id-filename-v1.json"))
+                .unwrap();
         for vector in fixture.valid {
             assert_eq!(encode_rule_filename(&vector.id).unwrap(), vector.encoded_v1);
-            assert_eq!(classify_manifest_rule_filename(&vector.id, &vector.legacy_safe), Ok(RuleFilenameRelation::LegacySafe));
+            assert_eq!(
+                classify_manifest_rule_filename(&vector.id, &vector.legacy_safe),
+                Ok(RuleFilenameRelation::LegacySafe)
+            );
         }
-        for invalid in fixture.invalid_ids { assert!(validate_rule_id(&invalid).is_err()); }
+        for invalid in fixture.invalid_ids {
+            assert!(validate_rule_id(&invalid).is_err());
+        }
         for invalid in fixture.invalid_filenames {
             assert!(classify_manifest_rule_filename("a", &invalid).is_err());
         }
@@ -120,7 +144,10 @@ mod tests {
 
     #[test]
     fn encodes_exact_url_safe_no_pad_filename() {
-        assert_eq!(encode_rule_filename("curated:alpha_1.2-3").unwrap(), "rid1_Y3VyYXRlZDphbHBoYV8xLjItMw.json");
+        assert_eq!(
+            encode_rule_filename("curated:alpha_1.2-3").unwrap(),
+            "rid1_Y3VyYXRlZDphbHBoYV8xLjItMw.json"
+        );
     }
 
     #[test]

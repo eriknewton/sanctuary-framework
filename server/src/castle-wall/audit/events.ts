@@ -36,7 +36,18 @@ export type CastleWallEventType =
   | "no_wall_expired"
   | "wal_overflow"
   | "external_firewall_clobber"
-  | "egress_metric_batch";
+  | "egress_metric_batch"
+  /**
+   * A verdict that was already durably recorded was OVERRIDDEN before the
+   * packet was released - the daemon's teardown mutation fence dropped a packet
+   * whose `egress_allowed` receipt was already on the WAL. The WAL is
+   * append-only and hash-chained, so the earlier record cannot be edited; this
+   * later record NAMES the sequence it corrects in
+   * `details.superseded_wal_seq`, and carries the final verdict in
+   * `details.final_verdict`. Emitted only by the daemon; see
+   * `OPERATION_VERDICT_SUPERSEDED` in `castle-wall-daemon/src/policy.rs`.
+   */
+  | "egress_verdict_superseded";
 
 /** Destination details captured at the time of the event (may be null for non-flow events). */
 export interface CastleWallEventDestination {

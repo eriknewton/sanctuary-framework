@@ -38,7 +38,10 @@ import {
   type EmissionRecoveryFinding,
   type EmissionStallFinding,
 } from "../audit/emission-liveness.js";
-import { verifyManifestSignature } from "../allowlist/parse.js";
+import {
+  castleWallSigningKeyId,
+  verifyManifestSignature,
+} from "../allowlist/parse.js";
 import type { SignedManifest } from "../allowlist/manifest.js";
 import type {
   ArmLeaseNotification,
@@ -2332,7 +2335,7 @@ async function loadSigningKey(input: MacOSCastleWallDaemonInput): Promise<Daemon
   }
   return {
     mode: "helper",
-    signingKeyId: `castle-wall:${toBase64url(publicKey)}`,
+    signingKeyId: castleWallSigningKeyId(publicKey),
     publicKey,
     signManifest: (bytes) => client.signManifest(bytes),
     signNonce: (nonce) => client.signNonce(nonce),
@@ -2367,7 +2370,7 @@ async function loadLocalSigningKey(
     privateKey.fill(0);
   }
   const signer = localManifestSigner({
-    signingKeyId: `castle-wall:${toBase64url(publicKey)}`,
+    signingKeyId: castleWallSigningKeyId(publicKey),
     encryptedPrivateKey,
     encryptionKey: masterKey,
   });

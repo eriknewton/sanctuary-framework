@@ -20,6 +20,7 @@ import { encodeRuleFilename, parseRuleId } from "../../../src/castle-wall/allowl
 import { CURATED_ALLOWLIST } from "../../../src/castle-wall/runtime/curated-allowlist.js";
 import { provisionedRuleId } from "../../../src/castle-wall/provision/egress.js";
 import { preflightPersistedManifestRuleIdentities } from "../../../src/castle-wall/allowlist/manifest-preflight.js";
+import { castleWallSigningKeyId } from "../../../src/castle-wall/allowlist/parse.js";
 import type { AllowlistManifest, SignedManifest } from "../../../src/castle-wall/allowlist/manifest.js";
 
 function signedManifest(entries: AllowlistManifest["rules"]): {
@@ -39,7 +40,7 @@ function signedManifest(entries: AllowlistManifest["rules"]): {
       manifest,
       signature: {
         signature_scheme: CASTLE_WALL_SIGNATURE_SCHEME_V1,
-        signing_key_id: "test-key",
+        signing_key_id: castleWallSigningKeyId(publicKey),
         signature_b64url: toBase64url(ed25519.sign(stringToBytes(canonicalize(manifest)), privateKey)),
       },
     },

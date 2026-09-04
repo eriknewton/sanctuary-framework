@@ -352,10 +352,30 @@ export function verify(
   publicKey: Uint8Array
 ): boolean {
   try {
-    // Generic Ed25519 verification funnel used by tool-level and suite-level
-    // verifiers. Malformed signature or public-key bytes must return `false`
-    // here, not escape as caller-dependent exception handling.
-    return ed25519.verify(signature, payload, publicKey);
+    if (
+      !isStrictEd25519PointEncoding(publicKey) ||
+      signature.length !== 64 ||
+      !isStrictEd25519PointEncoding(signature.subarray(0, 32))
+    ) {
+      return false;
+    }
+    // `zip215: false` rejects non-canonical encodings and small-order public
+    // keys. The explicit prime-subgroup checks above additionally match
+    // ed25519-dalek's `verify_strict` treatment of both A and R.
+    return ed25519.verify(signature, payload, publicKey, { zip215: false });
+  } catch {
+    return false;
+  }
+}
+
+/** Castle Wall's strict authority-point profile, shared by TS verifiers. */
+export function isStrictEd25519PointEncoding(bytes: Uint8Array): boolean {
+  if (bytes.length !== ED25519_PUBLIC_KEY_LENGTH) return false;
+  try {
+    const point = ed25519.Point.fromBytes(bytes, false);
+    if (point.isSmallOrder() || !point.isTorsionFree()) return false;
+    const canonical = point.toBytes();
+    return canonical.every((byte, index) => byte === bytes[index]);
   } catch {
     return false;
   }

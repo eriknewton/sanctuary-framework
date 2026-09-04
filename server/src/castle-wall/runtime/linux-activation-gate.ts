@@ -25,13 +25,25 @@
  *
  * # Drill-acceptance caveat (never overclaim)
  *
- * Activating this gate wires only the producer-signed binding/activation half.
- * Linux still lacks the manifest-publication half that stamps `agent_origin`, so
- * no Linux capability claim is made here. The claim is unavailable until that
- * half exists and a CAPTURED DRILL on real Linux hardware passes.
+ * Activating this gate wires the producer-signed evidence channel and the
+ * authenticated, byte-only policy-publication broker. That is code-complete,
+ * not deployment proof: no Linux capability claim is available until a
+ * CAPTURED DRILL on real Linux hardware passes.
  */
 
-import { startCastleWall, type CastleWallLifecycleHandle } from "./lifecycle.js";
+import {
+  healthCheck,
+  startCastleWall,
+  type CastleWallHealth,
+  type CastleWallLifecycleHandle,
+} from "./lifecycle.js";
+import {
+  castleWallSnapshotFromHealth,
+} from "../../health/castle-wall-snapshot.js";
+import {
+  evaluateCastleWall,
+  type CastleWallEvidence,
+} from "../../health/evidence.js";
 import type { AuditSink, ChainAnchorSource } from "./audit-consumer.js";
 import type { ClientKeyMaterial } from "./ipc-client.js";
 import {
@@ -46,21 +58,33 @@ import {
   startLinuxAuditDrainLoop,
   drainOnce,
   DEFAULT_AUDIT_DRAIN_MAX_EVENTS,
+  type CastleWallDrainState,
   type LinuxAuditDrainHandle,
   type LinuxAuditDrainOptions,
 } from "./linux-audit-drain.js";
-import { loadFortressProducerKey } from "./producer-signature.js";
+import {
+  loadFortressProducerKey,
+  resolveProducerPubKeyPath,
+  resolveLinuxSystemProducerPubKeyPath,
+} from "./producer-signature.js";
 import { CASTLE_WALL_EVIDENCE_BASIS_DRAIN_FAULT_UNSIGNED } from "../constants.js";
 import { RuntimeLinuxActivationError } from "./errors.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { decrypt, encrypt, type EncryptedPayload } from "../../core/encryption.js";
-import { toBase64url } from "../../core/encoding.js";
 import {
   ED25519_LEGACY_SEED_AND_PUBKEY_BYTES,
   ED25519_PRIVATE_KEY_BYTES,
   ED25519_PUBLIC_KEY_BYTES,
 } from "../../core/crypto-suite-registry.js";
+import {
+  BrokerManifestStorage,
+  type BuildSignedManifestInput,
+} from "./manifest-publisher.js";
+import { publishLinuxCompatiblePolicy } from "./linux-policy-compatibility.js";
+import { castleWallSigningKeyId } from "../allowlist/parse.js";
+
+export type LinuxPolicyPublication = Awaited<ReturnType<typeof publishLinuxCompatiblePolicy>>;
 
 /**
  * The capability flag that OPTS IN to the Linux producer-signed close.
@@ -89,9 +113,10 @@ export function isLinuxProducerSignedActivationRequested(opts?: {
 export interface ActivateLinuxProducerSignedInput {
   fortressId: string;
   /**
-   * The fortress storage path. AUTHORITATIVE single source for the pinned
-   * producer key: the daemon publishes its pub key here and `startCastleWall`
-   * loads it from here, so the consumer can never diverge onto a weaker basis.
+   * User-space fortress storage. Linux producer-key authority does NOT come
+   * from this caller-writable tree: the consumer resolves the daemon key from
+   * `/run/sanctuary/<fortress-id>/audit-producer.pub`. The corresponding private
+   * seed remains under root-only durable state.
    */
   fortressStoragePath: string;
   /** Identity key material the IPC client signs the daemon handshake with. */
@@ -115,12 +140,14 @@ export interface ActivateLinuxProducerSignedInput {
   socketPath?: string;
   /** systemctl runner - injected in tests; defaults to the real one. */
   systemctl?: SystemctlRunner;
-  /** Filesystem ops - injected in tests; defaults to node:fs/promises. */
+  /** @deprecated Legacy test input; runtime activation is attach-only and ignores it. */
   fs?: LauncherFs;
-  /** Daemon binary path override. */
+  /** @deprecated Legacy test input; the root installer fixes the daemon path. */
   daemonBinary?: string;
-  /** Drop-in dir override (tests). */
+  /** @deprecated Legacy test input; runtime activation never writes a drop-in. */
   dropInDir?: string;
+  /** TEST-ONLY root-service producer public-key path override. */
+  testSystemProducerPubKeyPath?: string;
   /**
    * Transport factory override (tests inject an in-process mock daemon). When
    * omitted, a real UDS transport is connected to the daemon socket. Letting
@@ -168,14 +195,81 @@ export interface ActivateLinuxProducerSignedInput {
    * human notices the box is enforcing-blind).
    */
   onAuditUnavailable?: (fatal: RuntimeLinuxActivationError) => void;
+  /**
+   * Consecutive RETRYABLE (or unclassified) drain/ACK faults tolerated before
+   * the wall is treated as genuinely faulted. Defaults to
+   * {@link DEFAULT_RETRYABLE_DRAIN_FAULT_BUDGET}.
+   */
+  retryableDrainFaultBudget?: number;
+  /**
+   * Attempts for the fail-closed initial-drain probe when the daemon answers
+   * with a RETRYABLE condition. Defaults to
+   * {@link DEFAULT_INITIAL_DRAIN_ATTEMPTS}. A TERMINAL answer never retries.
+   */
+  initialDrainAttempts?: number;
+  /** Injected delay for the initial-drain retry backoff; tests pass a no-op. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
+/**
+ * Consecutive retryable drain/ACK faults tolerated before the wall is declared
+ * faulted.
+ *
+ * Derived from what the loop does between faults, not picked: the loop backs off
+ * `pollIntervalMs * 2^(n-1)` capped at `maxFaultBackoffMs`, so with the defaults
+ * (1s, 30s cap) ten consecutive faults span 1+2+4+8+16+30+30+30+30 = 151
+ * seconds. That is long enough that no `systemctl restart` or contention burst
+ * reaches it, and short enough that a daemon which has been refusing for two and
+ * a half minutes is correctly called broken.
+ *
+ * A budget is REQUIRED, not optional: without one, a daemon that answers
+ * `retryable` forever would leave the wall retrying and claiming health
+ * indefinitely, which is the opposite failure from the one being fixed.
+ */
+export const DEFAULT_RETRYABLE_DRAIN_FAULT_BUDGET = 10;
+
+/**
+ * Attempts for the fail-closed initial-drain probe against a RETRYABLE answer.
+ *
+ * Three, spaced by `INITIAL_DRAIN_RETRY_BASE_MS` doubling (0.5s, 1s), so a
+ * daemon that is merely busy at the exact moment of arming gets ~1.5s to answer
+ * rather than failing the activation outright, while a daemon that is actually
+ * stopping still fails closed quickly. A TERMINAL answer consumes no attempts.
+ */
+export const DEFAULT_INITIAL_DRAIN_ATTEMPTS = 3;
+
+/** First backoff between initial-drain probe attempts; doubles per attempt. */
+const INITIAL_DRAIN_RETRY_BASE_MS = 500;
+
+/**
+ * Re-exported from the module that OWNS the drain loop, not declared here.
+ *
+ * `health/castle-wall-snapshot.ts` consumes this type and this file consumes
+ * that module's builder, so declaring it here made the two import each other.
+ * The re-export keeps `CastleWallDrainState` importable from the gate for
+ * callers that already think of it as an activation concept.
+ */
+export type { CastleWallDrainState } from "./linux-audit-drain.js";
+
 /** A live producer-signed activation; close it on shutdown. */
+/**
+ * How complete this activation is.
+ *
+ * - `full`                   the evidence channel is confirmed; Sanctuary may
+ *                            report drain health and (given a wrapped agent) a
+ *                            complete-enforcement claim.
+ * - `unconfirmed_audit_ack`  the peer is pre-v2 and does not confirm ACKs.
+ *                            OPERATION CONTINUES, but every health, arming, and
+ *                            enforcement-completeness surface reads
+ *                            degraded/incomplete (owner ruling, 2026-09-02).
+ */
+export type CastleWallActivationCompleteness = "full" | "unconfirmed_audit_ack";
+
 export interface LinuxProducerSignedActivation {
   lifecycle: CastleWallLifecycleHandle;
   drain: LinuxAuditDrainHandle | null;
-  /** The drop-in path written, for diagnostics. */
-  dropInPath: string;
+  /** Fixed pre-provisioned systemd unit verified by attach-only activation. */
+  unit: string;
   /**
    * Whether the drain loop is still healthy. Returns false the instant a drain
    * transport/persistence FAULT is observed (FIX 4): in opt-in mode a wedged
@@ -184,6 +278,28 @@ export interface LinuxProducerSignedActivation {
    * record + teardown then settle asynchronously (await `whenDrainSettled`).
    */
   drainHealthy(): boolean;
+  /**
+   * The drain loop tripped a transport/persistence FAULT. Narrower than
+   * `!drainHealthy()`: the legacy unconfirmed-ACK basis also fails
+   * `drainHealthy()` while the link itself is fine.
+   */
+  drainFaulted(): boolean;
+  /**
+   * The three-valued evidence-channel condition. `retrying` means the daemon has
+   * answered with a RETRYABLE condition (busy, or stopping) and the loop is
+   * backing off: evidence flow is stalled, nothing is torn down, no durable
+   * failure record exists, and a successful cycle returns it to `healthy`.
+   * After {@link DEFAULT_RETRYABLE_DRAIN_FAULT_BUDGET} consecutive retryable
+   * faults it escalates to `faulted`, which is terminal.
+   */
+  drainState(): CastleWallDrainState;
+  /**
+   * Whether this activation is FULL or is operating on the weaker pre-v2 basis.
+   * Never silently healthy: an `unconfirmed_audit_ack` activation also reads
+   * `drainHealthy() === false`, `runtimeHealth().ok === false`, and
+   * `runtimeEvidence().status === "degraded"`.
+   */
+  activationCompleteness(): CastleWallActivationCompleteness;
   /**
    * Resolves once the in-flight unhealthy-transition teardown has fully settled
    * - i.e. the durable NOT-ARMED record was persisted (or the explicit
@@ -195,6 +311,35 @@ export interface LinuxProducerSignedActivation {
    */
   whenDrainSettled(): Promise<void>;
   /**
+   * The daemon's kernel-runtime health as observed at ARMING time, mapped onto
+   * the truthful readiness model (`enforcing` / `kernel_runtime_ready` /
+   * `control_plane_only` / `degraded` / `unavailable`).
+   *
+   * The daemon observation is captured at activation; consumer-side drain and
+   * ACK state are recomputed on every call, so a later drain fault immediately
+   * withdraws `ok`/`enforcementComplete`. The daemon-side supervisor owns
+   * continuous kernel-runtime detection and exits the unit on a real loss.
+   */
+  runtimeHealth(): CastleWallHealth;
+  /**
+   * The health-evidence verdict `buildHealthEvidenceReport` would produce for
+   * this runtime. This is the PRODUCTION consumer of `evaluateCastleWall`'s
+   * lifecycle/runtime branch: without it the branch had no call path outside
+   * tests (AGENTS rule 4).
+   */
+  runtimeEvidence(): CastleWallEvidence;
+  /**
+   * Sign and publish a complete policy through the authenticated broker. The
+   * fortress id is bound to this activation and cannot be supplied by the
+   * caller. A strictly increasing generation is mandatory on this server
+   * profile; the root daemon also enforces its durable high-water mark.
+   */
+  publishPolicy(
+    input: Omit<BuildSignedManifestInput, "fortressId" | "generation"> & {
+      generation: number;
+    }
+  ): Promise<LinuxPolicyPublication>;
+  /**
    * Tear down the drain loop + lifecycle (does NOT stop the systemd daemon).
    * Awaits any in-flight unhealthy-transition teardown first, so a durable
    * not-armed record is never lost to a teardown race.
@@ -203,10 +348,15 @@ export interface LinuxProducerSignedActivation {
 }
 
 /**
- * The outcome of consulting the gate: either an active producer-signed
- * activation, or an explicit "not activated" with a reason (NOT an error - the
- * caller keeps the macOS/channel basis path). A FAILURE during a REQUESTED
- * activation is thrown, not returned, so it cannot be mistaken for "inactive".
+ * The outcome of consulting the gate: either a live producer-signed activation,
+ * or an explicit "not activated" with a reason (NOT an error - the caller keeps
+ * the macOS/channel basis path). A FAILURE during a REQUESTED activation is
+ * thrown, not returned, so it cannot be mistaken for "inactive".
+ *
+ * `activated: true` means the activation is LIVE, not that it is HEALTHY. Read
+ * `activation.activationCompleteness()` / `drainHealthy()` / `runtimeHealth()`
+ * before making any health, arming, or enforcement claim: an activation against
+ * a pre-v2 daemon is deliberately live-but-incomplete (owner ruling, 2026-09-02).
  */
 export type LinuxActivationOutcome =
   | { activated: true; activation: LinuxProducerSignedActivation }
@@ -257,15 +407,12 @@ export async function activateLinuxProducerSignedCastleWall(
   const platform = input.platform ?? process.platform;
   const systemctl = input.systemctl ?? realSystemctlRunner();
 
-  // P-1: render + install the drop-in, reload, (re)start, VERIFY active.
-  // Throws RuntimeLinuxActivationError fail-closed on any failure.
+  // P-1: attach to and verify an already-provisioned root service. Runtime
+  // activation has no authority to write `/etc` or restart systemd.
   const launch = await launchLinuxCastleWallDaemon({
     fortressId: input.fortressId,
     fortressStoragePath: input.fortressStoragePath,
-    daemonBinary: input.daemonBinary,
-    dropInDir: input.dropInDir,
     systemctl,
-    fs: input.fs,
   });
 
   // FIX 1 (codex CRITICAL - fail-open on absent key in the opt-in path).
@@ -283,8 +430,28 @@ export async function activateLinuxProducerSignedCastleWall(
   // not-armed. (`unreadable` already throws below via `startCastleWall`; this adds
   // the missing `absent` case so all three loads are handled honestly:
   // present→enforce, unreadable→throw, absent→throw - none silently channel.)
+  if (input.testSystemProducerPubKeyPath && !input.connectTransport) {
+    throw new RuntimeLinuxActivationError(
+      "test producer-key path override requires an injected transport",
+      "producer_key_unreadable"
+    );
+  }
+  let systemProducerPubKeyPath: string;
+  try {
+    systemProducerPubKeyPath =
+      input.testSystemProducerPubKeyPath ??
+      (input.connectTransport
+        ? resolveProducerPubKeyPath(input.fortressStoragePath)
+        : resolveLinuxSystemProducerPubKeyPath(input.fortressId));
+  } catch (error) {
+    throw new RuntimeLinuxActivationError(
+      `Castle Wall Linux activation failed (fail-closed, not armed): ${(error as Error).message}`,
+      "producer_key_unreadable"
+    );
+  }
   const keyLoad = await loadFortressProducerKey(input.fortressStoragePath, {
     platform: "linux",
+    linuxProducerPubKeyPath: systemProducerPubKeyPath,
   });
   if (keyLoad.status !== "present") {
     const reason: RuntimeLinuxActivationError["reason"] =
@@ -312,11 +479,11 @@ export async function activateLinuxProducerSignedCastleWall(
     ? await input.connectTransport(socketPath)
     : await connectLinuxUdsTransport({ socketPath });
 
-  // startCastleWall loads the pinned key from `fortressStoragePath` via the
-  // SINGLE source. key `present` → consumer ENFORCES; key `absent` → channel
-  // basis (pre-provision); key `unreadable` → THROWS (a key is expected). We do
-  // NOT swallow that throw: a thrown lifecycle = not-armed. We also wrap a
-  // handshake failure as fail-closed.
+  // startCastleWall loads the same root-published PUBLIC key selected above via
+  // `producerKeyLoadOptions`. key `present` → consumer verifies producer
+  // evidence; key `absent` / `unreadable` → THROWS on this opted-in server path.
+  // We do NOT swallow that throw: a thrown lifecycle = not-armed. We also wrap
+  // a handshake failure as fail-closed.
   let lifecycle: CastleWallLifecycleHandle;
   try {
     lifecycle = await startCastleWall({
@@ -324,7 +491,10 @@ export async function activateLinuxProducerSignedCastleWall(
       key: input.key,
       auditSink: input.auditSink,
       fortressStoragePath: input.fortressStoragePath,
-      producerKeyLoadOptions: { platform: "linux" },
+      producerKeyLoadOptions: {
+        platform: "linux",
+        linuxProducerPubKeyPath: systemProducerPubKeyPath,
+      },
       ...(input.chainAnchorSource !== undefined
         ? { chainAnchorSource: input.chainAnchorSource }
         : {}),
@@ -373,14 +543,29 @@ export async function activateLinuxProducerSignedCastleWall(
   // transition (the wall must read not-armed the instant a fault is seen), but
   // the teardown completion is observable via `whenDrainSettled`.
   let drainTeardown: Promise<void> = Promise.resolve();
+  // Consecutive RETRYABLE/UNCLASSIFIED faults. Reset by any clean cycle, so this
+  // counts a persistent refusal, not a lifetime tally.
+  let consecutiveRetryableFaults = 0;
+  let lastRetryableFault: Error | null = null;
+  /** The fault that latched `drainUnhealthy`, for the evidence string. */
+  let terminalDrainFault: Error | null = null;
+  const retryableBudget = positiveInteger(
+    input.retryableDrainFaultBudget,
+    DEFAULT_RETRYABLE_DRAIN_FAULT_BUDGET
+  );
   const callerOnError = input.drainOptions?.onError;
   const callerOnDrainFault = input.drainOptions?.onDrainFault;
+  const callerOnRetryableFault = input.drainOptions?.onRetryableFault;
   const markDrainUnhealthy = (err: Error): void => {
     if (drainUnhealthy) return;
     // Flip health to false SYNCHRONOUSLY: the instant a fault is observed the
     // wall is not draining, so `drainHealthy()` must already read false even
-    // before the durable record lands.
+    // before the durable record lands. NOTE this latch is only ONE of the two
+    // reasons `drainHealthy()` can be false; the other is the legacy
+    // unconfirmed-ACK basis, which is not a fault and tears nothing down. Use
+    // `drainFaulted()` when you mean this latch specifically.
     drainUnhealthy = true;
+    terminalDrainFault = err;
     drainTeardown = (async () => {
       // Record the audit-failure / not-armed signal DURABLY *before* we treat the
       // transition as complete. The audit sink IS the tamper-evident record;
@@ -437,6 +622,53 @@ export async function activateLinuxProducerSignedCastleWall(
     })();
   };
 
+  /**
+   * A RETRYABLE (or unclassified) drain/ACK fault: the daemon answered and said
+   * it was busy or stopping.
+   *
+   * The consumer's data is unaffected in both cases - on the drain path nothing
+   * was delivered, and on the ACK path the events are already durable
+   * consumer-side - so this writes NO durable failure record and tears NOTHING
+   * down. It is still not health: `drainState()` reads `retrying` until a clean
+   * cycle clears it. The budget is what stops "retryable" from becoming a
+   * permanent excuse: a daemon refusing for `retryableBudget` consecutive cycles
+   * is broken whatever it calls itself, and escalates to the terminal path.
+   */
+  /** The three-valued evidence-channel condition, derived in one place. */
+  const drainStateNow = (): CastleWallDrainState => {
+    if (drainUnhealthy) return "faulted";
+    return consecutiveRetryableFaults > 0 ? "retrying" : "healthy";
+  };
+
+  /**
+   * The operator-facing reason behind a non-healthy `drainState`, or `undefined`
+   * when healthy. Carries the daemon's own words so a reader is not left to
+   * guess which condition stalled the channel.
+   */
+  const drainStateReasonNow = (): string | undefined => {
+    if (drainUnhealthy) return terminalDrainFault?.message;
+    if (consecutiveRetryableFaults > 0 && lastRetryableFault !== null) {
+      return `${lastRetryableFault.message} (${consecutiveRetryableFaults} of ${retryableBudget} consecutive)`;
+    }
+    return undefined;
+  };
+
+  const noteRetryableDrainFault = (err: Error): void => {
+    if (drainUnhealthy) return;
+    consecutiveRetryableFaults += 1;
+    lastRetryableFault = err;
+    if (consecutiveRetryableFaults >= retryableBudget) {
+      markDrainUnhealthy(
+        new Error(
+          `audit drain reported a retryable condition ${consecutiveRetryableFaults} ` +
+            `consecutive times without a single clean cycle, exhausting the ` +
+            `retry budget; the evidence channel is treated as faulted. ` +
+            `Last condition: ${err.message}`
+        )
+      );
+    }
+  };
+
   if (input.startDrainLoop !== false) {
     const drainOptions: LinuxAuditDrainOptions = {
       ...input.drainOptions,
@@ -445,12 +677,26 @@ export async function activateLinuxProducerSignedCastleWall(
       onError: (err: Error) => {
         callerOnError?.(err);
       },
-      // Unsettled FAULT (transport/persistence failure, malformed entry): this is
-      // the load-bearing NOT-ARMED case. Pass through to the caller, then trip
-      // the durable not-armed signal + teardown.
+      // TERMINAL fault (consumer persistence/integrity failure, malformed entry,
+      // a poisoned or unwritable daemon WAL, a dropped link): the load-bearing
+      // NOT-ARMED case. Pass through to the caller, then trip the durable
+      // not-armed signal + teardown.
       onDrainFault: (err: Error) => {
         callerOnDrainFault?.(err);
         markDrainUnhealthy(err);
+      },
+      // RETRYABLE fault: bounded, non-durable, no teardown. See above.
+      onRetryableFault: (err: Error) => {
+        callerOnRetryableFault?.(err);
+        noteRetryableDrainFault(err);
+      },
+      // A clean cycle clears the retry budget. Without this the budget would
+      // count every retryable fault the process ever saw and would eventually
+      // fault a wall that had been working for days.
+      onCycleHealthy: () => {
+        input.drainOptions?.onCycleHealthy?.();
+        consecutiveRetryableFaults = 0;
+        lastRetryableFault = null;
       },
     };
 
@@ -474,55 +720,111 @@ export async function activateLinuxProducerSignedCastleWall(
     // becomes true → we also fail closed. The continuous loop then resumes from
     // the cursor the probe reached, so no event is drained twice or skipped.
     //
+    // BOUNDED RETRY on a RETRYABLE answer. The probe is fail-closed, not
+    // fail-fast: a daemon that is merely busy at the instant of arming (a WAL
+    // control-lock held by an in-flight append) used to fail the whole
+    // activation, and starting Sanctuary during a policy write was enough to
+    // trigger it. A RETRYABLE answer gets `initialDrainAttempts` tries with a
+    // doubling backoff; a TERMINAL answer consumes no attempts and fails closed
+    // at once; exhausting the attempts also fails closed. Never a silent pass.
+    //
     // `confirmInitialDrain: false` opts a caller out (e.g. a harness that injects
     // a non-responsive transport on purpose); the default is the fail-closed probe.
     const maxEvents =
       input.drainOptions?.maxEvents ?? DEFAULT_AUDIT_DRAIN_MAX_EVENTS;
+    const sleep =
+      input.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    const attempts = positiveInteger(
+      input.initialDrainAttempts,
+      DEFAULT_INITIAL_DRAIN_ATTEMPTS
+    );
     let initialCursor: number | null = null;
+    let initialPendingAckSeq: number | null = null;
     if (input.confirmInitialDrain !== false) {
-      try {
-        await drainOnce(
-          lifecycle.client(),
-          lifecycle.audit(),
-          null,
-          maxEvents,
-          drainOptions.onError,
-          drainOptions.onDrainFault
-        );
-        // RESUME from the CONSUMER's durable settled floor, NOT the probe's local
-        // `nextAfterSeq` (codex round-5 - initialCursor must never outrun
-        // settlement). `lastAckedSeq` is the authoritative high-water mark: the
-        // consumer advances it ONLY on durable persistence, so it can never point
-        // past an unsettled event even if the probe stopped mid-batch at a fault.
-        // (The `drainUnhealthy` guard below already fails closed on a probe fault
-        // so the loop never starts in that case; sourcing the cursor from the
-        // consumer's durable state makes the no-skip property hold by
-        // construction rather than by the probe's break-vs-advance bookkeeping.
-        // Re-pulling is additionally idempotent: the consumer's chain validator
-        // duplicate-drops an already-settled seq and refuses any skip-ahead.)
-        initialCursor = lifecycle.audit().getWalChainState().lastAckedSeq;
-      } catch (err) {
-        // The initial drain round-trip failed (link dropped / request timed out
-        // before any batch arrived). Tear down what we opened and surface
-        // NOT-ARMED - never report armed on an unconfirmed audit channel.
+      let lastProbeFailure: string | null = null;
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        let result;
+        try {
+          result = await drainOnce(
+            lifecycle.client(),
+            lifecycle.audit(),
+            null,
+            maxEvents,
+            drainOptions.onError,
+            drainOptions.onDrainFault,
+            {
+              pendingAckSeq: initialPendingAckSeq,
+              // The probe's retryable faults are NOT counted against the running
+              // loop's budget: the probe has its own, smaller attempt bound, and
+              // double-counting would let a slow start consume the budget the
+              // loop needs for its whole lifetime.
+              onRetryableFault: (err) => {
+                callerOnRetryableFault?.(err);
+                lastProbeFailure = err.message;
+              },
+            }
+          );
+        } catch (err) {
+          // An UNEXPECTED throw (link dropped / request timed out before any
+          // batch arrived). Tear down what we opened and surface NOT-ARMED -
+          // never report armed on an unconfirmed audit channel.
+          await lifecycle.stop().catch(() => {});
+          const message = err instanceof Error ? err.message : String(err);
+          throw new RuntimeLinuxActivationError(
+            `Castle Wall Linux activation failed (fail-closed, not armed): the initial ` +
+              `audit drain did not complete a round-trip, so the signed enforcement ` +
+              `evidence channel is unproven (armed-but-not-draining). Cause: ${message}`,
+            "drain_failed"
+          );
+        }
+        // Carry any reclamation debt the probe incurred into the loop, or those
+        // daemon WAL entries are never re-acked (the loop resumes ABOVE them).
+        initialPendingAckSeq = result.pendingAckSeq;
+        if (result.faultClass === null) break; // clean round-trip: channel proven
+        if (result.faultClass === "terminal") break; // `drainUnhealthy` handles it
+        if (attempt < attempts) {
+          await sleep(INITIAL_DRAIN_RETRY_BASE_MS * 2 ** (attempt - 1));
+          continue;
+        }
+        // Attempts exhausted on a retryable condition. Still fail CLOSED: the
+        // channel was never proven, and "the daemon said it was busy" is not
+        // evidence that evidence flows.
         await lifecycle.stop().catch(() => {});
-        const message = err instanceof Error ? err.message : String(err);
         throw new RuntimeLinuxActivationError(
           `Castle Wall Linux activation failed (fail-closed, not armed): the initial ` +
-            `audit drain did not complete a round-trip, so the signed enforcement ` +
-            `evidence channel is unproven (armed-but-not-draining). Cause: ${message}`,
+            `audit drain reported a retryable condition on all ${attempts} attempts, ` +
+            `so the signed enforcement evidence channel is unproven ` +
+            `(armed-but-not-draining). Last condition: ${lastProbeFailure ?? "unknown"}`,
           "drain_failed"
         );
       }
+      // RESUME from the CONSUMER's durable settled floor, NOT the probe's local
+      // `nextAfterSeq` (codex round-5 - initialCursor must never outrun
+      // settlement). `lastAckedSeq` is the authoritative high-water mark: the
+      // consumer advances it ONLY on durable persistence, so it can never point
+      // past an unsettled event even if the probe stopped mid-batch at a fault.
+      // (The `drainUnhealthy` guard below already fails closed on a probe fault
+      // so the loop never starts in that case; sourcing the cursor from the
+      // consumer's durable state makes the no-skip property hold by
+      // construction rather than by the probe's break-vs-advance bookkeeping.
+      // Re-pulling is additionally idempotent: the consumer's chain validator
+      // duplicate-drops an already-settled seq and refuses any skip-ahead.)
+      initialCursor = lifecycle.audit().getWalChainState().lastAckedSeq;
       if (drainUnhealthy) {
-        // A persistence fault tripped during the probe (the channel delivered but
-        // the consumer could not durably settle). The not-armed record + teardown
-        // are already in flight; await them, then surface NOT-ARMED.
+        // A TERMINAL fault tripped during the probe: either the transport failed
+        // outright, or the channel delivered and the consumer could not durably
+        // settle. Both leave the evidence channel UNPROVEN, which is the fact the
+        // operator needs; the cause below says which. The not-armed record +
+        // teardown are already in flight; await them, then surface NOT-ARMED.
         await drainTeardown.catch(() => {});
         await lifecycle.stop().catch(() => {});
         throw new RuntimeLinuxActivationError(
           `Castle Wall Linux activation failed (fail-closed, not armed): the initial ` +
-            `audit drain could not be durably settled (audit persistence fault).`,
+            `audit drain hit a terminal fault, so the signed enforcement evidence ` +
+            // Through the shared derivation, not the field: one place decides
+            // what the operator-facing reason for a non-healthy channel is.
+            `channel is unproven (armed-but-not-draining). Cause: ` +
+            `${drainStateReasonNow() ?? "unknown"}`,
           "drain_failed"
         );
       }
@@ -536,16 +838,146 @@ export async function activateLinuxProducerSignedCastleWall(
       // settled event is not needlessly re-pulled and an unsettled one is never
       // skipped. Even if this hint were stale, the consumer's chain validator is
       // the real guard (duplicate-drop / refuse-skip-ahead).
-      { ...drainOptions, initialCursor }
+      { ...drainOptions, initialCursor, initialPendingAckSeq }
+    );
+  }
+
+  // RUNTIME HONESTY GATE (wired, not ornamental).
+  //
+  // The daemon has completed the handshake and proven the evidence channel; ask
+  // it what its KERNEL RUNTIME is doing before reporting armed. Three outcomes,
+  // and the difference between them is the whole point:
+  //
+  //  * PROVEN-LOST (`degraded`)  -> fail closed. A daemon that reports a lost
+  //    required component is not enforcing, and arming over it would be exactly
+  //    the fake-green this file's contract forbids.
+  //  * INDETERMINATE (`unavailable`) -> DO NOT fail. This is what a pre-v2
+  //    daemon (which does not report the runtime block at all) and a momentary
+  //    health-probe miss both look like, and treating "the daemon did not say"
+  //    as "the daemon said no" would turn a partial upgrade into an outage.
+  //    It is recorded and surfaced through `runtimeEvidence()` instead.
+  //  * `kernel_runtime_ready` / `enforcing` -> proceed. NOTE the honesty bound:
+  //    `kernel_runtime_ready` proves the base nft/NFQUEUE runtime, not that any
+  //    particular agent has been wrapped. Per-agent enforcement remains a
+  //    separate live-state claim; requiring it at channel attachment would make
+  //    a correctly idle, default-deny daemon impossible to attach to.
+  // ONE round-trip. `healthCheck` returns the exact observation it decided from,
+  // so the snapshot below cannot pair a readiness from one status with the raw
+  // fields of a later, different one.
+  const health = await healthCheck(lifecycle.client());
+  const auditAckConfirmed = health.auditAckConfirmed;
+  const liveRuntimeHealth = (): CastleWallHealth => {
+    const drainState = drainStateNow();
+    const channelHealthy = drainState === "healthy" && auditAckConfirmed;
+    if (channelHealthy) return health;
+    return {
+      ...health,
+      ok: false,
+      enforcementComplete: false,
+    };
+  };
+  const liveRuntimeEvidence = (): CastleWallEvidence =>
+    evaluateCastleWall(
+      castleWallSnapshotFromHealth(liveRuntimeHealth(), {
+        platform,
+        drainState: drainStateNow(),
+        drainStateReason: drainStateReasonNow(),
+      })
+    );
+  const runtimeEvidenceAtActivation = liveRuntimeEvidence();
+
+  // OWNER RULING (2026-09-02), the AUDIT-ACK gate.
+  //
+  // A pre-v2 daemon that does not negotiate `audit_drain_ack_response` MAY keep
+  // operating: the ACK is still sent one-way, the daemon still truncates, and
+  // failing here would turn a partial upgrade into an outage. But operating is
+  // not the same as being healthy. Without confirmation the consumer cannot tell
+  // a REFUSED truncation from an applied one, so this activation is INCOMPLETE:
+  // `drainHealthy()` reads false, `activationCompleteness()` names the reason,
+  // `runtimeHealth().ok` and `.enforcementComplete` are false, and
+  // `runtimeEvidence()` is `degraded`. The one thing that must never happen is
+  // the state passing silently, so it also gets a DURABLE record below.
+  const activationCompleteness: CastleWallActivationCompleteness = auditAckConfirmed
+    ? "full"
+    : "unconfirmed_audit_ack";
+  if (!auditAckConfirmed) {
+    // Durable, before the activation is handed back. Best-effort on the sink:
+    // unlike the drain-fault path this is not a transition INTO a fault, so a
+    // sink failure must not tear down a wall that is otherwise operating. The
+    // in-memory state is already degraded either way, so a lost record cannot
+    // upgrade the claim.
+    try {
+      await input.auditSink.append(
+        "l1",
+        "castle_wall_audit_ack_unconfirmed",
+        input.fortressId,
+        {
+          reason:
+            "the connected daemon did not advertise audit_drain_ack_response; " +
+            "WAL evidence is reclaimed without a confirmed ACK",
+          // HONESTY: this is a consumer-emitted posture record, NOT accepted
+          // enforcement evidence, and it carries no producer signature.
+          evidence_basis: CASTLE_WALL_EVIDENCE_BASIS_DRAIN_FAULT_UNSIGNED,
+          armed: true,
+          complete: false,
+          activation_completeness: activationCompleteness,
+          peer_protocol_version: lifecycle.client().daemonProtocol(),
+          note:
+            "operation continues on the pre-v2 basis; Sanctuary must not report " +
+            "drain health, full activation, or complete enforcement from it",
+        },
+        "failure"
+      );
+      await input.auditSink.flush();
+    } catch {
+      // Swallowed deliberately: see above. The degraded state is carried by the
+      // returned handle, which the caller reads regardless of the sink.
+    }
+  }
+
+  if (health.readiness === "degraded" || health.readiness === "control_plane_only") {
+    if (drain) await drain.stop().catch(() => {});
+    await lifecycle.stop().catch(() => {});
+    throw new RuntimeLinuxActivationError(
+      `Castle Wall Linux activation failed (fail-closed, not armed): the daemon ` +
+        `reports its kernel runtime as ${health.readiness}. ` +
+        `${runtimeEvidenceAtActivation.detector_evidence}`,
+      "runtime_degraded"
     );
   }
 
   return {
     lifecycle,
     drain,
-    dropInPath: launch.dropInPath,
-    /** Whether the drain loop has tripped its unhealthy / not-armed signal. */
-    drainHealthy: () => !drainUnhealthy,
+    unit: launch.unit,
+    /**
+     * Whether Sanctuary may report the signed-evidence channel as HEALTHY.
+     *
+     * BOTH conditions, per the owner ruling: the drain loop has not tripped its
+     * fault signal, AND the peer confirms audit ACKs. The second is not a fault
+     * (nothing is broken and nothing is torn down), but an unconfirmed channel
+     * cannot prove reclamation, so it must never read as drain health. Use
+     * `drainFaulted()` when you need the fault dimension by itself.
+     */
+    drainHealthy: () => drainStateNow() === "healthy" && auditAckConfirmed,
+    /**
+     * The drain loop tripped a TERMINAL fault. Distinct from `!drainHealthy()`,
+     * which is also false on the legacy unconfirmed-ACK basis (link fine,
+     * nothing torn down) and while `retrying`.
+     */
+    drainFaulted: () => drainUnhealthy,
+    drainState: drainStateNow,
+    activationCompleteness: () => activationCompleteness,
+    runtimeHealth: liveRuntimeHealth,
+    runtimeEvidence: liveRuntimeEvidence,
+    publishPolicy: async (publication) =>
+      publishLinuxCompatiblePolicy(
+        {
+          ...publication,
+          fortressId: input.fortressId,
+        },
+        new BrokerManifestStorage(lifecycle.client())
+      ),
     /** Resolves once an in-flight unhealthy-transition teardown has settled. */
     whenDrainSettled: () => drainTeardown,
     stop: async () => {
@@ -616,8 +1048,23 @@ export async function buildLinuxIpcClientKeyMaterial(input: {
   }
   return {
     fortressId: input.fortressId,
-    signingKeyId: `castle-wall:${toBase64url(publicKey)}`,
+    signingKeyId: castleWallSigningKeyId(publicKey),
     encryptedPrivateKey,
     encryptionKey: input.masterKey,
   };
+}
+
+/**
+ * Coerce an optional caller-supplied bound to a usable positive integer.
+ *
+ * Shared by the retryable-fault budget and the initial-drain attempt count so
+ * both reject the same nonsense the same way. A zero or negative budget would
+ * mean "escalate on the first retryable condition", which is precisely the
+ * behavior these bounds exist to remove, so it falls back to the default rather
+ * than being honored.
+ */
+function positiveInteger(value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isFinite(value) || value < 1) return fallback;
+  return Math.floor(value);
 }

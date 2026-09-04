@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { generateRandomKey } from "../../../src/core/random.js";
+import { castleWallSigningKeyId } from "../../../src/castle-wall/allowlist/parse.js";
 import { AuditLog } from "../../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../../src/storage/filesystem.js";
 import type {
@@ -58,7 +59,7 @@ describe("Castle Wall lease-delivery watchdog", () => {
     const publicKey = ed25519.getPublicKey(privateKey);
     return {
       mode: "local",
-      signingKeyId: "test-daemon-key",
+      signingKeyId: castleWallSigningKeyId(publicKey),
       publicKey,
       async signManifest(canonicalBytes) {
         return ed25519.sign(canonicalBytes, privateKey);

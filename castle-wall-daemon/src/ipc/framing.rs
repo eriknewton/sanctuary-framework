@@ -32,13 +32,34 @@ pub enum ParseStep {
 }
 
 const HEADER_END: &[u8] = b"\r\n\r\n";
+/// Maximum header bytes accepted before the delimiter. This is deliberately
+/// small: the protocol currently defines one required integer header and no
+/// caller needs to stream arbitrary metadata ahead of the JSON body.
+pub const MAX_HEADER_BYTES: usize = 8 * 1024;
+/// Maximum inbound JSON body accepted by the privileged daemon.
+pub const MAX_INBOUND_BODY_BYTES: usize = 512 * 1024;
+/// Maximum bytes one complete inbound frame can occupy.
+pub const MAX_INBOUND_FRAME_BYTES: usize = MAX_HEADER_BYTES + MAX_INBOUND_BODY_BYTES;
 
 /// Parse one frame from `buf`. Caller is responsible for accumulating bytes
 /// across reads and slicing out `consumed_bytes` after a `Complete` result.
 pub fn parse_frame(buf: &[u8]) -> ParseStep {
     let header_end = match find_subslice(buf, HEADER_END) {
         Some(idx) => idx,
-        None => return ParseStep::NeedMore,
+        None if buf.len() <= MAX_HEADER_BYTES => return ParseStep::NeedMore,
+        None => {
+            return ParseStep::Error {
+                reason: format!("frame header exceeded maximum size {MAX_HEADER_BYTES} bytes"),
+            }
+        }
+    };
+    let body_start = match header_end.checked_add(HEADER_END.len()) {
+        Some(value) if value <= MAX_HEADER_BYTES => value,
+        _ => {
+            return ParseStep::Error {
+                reason: format!("frame header exceeded maximum size {MAX_HEADER_BYTES} bytes"),
+            }
+        }
     };
 
     let header_text = match std::str::from_utf8(&buf[..header_end]) {
@@ -63,6 +84,11 @@ pub fn parse_frame(buf: &[u8]) -> ParseStep {
         let name = line[..colon].trim();
         let value = line[colon + 1..].trim();
         if name.eq_ignore_ascii_case(IPC_CONTENT_LENGTH_HEADER) {
+            if content_length.is_some() {
+                return ParseStep::Error {
+                    reason: "duplicate Content-Length header".to_string(),
+                };
+            }
             content_length = match value.parse::<usize>() {
                 Ok(n) => Some(n),
                 Err(_) => {
@@ -82,9 +108,22 @@ pub fn parse_frame(buf: &[u8]) -> ParseStep {
             }
         }
     };
+    if content_length > MAX_INBOUND_BODY_BYTES {
+        return ParseStep::Error {
+            reason: format!(
+                "Content-Length exceeds maximum body size {MAX_INBOUND_BODY_BYTES} bytes"
+            ),
+        };
+    }
 
-    let body_start = header_end + HEADER_END.len();
-    let total_needed = body_start + content_length;
+    let total_needed = match body_start.checked_add(content_length) {
+        Some(value) if value <= MAX_INBOUND_FRAME_BYTES => value,
+        _ => {
+            return ParseStep::Error {
+                reason: format!("frame exceeded maximum size {MAX_INBOUND_FRAME_BYTES} bytes"),
+            }
+        }
+    };
     if buf.len() < total_needed {
         return ParseStep::NeedMore;
     }
@@ -121,7 +160,10 @@ mod tests {
     fn frame_round_trips_simple_body() {
         let framed = frame("{\"x\":1}");
         match parse_frame(&framed) {
-            ParseStep::Complete { body, consumed_bytes } => {
+            ParseStep::Complete {
+                body,
+                consumed_bytes,
+            } => {
                 assert_eq!(body, "{\"x\":1}");
                 assert_eq!(consumed_bytes, framed.len());
             }
@@ -187,6 +229,34 @@ mod tests {
                 assert_eq!(remainder, b"trailing");
             }
             other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_declared_length_overflow_before_arithmetic_or_allocation() {
+        let frame = format!("Content-Length: {}\r\n\r\n", usize::MAX);
+        match parse_frame(frame.as_bytes()) {
+            ParseStep::Error { reason } => {
+                assert!(reason.contains("maximum body size"));
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_oversized_unterminated_header() {
+        let oversized = vec![b'x'; MAX_HEADER_BYTES + 1];
+        match parse_frame(&oversized) {
+            ParseStep::Error { reason } => assert!(reason.contains("header exceeded")),
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_content_length() {
+        match parse_frame(b"Content-Length: 2\r\ncontent-length: 2\r\n\r\n{}") {
+            ParseStep::Error { reason } => assert!(reason.contains("duplicate")),
+            other => panic!("expected Error, got {:?}", other),
         }
     }
 }

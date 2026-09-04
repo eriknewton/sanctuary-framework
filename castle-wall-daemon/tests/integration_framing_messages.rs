@@ -15,12 +15,17 @@ fn handshake_envelope_round_trip() {
         method: "castle-wall.handshake_challenge".to_string(),
         params: IpcMessage::HandshakeChallenge {
             nonce_b64url: "deadbeef".to_string(),
+            protocol_version: None,
+            capabilities: Vec::new(),
         },
     };
     let json = serde_json::to_string(&envelope).expect("serialize");
     let framed = frame(&json);
     let parsed_body = match parse_frame(&framed) {
-        ParseStep::Complete { body, consumed_bytes } => {
+        ParseStep::Complete {
+            body,
+            consumed_bytes,
+        } => {
             assert_eq!(consumed_bytes, framed.len());
             body
         }
@@ -39,7 +44,10 @@ fn back_to_back_frames_split_correctly() {
     buf.extend_from_slice(&second);
 
     let consumed = match parse_frame(&buf) {
-        ParseStep::Complete { body, consumed_bytes } => {
+        ParseStep::Complete {
+            body,
+            consumed_bytes,
+        } => {
             assert_eq!(body, "{\"a\":1}");
             consumed_bytes
         }

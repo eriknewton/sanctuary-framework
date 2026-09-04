@@ -18,6 +18,7 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { AuditLog } from "../../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../../src/core/random.js";
+import { castleWallSigningKeyId } from "../../../src/castle-wall/allowlist/parse.js";
 import {
   CASTLE_WALL_SCHEMA_VERSION_V1,
 } from "../../../src/castle-wall/constants.js";
@@ -32,10 +33,11 @@ const DERIVED_DNS_RULE_ID = "derived_dns_for_hostname_rules";
 
 function makeSigner(): DaemonSigner {
   const privateKey = ed25519.utils.randomPrivateKey();
+  const publicKey = ed25519.getPublicKey(privateKey);
   return {
     mode: "local",
-    signingKeyId: "resolver-lifecycle-test",
-    publicKey: ed25519.getPublicKey(privateKey),
+    signingKeyId: castleWallSigningKeyId(publicKey),
+    publicKey,
     async signManifest(bytes) {
       return ed25519.sign(bytes, privateKey);
     },
@@ -47,11 +49,12 @@ function makeSigner(): DaemonSigner {
 
 function makeControllableSigner() {
   const privateKey = ed25519.utils.randomPrivateKey();
+  const publicKey = ed25519.getPublicKey(privateKey);
   let fail = false;
   const signer: DaemonSigner = {
     mode: "local",
-    signingKeyId: "resolver-lifecycle-controllable-test",
-    publicKey: ed25519.getPublicKey(privateKey),
+    signingKeyId: castleWallSigningKeyId(publicKey),
+    publicKey,
     async signManifest(bytes) {
       if (fail) throw new Error("test signer unavailable");
       return ed25519.sign(bytes, privateKey);

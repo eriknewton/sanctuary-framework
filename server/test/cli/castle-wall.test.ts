@@ -2028,6 +2028,20 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
   // ── FIX 3 (codex HIGH): the daemon entrypoint ROUTES opt-in Linux to the
   //    producer-signed gate, and everything else to the macOS/channel path. ──
   describe("runDaemon routing (FIX 3)", () => {
+    it("the direct Linux daemon entrypoint restores the local chain anchor before activation", async () => {
+      const source = await readFile(
+        new URL("../../src/cli/castle-wall.ts", import.meta.url),
+        "utf8",
+      );
+      const linuxBranch = source.slice(
+        source.indexOf("if (linuxProducerSigned)"),
+        source.indexOf("} else {", source.indexOf("if (linuxProducerSigned)")),
+      );
+      expect(linuxBranch).toContain(
+        "chainAnchorSource: buildChainAnchorSourceFromAuditLog(auditLog)",
+      );
+    });
+
     it("Linux WITHOUT the opt-in flag stays macOS-only (routes to the channel/macOS path, refuses Linux)", async () => {
       const out = new CaptureStream();
       const err = new CaptureStream();

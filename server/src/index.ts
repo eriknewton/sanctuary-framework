@@ -583,10 +583,17 @@ export async function createSanctuaryServer(options?: {
       },
       handler: async () => {
         const { buildHealthEvidenceReport } = await import("./health/evidence.js");
+        const { castleWallSnapshotForHealthReport } = await import(
+          "./health/castle-wall-detector.js"
+        );
+        // WIRED CONSUMER (AGENTS rule 4). Without this argument `evaluateCastleWall`
+        // reports `not_configured` on every host, live wall or not, and its
+        // lifecycle/runtime branch has no production call path at all.
         const evidence = buildHealthEvidenceReport({
           config,
           identityCount: identityManager.list().length,
           storageBackendName: storage.constructor.name,
+          castleWall: await castleWallSnapshotForHealthReport({ config, masterKey }),
         });
 
         return toolResult({
@@ -655,11 +662,18 @@ export async function createSanctuaryServer(options?: {
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
         const { buildHealthEvidenceReport } = await import("./health/evidence.js");
+        const { castleWallSnapshotForHealthReport } = await import(
+          "./health/castle-wall-detector.js"
+        );
         const storageSizeBytes = await storage.totalSize();
+        // WIRED CONSUMER (AGENTS rule 4). Same evidence source as `exec_attest`
+        // and the SHR publish payload, so the three cannot disagree about the
+        // same wall.
         const evidence = buildHealthEvidenceReport({
           config,
           identityCount: identityManager.list().length,
           storageBackendName: storage.constructor.name,
+          castleWall: await castleWallSnapshotForHealthReport({ config, masterKey }),
         });
 
         return toolResult({

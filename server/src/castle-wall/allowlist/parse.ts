@@ -12,8 +12,11 @@
  */
 
 import { sha256 } from "@noble/hashes/sha256";
-import { verify } from "../../core/identity.js";
-import { fromBase64url, stringToBytes } from "../../core/encoding.js";
+import {
+  isStrictEd25519PointEncoding,
+  verify,
+} from "../../core/identity.js";
+import { fromBase64url, stringToBytes, toBase64url } from "../../core/encoding.js";
 import { canonicalize } from "../../mesh/canonical-json.js";
 import {
   CASTLE_WALL_SCHEMA_VERSION_V1,
@@ -42,6 +45,22 @@ function toHex(bytes: Uint8Array): string {
   return out;
 }
 
+/** Canonical identifier mechanically derived from the pinned authority key. */
+export function castleWallSigningKeyId(publicKey: Uint8Array): string {
+  if (!isStrictEd25519PointEncoding(publicKey)) {
+    throw new Error("public key is not a strict Ed25519 authority key");
+  }
+  return toHex(sha256(publicKey)).slice(0, 16);
+}
+
+/** One-release verification-only label used by the pre-hash publisher. */
+export function legacyCastleWallSigningKeyId(publicKey: Uint8Array): string {
+  if (!isStrictEd25519PointEncoding(publicKey)) {
+    throw new Error("public key is not a strict Ed25519 authority key");
+  }
+  return `castle-wall:${toBase64url(publicKey)}`;
+}
+
 /** Verify the Ed25519 signature on a SignedManifest. */
 export function verifyManifestSignature(
   signed: SignedManifest,
@@ -57,6 +76,23 @@ export function verifyManifestSignature(
     return {
       ok: false,
       error: `unsupported manifest schema_version: ${String(signed.manifest.schema_version)}`,
+    };
+  }
+
+  let expectedKeyId: string;
+  try {
+    expectedKeyId = castleWallSigningKeyId(pinnedPublicKey);
+  } catch (err) {
+    return { ok: false, error: `pinned public key invalid: ${(err as Error).message}` };
+  }
+  const legacyKeyId = legacyCastleWallSigningKeyId(pinnedPublicKey);
+  if (
+    signed.signature.signing_key_id !== expectedKeyId &&
+    signed.signature.signing_key_id !== legacyKeyId
+  ) {
+    return {
+      ok: false,
+      error: `signing_key_id does not match pinned public key (expected ${expectedKeyId}, got ${String(signed.signature.signing_key_id)})`,
     };
   }
 

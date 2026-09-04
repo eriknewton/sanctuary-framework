@@ -2,7 +2,7 @@
 name = "castle-wall-daemon"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.75"
 description = "Sanctuary Castle Wall filter daemon (Castle Architecture Layer 1)."
 license = "Apache-2.0"
 publish = false
@@ -23,10 +23,25 @@ path = "src/bin/sanctuary-jail.rs"
 name = "sanctuary-plugin-launcher"
 path = "src/bin/sanctuary-plugin-launcher.rs"
 
+[features]
+# Compiles the TEST-ISOLATION seams into the crate: `LinuxRuntimePaths::isolated_under`
+# and `nftables::use_isolated_castle_table`. Integration tests that drive the real
+# boot path declare it through `required-features`, so a plain `cargo test` skips
+# those targets and a RELEASE build contains no way to redirect the daemon off the
+# production host lock, ownership journal, journal MAC key, or nftables table.
+# AGENTS.md: "the operator's machine is not a fixture". The seam is structural,
+# not a convention the next test author has to remember.
+test-isolation = []
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["rand_core", "std"] }
+# 2.2.0 raises the compiler floor to Rust 1.81; 2.1.1 exposes the signing and
+# verification API used here while retaining a Rust 1.60 minimum.
+ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["rand_core", "std"] }
+# Directly used to reject canonical-but-torsion-bearing authority keys before
+# they reach ed25519-dalek. Match dalek's pinned, Rust-1.75-compatible graph.
+curve25519-dalek = { version = "=4.1.3", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
 rand_core = { version = "0.6", features = ["std"] }
 sha2 = "=0.10.9"
 hex = "0.4"
@@ -34,13 +49,79 @@ base64 = "0.22"
 thiserror = "1.0"
 nix = { version = "=0.27.1", default-features = false, features = ["fs", "user", "signal", "socket", "process", "poll", "net", "sched", "mount", "resource"] }
 libc = "0.2"
+# `ed25519-dalek` accepts any zeroize 1.x, but 1.9.0 declares edition 2024
+# and cannot even be parsed by Cargo 1.75. Keep the lock graph within the
+# package's declared MSRV; this direct pin adds no new runtime surface.
+zeroize = "=1.8.1"
+# `spki` likewise accepts any base64ct 1.x, but 1.7+ raised the Rust floor
+# above this package's declared MSRV (and 1.8 uses edition 2024). Pin the
+# newest release whose declared Rust floor remains below 1.75.
+base64ct = "=1.6.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-inotify = "0.10"
+inotify = { version = "0.10", default-features = false }
 nfq = "=0.2.5"
 
 [dev-dependencies]
-tempfile = "3.10"
+# Later 3.x releases pull edition-2024-only transitive crates that Cargo 1.75
+# cannot parse. 3.10.1 declares Rust 1.63 and covers the APIs used by tests.
+tempfile = "=3.10.1"
+
+# Every suite below reaches a HOST-GLOBAL object -- the `sanctuary-castle` nft
+# table, the host ownership lock, the authenticated ownership journal and its MAC
+# key -- either by calling `nftables` directly or by driving `daemon::boot`,
+# whose Linux path calls `activate_kernel_runtime` and installs the table. Each
+# may therefore build ONLY where the isolation seams exist. Without this gate a
+# plain `cargo test` on a Linux host runs them against the operator's live
+# enforcement state (AGENTS.md, "the operator's machine is not a fixture").
+#
+# `integration_manifest_and_drain` is in this list even though its assertions are
+# platform-portable: portable ASSERTIONS do not make a portable BOOT. It calls
+# `daemon::boot`, so on a privileged Linux host it installed the production
+# table. The invariant is about which objects a target can reach, not about which
+# `cfg` its tests carry. Every target that can reach one is gated; that is the
+# whole list, and `tests/isolation/mod.rs` is the single shared guard all of them
+# install (AGENTS rule 5: one source, never a per-suite copy).
+#
+# The four Linux-only suites are `#![cfg(target_os = "linux")]`, so a macOS
+# `cargo test` loses no coverage by skipping them. `integration_manifest_and_drain`
+# DOES run on macOS, so the documented local command in README.md passes
+# `--features test-isolation`; without it that suite is silently skipped and a
+# green run means less than it looks like. The Linux CI job passes the flag and
+# fails closed when any of the five did not appear in the run log.
+#
+# `tests/test_isolation_gate.rs` is deliberately NOT gated and enforces this
+# whole block mechanically: it refuses any `tests/*.rs` that can reach a
+# host-global object without a `required-features` entry here.
+[[test]]
+name = "integration_linux_runtime_activation"
+path = "tests/integration_linux_runtime_activation.rs"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "integration_manifest_and_drain"
+path = "tests/integration_manifest_and_drain.rs"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "integration_kernel_binding"
+path = "tests/integration_kernel_binding.rs"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "integration_dns_bypass"
+path = "tests/integration_dns_bypass.rs"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "integration_failure_modes"
+path = "tests/integration_failure_modes.rs"
+required-features = ["test-isolation"]
+
+[[test]]
+name = "integration_gf1_recovery"
+path = "tests/integration_gf1_recovery.rs"
+required-features = ["test-isolation"]
 
 [profile.release]
 opt-level = 3

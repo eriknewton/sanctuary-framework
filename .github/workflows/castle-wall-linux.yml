@@ -16,7 +16,42 @@ on:
 permissions:
   contents: read
 
+# CHOKEPOINT, not a style setting. GitHub Actions' implicit shell for a `run:`
+# block is `bash -e {0}` -- WITHOUT `pipefail` -- so the exit status of any
+# `cmd | tee ...` step is `tee`'s and a failing `cmd` produces a green step. This
+# workflow had that shape twice (the privileged `cargo test`, and the SHA-256
+# manifest), and this job is the evidence CI check the README and
+# ASSURANCE_MATRIX cite, so an invisible failure here is a false capability claim
+# rather than a flake. `shell: bash` is documented as
+# `bash --noprofile --norc -eo pipefail {0}`; setting it once at workflow level
+# covers every step, including ones added later, instead of relying on each
+# author remembering a per-step `set -o pipefail`.
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  castle-wall-msrv:
+    name: Rust 1.75 minimum-version check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install native build dependencies
+        uses: ./.github/actions/apt-install-resilient
+        timeout-minutes: 22
+        with:
+          packages: libnetfilter-queue-dev libnfnetlink-dev
+
+      - name: Install declared minimum Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.75.0
+
+      - name: Check complete locked graph at declared MSRV
+        working-directory: castle-wall-daemon
+        run: cargo +1.75.0 check --locked --all-targets --all-features
+
   castle-wall-linux-integration:
     runs-on: ubuntu-24.04
     # Run as root so nftables + NFQUEUE + cgroup operations succeed
@@ -109,11 +144,14 @@ jobs:
 
       - name: cargo check
         working-directory: castle-wall-daemon
-        run: cargo check --all-targets
+        # `--all-features` so the Linux-only integration suites (which declare
+        # `required-features = ["test-isolation"]`) are actually type-checked here
+        # rather than silently skipped.
+        run: cargo check --locked --all-targets --all-features
 
       - name: cargo clippy (warnings as errors)
         working-directory: castle-wall-daemon
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version ^0.22
@@ -127,15 +165,71 @@ jobs:
         run: |
           # Run all tests including Linux-gated integration tests.
           # NFQUEUE and nftables tests need root.
-          sudo -E env "PATH=$PATH" cargo test --all-targets -- --test-threads=1 2>&1
+          #
+          # `--features test-isolation` is REQUIRED, not optional: the Linux
+          # integration suites declare it in `required-features`, so without it
+          # cargo silently builds ZERO of them and the job passes having tested
+          # nothing on the kernel path. The step below fails closed if that
+          # happens. The feature also compiles the guard that refuses any `nft`
+          # call against the production `sanctuary-castle` table, so these suites
+          # cannot touch a runner's (or an operator's) live enforcement state.
+          # `pipefail` is LOAD-BEARING here, not hygiene: without it the step's
+          # exit status is `tee`'s (always 0) and a FAILING cargo suite produced a
+          # green job, which the presence-grep below could not catch either
+          # (a failing suite still prints its `Running tests/<suite>.rs` line).
+          # The workflow-level `defaults.run.shell: bash` already supplies it;
+          # this line is a deliberate local restatement so the invariant survives
+          # someone deleting that block, and so the step reads correctly in
+          # isolation. Must match the `defaults:` block at the top of this file.
+          set -o pipefail
+          sudo -E env "PATH=$PATH" cargo test --locked --all-targets --features test-isolation \
+            -- --test-threads=1 2>&1 | tee cargo-test.log
+          # Two DIFFERENT questions, both required:
+          #   1. did cargo exit 0?  -> `pipefail` above
+          #   2. did every intended suite actually BUILD and RUN?
+          # Question 2 is not implied by question 1: a `required-features` target
+          # that is not selected is silently absent from the run, and cargo still
+          # exits 0 having tested nothing on that path. Keep this list equal to the
+          # gated set in castle-wall-daemon/Cargo.toml; `tests/test_isolation_gate.rs`
+          # pins that set from the other side.
+          for suite in integration_linux_runtime_activation integration_kernel_binding \
+                       integration_dns_bypass integration_failure_modes \
+                       integration_manifest_and_drain test_isolation_gate; do
+            grep -q "Running tests/$suite.rs" cargo-test.log || {
+              echo "FAIL: $suite did not run; the test-isolation feature is required for it"
+              exit 1
+            }
+          done
+          # Every suite that ran must also have REPORTED a result line. A binary
+          # that aborted (SIGSEGV, a panic in a harness thread, an OOM kill) prints
+          # `Running tests/<suite>.rs` and then dies without `test result:`, which
+          # the presence-grep alone would accept.
+          started=$(grep -cE "^[[:space:]]*Running " cargo-test.log || true)
+          finished=$(grep -cE "^test result: ok\." cargo-test.log || true)
+          if [ "$started" != "$finished" ]; then
+            echo "FAIL: $started test binaries started but only $finished reported \
+'test result: ok.'; a suite aborted without reporting"
+            exit 1
+          fi
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug
+          # Linux lifecycle tests may skip explicitly on ad-hoc unprivileged
+          # hosts, but this job promises root/CAP_NET_ADMIN and must fail if that
+          # precondition disappears rather than producing a false green.
+          SANCTUARY_EXPECT_PRIVILEGED_LINUX: "1"
 
       - name: Cleanup nftables state
         if: always()
         run: |
-          sudo nft delete table inet sanctuary-castle 2>/dev/null || true
+          # The suites run against per-process `sanctuary-castle-test-<pid>` tables
+          # (castle-wall-daemon/tests/isolation/mod.rs), so sweep those. The
+          # production name is swept too, but only as a belt-and-braces step for a
+          # runner that ran an older revision: nothing in this job creates it.
+          for t in $(sudo nft list tables inet 2>/dev/null | awk '{print $3}' \
+                     | grep -E '^sanctuary-castle(-test-[0-9a-f]+)?$' || true); do
+            sudo nft delete table inet "$t" 2>/dev/null || true
+          done
 
   # Static-binary build of the sanctuary-jail shim (B2 static-binary jail
   # delivery). The macOS launcher (SanctuaryGuestJail static-binary mode)

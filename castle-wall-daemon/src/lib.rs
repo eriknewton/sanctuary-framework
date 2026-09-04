@@ -21,27 +21,37 @@ pub mod approval;
 pub mod audit;
 pub mod cgroup;
 pub mod config;
+pub mod crypto;
 pub mod daemon;
 pub mod decision;
 pub mod enforcement;
 pub mod failure;
 pub mod habeas;
+pub mod health_probe;
 pub(crate) mod identity;
 pub mod ipc;
 pub mod jail;
 pub mod launcher;
+pub mod live_status;
 pub mod manifest;
 pub mod nfqueue;
 pub mod nftables;
+pub mod ownership_journal;
 pub mod policy;
+pub mod runtime_health;
+pub mod runtime_lock;
+pub mod runtime_providers;
+pub mod systemd_notify;
+pub mod thread_component;
 
 pub use config::DaemonConfig;
-pub use daemon::{boot, DaemonError, DaemonExitReport, DaemonHandle, DaemonRuntimeState};
+pub use daemon::{
+    boot, DaemonError, DaemonExitReport, DaemonHandle, DaemonRuntimeState, SupervisionOutcome,
+};
 pub use decision::{AttemptError, DecisionEngine, EvaluationOutcome};
 pub use enforcement::{
     derive_daemon_state, enforcement_status, AcquiredComponent, ComponentKind, ComponentProvider,
-    EnforcementError, EnforcementRuntime, EnforcementStartError, EnforcementStatus,
-    NotEnforcingReason,
+    EnforcementError, EnforcementRuntime, EnforcementStartError, EnforcementStatus, NotReadyReason,
 };
 pub use ipc::framing::{frame, parse_frame, ParseStep};
 pub use ipc::messages::{IpcMessage, MessageEnvelope};
@@ -49,6 +59,9 @@ pub use manifest::verify::verify_manifest_signature;
 pub use policy::{
     build_audit_event_canonical_json, DeniedReason, EvaluationRequest, PolicySnapshot,
     PolicySnapshotError, Verdict,
+};
+pub use runtime_providers::{
+    disarm_castle_runtime, linux_production_plan, DisarmOutcome, LinuxRuntimeConfig,
 };
 
 /// Wire constants synchronized with `server/src/castle-wall/constants.ts`.

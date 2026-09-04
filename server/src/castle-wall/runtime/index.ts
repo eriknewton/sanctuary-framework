@@ -28,4 +28,5 @@ export * from "./system-resolvers.js";
 export * from "./macos-daemon.js";
 export * from "./linux-daemon.js";
 export * from "./linux-audit-drain.js";
+export * from "./linux-policy-compatibility.js";
 export * from "./linux-activation-gate.js";

@@ -15,21 +15,28 @@
 //!   `append_metric` path skips the fsync because the surface is best-effort.
 //! - [`WalWriter::snapshot_after`] returns entries strictly newer than a
 //!   given chain seq; [`WalWriter::truncate_through_seq`] rewrites the file
-//!   atomically to drop ACK'd entries on Sanctuary main's signal.
+//!   atomically to hide ACK'd entries while retaining one durable predecessor
+//!   row as the restart chain anchor.
 //!
 //! Privilege boundary (scope-lock §8): the daemon never holds the fortress
-//! master key. The hash chain provides ordering integrity *without* a
-//! daemon-side signature. Sanctuary main signs each event into the existing
-//! L1 audit log on drain, satisfying the "tamper-evident" property at the
-//! main-process boundary while keeping the daemon free of signing keys.
+//! master key. It does hold a separately provisioned, root-owned audit-producer
+//! key and signs each drained event together with its sequence and capture
+//! timestamp. The hash chain preserves ordering, while Sanctuary main verifies
+//! the producer signature before committing the event to the L1 audit log.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime};
+
+/// Maximum portion of the configured WAL cap reserved for lifecycle/control
+/// evidence. Normal enforcement events stop before this region, leaving enough
+/// room for boot, loss, and authenticated drain-recovery records.
+pub const WAL_CONTROL_HEADROOM_MAX_BYTES: u64 = 64 * 1024;
 
 /// One audit event awaiting durable persistence.
 ///
@@ -94,10 +101,7 @@ impl AuditRingBuffer {
             // Prefer dropping the oldest non-critical entry. We scan
             // front-to-back so "oldest non-critical" wins over "newer
             // non-critical."
-            let drop_index = self
-                .buffer
-                .iter()
-                .position(|pending| !pending.critical);
+            let drop_index = self.buffer.iter().position(|pending| !pending.critical);
             match drop_index {
                 Some(index) => {
                     if let Some(dropped) = self.buffer.remove(index) {
@@ -193,6 +197,7 @@ impl AuditRingBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn pending(body: &str, t: SystemTime) -> PendingAuditEvent {
         // Default to non-critical so existing "drop oldest" tests still
@@ -276,10 +281,7 @@ mod tests {
         // First entry is critical; subsequent entries are metric-class.
         buf.append(pending_critical("{\"crit\":\"AAA\"}", now));
         for i in 0..6 {
-            buf.append(pending(
-                &format!("{{\"metric\":\"BBB{i}\"}}"),
-                now,
-            ));
+            buf.append(pending(&format!("{{\"metric\":\"BBB{i}\"}}"), now));
         }
 
         let bodies: Vec<&str> = buf
@@ -339,6 +341,106 @@ mod tests {
             "overflow_count must also reflect the dropped critical"
         );
     }
+
+    #[test]
+    fn disk_wal_cap_refuses_before_mutation_and_never_deletes_unacked_evidence() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bounded.wal");
+        let cap = 900;
+        let mut wal = WalWriter::open_with_cap(&path, cap).unwrap();
+        while wal.append_critical("{\"operation\":\"bounded\"}").is_ok() {}
+        let before = std::fs::read(&path).unwrap();
+        let before_seq = wal.next_seq;
+        let err = wal
+            .append_critical("{\"operation\":\"must_refuse\"}")
+            .unwrap_err();
+        assert!(matches!(err, WalError::CapacityExceeded { .. }));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(wal.next_seq, before_seq);
+        assert!(wal.bytes_written() <= cap);
+    }
+
+    #[test]
+    fn oversized_existing_wal_refuses_start_without_truncation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("oversized.wal");
+        let mut uncapped = WalWriter::open(&path).unwrap();
+        uncapped
+            .append_critical("{\"operation\":\"preserve\"}")
+            .unwrap();
+        drop(uncapped);
+        let before = std::fs::read(&path).unwrap();
+        let err = WalWriter::open_with_cap(&path, 1).unwrap_err();
+        assert!(matches!(err, WalError::CapacityExceeded { .. }));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn ordinary_events_stop_before_reserved_control_recovery_headroom() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("recovery-headroom.wal");
+        let cap = 8 * 1024;
+        let mut wal = WalWriter::open_with_cap(&path, cap).unwrap();
+        while wal.append_critical("{\"operation\":\"ordinary\"}").is_ok() {}
+        let before_control = wal.bytes_written();
+        wal.append_control_critical("{\"operation\":\"drain_recovery_started\"}")
+            .expect("reserved headroom must admit bounded recovery evidence");
+        assert!(wal.bytes_written() > before_control);
+        assert!(wal.bytes_written() <= cap);
+    }
+
+    #[test]
+    fn zero_budget_snapshot_and_ack_are_retryable_without_mutating_live_evidence() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bounded-control.wal");
+        let mut wal = WalWriter::open_with_cap(&path, 1024 * 1024).unwrap();
+        wal.append_critical("{\"operation\":\"keep\"}").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let shutdown = AtomicBool::new(false);
+        assert!(matches!(
+            wal.snapshot_after_bounded(None, 1, &shutdown, Duration::ZERO),
+            Err(WalError::OperationInProgress { .. })
+        ));
+        assert!(matches!(
+            wal.truncate_through_seq_bounded(0, &shutdown, Duration::ZERO),
+            Err(WalError::OperationInProgress { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn multi_megabyte_truncate_retries_resume_and_eventually_commit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("resumable-large.wal");
+        let mut wal = WalWriter::open_with_cap(&path, 8 * 1024 * 1024).unwrap();
+        let body = format!("{{\"payload\":\"{}\"}}", "x".repeat(480));
+        while wal.bytes_written() < 4 * 1024 * 1024 {
+            wal.append_metric(&body).unwrap();
+        }
+        let ack = wal.next_seq() / 2;
+        let shutdown = AtomicBool::new(false);
+        let mut last_progress = 0;
+        let mut saw_progress = false;
+        for _ in 0..20_000 {
+            match wal.truncate_through_seq_bounded(ack, &shutdown, Duration::from_micros(100)) {
+                Ok(dropped) => {
+                    assert!(dropped > 0);
+                    assert!(saw_progress);
+                    assert!(wal.bytes_written() < 4 * 1024 * 1024);
+                    return;
+                }
+                Err(WalError::OperationInProgress {
+                    processed_bytes, ..
+                }) => {
+                    assert!(processed_bytes >= last_progress);
+                    saw_progress |= processed_bytes > last_progress;
+                    last_progress = processed_bytes;
+                }
+                Err(err) => panic!("unexpected resumable truncate error: {err}"),
+            }
+        }
+        panic!("resumable truncate did not eventually finish");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +452,7 @@ mod tests {
 /// the prior entry's audit-event canonical-JSON bytes so Sanctuary main can
 /// detect drops or reordering on drain.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WalEntry {
     pub seq: u64,
     /// Milliseconds since UNIX epoch. `u64` rather than `u128` so the wire
@@ -366,6 +469,15 @@ pub struct WalEntry {
     /// drain. Critical events were fsync'd on append already; metric events
     /// were not.
     pub critical: bool,
+    /// A logically ACKed predecessor retained as the first physical row so a
+    /// restart never loses sequence/high-water or accepts an unverifiable
+    /// post-truncation chain root. Anchor rows are never returned by drain.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub acked_anchor: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Errors emitted by the WAL writer.
@@ -378,7 +490,9 @@ pub enum WalError {
     },
     #[error("WAL parse error at line {line}: {source_message}")]
     Parse { line: u64, source_message: String },
-    #[error("WAL chain integrity broken at seq {seq}: expected prior={expected:?}, found={found:?}")]
+    #[error(
+        "WAL chain integrity broken at seq {seq}: expected prior={expected:?}, found={found:?}"
+    )]
     ChainBroken {
         seq: u64,
         expected: Option<String>,
@@ -391,6 +505,35 @@ pub enum WalError {
         path: PathBuf,
         source_message: String,
     },
+    #[error("WAL operation cancelled during daemon shutdown")]
+    Cancelled,
+    #[error("WAL operation exceeded its bounded control-path budget")]
+    OperationBudgetExceeded,
+    #[error("WAL {operation} is still making progress ({processed_bytes} bytes validated)")]
+    OperationInProgress {
+        operation: &'static str,
+        processed_bytes: u64,
+    },
+    #[error("WAL on-disk capacity exceeded: cap={cap_bytes} current={current_bytes} attempted={attempted_bytes}; no unacknowledged evidence was deleted")]
+    CapacityExceeded {
+        cap_bytes: u64,
+        current_bytes: u64,
+        attempted_bytes: u64,
+    },
+    #[error("WAL is poisoned after an indeterminate durable mutation: {reason}")]
+    Poisoned { reason: String },
+}
+
+/// Test-only fault points that cross a durable-mutation boundary. Unlike the
+/// legacy pre-write injection, every one of these must permanently poison this
+/// writer instance because disk and in-memory chain state may have diverged.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalFaultPoint {
+    AppendPartialBody,
+    AppendSyncFailure,
+    TruncateParentSyncFailure,
+    TruncateReopenFailure,
 }
 
 /// True iff `s` is a sequence of exactly 64 lowercase hex chars
@@ -413,6 +556,13 @@ pub struct WalWriter {
     next_seq: u64,
     last_chain_hash_hex: Option<String>,
     bytes_written: u64,
+    size_cap_bytes: u64,
+    /// Once a mutation crosses a write/rename boundary and then fails, this
+    /// process can no longer prove which bytes are durable. The latch is never
+    /// cleared in-process: only a restart and full replay may establish truth.
+    poisoned_reason: Option<String>,
+    pending_snapshot: Option<SnapshotProgress>,
+    pending_truncate: Option<TruncateProgress>,
     /// Test-only injection seam. Setting this AtomicBool causes the next
     /// `append_critical` / `append_metric` call to short-circuit with a
     /// synthesized `WalError::Io` BEFORE touching the file. The error
@@ -429,6 +579,65 @@ pub struct WalWriter {
     inject_io_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     inject_rename_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    inject_fault: std::sync::Arc<std::sync::Mutex<Option<WalFaultPoint>>>,
+}
+
+#[derive(Debug)]
+struct SnapshotProgress {
+    after_seq: Option<u64>,
+    max_entries: usize,
+    reader: BufReader<File>,
+    validation: WalValidationState,
+    line_num: u64,
+    out: Vec<WalEntry>,
+}
+
+#[derive(Debug)]
+struct TruncateProgress {
+    last_acked_seq: u64,
+    reader: BufReader<File>,
+    tmp: File,
+    tmp_path: PathBuf,
+    validation: WalValidationState,
+    line_num: u64,
+    last_acked: Option<WalEntry>,
+    anchor_written: bool,
+    newly_dropped: u64,
+    new_bytes: u64,
+    new_chain_hash: Option<String>,
+}
+
+fn write_progress_entry(progress: &mut TruncateProgress, entry: &WalEntry) -> Result<(), WalError> {
+    let serialized = serde_json::to_string(entry).map_err(|err| WalError::Io {
+        path: progress.tmp_path.clone(),
+        source_message: err.to_string(),
+    })?;
+    progress
+        .tmp
+        .write_all(serialized.as_bytes())
+        .map_err(|err| WalError::Io {
+            path: progress.tmp_path.clone(),
+            source_message: err.to_string(),
+        })?;
+    progress.tmp.write_all(b"\n").map_err(|err| WalError::Io {
+        path: progress.tmp_path.clone(),
+        source_message: err.to_string(),
+    })?;
+    progress.new_bytes = progress
+        .new_bytes
+        .saturating_add(serialized.len() as u64 + 1);
+    progress.new_chain_hash = Some(sha256_hex(entry.event_canonical_json.as_bytes()));
+    Ok(())
+}
+
+fn write_progress_anchor(progress: &mut TruncateProgress) -> Result<(), WalError> {
+    if let Some(mut anchor) = progress.last_acked.take() {
+        anchor.acked_anchor = true;
+        write_progress_entry(progress, &anchor)?;
+    }
+    progress.anchor_written = true;
+    Ok(())
 }
 
 impl WalWriter {
@@ -438,20 +647,59 @@ impl WalWriter {
     /// `WalError::ChainBroken` so the daemon can refuse to come up with a
     /// corrupt audit history.
     pub fn open(path: &Path) -> Result<Self, WalError> {
+        Self::open_with_cap(path, u64::MAX)
+    }
+
+    /// Open with a strict on-disk byte cap. Existing evidence is never
+    /// truncated to satisfy the cap: an oversized WAL refuses startup, and an
+    /// append that would cross the cap fails before touching disk or sequence
+    /// state. Only an authenticated drain ACK may reclaim bytes.
+    pub fn open_with_cap(path: &Path, size_cap_bytes: u64) -> Result<Self, WalError> {
         // Read any existing content first so we can compute resume state.
         // Then re-open with create + append for writes.
-        let (next_seq, last_chain_hash_hex, bytes) = match std::fs::read_to_string(path) {
-            Ok(contents) => replay_existing(&contents).map_err(|e| match e {
-                WalError::Parse { .. } | WalError::ChainBroken { .. } => e,
-                other => other,
-            })?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (0u64, None, 0u64),
+        let existing = match File::open(path) {
+            Ok(file) => {
+                let metadata = file.metadata().map_err(|err| WalError::Io {
+                    path: path.to_path_buf(),
+                    source_message: err.to_string(),
+                })?;
+                if metadata.len() > size_cap_bytes {
+                    return Err(WalError::CapacityExceeded {
+                        cap_bytes: size_cap_bytes,
+                        current_bytes: metadata.len(),
+                        attempted_bytes: 0,
+                    });
+                }
+                let mut contents = String::new();
+                file.take(size_cap_bytes.saturating_add(1))
+                    .read_to_string(&mut contents)
+                    .map_err(|err| WalError::Io {
+                        path: path.to_path_buf(),
+                        source_message: err.to_string(),
+                    })?;
+                if contents.len() as u64 > size_cap_bytes {
+                    return Err(WalError::CapacityExceeded {
+                        cap_bytes: size_cap_bytes,
+                        current_bytes: contents.len() as u64,
+                        attempted_bytes: 0,
+                    });
+                }
+                Some(contents)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => {
                 return Err(WalError::Io {
                     path: path.to_path_buf(),
                     source_message: err.to_string(),
                 })
             }
+        };
+        let (next_seq, last_chain_hash_hex, bytes) = match existing {
+            Some(contents) => replay_existing(&contents).map_err(|e| match e {
+                WalError::Parse { .. } | WalError::ChainBroken { .. } => e,
+                other => other,
+            })?,
+            None => (0u64, None, 0u64),
         };
 
         if let Some(parent) = path.parent() {
@@ -471,16 +719,39 @@ impl WalWriter {
             path: path.to_path_buf(),
             source_message: err.to_string(),
         })?;
+        let opened_len = file
+            .metadata()
+            .map_err(|err| WalError::Io {
+                path: path.to_path_buf(),
+                source_message: err.to_string(),
+            })?
+            .len();
+        if opened_len != bytes {
+            return Err(WalError::Io {
+                path: path.to_path_buf(),
+                source_message: "WAL changed while startup replay was in progress".to_string(),
+            });
+        }
+        if bytes > size_cap_bytes {
+            return Err(WalError::CapacityExceeded {
+                cap_bytes: size_cap_bytes,
+                current_bytes: bytes,
+                attempted_bytes: 0,
+            });
+        }
         // On Linux the open does not enforce perms when the file already
         // exists (umask applies only to create). Set explicitly so an
         // operator-pre-created file with looser perms is corrected.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = file.metadata().map_err(|err| WalError::Io {
-                path: path.to_path_buf(),
-                source_message: err.to_string(),
-            })?.permissions();
+            let mut perms = file
+                .metadata()
+                .map_err(|err| WalError::Io {
+                    path: path.to_path_buf(),
+                    source_message: err.to_string(),
+                })?
+                .permissions();
             perms.set_mode(0o600);
             std::fs::set_permissions(path, perms).map_err(|err| WalError::Io {
                 path: path.to_path_buf(),
@@ -494,10 +765,16 @@ impl WalWriter {
             next_seq,
             last_chain_hash_hex,
             bytes_written: bytes,
+            size_cap_bytes,
+            poisoned_reason: None,
+            pending_snapshot: None,
+            pending_truncate: None,
             #[cfg(test)]
             inject_io_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             inject_rename_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            inject_fault: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -517,15 +794,69 @@ impl WalWriter {
         self.inject_rename_error.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn fault_injection_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<Option<WalFaultPoint>>> {
+        self.inject_fault.clone()
+    }
+
+    /// True after an append/rotation crossed a durable-mutation boundary and
+    /// failed. Supervisors use this independently of the writer mutex's poison
+    /// bit: ordinary `Result` errors do not poison a Rust mutex.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned_reason.is_some()
+    }
+
+    fn refuse_if_poisoned(&self) -> Result<(), WalError> {
+        match self.poisoned_reason.as_ref() {
+            Some(reason) => Err(WalError::Poisoned {
+                reason: reason.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn poison(&mut self, reason: String) -> WalError {
+        if self.poisoned_reason.is_none() {
+            self.poisoned_reason = Some(reason);
+        }
+        WalError::Poisoned {
+            reason: self
+                .poisoned_reason
+                .clone()
+                .expect("poison reason set above"),
+        }
+    }
+
+    #[cfg(test)]
+    fn take_fault(&self, point: WalFaultPoint) -> bool {
+        let Ok(mut armed) = self.inject_fault.lock() else {
+            return false;
+        };
+        if *armed == Some(point) {
+            *armed = None;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Append a critical event with `fsync` per scope-lock §8 OQ #2.
     /// Returns the assigned seq.
     pub fn append_critical(&mut self, event_canonical_json: &str) -> Result<u64, WalError> {
-        self.append(event_canonical_json, true, true)
+        self.append(event_canonical_json, true, true, false)
+    }
+
+    /// Append lifecycle/control evidence from reserved recovery headroom.
+    /// This is intentionally not used by ordinary verdict events.
+    pub fn append_control_critical(&mut self, event_canonical_json: &str) -> Result<u64, WalError> {
+        self.append(event_canonical_json, true, true, true)
     }
 
     /// Append a metric event without fsync (best-effort durability).
     pub fn append_metric(&mut self, event_canonical_json: &str) -> Result<u64, WalError> {
-        self.append(event_canonical_json, false, false)
+        self.append(event_canonical_json, false, false, false)
     }
 
     fn append(
@@ -533,7 +864,9 @@ impl WalWriter {
         event_canonical_json: &str,
         critical: bool,
         fsync: bool,
+        use_control_headroom: bool,
     ) -> Result<u64, WalError> {
+        self.refuse_if_poisoned()?;
         #[cfg(test)]
         if self
             .inject_io_error
@@ -545,6 +878,10 @@ impl WalWriter {
             });
         }
         let seq = self.next_seq;
+        let following_seq = seq.checked_add(1).ok_or_else(|| WalError::Io {
+            path: self.path.clone(),
+            source_message: "WAL sequence space exhausted before append".to_string(),
+        })?;
         let prior_sha256_hex = self.last_chain_hash_hex.clone();
         let event_canonical_json =
             add_wal_chain_fields(event_canonical_json, seq, prior_sha256_hex.as_deref())?;
@@ -557,30 +894,55 @@ impl WalWriter {
             prior_sha256_hex,
             event_canonical_json,
             critical,
+            acked_anchor: false,
         };
         let serialized = serde_json::to_string(&entry).map_err(|err| WalError::Io {
             path: self.path.clone(),
             source_message: err.to_string(),
         })?;
-        self.file
-            .write_all(serialized.as_bytes())
-            .map_err(|err| WalError::Io {
-                path: self.path.clone(),
-                source_message: err.to_string(),
-            })?;
-        self.file.write_all(b"\n").map_err(|err| WalError::Io {
-            path: self.path.clone(),
-            source_message: err.to_string(),
-        })?;
-        if fsync {
-            self.file.sync_all().map_err(|err| WalError::Io {
-                path: self.path.clone(),
-                source_message: err.to_string(),
-            })?;
+        let attempted_bytes = serialized.len() as u64 + 1;
+        let reserved = WAL_CONTROL_HEADROOM_MAX_BYTES.min(self.size_cap_bytes / 8);
+        let effective_cap = if use_control_headroom {
+            self.size_cap_bytes
+        } else {
+            self.size_cap_bytes.saturating_sub(reserved)
+        };
+        if match self.bytes_written.checked_add(attempted_bytes) {
+            Some(next) => next > effective_cap,
+            None => true,
+        } {
+            return Err(WalError::CapacityExceeded {
+                cap_bytes: self.size_cap_bytes,
+                current_bytes: self.bytes_written,
+                attempted_bytes,
+            });
         }
-        self.bytes_written += serialized.len() as u64 + 1;
+        #[cfg(test)]
+        if self.take_fault(WalFaultPoint::AppendPartialBody) {
+            let prefix_len = serialized.len().max(2) / 2;
+            if let Err(err) = self.file.write_all(&serialized.as_bytes()[..prefix_len]) {
+                return Err(self.poison(format!("append partial-body write failed: {err}")));
+            }
+            return Err(self.poison("test-injected failure after partial body write".to_string()));
+        }
+        if let Err(err) = self.file.write_all(serialized.as_bytes()) {
+            return Err(self.poison(format!("append body write became indeterminate: {err}")));
+        }
+        if let Err(err) = self.file.write_all(b"\n") {
+            return Err(self.poison(format!("append newline write became indeterminate: {err}")));
+        }
+        if fsync {
+            #[cfg(test)]
+            if self.take_fault(WalFaultPoint::AppendSyncFailure) {
+                return Err(self.poison("test-injected append fsync failure".to_string()));
+            }
+            if let Err(err) = self.file.sync_all() {
+                return Err(self.poison(format!("append fsync became indeterminate: {err}")));
+            }
+        }
+        self.bytes_written += attempted_bytes;
         self.last_chain_hash_hex = Some(sha256_hex(entry.event_canonical_json.as_bytes()));
-        self.next_seq += 1;
+        self.next_seq = following_seq;
         Ok(entry.seq)
     }
 
@@ -593,6 +955,121 @@ impl WalWriter {
         after_seq: Option<u64>,
         max_entries: usize,
     ) -> Result<Vec<WalEntry>, WalError> {
+        self.snapshot_after_impl(after_seq, max_entries, || false)
+    }
+
+    /// Shutdown-aware drain variant used by IPC handlers. Cancellation is
+    /// checked between bounded line reads and before returning the snapshot.
+    pub fn snapshot_after_cancellable(
+        &mut self,
+        after_seq: Option<u64>,
+        max_entries: usize,
+        shutdown: &AtomicBool,
+    ) -> Result<Vec<WalEntry>, WalError> {
+        self.snapshot_after_impl(after_seq, max_entries, || shutdown.load(Ordering::SeqCst))
+    }
+
+    pub fn snapshot_after_bounded(
+        &mut self,
+        after_seq: Option<u64>,
+        max_entries: usize,
+        shutdown: &AtomicBool,
+        budget: Duration,
+    ) -> Result<Vec<WalEntry>, WalError> {
+        self.refuse_if_poisoned()?;
+        if let Some(progress) = self.pending_truncate.as_ref() {
+            return Err(WalError::OperationInProgress {
+                operation: "truncate",
+                processed_bytes: progress.validation.bytes,
+            });
+        }
+        if shutdown.load(Ordering::SeqCst) {
+            self.pending_snapshot = None;
+            return Err(WalError::Cancelled);
+        }
+        if let Some(progress) = self.pending_snapshot.as_ref() {
+            if progress.after_seq != after_seq || progress.max_entries != max_entries {
+                return Err(WalError::OperationInProgress {
+                    operation: "snapshot",
+                    processed_bytes: progress.validation.bytes,
+                });
+            }
+        } else {
+            let mut reader = BufReader::new(self.file.try_clone().map_err(|err| WalError::Io {
+                path: self.path.clone(),
+                source_message: err.to_string(),
+            })?);
+            reader
+                .seek(SeekFrom::Start(0))
+                .map_err(|err| WalError::Io {
+                    path: self.path.clone(),
+                    source_message: err.to_string(),
+                })?;
+            self.pending_snapshot = Some(SnapshotProgress {
+                after_seq,
+                max_entries,
+                reader,
+                validation: WalValidationState::default(),
+                line_num: 0,
+                out: Vec::new(),
+            });
+        }
+        let deadline = Instant::now() + budget;
+        let progress = self.pending_snapshot.as_mut().expect("initialized above");
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                self.pending_snapshot = None;
+                return Err(WalError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(WalError::OperationInProgress {
+                    operation: "snapshot",
+                    processed_bytes: progress.validation.bytes,
+                });
+            }
+            let mut line = String::new();
+            let read = progress
+                .reader
+                .read_line(&mut line)
+                .map_err(|err| WalError::Io {
+                    path: self.path.clone(),
+                    source_message: err.to_string(),
+                })?;
+            if read == 0 {
+                let done = self.pending_snapshot.take().expect("snapshot exists");
+                return Ok(done.out);
+            }
+            progress.line_num += 1;
+            let row = line.strip_suffix('\n').unwrap_or(&line);
+            let row = row.strip_suffix('\r').unwrap_or(row);
+            let entry = match validate_wal_line(row, progress.line_num, &mut progress.validation) {
+                Ok(entry) => entry,
+                Err(err) => {
+                    self.pending_snapshot = None;
+                    return Err(err);
+                }
+            };
+            let is_after = !entry.acked_anchor
+                && progress
+                    .after_seq
+                    .map_or(true, |threshold| entry.seq > threshold);
+            if is_after {
+                progress.out.push(entry);
+                if progress.out.len() == progress.max_entries {
+                    let done = self.pending_snapshot.take().expect("snapshot exists");
+                    return Ok(done.out);
+                }
+            }
+        }
+    }
+
+    fn snapshot_after_impl(
+        &mut self,
+        after_seq: Option<u64>,
+        max_entries: usize,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Vec<WalEntry>, WalError> {
+        self.refuse_if_poisoned()?;
         // Rewind the file pointer to the start so BufReader sees everything.
         self.file
             .seek(SeekFrom::Start(0))
@@ -605,28 +1082,28 @@ impl WalWriter {
             source_message: err.to_string(),
         })?);
         let mut out = Vec::new();
+        let mut validation = WalValidationState::default();
         for (index, line) in reader.lines().enumerate() {
+            if cancelled() {
+                let _ = self.file.seek(SeekFrom::End(0));
+                return Err(WalError::Cancelled);
+            }
             let line_num = (index as u64) + 1;
             let line = line.map_err(|err| WalError::Io {
                 path: self.path.clone(),
                 source_message: err.to_string(),
             })?;
-            if line.is_empty() {
-                continue;
-            }
-            let entry: WalEntry =
-                serde_json::from_str(&line).map_err(|err| WalError::Parse {
-                    line: line_num,
-                    source_message: err.to_string(),
-                })?;
-            if let Some(threshold) = after_seq {
-                if entry.seq <= threshold {
-                    continue;
+            let entry = validate_wal_line(&line, line_num, &mut validation)?;
+            let is_after = !entry.acked_anchor
+                && match after_seq {
+                    Some(threshold) => entry.seq > threshold,
+                    None => true,
+                };
+            if is_after && out.len() < max_entries {
+                out.push(entry);
+                if out.len() == max_entries {
+                    break;
                 }
-            }
-            out.push(entry);
-            if out.len() >= max_entries {
-                break;
             }
         }
         // Restore append position for subsequent writes.
@@ -636,16 +1113,224 @@ impl WalWriter {
                 path: self.path.clone(),
                 source_message: err.to_string(),
             })?;
+        if cancelled() {
+            return Err(WalError::Cancelled);
+        }
         Ok(out)
     }
 
-    /// Drop all WAL entries with seq <= `last_acked_seq`. Atomic: writes a
-    /// new WAL to `<path>.tmp`, fsyncs, atomically renames over the live
-    /// file, then re-opens for append. Returns the count truncated.
+    /// Logically drop all WAL entries with seq <= `last_acked_seq`. One last
+    /// ACKed row is retained as a physical chain anchor but is never drained.
+    /// Atomic: writes a new WAL to `<path>.tmp`, fsyncs, atomically renames
+    /// over the live file, then re-opens for append. Returns the count newly
+    /// acknowledged (the retained anchor is included in that logical count).
     pub fn truncate_through_seq(&mut self, last_acked_seq: u64) -> Result<u64, WalError> {
+        self.truncate_through_seq_impl(last_acked_seq, || false)
+    }
+
+    /// Shutdown-aware ACK transaction. Cancellation before rename removes the
+    /// private temporary file and leaves the live WAL/in-memory chain intact.
+    pub fn truncate_through_seq_cancellable(
+        &mut self,
+        last_acked_seq: u64,
+        shutdown: &AtomicBool,
+    ) -> Result<u64, WalError> {
+        self.truncate_through_seq_impl(last_acked_seq, || shutdown.load(Ordering::SeqCst))
+    }
+
+    pub fn truncate_through_seq_bounded(
+        &mut self,
+        last_acked_seq: u64,
+        shutdown: &AtomicBool,
+        budget: Duration,
+    ) -> Result<u64, WalError> {
+        self.refuse_if_poisoned()?;
+        if let Some(progress) = self.pending_snapshot.as_ref() {
+            return Err(WalError::OperationInProgress {
+                operation: "snapshot",
+                processed_bytes: progress.validation.bytes,
+            });
+        }
+        if shutdown.load(Ordering::SeqCst) {
+            if let Some(progress) = self.pending_truncate.take() {
+                let _ = std::fs::remove_file(progress.tmp_path);
+            }
+            return Err(WalError::Cancelled);
+        }
+        if let Some(progress) = self.pending_truncate.as_ref() {
+            if progress.last_acked_seq != last_acked_seq {
+                return Err(WalError::OperationInProgress {
+                    operation: "truncate",
+                    processed_bytes: progress.validation.bytes,
+                });
+            }
+        } else {
+            let tmp_path = self.path.with_extension("tmp");
+            let mut opts = OpenOptions::new();
+            opts.create(true).truncate(true).write(true).read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let tmp = opts.open(&tmp_path).map_err(|err| WalError::Io {
+                path: tmp_path.clone(),
+                source_message: err.to_string(),
+            })?;
+            let mut reader = BufReader::new(self.file.try_clone().map_err(|err| WalError::Io {
+                path: self.path.clone(),
+                source_message: err.to_string(),
+            })?);
+            reader
+                .seek(SeekFrom::Start(0))
+                .map_err(|err| WalError::Io {
+                    path: self.path.clone(),
+                    source_message: err.to_string(),
+                })?;
+            self.pending_truncate = Some(TruncateProgress {
+                last_acked_seq,
+                reader,
+                tmp,
+                tmp_path,
+                validation: WalValidationState::default(),
+                line_num: 0,
+                last_acked: None,
+                anchor_written: false,
+                newly_dropped: 0,
+                new_bytes: 0,
+                new_chain_hash: None,
+            });
+        }
+        let deadline = Instant::now() + budget;
+        loop {
+            let progress = self.pending_truncate.as_mut().expect("initialized above");
+            if shutdown.load(Ordering::SeqCst) {
+                let progress = self.pending_truncate.take().expect("truncate exists");
+                let _ = std::fs::remove_file(progress.tmp_path);
+                return Err(WalError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(WalError::OperationInProgress {
+                    operation: "truncate",
+                    processed_bytes: progress.validation.bytes,
+                });
+            }
+            let mut line = String::new();
+            let read = progress
+                .reader
+                .read_line(&mut line)
+                .map_err(|err| WalError::Io {
+                    path: self.path.clone(),
+                    source_message: err.to_string(),
+                })?;
+            if read == 0 {
+                if !progress.anchor_written {
+                    write_progress_anchor(progress)?;
+                }
+                break;
+            }
+            progress.line_num += 1;
+            let row = line.strip_suffix('\n').unwrap_or(&line);
+            let row = row.strip_suffix('\r').unwrap_or(row);
+            let entry = match validate_wal_line(row, progress.line_num, &mut progress.validation) {
+                Ok(entry) => entry,
+                Err(err) => {
+                    let failed = self.pending_truncate.take().expect("truncate exists");
+                    let _ = std::fs::remove_file(failed.tmp_path);
+                    return Err(err);
+                }
+            };
+            if entry.seq <= last_acked_seq {
+                if !entry.acked_anchor {
+                    progress.newly_dropped =
+                        progress
+                            .newly_dropped
+                            .checked_add(1)
+                            .ok_or_else(|| WalError::Parse {
+                                line: progress.line_num,
+                                source_message: "WAL acknowledged-entry count overflow".to_string(),
+                            })?;
+                }
+                progress.last_acked = Some(entry);
+            } else {
+                if !progress.anchor_written {
+                    write_progress_anchor(progress)?;
+                }
+                write_progress_entry(progress, &entry)?;
+            }
+        }
+        let progress = self.pending_truncate.take().expect("truncate exists");
+        progress.tmp.sync_all().map_err(|err| WalError::Io {
+            path: progress.tmp_path.clone(),
+            source_message: err.to_string(),
+        })?;
+        drop(progress.tmp);
+        if shutdown.load(Ordering::SeqCst) {
+            let _ = std::fs::remove_file(&progress.tmp_path);
+            return Err(WalError::Cancelled);
+        }
+        #[cfg(test)]
+        if self
+            .inject_rename_error
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = std::fs::remove_file(&progress.tmp_path);
+            return Err(WalError::RenameFailed {
+                path: self.path.clone(),
+                source_message: "test-injected truncate rename failure".to_string(),
+            });
+        }
+        if let Err(err) = std::fs::rename(&progress.tmp_path, &self.path) {
+            let _ = std::fs::remove_file(&progress.tmp_path);
+            return Err(WalError::RenameFailed {
+                path: self.path.clone(),
+                source_message: err.to_string(),
+            });
+        }
+        if let Some(parent) = self.path.parent().map(Path::to_path_buf) {
+            #[cfg(test)]
+            if self.take_fault(WalFaultPoint::TruncateParentSyncFailure) {
+                return Err(self.poison(
+                    "test-injected parent-directory fsync failure after WAL rename".to_string(),
+                ));
+            }
+            File::open(&parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|err| {
+                    self.poison(format!(
+                        "parent-directory fsync after WAL rename failed: {err}"
+                    ))
+                })?;
+        }
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true).read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        #[cfg(test)]
+        if self.take_fault(WalFaultPoint::TruncateReopenFailure) {
+            return Err(self.poison("test-injected WAL reopen failure after rename".to_string()));
+        }
+        self.file = opts
+            .open(&self.path)
+            .map_err(|err| self.poison(format!("WAL reopen after rename failed: {err}")))?;
+        self.bytes_written = progress.new_bytes;
+        self.last_chain_hash_hex = progress.new_chain_hash;
+        Ok(progress.newly_dropped)
+    }
+
+    fn truncate_through_seq_impl(
+        &mut self,
+        last_acked_seq: u64,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<u64, WalError> {
+        self.refuse_if_poisoned()?;
         let tmp_path = self.path.with_extension("tmp");
-        let mut keepers: Vec<WalEntry> = Vec::new();
-        // Read everything; carry forward the entries strictly above the ack.
+        let mut last_acked: Option<WalEntry> = None;
+        // First pass validates the complete live WAL and identifies the one
+        // anchor. Unacked rows are deliberately NOT accumulated in memory.
         self.file
             .seek(SeekFrom::Start(0))
             .map_err(|err| WalError::Io {
@@ -656,27 +1341,36 @@ impl WalWriter {
             path: self.path.clone(),
             source_message: err.to_string(),
         })?);
-        let mut total_seen: u64 = 0;
+        let mut newly_dropped: u64 = 0;
+        let mut validation = WalValidationState::default();
         for (index, line) in reader.lines().enumerate() {
+            if cancelled() {
+                let _ = self.file.seek(SeekFrom::End(0));
+                return Err(WalError::Cancelled);
+            }
             let line_num = (index as u64) + 1;
             let line = line.map_err(|err| WalError::Io {
                 path: self.path.clone(),
                 source_message: err.to_string(),
             })?;
-            if line.is_empty() {
-                continue;
-            }
-            let entry: WalEntry =
-                serde_json::from_str(&line).map_err(|err| WalError::Parse {
-                    line: line_num,
-                    source_message: err.to_string(),
-                })?;
-            total_seen += 1;
-            if entry.seq > last_acked_seq {
-                keepers.push(entry);
+            let entry = validate_wal_line(&line, line_num, &mut validation)?;
+            if entry.seq <= last_acked_seq {
+                if !entry.acked_anchor {
+                    newly_dropped =
+                        newly_dropped
+                            .checked_add(1)
+                            .ok_or_else(|| WalError::Parse {
+                                line: line_num,
+                                source_message: "WAL acknowledged-entry count overflow".to_string(),
+                            })?;
+                }
+                last_acked = Some(entry);
             }
         }
-        let dropped = total_seen - keepers.len() as u64;
+        if cancelled() {
+            let _ = self.file.seek(SeekFrom::End(0));
+            return Err(WalError::Cancelled);
+        }
 
         // Rewrite to .tmp, then atomic-rename. fsync between write and
         // rename so the rename's metadata sees the durable bytes.
@@ -693,7 +1387,10 @@ impl WalWriter {
         })?;
         let mut new_bytes: u64 = 0;
         let mut new_chain_hash: Option<String> = None;
-        for entry in &keepers {
+        let mut write_entry = |entry: &WalEntry| -> Result<(), WalError> {
+            if cancelled() {
+                return Err(WalError::Cancelled);
+            }
             let serialized = serde_json::to_string(entry).map_err(|err| WalError::Io {
                 path: tmp_path.clone(),
                 source_message: err.to_string(),
@@ -709,12 +1406,62 @@ impl WalWriter {
             })?;
             new_bytes += serialized.len() as u64 + 1;
             new_chain_hash = Some(sha256_hex(entry.event_canonical_json.as_bytes()));
+            Ok(())
+        };
+        if let Some(mut anchor) = last_acked {
+            anchor.acked_anchor = true;
+            if let Err(err) = write_entry(&anchor) {
+                drop(tmp);
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(err);
+            }
+        }
+
+        // Second pass streams retained rows directly into the private file.
+        // Memory is O(one row), and the deadline check between every row bounds
+        // how long the shared WAL mutex can be monopolized by a large ACK.
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|err| WalError::Io {
+                path: self.path.clone(),
+                source_message: err.to_string(),
+            })?;
+        let reader = BufReader::new(self.file.try_clone().map_err(|err| WalError::Io {
+            path: self.path.clone(),
+            source_message: err.to_string(),
+        })?);
+        let mut validation = WalValidationState::default();
+        for (index, line) in reader.lines().enumerate() {
+            if cancelled() {
+                drop(tmp);
+                let _ = std::fs::remove_file(&tmp_path);
+                let _ = self.file.seek(SeekFrom::End(0));
+                return Err(WalError::Cancelled);
+            }
+            let line_num = (index as u64) + 1;
+            let line = line.map_err(|err| WalError::Io {
+                path: self.path.clone(),
+                source_message: err.to_string(),
+            })?;
+            let entry = validate_wal_line(&line, line_num, &mut validation)?;
+            if entry.seq > last_acked_seq {
+                if let Err(err) = write_entry(&entry) {
+                    drop(tmp);
+                    let _ = std::fs::remove_file(&tmp_path);
+                    let _ = self.file.seek(SeekFrom::End(0));
+                    return Err(err);
+                }
+            }
         }
         tmp.sync_all().map_err(|err| WalError::Io {
             path: tmp_path.clone(),
             source_message: err.to_string(),
         })?;
         drop(tmp);
+        if cancelled() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(WalError::Cancelled);
+        }
         #[cfg(test)]
         if self
             .inject_rename_error
@@ -734,6 +1481,26 @@ impl WalWriter {
             });
         }
 
+        // A successful rename is not durable until the containing directory's
+        // metadata is synced.  Do this before updating in-memory state and
+        // before the IPC layer can acknowledge reclamation; otherwise a power
+        // loss may resurrect ACKed evidence after main was told it was gone.
+        if let Some(parent) = self.path.parent().map(Path::to_path_buf) {
+            #[cfg(test)]
+            if self.take_fault(WalFaultPoint::TruncateParentSyncFailure) {
+                return Err(self.poison(
+                    "test-injected parent-directory fsync failure after WAL rename".to_string(),
+                ));
+            }
+            std::fs::File::open(&parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|err| {
+                    self.poison(format!(
+                        "parent-directory fsync after WAL rename failed: {err}"
+                    ))
+                })?;
+        }
+
         // Re-open the now-replaced file for append.
         let mut opts = OpenOptions::new();
         opts.create(true).append(true).read(true);
@@ -742,13 +1509,17 @@ impl WalWriter {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        self.file = opts.open(&self.path).map_err(|err| WalError::Io {
-            path: self.path.clone(),
-            source_message: err.to_string(),
-        })?;
+        #[cfg(test)]
+        if self.take_fault(WalFaultPoint::TruncateReopenFailure) {
+            return Err(self.poison("test-injected WAL reopen failure after rename".to_string()));
+        }
+        self.file = match opts.open(&self.path) {
+            Ok(file) => file,
+            Err(err) => return Err(self.poison(format!("WAL reopen after rename failed: {err}"))),
+        };
         self.bytes_written = new_bytes;
         self.last_chain_hash_hex = new_chain_hash;
-        Ok(dropped)
+        Ok(newly_dropped)
     }
 
     pub fn path(&self) -> &Path {
@@ -769,62 +1540,201 @@ impl WalWriter {
 }
 
 fn replay_existing(contents: &str) -> Result<(u64, Option<String>, u64), WalError> {
-    let mut next_seq = 0u64;
-    let mut last_chain_hash: Option<String> = None;
-    let mut bytes: u64 = 0;
+    let mut state = WalValidationState::default();
     for (index, line) in contents.lines().enumerate() {
         let line_num = (index as u64) + 1;
-        if line.is_empty() {
-            continue;
-        }
-        let entry: WalEntry = serde_json::from_str(line).map_err(|err| WalError::Parse {
+        validate_wal_line(line, line_num, &mut state)?;
+    }
+    Ok((state.next_seq, state.last_chain_hash, state.bytes))
+}
+
+#[derive(Debug, Default)]
+struct WalValidationState {
+    previous_seq: Option<u64>,
+    next_seq: u64,
+    last_chain_hash: Option<String>,
+    bytes: u64,
+}
+
+/// Parse and validate one exact on-disk row before it may be drained or used
+/// by an ACK transaction. Re-running this check for snapshots/truncation is
+/// deliberate: startup validation cannot protect against later disk mutation.
+fn validate_wal_line(
+    line: &str,
+    line_num: u64,
+    state: &mut WalValidationState,
+) -> Result<WalEntry, WalError> {
+    if line.is_empty() {
+        return Err(WalError::Parse {
             line: line_num,
-            source_message: err.to_string(),
-        })?;
-        // Reject entries whose `prior_sha256_hex` is structurally
-        // malformed before any chain comparison: the field must be
-        // exactly 64 lowercase hex chars or `None`. A non-conforming
-        // string can never be the legitimate output of an earlier
-        // append (which writes via `sha256_hex`), so accepting it
-        // would smuggle untyped corruption past the chain check
-        // whenever the comparison happened to match by accident.
-        // Per full-sweep #74.
-        if let Some(prior) = entry.prior_sha256_hex.as_deref() {
-            if !is_canonical_lowercase_sha256_hex(prior) {
-                return Err(WalError::MalformedPriorHash {
-                    seq: entry.seq,
-                    found: prior.to_string(),
-                });
-            }
+            source_message: "empty interior WAL row".to_string(),
+        });
+    }
+    let entry: WalEntry = serde_json::from_str(line).map_err(|err| WalError::Parse {
+        line: line_num,
+        source_message: err.to_string(),
+    })?;
+    let exact = serde_json::to_string(&entry).map_err(|err| WalError::Parse {
+        line: line_num,
+        source_message: format!("WAL row reserialization failed: {err}"),
+    })?;
+    if exact != line {
+        return Err(WalError::Parse {
+            line: line_num,
+            source_message:
+                "WAL row is not the exact canonical writer encoding (duplicate, unknown, reordered, or decorated fields)"
+                    .to_string(),
+        });
+    }
+
+    if let Some(prior) = entry.prior_sha256_hex.as_deref() {
+        if !is_canonical_lowercase_sha256_hex(prior) {
+            return Err(WalError::MalformedPriorHash {
+                seq: entry.seq,
+                found: prior.to_string(),
+            });
         }
-        // Verify chain integrity. Two valid shapes for the first remaining
-        // WAL line: (a) genesis (entry.seq == 0, prior_sha256_hex == None)
-        // or (b) post-truncate first entry (entry.seq > 0, prior_sha256_hex
-        // points at an already-ACKed entry no longer on disk; cannot verify
-        // locally). A genesis entry with a non-None prior_sha256_hex is
-        // tampering and must be rejected. Subsequent entries follow the
-        // standard chain check.
-        let is_first_iteration = next_seq == 0;
-        if is_first_iteration {
-            if entry.seq == 0 && entry.prior_sha256_hex.is_some() {
+    }
+
+    match state.previous_seq {
+        None => match (
+            entry.seq,
+            entry.prior_sha256_hex.as_ref(),
+            entry.acked_anchor,
+        ) {
+            (0, None, _) => {}
+            (0, Some(_), _) => {
                 return Err(WalError::ChainBroken {
                     seq: entry.seq,
                     expected: None,
                     found: entry.prior_sha256_hex.clone(),
+                })
+            }
+            (_, None, _) => {
+                return Err(WalError::Parse {
+                    line: line_num,
+                    source_message:
+                        "post-truncation first row must retain its non-null predecessor anchor"
+                            .to_string(),
+                })
+            }
+            (_, Some(_), true) => {}
+            (_, Some(_), false) => {
+                return Err(WalError::Parse {
+                    line: line_num,
+                    source_message: "post-truncation first row must be the retained ACK anchor"
+                        .to_string(),
+                })
+            }
+        },
+        Some(previous) => {
+            if entry.acked_anchor {
+                return Err(WalError::Parse {
+                    line: line_num,
+                    source_message: "ACK anchor may appear only as the first WAL row".to_string(),
                 });
             }
-        } else if entry.prior_sha256_hex != last_chain_hash {
-            return Err(WalError::ChainBroken {
-                seq: entry.seq,
-                expected: last_chain_hash.clone(),
-                found: entry.prior_sha256_hex.clone(),
-            });
+            let expected_seq = previous.checked_add(1).ok_or_else(|| WalError::Parse {
+                line: line_num,
+                source_message: "WAL sequence space exhausted".to_string(),
+            })?;
+            if entry.seq != expected_seq {
+                return Err(WalError::Parse {
+                    line: line_num,
+                    source_message: format!(
+                        "WAL sequence must increase by exactly one: expected {expected_seq}, found {}",
+                        entry.seq
+                    ),
+                });
+            }
+            if entry.prior_sha256_hex != state.last_chain_hash {
+                return Err(WalError::ChainBroken {
+                    seq: entry.seq,
+                    expected: state.last_chain_hash.clone(),
+                    found: entry.prior_sha256_hex.clone(),
+                });
+            }
         }
-        next_seq = entry.seq + 1;
-        last_chain_hash = Some(sha256_hex(entry.event_canonical_json.as_bytes()));
-        bytes += line.len() as u64 + 1;
     }
-    Ok((next_seq, last_chain_hash, bytes))
+
+    let event: serde_json::Value =
+        serde_json::from_str(&entry.event_canonical_json).map_err(|err| WalError::Parse {
+            line: line_num,
+            source_message: format!("event_canonical_json is invalid JSON: {err}"),
+        })?;
+    let event_object = event.as_object().ok_or_else(|| WalError::Parse {
+        line: line_num,
+        source_message: "event_canonical_json must be a JSON object".to_string(),
+    })?;
+    let recanonicalized =
+        crate::manifest::canonical_json::canonicalize(&event).map_err(|err| WalError::Parse {
+            line: line_num,
+            source_message: format!("event canonicalization failed: {err:?}"),
+        })?;
+    if recanonicalized != entry.event_canonical_json {
+        return Err(WalError::Parse {
+            line: line_num,
+            source_message: "event_canonical_json is not canonical".to_string(),
+        });
+    }
+    let details = event_object
+        .get("details")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| WalError::Parse {
+            line: line_num,
+            source_message: "event details must be an object containing WAL chain fields"
+                .to_string(),
+        })?;
+    let inner_seq = details
+        .get("seq")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| WalError::Parse {
+            line: line_num,
+            source_message: "event details.seq must be a u64".to_string(),
+        })?;
+    if inner_seq != entry.seq {
+        return Err(WalError::Parse {
+            line: line_num,
+            source_message: format!(
+                "event details.seq does not match outer seq: inner {inner_seq}, outer {}",
+                entry.seq
+            ),
+        });
+    }
+    let inner_prior = match details.get("prior_sha256_hex") {
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => Some(value.clone()),
+        _ => {
+            return Err(WalError::Parse {
+                line: line_num,
+                source_message: "event details.prior_sha256_hex must be null or a string"
+                    .to_string(),
+            })
+        }
+    };
+    if inner_prior != entry.prior_sha256_hex {
+        return Err(WalError::Parse {
+            line: line_num,
+            source_message:
+                "event details.prior_sha256_hex does not match outer predecessor anchor".to_string(),
+        });
+    }
+
+    state.next_seq = entry.seq.checked_add(1).ok_or_else(|| WalError::Parse {
+        line: line_num,
+        source_message: "WAL sequence space exhausted".to_string(),
+    })?;
+    state.previous_seq = Some(entry.seq);
+    state.last_chain_hash = Some(sha256_hex(entry.event_canonical_json.as_bytes()));
+    state.bytes = state
+        .bytes
+        .checked_add(line.len() as u64)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| WalError::Parse {
+            line: line_num,
+            source_message: "WAL byte count overflow".to_string(),
+        })?;
+    Ok(entry)
 }
 
 fn add_wal_chain_fields(
@@ -841,7 +1751,10 @@ fn add_wal_chain_fields(
         path: PathBuf::from("<audit-event>"),
         source_message: "audit event must be a JSON object".to_string(),
     })?;
-    if !entry.get("details").is_some_and(|details| details.is_object()) {
+    if !entry
+        .get("details")
+        .is_some_and(|details| details.is_object())
+    {
         entry.insert(
             "details".to_string(),
             serde_json::Value::Object(serde_json::Map::new()),
@@ -886,6 +1799,46 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod wal_tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn chained_event(seq: u64, prior: Option<&str>, operation: &str) -> String {
+        crate::manifest::canonical_json::canonicalize(&serde_json::json!({
+            "details": {
+                "prior_sha256_hex": prior,
+                "seq": seq,
+            },
+            "operation": operation,
+        }))
+        .unwrap()
+    }
+
+    fn read_entries(path: &Path) -> Vec<WalEntry> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn write_entries(path: &Path, entries: &[WalEntry]) {
+        let mut bytes = entries
+            .iter()
+            .map(|entry| serde_json::to_string(entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !entries.is_empty() {
+            bytes.push('\n');
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn replace_inner_chain(entry: &mut WalEntry, seq: u64, prior: Option<&str>) {
+        let mut event: serde_json::Value =
+            serde_json::from_str(&entry.event_canonical_json).unwrap();
+        let details = event["details"].as_object_mut().unwrap();
+        details.insert("seq".to_string(), serde_json::json!(seq));
+        details.insert("prior_sha256_hex".to_string(), serde_json::json!(prior));
+        entry.event_canonical_json = crate::manifest::canonical_json::canonicalize(&event).unwrap();
+    }
 
     #[test]
     fn open_creates_wal_with_mode_0600() {
@@ -990,6 +1943,36 @@ mod wal_tests {
     }
 
     #[test]
+    fn truncate_all_retains_hidden_durable_anchor_across_restart() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wal.jsonl");
+        let mut wal = WalWriter::open(&path).unwrap();
+        wal.append_critical("{\"operation\":\"zero\"}").unwrap();
+        let last = wal.append_critical("{\"operation\":\"one\"}").unwrap();
+        assert_eq!(wal.truncate_through_seq(last).unwrap(), 2);
+        assert!(wal.snapshot_after(None, 10).unwrap().is_empty());
+        drop(wal);
+
+        let on_disk = read_entries(&path);
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].seq, 1);
+        assert!(on_disk[0].acked_anchor);
+
+        let mut restarted = WalWriter::open(&path).unwrap();
+        assert_eq!(restarted.next_seq(), 2);
+        assert_eq!(
+            restarted
+                .append_critical("{\"operation\":\"after-restart\"}")
+                .unwrap(),
+            2
+        );
+        let visible = restarted.snapshot_after(None, 10).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].seq, 2);
+        assert!(!visible[0].acked_anchor);
+    }
+
+    #[test]
     fn truncate_rename_failure_leaves_in_memory_state_unchanged() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("wal.jsonl");
@@ -1020,6 +2003,112 @@ mod wal_tests {
         assert_eq!(entries.len(), 4);
         assert_eq!(entries[3].seq, appended);
         assert_eq!(entries[3].prior_sha256_hex, before_chain);
+    }
+
+    #[test]
+    fn ambiguous_append_faults_latch_poison_and_refuse_every_later_operation() {
+        for fault in [
+            WalFaultPoint::AppendPartialBody,
+            WalFaultPoint::AppendSyncFailure,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal.jsonl");
+            let mut wal = WalWriter::open(&path).expect("open");
+            let injection = wal.fault_injection_handle();
+            *injection.lock().unwrap() = Some(fault);
+
+            assert!(matches!(
+                wal.append_critical("{\"operation\":\"ambiguous\"}"),
+                Err(WalError::Poisoned { .. })
+            ));
+            assert!(wal.is_poisoned());
+            assert!(matches!(
+                wal.append_critical("{\"operation\":\"later\"}"),
+                Err(WalError::Poisoned { .. })
+            ));
+            assert!(matches!(
+                wal.snapshot_after(None, 10),
+                Err(WalError::Poisoned { .. })
+            ));
+            assert!(matches!(
+                wal.truncate_through_seq(0),
+                Err(WalError::Poisoned { .. })
+            ));
+            drop(wal);
+            match fault {
+                WalFaultPoint::AppendPartialBody => assert!(matches!(
+                    WalWriter::open(&path),
+                    Err(WalError::Parse { .. })
+                )),
+                WalFaultPoint::AppendSyncFailure => {
+                    let mut restarted = WalWriter::open(&path).expect("restart replay");
+                    assert_eq!(
+                        restarted.snapshot_after(None, 10).unwrap().len(),
+                        1,
+                        "a full line with an ambiguous fsync result is reconciled by replay"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn post_rename_parent_sync_and_reopen_faults_latch_poison_until_restart() {
+        for fault in [
+            WalFaultPoint::TruncateParentSyncFailure,
+            WalFaultPoint::TruncateReopenFailure,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal.jsonl");
+            let mut wal = WalWriter::open(&path).expect("open");
+            wal.append_critical("{\"k\":1}").unwrap();
+            let acked = wal.append_critical("{\"k\":2}").unwrap();
+            wal.append_critical("{\"k\":3}").unwrap();
+            let injection = wal.fault_injection_handle();
+            *injection.lock().unwrap() = Some(fault);
+
+            assert!(matches!(
+                wal.truncate_through_seq(acked),
+                Err(WalError::Poisoned { .. })
+            ));
+            assert!(wal.is_poisoned());
+            assert!(matches!(
+                wal.append_critical("{\"k\":4}"),
+                Err(WalError::Poisoned { .. })
+            ));
+
+            // A fresh process may establish truth by replaying the renamed file.
+            drop(wal);
+            let mut restarted = WalWriter::open(&path).expect("restart replay");
+            let remaining = restarted.snapshot_after(None, 10).expect("snapshot");
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].seq, 2);
+        }
+    }
+
+    #[test]
+    fn cancellable_snapshot_and_truncate_abort_without_mutation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wal.jsonl");
+        let mut wal = WalWriter::open(&path).unwrap();
+        wal.append_critical("{\"k\":1}").unwrap();
+        wal.append_critical("{\"k\":2}").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let before_next = wal.next_seq();
+        let shutdown = AtomicBool::new(true);
+
+        assert!(matches!(
+            wal.snapshot_after_cancellable(None, 100, &shutdown),
+            Err(WalError::Cancelled)
+        ));
+        assert!(matches!(
+            wal.truncate_through_seq_cancellable(0, &shutdown),
+            Err(WalError::Cancelled)
+        ));
+        assert_eq!(wal.next_seq(), before_next);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!path.with_extension("tmp").exists());
     }
 
     #[test]
@@ -1055,8 +2144,9 @@ mod wal_tests {
             seq: 0,
             captured_at_unix_ms: 0u64,
             prior_sha256_hex: None,
-            event_canonical_json: "{\"first\":1}".to_string(),
+            event_canonical_json: chained_event(0, None, "first"),
             critical: true,
+            acked_anchor: false,
         };
         let entry1 = WalEntry {
             seq: 1,
@@ -1067,8 +2157,13 @@ mod wal_tests {
             prior_sha256_hex: Some(
                 "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
             ),
-            event_canonical_json: "{\"second\":2}".to_string(),
+            event_canonical_json: chained_event(
+                1,
+                Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+                "second",
+            ),
             critical: true,
+            acked_anchor: false,
         };
         let mut content = serde_json::to_string(&entry0).unwrap();
         content.push('\n');
@@ -1091,16 +2186,18 @@ mod wal_tests {
             seq: 0,
             captured_at_unix_ms: 0u64,
             prior_sha256_hex: None,
-            event_canonical_json: "{\"first\":1}".to_string(),
+            event_canonical_json: chained_event(0, None, "first"),
             critical: true,
+            acked_anchor: false,
         };
         let entry1 = WalEntry {
             seq: 1,
             captured_at_unix_ms: 0u64,
             // 8 hex chars: way too short.
             prior_sha256_hex: Some("deadbeef".to_string()),
-            event_canonical_json: "{\"second\":2}".to_string(),
+            event_canonical_json: chained_event(1, Some("deadbeef"), "second"),
             critical: true,
+            acked_anchor: false,
         };
         let mut content = serde_json::to_string(&entry0).unwrap();
         content.push('\n');
@@ -1127,8 +2224,9 @@ mod wal_tests {
             seq: 0,
             captured_at_unix_ms: 0u64,
             prior_sha256_hex: None,
-            event_canonical_json: "{\"first\":1}".to_string(),
+            event_canonical_json: chained_event(0, None, "first"),
             critical: true,
+            acked_anchor: false,
         };
         // Exactly 64 chars but with uppercase letters; canonical
         // SHA-256 hex is lowercase only.
@@ -1138,8 +2236,13 @@ mod wal_tests {
             prior_sha256_hex: Some(
                 "DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF".to_string(),
             ),
-            event_canonical_json: "{\"second\":2}".to_string(),
+            event_canonical_json: chained_event(
+                1,
+                Some("DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF"),
+                "second",
+            ),
             critical: true,
+            acked_anchor: false,
         };
         let mut content = serde_json::to_string(&entry0).unwrap();
         content.push('\n');
@@ -1148,6 +2251,118 @@ mod wal_tests {
         std::fs::write(&path, content).unwrap();
         let err = WalWriter::open(&path).unwrap_err();
         assert!(matches!(err, WalError::MalformedPriorHash { seq: 1, .. }));
+    }
+
+    #[test]
+    fn replay_rejects_duplicate_regressed_and_gapped_sequences() {
+        for mutation in ["duplicate", "regression", "gap"] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal.jsonl");
+            let mut wal = WalWriter::open(&path).unwrap();
+            wal.append_critical("{\"operation\":\"zero\"}").unwrap();
+            wal.append_critical("{\"operation\":\"one\"}").unwrap();
+            wal.append_critical("{\"operation\":\"two\"}").unwrap();
+            drop(wal);
+            let mut entries = read_entries(&path);
+            let (index, seq) = match mutation {
+                "duplicate" => (1, 0),
+                "regression" => (2, 0),
+                "gap" => (1, 2),
+                _ => unreachable!(),
+            };
+            let prior = entries[index].prior_sha256_hex.clone();
+            entries[index].seq = seq;
+            replace_inner_chain(&mut entries[index], seq, prior.as_deref());
+            write_entries(&path, &entries);
+            let err = WalWriter::open(&path).unwrap_err();
+            assert!(
+                matches!(err, WalError::Parse { .. }),
+                "{mutation} must refuse: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_requires_exact_inner_outer_chain_binding() {
+        for mutation in ["seq", "prior"] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("wal.jsonl");
+            let mut wal = WalWriter::open(&path).unwrap();
+            wal.append_critical("{\"operation\":\"zero\"}").unwrap();
+            wal.append_critical("{\"operation\":\"one\"}").unwrap();
+            drop(wal);
+            let mut entries = read_entries(&path);
+            let mut event: serde_json::Value =
+                serde_json::from_str(&entries[1].event_canonical_json).unwrap();
+            let details = event["details"].as_object_mut().unwrap();
+            if mutation == "seq" {
+                details.insert("seq".to_string(), serde_json::json!(0));
+            } else {
+                details.insert("prior_sha256_hex".to_string(), serde_json::Value::Null);
+            }
+            entries[1].event_canonical_json =
+                crate::manifest::canonical_json::canonicalize(&event).unwrap();
+            write_entries(&path, &entries);
+            assert!(matches!(
+                WalWriter::open(&path),
+                Err(WalError::Parse { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn replay_requires_post_truncation_anchor_and_canonical_event() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wal.jsonl");
+        let mut wal = WalWriter::open(&path).unwrap();
+        wal.append_critical("{\"operation\":\"zero\"}").unwrap();
+        wal.append_critical("{\"operation\":\"one\"}").unwrap();
+        wal.truncate_through_seq(0).unwrap();
+        drop(wal);
+        assert_eq!(WalWriter::open(&path).unwrap().next_seq(), 2);
+
+        let mut entries = read_entries(&path);
+        entries[0].prior_sha256_hex = None;
+        replace_inner_chain(&mut entries[0], 1, None);
+        write_entries(&path, &entries);
+        assert!(matches!(
+            WalWriter::open(&path),
+            Err(WalError::Parse { .. })
+        ));
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("noncanonical.wal");
+        let mut wal = WalWriter::open(&path).unwrap();
+        wal.append_critical("{\"operation\":\"zero\"}").unwrap();
+        drop(wal);
+        let mut entries = read_entries(&path);
+        entries[0].event_canonical_json = format!(" {}", entries[0].event_canonical_json);
+        write_entries(&path, &entries);
+        assert!(matches!(
+            WalWriter::open(&path),
+            Err(WalError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn ack_revalidates_disk_and_never_drops_distinct_duplicate_sequence() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wal.jsonl");
+        let mut wal = WalWriter::open(&path).unwrap();
+        wal.append_critical("{\"operation\":\"zero\"}").unwrap();
+        wal.append_critical("{\"operation\":\"one\"}").unwrap();
+        let mut entries = read_entries(&path);
+        let prior = entries[1].prior_sha256_hex.clone();
+        entries[1].seq = 0;
+        replace_inner_chain(&mut entries[1], 0, prior.as_deref());
+        write_entries(&path, &entries);
+        let tampered = std::fs::read(&path).unwrap();
+
+        assert!(matches!(
+            wal.truncate_through_seq(0),
+            Err(WalError::Parse { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), tampered);
     }
 
     #[test]

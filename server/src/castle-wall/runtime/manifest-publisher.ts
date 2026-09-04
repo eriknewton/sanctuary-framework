@@ -34,10 +34,12 @@ import type { AllowlistRule } from "../allowlist/schema.js";
 import { encodeRuleFilename, parseRuleId } from "../allowlist/rule-identity.js";
 import { RuntimeManifestPublishError } from "./errors.js";
 import { ED25519_SIGNATURE_BYTES } from "../../core/crypto-suite-registry.js";
+import { parseIsoInstantWithOffset } from "../../core/time.js";
 // `rule.id` is type-checked just above but is unbounded in length, so the
 // diagnostic goes through the untrusted-diagnostic chokepoint for its length
 // bound (STATE-STORE-ERRMSG-INTERP-01).
 import { describeUntrusted } from "../../errors/index.js";
+import type { IpcClient } from "./ipc-client.js";
 
 /**
  * Encrypted private-key material for the LOCAL (dev/test) signing path. Under
@@ -91,10 +93,55 @@ export interface ManifestStorage {
   removeRule(filename: string): Promise<void>;
 }
 
+/**
+ * Server-profile storage adapter. It buffers the complete generated rule set
+ * and sends manifest+rules in one authenticated IPC request; it has no path or
+ * host-filesystem authority. The root daemon durably stages, verifies, and
+ * atomically activates the bundle before acknowledging it.
+ */
+export class BrokerManifestStorage implements ManifestStorage {
+  private readonly rules = new Map<string, Uint8Array>();
+
+  constructor(private readonly client: IpcClient) {}
+
+  async writeRule(filename: string, bytes: Uint8Array): Promise<void> {
+    if (this.rules.has(filename)) {
+      throw new RuntimeManifestPublishError(`duplicate broker rule file: ${describeUntrusted(filename)}`);
+    }
+    this.rules.set(filename, new Uint8Array(bytes));
+  }
+
+  async atomicRenameManifest(bytes: Uint8Array): Promise<void> {
+    const response = await this.client.publishPolicyBundle(
+      bytes,
+      [...this.rules].map(([file, body]) => ({ file, bytes: body }))
+    );
+    if (!response.ok) {
+      throw new RuntimeManifestPublishError(
+        `daemon refused policy bundle publication: ${response.error ?? "unknown error"}`
+      );
+    }
+  }
+
+  async listRules(): Promise<string[]> {
+    return [];
+  }
+
+  async removeRule(_filename: string): Promise<void> {
+    // Complete-set replacement makes orphan deletion a daemon-side generation
+    // concern. No path-based delete request crosses the broker boundary.
+  }
+}
+
 /** Inputs to `buildSignedManifest`. */
 export interface BuildSignedManifestInput {
   fortressId: string;
   issuedAt: string;
+  /**
+   * Explicit monotonic publication generation. Server-profile callers must
+   * supply this; legacy/local callers may omit it and use the issued-at epoch.
+   */
+  generation?: number;
   rules: ReadonlyArray<AllowlistRule>;
   /** Signing handle (helper-backed in prod, local-backed in dev/test). */
   signer: ManifestSigner;
@@ -179,6 +226,23 @@ export async function buildSignedManifest(input: BuildSignedManifestInput): Prom
     issued_at: input.issuedAt,
     rules: entries,
   };
+  // Server-profile callers provide an explicit monotonic generation. The
+  // issued-at epoch fallback preserves the legacy/local API, but the daemon's
+  // durable high-water mark remains authoritative and refuses collisions or
+  // rollback. Opaque legacy timestamps retain the old generation-0 wire shape.
+  const generation =
+    input.generation ?? parseIsoInstantWithOffset(input.issuedAt);
+  if (
+    typeof generation === "number" &&
+    Number.isSafeInteger(generation) &&
+    generation > 0
+  ) {
+    manifest.generation = generation;
+  } else if (input.generation !== undefined) {
+    throw new RuntimeManifestPublishError(
+      "manifest generation must be a positive safe integer"
+    );
+  }
 
   // Additive agent-origin descriptor. A malformed candidate is dropped (field
   // omitted) so a half-built descriptor is never signed. Omitting the field

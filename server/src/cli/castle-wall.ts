@@ -2004,6 +2004,7 @@ export async function runDaemon(
     const {
       maybeActivateLinuxProducerSignedCastleWall,
       buildLinuxIpcClientKeyMaterial,
+      buildChainAnchorSourceFromAuditLog,
     } = await import("../castle-wall/runtime/index.js");
     const fortressId = fortressIdFromStoragePath(storagePath);
     try {
@@ -2017,6 +2018,11 @@ export async function runDaemon(
         fortressStoragePath: storagePath,
         key,
         auditSink: auditLog,
+        // Restore the last locally persisted producer-signed chain point before
+        // accepting a new daemon drain. Omitting this silently re-enabled the
+        // legacy null-anchor bootstrap on every direct `castle-wall daemon`
+        // restart even though the wrap entrypoint already supplied the anchor.
+        chainAnchorSource: buildChainAnchorSourceFromAuditLog(auditLog),
         env,
       });
       if (!outcome.activated) {

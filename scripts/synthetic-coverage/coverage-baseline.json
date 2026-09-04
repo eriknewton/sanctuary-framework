@@ -119,9 +119,9 @@
     {
       "assurance_row_id": "9",
       "label": "Egress enforcement: Linux (Castle Wall Phase 1)",
-      "assurance_status": "not_implemented",
+      "assurance_status": "in_flight",
       "fixtures_passed": 0,
-      "coverage_state": "not_implemented",
+      "coverage_state": "no_fixture",
       "passing_fixture_names": []
     },
     {

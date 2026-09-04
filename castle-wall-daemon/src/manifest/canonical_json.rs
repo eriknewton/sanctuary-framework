@@ -126,10 +126,7 @@ mod tests {
     #[test]
     fn object_keys_are_sorted_lexicographically() {
         let v = json!({ "b": 1, "a": 2, "c": 3 });
-        assert_eq!(
-            canonicalize(&v).unwrap(),
-            "{\"a\":2,\"b\":1,\"c\":3}"
-        );
+        assert_eq!(canonicalize(&v).unwrap(), "{\"a\":2,\"b\":1,\"c\":3}");
     }
 
     #[test]

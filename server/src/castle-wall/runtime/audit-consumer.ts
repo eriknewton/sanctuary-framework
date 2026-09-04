@@ -305,6 +305,12 @@ export interface CriticalEventEnvelope {
    */
   producer?: ProducerSignatureInput;
   /**
+   * Authenticated transport context. Durable WAL delivery deliberately uses a
+   * longer retention horizon than the live anti-replay window: an outage must
+   * not turn old-but-still-retained evidence into an ACK-and-delete event.
+   */
+  producerDelivery?: "live" | "durable_wal";
+  /**
    * Subject-binding context for producer-signed verdicts. For macOS extension
    * verdicts, the signed WAL body carries the raw audit token and the local
    * runtime supplies the fortress id. For drain-shaped events whose signed WAL
@@ -355,6 +361,7 @@ export const ACCEPTED_EVENT_TYPES: ReadonlySet<CastleWallEventType> = Object.fre
     "wal_overflow",
     "external_firewall_clobber",
     "egress_metric_batch",
+    "egress_verdict_superseded",
   ])
 );
 
@@ -457,6 +464,7 @@ export class AuditConsumer {
    * timestamp). (codex L1 HIGH #3.)
    */
   private readonly producerSigMaxAgeMs: number;
+  private readonly producerWalRetentionMs: number;
   private readonly producerSigMaxSkewMs: number;
   private readonly now: () => number;
   private readonly chainAnchorSource: ChainAnchorSource | undefined;
@@ -469,6 +477,8 @@ export class AuditConsumer {
       pinnedProducerKeyB64url?: string | null;
       /** Reject signed enforcement events older than this many ms. Default 5 min. */
       producerSigMaxAgeMs?: number;
+      /** Maximum age accepted from an authenticated durable WAL. Default 24h. */
+      producerWalRetentionMs?: number;
       /** Reject signed enforcement events dated more than this far ahead. Default 1 min. */
       producerSigMaxSkewMs?: number;
       /** Clock injection for tests. */
@@ -510,6 +520,8 @@ export class AuditConsumer {
   ) {
     this.pinnedProducerKeyB64url = options?.pinnedProducerKeyB64url ?? null;
     this.producerSigMaxAgeMs = options?.producerSigMaxAgeMs ?? 5 * 60 * 1000;
+    this.producerWalRetentionMs =
+      options?.producerWalRetentionMs ?? 24 * 60 * 60 * 1000;
     this.producerSigMaxSkewMs = options?.producerSigMaxSkewMs ?? 60 * 1000;
     this.now = options?.now ?? Date.now;
     this.chainAnchorSource = options?.chainAnchorSource;
@@ -1128,18 +1140,19 @@ export class AuditConsumer {
         reason: "producer_signed_body_prior_hash_mismatch",
       };
     }
-    // Freshness gate (anti-replay across process restart). The signature is
-    // authentic, but a captured PAST signed frame could be replayed after a
-    // restart resets the in-memory seq watermark. Reject events whose bound
-    // timestamp is too old or implausibly far in the future.
-    if (this.producerSigMaxAgeMs > 0) {
-      const ageMs = this.now() - envelope.producer.capturedAtUnixMs;
-      if (ageMs > this.producerSigMaxAgeMs) {
+    // Live delivery keeps the narrow anti-replay window. Authenticated durable
+    // WAL delivery instead uses the WAL retention horizon: retained evidence
+    // can legitimately be older after an outage. A durable rejection is never
+    // ACKed below, so a bad/future/expired row cannot be deleted or skipped.
+    const ageMs = this.now() - envelope.producer.capturedAtUnixMs;
+    const maxAgeMs = envelope.producerDelivery === "durable_wal"
+      ? this.producerWalRetentionMs
+      : this.producerSigMaxAgeMs;
+    if (maxAgeMs > 0 && ageMs > maxAgeMs) {
         return { kind: "rejected", reason: "producer_signature_stale" };
-      }
-      if (ageMs < -this.producerSigMaxSkewMs) {
-        return { kind: "rejected", reason: "producer_signature_future_dated" };
-      }
+    }
+    if (ageMs < -this.producerSigMaxSkewMs) {
+      return { kind: "rejected", reason: "producer_signature_future_dated" };
     }
     return {
       kind: "verified",
@@ -1172,10 +1185,13 @@ export class AuditConsumer {
       "failure",
     );
     await this.sink.flush();
-    // Fail closed: do NOT persist as enforcement evidence, do NOT advance the
-    // chain. We DO ACK so the daemon stops re-delivering a packet we have
-    // permanently refused; the refusal is durably recorded above for audit.
-    await this.tryAck(envelope, "producer_signature_rejected");
+    // A live forged frame may be durably refused and settled. A durable-WAL
+    // frame is different: ACK is destructive authority over retained evidence.
+    // Leave every rejected WAL row unacked so the drain stops at the exact bad
+    // sequence and activation remains unhealthy until an operator resolves it.
+    if (envelope.producerDelivery !== "durable_wal") {
+      await this.tryAck(envelope, "producer_signature_rejected");
+    }
   }
 
   private async emitVerificationFailure(
@@ -1259,11 +1275,17 @@ type SignatureOutcome =
  * operation without a row added in the same change is refused fail-closed
  * (loud in CI/drills), never accepted un-corroborated.
  */
-const WAL_OPERATION_TO_EVENT_TYPE: Readonly<Record<string, CastleWallEventType>> =
+export const WAL_OPERATION_TO_EVENT_TYPE: Readonly<Record<string, CastleWallEventType>> =
   Object.freeze({
     egress_approved: "egress_allowed",
     egress_blocked: "egress_blocked",
     egress_pending: "operator_decision",
+    // A verdict superseded at the daemon's teardown fence. It MUST be mapped:
+    // `verifyProducerSignedBody` REJECTS a producer-signed event whose operation
+    // this table does not know, so an unmapped superseding record would be
+    // discarded as forgery-shaped - leaving the consumer holding the very allow
+    // receipt the record exists to correct.
+    egress_verdict_superseded: "egress_verdict_superseded",
   });
 
 /**

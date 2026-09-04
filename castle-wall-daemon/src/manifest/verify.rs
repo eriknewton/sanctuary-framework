@@ -5,16 +5,20 @@
 //! into these functions.
 
 use base64::Engine;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
+use ed25519_dalek::{Signature, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 use crate::constants::{SCHEMA_VERSION_V1, SIGNATURE_SCHEME_V1};
+use crate::crypto::{
+    castle_wall_signing_key_id, legacy_castle_wall_signing_key_id, parse_strict_verifying_key,
+};
 use crate::manifest::canonical_json::{canonicalize_to_bytes, CanonicalJsonError};
 
 /// One entry in a manifest's rules array.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestRuleEntry {
     pub rule_id: String,
     pub file: String,
@@ -26,6 +30,7 @@ pub struct ManifestRuleEntry {
 /// daemon uses that uid to emit the same `fortress/uid-N` protection subject the
 /// server/macOS path already expects.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AgentOrigin {
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -44,6 +49,7 @@ pub struct AgentOrigin {
 /// Optional operator/system-essential baseline allowlist covered by the same
 /// manifest signature as the allowlist rules.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorBaselineEssential {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,16 +62,23 @@ pub struct OperatorBaselineEssential {
 
 /// Wrapper shape for the TS `OperatorBaseline`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorBaseline {
     pub essentials: Vec<OperatorBaselineEssential>,
 }
 
 /// Unsigned manifest. Canonical-JSON of this shape is the signing input.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AllowlistManifest {
     pub schema_version: u32,
     pub fortress_id: String,
     pub issued_at: String,
+    /// Monotonic Linux policy generation. Legacy manifests deserialize as zero
+    /// for signature compatibility; once a daemon has recorded a high-water
+    /// mark, a different manifest at the same or a lower generation is refused.
+    #[serde(default, skip_serializing_if = "is_zero_generation")]
+    pub generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_origin: Option<AgentOrigin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,8 +86,13 @@ pub struct AllowlistManifest {
     pub rules: Vec<ManifestRuleEntry>,
 }
 
+fn is_zero_generation(value: &u64) -> bool {
+    *value == 0
+}
+
 /// Ed25519 signature wrapper.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestSignature {
     pub signature_scheme: String,
     pub signing_key_id: String,
@@ -83,6 +101,7 @@ pub struct ManifestSignature {
 
 /// Manifest plus signature; this is the structure persisted on disk.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SignedManifest {
     pub manifest: AllowlistManifest,
     pub signature: ManifestSignature,
@@ -91,6 +110,7 @@ pub struct SignedManifest {
 /// Body of a pinned-key rotation envelope (the bytes that are signed by both
 /// the old and the new key per scope-lock §4 OQ #1 option (a)).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RotationBody {
     pub schema_version: u32,
     pub fortress_id: String,
@@ -104,6 +124,7 @@ pub struct RotationBody {
 /// (proving the new key holder accepted custody) verify against the same
 /// canonical-JSON of `RotationBody`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CrossSignedRotation {
     pub body: RotationBody,
     pub old_key_signature_b64url: String,
@@ -116,8 +137,12 @@ pub struct CrossSignedRotation {
 /// alongside the prompt path in Checkpoint 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RotationVerifyOutcome {
-    Accepted { accepted_new_key: [u8; PUBLIC_KEY_LENGTH] },
-    Rejected { reason: String },
+    Accepted {
+        accepted_new_key: [u8; PUBLIC_KEY_LENGTH],
+    },
+    Rejected {
+        reason: String,
+    },
 }
 
 /// Verification result returned by both signature and rule-bytes paths.
@@ -212,9 +237,7 @@ pub fn verify_manifest_signature(
     sig_array.copy_from_slice(&signature_bytes);
     let signature = Signature::from_bytes(&sig_array);
 
-    let mut pk_array = [0u8; PUBLIC_KEY_LENGTH];
-    pk_array.copy_from_slice(pinned_public_key);
-    let verifying_key = match VerifyingKey::from_bytes(&pk_array) {
+    let verifying_key = match parse_strict_verifying_key(pinned_public_key) {
         Ok(k) => k,
         Err(err) => {
             return VerifyResult::Failed {
@@ -224,7 +247,30 @@ pub fn verify_manifest_signature(
         }
     };
 
-    match verifying_key.verify(&canonical, &signature) {
+    let expected_key_id = match castle_wall_signing_key_id(pinned_public_key) {
+        Ok(key_id) => key_id,
+        Err(err) => {
+            return VerifyResult::Failed {
+                reason: format!("pinned public key invalid: {}", err),
+                issues: Vec::new(),
+            }
+        }
+    };
+    let legacy_key_id = legacy_castle_wall_signing_key_id(pinned_public_key)
+        .expect("strict key was admitted above");
+    if signed.signature.signing_key_id != expected_key_id
+        && signed.signature.signing_key_id != legacy_key_id
+    {
+        return VerifyResult::Failed {
+            reason: format!(
+                "signing_key_id does not match pinned public key (expected canonical {}, got {})",
+                expected_key_id, signed.signature.signing_key_id
+            ),
+            issues: Vec::new(),
+        };
+    }
+
+    match verifying_key.verify_strict(&canonical, &signature) {
         Ok(()) => VerifyResult::Ok,
         Err(_) => VerifyResult::Failed {
             reason: "manifest signature does not verify against pinned key".to_string(),
@@ -351,9 +397,7 @@ pub fn verify_cross_signed_rotation(
         Err(reason) => return RotationVerifyOutcome::Rejected { reason },
     };
 
-    let mut old_key_arr = [0u8; PUBLIC_KEY_LENGTH];
-    old_key_arr.copy_from_slice(pinned_public_key);
-    let old_verifying_key = match VerifyingKey::from_bytes(&old_key_arr) {
+    let old_verifying_key = match parse_strict_verifying_key(pinned_public_key) {
         Ok(k) => k,
         Err(err) => {
             return RotationVerifyOutcome::Rejected {
@@ -361,9 +405,7 @@ pub fn verify_cross_signed_rotation(
             }
         }
     };
-    let mut new_key_arr = [0u8; PUBLIC_KEY_LENGTH];
-    new_key_arr.copy_from_slice(&new_key_bytes);
-    let new_verifying_key = match VerifyingKey::from_bytes(&new_key_arr) {
+    let new_verifying_key = match parse_strict_verifying_key(&new_key_bytes) {
         Ok(k) => k,
         Err(err) => {
             return RotationVerifyOutcome::Rejected {
@@ -372,19 +414,25 @@ pub fn verify_cross_signed_rotation(
         }
     };
 
-    if old_verifying_key.verify(&canonical, &old_sig).is_err() {
+    if old_verifying_key
+        .verify_strict(&canonical, &old_sig)
+        .is_err()
+    {
         return RotationVerifyOutcome::Rejected {
             reason: "rotation envelope's old_key_signature does not verify".to_string(),
         };
     }
-    if new_verifying_key.verify(&canonical, &new_sig).is_err() {
+    if new_verifying_key
+        .verify_strict(&canonical, &new_sig)
+        .is_err()
+    {
         return RotationVerifyOutcome::Rejected {
             reason: "rotation envelope's new_key_signature does not verify".to_string(),
         };
     }
 
     RotationVerifyOutcome::Accepted {
-        accepted_new_key: new_key_arr,
+        accepted_new_key: new_verifying_key.to_bytes(),
     }
 }
 
@@ -431,6 +479,7 @@ mod tests {
             schema_version: SCHEMA_VERSION_V1,
             fortress_id: "deadbeef".to_string(),
             issued_at: "2026-05-04T00:00:00Z".to_string(),
+            generation: 1,
             agent_origin: None,
             operator_baseline: None,
             rules: vec![ManifestRuleEntry {
@@ -441,13 +490,13 @@ mod tests {
         };
         let canonical = canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();
         let signature = signing_key.sign(&canonical);
-        let signature_b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(signature.to_bytes());
+        let signature_b64url =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes());
         let signed = SignedManifest {
             manifest,
             signature: ManifestSignature {
                 signature_scheme: SIGNATURE_SCHEME_V1.to_string(),
-                signing_key_id: "test-key".to_string(),
+                signing_key_id: castle_wall_signing_key_id(&verifying_key.to_bytes()).unwrap(),
                 signature_b64url,
             },
         };
@@ -458,6 +507,17 @@ mod tests {
     fn happy_path_verifies() {
         let (signed, pk) = build_signed_manifest();
         assert_eq!(verify_manifest_signature(&signed, &pk), VerifyResult::Ok);
+    }
+
+    #[test]
+    fn one_release_legacy_key_id_verifies_but_canonical_id_remains_the_publisher_format() {
+        let (mut signed, pk) = build_signed_manifest();
+        let canonical = castle_wall_signing_key_id(&pk).unwrap();
+        let legacy = legacy_castle_wall_signing_key_id(&pk).unwrap();
+        assert_ne!(canonical, legacy);
+        signed.signature.signing_key_id = legacy;
+        assert_eq!(verify_manifest_signature(&signed, &pk), VerifyResult::Ok);
+        assert_eq!(castle_wall_signing_key_id(&pk).unwrap(), canonical);
     }
 
     #[test]
@@ -485,9 +545,123 @@ mod tests {
         let (signed, _pk) = build_signed_manifest();
         let other = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
         match verify_manifest_signature(&signed, &other) {
-            VerifyResult::Failed { reason, .. } => assert!(reason.contains("does not verify")),
+            VerifyResult::Failed { reason, .. } => assert!(reason.contains("signing_key_id")),
             _ => panic!("expected failure"),
         }
+    }
+
+    #[test]
+    fn signing_key_id_relabelling_is_rejected_before_signature_acceptance() {
+        let (mut signed, pk) = build_signed_manifest();
+        signed.signature.signing_key_id = "castle-wall:attacker-label".to_string();
+        match verify_manifest_signature(&signed, &pk) {
+            VerifyResult::Failed { reason, .. } => assert!(reason.contains("signing_key_id")),
+            _ => panic!("expected key-id refusal"),
+        }
+    }
+
+    #[test]
+    fn strict_key_admission_rejects_identity_authority_key() {
+        let (mut signed, _pk) = build_signed_manifest();
+        let mut identity = [0u8; PUBLIC_KEY_LENGTH];
+        identity[0] = 1;
+        signed.signature.signing_key_id =
+            "castle-wall:AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string();
+        match verify_manifest_signature(&signed, &identity) {
+            VerifyResult::Failed { reason, .. } => assert!(reason.contains("invalid")),
+            _ => panic!("expected strict authority-key refusal"),
+        }
+    }
+
+    #[test]
+    fn signed_policy_shapes_reject_unknown_fields_at_every_nesting_level() {
+        let (signed, _pk) = build_signed_manifest();
+        let mut variants = Vec::new();
+
+        let mut top = serde_json::to_value(&signed).unwrap();
+        top.as_object_mut()
+            .unwrap()
+            .insert("future".to_string(), serde_json::json!(true));
+        variants.push(top);
+
+        let mut manifest = serde_json::to_value(&signed).unwrap();
+        manifest["manifest"]
+            .as_object_mut()
+            .unwrap()
+            .insert("future".to_string(), serde_json::json!(true));
+        variants.push(manifest);
+
+        let mut signature = serde_json::to_value(&signed).unwrap();
+        signature["signature"]
+            .as_object_mut()
+            .unwrap()
+            .insert("future".to_string(), serde_json::json!(true));
+        variants.push(signature);
+
+        let mut rule = serde_json::to_value(&signed).unwrap();
+        rule["manifest"]["rules"][0]
+            .as_object_mut()
+            .unwrap()
+            .insert("future".to_string(), serde_json::json!(true));
+        variants.push(rule);
+
+        let mut with_descriptors = signed.clone();
+        with_descriptors.manifest.agent_origin = Some(AgentOrigin {
+            mode: "uid".to_string(),
+            egress_helper_signing_id: None,
+            egress_helper_team_id: None,
+            agent_runtime_port_range: None,
+            agent_uid: Some(1001),
+            gate_uid: None,
+            system_uid_allow_ceiling: 500,
+        });
+        with_descriptors.manifest.operator_baseline = Some(OperatorBaseline {
+            essentials: vec![OperatorBaselineEssential {
+                name: "dns".to_string(),
+                signing_id: None,
+                team_id: None,
+                source_app_identifier: None,
+            }],
+        });
+        let mut origin = serde_json::to_value(&with_descriptors).unwrap();
+        origin["manifest"]["agent_origin"]
+            .as_object_mut()
+            .unwrap()
+            .insert("future".to_string(), serde_json::json!(true));
+        variants.push(origin);
+        let mut baseline = serde_json::to_value(&with_descriptors).unwrap();
+        baseline["manifest"]["operator_baseline"]
+            .as_object_mut()
+            .unwrap()
+            .insert("future".to_string(), serde_json::json!(true));
+        variants.push(baseline);
+        let mut essential = serde_json::to_value(&with_descriptors).unwrap();
+        essential["manifest"]["operator_baseline"]["essentials"][0]
+            .as_object_mut()
+            .unwrap()
+            .insert("future".to_string(), serde_json::json!(true));
+        variants.push(essential);
+
+        for value in variants {
+            assert!(serde_json::from_value::<SignedManifest>(value).is_err());
+        }
+
+        let old = SigningKey::generate(&mut OsRng);
+        let new = SigningKey::generate(&mut OsRng);
+        let rotation = build_cross_signed_rotation(&old, &new);
+        let mut rotation_top = serde_json::to_value(&rotation).unwrap();
+        rotation_top
+            .as_object_mut()
+            .unwrap()
+            .insert("future".to_string(), serde_json::json!(true));
+        assert!(serde_json::from_value::<CrossSignedRotation>(rotation_top).is_err());
+
+        let mut rotation_body = serde_json::to_value(&rotation).unwrap();
+        rotation_body["body"]
+            .as_object_mut()
+            .unwrap()
+            .insert("future".to_string(), serde_json::json!(true));
+        assert!(serde_json::from_value::<CrossSignedRotation>(rotation_body).is_err());
     }
 
     #[test]
@@ -570,8 +744,8 @@ mod tests {
         let mut rotation = build_cross_signed_rotation(&old, &new);
         // Corrupt the new-key signature by swapping in one over a different message.
         let bogus = old.sign(b"different bytes");
-        rotation.new_key_signature_b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(bogus.to_bytes());
+        rotation.new_key_signature_b64url =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bogus.to_bytes());
         match verify_cross_signed_rotation(&rotation, &old.verifying_key().to_bytes()) {
             RotationVerifyOutcome::Rejected { reason } => {
                 assert!(reason.contains("new_key_signature does not verify"));
@@ -587,8 +761,8 @@ mod tests {
         let mut rotation = build_cross_signed_rotation(&old, &new);
         // Corrupt the old-key signature.
         let bogus = new.sign(b"different bytes");
-        rotation.old_key_signature_b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(bogus.to_bytes());
+        rotation.old_key_signature_b64url =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bogus.to_bytes());
         match verify_cross_signed_rotation(&rotation, &old.verifying_key().to_bytes()) {
             RotationVerifyOutcome::Rejected { reason } => {
                 assert!(reason.contains("old_key_signature does not verify"));

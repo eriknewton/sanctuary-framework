@@ -25,6 +25,7 @@ import {
   type ManifestSigner,
 } from "../../../src/castle-wall/runtime/manifest-publisher.js";
 import {
+  castleWallSigningKeyId,
   verifyManifestSignature,
 } from "../../../src/castle-wall/allowlist/parse.js";
 import { encrypt } from "../../../src/core/encryption.js";
@@ -39,7 +40,7 @@ function makeSigningKey(): { signer: ManifestSigner; publicKey: Uint8Array } {
   const encryptedPrivateKey = encrypt(seed, masterKey);
   return {
     signer: localManifestSigner({
-      signingKeyId: "test-key",
+      signingKeyId: castleWallSigningKeyId(publicKey),
       encryptedPrivateKey,
       encryptionKey: masterKey,
     }),

@@ -10,11 +10,11 @@
 
 #![cfg(target_os = "linux")]
 
-use castle_wall_daemon::nftables::{
-    self, AgentRulesetId, NftRuleFragment, CASTLE_FAMILY, CASTLE_TABLE,
-};
+mod isolation;
+
 use castle_wall_daemon::cgroup;
 use castle_wall_daemon::nfqueue::{self, NfqueueConfig};
+use castle_wall_daemon::nftables::{self, AgentRulesetId, NftRuleFragment, CASTLE_FAMILY};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::Ordering;
@@ -31,14 +31,28 @@ fn nft_cmd(args: &[&str]) -> String {
 
 fn cleanup_castle_table() {
     let _ = Command::new("nft")
-        .args(["delete", "table", CASTLE_FAMILY, CASTLE_TABLE])
+        .args(["delete", "table", CASTLE_FAMILY, isolation::table()])
         .output();
+}
+
+/// Extract the nft rule handle of the single `queue to 0` rule in an
+/// `nft -a list chain ...` listing (the `-a` flag appends `# handle <N>` to
+/// each rule). Returns None when no NFQUEUE rule is present. Used to prove an
+/// atomic chain replace re-created the rule (the handle advances) rather than
+/// leaving a stale body in place.
+fn queue_rule_handle(listing: &str) -> Option<u64> {
+    listing
+        .lines()
+        .find(|l| l.contains("queue to 0"))
+        .and_then(|l| l.rsplit("# handle ").next())
+        .and_then(|tail| tail.trim().parse::<u64>().ok())
 }
 
 // ---- nftables tests -------------------------------------------------------
 
 #[test]
 fn nftables_install_castle_table_creates_and_is_idempotent() {
+    let _suite = isolation::guard();
     cleanup_castle_table();
 
     nftables::install_castle_table().expect("install_castle_table");
@@ -56,6 +70,7 @@ fn nftables_install_castle_table_creates_and_is_idempotent() {
 
 #[test]
 fn nftables_load_and_remove_agent_ruleset() {
+    let _suite = isolation::guard();
     cleanup_castle_table();
     nftables::install_castle_table().expect("install");
 
@@ -64,8 +79,7 @@ fn nftables_load_and_remove_agent_ruleset() {
     // rule-load time by walking `/sys/fs/cgroup/<path>`. Create a real
     // agent scope via systemd-run so the lookup succeeds.
     let scope = cgroup::create_agent_scope("test-agent-1").expect("create_agent_scope");
-    let cgroup_relative =
-        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
 
     let id = AgentRulesetId {
         agent_id: "test-agent-1".to_string(),
@@ -76,21 +90,12 @@ fn nftables_load_and_remove_agent_ruleset() {
         rule_id: "r-test-1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script = nftables::build_agent_ruleset(
-        "test-agent-1",
-        &cgroup_relative,
-        scope.cgroup_level,
-        &frags,
-    );
-    nftables::load_agent_ruleset(
-        &id,
-        &script,
-        scope.cgroup_level,
-        &cgroup_relative,
-    )
-    .expect("load_agent_ruleset");
+    let script =
+        nftables::build_agent_ruleset("test-agent-1", &cgroup_relative, scope.cgroup_level, &frags);
+    nftables::load_agent_ruleset(&id, &script, scope.cgroup_level, &cgroup_relative)
+        .expect("load_agent_ruleset");
 
-    let output = nft_cmd(&["list", "table", CASTLE_FAMILY, CASTLE_TABLE]);
+    let output = nft_cmd(&["list", "table", CASTLE_FAMILY, isolation::table()]);
     assert!(
         output.contains("agent_test-agent-1"),
         "agent chain should appear: {}",
@@ -110,18 +115,25 @@ fn nftables_load_and_remove_agent_ruleset() {
 
 #[test]
 fn nftables_atomic_replace_updates_rules() {
+    let _suite = isolation::guard();
     cleanup_castle_table();
     nftables::install_castle_table().expect("install");
 
     let scope = cgroup::create_agent_scope("test-replace").expect("create_agent_scope");
-    let cgroup_relative =
-        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
 
     let id = AgentRulesetId {
         agent_id: "test-replace".to_string(),
         cgroup_path: scope.cgroup_path.clone(),
     };
 
+    // Static fragments are intentionally IGNORED by `build_agent_ruleset` in the
+    // NFQUEUE-only model: every unmatched packet is routed to the daemon's
+    // userspace verdict path behind the single `queue to 0` rule, and no static
+    // `accept`/`dport` fragment is ever written into the privileged chain. Both
+    // loads below therefore emit the SAME body; the property under test is that
+    // the second load ATOMICALLY REPLACES the first (flush + re-add in one
+    // transaction) rather than appending or leaking a stale rule.
     let frags1 = vec![NftRuleFragment {
         rule_id: "r1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
@@ -132,13 +144,18 @@ fn nftables_atomic_replace_updates_rules() {
         scope.cgroup_level,
         &frags1,
     );
-    nftables::load_agent_ruleset(
-        &id,
-        &script1,
-        scope.cgroup_level,
-        &cgroup_relative,
-    )
-    .expect("load v1");
+    nftables::load_agent_ruleset(&id, &script1, scope.cgroup_level, &cgroup_relative)
+        .expect("load v1");
+    let listing_v1 = nft_cmd(&[
+        "-a",
+        "list",
+        "chain",
+        CASTLE_FAMILY,
+        isolation::table(),
+        "agent_test-replace",
+    ]);
+    let handle_v1 =
+        queue_rule_handle(&listing_v1).expect("v1 chain must carry exactly one NFQUEUE rule");
 
     let frags2 = vec![NftRuleFragment {
         rule_id: "r2".to_string(),
@@ -150,16 +167,45 @@ fn nftables_atomic_replace_updates_rules() {
         scope.cgroup_level,
         &frags2,
     );
-    nftables::load_agent_ruleset(
-        &id,
-        &script2,
-        scope.cgroup_level,
-        &cgroup_relative,
-    )
-    .expect("load v2");
+    nftables::load_agent_ruleset(&id, &script2, scope.cgroup_level, &cgroup_relative)
+        .expect("load v2");
+    let listing_v2 = nft_cmd(&[
+        "-a",
+        "list",
+        "chain",
+        CASTLE_FAMILY,
+        isolation::table(),
+        "agent_test-replace",
+    ]);
+    let handle_v2 =
+        queue_rule_handle(&listing_v2).expect("v2 chain must carry exactly one NFQUEUE rule");
 
-    let out = nft_cmd(&["list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "agent_test-replace"]);
-    assert!(out.contains("8443"), "v2 should contain 8443: {}", out);
+    // NFQUEUE-only body: exactly one `queue to 0` rule gated on the agent
+    // cgroup, and never a static fragment (`8443`, `accept`, `dport`) from the
+    // ignored `nft_expr`s. Exactly-one proves the replace did not leak a
+    // duplicate.
+    assert_eq!(
+        listing_v2.matches("queue to 0").count(),
+        1,
+        "exactly one NFQUEUE rule after atomic replace (no leaked duplicate): {listing_v2}"
+    );
+    assert!(
+        listing_v2.contains("socket cgroupv2"),
+        "agent chain must gate on the agent cgroup: {listing_v2}"
+    );
+    assert!(
+        !listing_v2.contains("8443")
+            && !listing_v2.contains("accept")
+            && !listing_v2.contains("dport"),
+        "static rule fragments must never enter the privileged chain: {listing_v2}"
+    );
+    // The atomic replace (flush + re-add in one nft transaction) re-creates the
+    // rule, so nft assigns it a fresh handle. An unchanged handle would mean the
+    // body was not actually swapped — the exact regression this test guards.
+    assert_ne!(
+        handle_v1, handle_v2,
+        "atomic replace must swap the rule identity (v1 handle {handle_v1} == v2 handle {handle_v2})"
+    );
 
     let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
@@ -167,15 +213,16 @@ fn nftables_atomic_replace_updates_rules() {
 
 #[test]
 fn nftables_namespace_isolation_from_default_filter() {
+    let _suite = isolation::guard();
     cleanup_castle_table();
     nftables::install_castle_table().expect("install");
 
     let tables = nft_cmd(&["list", "tables"]);
-    assert!(tables.contains(CASTLE_TABLE));
+    assert!(tables.contains(isolation::table()));
 
     if tables.contains("table inet filter") {
         let filter_output = nft_cmd(&["list", "table", "inet", "filter"]);
-        assert!(!filter_output.contains(CASTLE_TABLE));
+        assert!(!filter_output.contains(isolation::table()));
     }
 
     cleanup_castle_table();
@@ -183,12 +230,12 @@ fn nftables_namespace_isolation_from_default_filter() {
 
 #[test]
 fn nftables_ruleset_includes_nfqueue_catchall() {
+    let _suite = isolation::guard();
     cleanup_castle_table();
     nftables::install_castle_table().expect("install");
 
     let scope = cgroup::create_agent_scope("test-queue").expect("create_agent_scope");
-    let cgroup_relative =
-        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
 
     let id = AgentRulesetId {
         agent_id: "test-queue".to_string(),
@@ -199,23 +246,19 @@ fn nftables_ruleset_includes_nfqueue_catchall() {
         rule_id: "r1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script = nftables::build_agent_ruleset(
-        "test-queue",
-        &cgroup_relative,
-        scope.cgroup_level,
-        &frags,
-    );
-    nftables::load_agent_ruleset(
-        &id,
-        &script,
-        scope.cgroup_level,
-        &cgroup_relative,
-    )
-    .expect("load");
+    let script =
+        nftables::build_agent_ruleset("test-queue", &cgroup_relative, scope.cgroup_level, &frags);
+    nftables::load_agent_ruleset(&id, &script, scope.cgroup_level, &cgroup_relative).expect("load");
 
     // nft canonicalizes the input rule form `queue num 0` to `queue to 0`
     // in its listing output, so the assertion matches the listing form.
-    let out = nft_cmd(&["list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "agent_test-queue"]);
+    let out = nft_cmd(&[
+        "list",
+        "chain",
+        CASTLE_FAMILY,
+        isolation::table(),
+        "agent_test-queue",
+    ]);
     assert!(
         out.contains("queue to 0"),
         "ruleset should include NFQUEUE catch-all (queue to 0 in nft listing): {}",
@@ -227,7 +270,81 @@ fn nftables_ruleset_includes_nfqueue_catchall() {
 }
 
 #[test]
+fn gf1_deny_all_over_a_live_agent_table_forces_policy_drop_never_accept() {
+    // GF1 fault injection (delete-table-with-live-agent): build the live-agent
+    // fail-OPEN shape -- an owned table with a `policy accept` base chain plus a
+    // REAL agent jump/body -- then simulate an external `nft delete table` while
+    // the agent is live, then install the deny-all safety net (the exact call the
+    // ReArmLostOwned reclaim arm makes). The post-condition MUST be a base chain
+    // that DROPS every packet by default: never `policy accept`, never a
+    // surviving agent egress path. A non-allowlisted packet is therefore dropped.
+    let _suite = isolation::guard();
+    cleanup_castle_table();
+
+    nftables::install_castle_table().expect("install accept-base table");
+    let scope = cgroup::create_agent_scope("gf1-live-agent").expect("create_agent_scope");
+    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+    let id = AgentRulesetId {
+        agent_id: "gf1-live-agent".to_string(),
+        cgroup_path: scope.cgroup_path.clone(),
+    };
+    let frags = vec![NftRuleFragment {
+        rule_id: "r".to_string(),
+        nft_expr: "tcp dport 443 accept".to_string(),
+    }];
+    let script = nftables::build_agent_ruleset(
+        "gf1-live-agent",
+        &cgroup_relative,
+        scope.cgroup_level,
+        &frags,
+    );
+    nftables::load_agent_ruleset(&id, &script, scope.cgroup_level, &cgroup_relative)
+        .expect("load_agent_ruleset");
+
+    // Precondition: the fail-OPEN shape -- accept base chain, agent wired.
+    let before = nft_cmd(&["list", "table", CASTLE_FAMILY, isolation::table()]);
+    assert!(
+        before.contains("policy accept"),
+        "precondition: accept base chain: {before}"
+    );
+    assert!(
+        before.contains("agent_gf1-live-agent"),
+        "precondition: live agent wired: {before}"
+    );
+
+    // Simulate an external `nft delete table` while the agent is live.
+    cleanup_castle_table();
+    assert!(
+        !nftables::table_exists().unwrap_or(true),
+        "the table was deleted out from under the live agent"
+    );
+
+    // GF1 re-arm: install the deny-all safety net.
+    nftables::install_deny_all_safety_net().expect("install deny-all safety net");
+
+    // POST-CONDITION: deny-all. Base chain policy drop; no accept base; no agent
+    // chain -> every non-allowlisted packet is dropped, never accepted.
+    let after = nft_cmd(&["list", "table", CASTLE_FAMILY, isolation::table()]);
+    assert!(
+        after.contains("policy drop"),
+        "post: base chain must be policy drop: {after}"
+    );
+    assert!(
+        !after.contains("policy accept"),
+        "post: no accept base chain may survive: {after}"
+    );
+    assert!(
+        !after.contains("agent_gf1-live-agent"),
+        "post: the agent chain must be flushed: {after}"
+    );
+
+    cleanup_castle_table();
+    let _ = cgroup::destroy_agent_scope(&scope);
+}
+
+#[test]
 fn nftables_load_agent_ruleset_installs_base_chain_jump() {
+    let _suite = isolation::guard();
     // Closes the Castle Wall Phase 1 production gate: the per-agent chain
     // is reachable from the netfilter output hook only if a jump rule
     // gates entry from the base output chain. Without this, the per-agent
@@ -238,8 +355,7 @@ fn nftables_load_agent_ruleset_installs_base_chain_jump() {
     nftables::install_castle_table().expect("install");
 
     let scope = cgroup::create_agent_scope("jump-test").expect("create_agent_scope");
-    let cgroup_relative =
-        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
     let id = AgentRulesetId {
         agent_id: "jump-test".to_string(),
         cgroup_path: scope.cgroup_path.clone(),
@@ -248,22 +364,19 @@ fn nftables_load_agent_ruleset_installs_base_chain_jump() {
         rule_id: "r1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script = nftables::build_agent_ruleset(
-        "jump-test",
-        &cgroup_relative,
-        scope.cgroup_level,
-        &frags,
-    );
-    nftables::load_agent_ruleset(
-        &id,
-        &script,
-        scope.cgroup_level,
-        &cgroup_relative,
-    )
-    .expect("load");
+    let script =
+        nftables::build_agent_ruleset("jump-test", &cgroup_relative, scope.cgroup_level, &frags);
+    nftables::load_agent_ruleset(&id, &script, scope.cgroup_level, &cgroup_relative).expect("load");
 
     // The base `output` chain now holds the jump rule.
-    let listing = nft_cmd(&["-a", "list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "output"]);
+    let listing = nft_cmd(&[
+        "-a",
+        "list",
+        "chain",
+        CASTLE_FAMILY,
+        isolation::table(),
+        "output",
+    ]);
     let goto_count = listing.matches("goto agent_jump-test").count();
     assert_eq!(
         goto_count, 1,
@@ -275,8 +388,14 @@ fn nftables_load_agent_ruleset_installs_base_chain_jump() {
     );
 
     nftables::remove_agent_ruleset(&id).expect("remove");
-    let listing_after_remove =
-        nft_cmd(&["-a", "list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "output"]);
+    let listing_after_remove = nft_cmd(&[
+        "-a",
+        "list",
+        "chain",
+        CASTLE_FAMILY,
+        isolation::table(),
+        "output",
+    ]);
     assert!(
         !listing_after_remove.contains("goto agent_jump-test"),
         "remove_agent_ruleset must clean up the jump rule; got: {listing_after_remove}"
@@ -288,6 +407,7 @@ fn nftables_load_agent_ruleset_installs_base_chain_jump() {
 
 #[test]
 fn nftables_load_agent_ruleset_idempotent_under_reload() {
+    let _suite = isolation::guard();
     // Pin the delete-then-add shape inside install_agent_jump_rule_impl:
     // a future refactor must not regress to "leak a stale jump per
     // reload." Loading the agent ruleset twice in sequence (simulating
@@ -297,8 +417,7 @@ fn nftables_load_agent_ruleset_idempotent_under_reload() {
     nftables::install_castle_table().expect("install");
 
     let scope = cgroup::create_agent_scope("idem-test").expect("create_agent_scope");
-    let cgroup_relative =
-        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
     let id = AgentRulesetId {
         agent_id: "idem-test".to_string(),
         cgroup_path: scope.cgroup_path.clone(),
@@ -308,20 +427,18 @@ fn nftables_load_agent_ruleset_idempotent_under_reload() {
         rule_id: "r1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script1 = nftables::build_agent_ruleset(
-        "idem-test",
-        &cgroup_relative,
-        scope.cgroup_level,
-        &frags1,
-    );
-    nftables::load_agent_ruleset(
-        &id,
-        &script1,
-        scope.cgroup_level,
-        &cgroup_relative,
-    )
-    .expect("load v1");
-    let listing1 = nft_cmd(&["-a", "list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "output"]);
+    let script1 =
+        nftables::build_agent_ruleset("idem-test", &cgroup_relative, scope.cgroup_level, &frags1);
+    nftables::load_agent_ruleset(&id, &script1, scope.cgroup_level, &cgroup_relative)
+        .expect("load v1");
+    let listing1 = nft_cmd(&[
+        "-a",
+        "list",
+        "chain",
+        CASTLE_FAMILY,
+        isolation::table(),
+        "output",
+    ]);
     assert_eq!(
         listing1.matches("goto agent_idem-test").count(),
         1,
@@ -334,20 +451,18 @@ fn nftables_load_agent_ruleset_idempotent_under_reload() {
         rule_id: "r2".to_string(),
         nft_expr: "tcp dport 8443 accept".to_string(),
     }];
-    let script2 = nftables::build_agent_ruleset(
-        "idem-test",
-        &cgroup_relative,
-        scope.cgroup_level,
-        &frags2,
-    );
-    nftables::load_agent_ruleset(
-        &id,
-        &script2,
-        scope.cgroup_level,
-        &cgroup_relative,
-    )
-    .expect("load v2");
-    let listing2 = nft_cmd(&["-a", "list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "output"]);
+    let script2 =
+        nftables::build_agent_ruleset("idem-test", &cgroup_relative, scope.cgroup_level, &frags2);
+    nftables::load_agent_ruleset(&id, &script2, scope.cgroup_level, &cgroup_relative)
+        .expect("load v2");
+    let listing2 = nft_cmd(&[
+        "-a",
+        "list",
+        "chain",
+        CASTLE_FAMILY,
+        isolation::table(),
+        "output",
+    ]);
     assert_eq!(
         listing2.matches("goto agent_idem-test").count(),
         1,
@@ -361,6 +476,7 @@ fn nftables_load_agent_ruleset_idempotent_under_reload() {
 
 #[test]
 fn nftables_scope_recreation_refresh_fails_closed_then_restores_queue() {
+    let _suite = isolation::guard();
     cleanup_castle_table();
     nftables::install_castle_table().expect("install");
 
@@ -375,12 +491,8 @@ fn nftables_scope_recreation_refresh_fails_closed_then_restores_queue() {
         rule_id: "r-refresh".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let first_script = nftables::build_agent_ruleset(
-        agent_id,
-        &first_relative,
-        first_scope.cgroup_level,
-        &frags,
-    );
+    let first_script =
+        nftables::build_agent_ruleset(agent_id, &first_relative, first_scope.cgroup_level, &frags);
     nftables::load_agent_ruleset(
         &id,
         &first_script,
@@ -404,8 +516,13 @@ fn nftables_scope_recreation_refresh_fails_closed_then_restores_queue() {
         &refreshed_relative,
     )
     .expect("install fail-closed refreshed jump");
-    let fail_closed_chain =
-        nft_cmd(&["list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "agent_refresh-test"]);
+    let fail_closed_chain = nft_cmd(&[
+        "list",
+        "chain",
+        CASTLE_FAMILY,
+        isolation::table(),
+        "agent_refresh-test",
+    ]);
     assert!(
         fail_closed_chain.contains("drop"),
         "refresh stage must fail closed before restoring policy: {fail_closed_chain}"
@@ -428,8 +545,14 @@ fn nftables_scope_recreation_refresh_fails_closed_then_restores_queue() {
         &refreshed_relative,
     )
     .expect("restore refreshed ruleset");
-    let output_listing =
-        nft_cmd(&["-a", "list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "output"]);
+    let output_listing = nft_cmd(&[
+        "-a",
+        "list",
+        "chain",
+        CASTLE_FAMILY,
+        isolation::table(),
+        "output",
+    ]);
     assert_eq!(
         output_listing.matches("goto agent_refresh-test").count(),
         1,
@@ -445,8 +568,13 @@ fn nftables_scope_recreation_refresh_fails_closed_then_restores_queue() {
             "stale cgroup jump must be removed after refresh: {output_listing}"
         );
     }
-    let restored_chain =
-        nft_cmd(&["list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "agent_refresh-test"]);
+    let restored_chain = nft_cmd(&[
+        "list",
+        "chain",
+        CASTLE_FAMILY,
+        isolation::table(),
+        "agent_refresh-test",
+    ]);
     assert!(
         restored_chain.contains("queue to 0"),
         "normal policy must be restored after fail-closed stage: {restored_chain}"
@@ -461,6 +589,7 @@ fn nftables_scope_recreation_refresh_fails_closed_then_restores_queue() {
 
 #[test]
 fn cgroup_resolve_id_on_root_cgroup() {
+    let _suite = isolation::guard();
     let path = PathBuf::from("/sys/fs/cgroup");
     if path.exists() {
         let id = cgroup::resolve_cgroup_id(&path).expect("resolve");
@@ -470,6 +599,7 @@ fn cgroup_resolve_id_on_root_cgroup() {
 
 #[test]
 fn cgroup_scope_unit_name_format() {
+    let _suite = isolation::guard();
     // `.service` suffix: production code switched from `--scope` to
     // `--service` mode after systemd 255 rejected `--remain-after-exit`.
     let name = cgroup::scope_unit_name("my-agent");
@@ -478,6 +608,7 @@ fn cgroup_scope_unit_name_format() {
 
 #[test]
 fn cgroup_path_for_scope_shape() {
+    let _suite = isolation::guard();
     let path = cgroup::cgroup_path_for_scope("sanctuary-agent-test.service");
     assert_eq!(
         path,
@@ -489,12 +620,14 @@ fn cgroup_path_for_scope_shape() {
 
 #[test]
 fn nfqueue_config_default_fail_open_off() {
+    let _suite = isolation::guard();
     let cfg = NfqueueConfig::default();
     assert!(!cfg.fail_open);
 }
 
 #[test]
 fn nfqueue_bind_rejects_fail_open_true() {
+    let _suite = isolation::guard();
     let config = NfqueueConfig {
         fail_open: true,
         ..Default::default()
@@ -506,6 +639,7 @@ fn nfqueue_bind_rejects_fail_open_true() {
 
 #[test]
 fn nfqueue_bind_succeeds_with_fail_open_off() {
+    let _suite = isolation::guard();
     let config = NfqueueConfig::default();
     let handle = nfqueue::bind_queue(&config).expect("bind_queue");
     assert_eq!(handle.queue_number, 0);
@@ -515,11 +649,17 @@ fn nfqueue_bind_succeeds_with_fail_open_off() {
 
 #[test]
 fn nfqueue_parse_ip_header_tcp() {
+    let _suite = isolation::guard();
     let mut pkt = vec![0u8; 24];
     pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&24u16.to_be_bytes());
     pkt[9] = 6; // TCP
-    pkt[16] = 10; pkt[17] = 0; pkt[18] = 0; pkt[19] = 1;
-    pkt[22] = 0x01; pkt[23] = 0xBB; // port 443
+    pkt[16] = 10;
+    pkt[17] = 0;
+    pkt[18] = 0;
+    pkt[19] = 1;
+    pkt[22] = 0x01;
+    pkt[23] = 0xBB; // port 443
     let (ip, port, proto) = nfqueue::parse_ip_header(&pkt);
     assert_eq!(ip, Some("10.0.0.1".to_string()));
     assert_eq!(port, 443);
@@ -528,11 +668,17 @@ fn nfqueue_parse_ip_header_tcp() {
 
 #[test]
 fn nfqueue_parse_ip_header_udp_dns() {
+    let _suite = isolation::guard();
     let mut pkt = vec![0u8; 28];
     pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&28u16.to_be_bytes());
     pkt[9] = 17; // UDP
-    pkt[16] = 8; pkt[17] = 8; pkt[18] = 8; pkt[19] = 8;
-    pkt[22] = 0x00; pkt[23] = 0x35; // port 53
+    pkt[16] = 8;
+    pkt[17] = 8;
+    pkt[18] = 8;
+    pkt[19] = 8;
+    pkt[22] = 0x00;
+    pkt[23] = 0x35; // port 53
     let (ip, port, proto) = nfqueue::parse_ip_header(&pkt);
     assert_eq!(ip, Some("8.8.8.8".to_string()));
     assert_eq!(port, 53);
@@ -543,6 +689,13 @@ fn nfqueue_parse_ip_header_udp_dns() {
 
 #[test]
 fn end_to_end_nftables_then_evaluate_then_audit() {
+    let _suite = isolation::guard();
+    use base64::Engine as _;
+    use castle_wall_daemon::manifest::canonical_json::canonicalize_to_bytes;
+    use castle_wall_daemon::manifest::verify::{
+        AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+    };
+    use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
     use castle_wall_daemon::nftables::rule_to_nft_expr;
     use castle_wall_daemon::policy::{
         AllowlistRule, EvaluationRequest, RuleDisposition, RuleMatch, RuleScope, Verdict,
@@ -554,12 +707,6 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     use std::fs;
     use std::time::Duration;
     use tempfile::TempDir;
-    use castle_wall_daemon::manifest::canonical_json::canonicalize_to_bytes;
-    use castle_wall_daemon::manifest::verify::{
-        AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
-    };
-    use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
-    use base64::Engine as _;
 
     let dir = TempDir::new().unwrap();
     let signing = SigningKey::generate(&mut OsRng);
@@ -573,7 +720,12 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         "id": "rule-allow-test",
         "schema_version": 1,
         "created_at": "2026-05-05T00:00:00Z",
-        "match": { "host": ["api.anthropic.com"], "port": [443], "protocol": "tcp" },
+        // IP-pinned allow: the daemon refuses `match.host` / `match.host_pattern`
+        // rules at policy-snapshot admission (no authenticated DNS/SNI binding on
+        // the Linux L2 packet path; see `policy.rs` UnenforceableRuleAxis), so an
+        // enforceable allow rule must pin the wire destination IP. 203.0.113.44 is
+        // the RFC 5737 documentation address the bypass suite also uses.
+        "match": { "ip": ["203.0.113.44"], "port": [443], "protocol": "tcp" },
         "disposition": "allow"
     });
     let rule_bytes = serde_json::to_vec(&rule_body).unwrap();
@@ -591,7 +743,9 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     // (always-on-lane gate); the daemon refuses a lane-less manifest.
     let habeas_bytes = castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes();
     fs::write(
-        policy_dir.join(RULES_SUBDIR).join("reserved_habeas_distress_local.json"),
+        policy_dir
+            .join(RULES_SUBDIR)
+            .join("reserved_habeas_distress_local.json"),
         habeas_bytes,
     )
     .unwrap();
@@ -603,6 +757,7 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         schema_version: 1,
         fortress_id: "deadbeef".to_string(),
         issued_at: "2026-05-05T00:00:00Z".to_string(),
+        generation: 1,
         agent_origin: None,
         operator_baseline: None,
         rules: vec![
@@ -624,7 +779,10 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         manifest,
         signature: ManifestSignature {
             signature_scheme: "ed25519-v1".to_string(),
-            signing_key_id: "test".to_string(),
+            signing_key_id: castle_wall_daemon::crypto::castle_wall_signing_key_id(
+                &signing.verifying_key().to_bytes(),
+            )
+            .unwrap(),
             signature_b64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .encode(sig.to_bytes()),
         },
@@ -647,6 +805,11 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         no_wall_max_duration: Duration::from_secs(3600),
         wal_ttl: Duration::from_secs(86_400),
         wal_size_cap_bytes: 16 * 1024 * 1024,
+        trusted_service_uid: Some(unsafe { libc::geteuid() }),
+        // ISOLATION (AGENTS.md, "the operator's machine is not a fixture"): the
+        // host lock, ownership journal, and journal MAC key land in this run's
+        // temp root, never in /var/lib/sanctuary.
+        linux_runtime_paths: isolation::runtime_paths(),
     };
 
     let handle = boot(config).expect("daemon boot");
@@ -661,9 +824,9 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         created_at: "2026-05-05T00:00:00Z".to_string(),
         description: None,
         match_clause: RuleMatch {
-            host: Some(vec!["api.anthropic.com".to_string()]),
+            host: None,
             host_pattern: None,
-            ip: None,
+            ip: Some(vec!["203.0.113.44".to_string()]),
             cidr: None,
             port: Some(vec![443]),
             protocol: Some("tcp".to_string()),
@@ -676,20 +839,16 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     let frags = rule_to_nft_expr(&test_rule);
     assert!(
         frags.is_empty(),
-        "host allow rules must stay on the NFQUEUE verdict path"
+        "allow rules stay on the NFQUEUE verdict path (no static fragment is \
+         emitted into the privileged chain)"
     );
 
     // End-to-end policy + audit flow with the production cgroupv2 match.
     // Create a real agent scope so nft's path lookup at rule-load succeeds.
     let scope = cgroup::create_agent_scope("test-e2e").expect("create_agent_scope");
-    let cgroup_relative =
-        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
-    let ruleset_script = nftables::build_agent_ruleset(
-        "test-e2e",
-        &cgroup_relative,
-        scope.cgroup_level,
-        &frags,
-    );
+    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+    let ruleset_script =
+        nftables::build_agent_ruleset("test-e2e", &cgroup_relative, scope.cgroup_level, &frags);
     let agent_id = AgentRulesetId {
         agent_id: "test-e2e".to_string(),
         cgroup_path: scope.cgroup_path.clone(),
@@ -703,26 +862,33 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     .expect("load");
 
     // Verify rules installed.
-    let output = nft_cmd(&["list", "chain", CASTLE_FAMILY, CASTLE_TABLE, "agent_test-e2e"]);
+    let output = nft_cmd(&[
+        "list",
+        "chain",
+        CASTLE_FAMILY,
+        isolation::table(),
+        "agent_test-e2e",
+    ]);
     assert!(
         output.contains("queue"),
-        "host allow chain should route packets to NFQUEUE: {output}"
+        "allow chain should route packets to NFQUEUE: {output}"
     );
     assert!(
         !output.contains("accept"),
-        "host allow must not install a static port-wide accept: {output}"
+        "allow rule must not install a static port-wide accept: {output}"
     );
     assert!(
         !output.contains("dport 443"),
-        "host allow must not install a static TCP/443 match: {output}"
+        "allow rule must not install a static TCP/443 match: {output}"
     );
 
-    // Evaluate: allowed destination.
+    // Evaluate: allowed destination. Must carry the IP the allow rule pins
+    // (203.0.113.44), since the enforceable rule matches on the wire IP.
     let req_allowed = EvaluationRequest {
         agent_id: "test-e2e".to_string(),
         agent_template: "claude-code".to_string(),
-        dest_host: Some("api.anthropic.com".to_string()),
-        dest_ip: Some("104.18.0.1".to_string()),
+        dest_host: Some("example.com".to_string()),
+        dest_ip: Some("203.0.113.44".to_string()),
         dest_port: 443,
         dest_protocol: "tcp".to_string(),
         opaque: false,
@@ -742,14 +908,20 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         dest_protocol: "tcp".to_string(),
         opaque: false,
     };
-    let outcome_denied = handle.evaluate_attempt(&req_denied).expect("evaluate denied");
+    let outcome_denied = handle
+        .evaluate_attempt(&req_denied)
+        .expect("evaluate denied");
     assert!(matches!(
         outcome_denied.verdict,
-        Verdict::Deny { reason: castle_wall_daemon::DeniedReason::DefaultDeny }
+        Verdict::Deny {
+            reason: castle_wall_daemon::DeniedReason::DefaultDeny
+        }
     ));
-    assert!(outcome_denied.event_canonical_json.contains("\"egress_blocked\""));
+    assert!(outcome_denied
+        .event_canonical_json
+        .contains("\"egress_blocked\""));
 
-    // Live kernel regression for full-sweep #99: with only a hostname allow
+    // Live kernel regression for full-sweep #99: with only a single-IP allow
     // installed, raw TCP/443 traffic to an unlisted IP reaches NFQUEUE and
     // defaults closed instead of being accepted by a static dport rule.
     let req_raw_ip_denied = EvaluationRequest {
@@ -766,20 +938,26 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         .expect("evaluate raw ip denied");
     assert!(matches!(
         outcome_raw_ip_denied.verdict,
-        Verdict::Deny { reason: castle_wall_daemon::DeniedReason::DefaultDeny }
+        Verdict::Deny {
+            reason: castle_wall_daemon::DeniedReason::DefaultDeny
+        }
     ));
-    assert!(
-        outcome_raw_ip_denied
-            .event_canonical_json
-            .contains("\"egress_blocked\"")
-    );
+    assert!(outcome_raw_ip_denied
+        .event_canonical_json
+        .contains("\"egress_blocked\""));
 
     // Verify WAL has both events.
     let wal = handle.wal_writer().expect("wal");
     let mut wal_guard = wal.lock().unwrap();
     let snapshot = wal_guard.snapshot_after(None, 100).expect("snapshot");
-    let approved = snapshot.iter().filter(|e| e.event_canonical_json.contains("\"egress_approved\"")).count();
-    let blocked = snapshot.iter().filter(|e| e.event_canonical_json.contains("\"egress_blocked\"")).count();
+    let approved = snapshot
+        .iter()
+        .filter(|e| e.event_canonical_json.contains("\"egress_approved\""))
+        .count();
+    let blocked = snapshot
+        .iter()
+        .filter(|e| e.event_canonical_json.contains("\"egress_blocked\""))
+        .count();
     assert!(approved >= 1);
     assert!(blocked >= 2);
     drop(wal_guard);

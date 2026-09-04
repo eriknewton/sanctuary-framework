@@ -26,6 +26,7 @@ import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
@@ -35,6 +36,11 @@ import { frame, parseFrame } from "../../../src/castle-wall/ipc/framing.js";
 import type {
   AuditDrainEvent,
   CastleWallMessage,
+  StatusResponse,
+} from "../../../src/castle-wall/ipc/messages.js";
+import {
+  CASTLE_WALL_IPC_CAPABILITIES,
+  CASTLE_WALL_IPC_PROTOCOL_VERSION,
 } from "../../../src/castle-wall/ipc/messages.js";
 import type { IpcTransport } from "../../../src/castle-wall/runtime/ipc-client.js";
 import { createIdentity } from "../../../src/core/identity.js";
@@ -129,8 +135,9 @@ function signedDrainEvent(
   seq: number,
   priorHash: string | null,
   fixture: LinuxDaemonAuditFixtureKey = "uid_503",
+  capturedAtUnixMs: number = freshNow(),
 ): AuditDrainEvent {
-  const freshTs = freshNow();
+  const freshTs = capturedAtUnixMs;
   const canonical = walBody(fixture);
   const sig = ed25519.sign(producerSigningBytes(canonical, freshTs, seq), priv);
   return {
@@ -169,15 +176,38 @@ function forgedDrainEvent(
  * queue of drain events in response to `audit_drain_request`, then `more_pending`
  * goes false. Records the acks it receives so tests assert WAL truncation.
  */
-function buildMockDaemon(drainQueue: AuditDrainEvent[]): {
+function buildMockDaemon(
+  drainQueue: AuditDrainEvent[],
+  options: MockDaemonOptions = {},
+): {
   transport: IpcTransport;
   sendChallenge: () => Promise<void>;
   acks: number[];
+  statusRequests: number;
 } {
   let listener: ((bytes: Uint8Array) => void) | null = null;
   let buffer = new Uint8Array(0);
   const acks: number[] = [];
   let served = false;
+  let statusRequests = 0;
+  let drainRefusalsLeft = options.drainRefusals?.count ?? 0;
+  // Default: a v2 daemon on a privileged Linux host whose kernel runtime is
+  // LIVE with no agent wrapped. That is the honest ceiling of this slice
+  // (ASSURANCE_MATRIX row 17), and the activation gate must arm on it -- a gate
+  // that demanded `enforcing` would be unsatisfiable by construction.
+  const statusFields: Partial<StatusResponse> = options.status ?? {
+    manifest_state: "ready" as const,
+    lifecycle_state: "running",
+    runtime_state: "kernel_runtime_ready",
+    kernel_runtime_ready: true,
+    enforcing: false,
+    runtime_health: "ready",
+  };
+  const capabilities = options.capabilities ?? [...CASTLE_WALL_IPC_CAPABILITIES];
+  const protocolVersion =
+    options.protocolVersion === undefined
+      ? CASTLE_WALL_IPC_PROTOCOL_VERSION
+      : options.protocolVersion;
 
   const emit = (msg: CastleWallMessage): void => {
     if (!listener) throw new Error("mock daemon: no listener attached");
@@ -196,7 +226,36 @@ function buildMockDaemon(drainQueue: AuditDrainEvent[]): {
     const env = JSON.parse(body) as { params?: CastleWallMessage };
     const msg = env.params;
     if (!msg || typeof msg !== "object") return;
+    if (msg.type === "status_request") {
+      statusRequests += 1;
+      emit({
+        type: "status_response",
+        request_id: msg.request_id,
+        uptime_seconds: 12,
+        loaded_manifest_signature_b64url: "sig",
+        loaded_rule_count: 3,
+        no_wall_engaged: false,
+        ...statusFields,
+      });
+      return;
+    }
     if (msg.type === "audit_drain_request") {
+      if (drainRefusalsLeft > 0) {
+        drainRefusalsLeft -= 1;
+        emit({
+          type: "audit_drain_response",
+          request_id: msg.request_id,
+          events: [],
+          next_after_seq: msg.after_seq ?? null,
+          more_pending: false,
+          wal_overflow_count: 0,
+          error: options.drainRefusals!.error,
+          ...(options.drainRefusals!.errorClass
+            ? { error_class: options.drainRefusals!.errorClass }
+            : {}),
+        } as unknown as CastleWallMessage);
+        return;
+      }
       // Serve the whole queue in one batch, then more_pending=false.
       const events = served ? [] : drainQueue;
       served = true;
@@ -210,6 +269,13 @@ function buildMockDaemon(drainQueue: AuditDrainEvent[]): {
       });
     } else if (msg.type === "audit_drain_ack") {
       acks.push(msg.last_acked_seq);
+      emit({
+        type: "audit_drain_ack_response",
+        request_id: msg.request_id,
+        ok: true,
+        last_acked_seq: msg.last_acked_seq,
+        truncated_entries: 1,
+      });
     }
     // handshake_response + lock/unlock are accepted silently.
   };
@@ -249,10 +315,38 @@ function buildMockDaemon(drainQueue: AuditDrainEvent[]): {
         await new Promise((r) => setTimeout(r, 1));
       }
       if (!listener) throw new Error("mock daemon: listener never attached");
-      emit({ type: "handshake_challenge", nonce_b64url: "AAEC" });
+      emit({
+        type: "handshake_challenge",
+        nonce_b64url: "AAEC",
+        ...(protocolVersion === null ? {} : { protocol_version: protocolVersion }),
+        ...(capabilities.length > 0 ? { capabilities } : {}),
+      });
     },
     acks,
+    get statusRequests() {
+      return statusRequests;
+    },
   };
+}
+
+/**
+ * Knobs for {@link buildMockDaemon}, so a composition test can stand up a REAL
+ * object graph against a daemon in a chosen protocol/runtime state instead of
+ * asserting on a stubbed gate.
+ */
+interface MockDaemonOptions {
+  /** Overrides the daemon's reported runtime block. */
+  status?: Partial<StatusResponse>;
+  /** Capabilities the daemon advertises. `[]` models a pre-v2 daemon. */
+  capabilities?: string[];
+  /** `null` models a pre-v2 daemon that declares no version. */
+  protocolVersion?: number | null;
+  /**
+   * Make the daemon REFUSE the first N `audit_drain_request`s with a classified
+   * error, then serve normally. Models a daemon that is busy or stopping at the
+   * moment of arming - the condition that used to fail the whole activation.
+   */
+  drainRefusals?: { count: number; error: string; errorClass?: string };
 }
 
 /** A systemctl runner that reports the unit active (the happy path). */
@@ -377,6 +471,47 @@ async function activateAndDrainCapturedFixture(input: {
   };
 }
 
+it("activated real IPC path cumulatively ACKs every event in one served batch in ascending order", async () => {
+  const privateKey = ed25519.utils.randomPrivateKey();
+  const publicKey = ed25519.getPublicKey(privateKey);
+  await publishPubKey(tmp, publicKey);
+  const first = signedDrainEvent(privateKey, 1, null);
+  const firstHash = createHash("sha256")
+    .update(first.event_canonical_json, "utf8")
+    .digest("hex");
+  const second = signedDrainEvent(privateKey, 2, firstHash);
+  const mock = buildMockDaemon([first, second]);
+  const { runner } = activeSystemctl();
+  const { fs } = memoryFs();
+  const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+  const activationPromise = maybeActivateLinuxProducerSignedCastleWall({
+    fortressId: "fortress:test",
+    fortressStoragePath: tmp,
+    key: keyMaterial(),
+    auditSink: auditLog,
+    platform: "linux",
+    explicitOptIn: true,
+    systemctl: runner,
+    fs,
+    dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+    connectTransport: async () => mock.transport,
+    startDrainLoop: false,
+  });
+  await mock.sendChallenge();
+  const outcome = await activationPromise;
+  expect(outcome.activated).toBe(true);
+  if (!outcome.activated) return;
+  const drained = await drainOnce(
+    outcome.activation.lifecycle.client(),
+    outcome.activation.lifecycle.audit(),
+    null,
+    256,
+  );
+  expect(drained.drained).toBe(2);
+  expect(mock.acks).toEqual([1, 2]);
+  await outcome.activation.stop();
+});
+
 describe("C4 — opt-in gate (off by default, never surprise default-on)", () => {
   it("is OFF by default (no env flag → not requested)", () => {
     expect(isLinuxProducerSignedActivationRequested({ env: {} })).toBe(false);
@@ -480,45 +615,16 @@ describe("C4 — P-1 launcher: systemd drop-in renders + verifies active", () =>
     ).toThrow(/traversal/i);
   });
 
-  it("REJECTS a control char in the (test-only) unit name and drop-in filename", async () => {
-    const { runner } = activeSystemctl();
-    const { fs } = memoryFs();
-    await expect(
-      launchLinuxCastleWallDaemon({
-        fortressId: "fortress:test",
-        fortressStoragePath: tmp,
-        systemctl: runner,
-        fs,
-        unit: "evil\nWantedBy=multi-user.target",
-        dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
-      })
-    ).rejects.toThrow(/control character/i);
-    await expect(
-      launchLinuxCastleWallDaemon({
-        fortressId: "fortress:test",
-        fortressStoragePath: tmp,
-        systemctl: runner,
-        fs,
-        dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
-        dropInFileName: "../escape.conf",
-      })
-    ).rejects.toThrow(/bare basename/i);
-  });
-
-  it("installs the drop-in, reloads, restarts, and VERIFIES is-active", async () => {
+  it("has no runtime unit/path mutation authority and only verifies the fixed service", async () => {
     const { runner, calls } = activeSystemctl();
-    const { fs, files } = memoryFs();
     const result = await launchLinuxCastleWallDaemon({
       fortressId: "fortress:test",
       fortressStoragePath: tmp,
       systemctl: runner,
-      fs,
-      dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
     });
     expect(result.active).toBe(true);
-    expect(files.size).toBe(1);
-    // The orchestration order: daemon-reload → restart → is-active.
-    expect(calls.map((c) => c[0])).toEqual(["daemon-reload", "restart", "is-active"]);
+    expect(result.unit).toBe("sanctuary-castle-wall.service");
+    expect(calls.map((c) => c[0])).toEqual(["is-active"]);
   });
 });
 
@@ -745,10 +851,12 @@ describe("C4 — P-4 end-to-end (a)-(d), deterministic", () => {
     expect(stats.producerSignatureRejections).toBe(1);
     expect(stats.producerSignatureAccepted).toBe(0);
     expect(stats.acceptedCriticalEvents).toBe(0);
-    // The refusal is durably recorded → the loop acks past it (re-delivery is
-    // pointless), so the cursor advanced and the daemon was acked through seq 1.
-    expect(res.drained).toBe(1);
-    expect(mock.acks).toContain(1);
+    // A rejected durable-WAL row is recorded locally but deliberately retained
+    // daemon-side: ACK is destructive authority, so the cursor must stop at the
+    // exact bad sequence until an operator resolves it.
+    expect(res.drained).toBe(0);
+    expect(res.faultClass).toBe("terminal");
+    expect(mock.acks).not.toContain(1);
 
     await outcome.activation.stop();
   });
@@ -941,10 +1049,7 @@ describe("C4 — FIX 2 (codex CRITICAL): drain never acks past an UNPERSISTED ev
     expect(consumer.getStats().acceptedCriticalEvents).toBe(0);
   });
 
-  it("CONTINUES the batch when an event SETTLES (a refused forgery is acked, later events still flow)", async () => {
-    // Contrast case: a forgery is durably refused + acked (it settled), so the
-    // loop keeps going and a following genuine event is still pulled. This proves
-    // the BREAK is scoped to UN-settled (transient) failures, not every throw.
+  it("stops at a refused durable-WAL frame without ACKing or skipping its successor", async () => {
     const priv = ed25519.utils.randomPrivateKey();
     const pub = ed25519.getPublicKey(priv);
     await publishPubKey(tmp, pub);
@@ -958,18 +1063,45 @@ describe("C4 — FIX 2 (codex CRITICAL): drain never acks past an UNPERSISTED ev
     const consumer = new AuditConsumer(auditLog, undefined, {
       pinnedProducerKeyB64url: load.keyB64url,
     });
-    // seq 1 forged (refused+acked → settles), seq 2 genuine (accepted+acked).
+    // A durable refusal must preserve the bad row and stop before its successor.
     const { client, acks } = fakeClient([
       forgedDrainEvent(1, null),
       signedDrainEvent(priv, 2, null),
     ]);
     const res = await drainOnce(client, consumer, null, 256, () => {});
-    // Both settled → both acked; the loop did NOT break on the refused forgery.
-    expect(acks).toContain(1);
-    expect(acks).toContain(2);
-    expect(res.drained).toBe(2);
+    expect(acks).toHaveLength(0);
+    expect(res.drained).toBe(0);
+    expect(res.nextAfterSeq).toBeNull();
     expect(consumer.getStats().producerSignatureRejections).toBe(1);
-    expect(consumer.getStats().producerSignatureAccepted).toBe(1);
+    expect(consumer.getStats().producerSignatureAccepted).toBe(0);
+  });
+
+  it("accepts an old retained WAL row and its genuinely hash-linked successor", async () => {
+    const priv = ed25519.utils.randomPrivateKey();
+    const pub = ed25519.getPublicKey(priv);
+    await publishPubKey(tmp, pub);
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const { loadFortressProducerKey } = await import(
+      "../../../src/castle-wall/runtime/producer-signature.js"
+    );
+    const load = await loadFortressProducerKey(tmp, { platform: "linux" });
+    expect(load.status).toBe("present");
+    if (load.status !== "present") return;
+    const consumer = new AuditConsumer(auditLog, undefined, {
+      pinnedProducerKeyB64url: load.keyB64url,
+      now: freshNow,
+    });
+    const capturedAt = freshNow() - 10 * 60 * 1000;
+    const first = signedDrainEvent(priv, 1, null, "uid_503", capturedAt);
+    const firstHash = createHash("sha256")
+      .update(first.event_canonical_json, "utf8")
+      .digest("hex");
+    const second = signedDrainEvent(priv, 2, firstHash, "uid_503", capturedAt + 1);
+    const { client, acks } = fakeClient([first, second]);
+    const res = await drainOnce(client, consumer, null, 256);
+    expect(acks).toEqual([1, 2]);
+    expect(res.drained).toBe(2);
+    expect(consumer.getStats().producerSignatureAccepted).toBe(2);
   });
 });
 
@@ -1232,60 +1364,28 @@ describe("C4 — round-3 HIGH: NOT-ARMED record durability + settled-refusal vs 
     await activation.stop();
   });
 
-  it("(b) a SETTLED producer-signature refusal does NOT stop the drain / does NOT trip NOT-ARMED", async () => {
+  it("(b) a durable-WAL producer-signature refusal is retained and prevents arming", async () => {
     // The forger mints the marker but no valid signature. The live consumer
-    // (key loaded) durably REJECTS + acks it — a SETTLED refusal. The drain must
-    // stay HEALTHY: a refused forgery is the gate working, not a transport
-    // failure. (codex HIGH: settled-refusal must not be a false NOT-ARMED.)
+    // records the refusal, but a durable-WAL ACK would authorize destructive
+    // truncation of the rejected evidence. Activation therefore stays NOT-ARMED
+    // at the exact bad row until operator resolution.
     const priv = ed25519.utils.randomPrivateKey();
     await publishPubKey(tmp, ed25519.getPublicKey(priv));
     const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
     const appended = spyAppend(auditLog);
     const unhealthy: Error[] = [];
 
-    const { activation, scheduled } = await activateWithCapturedLoop({
-      auditSink: auditLog,
-      drainQueue: [forgedDrainEvent(1, null)],
-      onDrainUnhealthy: (e) => unhealthy.push(e),
-    });
-    // The live consumer is enforcing (key loaded), so the forgery is rejected.
-    expect(activation.lifecycle.audit().isProducerSignatureEnforced()).toBe(true);
+    await expect(
+      activateWithCapturedLoop({
+        auditSink: auditLog,
+        drainQueue: [forgedDrainEvent(1, null)],
+        onDrainUnhealthy: (e) => unhealthy.push(e),
+      }),
+    ).rejects.toMatchObject({ reason: "drain_failed" });
 
-    // Let the first cycle run (it drains + durably refuses + acks the forgery),
-    // then settle.
-    for (let i = 0; i < 100 && scheduled.length === 0; i++) {
-      await new Promise((r) => setTimeout(r, 1));
-    }
-    await activation.whenDrainSettled();
-
-    // Health is UNTOUCHED: a settled refusal is not a transport fault.
-    expect(activation.drainHealthy()).toBe(true);
-    expect(unhealthy).toHaveLength(0);
-    // The refusal was durably recorded; NO not-armed record was written.
-    expect(appended).toContain("producer_signature_rejected");
-    expect(appended).not.toContain("castle_wall_drain_failed");
-    // The consumer rejected (not accepted) the forgery.
-    expect(activation.lifecycle.audit().getStats().producerSignatureRejections).toBe(1);
-    expect(activation.lifecycle.audit().getStats().producerSignatureAccepted).toBe(0);
-
-    // CONTRAST: a real transport failure on the SAME activation DOES trip
-    // NOT-ARMED — proving the split is about settlement, not "any error".
-    const client = activation.lifecycle.client();
-    (client as unknown as { drainRequest: () => Promise<never> }).drainRequest =
-      async () => {
-        throw new Error("daemon link dropped");
-      };
-    expect(scheduled.length).toBeGreaterThanOrEqual(1);
-    scheduled[scheduled.length - 1]!();
-    for (let i = 0; i < 100 && activation.drainHealthy(); i++) {
-      await new Promise((r) => setTimeout(r, 1));
-    }
-    await activation.whenDrainSettled();
-    expect(activation.drainHealthy()).toBe(false);
     expect(unhealthy.length).toBeGreaterThanOrEqual(1);
+    expect(appended).toContain("producer_signature_rejected");
     expect(appended).toContain("castle_wall_drain_failed");
-
-    await activation.stop();
   });
 
   it("(a-i) the NOT-ARMED transition is NOT complete until the durable record is settled (append is AWAITED, not fire-and-forget)", async () => {
@@ -1587,6 +1687,170 @@ describe("C4 — round-4 HIGH: never report ARMED before the audit channel is PR
   });
 });
 
+describe("C4 — a BUSY daemon is not a broken one (retryable vs terminal at the arming boundary)", () => {
+  /**
+   * FAIL-BEFORE for the "retryable WAL error is terminal" defect (P1).
+   *
+   * The daemon returns `daemon is stopping` on every `systemctl stop` with an
+   * operation in flight, and `WAL lock failed` on any 2-second control-lock
+   * contention window. Both used to become a hard activation failure, so
+   * starting Sanctuary while the daemon was momentarily busy produced NOT-ARMED
+   * on a host whose wall was fine.
+   */
+  it("ARMS after a RETRYABLE initial-drain refusal clears on a later attempt", async () => {
+    const priv = ed25519.utils.randomPrivateKey();
+    await publishPubKey(tmp, ed25519.getPublicKey(priv));
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const appended: string[] = [];
+    const orig = auditLog.append.bind(auditLog);
+    (auditLog as unknown as { append: AuditSink["append"] }).append = (async (
+      layer: "l1",
+      operation: string,
+      id: string,
+      details?: Record<string, unknown>,
+      result?: "success" | "failure",
+    ) => {
+      appended.push(operation);
+      return orig(layer, operation, id, details, result);
+    }) as AuditSink["append"];
+
+    const mock = buildMockDaemon([], {
+      drainRefusals: {
+        count: 1,
+        error: "WAL lock failed: WAL lock acquisition exceeded the control-operation budget",
+        errorClass: "retryable",
+      },
+    });
+    const { runner } = activeSystemctl();
+    const { fs } = memoryFs();
+    const retryable: Error[] = [];
+
+    const outcomeP = maybeActivateLinuxProducerSignedCastleWall({
+      fortressId: "fortress:test",
+      fortressStoragePath: tmp,
+      key: keyMaterial(),
+      auditSink: auditLog,
+      platform: "linux",
+      explicitOptIn: true,
+      systemctl: runner,
+      fs,
+      dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+      connectTransport: async () => mock.transport,
+      startDrainLoop: true,
+      // No real waiting: the retry BOUND is the property under test, not the
+      // wall-clock spacing.
+      sleep: async () => {},
+      drainOptions: {
+        onRetryableFault: (e) => retryable.push(e),
+        // Keep the continuous loop from firing during the assertions.
+        setTimer: () => null,
+        clearTimer: () => {},
+      },
+    });
+    await mock.sendChallenge();
+    const outcome = await outcomeP;
+
+    expect(outcome.activated).toBe(true);
+    if (!outcome.activated) throw new Error("unreachable");
+    expect(retryable).toHaveLength(1);
+    expect(
+      appended,
+      "a busy daemon must NOT leave permanent transport-fault evidence",
+    ).not.toContain("castle_wall_drain_failed");
+    expect(outcome.activation.drainFaulted()).toBe(false);
+    await outcome.activation.stop();
+  });
+
+  /**
+   * The other half, so "retryable" cannot become a permanent excuse: a daemon
+   * that refuses on EVERY attempt still fails the activation closed. The wall is
+   * never reported armed on a channel that was never proven.
+   */
+  it("still FAILS CLOSED when every initial-drain attempt is refused as retryable", async () => {
+    const priv = ed25519.utils.randomPrivateKey();
+    await publishPubKey(tmp, ed25519.getPublicKey(priv));
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const mock = buildMockDaemon([], {
+      drainRefusals: { count: 99, error: "daemon is stopping", errorClass: "retryable" },
+    });
+    const { runner } = activeSystemctl();
+    const { fs } = memoryFs();
+
+    const outcomeP = maybeActivateLinuxProducerSignedCastleWall({
+      fortressId: "fortress:test",
+      fortressStoragePath: tmp,
+      key: keyMaterial(),
+      auditSink: auditLog,
+      platform: "linux",
+      explicitOptIn: true,
+      systemctl: runner,
+      fs,
+      dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+      connectTransport: async () => mock.transport,
+      sleep: async () => {},
+      initialDrainAttempts: 3,
+    });
+    await mock.sendChallenge();
+
+    let thrown: unknown;
+    try {
+      await outcomeP;
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(RuntimeLinuxActivationError);
+    expect((thrown as RuntimeLinuxActivationError).reason).toBe("drain_failed");
+    expect((thrown as Error).message).toMatch(/retryable condition on all 3 attempts/);
+    expect((thrown as Error).message).toMatch(/unproven/);
+  });
+
+  /**
+   * A TERMINAL refusal consumes no attempts: retrying a poisoned lock or an
+   * unwritable WAL is pointless, and delaying the not-armed signal by two
+   * backoffs would be strictly worse.
+   */
+  it("does not retry a TERMINAL initial-drain refusal", async () => {
+    const priv = ed25519.utils.randomPrivateKey();
+    await publishPubKey(tmp, ed25519.getPublicKey(priv));
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const mock = buildMockDaemon([], {
+      drainRefusals: { count: 99, error: "WAL lock is poisoned", errorClass: "terminal" },
+    });
+    const { runner } = activeSystemctl();
+    const { fs } = memoryFs();
+    let sleeps = 0;
+
+    const outcomeP = maybeActivateLinuxProducerSignedCastleWall({
+      fortressId: "fortress:test",
+      fortressStoragePath: tmp,
+      key: keyMaterial(),
+      auditSink: auditLog,
+      platform: "linux",
+      explicitOptIn: true,
+      systemctl: runner,
+      fs,
+      dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+      connectTransport: async () => mock.transport,
+      sleep: async () => {
+        sleeps += 1;
+      },
+      initialDrainAttempts: 3,
+    });
+    await mock.sendChallenge();
+
+    let thrown: unknown;
+    try {
+      await outcomeP;
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(RuntimeLinuxActivationError);
+    expect((thrown as RuntimeLinuxActivationError).reason).toBe("drain_failed");
+    expect((thrown as Error).message).toMatch(/terminal fault/);
+    expect(sleeps, "a terminal refusal must not spend retry backoff").toBe(0);
+  });
+});
+
 describe("C4 — round-5 HIGH: initial-drain probe never skips an unsettled event when it stops mid-batch", () => {
   it("FAILS CLOSED when the probe partially settles then hits a transient persist fault mid-batch (loop never starts, no skip)", async () => {
     // codex round-5: if the probe drains [seq1(ok), seq2(persist-fault)], it must
@@ -1600,12 +1864,12 @@ describe("C4 — round-5 HIGH: initial-drain probe never skips an unsettled even
     const priv = ed25519.utils.randomPrivateKey();
     await publishPubKey(tmp, ed25519.getPublicKey(priv));
 
-    // Two FORGED events in ONE batch. seq1's refusal record persists (settles +
-    // acks → cursor advances to 1). seq2's `producer_signature_rejected` append
+    // A genuine seq1 followed by a forged seq2 in ONE batch. seq1 persists and
+    // acks, advancing the cursor to 1. seq2's `producer_signature_rejected` append
     // THROWS (transient persist fault) → ingestCritical throws BEFORE acking →
     // seq2 does NOT settle, the cursor stays at 1. Forgeries need no WAL-chain
     // anchor, which isolates the "probe stops mid-batch at an unsettled fault"
-    // scenario cleanly.
+    // scenario cleanly under the durable-WAL retention contract.
     const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
     const orig = auditLog.append.bind(auditLog);
     let refusalAppends = 0;
@@ -1627,7 +1891,11 @@ describe("C4 — round-5 HIGH: initial-drain probe never skips an unsettled even
       return orig(layer, operation, id, details, result);
     }) as AuditSink["append"];
 
-    const mock = buildMockDaemon([forgedDrainEvent(1, null), forgedDrainEvent(2, null)]);
+    const first = signedDrainEvent(priv, 1, null);
+    const firstHash = createHash("sha256")
+      .update(first.event_canonical_json, "utf8")
+      .digest("hex");
+    const mock = buildMockDaemon([first, forgedDrainEvent(2, firstHash)]);
     const { runner } = activeSystemctl();
     const { fs } = memoryFs();
 
@@ -1830,4 +2098,292 @@ describe("PR-C — bounded retention for persistent Linux audit drain faults", (
     expect(scheduled.map((entry) => entry.ms)).toEqual([10, 20, 25]);
   });
 
+});
+
+/**
+ * COMPOSITION TESTS for the runtime honesty gate (AGENTS rule 4: a capability
+ * with no production consumer is not shipped).
+ *
+ * These do not unit-test `evaluateCastleWall` in isolation. They stand up the
+ * REAL Linux activation object graph -- launcher, transport, `startCastleWall`,
+ * drain probe, the arming decision -- against a mock daemon speaking the real
+ * wire, and assert the gate is REACHED and its verdict is acted on. The previous
+ * shape (a unit test over `evaluateCastleWall` plus three production call sites
+ * that never passed `castleWall`) is exactly the inert-capability defect this
+ * replaces.
+ */
+describe("C4 — the runtime honesty gate is wired into the real activation graph", () => {
+  async function activateAgainst(
+    mock: ReturnType<typeof buildMockDaemon>,
+  ): Promise<Awaited<ReturnType<typeof maybeActivateLinuxProducerSignedCastleWall>>> {
+    const priv = ed25519.utils.randomPrivateKey();
+    await publishPubKey(tmp, ed25519.getPublicKey(priv));
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const { runner } = activeSystemctl();
+    const { fs } = memoryFs();
+    const outcomeP = maybeActivateLinuxProducerSignedCastleWall({
+      fortressId: "fortress:test",
+      fortressStoragePath: tmp,
+      key: keyMaterial(),
+      auditSink: auditLog,
+      platform: "linux",
+      explicitOptIn: true,
+      systemctl: runner,
+      fs,
+      dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+      connectTransport: async () => mock.transport,
+      drainOptions: {
+        pollIntervalMs: 10_000,
+        setTimer: () => 1,
+        clearTimer: () => {},
+      },
+    });
+    await mock.sendChallenge();
+    return await outcomeP;
+  }
+
+  it("arms on a LIVE kernel runtime with no agent wrapped, without claiming enforcement", async () => {
+    // The state model must be SATISFIABLE. `kernel_runtime_ready` is this
+    // slice's honest ceiling: the daemon documents `enforcing` as never
+    // produced, so a gate that required it would refuse every healthy host
+    // forever. Arming here, while still reporting `enforcementComplete: false`,
+    // is the whole point of the four-state model.
+    const mock = buildMockDaemon([]);
+    const outcome = await activateAgainst(mock);
+    expect(outcome.activated).toBe(true);
+    if (!outcome.activated) return;
+
+    expect(mock.statusRequests).toBeGreaterThan(0);
+    const health = outcome.activation.runtimeHealth();
+    expect(health.readiness).toBe("kernel_runtime_ready");
+    expect(health.auditAckConfirmed).toBe(true);
+    expect(health.ok).toBe(true);
+    expect(health.enforcementComplete).toBe(false);
+    expect(health.indeterminate).toBe(false);
+    // The evidence branch really ran over a real status response.
+    expect(outcome.activation.runtimeEvidence().status).not.toBe("unknown");
+    await outcome.activation.stop();
+  });
+
+  it("REFUSES to arm when the daemon reports a proven-lost kernel runtime", async () => {
+    const mock = buildMockDaemon([], {
+      status: {
+        manifest_state: "ready" as const,
+        lifecycle_state: "degraded",
+        runtime_state: "degraded",
+        kernel_runtime_ready: false,
+        enforcing: false,
+        runtime_health: "lost",
+      },
+    });
+    await expect(activateAgainst(mock)).rejects.toMatchObject({
+      name: "RuntimeLinuxActivationError",
+      reason: "runtime_degraded",
+    });
+  });
+
+  it("REFUSES to arm a control-plane-only daemon (authenticated IPC is not enforcement)", async () => {
+    const mock = buildMockDaemon([], {
+      status: {
+        manifest_state: "ready" as const,
+        lifecycle_state: "running",
+        runtime_state: "control_plane_only",
+        kernel_runtime_ready: false,
+        enforcing: false,
+        runtime_health: "no_runtime",
+      },
+    });
+    await expect(activateAgainst(mock)).rejects.toMatchObject({
+      reason: "runtime_degraded",
+    });
+  });
+
+  it("arms against a PRE-V2 daemon but reports it as INCOMPLETE, never healthy", async () => {
+    // OLD DAEMON + NEW CLIENT through the whole graph, under the owner ruling
+    // (2026-09-02): the daemon may keep operating, but a confirmed audit ACK is
+    // MANDATORY before Sanctuary reports drain health, arms full activation, or
+    // makes a complete-enforcement claim. So the activation succeeds (refusing
+    // would turn a partial upgrade into an outage) and every claim surface reads
+    // degraded/incomplete.
+    const mock = buildMockDaemon([], {
+      protocolVersion: null,
+      capabilities: [],
+      status: {},
+    });
+    const outcome = await activateAgainst(mock);
+    expect(outcome.activated).toBe(true);
+    if (!outcome.activated) return;
+
+    // Operation CONTINUES: the link is live and nothing was torn down.
+    expect(outcome.activation.lifecycle.state()).toBe("running");
+    expect(outcome.activation.drainFaulted()).toBe(false);
+
+    // ...but nothing may be reported as healthy or complete.
+    const health = outcome.activation.runtimeHealth();
+    expect(health.auditAckConfirmed).toBe(false);
+    expect(health.ok).toBe(false);
+    expect(health.enforcementComplete).toBe(false);
+    expect(outcome.activation.drainHealthy()).toBe(false);
+    expect(outcome.activation.activationCompleteness()).toBe("unconfirmed_audit_ack");
+    expect(outcome.activation.runtimeEvidence().status).toBe("degraded");
+    expect(outcome.activation.lifecycle.client().drainAcksAreConfirmed()).toBe(false);
+    await outcome.activation.stop();
+  });
+
+  /**
+   * The ruling's load-bearing half: a daemon whose KERNEL RUNTIME is perfectly
+   * healthy but which does not confirm ACKs must still not read as healthy. This
+   * is the case a version check alone would wave through, and the one where a
+   * silent pass would be most tempting.
+   */
+  it("refuses to report health for a LIVE runtime whose ACKs are unconfirmed", async () => {
+    const mock = buildMockDaemon([], {
+      protocolVersion: null,
+      capabilities: [],
+      // A fully live kernel runtime, reported through the v2 status fields.
+      status: {
+        manifest_state: "ready" as const,
+        lifecycle_state: "running",
+        runtime_state: "kernel_runtime_ready",
+        kernel_runtime_ready: true,
+        enforcing: false,
+        runtime_health: "ready",
+      },
+    });
+    const outcome = await activateAgainst(mock);
+    expect(outcome.activated).toBe(true);
+    if (!outcome.activated) return;
+
+    const health = outcome.activation.runtimeHealth();
+    // The runtime dimension is genuinely fine...
+    expect(health.readiness).toBe("kernel_runtime_ready");
+    expect(health.indeterminate).toBe(false);
+    // ...and it is STILL not health, because the evidence channel is unconfirmed.
+    expect(health.auditAckConfirmed).toBe(false);
+    expect(health.ok).toBe(false);
+    expect(outcome.activation.drainHealthy()).toBe(false);
+    expect(outcome.activation.runtimeEvidence().status).toBe("degraded");
+    expect(outcome.activation.runtimeEvidence().detector_evidence).toContain(
+      "audit_drain_ack_response"
+    );
+    await outcome.activation.stop();
+  });
+
+  /**
+   * "Never silently healthy": the unconfirmed basis must leave a DURABLE record,
+   * not just an in-memory flag a caller might not read.
+   */
+  it("durably records that it armed on the unconfirmed-ACK basis", async () => {
+    const priv = ed25519.utils.randomPrivateKey();
+    await publishPubKey(tmp, ed25519.getPublicKey(priv));
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const mock = buildMockDaemon([], { protocolVersion: null, capabilities: [] });
+    const { runner } = activeSystemctl();
+    const { fs } = memoryFs();
+    const outcomeP = maybeActivateLinuxProducerSignedCastleWall({
+      fortressId: "fortress:test",
+      fortressStoragePath: tmp,
+      key: keyMaterial(),
+      auditSink: auditLog,
+      platform: "linux",
+      explicitOptIn: true,
+      systemctl: runner,
+      fs,
+      dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+      connectTransport: async () => mock.transport,
+      drainOptions: { pollIntervalMs: 10_000, setTimer: () => 1, clearTimer: () => {} },
+    });
+    await mock.sendChallenge();
+    const outcome = await outcomeP;
+    expect(outcome.activated).toBe(true);
+    if (!outcome.activated) return;
+
+    const { entries } = await auditLog.query({ limit: 100 });
+    const record = entries.find(
+      (e) => e.operation === "castle_wall_audit_ack_unconfirmed"
+    );
+    expect(record).toBeTruthy();
+    expect(record?.result).toBe("failure");
+    expect(record?.details).toMatchObject({ armed: true, complete: false });
+    await outcome.activation.stop();
+  });
+
+  /**
+   * The converse, so the gate is not vacuously always-degraded: a v2 daemon on a
+   * live runtime reaches FULL completeness and confirmed drain health.
+   */
+  /**
+   * The arming decision must rest on ONE observation. Two `statusRequest()`
+   * round-trips would let the readiness verdict and the snapshot's raw fields
+   * come from different daemon states that never coexisted.
+   */
+  it("decides from a single status observation", async () => {
+    const mock = buildMockDaemon([]);
+    const outcome = await activateAgainst(mock);
+    expect(outcome.activated).toBe(true);
+    if (!outcome.activated) return;
+    expect(mock.statusRequests).toBe(1);
+    // The snapshot's fields are the ones the readiness was derived from.
+    const health = outcome.activation.runtimeHealth();
+    expect(health.status.runtime_state).toBe("kernel_runtime_ready");
+    expect(health.uptime_seconds).toBe(health.status.uptime_seconds);
+    await outcome.activation.stop();
+  });
+
+  it("reaches FULL activation when the peer confirms ACKs", async () => {
+    const mock = buildMockDaemon([]);
+    const outcome = await activateAgainst(mock);
+    expect(outcome.activated).toBe(true);
+    if (!outcome.activated) return;
+
+    expect(outcome.activation.runtimeHealth().auditAckConfirmed).toBe(true);
+    expect(outcome.activation.runtimeHealth().ok).toBe(true);
+    expect(outcome.activation.activationCompleteness()).toBe("full");
+    expect(outcome.activation.drainHealthy()).toBe(true);
+    expect(outcome.activation.drainFaulted()).toBe(false);
+    await outcome.activation.stop();
+  });
+
+  it("does not arm on an INDETERMINATE probe reading as if it were health", async () => {
+    const mock = buildMockDaemon([], {
+      status: {
+        manifest_state: "ready" as const,
+        lifecycle_state: "running",
+        runtime_state: "kernel_runtime_ready",
+        kernel_runtime_ready: false,
+        enforcing: false,
+        runtime_health: "probe_unavailable",
+      },
+    });
+    const outcome = await activateAgainst(mock);
+    expect(outcome.activated).toBe(true);
+    if (!outcome.activated) return;
+    const health = outcome.activation.runtimeHealth();
+    // Not a failure (so no outage) and not health (so no overclaim).
+    expect(health.readiness).toBe("unavailable");
+    expect(health.ok).toBe(false);
+    expect(outcome.activation.runtimeEvidence().status).toBe("unknown");
+    await outcome.activation.stop();
+  });
+
+  it("NEVER reports enforcement complete from a merely-ready runtime", async () => {
+    // The strong claim requires the daemon to actually say `enforcing`. Proven
+    // by feeding exactly that and checking both directions.
+    const enforcing = buildMockDaemon([], {
+      status: {
+        manifest_state: "ready" as const,
+        lifecycle_state: "running",
+        runtime_state: "enforcing",
+        kernel_runtime_ready: true,
+        enforcing: true,
+        runtime_health: "ready",
+      },
+    });
+    const outcome = await activateAgainst(enforcing);
+    expect(outcome.activated).toBe(true);
+    if (!outcome.activated) return;
+    expect(outcome.activation.runtimeHealth().readiness).toBe("enforcing");
+    expect(outcome.activation.runtimeHealth().enforcementComplete).toBe(true);
+    await outcome.activation.stop();
+  });
 });
