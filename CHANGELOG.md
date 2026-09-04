@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-09-04
+
 ### Added
 
 - **The local-intelligence provisioning ceremony verifies a Sanctuary-signed model manifest shipped inside the package before any model pull.** `sanctuary init --provision-local-intelligence` and `sanctuary protect ... --provision-local-intelligence` now read the signed model manifest packaged with the release, check it against a model-catalog signing key pinned in the build (a dedicated key, separate from the release-signing key), a byte cap, a strict parser, and a build-time byte pin, and refuse with a named, audited reason if it is missing, oversized, malformed, altered, or signed by any other key. Stated precisely: the byte pin defends against an altered manifest file inside an otherwise intact package, the signature defends against a manifest signed by any other key, and only the package's own release provenance (the signed release manifest) defends against a package whose code has itself been rewritten. The first manifest lists the default models for the 8, 16, and 32 GiB hardware bands with their exact Ollama registry digests. Bounds: there is no network discovery of newer manifests yet (an operator may supply a newer Sanctuary-signed manifest by path with `--model-manifest <path>`, verified identically); light assurance verifies the digest Ollama reports, not every model byte on disk; Windows requires a manual Ollama install. See `docs/local-intelligence.md`.
