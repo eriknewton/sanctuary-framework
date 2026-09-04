@@ -99,6 +99,8 @@
     "l2_verify_isolation",
     "manifest",
     "memory_attest",
+    "memory_get",
+    "memory_search",
     "monitor_audit_log",
     "monitor_health",
     "proof_commitment",

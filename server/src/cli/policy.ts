@@ -48,6 +48,7 @@ import { installConsentGatedRedactor } from "../intelligence/privacy-tier2-redac
 import { resolveStoragePath } from "../paths.js";
 import { loadConfig } from "../config.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
+import { stripTrailingSlashes } from "../strings.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { createCompiledContextRuntime } from "../compiled-context/runtime.js";
 
@@ -470,7 +471,7 @@ function resolveApiBase(
     err.write("drafts command requires --api-base or SANCTUARY_POLICY_API_BASE\n");
     return null;
   }
-  return raw.replace(/\/+$/, "");
+  return stripTrailingSlashes(raw);
 }
 
 function resolveApiToken(err: NodeJS.WritableStream): string | null {

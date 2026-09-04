@@ -18,6 +18,7 @@ import type { HashedRekordProposal, RekorEntryRef } from "./anchor.js";
 // party and go through the untrusted-diagnostic chokepoint (STATE-STORE-
 // ERRMSG-INTERP-01).
 import { describeUntrusted } from "../errors/index.js";
+import { stripTrailingSlashes } from "../strings.js";
 
 export const REKOR_ENTRIES_PATH = "/api/v1/log/entries";
 export const REKOR_SUBMIT_TIMEOUT_MS = 30_000;
@@ -81,7 +82,7 @@ export class HttpRekorClient implements RekorClient {
   private readonly timeoutMs: number;
 
   constructor(options: HttpRekorClientOptions) {
-    this.baseUrl = options.baseUrl.replace(/\/+$/, "");
+    this.baseUrl = stripTrailingSlashes(options.baseUrl);
     this.fetchFn =
       options.fetchFn ?? (globalThis.fetch as unknown as FetchLike);
     if (typeof this.fetchFn !== "function") {
