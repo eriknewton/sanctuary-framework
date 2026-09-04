@@ -32,7 +32,8 @@
     "./intelligence/catalog-v3/schemas/schema-digests.json": "./dist/intelligence/catalog-v3/schemas/schema-digests.json",
     "./intelligence/catalog-v3/schemas/signed-catalog.v3.schema.json": "./dist/intelligence/catalog-v3/schemas/signed-catalog.v3.schema.json",
     "./intelligence/catalog-v3/schemas/signed-overlay.v1.schema.json": "./dist/intelligence/catalog-v3/schemas/signed-overlay.v1.schema.json",
-    "./intelligence/catalog-v3/spdx/spdx-expression-3.0.1.abnf": "./dist/intelligence/catalog-v3/spdx/spdx-expression-3.0.1.abnf"
+    "./intelligence/catalog-v3/spdx/spdx-expression-3.0.1.abnf": "./dist/intelligence/catalog-v3/spdx/spdx-expression-3.0.1.abnf",
+    "./intelligence/model-manifest/model-manifest.v2.json": "./dist/intelligence/model-manifest/model-manifest.v2.json"
   },
   "files": [
     "dist",
@@ -41,10 +42,11 @@
     "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
-    "build": "node scripts/copy-catalog-v3-assets.mjs --verify-only && node scripts/sign-reference-plugin.mjs && tsup && npm run build:boot-runtime && node scripts/copy-templates.js && node scripts/copy-catalog-v3-assets.mjs",
+    "build": "node scripts/copy-catalog-v3-assets.mjs --verify-only && node scripts/copy-model-manifest-v2-asset.mjs --verify-only && node scripts/sign-reference-plugin.mjs && tsup && npm run build:boot-runtime && node scripts/copy-templates.js && node scripts/copy-catalog-v3-assets.mjs && node scripts/copy-model-manifest-v2-asset.mjs",
     "build:boot-runtime": "tsup --config tsup.boot-runtime.config.ts",
     "sign-reference-plugin": "node scripts/sign-reference-plugin.mjs",
     "sign-release": "tsx scripts/sign-release-manifest.mjs",
+    "sign-model-manifest": "tsx scripts/sign-model-manifest-v2.mjs",
     "dev": "tsup --watch",
     "start": "node dist/cli.js",
     "pretest": "npm run build",

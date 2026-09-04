@@ -21,7 +21,12 @@ import type { MemoryBackendAdapter, MemoryPassage } from "./adapters/memory-back
 import { SdwValidationError } from "./errors.js";
 import type { MultiAgentIsolationGuard } from "./memory-isolation.js";
 import { SDW_MEMORY_MULTI_AGENT_DENIAL_CLASS } from "./memory-tools.js";
-import type { MemoryProvenanceCompanion } from "./memory-provenance-contract.js";
+import {
+  computeMemoryOriginProvenanceDigest,
+  isMemoryTransferLineageRef,
+  isMemoryTransportAdmissionChannel,
+  type MemoryProvenanceCompanion,
+} from "./memory-provenance-contract.js";
 
 export interface SdwMemoryProvenanceToolOptions {
   /** The shipped sovereign passage backend, scoped to one owner_ref. */
@@ -44,6 +49,12 @@ function provenanceGaps(
     if (companion === undefined) throw new Error("verified memory provenance companion missing");
     const origin = companion.origin.body;
     const admission = companion.admission.body;
+    const transport = isMemoryTransportAdmissionChannel(admission.admission_channel);
+    // Foreign vs locally recorded origin is decided by the ORIGIN FORTRESS,
+    // never by the channel: a transport channel also admits legacy V1 archive
+    // rows whose origin this fortress signed itself at import. Must match the
+    // same predicate in companionBindsPublicPassage below.
+    const foreignOrigin = origin.origin_fortress_id !== admission.destination_fortress_id;
     return {
       per_writer_signature: "verified",
       signing_status: "verified",
@@ -54,9 +65,18 @@ function provenanceGaps(
       origin_trust_tier: admission.origin_trust_tier,
       verification_basis: admission.verification_basis,
       admitted_at: admission.admitted_at,
+      // Transport admissions surface the import's lineage reference: an opaque
+      // digest the import receipt already returned to the operator, naming the
+      // transfer that admitted this passage. Never a key, a body, or a foreign
+      // fortress identifier.
+      ...(transport ? { transfer_lineage_ref: admission.transfer_lineage_ref } : {}),
       taint_retrievable: false,
       automatic_provenance_event: true,
-      note: "The fortress-recorded origin and admission bindings verify for this exact passage. This does not prove true authorship, content truth, safety, or a remote identity.",
+      note: foreignOrigin
+        ? "The origin binding was recorded by another fortress; this fortress's signed admission binds it to this exact passage and names the transfer lineage that admitted it. This does not prove true authorship, content truth, safety, or a remote identity."
+        : transport
+          ? "This fortress recorded the origin binding itself when it admitted this passage through a transfer; the admission names that transfer lineage and carries the admitted origin-trust tier. This does not prove true authorship, content truth, safety, or a remote identity."
+          : "The fortress-recorded origin and admission bindings verify for this exact passage. This does not prove true authorship, content truth, safety, or a remote identity.",
     };
   }
   return {
@@ -83,18 +103,88 @@ function sameProvenanceSnapshot(
   return JSON.stringify(first.companion) === JSON.stringify(second.companion);
 }
 
+/**
+ * Binds the companion the backend returned to the passage a SEPARATE read
+ * produced, so a companion that describes passage X can never be reported as
+ * the provenance of passage Y (the two reads are not one transaction).
+ *
+ * Rule 7 (AGENTS.md): the subject of every field checked here is THIS local
+ * passage; the evidence source is the companion the backend already
+ * signature-verified (status `verified` is the precondition for reaching this
+ * function); the verifier of those signatures is the backend's signer
+ * resolver, not this wrapper; consuming a `true` here means only "the
+ * verified companion describes the passage in hand", nothing about
+ * authorship or truth.
+ *
+ * Two branches, both safe:
+ *  - Local admissions (`local_write`, `legacy_migration`,
+ *    `operator_readmission`): this fortress signed the origin about THIS
+ *    passage, so the origin's own subject (`passage_id`, `owner_ref`) must
+ *    name the local passage.
+ *  - Transport admissions (`MEMORY_TRANSPORT_ADMISSION_CHANNELS`) whose origin
+ *    fortress is NOT this fortress: the origin was signed by the SOURCE
+ *    fortress and legitimately carries the source's passage id and owner
+ *    ref; the destination re-derived a local id at import. (A transport
+ *    admission whose origin fortress IS this fortress, the legacy V1 archive
+ *    row, was origin-signed here at import about the local id, so it takes
+ *    the local branch's direct subject check as well as the digest binding.)
+ *    The mapping source-id -> local-id is the destination-signed
+ *    admission written atomically with the passage at import: it names the
+ *    local `passage_id` and `destination_owner_ref`, commits to the exact
+ *    origin through `origin_provenance_digest`, and carries the import's
+ *    `transfer_lineage_ref`. This branch therefore recomputes the origin
+ *    digest and requires it to equal the digest the admission was signed
+ *    over, and refuses when the lineage reference is absent. An origin
+ *    swapped in from another imported passage fails the digest equality; a
+ *    tampered admission never reaches here because the backend's signature
+ *    check would have quarantined it. The check is never relaxed to "any id".
+ *
+ * Both branches share the destination binding (the admission names this
+ * passage and owner) and the content binding (the origin's hash and chunk
+ * count match the passage read back). The channel set MUST match
+ * `MEMORY_TRANSPORT_ADMISSION_CHANNELS` in memory-provenance-contract.ts,
+ * where `parseAdmissionBody` requires the lineage on exactly those channels.
+ */
 function companionBindsPublicPassage(
   companion: MemoryProvenanceCompanion,
   passage: MemoryPassage,
 ): boolean {
   const origin = companion.origin.body;
   const admission = companion.admission.body;
-  return origin.passage_id === passage.passage_id &&
-    origin.owner_ref === passage.owner_ref &&
-    origin.content_hash === passage.content_hash &&
-    origin.chunk_count === passage.chunk_count &&
+  const destinationBound =
     admission.passage_id === passage.passage_id &&
-    admission.destination_owner_ref === passage.owner_ref;
+    admission.destination_owner_ref === passage.owner_ref &&
+    origin.content_hash === passage.content_hash &&
+    origin.chunk_count === passage.chunk_count;
+  if (!destinationBound) return false;
+  // The admission is evidence about ONE origin: the digest it was signed over
+  // must be the digest of the origin presented alongside it. Recomputed here,
+  // never read from the companion's own claim.
+  const originDigest = computeMemoryOriginProvenanceDigest(companion.origin);
+  if (originDigest !== companion.origin_provenance_digest ||
+      originDigest !== admission.origin_provenance_digest) {
+    return false;
+  }
+  // Same predicate as provenanceGaps: the origin fortress, not the channel,
+  // decides whether the origin's own subject can be checked directly.
+  const foreignOrigin = origin.origin_fortress_id !== admission.destination_fortress_id;
+  if (isMemoryTransportAdmissionChannel(admission.admission_channel)) {
+    // Imported: the local binding is the import-time mapping above; the
+    // lineage reference is what makes that mapping an import record rather
+    // than a bare re-labelling, so its absence fails closed. Validity is the
+    // SAME predicate parseAdmissionBody applies (memory-provenance-contract.ts,
+    // isMemoryTransferLineageRef): one definition of a lineage reference.
+    if (!isMemoryTransferLineageRef(admission.transfer_lineage_ref)) return false;
+    if (foreignOrigin) return true;
+    // Locally origin-signed transport row (legacy V1 archive import): the
+    // direct subject check holds and is therefore required, not skipped.
+  } else if (foreignOrigin) {
+    // A non-transport channel never carries another fortress's origin.
+    return false;
+  }
+  // Locally recorded: the origin itself must name this passage.
+  return origin.passage_id === passage.passage_id &&
+    origin.owner_ref === passage.owner_ref;
 }
 
 /**
@@ -152,9 +242,11 @@ export function createSdwMemoryProvenanceTool(
     name: "sdw_memory_provenance",
     description:
       "Show per-record SDW memory integrity status. Verified rows expose the " +
-      "bounded fortress-recorded origin/admission classes; unsigned PRE_MIGRATION " +
-      "rows are explicit. Verification does not prove true authorship, content " +
-      "truth, safety, or a remote identity.",
+      "bounded fortress-recorded origin/admission classes; a passage admitted " +
+      "through a memory archive import reports its origin-trust tier and " +
+      "the transfer lineage reference; unsigned PRE_MIGRATION rows are explicit. " +
+      "Verification does not prove true authorship, content truth, safety, or a " +
+      "remote identity.",
     tool_class: "read",
     inputSchema: {
       type: "object",

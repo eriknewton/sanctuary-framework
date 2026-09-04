@@ -18,14 +18,24 @@ export {
   type SelectorConfig,
 } from "./selector.js";
 
+// `IntelligenceConfigStore.quarantineUnreadable` travels with this export but
+// carries no consent gate of its own: any caller must repeat the CLI verb's
+// TTY, typed-word, and write-intent-unlock gates, and no MCP tool or HTTP
+// route may reach it. The structure test pins `cli/intelligence.ts` as the
+// only production call site.
 export {
   IntelligenceConfigStore,
+  IntelligenceConfigUnreadableError,
+  INTELLIGENCE_CONFIG_RESET_VERB,
   INTELLIGENCE_NAMESPACE,
   LocalIntegrityStateLoadError,
   Q5_CONFIG_SAVE_LOCK_FILE,
   SUBSTRATE_CONFIG_KEY,
+  SUBSTRATE_CONFIG_QUARANTINE_PREFIX,
   type IntelligenceConfigStoreOptions,
   type LoadOutcome,
+  type QuarantineOutcome,
+  type UnreadableConfigKind,
 } from "./policy-store.js";
 
 export {
@@ -55,6 +65,7 @@ export {
   MODEL_MANIFEST_MIN_PARAMS_B,
   MODEL_MANIFEST_RUNTIMES,
   MODEL_MANIFEST_TIERS,
+  PINNED_MODEL_CATALOG_ROOT_PUBLIC_KEY_B64URL,
   PINNED_MODEL_MANIFEST_SIGNING_PUBLIC_KEY_B64URL,
   buildModelManifestMessage,
   loadPinnedModelManifestKey,
@@ -107,6 +118,23 @@ export {
   type SignedOllamaIdentityV2,
   type VerifiedLocalBindingV2,
 } from "./model-manifest-v2.js";
+
+export {
+  PACKAGED_MODEL_MANIFEST_AUDIT_STAGE,
+  PACKAGED_MODEL_MANIFEST_REFUSAL_REASONS,
+  PACKAGED_MODEL_MANIFEST_V2_ASSET_RELATIVE_PATH,
+  PACKAGED_MODEL_MANIFEST_V2_ASSET_SHA256,
+  PACKAGED_MODEL_MANIFEST_V2_MAX_BYTES,
+  loadPackagedModelManifestV2,
+  mapModelManifestV2RefusalToAssetRefusal,
+  resolveModuleDir,
+  resolvePackagedModelManifestV2AssetPath,
+  type LoadPackagedModelManifestV2Options,
+  type PackagedModelManifestAuditEvent,
+  type PackagedModelManifestLoadResult,
+  type PackagedModelManifestRefusalReason,
+  type PackagedModelManifestSource,
+} from "./packaged-model-manifest.js";
 
 export {
   ASSURANCES,
