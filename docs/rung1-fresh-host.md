@@ -33,6 +33,9 @@ runs through the same Tier gate and the same provenance signing as real use:
    stays Tier 1. Every agent connected to one fortress shares one memory scope
    today; per-agent memory isolation is not yet implemented. `memory_search`
    returns 10 results unless you pass `limit`, and at most 500.
+   `sdw_memory_provenance`, `memory_list`, and `memory_count` stay Tier 1, so
+   the provenance step below asks for one approval on the fortress's
+   configured approval channel.
 4. Provenance: `sdw_memory_provenance` is the tool that proves verified
    provenance. For a passage id it reports the per-record signing status
    (`verified` vs a legacy unsigned row) and the fortress-recorded origin and
