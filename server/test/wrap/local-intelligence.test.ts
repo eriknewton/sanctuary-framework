@@ -516,18 +516,47 @@ describe("shared protect/init local-intelligence adapter", () => {
 
   it("renders pull progress as one operator line per reported event", () => {
     expect(formatPullProgress("qwen2.5:1.5b", {
-      status: "pulling 12345",
+      status: `pulling sha256:${"1".repeat(64)}`,
       total: 400,
       completed: 100,
-    })).toBe("Pulling qwen2.5:1.5b: pulling 12345 25%");
+    })).toBe(`Pulling qwen2.5:1.5b: pulling ${"1".repeat(64)} 25%`);
+    expect(formatPullProgress("qwen2.5:1.5b", { status: "pulling 0f4c8fab" }))
+      .toBe("Pulling qwen2.5:1.5b: pulling 0f4c8fab");
     // No share is rendered when the runtime does not report both counters, or
     // reports counters that cannot be a share of a download.
     expect(formatPullProgress("qwen2.5:1.5b", { status: "pulling manifest" }))
       .toBe("Pulling qwen2.5:1.5b: pulling manifest");
-    expect(formatPullProgress("qwen2.5:1.5b", { status: "x", total: 0, completed: 0 }))
-      .toBe("Pulling qwen2.5:1.5b: x");
-    expect(formatPullProgress("qwen2.5:1.5b", { status: "x", total: 10, completed: 11 }))
-      .toBe("Pulling qwen2.5:1.5b: x");
+    expect(formatPullProgress("qwen2.5:1.5b", {
+      status: "verifying sha256 digest",
+      total: 0,
+      completed: 0,
+    })).toBe("Pulling qwen2.5:1.5b: verifying sha256 digest");
+    expect(formatPullProgress("qwen2.5:1.5b", {
+      status: "success",
+      total: 10,
+      completed: 11,
+    })).toBe("Pulling qwen2.5:1.5b: success");
+  });
+
+  it("never echoes a runtime-supplied status onto the operator's terminal", () => {
+    // The status arrives from the Ollama process. A newline could forge a log
+    // line, an ANSI escape could rewrite what is already on screen, and an
+    // unbounded string could bury the surrounding output, so anything outside
+    // the known forms renders as one fixed token.
+    const hostile = "\u001b[2Kpulling manifest\nSanctuary: fortress armed\u0007";
+    const rendered = formatPullProgress("qwen2.5:1.5b", { status: hostile });
+    expect(rendered).toBe("Pulling qwen2.5:1.5b: runtime status");
+    expect(rendered).not.toContain("\n");
+    // eslint-disable-next-line no-control-regex
+    expect(/[\u0000-\u001f\u007f]/.test(rendered)).toBe(false);
+    expect(formatPullProgress("qwen2.5:1.5b", { status: "p".repeat(100 * 1024) }))
+      .toBe("Pulling qwen2.5:1.5b: runtime status");
+    // A digest-shaped status is reconstructed from the matched hex, so a status
+    // that only starts like one cannot smuggle the rest through.
+    expect(formatPullProgress("qwen2.5:1.5b", { status: "pulling 0f4c8f\u001b[31m" }))
+      .toBe("Pulling qwen2.5:1.5b: runtime status");
+    expect(formatPullProgress("qwen2.5:1.5b", { status: "pulling 0f4" }))
+      .toBe("Pulling qwen2.5:1.5b: runtime status");
   });
 
   // WIRED-CONSUMER TEST (AGENTS.md rule 4): the ceremony's own pull seam must

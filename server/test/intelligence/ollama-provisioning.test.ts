@@ -127,10 +127,15 @@ describe("Ollama provisioning client", () => {
     await expect(client.pull("qwen2.5:1.5b")).resolves.toEqual({ ok: false, failureClass });
   });
 
-  it("refuses a progress line past the reviewed byte cap", async () => {
-    // 64 KiB is the reviewed per-line cap; one byte over it, with no newline, is
-    // a runtime that is not speaking the NDJSON protocol this client reviewed.
-    const oversized = `{"status":"${"p".repeat(64 * 1024 + 1)}"}`;
+  it.each([
+    ["a partial line past the cap", false],
+    // A newline does not exempt a line from the cap: without the terminated-line
+    // check such a line is parsed as progress, refreshes the inactivity
+    // deadline, and can repeat up to the whole-response cap.
+    ["a newline-terminated line past the cap", true],
+  ])("refuses %s", async (_label, terminated) => {
+    // 100 KiB of status text is well past the 64 KiB reviewed per-line cap.
+    const oversized = `{"status":"${"p".repeat(100 * 1024)}"}${terminated ? "\n" : ""}`;
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(encoder.encode(oversized));
@@ -142,6 +147,120 @@ describe("Ollama provisioning client", () => {
     const client = new OllamaClient({
       endpoint: "http://127.0.0.1:11434",
       pullInactivityTimeoutMs: 2_000,
+      fetchImpl: (async () => new Response(body, { status: 200 })) as unknown as typeof fetch,
+    });
+    await expect(client.pull("qwen2.5:1.5b")).resolves.toEqual({
+      ok: false,
+      failureClass: "substrate_misconfigured",
+    });
+  });
+
+  it("refuses one chunk larger than the pending-buffer cap before decoding it", async () => {
+    // 2 MiB in a single chunk exceeds the 1 MiB pending-buffer bound, so it is
+    // refused before it is ever decoded or appended.
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(2 * 1024 * 1024).fill(0x61));
+      },
+      pull() {
+        return new Promise<void>(() => {});
+      },
+    });
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      pullInactivityTimeoutMs: 2_000,
+      fetchImpl: (async () => new Response(body, { status: 200 })) as unknown as typeof fetch,
+    });
+    await expect(client.pull("qwen2.5:1.5b")).resolves.toEqual({
+      ok: false,
+      failureClass: "substrate_misconfigured",
+    });
+  });
+
+  it("accepts one chunk carrying many complete lines at once", async () => {
+    // The per-line cap must not become a per-CHUNK cap: a transport read can
+    // legitimately deliver a burst of complete lines in one chunk.
+    const burst = Array.from(
+      { length: 500 },
+      (_v, index) => JSON.stringify({ status: `pulling ${index}`, total: 500, completed: index }),
+    ).join("\n");
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(`${burst}\n`));
+        controller.enqueue(encoder.encode(`${JSON.stringify({ status: "success" })}\n`));
+        controller.close();
+      },
+    });
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      fetchImpl: (async () => new Response(body, { status: 200 })) as unknown as typeof fetch,
+    });
+    await expect(client.pull("qwen2.5:1.5b")).resolves.toEqual({
+      ok: true,
+      failureClass: null,
+    });
+  });
+
+  it("refuses an HTTP error whose body never ends, inside the inactivity deadline", async () => {
+    // `res.text()` on an error body the runtime never ends would hold the pull,
+    // and the provisioning lock it runs under, open forever.
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("internal error: "));
+      },
+      pull() {
+        return new Promise<void>(() => {});
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      pullInactivityTimeoutMs: 60,
+      fetchImpl: (async () => new Response(body, { status: 500 })) as unknown as typeof fetch,
+    });
+    const startedAt = Date.now();
+    await expect(client.pull("qwen2.5:1.5b")).resolves.toEqual({
+      ok: false,
+      failureClass: "substrate_unavailable",
+    });
+    // Bounded by the inactivity deadline (60 ms), with generous slack for a
+    // loaded machine; the pre-fix path never returned at all.
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(cancelled).toBe(true);
+  });
+
+  it("reads a bounded error snippet and still classifies a model-not-found refusal", async () => {
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      pullInactivityTimeoutMs: 2_000,
+      fetchImpl: (async () =>
+        new Response("model \'missing\' not found", { status: 404 })) as unknown as typeof fetch,
+    });
+    await expect(client.pull("missing:latest")).resolves.toEqual({
+      ok: false,
+      failureClass: "substrate_misconfigured",
+    });
+  });
+
+  it("flushes the decoder so truncated trailing bytes cannot read as success", async () => {
+    // The stream ends with a complete success line followed by the first two
+    // bytes of a three-byte UTF-8 sequence. Dropping that unflushed remainder
+    // would leave a syntactically perfect success line and report a TRUNCATED
+    // stream as a finished pull; flushing surfaces the replacement character,
+    // the line fails the parser, and the pull fails closed.
+    const head = encoder.encode(`${JSON.stringify({ status: "success" })}`);
+    const truncated = new Uint8Array([...head, 0xe2, 0x82]);
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(truncated);
+        controller.close();
+      },
+    });
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
       fetchImpl: (async () => new Response(body, { status: 200 })) as unknown as typeof fetch,
     });
     await expect(client.pull("qwen2.5:1.5b")).resolves.toEqual({

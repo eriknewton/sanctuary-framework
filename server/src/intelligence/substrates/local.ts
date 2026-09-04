@@ -66,6 +66,18 @@ const PULL_PROGRESS_LINE_MAX_BYTES = 64 * 1024;
 // above: far more than a full-ceiling pull produces, so the whole stream stays
 // bounded even when every individual line is well formed.
 const PULL_RESPONSE_MAX_BYTES = 64 * 1024 * 1024;
+// 1_048_576 bytes = 16 x PULL_PROGRESS_LINE_MAX_BYTES: room for one
+// maximum-length partial line plus the burst of complete ~200-byte lines a
+// single transport read can deliver (about 5_000 of them). Checked BEFORE a
+// chunk is decoded, so a runtime that sends one enormous chunk is refused
+// without it ever being buffered as a string.
+const PULL_PENDING_BUFFER_MAX_BYTES = 16 * PULL_PROGRESS_LINE_MAX_BYTES;
+// 8_192 bytes = 8 x 1024. An error body is read only to classify the failure
+// (`classifyHttpError` looks for a model-not-found phrase), so it is read
+// through the same bounded reader as the stream and truncated well below the
+// line cap; a runtime that never ends its error body cannot hold the pull, and
+// therefore the provisioning lock, open.
+const PULL_ERROR_BODY_MAX_BYTES = 8 * 1024;
 
 const PULL_LINE_ENCODER = new TextEncoder();
 
@@ -208,8 +220,20 @@ export class OllamaClient {
         this.pullInactivityTimeoutMs,
       );
       if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        return { ok: false, failureClass: classifyHttpError(res.status, text) };
+        // `res.text()` would await a body the runtime controls and may never
+        // end, holding this pull -- and the provisioning lock it runs under --
+        // open indefinitely. The classifying snippet is read through the same
+        // bounded reader as the stream: byte cap, inactivity deadline, and the
+        // abort/cancel in the finally below.
+        reader = res.body === null ? null : res.body.getReader();
+        const snippet = reader === null
+          ? ""
+          : await readBoundedText(
+            reader,
+            PULL_ERROR_BODY_MAX_BYTES,
+            this.pullInactivityTimeoutMs,
+          );
+        return { ok: false, failureClass: classifyHttpError(res.status, snippet) };
       }
       if (res.body === null) {
         // Without a body there can be no terminal `success` line, so there is no
@@ -231,17 +255,34 @@ export class OllamaClient {
         if (budgetMs <= 0) return { ok: false, failureClass: "substrate_timeout" };
         const chunk = await raceDeadline(reader.read(), budgetMs);
         if (chunk.done) break;
+        // Both caps are checked BEFORE the chunk is decoded or appended, so an
+        // over-cap stream is refused without ever being buffered as a string.
+        // A stream past either reviewed bound is a runtime not speaking the
+        // protocol this client reviewed; refuse instead of reading on.
         responseBytes += chunk.value.byteLength;
         if (responseBytes > PULL_RESPONSE_MAX_BYTES) {
-          // A stream past the reviewed total is a runtime not speaking the
-          // protocol this client reviewed; refuse instead of reading on.
+          return { ok: false, failureClass: "substrate_misconfigured" };
+        }
+        if (
+          utf8ByteLength(pending) + chunk.value.byteLength >
+            PULL_PENDING_BUFFER_MAX_BYTES
+        ) {
           return { ok: false, failureClass: "substrate_misconfigured" };
         }
         pending += decoder.decode(chunk.value, { stream: true });
         let newlineAt = pending.indexOf("\n");
         while (newlineAt !== -1) {
-          const verdict = parsePullLine(pending.slice(0, newlineAt));
+          const line = pending.slice(0, newlineAt);
           pending = pending.slice(newlineAt + 1);
+          // The per-line cap binds a TERMINATED line too. Checking only the
+          // unterminated remainder would let a runtime send one arbitrarily
+          // long line, end it with a newline, and have it parsed as progress
+          // (refreshing the inactivity deadline) all the way to the response
+          // cap.
+          if (utf8ByteLength(line) > PULL_PROGRESS_LINE_MAX_BYTES) {
+            return { ok: false, failureClass: "substrate_misconfigured" };
+          }
+          const verdict = parsePullLine(line);
           if (verdict.kind === "refused") {
             return { ok: false, failureClass: verdict.failureClass };
           }
@@ -255,13 +296,22 @@ export class OllamaClient {
           }
           newlineAt = pending.indexOf("\n");
         }
-        if (PULL_LINE_ENCODER.encode(pending).length > PULL_PROGRESS_LINE_MAX_BYTES) {
+        // The remainder is one unterminated line, so the same per-line cap
+        // binds it: a runtime that never emits a newline is refused here.
+        if (utf8ByteLength(pending) > PULL_PROGRESS_LINE_MAX_BYTES) {
           return { ok: false, failureClass: "substrate_misconfigured" };
         }
       }
+      // Flushing the decoder emits the replacement character for a truncated
+      // multibyte sequence rather than dropping it, so a mangled final line
+      // fails the parser instead of vanishing.
+      pending += decoder.decode();
       // Ollama terminates the stream with a newline, but a final line without
       // one is still the runtime's verdict and is judged by the same parser.
       if (pending.trim().length > 0) {
+        if (utf8ByteLength(pending) > PULL_PROGRESS_LINE_MAX_BYTES) {
+          return { ok: false, failureClass: "substrate_misconfigured" };
+        }
         const verdict = parsePullLine(pending);
         if (verdict.kind === "refused") {
           return { ok: false, failureClass: verdict.failureClass };
@@ -456,6 +506,42 @@ async function raceDeadline<T>(work: Promise<T>, budgetMs: number): Promise<T> {
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
+}
+
+function utf8ByteLength(text: string): number {
+  // The caps are byte caps; a UTF-16 length would under-count a multibyte line
+  // by up to a factor of three and let it past a bound stated in bytes.
+  return text.length === 0 ? 0 : PULL_LINE_ENCODER.encode(text).length;
+}
+
+/**
+ * Read at most `maxBytes` from an already-open body reader, bounded by the same
+ * deadline the stream uses. Used only for an error snippet the caller passes to
+ * `classifyHttpError`, so a read failure or a body that never ends yields the
+ * bytes seen so far and lets the HTTP status carry the classification; the
+ * caller's `finally` cancels the reader and aborts the request.
+ */
+async function readBoundedText(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  maxBytes: number,
+  budgetMs: number,
+): Promise<string> {
+  const decoder = new TextDecoder();
+  let text = "";
+  let bytes = 0;
+  try {
+    for (;;) {
+      const chunk = await raceDeadline(reader.read(), budgetMs);
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+      text += decoder.decode(chunk.value, { stream: true });
+      if (bytes >= maxBytes) break;
+    }
+  } catch {
+    // A stalled or failed error body is not itself the verdict; the status code
+    // is. Returning what was read keeps this path bounded and fail-closed.
+  }
+  return text;
 }
 
 type PullLineVerdict =

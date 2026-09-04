@@ -183,7 +183,45 @@ export async function resolveOllamaModelsRoot(
 // per five seconds still proves within a glance that the download is moving.
 const PULL_PROGRESS_PRINT_INTERVAL_MS = 5_000;
 
-/** One operator-facing line per reported pull progress event. */
+// The status forms Ollama emits during a pull. The renderer below prints one of
+// these exact strings or a fixed token, never the runtime's own bytes.
+const KNOWN_PULL_STATUSES: ReadonlySet<string> = new Set([
+  "pulling manifest",
+  "verifying sha256 digest",
+  "writing manifest",
+  "removing any unused layers",
+  "success",
+]);
+// 64 = the hex length of a SHA-256 digest; Ollama abbreviates the layer digest
+// in `pulling <digest>`, so the shortest form worth rendering is a 6-character
+// prefix and the longest is the full digest.
+const PULL_STATUS_DIGEST_MAX_HEX_CHARS = 64;
+const PULL_STATUS_DIGEST_MIN_HEX_CHARS = 6;
+const PULL_DIGEST_STATUS = new RegExp(
+  `^pulling (?:sha256:)?([0-9a-f]{${PULL_STATUS_DIGEST_MIN_HEX_CHARS},${PULL_STATUS_DIGEST_MAX_HEX_CHARS}})$`,
+);
+const UNRECOGNIZED_PULL_STATUS = "runtime status";
+
+/**
+ * Project the runtime's `status` onto a closed set of forms this renderer
+ * writes itself. The string arrives from the Ollama process and lands on the
+ * operator's terminal, where a newline could forge a fresh log line, an ANSI
+ * escape could rewrite what is already on screen, and an unbounded length could
+ * bury the surrounding output; an allowlist that reconstructs its output means
+ * no untrusted byte is ever echoed, rather than a denylist of the escapes
+ * someone remembered.
+ */
+function renderPullStatus(status: string): string {
+  if (KNOWN_PULL_STATUSES.has(status)) return status;
+  const digest = PULL_DIGEST_STATUS.exec(status);
+  return digest === null ? UNRECOGNIZED_PULL_STATUS : `pulling ${digest[1]}`;
+}
+
+/**
+ * One operator-facing line per reported pull progress event. `runtimeTag` is
+ * derived from the signed catalog entry (schema-validated identity components),
+ * not from the runtime, so only the status needs projecting.
+ */
 export function formatPullProgress(
   runtimeTag: string,
   progress: OllamaPullProgress,
@@ -195,7 +233,7 @@ export function formatPullProgress(
     // layer in flight, omitted entirely when it does not report both counters.
     ? ` ${Math.floor((completed / total) * 100)}%`
     : "";
-  return `Pulling ${runtimeTag}: ${progress.status}${share}`;
+  return `Pulling ${runtimeTag}: ${renderPullStatus(progress.status)}${share}`;
 }
 
 function errorCode(error: unknown): string | undefined {
