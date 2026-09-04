@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- **`sanctuary intelligence config-reset` recovers a fortress whose local-intelligence config record has become unreadable.** A record that no longer decrypts or parses, or that was written by a newer Sanctuary, now fails every local-intelligence config write with a typed error naming this verb (reads keep booting on defaults). The verb requires an interactive terminal and a typed confirmation with no bypass flag, unlocks the fortress with write intent, refuses any readable record (armed or legacy) and any Q5 integrity refusal, copies the unreadable record's raw bytes to an owner-only timestamped sidecar in the fortress's `_intelligence` state directory, removes the record, and audits the quarantine. Operator choices and API keys inside the unreadable record are not recovered. Runbook: `server/docs/cli-operator-verbs.md`.
+
 ### Fixed
 
 - **Rung 1 memory reads are hands-free by default.** `memory_get` and `memory_search` are Tier 3 under the default policy, so the documented restart acceptance step (store a marker, restart, read it back with no secret typed) completes with no approval prompt. The vault is one operator-owned memory scope shared by every agent connected to the fortress; the one-owner guard refuses a second distinct wrapped identity where an identity resolver is wired, and per-agent memory isolation is not yet implemented. `memory_search` is bounded at the tool boundary: 10 results by default and at most 500 (a larger `limit` is clamped), a non-empty needle of at most 8192 bytes, and a tag filter that must be a valid SDW identifier; every refusal is audited. `memory_insert`, `memory_delete`, `memory_list`, `memory_count`, and every plaintext-crossing memory verb stay Tier 1. Capability bound: master-key rotation does not yet cover the memory namespaces; while memory records are present, rotation refuses at preflight and changes nothing, and no shipped procedure yet rotates a fortress that holds memory records.

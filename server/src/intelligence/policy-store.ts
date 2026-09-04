@@ -24,6 +24,20 @@
  * Version 1 remains the legacy-unarmed shape. Version 2 is created only by
  * the injected Q5 provisioning commit and must carry one complete, reverified
  * `LocalIntegrityStateV2`; a partial V2 is never salvaged as legacy.
+ *
+ * Unreadable durable records (Q5E residual 2):
+ * A record that does not decrypt or parse (`corrupt`) or that carries a
+ * version this build does not know (`version-too-new`) fails EVERY config
+ * write closed with `IntelligenceConfigUnreadableError`, whose message names
+ * the one recovery verb. That verb calls `quarantineUnreadable()`, which
+ * copies the raw bytes to a timestamped sidecar file beside the record (a
+ * plain file, never a `.enc` entry, so namespace enumeration and master
+ * rotation skip it) and only then removes the record. An "empty V2" cannot
+ * exist (V2 by contract carries a complete verified integrity state), so the
+ * reinitialized state is the ABSENT record, which `load()` reads as the
+ * default legacy-unarmed config. Readable records, armed or legacy, are never
+ * quarantined; an armed record that fails Q5 validation is an integrity
+ * refusal, not an unreadable record, and has no in-product disarm.
  */
 
 import type {
@@ -49,13 +63,35 @@ import {
   type SubstrateConfig,
   type SubstrateConfigV2,
 } from "./types.js";
-import { withCrossProcessLock } from "../storage/cross-process-lock.js";
+import {
+  withCrossProcessLock,
+  type CrossProcessLockOptions,
+} from "../storage/cross-process-lock.js";
+import { writeFileCustody } from "../storage/custody-fs.js";
+import { stat } from "node:fs/promises";
+import { join } from "node:path";
 
 export const INTELLIGENCE_NAMESPACE = "_intelligence";
 export const SUBSTRATE_CONFIG_KEY = "substrate-config";
 /** Distinct from the provisioning lock: every config writer shares this save chokepoint. */
 export const Q5_CONFIG_SAVE_LOCK_FILE = ".q5-config-save.lock";
 const HKDF_INFO = "intelligence-substrate-config";
+/**
+ * The one operator verb that recovers an unreadable durable record. Must match
+ * the `config-reset` subcommand and help text in `cli/intelligence.ts`; the
+ * typed refusal below quotes it so the remedy travels with the error.
+ */
+export const INTELLIGENCE_CONFIG_RESET_VERB = "sanctuary intelligence config-reset";
+/**
+ * Sidecar file prefix for quarantined record bytes. The full name is
+ * `<prefix><UTC stamp>.bin`, deliberately NOT ending in `.enc`: it must stay
+ * outside the `.enc` filter in `storage/filesystem.ts list()` so namespace
+ * enumeration and the master-rotation walk never try to decrypt it.
+ */
+export const SUBSTRATE_CONFIG_QUARANTINE_PREFIX = "substrate-config.quarantine.";
+const QUARANTINE_FILE_SUFFIX = ".bin";
+/** 0o600: the quarantined ciphertext keeps the record's owner-only custody. */
+const QUARANTINE_FILE_MODE = 0o600;
 
 /**
  * Outcome of a load attempt. The selector audit-emits based on which
@@ -87,9 +123,72 @@ export class LocalIntegrityStateLoadError extends Error {
   }
 }
 
+/** The two durable-record shapes no writer may reinterpret and no reader can use. */
+export type UnreadableConfigKind = "corrupt" | "version-too-new";
+
+/**
+ * A durable record exists but cannot be consumed by this build. Extends the
+ * closed Q5 refusal (reason stays `integrity_state_invalid`, so provisioning's
+ * refusal taxonomy is unchanged) and adds the remedy: every write fails closed
+ * until the operator runs {@link INTELLIGENCE_CONFIG_RESET_VERB}.
+ */
+export class IntelligenceConfigUnreadableError extends LocalIntegrityStateLoadError {
+  readonly remedy: string;
+
+  constructor(
+    readonly kind: UnreadableConfigKind,
+    /** Present only for `version-too-new`; a corrupt record has no trusted version. */
+    readonly persistedVersion: number | null = null,
+  ) {
+    super("integrity_state_invalid");
+    this.name = "IntelligenceConfigUnreadableError";
+    this.remedy =
+      `run "${INTELLIGENCE_CONFIG_RESET_VERB}" to quarantine the unreadable record ` +
+      "and reinitialize local-intelligence config to the default legacy-unarmed state " +
+      "(a fortress armed on that record is unarmed until re-provisioned)";
+    const shape = kind === "version-too-new"
+      ? `version ${persistedVersion} is newer than this build supports`
+      : "the record does not decrypt or parse";
+    this.message =
+      `Q5 integrity state refused: integrity_state_invalid (durable config is ${kind}: ` +
+      `${shape}; ${this.remedy})`;
+  }
+}
+
+/** Result of {@link IntelligenceConfigStore.quarantineUnreadable}. */
+export type QuarantineOutcome =
+  | {
+    kind: "quarantined";
+    persisted: UnreadableConfigKind;
+    persistedVersion: number | null;
+    /** Sidecar file name inside the `_intelligence` namespace directory. */
+    quarantineFile: string;
+    /** Absolute sidecar path, for the operator-facing report. */
+    quarantinePath: string;
+    bytes: number;
+  }
+  | { kind: "absent" }
+  | {
+    kind: "refused";
+    reason:
+      /** The record loads; quarantining it would discard live operator state. */
+      | "readable"
+      /** An armed V2 record failed Q5 validation; that is not an unreadable record. */
+      | "integrity-state-invalid"
+      /** A sidecar with this stamp already exists; never overwrite quarantined bytes. */
+      | "quarantine-exists";
+    detail: string;
+  };
+
 export interface IntelligenceConfigStoreOptions {
   /** Test/fixture seam; production uses the pinned release key. */
   modelManifestV2PublicKey?: Uint8Array;
+  /**
+   * Test seam for the config-save lock: `onContended` lets an adversarial-
+   * schedule test prove a second saver actually blocked on the lock instead
+   * of inferring it from elapsed time. Never changes acquire behavior.
+   */
+  saveLockOptions?: Pick<CrossProcessLockOptions, "onContended" | "retryMs" | "timeoutMs">;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -146,6 +245,7 @@ export class IntelligenceConfigStore {
   private storage: StorageBackend;
   private encryptionKey: Uint8Array;
   private modelManifestV2PublicKey: Uint8Array | null;
+  private saveLockOptions: IntelligenceConfigStoreOptions["saveLockOptions"];
   private saveLockDepth = 0;
 
   constructor(
@@ -157,6 +257,7 @@ export class IntelligenceConfigStore {
     this.encryptionKey = derivePurposeKey(masterKey, HKDF_INFO);
     this.modelManifestV2PublicKey =
       options.modelManifestV2PublicKey ?? loadPinnedModelManifestKey();
+    this.saveLockOptions = options.saveLockOptions;
   }
 
   /**
@@ -191,6 +292,18 @@ export class IntelligenceConfigStore {
     if (outcome.kind === "loaded") return outcome.config;
     if (outcome.kind === "integrity-state-invalid") {
       throw new LocalIntegrityStateLoadError(outcome.reason);
+    }
+    // An unreadable record names its remedy at the refusal, because every
+    // config write funnels through this read and would otherwise fail with a
+    // generic reason the operator cannot act on.
+    if (outcome.kind === "corrupt") {
+      throw new IntelligenceConfigUnreadableError("corrupt");
+    }
+    if (outcome.kind === "version-too-new") {
+      throw new IntelligenceConfigUnreadableError(
+        "version-too-new",
+        outcome.persistedVersion,
+      );
     }
     throw new LocalIntegrityStateLoadError("integrity_state_invalid");
   }
@@ -286,7 +399,7 @@ export class IntelligenceConfigStore {
           this.saveLockDepth -= 1;
         }
       },
-      { metadata: { purpose: "q5-intelligence-config-save" } },
+      { ...this.saveLockOptions, metadata: { purpose: "q5-intelligence-config-save" } },
     );
   }
 
@@ -304,6 +417,14 @@ export class IntelligenceConfigStore {
       ...config,
       updatedAt: new Date().toISOString(),
     };
+    // INVARIANT (Q5E residual 1): the durable read below and the write at the
+    // end of this method are one critical section under the cross-process
+    // config-save lock, for every writer, provisioning or routine. A lock was
+    // chosen over a post-write verify because a verify can only detect a lost
+    // update after the armed V2 bytes are already gone and cannot restore
+    // them; the lock makes the V1-over-V2 interleaving unconstructible, and
+    // the loser re-reads the committed V2 record and refuses with a typed
+    // error instead of overwriting it.
     const durable = await this.loadAuthoritative();
     if (durable?.version === 2) {
       // INVARIANT: the durable record, not any in-memory snapshot, is the
@@ -360,6 +481,17 @@ export class IntelligenceConfigStore {
     if (current.kind === "integrity-state-invalid") {
       throw new LocalIntegrityStateLoadError(current.reason);
     }
+    // An unreadable record leaves only through the quarantine verb, which
+    // preserves its bytes; a silent delete here would discard the evidence.
+    if (current.kind === "corrupt") {
+      throw new IntelligenceConfigUnreadableError("corrupt");
+    }
+    if (current.kind === "version-too-new") {
+      throw new IntelligenceConfigUnreadableError(
+        "version-too-new",
+        current.persistedVersion,
+      );
+    }
     if (current.config.version === 2) {
       throw new LocalIntegrityStateLoadError("integrity_state_invalid");
     }
@@ -369,5 +501,98 @@ export class IntelligenceConfigStore {
       // Storage backend may not support delete on a non-existent key;
       // the selector tolerates this and proceeds with defaults.
     }
+  }
+
+  /**
+   * Recovery path for an unreadable durable record (the only one). Copies the
+   * raw record bytes to a timestamped sidecar file, then removes the record so
+   * the next `load()` returns the default legacy-unarmed config. Runs under
+   * the config-save lock so no writer can observe the record half-moved.
+   *
+   * Ordering is write-sidecar-then-delete: a crash after the sidecar write
+   * leaves both files (a rerun quarantines again under a new stamp), and a
+   * crash after the delete leaves the sidecar; at no point is the record gone
+   * with no copy of its bytes. Refuses a readable record (armed or legacy) and
+   * an armed record that failed Q5 validation, because neither is unreadable.
+   *
+   * INVARIANT (consent): this method carries only the data-plane refusals
+   * above. It has no terminal check, no typed confirmation, and no unlock of
+   * its own, so EVERY caller must repeat the `config-reset` gates (interactive
+   * TTY, typed word, write-intent master unlock) before reaching it, and it
+   * must never be reachable from an MCP tool or an HTTP route. The result
+   * leaves a fortress that was armed on the unreadable record in the default
+   * legacy-unarmed state. `test/structure/q5e-config-reset-chokepoint.test.ts`
+   * pins the single production caller.
+   */
+  async quarantineUnreadable(
+    options: { now?: () => Date } = {},
+  ): Promise<QuarantineOutcome> {
+    return this.withSaveLock(async () => {
+      const capabilities = this.storage as Partial<FilesystemStorageCapabilities>;
+      if (capabilities.namespacePath === undefined) {
+        // Only a filesystem-backed fortress has a sibling location that stays
+        // outside the encrypted-record set; no other backend may quarantine.
+        throw new LocalIntegrityStateLoadError("integrity_io_unavailable");
+      }
+      const raw = await this.storage.read(INTELLIGENCE_NAMESPACE, SUBSTRATE_CONFIG_KEY);
+      if (raw === null) return { kind: "absent" };
+      const outcome = this.decode(raw);
+      if (outcome.kind === "loaded" || outcome.kind === "default") {
+        return {
+          kind: "refused",
+          reason: "readable",
+          detail: `the durable record is readable (version ${outcome.config.version})`,
+        };
+      }
+      if (outcome.kind === "integrity-state-invalid") {
+        return {
+          kind: "refused",
+          reason: "integrity-state-invalid",
+          detail: `the armed record failed Q5 integrity validation (${outcome.reason})`,
+        };
+      }
+      const persistedVersion = outcome.kind === "version-too-new"
+        ? outcome.persistedVersion
+        : null;
+      // ISO-8601 with ":" and "." folded to "-" so the stamp is one plain
+      // path component on every filesystem this fortress may live on.
+      const stamp = (options.now ?? (() => new Date))().toISOString()
+        .replace(/[:.]/g, "-");
+      const quarantineFile =
+        `${SUBSTRATE_CONFIG_QUARANTINE_PREFIX}${stamp}${QUARANTINE_FILE_SUFFIX}`;
+      const quarantinePath = join(
+        capabilities.namespacePath.call(this.storage, INTELLIGENCE_NAMESPACE),
+        quarantineFile,
+      );
+      // Quarantined bytes are evidence and are never overwritten; the atomic
+      // temp-and-rename below would replace a same-stamp sidecar silently.
+      if (await pathExists(quarantinePath)) {
+        return {
+          kind: "refused",
+          reason: "quarantine-exists",
+          detail: `a quarantine sidecar already exists at ${quarantinePath}`,
+        };
+      }
+      await writeFileCustody(quarantinePath, raw, { mode: QUARANTINE_FILE_MODE });
+      await this.storage.delete(INTELLIGENCE_NAMESPACE, SUBSTRATE_CONFIG_KEY);
+      return {
+        kind: "quarantined",
+        persisted: outcome.kind,
+        persistedVersion,
+        quarantineFile,
+        quarantinePath,
+        bytes: raw.length,
+      };
+    });
+  }
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
   }
 }

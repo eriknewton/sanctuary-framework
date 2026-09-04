@@ -12,6 +12,7 @@ describe("audit operation name constants", () => {
       PII_REDACTION_EVENT: "intelligence_pii_redaction_event",
       CONFIG_LOADED: "intelligence_config_loaded",
       CONFIG_RESET: "intelligence_config_reset",
+      CONFIG_QUARANTINED: "intelligence_config_quarantined",
       MODEL_PULL: "intelligence_model_pull",
       MODEL_PROVISION_REFUSED: "intelligence_model_provision_refused",
       LOAD_INTEGRITY: "intelligence_load_integrity",
