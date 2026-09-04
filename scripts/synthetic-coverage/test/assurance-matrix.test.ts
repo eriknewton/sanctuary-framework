@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { loadAssuranceMatrix } from "../assurance-matrix.js";
+import { EXPECTED_ASSURANCE_ROW_COUNT, loadAssuranceMatrix } from "../assurance-matrix.js";
 
 describe("loadAssuranceMatrix", () => {
-  it("parses the canonical 23 row matrix", () => {
+  it("parses the canonical matrix at its pinned row count", () => {
     const rows = loadAssuranceMatrix();
 
-    expect(rows).toHaveLength(23);
+    expect(rows).toHaveLength(EXPECTED_ASSURANCE_ROW_COUNT);
     expect(rows.map((row) => row.label)).toEqual(
       expect.arrayContaining([
         "Tamper-evident audit chain",
@@ -17,7 +17,7 @@ describe("loadAssuranceMatrix", () => {
       ]),
     );
     expect(rows.map((row) => row.id)).toEqual(
-      Array.from({ length: 23 }, (_, index) => String(index + 1)),
+      Array.from({ length: EXPECTED_ASSURANCE_ROW_COUNT }, (_, index) => String(index + 1)),
     );
   });
 });
