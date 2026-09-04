@@ -25,11 +25,14 @@ import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
   existsSync,
+  lstatSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   rmSync,
   statSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -89,8 +92,9 @@ describe("sealed Castle Wall CLI runtime layout", () => {
       expect(files.filter((path) => /\.(map|cjs|d\.ts|d\.cts|d\.mts)$/.test(path))).toEqual([]);
       expect(existsSync(join(dist, "boot-runtime"))).toBe(false);
       expect(files.length).toBeGreaterThanOrEqual(SEALED_CLI_RUNTIME_DIST_ENTRIES.length);
-      // No symlinks inside the staged runtime (the signed bundle rule).
-      for (const path of walk(runtime)) expect(statSync(path).isSymbolicLink()).toBe(false);
+      // No symlinks inside the staged runtime (the signed bundle rule). lstat,
+      // not stat: stat follows the link and would report the target's type.
+      for (const path of walk(runtime)) expect(lstatSync(path).isSymbolicLink(), path).toBe(false);
     },
   );
 
@@ -102,13 +106,24 @@ describe("sealed Castle Wall CLI runtime layout", () => {
       // Dependencies via the server's own install; the layout's dist/ and
       // package.json are the staged bytes.
       symlinkSync(join(serverRoot, "node_modules"), join(runtime, "node_modules"), "dir");
+      // The keychain chokepoint finds its package root by walking up from
+      // dist/cli.js to the nearest package.json, which in this layout is the
+      // staged root, so the test-run marker must exist THERE. Always write it:
+      // a child that reads "no marker" would classify itself as production.
       const marker = join(serverRoot, TEST_RUN_MARKER_FILENAME);
       if (existsSync(marker)) copyFileSync(marker, join(runtime, TEST_RUN_MARKER_FILENAME));
+      else writeFileSync(join(runtime, TEST_RUN_MARKER_FILENAME), "sealed-cli-runtime-layout-smoke\n");
+      expect(existsSync(join(runtime, TEST_RUN_MARKER_FILENAME))).toBe(true);
 
       const root = join(runtime, "..");
       const fortress = join(root, "fortress");
       const recoveryOut = join(root, "recovery-key.txt");
-      const env = { ...process.env };
+      // Isolation belt: --no-pin keeps the run off any keychain; a private HOME
+      // means even an accidental keychain or ~/.sanctuary lookup cannot reach
+      // the operator's.
+      const home = join(root, "home");
+      mkdirSync(home, { recursive: true });
+      const env: NodeJS.ProcessEnv = { ...process.env, HOME: home };
       delete env.SANCTUARY_PASSPHRASE;
       delete env.SANCTUARY_RECOVERY_KEY;
       delete env.NODE_OPTIONS;

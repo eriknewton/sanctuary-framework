@@ -16,7 +16,8 @@ import { join, relative } from "node:path";
 // server/src/cli/install.ts `required` (the installer's verifier); this is the
 // same list the stage script gates on, re-checked here over the manifest walk.
 import {
-  SEALED_CLI_RUNTIME_DIST_ENTRIES,
+  deniedSealedCliRuntimeManifestPaths,
+  enforcedSealedCliRuntimeDistEntries,
   missingSealedCliRuntimeManifestEntries,
 } from "./sealed-cli-runtime-entries.mjs";
 
@@ -93,9 +94,19 @@ packages.sort((a, b) => a.path.localeCompare(b.path));
 // worker, templates, reference plugins, catalog assets) must be in the walk;
 // a runtime that is missing one is refused a manifest, so the signed build
 // fails here rather than on the first `sanctuary protect` of an installed Mac.
-const missingDistEntries = missingSealedCliRuntimeManifestEntries(files.map((entry) => entry.path));
+const filePathList = files.map((entry) => entry.path);
+const missingDistEntries = missingSealedCliRuntimeManifestEntries(filePathList);
 if (missingDistEntries.length > 0) {
   throw new Error(`sealed CLI runtime is incomplete; missing dist entries: ${missingDistEntries.join(", ")}`);
+}
+// The whole-tree copy has no ceiling of its own; the deny set is it. Test
+// material or key-shaped files under dist/ must never be codesigned into a
+// release, so their presence refuses the manifest.
+const deniedDistPaths = deniedSealedCliRuntimeManifestPaths(filePathList);
+if (deniedDistPaths.length > 0) {
+  throw new Error(
+    `sealed CLI runtime carries denied files: ${deniedDistPaths.map(([path, glob]) => `${path} (${glob})`).join(", ")}`,
+  );
 }
 const packageJsonCount = files.filter((entry) => entry.path.endsWith("/package.json")).length;
 const nestedPackageCount = packages.filter(
@@ -133,9 +144,10 @@ const manifest = {
     // The required dist entries this runtime was verified to carry (paths
     // relative to Resources/cli-runtime/dist), so an installer or doctor can
     // check presence without re-deriving the set from the build inputs.
-    dist_entries: SEALED_CLI_RUNTIME_DIST_ENTRIES.map((entry) => ({
+    dist_entries: enforcedSealedCliRuntimeDistEntries().map((entry) => ({
       path: entry.path,
       kind: entry.kind,
+      ...(entry.kind === "dir" ? { sentinel: entry.sentinel } : {}),
     })),
   },
   files,

@@ -280,15 +280,15 @@ jobs:
           test -x "$LAUNCHER"
           test -s "$MANIFEST"
           test -d "$CLI_RUNTIME/node_modules/@modelcontextprotocol/sdk"
-          # The sealed CLI reaches these by path from dist/cli.js; the worker is
-          # what every fortress creation forks. Same list the stage script and
-          # the manifest builder gate on (server/scripts/sealed-cli-runtime-entries.mjs).
+          # The sealed CLI reaches its dist/ siblings by path (the worker every
+          # fortress creation forks, templates, reference plugins, catalog
+          # assets). The shared gate checks presence WITH each directory's
+          # sentinel file and rejects every denied file class; it is the same
+          # gate the stage script and the manifest builder run
+          # (server/scripts/sealed-cli-runtime-entries.mjs).
           test -s "$CLI_RUNTIME/dist/directory-capability-worker.js"
-          test -d "$CLI_RUNTIME/dist/templates"
-          test -d "$CLI_RUNTIME/dist/reference-plugin"
-          test -d "$CLI_RUNTIME/dist/intelligence/catalog-v3"
-          node ../server/scripts/sealed-cli-runtime-entries.mjs --assert "$CLI_RUNTIME/dist"
-          test -z "$(find "$CLI_RUNTIME/dist" -name '*.map' -print -quit)"
+          node ../server/scripts/sealed-cli-runtime-assert.mjs "$CLI_RUNTIME/dist"
+          test -z "$(find "$CLI_RUNTIME" -type f -links +1 -print -quit)"
           test "$(stat -f '%Lp' "$NODE")" = 555
           test "$(stat -f '%Lp' "$DAEMON")" = 444
           test "$(stat -f '%Lp' "$CLI")" = 444
@@ -540,10 +540,8 @@ jobs:
           test -s "$ARTIFACT_CLI_RUNTIME/dist/cli.js"
           test -s "$ARTIFACT_CLI_RUNTIME/dist/directory-capability-worker.js"
           test -s "$ARTIFACT_CLI_RUNTIME/package.json"
-          test -d "$ARTIFACT_CLI_RUNTIME/dist/templates"
-          test -d "$ARTIFACT_CLI_RUNTIME/dist/reference-plugin"
-          test -d "$ARTIFACT_CLI_RUNTIME/dist/intelligence/catalog-v3"
-          node ../server/scripts/sealed-cli-runtime-entries.mjs --assert "$ARTIFACT_CLI_RUNTIME/dist"
+          node ../server/scripts/sealed-cli-runtime-assert.mjs "$ARTIFACT_CLI_RUNTIME/dist"
+          test -z "$(find "$ARTIFACT_CLI_RUNTIME" -type f -links +1 -print -quit)"
           test -d "$ARTIFACT_CLI_RUNTIME/node_modules/@modelcontextprotocol/sdk"
           test -x "$ARTIFACT_LAUNCHER"
           test -s "$ARTIFACT_MANIFEST"

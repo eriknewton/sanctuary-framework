@@ -40,9 +40,10 @@ REPO_DIR="$(cd "${PKG_DIR}/.." && pwd)"
 CLI_RUNTIME_SRC="${SANCTUARY_CLI_RUNTIME_DIR:-${REPO_DIR}/server/dist}"
 CLI_RUNTIME_NODE_MODULES="${SANCTUARY_CLI_NODE_MODULES:-${REPO_DIR}/server/node_modules}"
 CLI_RUNTIME_PACKAGE_JSON="${SANCTUARY_CLI_PACKAGE_JSON:-${REPO_DIR}/server/package.json}"
-# Must match the list in server/scripts/sealed-cli-runtime-entries.mjs; that
-# file is the presence gate this script runs after copying.
-CLI_RUNTIME_ENTRIES="${REPO_DIR}/server/scripts/sealed-cli-runtime-entries.mjs"
+# The gate this script runs after copying: presence of every required entry
+# (with its sentinel file) and absence of every denied file, both defined in
+# server/scripts/sealed-cli-runtime-entries.mjs.
+CLI_RUNTIME_ASSERT="${REPO_DIR}/server/scripts/sealed-cli-runtime-assert.mjs"
 
 log() {
     echo "[stage-cli-runtime] $*"
@@ -74,7 +75,7 @@ command -v node >/dev/null 2>&1 || fail "required command not found on PATH: nod
 # have produced before the runtime can be staged at all.
 [ -f "${CLI_RUNTIME_SRC}/cli.js" ] || fail "built CLI runtime not found at ${CLI_RUNTIME_SRC}/cli.js (run npm run build in server/)"
 [ -f "${CLI_RUNTIME_PACKAGE_JSON}" ] || fail "package manifest not found at ${CLI_RUNTIME_PACKAGE_JSON}"
-[ -f "${CLI_RUNTIME_ENTRIES}" ] || fail "sealed-runtime entry list not found at ${CLI_RUNTIME_ENTRIES}"
+[ -f "${CLI_RUNTIME_ASSERT}" ] || fail "sealed-runtime gate not found at ${CLI_RUNTIME_ASSERT}"
 if [ "${DIST_ONLY}" = "0" ]; then
     [ -d "${CLI_RUNTIME_NODE_MODULES}" ] || fail "dependency closure not found at ${CLI_RUNTIME_NODE_MODULES}"
 fi
@@ -96,10 +97,18 @@ fi
 #                   `cli.js`, which never requires a `.cjs` sibling
 #   /boot-runtime/  the Castle Wall boot daemon, sealed separately by
 #                   build-wrapped.sh at Contents/Resources/boot-runtime
+# Each exclude here must correspond to a glob in SEALED_CLI_RUNTIME_DIST_DENY
+# (server/scripts/sealed-cli-runtime-entries.mjs); the gate below re-checks the
+# staged tree against the full deny set, so anything the excludes miss (test
+# material, key-shaped files) fails the build instead of shipping.
 # server/test/structure/sealed-cli-runtime-contents.test.ts parses this exact
-# exclude list and fails if any pattern would drop a required entry.
+# exclude list and fails if any pattern would drop a required entry or lacks
+# its deny-set counterpart.
+#
+# --delete keeps a re-stage into an existing destination idempotent: a file
+# that left dist/ leaves the runtime too instead of surviving as a stale copy.
 mkdir -p "${CLI_RUNTIME_DEST}/dist"
-rsync -a \
+rsync -a --delete \
     --exclude='*.map' \
     --exclude='*.d.ts' \
     --exclude='*.d.cts' \
@@ -113,19 +122,27 @@ if [ "${DIST_ONLY}" = "0" ]; then
     # `.bin` holds symlinks into packages; the sealed runtime is exec'd by
     # absolute path and must not contain symbolic links (checked below).
     mkdir -p "${CLI_RUNTIME_DEST}/node_modules"
-    rsync -a --exclude='.bin' "${CLI_RUNTIME_NODE_MODULES}/" "${CLI_RUNTIME_DEST}/node_modules/"
+    rsync -a --delete --exclude='.bin' "${CLI_RUNTIME_NODE_MODULES}/" "${CLI_RUNTIME_DEST}/node_modules/"
 else
     log "--dist-only: node_modules not staged (test-harness mode)"
 fi
 
+# The runtime is sealed by the app signature over exactly the bytes in place. A
+# symlink would let a signed path resolve to unsigned bytes; a hardlinked file
+# (link count above one) shares its bytes with a path outside the seal, so a
+# write through the other name changes the signed runtime. Both fail the build.
 if find "${CLI_RUNTIME_DEST}" -type l -print -quit | grep -q .; then
     fail "CLI runtime must not contain symbolic links"
 fi
+if find "${CLI_RUNTIME_DEST}" -type f -links +1 -print -quit | grep -q .; then
+    fail "CLI runtime must not contain hardlinked files"
+fi
 
-# Presence gate: every entry the CLI reaches at run time must be in the staged
-# tree. This turns "cli.js alone" into a build failure rather than a first-run
-# failure on an installed Mac.
-node "${CLI_RUNTIME_ENTRIES}" --assert "${CLI_RUNTIME_DEST}/dist" \
-    || fail "staged CLI runtime is incomplete under ${CLI_RUNTIME_DEST}/dist"
+# Gate: every entry the CLI reaches at run time is in the staged tree (with its
+# sentinel file, so an empty directory does not pass), and nothing in the deny
+# set is. This turns "cli.js alone" or "fixtures shipped" into a build failure
+# rather than a first-run failure on an installed Mac.
+node "${CLI_RUNTIME_ASSERT}" "${CLI_RUNTIME_DEST}/dist" \
+    || fail "staged CLI runtime failed the contents gate under ${CLI_RUNTIME_DEST}/dist"
 
 log "staged sealed CLI runtime at ${CLI_RUNTIME_DEST} ($(find "${CLI_RUNTIME_DEST}/dist" -type f | wc -l | tr -d ' ') dist files)"

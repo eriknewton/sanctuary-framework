@@ -130,10 +130,15 @@ complete built `server/dist` tree (every compiled entry point, including the
 storage worker that fortress creation starts, plus the agent templates,
 reference plugins, and catalog schemas), the package manifest, and the
 production dependency closure. Source maps, type declarations, and the CommonJS
-duals are left out. The staged set is checked against
-`server/scripts/sealed-cli-runtime-entries.mjs` at build time and recorded in
-`cli-runtime-manifest.json`, so a Mac with no Node of its own can create and
-boot fortresses from the signed app alone.
+duals are left out, and the build refuses a tree that carries test material or
+key-shaped files. The staged set is checked against
+`server/scripts/sealed-cli-runtime-entries.mjs` at build time (every entry the
+CLI reaches at run time must be present, with a sentinel file inside each asset
+directory, and nothing from the deny set may be), recorded in
+`cli-runtime-manifest.json`, and re-checked by `sanctuary install` before the
+installer plans against that app. Whether a given released artifact creates a
+fortress on a Node-less Mac is confirmed per release on the exact artifact, not
+inferred from this build check.
 
 ## Security model
 
