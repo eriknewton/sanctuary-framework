@@ -366,9 +366,18 @@ export async function readEpochWitness(
  * (that would itself be a rollback-laundering write). A higher epoch (a
  * legitimate rotation) or an equal epoch (re-stamp) is accepted.
  *
- * `force` (restore-attest only) re-baselines to an explicit epoch even when it
- * is lower than the current witness — the audited, passphrase-gated escape
- * hatch. Without it, witness writes are strictly non-decreasing.
+ * `force` re-baselines to an explicit epoch even when it is lower than the
+ * current witness. Two callers hold it: `restoreAttest` below (the audited,
+ * passphrase-gated escape hatch) and master rotation's `finalize` in
+ * `core/master-rotation.ts` (advancing the epoch past a concurrent stale
+ * witness). Without it, witness writes are strictly non-decreasing. `force`
+ * ALSO bypasses the latch carry below, so every force caller must read the
+ * current witness itself and carry its whole authenticated data object
+ * forward, overriding only the fields it owns. Rotation's `finalize` carries
+ * the whole authenticated object (pinned as its "CARRY INVARIANT" in
+ * `advanceEpochWitnessData`); `restoreAttest` below carries the three known
+ * latches explicitly. A force caller that carries nothing is a latch-erasing
+ * write.
  */
 export async function writeEpochWitness(
   storage: StorageBackend,
@@ -391,8 +400,9 @@ export async function writeEpochWitness(
     // monotonic too: a non-force write must never DROP an already-set latch nor
     // LOWER the sealed-schema floor (either would launder a baseline deletion /
     // downgrade by re-stamping the witness). Carry them forward unless the caller
-    // is explicitly raising them. `force` (restore-attest) preserves them via its
-    // own read, so it is excluded here.
+    // is explicitly raising them. `force` callers (restoreAttest here, and
+    // master rotation's finalize in core/master-rotation.ts) preserve them via
+    // their own read, so they are excluded here; see the doc comment above.
     if (current.status === "valid") {
       if (current.data.baseline_established === true && data.baseline_established !== true) {
         toWrite = { ...toWrite, baseline_established: true };
