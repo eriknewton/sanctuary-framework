@@ -78,9 +78,9 @@ import {
 } from "./dashboard/v1_1/wiring.js";
 import { readPersistedLocalAgents } from "./hub/agent-registry-persistence.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
-// Boot refuses on this: an armed local-intelligence record that fails its
-// integrity checkpoint must stop the process, not degrade it.
-import { LocalIntegrityStateLoadError } from "./intelligence/policy-store.js";
+// Boot refuses on every local-intelligence wiring failure; this names which
+// condition refused it. MUST MATCH the use in `index.ts`.
+import { describeIntelligenceBootFailure } from "./intelligence/policy-store.js";
 import { installConsentGatedRedactor } from "./intelligence/privacy-tier2-redactor.js";
 import { createCompiledContextRuntime } from "./compiled-context/runtime.js";
 import { DistressInbox } from "./distress/inbox.js";
@@ -1332,26 +1332,17 @@ async function wireUnlockedDeps(args: {
       fortressId: fortressIdFromStoragePath(config.storage_path),
     });
   } catch (err) {
-    // An armed record that fails the integrity checkpoint is a tamper result,
-    // not a missing optional panel; degrading here would let a dashboard come
-    // up with local intelligence quietly switched off. MUST MATCH the same
-    // refusal in `index.ts`; the two entrypoints share one fortress, so a
-    // record either entrypoint refuses must not be startable through the other.
-    if (err instanceof LocalIntegrityStateLoadError) {
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(
-        `\nSanctuary cannot start.\nLocal-intelligence state failed its boot ` +
-          `integrity check: ${err.message}\n`,
-      );
-      throw err;
-    }
+    // ALLOWLIST, not denylist, and the allowlist of degradable conditions is
+    // empty: every failure of this block refuses startup, and the shared
+    // classifier only names which condition refused. Degrading here would let
+    // a dashboard come up with local intelligence quietly switched off. MUST
+    // MATCH the same refusal in `index.ts`; the two entrypoints share one
+    // fortress, so a record either entrypoint refuses must not be startable
+    // through the other, and both read the classifier rather than each
+    // deciding for itself.
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(
-      `  Note: Intelligence panel unavailable (${(err as Error).message}).`,
-    );
-    intelligenceSelector = undefined;
-    // tierBPiiRedactorInstalled stays false (its initialized value): the
-    // install assignment above only completes when the try did not throw.
+    console.error(`\nSanctuary cannot start.\n${describeIntelligenceBootFailure(err)}\n`);
+    throw err;
   }
   const v11Bindings = buildV11Bindings({
     identityId: hubIdentityId,

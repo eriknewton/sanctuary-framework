@@ -454,7 +454,26 @@ export class SubstrateSelector {
       was_default: wasDefault,
       overridden_surface_count: overriddenSurfaceCount,
     };
-    this.emit(INTEL_OPS.CONFIG_LOADED, payload, outcome.kind === "loaded" ? "success" : "failure");
+    // INVARIANT: awaited, unlike the fire-and-forget `emit` used on the hot
+    // invocation paths. `load()` is a BOOT step and the composition root
+    // returns as soon as it resolves, so an unawaited append here outlives the
+    // call: the audit write lands in the fortress state directory after the
+    // caller believes startup finished. Failure mode from the outside, which
+    // is how this was found: a test or a CLI that tears its temp fortress down
+    // right after boot fails with `ENOTEMPTY` on a directory it just emptied,
+    // naming a file nothing in the test wrote. The refusal branch above awaits
+    // its append for the same reason; both must stay awaited.
+    try {
+      await this.auditLog.append(
+        "l2",
+        INTEL_OPS.CONFIG_LOADED,
+        this.identityId,
+        payload as unknown as Record<string, unknown>,
+        outcome.kind === "loaded" ? "success" : "failure",
+      );
+    } catch {
+      // A completed load is still complete when its derived audit cannot persist.
+    }
   }
 
   /**

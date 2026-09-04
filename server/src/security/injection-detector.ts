@@ -90,10 +90,26 @@ const SHA256_HEX_VALUE_PATTERN = /^[0-9a-f]{64}$/i;
 // scanned through this same entry point and a caller can choose its own object
 // keys; requiring the scan name means only this runtime's own screening call
 // can reach the exemption, since no MCP tool is named `compiled_context`.
-// MUST MATCH `FIRST_PARTY_RUNTIME_FIELD` and the `scan("compiled_context", ...)`
-// call in `../compiled-context/scanner.ts`.
-const COMPILED_CONTEXT_SCAN_NAME = "compiled_context";
-const FIRST_PARTY_RUNTIME_FIELD = "compiled_payload_first_party_runtime";
+//
+// Both names are declared HERE, once, and imported by their only other user,
+// `../compiled-context/scanner.ts`. This is the exemption's granting side, so
+// it owns the contract; a hand-mirrored copy on the scanner side would be a
+// pair that drifts into a silently absent exemption or, worse, a field the
+// detector exempts and the scanner no longer writes.
+export const COMPILED_CONTEXT_SCAN_NAME = "compiled_context";
+export const FIRST_PARTY_RUNTIME_FIELD = "compiled_payload_first_party_runtime";
+
+/**
+ * The `large_string` prompt-stuffing threshold, in UTF-16 code units (what
+ * `String.prototype.length` counts), NOT bytes: 10240 = 10 * 1024.
+ *
+ * Exported because an assembler that must keep its own compiled prompt under
+ * this heuristic has to size against the real number rather than a copy of it.
+ * The concierge's bounded record projection derives its budget from this
+ * constant; see `CONCIERGE_RECORD_BUDGET_CHARS` in
+ * `../concierge/prompt-builder.ts`.
+ */
+export const PROMPT_STUFFING_LARGE_STRING_CHARS = 10240;
 const FIRST_PARTY_RUNTIME_FIELD_PATTERN = new RegExp(
   `^${FIRST_PARTY_RUNTIME_FIELD}$`,
 );
@@ -1127,8 +1143,8 @@ export class InjectionDetector {
       return;
     }
 
-    // Large string detection (> 10KB)
-    if (value.length > 10240) {
+    // Large string detection (> 10 KiB of UTF-16 code units, not bytes).
+    if (value.length > PROMPT_STUFFING_LARGE_STRING_CHARS) {
       signals.push({
         type: "prompt_stuffing",
         pattern: "large_string",

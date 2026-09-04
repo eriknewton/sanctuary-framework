@@ -278,26 +278,115 @@ export interface SubstrateInvocation {
   request: SummarizeRequest | ClassifyRequest | RedactRequest;
 }
 
+/**
+ * Brand key for {@link FIRST_PARTY_RUNTIME_CONTEXT}.
+ *
+ * INVARIANT: this symbol is module-private and is never exported. It is what
+ * makes the token unforgeable: no other module can build a value carrying this
+ * key, and `JSON.parse` cannot produce a symbol key at all, so a request DTO
+ * that arrived over HTTP or out of a persisted record can never hold the token
+ * however its fields are spelled.
+ */
+const FIRST_PARTY_RUNTIME_CONTEXT_BRAND: unique symbol = Symbol(
+  "sanctuary.intelligence.first-party-runtime-context",
+);
+
+/**
+ * Unforgeable claim that a NAMED LEADING SEGMENT of a `SummarizeRequest.context`
+ * was authored by this runtime: its own prompt template and its own fixed
+ * instruction text, and nothing an agent or an operator can steer.
+ *
+ * WHY A PREFIX AND NOT A FLAG ON THE WHOLE FIELD. The first shape of this
+ * claim covered all of `context` whenever the concierge was not embedding raw
+ * state-store payloads. That was false as built: a concierge briefing is
+ * compiled FROM this fortress's own records, and those records quote
+ * agent-authored strings (audit `details`, task titles, state-store keys and
+ * tags), so an agent could grow the exempt field by writing long or repetitive
+ * names. First-party is a claim about AUTHORSHIP, not about assembly, so the
+ * claim now names the exact prefix it can defend and everything after it is
+ * screened as untrusted.
+ *
+ * WHY A BRANDED OBJECT AND NOT A STRING LITERAL. `contextProvenance` rides on
+ * the generic request envelope every intelligence surface shares, so a
+ * self-declared string meant any caller able to construct the DTO, including
+ * one deserialized from an agent-shaped request body, could label its own
+ * context first-party. The brand key below is module-private and is never
+ * exported, and `JSON.parse` cannot produce a symbol key at all, so no
+ * deserialized value can carry this claim however its fields are spelled.
+ */
+export interface FirstPartyContextClaim {
+  readonly [FIRST_PARTY_RUNTIME_CONTEXT_BRAND]: true;
+  /**
+   * Serializable echo of the claim, present ONLY so audit request hashing and
+   * diagnostics still see a meaningful value; symbol keys vanish under
+   * `JSON.stringify`. It is never what is checked.
+   */
+  readonly provenance: "first_party_runtime";
+  /**
+   * The exact leading substring of `context` this runtime authored.
+   *
+   * INVARIANT: the assembler re-verifies this against the `context` it was
+   * actually handed (`context.startsWith(firstPartyPrefix)`) and discards the
+   * whole claim on any mismatch. A claim is a statement to be checked, never a
+   * fact to be trusted, so a caller cannot widen its exemption by naming a
+   * prefix longer than the text it really authored.
+   */
+  readonly firstPartyPrefix: string;
+}
+
+/**
+ * Mint a first-party-context claim. Callers hold it only while they can prove
+ * every character of `firstPartyPrefix` came from this runtime's own template.
+ *
+ * This function is exported, so the brand alone does not answer "which module
+ * may claim." Two further checks do: the assembler honors a claim only on the
+ * surfaces in `FIRST_PARTY_CONTEXT_SURFACES` (see
+ * `../compiled-context/compiler.ts`), and a structural test pins the set of
+ * `server/src` files allowed to call this function, so widening the set is a
+ * visible edit rather than a quiet import.
+ */
+export function claimFirstPartyContext(
+  firstPartyPrefix: string,
+): FirstPartyContextClaim {
+  return Object.freeze({
+    [FIRST_PARTY_RUNTIME_CONTEXT_BRAND]: true as const,
+    provenance: "first_party_runtime" as const,
+    firstPartyPrefix,
+  });
+}
+
+/** INVARIANT: the brand, not the shape. A structural check would restore the self-labelling this claim exists to remove. */
+export function isFirstPartyContextClaim(
+  value: unknown,
+): value is FirstPartyContextClaim {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as Record<symbol, unknown>)[FIRST_PARTY_RUNTIME_CONTEXT_BRAND] === true
+  );
+}
+
 export interface SummarizeRequest {
   kind: "summarize";
   context: string;
   query: string;
   maxTokens?: number;
   /**
-   * Declares that `context` holds ONLY bytes this runtime assembled itself:
-   * its own prompt template plus this fortress's own local records. The
-   * compiled-context scanner uses it to size that contributor by trust class
-   * instead of counting a locally compiled fortress briefing against the
-   * untrusted prompt-stuffing budget.
+   * Names the leading segment of `context` this runtime authored itself. The
+   * compiled-context scanner sizes that segment by its trust class instead of
+   * counting a local prompt template against the untrusted prompt-stuffing
+   * budget; every character after it is screened as untrusted.
    *
-   * INVARIANT: a caller may set this only when it can prove every byte of
-   * `context`; the moment raw agent- or operator-authored payload text is
-   * embedded, the field must be omitted. `query` is never covered by it, and
-   * omitting it is always the safe choice, because absent reads as untrusted.
-   * It exempts nothing but the stuffing size heuristic: injection, evasion,
-   * exfiltration and the hard byte ceiling still apply to `context`.
+   * INVARIANT: the only accepted value is a claim minted by
+   * {@link claimFirstPartyContext}, the surface must be one whose context this
+   * runtime compiles (`FIRST_PARTY_CONTEXT_SURFACES` in
+   * `../compiled-context/compiler.ts`), and the named prefix must really be a
+   * prefix of `context`. Omitting the field is always the safe choice, because
+   * absent reads as untrusted. `query` is never covered by it. It exempts
+   * nothing but the stuffing size heuristic: injection, evasion, exfiltration
+   * and the hard byte ceiling still apply to every character of `context`.
    */
-  contextProvenance?: "first_party_runtime";
+  contextProvenance?: FirstPartyContextClaim;
 }
 
 export interface ClassifyRequest {

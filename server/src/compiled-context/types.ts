@@ -94,15 +94,19 @@ export interface CompiledContextScanRequest {
   preflightOverLimit?: boolean;
   observedByteLength?: number;
   /**
-   * The contributor texts the assembler joined into `artifact`, index-aligned
-   * with `metadata.contributors`. Supplied only so the scanner can size each
-   * contributor by its trust class instead of sizing the joined total; the
-   * artifact itself stays the hashed, cached, screened unit.
+   * The contributor texts the assembler concatenated into `artifact`,
+   * index-aligned with `metadata.contributors`. Supplied only so the scanner
+   * can size each contributor by its trust class instead of sizing the joined
+   * total; the artifact itself stays the hashed, cached, screened unit.
    *
-   * INVARIANT: a `parts` array whose length does not equal the contributor
-   * count is unusable provenance, so the scanner ignores it and screens the
-   * whole artifact as untrusted. A mismatch can only lose an exemption, never
-   * grant one.
+   * INVARIANT: `parts.join("") === artifact`, exactly. Each part carries any
+   * separator that precedes it, so there is no separator constant to mirror
+   * between assembler and scanner and no way for the two to disagree about one.
+   *
+   * INVARIANT: unusable provenance (a length that does not equal the
+   * contributor count, or parts that do not reconstruct the artifact) makes the
+   * scanner ignore `parts` entirely and screen the whole artifact as untrusted.
+   * A mismatch can only lose an exemption, never grant one.
    */
   parts?: readonly string[];
 }

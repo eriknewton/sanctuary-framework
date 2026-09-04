@@ -8,7 +8,9 @@ import {
   type ConciergeSelectorLike,
   type ConciergeStatus,
 } from "./concierge-types.js";
-import { buildConciergePrompt, isSummarizationQuery } from "./prompt-builder.js";
+import { compileConciergePrompt, isSummarizationQuery } from "./prompt-builder.js";
+// Mints the unforgeable first-party-context claim; see the claim site in `ask`.
+import { claimFirstPartyContext } from "../intelligence/types.js";
 
 export interface ConciergeContextReaderLike {
   readContext(request: ConciergeAskRequest): Promise<ConciergeContextBundle>;
@@ -76,22 +78,31 @@ export class ConciergeService {
           "concierge substrate is disabled or does not support summarization",
         );
       }
-      // INVARIANT: `contextProvenance` may be claimed only while every byte of
-      // the compiled prompt is this runtime's own — its system template plus
-      // the bounded, structured summaries `SanctuaryContextReader` builds from
-      // local records. `includePayloads` is the one switch that embeds raw
-      // state-store payload bytes an agent authored, so it drops the claim and
-      // the whole artifact is sized as untrusted again. The operator's
-      // `question` rides in `query`, which is untrusted on every path.
-      const contextIsFirstPartyOnly = request.includePayloads !== true;
+      // INVARIANT: the claim names the compiled prompt's SYSTEM MESSAGE and
+      // nothing else. That message is built entirely from fixed strings in
+      // `prompt-builder.ts`; everything after it, the operator's question and
+      // the bounded projection of this fortress's records, quotes text this
+      // runtime did not author and is screened as untrusted.
+      //
+      // The earlier shape of this claim covered the whole compiled prompt
+      // whenever `includePayloads` was off, and that was false: `includePayloads`
+      // gates only the raw state-store VALUE, while audit `details`, task
+      // titles, state-store keys and tags reach the briefing either way, so an
+      // agent writing long names could grow the exempt segment. Assembling
+      // bytes locally is not the same as authoring them.
+      //
+      // The claim is a branded object, not a string: this is the one code path
+      // that compiles the fortress briefing, so it is the one call site that
+      // may mint one. MUST MATCH the check in `compiled-context/compiler.ts`,
+      // which re-verifies the prefix against the context it is handed and also
+      // requires the surface to be in `FIRST_PARTY_CONTEXT_SURFACES`.
+      const compiled = compileConciergePrompt({ question, context });
       const response = await this.selector.invokeSummarize("concierge", {
         kind: "summarize",
-        context: JSON.stringify(buildConciergePrompt({ question, context })),
+        context: compiled.context,
         query: question,
         maxTokens: 512,
-        ...(contextIsFirstPartyOnly
-          ? { contextProvenance: "first_party_runtime" as const }
-          : {}),
+        contextProvenance: claimFirstPartyContext(compiled.firstPartyPrefix),
       });
       if (response.failureClass || response.body.kind !== "summarize") {
         throw new ConciergeUnavailableError(

@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
-import { InjectionDetector } from "../security/injection-detector.js";
+import {
+  COMPILED_CONTEXT_SCAN_NAME,
+  FIRST_PARTY_RUNTIME_FIELD,
+  InjectionDetector,
+} from "../security/injection-detector.js";
 import {
   COMPILED_CONTEXT_CONTRACT_VERSION,
   COMPILED_CONTEXT_LIMITS,
@@ -21,18 +25,32 @@ export interface CompiledContextScannerOptions {
 type CompiledContextLimits = Record<keyof typeof COMPILED_CONTEXT_LIMITS, number>;
 
 /**
- * Detector field name carrying the bytes this runtime assembled itself.
- *
- * MUST MATCH `FIRST_PARTY_RUNTIME_FIELD` in `../security/injection-detector.ts`,
- * which exempts this ONE field name from the prompt-stuffing size and
- * repetition heuristic and from nothing else. Only this scanner ever writes
- * the field, and it writes it only from contributors an assembler labelled
+ * The field name carrying the bytes this runtime assembled itself, and the
+ * scan name that field is only meaningful under, are IMPORTED from
+ * `../security/injection-detector.ts` rather than re-typed here: that module
+ * is the side that grants the prompt-stuffing exemption, so it declares the
+ * contract and this module consumes it. The exemption covers the size and
+ * repetition heuristic and nothing else. Only this scanner ever writes the
+ * field, and it writes it only from contributors an assembler labelled
  * `first_party_runtime`, so untrusted bytes have no path to the exemption.
  */
-const FIRST_PARTY_RUNTIME_FIELD = "compiled_payload_first_party_runtime";
 
 /** Detector field name carrying every contributor that is not first-party. */
 const UNTRUSTED_FIELD = "compiled_payload";
+
+/**
+ * Term appended to every screening-cache policy fingerprint once the detector
+ * sizes a first-party contributor differently from an untrusted one.
+ *
+ * Declared here, once, and imported by `./runtime.ts`: the fingerprint is a
+ * CACHE KEY, so if the two fingerprints in this module and that one stop
+ * agreeing about the detector's policy, a result decided under the old policy
+ * can be replayed under the new one. A hand-typed suffix in two files is the
+ * shape that drifts, and it drifts silently, because a wrong cache key never
+ * fails to compile and never fails a test that does not exercise the cache.
+ */
+export const FIRST_PARTY_STUFFING_EXEMPT_FINGERPRINT_TERM =
+  "first-party-stuffing-exempt";
 
 /**
  * Safe construction default for tests and non-runtime embedders. Input is
@@ -50,7 +68,8 @@ export function createUnwiredCompiledContextScanner(): CompiledContextScanner {
     detectorEnabled: true,
     // Moves with the shared detector policy, same reason as
     // COMPILED_CONTEXT_DETECTOR_POLICY_FINGERPRINT in ./runtime.ts.
-    policyFingerprint: "default:enabled:medium:escalate:first-party-stuffing-exempt",
+    policyFingerprint:
+      `default:enabled:medium:escalate:${FIRST_PARTY_STUFFING_EXEMPT_FINGERPRINT_TERM}`,
     reporter: {
       async report(): Promise<void> {},
     },
@@ -138,7 +157,7 @@ export class CompiledContextScanner {
       // `payload` tells the shared detector that JSON/XML structure is
       // expected here; it does not skip role/bypass/Unicode/decoded scans.
       const detection = this.detector.scan(
-        "compiled_context",
+        COMPILED_CONTEXT_SCAN_NAME,
         detectorPayload(request),
       );
       // The shared detector also reports generic inbound URLs/emails as
@@ -272,20 +291,36 @@ function sha256Hex(value: string): string {
  * Default and fallback shape is the single `compiled_payload` field holding
  * the whole artifact, exactly as before trust classes existed. The two-field
  * shape is used ONLY when the assembler supplied per-contributor `parts` that
- * align with its contributor list AND at least one contributor is labelled
- * `first_party_runtime`. Every byte is still scanned in both shapes; the split
- * exists so the size of the runtime's own template is not counted against the
- * untrusted budget.
+ * align with its contributor list, CONCATENATE BACK to the artifact character
+ * for character, and include at least one contributor labelled
+ * `first_party_runtime`. Every character is still scanned in both shapes; the
+ * split exists so the size of the runtime's own template is not counted
+ * against the untrusted budget.
  *
- * INVARIANT: unusable provenance (missing, short, or long `parts`) falls back
- * to the single untrusted field, so a malformed request can only tighten
- * screening, never loosen it.
+ * INVARIANT: the artifact is the unit that is hashed, cached, and released, so
+ * `parts` are only a description of it and must be PROVEN to describe it. A
+ * count check alone is a container-level check: it passes parts that agree in
+ * number while differing in content, which would let the scanned text and the
+ * released text diverge. The concatenation comparison below is the whole
+ * agreement, and it pins the compiler's `PART_SEPARATOR` handling by
+ * construction rather than by a mirrored constant.
  *
- * Residual, stated rather than hidden: grouping means a pattern that straddles
- * the boundary between a first-party contributor and an untrusted one is no
- * longer adjacent to the pattern matcher. Both groups are still fully scanned,
- * so this costs only a pattern whose halves are individually benign and which
- * spans a trust boundary the attacker does not control on both sides.
+ * INVARIANT: unusable provenance (missing `parts`, a count mismatch, or parts
+ * that do not reconstruct the artifact) falls back to the single untrusted
+ * field, so a malformed request can only tighten screening, never loosen it.
+ *
+ * Residual, stated rather than hidden: grouping splits one scanned string into
+ * two, so a pattern that straddles the boundary between a first-party
+ * contributor and an untrusted one is no longer adjacent to the pattern
+ * matcher. Do NOT read that as "the attacker controls only one side."
+ * `first_party_runtime` is a claim about who ASSEMBLED the bytes, not about
+ * who authored them: a concierge briefing is compiled from this fortress's own
+ * records, and those records quote agent-authored strings (audit detail lines,
+ * identity labels, task titles), so an adversary can influence text in BOTH
+ * groups. The actual residual is exactly the lost adjacency across the group
+ * boundary, for a pattern whose halves are each individually benign. Every
+ * byte is still scanned, contributor order inside each group is preserved, and
+ * no pattern that fits within either group is lost.
  */
 function detectorPayload(
   request: CompiledContextScanRequest,
@@ -293,6 +328,10 @@ function detectorPayload(
   const contributors = request.metadata.contributors;
   const parts = request.parts;
   if (parts === undefined || parts.length !== contributors.length) {
+    return { [UNTRUSTED_FIELD]: request.artifact };
+  }
+  // The parts must BE the artifact, not merely be counted like it.
+  if (parts.join("") !== request.artifact) {
     return { [UNTRUSTED_FIELD]: request.artifact };
   }
   const firstParty: string[] = [];
@@ -307,8 +346,11 @@ function detectorPayload(
   if (firstParty.length === 0) {
     return { [UNTRUSTED_FIELD]: request.artifact };
   }
+  // Concatenated, not joined with a separator: the parts already carry the
+  // separators the artifact was built with (proven by the equality above), so
+  // inserting another would scan text the artifact does not contain.
   return {
-    [UNTRUSTED_FIELD]: untrusted.join("\n"),
-    [FIRST_PARTY_RUNTIME_FIELD]: firstParty.join("\n"),
+    [UNTRUSTED_FIELD]: untrusted.join(""),
+    [FIRST_PARTY_RUNTIME_FIELD]: firstParty.join(""),
   };
 }

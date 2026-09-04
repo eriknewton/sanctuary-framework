@@ -18,6 +18,8 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { ed25519 } from "@noble/curves/ed25519";
 import { createSanctuaryServer } from "../../src/index.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
@@ -27,8 +29,12 @@ import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { canonicalJson } from "../../src/v1/operator-signed.js";
 import {
+  INTELLIGENCE_CONFIG_RESET_VERB,
   INTELLIGENCE_NAMESPACE,
+  IntelligenceConfigUnreadableError,
+  LocalIntegrityStateLoadError,
   SUBSTRATE_CONFIG_KEY,
+  describeIntelligenceBootFailure,
 } from "../../src/intelligence/policy-store.js";
 import { INTEL_OPS } from "../../src/intelligence/audit-events.js";
 import {
@@ -242,5 +248,80 @@ describe("local-intelligence load integrity is checked on the default approval c
     await expect(
       createSanctuaryServer({ storage, passphrase: PASSPHRASE }),
     ).resolves.toBeDefined();
+  });
+});
+
+/**
+ * The boot catch is an ALLOWLIST of degradable conditions, and that allowlist
+ * is empty.
+ *
+ * The shape this replaced asked whether the error WAS a
+ * `LocalIntegrityStateLoadError` and degraded otherwise, so an error class the
+ * build did not recognize, or a tamper refusal wrapped by an intervening layer,
+ * started a fortress with local intelligence quietly switched off. A denylist
+ * has to recognize a danger in order to act; an allowlist has to recognize a
+ * safety in order to relax, and only the second fails closed on the unknown.
+ */
+describe("an unclassifiable local-intelligence failure refuses startup", () => {
+  it("names the unknown class and says startup refused rather than ran with it off", () => {
+    class SomethingNobodyAnticipated extends Error {}
+    const message = describeIntelligenceBootFailure(
+      new SomethingNobodyAnticipated("selector wiring blew up"),
+    );
+    expect(message).toContain("does not");
+    expect(message).toContain("classify");
+    expect(message).toContain("refuses");
+    expect(message).toContain("selector wiring blew up");
+    // The unknown case must not borrow the integrity sentence: an operator who
+    // is told the integrity check failed goes looking for tampering that did
+    // not happen.
+    expect(message).not.toContain("failed its boot integrity check");
+  });
+
+  it("distinguishes an unreadable record, and names the remedy verb", () => {
+    const message = describeIntelligenceBootFailure(
+      new IntelligenceConfigUnreadableError("corrupt"),
+    );
+    expect(message).toContain(INTELLIGENCE_CONFIG_RESET_VERB);
+    expect(message).not.toContain("failed its boot integrity check");
+  });
+
+  it("distinguishes an IO condition from a tamper verdict, and still refuses", () => {
+    const message = describeIntelligenceBootFailure(
+      new LocalIntegrityStateLoadError("integrity_io_unavailable"),
+    );
+    expect(message).toContain("storage unavailable");
+    expect(message).toContain("indeterminate");
+    expect(message).not.toContain("failed its boot integrity check");
+  });
+
+  it("keeps the integrity sentence for an actual integrity verdict", () => {
+    const message = describeIntelligenceBootFailure(
+      new LocalIntegrityStateLoadError("integrity_state_invalid"),
+    );
+    expect(message).toContain("failed its boot integrity check");
+  });
+
+  it("STRUCTURAL: neither composition root has a degrade path out of that catch", () => {
+    // A behavioral test cannot reach every unknown-error shape through the real
+    // boot graph, and the property at stake is the ABSENCE of a branch. So this
+    // reads the two catch blocks and asserts there is no path from a wiring
+    // failure to a booted fortress. If a degrade is ever added deliberately, it
+    // belongs in the classifier with a named condition, and this assertion is
+    // what forces that conversation.
+    const roots = ["index.ts", "dashboard-standalone.ts"] as const;
+    for (const file of roots) {
+      const source = readFileSync(
+        fileURLToPath(new URL(`../../src/${file}`, import.meta.url)),
+        "utf8",
+      );
+      const marker = source.indexOf("describeIntelligenceBootFailure(err)");
+      expect(marker, `${file} must route its wiring failure through the shared classifier`)
+        .toBeGreaterThan(-1);
+      const block = source.slice(marker, marker + 400);
+      expect(block, `${file} must rethrow`).toContain("throw err;");
+      expect(block, `${file} must not degrade to a selector-less boot`)
+        .not.toContain("intelligenceSelector = undefined");
+    }
   });
 });

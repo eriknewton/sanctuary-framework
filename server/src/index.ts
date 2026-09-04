@@ -179,10 +179,9 @@ import {
 import { OperatorAuthorizationSpentStore } from "./v1/operator-authorization-spent-store.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
 import { installConsentGatedRedactor } from "./intelligence/privacy-tier2-redactor.js";
-// Boot refuses on this: an armed local-intelligence record that fails its
-// integrity checkpoint must stop the process, not degrade it (see the
-// checkpoint site below).
-import { LocalIntegrityStateLoadError } from "./intelligence/policy-store.js";
+// Boot refuses on every local-intelligence wiring failure; this names which
+// condition refused it (see the checkpoint site below).
+import { describeIntelligenceBootFailure } from "./intelligence/policy-store.js";
 // Agent-facing audit redaction (property #11, no-policy-inference). Single-sourced
 // in operational/agent-audit-redaction.ts so the redact-key set is shared by
 // the agent-facing audit READ here (monitor_audit_log) and the agent-facing audit
@@ -1203,30 +1202,16 @@ export async function createSanctuaryServer(options?: {
       fortressId: fortressIdFromStoragePath(config.storage_path),
     });
   } catch (err) {
-    // An armed record that fails the integrity checkpoint is a tamper result,
-    // not a missing optional feature, so it fails the process closed rather
-    // than degrading to a fortress that runs with local intelligence quietly
-    // switched off. Absent state never reaches here: it loads as the honest
-    // legacy-unarmed default.
-    if (err instanceof LocalIntegrityStateLoadError) {
-      // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
-      console.error(
-        `\nSanctuary cannot start.\nLocal-intelligence state failed its boot ` +
-          `integrity check: ${err.message}\n`,
-      );
-      throw err;
-    }
-    // Any other failure (storage hiccup, backend without this namespace) is
-    // the pre-existing best-effort degrade: no selector, and every consumer
-    // surface reports intelligence as unconfigured rather than pretending.
+    // ALLOWLIST, not denylist: `describeIntelligenceBootFailure` is the single
+    // classifier both composition roots share, and no condition in it is
+    // degradable, so every failure of this block refuses startup. The previous
+    // shape refused only `LocalIntegrityStateLoadError` and degraded on
+    // anything else, which meant an unknown or wrapped tamper error started a
+    // fortress with local intelligence quietly off. Absent state never reaches
+    // here at all: it loads as the honest legacy-unarmed default.
     // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
-    console.error(
-      `  Note: Intelligence panel unavailable (${(err as Error).message}). ` +
-        `Run \`sanctuary dashboard\` and pick a substrate.`,
-    );
-    intelligenceSelector = undefined;
-    // tierBPiiRedactorInstalled stays false (its initialized value): the
-    // install assignment above only completes when the try did not throw.
+    console.error(`\nSanctuary cannot start.\n${describeIntelligenceBootFailure(err)}\n`);
+    throw err;
   }
 
   const selectedApprovalChannel = selectApprovalChannelByPolicy({
