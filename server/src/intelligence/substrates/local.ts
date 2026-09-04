@@ -566,15 +566,27 @@ async function readBoundedText(
       if (remainingMs <= 0) break;
       const chunk = await raceDeadline(reader.read(), remainingMs);
       if (chunk.done) break;
+      // The cap is applied BEFORE decoding, exactly as on the success stream:
+      // decoding first and then noticing the cap means one enormous first read
+      // is fully materialized as a string before anything stops it. Only the
+      // prefix that fits is decoded, and the read ends there.
+      const room = maxBytes - bytes;
+      if (chunk.value.byteLength >= room) {
+        text += decoder.decode(chunk.value.subarray(0, room), { stream: true });
+        break;
+      }
       bytes += chunk.value.byteLength;
       text += decoder.decode(chunk.value, { stream: true });
-      if (bytes >= maxBytes) break;
     }
   } catch {
     // A stalled or failed error body is not itself the verdict; the status code
     // is. Returning what was read keeps this path bounded and fail-closed.
   }
-  return text;
+  // Flushing surfaces a truncated multibyte tail as the replacement character
+  // instead of dropping it, so the snippet the classifier reads is the bytes
+  // that arrived. Truncation at the cap above can land mid-sequence, which is
+  // exactly the case that would otherwise vanish.
+  return text + decoder.decode();
 }
 
 type PullLineVerdict =

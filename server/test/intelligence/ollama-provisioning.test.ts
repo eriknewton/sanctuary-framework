@@ -269,6 +269,71 @@ describe("Ollama provisioning client", () => {
     });
   });
 
+  it("caps an enormous error body before decoding it", async () => {
+    // 4 MiB in the FIRST read, with the classifying phrase placed a megabyte in,
+    // far past the 8 KiB snippet cap. The snippet is not directly observable, so
+    // the cap is proven through the classification: if the whole chunk were
+    // decoded before the cap was noticed, the phrase would be in the snippet and
+    // the refusal would read `substrate_misconfigured`.
+    const filler = "x".repeat(1024 * 1024);
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(`${filler}model 'missing' not found${"y".repeat(3 * 1024 * 1024)}`));
+        controller.close();
+      },
+    });
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      pullInactivityTimeoutMs: 2_000,
+      fetchImpl: (async () => new Response(body, { status: 404 })) as unknown as typeof fetch,
+    });
+    await expect(client.pull("missing:latest")).resolves.toEqual({
+      ok: false,
+      failureClass: "substrate_capability_unsupported",
+    });
+
+    // Control: the same phrase INSIDE the cap is still read, so the cap is a
+    // bound on the snippet, not a refusal to classify.
+    const shortBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("model 'missing' not found"));
+        controller.close();
+      },
+    });
+    const shortClient = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      pullInactivityTimeoutMs: 2_000,
+      fetchImpl: (async () => new Response(shortBody, { status: 404 })) as unknown as typeof fetch,
+    });
+    await expect(shortClient.pull("missing:latest")).resolves.toEqual({
+      ok: false,
+      failureClass: "substrate_misconfigured",
+    });
+  });
+
+  it("flushes the error-body decoder so a truncated tail cannot vanish", async () => {
+    // The body ends on the first byte of a two-byte sequence, and the cap can
+    // truncate mid-sequence too. Flushing keeps the snippet equal to the bytes
+    // that arrived (with a replacement character for the incomplete tail)
+    // instead of silently dropping them.
+    const head = encoder.encode("model 'missing' not found: caf");
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array([...head, 0xc3]));
+        controller.close();
+      },
+    });
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      pullInactivityTimeoutMs: 2_000,
+      fetchImpl: (async () => new Response(body, { status: 404 })) as unknown as typeof fetch,
+    });
+    await expect(client.pull("missing:latest")).resolves.toEqual({
+      ok: false,
+      failureClass: "substrate_misconfigured",
+    });
+  });
+
   it("bounds a dripped error body by one cumulative deadline, not per read", async () => {
     // One byte per read, each arriving just inside the per-read budget. Under a
     // per-read deadline this body never times out and holds the provisioning
