@@ -254,7 +254,8 @@ describe("sealed Castle Wall CLI runtime: whole-set parity", () => {
     const parsed = parseCopyScriptOutputs(fixture);
     expect(parsed).toEqual(["intelligence/model-manifest/model-manifest.v2.json"]);
     const pending = SEALED_CLI_RUNTIME_DIST_ENTRIES.find((entry) => entry.path === "intelligence/model-manifest");
-    expect(pending?.landsWith).toBe("#1370");
+    // #1370 is on main, so the entry is no longer pending; a marker outliving its producer is a defect.
+    expect(pending?.landsWith).toBeUndefined();
     expect(pending?.source).toBe("copy-model-manifest-v2-asset.mjs");
     expect(parsed[0].startsWith(`${pending!.path}/`)).toBe(true);
     expect(parsed[0]).toBe(`${pending!.path}/${pending!.sentinel}`);
