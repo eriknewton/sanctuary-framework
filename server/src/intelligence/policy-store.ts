@@ -117,10 +117,30 @@ export type LoadOutcome =
   | { kind: "corrupt"; config: SubstrateConfig };
 
 /**
- * The operator-visible name for each durable-record state. There is exactly
- * one of these per {@link LoadOutcome} branch, because the runtime's branch IS
- * the classification: a diagnostic that re-derived the state from the bytes
- * could disagree with the selector about whether this fortress is armed.
+ * A load classified for an OPERATOR DIAGNOSTIC rather than for the boot path.
+ *
+ * It adds the one distinction {@link IntelligenceConfigStore.load} deliberately
+ * collapses: `load()` treats ANY storage read failure as a fresh fortress so a
+ * first boot proceeds, which is right for booting and wrong for reporting,
+ * because an EACCES or an I/O error on an EXISTING record would then be
+ * announced as "no durable record exists" together with a set-it-up remedy.
+ * Absent and indeterminate are different answers and neither may be rendered
+ * as the other (AGENTS.md assurance rule 1).
+ */
+export type DiagnosticLoadOutcome =
+  | LoadOutcome
+  | { kind: "read-failed" };
+
+/**
+ * The operator-visible name for each durable-record state. The classifier
+ * consumes the runtime's own {@link LoadOutcome} branch rather than re-deriving
+ * a verdict from the bytes, because a diagnostic that re-parses the record can
+ * disagree with the selector about whether this fortress is armed.
+ *
+ * The mapping is one state per branch with ONE deliberate exception: a
+ * `loaded` record splits by what the selector would do with it (a V1 record is
+ * `legacy-unarmed`; a V2 record with no verified binding is refused surface by
+ * surface and so reports `integrity_state_invalid`, never `armed`).
  */
 export type LocalIntelligenceArmedState =
   | "armed"
@@ -128,7 +148,9 @@ export type LocalIntelligenceArmedState =
   | "absent"
   | "integrity_state_invalid"
   | "corrupt"
-  | "version-too-new";
+  | "version-too-new"
+  /** The record store itself could not be read, so the answer is indeterminate. */
+  | "storage_unreadable";
 
 /** One armed surface binding, flattened for display. Public manifest data only. */
 export interface LocalIntelligenceBindingReport {
@@ -159,88 +181,138 @@ export interface LocalIntelligenceStateReport {
 }
 
 /**
+ * The fields a non-armed report leaves empty. Declared once so every branch
+ * below is a single object literal and no branch can forget to null a field it
+ * has no evidence for.
+ */
+const EMPTY_LOCAL_INTELLIGENCE_REPORT_FIELDS = {
+  detail: null,
+  manifest_version: null,
+  signed_body_sha256: null,
+  ollama_models_root: null,
+  committed_at: null,
+  bindings: [] as readonly LocalIntelligenceBindingReport[],
+} as const;
+
+/**
  * Classify a durable-record load for display. Consumes the SAME
  * {@link LoadOutcome} the selector and every config writer consume, so an
  * operator report cannot claim a fortress is armed when the runtime refuses it.
+ * One branch per {@link LoadOutcome} kind; the `loaded` kind delegates to
+ * {@link classifyLoadedRecord} rather than nesting a second discriminator here.
  */
 export function classifyLocalIntelligenceState(
-  outcome: LoadOutcome,
+  outcome: DiagnosticLoadOutcome,
 ): LocalIntelligenceStateReport {
-  const empty = {
-    detail: null,
-    manifest_version: null,
-    signed_body_sha256: null,
-    ollama_models_root: null,
-    committed_at: null,
-    bindings: [] as readonly LocalIntelligenceBindingReport[],
-  };
   switch (outcome.kind) {
+    case "read-failed":
+      return {
+        ...EMPTY_LOCAL_INTELLIGENCE_REPORT_FIELDS,
+        state: "storage_unreadable",
+        // Deliberately generic: the underlying storage error can carry the
+        // fortress path and an OS string, and neither belongs in a report a
+        // caller may forward. Whether a record exists is unknown here, so this
+        // branch claims neither presence nor absence.
+        detail:
+          "the durable record store could not be read from this host, so whether a record exists is indeterminate",
+        remedy:
+          "check that this user can read the fortress state directory, then re-run",
+      };
     case "default":
       return {
-        ...empty,
+        ...EMPTY_LOCAL_INTELLIGENCE_REPORT_FIELDS,
         state: "absent",
         detail: "no durable local-intelligence config record exists",
         remedy: LOCAL_INTELLIGENCE_OPT_IN_HINT,
       };
-    case "loaded": {
-      if (outcome.config.version !== 2) {
-        return {
-          ...empty,
-          state: "legacy-unarmed",
-          detail:
-            "a readable record exists but carries no verified model binding",
-          remedy: LOCAL_INTELLIGENCE_OPT_IN_HINT,
-        };
-      }
-      const integrity = outcome.config.localIntegrityState;
-      const bindings: LocalIntelligenceBindingReport[] = [];
-      for (const surface of SURFACES) {
-        const binding = integrity.bindings[surface];
-        if (binding === undefined) continue;
-        bindings.push({
-          surface,
-          model_id: binding.model_id,
-          runtime_tag: binding.runtime_tag,
-          ollama_manifest_sha256: binding.ollama_identity.ollama_manifest_sha256,
-          assurance: binding.assurance,
-        });
-      }
-      return {
-        state: "armed",
-        detail: null,
-        manifest_version: integrity.manifest_version_floor,
-        signed_body_sha256: integrity.signed_body_sha256,
-        ollama_models_root: integrity.ollama_models_root,
-        committed_at: integrity.committed_at,
-        bindings,
-        remedy: null,
-      };
-    }
+    case "loaded":
+      return classifyLoadedRecord(outcome.config);
     case "integrity-state-invalid":
       return {
-        ...empty,
+        ...EMPTY_LOCAL_INTELLIGENCE_REPORT_FIELDS,
         state: "integrity_state_invalid",
-        detail: `the armed record failed Q5 integrity validation (${outcome.reason})`,
-        // config-reset refuses this case by design, so the honest remedy is to
-        // re-provision, never the quarantine verb.
-        remedy: LOCAL_INTELLIGENCE_OPT_IN_HINT,
+        detail:
+          `the armed record failed Q5 integrity validation (${outcome.reason}); ` +
+          "there is no in-product recovery for this state today",
+        // INVARIANT: no remedy is offered because none exists. `config-reset`
+        // refuses this state ("not an unreadable record, and there is no
+        // in-product disarm"), and re-running the ceremony cannot write over it
+        // either: every config write goes through `saveWhileLocked`, whose
+        // `loadAuthoritative()` read throws `LocalIntegrityStateLoadError` on
+        // exactly this record. Naming either verb here would send the operator
+        // in a loop between two refusals.
+        remedy: null,
       };
     case "corrupt":
       return {
-        ...empty,
+        ...EMPTY_LOCAL_INTELLIGENCE_REPORT_FIELDS,
         state: "corrupt",
         detail: "the durable record does not decrypt or parse",
         remedy: `run "${INTELLIGENCE_CONFIG_RESET_VERB}"`,
       };
     case "version-too-new":
       return {
-        ...empty,
+        ...EMPTY_LOCAL_INTELLIGENCE_REPORT_FIELDS,
         state: "version-too-new",
         detail:
           `the durable record is version ${outcome.persistedVersion}, newer than this build supports`,
         remedy: `run "${INTELLIGENCE_CONFIG_RESET_VERB}"`,
       };
   }
+}
+
+/**
+ * Classify a readable record by what the SELECTOR would do with it, which is
+ * the only reading that cannot disagree with the runtime.
+ */
+function classifyLoadedRecord(
+  config: SubstrateConfig,
+): LocalIntelligenceStateReport {
+  if (config.version !== 2) {
+    return {
+      ...EMPTY_LOCAL_INTELLIGENCE_REPORT_FIELDS,
+      state: "legacy-unarmed",
+      detail: "a readable record exists but carries no verified model binding",
+      remedy: LOCAL_INTELLIGENCE_OPT_IN_HINT,
+    };
+  }
+  const integrity = config.localIntegrityState;
+  const bindings: LocalIntelligenceBindingReport[] = [];
+  for (const surface of SURFACES) {
+    const binding = integrity.bindings[surface];
+    if (binding === undefined) continue;
+    bindings.push({
+      surface,
+      model_id: binding.model_id,
+      runtime_tag: binding.runtime_tag,
+      ollama_manifest_sha256: binding.ollama_identity.ollama_manifest_sha256,
+      assurance: binding.assurance,
+    });
+  }
+  if (bindings.length === 0) {
+    // INVARIANT: `armed` means at least one surface has a verified binding the
+    // selector will honor. A V2 record with an empty binding set makes
+    // `gatedLocalHandle` refuse EVERY local surface with `integrity_state_invalid`,
+    // so reporting `armed` here would be the diagnostic contradicting the
+    // runtime — the exact disagreement this classifier exists to prevent.
+    return {
+      ...EMPTY_LOCAL_INTELLIGENCE_REPORT_FIELDS,
+      state: "integrity_state_invalid",
+      detail:
+        "the record carries no verified model binding, so every local surface refuses",
+      remedy: LOCAL_INTELLIGENCE_OPT_IN_HINT,
+    };
+  }
+  return {
+    state: "armed",
+    detail: null,
+    manifest_version: integrity.manifest_version_floor,
+    signed_body_sha256: integrity.signed_body_sha256,
+    ollama_models_root: integrity.ollama_models_root,
+    committed_at: integrity.committed_at,
+    bindings,
+    remedy: null,
+  };
 }
 
 export class LocalIntegrityStateLoadError extends Error {
@@ -406,6 +478,32 @@ export class IntelligenceConfigStore {
       return { kind: "default", config: buildDefaultConfig() };
     }
 
+    return this.decode(raw);
+  }
+
+  /**
+   * Read the durable config for an operator diagnostic. Identical to
+   * {@link load} except that a storage read FAILURE returns `read-failed`
+   * instead of the default config: `load()`'s swallow is correct for booting a
+   * fresh fortress and wrong for reporting, where it would turn "this record
+   * could not be read" into the positive claim "no record exists".
+   *
+   * Failure mode to expect: on a fortress whose state directory this user
+   * cannot read, `load()` reports a pristine new fortress and this method
+   * reports that it does not know. Reading the first as the truth is the
+   * mistake this method exists to prevent.
+   */
+  async loadForDiagnostics(): Promise<DiagnosticLoadOutcome> {
+    let raw: Uint8Array | null;
+    try {
+      raw = await this.storage.read(INTELLIGENCE_NAMESPACE, SUBSTRATE_CONFIG_KEY);
+    } catch {
+      // The caught error is not carried forward: a storage error message can
+      // embed the fortress path and an OS-level string, and the classifier's
+      // fixed text is the whole operator-facing surface for this state.
+      return { kind: "read-failed" };
+    }
+    if (!raw) return { kind: "default", config: buildDefaultConfig() };
     return this.decode(raw);
   }
 

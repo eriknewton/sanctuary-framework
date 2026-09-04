@@ -59,6 +59,10 @@ import {
   LocalIntegrityStateLoadError,
   type LoadOutcome,
 } from "./policy-store.js";
+// Imported, never re-typed: the operator line the ceremony prints and the badge
+// label this file renders must truncate the same digest to the same width, or
+// two surfaces describing one binding disagree by a character count.
+import { ARMED_DIGEST_PREFIX_CHARS } from "./provisioning.js";
 import {
   IMMUNE_MODEL_LOAD_SURFACES,
   type LocalIntegrityStateV2,
@@ -1439,13 +1443,29 @@ export class SubstrateSelector {
     const client = new OllamaClient({ endpoint, fetchImpl: this.fetchImpl });
     const sub = LocalSubstrate.fromPick(client, pick, customTag);
     const labelBase = BACKEND_FALLBACK_STRINGS[BADGE_LABEL_KEYS.local] ?? "Local model";
-    // INVARIANT: a verified binding is what this surface actually invokes, so
-    // it names the label; the configured pick is only a default and would
-    // report the wrong model on an armed fortress. Each form says which it is,
-    // because "Gemma 2 2B" and "the armed binding" are different claims.
+    // With no verified binding, whatever `LocalSubstrate.fromPick` invokes IS
+    // this handle's model, and it resolves `customTag ?? LOCAL_MODEL_TAGS[pick]`.
+    // The label must resolve in the SAME order: `LOCAL_MODEL_LABELS` is a total
+    // `Record<LocalModelPick, string>`, so reading it first made the custom-tag
+    // arm unreachable and an operator who set `customLocalModelTags` saw the
+    // friendly name of a pick that nothing was calling.
+    // Must match the tag resolution in `LocalSubstrate.fromPick`
+    // (`intelligence/substrates/local.ts`); a change on either side puts the
+    // badge back to naming a model this surface does not invoke.
+    const unarmedLabel = customTag ?? LOCAL_MODEL_LABELS[pick] ?? LOCAL_MODEL_TAGS[pick];
+    // INVARIANT: on an armed fortress the verified binding is what this surface
+    // actually invokes — `commitLocalIntegrityProvisioning` writes the binding's
+    // tag into `customLocalModelTags` while `pick` stays at its configured
+    // default — so naming the pick here would name a model that is not running.
+    // The manifest digest prefix travels WITH the tag because a tag alone names
+    // a subject with nothing to check it against; the prefix is the public
+    // manifest root the binding was verified to, and it is the same value, at
+    // the same width, that the ceremony's "Local intelligence armed" line and
+    // `sanctuary intelligence diagnose` print.
     const modelLabel = binding === undefined
-      ? `${LOCAL_MODEL_LABELS[pick] ?? customTag ?? LOCAL_MODEL_TAGS[pick]} (default pick, not armed)`
-      : `${binding.runtime_tag} (armed binding)`;
+      ? unarmedLabel
+      : `${binding.runtime_tag} (armed binding, manifest sha256 ` +
+        `${binding.ollama_identity.ollama_manifest_sha256.slice(0, ARMED_DIGEST_PREFIX_CHARS)})`;
     let firstInvocationPassed = false;
     let lastFullMonotonicMs = selectorLoadGate?.completedMonotonicMs;
     let lastFullWallMs = selectorLoadGate?.completedWallMs;

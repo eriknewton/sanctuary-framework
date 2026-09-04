@@ -14,6 +14,9 @@ import { generateRandomKey } from "../../src/core/random.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { SubstrateSelector } from "../../src/intelligence/selector.js";
+import { buildDefaultConfig } from "../../src/intelligence/defaults.js";
+import { IntelligenceConfigStore } from "../../src/intelligence/policy-store.js";
+import { ARMED_DIGEST_PREFIX_CHARS } from "../../src/intelligence/provisioning.js";
 import { ConciergeService } from "../../src/concierge/index.js";
 import type { ConciergeContextReaderLike } from "../../src/concierge/concierge-service.js";
 import { runLocalIntelligenceSetup } from "../../src/wrap/local-intelligence.js";
@@ -31,10 +34,23 @@ const fetchImpl = (async () =>
     headers: { "content-type": "application/json" },
   })) as typeof fetch;
 
-async function buildSelector(armed: boolean): Promise<SubstrateSelector> {
+async function buildSelector(
+  armed: boolean,
+  customLocalModelTags?: Record<string, string>,
+): Promise<SubstrateSelector> {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const auditLog = new AuditLog(storage, masterKey);
+  if (customLocalModelTags !== undefined) {
+    const base = buildDefaultConfig();
+    await new IntelligenceConfigStore(storage, masterKey).save({
+      ...base,
+      customLocalModelTags: {
+        ...(base.customLocalModelTags ?? {}),
+        ...customLocalModelTags,
+      },
+    });
+  }
   if (armed) {
     const outcome = await runLocalIntelligenceSetup({
       storage,
@@ -105,15 +121,41 @@ describe("concierge status model label follows the armed binding (R2-F3c)", () =
     expect(status.model).toContain("armed binding");
   });
 
-  it("falls back to the default pick on an unarmed fortress and says so", async () => {
+  it("carries the manifest digest prefix beside the armed tag, at the ceremony's width", async () => {
+    const selector = await buildSelector(true);
+    const handle = await selector.getSubstrate("concierge");
+    // The tag alone names a subject with nothing to check it against; the
+    // prefix is the public manifest root the binding was verified to, and it
+    // is truncated by the ONE shared constant the ceremony line uses.
+    expect(handle.displayLabel).toContain(
+      `manifest sha256 ${FIXTURE_MANIFEST_DIGEST.slice(0, ARMED_DIGEST_PREFIX_CHARS)}`,
+    );
+    expect(ARMED_DIGEST_PREFIX_CHARS).toBe(12);
+  });
+
+  it("leaves the unarmed label as the pre-existing pick string, with no armed claim", async () => {
     const selector = await buildSelector(false);
     const handle = await selector.getSubstrate("concierge");
+    // The pre-PR string, unchanged: with no verified binding the configured
+    // pick IS what this handle invokes, so the operator sees what they always
+    // saw and no claim about arming is made either way.
     expect(handle.displayLabel).toContain("Local model");
-    expect(handle.displayLabel).toContain("Gemma");
-    expect(handle.displayLabel).toContain("default pick, not armed");
+    expect(handle.displayLabel).toContain("Gemma 2 2B (via Ollama)");
+    expect(handle.displayLabel).not.toContain("armed binding");
+    expect(handle.displayLabel).not.toContain("manifest sha256");
 
     const status = await new ConciergeService({ reader: inertReader, selector })
       .status();
-    expect(status.model).toContain("default pick, not armed");
+    expect(status.model).toContain("Gemma 2 2B (via Ollama)");
+  });
+
+  it("names the operator's custom tag on an unarmed fortress, not the pick's friendly name", async () => {
+    // `LocalSubstrate.fromPick` invokes `customTag ?? LOCAL_MODEL_TAGS[pick]`,
+    // so a configured custom tag is what answers; a label that reads the total
+    // `LOCAL_MODEL_LABELS` table first would name a model nothing is calling.
+    const selector = await buildSelector(false, { concierge: "llama3.1:8b" });
+    const handle = await selector.getSubstrate("concierge");
+    expect(handle.displayLabel).toContain("llama3.1:8b");
+    expect(handle.displayLabel).not.toContain("Gemma");
   });
 });

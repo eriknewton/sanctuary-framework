@@ -674,6 +674,10 @@ function commitRefusalReason(error: unknown): LocalProvisioningRefusalReason {
  * 48 bits, long enough for an operator to match the line against the manifest
  * by eye and short enough that nobody mistakes it for the digest itself; the
  * full digest is what `sanctuary intelligence diagnose` prints.
+ *
+ * SOLE DECLARATION: the badge label in `intelligence/selector.ts` IMPORTS this
+ * constant rather than re-typing 12, so the ceremony line and the concierge
+ * label can never truncate one binding's digest to two different widths.
  */
 export const ARMED_DIGEST_PREFIX_CHARS = 12;
 

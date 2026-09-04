@@ -20,8 +20,12 @@ import {
   IntelligenceConfigStore,
   INTELLIGENCE_NAMESPACE,
   SUBSTRATE_CONFIG_KEY,
+  classifyLocalIntelligenceState,
 } from "../../src/intelligence/policy-store.js";
 import { buildDefaultConfig } from "../../src/intelligence/defaults.js";
+import type { LocalIntegrityStateV2 } from "../../src/intelligence/model-manifest-v2.js";
+import type { SubstrateConfigV2 } from "../../src/intelligence/types.js";
+import { q5eIntegrityState } from "./q5e-fixtures.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { stringToBytes, bytesToString } from "../../src/core/encoding.js";
@@ -189,5 +193,99 @@ describe("Intelligence Substrate Config Store", () => {
     expect(outcome.kind).toBe("corrupt");
     // Defaults applied; A's key not surfaced through B.
     expect(outcome.config.veniceApiKey).toBeUndefined();
+  });
+});
+
+/**
+ * The operator-facing classification of a durable-record load (R2-F3).
+ *
+ * These assert the two properties the diagnostic depends on: it never reports a
+ * state the SELECTOR would refuse to honor, and it never turns an indeterminate
+ * read into a positive claim about the record.
+ */
+describe("classifyLocalIntelligenceState", () => {
+  const armedState = (root = "/var/lib/ollama/models") => q5eIntegrityState(root);
+  const v2Config = (state: LocalIntegrityStateV2): SubstrateConfigV2 => ({
+    ...buildDefaultConfig(),
+    version: 2,
+    localIntegrityState: state,
+  });
+
+  it("reports armed for a V2 record that carries verified bindings", () => {
+    const report = classifyLocalIntelligenceState({
+      kind: "loaded",
+      config: v2Config(armedState()),
+    });
+    expect(report.state).toBe("armed");
+    expect(report.bindings.length).toBeGreaterThan(0);
+    expect(report.remedy).toBeNull();
+  });
+
+  it("refuses to call a V2 record with no verified binding armed", () => {
+    // `gatedLocalHandle` refuses EVERY local surface whose binding is missing
+    // from a V2 record, so "armed" here would be the report contradicting the
+    // runtime it is supposed to describe.
+    const report = classifyLocalIntelligenceState({
+      kind: "loaded",
+      config: v2Config({ ...armedState(), bindings: {} }),
+    });
+    expect(report.state).toBe("integrity_state_invalid");
+    expect(report.bindings).toEqual([]);
+    expect(report.manifest_version).toBeNull();
+    expect(report.detail).toContain("no verified model binding");
+  });
+
+  it("offers no remedy for a record that failed Q5 integrity validation", () => {
+    // Both candidate verbs refuse this state: config-reset by design, and
+    // re-provisioning because every config write reads the durable record
+    // through loadAuthoritative(), which throws on exactly this record.
+    const report = classifyLocalIntelligenceState({
+      kind: "integrity-state-invalid",
+      reason: "binding_mismatch",
+      config: buildDefaultConfig(),
+    });
+    expect(report.state).toBe("integrity_state_invalid");
+    expect(report.remedy).toBeNull();
+    expect(report.detail).toContain("no in-product recovery");
+  });
+
+  it("reports a failed record read as indeterminate, never as absent", () => {
+    const report = classifyLocalIntelligenceState({ kind: "read-failed" });
+    expect(report.state).toBe("storage_unreadable");
+    expect(report.detail).toContain("indeterminate");
+    // The absent wording is a positive claim and must not appear here.
+    expect(report.detail).not.toContain("no durable local-intelligence config record exists");
+  });
+});
+
+describe("IntelligenceConfigStore.loadForDiagnostics", () => {
+  /** A storage whose reads fail the way an unreadable fortress directory does. */
+  function eaccesStorage(): MemoryStorage {
+    const storage = new MemoryStorage();
+    vi.spyOn(storage, "read").mockImplementation(async () => {
+      const error = new Error("EACCES: permission denied, open '/fortress/state/_intelligence/substrate-config.enc'") as NodeJS.ErrnoException;
+      error.code = "EACCES";
+      throw error;
+    });
+    return storage;
+  }
+
+  it("reports read-failed where load() reports a fresh fortress", async () => {
+    const masterKey = generateRandomKey();
+    const storage = eaccesStorage();
+    const store = new IntelligenceConfigStore(storage, masterKey);
+    // The boot path's swallow is deliberate and stays; the diagnostic read is
+    // the one that must not launder a read failure into "no record exists".
+    expect((await store.load()).kind).toBe("default");
+    expect((await store.loadForDiagnostics()).kind).toBe("read-failed");
+    vi.restoreAllMocks();
+  });
+
+  it("agrees with load() on an absent record and on a readable one", async () => {
+    const storage = new MemoryStorage();
+    const store = new IntelligenceConfigStore(storage, generateRandomKey());
+    expect((await store.loadForDiagnostics()).kind).toBe("default");
+    await store.save(buildDefaultConfig());
+    expect((await store.loadForDiagnostics()).kind).toBe("loaded");
   });
 });

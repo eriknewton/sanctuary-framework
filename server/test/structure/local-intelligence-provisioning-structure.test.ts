@@ -37,6 +37,32 @@ describe("local intelligence provisioning structural inventory", () => {
     expect(sequencer).toContain('kind: "not-requested"');
   });
 
+  it("keeps the unarmed badge label resolving in the order the substrate invokes", () => {
+    const selector = source("intelligence/selector.ts");
+    const substrate = source("intelligence/substrates/local.ts");
+    // `LocalSubstrate.fromPick` invokes `customTag ?? LOCAL_MODEL_TAGS[pick]`.
+    // `LOCAL_MODEL_LABELS` is a TOTAL record, so a label that reads it first
+    // makes the custom-tag arm unreachable and names a model nothing calls.
+    expect(substrate).toContain("customTag ?? LOCAL_MODEL_TAGS[pick]");
+    expect(selector).toContain(
+      "customTag ?? LOCAL_MODEL_LABELS[pick] ?? LOCAL_MODEL_TAGS[pick]",
+    );
+    // Both sides name their counterpart, so an editor of either is warned
+    // before CI has to catch the divergence.
+    expect(substrate).toContain("must resolve in this same order");
+    expect(selector).toContain(
+      "Must match the tag resolution in `LocalSubstrate.fromPick`",
+    );
+    // The armed form's digest prefix is IMPORTED from the ceremony's constant,
+    // never re-typed, so one binding cannot be shown at two widths.
+    expect(selector).toContain(
+      'import { ARMED_DIGEST_PREFIX_CHARS } from "./provisioning.js"',
+    );
+    expect(source("intelligence/provisioning.ts")).toContain(
+      "SOLE DECLARATION: the badge label in `intelligence/selector.ts` IMPORTS",
+    );
+  });
+
   it("inventories both flags, both audit ops, and the registry provider category", () => {
     const wrap = source("wrap/cli.ts");
     const init = source("wrap/init.ts");
