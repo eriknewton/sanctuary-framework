@@ -140,25 +140,41 @@ describe("shared protect/init local-intelligence adapter", () => {
 
   it("reaches the packaged signed-manifest loader by default and refuses with its typed reason", async () => {
     const { storage, masterKey, auditLog, client } = fixture();
-    const result = await runLocalIntelligenceSetup({
-      storage,
-      masterKey,
-      auditLog,
-      identityId: "test-fortress",
-      isTty: true,
-      print: vi.fn(),
-    }, {
-      client,
-      confirm: vi.fn(async () => false),
-      probeHardware: async () => ({
-        totalRamGb: 16,
-        cpuArch: "apple-silicon-m2" as const,
-        tier: "baseline" as const,
-        recommendedLocalModel: "gemma-2-2b" as const,
-        ollamaReachable: true,
-        ollamaModels: [],
-      }),
-    });
+    // The ceremony resolves the Ollama model root through the production
+    // `OLLAMA_MODELS` input (same as `normalizes an absolute configured root`
+    // above); a runner without ~/.ollama/models must still reach the loader
+    // and then the operator decline, not stop at `model_root_invalid`.
+    const parent = await realpath(await mkdtemp(join(tmpdir(), "sanctuary-q5f-wired-root-")));
+    const modelsRoot = join(parent, "models");
+    await mkdir(modelsRoot);
+    const previousModelsEnv = process.env.OLLAMA_MODELS;
+    process.env.OLLAMA_MODELS = modelsRoot;
+    let result: Awaited<ReturnType<typeof runLocalIntelligenceSetup>>;
+    try {
+      result = await runLocalIntelligenceSetup({
+        storage,
+        masterKey,
+        auditLog,
+        identityId: "test-fortress",
+        isTty: true,
+        print: vi.fn(),
+      }, {
+        client,
+        confirm: vi.fn(async () => false),
+        probeHardware: async () => ({
+          totalRamGb: 16,
+          cpuArch: "apple-silicon-m2" as const,
+          tier: "baseline" as const,
+          recommendedLocalModel: "gemma-2-2b" as const,
+          ollamaReachable: true,
+          ollamaModels: [],
+        }),
+      });
+    } finally {
+      if (previousModelsEnv === undefined) delete process.env.OLLAMA_MODELS;
+      else process.env.OLLAMA_MODELS = previousModelsEnv;
+      await rm(parent, { recursive: true, force: true });
+    }
     expect(client.pull).not.toHaveBeenCalled();
     expect(client.show).not.toHaveBeenCalled();
     const loadEvents = await auditLog.query({ operation_type: INTEL_OPS.LOAD_INTEGRITY });
