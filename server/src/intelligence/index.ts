@@ -312,6 +312,8 @@ export {
   LOCAL_CAPABILITY,
   type OllamaClientConfig,
   type OllamaMutationResult,
+  type OllamaPullOptions,
+  type OllamaPullProgress,
   type OllamaShowResult,
 } from "./substrates/local.js";
 
@@ -330,6 +332,7 @@ export {
   runLocalIntelligenceProvisioning,
   type AtomicLocalProvisioningCommit,
   type LocalProvisioningAuditEvent,
+  type LocalModelsRootResolution,
   type LocalProvisioningOps,
   type LocalProvisioningRefusalReason,
   type LocalProvisioningResult,

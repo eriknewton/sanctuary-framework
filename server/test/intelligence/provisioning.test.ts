@@ -2,6 +2,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_PER_SURFACE } from "../../src/intelligence/defaults.js";
 import {
+  LocalModelsRootResolutionError,
   MODEL_REGISTRY_PROVIDER_CATEGORY,
   renderLocalProvisioningPlan,
   runLocalIntelligenceProvisioning,
@@ -121,7 +122,7 @@ function makeOps(overrides: Partial<LocalProvisioningOps> = {}) {
       ollamaReachable: true,
       ollamaModels: [],
     } satisfies HardwareCapabilityReport)),
-    resolveModelsRoot: vi.fn(async () => ROOT),
+    resolveModelsRoot: vi.fn(async () => ({ kind: "resolved" as const, rootReal: ROOT })),
     runtimeVerifier: { verify: vi.fn(async () => runtimeSuccess()) },
     immuneVerifier: { verify: vi.fn(async () => immuneSuccess()) },
     withProvisioningLock: async (operation) => {
@@ -375,7 +376,10 @@ describe("Q5D atomic local intelligence provisioning", () => {
       manifest_version_floor: 9,
       ollama_models_root: ROOT,
     } as LocalIntegrityStateV2;
-    const resolveModelsRoot = vi.fn(async () => "/changed/by/environment");
+    const resolveModelsRoot = vi.fn(async () => ({
+      kind: "resolved" as const,
+      rootReal: "/changed/by/environment",
+    }));
     const runtimeVerifier = { verify: vi.fn(async () => runtimeSuccess()) };
     const { ops, commits } = makeOps({
       reloadAuthority: vi.fn(async () => ({
@@ -391,6 +395,71 @@ describe("Q5D atomic local intelligence provisioning", () => {
       expect.objectContaining({ rootReal: ROOT }),
     );
     expect(commits[0]!.integrityState.ollama_models_root).toBe(ROOT);
+  });
+
+  it("an absent default model root on a reachable runtime reaches the plan and pulls", async () => {
+    // A host where Ollama has never pulled has no ~/.ollama/models; Ollama
+    // creates it on the first pull, so this is "no models yet", not a refusal.
+    const resolveModelsRoot = vi.fn()
+      .mockResolvedValueOnce({ kind: "default_root_absent" })
+      .mockResolvedValue({ kind: "resolved", rootReal: ROOT });
+    const runtimeVerifier = { verify: vi.fn(async () => runtimeSuccess()) };
+    const { ops, sequence, commits } = makeOps({ resolveModelsRoot, runtimeVerifier });
+    await expect(runLocalIntelligenceProvisioning(ops)).resolves.toMatchObject({
+      kind: "provisioned",
+      models: [MODEL.model_id],
+    });
+    expect(sequence.indexOf("print")).toBeLessThan(sequence.indexOf("confirm"));
+    expect(sequence.indexOf("confirm")).toBeLessThan(sequence.indexOf("pull"));
+    expect(ops.pull).toHaveBeenCalledOnce();
+    // Nothing was on disk before the pull, so the only verification sweep is the
+    // one that follows it, and it runs against the strictly re-resolved root.
+    expect(runtimeVerifier.verify).toHaveBeenCalledOnce();
+    expect(runtimeVerifier.verify).toHaveBeenCalledWith(
+      expect.objectContaining({ rootReal: ROOT }),
+    );
+    expect(resolveModelsRoot).toHaveBeenCalledTimes(2);
+    expect(commits[0]!.integrityState.ollama_models_root).toBe(ROOT);
+  });
+
+  it("an absent default model root without a reachable runtime still refuses", async () => {
+    const { ops } = makeOps({
+      resolveModelsRoot: vi.fn(async () => ({ kind: "default_root_absent" as const })),
+      probeHardware: vi.fn(async () => ({
+        totalRamGb: 16,
+        cpuArch: "apple-silicon-m2",
+        tier: "baseline",
+        recommendedLocalModel: "gemma-2-2b",
+        ollamaReachable: false,
+        ollamaModels: [],
+      } satisfies HardwareCapabilityReport)),
+    });
+    await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
+      kind: "refused",
+      reason: "model_root_invalid",
+    });
+    expect(ops.confirm).not.toHaveBeenCalled();
+    expect(ops.pull).not.toHaveBeenCalled();
+    expect(ops.commitVerified).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["still absent after the pull", { kind: "default_root_absent" as const }, undefined],
+    ["a symlinked root after the pull", undefined, new LocalModelsRootResolutionError("symlink_refused")],
+  ])("refuses %s rather than committing an unresolved root", async (_label, resolution, thrown) => {
+    const resolveModelsRoot = vi.fn()
+      .mockResolvedValueOnce({ kind: "default_root_absent" })
+      .mockImplementationOnce(async () => {
+        if (thrown !== undefined) throw thrown;
+        return resolution;
+      });
+    const { ops } = makeOps({ resolveModelsRoot });
+    await expect(runLocalIntelligenceProvisioning(ops)).resolves.toEqual({
+      kind: "refused",
+      reason: thrown === undefined ? "model_root_invalid" : "symlink_refused",
+    });
+    expect(ops.pull).toHaveBeenCalledOnce();
+    expect(ops.commitVerified).not.toHaveBeenCalled();
   });
 
   it("a lock contender refuses before verify, pull, or authoritative mutation", async () => {

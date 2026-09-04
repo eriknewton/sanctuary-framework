@@ -28,6 +28,8 @@ import {
   verifyModelManifestV2WithKey,
   type ImmuneDiskVerifier,
   type HardwareCapabilityReport,
+  type LocalModelsRootResolution,
+  type OllamaPullProgress,
   type LocalProvisioningAuditEvent,
   type LocalProvisioningResult,
   type PackagedModelManifestRefusalReason,
@@ -83,26 +85,33 @@ export interface RunLocalIntelligenceSetupDeps {
   modelManifestV2PublicKey?: Uint8Array;
   runtimeVerifier?: RuntimeLightVerifier;
   immuneVerifier?: ImmuneDiskVerifier;
-  resolveModelsRoot?: () => Promise<string>;
+  resolveModelsRoot?: () => Promise<LocalModelsRootResolution>;
   probeHardware?: () => Promise<HardwareCapabilityReport>;
   lockOptions?: CrossProcessLockOptions;
 }
 
 /**
- * Resolve and validate the one root that Q5 persists. This is called only
- * after an injected V2 catalog verifies; the null-default production path
- * never reads `OLLAMA_MODELS` or the host model store.
+ * Resolve and validate the one root that Q5 persists, reporting the one state
+ * that is not yet a verdict: a DEFAULT root that does not exist because Ollama
+ * has never pulled. Must match `LocalModelsRootResolution` in
+ * `../intelligence/provisioning.ts`, whose ceremony re-calls this strictly
+ * after the pull. This is called only after a V2 catalog verifies.
  */
-export async function resolveOllamaModelsRoot(
+export async function resolveOllamaModelsRootState(
   platform: NodeJS.Platform,
   environment: Readonly<Record<string, string | undefined>> = process.env,
   homeDirectory = homedir(),
-): Promise<string> {
+  // Same seam shape as `environment` and `homeDirectory`: production always
+  // takes the real uid, and no call site may pass a uid that is not this
+  // process's own.
+  processUid: number | undefined = process.getuid?.(),
+): Promise<LocalModelsRootResolution> {
   if (platform === "win32") {
     throw new LocalModelsRootResolutionError("immune_platform_unsupported");
   }
   const configured = environment.OLLAMA_MODELS;
-  const rawCandidate = configured !== undefined && configured.length > 0
+  const explicitlyConfigured = configured !== undefined && configured.length > 0;
+  const rawCandidate = explicitlyConfigured
     ? configured
     : join(homeDirectory, ".ollama", "models");
   if (!isAbsolute(rawCandidate) || rawCandidate.includes("\0")) {
@@ -114,6 +123,14 @@ export async function resolveOllamaModelsRoot(
     lexical = await lstat(candidate);
   } catch (error) {
     const code = errorCode(error);
+    // Ollama creates ~/.ollama/models on its first pull, so an absent DEFAULT
+    // root means "runtime present, no models yet", not a misconfigured host. An
+    // operator who set OLLAMA_MODELS asserted that exact path, so its absence
+    // stays a refusal; so does any other error, including ENOTDIR, where a path
+    // component exists but is not a directory.
+    if (code === "ENOENT" && !explicitlyConfigured) {
+      return { kind: "default_root_absent" };
+    }
     throw new LocalModelsRootResolutionError(
       code === "ENOENT" || code === "ENOTDIR"
         ? "model_root_invalid"
@@ -124,6 +141,23 @@ export async function resolveOllamaModelsRoot(
     throw new LocalModelsRootResolutionError(
       lexical.isSymbolicLink() ? "symlink_refused" : "model_root_invalid",
     );
+  }
+  // The accepted root is persisted as `ollama_models_root` and every later run
+  // treats it as authoritative, so it must be a directory only this operator can
+  // write. A root owned by someone else, or writable by group or other, can be
+  // repopulated between verification and load by a lower-privilege process on
+  // this host -- including the wrapped agent, which runs under this same uid --
+  // and an absent default root is now created by the first pull rather than
+  // refused, so pre-creating it group-writable is a reachable move. 0o022 = the
+  // group-write (0o020) and other-write (0o002) bits.
+  // A host that cannot report a uid never reaches here (the win32 gate above
+  // is the only such platform), so the undefined arm is a fail-closed guard
+  // rather than a live branch.
+  if (processUid === undefined || lexical.uid !== processUid) {
+    throw new LocalModelsRootResolutionError("model_root_invalid");
+  }
+  if ((lexical.mode & 0o022) !== 0) {
+    throw new LocalModelsRootResolutionError("model_root_invalid");
   }
   let resolved: string;
   try {
@@ -141,7 +175,65 @@ export async function resolveOllamaModelsRoot(
   if (resolved !== candidate) {
     throw new LocalModelsRootResolutionError("model_root_invalid");
   }
-  return resolved;
+  return { kind: "resolved", rootReal: resolved };
+}
+
+// 5_000 ms = 5 s x 1000 ms/s. Ollama emits progress lines several times a
+// second, so an unthrottled reporter would flood the operator channel; one line
+// per five seconds still proves within a glance that the download is moving.
+const PULL_PROGRESS_PRINT_INTERVAL_MS = 5_000;
+
+// The status forms Ollama emits during a pull. The renderer below prints one of
+// these exact strings or a fixed token, never the runtime's own bytes.
+const KNOWN_PULL_STATUSES: ReadonlySet<string> = new Set([
+  "pulling manifest",
+  "verifying sha256 digest",
+  "writing manifest",
+  "removing any unused layers",
+  "success",
+]);
+// 64 = the hex length of a SHA-256 digest; Ollama abbreviates the layer digest
+// in `pulling <digest>`, so the shortest form worth rendering is a 6-character
+// prefix and the longest is the full digest.
+const PULL_STATUS_DIGEST_MAX_HEX_CHARS = 64;
+const PULL_STATUS_DIGEST_MIN_HEX_CHARS = 6;
+const PULL_DIGEST_STATUS = new RegExp(
+  `^pulling (?:sha256:)?([0-9a-f]{${PULL_STATUS_DIGEST_MIN_HEX_CHARS},${PULL_STATUS_DIGEST_MAX_HEX_CHARS}})$`,
+);
+const UNRECOGNIZED_PULL_STATUS = "runtime status";
+
+/**
+ * Project the runtime's `status` onto a closed set of forms this renderer
+ * writes itself. The string arrives from the Ollama process and lands on the
+ * operator's terminal, where a newline could forge a fresh log line, an ANSI
+ * escape could rewrite what is already on screen, and an unbounded length could
+ * bury the surrounding output; an allowlist that reconstructs its output means
+ * no untrusted byte is ever echoed, rather than a denylist of the escapes
+ * someone remembered.
+ */
+function renderPullStatus(status: string): string {
+  if (KNOWN_PULL_STATUSES.has(status)) return status;
+  const digest = PULL_DIGEST_STATUS.exec(status);
+  return digest === null ? UNRECOGNIZED_PULL_STATUS : `pulling ${digest[1]}`;
+}
+
+/**
+ * One operator-facing line per reported pull progress event. `runtimeTag` is
+ * derived from the signed catalog entry (schema-validated identity components),
+ * not from the runtime, so only the status needs projecting.
+ */
+export function formatPullProgress(
+  runtimeTag: string,
+  progress: OllamaPullProgress,
+): string {
+  const { total, completed } = progress;
+  const share = total !== undefined && total > 0 && completed !== undefined &&
+      completed >= 0 && completed <= total
+    // Rendered as a whole-number percentage of bytes Ollama reports for the
+    // layer in flight, omitted entirely when it does not report both counters.
+    ? ` ${Math.floor((completed / total) * 100)}%`
+    : "";
+  return `Pulling ${runtimeTag}: ${renderPullStatus(progress.status)}${share}`;
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -319,7 +411,7 @@ export async function runLocalIntelligenceSetup(
       }),
     probeHardware: deps.probeHardware ?? (() => selector.probeHardware()),
     resolveModelsRoot: deps.resolveModelsRoot ?? (() =>
-      resolveOllamaModelsRoot(deps.platform ?? process.platform)),
+      resolveOllamaModelsRootState(deps.platform ?? process.platform)),
     runtimeVerifier,
     immuneVerifier,
     withProvisioningLock: (operation) => withCrossProcessLock(
@@ -335,7 +427,27 @@ export async function runLocalIntelligenceSetup(
       },
     ),
     installRuntime: deps.installRuntime ?? (async () => false),
-    pull: (runtimeTag) => client.pull(runtimeTag),
+    // A multi-gigabyte pull runs for minutes to hours; its progress goes to the
+    // ceremony's own operator channel (the same `print` that renders the plan),
+    // so a working download reads as movement instead of a hang.
+    pull: (runtimeTag) => {
+      let lastPrintedAt = 0;
+      return client.pull(runtimeTag, {
+        onProgress: (progress) => {
+          const now = Date.now();
+          // The terminal line is the one that says the download finished, so it
+          // is never dropped by the rate limit.
+          if (
+            progress.status !== "success" &&
+            now - lastPrintedAt < PULL_PROGRESS_PRINT_INTERVAL_MS
+          ) {
+            return;
+          }
+          lastPrintedAt = now;
+          print(formatPullProgress(runtimeTag, progress));
+        },
+      });
+    },
     confirm,
     print,
     commitVerified: (commit) => selector.commitLocalIntegrityProvisioning(

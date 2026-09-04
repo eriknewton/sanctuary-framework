@@ -89,7 +89,14 @@ export function armedCeremonyDeps(): RunLocalIntelligenceSetupDeps {
     client: { pull: vi.fn(), show: vi.fn() } as unknown as OllamaClient,
     loadManifest: async () => signedV2Fixture(),
     modelManifestV2PublicKey: CATALOG_PUBLIC_KEY,
-    resolveModelsRoot: async () => "/var/lib/ollama/models",
+    // Must match `LocalModelsRootResolution` in
+    // ../../src/intelligence/provisioning.ts: the seam reports a resolution
+    // state, never a bare path, so a caller cannot read "not resolved yet" as
+    // a root. This fixture stands for an already-present, strictly resolved root.
+    resolveModelsRoot: async () => ({
+      kind: "resolved" as const,
+      rootReal: "/var/lib/ollama/models",
+    }),
     probeHardware: async () => ({
       totalRamGb: 16,
       cpuArch: "apple-silicon-m2" as const,
