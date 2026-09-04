@@ -1,0 +1,84 @@
+{
+  "manifest_version": 1,
+  "models": {
+    "qwen3-4b": {
+      "model_name": "Qwen3 4B",
+      "model_version": "3",
+      "provider": "Alibaba Cloud",
+      "ollama_identity": { "namespace": "library", "model": "qwen3", "tag": "4b" },
+      "params_b": 4.0,
+      "license": {
+        "identifier": "Apache-2.0",
+        "name": "Apache License 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "osi_approved": true,
+        "redistribution": "permitted"
+      },
+      "open_weights": true,
+      "open_source": false
+    },
+    "qwen3-14b": {
+      "model_name": "Qwen3 14B",
+      "model_version": "3",
+      "provider": "Alibaba Cloud",
+      "ollama_identity": { "namespace": "library", "model": "qwen3", "tag": "14b" },
+      "params_b": 14.8,
+      "license": {
+        "identifier": "Apache-2.0",
+        "name": "Apache License 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "osi_approved": true,
+        "redistribution": "permitted"
+      },
+      "open_weights": true,
+      "open_source": false
+    },
+    "qwen3-32b": {
+      "model_name": "Qwen3 32B",
+      "model_version": "3",
+      "provider": "Alibaba Cloud",
+      "ollama_identity": { "namespace": "library", "model": "qwen3", "tag": "32b" },
+      "params_b": 32.8,
+      "license": {
+        "identifier": "Apache-2.0",
+        "name": "Apache License 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "osi_approved": true,
+        "redistribution": "permitted"
+      },
+      "open_weights": true,
+      "open_source": false
+    }
+  },
+  "tiers": {
+    "baseline": ["qwen3-4b"],
+    "mid": ["qwen3-14b"],
+    "pro": ["qwen3-32b"]
+  },
+  "surface_defaults": {
+    "baseline": {
+      "concierge": "qwen3-4b",
+      "direct-agent-gate-advisor": "qwen3-4b",
+      "sentinel-scoring": "qwen3-4b",
+      "gate-explanation": "qwen3-4b",
+      "privacy-filter-tier-2": "qwen3-4b",
+      "template-suggestion": "qwen3-4b"
+    },
+    "mid": {
+      "concierge": "qwen3-14b",
+      "direct-agent-gate-advisor": "qwen3-14b",
+      "sentinel-scoring": "qwen3-14b",
+      "gate-explanation": "qwen3-14b",
+      "privacy-filter-tier-2": "qwen3-14b",
+      "template-suggestion": "qwen3-14b"
+    },
+    "pro": {
+      "concierge": "qwen3-32b",
+      "direct-agent-gate-advisor": "qwen3-32b",
+      "sentinel-scoring": "qwen3-32b",
+      "gate-explanation": "qwen3-32b",
+      "privacy-filter-tier-2": "qwen3-32b",
+      "template-suggestion": "qwen3-32b"
+    }
+  }
+}

@@ -22,11 +22,14 @@ import {
   createNodeImmuneFileSystemAdapter,
   createOnDiskImmuneVerifier,
   isTier2PinViolation,
+  loadPackagedModelManifestV2,
   runLocalIntelligenceProvisioning,
   verifyModelManifestV2WithKey,
   type ImmuneDiskVerifier,
   type HardwareCapabilityReport,
+  type LocalProvisioningAuditEvent,
   type LocalProvisioningResult,
+  type PackagedModelManifestRefusalReason,
   type ProvenanceProjectionOutcome,
   type RuntimeLightVerifier,
   type SubstrateChoice,
@@ -43,14 +46,33 @@ export interface RunLocalIntelligenceSetupInput {
   identityId: string;
   preAnswered?: boolean;
   isTty?: boolean;
+  /**
+   * `--model-manifest <path>`: an operator-supplied signed manifest verified
+   * by the same loader, parser, byte cap, and pinned key as the packaged one.
+   * This is the only way to use a manifest newer than the shipped asset;
+   * network discovery is deferred.
+   */
+  modelManifestPath?: string;
   print?: (line: string) => void;
   input?: Readable;
   output?: Writable;
 }
 
+/** What the manifest loader hands the ceremony: verified text or a typed refusal. */
+export type LocalIntelligenceManifestLoad =
+  | { ok: true; manifestText: string }
+  | { ok: false; reason: PackagedModelManifestRefusalReason };
+
 export interface RunLocalIntelligenceSetupDeps {
-  /** Future bounded fetch path; deliberately null until a signed asset ships. */
-  loadManifest?: () => Promise<string | null>;
+  /**
+   * Test seam over the manifest source. Production takes the default below,
+   * the packaged-asset loader (`loadPackagedModelManifestV2`), which reads the
+   * signed envelope shipped in the package (or the operator path) and returns
+   * verified text or a typed, audited refusal. A seam returning a bare string
+   * is treated as text for the ceremony's own verifier to judge; there is no
+   * null default any more, so an absent manifest is a named refusal.
+   */
+  loadManifest?: () => Promise<string | null | LocalIntelligenceManifestLoad>;
   /** Host installer adapter; the production default performs no mutation. */
   installRuntime?: () => Promise<boolean>;
   modelStore?: ModelProvenanceStore;
@@ -161,8 +183,11 @@ function provenanceMatchesStableContent(
 }
 
 /**
- * Production remains honestly inert while the signed asset/fetch path is
- * absent. Tests inject every side effect and exercise the complete ceremony.
+ * Shared composition root for the ceremony. The manifest source defaults to
+ * the packaged signed asset (see `loadManifest` above), so production is live
+ * and fail-closed: a refusal from the loader is a typed, audited refusal of
+ * the whole ceremony. The host installer remains inert (no mutation). Tests
+ * inject side effects through `deps` and exercise the complete path.
  */
 export async function runLocalIntelligenceSetup(
   input: RunLocalIntelligenceSetupInput,
@@ -201,11 +226,49 @@ export async function runLocalIntelligenceSetup(
   });
 
   const isTty = input.isTty ?? process.stdin.isTTY === true;
-  // A headless run or explicit decline skips even the future manifest fetch;
-  // neither path may cause network activity while refusing host mutation.
-  const manifestText = input.preAnswered === false || !isTty
+  const audit = async (event: {
+    operation: LocalProvisioningAuditEvent["operation"];
+    outcome: LocalProvisioningAuditEvent["outcome"];
+    details: LocalProvisioningAuditEvent["details"];
+  }) => {
+    await input.auditLog.append(
+      "l2",
+      event.operation,
+      input.identityId,
+      event.details,
+      event.outcome,
+    );
+  };
+  // The production manifest source is the packaged signed asset (or the
+  // operator-supplied path), read and verified by the bounded loader; the
+  // loader performs no network fetch. Must match the loader's refusal
+  // taxonomy in packaged-model-manifest.ts: a refusal here becomes the
+  // ceremony's typed refusal, never a bare absence.
+  const loadManifest = deps.loadManifest ?? (async (): Promise<LocalIntelligenceManifestLoad> => {
+    const loaded = await loadPackagedModelManifestV2({
+      ...(input.modelManifestPath === undefined ? {} : { assetPath: input.modelManifestPath }),
+      ...(deps.modelManifestV2PublicKey === undefined
+        ? {}
+        : { publicKey: deps.modelManifestV2PublicKey }),
+      audit,
+    });
+    return loaded.ok
+      ? { ok: true, manifestText: loaded.manifestText }
+      : { ok: false, reason: loaded.reason };
+  });
+  // A headless run or explicit decline skips even reading the manifest;
+  // neither path may touch the asset or the host while refusing mutation.
+  const loaded = input.preAnswered === false || !isTty ? null : await loadManifest();
+  const manifestText = loaded === null
     ? null
-    : await (deps.loadManifest ?? (async () => null))();
+    : typeof loaded === "string"
+    ? loaded
+    : loaded.ok
+    ? loaded.manifestText
+    : null;
+  const manifestLoadRefusal = loaded !== null && typeof loaded === "object" && !loaded.ok
+    ? loaded.reason
+    : undefined;
   const runtimeVerifier = deps.runtimeVerifier ?? new OllamaRuntimeEvidenceClient({
     endpoint: config.ollamaEndpoint ?? "http://localhost:11434",
   });
@@ -217,6 +280,7 @@ export async function runLocalIntelligenceSetup(
     platform: deps.platform ?? process.platform,
     preAnswered: input.preAnswered,
     manifestText,
+    ...(manifestLoadRefusal === undefined ? {} : { manifestLoadRefusal }),
     initialConfiguredChoices,
     // Must match `reloadLocalProvisioningAuthority` in selector.ts; this
     // callback is invoked only from inside the provisioning lock.
@@ -282,14 +346,6 @@ export async function runLocalIntelligenceSetup(
     },
     recordFailure: (surfaces, failureClass, snippet) =>
       selector.recordLocalProvisioningFailure(surfaces, failureClass, snippet),
-    audit: async (event) => {
-      await input.auditLog.append(
-        "l2",
-        event.operation,
-        input.identityId,
-        event.details,
-        event.outcome,
-      );
-    },
+    audit,
   });
 }

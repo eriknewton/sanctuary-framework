@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { INTEL_OPS } from "../../src/intelligence/audit-events.js";
@@ -35,11 +36,58 @@ describe("local intelligence provisioning structural inventory", () => {
     expect(contextGate).toContain('| "model-registry"');
   });
 
-  it("keeps the production manifest loader and host installer explicitly inert", () => {
+  it("wires the packaged signed-manifest loader as the default and keeps the host installer inert", () => {
     const adapter = source("wrap/local-intelligence.ts");
-    expect(adapter).toContain("async () => null");
+    const wrap = source("wrap/cli.ts");
+    const init = source("wrap/init.ts");
+    // The manifest source is the packaged-asset loader, never a null default.
+    expect(adapter).toContain("loadPackagedModelManifestV2(");
+    expect(adapter).not.toContain("async () => null");
     expect(adapter).toContain("async () => false");
+    // No network and no host mutation from the adapter itself.
     expect(adapter).not.toMatch(/https:\/\//);
     expect(adapter).not.toMatch(/execFile|spawn|curl|brew install/);
+    // Both production callers take the shared default and only pass the
+    // operator path override; neither injects its own manifest source.
+    for (const caller of [wrap, init]) {
+      expect(caller).not.toContain("loadManifest");
+      expect(caller).toContain("--model-manifest");
+      expect(caller).toContain("modelManifestPath: options.modelManifestPath");
+    }
+  });
+
+  it("pins the packaged asset bytes at build, at load, and in the package exports", () => {
+    const loader = source("intelligence/packaged-model-manifest.ts");
+    const copyScript = readFileSync(
+      new URL("../../scripts/copy-model-manifest-v2-asset.mjs", import.meta.url),
+      "utf8",
+    );
+    const packageJson = JSON.parse(
+      readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+    ) as { exports: Record<string, unknown>; scripts: Record<string, string> };
+    const asset = readFileSync(
+      new URL("../../src/intelligence/model-manifest/model-manifest.v2.json", import.meta.url),
+    );
+    const digest = createHash("sha256").update(asset).digest("hex");
+    const pin = (text: string, name: string) =>
+      new RegExp(`${name}\\s*=\\s*\\n?\\s*"([0-9a-f]{64})"`).exec(text)?.[1];
+    expect(pin(loader, "PACKAGED_MODEL_MANIFEST_V2_ASSET_SHA256")).toBe(digest);
+    expect(pin(copyScript, "EXPECTED_MODEL_MANIFEST_V2_ASSET_SHA256")).toBe(digest);
+    expect(packageJson.exports["./intelligence/model-manifest/model-manifest.v2.json"])
+      .toBe("./dist/intelligence/model-manifest/model-manifest.v2.json");
+    expect(packageJson.scripts.build).toContain("copy-model-manifest-v2-asset.mjs --verify-only");
+    expect(packageJson.scripts.build.endsWith("node scripts/copy-model-manifest-v2-asset.mjs")).toBe(true);
+    // The loader's five refusal states each carry operator copy in the ceremony.
+    const provisioning = source("intelligence/provisioning.ts");
+    for (const reason of [
+      "integrity_asset_absent",
+      "integrity_asset_oversize",
+      "integrity_asset_unparseable",
+      "integrity_asset_signature_invalid",
+      "integrity_asset_pin_mismatch",
+    ]) {
+      expect(loader).toContain(`"${reason}"`);
+      expect(provisioning).toContain(`${reason}:`);
+    }
   });
 });

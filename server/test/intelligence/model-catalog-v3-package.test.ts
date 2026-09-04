@@ -404,6 +404,8 @@ describe("catalog-v3 built and packed consumers", () => {
       ".",
       "./intelligence",
       ...ASSET_SUBPATHS.map((path) => `./intelligence/catalog-v3/${path}`),
+      // Must match PACKAGED_MODEL_MANIFEST_V2_ASSET_RELATIVE_PATH in src/intelligence/packaged-model-manifest.ts.
+      "./intelligence/model-manifest/model-manifest.v2.json",
     ].sort());
     for (const mode of ["import", "require"] as const) {
       const result = runNode(SERVER_ROOT, mode);
@@ -521,6 +523,7 @@ describe("catalog-v3 built and packed consumers", () => {
         "index.d.ts",
         "index.js",
         "index.js.map",
+        "model-manifest",
       ]);
 
       for (const mode of ["import", "require"] as const) {

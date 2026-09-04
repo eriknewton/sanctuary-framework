@@ -22,6 +22,7 @@ import {
   type VerifiedLocalBindingV2,
 } from "./model-manifest-v2.js";
 import { loadPinnedModelManifestKey, type ModelManifestTier } from "./model-manifest.js";
+import type { PackagedModelManifestRefusalReason } from "./packaged-model-manifest.js";
 import type { RuntimeLightVerifier } from "./runtime-light-verifier.js";
 import type {
   ImmuneDiskVerifier,
@@ -59,6 +60,10 @@ export class LocalModelsRootResolutionError extends Error {
 export type LocalProvisioningRefusalReason =
   | "declined"
   | "non_tty"
+  // Asset-stage refusals from the packaged manifest loader
+  // (packaged-model-manifest.ts); each names why no manifest text arrived, so
+  // the ceremony never collapses a typed loader refusal into a bare "absent".
+  | PackagedModelManifestRefusalReason
   | "integrity_state_absent"
   | "integrity_state_invalid"
   | "manifest_signature_invalid"
@@ -113,6 +118,14 @@ export interface LocalProvisioningOps {
   /** false is an explicit decline; true still cannot bypass the TTY confirm. */
   preAnswered?: boolean;
   manifestText: string | null;
+  /**
+   * Why `manifestText` is null when the packaged loader ran and refused. The
+   * ceremony refuses with this exact reason instead of the generic
+   * `integrity_state_absent`, so an operator can tell a missing package asset
+   * from a bad signature from a byte-pin mismatch. Undefined when no loader
+   * ran (headless or declined) or when text arrived.
+   */
+  manifestLoadRefusal?: PackagedModelManifestRefusalReason;
   /** Pre-lock snapshot used only to describe an early consent refusal. */
   initialConfiguredChoices: Readonly<Record<Surface, SubstrateChoice>>;
   /**
@@ -161,6 +174,11 @@ export type LocalProvisioningResult =
 const FAILURE_COPY: Record<LocalProvisioningRefusalReason, string> = {
   declined: "Local intelligence setup was declined; configured local surfaces remain local and degraded.",
   non_tty: "Local intelligence setup requires an interactive TTY; no runtime or model mutation occurred.",
+  integrity_asset_absent: "The packaged signed model manifest is missing; no model pull was attempted.",
+  integrity_asset_oversize: "The signed model manifest exceeds the reviewed byte cap; no model pull was attempted.",
+  integrity_asset_unparseable: "The signed model manifest is not a valid V2 envelope; no model pull was attempted.",
+  integrity_asset_signature_invalid: "The signed model manifest does not verify under the pinned catalog root; no model pull was attempted.",
+  integrity_asset_pin_mismatch: "The packaged model manifest does not match the build-time byte pin; no model pull was attempted.",
   integrity_state_absent: "The signed V2 model catalog is unavailable; no model pull was attempted.",
   integrity_state_invalid: "The signed V2 model catalog or armed record is invalid; no model pull was attempted.",
   manifest_signature_invalid: "The V2 model catalog signature is invalid; no model pull was attempted.",
@@ -410,6 +428,11 @@ export async function runLocalIntelligenceProvisioning(
       );
       affectedSurfaces = localSurfaces;
       const floor = authority.existingIntegrityState?.manifest_version_floor;
+      // A typed loader refusal is the verdict; it is never re-read as the
+      // generic absence the verifier would otherwise report for null text.
+      if (ops.manifestText === null && ops.manifestLoadRefusal !== undefined) {
+        return refuse(ops, localSurfaces, ops.manifestLoadRefusal, "substrate_misconfigured");
+      }
       const verifyManifest = ops.verifyManifest ?? defaultVerifyManifest;
       const verified = verifyManifest(ops.manifestText, floor);
       if (!verified.ok) {
