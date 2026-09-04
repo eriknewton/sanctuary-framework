@@ -2188,9 +2188,11 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
         "proceed, run `sanctuary restore-attest --fortress <path>` now (it " +
         "re-establishes the witness under the rotated master at the live " +
         "envelope's epoch and is not blocked by the journal); then run " +
-        "`sanctuary rotate-master --resume`. Deleting the witness record is not " +
-        "a remedy (the journal records that one existed, so a missing witness is " +
-        "refused the same way). " +
+        "`sanctuary rotate-master --resume`. " +
+        (journal.epoch_witness_present === true
+          ? "Deleting the witness record is not a remedy (the journal records " +
+            "that one existed, so a missing witness is refused the same way). "
+          : "") +
         "The remedy forfeits the witness's config-baseline and revocation-floor " +
         "latches (the next boot re-raises the baseline latch; the revocation " +
         "floor resets)."

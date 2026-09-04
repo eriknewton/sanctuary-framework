@@ -373,10 +373,11 @@ export async function readEpochWitness(
  * witness). Without it, witness writes are strictly non-decreasing. `force`
  * ALSO bypasses the latch carry below, so every force caller must read the
  * current witness itself and carry its whole authenticated data object
- * forward, overriding only the fields it owns; both named callers do (the
- * rotation side pins this as its "CARRY INVARIANT" in
- * `advanceEpochWitnessData`). A third force caller that does not is a
- * latch-erasing write.
+ * forward, overriding only the fields it owns. Rotation's `finalize` carries
+ * the whole authenticated object (pinned as its "CARRY INVARIANT" in
+ * `advanceEpochWitnessData`); `restoreAttest` below carries the three known
+ * latches explicitly. A force caller that carries nothing is a latch-erasing
+ * write.
  */
 export async function writeEpochWitness(
   storage: StorageBackend,

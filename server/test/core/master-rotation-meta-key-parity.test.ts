@@ -226,7 +226,10 @@ interface ScanResult {
  */
 function scanMetaWriteSites(files: Map<string, string>): ScanResult {
   const aliases = [...metaNamespaceAliases(files)];
-  const nsAlt = ['"_meta"', ...aliases].map((a) => a.replace(/[$]/g, "\\$")).join("|");
+  // Full regex-metacharacter escape (including backslash) so an alias name can
+  // never widen or break the alternation it is spliced into.
+  const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const nsAlt = ['"_meta"', ...aliases].map(escapeRegExp).join("|");
   // `.write(<ns>, <keyExpr>,` and `writeRecordDurable(<storage>, <ns>, <keyExpr>,`
   const writeCall = new RegExp(
     `\\.write\\(\\s*(?:${nsAlt})\\s*,\\s*([^,]+?)\\s*,`,
