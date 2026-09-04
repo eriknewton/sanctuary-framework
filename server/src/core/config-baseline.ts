@@ -107,11 +107,31 @@ import {
   toBase64url,
 } from "./encoding.js";
 
-/** Storage namespace + key for the authenticated config-security baseline. */
+/**
+ * Storage namespace + key for the authenticated config-security baseline.
+ *
+ * MASTER-ROTATION CONTRACT: this record's MAC is keyed from the operator master
+ * (`baselineMacBytes` below), so `master-rotation.ts` must restamp it under the
+ * new master. The key, marker, MAC purpose, and MAC domain are duplicated there
+ * (`CONFIG_BASELINE_*` in `server/src/core/master-rotation.ts`, classified
+ * `config-security-baseline` by `classifyMetaKey`) and must match byte-for-byte.
+ * Each drift surfaces as a rotation PREFLIGHT refusal, never a corrupt restamp:
+ * a KEY drift leaves this record unclassified (generic abort); a PURPOSE or
+ * DOMAIN drift fails the engine's old-master MAC verify before any write; a
+ * MARKER drift is refused explicitly by the baseline recipe (it sets the
+ * engine's `onMarkerMismatch: "abort"`, because `loadAuthenticatedBaseline`
+ * below fails the next boot closed on a bare record, so silently leaving it
+ * would move the failure from preflight to the first post-rotation boot). If
+ * you rename any of the four, or change the MAC input layout, change both files
+ * in the same PR.
+ */
 const CONFIG_BASELINE_NAMESPACE = "_meta";
 export const CONFIG_BASELINE_META_KEY = "config-security-baseline-v1";
 
-/** Envelope marker. A record missing this marker is bare/legacy/forged. */
+/**
+ * Envelope marker. A record missing this marker is bare/legacy/forged.
+ * Must match CONFIG_BASELINE_MARKER in server/src/core/master-rotation.ts.
+ */
 const CONFIG_BASELINE_MARKER = "__sanctuary_config_security_baseline_v1";
 
 /**
@@ -135,6 +155,7 @@ const CONFIG_BASELINE_SCHEMA_VERSION = 3 as const;
  * custody-epoch-witness-mac, audit-head-anchor, audit-rotation-anchor,
  * transparency-counter-floor, principal-baseline). Registered in
  * `server/reorg-surface-manifest.md`.
+ * Must match CONFIG_BASELINE_MAC_PURPOSE in server/src/core/master-rotation.ts.
  */
 const CONFIG_BASELINE_MAC_PURPOSE = "config-security-baseline-mac";
 
@@ -144,6 +165,9 @@ const CONFIG_BASELINE_MAC_PURPOSE = "config-security-baseline-mac";
  * `record = { schema_version, observed_at, posture }`. Binding the storage key
  * into the MAC input (as `state-meta-mac` does) prevents replaying a valid
  * baseline envelope under a different `_meta` key.
+ * Must match CONFIG_BASELINE_MAC_DOMAIN in server/src/core/master-rotation.ts,
+ * whose restamp recipe appends `META_KEY + "\n"` to this prefix to reproduce
+ * the exact MAC input `baselineMacBytes` computes.
  */
 const CONFIG_BASELINE_MAC_DOMAIN = "sanctuary.config-security-baseline.v1\n";
 
