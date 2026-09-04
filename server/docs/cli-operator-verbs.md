@@ -141,3 +141,67 @@ The unit also runs `dashboard`, the long-lived HTTP process, while its `Descript
 `Sanctuary MCP Server`. The dashboard is the correct thing to supervise; the description is
 the part that is misleading. See [DEPLOYMENT.md](DEPLOYMENT.md) for why the stdio MCP server
 is not a service-manager workload.
+
+## `sanctuary intelligence config-reset`
+
+Recovers a fortress whose local-intelligence config record has become unreadable. Two
+shapes count as unreadable: a record that no longer decrypts or parses (`corrupt`), and
+a record written by a newer Sanctuary whose version this build does not know
+(`version-too-new`). Either one makes every local-intelligence config write fail closed
+with a typed error that names this verb; reads keep booting on the default configuration
+so the rest of the fortress is unaffected.
+
+```bash
+sanctuary intelligence config-reset
+sanctuary intelligence config-reset --fortress ~/.sanctuary-work
+```
+
+What it does, in order:
+
+1. Refuses unless stdin is an interactive terminal. There is no flag that skips the
+   prompt; a piped or scripted run exits 1 before the fortress is unlocked.
+2. Unlocks the fortress master with write intent (`SANCTUARY_PASSPHRASE`,
+   `SANCTUARY_RECOVERY_KEY`, or the exact-fortress stored credential), holding the shared
+   master-rotation barrier for the rest of the run.
+3. Classifies the durable record and prints the classification. A readable record, armed
+   or legacy, is refused: this verb never discards live operator state. An armed record
+   that fails Q5 integrity validation is refused too; that is an integrity refusal, not an
+   unreadable record, and there is no in-product disarm.
+4. Prints the plan and asks you to type `reset`. Anything else aborts with nothing changed.
+5. Copies the record's raw bytes to
+   `<fortress>/state/_intelligence/substrate-config.quarantine.<UTC stamp>.bin`
+   (owner-only, never overwritten), then removes the record, then appends an
+   `intelligence_config_quarantined` audit entry.
+
+After a successful run the next load returns the default configuration. Operator
+substrate choices and any API keys that were inside the unreadable record are not
+recovered; re-enter them through the dashboard or `sanctuary intelligence` as usual. A
+fortress that was Q5-armed on the quarantined record is unarmed afterward and must be
+re-provisioned before local load-integrity verification applies again.
+
+Exit codes: `0` quarantined or no record existed; `1` refused (non-interactive, declined,
+unlock failed, record not unreadable); `2` malformed flags.
+
+Failure modes to know before you run it:
+
+- **The symptom is a config write that fails, not a boot that fails.** Boot reads fall
+  back to defaults and log `intelligence_config_loaded` with `was_default: true`; the
+  first write (a substrate pick in the dashboard, a provisioning run) is what surfaces the
+  typed error. If writes fail with a Q5 integrity reason instead (`manifest_rollback`,
+  `binding_mismatch`, `manifest_signature_invalid`), the record is readable and this verb
+  will refuse; that is a different condition.
+- **A corrupt record also blocks `rotate-master` preflight by name** (the rotation walk
+  refuses any `_intelligence` entry it cannot decrypt). Running this verb clears that
+  block. The sidecar is deliberately not an encrypted entry, so rotation ignores it.
+- **The sidecar is bound to the master key in effect when it was written.** A quarantined
+  `version-too-new` record is still valid ciphertext under that key; after a later
+  `rotate-master` it will no longer decrypt under the new master. Copy it elsewhere first
+  if you intend to open it with a newer Sanctuary after rotating.
+- **Two runs in the same millisecond refuse the second** rather than overwrite the first
+  sidecar. Rerun; the stamp will differ.
+- **A crash between the sidecar write and the record removal leaves both files.** That is
+  the intended order: at no point is the record gone without a copy of its bytes. Rerun
+  the verb; it quarantines again under a new stamp and completes the removal.
+- **Unlock refusals are secret-free and name the source that failed** (`absent`,
+  `locked`, `mismatch`). A `locked` keyring over SSH means: pass `SANCTUARY_PASSPHRASE`
+  explicitly or run from a console session.

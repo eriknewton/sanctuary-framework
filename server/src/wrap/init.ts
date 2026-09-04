@@ -128,6 +128,12 @@ export interface InitOptions {
   noIdentity?: boolean;
   /** Pre-answer the local-intelligence setup choice; TTY confirm still gates mutation. */
   provisionLocalIntelligence?: boolean;
+  /**
+   * `--model-manifest <path>`: verify an operator-supplied signed model
+   * manifest instead of the packaged one; same loader, parser, byte cap, and
+   * pinned catalog root. Nothing is fetched.
+   */
+  modelManifestPath?: string;
 }
 
 /**
@@ -922,6 +928,9 @@ export async function runInit(
         auditLog: postLockAudit,
         identityId: fortressId,
         preAnswered: options.provisionLocalIntelligence,
+        ...(options.modelManifestPath === undefined
+          ? {}
+          : { modelManifestPath: options.modelManifestPath }),
         isTty: process.stdin.isTTY === true,
         // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
         print: (line) => console.error(`  ${line}`),
@@ -1141,6 +1150,10 @@ export function parseInitArgs(argv: string[]): ParsedInitArgs {
       case "--no-provision-local-intelligence":
         opts.provisionLocalIntelligence = false;
         break;
+      case "--model-manifest":
+        opts.modelManifestPath = readRequiredPathArg(argv, i, "--model-manifest");
+        i++;
+        break;
       case "--recovery-out":
         opts.recoveryOut = readRequiredPathArg(argv, i, "--recovery-out");
         i++;
@@ -1207,6 +1220,11 @@ Options:
                        plan and TTY confirmation still precede any mutation.
   --no-provision-local-intelligence
                        Decline local-model setup without printing a plan.
+  --model-manifest <path>
+                       With --provision-local-intelligence: verify an
+                       operator-supplied signed model manifest instead of the
+                       one packaged with this release. Same pinned catalog
+                       root, parser, and byte cap; nothing is fetched.
   --help, -h           Show this help.
 
 What init does:

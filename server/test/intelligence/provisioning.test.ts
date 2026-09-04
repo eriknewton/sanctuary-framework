@@ -1,3 +1,4 @@
+// fail-before-exempt: Q5E residual 3 trims the dead `configVersion` field from the reloadAuthority mocks; the production contract never declared it, so this test-only cleanup has no fail-before behavior.
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_PER_SURFACE } from "../../src/intelligence/defaults.js";
 import {
@@ -106,7 +107,6 @@ function makeOps(overrides: Partial<LocalProvisioningOps> = {}) {
     manifestText: "signed V2 fixture",
     initialConfiguredChoices: { ...DEFAULT_PER_SURFACE },
     reloadAuthority: vi.fn(async () => ({
-      configVersion: 1 as const,
       configuredChoices: { ...DEFAULT_PER_SURFACE },
     })),
     verifyManifest: (_text, floor) =>
@@ -327,7 +327,6 @@ describe("Q5D atomic local intelligence provisioning", () => {
       };
     const { ops } = makeOps({
       reloadAuthority: vi.fn(async () => ({
-        configVersion: 2 as const,
         configuredChoices: { ...DEFAULT_PER_SURFACE },
         existingIntegrityState: oldState,
       })),
@@ -349,7 +348,6 @@ describe("Q5D atomic local intelligence provisioning", () => {
     } as LocalIntegrityStateV2;
     const { ops } = makeOps({
       reloadAuthority: vi.fn(async () => ({
-        configVersion: 2 as const,
         configuredChoices: { ...DEFAULT_PER_SURFACE },
         existingIntegrityState: oldState,
       })),
@@ -372,7 +370,6 @@ describe("Q5D atomic local intelligence provisioning", () => {
     const runtimeVerifier = { verify: vi.fn(async () => runtimeSuccess()) };
     const { ops, commits } = makeOps({
       reloadAuthority: vi.fn(async () => ({
-        configVersion: 2 as const,
         configuredChoices: { ...DEFAULT_PER_SURFACE },
         existingIntegrityState,
       })),
