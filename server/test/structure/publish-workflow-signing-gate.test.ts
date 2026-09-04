@@ -141,6 +141,9 @@ describe("publish workflow trust zones", () => {
     expect(publish).toContain("--provenance");
     expect(publish.indexOf("verify-release-artifact.mjs")).toBeLessThan(publish.indexOf("npm publish"));
     expect(occurrences(publish, "npm publish")).toBe(1);
+    // The publish argument must be an explicit relative path (./...): a bare "dir/file.tgz"
+    // is parsed by npm as a GitHub owner/repo shorthand and turns into a git fetch.
+    expect(publish).toMatch(/tarball="\.\/release\/sanctuary-framework-mcp-server-\$\{RELEASE_VERSION\}\.tgz"/);
   });
 
   it("supports both failed-job and all-job reruns without changing artifact identity", () => {
