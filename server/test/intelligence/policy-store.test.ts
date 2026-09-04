@@ -21,6 +21,7 @@ import {
   INTELLIGENCE_NAMESPACE,
   SUBSTRATE_CONFIG_KEY,
   classifyLocalIntelligenceState,
+  probeDurableRecordPresence,
 } from "../../src/intelligence/policy-store.js";
 import { buildDefaultConfig } from "../../src/intelligence/defaults.js";
 import type { LocalIntegrityStateV2 } from "../../src/intelligence/model-manifest-v2.js";
@@ -255,6 +256,31 @@ describe("classifyLocalIntelligenceState", () => {
     expect(report.detail).toContain("indeterminate");
     // The absent wording is a positive claim and must not appear here.
     expect(report.detail).not.toContain("no durable local-intelligence config record exists");
+  });
+});
+
+describe("probeDurableRecordPresence", () => {
+  it("answers absent and present without a master key", async () => {
+    const storage = new MemoryStorage();
+    // No key is passed anywhere in this test: presence is a property of the
+    // bytes, which is why a diagnostic can settle it before resolving any
+    // fortress credential.
+    expect(await probeDurableRecordPresence(storage)).toBe("absent");
+    await new IntelligenceConfigStore(storage, generateRandomKey())
+      .save(buildDefaultConfig());
+    expect(await probeDurableRecordPresence(storage)).toBe("present");
+  });
+
+  it("keeps a failed read distinct from an absent record", async () => {
+    const storage = new MemoryStorage();
+    vi.spyOn(storage, "read").mockImplementation(async () => {
+      const error = new Error("EACCES: permission denied") as NodeJS.ErrnoException;
+      error.code = "EACCES";
+      throw error;
+    });
+    // Reporting "absent" here would be a positive claim built on a failure.
+    expect(await probeDurableRecordPresence(storage)).toBe("unreadable");
+    vi.restoreAllMocks();
   });
 });
 

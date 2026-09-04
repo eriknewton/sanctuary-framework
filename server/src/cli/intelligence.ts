@@ -25,6 +25,7 @@ import {
   INTELLIGENCE_CONFIG_RESET_VERB,
   IntelligenceConfigStore,
   classifyLocalIntelligenceState,
+  probeDurableRecordPresence,
   type LoadOutcome,
   type LocalIntelligenceStateReport,
 } from "../intelligence/policy-store.js";
@@ -124,19 +125,37 @@ async function readLocalIntelligenceState(
   storagePath: string,
   deps: DiagnoseDeps,
 ): Promise<DiagnoseLocalIntelligence> {
+  const absent = (): DiagnoseLocalIntelligence => ({
+    readable: true,
+    report: classifyLocalIntelligenceState({
+      kind: "default",
+      config: buildDefaultConfig(),
+    }),
+  });
   const statePath = join(storagePath, "state");
   if (!existsSync(statePath)) {
     // No fortress state directory: absence is the truth, and no credential
     // store is touched to establish it.
-    return {
-      readable: true,
-      report: classifyLocalIntelligenceState({
-        kind: "default",
-        config: buildDefaultConfig(),
-      }),
-    };
+    return absent();
   }
   const storage = deps.storage ?? new FilesystemStorage(statePath);
+  // INVARIANT: presence is settled from the BYTES before any credential is
+  // resolved. A fortress that was never armed has no record to open, so
+  // asking the OS keyring to prove that would make a read-only report reach
+  // the credential store (a keychain modal on a desktop, a `security` /
+  // `secret-tool` subprocess under test) on the commonest shape there is, and
+  // would then render the missing credential as the answer instead of the
+  // absent record. `unreadable` stays distinct from `absent`: a read that
+  // FAILED is not a record that is not there.
+  const presence = await probeDurableRecordPresence(storage);
+  if (presence === "unreadable") {
+    return {
+      readable: true,
+      report: classifyLocalIntelligenceState({ kind: "read-failed" }),
+    };
+  }
+  if (presence === "absent") return absent();
+  // A record exists, and opening it is what needs the fortress credential.
   const unlock = deps.unlock ?? unlockLocalFortress;
   const unlocked = await unlock({
     storage,
@@ -160,7 +179,9 @@ async function readLocalIntelligenceState(
     );
     // `loadForDiagnostics`, never `load`: the boot-path load reports a storage
     // read failure as a fresh fortress, which this verb would print as "no
-    // durable record exists" on a record it simply could not read.
+    // durable record exists" on a record it simply could not read. It re-reads
+    // the record rather than reusing the presence probe's bytes, so a record
+    // deleted between the two reads reports absent instead of failing.
     return {
       readable: true,
       report: classifyLocalIntelligenceState(await store.loadForDiagnostics()),

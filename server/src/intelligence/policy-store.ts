@@ -117,6 +117,30 @@ export type LoadOutcome =
   | { kind: "corrupt"; config: SubstrateConfig };
 
 /**
+ * Whether the durable record EXISTS, answered without a master key.
+ *
+ * Absence is establishable from the bytes alone, so a diagnostic must not
+ * resolve a fortress credential to prove that a fortress was never armed:
+ * doing so makes a read-only report reach the OS keyring (a modal, or a
+ * subprocess in a test) on the most common shape there is, a fresh fortress
+ * with no local-intelligence record.
+ *
+ * `unreadable` is kept distinct from `absent` for the same reason
+ * {@link IntelligenceConfigStore.loadForDiagnostics} exists: a read that FAILS
+ * is not a record that is not there.
+ */
+export async function probeDurableRecordPresence(
+  storage: StorageBackend,
+): Promise<"absent" | "present" | "unreadable"> {
+  try {
+    const raw = await storage.read(INTELLIGENCE_NAMESPACE, SUBSTRATE_CONFIG_KEY);
+    return raw === null ? "absent" : "present";
+  } catch {
+    return "unreadable";
+  }
+}
+
+/**
  * A load classified for an OPERATOR DIAGNOSTIC rather than for the boot path.
  *
  * It adds the one distinction {@link IntelligenceConfigStore.load} deliberately

@@ -11,7 +11,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -396,12 +396,84 @@ describe("sanctuary intelligence diagnose is read-only and closed-vocabulary (R2
       stringToBytes(JSON.stringify(derived.params)),
     );
     derived.key.fill(0);
+    // A record must EXIST for the credential to matter at all: with no record
+    // the verb settles absence from the bytes and never unlocks. The bytes
+    // here are never decoded, because the unlock refuses first.
+    await storage.write(
+      "_intelligence",
+      "substrate-config",
+      stringToBytes("{}"),
+    );
     return {
       storagePath,
       storage,
       cleanup: () => rm(dir, { recursive: true, force: true }),
     };
   }
+
+  it("settles an absent record without touching the credential store at all", async () => {
+    await withFortress(async (fortress) => {
+      // A fortress that was never armed: an intelligence directory, no record.
+      // Absence is provable from the bytes, so resolving a credential here
+      // would make a read-only report reach the OS keyring on the commonest
+      // shape there is, and would then report the missing credential instead
+      // of the missing record. The directory is created directly, matching the
+      // shape `vocab-drift-cleanup.test.ts` builds, so `ok` is not decided by
+      // the unrelated config-directory check.
+      await mkdir(join(fortress.storagePath, "state", "_intelligence"), {
+        recursive: true,
+      });
+      const unlock = vi.fn(async () => {
+        throw new Error("diagnose must not unlock a fortress with no record");
+      }) as unknown as DiagnoseDeps["unlock"];
+      const streams = captureStreams();
+      const code = await runIntelligenceCommand({
+        argv: ["diagnose", "--json", "--fortress", fortress.storagePath],
+        diagnoseDeps: { unlock },
+      });
+      const parsed = JSON.parse(streams.out()) as {
+        ok: boolean;
+        local_intelligence: { state: string; credential_failure: string | null };
+      };
+      vi.restoreAllMocks();
+      expect(vi.mocked(unlock!)).not.toHaveBeenCalled();
+      expect(parsed.local_intelligence.state).toBe("absent");
+      expect(parsed.local_intelligence.credential_failure).toBeNull();
+      // Nothing is wrong with this fortress: nobody asked for local
+      // intelligence on it.
+      expect(parsed.ok).toBe(true);
+      expect(code).toBe(0);
+    });
+  });
+
+  it("says unavailable and not ok when a record EXISTS and no credential resolves", async () => {
+    await withFortress(async (fortress) => {
+      await arm(fortress);
+      const streams = captureStreams();
+      const code = await runIntelligenceCommand({
+        argv: ["diagnose", "--json", "--fortress", fortress.storagePath],
+        diagnoseDeps: {
+          unlock: (async () => ({
+            ok: false as const,
+            failure: "absent" as const,
+            message: "no fortress credential is available",
+          })) as DiagnoseDeps["unlock"],
+        },
+      });
+      const parsed = JSON.parse(streams.out()) as {
+        ok: boolean;
+        local_intelligence: { state: string; credential_failure: string | null };
+      };
+      vi.restoreAllMocks();
+      // The mirror of the case above: here a record IS present, so "I could
+      // not open it" is the honest answer and it is not a passing one.
+      expect(parsed.local_intelligence.state).toBe("unavailable");
+      expect(parsed.local_intelligence.credential_failure).toBe("absent");
+      expect(parsed.ok).toBe(false);
+      // The exit code still tracks only the config directory, unchanged.
+      expect(code).toBe(0);
+    });
+  });
 
   it("tells a pre-envelope fortress it needs a migration, not that its credential is missing", async () => {
     const legacy = await seedLegacyFortress();
