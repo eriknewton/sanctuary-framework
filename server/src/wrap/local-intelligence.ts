@@ -101,6 +101,10 @@ export async function resolveOllamaModelsRootState(
   platform: NodeJS.Platform,
   environment: Readonly<Record<string, string | undefined>> = process.env,
   homeDirectory = homedir(),
+  // Same seam shape as `environment` and `homeDirectory`: production always
+  // takes the real uid, and no call site may pass a uid that is not this
+  // process's own.
+  processUid: number | undefined = process.getuid?.(),
 ): Promise<LocalModelsRootResolution> {
   if (platform === "win32") {
     throw new LocalModelsRootResolutionError("immune_platform_unsupported");
@@ -138,6 +142,23 @@ export async function resolveOllamaModelsRootState(
       lexical.isSymbolicLink() ? "symlink_refused" : "model_root_invalid",
     );
   }
+  // The accepted root is persisted as `ollama_models_root` and every later run
+  // treats it as authoritative, so it must be a directory only this operator can
+  // write. A root owned by someone else, or writable by group or other, can be
+  // repopulated between verification and load by a lower-privilege process on
+  // this host -- including the wrapped agent, which runs under this same uid --
+  // and an absent default root is now created by the first pull rather than
+  // refused, so pre-creating it group-writable is a reachable move. 0o022 = the
+  // group-write (0o020) and other-write (0o002) bits.
+  // A host that cannot report a uid never reaches here (the win32 gate above
+  // is the only such platform), so the undefined arm is a fail-closed guard
+  // rather than a live branch.
+  if (processUid === undefined || lexical.uid !== processUid) {
+    throw new LocalModelsRootResolutionError("model_root_invalid");
+  }
+  if ((lexical.mode & 0o022) !== 0) {
+    throw new LocalModelsRootResolutionError("model_root_invalid");
+  }
   let resolved: string;
   try {
     resolved = await realpath(candidate);
@@ -155,27 +176,6 @@ export async function resolveOllamaModelsRootState(
     throw new LocalModelsRootResolutionError("model_root_invalid");
   }
   return { kind: "resolved", rootReal: resolved };
-}
-
-/**
- * Strict resolution for callers that need a root string. Every state other than
- * a real, non-aliased, non-symlink directory is a refusal here, including the
- * absent default root: a caller asking for a path has nowhere to put "not yet".
- */
-export async function resolveOllamaModelsRoot(
-  platform: NodeJS.Platform,
-  environment: Readonly<Record<string, string | undefined>> = process.env,
-  homeDirectory = homedir(),
-): Promise<string> {
-  const resolution = await resolveOllamaModelsRootState(
-    platform,
-    environment,
-    homeDirectory,
-  );
-  if (resolution.kind !== "resolved") {
-    throw new LocalModelsRootResolutionError("model_root_invalid");
-  }
-  return resolution.rootReal;
 }
 
 // 5_000 ms = 5 s x 1000 ms/s. Ollama emits progress lines several times a

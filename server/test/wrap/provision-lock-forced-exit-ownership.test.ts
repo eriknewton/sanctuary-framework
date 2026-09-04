@@ -1,4 +1,4 @@
-// fail-before-exempt: test-isolation only. This file now stubs the local-intelligence ceremony so these wrap paths stop reading the HOST's Ollama runtime and waiting on a consent prompt no test can answer; no assertion changes, so it passes with or without the R2 source fix.
+// fail-before-exempt: test-isolation only. This PR NEWLY lets a host whose ~/.ollama/models does not exist reach the plan, the consent prompt and the pull instead of refusing before consent, so these wrap paths (they force isTTY true over a temp HOME) now block on a consent prompt no test can answer whenever the host's own Ollama is reachable; this file stubs the ceremony and changes no assertion, so it passes with or without the source fix.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { access, cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";

@@ -1,4 +1,4 @@
-// fail-before-exempt: test-isolation only. This file now stubs the local-intelligence ceremony so these wrap paths stop reading the HOST's Ollama runtime and waiting on a consent prompt no test can answer; no assertion changes, so it passes with or without the R2 source fix.
+// fail-before-exempt: test-isolation only. This PR NEWLY lets a host whose ~/.ollama/models does not exist reach the plan, the consent prompt and the pull instead of refusing before consent, so these wrap paths (they force isTTY true over a temp HOME) now block on a consent prompt no test can answer whenever the host's own Ollama is reachable; this file stubs the ceremony and changes no assertion, so it passes with or without the source fix. ALSO RETAINED from the prior exemption, which still describes lines in this file: type-forced fixture update only (armed outcomes gained a required liveness field); the liveness rendering that change added is pinned pre-fix-failing in auto-provision-wiring.test.ts and wrap-cli.test.ts.
 /**
  * N1: three bounded automation-blocker fixes for `sanctuary protect`
  * (drill record 2026-07-26), fix 2 corrected 2026-07-27 (harden-loop):

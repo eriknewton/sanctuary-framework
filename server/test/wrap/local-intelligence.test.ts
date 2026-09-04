@@ -1,5 +1,5 @@
 import { ed25519 } from "@noble/curves/ed25519";
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -18,7 +18,6 @@ import {
 import { SURFACES } from "../../src/intelligence/types.js";
 import {
   formatPullProgress,
-  resolveOllamaModelsRoot,
   resolveOllamaModelsRootState,
   runLocalIntelligenceSetup,
   type RunLocalIntelligenceSetupDeps,
@@ -100,15 +99,15 @@ describe("shared protect/init local-intelligence adapter", () => {
     try {
       const root = join(parent, "models");
       await mkdir(root);
-      await expect(resolveOllamaModelsRoot(
+      await expect(resolveOllamaModelsRootState(
         "darwin",
         { OLLAMA_MODELS: join(parent, "unused", "..", "models") },
-      )).resolves.toBe(root);
-      await expect(resolveOllamaModelsRoot(
+      )).resolves.toEqual({ kind: "resolved", rootReal: root });
+      await expect(resolveOllamaModelsRootState(
         "darwin",
         { OLLAMA_MODELS: join(parent, "missing") },
       )).rejects.toMatchObject({ reason: "model_root_invalid" });
-      await expect(resolveOllamaModelsRoot("win32", {}, parent))
+      await expect(resolveOllamaModelsRootState("win32", {}, parent))
         .rejects.toMatchObject({ reason: "immune_platform_unsupported" });
     } finally {
       await rm(parent, { recursive: true, force: true });
@@ -142,9 +141,38 @@ describe("shared protect/init local-intelligence adapter", () => {
       await expect(resolveOllamaModelsRootState("darwin", {}, blocked))
         .rejects.toMatchObject({ reason: "model_root_invalid" });
       await rm(blocked, { recursive: true, force: true });
-      // The strict wrapper has nowhere to put "not yet", so it still refuses.
-      await expect(resolveOllamaModelsRoot("darwin", {}, parent))
-        .rejects.toMatchObject({ reason: "model_root_invalid" });
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a model root that is group- or other-writable, or owned by another uid", async () => {
+    const parent = await realpath(
+      await mkdtemp(join(tmpdir(), "sanctuary-q5d-root-mode-")),
+    );
+    try {
+      const root = join(parent, "models");
+      await mkdir(root, { mode: 0o755 });
+      // Baseline: an operator-owned, operator-only-writable root resolves.
+      await expect(resolveOllamaModelsRootState("darwin", { OLLAMA_MODELS: root }))
+        .resolves.toEqual({ kind: "resolved", rootReal: root });
+      // The accepted root is persisted and trusted on every later run, so a
+      // directory any other local process can write into is refused. This is
+      // reachable now that an absent default root is created by the pull instead
+      // of refused: a same-uid lower-privilege process can pre-create it.
+      for (const mode of [0o775, 0o757, 0o777] as const) {
+        await chmod(root, mode);
+        await expect(resolveOllamaModelsRootState("darwin", { OLLAMA_MODELS: root }))
+          .rejects.toMatchObject({ reason: "model_root_invalid" });
+      }
+      await chmod(root, 0o755);
+      // A root owned by a different uid is refused even when its mode is tight.
+      // The uid the resolver compares against is its last argument, which
+      // production always supplies from the running process.
+      const foreignUid = (process.getuid?.() ?? 0) + 1;
+      await expect(
+        resolveOllamaModelsRootState("darwin", { OLLAMA_MODELS: root }, undefined, foreignUid),
+      ).rejects.toMatchObject({ reason: "model_root_invalid" });
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
@@ -159,7 +187,7 @@ describe("shared protect/init local-intelligence adapter", () => {
       const linked = join(parent, "models-link");
       await mkdir(root);
       await symlink(root, linked);
-      await expect(resolveOllamaModelsRoot(
+      await expect(resolveOllamaModelsRootState(
         "darwin",
         { OLLAMA_MODELS: linked },
       )).rejects.toMatchObject({ reason: "symlink_refused" });
@@ -571,7 +599,7 @@ describe("shared protect/init local-intelligence adapter", () => {
         onProgress?: (progress: { status: string; total?: number; completed?: number }) => void;
       }) => {
         options?.onProgress?.({ status: "pulling manifest" });
-        options?.onProgress?.({ status: "pulling 12345", total: 1000, completed: 500 });
+        options?.onProgress?.({ status: "pulling 0f4c8fab", total: 1000, completed: 500 });
         options?.onProgress?.({ status: "success" });
         return { ok: true as const, failureClass: null };
       }),

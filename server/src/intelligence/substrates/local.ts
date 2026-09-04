@@ -73,10 +73,11 @@ const PULL_RESPONSE_MAX_BYTES = 64 * 1024 * 1024;
 // without it ever being buffered as a string.
 const PULL_PENDING_BUFFER_MAX_BYTES = 16 * PULL_PROGRESS_LINE_MAX_BYTES;
 // 8_192 bytes = 8 x 1024. An error body is read only to classify the failure
-// (`classifyHttpError` looks for a model-not-found phrase), so it is read
-// through the same bounded reader as the stream and truncated well below the
-// line cap; a runtime that never ends its error body cannot hold the pull, and
-// therefore the provisioning lock, open.
+// (`classifyHttpError` looks for a model-not-found phrase), so it is truncated
+// well below the line cap and read under ONE cumulative deadline (see
+// `readBoundedText`): both the byte cap and that single deadline are needed, and
+// either alone leaves a runtime able to hold the pull, and therefore the
+// provisioning lock, open.
 const PULL_ERROR_BODY_MAX_BYTES = 8 * 1024;
 
 const PULL_LINE_ENCODER = new TextEncoder();
@@ -243,9 +244,15 @@ export class OllamaClient {
       reader = res.body.getReader();
       const decoder = new TextDecoder();
       let pending = "";
+      // Tracked incrementally rather than recomputed from `pending` each chunk:
+      // re-encoding the residual on every read is quadratic under a byte-at-a-
+      // time drip, which is exactly the schedule an adversarial runtime picks.
+      // A multibyte sequence split across chunks is counted before the decoder
+      // emits it, so this over-counts by at most 3 bytes until that sequence
+      // completes, which can only make a cap fire marginally early.
+      let pendingBytes = 0;
       let responseBytes = 0;
       let lastProgressAt = Date.now();
-      let sawSuccess = false;
       for (;;) {
         const now = Date.now();
         const budgetMs = Math.min(
@@ -263,17 +270,20 @@ export class OllamaClient {
         if (responseBytes > PULL_RESPONSE_MAX_BYTES) {
           return { ok: false, failureClass: "substrate_misconfigured" };
         }
-        if (
-          utf8ByteLength(pending) + chunk.value.byteLength >
-            PULL_PENDING_BUFFER_MAX_BYTES
-        ) {
+        if (pendingBytes + chunk.value.byteLength > PULL_PENDING_BUFFER_MAX_BYTES) {
           return { ok: false, failureClass: "substrate_misconfigured" };
         }
         pending += decoder.decode(chunk.value, { stream: true });
-        let newlineAt = pending.indexOf("\n");
+        pendingBytes += chunk.value.byteLength;
+        // Lines are consumed by advancing an index and slicing ONCE after the
+        // scan. Slicing per line copies the whole remaining buffer each time,
+        // so a chunk of many tiny lines would cost O(lines x buffer) work for a
+        // request an untrusted runtime shapes.
+        let scanFrom = 0;
+        let newlineAt = pending.indexOf("\n", scanFrom);
         while (newlineAt !== -1) {
-          const line = pending.slice(0, newlineAt);
-          pending = pending.slice(newlineAt + 1);
+          const line = pending.slice(scanFrom, newlineAt);
+          scanFrom = newlineAt + 1;
           // The per-line cap binds a TERMINATED line too. Checking only the
           // unterminated remainder would let a runtime send one arbitrarily
           // long line, end it with a newline, and have it parsed as progress
@@ -291,14 +301,31 @@ export class OllamaClient {
             // refreshes the inactivity deadline; a drip of bytes carrying no
             // line must not hold the pull open.
             lastProgressAt = Date.now();
+            // The absolute ceiling is re-checked HERE, not only at the top of
+            // the read loop: a runtime that keeps a single chunk's worth of
+            // parsed lines coming would otherwise run the inner scan with no
+            // deadline between reads.
+            if (lastProgressAt - startedAt > this.pullCeilingMs) {
+              return { ok: false, failureClass: "substrate_timeout" };
+            }
             reportProgress(options.onProgress, verdict.progress);
-            if (verdict.kind === "success") sawSuccess = true;
+            // The runtime's own terminal line ends the read immediately. Reading
+            // on would let a runtime that sends `success` and never closes hold
+            // the pull, and the provisioning lock under it, to the absolute
+            // ceiling and then discard a witnessed success as a timeout; it
+            // would also let repeated `success` lines past a reporter rate limit
+            // that exempts the terminal line. The `finally` cancels and aborts.
+            if (verdict.kind === "success") return { ok: true, failureClass: null };
           }
-          newlineAt = pending.indexOf("\n");
+          newlineAt = pending.indexOf("\n", scanFrom);
+        }
+        if (scanFrom > 0) {
+          pendingBytes -= utf8ByteLength(pending.slice(0, scanFrom));
+          pending = pending.slice(scanFrom);
         }
         // The remainder is one unterminated line, so the same per-line cap
         // binds it: a runtime that never emits a newline is refused here.
-        if (utf8ByteLength(pending) > PULL_PROGRESS_LINE_MAX_BYTES) {
+        if (pendingBytes > PULL_PROGRESS_LINE_MAX_BYTES) {
           return { ok: false, failureClass: "substrate_misconfigured" };
         }
       }
@@ -318,14 +345,12 @@ export class OllamaClient {
         }
         if (verdict.kind !== "blank") {
           reportProgress(options.onProgress, verdict.progress);
-          if (verdict.kind === "success") sawSuccess = true;
+          if (verdict.kind === "success") return { ok: true, failureClass: null };
         }
       }
       // A stream that ended without the runtime's own `success` line proves
       // nothing about what is on disk, so it fails closed.
-      return sawSuccess
-        ? { ok: true, failureClass: null }
-        : { ok: false, failureClass: "substrate_unavailable" };
+      return { ok: false, failureClass: "substrate_unavailable" };
     } catch (err) {
       if (err instanceof PullDeadlineError) {
         return { ok: false, failureClass: "substrate_timeout" };
@@ -515,23 +540,31 @@ function utf8ByteLength(text: string): number {
 }
 
 /**
- * Read at most `maxBytes` from an already-open body reader, bounded by the same
- * deadline the stream uses. Used only for an error snippet the caller passes to
- * `classifyHttpError`, so a read failure or a body that never ends yields the
- * bytes seen so far and lets the HTTP status carry the classification; the
- * caller's `finally` cancels the reader and aborts the request.
+ * Read at most `maxBytes` from an already-open body reader within ONE cumulative
+ * deadline. The budget bounds the whole snippet, never each individual read: a
+ * per-read deadline is refreshed by every byte, so a runtime dripping one byte
+ * just inside the budget would hold this read -- and the cross-process
+ * provisioning lock above it -- open for as long as it cared to.
+ *
+ * Used only for an error snippet the caller passes to `classifyHttpError`, so a
+ * read failure, an exhausted budget, or a body that never ends yields the bytes
+ * seen so far and lets the HTTP status carry the classification; the caller's
+ * `finally` cancels the reader and aborts the request.
  */
 async function readBoundedText(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   maxBytes: number,
   budgetMs: number,
 ): Promise<string> {
+  const endsAt = Date.now() + budgetMs;
   const decoder = new TextDecoder();
   let text = "";
   let bytes = 0;
   try {
     for (;;) {
-      const chunk = await raceDeadline(reader.read(), budgetMs);
+      const remainingMs = endsAt - Date.now();
+      if (remainingMs <= 0) break;
+      const chunk = await raceDeadline(reader.read(), remainingMs);
       if (chunk.done) break;
       bytes += chunk.value.byteLength;
       text += decoder.decode(chunk.value, { stream: true });

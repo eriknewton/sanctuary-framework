@@ -269,6 +269,185 @@ describe("Ollama provisioning client", () => {
     });
   });
 
+  it("bounds a dripped error body by one cumulative deadline, not per read", async () => {
+    // One byte per read, each arriving just inside the per-read budget. Under a
+    // per-read deadline this body never times out and holds the provisioning
+    // lock for as long as the runtime keeps dripping.
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        return new Promise<void>((resolve) => {
+          setTimeout(() => {
+            if (!cancelled) controller.enqueue(encoder.encode("e"));
+            resolve();
+          }, 15);
+        });
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      pullInactivityTimeoutMs: 100,
+      fetchImpl: (async () => new Response(body, { status: 500 })) as unknown as typeof fetch,
+    });
+    const startedAt = Date.now();
+    await expect(client.pull("qwen2.5:1.5b")).resolves.toEqual({
+      ok: false,
+      failureClass: "substrate_unavailable",
+    });
+    const elapsed = Date.now() - startedAt;
+    // One 100 ms budget covers the whole snippet read; the 8 KiB cap alone
+    // would need 8192 x 15 ms (about two minutes) of drip to trip.
+    expect(elapsed).toBeLessThan(5_000);
+    expect(cancelled).toBe(true);
+  });
+
+  it("returns as soon as the runtime reports success instead of reading on", async () => {
+    // A runtime that sends `success` and never closes would otherwise hold the
+    // pull to the absolute ceiling and then discard the witnessed success as a
+    // timeout, with the provisioning lock held the whole time.
+    let cancelled = false;
+    const progress: OllamaPullProgress[] = [];
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(`${JSON.stringify({ status: "success" })}\n`));
+      },
+      pull(controller) {
+        // Keeps sending more success lines and never closes.
+        return new Promise<void>((resolve) => {
+          setTimeout(() => {
+            if (!cancelled) {
+              controller.enqueue(encoder.encode(`${JSON.stringify({ status: "success" })}\n`));
+            }
+            resolve();
+          }, 5);
+        });
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      pullInactivityTimeoutMs: 10_000,
+      pullCeilingMs: 10_000,
+      fetchImpl: (async () => new Response(body, { status: 200 })) as unknown as typeof fetch,
+    });
+    const startedAt = Date.now();
+    await expect(
+      client.pull("qwen2.5:1.5b", { onProgress: (line) => progress.push(line) }),
+    ).resolves.toEqual({ ok: true, failureClass: null });
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    // Exactly one terminal line was reported, so a reporter that exempts the
+    // terminal line from its rate limit cannot be driven by repeats.
+    expect(progress).toEqual([{ status: "success" }]);
+    expect(cancelled).toBe(true);
+  });
+
+  it("keeps work bounded under many tiny lines and under a byte-at-a-time drip", async () => {
+    // Adversarial complexity (AGENTS.md rule 8), the two schedules the earlier
+    // shape was quadratic under: chunks packed with tiny PARSEABLE lines (a
+    // per-line buffer copy each) and a one-byte-per-read drip with no newline
+    // (re-encoding the residual on every read). Each chunk stays just under the
+    // 1 MiB pending-buffer bound so the scan itself is what is exercised.
+    const line = JSON.stringify({ status: "p" });
+    const linesPerChunk = Math.floor((900 * 1024) / (line.length + 1));
+    const chunkText = `${Array.from({ length: linesPerChunk }, () => line).join("\n")}\n`;
+    let chunksLeft = 3;
+    const burstBody = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (chunksLeft > 0) {
+          chunksLeft -= 1;
+          controller.enqueue(encoder.encode(chunkText));
+          return;
+        }
+        controller.enqueue(encoder.encode(`${JSON.stringify({ status: "success" })}\n`));
+        controller.close();
+      },
+    });
+    const burstClient = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      pullInactivityTimeoutMs: 20_000,
+      fetchImpl: (async () => new Response(burstBody, { status: 200 })) as unknown as typeof fetch,
+    });
+    const burstStartedAt = Date.now();
+    await expect(burstClient.pull("qwen2.5:1.5b")).resolves.toEqual({
+      ok: true,
+      failureClass: null,
+    });
+    expect(Date.now() - burstStartedAt).toBeLessThan(5_000);
+
+    // A 64 KiB unterminated line delivered one byte per read: refused by the
+    // per-line cap, and the residual must not be re-encoded on every read.
+    const dripBytes = 64 * 1024 + 1;
+    let sent = 0;
+    const dripBody = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent >= dripBytes) {
+          controller.close();
+          return;
+        }
+        sent += 1;
+        controller.enqueue(encoder.encode("a"));
+      },
+    });
+    const dripClient = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      pullInactivityTimeoutMs: 20_000,
+      fetchImpl: (async () => new Response(dripBody, { status: 200 })) as unknown as typeof fetch,
+    });
+    const dripStartedAt = Date.now();
+    await expect(dripClient.pull("qwen2.5:1.5b")).resolves.toEqual({
+      ok: false,
+      failureClass: "substrate_misconfigured",
+    });
+    expect(Date.now() - dripStartedAt).toBeLessThan(5_000);
+  });
+
+  it("has no observable effect when a read settles after the pull returned", async () => {
+    // Rule 12 (fault scheduling): the deadline race does not depend on the fetch
+    // honoring `signal`, and the reader is cancelled without awaiting, so a read
+    // can settle late. It must not report progress or change the verdict.
+    const progress: OllamaPullProgress[] = [];
+    let releaseLateRead: (() => void) | undefined;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(`${JSON.stringify({ status: "pulling manifest" })}\n`));
+      },
+      pull(controller) {
+        return new Promise<void>((resolve) => {
+          releaseLateRead = () => {
+            try {
+              controller.enqueue(encoder.encode(`${JSON.stringify({ status: "success" })}\n`));
+            } catch {
+              // The controller is already closed by the client's cancel; that IS
+              // the property under test.
+            }
+            resolve();
+          };
+        });
+      },
+    });
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      pullInactivityTimeoutMs: 40,
+      fetchImpl: (async () => new Response(body, { status: 200 })) as unknown as typeof fetch,
+    });
+    const result = await client.pull("qwen2.5:1.5b", {
+      onProgress: (line) => progress.push(line),
+    });
+    expect(result).toEqual({ ok: false, failureClass: "substrate_timeout" });
+    const progressAtReturn = [...progress];
+    releaseLateRead?.();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // The late read produced no further progress and could not turn a refused
+    // pull into a success after the fact.
+    expect(progress).toEqual(progressAtReturn);
+    expect(progress.map((line) => line.status)).toEqual(["pulling manifest"]);
+  });
+
   it("refuses a stream that ends without the runtime's own success line", async () => {
     const client = new OllamaClient({
       endpoint: "http://127.0.0.1:11434",
