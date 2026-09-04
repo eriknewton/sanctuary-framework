@@ -9,7 +9,8 @@ describe.sequential("coverage report", () => {
 
     expect(report.summary.total_rows).toBe(EXPECTED_ASSURANCE_ROW_COUNT);
     expect(report.summary.rows_with_fixtures).toBe(0);
-    expect(report.summary.rows_no_fixture).toBe(22);
+    // Every row but the single not_implemented one (row 9) has no fixture in an empty registry.
+    expect(report.summary.rows_no_fixture).toBe(EXPECTED_ASSURANCE_ROW_COUNT - 1);
     expect(report.summary.rows_not_implemented).toBe(1);
     expect(report.summary.rows_failing).toBe(0);
     expect(report.rows.find((row) => row.assurance_row_id === "9")?.coverage_state).toBe(
@@ -23,7 +24,7 @@ describe.sequential("coverage report", () => {
 
     const markdown = renderMarkdownSummary(report);
     expect(markdown).toContain(`Total rows: ${EXPECTED_ASSURANCE_ROW_COUNT}`);
-    expect(markdown).toContain("Rows without fixtures: 22");
+    expect(markdown).toContain(`Rows without fixtures: ${EXPECTED_ASSURANCE_ROW_COUNT - 1}`);
     expect(markdown).toContain("Rows not implemented: 1");
   });
 
