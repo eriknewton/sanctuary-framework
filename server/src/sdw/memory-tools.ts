@@ -52,8 +52,41 @@ import {
   createMultiAgentIsolationGuard,
   type MultiAgentIsolationGuard,
 } from "./memory-isolation.js";
+import {
+  DEFAULT_MAX_CHUNK_CHARS,
+  MEMORY_LIST_MAX_LIMIT,
+  MEMORY_SEARCH_DEFAULT_LIMIT,
+} from "./adapters/sdw-memory-backend.js";
 
 const MAX_TEXT_BYTES = 1024 * 1024;
+
+/**
+ * Bounds on the unattended memory_search handler (Tier 3 by default, see
+ * `DEFAULT_POLICY.tier3_always_allow` in `src/principal-policy/loader.ts`).
+ * A read that needs no human in the loop must carry its own ceiling on the
+ * work one call can buy: result count, needle size, and filter size are all
+ * bounded HERE, at the tool boundary, and audited, so the bound holds no
+ * matter which adapter is wired behind the interface. The adapter clamps and
+ * defaults on its own too; these are imported from it rather than mirrored so
+ * the two layers cannot disagree.
+ */
+/** Results returned when the caller supplies no `limit` (adapter default). */
+const MEMORY_SEARCH_DEFAULT_RESULTS = MEMORY_SEARCH_DEFAULT_LIMIT;
+/**
+ * Hard ceiling on `limit`: a larger request is clamped to this, never
+ * rejected, matching the adapter's own posture (a caller narrows the query
+ * with `tag` or a longer needle to see the rest).
+ */
+const MEMORY_SEARCH_MAX_RESULTS = MEMORY_LIST_MAX_LIMIT;
+/**
+ * Byte cap on the search needle. Derivation: sized to one default chunk of
+ * stored passage text (DEFAULT_MAX_CHUNK_CHARS), the unit the store already
+ * treats as one piece of a passage. A needle longer than a chunk is a body
+ * being replayed through search rather than a lexical term, and substring
+ * scan cost grows with needle length times corpus text. Counted in UTF-8
+ * bytes so the cap is on the wire payload, not on code points.
+ */
+const MAX_SEARCH_TEXT_BYTES = DEFAULT_MAX_CHUNK_CHARS;
 const PERSISTABLE_TAINTS: readonly PersistableTaint[] = [
   "user_content",
   "agent_derived_clean",
@@ -227,12 +260,25 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
     toolResult(fixedDenial(`audit:${operation}`, "request_review", null));
 
   /**
-   * Fail-closed multi-agent isolation gate, run at the top of every SDW memory
+   * Fail-closed one-owner-per-fortress gate, run at the top of every SDW memory
    * handler (insert / get / search / list / count / delete) BEFORE any adapter
-   * touch. Returns the fixed denial when a second, distinct wrapped-agent
-   * identity would reach the shared `fleet-self` scope; returns null (proceed)
-   * for single-agent use. The typed reason is audit-only; the response is the
-   * fixed denial, so no scope detail leaks.
+   * touch. The single adapter is bound to ONE shared `fleet-self` owner scope
+   * for every caller; this guard pins the first wrapped identity that touches
+   * it and refuses any SECOND distinct identity when an identity resolver is
+   * wired, and is a strict no-op otherwise. It is NOT per-agent custody
+   * isolation: every agent the operator connects to this fortress reads and
+   * writes the same passages, and per-agent isolation is an open capability
+   * bound. The typed reason is audit-only; the response is the fixed denial,
+   * so no scope detail leaks.
+   *
+   * Tier pin (must match the `memory_get` / `memory_search` entry in
+   * `DEFAULT_POLICY.tier3_always_allow`, `src/principal-policy/loader.ts`):
+   * the reads are unattended by design for the operator's own fortress (the
+   * documented hands-free restart read-back), the vault is one operator-owned
+   * scope, and this guard refuses a second distinct identity where wired.
+   * The Tier-3 decision relies on those three facts and on the egress wall
+   * for exfiltration containment; it does not rely on per-agent isolation,
+   * which does not exist yet.
    */
   const isolationDenialOrNull = async (
     operation: string,
@@ -400,7 +446,11 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       "Deterministic substring search over your sovereign memory passages. This is " +
       "the always-available lexical search so you can query your own vault with no " +
       "engine running; semantic / embedding search lives in a swappable engine, not here. " +
-      "Returns metadata only; use memory_get for an explicit full-body read.",
+      "Returns metadata only; use memory_get for an explicit full-body read. " +
+      `Bounded: ${MEMORY_SEARCH_DEFAULT_RESULTS} results unless \`limit\` is given, ` +
+      `at most ${MEMORY_SEARCH_MAX_RESULTS} (a larger limit is clamped); \`text\` ` +
+      `must be non-empty and at most ${MAX_SEARCH_TEXT_BYTES} bytes; \`tag\` must be a ` +
+      "valid SDW identifier.",
     tool_class: "read",
     inputSchema: {
       type: "object",
@@ -416,28 +466,53 @@ export function createSdwMemoryTools(options: SdwMemoryToolsOptions): ToolDefini
       if (isolationDenied) return isolationDenied;
       const text = args.text;
       const tag = args.tag;
-      const limit = asPositiveInt(args.limit);
+      const requestedLimit = asPositiveInt(args.limit);
       if (typeof text !== "string") {
         await auditFailure("memory_search_denied", { denial_class: "invalid_text" });
         return deny("memory_search");
       }
-      if (tag !== undefined && typeof tag !== "string") {
+      // Bound (unattended read): an empty needle matches nothing, yet the
+      // adapter would still decrypt-scan the corpus up to its scan cap to say
+      // so. A Tier-3 caller must not buy a full-corpus decrypt with zero bytes.
+      if (text.length === 0) {
+        await auditFailure("memory_search_denied", { denial_class: "empty_text" });
+        return deny("memory_search");
+      }
+      // Bound (unattended read): needle size caps per-passage substring work;
+      // see MAX_SEARCH_TEXT_BYTES for the derivation.
+      if (Buffer.byteLength(text, "utf8") > MAX_SEARCH_TEXT_BYTES) {
+        await auditFailure("memory_search_denied", { denial_class: "text_too_large" });
+        return deny("memory_search");
+      }
+      // Bound (unattended read): stored tags obey the SDW identifier grammar
+      // (must match `SDW_IDENTIFIER_PATTERN` in `sdw/grammar.ts`, which the
+      // insert path enforces), so a filter outside that grammar can never
+      // match and is refused here instead of scanning the corpus for nothing.
+      if (tag !== undefined && (typeof tag !== "string" || !isSdwIdentifier(tag))) {
         await auditFailure("memory_search_denied", { denial_class: "invalid_tag" });
         return deny("memory_search");
       }
-      if (Number.isNaN(limit)) {
+      if (Number.isNaN(requestedLimit)) {
         await auditFailure("memory_search_denied", { denial_class: "invalid_limit" });
         return deny("memory_search");
       }
+      // Bound (unattended read): the adapter always receives an explicit,
+      // capped limit; a missing limit is the default, an oversize one is
+      // clamped (never rejected, matching the adapter's own posture).
+      const limit = Math.min(
+        requestedLimit ?? MEMORY_SEARCH_DEFAULT_RESULTS,
+        MEMORY_SEARCH_MAX_RESULTS,
+      );
       try {
         const results = await adapter.searchPassages({
           text,
           tag: typeof tag === "string" ? tag : undefined,
-          limit: limit ?? undefined,
+          limit,
         });
         await auditSuccess("memory_search", {
           result_count: results.length,
-          limited: limit ?? null,
+          limited: limit,
+          limit_clamped: requestedLimit !== null && requestedLimit > MEMORY_SEARCH_MAX_RESULTS,
           tag_filter: typeof tag === "string",
         });
         return toolResult({
