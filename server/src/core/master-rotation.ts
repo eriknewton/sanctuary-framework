@@ -128,7 +128,11 @@ import {
   writeAuditEpochRecord,
   AUDIT_EPOCH_KEYS_KEY,
 } from "../operational/audit-log.js";
-import { writeEpochWitness } from "./anti-rollback.js";
+import {
+  readEpochWitness,
+  writeEpochWitness,
+  type EpochWitnessData,
+} from "./anti-rollback.js";
 import {
   resolveAuthenticatedIdentityWriterPublicKeys,
   rotateStateEntryBytes,
@@ -322,6 +326,17 @@ interface RotationJournalData {
   new_wrap_ids: string[];
   /** Non-secret authority for a staged, crash-adoptable recovery escrow. */
   recovery_escrow?: RotationRecoveryEscrowAuthority;
+  /**
+   * Whether an authenticated anti-rollback epoch witness existed at the point
+   * of no return (read under the OLD master, immediately before this journal
+   * was written; the preflight has already aborted on a tampered one). Finalize
+   * consults it so a witness that vanishes between conversion and finalize is a
+   * refusal, not a silent "never had one" (which would erase its latches).
+   * ADDITIVE: a journal written before this field existed reads as `undefined`
+   * and keeps the legacy behavior (absent at finalize is treated as no witness).
+   * Covered by the journal MAC like every other field.
+   */
+  epoch_witness_present?: boolean;
 }
 
 function journalMac(data: RotationJournalData, newMaster: Uint8Array): string {
@@ -700,6 +715,8 @@ type MetaKeyClass =
   | "rollback-freeze" // anti-rollback freeze marker → restamp under new master
   | "federation-guardian-antirollback" // {marker,data,mac} anchor → restamp
   | "federation-guardian-established" // dataless MAC sentinel → inline re-derive
+  | "config-security-baseline" // master-MAC'd boot-written record → restamp
+  | "audit-store-split-established" // F2 writer-split marker → refuse by name
   | "rekey-journal-pending"; // interrupted recovery-key rekey → refuse with a remedy
 
 // Duplicated marker/MAC constants (see the recipe-table drift note above —
@@ -715,6 +732,36 @@ const TRANSPARENCY_FLOOR_META_KEY = "transparency-counter-floor-v1";
 const TRANSPARENCY_FLOOR_MARKER = "__sanctuary_transparency_counter_floor_v1";
 const TRANSPARENCY_FLOOR_MAC_PURPOSE = "transparency-counter-floor";
 const TRANSPARENCY_FLOOR_MAC_DOMAIN = "sanctuary.transparency-counter-floor.v1\n";
+
+// Authenticated config-security baseline (boot step "5rc"). Must match
+// CONFIG_BASELINE_META_KEY / CONFIG_BASELINE_MARKER / CONFIG_BASELINE_MAC_PURPOSE
+// / CONFIG_BASELINE_MAC_DOMAIN in server/src/core/config-baseline.ts. Duplicated
+// per the recipe-table drift note above; each drift surfaces as a PREFLIGHT
+// refusal, never a corrupt restamp: a KEY drift leaves the writer's key
+// unclassified (generic abort), a PURPOSE or DOMAIN drift fails the old-master
+// MAC verify, and a MARKER drift is refused explicitly (the recipe sets
+// onMarkerMismatch: "abort", because the generic "leave" would let preflight
+// pass and the NEXT BOOT fail closed on the bare record instead).
+//
+// WHY ROTATION MUST RESTAMP IT: `baselineMacBytes` in config-baseline.ts keys
+// the record's MAC from the OPERATOR MASTER (`derivePurposeKey(master,
+// CONFIG_BASELINE_MAC_PURPOSE)`), and `crossCheckConfigBaseline` writes the
+// record on EVERY MCP-server boot. A fortress that has ever run the server
+// therefore carries a master-MAC'd record under this key; left un-restamped,
+// the first boot after rotation would fail closed on `config_baseline_invalid`
+// (the record no longer authenticates under the new master), and left
+// unclassified, rotation itself refuses every such fortress.
+//
+// SHAPE: `{ [MARKER]: true, data: record, mac }` with
+// `mac = HMAC(purposeKey, MAC_DOMAIN + META_KEY + "\n" + canonicalJson(record))`.
+// The meta key is bound INTO the MAC input, so the restampMacRecord `macDomain`
+// for this record is the domain prefix + key + newline (see the recipe in
+// convertMeta); restampMacRecord then MACs `macDomain + canonicalJson(data)`,
+// which is byte-identical to what config-baseline.ts computes.
+const CONFIG_BASELINE_META_KEY = "config-security-baseline-v1";
+const CONFIG_BASELINE_MARKER = "__sanctuary_config_security_baseline_v1";
+const CONFIG_BASELINE_MAC_PURPOSE = "config-security-baseline-mac";
+const CONFIG_BASELINE_MAC_DOMAIN = "sanctuary.config-security-baseline.v1\n";
 
 const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
 const PRIMARY_IDENTITY_META_KEY = "primary_identity_id";
@@ -767,7 +814,21 @@ const FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_META_KEY =
 const FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_MAC_DOMAIN =
   "sanctuary.federation.guardian-requirement.established.v1";
 
-function classifyMetaKey(key: string): MetaKeyClass | null {
+/**
+ * Classify a `_meta` key into the rotation recipe that handles it. `null` means
+ * "no recipe": the preflight aborts (fail closed) rather than rotating around a
+ * record it cannot vouch for.
+ *
+ * TOTALITY CONTRACT (AGENTS.md rule 5, whole-set parity): every `_meta` key the
+ * product can write MUST classify non-null here, because a key this switch does
+ * not name makes master rotation refuse every fortress that carries it. The
+ * whole-set check lives in
+ * `server/test/core/master-rotation-meta-key-parity.test.ts`, which enumerates
+ * the tree's `_meta` write sites; add the key to BOTH places in the same change.
+ * Exported for that parity test only; production callers go through
+ * `convertMeta`.
+ */
+export function classifyMetaKey(key: string): MetaKeyClass | null {
   switch (key) {
     case "key-params":
     case "recovery-key-hash":
@@ -798,6 +859,14 @@ function classifyMetaKey(key: string): MetaKeyClass | null {
       return "federation-guardian-antirollback";
     case FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_META_KEY:
       return "federation-guardian-established";
+    // Written on every MCP-server boot (crossCheckConfigBaseline, step "5rc");
+    // master-MAC'd, so it is restamped under the new master in convertMeta.
+    case CONFIG_BASELINE_META_KEY:
+      return "config-security-baseline";
+    // F2 BLOCKER-R2: recognized so the refusal is BY NAME (convertMeta throws
+    // the F2-specific message), never the generic unrecognized-record abort.
+    case AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY:
+      return "audit-store-split-established";
     // Must match REKEY_JOURNAL_KEY in server/src/cli/reset-passphrase.ts: the
     // authenticated journal a `reset-passphrase --mode recovery-key` writes and
     // deletes on completion. Its presence means an interrupted rekey left custody
@@ -820,6 +889,16 @@ function restampMacRecord(args: {
   macDomain: string;
   oldMaster: Uint8Array;
   newMaster: Uint8Array;
+  /**
+   * What a missing/mismatched envelope marker means for THIS record.
+   *  - "leave" (default): the owning subsystem treats a bare record as untrusted
+   *    and fails closed on its own; rotation leaves the bytes alone.
+   *  - "abort": the record is written on every server boot and its owner fails
+   *    the NEXT BOOT closed on a bare record, so "leave" would let preflight pass
+   *    and turn a marker problem into a post-rotation boot refusal. Abort now,
+   *    while the operator is present and nothing has been mutated.
+   */
+  onMarkerMismatch?: "leave" | "abort";
 }): Uint8Array | "already-new" | "leave" {
   let parsed: unknown;
   try {
@@ -829,6 +908,16 @@ function restampMacRecord(args: {
   }
   const obj = parsed as Record<string, unknown>;
   if (!obj || typeof obj !== "object" || obj[args.marker] !== true) {
+    if (args.onMarkerMismatch === "abort") {
+      // A marker mismatch here is either a stripped/forged record or a
+      // writer-vs-recipe MARKER drift; both must surface as a preflight refusal
+      // (before any write), never as a silent skip the next boot rejects.
+      throw new RotationPreflightError(
+        `${args.where} is missing its envelope marker (stripped, forged, or the ` +
+          "rotation recipe's marker has drifted from the writer's); refusing to " +
+          "rotate around it"
+      );
+    }
     // Bare / marker-stripped records are untrusted today; leave them so the
     // owning subsystem's own fail-closed handling applies unchanged.
     return "leave";
@@ -1365,29 +1454,178 @@ async function convertPurposeNamespace(
   return converted;
 }
 
+/** The `_meta` classes whose records are `{marker,data,mac}` envelopes that
+ * restampMacRecord re-keys generically. Every other class has a dedicated
+ * branch in convertMeta (skip, refuse, or an inline re-derive). */
+type RestampedMetaKeyClass = Extract<
+  MetaKeyClass,
+  | "transparency-anchor-config"
+  | "transparency-counter-floor"
+  | "rollback-freeze"
+  | "federation-guardian-antirollback"
+  | "config-security-baseline"
+>;
+
+/**
+ * The marker / MAC-purpose / MAC-domain recipe for a generically restamped
+ * `_meta` record. Total over RestampedMetaKeyClass: the `default` arm's `never`
+ * assignment makes a class added to the union without a recipe a typecheck
+ * failure, so a record can never fall through to another record's recipe (the
+ * previous ternary chain ended in an unconditional else).
+ */
+function restampRecipeFor(cls: RestampedMetaKeyClass): {
+  marker: string;
+  macPurpose: string;
+  macDomain: string;
+  onMarkerMismatch?: "leave" | "abort";
+} {
+  switch (cls) {
+    case "transparency-anchor-config":
+      return {
+        marker: TRANSPARENCY_ANCHOR_CONFIG_MARKER,
+        macPurpose: TRANSPARENCY_ANCHOR_CONFIG_MAC_PURPOSE,
+        macDomain: TRANSPARENCY_ANCHOR_CONFIG_MAC_DOMAIN,
+      };
+    case "transparency-counter-floor":
+      return {
+        marker: TRANSPARENCY_FLOOR_MARKER,
+        macPurpose: TRANSPARENCY_FLOOR_MAC_PURPOSE,
+        macDomain: TRANSPARENCY_FLOOR_MAC_DOMAIN,
+      };
+    case "rollback-freeze":
+      return {
+        marker: ROLLBACK_FREEZE_MARKER,
+        macPurpose: ROLLBACK_FREEZE_MAC_PURPOSE,
+        macDomain: ROLLBACK_FREEZE_MAC_DOMAIN,
+      };
+    case "federation-guardian-antirollback":
+      return {
+        // Finding #7 (4a): the anchor is a {marker,data,mac} record with the
+        // MAC over canonicalJson(data), so it fits restampMacRecord exactly.
+        // macPurpose is the STORE purpose key label (no new HKDF label; §7
+        // reuse), so restampMacRecord re-derives the identical key the store
+        // used.
+        marker: FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MARKER,
+        macPurpose: FEDERATION_SYNC_STATE_STORE_HKDF_INFO,
+        macDomain: FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MAC_DOMAIN,
+      };
+    case "config-security-baseline":
+      return {
+        // Must match `baselineMacBytes` in core/config-baseline.ts, which MACs
+        // `MAC_DOMAIN + metaKey + "\n" + canonicalJson(record)`. restampMacRecord
+        // MACs `macDomain + canonicalJson(data)`, so the meta key and its newline
+        // ride inside macDomain. A PURPOSE or DOMAIN drift makes the old-master
+        // verify fail and rotation refuse; a MARKER drift (or a stripped marker)
+        // is made a refusal too via onMarkerMismatch, because the config gate
+        // fails the NEXT BOOT closed on a bare record, so leaving it would turn
+        // a preflight-time problem into a post-rotation boot refusal.
+        marker: CONFIG_BASELINE_MARKER,
+        macPurpose: CONFIG_BASELINE_MAC_PURPOSE,
+        macDomain: CONFIG_BASELINE_MAC_DOMAIN + CONFIG_BASELINE_META_KEY + "\n",
+        onMarkerMismatch: "abort",
+      };
+    default: {
+      const exhaustive: never = cls;
+      throw new Error(`unreachable: no restamp recipe for ${String(exhaustive)}`);
+    }
+  }
+}
+
+/**
+ * Re-key the anti-rollback epoch witness under the new master with its data
+ * unchanged (same epoch, epoch_id, and every monotonic latch it carries).
+ * Returns true when it wrote.
+ *
+ * Verify-before-write, mirroring restampMacRecord: a witness that already
+ * authenticates under the NEW master is a converting-phase resume re-entering
+ * this pass (idempotent, nothing to do); one that authenticates under the OLD
+ * master is re-keyed; one that authenticates under NEITHER is tampered and the
+ * preflight aborts (rotation must never launder a tampered witness by
+ * re-stamping or overwriting it). An absent witness (a fortress that never
+ * rotated or sealed a baseline) has nothing to carry; finalize creates it.
+ *
+ * The write is deliberately NOT `force`: no valid witness exists under the new
+ * master yet, so writeEpochWitness's monotonic guards have nothing to compare
+ * against and persist the data as read. Boot is blocked while the rotation
+ * journal exists, so the brief window in which the on-disk witness is keyed
+ * under the new master while the live envelope is still the old one is never
+ * observed by the boot detector.
+ */
+async function restampEpochWitness(ctx: Ctx, verifyOnly: boolean): Promise<boolean> {
+  const underNew = await readEpochWitness(ctx.storage, ctx.newMaster);
+  if (underNew.status === "valid" || underNew.status === "absent") return false;
+  const underOld = await readEpochWitness(ctx.storage, ctx.oldMaster);
+  if (underOld.status !== "valid") {
+    throw new RotationPreflightError(
+      `_meta/${EPOCH_WITNESS_META_KEY} failed authentication under both the old ` +
+        "and the new master (tampered); rotation must not restamp it"
+    );
+  }
+  if (verifyOnly) return false;
+  await fenced(ctx, () =>
+    writeEpochWitness(ctx.storage, ctx.newMaster, underOld.data)
+  );
+  return true;
+}
+
+/** The only epoch-witness fields master rotation is allowed to assert. */
+export interface EpochWitnessAdvance {
+  epoch: number;
+  epoch_id: string;
+  witnessed_at: string;
+}
+
+/**
+ * Build the witness data finalize force-writes: the FULL prior data object with
+ * only the epoch fields overridden.
+ *
+ * CARRY INVARIANT (why this is an override and not an allow-list). `force`
+ * bypasses writeEpochWitness's monotonic carry, so whatever finalize does not
+ * copy is erased. An allow-list of the latch fields known today would drop the
+ * next monotonic field the moment anti-rollback adds one. Carrying the whole
+ * authenticated object means finalize can only ever CHANGE the three fields it
+ * owns (`epoch`, `epoch_id`, `witnessed_at`); it asserts nothing else, so a
+ * field it has never heard of, and an explicit `false`/`0` the reader
+ * authenticated as present, all survive byte-for-byte. That matches
+ * anti-rollback's own carry, which preserves a field exactly when the key is
+ * present in the authenticated record. `prior` undefined means no witness
+ * existed (the legitimate first-witness path); the advance fields alone are
+ * written.
+ */
+export function advanceEpochWitnessData(
+  prior: EpochWitnessData | undefined,
+  advance: EpochWitnessAdvance
+): EpochWitnessData {
+  return { ...(prior ?? {}), ...advance };
+}
+
 /** `_meta`: restamp MAC'd records; verify every key is classified. */
 async function convertMeta(ctx: Ctx, verifyOnly: boolean): Promise<number> {
   let converted = 0;
   for (const key of await listKeys(ctx.storage, "_meta")) {
+    // classifyMetaKey is the ONE chokepoint for `_meta` recognition (its
+    // totality is pinned by the meta-key parity test); every by-name refusal
+    // below keys off the class, so an unnamed key can only reach the generic
+    // fail-closed abort, never a silent skip.
+    const cls = classifyMetaKey(key);
+    if (cls === null) {
+      throw new RotationPreflightError(
+        `_meta/${key} is not a record this rotation engine recognizes; ` +
+          "refusing to rotate around it"
+      );
+    }
     // F2 BLOCKER-R2: refuse BY NAME on a fortress that ran the writer-split
     // migration. This covers the case where the `_audit-daemon*` namespaces were
     // deleted (so their named recipes never fire) but the durable `_meta`
     // established marker survives. The boundary MAC would silently regress F2 if
     // rotated without re-stamping; do not rotate until that lands.
-    if (key === AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY) {
+    if (cls === "audit-store-split-established") {
       throw new RotationPreflightError(
         `_meta/${key}: this fortress ran the F2 audit store writer-split ` +
           "migration. Master rotation does not support it yet (the split-boundary " +
           "MAC is keyed off the rotating master and is not re-stamped), so rotation " +
           "is deliberately refused until daemon-audit re-wrap + boundary-MAC " +
           "re-stamp land."
-      );
-    }
-    const cls = classifyMetaKey(key);
-    if (cls === null) {
-      throw new RotationPreflightError(
-        `_meta/${key} is not a record this rotation engine recognizes; ` +
-          "refusing to rotate around it"
       );
     }
     if (cls === "rekey-journal-pending") {
@@ -1407,14 +1645,21 @@ async function convertMeta(ctx: Ctx, verifyOnly: boolean): Promise<number> {
       cls === "legacy-marker" ||
       cls === "custody" ||
       cls === "rotation" ||
-      cls === "plaintext-keep" ||
-      // The epoch witness is re-stamped with the ADVANCED epoch by finalize
-      // (writeEpochWitness force), so the convert pass leaves it alone — like
-      // the custody envelope. Re-stamping the OLD epoch here would just be
-      // overwritten, and could briefly under-report the epoch mid-rotation;
-      // boot is blocked while the journal exists anyway.
-      cls === "epoch-witness"
+      cls === "plaintext-keep"
     ) {
+      continue;
+    }
+    if (cls === "epoch-witness") {
+      // The witness is re-keyed under the new master HERE (same data, so the
+      // epoch it reports is unchanged) rather than skipped, because finalize
+      // must read it under ctx.newMaster to carry the monotonic latches forward:
+      // on a `finalizing`-phase resume ctx.oldMaster is a placeholder, so a
+      // witness still MAC'd under the old master would be unreadable at exactly
+      // the moment finalize needs it (see the carry invariant in finalize).
+      if (await restampEpochWitness(ctx, verifyOnly)) {
+        converted++;
+        ctx.failpoint(`converted:_meta/${key}`);
+      }
       continue;
     }
     const raw = await ctx.storage.read("_meta", key);
@@ -1442,39 +1687,13 @@ async function convertMeta(ctx: Ctx, verifyOnly: boolean): Promise<number> {
         newMaster: ctx.newMaster,
       });
     } else {
-      const restampParams =
-        cls === "transparency-anchor-config"
-          ? {
-              marker: TRANSPARENCY_ANCHOR_CONFIG_MARKER,
-              macPurpose: TRANSPARENCY_ANCHOR_CONFIG_MAC_PURPOSE,
-              macDomain: TRANSPARENCY_ANCHOR_CONFIG_MAC_DOMAIN,
-            }
-          : cls === "rollback-freeze"
-            ? {
-                marker: ROLLBACK_FREEZE_MARKER,
-                macPurpose: ROLLBACK_FREEZE_MAC_PURPOSE,
-                macDomain: ROLLBACK_FREEZE_MAC_DOMAIN,
-              }
-            : cls === "federation-guardian-antirollback"
-              ? {
-                  // Finding #7 (4a): the anchor is a {marker,data,mac} record with
-                  // the MAC over canonicalJson(data), so it fits restampMacRecord
-                  // exactly. macPurpose is the STORE purpose key label (no new
-                  // HKDF label; §7 reuse), so restampMacRecord re-derives the
-                  // identical key the store used.
-                  marker: FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MARKER,
-                  macPurpose: FEDERATION_SYNC_STATE_STORE_HKDF_INFO,
-                  macDomain: FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MAC_DOMAIN,
-                }
-              : {
-                  marker: TRANSPARENCY_FLOOR_MARKER,
-                  macPurpose: TRANSPARENCY_FLOOR_MAC_PURPOSE,
-                  macDomain: TRANSPARENCY_FLOOR_MAC_DOMAIN,
-                };
+      // `cls` is narrowed to the restampable classes by the branches above; a
+      // new MetaKeyClass that none of them handles fails typecheck HERE (the
+      // parameter type) and inside restampRecipeFor (the `never` default).
       next = restampMacRecord({
         raw,
         where: `_meta/${key}`,
-        ...restampParams,
+        ...restampRecipeFor(cls),
         oldMaster: ctx.oldMaster,
         newMaster: ctx.newMaster,
       });
@@ -1916,14 +2135,80 @@ async function finalize(ctx: Ctx, journal: RotationJournalData): Promise<void> {
   // Advance the monotonic epoch witness to the new epoch (force: the rotation
   // is the authority on its own epoch; a concurrent stale witness must not
   // block a legitimate rotation from raising the floor).
+  //
+  // CARRY INVARIANT. `force` bypasses writeEpochWitness's monotonic carry of
+  // `baseline_established`, `baseline_schema`, and `revocation_floor` (that
+  // carry lives inside `if (!opts?.force)` in core/anti-rollback.ts), so a bare
+  // force write would ERASE both latches on every rotation: the config gate
+  // would stop detecting a deleted/downgraded baseline as a replay until the
+  // next boot re-raised the latch, and the fleet revocation floor would reset.
+  // Rotation must therefore read the prior witness back and carry its whole
+  // authenticated data object forward (advanceEpochWitnessData), overriding
+  // only the epoch fields it owns, as `restoreAttest` does for its own force
+  // write.
+  //
+  // WHY THIS IS SAFE ON RESUME. convertMeta re-keyed the witness under
+  // ctx.newMaster during the converting phase (restampEpochWitness), so it is
+  // readable here with the new master alone; ctx.oldMaster is a placeholder on
+  // a `finalizing`-phase resume and is never consulted. Re-running finalize
+  // reads the fields it wrote last time and writes them again (idempotent).
+  //
+  // "absent" is legitimate ONLY when the journal recorded no witness at the
+  // point of no return (`epoch_witness_present` false, or undefined for a
+  // journal written before the field existed). A witness the journal says
+  // existed but that reads absent now went missing between conversion and
+  // finalize (deleted, or the namespace was restored from an older copy);
+  // writing a fresh one would silently erase its latches, which is exactly the
+  // laundering the latch exists to detect, so fail closed.
+  // "invalid" means the witness stopped authenticating between conversion and
+  // finalize (tampered, or a pre-fix rotation resumed across the upgrade with
+  // the witness still keyed under the old master); overwriting it would launder
+  // that, so fail closed and leave the journal for a deliberate resume. The
+  // remedy must work under the NEW master, because that is the only key this
+  // path reads with: a pre-rotation backup of the witness is keyed under the
+  // retired master and stays invalid here. `sanctuary restore-attest` is not
+  // journal-gated; it unwraps the live envelope (already promoted above) and
+  // force-writes a fresh witness under the new master, after which the resume
+  // reads it as valid. Deleting the record is NOT a remedy: it then reads
+  // absent, and the journal-recorded presence refuses that too (by design, so
+  // a deletion cannot launder the latches either). The remedy forfeits the
+  // latches, which is the pre-fix behavior, so the operator is told the cost.
+  const priorWitness = await readEpochWitness(ctx.storage, ctx.newMaster);
+  const witnessWentMissing =
+    priorWitness.status === "absent" && journal.epoch_witness_present === true;
+  if (priorWitness.status === "invalid" || witnessWentMissing) {
+    const condition = witnessWentMissing
+      ? "is missing, but the rotation journal records that an authenticated " +
+        "witness existed when this rotation began"
+      : "does not authenticate under the new master";
+    throw new Error(
+      `Sanctuary: _meta/${EPOCH_WITNESS_META_KEY} ${condition} at finalize, so ` +
+        "its monotonic latches cannot be carried forward; refusing to write a " +
+        "fresh witness over it (the rotation journal stays in place). To " +
+        "proceed, run `sanctuary restore-attest --fortress <path>` now (it " +
+        "re-establishes the witness under the rotated master at the live " +
+        "envelope's epoch and is not blocked by the journal); then run " +
+        "`sanctuary rotate-master --resume`. Deleting the witness record is not " +
+        "a remedy (the journal records that one existed, so a missing witness is " +
+        "refused the same way). " +
+        "The remedy forfeits the witness's config-baseline and revocation-floor " +
+        "latches (the next boot re-raises the baseline latch; the revocation " +
+        "floor resets)."
+    );
+  }
   await fenced(ctx, () => writeEpochWitness(
     ctx.storage,
     ctx.newMaster,
-    {
-      epoch: newEpoch,
-      epoch_id: ctx.rotationId,
-      witnessed_at: new Date().toISOString(),
-    },
+    // Full prior object, epoch fields overridden: see advanceEpochWitnessData
+    // for why finalize may assert nothing else.
+    advanceEpochWitnessData(
+      priorWitness.status === "valid" ? priorWitness.data : undefined,
+      {
+        epoch: newEpoch,
+        epoch_id: ctx.rotationId,
+        witnessed_at: new Date().toISOString(),
+      }
+    ),
     { force: true },
   ));
   ctx.failpoint("epoch-witness-advanced");
@@ -2462,6 +2747,13 @@ async function rotateMasterLocked(
       (authority): authority is RotationRecoveryEscrowAuthority =>
         authority.kind === "os-keyring",
     );
+    // Recorded in the journal BEFORE any conversion write so finalize can tell
+    // "this fortress never had a witness" from "the witness went missing
+    // mid-rotation" (see the carry invariant in finalize). The preflight walk
+    // above already refused a witness that authenticates under neither master,
+    // so only valid/absent are reachable here.
+    const epochWitnessPresent =
+      (await readEpochWitness(ctx.storage, ctx.oldMaster)).status === "valid";
     const journal: RotationJournalData = {
       v: 1,
       rotation_id: rotationId,
@@ -2470,6 +2762,7 @@ async function rotateMasterLocked(
       updated_at: new Date().toISOString(),
       old_wrap_ids: oldEnvelope.wraps.map((w) => w.id),
       new_wrap_ids: stagedEnvelope.wraps.map((w) => w.id),
+      epoch_witness_present: epochWitnessPresent,
       ...(recoveryEscrowAuthority
         ? { recovery_escrow: recoveryEscrowAuthority }
         : {}),
