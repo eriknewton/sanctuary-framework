@@ -42,6 +42,12 @@ import {
   bootServiceReady,
 } from "./castle-wall-boot.js";
 import { parseCastleWallState, runStatus, type SysextState } from "./castle-wall.js";
+// The sealed-runtime contract shared with the build gate and the manifest
+// builder (server/scripts/sealed-cli-runtime-entries.mjs); bundled into cli.js.
+import {
+  installerRequiredSealedCliRuntimeEntries,
+  sealedCliRuntimeManifestPath,
+} from "../../scripts/sealed-cli-runtime-entries.mjs";
 
 declare const __SANCTUARY_SOURCE_SHA__: string;
 
@@ -147,10 +153,20 @@ export async function verifyCastleWallRuntimeManifest(
     !Array.isArray(manifest.inventory.packages) ||
     !Array.isArray(manifest.inventory.mach_o)
   ) return false;
+  // The runtime entries come from the shared sealed-runtime contract, never a
+  // hand list here: every bundler entry (cli.js, the storage worker every
+  // fortress creation forks, index.js, intelligence/index.js,
+  // verify-transparency.js) as a file, and every asset directory through its
+  // sentinel file (an empty `templates/` is not templates). Entries still
+  // marked `landsWith` are not part of the installer contract yet.
+  // Consequence for an already-installed older runtime that predates an entry:
+  // this verifier reports `mismatch`, and the planner's remedy is to replace
+  // the app with a verified current candidate, which is the honest outcome (the
+  // installer must not plan against a runtime that cannot create a fortress).
   const required = new Set([
     "MacOS/sanctuary",
     "Resources/boot-runtime/node",
-    "Resources/cli-runtime/dist/cli.js",
+    ...installerRequiredSealedCliRuntimeEntries().map(sealedCliRuntimeManifestPath),
   ]);
   const filePaths = new Set<string>();
   let totalBytes = 0;
@@ -1564,7 +1580,7 @@ export function buildAgentInstallPlan(input: {
     !/^[a-f0-9]{12}$/.test(input.observed.castleWallBuildSha)
   ) {
     plan.notes.push(
-      `The Castle Wall app failed signature, Gatekeeper, bundle-identity, build-identity, or headless-contract validation. Replace it with a verified current candidate at ${DEFAULT_CASTLE_WALL_APP}.`,
+      `The Castle Wall app failed signature, Gatekeeper, bundle-identity, build-identity, headless-contract, or sealed-runtime validation (an incomplete sealed runtime is one cause). Replace it with a verified current candidate at ${DEFAULT_CASTLE_WALL_APP}.`,
     );
     return plan;
   }
