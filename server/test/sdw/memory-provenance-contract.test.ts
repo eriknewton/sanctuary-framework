@@ -17,6 +17,10 @@ import {
   DISCLOSURE_CAPSULE_RETURN_AUTHOR_AGENT_ID,
   MEMORY_ADMISSION_CHANNELS,
   MEMORY_ADMISSION_SIGNING_DOMAIN,
+  MEMORY_ADMISSION_TRIPLES,
+  MEMORY_TRANSPORT_ADMISSION_CHANNELS,
+  isMemoryTransferLineageRef,
+  isMemoryTransportAdmissionChannel,
   MEMORY_EXTERNAL_DESTINATION_CLASSES,
   MEMORY_EXTERNAL_EVIDENCE_BASES,
   MEMORY_INGRESS_CHANNELS,
@@ -619,6 +623,40 @@ describe("C1 memory-provenance canonical contract", () => {
       }
     }
     expect(observedAllowed).toBe(8);
+  });
+
+  it("pins MEMORY_TRANSPORT_ADMISSION_CHANNELS to the transport rows of MEMORY_ADMISSION_TRIPLES (full-set equality)", () => {
+    // A transport row is one admitted from another fortress's material: a
+    // foreign tier, or an exit/fleet verification basis. Both derivations
+    // must yield the SAME channel set, and that set must equal the constant.
+    const byTier = new Set(MEMORY_ADMISSION_TRIPLES
+      .filter((t) => t.origin_trust_tier.startsWith("foreign_"))
+      .map((t) => t.admission_channel));
+    const byBasis = new Set(MEMORY_ADMISSION_TRIPLES
+      .filter((t) => t.verification_basis.startsWith("exit_v2_") ||
+        t.verification_basis.startsWith("fleet_sync_"))
+      .map((t) => t.admission_channel));
+    const constant = new Set<string>(MEMORY_TRANSPORT_ADMISSION_CHANNELS);
+    expect([...byTier].sort()).toEqual([...constant].sort());
+    expect([...byBasis].sort()).toEqual([...constant].sort());
+    for (const channel of MEMORY_ADMISSION_CHANNELS) {
+      expect(isMemoryTransportAdmissionChannel(channel)).toBe(constant.has(channel));
+    }
+    // Every transport channel requires a lineage ref in every one of its rows;
+    // no non-transport channel carries a foreign tier.
+    for (const t of MEMORY_ADMISSION_TRIPLES) {
+      if (!constant.has(t.admission_channel)) {
+        expect(t.origin_trust_tier.startsWith("foreign_")).toBe(false);
+      }
+    }
+  });
+
+  it("exposes one lineage-reference predicate that agrees with the parser's identifier rule", () => {
+    expect(isMemoryTransferLineageRef("a".repeat(64))).toBe(true);
+    expect(isMemoryTransferLineageRef("archive-ref_1.2")).toBe(true);
+    for (const bad of ["", " ", "has space", "slash/ref", "unicode\u00e9", 42, null, undefined, {}]) {
+      expect(isMemoryTransferLineageRef(bad)).toBe(false);
+    }
   });
 
   it("rejects unknown/missing keys and every unknown enum literal", () => {
