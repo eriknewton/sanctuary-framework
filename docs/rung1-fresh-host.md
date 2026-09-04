@@ -1,9 +1,9 @@
 # Rung 1: fresh-host sovereign-memory onboarding
 
 > **Candidate status:** this document describes the software contract under
-> review. It is not evidence that a fresh-host or reboot ceremony has been run
-> on shipping hardware. Treat Rung 1 as host-proven only after the release's
-> recorded fresh-host and restart drill passes.
+> review. Treat Rung 1 as host-ready only after you have confirmed restart
+> persistence on your own host: store a memory, restart, and read it back with
+> no secret typed.
 
 Rung 1 is Sanctuary's sovereign encrypted memory substrate: your agent's memory
 lives in an at-rest-encrypted vault you own, with signed provenance, and it is
