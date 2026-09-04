@@ -504,7 +504,17 @@ describe("master rotation — happy path", () => {
         join(dir, "castle-pinned-privkey.enc"),
         JSON.stringify(encrypt(seed, fortress.master))
       );
-      await rotateMaster(rotateOpts(fortress, { fortressPath: dir }));
+      const pinPath = join(dir, "castle-pinned-privkey.enc");
+      await rotateMaster(rotateOpts(fortress, {
+        fortressPath: dir,
+        __testFortressFiles: {
+          read: async () => new Uint8Array(await readFile(pinPath)),
+          write: async (_name, data) => writeFile(pinPath, data, { mode: 0o600 }),
+          delete: async () => false,
+          restoreFreshLockScaffold: async () => undefined,
+          cleanupFreshInitRecoveryResidue: async () => false,
+        },
+      }));
       const est = await establishMaster({
         storage: fortress.storage,
         passphrase: PASSPHRASE,
@@ -1349,10 +1359,193 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
     `converted:_identities/${KID}`,
     "converted:notes/k1",
     "audit-epoch-written",
+    "recovery-key-escrow-committed",
     "journal-finalizing-written",
     "envelope-promoted",
     "rotation-audited",
   ];
+
+  it("scrubs old, new, and recovery-key buffers after an injected rotate failure", async () => {
+    const fortress = await buildFortress();
+    const observed = new Map<string, Uint8Array[]>();
+    await expect(rotateMaster(rotateOpts(fortress, {
+      __testObserveSecretBuffer: (label, buffer) => {
+        const buffers = observed.get(label) ?? [];
+        buffers.push(buffer);
+        observed.set(label, buffers);
+      },
+      failpoint: (point) => {
+        if (point === "staged-envelope-written") {
+          throw new Error("injected rotate failure");
+        }
+      },
+    }))).rejects.toThrow("injected rotate failure");
+
+    expect([...observed.keys()]).toEqual(expect.arrayContaining([
+      "old-master",
+      "new-master",
+      "recovery-key",
+    ]));
+    for (const buffers of observed.values()) {
+      for (const buffer of buffers) {
+        expect([...buffer].every((byte) => byte === 0)).toBe(true);
+      }
+    }
+  });
+
+  it("scrubs both decoded masters after an injected resume failure", async () => {
+    const fortress = await buildFortress();
+    await expect(rotateMaster(rotateOpts(fortress, {
+      failpoint: (point) => {
+        if (point === "journal-converting-written") {
+          throw new Error("prepare interrupted resume fixture");
+        }
+      },
+    }))).rejects.toThrow("prepare interrupted resume fixture");
+
+    const observed = new Map<string, Uint8Array[]>();
+    await expect(resumeRotation({
+      storage: fortress.storage,
+      fortressId: FORTRESS_ID,
+      passphrase: PASSPHRASE,
+      __testObserveSecretBuffer: (label, buffer) => {
+        const buffers = observed.get(label) ?? [];
+        buffers.push(buffer);
+        observed.set(label, buffers);
+      },
+      failpoint: (point) => {
+        if (point === `converted:_identities/${KID}`) {
+          throw new Error("injected resume failure");
+        }
+      },
+    })).rejects.toThrow("injected resume failure");
+
+    expect([...observed.keys()]).toEqual(expect.arrayContaining([
+      "old-master",
+      "new-master",
+    ]));
+    for (const buffers of observed.values()) {
+      for (const buffer of buffers) {
+        expect([...buffer].every((byte) => byte === 0)).toBe(true);
+      }
+    }
+  });
+
+  it("promotes transactional recovery escrow only with a durable journal and then closes its handle", async () => {
+    const fortress = await buildFortress();
+    const events: string[] = [];
+    await rotateMaster(rotateOpts(fortress, {
+      captureRecoveryKey: async (rk, verify) => {
+        expect(await verify(rk)).toBe(true);
+        return {
+          captured: true,
+          commit: async () => {
+            expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY))
+              .not.toBeNull();
+            events.push("commit");
+          },
+          rollback: async () => { events.push("rollback"); },
+        };
+      },
+    }));
+    expect(events).toEqual(["commit"]);
+  });
+
+  it("preserves staged recovery escrow when conversion fails after the journal point of no return", async () => {
+    const fortress = await buildFortress();
+    const events: string[] = [];
+    await expect(rotateMaster(rotateOpts(fortress, {
+      captureRecoveryKey: async (rk, verify) => {
+        expect(await verify(rk)).toBe(true);
+        return {
+          captured: true,
+          commit: async () => { events.push("commit"); },
+          rollback: async () => { events.push("rollback"); },
+        };
+      },
+      failpoint: (point) => {
+        if (point === "journal-converting-written") {
+          throw new Error("injected pre-escrow-commit failure");
+        }
+      },
+    }))).rejects.toThrow("injected pre-escrow-commit failure");
+    expect(events).toEqual([]);
+  });
+
+  it("preserves both pre-journal failure and recovery-escrow rollback failure", async () => {
+    const fortress = await buildFortress();
+    const error = await rotateMaster(rotateOpts(fortress, {
+      captureRecoveryKey: async (rk, verify) => {
+        // Deliberately do not verify the recovery wrap. The custody floor then
+        // refuses before the journal is written, where rollback is still safe.
+        expect(rk).toBeTruthy();
+        expect(verify).toBeTypeOf("function");
+        return {
+          captured: true,
+          commit: async () => undefined,
+          rollback: async () => { throw new Error("escrow rollback failed"); },
+        };
+      },
+    })).catch((cause) => cause as unknown);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors.map(String)).toEqual([
+      expect.stringContaining("fewer than 2 verified factors"),
+      "Error: escrow rollback failed",
+    ]);
+  });
+
+  it("journals keyring escrow authority and re-adopts it after a hard crash", async () => {
+    const fortress = await buildFortress();
+    let disclosedKey = "";
+    let rollbackCalls = 0;
+    let promoted = false;
+    let authority: {
+      kind: "os-keyring";
+      canonical_service: string;
+      staging_service: string;
+    } | undefined;
+
+    await expect(rotateMaster(rotateOpts(fortress, {
+      captureRecoveryKey: async (rk, verify, rotationId, registerPendingAuthority) => {
+        disclosedKey = rk;
+        expect(await verify(rk)).toBe(true);
+        authority = {
+          kind: "os-keyring",
+          canonical_service: "sanctuary-recovery-test",
+          staging_service: `sanctuary-recovery-test:rotation:${rotationId}`,
+        };
+        await registerPendingAuthority(authority);
+        return {
+          captured: true,
+          authority,
+          commit: async () => { promoted = true; },
+          rollback: async () => { rollbackCalls++; },
+        };
+      },
+      failpoint: (point) => {
+        if (point === "journal-converting-written") {
+          throw new Error("simulated hard crash after journal");
+        }
+      },
+    }))).rejects.toThrow("simulated hard crash after journal");
+    expect(rollbackCalls).toBe(0);
+
+    await resumeRotation({
+      storage: fortress.storage,
+      fortressId: FORTRESS_ID,
+      passphrase: PASSPHRASE,
+      adoptRecoveryEscrow: async (observed, verify, rotationId) => {
+        expect(observed).toEqual(authority);
+        expect(rotationId).toBeTruthy();
+        expect(await verify(disclosedKey)).toBe(true);
+        expect(await verify(toBase64url(new Uint8Array(32).fill(0xee)))).toBe(false);
+        return { commit: async () => { promoted = true; } };
+      },
+    });
+
+    expect(promoted).toBe(true);
+    await verifyRotated(fortress, { newRecoveryKey: disclosedKey });
+  });
 
   for (const point of POST_JOURNAL_FAILPOINTS) {
     it(`crash at "${point}": boot refuses, resume completes, fortress fully rotated`, async () => {
@@ -1389,7 +1582,7 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
     });
   }
 
-  it("crash BEFORE the journal (staged envelope written): fortress boots under the old master; a fresh rotation cleans the orphan and succeeds", async () => {
+  it("an ordinary exception before the journal transactionally removes staged recovery state", async () => {
     const fortress = await buildFortress();
     await expect(
       rotateMaster(
@@ -1403,8 +1596,9 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
       )
     ).rejects.toThrow(/simulated crash/);
 
-    // No journal → normal boot works and yields the OLD master; the staged
-    // orphan is present but inert.
+    // No journal → normal boot works and yields the OLD master. An ordinary
+    // exception runs rollback; hard-crash residue is covered separately by
+    // the process-death tests.
     const est = await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
@@ -1412,7 +1606,7 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
     expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
     expect(
       await fortress.storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY)
-    ).not.toBeNull();
+    ).toBeNull();
 
     // A fresh rotation cleans the orphan and completes.
     let disclosedKey = "";

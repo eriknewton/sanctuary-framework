@@ -51,7 +51,7 @@ test/castle-wall/runtime/macos-daemon-reload.test.ts(578,50): error TS2554: Expe
 test/castle-wall/runtime/macos-daemon-reload.test.ts(612,47): error TS2554: Expected 0 arguments, but got 1.
 test/castle-wall/runtime/macos-ipc-listener.test.ts(223,11): error TS2349: This expression is not callable.
 test/castle-wall/runtime/producer-signature.test.ts(15,3): error TS2440: Import declaration conflicts with local declaration of 'toBase64url'.
-test/chat/agent-context-cache.test.ts(122,5): error TS2322: Type '"running"' is not assignable to type '"active" | "error" | "unknown" | "paused" | "restarting" | "locked_down" | "unwrapping"'.
+test/chat/agent-context-cache.test.ts(122,5): error TS2322: Type '"running"' is not assignable to type '"unknown" | "error" | "active" | "paused" | "restarting" | "locked_down" | "unwrapping"'.
 test/cli/agents-config-approval-redirect.test.ts(39,35): error TS2741: Property 'state' is missing in type '{ running: false; status: null; reason: string; }' but required in type 'HealthProbeResult'.
 test/cli/agents-list-fortress-scope.test.ts(130,7): error TS2322: Type '() => Promise<{ running: true; status: number; reason: null; }>' is not assignable to type '(tenant: TenantDescriptor) => Promise<HealthProbeResult>'.
 test/cli/agents-list-fortress-scope.test.ts(143,7): error TS2322: Type '() => Promise<{ running: true; status: number; reason: null; }>' is not assignable to type '(tenant: TenantDescriptor) => Promise<HealthProbeResult>'.
@@ -68,8 +68,8 @@ test/cli/auto-trigger-audit.test.ts(47,75): error TS2345: Argument of type '() =
 test/cli/castle-wall-audit-verify.test.ts(115,7): error TS2739: Type '{ host: string; ip: string; port: number; protocol: "tcp"; }' is missing the following properties from type 'IpcDestination': hostname_source, opaque
 test/cli/castle-wall-repair-custody.test.ts(140,5): error TS2322: Type 'Writable' is not assignable to type 'Writable & CaptureStream'.
 test/cli/castle-wall-repair-custody.test.ts(141,5): error TS2322: Type 'Writable' is not assignable to type 'Writable & CaptureStream'.
-test/cli/castle-wall.test.ts(1428,26): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
-test/cli/castle-wall.test.ts(1428,52): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
+test/cli/castle-wall.test.ts(1622,26): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
+test/cli/castle-wall.test.ts(1622,52): error TS2339: Property 'sequence' does not exist on type 'AuditEntry'.
 test/cli/singleton-audit-writes.test.ts(179,75): error TS2345: Argument of type '() => void' is not assignable to parameter of type '(layer: "l1" | "l2" | "l3" | "l4", operation: string, identityId: string, details?: Record<string, unknown> | undefined, result?: "success" | "failure" | undefined) => Promise<...>'.
 test/cli/singleton-audit-writes.test.ts(217,75): error TS2345: Argument of type '() => void' is not assignable to parameter of type '(layer: "l1" | "l2" | "l3" | "l4", operation: string, identityId: string, details?: Record<string, unknown> | undefined, result?: "success" | "failure" | undefined) => Promise<...>'.
 test/cli/singleton-audit-writes.test.ts(239,8): error TS7006: Parameter 'c' implicitly has an 'any' type.
@@ -82,8 +82,8 @@ test/cognitive/memory-attest.test.ts(44,35): error TS2554: Expected 0 arguments,
 test/compliance/eu_ai_act/generator.test.ts(60,39): error TS2554: Expected 0 arguments, but got 1.
 test/compliance/eu_ai_act/generator.test.ts(70,7): error TS2345: Argument of type '"fixture-passphrase"' is not assignable to parameter of type '"passphrase" | "hardware-key" | "recovery-key"'.
 test/composition/sidecar-trust-boundary.test.ts(41,7): error TS2741: Property 'signature_scheme' is missing in type '{ event_id: string; event_type: string; agent_id: string; counterparty_id: string; commitment_class: string; fortress_id: string; emitter_node: string; emitted_at: string; }' but required in type 'CommitmentEvent'.
-test/core/master-custody.test.ts(261,12): error TS18047: 'second.envelope' is possibly 'null'.
-test/core/master-custody.test.ts(670,7): error TS2345: Argument of type 'CustodyEnvelope | null' is not assignable to parameter of type 'CustodyEnvelope'.
+test/core/master-custody.test.ts(374,12): error TS18047: 'second.envelope' is possibly 'null'.
+test/core/master-custody.test.ts(783,7): error TS2345: Argument of type 'CustodyEnvelope | null' is not assignable to parameter of type 'CustodyEnvelope'.
 test/dashboard-slice2-park.test.ts(121,12): error TS18046: 'healthBody' is of type 'unknown'.
 test/dashboard-slice2-park.test.ts(154,14): error TS2571: Object is of type 'unknown'.
 test/dashboard-slice2-park.test.ts(172,12): error TS18046: 'body' is of type 'unknown'.
@@ -187,7 +187,7 @@ test/dashboard/readiness.test.ts(81,12): error TS18046: 'body' is of type 'unkno
 test/dashboard/readiness.test.ts(83,12): error TS18046: 'body' is of type 'unknown'.
 test/dashboard/readiness.test.ts(84,12): error TS18046: 'body' is of type 'unknown'.
 test/dashboard/v1_1/agents-empty-state-canary.test.ts(60,5): error TS2741: Property 'runs_locally' is missing in type '{ vendor: string; model_id: string; }' but required in type 'LocalAgentModelProvider'.
-test/dashboard/v1_1/agents-empty-state-canary.test.ts(62,5): error TS2322: Type '"running"' is not assignable to type '"active" | "error" | "unknown" | "paused" | "restarting" | "locked_down" | "unwrapping"'.
+test/dashboard/v1_1/agents-empty-state-canary.test.ts(62,5): error TS2322: Type '"running"' is not assignable to type '"unknown" | "error" | "active" | "paused" | "restarting" | "locked_down" | "unwrapping"'.
 test/dashboard/v1_1/agents-empty-state-canary.test.ts(64,7): error TS2353: Object literal may only specify known properties, and 'window' does not exist in type 'LocalAgentBudgetSummary'.
 test/dashboard/v1_1/agents-empty-state-canary.test.ts(71,5): error TS2739: Type '{ can_pause: true; can_resume: true; can_restart: true; can_unwrap: true; can_lockdown: true; }' is missing the following properties from type '{ can_pause: boolean; can_resume: boolean; can_restart: boolean; can_unwrap: boolean; can_lockdown: boolean; can_chat: boolean; can_change_template: boolean; }': can_chat, can_change_template
 test/dashboard/v1_1/exit-bundle-wiring.test.ts(63,30): error TS2339: Property 'resolution_payload' does not exist on type 'HubInboxItem'.
@@ -481,7 +481,7 @@ test/principal-policy/feature-fault-raise.test.ts(502,11): error TS2558: Expecte
 test/principal-policy/feature-fault-raise.test.ts(503,30): error TS2345: Argument of type 'FeatureHealthPanel' is not assignable to parameter of type 'never'.
 test/principal-policy/feature-fault-raise.test.ts(504,30): error TS2345: Argument of type 'FeatureHealthPanel' is not assignable to parameter of type 'never'.
 test/principal-policy/feature-fault-raise.test.ts(519,11): error TS2558: Expected 0-1 type arguments, but got 2.
-test/principal-policy/feature-fault-raise.test.ts(73,3): error TS2739: Type '{ origin_machine: string; feature_id: string; label: string; liveness: FeatureLivenessClass; status: "active" | "unknown" | "coarse_only" | "unconfirmed" | "fault"; ... 5 more ...; freshness_window_ms: number; }' is missing the following properties from type 'FeatureHealthRow': expectation_floor, trailing_window_volume
+test/principal-policy/feature-fault-raise.test.ts(73,3): error TS2739: Type '{ origin_machine: string; feature_id: string; label: string; liveness: FeatureLivenessClass; status: "unknown" | "active" | "coarse_only" | "unconfirmed" | "fault"; ... 5 more ...; freshness_window_ms: number; }' is missing the following properties from type 'FeatureHealthRow': expectation_floor, trailing_window_volume
 test/principal-policy/feature-health-per-feature-provenance.test.ts(94,32): error TS2345: Argument of type '{ verifyProducerSignature?: Mock<Procedure | Constructable> | undefined; feature: FeatureRegistryEntry; entries: AuditEntry[]; ... 4 more ...; pinnedProducerKeyB64url: string; }' is not assignable to parameter of type '{ feature: FeatureRegistryEntry; entries: readonly AuditEntry[]; freshnessEntries?: readonly AuditEntry[] | undefined; freshnessComplete?: boolean | undefined; ... 9 more ...; protectionSubjectMatchMode?: ProtectionSubjectMatchMode | undefined; }'.
 test/principal-policy/fleet-roster.test.ts(107,3): error TS2739: Type '{ getContext: () => FederationContext | null; isEnabled: () => boolean; listNodes: () => FederationNodeView[]; isNodeRevoked: (nodeId: string) => boolean; ... 12 more ...; federationPosture: never; }' is missing the following properties from type 'V1FederationDeps': isRootRevoked, issueReissueChallenge, consumeReissueChallenge
 test/principal-policy/gate-context-redaction.test.ts(49,49): error TS2345: Argument of type '(req: ApprovalRequest) => Promise<{ request_id: any; decision: "deny"; decided_by: "test"; reason: string; }>' is not assignable to parameter of type '(request: ApprovalRequest) => Promise<ApprovalResponse>'.
@@ -628,7 +628,7 @@ test/sdw/sdw-phase1.test.ts(369,64): error TS2554: Expected 2 arguments, but got
 test/security/agent-audit-allowlist.test.ts(149,15): error TS2352: Conversion of type 'AgentAuditView' to type 'Record<string, unknown>' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
 test/security/agent-audit-allowlist.test.ts(150,15): error TS2352: Conversion of type 'AgentAuditView' to type 'Record<string, unknown>' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
 test/security/agent-audit-allowlist.test.ts(349,15): error TS2352: Conversion of type 'AgentAuditView' to type 'Record<string, unknown>' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.
-test/security/at-rest-decrypt-fixtures.test.ts(302,41): error TS2345: Argument of type 'string' is not assignable to parameter of type '"l4-known-signers" | "l2-sentinel-finding-v1" | "l2-privacy-placeholders" | "l2-query-anonymity-tier-b-v1" | "l2-anomaly-classifier-state-v1" | "l2-english-policy-activation-v1" | ... 4 more ... | "l2-recognition-hosted-did-web-v1"'.
+test/security/at-rest-decrypt-fixtures.test.ts(302,41): error TS2345: Argument of type 'string' is not assignable to parameter of type '"l4-known-signers" | "l2-sentinel-finding-v1" | "l2-privacy-placeholders" | "l2-privacy-policies-v1" | "l2-english-policy-activation-v1" | "l2-approval-aggregator-v1" | ... 4 more ... | "l2-anomaly-classifier-state-v1"'.
 test/security/dashboard-no-query-token.test.ts(110,13): error TS2339: Property 'session_id' does not exist on type 'unknown'.
 test/security/dashboard-no-query-token.test.ts(117,12): error TS18046: 'body' is of type 'unknown'.
 test/security/dashboard-no-query-token.test.ts(132,13): error TS2339: Property 'session_id' does not exist on type 'unknown'.
@@ -947,7 +947,7 @@ test/wrap/castle-wall-banner-probe.test.ts(978,9): error TS2322: Type '{ kind: "
 test/wrap/custody-flow.test.ts(63,12): error TS18047: 'result.envelope' is possibly 'null'.
 test/wrap/hermes-yaml-injection.test.ts(484,35): error TS7006: Parameter 'c' implicitly has an 'any' type.
 test/wrap/hermes-yaml-parse-parity.test.ts(745,35): error TS7006: Parameter 'c' implicitly has an 'any' type.
-test/wrap/init.test.ts(555,12): error TS18047: 'unlocked.envelope' is possibly 'null'.
+test/wrap/init.test.ts(736,12): error TS18047: 'unlocked.envelope' is possibly 'null'.
 test/wrap/legacy-filename-compat.test.ts(38,26): error TS2322: Type 'Promise<{ url: string; port: number; host: string; stop: () => Promise<void>; publish: () => void; publishActivity: () => void; publishApproval: () => void; }>' is not assignable to type 'Promise<DashboardHandle>'.
 test/wrap/port-fallback.test.ts(33,9): error TS2322: Type '(opts: { port: number; host?: string | undefined; mode: "co-located" | "standalone"; authToken: string; serverVersion: string; }) => Promise<{ url: string; port: number; host: string; stop: () => Promise<void>; publish: () => void; publishActivity: () => void; publishApproval: () => void; }>' is not assignable to type 'DashboardStarter'.
 test/wrap/port-fallback.test.ts(83,11): error TS2322: Type '(opts: { port: number; host?: string | undefined; mode: "co-located" | "standalone"; authToken: string; serverVersion: string; }) => Promise<{ url: string; port: number; host: string; stop: () => Promise<void>; publish: () => void; publishActivity: () => void; publishApproval: () => void; }>' is not assignable to type 'DashboardStarter'.

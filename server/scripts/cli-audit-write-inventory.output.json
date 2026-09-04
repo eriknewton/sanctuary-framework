@@ -2,7 +2,7 @@
   {
     "subcommand": "sanctuary agents config",
     "file_path": "src/cli/agents/cli.ts",
-    "line_number": 114,
+    "line_number": 139,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append with before/after approval_redirect (ZZZZZ batch 5b)"
@@ -10,7 +10,7 @@
   {
     "subcommand": "sanctuary agents list",
     "file_path": "src/cli/agents/cli.ts",
-    "line_number": 108,
+    "line_number": 129,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -18,7 +18,7 @@
   {
     "subcommand": "sanctuary agents show",
     "file_path": "src/cli/agents/cli.ts",
-    "line_number": 110,
+    "line_number": 135,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -26,7 +26,7 @@
   {
     "subcommand": "sanctuary agents status",
     "file_path": "src/cli/agents/cli.ts",
-    "line_number": 112,
+    "line_number": 137,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -34,7 +34,7 @@
   {
     "subcommand": "sanctuary anomaly classifier-state",
     "file_path": "src/cli/anomaly.ts",
-    "line_number": 87,
+    "line_number": 91,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -42,7 +42,7 @@
   {
     "subcommand": "sanctuary anomaly detectors",
     "file_path": "src/cli/anomaly.ts",
-    "line_number": 77,
+    "line_number": 76,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -50,13 +50,21 @@
   {
     "subcommand": "sanctuary anomaly findings",
     "file_path": "src/cli/anomaly.ts",
-    "line_number": 85,
+    "line_number": 89,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
   },
   {
     "subcommand": "sanctuary anomaly list-subscribed",
+    "file_path": "src/cli/anomaly.ts",
+    "line_number": 78,
+    "classification": "read-only",
+    "audits_currently": null,
+    "notes": "read-only; audit not required"
+  },
+  {
+    "subcommand": "sanctuary anomaly status",
     "file_path": "src/cli/anomaly.ts",
     "line_number": 79,
     "classification": "read-only",
@@ -74,7 +82,7 @@
   {
     "subcommand": "sanctuary anomaly unsubscribe",
     "file_path": "src/cli/anomaly.ts",
-    "line_number": 83,
+    "line_number": 87,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append in unsubscribe handler (ZZZZZ batch 5b)"
@@ -82,7 +90,7 @@
   {
     "subcommand": "sanctuary auto-trigger cancel",
     "file_path": "src/cli/auto-trigger.ts",
-    "line_number": 82,
+    "line_number": 80,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "dashboard-delegated POST (audits server-side)"
@@ -90,7 +98,7 @@
   {
     "subcommand": "sanctuary auto-trigger recommendations accept",
     "file_path": "src/cli/auto-trigger.ts",
-    "line_number": 173,
+    "line_number": 171,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append with recommendation detail (ZZZZZ batch 5b)"
@@ -98,7 +106,7 @@
   {
     "subcommand": "sanctuary auto-trigger recommendations list",
     "file_path": "src/cli/auto-trigger.ts",
-    "line_number": 138,
+    "line_number": 136,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -106,7 +114,7 @@
   {
     "subcommand": "sanctuary auto-trigger recommendations reject",
     "file_path": "src/cli/auto-trigger.ts",
-    "line_number": 192,
+    "line_number": 190,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append with suppression detail (ZZZZZ batch 5b)"
@@ -114,7 +122,7 @@
   {
     "subcommand": "sanctuary auto-trigger recommendations show",
     "file_path": "src/cli/auto-trigger.ts",
-    "line_number": 156,
+    "line_number": 154,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -122,7 +130,7 @@
   {
     "subcommand": "sanctuary auto-trigger rules demote",
     "file_path": "src/cli/auto-trigger.ts",
-    "line_number": 236,
+    "line_number": 234,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append with before/after rung (ZZZZZ batch 5b)"
@@ -130,7 +138,7 @@
   {
     "subcommand": "sanctuary auto-trigger rules list",
     "file_path": "src/cli/auto-trigger.ts",
-    "line_number": 138,
+    "line_number": 136,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -138,7 +146,7 @@
   {
     "subcommand": "sanctuary auto-trigger rules promote",
     "file_path": "src/cli/auto-trigger.ts",
-    "line_number": 234,
+    "line_number": 232,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append with before/after rung (ZZZZZ batch 5b)"
@@ -146,7 +154,7 @@
   {
     "subcommand": "sanctuary auto-trigger rules set-threshold",
     "file_path": "src/cli/auto-trigger.ts",
-    "line_number": 238,
+    "line_number": 236,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append with before/after threshold values (ZZZZZ batch 5b)"
@@ -154,7 +162,7 @@
   {
     "subcommand": "sanctuary auto-trigger rules show",
     "file_path": "src/cli/auto-trigger.ts",
-    "line_number": 156,
+    "line_number": 154,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -218,7 +226,7 @@
   {
     "subcommand": "sanctuary did-web issue",
     "file_path": "src/cli/did-web.ts",
-    "line_number": 148,
+    "line_number": 146,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append in issue handler (ZZZZZ batch 5b)"
@@ -226,7 +234,7 @@
   {
     "subcommand": "sanctuary did-web key-history",
     "file_path": "src/cli/did-web.ts",
-    "line_number": 157,
+    "line_number": 159,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -234,7 +242,7 @@
   {
     "subcommand": "sanctuary did-web register-hosted",
     "file_path": "src/cli/did-web.ts",
-    "line_number": 160,
+    "line_number": 162,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append + flush in register-hosted handler"
@@ -242,7 +250,7 @@
   {
     "subcommand": "sanctuary did-web rotate-key",
     "file_path": "src/cli/did-web.ts",
-    "line_number": 154,
+    "line_number": 156,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append + flush in rotate-key handler"
@@ -250,7 +258,7 @@
   {
     "subcommand": "sanctuary did-web show",
     "file_path": "src/cli/did-web.ts",
-    "line_number": 151,
+    "line_number": 153,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -258,7 +266,7 @@
   {
     "subcommand": "sanctuary erc8004 register",
     "file_path": "src/cli/erc8004.ts",
-    "line_number": 115,
+    "line_number": 112,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append via handleErc8004Request (PR 3)"
@@ -266,7 +274,7 @@
   {
     "subcommand": "sanctuary erc8004 status",
     "file_path": "src/cli/erc8004.ts",
-    "line_number": 118,
+    "line_number": 115,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -274,15 +282,23 @@
   {
     "subcommand": "sanctuary exit export",
     "file_path": "src/exit/cli.ts",
-    "line_number": 267,
+    "line_number": 859,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append in exit export handler"
   },
   {
+    "subcommand": "sanctuary exit inspect",
+    "file_path": "src/exit/cli.ts",
+    "line_number": 792,
+    "classification": "read-only",
+    "audits_currently": null,
+    "notes": "read-only; audit not required"
+  },
+  {
     "subcommand": "sanctuary exit manifest-shape",
     "file_path": "src/exit/cli.ts",
-    "line_number": 208,
+    "line_number": 661,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -293,7 +309,7 @@
     "line_number": 203,
     "classification": "mutator",
     "audits_currently": true,
-    "notes": "R3-2: reclassified from read-only. cmdList calls reconcileFileGrantTree before listing (safe-direction cleanup: scrubs expired tree entries, flips expired status, emits file_grant_revoke/expired_ttl_scrub audits), so list is a mutator, not purely read-only. It also emits its own file_grant_list access audit via recordFileGrantListAudit (Tier-3 auto-allow + audit)."
+    "notes": "safe-direction mutator: calls reconcileFileGrantTree before listing (scrubs expired tree entries, flips expired status, emits file_grant_revoke/expired_ttl_scrub audits); also emits its own file_grant_list access audit (Tier-3 auto-allow + audit, recordFileGrantListAudit)"
   },
   {
     "subcommand": "sanctuary file-grant mint",
@@ -314,7 +330,7 @@
   {
     "subcommand": "sanctuary honeypot compile",
     "file_path": "src/honeypot/cli.ts",
-    "line_number": 150,
+    "line_number": 138,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -322,7 +338,7 @@
   {
     "subcommand": "sanctuary honeypot credential-traps",
     "file_path": "src/honeypot/cli.ts",
-    "line_number": 286,
+    "line_number": 274,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -330,7 +346,7 @@
   {
     "subcommand": "sanctuary honeypot deploy",
     "file_path": "src/honeypot/cli.ts",
-    "line_number": 199,
+    "line_number": 187,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append in honeypot deploy"
@@ -338,7 +354,7 @@
   {
     "subcommand": "sanctuary honeypot findings",
     "file_path": "src/honeypot/cli.ts",
-    "line_number": 346,
+    "line_number": 334,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -346,7 +362,7 @@
   {
     "subcommand": "sanctuary honeypot list",
     "file_path": "src/honeypot/cli.ts",
-    "line_number": 233,
+    "line_number": 221,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -354,7 +370,7 @@
   {
     "subcommand": "sanctuary honeypot tool-traps",
     "file_path": "src/honeypot/cli.ts",
-    "line_number": 250,
+    "line_number": 238,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -362,15 +378,23 @@
   {
     "subcommand": "sanctuary honeypot undeploy",
     "file_path": "src/honeypot/cli.ts",
-    "line_number": 323,
+    "line_number": 311,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append in honeypot undeploy"
   },
   {
+    "subcommand": "sanctuary identity create",
+    "file_path": "src/cli/identity.ts",
+    "line_number": 100,
+    "classification": "mutator",
+    "audits_currently": false,
+    "notes": "mints + persists a new Ed25519 identity via IdentityManager.saveNew; no AuditLog call anywhere in that path (gap recorded, not silently classified read-only)"
+  },
+  {
     "subcommand": "sanctuary identity show",
     "file_path": "src/cli/identity.ts",
-    "line_number": 86,
+    "line_number": 92,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -434,7 +458,7 @@
   {
     "subcommand": "sanctuary policy compile",
     "file_path": "src/cli/policy.ts",
-    "line_number": 75,
+    "line_number": 92,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "stateless preview, no fortress state change"
@@ -442,7 +466,7 @@
   {
     "subcommand": "sanctuary policy drafts activate",
     "file_path": "src/cli/policy.ts",
-    "line_number": 241,
+    "line_number": 317,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append before HTTP POST + failure audit (ZZZZZ batch 5b)"
@@ -450,7 +474,7 @@
   {
     "subcommand": "sanctuary policy drafts check-conflicts",
     "file_path": "src/cli/policy.ts",
-    "line_number": 238,
+    "line_number": 314,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "queries server for conflicts, no state change"
@@ -458,7 +482,7 @@
   {
     "subcommand": "sanctuary policy drafts list",
     "file_path": "src/cli/policy.ts",
-    "line_number": 215,
+    "line_number": 291,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -466,7 +490,7 @@
   {
     "subcommand": "sanctuary policy drafts show",
     "file_path": "src/cli/policy.ts",
-    "line_number": 227,
+    "line_number": 303,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -474,7 +498,7 @@
   {
     "subcommand": "sanctuary secrets add",
     "file_path": "src/cli/secrets.ts",
-    "line_number": 61,
+    "line_number": 97,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "broker-delegated (broker audits internally)"
@@ -482,7 +506,7 @@
   {
     "subcommand": "sanctuary secrets audit",
     "file_path": "src/cli/secrets.ts",
-    "line_number": 73,
+    "line_number": 109,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -490,7 +514,7 @@
   {
     "subcommand": "sanctuary secrets delete",
     "file_path": "src/cli/secrets.ts",
-    "line_number": 67,
+    "line_number": 103,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "broker-delegated (broker audits internally)"
@@ -498,7 +522,7 @@
   {
     "subcommand": "sanctuary secrets grant",
     "file_path": "src/cli/secrets.ts",
-    "line_number": 69,
+    "line_number": 105,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "broker-delegated (broker audits internally)"
@@ -506,7 +530,7 @@
   {
     "subcommand": "sanctuary secrets list",
     "file_path": "src/cli/secrets.ts",
-    "line_number": 63,
+    "line_number": 99,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -514,7 +538,7 @@
   {
     "subcommand": "sanctuary secrets revoke",
     "file_path": "src/cli/secrets.ts",
-    "line_number": 71,
+    "line_number": 107,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "broker-delegated (broker audits internally)"
@@ -522,7 +546,7 @@
   {
     "subcommand": "sanctuary secrets rotate",
     "file_path": "src/cli/secrets.ts",
-    "line_number": 65,
+    "line_number": 101,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "broker-delegated (broker audits internally)"
@@ -530,7 +554,7 @@
   {
     "subcommand": "sanctuary sentinel findings",
     "file_path": "src/cli/sentinel.ts",
-    "line_number": 67,
+    "line_number": 66,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -538,7 +562,7 @@
   {
     "subcommand": "sanctuary sentinel list",
     "file_path": "src/cli/sentinel.ts",
-    "line_number": 59,
+    "line_number": 58,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -546,7 +570,7 @@
   {
     "subcommand": "sanctuary sentinel list-subscribed",
     "file_path": "src/cli/sentinel.ts",
-    "line_number": 61,
+    "line_number": 60,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -554,7 +578,7 @@
   {
     "subcommand": "sanctuary sentinel subscribe",
     "file_path": "src/cli/sentinel.ts",
-    "line_number": 63,
+    "line_number": 62,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append in subscribe handler (ZZZZZ batch 5b)"
@@ -562,7 +586,7 @@
   {
     "subcommand": "sanctuary sentinel unsubscribe",
     "file_path": "src/cli/sentinel.ts",
-    "line_number": 65,
+    "line_number": 64,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append in unsubscribe handler (ZZZZZ batch 5b)"
@@ -570,7 +594,7 @@
   {
     "subcommand": "sanctuary task assign",
     "file_path": "src/cli/task.ts",
-    "line_number": 45,
+    "line_number": 46,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "dashboard-delegated POST (audits server-side)"
@@ -578,7 +602,7 @@
   {
     "subcommand": "sanctuary task cancel",
     "file_path": "src/cli/task.ts",
-    "line_number": 47,
+    "line_number": 48,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "dashboard-delegated POST (audits server-side)"
@@ -586,7 +610,7 @@
   {
     "subcommand": "sanctuary task create",
     "file_path": "src/cli/task.ts",
-    "line_number": 37,
+    "line_number": 38,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "dashboard-delegated POST (audits server-side)"
@@ -594,7 +618,7 @@
   {
     "subcommand": "sanctuary task list",
     "file_path": "src/cli/task.ts",
-    "line_number": 39,
+    "line_number": 40,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -602,7 +626,7 @@
   {
     "subcommand": "sanctuary task show",
     "file_path": "src/cli/task.ts",
-    "line_number": 41,
+    "line_number": 42,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"
@@ -610,7 +634,7 @@
   {
     "subcommand": "sanctuary task update",
     "file_path": "src/cli/task.ts",
-    "line_number": 43,
+    "line_number": 44,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "dashboard-delegated PATCH (audits server-side)"
@@ -618,7 +642,7 @@
   {
     "subcommand": "sanctuary template init",
     "file_path": "src/templates/cli.ts",
-    "line_number": 50,
+    "line_number": 56,
     "classification": "mutator",
     "audits_currently": true,
     "notes": "AuditLog.append with template + agent detail (ZZZZZ batch 5b)"
@@ -626,7 +650,7 @@
   {
     "subcommand": "sanctuary template list",
     "file_path": "src/templates/cli.ts",
-    "line_number": 48,
+    "line_number": 54,
     "classification": "read-only",
     "audits_currently": null,
     "notes": "read-only; audit not required"

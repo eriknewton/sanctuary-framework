@@ -42,8 +42,27 @@ export const RESET_HISTORY_FILENAME = ".reset-history.log";
 /** Audit-log operation name used for recovered-from-reset entries. */
 export const RECOVERED_FROM_RESET_OPERATION = "fortress_recovered_from_reset";
 
+/**
+ * Recovery modes that may appear in the marker. This array is the SINGLE
+ * SOURCE OF TRUTH for the valid `recovery_mode` set: the boot reader (this
+ * module's parser) and the marker writer (`RecoveryMode` in
+ * `server/src/cli/reset-passphrase.ts`, which imports the type below) share
+ * it, so a mode the writer can persist can never be a mode the reader
+ * rejects. A writer/reader schema split here bricks the next server boot —
+ * a rejected marker throws `ResetHistoryMalformedError` and `index.ts`
+ * refuses to start (AGENTS rule 11: writer and reader consume one schema).
+ * Must match `RecoveryMode` in server/src/cli/reset-passphrase.ts.
+ */
+export const RESET_HISTORY_RECOVERY_MODES = [
+  "shares",
+  "guardian",
+  "nuke",
+  "recovery-key",
+] as const;
+
 /** Recovery modes that may appear in the marker; matches reset-passphrase.ts. */
-export type ResetHistoryRecoveryMode = "shares" | "guardian" | "nuke";
+export type ResetHistoryRecoveryMode =
+  (typeof RESET_HISTORY_RECOVERY_MODES)[number];
 
 /**
  * Shape of one NDJSON line in `.reset-history.log` as written by
@@ -168,23 +187,27 @@ function coerceMarker(
     throw typed(markerPath, lineNumber, "storage_path", "string");
   if (typeof obj.keychain_cleared !== "boolean")
     throw typed(markerPath, lineNumber, "keychain_cleared", "boolean");
+  // Validate against the single source-of-truth set so the reader accepts
+  // exactly what the writer can persist (AGENTS rule 11); a hand-maintained
+  // disjunction here is the drift that bricks boot after a new mode ships.
   if (
-    obj.recovery_mode !== "shares" &&
-    obj.recovery_mode !== "guardian" &&
-    obj.recovery_mode !== "nuke"
+    typeof obj.recovery_mode !== "string" ||
+    !(RESET_HISTORY_RECOVERY_MODES as readonly string[]).includes(
+      obj.recovery_mode
+    )
   ) {
     throw new ResetHistoryMalformedError(
       markerPath,
       lineNumber,
       new Error(
-        `recovery_mode must be one of shares|guardian|nuke (got ${JSON.stringify(obj.recovery_mode)})`
+        `recovery_mode must be one of ${RESET_HISTORY_RECOVERY_MODES.join("|")} (got ${JSON.stringify(obj.recovery_mode)})`
       )
     );
   }
   return {
     started_at: obj.started_at,
     completed_at: obj.completed_at,
-    recovery_mode: obj.recovery_mode,
+    recovery_mode: obj.recovery_mode as ResetHistoryRecoveryMode,
     fortress_name: obj.fortress_name,
     storage_path: obj.storage_path,
     keychain_cleared: obj.keychain_cleared,

@@ -255,6 +255,13 @@ describe("MCP child fortress refusal", () => {
       await runInit(
         { fortress: fortressPath, noConfirm: true },
         {
+          // Isolate from the machine-wide Castle Wall global pin. Default init
+          // auto-bootstraps the host-wide anchor at
+          // /Library/Application Support/Sanctuary; provision-pin now fails
+          // closed when that anchor is absent, unwritable, or differs (a fresh
+          // CI runner has no such dir; a developer host may hold a differing
+          // pin), so the whole suite injects this seam. See test/wrap/init.test.ts.
+          provisionPin: async () => 0,
           recoveryKeychain: {
             home: "/tmp/sanctuary-test-home",
             platformOverride: "darwin",
@@ -279,6 +286,11 @@ describe("MCP child fortress refusal", () => {
     const result = await runInit(
       { fortress: fortressPath, noConfirm: true },
       {
+        // Isolate from the machine-wide Castle Wall global pin (see the sibling
+        // test above): provision-pin fails closed on a missing/unwritable/
+        // differing host-wide anchor, so tests inject a succeeding seam rather
+        // than touch /Library/Application Support/Sanctuary.
+        provisionPin: async () => 0,
         recoveryKeychain: {
           home: "/tmp/sanctuary-test-home",
           platformOverride: "darwin",

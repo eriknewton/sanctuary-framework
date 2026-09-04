@@ -27,20 +27,31 @@ import {
   resumeRotation,
   RotationPreflightError,
   RotationResumeError,
+  PENDING_RECOVERY_KEY,
+  type RotationPendingRecoveryAuthority,
   type RotationPlanSummary,
 } from "../core/master-rotation.js";
 import {
   getOrCreateKeychainCustodyKey,
-  storeRecoveryKeyInKeychain,
+  adoptRecoveryKeyRotationInKeychain,
+  reconcilePendingRecoveryKeyRotationInKeychain,
+  stageRecoveryKeyRotationInKeychain,
   RecoveryKeyKeychainStoreError,
+  type KeychainCustodyOptions,
+  type RecoveryKeyRotationMutation,
 } from "../wrap/keychain-custody.js";
-import { readCustodyEnvelope } from "../core/master-custody.js";
+import {
+  readCustodyEnvelope,
+  STAGED_CUSTODY_ENVELOPE_KEY,
+} from "../core/master-custody.js";
 import {
   preflightRecoveryKeyOutputFile,
+  reconcileRotationRecoveryKeyFile,
   resolveRecoveryKeyOutputPath,
   verifyRecoveryKeyReentry,
-  writeRecoveryKeyFile,
+  writeRotationRecoveryKeyFileTransactional,
   type DisclosureIo,
+  type RotationRecoveryFileMutation,
 } from "../wrap/recovery-key-disclosure.js";
 import { consumeFlagValue } from "./argv.js";
 
@@ -53,6 +64,12 @@ export interface RotateMasterCliArgs {
   home?: string;
   /** Test seam: passphrase without the interactive prompt. */
   passphraseOverride?: string;
+  /** Test seam: observe ownership of a keychain key without touching the real keyring. */
+  getKeychainCustodyKey?: typeof getOrCreateKeychainCustodyKey;
+  /** Test seam: inject a failure after custody-key acquisition. */
+  rotateMasterImpl?: typeof rotateMaster;
+  /** Test seam: isolate recovery escrow and resume adoption from real keyrings. */
+  recoveryKeychain?: KeychainCustodyOptions;
 }
 
 interface ParsedArgs {
@@ -142,6 +159,36 @@ async function fileExists(path: string): Promise<boolean> {
 }
 
 /**
+ * An interrupted pre-journal file handoff must reach authenticated engine
+ * reconciliation before ordinary single-issuance preflight rejects its exact
+ * output path. This probe is intentionally only a deferral hint: it trusts no
+ * bytes and authorizes no deletion or overwrite. The old-master MAC and staged
+ * envelope binding are verified inside rotateMaster before cleanup.
+ */
+async function mayBePendingRecoveryFileRetry(
+  statePath: string,
+  recoveryKeyFilePath: string,
+): Promise<boolean> {
+  try {
+    const storage = new FilesystemStorage(statePath);
+    const [raw, staged] = await Promise.all([
+      storage.read("_meta", PENDING_RECOVERY_KEY),
+      storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY),
+    ]);
+    if (!raw || !staged || raw.byteLength > 64 * 1024) return false;
+    const parsed = JSON.parse(Buffer.from(raw).toString("utf8")) as {
+      data?: { authorities?: Array<{ kind?: unknown; path?: unknown }> };
+    };
+    return parsed.data?.authorities?.some((authority) =>
+      authority.kind === "recovery-file"
+      && authority.path === recoveryKeyFilePath,
+    ) === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Capture the NEW recovery key minted by a rotation. Anti-strand (element 4):
  * a rotation must never strand the operator with a key that exists only inside
  * the fortress directory, so confirmed OFF-HOST capture is a HARD precondition
@@ -159,82 +206,137 @@ export async function captureRotatedRecoveryKey(opts: {
   verify: (entered: string) => Promise<boolean>;
   storagePath: string;
   fortressId: string;
+  rotationId: string;
   recoveryKeyFilePath?: string;
+  registerPendingAuthority: (
+    authority: RotationPendingRecoveryAuthority,
+  ) => Promise<void>;
   io: DisclosureIo;
   err: NodeJS.WritableStream;
   /** Test seam: inject a mock OS-keyring backend for recovery escrow. */
-  recoveryKeychain?: Parameters<typeof storeRecoveryKeyInKeychain>[2];
-}): Promise<boolean> {
+  recoveryKeychain?: KeychainCustodyOptions;
+}): Promise<
+  | boolean
+  | {
+      captured: true;
+      commit(): Promise<void>;
+      rollback(): Promise<void>;
+    }
+> {
   let recoveryOutPath: string | undefined;
-  let keychainService: string | undefined;
+  let fileMutation: RotationRecoveryFileMutation | undefined;
+  let keychainMutation: RecoveryKeyRotationMutation | undefined;
+
+  const rollbackMutations = async (): Promise<void> => {
+    const failures: unknown[] = [];
+    for (const rollback of [
+      () => fileMutation?.rollback(),
+      () => keychainMutation?.rollback(),
+    ]) {
+      try {
+        await rollback();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(failures, "recovery escrow rollbacks failed");
+    }
+  };
+
+  // Bind the engine's pending authority to the exact staged envelope bytes
+  // before any external location is published. This proves the generated
+  // string unwraps the staged master; the independent human re-entry below is
+  // still mandatory and a refusal rolls every external mutation back.
+  if (!(await opts.verify(opts.recoveryKey))) {
+    throw new Error("generated rotation recovery key did not verify its staged envelope");
+  }
 
   // 1. Off-host plaintext copy (outside the fortress), when --recovery-out was
-  //    supplied. Single-issuance + O_EXCL + O_NOFOLLOW (the #661 machinery).
+  //    supplied. Register the intended parent-bound authority BEFORE publish;
+  //    then upgrade it to the exact file inode after the atomic link.
   if (opts.recoveryKeyFilePath) {
-    await writeRecoveryKeyFile({
+    fileMutation = await writeRotationRecoveryKeyFileTransactional({
       storagePath: opts.storagePath,
       recoveryKeyFilePath: opts.recoveryKeyFilePath,
       recoveryKey: opts.recoveryKey,
       fortressId: opts.fortressId,
+      registerPendingAuthority: opts.registerPendingAuthority,
     });
-    recoveryOutPath = opts.recoveryKeyFilePath;
+    recoveryOutPath = fileMutation.authority.path;
   }
 
   // 2. OS-keyring recovery escrow (a recoverable second factor). Best-effort:
   //    a locked / absent keyring does not by itself satisfy the precondition.
   try {
-    const { service } = await storeRecoveryKeyInKeychain(
+    keychainMutation = await stageRecoveryKeyRotationInKeychain(
       opts.storagePath,
       opts.recoveryKey,
-      opts.recoveryKeychain ?? {}
+      opts.rotationId,
+      opts.recoveryKeychain ?? {},
+      opts.registerPendingAuthority,
     );
-    keychainService = service;
   } catch (err) {
-    if (!(err instanceof RecoveryKeyKeychainStoreError)) throw err;
+    if (!(err instanceof RecoveryKeyKeychainStoreError)) {
+      await rollbackMutations();
+      throw err;
+    }
     // keyring not usable here - fall through to the off-host file requirement
   }
 
-  // 3. HARD anti-strand precondition: there MUST be a durable off-host copy of
-  //    the new key. With neither, refuse capture so the rotation aborts before
-  //    touching data (the OLD recovery key keeps working).
-  if (!recoveryOutPath && !keychainService) {
-    opts.err.write(
-      "\n  Refusing to rotate: the NEW recovery key has no durable off-host\n" +
-        "  escrow target on this run. Sanctuary will NOT write it inside the\n" +
-        "  fortress directory (that copy gets wiped and strands you). Re-run with\n" +
-        "  --recovery-out <path outside the fortress>, or from a session where the\n" +
-        "  OS keyring is unlocked, so the new key is captured before rotation.\n\n"
-    );
-    return false;
-  }
-
-  // 4. Disclose on the controlling terminal (the rotation io channel; never an
-  //    in-fortress file) and re-entry verify. The key is shown for the operator
-  //    to confirm against what they just saved off-host.
-  const escrowNote =
-    (recoveryOutPath
-      ? `\n  Off-host plaintext copy written to:\n    ${recoveryOutPath}\n`
-      : "") +
-    (keychainService
-      ? `  Escrowed in the OS keyring (service ${keychainService}).\n`
-      : "");
-  opts.io.output.write(
-    "\n  ================ NEW RECOVERY KEY (rotation) ================\n" +
-      "  This is shown only on this terminal. Store it in your password\n" +
-      "  manager. It is NOT written inside the fortress directory.\n\n" +
-      `  Recovery key:\n    ${opts.recoveryKey}\n` +
-      escrowNote +
-      "  ============================================================\n"
-  );
-  opts.err.write(
-    "\n  NOTE: this NEW recovery key becomes active only when the rotation\n" +
-      "  completes. Your previous recovery key stops working at that point.\n\n"
-  );
+  let mutationTransferred = false;
   try {
-    await verifyRecoveryKeyReentry({ check: opts.verify, io: opts.io });
-    return true;
-  } catch {
-    return false;
+    // 3. HARD anti-strand precondition: there MUST be a durable off-host copy
+    //    of the new key. With neither, refuse before touching fortress data.
+    if (!fileMutation && !keychainMutation) {
+      opts.err.write(
+        "\n  Refusing to rotate: the NEW recovery key has no durable off-host\n" +
+          "  escrow target on this run. Sanctuary will NOT write it inside the\n" +
+          "  fortress directory (that copy gets wiped and strands you). Re-run with\n" +
+          "  --recovery-out <path outside the fortress>, or from a session where the\n" +
+          "  OS keyring is unlocked, so the new key is captured before rotation.\n\n"
+      );
+      return false;
+    }
+
+    // 4. Disclose on the controlling terminal and prove re-entry. Until the
+    //    mutation handle is returned to the engine, every exit rolls it back.
+    const escrowNote =
+      (recoveryOutPath
+        ? `\n  Off-host plaintext copy written to:\n    ${recoveryOutPath}\n`
+        : "") +
+      (keychainMutation
+        ? `  Staged in the OS keyring pending rotation commit (service ${keychainMutation.stagingService}).\n`
+        : "");
+    opts.io.output.write(
+      "\n  ================ NEW RECOVERY KEY (rotation) ================\n" +
+        "  This is shown only on this terminal. Store it in your password\n" +
+        "  manager. It is NOT written inside the fortress directory.\n\n" +
+        `  Recovery key:\n    ${opts.recoveryKey}\n` +
+        escrowNote +
+        "  ============================================================\n"
+    );
+    opts.err.write(
+      "\n  NOTE: this NEW recovery key becomes active only when the rotation\n" +
+        "  completes. Your previous recovery key stops working at that point.\n\n"
+    );
+    try {
+      await verifyRecoveryKeyReentry({ check: opts.verify, io: opts.io });
+    } catch {
+      return false;
+    }
+    mutationTransferred = true;
+    return {
+      captured: true,
+      commit: async () => {
+        await keychainMutation?.commit();
+        fileMutation?.commit();
+      },
+      rollback: rollbackMutations,
+    };
+  } finally {
+    if (!mutationTransferred) await rollbackMutations();
   }
 }
 
@@ -319,6 +421,7 @@ export async function runRotateMasterCommand(
 
   const storagePath =
     parsed.storage ?? args.storagePath ?? resolveStoragePath(process.env, home);
+  const statePath = join(storagePath, "state");
   let recoveryKeyFilePath: string | undefined;
   try {
     recoveryKeyFilePath = resolveRecoveryKeyOutputPath({
@@ -327,13 +430,18 @@ export async function runRotateMasterCommand(
       env: process.env,
     });
     if (recoveryKeyFilePath) {
-      await preflightRecoveryKeyOutputFile(recoveryKeyFilePath);
+      try {
+        await preflightRecoveryKeyOutputFile(recoveryKeyFilePath);
+      } catch (error) {
+        if (!(await mayBePendingRecoveryFileRetry(statePath, recoveryKeyFilePath))) {
+          throw error;
+        }
+      }
     }
   } catch (e) {
     err.write(`${e instanceof Error ? e.message : String(e)}\n`);
     return 1;
   }
-  const statePath = join(storagePath, "state");
   const fortressId = fortressIdFromStoragePath(storagePath);
   const fortressName = basename(storagePath) || "sanctuary";
 
@@ -366,6 +474,7 @@ export async function runRotateMasterCommand(
     err.write(q);
     return lines.next();
   };
+  let keychainKey: Uint8Array | null = null;
 
   try {
     const storage = new FilesystemStorage(statePath);
@@ -388,6 +497,14 @@ export async function runRotateMasterCommand(
         fortressId,
         passphrase,
         log: (line) => err.write(`${line}\n`),
+        adoptRecoveryEscrow: (authority, verify, rotationId) =>
+          adoptRecoveryKeyRotationInKeychain(
+            storagePath,
+            rotationId,
+            authority,
+            verify,
+            args.recoveryKeychain ?? { home },
+          ),
       });
       out.write(
         `\nRotation ${result.rotation_id} resumed to completion.\n` +
@@ -399,19 +516,36 @@ export async function runRotateMasterCommand(
 
     // Keychain custody key (re-creates the keychain wrap where the OS
     // keyring is available; null elsewhere - surfaced in the plan summary).
-    let keychainKey: Uint8Array | null = null;
     const envelope = await readCustodyEnvelope(storage);
     if (envelope?.wraps.some((w) => w.type === "keychain")) {
-      keychainKey = await getOrCreateKeychainCustodyKey(storagePath, { home });
+      const getKeychainKey =
+        args.getKeychainCustodyKey ?? getOrCreateKeychainCustodyKey;
+      keychainKey = await getKeychainKey(storagePath, { home });
     }
 
-    const result = await rotateMaster({
+    const rotate = args.rotateMasterImpl ?? rotateMaster;
+    const result = await rotate({
       storage,
       fortressPath: storagePath,
       fortressId,
       passphrase,
       ...(keychainKey ? { keychainKey } : {}),
       log: (line) => err.write(`${line}\n`),
+      reconcilePendingRecoveryEscrow: async (pending, verify) => {
+        for (const authority of pending.authorities) {
+          if (authority.kind === "os-keyring") {
+            await reconcilePendingRecoveryKeyRotationInKeychain(
+              storagePath,
+              pending.rotation_id,
+              authority,
+              verify,
+              args.recoveryKeychain ?? { home },
+            );
+          } else {
+            await reconcileRotationRecoveryKeyFile(authority, verify);
+          }
+        }
+      },
       approve: async (summary) => {
         out.write(renderSummary(summary));
         out.write(
@@ -433,14 +567,22 @@ export async function runRotateMasterCommand(
         }
         return true;
       },
-      captureRecoveryKey: async (recoveryKey, verify) => {
+      captureRecoveryKey: async (
+        recoveryKey,
+        verify,
+        rotationId,
+        registerPendingAuthority,
+      ) => {
         const captureOptions: Parameters<typeof captureRotatedRecoveryKey>[0] = {
           recoveryKey,
           verify,
           storagePath,
           fortressId,
+          rotationId,
+          registerPendingAuthority,
           io,
           err,
+          recoveryKeychain: args.recoveryKeychain ?? { home },
         };
         if (recoveryKeyFilePath) {
           captureOptions.recoveryKeyFilePath = recoveryKeyFilePath;
@@ -457,7 +599,6 @@ export async function runRotateMasterCommand(
         "The old master, old recovery key, and legacy key markers are retired.\n" +
         "Save the NEW recovery key you just verified.\n"
     );
-    if (keychainKey) keychainKey.fill(0);
     return 0;
   } catch (e) {
     if (e instanceof RotationPreflightError || e instanceof RotationResumeError) {
@@ -469,6 +610,7 @@ export async function runRotateMasterCommand(
     );
     return 1;
   } finally {
+    keychainKey?.fill(0);
     lines.close();
   }
 }

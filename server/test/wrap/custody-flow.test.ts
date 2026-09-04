@@ -284,6 +284,59 @@ describe("establishWrapCustody", () => {
     ).toHaveLength(1);
   });
 
+  it("does not invoke explicit-passphrase persistence when custody authentication fails", async () => {
+    await establishWrapCustody({
+      storagePath: fortress,
+      passphrase: "current-passphrase",
+      interactive: false,
+    });
+    let persistCalls = 0;
+
+    await expect(
+      establishWrapCustody({
+        storagePath: fortress,
+        passphrase: "wrong-replacement",
+        interactive: false,
+        persistAuthenticatedPassphrase: async () => {
+          persistCalls += 1;
+          return { location: "test-keyring", source: "keychain" };
+        },
+      }),
+    ).rejects.toThrow(/unlock|credential|passphrase/i);
+
+    expect(persistCalls).toBe(0);
+    const unlocked = await establishMaster({
+      storage: new FilesystemStorage(join(fortress, "state")),
+      passphrase: "current-passphrase",
+    });
+    expect(unlocked.envelope).not.toBeNull();
+  });
+
+  it("persists an explicit passphrase only after the committed envelope reads back", async () => {
+    let observedCommittedEnvelope = false;
+    const result = await establishWrapCustody({
+      storagePath: fortress,
+      passphrase: "authenticated-passphrase",
+      interactive: false,
+      persistAuthenticatedPassphrase: async () => {
+        const storage = new FilesystemStorage(join(fortress, "state"));
+        const envelope = await readCustodyEnvelope(storage);
+        const unlocked = await establishMaster({
+          storage,
+          passphrase: "authenticated-passphrase",
+        });
+        observedCommittedEnvelope = envelope !== null && unlocked.envelope !== null;
+        return { location: "test-keyring", source: "keychain" };
+      },
+    });
+
+    expect(observedCommittedEnvelope).toBe(true);
+    expect(result.persistedPassphrase).toEqual({
+      location: "test-keyring",
+      source: "keychain",
+    });
+  });
+
   it("a wrong passphrase against an envelope fortress fails closed (no parallel master)", async () => {
     await establishWrapCustody({
       storagePath: fortress,

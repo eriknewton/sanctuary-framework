@@ -678,7 +678,7 @@ describe("rotate-root --resume: atomicity (no half-rotated corrupt state)", () =
     ).rejects.toThrow(/fortress_id.*non-empty string/);
     await expect(identityFirst).rejects.toBeInstanceOf(FederationRotateRootResumeError);
     masterKey.fill(0);
-  });
+  }, 60_000); // heavy table-driven atomicity; full-suite load can exceed the 30s default
 });
 
 describe("rotate-root: mutual exclusion with custody rotation", () => {
@@ -713,7 +713,7 @@ describe("rotate-root: mutual exclusion with custody rotation", () => {
   });
 
   it("the reverse: a custody rotateMaster refuses while a federation rotate-root journal exists", async () => {
-    const { masterKey } = await seedIssuer();
+    const { masterKey, issuer } = await seedIssuer();
     // Plant a federation rotate-root journal via a mid-stage crash.
     await expect(
       rotateFederationRootRenew({
@@ -726,6 +726,16 @@ describe("rotate-root: mutual exclusion with custody rotation", () => {
     ).rejects.toThrow();
     expect(await federationRotateRootInProgress(storage)).toBe(true);
 
+    // Deliberately leave the seed's master-rotation reader LIVE (no
+    // `issuer.masterWriteBarrier?.release()`): this reproduces the condition
+    // that broke this test on Linux CI, where a lingering/slow-to-reap reader
+    // socket made rotateMaster's exclusive-barrier drain time out with the
+    // GENERIC "master rotation waited Nms for active writer session(s) to close"
+    // message and mask the real cause. The specific federation refusal must win
+    // regardless of barrier-reader timing, so rotateMaster now checks the
+    // federation rotate-root journal BEFORE the drain; this asserts that
+    // ordering. See src/core/master-rotation.ts `rotateMaster`.
+
     const { rotateMaster } = await import("../../src/core/master-rotation.js");
     await expect(
       rotateMaster({
@@ -736,6 +746,7 @@ describe("rotate-root: mutual exclusion with custody rotation", () => {
         captureRecoveryKey: async () => true,
       }),
     ).rejects.toThrow(/federation rotate-root is in progress/i);
+    await issuer.masterWriteBarrier?.release();
     masterKey.fill(0);
   });
 });

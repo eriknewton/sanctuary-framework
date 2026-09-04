@@ -122,12 +122,12 @@ below) when:
 - the Secret Service daemon refuses the connection or the user cancels the
   keyring unlock prompt.
 
-This mirrors the macOS behavior of falling through to the fallback file when
-`/usr/bin/security` writes fail.
+Reading an already-existing fallback is compatible with the macOS recovery
+behavior. It does not authorize generated Linux custody to create that file.
 
 > **Sovereign-custody change (2026-06-12, F3).** Sanctuary no longer
 > *generates* a passphrase into the fallback file when the keyring is
-> unusable — a machine-bound secret the user never saw was a lockout
+> unusable — a locally derived secret the user never saw was a lockout
 > generator (lose the machine, lose the fortress). Generation now fails
 > closed (`SilentCustodyRefusedError`) with remediation options. The
 > fallback file remains fully supported for **reading** passphrases
@@ -147,11 +147,13 @@ passphrase to an encrypted fallback file:
 | Default       | `~/.sanctuary/passphrase.enc`                   |
 | Per-tenant    | `<storage_path>/passphrase.enc`                 |
 
-The file is AES-256-GCM ciphertext (12-byte IV prepended) under a machine-local
-key derived via HKDF-SHA256 from `hostname + uid + username + home`. This is
-not cryptographically strong authentication: anyone with local read access can
-re-derive the key. The protection it provides is "the file cannot be copied off
-this machine and decrypted on another."
+The file is AES-256-GCM ciphertext (12-byte IV prepended) under a locally
+derived key using HKDF-SHA256 over `hostname + uid + username + home`. This is
+not hardware-backed and is not a cryptographic machine-binding primitive:
+anyone with local read access can re-derive the key, and cloned/snapshotted host
+identity material defeats the portability deterrent. Treat it as encrypted
+disk-local compatibility custody for a user-held secret, not as a hardware or
+OS-keyring security claim.
 
 > **Threat model warning.** The fallback-file derivation uses a machine-local
 > key from `hostname`, `uid`, `username`, and `home` directory. This is not
@@ -411,6 +413,46 @@ entry exists for the same tenant.
 
 The default-path tenant (`~/.sanctuary`) is unaffected by this change; its
 service name is always the un-suffixed `sanctuary-passphrase`.
+
+### Realpath-canonical service naming (symlink alias consolidation)
+
+`keychainServiceFor()`'s `path.resolve()` canonicalization is lexical only:
+it normalizes `.`, `..`, doubled separators, and trailing slashes, but it
+does not follow symlinks. A fortress reached through a symlink alias and the
+same fortress reached through its real path therefore resolved to two
+different lexical paths, hashed to two different service-name suffixes, and
+so held two different credentials; the alias route could not find the
+credential stored for the real-path route (an orphaned custody).
+
+`canonicalKeychainServiceFor()` in
+[`src/wrap/passphrase.ts`](../src/wrap/passphrase.ts) fixes this by
+symlink-resolving (`realpath`) the storage path before hashing, so an alias
+and its real path collapse to one canonical identity. It matches the
+existing lexical name whenever every existing path component is already
+canonical, and diverges only when an ancestor is a symlink. **Writes now
+target this canonical realpath name.** Reads try, in order: the canonical
+realpath 16-hex name, the pre-realpath lexical 16-hex name (a symlink-reached
+fortress's legacy credential), the canonical realpath 12-hex name (a pre-v1.2.3
+entry reached by an alias), then the pre-realpath lexical 12-hex name; the list
+is de-duplicated, so it collapses back to the two pre-realpath names when no
+ancestor is a symlink. Consolidating an existing lexical entry into the
+canonical name is a writable authority with no shipped consumer today, so it
+is deliberately not implemented; a legacy lexical entry stays readable
+indefinitely rather than being migrated in place.
+
+### Rotation-staging service (temporary, recovery-key rotation only)
+
+During a master rotation that carries an OS-keyring recovery-key escrow, the
+rotated recovery key is staged into a temporary OS-keyring entry named
+`<canonical-recovery-key-service>:rotation:<rotationId>` before the rotation
+commits, authenticated by the durable `rotation-recovery-pending` (`_meta`)
+escrow record so a crash between staging and commit can resume or roll back
+deterministically. The staging entry is removed on both a successful commit
+and a rollback; a staging entry that survives either is a defect, not an
+expected residue. This is a distinct, temporary keyring service in the
+recovery-key family (`canonicalRecoveryKeyServiceFor()` in
+[`src/wrap/keychain-custody.ts`](../src/wrap/keychain-custody.ts)), never a
+fourth read-path alias: ordinary credential reads never consult it.
 
 ---
 

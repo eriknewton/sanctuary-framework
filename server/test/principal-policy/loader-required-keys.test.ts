@@ -10,9 +10,27 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { parsePolicy } from "../../src/principal-policy/loader.js";
+import {
+  NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS,
+  NON_RELAXABLE_MEMORY_PLAINTEXT_TIER1_OPERATIONS,
+  parsePolicy,
+} from "../../src/principal-policy/loader.js";
 
 describe("policy loader required-key enforcement (#68)", () => {
+  it("pins the complete plaintext/recovery-material memory egress set", () => {
+    expect([
+      ...NON_RELAXABLE_MEMORY_PLAINTEXT_TIER1_OPERATIONS,
+      ...NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS.filter(
+        (operation) => operation === "memory_archive_export",
+      ),
+    ].sort())
+      .toEqual([
+        "memory_archive_export",
+        "memory_emit",
+        "memory_transcode",
+        "memory_transcode_restore",
+      ]);
+  });
   it("throws when tier1_always_approve is missing from YAML", () => {
     const yaml = `
 version: 1
@@ -114,6 +132,9 @@ approval_channel:
       "memory_provenance_prune_signers",
       "memory_archive_export",
       "memory_archive_import",
+      "memory_emit",
+      "memory_transcode",
+      "memory_transcode_restore",
       "state_disclose_unattributed",
       "sdw_export",
       "sdw_import",
@@ -152,6 +173,9 @@ approval_channel:
       "memory_provenance_prune_signers",
       "memory_archive_export",
       "memory_archive_import",
+      "memory_emit",
+      "memory_transcode",
+      "memory_transcode_restore",
       "state_disclose_unattributed",
       "sdw_export",
       "sdw_import",

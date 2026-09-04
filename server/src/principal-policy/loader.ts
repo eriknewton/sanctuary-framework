@@ -197,6 +197,13 @@ export const NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS = [
   "memory_archive_import",
 ] as const;
 
+/** Plaintext materialization of the sovereign memory corpus is human-held. */
+export const NON_RELAXABLE_MEMORY_PLAINTEXT_TIER1_OPERATIONS = [
+  "memory_emit",
+  "memory_transcode",
+  "memory_transcode_restore",
+] as const;
+
 /**
  * Operator unattributed-disclosure surface (STATE-DISCLOSE-UNATTRIB-01):
  * `state_disclose_unattributed` hands an operator the plaintext of an entry
@@ -253,6 +260,7 @@ const FORCED_TIER1_OPERATIONS = [
   ...NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS,
   ...NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS,
   ...NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS,
+  ...NON_RELAXABLE_MEMORY_PLAINTEXT_TIER1_OPERATIONS,
   ...NON_RELAXABLE_STATE_DISCLOSURE_TIER1_OPERATIONS,
   ...NON_RELAXABLE_SDW_VAULT_TIER1_OPERATIONS,
 ] as const;

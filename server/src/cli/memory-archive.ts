@@ -27,7 +27,8 @@ import { IdentityManager } from "../cognitive/tools.js";
 import type { ExitV2SdwMemoryManifest } from "../contracts/v1.2/exit-bundle-manifest.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { sign } from "../core/identity.js";
-import { resolveCliMasterKey } from "../core/master-custody.js";
+import { unlockLocalFortress } from "./local-fortress-unlock.js";
+import type { MasterWriteBarrierLease } from "../storage/cross-process-lock.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   exportExitV2SdwMemoryArchive,
@@ -111,7 +112,8 @@ export interface MemoryArchiveCommandArgs {
   readonly interaction?: PrivateMemoryArchiveInteraction | null;
   /** Test seam for the local OS dialog subprocess. */
   readonly dialogRunner?: MemoryArchiveDialogRunner;
-  readonly approvalChannel?: ApprovalChannel;
+  /** Test seam: observe the owned unlocked master without copying it. */
+  readonly observeMasterKey?: (master: Uint8Array) => void;
 }
 
 interface ParsedBadSigner {
@@ -149,6 +151,13 @@ interface Bootstrapped {
   readonly journalStorage: FilesystemStorage;
   readonly admissionWriteGuard: ExitAdmissionWriteGuard;
   readonly masterKey: Uint8Array;
+  /**
+   * Shared master-rotation barrier held for this write session (S1). Bound to
+   * `journalStorage` (the RAW backend whose `write` the guard delegates to, so
+   * the local write fence keys on the right instance). Released in `dispose`
+   * AFTER the final audit flush; a concurrent rotate-master serializes behind it.
+   */
+  readonly barrier?: MasterWriteBarrierLease;
   readonly identityKey: Uint8Array;
   readonly auditLog: AuditLog;
   readonly baseline: BaselineTracker;
@@ -191,7 +200,7 @@ export async function runMemoryArchiveExportCommand(
   let disclosed = false;
   let transferKey: Uint8Array | undefined;
   try {
-    boot = await bootstrap(parsed, args.env ?? process.env, err);
+    boot = await bootstrap(parsed, args.env ?? process.env, err, args.observeMasterKey);
     if (!boot) return 1;
     if (await exists(parsed.outputPath)) {
       write(err, "memory_archive_export failed: output path already exists\n");
@@ -209,7 +218,7 @@ export async function runMemoryArchiveExportCommand(
     const gate = new ApprovalGate(
       await loadPrincipalPolicy(parsed.fortressPath),
       boot.baseline,
-      args.approvalChannel ?? interaction,
+      interaction,
       boot.auditLog,
     );
     const decision = await gate.evaluate("memory_archive_export", approvalArgs);
@@ -380,7 +389,7 @@ export async function runMemoryArchiveImportCommand(
     // Verification consumes and clears its caller-owned key buffer.
     transferKey = undefined;
 
-    boot = await bootstrap(parsed, args.env ?? process.env, err);
+    boot = await bootstrap(parsed, args.env ?? process.env, err, args.observeMasterKey);
     if (!boot) return 1;
 
     const approvalArgs = {
@@ -394,7 +403,7 @@ export async function runMemoryArchiveImportCommand(
     const gate = new ApprovalGate(
       await loadPrincipalPolicy(parsed.fortressPath),
       boot.baseline,
-      args.approvalChannel ?? interaction,
+      interaction,
       boot.auditLog,
     );
     const decision = await gate.evaluate("memory_archive_import", approvalArgs);
@@ -541,12 +550,12 @@ export async function runMemoryProvenancePruneSignersCommand(
   if (interaction === null) return 1;
   let boot: Bootstrapped | null = null;
   try {
-    boot = await bootstrap(parsed, args.env ?? process.env, err);
+    boot = await bootstrap(parsed, args.env ?? process.env, err, args.observeMasterKey);
     if (boot === null) return 1;
     const gate = new ApprovalGate(
       await loadPrincipalPolicy(parsed.fortressPath),
       boot.baseline,
-      args.approvalChannel ?? interaction,
+      interaction,
       boot.auditLog,
     );
     const decision = await gate.evaluate(operation, { agent_id: null });
@@ -589,7 +598,7 @@ async function runMemoryProvenanceBadSignerCommand(
   if (interaction === null) return 1;
   let boot: Bootstrapped | null = null;
   try {
-    boot = await bootstrap(parsed, args.env ?? process.env, err);
+    boot = await bootstrap(parsed, args.env ?? process.env, err, args.observeMasterKey);
     if (boot === null) return 1;
     const gateArgs = {
       agent_id: null,
@@ -600,7 +609,7 @@ async function runMemoryProvenanceBadSignerCommand(
     const gate = new ApprovalGate(
       await loadPrincipalPolicy(parsed.fortressPath),
       boot.baseline,
-      args.approvalChannel ?? interaction,
+      interaction,
       boot.auditLog,
     );
     const decision = await gate.evaluate(operation, gateArgs);
@@ -640,25 +649,43 @@ async function bootstrap(
   parsed: Pick<ParsedExport, "fortressPath" | "ownerRef">,
   env: NodeJS.ProcessEnv,
   err: Writable,
+  observeMasterKey?: (master: Uint8Array) => void,
 ): Promise<Bootstrapped | null> {
-  const passphrase = env.SANCTUARY_PASSPHRASE;
-  const recoveryKey = env.SANCTUARY_RECOVERY_KEY;
-  if (!passphrase && !recoveryKey) {
-    write(err, "Error: fortress recovery material is required.\n");
-    return null;
-  }
   let masterKey: Uint8Array | undefined;
   let identityKey: Uint8Array | undefined;
+  // Held across the whole verb; released in dispose or on the failure path
+  // below so a construction throw after unlock cannot strand the lease (S1).
+  let barrier: MasterWriteBarrierLease | undefined;
   try {
     await access(parsed.fortressPath);
     const journalStorage = new FilesystemStorage(join(parsed.fortressPath, "state"));
     const admissionWriteGuard = createExitAdmissionWriteGuard(journalStorage);
     const storage = admissionWriteGuard.storage;
-    masterKey = await resolveCliMasterKey(storage, {
-      ...(passphrase !== undefined ? { passphrase } : {}),
-      ...(recoveryKey !== undefined ? { recoveryKey } : {}),
-      storagePathHint: parsed.fortressPath,
+    // Unlock via the shared local-fortress chokepoint. This carriage accepts
+    // credentials from env ONLY (argv secrets are refused upstream; there is no
+    // stdin verb), then falls back to the EXACT-fortress OS keyring so a second
+    // host whose passphrase is already stored by `protect` can open the archive
+    // without re-typing a secret. `parsed.fortressPath` is the exact fortress
+    // path, so the keyring lookup is namespaced to THIS fortress. Never generates.
+    const unlocked = await unlockLocalFortress({
+      storage,
+      storagePath: parsed.fortressPath,
+      env,
+      // This carriage appends master-derived audit/provenance entries; hold the
+      // shared rotation barrier across the whole verb so a concurrent
+      // rotate-master serializes or the write fails closed (S1). Bind it to the
+      // RAW journalStorage because the admission write guard delegates `write`
+      // to it, and the local write fence keys on the instance that writes.
+      writeIntent: true,
+      barrierStorage: journalStorage,
     });
+    if (!unlocked.ok) {
+      write(err, `Error: could not unlock the fortress: ${unlocked.message}\n`);
+      return null;
+    }
+    masterKey = unlocked.masterKey;
+    barrier = unlocked.barrier;
+    observeMasterKey?.(masterKey);
     const identityManager = new IdentityManager(storage, masterKey);
     const loaded = await identityManager.load();
     const primary = identityManager.getDefault();
@@ -737,6 +764,7 @@ async function bootstrap(
       admissionWriteGuard,
       masterKey,
       identityKey,
+      ...(barrier !== undefined ? { barrier } : {}),
       auditLog: memoryArchiveAuditLog,
       baseline: new BaselineTracker(storage, masterKey),
       adapter,
@@ -756,6 +784,9 @@ async function bootstrap(
   } catch {
     identityKey?.fill(0);
     masterKey?.fill(0);
+    // A throw AFTER a successful writeIntent unlock owns the lease here (the
+    // return object was never built); release it so it cannot block rotation.
+    await barrier?.release().catch(() => undefined);
     write(err, "Error: could not open or unlock the fortress.\n");
     return null;
   }
@@ -763,9 +794,12 @@ async function bootstrap(
 
 async function dispose(boot: Bootstrapped | null): Promise<void> {
   if (!boot) return;
+  // Flush is this carriage's final master-derived write; release the rotation
+  // barrier AFTER it so we release after the last write (S1 / AGENTS rule 12).
   await boot.auditLog.flush().catch(() => undefined);
   boot.identityKey.fill(0);
   boot.masterKey.fill(0);
+  await boot.barrier?.release().catch(() => undefined);
 }
 
 async function readBundle(inputPath: string): Promise<{
@@ -836,6 +870,14 @@ function resolveInteraction(
     return null;
   }
   if (injected !== undefined) return injected;
+  return createLocalHumanApprovalInteraction(dialogRunner, err);
+}
+
+/** Shared human-held approval boundary for plaintext memory CLI operations. */
+export function createLocalHumanApprovalInteraction(
+  dialogRunner: MemoryArchiveDialogRunner | undefined,
+  err: Writable,
+): PrivateMemoryArchiveInteraction | null {
   if (process.platform !== "darwin" && dialogRunner === undefined) {
     // A PTY cannot prove a local human. Platforms without the reviewed local
     // dialog boundary fail closed until they gain an equivalent OS primitive.
@@ -1207,9 +1249,9 @@ async function exists(path: string): Promise<boolean> {
 }
 
 function printExportHelp(out: Writable): void {
-  write(out, `Usage: sanctuary memory_archive_export --archive-id <id> --out <dir> --owner-ref <id> --fortress <path> [options]\n\nExports one completed SDW transcode archive through Exit V2 after Tier-1 approval.\nRecovery material is shown once in a local OS dialog and must be re-entered before success.\nFortress custody is read from SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY, never argv.\n\nOptions:\n  --owner-ref <id>       Required exact SDW owner scope.\n  --json                 Emit a metadata-only JSON receipt.\n  --help, -h             Show this help.\n`);
+  write(out, `Usage: sanctuary memory_archive_export --archive-id <id> --out <dir> --owner-ref <id> --fortress <path> [options]\n\nExports one completed SDW transcode archive through Exit V2 after Tier-1 approval.\nRecovery material is shown once in a local OS dialog and must be re-entered before success.\nFortress custody is read from SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY, then falls back to the exact-fortress stored credential; never argv.\n\nOptions:\n  --owner-ref <id>       Required exact SDW owner scope.\n  --json                 Emit a metadata-only JSON receipt.\n  --help, -h             Show this help.\n`);
 }
 
 function printImportHelp(out: Writable): void {
-  write(out, `Usage: sanctuary memory_archive_import --in <dir> --owner-ref <id> --fortress <path> [options]\n\nAuthenticates one Exit V2 SDW memory archive before any destination write, then imports it after Tier-1 approval.\nRecovery material is read through a hidden local OS dialog and is re-entered after approval.\nFortress custody is read from SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY, never argv.\n\nOptions:\n  --owner-ref <id>       Required exact destination SDW owner scope.\n  --json                 Emit a metadata-only JSON receipt.\n  --help, -h             Show this help.\n`);
+  write(out, `Usage: sanctuary memory_archive_import --in <dir> --owner-ref <id> --fortress <path> [options]\n\nAuthenticates one Exit V2 SDW memory archive before any destination write, then imports it after Tier-1 approval.\nRecovery material is read through a hidden local OS dialog and is re-entered after approval.\nFortress custody is read from SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY, then falls back to the exact-fortress stored credential; never argv.\n\nOptions:\n  --owner-ref <id>       Required exact destination SDW owner scope.\n  --json                 Emit a metadata-only JSON receipt.\n  --help, -h             Show this help.\n`);
 }

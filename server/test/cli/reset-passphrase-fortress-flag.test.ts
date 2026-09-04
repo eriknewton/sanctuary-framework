@@ -112,6 +112,21 @@ describe("reset-passphrase --fortress flag", () => {
     expect(err.text).toContain(tmpDir);
   });
 
+  it("refuses conflicting --fortress and --storage aliases", async () => {
+    const err = new StringWritable();
+    const code = await runResetPassphraseCommand({
+      argv: ["--fortress", tmpDir, "--storage", "/different", "--mode", "nuke"],
+      out: new StringWritable(),
+      err,
+      stdin: stdinFromLines([]),
+    });
+    expect(code).toBe(2);
+    expect(err.text).toMatch(/^Error: /);
+    expect(err.text).toContain("--fortress");
+    expect(err.text).toContain("--storage");
+    expect(err.text).toMatch(/both|alias|conflict/i);
+  });
+
   it("refuses missing fortress and storage values before resolving the default fortress", async () => {
     for (const flag of ["--fortress", "--storage"]) {
       const out = new StringWritable();
@@ -124,7 +139,8 @@ describe("reset-passphrase --fortress flag", () => {
         storagePath: tmpDir,
       });
 
-      expect(code).toBe(1);
+      expect(code).toBe(2);
+      expect(err.text).toMatch(/^Error: /);
       expect(err.text).toContain(`${flag} requires a value`);
     }
   });

@@ -38,7 +38,12 @@ Or substitute `--hermes`, `--claude-code`, `--cursor`, `--cline`, `--mastra`, or
 
 What happens when you run protect:
 
-1. A passphrase is generated and stored in the macOS Keychain (or an encrypted fallback file on Linux/Windows).
+1. A generated passphrase is stored only in the macOS Keychain or Linux Secret Service. On Linux, generation fails closed if Secret Service is absent, locked, or unreachable. An encrypted local fallback remains readable for legacy credentials and writable for a passphrase the user explicitly supplies, but it is neither hardware-backed nor cryptographically machine-bound. Windows can open an already-enveloped fortress for authenticated custody read with an available credential (with platform-specific directory-fsync tolerance after the file itself is durable), but custody creation, migration, rekey, reset, and `restore-attest` remain unavailable until a crash-recoverable cross-process lock is implemented; install readiness therefore stays fail-closed. Every memory verb, `memory_ingest`, `memory_emit`, `memory_transcode`, `memory_transcode_restore`, and memory/archive export and import, requires the reviewed local-human approval dialog, which is macOS-only; Linux and Windows fail closed on all of them, so no shipped memory or archive export verb runs on Windows.
+
+Custody mutation locking is a same-host, same-runtime-namespace guarantee. The
+fortress and its private socket runtime must be on local filesystems; known
+shared/network/FUSE filesystems are refused rather than presenting a local Unix
+socket as cross-host exclusion.
 2. Your existing harness config is backed up to `~/.sanctuary/backup/`.
 3. The config is rewritten so every tool call routes through Sanctuary.
 4. The Sovereignty Dashboard starts on `http://localhost:3501` (or the next free port up to 3510) and opens in your browser with a one-click auth token.
@@ -126,6 +131,16 @@ release artifact or explicitly supplied drill candidate must already be
 installed. See [Agent-guided installation](docs/agent-guided-install.md) for the
 contract and cold-install acceptance criterion.
 
+For fresh-host and second-machine memory onboarding (first-use proof with the
+MCP tools, restart persistence, portability and archive transfer, opening a
+fortress on a second host from its exact-fortress stored credential, and
+recovering with your recovery key), see
+[Rung 1: fresh-host sovereign-memory onboarding](docs/rung1-fresh-host.md).
+For a copied fortress or lost passphrase, begin with the hidden-prompt
+`sanctuary reset-passphrase --mode recovery-key --fortress <path>` path; it
+preserves custody and data. Nuke is a destructive last resort, not a recovery
+shortcut.
+
 ---
 
 ## Installation reference
@@ -207,7 +222,7 @@ Sanctuary is designed to run the same rights substrate in three places. Local mo
 
 | Mode | Status | What it is | Who picks this |
 |---|---|---|---|
-| **On your machines** (Local) | Shipping | Runs on the Macs, Linux boxes, or Windows machines you already own. On macOS with the wall armed, unauthorized outbound is blocked below the agent; on Linux and Windows today this is cooperative policy-gating plus local custody. | Self-hosters, privacy-maximalists, anyone who already runs a homelab. |
+| **On your machines** (Local) | Shipping on macOS/Linux | Runs on Macs and Linux boxes you already own. On macOS with the wall armed, unauthorized outbound is blocked below the agent; Linux currently provides cooperative policy-gating plus local custody. Windows cooperative and authenticated read-only custody surfaces may run when an exact-fortress stored fallback opens the envelope, but custody mutation and install readiness fail closed until a crash-recoverable cross-process lock is implemented. | Self-hosters, privacy-maximalists, anyone who already runs a homelab. |
 | **In your cloud** (Operator cloud) | Roadmapped | Runs in your own GCP / Azure / AWS account with operator-approved scoped node custody. The provider is inside the node runtime trust boundary until sovereign TEE mode is verified by hardware attestation. | Prosumers, small businesses, operators with light IT but no rack at home. |
 | **In a sealed cloud box we manage** (Sovereign-managed TEE) | Roadmapped (v2) | Runs on hardware Sanctuary operates, but the hardware proves to your console that even Sanctuary cannot see what's inside. You hold the keys; we hold the metal. | Regulated industries, operators who want sovereignty without operational burden. |
 
@@ -302,7 +317,7 @@ For AI coding agents handling install failures, here are the common cases.
 - The protect command may have failed to write to the Keychain (typically a permissions prompt the operator dismissed). Rerun the protect command and approve the Keychain prompt when it appears.
 
 **Install Step 3 (b) on Linux or Windows:**
-- The keychain check is macOS-specific. On Linux, Sanctuary uses Secret Service when available and falls back to an encrypted file at `~/.sanctuary/passphrase.enc`. Windows Credential Manager support is queued on the patch track. Test the fallback with `test -f ~/.sanctuary/passphrase.enc && echo "passphrase=ok"`.
+- The Keychain check is macOS-specific. On Linux, generated custody requires a working, unlocked Secret Service and fails closed without it. Sanctuary may read `~/.sanctuary/passphrase.enc` for a legacy or explicitly user-supplied credential, and may write that file only for an explicitly user-supplied passphrase; that encrypted local file is not hardware-backed or cryptographically machine-bound. Test only for expected user-supplied/legacy fallback residue with `test -f ~/.sanctuary/passphrase.enc && echo "fallback-file=present"`. On Windows, an existing authenticated exact-fortress fallback may make read-only custody usable, but custody mutation is unavailable and install readiness remains blocked until a crash-recoverable cross-process lock is implemented.
 
 **Install Step 3 (c) "identities=ok" check fails:**
 - Confirm protect completed without error. If it did, check `~/.sanctuary/identities/` for `.enc` files. If absent, the protect command exited early; rerun with `--dry-run` to see what it would do, then without to retry.

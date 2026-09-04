@@ -37,7 +37,7 @@ before invoking `sanctuary wrap` for each agent.
 | `SANCTUARY_DASHBOARD_HOST` | Dashboard bind host. | `127.0.0.1` |
 | `SANCTUARY_WEBHOOK_CALLBACK_PORT` | Webhook approval callback listener port. | `3502` |
 | `SANCTUARY_WEBHOOK_CALLBACK_HOST` | Webhook callback bind host. | `127.0.0.1` |
-| `SANCTUARY_PASSPHRASE` | Explicit passphrase for this agent. If unset, one is generated and stored in Keychain (macOS) or an encrypted fallback file under the storage path. | *unset* |
+| `SANCTUARY_PASSPHRASE` | Explicit passphrase for this agent. If unset, one is generated and stored in Keychain (macOS) or Secret Service (Linux). Linux generation fails closed if Secret Service is unavailable; only an explicit user-supplied or legacy credential may use the encrypted local fallback. | *unset* |
 
 **Rule of thumb:** the only variable you *must* set for multi-tenancy is
 `SANCTUARY_STORAGE_PATH`. Everything else isolates automatically once the
