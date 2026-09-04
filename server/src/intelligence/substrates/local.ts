@@ -573,6 +573,10 @@ async function readBoundedText(
       const room = maxBytes - bytes;
       if (chunk.value.byteLength >= room) {
         text += decoder.decode(chunk.value.subarray(0, room), { stream: true });
+        // Account the decoded prefix so `bytes` equals the snippet's true size on
+        // exit; nothing reads it after the break today, and the count must not
+        // silently drift if something does.
+        bytes += room;
         break;
       }
       bytes += chunk.value.byteLength;
