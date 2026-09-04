@@ -18,6 +18,7 @@ import { unlockLocalFortress } from "../../src/cli/local-fortress-unlock.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { establishMaster } from "../../src/core/master-custody.js";
+import { establishWrapCustody } from "../../src/wrap/custody-flow.js";
 import { deriveMasterKey } from "../../src/core/key-derivation.js";
 import { stringToBytes } from "../../src/core/encoding.js";
 import {
@@ -381,8 +382,12 @@ describe("unlockLocalFortress read-only sessions", () => {
       });
       expect(r.ok).toBe(false);
       if (!r.ok) {
-        expect(r.failure).toBe("other");
+        // Its OWN code, never a credential code: the credential resolved and
+        // is valid here, and only the migration write was refused.
+        expect(r.failure).toBe("migration_required");
+        expect(r.failure).not.toBe("absent");
         expect(r.message).toContain("read-only command will not migrate it");
+        expect(r.message).toContain("the credential is valid");
         expect(r.message).not.toContain(PASSPHRASE);
       }
       // The migration's write is what the flag exists to prevent.
@@ -404,6 +409,38 @@ describe("unlockLocalFortress read-only sessions", () => {
       });
       expect(r.ok).toBe(true);
       expect(await legacy.storage.read("_meta", "custody-envelope")).not.toBeNull();
+    } finally {
+      await legacy.cleanup();
+    }
+  });
+
+  it("migrates through the custody path `sanctuary protect` runs", async () => {
+    // The refusal above names `sanctuary protect` as the remedy, so that verb
+    // must actually perform the migration. `wrap/cli.ts` reaches it through
+    // `establishWrapCustody`, which is the path exercised here; a remedy that
+    // does not resolve the state it names is worse than none.
+    const legacy = await seedLegacyFortress();
+    try {
+      const result = await establishWrapCustody({
+        storagePath: legacy.storagePath,
+        passphrase: PASSPHRASE,
+        interactive: false,
+      });
+      result.masterKey.fill(0);
+      expect(result.origin).toBe("migrated-passphrase");
+      expect(result.envelope).not.toBeNull();
+      expect(await legacy.storage.read("_meta", "custody-envelope")).not.toBeNull();
+
+      // And the state the operator was told to clear is now clear: the same
+      // read-only unlock that refused before now succeeds.
+      const r = await unlockLocalFortress({
+        storage: legacy.storage,
+        storagePath: legacy.storagePath,
+        env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+        readOnly: true,
+      });
+      expect(r.ok).toBe(true);
+      if (r.ok) r.masterKey.fill(0);
     } finally {
       await legacy.cleanup();
     }

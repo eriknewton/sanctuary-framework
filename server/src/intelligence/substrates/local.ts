@@ -300,11 +300,12 @@ export class LocalSubstrate {
   }
 
   static fromPick(client: OllamaClient, pick: LocalModelPick, customTag?: string): LocalSubstrate {
-    // The custom tag wins over the pick. The unarmed badge label in
-    // `intelligence/selector.ts` (`gatedLocalHandle`)
-    // must resolve in this same order;
-    // if the two disagree the operator is shown the name of a model this
-    // substrate never calls.
+    // The custom tag wins on both sides: the unarmed badge label in
+    // `intelligence/selector.ts` (`gatedLocalHandle`) must prefer the same
+    // `customTag` this constructor does, or the operator is shown the name of
+    // a model this substrate never calls. Past that one shared arm the two
+    // diverge on purpose, the label naming the pick for a human and this
+    // constructor naming the tag for Ollama.
     return new LocalSubstrate(client, customTag ?? LOCAL_MODEL_TAGS[pick]);
   }
 

@@ -94,13 +94,21 @@ export type LocalFortressCredentialSource =
  *  - "other":      any other custody-establishment refusal (rotation in
  *                  progress, orphaned state); the underlying message is
  *                  already secret-free and is surfaced verbatim.
+ *  - "migration_required": NOT a credential problem. The credential resolved
+ *                  and is valid, but this fortress predates the custody
+ *                  envelope and the caller declared {@link
+ *                  LocalFortressUnlockOptions.readOnly}, so the one-time
+ *                  migration write was refused. A caller that renders this as
+ *                  "no credential available" tells the operator to fix a
+ *                  credential that is already correct.
  */
 export type LocalFortressUnlockFailure =
   | "absent"
   | "locked"
   | "unreadable"
   | "mismatch"
-  | "other";
+  | "other"
+  | "migration_required";
 
 export type LocalFortressUnlockResult =
   | {
@@ -435,9 +443,9 @@ async function resolveLocalFortressMaster(
           // fortress shape that would actually have been migrated.
           return {
             ok: false,
-            failure: "other",
+            failure: "migration_required",
             message:
-              "this fortress still uses the pre-envelope custody format, and a read-only command will not migrate it; run a custody verb (for example `sanctuary protect`) on this fortress first",
+              "this fortress still uses the pre-envelope custody format, and a read-only command will not migrate it; the credential is valid, so run `sanctuary protect` on this fortress once to perform the one-time custody migration, then retry",
           };
         }
         // Compatibility only: a pre-envelope fortress needs one journaled

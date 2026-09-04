@@ -20,6 +20,7 @@ import { stringToBytes } from "../../src/core/encoding.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { deriveMasterKey } from "../../src/core/key-derivation.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { runLocalIntelligenceSetup } from "../../src/wrap/local-intelligence.js";
 import { runIntelligenceCommand, type DiagnoseDeps } from "../../src/cli/intelligence.js";
@@ -255,6 +256,8 @@ describe("sanctuary intelligence diagnose armed-state reporting (R2-F3)", () => 
  * machine-readable verdict follows the classification, and a record it could
  * not read is never reported as one that does not exist.
  */
+const LEGACY_PASSPHRASE = "diagnose-legacy-fortress-passphrase-not-a-real-secret";
+
 describe("sanctuary intelligence diagnose is read-only and closed-vocabulary (R2-F3)", () => {
   /** sha256 of every file under the fortress, keyed by relative path. */
   async function snapshot(root: string): Promise<Record<string, string>> {
@@ -370,6 +373,89 @@ describe("sanctuary intelligence diagnose is read-only and closed-vocabulary (R2
       expect(parsed.local_intelligence.remedy).toContain("SANCTUARY_PASSPHRASE");
       expect(humanErr).toContain("Local intelligence: unavailable (mismatch");
     });
+  });
+
+  /**
+   * A pre-envelope fortress: key-params and no custody envelope. Failure mode
+   * to expect if this fixture drifts: with no `key-params` marker the unlock
+   * refuses with "absent" (a genuine credential answer) and the test would
+   * assert the migration rendering against the wrong state.
+   */
+  async function seedLegacyFortress(): Promise<{
+    storagePath: string;
+    storage: FilesystemStorage;
+    cleanup: () => Promise<void>;
+  }> {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-diagnose-legacy-"));
+    const storagePath = join(dir, ".sanctuary");
+    const storage = new FilesystemStorage(join(storagePath, "state"));
+    const derived = await deriveMasterKey(LEGACY_PASSPHRASE);
+    await storage.write(
+      "_meta",
+      "key-params",
+      stringToBytes(JSON.stringify(derived.params)),
+    );
+    derived.key.fill(0);
+    return {
+      storagePath,
+      storage,
+      cleanup: () => rm(dir, { recursive: true, force: true }),
+    };
+  }
+
+  it("tells a pre-envelope fortress it needs a migration, not that its credential is missing", async () => {
+    const legacy = await seedLegacyFortress();
+    try {
+      // The REAL unlock chokepoint, with a valid credential in the env: the
+      // only reason this fortress will not open is the migration this
+      // read-only verb refuses to perform.
+      const deps: DiagnoseDeps = { env: { SANCTUARY_PASSPHRASE: LEGACY_PASSPHRASE } };
+      const jsonStreams = captureStreams();
+      await runIntelligenceCommand({
+        argv: ["diagnose", "--json", "--fortress", legacy.storagePath],
+        diagnoseDeps: deps,
+      });
+      const jsonOut = jsonStreams.out();
+      vi.restoreAllMocks();
+
+      const humanStreams = captureStreams();
+      await runIntelligenceCommand({
+        argv: ["diagnose", "--fortress", legacy.storagePath],
+        diagnoseDeps: deps,
+      });
+      const humanErr = humanStreams.err();
+      vi.restoreAllMocks();
+
+      const parsed = JSON.parse(jsonOut) as {
+        ok: boolean;
+        local_intelligence: {
+          state: string;
+          detail: string;
+          remedy: string;
+          credential_failure: string | null;
+        };
+      };
+      expect(parsed.local_intelligence.state).toBe("custody_migration_required");
+      expect(parsed.local_intelligence.detail).toContain("predates the custody envelope");
+      expect(parsed.local_intelligence.remedy).toContain("sanctuary protect");
+      // Not a credential problem: the credential resolved and is valid.
+      expect(parsed.local_intelligence.credential_failure).toBeNull();
+      expect(parsed.ok).toBe(false);
+      expect(humanErr).toContain("Local intelligence: custody_migration_required");
+      expect(humanErr).toContain("sanctuary protect");
+
+      // The credential-unavailable rendering must appear in NEITHER form.
+      for (const text of [jsonOut, humanErr]) {
+        expect(text).not.toContain("the fortress credential is not available");
+        expect(text).not.toContain("SANCTUARY_PASSPHRASE");
+        expect(text).not.toContain("keyring");
+        expect(text).not.toContain(LEGACY_PASSPHRASE);
+      }
+      // And the refusal held: reporting the state did not migrate the fortress.
+      expect(await legacy.storage.read("_meta", "custody-envelope")).toBeNull();
+    } finally {
+      await legacy.cleanup();
+    }
   });
 
   it("reports a record it could not read as indeterminate, not as absent", async () => {

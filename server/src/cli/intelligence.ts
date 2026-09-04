@@ -97,9 +97,12 @@ export interface DiagnoseDeps {
 
 /**
  * What `diagnose` can say about the durable local-intelligence record. The
- * unreadable arm exists because this verb requires no passphrase: on a host
- * with no available credential the honest answer is "not readable from here",
- * never "unarmed".
+ * unreadable arm exists because this verb requires no passphrase and writes
+ * nothing: when the record cannot be opened from here the honest answer is
+ * "not readable from here", never "unarmed". The arm covers two DIFFERENT
+ * situations, separated by {@link renderUnlockRefusal}: no usable credential,
+ * and a valid credential on a fortress that needs the one-time custody
+ * migration this read-only verb refuses to perform.
  */
 type DiagnoseLocalIntelligence =
   | { readable: true; report: LocalIntelligenceStateReport }
@@ -112,9 +115,10 @@ type DiagnoseLocalIntelligence =
  * custody minting, and the master copy is zeroed on every outcome.
  *
  * Failure mode to expect: on a host where the fortress credential is not
- * reachable (a locked keyring over SSH, a different machine) this returns the
- * unreadable arm. Reading that as "not armed" is the mistake it exists to
- * prevent.
+ * reachable (a locked keyring over SSH, a different machine), and on a
+ * pre-envelope fortress whose one-time custody migration this verb refuses to
+ * perform, it returns the unreadable arm. Reading either as "not armed" is the
+ * mistake it exists to prevent, and the two carry different remedies.
  */
 async function readLocalIntelligenceState(
   storagePath: string,
@@ -167,13 +171,63 @@ async function readLocalIntelligenceState(
 }
 
 /**
+ * What an unreadable arm may say, as ONE table over the closed
+ * `LocalFortressUnlockFailure` union. Both renderings consume it, so the human
+ * and `--json` forms cannot describe the same refusal differently, and the
+ * `switch` is exhaustive so a new failure code fails the build here rather
+ * than silently inheriting the credential text.
+ */
+interface UnlockRefusalRender {
+  /** Closed diagnose state name for this refusal. */
+  state: string;
+  detail: string;
+  remedy: string;
+  /**
+   * The closed unlock code, or null when the refusal is not about a
+   * credential; only a non-null value is shown as a credential failure.
+   */
+  credentialFailure: LocalFortressUnlockFailure | null;
+}
+
+function renderUnlockRefusal(
+  failure: LocalFortressUnlockFailure,
+): UnlockRefusalRender {
+  switch (failure) {
+    case "migration_required":
+      // INVARIANT: the credential RESOLVED and is valid here; only the
+      // one-time pre-envelope custody migration was refused, because this verb
+      // declares a read-only session. Rendering this as a credential problem
+      // would tell the operator to fix a credential that already works, which
+      // is the mis-render class this branch exists to prevent.
+      return {
+        state: "custody_migration_required",
+        detail:
+          "this fortress predates the custody envelope format, and a read-only command will not migrate it",
+        remedy: LOCAL_INTELLIGENCE_MIGRATION_HINT,
+        credentialFailure: null,
+      };
+    case "absent":
+    case "locked":
+    case "unreadable":
+    case "mismatch":
+    case "other":
+      return {
+        state: "unavailable",
+        detail: "the fortress credential is not available in this session",
+        remedy: LOCAL_INTELLIGENCE_CREDENTIAL_HINT,
+        credentialFailure: failure,
+      };
+  }
+}
+
+/**
  * The machine-readable projection. Every field is public manifest content, a
  * local path, or a closed state name; no key material and no credential ever
  * reaches this object (MUST-NEVER #6).
  *
- * INVARIANT on the credential arm: only `LocalFortressUnlockFailure` — the
- * five-value closed union declared in `cli/local-fortress-unlock.ts` — and this
- * file's fixed hint are projected. The unlock result's `message` is DELIBERATELY
+ * INVARIANT on the unreadable arm: only `LocalFortressUnlockFailure` — the
+ * closed union declared in `cli/local-fortress-unlock.ts` — and this file's
+ * fixed hints are projected. The unlock result's `message` is DELIBERATELY
  * dropped: it is written for a different audience, it can embed the fortress
  * path, and it is the field an underlying `Error.message` or `cause` would
  * travel in. Never widen this to the result object.
@@ -182,16 +236,17 @@ function localIntelligenceJson(
   state: DiagnoseLocalIntelligence,
 ): Record<string, unknown> {
   if (!state.readable) {
+    const refusal = renderUnlockRefusal(state.failure);
     return {
-      state: "unavailable",
-      detail: "the fortress credential is not available in this session",
-      credential_failure: state.failure,
+      state: refusal.state,
+      detail: refusal.detail,
+      credential_failure: refusal.credentialFailure,
       manifest_version: null,
       signed_body_sha256: null,
       ollama_models_root: null,
       committed_at: null,
       bindings: [],
-      remedy: LOCAL_INTELLIGENCE_CREDENTIAL_HINT,
+      remedy: refusal.remedy,
     };
   }
   return { ...state.report, credential_failure: null };
@@ -199,15 +254,18 @@ function localIntelligenceJson(
 
 /**
  * Operator-facing lines for the durable record; one section, always printed.
- * Same projection rule as {@link localIntelligenceJson}: the credential arm
- * interpolates the closed `LocalFortressUnlockFailure` code and this file's
- * fixed hint, never the unlock result's `message`.
+ * Same projection rule as {@link localIntelligenceJson}, through the same
+ * {@link renderUnlockRefusal} table, never the unlock result's `message`.
  */
 function localIntelligenceLines(state: DiagnoseLocalIntelligence): string[] {
   if (!state.readable) {
+    const refusal = renderUnlockRefusal(state.failure);
     return [
-      `Local intelligence: unavailable (${state.failure}: the fortress credential is not available in this session)`,
-      `  ${LOCAL_INTELLIGENCE_CREDENTIAL_HINT}`,
+      refusal.credentialFailure === null
+        ? `Local intelligence: ${refusal.state}`
+        : `Local intelligence: ${refusal.state} (${refusal.credentialFailure})`,
+      `  ${refusal.detail}`,
+      `  remedy: ${refusal.remedy}`,
     ];
   }
   const report = state.report;
@@ -244,8 +302,9 @@ function localIntelligenceLines(state: DiagnoseLocalIntelligence): string[] {
  * intelligence on this fortress, or it was never armed, and neither is a
  * defect. Every state where a record EXISTS but the runtime would refuse it
  * (`corrupt`, `version-too-new`, `integrity_state_invalid`) is not ok, and
- * neither is `unavailable`: a session that could not read the record has an
- * indeterminate answer, and an indeterminate answer must never render as a
+ * neither is any unreadable arm (`unavailable` or
+ * `custody_migration_required`): a session that could not read the record has
+ * an indeterminate answer, and an indeterminate answer must never render as a
  * passing one (AGENTS.md assurance rule 1).
  */
 function localIntelligenceIsOk(state: DiagnoseLocalIntelligence): boolean {
@@ -262,6 +321,15 @@ function localIntelligenceIsOk(state: DiagnoseLocalIntelligence): boolean {
       return false;
   }
 }
+
+/**
+ * Said only when this fortress needs the one-time pre-envelope custody
+ * migration. `sanctuary protect` is named because its custody path
+ * (`wrap/custody-flow.ts` -> `establishWrapCustody` -> `establishMaster`) IS
+ * the migration, verified by a test; a read-only verb cannot perform it.
+ */
+const LOCAL_INTELLIGENCE_MIGRATION_HINT =
+  "run `sanctuary protect` on this fortress once to perform the one-time custody migration, then re-run this command";
 
 /**
  * Said only when the record could not be read for lack of a credential. Names

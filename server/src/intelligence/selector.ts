@@ -1444,15 +1444,17 @@ export class SubstrateSelector {
     const sub = LocalSubstrate.fromPick(client, pick, customTag);
     const labelBase = BACKEND_FALLBACK_STRINGS[BADGE_LABEL_KEYS.local] ?? "Local model";
     // With no verified binding, whatever `LocalSubstrate.fromPick` invokes IS
-    // this handle's model, and it resolves `customTag ?? LOCAL_MODEL_TAGS[pick]`.
-    // The label must resolve in the SAME order: `LOCAL_MODEL_LABELS` is a total
-    // `Record<LocalModelPick, string>`, so reading it first made the custom-tag
-    // arm unreachable and an operator who set `customLocalModelTags` saw the
-    // friendly name of a pick that nothing was calling.
-    // Must match the tag resolution in `LocalSubstrate.fromPick`
-    // (`intelligence/substrates/local.ts`); a change on either side puts the
-    // badge back to naming a model this surface does not invoke.
-    const unarmedLabel = customTag ?? LOCAL_MODEL_LABELS[pick] ?? LOCAL_MODEL_TAGS[pick];
+    // this handle's model. The shared invariant with that constructor
+    // (`intelligence/substrates/local.ts`) is narrow and exact: the custom tag
+    // wins on both sides. Only the second arm differs, and deliberately, since
+    // the two are answering different questions: with no custom tag the label
+    // shows the pick's HUMAN name from `LOCAL_MODEL_LABELS` while the runtime
+    // calls the pick's TAG from `LOCAL_MODEL_TAGS`.
+    // No `?? LOCAL_MODEL_TAGS[pick]` tail here: `LOCAL_MODEL_LABELS` is a total
+    // `Record<LocalModelPick, string>`, so such a tail would be dead code, and
+    // reading that table BEFORE `customTag` is what once made the custom-tag
+    // arm unreachable and showed the friendly name of a pick nothing called.
+    const unarmedLabel = customTag ?? LOCAL_MODEL_LABELS[pick];
     // INVARIANT: on an armed fortress the verified binding is what this surface
     // actually invokes — `commitLocalIntegrityProvisioning` writes the binding's
     // tag into `customLocalModelTags` while `pick` stays at its configured
