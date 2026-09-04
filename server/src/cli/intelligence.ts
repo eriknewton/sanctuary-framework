@@ -27,6 +27,7 @@ import {
   type LoadOutcome,
 } from "../intelligence/policy-store.js";
 import { AuditLog } from "../operational/audit-log.js";
+import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import type { MasterWriteBarrierLease } from "../storage/cross-process-lock.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
@@ -495,6 +496,22 @@ export async function runIntelligenceConfigReset(
   const masterKey = unlocked.masterKey;
   const barrier: MasterWriteBarrierLease | undefined = unlocked.barrier;
   try {
+    const auditLog = new AuditLog(storage, masterKey);
+    // Every fortress-open call site that can mutate state routes through the
+    // exit-import recovery chokepoint first: an interrupted Exit import leaves
+    // a journal whose snapshots this fortress's state is bound to, and opening
+    // around it would mutate a half-applied target as if it were legitimate.
+    // The wrapper throws on a partial or unparseable rollback (never proceeds).
+    try {
+      await recoverInterruptedExitImportsOrThrow(storage, auditLog);
+    } catch (error) {
+      print(
+        `Refused: interrupted exit-import recovery did not complete; nothing was changed. ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return CONFIG_RESET_EXIT.REFUSED;
+    }
     const store = new IntelligenceConfigStore(
       storage,
       masterKey,
@@ -557,7 +574,6 @@ export async function runIntelligenceConfigReset(
     print(`Quarantined ${result.bytes} bytes to ${result.quarantinePath}`);
     print("The record was removed; the next load returns the default legacy-unarmed configuration.");
     print("If this fortress was Q5-armed on that record it is now unarmed; re-provision local intelligence before relying on load-integrity verification.");
-    const auditLog = new AuditLog(storage, masterKey);
     try {
       await auditLog.append(
         "l2",
