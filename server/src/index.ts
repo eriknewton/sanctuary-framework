@@ -203,6 +203,14 @@ export interface SanctuaryServer {
   masterKey: Uint8Array;
   auditLog: AuditLog;
   policy: PrincipalPolicy;
+  /**
+   * Idempotent async cleanup: stop MCP admission, sentinel/anomaly/inbox
+   * ticks, the selected approval channel (dashboard or webhook), and proxy
+   * clients; then flush inbox persistence, save the baseline, and flush the
+   * audit log. Aggregates errors rather than swallowing them. Does NOT
+   * install process signal handlers; the CLI layer owns that wiring.
+   */
+  cleanup: () => Promise<void>;
 }
 
 /** Outcome of the hands-free boot credential resolution (H1). */
@@ -2227,16 +2235,53 @@ export async function createSanctuaryServer(options?: {
   // 20. Save config if this is first run
   await saveConfig(config);
 
-  // 21. Register baseline save and proxy shutdown on process exit
-  const cleanup = () => {
-    unifiedInboxScheduler.stop();
-    baseline.save().catch(() => {});
-    if (clientManager) {
-      clientManager.shutdown().catch(() => {});
-    }
+  // 21. Build the idempotent async cleanup function. Signal handlers are NOT
+  // installed here: the CLI layer (cli.ts) owns that wiring so that an
+  // embedded server never silently squats process signals. The cleanup is
+  // returned in SanctuaryServer.cleanup for the CLI and any embedding caller
+  // to invoke at the right time for their runtime model.
+  let cleanupPromise: Promise<void> | undefined;
+  const cleanup = (): Promise<void> => {
+    if (cleanupPromise) return cleanupPromise;
+    // Assign the cache via Promise.resolve().then(body) BEFORE the body runs.
+    // If server.close() inside the body synchronously fires onclose → cleanup(),
+    // the second call finds cleanupPromise already set and returns it (no reentry).
+    cleanupPromise = Promise.resolve().then(async () => {
+      const errors: unknown[] = [];
+      // Stop MCP admission first so no new tool calls are accepted.
+      // server.close() is async (SDK Protocol.close); awaiting it ensures the
+      // transport is fully torn down before we flush persistence below.
+      try { await server.close(); } catch (e) { errors.push(e); }
+      // Stop future ticks independently so a failure in one does not block others.
+      try { unifiedInboxScheduler.stop(); } catch (e) { errors.push(e); }
+      // Stop future calibration audit production before the final flush.
+      try { autoTriggerSuggester.stop(); } catch (e) { errors.push(e); }
+      try { await sentinelDispatcher.dispose(); } catch (e) { errors.push(e); }
+      try { await anomalyDispatcher.dispose(); } catch (e) { errors.push(e); }
+      // Dispose the auto-trigger dispatcher's pending timers/listeners after
+      // its event sources (sentinel, anomaly) have been stopped above.
+      try { autoTriggerDispatcher.dispose(); } catch (e) { errors.push(e); }
+      // Stop the selected approval channel. Dispose may emit audit entries.
+      if (selectedApprovalChannel.type === "dashboard") {
+        try { await selectedApprovalChannel.channel.stop(); } catch (e) { errors.push(e); }
+      } else if (selectedApprovalChannel.type === "webhook") {
+        try { await selectedApprovalChannel.channel.stop(); } catch (e) { errors.push(e); }
+      }
+      // Shut down proxy client connections.
+      if (clientManager) {
+        try { await clientManager.shutdown(); } catch (e) { errors.push(e); }
+      }
+      // Flush persistence last; audit flush must follow inbox and baseline.
+      try { await unifiedInboxBridge.flushPersistence(); } catch (e) { errors.push(e); }
+      try { await baseline.save(); } catch (e) { errors.push(e); }
+      try { await auditLog.flush(); } catch (e) { errors.push(e); }
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1) {
+        throw new AggregateError(errors, "Sanctuary MCP Server cleanup encountered errors");
+      }
+    });
+    return cleanupPromise;
   };
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
 
   // 22. Escrow the full recovery key off-host if one was generated on this
   // first run (the durable fix). The recovery key is NEVER written inside the
@@ -2276,6 +2321,7 @@ export async function createSanctuaryServer(options?: {
     masterKey,
     auditLog,
     policy,
+    cleanup,
   };
   } catch (error) {
     // Startup never transferred the master session to a live server. Release

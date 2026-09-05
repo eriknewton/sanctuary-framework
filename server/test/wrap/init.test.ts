@@ -50,6 +50,7 @@ import {
   canonicalRecoveryKeyServiceFor,
   RecoveryKeyKeychainStoreError,
 } from "../../src/wrap/keychain-custody.js";
+import { agentGuidedRecoveryOutputPath } from "../../src/wrap/custody-flow.js";
 import type { ExecResult } from "../../src/wrap/passphrase.js";
 import { runProvisionPinAlreadyLocked } from "../../src/cli/castle-wall.js";
 
@@ -158,6 +159,27 @@ async function runInitWithRecoveryKeychain(
   return { result, keychain };
 }
 
+async function withStdinTty<T>(run: () => Promise<T>): Promise<T> {
+  const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(
+    (() => true) as typeof process.stderr.write,
+  );
+  Object.defineProperty(process.stdin, "isTTY", {
+    configurable: true,
+    value: true,
+  });
+  try {
+    return await run();
+  } finally {
+    stderrWrite.mockRestore();
+    if (ttyDescriptor) {
+      Object.defineProperty(process.stdin, "isTTY", ttyDescriptor);
+    } else {
+      Reflect.deleteProperty(process.stdin, "isTTY");
+    }
+  }
+}
+
 function extractRecoveryKey(fileContent: string): string {
   const keyLine = fileContent
     .split("\n")
@@ -250,10 +272,11 @@ describe("runInit", () => {
     expect(rulesDirStats.isDirectory()).toBe(true);
     expect(rulesDirStats.mode & 0o777).toBe(0o700);
 
-    // Recovery key file landed at the fortress path, not at HOME.
-    expect(result.recoveryKeyDisclosurePath).toBe(
-      join(fortressPath, RECOVERY_KEY_FILENAME),
-    );
+    // Headless init: recovery key goes to the agent-guided external path
+    // (beside the fortress, never inside it) — not at HOME, not inside the
+    // fortress directory itself.
+    const expectedOut = agentGuidedRecoveryOutputPath(fortressPath);
+    expect(result.recoveryKeyDisclosurePath).toBe(expectedOut);
     const recoveryFile = await readFile(
       result.recoveryKeyDisclosurePath,
       "utf-8",
@@ -262,6 +285,8 @@ describe("runInit", () => {
     expect(recoveryFile).toContain(
       "DO NOT COMMIT, DO NOT EMAIL, MOVE OFF-HOST IMMEDIATELY",
     );
+    // No plaintext copy inside the fortress directory.
+    await expect(stat(join(fortressPath, RECOVERY_KEY_FILENAME))).rejects.toThrow();
 
     // Crucially: ~/.sanctuary was NOT touched. We can't safely assert this
     // on a developer machine (it might already exist), but we CAN assert
@@ -269,24 +294,33 @@ describe("runInit", () => {
     expect(result.fortressPath).not.toBe(join(homedir(), ".sanctuary"));
   });
 
-  it("stores the minted recovery key in a read-back-verified Keychain item", async () => {
+  it("stores the minted recovery key in a read-back-verified Keychain item during interactive init", async () => {
     const fortressPath = join(tmp, "keychain-recovery-fortress");
-    const { result, keychain } = await runInitWithRecoveryKeychain({
-      fortress: fortressPath,
-      noConfirm: true,
-      noPin: true,
-    });
-
-    const recoveryFile = await readFile(
-      result.recoveryKeyDisclosurePath,
-      "utf-8",
-    );
-    const recoveryKey = extractRecoveryKey(recoveryFile);
+    const keychain = makeRecoveryKeychainMock();
     const service = canonicalRecoveryKeyServiceFor(
       fortressPath,
       "/tmp/sanctuary-test-home",
     );
+    const { result } = await withStdinTty(() =>
+      runInitWithRecoveryKeychain(
+        { fortress: fortressPath, noPin: true, noIdentity: true },
+        keychain,
+        {
+          runLocalIntelligenceSetup: async () => ({ kind: "not-requested" }),
+          verifyRecoveryKeyReentry: async ({ check }) => {
+            const stored = keychain.stored.get(`sanctuary:${service}`);
+            expect(stored).toMatch(/^[A-Za-z0-9_-]{43}$/);
+            expect(await check(stored!)).toBe(true);
+          },
+        },
+      ),
+    );
 
+    const recoveryFile = await readFile(result.recoveryKeyDisclosurePath, "utf-8");
+    const recoveryKey = extractRecoveryKey(recoveryFile);
+    expect(result.recoveryKeyDisclosurePath).toBe(
+      join(fortressPath, RECOVERY_KEY_FILENAME),
+    );
     expect(keychain.stored.get(`sanctuary:${service}`)).toBe(recoveryKey);
 
     const writeIndex = keychain.calls.findIndex(
@@ -301,12 +335,10 @@ describe("runInit", () => {
     );
     expect(writeIndex).toBeGreaterThanOrEqual(0);
     expect(readIndex).toBeGreaterThan(writeIndex);
-    expect(
-      keychain.calls.some((call) => call.args.includes(recoveryKey)),
-    ).toBe(false);
+    expect(keychain.calls.some((call) => call.args.includes(recoveryKey))).toBe(false);
   });
 
-  it("fails closed before custody state when recovery-key Keychain write fails", async () => {
+  it("fails closed before custody state when interactive recovery-key Keychain write fails", async () => {
     const fortressPath = join(tmp, "keychain-write-fails-fortress");
     const keychain = makeRecoveryKeychainMock({ writeFails: true });
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -314,26 +346,22 @@ describe("runInit", () => {
     let thrown: unknown;
     let consoleOutput = "";
     try {
-      await runInitRaw(
-        {
-          fortress: fortressPath,
-          noConfirm: true,
-          noPin: true,
-        },
-        {
-          recoveryKeychain: {
-            home: "/tmp/sanctuary-test-home",
-            platformOverride: "darwin",
-            exec: keychain.exec,
+      await withStdinTty(() =>
+        runInitRaw(
+          { fortress: fortressPath, noPin: true, noIdentity: true },
+          {
+            recoveryKeychain: {
+              home: "/tmp/sanctuary-test-home",
+              platformOverride: "darwin",
+              exec: keychain.exec,
+            },
           },
-        },
+        ),
       );
     } catch (err) {
       thrown = err;
     } finally {
-      consoleOutput = consoleSpy.mock.calls
-        .map((args) => args.join(" "))
-        .join("\n");
+      consoleOutput = consoleSpy.mock.calls.map((args) => args.join(" ")).join("\n");
       consoleSpy.mockRestore();
     }
 
@@ -353,7 +381,7 @@ describe("runInit", () => {
     ).rejects.toThrow();
   });
 
-  it("fails closed before custody state when recovery-key Keychain read-back mismatches", async () => {
+  it("fails closed before custody state and scrubs key buffers when interactive recovery-key Keychain read-back mismatches", async () => {
     const fortressPath = join(tmp, "keychain-readback-fails-fortress");
     const keychain = makeRecoveryKeychainMock({
       readBackOverride: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -361,20 +389,18 @@ describe("runInit", () => {
     const observed: Uint8Array[] = [];
 
     await expect(
-      runInitRaw(
-        {
-          fortress: fortressPath,
-          noConfirm: true,
-          noPin: true,
-        },
-        {
-          recoveryKeychain: {
-            home: "/tmp/sanctuary-test-home",
-            platformOverride: "darwin",
-            exec: keychain.exec,
+      withStdinTty(() =>
+        runInitRaw(
+          { fortress: fortressPath, noPin: true, noIdentity: true },
+          {
+            recoveryKeychain: {
+              home: "/tmp/sanctuary-test-home",
+              platformOverride: "darwin",
+              exec: keychain.exec,
+            },
+            observeSecretBuffer: (_label, buffer) => observed.push(buffer),
           },
-          observeSecretBuffer: (_label, buffer) => observed.push(buffer),
-        },
+        ),
       ),
     ).rejects.toThrow(RecoveryKeyKeychainStoreError);
 
@@ -384,6 +410,60 @@ describe("runInit", () => {
     await expect(
       stat(join(fortressPath, RECOVERY_KEY_FILENAME)),
     ).rejects.toThrow();
+    expect(observed).toHaveLength(2);
+    for (const buffer of observed) {
+      expect([...buffer].every((byte) => byte === 0)).toBe(true);
+    }
+  });
+
+  it("headless default writes externally and never touches recovery-key Keychain escrow", async () => {
+    const fortressPath = join(tmp, "headless-default-external-fortress");
+    const keychain = makeRecoveryKeychainMock({ writeFails: true });
+    const { result } = await runInitWithRecoveryKeychain(
+      {
+        fortress: fortressPath,
+        noConfirm: true,
+        noPin: true,
+        noIdentity: true,
+      },
+      keychain,
+    );
+
+    expect(result.recoveryKeyDisclosurePath).toBe(
+      agentGuidedRecoveryOutputPath(fortressPath),
+    );
+    expect(keychain.calls).toHaveLength(0);
+    expect(extractRecoveryKey(
+      await readFile(result.recoveryKeyDisclosurePath, "utf8"),
+    )).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    await expect(stat(join(fortressPath, RECOVERY_KEY_FILENAME)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("headless default collision during O_EXCL capture fails closed and scrubs key buffers", async () => {
+    const fortressPath = join(tmp, "headless-default-race-fortress");
+    const expectedOut = agentGuidedRecoveryOutputPath(fortressPath);
+    const observed: Uint8Array[] = [];
+
+    await expect(runInit(
+      {
+        fortress: fortressPath,
+        noConfirm: true,
+        noPin: true,
+        noIdentity: true,
+      },
+      {
+        beforeRecoveryKeyOutputWrite: async (filePath) => {
+          expect(filePath).toBe(expectedOut);
+          await writeFile(filePath, "raced key", { mode: 0o600 });
+        },
+        observeSecretBuffer: (_label, buffer) => observed.push(buffer),
+      },
+    )).rejects.toThrow(RecoveryKeyOutputPathExistsError);
+
+    await expect(readFile(expectedOut, "utf8")).resolves.toBe("raced key");
+    await expect(stat(join(fortressPath, "state", "_meta", "custody-envelope.enc")))
+      .rejects.toMatchObject({ code: "ENOENT" });
     expect(observed).toHaveLength(2);
     for (const buffer of observed) {
       expect([...buffer].every((byte) => byte === 0)).toBe(true);
@@ -513,6 +593,28 @@ describe("runInit", () => {
     await expect(
       stat(join(fortressPath, RECOVERY_KEY_FILENAME)),
     ).rejects.toThrow();
+  });
+
+  it("--recovery-out takes precedence over SANCTUARY_RECOVERY_OUT in headless init", async () => {
+    const fortressPath = join(tmp, "flag-over-env-recovery-fortress");
+    const flagOut = join(tmp, "flag-durable", "recovery-key.txt");
+    const envOut = join(tmp, "env-must-not-win", "recovery-key.txt");
+    process.env.SANCTUARY_RECOVERY_OUT = envOut;
+
+    const result = await runInit({
+      fortress: fortressPath,
+      recoveryOut: flagOut,
+      noConfirm: true,
+      noPin: true,
+      noIdentity: true,
+    });
+
+    expect(result.recoveryKeyDisclosurePath).toBe(flagOut);
+    expect(extractRecoveryKey(await readFile(flagOut, "utf8")))
+      .toMatch(/^[A-Za-z0-9_-]{43}$/);
+    await expect(stat(envOut)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(join(fortressPath, RECOVERY_KEY_FILENAME)))
+      .rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("refuses --recovery-out paths inside the fortress before init writes state", async () => {
@@ -1210,12 +1312,26 @@ describe("runInit", () => {
   it("refuses --force before mutation when canonical keychain recovery escrow exists", async () => {
     const fortressPath = join(tmp, "forced-canonical-recovery-escrow");
     const keychain = makeRecoveryKeychainMock();
-    await runInitWithRecoveryKeychain({
-      fortress: fortressPath,
-      noConfirm: true,
-      noPin: true,
-      noIdentity: true,
-    }, keychain);
+    const service = canonicalRecoveryKeyServiceFor(
+      fortressPath,
+      "/tmp/sanctuary-test-home",
+    );
+    await withStdinTty(() => runInitWithRecoveryKeychain(
+      {
+        fortress: fortressPath,
+        noPin: true,
+        noIdentity: true,
+      },
+      keychain,
+      {
+        runLocalIntelligenceSetup: async () => ({ kind: "not-requested" }),
+        verifyRecoveryKeyReentry: async ({ check }) => {
+          const stored = keychain.stored.get(`sanctuary:${service}`);
+          expect(stored).toBeDefined();
+          expect(await check(stored!)).toBe(true);
+        },
+      },
+    ));
     const marker = join(fortressPath, "preserve-through-refusal.txt");
     await writeFile(marker, "preserve", { mode: 0o600 });
 
@@ -1251,21 +1367,133 @@ describe("runInit", () => {
   });
 
   it("recovery-key.txt is single-issuance: re-init with --force does NOT overwrite", async () => {
+    // Headless init writes the recovery key to the agent-guided external path.
+    // A second --force --no-confirm re-init on the same fortress produces the
+    // same agent-guided path (path-derived, not random). preflightRecoveryKeyOutputFile
+    // refuses that path because it already holds the first init's key, aborting
+    // before any fortress mutation — single-issuance is enforced at the preflight
+    // layer, not at the write layer.
     const fortressPath = join(tmp, "single-issuance-fortress");
     const first = await runInit({ fortress: fortressPath, noConfirm: true });
-    const firstContent = await readFile(
-      first.recoveryKeyDisclosurePath,
-      "utf-8",
-    );
+    const agentGuidedPath = agentGuidedRecoveryOutputPath(fortressPath);
+    expect(first.recoveryKeyDisclosurePath).toBe(agentGuidedPath);
+    const firstContent = await readFile(agentGuidedPath, "utf-8");
 
-    // Second init under --force should NOT overwrite recovery-key.txt
-    // (the disclosure helper enforces single-issuance regardless of caller).
-    await runInit({ fortress: fortressPath, force: true, noConfirm: true });
-    const afterSecond = await readFile(
-      first.recoveryKeyDisclosurePath,
-      "utf-8",
-    );
+    // Second init under --force is refused at preflight before any mutation.
+    await expect(
+      runInit({ fortress: fortressPath, force: true, noConfirm: true }),
+    ).rejects.toThrow(RecoveryKeyOutputPathExistsError);
+
+    // File unchanged: the refusal happened before any mutation.
+    const afterSecond = await readFile(agentGuidedPath, "utf-8");
     expect(afterSecond).toBe(firstContent);
+  });
+
+  it.each(["default", "explicit"] as const)(
+    "headless init (%s output): full process transcript shows the path, never the recovery key",
+    async (outputKind) => {
+      // When --no-confirm is set, discloseRecoveryKey is never called. Only the
+      // destination path is printed — the key value itself never appears in the
+      // process transcript captured by an MCP harness.
+      const fortressPath = join(
+        tmp,
+        `transcript-absence-${outputKind}-fortress`,
+      );
+      const explicitOut = join(tmp, "transcript-explicit", "recovery-key.txt");
+      const consoleLines: string[] = [];
+      const stderrWrites: string[] = [];
+      const stdoutWrites: string[] = [];
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(
+        (...args: unknown[]) => { consoleLines.push(args.join(" ")); },
+      );
+      const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(
+        ((chunk: string | Uint8Array) => {
+          stderrWrites.push(String(chunk));
+          return true;
+        }) as typeof process.stderr.write,
+      );
+      const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(
+        ((chunk: string | Uint8Array) => {
+          stdoutWrites.push(String(chunk));
+          return true;
+        }) as typeof process.stdout.write,
+      );
+      let recoveryKey: string | undefined;
+      let disclosurePath: string | undefined;
+      try {
+        const result = await runInit({
+          fortress: fortressPath,
+          ...(outputKind === "explicit" ? { recoveryOut: explicitOut } : {}),
+          noConfirm: true,
+          noPin: true,
+        });
+        disclosurePath = result.recoveryKeyDisclosurePath;
+        const recoveryFile = await readFile(
+          result.recoveryKeyDisclosurePath,
+          "utf-8",
+        );
+        recoveryKey = extractRecoveryKey(recoveryFile);
+      } finally {
+        stdoutSpy.mockRestore();
+        stderrSpy.mockRestore();
+        consoleSpy.mockRestore();
+      }
+
+      expect(recoveryKey).toBeDefined();
+      expect(disclosurePath).toBe(
+        outputKind === "explicit"
+          ? explicitOut
+          : agentGuidedRecoveryOutputPath(fortressPath),
+      );
+      const transcript = [
+        ...consoleLines,
+        ...stderrWrites,
+        ...stdoutWrites,
+      ].join("\n");
+      // This includes the original leak channel: printSecretBanner writes
+      // directly to process.stderr instead of through console.error.
+      expect(transcript).toContain(disclosurePath!);
+      expect(transcript).not.toContain(recoveryKey!);
+    },
+  );
+
+  it("headless init rollback removes the agent-guided recovery file when a later mutation fails", async () => {
+    // If a custody mutation fails after the external recovery file was written,
+    // rollback must delete the file so a clean retry can proceed. The fortress
+    // is left in the inert lock-scaffold state with no custody state.
+    const fortressPath = join(tmp, "rollback-agent-guided-fortress");
+    const agentGuidedPath = agentGuidedRecoveryOutputPath(fortressPath);
+    const observed: Uint8Array[] = [];
+
+    await expect(
+      runInit(
+        {
+          fortress: fortressPath,
+          noConfirm: true,
+          noPin: true,
+          noIdentity: true,
+        },
+        {
+          beforeDurableMutation: (label) => {
+            if (label === "custody-envelope") {
+              throw new Error("injected custody-envelope write failure");
+            }
+          },
+          observeSecretBuffer: (_label, buffer) => observed.push(buffer),
+        },
+      ),
+    ).rejects.toThrow("injected custody-envelope write failure");
+
+    // Rollback must remove the agent-guided file written before the failure.
+    await expect(stat(agentGuidedPath)).rejects.toMatchObject({ code: "ENOENT" });
+    // Custody state absent — init did not complete.
+    await expect(
+      stat(join(fortressPath, "state", "_meta", "custody-envelope.enc")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    // Key buffers zeroed.
+    for (const buffer of observed) {
+      expect([...buffer].every((byte) => byte === 0)).toBe(true);
+    }
   });
 });
 

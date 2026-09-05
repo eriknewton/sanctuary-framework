@@ -357,7 +357,9 @@ async function establishWrapCustodyLocked(
   // that makes a passphrase fortress actually recoverable.
   let mintedRecoveryKey = false;
   if (!envelope.wraps.some((w) => w.type === "recovery-key")) {
-    const agentRecoveryPath = opts.agentGuided
+    // ordinary noninteractive protect/wrap also stages recovery outside the
+    // fortress so recovery bytes never appear in a headless agent transcript.
+    const agentRecoveryPath = (opts.agentGuided || !opts.interactive)
       ? agentGuidedRecoveryOutputPath(opts.storagePath, fortressId)
       : undefined;
     let disclosure: { filePath: string; fileWritten: boolean };

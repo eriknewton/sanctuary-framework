@@ -56,6 +56,7 @@ import {
 } from "../../src/principal-policy/loader.js";
 import { readPersistedLocalAgents } from "../../src/hub/agent-registry-persistence.js";
 import { RECOVERY_KEY_FILENAME } from "../../src/wrap/recovery-key-disclosure.js";
+import { agentGuidedRecoveryOutputPath } from "../../src/wrap/custody-flow.js";
 
 const WRAP_PASSPHRASE = "fresh-install-wrap-passphrase";
 const INIT_PASSPHRASE = "fresh-install-init-passphrase";
@@ -348,8 +349,9 @@ describe("fresh-install onboarding smoke", () => {
 
     expect(result.fortressPath).toBe(fortressPath);
     expect(result.recoveryKeyDisclosurePath).toBe(
-      join(fortressPath, RECOVERY_KEY_FILENAME),
+      agentGuidedRecoveryOutputPath(fortressPath),
     );
+    await expectMissing(join(fortressPath, RECOVERY_KEY_FILENAME));
     await expectFortressDirectory(fortressPath);
     await expectDefaultPolicy(fortressPath);
 
