@@ -77,7 +77,7 @@
     {
       "assurance_row_id": "6",
       "label": "State envelope integrity / default verify-on-read",
-      "assurance_status": "proven",
+      "assurance_status": "partial",
       "fixtures_passed": 4,
       "coverage_state": "covered",
       "passing_fixture_names": [
@@ -139,7 +139,7 @@
     },
     {
       "assurance_row_id": "11",
-      "label": "Dashboard approval flow",
+      "label": "Per-agent network stop",
       "assurance_status": "partial",
       "fixtures_passed": 0,
       "coverage_state": "no_fixture",
@@ -147,6 +147,14 @@
     },
     {
       "assurance_row_id": "12",
+      "label": "Dashboard approval flow",
+      "assurance_status": "partial",
+      "fixtures_passed": 0,
+      "coverage_state": "no_fixture",
+      "passing_fixture_names": []
+    },
+    {
+      "assurance_row_id": "13",
       "label": "Export / exit bundle",
       "assurance_status": "partial",
       "fixtures_passed": 5,
@@ -160,7 +168,7 @@
       ]
     },
     {
-      "assurance_row_id": "13",
+      "assurance_row_id": "14",
       "label": "Query anonymity (selective disclosure)",
       "assurance_status": "proven",
       "fixtures_passed": 4,
@@ -173,7 +181,7 @@
       ]
     },
     {
-      "assurance_row_id": "14",
+      "assurance_row_id": "15",
       "label": "Context-gate single source of truth",
       "assurance_status": "proven",
       "fixtures_passed": 4,
@@ -186,7 +194,7 @@
       ]
     },
     {
-      "assurance_row_id": "15",
+      "assurance_row_id": "16",
       "label": "Proxy isolation: env (PR #267)",
       "assurance_status": "proven",
       "fixtures_passed": 3,
@@ -198,7 +206,7 @@
       ]
     },
     {
-      "assurance_row_id": "16",
+      "assurance_row_id": "17",
       "label": "Proxy SSE SSRF protection",
       "assurance_status": "proven",
       "fixtures_passed": 5,
@@ -212,7 +220,7 @@
       ]
     },
     {
-      "assurance_row_id": "17",
+      "assurance_row_id": "18",
       "label": "Dynamic proxy tool discovery",
       "assurance_status": "proven",
       "fixtures_passed": 4,
@@ -225,7 +233,7 @@
       ]
     },
     {
-      "assurance_row_id": "18",
+      "assurance_row_id": "19",
       "label": "did:key encoding (PR #268, base58btc compliant)",
       "assurance_status": "proven",
       "fixtures_passed": 3,
@@ -237,7 +245,7 @@
       ]
     },
     {
-      "assurance_row_id": "19",
+      "assurance_row_id": "20",
       "label": "Identity signing authority (PR #270, raw identity_sign Tier 1)",
       "assurance_status": "proven",
       "fixtures_passed": 7,
@@ -253,7 +261,7 @@
       ]
     },
     {
-      "assurance_row_id": "20",
+      "assurance_row_id": "21",
       "label": "Composition root review surface",
       "assurance_status": "planned",
       "fixtures_passed": 0,
@@ -261,7 +269,7 @@
       "passing_fixture_names": []
     },
     {
-      "assurance_row_id": "21",
+      "assurance_row_id": "22",
       "label": "Hostile-guest containment: macOS box launcher jails uncooperative plugins (B2 inner-confinement, seccomp-deny-AF_VSOCK)",
       "assurance_status": "proven",
       "fixtures_passed": 8,
@@ -278,7 +286,7 @@
       ]
     },
     {
-      "assurance_row_id": "22",
+      "assurance_row_id": "23",
       "label": "Verifiable transparency checkpoint format and offline verifier",
       "assurance_status": "proven",
       "fixtures_passed": 6,
@@ -291,6 +299,38 @@
         "transparency: happy-path chain",
         "transparency: replaced checkpoint breaks hash linkage"
       ]
+    },
+    {
+      "assurance_row_id": "24",
+      "label": "Sovereign encrypted memory custody (Rung 1, candidate)",
+      "assurance_status": "partial",
+      "fixtures_passed": 0,
+      "coverage_state": "no_fixture",
+      "passing_fixture_names": []
+    },
+    {
+      "assurance_row_id": "25",
+      "label": "Signed model-catalog verification (Rung 2 S1, catalog v3)",
+      "assurance_status": "partial",
+      "fixtures_passed": 0,
+      "coverage_state": "no_fixture",
+      "passing_fixture_names": []
+    },
+    {
+      "assurance_row_id": "26",
+      "label": "Fleet licensing and node-count enforcement (first paid tier)",
+      "assurance_status": "partial",
+      "fixtures_passed": 0,
+      "coverage_state": "no_fixture",
+      "passing_fixture_names": []
+    },
+    {
+      "assurance_row_id": "27",
+      "label": "Signed model manifest verified at provisioning (Rung 2 activation)",
+      "assurance_status": "partial",
+      "fixtures_passed": 0,
+      "coverage_state": "no_fixture",
+      "passing_fixture_names": []
     }
   ]
 }

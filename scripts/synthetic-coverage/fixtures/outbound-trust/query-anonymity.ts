@@ -19,7 +19,7 @@ import {
 import { registerFixture } from "../../registry.js";
 import { outcome } from "../state-trust/helpers.js";
 
-const CLAIM_ID = "13";
+const CLAIM_ID = "14";
 const CLAIM_LABEL = "Query anonymity (selective disclosure)";
 
 // Entrypoints: stripHeaders/createAnonymizedFetch, rewritePiiRegexOnly, and classifyQueryIntent.

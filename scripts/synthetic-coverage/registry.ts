@@ -34,6 +34,10 @@ export function registerFixture(
 ): void {
   const existing = claims.get(claimId);
   if (existing) {
+    // A shared row ID must not merge evidence for different trust claims.
+    if (existing.label !== label) {
+      throw new Error(`Conflicting labels for assurance row ${claimId}`);
+    }
     if (!existing.fixtures.some((fixture) => fixture.name === name)) {
       existing.fixtures.push({ name, fn });
     }

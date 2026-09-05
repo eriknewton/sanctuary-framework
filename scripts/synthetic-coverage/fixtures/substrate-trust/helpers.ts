@@ -10,9 +10,9 @@ export const ROW_STATE_ENCRYPTION = "5";
 export const ROW_STATE_ENCRYPTION_LABEL = "State encryption";
 export const ROW_ATTESTATION = "8";
 export const ROW_ATTESTATION_LABEL = "Health and attestation evidence-based";
-export const ROW_DID_KEY = "18";
+export const ROW_DID_KEY = "19";
 export const ROW_DID_KEY_LABEL = "did:key encoding (PR #268, base58btc compliant)";
-export const ROW_IDENTITY_SIGNING = "19";
+export const ROW_IDENTITY_SIGNING = "20";
 export const ROW_IDENTITY_SIGNING_LABEL =
   "Identity signing authority (PR #270, raw identity_sign Tier 1)";
 
