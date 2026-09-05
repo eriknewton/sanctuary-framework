@@ -64,16 +64,19 @@ const MACHINE_KEY_BYTES = 32;
 /**
  * HKDF info label for the machine-local fallback-file key.
  *
- * v2 binds the key to the host's STABLE identity (see `wrap/host-identity.ts`).
- * v1 bound it to `os.hostname()`, which is not boot-invariant, so a file
- * written on one boot could stop authenticating on the next with the file and
- * the machine both untouched.
+ * v2 is the label EVERY write uses. Its host fact is the host's stable identity
+ * where the platform exposes one (see `wrap/host-identity.ts`), and the
+ * resolved hostname where it does not. v1 bound the key to `os.hostname()`
+ * unconditionally, which is not boot-invariant, so a file written on one boot
+ * could stop authenticating on the next with the file and the machine both
+ * untouched.
  *
- * INVARIANT (enforcement site): the label is BUMPED rather than reused, so a v1
- * key and a v2 key can never both be valid for one file. That is what makes the
- * read-time ladder below sound: an authenticated decryption under v1 material
- * is positive evidence the file predates the migration, and only that evidence
- * authorizes the in-place re-wrap.
+ * INVARIANT (enforcement site): the label is BUMPED rather than reused, and v1
+ * is derived on the READ path only, so a v1 key and a v2 key can never both be
+ * valid for one file. That is what makes the read-time ladder below sound: an
+ * authenticated decryption under v1 material is positive evidence the file
+ * predates the migration, and only that evidence authorizes the in-place
+ * re-wrap.
  *
  * Both labels must match their rows in
  * `server/docs/hkdf-info-string-registry.md` and
@@ -180,8 +183,11 @@ export interface PassphraseOptions {
    * from the machine (for tests that model a host whose resolved hostname
    * changed, or a host that exposes no stable identity). Production callers
    * leave this undefined, in which case the facts come from
-   * `wrap/host-identity.ts`. Ignored when {@link deriveMachineKey} is supplied,
-   * which replaces the derivations these facts feed.
+   * `wrap/host-identity.ts` and describe the REAL running host. This is the
+   * ONLY way to model a different host: {@link platformOverride} selects the
+   * keyring backend and never the host identity. Ignored when
+   * {@link deriveMachineKey} is supplied, which replaces the derivations these
+   * facts feed.
    */
   machineIdentityOverride?: MachineIdentity;
   /**
@@ -478,7 +484,10 @@ export async function getOrCreatePassphrase(
   );
   if (fromFile.status === "ok") {
     if (fromFile.staleAtRest) {
-      await writeToFallbackFile(
+      // BEST EFFORT: the value is already authenticated, so a failed
+      // modernization write must not deny custody. See
+      // repairFallbackAtRestBestEffort.
+      await repairFallbackAtRestBestEffort(
         fallback,
         identity.fallbackAadIdentity,
         fromFile.value,
@@ -645,8 +654,12 @@ export async function observeStoredPassphrase(
     // authorities, and a diagnostic holds only the first. The value read is
     // identical either way; the repair is deferred to the next non-read-only
     // caller, and the ladder keeps opening the file until then.
+    //
+    // The repair is also BEST EFFORT for a writable caller: an unwritable or
+    // transiently failing storage path must not turn a successful authenticated
+    // read into a custody denial. See repairFallbackAtRestBestEffort.
     if (fromFile.staleAtRest && !opts.readOnly) {
-      await writeToFallbackFile(
+      await repairFallbackAtRestBestEffort(
         fallback,
         identity.fallbackAadIdentity,
         fromFile.value,
@@ -1474,6 +1487,52 @@ export function fallbackFilePath(home: string, storagePath?: string): string {
   return join(home, DEFAULT_STORAGE_DIR, "passphrase.enc");
 }
 
+/**
+ * Repair a fallback file that authenticated under a superseded at-rest form,
+ * BEST EFFORT, on behalf of a caller whose purpose was to READ.
+ *
+ * INVARIANT (enforcement site): a failed modernization write must not turn a
+ * SUCCESSFUL authenticated read into a custody denial. The old ciphertext is
+ * still on disk and still valid; the value in hand was already proven by an AEAD
+ * tag. Aborting here would deny custody on a read-only mount, a full disk, or a
+ * transient storage fault, which is strictly worse than carrying the older
+ * at-rest form for one more run — the ladder keeps opening it until a later
+ * writable read succeeds.
+ *
+ * This softening is scoped to the READ path on purpose. The persist entry points
+ * (`persistUserProvidedPassphrase`, `persistAndConfirmUserProvidedPassphrase`)
+ * exist to place a credential, so a write failure there IS the failure of the
+ * operation and stays strict.
+ *
+ * FAILURE MODE, from the outside: a deferred repair is invisible except for the
+ * warning below, so an operator who never looks at stderr will simply keep
+ * running on the older at-rest form. That is why the warning names the path and
+ * says the read succeeded; it is a maintenance notice, not an error.
+ */
+async function repairFallbackAtRestBestEffort(
+  path: string,
+  aadIdentity: string,
+  value: string,
+  home: string,
+  keys: MachineKeyLadder,
+  capability?: NonNullable<PassphraseOptions["fallbackCapability"]>,
+): Promise<void> {
+  try {
+    await writeToFallbackFile(path, aadIdentity, value, home, keys, capability);
+  } catch (err) {
+    const reason = (err as Error)?.message ?? "unknown write error";
+    // The custody VALUE never appears here. The path and the storage error are
+    // the only facts reported, matching what PassphraseUnreadableError already
+    // discloses on the failing branch of the same read.
+    process.stderr.write(
+      `sanctuary: the passphrase fallback file at ${path} is in a superseded at-rest form ` +
+        `and could not be re-wrapped in place (${reason}). The stored passphrase was read ` +
+        `successfully and the file is unchanged; the repair is retried on the next read by ` +
+        `a caller that may write.\n`,
+    );
+  }
+}
+
 async function readFromFallbackFile(
   path: string,
   aadIdentity: string,
@@ -1702,20 +1761,29 @@ function machineKeyMaterial(home: string, hostFact: string): Buffer {
  * about that threat model: both facts are readable by any local user. What it
  * changes is that the key survives a reboot on which the host answers to a
  * different spelling of its own name.
+ *
+ * AUDITED COST on a host that exposes no stable identity (Windows, or a host
+ * whose probe did not answer): the host fact falls back to the resolved
+ * hostname, so such a host KEEPS the hostname sensitivity the stable identity
+ * exists to remove — a rename can still strand its file, exactly as before this
+ * migration. It is stated here rather than silently absorbed. What it does NOT
+ * do is write under the superseded label.
  */
 function deriveMachineKey(home: string, identity: MachineIdentity): Uint8Array {
-  if (identity.stableHostId === null) {
-    // No stable identity on this platform (Windows, or a host whose probe did
-    // not answer). Absent evidence is not a pass, and it is not a licence to
-    // invent a weaker binding either: keep the EXISTING hostname derivation, so
-    // such a host is exactly as well off as before and its files stay readable.
-    // The audited cost is that this host keeps the hostname sensitivity the v2
-    // label exists to remove. It is stated here rather than silently absorbed.
-    return deriveLegacyHostnameMachineKey(home, identity.hostname);
-  }
+  // INVARIANT (enforcement site): every WRITE derives under
+  // MACHINE_KEY_HKDF_INFO, whichever host fact was available. The superseded
+  // label is read-only — the registry rows in
+  // `server/docs/hkdf-info-string-registry.md` and
+  // `server/test/fixtures/at-rest/hkdf-label-classification.json` state that as
+  // a property, so a host with no stable identity must not be the one exception
+  // that quietly falsifies it. Absent evidence is not a pass and it is not a
+  // licence to reuse a retired label; it is a weaker host fact under the
+  // current one, which also keeps the two labels from ever colliding on one
+  // file.
+  const hostFact = identity.stableHostId ?? identity.hostname;
   return hkdf(
     sha256,
-    machineKeyMaterial(home, identity.stableHostId),
+    machineKeyMaterial(home, hostFact),
     undefined,
     MACHINE_KEY_HKDF_INFO,
     MACHINE_KEY_BYTES
@@ -1748,6 +1816,16 @@ function deriveLegacyHostnameMachineKey(
  * the product's host-derived candidates underneath it would let a key it never
  * named authenticate the file.
  *
+ * INVARIANT (enforcement site): the host facts come from the REAL platform, and
+ * `platformOverride` is deliberately not consulted. That option selects which
+ * OS-keyring backend to exercise; the host identity is a fact about the machine
+ * this process is running on, and the file on that machine's disk was sealed
+ * under it. Deriving it from the simulated platform makes a write and a read of
+ * one file disagree whenever the two disagree about the override, which reads
+ * from the outside as an undecryptable fallback file on an untouched machine.
+ * A caller that needs to model a different HOST supplies
+ * {@link PassphraseOptions.machineIdentityOverride}, which says so explicitly.
+ *
  * The host facts are read LAZILY, on the first key derivation rather than here.
  * Resolving a stable host identity costs a subprocess on macOS, and the common
  * path never needs one: a fortress whose credential is in the OS keyring
@@ -1760,9 +1838,7 @@ function resolveMachineKeyLadder(opts: PassphraseOptions): MachineKeyLadder {
   if (injected) return { primary: injected, legacy: () => [] };
   let identity: MachineIdentity | undefined;
   const hostFacts = (): MachineIdentity =>
-    (identity ??=
-      opts.machineIdentityOverride ??
-      resolveMachineIdentity(opts.platformOverride ?? platform()));
+    (identity ??= opts.machineIdentityOverride ?? resolveMachineIdentity());
   return {
     primary: (home) => deriveMachineKey(home, hostFacts()),
     legacy: (home) =>

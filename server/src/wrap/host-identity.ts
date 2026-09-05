@@ -53,10 +53,20 @@ export interface MachineIdentity {
 /**
  * macOS: the IOPlatformExpertDevice node carries `IOPlatformUUID`, the
  * per-machine identifier that survives reboots, renames, and network changes.
- * Must match the parse in {@link readDarwinPlatformUuid}; `ioreg` prints it as
- * a quoted key/value pair inside the -rd1 device dump.
+ * Must match the parse in {@link parseDarwinPlatformUuidDump}; `ioreg` prints
+ * it as a quoted key/value pair inside the -rd1 device dump.
+ *
+ * INVARIANT (enforcement site): the tool is named by ABSOLUTE path, never by a
+ * bare `ioreg` that `execFileSync` would resolve through the inherited `PATH`.
+ * This value decides which key opens a custody credential, so the process
+ * environment must not be able to choose the binary that supplies it.
+ * `/usr/sbin/ioreg` is the OS-owned location on every supported macOS release.
+ *
+ * FAILURE MODE: if a future macOS moves the binary, the probe simply fails and
+ * `resolveStableHostId` returns `null` — the honest absence, not a silently
+ * different identity. That is the correct direction to fail in.
  */
-const DARWIN_PLATFORM_UUID_TOOL = "ioreg";
+const DARWIN_PLATFORM_UUID_TOOL = "/usr/sbin/ioreg";
 const DARWIN_PLATFORM_UUID_ARGS = ["-rd1", "-c", "IOPlatformExpertDevice"];
 /**
  * A hyphenated UUID in canonical 8-4-4-4-12 text form.
@@ -80,8 +90,9 @@ const LINUX_MACHINE_ID_PATTERN = /^[0-9a-f]{32}$/;
  * while the caller may be holding a custody lock.
  *
  * FAILURE MODE, for anyone reading this at 2am: if these bounds are hit, the
- * resolver returns `null` and the caller derives under the older hostname
- * material instead. It does not throw and it does not invent an identity, but a
+ * resolver returns `null` and the caller derives from the resolved hostname
+ * instead (still under the current HKDF label; see `deriveMachineKey` in
+ * `passphrase.ts`). It does not throw and it does not invent an identity, but a
  * file already written under the stable identity will NOT open on that run. So
  * the timeout is a safety stop for a wedged binary, deliberately set far above
  * any healthy latency for what is a local IOKit query with no network in it: a
@@ -112,6 +123,43 @@ const LOCAL_NAME_SUFFIXES = [".local", ".localdomain"] as const;
  */
 const stableHostIdCache = new Map<string, string | null>();
 
+/**
+ * The macOS platform UUID carried by an `ioreg -rd1 -c IOPlatformExpertDevice`
+ * dump, or `null` when the dump does not carry one in canonical form.
+ *
+ * Exported because it is the only part of the darwin probe that can be tested
+ * without a Mac: the subprocess call itself is deliberately NOT mocked (a mock
+ * would prove only that the mock was called), so this parser plus the real-host
+ * witness in `server/test/wrap/host-identity.test.ts` are the evidence that the
+ * production resolver works. Keep the two in step: that test feeds this
+ * function a captured dump shape, a malformed UUID, and a dump with the key
+ * absent.
+ */
+export function parseDarwinPlatformUuidDump(dump: string): string | null {
+  const matched = DARWIN_PLATFORM_UUID_LINE.exec(dump);
+  if (matched === null) return null;
+  const uuid = matched[1]!.trim();
+  // INVARIANT (enforcement site): a value that is not a canonical UUID is not
+  // this identity, whatever else it is. Accepting it would bind a custody key
+  // to an unvalidated string that a future OS release could reshape without
+  // notice, and an empty or truncated capture would then read as an identity.
+  return CANONICAL_UUID_PATTERN.test(uuid) ? uuid : null;
+}
+
+/**
+ * The systemd machine id carried by the contents of `/etc/machine-id`, or
+ * `null` when those contents are not one. Exported for the same reason as
+ * {@link parseDarwinPlatformUuidDump}: the file read is trivial, the shape
+ * check is the part worth pinning.
+ */
+export function parseLinuxMachineId(raw: string): string | null {
+  const id = raw.trim();
+  // INVARIANT (enforcement site): an uninitialized machine id is an empty
+  // file; the pattern rejects it along with any other shape, so a first-boot
+  // host is never bound to "" — which every such host would share.
+  return LINUX_MACHINE_ID_PATTERN.test(id) ? id : null;
+}
+
 /** Read the macOS platform UUID, or `null` when it cannot be established. */
 function readDarwinPlatformUuid(): string | null {
   let dump: string;
@@ -128,13 +176,7 @@ function readDarwinPlatformUuid(): string | null {
     // existing behavior.
     return null;
   }
-  const matched = DARWIN_PLATFORM_UUID_LINE.exec(dump);
-  if (matched === null) return null;
-  const uuid = matched[1]!.trim();
-  // A value that is not a canonical UUID is not this identity, whatever else
-  // it is. Accepting it would bind the key to an unvalidated string that a
-  // future OS release could reshape without notice.
-  return CANONICAL_UUID_PATTERN.test(uuid) ? uuid : null;
+  return parseDarwinPlatformUuidDump(dump);
 }
 
 /** Read the systemd machine id, or `null` when it cannot be established. */
@@ -147,10 +189,7 @@ function readLinuxMachineId(): string | null {
     // unreadable. Same disposition as darwin: absence, not a substitute.
     return null;
   }
-  const id = raw.trim();
-  // An uninitialized machine id is an empty file; the pattern rejects it along
-  // with any other shape, so a first-boot host is never bound to "".
-  return LINUX_MACHINE_ID_PATTERN.test(id) ? id : null;
+  return parseLinuxMachineId(raw);
 }
 
 /**

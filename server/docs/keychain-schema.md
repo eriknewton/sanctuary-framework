@@ -147,12 +147,24 @@ passphrase to an encrypted fallback file:
 | Default       | `~/.sanctuary/passphrase.enc`                   |
 | Per-tenant    | `<storage_path>/passphrase.enc`                 |
 
-The file is AES-256-GCM ciphertext (12-byte IV prepended) under a locally
-derived key using HKDF-SHA256 over `stable host identity + uid + username +
-home`. The stable host identity is the platform UUID on macOS and
-`/etc/machine-id` on Linux; both survive reboots, renames, and network changes.
-On a platform that exposes neither, the derivation keeps using the host's
-resolved hostname instead, which is recorded here rather than hidden.
+The file is a UTF-8 JSON envelope (version 3), not raw bytes. Its fields are
+`v` (3), `alg` (`aes-256-gcm`), `aad` (`canonical-storage-path`, naming which
+additional-authenticated-data form the ciphertext was sealed under), `nonce`
+(the base64url-encoded 12-byte AES-GCM nonce) and `ct` (the base64url-encoded
+ciphertext with its GCM tag). Two superseded at-rest forms are still READ and
+re-wrapped in place: the version-2 envelope, whose `aad` is `storage-path`, and
+the original pre-envelope layout of a raw 12-byte nonce followed by raw
+ciphertext. `parseFallbackEnvelope` in `server/src/wrap/passphrase.ts` is the
+authority on all three; if this list and that function disagree, the function is
+right and this paragraph is the defect.
+
+The ciphertext is under a locally derived key using HKDF-SHA256 over
+`stable host identity + uid + username + home`. The stable host identity is the
+platform UUID on macOS and `/etc/machine-id` on Linux; both survive reboots,
+renames, and network changes. On a platform that exposes neither, the same
+derivation runs with the host's resolved hostname in place of the stable
+identity, so such a host keeps the hostname sensitivity described below. It is
+recorded here rather than hidden.
 
 The key is bound to the stable host identity rather than to the hostname
 because the resolved hostname is not boot-invariant: the same Mac can answer
@@ -162,6 +174,14 @@ having changed. A file written under the earlier hostname-derived key is still
 read, and is re-wrapped in place under the stable-identity key on the first
 read by a caller that is allowed to write. A caller that declared itself
 read-only reads the value and leaves the file byte-identical.
+
+That in-place re-wrap is best effort on the read path. If the write fails (a
+read-only mount, a full disk, a transient storage fault) the read still returns
+the stored passphrase, the file is left exactly as it was, and a warning naming
+the file is written to stderr. **Failure mode from the outside:** the fortress
+opens normally and nothing looks wrong, so the only signal that a host is still
+carrying a superseded at-rest form is that stderr line. The persist commands are
+not softened this way: for them a failed write is the failure of the operation.
 
 This is not hardware-backed and is not a cryptographic machine-binding
 primitive: anyone with local read access can re-derive the key, and

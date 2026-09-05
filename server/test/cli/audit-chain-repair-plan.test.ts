@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only cross-file pin for the machine-key material; behavior is proven by server/test/wrap/passphrase-host-identity.test.ts
 /**
  * `sanctuary audit-chain repair-plan` — behavior and the no-mutation property.
  *
