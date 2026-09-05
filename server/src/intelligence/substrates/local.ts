@@ -41,6 +41,10 @@ export const LOCAL_CAPABILITY: SubstrateCapability = {
 };
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+// Generation uses a separate, configurable ceiling so callers can set a
+// tighter budget for tests without affecting the default 120 s production
+// budget. Show keeps DEFAULT_TIMEOUT_MS; model listing keeps its 1.5 s probe budget.
+const GENERATION_TIMEOUT_MS = 120_000;
 const HARDWARE_PROBE_TIMEOUT_MS = 1_500;
 
 // A model pull moves gigabytes, so it is bounded by evidence of progress plus a
@@ -84,8 +88,14 @@ const PULL_LINE_ENCODER = new TextEncoder();
 
 export interface OllamaClientConfig {
   endpoint: string;
-  /** Per-invocation timeout in ms; defaults to 30s. Never bounds `pull`. */
+  /** Per-invocation timeout in ms for show; defaults to 30 s. Never bounds `pull`. */
   timeoutMs?: number;
+  /**
+   * Generation timeout in ms. When omitted, falls back to `timeoutMs` and
+   * then to `GENERATION_TIMEOUT_MS` (120 s), preserving the legacy behaviour
+   * where a caller that only sets `timeoutMs` has it apply to generation too.
+   */
+  generateTimeoutMs?: number;
   /**
    * Silence (no NDJSON progress line) that ends a streaming pull; defaults to
    * `PULL_INACTIVITY_TIMEOUT_MS`.
@@ -144,6 +154,7 @@ const SHA256_DIGEST = /^(?:sha256:)?([0-9a-f]{64})$/;
 export class OllamaClient {
   private endpoint: string;
   private timeoutMs: number;
+  private generateTimeoutMs: number;
   private pullInactivityTimeoutMs: number;
   private pullCeilingMs: number;
   private fetchImpl: typeof fetch;
@@ -151,6 +162,10 @@ export class OllamaClient {
   constructor(config: OllamaClientConfig) {
     this.endpoint = stripTrailingSlashes(config.endpoint);
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    // Precedence: explicit generateTimeoutMs > legacy timeoutMs > module default.
+    // A caller that already set timeoutMs (e.g. in tests) retains that ceiling
+    // for generation rather than silently jumping to 120 s.
+    this.generateTimeoutMs = config.generateTimeoutMs ?? config.timeoutMs ?? GENERATION_TIMEOUT_MS;
     this.pullInactivityTimeoutMs = config.pullInactivityTimeoutMs ??
       PULL_INACTIVITY_TIMEOUT_MS;
     this.pullCeilingMs = config.pullCeilingMs ?? PULL_ABSOLUTE_CEILING_MS;
@@ -447,6 +462,14 @@ export class OllamaClient {
    * Generate a completion. Maps to `POST /api/generate` with `stream: false`
    * for v1.2; streaming is a v1.3+ enhancement (the chat surface will need
    * SSE forwarding then).
+   *
+   * `think: false` is set unconditionally: models in the qwen3 family default
+   * to producing a potentially long `<think>` chain before any visible text,
+   * consuming the entire `num_predict` budget on thinking tokens and returning
+   * `response: ""`. Disabling thinking makes the model answer directly, which
+   * is what the concierge and sentinel surfaces need from a local 14B model.
+   * An empty-text guard after the call fails closed: a model that returns no
+   * visible text is treated as a failure, never as a zero-length success.
    */
   async generate(args: {
     model: string;
@@ -457,7 +480,9 @@ export class OllamaClient {
     const startedAt = Date.now();
     try {
       const ctl = new AbortController();
-      const timer = setTimeout(() => ctl.abort(), this.timeoutMs);
+      // Generation on a local 14B model is bounded by generateTimeoutMs
+      // (default 120 s), not the 30 s show timeout.
+      const timer = setTimeout(() => ctl.abort(), this.generateTimeoutMs);
       try {
         const res = await this.fetchImpl(`${this.endpoint}/api/generate`, {
           method: "POST",
@@ -467,6 +492,11 @@ export class OllamaClient {
             prompt: args.prompt,
             system: args.system,
             stream: false,
+            // Thinking mode is disabled: a local model's thinking chain consumes
+            // the num_predict budget without producing visible text, and there is
+            // no product surface that consumes the thinking field. MUST MATCH the
+            // test expectation in `test/intelligence/ollama-provisioning.test.ts`.
+            think: false,
             options: args.maxTokens ? { num_predict: args.maxTokens } : undefined,
           }),
           signal: ctl.signal,
@@ -480,11 +510,25 @@ export class OllamaClient {
           });
         }
         const body = (await res.json()) as { response?: string };
-        const text = body.response ?? "";
+        const rawText = body.response ?? "";
+        // A model that returns empty visible text has not answered the
+        // question; treating it as success would hand the caller a blank
+        // string that looks like a valid response.  Fail closed so the
+        // selector can record the failure and try a fallback.  Trim is
+        // used only for the empty-detection check; the original text is
+        // returned so leading/trailing whitespace is preserved for the
+        // caller.
+        if (rawText.trim().length === 0) {
+          return failure({
+            startedAt,
+            class: "substrate_capability_unsupported",
+            message: "ollama returned empty response text",
+          });
+        }
         return {
           servedBy: "local",
           failureClass: null,
-          body: { kind: "summarize", text },
+          body: { kind: "summarize", text: rawText },
           completedAt: new Date().toISOString(),
           latencyMs: Date.now() - startedAt,
         };

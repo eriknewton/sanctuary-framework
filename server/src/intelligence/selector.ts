@@ -1226,6 +1226,8 @@ export class SubstrateSelector {
     }
 
     response = withTotalLatency(response, startedAt);
+    // Persist invocation audit rows before returning to short-lived callers.
+    // Storage failure must remain observable without exposing storage details.
     if (!emitInvoked) {
       if (primaryFailure) {
         const failurePayload: IntelligenceSubstrateFailurePayload = {
@@ -1239,7 +1241,7 @@ export class SubstrateSelector {
           failure_class: primaryFailure.response.failureClass ?? "internal_error",
           fallback_taken: primaryFailure.fallbackTaken,
         };
-        this.emit(INTEL_OPS.SUBSTRATE_FAILURE, failurePayload, "failure");
+        await this.emitAwaited(INTEL_OPS.SUBSTRATE_FAILURE, failurePayload, "failure");
         const snippet = primaryFailure.response.body.kind === "failure"
           ? primaryFailure.response.body.message
           : `${choice} ${method} failed`;
@@ -1262,7 +1264,7 @@ export class SubstrateSelector {
       latency_ms: response.latencyMs,
       failure_class: response.failureClass,
     };
-    this.emit(INTEL_OPS.SUBSTRATE_INVOKED, invokedPayload, response.failureClass ? "failure" : "success");
+    await this.emitAwaited(INTEL_OPS.SUBSTRATE_INVOKED, invokedPayload, response.failureClass ? "failure" : "success");
 
     if (primaryFailure) {
       const failurePayload: IntelligenceSubstrateFailurePayload = {
@@ -1276,7 +1278,7 @@ export class SubstrateSelector {
         failure_class: primaryFailure.response.failureClass ?? "internal_error",
         fallback_taken: primaryFailure.fallbackTaken,
       };
-      this.emit(INTEL_OPS.SUBSTRATE_FAILURE, failurePayload, "failure");
+      await this.emitAwaited(INTEL_OPS.SUBSTRATE_FAILURE, failurePayload, "failure");
       const snippet = primaryFailure.response.body.kind === "failure"
         ? primaryFailure.response.body.message
         : `${choice} ${method} failed`;
@@ -2169,6 +2171,29 @@ export class SubstrateSelector {
 
   private emit(operation: string, payload: IntelligenceAuditPayload, result: "success" | "failure"): void {
     void this.auditLog.append("l2", operation, this.identityId, payload as unknown as Record<string, unknown>, result);
+  }
+
+  /**
+   * Awaited variant of `emit` for the `invoke()` path. Substrate-invocation
+   * audit rows must be persisted before the response reaches the caller,
+   * so a short-lived caller can safely exit after awaiting the invocation.
+   * A failed audit write is
+   * re-thrown as a generic error (no raw storage details) so the caller
+   * exits nonzero; the record of what happened must reach persistent storage.
+   */
+  private async emitAwaited(
+    operation: string,
+    payload: IntelligenceAuditPayload,
+    result: "success" | "failure",
+  ): Promise<void> {
+    try {
+      await this.auditLog.append("l2", operation, this.identityId, payload as unknown as Record<string, unknown>, result);
+    } catch {
+      // Re-throw a generic error without raw storage details or private
+      // paths; the raw cause is intentionally discarded to avoid leaking
+      // storage internals through the concierge error surface.
+      throw new Error("intelligence audit persistence failed");
+    }
   }
 }
 
