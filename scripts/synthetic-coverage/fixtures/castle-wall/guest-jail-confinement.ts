@@ -1,5 +1,5 @@
 /**
- * Synthetic fixtures for assurance row 21: hostile-guest containment — the
+ * Synthetic fixtures for assurance row 22: hostile-guest containment — the
  * macOS box launcher jails uncooperative plugins via the B2 inner-confinement
  * seccomp-deny-AF_VSOCK shim.
  *
@@ -37,7 +37,7 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { registerFixture, type FixtureOutcome } from "../../registry.js";
 
-const CLAIM_ID = "21";
+const CLAIM_ID = "22";
 const CLAIM_LABEL =
   "Hostile-guest containment: macOS box launcher jails uncooperative plugins (B2 inner-confinement, seccomp-deny-AF_VSOCK)";
 

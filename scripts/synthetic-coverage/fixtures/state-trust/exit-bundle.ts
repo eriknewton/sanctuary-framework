@@ -15,7 +15,7 @@ import { MemoryStorage } from "../../../../server/src/storage/memory.js";
 import { registerFixture } from "../../registry.js";
 import { captureError, outcome } from "./helpers.js";
 
-const CLAIM_ID = "12";
+const CLAIM_ID = "13";
 const CLAIM_LABEL = "Export / exit bundle";
 
 // Entrypoints: exportExitBundle, verifyExitBundle, and importExitBundle in server/src/exit/index.ts.

@@ -20,7 +20,7 @@ import {
 // Entrypoints: mesh/trust-root.verifyCertChain and
 // mesh/lifecycle/node-roster.lookupActiveNodeCert. Existing mirror:
 // server/test/mesh/trust-root.test.ts.
-// ASSURANCE_MATRIX row: 18, did:key encoding. This fixture binds the same
+// ASSURANCE_MATRIX row: 19, did:key encoding. This fixture binds the same
 // identity-key material to the node certificate resolution path.
 
 function makeCertRig() {
