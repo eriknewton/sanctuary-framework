@@ -362,6 +362,127 @@ describe("withCrossProcessLock", () => {
     },
   );
 
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "re-observes a transient unknown owner probe before preserving mutual exclusion",
+    async () => {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const trace: string[] = [];
+      let holderAcquired!: () => void;
+      const acquired = new Promise<void>((resolve) => { holderAcquired = resolve; });
+      const holder = track(withCrossProcessLock(
+        storage,
+        NS,
+        LOCK,
+        async () => {
+          trace.push("holder:start");
+          await held;
+          trace.push("holder:end");
+        },
+        {
+          kernelBacked: true,
+          __testAfterKernelSocketAcquired: () => { holderAcquired(); },
+        },
+      ), release);
+      await Promise.race([
+        acquired,
+        holder.then(() => { throw new Error("holder released before acquisition was observed"); }),
+      ]);
+
+      let forcedUnknowns = 0;
+      let observeRealContention!: () => void;
+      const realContention = new Promise<void>((resolve) => {
+        observeRealContention = resolve;
+      });
+      const contender = track(withCrossProcessLock(
+        storage,
+        NS,
+        LOCK,
+        async () => { trace.push("contender:start"); },
+        {
+          kernelBacked: true,
+          timeoutMs: 500,
+          retryMs: 5,
+          __testForceKernelProbeUnknown: () => {
+            forcedUnknowns += 1;
+            return forcedUnknowns === 1;
+          },
+          onContended: (attempt) => {
+            if (attempt === 2) observeRealContention();
+          },
+        },
+      ));
+
+      await realContention;
+      expect(forcedUnknowns).toBeGreaterThanOrEqual(2);
+      expect(trace).toEqual(["holder:start"]);
+      release();
+      await expect(Promise.all([holder, contender])).resolves.toEqual([undefined, undefined]);
+      expect(trace).toEqual(["holder:start", "holder:end", "contender:start"]);
+    },
+  );
+
+  it.runIf(process.platform === "darwin" || process.platform === "linux")(
+    "bounds persistent unknown owner probes without entering or reaping",
+    async () => {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let socketPath = "";
+      let holderAcquired!: () => void;
+      const acquired = new Promise<void>((resolve) => { holderAcquired = resolve; });
+      const holder = track(withCrossProcessLock(
+        storage,
+        NS,
+        LOCK,
+        async () => { await held; },
+        {
+          kernelBacked: true,
+          __testAfterKernelSocketAcquired: (path) => {
+            socketPath = path;
+            holderAcquired();
+          },
+        },
+      ), release);
+      await Promise.race([
+        acquired,
+        holder.then(() => { throw new Error("holder released before acquisition was observed"); }),
+      ]);
+      const before = await lstat(socketPath);
+
+      let operationRan = false;
+      let reaperRan = false;
+      let forcedUnknowns = 0;
+      const contender = withCrossProcessLock(
+        storage,
+        NS,
+        LOCK,
+        async () => { operationRan = true; },
+        {
+          kernelBacked: true,
+          timeoutMs: 40,
+          retryMs: 5,
+          __testForceKernelProbeUnknown: () => {
+            forcedUnknowns += 1;
+            return true;
+          },
+          __testAfterStaleReaperStarted: () => { reaperRan = true; },
+        },
+      );
+      await expect(contender).rejects.toMatchObject({
+        kind: "io",
+        message: expect.stringContaining("owner liveness is indeterminate"),
+      });
+      expect(forcedUnknowns).toBeGreaterThan(1);
+      expect(operationRan).toBe(false);
+      expect(reaperRan).toBe(false);
+      const after = await lstat(socketPath);
+      expect({ dev: after.dev, ino: after.ino }).toEqual({ dev: before.dev, ino: before.ino });
+
+      release();
+      await holder;
+    },
+  );
+
   it.runIf(process.platform === "darwin")(
     "fails closed without writing when the inode-bound directory worker dies",
     async () => {

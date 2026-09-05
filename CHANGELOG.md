@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-09-04
+
+### Changed
+
+- **Local concierge responses use a longer generation window and complete after their outcome is recorded.**
+- **Local-intelligence setup shows signed model-manifest verification before consent and download.** The operator can see which manifest was verified before approving the model pull.
+
+### Fixed
+
+- Headless `init` and Protect stage recovery material outside the fortress and show only its location.
+- A failed Castle Wall daemon start no longer implies that an existing wall is unarmed.
+- Idle MCP sessions close their own listeners when the harness disconnects or requests shutdown.
+- A briefly indeterminate custody-lock owner is checked again within the existing timeout; uncertain ownership still refuses access.
+
+### Bounds
+
+Ollama is installed by the operator. Light assurance compares the runtime-reported model digest with the signed manifest at the documented checkpoints. Automatic discovery of newer signed manifests is unavailable.
+
 ## [1.8.1] - 2026-09-04
 
 ### Fixed
