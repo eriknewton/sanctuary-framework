@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The machine-local passphrase fallback file now survives a change in the host's resolved hostname (for example `.local` versus `.localdomain` after a reboot); files written under the earlier derivation are migrated on the next successful read.
+
 ## [1.8.3] - 2026-09-05
 
 v1.8.2 was tagged but never published. This release carries every 1.8.2 change listed below and adds one release-process fix.

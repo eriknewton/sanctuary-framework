@@ -21,7 +21,7 @@
 
 import { lstat, mkdir, unlink } from "node:fs/promises";
 import { realpathSync, statSync } from "node:fs";
-import { homedir, hostname, platform, userInfo } from "node:os";
+import { homedir, platform, userInfo } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { gcm } from "@noble/ciphers/aes.js";
@@ -37,6 +37,11 @@ import {
   classifyLinuxFailure,
   type KeychainReadStatus,
 } from "./keychain-custody.js";
+import {
+  hostnameMigrationCandidates,
+  resolveMachineIdentity,
+  type MachineIdentity,
+} from "./host-identity.js";
 
 // ── Constants ───────────────────────────────────────────────────────
 
@@ -46,6 +51,37 @@ const KEYCHAIN_SERVICE_DEFAULT = "sanctuary-passphrase";
 const FALLBACK_FILE_VERSION = 3;
 const LEGACY_FALLBACK_FILE_VERSION = 2;
 const FALLBACK_FILE_ALG = "aes-256-gcm";
+/** Raw (pre-envelope) fallback layout: a 12-byte AES-GCM nonce, then ciphertext. */
+const FALLBACK_NONCE_BYTES = 12;
+/**
+ * 13 = the 12-byte nonce plus at least one ciphertext byte. Below this the file
+ * cannot even be split into its two parts, so it is rejected before any key is
+ * derived.
+ */
+const MIN_RAW_FALLBACK_BYTES = FALLBACK_NONCE_BYTES + 1;
+/** 32 = the AES-256-GCM key width named by {@link FALLBACK_FILE_ALG}. */
+const MACHINE_KEY_BYTES = 32;
+/**
+ * HKDF info label for the machine-local fallback-file key.
+ *
+ * v2 binds the key to the host's STABLE identity (see `wrap/host-identity.ts`).
+ * v1 bound it to `os.hostname()`, which is not boot-invariant, so a file
+ * written on one boot could stop authenticating on the next with the file and
+ * the machine both untouched.
+ *
+ * INVARIANT (enforcement site): the label is BUMPED rather than reused, so a v1
+ * key and a v2 key can never both be valid for one file. That is what makes the
+ * read-time ladder below sound: an authenticated decryption under v1 material
+ * is positive evidence the file predates the migration, and only that evidence
+ * authorizes the in-place re-wrap.
+ *
+ * Both labels must match their rows in
+ * `server/docs/hkdf-info-string-registry.md` and
+ * `server/test/fixtures/at-rest/hkdf-label-classification.json`.
+ */
+const MACHINE_KEY_HKDF_INFO = "sanctuary-passphrase-v2-host-identity";
+/** Superseded label; still derived on the READ path only, never on a write. */
+const LEGACY_HOSTNAME_MACHINE_KEY_HKDF_INFO = "sanctuary-passphrase-v1";
 /** Human-readable label for Linux Secret Service items (shown in Seahorse,
  * KeePassXC, KDE KWalletManager). Invisible on macOS. */
 const KEYCHAIN_LABEL = "Sanctuary Passphrase";
@@ -129,16 +165,32 @@ export interface PassphraseOptions {
    */
   exec?: (cmd: string, args: string[], input?: string) => Promise<ExecResult>;
   /**
-   * Override the machine-local key derivation (for tests that simulate
+   * Override the machine-local key derivation ENTIRELY (for tests that simulate
    * host/user migration). Production callers leave this undefined.
+   *
+   * A caller that supplies this owns the whole derivation authority, so the
+   * built-in read-time migration ladder is NOT run underneath it: letting a key
+   * the caller never named decrypt the file would silently widen what that
+   * caller accepts. Use {@link machineIdentityOverride} instead to model a
+   * different HOST while keeping the product's own derivations.
    */
   deriveMachineKey?: (home: string) => Uint8Array;
   /**
+   * Override the host facts the built-in fallback-file key derivations read
+   * from the machine (for tests that model a host whose resolved hostname
+   * changed, or a host that exposes no stable identity). Production callers
+   * leave this undefined, in which case the facts come from
+   * `wrap/host-identity.ts`. Ignored when {@link deriveMachineKey} is supplied,
+   * which replaces the derivations these facts feed.
+   */
+  machineIdentityOverride?: MachineIdentity;
+  /**
    * Declared-read-only caller: perform NO writes of any kind while reading.
    * Honored by {@link readStoredPassphrase}, whose one write path is the
-   * in-place upgrade of a legacy-format fallback file to the current
-   * envelope; under this flag that upgrade is skipped and the file is left
-   * byte-identical. Read-only diagnostics (the audit-chain repair-plan verb)
+   * in-place repair of a fallback file that is not in the current at-rest form
+   * (a superseded envelope, a superseded machine key, or both); under this flag
+   * that repair is skipped and the file is left byte-identical. Read-only
+   * diagnostics (the audit-chain repair-plan verb)
    * MUST set this: their no-mutation contract covers the whole fortress
    * directory, and `passphrase.enc` lives inside it. Meaningless to
    * {@link getOrCreatePassphrase}, which exists to mint custody and never
@@ -345,9 +397,33 @@ type KeyringReadResult =
 
 /** Outcome of reading the fallback passphrase file. */
 type FallbackReadResult =
-  | { status: "ok"; value: string; legacy: boolean }
+  | {
+      status: "ok";
+      value: string;
+      /**
+       * The file authenticated, but not in the CURRENT at-rest form: either its
+       * envelope predates the canonical-AAD shape, or it opened under a
+       * superseded machine key. Both are repaired by the same in-place re-wrap,
+       * and a caller that declared itself read-only skips it. The value read is
+       * identical either way.
+       */
+      staleAtRest: boolean;
+    }
   | { status: "not-found" }
   | { status: "unreadable"; reason: string };
+
+/**
+ * The machine-local key material for the fallback file, as a ladder.
+ *
+ * `primary` is what a WRITE uses and what a read tries first. `legacy` is the
+ * bounded, ordered set of superseded derivations a read may fall back to before
+ * declaring the file unreadable; it is empty when the caller supplied its own
+ * derivation. Both take `home` because the home path is part of the material.
+ */
+interface MachineKeyLadder {
+  primary(home: string): Uint8Array;
+  legacy(home: string): Uint8Array[];
+}
 
 // `ExecResult` now lives in the leaf module exec-result.ts so passphrase.ts and
 // keychain-custody.ts can share it without an import cycle (passphrase.ts also
@@ -377,7 +453,7 @@ export async function getOrCreatePassphrase(
   const service = identity.keychainService;
   const plat = opts.platformOverride ?? platform();
   const exec = opts.exec ?? defaultExec;
-  const derive = opts.deriveMachineKey ?? deriveMachineKey;
+  const keys = resolveMachineKeyLadder(opts);
 
   // 1. Try the OS keyring (canonical realpath name, then lexical + 12-hex legacy).
   const fromKeyring = await readPassphraseFromKeyring(
@@ -397,17 +473,17 @@ export async function getOrCreatePassphrase(
     fallback,
     identity.fallbackAadIdentity,
     home,
-    derive,
+    keys,
     opts.fallbackCapability,
   );
   if (fromFile.status === "ok") {
-    if (fromFile.legacy) {
+    if (fromFile.staleAtRest) {
       await writeToFallbackFile(
         fallback,
         identity.fallbackAadIdentity,
         fromFile.value,
         home,
-        derive,
+        keys,
         opts.fallbackCapability,
       );
     }
@@ -528,7 +604,7 @@ export async function observeStoredPassphrase(
     capturePassphraseCredentialIdentity(storagePath, home);
   const plat = opts.platformOverride ?? platform();
   const exec = opts.exec ?? defaultExec;
-  const derive = opts.deriveMachineKey ?? deriveMachineKey;
+  const keys = resolveMachineKeyLadder(opts);
 
   // Same precedence as getOrCreatePassphrase: keyring (canonical realpath name,
   // then lexical and 12-hex legacy for pre-realpath / pre-v1.2.3 entries), then
@@ -558,23 +634,24 @@ export async function observeStoredPassphrase(
     fallback,
     identity.fallbackAadIdentity,
     home,
-    derive,
+    keys,
     opts.fallbackCapability,
   );
   if (fromFile.status === "ok") {
-    // A legacy-format file is normally upgraded in place here (fresh nonce,
-    // current envelope). A caller that declared itself read-only must not
-    // trigger that rewrite: "read the stored passphrase" and "modernize the
-    // file holding it" are different authorities, and a diagnostic holds
-    // only the first. The value read is identical either way; only the
-    // at-rest format upgrade is deferred to the next non-read-only caller.
-    if (fromFile.legacy && !opts.readOnly) {
+    // A file in a superseded at-rest form is normally repaired in place here
+    // (fresh nonce, current envelope, current machine key). A caller that
+    // declared itself read-only must not trigger that rewrite: "read the stored
+    // passphrase" and "modernize the file holding it" are different
+    // authorities, and a diagnostic holds only the first. The value read is
+    // identical either way; the repair is deferred to the next non-read-only
+    // caller, and the ladder keeps opening the file until then.
+    if (fromFile.staleAtRest && !opts.readOnly) {
       await writeToFallbackFile(
         fallback,
         identity.fallbackAadIdentity,
         fromFile.value,
         home,
-        derive,
+        keys,
         opts.fallbackCapability,
       );
     }
@@ -704,7 +781,7 @@ export async function persistUserProvidedPassphrase(
   const service = identity.keychainService;
   const plat = opts.platformOverride ?? platform();
   const exec = opts.exec ?? defaultExec;
-  const derive = opts.deriveMachineKey ?? deriveMachineKey;
+  const keys = resolveMachineKeyLadder(opts);
 
   if (plat === "darwin") {
     const write = await writeToKeychain(value, exec, service);
@@ -727,7 +804,7 @@ export async function persistUserProvidedPassphrase(
       identity.fallbackAadIdentity,
       value,
       home,
-      derive,
+      keys,
       opts.fallbackCapability,
     );
   } catch (err) {
@@ -747,7 +824,7 @@ export async function persistAndConfirmUserProvidedPassphrase(
     capturePassphraseCredentialIdentity(storagePath, home);
   const plat = opts.platformOverride ?? platform();
   const exec = opts.exec ?? defaultExec;
-  const derive = opts.deriveMachineKey ?? deriveMachineKey;
+  const keys = resolveMachineKeyLadder(opts);
   const fallback = fallbackFilePath(home, storagePath);
 
   const keyringSnapshot = new Map<string, KeyringReadResult>();
@@ -854,14 +931,14 @@ export async function persistAndConfirmUserProvidedPassphrase(
       identity.fallbackAadIdentity,
       value,
       home,
-      derive,
+      keys,
       opts.fallbackCapability,
     );
     const confirmed = await readFromFallbackFile(
       fallback,
       identity.fallbackAadIdentity,
       home,
-      derive,
+      keys,
       opts.fallbackCapability,
     );
     if (confirmed.status !== "ok" || confirmed.value !== value) {
@@ -1401,7 +1478,7 @@ async function readFromFallbackFile(
   path: string,
   aadIdentity: string,
   home: string,
-  derive: (home: string) => Uint8Array = deriveMachineKey,
+  keys: MachineKeyLadder,
   capability?: NonNullable<PassphraseOptions["fallbackCapability"]>,
 ): Promise<FallbackReadResult> {
   let raw: Buffer;
@@ -1422,40 +1499,39 @@ async function readFromFallbackFile(
   }
   try {
     const parsed = parseFallbackEnvelope(raw);
-    if (!parsed && raw.length < 13) {
+    if (!parsed && raw.length < MIN_RAW_FALLBACK_BYTES) {
       return { status: "unreadable", reason: "file too short to contain a valid nonce + ciphertext" };
     }
-    const key = derive(home);
-    if (parsed) {
-      try {
-        const aad = parsed.canonicalAad
-          ? fallbackFileAad(aadIdentity)
-          : legacyFallbackFileAad(path);
-        const plain = gcm(key, parsed.nonce, aad).decrypt(parsed.ciphertext);
-        return {
-          status: "ok",
-          value: Buffer.from(plain).toString("utf-8"),
-          // V2 used dirname(the actual fallback path) as AAD. Only an
-          // authenticated success authorizes a writable V3 promotion.
-          legacy: !parsed.canonicalAad,
-        };
-      } finally {
-        key.fill(0);
-      }
-    }
-    const nonce = raw.subarray(0, 12);
-    const ciphertext = raw.subarray(12);
-    try {
-      const cipher = gcm(key, nonce);
-      const plain = cipher.decrypt(ciphertext);
-      return {
-        status: "ok",
-        value: Buffer.from(plain).toString("utf-8"),
-        legacy: true,
-      };
-    } finally {
-      key.fill(0);
-    }
+    const attempt = parsed
+      ? decryptWithMachineKeyLadder(
+          {
+            nonce: parsed.nonce,
+            ciphertext: parsed.ciphertext,
+            // V2 used dirname(the actual fallback path) as AAD.
+            aad: parsed.canonicalAad
+              ? fallbackFileAad(aadIdentity)
+              : legacyFallbackFileAad(path),
+          },
+          keys,
+          home,
+        )
+      : decryptWithMachineKeyLadder(
+          {
+            nonce: raw.subarray(0, FALLBACK_NONCE_BYTES),
+            ciphertext: raw.subarray(FALLBACK_NONCE_BYTES),
+          },
+          keys,
+          home,
+        );
+    if (!attempt.ok) return { status: "unreadable", reason: attempt.reason };
+    return {
+      status: "ok",
+      value: attempt.value,
+      // Only an AUTHENTICATED success authorizes the writable promotion below.
+      // Three superseded at-rest forms map onto one repair: the pre-envelope
+      // raw layout, the V2 AAD, and a superseded machine key.
+      staleAtRest: !parsed || !parsed.canonicalAad || attempt.legacyMachineKey,
+    };
   } catch (err) {
     return {
       status: "unreadable",
@@ -1469,7 +1545,7 @@ async function writeToFallbackFile(
   aadIdentity: string,
   value: string,
   home: string,
-  derive: (home: string) => Uint8Array = deriveMachineKey,
+  keys: MachineKeyLadder,
   capability?: NonNullable<PassphraseOptions["fallbackCapability"]>,
 ): Promise<void> {
   // Derive the parent directory from the resolved path rather than assuming
@@ -1477,8 +1553,14 @@ async function writeToFallbackFile(
   // create the correct directory.
   const dir = dirname(path);
   if (!capability) await mkdir(dir, { recursive: true, mode: 0o700 });
-  const nonce = randomBytes(12);
-  const key = derive(home);
+  // A fresh nonce every write, including the in-place migration re-wrap: the
+  // new ciphertext is under a different key, but reusing a nonce is never the
+  // safe default to leave available to a later edit.
+  const nonce = randomBytes(FALLBACK_NONCE_BYTES);
+  // INVARIANT (enforcement site): a write NEVER uses a legacy ladder key. The
+  // superseded derivations exist so an old file can be read once and repaired,
+  // not so a new file can be produced in the form that caused the repair.
+  const key = keys.primary(home);
   let ciphertext: Uint8Array;
   try {
     const cipher = gcm(key, nonce, fallbackFileAad(aadIdentity));
@@ -1586,7 +1668,28 @@ function parseFallbackEnvelope(raw: Buffer): {
 }
 
 /**
- * Derive a machine-local key from hostname + uid + home path.
+ * The material every machine-local key derivation hashes: one host fact, then
+ * uid, username, and home path.
+ *
+ * Must match the mirrored derivation in
+ * `server/test/wrap/passphrase-host-identity.test.ts` and the one in
+ * `server/test/cli/audit-chain-repair-plan.test.ts`, both of which plant a file
+ * in the superseded form to prove the migration read works. If the field order
+ * or the separator changes here, those planted files stop being the artifact
+ * under test and the tests pass while proving nothing.
+ */
+function machineKeyMaterial(home: string, hostFact: string): Buffer {
+  const info = userInfo();
+  return Buffer.from(
+    `${hostFact}:${info.uid}:${info.username}:${home}`,
+    "utf-8"
+  );
+}
+
+/**
+ * Derive the machine-local key from the host's STABLE identity + uid + username
+ * + home path.
+ *
  * This is NOT cryptographically strong authentication, it only ensures that
  * the encrypted file cannot be read off a different machine. If an attacker
  * already has local access, they can trivially re-derive this.
@@ -1594,15 +1697,127 @@ function parseFallbackEnvelope(raw: Buffer): {
  * Threat model: see `server/docs/keychain-schema.md`, "Windows or
  * no-OS-keyring fallback: encrypted file" section. The fallback file is
  * intended for single-user machines without an OS keyring, NOT for
- * multi-user machines, shared CI runners, or snapshotted VMs.
+ * multi-user machines, shared CI runners, or snapshotted VMs. Binding to a
+ * stable host identity rather than to the resolved hostname changes NOTHING
+ * about that threat model: both facts are readable by any local user. What it
+ * changes is that the key survives a reboot on which the host answers to a
+ * different spelling of its own name.
  */
-function deriveMachineKey(home: string): Uint8Array {
-  const info = userInfo();
-  const material = Buffer.from(
-    `${hostname()}:${info.uid}:${info.username}:${home}`,
-    "utf-8"
+function deriveMachineKey(home: string, identity: MachineIdentity): Uint8Array {
+  if (identity.stableHostId === null) {
+    // No stable identity on this platform (Windows, or a host whose probe did
+    // not answer). Absent evidence is not a pass, and it is not a licence to
+    // invent a weaker binding either: keep the EXISTING hostname derivation, so
+    // such a host is exactly as well off as before and its files stay readable.
+    // The audited cost is that this host keeps the hostname sensitivity the v2
+    // label exists to remove. It is stated here rather than silently absorbed.
+    return deriveLegacyHostnameMachineKey(home, identity.hostname);
+  }
+  return hkdf(
+    sha256,
+    machineKeyMaterial(home, identity.stableHostId),
+    undefined,
+    MACHINE_KEY_HKDF_INFO,
+    MACHINE_KEY_BYTES
   );
-  return hkdf(sha256, material, undefined, "sanctuary-passphrase-v1", 32);
+}
+
+/**
+ * The SUPERSEDED derivation: machine-local key from a resolved hostname.
+ * Derived on the read path only, so a file written before the migration still
+ * opens. Never used for a write.
+ */
+function deriveLegacyHostnameMachineKey(
+  home: string,
+  host: string
+): Uint8Array {
+  return hkdf(
+    sha256,
+    machineKeyMaterial(home, host),
+    undefined,
+    LEGACY_HOSTNAME_MACHINE_KEY_HKDF_INFO,
+    MACHINE_KEY_BYTES
+  );
+}
+
+/**
+ * Resolve the key ladder for one call.
+ *
+ * INVARIANT (enforcement site): an injected `deriveMachineKey` yields an EMPTY
+ * legacy set. That caller declared the whole derivation authority, and running
+ * the product's host-derived candidates underneath it would let a key it never
+ * named authenticate the file.
+ *
+ * The host facts are read LAZILY, on the first key derivation rather than here.
+ * Resolving a stable host identity costs a subprocess on macOS, and the common
+ * path never needs one: a fortress whose credential is in the OS keyring
+ * returns before any fallback key is derived. Every entry point below builds a
+ * ladder unconditionally, so an eager probe would put that subprocess on every
+ * custody read on the machine.
+ */
+function resolveMachineKeyLadder(opts: PassphraseOptions): MachineKeyLadder {
+  const injected = opts.deriveMachineKey;
+  if (injected) return { primary: injected, legacy: () => [] };
+  let identity: MachineIdentity | undefined;
+  const hostFacts = (): MachineIdentity =>
+    (identity ??=
+      opts.machineIdentityOverride ??
+      resolveMachineIdentity(opts.platformOverride ?? platform()));
+  return {
+    primary: (home) => deriveMachineKey(home, hostFacts()),
+    legacy: (home) =>
+      hostnameMigrationCandidates(hostFacts().hostname).map((host) =>
+        deriveLegacyHostnameMachineKey(home, host)
+      ),
+  };
+}
+
+/** One authenticated-decryption attempt against the whole key ladder. */
+type MachineKeyLadderAttempt =
+  | { ok: true; value: string; legacyMachineKey: boolean }
+  | { ok: false; reason: string };
+
+/**
+ * Try the current machine key, then each superseded hostname-derived key, until
+ * one AUTHENTICATES the ciphertext.
+ *
+ * INVARIANT (enforcement site): every candidate key is zeroed on the way out,
+ * including the one that succeeded, and the walk stops at the first AEAD
+ * success. `legacyMachineKey` is reported ONLY from an authenticated
+ * decryption, so a failed candidate can never widen what the caller is then
+ * allowed to do with the file.
+ */
+function decryptWithMachineKeyLadder(
+  parts: { nonce: Uint8Array; ciphertext: Uint8Array; aad?: Uint8Array },
+  keys: MachineKeyLadder,
+  home: string
+): MachineKeyLadderAttempt {
+  const candidates = [
+    { key: keys.primary(home), legacyMachineKey: false },
+    ...keys.legacy(home).map((key) => ({ key, legacyMachineKey: true })),
+  ];
+  let reason = "no machine key authenticated the fallback file";
+  try {
+    for (const candidate of candidates) {
+      try {
+        const cipher =
+          parts.aad === undefined
+            ? gcm(candidate.key, parts.nonce)
+            : gcm(candidate.key, parts.nonce, parts.aad);
+        const plain = cipher.decrypt(parts.ciphertext);
+        return {
+          ok: true,
+          value: Buffer.from(plain).toString("utf-8"),
+          legacyMachineKey: candidate.legacyMachineKey,
+        };
+      } catch (err) {
+        reason = (err as Error).message ?? "unknown decryption error";
+      }
+    }
+  } finally {
+    for (const candidate of candidates) candidate.key.fill(0);
+  }
+  return { ok: false, reason };
 }
 
 // ── Default exec implementation ─────────────────────────────────────
