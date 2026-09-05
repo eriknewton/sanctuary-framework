@@ -353,6 +353,21 @@ export async function runInit(
         "No fortress layout was created.",
     );
   }
+
+  // Check the fortress parent before staging any external recovery destination:
+  // a failed fortress-path preflight must not leave recovery scaffolding behind.
+  const fortressWritable = await preflightFortressPathWritable(fortressPath);
+  if (!fortressWritable.ok) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  Sanctuary init: ${formatFortressPathWritableError(
+        fortressPath,
+        fortressWritable,
+      )}\n`,
+    );
+    throw new Error("fortress path is not writable");
+  }
+
   let recoveryKeyOutputPath: string | undefined;
   try {
     recoveryKeyOutputPath = resolveRecoveryKeyOutputPath({
@@ -402,18 +417,6 @@ export async function runInit(
       console.error(`\n  Sanctuary init: ${prefix}: ${message}\n`);
       throw err;
     }
-  }
-
-  const fortressWritable = await preflightFortressPathWritable(fortressPath);
-  if (!fortressWritable.ok) {
-    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(
-      `\n  Sanctuary init: ${formatFortressPathWritableError(
-        fortressPath,
-        fortressWritable,
-      )}\n`,
-    );
-    throw new Error("fortress path is not writable");
   }
 
   if (!options.force) {
