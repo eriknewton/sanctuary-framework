@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.8.3] - 2026-09-05
+
+v1.8.2 was tagged but never published. This release carries every 1.8.2 change listed below and adds one release-process fix.
+
+### Fixed
+
+- **Release coverage checks credit each fixture to the assurance row it proves.** The fixtures behind the release coverage report now name their correct Assurance Matrix rows, fixture registration refuses two different claims under one row number, and the ordinary test suite checks that every proven row has a passing fixture. Product runtime, fixture bodies and assurance claims are unchanged.
+
 ## [1.8.2] - 2026-09-04
 
 ### Changed
