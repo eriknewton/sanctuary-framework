@@ -481,6 +481,12 @@ export async function runLocalIntelligenceProvisioning(
           recordFailure: reason !== "manifest_rollback",
         });
       }
+      // Catalog-signature check: the signed manifest version has been verified
+      // against the pinned catalog key. Not model-file verification and not
+      // fortress arming; arming requires a complete atomic commit below.
+      ops.print(
+        `Verified signed model manifest v${verified.body.manifest_version} against the pinned catalog key.`,
+      );
 
       const hardware = await ops.probeHardware();
       if (hardware.tier === "below-baseline") {
@@ -649,12 +655,9 @@ export async function runLocalIntelligenceProvisioning(
         );
       }
 
-      // The ceremony's only success output. Without it an armed fortress looks
-      // exactly like one that silently did nothing, which is why the armed
-      // state had to be inferred from an encrypted record.
-      ops.print(
-        `Verified signed model manifest v${verified.body.manifest_version} against the pinned catalog key.`,
-      );
+      // Arming notice: without this, a successful commit looks exactly like one
+      // that silently did nothing; the armed state would otherwise have to be
+      // inferred from the encrypted record alone.
       ops.print(`Local intelligence armed: ${renderArmedBindings(commit)}`);
 
       let provenanceProjection: "projected" | "degraded" = "projected";

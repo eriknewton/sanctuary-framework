@@ -213,9 +213,9 @@ describe("Q5D atomic local intelligence provisioning", () => {
       kind: "already-provisioned",
       provenanceProjection: "projected",
     });
-    // The already-present path performs the same authoritative commit, so it
-    // owes the operator the same two success lines; what it must NOT print is
-    // the install/pull plan, which is what this assertion originally guarded.
+    // Catalog-signature check fires before hardware/plan/commit; armed fires
+    // after the successful commit. Both lines still arrive in this order.
+    // No install/pull plan is printed on the already-present path.
     const printed = (ops.print as ReturnType<typeof vi.fn>).mock.calls.map(
       (call) => String(call[0]),
     );
@@ -539,5 +539,142 @@ describe("Q5D atomic local intelligence provisioning", () => {
       "- Pull qwen2.5:1.5b from registry.ollama.ai (1.5B parameters; license Apache-2.0).",
       "- Verify its signed Ollama manifest root and required on-disk artifacts before binding.",
     ]);
+  });
+
+  describe("notice display order", () => {
+    const VERIFIED_LINE = "Verified signed model manifest v9 against the pinned catalog key.";
+    const ARMED_PREFIX = "Local intelligence armed:";
+
+    it("verified notice precedes confirm, pull, and commit; armed follows commit — fail-before regression", async () => {
+      const journal: string[] = [];
+      const { ops } = makeOps({
+        runtimeVerifier: absentThenPresentVerifier(),
+        print: vi.fn((line: string) => journal.push(`print:${line}`)),
+        confirm: vi.fn(async () => { journal.push("confirm"); return true; }),
+        pull: vi.fn(async () => { journal.push("pull"); return { ok: true, failureClass: null }; }),
+        commitVerified: vi.fn(async () => { journal.push("commit"); }),
+      });
+      await runLocalIntelligenceProvisioning(ops);
+      const verifiedIdx = journal.indexOf(`print:${VERIFIED_LINE}`);
+      const armedIdx = journal.findIndex((e) => e.startsWith(`print:${ARMED_PREFIX}`));
+      const confirmIdx = journal.indexOf("confirm");
+      const pullIdx = journal.indexOf("pull");
+      const commitIdx = journal.indexOf("commit");
+      expect(verifiedIdx).toBeGreaterThanOrEqual(0);
+      expect(armedIdx).toBeGreaterThanOrEqual(0);
+      // Verified notice must precede plan/confirm/pull/commit.
+      expect(verifiedIdx).toBeLessThan(confirmIdx);
+      expect(verifiedIdx).toBeLessThan(pullIdx);
+      expect(verifiedIdx).toBeLessThan(commitIdx);
+      // Armed notice must follow successful commit.
+      expect(armedIdx).toBeGreaterThan(commitIdx);
+      // Exactly one verified notice — a copy left at the old site would double it.
+      expect(journal.filter((e) => e === `print:${VERIFIED_LINE}`)).toHaveLength(1);
+    });
+
+    it("cached path: exactly one verified notice before commit, armed after commit, no pull", async () => {
+      const journal: string[] = [];
+      const { ops } = makeOps({
+        print: vi.fn((line: string) => journal.push(`print:${line}`)),
+        commitVerified: vi.fn(async () => { journal.push("commit"); }),
+      });
+      await runLocalIntelligenceProvisioning(ops);
+      const verifiedIdx = journal.indexOf(`print:${VERIFIED_LINE}`);
+      const armedIdx = journal.findIndex((e) => e.startsWith(`print:${ARMED_PREFIX}`));
+      const commitIdx = journal.indexOf("commit");
+      // No pull on the cached path.
+      expect(journal).not.toContain("pull");
+      expect(verifiedIdx).toBeGreaterThanOrEqual(0);
+      expect(armedIdx).toBeGreaterThanOrEqual(0);
+      expect(verifiedIdx).toBeLessThan(commitIdx);
+      expect(armedIdx).toBeGreaterThan(commitIdx);
+      expect(journal.filter((e) => e === `print:${VERIFIED_LINE}`)).toHaveLength(1);
+    });
+
+    it("invalid catalog signature: no verified or armed print", async () => {
+      const journal: string[] = [];
+      const { ops } = makeOps({
+        verifyManifest: () => ({ ok: false as const, reason: "bad_signature" as const }),
+        print: vi.fn((line: string) => journal.push(`print:${line}`)),
+      });
+      await runLocalIntelligenceProvisioning(ops);
+      expect(journal.some((e) => e === `print:${VERIFIED_LINE}`)).toBe(false);
+      expect(journal.some((e) => e.startsWith(`print:${ARMED_PREFIX}`))).toBe(false);
+    });
+
+    it("headless run: no verified or armed print", async () => {
+      const journal: string[] = [];
+      const { ops } = makeOps({
+        isTty: false,
+        print: vi.fn((line: string) => journal.push(`print:${line}`)),
+      });
+      await runLocalIntelligenceProvisioning(ops);
+      expect(journal.some((e) => e === `print:${VERIFIED_LINE}`)).toBe(false);
+      expect(journal.some((e) => e.startsWith(`print:${ARMED_PREFIX}`))).toBe(false);
+    });
+
+    it("declined after confirmation: exactly one verified notice, no armed print", async () => {
+      const journal: string[] = [];
+      const { ops } = makeOps({
+        // First call returns absent so the code reaches the plan/confirm path.
+        runtimeVerifier: { verify: vi.fn(async () => ({
+          ok: false as const,
+          state: "tags_model_absent" as const,
+          reason: "runtime_model_absent" as const,
+          runtimeTag: "qwen2.5:1.5b",
+        })) },
+        print: vi.fn((line: string) => journal.push(`print:${line}`)),
+        confirm: vi.fn(async () => false),
+      });
+      const result = await runLocalIntelligenceProvisioning(ops);
+      expect(result).toMatchObject({ kind: "refused", reason: "declined" });
+      expect(journal.filter((e) => e === `print:${VERIFIED_LINE}`)).toHaveLength(1);
+      expect(journal.some((e) => e.startsWith(`print:${ARMED_PREFIX}`))).toBe(false);
+    });
+
+    it("below-baseline hardware: exactly one verified notice, no armed print", async () => {
+      const journal: string[] = [];
+      const { ops } = makeOps({
+        probeHardware: vi.fn(async () => ({
+          totalRamGb: 4,
+          cpuArch: "x86_64" as const,
+          tier: "below-baseline" as const,
+          recommendedLocalModel: null,
+          ollamaReachable: false,
+          ollamaModels: [],
+        } satisfies HardwareCapabilityReport)),
+        print: vi.fn((line: string) => journal.push(`print:${line}`)),
+      });
+      const result = await runLocalIntelligenceProvisioning(ops);
+      expect(result).toMatchObject({ kind: "refused", reason: "below_baseline" });
+      expect(journal.filter((e) => e === `print:${VERIFIED_LINE}`)).toHaveLength(1);
+      expect(journal.some((e) => e.startsWith(`print:${ARMED_PREFIX}`))).toBe(false);
+    });
+
+    it("pull failure: exactly one verified notice, no armed print", async () => {
+      const journal: string[] = [];
+      const { ops } = makeOps({
+        runtimeVerifier: absentThenPresentVerifier(),
+        print: vi.fn((line: string) => journal.push(`print:${line}`)),
+        confirm: vi.fn(async () => true),
+        pull: vi.fn(async () => ({ ok: false as const, failureClass: null })),
+      });
+      const result = await runLocalIntelligenceProvisioning(ops);
+      expect(result).toMatchObject({ kind: "refused", reason: "pull_failed" });
+      expect(journal.filter((e) => e === `print:${VERIFIED_LINE}`)).toHaveLength(1);
+      expect(journal.some((e) => e.startsWith(`print:${ARMED_PREFIX}`))).toBe(false);
+    });
+
+    it("save failure: exactly one verified notice, no armed print", async () => {
+      const journal: string[] = [];
+      const { ops } = makeOps({
+        print: vi.fn((line: string) => journal.push(`print:${line}`)),
+        commitVerified: vi.fn(async () => { throw new Error("atomic rename failed"); }),
+      });
+      const result = await runLocalIntelligenceProvisioning(ops);
+      expect(result).toMatchObject({ kind: "refused", reason: "integrity_io_unavailable" });
+      expect(journal.filter((e) => e === `print:${VERIFIED_LINE}`)).toHaveLength(1);
+      expect(journal.some((e) => e.startsWith(`print:${ARMED_PREFIX}`))).toBe(false);
+    });
   });
 });

@@ -3,6 +3,11 @@ import {
   OllamaClient,
   type OllamaPullProgress,
 } from "../../src/intelligence/substrates/local.js";
+import { SubstrateSelector } from "../../src/intelligence/selector.js";
+import { INTEL_OPS } from "../../src/intelligence/audit-events.js";
+import { AuditLog } from "../../src/operational/audit-log.js";
+import { MemoryStorage } from "../../src/storage/memory.js";
+import { generateRandomKey } from "../../src/core/random.js";
 
 const HASH = "a".repeat(64);
 
@@ -611,4 +616,277 @@ describe("Ollama provisioning client", () => {
       failureClass: "substrate_unavailable",
     });
   });
+});
+
+describe("Ollama generation client", () => {
+  it("sends think:false so thinking-mode models produce visible text", async () => {
+    let capturedBody: string | undefined;
+    const fetchImpl = vi.fn(async (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      capturedBody = typeof init?.body === "string" ? init.body : undefined;
+      return new Response(
+        JSON.stringify({ response: "Four." }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const resp = await client.generate({ model: "qwen3:14b", prompt: "What is 2+2?" });
+    expect(resp.failureClass).toBeNull();
+    expect(resp.body.kind).toBe("summarize");
+    if (resp.body.kind === "summarize") expect(resp.body.text).toBe("Four.");
+
+    // The request body MUST contain think:false so thinking-mode models
+    // (qwen3 family) answer directly instead of consuming num_predict on
+    // a thinking chain that leaves response:"".
+    // MUST MATCH the enforcement site in `substrates/local.ts` generate().
+    expect(capturedBody).toBeDefined();
+    const parsed = JSON.parse(capturedBody!);
+    expect(parsed.think).toBe(false);
+    expect(parsed.stream).toBe(false);
+  });
+
+  it("fails closed on empty response text instead of returning a blank answer", async () => {
+    // Simulates a model that returns response:"" (e.g. thinking consumed all tokens).
+    const fetchImpl = vi.fn(async () =>
+      new Response(
+        JSON.stringify({ response: "", thinking: "I was just thinking..." }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const resp = await client.generate({ model: "qwen3:14b", prompt: "What is 2+2?" });
+    expect(resp.failureClass).toBe("substrate_capability_unsupported");
+    expect(resp.body.kind).toBe("failure");
+  });
+
+  it("fails closed on whitespace-only response text", async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response(
+        JSON.stringify({ response: "   \n  " }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const resp = await client.generate({ model: "qwen3:14b", prompt: "What is 2+2?" });
+    expect(resp.failureClass).toBe("substrate_capability_unsupported");
+    expect(resp.body.kind).toBe("failure");
+  });
+
+  it("uses the longer generation timeout, not the 30s show timeout", async () => {
+    // Fetch resolves after 20ms — longer than timeoutMs=5ms (the show timeout)
+    // but well within generateTimeoutMs=500ms.  If generate() used the show
+    // timeout, the AbortController would fire first (at 5ms) and the call
+    // would return substrate_timeout; the successful response proves generate
+    // arms its own longer deadline.
+    const fetchImpl = vi.fn((_, init?: { signal?: AbortSignal | null }) =>
+      new Promise<Response>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          resolve(new Response(
+            JSON.stringify({ response: "A valid answer." }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ));
+        }, 20);
+        init?.signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          reject(err);
+        });
+      }),
+    );
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      timeoutMs: 5,           // show timeout — generate MUST NOT use this
+      generateTimeoutMs: 500, // generate timeout — accommodates the 20ms delay
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const resp = await client.generate({ model: "qwen3:14b", prompt: "test" });
+    expect(resp.failureClass).toBeNull();
+    expect(resp.body.kind).toBe("summarize");
+    if (resp.body.kind === "summarize") expect(resp.body.text).toBe("A valid answer.");
+  });
+
+  it("times out at generateTimeoutMs, not the default show timeout", async () => {
+    const fetchImpl = vi.fn(async (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      // Wait for the abort signal to fire.
+      return new Promise<Response>((_, reject) => {
+        const onAbort = () => {
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          reject(err);
+        };
+        if (init?.signal?.aborted) return onAbort();
+        init?.signal?.addEventListener("abort", onAbort);
+      });
+    });
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      generateTimeoutMs: 50,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const resp = await client.generate({ model: "qwen3:14b", prompt: "slow" });
+    expect(resp.failureClass).toBe("substrate_timeout");
+    expect(resp.body.kind).toBe("failure");
+  });
+
+  it("passes maxTokens as num_predict in options", async () => {
+    let capturedBody: string | undefined;
+    const fetchImpl = vi.fn(async (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      capturedBody = typeof init?.body === "string" ? init.body : undefined;
+      return new Response(
+        JSON.stringify({ response: "ok" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await client.generate({ model: "qwen3:14b", prompt: "test", maxTokens: 512 });
+    const parsed = JSON.parse(capturedBody!);
+    expect(parsed.options.num_predict).toBe(512);
+  });
+
+  it("preserves an explicit legacy timeoutMs when no generation override is given", async () => {
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      timeoutMs: 5,
+      fetchImpl: ((_url, init) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+        });
+      })) as typeof fetch,
+    });
+    const response = await client.generate({ model: "qwen3:14b", prompt: "test" });
+    expect(response.failureClass).toBe("substrate_timeout");
+  });
+
+  it("preserves whitespace surrounding a nonempty completion", async () => {
+    const text = "  indented answer\n";
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      fetchImpl: (async () => new Response(JSON.stringify({ response: text }))) as typeof fetch,
+    });
+    const response = await client.generate({ model: "qwen3:14b", prompt: "test" });
+    expect(response.failureClass).toBeNull();
+    expect(response.body).toMatchObject({ kind: "summarize", text });
+  });
+
+  it("classifies HTTP 500 from Ollama as substrate_unavailable", async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response("internal server error", { status: 500 }),
+    );
+    const client = new OllamaClient({
+      endpoint: "http://127.0.0.1:11434",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const resp = await client.generate({ model: "qwen3:14b", prompt: "fail" });
+    expect(resp.failureClass).toBe("substrate_unavailable");
+    expect(resp.body.kind).toBe("failure");
+  });
+});
+
+describe("Selector audit persistence", () => {
+  // Queue operation names alongside the real append queue so storage faults
+  // target one event, even when earlier configuration/transport rows exist.
+  async function buildAuditFixture(operation: string, rejectWrite = false) {
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    const queuedOperations: string[] = [];
+    class ControlledStorage extends MemoryStorage {
+      blocked = false;
+      persistedTarget = false;
+      override async write(ns: string, key: string, data: Uint8Array): Promise<void> {
+        const target = ns === "_audit" && queuedOperations.shift() === operation;
+        if (target) {
+          this.blocked = true;
+          if (rejectWrite) throw new Error("simulated private storage failure");
+          await barrier;
+        }
+        await super.write(ns, key, data);
+        if (target) this.persistedTarget = true;
+      }
+    }
+    const storage = new ControlledStorage();
+    const masterKey = generateRandomKey();
+    const auditLog = new AuditLog(storage, masterKey);
+    const fetchImpl = vi.fn(async (_url: Parameters<typeof fetch>[0], _init?: Parameters<typeof fetch>[1]) =>
+      operation === INTEL_OPS.SUBSTRATE_FAILURE
+        ? new Response("server error", { status: 500 })
+        : new Response(JSON.stringify({ response: "local answer" })),
+    );
+    const selector = new SubstrateSelector({
+      storage: new MemoryStorage(), masterKey, auditLog,
+      identityId: "audit-test", fetchImpl: fetchImpl as typeof fetch,
+    });
+    await selector.load();
+    await auditLog.flush();
+    const append = auditLog.append.bind(auditLog);
+    vi.spyOn(auditLog, "append").mockImplementation((...args) => {
+      queuedOperations.push(args[1]);
+      return append(...args);
+    });
+    const invoke = () => selector.invokeSummarize("concierge", {
+      kind: "summarize", context: "test context", query: "test query",
+    });
+    const assertLocalFetch = () => {
+      expect(fetchImpl).toHaveBeenCalledOnce();
+      expect(String(fetchImpl.mock.calls[0]![0])).toMatch(/\/api\/generate$/);
+    };
+    return { storage, auditLog, invoke, release, assertLocalFetch };
+  }
+
+  it.each([INTEL_OPS.SUBSTRATE_INVOKED, INTEL_OPS.SUBSTRATE_FAILURE])(
+    "waits for %s storage before completing local invocation",
+    async (operation) => {
+      const fixture = await buildAuditFixture(operation);
+      let settled = false;
+      const pending = fixture.invoke();
+      // Attach both handlers immediately, including when testing older code.
+      void pending.then(() => { settled = true; }, () => { settled = true; });
+      try {
+        await vi.waitFor(() => expect(fixture.storage.blocked).toBe(true));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        fixture.assertLocalFetch();
+        expect(fixture.storage.persistedTarget).toBe(false);
+        // Check caller completion BEFORE query(): query itself drains appends.
+        expect(settled).toBe(false);
+      } finally {
+        fixture.release();
+        await pending.catch(() => undefined);
+        await fixture.auditLog.flush();
+      }
+      const response = await pending;
+      expect(response.failureClass === null).toBe(operation === INTEL_OPS.SUBSTRATE_INVOKED);
+      if (operation === INTEL_OPS.SUBSTRATE_INVOKED) expect(response.servedBy).toBe("local");
+      expect(fixture.storage.persistedTarget).toBe(true);
+      const events = await fixture.auditLog.query({ operation_type: operation });
+      expect(events.entries).toHaveLength(1);
+      expect(events.entries[0]!.result).toBe(operation === INTEL_OPS.SUBSTRATE_INVOKED ? "success" : "failure");
+    },
+  );
+
+  it.each([INTEL_OPS.SUBSTRATE_INVOKED, INTEL_OPS.SUBSTRATE_FAILURE])(
+    "propagates %s storage rejection without private details",
+    async (operation) => {
+      const fixture = await buildAuditFixture(operation, true);
+      try {
+        await expect(fixture.invoke()).rejects.toThrow(/^intelligence audit persistence failed$/);
+        fixture.assertLocalFetch();
+        expect(fixture.storage.blocked).toBe(true);
+        expect(fixture.storage.persistedTarget).toBe(false);
+      } finally {
+        fixture.release();
+        await fixture.auditLog.flush().catch(() => undefined);
+      }
+    },
+  );
 });
