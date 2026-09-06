@@ -1507,7 +1507,9 @@ export function fallbackFilePath(home: string, storagePath?: string): string {
  * FAILURE MODE, from the outside: a deferred repair is invisible except for the
  * warning below, so an operator who never looks at stderr will simply keep
  * running on the older at-rest form. That is why the warning names the path and
- * says the read succeeded; it is a maintenance notice, not an error.
+ * says the read succeeded; it is a maintenance notice, not an error. The one
+ * case that is NOT a maintenance notice is a file that no longer opens under
+ * either form after the failed write; that is raised, not warned about.
  */
 async function repairFallbackAtRestBestEffort(
   path: string,
@@ -1521,14 +1523,39 @@ async function repairFallbackAtRestBestEffort(
     await writeToFallbackFile(path, aadIdentity, value, home, keys, capability);
   } catch (err) {
     const reason = (err as Error)?.message ?? "unknown write error";
-    // The custody VALUE never appears here. The path and the storage error are
-    // the only facts reported, matching what PassphraseUnreadableError already
-    // discloses on the failing branch of the same read.
+    // INVARIANT (enforcement site): a caught write error is NOT evidence that
+    // the file on disk is still the old one, so this branch observes rather
+    // than claims. The custody writer renames the new file into place BEFORE
+    // the directory fsync, and an injected capability may commit its bytes and
+    // then reject, so the failure can be raised with the new ciphertext already
+    // installed. Re-read through the SAME ladder and report what is actually
+    // there.
+    const observed = await readFromFallbackFile(
+      path,
+      aadIdentity,
+      home,
+      keys,
+      capability,
+    );
+    if (observed.status !== "ok") {
+      // Neither the superseded form nor the current one opens the file any
+      // more. That is not a deferred repair, it is custody genuinely lost, and
+      // reporting it as a maintenance notice would hide the one failure the
+      // operator must act on. Raise the original write error.
+      throw err;
+    }
+    const state = observed.staleAtRest
+      ? "the file still opens under the superseded form and is unchanged, so the repair is " +
+        "retried on the next read by a caller that may write"
+      : "the file was nevertheless rewritten under the current key, so no repair remains";
+    // The custody VALUE never appears in any branch here. The path, the storage
+    // error, and the observed at-rest state are the only facts reported,
+    // matching what PassphraseUnreadableError already discloses on the failing
+    // branch of the same read.
     process.stderr.write(
       `sanctuary: the passphrase fallback file at ${path} is in a superseded at-rest form ` +
-        `and could not be re-wrapped in place (${reason}). The stored passphrase was read ` +
-        `successfully and the file is unchanged; the repair is retried on the next read by ` +
-        `a caller that may write.\n`,
+        `and the in-place re-wrap reported an error (${reason}). The stored passphrase was ` +
+        `read successfully; ${state}.\n`,
     );
   }
 }
@@ -1841,10 +1868,26 @@ function resolveMachineKeyLadder(opts: PassphraseOptions): MachineKeyLadder {
     (identity ??= opts.machineIdentityOverride ?? resolveMachineIdentity());
   return {
     primary: (home) => deriveMachineKey(home, hostFacts()),
-    legacy: (home) =>
-      hostnameMigrationCandidates(hostFacts().hostname).map((host) =>
-        deriveLegacyHostnameMachineKey(home, host)
-      ),
+    legacy: (home) => {
+      const candidates = hostnameMigrationCandidates(hostFacts().hostname);
+      return [
+        // The CURRENT label over each hostname candidate. This rung exists
+        // because a run whose stable-identity probe did not answer writes a
+        // perfectly current file under the hostname host fact; on a later run
+        // the probe succeeds, the primary key becomes the stable-identity one,
+        // and without this rung nothing would ever reach that file again. It is
+        // reported as legacy so the first writable read re-wraps it under the
+        // primary key and the window closes.
+        ...candidates.map((host) =>
+          deriveMachineKey(home, { stableHostId: null, hostname: host })
+        ),
+        // The SUPERSEDED label over the same candidates: a file written before
+        // the migration at all.
+        ...candidates.map((host) =>
+          deriveLegacyHostnameMachineKey(home, host)
+        ),
+      ];
+    },
   };
 }
 

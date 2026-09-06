@@ -9,14 +9,16 @@
  * itself read-only reads the same value and leaves the bytes untouched. A file
  * that belongs to a different host is still refused, whether that host has a
  * different name or the same name and a different machine identity. A host with
- * no stable identity still writes under the current label, and a repair that
- * cannot be written defers rather than denying custody.
+ * no stable identity still writes under the current label, a file written while
+ * the stable-identity probe was failing is still reached, and a repair that
+ * cannot be written defers rather than denying custody, reporting the file's
+ * observed state rather than assuming one.
  *
  * Register id: defect.fallback-passphrase-key-derived-from-volatile-hostname
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { hkdf } from "@noble/hashes/hkdf";
@@ -402,6 +404,107 @@ describe("passphrase fallback file across a change of hostname", () => {
     const surfaced = warnings.join("");
     expect(surfaced).toContain(fallback());
     expect(surfaced).not.toContain("repair-deferred-value");
+  });
+
+  it("opens a file written while the stable-identity probe was failing, and re-wraps it under the stable key", async () => {
+    // The window this closes: one run's probe does not answer, so the file is
+    // written under the CURRENT label with the hostname as the host fact. On
+    // the next run the probe succeeds and the primary key is the
+    // stable-identity one. Without a rung for the current label over the
+    // hostname candidates, nothing would ever reach this file again.
+    await persistUserProvidedPassphrase("probe-failed-on-the-write-run", {
+      home,
+      storagePath: home,
+      platformOverride: "linux",
+      exec: noKeyring,
+      machineIdentityOverride: {
+        stableHostId: null,
+        hostname: FORMER_HOSTNAME,
+      },
+    });
+    const planted = await readFile(fallback());
+
+    const resolved = await getOrCreatePassphrase({
+      home,
+      storagePath: home,
+      platformOverride: "linux",
+      exec: noKeyring,
+      machineIdentityOverride: RENAMED_HOST,
+    });
+    expect(resolved.source).toBe("fallback-file");
+    expect(resolved.value).toBe("probe-failed-on-the-write-run");
+
+    // Reported stale and repaired: the bytes moved, and the repaired file now
+    // opens under the primary key alone (a second read leaves it identical).
+    const migrated = await readFile(fallback());
+    expect(migrated.equals(planted)).toBe(false);
+    const second = await readStoredPassphrase({
+      home,
+      storagePath: home,
+      platformOverride: "linux",
+      exec: noKeyring,
+      machineIdentityOverride: RENAMED_HOST,
+    });
+    expect(second?.value).toBe("probe-failed-on-the-write-run");
+    expect((await readFile(fallback())).equals(migrated)).toBe(true);
+  });
+
+  it("reports the observed state when the repair writes its bytes and THEN fails", async () => {
+    const planted = await plantFileFromBeforeTheRename("repair-landed-then-threw");
+
+    // Storage that commits the new ciphertext and then rejects: the shipped
+    // writer renames the new file into place BEFORE the directory fsync, so a
+    // raised error is not evidence that the old bytes survived. Claiming the
+    // file is unchanged here would be a claim, not an observation.
+    const writeThenFailStorage = {
+      read: async (): Promise<Uint8Array> =>
+        new Uint8Array(await readFile(fallback())),
+      write: async (data: Uint8Array): Promise<void> => {
+        await writeFile(fallback(), data, { mode: 0o600 });
+        throw new Error("EIO: the bytes landed and the fsync failed");
+      },
+      delete: async (): Promise<boolean> => false,
+    };
+    const warnings: string[] = [];
+    const stderr = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk: unknown): boolean => {
+        warnings.push(String(chunk));
+        return true;
+      });
+    try {
+      const resolved = await getOrCreatePassphrase({
+        home,
+        storagePath: home,
+        platformOverride: "linux",
+        exec: noKeyring,
+        machineIdentityOverride: RENAMED_HOST,
+        fallbackCapability: writeThenFailStorage,
+      });
+      expect(resolved.value).toBe("repair-landed-then-threw");
+    } finally {
+      stderr.mockRestore();
+    }
+
+    // The file really was rewritten, and the warning says so rather than
+    // promising it was unchanged.
+    expect((await readFile(fallback())).equals(planted)).toBe(false);
+    const surfaced = warnings.join("");
+    expect(surfaced).toContain(fallback());
+    expect(surfaced).toContain("rewritten under the current key");
+    expect(surfaced).not.toContain("repair-landed-then-threw");
+
+    // And the rewritten file is readable afterwards, under the primary key
+    // alone: the failed write did not cost custody.
+    const after = await readStoredPassphrase({
+      home,
+      storagePath: home,
+      platformOverride: "linux",
+      exec: noKeyring,
+      machineIdentityOverride: RENAMED_HOST,
+      readOnly: true,
+    });
+    expect(after?.value).toBe("repair-landed-then-threw");
   });
 
   it("still refuses a file that belongs to a different host", async () => {

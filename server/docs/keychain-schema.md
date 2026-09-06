@@ -171,17 +171,25 @@ because the resolved hostname is not boot-invariant: the same Mac can answer
 `<name>.localdomain` on one boot and `<name>.local` on the next, and a key
 derived from that value stops opening its own file with nothing on the machine
 having changed. A file written under the earlier hostname-derived key is still
-read, and is re-wrapped in place under the stable-identity key on the first
-read by a caller that is allowed to write. A caller that declared itself
-read-only reads the value and leaves the file byte-identical.
+read. It is migrated on the first read by a caller that is allowed to write and
+whose re-wrap succeeds; until then it stays in the superseded form and keeps
+opening through the read ladder. A caller that declared itself read-only reads
+the value and leaves the file as it is.
 
 That in-place re-wrap is best effort on the read path. If the write fails (a
 read-only mount, a full disk, a transient storage fault) the read still returns
-the stored passphrase, the file is left exactly as it was, and a warning naming
-the file is written to stderr. **Failure mode from the outside:** the fortress
-opens normally and nothing looks wrong, so the only signal that a host is still
-carrying a superseded at-rest form is that stderr line. The persist commands are
-not softened this way: for them a failed write is the failure of the operation.
+the stored passphrase, and a warning naming the file is written to stderr. The
+warning reports the file's OBSERVED state rather than assuming one, because the
+writer renames the new file into place before the directory fsync and a failure
+can therefore be raised with the new ciphertext already installed: it says
+either that the file still opens under the superseded form and is unchanged, or
+that it was rewritten under the current key despite the error. If the file
+opens under neither form after the failed write, the failure is raised rather
+than warned about, because custody is then genuinely lost. **Failure mode from
+the outside:** in the two warned cases the fortress opens normally and nothing
+looks wrong, so the only signal that a host is still carrying a superseded
+at-rest form is that stderr line. The persist commands are not softened this
+way: for them a failed write is the failure of the operation.
 
 This is not hardware-backed and is not a cryptographic machine-binding
 primitive: anyone with local read access can re-derive the key, and

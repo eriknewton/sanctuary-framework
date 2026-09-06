@@ -73,16 +73,36 @@ const DARWIN_PLATFORM_UUID_ARGS = ["-rd1", "-c", "IOPlatformExpertDevice"];
  * 36 = 32 hex digits + 4 hyphens; the pattern is written out rather than
  * counted so a malformed or truncated dump cannot be accepted as an identity.
  */
-const CANONICAL_UUID_PATTERN = /^[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$/;
-const DARWIN_PLATFORM_UUID_LINE = /"IOPlatformUUID"\s*=\s*"([^"]+)"/;
+const CANONICAL_UUID_SOURCE = "[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}";
+/**
+ * The whole `ioreg` line carrying the platform UUID, anchored at both ends
+ * under the multiline flag.
+ *
+ * INVARIANT (enforcement site): the capture group IS
+ * {@link CANONICAL_UUID_SOURCE}, and the pattern spans the entire line, so
+ * anything the quoted value carries beyond a canonical UUID — inner whitespace,
+ * a truncated value, trailing text after the closing quote — fails to match at
+ * all rather than being trimmed into shape. A parser that trimmed inside the
+ * quotes would bind a custody key to a value the tool did not print, and an
+ * unanchored one would accept the pair embedded in some other node's text.
+ */
+const DARWIN_PLATFORM_UUID_LINE = new RegExp(
+  `^\\s*"IOPlatformUUID"\\s*=\\s*"(${CANONICAL_UUID_SOURCE})"\\s*$`,
+  "m",
+);
 
 /**
  * Linux: systemd's machine id. `/etc/machine-id` is 32 lowercase hex digits
  * with no hyphens, generated once at install and stable thereafter.
  * 32 = the documented width of that file's contents.
+ *
+ * INVARIANT (enforcement site): the pattern matches the file's contents WHOLE,
+ * allowing at most the single trailing newline systemd writes. Trimming
+ * arbitrary surrounding whitespace would accept a file no systemd host
+ * produces, which is a file something else wrote.
  */
 const LINUX_MACHINE_ID_PATH = "/etc/machine-id";
-const LINUX_MACHINE_ID_PATTERN = /^[0-9a-f]{32}$/;
+const LINUX_MACHINE_ID_PATTERN = /^([0-9a-f]{32})\n?$/;
 
 /**
  * Bounds on the one subprocess this module spawns. A wedged or hostile `ioreg`
@@ -115,13 +135,13 @@ const HOST_IDENTITY_PROBE_MAX_OUTPUT_BYTES = 256 * 1024;
 const LOCAL_NAME_SUFFIXES = [".local", ".localdomain"] as const;
 
 /**
- * Memoized per platform token. The identity cannot change inside one process,
- * and the darwin branch spawns a subprocess, so re-resolving it on every
- * credential read would be a spawn per read. A test that wants a different
- * identity supplies one explicitly rather than clearing this cache, so there
- * is deliberately no reset function.
+ * Memoized per platform token, RESOLVED IDENTITIES ONLY. The identity cannot
+ * change inside one process, and the darwin branch spawns a subprocess, so
+ * re-resolving it on every credential read would be a spawn per read. A test
+ * that wants a different identity supplies one explicitly rather than clearing
+ * this cache, so there is deliberately no reset function.
  */
-const stableHostIdCache = new Map<string, string | null>();
+const stableHostIdCache = new Map<string, string>();
 
 /**
  * The macOS platform UUID carried by an `ioreg -rd1 -c IOPlatformExpertDevice`
@@ -136,14 +156,11 @@ const stableHostIdCache = new Map<string, string | null>();
  * absent.
  */
 export function parseDarwinPlatformUuidDump(dump: string): string | null {
+  // INVARIANT (enforcement site): the captured text is returned verbatim, with
+  // no trim. The pattern already constrains the whole line to a canonical UUID
+  // between the quotes, so a value that is not one is absent, not repairable.
   const matched = DARWIN_PLATFORM_UUID_LINE.exec(dump);
-  if (matched === null) return null;
-  const uuid = matched[1]!.trim();
-  // INVARIANT (enforcement site): a value that is not a canonical UUID is not
-  // this identity, whatever else it is. Accepting it would bind a custody key
-  // to an unvalidated string that a future OS release could reshape without
-  // notice, and an empty or truncated capture would then read as an identity.
-  return CANONICAL_UUID_PATTERN.test(uuid) ? uuid : null;
+  return matched === null ? null : matched[1]!;
 }
 
 /**
@@ -153,11 +170,12 @@ export function parseDarwinPlatformUuidDump(dump: string): string | null {
  * check is the part worth pinning.
  */
 export function parseLinuxMachineId(raw: string): string | null {
-  const id = raw.trim();
-  // INVARIANT (enforcement site): an uninitialized machine id is an empty
-  // file; the pattern rejects it along with any other shape, so a first-boot
-  // host is never bound to "" — which every such host would share.
-  return LINUX_MACHINE_ID_PATTERN.test(id) ? id : null;
+  // INVARIANT (enforcement site): the raw contents are matched as they are,
+  // with no trim; an uninitialized machine id is an empty file and the pattern
+  // rejects it along with any other shape, so a first-boot host is never bound
+  // to "" — which every such host would share.
+  const matched = LINUX_MACHINE_ID_PATTERN.exec(raw);
+  return matched === null ? null : matched[1]!;
 }
 
 /** Read the macOS platform UUID, or `null` when it cannot be established. */
@@ -203,7 +221,15 @@ export function resolveStableHostId(plat: NodeJS.Platform = platform()): string 
   if (plat === "darwin") resolved = readDarwinPlatformUuid();
   else if (plat === "linux") resolved = readLinuxMachineId();
   else resolved = null;
-  stableHostIdCache.set(plat, resolved);
+  // INVARIANT (enforcement site): a FAILED probe is never cached. Absence is
+  // not a fact about this host, it is the absence of one, and freezing it for
+  // the life of the process would let a single transient failure (a wedged
+  // ioreg, a momentary EMFILE) decide the host fact for every later derivation
+  // in that run. A fallback file written under the weaker host fact during such
+  // a window is opened again by the read ladder in `passphrase.ts`, but only
+  // because the next run's probe is allowed to succeed. The retry costs at most
+  // one subprocess per derivation on a host that genuinely has no identity.
+  if (resolved !== null) stableHostIdCache.set(plat, resolved);
   return resolved;
 }
 

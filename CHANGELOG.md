@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
-- The machine-local passphrase fallback file now survives a change in the host's resolved hostname (for example `.local` versus `.localdomain` after a reboot); files written under the earlier derivation are migrated on the next successful read.
+- The machine-local passphrase fallback file now survives a change in the host's resolved hostname (for example `.local` versus `.localdomain` after a reboot); a file written under an earlier derivation keeps opening, and is migrated on the first read by a caller that is allowed to write and whose re-wrap succeeds. Read-only callers read the value and leave the file as it is.
 
 ## [1.8.3] - 2026-09-05
 
