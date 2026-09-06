@@ -147,16 +147,61 @@ passphrase to an encrypted fallback file:
 | Default       | `~/.sanctuary/passphrase.enc`                   |
 | Per-tenant    | `<storage_path>/passphrase.enc`                 |
 
-The file is AES-256-GCM ciphertext (12-byte IV prepended) under a locally
-derived key using HKDF-SHA256 over `hostname + uid + username + home`. This is
-not hardware-backed and is not a cryptographic machine-binding primitive:
-anyone with local read access can re-derive the key, and cloned/snapshotted host
-identity material defeats the portability deterrent. Treat it as encrypted
-disk-local compatibility custody for a user-held secret, not as a hardware or
-OS-keyring security claim.
+The file is a UTF-8 JSON envelope (version 3), not raw bytes. Its fields are
+`v` (3), `alg` (`aes-256-gcm`), `aad` (`canonical-storage-path`, naming which
+additional-authenticated-data form the ciphertext was sealed under), `nonce`
+(the base64url-encoded 12-byte AES-GCM nonce) and `ct` (the base64url-encoded
+ciphertext with its GCM tag). Two superseded at-rest forms are still READ and
+re-wrapped in place: the version-2 envelope, whose `aad` is `storage-path`, and
+the original pre-envelope layout of a raw 12-byte nonce followed by raw
+ciphertext. `parseFallbackEnvelope` in `server/src/wrap/passphrase.ts` is the
+authority on all three; if this list and that function disagree, the function is
+right and this paragraph is the defect.
+
+The ciphertext is under a locally derived key using HKDF-SHA256 over
+`stable host identity + uid + username + home`. The stable host identity is the
+platform UUID on macOS and `/etc/machine-id` on Linux; both survive reboots,
+renames, and network changes. On a platform that exposes neither, the same
+derivation runs with the host's resolved hostname in place of the stable
+identity, so such a host keeps the hostname sensitivity described below. It is
+recorded here rather than hidden.
+
+The key is bound to the stable host identity rather than to the hostname
+because the resolved hostname is not boot-invariant: the same Mac can answer
+`<name>.localdomain` on one boot and `<name>.local` on the next, and a key
+derived from that value stops opening its own file with nothing on the machine
+having changed. A file written under the earlier hostname-derived key is still
+read. It is migrated on the first read by a caller that is allowed to write and
+whose re-wrap succeeds; until then it stays in the superseded form and keeps
+opening through the read ladder. A caller that declared itself read-only reads
+the value and leaves the file as it is.
+
+That in-place re-wrap is best effort on the read path. If the write fails (a
+read-only mount, a full disk, a transient storage fault) the read still returns
+the stored passphrase, and a warning naming the file is written to stderr. The
+warning reports the file's OBSERVED state rather than assuming one, because the
+writer renames the new file into place before the directory fsync and a failure
+can therefore be raised with the new ciphertext already installed: it says
+either that the file still opens under a superseded form (the bytes are not
+compared, so nothing is claimed about them beyond that) and the repair is
+retried on the next writable read, or that the file now opens under the
+current key, so the rewrite landed despite the error. If the file
+opens under neither form after the failed write, the failure is raised rather
+than warned about, because custody is then genuinely lost. **Failure mode from
+the outside:** in the two warned cases the fortress opens normally and nothing
+looks wrong, so the only signal that a host is still carrying a superseded
+at-rest form is that stderr line. The persist commands are not softened this
+way: for them a failed write is the failure of the operation.
+
+This is not hardware-backed and is not a cryptographic machine-binding
+primitive: anyone with local read access can re-derive the key, and
+cloned/snapshotted host identity material defeats the portability deterrent.
+Treat it as encrypted disk-local compatibility custody for a user-held secret,
+not as a hardware or OS-keyring security claim.
 
 > **Threat model warning.** The fallback-file derivation uses a machine-local
-> key from `hostname`, `uid`, `username`, and `home` directory. This is not
+> key from the host's stable identity (or, where none exists, `hostname`),
+> `uid`, `username`, and `home` directory. This is not
 > cryptographically strong authentication. Anyone with local read access to
 > the user's machine can re-derive the key and decrypt the fallback file.
 > Do NOT rely on fallback-file protection on multi-user machines with
@@ -168,10 +213,11 @@ OS-keyring security claim.
 > keyring still get encryption-at-rest, not so multi-user environments get
 > identity isolation.
 
-The source comment at `server/src/wrap/passphrase.ts` (around the
-`deriveMachineKey` helper near line 650) cross-references this section so a
-future maintainer touching the derivation does not lose the threat-model
-context.
+The source comment at the `deriveMachineKey` helper in
+`server/src/wrap/passphrase.ts` cross-references this section so a future
+maintainer touching the derivation does not lose the threat-model context. The
+host facts it derives from are resolved in `server/src/wrap/host-identity.ts`,
+which holds no key material and no label.
 
 ---
 
