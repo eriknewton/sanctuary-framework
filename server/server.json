@@ -6,12 +6,12 @@
     "url": "https://github.com/eriknewton/sanctuary-framework",
     "source": "github"
   },
-  "version": "1.8.3",
+  "version": "1.8.4",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@sanctuary-framework/mcp-server",
-      "version": "1.8.3",
+      "version": "1.8.4",
       "transport": {
         "type": "stdio"
       }
