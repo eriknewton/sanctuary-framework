@@ -3,7 +3,7 @@
 This is the command-level reference behind the supported agent-guided flow. A
 normal operator should give a shell-capable agent the task and have it loop on
 `sanctuary install --profile full --harness hermes --json`; the operator should
-not have to execute this recipe. This reference targets Sanctuary `v1.8.0` and
+not have to execute this recipe. This reference targets Sanctuary `v1.8.4` and
 the `Sanctuary-CastleWall.app.zip` asset attached to that release.
 
 The npm package installs the cooperative Sanctuary CLI, dashboard, keys, policy gates, and audit trail. The operating-system wall is a separate signed and notarized macOS app with a system extension, a signer helper, and a root boot service.
@@ -22,7 +22,7 @@ The npm package installs the cooperative Sanctuary CLI, dashboard, keys, policy 
 Install the pinned CLI:
 
 ```bash
-npm install -g @sanctuary-framework/mcp-server@1.8.0
+npm install -g @sanctuary-framework/mcp-server@1.8.4
 ```
 
 Record the CLI's absolute path for the later commands that run through `sudo`:
@@ -50,12 +50,12 @@ Failure mode: this step does not install or arm the macOS wall. It prepares the 
 
 ## 2. Download and verify the Castle Wall app
 
-Download the `v1.8.0` release asset:
+Download the `v1.8.4` release asset:
 
 ```bash
 APP_ZIP="$HOME/Downloads/Sanctuary-CastleWall.app.zip"
 curl -L -o "$APP_ZIP" \
-  "https://github.com/eriknewton/sanctuary-framework/releases/download/v1.8.0/Sanctuary-CastleWall.app.zip"
+  "https://github.com/eriknewton/sanctuary-framework/releases/download/v1.8.4/Sanctuary-CastleWall.app.zip"
 ```
 
 Verify the SHA-256 digest:
@@ -67,7 +67,7 @@ shasum -a 256 "$APP_ZIP"
 Expected first field:
 
 ```text
-cd65676ca6c15259dbfd1ebcc373724b434074f4ad0d866fa8ba29f396777c67
+a19b71e8a5cb25070f8efff6df43cbb77c451da8b0f41bcb47680193553081c7
 ```
 
 The GitHub release asset metadata and the release body publish this digest. The release does not publish a separate `.sha256` sidecar file for the app zip. If your digest differs, stop and discard the download.
@@ -173,7 +173,7 @@ On first install it also prints:
 Boot token minted: /Library/Application Support/Sanctuary/castle-wall-boot-token.bin (root-owned 0600).
 ```
 
-Failure mode: if the command cannot resolve the CLI path, reinstall with `npm install -g @sanctuary-framework/mcp-server@1.8.0` and confirm `command -v sanctuary` prints an absolute path. `sudo: sanctuary: command not found` means root's PATH cannot find the CLI even when your user PATH can. If bootstrap is accepted and the service does not stay running, inspect the two paths the command prints: `sudo launchctl print system/ai.sanctuaryprotocol.castle-wall.daemon` and `/var/log/castle-wall-daemon.err.log`.
+Failure mode: if the command cannot resolve the CLI path, reinstall with `npm install -g @sanctuary-framework/mcp-server@1.8.4` and confirm `command -v sanctuary` prints an absolute path. `sudo: sanctuary: command not found` means root's PATH cannot find the CLI even when your user PATH can. If bootstrap is accepted and the service does not stay running, inspect the two paths the command prints: `sudo launchctl print system/ai.sanctuaryprotocol.castle-wall.daemon` and `/var/log/castle-wall-daemon.err.log`.
 
 ## 7. Choose the protected agent UID
 
