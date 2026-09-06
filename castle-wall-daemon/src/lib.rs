@@ -22,6 +22,7 @@ pub mod audit;
 pub mod cgroup;
 pub mod config;
 pub mod daemon;
+pub mod decision;
 pub mod failure;
 pub mod habeas;
 pub(crate) mod identity;
@@ -34,9 +35,8 @@ pub mod nftables;
 pub mod policy;
 
 pub use config::DaemonConfig;
-pub use daemon::{
-    boot, AttemptError, DaemonError, DaemonExitReport, DaemonHandle, EvaluationOutcome,
-};
+pub use daemon::{boot, DaemonError, DaemonExitReport, DaemonHandle, DaemonRuntimeState};
+pub use decision::{AttemptError, DecisionEngine, EvaluationOutcome};
 pub use ipc::framing::{frame, parse_frame, ParseStep};
 pub use ipc::messages::{IpcMessage, MessageEnvelope};
 pub use manifest::verify::verify_manifest_signature;
