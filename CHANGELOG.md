@@ -6,11 +6,60 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.8.4] - 2026-09-05
+
+v1.8.3 was tagged but never published. This release carries every 1.8.3 change listed below and adds one custody fix.
+
+### Fixed
+
+- The machine-local passphrase fallback file now survives a change in the host's resolved hostname (for example `.local` versus `.localdomain` after a reboot); a file written under an earlier derivation keeps opening, and is migrated on the first read by a caller that is allowed to write and whose re-wrap succeeds. Read-only callers read the value and leave the file as it is.
+
+
+## [1.8.3] - 2026-09-05
+
+v1.8.2 was tagged but never published. This release carries every 1.8.2 change listed below and adds one release-process fix.
+
+### Fixed
+
+- **Release coverage checks credit each fixture to the assurance row it proves.** The fixtures behind the release coverage report now name their correct Assurance Matrix rows, fixture registration refuses two different claims under one row number, and the ordinary test suite checks that every proven row has a passing fixture. Product runtime, fixture bodies and assurance claims are unchanged.
+
+## [1.8.2] - 2026-09-04
+
+### Changed
+
+- **Local concierge responses use a longer generation window and complete after their outcome is recorded.**
+- **Local-intelligence setup shows signed model-manifest verification before consent and download.** The operator can see which manifest was verified before approving the model pull.
+
+### Fixed
+
+- Headless `init` and Protect stage recovery material outside the fortress and show only its location.
+- A failed Castle Wall daemon start no longer implies that an existing wall is unarmed.
+- Idle MCP sessions close their own listeners when the harness disconnects or requests shutdown.
+- A briefly indeterminate custody-lock owner is checked again within the existing timeout; uncertain ownership still refuses access.
+
+### Bounds
+
+Ollama is installed by the operator. Light assurance compares the runtime-reported model digest with the signed manifest at the documented checkpoints. Automatic discovery of newer signed manifests is unavailable.
+
+## [1.8.1] - 2026-09-04
+
+### Fixed
+
+- **Local intelligence setup completes its own model download on a machine that has never run Ollama.** The model pull streams progress from the runtime instead of running under a fixed request timeout, so a multi-gigabyte download finishes rather than being cut off part-way; it is bounded by a stall deadline and an overall ceiling, with per-line and whole-response byte caps, and only the runtime's own completion signal counts as a finished pull. Any error, stall, or truncated response refuses and commits nothing. Setup prints the download's progress as it goes, and recognizes a host where Ollama is present but has no models yet, so it shows the plan and asks for consent instead of stopping early. A model directory that is unreadable, not owned by the operator, writable by others, or one an operator named explicitly that does not exist, is still refused, and the directory is re-checked in full after the download before anything is recorded.
+- **Local-intelligence integrity is checked at every startup.** Sanctuary verifies its stored local-intelligence configuration as part of coming up, on every fortress, whichever approval channel the operator has chosen; previously this check ran only under the dashboard channel. A fortress whose stored local-model state does not verify, or cannot be read, now refuses to start with a message naming the condition and the `sanctuary intelligence config-reset` recovery command, rather than starting quietly with local intelligence switched off. A fortress that never armed local intelligence starts as before.
+- **The concierge answers questions on an active fortress, and the prompt it builds is bounded.** Asking the concierge about a busy fortress could be refused before any model was contacted, because the briefing Sanctuary compiles from its own records was measured as if an outside caller had sent it. The briefing is now compiled in two parts: the instructions Sanctuary writes for itself, and the fortress records, which are screened as untrusted like any other input. The record half is capped, so how much of the prompt a stored record can occupy is Sanctuary's decision rather than the writer's. Injection, evasion, and the hard size ceiling still apply to every character. A prompt held back by screening is reported and audited as a screening decision, not as a provider outage.
+- **Local intelligence is set up only when asked.** A `sanctuary protect` or `sanctuary init` run with no terminal and no `--provision-local-intelligence` flag leaves local intelligence alone: it reads no configuration, records nothing, and marks no surface degraded; it prints one line saying how to opt in. Passing the flag on a machine with no terminal still refuses out loud.
+- **The armed state is visible.** `sanctuary intelligence diagnose` reports whether the fortress is armed, which signed model manifest version it verified, which model each surface is bound to and the digests behind those bindings, in both the human and `--json` views, using the same classification the running system uses. When the record cannot be verified, cannot be read, or the fortress credential is not available on this machine, it says which, and names the command that clears it where one exists. Setting local intelligence up confirms on screen that the signed manifest verified against the pinned catalog key and names the model it armed. `sanctuary concierge status` reports the model actually bound once a fortress is armed.
+
+### Bounds (unchanged)
+
+Ollama is installed by the operator on every platform; light assurance verifies the runtime-reported digest against the signed manifest at the documented checkpoints; there is no network discovery of newer signed manifests.
+
 ## [1.8.0] - 2026-09-04
 
 ### Added
 
-- **The local-intelligence provisioning ceremony verifies a Sanctuary-signed model manifest shipped inside the package before any model pull.** `sanctuary init --provision-local-intelligence` and `sanctuary protect ... --provision-local-intelligence` now read the signed model manifest packaged with the release, check it against a model-catalog signing key pinned in the build (a dedicated key, separate from the release-signing key), a byte cap, a strict parser, and a build-time byte pin, and refuse with a named, audited reason if it is missing, oversized, malformed, altered, or signed by any other key. Stated precisely: the byte pin defends against an altered manifest file inside an otherwise intact package, the signature defends against a manifest signed by any other key, and only the package's own release provenance (the signed release manifest) defends against a package whose code has itself been rewritten. The first manifest lists the default models for the 8, 16, and 32 GiB hardware bands with their exact Ollama registry digests. Bounds: there is no network discovery of newer manifests yet (an operator may supply a newer Sanctuary-signed manifest by path with `--model-manifest <path>`, verified identically); light assurance verifies the digest Ollama reports, not every model byte on disk; Windows requires a manual Ollama install. See `docs/local-intelligence.md`.
+- **The local-intelligence provisioning ceremony verifies a Sanctuary-signed model manifest shipped inside the package before any model pull.** `sanctuary init --provision-local-intelligence` and `sanctuary protect ... --provision-local-intelligence` now read the signed model manifest packaged with the release, check it against a model-catalog signing key pinned in the build (a dedicated key, separate from the release-signing key), a byte cap, a strict parser, and a build-time byte pin, and refuse with a named, audited reason if it is missing, oversized, malformed, altered, or signed by any other key. Stated precisely: the byte pin defends against an altered manifest file inside an otherwise intact package, the signature defends against a manifest signed by any other key, and only the package's own release provenance (the signed release manifest) defends against a package whose code has itself been rewritten. The first manifest lists the default models for the 8, 16, and 32 GiB hardware bands with their exact Ollama registry digests. Bounds: there is no network discovery of newer manifests yet (an operator may supply a newer Sanctuary-signed manifest by path with `--model-manifest <path>`, verified identically); light assurance verifies the digest Ollama reports, not every model byte on disk; Ollama is installed by the operator on every platform in this release (automatic runtime installation is not available yet), and pulling the tier model with `ollama pull` first is the reliable path; the ceremony then verifies the present model against the signed manifest and arms. See `docs/local-intelligence.md`.
 - **`sanctuary intelligence config-reset` recovers a fortress whose local-intelligence config record has become unreadable.** A record that no longer decrypts or parses, or that was written by a newer Sanctuary, now fails every local-intelligence config write with a typed error naming this verb (reads keep booting on defaults). The verb requires an interactive terminal and a typed confirmation with no bypass flag, unlocks the fortress with write intent, refuses any readable record (armed or legacy) and any Q5 integrity refusal, copies the unreadable record's raw bytes to an owner-only timestamped sidecar in the fortress's `_intelligence` state directory, removes the record, and audits the quarantine. Operator choices and API keys inside the unreadable record are not recovered. Runbook: `server/docs/cli-operator-verbs.md`.
 
 ### Fixed

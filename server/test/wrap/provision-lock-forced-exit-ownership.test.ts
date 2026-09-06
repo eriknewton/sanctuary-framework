@@ -1,3 +1,4 @@
+// fail-before-exempt: test-isolation only. This PR NEWLY lets a host whose ~/.ollama/models does not exist reach the plan, the consent prompt and the pull instead of refusing before consent, so these wrap paths (they force isTTY true over a temp HOME) now block on a consent prompt no test can answer whenever the host's own Ollama is reachable; this file stubs the ceremony and changes no assertion, so it passes with or without the source fix.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { access, cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -28,6 +29,23 @@ import {
   clearHermesParityHook,
   installHermesParityHook,
 } from "../helpers/hermes-parity.js";
+
+// TEST ISOLATION (AGENTS.md: the operator's machine is not a fixture). `runWrap`
+// runs the local-intelligence ceremony, which probes the HOST's Ollama runtime.
+// On a machine where Ollama is reachable but has no models for the signed
+// catalog, that ceremony correctly reaches an interactive consent prompt, and no
+// test here can answer it. This file is about provision-lock ownership, so the
+// ceremony is stubbed out rather than read from the host.
+vi.mock("../../src/wrap/local-intelligence.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/wrap/local-intelligence.js")>()),
+  runLocalIntelligenceSetup: async () => ({
+    kind: "already-provisioned" as const,
+    surfaces: [],
+    models: [],
+    provenanceProjection: "projected" as const,
+  }),
+}));
+
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, "..", "harness", "fixtures");

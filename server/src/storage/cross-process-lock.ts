@@ -292,6 +292,11 @@ export interface CrossProcessLockOptions {
   __testAfterStaleReaperStarted?: (pid: number) => void;
   /** TEST ONLY: observe the process-owned socket path after identity capture. */
   __testAfterKernelSocketAcquired?: (path: string) => void;
+  /**
+   * TEST ONLY: force a kernel socket-owner probe to report `unknown`. This seam
+   * cannot manufacture the `stale` or `live` states that authorize progress.
+   */
+  __testForceKernelProbeUnknown?: () => boolean;
   /** TEST ONLY: exercise the unsupported-platform pre-mutation fence. */
   __testPlatform?: NodeJS.Platform;
 }
@@ -1553,7 +1558,9 @@ async function acquireKernelLock(
       if (observed === null) continue;
       observed = await settleOwnedSocketPermissions(socketPath, observed);
       if (observed === null) continue;
-      const probe = await probeSocketOwner(socketPath);
+      const probe = options.__testForceKernelProbeUnknown?.() === true
+        ? "unknown"
+        : await probeSocketOwner(socketPath);
       if (probe === "stale") {
         const reaperOutcome = await reapStaleSocketWithSerializedAuthority(
           socketPath,
@@ -1578,10 +1585,19 @@ async function acquireKernelLock(
         continue;
       }
       if (probe === "unknown") {
-        throw new CrossProcessLockError(
-          `kernel custody lock owner liveness is indeterminate (${socketPath}); refusing to unlink`,
-          "io",
-        );
+        // Unknown is never authority to reap or enter the protected operation.
+        // Re-observe within the caller's existing bound because process exit and
+        // successor bind/release can transiently make one connect probe ambiguous.
+        contentions += 1;
+        options.onContended?.(contentions);
+        if (Date.now() - started >= timeoutMs) {
+          throw new CrossProcessLockError(
+            `kernel custody lock owner liveness is indeterminate (${socketPath}); refusing to unlink`,
+            "io",
+          );
+        }
+        await sleep(options.retryMs ?? CROSS_PROCESS_LOCK_RETRY_MS);
+        continue;
       }
       contentions += 1;
       options.onContended?.(contentions);

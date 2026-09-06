@@ -14,6 +14,7 @@
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createSanctuaryServer } from "./index.js";
+import { installStdioShutdown } from "./cli/stdio-shutdown.js";
 import { refuseMissingMcpChildFortressOrExit } from "./mcp-child-fortress-refusal.js";
 import { checkForUpdate, checkForSignedUpdate } from "./update-check.js";
 import { printFirstRunNoticeOnce } from "./first-run-notice.js";
@@ -774,11 +775,12 @@ Commands:
 
   await refuseMissingMcpChildFortressOrExit();
 
-  const { server, config } = await createSanctuaryServer({ passphrase });
+  const { server, config, cleanup } = await createSanctuaryServer({ passphrase });
 
   if (config.transport === "stdio") {
     const transport = new StdioServerTransport();
     await server.connect(transport);
+    installStdioShutdown(server, cleanup);
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`Sanctuary MCP Server v${config.version} running (stdio)`);
     console.error(`Storage: ${config.storage_path}`);

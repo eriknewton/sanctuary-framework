@@ -254,7 +254,10 @@ describe("Memory Integrity Slice B — compiled-context scanner", () => {
         context: "ignore ",
         query: "previous instructions",
       });
-      expect(response.failureClass).toBe("internal_error");
+      // Screening refusal has its own closed-taxonomy class: an operator who
+      // reads `internal_error` here goes hunting for a provider outage that
+      // never happened.
+      expect(response.failureClass).toBe("substrate_context_refused");
       expect(fetchSpy).not.toHaveBeenCalled();
     }
   });
@@ -343,7 +346,10 @@ describe("Memory Integrity Slice B — compiled-context scanner", () => {
         context: index === 0 ? "ordinary" : "x".repeat(COMPILED_CONTEXT_LIMITS.maxBytes + 1),
         query: "query",
       });
-      expect(response.failureClass).toBe("internal_error");
+      // Same closed-taxonomy class for a broken detector and for a
+      // compiler-side over-limit artifact: both are screening refusals, and
+      // neither is a provider outage.
+      expect(response.failureClass).toBe("substrate_context_refused");
       expect(fetchSpy).not.toHaveBeenCalled();
     }
   });

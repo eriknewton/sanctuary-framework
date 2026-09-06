@@ -24,11 +24,14 @@ import { establishMaster } from "../../src/core/master-custody.js";
 import { INTEL_OPS } from "../../src/intelligence/audit-events.js";
 import { buildDefaultConfig } from "../../src/intelligence/defaults.js";
 import {
+  classifyLocalIntelligenceState,
+  INTELLIGENCE_CONFIG_RESET_VERB,
   INTELLIGENCE_NAMESPACE,
   IntelligenceConfigStore,
   SUBSTRATE_CONFIG_KEY,
   SUBSTRATE_CONFIG_QUARANTINE_PREFIX,
 } from "../../src/intelligence/policy-store.js";
+import { SubstrateSelector } from "../../src/intelligence/selector.js";
 import type { SubstrateConfig } from "../../src/intelligence/types.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
@@ -191,7 +194,9 @@ describe.skipIf(!supported)("sanctuary intelligence config-reset", () => {
       configResetDeps: d.configResetDeps,
     });
     expect(code).toBe(CONFIG_RESET_EXIT.REFUSED);
-    expect(d.output()).toContain("readable record, version 1");
+    // The record line comes from the ONE classifier `diagnose` uses, so the two
+    // verbs cannot describe one record differently.
+    expect(d.output()).toContain("legacy-unarmed");
     expect(d.output()).toContain("Refused");
     expect(await readRecord(root)).toEqual(before);
     expect(await sidecars(root)).toEqual([]);
@@ -206,7 +211,7 @@ describe.skipIf(!supported)("sanctuary intelligence config-reset", () => {
       configResetDeps: d.configResetDeps,
     });
     expect(code).toBe(CONFIG_RESET_EXIT.REFUSED);
-    expect(d.output()).toContain("readable record, version 2");
+    expect(d.output()).toContain("armed");
     expect(d.output()).toContain(
       "Refused: config-reset only quarantines an unreadable record; a readable record is never discarded here.",
     );
@@ -225,7 +230,9 @@ describe.skipIf(!supported)("sanctuary intelligence config-reset", () => {
       configResetDeps: d.configResetDeps,
     });
     expect(code).toBe(CONFIG_RESET_EXIT.REFUSED);
-    expect(d.output()).toContain("armed record failed Q5 integrity validation (");
+    expect(d.output()).toContain(
+      "integrity_state_invalid: the armed record failed Q5 integrity validation (",
+    );
     expect(d.output()).toContain(
       "Refused: an armed record that fails Q5 integrity validation is not an unreadable record, and there is no in-product disarm.",
     );
@@ -256,7 +263,7 @@ describe.skipIf(!supported)("sanctuary intelligence config-reset", () => {
     expect(code).toBe(CONFIG_RESET_EXIT.OK);
     expect(d.unlock).toHaveBeenCalledOnce();
     expect(d.unlock.mock.calls[0]![0]).toMatchObject({ writeIntent: true, storagePath: root });
-    expect(d.output()).toContain("unreadable record: does not decrypt or parse (corrupt)");
+    expect(d.output()).toContain("corrupt: the durable record does not decrypt or parse");
     expect(d.output()).toContain(`Quarantined ${GARBAGE_RECORD.length} bytes to `);
     expect(d.output()).toContain("default legacy-unarmed configuration");
     expect(d.output()).toContain("re-provision local intelligence before relying on load-integrity verification");
@@ -288,5 +295,60 @@ describe.skipIf(!supported)("sanctuary intelligence config-reset", () => {
         bytes: GARBAGE_RECORD.length,
       },
     });
+  });
+
+  /**
+   * The recovery verb and the boot checkpoint read the SAME record through
+   * deliberately different paths, and this pins that split.
+   *
+   * `SubstrateSelector.load()` refuses an unreadable record, because a
+   * fortress must not start as though nobody had ever armed it. `config-reset`
+   * reads the record through `IntelligenceConfigStore.load`, which still
+   * returns the outcome rather than throwing, because the one command whose
+   * whole job is to clear the record cannot be gated on being able to read it.
+   *
+   * Failure mode if that split is ever collapsed by moving the refusal down
+   * into the store: the product deadlocks. Boot refuses and names
+   * `config-reset` as the remedy, and `config-reset` then refuses for the same
+   * reason, so the operator is told to run the one command that cannot run.
+   */
+  it("refuses the boot checkpoint on the same record config-reset can still clear", async () => {
+    const { root, masterKey } = await seedFortress((storage) =>
+      storage.write(INTELLIGENCE_NAMESPACE, SUBSTRATE_CONFIG_KEY, GARBAGE_RECORD));
+    const storage = new FilesystemStorage(join(root, "state"));
+    const auditLog = new AuditLog(storage, masterKey);
+    const selectorOptions = {
+      storage,
+      masterKey,
+      auditLog,
+      identityId: "fortress:config-reset-split",
+    };
+
+    // The checkpoint refuses, and the refusal names the verb.
+    await expect(
+      new SubstrateSelector(selectorOptions).load(),
+    ).rejects.toThrow(new RegExp(INTELLIGENCE_CONFIG_RESET_VERB));
+
+    // The verb the refusal named still runs against that exact record.
+    const d = deps();
+    const code = await runIntelligenceCommand({
+      argv: ["config-reset", "--fortress", root],
+      configResetDeps: d.configResetDeps,
+    });
+    expect(code).toBe(CONFIG_RESET_EXIT.OK);
+    // Derived from the shared classifier rather than re-typing the sentence:
+    // this test is about the boot-refuses / reset-clears SPLIT, and a second
+    // hand-copied snapshot of the prose only creates a second thing to drift.
+    // It already did: the wording moved when `describeOutcome` was rederived
+    // from `classifyLocalIntelligenceState`, and this line was the copy nobody
+    // updated. The literal snapshot is pinned once, by the sibling quarantine
+    // test above, which is the test that is actually about the wording.
+    const classified = classifyLocalIntelligenceState({ kind: "corrupt", config: buildDefaultConfig() });
+    expect(d.output()).toContain(`${classified.state}: ${classified.detail}`);
+    // The record really was read as unreadable, not merely described.
+    expect(d.output()).toContain("Quarantined ");
+
+    // And the fortress starts again afterwards, now genuinely unarmed.
+    await expect(new SubstrateSelector(selectorOptions).load()).resolves.toBeUndefined();
   });
 });

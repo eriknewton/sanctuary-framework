@@ -98,6 +98,10 @@ import {
   type AutoProvisionSummary,
 } from "./auto-provision.js";
 import { runLocalIntelligenceSetup } from "./local-intelligence.js";
+// The dependency-free consent leaf, not the `intelligence` barrel: this file
+// is on the CLI boot path and must not pull the selector graph in for one
+// string. Must match the flag names parsed below.
+import { LOCAL_INTELLIGENCE_OPT_IN_HINT } from "../intelligence/provisioning-consent.js";
 import {
   describeProtectPreflightBlockers,
   describeProtectPreflightStrictWarnings,
@@ -2525,7 +2529,14 @@ async function maybeRunLocalIntelligenceForWrap(
       // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
       print: (line) => console.error(`  ${line}`),
     });
-    if (outcome.kind === "refused") {
+    if (outcome.kind === "not-requested") {
+      // Nothing was read, recorded, or degraded: this run never asked. The
+      // line is informational, never a failure the operator must act on.
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `  Local intelligence was not set up; ${LOCAL_INTELLIGENCE_OPT_IN_HINT}.`,
+      );
+    } else if (outcome.kind === "refused") {
       // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
       console.error(`  Local intelligence remains DEGRADED (${outcome.reason}).`);
     }
@@ -6094,25 +6105,34 @@ async function unwrap(dryRun: boolean): Promise<void> {
 /**
  * Operator-facing warning when the Castle Wall enforcement daemon fails to
  * start during `wrap`. Wrap is best-effort with respect to the daemon (a start
- * failure never blocks wrapping the agent), but a silent "Note:" let an
- * upgrade quietly leave a previously-armed host UNARMED. This makes the
- * not-armed state loud, and - on macOS, when the failure is the A2/B2
- * helper-signing default having no reachable signer - prints the exact
- * migration path (install the helper + point at the shim, or opt back into the
- * legacy local-signing key). See the A2/B2 re-drill verdict's migration caveat.
+ * failure never blocks wrapping the agent). This reports the daemon startup
+ * failure and directs the operator to the proof-based status on the dashboard;
+ * it does NOT assert whether the system extension is currently armed or
+ * unarmed, because a daemon startup failure alone does not determine live
+ * enforcement state — the extension may still be enforcing if previously armed.
+ * On macOS, when the failure is the A2/B2 helper-signing default having no
+ * reachable signer, prints the bounded migration path. See the A2/B2 re-drill
+ * verdict's migration caveat.
  */
-function warnCastleWallDaemonNotStarted(err: unknown): void {
+// Exported for focused behavioral tests proving a daemon startup failure is
+// not reported as observed unarmed or armed (must match invariant above).
+export function warnCastleWallDaemonNotStarted(err: unknown): void {
   const message = err instanceof Error ? err.message : String(err);
   const helperMigration =
     process.platform === "darwin" &&
     /helper signing is unavailable|signer helper is unreachable|without a signer/i.test(
       message,
     );
+  // A startup failure here does not determine live enforcement status: the
+  // system extension may still be enforcing if it was previously armed. Do
+  // not assert "NOT armed" or "traffic NOT filtered" from a startup failure.
   const lines = [
     "",
     "  ====================================================================",
-    "  WARNING: Castle Wall is NOT armed. Your agent is wrapped, but the",
-    "  enforcement wall did not start, so outbound traffic is NOT filtered.",
+    "  WARNING: Castle Wall daemon failed to start.",
+    "  Live enforcement state is unknown from this event alone. Check the",
+    "  dashboard's Castle Wall panel to confirm whether traffic is currently",
+    "  filtered by the system extension.",
     `  Reason: ${message}`,
   ];
   if (helperMigration) {

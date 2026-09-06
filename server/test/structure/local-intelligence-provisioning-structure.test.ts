@@ -18,6 +18,52 @@ describe("local intelligence provisioning structural inventory", () => {
     expect(init).not.toContain('from "../intelligence/provisioning.js"');
   });
 
+  it("keeps the consent truth table in one shared predicate, with no second copy", () => {
+    const consent = source("intelligence/provisioning-consent.ts");
+    const adapter = source("wrap/local-intelligence.ts");
+    const sequencer = source("intelligence/provisioning.ts");
+    expect(consent).toContain("export function localProvisioningPreflight(");
+    // Both stages consume the predicate; neither re-derives "did the operator
+    // ask for this" from isTty/preAnswered, which is how "not requested" and
+    // "asked for and impossible" collapsed into one refusal.
+    for (const consumer of [adapter, sequencer]) {
+      expect(consumer).toContain("localProvisioningPreflight(");
+      expect(consumer).not.toMatch(/preAnswered\s*===\s*(false|true|undefined)/);
+    }
+    // The unrequested arm exists on the shared result and on both stages, so a
+    // headless run with no flag can end without a refusal.
+    expect(consent).toContain('kind: "not-requested"');
+    expect(adapter).toContain('kind: "not-requested"');
+    expect(sequencer).toContain('kind: "not-requested"');
+  });
+
+  it("keeps the custom tag winning on both the label and the runtime side", () => {
+    const selector = source("intelligence/selector.ts");
+    const substrate = source("intelligence/substrates/local.ts");
+    // The shared invariant is exactly one arm wide: `customTag` first on both
+    // sides. Reading `LOCAL_MODEL_LABELS` (a TOTAL record) before `customTag`
+    // is what made the custom-tag arm unreachable and named a model nothing
+    // calls; a `?? LOCAL_MODEL_TAGS[pick]` tail on the label would be dead.
+    expect(substrate).toContain("customTag ?? LOCAL_MODEL_TAGS[pick]");
+    expect(selector).toContain("customTag ?? LOCAL_MODEL_LABELS[pick];");
+    expect(selector).not.toContain(
+      "customTag ?? LOCAL_MODEL_LABELS[pick] ?? LOCAL_MODEL_TAGS[pick]",
+    );
+    // Both sides name their counterpart AND state the shared invariant in the
+    // same words, so an editor of either is warned before CI has to catch it.
+    expect(substrate).toContain("The custom tag wins on both sides");
+    expect(selector).toContain("wins on both sides");
+    expect(selector).toContain("intelligence/substrates/local.ts");
+    // The armed form's digest prefix is IMPORTED from the ceremony's constant,
+    // never re-typed, so one binding cannot be shown at two widths.
+    expect(selector).toContain(
+      'import { ARMED_DIGEST_PREFIX_CHARS } from "./provisioning.js"',
+    );
+    expect(source("intelligence/provisioning.ts")).toContain(
+      "SOLE DECLARATION: the badge label in `intelligence/selector.ts` IMPORTS",
+    );
+  });
+
   it("inventories both flags, both audit ops, and the registry provider category", () => {
     const wrap = source("wrap/cli.ts");
     const init = source("wrap/init.ts");

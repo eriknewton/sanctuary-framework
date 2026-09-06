@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only cross-file pin for the machine-key material; behavior is proven by server/test/wrap/passphrase-host-identity.test.ts
 /**
  * `sanctuary audit-chain repair-plan` — behavior and the no-mutation property.
  *
@@ -381,10 +382,15 @@ describe("audit-chain repair-plan", () => {
     // file, and proves the file (and the whole fortress) stays byte-identical.
     const fortressPath = await seededFortress();
 
-    // Mirror of `deriveMachineKey` — must match `deriveMachineKey` in
-    // `src/wrap/passphrase.ts` (hostname:uid:username:home, HKDF-SHA256,
-    // info "sanctuary-passphrase-v1", 32 bytes), or the planted file will not
-    // decrypt and the verb will fail for the wrong reason.
+    // Mirror of the SUPERSEDED machine-key derivation: must match
+    // `deriveLegacyHostnameMachineKey` in `src/wrap/passphrase.ts`
+    // (hostname:uid:username:home, HKDF-SHA256, info
+    // "sanctuary-passphrase-v1", 32 bytes), or the planted file will not
+    // decrypt and the verb will fail for the wrong reason. The read path
+    // reaches this key through its migration ladder, since the current
+    // derivation binds to the host's stable identity instead; that makes the
+    // planted file doubly superseded (raw layout and older key), and the
+    // assertion below is that a read-only caller repairs neither.
     const info = userInfo();
     const machineKey = hkdf(
       sha256,

@@ -85,11 +85,36 @@ describe("Memory Integrity Slice B — frozen production assembler inventory", (
     expect(directHandleInvocations).toEqual([]);
 
     const concierge = readFileSync(join(SRC_ROOT, "concierge/concierge-service.ts"), "utf8");
+    // The briefing is compiled through ONE builder that also names the segment
+    // this runtime authored; the context handed to the selector is that
+    // builder's output verbatim, never a locally re-joined variant, or the
+    // first-party prefix the claim names would no longer be a prefix of it.
     expect(concierge).toContain(
-      "context: JSON.stringify(buildConciergePrompt({ question, context }))",
+      "const compiled = compileConciergePrompt({ question, context })",
+    );
+    expect(concierge).toContain("context: compiled.context");
+    expect(concierge).toContain(
+      "contextProvenance: claimFirstPartyContext(compiled.firstPartyPrefix)",
     );
     expect(concierge).toContain("query: question");
     expect(concierge).not.toContain("compileLegacyConciergeContext");
+  });
+
+  it("freezes the set of modules allowed to mint a first-party context claim", () => {
+    // The mint function is exported, so the brand alone answers "can this be
+    // forged from the wire" and not "which module may claim". This full-set
+    // assertion is the answer to the second question: a new caller is a
+    // deliberate, visible edit here, reviewed as a claim about authorship
+    // rather than arriving as an import nobody reads. Full-set equality, not
+    // presence: a `toContain` would pass a second, unnoticed minting site.
+    const minters = sourceFiles()
+      // The declaring module matches its own `export function` line; every
+      // other match is a call site.
+      .filter((path) => rel(path) !== "intelligence/types.ts")
+      .filter((path) => /\bclaimFirstPartyContext\s*\(/.test(readFileSync(path, "utf8")))
+      .map(rel)
+      .sort();
+    expect(minters).toEqual(["concierge/concierge-service.ts"]);
   });
 
   it("requires real production reporter wiring at every runtime construction path", () => {

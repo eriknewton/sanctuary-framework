@@ -3,7 +3,12 @@ import {
   CONCIERGE_PROMPT_DOMAIN,
   type ConciergeContextBundle,
 } from "../../src/concierge/index.js";
-import { buildConciergePrompt, isSummarizationQuery } from "../../src/concierge/prompt-builder.js";
+import {
+  boundConciergeRecords,
+  buildConciergePrompt,
+  isSummarizationQuery,
+  projectWithBudgetForTest,
+} from "../../src/concierge/prompt-builder.js";
 
 describe("concierge prompt builder", () => {
   it("uses the concierge domain separator and redacts sensitive fields", () => {
@@ -125,5 +130,248 @@ describe("concierge prompt builder — ZZZZ summarization hardening", () => {
     const messages = buildConciergePrompt({ question: "any open approvals?", context: emptyContext });
     const systemPrompt = messages[0]!.content;
     expect(systemPrompt).not.toContain("Do not invent activities");
+  });
+});
+
+/**
+ * Adversarial-complexity coverage for the bounded record projection
+ * (AGENTS.md rule 8, and rule 12's standing fault-schedule class).
+ *
+ * Output size and WORK are different quantities, and capping the first does
+ * not cap the second. The per-level caps compose multiplicatively: 24 keys at
+ * each of 6 levels admits 24^6, roughly 191 million nodes, so a record shaped
+ * as a wide tree could cost minutes of CPU while every individual cap was
+ * respected and the rendered bundle stayed small. These fixtures are built
+ * from SHARED subtree references, which is exactly how an attacker gets
+ * enormous logical fan-out out of a small stored record, and they hang a naive
+ * walk rather than merely slowing it.
+ */
+describe("the concierge record projection is bounded in work, not only in output", () => {
+  // A generous ceiling, not a benchmark: the assertion that matters is
+  // "terminates in human time", and the unbounded walk did not terminate at
+  // all. A tight bound here would flake on a loaded CI runner.
+  const WALL_CLOCK_CEILING_MS = 2_000;
+
+  it("bounds a single record object with 200k keys", () => {
+    const wide: Record<string, string> = {};
+    for (let index = 0; index < 200_000; index++) {
+      wide[`agent-authored-key-${index}`] = `value-${index}`;
+    }
+    const started = Date.now();
+    const projected = boundConciergeRecords({ audit_log: { details: wide } });
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(WALL_CLOCK_CEILING_MS);
+    const rendered = JSON.stringify(projected);
+    expect(rendered.length).toBeLessThan(10_240);
+    // Kept a bounded sample and said so, rather than silently dropping.
+    expect(rendered).toContain("[keys-omitted]");
+  });
+
+  it("bounds a 200-wide, 6-deep tree that a naive walk would never finish", () => {
+    // Built by sharing one subtree per level: cheap to construct, and 200^6
+    // (6.4e13) nodes if expanded. Depth and width caps alone do not save the
+    // walk here; only the node budget does.
+    let level: unknown = { leaf: "agent-authored-leaf-value" };
+    for (let depth = 0; depth < 6; depth++) {
+      const wide: Record<string, unknown> = {};
+      for (let index = 0; index < 200; index++) wide[`child-${index}`] = level;
+      level = wide;
+    }
+
+    const started = Date.now();
+    const projected = boundConciergeRecords({ task_state: level });
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(WALL_CLOCK_CEILING_MS);
+    expect(JSON.stringify(projected).length).toBeLessThan(10_240);
+  });
+
+  it("charges prototype-inherited properties against the budget", () => {
+    // The budget used to be charged only for properties that produced output,
+    // so an object whose enumerable properties live on its PROTOTYPE was walked
+    // property by property with every one of them hitting `continue`: unbounded
+    // work, and the budget never noticed. `for...in` walks the prototype chain,
+    // so this is reachable from any record shape that carries one.
+    // 30k, sized by measurement rather than taste: the wasted work is
+    // (objects visited) x (prototype width), and the node budget already caps
+    // the first factor at 5000, so the prototype width is the only lever that
+    // sets the margin. At 10k the unfixed code took 2278ms against this 2000ms
+    // ceiling, which is too close to be a dependable tripwire on a fast
+    // machine; 30k puts it near 7s. The fixed code is unaffected by the width,
+    // because the budget is spent inside the first polluted object either way.
+    const polluted = Object.create(
+      Object.fromEntries(
+        Array.from({ length: 30_000 }, (_, index) => [`inherited-${index}`, index]),
+      ),
+    ) as Record<string, unknown>;
+    polluted["own"] = "kept";
+
+    // Fan the polluted object out so the skipped iterations multiply, which is
+    // what turns "a few thousand wasted iterations" into wall-clock time.
+    //
+    // THREE levels, not more, and the number is load-bearing: the projection
+    // stops descending at `CONCIERGE_MAX_DEPTH`, so burying the polluted object
+    // deeper than that makes it a `[depth-capped]` marker the loop never walks,
+    // and the fixture would pass against the unfixed code while proving
+    // nothing. It has to sit shallow enough to actually be entered, and be
+    // reachable often enough that the wasted iterations accumulate.
+    let level: unknown = polluted;
+    for (let depth = 0; depth < 3; depth++) {
+      const wide: Record<string, unknown> = {};
+      for (let index = 0; index < 200; index++) wide[`child-${index}`] = level;
+      level = wide;
+    }
+
+    const started = Date.now();
+    const projected = boundConciergeRecords({ audit_log: level });
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(WALL_CLOCK_CEILING_MS);
+    expect(JSON.stringify(projected).length).toBeLessThan(10_240);
+  });
+
+  it("never copies an inherited property into the projection", () => {
+    // The budget change must not have quietly turned `continue` into "keep it".
+    const polluted = Object.create({ inheritedSecretish: "must-not-appear" }) as
+      Record<string, unknown>;
+    polluted["own"] = "kept";
+    const rendered = JSON.stringify(boundConciergeRecords({ record: polluted }));
+    expect(rendered).toContain("kept");
+    expect(rendered).not.toContain("must-not-appear");
+  });
+
+  it("redacts sensitive keys inside the one bounded walk, on the untruncated key", () => {
+    // Redaction is applied to the ORIGINAL key. Testing the capped key instead
+    // would be a defect: truncating a long key can cut off the substring that
+    // marks it sensitive, and the value would then be shipped in full.
+    const longSensitiveKey = `${"a".repeat(300)}_api_token`;
+    const projected = boundConciergeRecords({
+      details: { [longSensitiveKey]: "do-not-include", private_key: "nope", safe: "kept" },
+    }) as { details: Record<string, unknown> };
+    const rendered = JSON.stringify(projected);
+
+    expect(rendered).not.toContain("do-not-include");
+    expect(rendered).not.toContain("nope");
+    expect(rendered).toContain("[redacted]");
+    expect(rendered).toContain("kept");
+  });
+
+  it("does not walk the subtree under a sensitive key", () => {
+    // Short-circuiting is a work bound as well as a privacy rule: an adversarial
+    // structure hidden under a sensitive key costs one node, not a whole walk.
+    let bomb: unknown = { leaf: "x" };
+    for (let depth = 0; depth < 5; depth++) {
+      const wide: Record<string, unknown> = {};
+      for (let index = 0; index < 200; index++) wide[`child-${index}`] = bomb;
+      bomb = wide;
+    }
+    const started = Date.now();
+    const projected = boundConciergeRecords({ details: { api_token: bomb } }) as
+      { details: { api_token: unknown } };
+    expect(Date.now() - started).toBeLessThan(WALL_CLOCK_CEILING_MS);
+    expect(projected.details.api_token).toBe("[redacted]");
+  });
+
+  /**
+   * The charging rule is exact: `project` charges one unit for the node it is
+   * entered on, and a key that does not descend charges itself, so every key
+   * costs exactly one. These tests are the only thing that can hold it to that,
+   * because an off-by-one is invisible at the production budget of 5000: the
+   * walk still terminates, still bounds work, and simply buys fewer nodes than
+   * the constant claims while sometimes marking a fully projected object as
+   * truncated.
+   */
+  describe("charges exactly one unit per key", () => {
+    const OWN_KEYS = 10;
+
+    function scalarKeys(count: number): Record<string, number> {
+      return Object.fromEntries(
+        Array.from({ length: count }, (_, index) => [`k${index}`, index]),
+      );
+    }
+
+    it("projects N keys fully under a budget of N plus the root", () => {
+      const projected = projectWithBudgetForTest(
+        scalarKeys(OWN_KEYS),
+        OWN_KEYS + 1,
+      ) as Record<string, unknown>;
+
+      expect(Object.keys(projected)).toHaveLength(OWN_KEYS);
+      expect(projected["[budget-exhausted]"]).toBeUndefined();
+      expect(projected["[keys-omitted]"]).toBeUndefined();
+      expect(projected["k9"]).toBe(9);
+    });
+
+    it("drops exactly one key at N+1 under the same budget, and says the budget did it", () => {
+      const projected = projectWithBudgetForTest(
+        scalarKeys(OWN_KEYS + 1),
+        OWN_KEYS + 1,
+      ) as Record<string, unknown>;
+
+      // OWN_KEYS projected, one refused, plus the marker naming why.
+      expect(projected["[budget-exhausted]"]).toBe(true);
+      expect(projected["[keys-omitted]"]).toBeUndefined();
+      expect(
+        Object.keys(projected).filter((key) => !key.startsWith("[")),
+      ).toHaveLength(OWN_KEYS);
+    });
+
+    it("charges a redacted key once, though it never descends", () => {
+      // A sensitive key short-circuits the subtree, so it does not pay through
+      // `project`; it must still pay for its own iteration or the exemption
+      // becomes a free pass.
+      const projected = projectWithBudgetForTest(
+        { api_token: { anything: "unwalked" }, a: 1, b: 2 },
+        3,
+      ) as Record<string, unknown>;
+
+      expect(projected["api_token"]).toBe("[redacted]");
+      expect(projected["a"]).toBe(1);
+      expect(projected["[budget-exhausted]"]).toBe(true);
+      expect(projected["b"]).toBeUndefined();
+    });
+  });
+
+  describe("names the two reasons a projection is incomplete, separately", () => {
+    it("reports the key cap as keys-omitted, not as budget exhaustion", () => {
+      const wide = Object.fromEntries(
+        Array.from({ length: 40 }, (_, index) => [`k${index}`, index]),
+      );
+      const projected = projectWithBudgetForTest(wide, 1_000) as Record<string, unknown>;
+
+      expect(projected["[keys-omitted]"]).toBe(true);
+      expect(projected["[budget-exhausted]"]).toBeUndefined();
+    });
+
+    it("reports inherited properties draining the budget as budget exhaustion, with no own key missing", () => {
+      // The regression this separates out: inherited enumerables can drain the
+      // budget while every own key was projected, and reporting that as
+      // `[keys-omitted]` would claim a policy decision where a resource limit
+      // occurred.
+      const polluted = Object.create(
+        Object.fromEntries(
+          Array.from({ length: 200 }, (_, index) => [`inherited-${index}`, index]),
+        ),
+      ) as Record<string, unknown>;
+      polluted["own"] = "kept";
+
+      const projected = projectWithBudgetForTest(polluted, 20) as Record<string, unknown>;
+
+      expect(projected["own"]).toBe("kept");
+      expect(projected["[budget-exhausted]"]).toBe(true);
+      expect(projected["[keys-omitted]"]).toBeUndefined();
+    });
+  });
+
+  it("still renders an ordinary bundle in full, so the bound is not just truncation", () => {
+    const ordinary = {
+      audit_log: {
+        entries: [
+          { operation: "state_write", identity_id: "operator", result: "success" },
+        ],
+      },
+    };
+    expect(boundConciergeRecords(ordinary)).toEqual(ordinary);
   });
 });

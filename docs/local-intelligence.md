@@ -39,6 +39,17 @@ The first manifest lists the default models for the three hardware
 bands (8, 16, and 32 GiB of RAM) with their exact Ollama registry digests, so
 the model that is pulled is the one that was signed.
 
+## Checking what is armed
+
+`sanctuary intelligence diagnose` reports whether local intelligence is armed on
+a fortress, which model manifest version it is armed to, and the bound model
+tags with the signed manifest digest each one was verified against. Reading that
+state needs the fortress credential, so on a host where no credential is
+available in the session the armed state reads as unavailable, which is a
+different answer from unarmed. The command writes nothing to the fortress and
+prints no credential or key material. Add `--json` for the machine-readable
+form.
+
 ## Bounds
 
 - **No network discovery of newer manifests yet.** The ceremony only reads the
@@ -49,10 +60,16 @@ the model that is pulled is the one that was signed.
 - **Light assurance verifies the runtime-reported digest.** The check confirms
   that Ollama reports the signed manifest digest for each required model. It
   does not by itself prove that every model byte on disk was read.
-- **Windows requires a manual Ollama install.** Automatic runtime installation
-  is not available there; install Ollama, then re-run the ceremony.
-- **Interactive only.** A headless run refuses before touching the host or the
-  manifest.
+- **Ollama is installed by the operator on every platform in this release.**
+  Automatic runtime installation is not available yet; install Ollama, start
+  it once, then run the ceremony. Pulling the tier model with `ollama pull`
+  first is the reliable path on this release; the ceremony then verifies the
+  present model against the signed manifest and arms.
+- **Interactive only, and the two headless cases differ.** A headless run that
+  passes `--provision-local-intelligence` is refused before the host or the
+  manifest is touched, and the refusal is recorded. A headless run that never
+  asks for local intelligence is left alone: no ceremony, no refusal, and no
+  record written.
 - **ESM entry only.** The packaged manifest is located from the module's own
   file URL, which the CommonJS builds of the library do not carry; a CommonJS
   consumer gets a named refusal, and the `sanctuary` CLI is the provisioning

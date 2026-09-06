@@ -7,7 +7,7 @@ import { ProxyRouter } from "../../../../server/src/proxy/proxy-router.js";
 import { registerFixture } from "../../registry.js";
 import { outcome } from "../state-trust/helpers.js";
 
-const CLAIM_ID = "17";
+const CLAIM_ID = "18";
 const CLAIM_LABEL = "Dynamic proxy tool discovery";
 
 // Entrypoints: DynamicProxyToolRegistry.refresh and ProxyRouter.getProxiedTools handler wrapping.

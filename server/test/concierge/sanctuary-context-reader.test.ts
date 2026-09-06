@@ -141,3 +141,64 @@ describe("SanctuaryContextReader", () => {
     expect((await readerB.readContext({ question: "tasks" })).task_state.total).toBe(0);
   });
 });
+
+/**
+ * `maxAuditEntries` rides on the caller-supplied ask request, so it is a knob
+ * on how much work this fortress does to answer one question. Unclamped, a
+ * single `ask` could drive an arbitrarily large audit query and decryption
+ * pass; nothing downstream could ever use the rows, because the prompt
+ * projection caps the rendered bundle far below the ceiling.
+ */
+describe("the concierge audit read is clamped, whatever the caller asks for", () => {
+  function readerRecordingLimit(limits: number[]) {
+    return makeReader({
+      auditLog: {
+        query: async (query: { limit: number }) => {
+          limits.push(query.limit);
+          return { total: 0, entries: [], integrity_findings: [] };
+        },
+        append: async () => undefined,
+      },
+    } as never);
+  }
+
+  it("clamps an oversized request to the ceiling", async () => {
+    const limits: number[] = [];
+    await readerRecordingLimit(limits).readContext({
+      question: "audit",
+      maxAuditEntries: 1_000_000,
+    });
+    expect(limits).toEqual([100]);
+  });
+
+  it("passes an in-range request through unchanged", async () => {
+    const limits: number[] = [];
+    await readerRecordingLimit(limits).readContext({
+      question: "audit",
+      maxAuditEntries: 25,
+    });
+    expect(limits).toEqual([25]);
+  });
+
+  it("floors a zero, negative, or fractional request instead of querying with it", async () => {
+    // A negative or NaN limit is not a smaller query, it is a malformed one:
+    // the storage layer would see a bound it cannot honor.
+    for (const [requested, expected] of [[0, 1], [-5, 1], [3.7, 3], [Number.NaN, 20]] as const) {
+      const limits: number[] = [];
+      await readerRecordingLimit(limits).readContext({
+        question: "audit",
+        maxAuditEntries: requested,
+      });
+      expect(limits, `maxAuditEntries=${requested}`).toEqual([expected]);
+    }
+  });
+
+  it("keeps the question-derived defaults when no limit is supplied", async () => {
+    const audit: number[] = [];
+    await readerRecordingLimit(audit).readContext({ question: "show me the audit log" });
+    expect(audit).toEqual([50]);
+    const other: number[] = [];
+    await readerRecordingLimit(other).readContext({ question: "how many identities?" });
+    expect(other).toEqual([20]);
+  });
+});

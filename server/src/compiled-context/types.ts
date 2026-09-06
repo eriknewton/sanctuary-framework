@@ -39,8 +39,31 @@ export type CompiledContextKnownSourceKind =
   | "fetched_tool_result"
   | "federation_content";
 
+/**
+ * Trust class of one contributor's bytes.
+ *
+ * `first_party_runtime` means the runtime itself assembled those bytes from
+ * its own template and its own local records, so their SIZE is a design
+ * choice of this fortress rather than an adversary's. `untrusted` means the
+ * bytes came from, or can be steered by, someone other than the runtime:
+ * the operator's question, agent-supplied text, a raw state-store payload.
+ *
+ * The class changes ONLY the prompt-stuffing size heuristic (see
+ * {@link CompiledContextScanRequest.parts} and the scanner's first-party
+ * field). No trust class exempts any contributor from role-override,
+ * security-bypass, Unicode/homoglyph, decoded-payload, exfiltration or
+ * over-limit screening, and no trust class makes a flagged artifact clean.
+ */
+export type CompiledContextTrustClass = "untrusted" | "first_party_runtime";
+
 export interface CompiledContextContributor {
   kind: CompiledContextKnownSourceKind;
+  /**
+   * INVARIANT: an absent `trust` reads as `untrusted`. Provenance is proven
+   * by the assembler that can prove it, never assumed by the scanner, so a
+   * caller that says nothing keeps the strictest sizing.
+   */
+  trust?: CompiledContextTrustClass;
 }
 
 /**
@@ -70,6 +93,22 @@ export interface CompiledContextScanRequest {
   /** Compiler-side bounded preflight; no detector/cache work may override it. */
   preflightOverLimit?: boolean;
   observedByteLength?: number;
+  /**
+   * The contributor texts the assembler concatenated into `artifact`,
+   * index-aligned with `metadata.contributors`. Supplied only so the scanner
+   * can size each contributor by its trust class instead of sizing the joined
+   * total; the artifact itself stays the hashed, cached, screened unit.
+   *
+   * INVARIANT: `parts.join("") === artifact`, exactly. Each part carries any
+   * separator that precedes it, so there is no separator constant to mirror
+   * between assembler and scanner and no way for the two to disagree about one.
+   *
+   * INVARIANT: unusable provenance (a length that does not equal the
+   * contributor count, or parts that do not reconstruct the artifact) makes the
+   * scanner ignore `parts` entirely and screen the whole artifact as untrusted.
+   * A mismatch can only lose an exemption, never grant one.
+   */
+  parts?: readonly string[];
 }
 
 export interface CompiledContextScanResult {

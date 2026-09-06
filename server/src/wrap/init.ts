@@ -15,8 +15,9 @@
  *   - Honors --fortress <path> (and SANCTUARY_FORTRESS_PATH env var) as
  *     the operator-friendly alias for SANCTUARY_STORAGE_PATH.
  *
- * Honors --force, --no-confirm. The recovery key is fully disclosed via
- * the shared helper at server/src/wrap/recovery-key-disclosure.ts.
+ * Honors --force, --no-confirm. Interactive init discloses the recovery key
+ * through the shared helper; headless init writes it to an external staging
+ * path and prints only that path.
  */
 
 import { lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
@@ -70,6 +71,7 @@ import {
   RecoveryKeyReentryMismatchError,
   type DiscloseRecoveryKeyResult,
 } from "./recovery-key-disclosure.js";
+import { agentGuidedRecoveryOutputPath } from "./custody-flow.js";
 import {
   DEFAULT_STORAGE_DIR,
   formatFortressPathWritableError,
@@ -81,6 +83,10 @@ import {
 } from "../cli/castle-wall.js";
 import { mkdirSafeUnderRoot } from "./config-reader.js";
 import { runLocalIntelligenceSetup } from "./local-intelligence.js";
+// The dependency-free consent leaf, not the `intelligence` barrel: this file
+// is on the CLI boot path and must not pull the selector graph in for one
+// string. Must match the flag names parsed below.
+import { LOCAL_INTELLIGENCE_OPT_IN_HINT } from "../intelligence/provisioning-consent.js";
 import type { CrossProcessLockLease } from "../storage/cross-process-lock.js";
 import { kernelBackedCrossProcessLockPlatformSupported } from "../storage/cross-process-lock.js";
 
@@ -301,6 +307,8 @@ export interface RunInitDeps {
   recoveryKeychain?: KeychainCustodyOptions;
   /** Test seam: simulate a race immediately before recovery-file O_EXCL capture. */
   beforeRecoveryKeyOutputWrite?: (filePath: string) => void | Promise<void>;
+  /** Test seam: drive attended recovery-key re-entry without real terminal input. */
+  verifyRecoveryKeyReentry?: typeof verifyRecoveryKeyReentry;
   /** Test seam: pause after unlocked preflight and mkdir, before custody lock. */
   beforeCustodyLockAcquire?: () => void | Promise<void>;
   runLocalIntelligenceSetup?: typeof runLocalIntelligenceSetup;
@@ -345,6 +353,21 @@ export async function runInit(
         "No fortress layout was created.",
     );
   }
+
+  // Check the fortress parent before staging any external recovery destination:
+  // a failed fortress-path preflight must not leave recovery scaffolding behind.
+  const fortressWritable = await preflightFortressPathWritable(fortressPath);
+  if (!fortressWritable.ok) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  Sanctuary init: ${formatFortressPathWritableError(
+        fortressPath,
+        fortressWritable,
+      )}\n`,
+    );
+    throw new Error("fortress path is not writable");
+  }
+
   let recoveryKeyOutputPath: string | undefined;
   try {
     recoveryKeyOutputPath = resolveRecoveryKeyOutputPath({
@@ -366,16 +389,34 @@ export async function runInit(
     throw err;
   }
 
-  const fortressWritable = await preflightFortressPathWritable(fortressPath);
-  if (!fortressWritable.ok) {
-    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(
-      `\n  Sanctuary init: ${formatFortressPathWritableError(
-        fortressPath,
-        fortressWritable,
-      )}\n`,
-    );
-    throw new Error("fortress path is not writable");
+  // Headless init requires a durable external destination for the recovery key:
+  // the key must never land inside the fortress directory when --no-confirm is
+  // set, because no operator is present to move it off-host. When neither
+  // --recovery-out nor SANCTUARY_RECOVERY_OUT names a destination, choose the
+  // agent-guided staging path (beside the fortress, never inside it). Validate
+  // and preflight through the same guards as an explicit destination, before
+  // any fortress mutation.
+  if (!recoveryKeyOutputPath && options.noConfirm) {
+    const headlessOut = agentGuidedRecoveryOutputPath(fortressPath);
+    try {
+      recoveryKeyOutputPath = resolveRecoveryKeyOutputPath({
+        recoveryOut: headlessOut,
+        storagePath: fortressPath,
+        env: {},
+      });
+      if (recoveryKeyOutputPath) {
+        await preflightRecoveryKeyOutputFile(recoveryKeyOutputPath);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const prefix =
+        err instanceof RecoveryKeyOutputPathInsideFortressError
+          ? "recovery key output refused"
+          : "recovery key output unavailable";
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(`\n  Sanctuary init: ${prefix}: ${message}\n`);
+      throw err;
+    }
   }
 
   if (!options.force) {
@@ -682,53 +723,82 @@ export async function runInit(
   // (runPostLockLocalSetup below).
   let disclosure: DiscloseRecoveryKeyResult;
   try {
-    const disclosureOptions: Parameters<typeof discloseRecoveryKey>[0] = {
-      recoveryKey,
-      storagePath: recoveryKeyOutputPath ? fortressPath : lockedFortressPath,
-      fortressId,
-      mode: "no-confirm", // capture/verification below replaces the Y/N prompt
-    };
-    if (!recoveryKeyOutputPath && lockedFortressPath !== fortressPath) {
-      // Linux writes through the inode-bound /proc/self/fd capability, but that
-      // ephemeral descriptor path must never be disclosed as recovery guidance.
-      disclosureOptions.operatorFilePath = join(
-        fortressPath,
-        "recovery-key.txt",
-      );
-    }
-    if (recoveryKeyOutputPath) {
+    if (!interactive) {
+      // Headless: do NOT call discloseRecoveryKey. The key was prewritten to an
+      // external destination before the custody-envelope commit. Calling the
+      // disclosure helper here would print the full key to stderr. Print only
+      // the durable external destination.
       if (!prewrittenRecoveryKeyFile) {
-        throw new Error("custom recovery-key output was not captured");
+        throw new Error(
+          "headless init requires a prewritten external recovery-key file; path selection failed",
+        );
       }
-      disclosureOptions.recoveryKeyFilePath = recoveryKeyOutputPath;
-    }
-    if (prewrittenRecoveryKeyFile) {
-      disclosureOptions.prewrittenFile = prewrittenRecoveryKeyFile;
-    }
-    disclosure = await fencedInit(lease, deps, "recovery-key-disclosure", () =>
-      discloseRecoveryKey(disclosureOptions),
-    );
-    if (interactive && !recoveryKeyOutputPath && disclosure.fileWritten) {
+      if (
+        resolve(prewrittenRecoveryKeyFile.filePath) !== recoveryKeyOutputPath ||
+        !prewrittenRecoveryKeyFile.written
+      ) {
+        throw new Error(
+          "headless init requires a newly written recovery-key file at the selected external path",
+        );
+      }
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
-        "\n  WARNING: the only plaintext recovery-key copy currently lives inside\n" +
-          "  the fortress directory. It will be lost if that directory is cleared;\n" +
-          "  a later master rotation also mints a new recovery key.\n" +
-          "  Re-run with --recovery-out <path outside the fortress>, or move this\n" +
-          "  file now.\n",
+        `\n  Sanctuary init: recovery key written to:\n    ${prewrittenRecoveryKeyFile.filePath}\n`,
       );
-    }
-    if (interactive && !recoveryKeyOutputPath && !disclosure.fileWritten) {
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(
-        "\n  WARNING: the default recovery-key.txt already existed and was not\n" +
-          "  overwritten. It may contain a prior recovery key. The authoritative\n" +
-          "  new recovery key is the one shown above and re-entered now; save\n" +
-          "  that key outside the fortress.\n",
+      disclosure = {
+        filePath: prewrittenRecoveryKeyFile.filePath,
+        fileWritten: prewrittenRecoveryKeyFile.written,
+        confirmed: false,
+      };
+    } else {
+      // Interactive: existing banner disclosure and end-to-end re-entry
+      // verification. The operator is present at a TTY.
+      const disclosureOptions: Parameters<typeof discloseRecoveryKey>[0] = {
+        recoveryKey,
+        storagePath: recoveryKeyOutputPath ? fortressPath : lockedFortressPath,
+        fortressId,
+        mode: "no-confirm", // capture/verification below replaces the Y/N prompt
+      };
+      if (!recoveryKeyOutputPath && lockedFortressPath !== fortressPath) {
+        // Linux writes through the inode-bound /proc/self/fd capability, but that
+        // ephemeral descriptor path must never be disclosed as recovery guidance.
+        disclosureOptions.operatorFilePath = join(
+          fortressPath,
+          "recovery-key.txt",
+        );
+      }
+      if (recoveryKeyOutputPath) {
+        if (!prewrittenRecoveryKeyFile) {
+          throw new Error("custom recovery-key output was not captured");
+        }
+        disclosureOptions.recoveryKeyFilePath = recoveryKeyOutputPath;
+      }
+      if (prewrittenRecoveryKeyFile) {
+        disclosureOptions.prewrittenFile = prewrittenRecoveryKeyFile;
+      }
+      disclosure = await fencedInit(lease, deps, "recovery-key-disclosure", () =>
+        discloseRecoveryKey(disclosureOptions),
       );
-    }
-    if (interactive) {
-      await verifyRecoveryKeyReentry({
+      if (!recoveryKeyOutputPath && disclosure.fileWritten) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          "\n  WARNING: the only plaintext recovery-key copy currently lives inside\n" +
+            "  the fortress directory. It will be lost if that directory is cleared;\n" +
+            "  a later master rotation also mints a new recovery key.\n" +
+            "  Re-run with --recovery-out <path outside the fortress>, or move this\n" +
+            "  file now.\n",
+        );
+      }
+      if (!recoveryKeyOutputPath && !disclosure.fileWritten) {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          "\n  WARNING: the default recovery-key.txt already existed and was not\n" +
+            "  overwritten. It may contain a prior recovery key. The authoritative\n" +
+            "  new recovery key is the one shown above and re-entered now; save\n" +
+            "  that key outside the fortress.\n",
+        );
+      }
+      await (deps.verifyRecoveryKeyReentry ?? verifyRecoveryKeyReentry)({
         check: async (entered) => {
           try {
             envelope = await fencedInit(
@@ -935,7 +1005,14 @@ export async function runInit(
         // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
         print: (line) => console.error(`  ${line}`),
       });
-      if (outcome.kind === "refused") {
+      if (outcome.kind === "not-requested") {
+        // Nothing was read, recorded, or degraded: this run never asked. The
+        // line is informational, never a failure the operator must act on.
+        // SAFETY: stderr is the operator-facing init channel; no logger exists yet.
+        console.error(
+          `  Local intelligence was not set up; ${LOCAL_INTELLIGENCE_OPT_IN_HINT}.`,
+        );
+      } else if (outcome.kind === "refused") {
         // SAFETY: stderr is the operator-facing init channel; no logger exists yet.
         console.error(`  Local intelligence remains DEGRADED (${outcome.reason}).`);
       }

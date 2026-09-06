@@ -24,14 +24,22 @@ import { INTEL_OPS } from "../intelligence/audit-events.js";
 import {
   INTELLIGENCE_CONFIG_RESET_VERB,
   IntelligenceConfigStore,
+  classifyLocalIntelligenceState,
+  probeDurableRecordPresence,
   type LoadOutcome,
+  type LocalIntelligenceStateReport,
 } from "../intelligence/policy-store.js";
 import { AuditLog } from "../operational/audit-log.js";
 import { recoverInterruptedExitImportsOrThrow } from "../exit/bundle.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import type { StorageBackend } from "../storage/interface.js";
 import type { MasterWriteBarrierLease } from "../storage/cross-process-lock.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
-import { unlockLocalFortress } from "./local-fortress-unlock.js";
+import { buildDefaultConfig } from "../intelligence/defaults.js";
+import {
+  unlockLocalFortress,
+  type LocalFortressUnlockFailure,
+} from "./local-fortress-unlock.js";
 import {
   aliasConflictMessage,
   consumeFlagValue,
@@ -69,7 +77,287 @@ interface IntelligenceCommandOpts {
   argv: string[];
   /** Test seams for `config-reset`; production leaves this undefined. */
   configResetDeps?: ConfigResetDeps;
+  /** Test seams for `diagnose`; production leaves this undefined. */
+  diagnoseDeps?: DiagnoseDeps;
 }
+
+export interface DiagnoseDeps {
+  /** Master unlock chokepoint; tests inject a keyring-free wrapper. */
+  unlock?: typeof unlockLocalFortress;
+  env?: NodeJS.ProcessEnv;
+  /** Test seam for the store's catalog key pin; production uses the compiled key. */
+  modelManifestV2PublicKey?: Uint8Array;
+  /**
+   * Test seam for the fortress state backend; production always constructs the
+   * real {@link FilesystemStorage} over `<fortress>/state`. Injected so a test
+   * can drive a storage whose reads fail (EACCES) without needing a fortress
+   * this process cannot read.
+   */
+  storage?: StorageBackend;
+}
+
+/**
+ * What `diagnose` can say about the durable local-intelligence record. The
+ * unreadable arm exists because this verb requires no passphrase and writes
+ * nothing: when the record cannot be opened from here the honest answer is
+ * "not readable from here", never "unarmed". The arm covers two DIFFERENT
+ * situations, separated by {@link renderUnlockRefusal}: no usable credential,
+ * and a valid credential on a fortress that needs the one-time custody
+ * migration this read-only verb refuses to perform.
+ */
+type DiagnoseLocalIntelligence =
+  | { readable: true; report: LocalIntelligenceStateReport }
+  | { readable: false; failure: LocalFortressUnlockFailure };
+
+/**
+ * Read the durable record through the SAME store, load-integrity path, and
+ * classification the runtime uses, so this diagnostic cannot report a fortress
+ * as armed that the selector would refuse. Read-only: no write barrier, no
+ * custody minting, and the master copy is zeroed on every outcome.
+ *
+ * Failure mode to expect: on a host where the fortress credential is not
+ * reachable (a locked keyring over SSH, a different machine), and on a
+ * pre-envelope fortress whose one-time custody migration this verb refuses to
+ * perform, it returns the unreadable arm. Reading either as "not armed" is the
+ * mistake it exists to prevent, and the two carry different remedies.
+ */
+async function readLocalIntelligenceState(
+  storagePath: string,
+  deps: DiagnoseDeps,
+): Promise<DiagnoseLocalIntelligence> {
+  const absent = (): DiagnoseLocalIntelligence => ({
+    readable: true,
+    report: classifyLocalIntelligenceState({
+      kind: "default",
+      config: buildDefaultConfig(),
+    }),
+  });
+  const statePath = join(storagePath, "state");
+  if (!existsSync(statePath)) {
+    // No fortress state directory: absence is the truth, and no credential
+    // store is touched to establish it.
+    return absent();
+  }
+  const storage = deps.storage ?? new FilesystemStorage(statePath);
+  // INVARIANT: presence is settled from the BYTES before any credential is
+  // resolved. A fortress that was never armed has no record to open, so
+  // asking the OS keyring to prove that would make a read-only report reach
+  // the credential store (a keychain modal on a desktop, a `security` /
+  // `secret-tool` subprocess under test) on the commonest shape there is, and
+  // would then render the missing credential as the answer instead of the
+  // absent record. `unreadable` stays distinct from `absent`: a read that
+  // FAILED is not a record that is not there.
+  const presence = await probeDurableRecordPresence(storage);
+  if (presence === "unreadable") {
+    return {
+      readable: true,
+      report: classifyLocalIntelligenceState({ kind: "read-failed" }),
+    };
+  }
+  if (presence === "absent") return absent();
+  // A record exists, and opening it is what needs the fortress credential.
+  const unlock = deps.unlock ?? unlockLocalFortress;
+  const unlocked = await unlock({
+    storage,
+    storagePath,
+    env: deps.env ?? process.env,
+    // INVARIANT: `diagnose` reports state and must never change it. `readOnly`
+    // is the chokepoint's explicit no-custody-mutation intent: it refuses the
+    // one journaled pre-envelope migration the ordinary read unlock would
+    // otherwise perform, so this verb writes nothing on any fortress shape.
+    readOnly: true,
+  });
+  if (!unlocked.ok) return { readable: false, failure: unlocked.failure };
+  const masterKey = unlocked.masterKey;
+  try {
+    const store = new IntelligenceConfigStore(
+      storage,
+      masterKey,
+      deps.modelManifestV2PublicKey === undefined
+        ? {}
+        : { modelManifestV2PublicKey: deps.modelManifestV2PublicKey },
+    );
+    // `loadForDiagnostics`, never `load`: the boot-path load reports a storage
+    // read failure as a fresh fortress, which this verb would print as "no
+    // durable record exists" on a record it simply could not read. It re-reads
+    // the record rather than reusing the presence probe's bytes, so a record
+    // deleted between the two reads reports absent instead of failing.
+    return {
+      readable: true,
+      report: classifyLocalIntelligenceState(await store.loadForDiagnostics()),
+    };
+  } finally {
+    masterKey.fill(0);
+  }
+}
+
+/**
+ * What an unreadable arm may say, as ONE table over the closed
+ * `LocalFortressUnlockFailure` union. Both renderings consume it, so the human
+ * and `--json` forms cannot describe the same refusal differently, and the
+ * `switch` is exhaustive so a new failure code fails the build here rather
+ * than silently inheriting the credential text.
+ */
+interface UnlockRefusalRender {
+  /** Closed diagnose state name for this refusal. */
+  state: string;
+  detail: string;
+  remedy: string;
+  /**
+   * The closed unlock code, or null when the refusal is not about a
+   * credential; only a non-null value is shown as a credential failure.
+   */
+  credentialFailure: LocalFortressUnlockFailure | null;
+}
+
+function renderUnlockRefusal(
+  failure: LocalFortressUnlockFailure,
+): UnlockRefusalRender {
+  switch (failure) {
+    case "migration_required":
+      // INVARIANT: the credential RESOLVED and is valid here; only the
+      // one-time pre-envelope custody migration was refused, because this verb
+      // declares a read-only session. Rendering this as a credential problem
+      // would tell the operator to fix a credential that already works, which
+      // is the mis-render class this branch exists to prevent.
+      return {
+        state: "custody_migration_required",
+        detail:
+          "this fortress predates the custody envelope format, and a read-only command will not migrate it",
+        remedy: LOCAL_INTELLIGENCE_MIGRATION_HINT,
+        credentialFailure: null,
+      };
+    case "absent":
+    case "locked":
+    case "unreadable":
+    case "mismatch":
+    case "other":
+      return {
+        state: "unavailable",
+        detail: "the fortress credential is not available in this session",
+        remedy: LOCAL_INTELLIGENCE_CREDENTIAL_HINT,
+        credentialFailure: failure,
+      };
+  }
+}
+
+/**
+ * The machine-readable projection. Every field is public manifest content, a
+ * local path, or a closed state name; no key material and no credential ever
+ * reaches this object (MUST-NEVER #6).
+ *
+ * INVARIANT on the unreadable arm: only `LocalFortressUnlockFailure` — the
+ * closed union declared in `cli/local-fortress-unlock.ts` — and this file's
+ * fixed hints are projected. The unlock result's `message` is DELIBERATELY
+ * dropped: it is written for a different audience, it can embed the fortress
+ * path, and it is the field an underlying `Error.message` or `cause` would
+ * travel in. Never widen this to the result object.
+ */
+function localIntelligenceJson(
+  state: DiagnoseLocalIntelligence,
+): Record<string, unknown> {
+  if (!state.readable) {
+    const refusal = renderUnlockRefusal(state.failure);
+    return {
+      state: refusal.state,
+      detail: refusal.detail,
+      credential_failure: refusal.credentialFailure,
+      manifest_version: null,
+      signed_body_sha256: null,
+      ollama_models_root: null,
+      committed_at: null,
+      bindings: [],
+      remedy: refusal.remedy,
+    };
+  }
+  return { ...state.report, credential_failure: null };
+}
+
+/**
+ * Operator-facing lines for the durable record; one section, always printed.
+ * Same projection rule as {@link localIntelligenceJson}, through the same
+ * {@link renderUnlockRefusal} table, never the unlock result's `message`.
+ */
+function localIntelligenceLines(state: DiagnoseLocalIntelligence): string[] {
+  if (!state.readable) {
+    const refusal = renderUnlockRefusal(state.failure);
+    return [
+      refusal.credentialFailure === null
+        ? `Local intelligence: ${refusal.state}`
+        : `Local intelligence: ${refusal.state} (${refusal.credentialFailure})`,
+      `  ${refusal.detail}`,
+      `  remedy: ${refusal.remedy}`,
+    ];
+  }
+  const report = state.report;
+  const lines = [`Local intelligence: ${report.state}`];
+  if (report.detail !== null) lines.push(`  ${report.detail}`);
+  if (report.manifest_version !== null) {
+    lines.push(`  model manifest version: ${report.manifest_version}`);
+  }
+  if (report.signed_body_sha256 !== null) {
+    lines.push(`  manifest body sha256: ${report.signed_body_sha256}`);
+  }
+  if (report.ollama_models_root !== null) {
+    lines.push(`  model store root: ${report.ollama_models_root}`);
+  }
+  if (report.committed_at !== null) lines.push(`  armed at: ${report.committed_at}`);
+  if (report.bindings.length > 0) {
+    lines.push("  bound models:");
+    for (const binding of report.bindings) {
+      lines.push(
+        `    ${binding.surface}: ${binding.runtime_tag} ` +
+          `(ollama manifest sha256 ${binding.ollama_manifest_sha256}, ${binding.assurance})`,
+      );
+    }
+  }
+  if (report.remedy !== null) lines.push(`  remedy: ${report.remedy}`);
+  return lines;
+}
+
+/**
+ * Whether the durable local-intelligence record reads as healthy, for the
+ * `--json` `ok` flag.
+ *
+ * `absent` and `legacy-unarmed` are healthy: nobody asked for local
+ * intelligence on this fortress, or it was never armed, and neither is a
+ * defect. Every state where a record EXISTS but the runtime would refuse it
+ * (`corrupt`, `version-too-new`, `integrity_state_invalid`) is not ok, and
+ * neither is any unreadable arm (`unavailable` or
+ * `custody_migration_required`): a session that could not read the record has
+ * an indeterminate answer, and an indeterminate answer must never render as a
+ * passing one (AGENTS.md assurance rule 1).
+ */
+function localIntelligenceIsOk(state: DiagnoseLocalIntelligence): boolean {
+  if (!state.readable) return false;
+  switch (state.report.state) {
+    case "armed":
+    case "absent":
+    case "legacy-unarmed":
+      return true;
+    case "integrity_state_invalid":
+    case "corrupt":
+    case "version-too-new":
+    case "storage_unreadable":
+      return false;
+  }
+}
+
+/**
+ * Said only when this fortress needs the one-time pre-envelope custody
+ * migration. `sanctuary protect` is named because its custody path
+ * (`wrap/custody-flow.ts` -> `establishWrapCustody` -> `establishMaster`) IS
+ * the migration, verified by a test; a read-only verb cannot perform it.
+ */
+const LOCAL_INTELLIGENCE_MIGRATION_HINT =
+  "run `sanctuary protect` on this fortress once to perform the one-time custody migration, then re-run this command";
+
+/**
+ * Said only when the record could not be read for lack of a credential. Names
+ * the two ways to get one without ever naming which this fortress uses.
+ */
+const LOCAL_INTELLIGENCE_CREDENTIAL_HINT =
+  "supply SANCTUARY_PASSPHRASE, or run this on the host whose keyring holds this fortress's credential, to read the armed state";
 
 function hasFlag(argv: string[], name: string): boolean {
   return argv.includes(name);
@@ -86,7 +374,7 @@ export async function runIntelligenceCommand(
       printIntelligenceDiagnoseHelp();
       return 0;
     }
-    return runDiagnose(rest);
+    return runDiagnose(rest, opts.diagnoseDeps);
   }
 
   if (subcommand === "config-reset") {
@@ -130,9 +418,15 @@ Usage:
   sanctuary intelligence diagnose [--fortress-path <path>]
 
 Description:
-  Checks the local fortress intelligence config directory, recent audit
-  filenames, and relevant substrate environment variables. This command does
-  not require a passphrase.
+  Reports whether local intelligence is armed on this fortress (the model
+  manifest version, the bound model tags and their digests), then checks the
+  local fortress intelligence config directory, recent audit filenames, and
+  relevant substrate environment variables.
+
+  This command does not require a passphrase. Reading the armed state does
+  need the fortress credential, so when none is available in this session the
+  armed state is reported as unavailable rather than as unarmed. Nothing is
+  written, and no credential or key material is printed.
 
 Options:
   --fortress <path>       Override the fortress path.
@@ -192,15 +486,19 @@ function resolveFortressStoragePath(
   };
 }
 
-async function runDiagnose(argv: string[] = []): Promise<number> {
+async function runDiagnose(
+  argv: string[] = [],
+  deps: DiagnoseDeps = {},
+): Promise<number> {
   const json = hasFlag(argv, "--json");
-  const resolved = resolveFortressStoragePath(argv, process.env);
+  const resolved = resolveFortressStoragePath(argv, deps.env ?? process.env);
   if ("error" in resolved) {
     // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(resolved.error);
     return FORTRESS_FLAG_USAGE_EXIT_CODE;
   }
   const storagePath = resolved.storagePath;
+  const localIntelligence = await readLocalIntelligenceState(storagePath, deps);
 
   const intelligenceDir = resolve(storagePath, "state", "_intelligence");
   const auditDir = resolve(storagePath, "state", "_audit");
@@ -249,8 +547,16 @@ async function runDiagnose(argv: string[] = []): Promise<number> {
     console.log(
       JSON.stringify(
         {
-          ok: initialized && intelligenceReadError === null,
+          // The armed classification is part of `ok`: a corrupt, unverifiable,
+          // or unreadable durable record is not a healthy fortress, and before
+          // this fold it read as ok because the directory happened to exist.
+          ok: initialized && intelligenceReadError === null &&
+            localIntelligenceIsOk(localIntelligence),
           fortress: storagePath,
+          // The armed state of the durable record, classified by the same
+          // function the runtime's load path feeds; the directory listing
+          // below is filenames only and can never answer "is this armed".
+          local_intelligence: localIntelligenceJson(localIntelligence),
           intelligence: {
             directory: intelligenceDir,
             exists: initialized,
@@ -270,12 +576,26 @@ async function runDiagnose(argv: string[] = []): Promise<number> {
         2,
       ),
     );
+    // The EXIT CODE deliberately still tracks only whether the intelligence
+    // config directory exists, unchanged from before the armed-state section
+    // existed: scripts on hosts with no reachable fortress credential (a CI
+    // runner, an SSH session against a locked keyring) call this verb, and
+    // making them exit non-zero for an unreadable armed state would be a
+    // behavior change this section does not need. The `ok` field is the
+    // diagnostic verdict; read it, not the exit code, for record health.
     return initialized ? 0 : 1;
   }
 
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`Intelligence substrate diagnostics`);
   console.error(`Fortress: ${storagePath}`);
+  console.error("");
+  // Printed before the early return below: an absent config directory is
+  // exactly the case where the operator most needs the armed state named.
+  for (const line of localIntelligenceLines(localIntelligence)) {
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(line);
+  }
   console.error("");
 
   // Check for intelligence config in the state directory
@@ -435,19 +755,17 @@ function defaultPrint(line: string): void {
   console.error(line);
 }
 
+/**
+ * One line naming the durable record's state for `config-reset`.
+ *
+ * Derived from {@link classifyLocalIntelligenceState}, not from a second switch
+ * over the same union: two hand-mirrored tables over one `LoadOutcome` drift,
+ * and the drift shows up as two verbs describing one record differently
+ * (AGENTS.md rule 5 and rule 11).
+ */
 function describeOutcome(outcome: LoadOutcome): string {
-  switch (outcome.kind) {
-    case "default":
-      return "no durable record";
-    case "loaded":
-      return `readable record, version ${outcome.config.version}`;
-    case "integrity-state-invalid":
-      return `armed record failed Q5 integrity validation (${outcome.reason})`;
-    case "corrupt":
-      return "unreadable record: does not decrypt or parse (corrupt)";
-    case "version-too-new":
-      return `unreadable record: version ${outcome.persistedVersion} is newer than this build supports`;
-  }
+  const report = classifyLocalIntelligenceState(outcome);
+  return report.detail === null ? report.state : `${report.state}: ${report.detail}`;
 }
 
 export async function runIntelligenceConfigReset(

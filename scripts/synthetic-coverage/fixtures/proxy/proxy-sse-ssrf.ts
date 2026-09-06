@@ -6,7 +6,7 @@ import {
 import { registerFixture } from "../../registry.js";
 import { outcome } from "../state-trust/helpers.js";
 
-const CLAIM_ID = "16";
+const CLAIM_ID = "17";
 const CLAIM_LABEL = "Proxy SSE SSRF protection";
 
 // Entrypoints: validateUpstreamSseUrl and ClientManager's audited private-network escape hatch shape.

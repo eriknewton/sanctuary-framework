@@ -78,6 +78,9 @@ import {
 } from "./dashboard/v1_1/wiring.js";
 import { readPersistedLocalAgents } from "./hub/agent-registry-persistence.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
+// Boot refuses on every local-intelligence wiring failure; this names which
+// condition refused it. MUST MATCH the use in `index.ts`.
+import { describeIntelligenceBootFailure } from "./intelligence/policy-store.js";
 import { installConsentGatedRedactor } from "./intelligence/privacy-tier2-redactor.js";
 import { createCompiledContextRuntime } from "./compiled-context/runtime.js";
 import { DistressInbox } from "./distress/inbox.js";
@@ -1300,13 +1303,20 @@ async function wireUnlockedDeps(args: {
   });
   // WP-V1.2-5: construct + load the Intelligence Substrate Selector against
   // the unlocked fortress so the v1.1 dashboard's Intelligence panel has
-  // a live config to render. Best-effort: any failure degrades to a
-  // selector-less binding (panel surfaces "not configured").
-  let intelligenceSelector: SubstrateSelector | undefined;
+  // a live config to render. `load()` is also the local-intelligence load-
+  // integrity checkpoint, so this entrypoint classifies the persisted record
+  // exactly as `index.ts` does.
+  //
+  // Neither binding carries a "not configured" initial value any more, and
+  // that is the point rather than a tidy-up: this block now either completes
+  // or throws, so there is no third state in which the dashboard runs with a
+  // selector-less binding. A `= false` seed here would be unreachable and
+  // would read as though a degraded start were still possible.
+  let intelligenceSelector: SubstrateSelector;
   // Rho-2.5: whether the consent-gated Tier B redactor was installed on
   // the selector below. Threaded into the v1.1 PII binding so the
   // /api/query-anonymity/pii route reports the truthful effective state.
-  let tierBPiiRedactorInstalled = false;
+  let tierBPiiRedactorInstalled: boolean;
   try {
     intelligenceSelector = new SubstrateSelector({
       storage,
@@ -1326,13 +1336,17 @@ async function wireUnlockedDeps(args: {
       fortressId: fortressIdFromStoragePath(config.storage_path),
     });
   } catch (err) {
+    // ALLOWLIST, not denylist, and the allowlist of degradable conditions is
+    // empty: every failure of this block refuses startup, and the shared
+    // classifier only names which condition refused. Degrading here would let
+    // a dashboard come up with local intelligence quietly switched off. MUST
+    // MATCH the same refusal in `index.ts`; the two entrypoints share one
+    // fortress, so a record either entrypoint refuses must not be startable
+    // through the other, and both read the classifier rather than each
+    // deciding for itself.
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(
-      `  Note: Intelligence panel unavailable (${(err as Error).message}).`,
-    );
-    intelligenceSelector = undefined;
-    // tierBPiiRedactorInstalled stays false (its initialized value): the
-    // install assignment above only completes when the try did not throw.
+    console.error(`\nSanctuary cannot start.\n${describeIntelligenceBootFailure(err)}\n`);
+    throw err;
   }
   const v11Bindings = buildV11Bindings({
     identityId: hubIdentityId,
