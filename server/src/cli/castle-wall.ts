@@ -5,15 +5,19 @@ import {
 } from "node:child_process";
 import { createConnection } from "node:net";
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
-import { chmod, lstat, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
-import { readFileSync as nodeReadFileSync } from "node:fs";
+import { chmod, lstat, mkdir, open, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { constants as fsConstants, readFileSync as nodeReadFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
-import { establishMaster } from "../core/master-custody.js";
+import {
+  establishMaster,
+  unlockExistingMasterReadOnly,
+  withCustodyWriteLock,
+} from "../core/master-custody.js";
 import { stringToBytes, toBase64url } from "../core/encoding.js";
-import { encrypt, type EncryptedPayload } from "../core/encryption.js";
+import { decrypt, encrypt, type EncryptedPayload } from "../core/encryption.js";
 import { sign as identitySign, type RotationEvent } from "../core/identity.js";
 import { randomBytes } from "../core/random.js";
 import {
@@ -23,9 +27,12 @@ import {
 import { resolveFortressCreateOwner } from "../castle-wall/runtime/fortress-create-owner.js";
 import { resolveStoragePath } from "../paths.js";
 import { getSanctuaryVersion } from "../version.js";
-import { getOrCreatePassphrase } from "../wrap/passphrase.js";
+import {
+  getOrCreatePassphrase,
+  observeStoredPassphrase,
+} from "../wrap/passphrase.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
-import { writeFileCustody } from "../storage/custody-fs.js";
+import { readFileCustody, writeFileCustody } from "../storage/custody-fs.js";
 import {
   AuditLog,
   AuditIntegrityError,
@@ -111,7 +118,10 @@ import {
   type PolicyReloadResult,
 } from "../castle-wall/runtime/policy-reload-client.js";
 import { observing, type Observed } from "../claim-witness.js";
-import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
+import {
+  ED25519_PRIVATE_KEY_BYTES,
+  ED25519_PUBLIC_KEY_BYTES,
+} from "../core/crypto-suite-registry.js";
 
 export { requestPolicyReload, type PolicyReloadResult };
 
@@ -124,7 +134,17 @@ const DENY_ALL_QUARANTINE_PROBE_TIMEOUT_MS = 12_000;
 export interface CastleWallCommandContext {
   out?: Writable;
   err?: Writable;
+  /** INTERNAL/TEST: route operator warnings across the Darwin capability boundary. */
+  warn?: (message: string) => void;
   env?: NodeJS.ProcessEnv;
+  /** INTERNAL: already-authenticated master owned and scrubbed by provision-pin. */
+  __resolvedProvisionMasterKey?: Uint8Array;
+  /** TEST ONLY: pause after authoritative unlock while the custody lease is held. */
+  __testAfterProvisionMasterResolved?: () => void | Promise<void>;
+  /** TEST ONLY: shorten provision-pin custody lock contention. */
+  __testProvisionLockTimeoutMs?: number;
+  /** TEST ONLY: prove provision-pin performs observation-only credential lookup. */
+  __testObserveStoredPassphrase?: typeof observeStoredPassphrase;
   platform?: NodeJS.Platform;
   execSyncFn?: (command: string) => string;
   /**
@@ -775,12 +795,18 @@ async function resolveMasterKey(
   // derive a *different* master for the same fortress (the 2026-06-12
   // incident class). SANCTUARY_RECOVERY_KEY keeps its historical precedence
   // over the passphrase for this CLI.
+  // S5: a CLI verb (including the best-effort audit-append after a `sudo` verb)
+  // must resolve the master for reads even when the per-invoker rotation barrier
+  // cannot be taken (non-owner uid under sudo, non-local fs). Reads open; a
+  // master-derived WRITE still fails closed with remediation, which also keeps
+  // a root/sudo caller from contaminating the operator-owned audit chain.
   if (env.SANCTUARY_RECOVERY_KEY) {
     const result = await establishMaster({
       storage,
       recoveryKey: env.SANCTUARY_RECOVERY_KEY,
       firstRun: { installMode: "headless", mintRecoveryKey: false },
       storagePathHint: storagePath,
+      barrierDegradeMode: "read-only",
     });
     return result.masterKey;
   }
@@ -794,6 +820,7 @@ async function resolveMasterKey(
     passphrase,
     firstRun: { installMode: "headless", mintRecoveryKey: false },
     storagePathHint: storagePath,
+    barrierDegradeMode: "read-only",
   });
   return result.masterKey;
 }
@@ -1019,7 +1046,13 @@ export async function runAuditStoreStatus(
   }
 }
 
-export async function runProvisionPin(
+/**
+ * Execute provision-pin while the caller already owns the exact fortress's
+ * custody lease. This is exported only for the cwd-bound Darwin capability
+ * worker and fresh-init's already-locked path; ordinary CLI callers must use
+ * {@link runProvisionPin}, which acquires the process-owned custody lock first.
+ */
+export async function runProvisionPinAlreadyLocked(
   argv: string[] = [],
   ctx: CastleWallCommandContext = {}
 ): Promise<number> {
@@ -1048,35 +1081,11 @@ export async function runProvisionPin(
   const globalPinPath =
     ctx.globalPinnedPublicKeyPath ?? CASTLE_GLOBAL_PINNED_PUBKEY_PATH;
 
+  let masterKey: Uint8Array | undefined;
+  let privateSeed: Uint8Array | undefined;
   try {
     await mkdir(storagePath, { recursive: true, mode: 0o700 });
-
-    try {
-      const existingPub = await readFile(pubPath);
-      if (existingPub.length !== ED25519_PUBLIC_KEY_BYTES) {
-        throw new Error(
-          `Pinned public key at ${pubPath} must be 32 bytes (found ${existingPub.length}).`
-        );
-      }
-      await writeGlobalPinnedPublicKey(existingPub, globalPinPath);
-      const fingerprint = fingerprintFromPublicKey(existingPub);
-      write(out, `${fingerprint}\n`);
-      write(
-        out,
-        "Pinned key already provisioned; leaving existing key in place.\n"
-      );
-      return 0;
-    } catch (readError) {
-      if (
-        !(readError instanceof Error) ||
-        !("code" in readError) ||
-        (readError as NodeJS.ErrnoException).code !== "ENOENT"
-      ) {
-        throw readError;
-      }
-    }
-
-    const masterKey = await resolveMasterKey(storagePath, env);
+    masterKey = ctx.__resolvedProvisionMasterKey ?? await resolveMasterKey(storagePath, env);
 
     // Two-factor custody floor (I4/F6): the Castle pin is trust-bearing
     // material. Enforced in the core verb - not the wrapping CLI - so
@@ -1088,23 +1097,72 @@ export async function runProvisionPin(
       masterKey
     );
 
-    const privateSeed = randomBytes(32);
-    const publicKey = ed25519.getPublicKey(privateSeed);
-    const encryptedPrivateKey = encrypt(privateSeed, masterKey);
+    const existingPub = await readOptionalFile(pubPath, { repairLegacyPublicMode: true });
+    const existingPrivate = await readOptionalFile(privPath);
+    let publicKey: Uint8Array;
+    let resumedLocalPair = false;
+    if (existingPrivate) {
+      let parsed: EncryptedPayload;
+      try {
+        parsed = JSON.parse(existingPrivate.toString("utf8")) as EncryptedPayload;
+      } catch (error) {
+        throw new Error(`Pinned private key at ${privPath} is malformed.`, {
+          cause: error,
+        });
+      }
+      privateSeed = decrypt(parsed, masterKey);
+      if (privateSeed.length !== ED25519_PRIVATE_KEY_BYTES) {
+        throw new Error(
+          `Pinned private seed at ${privPath} must decrypt to ${ED25519_PRIVATE_KEY_BYTES} bytes.`,
+        );
+      }
+      publicKey = ed25519.getPublicKey(privateSeed);
+      if (existingPub) {
+        if (
+          existingPub.length !== ED25519_PUBLIC_KEY_BYTES ||
+          !Buffer.from(existingPub).equals(Buffer.from(publicKey))
+        ) {
+          throw new Error(
+            `Pinned public/private key pair at ${pubPath} and ${privPath} does not match.`,
+          );
+        }
+        resumedLocalPair = true;
+      } else {
+        // Crash resume: the private half was synced first. Reconstruct and
+        // durably publish the matching public half before touching global trust.
+        await writeExclusiveDurableFile(pubPath, publicKey, 0o600);
+      }
+    } else {
+      if (existingPub) {
+        throw new Error(
+          `Pinned public key exists without its authenticated private key (${pubPath}); refusing to publish global trust.`,
+        );
+      }
+      privateSeed = randomBytes(32);
+      publicKey = ed25519.getPublicKey(privateSeed);
+      const encryptedPrivateKey = encrypt(privateSeed, masterKey);
+      // The recoverable private half is durable first; the public half follows.
+      // A crash between them resumes by decrypting the private half above.
+      await writeExclusiveDurableFile(
+        privPath,
+        JSON.stringify(encryptedPrivateKey),
+        0o600,
+      );
+      await writeExclusiveDurableFile(pubPath, publicKey, 0o600);
+    }
     const fingerprint = fingerprintFromPublicKey(publicKey);
 
-    await writeFile(pubPath, publicKey, { mode: 0o600 });
-    await chmod(pubPath, 0o600);
-    await writeGlobalPinnedPublicKey(publicKey, globalPinPath);
-    await writeFile(privPath, JSON.stringify(encryptedPrivateKey), {
-      mode: 0o600,
-    });
-    await chmod(privPath, 0o600);
-
-    privateSeed.fill(0);
-    masterKey.fill(0);
+    // Global publication is LAST. A differing or unverifiable established pin
+    // is a hard provisioning failure; only re-pin may migrate that anchor.
+    await writeGlobalPinnedPublicKey(publicKey, globalPinPath, ctx.warn);
 
     write(out, `${fingerprint}\n`);
+    if (resumedLocalPair) {
+      write(
+        out,
+        "Pinned key already provisioned; authenticated local pair left in place.\n",
+      );
+    }
     return 0;
   } catch (error) {
     write(
@@ -1114,12 +1172,192 @@ export async function runProvisionPin(
       }\n`
     );
     return 1;
+  } finally {
+    privateSeed?.fill(0);
+    masterKey?.fill(0);
+  }
+}
+
+export async function runProvisionPin(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {},
+): Promise<number> {
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const parsed = parseCastleWallArgs(argv);
+  if (writeCastleWallParseError(parsed, err)) return 2;
+  const storagePath = resolveFortressArg(parsed.fortress, env);
+  const storage = new FilesystemStorage(join(storagePath, "state"));
+  try {
+    return await withCustodyWriteLock(
+      storage,
+      async (lease) => {
+        lease.assertHeld();
+        const lockedFortressPath = lease.stableStorageParent;
+        if (!lockedFortressPath) {
+          throw new Error("provision-pin custody lock did not expose a stable fortress root");
+        }
+        const lockedEnv: NodeJS.ProcessEnv = { ...env };
+        if (!lockedEnv.SANCTUARY_RECOVERY_KEY && !lockedEnv.SANCTUARY_PASSPHRASE) {
+          const observed = await (
+            ctx.__testObserveStoredPassphrase ?? observeStoredPassphrase
+          )({
+            storagePath,
+            readOnly: true,
+          });
+          if (observed.status === "found") {
+            lockedEnv.SANCTUARY_PASSPHRASE = observed.result.value;
+          } else if (observed.status === "fallback-unreadable") {
+            throw new Error(
+              `stored passphrase fallback is unreadable (${observed.reason}); ` +
+                "refusing to mint or replace custody during provision-pin",
+            );
+          } else if (observed.keyringUnreachable) {
+            throw new Error(
+              `stored passphrase is unavailable because the OS keyring is locked or unreachable` +
+                `${observed.keyringDetail ? ` (${observed.keyringDetail})` : ""}; ` +
+                "unlock it and retry provision-pin",
+            );
+          } else {
+            throw new Error(
+              "no stored passphrase exists for this fortress; provision-pin is " +
+                "read-only with respect to custody and will not mint one",
+            );
+          }
+        }
+        const masterKey = await unlockExistingMasterReadOnly(storage, {
+          ...(lockedEnv.SANCTUARY_RECOVERY_KEY
+            ? { recoveryKey: lockedEnv.SANCTUARY_RECOVERY_KEY }
+            : { passphrase: lockedEnv.SANCTUARY_PASSPHRASE! }),
+          storagePathHint: storagePath,
+        });
+        await ctx.__testAfterProvisionMasterResolved?.();
+        lease.assertHeld();
+        try {
+          const result = lease.stableFortressCapability
+            ? await lease.stableFortressCapability.provisionPin({
+                masterKey,
+                ...(ctx.globalPinnedPublicKeyPath
+                  ? { globalPinnedPublicKeyPath: ctx.globalPinnedPublicKeyPath }
+                  : {}),
+              })
+            : await runProvisionPinAlreadyLocked([], {
+                ...ctx,
+                env: {
+                  ...lockedEnv,
+                  SANCTUARY_STORAGE_PATH: lockedFortressPath,
+                },
+                __resolvedProvisionMasterKey: masterKey,
+              });
+          lease.assertHeld();
+          if (typeof result === "number") return result;
+          if (result.stdout) write(ctx.out ?? process.stdout, result.stdout);
+          if (result.stderr) write(err, result.stderr);
+          for (const warning of result.warnings) console.warn(warning);
+          return result.code;
+        } finally {
+          masterKey.fill(0);
+        }
+      },
+      {
+        metadata: { owner: "castle-wall-provision-pin" },
+        ...(ctx.__testProvisionLockTimeoutMs === undefined
+          ? {}
+          : { timeoutMs: ctx.__testProvisionLockTimeoutMs }),
+      },
+    );
+  } catch (error) {
+    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+}
+
+async function readOptionalFile(
+  path: string,
+  options: { repairLegacyPublicMode?: boolean } = {},
+): Promise<Buffer | undefined> {
+  try {
+    if (options.repairLegacyPublicMode) {
+      const handle = await open(
+        path,
+        fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+      );
+      try {
+        const before = await handle.stat();
+        const uid = process.getuid?.();
+        if (
+          !before.isFile() ||
+          before.nlink !== 1 ||
+          uid === undefined ||
+          before.uid !== uid
+        ) {
+          throw new Error(`Pinned public key at ${path} is not a uid-owned, single-link regular file.`);
+        }
+        const mode = before.mode & 0o777;
+        if (mode === 0o644) {
+          await handle.chmod(0o600);
+          await handle.sync();
+        } else if (mode !== 0o600) {
+          throw new Error(`Pinned public key at ${path} has unsafe mode ${mode.toString(8)}; expected 0600.`);
+        }
+        const value = await handle.readFile();
+        const after = await handle.stat();
+        if (before.dev !== after.dev || before.ino !== after.ino) {
+          throw new Error(`Pinned public key at ${path} changed during legacy permission repair.`);
+        }
+        return value;
+      } finally {
+        await handle.close();
+      }
+    }
+    return await readFileCustody(path, {
+      mode: { exact: 0o600 },
+      verifyPathIdentity: true,
+    });
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function writeExclusiveDurableFile(
+  path: string,
+  data: string | Uint8Array,
+  mode: number,
+): Promise<void> {
+  const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+  const handle = await open(
+    path,
+    fsConstants.O_WRONLY |
+      fsConstants.O_CREAT |
+      fsConstants.O_EXCL |
+      noFollow,
+    mode,
+  );
+  try {
+    await handle.writeFile(data);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  const directory = await open(dirname(path), "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
   }
 }
 
 async function writeGlobalPinnedPublicKey(
   publicKey: Uint8Array,
   globalPinPath: string = CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
+  warn: (message: string) => void = console.warn,
 ): Promise<void> {
   // Fail-open fix (2026-07-07, drill-confirmed on real hardware): the ORIGINAL
   // guard here treated an EACCES/EPERM on write as "the root signer helper owns
@@ -1136,12 +1374,12 @@ async function writeGlobalPinnedPublicKey(
   // daemon) cannot reintroduce the fail-open on a different path. This function
   // supplies the CLI-specific fresh write (exclusive-create) + refusal guidance.
   const emitRePinGuidance = () =>
-    console.warn(
+    warn(
       `[castle-wall] global pin ${globalPinPath} already exists and is owned by the root signer helper (A2); provision-pin does not overwrite it. Run 'sanctuary castle-wall re-pin' to migrate the trust anchor to the signer helper.`,
     );
 
   try {
-    await writeGlobalPinIfUnestablished(publicKey, {
+    const outcome = await writeGlobalPinIfUnestablished(publicKey, {
       path: globalPinPath,
       onRefuse: emitRePinGuidance,
       // A2/B2 (F-A2-1): do NOT `mkdir` the custody directory here. This runs as
@@ -1156,39 +1394,49 @@ async function writeGlobalPinnedPublicKey(
         await chmod(path, 0o644);
       },
     });
+    if (outcome === "refused") {
+      throw new Error(
+        `global pin ${globalPinPath} differs from, raced with, or cannot authenticate the local Castle key; only re-pin may migrate it`,
+      );
+    }
   } catch (error) {
     // Reached only when the fresh write threw a NON-EEXIST error (the chokepoint
     // handled EEXIST as a refusal). SAFETY: provision-pin diagnostics are
     // operator-facing CLI stderr output. These carry CLI-specific guidance:
-    //   - ENOENT: the custody directory does not exist yet (only the root
-    //     helper creates it) - fresh install, no shared pin to migrate. Emit a
-    //     quiet, non-action-implying line so a first-time installer is not told
-    //     to "migrate the trust anchor" that does not exist. (audit-C MED-1 /
-    //     audit-D omit noise on fresh wrap.)
-    //   - EACCES/EPERM: the parent directory is not writable (e.g. root-owned
-    //     dir, no pin file yet) for an operator-UID caller - `re-pin` migrates
-    //     the trust anchor to the signer helper.
+    //   - ENOENT: the helper-owned custody directory does not exist, so the
+    //     requested global publication did not happen.
+    //   - EACCES/EPERM: the helper owns the directory but no authenticated pin
+    //     was published by this path. `re-pin` is the required helper-mediated
+    //     remedy.
+    // Both are hard failures. Cooperative-only init is available solely via
+    // the explicit --no-pin / SANCTUARY_INIT_NO_PIN opt-out handled upstream;
+    // returning success here would make default init lie about readiness.
     const code =
       error instanceof Error && "code" in error
         ? (error as NodeJS.ErrnoException).code
         : undefined;
     if (code === "ENOENT") {
-      console.warn(
-        `[castle-wall] shared pin not provisioned (root signer helper not installed); nothing to do for a cooperative-only install.`,
+      throw new Error(
+        "the root signer helper custody directory is absent, so the required " +
+          "global Castle Wall pin was not published; install the helper (or use " +
+          "the explicit init --no-pin opt-out for a cooperative-only fortress)",
+        { cause: error },
       );
-      return;
     }
     if (code === "EACCES" || code === "EPERM") {
-      console.warn(
-        `[castle-wall] global pin ${globalPinPath} is owned by the root signer helper (A2); provision-pin does not write it. Run 'sanctuary castle-wall re-pin' to migrate the trust anchor to the signer helper.`,
+      throw new Error(
+        `the required global Castle Wall pin at ${globalPinPath} was not ` +
+          "published; run 'sanctuary castle-wall re-pin' through the root " +
+          "signer helper (or use the explicit init --no-pin opt-out)",
+        { cause: error },
       );
-      return;
     }
     console.warn(
       `[castle-wall] warning: unable to write shared pinned key at ${globalPinPath}: ${
         error instanceof Error ? error.message : String(error)
       }`,
     );
+    throw error;
   }
 }
 
@@ -1914,6 +2162,14 @@ export async function runDaemon(
       storage,
       passphrase,
       storagePathHint: storagePath,
+      // S5b: this daemon runs as uid 0 (launchd) against an OPERATOR-owned
+      // fortress by design, so the per-invoker rotation barrier's uid/0700 gate
+      // cannot be satisfied. Failing closed here would refuse to start and
+      // regress the already-proven macOS armed-daemon reboot survival (N=5).
+      // Degrade to the pre-barrier behavior for THIS boot only: the daemon
+      // writes its own root-owned audit chain, and rotation is an operator
+      // foreground ceremony never run concurrently with unattended daemon boot.
+      barrierDegradeMode: "inert",
     });
     derived = { key: custodyResult.masterKey };
   } catch (error) {

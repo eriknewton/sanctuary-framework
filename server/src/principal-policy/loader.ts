@@ -197,6 +197,13 @@ export const NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS = [
   "memory_archive_import",
 ] as const;
 
+/** Plaintext materialization of the sovereign memory corpus is human-held. */
+export const NON_RELAXABLE_MEMORY_PLAINTEXT_TIER1_OPERATIONS = [
+  "memory_emit",
+  "memory_transcode",
+  "memory_transcode_restore",
+] as const;
+
 /**
  * Operator unattributed-disclosure surface (STATE-DISCLOSE-UNATTRIB-01):
  * `state_disclose_unattributed` hands an operator the plaintext of an entry
@@ -253,6 +260,7 @@ const FORCED_TIER1_OPERATIONS = [
   ...NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS,
   ...NON_RELAXABLE_MEMORY_INTEGRITY_TIER1_OPERATIONS,
   ...NON_RELAXABLE_EXIT_V2_MEMORY_TIER1_OPERATIONS,
+  ...NON_RELAXABLE_MEMORY_PLAINTEXT_TIER1_OPERATIONS,
   ...NON_RELAXABLE_STATE_DISCLOSURE_TIER1_OPERATIONS,
   ...NON_RELAXABLE_SDW_VAULT_TIER1_OPERATIONS,
 ] as const;
@@ -706,6 +714,26 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "reputation_publish", // Auto-allow: publishing sovereignty data to Verascore is routine
     "identity_set_primary", // One-time set, persists via _meta storage - safe at Tier 3
     "memory_attest", // Read-only audit attestation - records that a memory op happened
+    // Rung 1 hands-free restart read (must match the tier pin on
+    // `isolationDenialOrNull` in `src/sdw/memory-tools.ts`). memory_get and
+    // memory_search are unattended BY DESIGN for the operator's own fortress:
+    // the documented acceptance step (`restart_and_verify_rung1`,
+    // docs/rung1-fresh-host.md) is to read a marker back after a restart with
+    // no secret typed and nobody at an approval prompt, and Tier 3 is what
+    // makes that true on a stdio server with the default approval channel.
+    // The vault is ONE operator-owned scope shared by every agent the
+    // operator connects to this fortress; the one-owner guard in the handler
+    // refuses a second distinct wrapped identity where an identity resolver
+    // is wired. Per-agent memory isolation is an open capability bound and
+    // this tier decision does not rely on it; exfiltration containment is
+    // the egress wall's job, not a per-read prompt. memory_search is bounded
+    // at the handler (default and maximum result count, needle and tag size).
+    // memory_list / memory_count stay unclassified (Tier 1 by the safe
+    // default). The writes (memory_insert, memory_delete) and every
+    // plaintext-crossing verb stay in tier1_always_approve above;
+    // memory_delete is additionally force-pinned.
+    "memory_get",
+    "memory_search",
     // compliance_generate_eu_ai_act_bundle re-tiered Tier-3 → Tier-1 (CISO NEW-1):
     // its bundle body emits verbatim Tier-2 thresholds + the approval timeout +
     // audit-derived aggregates, a policy-inference oracle for the agent, and an

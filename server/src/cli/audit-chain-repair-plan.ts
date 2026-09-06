@@ -56,7 +56,7 @@
 
 import { createHash } from "node:crypto";
 import { Writable } from "node:stream";
-import { establishMaster } from "../core/master-custody.js";
+import { unlockExistingMasterReadOnly } from "../core/master-custody.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 // Shared canonicalizer rather than a fourth local copy. `mesh/canonical-json.ts`
 // is version-frozen by its own contract ("changing this function invalidates
@@ -537,15 +537,9 @@ async function buildExportManifest(
  *    keyring item (and a fallback file) on a fortress that has none, which is
  *    state this verb must not create. A fortress with no readable passphrase is
  *    reported as unreadable, not quietly provisioned.
- *  - `firstRun` is OMITTED, which `EstablishMasterOptions` documents as "refuse
- *    first runs (existing-state callers)". A diagnostic pointed at a path that
- *    holds no fortress must say so, never establish one there.
- *  - the storage handed to `establishMaster` is the read-only guard, so the
- *    unified custody path's in-place migration and floor-enforcement writes
- *    cannot land either. On a fortress that would need one, the guard throws
- *    and the caller reports STATE_UNREADABLE. The two mechanisms overlap on
- *    purpose: the omitted `firstRun` states the intent, the guard enforces it
- *    even if a future edit re-adds the option.
+ *  - `unlockExistingMasterReadOnly` accepts only an existing authenticated
+ *    envelope. It cannot establish or migrate custody and never acquires the
+ *    mutating namespace lock.
  */
 async function resolveMasterKeyReadOnly(opts: {
   guardedStorage: ReadOnlyStorageGuard;
@@ -554,12 +548,10 @@ async function resolveMasterKeyReadOnly(opts: {
 }): Promise<Uint8Array> {
   const { guardedStorage, fortressPath, env } = opts;
   if (env.SANCTUARY_RECOVERY_KEY) {
-    const result = await establishMaster({
-      storage: guardedStorage,
+    return await unlockExistingMasterReadOnly(guardedStorage, {
       recoveryKey: env.SANCTUARY_RECOVERY_KEY,
       storagePathHint: fortressPath,
     });
-    return result.masterKey;
   }
 
   // `readOnly` is part of this verb's no-mutation contract, not an
@@ -579,12 +571,10 @@ async function resolveMasterKeyReadOnly(opts: {
     );
   }
 
-  const result = await establishMaster({
-    storage: guardedStorage,
+  return await unlockExistingMasterReadOnly(guardedStorage, {
     passphrase,
     storagePathHint: fortressPath,
   });
-  return result.masterKey;
 }
 
 // ---- Args -------------------------------------------------------------------

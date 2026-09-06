@@ -35,6 +35,7 @@ import {
   type CastleWallCommandContext,
 } from "../../src/cli/castle-wall.js";
 import type { MacOSCastleWallDaemonInput } from "../../src/castle-wall/runtime/macos-daemon.js";
+import { initializeTestCustody } from "../helpers/custody-fixture.js";
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -75,6 +76,7 @@ describe("castle-wall FULL daemon : Slice M producer-key wiring", () => {
   async function makeLocalFortress(): Promise<{ fortressPath: string }> {
     const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-full-"));
     tempDirs.push(fortressPath);
+    await initializeTestCustody(fortressPath, { passphrase: PASSPHRASE });
     // Provision the local pin from the passphrase-derived master so the
     // daemon's "no pinned key" gate passes and local-sign decrypts the SAME
     // master against the passphrase.
@@ -82,6 +84,7 @@ describe("castle-wall FULL daemon : Slice M producer-key wiring", () => {
       out: new CaptureStream(),
       err: new CaptureStream(),
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_PASSPHRASE: PASSPHRASE },
+      globalPinnedPublicKeyPath: join(fortressPath, "global-pin.bin"),
     });
     expect(code).toBe(0);
     return { fortressPath };

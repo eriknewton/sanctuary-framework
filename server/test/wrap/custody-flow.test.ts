@@ -5,6 +5,11 @@
  * fresh fortresses get one master wrapped under passphrase + minted
  * recovery key; legacy fortresses migrate in place and THEN get the
  * recovery wrap the legacy scheme never had — the incident cure.
+ *
+ * Since 2026-09-04: ordinary noninteractive protect/wrap also stages recovery
+ * outside the fortress (agentGuided || !interactive), so recovery bytes never
+ * appear in a headless agent transcript. Tests use a parent temp dir so staged
+ * files (dirname(fortress)/Sanctuary Recovery/…) are cleaned up recursively.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -42,37 +47,59 @@ function extractRecoveryKey(fileContent: string): string {
 }
 
 describe("establishWrapCustody", () => {
+  // parent wraps both fortress and the staged-recovery sibling dir
+  // (dirname(fortress)/Sanctuary Recovery/…) so rm(parent, recursive)
+  // cleans all test artifacts without touching unrelated paths.
+  let parent: string;
   let fortress: string;
 
   beforeEach(async () => {
-    fortress = await mkdtemp(join(tmpdir(), "sanctuary-wrap-custody-"));
+    parent = await mkdtemp(join(tmpdir(), "sanctuary-wrap-custody-"));
+    fortress = join(parent, "fortress");
   });
 
   afterEach(async () => {
-    await rm(fortress, { recursive: true, force: true });
+    await rm(parent, { recursive: true, force: true });
   });
 
-  it("fresh fortress (non-interactive): headless envelope, minted recovery key unlocks the master, audited", async () => {
+  it("fresh fortress (non-interactive): headless envelope, staged to external path, key verifies against committed envelope, audited", async () => {
+    const output: string[] = [];
+    const recoveryPath = agentGuidedRecoveryOutputPath(fortress);
+
     const result = await establishWrapCustody({
       storagePath: fortress,
       passphrase: "wrap-passphrase",
       interactive: false,
+      io: {
+        input: Readable.from([]),
+        output: new Writable({
+          write(chunk, _encoding, callback) {
+            output.push(String(chunk));
+            callback();
+          },
+        }),
+      },
     });
     expect(result.origin).toBe("first-run");
     expect(result.mintedRecoveryKey).toBe(true);
-    expect(result.envelope.install_mode).toBe("headless");
+    expect(result.envelope!.install_mode).toBe("headless");
 
-    // The disclosed recovery key is a wrap of the one true master.
-    const fileContent = await readFile(
-      join(fortress, RECOVERY_KEY_FILENAME),
-      "utf-8"
-    );
+    // Staged to external path, NOT inside the fortress.
+    const fileContent = await readFile(recoveryPath, "utf-8");
     const recoveryKey = extractRecoveryKey(fileContent);
+
+    // Recovery bytes must not appear in any headless transcript output.
+    expect(output.join("")).not.toContain(recoveryKey);
+
+    // No recovery key file inside the fortress itself.
+    await expect(
+      readFile(join(fortress, RECOVERY_KEY_FILENAME), "utf-8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+
+    // Key verifies against the committed envelope.
     const storage = new FilesystemStorage(join(fortress, "state"));
     const unlocked = await establishMaster({ storage, recoveryKey });
-    expect(toBase64url(unlocked.masterKey)).toBe(
-      toBase64url(result.masterKey)
-    );
+    expect(toBase64url(unlocked.masterKey)).toBe(toBase64url(result.masterKey));
 
     // Audited as a distinct headless install, never a silent relaxation.
     const auditLog = new AuditLog(storage, result.masterKey);
@@ -86,133 +113,117 @@ describe("establishWrapCustody", () => {
   it("agent-guided first run stages recovery outside the fortress without transcript disclosure", async () => {
     const output: string[] = [];
     const recoveryPath = agentGuidedRecoveryOutputPath(fortress);
-    try {
-      const result = await establishWrapCustody({
-        storagePath: fortress,
-        passphrase: "agent-guided-passphrase",
-        interactive: false,
-        agentGuided: true,
-        io: {
-          input: Readable.from([]),
-          output: new Writable({
-            write(chunk, _encoding, callback) {
-              output.push(String(chunk));
-              callback();
-            },
-          }),
-        },
-      });
+    const result = await establishWrapCustody({
+      storagePath: fortress,
+      passphrase: "agent-guided-passphrase",
+      interactive: false,
+      agentGuided: true,
+      io: {
+        input: Readable.from([]),
+        output: new Writable({
+          write(chunk, _encoding, callback) {
+            output.push(String(chunk));
+            callback();
+          },
+        }),
+      },
+    });
 
-      const fileContent = await readFile(recoveryPath, "utf8");
-      const recoveryKey = extractRecoveryKey(fileContent);
-      expect(output.join("")).toContain(recoveryPath);
-      expect(output.join("")).not.toContain(recoveryKey);
-      await expect(readFile(join(fortress, RECOVERY_KEY_FILENAME), "utf8")).rejects.toMatchObject({
-        code: "ENOENT",
-      });
+    const fileContent = await readFile(recoveryPath, "utf8");
+    const recoveryKey = extractRecoveryKey(fileContent);
+    expect(output.join("")).toContain(recoveryPath);
+    expect(output.join("")).not.toContain(recoveryKey);
+    await expect(readFile(join(fortress, RECOVERY_KEY_FILENAME), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
 
-      const storage = new FilesystemStorage(join(fortress, "state"));
-      const unlocked = await establishMaster({ storage, recoveryKey });
-      expect(toBase64url(unlocked.masterKey)).toBe(toBase64url(result.masterKey));
-    } finally {
-      await rm(recoveryPath, { force: true });
-    }
+    const storage = new FilesystemStorage(join(fortress, "state"));
+    const unlocked = await establishMaster({ storage, recoveryKey });
+    expect(toBase64url(unlocked.masterKey)).toBe(toBase64url(result.masterKey));
   });
 
   it("does not persist an orphaned recovery wrap when the staging path loses the race", async () => {
     const recoveryPath = agentGuidedRecoveryOutputPath(fortress);
-    try {
-      await expect(
-        establishWrapCustody({
-          storagePath: fortress,
-          passphrase: "agent-guided-race-passphrase",
-          interactive: false,
-          agentGuided: true,
-          beforeAgentRecoveryFileCreate: async () => {
-            await writeFile(recoveryPath, "planted after preflight", { mode: 0o600 });
-          },
-        }),
-      ).rejects.toThrow(/existing .*recovery-out file/i);
+    await expect(
+      establishWrapCustody({
+        storagePath: fortress,
+        passphrase: "agent-guided-race-passphrase",
+        interactive: false,
+        agentGuided: true,
+        beforeAgentRecoveryFileCreate: async () => {
+          await writeFile(recoveryPath, "planted after preflight", { mode: 0o600 });
+        },
+      }),
+    ).rejects.toThrow(/existing .*recovery-out file/i);
 
-      const envelope = await readCustodyEnvelope(
-        new FilesystemStorage(join(fortress, "state")),
-      );
-      expect(envelope?.wraps.some((wrap) => wrap.type === "recovery-key")).toBe(false);
-      expect(await readFile(recoveryPath, "utf8")).toBe("planted after preflight");
-    } finally {
-      await rm(recoveryPath, { force: true });
-    }
+    const envelope = await readCustodyEnvelope(
+      new FilesystemStorage(join(fortress, "state")),
+    );
+    expect(envelope?.wraps.some((wrap) => wrap.type === "recovery-key")).toBe(false);
+    expect(await readFile(recoveryPath, "utf8")).toBe("planted after preflight");
   });
 
   it("resumes an authenticated staged recovery key after a crash before envelope commit", async () => {
     const recoveryPath = agentGuidedRecoveryOutputPath(fortress);
-    try {
-      await expect(
-        establishWrapCustody({
-          storagePath: fortress,
-          passphrase: "agent-guided-resume-passphrase",
-          interactive: false,
-          agentGuided: true,
-          afterAgentRecoveryFileCreate: () => {
-            throw new Error("simulated crash after recovery staging");
-          },
-        }),
-      ).rejects.toThrow("simulated crash after recovery staging");
-
-      const stagedBeforeRetry = await readFile(recoveryPath, "utf8");
-      const recoveryKey = extractRecoveryKey(stagedBeforeRetry);
-      expect(stagedBeforeRetry).toContain("Recovery staging receipt:");
-      const envelopeBeforeRetry = await readCustodyEnvelope(
-        new FilesystemStorage(join(fortress, "state")),
-      );
-      expect(envelopeBeforeRetry?.wraps.some((wrap) => wrap.type === "recovery-key")).toBe(false);
-
-      const resumed = await establishWrapCustody({
+    await expect(
+      establishWrapCustody({
         storagePath: fortress,
         passphrase: "agent-guided-resume-passphrase",
         interactive: false,
         agentGuided: true,
-      });
+        afterAgentRecoveryFileCreate: () => {
+          throw new Error("simulated crash after recovery staging");
+        },
+      }),
+    ).rejects.toThrow("simulated crash after recovery staging");
 
-      expect(resumed.mintedRecoveryKey).toBe(true);
-      expect(await readFile(recoveryPath, "utf8")).toBe(stagedBeforeRetry);
-      const unlocked = await establishMaster({
-        storage: new FilesystemStorage(join(fortress, "state")),
-        recoveryKey,
-      });
-      expect(toBase64url(unlocked.masterKey)).toBe(toBase64url(resumed.masterKey));
-    } finally {
-      await rm(recoveryPath, { force: true });
-    }
+    const stagedBeforeRetry = await readFile(recoveryPath, "utf8");
+    const recoveryKey = extractRecoveryKey(stagedBeforeRetry);
+    expect(stagedBeforeRetry).toContain("Recovery staging receipt:");
+    const envelopeBeforeRetry = await readCustodyEnvelope(
+      new FilesystemStorage(join(fortress, "state")),
+    );
+    expect(envelopeBeforeRetry?.wraps.some((wrap) => wrap.type === "recovery-key")).toBe(false);
+
+    const resumed = await establishWrapCustody({
+      storagePath: fortress,
+      passphrase: "agent-guided-resume-passphrase",
+      interactive: false,
+      agentGuided: true,
+    });
+
+    expect(resumed.mintedRecoveryKey).toBe(true);
+    expect(await readFile(recoveryPath, "utf8")).toBe(stagedBeforeRetry);
+    const unlocked = await establishMaster({
+      storage: new FilesystemStorage(join(fortress, "state")),
+      recoveryKey,
+    });
+    expect(toBase64url(unlocked.masterKey)).toBe(toBase64url(resumed.masterKey));
   });
 
   it("refuses a planted recovery file that lacks a valid staging receipt", async () => {
     const recoveryPath = agentGuidedRecoveryOutputPath(fortress);
-    try {
-      await mkdir(dirname(recoveryPath), { recursive: true, mode: 0o700 });
-      await writeFile(
-        recoveryPath,
-        "Recovery key:\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nRecovery staging receipt:\nBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n",
-        { mode: 0o600 },
-      );
-      await expect(
-        establishWrapCustody({
-          storagePath: fortress,
-          passphrase: "agent-guided-planted-passphrase",
-          interactive: false,
-          agentGuided: true,
-        }),
-      ).rejects.toThrow(/not an authenticated interrupted handoff/i);
-      const envelope = await readCustodyEnvelope(
-        new FilesystemStorage(join(fortress, "state")),
-      );
-      expect(envelope?.wraps.some((wrap) => wrap.type === "recovery-key")).toBe(false);
-    } finally {
-      await rm(recoveryPath, { force: true });
-    }
+    await mkdir(dirname(recoveryPath), { recursive: true, mode: 0o700 });
+    await writeFile(
+      recoveryPath,
+      "Recovery key:\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nRecovery staging receipt:\nBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n",
+      { mode: 0o600 },
+    );
+    await expect(
+      establishWrapCustody({
+        storagePath: fortress,
+        passphrase: "agent-guided-planted-passphrase",
+        interactive: false,
+        agentGuided: true,
+      }),
+    ).rejects.toThrow(/not an authenticated interrupted handoff/i);
+    const envelope = await readCustodyEnvelope(
+      new FilesystemStorage(join(fortress, "state")),
+    );
+    expect(envelope?.wraps.some((wrap) => wrap.type === "recovery-key")).toBe(false);
   });
 
-  it("legacy passphrase fortress: migrates in place and mints a recovery key that unlocks the LEGACY master (incident cure)", async () => {
+  it("legacy passphrase fortress: migrates in place, stages recovery outside fortress, key unlocks the LEGACY master (incident cure)", async () => {
     // Seed a legacy fortress: key-params + one identity under the Argon2id
     // master, exactly the drill fortress shape before the incident.
     const storage = new FilesystemStorage(join(fortress, "state"));
@@ -240,27 +251,25 @@ describe("establishWrapCustody", () => {
     expect(toBase64url(result.masterKey)).toBe(toBase64url(legacyMaster));
     expect(result.mintedRecoveryKey).toBe(true);
 
-    // THE incident regression: the printed recovery key reconstructs the
-    // master that actually encrypts this fortress's data.
-    const fileContent = await readFile(
-      join(fortress, RECOVERY_KEY_FILENAME),
-      "utf-8"
-    );
+    // Staged outside the fortress, not at RECOVERY_KEY_FILENAME inside.
+    const recoveryPath = agentGuidedRecoveryOutputPath(fortress);
+    const fileContent = await readFile(recoveryPath, "utf-8");
     const recoveryKey = extractRecoveryKey(fileContent);
+
+    // THE incident regression: the recovery key reconstructs the master that
+    // actually encrypts this fortress's data.
     const unlocked = await establishMaster({ storage, recoveryKey });
     expect(toBase64url(unlocked.masterKey)).toBe(toBase64url(legacyMaster));
   });
 
-  it("re-running wrap custody is idempotent: no re-mint, recovery-key.txt unchanged", async () => {
+  it("re-running wrap custody is idempotent: no re-mint, staged file unchanged", async () => {
     await establishWrapCustody({
       storagePath: fortress,
       passphrase: "wrap-passphrase",
       interactive: false,
     });
-    const firstContent = await readFile(
-      join(fortress, RECOVERY_KEY_FILENAME),
-      "utf-8"
-    );
+    const recoveryPath = agentGuidedRecoveryOutputPath(fortress);
+    const firstContent = await readFile(recoveryPath, "utf-8");
 
     const second = await establishWrapCustody({
       storagePath: fortress,
@@ -270,10 +279,7 @@ describe("establishWrapCustody", () => {
     expect(second.origin).toBe("envelope");
     expect(second.mintedRecoveryKey).toBe(false);
 
-    const secondContent = await readFile(
-      join(fortress, RECOVERY_KEY_FILENAME),
-      "utf-8"
-    );
+    const secondContent = await readFile(recoveryPath, "utf-8");
     expect(secondContent).toBe(firstContent);
 
     const envelope = await readCustodyEnvelope(
@@ -282,6 +288,59 @@ describe("establishWrapCustody", () => {
     expect(
       envelope!.wraps.filter((w) => w.type === "recovery-key")
     ).toHaveLength(1);
+  });
+
+  it("does not invoke explicit-passphrase persistence when custody authentication fails", async () => {
+    await establishWrapCustody({
+      storagePath: fortress,
+      passphrase: "current-passphrase",
+      interactive: false,
+    });
+    let persistCalls = 0;
+
+    await expect(
+      establishWrapCustody({
+        storagePath: fortress,
+        passphrase: "wrong-replacement",
+        interactive: false,
+        persistAuthenticatedPassphrase: async () => {
+          persistCalls += 1;
+          return { location: "test-keyring", source: "keychain" };
+        },
+      }),
+    ).rejects.toThrow(/unlock|credential|passphrase/i);
+
+    expect(persistCalls).toBe(0);
+    const unlocked = await establishMaster({
+      storage: new FilesystemStorage(join(fortress, "state")),
+      passphrase: "current-passphrase",
+    });
+    expect(unlocked.envelope).not.toBeNull();
+  });
+
+  it("persists an explicit passphrase only after the committed envelope reads back", async () => {
+    let observedCommittedEnvelope = false;
+    const result = await establishWrapCustody({
+      storagePath: fortress,
+      passphrase: "authenticated-passphrase",
+      interactive: false,
+      persistAuthenticatedPassphrase: async () => {
+        const storage = new FilesystemStorage(join(fortress, "state"));
+        const envelope = await readCustodyEnvelope(storage);
+        const unlocked = await establishMaster({
+          storage,
+          passphrase: "authenticated-passphrase",
+        });
+        observedCommittedEnvelope = envelope !== null && unlocked.envelope !== null;
+        return { location: "test-keyring", source: "keychain" };
+      },
+    });
+
+    expect(observedCommittedEnvelope).toBe(true);
+    expect(result.persistedPassphrase).toEqual({
+      location: "test-keyring",
+      source: "keychain",
+    });
   });
 
   it("a wrong passphrase against an envelope fortress fails closed (no parallel master)", async () => {

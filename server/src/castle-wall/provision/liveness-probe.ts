@@ -34,6 +34,7 @@ import type {
   AgentLivenessProbeResult,
   CosLivenessUnverifiedReason,
 } from "./orchestrate.js";
+import { stripTrailingSlashes } from "../../strings.js";
 
 export const TELEGRAM_LIVENESS_PROBE_CONFIG_RELATIVE_PATH = "config/liveness-probe/telegram.json";
 export const TELEGRAM_LIVENESS_PROBE_AUDIT_OP = "cos_liveness_probe";
@@ -417,7 +418,7 @@ function apiUrl(
   token: string,
   method: "sendMessage" | "getUpdates",
 ): string {
-  return `${(apiBaseUrl ?? DEFAULT_TELEGRAM_API_BASE_URL).replace(/\/+$/, "")}/bot${encodeURIComponent(token)}/${method}`;
+  return `${stripTrailingSlashes(apiBaseUrl ?? DEFAULT_TELEGRAM_API_BASE_URL)}/bot${encodeURIComponent(token)}/${method}`;
 }
 
 async function telegramCall(input: {

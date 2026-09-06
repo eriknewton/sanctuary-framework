@@ -30,7 +30,7 @@ import {
   MODEL_MANIFEST_MAX_VERSION,
   MODEL_MANIFEST_MIN_PARAMS_B,
   MODEL_MANIFEST_TIERS,
-  PINNED_MODEL_MANIFEST_SIGNING_PUBLIC_KEY_B64URL,
+  PINNED_MODEL_CATALOG_ROOT_PUBLIC_KEY_B64URL,
   type ModelLicenseMetadata,
   type ModelLicenseRedistribution,
   type ModelManifestTier,
@@ -41,8 +41,14 @@ export const MODEL_MANIFEST_V2_DOMAIN = "sanctuary.model-manifest.v2";
 export const MODEL_MANIFEST_V2_DELIMITER = "\n";
 export const MODEL_MANIFEST_V2_SCHEMA_VERSION = 2 as const;
 export const MODEL_MANIFEST_V2_REGISTRY = "registry.ollama.ai" as const;
+/**
+ * V2 bodies are signed by the dedicated model-catalog root, never by the
+ * release-signing key (owner ruling 2, 2026-09-03). The runtime decodes this
+ * through `loadPinnedModelManifestKey` in model-manifest.ts; this alias exists
+ * so the V2 contract names its own trust root at its own surface.
+ */
 export const PINNED_MODEL_MANIFEST_V2_SIGNING_PUBLIC_KEY_B64URL =
-  PINNED_MODEL_MANIFEST_SIGNING_PUBLIC_KEY_B64URL;
+  PINNED_MODEL_CATALOG_ROOT_PUBLIC_KEY_B64URL;
 
 export const MODEL_LOAD_INTEGRITY_ASSURANCES = ["light", "immune"] as const;
 export type ModelLoadIntegrityAssurance =

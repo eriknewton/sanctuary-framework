@@ -280,12 +280,19 @@ jobs:
           test -x "$LAUNCHER"
           test -s "$MANIFEST"
           test -d "$CLI_RUNTIME/node_modules/@modelcontextprotocol/sdk"
-          test -d "$CLI_RUNTIME/templates"
-          test -d "$CLI_RUNTIME/reference-plugin"
+          # The sealed CLI reaches its dist/ siblings by path (the worker every
+          # fortress creation forks, templates, reference plugins, catalog
+          # assets). The shared gate checks presence WITH each directory's
+          # sentinel file and rejects every denied file class; it is the same
+          # gate the stage script and the manifest builder run
+          # (server/scripts/sealed-cli-runtime-entries.mjs).
+          test -s "$CLI_RUNTIME/dist/directory-capability-worker.js"
+          node ../server/scripts/sealed-cli-runtime-assert.mjs "$CLI_RUNTIME/dist"
+          test -z "$(find "$CLI_RUNTIME" -type f -links +1 -print -quit)"
+          test -z "$(find "$CLI_RUNTIME" -type l -print -quit)"
           test "$(stat -f '%Lp' "$NODE")" = 555
           test "$(stat -f '%Lp' "$DAEMON")" = 444
           test "$(stat -f '%Lp' "$CLI")" = 444
-          test -z "$(find "$CLI_RUNTIME" -type l -print -quit)"
 
           codesign --verify --strict \
             --requirement='anchor apple generic and certificate leaf[subject.OU] = "YFQSWQ9BJN" and identifier "ai.sanctuaryprotocol.macos.castle-wall.node"' \
@@ -531,13 +538,14 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.cs.allow-jit' "$ARTIFACT_NODE_ENTITLEMENTS")" = true
           test "$(plutil -p "$ARTIFACT_NODE_ENTITLEMENTS" | grep -c ' => ')" = 1
           test -s "$ARTIFACT_CLI_RUNTIME/dist/cli.js"
+          test -s "$ARTIFACT_CLI_RUNTIME/dist/directory-capability-worker.js"
           test -s "$ARTIFACT_CLI_RUNTIME/package.json"
-          test -d "$ARTIFACT_CLI_RUNTIME/templates"
-          test -d "$ARTIFACT_CLI_RUNTIME/reference-plugin"
+          node ../server/scripts/sealed-cli-runtime-assert.mjs "$ARTIFACT_CLI_RUNTIME/dist"
+          test -z "$(find "$ARTIFACT_CLI_RUNTIME" -type f -links +1 -print -quit)"
+          test -z "$(find "$ARTIFACT_CLI_RUNTIME" -type l -print -quit)"
           test -d "$ARTIFACT_CLI_RUNTIME/node_modules/@modelcontextprotocol/sdk"
           test -x "$ARTIFACT_LAUNCHER"
           test -s "$ARTIFACT_MANIFEST"
-          test -z "$(find "$ARTIFACT_CLI_RUNTIME" -type l -print -quit)"
           xcrun stapler validate "$ARTIFACT_APP"
           spctl --assess --type execute --verbose=4 "$ARTIFACT_APP"
 

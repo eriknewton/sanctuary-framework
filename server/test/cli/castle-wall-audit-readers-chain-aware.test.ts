@@ -41,6 +41,7 @@ import {
 } from "../../src/operational/audit-store-split.js";
 import { establishMaster } from "../../src/core/master-custody.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { initializeTestCustody } from "../helpers/custody-fixture.js";
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -74,10 +75,12 @@ describe("F2 HIGH-1: Castle Wall audit readers are chain-aware", () => {
   async function migratedFortressWithDaemonEvents(n: number) {
     const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-readers-"));
     tempDirs.push(fortressPath);
+    await initializeTestCustody(fortressPath, { passphrase: PASSPHRASE });
     const code = await runProvisionPin([], {
       out: new CaptureStream(),
       err: new CaptureStream(),
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_PASSPHRASE: PASSPHRASE },
+      globalPinnedPublicKeyPath: join(fortressPath, "global-pin.bin"),
     });
     expect(code).toBe(0);
 
@@ -193,10 +196,12 @@ describe("F2 HIGH-1: Castle Wall audit readers are chain-aware", () => {
   it("audit-chain export on a non-migrated fortress behaves as before (no daemon chain, no flag needed)", async () => {
     const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-readers-nomig-"));
     tempDirs.push(fortressPath);
+    await initializeTestCustody(fortressPath, { passphrase: PASSPHRASE });
     await runProvisionPin([], {
       out: new CaptureStream(),
       err: new CaptureStream(),
       env: { SANCTUARY_STORAGE_PATH: fortressPath, SANCTUARY_PASSPHRASE: PASSPHRASE },
+      globalPinnedPublicKeyPath: join(fortressPath, "global-pin.bin"),
     });
     // No _audit-daemon → export must NOT require --operator-only.
     await expect(

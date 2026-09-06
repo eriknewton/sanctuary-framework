@@ -112,6 +112,11 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
   // ---- anomaly ----
   "anomaly detectors":       { classification: "read-only" },
   "anomaly list-subscribed": { classification: "read-only" },
+  // "status" is a documented alias for "list-subscribed" (see the header
+  // comment in src/cli/anomaly.ts) and routes to the same cmdListSubscribed
+  // handler: loadAnomalySubscriptions() only reads
+  // <storage>/anomaly-subscriptions.json, no write path in that call graph.
+  "anomaly status":          { classification: "read-only" },
   "anomaly subscribe":       { classification: "mutator", auditOverride: true, notes: "AuditLog.append in subscribe handler (ZZZZZ batch 5b)" },
   "anomaly unsubscribe":     { classification: "mutator", auditOverride: true, notes: "AuditLog.append in unsubscribe handler (ZZZZZ batch 5b)" },
   "anomaly findings":        { classification: "read-only" },
@@ -145,7 +150,16 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
   "auto-trigger cancel": { classification: "mutator", auditOverride: true, notes: "dashboard-delegated POST (audits server-side)" },
 
   // ---- identity ----
-  "identity show": { classification: "read-only" },
+  "identity show":   { classification: "read-only" },
+  // Mints a new Ed25519 operator identity and persists it via
+  // IdentityManager.saveNew -> save() (src/cognitive/tools.ts), which writes
+  // the encrypted identity record to `_identities/<identity_id>` and (for the
+  // first identity) the primary-identity pointer to `_meta`. Neither
+  // cmdCreate (src/cli/identity.ts) nor save()/saveNew() calls into
+  // AuditLog -- a genuine mutator-without-audit gap, recorded honestly
+  // rather than left unclassified (matches the castle-wall provision-pin /
+  // reset-passphrase recovery-key precedent above).
+  "identity create": { classification: "mutator", auditOverride: false, notes: "mints + persists a new Ed25519 identity via IdentityManager.saveNew; no AuditLog call anywhere in that path (gap recorded, not silently classified read-only)" },
 
   // ---- file-grant (Governed File-Grant v1, 2026-07-07) ----
   "file-grant mint":   { classification: "mutator", auditOverride: true, notes: "AuditLog.appendCritical in mintFileGrant (success and rolled-back-failure paths); reconciles expired grants on this touch" },
@@ -201,12 +215,32 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
 
   // ---- reset-passphrase ----
   "reset-passphrase nuke": { classification: "mutator", auditOverride: false, notes: "destroys fortress (audit log destroyed too)" },
+  // M2: the recovery-key rekey enrolls a fresh passphrase wrap under the custody
+  // write lock and now emits a `custody_passphrase_rekeyed` AuditLog entry (best
+  // effort after commit; the master is unchanged). Classified here in the
+  // canonical registry even though the line-scanner does not yet enumerate
+  // reset-passphrase --mode values as subcommands.
+  "reset-passphrase recovery-key": { classification: "mutator", auditOverride: true, notes: "M2: enrolls a fresh passphrase wrap under the custody write lock; emits custody_passphrase_rekeyed" },
+
+  // ---- castle-wall (routed via cli.ts; not line-scanned) ----
+  // M2: provision-pin pins the operator key for the IPC handshake under the
+  // custody write lock (runProvisionPin -> stableFortressCapability.provisionPin).
+  // It does NOT currently emit a dedicated AuditLog entry, so it is a mutator
+  // WITHOUT audit — recorded honestly here rather than left unclassified. Whether
+  // to add a `castle_wall_pin_provisioned` audit entry is a separate decision.
+  "castle-wall provision-pin": { classification: "mutator", auditOverride: false, notes: "M2: pins operator key under custody write lock; emits no dedicated audit entry today (gap recorded, not silently classified read-only)" },
 
   // ---- exit ----
   "exit export":        { classification: "mutator", auditOverride: true, notes: "AuditLog.append in exit export handler" },
   "exit verify":        { classification: "read-only" },
   "exit import":        { classification: "mutator", auditOverride: true, notes: "AuditLog.append in exit import handler" },
   "exit manifest-shape": { classification: "read-only" },
+  // inspectExitBundle (src/exit/inspect.ts) -> verifyExitBundle
+  // (src/exit/verifier.ts) only reads the already-exported bundle directory
+  // given on the command line and computes a report; no write/mkdir/rename
+  // call anywhere in that call graph, and it never touches the live fortress
+  // storage path at all.
+  "exit inspect":       { classification: "read-only" },
 
   // ---- honeypot ----
   "honeypot compile":          { classification: "read-only" },

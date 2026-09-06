@@ -2,7 +2,7 @@ import { buildUpstreamStdioEnv } from "../../../../server/src/proxy/client-manag
 import { registerFixture } from "../../registry.js";
 import { outcome } from "../state-trust/helpers.js";
 
-const CLAIM_ID = "15";
+const CLAIM_ID = "16";
 const CLAIM_LABEL = "Proxy isolation: env (PR #267)";
 
 // Entrypoint: buildUpstreamStdioEnv, the stdio env sanitizer used by ClientManager.

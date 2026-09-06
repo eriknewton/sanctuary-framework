@@ -44,10 +44,14 @@ import {
   type CompiledPolicy,
 } from "../policy-engine/english-policy-compiler.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
+// A typed load refusal must not be swallowed as "intelligence not configured";
+// see the catch in `tryLoadSubstrateSelector`.
+import { LocalIntegrityStateLoadError } from "../intelligence/policy-store.js";
 import { installConsentGatedRedactor } from "../intelligence/privacy-tier2-redactor.js";
 import { resolveStoragePath } from "../paths.js";
 import { loadConfig } from "../config.js";
 import { getOrCreatePassphrase } from "../wrap/passphrase.js";
+import { stripTrailingSlashes } from "../strings.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { createCompiledContextRuntime } from "../compiled-context/runtime.js";
 
@@ -226,7 +230,25 @@ async function tryLoadSubstrateSelector(storagePath: string): Promise<{
       fortressId: fortressIdFromStoragePath(storagePath),
     });
     return { selector, auditLog, fortressId };
-  } catch {
+  } catch (cause) {
+    // NOT a blanket swallow. "Intelligence is not configured here" and "this
+    // fortress refused to load its intelligence state" are opposite facts, and
+    // returning null for both turned a refusal into a silent unarm: the
+    // compile preview would quietly proceed without LLM assist and never say
+    // that a tampered or unreadable record was the reason. Every refusal the
+    // load checkpoint raises is typed, so it propagates and the caller reports
+    // it, remedy verb included. Everything else (no fortress, no passphrase,
+    // unreadable custody) stays the honest "not available here" null.
+    //
+    // ONE class covers both refusal families because
+    // `IntelligenceConfigUnreadableError` (corrupt or version-too-new record)
+    // EXTENDS `LocalIntegrityStateLoadError` (armed record failed Q5
+    // validation); see the declaration in `../intelligence/policy-store.ts`.
+    // If those classes are ever separated, this line silently stops covering
+    // the unreadable case and the swallow returns. The tripwire is
+    // "pins the inheritance the compile-preview rethrow depends on" in
+    // `test/policy-engine/english-policy-compiler.test.ts`.
+    if (cause instanceof LocalIntegrityStateLoadError) throw cause;
     return null;
   }
 }
@@ -470,7 +492,7 @@ function resolveApiBase(
     err.write("drafts command requires --api-base or SANCTUARY_POLICY_API_BASE\n");
     return null;
   }
-  return raw.replace(/\/+$/, "");
+  return stripTrailingSlashes(raw);
 }
 
 function resolveApiToken(err: NodeJS.WritableStream): string | null {

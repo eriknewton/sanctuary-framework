@@ -552,6 +552,23 @@ describe("mirrored declarations hold equal values and name their counterpart", (
       ],
     },
     {
+      // The build-step copy script is plain .mjs and cannot import the loader,
+      // so the asset byte pin is mirrored; the signing tool rewrites both.
+      label: "packaged model manifest asset pin / build copy script",
+      canonical: "server/src/intelligence/packaged-model-manifest.ts",
+      mirrors: ["server/scripts/copy-model-manifest-v2-asset.mjs"],
+      pairs: [
+        {
+          canonicalName: "PACKAGED_MODEL_MANIFEST_V2_ASSET_SHA256",
+          mirrorName: "EXPECTED_MODEL_MANIFEST_V2_ASSET_SHA256",
+        },
+        {
+          canonicalName: "PACKAGED_MODEL_MANIFEST_V2_ASSET_RELATIVE_PATH",
+          mirrorName: "ASSET_RELATIVE_PATH",
+        },
+      ],
+    },
+    {
       label: "mesh v2 hybrid certificate versions",
       canonical: "server/src/mesh/trust-root-hybrid.ts",
       mirrors: ["server/src/mesh/types.ts"],

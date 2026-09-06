@@ -11,8 +11,26 @@ import { getSanctuaryVersion } from "../version.js";
 import { agentGuidedRecoveryOutputPath } from "../wrap/custody-flow.js";
 import {
   probeExistingCustodyMaterial,
+  readStoredPassphrase,
+  PassphraseKeyringUnreachableError,
+  PassphraseUnreadableError,
   type ExistingCustodyMaterialStatus,
 } from "../wrap/passphrase.js";
+import { FilesystemStorage } from "../storage/filesystem.js";
+import {
+  probeKernelBackedCrossProcessLockCapability,
+  type KernelLockCapability,
+} from "../storage/cross-process-lock.js";
+import {
+  CustodyCredentialMissingError,
+  CustodyUnlockError,
+  readCustodyEnvelope,
+  unlockExistingMasterReadOnly,
+} from "../core/master-custody.js";
+import {
+  readKeychainCustodyKeyStatus,
+  type KeychainReadResult,
+} from "../wrap/keychain-custody.js";
 import {
   getPlatformPaths,
   hasExistingWrapMetaStrict,
@@ -24,6 +42,12 @@ import {
   bootServiceReady,
 } from "./castle-wall-boot.js";
 import { parseCastleWallState, runStatus, type SysextState } from "./castle-wall.js";
+// The sealed-runtime contract shared with the build gate and the manifest
+// builder (server/scripts/sealed-cli-runtime-entries.mjs); bundled into cli.js.
+import {
+  installerRequiredSealedCliRuntimeEntries,
+  sealedCliRuntimeManifestPath,
+} from "../../scripts/sealed-cli-runtime-entries.mjs";
 
 declare const __SANCTUARY_SOURCE_SHA__: string;
 
@@ -129,10 +153,20 @@ export async function verifyCastleWallRuntimeManifest(
     !Array.isArray(manifest.inventory.packages) ||
     !Array.isArray(manifest.inventory.mach_o)
   ) return false;
+  // The runtime entries come from the shared sealed-runtime contract, never a
+  // hand list here: every bundler entry (cli.js, the storage worker every
+  // fortress creation forks, index.js, intelligence/index.js,
+  // verify-transparency.js) as a file, and every asset directory through its
+  // sentinel file (an empty `templates/` is not templates). Entries still
+  // marked `landsWith` are not part of the installer contract yet.
+  // Consequence for an already-installed older runtime that predates an entry:
+  // this verifier reports `mismatch`, and the planner's remedy is to replace
+  // the app with a verified current candidate, which is the honest outcome (the
+  // installer must not plan against a runtime that cannot create a fortress).
   const required = new Set([
     "MacOS/sanctuary",
     "Resources/boot-runtime/node",
-    "Resources/cli-runtime/dist/cli.js",
+    ...installerRequiredSealedCliRuntimeEntries().map(sealedCliRuntimeManifestPath),
   ]);
   const filePaths = new Set<string>();
   let totalBytes = 0;
@@ -239,6 +273,60 @@ export type TrustAnchorObservation =
   | "unknown"
   | "not-applicable";
 
+/**
+ * Whether this host can UNLOCK the fortress today through the exact-fortress
+ * stored credential — the daily-UX question Rung 1 fresh-host onboarding turns
+ * on. Read-only and ambient-env-blind: the probe reads the OS keyring / fallback
+ * NAMESPACED to this fortress and tries the unwrap, and it deliberately does NOT
+ * consult SANCTUARY_PASSPHRASE / SANCTUARY_RECOVERY_KEY, so a passphrase that
+ * happens to be exported in the installing shell can never make a copied host
+ * look "usable" when the daily driver (no ambient secret) could not open it.
+ *  - "usable":         the stored credential reads AND unlocks the custody
+ *                      envelope — the operator can run memory verbs with no
+ *                      secret typed.
+ *  - "absent":         the fortress has envelope custody but this host holds NO
+ *                      stored credential for it (the just-copied second host,
+ *                      before a recovery-key rekey / import).
+ *  - "locked":         the OS keyring is locked / unreachable in this session
+ *                      (SSH, fresh reboot) — unlock it and re-probe.
+ *  - "mismatch":       a stored credential exists but does NOT unlock this
+ *                      fortress (a stale credential after a restore), or the
+ *                      encrypted fallback will not decrypt on this host.
+ *  - "missing":        no envelope custody exists yet (virgin fortress); the
+ *                      Rung 1 custody prerequisite is not complete.
+ *  - "unavailable":    this platform has no supported exact-fortress stored
+ *                      credential path; hands-free opening is not proven.
+ *  - "unknown":        an indeterminate read error; no remedy is invented.
+ */
+export type CustodyAccessObservation =
+  | "usable"
+  | "absent"
+  | "locked"
+  | "mismatch"
+  | "missing"
+  | "unavailable"
+  | "unknown";
+
+/** Whether this runtime can perform crash-recoverable custody mutations. */
+export type CustodyMutationObservation =
+  | "available"
+  | "unavailable"
+  | "unknown";
+
+/**
+ * Whether the fortress carries a human-held recovery factor (a recovery-key
+ * custody wrap) — the factor that makes a second-host recovery or a
+ * `reset-passphrase --mode recovery-key` possible. Read from the envelope's wrap
+ * types only after the envelope is authenticated under an unwrapped master;
+ * otherwise the observation is `unknown`.
+ *  - "present": at least one authenticated, operator-verified recovery-key
+ *               wrap exists.
+ *  - "absent":  no recovery-key wrap (or no envelope custody yet).
+ *  - "unknown": the envelope could not be authenticated, or it contains only
+ *               an unverified recovery wrap.
+ */
+export type RecoveryFactorObservation = "present" | "absent" | "unknown";
+
 export interface AgentInstallAction {
   id: string;
   actor: "agent" | "human";
@@ -268,6 +356,12 @@ export interface AgentInstallPlan {
     persistent_cli_version: string | null;
     package_manager_path: string | null;
     existing_custody: ExistingCustodyMaterialStatus;
+    // Rung 1 fresh-host onboarding: can this host open the fortress today via
+    // the exact-fortress stored credential (custody_access), and does the
+    // fortress carry a human-held recovery factor (recovery_factor)?
+    custody_access: CustodyAccessObservation;
+    custody_mutation: CustodyMutationObservation;
+    recovery_factor: RecoveryFactorObservation;
     castle_wall_app: InstallObservation;
     castle_wall_build_sha: string | null;
     system_extension: SysextState | "unknown" | "not-applicable";
@@ -305,6 +399,9 @@ export interface InstallProbeResult {
   persistentCliVersion: string | null;
   packageManagerPath: string | null;
   existingCustody: ExistingCustodyMaterialStatus;
+  custodyAccess: CustodyAccessObservation;
+  custodyMutation: CustodyMutationObservation;
+  recoveryFactor: RecoveryFactorObservation;
   nodePath: string;
   castleWallApp: InstallObservation;
   castleWallBuildSha: string | null;
@@ -734,19 +831,227 @@ async function probeOperatorTwin(
   return "unknown";
 }
 
+/**
+ * Read-only, ambient-env-blind daily-UX probe for Rung 1 fresh-host onboarding.
+ * Answers "can this host open the fortress today, and does it carry a recovery
+ * factor?" WITHOUT typing or reading any credential from the environment:
+ *  - reads both exact-fortress local factors (stored passphrase and the
+ *    interactive-init custody key) and tries each unwrap to decide
+ *    custody_access; passphrase is tried first and custody key is fallback,
+ *  - reports recovery_factor ONLY from an envelope that has passed its MAC under
+ *    the unwrapped master; without authenticated custody recovery_factor is
+ *    "unknown", so an attacker-added plaintext recovery wrap cannot change it.
+ * It never consults SANCTUARY_PASSPHRASE / SANCTUARY_RECOVERY_KEY, never
+ * generates custody or mutates the fortress. The independent mutation-capability
+ * probe creates and removes a private runtime socket and may create its 0700
+ * runtime directory; that bounded host-local probe is not fortress state.
+ * Any decrypted master is zeroed.
+ */
+export async function probeCustodyAccess(
+  fortress: string,
+  platform: NodeJS.Platform,
+  // Test seam: the exact-fortress stored-credential reader. Defaults to the real
+  // keyring/fallback read; tests inject an in-memory reader so the suite never
+  // spawns the OS keyring subprocess against the operator's keyring. (The binary
+  // names are intentionally not quoted here: the keychain-exec-guard source scan
+  // flags any quoted credential-binary literal outside the chokepoint.)
+  readStored: typeof readStoredPassphrase = readStoredPassphrase,
+  probeLock: (
+    host: NodeJS.Platform,
+    targetLockDirectory?: string,
+  ) => Promise<KernelLockCapability> = (host, targetLockDirectory) =>
+    probeKernelBackedCrossProcessLockCapability(
+      host,
+      undefined,
+      targetLockDirectory,
+    ),
+  readCustody: (
+    storagePath: string,
+  ) => Promise<KeychainReadResult> = (storagePath) =>
+    readKeychainCustodyKeyStatus(storagePath, { platformOverride: platform }),
+): Promise<{
+  custodyAccess: CustodyAccessObservation;
+  custodyMutation: CustodyMutationObservation;
+  recoveryFactor: RecoveryFactorObservation;
+}> {
+  const storage = new FilesystemStorage(join(fortress, "state"));
+  let custodyMutation: CustodyMutationObservation;
+  try {
+    custodyMutation = (
+      await probeLock(platform, join(fortress, "state", "_meta"))
+    ).available
+      ? "available"
+      : "unavailable";
+  } catch {
+    custodyMutation = "unknown";
+  }
+  let envelope: Awaited<ReturnType<typeof readCustodyEnvelope>>;
+  try {
+    envelope = await readCustodyEnvelope(storage);
+  } catch {
+    // Unreadable/tampered envelope: indeterminate. No remedy invented.
+    return { custodyAccess: "unknown", custodyMutation, recoveryFactor: "unknown" };
+  }
+  if (!envelope) {
+    // Virgin fortress: no custody envelope, so nothing to open and no recovery
+    // wrap can exist. Both observations are authentic with no unlock needed.
+    return { custodyAccess: "missing", custodyMutation, recoveryFactor: "absent" };
+  }
+
+  // recovery_factor is NEVER read from the envelope's plaintext wrap list until
+  // the envelope MAC has verified under an unwrapped master. An attacker with
+  // bare write access to the custody file can append a plaintext
+  // { type: "recovery-key" } wrap whose payload need not decrypt; trusting
+  // `wraps[].type` before authentication would flip recovery_factor to
+  // "present" and (once observations drive the planner) steer it toward a
+  // recovery path that does not exist (AGENTS.md rule 7). So every branch that
+  // has NOT authenticated custody reports recovery_factor: "unknown".
+
+  let stored: Awaited<ReturnType<typeof readStoredPassphrase>> = null;
+  let passphraseState: "absent" | "locked" | "unreadable" | "unknown" = "absent";
+  try {
+    stored = await readStored({
+      storagePath: fortress,
+      platformOverride: platform,
+      readOnly: true,
+    });
+  } catch (error) {
+    if (error instanceof PassphraseKeyringUnreachableError) {
+      passphraseState = "locked";
+    } else if (error instanceof PassphraseUnreadableError) {
+      passphraseState = "unreadable";
+    } else {
+      passphraseState = "unknown";
+    }
+  }
+  const custody = await readCustody(fortress).catch(() => ({
+    status: "unreachable" as const,
+    detail: "custody-key identity could not be determined",
+  }));
+  const custodyKey =
+    custody.status === "found" && custody.key !== undefined
+      ? custody.key
+      : undefined;
+  let authenticatedMaster: Uint8Array | null = null;
+  let integrityIndeterminate = false;
+  let sawMismatch =
+    passphraseState === "unreadable" ||
+    (custody.status === "found" && custody.key === undefined);
+  try {
+    if (stored && stored.value.length > 0) {
+      let candidate: Uint8Array | null = null;
+      try {
+        candidate = await unlockExistingMasterReadOnly(storage, {
+          passphrase: stored.value,
+          storagePathHint: fortress,
+        });
+        authenticatedMaster = candidate;
+        candidate = null;
+      } catch (error) {
+        if (error instanceof CustodyUnlockError && !(error instanceof CustodyCredentialMissingError)) {
+          sawMismatch = true;
+        } else {
+          integrityIndeterminate = true;
+        }
+      } finally {
+        candidate?.fill(0);
+      }
+    }
+    if (authenticatedMaster === null && custodyKey) {
+      let candidate: Uint8Array | null = null;
+      try {
+        candidate = await unlockExistingMasterReadOnly(storage, {
+          keychainKey: custodyKey,
+          storagePathHint: fortress,
+        });
+        authenticatedMaster = candidate;
+        candidate = null;
+      } catch (error) {
+        if (error instanceof CustodyUnlockError && !(error instanceof CustodyCredentialMissingError)) {
+          sawMismatch = true;
+        } else {
+          integrityIndeterminate = true;
+        }
+      } finally {
+        candidate?.fill(0);
+      }
+    }
+    if (authenticatedMaster === null) {
+      if (integrityIndeterminate) {
+        return { custodyAccess: "unknown", custodyMutation, recoveryFactor: "unknown" };
+      }
+      // An inaccessible factor may still be the valid one. Report the
+      // actionable locked state ahead of a different local factor's mismatch;
+      // never claim the fortress has no usable local credential while the OS
+      // keyring's answer is indeterminate. custody.status === "unreachable"
+      // is a genuine, transient "unlock and re-probe" signal only on a
+      // platform where custody keys are OS-keyring-backed (darwin, linux):
+      // readKeyClassified has no non-keyring path for custody keys, so on
+      // every other platform (e.g. Windows) that same status is a structural
+      // "no OS-keyring integration on this platform" answer, not a lock.
+      // Folding it into "locked" there would tell the operator to unlock a
+      // login Keychain that does not exist, so it is excluded from the
+      // locked check outside darwin/linux; the platform falls through to the
+      // passphrase-fallback-file signals below (Windows's real
+      // exact-fortress credential path), landing on "unavailable" only when
+      // none of those signals apply either.
+      const custodyKeyGenuinelyLocked =
+        custody.status === "unreachable" &&
+        (platform === "darwin" || platform === "linux");
+      if (passphraseState === "locked" || custodyKeyGenuinelyLocked) {
+        return { custodyAccess: "locked", custodyMutation, recoveryFactor: "unknown" };
+      }
+      if (sawMismatch) {
+        return { custodyAccess: "mismatch", custodyMutation, recoveryFactor: "unknown" };
+      }
+      if (passphraseState === "unknown") {
+        return { custodyAccess: "unknown", custodyMutation, recoveryFactor: "unknown" };
+      }
+      if (platform !== "darwin" && platform !== "linux") {
+        return { custodyAccess: "unavailable", custodyMutation, recoveryFactor: "unknown" };
+      }
+      return { custodyAccess: "absent", custodyMutation, recoveryFactor: "unknown" };
+    }
+    const hasVerifiedRecovery = envelope.wraps.some(
+      (w) => w.type === "recovery-key" && w.verified === true,
+    );
+    const hasUnverifiedRecovery = envelope.wraps.some(
+      (w) => w.type === "recovery-key" && w.verified !== true,
+    );
+    const recoveryFactor: RecoveryFactorObservation = hasVerifiedRecovery
+      ? "present"
+      : hasUnverifiedRecovery
+        ? "unknown"
+        : "absent";
+    return {
+      custodyAccess: "usable",
+      custodyMutation,
+      recoveryFactor,
+    };
+  } finally {
+    authenticatedMaster?.fill(0);
+    custodyKey?.fill(0);
+  }
+}
+
 function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
   const platform = ctx.platform ?? process.platform;
   const env = ctx.env ?? process.env;
   return {
     probe: async ({ profile, harness, fortress }) => {
       const cooperativeWrap = await probeWrap(harness);
-      const [pathCli, packageManagerPath, existingCustody] = await Promise.all([
-        probePersistentCli(),
-        probeExecutableOnPath("npm"),
-        platform === "darwin"
-          ? probeExistingCustodyMaterial(fortress)
-          : Promise.resolve("absent" as const),
-      ]);
+      const [pathCli, packageManagerPath, existingCustody, custodyAccessProbe] =
+        await Promise.all([
+          probePersistentCli(),
+          probeExecutableOnPath("npm"),
+          platform === "darwin"
+            ? probeExistingCustodyMaterial(fortress)
+            : Promise.resolve("absent" as const),
+          // Read-only, ambient-env-blind daily-UX probe — runs on every profile
+          // (Rung 1 IS the memory profile) and every platform.
+          probeCustodyAccess(fortress, platform),
+        ]);
+      const { custodyAccess, custodyMutation, recoveryFactor } = custodyAccessProbe;
       let persistentCli = pathCli;
       let nodePath = process.execPath;
       let verifiedCastleWallApp: Awaited<ReturnType<typeof probeCastleWallApp>> | null = null;
@@ -772,6 +1077,9 @@ function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
           persistentCliVersion: persistentCli.version,
           packageManagerPath,
           existingCustody,
+          custodyAccess,
+          custodyMutation,
+          recoveryFactor,
           nodePath,
           castleWallApp: "not-applicable",
           castleWallBuildSha: null,
@@ -799,6 +1107,9 @@ function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
         persistentCliVersion: persistentCli.version,
         packageManagerPath,
         existingCustody,
+        custodyAccess,
+        custodyMutation,
+        recoveryFactor,
         nodePath,
         castleWallApp: castleWallApp.status,
         castleWallBuildSha: castleWallApp.buildSha,
@@ -825,6 +1136,231 @@ function recoveryCustodyAction(fortress: string): AgentInstallAction {
   };
 }
 
+/**
+ * Rung 1 restart-persistence acceptance. A HUMAN action because it needs a real
+ * host restart, after which sovereign memory must still open from the
+ * exact-fortress stored credential with NO secret typed. The verification uses
+ * the EXISTING policy-enforcing MCP tools: memory_insert / memory_search /
+ * memory_get prove the exact content, and sdw_memory_provenance separately
+ * proves the signer and admission bindings. Never a new CLI verb, so the proof
+ * runs through the same Tier gate and provenance signing as daily use. No argv:
+ * these are MCP calls, not a shell command.
+ */
+function restartAndVerifyRung1Action(): AgentInstallAction {
+  return {
+    id: "restart_and_verify_rung1",
+    actor: "human",
+    description:
+      "Rung 1 acceptance: restart this host, then prove sovereign memory survives " +
+      "and still opens with no secret typed. Using the MCP tools (not a new CLI): " +
+      "before restarting, memory_insert a marker record; after the restart, " +
+      "memory_search for it and memory_get it back byte-faithfully. Then call " +
+      "sdw_memory_provenance for that passage id and require verified signer and " +
+      "admission bindings; memory_get itself does not carry signer data. The fortress " +
+      "must unlock from the " +
+      "exact-fortress stored credential (custody_access=usable) with no " +
+      "SANCTUARY_PASSPHRASE / SANCTUARY_RECOVERY_KEY in the environment.",
+    completion:
+      "After a restart, memory_get returns the pre-restart record and " +
+      "sdw_memory_provenance verifies its signer/admission bindings, with no ambient " +
+      "credential env set.",
+    secret_boundary:
+      "Do not set SANCTUARY_PASSPHRASE / SANCTUARY_RECOVERY_KEY for this proof, and do " +
+      "not paste any passphrase, recovery key, or keychain contents into chat.",
+  };
+}
+
+/**
+ * Locked-keyring remedy for a fortress this host CAN open but not in this
+ * session. custody_access=locked means a stored credential exists but the OS
+ * keyring is locked / unreachable here (SSH, fresh reboot) — nothing is wrong
+ * with custody, so the remedy is a human unlock + re-probe, NOT a rekey.
+ */
+function unlockLocalKeyringAction(): AgentInstallAction {
+  return {
+    id: "unlock_local_keyring",
+    actor: "human",
+    description:
+      "This host holds a stored credential for the fortress, but the OS keyring is locked " +
+      "or unreachable in this session (a common SSH or fresh-reboot state), so daily " +
+      "hands-free open cannot be confirmed. In a local desktop session, unlock the login " +
+      "Keychain (macOS) or start/unlock the Secret Service (Linux), then rerun the planner. " +
+      "No secret is typed here.",
+    completion: "A rerun observes custody_access=usable.",
+    secret_boundary:
+      "Do not paste a login password, passphrase, recovery key, or keychain contents into chat or an agent command.",
+  };
+}
+
+/**
+ * Attended, NONDESTRUCTIVE recovery ATTEMPT for the common copied/stale host
+ * where custody could not be authenticated (custody_access absent/mismatch,
+ * recovery_factor UNKNOWN). Because the envelope could not be MAC-verified from
+ * here, the planner must NOT claim a recovery factor exists (AGENTS.md rule 7 /
+ * finding 1: "never a recovery-factor claim"). It names the recovery-key rekey
+ * as an ATTEMPT the operator can safely try: it is nondestructive and a wrong or
+ * absent key changes nothing, so attempting it leaks nothing and risks nothing.
+ * The action id itself states that this is only an attempt; no parallel
+ * "proven factor" branch exists because the probe cannot emit that composition.
+ */
+function attemptCustodyRecoveryAction(
+  fortress: string,
+  access: "absent" | "mismatch",
+): AgentInstallAction {
+  return {
+    id: "attempt_custody_recovery",
+    actor: "human",
+    description:
+      (access === "absent"
+        ? "This host holds no stored credential for the installed fortress yet (a just-copied second host). "
+        : "This host's stored credential does not open the installed fortress (stale after a restore/copy). ") +
+      "Whether the fortress carries a recovery factor cannot be confirmed from here without a " +
+      "credential, so this is an ATTEMPT, not a guarantee. If you saved a recovery key at first " +
+      "custody, in a private local desktop Terminal execute the exact structured argv attached " +
+      "to this action (do not reconstruct it as an unquoted shell string). The recovery key " +
+      "is read from a hidden prompt (never argv, environment, or a pipe). It is nondestructive: a " +
+      "wrong or absent key changes nothing. If you have no recovery key, open the fortress on a host " +
+      "that already holds its credential.",
+    argv: [
+      "sanctuary",
+      "reset-passphrase",
+      "--mode",
+      "recovery-key",
+      "--fortress",
+      fortress,
+    ],
+    completion:
+      "A rerun observes custody_access=usable (the recovery key was present and enrolled a fresh " +
+      "passphrase), or the attempt reported the key does not unlock this fortress.",
+    secret_boundary:
+      "Type the recovery key only at the hidden prompt. Never place it in argv, an environment " +
+      "variable, a pipe, or a chat, and never paste keychain contents.",
+  };
+}
+
+/**
+ * Rung 1 fresh-host gate on a mechanically-complete cooperative surface.
+ *
+ * `cooperative_wrap=present` proves a wrap surface EXISTS on disk, but a
+ * just-copied second host can carry that surface and still be unable to OPEN it
+ * hands-free (`custody_access !== usable`). Daily-UX completion is the stronger
+ * claim, so this gate decides — from the AUTHENTICATED custody_access,
+ * independent custody_mutation, and recovery_factor observations — whether to declare `complete` or route to the
+ * exact nondestructive recovery/unlock step. It never claims a recovery path
+ * the observations do not prove: recovery_factor is `present` only after the
+ * envelope MAC verifies (probeCustodyAccess), so an attacker-added wrap cannot
+ * influence the plan. `completeNotes` are the profile-specific notes appended
+ * only on the genuine-complete path. Mutates and returns `plan`.
+ */
+function applyRung1CustodyCompletion(
+  input: { fortress: string; observed: InstallProbeResult },
+  plan: AgentInstallPlan,
+  completeNotes: string[],
+): AgentInstallPlan {
+  const access = input.observed.custodyAccess;
+  // Completion means the exact-fortress stored credential demonstrably opens
+  // custody. Missing custody and platforms without a supported hands-free store
+  // are never a green mechanical substitute for that proof.
+  if (access === "usable") {
+    if (input.observed.custodyMutation !== "available") {
+      plan.status = input.observed.custodyMutation === "unavailable"
+        ? "blocked"
+        : "human_action";
+      plan.next_action = {
+        id: "restore_custody_lock_capability",
+        actor: "human",
+        description:
+          input.observed.custodyMutation === "unavailable"
+            ? "The stored credential authenticated, but this runtime lacks the reviewed process-owned custody mutation lock. Install or select a supported Sanctuary runtime, then rerun."
+            : "The stored credential authenticated, but the custody mutation lock probe was indeterminate. Re-run locally and inspect the secure runtime-directory/socket capability before mutating custody.",
+        completion:
+          "A rerun observes custody_access=usable and custody_mutation=available.",
+      };
+      plan.notes.push(
+        "Daily hands-free authentication succeeded, but custody mutation readiness is a separate requirement and is not yet proven.",
+      );
+      return plan;
+    }
+    plan.status = "complete";
+    plan.operator_actions = [
+      recoveryCustodyAction(input.fortress),
+      restartAndVerifyRung1Action(),
+    ];
+    for (const note of completeNotes) plan.notes.push(note);
+    return plan;
+  }
+  if (access === "locked") {
+    plan.status = "human_action";
+    plan.next_action = unlockLocalKeyringAction();
+    plan.notes.push(
+      "The cooperative surface is installed, but this session's OS keyring is locked or " +
+        "unreachable, so daily hands-free open cannot be confirmed. Unlock it and rerun the planner.",
+    );
+    return plan;
+  }
+  if (access === "missing" || access === "unavailable") {
+    plan.status = "blocked";
+    plan.notes.push(
+      access === "missing"
+        ? "The cooperative wrap metadata is present but the custody envelope is missing; Rung 1 cannot open and must not be declared complete. Restore authenticated custody before retrying."
+        : "This platform has no supported exact-fortress hands-free credential store, so restart persistence cannot be proved and Rung 1 is not complete.",
+    );
+    if (access === "unavailable") {
+      plan.next_action = {
+        id: "restore_custody_access_capability",
+        actor: "human",
+        description:
+          "This platform has no supported exact-fortress stored credential path. Install or select a supported Sanctuary runtime and credential store, then rerun.",
+        completion:
+          "A rerun observes custody_access=usable.",
+      };
+    }
+    return plan;
+  }
+  if (access === "absent" || access === "mismatch") {
+    if (input.observed.recoveryFactor === "unknown") {
+      // This is the only probe-produced absent/mismatch composition: without an
+      // opening credential the envelope cannot be authenticated, so the factor
+      // remains unproven. Offer only the nondestructive attended attempt.
+      plan.status = "human_action";
+      plan.next_action = attemptCustodyRecoveryAction(input.fortress, access);
+      plan.notes.push(
+        "The cooperative surface is installed but this host cannot open it, and custody could not " +
+          "be authenticated from here to confirm a recovery factor. A nondestructive recovery-key " +
+          "attempt is offered; whether a recovery key exists is not claimed.",
+      );
+      return plan;
+    }
+    // present/absent alongside absent/mismatch is not emitted by
+    // probeCustodyAccess: authentication sufficient to assert a factor would
+    // also make custody_access usable. Treat injected/stale observations as an
+    // inconsistent trust input, never as a definite recovery path.
+    plan.status = "blocked";
+    plan.notes.push(
+      "The custody observations are internally inconsistent: absent/mismatch custody cannot carry an authenticated recovery-factor verdict. Rerun the read-only probe before taking recovery action.",
+    );
+    return plan;
+  }
+  // access === "unknown": an indeterminate custody read. Never claim a recovery
+  // factor (probeCustodyAccess reports recovery_factor=unknown here) and never
+  // fabricate a path; ask for an attended diagnostic re-probe.
+  plan.status = "human_action";
+  plan.next_action = {
+    id: "diagnose_custody_access",
+    actor: "human",
+    description:
+      "The cooperative surface is installed, but this host's ability to open the fortress could " +
+      "not be determined (an indeterminate custody read). In a private local desktop session, " +
+      "verify the fortress storage path and OS keyring are reachable, then rerun the planner. Do " +
+      "not assume a recovery path exists until custody_access reads a definite value.",
+    completion:
+      "A rerun observes custody_access as a definite value (usable / absent / locked / mismatch).",
+    secret_boundary:
+      "Do not paste a passphrase, recovery key, or keychain contents into chat while diagnosing.",
+  };
+  return plan;
+}
+
 function basePlan(
   profile: InstallProfile,
   harness: InstallHarness,
@@ -844,6 +1380,9 @@ function basePlan(
       persistent_cli_version: observed.persistentCliVersion,
       package_manager_path: observed.packageManagerPath,
       existing_custody: observed.existingCustody,
+      custody_access: observed.custodyAccess,
+      custody_mutation: observed.custodyMutation,
+      recovery_factor: observed.recoveryFactor,
       castle_wall_app: observed.castleWallApp,
       castle_wall_build_sha: observed.castleWallBuildSha,
       system_extension: observed.systemExtension,
@@ -952,10 +1491,13 @@ export function buildAgentInstallPlan(input: {
 
   if (input.profile === "memory") {
     if (input.observed.cooperativeWrap === "present") {
-      plan.status = "complete";
-      plan.operator_actions = [recoveryCustodyAction(input.fortress)];
-      plan.notes.push("The cooperative encrypted-memory and policy surface is installed.");
-      return plan;
+      // The wrap surface exists; the Rung 1 custody gate decides whether THIS
+      // host can open it hands-free (complete) or must run the exact
+      // nondestructive recovery/unlock step first. This runs AFTER the virgin/
+      // mechanical branches below, so it never disturbs first-custody flow.
+      return applyRung1CustodyCompletion(input, plan, [
+        "The cooperative encrypted-memory and policy surface is installed.",
+      ]);
     }
     if (input.observed.cooperativeWrap === "unknown") {
       plan.next_action = {
@@ -1038,7 +1580,7 @@ export function buildAgentInstallPlan(input: {
     !/^[a-f0-9]{12}$/.test(input.observed.castleWallBuildSha)
   ) {
     plan.notes.push(
-      `The Castle Wall app failed signature, Gatekeeper, bundle-identity, build-identity, or headless-contract validation. Replace it with a verified current candidate at ${DEFAULT_CASTLE_WALL_APP}.`,
+      `The Castle Wall app failed signature, Gatekeeper, bundle-identity, build-identity, headless-contract, or sealed-runtime validation (an incomplete sealed runtime is one cause). Replace it with a verified current candidate at ${DEFAULT_CASTLE_WALL_APP}.`,
     );
     return plan;
   }
@@ -1117,11 +1659,15 @@ export function buildAgentInstallPlan(input: {
     input.observed.contentFilter === "enabled" &&
     input.observed.enforcement === "live";
   if (fullMechanicsComplete) {
-    plan.status = "complete";
-    plan.operator_actions = [recoveryCustodyAction(input.fortress)];
-    plan.notes.push("The full mechanical install is observed: wrap, boot service, content filter, and live enforcement.");
-    plan.notes.push("Only an attended reboot drill proves boot survival on this specific machine.");
-    return plan;
+    // The full profile contains the Rung 1 cooperative memory surface, so the
+    // same custody gate applies: enforcement can be live while a copied host
+    // still cannot open memory hands-free. Only usable custody yields
+    // `complete` (with the reboot-survival note); every other custody state
+    // routes to the exact recovery/unlock/diagnostic step.
+    return applyRung1CustodyCompletion(input, plan, [
+      "The full mechanical install is observed: wrap, boot service, content filter, and live enforcement.",
+      "Only an attended reboot drill proves boot survival on this specific machine.",
+    ]);
   }
   if (
     input.observed.cooperativeWrap === "unknown" ||

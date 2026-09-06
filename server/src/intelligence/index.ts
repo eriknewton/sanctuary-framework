@@ -18,14 +18,24 @@ export {
   type SelectorConfig,
 } from "./selector.js";
 
+// `IntelligenceConfigStore.quarantineUnreadable` travels with this export but
+// carries no consent gate of its own: any caller must repeat the CLI verb's
+// TTY, typed-word, and write-intent-unlock gates, and no MCP tool or HTTP
+// route may reach it. The structure test pins `cli/intelligence.ts` as the
+// only production call site.
 export {
   IntelligenceConfigStore,
+  IntelligenceConfigUnreadableError,
+  INTELLIGENCE_CONFIG_RESET_VERB,
   INTELLIGENCE_NAMESPACE,
   LocalIntegrityStateLoadError,
   Q5_CONFIG_SAVE_LOCK_FILE,
   SUBSTRATE_CONFIG_KEY,
+  SUBSTRATE_CONFIG_QUARANTINE_PREFIX,
   type IntelligenceConfigStoreOptions,
   type LoadOutcome,
+  type QuarantineOutcome,
+  type UnreadableConfigKind,
 } from "./policy-store.js";
 
 export {
@@ -55,6 +65,7 @@ export {
   MODEL_MANIFEST_MIN_PARAMS_B,
   MODEL_MANIFEST_RUNTIMES,
   MODEL_MANIFEST_TIERS,
+  PINNED_MODEL_CATALOG_ROOT_PUBLIC_KEY_B64URL,
   PINNED_MODEL_MANIFEST_SIGNING_PUBLIC_KEY_B64URL,
   buildModelManifestMessage,
   loadPinnedModelManifestKey,
@@ -107,6 +118,95 @@ export {
   type SignedOllamaIdentityV2,
   type VerifiedLocalBindingV2,
 } from "./model-manifest-v2.js";
+
+export {
+  PACKAGED_MODEL_MANIFEST_AUDIT_STAGE,
+  PACKAGED_MODEL_MANIFEST_REFUSAL_REASONS,
+  PACKAGED_MODEL_MANIFEST_V2_ASSET_RELATIVE_PATH,
+  PACKAGED_MODEL_MANIFEST_V2_ASSET_SHA256,
+  PACKAGED_MODEL_MANIFEST_V2_MAX_BYTES,
+  loadPackagedModelManifestV2,
+  mapModelManifestV2RefusalToAssetRefusal,
+  resolveModuleDir,
+  resolvePackagedModelManifestV2AssetPath,
+  type LoadPackagedModelManifestV2Options,
+  type PackagedModelManifestAuditEvent,
+  type PackagedModelManifestLoadResult,
+  type PackagedModelManifestRefusalReason,
+  type PackagedModelManifestSource,
+} from "./packaged-model-manifest.js";
+
+export {
+  ASSURANCES,
+  ASSURANCE_RANK,
+  CATALOG_INDEX_V1_DOMAIN,
+  CATALOG_SIGNING_BODY_MAX_BYTES,
+  CATALOG_SURFACE_ORDER,
+  CATALOG_V3_DOMAIN,
+  CATALOG_V3_ASSET_DIGEST_MANIFEST_SHA256,
+  COMPILED_SPDX_TABLE_SHA256,
+  COMPILED_CATALOG_KEY_POLICY_DIGEST,
+  COMPILED_CATALOG_KEYRING,
+  COMPILED_INDEX_CHECKPOINT,
+  COMPILED_SURFACE_ASSURANCE_FLOOR,
+  HARDWARE_TIERS,
+  MAX_CATALOG_ENTRIES,
+  MAX_CATALOG_WIRE_JSON_BYTES,
+  MAX_INDEX_SEGMENT_ENTRIES,
+  MAX_OVERLAY_ENTRIES,
+  MAX_SIGNED_VERSION,
+  OLLAMA_REGISTRY_V3,
+  OVERLAY_V1_DOMAIN,
+  SPDX_EXPRESSION_ABNF_SHA256,
+  SPDX_LICENSE_LIST_VERSION,
+  SIGNATURE_DOMAIN_DELIMITER,
+  SURFACE_DEFAULTS_V3,
+  TIER_TABLE_V3,
+  deriveCatalogKeyringSha256,
+  deriveOverlaySignerKeyId,
+  parseAssurance,
+  parseCatalogBodyV3,
+  parseCatalogIndexBodyV1,
+  parseCatalogJson,
+  parseModelId,
+  parseOverlayBodyV1,
+  parseSignedOllamaIdentityV3,
+  parseSpdxExpression,
+  parseSurfaceList,
+  parseUntrustedCatalogContinuityObservationV3,
+  parseUntrustedCatalogIndexContinuityObservationV1,
+  validateCatalogKeyring,
+  validateCatalogOverlayCombination,
+  verifyAndParseSignedCatalogIndexSegmentV1,
+  verifyAndParseSignedCatalogIndexJsonV1,
+  verifyAndParseSignedCatalogJsonV3,
+  verifyAndParseSignedCatalogV3,
+  verifyAndParseSignedOverlayJsonV1,
+  verifyAndParseSignedOverlayV1,
+  type Assurance,
+  type CatalogBodyV3,
+  type CatalogIndexBodyV1,
+  type CatalogIndexEntryV1,
+  type CatalogKeyEpoch,
+  type CatalogModelEntryV3,
+  type CatalogV3ParseResult,
+  type CatalogV3RefusalReason,
+  type CompiledIndexCheckpoint,
+  type HardwareTier,
+  type LicenseEvidenceV3,
+  type OverlayBodyV1,
+  type OverlayModelEntryV1,
+  type SignedCatalogIndexSegmentV1,
+  type SignedCatalogV3,
+  type SignedOllamaIdentityV3,
+  type SignedOverlayV1,
+  type SurfaceDefaultV3,
+  type SurfaceDefaultsV3,
+  type TierSpecV3,
+  type TierTableV3,
+  type UntrustedCatalogContinuityObservationV3,
+  type UntrustedCatalogIndexContinuityObservationV1,
+} from "./model-catalog-v3.js";
 
 export {
   LIGHT_RUNTIME_SINGLE_FLIGHT_MAX_ENTRIES,
@@ -212,10 +312,19 @@ export {
   LOCAL_CAPABILITY,
   type OllamaClientConfig,
   type OllamaMutationResult,
+  type OllamaPullOptions,
+  type OllamaPullProgress,
   type OllamaShowResult,
 } from "./substrates/local.js";
 
 export {
+  LOCAL_INTELLIGENCE_OPT_IN_HINT,
+  localProvisioningPreflight,
+  type LocalProvisioningPreflight,
+} from "./provisioning-consent.js";
+
+export {
+  ARMED_DIGEST_PREFIX_CHARS,
   MODEL_REGISTRY_PROVIDER_CATEGORY,
   LocalModelsRootResolutionError,
   Q5_PROVISIONING_LOCK_FILE,
@@ -223,6 +332,7 @@ export {
   runLocalIntelligenceProvisioning,
   type AtomicLocalProvisioningCommit,
   type LocalProvisioningAuditEvent,
+  type LocalModelsRootResolution,
   type LocalProvisioningOps,
   type LocalProvisioningRefusalReason,
   type LocalProvisioningResult,

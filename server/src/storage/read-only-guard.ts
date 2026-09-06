@@ -32,6 +32,10 @@ import type {
   StorageBackend,
   StorageEntryMeta,
 } from "./interface.js";
+import type {
+  CrossProcessLockLease,
+  CrossProcessLockOptions,
+} from "./cross-process-lock.js";
 
 /**
  * Thrown when code running behind a {@link ReadOnlyStorageGuard} attempts a
@@ -75,6 +79,7 @@ export const READ_ONLY_STORAGE_MUTATING_METHODS = [
   "writeDurable",
   "writeIfAbsent",
   "replaceIfEquals",
+  "withNamespaceLock",
 ] as const;
 
 /**
@@ -171,6 +176,19 @@ export class ReadOnlyStorageGuard
     _secureOverwrite?: boolean
   ): Promise<boolean> {
     throw new ReadOnlyStorageViolationError("delete", namespace, key);
+  }
+
+  async withNamespaceLock<T>(
+    namespace: string,
+    lockFileName: string,
+    _operation: (lease: CrossProcessLockLease) => Promise<T>,
+    _options?: CrossProcessLockOptions,
+  ): Promise<T> {
+    throw new ReadOnlyStorageViolationError(
+      "withNamespaceLock",
+      namespace,
+      lockFileName,
+    );
   }
 
   // ---- delegated ----

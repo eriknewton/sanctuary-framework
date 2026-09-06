@@ -13,6 +13,7 @@ import {
   resolveCastleWallSocketPath,
 } from "../castle-wall/runtime/socket-path.js";
 import { resolveSudoIdentityDecision } from "./auto-provision.js";
+import { stripTrailingSlashes } from "../strings.js";
 
 export type ProtectPreflightStatus = "PASS" | "FAIL" | "UNDETERMINED";
 
@@ -768,7 +769,7 @@ function resolvePreflightFortressPath(
   const override = env.SANCTUARY_STORAGE_PATH ?? env.SANCTUARY_FORTRESS_PATH;
   if (override !== undefined && override.length > 0) return resolvePath(override);
   if (operatorHome !== undefined && operatorHome.length > 0) {
-    return `${operatorHome.replace(/\/+$/, "")}/.sanctuary`;
+    return `${stripTrailingSlashes(operatorHome)}/.sanctuary`;
   }
   return undefined;
 }

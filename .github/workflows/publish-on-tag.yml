@@ -382,7 +382,9 @@ jobs:
       - name: Publish or verify already-published exact tarball
         run: |
           set -euo pipefail
-          tarball="release/sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz"
+          # Explicit relative path: npm reads a bare "name/file" argument as a GitHub
+          # owner/repo shorthand and tries a git fetch instead of publishing the file.
+          tarball="./release/sanctuary-framework-mcp-server-${RELEASE_VERSION}.tgz"
           package="@sanctuary-framework/mcp-server@${RELEASE_VERSION}"
           local_integrity=$(node -e "const fs=require('fs'),c=require('crypto'); process.stdout.write('sha512-'+c.createHash('sha512').update(fs.readFileSync(process.argv[1])).digest('base64'))" "$tarball")
           existing_integrity=$(npm view "$package" dist.integrity 2>/dev/null || true)

@@ -26,6 +26,8 @@ import {
 import {
   getOrCreateKeychainCustodyKey,
   readKeychainCustodyKey,
+  RecoveryKeyKeychainStoreError,
+  storeRecoveryKeyInKeychain,
 } from "../../src/wrap/keychain-custody.js";
 import { installInMemoryKeychainStore } from "../setup/keychain-fake.js";
 
@@ -45,6 +47,32 @@ const memoryFake: KeychainExec = async (cmd, args, input) => {
   }
   return { stdout: "", stderr: "unsupported", code: 1 };
 };
+
+function makeCustodyExec(options: {
+  writeFails?: boolean;
+  readBackOverride?: string;
+} = {}): KeychainExec {
+  let stored: string | undefined;
+  return async (cmd, args, input) => {
+    if (cmd !== "security") {
+      return { stdout: "", stderr: "unsupported", code: 1 };
+    }
+    if (args[0] === "-i") {
+      if (options.writeFails) {
+        return { stdout: "", stderr: "write failed", code: 1 };
+      }
+      stored = /-w "([A-Za-z0-9_-]+)"/.exec(input ?? "")?.[1];
+      return { stdout: "", stderr: "", code: stored === undefined ? 1 : 0 };
+    }
+    if (args[0] === "find-generic-password") {
+      const value = stored === undefined ? undefined : (options.readBackOverride ?? stored);
+      return value === undefined
+        ? { stdout: "", stderr: "not found", code: 44 }
+        : { stdout: `${value}\n`, stderr: "", code: 0 };
+    }
+    return { stdout: "", stderr: "unsupported", code: 1 };
+  };
+}
 
 afterEach(() => {
   memoryStore.clear();
@@ -117,14 +145,128 @@ describe("the default in-memory store serves a real custody round-trip", () => {
       "/tmp/sanctuary-keychain-exec-test",
       { home: "/tmp/sanctuary-keychain-exec-home", platformOverride: "darwin" }
     );
-    expect(created).not.toBeNull();
+    let readBack: Uint8Array | null = null;
+    try {
+      expect(created).not.toBeNull();
+      readBack = await readKeychainCustodyKey(
+        "/tmp/sanctuary-keychain-exec-test",
+        { home: "/tmp/sanctuary-keychain-exec-home", platformOverride: "darwin" }
+      );
+      expect(readBack).not.toBeNull();
+      expect(Array.from(readBack!)).toEqual(Array.from(created!));
+    } finally {
+      // Both public reads transfer ownership to this test.
+      created?.fill(0);
+      readBack?.fill(0);
+    }
+  });
+});
 
-    const readBack = await readKeychainCustodyKey(
-      "/tmp/sanctuary-keychain-exec-test",
-      { home: "/tmp/sanctuary-keychain-exec-home", platformOverride: "darwin" }
-    );
-    expect(readBack).not.toBeNull();
-    expect(Array.from(readBack!)).toEqual(Array.from(created!));
+describe("keychain custody secret-buffer ownership", () => {
+  const storagePath = "/tmp/sanctuary-keychain-zeroization";
+  const baseOptions = {
+    home: "/tmp/sanctuary-keychain-zeroization-home",
+    platformOverride: "darwin" as const,
+  };
+
+  it("scrubs a generated custody key when the keychain write fails", async () => {
+    let generated: Uint8Array | undefined;
+    const result = await getOrCreateKeychainCustodyKey(storagePath, {
+      ...baseOptions,
+      exec: makeCustodyExec({ writeFails: true }),
+      __testObserveSecretBuffer: (label, buffer) => {
+        if (label === "generated-custody-key") generated = buffer;
+      },
+    });
+
+    expect(result).toBeNull();
+    expect(generated).toBeDefined();
+    expect([...generated!].every((byte) => byte === 0)).toBe(true);
+  });
+
+  it("scrubs both generated and decoded copies after a mismatched custody readback", async () => {
+    const observed = new Map<string, Uint8Array>();
+    const mismatch = Buffer.alloc(32, 0xa5).toString("base64url");
+    const result = await getOrCreateKeychainCustodyKey(storagePath, {
+      ...baseOptions,
+      exec: makeCustodyExec({ readBackOverride: mismatch }),
+      __testObserveSecretBuffer: (label, buffer) => observed.set(label, buffer),
+    });
+
+    expect(result).toBeNull();
+    expect([...observed.keys()]).toEqual([
+      "generated-custody-key",
+      "custody-key-readback",
+    ]);
+    for (const buffer of observed.values()) {
+      expect([...buffer].every((byte) => byte === 0)).toBe(true);
+    }
+  });
+
+  it("transfers only the generated custody key and scrubs the successful readback copy", async () => {
+    const observed = new Map<string, Uint8Array>();
+    const result = await getOrCreateKeychainCustodyKey(storagePath, {
+      ...baseOptions,
+      exec: makeCustodyExec(),
+      __testObserveSecretBuffer: (label, buffer) => observed.set(label, buffer),
+    });
+
+    try {
+      expect(result).not.toBeNull();
+      expect(result).toBe(observed.get("generated-custody-key"));
+      expect([...result!].some((byte) => byte !== 0)).toBe(true);
+      const readBack = observed.get("custody-key-readback");
+      expect(readBack).toBeDefined();
+      expect([...readBack!].every((byte) => byte === 0)).toBe(true);
+    } finally {
+      result?.fill(0);
+    }
+  });
+
+  it("always scrubs decoded recovery material and its success or mismatch readback", async () => {
+    const recoveryKey = Buffer.alloc(32, 0x5c).toString("base64url");
+    for (const mismatch of [false, true]) {
+      const observed = new Map<string, Uint8Array>();
+      const exec = makeCustodyExec(
+        mismatch
+          ? { readBackOverride: Buffer.alloc(32, 0xa6).toString("base64url") }
+          : {},
+      );
+      const operation = storeRecoveryKeyInKeychain(storagePath, recoveryKey, {
+        ...baseOptions,
+        exec,
+        __testObserveSecretBuffer: (label, buffer) => observed.set(label, buffer),
+      });
+
+      if (mismatch) {
+        await expect(operation).rejects.toBeInstanceOf(RecoveryKeyKeychainStoreError);
+      } else {
+        await expect(operation).resolves.toMatchObject({ service: expect.any(String) });
+      }
+      expect([...observed.keys()]).toEqual([
+        "decoded-recovery-key",
+        "recovery-key-readback",
+      ]);
+      for (const buffer of observed.values()) {
+        expect([...buffer].every((byte) => byte === 0)).toBe(true);
+      }
+    }
+  });
+
+  it("scrubs decoded recovery material when the keychain write fails", async () => {
+    const recoveryKey = Buffer.alloc(32, 0x6d).toString("base64url");
+    let decoded: Uint8Array | undefined;
+    const operation = storeRecoveryKeyInKeychain(storagePath, recoveryKey, {
+      ...baseOptions,
+      exec: makeCustodyExec({ writeFails: true }),
+      __testObserveSecretBuffer: (label, buffer) => {
+        if (label === "decoded-recovery-key") decoded = buffer;
+      },
+    });
+
+    await expect(operation).rejects.toBeInstanceOf(RecoveryKeyKeychainStoreError);
+    expect(decoded).toBeDefined();
+    expect([...decoded!].every((byte) => byte === 0)).toBe(true);
   });
 });
 
@@ -265,15 +407,67 @@ describe("nothing else in the tree spawns a credential CLI", () => {
     });
   }
 
-  /**
-   * Reaching a subprocess at all requires pulling in `node:child_process`.
-   * Matching on that import rather than on a bare `exec(` call is what keeps
-   * this precise: `keychain-custody.ts`, `passphrase.ts`, and
-   * `cli/reset-passphrase.ts` all CALL something named `exec`, but it is the
-   * injected executor that ends at the chokepoint, and flagging them would have
-   * made this test noise everyone learns to edit around.
-   */
-  const IMPORTS_CHILD_PROCESS = /(?:from|import|require)\s*\(?\s*["']node:child_process["']/;
+  const CHILD_PROCESS_EXECUTORS = new Set([
+    "spawn",
+    "spawnSync",
+    "exec",
+    "execSync",
+    "execFile",
+    "execFileSync",
+  ]);
+
+  function directlySpawnsCredentialBinary(source: string, file: string): boolean {
+    const parsed = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
+    const directBindings = new Set<string>();
+    const namespaces = new Set<string>();
+
+    for (const statement of parsed.statements) {
+      if (!ts.isImportDeclaration(statement)) continue;
+      if (!ts.isStringLiteral(statement.moduleSpecifier)) continue;
+      if (statement.moduleSpecifier.text !== "node:child_process") continue;
+      const clause = statement.importClause;
+      if (!clause?.namedBindings) continue;
+      if (ts.isNamespaceImport(clause.namedBindings)) {
+        namespaces.add(clause.namedBindings.name.text);
+        continue;
+      }
+      for (const binding of clause.namedBindings.elements) {
+        const imported = binding.propertyName?.text ?? binding.name.text;
+        if (CHILD_PROCESS_EXECUTORS.has(imported)) {
+          directBindings.add(binding.name.text);
+        }
+      }
+    }
+
+    let found = false;
+    const visit = (node: ts.Node): void => {
+      if (found) return;
+      if (ts.isCallExpression(node)) {
+        const callee = node.expression;
+        const isChildProcessCall =
+          (ts.isIdentifier(callee) && directBindings.has(callee.text)) ||
+          (ts.isPropertyAccessExpression(callee) &&
+            ts.isIdentifier(callee.expression) &&
+            namespaces.has(callee.expression.text) &&
+            CHILD_PROCESS_EXECUTORS.has(callee.name.text));
+        const target = node.arguments[0];
+        if (
+          isChildProcessCall &&
+          target &&
+          (ts.isStringLiteral(target) || ts.isNoSubstitutionTemplateLiteral(target)) &&
+          CREDENTIAL_BINARIES.some((bin) =>
+            target.text === bin || target.text === `/usr/bin/${bin}`
+          )
+        ) {
+          found = true;
+          return;
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(parsed);
+    return found;
+  }
 
   it("no module outside the chokepoint spawns `security` or `secret-tool`", () => {
     const offenders: string[] = [];
@@ -281,14 +475,13 @@ describe("nothing else in the tree spawns a credential CLI", () => {
       const relative = file.slice(srcRoot.length + 1);
       if (ALLOWED.includes(relative)) continue;
       const source = readFileSync(file, "utf8");
-      if (!IMPORTS_CHILD_PROCESS.test(source)) continue;
-      // A module may spawn plenty of other things (git, launchctl, pfctl);
-      // only naming a credential binary in the same file is a bypass.
-      if (
-        CREDENTIAL_BINARIES.some((bin) =>
-          new RegExp(`["'\`](?:/usr/bin/)?${bin}["'\`]`).test(source)
-        )
-      ) {
+      // A module may spawn plenty of other things (git, launchctl, a Node
+      // wipe worker) and separately name a credential CLI for an injected
+      // executor. Flag the dangerous operation itself: a child-process API
+      // whose target is the credential binary. Aliased and namespace imports
+      // are both resolved so moving the bypass behind an import rename does
+      // not evade the gate.
+      if (directlySpawnsCredentialBinary(source, relative)) {
         offenders.push(relative);
       }
     }
@@ -552,6 +745,118 @@ describe("no code path in server/test can reach the real credential binary", () 
   );
 });
 
+describe("the production credential subprocess is bounded", () => {
+  async function runBoundedSpawnProbe(
+    helperScript: string,
+    extraProbeLines: string[] = [],
+  ): Promise<{ stdout: string; stderr: string; status: number | null }> {
+    const { spawnSync: spawnChild } = await import("node:child_process");
+    const serverDir = fileURLToPath(new URL("../..", import.meta.url));
+    const probeDir = mkdtempSync(join(tmpdir(), "sanctuary-keychain-bound-"));
+    try {
+      let source = readFileSync(
+        join(serverDir, "src", "wrap", "keychain-exec.ts"),
+        "utf8",
+      );
+      source = source
+        .replace(
+          "const KEYCHAIN_PROCESS_TIMEOUT_MS = 15_000;",
+          "const KEYCHAIN_PROCESS_TIMEOUT_MS = 500;",
+        )
+        .replace(
+          "const KEYCHAIN_PROCESS_MAX_OUTPUT_BYTES = 64 * 1024;",
+          "const KEYCHAIN_PROCESS_MAX_OUTPUT_BYTES = 1024;",
+        )
+        .replace(
+          "const KEYCHAIN_PROCESS_TERM_GRACE_MS = 250;",
+          "const KEYCHAIN_PROCESS_TERM_GRACE_MS = 100;",
+        );
+      writeFileSync(join(probeDir, "keychain-exec.ts"), source);
+      writeFileSync(
+        join(probeDir, "exec-result.ts"),
+        readFileSync(join(serverDir, "src", "wrap", "exec-result.ts"), "utf8"),
+      );
+      writeFileSync(
+        join(probeDir, "package.json"),
+        JSON.stringify({ name: "bounded-keychain-probe", type: "module", private: true }),
+      );
+      writeFileSync(
+        join(probeDir, "probe.ts"),
+        [
+          'import { execKeychain } from "./keychain-exec.js";',
+          "let message = '';",
+          "try {",
+          `  await execKeychain(process.execPath, ["-e", ${JSON.stringify(helperScript)}]);`,
+          "  message = 'RESOLVED';",
+          "} catch (error) {",
+          "  message = (error as Error).message;",
+          "}",
+          ...extraProbeLines,
+          'process.stdout.write(message);',
+          "",
+        ].join("\n"),
+      );
+      const result = spawnChild(
+        process.execPath,
+        ["--import", "tsx", join(probeDir, "probe.ts")],
+        { env: {}, cwd: serverDir, encoding: "utf8", timeout: 10_000 },
+      );
+      return {
+        stdout: result.stdout ?? "",
+        stderr: result.stderr ?? "",
+        status: result.status,
+      };
+    } finally {
+      rmSync(probeDir, { recursive: true, force: true });
+    }
+  }
+
+  it("rejects output exhaustion before retaining unbounded helper output", async () => {
+    const result = await runBoundedSpawnProbe(
+      'process.stdout.write("x".repeat(4096)); setTimeout(() => process.exit(0), 3000);',
+    );
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe("credential helper exceeded output limit");
+    expect(result.stdout).not.toContain("xxxx");
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "times out and TERM-to-KILLs the helper process group",
+    async () => {
+    const pidFile = join(tmpdir(), `sanctuary-keychain-child-${process.pid}-${Date.now()}.pid`);
+    const descendant =
+      'process.on("SIGTERM", () => {}); setTimeout(() => process.exit(0), 3000);';
+    const helper = [
+      'const { spawn } = require("node:child_process");',
+      'const { writeFileSync } = require("node:fs");',
+      `const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], { stdio: "ignore" });`,
+      `writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+      'process.on("SIGTERM", () => {});',
+      'setTimeout(() => process.exit(0), 3000);',
+    ].join("\n");
+    const result = await runBoundedSpawnProbe(helper, [
+      'await new Promise((resolve) => setTimeout(resolve, 750));',
+      `const { readFileSync } = await import("node:fs");`,
+      `const descendantPid = Number(readFileSync(${JSON.stringify(pidFile)}, "utf8"));`,
+      "let descendantGone = false;",
+      "try { process.kill(descendantPid, 0); } catch { descendantGone = true; }",
+      "message += descendantGone ? ':group-gone' : ':descendant-alive';",
+    ]);
+    if (existsSync(pidFile)) {
+      const remainingPid = Number(readFileSync(pidFile, "utf8"));
+      try {
+        process.kill(remainingPid, "SIGKILL");
+      } catch {
+        // Expected: the production helper already killed the whole group.
+      }
+    }
+    rmSync(pidFile, { force: true });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe("credential helper timed out:group-gone");
+    },
+  );
+});
+
 describe("no test may spawn a child with a scrubbed environment", () => {
   /**
    * The one pattern that reopens the credential hole, refused at the authoring
@@ -719,7 +1024,7 @@ describe("no test may spawn a child with a scrubbed environment", () => {
   }
 
   /**
-   * This file is the exception, and it has to be: the two isolated probes above
+   * This file is the exception, and it has to be: the isolated probes above
    * spawn with `env: {}` ON PURPOSE, because that is the condition being proven
    * safe. They run against a copied module in a temp package, never the suite's
    * own marker.

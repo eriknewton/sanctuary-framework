@@ -13,7 +13,7 @@
  * degrade, there is nothing there to have the wrong permissions.
  */
 
-import { readdir, stat, chmod } from "node:fs/promises";
+import { readdir, lstat, chmod } from "node:fs/promises";
 import { join } from "node:path";
 
 /**
@@ -51,7 +51,10 @@ export async function tightenStoragePermissions(root: string): Promise<void> {
 async function tightenEntry(path: string): Promise<void> {
   let info;
   try {
-    info = await stat(path);
+    // Never follow an operator-controlled symlink while recursively tightening:
+    // chmod/stat traversal through a preserved forensic quarantine could mutate
+    // an unrelated tree outside the fortress.
+    info = await lstat(path);
   } catch (err) {
     // ENOENT only: entry doesn't exist (first run) or vanished mid-walk.
     // A stat failure that is NOT ENOENT (EACCES on an unreadable ancestor,
@@ -60,6 +63,9 @@ async function tightenEntry(path: string): Promise<void> {
     throw err;
   }
 
+  if (info.isSymbolicLink()) {
+    return;
+  }
   if (info.isDirectory()) {
     const current = info.mode & 0o777;
     if (current !== 0o700) {

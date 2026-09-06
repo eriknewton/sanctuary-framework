@@ -20,7 +20,16 @@ full-profile planner from the CLI runtime sealed inside that app:
 
 The planner and the Hermes MCP configuration both continue to use that absolute
 signed launcher. It clears Node preload/search overrides before entering the
-app-sealed runtime and does not require a separate Node/npm installation. For
+app-sealed runtime and does not require a separate Node/npm installation. The
+sealed runtime is staged to carry the complete built CLI: every compiled entry
+point (including the storage worker that fortress creation starts), the agent
+templates, the first-party reference plugins, the catalog schemas, and the
+production dependency closure. The build's contents gate verifies that set
+before the app is signed, and `sanctuary install` verifies it again against the
+app's runtime manifest before planning; an app whose runtime is incomplete
+reads as a mismatch with the remedy of replacing the app. Fortress creation
+from the signed app on a Mac with no Node of its own is confirmed per release
+on the exact released artifact. For
 profiles without a verified signed app, an absent package manager is reported
 as `blocked`; the agent must not invent a download or installer outside the
 returned action contract.
@@ -73,6 +82,35 @@ already has custody material (including a user-supplied encrypted fallback), the
 planner may return the ordinary single-shot agent action. Its `on_nonzero`
 transition still names the exact private-local-Terminal action; a failed agent
 attempt is never retried automatically.
+
+## Rung 1 memory onboarding
+
+For the fresh-host and second-machine walkthrough (first-use proof with the MCP
+tools, restart persistence, portability, archive transfer, the exact-fortress
+unwrap, recovery-key rekey, and `restore-attest`), see
+[Rung 1: fresh-host sovereign-memory onboarding](rung1-fresh-host.md).
+On a copied host or after a lost passphrase, guide the operator first to the
+private recovery-key rekey in that document. Never recommend nuke while a
+human-held recovery key (or configured share/guardian recovery) can preserve
+the fortress.
+
+The planner reports three ambient-env-blind daily-UX observations for the memory
+surface. Credential/envelope inspection is read-only; the separate lock-capability
+check uses a short-lived private runtime socket and refuses known shared/network
+filesystems. `custody_access`
+(`usable`, `absent`, `locked`, `mismatch`, `missing`, `unavailable`, or `unknown`)
+reports whether this host opens the fortress from its exact-fortress stored
+credential with no secret typed; `custody_mutation` (`available`, `unavailable`,
+or `unknown`) independently reports whether the reviewed process-owned mutation
+lock is usable; `recovery_factor` (`present`, `absent`, or `unknown`) reports a
+MAC-authenticated, operator-verified human-held recovery-key wrap. The planner
+reports `complete` only when access is `usable` and mutation is `available`.
+It then adds a
+`restart_and_verify_rung1` human action: restart the host and confirm memory
+survives via `memory_insert`, `memory_search`, and `memory_get` (which proves
+exact content: it decrypts and re-verifies the stored content hash, not signer
+data) with no ambient credential env. Verified provenance and signer fields come
+from `sdw_memory_provenance`, not `memory_get`.
 
 ## Profiles
 

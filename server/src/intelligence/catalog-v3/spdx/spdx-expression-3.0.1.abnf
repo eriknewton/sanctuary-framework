@@ -1,0 +1,26 @@
+; Sanctuary SPDX expression profile v1, based on SPDX 3.0.1 identifiers.
+; This is intentionally narrower than the complete SPDX 3.0.1 expression
+; grammar: binary operators require horizontal whitespace on both sides,
+; operator spelling is all-uppercase or all-lowercase, and special identifiers
+; such as NONE and NOASSERTION are outside this catalog admission profile.
+; Active SPDX 3.28 license and exception identifiers are matched
+; ASCII-case-insensitively and emitted with their list-canonical spelling;
+; deprecated identifiers are rejected. DocumentRef-/LicenseRef-/AdditionRef-
+; prefixes are case-sensitive, while their idstring suffixes are emitted in
+; lowercase. A signed catalog must already equal that canonical output.
+; The profile is Sanctuary-authored Apache-2.0 material, not an upstream SPDX
+; specification asset. See THIRD_PARTY_NOTICES.md for the list-data provenance.
+
+idstring             = 1*( ALPHA / DIGIT / "-" / "." )
+license-id           = <active short identifier in the pinned SPDX 3.28 License List>
+license-exception-id = <active short exception identifier in the pinned SPDX 3.28 License List>
+license-ref          = [ %s"DocumentRef-" idstring ":" ] %s"LicenseRef-" idstring
+addition-ref         = [ %s"DocumentRef-" idstring ":" ] %s"AdditionRef-" idstring
+simple-expression    = license-id / license-id "+" / license-ref
+addition-expression  = license-exception-id / addition-ref
+compound-expression  = simple-expression /
+                       simple-expression 1*WSP ( %s"WITH" / %s"with" ) 1*WSP addition-expression /
+                       compound-expression 1*WSP ( %s"AND" / %s"and" ) 1*WSP compound-expression /
+                       compound-expression 1*WSP ( %s"OR" / %s"or" ) 1*WSP compound-expression /
+                       "(" compound-expression ")"
+license-expression   = simple-expression / compound-expression

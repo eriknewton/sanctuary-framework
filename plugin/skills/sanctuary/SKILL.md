@@ -60,6 +60,29 @@ Then run `sanctuary/sovereignty_audit` to see your protection posture with OpenC
 
 Run `sanctuary/sovereignty_audit` to get a scored report (0-100) across all layers, with specific gaps identified and recommended next steps. Detects OpenClaw configurations including `requireApproval` hooks, sandbox policies, plaintext memory, and exposed `.env` files.
 
+### Sovereign memory (Rung 1)
+
+| Tool | Purpose |
+|------|---------|
+| `sanctuary/memory_insert` | Store a memory record in the encrypted vault (Tier-1, human-approved). |
+| `sanctuary/memory_search` | Find records by content. |
+| `sanctuary/memory_get` | Read a record back byte-faithfully (decrypts and re-verifies the stored content hash; proves exact content, not signer data). |
+| `sanctuary/sdw_memory_provenance` | Prove verified provenance for a record: per-writer signing status and the fortress-recorded origin/admission bindings. |
+
+First-use proof and restart persistence run through these existing
+policy-enforcing tools, never a parallel CLI: `memory_insert` → `memory_search`
+→ `memory_get` (proves exact content), then `sdw_memory_provenance` to confirm
+the record's verified provenance. On a
+second host the fortress opens from that host's exact-fortress stored credential
+with no secret typed. See [Rung 1: fresh-host onboarding](../../../docs/rung1-fresh-host.md).
+
+For a copied fortress with no local stored credential, or a lost passphrase,
+lead with the private hidden-prompt recovery path:
+`sanctuary reset-passphrase --mode recovery-key --fortress <path>`. It preserves
+the master, identities, audit history, and memory. Never recommend nuke while a
+human-held recovery key or another configured recovery factor can work; nuke is
+the destructive last resort.
+
 Example output:
 ```
 ═══════════════════════════════════════════════
@@ -207,4 +230,4 @@ Beneath the cooperative surface, the Castle Wall enforces egress policy at the o
 
 User state under `~/.sanctuary/state/` is encrypted with AES-256-GCM. Keys are derived via Argon2id. Integrity is verified via Merkle trees. Identity is Ed25519 with key rotation support. Operator policy and harness backup configs can be plaintext, so plaintext claims must stay scoped to user state.
 
-80+ MCP tools. Three approval channels (stderr, dashboard, webhook). Concordia bridge. Protection-posture audit. Context gating. Apache 2.0. Published as `@sanctuary-framework/mcp-server` on npm (current stable v1.7.2).
+80+ MCP tools. Three approval channels (stderr, dashboard, webhook). Concordia bridge. Protection-posture audit. Context gating. Apache 2.0. Package version v1.8.4 is in preparation. The current published stable version is v1.8.0 on npm as `@sanctuary-framework/mcp-server`.

@@ -19,11 +19,28 @@ CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=true
 
+# Custody kernel-lock root for any Sanctuary process in this service context.
+# The TypeScript custody lock (server/src/storage/cross-process-lock.ts, function
+# resolveCustodyLockRoot) honors SANCTUARY_CUSTODY_LOCK_ROOT as its
+# highest-precedence root, so a process launched here uses this per-service
+# runtime path and never falls back to world-writable /tmp. The Rust
+# castle-wall-daemon itself uses a SEPARATE control socket under its own
+# runtime_dir (see src/config.rs `filter.sock`) and does not consume this var;
+# it is provisioned here for a co-located Node custody-lock consumer. Failure
+# mode: if /run/sanctuary/locks is created group/other-writable or foreign-owned,
+# the lock's own startup owner/mode check fails closed rather than trusting it.
+Environment=SANCTUARY_CUSTODY_LOCK_ROOT=/run/sanctuary/locks
+
 # Filesystem hardening.
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/run/sanctuary /var/lib/sanctuary
+# Install the custody lock root root:sanctuary 0700 before the daemon starts.
+# `+` runs it as root outside the service sandbox; /run/sanctuary is in
+# ReadWritePaths so the create is permitted. Idempotent: `install -d` is a no-op
+# when the directory already exists with the requested owner/mode.
+ExecStartPre=+/usr/bin/install -d -o root -g sanctuary -m 0700 /run/sanctuary/locks
 
 # Process isolation.
 PrivateDevices=true
