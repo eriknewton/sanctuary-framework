@@ -32,6 +32,7 @@ import type {
   SummarizeRequest,
 } from "../types.js";
 import { LOCAL_MODEL_TAGS } from "../types.js";
+import { stripTrailingSlashes } from "../../strings.js";
 
 export const LOCAL_CAPABILITY: SubstrateCapability = {
   summarize: true,
@@ -40,14 +41,91 @@ export const LOCAL_CAPABILITY: SubstrateCapability = {
 };
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+// Generation uses a separate, configurable ceiling so callers can set a
+// tighter budget for tests without affecting the default 120 s production
+// budget. Show keeps DEFAULT_TIMEOUT_MS; model listing keeps its 1.5 s probe budget.
+const GENERATION_TIMEOUT_MS = 120_000;
 const HARDWARE_PROBE_TIMEOUT_MS = 1_500;
+
+// A model pull moves gigabytes, so it is bounded by evidence of progress plus a
+// generous absolute ceiling, never by the per-invocation request timeout above:
+// a fixed wall clock aborts a healthy multi-gigabyte download mid-transfer and
+// leaves partial blobs behind.
+// 120_000 ms = 120 s x 1000 ms/s. Ollama emits a progress line several times a
+// second while a layer moves and recovers a stalled registry connection well
+// inside two minutes, so a longer silence means the transfer has stopped.
+const PULL_INACTIVITY_TIMEOUT_MS = 120_000;
+// 14_400_000 ms = 4 h x 60 min/h x 60 s/min x 1000 ms/s. The largest
+// signed-catalog model is on the order of 6 GB; at 0.5 MB/s (a 4 Mbit/s link)
+// that is about 3.4 h, so the ceiling clears the slowest link this ceremony is
+// meant to serve while still bounding a runtime that streams without ever
+// finishing.
+const PULL_ABSOLUTE_CEILING_MS = 4 * 60 * 60 * 1_000;
+// 65_536 bytes = 64 x 1024. An Ollama NDJSON status line is roughly 200 bytes;
+// the cap sits two orders of magnitude above that, so no legitimate line is
+// clipped, while a runtime that never emits a newline cannot grow the pending
+// buffer without bound.
+const PULL_PROGRESS_LINE_MAX_BYTES = 64 * 1024;
+// 67_108_864 bytes = 64 x 1024 x 1024, roughly 335_000 of the ~200-byte lines
+// above: far more than a full-ceiling pull produces, so the whole stream stays
+// bounded even when every individual line is well formed.
+const PULL_RESPONSE_MAX_BYTES = 64 * 1024 * 1024;
+// 1_048_576 bytes = 16 x PULL_PROGRESS_LINE_MAX_BYTES: room for one
+// maximum-length partial line plus the burst of complete ~200-byte lines a
+// single transport read can deliver (about 5_000 of them). Checked BEFORE a
+// chunk is decoded, so a runtime that sends one enormous chunk is refused
+// without it ever being buffered as a string.
+const PULL_PENDING_BUFFER_MAX_BYTES = 16 * PULL_PROGRESS_LINE_MAX_BYTES;
+// 8_192 bytes = 8 x 1024. An error body is read only to classify the failure
+// (`classifyHttpError` looks for a model-not-found phrase), so it is truncated
+// well below the line cap and read under ONE cumulative deadline (see
+// `readBoundedText`): both the byte cap and that single deadline are needed, and
+// either alone leaves a runtime able to hold the pull, and therefore the
+// provisioning lock, open.
+const PULL_ERROR_BODY_MAX_BYTES = 8 * 1024;
+
+const PULL_LINE_ENCODER = new TextEncoder();
 
 export interface OllamaClientConfig {
   endpoint: string;
-  /** Per-invocation timeout in ms; defaults to 30s. */
+  /** Per-invocation timeout in ms for show; defaults to 30 s. Never bounds `pull`. */
   timeoutMs?: number;
+  /**
+   * Generation timeout in ms. When omitted, falls back to `timeoutMs` and
+   * then to `GENERATION_TIMEOUT_MS` (120 s), preserving the legacy behaviour
+   * where a caller that only sets `timeoutMs` has it apply to generation too.
+   */
+  generateTimeoutMs?: number;
+  /**
+   * Silence (no NDJSON progress line) that ends a streaming pull; defaults to
+   * `PULL_INACTIVITY_TIMEOUT_MS`.
+   */
+  pullInactivityTimeoutMs?: number;
+  /** Absolute ceiling for one streaming pull; defaults to `PULL_ABSOLUTE_CEILING_MS`. */
+  pullCeilingMs?: number;
   /** Optional fetch implementation override for tests. */
   fetchImpl?: typeof fetch;
+}
+
+/**
+ * One NDJSON line from `POST /api/pull`. Ollama reports a coarse `status`
+ * (`pulling manifest`, `pulling <digest>`, `verifying sha256 digest`,
+ * `success`) plus byte counters while a layer downloads.
+ */
+export interface OllamaPullProgress {
+  status: string;
+  digest?: string;
+  total?: number;
+  completed?: number;
+}
+
+export interface OllamaPullOptions {
+  /**
+   * Invoked once per NDJSON line, including the terminal `success` line, so a
+   * caller can report movement on its own operator channel. A throw from this
+   * callback is the caller's defect and is never allowed to abort the pull.
+   */
+  onProgress?: (progress: OllamaPullProgress) => void;
 }
 
 export interface OllamaTagsResponse {
@@ -76,12 +154,31 @@ const SHA256_DIGEST = /^(?:sha256:)?([0-9a-f]{64})$/;
 export class OllamaClient {
   private endpoint: string;
   private timeoutMs: number;
+  private generateTimeoutMs: number;
+  private pullInactivityTimeoutMs: number;
+  private pullCeilingMs: number;
   private fetchImpl: typeof fetch;
 
   constructor(config: OllamaClientConfig) {
-    this.endpoint = config.endpoint.replace(/\/+$/, "");
+    this.endpoint = stripTrailingSlashes(config.endpoint);
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    // Precedence: explicit generateTimeoutMs > legacy timeoutMs > module default.
+    // A caller that already set timeoutMs (e.g. in tests) retains that ceiling
+    // for generation rather than silently jumping to 120 s.
+    this.generateTimeoutMs = config.generateTimeoutMs ?? config.timeoutMs ?? GENERATION_TIMEOUT_MS;
+    this.pullInactivityTimeoutMs = config.pullInactivityTimeoutMs ??
+      PULL_INACTIVITY_TIMEOUT_MS;
+    this.pullCeilingMs = config.pullCeilingMs ?? PULL_ABSOLUTE_CEILING_MS;
     this.fetchImpl = config.fetchImpl ?? fetch;
+    // A non-positive or non-finite pull bound would disable the deadline that
+    // keeps a stalled pull from hanging the ceremony forever; refuse the client
+    // rather than run one unbounded.
+    if (!Number.isFinite(this.pullInactivityTimeoutMs) || this.pullInactivityTimeoutMs <= 0) {
+      throw new Error("Ollama pull inactivity timeout must be positive");
+    }
+    if (!Number.isFinite(this.pullCeilingMs) || this.pullCeilingMs <= 0) {
+      throw new Error("Ollama pull ceiling must be positive");
+    }
   }
 
   /**
@@ -109,11 +206,181 @@ export class OllamaClient {
   }
 
   /**
-   * Pull one manifest-approved runtime tag. `stream:false` bounds the response
-   * to one JSON object; callers still verify `/api/show` before trusting it.
+   * Pull one manifest-approved runtime tag.
+   *
+   * `stream:true` is what makes a multi-gigabyte download completable: the
+   * request is bounded by silence between NDJSON progress lines and by an
+   * absolute ceiling, never by `timeoutMs`, which a healthy pull exceeds by
+   * orders of magnitude. The pull counts as done only when the runtime's own
+   * final line says `success`; an inline `error` line, a stream that ends
+   * without that line, a line or response past the reviewed byte caps, and a
+   * deadline are all refusals, because a half-finished download that reported
+   * "ok" would carry a partial blob into the digest check. Callers still verify
+   * `/api/show` against the signed manifest before trusting the result.
    */
-  async pull(model: string): Promise<OllamaMutationResult> {
-    return this.runMutation("/api/pull", { model, stream: false });
+  async pull(
+    model: string,
+    options: OllamaPullOptions = {},
+  ): Promise<OllamaMutationResult> {
+    const ctl = new AbortController();
+    const startedAt = Date.now();
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    try {
+      const res = await raceDeadline(
+        this.fetchImpl(`${this.endpoint}/api/pull`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model, stream: true }),
+          signal: ctl.signal,
+        }),
+        this.pullInactivityTimeoutMs,
+      );
+      if (!res.ok) {
+        // `res.text()` would await a body the runtime controls and may never
+        // end, holding this pull -- and the provisioning lock it runs under --
+        // open indefinitely. The classifying snippet is read through the same
+        // bounded reader as the stream: byte cap, inactivity deadline, and the
+        // abort/cancel in the finally below.
+        reader = res.body === null ? null : res.body.getReader();
+        const snippet = reader === null
+          ? ""
+          : await readBoundedText(
+            reader,
+            PULL_ERROR_BODY_MAX_BYTES,
+            this.pullInactivityTimeoutMs,
+          );
+        return { ok: false, failureClass: classifyHttpError(res.status, snippet) };
+      }
+      if (res.body === null) {
+        // Without a body there can be no terminal `success` line, so there is no
+        // evidence the model landed; never report an unwitnessed pull as done.
+        return { ok: false, failureClass: "substrate_unavailable" };
+      }
+      reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let pending = "";
+      // Tracked incrementally rather than recomputed from `pending` each chunk:
+      // re-encoding the residual on every read is quadratic under a byte-at-a-
+      // time drip, which is exactly the schedule an adversarial runtime picks.
+      // A multibyte sequence split across chunks is counted before the decoder
+      // emits it, so this over-counts by at most 3 bytes until that sequence
+      // completes, which can only make a cap fire marginally early.
+      let pendingBytes = 0;
+      let responseBytes = 0;
+      let lastProgressAt = Date.now();
+      for (;;) {
+        const now = Date.now();
+        const budgetMs = Math.min(
+          this.pullCeilingMs - (now - startedAt),
+          this.pullInactivityTimeoutMs - (now - lastProgressAt),
+        );
+        if (budgetMs <= 0) return { ok: false, failureClass: "substrate_timeout" };
+        const chunk = await raceDeadline(reader.read(), budgetMs);
+        if (chunk.done) break;
+        // Both caps are checked BEFORE the chunk is decoded or appended, so an
+        // over-cap stream is refused without ever being buffered as a string.
+        // A stream past either reviewed bound is a runtime not speaking the
+        // protocol this client reviewed; refuse instead of reading on.
+        responseBytes += chunk.value.byteLength;
+        if (responseBytes > PULL_RESPONSE_MAX_BYTES) {
+          return { ok: false, failureClass: "substrate_misconfigured" };
+        }
+        if (pendingBytes + chunk.value.byteLength > PULL_PENDING_BUFFER_MAX_BYTES) {
+          return { ok: false, failureClass: "substrate_misconfigured" };
+        }
+        pending += decoder.decode(chunk.value, { stream: true });
+        pendingBytes += chunk.value.byteLength;
+        // Lines are consumed by advancing an index and slicing ONCE after the
+        // scan. Slicing per line copies the whole remaining buffer each time,
+        // so a chunk of many tiny lines would cost O(lines x buffer) work for a
+        // request an untrusted runtime shapes.
+        let scanFrom = 0;
+        let newlineAt = pending.indexOf("\n", scanFrom);
+        while (newlineAt !== -1) {
+          const line = pending.slice(scanFrom, newlineAt);
+          scanFrom = newlineAt + 1;
+          // The per-line cap binds a TERMINATED line too. Checking only the
+          // unterminated remainder would let a runtime send one arbitrarily
+          // long line, end it with a newline, and have it parsed as progress
+          // (refreshing the inactivity deadline) all the way to the response
+          // cap.
+          if (utf8ByteLength(line) > PULL_PROGRESS_LINE_MAX_BYTES) {
+            return { ok: false, failureClass: "substrate_misconfigured" };
+          }
+          const verdict = parsePullLine(line);
+          if (verdict.kind === "refused") {
+            return { ok: false, failureClass: verdict.failureClass };
+          }
+          if (verdict.kind !== "blank") {
+            // Only a parsed line is evidence of progress, so only a parsed line
+            // refreshes the inactivity deadline; a drip of bytes carrying no
+            // line must not hold the pull open.
+            lastProgressAt = Date.now();
+            // The absolute ceiling is re-checked HERE, not only at the top of
+            // the read loop: a runtime that keeps a single chunk's worth of
+            // parsed lines coming would otherwise run the inner scan with no
+            // deadline between reads.
+            if (lastProgressAt - startedAt > this.pullCeilingMs) {
+              return { ok: false, failureClass: "substrate_timeout" };
+            }
+            reportProgress(options.onProgress, verdict.progress);
+            // The runtime's own terminal line ends the read immediately. Reading
+            // on would let a runtime that sends `success` and never closes hold
+            // the pull, and the provisioning lock under it, to the absolute
+            // ceiling and then discard a witnessed success as a timeout; it
+            // would also let repeated `success` lines past a reporter rate limit
+            // that exempts the terminal line. The `finally` cancels and aborts.
+            if (verdict.kind === "success") return { ok: true, failureClass: null };
+          }
+          newlineAt = pending.indexOf("\n", scanFrom);
+        }
+        if (scanFrom > 0) {
+          pendingBytes -= utf8ByteLength(pending.slice(0, scanFrom));
+          pending = pending.slice(scanFrom);
+        }
+        // The remainder is one unterminated line, so the same per-line cap
+        // binds it: a runtime that never emits a newline is refused here.
+        if (pendingBytes > PULL_PROGRESS_LINE_MAX_BYTES) {
+          return { ok: false, failureClass: "substrate_misconfigured" };
+        }
+      }
+      // Flushing the decoder emits the replacement character for a truncated
+      // multibyte sequence rather than dropping it, so a mangled final line
+      // fails the parser instead of vanishing.
+      pending += decoder.decode();
+      // Ollama terminates the stream with a newline, but a final line without
+      // one is still the runtime's verdict and is judged by the same parser.
+      if (pending.trim().length > 0) {
+        if (utf8ByteLength(pending) > PULL_PROGRESS_LINE_MAX_BYTES) {
+          return { ok: false, failureClass: "substrate_misconfigured" };
+        }
+        const verdict = parsePullLine(pending);
+        if (verdict.kind === "refused") {
+          return { ok: false, failureClass: verdict.failureClass };
+        }
+        if (verdict.kind !== "blank") {
+          reportProgress(options.onProgress, verdict.progress);
+          if (verdict.kind === "success") return { ok: true, failureClass: null };
+        }
+      }
+      // A stream that ended without the runtime's own `success` line proves
+      // nothing about what is on disk, so it fails closed.
+      return { ok: false, failureClass: "substrate_unavailable" };
+    } catch (err) {
+      if (err instanceof PullDeadlineError) {
+        return { ok: false, failureClass: "substrate_timeout" };
+      }
+      const aborted = err instanceof Error && err.name === "AbortError";
+      return {
+        ok: false,
+        failureClass: aborted ? "substrate_timeout" : "substrate_unavailable",
+      };
+    } finally {
+      // Every exit path releases the connection, so a refused or deadlined pull
+      // cannot leave a download running behind the ceremony's back.
+      if (reader !== null) void reader.cancel().catch(() => undefined);
+      ctl.abort();
+    }
   }
 
   /**
@@ -195,6 +462,14 @@ export class OllamaClient {
    * Generate a completion. Maps to `POST /api/generate` with `stream: false`
    * for v1.2; streaming is a v1.3+ enhancement (the chat surface will need
    * SSE forwarding then).
+   *
+   * `think: false` is set unconditionally: models in the qwen3 family default
+   * to producing a potentially long `<think>` chain before any visible text,
+   * consuming the entire `num_predict` budget on thinking tokens and returning
+   * `response: ""`. Disabling thinking makes the model answer directly, which
+   * is what the concierge and sentinel surfaces need from a local 14B model.
+   * An empty-text guard after the call fails closed: a model that returns no
+   * visible text is treated as a failure, never as a zero-length success.
    */
   async generate(args: {
     model: string;
@@ -205,7 +480,9 @@ export class OllamaClient {
     const startedAt = Date.now();
     try {
       const ctl = new AbortController();
-      const timer = setTimeout(() => ctl.abort(), this.timeoutMs);
+      // Generation on a local 14B model is bounded by generateTimeoutMs
+      // (default 120 s), not the 30 s show timeout.
+      const timer = setTimeout(() => ctl.abort(), this.generateTimeoutMs);
       try {
         const res = await this.fetchImpl(`${this.endpoint}/api/generate`, {
           method: "POST",
@@ -215,6 +492,11 @@ export class OllamaClient {
             prompt: args.prompt,
             system: args.system,
             stream: false,
+            // Thinking mode is disabled: a local model's thinking chain consumes
+            // the num_predict budget without producing visible text, and there is
+            // no product surface that consumes the thinking field. MUST MATCH the
+            // test expectation in `test/intelligence/ollama-provisioning.test.ts`.
+            think: false,
             options: args.maxTokens ? { num_predict: args.maxTokens } : undefined,
           }),
           signal: ctl.signal,
@@ -228,11 +510,25 @@ export class OllamaClient {
           });
         }
         const body = (await res.json()) as { response?: string };
-        const text = body.response ?? "";
+        const rawText = body.response ?? "";
+        // A model that returns empty visible text has not answered the
+        // question; treating it as success would hand the caller a blank
+        // string that looks like a valid response.  Fail closed so the
+        // selector can record the failure and try a fallback.  Trim is
+        // used only for the empty-detection check; the original text is
+        // returned so leading/trailing whitespace is preserved for the
+        // caller.
+        if (rawText.trim().length === 0) {
+          return failure({
+            startedAt,
+            class: "substrate_capability_unsupported",
+            message: "ollama returned empty response text",
+          });
+        }
         return {
           servedBy: "local",
           failureClass: null,
-          body: { kind: "summarize", text },
+          body: { kind: "summarize", text: rawText },
           completedAt: new Date().toISOString(),
           latencyMs: Date.now() - startedAt,
         };
@@ -249,39 +545,174 @@ export class OllamaClient {
     }
   }
 
-  private async runMutation(
-    path: string,
-    body: Readonly<Record<string, unknown>>,
-  ): Promise<OllamaMutationResult> {
-    try {
-      const ctl = new AbortController();
-      const timer = setTimeout(() => ctl.abort(), this.timeoutMs);
-      try {
-        const res = await this.fetchImpl(`${this.endpoint}${path}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-          signal: ctl.signal,
-        });
-        if (!res.ok) {
-          const text = await res.text().catch(() => "");
-          return {
-            ok: false,
-            failureClass: classifyHttpError(res.status, text),
-          };
-        }
-        await res.json().catch(() => null);
-        return { ok: true, failureClass: null };
-      } finally {
-        clearTimeout(timer);
+}
+
+/** Raised when a pull's inactivity or absolute deadline elapses first. */
+class PullDeadlineError extends Error {
+  constructor() {
+    super("ollama pull deadline");
+    this.name = "PullDeadlineError";
+  }
+}
+
+/**
+ * Bound `work` by `budgetMs` without depending on the fetch implementation to
+ * honor an abort signal: a runtime (or a seam) that ignores `signal` would
+ * otherwise let a stalled read hang the ceremony forever.
+ */
+async function raceDeadline<T>(work: Promise<T>, budgetMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // The losing side of the race still settles; this handler keeps its rejection
+  // from surfacing as an unhandled rejection after the deadline wins.
+  void work.catch(() => undefined);
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new PullDeadlineError()), budgetMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function utf8ByteLength(text: string): number {
+  // The caps are byte caps; a UTF-16 length would under-count a multibyte line
+  // by up to a factor of three and let it past a bound stated in bytes.
+  return text.length === 0 ? 0 : PULL_LINE_ENCODER.encode(text).length;
+}
+
+/**
+ * Read at most `maxBytes` from an already-open body reader within ONE cumulative
+ * deadline. The budget bounds the whole snippet, never each individual read: a
+ * per-read deadline is refreshed by every byte, so a runtime dripping one byte
+ * just inside the budget would hold this read -- and the cross-process
+ * provisioning lock above it -- open for as long as it cared to.
+ *
+ * Used only for an error snippet the caller passes to `classifyHttpError`, so a
+ * read failure, an exhausted budget, or a body that never ends yields the bytes
+ * seen so far and lets the HTTP status carry the classification; the caller's
+ * `finally` cancels the reader and aborts the request.
+ */
+async function readBoundedText(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  maxBytes: number,
+  budgetMs: number,
+): Promise<string> {
+  const endsAt = Date.now() + budgetMs;
+  const decoder = new TextDecoder();
+  let text = "";
+  let bytes = 0;
+  try {
+    for (;;) {
+      const remainingMs = endsAt - Date.now();
+      if (remainingMs <= 0) break;
+      const chunk = await raceDeadline(reader.read(), remainingMs);
+      if (chunk.done) break;
+      // The cap is applied BEFORE decoding, exactly as on the success stream:
+      // decoding first and then noticing the cap means one enormous first read
+      // is fully materialized as a string before anything stops it. Only the
+      // prefix that fits is decoded, and the read ends there.
+      const room = maxBytes - bytes;
+      if (chunk.value.byteLength >= room) {
+        text += decoder.decode(chunk.value.subarray(0, room), { stream: true });
+        // Account the decoded prefix so `bytes` equals the snippet's true size on
+        // exit; nothing reads it after the break today, and the count must not
+        // silently drift if something does.
+        bytes += room;
+        break;
       }
-    } catch (err) {
-      const aborted = err instanceof Error && err.name === "AbortError";
-      return {
-        ok: false,
-        failureClass: aborted ? "substrate_timeout" : "substrate_unavailable",
-      };
+      bytes += chunk.value.byteLength;
+      text += decoder.decode(chunk.value, { stream: true });
     }
+  } catch {
+    // A stalled or failed error body is not itself the verdict; the status code
+    // is. Returning what was read keeps this path bounded and fail-closed.
+  }
+  // Flushing surfaces a truncated multibyte tail as the replacement character
+  // instead of dropping it, so the snippet the classifier reads is the bytes
+  // that arrived. Truncation at the cap above can land mid-sequence, which is
+  // exactly the case that would otherwise vanish.
+  return text + decoder.decode();
+}
+
+type PullLineVerdict =
+  | { kind: "blank" }
+  | { kind: "progress"; progress: OllamaPullProgress }
+  | { kind: "success"; progress: OllamaPullProgress }
+  | { kind: "refused"; failureClass: SubstrateResponse["failureClass"] };
+
+/**
+ * Judge one NDJSON line. Every state is named here rather than defaulting to
+ * "keep going": a line this parser does not model is a refusal, so a runtime
+ * that stops speaking the reviewed protocol can never be read as progress.
+ */
+function parsePullLine(raw: string): PullLineVerdict {
+  const text = raw.trim();
+  if (text.length === 0) return { kind: "blank" };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { kind: "refused", failureClass: "substrate_misconfigured" };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { kind: "refused", failureClass: "substrate_misconfigured" };
+  }
+  const record = parsed as {
+    status?: unknown;
+    error?: unknown;
+    digest?: unknown;
+    total?: unknown;
+    completed?: unknown;
+  };
+  if (record.error !== undefined) {
+    // Ollama reports a registry or model failure inline on an HTTP 200 stream;
+    // failing closed here is what stops a refused pull from reaching the digest
+    // check as a success.
+    return {
+      kind: "refused",
+      failureClass: typeof record.error === "string"
+        ? classifyPullErrorLine(record.error)
+        : "substrate_misconfigured",
+    };
+  }
+  if (typeof record.status !== "string" || record.status.length === 0) {
+    return { kind: "refused", failureClass: "substrate_misconfigured" };
+  }
+  const progress: OllamaPullProgress = {
+    status: record.status,
+    ...(typeof record.digest === "string" ? { digest: record.digest } : {}),
+    ...(typeof record.total === "number" ? { total: record.total } : {}),
+    ...(typeof record.completed === "number" ? { completed: record.completed } : {}),
+  };
+  return record.status === "success"
+    ? { kind: "success", progress }
+    : { kind: "progress", progress };
+}
+
+/** Same intent as `classifyHttpError`, applied to an in-stream error string. */
+function classifyPullErrorLine(
+  message: string,
+): "substrate_misconfigured" | "substrate_rate_limited" | "substrate_unavailable" {
+  if (/rate limit|too many requests/i.test(message)) return "substrate_rate_limited";
+  if (/not found|does not exist|unknown model|no such/i.test(message)) {
+    return "substrate_misconfigured";
+  }
+  return "substrate_unavailable";
+}
+
+function reportProgress(
+  onProgress: OllamaPullOptions["onProgress"],
+  progress: OllamaPullProgress,
+): void {
+  if (onProgress === undefined) return;
+  try {
+    onProgress(progress);
+  } catch {
+    // Reporting is an operator-channel convenience; a reporter defect must never
+    // turn a live download into a refusal.
   }
 }
 
@@ -299,6 +730,12 @@ export class LocalSubstrate {
   }
 
   static fromPick(client: OllamaClient, pick: LocalModelPick, customTag?: string): LocalSubstrate {
+    // The custom tag wins on both sides: the unarmed badge label in
+    // `intelligence/selector.ts` (`gatedLocalHandle`) must prefer the same
+    // `customTag` this constructor does, or the operator is shown the name of
+    // a model this substrate never calls. Past that one shared arm the two
+    // diverge on purpose, the label naming the pick for a human and this
+    // constructor naming the tag for Ollama.
     return new LocalSubstrate(client, customTag ?? LOCAL_MODEL_TAGS[pick]);
   }
 

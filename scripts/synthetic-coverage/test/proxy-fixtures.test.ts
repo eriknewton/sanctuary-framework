@@ -4,12 +4,12 @@ import "../fixtures/proxy/proxy-sse-ssrf.js";
 import "../fixtures/proxy/proxy-tool-discovery.js";
 import { listClaims } from "../registry.js";
 
-const proxyClaims = listClaims().filter((claim) => ["15", "16", "17"].includes(claim.id));
+const proxyClaims = listClaims().filter((claim) => ["16", "17", "18"].includes(claim.id));
 const fixtures = proxyClaims.flatMap((claim) =>
   claim.fixtures.map((fixture) => ({ claim, fixture })),
 );
 
-expect(proxyClaims.map((claim) => claim.id).sort()).toEqual(["15", "16", "17"]);
+expect(proxyClaims.map((claim) => claim.id).sort()).toEqual(["16", "17", "18"]);
 expect(fixtures).toHaveLength(12);
 
 describe("proxy synthetic fixtures", () => {

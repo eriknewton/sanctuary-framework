@@ -122,12 +122,12 @@ below) when:
 - the Secret Service daemon refuses the connection or the user cancels the
   keyring unlock prompt.
 
-This mirrors the macOS behavior of falling through to the fallback file when
-`/usr/bin/security` writes fail.
+Reading an already-existing fallback is compatible with the macOS recovery
+behavior. It does not authorize generated Linux custody to create that file.
 
 > **Sovereign-custody change (2026-06-12, F3).** Sanctuary no longer
 > *generates* a passphrase into the fallback file when the keyring is
-> unusable — a machine-bound secret the user never saw was a lockout
+> unusable — a locally derived secret the user never saw was a lockout
 > generator (lose the machine, lose the fortress). Generation now fails
 > closed (`SilentCustodyRefusedError`) with remediation options. The
 > fallback file remains fully supported for **reading** passphrases
@@ -147,14 +147,61 @@ passphrase to an encrypted fallback file:
 | Default       | `~/.sanctuary/passphrase.enc`                   |
 | Per-tenant    | `<storage_path>/passphrase.enc`                 |
 
-The file is AES-256-GCM ciphertext (12-byte IV prepended) under a machine-local
-key derived via HKDF-SHA256 from `hostname + uid + username + home`. This is
-not cryptographically strong authentication: anyone with local read access can
-re-derive the key. The protection it provides is "the file cannot be copied off
-this machine and decrypted on another."
+The file is a UTF-8 JSON envelope (version 3), not raw bytes. Its fields are
+`v` (3), `alg` (`aes-256-gcm`), `aad` (`canonical-storage-path`, naming which
+additional-authenticated-data form the ciphertext was sealed under), `nonce`
+(the base64url-encoded 12-byte AES-GCM nonce) and `ct` (the base64url-encoded
+ciphertext with its GCM tag). Two superseded at-rest forms are still READ and
+re-wrapped in place: the version-2 envelope, whose `aad` is `storage-path`, and
+the original pre-envelope layout of a raw 12-byte nonce followed by raw
+ciphertext. `parseFallbackEnvelope` in `server/src/wrap/passphrase.ts` is the
+authority on all three; if this list and that function disagree, the function is
+right and this paragraph is the defect.
+
+The ciphertext is under a locally derived key using HKDF-SHA256 over
+`stable host identity + uid + username + home`. The stable host identity is the
+platform UUID on macOS and `/etc/machine-id` on Linux; both survive reboots,
+renames, and network changes. On a platform that exposes neither, the same
+derivation runs with the host's resolved hostname in place of the stable
+identity, so such a host keeps the hostname sensitivity described below. It is
+recorded here rather than hidden.
+
+The key is bound to the stable host identity rather than to the hostname
+because the resolved hostname is not boot-invariant: the same Mac can answer
+`<name>.localdomain` on one boot and `<name>.local` on the next, and a key
+derived from that value stops opening its own file with nothing on the machine
+having changed. A file written under the earlier hostname-derived key is still
+read. It is migrated on the first read by a caller that is allowed to write and
+whose re-wrap succeeds; until then it stays in the superseded form and keeps
+opening through the read ladder. A caller that declared itself read-only reads
+the value and leaves the file as it is.
+
+That in-place re-wrap is best effort on the read path. If the write fails (a
+read-only mount, a full disk, a transient storage fault) the read still returns
+the stored passphrase, and a warning naming the file is written to stderr. The
+warning reports the file's OBSERVED state rather than assuming one, because the
+writer renames the new file into place before the directory fsync and a failure
+can therefore be raised with the new ciphertext already installed: it says
+either that the file still opens under a superseded form (the bytes are not
+compared, so nothing is claimed about them beyond that) and the repair is
+retried on the next writable read, or that the file now opens under the
+current key, so the rewrite landed despite the error. If the file
+opens under neither form after the failed write, the failure is raised rather
+than warned about, because custody is then genuinely lost. **Failure mode from
+the outside:** in the two warned cases the fortress opens normally and nothing
+looks wrong, so the only signal that a host is still carrying a superseded
+at-rest form is that stderr line. The persist commands are not softened this
+way: for them a failed write is the failure of the operation.
+
+This is not hardware-backed and is not a cryptographic machine-binding
+primitive: anyone with local read access can re-derive the key, and
+cloned/snapshotted host identity material defeats the portability deterrent.
+Treat it as encrypted disk-local compatibility custody for a user-held secret,
+not as a hardware or OS-keyring security claim.
 
 > **Threat model warning.** The fallback-file derivation uses a machine-local
-> key from `hostname`, `uid`, `username`, and `home` directory. This is not
+> key from the host's stable identity (or, where none exists, `hostname`),
+> `uid`, `username`, and `home` directory. This is not
 > cryptographically strong authentication. Anyone with local read access to
 > the user's machine can re-derive the key and decrypt the fallback file.
 > Do NOT rely on fallback-file protection on multi-user machines with
@@ -166,10 +213,11 @@ this machine and decrypted on another."
 > keyring still get encryption-at-rest, not so multi-user environments get
 > identity isolation.
 
-The source comment at `server/src/wrap/passphrase.ts` (around the
-`deriveMachineKey` helper near line 650) cross-references this section so a
-future maintainer touching the derivation does not lose the threat-model
-context.
+The source comment at the `deriveMachineKey` helper in
+`server/src/wrap/passphrase.ts` cross-references this section so a future
+maintainer touching the derivation does not lose the threat-model context. The
+host facts it derives from are resolved in `server/src/wrap/host-identity.ts`,
+which holds no key material and no label.
 
 ---
 
@@ -411,6 +459,46 @@ entry exists for the same tenant.
 
 The default-path tenant (`~/.sanctuary`) is unaffected by this change; its
 service name is always the un-suffixed `sanctuary-passphrase`.
+
+### Realpath-canonical service naming (symlink alias consolidation)
+
+`keychainServiceFor()`'s `path.resolve()` canonicalization is lexical only:
+it normalizes `.`, `..`, doubled separators, and trailing slashes, but it
+does not follow symlinks. A fortress reached through a symlink alias and the
+same fortress reached through its real path therefore resolved to two
+different lexical paths, hashed to two different service-name suffixes, and
+so held two different credentials; the alias route could not find the
+credential stored for the real-path route (an orphaned custody).
+
+`canonicalKeychainServiceFor()` in
+[`src/wrap/passphrase.ts`](../src/wrap/passphrase.ts) fixes this by
+symlink-resolving (`realpath`) the storage path before hashing, so an alias
+and its real path collapse to one canonical identity. It matches the
+existing lexical name whenever every existing path component is already
+canonical, and diverges only when an ancestor is a symlink. **Writes now
+target this canonical realpath name.** Reads try, in order: the canonical
+realpath 16-hex name, the pre-realpath lexical 16-hex name (a symlink-reached
+fortress's legacy credential), the canonical realpath 12-hex name (a pre-v1.2.3
+entry reached by an alias), then the pre-realpath lexical 12-hex name; the list
+is de-duplicated, so it collapses back to the two pre-realpath names when no
+ancestor is a symlink. Consolidating an existing lexical entry into the
+canonical name is a writable authority with no shipped consumer today, so it
+is deliberately not implemented; a legacy lexical entry stays readable
+indefinitely rather than being migrated in place.
+
+### Rotation-staging service (temporary, recovery-key rotation only)
+
+During a master rotation that carries an OS-keyring recovery-key escrow, the
+rotated recovery key is staged into a temporary OS-keyring entry named
+`<canonical-recovery-key-service>:rotation:<rotationId>` before the rotation
+commits, authenticated by the durable `rotation-recovery-pending` (`_meta`)
+escrow record so a crash between staging and commit can resume or roll back
+deterministically. The staging entry is removed on both a successful commit
+and a rollback; a staging entry that survives either is a defect, not an
+expected residue. This is a distinct, temporary keyring service in the
+recovery-key family (`canonicalRecoveryKeyServiceFor()` in
+[`src/wrap/keychain-custody.ts`](../src/wrap/keychain-custody.ts)), never a
+fourth read-path alias: ordinary credential reads never consult it.
 
 ---
 

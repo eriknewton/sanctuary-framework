@@ -19,15 +19,20 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   mkdir,
+  readdir,
   rm,
   readFile,
   stat,
   symlink,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { Readable, Writable } from "node:stream";
+import { spawn, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { cleanupFreshInitRecoveryResidue } from "../../src/storage/fresh-fortress.js";
 import {
   discloseRecoveryKey,
   resolveRecoveryKeyOutputPath,
@@ -59,6 +64,13 @@ function makeIo() {
 
 describe("Recovery key disclosure (Finding U)", () => {
   let tmpDir: string;
+  // Power-cut fixture children spawned by the "recovery-key.txt file" cases
+  // below. Each is SIGKILLed on its own happy path once the assertion on its
+  // READY line passes, but that assertion runs inside an async stdout
+  // "data" handler: if it throws (a real regression, a slow host), the kill
+  // below it never runs and the child is orphaned. Tracked here so teardown
+  // reaps it regardless of how the test exited.
+  const spawnedChildren: ChildProcess[] = [];
 
   beforeEach(async () => {
     tmpDir = join(
@@ -66,9 +78,16 @@ describe("Recovery key disclosure (Finding U)", () => {
       `sanctuary-recovery-${Date.now()}-${Math.random().toString(36).slice(2)}`
     );
     await mkdir(tmpDir, { recursive: true, mode: 0o700 });
+    spawnedChildren.length = 0;
   });
 
   afterEach(async () => {
+    for (const child of spawnedChildren) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+    }
+    spawnedChildren.length = 0;
     try {
       await rm(tmpDir, { recursive: true, force: true });
     } catch {}
@@ -156,6 +175,108 @@ describe("Recovery key disclosure (Finding U)", () => {
         stat(join(fortressPath, RECOVERY_KEY_FILENAME))
       ).rejects.toThrow();
     });
+
+    it.each(["stage-synced", "final-linked", "directory-synced"] as const)(
+      "power cut after %s leaves only recoverable complete artifacts and blocks overwrite",
+      async (cutStage) => {
+        const caseDir = join(tmpDir, cutStage);
+        const fortressPath = join(caseDir, "fortress");
+        const externalPath = join(caseDir, "durable", "recovery.txt");
+        const fixture = fileURLToPath(
+          new URL("./recovery-output-power-cut-child.ts", import.meta.url),
+        );
+        const child = spawn(
+          process.execPath,
+          ["--import", "tsx", fixture, fortressPath, externalPath, cutStage],
+          { stdio: ["ignore", "pipe", "pipe"] },
+        );
+        spawnedChildren.push(child);
+        await new Promise<void>((resolve, reject) => {
+          child.once("error", reject);
+          child.stdout.once("data", (chunk) => {
+            expect(chunk.toString("utf8")).toContain(`READY:${cutStage}`);
+            resolve();
+          });
+        });
+        const closed = new Promise<void>((resolve) =>
+          child.once("close", () => resolve()),
+        );
+        child.kill("SIGKILL");
+        await closed;
+
+        const durableDir = dirname(externalPath);
+        const entries = await (await import("node:fs/promises")).readdir(durableDir);
+        const stages = entries.filter((name) => name.includes("sanctuary-recovery-stage"));
+        expect(stages).toHaveLength(1);
+        const stagedContent = await readFile(join(durableDir, stages[0]!), "utf8");
+        expect(stagedContent).toContain(FIXTURE_KEY);
+        if (cutStage === "stage-synced") {
+          await expect(stat(externalPath)).rejects.toThrow();
+        } else {
+          await expect(readFile(externalPath, "utf8")).resolves.toBe(stagedContent);
+        }
+        await expect(writeRecoveryKeyFile({
+          storagePath: fortressPath,
+          recoveryKeyFilePath: externalPath,
+          recoveryKey: FIXTURE_KEY,
+        })).rejects.toThrow();
+      },
+    );
+
+    it.each(["stage-synced", "final-linked", "directory-synced"] as const)(
+      "default output power cut after %s leaves complete, idempotently cleanable residue",
+      async (cutStage) => {
+        const fortressPath = join(tmpDir, `default-${cutStage}`);
+        await mkdir(join(fortressPath, "state", "_meta"), { recursive: true });
+        await writeFile(
+          join(fortressPath, "state", "_meta", ".custody-write.lock"),
+          "",
+          { mode: 0o600 },
+        );
+        const fixture = fileURLToPath(
+          new URL("./recovery-output-power-cut-child.ts", import.meta.url),
+        );
+        const child = spawn(
+          process.execPath,
+          ["--import", "tsx", fixture, fortressPath, "DEFAULT", cutStage],
+          { stdio: ["ignore", "pipe", "pipe"] },
+        );
+        spawnedChildren.push(child);
+        await new Promise<void>((resolve, reject) => {
+          child.once("error", reject);
+          child.stdout.once("data", (chunk) => {
+            expect(chunk.toString("utf8")).toContain(`READY:${cutStage}`);
+            resolve();
+          });
+        });
+        const closed = new Promise<void>((resolve) =>
+          child.once("close", () => resolve()),
+        );
+        child.kill("SIGKILL");
+        await closed;
+
+        for (const name of await readdir(fortressPath)) {
+          if (name === "state") continue;
+          expect(await readFile(join(fortressPath, name), "utf8")).toContain(FIXTURE_KEY);
+        }
+        if (cutStage !== "stage-synced") {
+          // Model a second power cut after cleanup durably removed the final
+          // alias but before it removed the authenticated staging alias.
+          await unlink(join(fortressPath, RECOVERY_KEY_FILENAME));
+        }
+        expect(await cleanupFreshInitRecoveryResidue(
+          fortressPath,
+          ".custody-write.lock",
+          process.getuid!(),
+        )).toBe(true);
+        expect(await readdir(fortressPath)).toEqual(["state"]);
+        expect(await cleanupFreshInitRecoveryResidue(
+          fortressPath,
+          ".custody-write.lock",
+          process.getuid!(),
+        )).toBe(false);
+      },
+    );
 
     it("refuses a custom recovery-key path inside the fortress", async () => {
       const io = makeIo();

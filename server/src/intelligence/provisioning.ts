@@ -22,6 +22,7 @@ import {
   type VerifiedLocalBindingV2,
 } from "./model-manifest-v2.js";
 import { loadPinnedModelManifestKey, type ModelManifestTier } from "./model-manifest.js";
+import type { PackagedModelManifestRefusalReason } from "./packaged-model-manifest.js";
 import type { RuntimeLightVerifier } from "./runtime-light-verifier.js";
 import type {
   ImmuneDiskVerifier,
@@ -36,7 +37,7 @@ import type {
 import { SURFACES } from "./types.js";
 import type { ModelProvenance } from "../operational/model-provenance.js";
 import type { OllamaMutationResult } from "./substrates/local.js";
-import { localProvisioningPreflightRefusal } from "./provisioning-consent.js";
+import { localProvisioningPreflight } from "./provisioning-consent.js";
 import { LocalIntegrityStateLoadError } from "./policy-store.js";
 import { CrossProcessLockError } from "../storage/cross-process-lock.js";
 
@@ -56,9 +57,36 @@ export class LocalModelsRootResolutionError extends Error {
   }
 }
 
+/**
+ * What the model-root resolver reports. `default_root_absent` is the one state
+ * that is not yet a verdict: the DEFAULT root does not exist because the runtime
+ * has never pulled, and Ollama creates it on its first pull. It deliberately
+ * carries no path, so an unvalidated root cannot enter the ceremony; the caller
+ * re-resolves strictly once the pull has created the directory. Must match
+ * `resolveOllamaModelsRootState` in `../wrap/local-intelligence.ts`.
+ */
+export type LocalModelsRootResolution =
+  | { kind: "resolved"; rootReal: string }
+  | { kind: "default_root_absent" };
+
+/**
+ * The ceremony's own root protocol state. `ROOT_PENDING_PULL` carries no path
+ * at all, so the plan, the consent step, verification, and the commit cannot
+ * receive "not resolved yet" as a value; the commit consumes a root only from
+ * `ROOT_RESOLVED`, which is only ever entered from a strict resolution or from
+ * the durable armed record.
+ */
+type ProvisioningRootState =
+  | { state: "ROOT_RESOLVED"; rootReal: string }
+  | { state: "ROOT_PENDING_PULL" };
+
 export type LocalProvisioningRefusalReason =
   | "declined"
   | "non_tty"
+  // Asset-stage refusals from the packaged manifest loader
+  // (packaged-model-manifest.ts); each names why no manifest text arrived, so
+  // the ceremony never collapses a typed loader refusal into a bare "absent".
+  | PackagedModelManifestRefusalReason
   | "integrity_state_absent"
   | "integrity_state_invalid"
   | "manifest_signature_invalid"
@@ -113,6 +141,14 @@ export interface LocalProvisioningOps {
   /** false is an explicit decline; true still cannot bypass the TTY confirm. */
   preAnswered?: boolean;
   manifestText: string | null;
+  /**
+   * Why `manifestText` is null when the packaged loader ran and refused. The
+   * ceremony refuses with this exact reason instead of the generic
+   * `integrity_state_absent`, so an operator can tell a missing package asset
+   * from a bad signature from a byte-pin mismatch. Undefined when no loader
+   * ran (headless or declined) or when text arrived.
+   */
+  manifestLoadRefusal?: PackagedModelManifestRefusalReason;
   /** Pre-lock snapshot used only to describe an early consent refusal. */
   initialConfiguredChoices: Readonly<Record<Surface, SubstrateChoice>>;
   /**
@@ -128,7 +164,13 @@ export interface LocalProvisioningOps {
     manifestVersionFloor?: number,
   ) => ModelManifestV2VerificationResult;
   probeHardware: () => Promise<HardwareCapabilityReport>;
-  resolveModelsRoot: () => Promise<string>;
+  /**
+   * Resolve the one root Q5 persists. A `default_root_absent` result means the
+   * host has a runtime but has never pulled; the ceremony defers to after the
+   * pull and calls this again, so only a strictly resolved root is ever
+   * verified against or committed.
+   */
+  resolveModelsRoot: () => Promise<LocalModelsRootResolution>;
   runtimeVerifier: RuntimeLightVerifier;
   immuneVerifier: ImmuneDiskVerifier;
   withProvisioningLock: <T>(operation: () => Promise<T>) => Promise<T>;
@@ -156,11 +198,23 @@ export type LocalProvisioningResult =
     models: readonly string[];
     provenanceProjection: "projected" | "degraded";
   }
+  /**
+   * The run never asked for local intelligence (no flag, no terminal to ask).
+   * Distinct from `refused`: nothing was read, recorded, audited, or degraded,
+   * so a caller renders it as information, never as a failure.
+   */
+  | { kind: "not-requested" }
   | { kind: "refused"; reason: LocalProvisioningRefusalReason };
 
 const FAILURE_COPY: Record<LocalProvisioningRefusalReason, string> = {
   declined: "Local intelligence setup was declined; configured local surfaces remain local and degraded.",
   non_tty: "Local intelligence setup requires an interactive TTY; no runtime or model mutation occurred.",
+  integrity_asset_absent: "The packaged signed model manifest is missing; no model pull was attempted.",
+  integrity_asset_oversize: "The signed model manifest exceeds the reviewed byte cap; no model pull was attempted.",
+  integrity_asset_unparseable: "The signed model manifest is not a valid V2 envelope; no model pull was attempted.",
+  integrity_asset_signature_invalid: "The signed model manifest does not verify under the pinned catalog root; no model pull was attempted.",
+  integrity_asset_pin_mismatch: "The packaged model manifest does not match the build-time byte pin; no model pull was attempted.",
+  integrity_asset_module_location_unavailable: "The packaged model manifest cannot be located from a CommonJS entry point; run the ESM CLI (sanctuary) to provision. No model pull was attempted.",
   integrity_state_absent: "The signed V2 model catalog is unavailable; no model pull was attempted.",
   integrity_state_invalid: "The signed V2 model catalog or armed record is invalid; no model pull was attempted.",
   manifest_signature_invalid: "The V2 model catalog signature is invalid; no model pull was attempted.",
@@ -390,13 +444,17 @@ export async function runLocalIntelligenceProvisioning(
   let affectedSurfaces = SURFACES.filter(
     (surface) => ops.initialConfiguredChoices[surface] === "local",
   );
-  const preflightRefusal = localProvisioningPreflightRefusal(ops.isTty, ops.preAnswered);
-  if (preflightRefusal !== null) {
+  const preflight = localProvisioningPreflight(ops.isTty, ops.preAnswered);
+  // INVARIANT: an unrequested run returns BEFORE `refuse`, so it writes no
+  // refusal audit row and no persisted provisioning failure. Reaching `refuse`
+  // here is what made a plain headless `protect` mark five surfaces degraded.
+  if (preflight.kind === "not-requested") return { kind: "not-requested" };
+  if (preflight.kind === "refused") {
     return refuse(
       ops,
       affectedSurfaces,
-      preflightRefusal,
-      preflightRefusal === "non_tty" ? "substrate_unavailable" : "substrate_misconfigured",
+      preflight.reason,
+      preflight.reason === "non_tty" ? "substrate_unavailable" : "substrate_misconfigured",
     );
   }
 
@@ -410,6 +468,11 @@ export async function runLocalIntelligenceProvisioning(
       );
       affectedSurfaces = localSurfaces;
       const floor = authority.existingIntegrityState?.manifest_version_floor;
+      // A typed loader refusal is the verdict; it is never re-read as the
+      // generic absence the verifier would otherwise report for null text.
+      if (ops.manifestText === null && ops.manifestLoadRefusal !== undefined) {
+        return refuse(ops, localSurfaces, ops.manifestLoadRefusal, "substrate_misconfigured");
+      }
       const verifyManifest = ops.verifyManifest ?? defaultVerifyManifest;
       const verified = verifyManifest(ops.manifestText, floor);
       if (!verified.ok) {
@@ -418,6 +481,12 @@ export async function runLocalIntelligenceProvisioning(
           recordFailure: reason !== "manifest_rollback",
         });
       }
+      // Catalog-signature check: the signed manifest version has been verified
+      // against the pinned catalog key. Not model-file verification and not
+      // fortress arming; arming requires a complete atomic commit below.
+      ops.print(
+        `Verified signed model manifest v${verified.body.manifest_version} against the pinned catalog key.`,
+      );
 
       const hardware = await ops.probeHardware();
       if (hardware.tier === "below-baseline") {
@@ -428,31 +497,54 @@ export async function runLocalIntelligenceProvisioning(
         return refuse(ops, localSurfaces, "binding_mismatch", "substrate_misconfigured");
       }
 
-      let rootReal: string;
-      try {
+      // The root is a two-state protocol, never a nullable string: only
+      // ROOT_RESOLVED carries a path, so no consumer can read "not resolved
+      // yet" as a value. ROOT_PENDING_PULL means the default root does not
+      // exist because the reachable runtime has never pulled; nothing is on
+      // disk to verify and nothing may be persisted from it, so the strict
+      // resolution is deferred until the pull below has created the directory.
+      let rootState: ProvisioningRootState = { state: "ROOT_PENDING_PULL" };
+      const persistedRoot = authority.existingIntegrityState?.ollama_models_root;
+      if (persistedRoot !== undefined) {
         // Once armed, the just-reloaded durable root remains authoritative even
         // if the process environment changed before this lock was acquired.
-        rootReal = authority.existingIntegrityState?.ollama_models_root ??
-          await ops.resolveModelsRoot();
-      } catch (error) {
-        const reason = error instanceof LocalModelsRootResolutionError
-          ? error.reason
-          : "integrity_io_unavailable";
-        return refuse(ops, localSurfaces, reason, "substrate_misconfigured");
+        rootState = { state: "ROOT_RESOLVED", rootReal: persistedRoot };
+      } else {
+        let resolution: LocalModelsRootResolution;
+        try {
+          resolution = await ops.resolveModelsRoot();
+        } catch (error) {
+          return refuse(
+            ops,
+            localSurfaces,
+            rootResolutionRefusal(error),
+            "substrate_misconfigured",
+          );
+        }
+        if (resolution.kind === "resolved") {
+          rootState = { state: "ROOT_RESOLVED", rootReal: resolution.rootReal };
+        } else if (!hardware.ollamaReachable) {
+          // Without a reachable runtime nothing in this run can create the root,
+          // so an absent default root stays a refusal instead of becoming a wait
+          // for a pull that cannot happen.
+          return refuse(ops, localSurfaces, "model_root_invalid", "substrate_misconfigured");
+        }
       }
-      if (!isAbsolute(rootReal)) {
+      if (rootState.state === "ROOT_RESOLVED" && !isAbsolute(rootState.rootReal)) {
         return refuse(ops, localSurfaces, "model_root_invalid", "substrate_misconfigured");
       }
 
-      let sweep = await verifyEveryModel(
-        ops,
-        models,
-        rootReal,
-        verified.body.manifest_version,
-      );
-      const alreadyPresent = sweep.ok;
-      if (!sweep.ok) {
-        if (!repairableByPull(sweep.reason)) {
+      let sweep: VerificationSweep | null = rootState.state === "ROOT_RESOLVED"
+        ? await verifyEveryModel(
+          ops,
+          models,
+          rootState.rootReal,
+          verified.body.manifest_version,
+        )
+        : null;
+      const alreadyPresent = sweep !== null && sweep.ok;
+      if (sweep === null || !sweep.ok) {
+        if (sweep !== null && !repairableByPull(sweep.reason)) {
           return refuse(ops, localSurfaces, sweep.reason, "substrate_misconfigured");
         }
         for (const line of renderLocalProvisioningPlan({
@@ -504,15 +596,42 @@ export async function runLocalIntelligenceProvisioning(
             );
           }
         }
+        if (rootState.state === "ROOT_PENDING_PULL") {
+          // The pull has run, so the root must exist now and must clear exactly
+          // the same strict resolution a persisted root clears; a root that is
+          // still absent, aliased, or a symlink is refused here, never committed.
+          let resolution: LocalModelsRootResolution;
+          try {
+            resolution = await ops.resolveModelsRoot();
+          } catch (error) {
+            return refuse(
+              ops,
+              localSurfaces,
+              rootResolutionRefusal(error),
+              "substrate_misconfigured",
+            );
+          }
+          if (resolution.kind !== "resolved" || !isAbsolute(resolution.rootReal)) {
+            return refuse(ops, localSurfaces, "model_root_invalid", "substrate_misconfigured");
+          }
+          rootState = { state: "ROOT_RESOLVED", rootReal: resolution.rootReal };
+        }
         sweep = await verifyEveryModel(
           ops,
           models,
-          rootReal,
+          rootState.rootReal,
           verified.body.manifest_version,
         );
         if (!sweep.ok) {
           return refuse(ops, localSurfaces, sweep.reason, "substrate_misconfigured");
         }
+      }
+      // The commit consumes a root ONLY from the ROOT_RESOLVED state. Both
+      // conditions hold on every path above; refusing rather than asserting
+      // keeps a future edit that breaks one of them from persisting a root that
+      // was never strictly resolved or a sweep that never passed.
+      if (rootState.state !== "ROOT_RESOLVED" || !sweep.ok) {
+        return refuse(ops, localSurfaces, "model_root_invalid", "substrate_misconfigured");
       }
 
       const committedAt = (ops.now ?? (() => new Date()))().toISOString();
@@ -520,7 +639,7 @@ export async function runLocalIntelligenceProvisioning(
         verified,
         models,
         sweep.evidence,
-        rootReal,
+        rootState.rootReal,
         committedAt,
       );
       try {
@@ -535,6 +654,11 @@ export async function runLocalIntelligenceProvisioning(
           { recordFailure: false },
         );
       }
+
+      // Arming notice: without this, a successful commit looks exactly like one
+      // that silently did nothing; the armed state would otherwise have to be
+      // inferred from the encrypted record alone.
+      ops.print(`Local intelligence armed: ${renderArmedBindings(commit)}`);
 
       let provenanceProjection: "projected" | "degraded" = "projected";
       try {
@@ -620,11 +744,51 @@ export async function runLocalIntelligenceProvisioning(
   }
 }
 
+function rootResolutionRefusal(error: unknown): LocalProvisioningRefusalReason {
+  return error instanceof LocalModelsRootResolutionError
+    ? error.reason
+    : "integrity_io_unavailable";
+}
+
 function commitRefusalReason(error: unknown): LocalProvisioningRefusalReason {
   if (!(error instanceof LocalIntegrityStateLoadError)) {
     return "integrity_io_unavailable";
   }
   return error.reason;
+}
+
+/**
+ * Hex characters of a sha256 digest shown on an operator line. 12 hex chars =
+ * 48 bits, long enough for an operator to match the line against the manifest
+ * by eye and short enough that nobody mistakes it for the digest itself; the
+ * full digest is what `sanctuary intelligence diagnose` prints.
+ *
+ * SOLE DECLARATION: the badge label in `intelligence/selector.ts` IMPORTS this
+ * constant rather than re-typing 12, so the ceremony line and the concierge
+ * label can never truncate one binding's digest to two different widths.
+ */
+export const ARMED_DIGEST_PREFIX_CHARS = 12;
+
+/**
+ * One line naming what this fortress is now bound to: each distinct runtime
+ * tag with the prefix of the signed Ollama manifest digest it was verified
+ * against. Never prints key material; the digest is public manifest content.
+ */
+function renderArmedBindings(commit: AtomicLocalProvisioningCommit): string {
+  const byTag = new Map<string, string>();
+  for (const binding of Object.values(commit.integrityState.bindings)) {
+    if (binding === undefined) continue;
+    byTag.set(
+      binding.runtime_tag,
+      binding.ollama_identity.ollama_manifest_sha256.slice(
+        0,
+        ARMED_DIGEST_PREFIX_CHARS,
+      ),
+    );
+  }
+  return [...byTag.entries()]
+    .map(([tag, digestPrefix]) => `${tag} (manifest sha256 ${digestPrefix})`)
+    .join(", ");
 }
 
 export function renderLocalProvisioningPlan(input: {

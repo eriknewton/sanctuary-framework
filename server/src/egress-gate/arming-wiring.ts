@@ -164,6 +164,7 @@ import {
   withProvisionLock,
   type ProvisionLockOps,
 } from "../castle-wall/provision/lockfile.js";
+import { stripTrailingSlashes } from "../strings.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -634,7 +635,7 @@ function realGateAccountHomeLayoutOps(): GateAccountHomeLayoutOps {
 function normalizeLayoutPath(path: string): string {
   const normalized = normalizePath(path);
   if (normalized === "/") return normalized;
-  return normalized.replace(/\/+$/, "");
+  return stripTrailingSlashes(normalized);
 }
 
 function assertGateHomeUnderFixedBase(gateHomeDirectory: string): void {

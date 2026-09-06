@@ -27,6 +27,19 @@ does not have.
 This is the same shape as the wall's design rule: every protection is enforced below the
 party with an incentive to violate it. The machine is not the custodian; the human is.
 
+## In-process secret lifetime
+
+Custody commands necessarily expose the unlocked master as mutable bytes inside the
+bounded Node process while they decrypt or re-wrap state. Sanctuary explicitly zeroes
+those buffers in `finally` blocks. On Darwin, the inode-bound directory worker receives
+the master for `provision-pin` over private Node IPC using advanced byte serialization;
+both the parent's transfer buffer and the worker's received/copy buffers are zeroed.
+The IPC path deliberately does not materialize the master as a base64 JavaScript string,
+because JavaScript strings are immutable and cannot be scrubbed. This bounds but cannot
+prove the absence of transient runtime/serializer copies: process isolation, the private
+IPC channel, non-inherited credential variables, bounded worker lifetime, and the ban on
+logging or persistence are the remaining controls.
+
 ## The consequence, stated honestly
 
 If the operator loses **both** human-held factors (passphrase AND recovery key) while

@@ -14,4 +14,15 @@ describe("fixture registry", () => {
     registerFixture("1000", "Earlier synthetic claim", "earlier-fixture", pass);
     expect(listClaims().map((claim) => claim.id)).toEqual(["999", "1000", "1001"]);
   });
+
+  it("rejects conflicting labels before deduplication or adding another fixture", () => {
+    registerFixture("1002", "Original claim", "original-fixture", pass);
+    const before = getClaim("1002");
+
+    for (const name of ["original-fixture", "different-fixture"]) {
+      expect(() => registerFixture("1002", "Different claim", name, pass))
+        .toThrow(/Conflicting labels for assurance row 1002/);
+      expect(getClaim("1002")).toEqual(before);
+    }
+  });
 });

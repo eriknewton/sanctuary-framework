@@ -75,6 +75,45 @@ const EMAIL_PATTERN = /\b[a-zA-Z0-9._%+-]{1,64}@[a-zA-Z0-9-]{1,63}(?:\.[a-zA-Z0-
 const SHA256_FIELD_NAME_PATTERN = /(?:^|[._])sha256$/i;
 const SHA256_HEX_VALUE_PATTERN = /^[0-9a-f]{64}$/i;
 
+// The one scan whose SIZE the runtime itself chose: the compiled-context
+// scanner's own artifact, in its own field. That scanner writes the field only
+// from contributors an assembler labelled `first_party_runtime` (a locally
+// compiled template plus this fortress's own records), so its length and its
+// internal repetition are design facts about Sanctuary, not evidence about a
+// caller. Prompt stuffing is the only heuristic this exempts: role override,
+// security bypass, Unicode/homoglyph, token budget, encoded payloads and
+// exfiltration all still run on the field, and the compiled-context runtime's
+// hard 256 KiB `over_limit` refusal still counts these bytes.
+//
+// INVARIANT: the exemption needs BOTH the scan name and the field name. The
+// field name alone is not sufficient, because ordinary MCP tool arguments are
+// scanned through this same entry point and a caller can choose its own object
+// keys; requiring the scan name means only this runtime's own screening call
+// can reach the exemption, since no MCP tool is named `compiled_context`.
+//
+// Both names are declared HERE, once, and imported by their only other user,
+// `../compiled-context/scanner.ts`. This is the exemption's granting side, so
+// it owns the contract; a hand-mirrored copy on the scanner side would be a
+// pair that drifts into a silently absent exemption or, worse, a field the
+// detector exempts and the scanner no longer writes.
+export const COMPILED_CONTEXT_SCAN_NAME = "compiled_context";
+export const FIRST_PARTY_RUNTIME_FIELD = "compiled_payload_first_party_runtime";
+
+/**
+ * The `large_string` prompt-stuffing threshold, in UTF-16 code units (what
+ * `String.prototype.length` counts), NOT bytes: 10240 = 10 * 1024.
+ *
+ * Exported because an assembler that must keep its own compiled prompt under
+ * this heuristic has to size against the real number rather than a copy of it.
+ * The concierge's bounded record projection derives its budget from this
+ * constant; see `CONCIERGE_RECORD_BUDGET_CHARS` in
+ * `../concierge/prompt-builder.ts`.
+ */
+export const PROMPT_STUFFING_LARGE_STRING_CHARS = 10240;
+const FIRST_PARTY_RUNTIME_FIELD_PATTERN = new RegExp(
+  `^${FIRST_PARTY_RUNTIME_FIELD}$`,
+);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SEC-034: Invisible Unicode characters used in smuggling attacks
 // ─────────────────────────────────────────────────────────────────────────────
@@ -387,7 +426,7 @@ export class InjectionDetector {
   private scanString(
     value: string,
     path: string,
-    _toolName: string,
+    toolName: string,
     signals: InjectionSignal[]
   ): void {
     // Skip obviously safe fields
@@ -527,7 +566,7 @@ export class InjectionDetector {
     // ─────────────────────────────────────────────────────────────────────
     // LOW SEVERITY: Prompt Stuffing
     // ─────────────────────────────────────────────────────────────────────
-    this.detectPromptStuffing(value, location, signals);
+    this.detectPromptStuffing(value, location, signals, toolName);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1081,14 +1120,31 @@ export class InjectionDetector {
 
   /**
    * Detect prompt stuffing: very large strings or high repetition.
+   *
+   * Both patterns here are statements about a CALLER's budget usage, so they
+   * are meaningless against bytes this runtime assembled for itself; scoring a
+   * first-party template by its length turns a normal local prompt into a
+   * screening refusal while telling an operator nothing.
    */
   private detectPromptStuffing(
     value: string,
     path: string,
-    signals: InjectionSignal[]
+    signals: InjectionSignal[],
+    toolName: string
   ): void {
-    // Large string detection (> 10KB)
-    if (value.length > 10240) {
+    // Size and repetition of the runtime's own compiled context are our design
+    // choice, not caller evidence; every other detection above still ran on it.
+    // Both conditions are required: a caller-chosen object key with this name
+    // under any other scan is ordinary untrusted input and stays measured.
+    if (
+      toolName === COMPILED_CONTEXT_SCAN_NAME &&
+      FIRST_PARTY_RUNTIME_FIELD_PATTERN.test(path)
+    ) {
+      return;
+    }
+
+    // Large string detection (> 10 KiB of UTF-16 code units, not bytes).
+    if (value.length > PROMPT_STUFFING_LARGE_STRING_CHARS) {
       signals.push({
         type: "prompt_stuffing",
         pattern: "large_string",

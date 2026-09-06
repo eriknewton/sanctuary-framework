@@ -1,3 +1,4 @@
+// fail-before-exempt: test-isolation only. This PR NEWLY lets a host whose ~/.ollama/models does not exist reach the plan, the consent prompt and the pull instead of refusing before consent, so these wrap paths (they force isTTY true over a temp HOME) now block on a consent prompt no test can answer whenever the host's own Ollama is reachable; this file stubs the ceremony and changes no assertion, so it passes with or without the source fix.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -37,6 +38,23 @@ import {
   CLI_SUBPROCESS_TEST_TIMEOUT_MS,
   runCliRaw,
 } from "../cli/helpers/run-cli.js";
+
+// TEST ISOLATION (AGENTS.md: the operator's machine is not a fixture). `runWrap`
+// runs the local-intelligence ceremony, which probes the HOST's Ollama runtime.
+// On a machine where Ollama is reachable but has no models for the signed
+// catalog, that ceremony correctly reaches an interactive consent prompt, and no
+// test here can answer it. These tests are about the wrap paths around it, so
+// the ceremony is stubbed out rather than read from the host.
+vi.mock("../../src/wrap/local-intelligence.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/wrap/local-intelligence.js")>()),
+  runLocalIntelligenceSetup: async () => ({
+    kind: "already-provisioned" as const,
+    surfaces: [],
+    models: [],
+    provenanceProjection: "projected" as const,
+  }),
+}));
+
 
 const OPERATOR_HOME = "/Users/operator";
 const FORTRESS = `${OPERATOR_HOME}/.sanctuary`;
@@ -777,6 +795,11 @@ describe("protect preflight", () => {
       expect(parsed.command).toBe("sanctuary protect preflight");
       expect(parsed.rows.map((candidate) => candidate.id)).toEqual(ALL_PREFLIGHT_CHECK_IDS);
       expect(result.stderr).not.toContain("Bootstrapped");
+      // `--preflight` short-circuits before the wrap pipeline, so the spawned
+      // CLI never reaches the local-intelligence ceremony (whose only stderr
+      // line, on any refusal, names local intelligence). The file-scope stub
+      // above cannot reach a subprocess, so this is what proves it here.
+      expect(result.stderr).not.toContain("Local intelligence");
     } finally {
       await rm(tmp, { recursive: true, force: true });
     }

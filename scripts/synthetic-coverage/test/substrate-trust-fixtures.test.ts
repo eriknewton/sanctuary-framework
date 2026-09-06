@@ -7,15 +7,15 @@ import "../fixtures/substrate-trust/identity-signing.js";
 import { listClaims } from "../registry.js";
 
 const substrateClaims = listClaims().filter((claim) =>
-  ["4", "5", "8", "18", "19"].includes(claim.id),
+  ["4", "5", "8", "19", "20"].includes(claim.id),
 );
 const fixtures = substrateClaims.flatMap((claim) =>
   claim.fixtures.map((fixture) => ({ claim, fixture })),
 );
 
 expect(substrateClaims.map((claim) => claim.id).sort()).toEqual([
-  "18",
   "19",
+  "20",
   "4",
   "5",
   "8",

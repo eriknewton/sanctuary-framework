@@ -11,6 +11,7 @@ import { FilesystemStorage } from "../../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import { toBase64url } from "../../../src/core/encoding.js";
 import { runProvisionPin } from "../../../src/cli/castle-wall.js";
+import { initializeTestCustody } from "../../helpers/custody-fixture.js";
 import {
   assertExistingDirectoryTreeNoFollow,
   resolveFortressCreateOwner,
@@ -249,9 +250,16 @@ describe("startMacOSCastleWallDaemon threads the re-own uid (Slice M Layer-2)", 
     tempDirs.push(fortressPath);
     const masterKey = generateRandomKey();
     const recoveryKey = toBase64url(masterKey);
+    await initializeTestCustody(fortressPath, { recoveryKey });
+    await mkdir(join(fortressPath, "test-system"), { mode: 0o700 });
     const pinResult = await runProvisionPin([], {
       out: silent,
       err: silent,
+      globalPinnedPublicKeyPath: join(
+        fortressPath,
+        "test-system",
+        "global-pin.bin",
+      ),
       env: {
         SANCTUARY_STORAGE_PATH: fortressPath,
         SANCTUARY_RECOVERY_KEY: recoveryKey,

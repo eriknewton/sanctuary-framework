@@ -1,6 +1,6 @@
 {
   "name": "@sanctuary-framework/mcp-server",
-  "version": "1.7.2",
+  "version": "1.8.4",
   "mcpName": "ai.sanctuaryprotocol/sanctuary",
   "description": "The open source standard for secure, private AI: operating-system enforcement is live on macOS today; Linux and Windows are not live enforcement yet, and your data stays under your own keys with current portability bounds called out in the Assurance Matrix. Any agent, local or cloud, one machine or many.",
   "type": "module",
@@ -20,18 +20,33 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
-    }
+    },
+    "./intelligence": {
+      "types": "./dist/intelligence/index.d.ts",
+      "import": "./dist/intelligence/index.js",
+      "require": "./dist/intelligence/index.cjs"
+    },
+    "./intelligence/catalog-v3/schemas/catalog-body.v3.schema.json": "./dist/intelligence/catalog-v3/schemas/catalog-body.v3.schema.json",
+    "./intelligence/catalog-v3/schemas/catalog-index.v1.schema.json": "./dist/intelligence/catalog-v3/schemas/catalog-index.v1.schema.json",
+    "./intelligence/catalog-v3/schemas/overlay-body.v1.schema.json": "./dist/intelligence/catalog-v3/schemas/overlay-body.v1.schema.json",
+    "./intelligence/catalog-v3/schemas/schema-digests.json": "./dist/intelligence/catalog-v3/schemas/schema-digests.json",
+    "./intelligence/catalog-v3/schemas/signed-catalog.v3.schema.json": "./dist/intelligence/catalog-v3/schemas/signed-catalog.v3.schema.json",
+    "./intelligence/catalog-v3/schemas/signed-overlay.v1.schema.json": "./dist/intelligence/catalog-v3/schemas/signed-overlay.v1.schema.json",
+    "./intelligence/catalog-v3/spdx/spdx-expression-3.0.1.abnf": "./dist/intelligence/catalog-v3/spdx/spdx-expression-3.0.1.abnf",
+    "./intelligence/model-manifest/model-manifest.v2.json": "./dist/intelligence/model-manifest/model-manifest.v2.json"
   },
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
-    "build": "node scripts/sign-reference-plugin.mjs && tsup && npm run build:boot-runtime && node scripts/copy-templates.js",
+    "build": "node scripts/copy-catalog-v3-assets.mjs --verify-only && node scripts/copy-model-manifest-v2-asset.mjs --verify-only && node scripts/sign-reference-plugin.mjs && tsup && npm run build:boot-runtime && node scripts/copy-templates.js && node scripts/copy-catalog-v3-assets.mjs && node scripts/copy-model-manifest-v2-asset.mjs",
     "build:boot-runtime": "tsup --config tsup.boot-runtime.config.ts",
     "sign-reference-plugin": "node scripts/sign-reference-plugin.mjs",
     "sign-release": "tsx scripts/sign-release-manifest.mjs",
+    "sign-model-manifest": "tsx scripts/sign-model-manifest-v2.mjs",
     "dev": "tsup --watch",
     "start": "node dist/cli.js",
     "pretest": "npm run build",
@@ -100,6 +115,7 @@
     "@types/node": "26.2.0",
     "@types/pg": "8.23.1",
     "@vitest/coverage-v8": "4.1.11",
+    "ajv": "8.20.0",
     "eslint": "10.8.1",
     "tsup": "8.5.1",
     "tsx": "4.23.12",

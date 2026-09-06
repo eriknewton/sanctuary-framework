@@ -1,0 +1,51 @@
+{
+  "language_contract": ["typescript", "python-stdlib"],
+  "domain": "sanctuary.model-catalog.v3",
+  "body": {
+    "schema": "sanctuary.model-catalog.v3",
+    "catalog_version": 1,
+    "issued_at": "2026-09-01T00:00:00Z",
+    "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "previous_catalog_body_sha256": null,
+    "models": [{
+      "model_id": "golden",
+      "identity": {
+        "registry": "registry.ollama.ai",
+        "namespace": "library",
+        "model": "gemma2",
+        "tag": "2b",
+        "ollama_manifest_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "assurance": "light",
+      "license": {
+        "spdx": "Apache-2.0",
+        "source_url": "https://example.com/license",
+        "evidence_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "hardware_tier": "baseline"
+    }],
+    "tiers": {
+      "schema": "tier-table.v1",
+      "tiers": {
+        "baseline": { "min_ram_gib": 8, "description": "Baseline local model hardware" },
+        "mid": { "min_ram_gib": 16, "description": "Mid-tier local model hardware" },
+        "pro": { "min_ram_gib": 32, "description": "Pro local model hardware" }
+      }
+    },
+    "surface_defaults": {
+      "schema": "surface-defaults.v1",
+      "defaults": {
+        "concierge": { "tier": "baseline", "assurance": "light" },
+        "direct-agent-gate-advisor": { "tier": "baseline", "assurance": "light" },
+        "sentinel-scoring": { "tier": "mid", "assurance": "immune" },
+        "gate-explanation": { "tier": "baseline", "assurance": "light" },
+        "privacy-filter-tier-2": { "tier": "mid", "assurance": "immune" },
+        "template-suggestion": { "tier": "baseline", "assurance": "light" }
+      }
+    }
+  },
+  "canonical_body": "{\"catalog_version\":1,\"issued_at\":\"2026-09-01T00:00:00Z\",\"models\":[{\"assurance\":\"light\",\"hardware_tier\":\"baseline\",\"identity\":{\"model\":\"gemma2\",\"namespace\":\"library\",\"ollama_manifest_sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"registry\":\"registry.ollama.ai\",\"tag\":\"2b\"},\"license\":{\"evidence_sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"source_url\":\"https://example.com/license\",\"spdx\":\"Apache-2.0\"},\"model_id\":\"golden\"}],\"previous_catalog_body_sha256\":null,\"schema\":\"sanctuary.model-catalog.v3\",\"source_commit\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"surface_defaults\":{\"defaults\":{\"concierge\":{\"assurance\":\"light\",\"tier\":\"baseline\"},\"direct-agent-gate-advisor\":{\"assurance\":\"light\",\"tier\":\"baseline\"},\"gate-explanation\":{\"assurance\":\"light\",\"tier\":\"baseline\"},\"privacy-filter-tier-2\":{\"assurance\":\"immune\",\"tier\":\"mid\"},\"sentinel-scoring\":{\"assurance\":\"immune\",\"tier\":\"mid\"},\"template-suggestion\":{\"assurance\":\"light\",\"tier\":\"baseline\"}},\"schema\":\"surface-defaults.v1\"},\"tiers\":{\"schema\":\"tier-table.v1\",\"tiers\":{\"baseline\":{\"description\":\"Baseline local model hardware\",\"min_ram_gib\":8},\"mid\":{\"description\":\"Mid-tier local model hardware\",\"min_ram_gib\":16},\"pro\":{\"description\":\"Pro local model hardware\",\"min_ram_gib\":32}}}}",
+  "canonical_body_sha256": "04cdb352d99f88c4d00597313560cf820c56029531fe15ddcd43ca18bbbc9c02",
+  "test_public_key": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+  "signature": "7dPSD_TUoqf-8M4_8i0yhV3VB9oWU5VHQK5-I_DrQbmdwMKW6aljJ0TKHkSu2i_WS0eZBg98jNvmT6VhkOJ-Aw"
+}

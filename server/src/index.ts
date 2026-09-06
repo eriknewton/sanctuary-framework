@@ -145,7 +145,18 @@ import {
   establishMaster,
   checkCastlePinCustody,
   readEnvelopeEpoch,
+  readCustodyEnvelope,
 } from "./core/master-custody.js";
+import {
+  readStoredPassphrase,
+  PassphraseKeyringUnreachableError,
+  PassphraseUnreadableError,
+  PassphrasePathIdentityError,
+} from "./wrap/passphrase.js";
+import {
+  readKeychainCustodyKeyStatus,
+  type KeychainReadResult,
+} from "./wrap/keychain-custody.js";
 import { decrypt } from "./core/encryption.js";
 import { derivePurposeKey, IDENTITY_ENCRYPTION_PURPOSE } from "./core/key-derivation.js";
 import {
@@ -168,6 +179,9 @@ import {
 import { OperatorAuthorizationSpentStore } from "./v1/operator-authorization-spent-store.js";
 import { SubstrateSelector } from "./intelligence/selector.js";
 import { installConsentGatedRedactor } from "./intelligence/privacy-tier2-redactor.js";
+// Boot refuses on every local-intelligence wiring failure; this names which
+// condition refused it (see the checkpoint site below).
+import { describeIntelligenceBootFailure } from "./intelligence/policy-store.js";
 // Agent-facing audit redaction (property #11, no-policy-inference). Single-sourced
 // in operational/agent-audit-redaction.ts so the redact-key set is shared by
 // the agent-facing audit READ here (monitor_audit_log) and the agent-facing audit
@@ -189,6 +203,102 @@ export interface SanctuaryServer {
   masterKey: Uint8Array;
   auditLog: AuditLog;
   policy: PrincipalPolicy;
+  /**
+   * Idempotent async cleanup: stop MCP admission, sentinel/anomaly/inbox
+   * ticks, the selected approval channel (dashboard or webhook), and proxy
+   * clients; then flush inbox persistence, save the baseline, and flush the
+   * audit log. Aggregates errors rather than swallowing them. Does NOT
+   * install process signal handlers; the CLI layer owns that wiring.
+   */
+  cleanup: () => Promise<void>;
+}
+
+/** Outcome of the hands-free boot credential resolution (H1). */
+type HandsFreeBootCredential =
+  | { kind: "passphrase"; value: string }
+  | { kind: "keychain-key"; key: Uint8Array }
+  | { kind: "virgin" }
+  | { kind: "fail-closed"; message: string };
+
+/**
+ * Resolve the exact-fortress stored credential for a hands-free MCP boot (H1),
+ * READ-ONLY. Mirrors the CLI memory verbs' final fallback: the stored
+ * passphrase (OS keyring / namespaced fallback file) first, then the
+ * machine-local custody key. NEVER generates a passphrase and NEVER mints
+ * custody. The envelope presence is what separates a virgin fortress (fall
+ * through to the audited first-run) from an existing one that must fail closed
+ * when no credential resolves, so a boot never mints a fresh master over data a
+ * stored-but-unreadable credential was meant to unlock.
+ */
+async function resolveHandsFreeBootCredential(args: {
+  storage: StorageBackend;
+  storagePath: string;
+  readStored: typeof readStoredPassphrase;
+  readCustody: typeof readKeychainCustodyKeyStatus;
+}): Promise<HandsFreeBootCredential> {
+  const envelope = await readCustodyEnvelope(args.storage);
+  const hasEnvelope = envelope !== null;
+
+  let keyringFailure: string | undefined;
+  try {
+    const stored = await args.readStored({
+      storagePath: args.storagePath,
+      // Read-only: boot must never rewrite the at-rest passphrase file; a
+      // legacy-format upgrade is deferred to a custody verb.
+      readOnly: true,
+    });
+    if (stored && stored.value.length > 0) {
+      return { kind: "passphrase", value: stored.value };
+    }
+  } catch (error) {
+    // A locked/unreachable keyring or an unreadable fallback is NOT "absent":
+    // record it so an existing fortress fails closed with the real cause rather
+    // than minting over data hidden behind a temporary outage.
+    if (
+      error instanceof PassphraseKeyringUnreachableError ||
+      error instanceof PassphraseUnreadableError ||
+      error instanceof PassphrasePathIdentityError
+    ) {
+      keyringFailure = error.message;
+    } else {
+      keyringFailure =
+        "the stored fortress passphrase could not be read; no secret detail was emitted";
+    }
+  }
+
+  let custody: KeychainReadResult;
+  try {
+    custody = await args.readCustody(args.storagePath, {});
+  } catch {
+    custody = {
+      status: "unreachable",
+      detail: "the stored custody-key identity could not be determined",
+    };
+  }
+  if (custody.status === "found" && custody.key) {
+    return { kind: "keychain-key", key: custody.key };
+  }
+
+  if (!hasEnvelope) return { kind: "virgin" };
+
+  const cause =
+    keyringFailure ??
+    (custody.status === "unreachable" && custody.detail
+      ? custody.detail
+      : undefined);
+  return {
+    kind: "fail-closed",
+    message:
+      `Refusing to start: the fortress at ${args.storagePath} exists but no credential ` +
+      `is available to open it hands-free` +
+      (cause ? ` (${cause})` : "") +
+      `.\nSupply one of:\n` +
+      `  - SANCTUARY_PASSPHRASE=<fortress passphrase>, or\n` +
+      `  - SANCTUARY_RECOVERY_KEY=<recovery key>, or\n` +
+      `  - store this fortress's passphrase in the OS keyring on this host by\n` +
+      `    running \`sanctuary protect\` for it, then restart (no secret is typed here).\n` +
+      `Refusing to generate a passphrase or mint a new master: that would strand the existing state.`,
+  };
 }
 
 /**
@@ -207,6 +317,15 @@ export async function createSanctuaryServer(options?: {
    * without this hook is a startup error.
    */
   approvalCallback?: (request: ApprovalRequest) => Promise<ApprovalResponse>;
+  /**
+   * TEST ONLY: fake the exact-fortress stored-passphrase read used by the
+   * hands-free boot path (H1). Defaults to the real {@link readStoredPassphrase}.
+   * Injected so a wired-consumer test can boot with ONLY a stored keyring
+   * credential (in-memory keychain fake) and no credential env.
+   */
+  __testReadStoredPassphrase?: typeof readStoredPassphrase;
+  /** TEST ONLY: fake the machine-local custody-key read used by hands-free boot. */
+  __testReadKeychainCustody?: typeof readKeychainCustodyKeyStatus;
 }): Promise<SanctuaryServer> {
   // 1. Load configuration
   const config = await loadConfig(options?.configPath);
@@ -234,18 +353,63 @@ export async function createSanctuaryServer(options?: {
   const passphrase = options?.passphrase ?? process.env.SANCTUARY_PASSPHRASE;
   const envRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
 
-  const custody = await establishMaster({
-    storage,
-    ...(passphrase ? { passphrase } : {}),
-    ...(envRecoveryKey ? { recoveryKey: envRecoveryKey } : {}),
-    // The MCP server stdio boot is non-interactive by definition (the host
-    // harness owns stdin), so first runs here are a distinct, audited
-    // degraded install mode. A fresh recovery key — a wrap of the one true
-    // master — is minted and disclosed below regardless of credential mode,
-    // so the captured artifact always unlocks everything.
-    firstRun: { installMode: "stdio-server", mintRecoveryKey: true },
-    storagePathHint: config.storage_path,
-  });
+  // H1 (hands-free boot): when the operator supplied NO credential env, resolve
+  // the EXACT-fortress stored credential read-only — the same keyring/custody
+  // path the CLI memory verbs use — so a host whose passphrase is already in the
+  // OS keyring (put there by `sanctuary protect`) boots and reads memory without
+  // re-typing a secret. This NEVER generates a passphrase and NEVER mints
+  // custody (readOnly), so a virgin fortress still falls through to the audited
+  // first-run below, while an EXISTING fortress with no resolvable credential
+  // fails closed with a remediation instead of a bare "credential missing".
+  let bootPassphrase = passphrase;
+  let bootKeychainKey: Uint8Array | undefined;
+  if (passphrase === undefined && envRecoveryKey === undefined) {
+    const stored = await resolveHandsFreeBootCredential({
+      storage,
+      storagePath: config.storage_path,
+      readStored: options?.__testReadStoredPassphrase ?? readStoredPassphrase,
+      readCustody: options?.__testReadKeychainCustody ?? readKeychainCustodyKeyStatus,
+    });
+    if (stored.kind === "passphrase") {
+      bootPassphrase = stored.value;
+    } else if (stored.kind === "keychain-key") {
+      bootKeychainKey = stored.key;
+    } else if (stored.kind === "fail-closed") {
+      // An existing fortress that cannot be opened hands-free. Refuse with the
+      // secret-free remediation rather than minting a new master over data that
+      // the resolvable-but-absent credential was meant to unlock (MUST-NEVER 5).
+      throw new Error(stored.message);
+    }
+    // stored.kind === "virgin": no envelope; fall through to the first-run mint.
+  }
+
+  let custody: Awaited<ReturnType<typeof establishMaster>>;
+  try {
+    custody = await establishMaster({
+      storage,
+      ...(bootPassphrase ? { passphrase: bootPassphrase } : {}),
+      ...(bootKeychainKey ? { keychainKey: bootKeychainKey } : {}),
+      ...(envRecoveryKey ? { recoveryKey: envRecoveryKey } : {}),
+      // The MCP server stdio boot is non-interactive by definition (the host
+      // harness owns stdin), so first runs here are a distinct, audited
+      // degraded install mode. A fresh recovery key — a wrap of the one true
+      // master — is minted and disclosed below regardless of credential mode,
+      // so the captured artifact always unlocks everything.
+      firstRun: { installMode: "stdio-server", mintRecoveryKey: true },
+      storagePathHint: config.storage_path,
+      // An existing fortress on a network/FUSE/exFAT volume, under sudo, or with
+      // looser perms opens for reads (hands-free memory read) instead of bricking;
+      // a first-run/migration write on such a host still fails closed (S5).
+      barrierDegradeMode: "read-only",
+    });
+  } finally {
+    // Zero the OS-keyring-derived keychain factor on BOTH paths: a REJECTED
+    // establishment (wrong credential, rotation-in-progress, orphaned state)
+    // must not leave the keychain custody key live in memory (MUST-NEVER 6 —
+    // no key material lingers past the operation that needed it).
+    if (bootKeychainKey) bootKeychainKey.fill(0);
+  }
+  try {
   const masterKey = custody.masterKey;
   const keyProtection: "passphrase" | "hardware-key" | "recovery-key" =
     custody.keyProtection;
@@ -997,13 +1161,71 @@ export async function createSanctuaryServer(options?: {
   // the boot-path persistence work in Pi-2 needs the selector in scope
   // alongside the trap registry + trap store, so the declaration moves
   // here and the dashboard branch only assigns to it.
-  let intelligenceSelector: SubstrateSelector | undefined;
+  let intelligenceSelector: SubstrateSelector;
   // Rho-2.5: whether the consent-gated Tier B redactor was installed on
   // the selector above. Threaded into the v1.1 PII binding so the
   // `/api/query-anonymity/pii` route reports the truthful
-  // `effective_tier_b_enabled`. Stays false when the selector failed to
-  // construct (the route then honestly reports inactive).
-  let tierBPiiRedactorInstalled = false;
+  // `effective_tier_b_enabled`.
+  //
+  // No `= false` seed, and that is deliberate: the wiring block below either
+  // completes or throws, so a boot that reaches this point always installed
+  // the redactor. The old seed described a third state, "booted with the
+  // redactor absent and the route reporting inactive", which no longer exists
+  // and must not be implied by a dead initializer.
+  let tierBPiiRedactorInstalled: boolean;
+
+  // Identity binding for every intelligence-layer construction below. Pure
+  // function of state already resolved above, so computing it here rather
+  // than inside the dashboard branch is value-identical.
+  const intelligenceIdentityId =
+    identityManager.getPrimaryIdentityId() ??
+    `fortress:${config.storage_path}`;
+
+  // WP-V1.2-5: construct the Intelligence Substrate Selector against the
+  // unlocked fortress. The selector reads / writes its config under the
+  // fortress storage namespace `_intelligence`, encrypted with the master
+  // key.
+  //
+  // INVARIANT: this runs ONCE, for EVERY approval channel, before the channel
+  // switch below. `selector.load()` IS the boot-time local-intelligence load-
+  // integrity checkpoint: it classifies the persisted record as armed, absent
+  // (the honest legacy-unarmed default), or integrity-invalid, and emits the
+  // audit row for what it found. Constructing it only on the dashboard branch
+  // meant a fortress on any other approval channel never ran the checkpoint,
+  // so a tampered armed record was neither refused nor audited and the boot
+  // printed a healthy startup line. The approval channel an operator picked
+  // has nothing to do with whether their armed model state is intact, so the
+  // checkpoint must not be reachable only through one of them.
+  try {
+    intelligenceSelector = new SubstrateSelector({
+      storage,
+      masterKey,
+      auditLog,
+      identityId: intelligenceIdentityId,
+    });
+    await intelligenceSelector.load();
+    // Rho-2.5: install the consent-gated Tier B PII redactor on the
+    // production selector via THE shared chokepoint. The fortressId MUST
+    // match the one threaded into buildV11Bindings below so the route's
+    // PATCH and the live scrub read the same encrypted config.
+    tierBPiiRedactorInstalled = installConsentGatedRedactor({
+      selector: intelligenceSelector,
+      storage,
+      masterKey,
+      fortressId: fortressIdFromStoragePath(config.storage_path),
+    });
+  } catch (err) {
+    // ALLOWLIST, not denylist: `describeIntelligenceBootFailure` is the single
+    // classifier both composition roots share, and no condition in it is
+    // degradable, so every failure of this block refuses startup. The previous
+    // shape refused only `LocalIntegrityStateLoadError` and degraded on
+    // anything else, which meant an unknown or wrapped tamper error started a
+    // fortress with local intelligence quietly off. Absent state never reaches
+    // here at all: it loads as the honest legacy-unarmed default.
+    // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
+    console.error(`\nSanctuary cannot start.\n${describeIntelligenceBootFailure(err)}\n`);
+    throw err;
+  }
 
   const selectedApprovalChannel = selectApprovalChannelByPolicy({
     config,
@@ -1036,44 +1258,11 @@ export async function createSanctuaryServer(options?: {
     // v1.1 surface whether they boot via `sanctuary --dashboard` or
     // `sanctuary dashboard` (standalone). Legacy routes at / continue
     // to serve.
-    const embeddedHubIdentityId =
-      identityManager.getPrimaryIdentityId() ??
-      `fortress:${config.storage_path}`;
-    // WP-V1.2-5: construct the Intelligence Substrate Selector against the
-    // unlocked fortress. The selector reads / writes its config under the
-    // fortress storage namespace `_intelligence`, encrypted with the
-    // master key. Best-effort: any construction failure degrades to a
-    // selector-less binding (Intelligence panel surfaces "not configured").
-    // Pi-2: the declaration moved to outer function scope so the honeypot
-    // wiring below can pick it up; the dashboard branch only constructs.
-    try {
-      intelligenceSelector = new SubstrateSelector({
-        storage,
-        masterKey,
-        auditLog,
-        identityId: embeddedHubIdentityId,
-      });
-      await intelligenceSelector.load();
-      // Rho-2.5: install the consent-gated Tier B PII redactor on the
-      // production selector via THE shared chokepoint. The fortressId MUST
-      // match the one threaded into buildV11Bindings below so the route's
-      // PATCH and the live scrub read the same encrypted config.
-      tierBPiiRedactorInstalled = installConsentGatedRedactor({
-        selector: intelligenceSelector,
-        storage,
-        masterKey,
-        fortressId: fortressIdFromStoragePath(config.storage_path),
-      });
-    } catch (err) {
-      // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
-      console.error(
-        `  Note: Intelligence panel unavailable (${(err as Error).message}). ` +
-          `Run \`sanctuary dashboard\` and pick a substrate.`,
-      );
-      intelligenceSelector = undefined;
-      // tierBPiiRedactorInstalled stays false (its initialized value): the
-      // install assignment above only completes when the try did not throw.
-    }
+    // The selector and its identity binding were constructed once above, for
+    // every approval channel; this branch consumes THAT instance so the
+    // dashboard, the honeypot wiring and the MCP tool graph all read and
+    // write the same `_intelligence` config through one object.
+    const embeddedHubIdentityId = intelligenceIdentityId;
     dashboard.setV11Bindings(
       buildV11Bindings({
         identityId: embeddedHubIdentityId,
@@ -2046,16 +2235,53 @@ export async function createSanctuaryServer(options?: {
   // 20. Save config if this is first run
   await saveConfig(config);
 
-  // 21. Register baseline save and proxy shutdown on process exit
-  const cleanup = () => {
-    unifiedInboxScheduler.stop();
-    baseline.save().catch(() => {});
-    if (clientManager) {
-      clientManager.shutdown().catch(() => {});
-    }
+  // 21. Build the idempotent async cleanup function. Signal handlers are NOT
+  // installed here: the CLI layer (cli.ts) owns that wiring so that an
+  // embedded server never silently squats process signals. The cleanup is
+  // returned in SanctuaryServer.cleanup for the CLI and any embedding caller
+  // to invoke at the right time for their runtime model.
+  let cleanupPromise: Promise<void> | undefined;
+  const cleanup = (): Promise<void> => {
+    if (cleanupPromise) return cleanupPromise;
+    // Assign the cache via Promise.resolve().then(body) BEFORE the body runs.
+    // If server.close() inside the body synchronously fires onclose → cleanup(),
+    // the second call finds cleanupPromise already set and returns it (no reentry).
+    cleanupPromise = Promise.resolve().then(async () => {
+      const errors: unknown[] = [];
+      // Stop MCP admission first so no new tool calls are accepted.
+      // server.close() is async (SDK Protocol.close); awaiting it ensures the
+      // transport is fully torn down before we flush persistence below.
+      try { await server.close(); } catch (e) { errors.push(e); }
+      // Stop future ticks independently so a failure in one does not block others.
+      try { unifiedInboxScheduler.stop(); } catch (e) { errors.push(e); }
+      // Stop future calibration audit production before the final flush.
+      try { autoTriggerSuggester.stop(); } catch (e) { errors.push(e); }
+      try { await sentinelDispatcher.dispose(); } catch (e) { errors.push(e); }
+      try { await anomalyDispatcher.dispose(); } catch (e) { errors.push(e); }
+      // Dispose the auto-trigger dispatcher's pending timers/listeners after
+      // its event sources (sentinel, anomaly) have been stopped above.
+      try { autoTriggerDispatcher.dispose(); } catch (e) { errors.push(e); }
+      // Stop the selected approval channel. Dispose may emit audit entries.
+      if (selectedApprovalChannel.type === "dashboard") {
+        try { await selectedApprovalChannel.channel.stop(); } catch (e) { errors.push(e); }
+      } else if (selectedApprovalChannel.type === "webhook") {
+        try { await selectedApprovalChannel.channel.stop(); } catch (e) { errors.push(e); }
+      }
+      // Shut down proxy client connections.
+      if (clientManager) {
+        try { await clientManager.shutdown(); } catch (e) { errors.push(e); }
+      }
+      // Flush persistence last; audit flush must follow inbox and baseline.
+      try { await unifiedInboxBridge.flushPersistence(); } catch (e) { errors.push(e); }
+      try { await baseline.save(); } catch (e) { errors.push(e); }
+      try { await auditLog.flush(); } catch (e) { errors.push(e); }
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1) {
+        throw new AggregateError(errors, "Sanctuary MCP Server cleanup encountered errors");
+      }
+    });
+    return cleanupPromise;
   };
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
 
   // 22. Escrow the full recovery key off-host if one was generated on this
   // first run (the durable fix). The recovery key is NEVER written inside the
@@ -2095,7 +2321,25 @@ export async function createSanctuaryServer(options?: {
     masterKey,
     auditLog,
     policy,
+    cleanup,
   };
+  } catch (error) {
+    // Startup never transferred the master session to a live server. Release
+    // its shared rotation barrier only after every attempted startup write has
+    // settled, then scrub the unowned master before surfacing the root cause.
+    try {
+      await custody.masterWriteBarrier?.release();
+    } catch (releaseError) {
+      custody.masterKey.fill(0);
+      throw new AggregateError(
+        [error, releaseError],
+        "Sanctuary startup failed and its master-write barrier did not release cleanly",
+        { cause: releaseError },
+      );
+    }
+    custody.masterKey.fill(0);
+    throw error;
+  }
 }
 
 const WRITE_MCP_TOOLS: ReadonlySet<string> = new Set([

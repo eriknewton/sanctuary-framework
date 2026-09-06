@@ -32,8 +32,13 @@ import {
 } from "../../src/core/master-custody.js";
 import {
   readEpochWitness,
+  writeEpochWitness,
   observeWitnessEpoch,
   evaluateRollback,
+  raiseBaselineEstablishedLatch,
+  raiseRevocationFloorLatch,
+  readBaselineEstablishedLatch,
+  readRevocationFloorLatch,
   EPOCH_WITNESS_META_KEY,
 } from "../../src/core/anti-rollback.js";
 import {
@@ -49,6 +54,7 @@ import {
 import {
   rotateMaster,
   resumeRotation,
+  advanceEpochWitnessData,
   RotationPreflightError,
   RotationResumeError,
   type RotateMasterOptions,
@@ -112,6 +118,12 @@ import {
   readSdwOwnerPin,
   writeSdwOwnerPin,
 } from "../../src/sdw/write-gate.js";
+import {
+  crossCheckConfigBaseline,
+  CONFIG_BASELINE_META_KEY,
+} from "../../src/core/config-baseline.js";
+import { defaultConfig } from "../../src/config.js";
+import { FLEET_ACTIVATION_META_KEY } from "../../src/entitlement/activation.js";
 
 const PASSPHRASE = "rotation-test-passphrase";
 const KID = "agent-rotate-1";
@@ -504,7 +516,17 @@ describe("master rotation — happy path", () => {
         join(dir, "castle-pinned-privkey.enc"),
         JSON.stringify(encrypt(seed, fortress.master))
       );
-      await rotateMaster(rotateOpts(fortress, { fortressPath: dir }));
+      const pinPath = join(dir, "castle-pinned-privkey.enc");
+      await rotateMaster(rotateOpts(fortress, {
+        fortressPath: dir,
+        __testFortressFiles: {
+          read: async () => new Uint8Array(await readFile(pinPath)),
+          write: async (_name, data) => writeFile(pinPath, data, { mode: 0o600 }),
+          delete: async () => false,
+          restoreFreshLockScaffold: async () => undefined,
+          cleanupFreshInitRecoveryResidue: async () => false,
+        },
+      }));
       const est = await establishMaster({
         storage: fortress.storage,
         passphrase: PASSPHRASE,
@@ -1231,6 +1253,524 @@ describe("master rotation — fail-closed coverage", () => {
     expect((await store.readGuardianAntiRollbackAnchor()).status).toBe("invalid");
   });
 
+  it("restamps the authenticated config-security baseline under the new master, so a fortress that has booted the MCP server rotates and its next boot advances", async () => {
+    const fortress = await buildFortress();
+    const config = defaultConfig();
+
+    // Seed the record exactly as the MCP server does on boot (step "5rc"): the
+    // real cross-check writes it MAC'd under the OLD master and raises the
+    // baseline-established latch on the epoch witness. No hand-made blob.
+    const seeded = await crossCheckConfigBaseline({
+      storage: fortress.storage,
+      master: fortress.master,
+      config,
+    });
+    expect(seeded.kind).toBe("seeded");
+    const before = await fortress.storage.read("_meta", CONFIG_BASELINE_META_KEY);
+    expect(before).not.toBeNull();
+
+    // Preflight classifies the record and rotation completes end to end.
+    await rotateMaster(rotateOpts(fortress));
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    const newMaster = est.masterKey;
+
+    // Restamped, not deleted and not left alone: the authenticated body is
+    // byte-identical (rotation never rewrites a posture), only the MAC moved.
+    const after = await fortress.storage.read("_meta", CONFIG_BASELINE_META_KEY);
+    expect(after).not.toBeNull();
+    const parsedBefore = JSON.parse(bytesToString(before!)) as {
+      data: unknown;
+      mac: string;
+    };
+    const parsedAfter = JSON.parse(bytesToString(after!)) as {
+      data: unknown;
+      mac: string;
+    };
+    expect(parsedAfter.data).toEqual(parsedBefore.data);
+    expect(parsedAfter.mac).not.toBe(parsedBefore.mac);
+    // Byte identity of the authenticated body is what the MAC layout depends
+    // on: compare the raw `"data":...` slice of both envelopes, not the parsed
+    // object (a re-serialization that reordered or reformatted keys would pass
+    // toEqual and still break the MAC input).
+    const rawDataSlice = (raw: string): string =>
+      raw.slice(raw.indexOf('"data":'), raw.lastIndexOf(',"mac":'));
+    const rawBefore = bytesToString(before!);
+    const rawAfter = bytesToString(after!);
+    expect(rawDataSlice(rawBefore).length).toBeGreaterThan('"data":{}'.length);
+    expect(rawDataSlice(rawAfter)).toBe(rawDataSlice(rawBefore));
+
+    // The OLD master no longer authenticates it (the gate fails closed on it),
+    // which is what proves the restamp was a re-key rather than a copy.
+    await expect(
+      crossCheckConfigBaseline({
+        storage: fortress.storage,
+        master: fortress.master,
+        config,
+      })
+    ).rejects.toMatchObject({
+      downgrades: [{ reason: "config_baseline_invalid" }],
+    });
+
+    // The NEW master authenticates it through the real boot cross-check: the
+    // first boot after rotation ADVANCES the baseline instead of refusing.
+    const next = await crossCheckConfigBaseline({
+      storage: fortress.storage,
+      master: newMaster,
+      config,
+    });
+    expect(next.kind).toBe("advanced");
+  });
+
+  it("carries the epoch witness's monotonic latches (baseline_established, baseline_schema, revocation_floor) across rotation byte-for-byte", async () => {
+    const fortress = await buildFortress();
+    // Raise every latch the witness carries, exactly as the config gate and the
+    // fleet revocation chokepoint do, MAC'd under the OLD master.
+    await raiseBaselineEstablishedLatch(fortress.storage, fortress.master, 3);
+    await raiseRevocationFloorLatch(fortress.storage, fortress.master, 7);
+    const before = await readEpochWitness(fortress.storage, fortress.master);
+    expect(before.status).toBe("valid");
+    if (before.status !== "valid") throw new Error("unreachable");
+    expect(before.data).toMatchObject({
+      epoch: 0,
+      baseline_established: true,
+      baseline_schema: 3,
+      revocation_floor: 7,
+    });
+
+    await rotateMaster(rotateOpts(fortress));
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+
+    // The epoch advanced AND every latch survived with its exact value.
+    const after = await readEpochWitness(fortress.storage, est.masterKey);
+    expect(after.status).toBe("valid");
+    if (after.status !== "valid") throw new Error("unreachable");
+    expect(after.data.epoch).toBe(1);
+    expect(after.data.baseline_established).toBe(true);
+    expect(after.data.baseline_schema).toBe(3);
+    expect(after.data.revocation_floor).toBe(7);
+    // Byte-for-byte: the three latch fields serialize identically before and
+    // after (the witness MAC covers canonicalJson(data), so this is the layer
+    // the carry must preserve exactly).
+    const latchBytes = (d: typeof after.data): string =>
+      JSON.stringify({
+        baseline_established: d.baseline_established,
+        baseline_schema: d.baseline_schema,
+        revocation_floor: d.revocation_floor,
+      });
+    expect(latchBytes(after.data)).toBe(latchBytes(before.data));
+    // Through the real consumers, not just the raw record.
+    expect(
+      await readBaselineEstablishedLatch(fortress.storage, est.masterKey)
+    ).toEqual({ established: true, sealedSchema: 3 });
+    expect(
+      (await readRevocationFloorLatch(fortress.storage, est.masterKey)).floor
+    ).toBe(7);
+    // And the witness no longer authenticates under the retired master.
+    expect((await readEpochWitness(fortress.storage, fortress.master)).status).toBe(
+      "invalid"
+    );
+  });
+
+  it("refuses at preflight (nothing mutated) when the config-security baseline's envelope marker is missing, instead of leaving it for the next boot to reject", async () => {
+    const fortress = await buildFortress();
+    const config = defaultConfig();
+    await crossCheckConfigBaseline({
+      storage: fortress.storage,
+      master: fortress.master,
+      config,
+    });
+    // Strip the marker from the real record (what a stripped/forged record, or
+    // a writer-vs-recipe marker drift, looks like to the rotation engine).
+    const raw = await fortress.storage.read("_meta", CONFIG_BASELINE_META_KEY);
+    const envelope = JSON.parse(bytesToString(raw!)) as Record<string, unknown>;
+    const markerKey = Object.keys(envelope).find((k) => k.startsWith("__sanctuary_"));
+    expect(markerKey).toBeDefined();
+    delete envelope[markerKey!];
+    const stripped = stringToBytes(JSON.stringify(envelope));
+    await fortress.storage.write("_meta", CONFIG_BASELINE_META_KEY, stripped);
+
+    await expect(rotateMaster(rotateOpts(fortress))).rejects.toThrow(
+      /config-security-baseline-v1 is missing its envelope marker/
+    );
+    // Preflight refusal: the record is untouched and the old master still
+    // unlocks (no journal, no staged envelope).
+    expect(
+      bytesToString((await fortress.storage.read("_meta", CONFIG_BASELINE_META_KEY))!)
+    ).toBe(bytesToString(stripped));
+    expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).toBeNull();
+    expect(await fortress.storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY)).toBeNull();
+    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
+  });
+
+  it("refuses at preflight (nothing mutated) on a `_meta` key whose rotation recipe is still deferred (a fleet control-plane record)", async () => {
+    const fortress = await buildFortress();
+    await fortress.storage.write(
+      "_meta",
+      FLEET_ACTIVATION_META_KEY,
+      stringToBytes(JSON.stringify({ placeholder: true }))
+    );
+    await expect(rotateMaster(rotateOpts(fortress))).rejects.toThrow(
+      new RegExp(`_meta/${FLEET_ACTIVATION_META_KEY} is not a record this rotation engine recognizes`)
+    );
+    expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).toBeNull();
+    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
+  });
+
+  it("a crash right after the config-security baseline is restamped resumes forward without a second restamp, and the record verifies under the new master", async () => {
+    const fortress = await buildFortress();
+    const config = defaultConfig();
+    await crossCheckConfigBaseline({
+      storage: fortress.storage,
+      master: fortress.master,
+      config,
+    });
+    const point = `converted:_meta/${CONFIG_BASELINE_META_KEY}`;
+    let disclosedKey = "";
+    await expect(
+      rotateMaster(
+        rotateOpts(fortress, {
+          captureRecoveryKey: async (rk, verify) => {
+            disclosedKey = rk;
+            return verify(rk);
+          },
+          failpoint: (p) => {
+            if (p === point) throw new Error(`simulated crash at ${p}`);
+          },
+        })
+      )
+    ).rejects.toThrow(/simulated crash/);
+    const afterCrash = await fortress.storage.read("_meta", CONFIG_BASELINE_META_KEY);
+
+    // Resume records every failpoint it passes: the baseline must NOT be
+    // restamped again (it already authenticates under the new master, so the
+    // verify-before-write path reports "already-new" and skips it).
+    const resumePoints: string[] = [];
+    await resumeRotation({
+      storage: fortress.storage,
+      fortressId: FORTRESS_ID,
+      passphrase: PASSPHRASE,
+      failpoint: (p) => {
+        resumePoints.push(p);
+      },
+    });
+    expect(resumePoints).not.toContain(point);
+    expect(resumePoints).toContain("epoch-witness-advanced");
+    const afterResume = await fortress.storage.read("_meta", CONFIG_BASELINE_META_KEY);
+    expect(bytesToString(afterResume!)).toBe(bytesToString(afterCrash!));
+
+    await verifyRotated(fortress, { newRecoveryKey: disclosedKey });
+    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    const next = await crossCheckConfigBaseline({
+      storage: fortress.storage,
+      master: est.masterKey,
+      config,
+    });
+    expect(next.kind).toBe("advanced");
+  });
+
+  /** A fortress whose epoch witness carries every monotonic latch, under the OLD master. */
+  async function buildLatchedFortress(): Promise<Fortress> {
+    const fortress = await buildFortress();
+    await raiseBaselineEstablishedLatch(fortress.storage, fortress.master, 3);
+    await raiseRevocationFloorLatch(fortress.storage, fortress.master, 7);
+    return fortress;
+  }
+
+  async function expectLatchesSurvived(fortress: Fortress): Promise<void> {
+    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    const witness = await readEpochWitness(fortress.storage, est.masterKey);
+    expect(witness.status).toBe("valid");
+    if (witness.status !== "valid") throw new Error("unreachable");
+    expect(witness.data.epoch).toBe(1);
+    expect(witness.data.baseline_established).toBe(true);
+    expect(witness.data.baseline_schema).toBe(3);
+    expect(witness.data.revocation_floor).toBe(7);
+  }
+
+  it("a crash right after the epoch witness is re-keyed resumes without a second witness restamp (already-new), and all three latches survive", async () => {
+    const fortress = await buildLatchedFortress();
+    const point = `converted:_meta/${EPOCH_WITNESS_META_KEY}`;
+    await expect(
+      rotateMaster(
+        rotateOpts(fortress, {
+          failpoint: (p) => {
+            if (p === point) throw new Error(`simulated crash at ${p}`);
+          },
+        })
+      )
+    ).rejects.toThrow(/simulated crash/);
+    const afterCrash = await fortress.storage.read("_meta", EPOCH_WITNESS_META_KEY);
+
+    const resumePoints: string[] = [];
+    await resumeRotation({
+      storage: fortress.storage,
+      fortressId: FORTRESS_ID,
+      passphrase: PASSPHRASE,
+      failpoint: (p) => {
+        resumePoints.push(p);
+      },
+    });
+    // The converting-phase resume re-entered the `_meta` pass, found the witness
+    // already valid under the new master, and did not re-key it.
+    expect(resumePoints).not.toContain(point);
+    expect(resumePoints).toContain("epoch-witness-advanced");
+    // Finalize then advanced the epoch, so the bytes differ from the crash
+    // snapshot only by the epoch fields: the latches came through.
+    expect(bytesToString((await fortress.storage.read("_meta", EPOCH_WITNESS_META_KEY))!)).not.toBe(
+      bytesToString(afterCrash!)
+    );
+    await expectLatchesSurvived(fortress);
+  });
+
+  it("a crash right after the journal flips to finalizing resumes through finalize alone (old master is a placeholder) and still carries all three latches", async () => {
+    const fortress = await buildLatchedFortress();
+    await expect(
+      rotateMaster(
+        rotateOpts(fortress, {
+          failpoint: (p) => {
+            if (p === "journal-finalizing-written") throw new Error(`simulated crash at ${p}`);
+          },
+        })
+      )
+    ).rejects.toThrow(/simulated crash/);
+    // Mid-rotation: the witness is already keyed under the NEW master with epoch
+    // 0 and its latches (convertMeta re-keyed it before the phase flip).
+    const staged = await readCustodyEnvelope(fortress.storage, {
+      envelopeKey: STAGED_CUSTODY_ENVELOPE_KEY,
+    });
+    expect(staged).not.toBeNull();
+
+    const resumePoints: string[] = [];
+    await resumeRotation({
+      storage: fortress.storage,
+      fortressId: FORTRESS_ID,
+      passphrase: PASSPHRASE,
+      failpoint: (p) => {
+        resumePoints.push(p);
+      },
+    });
+    expect(resumePoints).toContain("epoch-witness-advanced");
+    await expectLatchesSurvived(fortress);
+  });
+
+  /**
+   * Simulate the effect of the remedy finalize's refusal names: `sanctuary
+   * restore-attest` force-writes a fresh witness under the ROTATED master at the
+   * live envelope's epoch (the envelope is already promoted when the refusal
+   * fires). The journal blocks establishMaster, so it is set aside for the one
+   * read that obtains the new master and put back byte-for-byte.
+   */
+  async function simulateRestoreAttestRemedy(fortress: Fortress): Promise<void> {
+    const journalBytes = await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY);
+    expect(journalBytes).not.toBeNull();
+    await fortress.storage.delete("_meta", ROTATION_JOURNAL_KEY);
+    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    await fortress.storage.write("_meta", ROTATION_JOURNAL_KEY, journalBytes!);
+    expect(toBase64url(est.masterKey)).not.toBe(toBase64url(fortress.master));
+    await writeEpochWitness(
+      fortress.storage,
+      est.masterKey,
+      { epoch: envelopeEpochOf(est.envelope!), epoch_id: "restore-attest-sim", witnessed_at: new Date().toISOString() },
+      { force: true }
+    );
+  }
+
+  it("finalize refuses (journal kept, witness untouched) when the epoch witness stops authenticating under the new master, names a working remedy, and that remedy lets the resume complete at the latch cost", async () => {
+    const fortress = await buildLatchedFortress();
+    await expect(
+      rotateMaster(
+        rotateOpts(fortress, {
+          failpoint: (p) => {
+            if (p === "journal-finalizing-written") throw new Error(`simulated crash at ${p}`);
+          },
+        })
+      )
+    ).rejects.toThrow(/simulated crash/);
+
+    // Corrupt the witness MAC in place (it is keyed under the NEW master here).
+    const raw = await fortress.storage.read("_meta", EPOCH_WITNESS_META_KEY);
+    const envelope = JSON.parse(bytesToString(raw!)) as { mac: string };
+    envelope.mac = envelope.mac.slice(0, -2) + (envelope.mac.endsWith("AA") ? "BB" : "AA");
+    const tampered = stringToBytes(JSON.stringify(envelope));
+    await fortress.storage.write("_meta", EPOCH_WITNESS_META_KEY, tampered);
+
+    const resume = () =>
+      resumeRotation({
+        storage: fortress.storage,
+        fortressId: FORTRESS_ID,
+        passphrase: PASSPHRASE,
+      });
+    const expectedMessage =
+      /custody-epoch-witness-v1 does not authenticate under the new master at finalize[\s\S]*restore-attest[\s\S]*rotate-master --resume[\s\S]*Deleting the witness record is not a remedy[\s\S]*forfeit/;
+    // Deterministic: the same refusal on every attempt, the journal stays, and
+    // the tampered record is never overwritten (no laundering).
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await expect(resume()).rejects.toThrow(expectedMessage);
+      expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).not.toBeNull();
+      expect(
+        bytesToString((await fortress.storage.read("_meta", EPOCH_WITNESS_META_KEY))!)
+      ).toBe(bytesToString(tampered));
+    }
+    // Deleting is not a remedy: the journal recorded a witness, so a missing one
+    // is refused too (and nothing is written over the gap).
+    await fortress.storage.delete("_meta", EPOCH_WITNESS_META_KEY);
+    await expect(resume()).rejects.toThrow(/is missing, but the rotation journal records/);
+    expect(await fortress.storage.read("_meta", EPOCH_WITNESS_META_KEY)).toBeNull();
+
+    // The remedy named in the message (restore-attest's write, simulated): the
+    // resume completes, and the fortress is rotated with a fresh witness at the
+    // new epoch, minus the latches (the stated cost).
+    await simulateRestoreAttestRemedy(fortress);
+    await resume();
+    expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).toBeNull();
+    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    const witness = await readEpochWitness(fortress.storage, est.masterKey);
+    expect(witness.status).toBe("valid");
+    if (witness.status !== "valid") throw new Error("unreachable");
+    expect(witness.data.epoch).toBe(1);
+    expect(witness.data.baseline_established).toBeUndefined();
+    expect(witness.data.revocation_floor).toBeUndefined();
+  });
+
+  /** The authenticated rotation journal's data object, read raw (MAC not re-verified here). */
+  async function readRawJournalData(fortress: Fortress): Promise<Record<string, unknown>> {
+    const raw = await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY);
+    expect(raw).not.toBeNull();
+    return (JSON.parse(bytesToString(raw!)) as { data: Record<string, unknown> }).data;
+  }
+
+  it("journal records no witness on a fortress that never had one, and finalize's absent path writes the first witness without refusing", async () => {
+    const fortress = await buildFortress();
+    expect((await readEpochWitness(fortress.storage, fortress.master)).status).toBe("absent");
+    await expect(
+      rotateMaster(
+        rotateOpts(fortress, {
+          failpoint: (p) => {
+            if (p === "journal-finalizing-written") throw new Error(`simulated crash at ${p}`);
+          },
+        })
+      )
+    ).rejects.toThrow(/simulated crash/);
+    expect((await readRawJournalData(fortress)).epoch_witness_present).toBe(false);
+
+    await resumeRotation({
+      storage: fortress.storage,
+      fortressId: FORTRESS_ID,
+      passphrase: PASSPHRASE,
+    });
+    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    const witness = await readEpochWitness(fortress.storage, est.masterKey);
+    expect(witness.status).toBe("valid");
+    if (witness.status !== "valid") throw new Error("unreachable");
+    expect(witness.data.epoch).toBe(1);
+  });
+
+  it("finalize refuses deterministically (journal kept) when the witness the journal recorded as present has gone missing, instead of writing a fresh latch-free one", async () => {
+    const fortress = await buildLatchedFortress();
+    await expect(
+      rotateMaster(
+        rotateOpts(fortress, {
+          failpoint: (p) => {
+            if (p === "journal-finalizing-written") throw new Error(`simulated crash at ${p}`);
+          },
+        })
+      )
+    ).rejects.toThrow(/simulated crash/);
+    expect((await readRawJournalData(fortress)).epoch_witness_present).toBe(true);
+
+    // The re-keyed witness vanishes between conversion and finalize.
+    await fortress.storage.delete("_meta", EPOCH_WITNESS_META_KEY);
+
+    const resume = () =>
+      resumeRotation({
+        storage: fortress.storage,
+        fortressId: FORTRESS_ID,
+        passphrase: PASSPHRASE,
+      });
+    const expectedMessage =
+      /custody-epoch-witness-v1 is missing, but the rotation journal records that an authenticated witness existed[\s\S]*restore-attest[\s\S]*rotate-master --resume[\s\S]*forfeit/;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await expect(resume()).rejects.toThrow(expectedMessage);
+      expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).not.toBeNull();
+      // No fresh witness was written over the gap.
+      expect(await fortress.storage.read("_meta", EPOCH_WITNESS_META_KEY)).toBeNull();
+    }
+    // The named remedy (restore-attest's write, simulated) unblocks the resume;
+    // the latches are forfeited, as the message says.
+    await simulateRestoreAttestRemedy(fortress);
+    await resume();
+    expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY)).toBeNull();
+    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    const witness = await readEpochWitness(fortress.storage, est.masterKey);
+    expect(witness.status).toBe("valid");
+    if (witness.status !== "valid") throw new Error("unreachable");
+    expect(witness.data.epoch).toBe(1);
+    expect(witness.data.baseline_established).toBeUndefined();
+  });
+
+  it("carries an explicitly-false latch and every other present witness field through finalize (full-object carry, not an allow-list)", async () => {
+    const fortress = await buildFortress();
+    // An explicit `false` is a PRESENT key the reader authenticates as such; the
+    // MAC covers it, so the carry must preserve it rather than drop it.
+    await writeEpochWitness(fortress.storage, fortress.master, {
+      epoch: 0,
+      epoch_id: "epoch-0-creation",
+      witnessed_at: new Date().toISOString(),
+      baseline_established: false,
+      baseline_schema: 0,
+      revocation_floor: 0,
+    });
+    await rotateMaster(rotateOpts(fortress));
+    const est = await establishMaster({ storage: fortress.storage, passphrase: PASSPHRASE });
+    const witness = await readEpochWitness(fortress.storage, est.masterKey);
+    expect(witness.status).toBe("valid");
+    if (witness.status !== "valid") throw new Error("unreachable");
+    expect(witness.data.epoch).toBe(1);
+    expect(witness.data.baseline_established).toBe(false);
+    expect(witness.data.baseline_schema).toBe(0);
+    expect(witness.data.revocation_floor).toBe(0);
+    expect(Object.keys(witness.data).sort()).toEqual(
+      ["baseline_established", "baseline_schema", "epoch", "epoch_id", "revocation_floor", "witnessed_at"]
+    );
+  });
+
+  it("advanceEpochWitnessData overrides only the epoch fields: a witness field finalize has never heard of survives", () => {
+    // Type-cast fixture: a monotonic field anti-rollback might add later. (The
+    // reader's closed schema would reject such a field on disk today, so this
+    // property is proven at the carry layer, where the allow-list lived.)
+    const prior = {
+      epoch: 4,
+      epoch_id: "old",
+      witnessed_at: "2026-01-01T00:00:00.000Z",
+      baseline_established: true,
+      future_latch: 42,
+    } as unknown as Parameters<typeof advanceEpochWitnessData>[0];
+    const advanced = advanceEpochWitnessData(prior, {
+      epoch: 5,
+      epoch_id: "new",
+      witnessed_at: "2026-02-02T00:00:00.000Z",
+    }) as unknown as Record<string, unknown>;
+    expect(advanced).toEqual({
+      epoch: 5,
+      epoch_id: "new",
+      witnessed_at: "2026-02-02T00:00:00.000Z",
+      baseline_established: true,
+      future_latch: 42,
+    });
+    // No witness at all: only the advance fields are written.
+    expect(
+      advanceEpochWitnessData(undefined, { epoch: 1, epoch_id: "r", witnessed_at: "t" })
+    ).toEqual({ epoch: 1, epoch_id: "r", witnessed_at: "t" });
+  });
+
   it("aborts BY NAME on unified-inbox operator-prefs records (hash-keyed AAD — codex r2)", async () => {
     const fortress = await buildFortress();
     await fortress.storage.write(
@@ -1349,10 +1889,193 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
     `converted:_identities/${KID}`,
     "converted:notes/k1",
     "audit-epoch-written",
+    "recovery-key-escrow-committed",
     "journal-finalizing-written",
     "envelope-promoted",
     "rotation-audited",
   ];
+
+  it("scrubs old, new, and recovery-key buffers after an injected rotate failure", async () => {
+    const fortress = await buildFortress();
+    const observed = new Map<string, Uint8Array[]>();
+    await expect(rotateMaster(rotateOpts(fortress, {
+      __testObserveSecretBuffer: (label, buffer) => {
+        const buffers = observed.get(label) ?? [];
+        buffers.push(buffer);
+        observed.set(label, buffers);
+      },
+      failpoint: (point) => {
+        if (point === "staged-envelope-written") {
+          throw new Error("injected rotate failure");
+        }
+      },
+    }))).rejects.toThrow("injected rotate failure");
+
+    expect([...observed.keys()]).toEqual(expect.arrayContaining([
+      "old-master",
+      "new-master",
+      "recovery-key",
+    ]));
+    for (const buffers of observed.values()) {
+      for (const buffer of buffers) {
+        expect([...buffer].every((byte) => byte === 0)).toBe(true);
+      }
+    }
+  });
+
+  it("scrubs both decoded masters after an injected resume failure", async () => {
+    const fortress = await buildFortress();
+    await expect(rotateMaster(rotateOpts(fortress, {
+      failpoint: (point) => {
+        if (point === "journal-converting-written") {
+          throw new Error("prepare interrupted resume fixture");
+        }
+      },
+    }))).rejects.toThrow("prepare interrupted resume fixture");
+
+    const observed = new Map<string, Uint8Array[]>();
+    await expect(resumeRotation({
+      storage: fortress.storage,
+      fortressId: FORTRESS_ID,
+      passphrase: PASSPHRASE,
+      __testObserveSecretBuffer: (label, buffer) => {
+        const buffers = observed.get(label) ?? [];
+        buffers.push(buffer);
+        observed.set(label, buffers);
+      },
+      failpoint: (point) => {
+        if (point === `converted:_identities/${KID}`) {
+          throw new Error("injected resume failure");
+        }
+      },
+    })).rejects.toThrow("injected resume failure");
+
+    expect([...observed.keys()]).toEqual(expect.arrayContaining([
+      "old-master",
+      "new-master",
+    ]));
+    for (const buffers of observed.values()) {
+      for (const buffer of buffers) {
+        expect([...buffer].every((byte) => byte === 0)).toBe(true);
+      }
+    }
+  });
+
+  it("promotes transactional recovery escrow only with a durable journal and then closes its handle", async () => {
+    const fortress = await buildFortress();
+    const events: string[] = [];
+    await rotateMaster(rotateOpts(fortress, {
+      captureRecoveryKey: async (rk, verify) => {
+        expect(await verify(rk)).toBe(true);
+        return {
+          captured: true,
+          commit: async () => {
+            expect(await fortress.storage.read("_meta", ROTATION_JOURNAL_KEY))
+              .not.toBeNull();
+            events.push("commit");
+          },
+          rollback: async () => { events.push("rollback"); },
+        };
+      },
+    }));
+    expect(events).toEqual(["commit"]);
+  });
+
+  it("preserves staged recovery escrow when conversion fails after the journal point of no return", async () => {
+    const fortress = await buildFortress();
+    const events: string[] = [];
+    await expect(rotateMaster(rotateOpts(fortress, {
+      captureRecoveryKey: async (rk, verify) => {
+        expect(await verify(rk)).toBe(true);
+        return {
+          captured: true,
+          commit: async () => { events.push("commit"); },
+          rollback: async () => { events.push("rollback"); },
+        };
+      },
+      failpoint: (point) => {
+        if (point === "journal-converting-written") {
+          throw new Error("injected pre-escrow-commit failure");
+        }
+      },
+    }))).rejects.toThrow("injected pre-escrow-commit failure");
+    expect(events).toEqual([]);
+  });
+
+  it("preserves both pre-journal failure and recovery-escrow rollback failure", async () => {
+    const fortress = await buildFortress();
+    const error = await rotateMaster(rotateOpts(fortress, {
+      captureRecoveryKey: async (rk, verify) => {
+        // Deliberately do not verify the recovery wrap. The custody floor then
+        // refuses before the journal is written, where rollback is still safe.
+        expect(rk).toBeTruthy();
+        expect(verify).toBeTypeOf("function");
+        return {
+          captured: true,
+          commit: async () => undefined,
+          rollback: async () => { throw new Error("escrow rollback failed"); },
+        };
+      },
+    })).catch((cause) => cause as unknown);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors.map(String)).toEqual([
+      expect.stringContaining("fewer than 2 verified factors"),
+      "Error: escrow rollback failed",
+    ]);
+  });
+
+  it("journals keyring escrow authority and re-adopts it after a hard crash", async () => {
+    const fortress = await buildFortress();
+    let disclosedKey = "";
+    let rollbackCalls = 0;
+    let promoted = false;
+    let authority: {
+      kind: "os-keyring";
+      canonical_service: string;
+      staging_service: string;
+    } | undefined;
+
+    await expect(rotateMaster(rotateOpts(fortress, {
+      captureRecoveryKey: async (rk, verify, rotationId, registerPendingAuthority) => {
+        disclosedKey = rk;
+        expect(await verify(rk)).toBe(true);
+        authority = {
+          kind: "os-keyring",
+          canonical_service: "sanctuary-recovery-test",
+          staging_service: `sanctuary-recovery-test:rotation:${rotationId}`,
+        };
+        await registerPendingAuthority(authority);
+        return {
+          captured: true,
+          authority,
+          commit: async () => { promoted = true; },
+          rollback: async () => { rollbackCalls++; },
+        };
+      },
+      failpoint: (point) => {
+        if (point === "journal-converting-written") {
+          throw new Error("simulated hard crash after journal");
+        }
+      },
+    }))).rejects.toThrow("simulated hard crash after journal");
+    expect(rollbackCalls).toBe(0);
+
+    await resumeRotation({
+      storage: fortress.storage,
+      fortressId: FORTRESS_ID,
+      passphrase: PASSPHRASE,
+      adoptRecoveryEscrow: async (observed, verify, rotationId) => {
+        expect(observed).toEqual(authority);
+        expect(rotationId).toBeTruthy();
+        expect(await verify(disclosedKey)).toBe(true);
+        expect(await verify(toBase64url(new Uint8Array(32).fill(0xee)))).toBe(false);
+        return { commit: async () => { promoted = true; } };
+      },
+    });
+
+    expect(promoted).toBe(true);
+    await verifyRotated(fortress, { newRecoveryKey: disclosedKey });
+  });
 
   for (const point of POST_JOURNAL_FAILPOINTS) {
     it(`crash at "${point}": boot refuses, resume completes, fortress fully rotated`, async () => {
@@ -1389,7 +2112,7 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
     });
   }
 
-  it("crash BEFORE the journal (staged envelope written): fortress boots under the old master; a fresh rotation cleans the orphan and succeeds", async () => {
+  it("an ordinary exception before the journal transactionally removes staged recovery state", async () => {
     const fortress = await buildFortress();
     await expect(
       rotateMaster(
@@ -1403,8 +2126,9 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
       )
     ).rejects.toThrow(/simulated crash/);
 
-    // No journal → normal boot works and yields the OLD master; the staged
-    // orphan is present but inert.
+    // No journal → normal boot works and yields the OLD master. An ordinary
+    // exception runs rollback; hard-crash residue is covered separately by
+    // the process-death tests.
     const est = await establishMaster({
       storage: fortress.storage,
       passphrase: PASSPHRASE,
@@ -1412,7 +2136,7 @@ describe("master rotation — crash safety (journaled two-phase, forward resume)
     expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
     expect(
       await fortress.storage.read("_meta", STAGED_CUSTODY_ENVELOPE_KEY)
-    ).not.toBeNull();
+    ).toBeNull();
 
     // A fresh rotation cleans the orphan and completes.
     let disclosedKey = "";

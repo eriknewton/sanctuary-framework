@@ -152,6 +152,12 @@ function isAllowedDynamicWrite(call: WriteCall): boolean {
         "operator-cloud provision-claim single-use replay-protection metadata (the claim set), written to the frozen internal _federation namespace under its own AES-GCM purpose key; not export-eligible user state, so it must not route through StateStore (mirrors federation-trust-root-store)",
     },
     {
+      path: "server/src/storage/directory-capability-worker.ts",
+      context: "storage.write(namespaceArg(a[0])",
+      reason:
+        "the directory-capability worker is a narrow filesystem transport for an already-authorized FilesystemStorage call; it preserves the caller's namespace and does not create a second state-write API",
+    },
+    {
       path: "server/src/v1/federation-sync-state-store.ts",
       context: "storage.write(",
       reason:

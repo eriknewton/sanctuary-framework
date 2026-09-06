@@ -52,6 +52,14 @@ export type KeychainExec = (
 
 let override: KeychainExec | null = null;
 
+// Credential helpers run while custody/master locks may be held. Bound both
+// time and captured output so a wedged or hostile helper cannot monopolize the
+// lock or exhaust the Node process. These are production constants; tests of
+// the real-spawn branch compile an isolated copy with shorter values.
+const KEYCHAIN_PROCESS_TIMEOUT_MS = 15_000;
+const KEYCHAIN_PROCESS_MAX_OUTPUT_BYTES = 64 * 1024;
+const KEYCHAIN_PROCESS_TERM_GRACE_MS = 250;
+
 /**
  * Install a credential-store implementation (the in-memory fake in tests).
  * Exported for the vitest setup file and for tests that want a bespoke stub;
@@ -242,17 +250,96 @@ async function spawnReal(
   input?: string
 ): Promise<ExecResult> {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d) => {
-      stdout += d.toString();
+    const detached = process.platform !== "win32";
+    const child = spawn(cmd, args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      detached,
     });
-    child.stderr.on("data", (d) => {
-      stderr += d.toString();
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let outputBytes = 0;
+    let settled = false;
+    let terminationReason: "timed out" | "exceeded output limit" | null = null;
+    let timeout: NodeJS.Timeout | null = null;
+    let killTimer: NodeJS.Timeout | null = null;
+
+    const killTree = (signal: NodeJS.Signals): void => {
+      if (child.pid === undefined) return;
+      try {
+        // A detached POSIX child is its own process-group leader. Negative PID
+        // signals the whole group, including descendants that inherited pipes.
+        if (detached) process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch {
+        // ESRCH means the group has already exited, which is the desired state.
+      }
+    };
+
+    const terminate = (
+      reason: "timed out" | "exceeded output limit"
+    ): void => {
+      if (terminationReason !== null) return;
+      terminationReason = reason;
+      if (timeout !== null) clearTimeout(timeout);
+      child.stdin.destroy();
+      killTree("SIGTERM");
+      // Keep this timer alive even if the direct child exits: a descendant may
+      // have inherited the pipes or ignored TERM. The unref prevents it from
+      // delaying a process whose entire group is already gone.
+      killTimer = setTimeout(() => killTree("SIGKILL"), KEYCHAIN_PROCESS_TERM_GRACE_MS);
+      killTimer.unref();
+    };
+
+    const collect = (target: Buffer[], chunk: Buffer | string): void => {
+      if (terminationReason !== null) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const remaining = KEYCHAIN_PROCESS_MAX_OUTPUT_BYTES - outputBytes;
+      if (bytes.length > remaining) {
+        if (remaining > 0) target.push(bytes.subarray(0, remaining));
+        outputBytes = KEYCHAIN_PROCESS_MAX_OUTPUT_BYTES;
+        terminate("exceeded output limit");
+        return;
+      }
+      target.push(bytes);
+      outputBytes += bytes.length;
+    };
+
+    timeout = setTimeout(
+      () => terminate("timed out"),
+      KEYCHAIN_PROCESS_TIMEOUT_MS,
+    );
+    timeout.unref();
+    child.stdout.on("data", (d: Buffer) => collect(stdout, d));
+    child.stderr.on("data", (d: Buffer) => collect(stderr, d));
+    // Destroying stdin during timeout can surface EPIPE. It is subordinate to
+    // the bounded termination result and must not become an unhandled event.
+    child.stdin.on("error", () => {});
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      if (timeout !== null) clearTimeout(timeout);
+      if (terminationReason === null && killTimer !== null) clearTimeout(killTimer);
+      reject(
+        terminationReason === null
+          ? error
+          : new Error(`credential helper ${terminationReason}`),
+      );
     });
-    child.on("error", reject);
-    child.on("close", (code) => resolvePromise({ stdout, stderr, code }));
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      if (timeout !== null) clearTimeout(timeout);
+      if (terminationReason !== null) {
+        reject(new Error(`credential helper ${terminationReason}`));
+        return;
+      }
+      if (killTimer !== null) clearTimeout(killTimer);
+      resolvePromise({
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+        code,
+      });
+    });
     if (input !== undefined) {
       child.stdin.write(input);
     }

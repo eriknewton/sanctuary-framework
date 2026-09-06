@@ -1,6 +1,6 @@
 // fail-before-exempt: type-forced stub only — the fake listener gains an inert recycleConnection() because MacOSCastleWallListenerHandle widened in this PR; nothing this file locks changed. The behavior change fails-before in lease-delivery-watchdog.test.ts (W1/W4/W6 RED on base).
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +13,7 @@ import { FilesystemStorage } from "../../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import { toBase64url } from "../../../src/core/encoding.js";
 import { runProvisionPin } from "../../../src/cli/castle-wall.js";
+import { initializeTestCustody } from "../../helpers/custody-fixture.js";
 import {
   formatCastleWallAlreadyRunningMessage,
   safeModeHandoffMessage,
@@ -96,6 +97,8 @@ describe("Castle Wall macOS daemon integration", () => {
     tempDirs.push(fortressPath);
     const masterKey = generateRandomKey();
     const recoveryKey = toBase64url(masterKey);
+    await initializeTestCustody(fortressPath, { recoveryKey });
+    await mkdir(join(fortressPath, "test-system"), { mode: 0o700 });
     const pinResult = await runProvisionPin([], {
       out: silent,
       err: silent,

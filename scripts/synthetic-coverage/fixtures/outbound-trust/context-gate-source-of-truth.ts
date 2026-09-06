@@ -15,7 +15,7 @@ import { MemoryStorage } from "../../../../server/src/storage/memory.js";
 import { registerFixture } from "../../registry.js";
 import { outcome } from "../state-trust/helpers.js";
 
-const CLAIM_ID = "14";
+const CLAIM_ID = "15";
 const CLAIM_LABEL = "Context-gate single source of truth";
 
 // Entrypoints: initializeContextGateEnforcerFromProfile, ContextGateEnforcer.filterArgs, and ProxyRouter contextGateFilter.

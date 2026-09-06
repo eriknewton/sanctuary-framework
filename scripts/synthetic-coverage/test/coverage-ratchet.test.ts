@@ -104,6 +104,13 @@ describe("synthetic-coverage PR ratchet", () => {
     // that returns an empty report would diff as "no regressions" vacuously.
     expect(report.rows.length).toBeGreaterThanOrEqual(20);
 
+    // Release gate (a) already requires fixtures for proven claims; a stale
+    // baseline must not defer a missing proof until the next release tag.
+    expect(report.rows.filter((row) =>
+      row.assurance_status === "proven" &&
+      (row.coverage_state !== "covered" || row.fixtures_passed === 0 || row.fixtures_failed > 0),
+    ), "Every proven assurance row must have passing synthetic fixtures").toEqual([]);
+
     const baseline = loadBaseline();
     const violations = diffAgainstBaseline(report, baseline);
 

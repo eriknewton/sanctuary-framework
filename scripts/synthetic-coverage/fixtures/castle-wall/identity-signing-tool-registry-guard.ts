@@ -7,8 +7,8 @@ import { generateRandomKey } from "../../../../server/src/core/random.js";
 import { DEFAULT_POLICY } from "../../../../server/src/principal-policy/loader.js";
 
 // Recon: canonical raw-sign guard is DEFAULT_POLICY plus Key 17 signer
-// services, mirrored by tool-registry and key-17 tests. Maps to row 19.
-const CLAIM_ID = "19";
+// services, mirrored by tool-registry and key-17 tests. Maps to row 20.
+const CLAIM_ID = "20";
 const CLAIM_LABEL = "Identity signing authority (PR #270, raw identity_sign Tier 1)";
 const DOMAIN_SEPARATED_SIGN_TOOL = "sanctuary_sign_challenge";
 const DOMAIN_PREFIX = "sanctuary-sign-challenge-v1";

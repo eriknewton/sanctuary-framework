@@ -31,6 +31,7 @@ import type {
   SubstrateResponse,
   SummarizeRequest,
 } from "../types.js";
+import { stripTrailingSlashes } from "../../strings.js";
 
 export const VENICE_CAPABILITY: SubstrateCapability = {
   summarize: true,
@@ -100,7 +101,7 @@ export class VeniceClient {
 
   constructor(config: VeniceClientConfig) {
     this.apiKey = config.apiKey;
-    this.endpoint = (config.endpoint ?? VENICE_DEFAULT_ENDPOINT).replace(/\/+$/, "");
+    this.endpoint = stripTrailingSlashes(config.endpoint ?? VENICE_DEFAULT_ENDPOINT);
     this.model = config.model ?? VENICE_DEFAULT_MODEL;
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.fetchImpl = config.fetchImpl ?? fetch;

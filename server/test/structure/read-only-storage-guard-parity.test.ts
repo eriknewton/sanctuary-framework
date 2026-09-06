@@ -7,6 +7,7 @@
  * asserts SET EQUALITY, in both directions, between:
  *
  *   - every method declared on `StorageBackend` + `FilesystemStorageCapabilities`
+ *     + `NamespaceLockStorageCapabilities`
  *     in `storage/interface.ts`, and
  *   - the union of the guard's declared mutating and delegated method lists.
  *
@@ -33,14 +34,18 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const INTERFACE_FILE = join(HERE, "..", "..", "src", "storage", "interface.ts");
 
 /** The interfaces whose methods the guard must classify. */
-const GUARDED_INTERFACES = ["StorageBackend", "FilesystemStorageCapabilities"];
+const GUARDED_INTERFACES = [
+  "StorageBackend",
+  "FilesystemStorageCapabilities",
+  "NamespaceLockStorageCapabilities",
+];
 
 /**
  * Pull method names out of one `export interface X { ... }` block.
  *
  * Deliberately source-text based, like the repo's other structural guards, so
  * it fails at authoring time. It reads the brace-balanced body of the named
- * interface and matches BOTH member spellings TypeScript allows for a
+ * interface and matches generic or non-generic forms of BOTH member spellings TypeScript allows for a
  * function-shaped member at a declaration position: method style (`name(` /
  * `name?(`) and property style (`name: (…) => …` / `name?: (…) => …`). A
  * parser that saw only the method style would let a mutating member declared
@@ -75,7 +80,7 @@ function interfaceMethodNames(source: string, interfaceName: string): string[] {
   // type). The `\(` after the colon is what keeps non-function properties
   // out of the set.
   for (const match of body.matchAll(
-    /(?:^|\n)\s*([A-Za-z_$][\w$]*)\??\s*(?::\s*)?\(/g
+    /^ {2}([A-Za-z_$][\w$]*)\??\s*(?:<[^>\n]+>)?\s*(?::\s*)?\(/gm
   )) {
     names.add(match[1]!);
   }
@@ -100,6 +105,7 @@ describe("ReadOnlyStorageGuard interface parity", () => {
     expect(declared).toContain("write");
     expect(declared).toContain("read");
     expect(declared).toContain("writeDurable");
+    expect(declared).toContain("withNamespaceLock");
   });
 
   it("classifies every declared storage method, and classifies nothing else", () => {

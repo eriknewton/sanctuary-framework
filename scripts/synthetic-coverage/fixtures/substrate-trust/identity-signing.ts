@@ -22,7 +22,7 @@ import {
 // and core/identity.sign. Existing mirrors: server/test/identity-signing-helpers.test.ts,
 // server/test/principal-policy/approval-gate.test.ts, and
 // server/test/security/tool-registry-raw-signing-guard.test.ts.
-// ASSURANCE_MATRIX row: 19, Identity signing authority.
+// ASSURANCE_MATRIX row: 20, Identity signing authority.
 
 registerFixture(
   ROW_IDENTITY_SIGNING,

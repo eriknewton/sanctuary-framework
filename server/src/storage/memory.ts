@@ -5,16 +5,49 @@
  * but stores everything in memory. Data does not persist across restarts.
  */
 
-import type { StorageBackend, StorageEntryMeta } from "./interface.js";
+import type {
+  NamespaceLockStorageCapabilities,
+  StorageBackend,
+  StorageEntryMeta,
+} from "./interface.js";
+import type {
+  CrossProcessLockLease,
+  CrossProcessLockOptions,
+} from "./cross-process-lock.js";
 import { constantTimeEqual } from "../core/encoding.js";
 import { assertSdwRawWriteAuthorized } from "../sdw/write-gate.js";
 
-export class MemoryStorage implements StorageBackend {
+export class MemoryStorage implements StorageBackend, NamespaceLockStorageCapabilities {
   private store = new Map<string, { data: Uint8Array; modified_at: string }>();
   // Composite store keys are `${namespace}/${key}` and a namespace may itself
   // contain "/", so live namespaces are tracked explicitly (entry counts)
   // rather than re-parsed out of composite keys.
   private namespaceCounts = new Map<string, number>();
+  private namespaceLockTails = new Map<string, Promise<void>>();
+
+  async withNamespaceLock<T>(
+    namespace: string,
+    lockFileName: string,
+    operation: (lease: CrossProcessLockLease) => Promise<T>,
+    _options: CrossProcessLockOptions = {},
+  ): Promise<T> {
+    const identity = `${namespace.length}:${namespace}${lockFileName}`;
+    const predecessor = this.namespaceLockTails.get(identity) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const tail = predecessor.catch(() => undefined).then(() => gate);
+    this.namespaceLockTails.set(identity, tail);
+    await predecessor.catch(() => undefined);
+    const controller = new AbortController();
+    try {
+      return await operation({ signal: controller.signal, assertHeld: () => undefined });
+    } finally {
+      release();
+      if (this.namespaceLockTails.get(identity) === tail) {
+        this.namespaceLockTails.delete(identity);
+      }
+    }
+  }
 
   private storageKey(namespace: string, key: string): string {
     return `${namespace}/${key}`;

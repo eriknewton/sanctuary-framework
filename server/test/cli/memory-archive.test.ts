@@ -48,6 +48,10 @@ import { ingestClaudeCodeMemoryDirectory } from "../../src/sdw/adapters/claude-c
 import { transcodeMemoryDirectory } from "../../src/sdw/memory-transcode.js";
 import { SdwMemoryProvenanceMigration } from "../../src/sdw/memory-provenance-migration.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import {
+  persistUserProvidedPassphrase,
+  readStoredPassphrase,
+} from "../../src/wrap/passphrase.js";
 import { runExitCommand } from "../../src/exit/cli.js";
 import {
   CLI_SUBPROCESS_TEST_TIMEOUT_MS,
@@ -132,6 +136,18 @@ class RecordingApprovalChannel implements ApprovalChannel {
     if (this.response instanceof Error) throw this.response;
     return this.response;
   }
+}
+
+function interactionWithApproval(
+  terminal: TestTerminal,
+  approval: RecordingApprovalChannel,
+): PrivateMemoryArchiveInteraction {
+  return {
+    requestApproval: (request) => approval.requestApproval(request),
+    discloseAndConfirm: (value) => terminal.discloseAndConfirm(value),
+    readHidden: (prompt) => terminal.readHidden(prompt),
+    close: () => terminal.close(),
+  };
 }
 
 interface Fortress {
@@ -247,6 +263,7 @@ async function exportBundle(source: Fortress, ownerRef = "owner-a", json = false
   const terminal = new TestTerminal();
   const approval = new RecordingApprovalChannel();
   const { out, err } = sinkPair();
+  let observedMaster: Uint8Array | undefined;
   const code = await runMemoryArchiveExportCommand({
     argv: [
       "--archive-id", source.archiveId!,
@@ -259,10 +276,10 @@ async function exportBundle(source: Fortress, ownerRef = "owner-a", json = false
     err,
     stdin: Readable.from(["ordinary-stdin-must-not-be-read\n"]),
     env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
-    interaction: terminal,
-    approvalChannel: approval,
+    interaction: interactionWithApproval(terminal, approval),
+    observeMasterKey: (master) => { observedMaster = master; },
   });
-  return { bundle, terminal, approval, out, err, code };
+  return { bundle, terminal, approval, out, err, code, observedMaster };
 }
 
 function secretText(terminal: TestTerminal): string {
@@ -295,6 +312,8 @@ describe("Exit V2 memory archive CLI", () => {
     const source = await fortress("exit-v2-cli-source", "owner-a", true);
     const result = await exportBundle(source, "owner-a", true);
     expect(result.code).toBe(0);
+    expect(result.observedMaster).toBeDefined();
+    expect([...result.observedMaster!].every((byte) => byte === 0)).toBe(true);
     expect(result.terminal.secretWrites).toHaveLength(1);
     expect(result.terminal.hiddenReads).toBe(1);
     const transferKey = secretText(result.terminal);
@@ -381,8 +400,10 @@ describe("Exit V2 memory archive CLI", () => {
         out,
         err,
         env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
-        interaction: new TestTerminal(),
-        approvalChannel: new RecordingApprovalChannel(response),
+        interaction: interactionWithApproval(
+          new TestTerminal(),
+          new RecordingApprovalChannel(response),
+        ),
       });
       expect(code).toBe(1);
       await expect(stat(bundle)).rejects.toMatchObject({ code: "ENOENT" });
@@ -403,8 +424,7 @@ describe("Exit V2 memory archive CLI", () => {
       out,
       err,
       env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
-      interaction: new TestTerminal(),
-      approvalChannel: approval,
+      interaction: interactionWithApproval(new TestTerminal(), approval),
     })).toBe(1);
     expect(approval.requests).toHaveLength(1);
     expect(approval.requests[0]!.operation).toBe("memory_provenance_prune_signers");
@@ -434,8 +454,7 @@ describe("Exit V2 memory archive CLI", () => {
         SANCTUARY_PASSPHRASE: PASSPHRASE,
         SANCTUARY_EXIT_TRANSFER_KEY: "wrong-env-value-must-be-ignored",
       },
-      interaction: terminal,
-      approvalChannel: approval,
+      interaction: interactionWithApproval(terminal, approval),
     });
     expect(code, err.text()).toBe(0);
     expect(terminal.hiddenReads).toBe(2);
@@ -492,7 +511,6 @@ describe("Exit V2 memory archive CLI", () => {
       stdin: Readable.from([`${secretText(exported.terminal)}\n`]),
       env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
       interaction: null,
-      approvalChannel: new RecordingApprovalChannel(),
     });
     expect(code).toBe(1);
     expect(out.text()).toBe("");
@@ -515,8 +533,7 @@ describe("Exit V2 memory archive CLI", () => {
         out,
         err,
         env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
-        interaction: terminal,
-        approvalChannel: new RecordingApprovalChannel(),
+        interaction: interactionWithApproval(terminal, new RecordingApprovalChannel()),
       });
       expect(code).toBe(1);
       expect(`${out.text()}${err.text()}`).not.toContain(
@@ -543,8 +560,10 @@ describe("Exit V2 memory archive CLI", () => {
         out: new Sink(),
         err: new Sink(),
         env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
-        interaction: terminal,
-        approvalChannel: new RecordingApprovalChannel(response),
+        interaction: interactionWithApproval(
+          terminal,
+          new RecordingApprovalChannel(response),
+        ),
       });
       expect(code).toBe(1);
       expect(terminal.hiddenReads).toBe(1);
@@ -571,8 +590,7 @@ describe("Exit V2 memory archive CLI", () => {
       out: new ThrowingSink(),
       err,
       env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
-      interaction: terminal,
-      approvalChannel: approval,
+      interaction: interactionWithApproval(terminal, approval),
     });
     expect(code).toBe(1);
     // The old catch-all message misdiagnosed a completed irreversible
@@ -626,8 +644,7 @@ describe("Exit V2 memory archive CLI", () => {
         out,
         err,
         env: {},
-        interaction: terminal,
-        approvalChannel: new RecordingApprovalChannel(),
+        interaction: interactionWithApproval(terminal, new RecordingApprovalChannel()),
       });
       expect(code).toBe(2);
       expect(`${out.text()}${err.text()}`).not.toContain(secret);
@@ -841,5 +858,121 @@ describe("Exit V2 memory archive CLI", () => {
     expect(source).not.toContain("readFile(manifestPath)");
     expect(source).not.toContain("readFile(artifactPath)");
     expect(source).toContain("open(path, \"r\")");
+  });
+});
+
+describe("Rung 1 memory-archive stored-custody wiring (F6)", () => {
+  async function exportWithEnv(
+    source: Fortress,
+    env: NodeJS.ProcessEnv,
+    ownerRef = "owner-a",
+  ) {
+    const bundle = join(await tempDir("f6-archive-bundle-parent"), "bundle");
+    const terminal = new TestTerminal();
+    const approval = new RecordingApprovalChannel();
+    const { out, err } = sinkPair();
+    const code = await runMemoryArchiveExportCommand({
+      argv: [
+        "--archive-id", source.archiveId!,
+        "--out", bundle,
+        "--owner-ref", ownerRef,
+        "--fortress", source.path,
+        "--json",
+      ],
+      out,
+      err,
+      stdin: Readable.from(["ordinary-stdin-must-not-be-read\n"]),
+      env,
+      interaction: interactionWithApproval(terminal, approval),
+    });
+    return { bundle, terminal, approval, out, err, code };
+  }
+
+  it("opens the EXACT fortress via stored custody with NO argv/env secret; the transfer key is fresh and distinct from fortress custody", async () => {
+    const source = await fortress("f6-archive-stored", "owner-a", true);
+    // Store the fortress passphrase in this host's (in-memory) keyring for the
+    // EXACT fortress path — exactly what `sanctuary protect` does.
+    await persistUserProvidedPassphrase(PASSPHRASE, { storagePath: source.path });
+
+    // Run with env:{} — no SANCTUARY_PASSPHRASE / SANCTUARY_RECOVERY_KEY.
+    const r = await exportWithEnv(source, {});
+    expect(r.code).toBe(0);
+    expect(r.err.text()).not.toContain("could not unlock the fortress");
+
+    // The transfer/recovery artifact key is fresh and NOT the fortress custody.
+    const transferKey = secretText(r.terminal);
+    expect(transferKey).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(transferKey).not.toBe(PASSPHRASE);
+    // No secret in stdout / JSON / stderr.
+    expect(r.out.text()).not.toContain(PASSPHRASE);
+    expect(r.out.text()).not.toContain(transferKey);
+    expect(r.err.text()).not.toContain(PASSPHRASE);
+    expect(JSON.parse(r.out.text())).not.toHaveProperty("transfer_key");
+  });
+
+  it("no generation: a fortress with no stored credential and no argv/env secret refuses, and never mints one", async () => {
+    const source = await fortress("f6-archive-nocred", "owner-a", true);
+    const r = await exportWithEnv(source, {});
+    expect(r.code).not.toBe(0);
+    expect(r.err.text()).toContain("could not unlock the fortress");
+    // The refusal never GENERATED a credential for this fortress.
+    const after = await readStoredPassphrase({ storagePath: source.path, readOnly: true });
+    expect(after).toBeNull();
+  });
+
+  it("mismatch: a stored credential that does not open the fortress is refused", async () => {
+    const source = await fortress("f6-archive-mismatch", "owner-a", true);
+    await persistUserProvidedPassphrase("not-the-fortress-passphrase", {
+      storagePath: source.path,
+    });
+    const r = await exportWithEnv(source, {});
+    expect(r.code).not.toBe(0);
+    expect(r.err.text()).toContain("could not unlock the fortress");
+  });
+
+  it("cross-fortress isolation: a --fortress target never reads a DIFFERENT fortress's stored credential", async () => {
+    const source = await fortress("f6-archive-isolation", "owner-a", true);
+    // Store a credential for an UNRELATED sibling fortress path only.
+    const otherPath = join(await tempDir("f6-archive-other"), ".sanctuary");
+    await persistUserProvidedPassphrase(PASSPHRASE, { storagePath: otherPath });
+    // The target fortress has NO credential of its own → must refuse, never
+    // borrow the sibling's entry (the keyring lookup is namespaced to the exact
+    // fortress path).
+    const r = await exportWithEnv(source, {});
+    expect(r.code).not.toBe(0);
+    expect(r.err.text()).toContain("could not unlock the fortress");
+  });
+
+  it("import opens the destination fortress via stored custody with no argv/env secret", async () => {
+    // Export from a source (env credential), then import into a destination
+    // opened via its STORED credential only (env:{}).
+    const src = await fortress("f6-import-src", "owner-a", true);
+    const exported = await exportBundle(src);
+    expect(exported.code).toBe(0);
+
+    const dest = await fortress("f6-import-dest", "owner-a", false);
+    await persistUserProvidedPassphrase(PASSPHRASE, { storagePath: dest.path });
+    const terminal = new TestTerminal();
+    // The operator re-enters the transfer key disclosed at export time.
+    terminal.hiddenValue = Buffer.from(secretText(exported.terminal), "ascii");
+    const { out, err } = sinkPair();
+    const code = await runMemoryArchiveImportCommand({
+      argv: [
+        "--in", exported.bundle,
+        "--owner-ref", "owner-a",
+        "--fortress", dest.path,
+        "--json",
+      ],
+      out,
+      err,
+      stdin: Readable.from(["ordinary-stdin-must-not-be-read\n"]),
+      env: {}, // no argv/env secret — opens via the stored credential
+      interaction: interactionWithApproval(terminal, new RecordingApprovalChannel()),
+    });
+    expect(err.text()).not.toContain("could not unlock the fortress");
+    expect(code, err.text()).toBe(0);
+    // No fortress secret leaked to stdout/JSON.
+    expect(out.text()).not.toContain(PASSPHRASE);
+    expect(out.text()).not.toContain(secretText(exported.terminal));
   });
 });

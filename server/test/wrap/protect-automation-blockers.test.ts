@@ -1,4 +1,4 @@
-// fail-before-exempt: type-forced fixture update only (armed outcomes gained a required liveness field); the liveness rendering this PR adds is already pinned pre-fix-failing in auto-provision-wiring.test.ts and wrap-cli.test.ts
+// fail-before-exempt: test-isolation only. This PR NEWLY lets a host whose ~/.ollama/models does not exist reach the plan, the consent prompt and the pull instead of refusing before consent, so these wrap paths (they force isTTY true over a temp HOME) now block on a consent prompt no test can answer whenever the host's own Ollama is reachable; this file stubs the ceremony and changes no assertion, so it passes with or without the source fix. ALSO RETAINED from the prior exemption, which still describes lines in this file: type-forced fixture update only (armed outcomes gained a required liveness field); the liveness rendering that change added is pinned pre-fix-failing in auto-provision-wiring.test.ts and wrap-cli.test.ts.
 /**
  * N1: three bounded automation-blocker fixes for `sanctuary protect`
  * (drill record 2026-07-26), fix 2 corrected 2026-07-27 (harden-loop):
@@ -67,6 +67,23 @@ import {
   installHermesParityHook,
   clearHermesParityHook,
 } from "../helpers/hermes-parity.js";
+
+// TEST ISOLATION (AGENTS.md: the operator's machine is not a fixture). `runWrap`
+// runs the local-intelligence ceremony, which probes the HOST's Ollama runtime.
+// On a machine where Ollama is reachable but has no models for the signed
+// catalog, that ceremony correctly reaches an interactive consent prompt, and no
+// test here can answer it. These tests are about the wrap paths around it, so
+// the ceremony is stubbed out rather than read from the host.
+vi.mock("../../src/wrap/local-intelligence.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/wrap/local-intelligence.js")>()),
+  runLocalIntelligenceSetup: async () => ({
+    kind: "already-provisioned" as const,
+    surfaces: [],
+    models: [],
+    provenanceProjection: "projected" as const,
+  }),
+}));
+
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, "..", "harness", "fixtures");
@@ -654,6 +671,16 @@ describe("runWrap: signals during in-flight provisioning refuse once, then force
           startDashboard: async () => { throw new Error("dashboard should not start"); },
           openBrowser: async () => {},
           resolvePassphrase: async () => ({ value: "test-passphrase", location: "test-keychain", source: "generated" }),
+          // The module-level mock above cannot reach this real subprocess, so the
+          // same isolation is applied through runWrap's own dependency seam: the
+          // ceremony would otherwise probe the HOST's Ollama and wait on a
+          // consent prompt no script can answer.
+          runLocalIntelligenceSetup: async () => ({
+            kind: "already-provisioned",
+            surfaces: [],
+            models: [],
+            provenanceProjection: "projected",
+          }),
           runAutoProvisionForWrap: async (options) => {
             if (!await options.beforeFirstMutation()) {
               console.log("mutation-blocked");

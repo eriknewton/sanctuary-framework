@@ -10,10 +10,20 @@ import {
 import { ThresholdConfigStore } from "../auto-trigger/threshold-config-store.js";
 import type { StorageBackend } from "../storage/interface.js";
 import { COMPILED_CONTEXT_SENTINEL_ID } from "./types.js";
-import { CompiledContextScanner } from "./scanner.js";
+import {
+  CompiledContextScanner,
+  FIRST_PARTY_STUFFING_EXEMPT_FINGERPRINT_TERM,
+} from "./scanner.js";
 
+// Cache-key input, not a contract version: every screening result the scanner
+// retains is keyed on this string, so ANY change to what the shared detector
+// does must move it or a result decided under the previous policy can be
+// replayed as a false hit. The trailing term is IMPORTED rather than re-typed,
+// because the unwired default fingerprint in `./scanner.ts` must move in the
+// same edit; it records the trust-classed prompt-stuffing sizing granted to
+// `FIRST_PARTY_RUNTIME_FIELD` in `../security/injection-detector.ts`.
 export const COMPILED_CONTEXT_DETECTOR_POLICY_FINGERPRINT =
-  "injection-detector:v1:enabled:medium:escalate:decoded-rescans-64";
+  `injection-detector:v1:enabled:medium:escalate:decoded-rescans-64:${FIRST_PARTY_STUFFING_EXEMPT_FINGERPRINT_TERM}`;
 
 /** Bind screening findings to the existing production dispatcher graph. */
 export function createDispatcherWiredCompiledContextScanner(options: {

@@ -366,9 +366,18 @@ export async function readEpochWitness(
  * (that would itself be a rollback-laundering write). A higher epoch (a
  * legitimate rotation) or an equal epoch (re-stamp) is accepted.
  *
- * `force` (restore-attest only) re-baselines to an explicit epoch even when it
- * is lower than the current witness — the audited, passphrase-gated escape
- * hatch. Without it, witness writes are strictly non-decreasing.
+ * `force` re-baselines to an explicit epoch even when it is lower than the
+ * current witness. Two callers hold it: `restoreAttest` below (the audited,
+ * passphrase-gated escape hatch) and master rotation's `finalize` in
+ * `core/master-rotation.ts` (advancing the epoch past a concurrent stale
+ * witness). Without it, witness writes are strictly non-decreasing. `force`
+ * ALSO bypasses the latch carry below, so every force caller must read the
+ * current witness itself and carry its whole authenticated data object
+ * forward, overriding only the fields it owns. Rotation's `finalize` carries
+ * the whole authenticated object (pinned as its "CARRY INVARIANT" in
+ * `advanceEpochWitnessData`); `restoreAttest` below carries the three known
+ * latches explicitly. A force caller that carries nothing is a latch-erasing
+ * write.
  */
 export async function writeEpochWitness(
   storage: StorageBackend,
@@ -391,8 +400,9 @@ export async function writeEpochWitness(
     // monotonic too: a non-force write must never DROP an already-set latch nor
     // LOWER the sealed-schema floor (either would launder a baseline deletion /
     // downgrade by re-stamping the witness). Carry them forward unless the caller
-    // is explicitly raising them. `force` (restore-attest) preserves them via its
-    // own read, so it is excluded here.
+    // is explicitly raising them. `force` callers (restoreAttest here, and
+    // master rotation's finalize in core/master-rotation.ts) preserve them via
+    // their own read, so they are excluded here; see the doc comment above.
     if (current.status === "valid") {
       if (current.data.baseline_established === true && data.baseline_established !== true) {
         toWrite = { ...toWrite, baseline_established: true };
@@ -1259,19 +1269,25 @@ export async function restoreAttest(args: {
    * absent it is derived from the surviving checkpoint records. */
   fortressId?: string;
   now?: () => Date;
+  /** Custody-lock lease fence; required by the CLI mutation ceremony. */
+  assertLockHeld?: () => void;
 }): Promise<RestoreAttestResult> {
   const now = args.now ?? (() => new Date());
+  const fence = args.assertLockHeld ?? (() => undefined);
+  fence();
   const priorFreeze = await isRollbackFrozen(args.storage, args.master);
   const unfroze = priorFreeze.frozen && priorFreeze.data !== undefined;
 
   // Durable audit FIRST — fail closed: if this throws, nothing is mutated, so a
   // failed audit append can never leave the freeze cleared without a record.
+  fence();
   await args.recordAttestation({
     attestedEpoch: args.currentEpoch,
     epochId: args.epochId,
     willUnfreeze: unfroze,
     ...(priorFreeze.data ? { priorFreeze: priorFreeze.data } : {}),
   });
+  fence();
 
   // Preserve the baseline-established latch across the force re-baseline: the
   // operator is attesting to a custody EPOCH restore, not un-establishing a
@@ -1302,6 +1318,7 @@ export async function restoreAttest(args: {
   // A caller WITHOUT the current master writes a witness keyed to its own wrong
   // master; the real master reads that as "invalid" → suspect → re-freeze at
   // next boot, so a forged attestation cannot launder a rollback.
+  fence();
   await writeEpochWitness(
     args.storage,
     args.master,
@@ -1319,6 +1336,7 @@ export async function restoreAttest(args: {
     },
     { force: true }
   );
+  fence();
   // Clear the freeze ONLY when the caller's master AUTHENTICATES the existing
   // freeze marker (priorFreeze.data is present only when the MAC verified under
   // this master). A wrong-master caller gets `frozen: true` with NO `data`
@@ -1330,7 +1348,9 @@ export async function restoreAttest(args: {
   // on-disk epoch + head anchor and re-freezes. The witness + envelope MAC
   // (master-keyed) are the actual boundary.
   if (unfroze) {
+    fence();
     await clearFreeze(args.storage);
+    fence();
   }
 
   // STAGE-2 RE-BASELINE (codex FIX 4 consequence): clearing the freeze marker
@@ -1340,10 +1360,18 @@ export async function restoreAttest(args: {
   // re-baseline above, raise the on-disk transparency floor to ≥ the highest
   // locally-recorded anchored counter, making the attested state internally
   // consistent. Only raises (monotonic), only when Stage 2 applies, best-effort
-  // and NEVER throws out of restore-attest (a re-baseline failure leaves the
+  // and never throws out of restore-attest for a transparency-stack failure (a re-baseline failure leaves the
   // freeze cleared but the floor as-is; the next recompute simply re-freezes,
   // which is the safe direction — it never silently launders a real rollback).
-  await rebaselineStage2FloorBestEffort(args.storage, args.master, args.fortressId);
+  // A lost custody-lock lease is different: it propagates fail-closed.
+  fence();
+  await rebaselineStage2FloorBestEffort(
+    args.storage,
+    args.master,
+    args.fortressId,
+    fence,
+  );
+  fence();
 
   return { attestedEpoch: args.currentEpoch, unfroze };
 }
@@ -1358,7 +1386,8 @@ export async function restoreAttest(args: {
 async function rebaselineStage2FloorBestEffort(
   storage: StorageBackend,
   master: Uint8Array,
-  fortressId?: string
+  fortressId?: string,
+  assertLockHeld: () => void = () => undefined,
 ): Promise<void> {
   try {
     const { readAnchorConfig, anchorReceiptsPresentOnDisk } = await import(
@@ -1389,13 +1418,17 @@ async function rebaselineStage2FloorBestEffort(
     const { rebaselineTransparencyCounterFloor } = await import(
       "../transparency/emitter.js"
     );
+    assertLockHeld();
     await rebaselineTransparencyCounterFloor(
       storage,
       master,
       anchored.highestAnchoredCounter
     );
+    assertLockHeld();
   } catch {
     // Swallow: never throw out of restore-attest.
+    // A lost custody lease is not a transparency-stack hiccup and must escape.
+    assertLockHeld();
   }
 }
 

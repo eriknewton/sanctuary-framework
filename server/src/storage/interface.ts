@@ -7,7 +7,8 @@
  * The storage backend deals in raw bytes — encryption/decryption happens
  * in the StateStore layer above.
  *
- * Every method declared on `StorageBackend` and `FilesystemStorageCapabilities`
+ * Every method declared on `StorageBackend`, `FilesystemStorageCapabilities`,
+ * and `NamespaceLockStorageCapabilities`
  * must be classified as mutating-or-delegated in `read-only-guard.ts` (must
  * match `READ_ONLY_STORAGE_MUTATING_METHODS` /
  * `READ_ONLY_STORAGE_DELEGATED_METHODS` there); full-set parity is enforced by
@@ -112,4 +113,27 @@ export interface FilesystemStorageCapabilities {
 
   /** Write bytes and fsync the file before resolving. */
   writeDurable(namespace: string, key: string, data: Uint8Array): Promise<void>;
+}
+
+/**
+ * Explicit serialization capability for security-critical namespace writes.
+ * Decorators MUST forward this capability deliberately; custody callers refuse
+ * backends that omit it instead of silently running unlocked.
+ */
+export interface NamespaceLockStorageCapabilities {
+  // These two `import("./cross-process-lock.js")` references are the ONLY edge
+  // from interface.ts to cross-process-lock.ts, and cross-process-lock.ts imports
+  // StorageBackend/NamespaceLockStorageCapabilities back from here: a cycle. It is
+  // a TYPE-ONLY cycle (both edges erase at compile time), so it carries none of
+  // the import-time init-order hazard the import-cycle guard exists to catch, and
+  // is recorded as intentional in test/fixtures/import-cycle-baseline.txt. Kept
+  // here rather than broken by extracting the lock types, because the concrete
+  // options type depends on the runtime `CrossProcessLockError` class that lives
+  // (and is thrown/instanceof-checked by 18 consumers) in cross-process-lock.ts.
+  withNamespaceLock<T>(
+    namespace: string,
+    lockFileName: string,
+    operation: (lease: import("./cross-process-lock.js").CrossProcessLockLease) => Promise<T>,
+    options?: import("./cross-process-lock.js").CrossProcessLockOptions,
+  ): Promise<T>;
 }
