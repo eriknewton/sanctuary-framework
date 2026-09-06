@@ -1544,19 +1544,24 @@ async function repairFallbackAtRestBestEffort(
       // operator must act on. Raise the original write error.
       throw err;
     }
-    const state = observed.staleAtRest
-      ? "the file still opens under the superseded form and is unchanged, so the repair is " +
-        "retried on the next read by a caller that may write"
-      : "the file was nevertheless rewritten under the current key, so no repair remains";
-    // The custody VALUE never appears in any branch here. The path, the storage
+    // Each branch states only what the re-read proved. An authenticated read
+    // under a superseded form proves the file still opens that way; it does
+    // not prove the bytes are the ones from before the attempt, so "unchanged"
+    // is never claimed. An authenticated read under the current key proves the
+    // rewrite landed despite the reported error.
+    const message = observed.staleAtRest
+      ? `sanctuary: the in-place re-wrap of the passphrase fallback file at ${path} reported ` +
+        `an error (${reason}). The stored passphrase was read successfully and the file still ` +
+        `opens under a superseded at-rest form; the repair is retried on the next read by a ` +
+        `caller that may write.\n`
+      : `sanctuary: the in-place re-wrap of the passphrase fallback file at ${path} reported ` +
+        `an error (${reason}), but the file now opens under the current key, so the rewrite ` +
+        `landed and no repair remains. The stored passphrase was read successfully.\n`;
+    // The custody VALUE never appears in either branch. The path, the storage
     // error, and the observed at-rest state are the only facts reported,
     // matching what PassphraseUnreadableError already discloses on the failing
     // branch of the same read.
-    process.stderr.write(
-      `sanctuary: the passphrase fallback file at ${path} is in a superseded at-rest form ` +
-        `and the in-place re-wrap reported an error (${reason}). The stored passphrase was ` +
-        `read successfully; ${state}.\n`,
-    );
+    process.stderr.write(message);
   }
 }
 

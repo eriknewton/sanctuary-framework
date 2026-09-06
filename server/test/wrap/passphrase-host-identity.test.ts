@@ -491,7 +491,9 @@ describe("passphrase fallback file across a change of hostname", () => {
     expect((await readFile(fallback())).equals(planted)).toBe(false);
     const surfaced = warnings.join("");
     expect(surfaced).toContain(fallback());
-    expect(surfaced).toContain("rewritten under the current key");
+    expect(surfaced).toContain("now opens under the current key");
+    expect(surfaced).toContain("the rewrite landed");
+    expect(surfaced).not.toContain("unchanged");
     expect(surfaced).not.toContain("repair-landed-then-threw");
 
     // And the rewritten file is readable afterwards, under the primary key

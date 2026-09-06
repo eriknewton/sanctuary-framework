@@ -6,9 +6,12 @@
  * from what each platform actually hands it, and reports an honest `null`
  * rather than a plausible-looking string when it cannot.
  *
- * METHOD, stated so the evidence is not overread: the subprocess call itself is
- * deliberately NOT mocked. A mock of `execFileSync` would prove that a mock was
- * called and nothing about the real probe. The evidence is instead (a) the pure
+ * METHOD, stated so the evidence is not overread: for the parser and witness
+ * evidence the subprocess call itself is deliberately NOT mocked. A mock of
+ * `execFileSync` would prove that a mock was called and nothing about the real
+ * probe. The one exception is the cache-behavior test below, which mocks
+ * `execFileSync` only to inject a failed first probe and restores the module
+ * afterward; it proves the cache, not the probe. The evidence is instead (a) the pure
  * parsers, exercised against the shapes a real dump takes, and (b) a real-host
  * witness that runs the shipped resolver on this machine when this machine is a
  * Mac. On a non-darwin runner the witness SKIPS, so it is not counted in the

@@ -182,8 +182,10 @@ the stored passphrase, and a warning naming the file is written to stderr. The
 warning reports the file's OBSERVED state rather than assuming one, because the
 writer renames the new file into place before the directory fsync and a failure
 can therefore be raised with the new ciphertext already installed: it says
-either that the file still opens under the superseded form and is unchanged, or
-that it was rewritten under the current key despite the error. If the file
+either that the file still opens under a superseded form (the bytes are not
+compared, so nothing is claimed about them beyond that) and the repair is
+retried on the next writable read, or that the file now opens under the
+current key, so the rewrite landed despite the error. If the file
 opens under neither form after the failed write, the failure is raised rather
 than warned about, because custody is then genuinely lost. **Failure mode from
 the outside:** in the two warned cases the fortress opens normally and nothing

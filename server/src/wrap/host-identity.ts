@@ -148,10 +148,12 @@ const stableHostIdCache = new Map<string, string>();
  * dump, or `null` when the dump does not carry one in canonical form.
  *
  * Exported because it is the only part of the darwin probe that can be tested
- * without a Mac: the subprocess call itself is deliberately NOT mocked (a mock
- * would prove only that the mock was called), so this parser plus the real-host
- * witness in `server/test/wrap/host-identity.test.ts` are the evidence that the
- * production resolver works. Keep the two in step: that test feeds this
+ * without a Mac: for the probe evidence the subprocess call is deliberately NOT
+ * mocked (a mock would prove only that the mock was called), so this parser
+ * plus the real-host witness in `server/test/wrap/host-identity.test.ts` are the
+ * evidence that the production resolver works; that file's cache test mocks the
+ * call only to inject a failed probe, and proves the cache, not the probe. Keep
+ * the two in step: that test feeds this
  * function a captured dump shape, a malformed UUID, and a dump with the key
  * absent.
  */
