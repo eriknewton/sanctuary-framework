@@ -1,10 +1,12 @@
 # Local intelligence: the model-provisioning ceremony
 
-> **Status:** the provisioning ceremony described here ships in this release.
-> Sanctuary has code paths and tests for signed model-manifest binding and
-> bounded local layer verification; production activation on a real host is
-> pending host evidence, and this page will say so in plain terms once that
-> evidence exists.
+> **Status:** the provisioning ceremony described here ships in v1.8.4 and was
+> exercised end to end on a clean macOS host from the signed release artifact
+> during the release acceptance drill on 2026-09-06: the signed manifest was
+> verified before the pull, tampered and foreign-signed manifests were refused
+> before any download, and the local route was visible in the dashboard. The
+> bounds below still hold: verification is digest-level (light assurance),
+> macOS is the only host exercised, and Windows needs a manual Ollama install.
 
 Local intelligence is Sanctuary's own cognition running on a local model
 through Ollama: the concierge, the sentinel scorer, the gate advisor, the
