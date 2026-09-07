@@ -243,6 +243,7 @@ import type { OperatorAuthorizationConsumeParams } from "../v1/operator-signed.j
 import { OperatorAuthorizationSpentStore } from "../v1/operator-authorization-spent-store.js";
 import { FederationReissueChallengeStore } from "../v1/federation-reissue-challenge-store.js";
 import { HubNotFoundError, HubCapabilityError } from "../hub/errors.js";
+import type { CharterApprovalRecord } from "../hub/charter-approval-bridge.js";
 import { fromBase64url } from "../core/encoding.js";
 import type { ApprovalAggregator } from "./approval-aggregator.js";
 import {
@@ -434,6 +435,25 @@ interface PendingRequest {
   resolve: (response: ApprovalResponse) => void;
   timer: ReturnType<typeof setTimeout>;
   created_at: string;
+}
+
+/**
+ * One live hold in the shape the hub's Charter approval bridge consumes.
+ *
+ * The ONE place the projection's field selection is written, so the bridge's
+ * list read and its by-id read cannot drift into describing the same hold
+ * differently. Deliberately header-only: no `reason` and no `context`, because
+ * a hold's context is raw tool arguments and an inbox card carries no
+ * free-text member to put them in (see
+ * `server/src/hub/charter-approval-bridge.ts`).
+ */
+function charterApprovalRecord(pending: PendingRequest): CharterApprovalRecord {
+  return {
+    id: pending.id,
+    operation: pending.request.operation,
+    tier: pending.request.tier,
+    created_at: pending.created_at,
+  };
 }
 
 /**
@@ -1588,7 +1608,67 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * Pass `null` to detach the bindings (used by tests and during shutdown).
    */
   setV11Bindings(bindings: V11Bindings | null): void {
+    const previous = this.v11Bindings;
     this.v11Bindings = bindings;
+    // Detach the OUTGOING hub before attaching the incoming one. The bridge
+    // hands a hub a live handle onto this channel's approval queue, including
+    // the power to resolve a hold, so a hub that is no longer this channel's
+    // v1.1 binding must not keep it: an unbind or a rebind is the operator
+    // taking that surface away, and a caller who retained the old hub object
+    // would otherwise still list and decide live holds through it. Skipped
+    // when the same hub is being re-bound, where the reinstall below is the
+    // whole operation.
+    if (previous && previous.hubService !== bindings?.hubService) {
+      previous.hubService.setCharterApprovalBridge(null);
+    }
+    // The v1.1 approvals surfaces read `GET /api/hub/inbox` and nothing else,
+    // so the hub has to be told about the Charter queue this channel owns or
+    // the Overview tile and the "Waiting on you" rail report an empty queue
+    // while a tool call is blocked here. Binding at THIS site rather than in
+    // each composition root is deliberate: every boot path that lights up the
+    // v1.1 surface goes through `setV11Bindings`, so there is no second place
+    // for a root to forget. Read-through, never copied: see
+    // `hub/charter-approval-bridge.ts`.
+    bindings?.hubService.setCharterApprovalBridge({
+      list: (limit) => this.listCharterApprovals(limit),
+      get: (approvalId) => this.getCharterApproval(approvalId),
+      resolve: (approvalId, decision) =>
+        this.resolveApprovalDecision(approvalId, decision),
+    });
+  }
+
+  /**
+   * At most `limit` live Charter holds, as records. Shares its field selection
+   * with `charterApprovalRecord` below, and through it with the
+   * `pendingApprovals` block of `aggregatorSources` (same file) that
+   * `GET /api/pending` serves, so the two approval readers cannot disagree
+   * about what a hold is.
+   *
+   * The walk STOPS at `limit` rather than materializing the queue and slicing
+   * it: `this.pending` is a Map whose size is agent-driven and bounded only in
+   * TIME (every hold carries an approval timer and auto-denies on expiry;
+   * admission has no count cap, register row
+   * `defect.approval-queue-admission-has-no-count-cap`), and the caller is a
+   * page render that will discard anything past its own page. A caller with no
+   * page to render passes `Number.POSITIVE_INFINITY` and gets every live hold.
+   */
+  private listCharterApprovals(limit: number): CharterApprovalRecord[] {
+    const out: CharterApprovalRecord[] = [];
+    if (limit <= 0) return out;
+    for (const pending of this.pending.values()) {
+      out.push(charterApprovalRecord(pending));
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
+  /**
+   * One live Charter hold by id. A Map key lookup, so an operator's approve or
+   * deny click costs the same whether one hold is live or thousands are.
+   */
+  private getCharterApproval(approvalId: string): CharterApprovalRecord | null {
+    const pending = this.pending.get(approvalId);
+    return pending ? charterApprovalRecord(pending) : null;
   }
 
   /**
@@ -8423,13 +8503,27 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
   }
 
-  private handleDecision(id: string, decision: "approve" | "deny", res: ServerResponse): void {
+  /**
+   * Apply an operator decision to one live Charter hold, with no HTTP shape
+   * attached. This is the ONE place a decision is applied, so every operator
+   * surface (the legacy `/api/approve/:id` route, the `/m` companion, and the
+   * v1.1 rail through the hub bridge) unblocks the waiting tool call the same
+   * way and cannot drift into a surface that clears a card without releasing
+   * the caller.
+   *
+   * Returns false when the hold is no longer live: already decided through
+   * another surface, or auto-denied on timeout. Callers report that as a
+   * not-found or conflict; it is never treated as success.
+   *
+   * Callers MUST have already established that the requester holds the
+   * operator bearer token. This method performs no authorization of its own.
+   */
+  private resolveApprovalDecision(
+    id: string,
+    decision: "approve" | "deny",
+  ): boolean {
     const pending = this.pending.get(id);
-    if (!pending) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Request not found or already resolved" }));
-      return;
-    }
+    if (!pending) return false;
 
     // Clear timeout
     clearTimeout(pending.timer);
@@ -8453,6 +8547,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
     // Resolve the waiting promise (unblocks the tool call)
     pending.resolve(response);
+    return true;
+  }
+
+  private handleDecision(id: string, decision: "approve" | "deny", res: ServerResponse): void {
+    if (!this.resolveApprovalDecision(id, decision)) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request not found or already resolved" }));
+      return;
+    }
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ success: true, decision }));

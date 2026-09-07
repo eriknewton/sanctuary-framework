@@ -36,6 +36,7 @@ import {
 import {
   HUB_AGENT_CONTROL_ACTIONS,
   HUB_API_PREFIX,
+  HUB_INBOX_MAX_LIMIT,
   HUB_INBOX_TEMPLATE_NAMESPACES,
   HUB_TIER_1_AGENT_CONTROL_ACTIONS,
   HUB_VERSION,
@@ -579,6 +580,109 @@ describe("Hub inbox happy path (Test 1)", () => {
       expect(typeof item.display_template_id).toBe("string");
       expect(Array.isArray(item.display_template_args)).toBe(true);
     }
+  });
+});
+
+/**
+ * CAPABILITY UNDER TEST: the operator inbox readers that are NOT a page.
+ *
+ * `listInbox` takes a `limit` so the `/api/hub/inbox` route can bound how much
+ * one page render projects. That bound must stay opt-in.
+ * `getAgentStatusSnapshot` and `openAgentInspectPanel` both call `listInbox`
+ * and filter the result by agent AFTERWARDS, so a page-sized default would
+ * drop one agent's open approval behind unrelated older cards and the agent
+ * panel would read "nothing waiting" while a hold was genuinely open.
+ *
+ * Register: defect.v11-dashboard-live-tier1-cards-not-surfaced-for-generic-wrap
+ */
+describe("Hub inbox: internal readers are not bounded by the route page size", () => {
+  const BETA_AGENT_ID = "agent-beta";
+  const BETA_ITEM_ID = "approval-beta";
+
+  // Enough older cards to fill the largest page the route will ever serve, so
+  // the pending item seeded after them sits past any page-sized default.
+  // Derived from the route's own ceiling rather than retyped as a literal.
+  const OLDER_RESOLVED_ITEMS = HUB_INBOX_MAX_LIMIT;
+
+  function makeReaderService(state: InboxSourceState): HubService {
+    const auditLog = new AuditLog(new MemoryStorage(), randomBytes(32));
+    return new HubService({
+      identityId: IDENTITY_ID,
+      fortressId: FORTRESS_ID,
+      agentRegistry: new InMemoryLocalAgentRegistry([
+        makeAgent(),
+        makeAgent({ agent_id: BETA_AGENT_ID }),
+      ]),
+      inboxSources: makeInboxSources(state),
+      activitySources: { auditLog, identityId: IDENTITY_ID },
+      policyBudgetSources: {
+        listPolicySummaries: () => [],
+        listBudgetSummaries: () => [],
+      },
+      agentController: new StubAgentController(),
+    });
+  }
+
+  it("surfaces agent-beta's open approval behind a full page of resolved items", async () => {
+    const state = makeEmptyInboxState();
+    // The aggregator lists approvals first, in insertion order, so the older
+    // cards must be approvals too or agent-beta's card would sit at index 0
+    // and never exercise the truncation this test exists to reproduce.
+    for (let i = 0; i < OLDER_RESOLVED_ITEMS; i++) {
+      state.approvals.push({
+        version: "1.1",
+        item_id: `approval-older-${i}`,
+        kind: "approval_pending",
+        identity_id: IDENTITY_ID,
+        agent_id: "agent-alpha",
+        created_at: "2026-04-25T01:00:00.000Z",
+        resolved: true,
+        resolved_at: "2026-04-25T01:30:00.000Z",
+        display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.approval_pending}.tier1.state_export`,
+        display_template_args: [
+          { kind: "agent_id", value: "agent-alpha" },
+          { kind: "tier", value: "tier1" },
+        ],
+        tier: "tier1",
+        operation_category: "state_export",
+      });
+    }
+    // Seeded LAST, so agent-beta's card sits at exactly the first position a
+    // page-sized default would discard before the agent filter runs.
+    state.approvals.push({
+      version: "1.1",
+      item_id: BETA_ITEM_ID,
+      kind: "approval_pending",
+      identity_id: IDENTITY_ID,
+      agent_id: BETA_AGENT_ID,
+      created_at: "2026-04-25T02:00:00.000Z",
+      resolved: false,
+      display_template_id: `${HUB_INBOX_TEMPLATE_NAMESPACES.approval_pending}.tier1.state_export`,
+      display_template_args: [
+        { kind: "agent_id", value: BETA_AGENT_ID },
+        { kind: "tier", value: "tier1" },
+      ],
+      tier: "tier1",
+      operation_category: "state_export",
+    });
+
+    const service = makeReaderService(state);
+    // Position proof: the card is past the route's largest page, and a
+    // page-sized read really would drop it.
+    const fullInventory = service.listInbox().map((item) => item.item_id);
+    expect(fullInventory.indexOf(BETA_ITEM_ID)).toBe(OLDER_RESOLVED_ITEMS);
+    expect(
+      service.listInbox({ limit: HUB_INBOX_MAX_LIMIT }).map((item) => item.item_id),
+    ).not.toContain(BETA_ITEM_ID);
+
+    expect(
+      service.getAgentStatusSnapshot(BETA_AGENT_ID).open_inbox_item_ids,
+    ).toEqual([BETA_ITEM_ID]);
+
+    const panel = await service.openAgentInspectPanel(BETA_AGENT_ID);
+    expect(panel.pending_approvals.map((item) => item.item_id)).toEqual([
+      BETA_ITEM_ID,
+    ]);
   });
 });
 

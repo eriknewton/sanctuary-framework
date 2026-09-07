@@ -634,3 +634,72 @@ describe("Xi-1 — audit emission + multi-fortress isolation", () => {
     expect(bOut.fortress_id).toBe(FORTRESS_B);
   });
 });
+
+/**
+ * CAPABILITY UNDER TEST: an operator can write a standing auto-allow rule in
+ * plain English, and the compiler refuses to turn an approval-card CATEGORY
+ * into one. `other` is the catch-all member of a card's `operation_category`,
+ * not the name of any operation, so "auto-allow other" would tell the operator
+ * a blanket standing rule is live while the gate has nothing to match it
+ * against. The refusal has to live below the dashboard, because the compile and
+ * activate API is reachable without the UI that hides the button.
+ *
+ * Register: defect.v11-dashboard-live-tier1-cards-not-surfaced-for-generic-wrap
+ */
+describe("english policy compiler refuses auto-allow of an approval-card category", () => {
+  it("compiles a named operation's auto-allow as before", async () => {
+    const { compiler } = makeRig();
+    const out = await compiler.compile({
+      english_text: "auto-allow state_list",
+      observed_at: "2026-09-06T00:00:00.000Z",
+      operator_id: OPERATOR,
+    });
+    expect(out.compiled_rule).toEqual({
+      kind: "tier3_add_operation",
+      operation: "state_list",
+    });
+    expect(out.compile_confidence).toBe("high");
+  });
+
+  it("refuses \"auto-allow other\" and never emits a tier3 rule for it", async () => {
+    const { compiler, auditLog } = makeRig();
+    const out = await compiler.compile({
+      english_text: "auto-allow other",
+      observed_at: "2026-09-06T00:00:00.000Z",
+      operator_id: OPERATOR,
+    });
+
+    expect(out.compiled_rule.kind).not.toBe("tier3_add_operation");
+    expect(out.compile_confidence).toBe("low");
+    expect(out.compile_warnings.join(" ")).toMatch(/approval-card category/);
+    expect(await auditOps(auditLog)).toContain(
+      ENGLISH_POLICY_AUDIT_OPS.COMPILE_FAILED,
+    );
+  });
+
+  it("refuses the same shape through the phrasing that spells it out", async () => {
+    const { compiler } = makeRig();
+    const out = await compiler.compile({
+      english_text: "allow other without approval",
+      observed_at: "2026-09-06T00:00:00.000Z",
+      operator_id: OPERATOR,
+    });
+    expect(out.compiled_rule.kind).not.toBe("tier3_add_operation");
+    expect(out.compile_confidence).toBe("low");
+  });
+
+  it("leaves the fail-safe direction alone: Tier 1 may still name the token", async () => {
+    const { compiler } = makeRig();
+    const out = await compiler.compile({
+      english_text: "require approval for other",
+      observed_at: "2026-09-06T00:00:00.000Z",
+      operator_id: OPERATOR,
+    });
+    // Adding a token to the always-approve list costs a prompt that never
+    // fires; it takes no protection away, so it is not this rule's business.
+    expect(out.compiled_rule).toEqual({
+      kind: "tier1_add_operation",
+      operation: "other",
+    });
+  });
+});

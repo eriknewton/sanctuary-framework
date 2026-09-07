@@ -2641,7 +2641,13 @@ function renderApprovalTile(i) {
 const NON_PROMOTABLE_OPERATIONS = {
   policy_change: true,
   lockdown: true,
-  unwrap: true
+  unwrap: true,
+  // "other" is the category enum's catch-all, never an operation name, so
+  // promoting it would compile the standing rule "auto-allow other" against
+  // an operation that does not exist. The card carries no operation name to
+  // promote instead: HubDisplayTemplateArg has no free-text member, on
+  // purpose, so a Charter hold's raw tool arguments cannot reach a card.
+  other: true
 };
 function promotableOperation(i) {
   const op = i && i.operation_category;

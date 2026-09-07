@@ -18,7 +18,32 @@ import type {
   HubApprovalPendingItem,
   HubInboxItem,
 } from "../contracts/v1.1/hub-events.js";
-import { HubConflictError, HubNotFoundError } from "./errors.js";
+import { HubConflictError, HubNotFoundError, HubValidationError } from "./errors.js";
+// Must match `CHARTER_APPROVAL_ITEM_ID_PREFIX` in
+// `server/src/hub/charter-approval-bridge.ts`, which mints the projected ids
+// this store must never hold; `HubService.resolveInboxItem` routes on the same
+// prefix.
+import { isCharterApprovalItemId } from "./charter-approval-bridge.js";
+
+/**
+ * Refuse any item id under the reserved Charter-approval namespace.
+ *
+ * Called at every entry point that can create an entry, because the ONLY
+ * legitimate holder of these ids is the live Charter queue, which is projected
+ * read-through and never stored. An id under the prefix inside this store
+ * would be a card whose `resolved` flag no approval queue ever agreed to: the
+ * hub would answer approve/deny from its own overlay while the blocked tool
+ * call sat untouched. Loud rather than skipped, per MUST-NEVER #5: a dropped
+ * row would be a silent degrade to a store that quietly disagrees with its
+ * source.
+ */
+function assertNotReservedItemId(itemId: string): void {
+  if (isCharterApprovalItemId(itemId)) {
+    throw new HubValidationError(
+      `inbox item id ${itemId} is in the reserved Charter approval namespace`,
+    );
+  }
+}
 
 /**
  * Callback the store invokes when an enqueued Tier 1 inbox item is approved.
@@ -57,6 +82,7 @@ export class HubInboxStore {
    * shape is refreshed.
    */
   upsertFromSource(item: HubInboxItem): void {
+    assertNotReservedItemId(item.item_id);
     const prior = this.entries.get(item.item_id);
     if (prior) {
       prior.item = {
@@ -81,6 +107,7 @@ export class HubInboxStore {
     item: HubApprovalPendingItem,
     handler: Tier1ResolutionHandler,
   ): void {
+    assertNotReservedItemId(item.item_id);
     if (this.entries.has(item.item_id)) {
       throw new HubConflictError(`inbox item ${item.item_id} already exists`);
     }

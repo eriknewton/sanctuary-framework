@@ -15,7 +15,11 @@
  *     Real harness-discovery via `discoverTenants()` remains v1.2 work.
  *   - Inbox sources return empty arrays. The privacy chokepoint already
  *     emits audit events through PR #69 / PR #71; the inbox aggregator is
- *     the v1.2 work to project those into operator cards.
+ *     the v1.2 work to project those into operator cards. Live Tier 1 / 2
+ *     approval holds do NOT arrive through these sources: the approval
+ *     channel installs a read-through Charter bridge on the HubService in
+ *     `DashboardApprovalChannel.setV11Bindings`, so an empty
+ *     `listPendingApprovals` here does NOT mean an empty approvals rail.
  *   - Activity feed reads from the real audit log. This is the one source
  *     that's already complete in v1.1.0 and just needs to be plugged in.
  *   - Agent controller errors on runtime harness actions that v1.1 cannot
@@ -648,6 +652,11 @@ export function buildV11Bindings(
   };
 
   const inboxSources = {
+    // Empty on purpose, and NOT the approvals surface: live Charter holds
+    // reach the inbox through the read-through bridge the approval channel
+    // installs (`HubService.setCharterApprovalBridge`). Filling this in with
+    // the same holds would double-count them and copy queue-owned rows into
+    // `HubInboxStore`, where a decided hold could not be removed.
     listPendingApprovals: () => [],
     listRecentBlockedEgress: () => [],
     listRecentPrivacyEvents: () => [],
