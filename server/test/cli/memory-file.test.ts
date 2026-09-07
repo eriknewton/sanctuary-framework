@@ -688,7 +688,10 @@ describe("memory file CLI: fortress-backed round trip", () => {
         err: refusedErr.stream,
         env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
       });
-      expect(refusedCode).toBe(0);
+      expect(
+        refusedCode,
+        `exit ${refusedCode}; stderr: ${refusedErr.text()}; stdout: ${refusedOut.text()}`,
+      ).toBe(0);
       expect(refusedOut.text()).toContain("ingested 3 of 4 Claude Code memory files");
       expect(refusedErr.text()).toContain("the mirror is INCOMPLETE");
 
@@ -707,7 +710,10 @@ describe("memory file CLI: fortress-backed round trip", () => {
         env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
       });
 
-      expect(code).toBe(0);
+      expect(
+        code,
+        `exit ${code}; stderr: ${err.text()}; stdout: ${out.text()}`,
+      ).toBe(0);
       expect(out.text()).toContain("ingested 4 of 4 Claude Code memory files");
       // Reported as overridden, never as a refusal, and the mirror is complete.
       expect(err.text()).not.toContain("the mirror is INCOMPLETE");
@@ -759,7 +765,10 @@ describe("memory file CLI: fortress-backed round trip", () => {
         env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
       });
 
-      expect(code).toBe(0);
+      expect(
+        code,
+        `exit ${code}; stderr: ${err.text()}; stdout: ${out.text()}`,
+      ).toBe(0);
       expect(err.text()).toContain(
         "--allow-file named 1 path(s) the classifier never refused (nothing was waived): concise-updates.md",
       );
@@ -785,7 +794,10 @@ describe("memory file CLI: fortress-backed round trip", () => {
         env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
       });
 
-      expect(code).toBe(1);
+      expect(
+        code,
+        `exit ${code}; stderr: ${err.text()}; stdout: ${out.text()}`,
+      ).toBe(1);
       expect(err.text()).toContain("memory_ingest failed");
       expect(out.text()).toBe("");
       const operations = (await auditOperations()).filter((op) => op.startsWith("memory_ingest"));
@@ -837,7 +849,10 @@ describe("memory file CLI: fortress-backed round trip", () => {
         env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
       });
 
-      expect(code).toBe(1);
+      expect(
+        code,
+        `exit ${code}; stderr: ${err.text()}; stdout: ${out.text()}`,
+      ).toBe(1);
       expect(err.text()).toContain("memory_ingest failed");
 
       const entries = await auditEntries();
@@ -877,7 +892,10 @@ describe("memory file CLI: fortress-backed round trip", () => {
 
       // The command itself fails closed (it cannot even durably record the
       // attempt); nothing reaches the vault.
-      expect(code).not.toBe(0);
+      expect(
+        code,
+        `exit ${code}; stderr: ${err.text()}; stdout: ${out.text()}`,
+      ).not.toBe(0);
       await rm(join(fortress, "state", "_audit"), { force: true });
       const adapter = await fortressAdapterForCheckOnly();
       expect(await adapter.listPassages()).toEqual([]);
