@@ -65,3 +65,39 @@ describe("HubInboxStore Tier 1 resolution outcomes", () => {
     });
   });
 });
+
+/**
+ * CAPABILITY UNDER TEST: the `charter.approval.` item-id namespace is reserved
+ * for holds the live Charter approval queue owns and projects read-through, so
+ * the hub's own store must never hold an item under it. A stored row wearing
+ * that id would answer an operator's approve or deny from the store's own
+ * resolution overlay and report `resolved: true` while the blocked tool call
+ * behind the real hold sat untouched.
+ *
+ * Register: defect.v11-dashboard-live-tier1-cards-not-surfaced-for-generic-wrap
+ */
+describe("HubInboxStore reserves the Charter approval id namespace", () => {
+  it("refuses a source-supplied item under the reserved prefix", () => {
+    const store = new HubInboxStore();
+    expect(() =>
+      store.upsertFromSource(item("charter.approval.forged")),
+    ).toThrow(/reserved Charter approval namespace/);
+    expect(store.get("charter.approval.forged")).toBeNull();
+    expect(store.list()).toEqual([]);
+  });
+
+  it("refuses a hub-enqueued Tier 1 item under the reserved prefix", () => {
+    const store = new HubInboxStore();
+    expect(() =>
+      store.enqueueTier1(item("charter.approval.hub-enqueued"), async () => {}),
+    ).toThrow(/reserved Charter approval namespace/);
+    expect(store.list()).toEqual([]);
+  });
+
+  it("refuses the bare prefix, which carries no approval id at all", () => {
+    const store = new HubInboxStore();
+    expect(() => store.upsertFromSource(item("charter.approval."))).toThrow(
+      /reserved Charter approval namespace/,
+    );
+  });
+});

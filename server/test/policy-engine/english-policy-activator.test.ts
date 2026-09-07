@@ -1197,3 +1197,62 @@ describe("Xi-2 - audit emission + Castle-walking", () => {
     expect(ops.has("intelligence_substrate_invoked")).toBe(false);
   });
 });
+
+/**
+ * CAPABILITY UNDER TEST: the site that writes the live Principal Policy refuses
+ * to auto-allow an approval-card CATEGORY token, whatever route the draft
+ * arrived by. `other` is a card's catch-all category, never an operation name,
+ * so landing it in `tier3_always_allow` would report a live blanket standing
+ * rule the gate can never match. The refusal runs before the posture-downgrade
+ * gate, so an operator override cannot carry it past.
+ *
+ * Register: defect.v11-dashboard-live-tier1-cards-not-surfaced-for-generic-wrap
+ */
+describe("Xi-2 - auto-allow of an approval-card category is refused at the write site", () => {
+  it("applyRule throws rather than adding the category token to tier3", () => {
+    expect(() =>
+      applyRule(DEFAULT_POLICY, {
+        kind: "tier3_add_operation",
+        operation: "other",
+      }),
+    ).toThrow(/approval-card/);
+    expect(DEFAULT_POLICY.tier3_always_allow).not.toContain("other");
+  });
+
+  it("activation reports invalid_rule and leaves the live policy unchanged", async () => {
+    const rig = makeActivatorRig();
+    const before = [...rig.livePolicy.current.tier3_always_allow];
+    const result = await rig.activator.activate(
+      buildCompiled({ kind: "tier3_add_operation", operation: "other" }),
+      OPERATOR,
+    );
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.reason).toBe("invalid_rule");
+    expect(rig.livePolicy.current.tier3_always_allow).toEqual(before);
+    expect(rig.livePolicy.current.tier3_always_allow).not.toContain("other");
+  });
+
+  it("a posture-downgrade override does not carry the refusal past", async () => {
+    const rig = makeActivatorRig();
+    const result = await rig.activator.activate(
+      buildCompiled({ kind: "tier3_add_operation", operation: "other" }),
+      OPERATOR,
+      { override_posture_downgrade: true },
+    );
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.reason).toBe("invalid_rule");
+    expect(rig.livePolicy.current.tier3_always_allow).not.toContain("other");
+  });
+
+  it("leaves an auto-allow that names a real operation alone", () => {
+    // The control, taken at the same enforcement site: the refusal is scoped
+    // to the category token, not to tier3 adds in general. (Whether such a
+    // rule then survives the conflict and posture-downgrade gates is those
+    // gates' business, and is covered above.)
+    const after = applyRule(DEFAULT_POLICY, {
+      kind: "tier3_add_operation",
+      operation: "state_list",
+    });
+    expect(after.tier3_always_allow).toContain("state_list");
+  });
+});

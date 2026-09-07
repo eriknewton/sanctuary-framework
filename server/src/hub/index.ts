@@ -20,6 +20,15 @@ export {
   type Tier1ResolutionHandler,
 } from "./inbox-store.js";
 export { aggregateInbox } from "./inbox-aggregator.js";
+export {
+  CHARTER_APPROVAL_ITEM_ID_PREFIX,
+  charterApprovalIdFromItemId,
+  charterApprovalItemId,
+  isCharterApprovalItemId,
+  projectCharterApproval,
+  type CharterApprovalBridge,
+  type CharterApprovalRecord,
+} from "./charter-approval-bridge.js";
 export { aggregateActivity, type HubActivityCategory } from "./activity-feed.js";
 export { HubService } from "./hub-service.js";
 export { handleHubRoute, type HubRouterDeps } from "./api-router.js";

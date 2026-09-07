@@ -400,7 +400,11 @@ export async function handleHubRoute(
         HUB_INBOX_DEFAULT_LIMIT,
         HUB_INBOX_MAX_LIMIT,
       );
-      const items = deps.service.listInbox().slice(0, limit);
+      // The bound goes DOWN into the service, not around it: a post-hoc
+      // slice still pays for every live Charter hold projected into a card
+      // before the truncation discards it, so a page read would cost
+      // O(live holds) rather than O(limit).
+      const items = deps.service.listInbox({ limit });
       writeJSON(res, 200, {
         ok: true,
         data:

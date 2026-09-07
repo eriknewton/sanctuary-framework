@@ -49,6 +49,12 @@ import {
 } from "./errors.js";
 import { aggregateInbox } from "./inbox-aggregator.js";
 import { HubInboxStore } from "./inbox-store.js";
+import {
+  charterApprovalIdFromItemId,
+  isCharterApprovalItemId,
+  projectCharterApproval,
+  type CharterApprovalBridge,
+} from "./charter-approval-bridge.js";
 import { writeLockdownStatus } from "../lockdown/status.js";
 import { aggregateActivity } from "./activity-feed.js";
 import type {
@@ -192,6 +198,7 @@ export class HubService {
   private inboxStore: HubInboxStore;
   private taskService?: TaskService;
   private concierge?: ConciergeService;
+  private charterApprovals: CharterApprovalBridge | null = null;
 
   constructor(deps: HubServiceTaskDeps) {
     this.deps = deps;
@@ -220,15 +227,110 @@ export class HubService {
 
   // ── Inbox ───────────────────────────────────────────────────────────
 
-  listInbox(): HubInboxItem[] {
-    const items = aggregateInbox(this.deps.inboxSources, this.inboxStore);
-    return items.filter((i) => i.identity_id === this.deps.identityId);
+  /**
+   * Install (or detach with `null`) the live Charter approval queue.
+   *
+   * Without this the hub inbox can only show approvals the hub itself
+   * enqueued, so a fortress that registers no named agent, which is every
+   * generic `sanctuary protect`, has an inbox that reads empty while a tool
+   * call is blocked on the operator. The bridge is read-through on every
+   * list, never copied into the inbox store, so a hold that leaves the
+   * Charter queue by any route leaves the inbox with it. See
+   * `charter-approval-bridge.ts` for the ownership invariant.
+   */
+  setCharterApprovalBridge(bridge: CharterApprovalBridge | null): void {
+    this.charterApprovals = bridge;
+  }
+
+  /**
+   * Live Charter holds as inbox cards, at most `limit` of them. Read-through:
+   * the Charter queue is asked on every call, so a decided or timed-out hold
+   * is simply absent.
+   *
+   * The bound is passed down rather than applied here, so the queue stops
+   * walking instead of handing over every live hold for this method to slice.
+   * The queue's size is agent-driven (one entry per blocked tool call) and is
+   * bounded only in TIME, by the approval channel's own timeout, never by a
+   * count (register row `defect.approval-queue-admission-has-no-count-cap`),
+   * so a projection with no bound would make one operator page cost O(live
+   * holds) in allocations the caller then throws away.
+   */
+  private charterApprovalItems(limit: number): HubApprovalPendingItem[] {
+    if (!this.charterApprovals || limit <= 0) return [];
+    return this.charterApprovals
+      .list(limit)
+      .map((record) => projectCharterApproval(record, this.deps.identityId));
+  }
+
+  /**
+   * The operator inbox.
+   *
+   * @param options.limit Upper bound on returned items, and the page size the
+   *   caller will render. Omitting it yields the COMPLETE inventory, which is
+   *   what internal readers need: `getAgentStatusSnapshot` and
+   *   `openAgentInspectPanel` filter this list by agent after it returns, so
+   *   any default page size here would hide one agent's pending item behind
+   *   older items belonging to other agents. The only caller that renders a
+   *   page is `api-router.ts`, and it passes its own clamped `?limit=` down.
+   */
+  listInbox(options?: { limit?: number }): HubInboxItem[] {
+    // Infinity, not a large number: it makes "no bound was asked for" a
+    // distinct value from any real page size, so the slice below is a no-op
+    // for internal readers instead of a cap that happens to be generous.
+    const limit = options?.limit ?? Number.POSITIVE_INFINITY;
+    // Charter holds lead: they are the only items with a caller blocked on
+    // the operator right now, and the list is truncated at `limit`.
+    const items = [
+      ...this.charterApprovalItems(limit),
+      ...aggregateInbox(this.deps.inboxSources, this.inboxStore),
+    ];
+    return items
+      .filter((i) => i.identity_id === this.deps.identityId)
+      .slice(0, limit);
   }
 
   async resolveInboxItem(
     itemId: string,
     action: HubInboxAction,
   ): Promise<HubInboxItem> {
+    // A projected Charter hold is owned by the approval queue, not by the
+    // inbox store, so its resolution must reach the blocked caller. Marking
+    // the card without delegating would clear it from the operator's rail
+    // while the agent's tool call stayed parked until its own timeout.
+    //
+    // The namespace is reserved whether or not a bridge is installed. With no
+    // bridge the id resolves to nothing, so it must be a not-found here: left
+    // to fall through, it would reach `HubInboxStore`, where a source-supplied
+    // item wearing this id would answer approve/deny from the store's own
+    // overlay and report `resolved: true` with no queue decision behind it.
+    // `HubInboxStore` refuses to admit such an id at all; this is the second
+    // half of the same reservation.
+    if (isCharterApprovalItemId(itemId)) {
+      const charterApprovalId = charterApprovalIdFromItemId(itemId);
+      if (!charterApprovalId || !this.charterApprovals) {
+        throw new HubNotFoundError(`inbox item ${itemId}`);
+      }
+      if (action === "dismiss") {
+        throw new HubConflictError(
+          "tier 1 approval items cannot be dismissed; use approve or deny",
+        );
+      }
+      // By key, never by scanning the queue: the id IS the queue's key, and a
+      // scan would make one operator click cost O(live holds).
+      const record = this.charterApprovals.get(charterApprovalId);
+      if (!record) throw new HubNotFoundError(`inbox item ${itemId}`);
+      if (!this.charterApprovals.resolve(charterApprovalId, action)) {
+        // Lost a race with another surface or with the queue's own timeout.
+        throw new HubConflictError(`inbox item ${itemId} already resolved`);
+      }
+      const resolvedAt = this.nowIso();
+      return {
+        ...projectCharterApproval(record, this.deps.identityId),
+        resolved: true,
+        resolved_at: resolvedAt,
+      };
+    }
+
     // Aggregate first so source-pulled items (egress, privacy, budget,
     // recovery, agent_error) are present in the store before we resolve.
     // Tier 1 hub-enqueued items already live in the store regardless.

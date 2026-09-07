@@ -122,6 +122,51 @@ export type EnglishPolicyAuditOp =
 
 export const ENGLISH_POLICY_MAX_TEXT_CHARS = 2_000;
 
+/**
+ * Tokens that are approval-CARD categories, never operation names a policy can
+ * list.
+ *
+ * `other` is the catch-all member of `HubApprovalPendingItem.operation_category`
+ * (server/src/contracts/v1.1/hub-events.ts): it is what a card reports when the
+ * held operation has no category of its own. Compiled into `tier3_always_allow`
+ * it reads to an operator as "auto-allow everything I could not name", while
+ * the gate matches the list against literal operation names and no tool is
+ * named `other`. The operator is then told a standing rule is live that can
+ * never fire, which is the honesty failure; a later contract change that DID
+ * give the token meaning would silently turn that dead entry into a real
+ * blanket allow, which is the security one.
+ *
+ * Refused in the auto-allow direction only: the same token in
+ * `tier1_always_approve` costs an approval prompt that never fires and takes no
+ * protection away.
+ *
+ * Must match the `other` member of `operation_category` in
+ * `server/src/contracts/v1.1/hub-events.ts`. The v1.1 client blocks the same
+ * token from a card's "Always allow" button (`NON_PROMOTABLE_OPERATIONS` in
+ * `server/src/dashboard/v1_1/client.ts`); that block is the UI courtesy and
+ * this is the enforcement, because the compile + activate API is reachable
+ * without the UI.
+ */
+export const NON_OPERATION_CATEGORY_TOKENS = ["other"] as const;
+
+/** True for a token that is an approval-card category, not an operation name. */
+export function isNonOperationCategoryToken(
+  operation: string | undefined,
+): boolean {
+  return (
+    typeof operation === "string" &&
+    (NON_OPERATION_CATEGORY_TOKENS as readonly string[]).includes(operation)
+  );
+}
+
+/** True for a compiled rule that would auto-allow an approval-card category. */
+export function isForbiddenAutoAllowRule(rule: CompiledPolicyRule): boolean {
+  return (
+    rule.kind === "tier3_add_operation" &&
+    isNonOperationCategoryToken(rule.operation)
+  );
+}
+
 // ── Compiler dependencies + entry point ─────────────────────────────
 
 export interface EnglishPolicyCompilerDeps {
@@ -188,6 +233,13 @@ export class EnglishPolicyCompiler {
     // Path 1: deterministic rule-based matcher.
     const deterministic = compileDeterministic(draft.english_text);
     if (deterministic !== null) {
+      const refused = this.refuseCategoryAutoAllow(
+        draft,
+        draftId,
+        deterministic.rule,
+        "deterministic",
+      );
+      if (refused) return refused;
       const compiled = this.buildCompiled(
         draft,
         draftId,
@@ -255,6 +307,13 @@ export class EnglishPolicyCompiler {
         this.auditCompileFailed(low, "schema_validation_failed");
         return low;
       }
+      const refusedLlm = this.refuseCategoryAutoAllow(
+        draft,
+        draftId,
+        parsed.rule,
+        resp.servedBy,
+      );
+      if (refusedLlm) return refusedLlm;
       const compiled = this.buildCompiled(
         draft,
         draftId,
@@ -341,6 +400,41 @@ export class EnglishPolicyCompiler {
         fortress_id: compiled.fortress_id,
       },
     );
+  }
+
+  /**
+   * Refuse a draft that would auto-allow an approval-card category token, on
+   * BOTH compile paths (the deterministic matcher's "auto-allow <op>" shape and
+   * anything the LLM emits), returning the refusal draft or null to continue.
+   *
+   * A refusal is a low-confidence draft rather than a thrown error because a
+   * compile is review-only by contract: the operator gets the text back with a
+   * named warning saying why it will not become a rule. The placeholder rule a
+   * low-confidence draft carries is a Tier 1 add, so even an operator who
+   * overrides low confidence at activation cannot land the auto-allow. The
+   * activator refuses the same shape again at the site that writes the live
+   * policy, since a draft can also arrive from storage or a future compile
+   * path this method does not sit in front of.
+   */
+  private refuseCategoryAutoAllow(
+    draft: EnglishPolicyDraft,
+    draftId: string,
+    rule: CompiledPolicyRule,
+    substrateUsed: string,
+  ): CompiledPolicy | null {
+    if (!isForbiddenAutoAllowRule(rule)) return null;
+    const token = rule.operation ?? "";
+    const low = this.buildLowConfidence(
+      draft,
+      draftId,
+      `Refused: "${token}" is an approval-card category, not an operation name, ` +
+        `so it can never be auto-allowed as a standing rule. Name the operation ` +
+        `you want to allow instead.`,
+      substrateUsed,
+      [`auto-allow of the approval-card category "${token}" is refused`],
+    );
+    this.auditCompileFailed(low, "category_token_auto_allow_refused");
+    return low;
   }
 
   private auditCompileFailed(compiled: CompiledPolicy, reason: string): void {

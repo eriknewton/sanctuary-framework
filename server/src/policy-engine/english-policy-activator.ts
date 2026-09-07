@@ -64,9 +64,10 @@ import {
   PrincipalPolicyDowngradeError,
   type PrincipalPolicyDowngrade,
 } from "../principal-policy/loader.js";
-import type {
-  CompiledPolicy,
-  CompiledPolicyRule,
+import {
+  isNonOperationCategoryToken,
+  type CompiledPolicy,
+  type CompiledPolicyRule,
 } from "./english-policy-compiler.js";
 import {
   conflictIds,
@@ -790,14 +791,25 @@ function applyRuleStructural(
           (op) => op !== requireOperation(rule),
         ),
       };
-    case "tier3_add_operation":
+    case "tier3_add_operation": {
+      const operation = requireOperation(rule);
+      // An approval-card category token is not an operation name, so writing
+      // one into tier3_always_allow tells the operator a standing auto-allow is
+      // live while the gate has nothing to match it against. Refused HERE, the
+      // site that mutates the live policy, so no compile path, stored draft, or
+      // activation override reaches the list with one: this throw runs before
+      // the posture-downgrade gate, and `activate` reports it as `invalid_rule`.
+      if (isNonOperationCategoryToken(operation)) {
+        throw new Error(
+          `tier3_add_operation refuses "${operation}": it is an approval-card ` +
+            `category, not an operation name, and can never be auto-allowed`,
+        );
+      }
       return {
         ...policy,
-        tier3_always_allow: dedupedAdd(
-          policy.tier3_always_allow,
-          requireOperation(rule),
-        ),
+        tier3_always_allow: dedupedAdd(policy.tier3_always_allow, operation),
       };
+    }
     case "tier3_remove_operation":
       return {
         ...policy,
