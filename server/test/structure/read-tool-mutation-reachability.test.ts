@@ -1175,10 +1175,21 @@ export function launder(path: string): string {
   {
     what: "a read-only primitive through .call (must stay clean)",
     expect: [],
+    // The encoding argument is `{ encoding: "utf8" }`, not the bare string
+    // `"utf8"`, because `readFileSync.call(...)` routes TypeScript's overload
+    // resolution through the LAST declared `readFileSync` overload only (an
+    // engine quirk for a generic call target, not specific to this fixture).
+    // @types/node 26.4.1 (#1363) reordered that overload set and narrowed the
+    // last signature's options parameter to the object-only `ReadFileSyncOptions`
+    // interface, so the bare string, which the prior last overload accepted
+    // via its `| BufferEncoding` arm, no longer typechecks there. The object
+    // form is accepted by every declared overload in both @types/node
+    // versions, so it exercises the same read-only call shape without
+    // depending on which overload the compiler's last-signature fallback picks.
     code: `
 import { readFileSync } from "node:fs";
 export function launder(path: string): string {
-  return readFileSync.call(null, path, "utf8") as string;
+  return readFileSync.call(null, path, { encoding: "utf8" }) as string;
 }
 `,
   },
