@@ -26,9 +26,36 @@ describe("PQC additive guard", () => {
     // pinned exact version in `dependencies` — never hidden in
     // optionalDependencies (npm would silently ship a partial install that
     // crashes at boot) or in devDependencies.
-    expect(pkg.dependencies?.["@noble/post-quantum"]).toBe("0.7.0");
+    //
+    // 0.7.0 -> 0.7.1 (deliberate, reviewed bump, #1363): the upstream diff
+    // hardens ml-dsa.ts option handling (unknown option keys and non-plain-object
+    // `opts` now throw, closing a prototype-pollution surface) and wipes
+    // secret-derived rejection-sampling buffers on each signing retry; it adds
+    // an XOF output-length check for the (unused here) pre-hash mode. Every
+    // call site in this repo (`trust-root-hybrid.ts`, `crypto-suite-registry.ts`)
+    // invokes `ml_dsa65.sign(bytes, secretKey)` / `.verify(sig, bytes, publicKey)`
+    // with no options object, so the stricter option validation never triggers
+    // and the signing/verification algorithm and wire output are unchanged. The
+    // pin moves because this was checked, not because bumps are silent.
+    const PINNED_PQC_VERSION = "0.7.1";
+    expect(pkg.dependencies?.["@noble/post-quantum"]).toBe(PINNED_PQC_VERSION);
     expect(pkg.devDependencies?.["@noble/post-quantum"]).toBeUndefined();
     expect(pkg.optionalDependencies?.["@noble/post-quantum"]).toBeUndefined();
+
+    // The declaration alone cannot see a lockfile or an install that drifted
+    // from it: a manifest that says one version while the lockfile resolved
+    // another ships the other. So the lockfile entry and the installed package
+    // must both agree with the pin; a divergence fails here, before boot.
+    const lock = JSON.parse(readRepoFile("server/package-lock.json")) as {
+      packages?: Record<string, { version?: string }>;
+    };
+    expect(lock.packages?.["node_modules/@noble/post-quantum"]?.version).toBe(
+      PINNED_PQC_VERSION
+    );
+    const installed = JSON.parse(
+      readRepoFile("server/node_modules/@noble/post-quantum/package.json")
+    ) as { version?: string };
+    expect(installed.version).toBe(PINNED_PQC_VERSION);
   });
 
   it("keeps the suite registry out of legacy frozen serializers", () => {
