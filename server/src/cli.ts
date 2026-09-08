@@ -1149,6 +1149,19 @@ Start the Principal Dashboard as a persistent HTTP server without running
 the MCP server. Use this when the MCP server runs via stdio (e.g., OpenClaw)
 and the dashboard needs to stay alive independently.
 
+No credential has to be TYPED when this host already holds one for the
+fortress: \`sanctuary init\` and \`sanctuary protect\` enrol an OS-keyring custody
+factor and may store the fortress passphrase, and either of those opens it
+hands-free. With no host-local credential, an existing fortress needs an
+explicit \`--passphrase\` or SANCTUARY_PASSPHRASE or SANCTUARY_RECOVERY_KEY and
+refuses to start without one. If you name a credential it is used as given.
+The full order is:
+\`--passphrase\`, then SANCTUARY_PASSPHRASE, then SANCTUARY_RECOVERY_KEY, then
+the enrolled keyring custody factor, then the stored passphrase. Each
+host-local candidate is checked against this fortress before it is used, so a
+leftover credential from another install is skipped rather than tried and
+failed. The MCP stdio server opens the same fortress the same way.
+
 Usage:
   sanctuary-mcp-server dashboard [options]
 
@@ -1157,7 +1170,7 @@ Options:
   --host <host>        Bind address (default: 127.0.0.1)
   --tenant <name>      Boot against a specific wrapped tenant by the name printed
                        by \`sanctuary agents\`. Resolves the per-tenant storage
-                       path and Keychain entry automatically. Use this on multi-
+                       path and keyring entries automatically. Use this on multi-
                        tenant hosts instead of guessing SANCTUARY_PASSPHRASE.
   --multi              Start the multi-agent overview instead of a single-tenant
                        dashboard. Does not decrypt any tenant state; scans every
@@ -1186,8 +1199,13 @@ Options:
 Environment variables:
   SANCTUARY_STORAGE_PATH            State directory (default: ~/.sanctuary)
   SANCTUARY_FORTRESS_PATH           Operator-friendly alias for STORAGE_PATH
-  SANCTUARY_PASSPHRASE              Key derivation passphrase
-  SANCTUARY_RECOVERY_KEY            Recovery key for existing installations
+  SANCTUARY_PASSPHRASE              Key derivation passphrase. Tried FIRST, and
+                                    on its own: a credential you name here must
+                                    fail loudly rather than be masked by a
+                                    host-local factor. An empty value counts as
+                                    not set.
+  SANCTUARY_RECOVERY_KEY            Recovery key for existing installations.
+                                    Tried after SANCTUARY_PASSPHRASE, same rule.
   SANCTUARY_RECOVERY_OUT            Off-host plaintext recovery-key path (first run)
   SANCTUARY_DASHBOARD_PORT          Dashboard port (default: 3501)
   SANCTUARY_DASHBOARD_AUTH_TOKEN    Bearer token or "auto"

@@ -495,6 +495,22 @@ describe("credential help text and boot-order comments match the shipped behavio
     );
   });
 
+  it("the dashboard help states the host-local credential bound instead of promising a free start", () => {
+    // `sanctuary dashboard` starts without a TYPED credential only when this
+    // host already holds one (the enrolled OS-keyring custody factor or the
+    // stored passphrase). On a host holding neither, an existing fortress
+    // refuses to start, so the retired sentence promised a start the code has
+    // never performed. Pinned with the manifest's CLI-command-surface row.
+    const dashboardHelp = read("cli.ts");
+    expect(dashboardHelp).not.toContain("No credential is required to start.");
+    expect(dashboardHelp).toContain(
+      "No credential has to be TYPED when this host already holds one for the",
+    );
+    expect(dashboardHelp).toContain(
+      "refuses to start without one",
+    );
+  });
+
   it("readStoredPassphrase's doc no longer claims export-passphrase as its consumer", () => {
     const passphrase = read("wrap/passphrase.ts");
     expect(passphrase).not.toContain("Used by the `export-passphrase` subcommand");

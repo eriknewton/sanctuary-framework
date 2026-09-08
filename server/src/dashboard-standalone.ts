@@ -54,17 +54,20 @@ import { TaskService } from "./operational/task-coordination/index.js";
 import type { HandshakeResult } from "./handshake/types.js";
 import { SovereigntyProfileStore } from "./sovereignty-profile.js";
 import { writeTenantRuntime, clearTenantRuntime } from "./cli/agents/runtime.js";
+import { keychainServiceFor } from "./wrap/passphrase.js";
 import {
-  readStoredPassphrase,
-  keychainServiceFor,
-  PassphraseUnreadableError,
-} from "./wrap/passphrase.js";
+  custodyCredentialRefusal,
+  ENROLLED_CUSTODY_FACTOR_LOCATION,
+  firstOperatorSuppliedCredential,
+  isOperatorSuppliedCredential,
+  resolveHostLocalBootCredential,
+  type CustodyCredentialReport,
+} from "./wrap/custody-credential.js";
 import {
   escrowBootRecoveryKey,
   BootRecoveryKeyEscrowRequiredError,
   BootRecoveryKeyCaptureDeclinedError,
 } from "./wrap/boot-recovery-escrow.js";
-import { probeKeychainCustodyKey } from "./wrap/keychain-custody.js";
 import { detectCustodyFactorOrphan } from "./wrap/orphan-detection.js";
 import {
   discoverTenants,
@@ -478,41 +481,113 @@ export async function startStandaloneDashboard(
   // 3. Initialize storage backend
   const storage = new FilesystemStorage(`${config.storage_path}/state`);
 
-  // 4. Derive or load master key (same logic as index.ts)
+  // 4. Resolve the boot credential, then derive or load the master key.
   //
-  // v0.10.2: when no explicit passphrase is given via options or env var,
-  // fall back to the per-tenant Keychain / fallback-file lookup keyed off
-  // `config.storage_path` (same path `sanctuary wrap` and the broker use).
-  // This lets `sanctuary dashboard` boot against a wrapped tenant without
-  // forcing the user to re-type - or re-paste - the passphrase the wrap
-  // already persisted. Multi-tenant hosts with N per-tenant Keychain items
-  // (service `sanctuary-passphrase-<12hex>`) no longer require a single
-  // `SANCTUARY_PASSPHRASE` that can only unlock one tenant.
-  let passphrase = options.passphrase ?? process.env.SANCTUARY_PASSPHRASE;
-  let passphraseSource: "option" | "env" | "keychain" | "fallback-file" | null = null;
-  if (passphrase) {
-    passphraseSource = options.passphrase !== undefined ? "option" : "env";
-  } else {
-    try {
-      const stored = await readStoredPassphrase({
-        storagePath: config.storage_path,
-      });
-      if (stored) {
-        passphrase = stored.value;
-        passphraseSource = stored.source === "keychain" ? "keychain" : "fallback-file";
-        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error(
-          `Passphrase: loaded from ${stored.location} (service ${keychainServiceFor(config.storage_path, homedir())})`
-        );
-      }
-    } catch (err) {
-      if (err instanceof PassphraseUnreadableError) {
-        // Never auto-regenerate - rethrow so the operator sees the same
-        // remediation steps the wrap CLI prints.
-        throw err;
-      }
-      // Non-fatal: fall through to the recovery-key path below.
+  // ORDER AND RULES ARE THE MCP STDIO BOOT'S, BY CONSTRUCTION: the operator
+  // sources first (`options.passphrase`, `SANCTUARY_PASSPHRASE`,
+  // `SANCTUARY_RECOVERY_KEY`) because a credential the operator named is an
+  // instruction that must fail loudly rather than be masked by a host-local
+  // factor; then the host-local sources through THE shared resolver
+  // (`wrap/custody-credential.ts`), which verifies every candidate against
+  // THIS fortress's envelope before returning it.
+  //
+  // WHY THIS PATH MUST CONSULT THE ENROLLED KEYRING CUSTODY FACTOR: `protect
+  // --claude-code --agent-guided` spawns this dashboard (the starter closure
+  // src/cli.ts injects over `startStandaloneDashboard`), and it hands over a
+  // passphrase STRING only when the credential it resolved happens to be a
+  // passphrase. On the documented new-user path `sanctuary init` enrolls an
+  // OS-keyring custody factor and no passphrase, so `protect` opens the
+  // fortress with 32 raw bytes and starts this boot with no credential at all.
+  // Resolving here on the old private chain (explicit/env passphrase, then the
+  // stored passphrase, then the recovery key) therefore refused the very
+  // fortress that had just been opened, and the install contract's own next
+  // action failed. One resolver, one order, one refusal text.
+  //
+  // WHY IT NEVER MINTS: `resolveHostLocalBootCredential` passes
+  // `allowMint: false`. Creating custody over an existing envelope can only
+  // ever produce a credential that does not open it (the A73 blocker); the
+  // audited first run below is the one place this process creates custody, and
+  // it is reached only when the fortress has no custody state at all.
+  // THE supplied-credential predicate, shared with the MCP stdio boot and the
+  // resolver's own operator-source loop (`wrap/custody-credential.ts`): an
+  // empty value is not an instruction and falls through to the next source, so
+  // `SANCTUARY_PASSPHRASE=""` reaches the host-local lookup here exactly as it
+  // does there. Calling the shared predicate rather than re-testing truthiness
+  // is what keeps the two boots from drifting apart again.
+  const envRecoveryKey = isOperatorSuppliedCredential(
+    process.env.SANCTUARY_RECOVERY_KEY,
+  )
+    ? process.env.SANCTUARY_RECOVERY_KEY
+    : undefined;
+  let passphrase = firstOperatorSuppliedCredential(
+    options.passphrase,
+    process.env.SANCTUARY_PASSPHRASE,
+  );
+  /**
+   * WHICH credential opened this fortress, for the operator-facing diagnostics
+   * below. `enrolled-custody-key` is a member because the OS-keyring custody
+   * factor is a credential SOURCE, not a passphrase: leaving it out defaulted
+   * the identity-decrypt warning to "the recovery key" and pointed the
+   * operator at `SANCTUARY_PASSPHRASE`, neither of which had anything to do
+   * with the boot that just happened. Every branch that resolves a credential
+   * sets this; a source with no member here is a diagnostic that lies.
+   */
+  let passphraseSource:
+    | "option"
+    | "env"
+    | "keychain"
+    | "fallback-file"
+    | "enrolled-custody-key"
+    | null = null;
+  /** The enrolled OS-keyring custody factor, when that is what opens this fortress. */
+  let bootKeychainKey: Uint8Array | undefined;
+  /**
+   * The shared resolver's non-secret account of what it saw, kept so the
+   * refusal below can carry the SAME accepted-sources listing the MCP boot and
+   * `protect` print. Undefined when an operator source short-circuited the
+   * host-local lookup.
+   */
+  let hostLocalReport: CustodyCredentialReport | undefined;
+  if (passphrase !== undefined) {
+    // Which source it came from follows the same fall-through the predicate
+    // above applies: an empty `--passphrase` is not the option's answer.
+    passphraseSource = isOperatorSuppliedCredential(options.passphrase)
+      ? "option"
+      : "env";
+  } else if (envRecoveryKey === undefined) {
+    const resolved = await resolveHostLocalBootCredential({
+      storage,
+      storagePath: config.storage_path,
+    });
+    if (resolved.kind === "passphrase") {
+      passphrase = resolved.value;
+      passphraseSource =
+        resolved.provenance.displaySource === "keychain"
+          ? "keychain"
+          : "fallback-file";
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `Passphrase: loaded from ${resolved.provenance.location} (service ${keychainServiceFor(config.storage_path, homedir())})`
+      );
+    } else if (resolved.kind === "keychain-key") {
+      bootKeychainKey = resolved.key;
+      // Record the SOURCE even though no passphrase was read: the diagnostics
+      // downstream name the credential that actually opened the fortress, and
+      // an unset source there reads as "the recovery key".
+      passphraseSource = "enrolled-custody-key";
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        `Custody: opened with the ${resolved.provenance.location} for this fortress.`
+      );
+    } else if (resolved.kind === "fail-closed") {
+      // Not thrown here: the refusal below still owes the operator the
+      // actionable diagnostic (enrolled factors, keyring reachability, the
+      // recovery command, tenant discovery), and `allowPark` may turn this
+      // into a parked boot instead. Carry the report to that site.
+      hostLocalReport = resolved.report;
     }
+    // resolved.kind === "virgin": no custody state at all; fall through to the
+    // audited first run below.
   }
 
   // Unified custody path (core/master-custody.ts): envelope-first, legacy
@@ -524,7 +599,6 @@ export async function startStandaloneDashboard(
   // unlock, surface discoverable sub-tenants - the common Mini1 failure mode
   // is `sanctuary dashboard` run against a default root while sub-tenants
   // hold their own keychain entries.
-  const envRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
   const isFirstRun =
     (await readCustodyEnvelope(storage)) === null &&
     (await storage.read("_meta", "key-params")) === null &&
@@ -566,6 +640,7 @@ export async function startStandaloneDashboard(
     custody = await establishMaster({
       storage,
       ...(passphrase ? { passphrase } : {}),
+      ...(bootKeychainKey ? { keychainKey: bootKeychainKey } : {}),
       ...(envRecoveryKey ? { recoveryKey: envRecoveryKey } : {}),
       // The standalone dashboard is a service boot, not a custody-setup
       // ceremony (no re-entry verification flow) - first runs here are the
@@ -591,7 +666,12 @@ export async function startStandaloneDashboard(
     if (
       (err instanceof CustodyUnlockError ||
         err instanceof CustodyMigrationRefusedError) &&
-      (passphrase || envRecoveryKey)
+      // The enrolled custody factor counts as a supplied credential here: the
+      // resolver VERIFIED it against this envelope, so a failure at
+      // establishment is a fortress-integrity condition (a rotation landing
+      // mid-boot), never "no credential". Treating it as missing would route
+      // an operator to supply a key they already hold.
+      (passphrase || envRecoveryKey || bootKeychainKey !== undefined)
     ) {
       throw new Error(
         `Sanctuary Dashboard: Encrypted identities found but NONE loaded - the supplied\n` +
@@ -612,22 +692,26 @@ export async function startStandaloneDashboard(
     if (
       err instanceof CustodyUnlockError &&
       !passphrase &&
-      !envRecoveryKey
+      !envRecoveryKey &&
+      bootKeychainKey === undefined
     ) {
       if (options.allowPark && envelopeExists) {
         // custody stays null -> fall through to the park boot below.
         custody = null;
       } else {
         const factors = await readEnrolledFactors(storage);
-        let keychainReachability: "found" | "not-found" | "unreachable" | undefined;
-        if (factors.hasKeychainFactor) {
-          try {
-            const probe = await probeKeychainCustodyKey(config.storage_path);
-            keychainReachability = probe.status;
-          } catch {
-            keychainReachability = undefined;
-          }
-        }
+        // Reachability comes from the resolver's OWN keyring read, not a second
+        // probe. Two independent reads can disagree (an unlock, a transient
+        // D-Bus fault, a keychain prompt answered between them), and this
+        // refusal prints both blocks: an actionable block saying the custody
+        // item is MISSING above an accepted-sources block saying that same
+        // item was present is a contradiction an operator acts on wrongly.
+        // Undefined only when the enrolled-custody-key source was never
+        // consulted, in which case the actionable block simply omits the
+        // keyring-state paragraph rather than guessing.
+        const keychainReachability = factors.hasKeychainFactor
+          ? hostLocalReport?.enrolledCustodyKeyItem
+          : undefined;
         const actionable = buildActionableUnlockMessage({
           ...factors,
           ...(keychainReachability !== undefined ? { keychainReachability } : {}),
@@ -638,8 +722,20 @@ export async function startStandaloneDashboard(
           config.storage_path,
           options.discoveryOptions,
         );
+        // MUST MATCH the refusal `protect`, `export-passphrase` and the MCP
+        // stdio boot print: `custodyCredentialRefusal` in
+        // `wrap/custody-credential.ts`. The operator and the release
+        // acceptance kit read ONE listing of the sources that are tried, in
+        // the order they are tried, whichever verb refused. `hostLocalReport`
+        // is undefined only when an operator source short-circuited the
+        // host-local lookup, and that case is handled by the branch above.
+        const acceptedSources =
+          hostLocalReport === undefined
+            ? ""
+            : `${custodyCredentialRefusal(hostLocalReport, config.storage_path).message}\n\n`;
         throw new Error(
           `Sanctuary Dashboard:\n${actionable}\n\n` +
+          acceptedSources +
           (otherTenants.length > 0 ? renderTenantDiscoveryHint(otherTenants) + "\n" : "") +
           `See server/docs/keychain-schema.md for the keychain layout and recovery options.`,
           { cause: err }
@@ -648,6 +744,12 @@ export async function startStandaloneDashboard(
     } else {
       throw err;
     }
+  } finally {
+    // Zero the OS-keyring-derived factor whether establishment succeeded,
+    // refused, or parked: no key material lingers past the operation that
+    // needed it (MUST-NEVER 6). MUST MATCH the same zeroization in
+    // `createSanctuaryServer` (src/index.ts).
+    bootKeychainKey?.fill(0);
   }
 
   // 6. Load principal policy (NO master key needed, safe in park too). This
@@ -883,7 +985,14 @@ async function wireUnlockedDeps(args: {
   dashboardHost: string;
   dashboardPort: number;
   passphrase: string | undefined;
-  passphraseSource: "option" | "env" | "keychain" | "fallback-file" | null;
+  /** MUST MATCH the `passphraseSource` union in `startStandaloneDashboard`. */
+  passphraseSource:
+    | "option"
+    | "env"
+    | "keychain"
+    | "fallback-file"
+    | "enrolled-custody-key"
+    | null;
 }): Promise<void> {
   const {
     dashboard,
@@ -1389,7 +1498,16 @@ async function wireUnlockedDeps(args: {
     const { storedIdentity } = createIdentity(
       `fortress:${config.storage_path}`,
       idEncKey,
-      passphrase ? "passphrase" : "recovery-key",
+      // ONE source of truth for the persisted `key_protection`: the custody
+      // result that actually opened this fortress, exactly as the MCP stdio
+      // boot uses it (`createSanctuaryServer` in src/index.ts reads
+      // `custody.keyProtection` too). Deciding it here from whether a
+      // passphrase string happened to be in scope recorded `recovery-key` for
+      // an enrolled-OS-keyring boot, which `establishMaster` maps to
+      // `passphrase` (`unwrapMaster` with a `keychainKey` in
+      // core/master-custody.ts): the same fortress got a different label
+      // depending on which boot path created the identity.
+      custody.keyProtection,
     );
     await identityManager.save(storedIdentity);
     signingIdentity = storedIdentity;
@@ -1561,6 +1679,11 @@ async function wireUnlockedDeps(args: {
   // 9a. Warn loudly if encrypted identity files exist but none could be decrypted
   if (loadResult.total > 0 && loadResult.loaded === 0) {
     const service = keychainServiceFor(config.storage_path, homedir());
+    // The label names the credential THIS boot opened the fortress with, which
+    // is the only one the operator can act on. An enrolled OS-keyring custody
+    // factor is not a passphrase, so it gets its own arm: without it this
+    // chain fell through to "recovery key" and the paragraph below sent the
+    // operator to `SANCTUARY_PASSPHRASE`, neither of which was in play.
     const sourceLabel =
       passphraseSource === "option"
         ? "--passphrase option"
@@ -1570,7 +1693,17 @@ async function wireUnlockedDeps(args: {
         ? `${process.platform === "linux" ? "Linux Secret Service" : "macOS Keychain"} (service ${service})`
         : passphraseSource === "fallback-file"
         ? "encrypted fallback file"
+        : passphraseSource === "enrolled-custody-key"
+        ? `enrolled ${ENROLLED_CUSTODY_FACTOR_LOCATION} for this fortress`
         : "recovery key";
+    // The keyring custody factor UNWRAPS the stored master; a passphrase or
+    // recovery key DERIVES a wrapping key. Saying "derived from" for the
+    // factor would misdescribe the custody model in the one message an
+    // operator reads while diagnosing it.
+    const sourceClause =
+      passphraseSource === "enrolled-custody-key"
+        ? `unwrapped by the ${sourceLabel}`
+        : `derived from the ${sourceLabel}`;
     const otherTenants = await discoverableSubTenants(
       config.storage_path,
       options.discoveryOptions,
@@ -1579,17 +1712,31 @@ async function wireUnlockedDeps(args: {
       otherTenants.length > 0
         ? `\n     ${renderTenantDiscoveryHint(otherTenants).split("\n").join("\n     ")}\n`
         : "";
+    // The remediation follows the source too: telling an operator whose boot
+    // used the enrolled keyring factor to set `SANCTUARY_PASSPHRASE` names a
+    // credential that had no part in this unlock, and enrolling a different
+    // host-local factor cannot change which master the identity files were
+    // encrypted under.
+    const remediationParagraph =
+      passphraseSource === "enrolled-custody-key"
+        ? `     This boot opened the fortress with the enrolled\n` +
+          `     ${ENROLLED_CUSTODY_FACTOR_LOCATION}, which unwraps THIS fortress's master.\n` +
+          `     Identity files encrypted under a different master stay unreadable\n` +
+          `     whichever host-local factor is enrolled here; they belong to the\n` +
+          `     tenant whose own credential created them.\n`
+        : `     Setting SANCTUARY_PASSPHRASE here will not help unless that value\n` +
+          `     is the passphrase that originally encrypted the identity files at\n` +
+          `     this storage path.\n`;
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
       `\n  ⚠  WARNING: Encrypted identities found but NONE loaded\n` +
         `     ${loadResult.total} encrypted identity file(s) in ${config.storage_path}/state/_identities/\n` +
-        `     0 could be decrypted with the master key derived from the ${sourceLabel}.\n\n` +
+        `     0 could be decrypted with the master key ${sourceClause}.\n\n` +
         `     The dashboard will show empty panels. Each wrapped tenant has its\n` +
         `     own passphrase under its own per-tenant Keychain service\n` +
         `     (this tenant's service: ${service}) - there is no global master\n` +
-        `     credential. Setting SANCTUARY_PASSPHRASE here will not help unless\n` +
-        `     that value is the passphrase that originally encrypted the\n` +
-        `     identity files at this storage path.\n` +
+        `     credential.\n` +
+        remediationParagraph +
         hint +
         `\n     Diagnostic recipes: server/docs/keychain-schema.md\n` +
         `     Sanctuary will never auto-regenerate - that would permanently\n` +
