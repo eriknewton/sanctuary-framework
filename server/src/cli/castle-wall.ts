@@ -7,7 +7,7 @@ import { createConnection } from "node:net";
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
 import { chmod, lstat, mkdir, open, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { constants as fsConstants, readFileSync as nodeReadFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, platform, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
@@ -125,10 +125,19 @@ import {
 
 export { requestPolicyReload, type PolicyReloadResult };
 
-const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
+/**
+ * Filename of the fortress-local Castle public key, and (under
+ * CASTLE_GLOBAL_PINNED_PUBKEY_DIR) of the machine-wide anchor as well. Both
+ * hold the SAME bytes when a fortress owns the anchor, which is what makes
+ * comparing them a meaningful adopt test. Exported because `wrap/init.ts`
+ * reads the fortress-local copy to decide whether a pre-existing machine-wide
+ * pin already authenticates this fortress; re-spelling the literal there
+ * would let init compare against a file Castle Wall does not write.
+ */
+export const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
 const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = "/Library/Application Support/Sanctuary";
-const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}/${CASTLE_PINNED_PUBKEY}`;
+export const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}/${CASTLE_PINNED_PUBKEY}`;
 const DENY_ALL_QUARANTINE_PROBE_TIMEOUT_MS = 12_000;
 
 export interface CastleWallCommandContext {
@@ -3976,33 +3985,106 @@ function defaultHostAppCandidates(env: NodeJS.ProcessEnv): string[] {
 }
 
 /**
+ * Three-state observation of one candidate binary. "absent" is reserved for
+ * the ONE case that actually proves nothing is installed there (ENOENT);
+ * every other outcome, including an untrusted owner and an unreadable parent
+ * directory, is "undetermined". A caller that turns an observation into a
+ * security decision must never read a failed observation as absence
+ * (AGENTS.md rule 1: absent, indeterminate and unproven are distinct).
+ */
+type OwnerTrustedExecutableObservation = "trusted" | "absent" | "undetermined";
+
+async function observeOwnerTrustedExecutable(
+  path: string,
+  getuid: (() => number) | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<OwnerTrustedExecutableObservation> {
+  let info: Awaited<ReturnType<typeof stat>>;
+  try {
+    info = await stat(path);
+  } catch (error) {
+    // Only "there is nothing at this path" is absence. An EACCES on an
+    // ancestor means the app may well be installed and this account simply
+    // cannot see it.
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? "absent"
+      : "undetermined";
+  }
+  // Something exists at the app's path. Whether or not we trust its owner, we
+  // cannot claim the machine has no Castle Wall app installed.
+  if (!info.isFile()) return "undetermined";
+  const uid = getuid?.();
+  const trusted = new Set<number>([0]);
+  if (uid !== undefined) {
+    trusted.add(uid);
+    if (uid === 0 && env.SUDO_UID !== undefined && /^\d+$/.test(env.SUDO_UID)) {
+      const sudoUid = Number(env.SUDO_UID);
+      if (Number.isSafeInteger(sudoUid) && sudoUid > 0) {
+        trusted.add(sudoUid);
+      }
+    }
+  }
+  return trusted.has(info.uid) ? "trusted" : "undetermined";
+}
+
+/**
  * True iff `path` is an existing regular file owned by root or the current
  * user (mirrors SanctuaryServerBridge.isOwnerTrustedExecutable on the Swift
  * side): prevents invoking a binary an attacker dropped at a probed path.
+ * Invocation sites need a two-state answer ("may I exec this?"), so an
+ * undetermined observation collapses to false here; presence questions must
+ * use observeOwnerTrustedExecutable instead and keep the third state.
  */
 async function isOwnerTrustedExecutable(
   path: string,
   getuid: (() => number) | undefined,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<boolean> {
-  try {
-    const info = await stat(path);
-    if (!info.isFile()) return false;
-    const uid = getuid?.();
-    const trusted = new Set<number>([0]);
-    if (uid !== undefined) {
-      trusted.add(uid);
-      if (uid === 0 && env.SUDO_UID !== undefined && /^\d+$/.test(env.SUDO_UID)) {
-        const sudoUid = Number(env.SUDO_UID);
-        if (Number.isSafeInteger(sudoUid) && sudoUid > 0) {
-          trusted.add(sudoUid);
-        }
-      }
-    }
-    return trusted.has(info.uid);
-  } catch {
-    return false;
+  return (await observeOwnerTrustedExecutable(path, getuid, env)) === "trusted";
+}
+
+/**
+ * Presence of a Castle Wall host app on this machine: "present", "absent", or
+ * "undetermined".
+ *
+ * Presence only: it answers "did someone install the app that enforces the
+ * machine-wide pin", never "is enforcement live". `sanctuary init` uses it to
+ * tell a stale pin left by an uninstalled older build (inert residue) apart
+ * from a pin an installed app is actually enforcing. Shares
+ * defaultHostAppCandidates + observeOwnerTrustedExecutable with
+ * resolveHostAppBinary so the two cannot disagree about where the app lives.
+ *
+ * "absent" is claimed ONLY when every documented location answered ENOENT.
+ * An app at a non-standard path, an unreadable /Applications, a non-file
+ * entry, or an untrusted owner all read "undetermined", and a
+ * SANCTUARY_CASTLE_HOSTAPP override that does not resolve to a trusted
+ * executable is undetermined too: the operator asserted the app lives there,
+ * so a stale or wrong override is missing information, not proof of absence.
+ * Failure mode from the outside: reading any of those as "absent" is exactly
+ * how an init on an enforcing host silently produced an unpinned fortress.
+ */
+export type CastleWallHostAppPresence = "present" | "absent" | "undetermined";
+
+export async function castleWallHostAppInstalled(
+  env: NodeJS.ProcessEnv = process.env,
+  getuid: (() => number) | undefined = process.getuid?.bind(process),
+): Promise<CastleWallHostAppPresence> {
+  const override = env.SANCTUARY_CASTLE_HOSTAPP;
+  const candidates = override
+    ? [override]
+    : defaultHostAppCandidates(env);
+  let sawUndetermined = false;
+  for (const candidate of candidates) {
+    const observation = await observeOwnerTrustedExecutable(candidate, getuid, env);
+    if (observation === "trusted") return "present";
+    if (observation === "undetermined") sawUndetermined = true;
   }
+  if (override) {
+    // An override names where the operator says the app is. Failing to
+    // confirm it there tells us nothing about the rest of the host.
+    return "undetermined";
+  }
+  return sawUndetermined ? "undetermined" : "absent";
 }
 
 /**
@@ -4549,6 +4631,58 @@ async function defaultActivatedSysextVersionsProbe(): Promise<string[]> {
   const stdout = await defaultSysextListRawProbe();
   if (stdout === null) return [];
   return parseActivatedCastleWallBundleVersions(stdout);
+}
+
+/**
+ * Is the Castle Wall Network Extension activated on this host?
+ *
+ * Read-only: `systemextensionsctl list` is a query and this never mutates the
+ * extension, the pin, or anything else. Three states, because the difference
+ * matters to a caller deciding whether the machine still enforces a pin:
+ *   - "activated":     at least one activated Castle Wall record is listed.
+ *   - "not-activated": the list was read, it does not mention the Castle Wall
+ *                      bundle id at all, and so contains no such record.
+ *   - "undetermined":  the list could not be read at all (the binary is
+ *                      missing, the probe timed out, exec failed), OR it was
+ *                      read, mentions the Castle Wall bundle id, and the
+ *                      strict parser could bind no activated version to it (an
+ *                      unknown state token, an unparseable version cell, a
+ *                      changed column layout). Silence from a probe, and
+ *                      silence from a deliberately strict parser, are both
+ *                      never evidence of absence.
+ * Non-macOS hosts return "not-activated" rather than "undetermined": system
+ * extensions are a macOS mechanism, so there is no Castle Wall NE to be
+ * loaded and the answer is known, not missing.
+ *
+ * Failure mode from the outside: a host whose extension is still loaded while
+ * the app has been moved or deleted looks "clean" to a filename probe. Init
+ * pairs this with castleWallHostAppInstalled precisely so that host is not
+ * mistaken for one with nothing enforcing the machine-wide pin.
+ */
+export type CastleWallExtensionActivation =
+  | "activated"
+  | "not-activated"
+  | "undetermined";
+
+export async function castleWallExtensionActivated(
+  rawListProbe: () => Promise<string | null> = defaultSysextListRawProbe,
+  hostPlatform: NodeJS.Platform = platform(),
+): Promise<CastleWallExtensionActivation> {
+  if (hostPlatform !== "darwin") return "not-activated";
+  const stdout = await rawListProbe();
+  if (stdout === null) return "undetermined";
+  if (parseActivatedCastleWallBundleVersions(stdout).length > 0) return "activated";
+  // An AFFIRMATIVE "not activated" claim needs more than the strict parser
+  // returning nothing. That parser deliberately contributes nothing for a row
+  // it cannot bind to a column layout, a team id, or a parseable version, so
+  // silence from it means "no PARSEABLE activated record", never "no record".
+  // A list that still carries our bundle id is therefore INDETERMINATE: the
+  // caller that reads this (the init pin disposition) bypasses the machine-wide
+  // pin only on proven absence of enforcement, and an unknown-state row on a
+  // host that is still enforcing is exactly the fail-open that bypass must not
+  // reach. Same rule, same file: the deploy preflight applies it below.
+  if (stdout.includes(CASTLE_WALL_SYSTEM_EXTENSION_BUNDLE_ID)) return "undetermined";
+  return "not-activated";
 }
 
 /**

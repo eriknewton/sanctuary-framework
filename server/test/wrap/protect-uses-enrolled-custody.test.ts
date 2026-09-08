@@ -1,3 +1,4 @@
+// fail-before-exempt: combined-tree seam only: the probe literal gained the stagedRecoveryFile field and the castle-wall mock became a partial (importOriginal) mock so init.ts loads; the behaviour this file proves shipped in #1391 and is unchanged by this PR
 /**
  * Rung 1 primary journey: `init` -> `install` -> the EXACT emitted `protect`
  * argv, end to end, with no credential supplied anywhere.
@@ -32,9 +33,18 @@ const castleWallMocks = vi.hoisted(() => ({
   startMacOSCastleWallDaemon: vi.fn(async () => ({ stop: async () => {} })),
 }));
 
-vi.mock("../../src/cli/castle-wall.js", () => ({
-  runProvisionPin: castleWallMocks.runProvisionPin,
-}));
+// Partial mock: only the pin provisioning verb is stubbed. init.ts also imports
+// the pin path constant and the read-only host/extension observers from this
+// module, and those must be the real ones (the tests here run with
+// SANCTUARY_INIT_NO_PIN, so the observers are never consulted, but a bare
+// factory would make the module fail to load at all).
+vi.mock("../../src/cli/castle-wall.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/cli/castle-wall.js")>();
+  return {
+    ...actual,
+    runProvisionPin: castleWallMocks.runProvisionPin,
+  };
+});
 
 vi.mock("../../src/castle-wall/runtime/index.js", () => ({
   startMacOSCastleWallDaemon: castleWallMocks.startMacOSCastleWallDaemon,
@@ -106,6 +116,7 @@ function baseProbe(over: Partial<InstallProbeResult>): InstallProbeResult {
     enforcement: "not-applicable",
     trustAnchor: "not-applicable",
     operatorTwin: "not-applicable",
+    stagedRecoveryFile: "absent",
     ...over,
   };
 }

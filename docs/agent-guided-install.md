@@ -60,9 +60,24 @@ observed state, not from a transcript or a claimed prior step.
 The planner never returns a passphrase, recovery key, dashboard bearer token, or
 command that prints one. `protect --agent-guided` keeps the passphrase in the
 platform credential store and stages the newly minted recovery key in a mode
-`0600` file outside the fortress without printing its contents. Once installation
-is complete, the response gives that path to the operator. The operator moves it
-into a password manager in a private local session and deletes the staging file.
+`0600` file outside the fortress without printing its contents.
+
+Once installation is complete, the custody step the planner emits depends on
+what it actually observed at that staged path, and it never names a file that
+is not there. A run that mints a recovery key stages one; a run against a
+fortress this host already holds a credential for does not, and the two need
+different instructions.
+
+- **Staged file present.** The response gives the operator that exact path. In a
+  private local session the operator moves the file into a password manager and
+  then deletes it.
+- **Staged file absent.** Nothing was staged, so there is nothing to move. The
+  response says which credential this host already holds and tells the operator
+  to run `sanctuary export-passphrase` in a private local session to record it.
+- **Path present but not a regular file.** The observation failed (a symlink, a
+  directory, an account that cannot stat it), so the response says so and asks
+  the operator to look at the path first rather than asserting either branch.
+
 The installing agent must not read the file, run `export-passphrase`, capture
 secret output, or ask the operator to paste recovery material into chat.
 
@@ -103,8 +118,17 @@ reports whether this host opens the fortress from its exact-fortress stored
 credential with no secret typed; `custody_mutation` (`available`, `unavailable`,
 or `unknown`) independently reports whether the reviewed process-owned mutation
 lock is usable; `recovery_factor` (`present`, `absent`, or `unknown`) reports a
-MAC-authenticated, operator-verified human-held recovery-key wrap. The planner
-reports `complete` only when access is `usable` and mutation is `available`.
+MAC-authenticated, operator-verified human-held recovery-key wrap.
+
+The planner also reports `staged_recovery_file` (`present`, `absent`, or
+`unknown`), the observation that selects the `private_recovery_custody` operator
+action. It is reported alongside the chosen action text so a `--json` consumer
+can see why that branch was taken: `present` names a staged file to move into a
+password manager, `absent` means this install staged none, and `unknown` means
+the path could not be observed as a regular file. `unknown` is never folded into
+`absent`.
+
+The planner reports `complete` only when access is `usable` and mutation is `available`.
 It then adds a
 `restart_and_verify_rung1` human action: restart the host and confirm memory
 survives via `memory_insert`, `memory_search`, and `memory_get` (which proves

@@ -52,6 +52,26 @@ describe("rotate-master --recovery-out", () => {
     }
   });
 
+  it("does not advertise a default recovery-key file the rotation never writes", async () => {
+    // The help said the default destination was <fortress>/recovery-key.txt.
+    // Rotation preflights a file ONLY when --recovery-out / SANCTUARY_RECOVERY_OUT
+    // resolves; otherwise nothing is written and the new key is captured through
+    // the keyring plus the re-entry prompt. An operator who trusted the old line
+    // went looking in the fortress for a file that was never created.
+    const out = captureStream();
+    const err = captureStream();
+    const code = await runRotateMasterCommand({
+      argv: ["--help"],
+      out: out.stream,
+      err: err.stream,
+    });
+    expect(code).toBe(0);
+    const help = out.writes.join("");
+    expect(help).toContain("--recovery-out");
+    expect(help).not.toContain(`<fortress>/${RECOVERY_KEY_FILENAME}`);
+    expect(help).toContain("rotation writes no recovery file at all");
+  });
+
   it("captures the rotated recovery key to an external path with mode 0600", async () => {
     const fortressPath = join(tmp, "fortress");
     const recoveryOut = join(tmp, "durable", "rotated-recovery-key.txt");

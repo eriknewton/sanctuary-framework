@@ -1,3 +1,4 @@
+// fail-before-exempt: the castle-wall mock became a partial (importOriginal) mock so init.ts, which now imports the pin path and the host observers from that module, still loads; no new behaviour is asserted here, the init behaviour tests live in init-recovery-doctor.test.ts
 import {
   afterEach,
   beforeEach,
@@ -23,7 +24,14 @@ const castleWallMocks = vi.hoisted(() => ({
   })),
 }));
 
-vi.mock("../../src/cli/castle-wall.js", () => ({
+// Partial mock, not a hand-written replacement surface: `init` also consumes
+// CASTLE_GLOBAL_PINNED_PUBKEY_PATH and castleWallHostAppInstalled from this
+// module, and an enumerated mock goes stale the moment it consumes one more.
+// Failure mode from the outside: the module fails to load with "no export is
+// defined on the mock", which reads like a broken import rather than a stale
+// fixture. Only the host-mutating verb is replaced.
+vi.mock("../../src/cli/castle-wall.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/cli/castle-wall.js")>()),
   runProvisionPin: castleWallMocks.runProvisionPin,
 }));
 

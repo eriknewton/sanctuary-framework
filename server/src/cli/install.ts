@@ -364,6 +364,12 @@ export interface AgentInstallPlan {
     custody_access: CustodyAccessObservation;
     custody_mutation: CustodyMutationObservation;
     recovery_factor: RecoveryFactorObservation;
+    // The observation that SELECTS the recovery operator_action below
+    // (recoveryCustodyAction reads it). Reported here because a --json
+    // consumer that sees only the chosen action text cannot tell whether the
+    // staged file was seen, was seen absent, or could not be read at all, and
+    // `unknown` is not `absent`.
+    staged_recovery_file: StagedRecoveryFileObservation;
     castle_wall_app: InstallObservation;
     castle_wall_build_sha: string | null;
     system_extension: SysextState | "unknown" | "not-applicable";
@@ -404,6 +410,8 @@ export interface InstallProbeResult {
   custodyAccess: CustodyAccessObservation;
   custodyMutation: CustodyMutationObservation;
   recoveryFactor: RecoveryFactorObservation;
+  /** Does the agent-guided staged recovery file actually exist on this host? */
+  stagedRecoveryFile: StagedRecoveryFileObservation;
   nodePath: string;
   castleWallApp: InstallObservation;
   castleWallBuildSha: string | null;
@@ -1005,15 +1013,29 @@ export async function probeCustodyAccess(
   };
 }
 
-
-function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
+/**
+ * The PRODUCTION probe wiring, exported so a test can exercise the real object
+ * graph rather than an injected `ctx.ops`.
+ *
+ * Every observation the plan renders is injectable for unit tests, which means
+ * a probe that returned a hardcoded value here would leave every one of those
+ * tests green (AGENTS.md rule 4: a capability that claims a live effect needs a
+ * wired-consumer test). This export is that test's entry point; runtime callers
+ * still reach it only through `runInstallCommand`.
+ */
+export function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
   const platform = ctx.platform ?? process.platform;
   const env = ctx.env ?? process.env;
   return {
     probe: async ({ profile, harness, fortress }) => {
       const cooperativeWrap = await probeWrap(harness);
-      const [pathCli, packageManagerPath, existingCustody, custodyAccessProbe] =
-        await Promise.all([
+      const [
+        pathCli,
+        packageManagerPath,
+        existingCustody,
+        custodyAccessProbe,
+        stagedRecoveryFile,
+      ] = await Promise.all([
           probePersistentCli(),
           probeExecutableOnPath("npm"),
           platform === "darwin"
@@ -1022,6 +1044,9 @@ function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
           // Read-only, ambient-env-blind daily-UX probe — runs on every profile
           // (Rung 1 IS the memory profile) and every platform.
           probeCustodyAccess(fortress, platform),
+          // Existence of the staged recovery file, so the custody instruction
+          // names a branch that applies rather than composing a path.
+          probeStagedRecoveryFile(fortress),
         ]);
       const { custodyAccess, custodyMutation, recoveryFactor } = custodyAccessProbe;
       let persistentCli = pathCli;
@@ -1052,6 +1077,7 @@ function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
           custodyAccess,
           custodyMutation,
           recoveryFactor,
+          stagedRecoveryFile,
           nodePath,
           castleWallApp: "not-applicable",
           castleWallBuildSha: null,
@@ -1082,6 +1108,7 @@ function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
         custodyAccess,
         custodyMutation,
         recoveryFactor,
+        stagedRecoveryFile,
         nodePath,
         castleWallApp: castleWallApp.status,
         castleWallBuildSha: castleWallApp.buildSha,
@@ -1094,18 +1121,55 @@ function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
   };
 }
 
-function recoveryCustodyAction(fortress: string): AgentInstallAction {
+/**
+ * Custody instruction for the recovery material this install staged.
+ *
+ * The branch is chosen from an OBSERVATION of the staged file, never composed
+ * from a path that may not exist: the earlier version interpolated
+ * agentGuidedRecoveryOutputPath() unconditionally and offered both branches,
+ * so an operator on a host with no staged file was sent to look for one.
+ * "unknown" is its own branch and is never folded into "present": a file that
+ * could not be observed is not a file that is there.
+ */
+function recoveryCustodyAction(
+  fortress: string,
+  stagedRecoveryFile: StagedRecoveryFileObservation,
+): AgentInstallAction {
   const stagedPath = agentGuidedRecoveryOutputPath(fortress);
+  const description =
+    stagedRecoveryFile === "present"
+      ? `In a private local session, move the staged recovery file at ${stagedPath} into a password manager, then delete the file.`
+      : stagedRecoveryFile === "absent"
+        ? "This install staged no recovery file, so there is nothing to move. In a private local session, run 'sanctuary export-passphrase' to record the credential this host already holds."
+        : `The staged recovery file at ${stagedPath} could not be observed (it is not a regular file, or this account cannot stat it). In a private local session, look at that path first: move it into a password manager and delete it if it is really there, otherwise run 'sanctuary export-passphrase' instead.`;
   return {
     id: "private_recovery_custody",
     actor: "human",
-    description:
-      `In a private local session, move the staged recovery file at ${stagedPath} into a password manager, then delete the file. ` +
-      "For an older install with no staged file, run 'sanctuary export-passphrase' privately instead.",
+    description,
     completion: "The operator confirms custody without pasting the secret into chat.",
     secret_boundary:
       "The installing agent must not run the command, capture its output, or ask the operator to paste recovery material.",
   };
+}
+
+/**
+ * Observation of the agent-guided staged recovery file. A symlink or a
+ * non-regular entry reads "unknown", never "present": the instruction must
+ * not tell an operator to move something that is not the file it names.
+ */
+export type StagedRecoveryFileObservation = "present" | "absent" | "unknown";
+
+export async function probeStagedRecoveryFile(
+  fortress: string,
+): Promise<StagedRecoveryFileObservation> {
+  try {
+    const entry = await lstat(agentGuidedRecoveryOutputPath(fortress));
+    return entry.isFile() && !entry.isSymbolicLink() ? "present" : "unknown";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? "absent"
+      : "unknown";
+  }
 }
 
 /**
@@ -1255,7 +1319,7 @@ function applyRung1CustodyCompletion(
     }
     plan.status = "complete";
     plan.operator_actions = [
-      recoveryCustodyAction(input.fortress),
+      recoveryCustodyAction(input.fortress, input.observed.stagedRecoveryFile),
       restartAndVerifyRung1Action(),
     ];
     for (const note of completeNotes) plan.notes.push(note);
@@ -1355,6 +1419,7 @@ function basePlan(
       custody_access: observed.custodyAccess,
       custody_mutation: observed.custodyMutation,
       recovery_factor: observed.recoveryFactor,
+      staged_recovery_file: observed.stagedRecoveryFile,
       castle_wall_app: observed.castleWallApp,
       castle_wall_build_sha: observed.castleWallBuildSha,
       system_extension: observed.systemExtension,

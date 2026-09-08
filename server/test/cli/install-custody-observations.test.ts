@@ -9,15 +9,18 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { cp, mkdtemp, rm, mkdir } from "node:fs/promises";
+import { cp, mkdtemp, rm, mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  createInstallOps,
   probeCustodyAccess,
+  probeStagedRecoveryFile,
   buildAgentInstallPlan,
   type InstallProbeResult,
 } from "../../src/cli/install.js";
+import { agentGuidedRecoveryOutputPath } from "../../src/wrap/custody-flow.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import {
   CUSTODY_ENVELOPE_KEY,
@@ -463,6 +466,7 @@ describe("buildAgentInstallPlan surfaces Rung 1 evidence and the restart action"
       custodyAccess: "usable",
       custodyMutation: "available",
       recoveryFactor: "present",
+      stagedRecoveryFile: "present",
       nodePath: "/usr/bin/node",
       castleWallApp: "not-applicable",
       castleWallBuildSha: null,
@@ -475,6 +479,47 @@ describe("buildAgentInstallPlan surfaces Rung 1 evidence and the restart action"
       ...over,
     };
   }
+
+  // The staged-file custody instruction must describe an OBSERVED file, not a
+  // composed path (register row defect.a73-install-reports-complete-on-
+  // unopenable-fortress, staged-file half). "unknown" is its own branch.
+  function recoveryAction(
+    staged: InstallProbeResult["stagedRecoveryFile"],
+  ): string {
+    const plan = buildAgentInstallPlan({
+      profile: "memory",
+      harness: "claude-code",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: completeMemoryProbe({ stagedRecoveryFile: staged }),
+    });
+    const action = plan.operator_actions.find(
+      (candidate) => candidate.id === "private_recovery_custody",
+    );
+    expect(action).toBeDefined();
+    return action!.description;
+  }
+
+  it("tells the operator to move the staged file only when one exists", () => {
+    const description = recoveryAction("present");
+    expect(description).toContain("move the staged recovery file at");
+    expect(description).toContain("Sanctuary Recovery");
+    expect(description).not.toContain("export-passphrase");
+  });
+
+  it("names no staged path when there is no staged file", () => {
+    const description = recoveryAction("absent");
+    expect(description).toContain("staged no recovery file");
+    expect(description).toContain("export-passphrase");
+    expect(description).not.toContain("Sanctuary Recovery");
+  });
+
+  it("says so when the staged file could not be observed", () => {
+    const description = recoveryAction("unknown");
+    expect(description).toContain("could not be observed");
+    expect(description).toContain("Sanctuary Recovery");
+    expect(description).toContain("export-passphrase");
+  });
 
   it("completes the memory profile and adds restart_and_verify_rung1", () => {
     const plan = buildAgentInstallPlan({
@@ -665,5 +710,103 @@ describe("buildAgentInstallPlan surfaces Rung 1 evidence and the restart action"
     });
     expect(p.status).toBe("human_action");
     expect(p.next_action?.id).toBe("attempt_custody_recovery");
+  });
+});
+
+describe("staged recovery file observation, against the real filesystem", () => {
+  let tmp: string;
+
+  beforeEach(async () => {
+    tmp = await mkdtemp(join(tmpdir(), "sanctuary-staged-recovery-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  it("distinguishes present, absent, and unknown at the exact staged path", async () => {
+    const fortress = join(tmp, "fortress");
+    const staged = agentGuidedRecoveryOutputPath(fortress);
+
+    // Nothing staged: the instruction must send the operator to
+    // export-passphrase, not to a path that does not exist.
+    expect(await probeStagedRecoveryFile(fortress)).toBe("absent");
+
+    await mkdir(join(tmp, "Sanctuary Recovery"), { recursive: true, mode: 0o700 });
+    await writeFile(staged, "Recovery key:\n", { mode: 0o600 });
+    expect(await probeStagedRecoveryFile(fortress)).toBe("present");
+
+    // A symlink is never "present": moving and deleting it would act on
+    // something other than the file the instruction names.
+    await rm(staged);
+    await symlink(join(tmp, "somewhere-else.txt"), staged);
+    expect(await probeStagedRecoveryFile(fortress)).toBe("unknown");
+
+    await rm(staged);
+    await mkdir(staged, { mode: 0o700 });
+    expect(await probeStagedRecoveryFile(fortress)).toBe("unknown");
+  });
+
+  it("reports the staged file from disk through the PRODUCTION probe wiring, with nothing injected", async () => {
+    // Wired-consumer test (AGENTS.md rule 4). Every test above injects the
+    // observation, so a createInstallOps that returned a hardcoded
+    // stagedRecoveryFile would leave all of them green while the shipped
+    // install plan told every operator to go move a file that is not there.
+    // This one builds the real ops object and asserts the value came off disk.
+    //
+    // Linux + the memory profile deliberately: it keeps the probe on the
+    // branch that spawns no macOS keyring subprocess, and the fortress below
+    // has no custody envelope, so the stored-credential read is never reached.
+    const fortress = join(tmp, "wired-fortress");
+    await mkdir(join(fortress, "state"), { recursive: true, mode: 0o700 });
+    const ops = createInstallOps({ platform: "linux", env: {} });
+    const probeArgs = {
+      profile: "memory" as const,
+      harness: "claude-code" as const,
+      fortress,
+    };
+
+    // Only the custody-access observations are overridden below, and only to
+    // reach the completion branch that renders the custody instruction; the
+    // stagedRecoveryFile value carried into the plan is the one the production
+    // probe just read off disk, which is what this test exists to prove.
+    const reachCompletion = (observed: InstallProbeResult): InstallProbeResult => ({
+      ...observed,
+      // A CI runner has no global `sanctuary` on PATH, so the real probe reports
+      // the persistent CLI absent and the plan stops at install_persistent_cli
+      // before the completion branch this test needs; pin the toolchain
+      // observations too. stagedRecoveryFile is deliberately NOT overridden.
+      persistentCli: "present",
+      persistentCliPath: "/usr/local/bin/sanctuary",
+      packageManagerPath: "/usr/bin/npm",
+      nodePath: "/usr/bin/node",
+      cooperativeWrap: "present",
+      custodyAccess: "usable",
+      custodyMutation: "available",
+      recoveryFactor: "present",
+    });
+    const instructions = (observed: InstallProbeResult): string =>
+      buildAgentInstallPlan({
+        ...probeArgs,
+        platform: "linux",
+        observed: reachCompletion(observed),
+      })
+        .operator_actions.map((action) => action.description)
+        .join("\n");
+
+    const absent = await ops.probe(probeArgs);
+    expect(absent.stagedRecoveryFile).toBe("absent");
+    expect(instructions(absent)).toContain("staged no recovery file");
+
+    await mkdir(join(tmp, "Sanctuary Recovery"), { recursive: true, mode: 0o700 });
+    await writeFile(agentGuidedRecoveryOutputPath(fortress), "Recovery key:\n", {
+      mode: 0o600,
+    });
+
+    const present = await ops.probe(probeArgs);
+    expect(present.stagedRecoveryFile).toBe("present");
+    expect(instructions(present)).toContain(
+      agentGuidedRecoveryOutputPath(fortress),
+    );
   });
 });

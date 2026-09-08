@@ -15,12 +15,14 @@
  *   - Honors --fortress <path> (and SANCTUARY_FORTRESS_PATH env var) as
  *     the operator-friendly alias for SANCTUARY_STORAGE_PATH.
  *
- * Honors --force, --no-confirm. Interactive init discloses the recovery key
- * through the shared helper; headless init writes it to an external staging
- * path and prints only that path.
+ * Honors --force, --no-confirm. The plaintext recovery key ALWAYS lands
+ * outside the fortress: --recovery-out names the destination, and without it
+ * init uses the agent-guided staging path beside the fortress (the same path
+ * the install contract names). Interactive init also discloses the key in a
+ * banner and forces re-entry; headless init prints only the destination.
  */
 
-import { lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, unlink } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { dirname, join, isAbsolute, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -69,19 +71,35 @@ import {
   RecoveryKeyConfirmationNonInteractiveError,
   RecoveryKeyOutputPathInsideFortressError,
   RecoveryKeyReentryMismatchError,
-  type DiscloseRecoveryKeyResult,
 } from "./recovery-key-disclosure.js";
-import { agentGuidedRecoveryOutputPath } from "./custody-flow.js";
+import {
+  agentGuidedRecoveryDefaultCollidesWithFortress,
+  agentGuidedRecoveryDefaultCollisionMessage,
+  agentGuidedRecoveryOutputPath,
+} from "./custody-flow.js";
 import {
   DEFAULT_STORAGE_DIR,
   formatFortressPathWritableError,
   preflightFortressPathWritable,
 } from "../paths.js";
 import {
+  CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
+  CASTLE_PINNED_PUBKEY,
+  castleWallExtensionActivated,
+  castleWallHostAppInstalled,
+  type CastleWallExtensionActivation,
+  type CastleWallHostAppPresence,
   runProvisionPin,
   runProvisionPinAlreadyLocked,
 } from "../cli/castle-wall.js";
+import { globalPinAuthenticates } from "../castle-wall/global-pin/index.js";
+import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 import { mkdirSafeUnderRoot } from "./config-reader.js";
+import {
+  preflightPrincipalPolicyFile,
+  principalPolicyPath,
+  writeDefaultPrincipalPolicyFile,
+} from "../principal-policy/loader.js";
 import { runLocalIntelligenceSetup } from "./local-intelligence.js";
 // The dependency-free consent leaf, not the `intelligence` barrel: this file
 // is on the CLI boot path and must not pull the selector graph in for one
@@ -91,13 +109,14 @@ import type { CrossProcessLockLease } from "../storage/cross-process-lock.js";
 import { kernelBackedCrossProcessLockPlatformSupported } from "../storage/cross-process-lock.js";
 
 /**
- * Operator-facing display path of the machine-wide Castle Wall enforcement
- * anchor that default init provisions (and --no-pin skips). Kept in sync with
- * server/src/cli/castle-wall.ts CASTLE_GLOBAL_PINNED_PUBKEY_PATH; used only
- * for the --no-pin notice, never for I/O here.
+ * Path of the machine-wide Castle Wall enforcement anchor that default init
+ * provisions (and --no-pin skips). Re-exported from the owning module rather
+ * than re-spelled here: init both DISPLAYS this path (the --no-pin notice,
+ * the pre-existing-pin sentence) and READS it (defaultReadGlobalCastlePin),
+ * so a literal that drifted from castle-wall.ts would make init report on a
+ * different file than the one Castle Wall enforces. Init never writes it.
  */
-const GLOBAL_CASTLE_PIN_PATH =
-  "/Library/Application Support/Sanctuary/castle-pinned-pubkey.bin";
+const GLOBAL_CASTLE_PIN_PATH = CASTLE_GLOBAL_PINNED_PUBKEY_PATH;
 
 export interface InitOptions {
   /** Operator-supplied fortress path. Wins over env + default. */
@@ -107,8 +126,11 @@ export interface InitOptions {
   /** Allow init against a non-empty directory. Refuses without this flag. */
   force?: boolean;
   /**
-   * Exact plaintext recovery-key destination. When set, the key is written
-   * here instead of <fortress>/recovery-key.txt. Must be outside fortress.
+   * Exact plaintext recovery-key destination. When unset, init uses the
+   * agent-guided staging path beside the fortress. Either way the path must
+   * resolve (symlinks followed) outside the fortress directory: the recovery
+   * key unlocks everything the fortress holds, so keeping it there makes one
+   * directory read total.
    */
   recoveryOut?: string;
   /**
@@ -211,7 +233,24 @@ export interface InitResult {
  *   3. SANCTUARY_STORAGE_PATH env var (back-compat)
  *   4. ~/.sanctuary
  *
- * Relative paths resolve against cwd.
+ * Every source, absolute included, goes through `resolve` so `.` and `..`
+ * segments are normalized away before anything is derived from the path.
+ * An ABSOLUTE flag used to be taken verbatim, and the default recovery
+ * destination is derived as `dirname(fortress)/Sanctuary Recovery/...`, so
+ * `--fortress /a/b/c/..` produced `dirname` = `/a/b/c` and put the plaintext
+ * recovery key INSIDE the `/a/b` fortress it protects. Normalizing here is
+ * the fix at its source: `resolve("/a/b/c/..")` is `/a/b`, and every consumer
+ * (the recovery destination, the containment guard, the messages) then agrees
+ * about which directory the fortress is.
+ *
+ * Deliberately NOT realpath'd: `fortressIdFromStoragePath` derives the
+ * fortress identity, the OS-keyring service name, and the recovery filename
+ * from this string, so resolving symlinks here would silently re-key every
+ * existing fortress reached through a symlinked path (on macOS `/var` alone
+ * is a symlink). Symlink safety belongs to the guards that need it, and it
+ * is already there: `assertPathOutsideFortress` realpath-anchors BOTH sides
+ * before deciding containment, so a symlinked fortress cannot smuggle the
+ * recovery destination inside itself.
  */
 export function resolveFortressPath(
   options: { fortress?: string },
@@ -220,21 +259,24 @@ export function resolveFortressPath(
 ): string {
   const flag = options.fortress?.trim();
   if (flag && flag.length > 0) {
-    return isAbsolute(flag) ? flag : resolve(process.cwd(), flag);
+    return resolveFortressCandidate(flag);
   }
   const fortressEnv = env.SANCTUARY_FORTRESS_PATH;
   if (fortressEnv && fortressEnv.length > 0) {
-    return isAbsolute(fortressEnv)
-      ? fortressEnv
-      : resolve(process.cwd(), fortressEnv);
+    return resolveFortressCandidate(fortressEnv);
   }
   const storageEnv = env.SANCTUARY_STORAGE_PATH;
   if (storageEnv && storageEnv.length > 0) {
-    return isAbsolute(storageEnv)
-      ? storageEnv
-      : resolve(process.cwd(), storageEnv);
+    return resolveFortressCandidate(storageEnv);
   }
   return join(home, DEFAULT_STORAGE_DIR);
+}
+
+/** Absolute + normalized. Relative candidates anchor on cwd, as documented. */
+function resolveFortressCandidate(candidate: string): string {
+  return isAbsolute(candidate)
+    ? resolve(candidate)
+    : resolve(process.cwd(), candidate);
 }
 
 /**
@@ -323,6 +365,27 @@ export interface RunInitDeps {
   __testAfterKeychainCustodyKeyResolved?: () => void | Promise<void>;
   /** Test only: pause/throw after the pre-mutation lease fence. */
   beforeDurableMutation?: (label: string) => void | Promise<void>;
+  /**
+   * Test only: pause/throw in the window AFTER the recovery-key banner has
+   * printed and BEFORE the disclosure fence's post-mutation assertion, which
+   * is the exact window in which a holder loss must not cost the operator the
+   * file they were just told to save.
+   */
+  __testAfterRecoveryKeyBannerPrinted?: () => void | Promise<void>;
+  /**
+   * Test seam: observe the machine-wide Castle Wall pin without reading the
+   * real host anchor. Read-only in production too; init never writes it.
+   */
+  readGlobalCastlePin?: () => Promise<GlobalCastlePinObservation>;
+  /**
+   * Test seam: observe whether a Castle Wall host app is installed. Three
+   * states, never a boolean: "undetermined" must not collapse into "absent"
+   * at the seam either, or a test could prove a fail-open that production
+   * cannot reach (and vice versa).
+   */
+  probeInstalledCastleWallApp?: () => Promise<CastleWallHostAppPresence>;
+  /** Test seam: observe whether the Castle Wall system extension is activated. */
+  probeCastleWallExtensionActivated?: () => Promise<CastleWallExtensionActivation>;
 }
 
 /** Assert custody ownership before and after every durable init helper. */
@@ -338,6 +401,280 @@ async function fencedInit<T>(
   const result = await mutation();
   lease.assertHeld();
   return result;
+}
+
+/**
+ * Success line for recovery-key re-entry DURING init. Scoped deliberately:
+ * re-entry happens before the operator-identity seed and the Castle Wall pin
+ * step, so this may not claim the ceremony finished. The completion claim is
+ * INIT_COMPLETE_MESSAGE, printed only after the last step.
+ */
+const INIT_RECOVERY_KEY_VERIFIED_MESSAGE =
+  "Recovery key verified: the key you re-entered unlocks this fortress. " +
+  "Initialization has more steps; wait for the completion line before " +
+  "treating this fortress as built.";
+
+/** The only line in init that claims the ceremony finished. */
+const INIT_COMPLETE_MESSAGE = "Sanctuary init: complete.";
+
+/**
+ * How default init should proceed when Castle Wall global-pin provisioning
+ * refused.
+ *   - `adopt-existing-pin`: the anchor's bytes ARE this fortress's Castle
+ *     key, so the fortress is pinned already and the init is complete as-is.
+ *   - `adopt-without-pin`: nothing on this host enforces the anchor, so
+ *     finishing without a pin removes no protection that exists today.
+ *   - `fail-closed`: every other case, including every case where the
+ *     observations needed to choose could not be made.
+ * Only `fail-closed` aborts, and it is the DEFAULT: a disposition is never
+ * reached by falling through.
+ */
+export type PreExistingGlobalPinDisposition =
+  | { kind: "adopt-existing-pin"; sentence: string; auditReason: string }
+  | { kind: "adopt-without-pin"; sentence: string; auditReason: string }
+  | { kind: "fail-closed"; reason: string };
+
+/**
+ * Read-only observation of the machine-wide anchor. Three states, because a
+ * caller that treats "could not read it" as "there is none" is exactly the
+ * fail-open this type exists to prevent (AGENTS.md rule 1: absent,
+ * indeterminate and unproven all read as not-proven, never as passing).
+ */
+export type GlobalCastlePinObservation =
+  | { state: "absent" }
+  | { state: "present"; bytes: Uint8Array }
+  | { state: "present-unreadable" };
+
+/**
+ * Decide what a provision-pin refusal means on THIS host.
+ *
+ * The machine-wide pin is never mutated here, and never by init: this reads
+ * the anchor, the fortress's own Castle key, the app, and the system
+ * extension list, and nothing more. Three observations decide it, and the
+ * decision is CLOSED by default:
+ *
+ *   1. Adopt the existing anchor only on byte agreement. The anchor is
+ *      adopted only when its bytes equal this fortress's Castle public key
+ *      under `globalPinAuthenticates`, the same comparison the global-pin
+ *      write guard uses to return "idempotent". Nothing weaker (an app being
+ *      installed, a refusal code, a matching fingerprint prefix) may stand in
+ *      for the bytes.
+ *   2. Bypass to an unpinned fortress only on proven absence of enforcement:
+ *      the app must be absent from EVERY documented location AND the Castle
+ *      Wall system extension must be listed as not activated. A leftover pin
+ *      with the extension still loaded, or an app at a non-standard path, is
+ *      a host that still enforces; creating an unpinned fortress there is the
+ *      fail-open this rule closes.
+ *   3. Otherwise refuse, and say which observation is missing. "Present",
+ *      "absent" and "could not be determined" are three different answers and
+ *      the refusal sentence prints the one that was actually observed.
+ *
+ * Failure mode from the outside: an adopted-without-pin fortress on an
+ * enforcing host looks like a successful install and fails later as
+ * unexplained blocked traffic, so the refusal is deliberately louder than the
+ * bypass.
+ */
+export async function resolvePreExistingGlobalPinDisposition(
+  deps: RunInitDeps,
+  fortressPath: string,
+): Promise<PreExistingGlobalPinDisposition> {
+  const readPin = deps.readGlobalCastlePin ?? defaultReadGlobalCastlePin;
+  const appPresence = await (
+    deps.probeInstalledCastleWallApp ?? castleWallHostAppInstalled
+  )();
+  const extension = await (
+    deps.probeCastleWallExtensionActivated ?? castleWallExtensionActivated
+  )();
+  const pin = await readPin();
+
+  if (pin.state === "absent") {
+    return {
+      kind: "fail-closed",
+      reason:
+        `no global pin exists at ${GLOBAL_CASTLE_PIN_PATH}, so the refusal was not a ` +
+        "pre-existing anchor; the required pin was not published. Next step: fix the " +
+        "reported provision-pin cause, or re-run init with --no-pin to create this " +
+        "fortress deliberately unpinned",
+    };
+  }
+
+  if (pin.state === "present") {
+    const local = await readFortressCastlePublicKey(fortressPath);
+    if (local !== undefined && globalPinAuthenticates(pin.bytes, local)) {
+      return {
+        kind: "adopt-existing-pin",
+        sentence:
+          `the machine-wide Castle Wall pin at ${GLOBAL_CASTLE_PIN_PATH} already holds this ` +
+          "fortress's own Castle key, so this fortress is pinned and the anchor needed no change.",
+        auditReason: "pre-existing-global-pin-authenticates-this-fortress",
+      };
+    }
+  }
+
+  if (appPresence === "absent" && extension === "not-activated") {
+    return {
+      kind: "adopt-without-pin",
+      sentence:
+        "an older Sanctuary install left a machine-wide Castle Wall pin on this host; no Castle " +
+        "Wall app is installed in any documented location and no Castle Wall system extension " +
+        "is activated, so nothing on this host is enforcing that anchor.",
+      auditReason: "pre-existing-global-pin-no-app-and-no-activated-extension",
+    };
+  }
+
+  const pinPhrase =
+    pin.state === "present"
+      ? "present and does not hold this fortress's Castle key"
+      : "present but could not be read, so whether it holds this fortress's Castle key could not be determined";
+  const appPhrase =
+    appPresence === "present"
+      ? "installed"
+      : appPresence === "absent"
+        ? "not found in any documented location"
+        : "presence could not be determined";
+  const extensionPhrase =
+    extension === "activated"
+      ? "activated"
+      : extension === "not-activated"
+        ? "not activated"
+        : "activation state could not be determined";
+  return {
+    kind: "fail-closed",
+    reason:
+      `the machine-wide Castle Wall pin at ${GLOBAL_CASTLE_PIN_PATH} is ${pinPhrase} ` +
+      `(Castle Wall app: ${appPhrase}; Castle Wall system extension: ${extensionPhrase}), ` +
+      "so this host may still be enforcing it and an unpinned fortress is not safe to create " +
+      "silently. Next step: run 'sanctuary castle-wall re-pin' to migrate the anchor to this " +
+      "fortress when you intend to arm the wall, or re-run init with --no-pin typed explicitly " +
+      "to create this fortress deliberately unpinned",
+  };
+}
+
+/**
+ * Read-only observation of the machine-wide pin.
+ *
+ * "present-unreadable" covers a file that exists but cannot be read (the
+ * root-owned anchor read as the operator uid, or a short/oversized file):
+ * an unreadable anchor is not an absent one, and ENOENT is the only state
+ * that may be treated as "nothing was established here". A file whose length
+ * is not the Ed25519 public-key length cannot be compared byte-for-byte, so
+ * it reads unreadable rather than present-with-bytes.
+ */
+export async function defaultReadGlobalCastlePin(
+  pinPath: string = GLOBAL_CASTLE_PIN_PATH,
+): Promise<GlobalCastlePinObservation> {
+  try {
+    const bytes = await readFile(pinPath);
+    return bytes.byteLength === ED25519_PUBLIC_KEY_BYTES
+      ? { state: "present", bytes }
+      : { state: "present-unreadable" };
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { state: "absent" }
+      : { state: "present-unreadable" };
+  }
+}
+
+/**
+ * This fortress's own Castle public key, or undefined when it is absent,
+ * unreadable, or not an Ed25519 public key's length.
+ *
+ * provision-pin publishes the fortress-local public half durably BEFORE it
+ * touches the machine-wide anchor (writeExclusiveDurableFile in
+ * cli/castle-wall.ts runs ahead of writeGlobalPinnedPublicKey), so by the
+ * time a refusal reaches the disposition resolver this file holds the exact
+ * bytes that were offered to the anchor. Failure mode from the outside: an
+ * undefined result here can only make the disposition MORE closed, never
+ * less, which is why every read failure collapses to undefined.
+ */
+async function readFortressCastlePublicKey(
+  fortressPath: string,
+): Promise<Uint8Array | undefined> {
+  try {
+    const bytes = await readFile(join(fortressPath, CASTLE_PINNED_PUBKEY));
+    return bytes.byteLength === ED25519_PUBLIC_KEY_BYTES ? bytes : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** What a failed init actually undid, for the one-line operator summary. */
+interface InitCleanupSummary {
+  rolledBack: boolean;
+  rollbackIncomplete: boolean;
+  preservedRecoveryFile?: string;
+}
+
+/**
+ * One operator-facing line after a failed init: what was cleaned, what was
+ * deliberately left, and the single next step. Failure mode this exists for:
+ * a run that printed a recovery key and then died left a half-built fortress
+ * and said nothing, so the operator could not tell whether to retry, whether
+ * the key they just saved was still worth anything, or what was on disk.
+ */
+function printInitCleanupSummary(
+  fortressPath: string,
+  summary: InitCleanupSummary,
+): void {
+  const parts: string[] = [];
+  const cleanRollback = summary.rolledBack && !summary.rollbackIncomplete;
+  if (summary.rolledBack) {
+    parts.push(
+      summary.rollbackIncomplete
+        ? `Cleanup was attempted at ${fortressPath} but did not finish; inspect that directory before retrying.`
+        : `Cleaned up: everything this run wrote under ${fortressPath} was removed (the empty state/ scaffold is inert and is reused by a retry).`,
+    );
+  } else {
+    parts.push(
+      `Nothing was cleaned up automatically; inspect ${fortressPath} before retrying.`,
+    );
+  }
+  const kept = summary.preservedRecoveryFile;
+  if (kept) {
+    // Say what the kept file IS now, not only that it was kept. After a clean
+    // rollback the custody it unwrapped is gone, so it is a valid recovery
+    // key for a fortress that no longer exists: keeping it costs nothing but
+    // it recovers nothing either. Without the rollback it may still be the
+    // only way into whatever survived.
+    parts.push(
+      cleanRollback
+        ? `Kept on purpose: ${kept} (the recovery key this run already told you to save). Init never deletes a key it has announced. The cleanup above removed the custody that key unwrapped, so it is now a valid recovery key for a fortress that no longer exists and can recover nothing.`
+        : `Kept on purpose: ${kept} (the recovery key this run already told you to save). ${fortressPath} was NOT fully cleaned up, so this key may still be the only way into whatever custody survived there; keep it until you have inspected that directory.`,
+    );
+  }
+  if (cleanRollback) {
+    const retry = `sanctuary init --fortress ${shellQuote(fortressPath)}`;
+    // The next step has to be a step that WORKS. Init refuses to reuse an
+    // existing recovery-key destination (single issuance: overwriting one
+    // would destroy a key that may still be authoritative), and --force does
+    // not relax that refusal, so a bare re-run while the kept file is still
+    // at the default destination fails on exactly the file this summary just
+    // told the operator about. Name the removal first, with the exact path.
+    parts.push(
+      kept
+        ? `Next step: fix the reported cause, then clear the kept recovery file before retrying. Init refuses to write over an existing recovery-key destination (and --force does not change that), so the retry fails while that path exists:\n      rm ${shellQuote(kept)}\n      ${retry}\n    Move the file off-host first if you want to keep a copy; after the cleanup above it opens nothing.`
+        : `Next step: fix the reported cause, then re-run \`${retry}\`.`,
+    );
+  } else {
+    parts.push(
+      `Next step: fix the reported cause and inspect the directory; do NOT re-run with --force until you have.`,
+    );
+  }
+  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+  console.error(`\n  Sanctuary init: ${parts.join("\n  ")}\n`);
+}
+
+/**
+ * POSIX single-quote a path for a command line printed to an operator.
+ *
+ * The default recovery destination contains a space ("Sanctuary Recovery"),
+ * so an unquoted `rm <path>` printed here would be a command that silently
+ * targets the wrong files when pasted. Single quotes suppress every shell
+ * expansion; the only character that cannot appear inside them is the single
+ * quote itself, which is closed, escaped, and reopened.
+ */
+function shellQuote(value: string): string {
+  return `'${value.split("'").join("'\\''")}'`;
 }
 
 export async function runInit(
@@ -368,16 +705,50 @@ export async function runInit(
     throw new Error("fortress path is not writable");
   }
 
-  let recoveryKeyOutputPath: string | undefined;
+  // The plaintext recovery key NEVER defaults into the fortress it protects:
+  // it is the one credential that unlocks everything the fortress holds, so
+  // storing it there means a single directory loss (or a single directory
+  // read) is total. An operator-named --recovery-out / SANCTUARY_RECOVERY_OUT
+  // wins; otherwise the destination is the agent-guided staging path the
+  // install contract already names (beside the fortress, never inside it).
+  // Both go through the SAME guards (realpath-anchored inside-fortress
+  // refusal, symlink refusal, single-issuance preflight) before any fortress
+  // mutation, so a bad destination fails before custody material is minted.
+  let operatorNamedRecoveryOut = false;
+  let recoveryKeyOutputPath: string;
   try {
-    recoveryKeyOutputPath = resolveRecoveryKeyOutputPath({
+    const named = resolveRecoveryKeyOutputPath({
       recoveryOut: options.recoveryOut,
       storagePath: fortressPath,
       env: process.env,
     });
-    if (recoveryKeyOutputPath) {
-      await preflightRecoveryKeyOutputFile(recoveryKeyOutputPath);
+    operatorNamedRecoveryOut = named !== undefined;
+    // Availability, checked before minting: for a fortress directory named
+    // `Sanctuary Recovery` the DEFAULT staging path resolves back inside that
+    // fortress, and the containment guard then refuses a destination the
+    // operator never chose. The containment refusal is correct and stays; this
+    // one names the remedy instead of reporting a path collision as a
+    // containment violation.
+    if (named === undefined && agentGuidedRecoveryDefaultCollidesWithFortress(fortressPath)) {
+      // One sentence, two callers: `establishWrapCustody` refuses the same
+      // collision with the same text; only the remedy clause differs, because
+      // `init` is the command that accepts --recovery-out.
+      throw new Error(agentGuidedRecoveryDefaultCollisionMessage(fortressPath, "init"));
     }
+    const resolved =
+      named ??
+      resolveRecoveryKeyOutputPath({
+        recoveryOut: agentGuidedRecoveryOutputPath(fortressPath),
+        storagePath: fortressPath,
+        env: {},
+      });
+    if (resolved === undefined) {
+      throw new Error(
+        "no recovery-key destination resolved; refusing to mint custody material",
+      );
+    }
+    await preflightRecoveryKeyOutputFile(resolved);
+    recoveryKeyOutputPath = resolved;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const prefix =
@@ -387,36 +758,6 @@ export async function runInit(
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(`\n  Sanctuary init: ${prefix}: ${message}\n`);
     throw err;
-  }
-
-  // Headless init requires a durable external destination for the recovery key:
-  // the key must never land inside the fortress directory when --no-confirm is
-  // set, because no operator is present to move it off-host. When neither
-  // --recovery-out nor SANCTUARY_RECOVERY_OUT names a destination, choose the
-  // agent-guided staging path (beside the fortress, never inside it). Validate
-  // and preflight through the same guards as an explicit destination, before
-  // any fortress mutation.
-  if (!recoveryKeyOutputPath && options.noConfirm) {
-    const headlessOut = agentGuidedRecoveryOutputPath(fortressPath);
-    try {
-      recoveryKeyOutputPath = resolveRecoveryKeyOutputPath({
-        recoveryOut: headlessOut,
-        storagePath: fortressPath,
-        env: {},
-      });
-      if (recoveryKeyOutputPath) {
-        await preflightRecoveryKeyOutputFile(recoveryKeyOutputPath);
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const prefix =
-        err instanceof RecoveryKeyOutputPathInsideFortressError
-          ? "recovery key output refused"
-          : "recovery key output unavailable";
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(`\n  Sanctuary init: ${prefix}: ${message}\n`);
-      throw err;
-    }
   }
 
   if (!options.force) {
@@ -444,11 +785,29 @@ export async function runInit(
 
   await mkdir(fortressPath, { recursive: true, mode: 0o700 });
   await preflightPolicyAncestors(fortressPath);
+  // Pre-mint refusal of a planted (non-regular) principal-policy entry, using
+  // the SAME lstat rule the writer applies under the lock. The writer runs at
+  // the END of init, after the recovery-key file and the custody envelope, and
+  // `--force` skips rollback: refusing there left the staged recovery file on
+  // disk, unannounced, so the cleanup summary could not name it and the next
+  // `--force` retry died at the single-issuance preflight on a file the
+  // operator had never been told about. Failure mode from the outside: init
+  // reports "recovery key output unavailable" on a retry and the operator has
+  // no idea which file to move.
+  await preflightPrincipalPolicyFile(fortressPath);
   await deps.beforeCustodyLockAcquire?.();
 
   const storage = new FilesystemStorage(`${fortressPath}/state`);
   let runPostLockLocalSetup: (() => Promise<void>) | undefined;
   let localSetupMaster: Uint8Array | undefined;
+  // What a failed run actually did, so the failure message can say it out
+  // loud instead of leaving the operator to inspect the directory. Failure
+  // mode from the outside: a half-built fortress looks like a working one
+  // until the next verb refuses to open it.
+  const cleanupSummary: InitCleanupSummary = {
+    rolledBack: false,
+    rollbackIncomplete: false,
+  };
   const result = await withCustodyWriteLock(
     storage,
     async (lease) => {
@@ -565,7 +924,11 @@ export async function runInit(
   }
   const fortressId = fortressIdFromStoragePath(fortressPath);
 
-  if (!recoveryKeyOutputPath) {
+  // OS-keyring recovery escrow accompanies the DEFAULT interactive
+  // destination only. An operator who named --recovery-out has chosen where
+  // the canonical copy lives, and headless installs are the audited degraded
+  // mode that never touches the host keyring.
+  if (interactive && !operatorNamedRecoveryOut) {
     await fencedInit(lease, deps, "recovery-key-keychain", async () => {
       const mutation = await storeRecoveryKeyInKeychainTransactional(
         fortressPath,
@@ -626,7 +989,11 @@ export async function runInit(
   let prewrittenRecoveryKeyFile:
     | Awaited<ReturnType<typeof writeRecoveryKeyFile>>
     | undefined;
-  if (recoveryKeyOutputPath) {
+  // Announced-file bookkeeping for the rollback below: once the operator has
+  // been TOLD about this file it is theirs, and a later failure must not
+  // delete the only plaintext copy of a key they were instructed to save.
+  let recoveryKeyFileAnnounced = false;
+  {
     try {
       await deps.beforeRecoveryKeyOutputWrite?.(recoveryKeyOutputPath);
       prewrittenRecoveryKeyFile = await fencedInit(
@@ -643,6 +1010,14 @@ export async function runInit(
       if (prewrittenRecoveryKeyFile.written) {
         const writtenIdentity = await lstat(recoveryKeyOutputPath);
         externalRollback.push(async () => {
+          if (recoveryKeyFileAnnounced) {
+            // Honesty over tidiness: init already printed this path and told
+            // the operator to save it. Deleting it here is exactly the
+            // "announced a recovery key, then removed it" failure; leave the
+            // file and let the cleanup summary name it instead.
+            cleanupSummary.preservedRecoveryFile = recoveryKeyOutputPath;
+            return;
+          }
           let current: Awaited<ReturnType<typeof lstat>>;
           try {
             current = await lstat(recoveryKeyOutputPath);
@@ -672,20 +1047,6 @@ export async function runInit(
       console.error(`\n  Sanctuary init: recovery key output unavailable: ${message}\n`);
       throw err;
     }
-  } else if (lease.stableFortressCapability) {
-    const result = await fencedInit(
-      lease,
-      deps,
-      "recovery-key-file",
-      () => lease.stableFortressCapability!.writeRecoveryKey(
-        recoveryKey,
-        fortressId,
-      ),
-    );
-    prewrittenRecoveryKeyFile = {
-      filePath: join(fortressPath, "recovery-key.txt"),
-      written: result.written,
-    };
   }
 
   let envelope: CustodyEnvelope = await fencedInit(
@@ -704,12 +1065,50 @@ export async function runInit(
     ),
   );
 
+  // Write the Principal Policy the runtime reads and `sanctuary doctor`
+  // checks for. The runtime (principal-policy/loader.ts loadPrincipalPolicy)
+  // treats a missing file as first boot and self-heals from the SAME default
+  // template, so init writing it changes no policy semantics; it only stops a
+  // freshly initialized fortress from reporting a doctor FAIL whose remedy
+  // ("run sanctuary init") had already been performed. One writer, one
+  // template: writeDefaultPrincipalPolicyFile.
+  //
+  // Placed AFTER the custody-envelope commit on purpose: everything written
+  // before it must stay inside the inert scaffold that
+  // isFreshFortressOrExactLockScaffold recognizes, so a killed init is still
+  // retryable. Failure mode from the outside: a policy file that never lands
+  // looks like a clean init until the first doctor run, so a write failure
+  // here fails the init rather than warning.
+  const principalPolicy = await fencedInit(lease, deps, "principal-policy", () =>
+    writeDefaultPrincipalPolicyFile(lockedFortressPath),
+  );
+
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`\n  Sanctuary init`);
   console.error(`  Fortress: ${fortressPath}\n`);
+  // The writer NEVER overwrites an existing policy, so on `--force` over a
+  // fortress that already had one, init's silence read as "init wrote the
+  // default policy" while the file on disk was the pre-existing one. An init
+  // that did not write the policy it is credited with says so out loud; the
+  // operator's approval tiers are decided by that file.
+  if (!principalPolicy.written) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      // Printed in the operator's own terms (the fortress path they named, as
+      // the Fortress line above prints it), not the lock's stable capability
+      // path, which is the same directory reached through a canonical route
+      // and differs textually on some platforms.
+      `  Principal policy: kept the existing file at\n    ${principalPolicyPath(fortressPath)}\n` +
+        `  It was NOT rewritten, so this fortress runs the approval tiers that file already\n` +
+        `  defines, not the Sanctuary defaults. Delete it and re-run init if you want the\n` +
+        `  default policy.\n`,
+    );
+  }
 
-  // Disclose first (banner + recovery-key.txt), then force re-entry
-  // verification on the interactive path. Verification is end-to-end: the
+  // Disclose first (the banner naming the external recovery file written
+  // above), then force re-entry verification on the interactive path. The
+  // file is never `<fortress>/recovery-key.txt`: init resolved an
+  // outside-the-fortress destination before any custody material was minted. Verification is end-to-end: the
   // re-entered key must actually unwrap the master.
   //
   // Init phase boundary: this attended prompt remains inside the fresh-fortress
@@ -721,7 +1120,6 @@ export async function runInit(
   // in this phase. Potentially unbounded model download/local-intelligence work
   // is deliberately deferred until AFTER this custody callback returns
   // (runPostLockLocalSetup below).
-  let disclosure: DiscloseRecoveryKeyResult;
   try {
     if (!interactive) {
       // Headless: do NOT call discloseRecoveryKey. The key was prewritten to an
@@ -741,64 +1139,57 @@ export async function runInit(
           "headless init requires a newly written recovery-key file at the selected external path",
         );
       }
+      // The file exists at this point (written + verified above), so naming it
+      // is a statement about something real, never a path the operator would
+      // go looking for and not find.
+      // Announced BEFORE the print, never after: from the operator's side the
+      // file is theirs the instant the path reaches their terminal, and a
+      // failure between the print and the flip would let rollback unlink it.
+      recoveryKeyFileAnnounced = true;
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
-        `\n  Sanctuary init: recovery key written to:\n    ${prewrittenRecoveryKeyFile.filePath}\n`,
+        `\n  Sanctuary init: recovery key written to:\n    ${prewrittenRecoveryKeyFile.filePath}\n` +
+          `  Move it off-host (password manager, encrypted backup), then delete this file\n` +
+          `  from this host. Keep it outside the fortress directory.\n`,
       );
-      disclosure = {
-        filePath: prewrittenRecoveryKeyFile.filePath,
-        fileWritten: prewrittenRecoveryKeyFile.written,
-        confirmed: false,
-      };
     } else {
       // Interactive: existing banner disclosure and end-to-end re-entry
       // verification. The operator is present at a TTY.
       const disclosureOptions: Parameters<typeof discloseRecoveryKey>[0] = {
         recoveryKey,
-        storagePath: recoveryKeyOutputPath ? fortressPath : lockedFortressPath,
+        storagePath: fortressPath,
         fortressId,
         mode: "no-confirm", // capture/verification below replaces the Y/N prompt
+        recoveryKeyFilePath: recoveryKeyOutputPath,
+        // The announced bit flips INSIDE the helper, at the instant the
+        // banner prints, not after this call returns. fencedInit re-asserts
+        // the lease after its mutation, so a holder loss there used to throw
+        // between "the operator has seen the key and its path" and "the
+        // rollback knows not to delete it", and rollback then unlinked the
+        // only plaintext copy of a key the banner had just told them to save.
+        onBeforeBannerPrint: () => {
+          recoveryKeyFileAnnounced = true;
+        },
       };
-      if (!recoveryKeyOutputPath && lockedFortressPath !== fortressPath) {
-        // Linux writes through the inode-bound /proc/self/fd capability, but that
-        // ephemeral descriptor path must never be disclosed as recovery guidance.
-        disclosureOptions.operatorFilePath = join(
-          fortressPath,
-          "recovery-key.txt",
-        );
+      if (!prewrittenRecoveryKeyFile) {
+        throw new Error("recovery-key output file was not captured");
       }
-      if (recoveryKeyOutputPath) {
-        if (!prewrittenRecoveryKeyFile) {
-          throw new Error("custom recovery-key output was not captured");
-        }
-        disclosureOptions.recoveryKeyFilePath = recoveryKeyOutputPath;
-      }
-      if (prewrittenRecoveryKeyFile) {
-        disclosureOptions.prewrittenFile = prewrittenRecoveryKeyFile;
-      }
-      disclosure = await fencedInit(lease, deps, "recovery-key-disclosure", () =>
-        discloseRecoveryKey(disclosureOptions),
-      );
-      if (!recoveryKeyOutputPath && disclosure.fileWritten) {
-        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error(
-          "\n  WARNING: the only plaintext recovery-key copy currently lives inside\n" +
-            "  the fortress directory. It will be lost if that directory is cleared;\n" +
-            "  a later master rotation also mints a new recovery key.\n" +
-            "  Re-run with --recovery-out <path outside the fortress>, or move this\n" +
-            "  file now.\n",
-        );
-      }
-      if (!recoveryKeyOutputPath && !disclosure.fileWritten) {
-        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-        console.error(
-          "\n  WARNING: the default recovery-key.txt already existed and was not\n" +
-            "  overwritten. It may contain a prior recovery key. The authoritative\n" +
-            "  new recovery key is the one shown above and re-entered now; save\n" +
-            "  that key outside the fortress.\n",
-        );
-      }
+      disclosureOptions.prewrittenFile = prewrittenRecoveryKeyFile;
+      await fencedInit(lease, deps, "recovery-key-disclosure", async () => {
+        const disclosed = await discloseRecoveryKey(disclosureOptions);
+        // Test-only window: the banner has printed and the old code had not
+        // yet flipped the announced bit. A throw here is what the fence's own
+        // post-mutation assertHeld would do on holder loss.
+        await deps.__testAfterRecoveryKeyBannerPrinted?.();
+        return disclosed;
+      });
       await (deps.verifyRecoveryKeyReentry ?? verifyRecoveryKeyReentry)({
+        // Say only what is true at this instant. Re-entry proves the key
+        // unwraps the master; identity seeding and Castle Wall pin
+        // provisioning still follow, and a failure in either used to leave
+        // the operator holding a bare "Recovery key verified." from a run
+        // that then died.
+        verifiedMessage: INIT_RECOVERY_KEY_VERIFIED_MESSAGE,
         check: async (entered) => {
           try {
             envelope = await fencedInit(
@@ -953,27 +1344,40 @@ export async function runInit(
       const message = err instanceof Error ? err.message : String(err);
       await fencedInit(lease, deps, "audit-identity-failure-flush", () => auditLog.flush());
       masterKey.fill(0);
-      // Honesty (Finding 2, 2026-06-25): the custody envelope and the recovery
-      // key just shown are already written and INTACT at this point; only the
-      // operator-identity seed failed. The old message said "Re-run init", but
-      // a plain `init` re-run REFUSES (the fortress dir is now non-empty) and a
-      // `--force` re-init mints a brand-new random master, ORPHANING the
-      // recovery key the operator was just told to save. Give the two
-      // remediations that actually work and do not contradict the
-      // non-empty/--force guards.
+      // ONE truth about what is on disk, decided by whether this throw is
+      // about to be rolled back.
+      //
+      // Without --force the outer handler restores the fresh-fortress
+      // scaffold: the custody envelope, the policy, and the identity store
+      // are all removed, so custody is NOT intact and `identity create`
+      // against this path would fail. Saying so here and having
+      // printInitCleanupSummary immediately say the opposite is how an
+      // operator ends up running a command that cannot work. On that path
+      // this site prints only the cause, and the cleanup summary is the
+      // single place that states what survives and what to do next.
+      //
+      // With --force rollback is deliberately skipped (a --force re-init has
+      // already overwritten a prior fortress; unwinding would destroy state
+      // that was never this run's to restore), so the custody envelope and
+      // the disclosed recovery key really are intact and the two
+      // remediations below are the ones that work.
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       console.error(
-        `\n  Sanctuary init: failed to seed the default operator identity:` +
-          ` ${message}\n` +
-          `  The fortress custody was provisioned and the recovery key shown above` +
-          ` is valid, but it has NO operator identity yet. To finish, do ONE of:\n` +
-          `    - add the identity to this existing fortress (custody is intact):\n` +
-          `        sanctuary identity create --fortress ${fortressPath}\n` +
-          `    - OR start over with a fresh master (this DISCARDS the recovery key` +
-          ` shown above; a new one will be minted):\n` +
-          `        sanctuary init --force --fortress ${fortressPath}\n` +
-          `  A plain \`sanctuary init\` re-run will refuse: this fortress directory` +
-          ` is no longer empty.\n`,
+        options.force
+          ? `\n  Sanctuary init: failed to seed the default operator identity:` +
+              ` ${message}\n` +
+              `  Nothing was rolled back (--force). The fortress custody was provisioned` +
+              ` and the recovery key shown above is valid, but it has NO operator` +
+              ` identity yet. To finish, do ONE of:\n` +
+              `    - add the identity to this existing fortress (custody is intact):\n` +
+              `        sanctuary identity create --fortress ${fortressPath}\n` +
+              `    - OR start over with a fresh master (this DISCARDS the recovery key` +
+              ` shown above; a new one will be minted):\n` +
+              `        sanctuary init --force --fortress ${fortressPath}\n` +
+              `  A plain \`sanctuary init\` re-run will refuse: this fortress directory` +
+              ` is no longer empty.\n`
+          : `\n  Sanctuary init: failed to seed the default operator identity:` +
+              ` ${message}\n`,
       );
       throw new Error(`operator identity seed failed: ${message}`, {
         cause: err,
@@ -1115,7 +1519,51 @@ export async function runInit(
       for (const warning of pinExecution.warnings) console.warn(warning);
     }
     if (pinResult !== 0) {
-      throw new Error("Castle Wall provision-pin auto-bootstrap failed");
+      // provision-pin never overwrites an established anchor, so a refusal on
+      // a machine that already has one is the ordinary "an older install left
+      // a pin" case, not a corrupt fortress. Decide from what is actually on
+      // this host rather than failing every default init on such a machine.
+      const disposition = await resolvePreExistingGlobalPinDisposition(
+        deps,
+        lockedFortressPath,
+      );
+      if (disposition.kind === "fail-closed") {
+        // The default. Everything that is not a proven-safe adopt lands here,
+        // including every case where an observation could not be made.
+        throw new Error(
+          `Castle Wall provision-pin auto-bootstrap failed: ${disposition.reason}`,
+        );
+      }
+      // Both adopt outcomes are audited with the SAME operation and different
+      // reasons: neither wrote the anchor, and the reason is what tells a
+      // later reader which of the two proofs was actually made. A new
+      // operation name would be a new audit surface for no added meaning.
+      await fencedInit(lease, deps, "audit-pin-preexisting", () =>
+        auditLog.appendCritical({
+          layer: "l2",
+          operation: "castle_pin_provision_skipped",
+          identity_id: fortressId,
+          result: "success",
+          details: {
+            source: "sanctuary-init",
+            reason: disposition.auditReason,
+          },
+        }),
+      );
+      await fencedInit(lease, deps, "audit-pin-preexisting-flush", () =>
+        auditLog.flush(),
+      );
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        disposition.kind === "adopt-existing-pin"
+          ? `\n  Sanctuary init: ${disposition.sentence}\n` +
+            `  The anchor at ${GLOBAL_CASTLE_PIN_PATH} was read and left exactly as it was.\n` +
+            `  No next step is needed for the pin.\n`
+          : `\n  Sanctuary init: ${disposition.sentence}\n` +
+            `  This fortress was created WITHOUT a Castle Wall pin (the same result as --no-pin);\n` +
+            `  the existing anchor at ${GLOBAL_CASTLE_PIN_PATH} was read and left exactly as it was.\n` +
+            `  Next step, only when you intend to arm the wall: sanctuary castle-wall re-pin\n`,
+      );
     }
   }
 
@@ -1123,8 +1571,7 @@ export async function runInit(
   for (const mutation of keychainMutations) mutation.commit();
   return {
     fortressPath,
-    recoveryKeyDisclosurePath:
-      recoveryKeyOutputPath ?? join(fortressPath, "recovery-key.txt"),
+    recoveryKeyDisclosurePath: recoveryKeyOutputPath,
   };
   } finally {
     recoveryKeyBytes?.fill(0);
@@ -1165,6 +1612,24 @@ export async function runInit(
             rollbackFailure ??= rollbackError;
           }
           lease.assertHeld();
+          // Record what this run undid so the outer handler can say it in one
+          // line.
+          //
+          // What restoreFreshLockScaffold actually removes (see
+          // storage/fresh-fortress.ts): every entry under the fortress root
+          // except `state/`, the reset-history log and its quarantine files;
+          // every entry under `state/` except `_meta/`; and every entry under
+          // `state/_meta/` except the custody lock file. It is scoped to the
+          // fortress root and never follows a link out of it, so the fortress
+          // directory itself, its siblings, and the external recovery-key file
+          // survive. It is NOT scoped to authorship: it removes anything at
+          // those paths, including a same-uid file that appeared after the
+          // under-lock freshness check, because that check is what proves the
+          // root was empty when this init claimed it. The refusal guards ahead
+          // of it (symlink, non-directory, changed lock scaffold) are what keep
+          // that reach safe.
+          cleanupSummary.rolledBack = true;
+          cleanupSummary.rollbackIncomplete = rollbackFailure !== undefined;
           if (rollbackFailure) {
             throw new AggregateError(
               [error, rollbackFailure],
@@ -1186,10 +1651,20 @@ export async function runInit(
     // A late lock-phase failure can happen after the setup copy is created but
     // before its post-lock closure is eligible to run.
     localSetupMaster?.fill(0);
+    printInitCleanupSummary(fortressPath, cleanupSummary);
     throw err;
   });
   try {
     await runPostLockLocalSetup?.();
+    // The ONLY completion claim in this command, and it is reachable only
+    // after every step that can fail has run. Anything printed earlier
+    // (including recovery-key verification) describes that moment, not the
+    // ceremony.
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  ${INIT_COMPLETE_MESSAGE} Fortress ${result.fortressPath} is built,` +
+        ` and its recovery key is at ${result.recoveryKeyDisclosurePath}.\n`,
+    );
     return result;
   } finally {
     // The post-lock closure normally owns this scrub. Keep an outer lifetime
@@ -1272,10 +1747,14 @@ Options:
   --no-confirm         Skip the recovery-key Y/N confirmation. Required
                        for non-TTY callers (CI, launchd, systemd).
   --recovery-out <path>
-                       Write the plaintext recovery key to this exact path
-                       instead of <fortress>/recovery-key.txt. The path must
-                       be outside the fortress directory. Also honors
-                       SANCTUARY_RECOVERY_OUT when this flag is absent.
+                       Write the plaintext recovery key to this exact path.
+                       The path must resolve outside the fortress directory.
+                       Also honors SANCTUARY_RECOVERY_OUT when this flag is
+                       absent. Without either, init writes the key to
+                       "<parent of fortress>/Sanctuary Recovery/
+                       <fortress-id>-recovery-key.txt" (directory mode 0700,
+                       file mode 0600). The key is NEVER written inside the
+                       fortress it protects.
   --no-pin             Do NOT provision the machine-wide Castle Wall pin.
                        Default init writes the host-wide enforcement anchor
                        at /Library/Application Support/Sanctuary/; use this
@@ -1311,12 +1790,11 @@ What init does:
      it unlocks everything the fortress holds (state, identity, Castle pin).
   3. Enrolls a second custody factor on interactive installs: an OS-keyring
      custody key when available, else a passphrase from SANCTUARY_PASSPHRASE.
-  4. Prints the full recovery key in a bordered banner AND writes it to
-     <fortress>/recovery-key.txt mode 0600, or to --recovery-out when set,
-     with explicit move-off-host instructions, then (interactive) requires
-     you to re-enter it — the re-entered key must actually unwrap the
-     master. Single-issuance: existing recovery-key files are never
-     overwritten.
+  4. Writes the recovery key mode 0600 to --recovery-out, or to the default
+     staging path beside the fortress, and (interactive) prints it in a
+     bordered banner with save-then-delete instructions, then requires you to
+     re-enter it — the re-entered key must actually unwrap the master.
+     Single-issuance: an existing recovery-key file is never overwritten.
   5. With --no-confirm: records an explicit, audited headless install
      (custody_headless_install in the audit log) instead of the
      re-entry verification.
@@ -1325,10 +1803,19 @@ What init does:
      SANCTUARY_INIT_NO_IDENTITY) is set. This is the identity every Tier-1
      operator-signed surface (federation admin verbs, did:web, exit) signs
      with. Idempotent: an existing default identity is left unchanged.
-  7. Provisions the machine-wide Castle Wall pin (the host-wide enforcement
+  7. Writes the default principal-policy.yaml, the approval-gate policy the
+     runtime loads at startup and \`sanctuary doctor\` checks for.
+  8. Provisions the machine-wide Castle Wall pin (the host-wide enforcement
      anchor) unless --no-pin (or SANCTUARY_INIT_NO_PIN) is set, in which
      case it records an audited castle_pin_provision_skipped entry and
-     prints a reminder to provision the pin explicitly when ready.
+     prints a reminder to provision the pin explicitly when ready. When an
+     older install already left a pin, init creates the fortress without a
+     pin only when BOTH observations come back negative: no Castle Wall app
+     in any documented location AND the Castle Wall system extension read as
+     not activated. It says so, and never modifies the existing pin. If
+     either observation is undetermined, or either one is positive, init
+     refuses and names both observations rather than guessing that nothing
+     is enforcing the anchor.
 
 After init:
   - Run \`sanctuary wrap --fortress <path>\` to bind the fortress to an
