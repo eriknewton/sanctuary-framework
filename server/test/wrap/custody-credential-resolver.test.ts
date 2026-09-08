@@ -22,7 +22,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -197,12 +197,12 @@ describe("custody credential resolver", () => {
 
   it("boot and protect agree about a directory with no custody and a leftover item", async () => {
     // The two verbs differ only in `allowMint`. `protect` mints (above); the
-    // hands-free server boot passes allowMint:false and reads `envelopePresent`
-    // to decide, so the same state must come back as "no envelope" — which
-    // `resolveHandsFreeBootCredential` turns into its `virgin` verdict and the
-    // audited first run. Before the fix `protect` was told the fortress was
-    // resolved while boot was told it was virgin: the disagreement this
-    // resolver exists to make impossible.
+    // hands-free server boot passes allowMint:false and reads
+    // `noCustodyStateAtAll` to decide, so the same state must come back as
+    // "nothing here has ever been locked" — which `resolveHandsFreeBootCredential`
+    // turns into its `virgin` verdict and the audited first run. Before the fix
+    // `protect` was told the fortress was resolved while boot was told it was
+    // virgin: the disagreement this resolver exists to make impossible.
     await mkdir(join(dir, "state"), { recursive: true, mode: 0o700 });
     const leftover = await getOrCreateKeychainCustodyKey(dir);
     leftover!.fill(0);
@@ -214,13 +214,24 @@ describe("custody credential resolver", () => {
     });
     expect(boot.status).toBe("unresolved");
     expect(boot.report.envelopePresent).toBe(false);
+    // The fact the boot adapter actually branches on. Envelope absence alone
+    // would also be true of a LEGACY fortress, which must NOT read as virgin.
+    expect(boot.report.noCustodyStateAtAll).toBe(true);
   });
 
-  it("still takes a host-local factor as-is on a LEGACY fortress with no envelope", async () => {
+  it("takes the STORED PASSPHRASE as-is on a LEGACY fortress, and never mints over one", async () => {
     // The other no-envelope state, and the reason the mint verdict is gated on
     // legacy markers rather than on the envelope alone: a pre-envelope fortress
     // has custody, has nothing to verify a candidate against, and must migrate
     // in place. Minting here would derive a parallel master over live data.
+    //
+    // The rule is PER SOURCE, not "any host-local factor": a pre-envelope
+    // master is Argon2id(passphrase, `_meta/key-params`), so the stored
+    // passphrase is the only host-local source such a fortress can be opened
+    // with and is taken as-is, while a keyring custody item is never selected
+    // without an envelope to authenticate it against (that half is
+    // `test/wrap/legacy-fortress-stray-custody-item.test.ts`; this test stubs
+    // the item ABSENT so it is only about the passphrase).
     await mkdir(join(dir, "state"), { recursive: true, mode: 0o700 });
     const storage = new FilesystemStorage(join(dir, "state"));
     await storage.write("_meta", "key-params", stringToBytes("legacy-marker"));
@@ -245,6 +256,57 @@ describe("custody credential resolver", () => {
     expect(resolution.status).toBe("resolved");
     if (resolution.status !== "resolved") return;
     expect(resolution.credential.source).toBe("stored-passphrase");
+    // A legacy marker is custody state even though there is no envelope, so
+    // `allowMint: true` must not have produced `mint-required` above and the
+    // boot adapter must not read this fortress as virgin.
+    expect(resolution.report.envelopePresent).toBe(false);
+    expect(resolution.report.noCustodyStateAtAll).toBe(false);
+  });
+
+  it("keeps the legacy mode UNKNOWN when the higher-priority marker is unreadable", async () => {
+    // `_meta/recovery-key-hash` outranks `_meta/key-params` (the legacy branch
+    // order in establishMaster). If the higher-priority marker cannot be read,
+    // a readable key-params must NOT decide passphrase mode: the fortress may
+    // be a recovery-key one whose marker is merely unreadable, and the
+    // passphrase remedy would then name a credential that cannot open it. The
+    // mode stays unknown, custody still "may exist" (no mint), and the refusal
+    // carries neither legacy remedy. An unreadable marker is modelled as a
+    // directory at the marker path, which every storage read rejects.
+    await mkdir(join(dir, "state"), { recursive: true, mode: 0o700 });
+    const storage = new FilesystemStorage(join(dir, "state"));
+    await storage.write("_meta", "key-params", stringToBytes("legacy-marker"));
+    // Write the higher-priority marker, then swap its on-disk entry for a
+    // directory of the same name: the no-follow regular-file read refuses a
+    // directory with an error that is not ENOENT, which is "unreadable", not
+    // "absent". The path is discovered rather than spelled so the test cannot
+    // drift from the storage layer's own key encoding.
+    await storage.write("_meta", "recovery-key-hash", stringToBytes("legacy-marker"));
+    const metaDir = storage.namespacePath("_meta");
+    const entry = (await readdir(metaDir)).find((name) => name.includes("recovery-key-hash"));
+    if (!entry) throw new Error("test could not find the recovery-key-hash entry on disk");
+    await rm(join(metaDir, entry), { force: true });
+    await mkdir(join(metaDir, entry), { mode: 0o700 });
+
+    const resolution = await resolveFortressCustodyCredential({
+      storagePath: dir,
+      allowMint: true,
+      readCustodyKey: async () => ({
+        status: "not-found" as const,
+        service: "sanctuary-custody",
+      }),
+      observePassphrase: async () => ({
+        status: "absent" as const,
+        keyringUnreachable: false,
+      }),
+    });
+    expect(resolution.status).toBe("unresolved");
+    if (resolution.status !== "unresolved") return;
+    expect(resolution.report.noCustodyStateAtAll).toBe(false);
+    expect(resolution.report.legacyCustodyMode).toBeUndefined();
+    const message = custodyCredentialRefusal(resolution.report, dir).message;
+    expect(message).toContain("Accepted credentials, in the order they are tried:");
+    expect(message).not.toMatch(/passphrase required/i);
+    expect(message).not.toMatch(/no credentials provided/i);
   });
 
   it("never reports mint-required over an existing envelope", async () => {

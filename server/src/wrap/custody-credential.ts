@@ -57,6 +57,19 @@
  * with ANY existing custody state fails closed here instead, and the refusal
  * names the sources that were tried.
  *
+ * ── WHY A HOST-LOCAL CANDIDATE IS NEVER TAKEN ON PRESENCE ALONE ────────
+ *
+ * A host-local factor is returned only when it is PROVEN to open this
+ * fortress, or when the fortress is one this SOURCE could still be the
+ * credential of. The second clause is the pre-envelope (legacy) fortress,
+ * whose master is Argon2id(passphrase, `_meta/key-params`): the stored
+ * passphrase is taken as-is there and custody establishment migrates in
+ * place, while an OS-keyring custody item is skipped as present-but-
+ * unverifiable, because nothing on such a fortress was ever derived from one.
+ * Selecting the item instead let a stale or planted `sanctuary-custody-<id>`
+ * SHADOW the passphrase that does open the fortress, and the boot then
+ * refused with a credential it had chosen itself.
+ *
  * Nothing in this module writes to the fortress or to the OS keyring. The mint
  * decision is REPORTED to the caller (`status: "mint-required"`); the caller
  * performs it through the ordinary passphrase path.
@@ -219,6 +232,51 @@ export interface CustodyCredentialReport {
   /** True when this fortress already holds a custody envelope. */
   envelopePresent: boolean;
   /**
+   * True when this directory has NEVER been locked with anything: no custody
+   * envelope AND no pre-envelope (legacy) marker. The resolver's own mint
+   * predicate, published so a caller decides "is there custody here?" from the
+   * same fact the mint verdict is computed from.
+   *
+   * NOT the negation of {@link envelopePresent}. A legacy fortress has no
+   * envelope and a master already, so envelope presence answers "which custody
+   * FORMAT is this", never "is there custody here". A caller that reads
+   * `!envelopePresent` as "virgin" mints a parallel master over live
+   * pre-envelope data, which is the whole failure this module exists to
+   * prevent. Consumed by {@link resolveHostLocalBootCredential}.
+   */
+  noCustodyStateAtAll: boolean;
+  /**
+   * True when an OS-keyring custody item was PRESENT on this host and this
+   * fortress has no custody envelope to authenticate it against, so the
+   * resolver skipped it.
+   *
+   * Its own answer, kept apart from the other three: `rejected` is "proven not
+   * to unlock", `integrityIndeterminate` is "the FORTRESS could not be
+   * evaluated", and this is "the fortress is fine and this item cannot be a
+   * credential of it". Collapsing it into either one would send an operator to
+   * restore custody state that is not damaged, or to unlock a keyring that is
+   * already open. Consumed by {@link custodyCredentialRefusal}, which uses it
+   * to say why the item was passed over; the credential that DOES open the
+   * fortress comes from {@link legacyCustodyMode}, because it differs by mode.
+   */
+  custodyKeyUnverifiable: boolean;
+  /**
+   * Which pre-envelope (LEGACY) custody mode this fortress is in, when it has
+   * no envelope and a legacy marker was read: `recovery-key` when
+   * `_meta/recovery-key-hash` is present (the master IS the recovery key, and
+   * no passphrase can ever open it), `passphrase` when only `_meta/key-params`
+   * is (the master is Argon2id(passphrase, params)).
+   *
+   * `undefined` for an enveloped fortress, for a directory with no custody at
+   * all, and for the one case where a marker read THREW: an unreadable marker
+   * still means "custody may exist" (so {@link noCustodyStateAtAll} is false
+   * and nothing mints), but it does not tell us which mode, and naming a mode
+   * we did not read would print a remedy for a credential that cannot open
+   * this fortress. Consumed by {@link custodyCredentialRefusal}, which owes a
+   * legacy fortress the remedy for ITS mode.
+   */
+  legacyCustodyMode?: "recovery-key" | "passphrase";
+  /**
    * How the OS-keyring CUSTODY-KEY item itself classified on this host, in the
    * vocabulary of `probeKeychainCustodyKey`: `found` (the item exists and
    * yielded material, whether or not it then unlocked), `not-found` (the
@@ -308,6 +366,8 @@ export async function resolveFortressCustodyCredential(
   let integrityIndeterminate = false;
   /** Set exactly once, at the single keyring read below. See the report field. */
   let enrolledCustodyKeyItem: "found" | "not-found" | "unreachable" | undefined;
+  /** See the report field: present item, no envelope to authenticate it against. */
+  let custodyKeyUnverifiable = false;
 
   // An envelope that exists but cannot be read is NOT "no custody". Fail
   // toward "custody exists", so an unreadable or tampered envelope can never
@@ -326,8 +386,13 @@ export async function resolveFortressCustodyCredential(
   // pre-envelope marker. Computed HERE, before the host-local step, because it
   // gates that step as well as the mint verdict below. Markers are read only
   // when there is no envelope; with one present they cannot change any answer.
-  const noCustodyStateAtAll =
-    !envelopePresent && (await noLegacyCustodyMarkers(storage));
+  const legacyMarkers: LegacyCustodyMarkers = envelopePresent
+    ? { present: false }
+    : await readLegacyCustodyMarkers(storage);
+  const noCustodyStateAtAll = !envelopePresent && !legacyMarkers.present;
+  const legacyCustodyMode = legacyMarkers.present
+    ? legacyMarkers.mode
+    : undefined;
 
   const report = (): CustodyCredentialReport => ({
     found: [...found],
@@ -336,6 +401,9 @@ export async function resolveFortressCustodyCredential(
     details: { ...details },
     integrityIndeterminate,
     envelopePresent,
+    noCustodyStateAtAll,
+    custodyKeyUnverifiable,
+    ...(legacyCustodyMode === undefined ? {} : { legacyCustodyMode }),
     ...(enrolledCustodyKeyItem === undefined
       ? {}
       : { enrolledCustodyKeyItem }),
@@ -408,12 +476,25 @@ export async function resolveFortressCustodyCredential(
   //
   //  - A LEGACY fortress: no envelope, but a `_meta/key-params` or
   //    `_meta/recovery-key-hash` marker says it was locked before envelopes
-  //    existed. There is nothing to verify against, so the first present
-  //    candidate is taken as-is and custody establishment migrates it in
-  //    place. Trying to "verify" here would reject every candidate and route a
-  //    legacy fortress into minting, which is the failure this module exists
-  //    to prevent. This is the ONLY remaining no-envelope case: the virgin one
-  //    returned above.
+  //    existed. There is nothing to verify against, so a candidate that COULD
+  //    be this fortress's credential is taken as-is and custody establishment
+  //    migrates it in place. Trying to "verify" the passphrase here would
+  //    reject every candidate and route a legacy fortress into minting, which
+  //    is the failure this module exists to prevent. This is the ONLY
+  //    remaining no-envelope case: the virgin one returned above.
+  //
+  //    "Could be this fortress's credential" is per SOURCE and is not a
+  //    formality. A pre-envelope master is Argon2id(passphrase, key-params),
+  //    so the stored passphrase is the only host-local source a legacy
+  //    fortress can ever be opened with; nothing there was derived from an
+  //    OS-keyring custody factor, so a `sanctuary-custody-<id>` item on this
+  //    host cannot be its credential and cannot be checked against it either.
+  //    Taking that item as-is is what let a stale or planted keyring item
+  //    SHADOW the valid stored passphrase: the resolver returned the item,
+  //    the stored passphrase was never consulted, and establishment then
+  //    refused because legacy migration needs the passphrase. Present but
+  //    unverifiable is its own answer (`custodyKeyUnverifiable`): skip the
+  //    item, keep going, and let the passphrase resolve.
   //
   //  - An envelope that EXISTS but cannot be read: the fortress does have a
   //    lock and this run cannot check any key against it. Returning a factor
@@ -423,14 +504,37 @@ export async function resolveFortressCustodyCredential(
   //    unreadable envelope makes every host-local candidate INDETERMINATE,
   //    which is neither "resolved" nor "your credential is wrong".
   const canVerify = envelope !== null;
-  const verifyHostLocal = async (credential: {
-    passphrase?: string;
-    keychainKey?: Uint8Array;
-  }): Promise<CandidateVerdict> => {
+  const verifyHostLocal = async (
+    credential: {
+      passphrase?: string;
+      keychainKey?: Uint8Array;
+    },
+    /**
+     * What this SOURCE means on a legacy fortress, where there is no envelope
+     * to check anything against. `migrates-legacy` is the stored passphrase:
+     * legacy custody is passphrase-derived, so it is taken as-is and
+     * establishment migrates in place. `needs-an-envelope` is the enrolled
+     * custody key: no pre-envelope fortress was ever locked with one, so an
+     * item that is present here is unverifiable rather than usable.
+     */
+    onLegacyFortress: "migrates-legacy" | "needs-an-envelope",
+  ): Promise<CandidateVerdict> => {
     if (!envelopeReadable) {
-      return { status: "indeterminate", detail: UNREADABLE_ENVELOPE_DETAIL };
+      return {
+        status: "indeterminate",
+        detail: UNREADABLE_ENVELOPE_DETAIL,
+        cause: "fortress",
+      };
     }
-    if (!canVerify) return { status: "unlocks" };
+    if (!canVerify) {
+      return onLegacyFortress === "migrates-legacy"
+        ? { status: "unlocks" }
+        : {
+            status: "indeterminate",
+            detail: UNVERIFIABLE_CUSTODY_KEY_DETAIL,
+            cause: "candidate",
+          };
+    }
     return verifyCandidate(storage, opts.storagePath, credential);
   };
   let resolved: ResolvedCustodyCredential | null = null;
@@ -459,7 +563,13 @@ export async function resolveFortressCustodyCredential(
       if (read.status === "found" && read.key !== undefined) {
         custodyKey = read.key;
         found.push("enrolled-custody-key");
-        const verdict = await verifyHostLocal({ keychainKey: custodyKey });
+        // A keyring custody item is only ever selected on the strength of an
+        // envelope wrap it opens; there is no legacy fortress it could be the
+        // credential of. See `onLegacyFortress` above.
+        const verdict = await verifyHostLocal(
+          { keychainKey: custodyKey },
+          "needs-an-envelope",
+        );
         if (verdict.status === "unlocks") {
           resolved = {
             source: "enrolled-custody-key",
@@ -473,7 +583,12 @@ export async function resolveFortressCustodyCredential(
         } else if (verdict.status === "mismatch") {
           rejected.push("enrolled-custody-key");
         } else {
-          integrityIndeterminate = true;
+          // Which thing could not be evaluated decides the remedy the refusal
+          // prints, so the two causes are never merged: a damaged fortress is
+          // restored from backup, while an item that simply is not a
+          // credential of a pre-envelope fortress needs the passphrase.
+          if (verdict.cause === "fortress") integrityIndeterminate = true;
+          else custodyKeyUnverifiable = true;
           indeterminate.push("enrolled-custody-key");
           details["enrolled-custody-key"] ??= verdict.detail;
         }
@@ -516,9 +631,15 @@ export async function resolveFortressCustodyCredential(
       }
       if (observed.status === "found") {
         found.push("stored-passphrase");
-        const verdict = await verifyHostLocal({
-          passphrase: observed.result.value,
-        });
+        // The one host-local source a pre-envelope fortress CAN be opened
+        // with, so on a legacy fortress it is taken as-is and establishment
+        // migrates in place. See `onLegacyFortress` above.
+        const verdict = await verifyHostLocal(
+          {
+            passphrase: observed.result.value,
+          },
+          "migrates-legacy",
+        );
         if (verdict.status === "unlocks") {
           resolved = {
             source: "stored-passphrase",
@@ -530,7 +651,12 @@ export async function resolveFortressCustodyCredential(
         } else if (verdict.status === "mismatch") {
           rejected.push("stored-passphrase");
         } else {
-          integrityIndeterminate = true;
+          // Same cause split as the custody-key branch above. Every
+          // indeterminate verdict this source can produce today is a
+          // FORTRESS condition (it is taken as-is on a legacy fortress), and
+          // reading the cause rather than assuming it keeps that true if the
+          // passphrase ever gains a candidate-side unverifiable state.
+          if (verdict.cause === "fortress") integrityIndeterminate = true;
           indeterminate.push("stored-passphrase");
           details["stored-passphrase"] ??= verdict.detail;
         }
@@ -572,12 +698,35 @@ export async function resolveFortressCustodyCredential(
 type CandidateVerdict =
   | { status: "unlocks" }
   | { status: "mismatch" }
-  | { status: "indeterminate"; detail: string };
+  | {
+      status: "indeterminate";
+      detail: string;
+      /**
+       * WHICH thing could not be evaluated, carried as a typed field rather
+       * than inferred from the wording of `detail`: `fortress` means the
+       * custody state itself is unreadable (the report's
+       * `integrityIndeterminate`, remedy = restore from backup), `candidate`
+       * means the fortress is fine and this SOURCE cannot be authenticated
+       * against it (remedy = a credential that can be). The refusal picks a
+       * different remedy for each, so a string comparison here would be a
+       * cross-file contract in prose.
+       */
+      cause: "fortress" | "candidate";
+    };
 
 /** Non-secret reason attached to every candidate when the envelope is unreadable. */
 const UNREADABLE_ENVELOPE_DETAIL =
   "this fortress's custody envelope could not be read, so no host-local " +
   "factor can be verified against it";
+
+/**
+ * Non-secret reason attached to a keyring custody item on a pre-envelope
+ * fortress: it is present, it is not this fortress's credential, and there is
+ * nothing to prove that either way.
+ */
+const UNVERIFIABLE_CUSTODY_KEY_DETAIL =
+  "this fortress has no custody envelope, so a keyring custody item cannot " +
+  "be verified against it and is not used";
 
 /** Non-secret reason attached when the fortress itself could not be evaluated. */
 const UNEVALUABLE_FORTRESS_DETAIL =
@@ -600,23 +749,75 @@ async function verifyCandidate(
   } catch (error) {
     return error instanceof CustodyUnlockError
       ? { status: "mismatch" }
-      : { status: "indeterminate", detail: UNEVALUABLE_FORTRESS_DETAIL };
+      : {
+          status: "indeterminate",
+          detail: UNEVALUABLE_FORTRESS_DETAIL,
+          cause: "fortress",
+        };
   } finally {
     master?.fill(0);
   }
 }
 
-/** True when the fortress carries no pre-envelope custody marker either. */
-async function noLegacyCustodyMarkers(storage: StorageBackend): Promise<boolean> {
+/**
+ * What the pre-envelope custody markers said. `present: false` is the only
+ * shape that means "this directory has never been locked"; `mode` is absent on
+ * a present result only when a marker read threw, so the mode is unknown
+ * rather than absent (see the report field).
+ */
+type LegacyCustodyMarkers =
+  | { present: false }
+  | { present: true; mode?: "recovery-key" | "passphrase" };
+
+/**
+ * Priority order for deciding the legacy custody mode. MUST MATCH the legacy
+ * branch order in `establishMaster` (`src/core/master-custody.ts`):
+ * `recovery-key-hash` outranks `key-params`.
+ */
+const LEGACY_CUSTODY_MARKER_PRIORITY = [
+  "recovery-key-hash",
+  "key-params",
+] as const satisfies readonly (typeof LEGACY_CUSTODY_MARKERS)[number][];
+
+/**
+ * Read the pre-envelope (legacy) custody markers and say which mode they put
+ * this fortress in.
+ *
+ * MUST MATCH the legacy branch ORDER in `establishMaster`
+ * (`src/core/master-custody.ts`): `_meta/recovery-key-hash` outranks
+ * `_meta/key-params`. A recovery-key-mode fortress can carry both markers and
+ * only the recovery key opens it, so reading them in array order would tell an
+ * operator to supply a passphrase that provably cannot unlock their data.
+ */
+async function readLegacyCustodyMarkers(
+  storage: StorageBackend,
+): Promise<LegacyCustodyMarkers> {
+  const seen = new Set<(typeof LEGACY_CUSTODY_MARKERS)[number]>();
+  const unreadable = new Set<(typeof LEGACY_CUSTODY_MARKERS)[number]>();
   for (const marker of LEGACY_CUSTODY_MARKERS) {
     try {
-      if ((await storage.read("_meta", marker)) !== null) return false;
+      if ((await storage.read("_meta", marker)) !== null) seen.add(marker);
     } catch {
-      // Unreadable is not "absent": fail toward "custody may exist".
-      return false;
+      // Unreadable is not "absent": fail toward "custody may exist". The mode
+      // stays unknown, which is a third answer and not a default to either.
+      unreadable.add(marker);
     }
   }
-  return true;
+  // Decide the mode in PRIORITY order, and only while every higher-priority
+  // marker was readable: an unreadable `recovery-key-hash` above a readable
+  // `key-params` must NOT read as passphrase mode, because the fortress may be
+  // a recovery-key one whose marker simply could not be read, and the
+  // passphrase remedy would then name a credential that cannot open it.
+  for (const marker of LEGACY_CUSTODY_MARKER_PRIORITY) {
+    if (unreadable.has(marker)) return { present: true };
+    if (seen.has(marker)) {
+      return {
+        present: true,
+        mode: marker === "recovery-key-hash" ? "recovery-key" : "passphrase",
+      };
+    }
+  }
+  return unreadable.size > 0 ? { present: true } : { present: false };
 }
 
 /**
@@ -666,11 +867,51 @@ export function custodyCredentialRefusal(
   }
   if (report.indeterminate.length > 0) {
     // The remedy follows the CAUSE. Telling an operator to unlock a keyring
-    // when the envelope is the unreadable thing sends them at the wrong door.
+    // when the envelope is the unreadable thing sends them at the wrong door,
+    // and so does telling them to unlock a keyring whose item was read fine
+    // and simply is not a credential of a fortress created before custody
+    // envelopes. Three causes, three doors.
+    const onlyTheUnverifiableCustodyKey =
+      report.custodyKeyUnverifiable &&
+      !report.integrityIndeterminate &&
+      report.indeterminate.every((source) => source === "enrolled-custody-key");
     lines.push(
       report.integrityIndeterminate
         ? "  Restore this fortress's custody state from backup, then retry."
-        : "  Unlock the OS keyring and retry.",
+        : onlyTheUnverifiableCustodyKey
+          ? "  The OS-keyring custody item on this host is not a credential for it: " +
+            "a fortress created before custody envelopes was never locked with one."
+          : "  Unlock the OS keyring and retry.",
+    );
+  }
+  // A pre-envelope (LEGACY) fortress gets the remedy for the mode it is
+  // actually in, and this block owns that remedy: the keyring-skip line above
+  // explains only WHY an item was passed over, because that explanation is
+  // mode-independent while the credential that opens the fortress is not.
+  //
+  // Composed here rather than left to `establishMaster`'s legacy branch,
+  // because a legacy fortress now fails closed at the resolver and never
+  // reaches that branch (see `resolveHostLocalBootCredential`). The two
+  // operator-facing phrases below are the contract this replaced and MUST
+  // MATCH the legacy refusals in `src/core/master-custody.ts`: "no credentials
+  // provided" from `CustodyCredentialMissingError` for recovery-key mode, and
+  // "passphrase required" from the passphrase-mode branch. Both are pinned by
+  // `test/security/sec-020-recovery-key-restart.test.ts`; changing the wording
+  // here without changing it there is the drift that test exists to catch.
+  if (report.legacyCustodyMode === "recovery-key") {
+    lines.push(
+      "  This fortress was locked in recovery-key mode before custody envelopes " +
+        "existed, and no credentials provided on this host open it. Supply " +
+        "SANCTUARY_RECOVERY_KEY (the key captured at creation); custody migrates " +
+        "on that unlock. A passphrase cannot open a recovery-key fortress.",
+    );
+  } else if (report.legacyCustodyMode === "passphrase") {
+    lines.push(
+      "  This fortress was locked before custody envelopes existed and uses " +
+        "passphrase-mode key derivation: passphrase required. Supply it as " +
+        "SANCTUARY_PASSPHRASE or --passphrase (or run " +
+        "`sanctuary export-passphrase` to retrieve it from the OS keyring); " +
+        "custody migrates on that unlock.",
     );
   }
   lines.push(
@@ -744,9 +985,10 @@ export interface HostLocalBootCredentialOptions {
  * operator-supplied credentials (`--passphrase`, `SANCTUARY_PASSPHRASE`,
  * `SANCTUARY_RECOVERY_KEY`) are handled by the CALLER before this runs — they
  * outrank everything and must not be re-read here. Nothing here mints,
- * generates, or writes: the envelope's presence is what separates a virgin
- * fortress (fall through to the audited first run) from an existing one that
- * must fail closed when nothing opens it.
+ * generates, or writes: the ABSENCE OF ALL CUSTODY STATE (no envelope and no
+ * pre-envelope marker) is what separates a virgin fortress (fall through to
+ * the audited first run) from an existing one — envelope-format or legacy —
+ * that must fail closed when nothing opens it.
  *
  * MUST MATCH the two call sites that consume it: `createSanctuaryServer`
  * (`src/index.ts`) and `startStandaloneDashboard` (`src/dashboard-standalone.ts`).
@@ -806,11 +1048,23 @@ export async function resolveHostLocalBootCredential(
     }
   }
 
-  if (!resolution.report.envelopePresent) return { kind: "virgin" };
+  // INVARIANT: `virgin` means this directory has never been locked with
+  // ANYTHING, so envelope presence is not the discriminator here. A legacy
+  // marker (`_meta/key-params`, `_meta/recovery-key-hash`) IS custody state:
+  // that fortress has a master already and no envelope, and mapping it to
+  // `virgin` sends both boots into `establishMaster`'s first run, which then
+  // refuses one layer down with a generic "passphrase required" the resolver's
+  // own remedy never reaches. An editor who later reads `kind === "virgin"` as
+  // "no custody, safe to mint" would mint a parallel master over live
+  // pre-envelope data. The resolver already computes the fact this must turn
+  // on; read it rather than re-deriving it from the envelope.
+  if (resolution.report.noCustodyStateAtAll) return { kind: "virgin" };
 
-  // An existing fortress that cannot be opened hands-free. The refusal names
-  // the credential SOURCES the resolver accepts and which of them were present
-  // or rejected on this host; it never carries a value.
+  // Any custody state at all (an envelope, or a legacy marker) plus no
+  // resolved credential is an existing fortress that cannot be opened
+  // hands-free. The refusal names the credential SOURCES the resolver accepts,
+  // which of them were present, rejected or unverifiable on this host, and the
+  // remedy for THIS state; it never carries a value.
   return {
     kind: "fail-closed",
     message: custodyCredentialRefusal(resolution.report, args.storagePath)
