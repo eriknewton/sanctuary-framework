@@ -261,18 +261,45 @@ const CUSTODY_HKDF_SALT = "sanctuary-custody-v1";
 // ── Errors ──────────────────────────────────────────────────────────
 
 /**
- * A credential failed to unwrap the master. Deliberately generic: it never
- * reveals which wrap was tried or why it failed beyond "did not match"
- * (CLAUDE.md #7 — denials must not leak rule structure; #6 — no material).
+ * The complete list of credential sources Sanctuary accepts for a fortress,
+ * in the order the shared resolver tries them.
+ *
+ * MUST MATCH `CUSTODY_CREDENTIAL_SOURCE_ORDER` in
+ * `wrap/custody-credential.ts` index for index: that array is the resolution
+ * ORDER and this one is its operator-facing WORDING, and an unlock refusal
+ * that lists credentials in a different order than they are actually tried is
+ * a lie the operator would act on. The pairing is asserted mechanically in
+ * `test/wrap/custody-credential-resolver.test.ts`. This list is also the whole
+ * contract: a credential named here must be reachable, and a credential that
+ * is reachable must be named here (the A73 defect was an error text naming
+ * `SANCTUARY_RECOVERY_KEY` on a path that never read it).
+ */
+export const ACCEPTED_CUSTODY_CREDENTIAL_SOURCES = [
+  "--passphrase (explicit)",
+  "SANCTUARY_PASSPHRASE",
+  "SANCTUARY_RECOVERY_KEY",
+  "the OS-keyring custody factor enrolled for this fortress",
+  "the stored fortress passphrase (OS keyring, else the encrypted fallback file)",
+] as const;
+
+/**
+ * A credential failed to unwrap the master. Deliberately generic about the
+ * CRYPTO: it never reveals which wrap was tried or why it failed beyond "did
+ * not match" (CLAUDE.md #7 — denials must not leak rule structure; #6 — no
+ * material). Naming the credential SOURCES it accepts is a different thing and
+ * is required: an operator cannot act on "wrong credential" without knowing
+ * what this fortress will accept.
  */
 export class CustodyUnlockError extends Error {
   constructor(detail?: string) {
     super(
       detail ??
         "Sanctuary: the supplied credential does not unlock this fortress.\n" +
-          "Provide the exact passphrase (SANCTUARY_PASSPHRASE) or recovery key\n" +
-          "(SANCTUARY_RECOVERY_KEY) for this fortress. Refusing to start with a\n" +
-          "credential that does not verify."
+          "Accepted credentials, in the order they are tried:\n" +
+          ACCEPTED_CUSTODY_CREDENTIAL_SOURCES.map(
+            (source) => `    - ${source}`,
+          ).join("\n") +
+          "\nRefusing to start with a credential that does not verify."
     );
     this.name = "CustodyUnlockError";
   }
@@ -308,9 +335,10 @@ export class CustodyCredentialMissingError extends CustodyUnlockError {
     super(
       `Sanctuary: existing encrypted data found${storagePathHint ? ` at ${storagePathHint}` : ""} but no credentials provided.\n` +
         "Provide one of:\n" +
-        "  - SANCTUARY_PASSPHRASE (the fortress passphrase)\n" +
-        "  - SANCTUARY_RECOVERY_KEY (the recovery key captured at creation)\n" +
-        "Without a valid credential, encrypted state cannot be accessed.\n" +
+        ACCEPTED_CUSTODY_CREDENTIAL_SOURCES.map(
+          (source) => `  - ${source}`,
+        ).join("\n") +
+        "\nWithout a valid credential, encrypted state cannot be accessed.\n" +
         "Refusing to start to prevent silent data loss."
     );
     this.name = "CustodyCredentialMissingError";
@@ -1868,12 +1896,30 @@ export async function acquireFortressMasterWriteBarrier(
   );
 }
 
+/** Read-only unlock plus THE envelope the returned master was proven against. */
+export interface ReadOnlyUnlock {
+  masterKey: Uint8Array;
+  /**
+   * The envelope this call MAC-verified. A caller that reads a wrap fact —
+   * "does this fortress carry a recovery factor" — must read it from HERE and
+   * never from a copy it loaded itself: its own copy was read at some other
+   * instant, and comparing two of its own reads cannot detect a swap that was
+   * put back before the second one.
+   */
+  envelope: CustodyEnvelope;
+}
+
 /**
  * Unlock an already-enveloped fortress without entering any custody mutation
- * path. This is the read/export chokepoint: it never creates, migrates, or
- * rewrites custody and therefore does not require the kernel write lock.
+ * path, and hand back the envelope the master was authenticated against. This
+ * is the read/export chokepoint: it never creates, migrates, or rewrites
+ * custody and therefore does not require the kernel write lock.
+ *
+ * The returned envelope is the one read INSIDE this call and re-read unchanged
+ * after the unlock, so it is the custody state the MAC verified against. That
+ * is the object a wrap-reading caller must consume; see {@link ReadOnlyUnlock}.
  */
-export async function unlockExistingMasterReadOnly(
+export async function unlockExistingMasterReadOnlyWithEnvelope(
   storage: StorageBackend,
   opts: {
     passphrase?: string;
@@ -1885,7 +1931,7 @@ export async function unlockExistingMasterReadOnly(
       buffer: Uint8Array,
     ) => void;
   },
-): Promise<Uint8Array> {
+): Promise<ReadOnlyUnlock> {
   if (await storage.read("_meta", ROTATION_JOURNAL_KEY)) {
     throw new CustodyRotationInProgressError();
   }
@@ -1904,10 +1950,31 @@ export async function unlockExistingMasterReadOnly(
       throw new CustodySnapshotChangedError();
     }
     transferred = true;
-    return unlocked.masterKey;
+    return { masterKey: unlocked.masterKey, envelope };
   } finally {
     if (!transferred) unlocked.masterKey.fill(0);
   }
+}
+
+/**
+ * {@link unlockExistingMasterReadOnlyWithEnvelope} for the callers that need
+ * only the master key. Identical behavior; it discards the envelope.
+ */
+export async function unlockExistingMasterReadOnly(
+  storage: StorageBackend,
+  opts: {
+    passphrase?: string;
+    recoveryKey?: string;
+    keychainKey?: Uint8Array;
+    storagePathHint?: string;
+    __testObserveSecretBuffer?: (
+      label: "master" | "recovery-key",
+      buffer: Uint8Array,
+    ) => void;
+  },
+): Promise<Uint8Array> {
+  return (await unlockExistingMasterReadOnlyWithEnvelope(storage, opts))
+    .masterKey;
 }
 
 async function verifyCustodySentinelReadOnly(
@@ -1992,10 +2059,18 @@ async function unlockEnvelopeReadOnly(
   }
 }
 
-function sameCustodyEnvelopeSnapshot(
+/**
+ * Whole-envelope equality: the SAME check every read-side consumer must use to
+ * decide whether the custody state it authenticated is still the custody state
+ * it is about to read a wrap out of. Exported (rather than re-derived by each
+ * caller) because a second hand-written comparison is how one side ends up
+ * comparing only the MAC, or only the wrap count, and calling a swapped
+ * envelope unchanged.
+ */
+export function sameCustodyEnvelopeSnapshot(
   before: CustodyEnvelope,
   after: CustodyEnvelope | null,
-): boolean {
+): after is CustodyEnvelope {
   return after !== null && JSON.stringify(before) === JSON.stringify(after);
 }
 

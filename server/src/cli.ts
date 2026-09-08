@@ -201,6 +201,7 @@ async function main(): Promise<void> {
   }
 
   if (args[0] === "export-passphrase") {
+    const { runExportPassphrase } = await import("./cli/export-passphrase.js");
     await runExportPassphrase(args.slice(1));
     return;
   }
@@ -936,64 +937,6 @@ async function runStandaloneDashboard(args: string[]): Promise<void> {
   // exit code was ever reached. Do not add a second listener here.
 }
 
-async function runExportPassphrase(args: string[]): Promise<void> {
-  let assumeYes = false;
-  for (const a of args) {
-    if (a === "--yes" || a === "-y") assumeYes = true;
-    else if (a === "--help" || a === "-h") {
-      printExportPassphraseHelp();
-      process.exit(0);
-    }
-  }
-
-  const { readStoredPassphrase, PassphraseUnreadableError } = await import(
-    "./wrap/passphrase.js"
-  );
-  // Resolve the fortress HERE, at the CLI entry point, and pass it down.
-  // Ambient resolution is correct at this layer -- for `sanctuary
-  // export-passphrase` the operator's own environment IS the input -- but it
-  // is stated rather than left implicit, so no leaf module has to reach for
-  // process state on its own.
-  const { resolveStoragePath } = await import("./paths.js");
-  const storagePath = resolveStoragePath();
-  let stored: Awaited<ReturnType<typeof readStoredPassphrase>>;
-  try {
-    stored = await readStoredPassphrase({ storagePath });
-  } catch (err) {
-    if (err instanceof PassphraseUnreadableError) {
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(`\n  Sanctuary: Passphrase Unreadable`);
-      console.error(`  ${err.message}\n`);
-      process.exit(2);
-    }
-    throw err;
-  }
-  if (!stored) {
-    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error("No stored passphrase found. Run `sanctuary wrap` first.");
-    process.exit(1);
-  }
-
-  if (!assumeYes) {
-    const readline = await import("node:readline/promises");
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stderr,
-    });
-    const answer = await rl.question(
-      `\n  This will print your passphrase (from ${stored.location}) to stdout.\n  Continue? [y/N] `
-    );
-    rl.close();
-    if (!/^y(es)?$/i.test(answer.trim())) {
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error("Aborted.");
-      process.exit(1);
-    }
-  }
-
-  process.stdout.write(stored.value + "\n");
-}
-
 function printHelp(): void {
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.log(`
@@ -1027,7 +970,7 @@ Usage:
   sanctuary protect [opts]                 # Protect an agent in one command
   sanctuary wrap [opts]                   # (alias for protect)
   sanctuary uninstall [opts]              # Remove installed enforcement footprint; preserve operator data
-  sanctuary export-passphrase             # Print stored passphrase
+  sanctuary export-passphrase             # Print this host's fortress credential
 
 Options:
   --fortress <path>    Fortress directory for state I/O (default:
@@ -1050,7 +993,9 @@ Subcommands:
                        Use "sanctuary install --help" for options.
 
   protect              Protect an agent and start the dashboard in one command.
-                       Auto-generates a passphrase, auto-opens the browser.
+                       Opens the fortress with the custody factor already
+                       enrolled on this host; generates a passphrase only for a
+                       fortress that has no custody yet. Auto-opens the browser.
                        Use "sanctuary protect --help" for options.
 
   wrap                 (alias for protect)
@@ -1149,8 +1094,10 @@ Subcommands:
   exit                 Export, verify, and import SANCTUARY_EXIT_BUNDLE_V1
                        bundles. Use "sanctuary exit --help" for options.
 
-  export-passphrase    Print the stored passphrase to stdout after
-                       confirmation. Use this to back up or migrate.
+  export-passphrase    Print the credential this host holds for the fortress
+                       to stdout after confirmation: the stored passphrase when
+                       one unlocks this fortress, otherwise the enrolled
+                       OS-keyring custody factor. Use this to back up.
 
   castle-wall          Inspect Castle Wall CLI commands.
                        Use "sanctuary castle-wall --help" for options.
@@ -1319,9 +1266,13 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
       printExitHelp();
       return true;
     }
-    case "export-passphrase":
+    case "export-passphrase": {
+      const { printExportPassphraseHelp } = await import(
+        "./cli/export-passphrase.js"
+      );
       printExportPassphraseHelp();
       return true;
+    }
     case "distress": {
       const { runDistressCommand } = await import("./cli/distress.js");
       await runDistressCommand({ argv: args.slice(1).concat("--help") });
@@ -1699,24 +1650,6 @@ function printCastleWallHelp(): void {
 `);
 }
 
-function printExportPassphraseHelp(): void {
-  // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-  console.log(`
-  sanctuary export-passphrase. Print the stored passphrase to stdout.
-
-  Usage:
-    sanctuary export-passphrase [--yes]
-
-  Options:
-    --yes, -y    Skip confirmation prompt (for scripts)
-    --help, -h   Show this help
-
-  The passphrase derives every encryption key in ~/.sanctuary. Anyone who
-  has it can decrypt your state. Store the output in a password manager
-  and clear your terminal history afterwards.
-`);
-}
-
 function printWrapHelpEarly(): void {
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.log(`
@@ -1770,7 +1703,10 @@ function printWrapHelpEarly(): void {
 
   What happens:
     1. Reads your agent's MCP config
-    2. Generates a passphrase (stored in Keychain on macOS, encrypted file elsewhere)
+    2. Opens the fortress with the credential this host already holds for it
+       (the custody factor 'sanctuary init' enrolled, else a stored passphrase),
+       and generates a passphrase only for a fortress with no custody yet
+       (stored in Keychain on macOS, encrypted file elsewhere)
     3. Backs up and rewrites the config so calls route through Sanctuary
     4. Starts the Sovereignty Dashboard and opens it in your browser
     5. Every tool call is logged, scanned, and tier-gated
@@ -1801,7 +1737,18 @@ function formatCliError(err: unknown): string {
   return String(err);
 }
 
-main().catch((err) => {
+/**
+ * The module-scope dispatch of this entry point, exposed as a promise.
+ *
+ * Importing this module runs the CLI against `process.argv`, exactly as
+ * `node dist/cli.js` does; that is unchanged and is what the bin entries rely
+ * on. The promise is EXPORTED so an in-process test can await the dispatch of
+ * an argv it set before importing: `process.argv` is the only input this
+ * dispatcher takes, so a test that must prove a produced argv runs through the
+ * REAL top-level dispatch (flag extraction, subcommand routing, dependency
+ * wiring) has nothing else to await. Nothing in production reads it.
+ */
+export const cliEntryInvocation: Promise<void> = main().catch((err) => {
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error("Sanctuary MCP Server failed to start:", err);
   process.exit(1);

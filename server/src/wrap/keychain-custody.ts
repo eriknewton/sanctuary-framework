@@ -35,6 +35,15 @@ import { DEFAULT_STORAGE_DIR } from "../paths.js";
 import type { ExecResult } from "./exec-result.js";
 import { execKeychain } from "./keychain-exec.js";
 
+// ENROL SIDE of the OS-keyring credential families. These prefixes, with the
+// path-derived suffix `serviceForStoragePath` composes, ARE the on-device
+// contract: the item lives in the operator's keyring, not in this repository,
+// so a rename orphans a credential on a machine no release can reach. They
+// must match the lookup side in `wrap/custody-credential.ts` (the one resolver
+// every verb reads through) and the frozen row in `reorg-surface-manifest.md`;
+// `test/structure/frozen-surfaces.test.ts` pins the composed names so a change
+// on either side trips. Add a new spelling to the READ list; never rename or
+// drop an existing one.
 const CUSTODY_ACCOUNT = "sanctuary";
 const CUSTODY_SERVICE_PREFIX = "sanctuary-custody";
 const CUSTODY_LABEL = "Sanctuary Custody Key";

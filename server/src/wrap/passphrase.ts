@@ -47,6 +47,13 @@ import {
 
 const KEYCHAIN_ACCOUNT = "sanctuary";
 /** Legacy single-tenant Keychain service name — kept for backward compat. */
+// ENROL SIDE of the stored-passphrase keyring family; the read spellings are
+// composed from it by `fortressKeychainReadServices` below. Must match the
+// lookup side in `wrap/custody-credential.ts` and the frozen row in
+// `reorg-surface-manifest.md`; `test/structure/frozen-surfaces.test.ts` pins
+// the composed names so a change on either side trips. The item lives in the
+// operator's keyring, so a rename orphans a credential no release can reach:
+// add a new spelling to the read list, never rename or drop an existing one.
 const KEYCHAIN_SERVICE_DEFAULT = "sanctuary-passphrase";
 const FALLBACK_FILE_VERSION = 3;
 const LEGACY_FALLBACK_FILE_VERSION = 2;
@@ -569,8 +576,21 @@ export async function getOrCreatePassphrase(
 }
 
 /**
- * Read the stored passphrase without generating a new one.
- * Used by the `export-passphrase` subcommand.
+ * Read the stored passphrase without generating a new one: the thin
+ * throw-or-value view of {@link observeStoredPassphrase}, for callers that want
+ * one credential rather than the full observation.
+ *
+ * It is NOT the fortress credential chain. `export-passphrase`, `protect`, the
+ * install planner, and the hands-free server boot all go through
+ * `wrap/custody-credential.ts`, which consults the enrolled OS-keyring custody
+ * factor as well as this family and verifies whatever it returns against the
+ * fortress's envelope; this function only ever answers about the
+ * `sanctuary-passphrase[-<id>]` family. Its callers are the verbs that
+ * genuinely want just that (the standalone dashboard, `agents`, `did-web`,
+ * `erc8004`, the audit-chain repair plan, `reset-passphrase` readback,
+ * `cli/local-fortress-unlock.ts`), plus the injected seam through which the
+ * install planner and the server boot feed that resolver's stored-passphrase
+ * step (`observeStoredPassphraseVia`).
  *
  * Throws {@link PassphraseUnreadableError} when the fallback file exists but
  * cannot be decrypted (same semantics as {@link getOrCreatePassphrase}).
@@ -706,6 +726,45 @@ export async function observeStoredPassphrase(
   }
 
   return { status: "absent", keyringUnreachable: false };
+}
+
+/**
+ * Adapt a {@link readStoredPassphrase}-shaped reader (the long-standing test
+ * seam of the install probe and the MCP boot path) to the richer observation
+ * the shared custody-credential resolver consumes.
+ *
+ * ONE adapter, not one per caller: the thing it preserves is the distinction
+ * between "absent", "the keyring is locked", and "the fallback file is
+ * unreadable", and a second hand-written copy is exactly how one of those
+ * three collapses into "absent" on one path and not the other.
+ */
+export async function observeStoredPassphraseVia(
+  readStored: typeof readStoredPassphrase,
+  opts: PassphraseOptions = {},
+): Promise<StoredPassphraseObservation> {
+  try {
+    const result = await readStored(opts);
+    return result === null
+      ? { status: "absent", keyringUnreachable: false }
+      : { status: "found", result, keyringUnreachable: false };
+  } catch (error) {
+    if (error instanceof PassphraseKeyringUnreachableError) {
+      return {
+        status: "absent",
+        keyringUnreachable: true,
+        keyringDetail: error.message,
+      };
+    }
+    if (error instanceof PassphraseUnreadableError) {
+      return {
+        status: "fallback-unreadable",
+        path: error.path,
+        reason: error.reason,
+        keyringUnreachable: false,
+      };
+    }
+    throw error;
+  }
 }
 
 /**

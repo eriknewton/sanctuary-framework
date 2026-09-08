@@ -40,11 +40,16 @@ sanctuary protect --claude-code
 
 Substitute `--openclaw`, `--hermes`, `--cursor`, `--cline`, `--mastra`, or `--wrap <path-to-config>` for another harness.
 
-Back up the passphrase:
+Back up the credential this machine holds for the fortress:
 
 ```bash
 sanctuary export-passphrase
 ```
+
+It prints the stored fortress passphrase when one unlocks this fortress, and otherwise the
+OS-keyring custody factor the fortress was created with. That factor is
+machine-resident: the portable credential is the recovery key captured at
+creation, so keep that one too.
 
 Failure mode: this step does not install or arm the macOS wall. It prepares the fortress, cooperative gates, dashboard, audit trail, and harness config.
 
