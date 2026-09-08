@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.8.5] - 2026-09-08
+
+Setup fixes for a first install on a personal Mac. No new capability; the capability bounds in the v1.8.4 notes stand.
+
+### Fixed
+
+- `protect`, `export-passphrase`, the agent-guided install planner and the launched server resolve the fortress credential through one shared path: an explicit passphrase, then the environment passphrase, then the environment recovery key, then the custody factor `init` enrolled in the OS keyring, then the machine-local stored passphrase. The next step the install planner prints now works on a fortress `init` just created, and a custody error names exactly the sources that are accepted. A new passphrase is minted only for a fortress with no custody state at all.
+- `init` writes the recovery key to the documented staging directory beside the fortress by default, never inside it, and refuses any destination that resolves inside the fortress. A destination the operator names is written into a directory that is owned by the operator, is not a symlink and is not group- or world-writable; only Sanctuary's own staging directory has its permissions tightened.
+- `init` writes the default principal policy, so a fresh fortress passes `doctor`; `doctor`, `init`, the agents CLI and the runtime all read that policy through the same no-follow, regular-file-only read, and a symlink or other non-regular entry at the policy path is refused rather than followed.
+- On a host with a pre-existing global Castle Wall pin, `init` adopts the pin only when it agrees byte-for-byte with the installed app, bypasses it only when both the app and the system extension are observed absent, and otherwise stops with the exact remedy. "Recovery key verified" and "complete" are printed only after the step they describe.
+- A failed `init` keeps the recovery file it announced, removes only what the run wrote, and prints one consistent next step, including a retry that works. A fortress directory named like the recovery staging directory is refused up front with the remedy, before anything is minted.
+- The `--json` install plan reports the staged recovery file observation alongside the action it selected; the agent-guided install contract documents all three values.
+- `rotate-master --help` describes the recovery destination the command actually uses.
+
 ## [1.8.4] - 2026-09-05
 
 v1.8.3 was tagged but never published. This release carries every 1.8.3 change listed below and adds one custody fix.
