@@ -27,9 +27,13 @@ import {
   establishMaster,
   verifyRecoveryWrapByReentry,
 } from "../src/core/master-custody.js";
-import { getOrCreateKeychainCustodyKeyTransactional } from "../src/wrap/keychain-custody.js";
+import {
+  getOrCreateKeychainCustodyKeyTransactional,
+  readKeychainCustodyKeyStatus,
+} from "../src/wrap/keychain-custody.js";
 import { IdentityManager } from "../src/cognitive/tools.js";
-import { setKeychainExec } from "../src/wrap/keychain-exec.js";
+import { readStoredPassphrase } from "../src/wrap/passphrase.js";
+import type { ExecResult } from "../src/wrap/exec-result.js";
 import { installInMemoryKeychainStore } from "./setup/keychain-fake.js";
 import { toBase64url } from "../src/core/encoding.js";
 import { createTempHome } from "./helpers/temp-fortress.js";
@@ -38,9 +42,25 @@ import { bindWithRetry, randomTestPort } from "./util/port-collision-retry.js";
 const DASHBOARD_TOKEN = "enrolled-custody-dashboard-token-not-a-secret";
 
 /**
- * Replace the in-memory credential store with one that answers every lookup
+ * The two boot-credential readers `startStandaloneDashboard` hands the shared
+ * host-local resolver, built over an exec that answers every keyring lookup
  * the same way, so a fortress whose envelope DOES carry an enrolled OS-keyring
  * factor can be booted against a keyring that no longer yields it.
+ *
+ * Injected through the boot's own options (`__testReadKeychainCustody` /
+ * `__testReadStoredPassphrase`, the pair `createSanctuaryServer` already
+ * carries), NOT through the process-global credential-store injection: that
+ * one re-points the chokepoint for every other test in the same worker, which
+ * is why `test/wrap/keychain-exec-guard.test.ts` allows it only in
+ * `test/setup/keychain-fake.ts`. Passing an `exec` down through
+ * `KeychainCustodyOptions` / `PassphraseOptions` is the supported route and is
+ * scoped to this one boot call.
+ *
+ * BOTH readers take the same answer on purpose: the refusal asserts that the
+ * enrolled-factor diagnostic and the accepted-sources listing describe ONE
+ * host state, and a stub that starved only the custody read would have the
+ * stored-passphrase step still talking to the suite's in-memory store, so the
+ * two blocks would describe two different keyrings.
  *
  * Portable across both backends on purpose: `classifyDarwinFailure` reads the
  * exit code / stderr marker and `classifyLinuxFailure` reads stderr emptiness,
@@ -48,18 +68,22 @@ const DASHBOARD_TOKEN = "enrolled-custody-dashboard-token-not-a-secret";
  * "interaction is not allowed") on either platform. A stub that only spoke
  * macOS would classify as `not-found` on the Linux CI runner and quietly test
  * the wrong branch.
- *
- * FAILURE MODE, from the outside: the store is process-global, so a test that
- * installs this and does not restore it in `afterEach` leaves every later test
- * in the worker unable to read any credential, and the damage looks like
- * unrelated custody flakes.
  */
-function installKeyringAnswering(kind: "not-found" | "unreachable"): void {
-  const answer =
+function keyringAnswering(kind: "not-found" | "unreachable"): {
+  __testReadKeychainCustody: typeof readKeychainCustodyKeyStatus;
+  __testReadStoredPassphrase: typeof readStoredPassphrase;
+} {
+  const answer: ExecResult =
     kind === "not-found"
       ? { stdout: "", stderr: "", code: 44 }
       : { stdout: "", stderr: "interaction is not allowed", code: 36 };
-  setKeychainExec(async () => answer);
+  const exec = async (): Promise<ExecResult> => answer;
+  return {
+    __testReadKeychainCustody: (storagePath, opts = {}) =>
+      readKeychainCustodyKeyStatus(storagePath, { ...opts, exec }),
+    __testReadStoredPassphrase: (opts = {}) =>
+      readStoredPassphrase({ ...opts, exec }),
+  };
 }
 
 /**
@@ -109,8 +133,11 @@ describe("standalone dashboard boots on the enrolled custody factor", () => {
       await dashboard.stop().catch(() => undefined);
       dashboard = null;
     }
-    // Restore the shared in-memory store BEFORE anything else: a bespoke stub
-    // installed by a test is process-global and would outlive a failing test.
+    // Re-assert the shared in-memory store. No test here re-points the
+    // process-global chokepoint any more (the keyring answers are injected per
+    // boot through the dashboard's own reader seams), so this is a belt on an
+    // already-installed store rather than a repair; keeping it means a future
+    // edit that reaches for a global stub still cannot leak into the next test.
     installInMemoryKeychainStore();
     vi.restoreAllMocks();
     await fortressHome.cleanup();
@@ -272,16 +299,21 @@ describe("standalone dashboard boots on the enrolled custody factor", () => {
   }, 120_000);
 
   /**
-   * Attempt the boot and return the refusal. Written as a helper because both
-   * refusal tests below need the SAME thrown message and neither may leave a
-   * started dashboard behind if the boot unexpectedly succeeds.
+   * Attempt the boot against the given keyring answer and return the refusal.
+   * Written as a helper because both refusal tests below need the SAME thrown
+   * message and neither may leave a started dashboard behind if the boot
+   * unexpectedly succeeds. The readers are scoped to this one boot call, so
+   * nothing about them survives into the next test.
    */
-  async function bootAndCaptureRefusal(): Promise<Error> {
+  async function bootAndCaptureRefusal(
+    keyring: ReturnType<typeof keyringAnswering>,
+  ): Promise<Error> {
     let threw: Error | null = null;
     try {
       const started = await startWithRetry({
         storagePath: fortress,
         discoveryOptions: { home: fortressHome.home, root: fortress },
+        ...keyring,
       });
       dashboard = started.dashboard;
     } catch (err) {
@@ -301,9 +333,8 @@ describe("standalone dashboard boots on the enrolled custody factor", () => {
     // factors diagnostic, and it would have passed with the diagnostic absent.
     const factor = await enrolCustodyFactorAndCreateEnvelope();
     factor.fill(0);
-    installKeyringAnswering("not-found");
 
-    const threw = await bootAndCaptureRefusal();
+    const threw = await bootAndCaptureRefusal(keyringAnswering("not-found"));
 
     // 1. The actionable diagnostic, which comes from the ENVELOPE's factor
     //    inventory and so exists only because a keychain wrap is enrolled.
@@ -346,9 +377,8 @@ describe("standalone dashboard boots on the enrolled custody factor", () => {
       "not a valid sanctuary fallback credential",
       { mode: 0o600 },
     );
-    installKeyringAnswering("unreachable");
 
-    const threw = await bootAndCaptureRefusal();
+    const threw = await bootAndCaptureRefusal(keyringAnswering("unreachable"));
 
     // The resolver's own classifier marker, through the accepted-sources block.
     expect(threw.message).toMatch(/locked or unreachable/);

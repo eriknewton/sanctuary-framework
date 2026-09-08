@@ -54,7 +54,8 @@ import { TaskService } from "./operational/task-coordination/index.js";
 import type { HandshakeResult } from "./handshake/types.js";
 import { SovereigntyProfileStore } from "./sovereignty-profile.js";
 import { writeTenantRuntime, clearTenantRuntime } from "./cli/agents/runtime.js";
-import { keychainServiceFor } from "./wrap/passphrase.js";
+import { keychainServiceFor, readStoredPassphrase } from "./wrap/passphrase.js";
+import { readKeychainCustodyKeyStatus } from "./wrap/keychain-custody.js";
 import {
   custodyCredentialRefusal,
   ENROLLED_CUSTODY_FACTOR_LOCATION,
@@ -357,6 +358,38 @@ export interface StandaloneDashboardOptions {
    * callers never set this; it has no effect when undefined.
    */
   __testFaultAfterLoads?: () => void | Promise<void>;
+  /**
+   * TEST-ONLY seam: the exact-fortress stored-passphrase read the shared
+   * host-local resolver performs at its `stored-passphrase` step. Defaults to
+   * the real {@link readStoredPassphrase}, so production behaviour is
+   * identical whether or not a caller passes this.
+   *
+   * MUST MATCH the same seam on the MCP stdio boot:
+   * `__testReadStoredPassphrase` on `createSanctuaryServer` in `src/index.ts`.
+   * The two boots exist to agree by construction, and a seam only one of them
+   * has means a test can only ever pin one of them against a given host state.
+   *
+   * FAILURE MODE, from the outside: a test that reaches for the process-global
+   * credential-store injection (`setKeychainExec`) instead of this option
+   * re-points the chokepoint for every OTHER test in the same worker, and the
+   * damage looks like unrelated custody flakes. Pass a reader here.
+   */
+  __testReadStoredPassphrase?: typeof readStoredPassphrase;
+  /**
+   * TEST-ONLY seam: the enrolled-custody-factor keyring read the shared
+   * host-local resolver performs at its `enrolled-custody-key` step. Defaults
+   * to the real {@link readKeychainCustodyKeyStatus}.
+   *
+   * This is the ONLY keyring read this boot path makes for the custody factor:
+   * the refusal diagnostic below takes its reachability from the resolver's
+   * report (`enrolledCustodyKeyItem`) rather than probing the item a second
+   * time, so injecting here covers the diagnostic too and the two blocks
+   * cannot disagree.
+   *
+   * MUST MATCH the same seam on the MCP stdio boot:
+   * `__testReadKeychainCustody` on `createSanctuaryServer` in `src/index.ts`.
+   */
+  __testReadKeychainCustody?: typeof readKeychainCustodyKeyStatus;
 }
 
 /**
@@ -558,6 +591,15 @@ export async function startStandaloneDashboard(
     const resolved = await resolveHostLocalBootCredential({
       storage,
       storagePath: config.storage_path,
+      // Defaults ARE the production readers, so this call is byte-identical to
+      // the un-injected one unless a test supplies a seam. MUST MATCH the
+      // injection `createSanctuaryServer` makes in `src/index.ts`
+      // (`resolveHandsFreeBootCredential`): both boots hand the resolver the
+      // same two readers under the same names, which is what lets one test
+      // pin either boot against the same synthetic host state.
+      readStored: options.__testReadStoredPassphrase ?? readStoredPassphrase,
+      readCustodyKey:
+        options.__testReadKeychainCustody ?? readKeychainCustodyKeyStatus,
     });
     if (resolved.kind === "passphrase") {
       passphrase = resolved.value;

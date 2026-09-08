@@ -288,6 +288,13 @@ export async function createSanctuaryServer(options?: {
   __testReadStoredPassphrase?: typeof readStoredPassphrase;
   /** TEST ONLY: fake the machine-local custody-key read used by hands-free boot. */
   __testReadKeychainCustody?: typeof readKeychainCustodyKeyStatus;
+  // MUST MATCH the same pair of seams on the standalone dashboard boot:
+  // `__testReadStoredPassphrase` / `__testReadKeychainCustody` on
+  // `StandaloneDashboardOptions` in `src/dashboard-standalone.ts`. Both boots
+  // resolve through the SAME `resolveHostLocalBootCredential`, so a seam that
+  // exists on only one of them leaves the other reachable only by re-pointing
+  // the process-global credential store, which the suite forbids
+  // (`test/wrap/keychain-exec-guard.test.ts`).
 }): Promise<SanctuaryServer> {
   // 1. Load configuration
   const config = await loadConfig(options?.configPath);
