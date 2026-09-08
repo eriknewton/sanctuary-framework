@@ -97,6 +97,7 @@ import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
 import { mkdirSafeUnderRoot } from "./config-reader.js";
 import {
   preflightPrincipalPolicyFile,
+  principalPolicyPath,
   writeDefaultPrincipalPolicyFile,
 } from "../principal-policy/loader.js";
 import { runLocalIntelligenceSetup } from "./local-intelligence.js";
@@ -1093,7 +1094,11 @@ export async function runInit(
   if (!principalPolicy.written) {
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
-      `  Principal policy: kept the existing file at\n    ${principalPolicy.policyPath}\n` +
+      // Printed in the operator's own terms (the fortress path they named, as
+      // the Fortress line above prints it), not the lock's stable capability
+      // path, which is the same directory reached through a canonical route
+      // and differs textually on some platforms.
+      `  Principal policy: kept the existing file at\n    ${principalPolicyPath(fortressPath)}\n` +
         `  It was NOT rewritten, so this fortress runs the approval tiers that file already\n` +
         `  defines, not the Sanctuary defaults. Delete it and re-run init if you want the\n` +
         `  default policy.\n`,

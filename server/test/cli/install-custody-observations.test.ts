@@ -772,6 +772,14 @@ describe("staged recovery file observation, against the real filesystem", () => 
     // probe just read off disk, which is what this test exists to prove.
     const reachCompletion = (observed: InstallProbeResult): InstallProbeResult => ({
       ...observed,
+      // A CI runner has no global `sanctuary` on PATH, so the real probe reports
+      // the persistent CLI absent and the plan stops at install_persistent_cli
+      // before the completion branch this test needs; pin the toolchain
+      // observations too. stagedRecoveryFile is deliberately NOT overridden.
+      persistentCli: "present",
+      persistentCliPath: "/usr/local/bin/sanctuary",
+      packageManagerPath: "/usr/bin/npm",
+      nodePath: "/usr/bin/node",
       cooperativeWrap: "present",
       custodyAccess: "usable",
       custodyMutation: "available",
