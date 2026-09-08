@@ -107,22 +107,56 @@ services derived from the canonical physical storage path, so symlink aliases
 share one credential family while two physical fortresses never do. Compatibility
 reads retain older lexical service names; new writes use the canonical identity.
 
-When you run a memory verb on a second host, Sanctuary resolves local factors in
-this order. Explicit factors always win; if a stored passphrase is stale, the
-interactive-init custody key remains an authenticated fallback:
+### Starting a server or the dashboard
+
+`sanctuary protect`, `export-passphrase`, the install planner, the MCP stdio
+server and the dashboard all resolve the fortress credential through one shared
+chain, in this order:
+
+1. `--passphrase`
+2. `SANCTUARY_PASSPHRASE`
+3. `SANCTUARY_RECOVERY_KEY`
+4. the enrolled OS-keyring custody factor for this fortress, the one
+   interactive `init` writes
+5. the exact-fortress stored passphrase: the OS keyring, else the encrypted
+   fallback file
+
+The first non-empty operator credential (1 to 3) wins outright and is used as
+given, so a credential you name that turns out to be wrong fails loudly instead
+of being masked by a factor that happens to work. An empty value counts as not
+set. The two host-local factors (4 and 5) fall through to each other, and each
+one is checked against this fortress before it is used, so a leftover
+credential from an earlier install is skipped rather than tried and failed.
+
+The custody factor comes before the stored passphrase because `init` enrols the
+custody factor and does not enrol a passphrase. On the documented new-host path
+that factor is the only host-local credential that exists, so a host where
+`init` ran opens with nothing supplied on the command line.
+
+### Running a memory verb
+
+Memory verbs use a narrower chain of their own, and its last two entries are in
+the opposite order:
 
 1. `--passphrase-stdin` (memory-file verbs only)
 2. a legacy `--passphrase` argv value
 3. `SANCTUARY_PASSPHRASE`
 4. `SANCTUARY_RECOVERY_KEY`
 5. the exact-fortress stored passphrase: the OS keyring or encrypted fallback
-   namespaced to this fortress.
-6. the exact-fortress machine-local custody key enrolled by interactive `init`.
+   namespaced to this fortress
+6. the exact-fortress machine-local custody key enrolled by interactive `init`,
+   retained as an authenticated fallback when the stored passphrase is stale
 
 So on a host where `protect` already stored the passphrase, memory verbs open the
 fortress with no secret supplied on the command line. Sanctuary never generates a
 passphrase on this path: if the keyring is locked it says so and stops; it never
 overwrites a stored credential.
+
+FAILURE MODE, from the outside: the two chains agree on every host that holds
+both factors, so a host that holds only one can make a memory verb and a server
+boot report different answers about the same fortress. If one succeeds and the
+other refuses, check which factor this host actually holds before treating the
+fortress as damaged.
 
 Custody-changing ceremonies bind every filesystem operation to the root inode
 that won the kernel lock. The mutating process itself owns an exclusive Unix-

@@ -15,12 +15,19 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { createSanctuaryServer } from "../../src/index.js";
 import type { readStoredPassphrase } from "../../src/wrap/passphrase.js";
 import type { readKeychainCustodyKeyStatus } from "../../src/wrap/keychain-custody.js";
 import { createTempHome } from "../helpers/temp-fortress.js";
+
+/** `server/src`, resolved from this file so the pin assertions below are
+ *  independent of the vitest working directory. */
+const SERVER_SRC = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "src");
 
 let saved: { pass?: string; rec?: string };
 let fortressHome: Awaited<ReturnType<typeof createTempHome>>;
@@ -90,5 +97,29 @@ describe("L1: the boot keychain custody factor is zeroed on the establishMaster 
     // The finally wiped the factor on the rejected path (the fix). Against the
     // pre-fix source these bytes are still 0xab.
     expect(Array.from(factor).every((b) => b === 0)).toBe(true);
+  });
+
+  it("both boot paths carry the cross-file pin naming the other's zeroization", () => {
+    // AGENTS.md prose hygiene: a cross-file contract is pinned on BOTH sides,
+    // so an editor who relaxes one zeroization is warned at the site they are
+    // editing. The dashboard side named `createSanctuaryServer` while the
+    // index side named nothing, which is exactly the one-sided pin the rule
+    // exists to prevent: a reader of index.ts had no way to know a second
+    // boot path wipes the same factor.
+    const index = readFileSync(
+      join(SERVER_SRC, "index.ts"),
+      "utf-8",
+    );
+    const dashboard = readFileSync(
+      join(SERVER_SRC, "dashboard-standalone.ts"),
+      "utf-8",
+    );
+    expect(index).toContain("startStandaloneDashboard");
+    expect(index).toMatch(
+      /MUST MATCH[\s\S]{0,200}startStandaloneDashboard[\s\S]{0,120}dashboard-standalone\.ts/,
+    );
+    expect(dashboard).toMatch(
+      /MUST MATCH[\s\S]{0,120}createSanctuaryServer[\s\S]{0,80}index\.ts/,
+    );
   });
 });

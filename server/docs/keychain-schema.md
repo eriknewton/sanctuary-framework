@@ -223,52 +223,91 @@ which holds no key material and no label.
 
 ## Where the master key comes from
 
-The passphrase is one of two paths into the master key. The complete unlock
-flow:
+The passphrase is one of several credential sources, and no boot path picks
+among them on its own. Both boot entry points call
+`resolveHostLocalBootCredential` in `server/src/wrap/custody-credential.ts`,
+which is the same ordered chain `protect`, `export-passphrase` and the install
+planner use. The complete unlock flow:
 
 ```
-                 ┌────────────────────────────────────────────┐
-                 │  startStandaloneDashboard / createSanctuary │
-                 │  (boot entry point)                         │
-                 └────────────────────────────────────────────┘
-                                   │
-            ┌──────────────────────┼──────────────────────┐
-            ▼                      ▼                      ▼
-  ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
-  │ options.passphrase│   │SANCTUARY_PASSPHRASE│   │readStoredPassphrase│
-  │ (CLI flag)       │   │ env var            │   │ (Keychain or       │
-  │                  │   │                    │   │  fallback file)    │
-  └──────────────────┘   └──────────────────┘   └──────────────────┘
-            │                      │                      │
-            └──────────────────────┴──────────────────────┘
-                                   │
-                                   ▼
-                  ┌────────────────────────────────────┐
-                  │ Argon2id (m=64MiB, t=3, p=4)       │
-                  │ deriveMasterKey(passphrase, params)│
-                  │ params persisted at                │
-                  │ <storage_path>/state/_meta/        │
-                  │ key-params.enc                     │
-                  └────────────────────────────────────┘
-                                   │
-                                   ▼
+   ┌───────────────────────────────────────────────────────────────┐
+   │ BOOT ENTRY POINTS (both resolve through the same chain)       │
+   │  - createSanctuaryServer          (MCP stdio server)          │
+   │  - startStandaloneDashboard       (sanctuary dashboard, and   │
+   │                                    the one protect starts)    │
+   └───────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+   ┌───────────────────────────────────────────────────────────────┐
+   │ 1-3. OPERATOR-SUPPLIED, in the invocation. First NON-EMPTY    │
+   │      one wins outright and never falls through: a credential  │
+   │      the operator named must fail loudly, not be masked.      │
+   │        --passphrase                                           │
+   │        SANCTUARY_PASSPHRASE                                   │
+   │        SANCTUARY_RECOVERY_KEY                                 │
+   │      An EMPTY value is not a supplied credential and falls    │
+   │      through to the next source.                              │
+   └───────────────────────────────────────────────────────────────┘
+                                │ none supplied
+                                ▼
+   ┌───────────────────────────────────────────────────────────────┐
+   │ HOST-LOCAL, through resolveHostLocalBootCredential.           │
+   │ These DO fall through to each other: nobody asserted          │
+   │ anything by having them on disk. Each candidate is VERIFIED   │
+   │ against this fortress's custody envelope before it is         │
+   │ returned, and one that does not open it is skipped.           │
+   │                                                               │
+   │  4. the enrolled OS-keyring custody factor for this fortress  │
+   │     (service sanctuary-custody-<id>, written by init)         │
+   │  5. the stored fortress passphrase                            │
+   │     (service sanctuary-passphrase-<id>, else the encrypted    │
+   │      fallback file)                                           │
+   │                                                               │
+   │ It never mints and never writes. A fortress with NO custody   │
+   │ state at all falls through to the audited first run; a        │
+   │ fortress that has custody and cannot be opened fails closed   │
+   │ with one listing of the sources that were tried.              │
+   └───────────────────────────────────────────────────────────────┘
+                                │
+            ┌───────────────────┴───────────────────┐
+            ▼                                       ▼
+  ┌──────────────────────────┐        ┌──────────────────────────┐
+  │ a passphrase             │        │ 32 raw bytes             │
+  │ (operator, or stored)    │        │ (custody factor, or      │
+  │                          │        │  recovery key)           │
+  │ Argon2id                 │        │ unwraps the master       │
+  │ (m=64MiB, t=3, p=4)      │        │ directly from its wrap   │
+  │ params persisted at      │        │ in the custody envelope  │
+  │ <storage_path>/state/    │        │                          │
+  │ _meta/key-params.enc     │        │                          │
+  └──────────────────────────┘        └──────────────────────────┘
+            │                                       │
+            └───────────────────┬───────────────────┘
+                                ▼
                   ┌────────────────────────────────────┐
                   │ master key (32 bytes)              │
-                  │ ─ derivePurposeKey("identity-     │
-                  │     encryption") → identity files  │
-                  │ ─ derivePurposeKey("audit-log")   │
-                  │ ─ derivePurposeKey("baseline")    │
-                  │   …etc, one HKDF context per       │
+                  │ - derivePurposeKey("identity-      │
+                  │     encryption") -> identity files │
+                  │ - derivePurposeKey("audit-log")    │
+                  │ - derivePurposeKey("baseline")     │
+                  │   ...etc, one HKDF context per     │
                   │   namespace                        │
                   └────────────────────────────────────┘
-                                   │
-                                   ▼
+                                │
+                                ▼
                   ┌────────────────────────────────────┐
                   │ AES-256-GCM decrypt of every       │
                   │ <storage_path>/state/_identities/  │
                   │ *.enc                              │
                   └────────────────────────────────────┘
 ```
+
+FAILURE MODE, from the outside: a boot that consults only the stored-passphrase
+family looks correct on a host that has one, and refuses a fortress whose
+custody factor is enrolled and healthy. The refusal names a keyring service
+that was never supposed to hold this fortress's credential, which sends an
+operator hunting for a passphrase that does not exist. Both boot paths call the
+shared resolver so that answer cannot differ between them.
 
 ### Key derivation parameters
 

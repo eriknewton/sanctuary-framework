@@ -112,6 +112,60 @@ describe("MCP boot resolves its credential through the shared custody resolver",
     }
   });
 
+  /**
+   * The GUI-launcher shape: a wrapper that exports the credential variables
+   * unconditionally leaves them EMPTY when the operator supplied nothing (a
+   * LaunchAgent plist with an empty `EnvironmentVariables` entry, `env
+   * SANCTUARY_PASSPHRASE= sanctuary ...`, a shell that exports an unset var).
+   *
+   * FAILS BEFORE THE FIX: this boot gated the host-local lookup on
+   * `passphrase === undefined && envRecoveryKey === undefined`, so an empty
+   * string read as "the operator named a credential". The resolver was never
+   * consulted, and `establishMaster` then received nothing at all (the spread
+   * is truthiness-gated), so the boot refused. The standalone dashboard tested
+   * truthiness and opened the very same fortress: one host state, two answers.
+   */
+  it("treats an EMPTY SANCTUARY_PASSPHRASE as unset and still boots on the enrolled factor", async () => {
+    process.env.SANCTUARY_PASSPHRASE = "";
+    try {
+      const server = await createSanctuaryServer({ storage });
+      try {
+        expect(constantTimeEqual(server.masterKey, establishedMaster)).toBe(
+          true,
+        );
+      } finally {
+        await server.cleanup();
+      }
+    } finally {
+      delete process.env.SANCTUARY_PASSPHRASE;
+    }
+  });
+
+  /**
+   * Same predicate, the other variable and the option form. An empty explicit
+   * `--passphrase` must fall THROUGH to the next source rather than settle the
+   * question, which is what the shared resolver's operator-source loop does.
+   *
+   * FAILS BEFORE THE FIX: `options?.passphrase ?? process.env.SANCTUARY_PASSPHRASE`
+   * kept the empty option (`??` only falls through on null/undefined), and an
+   * empty `SANCTUARY_RECOVERY_KEY` likewise suppressed the lookup.
+   */
+  it("treats an EMPTY explicit passphrase and an EMPTY recovery key as unset", async () => {
+    process.env.SANCTUARY_RECOVERY_KEY = "";
+    try {
+      const server = await createSanctuaryServer({ storage, passphrase: "" });
+      try {
+        expect(constantTimeEqual(server.masterKey, establishedMaster)).toBe(
+          true,
+        );
+      } finally {
+        await server.cleanup();
+      }
+    } finally {
+      delete process.env.SANCTUARY_RECOVERY_KEY;
+    }
+  });
+
   it("emits no credential value on either the refused or the successful boot", async () => {
     await expect(
       createSanctuaryServer({ storage, passphrase: STALE_PASSPHRASE }),

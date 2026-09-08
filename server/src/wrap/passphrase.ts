@@ -586,11 +586,15 @@ export async function getOrCreatePassphrase(
  * factor as well as this family and verifies whatever it returns against the
  * fortress's envelope; this function only ever answers about the
  * `sanctuary-passphrase[-<id>]` family. Its callers are the verbs that
- * genuinely want just that (the standalone dashboard, `agents`, `did-web`,
- * `erc8004`, the audit-chain repair plan, `reset-passphrase` readback,
- * `cli/local-fortress-unlock.ts`), plus the injected seam through which the
- * install planner and the server boot feed that resolver's stored-passphrase
- * step (`observeStoredPassphraseVia`).
+ * genuinely want just that (`agents`, `did-web`, `erc8004`, the audit-chain
+ * repair plan, `reset-passphrase` readback, `cli/local-fortress-unlock.ts`),
+ * plus the seam through which BOTH boot paths feed that resolver's
+ * stored-passphrase step (`observeStoredPassphraseVia`, reached from
+ * `resolveHostLocalBootCredential`). The standalone dashboard is NOT in the
+ * first list any more: it resolves its boot credential through
+ * `wrap/custody-credential.ts` like the MCP stdio boot, because a boot that
+ * consulted only this family ignored the OS-keyring custody factor `sanctuary
+ * init` enrols and refused the fortress `protect` had just opened.
  *
  * Throws {@link PassphraseUnreadableError} when the fallback file exists but
  * cannot be decrypted (same semantics as {@link getOrCreatePassphrase}).

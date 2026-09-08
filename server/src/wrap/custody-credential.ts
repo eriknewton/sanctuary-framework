@@ -74,7 +74,11 @@ import {
 import type { StorageBackend } from "../storage/interface.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { readKeychainCustodyKeyStatus } from "./keychain-custody.js";
-import { observeStoredPassphrase } from "./passphrase.js";
+import {
+  observeStoredPassphrase,
+  observeStoredPassphraseVia,
+  readStoredPassphrase,
+} from "./passphrase.js";
 
 /** One credential source the resolver knows how to consult. */
 export type CustodyCredentialSource =
@@ -121,6 +125,41 @@ export const HOST_LOCAL_CUSTODY_SOURCES: readonly CustodyCredentialSource[] = [
   "enrolled-custody-key",
   "stored-passphrase",
 ] as const;
+
+/**
+ * THE predicate for "the operator supplied this credential on this
+ * invocation". An empty string is NOT a supplied credential: an exported-but-
+ * empty `SANCTUARY_PASSPHRASE` is what a GUI launcher, a LaunchAgent plist
+ * with an empty `EnvironmentVariables` entry, or `env SANCTUARY_PASSPHRASE=`
+ * leaves behind, and it carries no instruction at all.
+ *
+ * MUST MATCH every boot entry point that decides whether to consult the
+ * host-local factors: `createSanctuaryServer` (`src/index.ts`) and
+ * `startStandaloneDashboard` (`src/dashboard-standalone.ts`) both call THIS
+ * function rather than re-testing the value. A caller that used
+ * `!== undefined` instead treated an empty value as an operator instruction,
+ * skipped the host-local lookup, and then handed `establishMaster` nothing —
+ * so one boot path opened a fortress the other refused, which is the exact
+ * class of divergence this module exists to close.
+ */
+export function isOperatorSuppliedCredential(
+  supplied: string | undefined,
+): supplied is string {
+  return supplied !== undefined && supplied.length > 0;
+}
+
+/**
+ * The first operator-supplied value in preference order, or `undefined` when
+ * none of them is supplied. Empty values fall THROUGH to the next candidate,
+ * exactly as the operator-source loop in
+ * {@link resolveFortressCustodyCredential} does (an empty
+ * `--passphrase` does not suppress `SANCTUARY_PASSPHRASE`).
+ */
+export function firstOperatorSuppliedCredential(
+  ...candidates: readonly (string | undefined)[]
+): string | undefined {
+  return candidates.find(isOperatorSuppliedCredential);
+}
 
 /** Operator-facing name of a source. Never a value. */
 export function custodyCredentialSourceLabel(
@@ -179,6 +218,23 @@ export interface CustodyCredentialReport {
   integrityIndeterminate: boolean;
   /** True when this fortress already holds a custody envelope. */
   envelopePresent: boolean;
+  /**
+   * How the OS-keyring CUSTODY-KEY item itself classified on this host, in the
+   * vocabulary of `probeKeychainCustodyKey`: `found` (the item exists and
+   * yielded material, whether or not it then unlocked), `not-found` (the
+   * keyring answered and holds no such item), `unreachable` (the keyring is
+   * locked or absent, so its contents are unknowable). `undefined` when the
+   * enrolled-custody-key source was not consulted at all (excluded by `allow`,
+   * or short-circuited by an operator-supplied credential).
+   *
+   * Recorded here so a diagnostic can state keyring reachability WITHOUT a
+   * second keyring read: two independent reads can disagree (an unlock between
+   * them, a transient D-Bus fault), and a refusal whose actionable block says
+   * "the item is MISSING" while its accepted-sources block says the same item
+   * was present is a message an operator acts on wrongly. One read, one
+   * answer. Consumed by `startStandaloneDashboard` (`src/dashboard-standalone.ts`).
+   */
+  enrolledCustodyKeyItem?: "found" | "not-found" | "unreachable";
 }
 
 export type CustodyCredentialResolution =
@@ -250,6 +306,8 @@ export async function resolveFortressCustodyCredential(
   const indeterminate: CustodyCredentialSource[] = [];
   const details: Partial<Record<CustodyCredentialSource, string>> = {};
   let integrityIndeterminate = false;
+  /** Set exactly once, at the single keyring read below. See the report field. */
+  let enrolledCustodyKeyItem: "found" | "not-found" | "unreachable" | undefined;
 
   // An envelope that exists but cannot be read is NOT "no custody". Fail
   // toward "custody exists", so an unreadable or tampered envelope can never
@@ -278,6 +336,9 @@ export async function resolveFortressCustodyCredential(
     details: { ...details },
     integrityIndeterminate,
     envelopePresent,
+    ...(enrolledCustodyKeyItem === undefined
+      ? {}
+      : { enrolledCustodyKeyItem }),
   });
 
   // ── 1-3. Operator-supplied credentials ────────────────────────────────
@@ -290,7 +351,9 @@ export async function resolveFortressCustodyCredential(
         : source === "env-passphrase"
           ? env.SANCTUARY_PASSPHRASE
           : env.SANCTUARY_RECOVERY_KEY;
-    if (supplied === undefined || supplied.length === 0) continue;
+    // THE supplied-credential predicate, shared with both boot entry points so
+    // an empty value means the same thing everywhere (see the function's note).
+    if (!isOperatorSuppliedCredential(supplied)) continue;
     found.push(source);
     const provenance: CustodyCredentialProvenance =
       source === "explicit-passphrase"
@@ -389,6 +452,10 @@ export async function resolveFortressCustodyCredential(
         detail: "custody-factor identity could not be determined",
         key: undefined,
       }));
+      // The ONE keyring-reachability observation this process makes. Every
+      // consumer (the accepted-sources listing here, the dashboard's actionable
+      // unlock block) reads it from the report rather than probing again.
+      enrolledCustodyKeyItem = read.status;
       if (read.status === "found" && read.key !== undefined) {
         custodyKey = read.key;
         found.push("enrolled-custody-key");
@@ -610,4 +677,144 @@ export function custodyCredentialRefusal(
     "  Refusing to continue with a credential that does not verify.",
   );
   return new CustodyUnlockError(lines.join("\n"));
+}
+
+// ── Hands-free BOOT credential (H1): one helper, two boot paths ─────────
+
+/**
+ * Outcome of a hands-free boot credential resolution (H1).
+ *
+ * `fail-closed` carries BOTH the composed refusal and the raw report: the MCP
+ * stdio boot prints the composed message as-is, while the standalone dashboard
+ * folds the accepted-sources listing into its own actionable diagnostic
+ * (enrolled factors, keyring reachability, tenant discovery). Handing back only
+ * a string would force the dashboard to re-derive the listing and the two
+ * refusals would drift.
+ */
+export type HostLocalBootCredential =
+  | {
+      kind: "passphrase";
+      value: string;
+      provenance: CustodyCredentialProvenance;
+    }
+  | {
+      kind: "keychain-key";
+      key: Uint8Array;
+      provenance: CustodyCredentialProvenance;
+    }
+  /** No custody state at all: the caller's audited first run may create it. */
+  | { kind: "virgin" }
+  | {
+      kind: "fail-closed";
+      message: string;
+      report: CustodyCredentialReport;
+    };
+
+export interface HostLocalBootCredentialOptions {
+  storage: StorageBackend;
+  /** Fortress root (the directory holding `state/`). */
+  storagePath: string;
+  /**
+   * Test seam: the exact-fortress stored-passphrase read. Defaults to the real
+   * {@link readStoredPassphrase}; the observation is built from it by
+   * {@link observeStoredPassphraseVia} either way, so both boot paths see the
+   * SAME collapsing of a locked keyring and an unreadable fallback file.
+   */
+  readStored?: typeof readStoredPassphrase;
+  /** Test seam: the enrolled-custody-factor read (keychain chokepoint). */
+  readCustodyKey?: typeof readKeychainCustodyKeyStatus;
+}
+
+/**
+ * Resolve the exact-fortress credential for a hands-free BOOT (H1), READ-ONLY,
+ * through THE shared resolver above restricted to
+ * {@link HOST_LOCAL_CUSTODY_SOURCES}.
+ *
+ * A73: each boot path used to run its own chain — the stored passphrase first,
+ * with no check that it opens THIS fortress and no fall-through on a mismatch,
+ * then (or never) the custody factor. That is a different order from the one
+ * `protect` uses, so a leftover `sanctuary-passphrase-<id>` item from an
+ * earlier failed mint made `protect` succeed and the process it launched fail
+ * closed. Routing every boot through one resolver makes them agree by
+ * construction: every host-local candidate is verified against this fortress's
+ * envelope before it is returned, and a candidate that does not open it is
+ * skipped rather than handed to `establishMaster` to discover.
+ *
+ * The restriction to host-local sources is what makes this hands-free: the
+ * operator-supplied credentials (`--passphrase`, `SANCTUARY_PASSPHRASE`,
+ * `SANCTUARY_RECOVERY_KEY`) are handled by the CALLER before this runs — they
+ * outrank everything and must not be re-read here. Nothing here mints,
+ * generates, or writes: the envelope's presence is what separates a virgin
+ * fortress (fall through to the audited first run) from an existing one that
+ * must fail closed when nothing opens it.
+ *
+ * MUST MATCH the two call sites that consume it: `createSanctuaryServer`
+ * (`src/index.ts`) and `startStandaloneDashboard` (`src/dashboard-standalone.ts`).
+ * `protect --claude-code --agent-guided` spawns the second one, so a boot path
+ * that resolves differently from `protect` breaks the install contract's own
+ * next action.
+ */
+export async function resolveHostLocalBootCredential(
+  args: HostLocalBootCredentialOptions,
+): Promise<HostLocalBootCredential> {
+  const resolution = await resolveFortressCustodyCredential({
+    storagePath: args.storagePath,
+    storage: args.storage,
+    allow: HOST_LOCAL_CUSTODY_SOURCES,
+    // A boot never creates custody through the resolver. The caller's audited
+    // first run is the only mint, and it is reached only when this fortress
+    // has no envelope and no legacy marker at all.
+    allowMint: false,
+    ...(args.readCustodyKey === undefined
+      ? {}
+      : { readCustodyKey: args.readCustodyKey }),
+    // UNCONDITIONAL, not "only when a seam was injected": the two observers
+    // disagree. `observeStoredPassphrase` reports a locked keyring plus a
+    // damaged fallback file as `fallback-unreadable` (naming the file), while
+    // the `readStoredPassphrase` adapter collapses it to
+    // `absent + keyringUnreachable` (naming the keyring). Picking the observer
+    // by whether a TEST seam was passed made the MCP boot print one
+    // stored-passphrase line and the dashboard print the other for the same
+    // host state. Both boots take this branch, so both print the same line.
+    observePassphrase: (opts) =>
+      observeStoredPassphraseVia(args.readStored ?? readStoredPassphrase, opts),
+  });
+
+  if (resolution.status === "resolved") {
+    const credential = resolution.credential;
+    const provenance: CustodyCredentialProvenance = {
+      location: credential.location,
+      displaySource: credential.displaySource,
+    };
+    switch (credential.kind) {
+      case "keychain-key":
+        return { kind: "keychain-key", key: credential.keychainKey, provenance };
+      case "passphrase":
+        return { kind: "passphrase", value: credential.passphrase, provenance };
+      case "recovery-key":
+        // A recovery key is an operator-supplied source and is excluded by the
+        // allow list above, so reaching this means the resolver returned a
+        // source it was not permitted to consult. Fail closed rather than boot
+        // on an unexpected credential class (MUST-NEVER 5).
+        return {
+          kind: "fail-closed",
+          message:
+            `Refusing to start: the hands-free boot credential resolution for ` +
+            `${args.storagePath} returned a credential class this path does not accept.`,
+          report: resolution.report,
+        };
+    }
+  }
+
+  if (!resolution.report.envelopePresent) return { kind: "virgin" };
+
+  // An existing fortress that cannot be opened hands-free. The refusal names
+  // the credential SOURCES the resolver accepts and which of them were present
+  // or rejected on this host; it never carries a value.
+  return {
+    kind: "fail-closed",
+    message: custodyCredentialRefusal(resolution.report, args.storagePath)
+      .message,
+    report: resolution.report,
+  };
 }

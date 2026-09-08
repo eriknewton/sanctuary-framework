@@ -146,15 +146,12 @@ import {
   checkCastlePinCustody,
   readEnvelopeEpoch,
 } from "./core/master-custody.js";
-import {
-  observeStoredPassphraseVia,
-  readStoredPassphrase,
-} from "./wrap/passphrase.js";
+import { readStoredPassphrase } from "./wrap/passphrase.js";
 import { readKeychainCustodyKeyStatus } from "./wrap/keychain-custody.js";
 import {
-  custodyCredentialRefusal,
-  HOST_LOCAL_CUSTODY_SOURCES,
-  resolveFortressCustodyCredential,
+  firstOperatorSuppliedCredential,
+  isOperatorSuppliedCredential,
+  resolveHostLocalBootCredential,
 } from "./wrap/custody-credential.js";
 import { decrypt } from "./core/encryption.js";
 import { derivePurposeKey, IDENTITY_ENCRYPTION_PURPOSE } from "./core/key-derivation.js";
@@ -221,25 +218,16 @@ type HandsFreeBootCredential =
 
 /**
  * Resolve the exact-fortress credential for a hands-free MCP boot (H1),
- * READ-ONLY, through THE shared custody-credential resolver
- * (`wrap/custody-credential.ts`) restricted to {@link HOST_LOCAL_CUSTODY_SOURCES}.
+ * READ-ONLY, through the SHARED host-local boot resolver
+ * (`wrap/custody-credential.ts` -> {@link resolveHostLocalBootCredential}).
  *
- * A73: this path used to run its own chain — the stored passphrase first, with
- * no check that it opens THIS fortress and no fall-through on a mismatch, then
- * the custody factor. That is a different order from the one `protect` uses, so
- * a leftover `sanctuary-passphrase-<id>` item from an earlier failed mint made
- * `protect` succeed and the server it launched fail closed. Routing both
- * through one resolver makes them agree by construction: every host-local
- * candidate is verified against this fortress's envelope before it is returned,
- * and a candidate that does not open it is skipped rather than handed to
- * `establishMaster` to discover.
- *
- * The restriction to host-local sources is what makes this hands-free: the two
- * operator-supplied env credentials are handled by the caller BEFORE this runs
- * (they outrank everything and must not be re-read here). Nothing here mints,
- * generates, or writes: the envelope's presence is what separates a virgin
- * fortress (fall through to the audited first run) from an existing one that
- * must fail closed when nothing opens it.
+ * The chain, and why it is that chain, lives in that module: this wrapper only
+ * appends the remediation tail that is specific to the stdio server (restart
+ * after `sanctuary protect`, and the refusal to mint over existing state). The
+ * standalone dashboard boot calls the SAME resolver and folds the same
+ * accepted-sources listing into its own actionable diagnostic, so a fortress
+ * `protect` can open is a fortress both boot paths can open — the whole point
+ * of the A73 chokepoint.
  */
 async function resolveHandsFreeBootCredential(args: {
   storage: StorageBackend;
@@ -247,54 +235,30 @@ async function resolveHandsFreeBootCredential(args: {
   readStored: typeof readStoredPassphrase;
   readCustody: typeof readKeychainCustodyKeyStatus;
 }): Promise<HandsFreeBootCredential> {
-  const resolution = await resolveFortressCustodyCredential({
-    storagePath: args.storagePath,
+  const resolved = await resolveHostLocalBootCredential({
     storage: args.storage,
-    allow: HOST_LOCAL_CUSTODY_SOURCES,
-    // A boot never creates custody through the resolver. The audited
-    // stdio-server first run below is the only mint, and it is reached only
-    // when this fortress has no envelope at all.
-    allowMint: false,
+    storagePath: args.storagePath,
+    readStored: args.readStored,
     readCustodyKey: args.readCustody,
-    observePassphrase: (opts) =>
-      observeStoredPassphraseVia(args.readStored, opts),
   });
-
-  if (resolution.status === "resolved") {
-    const credential = resolution.credential;
-    switch (credential.kind) {
-      case "keychain-key":
-        return { kind: "keychain-key", key: credential.keychainKey };
-      case "passphrase":
-        return { kind: "passphrase", value: credential.passphrase };
-      case "recovery-key":
-        // A recovery key is an operator-supplied source and is excluded by the
-        // allow list above, so reaching this means the resolver returned a
-        // source it was not permitted to consult. Fail closed rather than boot
-        // on an unexpected credential class (MUST-NEVER 5).
-        return {
-          kind: "fail-closed",
-          message:
-            `Refusing to start: the hands-free boot credential resolution for ` +
-            `${args.storagePath} returned a credential class this path does not accept.`,
-        };
-    }
+  switch (resolved.kind) {
+    case "keychain-key":
+      return { kind: "keychain-key", key: resolved.key };
+    case "passphrase":
+      return { kind: "passphrase", value: resolved.value };
+    case "virgin":
+      return { kind: "virgin" };
+    case "fail-closed":
+      return {
+        kind: "fail-closed",
+        message:
+          `${resolved.message}\n` +
+          `  Store this fortress's credential on this host by running \`sanctuary protect\`\n` +
+          `  for it, then restart (no secret is typed here).\n` +
+          `  Refusing to generate a passphrase or mint a new master: that would strand\n` +
+          `  the existing state.`,
+      };
   }
-
-  if (!resolution.report.envelopePresent) return { kind: "virgin" };
-
-  // An existing fortress that cannot be opened hands-free. The refusal names
-  // the credential SOURCES the resolver accepts and which of them were present
-  // or rejected on this host; it never carries a value.
-  return {
-    kind: "fail-closed",
-    message:
-      `${custodyCredentialRefusal(resolution.report, args.storagePath).message}\n` +
-      `  Store this fortress's credential on this host by running \`sanctuary protect\`\n` +
-      `  for it, then restart (no secret is typed here).\n` +
-      `  Refusing to generate a passphrase or mint a new master: that would strand\n` +
-      `  the existing state.`,
-  };
 }
 
 /**
@@ -324,6 +288,13 @@ export async function createSanctuaryServer(options?: {
   __testReadStoredPassphrase?: typeof readStoredPassphrase;
   /** TEST ONLY: fake the machine-local custody-key read used by hands-free boot. */
   __testReadKeychainCustody?: typeof readKeychainCustodyKeyStatus;
+  // MUST MATCH the same pair of seams on the standalone dashboard boot:
+  // `__testReadStoredPassphrase` / `__testReadKeychainCustody` on
+  // `StandaloneDashboardOptions` in `src/dashboard-standalone.ts`. Both boots
+  // resolve through the SAME `resolveHostLocalBootCredential`, so a seam that
+  // exists on only one of them leaves the other reachable only by re-pointing
+  // the process-global credential store, which the suite forbids
+  // (`test/wrap/keychain-exec-guard.test.ts`).
 }): Promise<SanctuaryServer> {
   // 1. Load configuration
   const config = await loadConfig(options?.configPath);
@@ -348,8 +319,24 @@ export async function createSanctuaryServer(options?: {
   // Legacy fortresses (key-params / recovery-key-hash markers) migrate in
   // place on this unlock — same master, no data re-encryption, markers
   // kept (an interrupted migration leaves a pure-legacy fortress).
-  const passphrase = options?.passphrase ?? process.env.SANCTUARY_PASSPHRASE;
-  const envRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
+  // An EMPTY operator value is not a supplied credential and must not suppress
+  // the host-local lookup below: `SANCTUARY_PASSPHRASE=""` (a GUI launcher, a
+  // LaunchAgent plist with an empty entry) used to read as "the operator named
+  // a credential", so this boot skipped the resolver and handed
+  // `establishMaster` nothing while the dashboard boot, which tests
+  // truthiness, opened the same fortress. THE predicate lives in
+  // `wrap/custody-credential.ts` and is shared by both boots and the resolver's
+  // own operator-source loop; an empty value falls through to the next source
+  // there, so it falls through here too.
+  const passphrase = firstOperatorSuppliedCredential(
+    options?.passphrase,
+    process.env.SANCTUARY_PASSPHRASE,
+  );
+  const envRecoveryKey = isOperatorSuppliedCredential(
+    process.env.SANCTUARY_RECOVERY_KEY,
+  )
+    ? process.env.SANCTUARY_RECOVERY_KEY
+    : undefined;
 
   // H1 (hands-free boot): when the operator supplied NO credential env, resolve
   // the EXACT-fortress credential read-only through the SAME shared resolver
@@ -407,7 +394,11 @@ export async function createSanctuaryServer(options?: {
     // Zero the OS-keyring-derived keychain factor on BOTH paths: a REJECTED
     // establishment (wrong credential, rotation-in-progress, orphaned state)
     // must not leave the keychain custody key live in memory (MUST-NEVER 6 —
-    // no key material lingers past the operation that needed it).
+    // no key material lingers past the operation that needed it). MUST MATCH
+    // the same zeroization in `startStandaloneDashboard`
+    // (src/dashboard-standalone.ts), which resolves the same host-local
+    // keychain factor for the other boot path: both sides carry the pin so an
+    // editor who relaxes one is warned before CI has to catch it.
     if (bootKeychainKey) bootKeychainKey.fill(0);
   }
   try {
