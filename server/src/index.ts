@@ -368,7 +368,9 @@ export async function createSanctuaryServer(options?: {
       // the resolvable-but-absent credential was meant to unlock (MUST-NEVER 5).
       throw new Error(stored.message);
     }
-    // stored.kind === "virgin": no envelope; fall through to the first-run mint.
+    // stored.kind === "virgin": no custody state at all (no envelope AND no
+    // pre-envelope marker); fall through to the first-run mint. A LEGACY
+    // fortress is NOT this case and arrives as fail-closed above.
   }
 
   let custody: Awaited<ReturnType<typeof establishMaster>>;
@@ -399,6 +401,15 @@ export async function createSanctuaryServer(options?: {
     // (src/dashboard-standalone.ts), which resolves the same host-local
     // keychain factor for the other boot path: both sides carry the pin so an
     // editor who relaxes one is warned before CI has to catch it.
+    //
+    // SCOPE, and why the two guards are not the same width: the factor's whole
+    // owned lifetime here is this establishment, because the resolution above
+    // hands the bytes over with no fortress read between it and this `try`. The
+    // dashboard boot has two such reads (its first-run probe and its
+    // park-eligibility envelope read), so its guard opens at the RESOLUTION
+    // instead. Add any await between the resolution above and this `try` and
+    // the guard has to move up with it: a read that faults in that window is
+    // how the dashboard side left the factor unwiped.
     if (bootKeychainKey) bootKeychainKey.fill(0);
   }
   try {

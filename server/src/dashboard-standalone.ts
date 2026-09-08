@@ -581,216 +581,232 @@ export async function startStandaloneDashboard(
    * host-local lookup.
    */
   let hostLocalReport: CustodyCredentialReport | undefined;
-  if (passphrase !== undefined) {
-    // Which source it came from follows the same fall-through the predicate
-    // above applies: an empty `--passphrase` is not the option's answer.
-    passphraseSource = isOperatorSuppliedCredential(options.passphrase)
-      ? "option"
-      : "env";
-  } else if (envRecoveryKey === undefined) {
-    const resolved = await resolveHostLocalBootCredential({
-      storage,
-      storagePath: config.storage_path,
-      // Defaults ARE the production readers, so this call is byte-identical to
-      // the un-injected one unless a test supplies a seam. MUST MATCH the
-      // injection `createSanctuaryServer` makes in `src/index.ts`
-      // (`resolveHandsFreeBootCredential`): both boots hand the resolver the
-      // same two readers under the same names, which is what lets one test
-      // pin either boot against the same synthetic host state.
-      readStored: options.__testReadStoredPassphrase ?? readStoredPassphrase,
-      readCustodyKey:
-        options.__testReadKeychainCustody ?? readKeychainCustodyKeyStatus,
-    });
-    if (resolved.kind === "passphrase") {
-      passphrase = resolved.value;
-      passphraseSource =
-        resolved.provenance.displaySource === "keychain"
-          ? "keychain"
-          : "fallback-file";
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(
-        `Passphrase: loaded from ${resolved.provenance.location} (service ${keychainServiceFor(config.storage_path, homedir())})`
-      );
-    } else if (resolved.kind === "keychain-key") {
-      bootKeychainKey = resolved.key;
-      // Record the SOURCE even though no passphrase was read: the diagnostics
-      // downstream name the credential that actually opened the fortress, and
-      // an unset source there reads as "the recovery key".
-      passphraseSource = "enrolled-custody-key";
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(
-        `Custody: opened with the ${resolved.provenance.location} for this fortress.`
-      );
-    } else if (resolved.kind === "fail-closed") {
-      // Not thrown here: the refusal below still owes the operator the
-      // actionable diagnostic (enrolled factors, keyring reachability, the
-      // recovery command, tenant discovery), and `allowPark` may turn this
-      // into a parked boot instead. Carry the report to that site.
-      hostLocalReport = resolved.report;
-    }
-    // resolved.kind === "virgin": no custody state at all; fall through to the
-    // audited first run below.
-  }
-
-  // Unified custody path (core/master-custody.ts): envelope-first, legacy
-  // markers migrated in place, first runs create the envelope. The dashboard
-  // can no longer derive a different master than the MCP server or the
-  // castle-wall CLI for the same fortress.
-  //
-  // v0.10.4 hints preserved: before failing against a tenant we cannot
-  // unlock, surface discoverable sub-tenants - the common Mini1 failure mode
-  // is `sanctuary dashboard` run against a default root while sub-tenants
-  // hold their own keychain entries.
-  const isFirstRun =
-    (await readCustodyEnvelope(storage)) === null &&
-    (await storage.read("_meta", "key-params")) === null &&
-    (await storage.read("_meta", "recovery-key-hash")) === null;
-
-  if (isFirstRun && !passphrase && !envRecoveryKey) {
-    // v0.10.4: refuse to silently fresh-install over a host that already
-    // has wrapped tenants. Pre-fix the dashboard would generate a brand-new
-    // recovery key in the default root, which made the operator think they
-    // had just lost access to N other tenants.
-    const otherTenants = await discoverableSubTenants(
-      config.storage_path,
-      options.discoveryOptions,
-    );
-    if (otherTenants.length > 0) {
-      throw new Error(
-        `Sanctuary Dashboard: ${config.storage_path} has no Sanctuary state, but other wrapped tenants exist on this host.\n` +
-        `Refusing to generate a new recovery key over the default root - that would obscure the existing tenants.\n\n` +
-        renderTenantDiscoveryHint(otherTenants)
-      );
-    }
-    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-    console.error(
-      "Warning: No existing Sanctuary data found. The standalone dashboard\n" +
-      "is typically started after the MCP server has been run at least once.\n" +
-      "Generating a new master key for this installation.\n"
-    );
-  }
-
-  // Slice 2 (park-not-exit): does a wrapped fortress already exist on disk?
-  // Park is allowed ONLY when there is a real envelope to unlock LATER (not on
-  // a first run, which keeps today's warn/refuse behavior). Checked before the
-  // establishMaster attempt so we can distinguish "credential missing for an
-  // existing fortress" (park-eligible) from "first run, nothing here".
-  const envelopeExists = (await readCustodyEnvelope(storage)) !== null;
-
+  /**
+   * The dashboard OWNS the enrolled factor's bytes from the moment the
+   * resolver hands them over, so the wipe covers that WHOLE lifetime: this
+   * `try` opens at the resolution, not at establishment. Everything between
+   * the two reads the fortress (the first-run probe, the park-eligibility
+   * envelope read), and a transient read fault there is exactly the path that
+   * left 32 bytes of key material live in a rejected boot (MUST-NEVER 6).
+   * Nothing in here catches: the sole job of the enclosing block is the
+   * `finally`, so every refusal, throw and park still surfaces unchanged, and
+   * `custody` is still assigned on every path that leaves the block normally
+   * (a parked boot sets it to null explicitly).
+   */
   let custody: EstablishMasterResult | null;
   try {
-    custody = await establishMaster({
-      storage,
-      ...(passphrase ? { passphrase } : {}),
-      ...(bootKeychainKey ? { keychainKey: bootKeychainKey } : {}),
-      ...(envRecoveryKey ? { recoveryKey: envRecoveryKey } : {}),
-      // The standalone dashboard is a service boot, not a custody-setup
-      // ceremony (no re-entry verification flow) - first runs here are the
-      // audited degraded install mode, same as the MCP stdio boot. A fresh
-      // recovery key (a wrap of the one true master) is minted and
-      // disclosed below regardless of credential mode.
-      firstRun: {
-        installMode: options.noConfirm ? "headless" : "stdio-server",
-        mintRecoveryKey: true,
-      },
-      storagePathHint: config.storage_path,
-    });
-  } catch (err) {
-    // A SUPPLIED credential that fails to verify stays fail-closed (no boot
-    // with a wrong master - that silently splits state). Carry the v0.10.4
-    // diagnostics in the error: the per-tenant Keychain service name and the
-    // canonical schema doc, never a bare SANCTUARY_PASSPHRASE=<your-passphrase>
-    // hint (misleading on multi-tenant hosts).
+    if (passphrase !== undefined) {
+      // Which source it came from follows the same fall-through the predicate
+      // above applies: an empty `--passphrase` is not the option's answer.
+      passphraseSource = isOperatorSuppliedCredential(options.passphrase)
+        ? "option"
+        : "env";
+    } else if (envRecoveryKey === undefined) {
+      const resolved = await resolveHostLocalBootCredential({
+        storage,
+        storagePath: config.storage_path,
+        // Defaults ARE the production readers, so this call is byte-identical to
+        // the un-injected one unless a test supplies a seam. MUST MATCH the
+        // injection `createSanctuaryServer` makes in `src/index.ts`
+        // (`resolveHandsFreeBootCredential`): both boots hand the resolver the
+        // same two readers under the same names, which is what lets one test
+        // pin either boot against the same synthetic host state.
+        readStored: options.__testReadStoredPassphrase ?? readStoredPassphrase,
+        readCustodyKey:
+          options.__testReadKeychainCustody ?? readKeychainCustodyKeyStatus,
+      });
+      if (resolved.kind === "passphrase") {
+        passphrase = resolved.value;
+        passphraseSource =
+          resolved.provenance.displaySource === "keychain"
+            ? "keychain"
+            : "fallback-file";
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `Passphrase: loaded from ${resolved.provenance.location} (service ${keychainServiceFor(config.storage_path, homedir())})`
+        );
+      } else if (resolved.kind === "keychain-key") {
+        bootKeychainKey = resolved.key;
+        // Record the SOURCE even though no passphrase was read: the diagnostics
+        // downstream name the credential that actually opened the fortress, and
+        // an unset source there reads as "the recovery key".
+        passphraseSource = "enrolled-custody-key";
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `Custody: opened with the ${resolved.provenance.location} for this fortress.`
+        );
+      } else if (resolved.kind === "fail-closed") {
+        // Not thrown here: the refusal below still owes the operator the
+        // actionable diagnostic (enrolled factors, keyring reachability, the
+        // recovery command, tenant discovery), and `allowPark` may turn this
+        // into a parked boot instead. Carry the report to that site.
+        hostLocalReport = resolved.report;
+      }
+      // resolved.kind === "virgin": no custody state at all; fall through to the
+      // audited first run below.
+    }
+
+    // Unified custody path (core/master-custody.ts): envelope-first, legacy
+    // markers migrated in place, first runs create the envelope. The dashboard
+    // can no longer derive a different master than the MCP server or the
+    // castle-wall CLI for the same fortress.
     //
-    // NOTE: a supplied-but-wrong credential is NEVER park-eligible. Park is
-    // strictly "a wrapped fortress is here, I do not hold the key yet"; a wrong
-    // key is an operator error that must surface loudly, parked or not.
-    if (
-      (err instanceof CustodyUnlockError ||
-        err instanceof CustodyMigrationRefusedError) &&
-      // The enrolled custody factor counts as a supplied credential here: the
-      // resolver VERIFIED it against this envelope, so a failure at
-      // establishment is a fortress-integrity condition (a rotation landing
-      // mid-boot), never "no credential". Treating it as missing would route
-      // an operator to supply a key they already hold.
-      (passphrase || envRecoveryKey || bootKeychainKey !== undefined)
-    ) {
-      throw new Error(
-        `Sanctuary Dashboard: Encrypted identities found but NONE loaded - the supplied\n` +
-        `credential does not unlock the fortress at ${config.storage_path}.\n` +
-        `Refusing to start with a wrong master key (that would split state, not recover it).\n\n` +
-        `This tenant's Keychain service: ${keychainServiceFor(config.storage_path, homedir())}\n` +
-        `Retrieve the stored passphrase with:\n` +
-        `  security find-generic-password -s ${keychainServiceFor(config.storage_path, homedir())} -w\n\n` +
-        `See server/docs/keychain-schema.md for the keychain layout and recovery options.`,
-        { cause: err }
+    // v0.10.4 hints preserved: before failing against a tenant we cannot
+    // unlock, surface discoverable sub-tenants - the common Mini1 failure mode
+    // is `sanctuary dashboard` run against a default root while sub-tenants
+    // hold their own keychain entries.
+    const isFirstRun =
+      (await readCustodyEnvelope(storage)) === null &&
+      (await storage.read("_meta", "key-params")) === null &&
+      (await storage.read("_meta", "recovery-key-hash")) === null;
+
+    if (isFirstRun && !passphrase && !envRecoveryKey) {
+      // v0.10.4: refuse to silently fresh-install over a host that already
+      // has wrapped tenants. Pre-fix the dashboard would generate a brand-new
+      // recovery key in the default root, which made the operator think they
+      // had just lost access to N other tenants.
+      const otherTenants = await discoverableSubTenants(
+        config.storage_path,
+        options.discoveryOptions,
+      );
+      if (otherTenants.length > 0) {
+        throw new Error(
+          `Sanctuary Dashboard: ${config.storage_path} has no Sanctuary state, but other wrapped tenants exist on this host.\n` +
+          `Refusing to generate a new recovery key over the default root - that would obscure the existing tenants.\n\n` +
+          renderTenantDiscoveryHint(otherTenants)
+        );
+      }
+      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+      console.error(
+        "Warning: No existing Sanctuary data found. The standalone dashboard\n" +
+        "is typically started after the MCP server has been run at least once.\n" +
+        "Generating a new master key for this installation.\n"
       );
     }
-    // Credential-missing for an EXISTING fortress. Slice 2: if park is enabled
-    // (supervised LaunchAgent path) boot PARKED instead of throwing (the
-    // KeepAlive crash-loop fix). Otherwise keep the ACTIONABLE diagnostic:
-    // enrolled factors, OS keyring reachability, GUI-unlock steps, recovery
-    // command, and tenant discovery hints. Never prints an on-disk key location.
-    if (
-      err instanceof CustodyUnlockError &&
-      !passphrase &&
-      !envRecoveryKey &&
-      bootKeychainKey === undefined
-    ) {
-      if (options.allowPark && envelopeExists) {
-        // custody stays null -> fall through to the park boot below.
-        custody = null;
-      } else {
-        const factors = await readEnrolledFactors(storage);
-        // Reachability comes from the resolver's OWN keyring read, not a second
-        // probe. Two independent reads can disagree (an unlock, a transient
-        // D-Bus fault, a keychain prompt answered between them), and this
-        // refusal prints both blocks: an actionable block saying the custody
-        // item is MISSING above an accepted-sources block saying that same
-        // item was present is a contradiction an operator acts on wrongly.
-        // Undefined only when the enrolled-custody-key source was never
-        // consulted, in which case the actionable block simply omits the
-        // keyring-state paragraph rather than guessing.
-        const keychainReachability = factors.hasKeychainFactor
-          ? hostLocalReport?.enrolledCustodyKeyItem
-          : undefined;
-        const actionable = buildActionableUnlockMessage({
-          ...factors,
-          ...(keychainReachability !== undefined ? { keychainReachability } : {}),
-          storagePathHint: config.storage_path,
-          keychainServiceHint: keychainServiceFor(config.storage_path, homedir()),
-        });
-        const otherTenants = await discoverableSubTenants(
-          config.storage_path,
-          options.discoveryOptions,
-        );
-        // MUST MATCH the refusal `protect`, `export-passphrase` and the MCP
-        // stdio boot print: `custodyCredentialRefusal` in
-        // `wrap/custody-credential.ts`. The operator and the release
-        // acceptance kit read ONE listing of the sources that are tried, in
-        // the order they are tried, whichever verb refused. `hostLocalReport`
-        // is undefined only when an operator source short-circuited the
-        // host-local lookup, and that case is handled by the branch above.
-        const acceptedSources =
-          hostLocalReport === undefined
-            ? ""
-            : `${custodyCredentialRefusal(hostLocalReport, config.storage_path).message}\n\n`;
+
+    // Slice 2 (park-not-exit): does a wrapped fortress already exist on disk?
+    // Park is allowed ONLY when there is a real envelope to unlock LATER (not on
+    // a first run, which keeps today's warn/refuse behavior). Checked before the
+    // establishMaster attempt so we can distinguish "credential missing for an
+    // existing fortress" (park-eligible) from "first run, nothing here".
+    const envelopeExists = (await readCustodyEnvelope(storage)) !== null;
+
+    try {
+      custody = await establishMaster({
+        storage,
+        ...(passphrase ? { passphrase } : {}),
+        ...(bootKeychainKey ? { keychainKey: bootKeychainKey } : {}),
+        ...(envRecoveryKey ? { recoveryKey: envRecoveryKey } : {}),
+        // The standalone dashboard is a service boot, not a custody-setup
+        // ceremony (no re-entry verification flow) - first runs here are the
+        // audited degraded install mode, same as the MCP stdio boot. A fresh
+        // recovery key (a wrap of the one true master) is minted and
+        // disclosed below regardless of credential mode.
+        firstRun: {
+          installMode: options.noConfirm ? "headless" : "stdio-server",
+          mintRecoveryKey: true,
+        },
+        storagePathHint: config.storage_path,
+      });
+    } catch (err) {
+      // A SUPPLIED credential that fails to verify stays fail-closed (no boot
+      // with a wrong master - that silently splits state). Carry the v0.10.4
+      // diagnostics in the error: the per-tenant Keychain service name and the
+      // canonical schema doc, never a bare SANCTUARY_PASSPHRASE=<your-passphrase>
+      // hint (misleading on multi-tenant hosts).
+      //
+      // NOTE: a supplied-but-wrong credential is NEVER park-eligible. Park is
+      // strictly "a wrapped fortress is here, I do not hold the key yet"; a wrong
+      // key is an operator error that must surface loudly, parked or not.
+      if (
+        (err instanceof CustodyUnlockError ||
+          err instanceof CustodyMigrationRefusedError) &&
+        // The enrolled custody factor counts as a supplied credential here: the
+        // resolver VERIFIED it against this envelope, so a failure at
+        // establishment is a fortress-integrity condition (a rotation landing
+        // mid-boot), never "no credential". Treating it as missing would route
+        // an operator to supply a key they already hold.
+        (passphrase || envRecoveryKey || bootKeychainKey !== undefined)
+      ) {
         throw new Error(
-          `Sanctuary Dashboard:\n${actionable}\n\n` +
-          acceptedSources +
-          (otherTenants.length > 0 ? renderTenantDiscoveryHint(otherTenants) + "\n" : "") +
+          `Sanctuary Dashboard: Encrypted identities found but NONE loaded - the supplied\n` +
+          `credential does not unlock the fortress at ${config.storage_path}.\n` +
+          `Refusing to start with a wrong master key (that would split state, not recover it).\n\n` +
+          `This tenant's Keychain service: ${keychainServiceFor(config.storage_path, homedir())}\n` +
+          `Retrieve the stored passphrase with:\n` +
+          `  security find-generic-password -s ${keychainServiceFor(config.storage_path, homedir())} -w\n\n` +
           `See server/docs/keychain-schema.md for the keychain layout and recovery options.`,
           { cause: err }
         );
       }
-    } else {
-      throw err;
+      // Credential-missing for an EXISTING fortress. Slice 2: if park is enabled
+      // (supervised LaunchAgent path) boot PARKED instead of throwing (the
+      // KeepAlive crash-loop fix). Otherwise keep the ACTIONABLE diagnostic:
+      // enrolled factors, OS keyring reachability, GUI-unlock steps, recovery
+      // command, and tenant discovery hints. Never prints an on-disk key location.
+      if (
+        err instanceof CustodyUnlockError &&
+        !passphrase &&
+        !envRecoveryKey &&
+        bootKeychainKey === undefined
+      ) {
+        if (options.allowPark && envelopeExists) {
+          // custody stays null -> fall through to the park boot below.
+          custody = null;
+        } else {
+          const factors = await readEnrolledFactors(storage);
+          // Reachability comes from the resolver's OWN keyring read, not a second
+          // probe. Two independent reads can disagree (an unlock, a transient
+          // D-Bus fault, a keychain prompt answered between them), and this
+          // refusal prints both blocks: an actionable block saying the custody
+          // item is MISSING above an accepted-sources block saying that same
+          // item was present is a contradiction an operator acts on wrongly.
+          // Undefined only when the enrolled-custody-key source was never
+          // consulted, in which case the actionable block simply omits the
+          // keyring-state paragraph rather than guessing.
+          const keychainReachability = factors.hasKeychainFactor
+            ? hostLocalReport?.enrolledCustodyKeyItem
+            : undefined;
+          const actionable = buildActionableUnlockMessage({
+            ...factors,
+            ...(keychainReachability !== undefined ? { keychainReachability } : {}),
+            storagePathHint: config.storage_path,
+            keychainServiceHint: keychainServiceFor(config.storage_path, homedir()),
+          });
+          const otherTenants = await discoverableSubTenants(
+            config.storage_path,
+            options.discoveryOptions,
+          );
+          // MUST MATCH the refusal `protect`, `export-passphrase` and the MCP
+          // stdio boot print: `custodyCredentialRefusal` in
+          // `wrap/custody-credential.ts`. The operator and the release
+          // acceptance kit read ONE listing of the sources that are tried, in
+          // the order they are tried, whichever verb refused. `hostLocalReport`
+          // is undefined only when an operator source short-circuited the
+          // host-local lookup, and that case is handled by the branch above.
+          const acceptedSources =
+            hostLocalReport === undefined
+              ? ""
+              : `${custodyCredentialRefusal(hostLocalReport, config.storage_path).message}\n\n`;
+          throw new Error(
+            `Sanctuary Dashboard:\n${actionable}\n\n` +
+            acceptedSources +
+            (otherTenants.length > 0 ? renderTenantDiscoveryHint(otherTenants) + "\n" : "") +
+            `See server/docs/keychain-schema.md for the keychain layout and recovery options.`,
+            { cause: err }
+          );
+        }
+      } else {
+        throw err;
+      }
     }
   } finally {
     // Zero the OS-keyring-derived factor whether establishment succeeded,
-    // refused, or parked: no key material lingers past the operation that
-    // needed it (MUST-NEVER 6). MUST MATCH the same zeroization in
-    // `createSanctuaryServer` (src/index.ts).
+    // refused, parked, or was never reached because a fortress read faulted
+    // first: no key material lingers past the operation that needed it
+    // (MUST-NEVER 6). MUST MATCH the same zeroization in
+    // `createSanctuaryServer` (src/index.ts), which holds the factor across a
+    // window with no fortress reads in it and so wraps establishment alone.
     bootKeychainKey?.fill(0);
   }
 

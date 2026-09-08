@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.8.6] - 2026-09-08
+
+### Fixed
+
+- A fortress created before custody envelopes opens with its stored passphrase again: the boot credential resolver no longer lets an OS-keyring custody item it cannot verify shadow that passphrase, and it reports such an item as present but unusable, with the remedy that matches.
+
 ## [1.8.5] - 2026-09-08
 
 Setup fixes for a first install on a personal Mac. No new capability; the capability bounds in the v1.8.4 notes stand.
