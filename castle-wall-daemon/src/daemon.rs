@@ -12,17 +12,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::audit::{AuditRingBuffer, WalError, WalWriter};
+use crate::audit::{AuditRingBuffer, WalWriter};
 use crate::config::DaemonConfig;
 use crate::constants::{AUDIT_LAYER, SCHEMA_VERSION_V1};
-use crate::failure::{default_disposition, FailureDisposition, FailureMode};
+use crate::decision::{AttemptError, DecisionEngine, EvaluationOutcome};
+use crate::failure::{FailureDisposition, FailureMode};
 use crate::ipc::auth::{load_pinned_public_key, AuthError};
 use crate::ipc::server::{IpcServer, IpcServerError};
 use crate::manifest::{ManifestStore, ManifestStoreError};
-use crate::manifest::canonical_json::CanonicalJsonError;
-use crate::policy::{
-    build_audit_event_canonical_json, DeniedReason, EvaluationRequest, Verdict,
-};
+use crate::policy::EvaluationRequest;
 
 /// Errors emitted by the daemon lifecycle.
 #[derive(Debug, thiserror::Error)]
@@ -98,29 +96,47 @@ pub struct DaemonHandle {
     config: DaemonConfig,
     ipc_server: Option<IpcServer>,
     audit_buffer: Arc<Mutex<AuditRingBuffer>>,
-    /// Disk-backed WAL. Shared between the daemon-side audit emitters and
-    /// the IPC drain dispatch. None when boot was invoked with a transient
-    /// in-memory-only configuration (e.g., short-lived smoke runs).
-    wal_writer: Option<Arc<Mutex<WalWriter>>>,
-    /// Manifest store. Shared with the IPC dispatch's policy.reload handler.
-    manifest_store: Option<Arc<Mutex<ManifestStore>>>,
+    /// Cloneable policy and audit surface used by kernel verdict callbacks.
+    decision_engine: Arc<DecisionEngine>,
+    runtime_state: Arc<Mutex<DaemonRuntimeState>>,
     shutdown_flag: Arc<AtomicBool>,
     started_at: Instant,
 }
 
 impl DaemonHandle {
+    /// Current enforcement truth. The existing boot path deliberately reports
+    /// `ControlPlaneOnly` until L1 owns live nftables and NFQUEUE resources.
+    pub fn runtime_state(&self) -> DaemonRuntimeState {
+        self.runtime_state
+            .lock()
+            .map(|state| *state)
+            .unwrap_or(DaemonRuntimeState::Degraded)
+    }
+
+    /// Kernel enforcement is true only in the explicit enforcing state.
+    pub fn is_enforcing(&self) -> bool {
+        self.runtime_state() == DaemonRuntimeState::Enforcing
+    }
+
     /// Test/integration helper: hand back the manifest store handle so the
     /// caller can simulate operator-driven flows that the IPC layer carries
     /// in production.
     pub fn manifest_store(&self) -> Option<&Arc<Mutex<ManifestStore>>> {
-        self.manifest_store.as_ref()
+        self.decision_engine.manifest_store()
     }
 
     /// Test/integration helper: hand back the WAL writer handle so the
     /// caller can append synthetic audit events without going through the
     /// kernel-touching emitter path.
     pub fn wal_writer(&self) -> Option<&Arc<Mutex<WalWriter>>> {
-        self.wal_writer.as_ref()
+        self.decision_engine.wal_writer()
+    }
+
+    /// Share the policy decision surface without sharing daemon lifecycle
+    /// ownership. The Linux verdict loop holds this while `DaemonHandle`
+    /// retains responsibility for stopping threads and kernel resources.
+    pub fn decision_engine(&self) -> Arc<DecisionEngine> {
+        Arc::clone(&self.decision_engine)
     }
 
     /// Evaluate one outbound attempt against the verified ManifestStore
@@ -140,219 +156,8 @@ impl DaemonHandle {
         &self,
         request: &EvaluationRequest,
     ) -> Result<EvaluationOutcome, AttemptError> {
-        let store = self
-            .manifest_store
-            .as_ref()
-            .ok_or(AttemptError::ManifestStoreUnwired)?;
-        let wal = self
-            .wal_writer
-            .as_ref()
-            .ok_or(AttemptError::WalUnwired)?;
-
-        let (verdict, audit_fortress_id, audit_confined_agent_uid) = {
-            let guard = store
-                .lock()
-                .map_err(|_| AttemptError::ManifestStorePoisoned)?;
-            // F-1 deny-by-default: when no snapshot has been loaded, the
-            // verdict is DefaultDeny. The evaluator on an empty snapshot
-            // returns the same shape, so we surface the no-snapshot case
-            // through the same code path.
-            match guard.current_snapshot() {
-                Some(snap) => (
-                    snap.evaluate(request),
-                    snap.fortress_id.clone(),
-                    snap.confined_agent_uid,
-                ),
-                None => (
-                    Verdict::Deny {
-                        reason: crate::policy::DeniedReason::DefaultDeny,
-                    },
-                    self.config.fortress_id.clone(),
-                    None,
-                ),
-            }
-        };
-
-        let timestamp_iso = current_timestamp_iso8601();
-        let event_canonical_json = build_audit_event_canonical_json(
-            &verdict,
-            request,
-            &audit_fortress_id,
-            audit_confined_agent_uid,
-            &timestamp_iso,
-        )
-        .map_err(AttemptError::AuditCanonicalize)?;
-
-        let append_result = {
-            let mut guard = wal
-                .lock()
-                .map_err(|_| AttemptError::WalPoisoned)?;
-            guard.append_critical(&event_canonical_json)
-        };
-
-        match append_result {
-            Ok(seq) => {
-                // Mirror into the in-memory ring so `wait_for_shutdown` and
-                // other observers see the same event count the WAL holds.
-                // The ring is capped + TTL-evicted on the wait-loop tick.
-                if let Ok(mut buf) = self.audit_buffer.lock() {
-                    buf.append(crate::audit::PendingAuditEvent {
-                        event_canonical_json: event_canonical_json.clone(),
-                        captured_at: std::time::SystemTime::now(),
-                        // Per-attempt allow/deny mirrors are the
-                        // high-volume metric stream: drop these first
-                        // when the ring saturates so the audit-truncate /
-                        // recovery / panic events stay (full-sweep #76).
-                        critical: false,
-                    });
-                }
-                Ok(EvaluationOutcome {
-                    verdict,
-                    wal_seq: Some(seq),
-                    event_canonical_json,
-                    timestamp_iso8601: timestamp_iso,
-                })
-            }
-            Err(_wal_err) => {
-                // Scope-lock section 7 / section 8: the
-                // RuntimeAuditWalAppendFailed dispatch forces fail-closed
-                // regardless of the original verdict. Without a durable
-                // audit chain the egress decision cannot be reconstructed,
-                // so the verdict-loop must drop the packet.
-                let disposition =
-                    default_disposition(FailureMode::RuntimeAuditWalAppendFailed);
-                debug_assert!(
-                    matches!(
-                        disposition,
-                        FailureDisposition::FailClosed {
-                            emit_event: "egress_blocked",
-                            reason: "audit_wal_append_failed",
-                        }
-                    ),
-                    "RuntimeAuditWalAppendFailed must dispatch to FailClosed \
-                     with emit_event=egress_blocked, reason=audit_wal_append_failed",
-                );
-                let _ = disposition;
-
-                let fail_closed_verdict = Verdict::Deny {
-                    reason: DeniedReason::AuditWalAppendFailed,
-                };
-                let fail_closed_canonical_json = build_audit_event_canonical_json(
-                    &fail_closed_verdict,
-                    request,
-                    &audit_fortress_id,
-                    audit_confined_agent_uid,
-                    &timestamp_iso,
-                )
-                .map_err(AttemptError::AuditCanonicalize)?;
-
-                // Mirror the synthesized fail-closed event into the
-                // in-memory ring so the next ACK can carry a
-                // wal_overflow_loss-equivalent record per scope-lock
-                // section 8. The original (allow/deny) audit body is
-                // intentionally NOT mirrored: the durable record never
-                // reached the WAL, and the in-memory ring's contract is
-                // "events the verdict-loop acted on," which is the
-                // fail-closed shape.
-                if let Ok(mut buf) = self.audit_buffer.lock() {
-                    buf.append(crate::audit::PendingAuditEvent {
-                        event_canonical_json: fail_closed_canonical_json.clone(),
-                        captured_at: std::time::SystemTime::now(),
-                        // Fail-closed audit-WAL-failure mirrors are
-                        // panic-class events per scope-lock §8 and
-                        // must survive ring-buffer saturation
-                        // (full-sweep #76).
-                        critical: true,
-                    });
-                }
-
-                Ok(EvaluationOutcome {
-                    verdict: fail_closed_verdict,
-                    wal_seq: None,
-                    event_canonical_json: fail_closed_canonical_json,
-                    timestamp_iso8601: timestamp_iso,
-                })
-            }
-        }
+        self.decision_engine.evaluate_attempt(request)
     }
-}
-
-/// Outcome of [`DaemonHandle::evaluate_attempt`]: the policy decision plus
-/// the durable WAL receipt (assigned seq, canonical-JSON body, ISO-8601
-/// timestamp). `wal_seq` is `None` when the daemon's
-/// `RuntimeAuditWalAppendFailed` dispatch fired, in which case `verdict`
-/// is the synthesized fail-closed `Verdict::Deny { reason:
-/// DeniedReason::AuditWalAppendFailed }` and `event_canonical_json`
-/// reflects the fail-closed audit shape rather than the original
-/// allow/deny outcome.
-#[derive(Debug, Clone)]
-pub struct EvaluationOutcome {
-    pub verdict: Verdict,
-    pub wal_seq: Option<u64>,
-    pub event_canonical_json: String,
-    pub timestamp_iso8601: String,
-}
-
-/// Errors returned by [`DaemonHandle::evaluate_attempt`].
-#[derive(Debug, thiserror::Error)]
-pub enum AttemptError {
-    #[error("manifest store not wired into this daemon instance")]
-    ManifestStoreUnwired,
-    #[error("WAL writer not wired into this daemon instance")]
-    WalUnwired,
-    #[error("manifest store mutex poisoned")]
-    ManifestStorePoisoned,
-    #[error("WAL writer mutex poisoned")]
-    WalPoisoned,
-    #[error("audit-event canonicalization failed: {0}")]
-    AuditCanonicalize(CanonicalJsonError),
-    #[error("WAL append failed: {0}")]
-    WalAppend(WalError),
-}
-
-/// Render the current wall-clock as an ISO-8601 timestamp suitable for
-/// the `AuditEntry.timestamp` field. Uses UTC; format mirrors the existing
-/// Sanctuary audit-log convention (`YYYY-MM-DDTHH:MM:SS.sssZ`).
-fn current_timestamp_iso8601() -> String {
-    let now = std::time::SystemTime::now();
-    let dur = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let total_ms = dur.as_millis() as i128;
-    let secs = (total_ms / 1000) as i64;
-    let ms = (total_ms % 1000) as i64;
-    let (y, mo, d, h, mi, s) = ymd_hms_from_unix_seconds(secs);
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        y, mo, d, h, mi, s, ms
-    )
-}
-
-/// Convert a UNIX-epoch second count into UTC (year, month, day, hour,
-/// minute, second). Avoids an external chrono dep; civil-from-days
-/// algorithm by Howard Hinnant. Valid for any year representable as i32.
-fn ymd_hms_from_unix_seconds(unix_seconds: i64) -> (i32, u32, u32, u32, u32, u32) {
-    let secs_per_day: i64 = 86_400;
-    let mut days = unix_seconds.div_euclid(secs_per_day);
-    let mut secs_of_day = unix_seconds.rem_euclid(secs_per_day);
-    if secs_of_day < 0 {
-        secs_of_day += secs_per_day;
-        days -= 1;
-    }
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let year = (if m <= 2 { y + 1 } else { y }) as i32;
-    let hour = (secs_of_day / 3600) as u32;
-    let minute = ((secs_of_day % 3600) / 60) as u32;
-    let second = (secs_of_day % 60) as u32;
-    (year, m, d, hour, minute, second)
 }
 
 impl DaemonHandle {
@@ -381,6 +186,9 @@ impl DaemonHandle {
 
     /// Stop the IPC server and wait for it to join.
     pub fn stop(mut self) -> Result<DaemonExitReport, DaemonError> {
+        if let Ok(mut state) = self.runtime_state.lock() {
+            *state = DaemonRuntimeState::Stopping;
+        }
         self.request_stop();
         if let Some(server) = self.ipc_server.take() {
             server.stop_and_join();
@@ -398,6 +206,17 @@ impl DaemonHandle {
             socket_path: self.config.socket_path.clone(),
         })
     }
+}
+
+/// Operator-visible daemon state. Process liveness and authenticated IPC are
+/// not enforcement; `Enforcing` is reserved for a later boot path that holds
+/// all required kernel resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonRuntimeState {
+    ControlPlaneOnly,
+    Enforcing,
+    Degraded,
+    Stopping,
 }
 
 /// Summary of a daemon run; surfaced to the operator on shutdown.
@@ -514,12 +333,20 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
 
     install_shutdown_signal_handlers(Arc::clone(&shutdown_flag))?;
 
+    let decision_engine = Arc::new(DecisionEngine::new(
+        config.fortress_id.clone(),
+        Some(Arc::clone(&manifest_store)),
+        Some(Arc::clone(&wal_writer)),
+        Arc::clone(&audit_buffer),
+    ));
+    let runtime_state = Arc::new(Mutex::new(DaemonRuntimeState::ControlPlaneOnly));
+
     Ok(DaemonHandle {
         config,
         ipc_server: Some(ipc_server),
         audit_buffer,
-        wal_writer: Some(wal_writer),
-        manifest_store: Some(manifest_store),
+        decision_engine,
+        runtime_state,
         shutdown_flag,
         started_at: Instant::now(),
     })
@@ -578,6 +405,7 @@ fn install_shutdown_signal_handlers(shutdown_flag: Arc<AtomicBool>) -> Result<()
 mod tests {
     use super::*;
     use crate::config::DaemonConfig;
+    use crate::policy::{DeniedReason, Verdict};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use std::fs;
@@ -622,6 +450,45 @@ mod tests {
         drop(buffer);
         let report = handle.stop().expect("stop");
         assert!(report.uptime > Duration::ZERO);
+    }
+
+    #[test]
+    fn boot_reports_control_plane_only_until_kernel_runtime_is_owned() {
+        let dir = TempDir::new().unwrap();
+        let (config, _signing) = fresh_config_in(&dir);
+        let handle = boot(config).expect("boot");
+
+        assert_eq!(
+            handle.runtime_state(),
+            DaemonRuntimeState::ControlPlaneOnly
+        );
+        assert!(
+            !handle.is_enforcing(),
+            "IPC and policy liveness must never be presented as kernel enforcement"
+        );
+
+        handle.stop().expect("stop");
+    }
+
+    #[test]
+    fn decision_engine_is_shareable_without_daemon_lifecycle_ownership() {
+        let dir = TempDir::new().unwrap();
+        let (config, _signing) = fresh_config_in(&dir);
+        let handle = boot(config).expect("boot");
+        let engine = handle.decision_engine();
+
+        let outcome = engine
+            .evaluate_attempt(&req_for(Some("unlisted.example"), 443))
+            .expect("evaluate through shared engine");
+        assert!(matches!(
+            outcome.verdict,
+            Verdict::Deny {
+                reason: DeniedReason::DefaultDeny
+            }
+        ));
+
+        drop(engine);
+        handle.stop().expect("stop");
     }
 
     #[test]
