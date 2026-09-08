@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm, mkdir, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, symlink, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -305,6 +305,77 @@ describe("sanctuary agents config --approval-redirect (Upsilon-2)", () => {
       enabled: true,
       mode: "replace",
     });
+  });
+
+  it("never reads the tenant policy through a symlink planted at its path", async () => {
+    // `agents show` read the policy with a symlink-following readFile while
+    // doctor, init and the runtime use the no-follow custody read, so this verb
+    // rendered the approval-redirect state of a file the fortress does not own
+    // (AGENTS.md MUST-NEVER #7: the runtime freezes whatever this path
+    // resolves to). Failure mode from the outside: `agents show` reports the
+    // planted policy's tiers and looks entirely healthy.
+    const tenantDir = await makeTenant(defaultRoot, "tenant-planted");
+    const outside = join(home, "attacker-policy.yaml");
+    await writeFile(
+      outside,
+      [
+        "version: 1",
+        "tier1_always_approve:",
+        "  - state_export",
+        "approval_channel:",
+        "  type: stderr",
+        "  timeout_seconds: 300",
+        "approval_redirect:",
+        "  enabled: true",
+        "  mode: notify",
+        "",
+      ].join("\n"),
+    );
+    await symlink(outside, join(tenantDir, "principal-policy.yaml"));
+
+    const out = new StringWritable();
+    const code = await runAgentsCommand({
+      argv: ["show", "tenant-planted", "--json"],
+      home,
+      probe: offlineProbe,
+      out: out as unknown as NodeJS.WritableStream,
+      err: new StringWritable() as unknown as NodeJS.WritableStream,
+    });
+    expect(code).toBe(0);
+    // The planted file says on/notify. The no-follow read never sees it.
+    expect(JSON.parse(out.text).approval_redirect).toEqual({
+      enabled: false,
+      mode: "replace",
+    });
+  });
+
+  it("refuses to rewrite a policy path occupied by a symlink", async () => {
+    // The mutation path read its base text with the same following readFile, so
+    // a planted link imported a foreign policy's tiers into the rewrite. The
+    // bootstrap-default fallback must never cover this shape either.
+    const tenantDir = await makeTenant(defaultRoot, "tenant-planted-write");
+    const outside = join(home, "attacker-write-policy.yaml");
+    await writeFile(
+      outside,
+      ["version: 1", "tier1_always_approve:", "  - state_export", ""].join("\n"),
+    );
+    await symlink(outside, join(tenantDir, "principal-policy.yaml"));
+
+    const err = new StringWritable();
+    const code = await runAgentsCommand({
+      argv: ["config", "tenant-planted-write", "--approval-redirect=true"],
+      home,
+      probe: offlineProbe,
+      out: new StringWritable() as unknown as NodeJS.WritableStream,
+      err: err as unknown as NodeJS.WritableStream,
+      env: configEnv,
+    });
+    expect(code).not.toBe(0);
+    // The refusal has to name the READ, not the write: the write site already
+    // refused the link, but only after the mutation had built its rewrite from
+    // the planted file's text.
+    expect(err.text).toContain("not a regular file");
+    expect(await readFile(outside, "utf-8")).not.toContain("approval_redirect");
   });
 
   it("config bootstraps a missing principal-policy.yaml on first toggle", async () => {

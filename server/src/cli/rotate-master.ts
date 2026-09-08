@@ -134,8 +134,11 @@ Options:
   --storage <path>    Alias for --fortress.
   --recovery-out <path>
                       Write the NEW plaintext recovery key to this exact
-                      path instead of <fortress>/recovery-key.txt. The path
-                      must be outside the fortress directory.
+                      path, which must be outside the fortress directory.
+                      Without it (and without SANCTUARY_RECOVERY_OUT)
+                      rotation writes no recovery file at all: the new key
+                      is escrowed in the OS keyring where available and you
+                      capture it by re-entering it at the prompt.
   --resume            Resume a rotation interrupted by a crash or power loss.
                       Idempotent; requires the fortress passphrase.
   --help, -h          Show this help.

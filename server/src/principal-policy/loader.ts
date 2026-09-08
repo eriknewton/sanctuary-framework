@@ -12,6 +12,7 @@
  *   rather than silently substituting a default (operator intent preservation).
  */
 
+import { lstat } from "node:fs/promises";
 import { join } from "node:path";
 import { readFileCustody, writeFileCustody } from "../storage/custody-fs.js";
 import type {
@@ -1102,6 +1103,139 @@ export class MalformedPrincipalPolicyError extends Error {
 }
 
 /**
+ * The Principal Policy path exists but is not a regular file (a symlink, a
+ * directory, a fifo).
+ *
+ * Distinct from `MalformedPrincipalPolicyError`, which is about CONTENT that
+ * cannot be parsed: this is about the path itself not being a file the
+ * fortress owns, which no amount of fixing the YAML addresses.
+ */
+export class NonRegularPrincipalPolicyFileError extends Error {
+  constructor(public readonly policyPath: string) {
+    super(
+      `Principal policy path ${policyPath} exists but is not a regular file. ` +
+        `Sanctuary will neither read a policy through it nor replace it: a link here redirects ` +
+        `the policy the runtime freezes at startup to a file this fortress does not own. ` +
+        `Move or delete ${policyPath}, then re-run.`,
+    );
+    this.name = "NonRegularPrincipalPolicyFileError";
+  }
+}
+
+/**
+ * Canonical on-disk filename of the Principal Policy, and the ONE definition
+ * of it. `sanctuary doctor` FAILS when this exact file is missing, so every
+ * reader and writer has to agree on the name; each of them therefore imports
+ * `principalPolicyPath` (or this constant) rather than re-spelling the
+ * literal. Current consumers: `sanctuary doctor`'s principal-policy check
+ * (server/src/cli/doctor.ts), the tenant reader/writers
+ * (server/src/cli/agents/cli.ts), the federation policy flag
+ * (server/src/cli/federation.ts), `sanctuary init`
+ * (server/src/wrap/init.ts, through writeDefaultPrincipalPolicyFile), and the
+ * runtime loader below. A hand-mirrored copy of this string is the drift that
+ * made a freshly initialized fortress fail its own doctor check.
+ */
+export const PRINCIPAL_POLICY_FILENAME = "principal-policy.yaml";
+
+/** Absolute path of a fortress's Principal Policy file. */
+export function principalPolicyPath(storagePath: string): string {
+  return join(storagePath, PRINCIPAL_POLICY_FILENAME);
+}
+
+/**
+ * The ONE lstat rule for "may Sanctuary adopt what is already at the policy
+ * path", shared by the writer's refusal and `sanctuary init`'s pre-mint
+ * preflight so the two can never disagree about what counts as adoptable.
+ *
+ * Returns true when a regular file is already there (operator intent to KEEP),
+ * false when the path is empty. Throws `NonRegularPrincipalPolicyFileError`
+ * for anything else.
+ *
+ * Must match the pre-mint caller `preflightPrincipalPolicyFile` below and the
+ * write-site caller in `writeDefaultPrincipalPolicyFile`: both consume this
+ * one function rather than re-spelling the lstat test.
+ */
+async function principalPolicyEntryIsAdoptable(
+  policyPath: string,
+): Promise<boolean> {
+  let existing: Awaited<ReturnType<typeof lstat>>;
+  try {
+    existing = await lstat(policyPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return false;
+    throw err;
+  }
+  // "Present" is only operator intent to KEEP when the thing present is a
+  // regular file. A symlink (or any non-file) here is refused rather than
+  // adopted: the runtime freezes whatever this path resolves to as the
+  // policy (AGENTS.md MUST-NEVER #7), so silently accepting a link lets a
+  // planted path decide the tier gate. `--force` does not relax this; force
+  // authorizes overwriting a fortress, never following a link out of it.
+  if (existing.isSymbolicLink() || !existing.isFile()) {
+    throw new NonRegularPrincipalPolicyFileError(policyPath);
+  }
+  return true;
+}
+
+/**
+ * Read-only refusal of a non-regular entry at the policy path, for callers
+ * that must fail BEFORE they mint anything.
+ *
+ * `sanctuary init` writes the policy near the END of its sequence, after the
+ * recovery-key file and the custody envelope. Under `--force` a failure there
+ * skips rollback, so the writer's own refusal fired with the staged recovery
+ * file already on disk and not yet announced: the cleanup summary could not
+ * name it, and the next `--force` retry died at the single-issuance preflight
+ * on a file the operator was never told about. Refusing the same shape here,
+ * beside the other pre-mint checks, is what keeps `--force` retryable.
+ *
+ * Advisory only, exactly like `preflightPolicyAncestors`: the writer re-checks
+ * under the custody write lock, so this never becomes the sole guard.
+ */
+export async function preflightPrincipalPolicyFile(
+  storagePath: string,
+): Promise<void> {
+  await principalPolicyEntryIsAdoptable(principalPolicyPath(storagePath));
+}
+
+/**
+ * Write the default Principal Policy for a fortress that has none.
+ *
+ * ONE source for the default policy text: `sanctuary init` calls this so a
+ * freshly initialized fortress already contains what `sanctuary doctor`
+ * checks for, and `loadPrincipalPolicy` calls it on the first-boot ENOENT
+ * path for fortresses created before init wrote it. Never overwrites: an
+ * existing file is operator intent (AGENTS.md MUST-NEVER #7 freezes the
+ * policy at startup), so a present file returns `written: false` rather than
+ * being replaced.
+ *
+ * Failure mode from the outside: a policy directory the caller cannot write
+ * looks like a successful init until the next `doctor` run reports the file
+ * missing, which is why init treats a throw here as a hard failure rather
+ * than a warning.
+ */
+export async function writeDefaultPrincipalPolicyFile(
+  storagePath: string
+): Promise<{ policyPath: string; written: boolean }> {
+  const policyPath = principalPolicyPath(storagePath);
+  // Read-then-write, not an exclusive create: writeFileCustody publishes via
+  // rename(2) and would silently replace an existing policy. Both callers hold
+  // a serializing claim on the fortress at this point (init holds the custody
+  // write lock; the runtime reaches here only after its own read returned
+  // ENOENT), so this check is the no-overwrite guard, not a race primitive.
+  // The non-regular refusal stays HERE as the defense at the write site even
+  // though init also preflights it: this is the check that runs under the lock.
+  if (await principalPolicyEntryIsAdoptable(policyPath)) {
+    return { policyPath, written: false };
+  }
+  await writeFileCustody(policyPath, generateDefaultPolicyYaml(), {
+    mode: 0o600,
+    createParent: false,
+  });
+  return { policyPath, written: true };
+}
+
+/**
  * Load the Principal Policy from disk.
  * If no policy file exists, generate the default and save it.
  * If the file exists but is malformed, throw MalformedPrincipalPolicyError.
@@ -1110,7 +1244,7 @@ export class MalformedPrincipalPolicyError extends Error {
 export async function loadPrincipalPolicy(
   storagePath: string
 ): Promise<PrincipalPolicy> {
-  const policyPath = join(storagePath, "principal-policy.yaml");
+  const policyPath = principalPolicyPath(storagePath);
 
   let content: string;
   try {
@@ -1121,13 +1255,12 @@ export async function loadPrincipalPolicy(
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code === "ENOENT") {
-      // Expected on first boot; generate default
-      const defaultYaml = generateDefaultPolicyYaml();
+      // Expected on first boot; generate default. `sanctuary init` calls the
+      // SAME writer (writeDefaultPrincipalPolicyFile) so a fresh fortress
+      // already carries the file `sanctuary doctor` checks for; this branch
+      // stays as the runtime self-heal for a fortress that predates it.
       try {
-        await writeFileCustody(policyPath, defaultYaml, {
-          mode: 0o600,
-          createParent: false,
-        });
+        await writeDefaultPrincipalPolicyFile(storagePath);
       } catch (writeErr) {
         // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
         console.warn(

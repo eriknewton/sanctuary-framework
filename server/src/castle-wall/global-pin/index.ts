@@ -7,6 +7,7 @@
  */
 
 export {
+  globalPinAuthenticates,
   writeGlobalPinIfUnestablished,
   type GlobalPinWriteOutcome,
   type WriteGlobalPinOptions,

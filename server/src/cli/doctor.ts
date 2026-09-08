@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 import { getSanctuaryVersion } from "../version.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import { isCustodyFsError, readFileCustody } from "../storage/custody-fs.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { detectCustodyFactorOrphan } from "../wrap/orphan-detection.js";
@@ -27,7 +28,11 @@ import {
   probePyYamlCandidates,
   type ParseParityOptions,
 } from "../wrap/hermes-yaml-parse-parity.js";
-import { parsePolicy } from "../principal-policy/loader.js";
+import {
+  parsePolicy,
+  principalPolicyPath,
+  PRINCIPAL_POLICY_FILENAME,
+} from "../principal-policy/loader.js";
 import { resolveStoragePath } from "../paths.js";
 import { checkNodeVersion } from "./node-version.js";
 import { verifyFortressAuditFullPicture } from "../operational/audit-store-split.js";
@@ -492,9 +497,22 @@ async function checkIdentity(
 }
 
 async function checkPolicy(storagePath: string): Promise<DoctorCheck> {
-  const policyPath = join(storagePath, "principal-policy.yaml");
+  // Must match the writers: `sanctuary init` (writeDefaultPrincipalPolicyFile)
+  // and the runtime first-boot self-heal both publish this exact path, so the
+  // name lives in one place rather than being re-spelled here.
+  const policyPath = principalPolicyPath(storagePath);
   try {
-    const content = await readFile(policyPath, "utf8");
+    // The SAME no-follow, regular-file-only read the custody paths use, not a
+    // bare readFile: a plain read follows a symlink at this path and reports
+    // OK for a policy the fortress does not own, so doctor would certify the
+    // exact planted-policy shape `sanctuary init` refuses. Must match the read
+    // in `loadPrincipalPolicy`, server/src/principal-policy/loader.ts, which is
+    // what the runtime actually freezes at startup; doctor may not be more
+    // permissive than the reader whose health it reports.
+    const content = await readFileCustody(policyPath, {
+      encoding: "utf-8",
+      verifyPathIdentity: true,
+    });
     parsePolicy(content);
     return ok("principal policy", `${policyPath} is present and parses`, "none");
   } catch (error) {
@@ -502,9 +520,21 @@ async function checkPolicy(storagePath: string): Promise<DoctorCheck> {
       ? (error as NodeJS.ErrnoException).code
       : undefined;
     if (code === "ENOENT") {
-      return fail("principal policy", `${policyPath} is missing`, "run sanctuary init or restore principal-policy.yaml");
+      return fail("principal policy", `${policyPath} is missing`, `run sanctuary init, or restore ${PRINCIPAL_POLICY_FILENAME}`);
     }
-    return fail("principal policy", "principal-policy.yaml is malformed", "fix the policy file syntax");
+    if (
+      isCustodyFsError(error) &&
+      (error.code === "symlink_rejected" ||
+        error.code === "not_regular_file" ||
+        error.code === "path_identity_changed")
+    ) {
+      return fail(
+        "principal policy",
+        `${policyPath} is not a regular file (it is a link or another entry type)`,
+        `move or delete ${policyPath}, then run sanctuary init to write the default ${PRINCIPAL_POLICY_FILENAME}`,
+      );
+    }
+    return fail("principal policy", `${PRINCIPAL_POLICY_FILENAME} is malformed`, "fix the policy file syntax");
   }
 }
 

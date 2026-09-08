@@ -17,7 +17,6 @@
 
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
 import type { Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
 import { loadConfig } from "../config.js";
@@ -93,7 +92,7 @@ import {
   type FederationRotateRootAuditEvent,
 } from "../mesh/federation-rotate-root.js";
 import { AuditLog } from "../operational/audit-log.js";
-import { parsePolicy } from "../principal-policy/loader.js";
+import { parsePolicy, principalPolicyPath } from "../principal-policy/loader.js";
 import {
   CustodyUnlockError,
   CustodyRotationInProgressError,
@@ -1598,7 +1597,7 @@ async function loadPolicyHashForPush(flags: AdminFlags): Promise<{
   policyHash: string;
 }> {
   const config = await loadConfig();
-  const policyPath = flags.policyPath ?? join(config.storage_path, "principal-policy.yaml");
+  const policyPath = flags.policyPath ?? principalPolicyPath(config.storage_path);
   let content: string;
   try {
     content = await readFileCustody(policyPath, {

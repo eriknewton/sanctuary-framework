@@ -24,7 +24,7 @@
  * as a distinct path, never a silent relaxation (F6/F13).
  */
 
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 
 import { FilesystemStorage } from "../storage/filesystem.js";
@@ -57,6 +57,8 @@ import {
 } from "../core/master-custody.js";
 import type { MasterWriteBarrierLease } from "../storage/cross-process-lock.js";
 import {
+  AGENT_GUIDED_RECOVERY_DIRNAME,
+  RECOVERY_OUT_ENV_VAR,
   discloseRecoveryKey,
   preflightRecoveryKeyOutputFile,
   verifyRecoveryKeyReentry,
@@ -129,14 +131,88 @@ function credentialFields(
   }
 }
 
+/**
+ * The staged recovery destination beside a fortress, never inside it.
+ *
+ * `storagePath` is normalized here as well as at every caller's own
+ * resolution point (`resolveFortressPath` in wrap/init.ts) because the whole
+ * containment property rests on `dirname`: for `/a/b/c/..` the lexical
+ * dirname is `/a/b/c`, which is INSIDE the `/a/b` fortress the key protects,
+ * while the normalized dirname is `/a`. A caller that hands this function an
+ * un-normalized path must not be able to relocate the plaintext recovery key
+ * into the fortress, so the normalization lives at both ends.
+ *
+ * Must agree with `resolveFortressPath` in server/src/wrap/init.ts about what
+ * normalization means (lexical `resolve`, deliberately not realpath: the
+ * fortress id is derived from the same string).
+ */
 export function agentGuidedRecoveryOutputPath(
   storagePath: string,
   fortressId: string = fortressIdFromStoragePath(storagePath),
 ): string {
   return join(
-    dirname(storagePath),
-    "Sanctuary Recovery",
+    // Must match AGENT_GUIDED_RECOVERY_DIRNAME in
+    // server/src/wrap/recovery-key-disclosure.ts: the preflight there decides
+    // whether it may tighten a destination's parent by comparing that exact
+    // basename, so a literal restated here would silently unlock the
+    // mode-change branch for a directory named the same by coincidence, or
+    // lock it out for the real staging directory.
+    dirname(resolve(storagePath)),
+    AGENT_GUIDED_RECOVERY_DIRNAME,
     `${fortressId}-recovery-key.txt`,
+  );
+}
+
+/**
+ * True when the default staging destination would land INSIDE the fortress it
+ * protects, which happens for exactly one shape: a fortress directory that is
+ * itself named `Sanctuary Recovery`, so `dirname(fortress)/Sanctuary Recovery`
+ * resolves back onto the fortress.
+ *
+ * This is a NAME COLLISION, not an operator error, and it is an availability
+ * defect rather than a containment one: the containment guard correctly
+ * refuses the destination, but the operator passed no `--recovery-out` and so
+ * reads a refusal about a path they never chose. Callers check this before
+ * minting any custody material and refuse with the remedy instead.
+ */
+export function agentGuidedRecoveryDefaultCollidesWithFortress(
+  storagePath: string,
+): boolean {
+  const fortress = resolve(storagePath);
+  return resolve(dirname(fortress), AGENT_GUIDED_RECOVERY_DIRNAME) === fortress;
+}
+
+/**
+ * The ONE remedy sentence for that collision, so `sanctuary init` and the
+ * wrap-first mint cannot tell the operator two different things about the
+ * same directory name. Both callers check
+ * `agentGuidedRecoveryDefaultCollidesWithFortress` before minting and refuse
+ * with this text; only the remedy clause differs, because `init` accepts
+ * `--recovery-out` and `protect` does not (parseWrapArgs rejects unknown
+ * flags), so a wrap-first mint must be sent through `init` rather than told
+ * to pass a flag it cannot pass.
+ *
+ * Must match the callers in `runInit` (server/src/wrap/init.ts) and
+ * `establishWrapCustody` below, which import this rather than re-spelling
+ * the sentence.
+ */
+export function agentGuidedRecoveryDefaultCollisionMessage(
+  storagePath: string,
+  caller: "init" | "wrap",
+): string {
+  const fortress = resolve(storagePath);
+  const remedy =
+    caller === "init"
+      ? `Re-run with --recovery-out <path> (or set ${RECOVERY_OUT_ENV_VAR}) naming a ` +
+        `destination outside ${fortress}, or choose a different --fortress directory name`
+      : `Run \`sanctuary init --fortress ${fortress} --recovery-out <path>\` first (or set ` +
+        `${RECOVERY_OUT_ENV_VAR} for init) naming a destination outside the fortress, then ` +
+        "protect; or choose a different --fortress directory name. protect itself accepts " +
+        "no --recovery-out flag";
+  return (
+    `the fortress directory is named "${basename(fortress)}", which is the same ` +
+    "name Sanctuary uses for its default recovery staging directory beside the fortress, so " +
+    `the default destination would land inside the fortress the key protects. ${remedy}`
   );
 }
 
@@ -256,6 +332,33 @@ export async function establishWrapCustody(
   opts: WrapCustodyOptions
 ): Promise<WrapCustodyResult> {
   const storage = new FilesystemStorage(join(opts.storagePath, "state"));
+  // Same pre-mint availability check `sanctuary init` runs, for the same
+  // reason: a fortress directory named `Sanctuary Recovery` makes the DEFAULT
+  // staging path resolve back inside the fortress, and the containment guard
+  // then refuses a destination the operator never chose. It runs BEFORE the
+  // write barrier and before `establishMaster`, so a colliding name leaves no
+  // passphrase envelope behind for a retry to trip over, and ONLY when this
+  // invocation would actually stage there: the same predicate the staging
+  // step below applies (staged-beside-fortress AND no recovery-key wrap yet).
+  // A fortress that already holds a recovery wrap (for example after the
+  // `init --recovery-out` route this sentence names) is not refused, or the
+  // sentence's own remedy would dead-end. The envelope read is read-only and
+  // fails closed on an unreadable envelope, like every other reader.
+  // Failure mode from the outside: a refusal that names a path appearing
+  // nowhere in the command the operator typed.
+  if (
+    (opts.agentGuided || !opts.interactive) &&
+    agentGuidedRecoveryDefaultCollidesWithFortress(opts.storagePath)
+  ) {
+    const existing = await readCustodyEnvelope(storage);
+    const hasRecoveryWrap =
+      existing !== null && existing.wraps.some((w) => w.type === "recovery-key");
+    if (!hasRecoveryWrap) {
+      throw new Error(
+        agentGuidedRecoveryDefaultCollisionMessage(opts.storagePath, "wrap"),
+      );
+    }
+  }
   // S2: acquire the shared master-rotation barrier BEFORE the custody write
   // lock, matching rotateMaster's (barrier -> custody-lock) order, and hand it
   // to establishMaster as `heldBarrier` so it never takes a SECOND barrier under
@@ -418,7 +521,8 @@ async function establishWrapCustodyLocked(
   if (!envelope.wraps.some((w) => w.type === "recovery-key")) {
     // ordinary noninteractive protect/wrap also stages recovery outside the
     // fortress so recovery bytes never appear in a headless agent transcript.
-    const agentRecoveryPath = (opts.agentGuided || !opts.interactive)
+    const stagesRecoveryBesideFortress = opts.agentGuided || !opts.interactive;
+    const agentRecoveryPath = stagesRecoveryBesideFortress
       ? agentGuidedRecoveryOutputPath(opts.storagePath, fortressId)
       : undefined;
     let disclosure: { filePath: string; fileWritten: boolean };

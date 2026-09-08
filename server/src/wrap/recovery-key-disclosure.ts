@@ -44,6 +44,19 @@ export const PASSPHRASE_BACKUP_FILENAME = "passphrase-backup.txt";
 export const RECOVERY_OUT_ENV_VAR = "SANCTUARY_RECOVERY_OUT";
 
 /**
+ * Basename of the ONE directory Sanctuary itself owns for staged recovery
+ * material: the parent of `agentGuidedRecoveryOutputPath`.
+ *
+ * Must match `agentGuidedRecoveryOutputPath` in
+ * server/src/wrap/custody-flow.ts, which builds the staging path from this
+ * constant. The name lives here because the preflight below is the only site
+ * that is allowed to CHANGE a directory's mode, and it may only do that to a
+ * directory Sanctuary created or to this one; an operator-chosen destination
+ * (a home directory, a Desktop) is inspected and refused, never rewritten.
+ */
+export const AGENT_GUIDED_RECOVERY_DIRNAME = "Sanctuary Recovery";
+
+/**
  * Confirmation policy:
  *   - "interactive": prompt at TTY; on non-TTY without bypass, throw.
  *   - "no-confirm": skip prompt entirely (CI / scripted callers).
@@ -79,6 +92,27 @@ interface SecretDisclosureCopy {
   promptLabel: string;
 }
 
+/**
+ * Body paragraph of the plaintext recovery-key file, as lines.
+ *
+ * ONE source, not a mirrored literal: `assertRecoveryResidueContent` in
+ * server/src/storage/fresh-fortress.ts must recognize this exact text before
+ * it will delete a crash-residue recovery file, so a body that changed on one
+ * side and not the other turns every interrupted init into an uncleanable
+ * fortress. It imports this constant rather than restating it.
+ *
+ * The destination is whatever the banner named: `sanctuary init` always writes
+ * this file OUTSIDE the fortress, so the body may not tell the operator to
+ * look in the fortress directory for it.
+ */
+export const RECOVERY_KEY_FILE_BODY_LINES = [
+  "This file was created when this recovery key was generated. Sanctuary will NOT",
+  "regenerate it on later runs and will NOT display the key again. After moving it",
+  "off this host (encrypted backup, password manager, paper safe), delete this",
+  "file. Never keep it inside the fortress directory it protects; the recovery key",
+  "bypasses the fortress passphrase by design.",
+] as const;
+
 const RECOVERY_KEY_COPY: SecretDisclosureCopy = {
   fileName: RECOVERY_KEY_FILENAME,
   bannerHeader: "SANCTUARY: First Run, Recovery Key Generated",
@@ -88,12 +122,7 @@ const RECOVERY_KEY_COPY: SecretDisclosureCopy = {
   fileWarningHeader:
     "SANCTUARY RECOVERY KEY, DO NOT COMMIT, DO NOT EMAIL, MOVE OFF-HOST IMMEDIATELY.",
   fileSecretLabel: "Recovery key:",
-  fileBody:
-    "This file was created on first init. Sanctuary will NOT regenerate this file on\n" +
-    "subsequent runs and will NOT display the key again. After moving this file off\n" +
-    "the host (encrypted backup, password manager, paper safe), delete it from the\n" +
-    "fortress directory. Do NOT keep it in the fortress; the recovery key bypasses\n" +
-    "the fortress passphrase by design.\n",
+  fileBody: `${RECOVERY_KEY_FILE_BODY_LINES.join("\n")}\n`,
   promptLabel: "recovery key",
 };
 
@@ -126,8 +155,8 @@ export class RecoveryKeyConfirmationDeclinedError extends Error {
   constructor() {
     super(
       "Recovery key confirmation declined. " +
-        "Save the recovery key (printed above and written to recovery-key.txt) " +
-        "before re-running init."
+        "Save the recovery key (printed above, and written to the file the banner " +
+        "names) before re-running init."
     );
     this.name = "RecoveryKeyConfirmationDeclinedError";
   }
@@ -335,10 +364,172 @@ export async function preflightRecoveryKeyOutputFile(
     }
     // File does not exist, ensure the parent can be created and written.
   }
-  const parent = dirname(filePath);
-  await mkdir(parent, { recursive: true, mode: 0o700 });
+  const parent = await prepareRecoveryOutputParent(filePath);
   await assertNoRecoveryOutputStages(filePath);
   await access(parent, constants.W_OK);
+}
+
+/**
+ * Create (if needed) and validate the directory a recovery key is about to be
+ * written into, and return it.
+ *
+ * ONE site decides whether the parent's mode may be CHANGED, because the
+ * preflight and the authoritative write both have to reach the same answer:
+ * a rule applied on one of the two is a rule an operator can route around.
+ * The decision is made BEFORE `mkdir`, since afterwards a directory Sanctuary
+ * minted one line ago and one the operator has kept for years look identical.
+ */
+async function prepareRecoveryOutputParent(filePath: string): Promise<string> {
+  const parent = dirname(filePath);
+  let parentExisted = true;
+  try {
+    await lstat(parent);
+  } catch (err) {
+    if (!isMissingPathError(err)) throw err;
+    parentExisted = false;
+  }
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  await assertRecoveryOutputParentSafe(parent, {
+    // Sanctuary owns exactly two kinds of parent: one it just created, and its
+    // own staging directory. Everything else belongs to the operator and is
+    // inspected, never rewritten.
+    mayTighten:
+      !parentExisted || basename(parent) === AGENT_GUIDED_RECOVERY_DIRNAME,
+  });
+  return parent;
+}
+
+/**
+ * The directory a plaintext recovery key is about to be written into must be
+ * a real directory, owned by this process, and readable by nobody else.
+ *
+ * `mkdir(..., { recursive: true, mode: 0o700 })` guarantees none of that for a
+ * directory that ALREADY exists: `mode` applies only to directories the call
+ * creates, and `recursive: true` succeeds silently on an existing path,
+ * including a symlink to somewhere else entirely. So a pre-existing
+ * world-readable `Sanctuary Recovery/` (or one an attacker pre-created as a
+ * link) was accepted as-is, and the 0600 file inside it sat under a directory
+ * anyone could traverse.
+ *
+ * Rules, in the order they are applied:
+ *   - a symlink or non-directory parent is REFUSED; there is no safe way to
+ *     tighten one, and following it is how the key leaves its intended tree;
+ *   - a parent owned by another uid is REFUSED (this covers the classic
+ *     world-writable shared directory, e.g. `--recovery-out /tmp/key.txt`);
+ *   - a parent that is group- or other-WRITABLE is REFUSED: another principal
+ *     who can write the directory can replace the file after it lands;
+ *   - a parent SANCTUARY OWNS (one this preflight just created, or the staging
+ *     directory named by AGENT_GUIDED_RECOVERY_DIRNAME) that is group- or
+ *     world-accessible is TIGHTENED to 0700 and re-checked.
+ *
+ * `mayTighten` is the whole point of the split, and it is a security property,
+ * not a convenience: `--recovery-out ~/recovery-key.txt` makes the operator's
+ * HOME the parent, and an earlier revision chmod'ed any owned parent with
+ * group/other bits to 0700, so one flag silently relocked the operator's home
+ * or Desktop with no rollback. A directory the operator chose is inspected and
+ * refused when it is unsafe; only a directory Sanctuary itself minted is ours
+ * to rewrite. A conventional 0755 home is accepted as-is: the key file is 0600
+ * and a traversable-but-unwritable parent does not expose it.
+ *
+ * Mirrors the identity discipline `recoveryOutputParentIdentity` applies on
+ * the rotation reconciliation path: same question, asked before the write
+ * rather than after a crash.
+ *
+ * Failure mode from the outside: none of this is visible in a directory
+ * listing after the fact, because the file itself is 0600 either way. The
+ * exposure is the directory, and it looks completely normal.
+ */
+async function assertRecoveryOutputParentSafe(
+  parent: string,
+  opts: { mayTighten: boolean },
+): Promise<void> {
+  // Every check AND the mode change run against ONE directory descriptor, not
+  // against the path: `lstat` then `chmod` is two lookups, and an attacker who
+  // swaps the last component between them redirects the chmod onto a directory
+  // of their choosing. O_NOFOLLOW | O_DIRECTORY refuses a symlinked or
+  // non-directory last component at open time; fstat/fchmod on the resulting
+  // fd cannot be redirected afterwards. Must match the no-follow directory
+  // open in `openExistingDirectoryNoFollow`, server/src/storage/custody-fs.ts.
+  const handle = await openRecoveryOutputParentNoFollow(parent);
+  try {
+    const before = await handle.stat();
+    if (!before.isDirectory()) {
+      throw new Error(
+        `Recovery key output parent is not a stable directory: ${parent}`,
+      );
+    }
+    const uid = process.getuid?.();
+    if (uid !== undefined && before.uid !== uid) {
+      throw new Error(
+        `Recovery key output parent ${parent} is owned by uid ${before.uid}, not by this ` +
+          `process (uid ${uid}); refusing to write a plaintext recovery key into a directory ` +
+          "this account does not control. Choose a --recovery-out path under a directory you own.",
+      );
+    }
+    // 0o077 = every group and other permission bit; 0o022 = the group-write and
+    // other-write bits inside it. Anything in 0o077 means a principal other
+    // than the owner can reach the directory; anything in 0o022 means they can
+    // replace what is in it.
+    if ((before.mode & 0o077) === 0) return;
+    if (!opts.mayTighten) {
+      if ((before.mode & 0o022) !== 0) {
+        throw new Error(
+          `Recovery key output parent ${parent} is writable by group or other ` +
+            `(mode ${(before.mode & 0o777).toString(8)}); refusing to write a plaintext recovery ` +
+            "key into a directory another account can replace files in. Sanctuary does not change " +
+            "the permissions of a directory you chose: either chmod it to 0700 yourself, or pass " +
+            "a --recovery-out path under a directory only you can write.",
+        );
+      }
+      // A group/other-READABLE parent the operator chose (the conventional
+      // 0755 home) is accepted with its mode untouched. Tightening it here is
+      // the regression this branch exists to prevent.
+      return;
+    }
+    await handle.chmod(0o700);
+    const after = await handle.stat();
+    if (
+      !after.isDirectory() ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      (after.mode & 0o077) !== 0
+    ) {
+      throw new Error(
+        `Recovery key output parent ${parent} could not be tightened to owner-only (0700); ` +
+          "refusing to write a plaintext recovery key into a directory other accounts can read.",
+      );
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Open `parent` as a directory descriptor that cannot be a symlink.
+ *
+ * ELOOP (a symlinked last component) and ENOTDIR (a file where a directory was
+ * expected) are the same answer to the caller: this is not a stable directory
+ * to write a plaintext recovery key into, so they are translated rather than
+ * surfaced as raw errno text.
+ */
+async function openRecoveryOutputParentNoFollow(
+  parent: string,
+): Promise<Awaited<ReturnType<typeof open>>> {
+  try {
+    return await open(
+      parent,
+      constants.O_RDONLY |
+        (typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0) |
+        (typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0),
+    );
+  } catch (err) {
+    if (isErrnoCode(err, "ELOOP") || isErrnoCode(err, "ENOTDIR")) {
+      throw new Error(
+        `Recovery key output parent is not a stable directory: ${parent}`,
+      );
+    }
+    throw err;
+  }
 }
 
 async function assertNoRecoveryOutputStages(filePath: string): Promise<void> {
@@ -407,8 +598,11 @@ async function writeCustomRecoveryOutputFile(
   faultAfter?: (stage: CustomRecoveryOutputStage) => void | Promise<void>,
   failIfExists = true,
 ): Promise<boolean> {
-  const parent = dirname(filePath);
-  await mkdir(parent, { recursive: true, mode: 0o700 });
+  // Re-checked here and not only in the preflight: the write is the
+  // authoritative step, and a caller may reach it without a preflight. Same
+  // helper, so the may-we-change-this-directory's-mode answer cannot differ
+  // between the two.
+  const parent = await prepareRecoveryOutputParent(filePath);
   await assertNoRecoveryOutputStages(filePath);
   const stagePath = join(
     parent,
@@ -496,6 +690,15 @@ export async function verifyRecoveryKeyReentry(opts: {
   check: (entered: string) => Promise<boolean>;
   io?: DisclosureIo;
   attempts?: number;
+  /**
+   * What this success line is allowed to claim. It fires the moment the
+   * re-entered key unwraps the master, which can be well before the calling
+   * command has finished its remaining steps, so a caller with work left
+   * supplies wording that describes only what was verified at that moment.
+   * Default: the bare statement, for callers where verification IS the last
+   * trust-bearing step.
+   */
+  verifiedMessage?: string;
 }): Promise<void> {
   const input = opts.io?.input ?? process.stdin;
   const output = opts.io?.output ?? process.stderr;
@@ -520,7 +723,9 @@ export async function verifyRecoveryKeyReentry(opts: {
         break;
       }
       if (await opts.check(answer)) {
-        output.write("Recovery key verified.\n");
+        output.write(
+          `${opts.verifiedMessage ?? "Recovery key verified."}\n`,
+        );
         return;
       }
       output.write(
@@ -579,9 +784,14 @@ function printSecretBanner(
   destination: "storage" | "custom" = "storage",
   fileWritten = true
 ): void {
+  // Save first, delete second, always in that order and always about a file
+  // that already exists at this point: the banner is printed after the write.
+  // Failure mode this ordering exists for: an operator who reads "delete" and
+  // acts on it before the copy is safely off-host destroys the only thing
+  // that can recover the fortress.
   const deleteLine =
     destination === "custom"
-      ? "and keep it outside the fortress directory."
+      ? "then delete this file. Never move it into the fortress directory."
       : "then delete the file from the fortress directory.";
   const lines = fileWritten
     ? [
@@ -1136,6 +1346,20 @@ interface DiscloseSecretInternalOptions {
   now?: () => Date;
   /** Test seam: stdin/stdout streams. */
   io?: DisclosureIo;
+  /**
+   * Invoked immediately BEFORE the banner is written, never after.
+   *
+   * The banner is the moment the operator is told the secret and the path it
+   * was written to; from that instant the file is theirs and no later failure
+   * may delete it. Callers that own rollback (init) flip their announced bit
+   * here, inside the helper, because the alternative -- flipping it after the
+   * disclosure call returns -- leaves a window in which the banner has
+   * printed, the caller's post-call custody fence throws, and rollback then
+   * unlinks the only plaintext copy of a key the operator was just told to
+   * save. Before, not after, so even a partially written banner counts as
+   * announced.
+   */
+  onBeforeBannerPrint?: () => void;
 }
 
 interface DiscloseSecretInternalResult {
@@ -1189,6 +1413,8 @@ async function discloseSecret(
     fileResult = await writeSecretFile(writeOpts);
   }
 
+  // Announced-from-here: see DiscloseSecretInternalOptions.onBeforeBannerPrint.
+  opts.onBeforeBannerPrint?.();
   printSecretBanner(
     opts.secret,
     opts.operatorFilePath ?? fileResult.filePath,
@@ -1217,7 +1443,13 @@ async function discloseSecret(
 export interface DiscloseRecoveryKeyOptions {
   /** Full base64url-encoded recovery key (do NOT pre-truncate). */
   recoveryKey: string;
-  /** Resolved fortress storage path; recovery-key.txt lands here. */
+  /**
+   * Resolved fortress storage path. It is the containment reference, not the
+   * destination: every output path is refused unless it resolves outside this
+   * directory. `sanctuary init` always supplies recoveryKeyFilePath, so the
+   * plaintext key never lands here; only callers that pass no explicit path
+   * fall back to a file inside the fortress.
+   */
   storagePath: string;
   /** Optional exact plaintext recovery-key path; must be outside storagePath. */
   recoveryKeyFilePath?: string;
@@ -1233,6 +1465,13 @@ export interface DiscloseRecoveryKeyOptions {
   now?: () => Date;
   /** Test seam: stdin/stdout streams. */
   io?: DisclosureIo;
+  /**
+   * Invoked immediately before the recovery-key banner prints. See
+   * DiscloseSecretInternalOptions.onBeforeBannerPrint: `sanctuary init` uses
+   * it to mark the recovery file as announced at the exact instant the
+   * operator learns about it, so rollback can never delete an announced file.
+   */
+  onBeforeBannerPrint?: () => void;
 }
 
 export interface DiscloseRecoveryKeyResult {
@@ -1294,6 +1533,9 @@ export async function discloseRecoveryKey(
   if (opts.mode !== undefined) internalOpts.mode = opts.mode;
   if (opts.now !== undefined) internalOpts.now = opts.now;
   if (opts.io !== undefined) internalOpts.io = opts.io;
+  if (opts.onBeforeBannerPrint !== undefined) {
+    internalOpts.onBeforeBannerPrint = opts.onBeforeBannerPrint;
+  }
 
   return discloseSecret(
     internalOpts,

@@ -74,6 +74,10 @@ function observed(overrides: Partial<InstallProbeResult> = {}): InstallProbeResu
     custodyAccess: "usable",
     custodyMutation: "available",
     recoveryFactor: "present",
+    // The staged recovery file this install wrote. Default "present" so the
+    // custody instruction under test is the move-and-delete branch; the
+    // absent/unknown branches are covered in install-custody-observations.
+    stagedRecoveryFile: "present",
     nodePath: "/opt/homebrew/bin/node",
     castleWallApp: "not-applicable",
     castleWallBuildSha: "a61a7322ca80",
@@ -1139,5 +1143,43 @@ describe("sanctuary install agent contract", () => {
       status: "complete",
       fortress: "/tmp/fortress",
     });
+  });
+
+  it("reports the staged-recovery observation that selected the custody action", async () => {
+    // The plan carried the CHOSEN operator_actions text but not the
+    // observation that chose it, so a --json consumer could not tell an
+    // observed-absent staged file from one that could not be read at all.
+    for (const staged of ["present", "absent", "unknown"] as const) {
+      const out = new Capture();
+      const probe: AgentInstallOps["probe"] = async () =>
+        observed({ cooperativeWrap: "present", stagedRecoveryFile: staged });
+      const code = await runInstallCommand({
+        argv: ["--profile", "memory", "--harness", "hermes", "--json"],
+        out,
+        err: new Capture(),
+        env: { SANCTUARY_STORAGE_PATH: "/tmp/fortress" },
+        platform: "darwin",
+        ops: { probe },
+      });
+
+      expect(code).toBe(0);
+      const plan = JSON.parse(out.text()) as {
+        observations: Record<string, unknown>;
+        operator_actions: { id: string; description: string }[];
+      };
+      expect(plan.observations.staged_recovery_file).toBe(staged);
+      // And it really is the observation the action was selected from.
+      const action = plan.operator_actions.find(
+        (candidate) => candidate.id === "private_recovery_custody",
+      );
+      expect(action).toBeDefined();
+      if (staged === "absent") {
+        expect(action!.description).toContain("staged no recovery file");
+      } else if (staged === "unknown") {
+        expect(action!.description).toContain("could not be observed");
+      } else {
+        expect(action!.description).toContain("move the staged recovery file at");
+      }
+    }
   });
 });

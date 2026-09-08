@@ -142,7 +142,7 @@ describe("Recovery key disclosure (Finding U)", () => {
       );
       expect(content).toContain("Fortress: fortress-test-001");
       expect(content).toContain(
-        "Sanctuary will NOT regenerate this file"
+        "Never keep it inside the fortress directory it protects"
       );
 
       const st = await stat(result.filePath);
@@ -416,11 +416,14 @@ describe("Recovery key disclosure (Finding U)", () => {
           "Recovery key:\n" +
           `${FIXTURE_KEY}\n` +
           "\n" +
-          "This file was created on first init. Sanctuary will NOT regenerate this file on\n" +
-          "subsequent runs and will NOT display the key again. After moving this file off\n" +
-          "the host (encrypted backup, password manager, paper safe), delete it from the\n" +
-          "fortress directory. Do NOT keep it in the fortress; the recovery key bypasses\n" +
-          "the fortress passphrase by design.\n"
+          // The body may not send the operator to the fortress directory to
+          // find this file: `sanctuary init` always writes it outside the
+          // fortress, and the in-fortress default is retired.
+          "This file was created when this recovery key was generated. Sanctuary will NOT\n" +
+          "regenerate it on later runs and will NOT display the key again. After moving it\n" +
+          "off this host (encrypted backup, password manager, paper safe), delete this\n" +
+          "file. Never keep it inside the fortress directory it protects; the recovery key\n" +
+          "bypasses the fortress passphrase by design.\n"
       );
     });
 

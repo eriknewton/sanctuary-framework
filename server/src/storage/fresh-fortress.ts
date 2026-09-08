@@ -3,6 +3,12 @@ import { lstat, open, readdir, rm, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { isBenignDirectoryFsyncError } from "./directory-fsync.js";
 import { classifyCustodyLockScaffold } from "./custody-lock-scaffold.js";
+// One source for the recovery-file body text. This module deletes a crash
+// residue only after recognizing the file byte-for-byte, so a hand-mirrored
+// copy of that paragraph here would make any wording change leave every
+// interrupted init uncleanable. recovery-key-disclosure.ts imports nothing but
+// node builtins, so this direction adds no cycle.
+import { RECOVERY_KEY_FILE_BODY_LINES } from "../wrap/recovery-key-disclosure.js";
 
 /**
  * The single filesystem definition of a fresh fortress after a kernel custody
@@ -108,6 +114,22 @@ export function isRecoveryKeyStageFileName(name: string): boolean {
     /^\d+-[a-f0-9]{24}$/u.test(name.slice(RECOVERY_STAGE_PREFIX.length));
 }
 
+/**
+ * The recovery-file body Sanctuary wrote before the destination moved outside
+ * the fortress. Retained for residue recognition ONLY: nothing writes it any
+ * more, and it must never be re-adopted (it tells the operator to look for the
+ * file in the fortress directory, which is exactly what was fixed). Never
+ * delete an entry from this list; a residue written under that release can
+ * still be sitting on a real fortress.
+ */
+const RETIRED_RECOVERY_KEY_FILE_BODY_LINES_V1 = [
+  "This file was created on first init. Sanctuary will NOT regenerate this file on",
+  "subsequent runs and will NOT display the key again. After moving this file off",
+  "the host (encrypted backup, password manager, paper safe), delete it from the",
+  "fortress directory. Do NOT keep it in the fortress; the recovery key bypasses",
+  "the fortress passphrase by design.",
+] as const;
+
 function assertRecoveryResidueContent(raw: Buffer): void {
   const text = raw.toString("utf8");
   const lines = text.split("\n");
@@ -119,14 +141,20 @@ function assertRecoveryResidueContent(raw: Buffer): void {
   const label = lines[cursor++];
   const key = lines[cursor++];
   const blankAfterKey = lines[cursor++];
-  const expectedTail = [
-    "This file was created on first init. Sanctuary will NOT regenerate this file on",
-    "subsequent runs and will NOT display the key again. After moving this file off",
-    "the host (encrypted backup, password manager, paper safe), delete it from the",
-    "fortress directory. Do NOT keep it in the fortress; the recovery key bypasses",
-    "the fortress passphrase by design.",
-    "",
-  ];
+  // Trailing "" is the file's final newline, not a body line.
+  //
+  // Every body text Sanctuary has ever written is accepted, not just the
+  // current one. This function is what authorizes DELETING a crash residue,
+  // and it deletes only a file it recognizes completely. A fortress
+  // interrupted under an older release carries that release's paragraph, so
+  // recognizing only the newest wording would leave those residues
+  // permanently uncleanable and every retry refusing a non-empty fortress.
+  // Retired bodies are therefore appended here and never removed; the current
+  // one is imported so it cannot drift.
+  const acceptedTails = [
+    [...RECOVERY_KEY_FILE_BODY_LINES, ""],
+    [...RETIRED_RECOVERY_KEY_FILE_BODY_LINES_V1, ""],
+  ].map((tail) => JSON.stringify(tail));
   if (
     header !== "SANCTUARY RECOVERY KEY, DO NOT COMMIT, DO NOT EMAIL, MOVE OFF-HOST IMMEDIATELY." ||
     !/^Generated: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(generated ?? "") ||
@@ -136,7 +164,7 @@ function assertRecoveryResidueContent(raw: Buffer): void {
     Buffer.from(key!, "base64url").length !== 32 ||
     Buffer.from(key!, "base64url").toString("base64url") !== key ||
     blankAfterKey !== "" ||
-    JSON.stringify(lines.slice(cursor)) !== JSON.stringify(expectedTail)
+    !acceptedTails.includes(JSON.stringify(lines.slice(cursor)))
   ) {
     throw new Error("recovery-key.txt crash residue has unexpected content");
   }

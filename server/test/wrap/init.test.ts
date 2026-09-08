@@ -9,8 +9,10 @@
  *     env var, and SANCTUARY_STORAGE_PATH env var in the documented
  *     precedence order.
  *   - runInit creates the fortress directory at the resolved path,
- *     persists the recovery-key hash, and writes recovery-key.txt with
- *     the full plaintext key.
+ *     persists the recovery-key hash, and writes the full plaintext key to a
+ *     destination OUTSIDE the fortress (an explicit --recovery-out, or the
+ *     staged path beside the fortress); it is never
+ *     `<fortress>/recovery-key.txt`.
  *   - runInit refuses to overwrite a non-empty directory unless --force.
  *   - parseInitArgs round-trips every flag.
  */
@@ -318,8 +320,11 @@ describe("runInit", () => {
 
     const recoveryFile = await readFile(result.recoveryKeyDisclosurePath, "utf-8");
     const recoveryKey = extractRecoveryKey(recoveryFile);
+    // The DEFAULT destination is outside the fortress (packet B outcome 1):
+    // the recovery key unlocks everything the fortress holds, so it never
+    // defaults into the directory it protects.
     expect(result.recoveryKeyDisclosurePath).toBe(
-      join(fortressPath, RECOVERY_KEY_FILENAME),
+      agentGuidedRecoveryOutputPath(fortressPath),
     );
     expect(keychain.stored.get(`sanctuary:${service}`)).toBe(recoveryKey);
 
@@ -1864,12 +1869,18 @@ describe("--no-identity (default operator-identity seed)", () => {
     expect(pinCalls).toBe(0);
   });
 
-  it("the seed-failure remediation message is honest: identity create OR --force, never the broken 'Re-run init'", async () => {
-    // Finding 2 (2026-06-25): the old message said "Re-run init", but a plain
-    // `init` re-run REFUSES the now-non-empty fortress and `--force` mints a NEW
-    // master that orphans the recovery key just shown. The corrected message
-    // must point at the two remediations that actually work and must NOT print
-    // the broken literal.
+  it("the seed-failure message states one truth: on the rolled-back path it claims no surviving custody", async () => {
+    // Finding 2 (2026-06-25) removed the broken "Re-run init" and replaced it
+    // with `identity create` OR `--force`. Both of those describe a fortress
+    // whose custody survived, and on a NON-force run it does not: this throw
+    // is rolled back, so the envelope, the policy and the identity store are
+    // all removed before the process exits. Printing the custody-intact
+    // remediations here and then having printInitCleanupSummary say the
+    // fortress was cleaned out is two contradictory next steps from one run.
+    // The rolled-back path therefore prints the cause only, and the cleanup
+    // summary is the single voice on what survives and what to do next. The
+    // --force branch, where the remediations really do apply, is pinned in
+    // test/wrap/init-recovery-doctor.test.ts.
     const fortressPath = join(tmp, "honest-message-fortress");
     const { IdentityManager } = await import("../../src/cognitive/tools.js");
     const saveNewSpy = vi
@@ -1893,17 +1904,20 @@ describe("--no-identity (default operator-identity seed)", () => {
       consoleSpy.mockRestore();
       saveNewSpy.mockRestore();
     }
-    // The accurate remediations, both naming the existing fortress path.
+    // The cause is stated.
     expect(consoleOutput).toContain(
+      "failed to seed the default operator identity",
+    );
+    // No remediation that assumes surviving custody, because there is none.
+    expect(consoleOutput).not.toContain(
       `sanctuary identity create --fortress ${fortressPath}`,
     );
-    expect(consoleOutput).toContain(
-      `sanctuary init --force --fortress ${fortressPath}`,
-    );
-    // It tells the operator custody is intact and warns --force discards the key.
-    expect(consoleOutput).toContain("recovery key shown above");
-    // The broken instruction is GONE.
+    expect(consoleOutput).not.toContain("custody is intact");
+    // The broken instruction is still GONE.
     expect(consoleOutput).not.toMatch(/Re-run init/);
+    // And the one voice that does name a next step agrees with the disk.
+    expect(consoleOutput).toContain("Cleaned up:");
+    expect(consoleOutput).toContain("Next step:");
   });
 
   it("resolveNoIdentity uses an allowlist for the env var, not 'anything truthy'", () => {

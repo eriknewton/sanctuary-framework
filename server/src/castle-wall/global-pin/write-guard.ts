@@ -64,6 +64,25 @@ function errnoCode(error: unknown): string | undefined {
 }
 
 /**
+ * The ONE definition of "this global pin authenticates that Castle key".
+ *
+ * Public keys: a straightforward byte compare is correct and no timing safety
+ * is needed. It lives here, and is called from the decision below, so every
+ * reader of the anchor agrees with the writer about what agreement means. The
+ * second caller is `resolvePreExistingGlobalPinDisposition` in
+ * `wrap/init.ts`, which may only adopt a pre-existing anchor on the same
+ * byte agreement that would have made this guard return "idempotent"; a
+ * looser or hand-rolled comparison there would let init treat a differing
+ * anchor as compatible.
+ */
+export function globalPinAuthenticates(
+  existing: Uint8Array,
+  publicKey: Uint8Array,
+): boolean {
+  return Buffer.from(existing).equals(Buffer.from(publicKey));
+}
+
+/**
  * Enforce the global-pin immutability invariant, then perform the caller's
  * fresh write only if no pin is established. See {@link WriteGlobalPinOptions}.
  *
@@ -102,9 +121,8 @@ export async function writeGlobalPinIfUnestablished(
   }
 
   if (existing !== undefined) {
-    // Public key: a straightforward byte compare is correct; no timing safety
-    // is needed.
-    if (existing.equals(Buffer.from(publicKey))) {
+    // Single definition of agreement, shared with init's adopt decision.
+    if (globalPinAuthenticates(existing, publicKey)) {
       return "idempotent";
     }
     onRefuse?.();

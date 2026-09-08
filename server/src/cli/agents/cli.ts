@@ -24,9 +24,11 @@
  * alias — see server/src/cli.ts.
  */
 
-import { readFile } from "node:fs/promises";
-import { writeFileCustody } from "../../storage/custody-fs.js";
-import { join } from "node:path";
+import {
+  isCustodyFsError,
+  readFileCustody,
+  writeFileCustody,
+} from "../../storage/custody-fs.js";
 
 import { resolveStoragePath } from "../../paths.js";
 import {
@@ -38,6 +40,7 @@ import { probeTenantDashboard, type HealthProbeResult } from "./health.js";
 import {
   assertNoPrincipalPolicyDowngrade,
   parsePolicy,
+  principalPolicyPath,
   PrincipalPolicyDowngradeError,
 } from "../../principal-policy/loader.js";
 import type { PrincipalPolicy } from "../../principal-policy/types.js";
@@ -420,9 +423,18 @@ interface ApprovalRedirectState {
 async function readApprovalRedirectState(
   tenant: TenantDescriptor,
 ): Promise<ApprovalRedirectState> {
-  const policyPath = join(tenant.storage_path, "principal-policy.yaml");
+  const policyPath = principalPolicyPath(tenant.storage_path);
   try {
-    const content = await readFile(policyPath, "utf-8");
+    // The SAME no-follow, regular-file-only read `sanctuary doctor`, the
+    // federation policy flag and `loadPrincipalPolicy` use, not a bare
+    // readFile: a plain read follows a symlink at this path and would render
+    // the approval-redirect state of a policy this fortress does not own,
+    // while init refuses that exact planted shape. Must match `checkPolicy`
+    // in server/src/cli/doctor.ts.
+    const content = await readFileCustody(policyPath, {
+      encoding: "utf-8",
+      verifyPathIdentity: true,
+    });
     const parsed = parsePolicy(content);
     const cfg = parsed.approval_redirect;
     if (!cfg) return { enabled: false, mode: "replace" };
@@ -558,7 +570,7 @@ async function writeApprovalRedirectToPolicyFile(params: {
   audit: () => Promise<void>;
 }): Promise<void> {
   const { storagePath, previousPolicyText, previousPolicy, state, audit } = params;
-  const policyPath = join(storagePath, "principal-policy.yaml");
+  const policyPath = principalPolicyPath(storagePath);
   const block = renderApprovalRedirectBlock(state);
   const updated = upsertApprovalRedirectBlock(previousPolicyText, block);
   const nextPolicy = parsePolicy(updated);
@@ -591,10 +603,32 @@ async function writeApprovalRedirectToPolicyFile(params: {
 }
 
 async function readPolicyTextForMutation(storagePath: string): Promise<string> {
-  const policyPath = join(storagePath, "principal-policy.yaml");
+  const policyPath = principalPolicyPath(storagePath);
   try {
-    return await readFile(policyPath, "utf-8");
+    // Same no-follow read as every other principal-policy reader. The text
+    // read here is the base the rewrite below is built on, so following a
+    // link would import a foreign policy's tiers into this fortress's file.
+    // Must match `checkPolicy` in server/src/cli/doctor.ts.
+    return await readFileCustody(policyPath, {
+      encoding: "utf-8",
+      verifyPathIdentity: true,
+    });
   } catch (err) {
+    if (
+      isCustodyFsError(err) &&
+      (err.code === "symlink_rejected" ||
+        err.code === "not_regular_file" ||
+        err.code === "path_identity_changed")
+    ) {
+      // Never fall back to the bootstrap default here: that would rewrite the
+      // path a link occupies and hand the planted policy this fortress's
+      // approval tiers. Refuse and name the remedy doctor names.
+      throw new Error(
+        `principal policy update refused: ${policyPath} is not a regular file ` +
+          "(it is a link or another entry type); move or delete it, then re-run",
+        { cause: err },
+      );
+    }
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code !== "ENOENT") throw err;
     // Generate a minimal default shape so this command works on a tenant

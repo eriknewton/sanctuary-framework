@@ -13,12 +13,16 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdir, mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, rename, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readable, Writable } from "node:stream";
 
-import { agentGuidedRecoveryOutputPath, establishWrapCustody } from "../../src/wrap/custody-flow.js";
+import {
+  agentGuidedRecoveryDefaultCollisionMessage,
+  agentGuidedRecoveryOutputPath,
+  establishWrapCustody,
+} from "../../src/wrap/custody-flow.js";
 import {
   establishMaster,
   readCustodyEnvelope,
@@ -356,6 +360,63 @@ describe("establishWrapCustody", () => {
         interactive: false,
       })
     ).rejects.toThrow(/does not unlock/);
+  });
+
+  it("refuses a fortress named like the staging directory before minting and names the init route", async () => {
+    // `dirname(fortress)/Sanctuary Recovery` resolves back onto a fortress that
+    // IS named `Sanctuary Recovery`. `sanctuary init` checks this before
+    // minting and names --recovery-out; the wrap-first mint did not, so it
+    // staged at the colliding default and died in the containment check for a
+    // path the operator never chose. protect accepts no --recovery-out flag,
+    // so the wrap sentence must route through init, and the check must run
+    // before the mint so no passphrase envelope is left for a retry.
+    const colliding = join(parent, "Sanctuary Recovery");
+    await expect(
+      establishWrapCustody({
+        storagePath: colliding,
+        passphrase: "wrap-passphrase",
+        interactive: false,
+      }),
+    ).rejects.toThrow(/sanctuary init --fortress .* --recovery-out/);
+    // One sentence for both callers, wrap variant.
+    await expect(
+      establishWrapCustody({
+        storagePath: colliding,
+        passphrase: "wrap-passphrase",
+        interactive: false,
+      }),
+    ).rejects.toThrow(agentGuidedRecoveryDefaultCollisionMessage(colliding, "wrap"));
+    // The wrap variant never tells protect's operator to pass a flag protect rejects.
+    expect(agentGuidedRecoveryDefaultCollisionMessage(colliding, "wrap")).not.toMatch(/Re-run with --recovery-out/);
+    // Nothing was minted before the refusal.
+    await expect(lstat(join(colliding, "state"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not refuse the colliding name once the fortress already holds a recovery wrap", async () => {
+    // The wrap sentence routes the operator through `init --recovery-out`, after
+    // which the envelope carries a recovery-key wrap and protect stages nothing.
+    // The refusal must therefore track the staging predicate (no recovery wrap
+    // yet), not the directory name alone, or the sentence's own remedy would
+    // dead-end on the next protect. Modelled by minting under a safe name and
+    // renaming the directory to the colliding one.
+    // Nested one level down so the first mint's own staging directory
+    // (`<dirname>/Sanctuary Recovery`) does not occupy the colliding name.
+    const safe = join(parent, "a", "fortress-a");
+    await mkdir(join(parent, "a"), { recursive: true });
+    const first = await establishWrapCustody({
+      storagePath: safe,
+      passphrase: "wrap-passphrase",
+      interactive: false,
+    });
+    expect(first.mintedRecoveryKey).toBe(true);
+    const colliding = join(parent, "Sanctuary Recovery");
+    await rename(safe, colliding);
+    const again = await establishWrapCustody({
+      storagePath: colliding,
+      passphrase: "wrap-passphrase",
+      interactive: false,
+    });
+    expect(again.mintedRecoveryKey).toBe(false);
   });
 });
 
