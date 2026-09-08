@@ -526,6 +526,7 @@ async function openRecoveryOutputParentNoFollow(
     if (isErrnoCode(err, "ELOOP") || isErrnoCode(err, "ENOTDIR")) {
       throw new Error(
         `Recovery key output parent is not a stable directory: ${parent}`,
+        { cause: err },
       );
     }
     throw err;

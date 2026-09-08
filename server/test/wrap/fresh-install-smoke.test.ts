@@ -1,3 +1,4 @@
+// fail-before-exempt: the castle-wall mock became a partial (importOriginal) mock so init.ts, which now imports the pin path and the host observers from that module, still loads; no new behaviour is asserted here, the init behaviour tests live in init-recovery-doctor.test.ts
 import {
   afterEach,
   beforeEach,

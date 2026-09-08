@@ -1,3 +1,4 @@
+// fail-before-exempt: combined-tree seam only: the probe literal gained the stagedRecoveryFile field and the castle-wall mock became a partial (importOriginal) mock so init.ts loads; the behaviour this file proves shipped in #1391 and is unchanged by this PR
 /**
  * Rung 1 primary journey: `init` -> `install` -> the EXACT emitted `protect`
  * argv, end to end, with no credential supplied anywhere.
