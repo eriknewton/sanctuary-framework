@@ -8,9 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [1.8.6] - 2026-09-08
 
+One first-install fix on top of v1.8.5. No new capability; the capability bounds in the v1.8.4 notes stand. v1.8.5 was tagged and built but not published: its own acceptance run caught this defect on the exact install path.
+
 ### Fixed
 
-- A fortress created before custody envelopes opens with its stored passphrase again: the boot credential resolver no longer lets an OS-keyring custody item it cannot verify shadow that passphrase, and it reports such an item as present but unusable, with the remedy that matches.
+- The dashboard, whether started directly or by the install contract's `protect` step, opens a fortress with the custody factor `init` enrolled in the OS keyring. Both the MCP server boot and the dashboard boot now resolve their credential through one shared path: an explicit passphrase, the environment passphrase, the environment recovery key, then the enrolled keyring factor and the stored passphrase, each checked against the fortress before use; a boot never mints a credential. A refusal names exactly the sources that are accepted.
+- The boot credential resolver no longer lets a keyring custody item that no envelope can verify shadow a valid stored passphrase on a fortress created before custody envelopes; the item is reported as present but unverifiable and the stored passphrase opens the fortress. The keyring factor a boot receives is cleared from memory across its whole lifetime, including a failed read between resolution and establishment.
 
 ## [1.8.5] - 2026-09-08
 
