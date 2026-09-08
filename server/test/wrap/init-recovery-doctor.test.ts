@@ -25,18 +25,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import {
-  chmod,
-  mkdir,
-  mkdtemp,
-  readFile,
-  readdir,
-  rm,
-  stat,
-  lstat,
-  symlink,
-  writeFile,
-} from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { dirname, join } from "node:path";
@@ -205,9 +194,16 @@ describe("sanctuary init: recovery key stays outside the fortress", () => {
     await expect(
       stat(join(fortressPath, RECOVERY_KEY_FILENAME)),
     ).rejects.toMatchObject({ code: "ENOENT" });
-    expect((await stat(expected)).mode & 0o777).toBe(0o600);
+    // Mode and content of the SAME file object from one descriptor (fstat +
+    // read on a single fd), not a path stat followed by a path read.
+    const handle = await open(expected, "r");
+    try {
+      expect((await handle.stat()).mode & 0o777).toBe(0o600);
+      expect(await handle.readFile("utf8")).toContain("Recovery key:");
+    } finally {
+      await handle.close();
+    }
     expect((await stat(join(tmp, "Sanctuary Recovery"))).mode & 0o777).toBe(0o700);
-    expect(await readFile(expected, "utf8")).toContain("Recovery key:");
   });
 
   it("refuses a --recovery-out that resolves inside the fortress through a symlink", async () => {

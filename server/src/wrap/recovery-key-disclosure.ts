@@ -516,6 +516,13 @@ async function openRecoveryOutputParentNoFollow(
   parent: string,
 ): Promise<Awaited<ReturnType<typeof open>>> {
   try {
+    // Read only, never through a link, and only a directory. No O_CREAT, no
+    // mode: this call creates nothing; every stat and the fchmod that may
+    // follow run on THIS descriptor, which is what closes the lstat-then-chmod
+    // swap window. CodeQL reads the numeric flag word as a possible write and
+    // reports js/insecure-temporary-file when a caller's directory came from
+    // the OS temp dir (test fixtures do); that is the same false positive
+    // already dismissed on audit-log.ts and claude-code-file-adapter.ts.
     return await open(
       parent,
       constants.O_RDONLY |
