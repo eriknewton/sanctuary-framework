@@ -145,18 +145,17 @@ import {
   establishMaster,
   checkCastlePinCustody,
   readEnvelopeEpoch,
-  readCustodyEnvelope,
 } from "./core/master-custody.js";
 import {
+  observeStoredPassphraseVia,
   readStoredPassphrase,
-  PassphraseKeyringUnreachableError,
-  PassphraseUnreadableError,
-  PassphrasePathIdentityError,
 } from "./wrap/passphrase.js";
+import { readKeychainCustodyKeyStatus } from "./wrap/keychain-custody.js";
 import {
-  readKeychainCustodyKeyStatus,
-  type KeychainReadResult,
-} from "./wrap/keychain-custody.js";
+  custodyCredentialRefusal,
+  HOST_LOCAL_CUSTODY_SOURCES,
+  resolveFortressCustodyCredential,
+} from "./wrap/custody-credential.js";
 import { decrypt } from "./core/encryption.js";
 import { derivePurposeKey, IDENTITY_ENCRYPTION_PURPOSE } from "./core/key-derivation.js";
 import {
@@ -221,14 +220,26 @@ type HandsFreeBootCredential =
   | { kind: "fail-closed"; message: string };
 
 /**
- * Resolve the exact-fortress stored credential for a hands-free MCP boot (H1),
- * READ-ONLY. Mirrors the CLI memory verbs' final fallback: the stored
- * passphrase (OS keyring / namespaced fallback file) first, then the
- * machine-local custody key. NEVER generates a passphrase and NEVER mints
- * custody. The envelope presence is what separates a virgin fortress (fall
- * through to the audited first-run) from an existing one that must fail closed
- * when no credential resolves, so a boot never mints a fresh master over data a
- * stored-but-unreadable credential was meant to unlock.
+ * Resolve the exact-fortress credential for a hands-free MCP boot (H1),
+ * READ-ONLY, through THE shared custody-credential resolver
+ * (`wrap/custody-credential.ts`) restricted to {@link HOST_LOCAL_CUSTODY_SOURCES}.
+ *
+ * A73: this path used to run its own chain — the stored passphrase first, with
+ * no check that it opens THIS fortress and no fall-through on a mismatch, then
+ * the custody factor. That is a different order from the one `protect` uses, so
+ * a leftover `sanctuary-passphrase-<id>` item from an earlier failed mint made
+ * `protect` succeed and the server it launched fail closed. Routing both
+ * through one resolver makes them agree by construction: every host-local
+ * candidate is verified against this fortress's envelope before it is returned,
+ * and a candidate that does not open it is skipped rather than handed to
+ * `establishMaster` to discover.
+ *
+ * The restriction to host-local sources is what makes this hands-free: the two
+ * operator-supplied env credentials are handled by the caller BEFORE this runs
+ * (they outrank everything and must not be re-read here). Nothing here mints,
+ * generates, or writes: the envelope's presence is what separates a virgin
+ * fortress (fall through to the audited first run) from an existing one that
+ * must fail closed when nothing opens it.
  */
 async function resolveHandsFreeBootCredential(args: {
   storage: StorageBackend;
@@ -236,68 +247,53 @@ async function resolveHandsFreeBootCredential(args: {
   readStored: typeof readStoredPassphrase;
   readCustody: typeof readKeychainCustodyKeyStatus;
 }): Promise<HandsFreeBootCredential> {
-  const envelope = await readCustodyEnvelope(args.storage);
-  const hasEnvelope = envelope !== null;
+  const resolution = await resolveFortressCustodyCredential({
+    storagePath: args.storagePath,
+    storage: args.storage,
+    allow: HOST_LOCAL_CUSTODY_SOURCES,
+    // A boot never creates custody through the resolver. The audited
+    // stdio-server first run below is the only mint, and it is reached only
+    // when this fortress has no envelope at all.
+    allowMint: false,
+    readCustodyKey: args.readCustody,
+    observePassphrase: (opts) =>
+      observeStoredPassphraseVia(args.readStored, opts),
+  });
 
-  let keyringFailure: string | undefined;
-  try {
-    const stored = await args.readStored({
-      storagePath: args.storagePath,
-      // Read-only: boot must never rewrite the at-rest passphrase file; a
-      // legacy-format upgrade is deferred to a custody verb.
-      readOnly: true,
-    });
-    if (stored && stored.value.length > 0) {
-      return { kind: "passphrase", value: stored.value };
+  if (resolution.status === "resolved") {
+    const credential = resolution.credential;
+    switch (credential.kind) {
+      case "keychain-key":
+        return { kind: "keychain-key", key: credential.keychainKey };
+      case "passphrase":
+        return { kind: "passphrase", value: credential.passphrase };
+      case "recovery-key":
+        // A recovery key is an operator-supplied source and is excluded by the
+        // allow list above, so reaching this means the resolver returned a
+        // source it was not permitted to consult. Fail closed rather than boot
+        // on an unexpected credential class (MUST-NEVER 5).
+        return {
+          kind: "fail-closed",
+          message:
+            `Refusing to start: the hands-free boot credential resolution for ` +
+            `${args.storagePath} returned a credential class this path does not accept.`,
+        };
     }
-  } catch (error) {
-    // A locked/unreachable keyring or an unreadable fallback is NOT "absent":
-    // record it so an existing fortress fails closed with the real cause rather
-    // than minting over data hidden behind a temporary outage.
-    if (
-      error instanceof PassphraseKeyringUnreachableError ||
-      error instanceof PassphraseUnreadableError ||
-      error instanceof PassphrasePathIdentityError
-    ) {
-      keyringFailure = error.message;
-    } else {
-      keyringFailure =
-        "the stored fortress passphrase could not be read; no secret detail was emitted";
-    }
   }
 
-  let custody: KeychainReadResult;
-  try {
-    custody = await args.readCustody(args.storagePath, {});
-  } catch {
-    custody = {
-      status: "unreachable",
-      detail: "the stored custody-key identity could not be determined",
-    };
-  }
-  if (custody.status === "found" && custody.key) {
-    return { kind: "keychain-key", key: custody.key };
-  }
+  if (!resolution.report.envelopePresent) return { kind: "virgin" };
 
-  if (!hasEnvelope) return { kind: "virgin" };
-
-  const cause =
-    keyringFailure ??
-    (custody.status === "unreachable" && custody.detail
-      ? custody.detail
-      : undefined);
+  // An existing fortress that cannot be opened hands-free. The refusal names
+  // the credential SOURCES the resolver accepts and which of them were present
+  // or rejected on this host; it never carries a value.
   return {
     kind: "fail-closed",
     message:
-      `Refusing to start: the fortress at ${args.storagePath} exists but no credential ` +
-      `is available to open it hands-free` +
-      (cause ? ` (${cause})` : "") +
-      `.\nSupply one of:\n` +
-      `  - SANCTUARY_PASSPHRASE=<fortress passphrase>, or\n` +
-      `  - SANCTUARY_RECOVERY_KEY=<recovery key>, or\n` +
-      `  - store this fortress's passphrase in the OS keyring on this host by\n` +
-      `    running \`sanctuary protect\` for it, then restart (no secret is typed here).\n` +
-      `Refusing to generate a passphrase or mint a new master: that would strand the existing state.`,
+      `${custodyCredentialRefusal(resolution.report, args.storagePath).message}\n` +
+      `  Store this fortress's credential on this host by running \`sanctuary protect\`\n` +
+      `  for it, then restart (no secret is typed here).\n` +
+      `  Refusing to generate a passphrase or mint a new master: that would strand\n` +
+      `  the existing state.`,
   };
 }
 
@@ -318,10 +314,12 @@ export async function createSanctuaryServer(options?: {
    */
   approvalCallback?: (request: ApprovalRequest) => Promise<ApprovalResponse>;
   /**
-   * TEST ONLY: fake the exact-fortress stored-passphrase read used by the
-   * hands-free boot path (H1). Defaults to the real {@link readStoredPassphrase}.
-   * Injected so a wired-consumer test can boot with ONLY a stored keyring
-   * credential (in-memory keychain fake) and no credential env.
+   * TEST ONLY: fake the exact-fortress stored-passphrase read the shared
+   * resolver performs at its `stored-passphrase` step. Defaults to the real
+   * {@link readStoredPassphrase}. Injected so a wired-consumer test can boot
+   * with ONLY a stored keyring credential (in-memory keychain fake) and no
+   * credential env. It does NOT outrank the enrolled custody factor and is
+   * still verified against this fortress's envelope.
    */
   __testReadStoredPassphrase?: typeof readStoredPassphrase;
   /** TEST ONLY: fake the machine-local custody-key read used by hands-free boot. */
@@ -354,13 +352,16 @@ export async function createSanctuaryServer(options?: {
   const envRecoveryKey = process.env.SANCTUARY_RECOVERY_KEY;
 
   // H1 (hands-free boot): when the operator supplied NO credential env, resolve
-  // the EXACT-fortress stored credential read-only — the same keyring/custody
-  // path the CLI memory verbs use — so a host whose passphrase is already in the
-  // OS keyring (put there by `sanctuary protect`) boots and reads memory without
-  // re-typing a secret. This NEVER generates a passphrase and NEVER mints
-  // custody (readOnly), so a virgin fortress still falls through to the audited
-  // first-run below, while an EXISTING fortress with no resolvable credential
-  // fails closed with a remediation instead of a bare "credential missing".
+  // the EXACT-fortress credential read-only through the SAME shared resolver
+  // `protect` runs (`wrap/custody-credential.ts`), restricted to the host-local
+  // sources — so a host whose credential is already in the OS keyring (put
+  // there by `sanctuary init` or `sanctuary protect`) boots and reads memory
+  // without re-typing a secret, and the server agrees with the verb that
+  // launched it by construction. This NEVER generates a passphrase and NEVER
+  // mints custody (readOnly), so a virgin fortress still falls through to the
+  // audited first-run below, while an EXISTING fortress with no resolvable
+  // credential fails closed with a remediation instead of a bare "credential
+  // missing".
   let bootPassphrase = passphrase;
   let bootKeychainKey: Uint8Array | undefined;
   if (passphrase === undefined && envRecoveryKey === undefined) {

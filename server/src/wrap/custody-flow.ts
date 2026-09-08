@@ -14,6 +14,12 @@
  *    the passphrase as a NEW wrap by first unlocking with the recovery key
  *    (interactive prompt) — never by deriving a parallel master.
  *
+ * The credential arrives already resolved, from the ONE resolver in
+ * `wrap/custody-credential.ts`, and may be a passphrase, a recovery key, or the
+ * fortress's enrolled OS-keyring custody factor. This module does not choose or
+ * mint credentials; choosing is the resolver's job and minting is reachable
+ * only through it.
+ *
  * Every degraded decision (headless install, unverified capture) is audited
  * as a distinct path, never a silent relaxation (F6/F13).
  */
@@ -58,10 +64,20 @@ import {
   type DisclosureIo,
 } from "./recovery-key-disclosure.js";
 
-export interface WrapCustodyOptions {
+/**
+ * The credential custody establishment opens the fortress with, as produced by
+ * the shared resolver (`wrap/custody-credential.ts`). Three kinds, because a
+ * fortress created by `sanctuary init` holds a recovery-key wrap and an
+ * OS-keyring custody wrap and NO passphrase wrap: a passphrase-only parameter
+ * here is what forced `protect` to mint a passphrase that could not open it.
+ */
+export type WrapCustodyCredential =
+  | { kind: "passphrase"; value: string }
+  | { kind: "recovery-key"; value: string }
+  | { kind: "keychain-key"; value: Uint8Array };
+
+interface WrapCustodyOptionsBase {
   storagePath: string;
-  /** The resolved fortress passphrase (always present on the wrap path). */
-  passphrase: string;
   /** True when an operator is present at a TTY. */
   interactive: boolean;
   /** Test seam: stdin/stderr streams for prompts. */
@@ -80,6 +96,37 @@ export interface WrapCustodyOptions {
   persistAuthenticatedPassphrase?: (
     value: string,
   ) => Promise<{ location: string; source: string }>;
+}
+
+/**
+ * Exactly one credential shape reaches custody establishment. Expressed as a
+ * union rather than two optional fields so "neither supplied" and "both
+ * supplied" are both unrepresentable at the type level (AGENTS.md rule 3: a
+ * dependency that gates a security property is required, not optional).
+ * `passphrase` is the legacy spelling of `credential: { kind: "passphrase" }`.
+ */
+export type WrapCustodyOptions = WrapCustodyOptionsBase &
+  (
+    | { passphrase: string; credential?: undefined }
+    | { credential: WrapCustodyCredential; passphrase?: undefined }
+  );
+
+/**
+ * Project the credential union onto `establishMaster`'s parameter names. One
+ * place, so a new credential kind cannot be silently dropped by a call site
+ * that only knew about passphrases.
+ */
+function credentialFields(
+  credential: WrapCustodyCredential,
+): { passphrase: string } | { recoveryKey: string } | { keychainKey: Uint8Array } {
+  switch (credential.kind) {
+    case "passphrase":
+      return { passphrase: credential.value };
+    case "recovery-key":
+      return { recoveryKey: credential.value };
+    case "keychain-key":
+      return { keychainKey: credential.value };
+  }
 }
 
 export function agentGuidedRecoveryOutputPath(
@@ -236,14 +283,23 @@ async function establishWrapCustodyLocked(
   barrier: MasterWriteBarrierLease,
 ): Promise<WrapCustodyResult> {
   const installMode = opts.interactive ? "interactive" : "headless";
+  const credential: WrapCustodyCredential =
+    opts.credential ?? { kind: "passphrase", value: opts.passphrase! };
 
   let result: EstablishMasterResult;
   let origin: WrapCustodyResult["origin"];
   try {
     result = await establishMaster({
       storage,
-      passphrase: opts.passphrase,
-      firstRun: { installMode, mintRecoveryKey: false },
+      ...credentialFields(credential),
+      // `firstRun` CREATES custody. Only a passphrase may do that: a
+      // recovery-key or OS-keyring credential exists because a fortress
+      // already does, so reaching first-run with one means the envelope went
+      // missing under us, and inventing custody there would strand the real
+      // one. Those kinds fail closed instead.
+      ...(credential.kind === "passphrase"
+        ? { firstRun: { installMode, mintRecoveryKey: false } }
+        : {}),
       storagePathHint: opts.storagePath,
       // Reuse the caller-held barrier; do not acquire a second one (S2).
       heldBarrier: barrier,
@@ -251,6 +307,9 @@ async function establishWrapCustodyLocked(
     origin = result.origin;
   } catch (err) {
     if (!(err instanceof CustodyUnlockError)) throw err;
+    // The interactive recovery-key enrolment below ADDS a passphrase wrap, so
+    // it is meaningful only when a passphrase is what failed to unlock.
+    if (credential.kind !== "passphrase") throw err;
 
     // The passphrase did not unlock. If this fortress's custody is
     // recovery-key-based (created by `sanctuary init`, no passphrase wrap
@@ -284,7 +343,7 @@ async function establishWrapCustodyLocked(
     if (result.envelope) {
       const passphraseWrap = await wrapMasterWithPassphrase(
         result.masterKey,
-        opts.passphrase,
+        credential.value,
         { verified: true }
       );
       result.envelope = await writeCustodyEnvelope(
@@ -485,9 +544,15 @@ async function establishWrapCustodyLocked(
   lease.assertHeld();
   let persistedPassphrase: { location: string; source: string } | undefined;
   try {
-    persistedPassphrase = await opts.persistAuthenticatedPassphrase?.(
-      opts.passphrase,
-    );
+    // Only a passphrase can be persisted as one. A recovery key or an
+    // OS-keyring custody factor authenticated custody without ever being a
+    // passphrase, so there is nothing to write into the passphrase store, and
+    // writing one would be minting custody from a machine-resident factor
+    // (docs/custody-recovery-posture.md forbids exactly that).
+    persistedPassphrase =
+      credential.kind === "passphrase"
+        ? await opts.persistAuthenticatedPassphrase?.(credential.value)
+        : undefined;
   } finally {
     lease.assertHeld();
   }

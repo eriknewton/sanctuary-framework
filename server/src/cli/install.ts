@@ -10,22 +10,24 @@ import { resolveStoragePath } from "../paths.js";
 import { getSanctuaryVersion } from "../version.js";
 import { agentGuidedRecoveryOutputPath } from "../wrap/custody-flow.js";
 import {
+  observeStoredPassphraseVia,
   probeExistingCustodyMaterial,
   readStoredPassphrase,
-  PassphraseKeyringUnreachableError,
-  PassphraseUnreadableError,
   type ExistingCustodyMaterialStatus,
 } from "../wrap/passphrase.js";
+import {
+  HOST_LOCAL_CUSTODY_SOURCES,
+  resolveFortressCustodyCredential,
+} from "../wrap/custody-credential.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import {
   probeKernelBackedCrossProcessLockCapability,
   type KernelLockCapability,
 } from "../storage/cross-process-lock.js";
 import {
-  CustodyCredentialMissingError,
-  CustodyUnlockError,
   readCustodyEnvelope,
-  unlockExistingMasterReadOnly,
+  unlockExistingMasterReadOnlyWithEnvelope,
+  type ReadOnlyUnlock,
 } from "../core/master-custody.js";
 import {
   readKeychainCustodyKeyStatus,
@@ -834,18 +836,26 @@ async function probeOperatorTwin(
 /**
  * Read-only, ambient-env-blind daily-UX probe for Rung 1 fresh-host onboarding.
  * Answers "can this host open the fortress today, and does it carry a recovery
- * factor?" WITHOUT typing or reading any credential from the environment:
- *  - reads both exact-fortress local factors (stored passphrase and the
- *    interactive-init custody key) and tries each unwrap to decide
- *    custody_access; passphrase is tried first and custody key is fallback,
- *  - reports recovery_factor ONLY from an envelope that has passed its MAC under
- *    the unwrapped master; without authenticated custody recovery_factor is
- *    "unknown", so an attacker-added plaintext recovery wrap cannot change it.
- * It never consults SANCTUARY_PASSPHRASE / SANCTUARY_RECOVERY_KEY, never
- * generates custody or mutates the fortress. The independent mutation-capability
- * probe creates and removes a private runtime socket and may create its 0700
- * runtime directory; that bounded host-local probe is not fortress state.
- * Any decrypted master is zeroed.
+ * factor?" WITHOUT typing or reading any credential from the environment.
+ *
+ * A73: `custody_access` is now computed by running the SAME shared resolver
+ * `protect` runs (`wrap/custody-credential.ts`), restricted to
+ * `HOST_LOCAL_CUSTODY_SOURCES`. That restriction is what makes the answer
+ * describe the STEP rather than the fortress: the argv this planner emits names
+ * no credential and its contract forbids adding one, so "usable" may only mean
+ * "that argv would unlock with what is already on this host". Before A73 this
+ * probe had its own credential chain in a different order from protect's, which
+ * is how it could report `custody_access: usable` moments before the argv it
+ * emitted failed custody establishment.
+ *
+ * `recovery_factor` is reported ONLY from an envelope that has passed its MAC
+ * under an unwrapped master; without authenticated custody it is "unknown", so
+ * an attacker-added plaintext recovery wrap cannot change it.
+ *
+ * The probe never generates custody and never mutates the fortress. The
+ * independent mutation-capability probe creates and removes a private runtime
+ * socket and may create its 0700 runtime directory; that bounded host-local
+ * probe is not fortress state. Any decrypted master is zeroed.
  */
 export async function probeCustodyAccess(
   fortress: string,
@@ -885,6 +895,7 @@ export async function probeCustodyAccess(
   } catch {
     custodyMutation = "unknown";
   }
+
   let envelope: Awaited<ReturnType<typeof readCustodyEnvelope>>;
   try {
     envelope = await readCustodyEnvelope(storage);
@@ -898,141 +909,102 @@ export async function probeCustodyAccess(
     return { custodyAccess: "missing", custodyMutation, recoveryFactor: "absent" };
   }
 
-  // recovery_factor is NEVER read from the envelope's plaintext wrap list until
-  // the envelope MAC has verified under an unwrapped master. An attacker with
-  // bare write access to the custody file can append a plaintext
-  // { type: "recovery-key" } wrap whose payload need not decrypt; trusting
-  // `wraps[].type` before authentication would flip recovery_factor to
-  // "present" and (once observations drive the planner) steer it toward a
-  // recovery path that does not exist (AGENTS.md rule 7). So every branch that
-  // has NOT authenticated custody reports recovery_factor: "unknown".
+  const resolution = await resolveFortressCustodyCredential({
+    storagePath: fortress,
+    platformOverride: platform,
+    allow: HOST_LOCAL_CUSTODY_SOURCES,
+    // A planner never creates custody, and it must never suggest it did.
+    allowMint: false,
+    storage,
+    readCustodyKey: (storagePath) => readCustody(storagePath).then((r) => ({
+      ...r,
+      // The resolver's reader reports which service answered; this seam's
+      // callers only model the classification, so name the family.
+      service: "sanctuary-custody",
+    })),
+    observePassphrase: (opts) => observeStoredPassphraseVia(readStored, opts),
+  });
 
-  let stored: Awaited<ReturnType<typeof readStoredPassphrase>> = null;
-  let passphraseState: "absent" | "locked" | "unreadable" | "unknown" = "absent";
-  try {
-    stored = await readStored({
-      storagePath: fortress,
-      platformOverride: platform,
-      readOnly: true,
-    });
-  } catch (error) {
-    if (error instanceof PassphraseKeyringUnreachableError) {
-      passphraseState = "locked";
-    } else if (error instanceof PassphraseUnreadableError) {
-      passphraseState = "unreadable";
-    } else {
-      passphraseState = "unknown";
+  const { report } = resolution;
+  if (resolution.status !== "resolved") {
+    // Order matters and is the same "absent is not failed" discipline the old
+    // branch table encoded: an indeterminate factor may still be the valid one,
+    // so it outranks another factor's mismatch; a fortress-integrity problem is
+    // never reported as a credential problem.
+    if (report.integrityIndeterminate) {
+      return { custodyAccess: "unknown", custodyMutation, recoveryFactor: "unknown" };
     }
+    // `custody.status === "unreachable"` is a genuine, transient "unlock and
+    // re-probe" signal only on a platform where these factors are OS-keyring
+    // backed (darwin, linux); everywhere else the same status is a structural
+    // "no OS-keyring integration on this platform" answer, and folding it into
+    // "locked" would tell the operator to unlock a keychain that does not
+    // exist. Off those platforms the run falls through to the fallback-file
+    // signals below, landing on "unavailable" only when none of them apply.
+    const keyringBacked = platform === "darwin" || platform === "linux";
+    if (report.indeterminate.length > 0 && keyringBacked) {
+      return { custodyAccess: "locked", custodyMutation, recoveryFactor: "unknown" };
+    }
+    if (report.rejected.length > 0) {
+      return { custodyAccess: "mismatch", custodyMutation, recoveryFactor: "unknown" };
+    }
+    if (report.indeterminate.length > 0) {
+      return { custodyAccess: "unknown", custodyMutation, recoveryFactor: "unknown" };
+    }
+    if (!keyringBacked) {
+      return { custodyAccess: "unavailable", custodyMutation, recoveryFactor: "unknown" };
+    }
+    return { custodyAccess: "absent", custodyMutation, recoveryFactor: "unknown" };
   }
-  const custody = await readCustody(fortress).catch(() => ({
-    status: "unreachable" as const,
-    detail: "custody-key identity could not be determined",
-  }));
-  const custodyKey =
-    custody.status === "found" && custody.key !== undefined
-      ? custody.key
-      : undefined;
-  let authenticatedMaster: Uint8Array | null = null;
-  let integrityIndeterminate = false;
-  let sawMismatch =
-    passphraseState === "unreadable" ||
-    (custody.status === "found" && custody.key === undefined);
+
+  // Authenticate the envelope under the resolved credential before reading a
+  // single wrap type from it (AGENTS.md rule 7), and report `recovery_factor`
+  // from THE ENVELOPE THE UNLOCK AUTHENTICATED — never from the copy read at
+  // the top of this probe, and never from a later re-read compared against it.
+  // Both of those are this probe's OWN reads at two instants it does not
+  // control, so an attacker with write access could swap envelope B in before
+  // the unlock and put envelope A back before the second read: the comparison
+  // passes, and the probe reports A's recovery wraps for a fortress it
+  // authenticated as B. The authenticated object cannot be swapped after the
+  // fact, so it is the only honest source for a wrap fact.
+  const credential = resolution.credential;
+  let authenticated: ReadOnlyUnlock | null = null;
   try {
-    if (stored && stored.value.length > 0) {
-      let candidate: Uint8Array | null = null;
-      try {
-        candidate = await unlockExistingMasterReadOnly(storage, {
-          passphrase: stored.value,
-          storagePathHint: fortress,
-        });
-        authenticatedMaster = candidate;
-        candidate = null;
-      } catch (error) {
-        if (error instanceof CustodyUnlockError && !(error instanceof CustodyCredentialMissingError)) {
-          sawMismatch = true;
-        } else {
-          integrityIndeterminate = true;
-        }
-      } finally {
-        candidate?.fill(0);
-      }
-    }
-    if (authenticatedMaster === null && custodyKey) {
-      let candidate: Uint8Array | null = null;
-      try {
-        candidate = await unlockExistingMasterReadOnly(storage, {
-          keychainKey: custodyKey,
-          storagePathHint: fortress,
-        });
-        authenticatedMaster = candidate;
-        candidate = null;
-      } catch (error) {
-        if (error instanceof CustodyUnlockError && !(error instanceof CustodyCredentialMissingError)) {
-          sawMismatch = true;
-        } else {
-          integrityIndeterminate = true;
-        }
-      } finally {
-        candidate?.fill(0);
-      }
-    }
-    if (authenticatedMaster === null) {
-      if (integrityIndeterminate) {
-        return { custodyAccess: "unknown", custodyMutation, recoveryFactor: "unknown" };
-      }
-      // An inaccessible factor may still be the valid one. Report the
-      // actionable locked state ahead of a different local factor's mismatch;
-      // never claim the fortress has no usable local credential while the OS
-      // keyring's answer is indeterminate. custody.status === "unreachable"
-      // is a genuine, transient "unlock and re-probe" signal only on a
-      // platform where custody keys are OS-keyring-backed (darwin, linux):
-      // readKeyClassified has no non-keyring path for custody keys, so on
-      // every other platform (e.g. Windows) that same status is a structural
-      // "no OS-keyring integration on this platform" answer, not a lock.
-      // Folding it into "locked" there would tell the operator to unlock a
-      // login Keychain that does not exist, so it is excluded from the
-      // locked check outside darwin/linux; the platform falls through to the
-      // passphrase-fallback-file signals below (Windows's real
-      // exact-fortress credential path), landing on "unavailable" only when
-      // none of those signals apply either.
-      const custodyKeyGenuinelyLocked =
-        custody.status === "unreachable" &&
-        (platform === "darwin" || platform === "linux");
-      if (passphraseState === "locked" || custodyKeyGenuinelyLocked) {
-        return { custodyAccess: "locked", custodyMutation, recoveryFactor: "unknown" };
-      }
-      if (sawMismatch) {
-        return { custodyAccess: "mismatch", custodyMutation, recoveryFactor: "unknown" };
-      }
-      if (passphraseState === "unknown") {
-        return { custodyAccess: "unknown", custodyMutation, recoveryFactor: "unknown" };
-      }
-      if (platform !== "darwin" && platform !== "linux") {
-        return { custodyAccess: "unavailable", custodyMutation, recoveryFactor: "unknown" };
-      }
-      return { custodyAccess: "absent", custodyMutation, recoveryFactor: "unknown" };
-    }
-    const hasVerifiedRecovery = envelope.wraps.some(
-      (w) => w.type === "recovery-key" && w.verified === true,
-    );
-    const hasUnverifiedRecovery = envelope.wraps.some(
-      (w) => w.type === "recovery-key" && w.verified !== true,
-    );
-    const recoveryFactor: RecoveryFactorObservation = hasVerifiedRecovery
+    authenticated = await unlockExistingMasterReadOnlyWithEnvelope(storage, {
+      ...(credential.kind === "passphrase"
+        ? { passphrase: credential.passphrase }
+        : credential.kind === "recovery-key"
+          ? { recoveryKey: credential.recoveryKey }
+          : { keychainKey: credential.keychainKey }),
+      storagePathHint: fortress,
+    });
+  } catch {
+    // The resolver proved this credential moments ago; a failure here is the
+    // fortress changing under the probe, not a credential verdict.
+    return { custodyAccess: "unknown", custodyMutation, recoveryFactor: "unknown" };
+  } finally {
+    authenticated?.masterKey.fill(0);
+    if (credential.kind === "keychain-key") credential.keychainKey.fill(0);
+  }
+
+  const authenticatedWraps = authenticated.envelope.wraps;
+  const hasVerifiedRecovery = authenticatedWraps.some(
+    (w) => w.type === "recovery-key" && w.verified === true,
+  );
+  const hasUnverifiedRecovery = authenticatedWraps.some(
+    (w) => w.type === "recovery-key" && w.verified !== true,
+  );
+  return {
+    custodyAccess: "usable",
+    custodyMutation,
+    recoveryFactor: hasVerifiedRecovery
       ? "present"
       : hasUnverifiedRecovery
         ? "unknown"
-        : "absent";
-    return {
-      custodyAccess: "usable",
-      custodyMutation,
-      recoveryFactor,
-    };
-  } finally {
-    authenticatedMaster?.fill(0);
-    custodyKey?.fill(0);
-  }
+        : "absent",
+  };
 }
+
 
 function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
   const platform = ctx.platform ?? process.platform;

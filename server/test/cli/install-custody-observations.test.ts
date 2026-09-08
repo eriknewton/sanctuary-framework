@@ -8,8 +8,8 @@
  * ambient credential env.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, mkdir } from "node:fs/promises";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { cp, mkdtemp, rm, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,7 +19,10 @@ import {
   type InstallProbeResult,
 } from "../../src/cli/install.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
-import { establishMaster } from "../../src/core/master-custody.js";
+import {
+  CUSTODY_ENVELOPE_KEY,
+  establishMaster,
+} from "../../src/core/master-custody.js";
 import {
   PassphraseKeyringUnreachableError,
   persistUserProvidedPassphrase,
@@ -218,6 +221,141 @@ describe("probeCustodyAccess (Rung 1 daily-UX probe)", () => {
     });
     expect([...observed]).toEqual(new Array(32).fill(0));
     keychainKey.fill(0);
+  });
+
+  it("never reports a recovery factor from an envelope swapped out from under the unlock", async () => {
+    // The probe reads the envelope BEFORE any credential is proven. Plant the
+    // swap in the window between that read and the unlock: the fortress the
+    // credential authenticates (B, no recovery wrap) is not the fortress whose
+    // wrap list was read (A, with a recovery wrap). Originally the probe
+    // reported `usable` plus A's recovery claim for a fortress it never opened.
+    //
+    // What is asserted is the PROPERTY, not the mechanism that used to enforce
+    // it. The probe no longer compares two of its own reads — that pair is
+    // defeated by a swap put back before the second one (see the next test) —
+    // and instead reports from the envelope the unlock authenticated. So the
+    // answer here is now about B, the fortress actually at this path: this host
+    // does hold a credential that opens it, and it carries no recovery factor.
+    // A's recovery wrap must not appear in either field.
+    await seedFortress(dir, true);
+    const swapped = await mkdtemp(join(tmpdir(), "install-probe-swapped-"));
+    const OTHER_PASSPHRASE = "a-second-fortress-passphrase-not-a-real-secret";
+    try {
+      await mkdir(join(swapped, "state"), { recursive: true, mode: 0o700 });
+      const otherCustody = await establishMaster({
+        storage: new FilesystemStorage(join(swapped, "state")),
+        passphrase: OTHER_PASSPHRASE,
+        firstRun: { installMode: "headless", mintRecoveryKey: false },
+        storagePathHint: swapped,
+      });
+      otherCustody.masterKey.fill(0);
+
+      const swapOnRead = async (): Promise<PassphraseResult> => {
+        // The stored-credential read is the probe's own step between the two
+        // envelope reads, so it is the exact seam an attacker's write would
+        // race. Swap the whole custody state, then answer with the credential
+        // that opens the NEW one.
+        await rm(join(dir, "state"), { recursive: true, force: true });
+        await cp(join(swapped, "state"), join(dir, "state"), { recursive: true });
+        return {
+          value: OTHER_PASSPHRASE,
+          source: "keychain",
+          location: "test-keyring",
+        };
+      };
+
+      const r = await probeCustodyAccess(
+        dir,
+        "linux",
+        swapOnRead,
+        mutationAvailable,
+        custodyAbsent,
+      );
+      expect(r.custodyAccess).toBe("usable");
+      // B's answer, not A's. A had a recovery wrap; reporting "unknown" or
+      // "present" here would be the original defect in a new spelling.
+      expect(r.recoveryFactor).toBe("absent");
+    } finally {
+      await rm(swapped, { recursive: true, force: true });
+    }
+  });
+
+  it("reports the AUTHENTICATED envelope's facts when a swap is put back before the recheck", async () => {
+    // The swap-then-swap-BACK schedule the previous test cannot reach. The
+    // probe's own two reads (the pre-authentication load and the post-unlock
+    // recheck) are taken at instants an attacker with write access chooses
+    // between, so comparing them proves only that they agree with EACH OTHER.
+    // Serve the foreign envelope A to both of those reads and this fortress's
+    // real envelope B to everything in between: the comparison passes, and
+    // before the fix the probe reported A's recovery wrap for a fortress it
+    // authenticated as B. The fix reads the wrap list off the envelope the
+    // unlock authenticated, which no later write can substitute.
+    await seedFortress(dir, false); // B: this fortress, NO recovery wrap.
+    const foreign = await mkdtemp(join(tmpdir(), "install-probe-foreign-"));
+    try {
+      await mkdir(join(foreign, "state"), { recursive: true, mode: 0o700 });
+      const foreignCustody = await establishMaster({
+        storage: new FilesystemStorage(join(foreign, "state")),
+        passphrase: "a-foreign-fortress-passphrase-not-a-real-secret",
+        firstRun: { installMode: "headless", mintRecoveryKey: true },
+        storagePathHint: foreign,
+      });
+      foreignCustody.masterKey.fill(0);
+      // A: read BEFORE the spy is installed, or the spy would intercept it.
+      const foreignEnvelope = await new FilesystemStorage(
+        join(foreign, "state"),
+      ).read("_meta", CUSTODY_ENVELOPE_KEY);
+      expect(foreignEnvelope).not.toBeNull();
+
+      // Envelope reads inside the authentication window, in order:
+      //   1  the probe's own pre-authentication load
+      //   2  the resolver's presence read
+      //   3  the resolver's verification unlock, before the unwrap
+      //   4  the resolver's verification unlock, its own snapshot recheck
+      //   5  the probe's authenticating unlock, before the unwrap
+      //   6  the probe's authenticating unlock, its own snapshot recheck
+      // Read 1 is the copy the pre-fix code compared against, and read 7 (which
+      // exists only before the fix) is that comparison's second half. Reads 3-6
+      // must see ONE envelope or the unlocks refuse on their own recheck, which
+      // is why the swap-back lands after 6 rather than anywhere earlier.
+      const ENVELOPE_READS_IN_THE_AUTHENTICATION_WINDOW = 6;
+      const realRead = FilesystemStorage.prototype.read;
+      let envelopeReads = 0;
+      const spy = vi
+        .spyOn(FilesystemStorage.prototype, "read")
+        .mockImplementation(async function (
+          this: FilesystemStorage,
+          namespace: string,
+          key: string,
+        ) {
+          if (namespace !== "_meta" || key !== CUSTODY_ENVELOPE_KEY) {
+            return realRead.call(this, namespace, key);
+          }
+          envelopeReads += 1;
+          return envelopeReads === 1 ||
+            envelopeReads > ENVELOPE_READS_IN_THE_AUTHENTICATION_WINDOW
+            ? foreignEnvelope
+            : realRead.call(this, namespace, key);
+        } as typeof FilesystemStorage.prototype.read);
+
+      try {
+        const r = await probeCustodyAccess(
+          dir,
+          "linux",
+          reader({ kind: "value", value: PASSPHRASE }),
+          mutationAvailable,
+          custodyAbsent,
+        );
+        // B has no recovery wrap; A has one. Before the fix this read "unknown"
+        // from A — a recovery claim about a fortress the probe never opened.
+        expect(r.custodyAccess).toBe("usable");
+        expect(r.recoveryFactor).toBe("absent");
+      } finally {
+        spy.mockRestore();
+      }
+    } finally {
+      await rm(foreign, { recursive: true, force: true });
+    }
   });
 
   it("mismatch: a stored credential that does not open this fortress", async () => {

@@ -3,7 +3,7 @@
  * Sanctuary wrap - CLI Entry Point
  *
  * One command to wrap any MCP-compatible agent in Sanctuary's enforcement
- * chain, auto-generate a passphrase, start the Sovereignty Dashboard
+ * chain, use the enrolled custody factor (generating a passphrase only for a fortress with no custody yet), start the Sovereignty Dashboard
  * in-process, and open it in the user's browser.
  *
  * Usage:
@@ -81,6 +81,7 @@ import {
   PassphrasePathIdentityError,
   PassphrasePersistenceError,
   probeExistingCustodyMaterial,
+  type PassphraseResult,
 } from "./passphrase.js";
 import { type DashboardHandle } from "../dashboard/index.js";
 import {
@@ -137,8 +138,14 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { CustodyUnlockError } from "../core/master-custody.js";
 import {
   establishWrapCustody,
+  type WrapCustodyCredential,
   type WrapCustodyResult,
 } from "./custody-flow.js";
+import {
+  custodyCredentialRefusal,
+  resolveFortressCustodyCredential,
+  type ResolvedCustodyCredential,
+} from "./custody-credential.js";
 import {
   AuditLog,
   type AuditEntry,
@@ -2895,6 +2902,101 @@ export function renderAutoProvisionOutcome(
   }
 }
 
+/**
+ * What `protect` resolved to open this fortress with. `passphraseValue` is
+ * present ONLY when the credential is literally a passphrase: the downstream
+ * consumers that need a passphrase STRING (the Castle-pin auto-bootstrap child
+ * env, the optional passphrase backup file) must skip themselves rather than
+ * substitute something else when the fortress is opened by its OS-keyring
+ * custody factor, which has no passphrase spelling.
+ */
+interface ProtectCredential {
+  credential: WrapCustodyCredential;
+  /** Source token printed in wrap's notices and branched on for warnings. */
+  source: string;
+  location: string;
+  /** The resolver's source id, or "minted" for a brand-new fortress. */
+  resolvedFrom: ResolvedCustodyCredential["source"] | "minted";
+  passphraseValue?: string;
+}
+
+/**
+ * Resolve the credential `protect` opens this fortress with, through the ONE
+ * shared resolver. Minting a new passphrase is reachable only on the
+ * resolver's `mint-required` verdict (no custody envelope and no legacy
+ * marker); on a fortress that already has custody this REFUSES rather than
+ * minting, because a minted credential can never open an envelope it was not
+ * part of. That refusal is the whole A73 fix: the old chain minted first and
+ * discovered the mismatch afterwards, at custody establishment.
+ */
+async function resolveProtectCredential(
+  storagePath: string,
+  explicitPassphrase: string | undefined,
+  deps: RunWrapDeps,
+): Promise<ProtectCredential> {
+  const resolve = deps.resolveCustodyCredential ?? resolveFortressCustodyCredential;
+  const injectedStored = deps.resolvePassphrase;
+  const resolution = await resolve({
+    storagePath,
+    ...(explicitPassphrase === undefined ? {} : { explicitPassphrase }),
+    allowMint: true,
+    // The historical `resolvePassphrase` seam IS this host's stored-passphrase
+    // read; route it through the resolver's own step rather than around the
+    // resolver, so an injected credential is subject to the same verification
+    // and the same precedence as the real one.
+    ...(injectedStored === undefined
+      ? {}
+      : {
+          observePassphrase: async () => ({
+            status: "found" as const,
+            // The seam's `source` is carried through unchanged: it is what the
+            // operator-facing notices branch on, so rewriting it here would
+            // change what a test observes about a path it did not touch.
+            result: (await injectedStored()) as PassphraseResult,
+            keyringUnreachable: false,
+          }),
+        }),
+  });
+  if (resolution.status === "unresolved") {
+    throw custodyCredentialRefusal(resolution.report, storagePath);
+  }
+  if (resolution.status === "mint-required") {
+    const minted = await (deps.resolvePassphrase ??
+      (() => getOrCreatePassphrase({ storagePath })))();
+    return {
+      credential: { kind: "passphrase", value: minted.value },
+      source: minted.source,
+      location: minted.location,
+      resolvedFrom: "minted",
+      passphraseValue: minted.value,
+    };
+  }
+  const resolved = resolution.credential;
+  const base = {
+    source: resolved.displaySource,
+    location: resolved.location,
+    resolvedFrom: resolved.source,
+  };
+  switch (resolved.kind) {
+    case "passphrase":
+      return {
+        ...base,
+        credential: { kind: "passphrase", value: resolved.passphrase },
+        passphraseValue: resolved.passphrase,
+      };
+    case "recovery-key":
+      return {
+        ...base,
+        credential: { kind: "recovery-key", value: resolved.recoveryKey },
+      };
+    case "keychain-key":
+      return {
+        ...base,
+        credential: { kind: "keychain-key", value: resolved.keychainKey },
+      };
+  }
+}
+
 export interface RunWrapDeps {
   /**
    * Override the read-only protect preflight (for tests). Production callers
@@ -2945,8 +3047,22 @@ export interface RunWrapDeps {
   probeDashboardHealth?: (baseUrl: string) => Promise<boolean>;
   /** Override browser opener (for tests). */
   openBrowser?: (url: string) => Promise<void>;
-  /** Override passphrase resolver (for tests). */
+  /**
+   * Override THIS HOST's stored fortress passphrase (for tests). It stands in
+   * for the keyring/fallback read at the resolver's `stored-passphrase` step
+   * and for the mint on a fortress with no custody at all, which is exactly
+   * the pair the real `getOrCreatePassphrase` covers. It does NOT outrank the
+   * enrolled custody factor and it is still VERIFIED against an existing
+   * envelope, so injecting it cannot make protect claim to open a fortress it
+   * does not open.
+   */
   resolvePassphrase?: () => Promise<{ value: string; location: string; source: string }>;
+  /**
+   * Override the shared custody-credential resolver (for tests that need to
+   * drive a specific source without a keyring). Production leaves it undefined
+   * and gets `resolveFortressCustodyCredential`.
+   */
+  resolveCustodyCredential?: typeof resolveFortressCustodyCredential;
   /**
    * Override the persistence helper for a user-supplied `--passphrase` flag
    * (for tests). Production callers leave this undefined.
@@ -3205,12 +3321,10 @@ export async function runWrap(
     }
   }
 
-  // Resolve the passphrase before config detection/bootstrap on the
+  // Resolve the credential before config detection/bootstrap on the
   // agent-guided path. An explicit setter is deliberately NOT persisted here:
   // it must first authenticate the fortress's existing custody below.
-  let preResolvedAgentPassphrase:
-    | { value: string; location: string; source: string }
-    | undefined;
+  let preResolvedAgentCredential: ProtectCredential | undefined;
   if (options.agentGuided === true && options.dryRun !== true) {
     const earlyStoragePath = resolveStoragePath();
     const existingCustody = await probeExistingCustodyMaterial(earlyStoragePath);
@@ -3228,23 +3342,21 @@ export async function runWrap(
       process.exit(2);
       return;
     }
-    if (options.passphrase !== undefined) {
-      preResolvedAgentPassphrase = {
-        value: options.passphrase,
-        location: "",
-        source: "explicit-pending-authentication",
-      };
-    } else if (process.env.SANCTUARY_PASSPHRASE !== undefined) {
-      preResolvedAgentPassphrase = {
-        value: process.env.SANCTUARY_PASSPHRASE,
-        location: "SANCTUARY_PASSPHRASE",
-        source: "env",
-      };
-    } else {
-      const resolve =
-        deps.resolvePassphrase ??
-        (() => getOrCreatePassphrase({ storagePath: earlyStoragePath }));
-      preResolvedAgentPassphrase = await resolve();
+    try {
+      preResolvedAgentCredential = await resolveProtectCredential(
+        earlyStoragePath,
+        options.passphrase,
+        deps,
+      );
+    } catch (err) {
+      if (err instanceof CustodyUnlockError) {
+        // SAFETY: stderr is the operator-facing CLI channel; the refusal names
+        // credential SOURCES and never a value.
+        console.error(`\n  Sanctuary wrap: Custody Establishment Failed`);
+        console.error(`  ${err.message}\n`);
+        process.exit(2);
+      }
+      throw err;
     }
   }
 
@@ -3725,9 +3837,11 @@ export async function runWrap(
     process.exit(2);
   }
 
-  // Resolve or generate passphrase.
+  // Resolve the fortress credential through the ONE shared resolver
+  // (wrap/custody-credential.ts). Its order and its mint condition live there;
+  // this block only reports what it chose.
   //
-  // Invariant: the resolved passphrase never reaches argv or the rewritten
+  // Invariant: the resolved credential never reaches argv or the rewritten
   // agent config. User-supplied `--passphrase` is treated as a one-time
   // setter - we persist it into Keychain/fallback and the launcher
   // re-resolves it at runtime via the same path everyone else uses.
@@ -3738,12 +3852,16 @@ export async function runWrap(
   // wrap-auto dashboard can derive the master key + initialize an
   // AuditLog for the v1.1 hub bindings. Held in this function's scope
   // only; never persisted to disk beyond the existing keychain write
-  // and never injected into the rewritten harness env.
+  // and never injected into the rewritten harness env. UNDEFINED when the
+  // fortress was opened by its OS-keyring custody factor or a recovery key,
+  // neither of which has a passphrase spelling.
   let passphraseValue: string | undefined;
-  if (preResolvedAgentPassphrase !== undefined) {
-    passphraseLocation = preResolvedAgentPassphrase.location;
-    passphraseSource = preResolvedAgentPassphrase.source;
-    passphraseValue = preResolvedAgentPassphrase.value;
+  let protectCredential: ProtectCredential;
+  if (preResolvedAgentCredential !== undefined) {
+    protectCredential = preResolvedAgentCredential;
+    passphraseLocation = protectCredential.location;
+    passphraseSource = protectCredential.source;
+    passphraseValue = protectCredential.passphraseValue;
     if (options.passphrase === undefined && passphraseSource === "generated") {
       // SAFETY: destination description only; never the generated value.
       console.error(
@@ -3752,27 +3870,20 @@ export async function runWrap(
       // SAFETY: fixed backup instruction only; never the generated value.
       console.error("  Back up with: sanctuary export-passphrase");
     }
-  } else if (options.passphrase) {
-    passphraseLocation = "";
-    passphraseSource = "explicit-pending-authentication";
-    passphraseValue = options.passphrase;
-  } else if (process.env.SANCTUARY_PASSPHRASE) {
-    passphraseLocation = "SANCTUARY_PASSPHRASE";
-    passphraseSource = "env";
-    passphraseValue = process.env.SANCTUARY_PASSPHRASE;
   } else {
     try {
-      const resolve =
-        deps.resolvePassphrase ??
-        (() => getOrCreatePassphrase({ storagePath }));
-      const resolved = await resolve();
-      passphraseLocation = resolved.location;
-      passphraseSource = resolved.source;
-      passphraseValue = resolved.value;
-      if (resolved.source === "generated") {
+      protectCredential = await resolveProtectCredential(
+        storagePath,
+        options.passphrase,
+        deps,
+      );
+      passphraseLocation = protectCredential.location;
+      passphraseSource = protectCredential.source;
+      passphraseValue = protectCredential.passphraseValue;
+      if (passphraseSource === "generated") {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
-          `\n  \u{1F510} Generated and stored passphrase (${resolved.location}).`
+          `\n  \u{1F510} Generated and stored passphrase (${passphraseLocation}).`
         );
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
         console.error(
@@ -3780,6 +3891,13 @@ export async function runWrap(
         );
       }
     } catch (err) {
+      if (err instanceof CustodyUnlockError) {
+        // SAFETY: stderr is the operator-facing CLI channel; the refusal names
+        // credential SOURCES in the order they are tried, never a value.
+        console.error(`\n  Sanctuary wrap: Custody Establishment Failed`);
+        console.error(`  ${err.message}\n`);
+        process.exit(2);
+      }
       if (err instanceof PassphraseKeyringUnreachableError) {
         // Locked / unreachable OS keyring (error 36 / no D-Bus): fail closed
         // with the actionable unlock message. Sanctuary did NOT regenerate or
@@ -3818,23 +3936,27 @@ export async function runWrap(
   // verification; non-interactive runs are recorded as an audited headless
   // install. Fail closed on a credential that does not unlock (#5).
   let wrapCustody: WrapCustodyResult | undefined;
-  if (passphraseValue !== undefined) {
+  {
+    // The explicit-setter persistence is keyed on what the resolver actually
+    // CHOSE, not on the flag being present: `--passphrase` is only persisted
+    // when it is the credential that authenticated custody.
+    const persistExplicit = protectCredential.resolvedFrom === "explicit-passphrase";
     try {
       wrapCustody = await establishWrapCustody({
         storagePath,
-        passphrase: passphraseValue,
+        credential: protectCredential.credential,
         interactive: !options.noOpen && process.stdin.isTTY === true,
         agentGuided: options.agentGuided === true,
-        ...(options.passphrase === undefined
-          ? {}
-          : {
+        ...(persistExplicit
+          ? {
               persistAuthenticatedPassphrase:
                 deps.persistPassphrase ??
                 ((value: string) =>
                   persistAndConfirmUserProvidedPassphrase(value, { storagePath })),
-            }),
+            }
+          : {}),
       });
-      if (options.passphrase !== undefined) {
+      if (persistExplicit) {
         const persisted = wrapCustody.persistedPassphrase;
         if (persisted === undefined) {
           throw new Error(
@@ -3888,11 +4010,24 @@ export async function runWrap(
     );
   }
 
-  if (passphraseValue !== undefined) {
+  {
     // Auto-bootstrap pinned-key state for the IPC handshake. Failures here
     // warn but do not abort wrap: a missing pin surfaces cleanly at handshake
     // time (sysext refuses connection) rather than as a wrap-startup abort.
     // First-integration discipline: do no harm to the wrap critical path.
+    //
+    // provision-pin runs as a child with its OWN credential chain, which reads
+    // only these two env vars plus the fortress's stored passphrase. Hand it
+    // whichever credential this run actually used; when the fortress was opened
+    // by its OS-keyring custody factor there is nothing to hand over, and the
+    // child's own refusal ("no stored passphrase exists for this fortress")
+    // surfaces as the non-fatal note below rather than being papered over.
+    const pinCredentialEnv: NodeJS.ProcessEnv =
+      protectCredential.credential.kind === "passphrase"
+        ? { SANCTUARY_PASSPHRASE: protectCredential.credential.value }
+        : protectCredential.credential.kind === "recovery-key"
+          ? { SANCTUARY_RECOVERY_KEY: protectCredential.credential.value }
+          : {};
     try {
       const pinResult = await runProvisionPin([], {
         out: new Writable({ write(_chunk, _encoding, callback) { callback(); } }),
@@ -3900,7 +4035,7 @@ export async function runWrap(
         env: {
           ...process.env,
           SANCTUARY_STORAGE_PATH: storagePath,
-          SANCTUARY_PASSPHRASE: passphraseValue,
+          ...pinCredentialEnv,
         },
       });
       if (pinResult !== 0) {
@@ -4044,11 +4179,14 @@ export async function runWrap(
 
   // The args list is a constant - never inject `--passphrase`. The launched
   // MCP server re-resolves the credential at runtime: SANCTUARY_PASSPHRASE /
-  // SANCTUARY_RECOVERY_KEY env first, and when neither is set it reads the
-  // EXACT-fortress stored passphrase (OS keyring / namespaced fallback file)
-  // and then the machine-local custody key, READ-ONLY, in
-  // createSanctuaryServer's hands-free boot path (see
-  // resolveHandsFreeBootCredential in server/src/index.ts). That path never
+  // SANCTUARY_RECOVERY_KEY env first, and when neither is set it runs the SAME
+  // shared resolver this verb runs (wrap/custody-credential.ts) restricted to
+  // the host-local sources, READ-ONLY, in createSanctuaryServer's hands-free
+  // boot path (see resolveHandsFreeBootCredential in server/src/index.ts). That
+  // resolver tries the ENROLLED OS-keyring custody factor before the
+  // exact-fortress stored passphrase, and verifies each against this fortress's
+  // envelope before returning it, so the server and this verb agree by
+  // construction rather than by two hand-kept orders. That path never
   // generates a passphrase and never mints custody. See SEC-061. Env-block and
   // command/args construction live in buildSanctuaryEnv /
   // resolveSanctuaryCommand so the dry-run reporter previews the exact
@@ -4658,7 +4796,10 @@ export async function runWrap(
     // dashboard startup path. Derive the master key and create a default
     // identity so CLI surfaces (exit export, identity show) work
     // immediately after wrap without launching the dashboard first.
-    if (passphraseValue !== undefined && wrapCustody !== undefined) {
+    // Gated on the ESTABLISHED master, not on a passphrase: a fortress opened
+    // by its OS-keyring custody factor has no passphrase and must still get
+    // its identity bootstrap.
+    if (wrapCustody !== undefined) {
       try {
         const ndStorage = new FilesystemStorage(`${storagePath}/state`);
         // Unified custody: the master was established (or migrated) above;
@@ -4838,7 +4979,9 @@ export async function runWrap(
   // Best-effort: a derivation failure does not fail wrap (operators still
   // get a working v1.0 dashboard at /). The v1.1 surface is reachable
   // via `sanctuary dashboard` if this wiring path errors.
-  if (passphraseValue !== undefined && wrapCustody !== undefined) {
+  // Gated on the ESTABLISHED master, not on a passphrase: see the identical
+  // note on the --no-dashboard bootstrap above.
+  if (wrapCustody !== undefined) {
     try {
       const v11Storage = new FilesystemStorage(`${storagePath}/state`);
       // Unified custody: reuse the master established above (envelope-backed)
@@ -6749,7 +6892,10 @@ function printWrapHelp(): void {
 
   What happens:
     1. Reads your agent's MCP config
-    2. Generates a passphrase (stored in Keychain on macOS, encrypted file elsewhere)
+    2. Opens the fortress with the credential this host already holds for it
+       (the custody factor 'sanctuary init' enrolled, else a stored passphrase),
+       and generates a passphrase only for a fortress with no custody yet
+       (stored in Keychain on macOS, encrypted file elsewhere)
     3. Backs up and rewrites the config so calls route through Sanctuary
     4. Starts the Sovereignty Dashboard and opens it in your browser
     5. Every tool call is logged, scanned, and tier-gated

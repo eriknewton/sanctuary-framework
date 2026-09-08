@@ -36,10 +36,27 @@
  * when the rename happens.
  */
 
-import { describe, it, expect } from "vitest";
-import { readdirSync, readFileSync } from "node:fs";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import {
+  readdirSync,
+  readFileSync,
+  mkdtempSync,
+  mkdirSync,
+  symlinkSync,
+  rmSync,
+} from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+
+import {
+  fortressCustodyCredentialServices,
+  custodyServiceFor,
+  canonicalCustodyServiceFor,
+  recoveryKeyServiceFor,
+  canonicalRecoveryKeyServiceFor,
+} from "../../src/wrap/keychain-custody.js";
+import { fortressKeychainReadServices } from "../../src/wrap/passphrase.js";
 
 const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
 const SERVER_SRC = join(REPO_ROOT, "server", "src");
@@ -273,5 +290,214 @@ describe("frozen-surface guard", () => {
       (v, i) => FROZEN_SURFACES.indexOf(v) !== i,
     );
     expect(dupes, `duplicate entries: ${dupes.join(", ")}`).toEqual([]);
+  });
+});
+
+/**
+ * OS-keyring credential service names (the on-device contract).
+ *
+ * These names live in the OPERATOR's keyring, not in this repository, so a
+ * rename orphans a credential on a machine no release can reach. The
+ * presence-only guard above cannot see them: every non-default fortress's name
+ * is COMPOSED at runtime as `<prefix>-<16 hex of sha256(canonical path)>`, so a
+ * changed prefix, a changed derivation, or a dropped compatibility spelling
+ * never removes a literal from the source corpus.
+ *
+ * This block pins the COMPOSED output of both sides against fixed fixture
+ * paths, so it trips when the ENROL side (`wrap/keychain-custody.ts`,
+ * `wrap/passphrase.ts`) or the derivation changes, and it pins the cross-file
+ * comments that warn an editor of either side before CI has to. The lookup side
+ * is `wrap/custody-credential.ts`, the one resolver every verb reads through:
+ * the A73 defect was a verb looking somewhere the enrolment never wrote.
+ *
+ * The expected strings are LITERALS on purpose. Recomputing the hash in the
+ * test would assert only that the code agrees with itself, which is exactly the
+ * assertion a renamed prefix would still pass.
+ */
+describe("OS-keyring credential service families (on-device contract)", () => {
+  // Fixture paths, not real ones: the parent of the fixture home is `/`, which
+  // exists on every platform, so the canonical (realpath-resolved) and lexical
+  // spellings coincide and the expected output is stable everywhere.
+  const FIXTURE_HOME = "/sanctuary-frozen-surface-fixture-home";
+  const DEFAULT_FORTRESS = `${FIXTURE_HOME}/.sanctuary`;
+  const NAMED_FORTRESS = `${FIXTURE_HOME}/fortresses/daily`;
+
+  it("composes the frozen custody/recovery service names", () => {
+    expect(
+      fortressCustodyCredentialServices(DEFAULT_FORTRESS, FIXTURE_HOME),
+    ).toEqual(["sanctuary-custody", "sanctuary-recovery"]);
+    expect(
+      fortressCustodyCredentialServices(NAMED_FORTRESS, FIXTURE_HOME),
+    ).toEqual([
+      "sanctuary-custody-461e5387cde66977",
+      "sanctuary-recovery-461e5387cde66977",
+    ]);
+  });
+
+  it("composes the frozen passphrase service names, including the legacy read spelling", () => {
+    expect(
+      fortressKeychainReadServices(DEFAULT_FORTRESS, FIXTURE_HOME),
+    ).toEqual(["sanctuary-passphrase"]);
+    // The 12-hex entry is the pre-v1.2.3 spelling and stays READABLE forever;
+    // dropping it strands a credential on any host installed before that.
+    expect(fortressKeychainReadServices(NAMED_FORTRESS, FIXTURE_HOME)).toEqual([
+      "sanctuary-passphrase-461e5387cde66977",
+      "sanctuary-passphrase-461e5387cde6",
+    ]);
+  });
+
+  it("both the enrol side and the lookup side carry the cross-file pin", () => {
+    const pinned: ReadonlyArray<[string, string]> = [
+      ["wrap/keychain-custody.ts", "wrap/custody-credential.ts"],
+      ["wrap/passphrase.ts", "wrap/custody-credential.ts"],
+      ["wrap/custody-credential.ts", "wrap/keychain-custody.ts"],
+      ["wrap/custody-credential.ts", "wrap/passphrase.ts"],
+    ];
+    const missing = pinned.filter(
+      ([file, mustName]) =>
+        !readFileSync(join(SERVER_SRC, file), "utf-8").includes(mustName),
+    );
+    expect(
+      missing,
+      "A credential service-name file no longer names its counterpart. The " +
+        "pin comments are the in-place tripwire that warns whoever edits one " +
+        "side that the other must move with it:\n  " +
+        missing.map(([file, name]) => `${file} -> ${name}`).join("\n  "),
+    ).toEqual([]);
+  });
+});
+
+/**
+ * The block above pins the composed names against a fixture whose canonical
+ * and lexical spellings COINCIDE (the fixture home's parent is `/`, which
+ * needs no realpath resolution), so a dropped lexical alias in
+ * `fortressCustodyCredentialServices` would not trip it: with coincident
+ * paths the de-duplication already collapses the four candidates to two, and
+ * removing the lexical entries from `ordered` produces that SAME two-entry
+ * result. A real symlink is the fixture where the two spellings diverge, so
+ * dropping the alias actually changes the composed output and this test can
+ * see it.
+ */
+describe("OS-keyring credential service families on a path that resolves through a symlink", () => {
+  let symlinkHome: string;
+  let lexicalFortress: string;
+
+  beforeEach(() => {
+    symlinkHome = mkdtempSync(join(tmpdir(), "a73-frozen-surface-symlink-"));
+    const realFortress = join(symlinkHome, "real-fortress");
+    mkdirSync(realFortress, { recursive: true });
+    const linkDir = join(symlinkHome, "link-fortress");
+    symlinkSync(realFortress, linkDir);
+    // The fixture path itself need not exist: `canonicalCredentialStoragePath`
+    // walks up to the deepest existing ancestor (the symlink) and resolves it,
+    // then rejoins the non-existent tail.
+    lexicalFortress = join(linkDir, "daily");
+  });
+
+  afterEach(() => {
+    rmSync(symlinkHome, { recursive: true, force: true });
+  });
+
+  it("composes distinct canonical and lexical names, and the lookup registry carries both", () => {
+    const canonicalCustody = canonicalCustodyServiceFor(lexicalFortress, symlinkHome);
+    const lexicalCustody = custodyServiceFor(lexicalFortress, symlinkHome);
+    const canonicalRecovery = canonicalRecoveryKeyServiceFor(lexicalFortress, symlinkHome);
+    const lexicalRecovery = recoveryKeyServiceFor(lexicalFortress, symlinkHome);
+
+    // Sanity check on the fixture: if the two spellings ever coincided again,
+    // the assertion below would be vacuous rather than a real pin.
+    expect(canonicalCustody).not.toBe(lexicalCustody);
+    expect(canonicalRecovery).not.toBe(lexicalRecovery);
+
+    expect(
+      fortressCustodyCredentialServices(lexicalFortress, symlinkHome),
+    ).toEqual([canonicalCustody, lexicalCustody, canonicalRecovery, lexicalRecovery]);
+  });
+});
+
+/**
+ * Credential help text and the boot-order comments that describe it.
+ *
+ * `server/reorg-surface-manifest.md` freezes the CLI command surface INCLUDING
+ * its help text, because help text is product copy an operator acts on. The
+ * A73 credential work changed the behavior underneath it: `protect` stopped
+ * minting a passphrase over a fortress that already has custody, and
+ * `export-passphrase` stopped being a `sanctuary-passphrase`-only read. The old
+ * wording therefore described behavior the code no longer has, which is the one
+ * reason frozen text may change — and it changes WITH the manifest row, never
+ * around it.
+ *
+ * These assertions pin the new wording so the next edit is a deliberate one,
+ * and pin the two source comments that state the same contract from the other
+ * side. A comment that is merely true today is not a contract; a comment a test
+ * fails on is.
+ */
+describe("credential help text and boot-order comments match the shipped behavior", () => {
+  const read = (file: string): string =>
+    readFileSync(join(SERVER_SRC, file), "utf-8");
+
+  it("no help text still promises that protect auto-generates a passphrase", () => {
+    // The exact strings that were false: `protect` opens an existing fortress
+    // with the credential this host already holds, and mints only for a
+    // fortress with no custody at all.
+    const retired = [
+      "Auto-generates a passphrase",
+      "2. Generates a passphrase (stored in Keychain on macOS",
+      "# Print stored passphrase",
+      "Print the stored passphrase to stdout after",
+    ];
+    const survivors = retired.filter(
+      (text) => read("cli.ts").includes(text) || read("wrap/cli.ts").includes(text),
+    );
+    expect(
+      survivors,
+      "Frozen help text that describes retired behavior is back in the tree. " +
+        "If the behavior itself came back, update the CLI-command-surface row " +
+        "in server/reorg-surface-manifest.md in the same change:\n  " +
+        survivors.join("\n  "),
+    ).toEqual([]);
+  });
+
+  it("both protect help surfaces describe the enrolled-credential path", () => {
+    for (const file of ["cli.ts", "wrap/cli.ts"] as const) {
+      expect(read(file)).toContain(
+        "generates a passphrase only for a fortress with no custody yet",
+      );
+    }
+    expect(read("cli.ts")).toContain(
+      "Opens the fortress with the custody factor already",
+    );
+  });
+
+  it("export-passphrase help states the passphrase-first order its code runs", () => {
+    // Paired with the two resolver calls in `cli/export-passphrase.ts`: the
+    // stored passphrase first, the enrolled custody factor only as a fallback.
+    // The defect this closes was help and code disagreeing about that order.
+    expect(read("cli/export-passphrase.ts")).toContain(
+      "Prints the stored fortress passphrase when one unlocks this fortress,",
+    );
+    expect(read("cli/export-passphrase.ts")).toContain(
+      'const stored = await resolveHostLocal(["stored-passphrase"]);',
+    );
+  });
+
+  it("the wrap MCP-entry comment names the resolver the launched server runs", () => {
+    // The launched server resolves its credential through
+    // `wrap/custody-credential.ts`, which tries the ENROLLED custody factor
+    // before the stored passphrase. The comment used to state the opposite
+    // order, which is a boot-order claim an operator would debug against.
+    const wrapCli = read("wrap/cli.ts");
+    expect(wrapCli).toContain(
+      "the SAME\n  // shared resolver this verb runs (wrap/custody-credential.ts)",
+    );
+    expect(wrapCli).toContain(
+      "tries the ENROLLED OS-keyring custody factor before the",
+    );
+  });
+
+  it("readStoredPassphrase's doc no longer claims export-passphrase as its consumer", () => {
+    const passphrase = read("wrap/passphrase.ts");
+    expect(passphrase).not.toContain("Used by the `export-passphrase` subcommand");
+    expect(passphrase).toContain("It is NOT the fortress credential chain.");
   });
 });
