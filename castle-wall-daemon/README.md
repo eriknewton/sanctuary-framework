@@ -99,9 +99,13 @@ Three layers of source, named after the surface they own.
    assembles them (plus `src/runtime_lock.rs`, `src/systemd_notify.rs`, and
    `src/thread_component.rs`) into the ordered enforcement runtime that
    `src/enforcement.rs` acquires with all-or-nothing startup, readiness gating,
-   and reverse-order teardown. The shipped boot path drives this to
-   `KernelRuntimeReady`; the agent lifecycle installs a marker-bound cgroup
-   jump and NFQUEUE body as one transaction before it can report enforcement.
+   and reverse-order teardown. The shipped boot path stops at
+   `KernelRuntimeReady`, and that is the end of what this tree does: the agent
+   lifecycle (launching or wrapping a protected agent, and the marker-bound
+   cgroup jump plus NFQUEUE body that would confine one) is NOT built here, as
+   the Status section above states. Reporting enforcement would require that
+   unbuilt lifecycle, so this daemon never reports `Enforcing`. Tracked as
+   `ic-sweep-linux-enforcement-actually-enforces`.
    Once acquired, the owned nftables table and its authenticated, root-owned
    ownership journal are PRESERVED across every ordinary userspace loss
    (SIGTERM, `systemctl stop`, a crash, a readiness-notify failure, a partial

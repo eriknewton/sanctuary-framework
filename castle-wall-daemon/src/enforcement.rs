@@ -41,7 +41,7 @@
 //! reference server CI/drill environment, but no Ubuntu-only behavior is baked
 //! in; a distro-specific concern belongs in the boot/install layer, not here.
 //! Server hardware is the first acceptance platform (Omarchy is not); Linux
-//! assurance stays `not_verified` until captured hardware-drill evidence
+//! assurance stays `not_implemented` until captured hardware-drill evidence
 //! exists.
 //!
 //! Scope boundary: this L1 slice owns the kernel-runtime lifecycle only. The
@@ -59,9 +59,9 @@
 //! teardown — so it stays testable with deterministic fakes on a host without a
 //! kernel. Activating the plan makes the daemon reach `KernelRuntimeReady` on a
 //! privileged Linux host. That base state alone is not `Enforcing`: a protected
-//! agent must also be wrapped. Linux egress enforcement stays `not_verified`
-//! (ASSURANCE_MATRIX row 17) until a captured hardware drill proves a wrapped
-//! agent is actually blocked.
+//! agent must also be wrapped. Linux egress enforcement stays
+//! `not_implemented` (ASSURANCE_MATRIX row 17) until a captured hardware drill
+//! proves a wrapped agent is actually blocked.
 //! [`EnforcementError::AdapterNotVerified`] remains the vocabulary for a future
 //! provider that is wired but not yet drill-proven.
 
