@@ -311,7 +311,6 @@ mod linux {
             ))
         })
     }
-
 }
 
 // ---- Public API (platform-dispatching) ------------------------------------

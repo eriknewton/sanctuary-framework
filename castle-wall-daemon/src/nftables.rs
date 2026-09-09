@@ -86,10 +86,7 @@ pub enum ExpectedAgentBinding {
     /// design names, and it is read fresh at each comparison, never frozen at
     /// acquisition: a manifest reload that changes the uid must invalidate a
     /// stale kernel binding rather than keep blessing it.
-    Confined {
-        fortress_id: String,
-        agent_uid: u32,
-    },
+    Confined { fortress_id: String, agent_uid: u32 },
     /// The current snapshot confines NO agent uid (absent `agent_origin`, or a
     /// non-`uid` mode), or the table was just created and cannot yet hold one.
     /// Any live per-agent binding is then unverifiable against a trusted
@@ -447,11 +444,7 @@ pub struct NftRuleFragment {
 /// that it is not what the live guarantee rests on: the `queue num 0` above it
 /// is emitted WITHOUT `bypass`, so an unreachable or unbound NFQUEUE drops the
 /// packet in the kernel rather than releasing it.
-pub fn build_agent_ruleset(
-    agent_id: &str,
-    agent_uid: u32,
-    rules: &[NftRuleFragment],
-) -> String {
+pub fn build_agent_ruleset(agent_id: &str, agent_uid: u32, rules: &[NftRuleFragment]) -> String {
     let chain_name = agent_chain_name(agent_id);
     let castle_table = castle_table();
     let agent_mark = crate::nfqueue::register_agent_mark(agent_id);
@@ -988,10 +981,8 @@ mod linux {
         // chains by construction, so any per-agent binding present here is
         // something this process did not install: refuse it rather than capture
         // an identity over state of unknown provenance.
-        let owned = super::parse_owned_table_identity(
-            &json,
-            &super::ExpectedAgentBinding::NoneConfined,
-        )?;
+        let owned =
+            super::parse_owned_table_identity(&json, &super::ExpectedAgentBinding::NoneConfined)?;
         if owned.marker != expected_marker {
             return Err(NftablesError::ForeignState(format!(
                 "captured table marker does not match the marker just written \
@@ -1093,12 +1084,18 @@ mod linux {
         } else {
             format!(
                 "{}:{rule_role}:{}{}{}",
-                ownership.marker, id.agent_id, super::AGENT_UID_SEAL_INFIX, uid_seal
+                ownership.marker,
+                id.agent_id,
+                super::AGENT_UID_SEAL_INFIX,
+                uid_seal
             )
         };
         let jump_comment = format!(
             "{}:jump:{}{}{}",
-            ownership.marker, id.agent_id, super::AGENT_UID_SEAL_INFIX, uid_seal
+            ownership.marker,
+            id.agent_id,
+            super::AGENT_UID_SEAL_INFIX,
+            uid_seal
         );
         let listing = match run_nft(&["-a", "list", "chain", CASTLE_FAMILY, castle_table, "output"])
         {
@@ -2120,8 +2117,7 @@ fn parse_owned_table_inventory(
             if let Some(prior) = uid_bindings.insert(agent_id.to_string(), binding) {
                 if prior != binding {
                     return Err(NftablesError::ForeignState(
-                        "owned body and output jump disagree on the agent uid binding"
-                            .to_string(),
+                        "owned body and output jump disagree on the agent uid binding".to_string(),
                     ));
                 }
             }
@@ -2532,7 +2528,10 @@ mod tests {
         let stringified = serde_json::json!({
             "match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": "4242"}
         });
-        assert!(parse_skuid_value(&stringified).is_none(), "string uid refused");
+        assert!(
+            parse_skuid_value(&stringified).is_none(),
+            "string uid refused"
+        );
         let root = serde_json::json!({
             "match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 0}
         });
@@ -2553,15 +2552,24 @@ mod tests {
         let wrong_key = serde_json::json!({
             "match": {"op": "==", "left": {"meta": {"key": "skgid"}}, "right": 4242}
         });
-        assert!(parse_skuid_value(&wrong_key).is_none(), "skgid is not skuid");
+        assert!(
+            parse_skuid_value(&wrong_key).is_none(),
+            "skgid is not skuid"
+        );
         let extra_key = serde_json::json!({
             "match": {"op": "==", "left": {"meta": {"key": "skuid", "foo": 1}}, "right": 4242}
         });
-        assert!(parse_skuid_value(&extra_key).is_none(), "extra meta key refused");
+        assert!(
+            parse_skuid_value(&extra_key).is_none(),
+            "extra meta key refused"
+        );
         let not_equality = serde_json::json!({
             "match": {"op": "!=", "left": {"meta": {"key": "skuid"}}, "right": 4242}
         });
-        assert!(parse_skuid_value(&not_equality).is_none(), "non-== op refused");
+        assert!(
+            parse_skuid_value(&not_equality).is_none(),
+            "non-== op refused"
+        );
         let socket_shape = serde_json::json!({
             "match": {"op": "==", "left": {"socket": {"key": "cgroupv2"}}, "right": "system.slice"}
         });
@@ -2596,7 +2604,10 @@ mod tests {
         // The derivation, checked rather than asserted by comment: a
         // worst-case marker + role + agent id + seal must fit nft's comment cap,
         // and the queue role must be the binding one.
-        let marker = format!("{OWNER_MARKER_PREFIX}{}", "a".repeat(OWNER_MARKER_NONCE_HEX_LEN));
+        let marker = format!(
+            "{OWNER_MARKER_PREFIX}{}",
+            "a".repeat(OWNER_MARKER_NONCE_HEX_LEN)
+        );
         let agent_id = "a".repeat(MAX_AGENT_ID_LEN);
         let seal = agent_uid_seal("fortress-id", &agent_id, 4242);
         for role in [":queue:", ":jump:"] {
@@ -2854,7 +2865,8 @@ mod tests {
     #[test]
     fn owned_identity_parses_handles_and_marker() {
         let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        let owned = parse_owned_table_identity(&owned_json(2, 1, &marker), &fixture_expectation()).expect("owned");
+        let owned = parse_owned_table_identity(&owned_json(2, 1, &marker), &fixture_expectation())
+            .expect("owned");
         assert_eq!(
             owned,
             CastleTableOwnership {
@@ -2937,9 +2949,11 @@ mod tests {
         let marker = fixture_marker();
         let mark = crate::nfqueue::agent_mark("agent-one");
         let before = crate::nfqueue::resolve_agent_mark(mark);
-        let parsed =
-            parse_owned_table_inventory(&owned_agent_json(&marker, true, true), &fixture_expectation())
-                .expect("complete inventory");
+        let parsed = parse_owned_table_inventory(
+            &owned_agent_json(&marker, true, true),
+            &fixture_expectation(),
+        )
+        .expect("complete inventory");
         assert_eq!(parsed.agent_ids, vec!["agent-one".to_string()]);
         assert_eq!(
             crate::nfqueue::resolve_agent_mark(mark),
@@ -2962,9 +2976,12 @@ mod tests {
         let other_uid = owned_agent_json_with_uid(&marker, true, true, 5555);
         // Sanity: the forgery IS internally consistent, so it would pass every
         // check that reads only the dump.
-        parse_owned_table_identity(&other_uid, &ExpectedAgentBinding::SealOnly {
-            fortress_id: FIXTURE_FORTRESS.to_string(),
-        })
+        parse_owned_table_identity(
+            &other_uid,
+            &ExpectedAgentBinding::SealOnly {
+                fortress_id: FIXTURE_FORTRESS.to_string(),
+            },
+        )
         .expect("the forgery is internally consistent and passes seal-only");
 
         let err = parse_owned_table_identity(&other_uid, &fixture_expectation()).unwrap_err();
@@ -2974,8 +2991,11 @@ mod tests {
              refused as foreign, got: {err:?}"
         );
         // The legitimate binding still parses: the check rejects ONLY the wrong uid.
-        parse_owned_table_identity(&owned_agent_json(&marker, true, true), &fixture_expectation())
-            .expect("the correct per-agent binding must still parse");
+        parse_owned_table_identity(
+            &owned_agent_json(&marker, true, true),
+            &fixture_expectation(),
+        )
+        .expect("the correct per-agent binding must still parse");
     }
 
     #[test]
@@ -2990,11 +3010,17 @@ mod tests {
             &ExpectedAgentBinding::NoneConfined,
         )
         .unwrap_err();
-        assert!(matches!(err, NftablesError::ForeignState(_)), "got: {err:?}");
+        assert!(
+            matches!(err, NftablesError::ForeignState(_)),
+            "got: {err:?}"
+        );
         // A table with NO agent binding is still fine under the same expectation:
         // that is the ordinary kernel-runtime-ready posture with nothing wrapped.
-        parse_owned_table_identity(&owned_json(2, 1, &marker), &ExpectedAgentBinding::NoneConfined)
-            .expect("an agent-free owned table is legitimate with nothing confined");
+        parse_owned_table_identity(
+            &owned_json(2, 1, &marker),
+            &ExpectedAgentBinding::NoneConfined,
+        )
+        .expect("an agent-free owned table is legitimate with nothing confined");
     }
 
     #[test]
@@ -3062,8 +3088,8 @@ mod tests {
             "{marker}:jump:agent-one:uid:{}",
             agent_uid_seal(FIXTURE_FORTRESS, "agent-one", FIXTURE_AGENT_UID + 1)
         ));
-        let err = parse_owned_table_identity(&document.to_string(), &fixture_expectation())
-            .unwrap_err();
+        let err =
+            parse_owned_table_identity(&document.to_string(), &fixture_expectation()).unwrap_err();
         assert!(
             matches!(err, NftablesError::ForeignState(_)),
             "a body/jump uid disagreement must be refused as foreign, got: {err:?}"
@@ -3150,9 +3176,21 @@ mod tests {
     #[test]
     fn owned_identity_refuses_partial_agent_inventory_after_interrupted_mutation() {
         let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        assert!(parse_owned_table_identity(&owned_agent_json(&marker, false, true), &fixture_expectation()).is_err());
-        assert!(parse_owned_table_identity(&owned_agent_json(&marker, true, false), &fixture_expectation()).is_err());
-        assert!(parse_owned_table_identity(&owned_agent_json(&marker, false, false), &fixture_expectation()).is_err());
+        assert!(parse_owned_table_identity(
+            &owned_agent_json(&marker, false, true),
+            &fixture_expectation()
+        )
+        .is_err());
+        assert!(parse_owned_table_identity(
+            &owned_agent_json(&marker, true, false),
+            &fixture_expectation()
+        )
+        .is_err());
+        assert!(parse_owned_table_identity(
+            &owned_agent_json(&marker, false, false),
+            &fixture_expectation()
+        )
+        .is_err());
     }
 
     #[test]
@@ -3282,8 +3320,10 @@ mod tests {
         // verify against the captured tuple (handle-bound) refuses it. This is
         // what makes "same-shape replacement withdraws readiness" hold.
         let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        let first = parse_owned_table_identity(&owned_json(2, 1, &marker), &fixture_expectation()).unwrap();
-        let recreated = parse_owned_table_identity(&owned_json(7, 5, &marker), &fixture_expectation()).unwrap();
+        let first =
+            parse_owned_table_identity(&owned_json(2, 1, &marker), &fixture_expectation()).unwrap();
+        let recreated =
+            parse_owned_table_identity(&owned_json(7, 5, &marker), &fixture_expectation()).unwrap();
         assert_ne!(
             first, recreated,
             "a same-shape recreate must not compare equal to the captured identity"
@@ -3379,7 +3419,11 @@ mod tests {
         // first health poll declares it foreign and re-arms deny-all.
         let script = build_agent_ruleset("regression", 60123, &[]);
         let skuid_lines: Vec<&str> = script.lines().filter(|l| l.contains("skuid")).collect();
-        assert_eq!(skuid_lines.len(), 1, "exactly one skuid rule expected: {script}");
+        assert_eq!(
+            skuid_lines.len(),
+            1,
+            "exactly one skuid rule expected: {script}"
+        );
         let after = skuid_lines[0]
             .split("meta skuid ")
             .nth(1)
@@ -3388,7 +3432,10 @@ mod tests {
             after.starts_with("60123 "),
             "uid must be emitted as a bare decimal integer, got: {after}"
         );
-        assert!(!after.starts_with('"'), "a quoted/name form is never emitted");
+        assert!(
+            !after.starts_with('"'),
+            "a quoted/name form is never emitted"
+        );
     }
 
     #[test]

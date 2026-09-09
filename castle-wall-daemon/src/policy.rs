@@ -1898,7 +1898,10 @@ mod tests {
     fn snapshot_refuses_uid_mode_agent_origin_with_no_agent_uid() {
         let loaded = loaded_with_origin(Some(uid_origin(None, None, 500)));
         let err = PolicySnapshot::from_loaded_manifest(&loaded).unwrap_err();
-        assert!(matches!(err, PolicySnapshotError::AgentOriginUnusable { .. }));
+        assert!(matches!(
+            err,
+            PolicySnapshotError::AgentOriginUnusable { .. }
+        ));
     }
 
     #[test]

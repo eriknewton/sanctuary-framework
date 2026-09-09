@@ -126,10 +126,8 @@ fn nftables_load_and_remove_agent_ruleset() {
         rule_id: "r-test-1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script =
-        nftables::build_agent_ruleset("test-agent-1", TEST_AGENT_UID, &frags);
-    nftables::load_agent_ruleset(&id, &script, test_binding())
-        .expect("load_agent_ruleset");
+    let script = nftables::build_agent_ruleset("test-agent-1", TEST_AGENT_UID, &frags);
+    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load_agent_ruleset");
 
     let output = nft_cmd(&["list", "table", CASTLE_FAMILY, isolation::table()]);
     assert!(
@@ -154,7 +152,6 @@ fn nftables_atomic_replace_updates_rules() {
     cleanup_castle_table();
     nftables::install_castle_table().expect("install");
 
-
     let id = ruleset_id("test-replace");
 
     // Static fragments are intentionally IGNORED by `build_agent_ruleset` in the
@@ -169,8 +166,7 @@ fn nftables_atomic_replace_updates_rules() {
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
     let script1 = nftables::build_agent_ruleset("test-replace", TEST_AGENT_UID, &frags1);
-    nftables::load_agent_ruleset(&id, &script1, test_binding())
-        .expect("load v1");
+    nftables::load_agent_ruleset(&id, &script1, test_binding()).expect("load v1");
     let listing_v1 = nft_cmd(&[
         "-a",
         "list",
@@ -187,8 +183,7 @@ fn nftables_atomic_replace_updates_rules() {
         nft_expr: "tcp dport 8443 accept".to_string(),
     }];
     let script2 = nftables::build_agent_ruleset("test-replace", TEST_AGENT_UID, &frags2);
-    nftables::load_agent_ruleset(&id, &script2, test_binding())
-        .expect("load v2");
+    nftables::load_agent_ruleset(&id, &script2, test_binding()).expect("load v2");
     let listing_v2 = nft_cmd(&[
         "-a",
         "list",
@@ -253,7 +248,14 @@ fn installed_binding_verifies_under_the_manifest_uid_and_not_under_another() {
     let script = nftables::build_agent_ruleset("agreement-test", TEST_AGENT_UID, &[]);
     nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load");
 
-    let json = nft_cmd(&["-a", "-j", "list", "table", CASTLE_FAMILY, isolation::table()]);
+    let json = nft_cmd(&[
+        "-a",
+        "-j",
+        "list",
+        "table",
+        CASTLE_FAMILY,
+        isolation::table(),
+    ]);
 
     // The uid the manifest confines: the live inventory is the owned object.
     nftables::parse_owned_table_identity(&json, &test_expectation())
@@ -316,15 +318,13 @@ fn nftables_ruleset_includes_nfqueue_catchall() {
     cleanup_castle_table();
     nftables::install_castle_table().expect("install");
 
-
     let id = ruleset_id("test-queue");
 
     let frags = vec![NftRuleFragment {
         rule_id: "r1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script =
-        nftables::build_agent_ruleset("test-queue", TEST_AGENT_UID, &frags);
+    let script = nftables::build_agent_ruleset("test-queue", TEST_AGENT_UID, &frags);
     nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load");
 
     // nft canonicalizes the input rule form `queue num 0` to `queue to 0`
@@ -364,8 +364,7 @@ fn gf1_deny_all_over_a_live_agent_table_forces_policy_drop_never_accept() {
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
     let script = nftables::build_agent_ruleset("gf1-live-agent", TEST_AGENT_UID, &frags);
-    nftables::load_agent_ruleset(&id, &script, test_binding())
-        .expect("load_agent_ruleset");
+    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load_agent_ruleset");
 
     // Precondition: the fail-OPEN shape -- accept base chain, agent wired.
     let before = nft_cmd(&["list", "table", CASTLE_FAMILY, isolation::table()]);
@@ -424,8 +423,7 @@ fn nftables_load_agent_ruleset_installs_base_chain_jump() {
         rule_id: "r1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script =
-        nftables::build_agent_ruleset("jump-test", TEST_AGENT_UID, &frags);
+    let script = nftables::build_agent_ruleset("jump-test", TEST_AGENT_UID, &frags);
     nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load");
 
     // The base `output` chain now holds the jump rule.
@@ -488,10 +486,8 @@ fn nftables_load_agent_ruleset_idempotent_under_reload() {
         rule_id: "r1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script1 =
-        nftables::build_agent_ruleset("idem-test", TEST_AGENT_UID, &frags1);
-    nftables::load_agent_ruleset(&id, &script1, test_binding())
-        .expect("load v1");
+    let script1 = nftables::build_agent_ruleset("idem-test", TEST_AGENT_UID, &frags1);
+    nftables::load_agent_ruleset(&id, &script1, test_binding()).expect("load v1");
     let listing1 = nft_cmd(&[
         "-a",
         "list",
@@ -512,10 +508,8 @@ fn nftables_load_agent_ruleset_idempotent_under_reload() {
         rule_id: "r2".to_string(),
         nft_expr: "tcp dport 8443 accept".to_string(),
     }];
-    let script2 =
-        nftables::build_agent_ruleset("idem-test", TEST_AGENT_UID, &frags2);
-    nftables::load_agent_ruleset(&id, &script2, test_binding())
-        .expect("load v2");
+    let script2 = nftables::build_agent_ruleset("idem-test", TEST_AGENT_UID, &frags2);
+    nftables::load_agent_ruleset(&id, &script2, test_binding()).expect("load v2");
     let listing2 = nft_cmd(&[
         "-a",
         "list",

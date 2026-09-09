@@ -138,42 +138,6 @@ fn write_pinned_key(dir: &Path, signing: &SigningKey) -> PathBuf {
 }
 
 fn write_signed_manifest_one_rule(policy_dir: &Path, signing: &SigningKey) {
-    write_signed_manifest_one_rule_with_origin(policy_dir, signing, None)
-}
-
-/// The same manifest, carrying a signed `uid`-mode agent origin.
-///
-/// A per-agent kernel binding is only legitimate because a manifest in force
-/// confines that uid, so any test that installs one and then expects a restart to
-/// ADOPT it must publish the matching origin. Without it the restart is being
-/// asked to vouch for a binding nothing in force describes, and refusing is the
-/// correct answer, not a test failure.
-fn write_signed_manifest_one_rule_with_uid_origin(
-    policy_dir: &Path,
-    signing: &SigningKey,
-    agent_uid: u32,
-    system_uid_allow_ceiling: u32,
-) {
-    write_signed_manifest_one_rule_with_origin(
-        policy_dir,
-        signing,
-        Some(AgentOrigin {
-            mode: "uid".to_string(),
-            egress_helper_signing_id: None,
-            egress_helper_team_id: None,
-            agent_runtime_port_range: None,
-            agent_uid: Some(agent_uid),
-            gate_uid: None,
-            system_uid_allow_ceiling,
-        }),
-    )
-}
-
-fn write_signed_manifest_one_rule_with_origin(
-    policy_dir: &Path,
-    signing: &SigningKey,
-    agent_origin: Option<AgentOrigin>,
-) {
     fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
     let body = format!(
         "{{\"id\":\"{}\",\"schema_version\":1,\"created_at\":\"2026-05-06T00:00:00Z\",\"match\":{{\"host\":[\"example.com\"],\"port\":[443],\"protocol\":\"tcp\"}},\"disposition\":\"allow\"}}",
@@ -198,7 +162,7 @@ fn write_signed_manifest_one_rule_with_origin(
         fortress_id: "deadbeef".to_string(),
         issued_at: "2026-05-06T00:00:00Z".to_string(),
         generation: 1,
-        agent_origin,
+        agent_origin: None,
         operator_baseline: None,
         rules: vec![
             ManifestRuleEntry {
@@ -229,6 +193,107 @@ fn write_signed_manifest_one_rule_with_origin(
     };
     let serialized = serde_json::to_string_pretty(&signed).unwrap();
     fs::write(policy_dir.join(MANIFEST_FILENAME), serialized).unwrap();
+}
+
+/// A manifest the daemon actually ADMITS, optionally carrying a signed
+/// `uid`-mode agent origin.
+///
+/// Distinct from [`write_signed_manifest_one_rule`] on purpose: that one's rule
+/// carries a `match.host` axis this daemon refuses to enforce, so the manifest is
+/// rejected at boot and the daemon runs with NO policy. That is what its callers
+/// want. A test about the RECLAIM comparison needs the opposite — a manifest that
+/// is genuinely in force — so this writer uses an ip/port/protocol rule, which the
+/// daemon can enforce. Failure mode if the two are confused: the daemon logs a
+/// manifest-refused line, runs with no policy, and the reclaim comparison then
+/// refuses the agent binding for a reason that has nothing to do with the uid.
+fn write_admitted_manifest_with_origin(
+    policy_dir: &Path,
+    signing: &SigningKey,
+    agent_origin: Option<AgentOrigin>,
+) {
+    fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
+    let body = "{\"id\":\"rule-allow-ip\",\"schema_version\":1,\"created_at\":\"2026-05-06T00:00:00Z\",\"match\":{\"ip\":[\"203.0.113.10\"],\"port\":[443],\"protocol\":\"tcp\"},\"disposition\":\"allow\"}";
+    let body_bytes = body.as_bytes();
+    fs::write(
+        policy_dir.join(RULES_SUBDIR).join("rule-allow-ip.json"),
+        body_bytes,
+    )
+    .unwrap();
+    let habeas_body = castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes();
+    fs::write(
+        policy_dir
+            .join(RULES_SUBDIR)
+            .join("reserved_habeas_distress_local.json"),
+        habeas_body,
+    )
+    .unwrap();
+    let manifest = AllowlistManifest {
+        schema_version: 1,
+        fortress_id: "deadbeef".to_string(),
+        issued_at: "2026-05-06T00:00:00Z".to_string(),
+        generation: 1,
+        agent_origin,
+        operator_baseline: None,
+        rules: vec![
+            ManifestRuleEntry {
+                rule_id: "rule-allow-ip".to_string(),
+                file: "rule-allow-ip.json".to_string(),
+                sha256: sha256_hex(body_bytes),
+            },
+            ManifestRuleEntry {
+                rule_id: "reserved_habeas_distress_local".to_string(),
+                file: "reserved_habeas_distress_local.json".to_string(),
+                sha256: sha256_hex(habeas_body),
+            },
+        ],
+    };
+    let canonical = canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();
+    let sig = signing.sign(&canonical);
+    let signed = SignedManifest {
+        manifest,
+        signature: ManifestSignature {
+            signature_scheme: SIGNATURE_SCHEME_V1.to_string(),
+            signing_key_id: castle_wall_daemon::crypto::castle_wall_signing_key_id(
+                &signing.verifying_key().to_bytes(),
+            )
+            .unwrap(),
+            signature_b64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(sig.to_bytes()),
+        },
+    };
+    fs::write(
+        policy_dir.join(MANIFEST_FILENAME),
+        serde_json::to_string_pretty(&signed).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A manifest the daemon admits, carrying a signed `uid`-mode agent origin.
+///
+/// A per-agent kernel binding is only legitimate because a manifest in force
+/// confines that uid, so any test that installs one and then expects a restart to
+/// ADOPT it must publish the matching origin. Without it the restart is being
+/// asked to vouch for a binding nothing in force describes, and refusing is the
+/// correct answer, not a test failure.
+fn write_signed_manifest_one_rule_with_uid_origin(
+    policy_dir: &Path,
+    signing: &SigningKey,
+    agent_uid: u32,
+    system_uid_allow_ceiling: u32,
+) {
+    write_admitted_manifest_with_origin(
+        policy_dir,
+        signing,
+        Some(AgentOrigin {
+            mode: "uid".to_string(),
+            egress_helper_signing_id: None,
+            egress_helper_team_id: None,
+            agent_runtime_port_range: None,
+            agent_uid: Some(agent_uid),
+            gate_uid: None,
+            system_uid_allow_ceiling,
+        }),
+    )
 }
 
 fn write_bad_signature_manifest(policy_dir: &Path, signing: &SigningKey) {
@@ -449,10 +514,8 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
         rule_id: "r-f2".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script =
-        nftables::build_agent_ruleset("f2-test", TEST_AGENT_UID, &frags);
-    nftables::load_agent_ruleset(&id, &script, test_binding())
-        .expect("load_agent_ruleset");
+    let script = nftables::build_agent_ruleset("f2-test", TEST_AGENT_UID, &frags);
+    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load_agent_ruleset");
 
     // Sanity: the chain is in the kernel before the simulated crash.
     let pre = Command::new("nft")
@@ -565,7 +628,10 @@ fn a_live_agent_binding_is_refused_when_the_restart_confines_no_uid() {
     let signing2 = SigningKey::generate(&mut OsRng);
     let dir2 = TempDir::new().unwrap();
     let config2 = fresh_config(&dir2, &signing2);
-    write_signed_manifest_one_rule(&config2.policy_dir, &signing2);
+    // An ADMITTED manifest that simply carries no agent origin: the legitimate
+    // unwrapped posture. Using a manifest the daemon REJECTS would refuse the
+    // binding for the wrong reason and the test would pass without testing this.
+    write_admitted_manifest_with_origin(&config2.policy_dir, &signing2, None);
 
     match boot(config2) {
         Ok(_) => panic!(
@@ -628,8 +694,7 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
         rule_id: "r-f3".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script =
-        nftables::build_agent_ruleset("f3-test", TEST_AGENT_UID, &frags);
+    let script = nftables::build_agent_ruleset("f3-test", TEST_AGENT_UID, &frags);
     nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load");
 
     // Connect, handshake, then forcibly close the client side mid-session.
