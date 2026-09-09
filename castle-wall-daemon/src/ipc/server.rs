@@ -2665,15 +2665,21 @@ mod tests {
 
     #[test]
     fn audit_drain_never_builds_an_oversized_encoded_response() {
+        // Named so the resume cap below is derived from the fixture rather than
+        // written as a bare literal: WAL_ROWS rows of PAYLOAD_BYTES each is
+        // roughly 18 MB of WAL, comfortably inside WAL_CAP_BYTES.
+        const WAL_ROWS: usize = 60;
+        const PAYLOAD_BYTES: usize = 300 * 1024;
+        const WAL_CAP_BYTES: u64 = 32 * 1024 * 1024;
+
         let dir = TempDir::new().unwrap();
         let wal = Arc::new(Mutex::new(
-            WalWriter::open_with_cap(&dir.path().join("byte-bounded.wal"), 32 * 1024 * 1024)
-                .unwrap(),
+            WalWriter::open_with_cap(&dir.path().join("byte-bounded.wal"), WAL_CAP_BYTES).unwrap(),
         ));
-        let large_value = "x".repeat(300 * 1024);
+        let large_value = "x".repeat(PAYLOAD_BYTES);
         {
             let mut writer = wal.lock().unwrap();
-            for index in 0..60 {
+            for index in 0..WAL_ROWS {
                 writer
                     .append_metric(&format!(
                         "{{\"event\":{index},\"payload\":\"{large_value}\"}}"
@@ -2684,7 +2690,43 @@ mod tests {
         let mut state = fresh_state("wal-byte-bounded", Vec::new());
         Arc::get_mut(&mut state).unwrap().wal_writer = Some(wal);
 
-        let response = handle_audit_drain("drain-byte-bounded", None, u32::MAX, &state);
+        // The loop exists because WAL snapshot validation is bounded work per
+        // call (`CONTROL_OPERATION_BUDGET`) that resumes from its retained
+        // cursor on the next call with the same cursor and limit, so one call
+        // completing an ~18 MB validation is a property of a fast machine and
+        // never a contract; the drain's byte bound is what this test proves,
+        // not the number of calls the validation takes.
+        //
+        // Cap derivation: `WalWriter::snapshot_after_bounded` tests its deadline
+        // before each line read, so every resumed call consumes at least one WAL
+        // line; the snapshot walks WAL_ROWS lines plus one zero-length read at
+        // EOF, and RESUME_CALL_SLACK absorbs a call whose budget expires before
+        // its first read.
+        const RESUME_CALL_SLACK: usize = 4;
+        const MAX_SNAPSHOT_RESUME_CALLS: usize = WAL_ROWS + 1 + RESUME_CALL_SLACK;
+        let mut completed = None;
+        for _ in 0..MAX_SNAPSHOT_RESUME_CALLS {
+            let attempt = handle_audit_drain("drain-byte-bounded", None, u32::MAX, &state);
+            // Match the handler's own classification enum, not the message text:
+            // an in-progress bounded snapshot is exactly the Retryable class.
+            let still_validating = matches!(
+                &attempt,
+                IpcMessage::AuditDrainResponse {
+                    error: Some(_),
+                    error_class: Some(class),
+                    ..
+                } if class.as_str() == DrainErrorClass::Retryable.as_str()
+            );
+            if !still_validating {
+                completed = Some(attempt);
+                break;
+            }
+        }
+        let response = completed.unwrap_or_else(|| {
+            panic!(
+                "bounded WAL snapshot never completed within {MAX_SNAPSHOT_RESUME_CALLS} resumed audit_drain calls"
+            )
+        });
         let event_count = match &response {
             IpcMessage::AuditDrainResponse {
                 events,
@@ -2697,7 +2739,7 @@ mod tests {
             }
             other => panic!("expected byte-bounded audit drain response, got {other:?}"),
         };
-        assert!(event_count > 0 && event_count < 60);
+        assert!(event_count > 0 && event_count < WAL_ROWS);
         let envelope = MessageEnvelope {
             jsonrpc: "2.0".to_string(),
             method: format!("{}.audit_drain_response", IPC_NAMESPACE),
