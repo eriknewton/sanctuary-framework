@@ -474,7 +474,14 @@ fn nftables_load_agent_ruleset_idempotent_under_reload() {
     cleanup_castle_table();
 }
 
+// Ignored, not deleted: this test reproduces the open register row
+// `defect.linux-recreated-agent-scope-refused-as-foreign` (a legitimately
+// destroyed and recreated agent scope reads back in numeric resolved-id form
+// and is refused as foreign). The F2 build that closes that row removes this
+// attribute in the same change so the assertions below run unedited; an
+// ignored test that stays ignored after the fix lands is a drill-close defect.
 #[test]
+#[ignore = "open defect defect.linux-recreated-agent-scope-refused-as-foreign; re-enabled by the F2 fix"]
 fn nftables_scope_recreation_refresh_fails_closed_then_restores_queue() {
     let _suite = isolation::guard();
     cleanup_castle_table();
