@@ -416,9 +416,29 @@ function castleWallEvidenceString(snapshot: CastleWallRuntimeSnapshot): string {
   return parts.join("; ");
 }
 
+/**
+ * Map the Castle Wall verdict onto the L1 cognitive status that the SIGNED,
+ * externally published reputation payload scores from.
+ *
+ * `degraded` is reserved for a wall that EXISTS and is impaired, because a
+ * relying party reads it as partial enforcement and it scores well above zero.
+ * A host with no wall at all has no enforcement evidence whatsoever, so it must
+ * never publish a higher score than a host we know nothing about: both floor at
+ * the no-evidence reading. The positive fact is not lost, it moves to the
+ * evidence string and to `castle_wall.status`, which still carry
+ * `not_configured` verbatim; only the score-bearing status is floored.
+ *
+ * Failure mode this prevents, stated as a relying party sees it: before the
+ * Linux detector was wired, nothing in production produced `not_configured`, so
+ * this mapping's catch-all was never exercised by a real host. Wiring the
+ * detector made every Linux machine WITHOUT Castle Wall start publishing
+ * partial-enforcement credit it had not earned, and the published overall score
+ * ROSE when enforcement evidence was absent.
+ */
 function cognitiveStatusFromCastleWall(status: RuntimeStatus): RuntimeStatus {
   if (status === "active") return "active";
   if (status === "unknown") return "unknown";
+  if (status === "not_configured") return "unknown";
   return "degraded";
 }
 

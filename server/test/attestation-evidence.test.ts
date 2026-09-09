@@ -1,3 +1,4 @@
+// fail-before-exempt: this change adds only the newly required Castle Wall status fields to an existing fixture so the object still satisfies the widened StatusResponse shape; it asserts nothing new and therefore passes against pre-fix source by construction. Fail-before coverage for those fields lives in the changed castle-wall runtime and health tests, which do pin them.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";

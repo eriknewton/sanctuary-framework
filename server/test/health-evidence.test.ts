@@ -55,6 +55,38 @@ describe("health evidence", () => {
     expect(inactive.status).not.toBe("active");
   });
 
+  it("floors L1 at no-evidence when Castle Wall is absent, never at degraded", () => {
+    // A host with NO wall must not out-score a host we know nothing about. The
+    // published L1 status is what the signed reputation payload assigns a score
+    // to, and `degraded` scores well above zero there, so a Linux machine
+    // without Castle Wall would otherwise earn partial-enforcement credit for
+    // having no enforcement at all.
+    const absent = buildHealthEvidenceReport({
+      config: defaultConfig(),
+      identityCount: 0,
+      storageBackendName: "MemoryStorage",
+      castleWall: {
+        platform: "linux",
+        configured: false,
+        detectorName: "Castle Wall daemon (authenticated IPC status)",
+        reason: "no Castle Wall daemon socket for this fortress on this host",
+      },
+    });
+    const unknown = buildHealthEvidenceReport({
+      config: defaultConfig(),
+      identityCount: 0,
+      storageBackendName: "MemoryStorage",
+    });
+
+    expect(absent.castle_wall.status).toBe("not_configured");
+    expect(absent.layers.l1.status).not.toBe("degraded");
+    // Identical to the no-detector reading: absence of a wall and absence of
+    // knowledge about a wall are both absence of enforcement evidence.
+    expect(absent.layers.l1.status).toBe(unknown.layers.l1.status);
+    // The positive fact is not lost; it moves to the evidence string.
+    expect(absent.layers.l1.evidence).toContain("Castle Wall not_configured");
+  });
+
   it("reports degraded when the daemon is up but nftables is not applied", () => {
     const status = evaluateCastleWall({
       platform: "linux",
