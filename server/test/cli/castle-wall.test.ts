@@ -38,10 +38,52 @@ import {
   runStatus,
   type HostAppInvoker,
 } from "../../src/cli/castle-wall.js";
-import { LINUX_PRODUCER_SIGNED_ACTIVATION_ENV } from "../../src/castle-wall/runtime/linux-activation-gate.js";
+import {
+  LINUX_PRODUCER_SIGNED_ACTIVATION_ENV,
+  type CastleWallActivationCompleteness,
+} from "../../src/castle-wall/runtime/linux-activation-gate.js";
 import type { ShimInvoker } from "../../src/castle-wall/runtime/helper-signer.js";
 import { DEFAULT_DENY_BUCKET } from "../../src/castle-wall/audit/per-rule-report.js";
 import { runInit } from "../../src/wrap/init.js";
+
+/**
+ * Drives the Linux producer-signed activation's REPORTED completeness for the
+ * operator-copy tests below. `undefined` (the default, and the state every
+ * other test in this file runs in) delegates to the real gate, so only a test
+ * that sets it sees a substituted activation.
+ */
+let linuxActivationCompletenessOverride:
+  | CastleWallActivationCompleteness
+  | undefined;
+
+vi.mock("../../src/castle-wall/runtime/index.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../../src/castle-wall/runtime/index.js")>();
+  return {
+    ...actual,
+    // Only the two calls the daemon's Linux branch makes are substituted, and
+    // only while an override is set; platform/opt-in detection, socket-path
+    // resolution and the chain-anchor source stay real so the routing under
+    // test is the production routing.
+    buildLinuxIpcClientKeyMaterial: async (input: never) =>
+      linuxActivationCompletenessOverride === undefined
+        ? actual.buildLinuxIpcClientKeyMaterial(input)
+        : ({} as never),
+    maybeActivateLinuxProducerSignedCastleWall: async (input: never) => {
+      if (linuxActivationCompletenessOverride === undefined) {
+        return actual.maybeActivateLinuxProducerSignedCastleWall(input);
+      }
+      const completeness = linuxActivationCompletenessOverride;
+      return {
+        activated: true,
+        activation: {
+          activationCompleteness: () => completeness,
+          stop: async () => undefined,
+        },
+      } as never;
+    },
+  };
+});
 
 class CaptureStream extends Writable {
   chunks: string[] = [];
@@ -2234,6 +2276,20 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
   // ── FIX 3 (codex HIGH): the daemon entrypoint ROUTES opt-in Linux to the
   //    producer-signed gate, and everything else to the macOS/channel path. ──
   describe("runDaemon routing (FIX 3)", () => {
+    it("the direct Linux daemon entrypoint restores the local chain anchor before activation", async () => {
+      const source = await readFile(
+        new URL("../../src/cli/castle-wall.ts", import.meta.url),
+        "utf8",
+      );
+      const linuxBranch = source.slice(
+        source.indexOf("if (linuxProducerSigned)"),
+        source.indexOf("} else {", source.indexOf("if (linuxProducerSigned)")),
+      );
+      expect(linuxBranch).toContain(
+        "chainAnchorSource: buildChainAnchorSourceFromAuditLog(auditLog)",
+      );
+    });
+
     it("Linux WITHOUT the opt-in flag stays macOS-only (routes to the channel/macOS path, refuses Linux)", async () => {
       const out = new CaptureStream();
       const err = new CaptureStream();
@@ -2296,6 +2352,117 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
       expect(err.text()).not.toMatch(/fail-closed.*not armed/i);
       // It reached the real macOS daemon flow (a pin / credential failure).
       expect(err.text()).toMatch(/No pinned key found|Refusing to start/i);
+    });
+  });
+
+  /**
+   * The Linux producer-signed daemon's console verdict is a claim about the
+   * KERNEL runtime, so it may read ACTIVE only when the activation's own
+   * evidence is complete. Every other completeness the type admits reads
+   * DEGRADED, and the DEGRADED copy never doubles as an ACTIVE claim. These
+   * drive each value of `CastleWallActivationCompleteness` through the real
+   * daemon entrypoint and assert the printed verdict.
+   * Register: `ic-sweep-linux-enforcement-actually-enforces`.
+   */
+  describe("Linux daemon operator copy (ACTIVE only on a full activation)", () => {
+    afterEach(() => {
+      linuxActivationCompletenessOverride = undefined;
+    });
+
+    /**
+     * Runs the real `runDaemon` Linux producer-signed branch with a substituted
+     * activation completeness and returns everything it printed.
+     *
+     * The foreground wait is exited WITHOUT signalling the process (a synthetic
+     * SIGTERM would also fire the test runner's own handlers): the transparency
+     * cadence is deliberately unparseable, which the daemon refuses AFTER the
+     * operator copy is written. Failure mode if that ordering ever moves: the
+     * captured stdout comes back missing the verdict line entirely rather than
+     * carrying the wrong one, so these assertions fail loudly instead of
+     * silently passing on an empty stream.
+     */
+    async function runLinuxDaemon(
+      completeness: CastleWallActivationCompleteness,
+    ): Promise<string> {
+      const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-cw-linux-copy-"));
+      tempDirs.push(fortressPath);
+      const passphrase = "linux-operator-copy-passphrase";
+      const storage = new FilesystemStorage(join(fortressPath, "state"));
+      const custody = await establishMaster({
+        storage,
+        passphrase,
+        firstRun: { installMode: "headless", mintRecoveryKey: false },
+        storagePathHint: fortressPath,
+      });
+      custody.masterKey.fill(0);
+      // The daemon only fingerprints this key; 32 = ED25519_PUBLIC_KEY_BYTES,
+      // the length its own length check enforces before fingerprinting.
+      await writeFile(
+        join(fortressPath, "castle-pinned-pubkey.bin"),
+        new Uint8Array(32).fill(7),
+      );
+
+      linuxActivationCompletenessOverride = completeness;
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+      await runDaemon([], {
+        out,
+        err,
+        env: {
+          SANCTUARY_STORAGE_PATH: fortressPath,
+          SANCTUARY_PASSPHRASE: passphrase,
+          SANCTUARY_CASTLE_LOCAL_SIGN: "1",
+          [LINUX_PRODUCER_SIGNED_ACTIVATION_ENV]: "1",
+          // See the note above: this is the deterministic foreground exit.
+          SANCTUARY_TRANSPARENCY_INTERVAL: "not-a-cadence",
+        },
+        platform: "linux",
+        // Non-root: keeps this on the shared audit chain, off the root
+        // daemon-namespace migration, which is not what these tests pin.
+        getuid: () => 501,
+      });
+      return out.text();
+    }
+
+    it("a FULL activation prints ACTIVE", async () => {
+      const text = await runLinuxDaemon("full");
+      expect(text).toContain("Linux producer-signed close ACTIVE");
+      expect(text).not.toContain("DEGRADED");
+    });
+
+    it("an unconfirmed audit ACK prints DEGRADED and never ACTIVE", async () => {
+      const text = await runLinuxDaemon("unconfirmed_audit_ack");
+      expect(text).toContain("Linux producer-signed close DEGRADED");
+      expect(text).toContain("does not confirm audit ACKs");
+      expect(text).not.toContain("ACTIVE");
+    });
+
+    it("absent kernel-runtime evidence prints DEGRADED and never ACTIVE", async () => {
+      const text = await runLinuxDaemon("unavailable_kernel_evidence");
+      expect(text).toContain("Linux producer-signed close DEGRADED");
+      expect(text).toContain("no current proof of a live kernel runtime");
+      expect(text).not.toContain("ACTIVE");
+    });
+
+    it("covers every completeness the type admits, so a new value cannot join silently", async () => {
+      // Full-set parity, not a sample: a fourth completeness added upstream
+      // without a verdict decision here fails this assertion rather than
+      // defaulting into whichever branch happens to be last.
+      const source = await readFile(
+        new URL(
+          "../../src/castle-wall/runtime/linux-activation-gate.ts",
+          import.meta.url,
+        ),
+        "utf8",
+      );
+      const declaration = source.slice(
+        source.indexOf("export type CastleWallActivationCompleteness"),
+        source.indexOf(";", source.indexOf("export type CastleWallActivationCompleteness")),
+      );
+      const declared = [...declaration.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
+      expect(new Set(declared)).toEqual(
+        new Set(["full", "unconfirmed_audit_ack", "unavailable_kernel_evidence"]),
+      );
     });
   });
 });

@@ -17,6 +17,11 @@ import {
   type ChainAnchorSource,
 } from "./audit-consumer.js";
 import { IpcClient, type IpcTransport, type ClientKeyMaterial } from "./ipc-client.js";
+import {
+  castleWallRuntimeReadiness,
+  type CastleWallRuntimeReadiness,
+  type StatusResponse,
+} from "../ipc/messages.js";
 import { RuntimeIpcError } from "./errors.js";
 import {
   loadFortressProducerKey,
@@ -207,16 +212,113 @@ export async function startCastleWall(
   };
 }
 
-/** Health check: send a status request and verify the response shape. */
-export async function healthCheck(
-  client: IpcClient
-): Promise<{ ok: boolean; uptime_seconds: number; loaded_rule_count: number }> {
+/** What a health check learned about the daemon's kernel runtime. */
+export interface CastleWallHealth {
+  /**
+   * Sanctuary may report this runtime as healthy.
+   *
+   * TWO independent conditions, both required (owner ruling, 2026-09-02):
+   *
+   * 1. the kernel runtime is live: either a wrapped agent is being gated
+   *    (`enforcing`) or the runtime is up with none wrapped
+   *    (`kernel_runtime_ready`), which is this slice's ceiling; AND
+   * 2. the peer confirms audit ACKs ({@link auditAckConfirmed}), so reclaimed
+   *    WAL evidence was positively acknowledged rather than assumed.
+   *
+   * Deliberately NOT "enforcement is complete". The predicate this replaced
+   * required `runtime_state === "enforcing"`, a state the daemon documents as
+   * never produced in this slice, so `ok` was unsatisfiable by construction: a
+   * fully healthy privileged host reported unhealthy forever. Requiring a claim
+   * the system cannot make is not strictness, it is a broken gate. Condition 2
+   * is different in kind: it IS satisfiable, and a peer that fails it is
+   * operating on a weaker basis that must be visible, not fatal.
+   *
+   * Read `readiness` and `auditAckConfirmed` when you need the two facts apart;
+   * `ok` is the composite a caller uses to decide whether to CLAIM health.
+   */
+  ok: boolean;
+  /** The truthful state, for a caller that must distinguish the four cases. */
+  readiness: CastleWallRuntimeReadiness;
+  /**
+   * The connected daemon negotiated `audit_drain_ack_response`, so a refused WAL
+   * truncation is distinguishable from an applied one.
+   *
+   * `false` against a pre-v2 daemon. That peer keeps operating (the ACK is still
+   * sent, the daemon still truncates), but reclamation is UNPROVEN, so it can
+   * never support a health or complete-enforcement claim.
+   */
+  auditAckConfirmed: boolean;
+  /**
+   * True only for a gated wrapped agent on a CONFIRMED evidence channel. This is
+   * the strong claim; keep it separate from `ok` so no caller can present a
+   * ready-but-idle runtime, or an unconfirmed channel, as an enforced agent.
+   */
+  enforcementComplete: boolean;
+  /**
+   * The daemon did not give enough information to decide (a pre-v2 daemon that
+   * does not report the runtime block, or a health probe with no current
+   * answer). Not health and not failure: report it as unknown.
+   */
+  indeterminate: boolean;
+  /**
+   * The EXACT `status_response` every field above was derived from.
+   *
+   * Returned rather than left to the caller to re-fetch: a second
+   * `statusRequest()` is a second OBSERVATION, and pairing a readiness computed
+   * from one with the raw fields of another lets a snapshot straddle two daemon
+   * states that never coexisted. One round-trip, one observation.
+   */
+  status: StatusResponse;
+  uptime_seconds: number;
+  loaded_rule_count: number;
+}
+
+const HEALTH_CHECK_CACHE_MS = 1_000;
+const healthChecks = new WeakMap<
+  IpcClient,
+  { expiresAt: number; value?: CastleWallHealth; inFlight?: Promise<CastleWallHealth> }
+>();
+
+/**
+ * Health check: send a status request and map it onto the truthful readiness
+ * model. Sanctuary main's health evidence consumes this through
+ * `castleWallSnapshotFromStatus`, so the gate has a real production call path
+ * (AGENTS rule 4: a capability with no production consumer is not shipped).
+ */
+export async function healthCheck(client: IpcClient): Promise<CastleWallHealth> {
   if (!client.isHandshakeComplete()) {
     throw new RuntimeIpcError("handshake not complete; cannot health-check");
   }
+  const cached = healthChecks.get(client);
+  if (cached?.value && cached.expiresAt > Date.now()) return cached.value;
+  if (cached?.inFlight) return await cached.inFlight;
+  const inFlight = healthCheckUncached(client);
+  healthChecks.set(client, { expiresAt: 0, inFlight });
+  try {
+    const value = await inFlight;
+    healthChecks.set(client, { expiresAt: Date.now() + HEALTH_CHECK_CACHE_MS, value });
+    return value;
+  } catch (err) {
+    healthChecks.delete(client);
+    throw err;
+  }
+}
+
+async function healthCheckUncached(client: IpcClient): Promise<CastleWallHealth> {
   const status = await client.statusRequest();
+  const readiness = castleWallRuntimeReadiness(status);
+  // Read from the NEGOTIATED handshake, not from an assumption about the peer's
+  // version: only the advertised capability token proves the daemon will confirm
+  // an ACK (see `IpcClient.drainAcksAreConfirmed`).
+  const auditAckConfirmed = client.drainAcksAreConfirmed();
+  const runtimeLive = readiness === "enforcing" || readiness === "kernel_runtime_ready";
   return {
-    ok: status.no_wall_engaged === false,
+    ok: runtimeLive && auditAckConfirmed,
+    readiness,
+    auditAckConfirmed,
+    enforcementComplete: readiness === "enforcing" && auditAckConfirmed,
+    indeterminate: readiness === "unavailable",
+    status,
     uptime_seconds: status.uptime_seconds,
     loaded_rule_count: status.loaded_rule_count,
   };

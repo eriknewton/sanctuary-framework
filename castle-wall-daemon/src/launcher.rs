@@ -23,7 +23,11 @@
 //! report is missing or does not match the expected configuration; a report
 //! that never arrives means the sandbox was never fully built. The host
 //! consumer side is not part of this slice (S3 builds the launcher half); the
-//! report is emitted here and the consumer is a tracked follow-up.
+//! report is emitted here and the consumer is a tracked follow-up. A residual
+//! named only in a source comment is not owned risk (AGENTS rule 9), so it is
+//! reconciled into the private register as
+//! `ic-sweep-linux-enforcement-actually-enforces`; that id is the record, and
+//! this comment is only its pointer.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -204,10 +208,7 @@ pub enum LauncherError {
     InvalidSpec { detail: String },
 
     #[error("step {step} failed: {detail}")]
-    Step {
-        step: LaunchStep,
-        detail: String,
-    },
+    Step { step: LaunchStep, detail: String },
 
     #[error("realized-confinement report serialization failed: {detail}")]
     ReportSerialize { detail: String },
@@ -362,11 +363,9 @@ pub fn namespaces_for_mode(mode: PrivilegeMode) -> Vec<String> {
     match mode {
         // Rootless: the user namespace must come first so it is the source of
         // privilege for the mount + net namespaces.
-        PrivilegeMode::RootlessUserns => vec![
-            "user".to_string(),
-            "mount".to_string(),
-            "net".to_string(),
-        ],
+        PrivilegeMode::RootlessUserns => {
+            vec!["user".to_string(), "mount".to_string(), "net".to_string()]
+        }
         // Privileged: the launcher already holds the needed capabilities, so it
         // creates mount + net directly without a user namespace.
         PrivilegeMode::Privileged => vec!["mount".to_string(), "net".to_string()],
@@ -543,13 +542,7 @@ mod linux {
     /// `Command`, not the live process, so the report-writing code keeps its env).
     pub fn close_extra_fds(spec: &LaunchSpec) -> Result<(), LauncherError> {
         let step = LaunchStep::ScrubFdsAndEnv;
-        let keep = [
-            0,
-            1,
-            2,
-            spec.control_pipe_fd,
-            spec.broker_fd,
-        ];
+        let keep = [0, 1, 2, spec.control_pipe_fd, spec.broker_fd];
         // Determine the highest fd we might hold. Iterate /proc/self/fd so we
         // close exactly the open ones rather than blindly looping to a guessed
         // max. Fail closed if the fd table cannot be read.
@@ -582,9 +575,8 @@ mod linux {
     /// unchanged so the proven apply-order (set_no_new_privs -> drop caps ->
     /// install filter) is shared, not duplicated.
     pub fn confine(profile: SeccompProfile) -> Result<(), LauncherError> {
-        jail::confine_current_process_with_profile(profile).map_err(|e| {
-            LauncherError::step(LaunchStep::ConfineSeccompAndCaps, e.to_string())
-        })
+        jail::confine_current_process_with_profile(profile)
+            .map_err(|e| LauncherError::step(LaunchStep::ConfineSeccompAndCaps, e.to_string()))
     }
 
     /// Write the realized-confinement report to the control pipe (immediately
@@ -763,7 +755,10 @@ mod tests {
         let scrubbed = scrub_env(env);
         assert_eq!(scrubbed.get("PATH").map(String::as_str), Some("/usr/bin"));
         assert_eq!(scrubbed.get("LANG").map(String::as_str), Some("C.UTF-8"));
-        assert_eq!(scrubbed.get("HOME").map(String::as_str), Some("/home/plugin"));
+        assert_eq!(
+            scrubbed.get("HOME").map(String::as_str),
+            Some("/home/plugin")
+        );
         assert!(!scrubbed.contains_key("DISPLAY"));
         assert!(!scrubbed.contains_key("AWS_REGION"));
         assert!(!scrubbed.contains_key("SANCTUARY_KEY_PRIMARY"));

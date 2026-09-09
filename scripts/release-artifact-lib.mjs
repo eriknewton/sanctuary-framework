@@ -3,10 +3,37 @@ import { gunzipSync } from "node:zlib";
 
 export const RELEASE_MANIFEST_DOMAIN = "sanctuary.release-manifest.v1";
 export const RELEASE_VERSION_SHAPE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$/;
+// Both release bounds are anti-decompression-bomb ceilings for the signer and
+// the verifier, not a policy about how large the package is allowed to be. Each
+// is derived from a MEASURED `npm pack --dry-run --json` of this repository's
+// own artifact plus roughly 50% headroom, so a legitimate release fits and an
+// adversarial tarball still cannot make either script allocate without limit.
+// Re-measure and re-derive both when the package grows; never remove them, and
+// never widen the gzip validity check itself to get a large archive through.
+//
+// Compressed ceiling. Measured at 1.8.6-rc.1: 32,901,969 B packed.
+// 64 MiB = 67,108,864 B, which is 2.04x the measured size.
 export const MAX_RELEASE_TARBALL_BYTES = 64 * 1024 * 1024;
 
 const PACKAGE_NAME = "@sanctuary-framework/mcp-server";
-const MAX_UNPACKED_BYTES = 128 * 1024 * 1024;
+// Decompressed ceiling. Measured at 1.8.6-rc.1: 136,023,052 B unpacked across
+// 81 entries, of which 100,429,174 B (73.8%) are `dist/**/*.map` debug source
+// maps. 192 MiB = 201,326,592 B, which is 1.48x the measured size.
+//
+// The two ceilings are INDEPENDENT ABSOLUTE bounds; neither constrains the
+// expansion RATIO between them, and reading the pair as a ratio limit is wrong:
+// a small archive that decompresses to just under the output ceiling passes both
+// at an expansion of many hundreds to one. The cost of this raise stated
+// plainly: moving the output ceiling from 128 MiB to 192 MiB admits 64 MiB more
+// decompressed output (a 50% increase), plus the decompression work and the
+// transient allocation that output implies, and the verifier does this
+// decompression BEFORE it verifies any signature. Bounded, but weaker by exactly
+// that amount.
+// Failure mode when this is too small, stated as the operator sees it: signing
+// or verifying a HEALTHY release refuses with "tarball is not a bounded valid
+// gzip archive", which reads like a corrupt or hostile archive rather than a
+// ceiling the package outgrew.
+const MAX_UNPACKED_BYTES = 192 * 1024 * 1024;
 
 /** Open once and read a bounded regular-file snapshot from that descriptor. */
 export function readBoundedRegularFile(path, maxBytes, label) {
@@ -43,6 +70,10 @@ export function validatePackageIdentity(tarball, tarballName, version) {
   if (tarballName !== expectedName) throw new Error(`tarball name must be ${expectedName}`);
   let archive;
   try {
+    // Enforcement site for the decompressed ceiling: `maxOutputLength` is what
+    // makes a decompression bomb fail here instead of exhausting the signer's
+    // memory. The bound must stay an explicit argument; gunzipSync defaults to
+    // unbounded output.
     archive = gunzipSync(tarball, { maxOutputLength: MAX_UNPACKED_BYTES });
   } catch {
     throw new Error("tarball is not a bounded valid gzip archive");

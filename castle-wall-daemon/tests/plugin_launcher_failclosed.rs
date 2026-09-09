@@ -64,7 +64,10 @@ fn missing_required_flag_exits_nonzero() {
 #[test]
 fn invalid_mode_exits_nonzero() {
     let mut args = base_args("/bundle", "/scratch", "/cgroup", "bin/entry");
-    let mode_idx = args.iter().position(|a| a == "rootless").expect("mode value");
+    let mode_idx = args
+        .iter()
+        .position(|a| a == "rootless")
+        .expect("mode value");
     args[mode_idx] = "wide-open".to_string();
     let status = Command::new(launcher_bin())
         .args(&args)
@@ -320,7 +323,10 @@ mod linux {
             "bin/entry",
         );
         let run = run_forced(&args, 3, 4, &sentinel);
-        assert_fail_closed(&run, "forced cgroup failure (or earlier pre-exec abort) is fail-closed");
+        assert_fail_closed(
+            &run,
+            "forced cgroup failure (or earlier pre-exec abort) is fail-closed",
+        );
     }
 
     /// Forces an exec failure by supplying a missing entry binary. The intent is
@@ -365,10 +371,7 @@ mod linux {
             Some(1),
             "forced exec failure (or earlier pre-exec abort) must exit non-zero"
         );
-        assert!(
-            !run.sentinel_exists,
-            "entry must never run on exec failure"
-        );
+        assert!(!run.sentinel_exists, "entry must never run on exec failure");
     }
 
     /// Best-effort: create a writable transient cgroup for the test process, or

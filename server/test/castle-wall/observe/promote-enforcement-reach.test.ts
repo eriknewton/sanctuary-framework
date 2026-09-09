@@ -74,6 +74,7 @@ import {
   parseRuleId,
 } from "../../../src/castle-wall/allowlist/rule-identity.js";
 import { ExclusiveRoutingViolationError } from "../../../src/castle-wall/allowlist/exclusive-routing.js";
+import { castleWallSigningKeyId } from "../../../src/castle-wall/allowlist/parse.js";
 import type { ExclusiveEgressGatePolicy } from "../../../src/castle-wall/allowlist/gate-derivation.js";
 import { promoteCandidates, type PromoteOutcome } from "../../../src/castle-wall/observe/promote.js";
 import {
@@ -165,12 +166,12 @@ describe("observe promote reaches live enforcement (the real composer, not promo
     publicKey = ed25519.getPublicKey(privateSeed);
     const encryptionKey = generateRandomKey();
     const encryptedPrivateKey = encrypt(privateSeed, encryptionKey);
-    signer = localManifestSigner({ signingKeyId: "test-key", encryptedPrivateKey, encryptionKey });
+    signer = localManifestSigner({ signingKeyId: castleWallSigningKeyId(publicKey), encryptedPrivateKey, encryptionKey });
     // mode "local": the daemon's dev/test signing path (the helper path's
     // global-pin cross-check needs a root-owned system file no test may own).
     daemonSigner = {
       mode: "local",
-      signingKeyId: "test-key",
+      signingKeyId: castleWallSigningKeyId(publicKey),
       publicKey,
       signManifest: async (bytes) => signer.sign(bytes),
       signNonce: async (bytes) => signer.sign(bytes),

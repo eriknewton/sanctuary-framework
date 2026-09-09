@@ -4110,6 +4110,35 @@ export async function runWrap(
       if (outcome.activated) {
         castleWallDaemon = outcome.activation;
         registerCastleWallCleanup();
+        // OWNER RULING (2026-09-02): an activation against a pre-v2 daemon is
+        // LIVE but INCOMPLETE. It is already recorded durably in the audit log;
+        // this is the operator-facing half, so the weaker basis is never silent
+        // at the console either. Not fatal: the wall is operating.
+        const completeness = outcome.activation.activationCompleteness();
+        if (completeness !== "full") {
+          // SAFETY: stderr is the operator-facing CLI channel; both fixed texts
+          // name only the negotiated protocol shortfall and the posture it
+          // implies. They carry no fortress, agent, or key material.
+          // The two shortfalls are DIFFERENT claims and must not share copy.
+          // The ACK shortfall leaves the kernel runtime proven and only the
+          // reclamation evidence unprovable. Absent kernel-runtime evidence
+          // leaves the actual filtering UNPROVEN, so this branch must never
+          // say filtering is running: that sentence is the enforcement claim
+          // the Linux assurance row does not make.
+          console.error(
+            completeness === "unconfirmed_audit_ack"
+              ? "Sanctuary: Castle Wall is DEGRADED. The installed " +
+                  "castle-wall-daemon does not confirm audit ACKs " +
+                  "(audit_drain_ack_response), so reclaimed enforcement " +
+                  "evidence cannot be proven truncated. Sanctuary will report " +
+                  "Castle Wall as degraded until the daemon binary is upgraded."
+              : "Sanctuary: Castle Wall is DEGRADED. The installed " +
+                  "castle-wall-daemon returned no current proof of a live " +
+                  "kernel runtime, so Sanctuary cannot report the wall as " +
+                  "filtering. Treat egress as unprotected until the daemon " +
+                  "reports a ready kernel runtime."
+          );
+        }
       }
       return;
     }

@@ -58,6 +58,9 @@ import {
 import { frame, parseFrame } from "../castle-wall/ipc/framing.js";
 import { writeGlobalPinIfUnestablished } from "../castle-wall/global-pin/index.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
+// Type-only: the runtime module itself stays behind the dynamic import below
+// so the Linux activation path is not pulled into every CLI invocation.
+import type { CastleWallActivationCompleteness } from "../castle-wall/runtime/linux-activation-gate.js";
 import {
   DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
   queryMacOSEnforcementAvailability,
@@ -2260,6 +2263,10 @@ export async function runDaemon(
   }
 
   let daemon: { socketPath: string; stop: () => Promise<void> };
+  // Carried out of the activation block so the console claim below is derived
+  // from the activation's own evidence rather than from the fact that a start
+  // did not throw. `undefined` means the Linux path was not taken at all.
+  let linuxActivationCompleteness: CastleWallActivationCompleteness | undefined;
 
   if (linuxProducerSigned) {
     // FIX 3: opt-in Linux producer-signed close. Route through the fail-closed
@@ -2269,6 +2276,7 @@ export async function runDaemon(
     const {
       maybeActivateLinuxProducerSignedCastleWall,
       buildLinuxIpcClientKeyMaterial,
+      buildChainAnchorSourceFromAuditLog,
     } = await import("../castle-wall/runtime/index.js");
     const fortressId = fortressIdFromStoragePath(storagePath);
     try {
@@ -2282,6 +2290,11 @@ export async function runDaemon(
         fortressStoragePath: storagePath,
         key,
         auditSink: auditLog,
+        // Restore the last locally persisted producer-signed chain point before
+        // accepting a new daemon drain. Omitting this silently re-enabled the
+        // legacy null-anchor bootstrap on every direct `castle-wall daemon`
+        // restart even though the wrap entrypoint already supplied the anchor.
+        chainAnchorSource: buildChainAnchorSourceFromAuditLog(auditLog),
         env,
       });
       if (!outcome.activated) {
@@ -2298,6 +2311,10 @@ export async function runDaemon(
         fortressId,
         fortressPath: storagePath,
       }).path;
+      // The health handle is the ONLY thing that distinguishes a proven kernel
+      // runtime from an indeterminate one; read it here, because `daemon` below
+      // deliberately narrows to socket+stop and cannot answer that question.
+      linuxActivationCompleteness = outcome.activation.activationCompleteness();
       daemon = { socketPath, stop: () => outcome.activation.stop() };
     } catch (error) {
       write(err, `Daemon failed to start (Linux producer-signed, fail-closed): ${(error as Error).message}\n`);
@@ -2369,12 +2386,35 @@ export async function runDaemon(
 
   write(out, `Castle Wall daemon listening on ${daemon.socketPath}\n`);
   if (linuxProducerSigned) {
-    write(
-      out,
-      `Linux producer-signed close ACTIVE (opt-in): the systemd daemon signs every ` +
-        `enforcement event with its root-owned producer key; the in-process server ` +
-        `re-verifies against pin ${pinFingerprint}. Drill-acceptance pending.\n`,
-    );
+    // ACTIVE is a claim about the KERNEL runtime, not about the process having
+    // started. An indeterminate or unconfirmed activation prints DEGRADED here:
+    // the failure mode this prevents is an operator reading "ACTIVE" off a
+    // daemon that returned no current proof it is filtering anything, which is
+    // exactly the claim the Linux assurance row refuses to make.
+    if (linuxActivationCompleteness === "full") {
+      write(
+        out,
+        `Linux producer-signed close ACTIVE (opt-in): the systemd daemon signs every ` +
+          `enforcement event with its root-owned producer key; the in-process server ` +
+          `re-verifies against pin ${pinFingerprint}. Drill-acceptance pending.\n`,
+      );
+    } else if (linuxActivationCompleteness === "unconfirmed_audit_ack") {
+      write(
+        out,
+        `Linux producer-signed close DEGRADED (opt-in): the daemon signs enforcement ` +
+          `events and the in-process server re-verifies against pin ${pinFingerprint}, ` +
+          `but the peer does not confirm audit ACKs, so reclaimed evidence cannot be ` +
+          `proven truncated. Sanctuary reports Castle Wall as degraded.\n`,
+      );
+    } else {
+      write(
+        out,
+        `Linux producer-signed close DEGRADED (opt-in): the daemon returned no current ` +
+          `proof of a live kernel runtime, so Sanctuary cannot report the wall as ` +
+          `filtering. Treat egress as unprotected until the daemon reports a ready ` +
+          `kernel runtime.\n`,
+      );
+    }
   } else {
     if (launchdBoot) {
       write(out, "Started under launchd (boot service); audit source = launchd-boot.\n");

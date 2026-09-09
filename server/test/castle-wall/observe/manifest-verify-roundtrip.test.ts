@@ -41,6 +41,7 @@ import type {
 import { canonicalize } from "../../../src/mesh/canonical-json.js";
 import { stringToBytes, toBase64url } from "../../../src/core/encoding.js";
 import { encodeRuleFilename, parseRuleId } from "../../../src/castle-wall/allowlist/rule-identity.js";
+import { castleWallSigningKeyId } from "../../../src/castle-wall/allowlist/parse.js";
 
 /** Derive the encoded-v1 filename for a rule id (must be valid by the pattern). */
 function encodedFilename(id: string): string {
@@ -72,7 +73,7 @@ describe("readVerifiedManifest: real publisher round-trip + tamper detection (FI
     publicKey = ed25519.getPublicKey(privateSeed);
     const encryptionKey = generateRandomKey();
     const encryptedPrivateKey = encrypt(privateSeed, encryptionKey);
-    signer = localManifestSigner({ signingKeyId: "test-key", encryptedPrivateKey, encryptionKey });
+    signer = localManifestSigner({ signingKeyId: castleWallSigningKeyId(publicKey), encryptedPrivateKey, encryptionKey });
   });
 
   afterEach(async () => {
@@ -223,7 +224,7 @@ describe("readVerifiedManifest: manifest-level descriptor carry-forward (#897 P1
     publicKey = ed25519.getPublicKey(privateSeed);
     const encryptionKey = generateRandomKey();
     const encryptedPrivateKey = encrypt(privateSeed, encryptionKey);
-    signer = localManifestSigner({ signingKeyId: "test-key", encryptedPrivateKey, encryptionKey });
+    signer = localManifestSigner({ signingKeyId: castleWallSigningKeyId(publicKey), encryptedPrivateKey, encryptionKey });
   });
 
   afterEach(async () => {

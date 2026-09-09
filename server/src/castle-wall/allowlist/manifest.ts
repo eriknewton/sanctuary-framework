@@ -98,6 +98,8 @@ export interface AllowlistManifest {
   schema_version: typeof CASTLE_WALL_SCHEMA_VERSION_V1;
   fortress_id: string;
   issued_at: string;
+  /** Monotonic anti-rollback generation. New publishers always emit it. */
+  generation?: number;
   rules: ManifestRuleEntry[];
   /**
    * Optional agent-origin descriptor. Omitted (NOT null) when absent so the
@@ -115,10 +117,13 @@ export interface AllowlistManifest {
 
 /**
  * The Ed25519 signature wrapper produced by Sanctuary main and verified by
- * the filter daemon. The `signing_key_id` is a fingerprint of the public key
- * used so the daemon can detect mismatch against its pinned key without
- * loading the manifest body. `signature_scheme` is the post-quantum migration
- * hinge field already shipped on federation v0.1.
+ * the filter daemon. The `signing_key_id` is the canonical
+ * lowercase first-16-hex SHA-256 fingerprint derived from the pinned authority
+ * key and is compared before signature acceptance. It is outside
+ * the signed body but cannot be relabelled into acceptance because both TS and
+ * Rust derive the one permitted value from the verification key.
+ * `signature_scheme` is the post-quantum migration hinge field already shipped
+ * on federation v0.1.
  */
 export interface ManifestSignature {
   signature_scheme: typeof CASTLE_WALL_SIGNATURE_SCHEME_V1;

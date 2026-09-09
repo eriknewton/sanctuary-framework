@@ -7,11 +7,10 @@
 //! and the canonical-JSON audit shape per scope-lock §8 that Sanctuary main
 //! signs into the existing L1 audit log on drain.
 //!
-//! The evaluator is a pure function of (snapshot, request); it does not
-//! touch the kernel, the filesystem, or the IPC surface. Kernel binding
-//! (nftables atomic-replace, cgroup v2 transient scopes, NFQUEUE verdict
-//! loop) is the next-checkpoint scope; this module is the in-process
-//! decision engine those bindings drive.
+//! The evaluator is a pure function of (snapshot, request); it does not touch
+//! the kernel, filesystem, or IPC surface. The Linux adapter now drives this
+//! engine from its typed nftables/cgroup/NFQUEUE path; this module remains the
+//! policy authority and deliberately carries no kernel mutation capability.
 
 use std::collections::{HashMap, HashSet};
 
@@ -67,10 +66,12 @@ where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    Ok(Option::<OneOrMany<T>>::deserialize(deserializer)?.map(|v| match v {
-        OneOrMany::One(one) => vec![one],
-        OneOrMany::Many(many) => many,
-    }))
+    Ok(
+        Option::<OneOrMany<T>>::deserialize(deserializer)?.map(|v| match v {
+            OneOrMany::One(one) => vec![one],
+            OneOrMany::Many(many) => many,
+        }),
+    )
 }
 
 /// Port axis deserializer (codex round-7): JSON has ONE number type, so the
@@ -300,7 +301,11 @@ fn cidr_contains(cidr: &str, target: &std::net::IpAddr) -> bool {
             if prefix > 32 {
                 return false;
             }
-            let mask: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            let mask: u32 = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
             (u32::from(base) & mask) == (u32::from(*target) & mask)
         }
         (IpAddr::V6(base), IpAddr::V6(target)) => {
@@ -527,10 +532,21 @@ pub enum PolicySnapshotError {
          enforce; refusing the manifest rather than enforcing the rule \
          without its {axis} bound"
     )]
-    UnenforceableRuleAxis {
-        rule_id: String,
-        axis: &'static str,
-    },
+    UnenforceableRuleAxis { rule_id: String, axis: &'static str },
+    /// The rule carries the `prompt` disposition, which Linux cannot serve
+    /// until the operator-decision round trip exists. Fail closed at ADMISSION:
+    /// silently mapping `prompt` to `deny` (or a no-op) would enforce something
+    /// the operator never signed, so the whole manifest is refused with a loud,
+    /// typed error and the prior good policy is kept. Matches the L2 contract in
+    /// Linux_Enforcement_Sprint_Architecture: "Linux must reject `prompt`
+    /// dispositions at policy admission until the operator-decision round trip
+    /// is fully implemented."
+    #[error(
+        "rule {rule_id} carries the `prompt` disposition, which this daemon \
+         cannot serve on Linux yet; refusing the manifest rather than silently \
+         downgrading prompt to deny or a no-op"
+    )]
+    UnsupportedDisposition { rule_id: String },
     #[error(
         "agent ids {left_agent_id} and {right_agent_id} collide for {resource_kind} identity {resource_name}"
     )]
@@ -664,10 +680,7 @@ fn confined_agent_uid_from_loaded_manifest(loaded: &LoadedManifest) -> Option<u3
     }
 
     if let Some(gate_uid) = origin.gate_uid {
-        if gate_uid < 1
-            || gate_uid < origin.system_uid_allow_ceiling
-            || gate_uid == agent_uid
-        {
+        if gate_uid < 1 || gate_uid < origin.system_uid_allow_ceiling || gate_uid == agent_uid {
             return None;
         }
     }
@@ -696,7 +709,103 @@ fn validate_rule_axes(rule: &AllowlistRule) -> Result<(), PolicySnapshotError> {
             axis: "time_window",
         });
     }
+    // Fail closed at admission on the `prompt` disposition. The Linux L2 path
+    // has no operator-decision round trip, so a prompt rule can only be served
+    // by silently downgrading it to Drop (see `evaluate` below), which enforces
+    // a verdict the operator never signed. Refuse the whole manifest here with a
+    // typed error instead, exactly as the other unenforceable axes are refused,
+    // so the prior good policy is retained until the flow-suspension protocol
+    // lands. Contract: Linux_Enforcement_Sprint_Architecture, "Ship allow and
+    // deny policy first. Linux must reject `prompt` dispositions at policy
+    // admission until the operator-decision round trip is fully implemented."
+    if matches!(rule.disposition, RuleDisposition::Prompt) {
+        return Err(PolicySnapshotError::UnsupportedDisposition {
+            rule_id: rule.id.clone(),
+        });
+    }
+    // The Linux L2 packet path currently receives the wire destination IP and
+    // cgroup-derived agent id.  It does not yet have an authenticated DNS/SNI
+    // binding or a trustworthy template attestation.  Refuse those axes at
+    // admission instead of accepting a signed rule which can never match (or,
+    // worse, matching an attacker-supplied hostname/template in the future).
+    if rule.match_clause.host.is_some() {
+        return Err(PolicySnapshotError::UnenforceableRuleAxis {
+            rule_id: rule.id.clone(),
+            axis: "match.host (authenticated DNS/SNI binding unavailable)",
+        });
+    }
+    if rule.match_clause.host_pattern.is_some() {
+        return Err(PolicySnapshotError::UnenforceableRuleAxis {
+            rule_id: rule.id.clone(),
+            axis: "match.host_pattern (authenticated DNS/SNI binding unavailable)",
+        });
+    }
+    if !rule.scope.template_ids.is_empty() {
+        return Err(PolicySnapshotError::UnenforceableRuleAxis {
+            rule_id: rule.id.clone(),
+            axis: "scope.template_ids (template attestation unavailable)",
+        });
+    }
+
+    let has_destination = rule
+        .match_clause
+        .ip
+        .as_ref()
+        .is_some_and(|values| !values.is_empty())
+        || rule
+            .match_clause
+            .cidr
+            .as_ref()
+            .is_some_and(|values| !values.is_empty());
+    if !has_destination {
+        return Err(PolicySnapshotError::InvalidMatchAxis {
+            rule_id: rule.id.clone(),
+            axis: "match",
+            value: "<missing destination>".to_string(),
+            message: "Linux L2 requires a non-empty ip or cidr destination axis",
+        });
+    }
+
+    if let Some(protocol) = rule.match_clause.protocol.as_deref() {
+        if !matches!(protocol, "tcp" | "udp" | "tcp+udp") {
+            return Err(PolicySnapshotError::InvalidMatchAxis {
+                rule_id: rule.id.clone(),
+                axis: "match.protocol",
+                value: protocol.to_string(),
+                message: "expected exactly tcp, udp, or tcp+udp",
+            });
+        }
+    }
+    if rule.match_clause.port.as_ref().is_some_and(Vec::is_empty) {
+        return Err(PolicySnapshotError::InvalidMatchAxis {
+            rule_id: rule.id.clone(),
+            axis: "match.port",
+            value: "[]".to_string(),
+            message: "empty arrays are not valid constraints",
+        });
+    }
+    for (axis, values) in [
+        ("scope.agent_ids", &rule.scope.agent_ids),
+        ("scope.template_ids", &rule.scope.template_ids),
+    ] {
+        if values.iter().any(|value| value.is_empty()) {
+            return Err(PolicySnapshotError::InvalidMatchAxis {
+                rule_id: rule.id.clone(),
+                axis,
+                value: "<empty string>".to_string(),
+                message: "scope identifiers must be non-empty",
+            });
+        }
+    }
     if let Some(ips) = rule.match_clause.ip.as_ref() {
+        if ips.is_empty() {
+            return Err(PolicySnapshotError::InvalidMatchAxis {
+                rule_id: rule.id.clone(),
+                axis: "match.ip",
+                value: "[]".to_string(),
+                message: "empty arrays are not valid constraints",
+            });
+        }
         for entry in ips {
             if entry.parse::<std::net::IpAddr>().is_err() {
                 return Err(PolicySnapshotError::InvalidMatchAxis {
@@ -709,6 +818,14 @@ fn validate_rule_axes(rule: &AllowlistRule) -> Result<(), PolicySnapshotError> {
         }
     }
     if let Some(cidrs) = rule.match_clause.cidr.as_ref() {
+        if cidrs.is_empty() {
+            return Err(PolicySnapshotError::InvalidMatchAxis {
+                rule_id: rule.id.clone(),
+                axis: "match.cidr",
+                value: "[]".to_string(),
+                message: "empty arrays are not valid constraints",
+            });
+        }
         for entry in cidrs {
             validate_cidr_literal(entry).map_err(|message| {
                 PolicySnapshotError::InvalidMatchAxis {
@@ -945,6 +1062,90 @@ pub fn build_audit_event_canonical_json(
     canonicalize(&serde_json::Value::Object(entry))
 }
 
+/// WAL `operation` tag for a verdict that was SUPERSEDED after its own audit
+/// record was already durable.
+///
+/// Must match `WAL_OPERATION_TO_EVENT_TYPE` in
+/// `server/src/castle-wall/runtime/audit-consumer.ts`, which REJECTS a
+/// producer-signed event whose operation it cannot map; an unmapped operation
+/// would make the superseding record itself unreadable, which is worse than the
+/// divergence it exists to close.
+pub const OPERATION_VERDICT_SUPERSEDED: &str = "egress_verdict_superseded";
+
+/// Build the canonical-JSON body that SUPERSEDES an already-durable verdict.
+///
+/// ## Why a second record rather than a corrected first one
+///
+/// The audit WAL is append-only and hash-chained: the record for the superseded
+/// sequence is already durable and already chained into every later entry, so it
+/// cannot be edited without breaking the chain the consumer verifies. Emitting a
+/// later record that NAMES the sequence it overrides is the only correction the
+/// structure admits, and it is strictly better evidence than an edit would be:
+/// the reader sees both what was decided and that it was overridden, in order.
+///
+/// ## Strict sequence semantics
+///
+/// `superseded_wal_seq` names an EARLIER sequence, always. WAL sequences are
+/// monotonic and this record is appended after the one it supersedes, so
+/// `this.seq > superseded_wal_seq` holds by construction. A reader resolving the
+/// final verdict for sequence N must therefore scan FORWARD from N for a
+/// superseding record naming N; a record naming a sequence at or after itself is
+/// malformed and must be rejected rather than applied.
+pub fn build_superseding_verdict_canonical_json(
+    superseded_wal_seq: u64,
+    final_verdict: &str,
+    reason: &str,
+    fortress_id: &str,
+    identity_id: &str,
+    timestamp_iso8601: &str,
+) -> Result<String, CanonicalJsonError> {
+    let mut details = serde_json::Map::new();
+    details.insert(
+        "superseded_wal_seq".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(superseded_wal_seq)),
+    );
+    details.insert(
+        "final_verdict".to_string(),
+        serde_json::Value::String(final_verdict.to_string()),
+    );
+    details.insert(
+        "reason".to_string(),
+        serde_json::Value::String(reason.to_string()),
+    );
+
+    let mut entry = serde_json::Map::new();
+    entry.insert(
+        "timestamp".to_string(),
+        serde_json::Value::String(timestamp_iso8601.to_string()),
+    );
+    entry.insert(
+        "layer".to_string(),
+        serde_json::Value::String(AUDIT_LAYER.to_string()),
+    );
+    entry.insert(
+        "operation".to_string(),
+        serde_json::Value::String(OPERATION_VERDICT_SUPERSEDED.to_string()),
+    );
+    entry.insert(
+        "identity_id".to_string(),
+        serde_json::Value::String(identity_id.to_string()),
+    );
+    entry.insert(
+        "fortress_id".to_string(),
+        serde_json::Value::String(fortress_id.to_string()),
+    );
+    // `blocked`, not `superseded`: the RESULT field says what happened to the
+    // packet, and what happened is that it was dropped on the wire. The
+    // `operation` is what says this record corrects an earlier one.
+    entry.insert(
+        "result".to_string(),
+        serde_json::Value::String("blocked".to_string()),
+    );
+    entry.insert("details".to_string(), serde_json::Value::Object(details));
+
+    canonicalize(&serde_json::Value::Object(entry))
+}
+
 fn protection_subject_for_uid(fortress_id: &str, uid: Option<u32>) -> Option<String> {
     let uid = uid.filter(|candidate| *candidate > 0)?;
     if fortress_id.is_empty() {
@@ -1165,7 +1366,7 @@ mod tests {
         // dest_ip path.
         assert!(m.matches(None, Some("127.0.0.1"), 8741, "tcp"));
         assert!(m.matches(None, Some("0:0:0:0:0:0:0:1"), 8741, "tcp")); // ::1 normalized
-        // dest_host carrying an IP literal also matches the ip axis.
+                                                                        // dest_host carrying an IP literal also matches the ip axis.
         assert!(m.matches(Some("127.0.0.1"), None, 8741, "tcp"));
         // A non-loopback IP does NOT match (the key regression fix: an ip-only
         // rule is no longer "any host").
@@ -1478,6 +1679,7 @@ mod tests {
             schema_version: SCHEMA_VERSION_V1,
             fortress_id: "deadbeef".to_string(),
             issued_at: "2026-05-05T00:00:00Z".to_string(),
+            generation: 1,
             agent_origin: None,
             operator_baseline: None,
             rules: entries,
@@ -1507,12 +1709,10 @@ mod tests {
         let r1 = rule(
             "uuid-1",
             RuleMatch {
-                host: Some(vec!["api.anthropic.com".to_string()]),
-                host_pattern: None,
-                ip: None,
-                cidr: None,
+                ip: Some(vec!["203.0.113.10".to_string()]),
                 port: Some(vec![443]),
                 protocol: Some("tcp".to_string()),
+                ..Default::default()
             },
             RuleScope::default(),
             RuleDisposition::Allow,
@@ -1533,7 +1733,7 @@ mod tests {
         let r1 = rule(
             "uuid-1",
             RuleMatch {
-                host: Some(vec!["api.anthropic.com".to_string()]),
+                ip: Some(vec!["203.0.113.10".to_string()]),
                 port: Some(vec![443]),
                 protocol: Some("tcp".to_string()),
                 ..Default::default()
@@ -1565,7 +1765,7 @@ mod tests {
         let r1 = rule(
             "uuid-1",
             RuleMatch {
-                host: Some(vec!["api.anthropic.com".to_string()]),
+                ip: Some(vec!["203.0.113.10".to_string()]),
                 port: Some(vec![443]),
                 protocol: Some("tcp".to_string()),
                 ..Default::default()
@@ -1613,7 +1813,7 @@ mod tests {
             RuleMatch {
                 host: None,
                 host_pattern: None,
-                ip: None,
+                ip: Some(vec!["203.0.113.10".to_string()]),
                 cidr: None,
                 port: Some(vec![443]),
                 protocol: Some("tcp".to_string()),
@@ -1629,7 +1829,7 @@ mod tests {
             RuleMatch {
                 host: None,
                 host_pattern: None,
-                ip: None,
+                ip: Some(vec!["203.0.113.11".to_string()]),
                 cidr: None,
                 port: Some(vec![8443]),
                 protocol: Some("tcp".to_string()),
@@ -1678,6 +1878,7 @@ mod tests {
             schema_version: SCHEMA_VERSION_V1,
             fortress_id: "deadbeef".to_string(),
             issued_at: "2026-05-05T00:00:00Z".to_string(),
+            generation: 1,
             agent_origin: None,
             operator_baseline: None,
             rules: vec![entry],
@@ -1750,6 +1951,7 @@ mod tests {
             schema_version: SCHEMA_VERSION_V1,
             fortress_id: "deadbeef".to_string(),
             issued_at: "2026-05-05T00:00:00Z".to_string(),
+            generation: 1,
             agent_origin: None,
             operator_baseline: None,
             rules: vec![entry],
@@ -1782,7 +1984,12 @@ mod tests {
                 // Allow disposition: these tests target axis validation, which
                 // runs BEFORE the habeas conflict gate; an allow rule cannot
                 // trip the gate's deny/prompt loopback-shadow scan.
-                rule("uuid-1", match_clause, RuleScope::default(), RuleDisposition::Allow),
+                rule(
+                    "uuid-1",
+                    match_clause,
+                    RuleScope::default(),
+                    RuleDisposition::Allow,
+                ),
             ),
             ("rule-habeas.json".to_string(), habeas_local_rule()),
         ])
@@ -1799,7 +2006,10 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    PolicySnapshotError::InvalidMatchAxis { axis: "match.ip", .. }
+                    PolicySnapshotError::InvalidMatchAxis {
+                        axis: "match.ip",
+                        ..
+                    }
                 ),
                 "ip entry {bad:?} must be rejected, got: {err}"
             );
@@ -1809,14 +2019,14 @@ mod tests {
     #[test]
     fn snapshot_rejects_malformed_cidr_entries() {
         for bad in [
-            "10.0.0.0",      // missing prefix
-            "10.0.0.0/33",   // v4 prefix out of range
-            "::1/129",       // v6 prefix out of range
-            "10.0.0.0/abc",  // non-numeric prefix
-            "10.0.0.0/-1",   // negative prefix
-            "10.0.0.0/",     // empty prefix
-            "999.0.0.0/8",   // malformed base
-            "evil.com/8",    // hostname base
+            "10.0.0.0",     // missing prefix
+            "10.0.0.0/33",  // v4 prefix out of range
+            "::1/129",      // v6 prefix out of range
+            "10.0.0.0/abc", // non-numeric prefix
+            "10.0.0.0/-1",  // negative prefix
+            "10.0.0.0/",    // empty prefix
+            "999.0.0.0/8",  // malformed base
+            "evil.com/8",   // hostname base
         ] {
             let loaded = loaded_with_single_match(RuleMatch {
                 cidr: Some(vec![bad.to_string()]),
@@ -1826,7 +2036,10 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    PolicySnapshotError::InvalidMatchAxis { axis: "match.cidr", .. }
+                    PolicySnapshotError::InvalidMatchAxis {
+                        axis: "match.cidr",
+                        ..
+                    }
                 ),
                 "cidr entry {bad:?} must be rejected, got: {err}"
             );
@@ -1841,6 +2054,104 @@ mod tests {
             ..Default::default()
         });
         PolicySnapshot::from_loaded_manifest(&loaded).expect("well-formed axes accepted");
+    }
+
+    #[test]
+    fn snapshot_refuses_prompt_disposition_at_admission() {
+        // CF1 fault injection: a `prompt` rule must be REFUSED at snapshot-build
+        // time, never admitted and silently served as Drop. The Linux L2 path
+        // has no operator-decision round trip, so downgrading prompt to deny (or
+        // a no-op) would enforce a verdict the operator never signed. Contract:
+        // Linux_Enforcement_Sprint_Architecture, prompt-admission clause.
+        let loaded = synthetic_loaded(vec![
+            (
+                "rule-0.json".to_string(),
+                rule(
+                    "uuid-1",
+                    RuleMatch {
+                        ip: Some(vec!["192.0.2.1".to_string()]),
+                        ..Default::default()
+                    },
+                    RuleScope::default(),
+                    RuleDisposition::Prompt,
+                ),
+            ),
+            ("rule-habeas.json".to_string(), habeas_local_rule()),
+        ]);
+        let err = PolicySnapshot::from_loaded_manifest(&loaded).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PolicySnapshotError::UnsupportedDisposition { ref rule_id }
+                    if rule_id == "uuid-1"
+            ),
+            "a prompt rule must be refused with UnsupportedDisposition, got: {err}"
+        );
+    }
+
+    #[test]
+    fn snapshot_refuses_unattributed_host_and_template_axes() {
+        for match_clause in [
+            RuleMatch {
+                host: Some(vec!["api.example.com".to_string()]),
+                ..Default::default()
+            },
+            RuleMatch {
+                host_pattern: Some(".example.com".to_string()),
+                ..Default::default()
+            },
+        ] {
+            let err = PolicySnapshot::from_loaded_manifest(&loaded_with_single_match(match_clause))
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                PolicySnapshotError::UnenforceableRuleAxis { .. }
+            ));
+        }
+
+        let mut scoped = rule(
+            "uuid-1",
+            RuleMatch {
+                ip: Some(vec!["192.0.2.1".to_string()]),
+                ..Default::default()
+            },
+            RuleScope {
+                template_ids: vec!["browser".to_string()],
+                ..Default::default()
+            },
+            RuleDisposition::Allow,
+        );
+        scoped.created_at = "2026-05-05T00:00:00Z".to_string();
+        let loaded = synthetic_loaded(vec![
+            ("rule-0.json".to_string(), scoped),
+            ("rule-habeas.json".to_string(), habeas_local_rule()),
+        ]);
+        assert!(matches!(
+            PolicySnapshot::from_loaded_manifest(&loaded),
+            Err(PolicySnapshotError::UnenforceableRuleAxis { .. })
+        ));
+    }
+
+    #[test]
+    fn snapshot_refuses_missing_destinations_and_noncanonical_protocols() {
+        assert!(matches!(
+            PolicySnapshot::from_loaded_manifest(&loaded_with_single_match(RuleMatch::default())),
+            Err(PolicySnapshotError::InvalidMatchAxis { axis: "match", .. })
+        ));
+        for protocol in ["TCP", "icmp", "tcp; drop", ""] {
+            let loaded = loaded_with_single_match(RuleMatch {
+                ip: Some(vec!["192.0.2.1".to_string()]),
+                protocol: Some(protocol.to_string()),
+                ..Default::default()
+            });
+            assert!(matches!(
+                PolicySnapshot::from_loaded_manifest(&loaded),
+                Err(PolicySnapshotError::InvalidMatchAxis {
+                    axis: "match.protocol",
+                    ..
+                })
+            ));
+        }
     }
 
     // ---- codex round-4 MEDIUM: unmodeled / unenforceable axes fail closed --
@@ -1869,7 +2180,10 @@ mod tests {
         let err = PolicySnapshot::from_loaded_manifest(&loaded).unwrap_err();
         assert!(matches!(
             err,
-            PolicySnapshotError::UnenforceableRuleAxis { axis: "time_window", .. }
+            PolicySnapshotError::UnenforceableRuleAxis {
+                axis: "time_window",
+                ..
+            }
         ));
     }
 
@@ -1879,9 +2193,18 @@ mod tests {
         // and signs scalar-form rules as-is; the daemon must accept them.
         let raw = r#"{ "id": "uuid-1", "schema_version": 1, "created_at": "2026-05-05T00:00:00Z", "match": { "host": "api.example.com", "ip": "203.0.113.7", "cidr": "10.0.0.0/8", "port": 443 }, "scope": {}, "disposition": "allow" }"#;
         let parsed = serde_json::from_str::<AllowlistRule>(raw).expect("scalar forms parse");
-        assert_eq!(parsed.match_clause.host.as_deref(), Some(&["api.example.com".to_string()][..]));
-        assert_eq!(parsed.match_clause.ip.as_deref(), Some(&["203.0.113.7".to_string()][..]));
-        assert_eq!(parsed.match_clause.cidr.as_deref(), Some(&["10.0.0.0/8".to_string()][..]));
+        assert_eq!(
+            parsed.match_clause.host.as_deref(),
+            Some(&["api.example.com".to_string()][..])
+        );
+        assert_eq!(
+            parsed.match_clause.ip.as_deref(),
+            Some(&["203.0.113.7".to_string()][..])
+        );
+        assert_eq!(
+            parsed.match_clause.cidr.as_deref(),
+            Some(&["10.0.0.0/8".to_string()][..])
+        );
         assert_eq!(parsed.match_clause.port.as_deref(), Some(&[443u16][..]));
         // Array forms still parse identically.
         let raw_arrays = raw
@@ -1902,7 +2225,10 @@ mod tests {
         let raw = r#"{ "id": "uuid-1", "schema_version": 1.0, "created_at": "2026-05-05T00:00:00Z", "match": { "host": ["api.example.com"], "port": [443.0, 4.43e2, 80] }, "scope": {}, "disposition": "allow" }"#;
         let parsed = serde_json::from_str::<AllowlistRule>(raw).expect("number tokens parse");
         assert_eq!(parsed.schema_version, 1);
-        assert_eq!(parsed.match_clause.port.as_deref(), Some(&[443u16, 443, 80][..]));
+        assert_eq!(
+            parsed.match_clause.port.as_deref(),
+            Some(&[443u16, 443, 80][..])
+        );
     }
 
     #[test]
@@ -1928,7 +2254,10 @@ mod tests {
         // silently ignored.
         let raw = r#"{ "id": "uuid-1", "schema_version": 1, "created_at": "2026-05-05T00:00:00Z", "match": { "host": ["api.example.com"], "future_axis": ["x"] }, "scope": {}, "disposition": "deny" }"#;
         let parsed = serde_json::from_str::<AllowlistRule>(raw);
-        assert!(parsed.is_err(), "unknown match axis must fail deserialization");
+        assert!(
+            parsed.is_err(),
+            "unknown match axis must fail deserialization"
+        );
         assert!(parsed.unwrap_err().to_string().contains("future_axis"));
     }
 
@@ -1987,7 +2316,7 @@ mod tests {
         let r1 = rule(
             "uuid-1",
             RuleMatch {
-                host: Some(vec!["api.example.com".to_string()]),
+                ip: Some(vec!["203.0.113.12".to_string()]),
                 port: Some(vec![443]),
                 ..Default::default()
             },
@@ -2022,7 +2351,8 @@ mod tests {
             "deadbeef",
             Some(503),
             "2026-05-05T01:02:03Z",
-        ).unwrap();
+        )
+        .unwrap();
         let parsed = parse_canonical(&body);
         assert_eq!(parsed["layer"], json!("l1"));
         assert_eq!(parsed["operation"], json!("egress_approved"));
@@ -2057,7 +2387,8 @@ mod tests {
             "deadbeef",
             Some(503),
             "2026-05-05T01:02:03Z",
-        ).unwrap();
+        )
+        .unwrap();
         let parsed = parse_canonical(&body);
 
         assert_eq!(parsed["identity_id"], json!("deadbeef/uid-503"));
@@ -2077,7 +2408,8 @@ mod tests {
             "deadbeef",
             None,
             "2026-05-05T01:02:03Z",
-        ).unwrap();
+        )
+        .unwrap();
         let parsed = parse_canonical(&body);
 
         assert_eq!(parsed["fortress_id"], json!("deadbeef"));
@@ -2100,28 +2432,28 @@ mod tests {
             "fortress:test",
             Some(503),
             "2026-05-05T01:02:03Z",
-        ).unwrap();
+        )
+        .unwrap();
         let uid_504 = build_audit_event_canonical_json(
             &v,
             &request,
             "fortress:test",
             Some(504),
             "2026-05-05T01:02:03Z",
-        ).unwrap();
+        )
+        .unwrap();
         let old_agent_name = build_audit_event_canonical_json(
             &v,
             &request,
             "fortress:test",
             None,
             "2026-05-05T01:02:03Z",
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(uid_503, fixture["uid_503"].as_str().unwrap());
         assert_eq!(uid_504, fixture["uid_504"].as_str().unwrap());
-        assert_eq!(
-            old_agent_name,
-            fixture["old_agent_name"].as_str().unwrap()
-        );
+        assert_eq!(old_agent_name, fixture["old_agent_name"].as_str().unwrap());
 
         if std::env::var("SANCTUARY_CAPTURE_LINUX_AUDIT_FIXTURES").as_deref() == Ok("1") {
             println!("uid_503={uid_503}");
@@ -2142,7 +2474,8 @@ mod tests {
             "deadbeef",
             Some(503),
             "2026-05-05T01:02:03Z",
-        ).unwrap();
+        )
+        .unwrap();
         let parsed = parse_canonical(&body);
         assert_eq!(parsed["operation"], json!("egress_blocked"));
         assert_eq!(parsed["result"], json!("failure"));
@@ -2170,7 +2503,8 @@ mod tests {
             "deadbeef",
             Some(503),
             "2026-05-05T01:02:03Z",
-        ).unwrap();
+        )
+        .unwrap();
         let parsed = parse_canonical(&body);
         assert_eq!(parsed["operation"], json!("egress_blocked"));
         assert_eq!(
@@ -2192,7 +2526,8 @@ mod tests {
             "deadbeef",
             Some(503),
             "2026-05-05T01:02:03Z",
-        ).unwrap();
+        )
+        .unwrap();
         let parsed = parse_canonical(&body);
         assert_eq!(parsed["operation"], json!("egress_pending"));
         assert_eq!(parsed["result"], json!("success"));
@@ -2219,7 +2554,8 @@ mod tests {
             "deadbeef",
             Some(504),
             "2026-05-05T01:02:03Z",
-        ).unwrap();
+        )
+        .unwrap();
         let parsed = parse_canonical(&body);
         assert!(parsed["details"].get("dest_host").is_none());
         assert_eq!(parsed["details"]["dest_ip"], json!("203.0.113.10"));
@@ -2241,14 +2577,16 @@ mod tests {
             "deadbeef",
             Some(503),
             "2026-05-05T01:02:03Z",
-        ).unwrap();
+        )
+        .unwrap();
         let b = build_audit_event_canonical_json(
             &v,
             &request,
             "deadbeef",
             Some(503),
             "2026-05-05T01:02:03Z",
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(a, b);
         // Same shape under canonical-JSON byte serialization.
         let bytes_a = canonicalize_to_bytes(&serde_json::from_str(&a).unwrap()).unwrap();

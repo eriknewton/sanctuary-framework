@@ -63,6 +63,7 @@ import {
 import type { SignedManifest } from "../castle-wall/allowlist/manifest.js";
 import type { AllowlistRule } from "../castle-wall/allowlist/schema.js";
 import {
+  castleWallSigningKeyId,
   verifyManifestSignature,
   verifyAndParseRules,
 } from "../castle-wall/allowlist/parse.js";
@@ -148,10 +149,6 @@ function hasFlag(argv: string[], name: string): boolean {
 function resolveFortressArg(fortress: string | undefined, env: NodeJS.ProcessEnv): string {
   if (!fortress) return resolveStoragePath(env);
   return isAbsolute(fortress) ? fortress : resolve(process.cwd(), fortress);
-}
-
-function fingerprintFromPublicKey(publicKey: Uint8Array): string {
-  return createHash("sha256").update(publicKey).digest("hex").slice(0, 16);
 }
 
 function destinationLabel(candidate: CandidateObservation): string {
@@ -1618,7 +1615,7 @@ async function loadPinnedManifestSigner(
     const pub = await readFile(pubPath);
     const encryptedPrivateKey = JSON.parse(await readFile(privPath, "utf8")) as EncryptedPayload;
     return localManifestSigner({
-      signingKeyId: fingerprintFromPublicKey(pub),
+      signingKeyId: castleWallSigningKeyId(pub),
       encryptedPrivateKey,
       encryptionKey: masterKey,
     });

@@ -17,6 +17,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 
 import {
+  BrokerManifestStorage,
   buildSignedManifest,
   publishSignedManifest,
   renderRuleFile,
@@ -26,7 +27,9 @@ import {
   type ManifestStorage,
   type ManifestSigner,
 } from "../../../src/castle-wall/runtime/manifest-publisher.js";
+import type { IpcClient } from "../../../src/castle-wall/runtime/ipc-client.js";
 import {
+  castleWallSigningKeyId,
   verifyAndParseRules,
   verifyManifestSignature,
 } from "../../../src/castle-wall/allowlist/parse.js";
@@ -96,12 +99,12 @@ describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
       identityEncKey,
       "passphrase"
     );
+    pinnedPublicKey = fromBase64url(publicIdentity.public_key);
     signer = localManifestSigner({
-      signingKeyId: storedIdentity.identity_id,
+      signingKeyId: castleWallSigningKeyId(pinnedPublicKey),
       encryptedPrivateKey: storedIdentity.encrypted_private_key,
       encryptionKey: identityEncKey,
     });
-    pinnedPublicKey = fromBase64url(publicIdentity.public_key);
   });
 
   it("produces a signed manifest the PR-1 parser verifies", async () => {
@@ -117,6 +120,53 @@ describe("castle-wall/runtime/manifest-publisher : buildSignedManifest", () => {
 
     const result = verifyManifestSignature(signed, pinnedPublicKey);
     expect(result.ok).toBe(true);
+  });
+
+  it("binds an explicit monotonic generation and rejects unsafe values", async () => {
+    const { signed } = await buildSignedManifest({
+      fortressId: "deadbeef",
+      issuedAt: "2026-05-04T00:00:00Z",
+      generation: 42,
+      rules: [makeRule("rule-1", "api.anthropic.com")],
+      signer,
+    });
+    expect(signed.manifest.generation).toBe(42);
+    await expect(
+      buildSignedManifest({
+        fortressId: "deadbeef",
+        issuedAt: "2026-05-04T00:00:00Z",
+        generation: Number.MAX_SAFE_INTEGER + 1,
+        rules: [makeRule("rule-1", "api.anthropic.com")],
+        signer,
+      })
+    ).rejects.toThrow(/positive safe integer/);
+  });
+
+  it("derives legacy generation only from a strict real instant with an explicit offset", async () => {
+    const valid = await buildSignedManifest({
+      fortressId: "deadbeef",
+      issuedAt: "2026-05-04T00:00:00-07:00",
+      rules: [makeRule("rule-valid", "api.anthropic.com")],
+      signer,
+    });
+    expect(valid.signed.manifest.generation).toBe(
+      Date.UTC(2026, 4, 4, 7, 0, 0),
+    );
+
+    for (const [index, issuedAt] of [
+      "2026-05-04T00:00:00",
+      "2026-02-30T00:00:00Z",
+      "2026-04-31T00:00:00Z",
+      "2026-05-04T24:00:00Z",
+    ].entries()) {
+      const invalid = await buildSignedManifest({
+        fortressId: "deadbeef",
+        issuedAt,
+        rules: [makeRule(`rule-invalid-${index}`, "api.anthropic.com")],
+        signer,
+      });
+      expect(invalid.signed.manifest).not.toHaveProperty("generation");
+    }
   });
 
   it("orders rules by rule_id deterministically", async () => {
@@ -393,16 +443,52 @@ describe("castle-wall/runtime/manifest-publisher : publishSignedManifest", () =>
   beforeEach(() => {
     const masterKey = generateRandomKey();
     const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
-    const { storedIdentity } = createIdentity(
+    const { publicIdentity, storedIdentity } = createIdentity(
       "publisher-test",
       identityEncKey,
       "passphrase"
     );
     signer = localManifestSigner({
-      signingKeyId: storedIdentity.identity_id,
+      signingKeyId: castleWallSigningKeyId(fromBase64url(publicIdentity.public_key)),
       encryptedPrivateKey: storedIdentity.encrypted_private_key,
       encryptionKey: identityEncKey,
     });
+  });
+
+  it("publishes one complete byte-only bundle through the broker adapter", async () => {
+    const calls: Array<{
+      manifest: Uint8Array;
+      rules: ReadonlyArray<{ file: string; bytes: Uint8Array }>;
+    }> = [];
+    const client = {
+      publishPolicyBundle: async (
+        manifest: Uint8Array,
+        rules: ReadonlyArray<{ file: string; bytes: Uint8Array }>
+      ) => {
+        calls.push({ manifest, rules });
+        return {
+          type: "policy_bundle_publish_response" as const,
+          request_id: "req",
+          ok: true,
+          loaded_manifest_signature_b64url: "sig",
+          loaded_rule_count: rules.length,
+        };
+      },
+    } as Pick<IpcClient, "publishPolicyBundle"> as IpcClient;
+
+    await publishSignedManifest(
+      {
+        fortressId: "deadbeef",
+        issuedAt: "2026-05-04T00:00:00Z",
+        generation: 9,
+        rules: [makeRule("rule-a", "a")],
+        signer,
+      },
+      new BrokerManifestStorage(client)
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.rules).toHaveLength(1);
+    expect(new TextDecoder().decode(calls[0]!.manifest)).toContain('"generation":9');
   });
 
   it("writes rule files BEFORE the atomic manifest rename", async () => {
@@ -490,13 +576,13 @@ describe("rule id to filename mapping", () => {
   beforeEach(() => {
     const masterKey = generateRandomKey();
     const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
-    const { storedIdentity } = createIdentity(
+    const { publicIdentity, storedIdentity } = createIdentity(
       "castle-wall-filename-test",
       identityEncKey,
       "passphrase"
     );
     signer = localManifestSigner({
-      signingKeyId: storedIdentity.identity_id,
+      signingKeyId: castleWallSigningKeyId(fromBase64url(publicIdentity.public_key)),
       encryptedPrivateKey: storedIdentity.encrypted_private_key,
       encryptionKey: identityEncKey,
     });

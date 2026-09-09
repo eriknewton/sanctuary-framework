@@ -24,9 +24,11 @@ export interface CuratedSelection {
 export interface InstallStep {
   kind:
     | "create_sanctuary_group"
+    | "create_broker_principal"
     | "create_runtime_dir"
     | "create_state_dir"
     | "place_systemd_unit"
+    | "write_environment_file"
     | "enable_systemd_unit"
     | "place_pinned_public_key"
     | "publish_initial_manifest";
@@ -61,6 +63,9 @@ export interface PlanInstallInput {
 
 /** Build the install plan. Pure: no I/O, no syscalls. */
 export function planInstall(input: PlanInstallInput): InstallPlan {
+  if (!/^[a-f0-9]{8,64}$/.test(input.fortress_id)) {
+    throw new Error("fortress_id must be 8..64 lowercase hexadecimal characters");
+  }
   const knownIds = new Set(CURATED_ALLOWLIST.map((e) => e.rule_id));
   const enabled: string[] = [];
   const skipped: string[] = [];
@@ -81,8 +86,15 @@ export function planInstall(input: PlanInstallInput): InstallPlan {
   const steps: InstallStep[] = [
     {
       kind: "create_sanctuary_group",
-      description: "Create the sanctuary group and add the operator user to it.",
+      description: "Create the system sanctuary group; do not add an interactive operator on the server profile.",
       destination: "sanctuary",
+      side_effects: "user_group_create",
+    },
+    {
+      kind: "create_broker_principal",
+      description:
+        "Create the dedicated non-login sanctuary-broker service principal in the sanctuary group and record its numeric UID.",
+      destination: "sanctuary-broker",
       side_effects: "user_group_create",
     },
     {
@@ -93,7 +105,7 @@ export function planInstall(input: PlanInstallInput): InstallPlan {
     },
     {
       kind: "create_state_dir",
-      description: `Create state dir at ${stateDir} (mode 0750, root:sanctuary).`,
+      description: `Create state dir at ${stateDir} (mode 0700, root:root); the broker must never traverse private keys, policy, or WAL state.`,
       destination: stateDir,
       side_effects: "filesystem_write",
     },
@@ -101,6 +113,13 @@ export function planInstall(input: PlanInstallInput): InstallPlan {
       kind: "place_systemd_unit",
       description: `Place systemd unit at ${systemdUnitPath} (daemon binary: ${daemonBinary}).`,
       destination: systemdUnitPath,
+      side_effects: "filesystem_write",
+    },
+    {
+      kind: "write_environment_file",
+      description:
+        "Write root-owned mode-0600 /etc/sanctuary/castle-wall.env with the canonical fortress id and the dedicated sanctuary-broker numeric UID.",
+      destination: "/etc/sanctuary/castle-wall.env",
       side_effects: "filesystem_write",
     },
     {

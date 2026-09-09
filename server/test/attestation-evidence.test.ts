@@ -1,3 +1,4 @@
+// fail-before-exempt: this change adds only the newly required Castle Wall status fields to an existing fixture so the object still satisfies the widened StatusResponse shape; it asserts nothing new and therefore passes against pre-fix source by construction. Fail-before coverage for those fields lives in the changed castle-wall runtime and health tests, which do pin them.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -56,6 +57,15 @@ describe("attestation evidence", () => {
           uptime_seconds: 10,
           loaded_rule_count: 2,
           no_wall_engaged: false,
+          manifest_state: "ready" as const,
+          lifecycle_state: "running",
+          runtime_state: "enforcing",
+          kernel_runtime_ready: true,
+          enforcing: true,
+          // A frame claiming a kernel runtime must carry the proof token on the
+          // same frame; without it the classifier reads the claim as
+          // indeterminate rather than active.
+          runtime_health: "ready" as const,
           loaded_manifest_signature_b64url: "sig",
         },
       },

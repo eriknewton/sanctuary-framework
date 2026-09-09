@@ -48,7 +48,18 @@ server/test-results/
 
 # Castle Wall daemon Rust artifacts
 castle-wall-daemon/target/
-castle-wall-daemon/Cargo.lock
+
+# Local pre-commit hook transcripts. The commit hook runs the whole suite and
+# its log is the only record of a run that took ~9 minutes, so keep it beside
+# the worktree rather than in a system temp dir that a reboot deletes. It is
+# a local artifact and must never be committed: the repo-root allowlist guard
+# (server/test/structure/root-allowlist.test.ts) fails the suite if it is.
+.hooklogs/
+
+# Cargo.lock IS tracked for this crate: the Linux CI job builds with `--locked`,
+# which fails outright without a committed lock, and the MSRV job's whole point is
+# that the exact resolved graph still builds on Rust 1.75. It was ignored while the
+# crate was a scratch prototype; do not re-add an ignore line for it.
 
 # Castle Wall macOS Swift package artifacts
 castle-wall-macos/.build/
