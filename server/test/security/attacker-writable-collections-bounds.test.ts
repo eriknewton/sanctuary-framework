@@ -43,7 +43,7 @@
  * test proved the lockout was still reachable).
  */
 
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey, randomBytes } from "../../src/core/random.js";
@@ -65,6 +65,20 @@ import {
 } from "../../src/federation/registry.js";
 import { ON_EVICT_AUDIT_TIMEOUT_MS } from "../../src/core/bounded-map.js";
 import { generateSHR } from "../../src/shr/generator.js";
+
+// Owner token for the tests below that install fake timers. Runner-owned
+// cleanup: if such a test times out with an await still pending, vitest
+// rejects the wrapper WITHOUT unwinding the callback, so the test's own
+// `finally` never runs and the next test would inherit a frozen clock. This
+// afterEach restores real timers regardless (idempotent when timers are
+// already real) and clears the owner, so a late continuation of the timed-out
+// body sees it no longer owns the clock and neither advances nor restores
+// another test's time.
+let frozenClockOwner: symbol | null = null;
+afterEach(() => {
+  frozenClockOwner = null;
+  vi.useRealTimers();
+});
 import { createIdentity, generateIdentityId } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { canonicalizeForSigning } from "../../src/shr/types.js";
@@ -462,10 +476,11 @@ describe("2. handshake results: capped + per-session fair + expires_at-aware evi
   it(
     "MUTATION-PROOF TARGET (expires_at): refuses a new result while every slot holds a live verified peer, then EVICTS one once they expire — never blind-FIFOs a live peer",
     async () => {
-      // Short SHR validity (test-only override) so 1000 real handshakes can
-      // all complete WITHIN their validity window, and then all become
-      // expired together after one short sleep — without waiting the real
-      // 1-hour default.
+      // Short SHR validity (test-only override) so the 1000 filler entries
+      // carry a near expires_at that one frozen-clock jump below can push
+      // into the past together, without waiting the real 1-hour default.
+      // The fill's own duration never counts against this window: `Date` is
+      // frozen for the whole fill (see the comment at the freeze).
       const SHR_VALIDITY_MS = 30_000;
       const registrar = makeAgent();
       const registrarIdentity = await createIdentityFor(registrar, "registrar-identity");
@@ -540,6 +555,8 @@ describe("2. handshake results: capped + per-session fair + expires_at-aware evi
       // never race SHR_VALIDITY_MS and evict a filler entry mid-fill. The
       // property under test is refuse-while-live then evict-after-expiry,
       // never a wall-clock budget the fill has to beat.
+      const clockOwner = Symbol("expires_at-proof clock owner");
+      frozenClockOwner = clockOwner;
       vi.useFakeTimers({ toFake: ["Date"] });
       try {
         // Fill handshakeResults to EXACTLY the global cap, spread across
@@ -602,6 +619,11 @@ describe("2. handshake results: capped + per-session fair + expires_at-aware evi
         // fresh handshake for the SAME probe session must now SUCCEED — an
         // expired verified entry rolls off to admit a new one, instead of
         // wedging the store for the server's lifetime.
+        if (frozenClockOwner !== clockOwner) {
+          throw new Error(
+            "frozen clock is no longer owned by this test (it timed out and the runner moved on); refusing to advance another test's clock"
+          );
+        }
         vi.setSystemTime(Date.now() + SHR_VALIDITY_MS + 500);
         const afterExpiry = await completeRealHandshake(
           probeSession,
@@ -612,7 +634,12 @@ describe("2. handshake results: capped + per-session fair + expires_at-aware evi
         expect(evictedAudited).toBeDefined();
         expect(evictedAudited!.expired).toBe(true);
       } finally {
-        vi.useRealTimers();
+        // Only the current owner restores real timers; a late continuation
+        // after a timeout must not touch the clock a later test may own.
+        if (frozenClockOwner === clockOwner) {
+          frozenClockOwner = null;
+          vi.useRealTimers();
+        }
       }
     },
     240_000
