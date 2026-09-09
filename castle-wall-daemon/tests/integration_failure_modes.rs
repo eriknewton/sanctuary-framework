@@ -66,7 +66,22 @@ use castle_wall_daemon::manifest::verify::{
 };
 use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
 use castle_wall_daemon::nfqueue::{NfqueueConfig, QueueHandle};
-use castle_wall_daemon::nftables::{self, AgentRulesetId, NftRuleFragment, CASTLE_FAMILY};
+use castle_wall_daemon::nftables::{
+    self, AgentRulesetId, AgentUidBinding, NftRuleFragment, CASTLE_FAMILY,
+};
+
+/// The uid these tests bind an agent to, and the manifest ceiling it clears.
+/// Deliberately a uid with no account: nft validates nothing about a `meta
+/// skuid` value at rule-load time, so no system user has to exist on the runner.
+const TEST_AGENT_UID: u32 = 60123;
+const TEST_UID_CEILING: u32 = 1000;
+
+fn test_binding() -> AgentUidBinding {
+    AgentUidBinding {
+        agent_uid: TEST_AGENT_UID,
+        system_uid_allow_ceiling: TEST_UID_CEILING,
+    }
+}
 use castle_wall_daemon::policy::{DeniedReason, EvaluationRequest, Verdict};
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
@@ -378,21 +393,17 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
     let handle = boot(config).expect("boot");
     nftables::install_castle_table().expect("install_castle_table");
 
-    // Real agent scope so the production rule's cgroupv2 path lookup
-    // succeeds at rule-load time.
-    let scope = cgroup::create_agent_scope("f2-test").expect("create_agent_scope");
-    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
     let id = AgentRulesetId {
         agent_id: "f2-test".to_string(),
-        cgroup_path: scope.cgroup_path.clone(),
+        fortress_id: "failmodes-fortress".to_string(),
     };
     let frags = vec![NftRuleFragment {
         rule_id: "r-f2".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
     let script =
-        nftables::build_agent_ruleset("f2-test", &cgroup_relative, scope.cgroup_level, &frags);
-    nftables::load_agent_ruleset(&id, &script, scope.cgroup_level, &cgroup_relative)
+        nftables::build_agent_ruleset("f2-test", TEST_AGENT_UID, &frags);
+    nftables::load_agent_ruleset(&id, &script, test_binding())
         .expect("load_agent_ruleset");
 
     // Sanity: the chain is in the kernel before the simulated crash.
@@ -453,7 +464,6 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
     }
 
     let _ = handle2.stop();
-    let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
 }
 
@@ -473,19 +483,17 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
     let handle = boot(config).expect("boot");
     nftables::install_castle_table().expect("install");
 
-    let scope = cgroup::create_agent_scope("f3-test").expect("create_agent_scope");
-    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
     let id = AgentRulesetId {
         agent_id: "f3-test".to_string(),
-        cgroup_path: scope.cgroup_path.clone(),
+        fortress_id: "failmodes-fortress".to_string(),
     };
     let frags = vec![NftRuleFragment {
         rule_id: "r-f3".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
     let script =
-        nftables::build_agent_ruleset("f3-test", &cgroup_relative, scope.cgroup_level, &frags);
-    nftables::load_agent_ruleset(&id, &script, scope.cgroup_level, &cgroup_relative).expect("load");
+        nftables::build_agent_ruleset("f3-test", TEST_AGENT_UID, &frags);
+    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load");
 
     // Connect, handshake, then forcibly close the client side mid-session.
     let stream = connect_with_handshake(&socket_path, &signing, &fortress_id);
@@ -543,7 +551,6 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
 
     drop(stream2);
     let _ = handle.stop();
-    let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
 }
 

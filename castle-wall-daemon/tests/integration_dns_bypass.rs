@@ -41,7 +41,6 @@
 mod isolation;
 
 use base64::Engine as _;
-use castle_wall_daemon::cgroup;
 use castle_wall_daemon::config::DaemonConfig;
 use castle_wall_daemon::daemon::{boot, DaemonHandle};
 use castle_wall_daemon::manifest::canonical_json::canonicalize_to_bytes;
@@ -49,7 +48,14 @@ use castle_wall_daemon::manifest::verify::{
     AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
 };
 use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
-use castle_wall_daemon::nftables::{self, AgentRulesetId};
+use castle_wall_daemon::nftables::{self, AgentRulesetId, AgentUidBinding};
+
+/// The uid the wrapped agent in these bypass tests runs as, and the manifest
+/// ceiling it clears. No account is created: nft validates nothing about a
+/// `meta skuid` value at rule-load time, and `setpriv` will switch to a uid with
+/// no passwd entry, which is exactly the shape the kernel match reads.
+const BYPASS_AGENT_UID: u32 = 60123;
+const BYPASS_UID_CEILING: u32 = 1000;
 use castle_wall_daemon::policy::{DeniedReason, EvaluationRequest, Verdict};
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
@@ -437,7 +443,6 @@ struct KernelBypassFixture {
     daemon: Option<DaemonHandle>,
     _tempdir: TempDir,
     agent_id: String,
-    scope: cgroup::ScopeHandle,
     ruleset_id: AgentRulesetId,
 }
 
@@ -450,50 +455,58 @@ impl KernelBypassFixture {
         // loop. The daemon is now the NFQUEUE consumer for this process.
         let (daemon, tempdir) = boot_with_only_example_com_443_allowed();
 
-        // Wrap a real agent cgroup and install its per-agent chain + base-output
-        // jump INTO THE DAEMON'S owned table. `build_agent_ruleset` registers
-        // the agent's nfmark (so the daemon's verdict loop can attribute the
-        // dequeued packet back to this agent) and emits the
-        // `socket cgroupv2 ... meta mark set <mark> queue to 0` catchall;
+        // Install the agent's per-agent chain + base-output jump INTO THE
+        // DAEMON'S owned table. `build_agent_ruleset` registers the agent's
+        // nfmark (so the daemon's verdict loop can attribute the dequeued packet
+        // back to this agent) and emits the
+        // `meta skuid <uid> ... meta mark set <mark> queue to 0` catchall;
         // `load_agent_ruleset` wires the base-output-chain jump. The load
         // authorizes because the daemon already holds this process's single nft
         // runtime ownership identity.
-        let scope = cgroup::create_agent_scope(agent_id).expect("create_agent_scope");
-        let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
         let ruleset_id = AgentRulesetId {
             agent_id: agent_id.to_string(),
-            cgroup_path: scope.cgroup_path.clone(),
+            fortress_id: "dnsbypass-fortress".to_string(),
         };
         // Static fragments are intentionally empty: the NFQUEUE-only model
         // routes every unmatched packet to the daemon's userspace evaluator,
         // which is exactly what these bypass tests exercise.
-        let script =
-            nftables::build_agent_ruleset(agent_id, &cgroup_relative, scope.cgroup_level, &[]);
-        nftables::load_agent_ruleset(&ruleset_id, &script, scope.cgroup_level, &cgroup_relative)
-            .expect("load_agent_ruleset into daemon-owned table");
+        let script = nftables::build_agent_ruleset(agent_id, BYPASS_AGENT_UID, &[]);
+        nftables::load_agent_ruleset(
+            &ruleset_id,
+            &script,
+            AgentUidBinding {
+                agent_uid: BYPASS_AGENT_UID,
+                system_uid_allow_ceiling: BYPASS_UID_CEILING,
+            },
+        )
+        .expect("load_agent_ruleset into daemon-owned table");
 
         Self {
             daemon: Some(daemon),
             _tempdir: tempdir,
             agent_id: agent_id.to_string(),
-            scope,
             ruleset_id,
         }
     }
 
-    /// Spawn the bypass attempt subprocess in the agent cgroup. The shell
-    /// wrapper writes the subprocess PID to `cgroup.procs` BEFORE exec'ing the
-    /// real command, so the socket the packet leaves on is owned inside the
-    /// cgroup (no race window).
+    /// Spawn the bypass attempt subprocess AS THE AGENT UID. `setpriv` switches
+    /// credentials and then `exec`s, so the socket the packet leaves on is
+    /// created after the switch and carries the agent's uid.
+    ///
+    /// The ordering matters and is the reason for `exec` rather than a shell
+    /// builtin: `meta skuid` reads credentials RECORDED ON THE SOCKET, so a
+    /// socket opened before the switch would keep the parent's uid and miss the
+    /// match entirely — a false PASS that looked like enforcement.
     fn spawn_bypass(&self, bypass_shell_cmd: &str) {
-        let cgroup_procs = self.scope.cgroup_path.join("cgroup.procs");
-        let wrapped = format!(
-            "echo $$ > {} && exec {}",
-            cgroup_procs.display(),
-            bypass_shell_cmd
-        );
-        let mut child = Command::new("sh")
-            .args(["-c", &wrapped])
+        let mut child = Command::new("setpriv")
+            .args([
+                &format!("--reuid={BYPASS_AGENT_UID}"),
+                &format!("--regid={BYPASS_AGENT_UID}"),
+                "--clear-groups",
+                "sh",
+                "-c",
+                bypass_shell_cmd,
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -547,12 +560,11 @@ impl KernelBypassFixture {
 
     fn shutdown_in_place(&mut self) {
         // Remove the per-agent chain/jump while the daemon still holds nft
-        // runtime ownership (remove_agent_ruleset verifies it), then tear down
-        // the cgroup, then stop the daemon (which releases the owned table and
-        // unbinds queue 0). Reversing this order would try to mutate a table
-        // the stopped daemon no longer owns.
+        // runtime ownership (remove_agent_ruleset verifies it), then stop the
+        // daemon (which releases the owned table and unbinds queue 0).
+        // Reversing this order would try to mutate a table the stopped daemon no
+        // longer owns.
         let _ = nftables::remove_agent_ruleset(&self.ruleset_id);
-        let _ = cgroup::destroy_agent_scope(&self.scope);
         if let Some(daemon) = self.daemon.take() {
             let _ = daemon.stop();
         }

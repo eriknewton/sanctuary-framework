@@ -482,6 +482,16 @@ pub struct PolicySnapshot {
     pub manifest_signature_b64url: Option<String>,
     pub fortress_id: String,
     pub confined_agent_uid: Option<u32>,
+    /// The `system_uid_allow_ceiling` the CURRENT manifest admitted
+    /// `confined_agent_uid` under. `Some` exactly when `confined_agent_uid` is
+    /// `Some`; the two are set together and must stay that way.
+    ///
+    /// Exposed so an emission site can prove, at the moment it seals a uid into a
+    /// kernel rule, that the uid still clears the floor admission accepted it
+    /// under. `crate::nftables::AgentUidBinding` is the shape it travels in.
+    /// Must match `AgentOrigin.system_uid_allow_ceiling` in
+    /// `src/manifest/verify.rs`.
+    pub confined_agent_uid_ceiling: Option<u32>,
 }
 
 /// Errors produced when constructing a [`PolicySnapshot`] from a
@@ -569,6 +579,17 @@ pub enum PolicySnapshotError {
         issues.join("; ")
     )]
     HabeasConflict { issues: Vec<String> },
+    /// The manifest DECLARES `uid`-mode agent confinement but its binding is
+    /// unusable (no `agent_uid`, a uid at or below the declared system floor, or
+    /// an invalid/colliding `gate_uid`). Fail closed: snapshot construction
+    /// aborts and the caller keeps the prior good policy, rather than putting a
+    /// live snapshot into force that confines nobody while claiming to.
+    #[error(
+        "manifest rejected: it declares uid-mode agent confinement but the binding is \
+         unusable ({detail}). A manifest that claims to confine an agent and cannot is \
+         refused, never admitted with nothing confined."
+    )]
+    AgentOriginUnusable { detail: String },
 }
 
 impl PolicySnapshot {
@@ -619,11 +640,19 @@ impl PolicySnapshot {
                 issues: habeas_issues,
             });
         }
+        // Section-5 admission polarity: a manifest that DECLARES `uid` mode but
+        // carries no usable binding must fail the snapshot closed, not build a
+        // live snapshot with no confined uid. The prior return-`None` behaviour
+        // put a policy into force over a `policy accept` base with nothing
+        // confined, which reads as a healthy wall while confining nobody.
+        let confined_agent_uid = confined_agent_uid_from_loaded_manifest(loaded)?;
         Ok(Self {
             rules,
             manifest_signature_b64url: Some(loaded.manifest_signature_b64url.clone()),
             fortress_id: loaded.signed.manifest.fortress_id.clone(),
-            confined_agent_uid: confined_agent_uid_from_loaded_manifest(loaded),
+            confined_agent_uid: confined_agent_uid.map(|admitted| admitted.agent_uid),
+            confined_agent_uid_ceiling: confined_agent_uid
+                .map(|admitted| admitted.system_uid_allow_ceiling),
         })
     }
 
@@ -668,24 +697,79 @@ impl PolicySnapshot {
     }
 }
 
-fn confined_agent_uid_from_loaded_manifest(loaded: &LoadedManifest) -> Option<u32> {
-    let origin = loaded.signed.manifest.agent_origin.as_ref()?;
+/// The validated agent binding a signed manifest admits: the uid plus the
+/// ceiling it cleared. Returned together so a consumer cannot pick up the uid
+/// while dropping the floor that made it legitimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdmittedAgentUid {
+    agent_uid: u32,
+    system_uid_allow_ceiling: u32,
+}
+
+/// Resolve the confined agent uid a signed manifest binds, or REFUSE the
+/// manifest.
+///
+/// Two outcomes are legitimately `Ok(None)` and are not confinement:
+///
+///   * no `agent_origin` at all — the unwrapped posture, a first boot;
+///   * a non-`uid` mode — a descriptor this daemon does not implement.
+///
+/// Everything else in `uid` mode is a REFUSAL, not a `None`. INVARIANT: a
+/// manifest that declares `uid` mode is asserting that an agent is confined; if
+/// its binding is unusable, the honest response is to keep the prior good policy,
+/// never to put a live snapshot into force with nothing confined. macOS admission
+/// has the same polarity (`SignedManifestVerification.swift`), and a Linux daemon
+/// that admitted what macOS refuses would make the same signed manifest mean two
+/// different things on the two platforms.
+///
+/// The `gate_uid` rules are the same refusal, for the same reason: an invalid or
+/// colliding gate uid used to zero the WHOLE agent uid, unconfining the FIRST
+/// principal because of the SECOND's defect.
+fn confined_agent_uid_from_loaded_manifest(
+    loaded: &LoadedManifest,
+) -> Result<Option<AdmittedAgentUid>, PolicySnapshotError> {
+    let Some(origin) = loaded.signed.manifest.agent_origin.as_ref() else {
+        return Ok(None);
+    };
     if origin.mode != "uid" {
-        return None;
+        return Ok(None);
     }
 
-    let agent_uid = origin.agent_uid?;
+    let unusable = |detail: String| PolicySnapshotError::AgentOriginUnusable { detail };
+
+    let Some(agent_uid) = origin.agent_uid else {
+        return Err(unusable(
+            "agent_origin declares `uid` mode but carries no agent_uid".to_string(),
+        ));
+    };
+    // Must match the floors in `crate::nftables::validate_agent_binding_input`
+    // and in `agent-origin.ts` on the publishing side: uid 0 is root, and a uid
+    // below the ceiling is a system account this wall must not claim to gate.
     if agent_uid < 1 || agent_uid < origin.system_uid_allow_ceiling {
-        return None;
+        return Err(unusable(format!(
+            "agent_uid {agent_uid} is root or below the declared system_uid_allow_ceiling {}",
+            origin.system_uid_allow_ceiling
+        )));
     }
 
     if let Some(gate_uid) = origin.gate_uid {
-        if gate_uid < 1 || gate_uid < origin.system_uid_allow_ceiling || gate_uid == agent_uid {
-            return None;
+        if gate_uid < 1 || gate_uid < origin.system_uid_allow_ceiling {
+            return Err(unusable(format!(
+                "gate_uid {gate_uid} is root or below the declared system_uid_allow_ceiling {}",
+                origin.system_uid_allow_ceiling
+            )));
+        }
+        if gate_uid == agent_uid {
+            return Err(unusable(format!(
+                "gate_uid {gate_uid} collides with agent_uid; the two principals must be distinct"
+            )));
         }
     }
 
-    Some(agent_uid)
+    Ok(Some(AdmittedAgentUid {
+        agent_uid,
+        system_uid_allow_ceiling: origin.system_uid_allow_ceiling,
+    }))
 }
 
 /// Validate a parsed rule's match axes at snapshot-build time (codex round-4
@@ -1190,6 +1274,7 @@ mod tests {
             manifest_signature_b64url: Some("test-sig".to_string()),
             fortress_id: "deadbeef".to_string(),
             confined_agent_uid: Some(503),
+            confined_agent_uid_ceiling: Some(500),
         }
     }
 
@@ -1760,8 +1845,20 @@ mod tests {
         assert_eq!(snap.confined_agent_uid, Some(503));
     }
 
-    #[test]
-    fn snapshot_refuses_uid_mode_agent_origin_below_system_uid_ceiling() {
+    /// A `uid`-mode origin the caller can vary one field of at a time.
+    fn uid_origin(agent_uid: Option<u32>, gate_uid: Option<u32>, ceiling: u32) -> AgentOrigin {
+        AgentOrigin {
+            mode: "uid".to_string(),
+            egress_helper_signing_id: None,
+            egress_helper_team_id: None,
+            agent_runtime_port_range: None,
+            agent_uid,
+            gate_uid,
+            system_uid_allow_ceiling: ceiling,
+        }
+    }
+
+    fn loaded_with_origin(origin: Option<AgentOrigin>) -> LoadedManifest {
         let r1 = rule(
             "uuid-1",
             RuleMatch {
@@ -1777,33 +1874,73 @@ mod tests {
             ("rule-0.json".to_string(), r1),
             ("rule-habeas.json".to_string(), habeas_local_rule()),
         ]);
-        loaded.signed.manifest.agent_origin = Some(AgentOrigin {
-            mode: "uid".to_string(),
-            egress_helper_signing_id: None,
-            egress_helper_team_id: None,
-            agent_runtime_port_range: None,
-            agent_uid: Some(65),
-            gate_uid: None,
-            system_uid_allow_ceiling: 500,
-        });
+        loaded.signed.manifest.agent_origin = origin;
+        loaded
+    }
 
-        let snap = PolicySnapshot::from_loaded_manifest(&loaded).expect("snapshot");
+    #[test]
+    fn snapshot_refuses_uid_mode_agent_origin_below_system_uid_ceiling() {
+        // Section-5 admission polarity. This case USED to build a live snapshot
+        // with `confined_agent_uid == None`: a policy in force over a
+        // `policy accept` base with nothing confined, which reads as a healthy
+        // wall while confining nobody. A manifest that DECLARES uid-mode
+        // confinement and cannot deliver it must fail the snapshot closed, so the
+        // caller keeps the prior good policy.
+        let loaded = loaded_with_origin(Some(uid_origin(Some(65), None, 500)));
+        let err = PolicySnapshot::from_loaded_manifest(&loaded).unwrap_err();
+        assert!(
+            matches!(err, PolicySnapshotError::AgentOriginUnusable { .. }),
+            "a uid below the declared ceiling must REFUSE the snapshot, got: {err:?}"
+        );
+    }
 
+    #[test]
+    fn snapshot_refuses_uid_mode_agent_origin_with_no_agent_uid() {
+        let loaded = loaded_with_origin(Some(uid_origin(None, None, 500)));
+        let err = PolicySnapshot::from_loaded_manifest(&loaded).unwrap_err();
+        assert!(matches!(err, PolicySnapshotError::AgentOriginUnusable { .. }));
+    }
+
+    #[test]
+    fn snapshot_refuses_an_invalid_or_colliding_gate_uid_instead_of_unconfining_the_agent() {
+        // The gate uid used to zero the WHOLE agent uid, unconfining the FIRST
+        // principal because of the SECOND's defect. Both shapes now refuse.
+        for gate_uid in [Some(65), Some(0), Some(503)] {
+            let loaded = loaded_with_origin(Some(uid_origin(Some(503), gate_uid, 500)));
+            let err = PolicySnapshot::from_loaded_manifest(&loaded).unwrap_err();
+            assert!(
+                matches!(err, PolicySnapshotError::AgentOriginUnusable { .. }),
+                "gate_uid {gate_uid:?} must refuse the snapshot, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_still_builds_with_no_agent_origin_or_a_non_uid_mode() {
+        // What refusal does NOT do: an ABSENT `agent_origin`, or a mode this
+        // daemon does not implement, is the legitimate unwrapped posture — a
+        // first boot with nothing confined. It must still yield a live snapshot,
+        // or an ordinary host could not put a policy into force at all.
+        let snap = PolicySnapshot::from_loaded_manifest(&loaded_with_origin(None))
+            .expect("an absent agent_origin is the unwrapped posture, not a refusal");
         assert_eq!(snap.confined_agent_uid, None);
+        assert_eq!(snap.confined_agent_uid_ceiling, None);
 
-        let body = build_audit_event_canonical_json(
-            &Verdict::Deny {
-                reason: DeniedReason::DefaultDeny,
-            },
-            &req(Some("evil.example"), 443, "tcp"),
-            "fortress:test",
-            snap.confined_agent_uid,
-            "2026-05-05T01:02:03Z",
-        )
-        .unwrap();
-        let parsed = parse_canonical(&body);
-        assert_ne!(parsed["identity_id"], json!("fortress:test/uid-65"));
-        assert_eq!(parsed["identity_id"], json!("agent-1"));
+        let mut other_mode = uid_origin(Some(503), None, 500);
+        other_mode.mode = "signing_id".to_string();
+        let snap = PolicySnapshot::from_loaded_manifest(&loaded_with_origin(Some(other_mode)))
+            .expect("a non-uid mode is not a uid-confinement claim");
+        assert_eq!(snap.confined_agent_uid, None);
+    }
+
+    #[test]
+    fn an_admitted_uid_carries_the_ceiling_it_cleared() {
+        // The uid and the floor that made it legitimate travel together, so an
+        // emission site cannot pick up the uid while dropping the ceiling.
+        let loaded = loaded_with_origin(Some(uid_origin(Some(503), Some(504), 500)));
+        let snap = PolicySnapshot::from_loaded_manifest(&loaded).expect("snapshot");
+        assert_eq!(snap.confined_agent_uid, Some(503));
+        assert_eq!(snap.confined_agent_uid_ceiling, Some(500));
     }
 
     #[test]
