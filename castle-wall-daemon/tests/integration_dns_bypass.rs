@@ -465,7 +465,11 @@ impl KernelBypassFixture {
         // runtime ownership identity.
         let ruleset_id = AgentRulesetId {
             agent_id: agent_id.to_string(),
-            fortress_id: "dnsbypass-fortress".to_string(),
+            // Must match the daemon's `DaemonConfig.fortress_id` above: the uid
+            // seal is recomputed under the fortress the CURRENT snapshot names,
+            // so a different id here reads the live binding as foreign and the
+            // very first health poll re-arms deny-all.
+            fortress_id: "deadbeef".to_string(),
         };
         // Static fragments are intentionally empty: the NFQUEUE-only model
         // routes every unmatched packet to the daemon's userspace evaluator,

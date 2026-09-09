@@ -25,7 +25,11 @@ use std::sync::atomic::Ordering;
 
 /// The fortress every agent binding in this file is sealed under. A single
 /// constant so a test that means to vary the FORTRESS has to say so.
-const TEST_FORTRESS: &str = "kernelbind-fortress";
+///
+/// Must match the `DaemonConfig.fortress_id` the end-to-end test boots with: the
+/// uid seal is recomputed under the fortress the CURRENT policy snapshot names,
+/// so a binding installed under one id does not verify under another.
+const TEST_FORTRESS: &str = "deadbeef";
 /// The system-uid allow ceiling these tests admit uids under. Mirrors the
 /// manifest floor (`AgentOrigin.system_uid_allow_ceiling`).
 const TEST_UID_CEILING: u32 = 1000;
