@@ -142,6 +142,9 @@ fn verdict_deadline_fail_stop(deadline: Duration) -> Result<(), NfqueueError> {
     // The evaluator is a Rust thread and cannot be cancelled safely. Do not
     // return through ordinary runtime release while it is still running: that
     // would detach authority-bearing work after the wall reports stopped.
+    // SAFETY: stderr is the fail-stop contract. This runs immediately before
+    // `process::exit`, so no structured channel survives to carry it, and the
+    // systemd journal is the only place the operator can read why the process died.
     eprintln!(
         "castle-wall-daemon: FATAL NFQUEUE verdict deadline exceeded ({deadline:?}); fail-stopping process so systemd kills the stuck worker"
     );
@@ -716,6 +719,9 @@ fn supersede_allow_receipt(
         // LOUD, never silent: an absent correction is exactly the shape of the
         // defect this exists to close, so it must be visible in the journal
         // rather than inferred from a missing record.
+        // SAFETY: stderr is the last-resort channel for an audit-trail correction
+        // that could not be written; routing it through the audit log is exactly what
+        // just failed, so a structured logger would lose the message.
         eprintln!(
             "castle-wall-daemon: dropped packet at the teardown fence after WAL seq {seq} \
              recorded an allow, and the superseding record could not be written ({err}); \

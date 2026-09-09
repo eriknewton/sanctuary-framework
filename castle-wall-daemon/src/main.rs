@@ -34,17 +34,19 @@ fn print_help() {
     println!("    -h, --help                    Print help");
     println!();
     println!("RECOVERY:");
-    println!("    --disarm                      DELETE the owned nftables table and clear its");
+    // SAFETY: stdout is the CLI --help contract, same as the block above.
+    // One call rather than five: rustfmt wraps a long single-argument `println!`
+    // onto its own lines, and the closing `);` of a wrapped call breaks the
+    // stdout-discipline gate's walk-back to the SAFETY note at the top of this
+    // function, so each wrapped call would need its own duplicate annotation.
+    // A single literal keeps the help text one block with one channel contract.
     println!(
-        "                                  ownership journal, under the host lock. This is the"
+        "    --disarm                      DELETE the owned nftables table and clear its\n\
+         \x20                                 ownership journal, under the host lock. This is the\n\
+         \x20                                 ONLY action that removes enforcement state; ordinary\n\
+         \x20                                 shutdown / SIGTERM / systemd stop NEVER does. Refuses\n\
+         \x20                                 if the daemon is running or the table is foreign."
     );
-    println!(
-        "                                  ONLY action that removes enforcement state; ordinary"
-    );
-    println!(
-        "                                  shutdown / SIGTERM / systemd stop NEVER does. Refuses"
-    );
-    println!("                                  if the daemon is running or the table is foreign.");
 }
 
 fn has_structural_flag(args: &[String], wanted: &str) -> bool {
@@ -284,6 +286,8 @@ fn main() -> ExitCode {
             }
         };
         if let Some(reason) = smoke_failure {
+            // SAFETY: stderr is the CLI smoke-failure contract, not a log channel. The
+            // boot-and-exit CI harness scrapes this line and the nonzero exit beside it.
             eprintln!("castle-wall-daemon: boot-and-exit smoke failed: {reason}");
             return ExitCode::from(75);
         }
@@ -305,11 +309,16 @@ fn main() -> ExitCode {
     // leaving a live-but-not-enforcing service reporting itself active.
     let outcome = handle.supervise_until_shutdown(SHUTDOWN_TICK, HEALTH_INTERVAL);
     match &outcome {
+        // SAFETY: stderr is the operator-visible supervision-outcome contract. These
+        // two arms explain a NONZERO exit that systemd is about to restart; the
+        // durable audit for the loss is written by the supervision loop itself.
         daemon::SupervisionOutcome::KernelRuntimeLost(reason) => eprintln!(
             "castle-wall-daemon: kernel runtime lost after ready ({:?}); tearing down and \
              exiting nonzero so systemd restarts enforcement",
             reason
         ),
+        // SAFETY: stderr is the operator-visible supervision-outcome contract; same
+        // channel and reason as the KernelRuntimeLost arm above.
         daemon::SupervisionOutcome::FatalControlPath => eprintln!(
             "castle-wall-daemon: fatal control-path durability failure after commit; \
              tearing down and exiting nonzero so systemd restarts enforcement"

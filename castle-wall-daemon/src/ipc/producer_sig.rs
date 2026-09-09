@@ -302,6 +302,8 @@ fn write_private_key(path: &Path, key: &SigningKey) -> Result<(), ProducerSigErr
 
 fn write_public_key(path: &Path, key: &SigningKey) -> Result<(), ProducerSigError> {
     validate_key_parent(path)?;
+    // Safety: `validate_key_parent` on the previous line rejects a path with no
+    // parent, so the parent is present once it returns Ok.
     let parent = path.parent().expect("validated above");
     let tmp = parent.join(format!(".audit-producer.pub.{:016x}.tmp", OsRng.next_u64()));
     #[cfg(unix)]

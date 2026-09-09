@@ -1303,6 +1303,9 @@ fn handle_audit_drain(
             byte_limited = true;
             break;
         }
+        // Safety: the `map_or(true, ...)` guard above returns or breaks whenever
+        // `projected` is None (checked_add overflow) or over the ceiling, so reaching
+        // this line proves it is Some and within MAX_OUTBOUND_BODY_BYTES.
         encoded_body_bytes = projected.expect("checked above");
         events.push(wire_event);
     }

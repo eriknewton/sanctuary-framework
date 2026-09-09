@@ -404,6 +404,8 @@ impl EnforcementRuntime {
                     // Per-step readiness: an unready just-acquired component is
                     // torn down by the same reverse-order sweep as its
                     // predecessors.
+                    // Safety: the delivered component was pushed onto `components` immediately
+                    // above in this same iteration, so the vector is non-empty.
                     if !components.last().expect("component just pushed").is_ready() {
                         release_reverse(&mut components);
                         return Err(EnforcementStartError::Component {

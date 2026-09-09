@@ -580,6 +580,9 @@ impl DaemonHandle {
             // The capability is already lost, so there is no mutation to roll
             // back. Do not hide the audit failure: exit/restart remains mandatory
             // and systemd captures this diagnostic.
+            // SAFETY: stderr is the last-resort operator channel when the DURABLE audit
+            // channel itself failed; there is no other place this loss can be recorded,
+            // and systemd's journal is where an operator looks after a restart.
             eprintln!(
                 "castle-wall-daemon: kernel runtime lost ({reason:?}) and durable loss audit failed: {audit_err}"
             );
@@ -871,6 +874,9 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     match decision_engine.reload_manifest_authorized("boot_manifest_load_authorized", "boot") {
         Ok(_) => {}
         Err(crate::decision::ManifestReloadAuthorizationError::Verify(err)) => {
+            // SAFETY: stderr is the boot-diagnostic contract. A deny-by-default boot with
+            // no policy is an operator-visible posture change, and this line is emitted
+            // before the audit channel is trusted to carry it.
             eprintln!(
                 "castle-wall-daemon: boot-time manifest load failed; running deny-by-default with NO policy until a valid manifest is reloaded: {err}"
             );
@@ -916,6 +922,9 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     debug_assert!(Arc::ptr_eq(
         decision_engine
             .manifest_store()
+            // Safety: debug-assert-only path. `boot` constructs the production decision
+            // engine from `manifest_store` a few lines above, so the store is wired; a
+            // None here would be a composition-root bug the assert is there to catch.
             .expect("production decision engine is store-wired"),
         &manifest_store
     ));
