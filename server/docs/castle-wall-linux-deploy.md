@@ -648,9 +648,10 @@ sudo systemctl enable --now sanctuary-castle-wall.service
 ## Castle-walking acknowledgement
 
 Castle Wall Linux L2 is not a published production assurance baseline yet. The
-kernel decision path is implemented, but remains `not_verified` until the
-servers-first captured drill proves install, reboot/restart recovery, real
-wrapped-agent allow/deny ordering, queue-pressure fail-closed behavior, DNS
+kernel decision path is implemented, but the assurance row stays
+`not_implemented`, the status it carries in `ASSURANCE_MATRIX.md`, until the
+servers-first captured drill proves install,
+reboot/restart recovery, real wrapped-agent allow/deny ordering, queue-pressure fail-closed behavior, DNS
 bypass resistance, audit drain durability, and disarm on the reference host.
 
 Cooperative MCP is the sovereignty surface for compliant agents. It is not a

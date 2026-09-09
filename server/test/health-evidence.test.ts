@@ -24,6 +24,9 @@ describe("health evidence", () => {
         runtime_state: "enforcing",
         kernel_runtime_ready: true,
         enforcing: true,
+        // A frame claiming a kernel runtime must carry the proof token on the
+        // same frame; the case without it is pinned separately below.
+        runtime_health: "ready" as const,
         loaded_manifest_signature_b64url: "sig",
       },
     });
@@ -34,6 +37,35 @@ describe("health evidence", () => {
     expect(status.detector_evidence).toContain("loaded rules 7");
     expect(status.detector_evidence).toContain("nftables true");
     expect(status.detector_evidence).toContain("cgroup true");
+  });
+
+  it("does not report Castle Wall active from an enforcing claim with no health proof", () => {
+    // Same frame as the case above with the proof token REMOVED. A daemon that
+    // reports the runtime block but no current health observation has given no
+    // evidence its kernel runtime is live, and the health report is what an
+    // operator and an attestation reader consume. Absent evidence must read as
+    // unknown, never as active.
+    const status = evaluateCastleWall({
+      platform: "linux",
+      configured: true,
+      daemonUp: true,
+      nftablesApplied: true,
+      cgroupAttached: true,
+      detectorName: "test detector",
+      statusResponse: {
+        uptime_seconds: 42,
+        loaded_rule_count: 7,
+        no_wall_engaged: false,
+        manifest_state: "ready" as const,
+        lifecycle_state: "running",
+        runtime_state: "enforcing",
+        kernel_runtime_ready: true,
+        enforcing: true,
+        loaded_manifest_signature_b64url: "sig",
+      },
+    });
+
+    expect(status.status).toBe("unknown");
   });
 
   it("does not report Castle Wall active when it is missing or disabled", () => {
@@ -103,6 +135,7 @@ describe("health evidence", () => {
         runtime_state: "enforcing",
         kernel_runtime_ready: true,
         enforcing: true,
+        runtime_health: "ready" as const,
         loaded_manifest_signature_b64url: "sig",
       },
     });

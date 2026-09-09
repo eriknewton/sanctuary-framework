@@ -180,6 +180,11 @@ enum DriftFailClosedOutcome {
     EscalatedDeleteOk,
     /// The net install FAILED and the escalating by-name delete ALSO failed: the
     /// kernel egress state is genuinely indeterminate (loud refusal upstream).
+    ///
+    /// Tracked in the private register as
+    /// `defect.linux-gf1-2-deny-all-and-escalating-delete-both-fail-leaves-kernel-state-indeterminate`.
+    /// A residual described only in prose is not owned risk (AGENTS rule 9);
+    /// the register row is the record and this line is its pointer.
     Indeterminate { net_err: String, delete_err: String },
 }
 
@@ -246,10 +251,6 @@ fn ensure_deny_all_net_installed_once(
             // proper deny-all net is retried on the next health poll.
             match force_delete() {
                 Ok(()) => {
-                    // SAFETY: stderr is the operator channel for a kernel-egress escalation.
-                    // These branches report what the daemon did to the host's live nft state
-                    // after a safety-net install failed; systemd's journal is where an operator
-                    // reconstructs that sequence.
                     eprintln!(
                         "castle-wall-daemon: owned nft table lost at runtime and installing the \
                          deny-all safety net FAILED; ESCALATED to a by-name delete so no live \
@@ -258,9 +259,6 @@ fn ensure_deny_all_net_installed_once(
                     );
                 }
                 Err(delete_err) => {
-                    // SAFETY: same escalation channel as the branch above; this is the
-                    // both-attempts-failed case, where kernel egress state is indeterminate and
-                    // the operator must be told so in the journal.
                     eprintln!(
                         "castle-wall-daemon: owned nft table lost at runtime; BOTH the deny-all \
                          safety net install AND the escalating by-name delete FAILED (kernel \
@@ -1291,16 +1289,11 @@ fn record_nfqueue_serve_failure(
             &err.to_string(),
             crate::decision::FAILURE_AUDIT_BUDGET,
         ) {
-            // SAFETY: stderr is the last-resort channel when the durable failure audit
-            // ITSELF failed, so the structured channel is the thing unavailable here.
             eprintln!(
                 "castle-wall-daemon: NFQUEUE serve failed ({err}) and durable failure audit failed: {audit_err}"
             );
             return;
         }
-        // SAFETY: stderr is the operator-visible NFQUEUE failure line that accompanies
-        // the durable audit written just above; the audit is the record, this is the
-        // journal diagnostic an operator sees without opening the WAL.
         eprintln!("castle-wall-daemon: NFQUEUE serve failed: {err}");
     }
 }
@@ -1489,9 +1482,6 @@ fn drive_manifest_watcher_at<P>(
             // other events / idle polls (Ok(None)) are no-ops.
             Ok(event) => {
                 if let Err(err) = handle_manifest_watcher_event(event, decision_engine.as_deref()) {
-                    // SAFETY: stderr is the operator channel for a TERMINAL control-path failure
-                    // in the manifest watcher thread; the thread returns immediately after, so
-                    // nothing downstream would carry the reason.
                     eprintln!(
                         "castle-wall-daemon: fatal manifest watcher control-path failure: {err}"
                     );
@@ -1507,8 +1497,6 @@ fn drive_manifest_watcher_at<P>(
                         &err.to_string(),
                         crate::decision::FAILURE_AUDIT_BUDGET,
                     ) {
-                        // SAFETY: stderr is the last-resort channel when the durable loss audit for
-                        // the watcher itself could not be written.
                         eprintln!(
                             "castle-wall-daemon: manifest watcher lost and durable loss audit failed: {audit_err}"
                         );
@@ -1569,9 +1557,6 @@ impl ComponentProvider for ManifestWatcherProvider {
                         })?;
                         // Also keep a loud boot diagnostic in systemd's journal;
                         // the authenticated WAL record above is the required audit.
-                        // SAFETY: stderr is the boot diagnostic beside the authenticated WAL record
-                        // written just above; the WAL entry is the required audit, this line is the
-                        // loud journal copy so a degraded watcher is visible without a drain.
                         eprintln!(
                             "castle-wall-daemon: manifest watcher degraded to polling: {reason}"
                         );

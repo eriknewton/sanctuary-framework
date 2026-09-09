@@ -357,9 +357,6 @@ impl DecisionEngine {
             summary = Some(candidate);
             Ok(())
         }) {
-            // Safety: the Ok arm means the authorization callback ran to completion,
-            // and its last statement assigns `summary`. Any early return inside the
-            // callback yields Err, which the arms below handle.
             Ok(_) => Ok(summary.expect("authorization callback completed")),
             Err(AuthorizedReloadError::Verify(err)) => {
                 Err(ManifestReloadAuthorizationError::Verify(err))
@@ -423,8 +420,6 @@ impl DecisionEngine {
             summary = Some(candidate);
             Ok(())
         }) {
-            // Safety: same invariant as `reload_manifest_authorized` above -- the Ok
-            // arm is reachable only after the callback's final `summary = Some(..)`.
             Ok(_) => Ok(summary.expect("publication authorization callback completed")),
             Err(AuthorizedReloadError::Verify(err)) => {
                 Err(ManifestReloadAuthorizationError::Verify(err))

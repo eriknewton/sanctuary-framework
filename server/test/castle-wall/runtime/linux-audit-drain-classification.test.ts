@@ -1,21 +1,19 @@
 /**
- * Drain-cycle SETTLEMENT vs RECLAMATION, and retryable vs terminal routing.
+ * Drain-cycle classification: what SETTLEMENT means, and which refusals are
+ * terminal.
  *
- * These are the two conflations the cycle used to carry, and both were invisible
- * in a green suite because each one produced a plausible-looking outcome:
+ * Two independent properties are pinned here, because each is a distinct claim
+ * the cycle makes to the rest of the system:
  *
- *  1. SETTLEMENT was read off the ACK's WIRE SUCCESS. The consumer advances its
- *     own durable chain state BEFORE calling `ack()` (precisely because "the data
- *     is already durable"), so a failed ACK send left the loop's cursor behind
- *     the consumer's and the loop reported "event did not settle" for an event
- *     that had fully settled - tripping a permanent not-armed wall.
- *  2. EVERY daemon-side refusal was TERMINAL. An ordinary `systemctl stop` with
- *     an ACK in flight, and any 2-second control-lock contention window, wrote a
- *     durable `castle_wall_drain_failed` record blaming a transport/persistence
- *     fault for a link that was fine.
+ *  1. SETTLEMENT is decided from the consumer's own durable chain state, which
+ *     the consumer advances before it acknowledges, never from the transport
+ *     outcome of the acknowledgement itself.
+ *  2. A daemon-side refusal is classified before it is acted on: only a proven
+ *     transport or persistence fault is terminal, and a retryable condition
+ *     keeps the loop backing off without a durable failure record.
  *
- * The fakes here are deliberately minimal: `drainOnce` touches exactly three
- * methods, and a fuller harness would hide which one each assertion is about.
+ * The fakes are deliberately minimal: `drainOnce` touches exactly three methods,
+ * and a fuller harness would hide which one each assertion is about.
  */
 
 import { describe, it, expect } from "vitest";

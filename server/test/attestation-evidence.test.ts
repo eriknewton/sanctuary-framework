@@ -62,6 +62,10 @@ describe("attestation evidence", () => {
           runtime_state: "enforcing",
           kernel_runtime_ready: true,
           enforcing: true,
+          // A frame claiming a kernel runtime must carry the proof token on the
+          // same frame; without it the classifier reads the claim as
+          // indeterminate rather than active.
+          runtime_health: "ready" as const,
           loaded_manifest_signature_b64url: "sig",
         },
       },

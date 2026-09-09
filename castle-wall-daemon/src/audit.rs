@@ -825,8 +825,6 @@ impl WalWriter {
             reason: self
                 .poisoned_reason
                 .clone()
-                // Safety: the `if self.poisoned_reason.is_none()` guard immediately above
-                // sets the field, so it is Some on every path that reaches this clone.
                 .expect("poison reason set above"),
         }
     }
@@ -1017,9 +1015,6 @@ impl WalWriter {
             });
         }
         let deadline = Instant::now() + budget;
-        // Safety: both arms of the if/else above leave `self.pending_snapshot`
-        // Some -- the resume arm keeps the existing progress, the else arm just
-        // assigned one -- so the borrow cannot be None here.
         let progress = self.pending_snapshot.as_mut().expect("initialized above");
         loop {
             if shutdown.load(Ordering::SeqCst) {
@@ -1041,8 +1036,6 @@ impl WalWriter {
                     source_message: err.to_string(),
                 })?;
             if read == 0 {
-                // Safety: `pending_snapshot` was proven Some by the `as_mut()` above and
-                // nothing in this loop clears it before this take.
                 let done = self.pending_snapshot.take().expect("snapshot exists");
                 return Ok(done.out);
             }
@@ -1063,9 +1056,6 @@ impl WalWriter {
             if is_after {
                 progress.out.push(entry);
                 if progress.out.len() == progress.max_entries {
-                    // Safety: same invariant as the end-of-file take above -- the loop never
-                    // clears `pending_snapshot`, and reaching this branch means the borrow
-                    // established at loop entry succeeded.
                     let done = self.pending_snapshot.take().expect("snapshot exists");
                     return Ok(done.out);
                 }
@@ -1213,13 +1203,8 @@ impl WalWriter {
         }
         let deadline = Instant::now() + budget;
         loop {
-            // Safety: both arms of the if/else above leave `self.pending_truncate`
-            // Some, and every `take()` inside this loop returns immediately after,
-            // so a later iteration never observes None.
             let progress = self.pending_truncate.as_mut().expect("initialized above");
             if shutdown.load(Ordering::SeqCst) {
-                // Safety: the `as_mut()` on the previous line proved `pending_truncate`
-                // is Some, and no statement between them clears it.
                 let progress = self.pending_truncate.take().expect("truncate exists");
                 let _ = std::fs::remove_file(progress.tmp_path);
                 return Err(WalError::Cancelled);
@@ -1250,8 +1235,6 @@ impl WalWriter {
             let entry = match validate_wal_line(row, progress.line_num, &mut progress.validation) {
                 Ok(entry) => entry,
                 Err(err) => {
-                    // Safety: reached inside the same loop iteration whose `as_mut()` borrow
-                    // succeeded; `pending_truncate` is still Some.
                     let failed = self.pending_truncate.take().expect("truncate exists");
                     let _ = std::fs::remove_file(failed.tmp_path);
                     return Err(err);
@@ -1276,8 +1259,6 @@ impl WalWriter {
                 write_progress_entry(progress, &entry)?;
             }
         }
-        // Safety: the loop exits only by `break`, never by clearing
-        // `pending_truncate`, so it is still Some once the loop finishes.
         let progress = self.pending_truncate.take().expect("truncate exists");
         progress.tmp.sync_all().map_err(|err| WalError::Io {
             path: progress.tmp_path.clone(),

@@ -749,10 +749,8 @@ export async function createSanctuaryServer(options?: {
         },
       },
       handler: async () => {
-        const { buildHealthEvidenceReport } = await import("./health/evidence.js");
-        const { castleWallSnapshotForHealthReport } = await import(
-          "./health/castle-wall-detector.js"
-        );
+        const { buildHealthEvidenceReport, castleWallSnapshotForHealthReport } =
+          await import("./health/index.js");
         // WIRED CONSUMER (AGENTS rule 4). Without this argument `evaluateCastleWall`
         // reports `not_configured` on every host, live wall or not, and its
         // lifecycle/runtime branch has no production call path at all.
@@ -828,10 +826,8 @@ export async function createSanctuaryServer(options?: {
         "Report this instance's health and sovereignty posture: overall state (healthy/degraded/compromised), versions, Castle Wall status (active/unknown/not_configured depending on what runtime detector is wired in), and audit/state/egress posture, plus any active degradations. Disclosure and reputation layers report configured-but-unverified posture, not observed enforcement. Read-only, unsigned local status: for a signed, shareable sovereignty advertisement use shr_generate instead.",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
-        const { buildHealthEvidenceReport } = await import("./health/evidence.js");
-        const { castleWallSnapshotForHealthReport } = await import(
-          "./health/castle-wall-detector.js"
-        );
+        const { buildHealthEvidenceReport, castleWallSnapshotForHealthReport } =
+          await import("./health/index.js");
         const storageSizeBytes = await storage.totalSize();
         // WIRED CONSUMER (AGENTS rule 4). Same evidence source as `exec_attest`
         // and the SHR publish payload, so the three cannot disagree about the

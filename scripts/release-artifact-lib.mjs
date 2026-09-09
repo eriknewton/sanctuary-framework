@@ -18,8 +18,17 @@ export const MAX_RELEASE_TARBALL_BYTES = 64 * 1024 * 1024;
 const PACKAGE_NAME = "@sanctuary-framework/mcp-server";
 // Decompressed ceiling. Measured at 1.8.6-rc.1: 136,023,052 B unpacked across
 // 81 entries, of which 100,429,174 B (73.8%) are `dist/**/*.map` debug source
-// maps. 192 MiB = 201,326,592 B, which is 1.48x the measured size and keeps the
-// compressed-to-decompressed ratio this pair will admit at 3:1.
+// maps. 192 MiB = 201,326,592 B, which is 1.48x the measured size.
+//
+// The two ceilings are INDEPENDENT ABSOLUTE bounds; neither constrains the
+// expansion RATIO between them, and reading the pair as a ratio limit is wrong:
+// a small archive that decompresses to just under the output ceiling passes both
+// at an expansion of many hundreds to one. The cost of this raise stated
+// plainly: moving the output ceiling from 128 MiB to 192 MiB admits 64 MiB more
+// decompressed output (a 50% increase), plus the decompression work and the
+// transient allocation that output implies, and the verifier does this
+// decompression BEFORE it verifies any signature. Bounded, but weaker by exactly
+// that amount.
 // Failure mode when this is too small, stated as the operator sees it: signing
 // or verifying a HEALTHY release refuses with "tarball is not a bounded valid
 // gzip archive", which reads like a corrupt or hostile archive rather than a

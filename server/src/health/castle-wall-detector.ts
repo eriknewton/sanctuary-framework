@@ -3,21 +3,13 @@
  *
  * # Why this file exists
  *
- * `evaluateCastleWall`'s lifecycle/runtime branch, and the whole
- * `castleWallSnapshotFromHealth` mapping, had exactly one non-test consumer: the
- * activation gate's own error string. Every production `buildHealthEvidenceReport`
- * call site (`monitor_health`, `exec_attest`, and the SHR publish payload)
- * omitted `castleWall` entirely, so all three reported `not_configured` on a host
- * whose wall was live, degraded, or faulted alike. The capability had unit tests
- * and no production call path, which is the AGENTS rule-4 / rule-9 shape: a
- * `shipped` claim over an inert sub-capability.
- *
- * The activation handle cannot close that gap on its own, because of a PROCESS
- * boundary: the gate runs in the `wrap` / `castle-wall daemon` CLI process, and
- * `monitor_health` runs in the MCP server process. An in-memory handle is not
- * reachable across it. This detector is the reachable path: a bounded,
- * authenticated status round-trip to the same daemon, from whichever process is
- * asking.
+ * `monitor_health`, `exec_attest`, and the SHR publish payload all run in the
+ * MCP server process, while the activation handle that knows the wall's state
+ * lives in the `wrap` / `castle-wall daemon` CLI process. An in-memory handle is
+ * not reachable across that boundary, so those surfaces need their own reachable
+ * evidence path. This detector is it: a bounded, authenticated status round-trip
+ * to the same daemon, from whichever process is asking (AGENTS rule 4, a
+ * capability with no production consumer is not shipped).
  *
  * # What it proves, and what it deliberately does not
  *
@@ -32,8 +24,8 @@
  * DOES NOT PROVE, and says so rather than defaulting:
  *   - that the consumer-side drain loop is delivering. That loop lives in the
  *     arming process. The snapshot carries `evidenceChannel: "unobserved"`, which
- *     caps the verdict at `unknown` — never `active`. Defaulting it to healthy
- *     here would fabricate exactly the claim this file exists to stop faking.
+ *     caps the verdict at `unknown`, never `active`. Defaulting it to healthy
+ *     here would fabricate the one claim this file exists to keep honest.
  *
  * # Fail directions
  *

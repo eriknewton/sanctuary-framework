@@ -257,9 +257,6 @@ pub fn verify_manifest_signature(
         }
     };
     let legacy_key_id = legacy_castle_wall_signing_key_id(pinned_public_key)
-        // Safety: `castle_wall_signing_key_id` above already admitted this key under
-        // the STRICTER rule set and returned early otherwise, so the legacy key-id
-        // derivation over the same bytes cannot fail here.
         .expect("strict key was admitted above");
     if signed.signature.signing_key_id != expected_key_id
         && signed.signature.signing_key_id != legacy_key_id

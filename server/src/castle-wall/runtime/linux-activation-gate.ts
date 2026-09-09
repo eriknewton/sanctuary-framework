@@ -262,8 +262,18 @@ export type { CastleWallDrainState } from "./linux-audit-drain.js";
  *                            OPERATION CONTINUES, but every health, arming, and
  *                            enforcement-completeness surface reads
  *                            degraded/incomplete (owner ruling, 2026-09-02).
+ * - `unavailable_kernel_evidence`
+ *                            the ACK basis is fine but the daemon gave no
+ *                            CURRENT proof of a live kernel runtime (pre-v2
+ *                            runtime block, a probe with no answer, or a
+ *                            contradictory frame). Indeterminate is not a
+ *                            failure, and it is not `full` either: absent
+ *                            evidence must never read as proven enforcement.
  */
-export type CastleWallActivationCompleteness = "full" | "unconfirmed_audit_ack";
+export type CastleWallActivationCompleteness =
+  | "full"
+  | "unconfirmed_audit_ack"
+  | "unavailable_kernel_evidence";
 
 export interface LinuxProducerSignedActivation {
   lifecycle: CastleWallLifecycleHandle;
@@ -294,10 +304,12 @@ export interface LinuxProducerSignedActivation {
    */
   drainState(): CastleWallDrainState;
   /**
-   * Whether this activation is FULL or is operating on the weaker pre-v2 basis.
-   * Never silently healthy: an `unconfirmed_audit_ack` activation also reads
-   * `drainHealthy() === false`, `runtimeHealth().ok === false`, and
-   * `runtimeEvidence().status === "degraded"`.
+   * Whether this activation is FULL or is operating on a weaker basis.
+   * Never silently healthy: both weaker values also read
+   * `runtimeHealth().ok === false` and `runtimeEvidence().status === "degraded"`
+   * (`unconfirmed_audit_ack` additionally reads `drainHealthy() === false`,
+   * since that basis is the one that cannot prove reclamation). Any operator- or
+   * agent-facing "ACTIVE"/"filtering" wording is gated on `full`.
    */
   activationCompleteness(): CastleWallActivationCompleteness;
   /**
@@ -866,10 +878,18 @@ export async function activateLinuxProducerSignedCastleWall(
   // fields of a later, different one.
   const health = await healthCheck(lifecycle.client());
   const auditAckConfirmed = health.auditAckConfirmed;
+  // A SEPARATE dimension from the ACK basis, and the one the CLI's ACTIVE copy
+  // is derived from: only `kernel_runtime_ready`/`enforcing` are positive proof
+  // that the daemon holds a live kernel runtime. `unavailable` is INDETERMINATE
+  // (pre-v2 runtime block, a probe with no current answer, or a contradictory
+  // frame), and an indeterminate probe must never be presented as a proven wall
+  // -- absent, indeterminate and unproven all read as NOT-proven here.
+  const kernelEvidenceProven =
+    health.readiness === "kernel_runtime_ready" || health.readiness === "enforcing";
   const liveRuntimeHealth = (): CastleWallHealth => {
     const drainState = drainStateNow();
     const channelHealthy = drainState === "healthy" && auditAckConfirmed;
-    if (channelHealthy) return health;
+    if (channelHealthy && kernelEvidenceProven) return health;
     return {
       ...health,
       ok: false,
@@ -897,9 +917,15 @@ export async function activateLinuxProducerSignedCastleWall(
   // `runtimeHealth().ok` and `.enforcementComplete` are false, and
   // `runtimeEvidence()` is `degraded`. The one thing that must never happen is
   // the state passing silently, so it also gets a DURABLE record below.
-  const activationCompleteness: CastleWallActivationCompleteness = auditAckConfirmed
-    ? "full"
-    : "unconfirmed_audit_ack";
+  // Ordered weakest-basis-first: a peer can fail BOTH dimensions, and the ACK
+  // shortfall is the one with the durable record and the established operator
+  // copy, so it is named first. `full` requires BOTH a confirmed evidence
+  // channel and current kernel-runtime proof; no other combination may claim it.
+  const activationCompleteness: CastleWallActivationCompleteness = !auditAckConfirmed
+    ? "unconfirmed_audit_ack"
+    : kernelEvidenceProven
+      ? "full"
+      : "unavailable_kernel_evidence";
   if (!auditAckConfirmed) {
     // Durable, before the activation is handed back. Best-effort on the sink:
     // unlike the drain-fault path this is not a transition INTO a fault, so a

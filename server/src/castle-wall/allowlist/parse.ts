@@ -12,10 +12,8 @@
  */
 
 import { sha256 } from "@noble/hashes/sha256";
-import {
-  isStrictEd25519PointEncoding,
-  verify,
-} from "../../core/identity.js";
+import { ed25519 } from "@noble/curves/ed25519";
+import { verify } from "../../core/identity.js";
 import { fromBase64url, stringToBytes, toBase64url } from "../../core/encoding.js";
 import { canonicalize } from "../../mesh/canonical-json.js";
 import {
@@ -43,6 +41,37 @@ function toHex(bytes: Uint8Array): string {
     out += b.toString(16).padStart(2, "0");
   }
   return out;
+}
+
+/**
+ * Ed25519 authority-key profile for the manifest signing-key identifier.
+ *
+ * The identifier is a hash of the pinned key bytes, so two DIFFERENT encodings
+ * of the same curve point would hash to two different ids and silently split
+ * the pin; a small-order or torsion-bearing point is not a usable authority key
+ * at all. Rejecting non-canonical, small-order and torsion-bearing encodings
+ * here is what makes the derived id a function of the point, not of the bytes a
+ * publisher happened to write.
+ *
+ * DELIBERATELY LOCAL and not exported: the same profile applied inside the
+ * shared `core/identity.ts` verify funnel is a separate change (it costs every
+ * Ed25519 caller on every platform roughly 2.5x verification CPU) and ships as
+ * its own PR with its own benchmark. When that lands, delete this copy and
+ * import the shared helper. Bytes preserved at
+ * `Review/Sanctuary/Ed25519_Strict_Verify_Hardening_Patch_2026-09-09.patch`.
+ */
+function isStrictEd25519PointEncoding(bytes: Uint8Array): boolean {
+  // 32 = the Ed25519 compressed-point encoding length fixed by RFC 8032
+  // (a 255-bit y coordinate plus one sign bit, rounded up to whole bytes).
+  if (bytes.length !== 32) return false;
+  try {
+    const point = ed25519.Point.fromBytes(bytes, false);
+    if (point.isSmallOrder() || !point.isTorsionFree()) return false;
+    const canonical = point.toBytes();
+    return canonical.every((byte, index) => byte === bytes[index]);
+  } catch {
+    return false;
+  }
 }
 
 /** Canonical identifier mechanically derived from the pinned authority key. */

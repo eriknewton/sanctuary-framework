@@ -2363,6 +2363,40 @@ describe("C4 — the runtime honesty gate is wired into the real activation grap
     expect(health.readiness).toBe("unavailable");
     expect(health.ok).toBe(false);
     expect(outcome.activation.runtimeEvidence().status).toBe("unknown");
+    // The COMPLETENESS dimension is what the operator-facing "ACTIVE" copy and
+    // the wrap entrypoint read; an indeterminate probe reaching `full` here is
+    // how absent kernel evidence became a printed enforcement claim.
+    expect(outcome.activation.activationCompleteness()).toBe(
+      "unavailable_kernel_evidence"
+    );
+    await outcome.activation.stop();
+  });
+
+  it("refuses FULL when the peer claims a kernel runtime it also denies holding", async () => {
+    // Contradictory frame: the ready-state fields say `kernel_runtime_ready`
+    // while `runtime_health` says this daemon holds no kernel runtime at all.
+    // Honouring the ready fields here is what let a self-contradicting peer
+    // produce `ok: true` and a `full` activation.
+    const mock = buildMockDaemon([], {
+      status: {
+        manifest_state: "ready" as const,
+        lifecycle_state: "running",
+        runtime_state: "kernel_runtime_ready",
+        kernel_runtime_ready: true,
+        enforcing: false,
+        runtime_health: "no_runtime",
+      },
+    });
+    const outcome = await activateAgainst(mock);
+    expect(outcome.activated).toBe(true);
+    if (!outcome.activated) return;
+    const health = outcome.activation.runtimeHealth();
+    expect(health.readiness).toBe("unavailable");
+    expect(health.ok).toBe(false);
+    expect(health.enforcementComplete).toBe(false);
+    expect(outcome.activation.activationCompleteness()).toBe(
+      "unavailable_kernel_evidence"
+    );
     await outcome.activation.stop();
   });
 

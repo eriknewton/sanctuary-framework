@@ -20,14 +20,17 @@ never reach the root daemon.
 This is still **drill-gated**. Source and automated tests do not establish that
 the reference Ubuntu host, its nft build, queue pressure behavior, reboot
 recovery, and real wrapped-agent traffic satisfy the release claim. Until the
-captured Gate A hardware drill passes, the published assurance remains
-`not_verified`, never “Linux enforcement available.”
+captured Gate A hardware drill passes, the published assurance stays
+`not_implemented`, the status this row carries in `ASSURANCE_MATRIX.md`, never
+“Linux enforcement available.”
 
 ## Status
 
-Linux L2 code-complete candidate: boot/runtime ownership, per-agent cgroup
-binding, queue verdicts, signed policy reload, restart reconciliation, and live
-health/evidence are wired. Hostname, hostname-pattern, template-id, and time
+Linux L2 kernel-runtime activation: boot/runtime ownership, queue verdicts,
+signed policy reload, restart reconciliation, and live health/evidence are
+wired. Launching or wrapping a protected agent, and binding one to a per-agent
+cgroup, are NOT built here: that lifecycle is reserved for a later slice, so
+this daemon never reports `Enforcing`. Hostname, hostname-pattern, template-id, and time
 window rules are deliberately refused at policy admission: the packet path has
 no authenticated DNS/SNI correlation or template attestation yet. Enforceable
 rules must name a non-empty IP or CIDR destination and may narrow by port and

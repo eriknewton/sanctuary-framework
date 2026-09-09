@@ -315,7 +315,11 @@ export type CastleWallRuntimeReadiness =
  *    contended in normal operation (per-verdict reads, and a reload that holds
  *    it across verify + WAL fsync, which is what the policy write before arming
  *    triggers). Reading that as `degraded` tore down healthy walls.
- * 6. `enforcing` -> `enforcing`; kernel-ready -> `kernel_runtime_ready`.
+ * 6. A frame that CLAIMS a kernel runtime (`enforcing` / `kernel_runtime_ready`)
+ *    without `runtime_health: "ready"` on that same frame is contradictory ->
+ *    `unavailable`. Absent health evidence is not ready evidence, and
+ *    `no_runtime` explicitly denies the runtime the state field claims.
+ * 7. `enforcing` -> `enforcing`; kernel-ready -> `kernel_runtime_ready`.
  *
  * Never returns `enforcing` from a merely-ready runtime: agent wrapping is a
  * strictly stronger claim and this slice does not make it.
@@ -358,7 +362,22 @@ export function castleWallRuntimeReadiness(
   if (status.manifest_state === undefined || status.manifest_state === "unavailable") {
     return "unavailable";
   }
-  // 6. Positive claims, weakest-sufficient first.
+  // 6. A KERNEL-runtime claim needs kernel-runtime PROOF on the SAME frame.
+  //    Steps 3 and 4 only reject the probe tokens that speak for themselves
+  //    (`probe_unavailable`, `lost`). A frame that carries the ready-state
+  //    fields while `runtime_health` is ABSENT, or says `no_runtime` ("this
+  //    daemon holds no kernel runtime at all"), is CONTRADICTORY: honouring its
+  //    ready fields would let a peer assert a live kernel runtime in the same
+  //    breath as denying it holds one, and every downstream armed/ACTIVE
+  //    surface is derived from this return value. Withhold the claim as
+  //    indeterminate rather than invent a proven loss; `control_plane_only`
+  //    below is unaffected because it claims no kernel runtime.
+  const claimsKernelRuntime =
+    status.runtime_state === "enforcing" || status.runtime_state === "kernel_runtime_ready";
+  if (claimsKernelRuntime && status.runtime_health !== "ready") {
+    return "unavailable";
+  }
+  // 7. Positive claims, weakest-sufficient first.
   if (status.runtime_state === "enforcing" && status.enforcing === true) {
     return "enforcing";
   }

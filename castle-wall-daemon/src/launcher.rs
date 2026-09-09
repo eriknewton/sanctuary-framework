@@ -23,7 +23,11 @@
 //! report is missing or does not match the expected configuration; a report
 //! that never arrives means the sandbox was never fully built. The host
 //! consumer side is not part of this slice (S3 builds the launcher half); the
-//! report is emitted here and the consumer is a tracked follow-up.
+//! report is emitted here and the consumer is a tracked follow-up. A residual
+//! named only in a source comment is not owned risk (AGENTS rule 9), so it is
+//! reconciled into the private register as
+//! `ic-sweep-linux-enforcement-actually-enforces`; that id is the record, and
+//! this comment is only its pointer.
 
 use std::collections::BTreeMap;
 use std::fmt;

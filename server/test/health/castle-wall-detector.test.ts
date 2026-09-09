@@ -1,18 +1,14 @@
 /**
- * The production Castle Wall evidence source, and the WIRED-CONSUMER proof.
+ * The production Castle Wall evidence source, and its WIRED-CONSUMER proof.
  *
  * AGENTS rule 4: a capability with no production consumer is not shipped,
- * whatever its own tests say. `evaluateCastleWall`'s lifecycle/runtime branch
- * had unit tests and ZERO production call paths - every
- * `buildHealthEvidenceReport` call site omitted `castleWall`, so `monitor_health`,
- * `exec_attest` and the SHR publish payload reported `not_configured` on a host
- * whose wall was live, degraded, or faulted alike.
- *
- * Two kinds of test here, because one without the other proves nothing:
+ * whatever its own tests say. Two kinds of test here, because either alone
+ * proves nothing:
  *   - BEHAVIOR: the detector answers honestly across every reachable state, and
  *     never manufactures health from what it could not observe.
- *   - COMPOSITION: the production call sites actually reach it. A behavior test
- *     alone is exactly what the inert version already had.
+ *   - COMPOSITION: the production call sites (`monitor_health`, `exec_attest`,
+ *     and the SHR publish payload) actually reach it, so the honest answer is
+ *     the one those surfaces report.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";

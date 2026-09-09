@@ -208,8 +208,11 @@ jobs:
           started=$(grep -cE "^[[:space:]]*Running " cargo-test.log || true)
           finished=$(grep -cE "^test result: ok\." cargo-test.log || true)
           if [ "$started" != "$finished" ]; then
-            echo "FAIL: $started test binaries started but only $finished reported \
-'test result: ok.'; a suite aborted without reporting"
+            # Kept on ONE physical line deliberately: a backslash continuation
+            # whose next line starts in column 1 ends the surrounding `run: |`
+            # block scalar, and the whole workflow then fails to parse with zero
+            # jobs -- a failure that never appears in the PR's job-check list.
+            echo "FAIL: $started test binaries started but only $finished reported 'test result: ok.'; a suite aborted without reporting"
             exit 1
           fi
         env:

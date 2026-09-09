@@ -4114,17 +4114,29 @@ export async function runWrap(
         // LIVE but INCOMPLETE. It is already recorded durably in the audit log;
         // this is the operator-facing half, so the weaker basis is never silent
         // at the console either. Not fatal: the wall is operating.
-        if (outcome.activation.activationCompleteness() !== "full") {
-          // SAFETY: stderr is the operator-facing CLI channel; this fixed text
-          // names only the negotiated protocol shortfall and the posture it
-          // implies. It carries no fortress, agent, or key material.
+        const completeness = outcome.activation.activationCompleteness();
+        if (completeness !== "full") {
+          // SAFETY: stderr is the operator-facing CLI channel; both fixed texts
+          // name only the negotiated protocol shortfall and the posture it
+          // implies. They carry no fortress, agent, or key material.
+          // The two shortfalls are DIFFERENT claims and must not share copy.
+          // The ACK shortfall leaves the kernel runtime proven and only the
+          // reclamation evidence unprovable. Absent kernel-runtime evidence
+          // leaves the actual filtering UNPROVEN, so this branch must never
+          // say filtering is running: that sentence is the enforcement claim
+          // the Linux assurance row does not make.
           console.error(
-            "Sanctuary: Castle Wall is ACTIVE but INCOMPLETE. The installed " +
-              "castle-wall-daemon does not confirm audit ACKs " +
-              "(audit_drain_ack_response), so reclaimed enforcement evidence " +
-              "cannot be proven truncated. Egress filtering is running; " +
-              "Sanctuary will report Castle Wall as degraded until the daemon " +
-              "binary is upgraded."
+            completeness === "unconfirmed_audit_ack"
+              ? "Sanctuary: Castle Wall is DEGRADED. The installed " +
+                  "castle-wall-daemon does not confirm audit ACKs " +
+                  "(audit_drain_ack_response), so reclaimed enforcement " +
+                  "evidence cannot be proven truncated. Sanctuary will report " +
+                  "Castle Wall as degraded until the daemon binary is upgraded."
+              : "Sanctuary: Castle Wall is DEGRADED. The installed " +
+                  "castle-wall-daemon returned no current proof of a live " +
+                  "kernel runtime, so Sanctuary cannot report the wall as " +
+                  "filtering. Treat egress as unprotected until the daemon " +
+                  "reports a ready kernel runtime."
           );
         }
       }

@@ -347,8 +347,6 @@ impl ManifestStore {
         Ok(self
             .current
             .as_ref()
-            // Safety: `self.current` was assigned Some three lines above and nothing
-            // between can clear it; the re-read is only to hand back a borrow.
             .expect("prepared reload committed above"))
     }
 
