@@ -51,7 +51,6 @@ fn ruleset_id(agent_id: &str) -> AgentRulesetId {
 
 /// The trusted expectation a healthy reclaim/health comparison would carry for
 /// the bindings this file installs.
-#[allow(dead_code)]
 fn test_expectation() -> ExpectedAgentBinding {
     ExpectedAgentBinding::Confined {
         fortress_id: TEST_FORTRESS.to_string(),
@@ -228,6 +227,65 @@ fn nftables_atomic_replace_updates_rules() {
         "atomic replace must swap the rule identity (v1 handle {handle_v1} == v2 handle {handle_v2})"
     );
 
+    cleanup_castle_table();
+}
+
+/// End-to-end agreement between what the emitter INSTALLS in the kernel and what
+/// the ownership parser will ACCEPT reading it back.
+///
+/// This is the test a pure parser test cannot be: the JSON here is nft's own
+/// rendering of a rule the daemon really loaded, not a fixture written by the
+/// same person who wrote the parser. A drift between emission and verification
+/// would otherwise install a wall that fails its own first health poll, and the
+/// operator would see a daemon that comes up and immediately re-arms deny-all
+/// with no obvious cause.
+#[test]
+fn installed_binding_verifies_under_the_manifest_uid_and_not_under_another() {
+    let _suite = isolation::guard();
+    cleanup_castle_table();
+    nftables::install_castle_table().expect("install");
+
+    let id = ruleset_id("agreement-test");
+    let script = nftables::build_agent_ruleset("agreement-test", TEST_AGENT_UID, &[]);
+    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load");
+
+    let json = nft_cmd(&["-a", "-j", "list", "table", CASTLE_FAMILY, isolation::table()]);
+
+    // The uid the manifest confines: the live inventory is the owned object.
+    nftables::parse_owned_table_identity(&json, &test_expectation())
+        .expect("a binding this daemon just installed must verify under the manifest uid");
+
+    // A DIFFERENT uid: the same live bytes, the same seal, the same shape, the
+    // same body/jump agreement. Only the trusted expectation separates them, and
+    // it must refuse.
+    let other = ExpectedAgentBinding::Confined {
+        fortress_id: TEST_FORTRESS.to_string(),
+        agent_uid: TEST_AGENT_UID + 1,
+    };
+    assert!(
+        nftables::parse_owned_table_identity(&json, &other).is_err(),
+        "a live binding for a uid the manifest does not confine must be refused"
+    );
+
+    // A different FORTRESS: the seal is domain-separated, so the same uid under
+    // another fortress is not this fortress's owned object.
+    let other_fortress = ExpectedAgentBinding::Confined {
+        fortress_id: "some-other-fortress".to_string(),
+        agent_uid: TEST_AGENT_UID,
+    };
+    assert!(
+        nftables::parse_owned_table_identity(&json, &other_fortress).is_err(),
+        "a live binding sealed under another fortress must be refused"
+    );
+
+    // Nothing confined: absent is not passing. A live per-agent binding with no
+    // trusted expectation to check it against is refused, never adopted.
+    assert!(
+        nftables::parse_owned_table_identity(&json, &ExpectedAgentBinding::NoneConfined).is_err(),
+        "a live binding must be refused when the current policy confines no uid"
+    );
+
+    nftables::remove_agent_ruleset(&id).expect("remove");
     cleanup_castle_table();
 }
 

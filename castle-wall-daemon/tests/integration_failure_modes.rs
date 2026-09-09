@@ -53,7 +53,6 @@ mod isolation;
 
 use base64::Engine as _;
 use castle_wall_daemon::audit::WalWriter;
-use castle_wall_daemon::cgroup;
 use castle_wall_daemon::config::DaemonConfig;
 use castle_wall_daemon::daemon::{boot, mode_for_error, refuse_to_start_message, DaemonError};
 use castle_wall_daemon::failure::{default_disposition, FailureDisposition, FailureMode};
