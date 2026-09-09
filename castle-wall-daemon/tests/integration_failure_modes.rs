@@ -82,6 +82,7 @@ fn test_binding() -> AgentUidBinding {
     }
 }
 use castle_wall_daemon::policy::{DeniedReason, EvaluationRequest, Verdict};
+use castle_wall_daemon::runtime_health::RuntimeHealthState;
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
@@ -137,75 +138,17 @@ fn write_pinned_key(dir: &Path, signing: &SigningKey) -> PathBuf {
     path
 }
 
-fn write_signed_manifest_one_rule(policy_dir: &Path, signing: &SigningKey) {
-    fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
-    let body = format!(
-        "{{\"id\":\"{}\",\"schema_version\":1,\"created_at\":\"2026-05-06T00:00:00Z\",\"match\":{{\"host\":[\"example.com\"],\"port\":[443],\"protocol\":\"tcp\"}},\"disposition\":\"allow\"}}",
-        "rule-allow-example"
-    );
-    let body_bytes = body.into_bytes();
-    let file = "rule-allow-example.json";
-    fs::write(policy_dir.join(RULES_SUBDIR).join(file), &body_bytes).unwrap();
-    // Every composed manifest must carry the genuine habeas local lane
-    // (always-on-lane gate); the daemon refuses a lane-less manifest.
-    let habeas_body = castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes();
-    fs::write(
-        policy_dir
-            .join(RULES_SUBDIR)
-            .join("reserved_habeas_distress_local.json"),
-        habeas_body,
-    )
-    .unwrap();
-
-    let manifest = AllowlistManifest {
-        schema_version: 1,
-        fortress_id: "deadbeef".to_string(),
-        issued_at: "2026-05-06T00:00:00Z".to_string(),
-        generation: 1,
-        agent_origin: None,
-        operator_baseline: None,
-        rules: vec![
-            ManifestRuleEntry {
-                rule_id: "rule-allow-example".to_string(),
-                file: file.to_string(),
-                sha256: sha256_hex(&body_bytes),
-            },
-            ManifestRuleEntry {
-                rule_id: "reserved_habeas_distress_local".to_string(),
-                file: "reserved_habeas_distress_local.json".to_string(),
-                sha256: sha256_hex(habeas_body),
-            },
-        ],
-    };
-    let canonical = canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();
-    let sig = signing.sign(&canonical);
-    let signed = SignedManifest {
-        manifest,
-        signature: ManifestSignature {
-            signature_scheme: SIGNATURE_SCHEME_V1.to_string(),
-            signing_key_id: castle_wall_daemon::crypto::castle_wall_signing_key_id(
-                &signing.verifying_key().to_bytes(),
-            )
-            .unwrap(),
-            signature_b64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(sig.to_bytes()),
-        },
-    };
-    let serialized = serde_json::to_string_pretty(&signed).unwrap();
-    fs::write(policy_dir.join(MANIFEST_FILENAME), serialized).unwrap();
-}
-
 /// A manifest the daemon actually ADMITS, optionally carrying a signed
 /// `uid`-mode agent origin.
 ///
-/// Distinct from [`write_signed_manifest_one_rule`] on purpose: that one's rule
-/// carries a `match.host` axis this daemon refuses to enforce, so the manifest is
-/// rejected at boot and the daemon runs with NO policy. That is what its callers
-/// want. A test about the RECLAIM comparison needs the opposite — a manifest that
-/// is genuinely in force — so this writer uses an ip/port/protocol rule, which the
-/// daemon can enforce. Failure mode if the two are confused: the daemon logs a
-/// manifest-refused line, runs with no policy, and the reclaim comparison then
-/// refuses the agent binding for a reason that has nothing to do with the uid.
+/// Its rule pins ip/port/protocol, which this daemon CAN enforce, so the manifest
+/// is genuinely in force. An earlier `match.host` writer lived here and was
+/// rejected at boot, leaving the daemon with NO policy; it was removed once its
+/// last caller (the F-3 IPC-persistence test) moved to this one, because a test
+/// that installs a per-agent kernel binding under a rejected manifest asserts over
+/// an inventory production refuses. Failure mode if a rejected manifest is used
+/// again: the daemon logs a manifest-refused line, runs with no policy, and the
+/// binding comparison refuses for a reason that has nothing to do with the uid.
 fn write_admitted_manifest_with_origin(
     policy_dir: &Path,
     signing: &SigningKey,
@@ -676,7 +619,17 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
     let dir = TempDir::new().unwrap();
     let signing = SigningKey::generate(&mut OsRng);
     let config = fresh_config(&dir, &signing);
-    write_signed_manifest_one_rule(&config.policy_dir, &signing);
+    // An ADMITTED manifest that publishes the SIGNED uid origin for the binding
+    // this test installs below. This test previously wrote a `match.host`
+    // manifest the daemon REJECTS, so it ran with no policy in force, the live
+    // per-agent binding was unverifiable, and the IPC-persistence assertion was
+    // made over an inventory production refuses.
+    write_signed_manifest_one_rule_with_uid_origin(
+        &config.policy_dir,
+        &signing,
+        TEST_AGENT_UID,
+        TEST_UID_CEILING,
+    );
     let socket_path = config.socket_path.clone();
     let fortress_id = config.fortress_id.clone();
 
@@ -696,6 +649,25 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
     }];
     let script = nftables::build_agent_ruleset("f3-test", TEST_AGENT_UID, &frags);
     nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load");
+
+    // The binding is legitimate only because the manifest in force confines this
+    // uid; prove the daemon's own health poll reads the live table as OWNED
+    // before the IPC drop, so what persists below is a supervised inventory.
+    // ProbeUnavailable is INDETERMINATE (a bounded `nft` proof may be in flight),
+    // so it is retried and never read as ready; a proven Lost fails now.
+    let mut health = handle.kernel_runtime_health();
+    for _ in 0..40 {
+        if health != RuntimeHealthState::ProbeUnavailable {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        health = handle.kernel_runtime_health();
+    }
+    assert_eq!(
+        health,
+        RuntimeHealthState::Ready,
+        "kernel runtime health must be Ready once the manifest-matched uid binding is installed"
+    );
 
     // Connect, handshake, then forcibly close the client side mid-session.
     let stream = connect_with_handshake(&socket_path, &signing, &fortress_id);

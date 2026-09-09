@@ -39,8 +39,10 @@ pub enum CgroupError {
     IdResolutionFailed(String),
     #[error("systemd not PID 1 (F-8 per scope-lock section 7)")]
     SystemdNotPid1,
-    #[error("cgroup refresh failed: {0}")]
-    RefreshFailed(String),
+    // RETIRED with the cgroup-identity match: a `RefreshFailed` variant lived
+    // here for the scope-refresh path. That path is deleted, so the variant had
+    // no constructor and no reader; a dead error state reads as a handled
+    // failure mode that cannot occur.
 }
 
 /// A live cgroup identifier from systemd transient scope creation.
@@ -55,8 +57,10 @@ pub struct ScopeHandle {
     /// in canonical deployments (`/system.slice/sanctuary-agent-foo.service`)
     /// but can be 3+ in nested environments (CI runners, Docker-in-Docker)
     /// where the daemon process itself is already inside a deeper cgroup.
-    /// Used by nftables `socket cgroupv2 level <N> "<path>"` rule emission
-    /// so the level matches where systemd actually placed the unit.
+    /// RETIRED CONSUMER: this fed the `socket cgroupv2 level <N> "<path>"`
+    /// emission, which no longer exists (the kernel match is `meta skuid`). It
+    /// is retained as a description of where systemd placed the unit for the
+    /// jail, and nothing in the egress match reads it.
     pub cgroup_level: u32,
 }
 
@@ -90,10 +94,11 @@ pub fn cgroup_path_for_scope(scope_unit: &str) -> PathBuf {
 
 /// Compute the cgroup-v2 relative path string from a `ScopeHandle`.
 ///
-/// nftables `socket cgroupv2 level <N> "<path>"` rules expect the cgroup
+/// RETIRED CONSUMER: this shape existed for `socket cgroupv2 level <N>
+/// "<path>"` rules, which this daemon no longer emits. It returns the cgroup
 /// path with the `/sys/fs/cgroup/` prefix stripped, no leading slash, no
-/// trailing slash (e.g. `system.slice/sanctuary-agent-foo.service`). The
-/// kernel walks `/sys/fs/cgroup/<path>` at rule-load time at depth N.
+/// trailing slash (e.g. `system.slice/sanctuary-agent-foo.service`), and is now
+/// a description of the jail's placement, not an input to any egress match.
 ///
 /// Returns `CgroupError::PathNotFound` if the absolute path does not start
 /// with `/sys/fs/cgroup/`, which would indicate the daemon resolved the
@@ -170,10 +175,10 @@ mod linux {
     /// `systemctl show --property=ControlGroup` (the canonical source of
     /// truth) rather than synthesized from the unit name. This avoids
     /// drift between the daemon's path assumption and where systemd 255
-    /// actually places the cgroup, and it lets nft's
-    /// `socket cgroupv2 level 2 "<path>"` rule lookup find the cgroup at
-    /// rule-load time. Waits for the unit to reach `active` state before
-    /// resolving so the cgroup inode is stable.
+    /// actually places the cgroup. It no longer feeds an nft
+    /// `socket cgroupv2 level 2 "<path>"` lookup: that emission is retired and
+    /// the egress match reads socket credentials instead. Waits for the unit to
+    /// reach `active` state before resolving so the cgroup inode is stable.
     pub fn create_agent_scope_impl(agent_id: &str) -> Result<ScopeHandle, CgroupError> {
         let unit = scope_unit_name(agent_id);
         let output = Command::new("systemd-run")
@@ -263,11 +268,13 @@ mod linux {
         })
     }
 
-    /// Resolve the cgroup inode ID for an nftables `socket cgroupv2` match.
-    /// This is the cgroup-id-renumbering gotcha from scope-lock section 1:
-    /// nftables resolves paths to inode IDs at rule-load time, so we must
-    /// re-resolve and re-install rules when a scope is destroyed and
-    /// recreated.
+    /// Resolve the cgroup inode ID of the jail scope.
+    ///
+    /// RETIRED CONSUMER: this served the `socket cgroupv2` match, where the
+    /// renumbering gotcha from scope-lock section 1 (nftables resolves paths to
+    /// inode IDs at rule-load time, so a destroyed-and-recreated scope needed a
+    /// re-resolve and a re-install) applied. No egress rule reads a cgroup id
+    /// now, so nothing re-resolves; the id remains only as scope identity.
     pub fn resolve_cgroup_id(cgroup_path: &Path) -> Result<u64, CgroupError> {
         use std::os::unix::fs::MetadataExt;
         let meta = fs::metadata(cgroup_path).map_err(|e| {

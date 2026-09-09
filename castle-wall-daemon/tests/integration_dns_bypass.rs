@@ -22,16 +22,23 @@
 //!    that when the kernel hands the daemon a DNS-class request matching
 //!    a bypass scenario, the verdict resolves to Deny with DefaultDeny
 //!    provenance and the audit entry carries the scope-lock-prescribed
-//!    egress_blocked + default_deny shape. They do not require real
-//!    cgroup attachment or real packet flow; they lock the contract on
+//!    egress_blocked + default_deny shape. They do not require a real
+//!    confined process or real packet flow; they lock the contract on
 //!    every Linux CI cycle.
 //!
-//! 2. **Real-cgroup, real-packet tests.** Active in Linux CI as of the
-//!    chain-wiring fix (this PR). They exercise the full kernel drop
-//!    path: cgroup attach + subprocess + nftables cgroupv2 match +
-//!    base-output-chain jump + NFQUEUE drop verdict + audit assertion.
-//!    Require root or `CAP_NET_ADMIN` (same as the kernel-binding tests
-//!    in `integration_kernel_binding.rs`).
+//! 2. **Real-uid, real-packet tests.** They exercise the full kernel drop
+//!    path: a subprocess switched to the agent uid with `setpriv` (so the
+//!    socket it opens carries that uid) + the `meta skuid` per-agent match +
+//!    base-output-chain jump + NFQUEUE drop verdict + audit assertion. The
+//!    manifest they boot with publishes the SIGNED uid origin for that
+//!    binding, and the fixture asserts the daemon's own health poll still
+//!    reads the live table as owned, so the supervision production performs
+//!    is exercised rather than skipped. Require root or `CAP_NET_ADMIN`
+//!    (same as the kernel-binding tests in `integration_kernel_binding.rs`).
+//!
+//!    HISTORY, because the header outlived the mechanism once: these tests
+//!    matched the agent's CGROUP identity until the uid-match change. Nothing
+//!    here attaches a cgroup or emits `socket cgroupv2` any more.
 //!
 //! Linux-gated. cfg-out on macOS so `cargo test` on the dev sandbox sees
 //! zero tests from this file.
@@ -45,10 +52,11 @@ use castle_wall_daemon::config::DaemonConfig;
 use castle_wall_daemon::daemon::{boot, DaemonHandle};
 use castle_wall_daemon::manifest::canonical_json::canonicalize_to_bytes;
 use castle_wall_daemon::manifest::verify::{
-    AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+    AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
 };
 use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
 use castle_wall_daemon::nftables::{self, AgentRulesetId, AgentUidBinding};
+use castle_wall_daemon::runtime_health::RuntimeHealthState;
 
 /// The uid the wrapped agent in these bypass tests runs as, and the manifest
 /// ceiling it clears. No account is created: nft validates nothing about a
@@ -142,7 +150,23 @@ fn write_signed_allow_only_example_443(policy_dir: &Path, signing: &SigningKey) 
         fortress_id: "deadbeef".to_string(),
         issued_at: "2026-05-06T00:00:00Z".to_string(),
         generation: 1,
-        agent_origin: None,
+        // The SIGNED uid binding these tests' kernel fixture then installs. A
+        // per-agent uid rule is legitimate only because a manifest in force
+        // confines that uid: under `agent_origin: None` the live binding is
+        // unverifiable, production health reads it as foreign and re-arms
+        // deny-all, and a fixture that installed one anyway would exercise the
+        // packet path while skipping the supervision entirely.
+        // Must match `BYPASS_AGENT_UID` / `BYPASS_UID_CEILING` above and the
+        // `AgentUidBinding` passed to `load_agent_ruleset` in the fixture.
+        agent_origin: Some(AgentOrigin {
+            mode: "uid".to_string(),
+            egress_helper_signing_id: None,
+            egress_helper_team_id: None,
+            agent_runtime_port_range: None,
+            agent_uid: Some(BYPASS_AGENT_UID),
+            gate_uid: None,
+            system_uid_allow_ceiling: BYPASS_UID_CEILING,
+        }),
         operator_baseline: None,
         rules: vec![
             ManifestRuleEntry {
@@ -176,6 +200,36 @@ fn write_signed_allow_only_example_443(policy_dir: &Path, signing: &SigningKey) 
         serde_json::to_string_pretty(&signed).unwrap(),
     )
     .unwrap();
+}
+
+/// Assert the daemon's OWN supervision still reads the live table as owned after
+/// a per-agent uid binding is installed into it.
+///
+/// This is the check that makes the kernel fixture a test of production
+/// behaviour: the health poll recomputes the uid seal and compares the live
+/// `meta skuid` value against the uid the CURRENT signed manifest confines, so it
+/// passes only because the manifest above publishes the matching origin. With no
+/// origin in force the same installation reads foreign, health latches Lost and
+/// deny-all re-arms.
+///
+/// Failure mode if this is skipped: the packet assertions still pass, and an
+/// inventory production would refuse looks like a healthy wall.
+fn assert_healthy_ownership(daemon: &DaemonHandle, context: &str) {
+    // ProbeUnavailable is INDETERMINATE (the bounded `nft` proof may still be in
+    // flight), so it is retried and never read as ready; a proven Lost fails now.
+    for _ in 0..40 {
+        match daemon.kernel_runtime_health() {
+            RuntimeHealthState::Ready => return,
+            RuntimeHealthState::ProbeUnavailable => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            other => panic!(
+                "{context}: kernel runtime health must be Ready once the manifest-matched uid \
+                 binding is installed; got {other:?}"
+            ),
+        }
+    }
+    panic!("{context}: kernel runtime health never resolved to Ready (probe stayed indeterminate)");
 }
 
 fn dns_request(host: Option<&str>, ip: &str, port: u16, protocol: &str) -> EvaluationRequest {
@@ -410,7 +464,7 @@ fn policy_allows_explicitly_listed_destination_alongside_bypass_denials() {
     let _ = handle.stop();
 }
 
-// ---- Tier B: real-cgroup, real-packet bypass tests ------------------------
+// ---- Tier B: real-uid, real-packet bypass tests ---------------------------
 //
 // These tests exercise the PRODUCTION drop path end to end, with the DAEMON as
 // the sole NFQUEUE consumer. `daemon::boot` on a privileged Linux host
@@ -425,15 +479,16 @@ fn policy_allows_explicitly_listed_destination_alongside_bypass_denials() {
 // bind failed EPERM under the now-active daemon enforcement, the error was
 // swallowed, and every capture came back empty. See the fixture below.)
 //
-// The test's job is therefore: (1) wrap a real agent cgroup and install its
-// per-agent chain + base-output jump INTO THE DAEMON'S owned table so the
-// cgroup's packets carry the agent mark and route to queue 0; (2) emit a real
-// non-allowlisted packet from inside that cgroup; (3) prove the daemon's own
-// verdict loop dequeued it, defaulted closed (kernel DROP with fail-open off),
-// and wrote the scope-lock audit shape (egress_blocked + default_deny,
-// attributed to the wrapped agent) to the durable WAL. Asserting on the
-// daemon's WAL is the production-faithful proof: the WAL receipt exists only
-// because the daemon's verdict loop received the real packet off NFQUEUE.
+// The test's job is therefore: (1) install the agent's per-agent chain +
+// base-output jump INTO THE DAEMON'S owned table, matching the uid the signed
+// manifest confines, so that uid's packets carry the agent mark and route to
+// queue 0; (2) emit a real non-allowlisted packet from a process running AS
+// that uid; (3) prove the daemon's own verdict loop dequeued it, defaulted
+// closed (kernel DROP with fail-open off), and wrote the scope-lock audit shape
+// (egress_blocked + default_deny, attributed to the wrapped agent) to the
+// durable WAL. Asserting on the daemon's WAL is the production-faithful proof:
+// the WAL receipt exists only because the daemon's verdict loop received the
+// real packet off NFQUEUE.
 
 /// Test fixture: one wrapped agent whose non-allowlisted egress the booted
 /// daemon must drop and audit through its own verdict loop.
@@ -447,8 +502,8 @@ struct KernelBypassFixture {
 }
 
 impl KernelBypassFixture {
-    /// Boot the enforcing daemon, then wrap one agent cgroup and route its
-    /// egress to the daemon-owned NFQUEUE 0.
+    /// Boot the enforcing daemon, then install one agent's uid binding and
+    /// route that uid's egress to the daemon-owned NFQUEUE 0.
     fn setup(agent_id: &str) -> Self {
         // Boot activates enforcement: installs the isolated castle table under
         // the host lock, binds queue 0 fail-open-off, and starts the verdict
@@ -484,6 +539,11 @@ impl KernelBypassFixture {
             },
         )
         .expect("load_agent_ruleset into daemon-owned table");
+
+        // The binding is only legitimate because the signed manifest above
+        // confines this exact uid; prove the daemon's live health poll agrees
+        // before any packet is sent.
+        assert_healthy_ownership(&daemon, "dns-bypass fixture after uid-binding install");
 
         Self {
             daemon: Some(daemon),
@@ -577,26 +637,28 @@ impl KernelBypassFixture {
 
 impl Drop for KernelBypassFixture {
     /// Belt-and-suspenders cleanup so an `assert!` panic in the test body still
-    /// removes the agent ruleset, destroys the cgroup, and stops the daemon
-    /// (releasing the owned nft table and unbinding queue 0) during unwinding.
+    /// removes the agent ruleset and stops the daemon (releasing the owned nft
+    /// table and unbinding queue 0) during unwinding.
     fn drop(&mut self) {
         self.shutdown_in_place();
     }
 }
 
-/// Real-cgroup-driven plain DNS bypass test. Wraps an agent cgroup whose only
-/// allowed destination is example.com:443, emits UDP/53 to 8.8.8.8 from inside
-/// that cgroup, and asserts the DAEMON's own verdict loop dropped and audited
-/// the packet (egress_blocked + default_deny, attributed to the agent).
+/// Real-uid-driven plain DNS bypass test. Confines an agent uid whose only
+/// allowed destination is example.com:443, emits UDP/53 to 8.8.8.8 from a
+/// process running as that uid, and asserts the DAEMON's own verdict loop
+/// dropped and audited the packet (egress_blocked + default_deny, attributed to
+/// the agent).
 #[test]
 fn kernel_drops_plain_dns_to_unallowed_resolver() {
     let _suite = isolation::guard();
     let fixture = KernelBypassFixture::setup("dns-bypass-test");
 
-    // UDP send to 8.8.8.8:53 from inside the agent cgroup. The shell wrapper
-    // ensures the sender is in the cgroup before sending, so the packet's
-    // owning socket matches the daemon's `socket cgroupv2` catchall and is
-    // queued to NFQUEUE 0.
+    // UDP send to 8.8.8.8:53 as the agent uid. `setpriv` switches credentials
+    // and then execs, so the socket is created AFTER the switch and carries that
+    // uid: the packet's owning socket matches the daemon's `meta skuid` catchall
+    // and is queued to NFQUEUE 0. A socket opened before the switch would keep
+    // the parent's uid and miss the match.
     fixture.spawn_bypass(
         "python3 -c \"import socket,sys;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(1.0);s.sendto(b'\\x00\\x01\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x07example\\x03com\\x00\\x00\\x01\\x00\\x01',('8.8.8.8',53));\\\nimport time;time.sleep(0.3)\" || true",
     );
@@ -604,9 +666,9 @@ fn kernel_drops_plain_dns_to_unallowed_resolver() {
     let audit = fixture.await_agent_drop_audit().expect(
         "daemon verdict loop must dequeue, drop, and durably audit the \
          non-allowlisted plain-DNS packet; got no egress_blocked WAL receipt \
-         for the agent. Either the cgroupv2 match/jump did not route the packet \
-         to queue 0, the subprocess did not enter the cgroup, or the daemon's \
-         NFQUEUE consumer is not live.",
+         for the agent. Either the skuid match/jump did not route the packet \
+         to queue 0, the subprocess did not run as the agent uid, or the \
+         daemon's NFQUEUE consumer is not live.",
     );
     assert!(
         audit.contains("\"udp\""),
@@ -620,19 +682,19 @@ fn kernel_drops_plain_dns_to_unallowed_resolver() {
     fixture.shutdown();
 }
 
-/// Real-cgroup-driven DoH bypass test. Opens a TCP/443 connection to
-/// `dns.google` (8.8.8.8) from inside the agent cgroup and asserts the daemon's
-/// verdict loop dropped + audited the SYN (egress_blocked, tcp/443,
-/// default_deny) before any TLS handshake.
+/// Real-uid-driven DoH bypass test. Opens a TCP/443 connection to
+/// `dns.google` (8.8.8.8) as the agent uid and asserts the daemon's verdict loop
+/// dropped + audited the SYN (egress_blocked, tcp/443, default_deny) before any
+/// TLS handshake.
 #[test]
 fn kernel_drops_doh_to_unallowed_provider() {
     let _suite = isolation::guard();
     let fixture = KernelBypassFixture::setup("doh-bypass-test");
 
-    // TCP SYN to 8.8.8.8:443 from inside the agent cgroup. `connect_ex` returns
-    // errno instead of raising, so a single-line Python emits exactly one SYN
-    // whose owning socket the daemon's cgroupv2 catchall queues to NFQUEUE 0
-    // before the handshake completes.
+    // TCP SYN to 8.8.8.8:443 as the agent uid. `connect_ex` returns errno
+    // instead of raising, so a single-line Python emits exactly one SYN whose
+    // owning socket the daemon's skuid catchall queues to NFQUEUE 0 before the
+    // handshake completes.
     fixture.spawn_bypass(
         "python3 -c \"import socket;s=socket.socket();s.settimeout(1.5);s.connect_ex(('8.8.8.8',443))\" || true",
     );
@@ -653,17 +715,17 @@ fn kernel_drops_doh_to_unallowed_provider() {
     fixture.shutdown();
 }
 
-/// Real-cgroup-driven DoT bypass test. Opens a TCP/853 connection to a DoT
-/// provider (1.1.1.1) from inside the agent cgroup and asserts the daemon's
-/// verdict loop dropped + audited the SYN (egress_blocked, tcp/853,
-/// default_deny) before the TLS handshake.
+/// Real-uid-driven DoT bypass test. Opens a TCP/853 connection to a DoT
+/// provider (1.1.1.1) as the agent uid and asserts the daemon's verdict loop
+/// dropped + audited the SYN (egress_blocked, tcp/853, default_deny) before the
+/// TLS handshake.
 #[test]
 fn kernel_drops_dot_to_unallowed_resolver() {
     let _suite = isolation::guard();
     let fixture = KernelBypassFixture::setup("dot-bypass-test");
 
     // Single-line valid Python via `connect_ex`; one TCP SYN to 1.1.1.1:853
-    // from inside the agent cgroup.
+    // from a process running as the agent uid.
     fixture.spawn_bypass(
         "python3 -c \"import socket;s=socket.socket();s.settimeout(1.5);s.connect_ex(('1.1.1.1',853))\" || true",
     );

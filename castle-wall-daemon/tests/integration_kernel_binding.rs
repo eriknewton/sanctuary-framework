@@ -647,7 +647,7 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     use base64::Engine as _;
     use castle_wall_daemon::manifest::canonical_json::canonicalize_to_bytes;
     use castle_wall_daemon::manifest::verify::{
-        AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+        AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
     };
     use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
     use castle_wall_daemon::nftables::rule_to_nft_expr;
@@ -712,7 +712,22 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         fortress_id: "deadbeef".to_string(),
         issued_at: "2026-05-05T00:00:00Z".to_string(),
         generation: 1,
-        agent_origin: None,
+        // The SIGNED binding for the uid this test then installs a kernel rule
+        // for. A per-agent uid rule is legitimate only because a manifest in
+        // force confines that uid: with no origin the live binding is
+        // unverifiable, the daemon's health poll reads it as foreign and re-arms
+        // deny-all, and this end-to-end test would assert the evaluator path
+        // while skipping that supervision entirely.
+        // Must match `TEST_AGENT_UID` / `TEST_UID_CEILING` and `test_binding()`.
+        agent_origin: Some(AgentOrigin {
+            mode: "uid".to_string(),
+            egress_helper_signing_id: None,
+            egress_helper_team_id: None,
+            agent_runtime_port_range: None,
+            agent_uid: Some(TEST_AGENT_UID),
+            gate_uid: None,
+            system_uid_allow_ceiling: TEST_UID_CEILING,
+        }),
         operator_baseline: None,
         rules: vec![
             ManifestRuleEntry {
@@ -804,6 +819,28 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     let ruleset_script = nftables::build_agent_ruleset("test-e2e", TEST_AGENT_UID, &frags);
     let agent_id = ruleset_id("test-e2e");
     nftables::load_agent_ruleset(&agent_id, &ruleset_script, test_binding()).expect("load");
+
+    // The daemon's own supervision must still read the live table as OWNED: the
+    // health poll recomputes the uid seal and compares the live `meta skuid`
+    // value against the uid the CURRENT signed manifest confines, so it passes
+    // only because the manifest above publishes the matching origin. Failure mode
+    // if this assertion is absent: the evaluator assertions below still pass over
+    // an inventory production would refuse.
+    // ProbeUnavailable is INDETERMINATE (a bounded `nft` proof may be in flight),
+    // so it is retried, never read as ready; a proven Lost fails now.
+    let mut health = handle.kernel_runtime_health();
+    for _ in 0..40 {
+        if health != castle_wall_daemon::runtime_health::RuntimeHealthState::ProbeUnavailable {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        health = handle.kernel_runtime_health();
+    }
+    assert_eq!(
+        health,
+        castle_wall_daemon::runtime_health::RuntimeHealthState::Ready,
+        "kernel runtime health must be Ready once the manifest-matched uid binding is installed"
+    );
 
     // Verify rules installed.
     let output = nft_cmd(&[

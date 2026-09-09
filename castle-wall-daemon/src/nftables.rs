@@ -8,11 +8,15 @@
 //! ## What `meta skuid` matches, precisely
 //!
 //! On Linux 6.8 `nft_meta` reads `sock->file->f_cred->fsuid`, translated through
-//! the user namespace of the socket's network namespace. With no socket, no
-//! backing file, or no mapping, the expression is UNAVAILABLE and the packet
-//! does not match, falling through to the base chain's `policy accept`. The
-//! guarantee is therefore bounded to SOCKET credentials, and only while the rule
-//! exists: an inherited or passed socket, another network namespace, a
+//! the user namespace of the socket's network namespace. The expression is
+//! UNAVAILABLE, so the packet does not match, in exactly three cases: no socket,
+//! no backing file, or a socket-versus-packet network-namespace mismatch. A uid
+//! with NO mapping in that user namespace is NOT one of them: the kernel renders
+//! it through `from_kuid_munged` as the overflow uid (65534), which then matches
+//! nothing the manifest names. Either way the packet falls through to the base
+//! chain's `policy accept`, but the two are different mechanisms and must not be
+//! collapsed. The guarantee is bounded to SOCKET credentials, and only while the
+//! rule exists: an inherited or passed socket, another network namespace, a
 //! `setfsuid` divergence, or a uid hop on a NEW socket all leave the match. Each
 //! of those is a row in the private defect register; none is closed here.
 //!
