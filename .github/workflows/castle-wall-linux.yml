@@ -182,7 +182,7 @@ jobs:
           # someone deleting that block, and so the step reads correctly in
           # isolation. Must match the `defaults:` block at the top of this file.
           set -o pipefail
-          sudo -E env "PATH=$PATH" cargo test --locked --all-targets --features test-isolation \
+          sudo -E env "PATH=$PATH" CARGO_TERM_COLOR=never cargo test --locked --all-targets --features test-isolation --color never \
             -- --test-threads=1 2>&1 | tee cargo-test.log
           # Two DIFFERENT questions, both required:
           #   1. did cargo exit 0?  -> `pipefail` above
@@ -192,11 +192,18 @@ jobs:
           # exits 0 having tested nothing on that path. Keep this list equal to the
           # gated set in castle-wall-daemon/Cargo.toml; `tests/test_isolation_gate.rs`
           # pins that set from the other side.
+          # The guard greps PLAIN text. Cargo colours its "Running" banner when
+          # CARGO_TERM_COLOR is set (the job env sets it), which puts an escape
+          # sequence between "Running" and the path and makes every grep below
+          # miss; on 2026-09-09 that reported a suite as not-run although the
+          # log showed it ran. Colour is forced off above AND stripped here, so
+          # the guard cannot be defeated by a colour setting from either side.
+          sed 's/\x1b\[[0-9;]*m//g' cargo-test.log > cargo-test.plain.log
           for suite in integration_linux_runtime_activation integration_kernel_binding \
                        integration_dns_bypass integration_failure_modes \
                        integration_gf1_recovery integration_manifest_and_drain \
                        test_isolation_gate; do
-            grep -q "Running tests/$suite.rs" cargo-test.log || {
+            grep -q "Running tests/$suite.rs" cargo-test.plain.log || {
               echo "FAIL: $suite did not run; the test-isolation feature is required for it"
               exit 1
             }
@@ -205,8 +212,8 @@ jobs:
           # that aborted (SIGSEGV, a panic in a harness thread, an OOM kill) prints
           # `Running tests/<suite>.rs` and then dies without `test result:`, which
           # the presence-grep alone would accept.
-          started=$(grep -cE "^[[:space:]]*Running " cargo-test.log || true)
-          finished=$(grep -cE "^test result: ok\." cargo-test.log || true)
+          started=$(grep -cE "^[[:space:]]*Running " cargo-test.plain.log || true)
+          finished=$(grep -cE "^test result: ok\." cargo-test.plain.log || true)
           if [ "$started" != "$finished" ]; then
             # Kept on ONE physical line deliberately: a backslash continuation
             # whose next line starts in column 1 ends the surrounding `run: |`
