@@ -2,23 +2,20 @@
  * Linux Castle Wall daemon launcher + producer-signed activation path (Slice
  * "PR 2b" + C4 tamper-proof half).
  *
- * The Linux enforcing daemon runs as a root systemd service
- * (`castle-wall-daemon/systemd/sanctuary-castle-wall.service`): an unprivileged
- * TS process cannot rewrite a root unit or `systemctl edit`. The RATIFIED model
- * (split-process + Tier-A, 2026-06-16) keeps the daemon systemd-managed and has
- * the launcher PATCH the unit via a drop-in that splices
- * `producerKeyDaemonLaunchArgs(fortressStoragePath)` so the daemon publishes its
- * `audit-producer.pub` to EXACTLY `resolveProducerPubKeyPath(fortressStoragePath)`
- * - the same path the in-process TS server reads. Deriving both halves from one
- * storage root closes the daemon↔TS path divergence by construction.
+ * The Linux enforcing daemon is a pre-provisioned root systemd service. Runtime
+ * activation never writes `/etc`, rewrites ExecStart, or restarts the service:
+ * doing so from a user-owned Node process would collapse the privilege boundary.
+ * A privileged installer owns unit/environment/key placement; this module only
+ * verifies the service and attaches through authenticated IPC.
  *
  * # Security posture
  *
- * - The daemon's PRIVATE producer key stays root-owned (the drop-in points
- *   `--producer-key` into the fortress `policy/egress` dir; the daemon writes
- *   the priv key `0600` root-owned and the pub key world-readable per
- *   `producer-signature.ts` / the Rust `producer_sig` module). The TS server
- *   only ever reads the PUBLIC key.
+ * - The daemon's PRIVATE producer key stays root-owned below
+ *   `/var/lib/sanctuary/<fortress-id>/policy/egress`. On each boot it republishes
+ *   only the public half at
+ *   `/run/sanctuary/<fortress-id>/audit-producer.pub`, where the dedicated
+ *   non-root broker can traverse and read it. The TS server never receives the
+ *   private seed.
  * - FAIL-CLOSED: every failure mode here (daemon won't start, unit not active,
  *   key unreadable, handshake fails) throws `RuntimeLinuxActivationError`. The
  *   caller surfaces NOT-ARMED. There is NO path that swallows a failure and
@@ -29,15 +26,14 @@
  *
  * # Drill-acceptance caveat (never overclaim)
  *
- * This wires only the producer-signed binding/activation half behind an opt-in
- * gate. Linux still lacks the manifest-publication half that stamps
- * `agent_origin`, so this module does not make a Linux capability claim. That
- * claim is unavailable until the missing half exists and a CAPTURED DRILL on real
- * Linux hardware passes.
+ * This wires the producer-signed channel and authenticated byte-only policy
+ * broker behind an opt-in gate. It still does not make a Linux capability
+ * claim: that remains unavailable until a CAPTURED DRILL on real Linux hardware
+ * passes.
  */
 
 import { createConnection } from "node:net";
-import { readFile, writeFile, mkdir, chmod } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join, isAbsolute, normalize } from "node:path";
 
 import { resolveCastleWallSocketPath } from "./socket-path.js";
@@ -49,10 +45,8 @@ import { RuntimeLinuxActivationError } from "./errors.js";
 import type { IpcTransport } from "./ipc-client.js";
 
 /**
- * Default path of the privileged daemon binary the unit launches. The drop-in
- * re-states the full `ExecStart` (systemd requires a blank reset line + the new
- * command), so we must know the binary path. Mirrors the base unit's
- * `ExecStart` (`castle-wall-daemon/systemd/sanctuary-castle-wall.service`).
+ * Default path of the privileged daemon binary installed by the root-owned
+ * provisioning flow. Runtime activation never rewrites this value.
  */
 export const CASTLE_WALL_DAEMON_BINARY_DEFAULT =
   "/usr/local/libexec/sanctuary/castle-wall-daemon";
@@ -61,8 +55,8 @@ export const CASTLE_WALL_DAEMON_BINARY_DEFAULT =
 export const CASTLE_WALL_SYSTEMD_UNIT = "sanctuary-castle-wall.service";
 
 /**
- * Directory under which systemd reads drop-in overrides for the unit. A file
- * `NN-name.conf` here overrides directives in the base unit without editing it.
+ * Legacy pure installer helper. Runtime activation never writes this directory;
+ * the privileged offline installer owns the fixed unit and environment.
  */
 export function castleWallDropInDir(
   unit: string = CASTLE_WALL_SYSTEMD_UNIT
@@ -71,7 +65,10 @@ export function castleWallDropInDir(
 }
 
 /**
- * Render the systemd drop-in `.conf` that splices the producer-key launch args
+ * Legacy pure installer renderer for pre-server-profile fixtures. It is not a
+ * runtime activation primitive and must not be used for the hardened server
+ * profile, whose fixed root unit uses `/var/lib` private state and `/run` public
+ * state. Render the historical systemd drop-in `.conf` that splices the producer-key launch args
  * into the daemon's `ExecStart`. systemd requires clearing the inherited
  * `ExecStart` with a blank assignment before re-stating the command, otherwise
  * the directive would be additive (two ExecStart lines = a startup error for
@@ -85,6 +82,7 @@ export function castleWallDropInDir(
  *
  * Exported pure so tests assert the rendered text WITHOUT touching the host.
  */
+/** @deprecated Use the shipped root-owned unit and deployment procedure. */
 export function renderProducerKeyDropIn(input: {
   fortressId: string;
   fortressStoragePath: string;
@@ -153,113 +151,34 @@ export interface LauncherFs {
   chmod(path: string, mode: number): Promise<void>;
 }
 
-const realFs: LauncherFs = {
-  mkdir: async (path) => {
-    await mkdir(path, { recursive: true });
-  },
-  writeFile: async (path, contents, mode) => {
-    await writeFile(path, contents, { mode });
-  },
-  chmod: async (path, mode) => {
-    await chmod(path, mode);
-  },
-};
-
-/** Inputs to launch (or re-launch) the Linux daemon with producer-key flags. */
+/** Inputs to attach to the pre-provisioned Linux daemon. */
 export interface LaunchLinuxDaemonInput {
   fortressId: string;
   fortressStoragePath: string;
-  daemonBinary?: string;
-  /**
-   * TEST-ONLY override of the systemd unit name. Production callers MUST NOT set
-   * this (the unit name is a fixed constant, `CASTLE_WALL_SYSTEMD_UNIT`);
-   * exposing an arbitrary unit name to production would let an operator-supplied
-   * value pick which unit gets the spliced ExecStart. (codex MEDIUM.)
-   */
-  unit?: string;
-  /**
-   * TEST-ONLY override of the drop-in directory (hermetic tests point it away
-   * from the host `/etc`). Production resolves it from the unit name.
-   */
-  dropInDir?: string;
-  /**
-   * TEST-ONLY override of the drop-in filename. Production uses the fixed
-   * `10-sanctuary-producer-key.conf`.
-   */
-  dropInFileName?: string;
   systemctl: SystemctlRunner;
-  fs?: LauncherFs;
 }
 
 /** Result of a launch attempt. */
 export interface LaunchLinuxDaemonResult {
-  dropInPath: string;
   unit: string;
   active: boolean;
 }
 
 /**
- * P-1: render + install the producer-key drop-in, reload systemd, (re)start the
- * unit, and VERIFY it is active. FAIL-CLOSED: any systemctl failure or a unit
- * that is not active after start throws `RuntimeLinuxActivationError` - the
- * launcher never reports success it cannot prove.
+ * Verify the fixed, pre-provisioned root service is active. This runtime path
+ * has deliberately no unit-name, binary-path, drop-in, or filesystem mutation
+ * parameters: those belong to the privileged installer, not to a user process.
  */
 export async function launchLinuxCastleWallDaemon(
   input: LaunchLinuxDaemonInput
 ): Promise<LaunchLinuxDaemonResult> {
-  const fs = input.fs ?? realFs;
-  const unit = input.unit ?? CASTLE_WALL_SYSTEMD_UNIT;
-  // FIX 5: validate even the test-only overrides - a control char in the unit
-  // name or filename is an injection vector into the systemctl argv / drop-in
-  // path. The filename must additionally be a bare basename (no separator).
-  assertNoControlChars(unit, "systemd unit name");
-  const dropInDir = input.dropInDir ?? castleWallDropInDir(unit);
-  assertNoControlChars(dropInDir, "drop-in directory");
-  const dropInFileName =
-    input.dropInFileName ?? "10-sanctuary-producer-key.conf";
-  assertNoControlChars(dropInFileName, "drop-in filename");
-  if (dropInFileName.includes("/")) {
-    throw new RuntimeLinuxActivationError(
-      `Castle Wall Linux activation: drop-in filename must be a bare basename (no "/"); got "${dropInFileName}".`,
-      "daemon_start_failed"
-    );
-  }
-  const dropInPath = join(dropInDir, dropInFileName);
-
-  const contents = renderProducerKeyDropIn({
-    fortressId: input.fortressId,
-    fortressStoragePath: input.fortressStoragePath,
-    daemonBinary: input.daemonBinary,
-  });
-
-  // Install the drop-in (root-owned, 0644 - the daemon's ExecStart override is
-  // not a secret; the secret is the private key, which the daemon writes 0600).
-  try {
-    await fs.mkdir(dropInDir);
-    await fs.writeFile(dropInPath, contents, 0o644);
-    await fs.chmod(dropInPath, 0o644);
-  } catch (err) {
-    throw new RuntimeLinuxActivationError(
-      `failed to install producer-key drop-in at ${dropInPath}: ${errMsg(err)}`,
-      "daemon_start_failed"
-    );
-  }
-
-  // Reload so systemd picks up the spliced ExecStart, then (re)start the unit.
-  await runOrThrow(input.systemctl, ["daemon-reload"], "daemon_start_failed");
-  await runOrThrow(
-    input.systemctl,
-    ["restart", unit],
-    "daemon_start_failed"
-  );
-
-  // VERIFY active - the load-bearing honesty check. `is-active` exits 0 + prints
-  // "active" only when the unit actually came up. Anything else = not armed.
+  const unit = CASTLE_WALL_SYSTEMD_UNIT;
+  // Verify the already-provisioned service without mutating host state.
   const active = await input.systemctl.run(["is-active", unit]);
   const isActive = active.code === 0 && active.stdout.trim() === "active";
   if (!isActive) {
     throw new RuntimeLinuxActivationError(
-      `Castle Wall daemon unit ${unit} is not active after start ` +
+      `Castle Wall daemon unit ${unit} is not active (runtime activation is attach-only) ` +
         `(is-active exit=${active.code}, state="${active.stdout.trim()}"${
           active.stderr.trim() ? `, stderr="${active.stderr.trim()}"` : ""
         }).`,
@@ -267,7 +186,7 @@ export async function launchLinuxCastleWallDaemon(
     );
   }
 
-  return { dropInPath, unit, active: true };
+  return { unit, active: true };
 }
 
 /**
@@ -277,6 +196,7 @@ export async function launchLinuxCastleWallDaemon(
 export function realSystemctlRunner(
   systemctlBinary: string = "systemctl"
 ): SystemctlRunner {
+  const timeoutMs = 5_000;
   return {
     run: async (args) => {
       const { spawn } = await import("node:child_process");
@@ -286,11 +206,31 @@ export function realSystemctlRunner(
         });
         let stdout = "";
         let stderr = "";
+        let settled = false;
+        const finish = (result: { code: number; stdout: string; stderr: string }): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(result);
+        };
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          finish({
+            code: -1,
+            stdout,
+            stderr: `${stderr}${stderr ? "; " : ""}systemctl timed out after ${timeoutMs}ms`,
+          });
+        }, timeoutMs);
         child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
         child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-        child.on("error", (err) => reject(err));
+        child.on("error", (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(err);
+        });
         child.on("close", (code) =>
-          resolve({ code: code ?? -1, stdout, stderr })
+          finish({ code: code ?? -1, stdout, stderr })
         );
       });
     },
@@ -344,10 +284,33 @@ export async function connectLinuxUdsTransport(
 /** Wrap a connected `net.Socket` in the `IpcTransport` interface. */
 function adaptSocketToTransport(socket: import("node:net").Socket): IpcTransport {
   const listeners = new Set<(bytes: Uint8Array) => void>();
+  const closeListeners = new Set<(reason: Error) => void>();
+  let terminalReason: Error | null = null;
+  let terminalDelivered = false;
+  const deliverTerminal = (reason: Error): void => {
+    if (terminalDelivered) return;
+    terminalDelivered = true;
+    terminalReason = reason;
+    for (const listener of closeListeners) listener(reason);
+  };
   socket.on("data", (chunk: Buffer) => {
     const bytes = new Uint8Array(chunk);
     for (const l of listeners) l(bytes);
   });
+  // Keep an error listener for the entire connected lifetime. Removing the
+  // connect-phase listener without replacing it makes a later ECONNRESET an
+  // uncaught EventEmitter `error` that can terminate Sanctuary main.
+  socket.on("error", (err) => deliverTerminal(err));
+  socket.on("close", (hadError) =>
+    deliverTerminal(
+      terminalReason ??
+        new Error(
+          hadError
+            ? "Castle Wall daemon socket closed after a transport error"
+            : "Castle Wall daemon socket closed"
+        )
+    )
+  );
   return {
     send: (bytes: Uint8Array) =>
       new Promise<void>((resolve, reject) => {
@@ -357,9 +320,18 @@ function adaptSocketToTransport(socket: import("node:net").Socket): IpcTransport
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
+    onClose: (listener) => {
+      if (terminalDelivered && terminalReason) {
+        queueMicrotask(() => listener(terminalReason!));
+        return () => {};
+      }
+      closeListeners.add(listener);
+      return () => closeListeners.delete(listener);
+    },
     close: () =>
       new Promise<void>((resolve) => {
         listeners.clear();
+        closeListeners.clear();
         socket.end(() => {
           socket.destroy();
           resolve();
@@ -369,7 +341,7 @@ function adaptSocketToTransport(socket: import("node:net").Socket): IpcTransport
 }
 
 /**
- * Resolve the producer pub-key path for a fortress + assert the published key is
+ * Resolve the legacy/test fortress-relative producer pub-key path + assert it is
  * READABLE by this (unprivileged) process. The daemon writes it world-readable;
  * if it is missing or unreadable AFTER a successful daemon start, that is a
  * fail-closed condition (a key is EXPECTED - `startCastleWall` will throw
@@ -384,26 +356,6 @@ export async function readPublishedProducerPubKey(
 }
 
 // ---------- helpers ----------
-
-async function runOrThrow(
-  systemctl: SystemctlRunner,
-  args: string[],
-  reason: RuntimeLinuxActivationError["reason"]
-): Promise<void> {
-  const result = await systemctl.run(args);
-  if (result.code !== 0) {
-    throw new RuntimeLinuxActivationError(
-      `systemctl ${args.join(" ")} failed (exit=${result.code})${
-        result.stderr.trim() ? `: ${result.stderr.trim()}` : ""
-      }`,
-      reason
-    );
-  }
-}
-
-function errMsg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 /**
  * Quote a value for a systemd `ExecStart` token. systemd uses a restricted

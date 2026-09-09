@@ -1159,10 +1159,23 @@ export function createReputationTools(
               }
 
               const { buildHealthEvidenceReport } = await import("../health/evidence.js");
+              const { castleWallSnapshotForHealthReport } = await import(
+                "../health/castle-wall-detector.js"
+              );
+              // WIRED CONSUMER (AGENTS rule 4). This payload is SIGNED and
+              // published to an external reputation surface, so it is the one
+              // place a fabricated Castle Wall verdict would leave the machine.
+              // Same evidence source as `monitor_health` and `exec_attest`; a
+              // second derivation here would let the signed claim disagree with
+              // the local one.
               const evidence = buildHealthEvidenceReport({
                 config,
                 identityCount: identityManager.list().length,
                 storageBackendName: storage.constructor.name,
+                castleWall: await castleWallSnapshotForHealthReport({
+                  config,
+                  masterKey,
+                }),
               });
 
               const l1 = verascoreLayerFromStatus(

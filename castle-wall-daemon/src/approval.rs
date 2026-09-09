@@ -114,8 +114,7 @@ impl NonceStore {
 
     /// Sweep nonces older than `expiry` from both maps.
     pub fn sweep_expired(&mut self, now: Instant, expiry: Duration) {
-        self.issued
-            .retain(|_, t| now.duration_since(*t) <= expiry);
+        self.issued.retain(|_, t| now.duration_since(*t) <= expiry);
         self.consumed
             .retain(|_, t| now.duration_since(*t) <= expiry);
     }
@@ -175,7 +174,9 @@ mod tests {
         let mut store = NonceStore::default();
         let now = Instant::now();
         store.record_issued("abc", now);
-        assert!(store.try_consume("abc", now, Duration::from_secs(60)).is_ok());
+        assert!(store
+            .try_consume("abc", now, Duration::from_secs(60))
+            .is_ok());
     }
 
     #[test]

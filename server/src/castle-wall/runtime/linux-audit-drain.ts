@@ -32,6 +32,35 @@
  * daemon re-delivers exactly the events that were not durably handled. Reusing
  * the consumer's own ack path (rather than a parallel batch ack) keeps a single
  * settlement authority and inherits its correctness.
+ *
+ * # Two cursors, because they answer different questions
+ *
+ * SETTLEMENT and RECLAMATION are separate facts and used to be conflated. The
+ * local cursor advanced only after `client.sendDrainAck` RESOLVED, so an ACK
+ * that failed on the wire left the cursor behind while the consumer had already
+ * advanced `lastAckedSeq` and flushed (`audit-consumer.ts` updates its chain
+ * state BEFORE calling ack, precisely because "the data is already durable"). The
+ * loop then reported the event as "did not settle (no ack)" - an UNSETTLED FAULT
+ * that tripped a permanent not-armed wall - for an event that had fully settled.
+ * Two cursors, each meaning one thing:
+ *
+ *   - `cursor`         what the CONSUMER has durably settled. Advanced the
+ *                      instant the consumer calls `ack()`, before the wire send,
+ *                      because that call IS the settlement proof. It decides
+ *                      where the next drain request resumes.
+ *   - `pendingAckSeq`  the highest settled seq the DAEMON has not confirmed
+ *                      truncating. Re-sent at the top of every later cycle until
+ *                      confirmed. Without this, advancing `cursor` past an
+ *                      unconfirmed ACK would leave those entries in the daemon
+ *                      WAL forever (the daemon never re-delivers below
+ *                      `after_seq`), growing it to its cap, at which point the
+ *                      daemon fails closed and denies all wrapped-agent egress.
+ *                      Re-acking is safe because truncate-through-seq is
+ *                      idempotent.
+ *
+ * No data is lost in either direction: the consumer never advances past an
+ * unpersisted event, and the daemon never truncates through one the consumer did
+ * not durably hold.
  */
 
 import type {
@@ -44,22 +73,93 @@ import {
   CASTLE_WALL_SCHEMA_VERSION_V1,
 } from "../constants.js";
 import { fortressIdFromProtectionSubject } from "../subject-binding.js";
+// `WAL_OPERATION_TO_EVENT_TYPE` is IMPORTED, not re-declared. It used to be a
+// hand-mirrored copy carrying a "MUST stay in sync with audit-consumer.ts"
+// comment, which is the exact shape AGENTS rule 5 prohibits: the consumer
+// REJECTS a producer-signed event whose mapped type does not equal the one this
+// loop attached, so a divergence between the two tables does not surface as a
+// mismatch warning - it surfaces as genuine enforcement evidence being discarded
+// as forgery-shaped. One table makes that unrepresentable.
+import { WAL_OPERATION_TO_EVENT_TYPE } from "./audit-consumer.js";
 import type { AuditConsumer, CriticalEventEnvelope } from "./audit-consumer.js";
 import type { IpcClient } from "./ipc-client.js";
+import { RuntimeDrainError } from "./errors.js";
 
 /**
- * Map a daemon WAL `operation` tag to the consumer's `event_type`. MUST stay in
- * sync with `WAL_OPERATION_TO_EVENT_TYPE` in `audit-consumer.ts` (which the
- * consumer uses to cross-check the signed body against the persisted slot). Only
- * the enforcement-evidence operations are mapped here; any other operation maps
- * to its own string and is carried through unchanged (control/diagnostic events
- * are not producer-gated by the consumer).
+ * How a drain-cycle failure must be handled.
+ *
+ * `unclassified` is kept distinct from `retryable` rather than folded into it
+ * because they are different facts: `retryable` is the daemon saying "I am busy
+ * or stopping", while `unclassified` is a pre-v2 daemon saying nothing at all.
+ * Both get the caller's bounded retry budget, but only one of them is a
+ * statement about the daemon's condition, and an operator reading the reason
+ * string is entitled to know which.
  */
-const WAL_OPERATION_TO_EVENT_TYPE: Readonly<Record<string, string>> = Object.freeze({
-  egress_approved: "egress_allowed",
-  egress_blocked: "egress_blocked",
-  egress_pending: "operator_decision",
-});
+export type DrainFaultClass = "retryable" | "unclassified" | "terminal";
+
+/**
+ * The three-valued condition of the signed-evidence channel.
+ *
+ * Declared HERE, in the module that owns the drain loop, rather than in the
+ * activation gate that latches it: `health/castle-wall-snapshot.ts` needs the
+ * type, and importing it from the gate created a gate <-> snapshot import cycle
+ * (the gate already imports the snapshot builder). One direction, one owner.
+ *
+ * `retrying` is neither health nor failure. Folding it into `faulted` is what let
+ * an ordinary `systemctl stop` or a 2-second control-lock window write permanent
+ * not-armed evidence; folding it into `healthy` would let a daemon that refuses
+ * forever pass as a working wall.
+ */
+export type CastleWallDrainState = "healthy" | "retrying" | "faulted";
+
+/**
+ * Classify one drain-cycle failure.
+ *
+ * The ONE place the question is answered, so the loop, the activation gate, and
+ * any later consumer cannot answer it differently. Everything that is not a
+ * classified {@link RuntimeDrainError} stays TERMINAL: a dropped socket, a
+ * request timeout, or an unexpected throw is not a daemon telling us it is busy,
+ * and the fail-closed armed-but-not-draining contract is written for exactly
+ * those. Only a daemon RESPONSE carrying (or lacking) a class can be softened.
+ */
+export function classifyDrainFault(err: unknown): DrainFaultClass {
+  if (err instanceof RuntimeDrainError) {
+    if (err.errorClass === "terminal") return "terminal";
+    return err.errorClass === "retryable" ? "retryable" : "unclassified";
+  }
+  return "terminal";
+}
+
+/** Per-cycle inputs that carry over from the previous cycle. */
+export interface DrainCycleOptions {
+  /**
+   * Highest seq the consumer durably settled whose daemon-side truncation is
+   * still unconfirmed. Re-acked at the top of the cycle. Carry the value from
+   * the previous cycle's result, or the daemon WAL keeps entries the consumer
+   * already holds until it hits its cap and fails closed.
+   */
+  pendingAckSeq?: number | null;
+  /**
+   * Sink for a RETRYABLE or UNCLASSIFIED fault. Separate from `onDrainFault`
+   * (terminal only) so a busy or stopping daemon cannot write permanent
+   * not-armed evidence about a link that is fine.
+   */
+  onRetryableFault?: (err: Error) => void;
+}
+
+/** What one drain cycle observed. */
+export interface DrainCycleResult {
+  nextAfterSeq: number | null;
+  morePending: boolean;
+  drained: number;
+  faulted: boolean;
+  faultedSeq: number | null;
+  /** Reclamation debt to carry into the next cycle; `null` when nothing is owed. */
+  pendingAckSeq: number | null;
+  /** Worst class seen this cycle, or `null` when the cycle was clean. */
+  faultClass: DrainFaultClass | null;
+}
+
 
 /** Default batch cap per drain request. Matches a sane daemon snapshot ceiling. */
 export const DEFAULT_AUDIT_DRAIN_MAX_EVENTS = 256;
@@ -87,6 +187,14 @@ export interface LinuxAuditDrainOptions {
    * the probe already drained.
    */
   initialCursor?: number | null;
+  /**
+   * Reclamation debt inherited from the activation gate's initial-drain probe:
+   * a seq the consumer durably settled whose daemon-side truncation the probe
+   * could not confirm. Without carrying it, those daemon WAL entries would never
+   * be re-acked (the loop resumes ABOVE them) and the WAL would grow toward its
+   * cap. Defaults to null.
+   */
+  initialPendingAckSeq?: number | null;
   /** Injected timer for tests; defaults to setTimeout. */
   setTimer?: (cb: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
@@ -113,6 +221,26 @@ export interface LinuxAuditDrainOptions {
    * HIGH FIX.)
    */
   onDrainFault?: (err: Error) => void;
+  /**
+   * Sink for a RETRYABLE or UNCLASSIFIED fault: the daemon answered and said it
+   * was busy or stopping (or, pre-v2, said nothing about why).
+   *
+   * Deliberately NOT routed to `onDrainFault`. Every daemon-side refusal used to
+   * land there, so an ordinary `systemctl stop` with an ACK in flight, or any
+   * 2-second control-lock contention window, wrote a durable
+   * `castle_wall_drain_failed` record and latched the wall permanently
+   * not-armed - blaming a transport/persistence fault for a link that was fine
+   * and a daemon that was merely busy. The consumer's data is unaffected in both
+   * cases. The CALLER applies a bounded budget to these and escalates to
+   * `onDrainFault` only when it is exhausted.
+   */
+  onRetryableFault?: (err: Error) => void;
+  /**
+   * Called after any cycle that completed with no fault AND no reclamation debt.
+   * The caller uses it to reset its retryable-fault budget, so the budget counts
+   * CONSECUTIVE failures rather than accumulating over the process lifetime.
+   */
+  onCycleHealthy?: () => void;
 }
 
 /**
@@ -196,6 +324,7 @@ export function buildCriticalEnvelopeFromDrainEvent(
   const envelope: CriticalEventEnvelope = {
     event,
     ack,
+    producerDelivery: "durable_wal",
     producer: {
       eventCanonicalJson: drained.event_canonical_json,
       capturedAtUnixMs: drained.captured_at_unix_ms,
@@ -253,29 +382,99 @@ export async function drainOnce(
   afterSeq: number | null,
   maxEvents: number,
   onError?: (err: Error) => void,
-  onDrainFault?: (err: Error) => void
-): Promise<{
-  nextAfterSeq: number | null;
-  morePending: boolean;
-  drained: number;
-  faulted: boolean;
-  faultedSeq: number | null;
-}> {
-  const response: AuditDrainResponse = await client.drainRequest(afterSeq, maxEvents);
+  onDrainFault?: (err: Error) => void,
+  options: DrainCycleOptions = {}
+): Promise<DrainCycleResult> {
+  // Two distinct roles, kept apart on purpose (see the module header): `cursor`
+  // is what the CONSUMER has durably settled and decides where we resume;
+  // `pendingAckSeq` is what the DAEMON has not confirmed truncating.
   let cursor: number | null = afterSeq;
+  let pendingAckSeq: number | null = options.pendingAckSeq ?? null;
   let drained = 0;
   let faulted = false;
   let faultedSeq: number | null = null;
+  // The worst class seen this cycle. `null` while healthy.
+  let faultClass: DrainFaultClass | null = null;
+
+  /** Fold one failure into this cycle's worst-class summary and route it. */
+  const noteFault = (err: Error, seq: number | null): void => {
+    const cls = classifyDrainFault(err);
+    faulted = true;
+    if (faultedSeq === null) faultedSeq = seq;
+    // `terminal` always wins; otherwise the first class seen stands.
+    if (faultClass === null || cls === "terminal") faultClass = cls;
+    if (cls === "terminal") onDrainFault?.(err);
+    else options.onRetryableFault?.(err);
+  };
+
+  /**
+   * Send one ACK and track the reclamation debt.
+   *
+   * Rethrows so the consumer's own `tryAck` still records
+   * `critical_event_ack_failed`, but the fault is CLASSIFIED here first: a
+   * stopping or busy daemon refusing a truncation is not a broken evidence
+   * channel, and the events in question are already durable consumer-side.
+   */
+  const ack = async (seq: number): Promise<void> => {
+    try {
+      await client.sendDrainAck(seq);
+      // Confirmed (or, on a pre-v2 peer, sent on the documented one-way basis
+      // the owner ruling preserves, whose weaker guarantee is reported through
+      // `drainAcksAreConfirmed()` rather than hidden). Debt cleared.
+      if (pendingAckSeq !== null && pendingAckSeq <= seq) pendingAckSeq = null;
+    } catch (err) {
+      pendingAckSeq = pendingAckSeq === null ? seq : Math.max(pendingAckSeq, seq);
+      noteFault(err instanceof Error ? err : new Error(String(err)), seq);
+      throw err;
+    }
+  };
+
+  const summary = (morePending: boolean): DrainCycleResult => ({
+    nextAfterSeq: cursor,
+    morePending,
+    drained,
+    faulted,
+    faultedSeq,
+    pendingAckSeq,
+    faultClass,
+  });
+
+  // Settle any ACK the daemon has not confirmed BEFORE pulling more. Doing it
+  // first bounds the debt at one seq: a cycle cannot stack a second unconfirmed
+  // ACK on top of an unresolved one, so the retained state here is O(1) rather
+  // than a list that grows with every failed reclamation (AGENTS rule 8).
+  if (pendingAckSeq !== null) {
+    try {
+      await ack(pendingAckSeq);
+    } catch {
+      // Already classified and routed by `ack`. Do NOT pull a new batch on top
+      // of an unresolved reclamation debt; the loop's capped backoff paces it.
+      return summary(false);
+    }
+  }
+
+  let response: AuditDrainResponse;
+  try {
+    response = await client.drainRequest(afterSeq, maxEvents);
+  } catch (err) {
+    // Routed here rather than thrown so a RETRYABLE daemon response (busy,
+    // stopping) cannot reach the loop's catch-all, which treats anything it
+    // catches as an unsettled fault.
+    const error = err instanceof Error ? err : new Error(String(err));
+    noteFault(error, null);
+    return summary(false);
+  }
 
   for (const drainedEvent of response.events) {
-    // The per-event ack IS the drain ack: the consumer invokes it on durable
-    // settlement, which truncates the daemon WAL through this seq and advances
-    // our cursor. Building the cursor advance INSIDE the ack means the cursor
-    // can never run ahead of what the consumer durably settled.
+    // SETTLEMENT, not transport success, advances the cursor. The consumer
+    // invokes this callback only after the event is durably persisted AND its
+    // own chain state has advanced, so by the time we are called the event has
+    // settled whether or not the wire send that follows succeeds. Advancing
+    // after the send is what made a failed ACK look like an unpersisted event.
     const built = buildCriticalEnvelopeFromDrainEvent(drainedEvent, async () => {
-      await client.sendDrainAck(drainedEvent.seq);
       cursor = drainedEvent.seq;
       drained += 1;
+      await ack(drainedEvent.seq);
     });
     if (built.kind === "error") {
       // A malformed drain entry never settles (the cursor cannot advance past a
@@ -284,11 +483,15 @@ export async function drainOnce(
       // armed-but-not-draining. Route it to `onDrainFault` (trips NOT-ARMED) and
       // STOP iterating so the cursor does not advance past the gap (the daemon
       // re-delivers from `cursor`).
-      onDrainFault?.(
-        new Error(`audit_drain: ${built.reason} at seq ${drainedEvent.seq}`)
+      // TERMINAL: bytes that will not parse do not become parseable on a retry.
+      noteFault(
+        new RuntimeDrainError(
+          `audit_drain: ${built.reason} at seq ${drainedEvent.seq}`,
+          "drain",
+          "terminal"
+        ),
+        drainedEvent.seq
       );
-      faulted = true;
-      faultedSeq = drainedEvent.seq;
       break;
     }
     let ingestError: Error | undefined;
@@ -309,7 +512,11 @@ export async function drainOnce(
     //
     // The ack callback advances `cursor` to `drainedEvent.seq` ONLY when the
     // consumer durably settled this event (accepted, rejected-and-recorded, or
-    // duplicate-dropped). The cursor is therefore the single discriminator:
+    // duplicate-dropped). The cursor is therefore the single discriminator for
+    // SETTLEMENT. It no longer conflates settlement with RECLAMATION: a failed
+    // ACK wire send leaves `pendingAckSeq` owed and is classified by `ack`,
+    // while the cursor - which the consumer's own durable state already
+    // advanced - stays advanced.
     if (cursor === drainedEvent.seq) {
       // SETTLED. If it threw, it was a producer-signature refusal recorded +
       // acked - a diagnostic, NOT a transport failure. Report it via `onError`;
@@ -323,28 +530,29 @@ export async function drainOnce(
       // which - with `lastEventChainHash` still null because seq N never
       // persisted - would accept N+1 as a fresh bootstrap and ack
       // `audit_drain_ack(N+1)`, truncating the daemon WAL THROUGH the lost seq N
-      // (silent audit data loss). This is an UNSETTLED FAULT → `onDrainFault`
-      // (trips NOT-ARMED in opt-in mode). We STOP the batch; the cursor stays at
-      // the last durably settled seq and the daemon re-delivers from there.
-      onDrainFault?.(
-        ingestError ??
-          new Error(
-            `audit_drain: event seq ${drainedEvent.seq} did not settle (no ack)`
-          )
+      // (silent audit data loss). We STOP the batch; the cursor stays at the last
+      // durably settled seq and the daemon re-delivers from there.
+      //
+      // TERMINAL: this is a CONSUMER-side persistence/integrity failure, which
+      // is the class the fail-closed contract is written for. It is not the
+      // daemon-busy case that `error_class` reclassifies.
+      noteFault(
+        new RuntimeDrainError(
+          ingestError?.message ??
+            `audit_drain: event seq ${drainedEvent.seq} did not settle (no ack)`,
+          "drain",
+          "terminal"
+        ),
+        drainedEvent.seq
       );
-      faulted = true;
-      faultedSeq = drainedEvent.seq;
       break;
     }
   }
 
-  return {
-    nextAfterSeq: cursor,
-    morePending: !faulted && cursor !== afterSeq ? response.more_pending : false,
-    drained,
-    faulted,
-    faultedSeq,
-  };
+  // `morePending` is suppressed after ANY fault (including a retryable one): the
+  // loop's backoff is what paces a retry, and chasing more batches through a
+  // daemon that just told us it is busy is the amplification this bounds.
+  return summary(!faulted && cursor !== afterSeq ? response.more_pending : false);
 }
 
 /**
@@ -382,6 +590,10 @@ export function startLinuxAuditDrainLoop(
   let stopped = false;
   let cursor: number | null = options.initialCursor ?? null;
   let lastAcked: number | null = null;
+  // Reclamation debt carried BETWEEN cycles. Bounded at one seq by construction:
+  // `drainOnce` settles it before pulling a new batch and returns without
+  // pulling if it cannot, so this can never accumulate a list (AGENTS rule 8).
+  let pendingAckSeq: number | null = options.initialPendingAckSeq ?? null;
   let consecutiveFaultCursor: number | null = null;
   let consecutiveFaultsAtCursor = 0;
   let timer: unknown = null;
@@ -400,25 +612,34 @@ export function startLinuxAuditDrainLoop(
           cursor,
           maxEvents,
           options.onError,
-          options.onDrainFault
+          options.onDrainFault,
+          { pendingAckSeq, onRetryableFault: options.onRetryableFault }
         );
         cursor = result.nextAfterSeq;
+        pendingAckSeq = result.pendingAckSeq;
         if (result.drained > 0) lastAcked = cursor;
         if (result.faulted) faultedThisCycle = true;
         morePending = result.morePending;
       }
     } catch (err) {
-      // A `drainRequest` itself threw - the daemon link dropped. The signed
+      // `drainOnce` routes daemon-classified failures itself, so anything
+      // reaching here is an UNEXPECTED throw. Treated as TERMINAL, which is the
+      // pre-existing fail-closed behavior for a dropped link: the signed
       // enforcement evidence is not reaching the consumer, so in opt-in mode the
-      // wall is armed-but-not-draining: this is an UNSETTLED transport FAULT
-      // (`onDrainFault` → NOT-ARMED), NOT a settled diagnostic. We never throw
-      // out of the loop; the health machine (opt-in mode) decides whether to
-      // tear the activation down. Without an `onDrainFault` handler the loop
-      // simply retries on the next tick (the channel-basis floor behavior).
+      // wall is armed-but-not-draining. We never throw out of the loop; the
+      // health machine (opt-in mode) decides whether to tear the activation
+      // down. Without an `onDrainFault` handler the loop simply retries on the
+      // next tick (the channel-basis floor behavior).
       const fault = err instanceof Error ? err : new Error(String(err));
       if (options.onDrainFault) options.onDrainFault(fault);
       else options.onError?.(fault);
       faultedThisCycle = true;
+    }
+    if (!faultedThisCycle && pendingAckSeq === null) {
+      // A clean cycle with nothing owed. The caller resets its retryable budget
+      // here, which is what makes that budget count CONSECUTIVE failures rather
+      // than every failure the process has ever seen.
+      options.onCycleHealthy?.();
     }
     if (faultedThisCycle) {
       if (consecutiveFaultCursor === cursor) {

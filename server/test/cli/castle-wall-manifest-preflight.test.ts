@@ -12,6 +12,7 @@ import {
 } from "../../src/castle-wall/constants.js";
 import { canonicalize } from "../../src/mesh/canonical-json.js";
 import { stringToBytes, toBase64url } from "../../src/core/encoding.js";
+import { castleWallSigningKeyId } from "../../src/castle-wall/allowlist/parse.js";
 import type { AllowlistManifest, SignedManifest } from "../../src/castle-wall/allowlist/manifest.js";
 
 class CaptureStream extends Writable {
@@ -41,7 +42,11 @@ function signedManifest(entries: AllowlistManifest["rules"]): { envelope: Signed
       manifest,
       signature: {
         signature_scheme: CASTLE_WALL_SIGNATURE_SCHEME_V1,
-        signing_key_id: "test-key",
+        // MUST MATCH `castleWallSigningKeyId` in
+        // server/src/castle-wall/allowlist/parse.ts: the verifier derives the one
+        // permitted id from the pinned key, so a hand-written literal here would
+        // make every fixture manifest fail verification for the wrong reason.
+        signing_key_id: castleWallSigningKeyId(publicKey),
         signature_b64url: toBase64url(ed25519.sign(stringToBytes(canonicalize(manifest)), privateKey)),
       },
     },

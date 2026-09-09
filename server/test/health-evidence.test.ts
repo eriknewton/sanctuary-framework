@@ -19,6 +19,11 @@ describe("health evidence", () => {
         uptime_seconds: 42,
         loaded_rule_count: 7,
         no_wall_engaged: false,
+        manifest_state: "ready" as const,
+        lifecycle_state: "running",
+        runtime_state: "enforcing",
+        kernel_runtime_ready: true,
+        enforcing: true,
         loaded_manifest_signature_b64url: "sig",
       },
     });
@@ -61,12 +66,40 @@ describe("health evidence", () => {
         uptime_seconds: 12,
         loaded_rule_count: 3,
         no_wall_engaged: false,
+        manifest_state: "ready" as const,
+        lifecycle_state: "running",
+        runtime_state: "enforcing",
+        kernel_runtime_ready: true,
+        enforcing: true,
         loaded_manifest_signature_b64url: "sig",
       },
     });
 
     expect(status.status).toBe("degraded");
     expect(status.detector_evidence).toContain("nftables rules not applied");
+  });
+
+  it("does not promote a running control-plane-only daemon to active", () => {
+    const status = evaluateCastleWall({
+      platform: "linux",
+      configured: true,
+      daemonUp: true,
+      nftablesApplied: true,
+      cgroupAttached: true,
+      statusResponse: {
+        uptime_seconds: 12,
+        loaded_rule_count: 3,
+        no_wall_engaged: false,
+        manifest_state: "ready" as const,
+        lifecycle_state: "running",
+        runtime_state: "control_plane_only",
+        kernel_runtime_ready: false,
+        enforcing: false,
+        loaded_manifest_signature_b64url: "sig",
+      },
+    });
+    expect(status.status).toBe("degraded");
+    expect(status.detector_evidence).toContain("control_plane_only");
   });
 
   it("reports unknown when no runtime detector evidence is available", () => {
@@ -128,5 +161,201 @@ describe("health evidence", () => {
 
     expect(report.layers.l3.status).toBe("not_configured");
     expect(report.layers.l3.evidence).toContain("no zero-knowledge proof system");
+  });
+});
+
+describe("health/evidence : the four-state runtime model", () => {
+  const base = {
+    platform: "linux" as const,
+    configured: true as const,
+    daemonUp: true as const,
+    nftablesApplied: true as const,
+    cgroupAttached: true as const,
+  };
+  const status = (over: Record<string, unknown>) => ({
+    uptime_seconds: 12,
+    loaded_rule_count: 3,
+    no_wall_engaged: false,
+    loaded_manifest_signature_b64url: "sig",
+    ...over,
+  });
+
+  /**
+   * FAIL-BEFORE for the compatibility outage: a pre-v2 daemon reports NONE of
+   * the runtime fields. The previous branch compared them directly, so
+   * `undefined !== "running"` produced a `degraded` verdict about a daemon that
+   * simply does not report the field. Absence must read as not-proven, never as
+   * proof of failure.
+   */
+  it("reads a pre-v2 daemon's ABSENT runtime block as unknown, not degraded", () => {
+    const result = evaluateCastleWall({
+      ...base,
+      statusResponse: status({}) as never,
+    });
+    expect(result.status).toBe("unknown");
+    expect(result.status).not.toBe("degraded");
+    expect(result.status).not.toBe("active");
+    expect(result.detector_evidence).toContain("not currently proven");
+  });
+
+  it("reads an INDETERMINATE health probe as unknown, not degraded and not active", () => {
+    const result = evaluateCastleWall({
+      ...base,
+      statusResponse: status({
+        manifest_state: "ready" as const,
+        lifecycle_state: "running",
+        runtime_state: "kernel_runtime_ready",
+        kernel_runtime_ready: false,
+        enforcing: false,
+        runtime_health: "probe_unavailable",
+      }) as never,
+    });
+    expect(result.status).toBe("unknown");
+    expect(result.detector_evidence).toContain("probe_unavailable");
+  });
+
+  it("reads a PROVEN-lost runtime as degraded", () => {
+    const result = evaluateCastleWall({
+      ...base,
+      statusResponse: status({
+        manifest_state: "ready" as const,
+        lifecycle_state: "running",
+        runtime_state: "kernel_runtime_ready",
+        kernel_runtime_ready: true,
+        enforcing: false,
+        runtime_health: "lost",
+      }) as never,
+    });
+    expect(result.status).toBe("degraded");
+  });
+
+  /**
+   * The state model must be SATISFIABLE. `runtime_state: "enforcing"` is
+   * documented in `castle-wall-daemon/src/daemon.rs` as never produced in this
+   * slice, so requiring it made every healthy privileged host read degraded
+   * forever. A live kernel runtime with the detector details confirmed is the
+   * honest top of the reachable model.
+   */
+  it("accepts a live kernel runtime with no agent wrapped", () => {
+    const result = evaluateCastleWall({
+      ...base,
+      statusResponse: status({
+        manifest_state: "ready" as const,
+        lifecycle_state: "running",
+        runtime_state: "kernel_runtime_ready",
+        kernel_runtime_ready: true,
+        enforcing: false,
+        runtime_health: "ready",
+      }) as never,
+    });
+    expect(result.status).toBe("active");
+  });
+
+  it("still refuses to call a wall active while the operator bypass is engaged", () => {
+    const result = evaluateCastleWall({
+      ...base,
+      statusResponse: status({
+        no_wall_engaged: true,
+        manifest_state: "ready" as const,
+        lifecycle_state: "running",
+        runtime_state: "enforcing",
+        kernel_runtime_ready: true,
+        enforcing: true,
+        runtime_health: "ready",
+      }) as never,
+    });
+    expect(result.status).toBe("degraded");
+  });
+});
+
+describe("health/evidence : the mandatory audit-ACK confirmation gate", () => {
+  const live = {
+    platform: "linux" as const,
+    configured: true as const,
+    daemonUp: true as const,
+    nftablesApplied: true as const,
+    cgroupAttached: true as const,
+    statusResponse: {
+      uptime_seconds: 12,
+      loaded_rule_count: 3,
+      no_wall_engaged: false,
+      loaded_manifest_signature_b64url: "sig",
+      manifest_state: "ready" as const,
+      lifecycle_state: "running",
+      runtime_state: "kernel_runtime_ready",
+      kernel_runtime_ready: true,
+      enforcing: false,
+      runtime_health: "ready",
+    } as never,
+  };
+
+  /**
+   * OWNER RULING (2026-09-02). This is the exact input that must NOT pass: a
+   * perfectly live kernel runtime whose evidence channel cannot confirm that
+   * reclaimed WAL ranges were actually truncated. Without the gate this reads
+   * `active`, which is a complete-enforcement claim on unproven evidence.
+   */
+  it("degrades a LIVE runtime whose ACKs are unconfirmed", () => {
+    expect(evaluateCastleWall({ ...live, evidenceChannel: "confirmed" }).status).toBe(
+      "active"
+    );
+    const unconfirmed = evaluateCastleWall({ ...live, evidenceChannel: "unconfirmed_ack" });
+    expect(unconfirmed.status).toBe("degraded");
+    expect(unconfirmed.status).not.toBe("active");
+    expect(unconfirmed.detector_evidence).toContain("audit_drain_ack_response");
+  });
+
+  it("degrades a LIVE runtime whose drain link has faulted", () => {
+    const faulted = evaluateCastleWall({ ...live, evidenceChannel: "faulted" });
+    expect(faulted.status).toBe("degraded");
+    expect(faulted.detector_evidence).toContain("not reaching the consumer");
+  });
+
+  /**
+   * The channel gate outranks the runtime block. An unconfirmed channel is a
+   * POSITIVE fact (the peer did not advertise the capability), so reporting
+   * `unknown` here would understate what we actually observed.
+   */
+  it("reports an unconfirmed channel as degraded even when the runtime is indeterminate", () => {
+    const both = evaluateCastleWall({
+      platform: "linux",
+      configured: true,
+      daemonUp: true,
+      nftablesApplied: true,
+      cgroupAttached: true,
+      evidenceChannel: "unconfirmed_ack",
+      statusResponse: {
+        uptime_seconds: 1,
+        loaded_rule_count: 0,
+        no_wall_engaged: false,
+        loaded_manifest_signature_b64url: null,
+      } as never,
+    });
+    expect(both.status).toBe("degraded");
+  });
+
+  /**
+   * Absence is NOT confirmation, but it is also not this field's business: the
+   * macOS detector has no consumer-side drain channel at all, so an omitted
+   * `evidenceChannel` must leave the existing verdict untouched rather than
+   * degrading every non-Linux runtime.
+   */
+  it("leaves the verdict untouched when no drain channel is reported", () => {
+    expect(evaluateCastleWall(live).status).toBe("active");
+  });
+
+  it("carries the degradation into the full health report", () => {
+    const report = buildHealthEvidenceReport({
+      config: defaultConfig(),
+      identityCount: 0,
+      storageBackendName: "FilesystemStorage",
+      castleWall: { ...live, evidenceChannel: "unconfirmed_ack" },
+    });
+    expect(report.castle_wall.status).toBe("degraded");
+    expect(report.egress.enforcement).toBe("degraded");
+    expect(report.layers.l1.status).toBe("degraded");
+    expect(
+      report.degradations.some((d) => d.layer === "l1" && d.severity === "critical")
+    ).toBe(true);
   });
 });

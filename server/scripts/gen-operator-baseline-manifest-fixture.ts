@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import { canonicalize } from "../src/mesh/canonical-json.js";
+import { castleWallSigningKeyId } from "../src/castle-wall/allowlist/parse.js";
 import {
   buildSignedManifest,
   type ManifestSigner,
@@ -42,7 +43,7 @@ const seed = Uint8Array.from(
 );
 const publicKey = ed25519.getPublicKey(seed);
 const signer: ManifestSigner = {
-  signingKeyId: "operator-baseline-cross-lang-test-key",
+  signingKeyId: castleWallSigningKeyId(publicKey),
   sign(canonicalBytes: Uint8Array): Uint8Array {
     return ed25519.sign(canonicalBytes, seed);
   },

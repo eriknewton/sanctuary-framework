@@ -49,12 +49,15 @@
 
 #![cfg(target_os = "linux")]
 
+mod isolation;
+
 use base64::Engine as _;
 use castle_wall_daemon::audit::WalWriter;
 use castle_wall_daemon::cgroup;
 use castle_wall_daemon::config::DaemonConfig;
 use castle_wall_daemon::daemon::{boot, mode_for_error, refuse_to_start_message, DaemonError};
 use castle_wall_daemon::failure::{default_disposition, FailureDisposition, FailureMode};
+use castle_wall_daemon::ipc::auth::{handshake_signing_bytes, CHALLENGE_NONCE_BYTES};
 use castle_wall_daemon::ipc::framing::{frame, parse_frame, ParseStep};
 use castle_wall_daemon::ipc::messages::{IpcMessage, MessageEnvelope};
 use castle_wall_daemon::manifest::canonical_json::canonicalize_to_bytes;
@@ -63,9 +66,7 @@ use castle_wall_daemon::manifest::verify::{
 };
 use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
 use castle_wall_daemon::nfqueue::{NfqueueConfig, QueueHandle};
-use castle_wall_daemon::nftables::{
-    self, AgentRulesetId, NftRuleFragment, CASTLE_FAMILY, CASTLE_TABLE,
-};
+use castle_wall_daemon::nftables::{self, AgentRulesetId, NftRuleFragment, CASTLE_FAMILY};
 use castle_wall_daemon::policy::{DeniedReason, EvaluationRequest, Verdict};
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
@@ -83,11 +84,24 @@ use tempfile::TempDir;
 const SIGNATURE_SCHEME_V1: &str = "ed25519-v1";
 const IPC_NAMESPACE: &str = "castle-wall";
 
+#[test]
+fn verdict_deadline_fail_stops_subprocess_nonzero_without_clean_exit_claim() {
+    let output = Command::new(env!("CARGO_BIN_EXE_castle-wall-daemon"))
+        .arg("--test-trigger-nfqueue-deadline-fail-stop")
+        .output()
+        .expect("launch fail-stop probe subprocess");
+    assert_eq!(output.status.code(), Some(75));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stderr.contains("FATAL NFQUEUE verdict deadline exceeded"));
+    assert!(!stdout.contains("clean exit"));
+}
+
 // ---- helpers --------------------------------------------------------------
 
 fn cleanup_castle_table() {
     let _ = Command::new("nft")
-        .args(["delete", "table", CASTLE_FAMILY, CASTLE_TABLE])
+        .args(["delete", "table", CASTLE_FAMILY, isolation::table()])
         .output();
 }
 
@@ -122,7 +136,9 @@ fn write_signed_manifest_one_rule(policy_dir: &Path, signing: &SigningKey) {
     // (always-on-lane gate); the daemon refuses a lane-less manifest.
     let habeas_body = castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes();
     fs::write(
-        policy_dir.join(RULES_SUBDIR).join("reserved_habeas_distress_local.json"),
+        policy_dir
+            .join(RULES_SUBDIR)
+            .join("reserved_habeas_distress_local.json"),
         habeas_body,
     )
     .unwrap();
@@ -131,6 +147,7 @@ fn write_signed_manifest_one_rule(policy_dir: &Path, signing: &SigningKey) {
         schema_version: 1,
         fortress_id: "deadbeef".to_string(),
         issued_at: "2026-05-06T00:00:00Z".to_string(),
+        generation: 1,
         agent_origin: None,
         operator_baseline: None,
         rules: vec![
@@ -152,7 +169,10 @@ fn write_signed_manifest_one_rule(policy_dir: &Path, signing: &SigningKey) {
         manifest,
         signature: ManifestSignature {
             signature_scheme: SIGNATURE_SCHEME_V1.to_string(),
-            signing_key_id: "test".to_string(),
+            signing_key_id: castle_wall_daemon::crypto::castle_wall_signing_key_id(
+                &signing.verifying_key().to_bytes(),
+            )
+            .unwrap(),
             signature_b64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .encode(sig.to_bytes()),
         },
@@ -170,6 +190,7 @@ fn write_bad_signature_manifest(policy_dir: &Path, signing: &SigningKey) {
         schema_version: 1,
         fortress_id: "deadbeef".to_string(),
         issued_at: "2026-05-06T00:00:00Z".to_string(),
+        generation: 1,
         agent_origin: None,
         operator_baseline: None,
         rules: vec![ManifestRuleEntry {
@@ -186,7 +207,10 @@ fn write_bad_signature_manifest(policy_dir: &Path, signing: &SigningKey) {
         manifest,
         signature: ManifestSignature {
             signature_scheme: SIGNATURE_SCHEME_V1.to_string(),
-            signing_key_id: "test".to_string(),
+            signing_key_id: castle_wall_daemon::crypto::castle_wall_signing_key_id(
+                &signing.verifying_key().to_bytes(),
+            )
+            .unwrap(),
             signature_b64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .encode(bad_sig.to_bytes()),
         },
@@ -212,6 +236,11 @@ fn fresh_config(dir: &TempDir, signing: &SigningKey) -> DaemonConfig {
         no_wall_max_duration: Duration::from_secs(3600),
         wal_ttl: Duration::from_secs(86_400),
         wal_size_cap_bytes: 16 * 1024 * 1024,
+        trusted_service_uid: Some(unsafe { libc::geteuid() }),
+        // ISOLATION (AGENTS.md, "the operator's machine is not a fixture"): the
+        // host lock, ownership journal, and journal MAC key land in this run's
+        // temp root, never in /var/lib/sanctuary.
+        linux_runtime_paths: isolation::runtime_paths(),
     }
 }
 
@@ -219,6 +248,7 @@ fn fresh_config(dir: &TempDir, signing: &SigningKey) -> DaemonConfig {
 
 #[test]
 fn f3_startup_ipc_bind_fails_when_socket_path_is_a_regular_file() {
+    let _suite = isolation::guard();
     // Place a regular file at the socket path. IpcServer::start removes
     // stale UDS sockets but leaves non-socket files alone, so UnixListener
     // bind fails and surfaces as DaemonError::IpcBind.
@@ -254,6 +284,7 @@ fn f3_startup_ipc_bind_fails_when_socket_path_is_a_regular_file() {
 
 #[test]
 fn f4_startup_pinned_key_missing_refuses_to_start_with_f4_message() {
+    let _suite = isolation::guard();
     // Boot when the pinned-key file is absent. mode_for_error maps
     // PinnedKeyLoad to StartupPolicyParseFailed; disposition is RefuseToStart
     // with key F-4. This is the integration-level companion to the unit
@@ -289,6 +320,7 @@ fn f4_startup_pinned_key_missing_refuses_to_start_with_f4_message() {
 
 #[test]
 fn f4_bad_signature_manifest_at_boot_keeps_default_deny_at_first_evaluate() {
+    let _suite = isolation::guard();
     // boot() does a best-effort first manifest load. Bad signature -> the
     // store stays in current=None; the daemon comes up but the F-1 deny-by-
     // default invariant is preserved on the very first evaluate_attempt.
@@ -330,6 +362,7 @@ fn f4_bad_signature_manifest_at_boot_keeps_default_deny_at_first_evaluate() {
 
 #[test]
 fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
+    let _suite = isolation::guard();
     // Section 9 F-2: filter daemon crashed mid-session. The kernel ruleset
     // is the load-bearing enforcement surface; it persists across a daemon
     // crash so wrapped-agent traffic stays denied during the gap. This test
@@ -348,8 +381,7 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
     // Real agent scope so the production rule's cgroupv2 path lookup
     // succeeds at rule-load time.
     let scope = cgroup::create_agent_scope("f2-test").expect("create_agent_scope");
-    let cgroup_relative =
-        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
     let id = AgentRulesetId {
         agent_id: "f2-test".to_string(),
         cgroup_path: scope.cgroup_path.clone(),
@@ -358,23 +390,14 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
         rule_id: "r-f2".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script = nftables::build_agent_ruleset(
-        "f2-test",
-        &cgroup_relative,
-        scope.cgroup_level,
-        &frags,
-    );
-    nftables::load_agent_ruleset(
-        &id,
-        &script,
-        scope.cgroup_level,
-        &cgroup_relative,
-    )
-    .expect("load_agent_ruleset");
+    let script =
+        nftables::build_agent_ruleset("f2-test", &cgroup_relative, scope.cgroup_level, &frags);
+    nftables::load_agent_ruleset(&id, &script, scope.cgroup_level, &cgroup_relative)
+        .expect("load_agent_ruleset");
 
     // Sanity: the chain is in the kernel before the simulated crash.
     let pre = Command::new("nft")
-        .args(["list", "table", CASTLE_FAMILY, CASTLE_TABLE])
+        .args(["list", "table", CASTLE_FAMILY, isolation::table()])
         .output()
         .expect("pre-list");
     let pre_out = String::from_utf8_lossy(&pre.stdout);
@@ -387,7 +410,7 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
 
     // Kernel-side: chain still present.
     let post = Command::new("nft")
-        .args(["list", "table", CASTLE_FAMILY, CASTLE_TABLE])
+        .args(["list", "table", CASTLE_FAMILY, isolation::table()])
         .output()
         .expect("post-list");
     let post_out = String::from_utf8_lossy(&post.stdout);
@@ -397,7 +420,10 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
     );
 
     // Userspace side: the IPC socket is gone (proves the daemon really did drop).
-    assert!(!socket_path.exists(), "IPC socket should be removed on drop");
+    assert!(
+        !socket_path.exists(),
+        "IPC socket should be removed on drop"
+    );
 
     // Fresh boot finds the kernel rules still in place; idempotent install
     // is a no-op against the existing table.
@@ -407,11 +433,14 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
     let handle2 = boot(config2).expect("re-boot");
     nftables::install_castle_table().expect("install idempotent");
     let still_present = Command::new("nft")
-        .args(["list", "table", CASTLE_FAMILY, CASTLE_TABLE])
+        .args(["list", "table", CASTLE_FAMILY, isolation::table()])
         .output()
         .expect("re-list");
     let still_out = String::from_utf8_lossy(&still_present.stdout);
-    assert!(still_out.contains("agent_f2-test"), "rules persist into re-boot");
+    assert!(
+        still_out.contains("agent_f2-test"),
+        "rules persist into re-boot"
+    );
 
     // Verify the dispatch table for runtime crash is FailClosed.
     let disposition = default_disposition(FailureMode::RuntimeDaemonCrash);
@@ -432,6 +461,7 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
 
 #[test]
 fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
+    let _suite = isolation::guard();
     cleanup_castle_table();
     let dir = TempDir::new().unwrap();
     let signing = SigningKey::generate(&mut OsRng);
@@ -444,8 +474,7 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
     nftables::install_castle_table().expect("install");
 
     let scope = cgroup::create_agent_scope("f3-test").expect("create_agent_scope");
-    let cgroup_relative =
-        cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
     let id = AgentRulesetId {
         agent_id: "f3-test".to_string(),
         cgroup_path: scope.cgroup_path.clone(),
@@ -454,19 +483,9 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
         rule_id: "r-f3".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script = nftables::build_agent_ruleset(
-        "f3-test",
-        &cgroup_relative,
-        scope.cgroup_level,
-        &frags,
-    );
-    nftables::load_agent_ruleset(
-        &id,
-        &script,
-        scope.cgroup_level,
-        &cgroup_relative,
-    )
-    .expect("load");
+    let script =
+        nftables::build_agent_ruleset("f3-test", &cgroup_relative, scope.cgroup_level, &frags);
+    nftables::load_agent_ruleset(&id, &script, scope.cgroup_level, &cgroup_relative).expect("load");
 
     // Connect, handshake, then forcibly close the client side mid-session.
     let stream = connect_with_handshake(&socket_path, &signing, &fortress_id);
@@ -475,10 +494,13 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
     // Section 9 F-3 disposition: kernel up, IPC down -> fail-degraded for up
     // to 60s. The kernel ruleset is the load-bearing surface and remains
     // in place; the daemon does not shut itself down; reconnect succeeds.
-    assert!(!handle.is_shutdown_requested(), "daemon must stay up on IPC drop");
+    assert!(
+        !handle.is_shutdown_requested(),
+        "daemon must stay up on IPC drop"
+    );
 
     let kernel_after_drop = Command::new("nft")
-        .args(["list", "table", CASTLE_FAMILY, CASTLE_TABLE])
+        .args(["list", "table", CASTLE_FAMILY, isolation::table()])
         .output()
         .expect("post-drop list");
     let out = String::from_utf8_lossy(&kernel_after_drop.stdout);
@@ -504,14 +526,20 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
     let reply = recv_envelope(&mut stream2, &mut buf);
     match reply.params {
         IpcMessage::AuditDrainResponse { events, .. } => {
-            assert!(!events.is_empty(), "reconnected drain returns daemon_started");
+            assert!(
+                !events.is_empty(),
+                "reconnected drain returns daemon_started"
+            );
         }
         other => panic!("unexpected reply on reconnect: {other:?}"),
     }
 
     // Verify dispatch is FailDegraded (matches §9 F-3 "kernel up, IPC down").
     let disposition = default_disposition(FailureMode::RuntimeIpcDropKernelUp);
-    assert!(matches!(disposition, FailureDisposition::FailDegraded { .. }));
+    assert!(matches!(
+        disposition,
+        FailureDisposition::FailDegraded { .. }
+    ));
 
     drop(stream2);
     let _ = handle.stop();
@@ -523,6 +551,7 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
 
 #[test]
 fn f7_external_firewall_clobber_castle_table_is_restored_idempotently() {
+    let _suite = isolation::guard();
     // Section 9 F-7: a sibling process (ufw, firewalld, an operator running
     // `nft flush ruleset`) wipes the castle table mid-session. The
     // disposition is RestoreAndAudit: the daemon detects, restores, logs,
@@ -573,6 +602,7 @@ fn f7_external_firewall_clobber_castle_table_is_restored_idempotently() {
 
 #[test]
 fn f5_runtime_queue_saturated_disposition_emits_egress_blocked_queue_saturated() {
+    let _suite = isolation::guard();
     // Real packet-flow saturation requires sustained packet pressure with
     // a verdict loop running, which is fragile in CI. This test exercises
     // the two surfaces PR 2b ships:
@@ -617,6 +647,7 @@ fn f5_runtime_queue_saturated_disposition_emits_egress_blocked_queue_saturated()
 
 #[test]
 fn f1_dispatch_renders_filter_install_failure_message_for_operator() {
+    let _suite = isolation::guard();
     // Section 9 F-1 ("Filter daemon never started") has the strongest
     // refuse-to-start posture. Verify the chain mode_for_error -> dispatch
     // -> render produces the operator-facing message that names nftables
@@ -642,6 +673,7 @@ fn f1_dispatch_renders_filter_install_failure_message_for_operator() {
 
 #[test]
 fn audit_wal_append_failure_dispatch_is_fail_closed() {
+    let _suite = isolation::guard();
     // Companion to the failure.rs unit test
     // audit_wal_append_failure_fails_closed. The unit test runs on every
     // host; this integration-level repeat keeps the section 9 catalog
@@ -673,6 +705,7 @@ fn audit_wal_append_failure_dispatch_is_fail_closed() {
 
 #[test]
 fn wal_chain_corruption_at_open_refuses_to_start() {
+    let _suite = isolation::guard();
     // The WAL writer replays the file at open-time and verifies the
     // SHA-256 chain across entries. A corrupted (or hand-edited) WAL
     // surfaces as an open failure; the daemon refuses to come up rather
@@ -717,22 +750,38 @@ fn connect_with_handshake(
                     .expect("read challenge");
                 let envelope: MessageEnvelope = serde_json::from_str(&body).unwrap();
                 let nonce_b64 = match envelope.params {
-                    IpcMessage::HandshakeChallenge { nonce_b64url } => nonce_b64url,
+                    IpcMessage::HandshakeChallenge { nonce_b64url, .. } => nonce_b64url,
                     other => panic!("expected HandshakeChallenge, got {other:?}"),
                 };
-                let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(nonce_b64.as_bytes())
-                    .unwrap();
-                let signature = signing.sign(&nonce);
+                let nonce: [u8; CHALLENGE_NONCE_BYTES] =
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(nonce_b64.as_bytes())
+                        .unwrap()
+                        .try_into()
+                        .expect("challenge nonce has the protocol length");
+                let protocol_version =
+                    Some(castle_wall_daemon::ipc::messages::IPC_PROTOCOL_VERSION);
+                let capabilities: Vec<String> = castle_wall_daemon::ipc::messages::CAPABILITIES
+                    .iter()
+                    .map(|c| (*c).to_string())
+                    .collect();
+                let signature = signing.sign(&handshake_signing_bytes(
+                    &nonce,
+                    fortress_id,
+                    "test",
+                    protocol_version,
+                    &capabilities,
+                ));
                 let response = MessageEnvelope {
                     jsonrpc: "2.0".to_string(),
                     method: format!("{IPC_NAMESPACE}.handshake_response"),
                     params: IpcMessage::HandshakeResponse {
                         fortress_id: fortress_id.to_string(),
                         signing_key_id: "test".to_string(),
-                        nonce_signature_b64url:
-                            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                                .encode(signature.to_bytes()),
+                        nonce_signature_b64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .encode(signature.to_bytes()),
+                        protocol_version,
+                        capabilities,
                     },
                 };
                 send_envelope(&mut stream, &response);

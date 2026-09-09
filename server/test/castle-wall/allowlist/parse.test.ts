@@ -15,6 +15,8 @@ import {
 import { canonicalize } from "../../../src/mesh/canonical-json.js";
 import { toBase64url, stringToBytes } from "../../../src/core/encoding.js";
 import {
+  castleWallSigningKeyId,
+  legacyCastleWallSigningKeyId,
   verifyManifestSignature,
   verifyAndParseRules,
   type RuleFileBytes,
@@ -84,7 +86,7 @@ function buildSignedManifest(ruleIds: string[]): Fixture {
     manifest,
     signature: {
       signature_scheme: CASTLE_WALL_SIGNATURE_SCHEME_V1,
-      signing_key_id: toBase64url(sha256(publicKey)).slice(0, 16),
+      signing_key_id: castleWallSigningKeyId(publicKey),
       signature_b64url: toBase64url(signature),
     },
   };
@@ -93,10 +95,30 @@ function buildSignedManifest(ruleIds: string[]): Fixture {
 }
 
 describe("castle-wall/allowlist/parse : manifest signature", () => {
+  it("derives the same canonical signing-key fingerprint as Rust", () => {
+    const publicKey = Uint8Array.from(
+      "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+        .match(/../g)!
+        .map((byte) => Number.parseInt(byte, 16))
+    );
+    expect(castleWallSigningKeyId(publicKey)).toBe("21fe31dfa154a261");
+  });
+
   it("verifies a well-formed signed manifest", () => {
     const f = buildSignedManifest(["rule-a", "rule-b"]);
     const result = verifyManifestSignature(f.signed, f.pinnedPubkey);
     expect(result.ok).toBe(true);
+  });
+
+  it("accepts the one-release legacy key id while keeping the canonical publisher id", () => {
+    const f = buildSignedManifest(["rule-a"]);
+    const canonical = castleWallSigningKeyId(f.pinnedPubkey);
+    const legacy = legacyCastleWallSigningKeyId(f.pinnedPubkey);
+    expect(legacy).toMatch(/^castle-wall:/);
+    expect(legacy).not.toBe(canonical);
+    f.signed.signature.signing_key_id = legacy;
+    expect(verifyManifestSignature(f.signed, f.pinnedPubkey).ok).toBe(true);
+    expect(castleWallSigningKeyId(f.pinnedPubkey)).toBe(canonical);
   });
 
   it("rejects a manifest signed by an unrelated key", () => {
@@ -104,6 +126,14 @@ describe("castle-wall/allowlist/parse : manifest signature", () => {
     const wrongPub = ed25519.getPublicKey(ed25519.utils.randomSecretKey());
     const result = verifyManifestSignature(f.signed, wrongPub);
     expect(result.ok).toBe(false);
+  });
+
+  it("rejects a valid signature whose signing-key identifier was relabelled", () => {
+    const f = buildSignedManifest(["rule-a"]);
+    f.signed.signature.signing_key_id = "castle-wall:attacker-label";
+    const result = verifyManifestSignature(f.signed, f.pinnedPubkey);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("signing_key_id");
   });
 
   it("rejects unsupported signature_scheme", () => {
@@ -212,7 +242,7 @@ describe("castle-wall/allowlist/parse : rule body verification", () => {
       manifest,
       signature: {
         signature_scheme: CASTLE_WALL_SIGNATURE_SCHEME_V1,
-        signing_key_id: "test",
+        signing_key_id: castleWallSigningKeyId(publicKey),
         signature_b64url: toBase64url(sig),
       },
     };

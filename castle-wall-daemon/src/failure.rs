@@ -6,6 +6,11 @@
 //! pure mapping; PR 2b wires the watchdogs (process-supervisor restart on
 //! daemon crash, IPC-drop detection, external-firewall-rule clobber sweep).
 
+/// Production cadence for the explicitly degraded manifest polling fallback.
+/// Shared with daemon activation so the declared disposition cannot drift from
+/// the runtime timer.
+pub const MANIFEST_WATCHER_POLL_INTERVAL_MS: u32 = 2_000;
+
 /// Every named failure mode the Castle Wall recognizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureMode {
@@ -22,10 +27,14 @@ pub enum FailureMode {
     /// force, surface error to operator. Distinct from F-4 startup failure
     /// which refuses to start.
     RuntimeManifestVerifyFailed,
-    /// inotify subscription or watcher loop failed; daemon is degraded to
-    /// periodic mtime polling at 1s interval. Enforcement is unaffected;
-    /// reload latency increases.
-    RuntimeManifestWatcherDegraded,
+    /// The initial inotify subscription failed, but the synchronously validated
+    /// fallback watcher is running at the declared 2-second polling cadence.
+    /// The fallback is accepted only after its degradation audit is durable.
+    RuntimeManifestWatcherInitDegraded,
+    /// A watcher that was already live lost its ability to observe policy files.
+    /// This is fatal to runtime readiness: the daemon exits nonzero and relies on
+    /// systemd `Restart=on-failure`, never silently switching modes mid-session.
+    RuntimeManifestWatcherLost,
     /// Daemon-side WAL append failed (filesystem error, permission denied,
     /// disk full). The audit ring buffer absorbs the event in memory; if
     /// the buffer overflows the next ACK carries a wal_overflow_loss
@@ -60,6 +69,11 @@ pub enum FailureDisposition {
     /// the degradation; reload still works, just with higher latency.
     DegradeWatcherToPoll {
         poll_interval_ms: u32,
+    },
+    /// A required runtime capability was lost after readiness. Record the loss,
+    /// tear down in order, and exit nonzero so the service manager restarts it.
+    TerminateForRestart {
+        emit_event: &'static str,
     },
 }
 
@@ -97,8 +111,13 @@ pub fn default_disposition(mode: FailureMode) -> FailureDisposition {
         FailureMode::RuntimeManifestVerifyFailed => FailureDisposition::KeepPriorAndAudit {
             emit_event: "manifest_verify_failed_kept_prior",
         },
-        FailureMode::RuntimeManifestWatcherDegraded => FailureDisposition::DegradeWatcherToPoll {
-            poll_interval_ms: 1_000,
+        FailureMode::RuntimeManifestWatcherInitDegraded => {
+            FailureDisposition::DegradeWatcherToPoll {
+                poll_interval_ms: MANIFEST_WATCHER_POLL_INTERVAL_MS,
+            }
+        }
+        FailureMode::RuntimeManifestWatcherLost => FailureDisposition::TerminateForRestart {
+            emit_event: "kernel_runtime_lost",
         },
         FailureMode::RuntimeAuditWalAppendFailed => FailureDisposition::FailClosed {
             emit_event: "egress_blocked",
@@ -155,13 +174,24 @@ mod tests {
     }
 
     #[test]
-    fn watcher_degradation_emits_poll_disposition() {
-        let d = default_disposition(FailureMode::RuntimeManifestWatcherDegraded);
+    fn watcher_init_degradation_emits_two_second_poll_disposition() {
+        let d = default_disposition(FailureMode::RuntimeManifestWatcherInitDegraded);
         match d {
             FailureDisposition::DegradeWatcherToPoll { poll_interval_ms } => {
-                assert_eq!(poll_interval_ms, 1_000);
+                assert_eq!(poll_interval_ms, MANIFEST_WATCHER_POLL_INTERVAL_MS);
             }
             _ => panic!("expected DegradeWatcherToPoll"),
+        }
+    }
+
+    #[test]
+    fn watcher_capability_loss_is_fatal_and_requests_restart() {
+        let d = default_disposition(FailureMode::RuntimeManifestWatcherLost);
+        match d {
+            FailureDisposition::TerminateForRestart { emit_event } => {
+                assert_eq!(emit_event, "kernel_runtime_lost");
+            }
+            _ => panic!("expected TerminateForRestart"),
         }
     }
 

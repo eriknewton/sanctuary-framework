@@ -42,8 +42,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { ed25519 } from "@noble/curves/ed25519";
-
 import {
   CASTLE_WALL_PRODUCER_SIG_DOMAIN_PREFIX,
   CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
@@ -52,20 +50,33 @@ import {
   ED25519_PUBLIC_KEY_BYTES,
   ED25519_SIGNATURE_BYTES,
 } from "../../core/crypto-suite-registry.js";
+import { verify as verifyStrictEd25519 } from "../../core/identity.js";
 
 const ENCODER = new TextEncoder();
 
 /**
- * The canonical relative location, under a fortress storage path, of the
- * audit-producer public key the Linux daemon publishes. The daemon writes its
- * 32-byte verifying key world-readable here (see `producer_pub_key_path` in
- * `castle-wall-daemon/src/config.rs`, whose default `policy/egress` segment this
- * mirrors). Both the audit CONSUMER and the read-side posture/feature-health
- * READERS resolve the pinned key through this SINGLE constant so they can never
- * diverge onto different bases: "a reader must never read with a weaker basis
- * than the consumer wrote with" (Slice P).
+ * Legacy/test fortress-relative producer-public-key location. The hardened
+ * Linux server profile uses `resolveLinuxSystemProducerPubKeyPath` instead so
+ * its non-root broker can traverse to the public half without gaining access to
+ * root-only policy/private-key state. macOS and hermetic fixtures retain this
+ * relative layout, and their audit consumer/readers still share this one
+ * constant so they cannot diverge onto different verification bases.
  */
 export const CASTLE_WALL_PRODUCER_PUBKEY_RELPATH = "policy/egress/audit-producer.pub";
+export const CASTLE_WALL_LINUX_STATE_ROOT = "/var/lib/sanctuary";
+export const CASTLE_WALL_LINUX_RUNTIME_ROOT = "/run/sanctuary";
+
+/**
+ * Root-published producer public key for the pre-provisioned Linux service.
+ * Only the public half lives in the broker-traversable runtime directory; the
+ * private seed stays under the root-only `/var/lib/sanctuary` state tree.
+ */
+export function resolveLinuxSystemProducerPubKeyPath(fortressId: string): string {
+  if (!/^[a-f0-9]{8,64}$/.test(fortressId)) {
+    throw new Error("fortress id is outside the canonical lowercase-hex grammar");
+  }
+  return join(CASTLE_WALL_LINUX_RUNTIME_ROOT, fortressId, "audit-producer.pub");
+}
 
 /** Host-wide macOS custody directory owned by the root helper. */
 export const CASTLE_WALL_MACOS_GLOBAL_PINNED_PUBKEY_DIR =
@@ -79,12 +90,10 @@ export const CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH =
   `${CASTLE_WALL_MACOS_GLOBAL_PINNED_PUBKEY_DIR}/castle-audit-producer.pub`;
 
 /**
- * Resolve the absolute path to the published audit-producer public key for a
- * fortress rooted at `storagePath`. The daemon must be launched with its
- * `--producer-pub-key` (or `--policy-dir`) pointed at this same location so the
- * key it publishes is the key the in-process server pins (Slice P provisioning
- * contract). Centralizing the path here is what keeps the consumer and the
- * readers on one source of truth.
+ * Resolve the legacy fortress-relative producer-key path used by macOS and
+ * test fixtures. Linux server activation must use
+ * `resolveLinuxSystemProducerPubKeyPath`; it never trusts this caller-writable
+ * tree as the producer-key authority.
  */
 export function resolveProducerPubKeyPath(storagePath: string): string {
   return join(storagePath, CASTLE_WALL_PRODUCER_PUBKEY_RELPATH);
@@ -98,21 +107,10 @@ export const CASTLE_WALL_PRODUCER_PRIVKEY_RELPATH =
 export const CASTLE_WALL_POLICY_DIR_RELPATH = "policy/egress";
 
 /**
- * The daemon-launch argv that BINDS the Linux daemon's key-publish location to
- * the fortress storage path the in-process TS server reads from, closing the
- * daemon↔TS path divergence (codex HIGH #2). Without this the daemon's default
- * `/var/lib/sanctuary/<id>/...` publish path and the TS `<storage_path>/...`
- * read path differ, so the TS side sees `absent` while the daemon signs and the
- * close silently never activates.
- *
- * Any launcher that starts the Linux daemon for a fortress MUST splice these
- * args (in addition to `--fortress-id`, `--socket-path`, etc.) so the published
- * `audit-producer.pub` lands at exactly `resolveProducerPubKeyPath(storagePath)`.
- * Deriving both halves here from ONE input is what makes the binding
- * correct-by-construction rather than a convention a launcher can forget.
- *
- * Mirrors the daemon's `--policy-dir`, `--producer-key`, `--producer-pub-key`
- * flags (`castle-wall-daemon/src/config.rs`).
+ * Legacy/pure installer helper retained for macOS fixtures. The Linux runtime
+ * launcher must not call it: the pre-provisioned server profile fixes all
+ * privileged paths under `/var/lib/sanctuary/<fortress-id>` and rejects
+ * overrides.
  */
 export function producerKeyDaemonLaunchArgs(storagePath: string): string[] {
   return [
@@ -150,6 +148,8 @@ export type ProducerKeyLoad =
 export interface ProducerKeyLoadOptions {
   platform?: NodeJS.Platform;
   macosProducerPubKeyPath?: string;
+  /** Explicit root-owned service key path for Linux server enforcement. */
+  linuxProducerPubKeyPath?: string;
 }
 
 /**
@@ -176,6 +176,9 @@ export async function loadFortressProducerKey(
         CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH,
     );
     if (macosLoad.status !== "absent") return macosLoad;
+  }
+  if (platform === "linux" && options.linuxProducerPubKeyPath) {
+    return loadProducerKeyFromPath(options.linuxProducerPubKeyPath);
   }
   return loadProducerKeyFromPath(resolveProducerPubKeyPath(storagePath));
 }
@@ -223,7 +226,8 @@ export function toBase64url(bytes: Uint8Array): string {
 /**
  * Load the daemon's published audit-producer public key from disk and return
  * it as base64url-no-pad. The file holds 32 raw Ed25519 verifying-key bytes
- * (the daemon writes it world-readable at `<policy_dir>/audit-producer.pub`).
+ * (the server daemon writes it beneath the broker-traversable runtime directory;
+ * legacy/test callers may still supply the fortress-relative path explicitly).
  * Throws if the file is missing or not exactly 32 bytes; a caller that wants
  * L1 enforcement MUST get a valid key or fail, never silently degrade.
  */
@@ -361,7 +365,7 @@ export function verifyProducerSignature(
       input.capturedAtUnixMs,
       input.seq
     );
-    if (!ed25519.verify(sig, message, key)) {
+    if (!verifyStrictEd25519(message, sig, key)) {
       return { ok: false, reason: "producer_signature_verification_failed" };
     }
     return { ok: true };

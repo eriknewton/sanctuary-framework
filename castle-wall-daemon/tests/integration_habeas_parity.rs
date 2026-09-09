@@ -64,13 +64,10 @@ fn rust_gate_agrees_with_shared_parity_fixture() {
     assert!(!fixture.cases.is_empty(), "fixture has no cases");
 
     for case in &fixture.cases {
-        let webhook = case
-            .webhook
-            .as_ref()
-            .map(|w| HabeasWebhookTarget {
-                host: w.host.clone(),
-                port: w.port,
-            });
+        let webhook = case.webhook.as_ref().map(|w| HabeasWebhookTarget {
+            host: w.host.clone(),
+            port: w.port,
+        });
         let issues = find_habeas_conflicts(&case.rules, webhook.as_ref());
         let conflicted = !issues.is_empty();
         assert_eq!(
