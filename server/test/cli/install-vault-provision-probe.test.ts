@@ -23,6 +23,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ExclusiveEgressStatus } from "../../src/egress-gate/posture.js";
 
 const statusScript = vi.hoisted(() => ({
   text: "",
@@ -47,6 +48,7 @@ const { createInstallOps } = await import("../../src/cli/install.js");
 const { CASTLE_WALL_NOT_YET_WALLED, castleWallProvisionRecordPath } = await import(
   "../../src/castle-wall/provision-state.js"
 );
+const { failedExclusiveEgressStatus } = await import("../../src/egress-gate/posture.js");
 
 // The authoritative verdict lines `reportGlobalPinAndVerdict` prints. Must match
 // the constants in cli/install.ts; a drift here would make this test pass
@@ -71,13 +73,24 @@ describe("the production install probe reads THIS vault's wall state", () => {
 
   const probeFortress = async (
     contents: string | null,
+    // Defaults to the pre-existing "no exclusive-egress evidence" behavior
+    // (undefined/null = no cap) so these anchor/enforcement-focused tests stay
+    // hermetic: the PRODUCTION default (no override) reaches the real S5-P
+    // producer (`egress-gate/arming-wiring.ts`
+    // createExclusiveEgressPostureProducer), whose registry component is a
+    // single ROOT-OWNED, machine-wide file, never fortress-scoped -- exercising
+    // it for real here would make these tests observe whatever fine-grained
+    // agents happen to be provisioned on the host running the suite. The cap
+    // itself is proven separately below via this same injection seam.
+    resolveExclusiveEgress: (() => Promise<ExclusiveEgressStatus | null>) | undefined = async () =>
+      null,
   ): Promise<Awaited<ReturnType<ReturnType<typeof createInstallOps>["probe"]>>> => {
     const fortress = join(tmp, `f-${statusScript.calls.length}-${Date.now()}`);
     await mkdir(join(fortress, "state", "_meta"), { recursive: true, mode: 0o700 });
     if (contents !== null) {
       await writeFile(castleWallProvisionRecordPath(fortress), contents, { mode: 0o600 });
     }
-    const ops = createInstallOps({ platform: "darwin", env: {} });
+    const ops = createInstallOps({ platform: "darwin", env: {}, resolveExclusiveEgress });
     return await ops.probe({ profile: "full", harness: "claude-code", fortress });
   };
 
@@ -122,5 +135,49 @@ describe("the production install probe reads THIS vault's wall state", () => {
     expect((await probeFortress("walled")).vaultProvision).toBe("unreadable");
     expect((await probeFortress("")).vaultProvision).toBe("unreadable");
     expect((await probeFortress(null)).vaultProvision).toBe("unknown");
+  });
+
+  // Codex round-3 gate (2026-09-09): the production probe computed
+  // `deriveInstallVaultProvision` without ever supplying `exclusiveEgress`, so
+  // this planner could report `walled`/`complete` in exactly the scenario the
+  // canonical posture (`principal-policy/posture.ts` `applyExclusiveEgress`)
+  // reports as the DISTINCT non-green `coarse_only` / `not_yet_walled`: a
+  // consistent anchor, live enforcement, and a fine-grained-provisioned agent
+  // whose exclusive-egress stack is not live. These tests pin the fix at the
+  // wiring boundary (`resolveInstallExclusiveEgressStatus` in cli/install.ts):
+  // whatever the injected producer reports, the SAME cap the dashboard applies
+  // must reach this planner's verdict.
+  describe("wires the S5-P exclusive-egress producer into the production probe", () => {
+    const LIVE_UNCAPPED: ExclusiveEgressStatus = {
+      fine_grained_declared: true,
+      exclusive_egress_live: true,
+      mode: "exclusive",
+      agents: [],
+      reasons: [],
+    };
+
+    it("a fine-grained agent whose exclusive-egress stack is not live: never walled, even with a consistent anchor and live enforcement", async () => {
+      statusScript.text = `${ANCHOR_CONSISTENT}\n${ENFORCEMENT_LIVE}\n`;
+      const result = await probeFortress(CASTLE_WALL_NOT_YET_WALLED, async () =>
+        failedExclusiveEgressStatus("test: exclusive-egress stack not live"),
+      );
+      expect(result.trustAnchor).toBe("consistent");
+      expect(result.enforcement).toBe("live");
+      expect(result.vaultProvision).not.toBe("walled");
+    });
+
+    it("a fine-grained agent whose exclusive-egress stack IS live: walled, same as the uncapped case", async () => {
+      statusScript.text = `${ANCHOR_CONSISTENT}\n${ENFORCEMENT_LIVE}\n`;
+      const result = await probeFortress(CASTLE_WALL_NOT_YET_WALLED, async () => LIVE_UNCAPPED);
+      expect(result.vaultProvision).toBe("walled");
+    });
+
+    it("the producer throws: fails closed, never walled (must not silently read as 'no fine-grained agent')", async () => {
+      statusScript.text = `${ANCHOR_CONSISTENT}\n${ENFORCEMENT_LIVE}\n`;
+      const result = await probeFortress(CASTLE_WALL_NOT_YET_WALLED, async () => {
+        throw new Error("gate liveness socket unreachable");
+      });
+      expect(result.vaultProvision).not.toBe("walled");
+    });
   });
 });

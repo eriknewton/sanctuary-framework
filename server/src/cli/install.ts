@@ -58,6 +58,7 @@ import {
 // `arm_state` a would-be `armed` wall caps to `coarse_only` under.
 import {
   exclusiveEgressCapsAggregateGreen,
+  failedExclusiveEgressStatus,
   type ExclusiveEgressStatus,
 } from "../egress-gate/posture.js";
 // The sealed-runtime contract shared with the build gate and the manifest
@@ -484,6 +485,19 @@ export interface InstallCommandContext {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   ops?: Partial<AgentInstallOps>;
+  /**
+   * Test-only override for the S5-P exclusive-egress posture read, mirroring
+   * the `resolveExclusiveEgress` injection seam `wrap/cli.ts` and its tests
+   * already use. Production callers never set this: the real path always
+   * reaches the SAME producer `dashboard-standalone.ts` binds on darwin
+   * (`egress-gate/arming-wiring.ts` `createExclusiveEgressPostureProducer`).
+   * That producer's registry component is a single ROOT-OWNED, machine-wide
+   * file, never fortress-scoped, so exercising the real producer in a test
+   * would observe whatever fine-grained agents happen to be provisioned on
+   * the host running the suite; this seam lets a test supply a controlled
+   * verdict instead, exactly as the dashboard's own tests do.
+   */
+  resolveExclusiveEgress?: () => Promise<ExclusiveEgressStatus | null>;
 }
 
 const HARNESSES = new Set<InstallHarness>([
@@ -871,12 +885,15 @@ export function parseTrustAnchor(text: string): TrustAnchorObservation {
  * as armed: a consistent anchor + live availability + a fine-grained agent
  * whose exclusive-egress stack was NOT live derived `walled`/`complete` here
  * while the canonical posture derived the distinct non-green `coarse_only` /
- * `not_yet_walled`. `exclusiveEgress` closes that: `undefined`/`null` (this
- * probe observes no exclusive-egress evidence today — no producer is wired on
- * the install-probe path) applies NO cap, matching the canonical "no producer
- * wired = no fine-grained agent exists = unchanged behavior" bound already
- * stated on `exclusiveEgressCapsAggregateGreen` itself; a caller that DOES
- * have the evidence gets the identical cap the dashboard renders.
+ * `not_yet_walled`. `exclusiveEgress` closes that: the PRODUCTION probe now
+ * wires the same producer the dashboard binds
+ * (`resolveInstallExclusiveEgressStatus`, see its doc for the derivation), so
+ * `undefined`/`null` here means only what it means everywhere else in the
+ * tree -- no fine-grained agent has ever been provisioned on this fortress --
+ * matching the canonical "no producer wired = no fine-grained agent exists =
+ * unchanged behavior" bound already stated on
+ * `exclusiveEgressCapsAggregateGreen` itself; a caller that DOES have the
+ * evidence gets the identical cap the dashboard renders.
  *
  * Failure mode this replaced: the probe passed a hardcoded `armed: "unknown"`,
  * so NO vault could ever derive `walled` here and the planner emitted
@@ -1150,6 +1167,60 @@ export async function probeCustodyAccess(
 }
 
 /**
+ * Resolve the S5-P exclusive-egress posture for the install probe, reusing
+ * the SAME producer `dashboard-standalone.ts` binds on darwin
+ * (`egress-gate/arming-wiring.ts` `createExclusiveEgressPostureProducer`),
+ * never a second implementation, so `deriveInstallVaultProvision`'s cap can
+ * never diverge from `applyExclusiveEgress`'s cap on the same host at the
+ * same moment.
+ *
+ * `coarseWallArmed` reuses THIS probe's own already-trusted
+ * enforcement-availability evidence (`wall.enforcement === "live"`) rather
+ * than the dashboard's audit-log-based
+ * `probeCoarseCastleWallEnforcementObserved`: that satisfies
+ * `ExclusiveEgressPostureInput.coarse_wall_armed`'s own contract ("the
+ * caller derives it from the same evidence surface it already trusts"),
+ * and this probe is read-only and ambient-env-blind by design (see
+ * `probeCustodyAccess` below) -- it must never open the encrypted audit log,
+ * which needs an unwrapped master key this subprocess does not hold.
+ *
+ * FAIL-CLOSED: a producer throw maps to `failedExclusiveEgressStatus` here,
+ * the IDENTICAL contract `principal-policy/dashboard.ts`'s
+ * `resolveExclusiveEgressPosture` applies, so a read failure caps green
+ * rather than silently reading "no fine-grained agent."
+ *
+ * `override` is the test-only injection seam (`InstallCommandContext.
+ * resolveExclusiveEgress`); production callers never set it.
+ */
+async function resolveInstallExclusiveEgressStatus(
+  fortress: string,
+  coarseWallArmed: boolean,
+  override?: () => Promise<ExclusiveEgressStatus | null>,
+): Promise<ExclusiveEgressStatus | null> {
+  // The fail-closed catch wraps BOTH sources (test override and the real
+  // producer): the contract is "a resolution attempt that throws caps green",
+  // not "only the production path is allowed to fail closed" -- a throwing
+  // override must observe the identical behavior a throwing production
+  // producer does, the same shared-boundary shape `wrap/cli.ts`'s
+  // `probeCastleWallProtectionClaim` uses for its own injected resolver.
+  try {
+    if (override) return await override();
+    const { createExclusiveEgressPostureProducer } = await import(
+      "../egress-gate/arming-wiring.js"
+    );
+    const producer = createExclusiveEgressPostureProducer({
+      fortressPath: fortress,
+      coarseWallArmed: async () => coarseWallArmed,
+    });
+    return await producer();
+  } catch (err) {
+    return failedExclusiveEgressStatus(
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
+/**
  * The PRODUCTION probe wiring, exported so a test can exercise the real object
  * graph rather than an injected `ctx.ops`.
  *
@@ -1237,19 +1308,21 @@ export function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
             ? probeOperatorTwin(env, platform)
             : Promise.resolve("not-applicable" as const),
         ]);
-      // HONEST BOUND: this read-only probe does not resolve the S5-P
-      // exclusive-egress posture (its producer is wired only on the dashboard
-      // path, `dashboard-standalone.ts`, over root-owned runtime state this
-      // subprocess probe has no reason to touch). Passing no observation
-      // applies NO cap here, exactly as `exclusiveEgressCapsAggregateGreen`
-      // documents for "no producer wired" — honest for the common host with no
-      // fine-grained exclusive-egress agent, and a residual (not yet a
-      // regression) for one that has provisioned one: tracked as a follow-up
-      // to wire a real probe into this path, never silently claimed complete.
+      // Must match `dashboard-standalone.ts`'s S5-P producer binding and
+      // `principal-policy/dashboard.ts`'s `resolveExclusiveEgressPosture`
+      // fail-closed contract: see `resolveInstallExclusiveEgressStatus` above
+      // for the full derivation and why `coarseWallArmed` differs from the
+      // dashboard's audit-based probe.
+      const exclusiveEgress = await resolveInstallExclusiveEgressStatus(
+        fortress,
+        wall.enforcement === "live",
+        ctx.resolveExclusiveEgress,
+      );
       const vaultProvision = deriveInstallVaultProvision({
         trustAnchor: wall.trustAnchor,
         enforcement: wall.enforcement,
         persisted: vaultClaim.state,
+        exclusiveEgress,
       });
       return {
         cooperativeWrap,
