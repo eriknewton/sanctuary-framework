@@ -66,14 +66,17 @@ import {
 import { ON_EVICT_AUDIT_TIMEOUT_MS } from "../../src/core/bounded-map.js";
 import { generateSHR } from "../../src/shr/generator.js";
 
-// Owner token for the tests below that install fake timers. Runner-owned
-// cleanup: if such a test times out with an await still pending, vitest
-// rejects the wrapper WITHOUT unwinding the callback, so the test's own
-// `finally` never runs and the next test would inherit a frozen clock. This
-// afterEach restores real timers regardless (idempotent when timers are
-// already real) and clears the owner, so a late continuation of the timed-out
-// body sees it no longer owns the clock and neither advances nor restores
-// another test's time.
+// Clock ownership for the tests below that install fake timers. Runner-owned
+// cleanup: if a test times out with an await still pending, vitest rejects the
+// wrapper WITHOUT unwinding the callback, so the test's own `finally` never
+// runs and the next test would inherit a frozen clock. This afterEach restores
+// real timers regardless (idempotent when timers are already real) and clears
+// the owner. The expires_at proof additionally claims ownership as its FIRST
+// statement (before any await) and re-checks it before freezing, before
+// jumping, and before restoring, so a late continuation of its timed-out body
+// can neither install nor move nor restore a clock a later test owns. The two
+// older fake-timer tests further down get only the afterEach cleanup; their
+// own unconditional restores after a late resumption are a tracked residual.
 let frozenClockOwner: symbol | null = null;
 afterEach(() => {
   frozenClockOwner = null;
@@ -476,6 +479,11 @@ describe("2. handshake results: capped + per-session fair + expires_at-aware evi
   it(
     "MUTATION-PROOF TARGET (expires_at): refuses a new result while every slot holds a live verified peer, then EVICTS one once they expire — never blind-FIFOs a live peer",
     async () => {
+      // Claim clock ownership BEFORE the first await: a body that times out
+      // during setup and resumes later must not be able to mint itself a
+      // fresh token after the runner's afterEach has cleared the owner.
+      const clockOwner = Symbol("expires_at-proof clock owner");
+      frozenClockOwner = clockOwner;
       // Short SHR validity (test-only override) so the 1000 filler entries
       // carry a near expires_at that one frozen-clock jump below can push
       // into the past together, without waiting the real 1-hour default.
@@ -555,8 +563,11 @@ describe("2. handshake results: capped + per-session fair + expires_at-aware evi
       // never race SHR_VALIDITY_MS and evict a filler entry mid-fill. The
       // property under test is refuse-while-live then evict-after-expiry,
       // never a wall-clock budget the fill has to beat.
-      const clockOwner = Symbol("expires_at-proof clock owner");
-      frozenClockOwner = clockOwner;
+      if (frozenClockOwner !== clockOwner) {
+        throw new Error(
+          "clock ownership was revoked during setup (this test timed out and the runner moved on); refusing to install fake timers under a later test"
+        );
+      }
       vi.useFakeTimers({ toFake: ["Date"] });
       try {
         // Fill handshakeResults to EXACTLY the global cap, spread across
