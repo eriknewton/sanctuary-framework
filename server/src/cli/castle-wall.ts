@@ -4,10 +4,11 @@ import {
   spawnSync as nodeSpawnSync,
 } from "node:child_process";
 import { createConnection } from "node:net";
+import { createInterface } from "node:readline";
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, stat, unlink } from "node:fs/promises";
 import { constants as fsConstants, readFileSync as nodeReadFileSync } from "node:fs";
-import { homedir, platform, tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
@@ -25,6 +26,15 @@ import {
   type ShimInvoker,
 } from "../castle-wall/runtime/helper-signer.js";
 import { resolveFortressCreateOwner } from "../castle-wall/runtime/fortress-create-owner.js";
+// The vault-level wall claim (written by wrap/init.ts). `status` READS it and
+// never writes it: `walled` has no writer anywhere by design.
+import {
+  CASTLE_WALL_NOT_YET_WALLED,
+  CASTLE_WALL_NOT_YET_WALLED_SENTENCE,
+  CASTLE_WALL_PROVISION_UNREADABLE_MESSAGE,
+  castleWallProvisionRecordPath,
+  readPersistedCastleWallProvision,
+} from "../castle-wall/provision-state.js";
 import { resolveStoragePath } from "../paths.js";
 import { getSanctuaryVersion } from "../version.js";
 import {
@@ -56,7 +66,6 @@ import {
   type PerRuleGroup,
 } from "../castle-wall/audit/per-rule-report.js";
 import { frame, parseFrame } from "../castle-wall/ipc/framing.js";
-import { writeGlobalPinIfUnestablished } from "../castle-wall/global-pin/index.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import {
   DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
@@ -135,6 +144,35 @@ export { requestPolicyReload, type PolicyReloadResult };
  * would let init compare against a file Castle Wall does not write.
  */
 export const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
+
+/**
+ * The word the operator types to confirm `castle-wall re-pin`. A word, not a
+ * bare "y": the failure mode this exists for is a stray keystroke or a
+ * one-character answer left in a paste buffer moving the whole machine's trust
+ * anchor. Displayed in the prompt, so it is never a guess.
+ *
+ * CROSS-FILE CONTRACT: must match `rePinConfirmationWord` in
+ * `castle-wall-macos/Sources/CastleWallSignerClient/main.swift`. The native shim
+ * is a SECOND executable entry point to the same anchor migration (the TS CLI
+ * `execFile`s it, but anything that can reach the app bundle can run it
+ * directly), so both entry points must ask for the same word. A drift leaves one
+ * gate asking for a word the operator was never shown; the parity test
+ * `test/castle-wall/re-pin-confirmation-parity.test.ts` reads BOTH sources and
+ * fails on a mismatch.
+ */
+export const RE_PIN_CONFIRMATION_WORD = "re-pin";
+
+/**
+ * Deadline for the `re-pin` shim call, which now includes an operator reading a
+ * prompt and typing a word.
+ *
+ * 120_000 = 2 minutes, derived as "long enough for a person who has just been
+ * asked to confirm a machine-wide trust-anchor migration to read the prompt and
+ * type it", not as a signing bound. Every other shim call keeps the 10s default
+ * in `castle-wall/runtime/helper-signer.ts`, which is the daemon's liveness
+ * contract and must not be relaxed.
+ */
+const RE_PIN_SHIM_CONFIRMATION_TIMEOUT_MS = 120_000;
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
 const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = "/Library/Application Support/Sanctuary";
 export const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}/${CASTLE_PINNED_PUBKEY}`;
@@ -171,6 +209,15 @@ export interface CastleWallCommandContext {
    */
   readFileSyncFn?: (path: string) => string;
   getuid?: () => number;
+  /**
+   * TEST SEAM ONLY for the `re-pin` confirmation gate (house pattern, mirroring
+   * `rotate-master.ts` `args.stdin` and `reset-passphrase.ts`): supply the
+   * stream the typed confirmation is read from so the gate can be driven
+   * without a real terminal. Production leaves this undefined, and the gate
+   * then REQUIRES `process.stdin.isTTY`. There is deliberately no environment
+   * override; see `confirmRePinInteractively`.
+   */
+  confirmStdin?: NodeJS.ReadableStream;
   /** Path to the signer-client shim (re-pin). Defaults to env. */
   signerClientPath?: string;
   /** Override the shim runner (tests drive re-pin without a real helper). */
@@ -1083,12 +1130,18 @@ export async function runProvisionPinAlreadyLocked(
   const storagePath = resolveFortressArg(parsed.fortress, env);
   const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
   const privPath = join(storagePath, CASTLE_PINNED_PRIVKEY);
-  // Reuse the existing globalPinnedPublicKeyPath test seam (already threaded
-  // through the F1 safe-mode daemon path above) instead of adding a new ctx
-  // field: tests point this at a temp file so the fail-open regression test
-  // below can drive the guard without a real root-owned path.
-  const globalPinPath =
-    ctx.globalPinnedPublicKeyPath ?? CASTLE_GLOBAL_PINNED_PUBKEY_PATH;
+  // INVARIANT (one anchor writer): provision-pin mints and publishes THIS
+  // FORTRESS's local Castle key pair and nothing else. It does not read,
+  // compare, or write the machine-wide enforcement anchor at
+  // CASTLE_GLOBAL_PINNED_PUBKEY_PATH. In production the daemon signs through
+  // the root signer helper (castle-wall/runtime/macos-daemon.ts loadSigningKey)
+  // and the trust anchor is DEFINED as "machine-wide pin == signer-helper key"
+  // (cli/install.ts parseTrustAnchor), so publishing a fortress-local key there
+  // could only ever contradict that definition: on a fresh host it wrote a key
+  // re-pin then had to overwrite, and on any host that was ever armed it
+  // refused, failing every default init on that machine. The ONLY writer of the
+  // machine-wide anchor is the helper's installPin(), reached only through the
+  // confirmed `castle-wall re-pin` verb.
 
   let masterKey: Uint8Array | undefined;
   let privateSeed: Uint8Array | undefined;
@@ -1160,10 +1213,6 @@ export async function runProvisionPinAlreadyLocked(
       await writeExclusiveDurableFile(pubPath, publicKey, 0o600);
     }
     const fingerprint = fingerprintFromPublicKey(publicKey);
-
-    // Global publication is LAST. A differing or unverifiable established pin
-    // is a hard provisioning failure; only re-pin may migrate that anchor.
-    await writeGlobalPinnedPublicKey(publicKey, globalPinPath, ctx.warn);
 
     write(out, `${fingerprint}\n`);
     if (resumedLocalPair) {
@@ -1363,92 +1412,6 @@ async function writeExclusiveDurableFile(
   }
 }
 
-async function writeGlobalPinnedPublicKey(
-  publicKey: Uint8Array,
-  globalPinPath: string = CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
-  warn: (message: string) => void = console.warn,
-): Promise<void> {
-  // Fail-open fix (2026-07-07, drill-confirmed on real hardware): the ORIGINAL
-  // guard here treated an EACCES/EPERM on write as "the root signer helper owns
-  // this file, skip." That holds for an operator-UID provision-pin, but fails
-  // OPEN under root: `sanctuary protect --hermes --provision-agent-account`
-  // runs the whole wrap (including provision-pin) under `sudo` because
-  // OS-account creation needs root, so a root-euid write to the root:wheel 0644
-  // global pin SUCCEEDS - silently clobbering the signer helper's pin with a
-  // fortress-local key and breaking arm/enforcement until a manual re-pin.
-  //
-  // The global-pin immutability invariant ("only re-pin migrates the pin") is
-  // now enforced in ONE shared chokepoint - `writeGlobalPinIfUnestablished` -
-  // that reads-and-compares BEFORE any write, so a second writer (the local-sign
-  // daemon) cannot reintroduce the fail-open on a different path. This function
-  // supplies the CLI-specific fresh write (exclusive-create) + refusal guidance.
-  const emitRePinGuidance = () =>
-    warn(
-      `[castle-wall] global pin ${globalPinPath} already exists and is owned by the root signer helper (A2); provision-pin does not overwrite it. Run 'sanctuary castle-wall re-pin' to migrate the trust anchor to the signer helper.`,
-    );
-
-  try {
-    const outcome = await writeGlobalPinIfUnestablished(publicKey, {
-      path: globalPinPath,
-      onRefuse: emitRePinGuidance,
-      // A2/B2 (F-A2-1): do NOT `mkdir` the custody directory here. This runs as
-      // the operator-UID (or, under auto-provision, root-euid) provision-pin
-      // CLI; creating the directory operator-owned is exactly the gap the
-      // helper-as-signer design closes (an operator-owned dir lets same-UID
-      // malware swap the key + pin). The root signer helper creates + owns the
-      // directory. The exclusive-create ("wx") flag closes the read-then-write
-      // TOCTOU inside the chokepoint (EEXIST there is turned into a refusal).
-      freshWrite: async (path, key) => {
-        await writeFile(path, key, { mode: 0o644, flag: "wx" });
-        await chmod(path, 0o644);
-      },
-    });
-    if (outcome === "refused") {
-      throw new Error(
-        `global pin ${globalPinPath} differs from, raced with, or cannot authenticate the local Castle key; only re-pin may migrate it`,
-      );
-    }
-  } catch (error) {
-    // Reached only when the fresh write threw a NON-EEXIST error (the chokepoint
-    // handled EEXIST as a refusal). SAFETY: provision-pin diagnostics are
-    // operator-facing CLI stderr output. These carry CLI-specific guidance:
-    //   - ENOENT: the helper-owned custody directory does not exist, so the
-    //     requested global publication did not happen.
-    //   - EACCES/EPERM: the helper owns the directory but no authenticated pin
-    //     was published by this path. `re-pin` is the required helper-mediated
-    //     remedy.
-    // Both are hard failures. Cooperative-only init is available solely via
-    // the explicit --no-pin / SANCTUARY_INIT_NO_PIN opt-out handled upstream;
-    // returning success here would make default init lie about readiness.
-    const code =
-      error instanceof Error && "code" in error
-        ? (error as NodeJS.ErrnoException).code
-        : undefined;
-    if (code === "ENOENT") {
-      throw new Error(
-        "the root signer helper custody directory is absent, so the required " +
-          "global Castle Wall pin was not published; install the helper (or use " +
-          "the explicit init --no-pin opt-out for a cooperative-only fortress)",
-        { cause: error },
-      );
-    }
-    if (code === "EACCES" || code === "EPERM") {
-      throw new Error(
-        `the required global Castle Wall pin at ${globalPinPath} was not ` +
-          "published; run 'sanctuary castle-wall re-pin' through the root " +
-          "signer helper (or use the explicit init --no-pin opt-out)",
-        { cause: error },
-      );
-    }
-    console.warn(
-      `[castle-wall] warning: unable to write shared pinned key at ${globalPinPath}: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-    throw error;
-  }
-}
-
 /**
  * Build the audit-continuity rotation proof binding the OLD pin key to the new
  * helper key (§4.5 step 4). The OLD key signs the binding, proving the holder of
@@ -1557,8 +1520,83 @@ async function resolveSignerClientPath(
  *
  * This is a Tier-1-class irreversible op (hard constraint #3): it runs only when
  * the operator is present and has just approved the helper - never silently,
- * never agent-triggerable.
+ * never agent-triggerable. Since 2026-09-09 that sentence is CODE, not a
+ * comment: `confirmRePinInteractively` below refuses a non-TTY stdin and
+ * requires a typed confirmation.
  */
+/**
+ * The `re-pin` confirmation gate.
+ *
+ * `re-pin` is the ONLY writer of the machine-wide enforcement anchor (it asks
+ * the root signer helper to install its own key there), so it is the one verb
+ * that can move the trust anchor of the whole machine. It therefore takes the
+ * same interactive-only shape every other irreversible Sanctuary verb takes
+ * (`cli/reset-passphrase.ts` recovery-key mode, `cli/rotate-master.ts`): a
+ * typed confirmation read from a terminal, and a refusal when stdin is not one.
+ *
+ * THREAT MODEL, stated so the bound is not read as stronger than it is. This
+ * gate defends against NON-INTERACTIVE callers: wrap's auto-provision (which
+ * hands its children a black-hole stdin), a planner-executed argv, a
+ * `--headless enable` path, a cron job, an SSH one-liner. It does NOT defend
+ * against an agent that holds a pty and types the confirmation; such an agent
+ * is operator-equivalent and is deliberately OUT of scope here (adding a second
+ * mechanism against it would buy nothing and would break the operator's own
+ * legitimate terminal path). There is no environment override on purpose: an
+ * override is exactly the affordance a non-interactive caller would use.
+ *
+ * Returns true when the operator confirmed; false on any refusal (the caller
+ * must then perform NO migration).
+ */
+async function confirmRePinInteractively(
+  ctx: CastleWallCommandContext,
+  err: Writable,
+  storagePath: string,
+): Promise<boolean> {
+  const stdin = ctx.confirmStdin;
+  if (!stdin && process.stdin.isTTY !== true) {
+    write(
+      err,
+      "Refusing: castle-wall re-pin requires an interactive terminal.\n" +
+        "It moves this machine's Castle Wall trust anchor to the root signer\n" +
+        "helper, so it runs only when the operator is present and types the\n" +
+        "confirmation. There is no flag or environment variable that skips this.\n",
+    );
+    return false;
+  }
+  const source = stdin ?? process.stdin;
+  write(
+    err,
+    `Move this machine's Castle Wall trust anchor to the root signer helper for fortress ${storagePath}?\n` +
+      `Type ${RE_PIN_CONFIRMATION_WORD} to continue, anything else to abort.\n` +
+      `(The native signer shim asks for the same word once more; that second\n` +
+      `ask is the gate a non-interactive caller cannot get past.): `,
+  );
+  const rl = createInterface({ input: source });
+  let answer: string;
+  try {
+    answer = await new Promise<string>((resolve) => {
+      let settled = false;
+      const finish = (value: string) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      rl.once("line", (line) => finish(line));
+      // A closed stream with no line is an abort, never a silent success: the
+      // failure mode from the outside is a piped or EOF stdin that would
+      // otherwise fall through as "no answer" and migrate the anchor.
+      rl.once("close", () => finish(""));
+    });
+  } finally {
+    rl.close();
+  }
+  if (answer.trim() !== RE_PIN_CONFIRMATION_WORD) {
+    write(err, "Aborted: the trust anchor was not moved.\n");
+    return false;
+  }
+  return true;
+}
+
 export async function runRePin(
   argv: string[] = [],
   ctx: CastleWallCommandContext = {},
@@ -1597,6 +1635,10 @@ export async function runRePin(
       "\n",
   );
 
+  // The confirmation gate runs BEFORE any state-touching work and before the
+  // shim is even resolved, so a refusal leaves the machine byte-identical.
+  if (!(await confirmRePinInteractively(ctx, err, storagePath))) return 1;
+
   const clientBinaryPath =
     (await resolveSignerClientPath(env, platform, ctx)) ??
     ctx.signerClientPath ??
@@ -1611,6 +1653,18 @@ export async function runRePin(
 
   const client = new HelperSignerClient({
     clientBinaryPath: clientBinaryPath ?? "castle-wall-signer-client",
+    // The shim runs its OWN confirmation for `re-pin` (it is directly
+    // executable, and the helper's caller check authenticates the binary, not
+    // operator presence), so the operator's terminal is handed through rather
+    // than piped. The gate above and the shim's gate are deliberately two
+    // separate asks: this one can be reached only through the CLI, that one
+    // covers every way the shim can be executed.
+    interactiveTerminal: true,
+    // The operator has to read a prompt and type a word inside this deadline;
+    // the 10s default is the DAEMON's per-signature liveness bound and is far
+    // too short for a person. Failure mode if the default is kept: the shim is
+    // SIGKILLed mid-prompt and the operator sees "shim timed out".
+    timeoutMs: RE_PIN_SHIM_CONFIRMATION_TIMEOUT_MS,
     ...(ctx.signerClientInvoke ? { invoke: ctx.signerClientInvoke } : {}),
   });
 
@@ -1932,6 +1986,31 @@ export async function runStatus(
       const reason = error instanceof Error ? error.message : String(error);
       write(out, `Local fortress key: unreadable (${reason})\n`);
     }
+  }
+
+  // ADDITIVE line (new surface, not a change to an existing one): the
+  // fortress's own wall claim, printed whenever it carries one. Deliberately
+  // placed after the local fingerprint and before the trust-anchor verdict, and
+  // deliberately NOT phrased like the three authoritative "Trust anchor: ..."
+  // lines cli/install.ts parses byte-for-byte: those must stay unique.
+  // Absent claim = no line, so every fortress created before this state existed
+  // prints exactly what it printed before.
+  const vaultProvision = await readPersistedCastleWallProvision(storagePath);
+  if (vaultProvision.state === "not-yet-walled") {
+    write(
+      out,
+      `Vault wall provisioning: ${CASTLE_WALL_NOT_YET_WALLED} (${CASTLE_WALL_NOT_YET_WALLED_SENTENCE})\n`,
+    );
+  } else if (vaultProvision.state === "unreadable") {
+    // A record that exists and does not parse is NOT-PROVEN, and `status` is the
+    // surface `doctor` sends the operator to when it sees one, so it has to say
+    // the same thing rather than fall silent (silence here reads as "no claim",
+    // which is a different and more reassuring fact).
+    write(
+      out,
+      `Vault wall provisioning: unreadable (${CASTLE_WALL_PROVISION_UNREADABLE_MESSAGE}; ` +
+        `${castleWallProvisionRecordPath(storagePath)})\n`,
+    );
   }
 
   if (platform !== "darwin") {
@@ -4044,50 +4123,6 @@ async function isOwnerTrustedExecutable(
 }
 
 /**
- * Presence of a Castle Wall host app on this machine: "present", "absent", or
- * "undetermined".
- *
- * Presence only: it answers "did someone install the app that enforces the
- * machine-wide pin", never "is enforcement live". `sanctuary init` uses it to
- * tell a stale pin left by an uninstalled older build (inert residue) apart
- * from a pin an installed app is actually enforcing. Shares
- * defaultHostAppCandidates + observeOwnerTrustedExecutable with
- * resolveHostAppBinary so the two cannot disagree about where the app lives.
- *
- * "absent" is claimed ONLY when every documented location answered ENOENT.
- * An app at a non-standard path, an unreadable /Applications, a non-file
- * entry, or an untrusted owner all read "undetermined", and a
- * SANCTUARY_CASTLE_HOSTAPP override that does not resolve to a trusted
- * executable is undetermined too: the operator asserted the app lives there,
- * so a stale or wrong override is missing information, not proof of absence.
- * Failure mode from the outside: reading any of those as "absent" is exactly
- * how an init on an enforcing host silently produced an unpinned fortress.
- */
-export type CastleWallHostAppPresence = "present" | "absent" | "undetermined";
-
-export async function castleWallHostAppInstalled(
-  env: NodeJS.ProcessEnv = process.env,
-  getuid: (() => number) | undefined = process.getuid?.bind(process),
-): Promise<CastleWallHostAppPresence> {
-  const override = env.SANCTUARY_CASTLE_HOSTAPP;
-  const candidates = override
-    ? [override]
-    : defaultHostAppCandidates(env);
-  let sawUndetermined = false;
-  for (const candidate of candidates) {
-    const observation = await observeOwnerTrustedExecutable(candidate, getuid, env);
-    if (observation === "trusted") return "present";
-    if (observation === "undetermined") sawUndetermined = true;
-  }
-  if (override) {
-    // An override names where the operator says the app is. Failing to
-    // confirm it there tells us nothing about the rest of the host.
-    return "undetermined";
-  }
-  return sawUndetermined ? "undetermined" : "absent";
-}
-
-/**
  * Resolve the Castle Wall host-app binary that owns the NE filter
  * configuration. Only that signed binary can toggle the filter without
  * re-triggering the one-time consent, so this is the single arming surface.
@@ -4631,58 +4666,6 @@ async function defaultActivatedSysextVersionsProbe(): Promise<string[]> {
   const stdout = await defaultSysextListRawProbe();
   if (stdout === null) return [];
   return parseActivatedCastleWallBundleVersions(stdout);
-}
-
-/**
- * Is the Castle Wall Network Extension activated on this host?
- *
- * Read-only: `systemextensionsctl list` is a query and this never mutates the
- * extension, the pin, or anything else. Three states, because the difference
- * matters to a caller deciding whether the machine still enforces a pin:
- *   - "activated":     at least one activated Castle Wall record is listed.
- *   - "not-activated": the list was read, it does not mention the Castle Wall
- *                      bundle id at all, and so contains no such record.
- *   - "undetermined":  the list could not be read at all (the binary is
- *                      missing, the probe timed out, exec failed), OR it was
- *                      read, mentions the Castle Wall bundle id, and the
- *                      strict parser could bind no activated version to it (an
- *                      unknown state token, an unparseable version cell, a
- *                      changed column layout). Silence from a probe, and
- *                      silence from a deliberately strict parser, are both
- *                      never evidence of absence.
- * Non-macOS hosts return "not-activated" rather than "undetermined": system
- * extensions are a macOS mechanism, so there is no Castle Wall NE to be
- * loaded and the answer is known, not missing.
- *
- * Failure mode from the outside: a host whose extension is still loaded while
- * the app has been moved or deleted looks "clean" to a filename probe. Init
- * pairs this with castleWallHostAppInstalled precisely so that host is not
- * mistaken for one with nothing enforcing the machine-wide pin.
- */
-export type CastleWallExtensionActivation =
-  | "activated"
-  | "not-activated"
-  | "undetermined";
-
-export async function castleWallExtensionActivated(
-  rawListProbe: () => Promise<string | null> = defaultSysextListRawProbe,
-  hostPlatform: NodeJS.Platform = platform(),
-): Promise<CastleWallExtensionActivation> {
-  if (hostPlatform !== "darwin") return "not-activated";
-  const stdout = await rawListProbe();
-  if (stdout === null) return "undetermined";
-  if (parseActivatedCastleWallBundleVersions(stdout).length > 0) return "activated";
-  // An AFFIRMATIVE "not activated" claim needs more than the strict parser
-  // returning nothing. That parser deliberately contributes nothing for a row
-  // it cannot bind to a column layout, a team id, or a parseable version, so
-  // silence from it means "no PARSEABLE activated record", never "no record".
-  // A list that still carries our bundle id is therefore INDETERMINATE: the
-  // caller that reads this (the init pin disposition) bypasses the machine-wide
-  // pin only on proven absence of enforcement, and an unknown-state row on a
-  // host that is still enforcing is exactly the fail-open that bypass must not
-  // reach. Same rule, same file: the deploy preflight applies it below.
-  if (stdout.includes(CASTLE_WALL_SYSTEM_EXTENSION_BUNDLE_ID)) return "undetermined";
-  return "not-activated";
 }
 
 /**

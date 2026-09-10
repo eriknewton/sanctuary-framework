@@ -25,7 +25,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { dirname, join } from "node:path";
@@ -33,18 +33,12 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import {
-  defaultReadGlobalCastlePin,
   resolveFortressPath,
   printInitHelp,
-  resolvePreExistingGlobalPinDisposition,
   runInit,
   type InitOptions,
   type RunInitDeps,
 } from "../../src/wrap/init.js";
-import {
-  castleWallExtensionActivated,
-  castleWallHostAppInstalled,
-} from "../../src/cli/castle-wall.js";
 import {
   RECOVERY_KEY_FILE_BODY_LINES,
   RECOVERY_KEY_FILENAME,
@@ -154,18 +148,6 @@ const SERVER_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const readSource = (relative: string): Promise<string> =>
   readFile(join(SERVER_ROOT, relative), "utf8");
 
-/** Every observation seam supplied, so no test reads this machine's anchor. */
-function pinSeams(overrides: Partial<RunInitDeps> = {}): RunInitDeps {
-  return {
-    readGlobalCastlePin: async () => ({ state: "absent" }),
-    probeInstalledCastleWallApp: async () => "absent",
-    probeCastleWallExtensionActivated: async () => "not-activated",
-    ...overrides,
-  };
-}
-
-/** A syntactically valid 32-byte Ed25519 public key stand-in. */
-const pinBytes = (fill: number): Uint8Array => new Uint8Array(32).fill(fill);
 
 describe("sanctuary init: recovery key stays outside the fortress", () => {
   let tmp: string;
@@ -481,7 +463,7 @@ describe("sanctuary init: a failed run is honest and cleans only its own work", 
     await rm(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
-  it("keeps the announced recovery file, removes what it created, and says both", async () => {
+  it("removes the announced recovery file with the custody it unwrapped, and says so", async () => {
     const fortressPath = join(tmp, "failing");
     const recoveryOut = join(tmp, "keys", "failing.txt");
 
@@ -494,19 +476,23 @@ describe("sanctuary init: a failed run is honest and cleans only its own work", 
             noIdentity: true,
             recoveryOut,
           },
-          pinSeams({
+          {
             // Fail at the LAST step, after the key has been written and named.
             provisionPin: async () => 1,
-          }),
+          },
         ),
-      ).rejects.toThrow(/provision-pin auto-bootstrap failed/);
+      ).rejects.toThrow(/Castle Wall key provisioning failed/);
       return lines.join("\n");
     });
 
-    // The file the operator was told to save survives the failure.
-    await expect(stat(recoveryOut)).resolves.toBeDefined();
-    expect(output).toContain("Kept on purpose");
+    // The file the operator was told to save is REMOVED, because the rollback
+    // also removed the custody it unwrapped: an announced key for a fortress
+    // that no longer exists opens nothing, and leaving it behind made the
+    // retry refuse on exactly that path.
+    await expect(stat(recoveryOut)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(output).toContain("Removed:");
     expect(output).toContain(recoveryOut);
+    expect(output).not.toContain("Kept on purpose");
     // Everything this run created inside the fortress is gone; the inert
     // state/ lock scaffold is the only residue and a retry reuses it.
     await expect(
@@ -570,360 +556,6 @@ describe("sanctuary init: a failed run is honest and cleans only its own work", 
   });
 });
 
-describe("sanctuary init: a pre-existing machine-wide Castle Wall pin", () => {
-  let tmp: string;
-
-  beforeEach(async () => {
-    tmp = await mkdtemp(join(tmpdir(), "sanctuary-init-a73-pin-"));
-  });
-
-  afterEach(async () => {
-    await rm(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-  });
-
-  it("finishes the init without a pin only when the app is absent AND no extension is activated", async () => {
-    const fortressPath = join(tmp, "stale-pin-host");
-    const output = await attended(async (lines) => {
-      const result = await init(
-        { fortress: fortressPath, noConfirm: true, noIdentity: true },
-        pinSeams({
-          // provision-pin refuses because the anchor already exists; it never
-          // overwrites one, so this is the observed shape on such a host.
-          provisionPin: async () => 1,
-          readGlobalCastlePin: async () => ({
-            state: "present",
-            bytes: pinBytes(0x11),
-          }),
-        }),
-      );
-      expect(result.fortressPath).toBe(fortressPath);
-      return lines.join("\n");
-    });
-
-    // The defect this pins: default init aborted outright on such a host.
-    await expect(
-      stat(join(fortressPath, "state", "_meta", "custody-envelope.enc")),
-    ).resolves.toBeDefined();
-    expect(output).toContain("an older Sanctuary install left a machine-wide Castle Wall pin");
-    expect(output).toContain("no Castle Wall system extension");
-    expect(output).toContain("sanctuary castle-wall re-pin");
-    expect(output).toContain("left exactly as it was");
-  });
-
-  it("refuses when the system extension is still activated even though no app is found", async () => {
-    // THE fail-open this rule closes: a leftover pin on a host whose Network
-    // Extension is still loaded. A filename-and-uid app probe reports "no app
-    // installed", and the old resolver read that alone as "nothing enforces
-    // this anchor", producing an unpinned fortress on an enforcing host.
-    const disposition = await resolvePreExistingGlobalPinDisposition(
-      pinSeams({
-        readGlobalCastlePin: async () => ({ state: "present", bytes: pinBytes(0x11) }),
-        probeInstalledCastleWallApp: async () => "absent",
-        probeCastleWallExtensionActivated: async () => "activated",
-      }),
-      join(tmp, "no-such-fortress"),
-    );
-    expect(disposition.kind).toBe("fail-closed");
-    if (disposition.kind !== "fail-closed") throw new Error("unreachable");
-    expect(disposition.reason).toContain("system extension: activated");
-    expect(disposition.reason).toContain("sanctuary castle-wall re-pin");
-    expect(disposition.reason).toContain("--no-pin");
-  });
-
-  it("refuses, saying so, when the app's presence could not be determined", async () => {
-    // An app at a non-standard path or a stale SANCTUARY_CASTLE_HOSTAPP reads
-    // undetermined, and undetermined is not absence.
-    const disposition = await resolvePreExistingGlobalPinDisposition(
-      pinSeams({
-        readGlobalCastlePin: async () => ({ state: "present", bytes: pinBytes(0x11) }),
-        probeInstalledCastleWallApp: async () => "undetermined",
-      }),
-      join(tmp, "no-such-fortress"),
-    );
-    expect(disposition.kind).toBe("fail-closed");
-    if (disposition.kind !== "fail-closed") throw new Error("unreachable");
-    expect(disposition.reason).toContain("presence could not be determined");
-  });
-
-  it("refuses when the anchor itself could not be read, and says which observation is missing", async () => {
-    const disposition = await resolvePreExistingGlobalPinDisposition(
-      pinSeams({
-        readGlobalCastlePin: async () => ({ state: "present-unreadable" }),
-        probeCastleWallExtensionActivated: async () => "undetermined",
-      }),
-      join(tmp, "no-such-fortress"),
-    );
-    expect(disposition.kind).toBe("fail-closed");
-    if (disposition.kind !== "fail-closed") throw new Error("unreachable");
-    expect(disposition.reason).toContain("could not be read");
-    expect(disposition.reason).toContain("activation state could not be determined");
-  });
-
-  it("adopts a pre-existing anchor ONLY on byte agreement with this fortress's Castle key", async () => {
-    const fortressPath = join(tmp, "already-pinned");
-    await mkdir(fortressPath, { recursive: true, mode: 0o700 });
-    await writeFile(join(fortressPath, "castle-pinned-pubkey.bin"), pinBytes(0x2a), {
-      mode: 0o600,
-    });
-
-    const agreeing = await resolvePreExistingGlobalPinDisposition(
-      pinSeams({
-        readGlobalCastlePin: async () => ({ state: "present", bytes: pinBytes(0x2a) }),
-        // Deliberately the hostile shape for a bypass: an app IS installed and
-        // the extension IS live. Byte agreement is what authorizes the adopt,
-        // never the absence of enforcement.
-        probeInstalledCastleWallApp: async () => "present",
-        probeCastleWallExtensionActivated: async () => "activated",
-      }),
-      fortressPath,
-    );
-    expect(agreeing.kind).toBe("adopt-existing-pin");
-
-    const disagreeing = await resolvePreExistingGlobalPinDisposition(
-      pinSeams({
-        readGlobalCastlePin: async () => ({ state: "present", bytes: pinBytes(0x2b) }),
-        probeInstalledCastleWallApp: async () => "present",
-        probeCastleWallExtensionActivated: async () => "activated",
-      }),
-      fortressPath,
-    );
-    expect(disagreeing.kind).toBe("fail-closed");
-  });
-
-  it("never adopts on byte agreement it cannot actually observe", async () => {
-    // The fortress-local key is missing, so there is nothing to agree with.
-    // An unreadable local key must not become an implicit match.
-    const disposition = await resolvePreExistingGlobalPinDisposition(
-      pinSeams({
-        readGlobalCastlePin: async () => ({ state: "present", bytes: pinBytes(0x2a) }),
-        probeInstalledCastleWallApp: async () => "present",
-      }),
-      join(tmp, "fortress-with-no-local-key"),
-    );
-    expect(disposition.kind).toBe("fail-closed");
-  });
-
-  it("fails closed when an installed app is enforcing the disagreeing pin", async () => {
-    const fortressPath = join(tmp, "app-installed-host");
-    await expect(
-      init(
-        { fortress: fortressPath, noConfirm: true, noIdentity: true },
-        pinSeams({
-          provisionPin: async () => 1,
-          readGlobalCastlePin: async () => ({
-            state: "present",
-            bytes: pinBytes(0x11),
-          }),
-          probeInstalledCastleWallApp: async () => "present",
-        }),
-      ),
-    ).rejects.toThrow(/provision-pin auto-bootstrap failed/);
-  });
-
-  it("still fails closed when the refusal was not a pre-existing anchor", async () => {
-    const disposition = await resolvePreExistingGlobalPinDisposition(
-      pinSeams(),
-      join(tmp, "no-such-fortress"),
-    );
-    expect(disposition.kind).toBe("fail-closed");
-    if (disposition.kind !== "fail-closed") throw new Error("unreachable");
-    expect(disposition.reason).toContain("no global pin exists");
-  });
-
-  it("never reads the real machine-wide anchor when a seam is supplied", async () => {
-    // Every observation is injected, so the resolver performs no host I/O:
-    // a unit test must not depend on (or perturb) this machine's pin.
-    let reads = 0;
-    await resolvePreExistingGlobalPinDisposition(
-      pinSeams({
-        readGlobalCastlePin: async () => {
-          reads += 1;
-          return { state: "present", bytes: pinBytes(0x11) };
-        },
-      }),
-      join(tmp, "no-such-fortress"),
-    );
-    expect(reads).toBe(1);
-  });
-
-  it("describes the unpinned-finish rule the resolver actually applies", () => {
-    // The help text said a leftover pin plus "no Castle Wall app is installed"
-    // was enough to finish unpinned. The resolver also requires the extension
-    // to have been OBSERVED not-activated, and fails closed on undetermined,
-    // so the documented rule was strictly looser than the code and an operator
-    // reading it would read a refusal as a bug. AGENTS.md rule 6: the source is
-    // right and the doc is the defect.
-    const lines: string[] = [];
-    const consoleLog = vi
-      .spyOn(console, "log")
-      .mockImplementation((...args: unknown[]) => {
-        lines.push(args.map((a) => String(a)).join(" "));
-      });
-    try {
-      printInitHelp();
-    } finally {
-      consoleLog.mockRestore();
-    }
-    const help = lines.join("\n");
-
-    expect(help).toContain("BOTH observations");
-    expect(help).toContain("no Castle Wall app");
-    expect(help).toContain("not activated");
-    expect(help).toContain("undetermined");
-    // The old wording claimed the app observation alone decided it.
-    expect(help).not.toContain("no Castle Wall app is installed to");
-  });
-});
-
-describe("machine-wide anchor and enforcement observations are three-state", () => {
-  let tmp: string;
-
-  beforeEach(async () => {
-    tmp = await mkdtemp(join(tmpdir(), "sanctuary-init-a73-obs-"));
-  });
-
-  afterEach(async () => {
-    await rm(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-  });
-
-  it("reads an unreadable anchor as present, never as absent", async () => {
-    const missing = join(tmp, "nothing-here.bin");
-    expect(await defaultReadGlobalCastlePin(missing)).toEqual({ state: "absent" });
-
-    // Deterministic at any euid, including a root CI runner (a chmod 000 file
-    // is still readable by root, so it cannot cover this branch there).
-    const asDirectory = join(tmp, "anchor-is-a-directory.bin");
-    await mkdir(asDirectory, { mode: 0o700 });
-    expect(await defaultReadGlobalCastlePin(asDirectory)).toEqual({
-      state: "present-unreadable",
-    });
-
-    const unreadable = join(tmp, "eacces.bin");
-    await writeFile(unreadable, Buffer.from(pinBytes(0x11)), { mode: 0o600 });
-    await chmod(unreadable, 0o000);
-    if (process.getuid?.() !== 0) {
-      expect(await defaultReadGlobalCastlePin(unreadable)).toEqual({
-        state: "present-unreadable",
-      });
-    }
-    await chmod(unreadable, 0o600);
-
-    const good = join(tmp, "anchor.bin");
-    await writeFile(good, Buffer.from(pinBytes(0x11)), { mode: 0o600 });
-    const observed = await defaultReadGlobalCastlePin(good);
-    expect(observed.state).toBe("present");
-
-    // A file that is not a public key's length cannot be byte-compared, so it
-    // is missing information rather than an anchor holding some other key.
-    const short = join(tmp, "short.bin");
-    await writeFile(short, Buffer.from([1, 2, 3]), { mode: 0o600 });
-    expect(await defaultReadGlobalCastlePin(short)).toEqual({
-      state: "present-unreadable",
-    });
-  });
-
-  it("reads an unconfirmable host-app override as undetermined, never as absent", async () => {
-    const real = join(tmp, "CastleWallHostApp");
-    await writeFile(real, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    await expect(
-      castleWallHostAppInstalled({ SANCTUARY_CASTLE_HOSTAPP: real }, () =>
-        process.getuid?.() ?? 0,
-      ),
-    ).resolves.toBe("present");
-
-    // The fail-open: a stale or wrong override used to read as "no app
-    // installed", which is what let init bypass the pin on an enforcing host.
-    await expect(
-      castleWallHostAppInstalled(
-        { SANCTUARY_CASTLE_HOSTAPP: join(tmp, "not-there") },
-        () => process.getuid?.() ?? 0,
-      ),
-    ).resolves.toBe("undetermined");
-
-    const asDirectory = join(tmp, "app-dir");
-    await mkdir(asDirectory, { mode: 0o700 });
-    await expect(
-      castleWallHostAppInstalled({ SANCTUARY_CASTLE_HOSTAPP: asDirectory }, () =>
-        process.getuid?.() ?? 0,
-      ),
-    ).resolves.toBe("undetermined");
-  });
-
-  it("reads an unreadable system-extension list as undetermined, never as not-activated", async () => {
-    await expect(
-      castleWallExtensionActivated(async () => null, "darwin"),
-    ).resolves.toBe("undetermined");
-    await expect(
-      castleWallExtensionActivated(async () => "no extensions", "darwin"),
-    ).resolves.toBe("not-activated");
-    const activatedRow = [
-      "*",
-      "*",
-      "YFQSWQ9BJN",
-      "ai.sanctuaryprotocol.macos.castle-wall (1.0/42)",
-      "Castle Wall",
-      "[activated enabled]",
-    ].join("\t");
-    await expect(
-      castleWallExtensionActivated(async () => activatedRow, "darwin"),
-    ).resolves.toBe("activated");
-    // System extensions are a macOS mechanism; elsewhere the answer is known.
-    await expect(
-      castleWallExtensionActivated(async () => null, "linux"),
-    ).resolves.toBe("not-activated");
-  });
-
-  it("reads a mentioned-but-unparseable extension record as undetermined, and init then refuses", async () => {
-    // The strict parser contributes nothing for a row it cannot bind to a
-    // column layout, a team id, or a parseable version. Treating that silence
-    // as "not activated" is a fail-open: the row is our bundle, on a host that
-    // may still be enforcing.
-    const unknownState = [
-      "*",
-      "*",
-      "YFQSWQ9BJN",
-      "ai.sanctuaryprotocol.macos.castle-wall (1.0/42)",
-      "Castle Wall",
-      "[some_state_this_build_does_not_know]",
-    ].join("\t");
-    await expect(
-      castleWallExtensionActivated(async () => unknownState, "darwin"),
-    ).resolves.toBe("undetermined");
-
-    const unparseableVersion = [
-      "*",
-      "*",
-      "YFQSWQ9BJN",
-      "ai.sanctuaryprotocol.macos.castle-wall",
-      "Castle Wall",
-      "[activated enabled]",
-    ].join("\t");
-    await expect(
-      castleWallExtensionActivated(async () => unparseableVersion, "darwin"),
-    ).resolves.toBe("undetermined");
-
-    // And the disposition that consumes it never reaches the bypass: an
-    // adopt-without-pin fortress on a still-enforcing host looks like a
-    // successful install and fails later as unexplained blocked traffic.
-    const disposition = await resolvePreExistingGlobalPinDisposition(
-      pinSeams({
-        readGlobalCastlePin: async () => ({
-          state: "present",
-          bytes: pinBytes(0x22),
-        }),
-        probeInstalledCastleWallApp: async () => "absent",
-        probeCastleWallExtensionActivated: async () =>
-          castleWallExtensionActivated(async () => unknownState, "darwin"),
-      }),
-      join(tmp, "no-such-fortress"),
-    );
-    expect(disposition.kind).toBe("fail-closed");
-    expect(disposition.kind === "fail-closed" && disposition.reason).toContain(
-      "activation state could not be determined",
-    );
-  });
-});
-
 describe("recovery-key output containment", () => {
   it("refuses a destination equal to the fortress directory itself", async () => {
     const tmp = await mkdtemp(join(tmpdir(), "sanctuary-init-a73-eq-"));
@@ -966,49 +598,84 @@ describe("sanctuary init: the printed next step is a step that works", () => {
       await expect(
         init(
           { fortress: fortressPath, noConfirm: true, noIdentity: true },
-          pinSeams({ provisionPin: async () => 1 }),
+          { provisionPin: async () => 1 },
         ),
-      ).rejects.toThrow(/provision-pin auto-bootstrap failed/);
+      ).rejects.toThrow(/Castle Wall key provisioning failed/);
       return lines.join("\n");
     });
 
-    // The kept file is described for what it now is, not merely as "kept".
-    await expect(stat(staged)).resolves.toBeDefined();
-    expect(output).toContain("a fortress that no longer exists");
-
-    // The retry trap: init refuses an existing recovery-key destination, so
-    // the summary used to print a bare re-run that could not succeed.
+    // The default destination is cleared by the rollback itself, so the
+    // summary no longer has to teach the operator an `rm`, and the retry it
+    // prints is a step that actually works.
+    await expect(stat(staged)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(output).toContain("Removed:");
     const rmLine = output
       .split("\n")
       .map((line) => line.trim())
       .find((line) => line.startsWith("rm "));
-    expect(rmLine).toBeDefined();
-    expect(rmLine).toContain("Sanctuary Recovery");
+    expect(rmLine).toBeUndefined();
 
-    // Execute the printed step, exactly as printed, in a real shell: quoting
-    // matters here because the default destination contains a space.
-    await sh("/bin/sh", ["-c", rmLine!]);
-    await expect(stat(staged)).rejects.toMatchObject({ code: "ENOENT" });
-
-    // And then the printed retry really does complete.
+    // And the printed retry really does complete.
     const result = await init(
       { fortress: fortressPath, noConfirm: true, noPin: true, noIdentity: true },
     );
     expect(result.recoveryKeyDisclosurePath).toBe(staged);
   });
 
-  it("proves the bare re-run the old summary printed is refused while the file stands", async () => {
-    const fortressPath = join(tmp, "trap");
-    await attended(async () => {
+  it("leaves a recovery destination it cannot prove it wrote, and names it", async () => {
+    // The removal is scoped by INODE IDENTITY, not by path: a destination that
+    // was replaced between the write and the failure is somebody else's file,
+    // and this rollback must not unlink it. The summary then has to name it,
+    // because the retry refuses while any file stands at that path.
+    const fortressPath = join(tmp, "swapped");
+    const staged = agentGuidedRecoveryOutputPath(fortressPath);
+    const output = await attended(async (lines) => {
       await expect(
         init(
           { fortress: fortressPath, noConfirm: true, noIdentity: true },
-          pinSeams({ provisionPin: async () => 1 }),
+          {
+            provisionPin: async () => {
+              // Same path, different inode: exactly the shape the guard exists
+              // for. Runs at the last step, after the key was written and
+              // announced.
+              //
+              // The replacement is written to a SIBLING path first and moved
+              // onto the destination with rename(2), rather than unlinked and
+              // recreated in place. An unlink-then-create at the same path
+              // asks the filesystem's allocator not to hand back the inode
+              // number it just freed, which is not a portable guarantee: a
+              // freshly formatted Linux tmp filesystem (tmpfs or a fresh ext4
+              // allocation group, both routine on a CI runner) can and does
+              // reuse the just-freed inode for the very next file created in
+              // the same directory, while APFS on macOS practically never
+              // does. This flaked the test on Linux CI (run 34493018511):
+              // the reused inode made the rollback's dev/ino identity check
+              // read "same file" and unlink the swapped-in content, and the
+              // very next assertion then found nothing at `staged` to read.
+              // Renaming a file whose inode was allocated separately, while
+              // the original still holds its own live inode, cannot collide:
+              // the two inodes coexist until the rename's atomic replace, so
+              // the guard is exercised the same way on every filesystem.
+              const swapSource = `${staged}.test-swap-source`;
+              await writeFile(swapSource, "written by someone else\n", { mode: 0o600 });
+              await rename(swapSource, staged);
+              return 1;
+            },
+          },
         ),
-      ).rejects.toThrow(/provision-pin auto-bootstrap failed/);
+      ).rejects.toThrow(/Castle Wall key provisioning failed/);
+      return lines.join("\n");
     });
 
-    // Exactly what the pre-fix "Next step" told the operator to do.
+    expect(await readFile(staged, "utf8")).toBe("written by someone else\n");
+    expect(output).toContain("Still on disk:");
+    expect(output).not.toContain("Removed:");
+    const rmLine = output
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => line.startsWith("rm "));
+    expect(rmLine).toBeDefined();
+
     await expect(
       init({ fortress: fortressPath, noConfirm: true, noPin: true, noIdentity: true }),
     ).rejects.toThrow(/existing --recovery-out file/);
@@ -1247,7 +914,7 @@ describe("fortress path normalization", () => {
   });
 });
 
-describe("an announced recovery file survives a failure right after the banner", () => {
+describe("an announced recovery file is accounted for after a failure right after the banner", () => {
   let tmp: string;
 
   beforeEach(async () => {
@@ -1258,7 +925,7 @@ describe("an announced recovery file survives a failure right after the banner",
     await rm(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
-  it("keeps the file when the disclosure fence throws after the banner printed", async () => {
+  it("removes the announced file when the disclosure fence throws after the banner printed", async () => {
     const fortressPath = join(tmp, "banner-then-throw");
     const staged = agentGuidedRecoveryOutputPath(fortressPath);
 
@@ -1277,9 +944,14 @@ describe("an announced recovery file survives a failure right after the banner",
       return lines.join("\n");
     });
 
+    // The announced bit is still what this pins: the summary must ACCOUNT for
+    // the file by name in this exact window. What changed is the account. The
+    // rollback removed the custody this key unwrapped, so the key opens
+    // nothing, and leaving it behind made the retry refuse on that path.
     expect(output).toContain(staged);
-    await expect(stat(staged)).resolves.toBeDefined();
-    expect(output).toContain("Kept on purpose");
+    await expect(stat(staged)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(output).toContain("Removed:");
+    expect(output).not.toContain("Kept on purpose");
   });
 });
 
@@ -1316,7 +988,7 @@ describe("what a failed init's rollback actually reaches", () => {
       await expect(
         init(
           { fortress: fortressPath, noConfirm: true, noIdentity: true, recoveryOut },
-          pinSeams({
+          {
             provisionPin: async () => 1,
             beforeDurableMutation: async (label) => {
               // After the under-lock freshness check has already passed.
@@ -1324,17 +996,20 @@ describe("what a failed init's rollback actually reaches", () => {
                 await writeFile(intruder, "not written by this init", { mode: 0o600 });
               }
             },
-          }),
+          },
         ),
-      ).rejects.toThrow(/provision-pin auto-bootstrap failed/);
+      ).rejects.toThrow(/Castle Wall key provisioning failed/);
     });
 
     // Removed: it sits at the fortress root, whoever wrote it.
     await expect(stat(intruder)).rejects.toMatchObject({ code: "ENOENT" });
-    // Untouched: the fortress directory itself, its siblings, the external file.
+    // Untouched: the fortress directory itself and its siblings. The external
+    // recovery file this run announced IS removed with the custody it
+    // unwrapped, and its PARENT directory (which init did not create) stands.
     await expect(stat(fortressPath)).resolves.toBeDefined();
     await expect(stat(sibling)).resolves.toBeDefined();
-    await expect(stat(recoveryOut)).resolves.toBeDefined();
+    await expect(stat(recoveryOut)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(dirname(recoveryOut))).resolves.toBeDefined();
   });
 });
 

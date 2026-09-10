@@ -24,4 +24,5 @@ export * from "./observe/index.js";
 export * from "./export/index.js";
 export * from "./egress-proxy.js";
 export * from "./subject-binding.js";
+export * from "./provision-state.js";
 export * from "./audit-attribution.js";

@@ -1206,6 +1206,25 @@ export function createReputationTools(
                 ],
                 overallScore,
                 evidence_basis: "derived from live health evidence (monitor_health)",
+                // The vault's own wall claim, carried onto the SIGNED, EXTERNALLY
+                // PUBLISHED payload. Everything above is a layer SCORE; none of
+                // those numbers says whether this vault is on the wall running on
+                // this machine, and the evidence object already carried the
+                // answer while this builder dropped it. Published under a
+                // signature, so omitting it is the over-claim: additive, and
+                // absent when the fortress carries no claim.
+                //
+                // release/1.8.6 branch note: `evidence` above comes from
+                // `buildHealthEvidenceReport({ config, identityCount,
+                // storageBackendName })` with no `castleWall` snapshot supplied at
+                // this call site on this branch, so `evidence.castle_wall
+                // .vault_provision` is always undefined here and this spread is a
+                // no-op until the Linux Castle Wall reconstruction (which wires
+                // `castleWallSnapshotForHealthReport` into this call) is merged.
+                // The spread itself is correct and stays additive either way.
+                ...(evidence.castle_wall.vault_provision !== undefined
+                  ? { castle_wall_provision: evidence.castle_wall.vault_provision }
+                  : {}),
               };
               break;
             }

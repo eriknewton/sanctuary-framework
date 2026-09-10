@@ -22,7 +22,7 @@
  * banner and forces re-entry; headless init prints only the destination.
  */
 
-import { lstat, mkdir, open, readFile, readdir, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { dirname, join, isAbsolute, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -83,17 +83,19 @@ import {
   preflightFortressPathWritable,
 } from "../paths.js";
 import {
-  CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
-  CASTLE_PINNED_PUBKEY,
-  castleWallExtensionActivated,
-  castleWallHostAppInstalled,
-  type CastleWallExtensionActivation,
-  type CastleWallHostAppPresence,
   runProvisionPin,
   runProvisionPinAlreadyLocked,
 } from "../cli/castle-wall.js";
-import { globalPinAuthenticates } from "../castle-wall/global-pin/index.js";
-import { ED25519_PUBLIC_KEY_BYTES } from "../core/crypto-suite-registry.js";
+// The named wall state this fortress persists, and the one sentence every
+// surface prints for it. Must match `classifyMetaKey` in
+// core/master-rotation.ts (an unrecognized `_meta` key makes master rotation
+// refuse every fortress that carries it).
+import {
+  CASTLE_WALL_NOT_YET_WALLED,
+  CASTLE_WALL_NOT_YET_WALLED_SENTENCE,
+  CASTLE_WALL_PROVISION_META_KEY,
+} from "../castle-wall/provision-state.js";
+import { stringToBytes } from "../core/encoding.js";
 import { mkdirSafeUnderRoot } from "./config-reader.js";
 import {
   preflightPrincipalPolicyFile,
@@ -108,15 +110,6 @@ import { LOCAL_INTELLIGENCE_OPT_IN_HINT } from "../intelligence/provisioning-con
 import type { CrossProcessLockLease } from "../storage/cross-process-lock.js";
 import { kernelBackedCrossProcessLockPlatformSupported } from "../storage/cross-process-lock.js";
 
-/**
- * Path of the machine-wide Castle Wall enforcement anchor that default init
- * provisions (and --no-pin skips). Re-exported from the owning module rather
- * than re-spelled here: init both DISPLAYS this path (the --no-pin notice,
- * the pre-existing-pin sentence) and READS it (defaultReadGlobalCastlePin),
- * so a literal that drifted from castle-wall.ts would make init report on a
- * different file than the one Castle Wall enforces. Init never writes it.
- */
-const GLOBAL_CASTLE_PIN_PATH = CASTLE_GLOBAL_PINNED_PUBKEY_PATH;
 
 export interface InitOptions {
   /** Operator-supplied fortress path. Wins over env + default. */
@@ -134,14 +127,13 @@ export interface InitOptions {
    */
   recoveryOut?: string;
   /**
-   * Skip the Castle Wall global-pin provisioning step. Default init writes
-   * the machine-wide enforcement anchor at
-   * /Library/Application Support/Sanctuary/castle-pinned-pubkey, so a
-   * test/isolated fortress would silently touch the host-wide trust anchor.
-   * With this flag set, init provisions NO global pin and prints a notice
-   * telling the operator to run `sanctuary castle-wall provision-pin`
-   * explicitly when ready. Also settable via SANCTUARY_INIT_NO_PIN=1 for
-   * non-interactive harnesses. Default behavior (no flag) is unchanged.
+   * DEPRECATED no-op, still parsed and still accepted.
+   *
+   * It used to skip an init-time write of the machine-wide Castle Wall anchor.
+   * Default init no longer touches that anchor at all, so there is nothing left
+   * to skip. The flag stays because saved operator commands, the release
+   * acceptance kit, and published install docs pass it; init prints one
+   * deprecation line when it sees it. Also settable via SANCTUARY_INIT_NO_PIN.
    */
   noPin?: boolean;
   /**
@@ -165,19 +157,18 @@ export interface InitOptions {
 }
 
 /**
- * Explicit opt-in values for SANCTUARY_INIT_NO_PIN. Skipping the host-wide
- * Castle Wall pin is a security-relevant downgrade, so the env var is an
- * allowlist (NOT "anything truthy"): only these exact values opt out. A
- * typo, an inherited shell value, or `no`/`off` therefore does NOT silently
- * disable global-pin provisioning.
+ * Explicit opt-in values for SANCTUARY_INIT_NO_PIN. The variable now selects
+ * only whether the deprecation line prints, but the allowlist (NOT "anything
+ * truthy") is kept so an inherited shell value or a `no`/`off` cannot be read
+ * as an opt-in if this ever regains meaning.
  */
 const NO_PIN_ENV_OPT_IN = new Set(["1", "true", "yes", "on"]);
 
 /**
- * Resolve whether the Castle Wall global-pin step should be skipped.
+ * Resolve whether the operator asked for the retired no-pin behavior.
  * Precedence: the --no-pin CLI flag wins; otherwise SANCTUARY_INIT_NO_PIN
- * opts out only when set to an explicit allowlisted value (1/true/yes/on,
- * case-insensitive). Default is to provision the pin exactly as before.
+ * opts in only at an explicit allowlisted value (1/true/yes/on,
+ * case-insensitive). The result now selects a deprecation line, nothing more.
  */
 export function resolveNoPin(
   options: { noPin?: boolean },
@@ -339,9 +330,10 @@ async function preflightPolicyAncestors(root: string): Promise<void> {
 }
 
 /**
- * Test seam: lets tests observe/replace the global-pin provisioning call so
- * they can prove `--no-pin` never invokes it (and default init does), without
- * writing to the real machine-wide anchor. Not part of the CLI surface.
+ * Test seams for init. `provisionPin` lets a test observe or replace the
+ * fortress-local Castle key-pair provisioning call (it is fortress-local only:
+ * no init path reads or writes the machine-wide anchor). Not part of the CLI
+ * surface.
  */
 export interface RunInitDeps {
   provisionPin?: typeof runProvisionPin;
@@ -372,20 +364,6 @@ export interface RunInitDeps {
    * file they were just told to save.
    */
   __testAfterRecoveryKeyBannerPrinted?: () => void | Promise<void>;
-  /**
-   * Test seam: observe the machine-wide Castle Wall pin without reading the
-   * real host anchor. Read-only in production too; init never writes it.
-   */
-  readGlobalCastlePin?: () => Promise<GlobalCastlePinObservation>;
-  /**
-   * Test seam: observe whether a Castle Wall host app is installed. Three
-   * states, never a boolean: "undetermined" must not collapse into "absent"
-   * at the seam either, or a test could prove a fail-open that production
-   * cannot reach (and vice versa).
-   */
-  probeInstalledCastleWallApp?: () => Promise<CastleWallHostAppPresence>;
-  /** Test seam: observe whether the Castle Wall system extension is activated. */
-  probeCastleWallExtensionActivated?: () => Promise<CastleWallExtensionActivation>;
 }
 
 /** Assert custody ownership before and after every durable init helper. */
@@ -417,191 +395,21 @@ const INIT_RECOVERY_KEY_VERIFIED_MESSAGE =
 /** The only line in init that claims the ceremony finished. */
 const INIT_COMPLETE_MESSAGE = "Sanctuary init: complete.";
 
-/**
- * How default init should proceed when Castle Wall global-pin provisioning
- * refused.
- *   - `adopt-existing-pin`: the anchor's bytes ARE this fortress's Castle
- *     key, so the fortress is pinned already and the init is complete as-is.
- *   - `adopt-without-pin`: nothing on this host enforces the anchor, so
- *     finishing without a pin removes no protection that exists today.
- *   - `fail-closed`: every other case, including every case where the
- *     observations needed to choose could not be made.
- * Only `fail-closed` aborts, and it is the DEFAULT: a disposition is never
- * reached by falling through.
- */
-export type PreExistingGlobalPinDisposition =
-  | { kind: "adopt-existing-pin"; sentence: string; auditReason: string }
-  | { kind: "adopt-without-pin"; sentence: string; auditReason: string }
-  | { kind: "fail-closed"; reason: string };
-
-/**
- * Read-only observation of the machine-wide anchor. Three states, because a
- * caller that treats "could not read it" as "there is none" is exactly the
- * fail-open this type exists to prevent (AGENTS.md rule 1: absent,
- * indeterminate and unproven all read as not-proven, never as passing).
- */
-export type GlobalCastlePinObservation =
-  | { state: "absent" }
-  | { state: "present"; bytes: Uint8Array }
-  | { state: "present-unreadable" };
-
-/**
- * Decide what a provision-pin refusal means on THIS host.
- *
- * The machine-wide pin is never mutated here, and never by init: this reads
- * the anchor, the fortress's own Castle key, the app, and the system
- * extension list, and nothing more. Three observations decide it, and the
- * decision is CLOSED by default:
- *
- *   1. Adopt the existing anchor only on byte agreement. The anchor is
- *      adopted only when its bytes equal this fortress's Castle public key
- *      under `globalPinAuthenticates`, the same comparison the global-pin
- *      write guard uses to return "idempotent". Nothing weaker (an app being
- *      installed, a refusal code, a matching fingerprint prefix) may stand in
- *      for the bytes.
- *   2. Bypass to an unpinned fortress only on proven absence of enforcement:
- *      the app must be absent from EVERY documented location AND the Castle
- *      Wall system extension must be listed as not activated. A leftover pin
- *      with the extension still loaded, or an app at a non-standard path, is
- *      a host that still enforces; creating an unpinned fortress there is the
- *      fail-open this rule closes.
- *   3. Otherwise refuse, and say which observation is missing. "Present",
- *      "absent" and "could not be determined" are three different answers and
- *      the refusal sentence prints the one that was actually observed.
- *
- * Failure mode from the outside: an adopted-without-pin fortress on an
- * enforcing host looks like a successful install and fails later as
- * unexplained blocked traffic, so the refusal is deliberately louder than the
- * bypass.
- */
-export async function resolvePreExistingGlobalPinDisposition(
-  deps: RunInitDeps,
-  fortressPath: string,
-): Promise<PreExistingGlobalPinDisposition> {
-  const readPin = deps.readGlobalCastlePin ?? defaultReadGlobalCastlePin;
-  const appPresence = await (
-    deps.probeInstalledCastleWallApp ?? castleWallHostAppInstalled
-  )();
-  const extension = await (
-    deps.probeCastleWallExtensionActivated ?? castleWallExtensionActivated
-  )();
-  const pin = await readPin();
-
-  if (pin.state === "absent") {
-    return {
-      kind: "fail-closed",
-      reason:
-        `no global pin exists at ${GLOBAL_CASTLE_PIN_PATH}, so the refusal was not a ` +
-        "pre-existing anchor; the required pin was not published. Next step: fix the " +
-        "reported provision-pin cause, or re-run init with --no-pin to create this " +
-        "fortress deliberately unpinned",
-    };
-  }
-
-  if (pin.state === "present") {
-    const local = await readFortressCastlePublicKey(fortressPath);
-    if (local !== undefined && globalPinAuthenticates(pin.bytes, local)) {
-      return {
-        kind: "adopt-existing-pin",
-        sentence:
-          `the machine-wide Castle Wall pin at ${GLOBAL_CASTLE_PIN_PATH} already holds this ` +
-          "fortress's own Castle key, so this fortress is pinned and the anchor needed no change.",
-        auditReason: "pre-existing-global-pin-authenticates-this-fortress",
-      };
-    }
-  }
-
-  if (appPresence === "absent" && extension === "not-activated") {
-    return {
-      kind: "adopt-without-pin",
-      sentence:
-        "an older Sanctuary install left a machine-wide Castle Wall pin on this host; no Castle " +
-        "Wall app is installed in any documented location and no Castle Wall system extension " +
-        "is activated, so nothing on this host is enforcing that anchor.",
-      auditReason: "pre-existing-global-pin-no-app-and-no-activated-extension",
-    };
-  }
-
-  const pinPhrase =
-    pin.state === "present"
-      ? "present and does not hold this fortress's Castle key"
-      : "present but could not be read, so whether it holds this fortress's Castle key could not be determined";
-  const appPhrase =
-    appPresence === "present"
-      ? "installed"
-      : appPresence === "absent"
-        ? "not found in any documented location"
-        : "presence could not be determined";
-  const extensionPhrase =
-    extension === "activated"
-      ? "activated"
-      : extension === "not-activated"
-        ? "not activated"
-        : "activation state could not be determined";
-  return {
-    kind: "fail-closed",
-    reason:
-      `the machine-wide Castle Wall pin at ${GLOBAL_CASTLE_PIN_PATH} is ${pinPhrase} ` +
-      `(Castle Wall app: ${appPhrase}; Castle Wall system extension: ${extensionPhrase}), ` +
-      "so this host may still be enforcing it and an unpinned fortress is not safe to create " +
-      "silently. Next step: run 'sanctuary castle-wall re-pin' to migrate the anchor to this " +
-      "fortress when you intend to arm the wall, or re-run init with --no-pin typed explicitly " +
-      "to create this fortress deliberately unpinned",
-  };
-}
-
-/**
- * Read-only observation of the machine-wide pin.
- *
- * "present-unreadable" covers a file that exists but cannot be read (the
- * root-owned anchor read as the operator uid, or a short/oversized file):
- * an unreadable anchor is not an absent one, and ENOENT is the only state
- * that may be treated as "nothing was established here". A file whose length
- * is not the Ed25519 public-key length cannot be compared byte-for-byte, so
- * it reads unreadable rather than present-with-bytes.
- */
-export async function defaultReadGlobalCastlePin(
-  pinPath: string = GLOBAL_CASTLE_PIN_PATH,
-): Promise<GlobalCastlePinObservation> {
-  try {
-    const bytes = await readFile(pinPath);
-    return bytes.byteLength === ED25519_PUBLIC_KEY_BYTES
-      ? { state: "present", bytes }
-      : { state: "present-unreadable" };
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT"
-      ? { state: "absent" }
-      : { state: "present-unreadable" };
-  }
-}
-
-/**
- * This fortress's own Castle public key, or undefined when it is absent,
- * unreadable, or not an Ed25519 public key's length.
- *
- * provision-pin publishes the fortress-local public half durably BEFORE it
- * touches the machine-wide anchor (writeExclusiveDurableFile in
- * cli/castle-wall.ts runs ahead of writeGlobalPinnedPublicKey), so by the
- * time a refusal reaches the disposition resolver this file holds the exact
- * bytes that were offered to the anchor. Failure mode from the outside: an
- * undefined result here can only make the disposition MORE closed, never
- * less, which is why every read failure collapses to undefined.
- */
-async function readFortressCastlePublicKey(
-  fortressPath: string,
-): Promise<Uint8Array | undefined> {
-  try {
-    const bytes = await readFile(join(fortressPath, CASTLE_PINNED_PUBKEY));
-    return bytes.byteLength === ED25519_PUBLIC_KEY_BYTES ? bytes : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 /** What a failed init actually undid, for the one-line operator summary. */
 interface InitCleanupSummary {
   rolledBack: boolean;
   rollbackIncomplete: boolean;
+  /**
+   * The announced recovery-key file this run's rollback REMOVED, because the
+   * rollback also removed the custody that key unwrapped. Set only when the
+   * removal actually happened.
+   */
+  removedAnnouncedRecoveryFile?: string;
+  /**
+   * The announced recovery-key file this run could NOT remove (it had changed
+   * identity, or the unlink failed). It is still on disk and still opens
+   * nothing, so the operator has to clear it before a retry can write there.
+   */
   preservedRecoveryFile?: string;
 }
 
@@ -629,17 +437,26 @@ function printInitCleanupSummary(
       `Nothing was cleaned up automatically; inspect ${fortressPath} before retrying.`,
     );
   }
+  const removed = summary.removedAnnouncedRecoveryFile;
+  if (removed) {
+    // The file this run announced is GONE, and saying so is the whole point:
+    // an operator who was told to save a recovery key and then reads a silent
+    // failure summary keeps guarding a key for a fortress that no longer
+    // exists. The rollback removed the custody that key unwrapped, so the key
+    // could open nothing; leaving it behind only made the retry fail on it.
+    parts.push(
+      `Removed: ${removed} (the recovery key this run told you to save). The cleanup above removed the custody it unwrapped, so it could no longer open anything; if you already copied it somewhere, that copy is equally useless and can be deleted.`,
+    );
+  }
   const kept = summary.preservedRecoveryFile;
   if (kept) {
-    // Say what the kept file IS now, not only that it was kept. After a clean
-    // rollback the custody it unwrapped is gone, so it is a valid recovery
-    // key for a fortress that no longer exists: keeping it costs nothing but
-    // it recovers nothing either. Without the rollback it may still be the
-    // only way into whatever survived.
+    // Reached only when the removal could NOT be completed (the file changed
+    // identity under us, or the unlink failed). Failure mode from the outside:
+    // the retry refuses on exactly this path, so the summary must name it.
     parts.push(
       cleanRollback
-        ? `Kept on purpose: ${kept} (the recovery key this run already told you to save). Init never deletes a key it has announced. The cleanup above removed the custody that key unwrapped, so it is now a valid recovery key for a fortress that no longer exists and can recover nothing.`
-        : `Kept on purpose: ${kept} (the recovery key this run already told you to save). ${fortressPath} was NOT fully cleaned up, so this key may still be the only way into whatever custody survived there; keep it until you have inspected that directory.`,
+        ? `Still on disk: ${kept} (the recovery key this run told you to save). It could not be removed automatically. The cleanup above removed the custody it unwrapped, so it opens nothing.`
+        : `Still on disk: ${kept} (the recovery key this run told you to save). ${fortressPath} was NOT fully cleaned up, so this key may still be the only way into whatever custody survived there; keep it until you have inspected that directory.`,
     );
   }
   if (cleanRollback) {
@@ -647,12 +464,13 @@ function printInitCleanupSummary(
     // The next step has to be a step that WORKS. Init refuses to reuse an
     // existing recovery-key destination (single issuance: overwriting one
     // would destroy a key that may still be authoritative), and --force does
-    // not relax that refusal, so a bare re-run while the kept file is still
-    // at the default destination fails on exactly the file this summary just
-    // told the operator about. Name the removal first, with the exact path.
+    // not relax that refusal, so a retry can only be a bare re-run once the
+    // destination is clear. It IS clear on the ordinary path now, because the
+    // rollback removed the file it announced; the `rm` line survives only for
+    // the case where that removal did not complete.
     parts.push(
       kept
-        ? `Next step: fix the reported cause, then clear the kept recovery file before retrying. Init refuses to write over an existing recovery-key destination (and --force does not change that), so the retry fails while that path exists:\n      rm ${shellQuote(kept)}\n      ${retry}\n    Move the file off-host first if you want to keep a copy; after the cleanup above it opens nothing.`
+        ? `Next step: fix the reported cause, then clear the leftover recovery file before retrying. Init refuses to write over an existing recovery-key destination (and --force does not change that), so the retry fails while that path exists:\n      rm ${shellQuote(kept)}\n      ${retry}`
         : `Next step: fix the reported cause, then re-run \`${retry}\`.`,
     );
   } else {
@@ -820,6 +638,30 @@ export async function runInit(
       }
       const keychainMutations: Array<Pick<KeychainMutation<unknown>, "rollback" | "commit">> = [];
       const externalRollback: Array<() => Promise<void>> = [];
+      /**
+       * Rollback steps that may run ONLY AFTER the custody they depend on is
+       * confirmed gone.
+       *
+       * ORDERING INVARIANT, and the reason this is a second list rather than
+       * one more entry in `externalRollback`: the recovery key this run wrote
+       * unwraps the custody this run wrote. Removing the key first and then
+       * failing to remove the custody leaves custody on disk with its recovery
+       * factor destroyed, while the cleanup summary tells the operator the key
+       * "could no longer open anything" — the one sentence that is false in
+       * exactly that case. Removing custody first is safe in the mirror case:
+       * a recovery key with no custody opens nothing whether or not the file
+       * survives, and the summary already has a branch that names a surviving
+       * file. Deletion order therefore follows the dependency, never the write
+       * order.
+       */
+      const afterCustodyRemovalRollback: Array<() => Promise<void>> = [];
+      /**
+       * The recovery-key file this run actually wrote, or null when it wrote
+       * none. Recorded at write time so the rollback can name it without
+       * re-deriving a path: the summary must never claim a file is still on
+       * disk when no file was ever written there.
+       */
+      let writtenRecoveryKeyFilePath: string | null = null;
       // The preflight emptiness check happened before the lock existed. Repeat
       // both the broad filesystem check and custody-current-state reads now,
       // under the same lock used by reset and rotation, so a concurrent winner
@@ -989,9 +831,9 @@ export async function runInit(
   let prewrittenRecoveryKeyFile:
     | Awaited<ReturnType<typeof writeRecoveryKeyFile>>
     | undefined;
-  // Announced-file bookkeeping for the rollback below: once the operator has
-  // been TOLD about this file it is theirs, and a later failure must not
-  // delete the only plaintext copy of a key they were instructed to save.
+  // Announced-file bookkeeping for the rollback below. The announcement used to
+  // make the file untouchable; it no longer does, and the reason is at the
+  // rollback site.
   let recoveryKeyFileAnnounced = false;
   {
     try {
@@ -1009,15 +851,24 @@ export async function runInit(
       );
       if (prewrittenRecoveryKeyFile.written) {
         const writtenIdentity = await lstat(recoveryKeyOutputPath);
-        externalRollback.push(async () => {
-          if (recoveryKeyFileAnnounced) {
-            // Honesty over tidiness: init already printed this path and told
-            // the operator to save it. Deleting it here is exactly the
-            // "announced a recovery key, then removed it" failure; leave the
-            // file and let the cleanup summary name it instead.
-            cleanupSummary.preservedRecoveryFile = recoveryKeyOutputPath;
-            return;
-          }
+        writtenRecoveryKeyFilePath = recoveryKeyOutputPath;
+        // Deferred until custody removal is CONFIRMED; see the ordering
+        // invariant on `afterCustodyRemovalRollback`.
+        afterCustodyRemovalRollback.push(async () => {
+          // INVARIANT: this rollback runs only when init FAILED, and it runs
+          // alongside the removal of the custody this key unwraps. A key whose
+          // custody is gone opens nothing, so leaving it behind announced a
+          // live recovery key for a fortress that no longer exists: the
+          // operator guarded a useless secret, and the retry then refused on
+          // exactly that path (init never overwrites a recovery destination).
+          // The announcement therefore does NOT protect the file; the removal
+          // is reported in the cleanup summary in one sentence.
+          //
+          // Failure mode from the outside if the identity guard below is
+          // dropped: a destination that was replaced between the write and the
+          // failure (a symlink swapped in, a different file at the same path)
+          // gets unlinked, and this rollback deletes something it never wrote.
+          // A file it cannot prove it wrote is left alone and named instead.
           let current: Awaited<ReturnType<typeof lstat>>;
           try {
             current = await lstat(recoveryKeyOutputPath);
@@ -1030,6 +881,13 @@ export async function runInit(
             current.dev !== writtenIdentity.dev ||
             current.ino !== writtenIdentity.ino
           ) {
+            if (recoveryKeyFileAnnounced) {
+              // Announced, and not provably ours any more. Say it is still
+              // there rather than throwing: a rollback that aborts here would
+              // report an incomplete cleanup for a file it must not touch.
+              cleanupSummary.preservedRecoveryFile = recoveryKeyOutputPath;
+              return;
+            }
             throw new Error("recovery-key output changed before init rollback");
           }
           await unlink(recoveryKeyOutputPath);
@@ -1038,6 +896,9 @@ export async function runInit(
             await parent.sync();
           } finally {
             await parent.close();
+          }
+          if (recoveryKeyFileAnnounced) {
+            cleanupSummary.removedAnnouncedRecoveryFile = recoveryKeyOutputPath;
           }
         });
       }
@@ -1185,8 +1046,8 @@ export async function runInit(
       });
       await (deps.verifyRecoveryKeyReentry ?? verifyRecoveryKeyReentry)({
         // Say only what is true at this instant. Re-entry proves the key
-        // unwraps the master; identity seeding and Castle Wall pin
-        // provisioning still follow, and a failure in either used to leave
+        // unwraps the master; identity seeding and this vault's Castle Wall
+        // key provisioning still follow, and a failure in either used to leave
         // the operator holding a bare "Recovery key verified." from a run
         // that then died.
         verifiedMessage: INIT_RECOVERY_KEY_VERIFIED_MESSAGE,
@@ -1334,7 +1195,7 @@ export async function runInit(
         // has done its job (success, the skip path, or error), mirroring how
         // the raw private key is zeroed inside createIdentity. masterKey
         // itself is zeroed on the error path below and on the success path
-        // after pin provisioning.
+        // after the fortress-local Castle key provisioning.
         identityEncKey.fill(0);
       }
     } catch (err) {
@@ -1434,10 +1295,24 @@ export async function runInit(
       }
     }
   };
-  // Castle Wall global-pin provisioning. By default init writes the
-  // machine-wide enforcement anchor; --no-pin (or SANCTUARY_INIT_NO_PIN)
-  // skips it so a test/isolated fortress never silently touches the
-  // host-wide trust anchor. The skip is audited, not silent.
+  // Castle Wall provisioning for THIS FORTRESS.
+  //
+  // INVARIANT (one anchor writer, 2026-09-09): init mints this fortress's own
+  // Castle key pair and writes the fortress-local `castle-pinned-pubkey.bin`.
+  // It does not read, compare, or write the machine-wide enforcement anchor.
+  // In production the Castle Wall daemon signs through the ROOT SIGNER HELPER
+  // and the trust anchor is DEFINED as "machine-wide pin == signer-helper key"
+  // (cli/install.ts parseTrustAnchor), so an init-time publication of a
+  // fortress-local key there contradicted that definition: on a fresh Mac it
+  // wrote a key the arm step then had to overwrite, and on any Mac that had
+  // ever been armed it refused, so `sanctuary init` could not create a first
+  // vault at all. Turning the wall ON for this vault is a separate, confirmed
+  // operator step (`castle-wall re-pin`, then arm), and it is the only thing
+  // that touches the machine-wide anchor.
+  //
+  // Failure mode from the outside if this is ever re-added: `init` on an
+  // upgrader's Mac refuses with trust-anchor vocabulary on the operator's very
+  // first command, and the fortress it half-built is rolled back.
   const skipPin = resolveNoPin(options);
   if (skipPin) {
     await fencedInit(lease, deps, "audit-pin-skip", () => auditLog.appendCritical({
@@ -1451,18 +1326,54 @@ export async function runInit(
       },
     }));
   }
+
+  // The named wall state for THIS VAULT, persisted as an explicit token rather
+  // than left as an absence: every consumer used to infer wall state from
+  // host-wide facts (an activated system extension, a machine-wide pin file),
+  // and none of those is a claim about a vault. `not_yet_walled` is the only
+  // value anything ever writes; `walled` is derived at read time from the
+  // helper-authoritative anchor verdict AND this fortress's own arm evidence.
+  // See castle-wall/provision-state.ts.
+  await fencedInit(lease, deps, "castle-wall-provision-state", () =>
+    storage.write(
+      "_meta",
+      CASTLE_WALL_PROVISION_META_KEY,
+      stringToBytes(CASTLE_WALL_NOT_YET_WALLED),
+    ),
+  );
+  // The init decision is audited with the SAME operation name the skip uses;
+  // the reason string is what tells a later reader which decision was made. A
+  // new operation name would be a new audit surface for no added meaning.
+  await fencedInit(lease, deps, "audit-castle-wall-provision-state", () =>
+    auditLog.appendCritical({
+      layer: "l2",
+      operation: "castle_pin_provision_skipped",
+      identity_id: fortressId,
+      result: "success",
+      details: {
+        source: "sanctuary-init",
+        reason: "init-does-not-touch-machine-wide-anchor",
+      },
+    }),
+  );
   await fencedInit(lease, deps, "audit-final-flush", () => auditLog.flush());
 
   if (skipPin) {
     const skipSource = options.noPin ? "--no-pin" : "SANCTUARY_INIT_NO_PIN";
+    // DEPRECATION, not a behavior branch. The flag and the environment variable
+    // are still PARSED and still ACCEPTED (the acceptance kit and the install
+    // docs pass them, and an operator's saved command must not start failing),
+    // but there is nothing left for them to skip: default init already leaves
+    // the machine-wide anchor alone. Keep the parser; say so once.
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
     console.error(
-      `\n  Sanctuary init: global Castle Wall pin NOT provisioned (${skipSource}).\n` +
-        `  This fortress did NOT touch the machine-wide enforcement anchor at\n` +
-        `    ${GLOBAL_CASTLE_PIN_PATH}\n` +
-        `  Run \`sanctuary castle-wall provision-pin\` against this fortress when ready.\n`,
+      `\n  Sanctuary init: ${skipSource} is accepted but no longer does anything.\n` +
+        `  Creating a vault never changes this Mac's Castle Wall settings, with or\n` +
+        `  without that option. You can stop passing it.\n`,
     );
-  } else {
+  }
+
+  {
     type PinExecution = number | {
       code: number;
       stdout: string;
@@ -1472,7 +1383,7 @@ export async function runInit(
     const pinExecution = await fencedInit<PinExecution>(
       lease,
       deps,
-      "hostwide-castle-pin",
+      "fortress-castle-key",
       async () => {
         // The injected implementation is a test seam and must remain observable
         // in the parent. Production uses the inode-bound worker so its
@@ -1519,52 +1430,22 @@ export async function runInit(
       for (const warning of pinExecution.warnings) console.warn(warning);
     }
     if (pinResult !== 0) {
-      // provision-pin never overwrites an established anchor, so a refusal on
-      // a machine that already has one is the ordinary "an older install left
-      // a pin" case, not a corrupt fortress. Decide from what is actually on
-      // this host rather than failing every default init on such a machine.
-      const disposition = await resolvePreExistingGlobalPinDisposition(
-        deps,
-        lockedFortressPath,
-      );
-      if (disposition.kind === "fail-closed") {
-        // The default. Everything that is not a proven-safe adopt lands here,
-        // including every case where an observation could not be made.
-        throw new Error(
-          `Castle Wall provision-pin auto-bootstrap failed: ${disposition.reason}`,
-        );
-      }
-      // Both adopt outcomes are audited with the SAME operation and different
-      // reasons: neither wrote the anchor, and the reason is what tells a
-      // later reader which of the two proofs was actually made. A new
-      // operation name would be a new audit surface for no added meaning.
-      await fencedInit(lease, deps, "audit-pin-preexisting", () =>
-        auditLog.appendCritical({
-          layer: "l2",
-          operation: "castle_pin_provision_skipped",
-          identity_id: fortressId,
-          result: "success",
-          details: {
-            source: "sanctuary-init",
-            reason: disposition.auditReason,
-          },
-        }),
-      );
-      await fencedInit(lease, deps, "audit-pin-preexisting-flush", () =>
-        auditLog.flush(),
-      );
-      // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-      console.error(
-        disposition.kind === "adopt-existing-pin"
-          ? `\n  Sanctuary init: ${disposition.sentence}\n` +
-            `  The anchor at ${GLOBAL_CASTLE_PIN_PATH} was read and left exactly as it was.\n` +
-            `  No next step is needed for the pin.\n`
-          : `\n  Sanctuary init: ${disposition.sentence}\n` +
-            `  This fortress was created WITHOUT a Castle Wall pin (the same result as --no-pin);\n` +
-            `  the existing anchor at ${GLOBAL_CASTLE_PIN_PATH} was read and left exactly as it was.\n` +
-            `  Next step, only when you intend to arm the wall: sanctuary castle-wall re-pin\n`,
+      // This step is now purely fortress-local (mint a key pair, write two
+      // files under the fortress root), so a non-zero exit means the FORTRESS
+      // could not be provisioned, not that some other install owns a
+      // machine-wide file. MUST-NEVER #5: fail, never degrade.
+      throw new Error(
+        `Castle Wall key provisioning failed for this fortress (exit ${pinResult}); ` +
+          "the fortress-local Castle key pair was not created",
       );
     }
+    // The one operator sentence about the wall, in the words of someone who has
+    // not yet met the word "pin".
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `\n  Sanctuary init: your vault is created.\n` +
+        `  ${CASTLE_WALL_NOT_YET_WALLED_SENTENCE}\n`,
+    );
   }
 
   masterKey.fill(0);
@@ -1606,10 +1487,33 @@ export async function runInit(
               { cause: error },
             );
           }
+          // CUSTODY REMOVAL. Everything in `afterCustodyRemovalRollback` waits
+          // on this succeeding; see the ordering invariant where that list is
+          // declared. Failure mode from the outside if this is reordered: the
+          // announced recovery key is gone and the custody it unwrapped is
+          // still on disk, so the operator has destroyed their only recovery
+          // factor for a fortress that survived — and the summary says the
+          // opposite.
+          let custodyRemoved = true;
           try {
             await files.restoreFreshLockScaffold(CUSTODY_WRITE_LOCK_FILE);
           } catch (rollbackError) {
+            custodyRemoved = false;
             rollbackFailure ??= rollbackError;
+          }
+          if (custodyRemoved) {
+            for (const rollback of [...afterCustodyRemovalRollback].reverse()) {
+              try {
+                await rollback();
+              } catch (rollbackError) {
+                rollbackFailure ??= rollbackError;
+              }
+            }
+          } else if (writtenRecoveryKeyFilePath !== null) {
+            // Keep the key. It is the only thing that can still open whatever
+            // custody survived, and the summary's `preservedRecoveryFile`
+            // branch is the one sentence that says so.
+            cleanupSummary.preservedRecoveryFile = writtenRecoveryKeyFilePath;
           }
           lease.assertHeld();
           // Record what this run undid so the outer handler can say it in one
@@ -1755,15 +1659,11 @@ Options:
                        <fortress-id>-recovery-key.txt" (directory mode 0700,
                        file mode 0600). The key is NEVER written inside the
                        fortress it protects.
-  --no-pin             Do NOT provision the machine-wide Castle Wall pin.
-                       Default init writes the host-wide enforcement anchor
-                       at /Library/Application Support/Sanctuary/; use this
-                       for a test or side-by-side isolated fortress so it
-                       never touches that anchor. The skip is audited, and
-                       init prints a reminder to run
-                       \`sanctuary castle-wall provision-pin\` when ready.
-                       Also settable via SANCTUARY_INIT_NO_PIN=1 for
-                       non-interactive harnesses.
+  --no-pin             Accepted, does nothing. Creating a vault never
+                       changes this Mac's Castle Wall settings, so there is
+                       nothing for this option to skip. It stays accepted so
+                       saved commands keep working. Also settable via
+                       SANCTUARY_INIT_NO_PIN=1.
   --no-identity        Do NOT seed the default operator identity. Default
                        init mints one Ed25519 operator identity under the
                        fortress's existing custody so federation admin verbs
@@ -1805,17 +1705,11 @@ What init does:
      with. Idempotent: an existing default identity is left unchanged.
   7. Writes the default principal-policy.yaml, the approval-gate policy the
      runtime loads at startup and \`sanctuary doctor\` checks for.
-  8. Provisions the machine-wide Castle Wall pin (the host-wide enforcement
-     anchor) unless --no-pin (or SANCTUARY_INIT_NO_PIN) is set, in which
-     case it records an audited castle_pin_provision_skipped entry and
-     prints a reminder to provision the pin explicitly when ready. When an
-     older install already left a pin, init creates the fortress without a
-     pin only when BOTH observations come back negative: no Castle Wall app
-     in any documented location AND the Castle Wall system extension read as
-     not activated. It says so, and never modifies the existing pin. If
-     either observation is undetermined, or either one is positive, init
-     refuses and names both observations rather than guessing that nothing
-     is enforcing the anchor.
+  8. Creates this vault's own Castle Wall key pair, inside the fortress
+     directory, and records that the vault is not yet on the Castle Wall of
+     this Mac. Init never reads or changes this Mac's Castle Wall settings:
+     turning the wall on for a vault is a separate step you run when you
+     mean to, and it is the installer's next action.
 
 After init:
   - Run \`sanctuary wrap --fortress <path>\` to bind the fortress to an

@@ -737,6 +737,13 @@ export async function createSanctuaryServer(options?: {
   const l2Tools: ToolDefinition[] = [
     {
       name: "exec_attest",
+      // release/1.8.6 branch note: this call site's buildHealthEvidenceReport
+      // never receives a castleWall snapshot here (that wiring is
+      // castleWallSnapshotForHealthReport in server/src/health/castle-wall-
+      // detector.ts, a module the Linux Castle Wall reconstruction (#1398)
+      // introduces and this branch does not carry), so castle_wall.vault_
+      // provision is never populated by this handler on this branch. The
+      // description is kept to what this branch actually returns.
       description:
         "Generate an attestation of the current execution environment, " +
         "including sovereignty assessment and degradation report.",
@@ -817,6 +824,14 @@ export async function createSanctuaryServer(options?: {
       // whatever runtime snapshot is wired in (often "unknown" when none is),
       // and the disclosure/reputation layers report configured-vs-verified, not
       // observed enforcement. Describe what the tool actually returns.
+      //
+      // release/1.8.6 branch note: this call site's buildHealthEvidenceReport
+      // never receives a castleWall snapshot here (that wiring is
+      // castleWallSnapshotForHealthReport in server/src/health/castle-wall-
+      // detector.ts, a module the Linux Castle Wall reconstruction (#1398)
+      // introduces and this branch does not carry), so castle_wall.vault_
+      // provision is never populated by this handler on this branch; the
+      // vault_provision sentence is dropped until that wiring lands.
       description:
         "Report this instance's health and sovereignty posture: overall state (healthy/degraded/compromised), versions, Castle Wall status (active/unknown/not_configured depending on what runtime detector is wired in), and audit/state/egress posture, plus any active degradations. Disclosure and reputation layers report configured-but-unverified posture, not observed enforcement. Read-only, unsigned local status: for a signed, shareable sovereignty advertisement use shr_generate instead.",
       inputSchema: { type: "object", properties: {} },
