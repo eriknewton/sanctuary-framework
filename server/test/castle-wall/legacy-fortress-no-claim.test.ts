@@ -35,8 +35,6 @@ import {
 } from "../../src/castle-wall/provision-state.js";
 import { runDoctorChecks } from "../../src/cli/doctor.js";
 import { runStatus } from "../../src/cli/castle-wall.js";
-import { castleWallSnapshotForHealthReport } from "../../src/health/castle-wall-detector.js";
-import { evaluateCastleWall } from "../../src/health/evidence.js";
 import {
   getProtectionSnapshot,
   type AggregatorSources,
@@ -150,16 +148,12 @@ describe("a legacy fortress with no castle-wall-provision record", () => {
     expect(text).not.toContain("Vault wall provisioning:");
   });
 
-  it("the health snapshot and evidence surface carry no vault claim", async () => {
-    const snapshot = await castleWallSnapshotForHealthReport({
-      config: { storage_path: fortressPath },
-      masterKey: new Uint8Array(32),
-      overrides: { platform: "darwin" },
-    });
-    expect(snapshot).toBeUndefined();
-    const evidence = evaluateCastleWall(snapshot);
-    expect(evidence).not.toHaveProperty("vault_provision");
-  });
+  // NOTE (release/1.8.6 branch): "the health snapshot and evidence surface
+  // carry no vault claim" is intentionally dropped from this cherry-pick. It
+  // exercises castleWallSnapshotForHealthReport in
+  // server/src/health/castle-wall-detector.ts, a module introduced by the
+  // Linux Castle Wall reconstruction (#1398), which this release branch does
+  // not carry (base 913fa8b9 predates it).
 
   it("the dashboard protection snapshot never marks it walled", async () => {
     const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
