@@ -114,7 +114,7 @@ Failure modes:
 
 ## 5. Re-pin to the signer helper
 
-Migrate the enforcement trust anchor to the approved root signer helper:
+Put the enforcement trust anchor in the hands of the approved root signer helper. This is the step that turns the Castle Wall on for the vault you created, and it is the only command that changes this Mac's trust anchor. Creating a vault never does.
 
 ```bash
 sanctuary castle-wall re-pin
@@ -126,7 +126,9 @@ Expected stderr announcement starts with:
 Re-pinning trust anchor for fortress: <fortress-path>
 ```
 
-This line is informational even though it goes to stderr. The command derives the master key after this announcement, so a normal passphrase or custody prompt can still appear before it completes.
+The command then asks you to confirm, and continues only when you type the word it names. It runs in a terminal you are sitting at: with no terminal it refuses, and there is no flag or environment variable that skips the question. The master key is derived after the confirmation, so a normal passphrase or custody prompt can still appear before it completes.
+
+Failure mode: `Refusing: castle-wall re-pin requires an interactive terminal.` means the command was started by something that has no terminal (a script, a scheduled job, or an agent). Run it yourself from a local Terminal window.
 
 Check helper readiness:
 

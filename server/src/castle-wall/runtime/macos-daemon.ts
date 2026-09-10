@@ -2399,6 +2399,17 @@ async function loadLocalSigningKey(
  * (`helper-signer.ts installPin()`, NOT routed here) migrates an established
  * pin. `globalPinPath` mirrors the existing helper-mode cross-check seam so the
  * guard is testable without the real `/Library` path.
+ *
+ * NON-PRODUCTION (invariant, stated at the enforcement site): the write below
+ * is reachable ONLY on the dev/test local-sign path (`signer.mode !== "helper"`,
+ * i.e. SANCTUARY_CASTLE_LOCAL_SIGN=1 or an explicit `localSign: true`). Since
+ * 2026-09-09 it is the ONLY caller of `writeGlobalPinIfUnestablished` anywhere
+ * in the tree: `provision-pin` no longer publishes the machine-wide anchor, so
+ * the sole production writer is the helper's `installPin()` behind the confirmed
+ * `castle-wall re-pin` verb. Failure mode if this is ever reached in
+ * production: a fortress-local key lands at the machine-wide path, the
+ * signer-helper comparison reads BROKEN, and the boot daemon crash-loops
+ * because it cannot sign a manifest the extension will accept.
  */
 export async function writeSystemPinnedPublicKey(
   signer: DaemonSigner,

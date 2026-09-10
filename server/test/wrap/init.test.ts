@@ -866,7 +866,7 @@ describe("runInit", () => {
           },
         },
       ),
-    ).rejects.toThrow("Castle Wall provision-pin auto-bootstrap failed");
+    ).rejects.toThrow("Castle Wall key provisioning failed for this fortress");
 
     expect(localSetupInvoked).toBe(false);
     expect(localSetupMaster).toBeDefined();
@@ -1549,11 +1549,12 @@ describe("--no-pin (Castle Wall global-pin skip)", () => {
     }>;
   }
 
-  it("--no-pin NEVER invokes provision-pin (the global-anchor write path)", async () => {
-    // Directly prove the invariant: the provision-pin call (which is what
-    // writes the machine-wide /Library/Application Support/Sanctuary anchor)
-    // is never reached. A spy is more robust than checking a per-fortress
-    // file path, since it pins the actual code path that touches the anchor.
+  it("--no-pin is a no-op: the same vault, with its own Castle key", async () => {
+    // The option used to skip an init-time write of the machine-wide anchor.
+    // Default init no longer touches that anchor, so there is nothing left to
+    // skip and the flag must not change what the vault gets. It stays accepted
+    // because saved operator commands, the release acceptance kit, and the
+    // published install docs pass it.
     const fortressPath = join(tmp, "no-pin-spy-fortress");
     let calls = 0;
     await runInit(
@@ -1565,12 +1566,7 @@ describe("--no-pin (Castle Wall global-pin skip)", () => {
         },
       },
     );
-    expect(calls).toBe(0);
-
-    // And no per-fortress pinned key is written either.
-    await expect(
-      stat(join(fortressPath, "castle-pinned-pubkey.bin")),
-    ).rejects.toThrow();
+    expect(calls).toBe(1);
   });
 
   it("default init (no flag) DOES invoke provision-pin and writes the per-fortress key", async () => {
@@ -1597,7 +1593,7 @@ describe("--no-pin (Castle Wall global-pin skip)", () => {
     expect(sawStorageRealPath).toBe(await realpath(fortressPath));
   });
 
-  it("default init with the REAL provision-pin writes the per-fortress pinned key", async () => {
+  it("default init with the REAL provisioning writes the per-fortress key and no machine-wide anchor", async () => {
     const fortressPath = join(tmp, "default-pin-real-fortress");
     const globalPinPath = join(tmp, "default-pin-real-global", "castle-pinned-pubkey.bin");
     await mkdir(join(tmp, "default-pin-real-global"), { recursive: true });
@@ -1614,7 +1610,10 @@ describe("--no-pin (Castle Wall global-pin skip)", () => {
     const st = await stat(join(fortressPath, "castle-pinned-pubkey.bin"));
     expect(st.isFile()).toBe(true);
     expect(st.size).toBe(32);
-    expect((await stat(globalPinPath)).size).toBe(32);
+    // Creating a vault publishes nothing at the machine-wide path: the trust
+    // anchor is defined as the signer helper's key, so a fortress-local key
+    // there could only contradict it. Only a confirmed re-pin writes it.
+    await expect(stat(globalPinPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("--no-pin records an audited castle_pin_provision_skipped entry", async () => {
@@ -1636,7 +1635,10 @@ describe("--no-pin (Castle Wall global-pin skip)", () => {
     expect(skip!.details?.reason).toBe("--no-pin");
   });
 
-  it("default init does NOT record a skip entry", async () => {
+  it("default init audits the decision not to touch the machine-wide anchor", async () => {
+    // Same operation name the flag path uses; the REASON is what tells a later
+    // reader which decision this was. A new operation name would be a new audit
+    // surface for no added meaning.
     const fortressPath = join(tmp, "default-no-skip-fortress");
     const result = await runInit({ fortress: fortressPath, noConfirm: true });
 
@@ -1644,19 +1646,25 @@ describe("--no-pin (Castle Wall global-pin skip)", () => {
       fortressPath,
       result.recoveryKeyDisclosurePath,
     );
-    expect(
-      entries.find((e) => e.operation === "castle_pin_provision_skipped"),
-    ).toBeUndefined();
+    const decision = entries.find(
+      (e) => e.operation === "castle_pin_provision_skipped",
+    );
+    expect(decision).toBeDefined();
+    expect(decision!.details?.reason).toBe("init-does-not-touch-machine-wide-anchor");
   });
 
-  it("SANCTUARY_INIT_NO_PIN=1 skips provision-pin for non-interactive harnesses", async () => {
+  it("SANCTUARY_INIT_NO_PIN=1 is accepted and audited, and still builds the same vault", async () => {
     const fortressPath = join(tmp, "env-no-pin-fortress");
     process.env.SANCTUARY_INIT_NO_PIN = "1";
     const result = await runInit({ fortress: fortressPath, noConfirm: true });
 
+    // The vault is built either way; the variable now selects only the
+    // deprecation line and its audit reason. (This helper stubs the
+    // provisioning call, so the per-fortress key file is asserted by the
+    // REAL-provisioning case above.)
     await expect(
-      stat(join(fortressPath, "castle-pinned-pubkey.bin")),
-    ).rejects.toThrow();
+      stat(join(fortressPath, "state", "_meta", "custody-envelope.enc")),
+    ).resolves.toBeDefined();
 
     const entries = await readSkipAudit(
       fortressPath,

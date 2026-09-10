@@ -34,6 +34,12 @@ import {
   PRINCIPAL_POLICY_FILENAME,
 } from "../principal-policy/loader.js";
 import { resolveStoragePath } from "../paths.js";
+// The vault-level wall claim. Must match the writer in wrap/init.ts: doctor
+// reports on the SAME named state init persists, never a second derivation.
+import {
+  CASTLE_WALL_NOT_YET_WALLED,
+  readPersistedCastleWallProvision,
+} from "../castle-wall/provision-state.js";
 import { checkNodeVersion } from "./node-version.js";
 import { verifyFortressAuditFullPicture } from "../operational/audit-store-split.js";
 import {
@@ -837,6 +843,18 @@ function checkRuntime(): DoctorCheck {
   );
 }
 
+/**
+ * Castle Wall check.
+ *
+ * INVARIANT (the reason this reads two things, not one): the system-extension
+ * list is a claim about the MACHINE, never about THIS VAULT. A Mac that was
+ * armed by an earlier install still lists `[activated enabled]` long after
+ * that install is gone, so reporting OK from that line alone told a brand-new
+ * vault's owner that their vault was protected by a wall it is not on. The
+ * fortress's own `not_yet_walled` claim (castle-wall/provision-state.ts) is
+ * the vault-level half, and while it stands this check is a WARN naming the
+ * gap, whatever the machine's extension list says.
+ */
 async function checkCastleWall(opts: {
   storagePath: string;
   env: NodeJS.ProcessEnv;
@@ -852,6 +870,11 @@ async function checkCastleWall(opts: {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
       }).trim());
+  // Read the vault-level claim FIRST, so every return below can consult it.
+  // A read failure is not a claim of health: `unreadable` and `absent` both
+  // leave the machine-level verdict standing, they never upgrade it.
+  const vault = await readPersistedCastleWallProvision(opts.storagePath);
+  const notYetWalled = vault.state === "not-yet-walled";
   try {
     const raw = execSyncFn("systemextensionsctl list 2>/dev/null | grep castle-wall");
     const state = raw.includes("[activated enabled]")
@@ -859,6 +882,14 @@ async function checkCastleWall(opts: {
       : raw.includes("[activated waiting for user]")
         ? "[activated waiting for user]"
         : "not loaded";
+    if (notYetWalled) {
+      return {
+        name: "castle wall sysext",
+        status: "WARN",
+        message: `${state}; this vault is not on that wall (${CASTLE_WALL_NOT_YET_WALLED})`,
+        hint: "turn the Castle Wall on for this vault: run the installer's next step (sanctuary castle-wall re-pin, then arm)",
+      };
+    }
     const status = state === "[activated enabled]" ? "OK" : "WARN";
     return {
       name: "castle wall sysext",
@@ -867,7 +898,13 @@ async function checkCastleWall(opts: {
       hint: status === "OK" ? "none" : "approve the system extension in System Settings",
     };
   } catch {
-    return warn("castle wall sysext", "not loaded", "run sanctuary castle-wall status");
+    return warn(
+      "castle wall sysext",
+      notYetWalled
+        ? `not loaded; this vault is not on the wall (${CASTLE_WALL_NOT_YET_WALLED})`
+        : "not loaded",
+      "run sanctuary castle-wall status",
+    );
   }
 }
 

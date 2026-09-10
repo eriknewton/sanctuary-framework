@@ -739,7 +739,12 @@ export async function createSanctuaryServer(options?: {
       name: "exec_attest",
       description:
         "Generate an attestation of the current execution environment, " +
-        "including sovereignty assessment and degradation report.",
+        "including sovereignty assessment and degradation report. The " +
+        "castle_wall block reports the runtime detector's verdict and, when " +
+        "this vault carries the claim, its own vault_provision state: " +
+        "not_yet_walled means this vault has not been put on this machine's " +
+        "Castle Wall, whatever the machine's own enforcement state is, so do " +
+        "not read a healthy wall runtime as protection for this vault.",
       inputSchema: {
         type: "object",
         properties: {
@@ -823,7 +828,7 @@ export async function createSanctuaryServer(options?: {
       // and the disclosure/reputation layers report configured-vs-verified, not
       // observed enforcement. Describe what the tool actually returns.
       description:
-        "Report this instance's health and sovereignty posture: overall state (healthy/degraded/compromised), versions, Castle Wall status (active/unknown/not_configured depending on what runtime detector is wired in), and audit/state/egress posture, plus any active degradations. Disclosure and reputation layers report configured-but-unverified posture, not observed enforcement. Read-only, unsigned local status: for a signed, shareable sovereignty advertisement use shr_generate instead.",
+        "Report this instance's health and sovereignty posture: overall state (healthy/degraded/compromised), versions, Castle Wall status (active/unknown/not_configured depending on what runtime detector is wired in), and audit/state/egress posture, plus any active degradations. The castle_wall block also carries vault_provision when this vault records one: not_yet_walled means this vault is not on this machine's Castle Wall, which is a separate question from whether a wall is running here, so a healthy wall runtime is not protection for this vault while that value stands. Disclosure and reputation layers report configured-but-unverified posture, not observed enforcement. Read-only, unsigned local status: for a signed, shareable sovereignty advertisement use shr_generate instead.",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
         const { buildHealthEvidenceReport, castleWallSnapshotForHealthReport } =

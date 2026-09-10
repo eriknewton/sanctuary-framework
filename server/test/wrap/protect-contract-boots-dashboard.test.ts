@@ -1,3 +1,4 @@
+// fail-before-exempt: fixture-only edit. The shared InstallProbeResult fixture gains the additive vaultProvision observation with the neutral "unknown" value; no assertion changed. The behavior it feeds is proven in test/cli/install.test.ts.
 /**
  * Capability under test (AGENTS.md rule 4, wired consumer): the credential
  * `sanctuary init` enrols is the credential every stage of the install
@@ -106,6 +107,9 @@ function baseProbe(over: Partial<InstallProbeResult>): InstallProbeResult {
     contentFilter: "not-applicable",
     enforcement: "not-applicable",
     trustAnchor: "not-applicable",
+    // Base fixture: this vault carries no wall claim, which is not a claim of
+    // protection either. Tests that need one set it explicitly.
+    vaultProvision: "unknown",
     operatorTwin: "not-applicable",
     stagedRecoveryFile: "absent",
     ...over,

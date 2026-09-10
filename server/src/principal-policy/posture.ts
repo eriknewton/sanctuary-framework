@@ -46,6 +46,13 @@ import {
   type AuditChainVerdict,
   type AuditChainVerdictStatus,
 } from "../operational/audit-log.js";
+// The vault-level wall claim + its ONE derivation chokepoint. This module
+// RENDERS the state; it never writes it (nothing writes `walled`).
+import {
+  deriveCastleWallProvision,
+  type CastleWallProvisionState,
+  type TrustAnchorVerdictObservation,
+} from "../castle-wall/provision-state.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import type { AgentPlatform } from "../wrap/config-reader.js";
 import type { SovereigntyTier } from "../reputation/tiers.js";
@@ -334,6 +341,26 @@ export interface CastleWallPosture {
    * `coarse_only` — never `armed`.
    */
   exclusive_egress?: ExclusiveEgressStatus;
+  /**
+   * ADDITIVE (2026-09-09): this VAULT's own Castle Wall provisioning state,
+   * present only when the fortress carries the claim `wrap/init.ts` persists.
+   * `arm_state` is untouched: it stays the closed enum
+   * {@link CastleWallArmState} and this value never feeds it.
+   *
+   * What each value means to a reader:
+   *  - `not_yet_walled` — the vault declared at creation that the wall had not
+   *    been turned on for it, and this surface has NOT positively proven both
+   *    halves of the pair that would clear it (helper-authoritative trust
+   *    anchor CONSISTENT AND this fortress armed).
+   *  - `walled` — both halves were positively observed here.
+   *
+   * STATED BOUND: a surface that cannot make the helper-authoritative anchor
+   * comparison reports `not_yet_walled` even for a vault whose `arm_state` is
+   * `armed`. That is deliberate under-claiming (AGENTS.md rule 1); it is never
+   * the other way round. Absent field = the fortress carries no claim (it
+   * predates this state), which is not a claim of protection either.
+   */
+  castle_wall_provision?: CastleWallProvisionState;
 }
 
 export interface BuildCastleWallPostureInput {
@@ -398,6 +425,20 @@ export interface BuildCastleWallPostureInput {
    * not supplying this object.
    */
   enforcementAvailability?: ResolvedEnforcementAvailability | null;
+  /**
+   * True when THIS fortress carries the persisted `not_yet_walled` claim
+   * (`readPersistedCastleWallProvision` in castle-wall/provision-state.ts
+   * returned `not-yet-walled`). Impure callers read it; this builder is pure.
+   * When false or absent, the additive `castle_wall_provision` field is omitted
+   * entirely rather than guessed.
+   */
+  vaultProvisionClaimed?: boolean;
+  /**
+   * The helper-authoritative trust-anchor verdict as THIS caller observed it.
+   * `unknown` is the honest default and never stands in for `consistent`; see
+   * the stated bound on {@link CastleWallPosture.castle_wall_provision}.
+   */
+  trustAnchor?: TrustAnchorVerdictObservation;
 }
 
 /**
@@ -423,6 +464,32 @@ function applyExclusiveEgress(
     ...posture,
     ...(capped ? { arm_state: "coarse_only" as const } : {}),
     exclusive_egress: exclusiveEgress,
+  };
+}
+
+/**
+ * Attach the vault's own wall claim, AFTER the exclusive-egress cap so the
+ * `armed` half of the derivation reads the FINAL arm-state (a capped
+ * `coarse_only` is not armed and must not clear the claim).
+ *
+ * The derivation itself lives in ONE place
+ * (`castle-wall/provision-state.ts deriveCastleWallProvision`); this function
+ * only decides whether there is a claim to render at all.
+ */
+function attachVaultProvision(
+  posture: CastleWallPosture,
+  input: Pick<
+    BuildCastleWallPostureInput,
+    "vaultProvisionClaimed" | "trustAnchor"
+  >,
+): CastleWallPosture {
+  if (input.vaultProvisionClaimed !== true) return posture;
+  return {
+    ...posture,
+    castle_wall_provision: deriveCastleWallProvision({
+      trustAnchor: input.trustAnchor ?? "unknown",
+      armed: posture.arm_state === "armed",
+    }),
   };
 }
 
@@ -470,7 +537,7 @@ export async function buildCastleWallPosture(
   // basis, so the reader must NOT fall back to the channel basis and render
   // green — it surfaces `degraded` (not-armed) until the key is readable again.
   if (input.producerKeyExpectedButUnavailable === true) {
-    return applyExclusiveEgress(
+    return attachVaultProvision(applyExclusiveEgress(
       {
         origin_machine: input.originMachine,
         arm_state: "degraded",
@@ -487,7 +554,7 @@ export async function buildCastleWallPosture(
           : {}),
       },
       input.exclusiveEgress,
-    );
+    ), input);
   }
 
   // Read the l1 (Castle Wall) slice over the digest window. The freshness
@@ -521,7 +588,7 @@ export async function buildCastleWallPosture(
   } catch {
     // A failed/ tainted read must NOT be reported as armed. Fail closed to
     // unknown with integrity flagged.
-    return applyExclusiveEgress(
+    return attachVaultProvision(applyExclusiveEgress(
       {
         origin_machine: input.originMachine,
         arm_state: "unknown",
@@ -538,7 +605,7 @@ export async function buildCastleWallPosture(
           : {}),
       },
       input.exclusiveEgress,
-    );
+    ), input);
   }
 
   const freshnessFloor = now - freshnessWindowMs;
@@ -863,7 +930,7 @@ export async function buildCastleWallPosture(
   // exclusive stack did not". `producer_authenticity` keeps describing the
   // wall-evidence basis it was computed from (the pill only renders it when
   // `armed`, so a capped posture surfaces the coarse-only story instead).
-  return applyExclusiveEgress(
+  return attachVaultProvision(applyExclusiveEgress(
     {
       origin_machine: input.originMachine,
       arm_state: armState,
@@ -883,7 +950,7 @@ export async function buildCastleWallPosture(
         : {}),
     },
     input.exclusiveEgress,
-  );
+  ), input);
 }
 
 /**

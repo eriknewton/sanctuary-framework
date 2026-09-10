@@ -44,6 +44,12 @@ import {
   bootServiceReady,
 } from "./castle-wall-boot.js";
 import { parseCastleWallState, runStatus, type SysextState } from "./castle-wall.js";
+// The vault-level wall claim + its ONE derivation chokepoint. The planner
+// reads it; only `wrap/init.ts` writes it.
+import {
+  deriveCastleWallProvision,
+  readPersistedCastleWallProvision,
+} from "../castle-wall/provision-state.js";
 // The sealed-runtime contract shared with the build gate and the manifest
 // builder (server/scripts/sealed-cli-runtime-entries.mjs); bundled into cli.js.
 import {
@@ -385,6 +391,8 @@ export interface AgentInstallPlan {
     // planner names re-pin as the remedy instead of leaving only the crash-loop
     // observable.
     trust_anchor: TrustAnchorObservation;
+    /** This VAULT's own wall claim; see InstallProbeResult.vaultProvision. */
+    vault_provision: "not-yet-walled" | "walled" | "unknown" | "not-applicable";
     operator_twin: InstallObservation;
   };
   next_action: AgentInstallAction | null;
@@ -420,6 +428,16 @@ export interface InstallProbeResult {
   contentFilter: "enabled" | "disabled" | "unknown" | "not-applicable";
   enforcement: "live" | "unavailable" | "undetermined" | "not-applicable";
   trustAnchor: TrustAnchorObservation;
+  /**
+   * THIS VAULT's own Castle Wall provisioning claim (castle-wall/
+   * provision-state.ts), as persisted by `init`. Distinct from every other
+   * observation in this record: the rest describe the MACHINE (an app, a system
+   * extension, a content filter, a machine-wide anchor), and a machine that was
+   * armed by an earlier install satisfies all of them while the vault in front
+   * of the operator is on no wall at all. `not-applicable` on non-macOS;
+   * `unknown` when the claim could not be read.
+   */
+  vaultProvision: "not-yet-walled" | "walled" | "unknown" | "not-applicable";
   operatorTwin: InstallObservation;
 }
 
@@ -1086,18 +1104,38 @@ export function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
           contentFilter: "not-applicable",
           enforcement: "not-applicable",
           trustAnchor: "not-applicable",
+          vaultProvision: "not-applicable",
           operatorTwin: "not-applicable",
         };
       }
-      const [castleWallApp, systemExtension, bootService, wall, operatorTwin] = await Promise.all([
-        verifiedCastleWallApp === null ? probeCastleWallApp() : verifiedCastleWallApp,
-        probeSystemExtension(),
-        probeBootService(fortress),
-        probeWallStatus(env),
-        harness === "hermes"
-          ? probeOperatorTwin(env, platform)
-          : Promise.resolve("not-applicable" as const),
-      ]);
+      const [castleWallApp, systemExtension, bootService, wall, vaultClaim, operatorTwin] =
+        await Promise.all([
+          verifiedCastleWallApp === null ? probeCastleWallApp() : verifiedCastleWallApp,
+          probeSystemExtension(),
+          probeBootService(fortress),
+          probeWallStatus(env),
+          readPersistedCastleWallProvision(fortress),
+          harness === "hermes"
+            ? probeOperatorTwin(env, platform)
+            : Promise.resolve("not-applicable" as const),
+        ]);
+      // The vault's own claim, folded through the ONE derivation chokepoint so
+      // the planner cannot invent a second rule. `walled` needs BOTH the
+      // helper-authoritative anchor verdict and this fortress's arm evidence;
+      // the planner observes the first and not the second, so a claim-bearing
+      // vault reads `not-yet-walled` here until the arm-state surface clears
+      // it. Under-claiming, never over-claiming (AGENTS.md rule 1).
+      const vaultProvision: InstallProbeResult["vaultProvision"] =
+        vaultClaim.state === "not-yet-walled"
+          ? deriveCastleWallProvision({
+              trustAnchor: wall.trustAnchor === "not-applicable" ? "unknown" : wall.trustAnchor,
+              armed: "unknown",
+            }) === "walled"
+            ? "walled"
+            : "not-yet-walled"
+          : vaultClaim.state === "absent"
+            ? "unknown"
+            : "unknown";
       return {
         cooperativeWrap,
         persistentCli: persistentCli.status,
@@ -1115,6 +1153,7 @@ export function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
         systemExtension,
         bootService,
         ...wall,
+        vaultProvision,
         operatorTwin,
       };
     },
@@ -1427,6 +1466,7 @@ function basePlan(
       content_filter: observed.contentFilter,
       enforcement: observed.enforcement,
       trust_anchor: observed.trustAnchor,
+      vault_provision: observed.vaultProvision,
       operator_twin: observed.operatorTwin,
     },
     next_action: null,
@@ -1661,10 +1701,29 @@ export function buildAgentInstallPlan(input: {
   // is a Tier-1 operator-present migration and is never agent-triggerable, so
   // this is a human action naming the exact command (no sudo: the root signer
   // helper writes the pin, the CLI only asks it to).
-  if (input.observed.trustAnchor === "broken") {
+  // THREE observations route to the SAME human action now, because the remedy
+  // is the same command and the failure they cause is the same one:
+  //   - `broken`        the anchor holds a key that is not the helper's, so the
+  //                     boot daemon cannot sign a manifest and crash-loops.
+  //   - `unprovisioned` there is no anchor at all. This is the ORDINARY state of
+  //                     a fresh Mac since init stopped publishing one, and boot
+  //                     install refuses outright on a missing pin
+  //                     (cli/castle-wall-boot.ts, "Helper mode requires the
+  //                     root-owned global pin"). Leaving it with no remedy
+  //                     action was a dead end: the planner observed the state,
+  //                     named nothing, and the operator's next mutating retry
+  //                     failed the same way.
+  //   - `not-yet-walled` this VAULT has never been put on the wall, whatever the
+  //                     machine's own state is. A leftover activated extension
+  //                     from an earlier install must not stand in for it.
+  const trustAnchorNeedsRepin =
+    input.observed.trustAnchor === "broken" ||
+    input.observed.trustAnchor === "unprovisioned" ||
+    input.observed.vaultProvision === "not-yet-walled";
+  if (trustAnchorNeedsRepin) {
     const repinCliPath = input.observed.persistentCliPath;
     if (repinCliPath === null) {
-      plan.notes.push("The trust anchor is broken but the persistent CLI path disappeared after it was observed; refusing to construct a re-pin command.");
+      plan.notes.push("The trust anchor needs to be installed or migrated, but the persistent CLI path disappeared after it was observed; refusing to construct a re-pin command.");
       return plan;
     }
     plan.status = "human_action";
@@ -1672,7 +1731,7 @@ export function buildAgentInstallPlan(input: {
       id: "repin_trust_anchor",
       actor: "human",
       description:
-        "The Castle Wall boot daemon is crash-looping: the root-owned global enforcement pin does not match the live signer-helper key, so it cannot sign a policy manifest and macOS keeps restarting it. Run this exact 'castle-wall re-pin' command in a private local Terminal to migrate the trust anchor to the signer helper, then rerun the planner. Arming cannot proceed until this is repaired.",
+        "This vault is not on this Mac's Castle Wall yet, or the wall's trust anchor does not match the live signer helper, so the Castle Wall boot daemon cannot sign a policy manifest (a mismatched anchor makes macOS restart it in a loop). Run this exact 'castle-wall re-pin' command in a private local Terminal to install or migrate the trust anchor to the signer helper, then rerun the planner. It asks you to type a confirmation; that is expected. Arming cannot proceed until this is done.",
       argv: [
         "/usr/bin/env",
         `SANCTUARY_STORAGE_PATH=${input.fortress}`,
@@ -1689,12 +1748,21 @@ export function buildAgentInstallPlan(input: {
     };
     return plan;
   }
+  // INVARIANT: every other term here is a MACHINE fact, and a Mac armed by an
+  // earlier install satisfies all of them while the vault in front of the
+  // operator is on no wall. `vaultProvision` is the vault-level term, so a
+  // claim-bearing vault can never read mechanically complete on borrowed
+  // evidence. (`unknown` and `not-applicable` keep prior behavior: this
+  // predicate is not the place to fabricate a vault claim, and a
+  // `not-yet-walled` vault has already been routed to `repin_trust_anchor`
+  // above; this term is the belt on that.)
   const fullMechanicsComplete =
     input.observed.cooperativeWrap === "present" &&
     input.observed.systemExtension === "[activated enabled]" &&
     input.observed.bootService === "present" &&
     input.observed.contentFilter === "enabled" &&
-    input.observed.enforcement === "live";
+    input.observed.enforcement === "live" &&
+    input.observed.vaultProvision !== "not-yet-walled";
   if (fullMechanicsComplete) {
     // The full profile contains the Rung 1 cooperative memory surface, so the
     // same custody gate applies: enforcement can be live while a copied host

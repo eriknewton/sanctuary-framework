@@ -86,6 +86,9 @@ function observed(overrides: Partial<InstallProbeResult> = {}): InstallProbeResu
     contentFilter: "not-applicable",
     enforcement: "not-applicable",
     trustAnchor: "not-applicable",
+    // Base fixture: this vault carries no wall claim, which is not a claim of
+    // protection either. Tests that need one set it explicitly.
+    vaultProvision: "unknown",
     operatorTwin: "not-applicable",
     ...overrides,
   };
@@ -982,6 +985,55 @@ describe("sanctuary install agent contract", () => {
     expect(argv).not.toContain("sudo");
     expect(argv).toContain("SANCTUARY_STORAGE_PATH=/tmp/fortress");
     expect((plan.next_action?.description ?? "").toLowerCase()).toContain("re-pin");
+  });
+
+  it("names re-pin for a machine with no anchor yet, and for a vault that is not on the wall", () => {
+    // Creating a vault no longer publishes a machine-wide anchor, so a machine
+    // that has never been armed reports `unprovisioned`, and boot install
+    // refuses outright on a missing anchor. Leaving that observation with no
+    // remedy action was a dead end: the operator's next mutating retry failed
+    // the same way, with nothing naming the step that fixes it.
+    const unprovisioned = buildAgentInstallPlan({
+      profile: "full",
+      harness: "hermes",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: fullObserved({
+        cooperativeWrap: "present",
+        castleWallApp: "present",
+        systemExtension: "[activated enabled]",
+        bootService: "absent",
+        contentFilter: "disabled",
+        enforcement: "unavailable",
+        trustAnchor: "unprovisioned",
+      }),
+    });
+    expect(unprovisioned.status).toBe("human_action");
+    expect(unprovisioned.next_action?.id).toBe("repin_trust_anchor");
+    expect(unprovisioned.next_action?.actor).toBe("human");
+
+    // And the vault-level half: every machine fact below is satisfied by a Mac
+    // an EARLIER install armed, while this vault is on no wall. A vault claim
+    // outranks all of them, and the plan is never `complete`.
+    const notYetWalled = buildAgentInstallPlan({
+      profile: "full",
+      harness: "hermes",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: fullObserved({
+        cooperativeWrap: "present",
+        castleWallApp: "present",
+        systemExtension: "[activated enabled]",
+        bootService: "present",
+        contentFilter: "enabled",
+        enforcement: "live",
+        trustAnchor: "consistent",
+        vaultProvision: "not-yet-walled",
+      }),
+    });
+    expect(notYetWalled.status).toBe("human_action");
+    expect(notYetWalled.next_action?.id).toBe("repin_trust_anchor");
+    expect(notYetWalled.status).not.toBe("complete");
   });
 
   // Finding B (defect.fresh-install-daemon-needs-manual-repin-on-first-arm):

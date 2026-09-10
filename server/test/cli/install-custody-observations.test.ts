@@ -1,3 +1,4 @@
+// fail-before-exempt: fixture-only edit. The shared InstallProbeResult fixture gains the additive vaultProvision observation with the neutral "unknown" value; no assertion changed. The behavior it feeds is proven in test/cli/install.test.ts (repin_trust_anchor fires for unprovisioned and for a not-yet-walled vault).
 /**
  * Rung 1 install evidence: the read-only, ambient-env-blind daily-UX probe
  * (`custody_access` / `recovery_factor`) and the plan wiring that surfaces them
@@ -475,6 +476,9 @@ describe("buildAgentInstallPlan surfaces Rung 1 evidence and the restart action"
       contentFilter: "not-applicable",
       enforcement: "not-applicable",
       trustAnchor: "not-applicable",
+      // Base fixture: this vault carries no wall claim, which is not a claim of
+      // protection either. Tests that need one set it explicitly.
+      vaultProvision: "unknown",
       operatorTwin: "not-applicable",
       ...over,
     };

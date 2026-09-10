@@ -1,4 +1,5 @@
 import type { StatusResponse } from "../castle-wall/ipc/messages.js";
+import type { CastleWallProvisionState } from "../castle-wall/provision-state.js";
 import {
   castleWallRuntimeReadiness,
   manifestFieldsAreAuthoritative,
@@ -97,6 +98,16 @@ export interface CastleWallRuntimeSnapshot {
   lastEventAt?: string | null;
   detectorName?: string;
   reason?: string;
+  /**
+   * THIS VAULT's own Castle Wall provisioning state (castle-wall/
+   * provision-state.ts), when the fortress carries the claim `init` persists.
+   * Deliberately separate from every other member here: the rest describe a
+   * RUNTIME (a daemon, a kernel ruleset, an evidence channel), and none of them
+   * is a claim that the vault being reported on is on the wall that is running.
+   * Absent = the fortress carries no claim, which is not a claim of protection
+   * either.
+   */
+  vaultProvision?: CastleWallProvisionState;
 }
 
 export interface CastleWallEvidence {
@@ -104,6 +115,14 @@ export interface CastleWallEvidence {
   status: RuntimeStatus;
   last_event_at: string | null;
   detector_evidence: string;
+  /**
+   * ADDITIVE: the vault-level wall claim, carried verbatim from the snapshot.
+   * Present only when the fortress carries the claim, so every report about a
+   * fortress that predates the state is byte-identical to before. This is the
+   * ONE shape `monitor_health`, `exec_attest`, and the signed SHR publish
+   * payload all read, so the three cannot disagree about the same vault.
+   */
+  vault_provision?: CastleWallProvisionState;
 }
 
 export interface LayerEvidence {
@@ -223,7 +242,22 @@ export function buildHealthEvidenceReport(input: BuildHealthEvidenceInput): Heal
   };
 }
 
+/**
+ * Evaluate the Castle Wall runtime AND carry this vault's own wall claim.
+ *
+ * The claim is attached HERE rather than at each of the many verdict returns
+ * below: a hand-mirrored copy at every branch is the drift shape AGENTS rule 5
+ * names, and a branch that silently lost the field would look exactly like a
+ * fortress that never carried one.
+ */
 export function evaluateCastleWall(snapshot?: CastleWallRuntimeSnapshot): CastleWallEvidence {
+  const evidence = evaluateCastleWallRuntime(snapshot);
+  return snapshot?.vaultProvision === undefined
+    ? evidence
+    : { ...evidence, vault_provision: snapshot.vaultProvision };
+}
+
+function evaluateCastleWallRuntime(snapshot?: CastleWallRuntimeSnapshot): CastleWallEvidence {
   const platform = snapshot?.platform ?? process.platform;
   if (!snapshot) {
     return {

@@ -31,6 +31,8 @@ import {
   type ProducerKeyLoadOptions,
 } from "../castle-wall/runtime/producer-signature.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
+// The vault-level wall claim written by wrap/init.ts; this surface reads it.
+import { readPersistedCastleWallProvision } from "../castle-wall/provision-state.js";
 import {
   DEFAULT_ENFORCEMENT_AVAILABILITY_FRESHNESS_MS,
   queryMacOSEnforcementAvailability,
@@ -2528,11 +2530,25 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       const exclusiveEgress = await this.resolveExclusiveEgressPosture();
       const protectionClaimSubject = await this.resolveProtectionClaimSubject();
       const enforcementAvailability = await this.resolveEnforcementAvailability();
+      // The vault's own wall claim, read from this fortress. Never throws (the
+      // reader collapses every failure to `absent`/`unreadable`), and an
+      // absent claim omits the additive field rather than asserting anything.
+      // `trustAnchor` is deliberately left at its honest default here: this
+      // process cannot run the signer-helper query, so it must not assert
+      // CONSISTENT. See the stated bound on CastleWallPosture.
+      const fortressStoragePath = this._sanctuaryConfig?.storage_path;
+      const vaultProvision =
+        typeof fortressStoragePath === "string" && fortressStoragePath.length > 0
+          ? await readPersistedCastleWallProvision(fortressStoragePath)
+          : ({ state: "absent" } as const);
       return await this.auditLog.runEagerReads(() =>
         buildCastleWallPosture({
           auditLog: this.auditLog as AuditLog,
           originMachine,
           platform: process.platform,
+          ...(vaultProvision.state === "not-yet-walled"
+            ? { vaultProvisionClaimed: true }
+            : {}),
           pinnedProducerKeyB64url:
             load?.status === "present" ? load.keyB64url : null,
           ...(load?.status === "unreadable"

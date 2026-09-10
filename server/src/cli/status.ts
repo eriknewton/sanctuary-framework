@@ -171,6 +171,14 @@ export function renderTable(status: Record<string, unknown>): string {
     `  identity:     ${identity ? `${str(identity.label)} (${str(identity.did)})` : "none"}`,
     `  castle wall:  ${str(castleWall?.arm_state)}`,
   ];
+  // ADDITIVE line: the vault's OWN wall claim, from the same `/v1/status`
+  // document. `arm_state` above is unchanged. The line appears only when the
+  // document carries the field (a fortress that predates the state omits it),
+  // so this table is byte-identical for every such fortress. Must match the
+  // value vocabulary in castle-wall/provision-state.ts.
+  if (typeof castleWall?.castle_wall_provision === "string") {
+    lines.push(`  vault on wall: ${castleWall.castle_wall_provision}`);
+  }
   // S5-P (design section 6): the exclusive-egress posture is a first-class
   // status line on this surface whenever a fine-grained agent is provisioned.
   // `coarse_only` above is the DISTINCT non-green arm-state; this line carries
