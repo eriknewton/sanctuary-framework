@@ -172,6 +172,19 @@ export interface PostureRouteDeps {
    * the panel ever sees.
    */
   gatherRecognitionReputation?: () => Promise<RecognitionReputationEvidence | null>;
+  /**
+   * Does THIS fortress carry the persisted `not_yet_walled` claim
+   * (`castle-wall/provision-state.ts`)? Supplied by the dashboard, which holds
+   * the fortress storage path; resolved lazily per request so a vault created
+   * after the server started is observed.
+   *
+   * ABSENT = no claim is rendered, which is what every fortress that predates
+   * the state gets. It is NOT a claim of protection: this route can observe
+   * neither half of the `walled` pair on its own, so the additive field it
+   * renders can only ever say `not_yet_walled` (deliberate under-claiming,
+   * AGENTS.md rule 1).
+   */
+  resolveVaultProvisionClaimed?: () => Promise<boolean>;
   /** Live wrapped-agent roster from the hub registry. */
   listAgents: () => LocalAgentRecord[];
   /**
@@ -718,10 +731,26 @@ async function buildWallPosture(
     preResolvedEnforcementAvailability !== undefined
       ? preResolvedEnforcementAvailability
       : await resolveEnforcementAvailability(deps);
+  // Resolved BEFORE the eager read scope, like every other provider here, so a
+  // filesystem read never nests inside the audit log's read scope. A throwing
+  // provider is a claim-read FAILURE, not an absence of a claim, and must fail
+  // closed: claimed=true renders the honest not-walled reading (the posture
+  // read itself still succeeds; only the vault-claim half degrades honestly).
+  // Falling back to `false` here was the "a throwing resolver also produces
+  // green" fail-open Codex lens A round 2 found on 2026-09-10.
+  let vaultProvisionClaimed = false;
+  if (deps.resolveVaultProvisionClaimed) {
+    try {
+      vaultProvisionClaimed = await deps.resolveVaultProvisionClaimed();
+    } catch {
+      vaultProvisionClaimed = true;
+    }
+  }
   return (deps.auditLog as AuditLog).runEagerReads(() =>
     buildCastleWallPosture({
       auditLog: deps.auditLog as AuditLog,
       originMachine: deps.originMachine,
+      ...(vaultProvisionClaimed ? { vaultProvisionClaimed: true } : {}),
       ...(deps.platform !== undefined ? { platform: deps.platform } : {}),
       ...(deps.now ? { now: deps.now() } : {}),
       pinnedProducerKeyB64url: deps.resolvePinnedProducerKey

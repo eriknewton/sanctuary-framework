@@ -765,6 +765,13 @@ const CONFIG_BASELINE_MAC_DOMAIN = "sanctuary.config-security-baseline.v1\n";
 
 const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
 const PRIMARY_IDENTITY_META_KEY = "primary_identity_id";
+// Must match CASTLE_WALL_PROVISION_META_KEY in
+// castle-wall/provision-state.ts (the writer is wrap/init.ts). Plaintext
+// product-state token, never a secret and never master-keyed, so rotation
+// carries it verbatim. A drift here makes rotation refuse every fortress
+// initialized after this change, so the two sides are pinned to each other and
+// asserted by test/core/master-rotation-meta-key-parity.test.ts.
+const CASTLE_WALL_PROVISION_META_KEY = "castle-wall-provision-v1";
 // F2 BLOCKER-R2 (adversarial re-gate 2026-07-14): the writer-split
 // migration-established marker (byte-matches audit-log.ts's
 // AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY). Its presence proves the fortress ran
@@ -844,6 +851,7 @@ export function classifyMetaKey(key: string): MetaKeyClass | null {
     case STATE_META_PUBLIC_KEYS_KEY: // public keys only
     case AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY: // literal "1"
     case PRIMARY_IDENTITY_META_KEY: // identity id string
+    case CASTLE_WALL_PROVISION_META_KEY: // literal "not_yet_walled"
       return "plaintext-keep";
     case STATE_META_VERSION_ANCHORS_KEY:
       return "state-meta-mac";

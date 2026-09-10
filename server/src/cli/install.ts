@@ -44,6 +44,23 @@ import {
   bootServiceReady,
 } from "./castle-wall-boot.js";
 import { parseCastleWallState, runStatus, type SysextState } from "./castle-wall.js";
+// The vault-level wall claim + its ONE derivation chokepoint. The planner
+// reads it; only `wrap/init.ts` writes it.
+import {
+  deriveCastleWallProvision,
+  readPersistedCastleWallProvision,
+  type PersistedCastleWallProvisionObservation,
+} from "../castle-wall/provision-state.js";
+// THE ONE exclusive-egress cap predicate (S5-P design §6). Must match
+// `principal-policy/posture.ts` (`applyExclusiveEgress`), the only other
+// caller: both derive "is this wall really armed" from the SAME function so
+// an installer verdict of `walled` can never diverge from the canonical
+// `arm_state` a would-be `armed` wall caps to `coarse_only` under.
+import {
+  exclusiveEgressCapsAggregateGreen,
+  failedExclusiveEgressStatus,
+  type ExclusiveEgressStatus,
+} from "../egress-gate/posture.js";
 // The sealed-runtime contract shared with the build gate and the manifest
 // builder (server/scripts/sealed-cli-runtime-entries.mjs); bundled into cli.js.
 import {
@@ -385,6 +402,15 @@ export interface AgentInstallPlan {
     // planner names re-pin as the remedy instead of leaving only the crash-loop
     // observable.
     trust_anchor: TrustAnchorObservation;
+    /** This VAULT's own wall claim; see InstallProbeResult.vaultProvision. */
+    // Must match the vocabulary on InstallProbeResult.vaultProvision; this is
+    // the rendered mirror of that field and the two are written side by side.
+    vault_provision:
+      | "not-yet-walled"
+      | "walled"
+      | "unreadable"
+      | "unknown"
+      | "not-applicable";
     operator_twin: InstallObservation;
   };
   next_action: AgentInstallAction | null;
@@ -420,6 +446,27 @@ export interface InstallProbeResult {
   contentFilter: "enabled" | "disabled" | "unknown" | "not-applicable";
   enforcement: "live" | "unavailable" | "undetermined" | "not-applicable";
   trustAnchor: TrustAnchorObservation;
+  /**
+   * THIS VAULT's own Castle Wall provisioning claim (castle-wall/
+   * provision-state.ts), as persisted by `init`. Distinct from every other
+   * observation in this record: the rest describe the MACHINE (an app, a system
+   * extension, a content filter, a machine-wide anchor), and a machine that was
+   * armed by an earlier install satisfies all of them while the vault in front
+   * of the operator is on no wall at all. `not-applicable` on non-macOS.
+   *
+   * `unreadable` and `unknown` are DISTINCT and neither is a claim of
+   * protection (AGENTS.md rule 1: absent, indeterminate and unproven all read
+   * as not-proven). `unreadable` = a record exists at the claim's path and did
+   * not parse (empty, truncated, some other token); `unknown` = no record and
+   * the positive `walled` pair was not observable either. The planner refuses
+   * to report a mechanically complete install on either.
+   */
+  vaultProvision:
+    | "not-yet-walled"
+    | "walled"
+    | "unreadable"
+    | "unknown"
+    | "not-applicable";
   operatorTwin: InstallObservation;
 }
 
@@ -438,6 +485,19 @@ export interface InstallCommandContext {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   ops?: Partial<AgentInstallOps>;
+  /**
+   * Test-only override for the S5-P exclusive-egress posture read, mirroring
+   * the `resolveExclusiveEgress` injection seam `wrap/cli.ts` and its tests
+   * already use. Production callers never set this: the real path always
+   * reaches the SAME producer `dashboard-standalone.ts` binds on darwin
+   * (`egress-gate/arming-wiring.ts` `createExclusiveEgressPostureProducer`).
+   * That producer's registry component is a single ROOT-OWNED, machine-wide
+   * file, never fortress-scoped, so exercising the real producer in a test
+   * would observe whatever fine-grained agents happen to be provisioned on
+   * the host running the suite; this seam lets a test supply a controlled
+   * verdict instead, exactly as the dashboard's own tests do.
+   */
+  resolveExclusiveEgress?: () => Promise<ExclusiveEgressStatus | null>;
 }
 
 const HARNESSES = new Set<InstallHarness>([
@@ -803,12 +863,105 @@ export function parseTrustAnchor(text: string): TrustAnchorObservation {
   return "unknown";
 }
 
+/**
+ * The planner's vault-level wall observation, from the things the probe can
+ * actually see. Pure and exported so the truth table is provable without a
+ * Mac (AGENTS rule 4 still applies: the production probe below is its only
+ * runtime caller and is exercised by its own test).
+ *
+ * ARM HALF, cross-file contract: `enforcement === "live"` must match the macOS
+ * branch of the arm-state determination in `principal-policy/posture.ts`
+ * (`buildCastleWallPosture`), where a would-be `arm_state === "armed"` on
+ * macOS holds EXACTLY when the resolved enforcement availability reads `live`
+ * AND the exclusive-egress cap does not fire. Both sides read the SAME
+ * fortress-scoped availability record and the SAME cap predicate
+ * (`exclusiveEgressCapsAggregateGreen`, `egress-gate/posture.ts`), so this is
+ * that determination made from the CLI, not a second weaker rule that stops
+ * at the first half. `unavailable` is a positive not-armed fact; `undetermined`
+ * is the honest unknown; neither can produce `walled`, and `live`-but-capped
+ * is a definite not-armed, never `unknown`.
+ *
+ * Codex lens A round 2 (2026-09-10) found this function reading `live` alone
+ * as armed: a consistent anchor + live availability + a fine-grained agent
+ * whose exclusive-egress stack was NOT live derived `walled`/`complete` here
+ * while the canonical posture derived the distinct non-green `coarse_only` /
+ * `not_yet_walled`. `exclusiveEgress` closes that: the PRODUCTION probe now
+ * wires the same producer the dashboard binds
+ * (`resolveInstallExclusiveEgressStatus`, see its doc for the derivation), so
+ * `undefined`/`null` here means only what it means everywhere else in the
+ * tree -- no fine-grained agent has ever been provisioned on this fortress --
+ * matching the canonical "no producer wired = no fine-grained agent exists =
+ * unchanged behavior" bound already stated on
+ * `exclusiveEgressCapsAggregateGreen` itself; a caller that DOES have the
+ * evidence gets the identical cap the dashboard renders.
+ *
+ * Failure mode this replaced: the probe passed a hardcoded `armed: "unknown"`,
+ * so NO vault could ever derive `walled` here and the planner emitted
+ * `repin_trust_anchor` forever — the operator re-pinned, the anchor went
+ * CONSISTENT, and the very next plan asked for the same command again.
+ *
+ * The derivation runs whether or not a persisted claim exists, so a fortress
+ * created before this state earns `walled` from the POSITIVE pair and never
+ * from the absence of a claim. Absent and unreadable stay distinct and neither
+ * is protection (AGENTS.md rule 1).
+ */
+export function deriveInstallVaultProvision(input: {
+  trustAnchor: TrustAnchorObservation;
+  enforcement: InstallProbeResult["enforcement"];
+  persisted: PersistedCastleWallProvisionObservation["state"];
+  /**
+   * The SAME S5-P exclusive-egress posture `principal-policy/posture.ts`
+   * caps `arm_state` with. `undefined`/`null` = unobserved here = no cap
+   * (see the function doc above); a caller that resolves a real status
+   * (including `failedExclusiveEgressStatus` on a read failure) gets the
+   * identical cap `applyExclusiveEgress` applies.
+   */
+  exclusiveEgress?: ExclusiveEgressStatus | null;
+}): InstallProbeResult["vaultProvision"] {
+  const enforcementLive = input.enforcement === "live";
+  // THE cap: a live-enforcing wall with a fine-grained agent whose
+  // exclusive-egress stack is not live is definitively NOT armed here, exactly
+  // as `applyExclusiveEgress` caps a would-be `armed` to `coarse_only` there.
+  const cappedByExclusiveEgress =
+    enforcementLive && exclusiveEgressCapsAggregateGreen(input.exclusiveEgress);
+  const derived = deriveCastleWallProvision({
+    trustAnchor: input.trustAnchor === "not-applicable" ? "unknown" : input.trustAnchor,
+    armed: cappedByExclusiveEgress
+      ? false
+      : enforcementLive
+        ? true
+        : input.enforcement === "unavailable"
+          ? false
+          : "unknown",
+  });
+  if (derived === "walled") return "walled";
+  if (input.persisted === "not-yet-walled") return "not-yet-walled";
+  if (input.persisted === "unreadable") return "unreadable";
+  return "unknown";
+}
+
+/**
+ * INVARIANT: `castle-wall status` is run against THIS install's fortress, named
+ * explicitly, never against whatever `SANCTUARY_STORAGE_PATH` happens to hold.
+ * The enforcement-availability line this parses is FORTRESS-SCOPED
+ * (`readEnforcementAvailabilityForStatus(storagePath, ...)` in
+ * `cli/castle-wall.ts`), and it is the observation the arm half of the vault's
+ * wall claim is derived from below. Reading it for a different fortress is
+ * exactly the borrowed-evidence fail-open this whole state exists to close:
+ * failure mode from the outside is a planner that reports the operator's brand
+ * new vault as armed because some other fortress on the box is.
+ */
 async function probeWallStatus(
   env: NodeJS.ProcessEnv,
+  fortress: string,
 ): Promise<Pick<InstallProbeResult, "contentFilter" | "enforcement" | "trustAnchor">> {
   const chunks: string[] = [];
   try {
-    await runStatus([], { out: captureWritable(chunks), env, platform: "darwin" });
+    await runStatus(["--fortress", fortress], {
+      out: captureWritable(chunks),
+      env,
+      platform: "darwin",
+    });
   } catch {
     return { contentFilter: "unknown", enforcement: "undetermined", trustAnchor: "unknown" };
   }
@@ -1014,6 +1167,62 @@ export async function probeCustodyAccess(
 }
 
 /**
+ * Resolve the S5-P exclusive-egress posture for the install probe, reusing
+ * the SAME producer `dashboard-standalone.ts` binds on darwin
+ * (`egress-gate/arming-wiring.ts` `createExclusiveEgressPostureProducer`),
+ * never a second implementation. When both probes observe the same live
+ * runtime state, `deriveInstallVaultProvision`'s cap and
+ * `applyExclusiveEgress`'s cap agree; each side runs its own availability
+ * query, so a query failure on one side is reported as that side's failed
+ * status (fail closed there) and can differ from the other side's reading.
+ *
+ * `coarseWallArmed` reuses THIS probe's own already-trusted
+ * enforcement-availability evidence (`wall.enforcement === "live"`) rather
+ * than the dashboard's audit-log-based
+ * `probeCoarseCastleWallEnforcementObserved`: that satisfies
+ * `ExclusiveEgressPostureInput.coarse_wall_armed`'s own contract ("the
+ * caller derives it from the same evidence surface it already trusts"),
+ * and this probe is read-only and ambient-env-blind by design (see
+ * `probeCustodyAccess` below) -- it must never open the encrypted audit log,
+ * which needs an unwrapped master key this subprocess does not hold.
+ *
+ * FAIL-CLOSED: a producer throw maps to `failedExclusiveEgressStatus` here,
+ * the IDENTICAL contract `principal-policy/dashboard.ts`'s
+ * `resolveExclusiveEgressPosture` applies, so a read failure caps green
+ * rather than silently reading "no fine-grained agent."
+ *
+ * `override` is the test-only injection seam (`InstallCommandContext.
+ * resolveExclusiveEgress`); production callers never set it.
+ */
+async function resolveInstallExclusiveEgressStatus(
+  fortress: string,
+  coarseWallArmed: boolean,
+  override?: () => Promise<ExclusiveEgressStatus | null>,
+): Promise<ExclusiveEgressStatus | null> {
+  // The fail-closed catch wraps BOTH sources (test override and the real
+  // producer): the contract is "a resolution attempt that throws caps green",
+  // not "only the production path is allowed to fail closed" -- a throwing
+  // override must observe the identical behavior a throwing production
+  // producer does, the same shared-boundary shape `wrap/cli.ts`'s
+  // `probeCastleWallProtectionClaim` uses for its own injected resolver.
+  try {
+    if (override) return await override();
+    const { createExclusiveEgressPostureProducer } = await import(
+      "../egress-gate/arming-wiring.js"
+    );
+    const producer = createExclusiveEgressPostureProducer({
+      fortressPath: fortress,
+      coarseWallArmed: async () => coarseWallArmed,
+    });
+    return await producer();
+  } catch (err) {
+    return failedExclusiveEgressStatus(
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
+/**
  * The PRODUCTION probe wiring, exported so a test can exercise the real object
  * graph rather than an injected `ctx.ops`.
  *
@@ -1086,18 +1295,37 @@ export function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
           contentFilter: "not-applicable",
           enforcement: "not-applicable",
           trustAnchor: "not-applicable",
+          vaultProvision: "not-applicable",
           operatorTwin: "not-applicable",
         };
       }
-      const [castleWallApp, systemExtension, bootService, wall, operatorTwin] = await Promise.all([
-        verifiedCastleWallApp === null ? probeCastleWallApp() : verifiedCastleWallApp,
-        probeSystemExtension(),
-        probeBootService(fortress),
-        probeWallStatus(env),
-        harness === "hermes"
-          ? probeOperatorTwin(env, platform)
-          : Promise.resolve("not-applicable" as const),
-      ]);
+      const [castleWallApp, systemExtension, bootService, wall, vaultClaim, operatorTwin] =
+        await Promise.all([
+          verifiedCastleWallApp === null ? probeCastleWallApp() : verifiedCastleWallApp,
+          probeSystemExtension(),
+          probeBootService(fortress),
+          probeWallStatus(env, fortress),
+          readPersistedCastleWallProvision(fortress),
+          harness === "hermes"
+            ? probeOperatorTwin(env, platform)
+            : Promise.resolve("not-applicable" as const),
+        ]);
+      // Must match `dashboard-standalone.ts`'s S5-P producer binding and
+      // `principal-policy/dashboard.ts`'s `resolveExclusiveEgressPosture`
+      // fail-closed contract: see `resolveInstallExclusiveEgressStatus` above
+      // for the full derivation and why `coarseWallArmed` differs from the
+      // dashboard's audit-based probe.
+      const exclusiveEgress = await resolveInstallExclusiveEgressStatus(
+        fortress,
+        wall.enforcement === "live",
+        ctx.resolveExclusiveEgress,
+      );
+      const vaultProvision = deriveInstallVaultProvision({
+        trustAnchor: wall.trustAnchor,
+        enforcement: wall.enforcement,
+        persisted: vaultClaim.state,
+        exclusiveEgress,
+      });
       return {
         cooperativeWrap,
         persistentCli: persistentCli.status,
@@ -1115,6 +1343,7 @@ export function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
         systemExtension,
         bootService,
         ...wall,
+        vaultProvision,
         operatorTwin,
       };
     },
@@ -1427,6 +1656,7 @@ function basePlan(
       content_filter: observed.contentFilter,
       enforcement: observed.enforcement,
       trust_anchor: observed.trustAnchor,
+      vault_provision: observed.vaultProvision,
       operator_twin: observed.operatorTwin,
     },
     next_action: null,
@@ -1661,10 +1891,40 @@ export function buildAgentInstallPlan(input: {
   // is a Tier-1 operator-present migration and is never agent-triggerable, so
   // this is a human action naming the exact command (no sudo: the root signer
   // helper writes the pin, the CLI only asks it to).
-  if (input.observed.trustAnchor === "broken") {
+  // THREE observations route to the SAME human action now, because the remedy
+  // is the same command and the failure they cause is the same one:
+  //   - `broken`        the anchor holds a key that is not the helper's, so the
+  //                     boot daemon cannot sign a manifest and crash-loops.
+  //   - `unprovisioned` there is no anchor at all. This is the ORDINARY state of
+  //                     a fresh Mac since init stopped publishing one, and boot
+  //                     install refuses outright on a missing pin
+  //                     (cli/castle-wall-boot.ts, "Helper mode requires the
+  //                     root-owned global pin"). Leaving it with no remedy
+  //                     action was a dead end: the planner observed the state,
+  //                     named nothing, and the operator's next mutating retry
+  //                     failed the same way.
+  //   - `not-yet-walled` this VAULT has never been put on the wall, whatever the
+  //                     machine's own state is. A leftover activated extension
+  //                     from an earlier install must not stand in for it.
+  //
+  // INVARIANT on the third term: a `not-yet-walled` vault routes here ONLY
+  // while the anchor is not already CONSISTENT. `re-pin` is idempotent — on a
+  // consistent anchor it re-asserts the same key and changes nothing — so once
+  // the anchor is consistent it can no longer advance this vault, and the
+  // remaining gap is ARMING, which the privileged install action below
+  // performs. Without this term the planner emits `repin_trust_anchor` on every
+  // rerun of an already-re-pinned, not-yet-armed host: the operator runs the
+  // command, the anchor is consistent, the vault is still not on the wall, and
+  // the next plan asks for the same command again.
+  const trustAnchorNeedsRepin =
+    input.observed.trustAnchor === "broken" ||
+    input.observed.trustAnchor === "unprovisioned" ||
+    (input.observed.vaultProvision === "not-yet-walled" &&
+      input.observed.trustAnchor !== "consistent");
+  if (trustAnchorNeedsRepin) {
     const repinCliPath = input.observed.persistentCliPath;
     if (repinCliPath === null) {
-      plan.notes.push("The trust anchor is broken but the persistent CLI path disappeared after it was observed; refusing to construct a re-pin command.");
+      plan.notes.push("The trust anchor needs to be installed or migrated, but the persistent CLI path disappeared after it was observed; refusing to construct a re-pin command.");
       return plan;
     }
     plan.status = "human_action";
@@ -1672,7 +1932,7 @@ export function buildAgentInstallPlan(input: {
       id: "repin_trust_anchor",
       actor: "human",
       description:
-        "The Castle Wall boot daemon is crash-looping: the root-owned global enforcement pin does not match the live signer-helper key, so it cannot sign a policy manifest and macOS keeps restarting it. Run this exact 'castle-wall re-pin' command in a private local Terminal to migrate the trust anchor to the signer helper, then rerun the planner. Arming cannot proceed until this is repaired.",
+        "This vault is not on this Mac's Castle Wall yet, or the wall's trust anchor does not match the live signer helper, so the Castle Wall boot daemon cannot sign a policy manifest (a mismatched anchor makes macOS restart it in a loop). Run this exact 'castle-wall re-pin' command in a private local Terminal to install or migrate the trust anchor to the signer helper, then rerun the planner. It asks you to type a confirmation; that is expected. Arming cannot proceed until this is done.",
       argv: [
         "/usr/bin/env",
         `SANCTUARY_STORAGE_PATH=${input.fortress}`,
@@ -1689,12 +1949,45 @@ export function buildAgentInstallPlan(input: {
     };
     return plan;
   }
-  const fullMechanicsComplete =
+  // INVARIANT: every term in this predicate is a MACHINE fact, and a Mac armed
+  // by an earlier install satisfies all of them while the vault in front of the
+  // operator is on no wall. It is therefore NOT sufficient on its own; the
+  // vault-level term below is what makes the verdict about this vault.
+  const machineMechanicsComplete =
     input.observed.cooperativeWrap === "present" &&
     input.observed.systemExtension === "[activated enabled]" &&
     input.observed.bootService === "present" &&
     input.observed.contentFilter === "enabled" &&
     input.observed.enforcement === "live";
+  // INVARIANT (AGENTS.md rule 1): only a POSITIVELY observed vault claim clears
+  // this gate. `unreadable` and `unknown` are not-proven and must never be read
+  // as walled, which is exactly what the previous `!== "not-yet-walled"` test
+  // did: a vault whose claim could not be read inherited the machine's own
+  // enforcement and was reported `complete`. `not-applicable` is the non-macOS
+  // profile, where there is no vault-level wall to be on.
+  const vaultIsOnThisWall =
+    input.observed.vaultProvision === "walled" ||
+    input.observed.vaultProvision === "not-applicable";
+  // Scoped to the two NOT-PROVEN readings. A `not-yet-walled` vault is a claim
+  // that WAS read, and on a machine whose anchor is already consistent its
+  // remedy is arming, which the privileged install action below performs; only
+  // an unreadable or unobservable claim needs a human to repair a read.
+  const vaultEvidenceNotProven =
+    input.observed.vaultProvision === "unreadable" ||
+    input.observed.vaultProvision === "unknown";
+  if (machineMechanicsComplete && vaultEvidenceNotProven) {
+    // Deliberately NOT a mutating retry — the privileged install below would
+    // re-run a full protect flow that cannot repair a read, and looping the
+    // operator through it is the failure this arm exists to prevent. Same
+    // disposition as every other unknown safety-bearing observation: name it,
+    // change nothing.
+    plan.notes.push(
+      "Every machine-level Castle Wall fact is satisfied, but this vault's own wall claim could not be read, so this install is not reported complete. Check that " +
+        `${input.fortress} is readable by this user and rerun; an unreadable claim is never treated as protection.`,
+    );
+    return plan;
+  }
+  const fullMechanicsComplete = machineMechanicsComplete && vaultIsOnThisWall;
   if (fullMechanicsComplete) {
     // The full profile contains the Rung 1 cooperative memory surface, so the
     // same custody gate applies: enforcement can be live while a copied host

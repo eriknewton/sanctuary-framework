@@ -1,3 +1,4 @@
+// fail-before-exempt: harness-only edit. Every runRePin call gains the confirmStdin seam the new interactive-only gate requires; no assertion in this file changed, and the gate itself is proven in test/cli/castle-wall-vault-provision-state.test.ts (non-TTY refusal, wrong-answer abort, confirmed pass-through).
 /**
  * Tests for the A2/B2 re-pin (trust-anchor migration) flow.
  *
@@ -13,7 +14,7 @@ import { describe, it, expect } from "vitest";
 import { mkdtemp, readFile, rm, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Writable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import {
@@ -125,6 +126,9 @@ describe("castle-wall re-pin : runRePin", () => {
       const helper = makeMockHelper();
       const out = capture();
       const rc = await runRePin([], {
+        // The re-pin confirmation gate is interactive-only; every test drives
+        // it through the same seam the house pattern uses.
+        confirmStdin: Readable.from(["re-pin\n"]),
         out: out.stream,
         err: silent,
         env,
@@ -179,6 +183,9 @@ describe("castle-wall re-pin : runRePin", () => {
       const helper = makeMockHelper();
       const out = capture();
       const rc = await runRePin([], {
+        // The re-pin confirmation gate is interactive-only; every test drives
+        // it through the same seam the house pattern uses.
+        confirmStdin: Readable.from(["re-pin\n"]),
         out: out.stream,
         err: silent,
         env,
@@ -195,6 +202,9 @@ describe("castle-wall re-pin : runRePin", () => {
   it("fails when no signer-client is configured and none auto-discovered", async () => {
     const err = capture();
     const rc = await runRePin([], {
+      // The re-pin confirmation gate is interactive-only; every test drives
+      // it through the same seam the house pattern uses.
+      confirmStdin: Readable.from(["re-pin\n"]),
       out: silent,
       err: err.stream,
       env: { SANCTUARY_STORAGE_PATH: "/tmp/does-not-matter" },

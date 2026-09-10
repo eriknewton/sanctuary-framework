@@ -74,6 +74,10 @@ import {
   bytesToString,
 } from "../../src/core/encoding.js";
 import {
+  CASTLE_WALL_NOT_YET_WALLED,
+  CASTLE_WALL_PROVISION_META_KEY,
+} from "../../src/castle-wall/provision-state.js";
+import {
   FEDERATION_TRUST_ROOT_NAMESPACE,
   FEDERATION_TRUST_ROOT_KEY,
   FEDERATION_TRUST_ROOT_HKDF_INFO,
@@ -505,6 +509,23 @@ describe("master rotation — happy path", () => {
     if (pin.status === "valid") {
       expect(pin.data.agent_id).toBe("claude_code:fortress-rotation-test");
     }
+  });
+
+  it("carries the vault's Castle Wall provisioning record across the rotation", async () => {
+    // A `_meta` key rotation does not recognize aborts the rotation of EVERY
+    // fortress that carries it, and every fortress created by `init` now
+    // carries this one. The record is a plaintext product-state token, so it
+    // survives verbatim rather than being restamped.
+    const fortress = await buildFortress();
+    await fortress.storage.write(
+      "_meta",
+      CASTLE_WALL_PROVISION_META_KEY,
+      stringToBytes(CASTLE_WALL_NOT_YET_WALLED),
+    );
+    await rotateMaster(rotateOpts(fortress));
+    const carried = await fortress.storage.read("_meta", CASTLE_WALL_PROVISION_META_KEY);
+    expect(carried).not.toBeNull();
+    expect(Buffer.from(carried!).toString("utf8")).toBe(CASTLE_WALL_NOT_YET_WALLED);
   });
 
   it("re-encrypts the castle pin file in place", async () => {

@@ -75,6 +75,7 @@ import {
   FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY,
   FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY,
 } from "../../src/v1/federation-sync-state-store.js";
+import { CASTLE_WALL_PROVISION_META_KEY } from "../../src/castle-wall/provision-state.js";
 import { FLEET_ACTIVATION_META_KEY } from "../../src/entitlement/activation.js";
 import { DOWNGRADE_LOG_META_KEY } from "../../src/entitlement/downgrade-log.js";
 import { REVOCATION_LIST_META_KEY } from "../../src/entitlement/revocation-list.js";
@@ -142,6 +143,12 @@ const ROTATION_RECOGNIZED_META_KEYS: readonly MetaKeyWriteSite[] = [
   },
   // Config-security baseline, written on every MCP-server boot (step "5rc").
   { key: CONFIG_BASELINE_META_KEY, writer: "core/config-baseline.ts" },
+  // The fortress's own Castle Wall provisioning claim (plaintext
+  // "not_yet_walled"), written once by init.
+  {
+    key: CASTLE_WALL_PROVISION_META_KEY,
+    writer: "wrap/init.ts (castle-wall/provision-state.ts)",
+  },
   // Recovery-key passphrase rekey journal (refused with a heal remedy).
   {
     key: "custody-rekey-journal",

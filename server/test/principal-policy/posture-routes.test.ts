@@ -214,6 +214,79 @@ describe("posture route layer", () => {
     ).toBe("unknown");
   });
 
+  it("carries THIS VAULT's wall claim onto the posture home payload", async () => {
+    // The route builds the wall posture from a pile of MACHINE facts. None of
+    // them is a claim about the vault, and this route supplied nothing that
+    // was, so the additive field never reached the dashboard or the console
+    // that render from this payload.
+    const log = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const base = await serve(
+      baseDeps(log, [wrappedAgent("a1", "claude_code")], {
+        resolveEnforcementAvailability: () => UNDETERMINED_AVAILABILITY,
+        resolveVaultProvisionClaimed: async () => true,
+      }),
+    );
+    const body = (await (
+      await fetch(`${base}${POSTURE_API_PREFIX}/home`)
+    ).json()) as { castle_wall: Record<string, unknown> };
+    expect(body.castle_wall.castle_wall_provision).toBe("not_yet_walled");
+    // arm_state is a CLOSED enum and is untouched by the additive field.
+    expect(body.castle_wall.arm_state).not.toBe("armed");
+  });
+
+  it("renders no vault claim when the fortress carries none", async () => {
+    const log = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const noClaim = await serve(
+      baseDeps(log, [wrappedAgent("a1", "claude_code")], {
+        resolveEnforcementAvailability: () => UNDETERMINED_AVAILABILITY,
+      }),
+    );
+    const unclaimed = (await (
+      await fetch(`${noClaim}${POSTURE_API_PREFIX}/home`)
+    ).json()) as { castle_wall: Record<string, unknown> };
+    expect(unclaimed.castle_wall).not.toHaveProperty("castle_wall_provision");
+  });
+
+  it("a resolver that throws renders the honest not-walled claim, on OTHERWISE fully-armed evidence — never silently unclaimed", async () => {
+    // Codex lens A round 2 (2026-09-10): the prior catch fallback (`false`)
+    // treated a claim-read FAILURE the same as no claim at all, so this
+    // additive field simply vanished from the response instead of naming the
+    // failure. Armed with the SAME genuinely-live evidence
+    // ("composes the home payload" above, which reaches `arm_state: "armed"`
+    // on this exact fixture with no resolver at all), so the control proves
+    // the fixture is not vacuously non-green already.
+    const log = newLog();
+    const now = Date.now();
+    await log.appendCritical({
+      layer: "l1",
+      operation: "egress_allowed",
+      identity_id: CLAIM_SUBJECT,
+      result: "success",
+      details: {
+        agent_id: CLAIM_TOKEN,
+        cw_source: "castle_wall_audit_consumer",
+      },
+      timestamp: new Date(now - 30_000).toISOString(),
+    });
+    const control = await serve(baseDeps(log, [wrappedAgent("a1", "claude_code")]));
+    const controlBody = (await (
+      await fetch(`${control}${POSTURE_API_PREFIX}/home`)
+    ).json()) as { castle_wall: Record<string, unknown> };
+    expect(controlBody.castle_wall.arm_state).toBe("armed");
+
+    const throwing = await serve(
+      baseDeps(log, [wrappedAgent("a1", "claude_code")], {
+        resolveVaultProvisionClaimed: async () => {
+          throw new Error("injected claim-read failure");
+        },
+      }),
+    );
+    const failed = (await (
+      await fetch(`${throwing}${POSTURE_API_PREFIX}/home`)
+    ).json()) as { castle_wall: Record<string, unknown> };
+    expect(failed.castle_wall.castle_wall_provision).toBe("not_yet_walled");
+  });
+
   it("home digest reflects a just-appended entry with NO stale lag (eager-read never-stale-green, #714)", async () => {
     // The home route composes its reads through the AuditLog EAGER path (bounded
     // cost on a long chain). This guards the honesty side of that change: an

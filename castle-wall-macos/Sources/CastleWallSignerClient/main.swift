@@ -39,6 +39,66 @@ func fail(_ message: String) -> Never {
     exit(1)
 }
 
+// MARK: - re-pin confirmation gate
+
+/**
+ The word the operator types to confirm a trust-anchor migration.
+
+ CROSS-FILE CONTRACT: must match `RE_PIN_CONFIRMATION_WORD` in
+ `server/src/cli/castle-wall.ts`. The TypeScript CLI and this shim are two
+ executable entry points to the SAME irreversible operation, so they ask for the
+ same word; a drift leaves one gate asking for something the operator was never
+ shown. The parity test `server/test/castle-wall/re-pin-confirmation-parity.test.ts`
+ reads both source files and fails on a mismatch.
+ */
+let rePinConfirmationWord = "re-pin"
+
+/**
+ Refuse `re-pin` unless a human is at a terminal and types the confirmation.
+
+ WHY THIS EXISTS HERE AND NOT ONLY IN THE TYPESCRIPT CLI: this binary is
+ directly executable. The helper's caller check authenticates THIS SHIM (code
+ signature + Team ID); it says nothing about whether an operator is present, so
+ anything that can exec the bundled shim could previously move the whole
+ machine's Castle Wall trust anchor with a single non-interactive argv,
+ bypassing the CLI's confirmation entirely.
+
+ THREAT MODEL, stated so the bound is not read as stronger than it is. This
+ gate defends against NON-INTERACTIVE callers: an agent-executed argv, a wrap or
+ planner subprocess, `--headless` paths, cron, an SSH one-liner without a pty.
+ It does NOT defend against an operator-equivalent process that holds a pty and
+ types the word; such a process is out of scope by design, and a second
+ mechanism against it would buy nothing while breaking the operator's own
+ legitimate terminal path. There is deliberately no flag and no environment
+ override: an override is exactly the affordance a non-interactive caller would
+ reach for. The helper's caller code-requirement pin is unchanged and still
+ does its own separate job.
+ */
+func confirmRePinOrRefuse() {
+    guard isatty(FileHandle.standardInput.fileDescriptor) == 1 else {
+        fail(
+            "re-pin requires an interactive terminal. It moves this machine's "
+                + "Castle Wall trust anchor to the root signer helper, so it runs only "
+                + "when the operator is present and types the confirmation. There is no "
+                + "flag or environment variable that skips this."
+        )
+    }
+    FileHandle.standardError.write(
+        Data(
+            ("Move this machine's Castle Wall trust anchor to the root signer helper?\n"
+                + "Type \(rePinConfirmationWord) to continue, anything else to abort: ").utf8
+        )
+    )
+    // A closed stdin with no line is an ABORT, never a silent success: an EOF
+    // that fell through as "no answer" would migrate the anchor, which is the
+    // whole failure this gate exists to prevent.
+    guard let typed = readLine(strippingNewline: true),
+        typed.trimmingCharacters(in: .whitespacesAndNewlines) == rePinConfirmationWord
+    else {
+        fail("aborted: the trust anchor was not moved")
+    }
+}
+
 func readPayload(args: [String]) -> Data {
     if let inIdx = args.firstIndex(of: "--in"), inIdx + 1 < args.count {
         let path = args[inIdx + 1]
@@ -135,6 +195,9 @@ case "sign-nonce":
 case "get-pubkey":
     run(.publicKey)
 case "re-pin":
+    // The gate runs BEFORE any XPC connection is opened, so a refusal leaves
+    // the machine byte-identical.
+    confirmRePinOrRefuse()
     run(.installPin)
 default:
     fail("unknown mode: \(mode)")

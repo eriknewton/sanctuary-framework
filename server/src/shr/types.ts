@@ -28,7 +28,16 @@ export type DegradationCode =
   | "LOW_TIER_DOMINANCE"
   | "STALE_REPUTATION"
   | "DISPUTE_ON_RECORD"
-  | "NO_VERASCORE_LINK";
+  | "NO_VERASCORE_LINK"
+  // Castle Wall vault provisioning (additive, 2026-09-10). Emitted when THIS
+  // vault carries the `not_yet_walled` claim `wrap/init.ts` persists. It is an
+  // L2 (operational isolation) degradation because the missing thing is
+  // OS-level egress containment for this vault, and it is carried as a
+  // degradation rather than a new body field because the SHR body is a
+  // versioned-frozen v1.0 schema that external counterparties parse: the
+  // degradations array is the mechanism that schema already provides for
+  // exactly this kind of honest subtraction.
+  | "VAULT_NOT_ON_CASTLE_WALL";
 
 // ── SHR Body (signed content) ────────────────────────────────────────
 

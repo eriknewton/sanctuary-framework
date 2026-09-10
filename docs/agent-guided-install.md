@@ -158,14 +158,32 @@ Apple consent on the full profile is more than the system-extension toggle. The
 first time the content filter arms, macOS raises a one-time "would like to filter
 network content" approval; the planner returns an `approve_content_filter` human
 action that names this dialog and the System Settings pane, because the arm
-otherwise appears to hang until the operator approves it. Separately, if a fresh
-install leaves the root-owned enforcement pin inconsistent with the signer helper,
-the boot service cannot come up cleanly; the planner then returns a
-`repin_trust_anchor` human action naming the exact `castle-wall re-pin` command
-rather than leaving the operator with an unexplained boot loop. The trust-anchor
-verdict is read from `castle-wall status`; when the pin is not readable from the
-planner's context, the observation is reported as unknown and no remedy is
-invented.
+otherwise appears to hang until the operator approves it. Separately, the boot service cannot come up cleanly
+until the root-owned enforcement anchor holds the signer helper's key. That is
+true of a machine where the anchor holds some other key, of a machine that has
+no anchor yet, and of a vault that has never been put on the wall, and the
+planner returns the same `repin_trust_anchor` human action for all three, naming
+the exact `castle-wall re-pin` command rather than leaving the operator with an
+unexplained boot loop. Creating a vault never installs that anchor, so a machine
+that has never been through this step is the ordinary starting state, not a
+fault. The command asks the operator to confirm and refuses when it has no
+terminal, so the agent cannot run it: it is a human action by construction as
+well as by policy. The trust-anchor verdict is read from `castle-wall status`;
+when the anchor is not readable from the planner's context, the observation is
+reported as unknown and no remedy is invented.
+
+The vault's own state is reported separately from the machine's. Init records
+only that a vault has not yet been put on this machine's Castle Wall
+(`not_yet_walled`); nothing is ever recorded to say a vault IS on the wall.
+Whether a vault is on the wall is derived, never stored: it holds only when
+this Mac's trust-anchor verdict is consistent with the signer helper's key
+AND that vault's own arm evidence says armed. Re-pin supplies the anchor half
+of that pair; arming, a separate step, supplies the other. The planner,
+`doctor`, `castle-wall status`, `sanctuary status`, and the health surfaces
+each report what they can observe of that pair, so a machine can carry a
+running wall from an earlier install while the vault in front of the operator
+is on no wall at all; machine-wide observations are never read as protection
+for a particular vault.
 
 ### Root boot-runtime custody
 
