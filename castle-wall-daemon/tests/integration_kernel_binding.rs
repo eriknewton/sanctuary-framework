@@ -783,9 +783,13 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
 
     let handle = boot(config).expect("daemon boot");
 
-    // Install nftables table + agent ruleset.
-    cleanup_castle_table();
-    nftables::install_castle_table().expect("install castle table");
+    // NO cleanup/reinstall here. `boot` on a privileged Linux host ACQUIRES the
+    // castle table under the host lock and records its identity in the ownership
+    // journal, so deleting it and installing a replacement hands the daemon a
+    // table with a different owner marker: the next health proof must read that
+    // as drifted, and the ownership assertion below would then be asserting over
+    // an inventory production refuses. The agent ruleset is loaded INTO the
+    // acquired table, exactly as the production agent-management path does.
 
     let test_rule = AllowlistRule {
         id: "rule-allow-test".to_string(),
@@ -825,21 +829,12 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     // value against the uid the CURRENT signed manifest confines, so it passes
     // only because the manifest above publishes the matching origin. Failure mode
     // if this assertion is absent: the evaluator assertions below still pass over
-    // an inventory production would refuse.
-    // ProbeUnavailable is INDETERMINATE (a bounded `nft` proof may be in flight),
-    // so it is retried, never read as ready; a proven Lost fails now.
-    let mut health = handle.kernel_runtime_health();
-    for _ in 0..40 {
-        if health != castle_wall_daemon::runtime_health::RuntimeHealthState::ProbeUnavailable {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-        health = handle.kernel_runtime_health();
-    }
-    assert_eq!(
-        health,
-        castle_wall_daemon::runtime_health::RuntimeHealthState::Ready,
-        "kernel runtime health must be Ready once the manifest-matched uid binding is installed"
+    // an inventory production would refuse. The shared helper waits out the
+    // readiness cache so this is an observation taken AFTER the load, not a
+    // cached reading of the table as it stood before it.
+    isolation::assert_ownership_health_after_install(
+        &handle,
+        "end-to-end fixture after uid-binding install",
     );
 
     // Verify rules installed.

@@ -56,7 +56,6 @@ use castle_wall_daemon::manifest::verify::{
 };
 use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
 use castle_wall_daemon::nftables::{self, AgentRulesetId, AgentUidBinding};
-use castle_wall_daemon::runtime_health::RuntimeHealthState;
 
 /// The uid the wrapped agent in these bypass tests runs as, and the manifest
 /// ceiling it clears. No account is created: nft validates nothing about a
@@ -200,36 +199,6 @@ fn write_signed_allow_only_example_443(policy_dir: &Path, signing: &SigningKey) 
         serde_json::to_string_pretty(&signed).unwrap(),
     )
     .unwrap();
-}
-
-/// Assert the daemon's OWN supervision still reads the live table as owned after
-/// a per-agent uid binding is installed into it.
-///
-/// This is the check that makes the kernel fixture a test of production
-/// behaviour: the health poll recomputes the uid seal and compares the live
-/// `meta skuid` value against the uid the CURRENT signed manifest confines, so it
-/// passes only because the manifest above publishes the matching origin. With no
-/// origin in force the same installation reads foreign, health latches Lost and
-/// deny-all re-arms.
-///
-/// Failure mode if this is skipped: the packet assertions still pass, and an
-/// inventory production would refuse looks like a healthy wall.
-fn assert_healthy_ownership(daemon: &DaemonHandle, context: &str) {
-    // ProbeUnavailable is INDETERMINATE (the bounded `nft` proof may still be in
-    // flight), so it is retried and never read as ready; a proven Lost fails now.
-    for _ in 0..40 {
-        match daemon.kernel_runtime_health() {
-            RuntimeHealthState::Ready => return,
-            RuntimeHealthState::ProbeUnavailable => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            other => panic!(
-                "{context}: kernel runtime health must be Ready once the manifest-matched uid \
-                 binding is installed; got {other:?}"
-            ),
-        }
-    }
-    panic!("{context}: kernel runtime health never resolved to Ready (probe stayed indeterminate)");
 }
 
 fn dns_request(host: Option<&str>, ip: &str, port: u16, protocol: &str) -> EvaluationRequest {
@@ -542,8 +511,13 @@ impl KernelBypassFixture {
 
         // The binding is only legitimate because the signed manifest above
         // confines this exact uid; prove the daemon's live health poll agrees
-        // before any packet is sent.
-        assert_healthy_ownership(&daemon, "dns-bypass fixture after uid-binding install");
+        // before any packet is sent. The shared helper is what makes that proof
+        // a POST-INSTALLATION observation: the readiness cache would otherwise
+        // let this assertion certify the table as it stood before the load.
+        isolation::assert_ownership_health_after_install(
+            &daemon,
+            "dns-bypass fixture after uid-binding install",
+        );
 
         Self {
             daemon: Some(daemon),

@@ -82,7 +82,6 @@ fn test_binding() -> AgentUidBinding {
     }
 }
 use castle_wall_daemon::policy::{DeniedReason, EvaluationRequest, Verdict};
-use castle_wall_daemon::runtime_health::RuntimeHealthState;
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
@@ -634,6 +633,12 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
     let fortress_id = config.fortress_id.clone();
 
     let handle = boot(config).expect("boot");
+    // Idempotent by contract (`install_castle_table_impl` re-adds nothing when the
+    // table exists), so this does NOT replace the table `boot` just acquired; it
+    // only covers a host where activation left no table to load into. Deleting
+    // and recreating here would hand the daemon a different owner marker and the
+    // ownership assertion below would be made over an inventory production
+    // refuses.
     nftables::install_castle_table().expect("install");
 
     let id = AgentRulesetId {
@@ -652,21 +657,12 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
 
     // The binding is legitimate only because the manifest in force confines this
     // uid; prove the daemon's own health poll reads the live table as OWNED
-    // before the IPC drop, so what persists below is a supervised inventory.
-    // ProbeUnavailable is INDETERMINATE (a bounded `nft` proof may be in flight),
-    // so it is retried and never read as ready; a proven Lost fails now.
-    let mut health = handle.kernel_runtime_health();
-    for _ in 0..40 {
-        if health != RuntimeHealthState::ProbeUnavailable {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-        health = handle.kernel_runtime_health();
-    }
-    assert_eq!(
-        health,
-        RuntimeHealthState::Ready,
-        "kernel runtime health must be Ready once the manifest-matched uid binding is installed"
+    // before the IPC drop, so what persists below is a supervised inventory. The
+    // shared helper waits out the readiness cache, so this is an observation
+    // taken AFTER the load rather than a cached reading of the pre-load table.
+    isolation::assert_ownership_health_after_install(
+        &handle,
+        "f3 fixture after uid-binding install",
     );
 
     // Connect, handshake, then forcibly close the client side mid-session.

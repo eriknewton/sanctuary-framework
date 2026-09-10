@@ -910,8 +910,15 @@ const NFT_HEALTH_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// still runs a fresh proof (a genuine loss is detected within one tick), while
 /// any additional caller inside the same window is served from the cached
 /// reading instead of forking a second `nft`.
+///
+/// Public because a reading served from that cache can predate whatever the
+/// caller just installed: the privileged integration suites derive their
+/// post-install freshness wait from THIS value (see
+/// `tests/isolation/mod.rs::assert_ownership_health_after_install`) rather than
+/// mirroring the number, so a change here moves the fixtures with it instead of
+/// silently letting them certify a pre-installation table.
 #[cfg(target_os = "linux")]
-const NFT_HEALTH_MIN_INTERVAL: Duration = Duration::from_millis(500);
+pub const NFT_HEALTH_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Consecutive indeterminate proofs tolerated before readiness is withdrawn
 /// fail-closed, while a single transient timeout under momentary load no longer

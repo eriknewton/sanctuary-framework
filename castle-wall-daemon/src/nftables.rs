@@ -3640,12 +3640,17 @@ mod tests {
         // Synthetic `nft -a list chain` output with three rules: one
         // jumping to our chain, one jumping to a different chain, one
         // doing something else entirely.
+        //
+        // The jump lines carry the PRODUCTION `meta skuid <uid>` match this
+        // emitter now builds (`build_agent_jump_rule`); a fixture still depicting
+        // the retired `socket cgroupv2` match would keep testing the parser
+        // against a listing the kernel can no longer produce.
         let listing = "\
 table inet sanctuary-castle {
 \tchain output {
 \t\ttype filter hook output priority 0; policy accept;
-\t\tsocket cgroupv2 level 2 \"system.slice/sanctuary-agent-alpha.service\" goto agent_alpha # handle 5
-\t\tsocket cgroupv2 level 2 \"system.slice/sanctuary-agent-beta.service\" goto agent_beta # handle 7
+\t\tmeta skuid 4242 goto agent_alpha # handle 5
+\t\tmeta skuid 4243 goto agent_beta # handle 7
 \t\tudp dport 53 accept # handle 9
 \t}
 }";
@@ -3665,8 +3670,8 @@ table inet sanctuary-castle {
         // substring match for `agent_foo` would wrongly hit the line
         // ending in `goto agent_foo_bar`.
         let listing = "\
-\t\tsocket cgroupv2 level 2 \"system.slice/foo.service\" goto agent_foo # handle 11
-\t\tsocket cgroupv2 level 2 \"system.slice/foo_bar.service\" goto agent_foo_bar # handle 13
+\t\tmeta skuid 4242 goto agent_foo # handle 11
+\t\tmeta skuid 4243 goto agent_foo_bar # handle 13
 ";
         let handles_foo = linux::parse_jump_rule_handles(listing, "agent_foo");
         assert_eq!(handles_foo, vec![11], "must not match agent_foo_bar");
@@ -3682,9 +3687,9 @@ table inet sanctuary-castle {
         // delete-then-add prevents going forward), the parser must surface
         // every handle so a remove call cleans them all out.
         let listing = "\
-\t\tsocket cgroupv2 level 2 \"x\" goto agent_dup # handle 21
-\t\tsocket cgroupv2 level 2 \"x\" goto agent_dup # handle 22
-\t\tsocket cgroupv2 level 2 \"x\" goto agent_dup # handle 23
+\t\tmeta skuid 4242 goto agent_dup # handle 21
+\t\tmeta skuid 4242 goto agent_dup # handle 22
+\t\tmeta skuid 4242 goto agent_dup # handle 23
 ";
         let handles = linux::parse_jump_rule_handles(listing, "agent_dup");
         assert_eq!(handles, vec![21, 22, 23]);

@@ -133,3 +133,81 @@ pub fn subprocess_args() -> Vec<String> {
         (unsafe { libc::geteuid() }).to_string(),
     ]
 }
+
+/// Post-installation readiness assertion, shared by the privileged fixtures that
+/// install a per-agent uid binding into the daemon's acquired table.
+///
+/// Linux-only because the cache it waits out is the Linux `nft` ownership proof;
+/// the non-Linux suites that also include this module have no such probe.
+#[cfg(target_os = "linux")]
+mod health_freshness {
+    use std::time::Duration;
+
+    use castle_wall_daemon::daemon::DaemonHandle;
+    use castle_wall_daemon::runtime_health::RuntimeHealthState;
+    use castle_wall_daemon::runtime_providers::NFT_HEALTH_MIN_INTERVAL;
+
+    /// Slack added to `NFT_HEALTH_MIN_INTERVAL` before a post-install readiness
+    /// poll. Absorbs sleep granularity only; it is not a retry budget and must
+    /// never be raised to make a flaky fixture pass.
+    const HEALTH_FRESHNESS_MARGIN: Duration = Duration::from_millis(100);
+
+    /// Consecutive indeterminate readings tolerated, `HEALTH_PROBE_RETRY_SPACING`
+    /// apart. 40 x 50ms = 2s, comfortably past the daemon's 1s bounded `nft`
+    /// proof (`NFT_HEALTH_QUERY_TIMEOUT`), so a proof still in flight resolves
+    /// rather than failing the fixture.
+    const HEALTH_PROBE_MAX_INDETERMINATE: usize = 40;
+    const HEALTH_PROBE_RETRY_SPACING: Duration = Duration::from_millis(50);
+
+    /// Assert the daemon's OWN supervision reads the live table as owned, from a
+    /// health observation that COMPLETED AFTER the caller installed its binding.
+    ///
+    /// One shared helper rather than an inline loop per suite: three fixtures
+    /// need the identical predicate, and a per-suite copy is the hand-mirrored
+    /// shape that drifts (AGENTS rule 5).
+    ///
+    /// Why the sleep is load-bearing: `BoundedHealthProbe::poll_result`
+    /// (`src/health_probe.rs`) serves any reading taken within
+    /// `NFT_HEALTH_MIN_INTERVAL` of the last completed proof straight from cache.
+    /// A poll issued immediately after an install can therefore return a reading
+    /// of the PRE-INSTALL table and certify an inventory that was never examined.
+    /// Sleeping one whole min-interval past the install bounds the age of any
+    /// cached reading below the elapsed time since that install, so whatever comes
+    /// back was observed after it; a cache that has aged out forks a fresh `nft`
+    /// proof instead. Either way the observation post-dates the installation.
+    ///
+    /// Failure mode if this is skipped: the fixture passes through the cache while
+    /// the binding is unverifiable, then fails intermittently once the cache
+    /// expires, which reads as a flake rather than as the missing supervision it
+    /// is.
+    ///
+    /// `ProbeUnavailable` is INDETERMINATE (a bounded `nft` proof may still be in
+    /// flight), so it is retried and NEVER read as ready; a proven `Lost` fails
+    /// now.
+    pub fn assert_ownership_health_after_install(handle: &DaemonHandle, context: &str) {
+        std::thread::sleep(NFT_HEALTH_MIN_INTERVAL + HEALTH_FRESHNESS_MARGIN);
+        for _ in 0..HEALTH_PROBE_MAX_INDETERMINATE {
+            match handle.kernel_runtime_health() {
+                RuntimeHealthState::Ready => return,
+                RuntimeHealthState::ProbeUnavailable => {
+                    std::thread::sleep(HEALTH_PROBE_RETRY_SPACING);
+                }
+                other => panic!(
+                    "{context}: kernel runtime health must be Ready in an observation taken \
+                     AFTER the manifest-matched uid binding was installed; got {other:?}"
+                ),
+            }
+        }
+        panic!(
+            "{context}: kernel runtime health never resolved past ProbeUnavailable, so no \
+             post-installation observation was ever completed"
+        );
+    }
+}
+
+// Same reason as the file-level `dead_code` allow: only three of the suites that
+// include this module install a uid binding, so for the others the re-export is
+// legitimately unused.
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+pub use health_freshness::assert_ownership_health_after_install;
