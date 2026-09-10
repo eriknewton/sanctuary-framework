@@ -1170,9 +1170,11 @@ export async function probeCustodyAccess(
  * Resolve the S5-P exclusive-egress posture for the install probe, reusing
  * the SAME producer `dashboard-standalone.ts` binds on darwin
  * (`egress-gate/arming-wiring.ts` `createExclusiveEgressPostureProducer`),
- * never a second implementation, so `deriveInstallVaultProvision`'s cap can
- * never diverge from `applyExclusiveEgress`'s cap on the same host at the
- * same moment.
+ * never a second implementation. When both probes observe the same live
+ * runtime state, `deriveInstallVaultProvision`'s cap and
+ * `applyExclusiveEgress`'s cap agree; each side runs its own availability
+ * query, so a query failure on one side is reported as that side's failed
+ * status (fail closed there) and can differ from the other side's reading.
  *
  * `coarseWallArmed` reuses THIS probe's own already-trusted
  * enforcement-availability evidence (`wall.enforcement === "live"`) rather
