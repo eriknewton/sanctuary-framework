@@ -356,12 +356,14 @@ export function verify(
   try {
     // Strict profile. RFC 8032 section 5.1.7 permits cofactored and
     // cofactorless verification alike, and requires a prime-order check on
-    // neither the public key A nor the commitment R, so two conformant
-    // verifiers can disagree about the same bytes. We run the narrower
-    // COFACTORLESS STRICT profile (ed25519-dalek's `verify_strict`, what the
-    // Rust daemon runs), rejecting what an RFC-only verifier may accept: a y
-    // not reduced mod p, the eight small-order points (the identity-key
-    // forgery is one), and torsion-bearing points.
+    // neither public key A nor commitment R, so two conformant verifiers can
+    // disagree about the same bytes. @noble's equation below is always the
+    // COFACTORED one; this gate is what turns the combined result
+    // COFACTORLESS STRICT (ed25519-dalek's `verify_strict`, what the Rust
+    // daemon runs), the funnel's INTENDED shared profile with the daemon.
+    // Reject here what an RFC-only verifier may accept: a y not reduced mod
+    // p, the eight small-order points (the identity-key forgery is one), and
+    // torsion-bearing points.
     if (
       !isStrictEd25519PointEncoding(publicKey) ||
       signature.length !== ED25519_SIGNATURE_LENGTH ||
@@ -371,13 +373,16 @@ export function verify(
     ) {
       return false;
     }
-    // Generic Ed25519 verification funnel used by tool-level and suite-level
-    // verifiers. Malformed signature or public-key bytes must return `false`
-    // here, not escape as caller-dependent exception handling. `zip215: false`
-    // holds @noble to the cofactorless equation and its own canonical-encoding
-    // checks; the gate above supplies the prime-order half that the ZIP-215
-    // profile deliberately omits, so a signature this funnel accepts is one
-    // the Rust daemon accepts too.
+    // Malformed bytes must return `false`, not throw. `zip215: false` only
+    // selects canonical point decoding for A and R and canonical `S < L`; it
+    // does NOT select a cofactorless equation. @noble always evaluates the
+    // cofactored `[8](R + [k]A - [S]B) = 0` (@noble/curves/esm/abstract/
+    // edwards.js:512-515). The gate above puts A and R in the prime-order
+    // subgroup, so multiplying by 8 is invertible there and the cofactored
+    // check @noble runs is equivalent to the cofactorless one dalek's
+    // `verify_strict` runs (ed25519-dalek 2.1.1, src/verifying.rs:402). No
+    // cross-implementation fixture in this PR pins that the two agree
+    // byte-for-byte on one signature.
     return ed25519.verify(signature, payload, publicKey, { zip215: false });
   } catch {
     return false;
@@ -385,7 +390,11 @@ export function verify(
 }
 
 /**
- * Castle Wall's strict authority-point profile, shared by every TS verifier.
+ * Castle Wall's strict authority-point profile. Shared by the `verify` funnel
+ * above and by `castle-wall/allowlist/parse.ts`, not by every Ed25519 check in
+ * the server: several sites call `ed25519.verify` directly (for example
+ * `substrate/manifest.ts`, `intelligence/model-catalog-v3.ts`, and multiple
+ * exit and transparency sites) and are unaffected by this profile.
  *
  * Three rejections, in the order the checks run. A wrong length is not a point
  * at all. `isSmallOrder() || !isTorsionFree()` rejects any point outside the

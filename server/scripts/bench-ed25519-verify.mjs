@@ -3,9 +3,16 @@
  *
  * The strict funnel in `src/core/identity.ts` decodes and subgroup-checks two
  * curve points (the public key A and the signature commitment R) before it
- * calls into @noble, and it pins @noble to the cofactorless equation with
- * `zip215: false`. Every Ed25519 verification in the product pays that, so the
- * number belongs in the PR that introduces it rather than in an estimate.
+ * calls into @noble. `zip215: false` narrows @noble's own point decoding to
+ * canonical encodings and its S check to canonical `S < L`; @noble evaluates
+ * the cofactored equation either way. The subgroup gate is what makes the
+ * combined result cofactorless (see the invariant comment at the
+ * `ed25519.verify` call in `src/core/identity.ts` for the equivalence
+ * argument). Every caller of that shared `verify` funnel pays this cost, not
+ * every Ed25519 verification in the product: several sites (for example
+ * `substrate/manifest.ts`, `intelligence/model-catalog-v3.ts`) call
+ * `ed25519.verify` directly and are unaffected. The number belongs in the PR
+ * that introduces it rather than in an estimate.
  *
  * Run:  npx tsx scripts/bench-ed25519-verify.mjs
  * (tsx, not plain node: the "after" arm imports the real TypeScript funnel
