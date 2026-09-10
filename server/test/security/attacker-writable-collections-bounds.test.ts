@@ -43,7 +43,7 @@
  * test proved the lockout was still reachable).
  */
 
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey, randomBytes } from "../../src/core/random.js";
@@ -65,6 +65,23 @@ import {
 } from "../../src/federation/registry.js";
 import { ON_EVICT_AUDIT_TIMEOUT_MS } from "../../src/core/bounded-map.js";
 import { generateSHR } from "../../src/shr/generator.js";
+
+// Clock ownership for the tests below that install fake timers. Runner-owned
+// cleanup: if a test times out with an await still pending, vitest rejects the
+// wrapper WITHOUT unwinding the callback, so the test's own `finally` never
+// runs and the next test would inherit a frozen clock. This afterEach restores
+// real timers regardless (idempotent when timers are already real) and clears
+// the owner. The expires_at proof additionally claims ownership as its FIRST
+// statement (before any await) and re-checks it before freezing, before
+// jumping, and before restoring, so a late continuation of its timed-out body
+// can neither install nor move nor restore a clock a later test owns. The two
+// older fake-timer tests further down get only the afterEach cleanup; their
+// own unconditional restores after a late resumption are a tracked residual.
+let frozenClockOwner: symbol | null = null;
+afterEach(() => {
+  frozenClockOwner = null;
+  vi.useRealTimers();
+});
 import { createIdentity, generateIdentityId } from "../../src/core/identity.js";
 import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { canonicalizeForSigning } from "../../src/shr/types.js";
@@ -462,10 +479,16 @@ describe("2. handshake results: capped + per-session fair + expires_at-aware evi
   it(
     "MUTATION-PROOF TARGET (expires_at): refuses a new result while every slot holds a live verified peer, then EVICTS one once they expire — never blind-FIFOs a live peer",
     async () => {
-      // Short SHR validity (test-only override) so 1000 real handshakes can
-      // all complete WITHIN their validity window, and then all become
-      // expired together after one short sleep — without waiting the real
-      // 1-hour default.
+      // Claim clock ownership BEFORE the first await: a body that times out
+      // during setup and resumes later must not be able to mint itself a
+      // fresh token after the runner's afterEach has cleared the owner.
+      const clockOwner = Symbol("expires_at-proof clock owner");
+      frozenClockOwner = clockOwner;
+      // Short SHR validity (test-only override) so the 1000 filler entries
+      // carry a near expires_at that one frozen-clock jump below can push
+      // into the past together, without waiting the real 1-hour default.
+      // The fill's own duration never counts against this window: `Date` is
+      // frozen for the whole fill (see the comment at the freeze).
       const SHR_VALIDITY_MS = 30_000;
       const registrar = makeAgent();
       const registrarIdentity = await createIdentityFor(registrar, "registrar-identity");
@@ -531,74 +554,104 @@ describe("2. handshake results: capped + per-session fair + expires_at-aware evi
         );
       }
 
-      // Fill handshakeResults to EXACTLY the global cap, spread across
-      // `fillerSessionCount` distinct agent SESSIONS (one shared registrar
-      // identity throughout — origin no longer depends on identity_id) so
-      // no single one ever exceeds its own per-origin quota.
-      let counter = 0;
-      for (let s = 0; s < fillerSessionCount; s += 1) {
-        const session = `agent:filler-session-${s}`;
-        for (let i = 0; i < MAX_HANDSHAKE_RESULTS_PER_ORIGIN; i += 1) {
-          const completed = await completeRealHandshake(session, `peer-${counter}`);
-          expect(completed.result?.verified).toBe(true);
-          counter += 1;
+      // Freeze `Date` only (toFake: ["Date"]) for the rest of this test —
+      // setTimeout, promises, and real network/storage I/O still run at
+      // real wall-clock speed, so the 1000-handshake fill below is not
+      // slowed or altered in any way. Only `new Date()`/`Date.now()` reads
+      // (the expires_at computation and the expiry comparison in
+      // handshake/tools.ts) are frozen, so the fill's real duration can
+      // never race SHR_VALIDITY_MS and evict a filler entry mid-fill. The
+      // property under test is refuse-while-live then evict-after-expiry,
+      // never a wall-clock budget the fill has to beat.
+      if (frozenClockOwner !== clockOwner) {
+        throw new Error(
+          "clock ownership was revoked during setup (this test timed out and the runner moved on); refusing to install fake timers under a later test"
+        );
+      }
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        // Fill handshakeResults to EXACTLY the global cap, spread across
+        // `fillerSessionCount` distinct agent SESSIONS (one shared registrar
+        // identity throughout — origin no longer depends on identity_id) so
+        // no single one ever exceeds its own per-origin quota.
+        let counter = 0;
+        for (let s = 0; s < fillerSessionCount; s += 1) {
+          const session = `agent:filler-session-${s}`;
+          for (let i = 0; i < MAX_HANDSHAKE_RESULTS_PER_ORIGIN; i += 1) {
+            const completed = await completeRealHandshake(session, `peer-${counter}`);
+            expect(completed.result?.verified).toBe(true);
+            counter += 1;
+          }
+        }
+        expect(handshakeResults.size).toBe(MAX_HANDSHAKE_RESULTS);
+
+        let saturatedAudited = 0;
+        let evictedAudited: { expired?: boolean } | undefined;
+        const originalAppend = registrar.auditLog.append.bind(registrar.auditLog);
+        registrar.auditLog.append = ((...args: Parameters<AuditLog["append"]>) => {
+          if (args[1] === "handshake_results_saturated") saturatedAudited += 1;
+          return originalAppend(...args);
+        }) as AuditLog["append"];
+        // Eviction now audits via appendCritical (MUST-FIX 6, fix-round-2 —
+        // awaited, durable, BEFORE the delete), not the low-risk `.append`
+        // fire-and-forget it used before, so the spy targets that method.
+        const originalAppendCritical = registrar.auditLog.appendCritical.bind(
+          registrar.auditLog
+        );
+        registrar.auditLog.appendCritical = ((
+          ...args: Parameters<AuditLog["appendCritical"]>
+        ) => {
+          const entry = args[0];
+          // MUST-FIX 2, fix-round-5: the pre-delete critical write is now the
+          // INTENT record (`_eviction_intent`), not `_evicted` — the
+          // COMPLETION record moved to a fire-and-forget `append()` call in
+          // `onEvicted` (see handshake/tools.ts), which fires only after the
+          // authoritative delete and is therefore not intercepted here.
+          if (entry.operation === "handshake_result_eviction_intent") {
+            evictedAudited = entry.details as { expired?: boolean };
+          }
+          return originalAppendCritical(...args);
+        }) as AuditLog["appendCritical"];
+
+        // Every slot holds a verified, live, UNEXPIRED peer — the probe
+        // session's own new handshake is REFUSED, not admitted by evicting
+        // one of them (never blind-FIFO a live peer).
+        const whileLive = await completeRealHandshake(
+          probeSession,
+          "overflow-while-live"
+        );
+        expect(whileLive.result).toBeUndefined();
+        expect(whileLive.error).toContain("live, unexpired peer");
+        expect(handshakeResults.size).toBe(MAX_HANDSHAKE_RESULTS);
+        expect(saturatedAudited).toBeGreaterThan(0);
+
+        // Jump the frozen clock past SHR_VALIDITY_MS instead of a real
+        // sleep: every filler entry's expires_at is now in the past. A
+        // fresh handshake for the SAME probe session must now SUCCEED — an
+        // expired verified entry rolls off to admit a new one, instead of
+        // wedging the store for the server's lifetime.
+        if (frozenClockOwner !== clockOwner) {
+          throw new Error(
+            "frozen clock is no longer owned by this test (it timed out and the runner moved on); refusing to advance another test's clock"
+          );
+        }
+        vi.setSystemTime(Date.now() + SHR_VALIDITY_MS + 500);
+        const afterExpiry = await completeRealHandshake(
+          probeSession,
+          "overflow-after-expiry"
+        );
+        expect(afterExpiry.result?.verified).toBe(true);
+        expect(handshakeResults.size).toBe(MAX_HANDSHAKE_RESULTS);
+        expect(evictedAudited).toBeDefined();
+        expect(evictedAudited!.expired).toBe(true);
+      } finally {
+        // Only the current owner restores real timers; a late continuation
+        // after a timeout must not touch the clock a later test may own.
+        if (frozenClockOwner === clockOwner) {
+          frozenClockOwner = null;
+          vi.useRealTimers();
         }
       }
-      expect(handshakeResults.size).toBe(MAX_HANDSHAKE_RESULTS);
-
-      let saturatedAudited = 0;
-      let evictedAudited: { expired?: boolean } | undefined;
-      const originalAppend = registrar.auditLog.append.bind(registrar.auditLog);
-      registrar.auditLog.append = ((...args: Parameters<AuditLog["append"]>) => {
-        if (args[1] === "handshake_results_saturated") saturatedAudited += 1;
-        return originalAppend(...args);
-      }) as AuditLog["append"];
-      // Eviction now audits via appendCritical (MUST-FIX 6, fix-round-2 —
-      // awaited, durable, BEFORE the delete), not the low-risk `.append`
-      // fire-and-forget it used before, so the spy targets that method.
-      const originalAppendCritical = registrar.auditLog.appendCritical.bind(
-        registrar.auditLog
-      );
-      registrar.auditLog.appendCritical = ((
-        ...args: Parameters<AuditLog["appendCritical"]>
-      ) => {
-        const entry = args[0];
-        // MUST-FIX 2, fix-round-5: the pre-delete critical write is now the
-        // INTENT record (`_eviction_intent`), not `_evicted` — the
-        // COMPLETION record moved to a fire-and-forget `append()` call in
-        // `onEvicted` (see handshake/tools.ts), which fires only after the
-        // authoritative delete and is therefore not intercepted here.
-        if (entry.operation === "handshake_result_eviction_intent") {
-          evictedAudited = entry.details as { expired?: boolean };
-        }
-        return originalAppendCritical(...args);
-      }) as AuditLog["appendCritical"];
-
-      // Every slot holds a verified, live, UNEXPIRED peer — the probe
-      // session's own new handshake is REFUSED, not admitted by evicting
-      // one of them (never blind-FIFO a live peer).
-      const whileLive = await completeRealHandshake(
-        probeSession,
-        "overflow-while-live"
-      );
-      expect(whileLive.result).toBeUndefined();
-      expect(whileLive.error).toContain("live, unexpired peer");
-      expect(handshakeResults.size).toBe(MAX_HANDSHAKE_RESULTS);
-      expect(saturatedAudited).toBeGreaterThan(0);
-
-      // Wait past SHR_VALIDITY_MS: every filler entry's expires_at is now
-      // in the past. A fresh handshake for the SAME probe session must now
-      // SUCCEED — an expired verified entry rolls off to admit a new one,
-      // instead of wedging the store for the server's lifetime.
-      await sleep(SHR_VALIDITY_MS + 500);
-      const afterExpiry = await completeRealHandshake(
-        probeSession,
-        "overflow-after-expiry"
-      );
-      expect(afterExpiry.result?.verified).toBe(true);
-      expect(handshakeResults.size).toBe(MAX_HANDSHAKE_RESULTS);
-      expect(evictedAudited).toBeDefined();
-      expect(evictedAudited!.expired).toBe(true);
     },
     240_000
   );
