@@ -356,14 +356,14 @@ export function verify(
   try {
     // Strict profile. RFC 8032 section 5.1.7 permits cofactored and
     // cofactorless verification alike, and requires a prime-order check on
-    // neither public key A nor commitment R, so two conformant verifiers can
-    // disagree about the same bytes. @noble's equation below is always the
-    // COFACTORED one; this gate is what turns the combined result
-    // COFACTORLESS STRICT (ed25519-dalek's `verify_strict`, what the Rust
-    // daemon runs), the funnel's INTENDED shared profile with the daemon.
-    // Reject here what an RFC-only verifier may accept: a y not reduced mod
-    // p, the eight small-order points (the identity-key forgery is one), and
-    // torsion-bearing points.
+    // neither A nor R, so two conformant verifiers can disagree about the
+    // same bytes. @noble's equation below is always the COFACTORED one;
+    // this gate is what turns the combined result COFACTORLESS STRICT
+    // (ed25519-dalek's `verify_strict`, what the Rust daemon runs), the
+    // funnel's INTENDED shared profile with the daemon. RFC 8032 5.1.3
+    // already rejects unreduced y; this gate adds the eight small-order
+    // points (the identity-key forgery is one) and torsion-bearing points,
+    // neither required by bare RFC 8032.
     if (
       !isStrictEd25519PointEncoding(publicKey) ||
       signature.length !== ED25519_SIGNATURE_LENGTH ||
@@ -373,16 +373,16 @@ export function verify(
     ) {
       return false;
     }
-    // Malformed bytes must return `false`, not throw. `zip215: false` only
-    // selects canonical point decoding for A and R and canonical `S < L`; it
-    // does NOT select a cofactorless equation. @noble always evaluates the
-    // cofactored `[8](R + [k]A - [S]B) = 0` (@noble/curves/esm/abstract/
-    // edwards.js:512-515). The gate above puts A and R in the prime-order
-    // subgroup, so multiplying by 8 is invertible there and the cofactored
-    // check @noble runs is equivalent to the cofactorless one dalek's
-    // `verify_strict` runs (ed25519-dalek 2.1.1, src/verifying.rs:402). No
-    // cross-implementation fixture in this PR pins that the two agree
-    // byte-for-byte on one signature.
+    // Malformed bytes must return `false`, not throw. `zip215: false` selects
+    // canonical decoding for A and R (RFC 8032 `y < p`); it
+    // does NOT select a cofactorless equation, and it does not gate the scalar check
+    // either: `S < L` runs unconditionally either way. @noble always evaluates the
+    // cofactored `[8](R + [k]A - [S]B) = 0`. The gate above puts A and R in the
+    // prime-order subgroup, so multiplying by 8 is invertible there and the
+    // cofactored check @noble runs is equivalent to the cofactorless one dalek's
+    // `verify_strict` runs (ed25519-dalek 2.1.1). No
+    // cross-implementation fixture in this PR pins that the two agree byte-for-byte
+    // on one signature.
     return ed25519.verify(signature, payload, publicKey, { zip215: false });
   } catch {
     return false;
