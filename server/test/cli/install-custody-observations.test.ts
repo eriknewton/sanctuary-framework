@@ -1,3 +1,4 @@
+// fail-before-exempt: fixture-only edit. The shared InstallProbeResult fixture gains the additive vaultProvision observation with the neutral "unknown" value, and the one full-profile case that describes an ARMED darwin host names the matching "walled" value so the custody gate it asserts is still the gate it reaches; no assertion changed. The behavior these feed is proven in test/cli/install.test.ts (the first-run walk, the re-pin loop, and the refusal to report a complete install on vault evidence that could not be read).
 /**
  * Rung 1 install evidence: the read-only, ambient-env-blind daily-UX probe
  * (`custody_access` / `recovery_factor`) and the plan wiring that surfaces them
@@ -475,6 +476,9 @@ describe("buildAgentInstallPlan surfaces Rung 1 evidence and the restart action"
       contentFilter: "not-applicable",
       enforcement: "not-applicable",
       trustAnchor: "not-applicable",
+      // Base fixture: this vault carries no wall claim, which is not a claim of
+      // protection either. Tests that need one set it explicitly.
+      vaultProvision: "unknown",
       operatorTwin: "not-applicable",
       ...over,
     };
@@ -704,6 +708,10 @@ describe("buildAgentInstallPlan surfaces Rung 1 evidence and the restart action"
         enforcement: "live",
         trustAnchor: "consistent",
         operatorTwin: "absent",
+        // This case describes a fully armed host, so its vault is on that
+        // wall: a vault claim that could not be read would (correctly) stop
+        // the plan before the custody gate this test is about.
+        vaultProvision: "walled",
         custodyAccess: "absent",
         recoveryFactor: "unknown",
       }),

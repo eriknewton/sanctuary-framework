@@ -1,3 +1,4 @@
+// fail-before-exempt: fixture-only edit. The shared InstallProbeResult fixture gains the additive vaultProvision observation with the neutral "unknown" value; no assertion changed. The behavior it feeds is proven in test/cli/install.test.ts.
 // fail-before-exempt: combined-tree seam only: the probe literal gained the stagedRecoveryFile field and the castle-wall mock became a partial (importOriginal) mock so init.ts loads; the behaviour this file proves shipped in #1391 and is unchanged by this PR
 /**
  * Rung 1 primary journey: `init` -> `install` -> the EXACT emitted `protect`
@@ -115,6 +116,9 @@ function baseProbe(over: Partial<InstallProbeResult>): InstallProbeResult {
     contentFilter: "not-applicable",
     enforcement: "not-applicable",
     trustAnchor: "not-applicable",
+    // Base fixture: this vault carries no wall claim, which is not a claim of
+    // protection either. Tests that need one set it explicitly.
+    vaultProvision: "unknown",
     operatorTwin: "not-applicable",
     stagedRecoveryFile: "absent",
     ...over,

@@ -94,6 +94,12 @@ import {
   type ResolvedEnforcementAvailability,
 } from "../castle-wall/runtime/enforcement-availability.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
+// The vault-level wall claim written by wrap/init.ts. Wrap reads it and never
+// writes it.
+import {
+  CASTLE_WALL_NOT_YET_WALLED_SENTENCE,
+  readPersistedCastleWallProvision,
+} from "../castle-wall/provision-state.js";
 import {
   runAutoProvisionForWrap,
   type AutoProvisionSummary,
@@ -4011,10 +4017,18 @@ export async function runWrap(
   }
 
   {
-    // Auto-bootstrap pinned-key state for the IPC handshake. Failures here
-    // warn but do not abort wrap: a missing pin surfaces cleanly at handshake
-    // time (sysext refuses connection) rather than as a wrap-startup abort.
-    // First-integration discipline: do no harm to the wrap critical path.
+    // Auto-bootstrap this fortress's OWN Castle key pair for the IPC handshake.
+    // Failures here warn but do not abort wrap: a missing local key surfaces
+    // cleanly at handshake time (sysext refuses connection) rather than as a
+    // wrap-startup abort. First-integration discipline: do no harm to the wrap
+    // critical path.
+    //
+    // INVARIANT (one anchor writer): this is fortress-local ONLY. `provision-pin`
+    // no longer writes the machine-wide enforcement anchor (see
+    // cli/castle-wall.ts), so wrap, which is an AGENT-invoked path with a
+    // non-interactive stdin, cannot move this machine's trust anchor. Only the
+    // confirmed `castle-wall re-pin` verb can. Do not re-add a machine-wide
+    // write here.
     //
     // provision-pin runs as a child with its OWN credential chain, which reads
     // only these two env vars plus the fortress's stored passphrase. Hand it
@@ -4043,6 +4057,17 @@ export async function runWrap(
         console.error(
           `\n  Sanctuary wrap: Castle Wall provision-pin auto-bootstrap exited ${pinResult}.` +
           `\n  Wrap continues; run 'sanctuary castle-wall provision-pin' manually if IPC handshake fails.`
+        );
+      }
+      // Required consumer of the vault-level wall claim: wrap is where an
+      // operator most often first sees a protected-looking banner, so a vault
+      // that is not on this machine's wall says so on its own line rather than
+      // letting the surrounding output imply protection.
+      const vaultProvision = await readPersistedCastleWallProvision(storagePath);
+      if (vaultProvision.state === "not-yet-walled") {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `\n  Sanctuary wrap: ${CASTLE_WALL_NOT_YET_WALLED_SENTENCE}`
         );
       }
     } catch (err) {

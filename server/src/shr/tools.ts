@@ -7,6 +7,10 @@
 import type { ToolDefinition } from "../router.js";
 import { toolResult } from "../router.js";
 import type { SanctuaryConfig } from "../config.js";
+import {
+  CASTLE_WALL_NOT_YET_WALLED,
+  readPersistedCastleWallProvision,
+} from "../castle-wall/provision-state.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import {
@@ -116,11 +120,21 @@ export function createSHRTools(
 
         const identityId = args.identity_id as string | undefined;
         const l4Evidence = await resolveReputationEvidence(identityId);
+        // WIRED CONSUMER (AGENTS rule 4): the SHR is signed and handed to a
+        // counterparty, so the vault's own wall claim has to be read HERE, on
+        // the production path, not left to a caller that may not exist. The
+        // reader never throws and an absent claim adds nothing.
+        const vaultProvision = await readPersistedCastleWallProvision(
+          config.storage_path,
+        );
 
         const result = generateSHR(identityId, {
           ...generatorOpts,
           validityMs,
           l4Evidence,
+          ...(vaultProvision.state === "not-yet-walled"
+            ? { vaultProvision: CASTLE_WALL_NOT_YET_WALLED }
+            : {}),
         });
 
         if (typeof result === "string") {
