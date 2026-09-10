@@ -20,12 +20,6 @@ import {
   CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
 } from "../../../src/castle-wall/constants.js";
 
-function toBase64url(bytes: Uint8Array): string {
-  let bin = "";
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
 function freshKeypair(): { priv: Uint8Array; pubB64: string } {
   const priv = ed25519.utils.randomPrivateKey();
   const pub = ed25519.getPublicKey(priv);
@@ -150,6 +144,30 @@ describe("castle-wall producer-signature : verifyProducerSignature", () => {
       keyId: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
     };
     expect(verifyProducerSignature(input, "!!!not-base64!!!").ok).toBe(false);
+  });
+
+  it("rejects an identity-key equation forgery accepted by permissive ZIP-215", () => {
+    const identity = new Uint8Array(32);
+    identity[0] = 1;
+    const scalarOne = new Uint8Array(32);
+    scalarOne[0] = 1;
+    const message = producerSigningBytes(CANONICAL, 1, 7);
+    const forged = new Uint8Array(64);
+    forged.set(ed25519.Point.BASE.toBytes(), 0);
+    forged.set(scalarOne, 32);
+    expect(ed25519.verify(forged, message, identity)).toBe(true);
+    expect(
+      verifyProducerSignature(
+        {
+          eventCanonicalJson: CANONICAL,
+          capturedAtUnixMs: 1,
+          seq: 7,
+          signatureB64url: toBase64url(forged),
+          keyId: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+        },
+        toBase64url(identity)
+      ).ok
+    ).toBe(false);
   });
 
   it("fails closed on a tampered body", () => {

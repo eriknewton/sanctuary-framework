@@ -42,9 +42,29 @@ describe("Core invariant comment hygiene", () => {
   it("keeps the identity Ed25519 verification funnel rationale at the verifier", () => {
     const source = read("server/src/core/identity.ts");
 
-    expectNear(source, "return ed25519.verify(signature, payload, publicKey);", [
-      "Generic Ed25519 verification funnel",
-      "Malformed signature or public-key bytes must return `false`",
+    expectNear(
+      source,
+      "return ed25519.verify(signature, payload, publicKey, { zip215: false });",
+      [
+        "Generic Ed25519 verification funnel",
+        "Malformed signature or public-key bytes must return `false`",
+        // The strictness profile is part of the invariant, not decoration: the
+        // Rust daemon verifies the same bytes with `verify_strict`, so a TS
+        // funnel that quietly relaxed to zip215 semantics would accept
+        // signatures the daemon rejects and the two sides would disagree about
+        // the same authority key.
+        "zip215: false",
+      ]
+    );
+
+    // The gate is only auditable if the site says which profile it implements
+    // and what that profile rejects that a plain RFC 8032 verifier would not.
+    expectNear(source, "!isStrictEd25519PointEncoding(publicKey) ||", [
+      "RFC 8032 section 5.1.7",
+      "COFACTORLESS STRICT",
+      "verify_strict",
+      "small-order",
+      "torsion-bearing",
     ]);
   });
 

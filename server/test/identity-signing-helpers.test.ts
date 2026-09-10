@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { sign as identitySign, verify as identityVerify } from "../src/core/identity.js";
+import { ed25519 } from "@noble/curves/ed25519";
+import {
+  isStrictEd25519PointEncoding,
+  sign as identitySign,
+  verify as identityVerify,
+} from "../src/core/identity.js";
 import { fromBase64url, stringToBytes, toBase64url } from "../src/core/encoding.js";
 import { derivePurposeKey } from "../src/core/key-derivation.js";
 import { generateRandomKey } from "../src/core/random.js";
@@ -66,6 +71,32 @@ const receiptPayload: InternalReceiptSigningPayload = {
 };
 
 describe("internal identity signing helpers", () => {
+  it("rejects the constructive identity-key equation forgery and malformed subgroups", () => {
+    const message = stringToBytes("arbitrary Castle Wall authority message");
+    const identity = new Uint8Array(32);
+    identity[0] = 1;
+    const scalarOne = new Uint8Array(32);
+    scalarOne[0] = 1;
+    const signature = new Uint8Array(64);
+    signature.set(ed25519.Point.BASE.toBytes(), 0);
+    signature.set(scalarOne, 32);
+    expect(ed25519.verify(signature, message, identity)).toBe(true);
+    expect(identityVerify(message, signature, identity)).toBe(false);
+
+    const noncanonicalIdentity = new Uint8Array(identity);
+    noncanonicalIdentity[31] = 0x80;
+    expect(isStrictEd25519PointEncoding(noncanonicalIdentity)).toBe(false);
+
+    const orderTwo = new Uint8Array(32).fill(0xff);
+    orderTwo[0] = 0xec;
+    orderTwo[31] = 0x7f;
+    const torsionBearing = ed25519.Point.BASE.add(
+      ed25519.Point.fromBytes(orderTwo, false)
+    ).toBytes();
+    expect(ed25519.Point.fromBytes(torsionBearing, false).isSmallOrder()).toBe(false);
+    expect(isStrictEd25519PointEncoding(torsionBearing)).toBe(false);
+  });
+
   it("keeps typed signing helpers off the MCP tool surface", () => {
     const { tools } = makeRig();
     const names = tools.map((tool) => tool.name);

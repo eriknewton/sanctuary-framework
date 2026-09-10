@@ -30,6 +30,8 @@ const ED25519_MULTICODEC_PREFIX = new Uint8Array([0xed, 0x01]);
  * `key-length-constants.test.ts` asserts the two declarations stay equal.
  */
 const ED25519_PUBLIC_KEY_LENGTH = 32;
+/** 64 = the RFC 8032 signature encoding: compressed point R then scalar S. */
+const ED25519_SIGNATURE_LENGTH = ED25519_PUBLIC_KEY_LENGTH * 2;
 
 /** Public identity information (safe to share) */
 export interface PublicIdentity {
@@ -352,10 +354,58 @@ export function verify(
   publicKey: Uint8Array
 ): boolean {
   try {
+    // Strict profile. RFC 8032 section 5.1.7 permits cofactored and
+    // cofactorless verification alike, and requires a prime-order check on
+    // neither the public key A nor the commitment R, so two conformant
+    // verifiers can disagree about the same bytes. We run the narrower
+    // COFACTORLESS STRICT profile (ed25519-dalek's `verify_strict`, what the
+    // Rust daemon runs), rejecting what an RFC-only verifier may accept: a y
+    // not reduced mod p, the eight small-order points (the identity-key
+    // forgery is one), and torsion-bearing points.
+    if (
+      !isStrictEd25519PointEncoding(publicKey) ||
+      signature.length !== ED25519_SIGNATURE_LENGTH ||
+      !isStrictEd25519PointEncoding(
+        signature.subarray(0, ED25519_PUBLIC_KEY_LENGTH)
+      )
+    ) {
+      return false;
+    }
     // Generic Ed25519 verification funnel used by tool-level and suite-level
     // verifiers. Malformed signature or public-key bytes must return `false`
-    // here, not escape as caller-dependent exception handling.
-    return ed25519.verify(signature, payload, publicKey);
+    // here, not escape as caller-dependent exception handling. `zip215: false`
+    // holds @noble to the cofactorless equation and its own canonical-encoding
+    // checks; the gate above supplies the prime-order half that the ZIP-215
+    // profile deliberately omits, so a signature this funnel accepts is one
+    // the Rust daemon accepts too.
+    return ed25519.verify(signature, payload, publicKey, { zip215: false });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Castle Wall's strict authority-point profile, shared by every TS verifier.
+ *
+ * Three rejections, in the order the checks run. A wrong length is not a point
+ * at all. `isSmallOrder() || !isTorsionFree()` rejects any point outside the
+ * prime-order subgroup, which is what makes a verified signature attributable
+ * to one key. The re-encode comparison rejects a non-canonical encoding of an
+ * otherwise-valid point: decoding is many-to-one, so two byte strings can name
+ * the same point, and any consumer that keys a pin, an id, or a cache on the
+ * BYTES would then split on what is really one authority.
+ *
+ * Exported because `castle-wall/allowlist/parse.ts` derives the signing-key id
+ * from these same bytes and must apply the identical profile; a private copy
+ * there is how the two drifted before.
+ */
+export function isStrictEd25519PointEncoding(bytes: Uint8Array): boolean {
+  if (bytes.length !== ED25519_PUBLIC_KEY_LENGTH) return false;
+  try {
+    const point = ed25519.Point.fromBytes(bytes, false);
+    if (point.isSmallOrder() || !point.isTorsionFree()) return false;
+    const canonical = point.toBytes();
+    return canonical.every((byte, index) => byte === bytes[index]);
   } catch {
     return false;
   }
