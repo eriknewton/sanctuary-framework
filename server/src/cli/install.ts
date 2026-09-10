@@ -49,6 +49,7 @@ import { parseCastleWallState, runStatus, type SysextState } from "./castle-wall
 import {
   deriveCastleWallProvision,
   readPersistedCastleWallProvision,
+  type PersistedCastleWallProvisionObservation,
 } from "../castle-wall/provision-state.js";
 // The sealed-runtime contract shared with the build gate and the manifest
 // builder (server/scripts/sealed-cli-runtime-entries.mjs); bundled into cli.js.
@@ -392,7 +393,14 @@ export interface AgentInstallPlan {
     // observable.
     trust_anchor: TrustAnchorObservation;
     /** This VAULT's own wall claim; see InstallProbeResult.vaultProvision. */
-    vault_provision: "not-yet-walled" | "walled" | "unknown" | "not-applicable";
+    // Must match the vocabulary on InstallProbeResult.vaultProvision; this is
+    // the rendered mirror of that field and the two are written side by side.
+    vault_provision:
+      | "not-yet-walled"
+      | "walled"
+      | "unreadable"
+      | "unknown"
+      | "not-applicable";
     operator_twin: InstallObservation;
   };
   next_action: AgentInstallAction | null;
@@ -434,10 +442,21 @@ export interface InstallProbeResult {
    * observation in this record: the rest describe the MACHINE (an app, a system
    * extension, a content filter, a machine-wide anchor), and a machine that was
    * armed by an earlier install satisfies all of them while the vault in front
-   * of the operator is on no wall at all. `not-applicable` on non-macOS;
-   * `unknown` when the claim could not be read.
+   * of the operator is on no wall at all. `not-applicable` on non-macOS.
+   *
+   * `unreadable` and `unknown` are DISTINCT and neither is a claim of
+   * protection (AGENTS.md rule 1: absent, indeterminate and unproven all read
+   * as not-proven). `unreadable` = a record exists at the claim's path and did
+   * not parse (empty, truncated, some other token); `unknown` = no record and
+   * the positive `walled` pair was not observable either. The planner refuses
+   * to report a mechanically complete install on either.
    */
-  vaultProvision: "not-yet-walled" | "walled" | "unknown" | "not-applicable";
+  vaultProvision:
+    | "not-yet-walled"
+    | "walled"
+    | "unreadable"
+    | "unknown"
+    | "not-applicable";
   operatorTwin: InstallObservation;
 }
 
@@ -821,12 +840,73 @@ export function parseTrustAnchor(text: string): TrustAnchorObservation {
   return "unknown";
 }
 
+/**
+ * The planner's vault-level wall observation, from the three things the probe
+ * can actually see. Pure and exported so the truth table is provable without a
+ * Mac (AGENTS rule 4 still applies: the production probe below is its only
+ * runtime caller and is exercised by its own test).
+ *
+ * ARM HALF, cross-file contract: `enforcement === "live"` must match the macOS
+ * branch of the arm-state determination in `principal-policy/posture.ts`
+ * (`buildCastleWallPosture`), where `arm_state === "armed"` on macOS holds
+ * EXACTLY when the resolved enforcement availability reads `live`. Both sides
+ * read the SAME fortress-scoped availability record, so this is that
+ * determination made from the CLI, not a second weaker rule. `unavailable` is a
+ * positive not-armed fact; `undetermined` is the honest unknown; neither can
+ * produce `walled`.
+ *
+ * Failure mode this replaced: the probe passed a hardcoded `armed: "unknown"`,
+ * so NO vault could ever derive `walled` here and the planner emitted
+ * `repin_trust_anchor` forever — the operator re-pinned, the anchor went
+ * CONSISTENT, and the very next plan asked for the same command again.
+ *
+ * The derivation runs whether or not a persisted claim exists, so a fortress
+ * created before this state earns `walled` from the POSITIVE pair and never
+ * from the absence of a claim. Absent and unreadable stay distinct and neither
+ * is protection (AGENTS.md rule 1).
+ */
+export function deriveInstallVaultProvision(input: {
+  trustAnchor: TrustAnchorObservation;
+  enforcement: InstallProbeResult["enforcement"];
+  persisted: PersistedCastleWallProvisionObservation["state"];
+}): InstallProbeResult["vaultProvision"] {
+  const derived = deriveCastleWallProvision({
+    trustAnchor: input.trustAnchor === "not-applicable" ? "unknown" : input.trustAnchor,
+    armed:
+      input.enforcement === "live"
+        ? true
+        : input.enforcement === "unavailable"
+          ? false
+          : "unknown",
+  });
+  if (derived === "walled") return "walled";
+  if (input.persisted === "not-yet-walled") return "not-yet-walled";
+  if (input.persisted === "unreadable") return "unreadable";
+  return "unknown";
+}
+
+/**
+ * INVARIANT: `castle-wall status` is run against THIS install's fortress, named
+ * explicitly, never against whatever `SANCTUARY_STORAGE_PATH` happens to hold.
+ * The enforcement-availability line this parses is FORTRESS-SCOPED
+ * (`readEnforcementAvailabilityForStatus(storagePath, ...)` in
+ * `cli/castle-wall.ts`), and it is the observation the arm half of the vault's
+ * wall claim is derived from below. Reading it for a different fortress is
+ * exactly the borrowed-evidence fail-open this whole state exists to close:
+ * failure mode from the outside is a planner that reports the operator's brand
+ * new vault as armed because some other fortress on the box is.
+ */
 async function probeWallStatus(
   env: NodeJS.ProcessEnv,
+  fortress: string,
 ): Promise<Pick<InstallProbeResult, "contentFilter" | "enforcement" | "trustAnchor">> {
   const chunks: string[] = [];
   try {
-    await runStatus([], { out: captureWritable(chunks), env, platform: "darwin" });
+    await runStatus(["--fortress", fortress], {
+      out: captureWritable(chunks),
+      env,
+      platform: "darwin",
+    });
   } catch {
     return { contentFilter: "unknown", enforcement: "undetermined", trustAnchor: "unknown" };
   }
@@ -1113,29 +1193,17 @@ export function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
           verifiedCastleWallApp === null ? probeCastleWallApp() : verifiedCastleWallApp,
           probeSystemExtension(),
           probeBootService(fortress),
-          probeWallStatus(env),
+          probeWallStatus(env, fortress),
           readPersistedCastleWallProvision(fortress),
           harness === "hermes"
             ? probeOperatorTwin(env, platform)
             : Promise.resolve("not-applicable" as const),
         ]);
-      // The vault's own claim, folded through the ONE derivation chokepoint so
-      // the planner cannot invent a second rule. `walled` needs BOTH the
-      // helper-authoritative anchor verdict and this fortress's arm evidence;
-      // the planner observes the first and not the second, so a claim-bearing
-      // vault reads `not-yet-walled` here until the arm-state surface clears
-      // it. Under-claiming, never over-claiming (AGENTS.md rule 1).
-      const vaultProvision: InstallProbeResult["vaultProvision"] =
-        vaultClaim.state === "not-yet-walled"
-          ? deriveCastleWallProvision({
-              trustAnchor: wall.trustAnchor === "not-applicable" ? "unknown" : wall.trustAnchor,
-              armed: "unknown",
-            }) === "walled"
-            ? "walled"
-            : "not-yet-walled"
-          : vaultClaim.state === "absent"
-            ? "unknown"
-            : "unknown";
+      const vaultProvision = deriveInstallVaultProvision({
+        trustAnchor: wall.trustAnchor,
+        enforcement: wall.enforcement,
+        persisted: vaultClaim.state,
+      });
       return {
         cooperativeWrap,
         persistentCli: persistentCli.status,
@@ -1716,10 +1784,21 @@ export function buildAgentInstallPlan(input: {
   //   - `not-yet-walled` this VAULT has never been put on the wall, whatever the
   //                     machine's own state is. A leftover activated extension
   //                     from an earlier install must not stand in for it.
+  //
+  // INVARIANT on the third term: a `not-yet-walled` vault routes here ONLY
+  // while the anchor is not already CONSISTENT. `re-pin` is idempotent — on a
+  // consistent anchor it re-asserts the same key and changes nothing — so once
+  // the anchor is consistent it can no longer advance this vault, and the
+  // remaining gap is ARMING, which the privileged install action below
+  // performs. Without this term the planner emits `repin_trust_anchor` on every
+  // rerun of an already-re-pinned, not-yet-armed host: the operator runs the
+  // command, the anchor is consistent, the vault is still not on the wall, and
+  // the next plan asks for the same command again.
   const trustAnchorNeedsRepin =
     input.observed.trustAnchor === "broken" ||
     input.observed.trustAnchor === "unprovisioned" ||
-    input.observed.vaultProvision === "not-yet-walled";
+    (input.observed.vaultProvision === "not-yet-walled" &&
+      input.observed.trustAnchor !== "consistent");
   if (trustAnchorNeedsRepin) {
     const repinCliPath = input.observed.persistentCliPath;
     if (repinCliPath === null) {
@@ -1748,21 +1827,45 @@ export function buildAgentInstallPlan(input: {
     };
     return plan;
   }
-  // INVARIANT: every other term here is a MACHINE fact, and a Mac armed by an
-  // earlier install satisfies all of them while the vault in front of the
-  // operator is on no wall. `vaultProvision` is the vault-level term, so a
-  // claim-bearing vault can never read mechanically complete on borrowed
-  // evidence. (`unknown` and `not-applicable` keep prior behavior: this
-  // predicate is not the place to fabricate a vault claim, and a
-  // `not-yet-walled` vault has already been routed to `repin_trust_anchor`
-  // above; this term is the belt on that.)
-  const fullMechanicsComplete =
+  // INVARIANT: every term in this predicate is a MACHINE fact, and a Mac armed
+  // by an earlier install satisfies all of them while the vault in front of the
+  // operator is on no wall. It is therefore NOT sufficient on its own; the
+  // vault-level term below is what makes the verdict about this vault.
+  const machineMechanicsComplete =
     input.observed.cooperativeWrap === "present" &&
     input.observed.systemExtension === "[activated enabled]" &&
     input.observed.bootService === "present" &&
     input.observed.contentFilter === "enabled" &&
-    input.observed.enforcement === "live" &&
-    input.observed.vaultProvision !== "not-yet-walled";
+    input.observed.enforcement === "live";
+  // INVARIANT (AGENTS.md rule 1): only a POSITIVELY observed vault claim clears
+  // this gate. `unreadable` and `unknown` are not-proven and must never be read
+  // as walled, which is exactly what the previous `!== "not-yet-walled"` test
+  // did: a vault whose claim could not be read inherited the machine's own
+  // enforcement and was reported `complete`. `not-applicable` is the non-macOS
+  // profile, where there is no vault-level wall to be on.
+  const vaultIsOnThisWall =
+    input.observed.vaultProvision === "walled" ||
+    input.observed.vaultProvision === "not-applicable";
+  // Scoped to the two NOT-PROVEN readings. A `not-yet-walled` vault is a claim
+  // that WAS read, and on a machine whose anchor is already consistent its
+  // remedy is arming, which the privileged install action below performs; only
+  // an unreadable or unobservable claim needs a human to repair a read.
+  const vaultEvidenceNotProven =
+    input.observed.vaultProvision === "unreadable" ||
+    input.observed.vaultProvision === "unknown";
+  if (machineMechanicsComplete && vaultEvidenceNotProven) {
+    // Deliberately NOT a mutating retry — the privileged install below would
+    // re-run a full protect flow that cannot repair a read, and looping the
+    // operator through it is the failure this arm exists to prevent. Same
+    // disposition as every other unknown safety-bearing observation: name it,
+    // change nothing.
+    plan.notes.push(
+      "Every machine-level Castle Wall fact is satisfied, but this vault's own wall claim could not be read, so this install is not reported complete. Check that " +
+        `${input.fortress} is readable by this user and rerun; an unreadable claim is never treated as protection.`,
+    );
+    return plan;
+  }
+  const fullMechanicsComplete = machineMechanicsComplete && vaultIsOnThisWall;
   if (fullMechanicsComplete) {
     // The full profile contains the Rung 1 cooperative memory surface, so the
     // same custody gate applies: enforcement can be live while a copied host

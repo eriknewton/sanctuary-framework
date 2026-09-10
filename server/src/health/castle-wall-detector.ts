@@ -389,14 +389,20 @@ export async function castleWallSnapshotForHealthReport(input: {
     // derivation can only under-claim (AGENTS.md rule 1). The arm-state-bearing
     // surface is `principal-policy/posture.ts`.
     const claim = await readPersistedCastleWallProvision(input.config.storage_path);
-    if (snapshot === undefined || claim.state !== "not-yet-walled") return snapshot;
-    return {
-      ...snapshot,
-      vaultProvision: deriveCastleWallProvision({
-        trustAnchor: "unknown",
-        armed: "unknown",
-      }),
-    };
+    if (claim.state !== "not-yet-walled") return snapshot;
+    const vaultProvision = deriveCastleWallProvision({
+      trustAnchor: "unknown",
+      armed: "unknown",
+    });
+    // A macOS host has NO runtime detector, so the detector returns undefined
+    // and there is nothing to spread the claim onto. Returning `undefined` here
+    // is what dropped the field on the platform the claim is actually about;
+    // the carrier below renders the identical runtime verdict and adds the
+    // claim. Cross-file pin: `runtimeDetectorApplies` must match the branch in
+    // `health/evidence.ts evaluateCastleWallRuntime`.
+    return snapshot === undefined
+      ? { runtimeDetectorApplies: false, vaultProvision }
+      : { ...snapshot, vaultProvision };
   } catch {
     // Deliberately swallowed: see the NEVER THROWS note above. `undefined` is
     // the same answer as "no wall here", which is the weakest claim available

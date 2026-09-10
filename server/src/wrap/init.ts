@@ -638,6 +638,30 @@ export async function runInit(
       }
       const keychainMutations: Array<Pick<KeychainMutation<unknown>, "rollback" | "commit">> = [];
       const externalRollback: Array<() => Promise<void>> = [];
+      /**
+       * Rollback steps that may run ONLY AFTER the custody they depend on is
+       * confirmed gone.
+       *
+       * ORDERING INVARIANT, and the reason this is a second list rather than
+       * one more entry in `externalRollback`: the recovery key this run wrote
+       * unwraps the custody this run wrote. Removing the key first and then
+       * failing to remove the custody leaves custody on disk with its recovery
+       * factor destroyed, while the cleanup summary tells the operator the key
+       * "could no longer open anything" — the one sentence that is false in
+       * exactly that case. Removing custody first is safe in the mirror case:
+       * a recovery key with no custody opens nothing whether or not the file
+       * survives, and the summary already has a branch that names a surviving
+       * file. Deletion order therefore follows the dependency, never the write
+       * order.
+       */
+      const afterCustodyRemovalRollback: Array<() => Promise<void>> = [];
+      /**
+       * The recovery-key file this run actually wrote, or null when it wrote
+       * none. Recorded at write time so the rollback can name it without
+       * re-deriving a path: the summary must never claim a file is still on
+       * disk when no file was ever written there.
+       */
+      let writtenRecoveryKeyFilePath: string | null = null;
       // The preflight emptiness check happened before the lock existed. Repeat
       // both the broad filesystem check and custody-current-state reads now,
       // under the same lock used by reset and rotation, so a concurrent winner
@@ -827,7 +851,10 @@ export async function runInit(
       );
       if (prewrittenRecoveryKeyFile.written) {
         const writtenIdentity = await lstat(recoveryKeyOutputPath);
-        externalRollback.push(async () => {
+        writtenRecoveryKeyFilePath = recoveryKeyOutputPath;
+        // Deferred until custody removal is CONFIRMED; see the ordering
+        // invariant on `afterCustodyRemovalRollback`.
+        afterCustodyRemovalRollback.push(async () => {
           // INVARIANT: this rollback runs only when init FAILED, and it runs
           // alongside the removal of the custody this key unwraps. A key whose
           // custody is gone opens nothing, so leaving it behind announced a
@@ -1460,10 +1487,33 @@ export async function runInit(
               { cause: error },
             );
           }
+          // CUSTODY REMOVAL. Everything in `afterCustodyRemovalRollback` waits
+          // on this succeeding; see the ordering invariant where that list is
+          // declared. Failure mode from the outside if this is reordered: the
+          // announced recovery key is gone and the custody it unwrapped is
+          // still on disk, so the operator has destroyed their only recovery
+          // factor for a fortress that survived — and the summary says the
+          // opposite.
+          let custodyRemoved = true;
           try {
             await files.restoreFreshLockScaffold(CUSTODY_WRITE_LOCK_FILE);
           } catch (rollbackError) {
+            custodyRemoved = false;
             rollbackFailure ??= rollbackError;
+          }
+          if (custodyRemoved) {
+            for (const rollback of [...afterCustodyRemovalRollback].reverse()) {
+              try {
+                await rollback();
+              } catch (rollbackError) {
+                rollbackFailure ??= rollbackError;
+              }
+            }
+          } else if (writtenRecoveryKeyFilePath !== null) {
+            // Keep the key. It is the only thing that can still open whatever
+            // custody survived, and the summary's `preservedRecoveryFile`
+            // branch is the one sentence that says so.
+            cleanupSummary.preservedRecoveryFile = writtenRecoveryKeyFilePath;
           }
           lease.assertHeld();
           // Record what this run undid so the outer handler can say it in one

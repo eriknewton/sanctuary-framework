@@ -10,6 +10,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   AGENT_INSTALL_CONTRACT,
   buildAgentInstallPlan,
+  deriveInstallVaultProvision,
   parseInstallSystemExtensionState,
   parseTrustAnchor,
   runInstallCommand,
@@ -105,6 +106,11 @@ function fullObserved(overrides: Partial<InstallProbeResult> = {}): InstallProbe
     // A verified full-profile host has a consistent trust anchor by default;
     // the broken-anchor crash-loop path is exercised by opting in explicitly.
     trustAnchor: "consistent",
+    // ...and its vault is on that wall, which is what the probe's derivation
+    // reports for a host with a consistent anchor and live enforcement. The
+    // not-yet-walled, unreadable and unknown readings are each opted into
+    // explicitly, because each is a different not-proven story.
+    vaultProvision: "walled",
     ...overrides,
   });
 }
@@ -1014,8 +1020,38 @@ describe("sanctuary install agent contract", () => {
 
     // And the vault-level half: every machine fact below is satisfied by a Mac
     // an EARLIER install armed, while this vault is on no wall. A vault claim
-    // outranks all of them, and the plan is never `complete`.
+    // outranks all of them, and the plan is never `complete`. The anchor is
+    // NOT confirmed here, so re-pin is the named remedy.
     const notYetWalled = buildAgentInstallPlan({
+      profile: "full",
+      harness: "hermes",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: fullObserved({
+        cooperativeWrap: "present",
+        castleWallApp: "present",
+        systemExtension: "[activated enabled]",
+        bootService: "present",
+        contentFilter: "enabled",
+        enforcement: "live",
+        trustAnchor: "unknown",
+        vaultProvision: "not-yet-walled",
+      }),
+    });
+    expect(notYetWalled.status).toBe("human_action");
+    expect(notYetWalled.next_action?.id).toBe("repin_trust_anchor");
+    expect(notYetWalled.status).not.toBe("complete");
+  });
+
+  it("stops naming re-pin once the anchor is consistent, so the operator is not sent round the same command", () => {
+    // THE LOOP THIS CLOSES: `re-pin` is idempotent. On an anchor that already
+    // holds the signer helper's key it re-asserts the same bytes and changes
+    // nothing, so a planner that keeps naming it for a not-yet-armed vault
+    // sends the operator round the identical command forever — which is what
+    // the first-run host did: run re-pin, anchor consistent, plan says run
+    // re-pin. The remaining gap at this point is ARMING, and the privileged
+    // install action is what performs it.
+    const consistentButUnarmed = buildAgentInstallPlan({
       profile: "full",
       harness: "hermes",
       fortress: "/tmp/fortress",
@@ -1031,9 +1067,153 @@ describe("sanctuary install agent contract", () => {
         vaultProvision: "not-yet-walled",
       }),
     });
-    expect(notYetWalled.status).toBe("human_action");
-    expect(notYetWalled.next_action?.id).toBe("repin_trust_anchor");
-    expect(notYetWalled.status).not.toBe("complete");
+    expect(consistentButUnarmed.next_action?.id).not.toBe("repin_trust_anchor");
+    expect(consistentButUnarmed.status).not.toBe("complete");
+    // The action it DOES name has to be the arming step, not another read.
+    expect(consistentButUnarmed.next_action?.argv ?? []).toContain("protect");
+  });
+
+  it("walks a first run from a fresh vault to completion, and cannot fall back into the loop", () => {
+    const walk = (
+      overrides: Parameters<typeof fullObserved>[0],
+    ): ReturnType<typeof buildAgentInstallPlan> =>
+      buildAgentInstallPlan({
+        profile: "full",
+        harness: "hermes",
+        fortress: "/tmp/fortress",
+        platform: "darwin",
+        observed: fullObserved({
+          cooperativeWrap: "present",
+          castleWallApp: "present",
+          systemExtension: "[activated enabled]",
+          bootService: "present",
+          contentFilter: "enabled",
+          ...overrides,
+        }),
+      });
+
+    // STEP 1 — the vault has just been created on a Mac that has never been
+    // armed: no machine-wide anchor, and the vault carries its own claim.
+    const fresh = walk({
+      enforcement: "undetermined",
+      trustAnchor: "unprovisioned",
+      vaultProvision: "not-yet-walled",
+    });
+    expect(fresh.next_action?.id).toBe("repin_trust_anchor");
+    expect(fresh.next_action?.actor).toBe("human");
+
+    // STEP 2 — the operator ran re-pin. The anchor is now CONSISTENT but the
+    // wall has not been armed for this vault, so the plan moves ON to arming
+    // instead of repeating itself.
+    const repinned = walk({
+      enforcement: "undetermined",
+      trustAnchor: "consistent",
+      vaultProvision: "not-yet-walled",
+    });
+    expect(repinned.next_action?.id).not.toBe("repin_trust_anchor");
+    expect(repinned.status).not.toBe("complete");
+
+    // STEP 3 — arming succeeded. The probe's derivation (both halves observed:
+    // helper-authoritative anchor CONSISTENT and this fortress's enforcement
+    // live) now reports the vault as walled, and the install completes.
+    const armed = walk({
+      enforcement: "live",
+      trustAnchor: "consistent",
+      vaultProvision: "walled",
+    });
+    expect(armed.next_action?.id).not.toBe("repin_trust_anchor");
+    expect(armed.status).toBe("complete");
+  });
+
+  it("never reports a mechanically complete install on vault evidence it could not read", () => {
+    // Every MACHINE fact is satisfied — by a Mac an earlier install armed —
+    // and the vault's own claim is not readable. Absent, unreadable and
+    // indeterminate are all NOT-PROVEN (AGENTS.md rule 1), so none of them may
+    // borrow the machine's enforcement and report the install done. The remedy
+    // is repairing the read, so no mutating retry is named.
+    for (const vaultProvision of ["unknown", "unreadable"] as const) {
+      const plan = buildAgentInstallPlan({
+        profile: "full",
+        harness: "hermes",
+        fortress: "/tmp/fortress",
+        platform: "darwin",
+        observed: fullObserved({
+          cooperativeWrap: "present",
+          castleWallApp: "present",
+          systemExtension: "[activated enabled]",
+          bootService: "present",
+          contentFilter: "enabled",
+          enforcement: "live",
+          trustAnchor: "consistent",
+          vaultProvision,
+        }),
+      });
+      expect(plan.status, vaultProvision).not.toBe("complete");
+      expect(plan.next_action, vaultProvision).toBeNull();
+      expect(plan.notes.join(" "), vaultProvision).toContain(
+        "could not be read",
+      );
+    }
+  });
+
+  it("derives the vault observation from both halves, and from neither alone", () => {
+    // ARM HALF: `enforcement === "live"` is the same determination
+    // principal-policy/posture.ts makes for `arm_state: armed` on macOS, read
+    // from the same fortress-scoped availability record. The probe used to pass
+    // a hardcoded unknown here, which made `walled` unreachable and the re-pin
+    // action permanent.
+    expect(
+      deriveInstallVaultProvision({
+        trustAnchor: "consistent",
+        enforcement: "live",
+        persisted: "not-yet-walled",
+      }),
+    ).toBe("walled");
+    // A fortress that predates the claim still earns walled from the positive
+    // pair, and never from the absence of a claim.
+    expect(
+      deriveInstallVaultProvision({
+        trustAnchor: "consistent",
+        enforcement: "live",
+        persisted: "absent",
+      }),
+    ).toBe("walled");
+    // Either half missing keeps the vault off the wall.
+    for (const enforcement of ["unavailable", "undetermined"] as const) {
+      expect(
+        deriveInstallVaultProvision({
+          trustAnchor: "consistent",
+          enforcement,
+          persisted: "not-yet-walled",
+        }),
+        enforcement,
+      ).toBe("not-yet-walled");
+    }
+    for (const trustAnchor of ["broken", "unprovisioned", "unknown"] as const) {
+      expect(
+        deriveInstallVaultProvision({
+          trustAnchor,
+          enforcement: "live",
+          persisted: "not-yet-walled",
+        }),
+        trustAnchor,
+      ).toBe("not-yet-walled");
+    }
+    // Absent and unreadable stay DISTINCT, and neither is protection.
+    expect(
+      deriveInstallVaultProvision({
+        trustAnchor: "unknown",
+        enforcement: "undetermined",
+        persisted: "absent",
+      }),
+    ).toBe("unknown");
+    expect(
+      deriveInstallVaultProvision({
+        trustAnchor: "unknown",
+        enforcement: "undetermined",
+        persisted: "unreadable",
+      }),
+    ).toBe("unreadable");
   });
 
   // Finding B (defect.fresh-install-daemon-needs-manual-repin-on-first-arm):

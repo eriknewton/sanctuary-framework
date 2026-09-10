@@ -37,6 +37,7 @@ import {
   readPersistedCastleWallProvision,
 } from "../../src/castle-wall/provision-state.js";
 import { agentGuidedRecoveryOutputPath } from "../../src/wrap/custody-flow.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
 
 /** Capture the operator-facing stderr channel init writes to. */
 async function captured<T>(run: (lines: string[]) => Promise<T>): Promise<[T, string]> {
@@ -227,5 +228,74 @@ describe("sanctuary init: a run that fails after announcing a recovery key", () 
     // The named destination is clear, so the printed retry actually completes.
     const retry = await captured(() => init({ fortress: fortressPath }));
     expect(retry[0].recoveryKeyDisclosurePath).toBe(staged);
+  });
+
+  it("keeps the announced key when the custody it unwraps could NOT be removed", async () => {
+    // ORDERING, not merely cleanup. The key unwraps the custody, so deleting
+    // the key first and then failing to delete the custody destroys the only
+    // recovery factor for a fortress that survived — while the summary tells
+    // the operator the key "could no longer open anything", which is the one
+    // sentence that is false in exactly this case.
+    //
+    // The failure is injected at the real custody-removal capability on a real
+    // temporary filesystem, so the ordering under test is the shipped one.
+    const fortressPath = join(tmp, "cleanup-fails");
+    const staged = agentGuidedRecoveryOutputPath(fortressPath);
+    const original = FilesystemStorage.prototype.withNamespaceLock;
+    let removalAttempted = false;
+
+    const spy = vi
+      .spyOn(FilesystemStorage.prototype, "withNamespaceLock")
+      .mockImplementation(function (
+        this: FilesystemStorage,
+        namespace: never,
+        lockKey: never,
+        operation: never,
+        options: never,
+      ) {
+        return (original as (...a: unknown[]) => Promise<unknown>).call(
+          this,
+          namespace,
+          lockKey,
+          async (lease: { stableFortressFiles?: Record<string, unknown> }) => {
+            if (!lease.stableFortressFiles) {
+              return (operation as (l: unknown) => unknown)(lease);
+            }
+            return (operation as (l: unknown) => unknown)({
+              ...lease,
+              stableFortressFiles: {
+                ...lease.stableFortressFiles,
+                restoreFreshLockScaffold: async () => {
+                  removalAttempted = true;
+                  throw new Error("injected custody cleanup I/O failure");
+                },
+              },
+            });
+          },
+          options,
+        );
+      } as never);
+
+    try {
+      const [, output] = await captured(async () => {
+        await expect(
+          init({ fortress: fortressPath }, { provisionPin: async () => 1 }),
+        ).rejects.toThrow(/rollback did not complete/);
+      });
+
+      expect(removalAttempted).toBe(true);
+      // The custody survived the failed cleanup...
+      await expect(
+        stat(join(fortressPath, "state", "_meta", "custody-envelope.enc")),
+      ).resolves.toBeDefined();
+      // ...so the key that opens it is still on disk, and the summary says so
+      // instead of claiming the key is now useless.
+      await expect(stat(staged)).resolves.toBeDefined();
+      expect(output).toContain("Still on disk:");
+      expect(output).toContain(staged);
+      expect(output).not.toContain("could no longer open anything");
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

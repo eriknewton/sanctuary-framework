@@ -153,6 +153,20 @@ export async function readPersistedCastleWallProvision(
 }
 
 /**
+ * The one operator-facing sentence for a record that exists at the claim's path
+ * and does not parse (empty, truncated, some token this version does not know).
+ *
+ * Shared so `doctor` and any later diagnostic cannot drift into two different
+ * descriptions of the same state, and deliberately phrased as a statement about
+ * the CLAIM rather than about the wall: the honest reading is "this vault's own
+ * wall claim is unreadable", never "the wall is broken" and never, as the code
+ * did before, silence that a machine-level OK then filled in.
+ */
+export const CASTLE_WALL_PROVISION_UNREADABLE_MESSAGE =
+  "this vault's wall provisioning state is unreadable, so it is not read as " +
+  "being on the wall";
+
+/**
  * The one operator-facing sentence for a vault that is not yet on the wall.
  * Shared so `init`, `wrap`, `castle-wall status`, and `doctor` cannot drift
  * into four different descriptions of the same state.

@@ -214,6 +214,54 @@ describe("posture route layer", () => {
     ).toBe("unknown");
   });
 
+  it("carries THIS VAULT's wall claim onto the posture home payload", async () => {
+    // The route builds the wall posture from a pile of MACHINE facts. None of
+    // them is a claim about the vault, and this route supplied nothing that
+    // was, so the additive field never reached the dashboard or the console
+    // that render from this payload.
+    const log = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const base = await serve(
+      baseDeps(log, [wrappedAgent("a1", "claude_code")], {
+        resolveEnforcementAvailability: () => UNDETERMINED_AVAILABILITY,
+        resolveVaultProvisionClaimed: async () => true,
+      }),
+    );
+    const body = (await (
+      await fetch(`${base}${POSTURE_API_PREFIX}/home`)
+    ).json()) as { castle_wall: Record<string, unknown> };
+    expect(body.castle_wall.castle_wall_provision).toBe("not_yet_walled");
+    // arm_state is a CLOSED enum and is untouched by the additive field.
+    expect(body.castle_wall.arm_state).not.toBe("armed");
+  });
+
+  it("renders no vault claim when the fortress carries none, and never one it could not read", async () => {
+    const log = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const noClaim = await serve(
+      baseDeps(log, [wrappedAgent("a1", "claude_code")], {
+        resolveEnforcementAvailability: () => UNDETERMINED_AVAILABILITY,
+      }),
+    );
+    const unclaimed = (await (
+      await fetch(`${noClaim}${POSTURE_API_PREFIX}/home`)
+    ).json()) as { castle_wall: Record<string, unknown> };
+    expect(unclaimed.castle_wall).not.toHaveProperty("castle_wall_provision");
+
+    // A resolver that throws is a read that failed, which is not a claim and
+    // is certainly not protection.
+    const throwing = await serve(
+      baseDeps(log, [wrappedAgent("a1", "claude_code")], {
+        resolveEnforcementAvailability: () => UNDETERMINED_AVAILABILITY,
+        resolveVaultProvisionClaimed: async () => {
+          throw new Error("injected claim-read failure");
+        },
+      }),
+    );
+    const failed = (await (
+      await fetch(`${throwing}${POSTURE_API_PREFIX}/home`)
+    ).json()) as { castle_wall: Record<string, unknown> };
+    expect(failed.castle_wall).not.toHaveProperty("castle_wall_provision");
+  });
+
   it("home digest reflects a just-appended entry with NO stale lag (eager-read never-stale-green, #714)", async () => {
     // The home route composes its reads through the AuditLog EAGER path (bounded
     // cost on a long chain). This guards the honesty side of that change: an

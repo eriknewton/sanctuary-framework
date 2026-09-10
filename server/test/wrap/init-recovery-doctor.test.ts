@@ -25,7 +25,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { dirname, join } from "node:path";
@@ -638,8 +638,27 @@ describe("sanctuary init: the printed next step is a step that works", () => {
               // Same path, different inode: exactly the shape the guard exists
               // for. Runs at the last step, after the key was written and
               // announced.
-              await rm(staged, { force: true });
-              await writeFile(staged, "written by someone else\n", { mode: 0o600 });
+              //
+              // The replacement is written to a SIBLING path first and moved
+              // onto the destination with rename(2), rather than unlinked and
+              // recreated in place. An unlink-then-create at the same path
+              // asks the filesystem's allocator not to hand back the inode
+              // number it just freed, which is not a portable guarantee: a
+              // freshly formatted Linux tmp filesystem (tmpfs or a fresh ext4
+              // allocation group, both routine on a CI runner) can and does
+              // reuse the just-freed inode for the very next file created in
+              // the same directory, while APFS on macOS practically never
+              // does. This flaked the test on Linux CI (run 34493018511):
+              // the reused inode made the rollback's dev/ino identity check
+              // read "same file" and unlink the swapped-in content, and the
+              // very next assertion then found nothing at `staged` to read.
+              // Renaming a file whose inode was allocated separately, while
+              // the original still holds its own live inode, cannot collide:
+              // the two inodes coexist until the rename's atomic replace, so
+              // the guard is exercised the same way on every filesystem.
+              const swapSource = `${staged}.test-swap-source`;
+              await writeFile(swapSource, "written by someone else\n", { mode: 0o600 });
+              await rename(swapSource, staged);
               return 1;
             },
           },

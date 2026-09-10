@@ -158,6 +158,82 @@ describe("the vault-level wall state is readable, and never guessed", () => {
     ).toBe("OK");
   });
 
+  it("never reports OK from machine evidence when the vault claim exists and does not parse", async () => {
+    // Every one of these is a record that EXISTS at the claim's path. Absent is
+    // a different fact and is covered by its own case below; these four are
+    // "there is a claim here and I cannot read it", which AGENTS.md rule 1
+    // makes not-proven. Before this, all four fell into the absent path and
+    // doctor reported OK from `[activated enabled]` alone — on a host whose
+    // enabled extension belongs to an EARLIER install.
+    const corrupted: Array<[string, string]> = [
+      ["empty", ""],
+      ["whitespace only", "   \n"],
+      ["unparseable", "\u0000\u0001binary-garbage"],
+      ["wrong type", "walled"],
+    ];
+    const activated = () =>
+      "ai.sanctuaryprotocol.macos.castle-wall (1.0/42)\tCastle Wall\t[activated enabled]";
+
+    for (const [label, contents] of corrupted) {
+      const fortressPath = join(tmp, `corrupt-${label.replace(/\s+/g, "-")}`);
+      await mkdir(join(fortressPath, "state", "_meta"), { recursive: true, mode: 0o700 });
+      await writeFile(castleWallProvisionRecordPath(fortressPath), contents, {
+        mode: 0o600,
+      });
+      await expect(readPersistedCastleWallProvision(fortressPath)).resolves.toEqual({
+        state: "unreadable",
+      });
+
+      const checks = await runDoctorChecks({
+        storagePath: fortressPath,
+        env: {},
+        platform: "darwin",
+        execSyncFn: activated,
+      });
+      const wall = checks.find((check) => check.name === "castle wall sysext");
+      expect(wall, label).toBeDefined();
+      expect(wall!.status, label).toBe("WARN");
+      expect(wall!.message, label).toContain("unreadable");
+    }
+  });
+
+  it("keeps a fortress with NO claim from reading as a vault-level protection claim", async () => {
+    // `absent` is honest: this fortress predates the state, and doctor observes
+    // neither half of the `walled` pair, so the machine's own extension state
+    // is all it may report. The OK line therefore has to SAY that, or a reader
+    // takes a green line about a system extension as an answer about a vault.
+    const checks = await runDoctorChecks({
+      storagePath: join(tmp, "no-claim-at-all"),
+      env: {},
+      platform: "darwin",
+      execSyncFn: () =>
+        "ai.sanctuaryprotocol.macos.castle-wall (1.0/42)\tCastle Wall\t[activated enabled]",
+    });
+    const wall = checks.find((check) => check.name === "castle wall sysext")!;
+    expect(wall.status).toBe("OK");
+    expect(wall.message).toContain("machine-level");
+    expect(wall.message).toContain("no vault-level protection is asserted");
+  });
+
+  it("prints an unreadable claim on castle-wall status, not silence", async () => {
+    // Silence here reads as "this fortress makes no claim", which is a
+    // different and more reassuring fact than "there is a claim and I cannot
+    // read it". `doctor` sends the operator to this surface, so it has to say
+    // the same thing doctor just said.
+    const fortressPath = join(tmp, "status-unreadable");
+    await mkdir(join(fortressPath, "state", "_meta"), { recursive: true, mode: 0o700 });
+    await writeFile(castleWallProvisionRecordPath(fortressPath), "walled", { mode: 0o600 });
+
+    const chunks: string[] = [];
+    await runStatus([], {
+      out: capture(chunks),
+      err: silent(),
+      env: { SANCTUARY_STORAGE_PATH: fortressPath },
+      platform: "linux",
+    });
+    expect(chunks.join("")).toContain("Vault wall provisioning: unreadable");
+  });
+
   it("prints the state on castle-wall status, without touching the parsed verdict lines", async () => {
     const fortressPath = join(tmp, "status-fortress");
     await plantNotYetWalled(fortressPath);

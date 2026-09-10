@@ -38,6 +38,8 @@ import { resolveStoragePath } from "../paths.js";
 // reports on the SAME named state init persists, never a second derivation.
 import {
   CASTLE_WALL_NOT_YET_WALLED,
+  CASTLE_WALL_PROVISION_UNREADABLE_MESSAGE,
+  castleWallProvisionRecordPath,
   readPersistedCastleWallProvision,
 } from "../castle-wall/provision-state.js";
 import { checkNodeVersion } from "./node-version.js";
@@ -875,6 +877,23 @@ async function checkCastleWall(opts: {
   // leave the machine-level verdict standing, they never upgrade it.
   const vault = await readPersistedCastleWallProvision(opts.storagePath);
   const notYetWalled = vault.state === "not-yet-walled";
+  // INVARIANT (AGENTS.md rule 1): a claim record that exists and does not parse
+  // is NOT-PROVEN, and not-proven never renders OK. Before this arm, a truncated
+  // or garbled record fell into the `absent` path and the check reported OK from
+  // `[activated enabled]` alone, which is the exact borrowed-machine-evidence
+  // fail-open this whole check exists to close — with the added twist that the
+  // vault very likely DID carry a claim and the operator was told the opposite.
+  // The message is deliberately its own sentence rather than a suffix on the
+  // machine state, so "I cannot read this vault's wall claim" is never mistaken
+  // for a statement about the system extension.
+  if (vault.state === "unreadable") {
+    return {
+      name: "castle wall sysext",
+      status: "WARN",
+      message: `${CASTLE_WALL_PROVISION_UNREADABLE_MESSAGE} (${castleWallProvisionRecordPath(opts.storagePath)})`,
+      hint: "repair or remove that record, then run sanctuary castle-wall status; an unreadable wall claim is never read as protection",
+    };
+  }
   try {
     const raw = execSyncFn("systemextensionsctl list 2>/dev/null | grep castle-wall");
     const state = raw.includes("[activated enabled]")
@@ -894,7 +913,17 @@ async function checkCastleWall(opts: {
     return {
       name: "castle wall sysext",
       status,
-      message: state,
+      // STATED BOUND on the OK case: `absent` means this fortress predates the
+      // vault-level claim, so all doctor can honestly report here is the
+      // MACHINE's extension state. Saying so inline keeps a green line from
+      // being read as "this vault is protected" — the claim doctor cannot make
+      // without the anchor verdict and this fortress's arm evidence, neither of
+      // which it observes. `sanctuary castle-wall status` is the surface that
+      // does.
+      message:
+        status === "OK"
+          ? `${state} (machine-level; this vault records no wall claim, so no vault-level protection is asserted here)`
+          : state,
       hint: status === "OK" ? "none" : "approve the system extension in System Settings",
     };
   } catch {

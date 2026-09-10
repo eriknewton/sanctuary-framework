@@ -31,6 +31,8 @@ import { resolveFortressCreateOwner } from "../castle-wall/runtime/fortress-crea
 import {
   CASTLE_WALL_NOT_YET_WALLED,
   CASTLE_WALL_NOT_YET_WALLED_SENTENCE,
+  CASTLE_WALL_PROVISION_UNREADABLE_MESSAGE,
+  castleWallProvisionRecordPath,
   readPersistedCastleWallProvision,
 } from "../castle-wall/provision-state.js";
 import { resolveStoragePath } from "../paths.js";
@@ -151,8 +153,29 @@ export const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
  * bare "y": the failure mode this exists for is a stray keystroke or a
  * one-character answer left in a paste buffer moving the whole machine's trust
  * anchor. Displayed in the prompt, so it is never a guess.
+ *
+ * CROSS-FILE CONTRACT: must match `rePinConfirmationWord` in
+ * `castle-wall-macos/Sources/CastleWallSignerClient/main.swift`. The native shim
+ * is a SECOND executable entry point to the same anchor migration (the TS CLI
+ * `execFile`s it, but anything that can reach the app bundle can run it
+ * directly), so both entry points must ask for the same word. A drift leaves one
+ * gate asking for a word the operator was never shown; the parity test
+ * `test/castle-wall/re-pin-confirmation-parity.test.ts` reads BOTH sources and
+ * fails on a mismatch.
  */
-const RE_PIN_CONFIRMATION_WORD = "re-pin";
+export const RE_PIN_CONFIRMATION_WORD = "re-pin";
+
+/**
+ * Deadline for the `re-pin` shim call, which now includes an operator reading a
+ * prompt and typing a word.
+ *
+ * 120_000 = 2 minutes, derived as "long enough for a person who has just been
+ * asked to confirm a machine-wide trust-anchor migration to read the prompt and
+ * type it", not as a signing bound. Every other shim call keeps the 10s default
+ * in `castle-wall/runtime/helper-signer.ts`, which is the daemon's liveness
+ * contract and must not be relaxed.
+ */
+const RE_PIN_SHIM_CONFIRMATION_TIMEOUT_MS = 120_000;
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
 const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = "/Library/Application Support/Sanctuary";
 export const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}/${CASTLE_PINNED_PUBKEY}`;
@@ -1547,7 +1570,9 @@ async function confirmRePinInteractively(
   write(
     err,
     `Move this machine's Castle Wall trust anchor to the root signer helper for fortress ${storagePath}?\n` +
-      `Type ${RE_PIN_CONFIRMATION_WORD} to continue, anything else to abort: `,
+      `Type ${RE_PIN_CONFIRMATION_WORD} to continue, anything else to abort.\n` +
+      `(The native signer shim asks for the same word once more; that second\n` +
+      `ask is the gate a non-interactive caller cannot get past.): `,
   );
   const rl = createInterface({ input: source });
   let answer: string;
@@ -1631,6 +1656,18 @@ export async function runRePin(
 
   const client = new HelperSignerClient({
     clientBinaryPath: clientBinaryPath ?? "castle-wall-signer-client",
+    // The shim runs its OWN confirmation for `re-pin` (it is directly
+    // executable, and the helper's caller check authenticates the binary, not
+    // operator presence), so the operator's terminal is handed through rather
+    // than piped. The gate above and the shim's gate are deliberately two
+    // separate asks: this one can be reached only through the CLI, that one
+    // covers every way the shim can be executed.
+    interactiveTerminal: true,
+    // The operator has to read a prompt and type a word inside this deadline;
+    // the 10s default is the DAEMON's per-signature liveness bound and is far
+    // too short for a person. Failure mode if the default is kept: the shim is
+    // SIGKILLed mid-prompt and the operator sees "shim timed out".
+    timeoutMs: RE_PIN_SHIM_CONFIRMATION_TIMEOUT_MS,
     ...(ctx.signerClientInvoke ? { invoke: ctx.signerClientInvoke } : {}),
   });
 
@@ -1966,6 +2003,16 @@ export async function runStatus(
     write(
       out,
       `Vault wall provisioning: ${CASTLE_WALL_NOT_YET_WALLED} (${CASTLE_WALL_NOT_YET_WALLED_SENTENCE})\n`,
+    );
+  } else if (vaultProvision.state === "unreadable") {
+    // A record that exists and does not parse is NOT-PROVEN, and `status` is the
+    // surface `doctor` sends the operator to when it sees one, so it has to say
+    // the same thing rather than fall silent (silence here reads as "no claim",
+    // which is a different and more reassuring fact).
+    write(
+      out,
+      `Vault wall provisioning: unreadable (${CASTLE_WALL_PROVISION_UNREADABLE_MESSAGE}; ` +
+        `${castleWallProvisionRecordPath(storagePath)})\n`,
     );
   }
 

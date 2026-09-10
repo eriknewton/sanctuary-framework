@@ -27,6 +27,12 @@ import {
   type ExclusiveEgressStatus,
 } from "../principal-policy/posture.js";
 import type { ResolvedEnforcementAvailability } from "../castle-wall/runtime/enforcement-availability.js";
+// The vault-level wall claim. Read here; the derivation lives in ONE place and
+// this consumer never re-implements it.
+import {
+  CASTLE_WALL_NOT_YET_WALLED,
+  type CastleWallProvisionState,
+} from "../castle-wall/provision-state.js";
 import type { ReputationEvidence } from "../shr/generator.js";
 import { deriveReputationDegradations } from "../shr/generator.js";
 import type { SHRDegradation } from "../shr/types.js";
@@ -178,6 +184,18 @@ export interface ProtectionSnapshot {
   mode: "co-located" | "standalone";
   server_version: string;
   generated_at: string;
+  /**
+   * ADDITIVE: THIS VAULT's own Castle Wall provisioning state
+   * (`castle-wall/provision-state.ts`), present only when the fortress carries
+   * the claim `init` persists, so every snapshot for a fortress that predates
+   * the state is byte-identical to before.
+   *
+   * Distinct from `overall`, which is a rollup of MACHINE facts: a Mac armed by
+   * an earlier install produces a green wall arm-state for a vault that is on no
+   * wall. The green light is gated on this too (see `computeOverall`); this
+   * field is what lets a reader see WHY.
+   */
+  castle_wall_provision?: CastleWallProvisionState;
 }
 
 export function redactPendingApprovalsForPositionOnly(
@@ -285,6 +303,16 @@ export interface AggregatorSources {
   resolveEnforcementAvailability?: () =>
     | Promise<ResolvedEnforcementAvailability>
     | ResolvedEnforcementAvailability;
+  /**
+   * Does THIS fortress carry the persisted `not_yet_walled` claim
+   * (`castle-wall/provision-state.ts`)? Supplied by the dashboard owner, which
+   * holds the fortress storage path; this pure aggregator only threads the
+   * resolved answer into the canonical wall posture builder.
+   *
+   * ABSENT = no claim rendered and no gating change, which is what every
+   * fortress that predates the state gets. It is never a claim of protection.
+   */
+  resolveVaultProvisionClaimed?: () => Promise<boolean>;
 }
 
 /**
@@ -320,6 +348,8 @@ export interface AggregatorSourcesInput {
         | Promise<ResolvedEnforcementAvailability>
         | ResolvedEnforcementAvailability)
     | undefined;
+  /** Mirror of AggregatorSources.resolveVaultProvisionClaimed. */
+  resolveVaultProvisionClaimed?: (() => Promise<boolean>) | undefined;
   activity?: ActivityEntry[] | undefined;
   pendingApprovals?: PendingApproval[] | undefined;
 }
@@ -382,6 +412,9 @@ export function composeAggregatorSources(
       : {}),
     ...(input.resolveEnforcementAvailability
       ? { resolveEnforcementAvailability: input.resolveEnforcementAvailability }
+      : {}),
+    ...(input.resolveVaultProvisionClaimed
+      ? { resolveVaultProvisionClaimed: input.resolveVaultProvisionClaimed }
       : {}),
     ...(input.activity ? { activity: input.activity } : {}),
     ...(input.pendingApprovals
@@ -745,7 +778,15 @@ function computeOverall(
   l2: OperationalStatus,
   l3: DisclosureStatus,
   l4: ReputationStatus,
-  enforcement: { wallArmState: CastleWallArmState; auditIntegrityOk: boolean }
+  enforcement: {
+    wallArmState: CastleWallArmState;
+    auditIntegrityOk: boolean;
+    /**
+     * True when THIS vault carries the `not_yet_walled` claim. Gates green
+     * independently of `wallArmState`, which is a MACHINE fact.
+     */
+    vaultNotOnThisWall: boolean;
+  }
 ): ProtectionSnapshot["overall"] {
   // Fail closed on a tamper-flagged or unreadable audit chain: the evidence the
   // overall light would be judged from is itself untrustworthy, so it can never
@@ -769,7 +810,14 @@ function computeOverall(
     };
   }
   const allCriticalFull = critical.every((s) => s === "full");
-  const wallArmed = enforcement.wallArmState === "armed";
+  // INVARIANT: green asserts THIS VAULT is being enforced. `wallArmState` is a
+  // claim about the machine's wall, and a Mac armed by an earlier install
+  // reports `armed` while the vault in front of the operator is on no wall at
+  // all, so the vault-level claim gates green alongside it. Failure mode if
+  // this term is dropped: the hero shield goes green and says "Castle Wall
+  // enforcing" for a brand-new vault whose traffic nothing is filtering.
+  const wallArmed =
+    enforcement.wallArmState === "armed" && !enforcement.vaultNotOnThisWall;
 
   // GREEN requires the ENFORCING layer to be proven armed, not just the
   // config-present layers (identity / DID / Verascore). A wall that is dead,
@@ -793,7 +841,10 @@ function computeOverall(
     return {
       status: "degraded",
       light: "yellow",
-      headline: castleWallNotEnforcingHeadline(enforcement.wallArmState),
+      headline: castleWallNotEnforcingHeadline(
+        enforcement.wallArmState,
+        enforcement.vaultNotOnThisWall,
+      ),
     };
   }
   return {
@@ -804,7 +855,17 @@ function computeOverall(
 }
 
 /** Honest headline for the configured-but-enforcement-not-confirmed amber. */
-function castleWallNotEnforcingHeadline(arm: CastleWallArmState): string {
+function castleWallNotEnforcingHeadline(
+  arm: CastleWallArmState,
+  vaultNotOnThisWall = false,
+): string {
+  // The vault-level gap outranks the machine's arm-state in this headline: on a
+  // host with a leftover armed wall the arm-state reads `armed`, and a headline
+  // derived from it alone would say the wall is fine while the operator's vault
+  // is the thing that is not on it.
+  if (vaultNotOnThisWall) {
+    return "Layers configured, but this vault is not on this Mac's Castle Wall";
+  }
   switch (arm) {
     case "degraded":
       return "Layers configured, Castle Wall degraded (not enforcing)";
@@ -987,6 +1048,11 @@ export async function getProtectionSnapshot(
   // than silently dropping to the weaker channel basis. Mirrors the
   // posture-routes / dispatchPosture wiring.
   let wallArmState: CastleWallArmState = "unknown";
+  // Defaults to "no claim rendered", which is what a fortress that predates the
+  // state gets. It is never a claim of protection: the green gate below reads
+  // only the POSITIVE `not_yet_walled`, so an unresolved provider changes
+  // nothing rather than manufacturing either answer.
+  let vaultProvision: CastleWallProvisionState | undefined;
   if (sources.auditLog) {
     try {
       const pinnedProducerKeyB64url = sources.resolvePinnedProducerKey
@@ -1019,10 +1085,21 @@ export async function getProtectionSnapshot(
       const enforcementAvailability = sources.resolveEnforcementAvailability
         ? await sources.resolveEnforcementAvailability()
         : null;
+      // Resolved BEFORE the eager read scope like every other provider here, so
+      // a filesystem read never nests inside the audit log's read scope.
+      let vaultProvisionClaimed = false;
+      if (sources.resolveVaultProvisionClaimed) {
+        try {
+          vaultProvisionClaimed = await sources.resolveVaultProvisionClaimed();
+        } catch {
+          vaultProvisionClaimed = false;
+        }
+      }
       const wall = await sources.auditLog.runEagerReads(() =>
         buildCastleWallPosture({
           auditLog: sources.auditLog as AuditLog,
           originMachine: agent.primary_identity_id ?? "local",
+          ...(vaultProvisionClaimed ? { vaultProvisionClaimed: true } : {}),
           ...(sources.platform !== undefined ? { platform: sources.platform } : {}),
           pinnedProducerKeyB64url,
           ...(sources.producerKeyExpectedButUnavailable
@@ -1036,6 +1113,10 @@ export async function getProtectionSnapshot(
         }),
       );
       wallArmState = wall.arm_state;
+      // Read back from the ONE derivation chokepoint the shaper already ran
+      // (`castle-wall/provision-state.ts`), never re-derived here: a second
+      // rule at this consumer is the drift AGENTS rule 5 names.
+      vaultProvision = wall.castle_wall_provision;
     } catch {
       wallArmState = "unknown";
     }
@@ -1047,7 +1128,11 @@ export async function getProtectionSnapshot(
   const upstream_servers = buildUpstreamServers(sources);
 
   return {
-    overall: computeOverall(l1, l2, l3, l4, { wallArmState, auditIntegrityOk }),
+    overall: computeOverall(l1, l2, l3, l4, {
+      wallArmState,
+      auditIntegrityOk,
+      vaultNotOnThisWall: vaultProvision === CASTLE_WALL_NOT_YET_WALLED,
+    }),
     agent,
     layers: { l1, l2, l3, l4 },
     activity,
@@ -1058,5 +1143,8 @@ export async function getProtectionSnapshot(
     mode: sources.mode,
     server_version: sources.server_version,
     generated_at: new Date().toISOString(),
+    ...(vaultProvision !== undefined
+      ? { castle_wall_provision: vaultProvision }
+      : {}),
   };
 }

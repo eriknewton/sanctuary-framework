@@ -172,12 +172,18 @@ well as by policy. The trust-anchor verdict is read from `castle-wall status`;
 when the anchor is not readable from the planner's context, the observation is
 reported as unknown and no remedy is invented.
 
-The vault's own state is reported separately from the machine's. A vault records
-whether it has been put on this machine's Castle Wall, and the planner, `doctor`,
-`castle-wall status`, `sanctuary status`, and the health surfaces all render that
-value. A machine can carry a running wall from an earlier install while the vault
-in front of the operator is on no wall at all, so machine-wide observations are
-never read as protection for a particular vault.
+The vault's own state is reported separately from the machine's. Init records
+only that a vault has not yet been put on this machine's Castle Wall
+(`not_yet_walled`); nothing is ever recorded to say a vault IS on the wall.
+Whether a vault is on the wall is derived, never stored: it holds only when
+this Mac's trust-anchor verdict is consistent with the signer helper's key
+AND that vault's own arm evidence says armed. Re-pin supplies the anchor half
+of that pair; arming, a separate step, supplies the other. The planner,
+`doctor`, `castle-wall status`, `sanctuary status`, and the health surfaces
+each report what they can observe of that pair, so a machine can carry a
+running wall from an earlier install while the vault in front of the operator
+is on no wall at all; machine-wide observations are never read as protection
+for a particular vault.
 
 ### Root boot-runtime custody
 

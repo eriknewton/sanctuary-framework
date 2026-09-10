@@ -2321,6 +2321,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       resolveEnforcementAvailability:
         this.injectedResolveEnforcementAvailability ??
         (() => this.resolveEnforcementAvailability()),
+      resolveVaultProvisionClaimed: () => this.resolveVaultProvisionClaimed(),
       // Wire the shared registry so the SSE live-refresh stream is available and
       // its concurrency cap is enforced server-wide. The stream reuses `buildHome`
       // (no new data, no new green paths) on a cadence plus a heartbeat.
@@ -2686,6 +2687,23 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       load = { status: "unreadable", reason: "broker_producer_key_load_threw" };
     }
     this._brokerProducerKeyLoad = load.status === "absent" ? undefined : load;
+  }
+
+  /**
+   * Does THIS fortress carry the persisted `not_yet_walled` claim?
+   *
+   * ONE resolver, shared by the posture routes and the snapshot aggregator, so
+   * the hero shield and the posture board can never disagree about the same
+   * vault (AGENTS rule 5). Never throws: the reader collapses every failure to
+   * `absent`/`unreadable`, and both answer `false` here — an unreadable claim
+   * is not rendered as a claim, and it is never rendered as protection either
+   * (nothing in this path can turn it green).
+   */
+  private async resolveVaultProvisionClaimed(): Promise<boolean> {
+    const storagePath = this._sanctuaryConfig?.storage_path;
+    if (typeof storagePath !== "string" || storagePath.length === 0) return false;
+    const claim = await readPersistedCastleWallProvision(storagePath);
+    return claim.state === "not-yet-walled";
   }
 
   private async resolveEnforcementAvailability() {
@@ -8154,6 +8172,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       resolveEnforcementAvailability:
         this.injectedResolveEnforcementAvailability ??
         (() => this.resolveEnforcementAvailability()),
+      resolveVaultProvisionClaimed: () => this.resolveVaultProvisionClaimed(),
       pendingApprovals: Array.from(this.pending.values()).map((p) => ({
         id: p.id,
         operation: p.request.operation,

@@ -108,6 +108,19 @@ export interface CastleWallRuntimeSnapshot {
    * either.
    */
   vaultProvision?: CastleWallProvisionState;
+  /**
+   * `false` when NO runtime detector applies on this platform, so this object
+   * exists only to carry {@link vaultProvision}.
+   *
+   * WHY IT EXISTS: on macOS the Linux producer-signed detector returns
+   * `undefined`, and `undefined` cannot carry a field. Before this flag the
+   * vault's own wall claim was silently dropped on macOS — the platform the
+   * claim is about — so `monitor_health`, `exec_attest` and the signed SHR
+   * payload all omitted it there. `evaluateCastleWall` maps this flag to
+   * BYTE-IDENTICAL evidence to the `undefined` case, so the runtime verdict on
+   * that platform is unchanged and only the additive field is new.
+   */
+  runtimeDetectorApplies?: false;
 }
 
 export interface CastleWallEvidence {
@@ -259,7 +272,11 @@ export function evaluateCastleWall(snapshot?: CastleWallRuntimeSnapshot): Castle
 
 function evaluateCastleWallRuntime(snapshot?: CastleWallRuntimeSnapshot): CastleWallEvidence {
   const platform = snapshot?.platform ?? process.platform;
-  if (!snapshot) {
+  // Must stay one branch with the `!snapshot` case: a carrier object exists
+  // only to hold the vault claim and asserts nothing about a runtime, so its
+  // runtime verdict has to be the same "no detector applies" answer, byte for
+  // byte, that the absent snapshot produces.
+  if (!snapshot || snapshot.runtimeDetectorApplies === false) {
     return {
       platform,
       status: "unknown",

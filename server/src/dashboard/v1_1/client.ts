@@ -2988,6 +2988,17 @@ function renderPostureScreen() {
       '</section>';
   }
   const wall = postureWallLabel(home.castle_wall && home.castle_wall.arm_state);
+  // ADDITIVE vault-level line. The wall label above is the MACHINE arm-state and
+  // is unchanged; a Mac armed by an earlier install renders it protected while
+  // this vault is on no wall, so the vault's own claim gets its own sentence
+  // rather than being folded into that label. NOTE: this whole browser script
+  // lives inside a TypeScript template literal, so a backtick here would
+  // terminate it; comments in this file use plain words, never code quotes.
+  const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
+  const vaultNotice =
+    vaultProvision === "not_yet_walled"
+      ? '<p class="muted">This vault is not on this Mac\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
+      : "";
   const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
   const findings = home.anomaly_findings || [];
   const anomalyUnknown = home.anomaly_findings_unknown === true;
@@ -3026,6 +3037,7 @@ function renderPostureScreen() {
         fresh: wallEvidenceAt,
         freshNone: "no enforcement evidence yet",
       }) +
+      vaultNotice +
       postureMetricCard(escHtml(pending), "Approvals waiting") +
       postureMetricCard(anomalyUnknown ? '<span class="tone-degraded">?</span>' : escHtml(findings.length), "Open anomalies") +
       postureMetricCard(chainPill, "Audit chain", {
