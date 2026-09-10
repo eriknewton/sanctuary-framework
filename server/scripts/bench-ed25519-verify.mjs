@@ -7,6 +7,7 @@
  * A and R to canonical encodings; the scalar range check `S < L` is enforced
  * unconditionally by @noble regardless of `zip215`, and @noble evaluates the
  * cofactored equation either way. The subgroup gate is what makes the
+ * combined result cofactorless (see the invariant comment at the
  * `ed25519.verify` call in `src/core/identity.ts` for the equivalence
  * argument). Every caller of that shared `verify` funnel pays this cost, not
  * every Ed25519 verification in the product: several sites (for example
