@@ -25,6 +25,10 @@ import {
 } from "../../scripts/sealed-cli-runtime-entries.mjs";
 import { parseWrapArgs, runWrap, type WrapOptions } from "../../src/wrap/cli.js";
 import { TOP_LEVEL_SUBCOMMANDS } from "../../src/cli/subcommands.js";
+import {
+  failedExclusiveEgressStatus,
+  type ExclusiveEgressStatus,
+} from "../../src/egress-gate/posture.js";
 
 const require = createRequire(import.meta.url);
 const packageJson = require("../../package.json") as { version: string };
@@ -1214,6 +1218,117 @@ describe("sanctuary install agent contract", () => {
         persisted: "unreadable",
       }),
     ).toBe("unreadable");
+  });
+
+  // Codex lens A round 2 (2026-09-10): the ARM HALF above matched
+  // `enforcement === "live"` alone against `principal-policy/posture.ts`'s
+  // arm-state determination, but that determination also caps a would-be
+  // `armed` to the distinct non-green `coarse_only` when a fine-grained agent's
+  // exclusive-egress stack is not live (`applyExclusiveEgress`,
+  // `exclusiveEgressCapsAggregateGreen`). A consistent anchor + live
+  // availability + a capped exclusive-egress stack derived `walled` here while
+  // the canonical posture derived `coarse_only` / not-armed — this pins the
+  // fix: the installer now consumes the IDENTICAL predicate, so it can never
+  // report `walled` (and therefore `complete`) in a scenario the canonical
+  // posture would report as not-armed.
+  describe("the exclusive-egress cap: the installer's arm verdict cannot outrun the canonical posture", () => {
+    const CAPPED = failedExclusiveEgressStatus("test: exclusive-egress stack not live");
+    const LIVE_UNCAPPED: ExclusiveEgressStatus = {
+      fine_grained_declared: true,
+      exclusive_egress_live: true,
+      mode: "exclusive",
+      agents: [],
+      reasons: [],
+    };
+
+    it("enforcement live but the exclusive-egress cap fires: never walled, whatever the persisted claim says", () => {
+      for (const persisted of ["not-yet-walled", "absent"] as const) {
+        expect(
+          deriveInstallVaultProvision({
+            trustAnchor: "consistent",
+            enforcement: "live",
+            persisted,
+            exclusiveEgress: CAPPED,
+          }),
+          persisted,
+        ).not.toBe("walled");
+      }
+    });
+
+    it("enforcement live and the exclusive-egress stack is genuinely live: walled, same as the uncapped case", () => {
+      expect(
+        deriveInstallVaultProvision({
+          trustAnchor: "consistent",
+          enforcement: "live",
+          persisted: "not-yet-walled",
+          exclusiveEgress: LIVE_UNCAPPED,
+        }),
+      ).toBe("walled");
+    });
+
+    it("no exclusive-egress observation at all (undefined/null): unchanged — matches the canonical 'no producer wired' bound", () => {
+      for (const exclusiveEgress of [undefined, null] as const) {
+        expect(
+          deriveInstallVaultProvision({
+            trustAnchor: "consistent",
+            enforcement: "live",
+            persisted: "not-yet-walled",
+            exclusiveEgress,
+          }),
+          String(exclusiveEgress),
+        ).toBe("walled");
+      }
+    });
+
+    it("end to end: the planner never reports install complete when the exclusive-egress cap fires", () => {
+      const cappedVaultProvision = deriveInstallVaultProvision({
+        trustAnchor: "consistent",
+        enforcement: "live",
+        persisted: "not-yet-walled",
+        exclusiveEgress: CAPPED,
+      });
+      const plan = buildAgentInstallPlan({
+        profile: "full",
+        harness: "hermes",
+        fortress: "/tmp/fortress",
+        platform: "darwin",
+        observed: fullObserved({
+          cooperativeWrap: "present",
+          castleWallApp: "present",
+          systemExtension: "[activated enabled]",
+          bootService: "present",
+          contentFilter: "enabled",
+          enforcement: "live",
+          trustAnchor: "consistent",
+          vaultProvision: cappedVaultProvision,
+        }),
+      });
+      expect(plan.status).not.toBe("complete");
+
+      const uncappedVaultProvision = deriveInstallVaultProvision({
+        trustAnchor: "consistent",
+        enforcement: "live",
+        persisted: "not-yet-walled",
+        exclusiveEgress: LIVE_UNCAPPED,
+      });
+      const uncappedPlan = buildAgentInstallPlan({
+        profile: "full",
+        harness: "hermes",
+        fortress: "/tmp/fortress",
+        platform: "darwin",
+        observed: fullObserved({
+          cooperativeWrap: "present",
+          castleWallApp: "present",
+          systemExtension: "[activated enabled]",
+          bootService: "present",
+          contentFilter: "enabled",
+          enforcement: "live",
+          trustAnchor: "consistent",
+          vaultProvision: uncappedVaultProvision,
+        }),
+      });
+      expect(uncappedPlan.status).toBe("complete");
+    });
   });
 
   // Finding B (defect.fresh-install-daemon-needs-manual-repin-on-first-arm):

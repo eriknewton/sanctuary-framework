@@ -29,6 +29,7 @@ import {
 import { protectionSubjectForUid } from "../../src/castle-wall/subject-binding.js";
 import type { IdentityManager } from "../../src/cognitive/tools.js";
 import type { PublicIdentity, StoredIdentity } from "../../src/core/identity.js";
+import { CASTLE_WALL_NOT_YET_WALLED } from "../../src/castle-wall/provision-state.js";
 
 function stubIdentity(overrides: Partial<PublicIdentity> = {}): StoredIdentity {
   return {
@@ -203,6 +204,55 @@ describe("getProtectionSnapshot", () => {
     expect(snap.overall.light).toBe("green");
     expect(snap.overall.status).toBe("healthy");
     expect(snap.overall.headline).toBe("All layers full, Castle Wall enforcing");
+  });
+
+  // Codex lens A round 2 (2026-09-10): on OTHERWISE IDENTICAL fully-armed,
+  // all-layers-full evidence (the exact fixture the "flags green only when..."
+  // test above proves goes green), a vault-provision claim that could not be
+  // read must cap the light exactly like an intact `not_yet_walled` claim does
+  // — never render green because the read failed. Before the fix, an
+  // unreadable/throwing resolver collapsed to "no claim" and this fixture
+  // rendered GREEN, identically to a vault with no wall problem at all.
+  describe("a vault claim that could not be read never renders green on otherwise-healthy evidence", () => {
+    function armedSources(
+      resolveVaultProvisionClaimed?: () => Promise<boolean>,
+    ): AggregatorSources {
+      return baseSources({
+        identityManager: stubIdentityManager(stubIdentity()),
+        auditLog: stubAuditLog([cwArmEntry()]),
+        teeAvailable: true,
+        reputation: { score: 95, profile_url: "https://verascore.ai/p/xyz" },
+        resolveProtectionClaimSubject: () => CLAIM_SUBJECT,
+        ...(resolveVaultProvisionClaimed ? { resolveVaultProvisionClaimed } : {}),
+      });
+    }
+
+    it("no resolver wired: renders green exactly as before (unchanged, legacy surfaces)", async () => {
+      const snap = await getProtectionSnapshot(armedSources());
+      expect(snap.overall.light).toBe("green");
+      expect(snap).not.toHaveProperty("castle_wall_provision");
+    });
+
+    it("an intact not_yet_walled claim caps the light (already correct; the control)", async () => {
+      const snap = await getProtectionSnapshot(armedSources(async () => true));
+      expect(snap.castle_wall_provision).toBe(CASTLE_WALL_NOT_YET_WALLED);
+      expect(snap.overall.light).not.toBe("green");
+    });
+
+    it("a resolver that returns claimed=false because the record was unreadable must still cap — the fix at aggregator.ts's catch, exercised end to end", async () => {
+      // Mirrors the FIXED dashboard.ts resolver's contract: an unreadable
+      // record resolves `true` (claimed), never silently `false`. A caller
+      // that still passes `false` for a genuinely-unreadable record is a
+      // caller bug outside this module's fix, so this pins the OTHER half —
+      // the resolver throwing — as the aggregator-level regression proof.
+      const snap = await getProtectionSnapshot(
+        armedSources(async () => {
+          throw new Error("injected claim-read failure (simulates an unreadable record)");
+        }),
+      );
+      expect(snap.overall.light).not.toBe("green");
+      expect(snap.castle_wall_provision).toBe(CASTLE_WALL_NOT_YET_WALLED);
+    });
   });
 
   it("injected undetermined v3 availability prevents linux-shaped legacy evidence from going green", async () => {

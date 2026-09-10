@@ -51,6 +51,15 @@ import {
   readPersistedCastleWallProvision,
   type PersistedCastleWallProvisionObservation,
 } from "../castle-wall/provision-state.js";
+// THE ONE exclusive-egress cap predicate (S5-P design §6). Must match
+// `principal-policy/posture.ts` (`applyExclusiveEgress`), the only other
+// caller: both derive "is this wall really armed" from the SAME function so
+// an installer verdict of `walled` can never diverge from the canonical
+// `arm_state` a would-be `armed` wall caps to `coarse_only` under.
+import {
+  exclusiveEgressCapsAggregateGreen,
+  type ExclusiveEgressStatus,
+} from "../egress-gate/posture.js";
 // The sealed-runtime contract shared with the build gate and the manifest
 // builder (server/scripts/sealed-cli-runtime-entries.mjs); bundled into cli.js.
 import {
@@ -841,19 +850,33 @@ export function parseTrustAnchor(text: string): TrustAnchorObservation {
 }
 
 /**
- * The planner's vault-level wall observation, from the three things the probe
- * can actually see. Pure and exported so the truth table is provable without a
+ * The planner's vault-level wall observation, from the things the probe can
+ * actually see. Pure and exported so the truth table is provable without a
  * Mac (AGENTS rule 4 still applies: the production probe below is its only
  * runtime caller and is exercised by its own test).
  *
  * ARM HALF, cross-file contract: `enforcement === "live"` must match the macOS
  * branch of the arm-state determination in `principal-policy/posture.ts`
- * (`buildCastleWallPosture`), where `arm_state === "armed"` on macOS holds
- * EXACTLY when the resolved enforcement availability reads `live`. Both sides
- * read the SAME fortress-scoped availability record, so this is that
- * determination made from the CLI, not a second weaker rule. `unavailable` is a
- * positive not-armed fact; `undetermined` is the honest unknown; neither can
- * produce `walled`.
+ * (`buildCastleWallPosture`), where a would-be `arm_state === "armed"` on
+ * macOS holds EXACTLY when the resolved enforcement availability reads `live`
+ * AND the exclusive-egress cap does not fire. Both sides read the SAME
+ * fortress-scoped availability record and the SAME cap predicate
+ * (`exclusiveEgressCapsAggregateGreen`, `egress-gate/posture.ts`), so this is
+ * that determination made from the CLI, not a second weaker rule that stops
+ * at the first half. `unavailable` is a positive not-armed fact; `undetermined`
+ * is the honest unknown; neither can produce `walled`, and `live`-but-capped
+ * is a definite not-armed, never `unknown`.
+ *
+ * Codex lens A round 2 (2026-09-10) found this function reading `live` alone
+ * as armed: a consistent anchor + live availability + a fine-grained agent
+ * whose exclusive-egress stack was NOT live derived `walled`/`complete` here
+ * while the canonical posture derived the distinct non-green `coarse_only` /
+ * `not_yet_walled`. `exclusiveEgress` closes that: `undefined`/`null` (this
+ * probe observes no exclusive-egress evidence today — no producer is wired on
+ * the install-probe path) applies NO cap, matching the canonical "no producer
+ * wired = no fine-grained agent exists = unchanged behavior" bound already
+ * stated on `exclusiveEgressCapsAggregateGreen` itself; a caller that DOES
+ * have the evidence gets the identical cap the dashboard renders.
  *
  * Failure mode this replaced: the probe passed a hardcoded `armed: "unknown"`,
  * so NO vault could ever derive `walled` here and the planner emitted
@@ -869,11 +892,26 @@ export function deriveInstallVaultProvision(input: {
   trustAnchor: TrustAnchorObservation;
   enforcement: InstallProbeResult["enforcement"];
   persisted: PersistedCastleWallProvisionObservation["state"];
+  /**
+   * The SAME S5-P exclusive-egress posture `principal-policy/posture.ts`
+   * caps `arm_state` with. `undefined`/`null` = unobserved here = no cap
+   * (see the function doc above); a caller that resolves a real status
+   * (including `failedExclusiveEgressStatus` on a read failure) gets the
+   * identical cap `applyExclusiveEgress` applies.
+   */
+  exclusiveEgress?: ExclusiveEgressStatus | null;
 }): InstallProbeResult["vaultProvision"] {
+  const enforcementLive = input.enforcement === "live";
+  // THE cap: a live-enforcing wall with a fine-grained agent whose
+  // exclusive-egress stack is not live is definitively NOT armed here, exactly
+  // as `applyExclusiveEgress` caps a would-be `armed` to `coarse_only` there.
+  const cappedByExclusiveEgress =
+    enforcementLive && exclusiveEgressCapsAggregateGreen(input.exclusiveEgress);
   const derived = deriveCastleWallProvision({
     trustAnchor: input.trustAnchor === "not-applicable" ? "unknown" : input.trustAnchor,
-    armed:
-      input.enforcement === "live"
+    armed: cappedByExclusiveEgress
+      ? false
+      : enforcementLive
         ? true
         : input.enforcement === "unavailable"
           ? false
@@ -1199,6 +1237,15 @@ export function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
             ? probeOperatorTwin(env, platform)
             : Promise.resolve("not-applicable" as const),
         ]);
+      // HONEST BOUND: this read-only probe does not resolve the S5-P
+      // exclusive-egress posture (its producer is wired only on the dashboard
+      // path, `dashboard-standalone.ts`, over root-owned runtime state this
+      // subprocess probe has no reason to touch). Passing no observation
+      // applies NO cap here, exactly as `exclusiveEgressCapsAggregateGreen`
+      // documents for "no producer wired" — honest for the common host with no
+      // fine-grained exclusive-egress agent, and a residual (not yet a
+      // regression) for one that has provisioned one: tracked as a follow-up
+      // to wire a real probe into this path, never silently claimed complete.
       const vaultProvision = deriveInstallVaultProvision({
         trustAnchor: wall.trustAnchor,
         enforcement: wall.enforcement,

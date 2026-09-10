@@ -1092,7 +1092,14 @@ export async function getProtectionSnapshot(
         try {
           vaultProvisionClaimed = await sources.resolveVaultProvisionClaimed();
         } catch {
-          vaultProvisionClaimed = false;
+          // A resolver that THROWS is a claim-read FAILURE, not an absence of a
+          // claim, and must fail closed: claimed=true feeds the honest
+          // not-walled reading through `attachVaultProvision` below, capping
+          // green via `vaultNotOnThisWall`. Falling back to `false` here was
+          // the "a throwing resolver also produces green" fail-open Codex lens
+          // A round 2 found on 2026-09-10 (identical otherwise-healthy,
+          // fully-armed evidence rendered green on a failed claim read).
+          vaultProvisionClaimed = true;
         }
       }
       const wall = await sources.auditLog.runEagerReads(() =>

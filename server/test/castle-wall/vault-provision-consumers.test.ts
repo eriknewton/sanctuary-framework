@@ -27,6 +27,7 @@ import { castleWallSnapshotForHealthReport } from "../../src/health/castle-wall-
 import { evaluateCastleWall } from "../../src/health/evidence.js";
 import { getProtectionSnapshot } from "../../src/dashboard/aggregator.js";
 import type { AggregatorSources } from "../../src/dashboard/aggregator.js";
+import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
@@ -50,6 +51,84 @@ async function claimingFortress(root: string, name: string): Promise<string> {
   });
   return fortressPath;
 }
+
+/**
+ * Reach into the private production resolver
+ * (`principal-policy/dashboard.ts:resolveVaultProvisionClaimed`, Codex lens A
+ * round 2's fix location #1) exactly the way `test/principal-policy/
+ * dashboard.test.ts` reaches into other private dashboard internals — a real
+ * `DashboardApprovalChannel` instance, `_sanctuaryConfig` set directly, no HTTP
+ * server started. This proves the FIX AT ITS OWN LINE, not just at the
+ * abstracted `AggregatorSources`/`PostureRouteDeps` boolean-injection seam the
+ * other describe blocks in this file exercise (which cannot see this specific
+ * regression: they inject the boolean already-collapsed).
+ */
+function resolverFor(storagePath: string): () => Promise<boolean> {
+  const dashboard = new DashboardApprovalChannel({
+    port: 0,
+    host: "127.0.0.1",
+    timeout_seconds: 30,
+    auto_deny: true,
+  });
+  (dashboard as unknown as { _sanctuaryConfig: { storage_path: string } })._sanctuaryConfig = {
+    storage_path: storagePath,
+  } as unknown as { storage_path: string };
+  return () =>
+    (
+      dashboard as unknown as { resolveVaultProvisionClaimed(): Promise<boolean> }
+    ).resolveVaultProvisionClaimed();
+}
+
+describe("the production resolver reads unreadable evidence as claimed, never as absent", () => {
+  let tmp: string;
+
+  beforeEach(async () => {
+    tmp = await mkdtemp(join(tmpdir(), "sanctuary-vault-resolver-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  async function fortressWithRecord(
+    name: string,
+    content: string | null,
+  ): Promise<string> {
+    const fortressPath = join(tmp, name);
+    await mkdir(join(fortressPath, "state", "_meta"), { recursive: true, mode: 0o700 });
+    if (content !== null) {
+      await writeFile(castleWallProvisionRecordPath(fortressPath), content, { mode: 0o600 });
+    }
+    return fortressPath;
+  }
+
+  it("absent (no record ever written) reads as unclaimed — the legacy pass-through", async () => {
+    const fortressPath = await fortressWithRecord("absent", null);
+    await expect(resolverFor(fortressPath)()).resolves.toBe(false);
+  });
+
+  it("the current not_yet_walled claim reads as claimed", async () => {
+    const fortressPath = await fortressWithRecord("intact", CASTLE_WALL_NOT_YET_WALLED);
+    await expect(resolverFor(fortressPath)()).resolves.toBe(true);
+  });
+
+  it("an EMPTY record (exists, zero bytes) reads as claimed, not as absent", async () => {
+    // The exact Codex lens A round 2 counterexample: an emptied marker file
+    // used to collapse to the same `false` as a genuinely absent one.
+    const fortressPath = await fortressWithRecord("empty", "");
+    await expect(resolverFor(fortressPath)()).resolves.toBe(true);
+  });
+
+  it("an unparseable record (garbage bytes) reads as claimed, not as absent", async () => {
+    const fortressPath = await fortressWithRecord("garbage", "\x00\x01\xff not json at all {{{");
+    await expect(resolverFor(fortressPath)()).resolves.toBe(true);
+  });
+
+  it("a wrong-type record (a recognizable but non-current token) reads as claimed, not as absent", async () => {
+    const fortressPath = await fortressWithRecord("wrong-type", "walled");
+    await expect(resolverFor(fortressPath)()).resolves.toBe(true);
+  });
+});
 
 describe("MCP health and attestation carry the vault claim on macOS", () => {
   let tmp: string;
@@ -120,14 +199,18 @@ describe("the dashboard snapshot never shows a not-yet-walled vault as protected
     expect(unclaimed).not.toHaveProperty("castle_wall_provision");
   });
 
-  it("treats a resolver that throws as no claim, never as protection", async () => {
+  it("treats a resolver that throws as a claim-read FAILURE — fail closed, never as an absent claim", async () => {
+    // Codex lens A round 2 (2026-09-10): the prior fallback (`false`, "no
+    // claim") let a throwing resolver render exactly like a genuinely absent
+    // one. A read that failed is not a read that found nothing, and must
+    // never be indistinguishable from protection.
     const thrown = await getProtectionSnapshot(
       sources(async () => {
         throw new Error("injected claim-read failure");
       }),
     );
     expect(thrown.overall.light).not.toBe("green");
-    expect(thrown).not.toHaveProperty("castle_wall_provision");
+    expect(thrown.castle_wall_provision).toBe(CASTLE_WALL_NOT_YET_WALLED);
   });
 });
 

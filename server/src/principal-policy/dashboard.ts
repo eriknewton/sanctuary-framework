@@ -2534,6 +2534,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // The vault's own wall claim, read from this fortress. Never throws (the
       // reader collapses every failure to `absent`/`unreadable`), and an
       // absent claim omits the additive field rather than asserting anything.
+      // `unreadable` is grouped WITH the claimed (`not-yet-walled`) branch
+      // below, never with `absent` — see the same grouping and its rationale
+      // on `resolveVaultProvisionClaimed` above (both must render identically,
+      // AGENTS rule 5: one derivation, not two hand-mirrored copies).
       // `trustAnchor` is deliberately left at its honest default here: this
       // process cannot run the signer-helper query, so it must not assert
       // CONSISTENT. See the stated bound on CastleWallPosture.
@@ -2547,7 +2551,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           auditLog: this.auditLog as AuditLog,
           originMachine,
           platform: process.platform,
-          ...(vaultProvision.state === "not-yet-walled"
+          ...(vaultProvision.state !== "absent"
             ? { vaultProvisionClaimed: true }
             : {}),
           pinnedProducerKeyB64url:
@@ -2690,20 +2694,32 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
-   * Does THIS fortress carry the persisted `not_yet_walled` claim?
+   * Does THIS fortress carry a wall claim that must NOT be rendered as
+   * protection — either the current `not_yet_walled` claim, or a record that
+   * exists and could not be read?
    *
    * ONE resolver, shared by the posture routes and the snapshot aggregator, so
    * the hero shield and the posture board can never disagree about the same
-   * vault (AGENTS rule 5). Never throws: the reader collapses every failure to
-   * `absent`/`unreadable`, and both answer `false` here — an unreadable claim
-   * is not rendered as a claim, and it is never rendered as protection either
-   * (nothing in this path can turn it green).
+   * vault (AGENTS rule 5). Never throws: the reader collapses every read
+   * failure to `absent`/`unreadable`.
+   *
+   * `unreadable` (a record exists at the claim's path and did not parse —
+   * emptied, truncated, or holding a token this version does not recognize) is
+   * grouped WITH `not-yet-walled`, never with `absent`: a marker that exists
+   * but cannot be read is evidence of tampering or corruption, and collapsing
+   * it into "no claim" is the exact fail-open Codex lens A round 2 found on
+   * 2026-09-10 (an emptied marker read as green, identical otherwise-healthy
+   * evidence that an intact `not_yet_walled` marker correctly capped). Only a
+   * genuine ENOENT (`absent`: no marker was ever written, e.g. a fortress that
+   * predates this claim entirely) keeps the legacy pass-through, so that
+   * fortress's own arm_state still governs its color
+   * (test/castle-wall/legacy-fortress-no-claim.test.ts).
    */
   private async resolveVaultProvisionClaimed(): Promise<boolean> {
     const storagePath = this._sanctuaryConfig?.storage_path;
     if (typeof storagePath !== "string" || storagePath.length === 0) return false;
     const claim = await readPersistedCastleWallProvision(storagePath);
-    return claim.state === "not-yet-walled";
+    return claim.state !== "absent";
   }
 
   private async resolveEnforcementAvailability() {

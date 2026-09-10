@@ -733,14 +733,17 @@ async function buildWallPosture(
       : await resolveEnforcementAvailability(deps);
   // Resolved BEFORE the eager read scope, like every other provider here, so a
   // filesystem read never nests inside the audit log's read scope. A throwing
-  // provider yields "no claim" rather than failing the whole posture: this
-  // field is additive and its absence renders nothing.
+  // provider is a claim-read FAILURE, not an absence of a claim, and must fail
+  // closed: claimed=true renders the honest not-walled reading (the posture
+  // read itself still succeeds; only the vault-claim half degrades honestly).
+  // Falling back to `false` here was the "a throwing resolver also produces
+  // green" fail-open Codex lens A round 2 found on 2026-09-10.
   let vaultProvisionClaimed = false;
   if (deps.resolveVaultProvisionClaimed) {
     try {
       vaultProvisionClaimed = await deps.resolveVaultProvisionClaimed();
     } catch {
-      vaultProvisionClaimed = false;
+      vaultProvisionClaimed = true;
     }
   }
   return (deps.auditLog as AuditLog).runEagerReads(() =>
