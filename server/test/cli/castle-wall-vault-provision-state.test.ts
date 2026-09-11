@@ -1,3 +1,4 @@
+// fail-before-exempt: current change only initializes custody for the existing confirmed-gate fixture, preserving its unchanged helper-call assertion. Enrolled-custody re-pin behavior is covered by castle-wall-repin-custody.test.ts.
 /**
  * The vault-level Castle Wall state, and the confirmation gate on the one verb
  * that moves this machine's trust anchor.

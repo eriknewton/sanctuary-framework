@@ -1,4 +1,4 @@
-// fail-before-exempt: harness-only edit. Every runRePin call gains the confirmStdin seam the new interactive-only gate requires; no assertion in this file changed, and the gate itself is proven in test/cli/castle-wall-vault-provision-state.test.ts (non-TTY refusal, wrong-answer abort, confirmed pass-through).
+// fail-before-exempt: current change only initializes custody for the existing missing-shim fixture, so it reaches its unchanged shim-path assertion. Enrolled-custody re-pin behavior is covered by cli/castle-wall-repin-custody.test.ts.
 /**
  * Tests for the A2/B2 re-pin (trust-anchor migration) flow.
  *
