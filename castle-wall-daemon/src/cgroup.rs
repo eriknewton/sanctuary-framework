@@ -1,10 +1,11 @@
 //! cgroup v2 transient unit creation via systemd-run.
 //!
 //! Per scope-lock section 1: each wrapped agent runs in its own systemd
-//! transient unit. The daemon resolves the cgroup ID from the unit path
-//! for use in nftables `socket cgroupv2` matches. The cgroup-id renumbering
-//! gotcha (nftables resolves cgroup paths to numeric inode IDs at rule-load
-//! time) is handled by re-installing rules when a unit is re-created.
+//! transient unit, which anchors a cgroup for JAILING. The kernel egress match
+//! is bound to the agent's uid (`meta skuid`), NOT to cgroup identity, so the
+//! cgroup-id renumbering gotcha that used to require re-installing rules after a
+//! unit was recreated no longer applies: a recreated scope gets a new cgroup id
+//! and the same uid, and the installed rule stays correct untouched.
 //!
 //! Implementation note: we use systemd transient `.service` units with a
 //! `sleep infinity` placeholder to anchor the cgroup lifetime. The earlier
@@ -18,10 +19,6 @@
 //! All kernel-touching functions are `#[cfg(target_os = "linux")]`-gated.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::Duration;
 
 const SYSTEMD_UNIT_MAX_LEN: usize = 256;
 const SCOPE_UNIT_PREFIX: &str = "sanctuary-agent-";
@@ -42,8 +39,10 @@ pub enum CgroupError {
     IdResolutionFailed(String),
     #[error("systemd not PID 1 (F-8 per scope-lock section 7)")]
     SystemdNotPid1,
-    #[error("cgroup refresh failed: {0}")]
-    RefreshFailed(String),
+    // RETIRED with the cgroup-identity match: a `RefreshFailed` variant lived
+    // here for the scope-refresh path. That path is deleted, so the variant had
+    // no constructor and no reader; a dead error state reads as a handled
+    // failure mode that cannot occur.
 }
 
 /// A live cgroup identifier from systemd transient scope creation.
@@ -58,74 +57,19 @@ pub struct ScopeHandle {
     /// in canonical deployments (`/system.slice/sanctuary-agent-foo.service`)
     /// but can be 3+ in nested environments (CI runners, Docker-in-Docker)
     /// where the daemon process itself is already inside a deeper cgroup.
-    /// Used by nftables `socket cgroupv2 level <N> "<path>"` rule emission
-    /// so the level matches where systemd actually placed the unit.
+    /// RETIRED CONSUMER: this fed the `socket cgroupv2 level <N> "<path>"`
+    /// emission, which no longer exists (the kernel match is `meta skuid`). It
+    /// is retained as a description of where systemd placed the unit for the
+    /// jail, and nothing in the egress match reads it.
     pub cgroup_level: u32,
 }
 
-/// Configuration for watching one agent's systemd unit for cgroup
-/// recreation. The ruleset script is the already-rendered normal policy body
-/// for the agent chain. Refresh installs a temporary fail-closed chain for
-/// the refreshed cgroup before restoring this normal ruleset.
-#[derive(Debug, Clone)]
-pub struct ScopeRefreshRegistration {
-    pub handle: ScopeHandle,
-    pub ruleset_script: String,
-    pub poll_interval: Duration,
-}
-
-/// Operator-visible diagnostic state for scope refresh.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScopeRefreshDiagnostic {
-    pub agent_id: String,
-    pub scope_unit: String,
-    pub old_cgroup_id: u64,
-    pub new_cgroup_id: Option<u64>,
-    pub state: ScopeRefreshState,
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScopeRefreshState {
-    RefreshStarted,
-    FailClosedInstalled,
-    RulesetRestored,
-    RefreshFailed,
-}
-
-/// Background watcher returned by [`register_scope_journal_listener`].
-/// Dropping or stopping the watcher ends the polling thread.
-pub struct ScopeRefreshWatcher {
-    stop: Arc<AtomicBool>,
-    diagnostics: Arc<Mutex<Vec<ScopeRefreshDiagnostic>>>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl ScopeRefreshWatcher {
-    pub fn stop(mut self) -> Vec<ScopeRefreshDiagnostic> {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        self.diagnostics()
-    }
-
-    pub fn diagnostics(&self) -> Vec<ScopeRefreshDiagnostic> {
-        self.diagnostics
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
-    }
-}
-
-impl Drop for ScopeRefreshWatcher {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
+// RETIRED with the cgroup-identity match (A104 option B): the scope-refresh
+// registration, its diagnostic types and its background watcher existed only to
+// re-resolve a cgroup id after systemd recreated an agent's scope. The kernel
+// match no longer depends on cgroup resolution at all — a restarted agent gets a
+// new pid and a new cgroup but the SAME uid, so the installed rule stays correct
+// and there is nothing to refresh. Scope creation is retained below for jailing.
 
 /// Derive the systemd transient unit name from an agent id.
 ///
@@ -150,10 +94,11 @@ pub fn cgroup_path_for_scope(scope_unit: &str) -> PathBuf {
 
 /// Compute the cgroup-v2 relative path string from a `ScopeHandle`.
 ///
-/// nftables `socket cgroupv2 level <N> "<path>"` rules expect the cgroup
+/// RETIRED CONSUMER: this shape existed for `socket cgroupv2 level <N>
+/// "<path>"` rules, which this daemon no longer emits. It returns the cgroup
 /// path with the `/sys/fs/cgroup/` prefix stripped, no leading slash, no
-/// trailing slash (e.g. `system.slice/sanctuary-agent-foo.service`). The
-/// kernel walks `/sys/fs/cgroup/<path>` at rule-load time at depth N.
+/// trailing slash (e.g. `system.slice/sanctuary-agent-foo.service`), and is now
+/// a description of the jail's placement, not an input to any egress match.
 ///
 /// Returns `CgroupError::PathNotFound` if the absolute path does not start
 /// with `/sys/fs/cgroup/`, which would indicate the daemon resolved the
@@ -230,10 +175,10 @@ mod linux {
     /// `systemctl show --property=ControlGroup` (the canonical source of
     /// truth) rather than synthesized from the unit name. This avoids
     /// drift between the daemon's path assumption and where systemd 255
-    /// actually places the cgroup, and it lets nft's
-    /// `socket cgroupv2 level 2 "<path>"` rule lookup find the cgroup at
-    /// rule-load time. Waits for the unit to reach `active` state before
-    /// resolving so the cgroup inode is stable.
+    /// actually places the cgroup. It no longer feeds an nft
+    /// `socket cgroupv2 level 2 "<path>"` lookup: that emission is retired and
+    /// the egress match reads socket credentials instead. Waits for the unit to
+    /// reach `active` state before resolving so the cgroup inode is stable.
     pub fn create_agent_scope_impl(agent_id: &str) -> Result<ScopeHandle, CgroupError> {
         let unit = scope_unit_name(agent_id);
         let output = Command::new("systemd-run")
@@ -323,11 +268,13 @@ mod linux {
         })
     }
 
-    /// Resolve the cgroup inode ID for an nftables `socket cgroupv2` match.
-    /// This is the cgroup-id-renumbering gotcha from scope-lock section 1:
-    /// nftables resolves paths to inode IDs at rule-load time, so we must
-    /// re-resolve and re-install rules when a scope is destroyed and
-    /// recreated.
+    /// Resolve the cgroup inode ID of the jail scope.
+    ///
+    /// RETIRED CONSUMER: this served the `socket cgroupv2` match, where the
+    /// renumbering gotcha from scope-lock section 1 (nftables resolves paths to
+    /// inode IDs at rule-load time, so a destroyed-and-recreated scope needed a
+    /// re-resolve and a re-install) applied. No egress rule reads a cgroup id
+    /// now, so nothing re-resolves; the id remains only as scope identity.
     pub fn resolve_cgroup_id(cgroup_path: &Path) -> Result<u64, CgroupError> {
         use std::os::unix::fs::MetadataExt;
         let meta = fs::metadata(cgroup_path).map_err(|e| {
@@ -370,61 +317,6 @@ mod linux {
                 e
             ))
         })
-    }
-
-    pub fn refresh_scope_ruleset(
-        current: &ScopeHandle,
-        refreshed: &ScopeHandle,
-        ruleset_script: &str,
-    ) -> Result<Vec<ScopeRefreshDiagnostic>, CgroupError> {
-        let cgroup_relative = cgroup_relative_path(refreshed)?;
-        let ruleset_id = crate::nftables::AgentRulesetId {
-            agent_id: refreshed.agent_id.clone(),
-            cgroup_path: refreshed.cgroup_path.clone(),
-        };
-        let mut diagnostics = Vec::new();
-        diagnostics.push(ScopeRefreshDiagnostic {
-            agent_id: refreshed.agent_id.clone(),
-            scope_unit: refreshed.scope_unit.clone(),
-            old_cgroup_id: current.cgroup_id,
-            new_cgroup_id: Some(refreshed.cgroup_id),
-            state: ScopeRefreshState::RefreshStarted,
-            detail: "systemd scope cgroup identity changed; refreshing Castle Wall jump"
-                .to_string(),
-        });
-
-        crate::nftables::load_agent_fail_closed_ruleset(
-            &ruleset_id,
-            refreshed.cgroup_level,
-            &cgroup_relative,
-        )
-        .map_err(|e| CgroupError::RefreshFailed(format!("install fail-closed ruleset: {e}")))?;
-        diagnostics.push(ScopeRefreshDiagnostic {
-            agent_id: refreshed.agent_id.clone(),
-            scope_unit: refreshed.scope_unit.clone(),
-            old_cgroup_id: current.cgroup_id,
-            new_cgroup_id: Some(refreshed.cgroup_id),
-            state: ScopeRefreshState::FailClosedInstalled,
-            detail: "refreshed cgroup is temporarily fail-closed".to_string(),
-        });
-
-        crate::nftables::load_agent_ruleset(
-            &ruleset_id,
-            ruleset_script,
-            refreshed.cgroup_level,
-            &cgroup_relative,
-        )
-        .map_err(|e| CgroupError::RefreshFailed(format!("restore agent ruleset: {e}")))?;
-        diagnostics.push(ScopeRefreshDiagnostic {
-            agent_id: refreshed.agent_id.clone(),
-            scope_unit: refreshed.scope_unit.clone(),
-            old_cgroup_id: current.cgroup_id,
-            new_cgroup_id: Some(refreshed.cgroup_id),
-            state: ScopeRefreshState::RulesetRestored,
-            detail: "refreshed cgroup jump restored with current agent ruleset".to_string(),
-        });
-
-        Ok(diagnostics)
     }
 }
 
@@ -497,103 +389,10 @@ pub fn classify_pid(_cgroup_path: &Path, _pid: u32) -> Result<(), CgroupError> {
     Err(CgroupError::NotAvailableOnPlatform)
 }
 
-/// Register a lifecycle listener that re-installs nftables rules if the
-/// agent's transient systemd unit is destroyed and recreated under a new
-/// cgroup id (the cgroup-id renumbering gotcha).
-///
-/// The implementation uses systemd's ControlGroup as the reliable source of
-/// truth and polls it from a dedicated watcher thread. Polling is deliberate:
-/// it avoids adding an sd-journal binding while still observing the same
-/// lifecycle signal the journal would carry. On change, refresh is staged as:
-/// resolve new cgroup, atomically wire a fail-closed drop chain for that
-/// cgroup, then atomically restore the normal agent ruleset and refreshed
-/// jump. Diagnostics are retained on the watcher for operator surfaces.
-#[cfg(target_os = "linux")]
-pub fn register_scope_journal_listener(
-    registration: ScopeRefreshRegistration,
-) -> Result<ScopeRefreshWatcher, CgroupError> {
-    let stop = Arc::new(AtomicBool::new(false));
-    let diagnostics = Arc::new(Mutex::new(Vec::new()));
-    let thread_stop = Arc::clone(&stop);
-    let thread_diagnostics = Arc::clone(&diagnostics);
-
-    let thread = std::thread::Builder::new()
-        .name(format!(
-            "castle-cgroup-refresh-{}",
-            registration.handle.agent_id
-        ))
-        .spawn(move || {
-            let mut current = registration.handle;
-            let poll_interval = registration.poll_interval;
-            while !thread_stop.load(Ordering::SeqCst) {
-                std::thread::sleep(poll_interval);
-                if thread_stop.load(Ordering::SeqCst) {
-                    break;
-                }
-
-                let refreshed = match query_scope_handle(&current.agent_id, &current.scope_unit) {
-                    Ok(handle) => handle,
-                    Err(err) => {
-                        if let Ok(mut guard) = thread_diagnostics.lock() {
-                            guard.push(ScopeRefreshDiagnostic {
-                                agent_id: current.agent_id.clone(),
-                                scope_unit: current.scope_unit.clone(),
-                                old_cgroup_id: current.cgroup_id,
-                                new_cgroup_id: None,
-                                state: ScopeRefreshState::RefreshFailed,
-                                detail: format!("scope query failed: {err}"),
-                            });
-                        }
-                        continue;
-                    }
-                };
-
-                if !scope_identity_changed(&current, &refreshed) {
-                    continue;
-                }
-
-                match linux::refresh_scope_ruleset(
-                    &current,
-                    &refreshed,
-                    &registration.ruleset_script,
-                ) {
-                    Ok(events) => {
-                        if let Ok(mut guard) = thread_diagnostics.lock() {
-                            guard.extend(events);
-                        }
-                        current = refreshed;
-                    }
-                    Err(err) => {
-                        if let Ok(mut guard) = thread_diagnostics.lock() {
-                            guard.push(ScopeRefreshDiagnostic {
-                                agent_id: refreshed.agent_id.clone(),
-                                scope_unit: refreshed.scope_unit.clone(),
-                                old_cgroup_id: current.cgroup_id,
-                                new_cgroup_id: Some(refreshed.cgroup_id),
-                                state: ScopeRefreshState::RefreshFailed,
-                                detail: err.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        })
-        .map_err(|e| CgroupError::RefreshFailed(format!("spawn refresh watcher: {e}")))?;
-
-    Ok(ScopeRefreshWatcher {
-        stop,
-        diagnostics,
-        thread: Some(thread),
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn register_scope_journal_listener(
-    _registration: ScopeRefreshRegistration,
-) -> Result<ScopeRefreshWatcher, CgroupError> {
-    Err(CgroupError::NotAvailableOnPlatform)
-}
-
+/// Whether two observations of the same agent's scope describe DIFFERENT cgroup
+/// objects. No longer consulted by any enforcement path: it is a pure
+/// observation helper retained for diagnostics, because a scope recreation is
+/// still worth SEEING even though it no longer invalidates the kernel binding.
 pub fn scope_identity_changed(previous: &ScopeHandle, current: &ScopeHandle) -> bool {
     previous.cgroup_id != current.cgroup_id
         || previous.cgroup_path != current.cgroup_path

@@ -313,5 +313,11 @@ fn live_owned_identity() -> Result<nftables::CastleTableOwnership, String> {
     }
     let json =
         std::str::from_utf8(&output.stdout).map_err(|err| format!("non-utf8 nft json: {err}"))?;
-    nftables::parse_owned_table_identity(json).map_err(|err| format!("not an owned table: {err}"))
+    // NoneConfined: these lifecycle tests wrap no agent, so a per-agent binding
+    // in the table would be state this helper cannot vouch for and must refuse.
+    nftables::parse_owned_table_identity(
+        json,
+        &castle_wall_daemon::nftables::ExpectedAgentBinding::NoneConfined,
+    )
+    .map_err(|err| format!("not an owned table: {err}"))
 }
