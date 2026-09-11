@@ -1,3 +1,4 @@
+// fail-before-exempt: current change only initializes custody for the existing confirmed-gate fixture, preserving its unchanged helper-call assertion. Enrolled-custody re-pin behavior is covered by castle-wall-repin-custody.test.ts.
 /**
  * The vault-level Castle Wall state, and the confirmation gate on the one verb
  * that moves this machine's trust anchor.
@@ -37,6 +38,7 @@ import { runRePin, runStatus } from "../../src/cli/castle-wall.js";
 import { runDoctorChecks } from "../../src/cli/doctor.js";
 import { renderTable } from "../../src/cli/status.js";
 import { classifyMetaKey } from "../../src/core/master-rotation.js";
+import { initializeTestCustody } from "../helpers/custody-fixture.js";
 
 /** Collect a CLI writable's output. */
 function capture(chunks: string[]): Writable {
@@ -318,20 +320,30 @@ describe("castle-wall re-pin is operator-present, in code", () => {
     // Past the gate is all this asserts: the migration itself needs a real
     // signer helper, so the proof here is that the gate stopped refusing and
     // the helper was actually asked.
-    let installPinCalls = 0;
-    const code = await runRePin([], {
-      out: silent(),
-      err: silent(),
-      env: { SANCTUARY_STORAGE_PATH: "/nonexistent-fortress" },
-      platform: "darwin",
-      confirmStdin: Readable.from(["re-pin\n"]),
-      signerClientInvoke: async (_args: string[], _stdin: Uint8Array | null) => {
-        installPinCalls += 1;
-        return { stdout: "", stderr: "helper unavailable in this test", code: 1 };
-      },
-    });
+    const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-repin-confirmed-"));
+    try {
+      const passphrase = "test-confirmed-repin-passphrase";
+      await initializeTestCustody(fortressPath, { passphrase });
+      let installPinCalls = 0;
+      const code = await runRePin([], {
+        out: silent(),
+        err: silent(),
+        env: {
+          SANCTUARY_STORAGE_PATH: fortressPath,
+          SANCTUARY_PASSPHRASE: passphrase,
+        },
+        platform: "darwin",
+        confirmStdin: Readable.from(["re-pin\n"]),
+        signerClientInvoke: async (_args: string[], _stdin: Uint8Array | null) => {
+          installPinCalls += 1;
+          return { stdout: "", stderr: "helper unavailable in this test", code: 1 };
+        },
+      });
 
-    expect(installPinCalls).toBeGreaterThan(0);
-    expect(code).toBe(1);
+      expect(installPinCalls).toBeGreaterThan(0);
+      expect(code).toBe(1);
+    } finally {
+      await rm(fortressPath, { recursive: true, force: true });
+    }
   });
 });

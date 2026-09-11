@@ -1515,6 +1515,9 @@ describe("castle-wall audit-chain operator override", () => {
 
     expect(code).not.toBe(0);
     expect(err.text()).toContain("audit integrity findings");
+    expect(out.text()).toMatch(/^[a-f0-9]{16}\n/);
+    expect(err.text()).toContain("Trust anchor migrated");
+    expect(err.text()).toContain("rotation proof was not recorded");
     // No override entry was written — the fail-closed default did not consent.
     const ops = await readAuditOperations(fortressPath, masterKey);
     expect(
@@ -1863,15 +1866,15 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
     }
   });
 
-  // ── F2b: don't mask a successful migration behind a post-migration error ──
+  // ── F2b: truthfully report migration but fail incomplete audit work ───────
 
-  it("F2b: post-migration audit failure degrades to a warning, prints fp, exits 0", async () => {
+  it("F2b: post-migration audit failure reports the moved pin and exits nonzero", async () => {
     const { fortressPath } = await makeFortress();
     const helper = makeMockHelper();
     // installPin() succeeds (mock helper), but resolveMasterKey FAILS because the
     // supplied recovery key does not match the fortress's recovery-key-hash
     // marker. That throw lands in the POST-migration audit-bookkeeping phase, so
-    // the migration must NOT be reported as a failure.
+    // the migration remains visible while the incomplete operation exits nonzero.
     const out = new CaptureStream();
     const err = new CaptureStream();
     const code = await runRePin([], {
@@ -1888,7 +1891,7 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
       platform: "darwin",
       signerClientInvoke: helper.invoke,
     });
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     // The migrated fingerprint is still printed to stdout.
     expect(out.text()).toContain(fingerprint(helper.pub));
     // The warning explains the audit-record failure but affirms the migration.
