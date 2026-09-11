@@ -1659,8 +1659,9 @@ export async function runRePin(
       storagePath,
       env,
       storage,
-      // Re-pin authenticates an existing fortress before moving a machine-wide
-      // anchor. This read-only probe must never mint custody as a side effect.
+      // Resolve an existing custody factor without minting one. Authentication
+      // remains in the post-migration audit phase; a wrong explicit factor can
+      // still move the anchor, then returns nonzero with the partial outcome.
       allowMint: false,
     });
     if (resolution.status === "resolved") resolvedCredential = resolution.credential;

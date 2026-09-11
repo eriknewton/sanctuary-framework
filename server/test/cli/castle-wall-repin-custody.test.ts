@@ -22,10 +22,15 @@ import {
   establishMaster,
   verifyRecoveryWrapByReentry,
 } from "../../src/core/master-custody.js";
+import * as masterCustody from "../../src/core/master-custody.js";
 import { toBase64url } from "../../src/core/encoding.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { withExclusiveMasterRotationBarrier } from "../../src/storage/cross-process-lock.js";
 import { getOrCreateKeychainCustodyKey } from "../../src/wrap/keychain-custody.js";
-import type { CustodyCredentialResolution } from "../../src/wrap/custody-credential.js";
+import {
+  resolveFortressCustodyCredential,
+  type CustodyCredentialResolution,
+} from "../../src/wrap/custody-credential.js";
 import type { ShimInvoker } from "../../src/castle-wall/runtime/helper-signer.js";
 
 class CaptureStream extends Writable {
@@ -126,6 +131,25 @@ async function provisionLocalPin(
   if (code !== 0) throw new Error(`test local pin provisioning failed: ${err.text()}`);
 }
 
+function expectLiveSecret(buffer: Uint8Array | undefined, label: string): asserts buffer is Uint8Array {
+  expect(buffer, `${label} was captured from the real custody path`).toBeInstanceOf(Uint8Array);
+  expect(buffer!.some((byte) => byte !== 0), `${label} was live before cleanup`).toBe(true);
+}
+
+async function expectMasterRotationBarrierReleased(fortressPath: string): Promise<void> {
+  let enteredExclusiveSection = false;
+  await withExclusiveMasterRotationBarrier(
+    new FilesystemStorage(join(fortressPath, "state")),
+    masterCustody.CUSTODY_WRITE_LOCK_NAMESPACE,
+    masterCustody.MASTER_ROTATION_BARRIER_NAME,
+    async () => {
+      enteredExclusiveSection = true;
+    },
+    { timeoutMs: 1_000, retryMs: 10 },
+  );
+  expect(enteredExclusiveSection).toBe(true);
+}
+
 describe("castle-wall re-pin enrolled custody", () => {
   const tempDirs: string[] = [];
 
@@ -143,6 +167,17 @@ describe("castle-wall re-pin enrolled custody", () => {
     try {
       await provisionLocalPin(fortressPath, masterKey);
 
+      let rePinMasterKey: Uint8Array | undefined;
+      let resolvedKeychainKey: Uint8Array | undefined;
+      let releaseCalls = 0;
+      let releaseLeakedLease: (() => Promise<void>) | undefined;
+      const realEstablishMaster = masterCustody.establishMaster;
+      vi.spyOn(masterCustody, "establishMaster").mockImplementation(async (options) => {
+        const established = await realEstablishMaster(options);
+        rePinMasterKey = established.masterKey;
+        return established;
+      });
+
       const helper = makeMockHelper();
       const code = await runRePin([], {
         confirmStdin: Readable.from(["re-pin\n"]),
@@ -151,9 +186,35 @@ describe("castle-wall re-pin enrolled custody", () => {
         env: { SANCTUARY_STORAGE_PATH: fortressPath },
         platform: "darwin",
         signerClientInvoke: helper.invoke,
+        __testResolveRePinCustodyCredential: async (options) => {
+          const resolution = await resolveFortressCustodyCredential(options);
+          if (resolution.status === "resolved" && resolution.credential.kind === "keychain-key") {
+            resolvedKeychainKey = resolution.credential.keychainKey;
+          }
+          return resolution;
+        },
+        __testAfterRePinMasterEstablished: (lease) => {
+          expectLiveSecret(rePinMasterKey, "runRePin master key");
+          expectLiveSecret(resolvedKeychainKey, "resolved keychain credential");
+          if (lease === undefined) throw new Error("test expected a master-write barrier");
+          const originalRelease = lease.release.bind(lease);
+          releaseLeakedLease = originalRelease;
+          vi.spyOn(lease, "release").mockImplementation(async () => {
+            releaseCalls += 1;
+            await originalRelease();
+          });
+        },
       });
 
       expect(code).toBe(0);
+      expect(rePinMasterKey).toEqual(new Uint8Array(rePinMasterKey!.length));
+      expect(resolvedKeychainKey).toEqual(new Uint8Array(resolvedKeychainKey!.length));
+      try {
+        await expectMasterRotationBarrierReleased(fortressPath);
+      } finally {
+        if (releaseCalls === 0) await releaseLeakedLease?.();
+      }
+      expect(releaseCalls).toBe(1);
       const audit = new AuditLog(
         new FilesystemStorage(join(fortressPath, "state")),
         masterKey,
@@ -187,6 +248,7 @@ describe("castle-wall re-pin enrolled custody", () => {
       expect(cleanupCode).toBe(1);
       expect(cleanupErr.text()).toContain("migration and its audit record completed");
       expect(cleanupErr.text()).toContain("test cleanup failure");
+      await expectMasterRotationBarrierReleased(fortressPath);
     } finally {
       masterKey.fill(0);
     }
@@ -225,6 +287,17 @@ describe("castle-wall re-pin enrolled custody", () => {
         new_pin_fingerprint: createHash("sha256").update(helper.pub).digest("hex").slice(0, 16),
       });
 
+      let rePinMasterKey: Uint8Array | undefined;
+      let resolvedKeychainKey: Uint8Array | undefined;
+      let releaseCalls = 0;
+      let releaseLeakedLease: (() => Promise<void>) | undefined;
+      const realEstablishMaster = masterCustody.establishMaster;
+      vi.spyOn(masterCustody, "establishMaster").mockImplementation(async (options) => {
+        const established = await realEstablishMaster(options);
+        rePinMasterKey = established.masterKey;
+        return established;
+      });
+
       const flush = vi.spyOn(AuditLog.prototype, "flush").mockRejectedValue(
         new Error("test required audit flush failure"),
       );
@@ -237,6 +310,24 @@ describe("castle-wall re-pin enrolled custody", () => {
         env: { SANCTUARY_STORAGE_PATH: fortressPath },
         platform: "darwin",
         signerClientInvoke: helper.invoke,
+        __testResolveRePinCustodyCredential: async (options) => {
+          const resolution = await resolveFortressCustodyCredential(options);
+          if (resolution.status === "resolved" && resolution.credential.kind === "keychain-key") {
+            resolvedKeychainKey = resolution.credential.keychainKey;
+          }
+          return resolution;
+        },
+        __testAfterRePinMasterEstablished: (lease) => {
+          expectLiveSecret(rePinMasterKey, "runRePin master key");
+          expectLiveSecret(resolvedKeychainKey, "resolved keychain credential");
+          if (lease === undefined) throw new Error("test expected a master-write barrier");
+          const originalRelease = lease.release.bind(lease);
+          releaseLeakedLease = originalRelease;
+          vi.spyOn(lease, "release").mockImplementation(async () => {
+            releaseCalls += 1;
+            await originalRelease();
+          });
+        },
       });
 
       expect(code).toBe(1);
@@ -244,6 +335,14 @@ describe("castle-wall re-pin enrolled custody", () => {
       expect(err.text()).toContain("recording the rotation proof in the audit log failed");
       expect(err.text()).toContain("pin migration itself succeeded");
       expect(flush).toHaveBeenCalledTimes(1);
+      expect(rePinMasterKey).toEqual(new Uint8Array(rePinMasterKey!.length));
+      expect(resolvedKeychainKey).toEqual(new Uint8Array(resolvedKeychainKey!.length));
+      try {
+        await expectMasterRotationBarrierReleased(fortressPath);
+      } finally {
+        if (releaseCalls === 0) await releaseLeakedLease?.();
+      }
+      expect(releaseCalls).toBe(1);
     } finally {
       masterKey.fill(0);
     }
