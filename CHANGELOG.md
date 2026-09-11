@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [1.8.6] - 2026-09-08
 
-One first-install fix on top of v1.8.5. No new capability; the capability bounds in the v1.8.4 notes stand. v1.8.5 was tagged and built but not published: its own acceptance run caught this defect on the exact install path.
+First-install fixes on top of v1.8.5. No new capability; the capability bounds in the v1.8.4 notes stand. v1.8.5 was tagged and built but not published: its own acceptance run found issues on the exact install path.
 
 ### Fixed
 
@@ -19,6 +19,12 @@ One first-install fix on top of v1.8.5. No new capability; the capability bounds
   surface that reports wall state (`doctor`, `status`, the dashboard, the MCP health and attestation
   tools) renders whether a vault has completed that step, and treats an unreadable record as not
   walled rather than as protected; a record that is absent carries no claim.
+- A confirmed `castle-wall re-pin` uses the credential already enrolled for that exact fortress,
+  refuses when no usable custody credential exists, clears resolved key material after use, and
+  reports a nonzero result if the required audit record cannot be persisted.
+- A dashboard opened with a launch session carries that session through same-origin reads and event
+  streams, so the initial authenticated view and its live data use the same read authority. Mutation
+  requests and cross-origin destinations never receive the launch session.
 
 ## [1.8.5] - 2026-09-08
 
