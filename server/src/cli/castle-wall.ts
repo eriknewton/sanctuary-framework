@@ -41,6 +41,11 @@ import {
   getOrCreatePassphrase,
   observeStoredPassphrase,
 } from "../wrap/passphrase.js";
+import {
+  custodyCredentialRefusal,
+  resolveFortressCustodyCredential,
+  type ResolvedCustodyCredential,
+} from "../wrap/custody-credential.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { readFileCustody, writeFileCustody } from "../storage/custody-fs.js";
 import {
@@ -222,6 +227,10 @@ export interface CastleWallCommandContext {
   signerClientPath?: string;
   /** Override the shim runner (tests drive re-pin without a real helper). */
   signerClientInvoke?: ShimInvoker;
+  /** TEST ONLY: resolve re-pin custody through a controlled in-memory seam. */
+  __testResolveRePinCustodyCredential?: typeof resolveFortressCustodyCredential;
+  /** TEST ONLY: observe the re-pin lease before its final cleanup. */
+  __testAfterRePinMasterEstablished?: (lease: { release(): Promise<void> } | undefined) => void;
   /**
    * Override the auto-discovery candidate list for the signer-client shim
    * (tests drive bundle auto-discovery without a real /Applications install).
@@ -1639,71 +1648,97 @@ export async function runRePin(
   // shim is even resolved, so a refusal leaves the machine byte-identical.
   if (!(await confirmRePinInteractively(ctx, err, storagePath))) return 1;
 
-  const clientBinaryPath =
-    (await resolveSignerClientPath(env, platform, ctx)) ??
-    ctx.signerClientPath ??
-    env.SANCTUARY_CASTLE_SIGNER_CLIENT;
-  if (!clientBinaryPath && !ctx.signerClientInvoke) {
-    write(
-      err,
-      "Cannot re-pin: signer-client shim path unknown. Set SANCTUARY_CASTLE_SIGNER_CLIENT or install the Castle Wall app (which bundles it).\n",
-    );
-    return 1;
-  }
-
-  const client = new HelperSignerClient({
-    clientBinaryPath: clientBinaryPath ?? "castle-wall-signer-client",
-    // The shim runs its OWN confirmation for `re-pin` (it is directly
-    // executable, and the helper's caller check authenticates the binary, not
-    // operator presence), so the operator's terminal is handed through rather
-    // than piped. The gate above and the shim's gate are deliberately two
-    // separate asks: this one can be reached only through the CLI, that one
-    // covers every way the shim can be executed.
-    interactiveTerminal: true,
-    // The operator has to read a prompt and type a word inside this deadline;
-    // the 10s default is the DAEMON's per-signature liveness bound and is far
-    // too short for a person. Failure mode if the default is kept: the shim is
-    // SIGKILLed mid-prompt and the operator sees "shim timed out".
-    timeoutMs: RE_PIN_SHIM_CONFIRMATION_TIMEOUT_MS,
-    ...(ctx.signerClientInvoke ? { invoke: ctx.signerClientInvoke } : {}),
-  });
-
-  // PRE-MIGRATION phase: any failure here (shim unreachable, bad key length,
-  // etc.) means the trust anchor did NOT move - report failure and return 1.
-  let helperPub: Uint8Array;
+  const storage = new FilesystemStorage(join(storagePath, "state"));
+  let resolvedCredential: ResolvedCustodyCredential | null = null;
   try {
-    // Ask the helper to (re)write the root-owned pin with K_helper and return it.
-    helperPub = await client.installPin();
-  } catch (error) {
-    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
-    return 1;
-  }
-  if (helperPub.length !== ED25519_PUBLIC_KEY_BYTES) {
-    write(err, `Helper returned a ${helperPub.length}-byte key (expected 32).\n`);
-    return 1;
-  }
-  const helperFingerprint = fingerprintFromPublicKey(helperPub);
+    const resolution = await (ctx.__testResolveRePinCustodyCredential ??
+      resolveFortressCustodyCredential)({
+      storagePath,
+      env,
+      storage,
+      // Resolve an existing custody factor without minting one. Authentication
+      // remains in the post-migration audit phase; a wrong explicit factor can
+      // still move the anchor, then returns nonzero with the partial outcome.
+      allowMint: false,
+    });
+    if (resolution.status === "resolved") resolvedCredential = resolution.credential;
 
-  // POST-MIGRATION phase: `installPin()` succeeded, so the trust anchor IS
-  // migrated to the helper key. Everything below is audit bookkeeping (reading
-  // the retiring key, deriving the master key, recording the rotation proof).
-  // F2b - a failure HERE (e.g. `aes/gcm: invalid ghash tag` when the fortress
-  // material can't be decrypted) must NOT be reported as a re-pin failure:
-  // telling the operator the migration failed when the anchor actually moved is
-  // the more dangerous lie. Degrade to a loud warning and still return 0,
-  // printing the migrated fingerprint.
-  //
-  // FIX 3 - `masterKey` (decrypted fortress secret) is hoisted so a `finally`
-  // zeroes it on EVERY exit from this block: success returns, the
-  // AuditIntegrityError exit-1 path, and the F2b degraded-warning exit-0 path.
-  // A throw between resolveMasterKey() and a return must never leave the
-  // plaintext key resident in memory.
-  let masterKey: Uint8Array | null = null;
-  try {
-    // Read the retiring K_old (the passphrase-derived key provision-pin minted).
-    // Its presence lets us emit the old-signs-new rotation proof for audit
-    // continuity. If it is already gone (a prior re-pin retired it), treat this
-    // as an idempotent re-assert.
+    // A supplied value cannot make an uninitialized directory eligible for an
+    // irreversible anchor migration: no existing fortress can later produce
+    // the required audit record, so refuse before the helper is invoked.
+    if (resolution.report.noCustodyStateAtAll) {
+      write(err, "Cannot re-pin: this fortress has no enrolled custody credential.\n");
+      return 1;
+    }
+    if (resolvedCredential === null) {
+      write(err, `${custodyCredentialRefusal(resolution.report, storagePath).message}\n`);
+      return 1;
+    }
+
+    const clientBinaryPath =
+      (await resolveSignerClientPath(env, platform, ctx)) ??
+      ctx.signerClientPath ??
+      env.SANCTUARY_CASTLE_SIGNER_CLIENT;
+    if (!clientBinaryPath && !ctx.signerClientInvoke) {
+      write(
+        err,
+        "Cannot re-pin: signer-client shim path unknown. Set SANCTUARY_CASTLE_SIGNER_CLIENT or install the Castle Wall app (which bundles it).\n",
+      );
+      return 1;
+    }
+
+    const client = new HelperSignerClient({
+      clientBinaryPath: clientBinaryPath ?? "castle-wall-signer-client",
+      // The shim runs its OWN confirmation for `re-pin` (it is directly
+      // executable, and the helper's caller check authenticates the binary, not
+      // operator presence), so the operator's terminal is handed through rather
+      // than piped. The gate above and the shim's gate are deliberately two
+      // separate asks: this one can be reached only through the CLI, that one
+      // covers every way the shim can be executed.
+      interactiveTerminal: true,
+      // The operator has to read a prompt and type a word inside this deadline;
+      // the 10s default is the DAEMON's per-signature liveness bound and is far
+      // too short for a person. Failure mode if the default is kept: the shim is
+      // SIGKILLed mid-prompt and the operator sees "shim timed out".
+      timeoutMs: RE_PIN_SHIM_CONFIRMATION_TIMEOUT_MS,
+      ...(ctx.signerClientInvoke ? { invoke: ctx.signerClientInvoke } : {}),
+    });
+
+    // PRE-MIGRATION phase: any helper/result failure reports failure and returns
+    // 1. A timeout can leave the pin state unknown, so do not claim it is unchanged.
+    let helperPub: Uint8Array;
+    try {
+      // Ask the helper to (re)write the root-owned pin with K_helper and return it.
+      helperPub = await client.installPin();
+    } catch (error) {
+      write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+      return 1;
+    }
+    if (helperPub.length !== ED25519_PUBLIC_KEY_BYTES) {
+      write(err, `Helper returned a ${helperPub.length}-byte key (expected 32).\n`);
+      return 1;
+    }
+    const helperFingerprint = fingerprintFromPublicKey(helperPub);
+
+    // POST-MIGRATION phase: `installPin()` succeeded, so the trust anchor IS
+    // migrated to the helper key. Everything below is audit bookkeeping (reading
+    // the retiring key, deriving the master key, recording the rotation proof).
+    // A failure HERE leaves the anchor migrated but the overall operation
+    // incomplete: the required durable audit record is missing. Report both
+    // facts truthfully and return nonzero without attempting an unsafe rollback.
+    //
+    // FIX 3 - `masterKey` (decrypted fortress secret) is hoisted so a `finally`
+    // zeroes it on EVERY exit from this block: success returns, the
+    // AuditIntegrityError exit-1 path, and the required-audit failure exit-1 path.
+    // A throw between establishMaster() and a return must never leave the
+    // plaintext key resident in memory.
+    let masterKey: Uint8Array | null = null;
+    let masterWriteBarrier: { release(): Promise<void> } | undefined;
+    let postMigrationCode = 1;
+    try {
+      // Read the retiring K_old (the passphrase-derived key provision-pin minted).
+      // Its presence lets us emit the old-signs-new rotation proof for audit
+      // continuity. If it is already gone, treat this as an idempotent re-assert.
     const pubPath = join(storagePath, CASTLE_PINNED_PUBKEY);
     const privPath = join(storagePath, CASTLE_PINNED_PRIVKEY);
     let oldPub: Uint8Array | null = null;
@@ -1716,8 +1751,19 @@ export async function runRePin(
       oldEnc = null;
     }
 
-    const storage = new FilesystemStorage(join(storagePath, "state"));
-    masterKey = await resolveMasterKey(storagePath, env);
+    const established = await establishMaster({
+      storage,
+      ...(resolvedCredential.kind === "passphrase"
+        ? { passphrase: resolvedCredential.passphrase }
+        : resolvedCredential.kind === "recovery-key"
+          ? { recoveryKey: resolvedCredential.recoveryKey }
+          : { keychainKey: resolvedCredential.keychainKey }),
+      storagePathHint: storagePath,
+      barrierDegradeMode: "read-only",
+    });
+    masterKey = established.masterKey;
+    masterWriteBarrier = established.masterWriteBarrier;
+    ctx.__testAfterRePinMasterEstablished?.(masterWriteBarrier);
     const auditLog = await buildAuditLogForPrivilegedAction({
       storage,
       masterKey,
@@ -1734,80 +1780,120 @@ export async function runRePin(
         // re-running after a prior re-pin where the helper key is now the pin is
         // the idempotent case handled below). Treat equal fingerprints as a
         // no-op re-assert.
+        await auditLog.append(
+          "l1",
+          "policy_loaded",
+          fortressIdFromStoragePath(storagePath),
+          {
+            source: "castle-wall-re-pin",
+            new_pin_fingerprint: helperFingerprint,
+            note: "re-assert (pin already holds helper key)",
+          },
+          "success",
+        );
+        await auditLog.flush();
         write(out, `${helperFingerprint}\n`);
         write(out, "Pin already holds the helper key; re-asserted (no rotation).\n");
-        return 0;
+      } else {
+        const proof = buildPinRotationProof({
+          oldPublicKey: oldPub,
+          oldEncryptedPrivateKey: oldEnc,
+          encryptionKey: masterKey,
+          newPublicKey: helperPub,
+          rotatedAt: new Date().toISOString(),
+        });
+        await auditLog.append(
+          "l1",
+          "policy_loaded",
+          fortressIdFromStoragePath(storagePath),
+          {
+            source: "castle-wall-re-pin",
+            rotation_proof: proof,
+            old_pin_fingerprint: oldFingerprint,
+            new_pin_fingerprint: helperFingerprint,
+          },
+          "success",
+        );
+        await auditLog.flush();
+        write(out, `${helperFingerprint}\n`);
+        write(
+          out,
+          `Trust anchor migrated to the signer helper (was ${oldFingerprint}). Rotation proof recorded in the audit log.\n`,
+        );
       }
-      const proof = buildPinRotationProof({
-        oldPublicKey: oldPub,
-        oldEncryptedPrivateKey: oldEnc,
-        encryptionKey: masterKey,
-        newPublicKey: helperPub,
-        rotatedAt: new Date().toISOString(),
-      });
+    } else {
+      // No retiring key on disk: idempotent re-assert (already migrated earlier).
       await auditLog.append(
         "l1",
         "policy_loaded",
         fortressIdFromStoragePath(storagePath),
         {
           source: "castle-wall-re-pin",
-          rotation_proof: proof,
-          old_pin_fingerprint: oldFingerprint,
           new_pin_fingerprint: helperFingerprint,
+          note: "re-assert (no retiring key present)",
         },
         "success",
       );
       await auditLog.flush();
       write(out, `${helperFingerprint}\n`);
-      write(
-        out,
-        `Trust anchor migrated to the signer helper (was ${oldFingerprint}). Rotation proof recorded in the audit log.\n`,
-      );
-      return 0;
+      write(out, "Pin re-asserted to the helper key (no retiring key to rotate).\n");
     }
-
-    // No retiring key on disk: idempotent re-assert (already migrated earlier).
-    await auditLog.append(
-      "l1",
-      "policy_loaded",
-      fortressIdFromStoragePath(storagePath),
-      {
-        source: "castle-wall-re-pin",
-        new_pin_fingerprint: helperFingerprint,
-        note: "re-assert (no retiring key present)",
-      },
-      "success",
-    );
-    await auditLog.flush();
-    write(out, `${helperFingerprint}\n`);
-    write(out, "Pin re-asserted to the helper key (no retiring key to rotate).\n");
-    return 0;
-  } catch (error) {
+    postMigrationCode = 0;
+    } catch (error) {
     // The broken-audit-chain refusal (no --accept-broken-chain) is a DELIBERATE
     // fail-closed gate, not an incidental bookkeeping error. Preserve it exactly
     // as before: surface it and return 1. F2b must not weaken this gating.
     if (error instanceof AuditIntegrityError) {
+      write(out, `${helperFingerprint}\n`);
       write(err, `Error: ${error.message}\n`);
-      return 1;
+      write(
+        err,
+        `Trust anchor migrated to ${helperFingerprint}, but the rotation proof was not recorded because the audit chain is broken.\n`,
+      );
+      postMigrationCode = 1;
+    } else {
+      // The pin migrated, but a required audit record did not become durable.
+      // Keep the anchor result visible while returning failure for the incomplete
+      // operation; callers must not treat a missing custody audit as success.
+      const reason = error instanceof Error ? error.message : String(error);
+      write(out, `${helperFingerprint}\n`);
+      write(
+        err,
+        `Trust anchor migrated to ${helperFingerprint}, but recording the rotation ` +
+          `proof in the audit log failed: ${reason}. The pin migration itself succeeded.\n`,
+      );
+      postMigrationCode = 1;
     }
-    // F2b - the pin migrated, but recording the rotation proof failed for an
-    // incidental reason (e.g. `aes/gcm: invalid ghash tag` when fortress
-    // material can't be decrypted). Do NOT report re-pin failure: emit a
-    // warning, print the migrated fingerprint, and return 0. The anchor IS
-    // migrated; claiming failure would be the more dangerous lie.
-    const reason = error instanceof Error ? error.message : String(error);
-    write(out, `${helperFingerprint}\n`);
-    write(
-      err,
-      `Trust anchor migrated to ${helperFingerprint}, but recording the rotation ` +
-        `proof in the audit log failed: ${reason}. The pin migration itself succeeded.\n`,
-    );
-    return 0;
-  } finally {
+    } finally {
     // FIX 3 - zero the decrypted fortress key on every exit (success,
-    // AuditIntegrityError exit-1, F2b degraded exit-0, or any throw between
-    // resolveMasterKey() and a return). No-op when resolveMasterKey() never ran.
-    masterKey?.fill(0);
+    // AuditIntegrityError exit-1, required-audit failure exit-1, or any throw between
+    // establishMaster() and a return). No-op when establishment never ran.
+      masterKey?.fill(0);
+      // A successful establishment owns this shared reader until the final
+      // master-derived audit write. A read-only degraded lease permits reads
+      // but its first master-derived write refuses, so audit durability stays closed.
+      try {
+        await masterWriteBarrier?.release();
+      } catch (releaseError) {
+        const detail = releaseError instanceof Error ? releaseError.message : String(releaseError);
+        write(
+          err,
+          postMigrationCode === 0
+            ? `Trust anchor migration and its audit record completed, but master-write barrier cleanup failed: ${detail}.\n`
+            : `Error: master-write barrier release failed: ${detail}\n`,
+        );
+        // Cleanup failure makes the whole command incomplete, but the
+        // post-migration diagnostic above remains intact if one was emitted.
+        postMigrationCode = 1;
+      }
+    }
+    return postMigrationCode;
+  } finally {
+    // The resolver transfers ownership of a selected OS-keyring buffer to this
+    // command. Scrub it even when pre-migration helper work or audit fails.
+    if (resolvedCredential?.kind === "keychain-key") {
+      resolvedCredential.keychainKey.fill(0);
+    }
   }
 }
 
