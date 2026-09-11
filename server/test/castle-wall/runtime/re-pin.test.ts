@@ -1,4 +1,4 @@
-// fail-before-exempt: harness-only edit. Every runRePin call gains the confirmStdin seam the new interactive-only gate requires; no assertion in this file changed, and the gate itself is proven in test/cli/castle-wall-vault-provision-state.test.ts (non-TTY refusal, wrong-answer abort, confirmed pass-through).
+// fail-before-exempt: current change only initializes custody for the existing missing-shim fixture, so it reaches its unchanged shim-path assertion. Enrolled-custody re-pin behavior is covered by cli/castle-wall-repin-custody.test.ts.
 /**
  * Tests for the A2/B2 re-pin (trust-anchor migration) flow.
  *
@@ -200,23 +200,33 @@ describe("castle-wall re-pin : runRePin", () => {
   });
 
   it("fails when no signer-client is configured and none auto-discovered", async () => {
-    const err = capture();
-    const rc = await runRePin([], {
-      // The re-pin confirmation gate is interactive-only; every test drives
-      // it through the same seam the house pattern uses.
-      confirmStdin: Readable.from(["re-pin\n"]),
-      out: silent,
-      err: err.stream,
-      env: { SANCTUARY_STORAGE_PATH: "/tmp/does-not-matter" },
-      platform: "darwin",
-      // F1 (drill 06-13): re-pin now auto-discovers the bundled shim on darwin.
-      // Pin the discovery seam to "nothing found" so this fail-closed test is
-      // independent of whether the build host has the Castle Wall app installed.
-      signerClientCandidates: [],
-      fileExistsFn: async () => false,
-    });
-    expect(rc).toBe(1);
-    expect(err.text()).toMatch(/signer-client shim path unknown/);
+    const fortressPath = await mkdtemp(join(tmpdir(), "cw-repin-no-shim-"));
+    try {
+      const recoveryKey = toBase64url(generateRandomKey());
+      await initializeTestCustody(fortressPath, { recoveryKey });
+      const err = capture();
+      const rc = await runRePin([], {
+        // The re-pin confirmation gate is interactive-only; every test drives
+        // it through the same seam the house pattern uses.
+        confirmStdin: Readable.from(["re-pin\n"]),
+        out: silent,
+        err: err.stream,
+        env: {
+          SANCTUARY_STORAGE_PATH: fortressPath,
+          SANCTUARY_RECOVERY_KEY: recoveryKey,
+        },
+        platform: "darwin",
+        // F1 (drill 06-13): re-pin now auto-discovers the bundled shim on darwin.
+        // Pin the discovery seam to "nothing found" so this fail-closed test is
+        // independent of whether the build host has the Castle Wall app installed.
+        signerClientCandidates: [],
+        fileExistsFn: async () => false,
+      });
+      expect(rc).toBe(1);
+      expect(err.text()).toMatch(/signer-client shim path unknown/);
+    } finally {
+      await rm(fortressPath, { recursive: true, force: true });
+    }
   });
 });
 
