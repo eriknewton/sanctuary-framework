@@ -467,6 +467,7 @@ describe("buildAgentInstallPlan surfaces Rung 1 evidence and the restart action"
       custodyAccess: "usable",
       custodyMutation: "available",
       recoveryFactor: "present",
+      tier1Approval: "available",
       stagedRecoveryFile: "present",
       nodePath: "/usr/bin/node",
       castleWallApp: "not-applicable",
@@ -792,6 +793,7 @@ describe("staged recovery file observation, against the real filesystem", () => 
       custodyAccess: "usable",
       custodyMutation: "available",
       recoveryFactor: "present",
+      tier1Approval: "available",
     });
     const instructions = (observed: InstallProbeResult): string =>
       buildAgentInstallPlan({

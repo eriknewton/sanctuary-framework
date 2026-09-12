@@ -129,6 +129,12 @@ the path could not be observed as a regular file. `unknown` is never folded into
 `absent`.
 
 The planner reports `complete` only when access is `usable` and mutation is `available`.
+For the memory profile it also requires `tier1_approval=available`: the
+documented acceptance write cannot pass through the deny-only stdio `stderr`
+channel, and a dashboard without an operator bearer cannot resolve strict
+approve/deny routes. When this observation is `unavailable`, the planner names
+the human-only policy/config edit that selects the local dashboard and its
+ephemeral `"auto"` bearer; it never weakens the Tier-1 classification.
 It then adds a
 `restart_and_verify_rung1` human action: restart the host and confirm memory
 survives via `memory_insert`, `memory_search`, and `memory_get` (which proves

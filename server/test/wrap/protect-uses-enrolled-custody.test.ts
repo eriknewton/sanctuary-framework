@@ -108,6 +108,7 @@ function baseProbe(over: Partial<InstallProbeResult>): InstallProbeResult {
     custodyAccess: "usable",
     custodyMutation: "available",
     recoveryFactor: "present",
+    tier1Approval: "available",
     nodePath: "/usr/bin/node",
     castleWallApp: "not-applicable",
     castleWallBuildSha: null,

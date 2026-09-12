@@ -51,6 +51,24 @@ byte-faithfully and `sdw_memory_provenance` reports its provenance verified,
 the in-process Rung 1 data path works on this host. The separate restart drill
 below is still required before calling the host ready for daily use.
 
+### Tier-1 approval readiness
+
+The stdio `stderr` approval channel is informational and always denies; it
+cannot read an operator decision because stdin carries MCP traffic. It is a
+safe fail-closed default, not an interactive Day-1 path. Before the installer
+declares Rung 1 complete it therefore reports `tier1_approval=available` only
+for a configured interactive channel. For a local dashboard, the strict
+approve/deny routes also require a bearer: set `approval_channel.type` to
+`dashboard` in `principal-policy.yaml` and set `dashboard.auth_token` to
+`"auto"` in `sanctuary.json`, then restart the harness. The MCP process mints
+the bearer and auto-opens a short-lived authenticated localhost session; never
+paste its token or session URL into chat. Do not relax `memory_insert` out of
+Tier 1 to work around an unavailable approval channel.
+
+Both files must be regular non-symlink files. A missing, malformed, linked, or
+read-raced file makes `tier1_approval=unknown` and blocks completion rather than
+trusting a configuration the MCP server may refuse or interpret differently.
+
 ## Restart persistence
 
 Rung 1 must survive a reboot with no secret typed. The acceptance step

@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { join, resolve } from "node:path";
 
 import { resolveStoragePath } from "../paths.js";
+import { parsePolicy } from "../principal-policy/loader.js";
 import { getSanctuaryVersion } from "../version.js";
 import { agentGuidedRecoveryOutputPath } from "../wrap/custody-flow.js";
 import {
@@ -20,6 +21,7 @@ import {
   resolveFortressCustodyCredential,
 } from "../wrap/custody-credential.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
+import { readFileCustody } from "../storage/custody-fs.js";
 import {
   probeKernelBackedCrossProcessLockCapability,
   type KernelLockCapability,
@@ -346,6 +348,9 @@ export type CustodyMutationObservation =
  */
 export type RecoveryFactorObservation = "present" | "absent" | "unknown";
 
+/** Whether the installed MCP surface has a human-resolvable Tier-1 channel. */
+export type Tier1ApprovalObservation = "available" | "unavailable" | "unknown";
+
 export interface AgentInstallAction {
   id: string;
   actor: "agent" | "human";
@@ -381,6 +386,11 @@ export interface AgentInstallPlan {
     custody_access: CustodyAccessObservation;
     custody_mutation: CustodyMutationObservation;
     recovery_factor: RecoveryFactorObservation;
+    // memory_insert and sdw_memory_provenance are Tier 1. A mechanically
+    // installed memory surface is not daily-ready when its selected channel
+    // is the deliberately non-interactive stderr channel, or when a dashboard
+    // has no operator bearer configured for strict approve/deny routes.
+    tier1_approval: Tier1ApprovalObservation;
     // The observation that SELECTS the recovery operator_action below
     // (recoveryCustodyAction reads it). Reported here because a --json
     // consumer that sees only the chosen action text cannot tell whether the
@@ -436,6 +446,7 @@ export interface InstallProbeResult {
   custodyAccess: CustodyAccessObservation;
   custodyMutation: CustodyMutationObservation;
   recoveryFactor: RecoveryFactorObservation;
+  tier1Approval: Tier1ApprovalObservation;
   /** Does the agent-guided staged recovery file actually exist on this host? */
   stagedRecoveryFile: StagedRecoveryFileObservation;
   nodePath: string;
@@ -997,6 +1008,61 @@ async function probeOperatorTwin(
 }
 
 /**
+ * Read-only proof that a Tier-1 MCP call can reach an operator.
+ *
+ * `stderr` is deliberately deny-only in the stdio transport, and `callback`
+ * exists only for an embedding that injects a callback at server construction;
+ * neither is a usable installed-harness approval path. Dashboard decisions use
+ * strict bearer-only routes, so a dashboard with no configured token is also
+ * non-interactive even on loopback. `"auto"` is sufficient: the MCP process
+ * mints a token and opens a short-lived authenticated browser session at boot.
+ */
+export async function probeTier1Approval(
+  fortress: string,
+): Promise<Tier1ApprovalObservation> {
+  try {
+    const [policyText, configText] = await Promise.all([
+      readFileCustody(join(fortress, "principal-policy.yaml"), {
+        encoding: "utf8",
+        verifyPathIdentity: true,
+      }),
+      readFileCustody(join(fortress, "sanctuary.json"), {
+        encoding: "utf8",
+        verifyPathIdentity: true,
+      }),
+    ]);
+    const policy = parsePolicy(policyText);
+    const config = JSON.parse(configText) as {
+      dashboard?: { auth_token?: unknown };
+      webhook?: { url?: unknown; secret?: unknown };
+    };
+    const nonEmpty = (value: unknown): boolean =>
+      typeof value === "string" && value.trim().length > 0;
+
+    switch (policy.approval_channel.type) {
+      case "dashboard":
+        return nonEmpty(config.dashboard?.auth_token) ? "available" : "unavailable";
+      case "webhook": {
+        const url = nonEmpty(config.webhook?.url) ||
+          nonEmpty(policy.approval_channel.webhook_url);
+        const secret = nonEmpty(config.webhook?.secret) ||
+          nonEmpty(policy.approval_channel.webhook_secret);
+        return url && secret ? "available" : "unavailable";
+      }
+      case "stderr":
+      case "callback":
+        return "unavailable";
+    }
+    // Future channel values must fail closed until this probe has an explicit
+    // proof that the installed harness can resolve them. Keep this return even
+    // while today's PrincipalPolicy union makes the switch exhaustive.
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
  * Read-only, ambient-env-blind daily-UX probe for Rung 1 fresh-host onboarding.
  * Answers "can this host open the fortress today, and does it carry a recovery
  * factor?" WITHOUT typing or reading any credential from the environment.
@@ -1299,6 +1365,7 @@ export function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
         existingCustody,
         custodyAccessProbe,
         stagedRecoveryFile,
+        tier1Approval,
       ] = await Promise.all([
           probePersistentCli(),
           probeExecutableOnPath("npm"),
@@ -1311,6 +1378,7 @@ export function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
           // Existence of the staged recovery file, so the custody instruction
           // names a branch that applies rather than composing a path.
           probeStagedRecoveryFile(fortress),
+          probeTier1Approval(fortress),
         ]);
       const { custodyAccess, custodyMutation, recoveryFactor } = custodyAccessProbe;
       const { persistentCli, nodePath, verifiedCastleWallApp } =
@@ -1331,6 +1399,7 @@ export function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
           custodyAccess,
           custodyMutation,
           recoveryFactor,
+          tier1Approval,
           stagedRecoveryFile,
           nodePath,
           castleWallApp: "not-applicable",
@@ -1381,6 +1450,7 @@ export function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
         custodyAccess,
         custodyMutation,
         recoveryFactor,
+        tier1Approval,
         stagedRecoveryFile,
         nodePath,
         castleWallApp: castleWallApp.status,
@@ -1477,6 +1547,26 @@ function restartAndVerifyRung1Action(): AgentInstallAction {
     secret_boundary:
       "Do not set SANCTUARY_PASSPHRASE / SANCTUARY_RECOVERY_KEY for this proof, and do " +
       "not paste any passphrase, recovery key, or keychain contents into chat.",
+  };
+}
+
+/** Human-only policy/config edit that makes Tier-1 MCP approval resolvable. */
+function configureInteractiveTier1ApprovalAction(fortress: string): AgentInstallAction {
+  return {
+    id: "configure_interactive_tier1_approval",
+    actor: "human",
+    description:
+      `The installed MCP server cannot receive a human Tier-1 decision. In a private ` +
+      `local session, edit ${join(fortress, "principal-policy.yaml")} and change only ` +
+      `approval_channel.type from stderr to dashboard. Then edit ` +
+      `${join(fortress, "sanctuary.json")} and set dashboard.auth_token to \"auto\". ` +
+      `Do not move memory_insert out of Tier 1. Quit and relaunch the selected harness, ` +
+      `then rerun this installer. The MCP process will open a short-lived authenticated ` +
+      `local dashboard session when an approval is needed.`,
+    completion:
+      "A rerun observes tier1_approval=available after the harness has been restarted.",
+    secret_boundary:
+      "Do not paste a generated dashboard token, session URL, passphrase, recovery key, or policy contents into chat.",
   };
 }
 
@@ -1591,6 +1681,24 @@ function applyRung1CustodyCompletion(
       );
       return plan;
     }
+    // Ordering is load-bearing: report a broken custody prerequisite first,
+    // then prove the operator can approve the acceptance write, and only then
+    // let the mechanically installed surface claim `complete`.
+    if (input.observed.tier1Approval === "unavailable") {
+      plan.status = "human_action";
+      plan.next_action = configureInteractiveTier1ApprovalAction(input.fortress);
+      plan.notes.push(
+        "Custody opens hands-free, but the configured MCP approval channel cannot resolve the Tier-1 memory write required by Rung 1 acceptance.",
+      );
+      return plan;
+    }
+    if (input.observed.tier1Approval === "unknown") {
+      plan.status = "blocked";
+      plan.notes.push(
+        "Custody opens hands-free, but the installer could not safely read and parse principal-policy.yaml plus sanctuary.json well enough to prove a human-resolvable Tier-1 approval path. Inspect both named files directly: each must exist as a regular non-symlink file, remain unchanged during the read, and contain valid policy/JSON syntax.",
+      );
+      return plan;
+    }
     plan.status = "complete";
     plan.operator_actions = [
       recoveryCustodyAction(input.fortress, input.observed.stagedRecoveryFile),
@@ -1693,6 +1801,7 @@ function basePlan(
       custody_access: observed.custodyAccess,
       custody_mutation: observed.custodyMutation,
       recovery_factor: observed.recoveryFactor,
+      tier1_approval: observed.tier1Approval,
       staged_recovery_file: observed.stagedRecoveryFile,
       castle_wall_app: observed.castleWallApp,
       castle_wall_build_sha: observed.castleWallBuildSha,

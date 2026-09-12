@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Writable } from "node:stream";
@@ -15,6 +15,7 @@ import {
   deriveInstallVaultProvision,
   parseInstallSystemExtensionState,
   parseTrustAnchor,
+  probeTier1Approval,
   resolvePersistentCliRuntimeForProfile,
   runInstallCommand,
   verifyCastleWallRuntimeManifest,
@@ -223,6 +224,7 @@ function observed(overrides: Partial<InstallProbeResult> = {}): InstallProbeResu
     custodyAccess: "usable",
     custodyMutation: "available",
     recoveryFactor: "present",
+    tier1Approval: "available",
     // The staged recovery file this install wrote. Default "present" so the
     // custody instruction under test is the move-and-delete branch; the
     // absent/unknown branches are covered in install-custody-observations.
@@ -1045,6 +1047,125 @@ describe("sanctuary install agent contract", () => {
     expect(plan.operator_actions[1]?.description).toContain(
       "memory_get itself does not carry signer data",
     );
+  });
+
+  it("does not report memory complete when the fresh policy uses deny-only stderr", () => {
+    const plan = buildAgentInstallPlan({
+      profile: "memory",
+      harness: "claude-code",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: observed({
+        cooperativeWrap: "present",
+        tier1Approval: "unavailable",
+      }),
+    });
+
+    expect(plan.status).toBe("human_action");
+    expect(plan.observations.tier1_approval).toBe("unavailable");
+    expect(plan.next_action?.id).toBe("configure_interactive_tier1_approval");
+    expect(plan.next_action?.description).toContain("approval_channel.type from stderr to dashboard");
+    expect(plan.next_action?.description).toContain('dashboard.auth_token to "auto"');
+    expect(plan.next_action?.description).toContain("Do not move memory_insert out of Tier 1");
+  });
+
+  it("reports memory complete once the same host has an interactive Tier-1 path", () => {
+    const plan = buildAgentInstallPlan({
+      profile: "memory",
+      harness: "claude-code",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: observed({
+        cooperativeWrap: "present",
+        tier1Approval: "available",
+      }),
+    });
+
+    expect(plan.status).toBe("complete");
+    expect(plan.observations.tier1_approval).toBe("available");
+    expect(plan.operator_actions.map((action) => action.id)).toContain(
+      "restart_and_verify_rung1",
+    );
+  });
+
+  it("blocks rather than guessing when Tier-1 approval readiness is unknown", () => {
+    const plan = buildAgentInstallPlan({
+      profile: "memory",
+      harness: "claude-code",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: observed({
+        cooperativeWrap: "present",
+        tier1Approval: "unknown",
+      }),
+    });
+
+    expect(plan.status).toBe("blocked");
+    expect(plan.next_action).toBeNull();
+    expect(plan.notes.join(" ")).toContain("human-resolvable Tier-1 approval path");
+    expect(plan.notes.join(" ")).toContain("regular non-symlink file");
+  });
+
+  it("probes only genuinely resolvable installed Tier-1 approval channels", async () => {
+    const fortress = await mkdtemp(join(tmpdir(), "sanctuary-install-approval-"));
+    try {
+      const writePolicy = async (type: string, extras = "") =>
+        writeFile(
+          join(fortress, "principal-policy.yaml"),
+          [
+            "version: 1",
+            "tier1_always_approve:",
+            "  - memory_insert",
+            "approval_channel:",
+            `  type: ${type}`,
+            "  timeout_seconds: 300",
+            extras,
+            "",
+          ].join("\n"),
+        );
+      const writeConfig = async (config: Record<string, unknown>) =>
+        writeFile(join(fortress, "sanctuary.json"), JSON.stringify(config));
+
+      await writePolicy("stderr");
+      await writeConfig({ dashboard: { auth_token: null } });
+      expect(await probeTier1Approval(fortress)).toBe("unavailable");
+
+      await writePolicy("dashboard");
+      expect(await probeTier1Approval(fortress)).toBe("unavailable");
+      await writeConfig({ dashboard: { auth_token: true } });
+      expect(await probeTier1Approval(fortress)).toBe("unavailable");
+      await writeConfig({ dashboard: { auth_token: "auto" } });
+      expect(await probeTier1Approval(fortress)).toBe("available");
+
+      await writePolicy("webhook");
+      await writeConfig({ webhook: { url: "https://approver.invalid" } });
+      expect(await probeTier1Approval(fortress)).toBe("unavailable");
+      await writeConfig({ webhook: { secret: "configured" } });
+      expect(await probeTier1Approval(fortress)).toBe("unavailable");
+      await writeConfig({ webhook: { url: "https://approver.invalid", secret: "configured" } });
+      expect(await probeTier1Approval(fortress)).toBe("available");
+      await writePolicy(
+        "webhook",
+        "  webhook_url: https://policy-approver.invalid\n  webhook_secret: policy-configured",
+      );
+      await writeConfig({});
+      expect(await probeTier1Approval(fortress)).toBe("available");
+
+      await writePolicy("callback");
+      expect(await probeTier1Approval(fortress)).toBe("unavailable");
+
+      await rm(join(fortress, "principal-policy.yaml"));
+      expect(await probeTier1Approval(fortress)).toBe("unknown");
+
+      const externalPolicy = join(fortress, "external-policy.yaml");
+      await writePolicy("dashboard");
+      await writeFile(externalPolicy, await readFile(join(fortress, "principal-policy.yaml")));
+      await rm(join(fortress, "principal-policy.yaml"));
+      await symlink(externalPolicy, join(fortress, "principal-policy.yaml"));
+      expect(await probeTier1Approval(fortress)).toBe("unknown");
+    } finally {
+      await rm(fortress, { recursive: true, force: true });
+    }
   });
 
   it("refuses to guess or download a full-profile enforcement artifact", () => {
