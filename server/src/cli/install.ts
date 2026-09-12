@@ -498,6 +498,8 @@ export interface InstallCommandContext {
    * verdict instead, exactly as the dashboard's own tests do.
    */
   resolveExclusiveEgress?: () => Promise<ExclusiveEgressStatus | null>;
+  /** Test-only seam proving the production probe consumes runtime selection. */
+  resolvePersistentCliRuntime?: typeof resolvePersistentCliRuntimeForProfile;
 }
 
 const HARNESSES = new Set<InstallHarness>([
@@ -1232,6 +1234,59 @@ async function resolveInstallExclusiveEgressStatus(
  * wired-consumer test). This export is that test's entry point; runtime callers
  * still reach it only through `runInstallCommand`.
  */
+type PersistentCliProbe = Awaited<ReturnType<typeof probePersistentCli>>;
+type CastleWallAppProbe = Awaited<ReturnType<typeof probeCastleWallApp>>;
+
+/**
+ * Select the persistent CLI that an install plan will actually execute.
+ * The injectable readers are a pure test seam; production always supplies the
+ * signed-app and sealed-runtime verifiers below.
+ */
+export async function resolvePersistentCliRuntimeForProfile(
+  platform: NodeJS.Platform,
+  profile: InstallProfile,
+  pathCli: PersistentCliProbe,
+  defaultNodePath: string,
+  readers: {
+    probeApp: () => Promise<CastleWallAppProbe>;
+    probeBundled: () => Promise<PersistentCliProbe>;
+  } = {
+    probeApp: probeCastleWallApp,
+    probeBundled: probeBundledCliRuntime,
+  },
+): Promise<{
+  persistentCli: PersistentCliProbe;
+  nodePath: string;
+  verifiedCastleWallApp: CastleWallAppProbe | null;
+}> {
+  let persistentCli = pathCli;
+  let nodePath = defaultNodePath;
+  let verifiedCastleWallApp: CastleWallAppProbe | null = null;
+
+  // The signed app is already an exact, persistent CLI for BOTH profiles.
+  // Restricting this probe to `full` makes memory onboarding depend on an
+  // independently published npm package and creates a circular release gate:
+  // the candidate cannot pass Day 1 until Day 1 authorizes its publication.
+  // A verified bundled runtime wins over any stale PATH CLI; memory keeps its
+  // PATH fallback only when no verified app is available.
+  if (platform === "darwin") {
+    verifiedCastleWallApp = await readers.probeApp();
+    if (verifiedCastleWallApp.status === "present") {
+      const bundledCli = await readers.probeBundled();
+      // Once a signed app is available, never silently fall back to a stale or
+      // unrelated PATH CLI if its sealed runtime fails verification.
+      persistentCli = bundledCli;
+      if (bundledCli.status === "present") {
+        nodePath = DEFAULT_CASTLE_WALL_LAUNCHER;
+      }
+    } else if (profile === "full") {
+      persistentCli = { status: verifiedCastleWallApp.status, path: null, version: null };
+    }
+  }
+
+  return { persistentCli, nodePath, verifiedCastleWallApp };
+}
+
 export function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
   const platform = ctx.platform ?? process.platform;
   const env = ctx.env ?? process.env;
@@ -1258,23 +1313,13 @@ export function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
           probeStagedRecoveryFile(fortress),
         ]);
       const { custodyAccess, custodyMutation, recoveryFactor } = custodyAccessProbe;
-      let persistentCli = pathCli;
-      let nodePath = process.execPath;
-      let verifiedCastleWallApp: Awaited<ReturnType<typeof probeCastleWallApp>> | null = null;
-      if (platform === "darwin" && profile === "full") {
-        verifiedCastleWallApp = await probeCastleWallApp();
-        if (verifiedCastleWallApp.status === "present") {
-          const bundledCli = await probeBundledCliRuntime();
-          if (bundledCli.status === "present") {
-            persistentCli = bundledCli;
-            nodePath = DEFAULT_CASTLE_WALL_LAUNCHER;
-          } else {
-            persistentCli = bundledCli;
-          }
-        } else {
-          persistentCli = { status: verifiedCastleWallApp.status, path: null, version: null };
-        }
-      }
+      const { persistentCli, nodePath, verifiedCastleWallApp } =
+        await (ctx.resolvePersistentCliRuntime ?? resolvePersistentCliRuntimeForProfile)(
+          platform,
+          profile,
+          pathCli,
+          process.execPath,
+        );
       if (profile !== "full" || platform !== "darwin") {
         return {
           cooperativeWrap,
@@ -1675,11 +1720,11 @@ export function buildAgentInstallPlan(input: {
   observed: InstallProbeResult;
 }): AgentInstallPlan {
   const plan = basePlan(input.profile, input.harness, input.fortress, input.observed);
-  const sealedFullRuntime =
-    input.profile === "full" &&
+  const sealedLauncherRuntime =
     input.platform === "darwin" &&
     input.observed.persistentCliPath === DEFAULT_CASTLE_WALL_LAUNCHER;
-  const commandPrefix = sealedFullRuntime
+  const sealedFullRuntime = input.profile === "full" && sealedLauncherRuntime;
+  const commandPrefix = sealedLauncherRuntime
     ? [DEFAULT_CASTLE_WALL_LAUNCHER]
     : [input.observed.nodePath, input.observed.persistentCliPath ?? "sanctuary"];
   const protectArgs = [
@@ -1690,7 +1735,7 @@ export function buildAgentInstallPlan(input: {
     `--${input.harness}`,
     "--no-open",
     "--agent-guided",
-    ...(sealedFullRuntime ? ["--sealed-launcher", DEFAULT_CASTLE_WALL_LAUNCHER] : []),
+    ...(sealedLauncherRuntime ? ["--sealed-launcher", DEFAULT_CASTLE_WALL_LAUNCHER] : []),
   ];
   const protectFailureAction = (): AgentInstallAction => ({
     id: "complete_cooperative_surface_locally",
