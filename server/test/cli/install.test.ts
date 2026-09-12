@@ -9,10 +9,13 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   AGENT_INSTALL_CONTRACT,
+  DEFAULT_CASTLE_WALL_LAUNCHER,
   buildAgentInstallPlan,
+  createInstallOps,
   deriveInstallVaultProvision,
   parseInstallSystemExtensionState,
   parseTrustAnchor,
+  resolvePersistentCliRuntimeForProfile,
   runInstallCommand,
   verifyCastleWallRuntimeManifest,
   type AgentInstallOps,
@@ -32,6 +35,147 @@ import {
 
 const require = createRequire(import.meta.url);
 const packageJson = require("../../package.json") as { version: string };
+
+describe("resolvePersistentCliRuntimeForProfile", () => {
+  const stalePathCli = {
+    status: "mismatch" as const,
+    path: "/usr/local/bin/sanctuary",
+    version: "1.8.4",
+  };
+  const verifiedApp = { status: "present" as const, buildSha: "0123456789ab" };
+  const bundledCli = {
+    status: "present" as const,
+    path: DEFAULT_CASTLE_WALL_LAUNCHER,
+    version: packageJson.version,
+  };
+
+  it("uses the verified sealed app CLI for the macOS memory profile", async () => {
+    const resolved = await resolvePersistentCliRuntimeForProfile(
+      "darwin",
+      "memory",
+      stalePathCli,
+      "/usr/local/bin/node",
+      {
+        probeApp: async () => verifiedApp,
+        probeBundled: async () => bundledCli,
+      },
+    );
+
+    expect(resolved).toEqual({
+      persistentCli: bundledCli,
+      nodePath: DEFAULT_CASTLE_WALL_LAUNCHER,
+      verifiedCastleWallApp: verifiedApp,
+    });
+  });
+
+  it("fails closed when a verified app has an invalid sealed runtime", async () => {
+    const invalidBundledCli = { status: "mismatch" as const, path: null, version: null };
+    const resolved = await resolvePersistentCliRuntimeForProfile(
+      "darwin",
+      "memory",
+      stalePathCli,
+      "/usr/local/bin/node",
+      {
+        probeApp: async () => verifiedApp,
+        probeBundled: async () => invalidBundledCli,
+      },
+    );
+
+    expect(resolved.persistentCli).toEqual(invalidBundledCli);
+    expect(resolved.nodePath).toBe("/usr/local/bin/node");
+  });
+
+  it("keeps the PATH CLI fallback for memory when no verified app exists", async () => {
+    const resolved = await resolvePersistentCliRuntimeForProfile(
+      "darwin",
+      "memory",
+      stalePathCli,
+      "/usr/local/bin/node",
+      {
+        probeApp: async () => ({ status: "absent", buildSha: null }),
+        probeBundled: async () => bundledCli,
+      },
+    );
+
+    expect(resolved.persistentCli).toEqual(stalePathCli);
+    expect(resolved.nodePath).toBe("/usr/local/bin/node");
+  });
+
+  it("keeps the PATH CLI fallback for memory when the app is not exact", async () => {
+    const resolved = await resolvePersistentCliRuntimeForProfile(
+      "darwin",
+      "memory",
+      stalePathCli,
+      "/usr/local/bin/node",
+      {
+        probeApp: async () => ({ status: "mismatch", buildSha: null }),
+        probeBundled: async () => bundledCli,
+      },
+    );
+
+    expect(resolved.persistentCli).toEqual(stalePathCli);
+    expect(resolved.nodePath).toBe("/usr/local/bin/node");
+  });
+
+  it("keeps the full profile fail-closed when the signed app is absent", async () => {
+    const absentApp = { status: "absent" as const, buildSha: null };
+    const resolved = await resolvePersistentCliRuntimeForProfile(
+      "darwin",
+      "full",
+      stalePathCli,
+      "/usr/local/bin/node",
+      {
+        probeApp: async () => absentApp,
+        probeBundled: async () => bundledCli,
+      },
+    );
+
+    expect(resolved).toEqual({
+      persistentCli: { status: "absent", path: null, version: null },
+      nodePath: "/usr/local/bin/node",
+      verifiedCastleWallApp: absentApp,
+    });
+  });
+
+  it("uses the verified sealed app CLI for the full profile", async () => {
+    const resolved = await resolvePersistentCliRuntimeForProfile(
+      "darwin",
+      "full",
+      stalePathCli,
+      "/usr/local/bin/node",
+      {
+        probeApp: async () => verifiedApp,
+        probeBundled: async () => bundledCli,
+      },
+    );
+
+    expect(resolved).toEqual({
+      persistentCli: bundledCli,
+      nodePath: DEFAULT_CASTLE_WALL_LAUNCHER,
+      verifiedCastleWallApp: verifiedApp,
+    });
+  });
+
+  it("does not probe macOS app state on other platforms", async () => {
+    const probeApp = vi.fn(async () => verifiedApp);
+    const probeBundled = vi.fn(async () => bundledCli);
+    const resolved = await resolvePersistentCliRuntimeForProfile(
+      "linux",
+      "memory",
+      stalePathCli,
+      "/usr/bin/node",
+      { probeApp, probeBundled },
+    );
+
+    expect(resolved).toEqual({
+      persistentCli: stalePathCli,
+      nodePath: "/usr/bin/node",
+      verifiedCastleWallApp: null,
+    });
+    expect(probeApp).not.toHaveBeenCalled();
+    expect(probeBundled).not.toHaveBeenCalled();
+  });
+});
 
 async function executeOnePlannedAction(
   plan: AgentInstallPlan,
@@ -305,6 +449,92 @@ describe("sanctuary install agent contract", () => {
       "--no-provision-agent-account",
     ]);
     expect(JSON.stringify(plan)).not.toMatch(/passphrase['"\s]*:/i);
+  });
+
+  it("executes the sealed launcher once for a macOS memory install", async () => {
+    const runtime = await resolvePersistentCliRuntimeForProfile(
+      "darwin",
+      "memory",
+      {
+        status: "mismatch",
+        path: "/usr/local/bin/sanctuary",
+        version: "1.8.4",
+      },
+      "/usr/local/bin/node",
+      {
+        probeApp: async () => ({ status: "present", buildSha: "0123456789ab" }),
+        probeBundled: async () => ({
+          status: "present",
+          path: DEFAULT_CASTLE_WALL_LAUNCHER,
+          version: packageJson.version,
+        }),
+      },
+    );
+    const plan = buildAgentInstallPlan({
+      profile: "memory",
+      harness: "claude-code",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: observed({
+        persistentCli: runtime.persistentCli.status,
+        persistentCliPath: runtime.persistentCli.path,
+        persistentCliVersion: runtime.persistentCli.version,
+        nodePath: runtime.nodePath,
+      }),
+    });
+
+    expect(plan.status).toBe("agent_action");
+    expect(plan.next_action?.argv).toEqual([
+      DEFAULT_CASTLE_WALL_LAUNCHER,
+      "--fortress",
+      "/tmp/fortress",
+      "protect",
+      "--claude-code",
+      "--no-open",
+      "--agent-guided",
+      "--sealed-launcher",
+      DEFAULT_CASTLE_WALL_LAUNCHER,
+      "--no-provision-agent-account",
+    ]);
+  });
+
+  it("carries the selected sealed runtime through the production memory probe", async () => {
+    const fortress = await mkdtemp(join(tmpdir(), "sanctuary-memory-runtime-wiring-"));
+    const resolvePersistentCliRuntime = vi.fn(async () => ({
+      persistentCli: {
+        status: "present" as const,
+        path: DEFAULT_CASTLE_WALL_LAUNCHER,
+        version: packageJson.version,
+      },
+      nodePath: DEFAULT_CASTLE_WALL_LAUNCHER,
+      verifiedCastleWallApp: {
+        status: "present" as const,
+        buildSha: "0123456789ab",
+      },
+    }));
+    try {
+      const ops = createInstallOps({
+        platform: "darwin",
+        env: {},
+        resolvePersistentCliRuntime,
+      });
+      const result = await ops.probe({
+        profile: "memory",
+        harness: "claude-code",
+        fortress,
+      });
+
+      expect(resolvePersistentCliRuntime).toHaveBeenCalledOnce();
+      expect(resolvePersistentCliRuntime.mock.calls[0]?.slice(0, 2)).toEqual([
+        "darwin",
+        "memory",
+      ]);
+      expect(result.persistentCli).toBe("present");
+      expect(result.persistentCliPath).toBe(DEFAULT_CASTLE_WALL_LAUNCHER);
+      expect(result.nodePath).toBe(DEFAULT_CASTLE_WALL_LAUNCHER);
+    } finally {
+      await rm(fortress, { recursive: true, force: true });
+    }
   });
 
   it("replaces a stale persistent CLI before returning feature-bearing actions", () => {

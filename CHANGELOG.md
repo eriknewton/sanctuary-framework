@@ -25,6 +25,9 @@ First-install fixes on top of v1.8.5. No new capability; the capability bounds i
 - A dashboard opened with a launch session carries that session through same-origin reads and event
   streams, so the initial authenticated view and its live data use the same read authority. Mutation
   requests and cross-origin destinations never receive the launch session.
+- On macOS, the installer uses the verified signed app's bundled CLI for both memory and full
+  profiles. A first install therefore advances with the exact candidate already in the app rather
+  than requiring a separately installed global package; an inconsistent app runtime is refused.
 
 ## [1.8.5] - 2026-09-08
 
