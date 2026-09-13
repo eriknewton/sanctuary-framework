@@ -28,6 +28,9 @@ First-install fixes on top of v1.8.5. No new capability; the capability bounds i
 - On macOS, the installer uses the verified signed app's bundled CLI for both memory and full
   profiles. A first install therefore advances with the exact candidate already in the app rather
   than requiring a separately installed global package; an inconsistent app runtime is refused.
+- Memory and Rung 1 installation report completion only when a usable Tier-1 approval channel is
+  available. Dashboard approval requires an explicit strong operator bearer, while `auto` remains
+  read-only. Unreadable configuration, or configuration replaced while being read, is refused.
 
 ## [1.8.5] - 2026-09-08
 
