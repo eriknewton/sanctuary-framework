@@ -1,4 +1,4 @@
-// fail-before-exempt: fixture-only edit. The shared InstallProbeResult fixture gains the additive vaultProvision observation with the neutral "unknown" value, and the one full-profile case that describes an ARMED darwin host names the matching "walled" value so the custody gate it asserts is still the gate it reaches; no assertion changed. The behavior these feed is proven in test/cli/install.test.ts (the first-run walk, the re-pin loop, and the refusal to report a complete install on vault evidence that could not be read).
+// fail-before-exempt: fixture-only edit for this approval-readiness change. Existing InstallProbeResult literals gain tier1Approval="available" so their custody assertions continue reaching the same gate; no assertion changes here. The new approval behavior fails before in test/cli/install.test.ts.
 /**
  * Rung 1 install evidence: the read-only, ambient-env-blind daily-UX probe
  * (`custody_access` / `recovery_factor`) and the plan wiring that surfaces them
@@ -467,6 +467,7 @@ describe("buildAgentInstallPlan surfaces Rung 1 evidence and the restart action"
       custodyAccess: "usable",
       custodyMutation: "available",
       recoveryFactor: "present",
+      tier1Approval: "available",
       stagedRecoveryFile: "present",
       nodePath: "/usr/bin/node",
       castleWallApp: "not-applicable",
@@ -792,6 +793,7 @@ describe("staged recovery file observation, against the real filesystem", () => 
       custodyAccess: "usable",
       custodyMutation: "available",
       recoveryFactor: "present",
+      tier1Approval: "available",
     });
     const instructions = (observed: InstallProbeResult): string =>
       buildAgentInstallPlan({

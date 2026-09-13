@@ -1,4 +1,4 @@
-// fail-before-exempt: fixture-only edit. The shared InstallProbeResult fixture gains the additive vaultProvision observation with the neutral "unknown" value; no assertion changed. The behavior it feeds is proven in test/cli/install.test.ts.
+// fail-before-exempt: fixture-only edit for this approval-readiness change. The InstallProbeResult literal gains tier1Approval="available" so these unchanged custody/protect tests reach their existing assertions; the new approval behavior fails before in test/cli/install.test.ts.
 // fail-before-exempt: combined-tree seam only: the probe literal gained the stagedRecoveryFile field and the castle-wall mock became a partial (importOriginal) mock so init.ts loads; the behaviour this file proves shipped in #1391 and is unchanged by this PR
 /**
  * Rung 1 primary journey: `init` -> `install` -> the EXACT emitted `protect`
@@ -108,6 +108,7 @@ function baseProbe(over: Partial<InstallProbeResult>): InstallProbeResult {
     custodyAccess: "usable",
     custodyMutation: "available",
     recoveryFactor: "present",
+    tier1Approval: "available",
     nodePath: "/usr/bin/node",
     castleWallApp: "not-applicable",
     castleWallBuildSha: null,
