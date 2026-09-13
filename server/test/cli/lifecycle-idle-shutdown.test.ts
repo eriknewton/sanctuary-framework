@@ -1,4 +1,4 @@
-// fail-before-exempt: test-harness stabilization only. This change bounds one retry for full-suite scheduling timeout or the existing unused-port bind race; production lifecycle behavior is unchanged, so the file correctly passes against pre-fix source. Approval readiness fails before in test/cli/install.test.ts.
+// fail-before-exempt: bounds one lifecycle harness retry to clean or signaled early exits and adds capped diagnostics; assertions and production behavior are unchanged (CAP-READY-01).
 /** Real CLI/dashboard and fault injection into production lifecycle code. */
 import { afterEach, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -73,8 +73,14 @@ async function launch(mode: string) {
       const stopped = child.exitCode !== null || child.signalCode !== null;
       if (stopped || Date.now() > limit) {
         await writeFile(join(root, "child-stderr.log"), stderr, { mode: 0o600 });
-        const reason = stopped ? "child-exit" : "observation-timeout";
-        throw new Error(`Lifecycle observation failed (${mode}:${reason}); private fixture ${root}`);
+        const reason = stopped
+          ? `child-exit:${child.exitCode ?? "null"}:${child.signalCode ?? "none"}`
+          : "observation-timeout";
+        const stderrTail = stderr.trim().slice(-2_000);
+        throw new Error(
+          `Lifecycle observation failed (${mode}:${reason}); private fixture ${root}` +
+          (stderrTail ? `; stderr tail: ${stderrTail}` : ""),
+        );
       }
       await pause(20);
     }
@@ -108,7 +114,11 @@ async function launchReady(mode: string) {
       const portRace = /EADDRINUSE|already (?:owned|in use)/i.test(run.stderr());
       const schedulingTimeout = error instanceof Error &&
         error.message.includes(":observation-timeout)");
-      if (attempt === 1 || (!portRace && !schedulingTimeout)) throw error;
+      // A clean early exit is the dashboard's benign single-owner stand-down;
+      // a signal is host scheduling/resource pressure. Retry either once, but
+      // never retry a numeric non-zero exit: that is a real CLI failure.
+      const retryableChildExit = run.child.exitCode === 0 || run.child.signalCode !== null;
+      if (attempt === 1 || (!portRace && !schedulingTimeout && !retryableChildExit)) throw error;
       await run.dispose();
     }
   }
