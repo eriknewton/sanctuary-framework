@@ -133,8 +133,10 @@ For the memory profile it also requires `tier1_approval=available`: the
 documented acceptance write cannot pass through the deny-only stdio `stderr`
 channel, and a dashboard without an operator bearer cannot resolve strict
 approve/deny routes. When this observation is `unavailable`, the planner names
-the human-only policy/config edit that selects the local dashboard and its
-ephemeral `"auto"` bearer; it never weakens the Tier-1 classification.
+the human-only policy/config edit that selects the local dashboard and an
+explicit operator-held bearer; it never weakens the Tier-1 classification.
+The MCP path's `"auto"` setting is not decision-ready: it opens a read-only
+session but does not disclose the generated bearer required by approve/deny.
 It then adds a
 `restart_and_verify_rung1` human action: restart the host and confirm memory
 survives via `memory_insert`, `memory_search`, and `memory_get` (which proves

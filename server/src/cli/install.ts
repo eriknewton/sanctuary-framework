@@ -1013,12 +1013,14 @@ async function probeOperatorTwin(
  * `stderr` is deliberately deny-only in the stdio transport, and `callback`
  * exists only for an embedding that injects a callback at server construction;
  * neither is a usable installed-harness approval path. Dashboard decisions use
- * strict bearer-only routes, so a dashboard with no configured token is also
- * non-interactive even on loopback. `"auto"` is sufficient: the MCP process
- * mints a token and opens a short-lived authenticated browser session at boot.
+ * strict bearer-only routes, so a dashboard with no operator-held explicit
+ * token is also non-interactive even on loopback. `"auto"` is deliberately not
+ * sufficient here: the MCP process mints a bearer but exposes only a read-only
+ * browser session, leaving the operator unable to authorize a decision.
  */
 export async function probeTier1Approval(
   fortress: string,
+  env: NodeJS.ProcessEnv = {},
 ): Promise<Tier1ApprovalObservation> {
   try {
     const [policyText, configText] = await Promise.all([
@@ -1038,16 +1040,27 @@ export async function probeTier1Approval(
     };
     const nonEmpty = (value: unknown): boolean =>
       typeof value === "string" && value.trim().length > 0;
+    const envValue = (name: string): string | undefined => {
+      const value = env[name];
+      return value && value.length > 0 ? value : undefined;
+    };
 
     switch (policy.approval_channel.type) {
-      case "dashboard":
-        return nonEmpty(config.dashboard?.auth_token) ? "available" : "unavailable";
+      case "dashboard": {
+        const token = envValue("SANCTUARY_DASHBOARD_AUTH_TOKEN") ??
+          config.dashboard?.auth_token;
+        return nonEmpty(token) && token !== "auto"
+          ? "available"
+          : "unavailable";
+      }
       case "webhook": {
-        const url = nonEmpty(config.webhook?.url) ||
-          nonEmpty(policy.approval_channel.webhook_url);
-        const secret = nonEmpty(config.webhook?.secret) ||
+        const configUrl = envValue("SANCTUARY_WEBHOOK_URL") ?? config.webhook?.url;
+        const configSecret = envValue("SANCTUARY_WEBHOOK_SECRET") ??
+          config.webhook?.secret;
+        const configPair = nonEmpty(configUrl) && nonEmpty(configSecret);
+        const policyPair = nonEmpty(policy.approval_channel.webhook_url) &&
           nonEmpty(policy.approval_channel.webhook_secret);
-        return url && secret ? "available" : "unavailable";
+        return configPair || policyPair ? "available" : "unavailable";
       }
       case "stderr":
       case "callback":
@@ -1378,7 +1391,10 @@ export function createInstallOps(ctx: InstallCommandContext): AgentInstallOps {
           // Existence of the staged recovery file, so the custody instruction
           // names a branch that applies rather than composing a path.
           probeStagedRecoveryFile(fortress),
-          probeTier1Approval(fortress),
+          // Unlike custody secrets, approval connection settings are
+          // intentionally environment-overridable at runtime. Mirror those
+          // overrides so the planner describes the harness it will launch.
+          probeTier1Approval(fortress, env),
         ]);
       const { custodyAccess, custodyMutation, recoveryFactor } = custodyAccessProbe;
       const { persistentCli, nodePath, verifiedCastleWallApp } =
@@ -1557,12 +1573,14 @@ function configureInteractiveTier1ApprovalAction(fortress: string): AgentInstall
     actor: "human",
     description:
       `The installed MCP server cannot receive a human Tier-1 decision. In a private ` +
-      `local session, edit ${join(fortress, "principal-policy.yaml")} and change only ` +
-      `approval_channel.type from stderr to dashboard. Then edit ` +
-      `${join(fortress, "sanctuary.json")} and set dashboard.auth_token to \"auto\". ` +
+      `local session, edit ${join(fortress, "principal-policy.yaml")} and set ` +
+      `approval_channel.type to dashboard. Then edit ` +
+      `${join(fortress, "sanctuary.json")} and set dashboard.auth_token to a strong ` +
+      `explicit bearer that the operator retains privately; do not use "auto", because ` +
+      `the MCP launch session is read-only and does not disclose its generated bearer. ` +
       `Do not move memory_insert out of Tier 1. Quit and relaunch the selected harness, ` +
-      `then rerun this installer. The MCP process will open a short-lived authenticated ` +
-      `local dashboard session when an approval is needed.`,
+      `then rerun this installer. Enter the bearer only into the local dashboard when it ` +
+      `asks for the operator token.`,
     completion:
       "A rerun observes tier1_approval=available after the harness has been restarted.",
     secret_boundary:

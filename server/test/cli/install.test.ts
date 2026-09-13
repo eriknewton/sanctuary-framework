@@ -515,6 +515,22 @@ describe("sanctuary install agent contract", () => {
       },
     }));
     try {
+      await writeFile(
+        join(fortress, "principal-policy.yaml"),
+        [
+          "version: 1",
+          "tier1_always_approve:",
+          "  - memory_insert",
+          "approval_channel:",
+          "  type: dashboard",
+          "  timeout_seconds: 300",
+          "",
+        ].join("\n"),
+      );
+      await writeFile(
+        join(fortress, "sanctuary.json"),
+        JSON.stringify({ dashboard: { auth_token: "operator-held-bearer" } }),
+      );
       const ops = createInstallOps({
         platform: "darwin",
         env: {},
@@ -534,6 +550,7 @@ describe("sanctuary install agent contract", () => {
       expect(result.persistentCli).toBe("present");
       expect(result.persistentCliPath).toBe(DEFAULT_CASTLE_WALL_LAUNCHER);
       expect(result.nodePath).toBe(DEFAULT_CASTLE_WALL_LAUNCHER);
+      expect(result.tier1Approval).toBe("available");
     } finally {
       await rm(fortress, { recursive: true, force: true });
     }
@@ -1064,8 +1081,9 @@ describe("sanctuary install agent contract", () => {
     expect(plan.status).toBe("human_action");
     expect(plan.observations.tier1_approval).toBe("unavailable");
     expect(plan.next_action?.id).toBe("configure_interactive_tier1_approval");
-    expect(plan.next_action?.description).toContain("approval_channel.type from stderr to dashboard");
-    expect(plan.next_action?.description).toContain('dashboard.auth_token to "auto"');
+    expect(plan.next_action?.description).toContain("approval_channel.type to dashboard");
+    expect(plan.next_action?.description).toContain("strong explicit bearer");
+    expect(plan.next_action?.description).toContain('do not use "auto"');
     expect(plan.next_action?.description).toContain("Do not move memory_insert out of Tier 1");
   });
 
@@ -1086,6 +1104,23 @@ describe("sanctuary install agent contract", () => {
     expect(plan.operator_actions.map((action) => action.id)).toContain(
       "restart_and_verify_rung1",
     );
+  });
+
+  it("reports custody mutation failure before Tier-1 approval remediation", () => {
+    const plan = buildAgentInstallPlan({
+      profile: "memory",
+      harness: "claude-code",
+      fortress: "/tmp/fortress",
+      platform: "darwin",
+      observed: observed({
+        cooperativeWrap: "present",
+        custodyMutation: "unavailable",
+        tier1Approval: "unavailable",
+      }),
+    });
+
+    expect(plan.status).toBe("blocked");
+    expect(plan.next_action?.id).toBe("restore_custody_lock_capability");
   });
 
   it("blocks rather than guessing when Tier-1 approval readiness is unknown", () => {
@@ -1135,7 +1170,16 @@ describe("sanctuary install agent contract", () => {
       await writeConfig({ dashboard: { auth_token: true } });
       expect(await probeTier1Approval(fortress)).toBe("unavailable");
       await writeConfig({ dashboard: { auth_token: "auto" } });
+      expect(await probeTier1Approval(fortress)).toBe("unavailable");
+      await writeConfig({ dashboard: { auth_token: "operator-held-bearer" } });
       expect(await probeTier1Approval(fortress)).toBe("available");
+      expect(await probeTier1Approval(fortress, {
+        SANCTUARY_DASHBOARD_AUTH_TOKEN: "auto",
+      })).toBe("unavailable");
+      await writeConfig({ dashboard: { auth_token: "auto" } });
+      expect(await probeTier1Approval(fortress, {
+        SANCTUARY_DASHBOARD_AUTH_TOKEN: "operator-held-env-bearer",
+      })).toBe("available");
 
       await writePolicy("webhook");
       await writeConfig({ webhook: { url: "https://approver.invalid" } });
@@ -1144,6 +1188,22 @@ describe("sanctuary install agent contract", () => {
       expect(await probeTier1Approval(fortress)).toBe("unavailable");
       await writeConfig({ webhook: { url: "https://approver.invalid", secret: "configured" } });
       expect(await probeTier1Approval(fortress)).toBe("available");
+      await writeConfig({ webhook: { url: "https://approver.invalid" } });
+      expect(await probeTier1Approval(fortress, {
+        SANCTUARY_WEBHOOK_SECRET: "env-configured",
+      })).toBe("available");
+      await writePolicy(
+        "webhook",
+        "  webhook_secret: policy-configured",
+      );
+      await writeConfig({ webhook: { url: "https://approver.invalid" } });
+      expect(await probeTier1Approval(fortress)).toBe("unavailable");
+      await writePolicy(
+        "webhook",
+        "  webhook_url: https://policy-approver.invalid",
+      );
+      await writeConfig({ webhook: { secret: "configured" } });
+      expect(await probeTier1Approval(fortress)).toBe("unavailable");
       await writePolicy(
         "webhook",
         "  webhook_url: https://policy-approver.invalid\n  webhook_secret: policy-configured",
@@ -1162,6 +1222,23 @@ describe("sanctuary install agent contract", () => {
       await writeFile(externalPolicy, await readFile(join(fortress, "principal-policy.yaml")));
       await rm(join(fortress, "principal-policy.yaml"));
       await symlink(externalPolicy, join(fortress, "principal-policy.yaml"));
+      expect(await probeTier1Approval(fortress)).toBe("unknown");
+
+      await rm(join(fortress, "principal-policy.yaml"));
+      await writePolicy("dashboard");
+      await writeConfig({ dashboard: { auth_token: "operator-held-bearer" } });
+      const externalConfig = join(fortress, "external-config.json");
+      await writeFile(externalConfig, await readFile(join(fortress, "sanctuary.json")));
+      await rm(join(fortress, "sanctuary.json"));
+      await symlink(externalConfig, join(fortress, "sanctuary.json"));
+      expect(await probeTier1Approval(fortress)).toBe("unknown");
+
+      await rm(join(fortress, "sanctuary.json"));
+      expect(await probeTier1Approval(fortress)).toBe("unknown");
+      await writeFile(join(fortress, "sanctuary.json"), "not-json");
+      expect(await probeTier1Approval(fortress)).toBe("unknown");
+      await writeConfig({ dashboard: { auth_token: "operator-held-bearer" } });
+      await writeFile(join(fortress, "principal-policy.yaml"), "not: [valid");
       expect(await probeTier1Approval(fortress)).toBe("unknown");
     } finally {
       await rm(fortress, { recursive: true, force: true });
