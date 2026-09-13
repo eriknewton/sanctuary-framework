@@ -76,6 +76,13 @@ import {
 
 const SAFE_CHARS = /[^A-Za-z0-9_.-]/g;
 
+// Starting the source worker requires loading tsx; on a saturated host that
+// handshake can legitimately exceed two seconds even though the child is
+// healthy. Custody mutation still waits fail-closed for a positive ready
+// message, but gives process startup a bounded window distinct from the much
+// shorter per-operation deadline used after admission.
+export const DIRECTORY_CAPABILITY_READY_TIMEOUT_MS = 15_000;
+
 function bijectiveEncode(name: string): string {
   return name.replace(SAFE_CHARS, (ch) =>
     "!" + ch.charCodeAt(0).toString(16).padStart(2, "0").toUpperCase()
@@ -267,7 +274,7 @@ class DarwinDirectoryCapabilityClient {
       await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(
           () => reject(new Error("directory-capability worker readiness timed out")),
-          2_000,
+          DIRECTORY_CAPABILITY_READY_TIMEOUT_MS,
         );
         const onMessage = (raw: CapabilityResponse): void => {
           if (!raw.ready) return;
