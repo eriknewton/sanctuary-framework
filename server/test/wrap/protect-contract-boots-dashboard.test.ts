@@ -1,4 +1,4 @@
-// fail-before-exempt: fixture-only edit. The shared InstallProbeResult fixture gains the additive vaultProvision observation with the neutral "unknown" value; no assertion changed. The behavior it feeds is proven in test/cli/install.test.ts.
+// fail-before-exempt: fixture-only edit for this approval-readiness change. The InstallProbeResult literal gains tier1Approval="available" so this unchanged protect-contract test reaches its existing assertion; the new approval behavior fails before in test/cli/install.test.ts.
 /**
  * Capability under test (AGENTS.md rule 4, wired consumer): the credential
  * `sanctuary init` enrols is the credential every stage of the install
@@ -99,6 +99,7 @@ function baseProbe(over: Partial<InstallProbeResult>): InstallProbeResult {
     custodyAccess: "usable",
     custodyMutation: "available",
     recoveryFactor: "present",
+    tier1Approval: "available",
     nodePath: "/usr/bin/node",
     castleWallApp: "not-applicable",
     castleWallBuildSha: null,
