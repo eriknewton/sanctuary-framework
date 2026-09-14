@@ -18,7 +18,8 @@
 #     expensive gate 2 never runs on a broken typecheck.
 #
 #   Gate 2: transform-error detection + test baseline check
-#     Runs `npm test` in server/ and parses vitest's output for
+#     Runs `npm test` in server/, redacts secret-bearing diagnostic values,
+#     and parses the safe output copy for
 #     three kinds of drift:
 #
 #       a. Transform / collection error substrings.
@@ -309,7 +310,11 @@ fi
 # captured output to classify the failure before deciding how to
 # report it.
 set +e
-test_output=$(cd server && npm test 2>&1)
+# Redact before command substitution stores the diagnostic copy in memory.
+# Tests still receive and exercise their real fixture values. Only their
+# operator/CI-facing output is filtered, and `pipefail` preserves an npm or
+# redactor failure as a non-zero pipeline result.
+test_output=$(cd server && npm test 2>&1 | node ../scripts/redact-test-output.mjs)
 test_exit=$?
 set -e
 
