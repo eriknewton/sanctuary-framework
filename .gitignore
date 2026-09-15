@@ -92,3 +92,6 @@ castle-wall-vmm/Package.resolved
 # credential chokepoint reads it so a child spawned with a scrubbed env still
 # knows it belongs to the test run. See server/test/setup/test-run-marker.ts.
 server/.sanctuary-test-run
+
+# Disposable copied source trees for destructive bundled-plugin tests.
+server/.plugin-test-fixture-*/
