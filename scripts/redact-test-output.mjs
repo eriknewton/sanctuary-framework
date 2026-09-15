@@ -23,17 +23,23 @@ const cliSecret =
 const queryToken = /([?&](?:token|auth_token|bearer_token)=)[^&#\s]+/gi;
 const keyringService = /(service\s+sanctuary-recovery-)[^)\s]+/gi;
 
+// Output can interleave a diagnostic with a secret value. Never silently hide
+// a gate diagnostic during redaction: suppress the bytes but fail the pipeline.
+// These broad words cover the transform/collection classifier and count headers
+// in both .githooks/pre-commit and .github/workflows/test-baseline-guard.yml.
+const gateDiagnostic = /\b(?:transform|failed|cannot|tests|test files)\b/i;
+
 let redactNextNonEmpty = false;
 
 function redactLine(line) {
-  if (redactNextNonEmpty && line.trim() !== "") {
-    redactNextNonEmpty = false;
-    return `${line.match(/^\s*/)?.[0] ?? ""}[REDACTED]`;
-  }
-
   if (nextLineLabels.some((pattern) => pattern.test(line))) {
     redactNextNonEmpty = true;
     return line;
+  }
+
+  if (redactNextNonEmpty && line.trim() !== "") {
+    redactNextNonEmpty = false;
+    return `${line.match(/^\s*/)?.[0] ?? ""}[REDACTED]`;
   }
 
   return line
@@ -49,6 +55,16 @@ process.stdout.on("error", (error) => {
 });
 
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+let refused = false;
 for await (const line of lines) {
-  process.stdout.write(`${redactLine(line)}\n`);
+  // Drain without forwarding after ambiguity: a delayed value may follow it.
+  if (refused) continue;
+  const redacted = redactLine(line);
+  if (redacted !== line && gateDiagnostic.test(line)) {
+    refused = true;
+    process.exitCode = 1;
+    process.stderr.write("redactor: ambiguous diagnostic; refusing gate output\n");
+    continue;
+  }
+  process.stdout.write(`${redacted}\n`);
 }
