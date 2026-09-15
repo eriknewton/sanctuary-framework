@@ -250,23 +250,27 @@ fi
 # work stops being a gate, and its override log stops being a signal.
 #
 # So: scope the fail-above demand to commits that could plausibly have changed
-# the count. Anything under server/ qualifies (test files obviously, but also
-# src, package.json, and vitest config - all of which can move the count). A
-# commit staging NOTHING under server/ cannot have added a test, so an excess
-# over the floor there is platform delta by construction, and is reported as a
-# warning instead of a block.
+# the count. Anything under server/ qualifies except the public package README
+# and server/docs/** (test files obviously qualify, but also src, package.json,
+# and vitest config - all of which can move the count). A commit staging only
+# those documentation paths cannot have added a test, so an excess over the
+# floor there is platform delta by construction and is reported as a warning
+# instead of a block.
 #
 # What this deliberately does NOT relax:
 #   - the fail-BELOW regression check still blocks unconditionally, on every
 #     commit, regardless of what is staged;
-#   - any commit touching server/ still owes the full accounting;
+#   - any commit touching a non-documentation path under server/ still owes the
+#     full accounting;
 #   - the CI guard (.github/workflows/test-baseline-guard.yml) is UNCHANGED and
 #     still enforces the floor exactly. It runs on ubuntu-latest, where local
 #     == CI and no platform delta exists, so it is the authority this local hook
 #     is only the fast convenience copy of.
-server_code_staged=""
-if git diff --cached --name-only 2>/dev/null | grep -qE '^server/'; then
-  server_code_staged="yes"
+server_test_surface_staged=""
+if git diff --cached --name-only 2>/dev/null \
+  | grep -E '^server/' \
+  | grep -qvE '^server/(README\.md|docs/)'; then
+  server_test_surface_staged="yes"
 fi
 
 # `|| true`: under `set -o pipefail` a failing `git show` (e.g. no HEAD on the
@@ -546,9 +550,9 @@ if (( passing > baseline )); then
     # cannot have added a test. The excess is the macOS-over-Linux delta, which
     # is the normal resting state on a dev box. Report it and allow; do NOT
     # demand a bump that would set a floor Linux can never reach.
-    if [[ -z "$server_code_staged" ]]; then
+    if [[ -z "$server_test_surface_staged" ]]; then
       warn "Passing count ($passing) exceeds the committed floor ($baseline) by $((passing - baseline))."
-      warn "This commit stages nothing under server/, so it cannot have added a test -"
+      warn "This commit stages no test-affecting path under server/, so it cannot have added a test -"
       warn "treating the excess as the known macOS-over-Linux platform delta."
       warn "The floor is UNCHANGED at $baseline. Do NOT raise it to your local count:"
       warn "the floor is the LINUX CI passing count, and CI enforces it exactly."
