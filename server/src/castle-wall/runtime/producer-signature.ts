@@ -42,8 +42,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { ed25519 } from "@noble/curves/ed25519";
-
 import {
   CASTLE_WALL_PRODUCER_SIG_DOMAIN_PREFIX,
   CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
@@ -52,6 +50,7 @@ import {
   ED25519_PUBLIC_KEY_BYTES,
   ED25519_SIGNATURE_BYTES,
 } from "../../core/crypto-suite-registry.js";
+import { verify as identityVerify } from "../../core/identity.js";
 
 const ENCODER = new TextEncoder();
 
@@ -361,7 +360,10 @@ export function verifyProducerSignature(
       input.capturedAtUnixMs,
       input.seq
     );
-    if (!ed25519.verify(sig, message, key)) {
+    // Route through the shared strict verify funnel (identity.ts) so the
+    // producer-signature consumer applies the same cofactorless strict profile
+    // as the identity verifier: argument order is (message, sig, key).
+    if (!identityVerify(message, sig, key)) {
       return { ok: false, reason: "producer_signature_verification_failed" };
     }
     return { ok: true };

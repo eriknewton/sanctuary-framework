@@ -348,6 +348,14 @@ describe("Ed25519 byte-width constants", () => {
     expect(declaredInt(identity, "ED25519_PUBLIC_KEY_LENGTH")).toBe(
       declaredInt(registry, "ED25519_PUBLIC_KEY_BYTES"),
     );
+    expect(identity).toMatch(
+      /const ED25519_SIGNATURE_LENGTH = ED25519_PUBLIC_KEY_LENGTH \* 2;/,
+    );
+    const publicWidth = declaredInt(identity, "ED25519_PUBLIC_KEY_LENGTH");
+    expect(publicWidth).not.toBeNull();
+    expect(publicWidth! * 2).toBe(
+      declaredInt(registry, "ED25519_SIGNATURE_BYTES"),
+    );
   });
 
   it("proves core/identity.ts still cannot import the registry", () => {

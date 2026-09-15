@@ -106,6 +106,28 @@ describe("castle-wall/allowlist/parse : manifest signature", () => {
     expect(result.ok).toBe(false);
   });
 
+  it("requires the strict point profile for manifest signatures", () => {
+    const f = buildSignedManifest(["rule-a"]);
+    const identity = new Uint8Array(32);
+    identity[0] = 1;
+    const signature = new Uint8Array(64);
+    signature.set(ed25519.Point.BASE.toBytes());
+    signature[32] = 1;
+    const payload = stringToBytes(canonicalize(f.signed.manifest));
+    expect(ed25519.verify(signature, payload, identity)).toBe(true);
+    const signed: SignedManifest = {
+      ...f.signed,
+      signature: {
+        ...f.signed.signature,
+        signature_b64url: toBase64url(signature),
+      },
+    };
+    expect(verifyManifestSignature(signed, identity)).toEqual({
+      ok: false,
+      error: "manifest signature does not verify against pinned key",
+    });
+  });
+
   it("rejects unsupported signature_scheme", () => {
     const f = buildSignedManifest(["rule-a"]);
     const tampered: SignedManifest = {
