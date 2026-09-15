@@ -28,6 +28,7 @@ import {
   sealedCliRuntimeManifestPath,
 } from "../../scripts/sealed-cli-runtime-entries.mjs";
 import { parseWrapArgs, runWrap, type WrapOptions } from "../../src/wrap/cli.js";
+import { defaultConfig, validateConfig } from "../../src/config.js";
 import { TOP_LEVEL_SUBCOMMANDS } from "../../src/cli/subcommands.js";
 import {
   failedExclusiveEgressStatus,
@@ -1217,6 +1218,7 @@ describe("sanctuary install agent contract", () => {
       await rm(join(fortress, "principal-policy.yaml"));
       expect(await probeTier1Approval(fortress)).toBe("unknown");
 
+
       const externalPolicy = join(fortress, "external-policy.yaml");
       await writePolicy("dashboard");
       await writeFile(externalPolicy, await readFile(join(fortress, "principal-policy.yaml")));
@@ -1240,6 +1242,58 @@ describe("sanctuary install agent contract", () => {
       await writeConfig({ dashboard: { auth_token: "operator-held-bearer" } });
       await writeFile(join(fortress, "principal-policy.yaml"), "not: [valid");
       expect(await probeTier1Approval(fortress)).toBe("unknown");
+    } finally {
+      await rm(fortress, { recursive: true, force: true });
+    }
+  });
+
+  it("checks file and environment validity without changing configuration files", async () => {
+    const fortress = await mkdtemp(join(tmpdir(), "sanctuary-install-approval-valid-"));
+    try {
+      await writeFile(
+        join(fortress, "principal-policy.yaml"),
+        [
+          "version: 1",
+          "tier1_always_approve:",
+          "  - memory_insert",
+          "approval_channel:",
+          "  type: dashboard",
+          "  timeout_seconds: 300",
+          "",
+        ].join("\n"),
+      );
+      const config = defaultConfig();
+      config.dashboard.auth_token = "operator-held-bearer";
+      config.dashboard.port = 3501;
+      validateConfig(config);
+      await writeFile(join(fortress, "sanctuary.json"), JSON.stringify(config));
+      expect(await probeTier1Approval(fortress, {})).toBe("available");
+
+      // Invalid FILE port: the runtime would refuse to boot on this config.
+      config.dashboard.port = 70000;
+      const invalidConfig = JSON.stringify(config);
+      const configPath = join(fortress, "sanctuary.json");
+      await writeFile(configPath, invalidConfig);
+      const entries = (await readdir(fortress)).sort();
+      expect(() => validateConfig(config)).toThrow(/dashboard\.port/);
+      expect(await probeTier1Approval(fortress, {})).toBe("unknown");
+      expect(
+        await probeTier1Approval(fortress, { SANCTUARY_DASHBOARD_PORT: "3501" }),
+      ).toBe("unknown");
+      expect(await readFile(configPath, "utf8")).toBe(invalidConfig);
+      expect((await readdir(fortress)).sort()).toEqual(entries);
+
+      // The environment stage is validated independently of the file stage.
+      config.dashboard.port = 3501;
+      await writeFile(join(fortress, "sanctuary.json"), JSON.stringify(config));
+      expect(
+        await probeTier1Approval(fortress, { SANCTUARY_DASHBOARD_PORT: "80abc" }),
+      ).toBe("unknown");
+      expect(await readFile(configPath, "utf8")).toBe(JSON.stringify(config));
+      await writeFile(configPath, "{malformed");
+      expect(await probeTier1Approval(fortress, {})).toBe("unknown");
+      expect(await readFile(configPath, "utf8")).toBe("{malformed");
+      expect((await readdir(fortress)).sort()).toEqual(entries);
     } finally {
       await rm(fortress, { recursive: true, force: true });
     }
