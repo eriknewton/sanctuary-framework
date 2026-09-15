@@ -462,143 +462,158 @@ describe("2. handshake results: capped + per-session fair + expires_at-aware evi
   it(
     "MUTATION-PROOF TARGET (expires_at): refuses a new result while every slot holds a live verified peer, then EVICTS one once they expire — never blind-FIFOs a live peer",
     async () => {
-      // Short SHR validity (test-only override) so 1000 real handshakes can
-      // all complete WITHIN their validity window, and then all become
-      // expired together after one short sleep — without waiting the real
-      // 1-hour default.
-      const SHR_VALIDITY_MS = 30_000;
-      const registrar = makeAgent();
-      const registrarIdentity = await createIdentityFor(registrar, "registrar-identity");
-      const { tools: registrarTools, handshakeResults } = createHandshakeTools(
-        registrar.config,
-        registrar.identityManager,
-        registrar.masterKey,
-        registrar.auditLog,
-        { shrValidityMs: SHR_VALIDITY_MS }
-      );
-      const initiate = registrarTools.find((t) => t.name === "handshake_initiate")!;
-      const complete = registrarTools.find((t) => t.name === "handshake_complete")!;
-
-      const fillerSessionCount = MAX_HANDSHAKE_RESULTS / MAX_HANDSHAKE_RESULTS_PER_ORIGIN;
-      const probeSession = "agent:probe-session";
-
-      // Runs a REAL 3-step handshake (initiate/respond/complete) between the
-      // registrar (as `callerIdentity`'s session) and a freshly-minted
-      // counterparty fortress, and returns the PARSED handshake_complete
-      // response — callers assert success or refusal as appropriate (a
-      // refused recordHandshakeResult is an EXPECTED outcome for the
-      // overflow probes below, so this helper must not assert success
-      // itself). The counterparty's OWN `respond` call gets a per-call
-      // UNIQUE callerIdentity so its (separate, single-use) session store
-      // never approaches its own quota.
-      async function completeRealHandshake(
-        callerIdentity: string,
-        counterpartyLabel: string
-      ): Promise<{ result?: { verified: boolean }; error?: string }> {
-        const counterpartyFortress = makeAgent();
-        const counterpartyIdentity = await createIdentityFor(
-          counterpartyFortress,
-          counterpartyLabel
-        );
-        const { tools: counterpartyTools } = createHandshakeTools(
-          counterpartyFortress.config,
-          counterpartyFortress.identityManager,
-          counterpartyFortress.masterKey,
-          counterpartyFortress.auditLog,
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        // Control Date only: real handshakes, audit work, and timeout timers
+        // still run normally, independent of verifier throughput or CI load.
+        const SHR_VALIDITY_MS = 30_000;
+        const registrar = makeAgent();
+        const registrarIdentity = await createIdentityFor(registrar, "registrar-identity");
+        const { tools: registrarTools, handshakeResults } = createHandshakeTools(
+          registrar.config,
+          registrar.identityManager,
+          registrar.masterKey,
+          registrar.auditLog,
           { shrValidityMs: SHR_VALIDITY_MS }
         );
-        const respond = counterpartyTools.find((t) => t.name === "handshake_respond")!;
-        const initiated = parse(
-          await initiate.handler({ identity_id: registrarIdentity.identity_id }, callerIdentity)
+        const initiate = registrarTools.find((t) => t.name === "handshake_initiate")!;
+        const complete = registrarTools.find((t) => t.name === "handshake_complete")!;
+
+        const fillerSessionCount = MAX_HANDSHAKE_RESULTS / MAX_HANDSHAKE_RESULTS_PER_ORIGIN;
+        const probeSession = "agent:probe-session";
+
+        // Runs a REAL 3-step handshake (initiate/respond/complete) between the
+        // registrar (as `callerIdentity`'s session) and a freshly-minted
+        // counterparty fortress, and returns the PARSED handshake_complete
+        // response — callers assert success or refusal as appropriate (a
+        // refused recordHandshakeResult is an EXPECTED outcome for the
+        // overflow probes below, so this helper must not assert success
+        // itself). The counterparty's OWN `respond` call gets a per-call
+        // UNIQUE callerIdentity so its (separate, single-use) session store
+        // never approaches its own quota.
+        async function completeRealHandshake(
+          callerIdentity: string,
+          counterpartyLabel: string
+        ): Promise<{ result?: { verified: boolean }; error?: string }> {
+          const counterpartyFortress = makeAgent();
+          const counterpartyIdentity = await createIdentityFor(
+            counterpartyFortress,
+            counterpartyLabel
+          );
+          const { tools: counterpartyTools } = createHandshakeTools(
+            counterpartyFortress.config,
+            counterpartyFortress.identityManager,
+            counterpartyFortress.masterKey,
+            counterpartyFortress.auditLog,
+            { shrValidityMs: SHR_VALIDITY_MS }
+          );
+          const respond = counterpartyTools.find((t) => t.name === "handshake_respond")!;
+          const initiated = parse(
+            await initiate.handler({ identity_id: registrarIdentity.identity_id }, callerIdentity)
+          );
+          const responded = parse(
+            await respond.handler(
+              {
+                challenge: initiated.challenge,
+                identity_id: counterpartyIdentity.identity_id,
+              },
+              `agent:counterparty-${counterpartyLabel}`
+            )
+          );
+          return parse(
+            await complete.handler(
+              {
+                session_id: initiated.session_id,
+                response: responded.response,
+              },
+              callerIdentity
+            )
+          );
+        }
+
+        // Fill handshakeResults to EXACTLY the global cap, spread across
+        // `fillerSessionCount` distinct agent SESSIONS (one shared registrar
+        // identity throughout — origin no longer depends on identity_id) so
+        // no single one ever exceeds its own per-origin quota.
+        let counter = 0;
+        for (let s = 0; s < fillerSessionCount; s += 1) {
+          const session = `agent:filler-session-${s}`;
+          for (let i = 0; i < MAX_HANDSHAKE_RESULTS_PER_ORIGIN; i += 1) {
+            const completed = await completeRealHandshake(session, `peer-${counter}`);
+            expect(completed.result?.verified).toBe(true);
+            counter += 1;
+          }
+        }
+        expect(handshakeResults.size).toBe(MAX_HANDSHAKE_RESULTS);
+        for (const result of handshakeResults.values()) {
+          expect(result.verified).toBe(true);
+          expect(result.liveness_proven).toBe(true);
+          expect(new Date(result.expires_at).getTime()).toBeGreaterThan(Date.now());
+        }
+
+        let saturatedAudited = 0;
+        let evictedAudited: { expired?: boolean } | undefined;
+        const originalAppend = registrar.auditLog.append.bind(registrar.auditLog);
+        registrar.auditLog.append = ((...args: Parameters<AuditLog["append"]>) => {
+          if (args[1] === "handshake_results_saturated") saturatedAudited += 1;
+          return originalAppend(...args);
+        }) as AuditLog["append"];
+        // Eviction now audits via appendCritical (MUST-FIX 6, fix-round-2 —
+        // awaited, durable, BEFORE the delete), not the low-risk `.append`
+        // fire-and-forget it used before, so the spy targets that method.
+        const originalAppendCritical = registrar.auditLog.appendCritical.bind(
+          registrar.auditLog
         );
-        const responded = parse(
-          await respond.handler(
-            {
-              challenge: initiated.challenge,
-              identity_id: counterpartyIdentity.identity_id,
-            },
-            `agent:counterparty-${counterpartyLabel}`
+        registrar.auditLog.appendCritical = ((
+          ...args: Parameters<AuditLog["appendCritical"]>
+        ) => {
+          const entry = args[0];
+          // MUST-FIX 2, fix-round-5: the pre-delete critical write is now the
+          // INTENT record (`_eviction_intent`), not `_evicted` — the
+          // COMPLETION record moved to a fire-and-forget `append()` call in
+          // `onEvicted` (see handshake/tools.ts), which fires only after the
+          // authoritative delete and is therefore not intercepted here.
+          if (entry.operation === "handshake_result_eviction_intent") {
+            evictedAudited = entry.details as { expired?: boolean };
+          }
+          return originalAppendCritical(...args);
+        }) as AuditLog["appendCritical"];
+
+        // Every slot holds a verified, live, UNEXPIRED peer — the probe
+        // session's own new handshake is REFUSED, not admitted by evicting
+        // one of them (never blind-FIFO a live peer).
+        const whileLive = await completeRealHandshake(
+          probeSession,
+          "overflow-while-live"
+        );
+        expect(whileLive.result).toBeUndefined();
+        expect(whileLive.error).toContain("live, unexpired peer");
+        expect(handshakeResults.size).toBe(MAX_HANDSHAKE_RESULTS);
+        expect(saturatedAudited).toBeGreaterThan(0);
+
+        // Move Date beyond the actual latest stored expiry, without changing
+        // any peer record or faking timeout timers. The same probe must now
+        // succeed through the real admission and eviction-audit paths.
+        const latestExpiry = Math.max(
+          ...Array.from(handshakeResults.values(), (result) =>
+            new Date(result.expires_at).getTime()
           )
         );
-        return parse(
-          await complete.handler(
-            {
-              session_id: initiated.session_id,
-              response: responded.response,
-            },
-            callerIdentity
-          )
+        vi.setSystemTime(latestExpiry + 1);
+        for (const result of handshakeResults.values()) {
+          expect(new Date(result.expires_at).getTime()).toBeLessThanOrEqual(Date.now());
+        }
+        const afterExpiry = await completeRealHandshake(
+          probeSession,
+          "overflow-after-expiry"
         );
+        expect(afterExpiry.result?.verified).toBe(true);
+        expect(handshakeResults.size).toBe(MAX_HANDSHAKE_RESULTS);
+        expect(evictedAudited).toBeDefined();
+        expect(evictedAudited!.expired).toBe(true);
+      } finally {
+        vi.useRealTimers();
       }
-
-      // Fill handshakeResults to EXACTLY the global cap, spread across
-      // `fillerSessionCount` distinct agent SESSIONS (one shared registrar
-      // identity throughout — origin no longer depends on identity_id) so
-      // no single one ever exceeds its own per-origin quota.
-      let counter = 0;
-      for (let s = 0; s < fillerSessionCount; s += 1) {
-        const session = `agent:filler-session-${s}`;
-        for (let i = 0; i < MAX_HANDSHAKE_RESULTS_PER_ORIGIN; i += 1) {
-          const completed = await completeRealHandshake(session, `peer-${counter}`);
-          expect(completed.result?.verified).toBe(true);
-          counter += 1;
-        }
-      }
-      expect(handshakeResults.size).toBe(MAX_HANDSHAKE_RESULTS);
-
-      let saturatedAudited = 0;
-      let evictedAudited: { expired?: boolean } | undefined;
-      const originalAppend = registrar.auditLog.append.bind(registrar.auditLog);
-      registrar.auditLog.append = ((...args: Parameters<AuditLog["append"]>) => {
-        if (args[1] === "handshake_results_saturated") saturatedAudited += 1;
-        return originalAppend(...args);
-      }) as AuditLog["append"];
-      // Eviction now audits via appendCritical (MUST-FIX 6, fix-round-2 —
-      // awaited, durable, BEFORE the delete), not the low-risk `.append`
-      // fire-and-forget it used before, so the spy targets that method.
-      const originalAppendCritical = registrar.auditLog.appendCritical.bind(
-        registrar.auditLog
-      );
-      registrar.auditLog.appendCritical = ((
-        ...args: Parameters<AuditLog["appendCritical"]>
-      ) => {
-        const entry = args[0];
-        // MUST-FIX 2, fix-round-5: the pre-delete critical write is now the
-        // INTENT record (`_eviction_intent`), not `_evicted` — the
-        // COMPLETION record moved to a fire-and-forget `append()` call in
-        // `onEvicted` (see handshake/tools.ts), which fires only after the
-        // authoritative delete and is therefore not intercepted here.
-        if (entry.operation === "handshake_result_eviction_intent") {
-          evictedAudited = entry.details as { expired?: boolean };
-        }
-        return originalAppendCritical(...args);
-      }) as AuditLog["appendCritical"];
-
-      // Every slot holds a verified, live, UNEXPIRED peer — the probe
-      // session's own new handshake is REFUSED, not admitted by evicting
-      // one of them (never blind-FIFO a live peer).
-      const whileLive = await completeRealHandshake(
-        probeSession,
-        "overflow-while-live"
-      );
-      expect(whileLive.result).toBeUndefined();
-      expect(whileLive.error).toContain("live, unexpired peer");
-      expect(handshakeResults.size).toBe(MAX_HANDSHAKE_RESULTS);
-      expect(saturatedAudited).toBeGreaterThan(0);
-
-      // Wait past SHR_VALIDITY_MS: every filler entry's expires_at is now
-      // in the past. A fresh handshake for the SAME probe session must now
-      // SUCCEED — an expired verified entry rolls off to admit a new one,
-      // instead of wedging the store for the server's lifetime.
-      await sleep(SHR_VALIDITY_MS + 500);
-      const afterExpiry = await completeRealHandshake(
-        probeSession,
-        "overflow-after-expiry"
-      );
-      expect(afterExpiry.result?.verified).toBe(true);
-      expect(handshakeResults.size).toBe(MAX_HANDSHAKE_RESULTS);
-      expect(evictedAudited).toBeDefined();
-      expect(evictedAudited!.expired).toBe(true);
     },
     240_000
   );

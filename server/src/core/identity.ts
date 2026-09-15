@@ -30,6 +30,12 @@ const ED25519_MULTICODEC_PREFIX = new Uint8Array([0xed, 0x01]);
  * `key-length-constants.test.ts` asserts the two declarations stay equal.
  */
 const ED25519_PUBLIC_KEY_LENGTH = 32;
+/**
+ * RFC 8032 encoding: 32-byte compressed R followed by 32-byte scalar S.
+ * Must match ED25519_SIGNATURE_BYTES in core/crypto-suite-registry.ts;
+ * key-length-constants.test.ts pins this without an import cycle.
+ */
+const ED25519_SIGNATURE_LENGTH = ED25519_PUBLIC_KEY_LENGTH * 2;
 
 /** Public identity information (safe to share) */
 export interface PublicIdentity {
@@ -352,10 +358,60 @@ export function verify(
   publicKey: Uint8Array
 ): boolean {
   try {
-    // Generic Ed25519 verification funnel used by tool-level and suite-level
-    // verifiers. Malformed signature or public-key bytes must return `false`
-    // here, not escape as caller-dependent exception handling.
-    return ed25519.verify(signature, payload, publicKey);
+    // Strict profile. RFC 8032 section 5.1.7 permits cofactored and
+    // cofactorless verification alike, and requires a prime-order check on
+    // neither A nor R, so two conformant verifiers can disagree about the
+    // same bytes. @noble's equation below is always the COFACTORED one;
+    // this gate is what turns the combined result COFACTORLESS STRICT
+    // for this TypeScript funnel. RFC 8032 5.1.3
+    // already rejects unreduced y; this gate adds the eight small-order
+    // points and torsion-bearing points,
+    // neither required by bare RFC 8032.
+    if (
+      !isStrictEd25519PointEncoding(publicKey) ||
+      signature.length !== ED25519_SIGNATURE_LENGTH ||
+      !isStrictEd25519PointEncoding(
+        signature.subarray(0, ED25519_PUBLIC_KEY_LENGTH)
+      )
+    ) {
+      return false;
+    }
+    // Malformed bytes must return `false`, not throw. `zip215: false` selects
+    // canonical decoding for A and R (RFC 8032 `y < p`); it
+    // does NOT select a cofactorless equation, and it does not gate the scalar check
+    // either: `S < L` runs unconditionally either way. @noble always evaluates the
+    // cofactored `[8](R + [k]A - [S]B) = 0`. The gate above puts A and R in the
+    // prime-order subgroup, so multiplying by 8 is invertible there and the
+    // cofactored check @noble runs is equivalent to the cofactorless equation
+    // on these admitted points. This is not a cross-language acceptance claim:
+    // the release's Rust verifiers are unchanged and are not certified here.
+    return ed25519.verify(signature, payload, publicKey, { zip215: false });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Castle Wall's strict authority-point profile. Shared by the `verify` funnel
+ * above; not by every Ed25519 check in the server: several sites call
+ * `ed25519.verify` directly (for example `substrate/manifest.ts`,
+ * `intelligence/model-catalog-v3.ts`, and multiple exit and transparency
+ * sites) and are unaffected by this profile.
+ *
+ * A wrong length is not a point at all. The strict decoder enforces canonical
+ * encoding; `isSmallOrder() || !isTorsionFree()` then restricts admission to
+ * nonidentity prime-order points. Re-encoding is redundant with the installed
+ * strict decoder, retained as defense in depth against a future decoder change.
+ * Consumers that key a pin, id, or cache on bytes must not admit multiple byte
+ * encodings for the same authority point.
+ */
+export function isStrictEd25519PointEncoding(bytes: Uint8Array): boolean {
+  if (bytes.length !== ED25519_PUBLIC_KEY_LENGTH) return false;
+  try {
+    const point = ed25519.Point.fromBytes(bytes, false);
+    if (point.isSmallOrder() || !point.isTorsionFree()) return false;
+    const canonical = point.toBytes();
+    return canonical.every((byte, index) => byte === bytes[index]);
   } catch {
     return false;
   }
