@@ -3,6 +3,7 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readFileSync } from "node:fs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const redactor = join(scriptDir, "redact-test-output.mjs");
@@ -63,6 +64,63 @@ for (const preserved of [
 const redactionCount = result.stdout.match(/\[REDACTED\]/g)?.length ?? 0;
 if (redactionCount !== 8) {
   throw new Error(`expected 8 redactions, observed ${redactionCount}`);
+}
+
+// A diagnostic arriving where a multiline value was expected must not become
+// an apparently clean gate transcript. Refuse without echoing candidate bytes.
+// Exercise the actual consumers' entire classifier sets, not a hand-maintained
+// subset. A changed declaration format must fail this extraction for review.
+const consumerMarkers = [
+  [join(scriptDir, "../.githooks/pre-commit"), /TRANSFORM_ERROR_PATTERNS='\(([^']+)\)'/],
+  [join(scriptDir, "../.github/workflows/test-baseline-guard.yml"), /PATTERNS='\(([^']+)\)'/],
+].flatMap(([path, pattern]) => {
+  const match = readFileSync(path, "utf8").match(pattern);
+  if (!match) throw new Error("gate classifier extraction needs review");
+  return match[1].split("|");
+});
+const diagnostics = [
+  ...new Set(consumerMarkers),
+  "Test Files 1132 passed (1132)",
+  "Tests 16315 passed (16315)",
+];
+const labels = [
+  "Recovery key:",
+  "Auth token:",
+  "Recovery material staged locally for the operator at:",
+  "An off-host plaintext copy was written to:",
+  "Sanctuary init: recovery key written to:",
+];
+const sentinel = "COLLISION_VALUE_MUST_NOT_BE_EMITTED";
+for (const first of labels) {
+  for (const second of labels) {
+    const consecutive = spawnSync(process.execPath, [redactor], {
+      encoding: "utf8",
+      input: `${first}\n${second}\n${sentinel}\n`,
+    });
+    if (consecutive.status !== 0 || consecutive.stdout.includes(sentinel) ||
+        consecutive.stderr.includes(sentinel)) {
+      throw new Error("consecutive labels exposed the following value");
+    }
+  }
+}
+for (const diagnostic of diagnostics) {
+  for (const label of labels) {
+    const collision = spawnSync(process.execPath, [redactor], {
+      encoding: "utf8",
+      input: `${label}\n\n${diagnostic} ${sentinel}\n${sentinel}_DELAYED\nTests 16315 passed (16315)\n`,
+    });
+    if (collision.status !== 1 ||
+        collision.stdout.includes(sentinel) || collision.stderr.includes(sentinel)) {
+      throw new Error("multiline diagnostic collision did not fail closed safely");
+    }
+  }
+  const inline = spawnSync(process.execPath, [redactor], {
+    encoding: "utf8",
+    input: `fixture={"passphrase":"${diagnostic} ${sentinel}"}\n`,
+  });
+  if (inline.status !== 1 || inline.stdout.includes(sentinel) || inline.stderr.includes(sentinel)) {
+    throw new Error("inline diagnostic collision did not fail closed safely");
+  }
 }
 
 process.stdout.write("redact-test-output self-test: PASS\n");
