@@ -69,6 +69,21 @@ Prints the passphrase to stdout after a confirmation prompt. Store it in a passw
 npm install -g @sanctuary-framework/mcp-server
 ```
 
+The current opt-in preview is **v1.8.6-rc.5** on npm's `next` channel. Default
+installs still resolve to v1.8.4, and RC5 does not widen any capability claim.
+
+```bash
+npm install -g @sanctuary-framework/mcp-server@1.8.6-rc.5
+# or run the guided installer without a global install
+npx @sanctuary-framework/mcp-server@1.8.6-rc.5 protect --claude-code
+```
+
+The [v1.8.6-rc.5 GitHub prerelease](https://github.com/eriknewton/sanctuary-framework/releases/tag/v1.8.6-rc.5)
+carries the signed and notarized macOS app. Its
+`Sanctuary-CastleWall.app.zip` SHA-256 is
+`bd19890ad40d8c15b0c44201d537d6d7c9d6c82437db6a4611f8d841837409aa`.
+See the [RC5 release notes](docs/releases/v1.8.6.md) for the bounded fix set.
+
 Current capability summary:
 
 | Surface | Current status |
@@ -158,28 +173,14 @@ npm install -g @sanctuary-framework/mcp-server
 
 Makes the `sanctuary` CLI available without `npx` prefix.
 
-### Manual MCP config
+### Advanced MCP configuration
 
-If you prefer to edit your harness MCP config by hand:
-
-```bash
-# OpenClaw
-openclaw mcp set sanctuary '{"command":"npx","args":["-y","@sanctuary-framework/mcp-server"],"env":{"SANCTUARY_PASSPHRASE":"your-passphrase-here"}}'
-
-# Hermes Agent
-hermes mcp set sanctuary '{"command":"npx","args":["-y","@sanctuary-framework/mcp-server"],"env":{"SANCTUARY_PASSPHRASE":"your-passphrase-here"}}'
-
-# Claude Code
-claude mcp add sanctuary -- npx -y @sanctuary-framework/mcp-server
-```
-
-Generate a passphrase before first launch:
-
-```bash
-openssl rand -base64 32
-```
-
-Store it securely. It derives the encryption keys for all persistent state. If lost, encrypted state cannot be recovered.
+Prefer `sanctuary protect` because it preserves existing MCP entries, binds the
+harness to the selected fortress, and uses enrolled host-local custody. A raw
+parallel MCP entry does not place calls to other servers behind Sanctuary's
+cooperative policy gate. Do not put a passphrase or recovery key in a harness
+configuration. For service-manager and direct-server cases, provision the
+fortress first and follow the [deployment guide](server/docs/DEPLOYMENT.md).
 
 ### Health check
 
