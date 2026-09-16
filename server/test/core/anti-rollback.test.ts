@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only DEBT handle retrofit (PR #1428); no behavior is asserted by this change, so the file cannot fail against pre-change source.
 /**
  * Anti-Rollback Epoch Anchoring — Stage 1 tests.
  *

@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only DEBT handle retrofit (PR #1428); no behavior is asserted by this change, so the file cannot fail against pre-change source.
 /**
  * Store-level durability tests for the federation peer-sync security state
  * (Federation 3/3b P0).
