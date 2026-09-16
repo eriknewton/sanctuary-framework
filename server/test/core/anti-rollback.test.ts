@@ -178,7 +178,7 @@ describe("epoch witness", () => {
   });
 });
 
-describe("baseline-established latch (DEBT-1 close-out)", () => {
+describe("baseline-established latch (CONFIG-BASELINE-ROLLBACK-CLOSED close-out)", () => {
   it("an untrusted (absent) witness reports established=false + witnessUntrusted", async () => {
     const storage = new MemoryStorage();
     const master = generateRandomKey();

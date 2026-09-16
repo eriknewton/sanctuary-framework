@@ -62,7 +62,7 @@
  * config, never the wire request; `gate-server.ts` sources it from the
  * policy it was constructed with), never a value an adversary could steer.
  * `parseLsofPeer` stays PURE: it takes `gatePort` as a parameter and makes
- * no policy decision of its own. DEBT: a
+ * no policy decision of its own. DEBT(EGRESS-PEER-NATIVE-LOOKUP): a
  * `proc_pidinfo`/`PROC_PIDFDSOCKETINFO` native path would avoid the lsof
  * dependency (in BOTH the legacy in-process caller and the privileged
  * resolver daemon) at the cost of a native module; the 2026-07-24 fix ships

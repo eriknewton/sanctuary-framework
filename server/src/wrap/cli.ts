@@ -3565,7 +3565,7 @@ export async function runWrap(
         // plain writeFile, both of which follow a symlinked parent (e.g.
         // ~/.hermes -> /tmp/victim). Route it through the same safe-path
         // discipline as every other wrap sink.
-        // DEBT (hermes cli-config.json): this JSON file is a legacy compat
+        // DEBT(WRAP-CLI-HERMES-LEGACY-CONFIG) (hermes cli-config.json): this JSON file is a legacy compat
         // artifact. Hermes v0.16.0 does NOT consult it for MCP routing
         // (hermes-yaml.ts:4-10). It is kept because the generic wrap flow
         // keys off `agentConfig`, which detectAgentConfigWithDiagnostics
@@ -3627,7 +3627,7 @@ export async function runWrap(
   // detection only probes the legacy JSON compat surface
   // (`~/.hermes/cli-config.json` / `config.json`) -- never the authoritative
   // `~/.hermes/config.yaml` that v0.16.0 actually routes MCP traffic
-  // through (see the DEBT note above). A first-install/yaml-only Hermes
+  // through (see the WRAP-CLI-HERMES-LEGACY-CONFIG note above). A first-install/yaml-only Hermes
   // host therefore has `agentConfig === undefined` on the FIRST detection
   // call, and only resolves to a Hermes config once the bootstrap block
   // above has written the compat JSON file and re-detected. Checking before
@@ -3775,7 +3775,7 @@ export async function runWrap(
     if (agentConfig.platform === "hermes") {
       // F7 (v1.6.1 first-run honesty): the empty surface here is the legacy
       // cli-config.json artifact Hermes does NOT consult for MCP routing
-      // (see the DEBT note in the bootstrap path above). Printing "installed
+      // (see the WRAP-CLI-HERMES-LEGACY-CONFIG note in the bootstrap path above). Printing "installed
       // as the only MCP server" contradicted the config.yaml message printed
       // moments earlier ("existing MCP servers there are preserved"), so
       // point at the authoritative YAML surface instead.

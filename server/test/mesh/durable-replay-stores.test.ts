@@ -1,7 +1,7 @@
 /**
  * Durability tests for the two federation single-use replay stores.
  *
- * The DEBT these close: both the local-join nonce store and the operator-cloud
+ * The debt these close (tracked as MESH-SPENT-SET-DURABILITY): both the local-join nonce store and the operator-cloud
  * provision-claim store were in-memory only, so a daemon restart mid-TTL FORGOT a
  * spent nonce / consumed claim and re-allowed that one already-authorized token
  * until its (<=15 min) expiry. These tests prove the durable backend remembers

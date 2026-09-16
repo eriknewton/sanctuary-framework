@@ -452,7 +452,7 @@ export class PolicyStore {
     if (!rehydrated.ok) {
       return { ok: false, reason: "quota_state_unavailable" };
     }
-    // DEBT (residual, LD3 gate fix-round-2, accepted not fixed): the
+    // DEBT(DISCLOSURE-QUOTA-CROSS-PROCESS-RACE) (residual, LD3 gate fix-round-2, accepted not fixed): the
     // rehydrate-then-admit sequence above is not atomic ACROSS PROCESSES —
     // two `PolicyStore` instances backed by the same storage could both
     // `loadAll()` a count of 19 and both admit, landing at 21. Accepted
@@ -627,7 +627,7 @@ export class PolicyStore {
    * that got cached: the `this.policies.has(meta.key)` guard below skips
    * them, so a call after the first successful rehydrate only re-lists
    * storage metadata and does no redundant decrypt work for those keys.
-   * DEBT (LD3 gate fix-round-2, accepted not fixed): a legacy, pre-fix
+   * DEBT(DISCLOSURE-OVERCAP-CACHE-RESCAN) (LD3 gate fix-round-2, accepted not fixed): a legacy, pre-fix
    * over-cap policy that `this.policies.set()` REFUSES below is never
    * cached, so `has()` never skips it — every future call to `loadAll()`
    * (i.e. every `create()`/`update()`, since both call it) re-reads and

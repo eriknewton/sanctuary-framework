@@ -39,7 +39,7 @@
  * only). `crossCheckConfigBaseline` runs as boot step "5rc", immediately after
  * the master key is established (alongside the "5rb" anti-rollback cross-check).
  *
- * DEBT-1 (CLOSED 2026-06-29, via the boot-anchored monotonic witness). The
+ * DEBT(CONFIG-BASELINE-ROLLBACK-CLOSED) (CLOSED 2026-06-29, via the boot-anchored monotonic witness). The
  * original residual: an on-host attacker without the master key could DELETE the
  * baseline record (re-entering the genuine-first-run seed path) OR present a
  * recognized-OLDER-schema record (the reseed path), and in either case seed a
@@ -48,7 +48,7 @@
  * older-schema reseed was closed by a record that lives in ONE deletable
  * location.
  *
- * THE CLOSE-OUT (the upgrade path named in the original DEBT block). The
+ * THE CLOSE-OUT (the upgrade path named in the original CONFIG-BASELINE-ROLLBACK-CLOSED block). The
  * baseline's EXISTENCE and highest sealed SCHEMA are now bound into the same
  * boot-anchored monotonic epoch witness the custody anti-rollback floor uses
  * (`readBaselineEstablishedLatch` / `raiseBaselineEstablishedLatch` in
@@ -337,7 +337,7 @@ async function loadAuthenticatedBaseline(
   // upgraded the binary) is not necessarily an attack: signal a reseed and carry
   // the recognized schema so the CALLER can distinguish a legit forward upgrade
   // from a downgrade-reseed replay against the boot-anchored witness's
-  // sealed-schema floor (DEBT-1 close-out in `crossCheckConfigBaseline`). This
+  // sealed-schema floor (CONFIG-BASELINE-ROLLBACK-CLOSED close-out in `crossCheckConfigBaseline`). This
   // branch is reached BEFORE the MAC check, so the older record's MAC is NOT
   // verified here (an older-schema record cannot authenticate as the current
   // schema anyway; the MAC covers the schema): the reseed mints from the CURRENT
@@ -425,7 +425,7 @@ export type ConfigBaselineCrossCheck =
 // first-run "seeded" so the audit trail records why a new baseline was minted.
 
 /**
- * Build the `config_baseline_rollback` refusal (DEBT-1 close-out): the baseline
+ * Build the `config_baseline_rollback` refusal (CONFIG-BASELINE-ROLLBACK-CLOSED close-out): the baseline
  * record is absent (deleted) or presents an older schema (downgrade reseed) on a
  * fortress whose boot-anchored monotonic witness records that a baseline was
  * already established. Distinct reason from `config_baseline_invalid` so the
@@ -446,20 +446,20 @@ function configBaselineRollbackError(detail: string): ConfigDowngradeError {
 /**
  * Boot step "5rc": authenticate the persisted config-security baseline against
  * the master key, cross-check its EXISTENCE against the boot-anchored monotonic
- * witness (DEBT-1 close-out), then compare its posture to the running config.
+ * witness (CONFIG-BASELINE-ROLLBACK-CLOSED close-out), then compare its posture to the running config.
  *
  *   - downgrade detected  -> THROW `ConfigDowngradeError` (boot refused).
  *   - invalid baseline    -> THROW `ConfigDowngradeError`
  *                            (`config_baseline_invalid`; boot refused).
  *   - DELETION replay     -> THROW `ConfigDowngradeError`
  *     (record absent but the witness latch says a baseline WAS established;
- *      `config_baseline_rollback`; boot refused). This closes the DEBT-1
+ *      `config_baseline_rollback`; boot refused). This closes the CONFIG-BASELINE-ROLLBACK-CLOSED
  *      deletion-then-reseed leg with PREVENTION, not just an after-the-fact
  *      `reseeded` audit entry.
  *   - DOWNGRADE reseed    -> THROW `ConfigDowngradeError`
  *     (an older-schema record presented on a fortress whose witness already
  *      sealed a HIGHER schema; `config_baseline_rollback`; boot refused). This
- *      closes the DEBT-1 older-schema-reseed leg.
+ *      closes the CONFIG-BASELINE-RESEED-LEG older-schema-reseed leg.
  *   - no downgrade        -> advance the baseline (re-MAC, fresh observed_at) and
  *                            re-raise the witness latch; returns { kind: "advanced" }.
  *   - genuine first run   -> seed the baseline + raise the witness latch; returns
@@ -470,7 +470,7 @@ function configBaselineRollbackError(detail: string): ConfigDowngradeError {
  *     brick: the #805 reseed-not-brick behavior survives; only a BACKWARD reseed
  *     below the sealed floor is refused.
  *
- * THE WITNESS THREADING (DEBT-1). The config-baseline record lives in a single
+ * THE WITNESS THREADING (CONFIG-BASELINE-ROLLBACK-CLOSED). The config-baseline record lives in a single
  * deletable location; deleting it (or presenting an older-schema record) re-
  * enters the genuine-first-run seed path and seeds a downgraded posture WITHOUT
  * the master key. We close that by binding the baseline's existence + highest
@@ -513,7 +513,7 @@ export async function crossCheckConfigBaseline(args: {
   const latch = await readBaselineEstablishedLatch(storage, master);
 
   if (loaded.status === "absent") {
-    // DEBT-1 deletion leg. A baseline record that is ABSENT on a fortress whose
+    // DEBT(CONFIG-BASELINE-DELETION-LEG) (deletion leg). A baseline record that is ABSENT on a fortress whose
     // authenticated witness latch says one WAS established is a deletion-replay:
     // the attacker deleted the single deletable record to re-enter the first-run
     // seed path and seed a downgraded posture. Fail closed (refuse boot). Only a
@@ -539,7 +539,7 @@ export async function crossCheckConfigBaseline(args: {
   }
 
   if (loaded.status === "reseed") {
-    // DEBT-1 reseed leg. A recognized OLDER-schema record. Distinguish a
+    // DEBT(CONFIG-BASELINE-RESEED-LEG) (reseed leg). A recognized OLDER-schema record. Distinguish a
     // legitimate FORWARD binary upgrade from a BACKWARD downgrade-reseed attack
     // using the witness's monotonic sealed-schema floor:
     //  - presented schema BELOW the sealed floor  -> downgrade reseed: an

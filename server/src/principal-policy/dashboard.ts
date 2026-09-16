@@ -6307,7 +6307,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // distinguishable error → no membership/enabled-state oracle). The counter
       // is released in a finally after the handler resolves.
       //
-      // DEBT (Federation P1): the per-/64 rate limit + this concurrent-verify
+      // DEBT(PRINCIPAL-POLICY-FEDERATION-RATE-LIMIT) (Federation P1): the per-/64 rate limit + this concurrent-verify
       // ceiling bound CPU spent on crypto verification, but do NOT bound a
       // slow-loris socket-exhaustion attack: there is no listener read/idle
       // timeout and no max-connection bound. `v1/http.ts` readJsonBody has no

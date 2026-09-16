@@ -908,7 +908,7 @@ export async function startMacOSCastleWallDaemon(
    * loss window is one heartbeat interval, or a crash/SIGKILL before the
    * next carry. This is availability-of-evidence in a crash window, not a
    * forgery path; the full-chain verification is unchanged.
-   * DEBT: if a drill ever shows that window matters, persist the pending
+   * DEBT(CASTLE-WALL-MACOS-DAEMON-PENDING-WINDOW): if a drill ever shows that window matters, persist the pending
    * count alongside the existing daemon state (the active-config /
    * fortress-path files) instead of building a retry queue.
    *
