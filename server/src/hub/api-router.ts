@@ -494,14 +494,12 @@ export async function handleHubRoute(
         question?: unknown;
         stream?: unknown;
         includePayloads?: unknown;
-        localOnly?: unknown;
       }>(req);
       const question = checkChatMessage(body.question);
       const response = await deps.service.askConcierge({
         question,
         stream: body.stream === true,
         includePayloads: body.includePayloads === true,
-        localOnly: body.localOnly === true,
       });
       writeJSON(res, 200, { ok: true, data: { response } });
       return true;
@@ -782,10 +780,9 @@ export async function handleHubRoute(
       method === "POST" &&
       path === HUB_ROUTES.CHAT_CONCIERGE_SEND
     ) {
-      const body = await readJSONBody<{ message?: unknown; localOnly?: unknown }>(req);
+      const body = await readJSONBody<{ message?: unknown }>(req);
       const message = checkChatMessage(body.message);
-      const localOnly = body.localOnly === true;
-      const result = await deps.service.sendConcierge(message, { localOnly });
+      const result = await deps.service.sendConcierge(message);
       writeJSON(res, 200, { ok: true, data: result });
       return true;
     }

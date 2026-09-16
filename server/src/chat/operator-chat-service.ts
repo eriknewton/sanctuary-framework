@@ -548,24 +548,8 @@ export class OperatorChatService {
    * unavailable" response and audit-emits with `outcome` = the
    * appropriate failure class. The chat history reflects what the
    * operator sees on the page (no silent dropping).
-   *
-   * `opts.localOnly` (2026-09-15 slice) is a per-request constraint, not a
-   * standing configuration change: when true, this round-trip's final
-   * summarize call never reaches a hosted substrate, refusing instead of
-   * falling back, regardless of the surface's persisted binding or the
-   * operator's degrade-silent fallback preference. See the enforcement
-   * invariant comment in `SubstrateSelector.invoke()`. The query-privacy
-   * helpers above (Tier B PII rewrite, smart-mode intent classification)
-   * are unaffected because they already route through the
-   * `privacy-filter-tier-2` surface, which is structurally pinned
-   * local-only for every request regardless of this flag (see
-   * `TIER2_PINNED_SURFACE` in `../intelligence/types.js`).
    */
-  async sendConcierge(
-    query: string,
-    opts?: { localOnly?: boolean },
-  ): Promise<ConciergeResponse> {
-    const localOnly = opts?.localOnly === true;
+  async sendConcierge(query: string): Promise<ConciergeResponse> {
     const trimmed = query.trim();
     if (trimmed.length === 0) {
       throw new Error("concierge query must not be empty");
@@ -804,7 +788,7 @@ export class OperatorChatService {
     // even when the dynamic-context router is not wired. The hook
     // routes through the substrate selector at the same `concierge`
     // surface, holding the no-new-outbound-surface invariant.
-    const parsedGrammar = await this.runGrammarParse(substrateQuery, localOnly);
+    const parsedGrammar = await this.runGrammarParse(substrateQuery);
 
     // WP-V1.3-9 Tau-5: read the agent-context cache snapshot once for
     // this round-trip. Synchronous accessor; returns [] until the
@@ -833,27 +817,18 @@ export class OperatorChatService {
         "Concierge unavailable. The substrate selector is not configured for this fortress. Pick a substrate in the Policy center to enable concierge replies.";
     } else {
       try {
-        // Passing `{ localOnly }` here means a local-only round-trip against
-        // a venice/frontier-bound surface never constructs that hosted
-        // client just to read its capability/display metadata; see the
-        // guard in `SubstrateSelector.getOrIssueHandle()`.
-        const handle = await this.substrateSelector.getSubstrate(
-          "concierge",
-          localOnly ? { localOnly: true } : undefined,
-        );
+        const handle = await this.substrateSelector.getSubstrate("concierge");
         servedBy = handle.substrate;
         displayLabel = handle.displayLabel;
 
         if (!handle.capability.summarize) {
-          conciergeBody = localOnly
-            ? "Concierge unavailable. Local-only was requested and this fortress's concierge surface is not bound to a local model; refusing rather than falling back to a hosted provider. Bind concierge to \"local\" in the Policy center, or retry without local-only."
-            : "Concierge unavailable. The chosen substrate does not support summarization. Pick a different substrate in the Policy center.";
+          conciergeBody =
+            "Concierge unavailable. The chosen substrate does not support summarization. Pick a different substrate in the Policy center.";
           outcome = "substrate_disabled";
         } else {
           const dynamicResult = await this.runDynamicContextFold(
             substrateQuery,
             parsedGrammar,
-            localOnly,
           );
           dynamicCategoriesIncluded = dynamicResult.categoriesIncluded;
           const assembledContext = await this.assembleConciergeContext(
@@ -880,7 +855,6 @@ export class OperatorChatService {
               context,
               query: substrateQuery,
               maxTokens: this.conciergeMaxTokens,
-              localOnly,
             },
           );
           if (response.failureClass || response.body.kind !== "summarize") {
@@ -1373,7 +1347,6 @@ export class OperatorChatService {
   private async runDynamicContextFold(
     query: string,
     parsedGrammar: ParsedQuery,
-    localOnly: boolean,
   ): Promise<{
     section: string;
     categoriesIncluded: ContextCategory[];
@@ -1390,7 +1363,6 @@ export class OperatorChatService {
         this.emitContextFetcherFailed(category, classifyFetcherError(error));
       },
       parsed: parsedGrammar,
-      localOnly,
     });
     return result;
   }
@@ -1402,16 +1374,12 @@ export class OperatorChatService {
    * `LLM_ASSIST_THRESHOLD`. Always returns a parse object (never
    * throws) so the audit emission can carry the result unconditionally.
    */
-  private async runGrammarParse(
-    query: string,
-    localOnly: boolean,
-  ): Promise<ParsedQuery> {
+  private async runGrammarParse(query: string): Promise<ParsedQuery> {
     return parseQueryWithLlmAssist(query, this.grammarLlmAssist, {
       ...(this.agentRegistry !== undefined
         ? { registry: this.agentRegistry }
         : {}),
       eventClassEnum: CANONICAL_AUDIT_EVENT_CLASSES,
-      localOnly,
     });
   }
 

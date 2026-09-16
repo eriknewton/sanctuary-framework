@@ -158,19 +158,10 @@ export interface ContextFetchers {
  * Auxiliary classifier the caller may supply for the LLM-assist fallback
  * path. Invoked only when keyword classification returns zero matches
  * AND the query is non-trivial (>= 8 chars, not a clear greeting).
- *
- * `opts.localOnly` (2026-09-15 slice) carries the ROUND-TRIP's request-scoped
- * local-only constraint through to this call. The runtime implementation
- * (`buildConciergeContextLlmAssist` in `dashboard/v1_1/wiring.ts`) routes
- * through the substrate selector at the `concierge` surface, so forwarding
- * this flag into that selector call is what keeps a local-only round-trip's
- * dynamic-context classification from reaching a hosted provider, exactly
- * like the round-trip's final summarize call.
  */
 export type LlmAssistClassifier = (
   query: string,
   categories: readonly ContextCategory[],
-  opts?: { localOnly?: boolean },
 ) => Promise<ContextCategory | "none">;
 
 export interface FoldContextOptions {
@@ -178,8 +169,6 @@ export interface FoldContextOptions {
   maxTokens?: number;
   /** When set, invoked on zero keyword matches to ask an LLM. */
   llmAssistClassify?: LlmAssistClassifier;
-  /** Forwarded verbatim to `llmAssistClassify`; see that type's doc. */
-  localOnly?: boolean;
   /** Audit hook for fetcher failures; receives the category + error. */
   onFetcherFailure?: (category: ContextCategory, error: unknown) => void;
   /**
@@ -539,9 +528,7 @@ export async function foldContext(
 
   if (matches.length === 0 && !isTrivialQuery(query) && opts?.llmAssistClassify) {
     try {
-      const picked = await opts.llmAssistClassify(query, CONTEXT_CATEGORIES, {
-        localOnly: opts.localOnly === true,
-      });
+      const picked = await opts.llmAssistClassify(query, CONTEXT_CATEGORIES);
       if (picked !== "none" && CONTEXT_CATEGORIES.includes(picked)) {
         matches = [trivialMatch(picked, parsed)];
       }

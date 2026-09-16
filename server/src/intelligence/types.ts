@@ -452,6 +452,39 @@ export interface SubstrateResponse {
   completedAt: string;
   /** Total wall-clock latency in ms. */
   latencyMs: number;
+  /**
+   * Fix-round-4 (Grok P1): set only when `failureClass ===
+   * "local_only_violation"`, distinguishing the two different ways a
+   * local-only request can fail to be served locally. `"binding_conflict"`
+   * is the pre-emptive refusal: the surface (or handle) is bound to a
+   * non-local substrate, refused before any handle/client is constructed.
+   * `"local_unavailable"` is the local substrate itself failing (down,
+   * integrity refusal, timeout, missing model) after a local invocation
+   * was actually attempted. Callers that need to choose an HTTP status
+   * (409 vs 503) or a retry strategy need this distinction; `failureClass`
+   * alone collapses both into one value on purpose (P2-4: "one truth" for
+   * a caller that only asks "was this served locally"), so this field is
+   * additive, not a replacement.
+   */
+  localOnlyReason?: "binding_conflict" | "local_unavailable";
+  /**
+   * Fix-round-6 (P1, item 3): set only alongside `localOnlyReason`, i.e.
+   * only on a local-only refusal response. `true` means the refusal's
+   * audit event was written; `false` means the write itself failed. The
+   * refusal is unconditional either way (fail-closed always wins), and an
+   * earlier version of this file's docs claimed "every local-only
+   * decision writes exactly one audit row" — that claim was false
+   * whenever the write failed, since the row then simply never existed.
+   * The claim is narrowed instead of building the durability it would
+   * take to make it true: every local-only refusal ATTEMPTS an audit
+   * event; a failed attempt is reported HERE (plus one stderr line at the
+   * write site) rather than silently dropped. Omitted (not `false`) on
+   * every non-refusal response and on refusals where the write succeeded,
+   * so its mere presence at `false` is itself the signal to look closer.
+   */
+  auditRecorded?: boolean;
+  /** The failed audit write's error class/name, set only when `auditRecorded === false`. */
+  auditError?: string;
 }
 
 /**
@@ -520,6 +553,23 @@ export interface SubstrateHandle {
   summarize?: (req: SummarizeRequest) => Promise<SubstrateResponse>;
   classify?: (req: ClassifyRequest) => Promise<SubstrateResponse>;
   redact?: (req: RedactRequest) => Promise<SubstrateResponse>;
+  /**
+   * Fix-round-9 (P1): mirrors `SubstrateResponse.auditRecorded` for the
+   * ONE handle-issuance path that is itself a local-only decision:
+   * `getSubstrate()`'s capability pre-check against a hosted binding,
+   * which refuses to construct the hosted client and returns a
+   * capability-zeroed disabled handle instead of ever reaching `invoke()`.
+   * Before this field existed, that refusal's own audit ATTEMPT (via
+   * `auditLocalOnlyRefusal`) was made and then discarded — a caller
+   * holding only the returned handle had no way to learn that the audit
+   * write itself had failed, unlike every other local-only refusal shape
+   * in this file, which surfaces exactly this pair on the typed response.
+   * Present (`true` or `false`) only on a handle returned from THAT
+   * refusal path; absent on every ordinarily-issued handle.
+   */
+  auditRecorded?: boolean;
+  /** The failed audit write's error class/name, set only when `auditRecorded === false`. */
+  auditError?: string;
 }
 
 /**

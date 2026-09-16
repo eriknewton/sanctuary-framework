@@ -107,8 +107,34 @@ export interface IntelligenceSubstrateInvokedPayload extends IntelligenceAuditPa
   surface: Surface;
   substrate: SubstrateChoice;
   served_by: SubstrateChoice;
-  /** SHA-256 base64url of the request body, never the body itself. */
+  /**
+   * SHA-256 base64url of the request body, never the body itself. LEGACY
+   * preimage (unchanged since v1.2 first shipped): `JSON.stringify` of
+   * the request's own fields exactly as the caller set them -- an
+   * omitted optional field (including `localOnly` on a request that
+   * never set it, the common case for every pre-2026-09-15 caller) is
+   * simply absent from the hashed object, matching `JSON.stringify`'s
+   * own undefined-skipping behavior. Two historically-identical requests
+   * hash identically under this field forever; this field's preimage
+   * NEVER changes shape again -- a new preimage version gets a NEW
+   * field (see `request_projection_hash`), not a silent reinterpretation
+   * of this one.
+   */
   request_hash: string;
+  /**
+   * OPTIONAL (fix-round-10, P1, item 2): SHA-256 base64url of preimage
+   * VERSION 2, a more complete canonical projection that `request_hash`
+   * deliberately does not attempt: `{ surface, kind, localOnly, ...the
+   * request kind's own named content fields }`, with `localOnly` coerced
+   * to a real boolean (never omitted) and every omitted optional content
+   * field made an EXPLICIT `null` (never silently absent) -- so this
+   * hash is sensitive to the surface a request was submitted against and
+   * to a genuinely-absent `localOnly` (which `request_hash` cannot
+   * distinguish from an explicit `false`). Present on every payload this
+   * file's producer emits from the 2026-09-15 slice onward; absent only
+   * on a payload persisted before this field existed.
+   */
+  request_projection_hash?: string;
   /** SHA-256 base64url of the response body, or null on failure. */
   response_hash: string | null;
   /** Wall-clock latency in ms. */
@@ -122,8 +148,17 @@ export interface IntelligenceSubstrateInvokedPayload extends IntelligenceAuditPa
    * that is the surface's ordinary binding from one that was REQUIRED to
    * be local for this one request; `served_by` alone cannot tell those
    * apart.
+   *
+   * OPTIONAL, default `false`, added additively (fix-round-10, P2):
+   * this field did not exist before the 2026-09-15 slice, so a
+   * historical payload persisted before that slice has no `local_only`
+   * key at all, and a producer built before the slice's own code shipped
+   * would fail to type-check against a REQUIRED field it has no way to
+   * populate. Every consumer that reads this field treats an absent
+   * value the same as `false` -- a request with no recorded local-only
+   * constraint was, in fact, not local-only.
    */
-  local_only: boolean;
+  local_only?: boolean;
 }
 
 /**
@@ -143,8 +178,13 @@ export interface IntelligenceSubstrateFailurePayload extends IntelligenceAuditPa
    * constraint (2026-09-15 slice). When true, `fallback_taken` never
    * reflects an attempted Venice/frontier fallback: the fallback chain is
    * never entered for a local-only request, by construction.
+   *
+   * OPTIONAL, default `false`, added additively (fix-round-10, P2) — see
+   * `IntelligenceSubstrateInvokedPayload.local_only`'s doc comment for
+   * why this is optional rather than required, and why absence must read
+   * as `false` everywhere this field is consumed.
    */
-  local_only: boolean;
+  local_only?: boolean;
 }
 
 /**

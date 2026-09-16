@@ -94,6 +94,7 @@ import {
   type FrontierProvider,
   type HardwareCapabilityReport,
   type LocalModelPick,
+  type LocalOnlyRequest,
   type RecentFailureEntry,
   type RedactRequest,
   type SubstrateBadge,
@@ -109,7 +110,6 @@ import {
   type SurfaceStatus,
   TIER2_PINNED_SURFACE,
   Tier2BindingPinnedError,
-  isLocalOnlyRequest,
   isTier2PinViolation,
 } from "./types.js";
 import { LocalSubstrate, OllamaClient, LOCAL_CAPABILITY } from "./substrates/local.js";
@@ -152,6 +152,78 @@ const DISABLED_CAPABILITY: SubstrateCapability = {
 };
 
 /**
+ * THE single authority for the request-scoped local-only constraint
+ * (fix-round-4, item 5; generalized fix-round-5 item 5 to cover a THIRD
+ * call site). Every enforcement site — `invoke()`'s pre-emptive check
+ * (before any handle exists, given the concrete substrate a handle WOULD
+ * be issued for), `guardDirectHandleCall` (given an already-issued
+ * handle's own `raw.substrate`), and `getOrIssueHandle`'s defense-in-depth
+ * guard (given `opts.localOnly` from a `getSubstrate()` caller, no full
+ * request object available) — calls this SAME function rather than each
+ * re-implementing the comparison. There is one predicate and three call
+ * sites, not predicates that happen to agree today.
+ *
+ * Pure and stateless: takes the concrete substrate identity to judge
+ * (never re-derives it, never reads selector state) and the ALREADY-READ
+ * `localOnly` boolean, never a request/opts object (fix-round-8: see
+ * `readLocalOnlyOnce`'s doc comment for why this predicate stopped
+ * accepting a `LocalOnlyRequest` and reading `.localOnly` off it
+ * internally). Every call site has already read the flag exactly once, at
+ * its own entry point, before reaching here. A substrate is refused iff
+ * the carrier is local-only AND that substrate is not `"local"`.
+ */
+function refusesLocalOnly(
+  handleSubstrate: SubstrateChoice,
+  localOnly: boolean,
+): boolean {
+  return localOnly && handleSubstrate !== "local";
+}
+
+/**
+ * Fix-round-8 (P1 regression fix, subtracting fix-round-7's own defect):
+ * reads `request.localOnly` EXACTLY ONCE, at an entry point's first
+ * statement, and returns ONLY that value — never a copy of `request`
+ * itself. The PRIOR version of this fix (`freezeLocalOnlyRequest`) built
+ * a copy via `{ ...rest, localOnly }` to dodge double-reading an
+ * accessor, which was sound for the FLAG but unsound for the REQUEST: a
+ * class-backed request (fields defined as getters on the prototype, or
+ * non-enumerable instance fields) loses every field a plain-object
+ * rest/spread cannot see, so the "frozen copy" a caller downstream
+ * received could be missing `context`/`query`/etc. entirely —
+ * `compileSubstrateContext` then threw on the mangled object before the
+ * typed refusal ever ran. The fix is smaller: never copy `request` at
+ * all. Every entry point (`invoke()`, `getSubstrate()`,
+ * `getOrIssueHandle()`, each `chokepointHandle` bound method) calls this
+ * once, keeps its OWN request/opts object unchanged for content, and
+ * threads the RESULT — not the request — to every guard, predicate,
+ * audit, and fallback decision from that line on. Nothing downstream
+ * reads `.localOnly` off the original object again: every function that
+ * used to accept a `LocalOnlyRequest` purely to re-derive this boolean
+ * (`refusesLocalOnly`, `guardDirectHandleCall`) now accepts a boolean
+ * parameter instead.
+ *
+ * Fix-round-10 (P1, item 2): returns the RAW read value
+ * (`boolean | undefined`), NOT pre-coerced to a boolean. Every call site
+ * except `invoke()` immediately coerces it (`readLocalOnlyOnce(x) ===
+ * true`) and never looks at the raw value again, so this is not a
+ * behavior change for them. `invoke()` is the one caller that needs the
+ * RAW value too: the LEGACY `request_hash` preimage (see `hashOfRequest`)
+ * must stay byte-identical to what `JSON.stringify(req)` produced before
+ * this file coerced `localOnly` at all -- an omitted `localOnly` (the
+ * overwhelming majority of historical production requests, which never
+ * set the field) must still serialize with NO `localOnly` key, not a
+ * coerced `false`. Returning the raw value here, once, is what lets
+ * `invoke()` serve both needs (the coerced DECISION boolean, and the
+ * raw-preserving HASH input) from the SAME single property read, rather
+ * than reading `.localOnly` a second time to recover what coercion threw
+ * away.
+ */
+function readLocalOnlyOnce(request: LocalOnlyRequest): boolean | undefined {
+  const { localOnly: rawFlag } = request;
+  return rawFlag;
+}
+
+/**
  * Cap on the per-surface recent-failures ring buffer. Exposed via
  * `/api/hub/intelligence/status` so the operator can triage the most
  * recent failures inline without paging through the L2 audit log.
@@ -185,6 +257,12 @@ type IntegrityGateStage =
 interface HandleIssueResult {
   handle: SubstrateHandle;
   cacheable: boolean;
+}
+
+/** Result of attempting to write a local-only refusal's audit event; see `auditLocalOnlyRefusal`. */
+interface LocalOnlyAuditResult {
+  recorded: boolean;
+  errorClass?: string;
 }
 
 interface IntegrityFailureState {
@@ -1023,8 +1101,196 @@ export class SubstrateSelector {
     surface: Surface,
     opts?: { localOnly?: boolean },
   ): Promise<SubstrateHandle> {
+    // P0 fix-round-8: `opts.localOnly` is read here, as the literal first
+    // statement, via `readLocalOnlyOnce` — exactly once, whether `opts`
+    // holds a plain boolean or a getter. `localOnly` (the boolean) is what
+    // `getOrIssueHandle` receives below, never `opts` itself.
+    const localOnly = readLocalOnlyOnce(opts ?? {}) === true;
     await this.ensureLoaded();
-    return this.getOrIssueHandle(surface, this.effectiveChoice(surface), opts);
+    const raw = await this.getOrIssueHandle(surface, this.effectiveChoice(surface), { localOnly });
+    return this.chokepointHandle(surface, raw);
+  }
+
+  /**
+   * Wrap a raw, internally-issued handle so every bound method a CALLER
+   * might invoke directly (`handle.summarize(req)`) is guarded by
+   * `refusesLocalOnly` before it can reach the raw handle's own method.
+   *
+   * Without this wrapper, `getSubstrate()` handed out the raw handle from
+   * `getOrIssueHandle`, whose bound methods call the substrate client
+   * directly (see `gatedLocalHandle`/`veniceHandle`/`frontierHandle`).
+   * Those methods have no knowledge of a per-request `localOnly`
+   * constraint. A caller that obtained a hosted-bound handle via
+   * `getSubstrate("concierge")` and then called `handle.summarize({ ...,
+   * localOnly: true })` directly reached the hosted substrate anyway,
+   * bypassing every local-only guarantee.
+   *
+   * Each bound method calls `guardDirectHandleCall`, which judges
+   * `raw.substrate` — the identity the HANDLE itself carries — against
+   * `refusesLocalOnly`, the ONE predicate `invoke()`'s own pre-emptive
+   * check also calls (see that method). `capability` comes from `raw` so
+   * a caller's `handle.capability.summarize === false` short-circuit sees
+   * the same answer it always did.
+   *
+   * `invoke()` itself never goes through this wrapper: it obtains its
+   * handle from `getOrIssueHandle` directly (see `invoke()` and
+   * `tryNextSubstrate()`), calling the substrate client without another
+   * hop back through itself.
+   */
+  private chokepointHandle(surface: Surface, raw: SubstrateHandle): SubstrateHandle {
+    return {
+      surface: raw.surface,
+      substrate: raw.substrate,
+      badge: raw.badge,
+      capability: raw.capability,
+      displayLabel: raw.displayLabel,
+      // Fix-round-9 (P1, item 2): `raw` can be the disabled handle
+      // `getOrIssueHandle`'s own local-only precheck refusal returns,
+      // carrying `auditRecorded`/`auditError` when that refusal's audit
+      // write failed. This wrapper otherwise rebuilds an entirely NEW
+      // object from `raw`'s named fields (so its bound methods can be
+      // chokepoint-guarded), which would silently drop those two fields
+      // if they were not forwarded explicitly here -- exactly the
+      // regression this fix-round exists to close.
+      ...(raw.auditRecorded !== undefined ? { auditRecorded: raw.auditRecorded, auditError: raw.auditError } : {}),
+      ...(raw.summarize
+        ? {
+            summarize: async (req: SummarizeRequest) => {
+              // P0 fix-round-8: `req.localOnly` is read HERE, once, via
+              // `readLocalOnlyOnce` — never as a copy of `req` itself
+              // (fix-round-7's `freezeLocalOnlyRequest` copy silently
+              // dropped a class-backed request's prototype-getter/
+              // non-enumerable fields, which `compileSubstrateContext`
+              // then choked on before the typed refusal could run). `req`
+              // is threaded on to `guardDirectHandleCall` and
+              // `raw.summarize!()` UNCHANGED, for its content only;
+              // `guardDirectHandleCall` takes the already-read boolean
+              // directly and never touches `req.localOnly` again.
+              const localOnly = readLocalOnlyOnce(req) === true;
+              const response =
+                (await this.guardDirectHandleCall(surface, raw.substrate, localOnly)) ??
+                (await raw.summarize!(req));
+              return this.normalizeDirectHandleLocalFailure(surface, response, localOnly);
+            },
+          }
+        : {}),
+      ...(raw.classify
+        ? {
+            classify: async (req: ClassifyRequest) => {
+              // P0 fix-round-8: same construction as `summarize` above —
+              // read once via `readLocalOnlyOnce`, `req` threaded onward
+              // unchanged. See `summarize`'s comment for the failure mode
+              // this removes.
+              const localOnly = readLocalOnlyOnce(req) === true;
+              const response =
+                (await this.guardDirectHandleCall(surface, raw.substrate, localOnly)) ??
+                (await raw.classify!(req));
+              return this.normalizeDirectHandleLocalFailure(surface, response, localOnly);
+            },
+          }
+        : {}),
+      ...(raw.redact
+        ? {
+            redact: async (req: RedactRequest) => {
+              // P0 fix-round-8: same construction as `summarize` above —
+              // read once via `readLocalOnlyOnce`, `req` threaded onward
+              // unchanged. See `summarize`'s comment for the failure mode
+              // this removes.
+              const localOnly = readLocalOnlyOnce(req) === true;
+              const response =
+                (await this.guardDirectHandleCall(surface, raw.substrate, localOnly)) ??
+                (await raw.redact!(req));
+              return this.normalizeDirectHandleLocalFailure(surface, response, localOnly);
+            },
+          }
+        : {}),
+    };
+  }
+
+  /**
+   * P1 fix-round-6, item 2: a directly held handle whose `raw.substrate`
+   * IS `"local"` (so `guardDirectHandleCall` returned `null` — refusing
+   * was never in question) but whose local invocation itself fails must
+   * read the SAME way `invoke()`'s P2-4 normalization already makes it
+   * read for the exact same failure shape: `local_only_violation` /
+   * `local_unavailable`, with an audit event. Before this fix, the raw
+   * substrate's own failure class (`substrate_unavailable`, etc.) passed
+   * through unchanged and unaudited — a caller going through
+   * `invokeSummarize` and a caller holding the handle directly saw two
+   * different outcomes for the identical failure.
+   *
+   * Only normalizes a REAL raw failure: a response `guardDirectHandleCall`
+   * already refused (`failureClass === "local_only_violation"`) is left
+   * untouched, or this would re-audit and overwrite its
+   * `binding_conflict` reason with `local_unavailable`.
+   */
+  private async normalizeDirectHandleLocalFailure(
+    surface: Surface,
+    response: SubstrateResponse,
+    localOnly: boolean,
+  ): Promise<SubstrateResponse> {
+    if (!localOnly || !response.failureClass || response.failureClass === "local_only_violation") {
+      return response;
+    }
+    const audit = await this.auditLocalOnlyRefusal(surface, "local", "local", "local_unavailable");
+    return failureResponse(
+      "local",
+      "local_only_violation",
+      `local-only request refused: local generation failed (${response.failureClass})`,
+      "local_unavailable",
+      audit,
+    );
+  }
+
+  /**
+   * The local-only check `chokepointHandle`'s bound methods run BEFORE
+   * falling through to the raw handle's own method. Returns a refusal
+   * `SubstrateResponse` when `refusesLocalOnly(handleSubstrate, localOnly)`
+   * is true, or `null` when the raw method may proceed unmodified. Takes
+   * the ALREADY-READ boolean (fix-round-8), never the request itself —
+   * this function has no use for the request's content, only the flag its
+   * caller already extracted via `readLocalOnlyOnce`.
+   *
+   * `handleSubstrate` is `raw.substrate` — the identity `raw` itself
+   * carries, captured at the moment `getSubstrate()` issued it — passed
+   * in by the caller, never re-derived here or in `refusesLocalOnly`.
+   * `raw.summarize`/`classify`/`redact` are closures already bound to
+   * whichever substrate `raw` was issued for (e.g. a `VeniceClient`
+   * captured in a `veniceHandle()` closure); judging anything other than
+   * that captured identity (the surface's current binding, say) would let
+   * a held handle's answer diverge from which closure it actually
+   * invokes. See `test/intelligence/selector-local-only.test.ts`'s
+   * held-handle trigger and mirror tests for the failure mode this
+   * closes and its converse.
+   *
+   * Deliberately does NOT delegate to `this.invoke()`: routing every
+   * bound method through `invoke()` would re-derive a brand-new handle at
+   * call time instead of using the held one, breaking the Q5E
+   * integrity-gate tests that hold a raw handle across a config change
+   * specifically to exercise that handle's OWN closure-captured
+   * epoch/staleness self-check in isolation (`gatedLocalHandle`'s
+   * `beforeInvocation`), and changing audit-emission behavior (a direct
+   * handle call is documented, on `invokeSummarize` above, as a probe
+   * path that skips audit emission on purpose). This guard preserves
+   * every other property of the raw handle (fallback exemptions,
+   * integrity gating, audit skipping) and adds exactly one thing, judged
+   * by the one shared predicate: a request-scoped local-only constraint
+   * can never be satisfied by falling through to a non-local closure.
+   */
+  private async guardDirectHandleCall(
+    surface: Surface,
+    handleSubstrate: SubstrateChoice,
+    localOnly: boolean,
+  ): Promise<SubstrateResponse | null> {
+    if (!refusesLocalOnly(handleSubstrate, localOnly)) return null;
+    const audit = await this.auditLocalOnlyRefusal(surface, handleSubstrate, handleSubstrate, "binding_conflict");
+    return failureResponse(
+      "disabled",
+      "local_only_violation",
+      `local-only request refused: this handle is bound to "${handleSubstrate}", not local`,
+      "binding_conflict",
+      audit,
+    );
   }
 
   /**
@@ -1074,17 +1340,38 @@ export class SubstrateSelector {
   }
 
   /**
-   * Audit a request-scoped local-only refusal. Shared by `invoke()` (the
-   * primary enforcement site) and `getOrIssueHandle()`'s defense-in-depth
-   * guard (reached by `getSubstrate()` capability pre-checks), so every
-   * local-only decision writes exactly one audit row regardless of which
-   * of the two guards actually fired for a given call.
+   * ATTEMPT to audit a request-scoped local-only refusal or a held-local-
+   * handle's local-generation failure under local-only. Shared by every
+   * enforcement site — `invoke()`'s pre-emptive check,
+   * `getOrIssueHandle()`'s defense-in-depth guard, `guardDirectHandleCall`,
+   * and the held-handle local-failure normalization — so a local-only
+   * decision has exactly ONE audit code path regardless of which site
+   * fired.
+   *
+   * Fix-round-6 (P1, item 3): an earlier version of this doc unconditionally
+   * promised a row per decision, phrased as "writes exactly one" rather
+   * than "attempts one". That was false whenever this write itself failed:
+   * the catch block swallowed
+   * the error and the row simply never existed, with nothing in the
+   * response or anywhere else recording that the claim had not held.
+   * Building the durability to make "writes" true (retries, a dead-letter
+   * queue, ...) is out of scope for what this method is; the claim is
+   * SUBTRACTED instead, to the version that is actually true: every
+   * refusal ATTEMPTS an audit event. The refusal itself is unconditional
+   * either way — fail-closed always wins, a failed audit write never
+   * turns a refusal into an allow — but the ATTEMPT's own outcome is now
+   * returned so the caller can surface it (`auditRecorded: false` +
+   * `auditError` on the response `failureResponse` builds) rather than
+   * drop it, and one line reaches stderr here so an operator watching the
+   * process directly (not just the audit log the write failed to reach)
+   * has a chance to see it too.
    */
   private async auditLocalOnlyRefusal(
     surface: Surface,
     boundChoice: SubstrateChoice,
     resolvedChoice: SubstrateChoice,
-  ): Promise<void> {
+    reason: "binding_conflict" | "local_unavailable" = "binding_conflict",
+  ): Promise<LocalOnlyAuditResult> {
     const payload: IntelligenceSubstrateFailurePayload = {
       version: "1.2",
       event_id: makeEventId(),
@@ -1094,9 +1381,12 @@ export class SubstrateSelector {
       surface,
       substrate: boundChoice,
       failure_class: "local_only_violation",
-      // No substrate was contacted and no fallback may be tried: the
-      // request itself forbids leaving the local substrate, so there is no
-      // "next" to try. Matches the `substrate_context_refused` precedent.
+      // "binding_conflict": no substrate was contacted and no fallback may
+      // be tried, matching the `substrate_context_refused` precedent.
+      // "local_unavailable": a local invocation WAS attempted (this row is
+      // reached only from the post-attempt normalization path in that
+      // case), so `fallback_taken: "deny"` here means "none was permitted
+      // afterward", not "none was attempted".
       fallback_taken: "deny",
       local_only: true,
     };
@@ -1108,11 +1398,17 @@ export class SubstrateSelector {
         {
           ...(payload as unknown as Record<string, unknown>),
           resolved_substrate: resolvedChoice,
+          local_only_reason: reason,
         },
         "failure",
       );
-    } catch {
-      // A local-only refusal still refuses when its derived audit cannot persist.
+      return { recorded: true };
+    } catch (error) {
+      const errorClass = error instanceof Error ? error.constructor.name : typeof error;
+      process.stderr.write(
+        `[sanctuary:local-only-audit-failed] surface=${surface} reason=${reason} error=${errorClass}\n`,
+      );
+      return { recorded: false, errorClass };
     }
   }
 
@@ -1210,9 +1506,34 @@ export class SubstrateSelector {
     method: InvocationMethod,
     req: SummarizeRequest | ClassifyRequest | RedactRequest,
   ): Promise<SubstrateResponse> {
+    // P0 fix-round-8 (subtracting fix-round-7's own regression):
+    // `req.localOnly` is read HERE, as the literal first statement, via
+    // `readLocalOnlyOnce` — exactly once, whether `req` is a plain object
+    // or a class instance with a prototype getter. See `readLocalOnlyOnce`'s
+    // doc comment for the full account, including fix-round-10's addition
+    // (below) of why the RAW read value is kept alongside the coerced one.
+    const requestLocalOnlyRaw = readLocalOnlyOnce(req);
+    const requestLocalOnly = requestLocalOnlyRaw === true;
+    // P1 fix-round-10, item 3: every NAMED CONTENT FIELD is read from
+    // `req` EXACTLY ONCE too, right here, immediately after the single
+    // `localOnly` read and before this method's first `await` — mirroring
+    // exactly why `localOnly` itself is read once. Without this, a
+    // STATEFUL getter (one that returns different content on successive
+    // reads) could present one value to the pre-egress context scanner
+    // below, a DIFFERENT value to the audit hash further down, and a
+    // THIRD value to the substrate actually invoked — the thing screened,
+    // the thing recorded, and the thing sent would then be three
+    // different values, which defeats the entire purpose of screening
+    // and auditing a request's content. `content` (the materialized
+    // snapshot `materializeRequestContent` returns) is what every one of
+    // those three steps consumes from here on; `req` itself is never read
+    // for its content fields again. See `materializeRequestContent`'s own
+    // doc comment for why field VALUES are preserved as read (including
+    // `undefined` for an omitted optional field) rather than coerced.
+    const content = materializeRequestContent(req);
     await this.ensureLoaded();
     const screened = await this.compiledContextScanner.screen(
-      compileSubstrateContext(surface, req),
+      compileSubstrateContext(surface, content),
     );
     // Resolved once, before the screening branch, so the refusal row names the
     // same substrate a served invocation would have named and the one-time
@@ -1240,7 +1561,7 @@ export class SubstrateSelector {
         // artifact is refused for every substrate, so falling through would
         // hand the same bytes to the next provider.
         fallback_taken: "deny",
-        local_only: isLocalOnlyRequest(req),
+        local_only: requestLocalOnly,
       };
       try {
         await this.auditLog.append(
@@ -1263,21 +1584,26 @@ export class SubstrateSelector {
     // Request-scoped local-only constraint (2026-09-15 slice; MUST-NEVER 5:
     // never silently degrade). `choice` is what the OPERATOR bound this
     // surface to; `req.localOnly` is what THIS request requires, and the
-    // request wins. Resolved against the CONCRETE substrate (hybrid rules
-    // included) so a hybrid binding that would route to Venice/frontier is
-    // refused exactly like a direct hosted binding. This check runs BEFORE
-    // `getOrIssueHandle` below, which is the sole place a Venice/frontier
-    // client constructor is called: a conflicting binding is refused here
-    // and never reaches that constructor, so a local-only request can never
-    // cause a hosted client to be built, let alone contacted.
-    const requestLocalOnly = isLocalOnlyRequest(req);
+    // request wins. Judged against the CONCRETE substrate a handle would
+    // be issued for (hybrid rules resolved) via `refusesLocalOnly` — the
+    // SAME predicate `guardDirectHandleCall` uses against an
+    // already-issued handle's `raw.substrate` — so a hybrid binding that
+    // would route to Venice/frontier is refused exactly like a direct
+    // hosted binding, by the one authority both sites share. This check
+    // runs BEFORE `getOrIssueHandle` below, which is the sole place a
+    // Venice/frontier client constructor is called: a conflicting binding
+    // is refused here and never reaches that constructor, so a local-only
+    // request can never cause a hosted client to be built, let alone
+    // contacted.
     const resolvedChoice = this.resolveConcreteChoice(surface, choice);
-    if (requestLocalOnly && resolvedChoice !== "local") {
-      await this.auditLocalOnlyRefusal(surface, choice, resolvedChoice);
+    if (refusesLocalOnly(resolvedChoice, requestLocalOnly)) {
+      const audit = await this.auditLocalOnlyRefusal(surface, choice, resolvedChoice, "binding_conflict");
       return failureResponse(
         "disabled",
         "local_only_violation",
         `local-only request refused: surface "${surface}" is bound to "${resolvedChoice}", not local`,
+        "binding_conflict",
+        audit,
       );
     }
 
@@ -1285,25 +1611,130 @@ export class SubstrateSelector {
     // All local generation reaches the async selector-load chokepoint; a
     // direct synchronous local-handle construction would bypass Q5E.
     const handle = await this.getOrIssueHandle(surface, choice, { localOnly: requestLocalOnly });
-    const requestHash = hashOfRequest(req);
-    const primary = await this.invokeHandle(surface, handle, method, req);
+    // Fix-round-10, item 2: `requestHash` is the LEGACY preimage (byte-
+    // identical to what this file hashed before fix-round-9), built from
+    // the single materialized `content` snapshot plus the RAW (not
+    // coerced) `localOnly` read — see `hashOfRequest`'s doc comment.
+    // `requestProjectionHash` is the NEW, more complete projection (bound
+    // to `surface`, coerced `localOnly`, explicit nulls for omitted
+    // fields) under its own field, `request_projection_hash`, so nothing
+    // historical breaks while the more correct hash is still committed.
+    const requestHash = hashOfRequest(content, requestLocalOnlyRaw);
+    const requestProjectionHash = hashOfRequestProjection(surface, requestLocalOnly, content);
+    const primary = await this.invokeHandle(surface, handle, method, content);
     let response = primary.response;
     let primaryFailure: { response: SubstrateResponse; fallbackTaken: FallbackTaken } | null = null;
     let emitInvoked = primary.methodAvailable;
 
     if (primary.response.failureClass) {
-      const fallback = await this.tryNextSubstrate(surface, handle.substrate, method, req);
+      const fallback = await this.tryNextSubstrate(surface, handle.substrate, method, content, requestLocalOnly);
       if (fallback && !fallback.response.failureClass) {
         response = fallback.response;
         primaryFailure = { response: primary.response, fallbackTaken: "next-substrate" };
         emitInvoked = true;
       } else {
-        response = fallback?.response ?? primary.response;
+        const settled = fallback?.response ?? primary.response;
+        // Request-scoped local-only constraint (2026-09-15 slice, P2-4: one
+        // truth, not two). The pre-emptive refusal above (a conflicting
+        // BINDING, refused before any handle is issued) already returns
+        // `local_only_violation`. This is the other way a local-only
+        // request can fail to be served locally: the binding WAS local,
+        // but local generation itself failed, and `tryNextSubstrate`
+        // refused to fall back to a hosted substrate because the request
+        // forbids it. A caller filtering responses on `local_only_violation`
+        // must see BOTH shapes, not just the pre-emptive one — otherwise
+        // "local unavailable" and "local unreachable" look identical to a
+        // caller that never inspects the message text. The original
+        // substrate failure class survives in the message and in
+        // `recordRecentFailure`'s snippet below for operator diagnosis;
+        // only the class an external caller sees is normalized.
+        //
+        // P1 fix-round-7: this branch must return the SAME way every other
+        // local-only refusal in this file returns — through
+        // `auditLocalOnlyRefusal`, which never throws. Below this `if`, the
+        // method falls through to the shared `emitAwaited` calls, which DO
+        // throw on a failed audit write (by design, for the non-local-only
+        // paths that share that call). Routing a local-only request through
+        // that shared path would mean a failing audit backend crashes the
+        // whole call for exactly the callers who most need a typed,
+        // fail-closed refusal instead of an exception. So this case is
+        // handled here, fully, with its own audit + return, and never
+        // reaches `emitInvoked`/`emitAwaited` at all.
+        if (requestLocalOnly) {
+          const audit = await this.auditLocalOnlyRefusal(
+            surface,
+            handle.substrate,
+            handle.substrate,
+            "local_unavailable",
+          );
+          const normalized = withTotalLatency(
+            failureResponse(
+              settled.servedBy,
+              "local_only_violation",
+              `local-only request refused: local generation failed (${settled.failureClass ?? "internal_error"})`,
+              "local_unavailable",
+              audit,
+            ),
+            startedAt,
+          );
+          // P1 fix-round-10, item 4: this method promises ONE
+          // `substrate_invoked` event per `invoke()` call, carrying the
+          // fields NO other event shape carries (`request_hash`,
+          // `response_hash`, `latency_ms`) — `auditLocalOnlyRefusal`
+          // above writes only a `substrate_failure` row, which has none
+          // of those fields. Before this fix, this early return skipped
+          // the invoked event entirely: a local-only request whose local
+          // generation genuinely failed left NO audit row anywhere
+          // carrying the request hash or latency for that invocation,
+          // silently thinner evidence than every other `invoke()`
+          // outcome (including the non-local-only local-failure path,
+          // which falls through to the shared `emitInvoked`/`emitAwaited`
+          // machinery further below and always gets one). Written via a
+          // local try/catch, never `emitAwaited` (which throws by
+          // design for non-local-only paths) — this branch's whole
+          // contract is an unconditional typed return, so a failed
+          // audit WRITE here must never become a thrown exception; the
+          // refusal's OWN audit attempt (`audit`, above) already
+          // surfaces its failure via `normalized.auditRecorded`/
+          // `auditError`, and that is unaffected by this write's outcome
+          // either way.
+          const invokedPayload: IntelligenceSubstrateInvokedPayload = {
+            version: "1.2",
+            event_id: makeEventId(),
+            emitted_at: new Date().toISOString(),
+            identity_id: this.identityId,
+            kind: "substrate_invoked",
+            surface,
+            substrate: choice,
+            served_by: normalized.servedBy,
+            request_hash: requestHash,
+            request_projection_hash: requestProjectionHash,
+            response_hash: null,
+            latency_ms: normalized.latencyMs,
+            failure_class: normalized.failureClass,
+            local_only: true,
+          };
+          try {
+            await this.auditLog.append(
+              "l2",
+              INTEL_OPS.SUBSTRATE_INVOKED,
+              this.identityId,
+              invokedPayload as unknown as Record<string, unknown>,
+              "failure",
+            );
+          } catch {
+            // Fail-closed always wins: the refusal itself (already built
+            // above) is unconditional and does not depend on this write.
+          }
+          const snippet =
+            normalized.body.kind === "failure" ? normalized.body.message : "local-only request refused";
+          this.recordRecentFailure(surface, "local_only_violation", snippet);
+          return normalized;
+        }
+        response = settled;
         primaryFailure = {
-          response: fallback?.response ?? primary.response,
-          fallbackTaken: fallback?.exhausted
-            ? "all-exhausted"
-            : this.fallbackFailureAction(surface, handle.substrate),
+          response,
+          fallbackTaken: fallback?.exhausted ? "all-exhausted" : this.fallbackFailureAction(surface, handle.substrate),
         };
         if (fallback) emitInvoked = true;
       }
@@ -1345,6 +1776,7 @@ export class SubstrateSelector {
       substrate: choice,
       served_by: response.servedBy,
       request_hash: requestHash,
+      request_projection_hash: requestProjectionHash,
       response_hash: response.failureClass ? null : hashOfResponse(response),
       latency_ms: response.latencyMs,
       failure_class: response.failureClass,
@@ -1483,19 +1915,32 @@ export class SubstrateSelector {
     primary: SubstrateChoice,
     method: InvocationMethod,
     req: SummarizeRequest | ClassifyRequest | RedactRequest,
+    requestLocalOnly: boolean,
   ): Promise<{
     handle: SubstrateHandle;
     response: SubstrateResponse;
     exhausted: boolean;
   } | null> {
-    // Request-scoped local-only constraint (2026-09-15 slice): checked
-    // first, ahead of every other fallback gate. A local-only request's
-    // primary local invocation failing is a terminal local-generation
-    // failure, never a signal to try Venice/frontier next — the operator's
+    // Request-scoped local-only constraint (2026-09-15 slice; P0
+    // fix-round-6): checked first, ahead of every other fallback gate,
+    // using `requestLocalOnly` — the CALLER's snapshot, taken before
+    // `invoke()`'s first await — never `req.localOnly`/
+    // `isLocalOnlyRequest(req)` re-read here. This call happens after
+    // `invokeHandle`'s await in `invoke()`, well after that snapshot; a
+    // caller who mutated `req.localOnly` during that await must not be
+    // able to flip this gate. Checked via the single authority
+    // `refusesLocalOnly` (the substrate argument is a fixed non-local
+    // placeholder: every later candidate substrate this function would
+    // try, sliced from the fallback chain below, is, by construction,
+    // never `"local"`, the fallback chain only ever moves forward, so the
+    // boolean this produces is identical for any non-local placeholder;
+    // it exists so this gate shares the ONE predicate rather than
+    // checking `requestLocalOnly` bare). A local-only request's primary
+    // local invocation failing is a terminal local-generation failure,
+    // never a signal to try Venice/frontier next — the operator's
     // degrade-silent preference does not override a stricter per-request
-    // requirement. `req` (not `primary`, which is already known local by
-    // the time this is reached from `invoke()`) is the source of truth.
-    if (isLocalOnlyRequest(req)) return null;
+    // requirement.
+    if (refusesLocalOnly("venice", requestLocalOnly)) return null;
     if (this.config.fallback[surface] !== "degrade-silent") return null;
     if (primary === "disabled" || primary === "hybrid") return null;
     // An immune integrity refusal is a terminal local denial: operator fallback
@@ -1517,7 +1962,16 @@ export class SubstrateSelector {
 
     let lastFailure: { handle: SubstrateHandle; response: SubstrateResponse } | null = null;
     for (const choice of FALLBACK_CHAIN.slice(primaryIndex + 1)) {
-      const handle = await this.getOrIssueHandle(surface, choice);
+      // Defense in depth (2026-09-15 slice, lens-B): this loop is already
+      // unreachable for a local-only request via the early `return null`
+      // above, but the handle-issuance guard in `getOrIssueHandle` is
+      // passed the same opts here too, so the hosted-client-construction
+      // defense does not rest on that one early return alone — a future
+      // refactor that weakens or reorders the early return still cannot
+      // let this call construct a hosted client for a local-only request.
+      const handle = await this.getOrIssueHandle(surface, choice, {
+        localOnly: requestLocalOnly,
+      });
       if (handle.substrate !== choice) continue;
       const fn = handle[method] as SubstrateInvoker | undefined;
       if (!fn) continue;
@@ -1554,13 +2008,30 @@ export class SubstrateSelector {
     // BEFORE the `issuedHandles` cache lookup and BEFORE `issueHandle` means
     // a hosted client constructor is never reached for a local-only request
     // via this path either.
-    if (opts?.localOnly && this.resolveConcreteChoice(surface, choice) !== "local") {
-      await this.auditLocalOnlyRefusal(
-        surface,
-        choice,
-        this.resolveConcreteChoice(surface, choice),
-      );
-      return this.disabledHandle(surface);
+    //
+    // P0 fix-round-8: `opts.localOnly` is read here, as the literal first
+    // statement, via `readLocalOnlyOnce` — exactly once. Every caller of
+    // this private method already passes a plain `{ localOnly }` object it
+    // built itself (see `invoke`, `tryNextSubstrate`, `getSubstrate`), so
+    // this is defense in depth for the entry point's own contract, not a
+    // response to a known caller shape, per "every entry point" rather
+    // than "every entry point that currently needs it."
+    const localOnly = readLocalOnlyOnce(opts ?? {}) === true;
+    const resolvedForOpts = this.resolveConcreteChoice(surface, choice);
+    if (refusesLocalOnly(resolvedForOpts, localOnly)) {
+      const audit = await this.auditLocalOnlyRefusal(surface, choice, resolvedForOpts, "binding_conflict");
+      // Fix-round-9 (P1): this refusal's audit ATTEMPT result must reach
+      // the caller the same way every other local-only refusal in this
+      // file surfaces it (`failureResponse`'s `auditRecorded`/
+      // `auditError` pair) — carrying only the content fields of
+      // `disabledHandle(surface)` forward and discarding `audit` here
+      // would leave a caller of the `getSubstrate()` capability-precheck
+      // path with NO signal that a failing audit backend swallowed this
+      // decision's own audit row, unlike `invoke()`'s equivalent refusal.
+      return {
+        ...this.disabledHandle(surface),
+        ...(audit.recorded ? {} : { auditRecorded: false, auditError: audit.errorClass ?? "unknown" }),
+      };
     }
     const key = `${surface}:${choice}`;
     const existing = this.issuedHandles.get(key);
@@ -2320,8 +2791,125 @@ function makeEventId(): string {
   return `int-${Date.now()}-${toBase64url(randomBytes(8))}`;
 }
 
-function hashOfRequest(req: SummarizeRequest | ClassifyRequest | RedactRequest): string {
-  return hashToString(sha256(stringToBytes(JSON.stringify(req))));
+/**
+ * Fix-round-10 (P1, item 3): reads every one of `req`'s NAMED CONTENT
+ * FIELDS exactly once, via ordinary property access (which works
+ * identically on a plain data property or a prototype getter, enumerable
+ * or not), and returns a plain object holding those single-read values.
+ * `invoke()` calls this ONCE, immediately after its own single
+ * `localOnly` read, and uses the RESULT for screening, both hashes, and
+ * the actual substrate invocation from that point on -- `req` itself is
+ * never read for its content again. Without this, a STATEFUL getter
+ * (one that returns different content on each read) could present
+ * DIFFERENT content to the pre-egress context scanner, the audit hash,
+ * and the substrate actually invoked: the thing screened, the thing
+ * recorded, and the thing sent would then be three different values,
+ * which is not auditable at all.
+ *
+ * Field VALUES are preserved exactly as read -- including `undefined`
+ * for an omitted optional field -- rather than coerced or defaulted.
+ * This is what keeps `hashOfRequest`'s LEGACY preimage byte-identical to
+ * what `JSON.stringify(req)` produced for any well-formed (non-stateful)
+ * caller: `JSON.stringify` itself already skips an `undefined`-valued
+ * property, so a materialized object that preserves `undefined` exactly
+ * where the original had it serializes identically to the original.
+ */
+function materializeRequestContent(
+  req: SummarizeRequest | ClassifyRequest | RedactRequest,
+): SummarizeRequest | ClassifyRequest | RedactRequest {
+  if (req.kind === "summarize") {
+    return {
+      kind: "summarize",
+      context: req.context,
+      query: req.query,
+      maxTokens: req.maxTokens,
+      contextProvenance: req.contextProvenance,
+    };
+  }
+  if (req.kind === "classify") {
+    return { kind: "classify", items: req.items, categories: req.categories, maxTokens: req.maxTokens };
+  }
+  return { kind: "redact", text: req.text };
+}
+
+/**
+ * Fix-round-10 (P1, item 2): reverted to the EXACT preimage shape this
+ * function had before fix-round-9 (Codex round-5 finding: fix-round-9's
+ * version silently changed `request_hash`'s MEANING -- adding `surface`,
+ * coercing `localOnly` to an always-present boolean, and turning omitted
+ * optional fields into explicit `null`s -- with no version bump, so an
+ * identical HISTORICAL request would hash differently after that round,
+ * and a request that never set `localOnly` at all, the common case for
+ * every pre-2026-09-15 caller, would suddenly hash as `localOnly: false`
+ * instead of omitting the key). This function's ONLY job is to reproduce
+ * what `JSON.stringify(req)` produced originally: the request's own named
+ * fields (from `content`, the fix-round-10 single-read materialization --
+ * see `materializeRequestContent`), `undefined`-valued/omitted fields
+ * skipped (`JSON.stringify`'s own behavior, not special-cased here), and
+ * `localOnly` present ONLY when the original request actually set it
+ * (`rawLocalOnly`, the UNCOERCED value `readLocalOnlyOnce` returned --
+ * seeing `undefined` here reproduces "the caller never set this field"
+ * exactly, where a pre-coerced `false` could not).
+ *
+ * `content` and `rawLocalOnly` are both read ONCE, at `invoke()`'s entry,
+ * never re-read here -- this function hashes the MATERIALIZED snapshot,
+ * never the caller's live object, so a stateful getter cannot make this
+ * hash disagree with what was actually screened and invoked, while a
+ * well-behaved caller's historical hash is unaffected byte-for-byte.
+ *
+ * The NEW, more complete projection (surface-bound, coerced-boolean,
+ * explicit-null) lives separately in `hashOfRequestProjection`, under a
+ * NEW audit field, `request_projection_hash`, documented there and on
+ * the contract as preimage version 2 -- so nothing historical breaks
+ * while the more correct hash is still committed to.
+ */
+function hashOfRequest(
+  content: SummarizeRequest | ClassifyRequest | RedactRequest,
+  rawLocalOnly: boolean | undefined,
+): string {
+  return hashToString(sha256(stringToBytes(JSON.stringify({ ...content, localOnly: rawLocalOnly }))));
+}
+
+/**
+ * Fix-round-9 (P1), retained under a NEW name (fix-round-10, P1, item 2):
+ * explicit, named-field projection of a request's audited content, bound
+ * to the surface it was submitted against, with `localOnly` coerced to a
+ * real boolean (never omitted) and every omitted optional content field
+ * made an EXPLICIT `null` (never silently absent). This is preimage
+ * VERSION 2: more complete than `hashOfRequest`'s legacy preimage, but
+ * under its OWN field (`request_projection_hash`) so it never collides
+ * with or silently reinterprets the legacy one. `content` (the
+ * fix-round-10 single-read materialization) is what this hashes, never
+ * `req` directly, for the same stateful-getter reason `hashOfRequest`
+ * documents.
+ */
+function canonicalRequestProjection(
+  surface: Surface,
+  localOnly: boolean,
+  content: SummarizeRequest | ClassifyRequest | RedactRequest,
+): Record<string, unknown> {
+  const base = { surface, kind: content.kind, localOnly };
+  if (content.kind === "summarize") {
+    return {
+      ...base,
+      context: content.context,
+      query: content.query,
+      maxTokens: content.maxTokens ?? null,
+      contextProvenance: content.contextProvenance ?? null,
+    };
+  }
+  if (content.kind === "classify") {
+    return { ...base, items: content.items, categories: content.categories, maxTokens: content.maxTokens ?? null };
+  }
+  return { ...base, text: content.text };
+}
+
+function hashOfRequestProjection(
+  surface: Surface,
+  localOnly: boolean,
+  content: SummarizeRequest | ClassifyRequest | RedactRequest,
+): string {
+  return hashToString(sha256(stringToBytes(JSON.stringify(canonicalRequestProjection(surface, localOnly, content)))));
 }
 
 function hashOfResponse(resp: SubstrateResponse): string {
@@ -2382,6 +2970,8 @@ function failureResponse(
   servedBy: SubstrateChoice,
   failureClass: SubstrateFailureClass,
   message: string,
+  localOnlyReason?: "binding_conflict" | "local_unavailable",
+  auditResult?: LocalOnlyAuditResult,
 ): SubstrateResponse {
   return {
     servedBy,
@@ -2389,6 +2979,14 @@ function failureResponse(
     body: { kind: "failure", message },
     completedAt: new Date().toISOString(),
     latencyMs: 0,
+    ...(localOnlyReason ? { localOnlyReason } : {}),
+    // Fix-round-6 (P1, item 3): only ever set when the refusal's audit
+    // write FAILED; a successful write (or a response this helper builds
+    // for a non-local-only refusal, where `auditResult` is never passed)
+    // leaves both fields absent.
+    ...(auditResult && !auditResult.recorded
+      ? { auditRecorded: false, auditError: auditResult.errorClass ?? "unknown" }
+      : {}),
   };
 }
 

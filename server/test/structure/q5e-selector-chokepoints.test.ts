@@ -1,6 +1,7 @@
 import { readFile, readdir, stat } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 import { IMMUNE_MODEL_LOAD_SURFACES } from "../../src/intelligence/model-manifest-v2.js";
 
@@ -19,6 +20,42 @@ async function productionSourceFiles(dir = srcRoot): Promise<string[]> {
 
 function relativeSourcePath(path: string): string {
   return relative(srcRoot, path).replaceAll("\\", "/");
+}
+
+/**
+ * Fix-round-8 (P2, round 4 item 4): true iff `methodSource` declares
+ * `const <varName> = await this.<calleeName>(...)` (or without `await`),
+ * matched on the DECLARATION NAME and the CALLEE NAME via the parser, not
+ * on the exact call text (arguments included). The prior version of this
+ * assertion (`.toContain("const handle = await this.getOrIssueHandle(
+ * surface, choice, { localOnly: requestLocalOnly })")`) broke on any
+ * cosmetic change to that call's arguments — a rename, a reformat, an
+ * added parameter — independent of whether the property it exists to pin
+ * (the handle really does come from `getOrIssueHandle`) still held.
+ */
+function assignsFromCall(methodSource: string, varName: string, calleeName: string): boolean {
+  const sourceFile = ts.createSourceFile("method.ts", `class C { ${methodSource} }`, ts.ScriptTarget.Latest, true);
+  let matched = false;
+  const calleeMatches = (expr: ts.Expression): boolean => {
+    if (ts.isIdentifier(expr)) return expr.text === calleeName;
+    if (ts.isPropertyAccessExpression(expr) && expr.expression.kind === ts.SyntaxKind.ThisKeyword) {
+      return expr.name.text === calleeName;
+    }
+    return false;
+  };
+  const visit = (node: ts.Node): void => {
+    if (matched) return;
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === varName && node.initializer) {
+      const init = ts.isAwaitExpression(node.initializer) ? node.initializer.expression : node.initializer;
+      if (ts.isCallExpression(init) && calleeMatches(init.expression)) {
+        matched = true;
+        return;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return matched;
 }
 
 describe("Q5E structural chokepoints", () => {
@@ -44,10 +81,12 @@ describe("Q5E structural chokepoints", () => {
     // `test/structure/local-only-chokepoints.test.ts` for the dedicated
     // ordering/gating assertions on that addition); this still pins the
     // original claim, that `invoke()`'s handle comes from
-    // `getOrIssueHandle` and nowhere else.
-    expect(selector.slice(invokeStart, invokeEnd)).toContain(
-      "const handle = await this.getOrIssueHandle(surface, choice, { localOnly: requestLocalOnly })",
-    );
+    // `getOrIssueHandle` and nowhere else. Fix-round-8 (P2): pinned by
+    // DECLARATION + CALLEE NAME via the parser (`assignsFromCall`), not by
+    // the exact call text (arguments included) — see that function's doc
+    // comment for why the prior exact-text version was fragile
+    // independent of this property.
+    expect(assignsFromCall(selector.slice(invokeStart, invokeEnd), "handle", "getOrIssueHandle")).toBe(true);
     expect(selector).not.toContain("const handle = this.buildHandle(surface, choice)");
   });
 

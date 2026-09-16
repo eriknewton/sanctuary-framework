@@ -71,21 +71,11 @@ export class ConciergeService {
       };
     }
 
-    const localOnly = request.localOnly === true;
     try {
-      // Passing `{ localOnly }` here (not just on the later `invokeSummarize`
-      // call) means a local-only ask against a venice/frontier-bound surface
-      // never constructs that hosted client just to read its capability —
-      // see the guard in `SubstrateSelector.getOrIssueHandle()`.
-      const handle = await this.selector.getSubstrate(
-        "concierge",
-        localOnly ? { localOnly: true } : undefined,
-      );
+      const handle = await this.selector.getSubstrate("concierge");
       if (!handle.capability.summarize) {
         throw new ConciergeUnavailableError(
-          localOnly
-            ? "concierge is not bound to a local model; a local-only ask is refused rather than falling back to a hosted provider"
-            : "concierge substrate is disabled or does not support summarization",
+          "concierge substrate is disabled or does not support summarization",
         );
       }
       // INVARIANT: the claim names the compiled prompt's SYSTEM MESSAGE and
@@ -120,7 +110,6 @@ export class ConciergeService {
         query: question,
         maxTokens: 512,
         contextProvenance: claimFirstPartyContext(compiled.firstPartyPrefix),
-        localOnly,
       });
       if (response.failureClass || response.body.kind !== "summarize") {
         throw new ConciergeUnavailableError(

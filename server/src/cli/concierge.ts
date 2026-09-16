@@ -51,14 +51,8 @@ export async function runConciergeCommand(args: ConciergeCliArgs): Promise<numbe
       printUsage(out);
       return 0;
     }
-    // `await` (not a bare `return <promise>`) is required here: a bare
-    // `return` hands the still-pending promise straight to the CALLER
-    // without ever settling inside this try block, so a rejection (e.g.
-    // `ConciergeUnavailableError` from a refused local-only ask) skips the
-    // catch below entirely and surfaces as an unhandled rejection instead
-    // of the clean operator-facing error line this command promises.
-    if (sub === "ask") return await ask(rest, out, err, env, ctx, args.localServiceFactory);
-    if (sub === "status") return await status(rest, out, err, env, ctx, args.localServiceFactory);
+    if (sub === "ask") return ask(rest, out, err, env, ctx, args.localServiceFactory);
+    if (sub === "status") return status(rest, out, err, env, ctx, args.localServiceFactory);
     err.write(`Unknown concierge subcommand: ${sub}\n`);
     printUsage(err);
     return 2;
@@ -74,7 +68,7 @@ export async function runConciergeCommand(args: ConciergeCliArgs): Promise<numbe
 function printUsage(s: Writable): void {
   s.write(`Usage: sanctuary concierge <command> [args]
 
-  ask "<question>" [--fortress <path>] [--json] [--no-stream] [--include-payloads] [--local-only]
+  ask "<question>" [--fortress <path>] [--json] [--no-stream] [--include-payloads]
   status [--fortress <path>] [--json]
 
 Options:
@@ -82,7 +76,6 @@ Options:
   --json                 Output machine-readable JSON.
   --no-stream            Return the full answer at the end.
   --include-payloads     Include state-store payloads in local read context.
-  --local-only           Refuse rather than answer if the concierge is not bound to a local model; the question and its context never reach a hosted provider.
 
 Env: SANCTUARY_DASHBOARD_URL, SANCTUARY_DASHBOARD_AUTH_TOKEN, SANCTUARY_PASSPHRASE, SANCTUARY_RECOVERY_KEY
 `);
@@ -107,7 +100,6 @@ async function ask(
     question,
     stream,
     includePayloads: hasFlag(argv, "--include-payloads"),
-    localOnly: hasFlag(argv, "--local-only"),
   };
   const response = ctx.dashboardUrl || env.SANCTUARY_DASHBOARD_URL
     ? await askViaHub(payload, ctx)
@@ -150,7 +142,7 @@ async function status(
 }
 
 async function askViaHub(
-  payload: { question: string; stream: boolean; includePayloads: boolean; localOnly: boolean },
+  payload: { question: string; stream: boolean; includePayloads: boolean },
   ctx: ConciergeCliContext,
 ): Promise<ConciergeAskResponse> {
   const body = await request("/api/hub/concierge/ask", {
@@ -166,7 +158,7 @@ async function statusViaHub(ctx: ConciergeCliContext): Promise<ConciergeStatus> 
 }
 
 async function askLocal(
-  payload: { question: string; stream: boolean; includePayloads: boolean; localOnly: boolean },
+  payload: { question: string; stream: boolean; includePayloads: boolean },
   out: Writable,
   env: NodeJS.ProcessEnv,
   localServiceFactory?: (env: NodeJS.ProcessEnv) => Promise<ConciergeService>,
@@ -308,12 +300,7 @@ function firstPositional(argv: string[]): string | null {
   for (let i = 0; i < argv.length; i++) {
     const current = argv[i]!;
     if (current.startsWith("--")) {
-      if (
-        current !== "--json" &&
-        current !== "--no-stream" &&
-        current !== "--include-payloads" &&
-        current !== "--local-only"
-      ) i++;
+      if (current !== "--json" && current !== "--no-stream" && current !== "--include-payloads") i++;
       continue;
     }
     return current;

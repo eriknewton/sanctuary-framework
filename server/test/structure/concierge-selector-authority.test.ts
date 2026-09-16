@@ -44,22 +44,9 @@ describe("concierge selector authority structural guard", () => {
 
   it("keeps the deterministic empty-context return before selector handle or invocation", () => {
     const service = source("concierge/concierge-service.ts");
-    // Bounded to `ask()`'s own body (up to the next method) rather than a
-    // bare file-wide `indexOf`: `status()` also calls
-    // `this.selector.getSubstrate("concierge")` later in the file, and
-    // `getSubstrate` now optionally takes a second (localOnly) argument, so
-    // an exact single-line literal match on the `ask()` call site is no
-    // longer stable — a file-wide search can silently jump to that later,
-    // unrelated call instead of failing loudly.
-    const askStart = service.indexOf("async ask(");
-    const askEnd = service.indexOf("async status(", askStart);
-    expect(askStart).toBeGreaterThan(-1);
-    expect(askEnd).toBeGreaterThan(askStart);
-    const ask = service.slice(askStart, askEnd);
-
-    const shortCircuit = ask.indexOf("isSummarizationQuery(question) && isEmptyContext(context)");
-    const handle = ask.indexOf("this.selector.getSubstrate(");
-    const invoke = ask.indexOf('this.selector.invokeSummarize("concierge"');
+    const shortCircuit = service.indexOf("isSummarizationQuery(question) && isEmptyContext(context)");
+    const handle = service.indexOf('this.selector.getSubstrate("concierge")');
+    const invoke = service.indexOf('this.selector.invokeSummarize("concierge"');
 
     expect(shortCircuit).toBeGreaterThan(-1);
     expect(handle).toBeGreaterThan(shortCircuit);

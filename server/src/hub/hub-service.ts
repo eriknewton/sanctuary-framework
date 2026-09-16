@@ -1139,12 +1139,9 @@ export class HubService {
    * operator-chat-service which owns substrate-selector routing, PII
    * filtering, persistence, and audit emission.
    */
-  async sendConcierge(
-    query: string,
-    opts?: { localOnly?: boolean },
-  ): Promise<ConciergeResponse> {
+  async sendConcierge(query: string): Promise<ConciergeResponse> {
     const chat = this.requireOperatorChat();
-    return chat.sendConcierge(query, opts);
+    return chat.sendConcierge(query);
   }
 
   /**

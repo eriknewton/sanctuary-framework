@@ -1047,8 +1047,7 @@ function buildConciergeContextLlmAssist(args: {
   selector: SubstrateSelector;
   identityId: string;
 }): LlmAssistClassifier {
-  return async (query, categories, opts) => {
-    const localOnly = opts?.localOnly === true;
+  return async (query, categories) => {
     const labelList = categories.map((c) => `- ${c}`).join("\n");
     const prompt =
       `You are a router. Classify the operator's query into one of the categories below or "none".\n` +
@@ -1057,25 +1056,13 @@ function buildConciergeContextLlmAssist(args: {
       `Query: ${query}\n\n` +
       `Category:`;
     try {
-      // Local-only (2026-09-15 slice): pass `{ localOnly }` into BOTH the
-      // capability pre-check and the invocation below, mirroring the
-      // final-summarize call site. `!handle.capability.summarize` covers a
-      // local-only refusal too (the selector zeroes capability for a
-      // conflicting binding), so a constrained round-trip degrades to
-      // "no classification" here exactly like an ordinary substrate
-      // failure — the round-trip is never blocked by this auxiliary step,
-      // it simply cannot escape to a hosted provider through it.
-      const handle = await args.selector.getSubstrate(
-        "concierge",
-        localOnly ? { localOnly: true } : undefined,
-      );
+      const handle = await args.selector.getSubstrate("concierge");
       if (!handle.capability.summarize) return "none";
       const response = await args.selector.invokeSummarize("concierge", {
         kind: "summarize",
         context: prompt,
         query: "Output the single category token.",
         maxTokens: 16,
-        localOnly,
       });
       if (response.failureClass || response.body.kind !== "summarize") {
         return "none";
