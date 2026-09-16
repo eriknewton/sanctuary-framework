@@ -96,7 +96,7 @@ jobs:
 
       - name: Install npm deps
         working-directory: server
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Build
         working-directory: server
