@@ -1,4 +1,4 @@
-// fail-before-exempt: comment-only DEBT handle retrofit (PR #1428); no behavior is asserted by this change, so the file cannot fail against pre-change source.
+// fail-before-exempt: comment-only debt-handle retrofit (PR #1428); no behavior is asserted by this change, so the file cannot fail against pre-change source.
 /**
  * Authenticated config-security baseline — the custody-MAC config-downgrade
  * gate (boot step "5rc"; replaces #791's forgeable adjacent baseline file).

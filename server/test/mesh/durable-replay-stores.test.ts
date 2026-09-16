@@ -1,4 +1,4 @@
-// fail-before-exempt: comment-only DEBT handle retrofit (PR #1428); no behavior is asserted by this change, so the file cannot fail against pre-change source.
+// fail-before-exempt: comment-only debt-handle retrofit (PR #1428); no behavior is asserted by this change, so the file cannot fail against pre-change source.
 /**
  * Durability tests for the two federation single-use replay stores.
  *
