@@ -1,4 +1,3 @@
-// fail-before-exempt: this test's own fail-before proof is the 42-count captured by hand against main (d059897f) per the E9 build task; the paired server/src edits in this same change are comment-only handle retrofits, so the automated fail-before harness has nothing behaviorally new to exercise beyond what the manual proof already recorded.
 /**
  * DEBT-handle shape + uniqueness guard (AGENTS.md rule 9, the mechanical half
  * named as feasible-and-unbuilt: "rule 9's `DEBT`-comment-to-register
