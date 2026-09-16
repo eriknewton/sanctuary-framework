@@ -126,10 +126,18 @@ export type AgentRegistryView =
  * The runtime caller (operator-chat-service) MUST route this through
  * the substrate selector at the `concierge` surface so no new outbound
  * channel opens. See Castle-walking discipline at the top of the file.
+ *
+ * `opts.localOnly` (2026-09-15 slice) carries the round-trip's
+ * request-scoped local-only constraint through to this call, mirroring
+ * `LlmAssistClassifier` in `concierge-context-router.ts`: whatever routes
+ * this completion through the substrate selector must forward the flag so
+ * a local-only round-trip's grammar assist can never reach a hosted
+ * provider either.
  */
 export type LlmAssistGrammarCompletion = (
   query: string,
   partial: ParsedQuery,
+  opts?: { localOnly?: boolean },
 ) => Promise<Partial<{
   time_range: ParsedTimeRange;
   agent_names: string[];
@@ -150,6 +158,8 @@ export interface ParseQueryOptions {
    * internally consistent.
    */
   now?: Date;
+  /** Forwarded verbatim to `llmAssist`; see `LlmAssistGrammarCompletion`. */
+  localOnly?: boolean;
 }
 
 // ── Canonical audit-event-class enumeration ──────────────────────────────
@@ -845,7 +855,7 @@ export async function parseQueryWithLlmAssist(
 
   let completion: Awaited<ReturnType<LlmAssistGrammarCompletion>>;
   try {
-    completion = await llmAssist(query, parsed);
+    completion = await llmAssist(query, parsed, { localOnly: opts?.localOnly === true });
   } catch {
     return parsed;
   }

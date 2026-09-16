@@ -372,7 +372,31 @@ export function isFirstPartyContextClaim(
   );
 }
 
-export interface SummarizeRequest {
+/**
+ * Request-scoped local-only constraint, shared by all three invocation
+ * kinds (2026-09-15 slice). Set by the CALLER on a per-request basis, never
+ * read from persisted operator config: an operator-configured binding is a
+ * standing preference, while `localOnly` is this one request's requirement
+ * and must win over that preference rather than merge with it.
+ *
+ * When true, `SubstrateSelector.invoke()` (the sole chokepoint every
+ * summarize/classify/redact call passes through) refuses the request unless
+ * the surface's EFFECTIVE, hybrid-resolved substrate is `local`; on refusal
+ * or on a subsequent local-generation failure, the standing
+ * `degrade-silent` fallback chain to Venice/frontier is never attempted, so
+ * a local-only request can only ever be served locally or refused. See the
+ * enforcement invariant comment at the top of `SubstrateSelector.invoke()`.
+ */
+export interface LocalOnlyRequest {
+  localOnly?: boolean;
+}
+
+/** True iff `req` carries an explicit, active local-only constraint. */
+export function isLocalOnlyRequest(req: LocalOnlyRequest): boolean {
+  return req.localOnly === true;
+}
+
+export interface SummarizeRequest extends LocalOnlyRequest {
   kind: "summarize";
   context: string;
   query: string;
@@ -395,14 +419,14 @@ export interface SummarizeRequest {
   contextProvenance?: FirstPartyContextClaim;
 }
 
-export interface ClassifyRequest {
+export interface ClassifyRequest extends LocalOnlyRequest {
   kind: "classify";
   items: string[];
   categories: string[];
   maxTokens?: number;
 }
 
-export interface RedactRequest {
+export interface RedactRequest extends LocalOnlyRequest {
   kind: "redact";
   text: string;
 }
@@ -453,6 +477,15 @@ export type SubstrateFailureClass =
    * who cannot tell them apart goes looking for an outage that is not there.
    */
   | "substrate_context_refused"
+  /**
+   * A request carried `localOnly: true` and the surface's effective,
+   * hybrid-resolved substrate was not `local` (or local generation itself
+   * failed). Distinct from `substrate_disabled`/`substrate_unavailable`:
+   * this class means the request was refused ON PURPOSE to honor its own
+   * constraint, not that the surface is misconfigured or unreachable, and
+   * it always means no Venice/frontier fallback was attempted.
+   */
+  | "local_only_violation"
   | "internal_error";
 
 /**

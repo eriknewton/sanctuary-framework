@@ -115,6 +115,15 @@ export interface IntelligenceSubstrateInvokedPayload extends IntelligenceAuditPa
   latency_ms: number;
   /** Stable failure-class enum, or null on success. */
   failure_class: SubstrateFailureClass | null;
+  /**
+   * True when the originating request carried a request-scoped local-only
+   * constraint (2026-09-15 slice). Lets an auditor distinguish a
+   * completed LOCAL generation that happened to be served locally because
+   * that is the surface's ordinary binding from one that was REQUIRED to
+   * be local for this one request; `served_by` alone cannot tell those
+   * apart.
+   */
+  local_only: boolean;
 }
 
 /**
@@ -129,6 +138,13 @@ export interface IntelligenceSubstrateFailurePayload extends IntelligenceAuditPa
   failure_class: SubstrateFailureClass;
   /** Operator-action taken: which fallback fired, or why no fallback served. */
   fallback_taken: "next-substrate" | "primary-failed" | "all-exhausted" | "deny" | "disable-surface";
+  /**
+   * True when the originating request carried a request-scoped local-only
+   * constraint (2026-09-15 slice). When true, `fallback_taken` never
+   * reflects an attempted Venice/frontier fallback: the fallback chain is
+   * never entered for a local-only request, by construction.
+   */
+  local_only: boolean;
 }
 
 /**

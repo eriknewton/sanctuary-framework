@@ -109,6 +109,7 @@ import {
   type SurfaceStatus,
   TIER2_PINNED_SURFACE,
   Tier2BindingPinnedError,
+  isLocalOnlyRequest,
   isTier2PinViolation,
 } from "./types.js";
 import { LocalSubstrate, OllamaClient, LOCAL_CAPABILITY } from "./substrates/local.js";
@@ -1018,9 +1019,12 @@ export class SubstrateSelector {
    * routing rules (set via `setPerSurfaceChoice` on a substrate other
    * than `hybrid`); v1.2 ships per-surface routing only.
    */
-  async getSubstrate(surface: Surface): Promise<SubstrateHandle> {
+  async getSubstrate(
+    surface: Surface,
+    opts?: { localOnly?: boolean },
+  ): Promise<SubstrateHandle> {
     await this.ensureLoaded();
-    return this.getOrIssueHandle(surface, this.effectiveChoice(surface));
+    return this.getOrIssueHandle(surface, this.effectiveChoice(surface), opts);
   }
 
   /**
@@ -1053,6 +1057,63 @@ export class SubstrateSelector {
       this.emit(INTEL_OPS.TIER2_BINDING_PINNED, payload, "success");
     }
     return "local";
+  }
+
+  /**
+   * Resolve `choice` to the concrete substrate a request would actually
+   * reach: `hybrid` fans out through the per-surface routing rules (an
+   * unresolvable hybrid binding is treated as `disabled`, matching
+   * `issueHandle`'s own fallback), every other choice is already concrete.
+   * The local-only guard (see `invoke()` and `getOrIssueHandle()`) checks
+   * THIS, not the raw `choice`, so a hybrid binding that routes to a
+   * hosted substrate is refused exactly like a direct hosted binding.
+   */
+  private resolveConcreteChoice(surface: Surface, choice: SubstrateChoice): SubstrateChoice {
+    if (choice !== "hybrid") return choice;
+    return resolveHybridChoice(this.config.hybridRules, surface) ?? "disabled";
+  }
+
+  /**
+   * Audit a request-scoped local-only refusal. Shared by `invoke()` (the
+   * primary enforcement site) and `getOrIssueHandle()`'s defense-in-depth
+   * guard (reached by `getSubstrate()` capability pre-checks), so every
+   * local-only decision writes exactly one audit row regardless of which
+   * of the two guards actually fired for a given call.
+   */
+  private async auditLocalOnlyRefusal(
+    surface: Surface,
+    boundChoice: SubstrateChoice,
+    resolvedChoice: SubstrateChoice,
+  ): Promise<void> {
+    const payload: IntelligenceSubstrateFailurePayload = {
+      version: "1.2",
+      event_id: makeEventId(),
+      emitted_at: new Date().toISOString(),
+      identity_id: this.identityId,
+      kind: "substrate_failure",
+      surface,
+      substrate: boundChoice,
+      failure_class: "local_only_violation",
+      // No substrate was contacted and no fallback may be tried: the
+      // request itself forbids leaving the local substrate, so there is no
+      // "next" to try. Matches the `substrate_context_refused` precedent.
+      fallback_taken: "deny",
+      local_only: true,
+    };
+    try {
+      await this.auditLog.append(
+        "l2",
+        INTEL_OPS.SUBSTRATE_FAILURE,
+        this.identityId,
+        {
+          ...(payload as unknown as Record<string, unknown>),
+          resolved_substrate: resolvedChoice,
+        },
+        "failure",
+      );
+    } catch {
+      // A local-only refusal still refuses when its derived audit cannot persist.
+    }
   }
 
   /**
@@ -1179,6 +1240,7 @@ export class SubstrateSelector {
         // artifact is refused for every substrate, so falling through would
         // hand the same bytes to the next provider.
         fallback_taken: "deny",
+        local_only: isLocalOnlyRequest(req),
       };
       try {
         await this.auditLog.append(
@@ -1197,10 +1259,32 @@ export class SubstrateSelector {
         `compiled-context screening refused provider invocation (${screened.outcome})`,
       );
     }
+
+    // Request-scoped local-only constraint (2026-09-15 slice; MUST-NEVER 5:
+    // never silently degrade). `choice` is what the OPERATOR bound this
+    // surface to; `req.localOnly` is what THIS request requires, and the
+    // request wins. Resolved against the CONCRETE substrate (hybrid rules
+    // included) so a hybrid binding that would route to Venice/frontier is
+    // refused exactly like a direct hosted binding. This check runs BEFORE
+    // `getOrIssueHandle` below, which is the sole place a Venice/frontier
+    // client constructor is called: a conflicting binding is refused here
+    // and never reaches that constructor, so a local-only request can never
+    // cause a hosted client to be built, let alone contacted.
+    const requestLocalOnly = isLocalOnlyRequest(req);
+    const resolvedChoice = this.resolveConcreteChoice(surface, choice);
+    if (requestLocalOnly && resolvedChoice !== "local") {
+      await this.auditLocalOnlyRefusal(surface, choice, resolvedChoice);
+      return failureResponse(
+        "disabled",
+        "local_only_violation",
+        `local-only request refused: surface "${surface}" is bound to "${resolvedChoice}", not local`,
+      );
+    }
+
     const startedAt = Date.now();
     // All local generation reaches the async selector-load chokepoint; a
     // direct synchronous local-handle construction would bypass Q5E.
-    const handle = await this.getOrIssueHandle(surface, choice);
+    const handle = await this.getOrIssueHandle(surface, choice, { localOnly: requestLocalOnly });
     const requestHash = hashOfRequest(req);
     const primary = await this.invokeHandle(surface, handle, method, req);
     let response = primary.response;
@@ -1240,6 +1324,7 @@ export class SubstrateSelector {
           substrate: choice,
           failure_class: primaryFailure.response.failureClass ?? "internal_error",
           fallback_taken: primaryFailure.fallbackTaken,
+          local_only: requestLocalOnly,
         };
         await this.emitAwaited(INTEL_OPS.SUBSTRATE_FAILURE, failurePayload, "failure");
         const snippet = primaryFailure.response.body.kind === "failure"
@@ -1263,6 +1348,7 @@ export class SubstrateSelector {
       response_hash: response.failureClass ? null : hashOfResponse(response),
       latency_ms: response.latencyMs,
       failure_class: response.failureClass,
+      local_only: requestLocalOnly,
     };
     await this.emitAwaited(INTEL_OPS.SUBSTRATE_INVOKED, invokedPayload, response.failureClass ? "failure" : "success");
 
@@ -1277,6 +1363,7 @@ export class SubstrateSelector {
         substrate: choice,
         failure_class: primaryFailure.response.failureClass ?? "internal_error",
         fallback_taken: primaryFailure.fallbackTaken,
+        local_only: requestLocalOnly,
       };
       await this.emitAwaited(INTEL_OPS.SUBSTRATE_FAILURE, failurePayload, "failure");
       const snippet = primaryFailure.response.body.kind === "failure"
@@ -1401,6 +1488,14 @@ export class SubstrateSelector {
     response: SubstrateResponse;
     exhausted: boolean;
   } | null> {
+    // Request-scoped local-only constraint (2026-09-15 slice): checked
+    // first, ahead of every other fallback gate. A local-only request's
+    // primary local invocation failing is a terminal local-generation
+    // failure, never a signal to try Venice/frontier next — the operator's
+    // degrade-silent preference does not override a stricter per-request
+    // requirement. `req` (not `primary`, which is already known local by
+    // the time this is reached from `invoke()`) is the source of truth.
+    if (isLocalOnlyRequest(req)) return null;
     if (this.config.fallback[surface] !== "degrade-silent") return null;
     if (primary === "disabled" || primary === "hybrid") return null;
     // An immune integrity refusal is a terminal local denial: operator fallback
@@ -1444,7 +1539,29 @@ export class SubstrateSelector {
   private async getOrIssueHandle(
     surface: Surface,
     choice: SubstrateChoice,
+    opts?: { localOnly?: boolean },
   ): Promise<SubstrateHandle> {
+    // Defense in depth for the local-only constraint (2026-09-15 slice):
+    // `invoke()` already refuses a conflicting binding before it ever calls
+    // this method, so a caller that goes through `invoke()` never reaches
+    // here with a mismatched `opts.localOnly`. But `getSubstrate()` is ALSO
+    // a public entry point that consumers (concierge, operator chat) call
+    // directly to read capability/display metadata before deciding whether
+    // to invoke at all; without this guard, a capability pre-check on a
+    // venice/frontier-bound surface would construct that hosted client here
+    // (in `issueHandle` below) purely to answer "can I use this?", even
+    // though the eventual invocation would be refused. Short-circuiting
+    // BEFORE the `issuedHandles` cache lookup and BEFORE `issueHandle` means
+    // a hosted client constructor is never reached for a local-only request
+    // via this path either.
+    if (opts?.localOnly && this.resolveConcreteChoice(surface, choice) !== "local") {
+      await this.auditLocalOnlyRefusal(
+        surface,
+        choice,
+        this.resolveConcreteChoice(surface, choice),
+      );
+      return this.disabledHandle(surface);
+    }
     const key = `${surface}:${choice}`;
     const existing = this.issuedHandles.get(key);
     if (existing !== undefined && existing.epoch === this.integrityConfigEpoch) {

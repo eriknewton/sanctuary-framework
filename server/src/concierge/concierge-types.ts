@@ -31,6 +31,14 @@ export interface ConciergeAskRequest {
   includePayloads?: boolean;
   maxAuditEntries?: number;
   now?: Date;
+  /**
+   * Request-scoped local-only constraint (2026-09-15 slice). When true,
+   * `ConciergeService.ask()` never lets this question reach a hosted
+   * substrate: it is answered by a local model or refused. See
+   * `LocalOnlyRequest` in `../intelligence/types.js`, which this flows into
+   * at the selector call.
+   */
+  localOnly?: boolean;
 }
 
 export interface ConciergeAskResponse {
@@ -145,7 +153,10 @@ export interface ConciergePromptMessage {
  * easy to exercise without giving any route a provider-construction seam.
  */
 export interface ConciergeSelectorLike {
-  getSubstrate(surface: "concierge"): Promise<SubstrateHandle>;
+  getSubstrate(
+    surface: "concierge",
+    opts?: { localOnly?: boolean },
+  ): Promise<SubstrateHandle>;
   invokeSummarize(
     surface: "concierge",
     request: SummarizeRequest,

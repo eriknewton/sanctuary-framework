@@ -63,11 +63,16 @@ describe("Memory Integrity Slice B — frozen production assembler inventory", (
   it("requires scan-after-final-assembly and scan-before-provider ordering", () => {
     const selector = readFileSync(join(SRC_ROOT, "intelligence/selector.ts"), "utf8");
     const invoke = selector.slice(selector.indexOf("  private async invoke("), selector.indexOf("  /**\n   * Append a failure entry"));
+    // 2026-09-15 slice: `getOrIssueHandle` now also takes the request-scoped
+    // local-only opts (see `test/structure/local-only-chokepoints.test.ts`
+    // for the dedicated assertions on that addition); this still pins the
+    // original claim, that context screening precedes handle construction
+    // precedes invocation.
     expect(invoke.indexOf("compileSubstrateContext(surface, req)")).toBeGreaterThan(-1);
     expect(invoke.indexOf("compileSubstrateContext(surface, req)")).toBeLessThan(
-      invoke.indexOf("this.getOrIssueHandle(surface, choice)"),
+      invoke.indexOf("this.getOrIssueHandle(surface, choice, { localOnly: requestLocalOnly })"),
     );
-    expect(invoke.indexOf("this.getOrIssueHandle(surface, choice)")).toBeLessThan(
+    expect(invoke.indexOf("this.getOrIssueHandle(surface, choice, { localOnly: requestLocalOnly })")).toBeLessThan(
       invoke.indexOf("this.invokeHandle(surface, handle, method, req)"),
     );
 

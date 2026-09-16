@@ -39,8 +39,14 @@ describe("Q5E structural chokepoints", () => {
     expect(selector.slice(gatedStart, nextMethod)).toContain("LocalSubstrate.fromPick(");
     const invokeStart = selector.indexOf("private async invoke(");
     const invokeEnd = selector.indexOf("private recordRecentFailure(", invokeStart);
+    // 2026-09-15 slice: `invoke()` now also passes the request-scoped
+    // local-only constraint into the handle issuer (see
+    // `test/structure/local-only-chokepoints.test.ts` for the dedicated
+    // ordering/gating assertions on that addition); this still pins the
+    // original claim, that `invoke()`'s handle comes from
+    // `getOrIssueHandle` and nowhere else.
     expect(selector.slice(invokeStart, invokeEnd)).toContain(
-      "const handle = await this.getOrIssueHandle(surface, choice)",
+      "const handle = await this.getOrIssueHandle(surface, choice, { localOnly: requestLocalOnly })",
     );
     expect(selector).not.toContain("const handle = this.buildHandle(surface, choice)");
   });
