@@ -9,7 +9,7 @@
       "command": "node",
       "args": ["./node_modules/.bin/sanctuary-mcp-server"],
       "env": {
-        "SANCTUARY_PASSPHRASE": "${SANCTUARY_PASSPHRASE}",
+        "SANCTUARY_FORTRESS_PATH": "/absolute/path/to/pre-provisioned-fortress",
         "SANCTUARY_DASHBOARD_ENABLED": "true"
       }
     }

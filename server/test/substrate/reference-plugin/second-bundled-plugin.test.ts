@@ -53,7 +53,6 @@ import {
   loadBundledPlugin,
   loadBundledReferenceBlocklist,
   loadReferenceBlocklistBundle,
-  pinnedSignerFor,
   spawnReferencePlugin,
   readBundledSignerFrom,
   enumerateBundleDir,
@@ -64,6 +63,11 @@ import {
   type TrustedSigner,
 } from "../../../src/substrate/index.js";
 import { runPluginCommand } from "../../../src/cli/plugin.js";
+import {
+  assertIsolatedBundlePath,
+  createIsolatedSourceTree,
+  type IsolatedSourceTree,
+} from "../../helpers/isolated-source-tree.js";
 
 const HOSTS_PLUGIN_ID = "ai.sanctuary.hosts-blocklist";
 const BLOCKLIST_PLUGIN_ID = "ai.sanctuary.blocklist";
@@ -377,14 +381,50 @@ describe("S5 second bundled plugin - tampered SIGNATURE fails closed (either bun
  */
 describe("S5 second bundled plugin - registry is the root of trust (arbitrary-path load is fail-closed)", () => {
   const evilDirs: string[] = [];
-  const swappedBack: Array<() => Promise<void>> = [];
+  const isolatedCleanups: Array<() => Promise<void>> = [];
   afterEach(async () => {
-    while (swappedBack.length > 0) await swappedBack.pop()?.();
+    const cleanupErrors: unknown[] = [];
+    while (isolatedCleanups.length > 0) {
+      try {
+        await isolatedCleanups.pop()?.();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
     while (evilDirs.length > 0) {
       const d = evilDirs.pop();
-      if (d) await rm(d, { recursive: true, force: true }).catch(() => {});
+      if (!d) continue;
+      try {
+        await rm(d, { recursive: true, force: true });
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(cleanupErrors, "bundled-plugin test cleanup failed");
     }
   });
+
+  async function isolatedLoader(): Promise<IsolatedSourceTree> {
+    const tree = await createIsolatedSourceTree((cleanup) => isolatedCleanups.push(cleanup));
+    const { substrate } = tree;
+    const block = await substrate.loadBundledPlugin(BLOCKLIST_PLUGIN_ID);
+    const hosts = await substrate.loadBundledPlugin(HOSTS_PLUGIN_ID);
+    expect(block.governance.plugin_id).toBe(BLOCKLIST_PLUGIN_ID);
+    expect(hosts.governance.plugin_id).toBe(HOSTS_PLUGIN_ID);
+    return tree;
+  }
+
+  async function canonicalHostsIdentity(): Promise<[number, number]> {
+    const canonical = bundledPluginDir(bundledPluginSpec(HOSTS_PLUGIN_ID));
+    // lstat catches replacement by a symlink even if that symlink targets the original inode.
+    const info = await fs.lstat(canonical);
+    return [info.dev, info.ino];
+  }
+
+  async function expectCanonicalHostsIdentity(expected: [number, number]): Promise<void> {
+    expect(await canonicalHostsIdentity()).toEqual(expected);
+  }
 
   /**
    * Materialize a FULLY self-signed "evil" bundle in a fresh temp dir: an attacker key,
@@ -476,20 +516,26 @@ describe("S5 second bundled plugin - registry is the root of trust (arbitrary-pa
     // only the realpath gate (not the identity gate) can catch it. Then replace the real
     // registry directory with a symlink pointing at that foreign bundle.
     const foreign = await stageEvilSelfSignedBundle(HOSTS_PLUGIN_ID);
-    const realDir = bundledPluginDir(bundledPluginSpec(HOSTS_PLUGIN_ID));
+    const tree = await isolatedLoader();
+    const canonicalIdentity = await canonicalHostsIdentity();
+    const realDir = tree.substrate.bundledPluginDir(tree.substrate.bundledPluginSpec(HOSTS_PLUGIN_ID));
+    await assertIsolatedBundlePath(tree, realDir);
     const backup = `${realDir}.bak-${Date.now()}`;
 
     await fs.rename(realDir, backup);
-    // Restore the real directory no matter how the assertion goes.
-    swappedBack.push(async () => {
-      await rm(realDir, { recursive: true, force: true }).catch(() => {});
-      await fs.rename(backup, realDir).catch(() => {});
-    });
-    await fs.symlink(foreign, realDir);
+    try {
+      await fs.symlink(foreign, realDir);
+      await expectCanonicalHostsIdentity(canonicalIdentity);
 
-    // The realpath of the resolved dir now points outside the bundled-plugin tree; the
-    // loader must reject rather than load+trust the foreign bundle.
-    await expect(loadBundledPlugin(HOSTS_PLUGIN_ID)).rejects.toBeInstanceOf(SubstrateError);
+      // The realpath of the resolved dir now points outside the bundled-plugin tree; the
+      // loader must reject rather than load+trust the foreign bundle.
+      await expect(tree.substrate.loadBundledPlugin(HOSTS_PLUGIN_ID)).rejects.toBeInstanceOf(
+        tree.substrate.SubstrateError,
+      );
+    } finally {
+      // afterEach retries and reports cleanup failures without masking this assertion.
+      await tree.cleanup().catch(() => {});
+    }
   });
 
   it("(c) both legitimate registry bundles still load + verify after the fix", async () => {
@@ -510,21 +556,25 @@ describe("S5 second bundled plugin - registry is the root of trust (arbitrary-pa
     // identity gate even if internally self-consistent - proving trust is pinned to the
     // frozen registry tuple, not to the bundle's own declaration.
     const foreign = await stageEvilSelfSignedBundle(HOSTS_PLUGIN_ID); // signer key_id release-v1
-    const realDir = bundledPluginDir(bundledPluginSpec(HOSTS_PLUGIN_ID));
+    const tree = await isolatedLoader();
+    const canonicalIdentity = await canonicalHostsIdentity();
+    const realDir = tree.substrate.bundledPluginDir(tree.substrate.bundledPluginSpec(HOSTS_PLUGIN_ID));
+    await assertIsolatedBundlePath(tree, realDir);
     const backup = `${realDir}.bak2-${Date.now()}`;
 
     await fs.rename(realDir, backup);
-    swappedBack.push(async () => {
-      await rm(realDir, { recursive: true, force: true }).catch(() => {});
-      await fs.rename(backup, realDir).catch(() => {});
-    });
-    // Copy (not symlink) the foreign bundle into the real location so the realpath gate
-    // passes and the IDENTITY gate is the one under test.
-    await fs.cp(foreign, realDir, { recursive: true });
+    try {
+      // Copy (not symlink) the foreign bundle into the real location so the realpath gate
+      // passes and the IDENTITY gate is the one under test.
+      await fs.cp(foreign, realDir, { recursive: true });
+      await expectCanonicalHostsIdentity(canonicalIdentity);
 
-    await expect(loadBundledPlugin(HOSTS_PLUGIN_ID)).rejects.toMatchObject({
-      reason: "signature_signer_mismatch",
-    });
+      await expect(tree.substrate.loadBundledPlugin(HOSTS_PLUGIN_ID)).rejects.toMatchObject({
+        reason: "signature_signer_mismatch",
+      });
+    } finally {
+      await tree.cleanup().catch(() => {});
+    }
   });
 
   /**
@@ -590,26 +640,32 @@ describe("S5 second bundled plugin - registry is the root of trust (arbitrary-pa
     // ATTACKER key bytes verified and was spawnable. PASS-AFTER: the signature is checked
     // against the REGISTRY-PINNED key, and the self-shipped key must EQUAL it, so an
     // attacker key with a matching tuple is rejected fail-closed.
-    const spec = bundledPluginSpec(HOSTS_PLUGIN_ID);
+    const tree = await isolatedLoader();
+    const canonicalIdentity = await canonicalHostsIdentity();
+    const spec = tree.substrate.bundledPluginSpec(HOSTS_PLUGIN_ID);
     const foreign = await stageEvilBundleWithTuple(HOSTS_PLUGIN_ID, spec.signer_id, spec.key_id);
     // Sanity: the attacker's self-shipped key does NOT equal the registry-pinned key.
     const attackerSigner = await readBundledSignerFrom(foreign);
-    const pinned: TrustedSigner = pinnedSignerFor(spec);
+    const pinned: TrustedSigner = tree.substrate.pinnedSignerFor(spec);
     expect(Buffer.from(attackerSigner.publicKey).toString("base64")).not.toBe(
       Buffer.from(pinned.publicKey).toString("base64"),
     );
 
-    const realDir = bundledPluginDir(spec);
+    const realDir = tree.substrate.bundledPluginDir(spec);
+    await assertIsolatedBundlePath(tree, realDir);
     const backup = `${realDir}.bak-tuple-${Date.now()}`;
     await fs.rename(realDir, backup);
-    swappedBack.push(async () => {
-      await rm(realDir, { recursive: true, force: true }).catch(() => {});
-      await fs.rename(backup, realDir).catch(() => {});
-    });
-    // Copy (not symlink) so the realpath gate passes and the PINNED-KEY gate is under test.
-    await fs.cp(foreign, realDir, { recursive: true });
+    try {
+      // Copy (not symlink) so the realpath gate passes and the PINNED-KEY gate is under test.
+      await fs.cp(foreign, realDir, { recursive: true });
+      await expectCanonicalHostsIdentity(canonicalIdentity);
 
-    await expect(loadBundledPlugin(HOSTS_PLUGIN_ID)).rejects.toBeInstanceOf(SubstrateError);
+      await expect(tree.substrate.loadBundledPlugin(HOSTS_PLUGIN_ID)).rejects.toBeInstanceOf(
+        tree.substrate.SubstrateError,
+      );
+    } finally {
+      await tree.cleanup().catch(() => {});
+    }
   });
 
   it("(f) a SAME-BASENAME in-tree SYMLINK to a foreign bundle is REJECTED (realpath EQUALITY, not descendant)", async () => {
@@ -618,8 +674,11 @@ describe("S5 second bundled plugin - registry is the root of trust (arbitrary-pa
     // directory (that itself sits under the module tree) could slip past a prefix check.
     // PASS-AFTER: the realpath of the resolved dir must EQUAL the registry location exactly;
     // any redirect (even same-basename, even in-tree) breaks equality and is rejected.
-    const spec = bundledPluginSpec(HOSTS_PLUGIN_ID);
-    const realDir = bundledPluginDir(spec);
+    const tree = await isolatedLoader();
+    const canonicalIdentity = await canonicalHostsIdentity();
+    const spec = tree.substrate.bundledPluginSpec(HOSTS_PLUGIN_ID);
+    const realDir = tree.substrate.bundledPluginDir(spec);
+    await assertIsolatedBundlePath(tree, realDir);
     const parent = path.dirname(realDir); // .../reference-plugin
     // A foreign bundle that lives IN-TREE (under reference-plugin/.evil/) with the SAME
     // basename as the registry dir, so basename + ancestor-prefix checks would both pass.
@@ -632,17 +691,17 @@ describe("S5 second bundled plugin - registry is the root of trust (arbitrary-pa
 
     const backup = `${realDir}.bak-symlink-${Date.now()}`;
     await fs.rename(realDir, backup);
-    swappedBack.push(async () => {
-      await rm(realDir, { recursive: true, force: true }).catch(() => {});
-      await fs.rename(backup, realDir).catch(() => {});
-      await rm(evilParent, { recursive: true, force: true }).catch(() => {});
-    });
-    // Same-basename in-tree symlink: reference-plugin/hosts-blocklist -> reference-plugin/.evil/hosts-blocklist
-    await fs.symlink(evilBundle, realDir);
+    try {
+      // Same-basename in-tree symlink: reference-plugin/hosts-blocklist -> reference-plugin/.evil/hosts-blocklist
+      await fs.symlink(evilBundle, realDir);
+      await expectCanonicalHostsIdentity(canonicalIdentity);
 
-    await expect(loadBundledPlugin(HOSTS_PLUGIN_ID)).rejects.toMatchObject({
-      reason: "bundle_path_traversal",
-    });
+      await expect(tree.substrate.loadBundledPlugin(HOSTS_PLUGIN_ID)).rejects.toMatchObject({
+        reason: "bundle_path_traversal",
+      });
+    } finally {
+      await tree.cleanup().catch(() => {});
+    }
   });
 });
 

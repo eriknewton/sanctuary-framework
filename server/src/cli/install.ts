@@ -7,6 +7,12 @@ import { promisify } from "node:util";
 import { join, resolve } from "node:path";
 
 import { resolveStoragePath } from "../paths.js";
+import {
+  applyConfigEnvOverrides,
+  defaultConfig,
+  mergeFileConfig,
+  validateConfig,
+} from "../config.js";
 import { parsePolicy } from "../principal-policy/loader.js";
 import { getSanctuaryVersion } from "../version.js";
 import { agentGuidedRecoveryOutputPath } from "../wrap/custody-flow.js";
@@ -1008,7 +1014,8 @@ async function probeOperatorTwin(
 }
 
 /**
- * Read-only proof that a Tier-1 MCP call can reach an operator.
+ * Read-only configuration readiness check for Tier-1 approval.
+ * This does not verify a live listener or operator presence.
  *
  * `stderr` is deliberately deny-only in the stdio transport, and `callback`
  * exists only for an embedding that injects a callback at server construction;
@@ -1034,30 +1041,24 @@ export async function probeTier1Approval(
       }),
     ]);
     const policy = parsePolicy(policyText);
-    const config = JSON.parse(configText) as {
-      dashboard?: { auth_token?: unknown };
-      webhook?: { url?: unknown; secret?: unknown };
-    };
+    // Share runtime file-stage validation and environment precedence.
+    // Keep custody reads read-only: loadConfig's quarantine behavior is
+    // intentionally absent from this probe.
+    const config = mergeFileConfig(defaultConfig(), JSON.parse(configText));
+    applyConfigEnvOverrides(config, env);
+    validateConfig(config);
     const nonEmpty = (value: unknown): boolean =>
       typeof value === "string" && value.trim().length > 0;
-    const envValue = (name: string): string | undefined => {
-      const value = env[name];
-      return value && value.length > 0 ? value : undefined;
-    };
 
     switch (policy.approval_channel.type) {
       case "dashboard": {
-        const token = envValue("SANCTUARY_DASHBOARD_AUTH_TOKEN") ??
-          config.dashboard?.auth_token;
+        const token = config.dashboard.auth_token;
         return nonEmpty(token) && token !== "auto"
           ? "available"
           : "unavailable";
       }
       case "webhook": {
-        const configUrl = envValue("SANCTUARY_WEBHOOK_URL") ?? config.webhook?.url;
-        const configSecret = envValue("SANCTUARY_WEBHOOK_SECRET") ??
-          config.webhook?.secret;
-        const configPair = nonEmpty(configUrl) && nonEmpty(configSecret);
+        const configPair = nonEmpty(config.webhook.url) && nonEmpty(config.webhook.secret);
         const policyPair = nonEmpty(policy.approval_channel.webhook_url) &&
           nonEmpty(policy.approval_channel.webhook_secret);
         return configPair || policyPair ? "available" : "unavailable";

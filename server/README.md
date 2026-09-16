@@ -6,7 +6,7 @@ Your agent. Your machine. Your keys.
 
 ## What Sanctuary is
 
-Sanctuary is the substrate that makes operator sovereignty structurally real in the agent era. Your agent runtime (Claude Code, OpenClaw, Hermes, Cline, Mastra, Cursor, or any MCP-speaking harness) runs as it normally would. Sanctuary sits underneath, providing four named mechanisms that together preserve the operator's identity, durable record, and decision authority across vendor churn.
+Sanctuary is the substrate that makes operator sovereignty structurally real in the agent era. Your agent runtime (Claude Code, OpenClaw, Hermes, Cline, Mastra, Cursor, or any MCP-speaking harness) runs as it normally would. Sanctuary sits underneath, providing named mechanisms that together preserve the operator's identity, durable record, and decision authority across vendor churn. The [repository README](https://github.com/eriknewton/sanctuary-framework#readme) is the canonical public capability summary.
 
 The framework is open source and free always. Commercial extensions (managed hosting for sovereignty-bound enterprises, premium support, compliance-pack-as-a-service, container-isolation for highest-assurance deployments) ship on top.
 
@@ -127,7 +127,7 @@ Sanctuary's enforcement model is the Castle Architecture. Four layers, each with
 
 **Castle Wall: the perimeter.** OS-level egress filtering at the operator-external boundary. Phase 1 ships as live enforcement on macOS only in v1.x: the signed Network Extension or pf path enforces when installed and armed. The Linux netfilter / NFQUEUE modules are tested against a real kernel, but the shipped daemon does not install them, so the Assurance Matrix row is `not_implemented` (open defect: **IC-02, IC-03, IC-04**, see). Windows Filtering Platform is roadmap. Where the macOS wall is installed and armed within the proven scope, the kernel blocks unauthorized cross-boundary calls and a prompt-injected agent cannot bypass it.
 
-**Sentinels: the nerves.** Internal observation, not enforcement. Behavioral baselining via process introspection, auditd-tail fallback, and an eBPF watcher scaffold that currently falls back to stub mode because the real probe loader is not implemented. Anomalies surface to the operator via menubar and OS notifications. Sentinels watch internal patterns the wall cannot see (file access, internal LLM calls, cross-agent coordination); they observe and surface; they do not block. Sentinels ship in v1.3.
+**Sentinels: the nerves.** Internal observation, not enforcement. Behavioral baselining via process introspection, auditd-tail fallback, and an eBPF watcher scaffold that currently falls back to stub mode because the real probe loader is not implemented. Anomalies surface to the operator via menubar and OS notifications. Sentinels watch internal patterns the wall cannot see (file access, internal LLM calls, cross-agent coordination); they observe and surface; they do not block. The observation surface is shipped; the real eBPF probe loader is not.
 
 **Charter: the will.** Additive sovereignty surface for compliant agents, exposed as Cooperative MCP. Encrypted state at rest, hash-chained audit with current checkpoint-signing bounds, mandate primitives, four canonical policy slots (memory, credentials, plans, outputs), substrate selector, Concordia receipt integration, Verascore reputation hooks. Compliant agents that voluntarily route through Sanctuary's MCP get the full sovereignty surface. Non-compliant agents still hit the Castle Wall at the macOS wall where it is installed and armed, and Sentinels inside the castle.
 
@@ -141,7 +141,7 @@ Within the Cooperative MCP layer (Charter), Sanctuary exposes four capability su
 
 **Cognitive Sovereignty.** All agent state encrypted at rest with AES-256-GCM. Keys are participant-held. Identity is Ed25519-based with DID support. Merkle tree integrity verification detects tampering and rollback.
 
-**Operational Isolation.** Environment attestation, encrypted audit log, and Principal Policy: a human-controlled, agent-immutable approval system that gates high-risk operations. The Sentinels layer (v1.3+) extends this with behavioral baselining and anomaly detection.
+**Operational Isolation.** Environment attestation, encrypted audit log, and Principal Policy: a human-controlled, agent-immutable approval system that gates high-risk operations. The shipped Sentinels observation layer exposes behavioral-baselining signals; the real eBPF probe loader remains a roadmap item.
 
 **Selective Disclosure.** SHA-256 commitments, Pedersen commitments on Ristretto255, zero-knowledge proofs of knowledge (Schnorr/Fiat-Shamir), and ZK range proofs (bit-decomposition with CDS OR-proofs). Disclosure policies define what information flows where.
 
@@ -151,62 +151,73 @@ Within the Cooperative MCP layer (Charter), Sanctuary exposes four capability su
 
 Sanctuary lives in your menubar. When your agent wants to do something risky, you get an OS notification. Click, see the request in plain English, approve or deny in five seconds. The agent receives a structured response that surfaces the decision back to you naturally if you missed the notification. Three-channel coverage means you never get to the "my agent is mysteriously broken" mental state.
 
-The dashboard is for setup and inspection, not daily ops. Substrate selector (pick local model, Venice.ai, or operator-frontier with redaction), policy editor, audit deep-dive, exit bundle drill, fortress configuration. You visit the dashboard for setup; you stay in your menubar for daily ops.
+The dashboard is for setup, inspection, and authenticated operator approvals.
+It includes the substrate selector, policy editor, audit deep-dive, exit bundle
+drill, and fortress configuration. The menubar keeps routine status and
+approval entry points close at hand.
 
-Concierge chat is the natural-language interface to your sovereignty primitives. "What's going on?" returns a summary from the audit log. "Why did my Hermes agent stop?" looks up recent gate triggers and explains. "Approve all GitHub-read requests" batch-approves. "What does my Hermes agent have access to?" introspects policy. "Give me a portable bundle of everything" triggers exit bundle generation.
+Concierge chat is a read-oriented natural-language interface to fortress state.
+"What's going on?" returns a summary from the audit log. "Why did my Hermes
+agent stop?" looks up recent gate triggers and explains. "What does my Hermes
+agent have access to?" introspects policy. It does not approve requests or
+trigger exports on the operator's behalf.
 
 You do not sit in Sanctuary. Sanctuary sits with you.
 
 ## Quick start
 
-### Install
+### Protect a harness
 
 ```bash
-npm install @sanctuary-framework/mcp-server
+npx @sanctuary-framework/mcp-server protect --claude-code
 ```
 
-### Connect to Claude Code
+The command initializes or adopts one fortress, preserves the existing harness
+configuration, and installs Sanctuary as the upstream MCP gateway. Use
+`--harness hermes` for Hermes. The current opt-in preview is
+`@sanctuary-framework/mcp-server@1.8.6-rc.5`; unqualified commands use the
+stable `latest` channel.
 
-Add to your Claude Code MCP configuration (`~/.claude/mcp_servers.json`):
-
-```json
-{
-  "sanctuary": {
-    "command": "npx",
-    "args": ["-y", "@sanctuary-framework/mcp-server"],
-    "env": {
-      "SANCTUARY_PASSPHRASE": "your-passphrase-here"
-    }
-  }
-}
-```
-
-Or run directly:
+For an agent-guided full install, use the resumable planner:
 
 ```bash
-SANCTUARY_PASSPHRASE="your-passphrase" npx @sanctuary-framework/mcp-server
+npx @sanctuary-framework/mcp-server install --profile full --harness hermes --json
 ```
 
-### First run
+Execute only the returned `agent_action` argument vector, then rerun the same
+planner. Stop on `human_action` for Apple consent, bounded privilege, or private
+recovery custody. Never read or print recovery material.
 
-On first launch, Sanctuary will:
+### First run and custody
 
-1. Derive a master encryption key from your passphrase (Argon2id)
-2. Create the storage directory (`~/.sanctuary/`)
-3. Display a recovery key if no passphrase is set (save it; shown once)
-4. Walk you through the first-run wizard for the egress filter (which endpoints to pre-allow vs prompt for); the wizard's rules reach live enforcement on macOS Phase 1 only, with Linux Phase 1 unshipped (**IC-02, IC-03, IC-04**) and Windows on Phase 2
+On first initialization, Sanctuary will:
+
+1. Create the selected fortress and establish its encrypted vault
+2. Enroll host-local custody and, in agent-guided mode, stage the recovery key
+   outside the fortress without printing it
+3. Preserve the harness's existing MCP entries while adding Sanctuary as the
+   cooperative gateway
+4. Report explicit operator actions for any macOS Castle Wall consent or
+   privileged step; Linux egress enforcement remains unshipped
 
 ## Key protection modes
 
-Sanctuary supports three key protection modes:
+Sanctuary supports host-local custody with explicit recovery:
 
-- **Passphrase.** Master key derived via Argon2id. Set `SANCTUARY_PASSPHRASE` env var.
-- **Recovery key.** Random master key generated on first run. Recovery key displayed once.
-- **Hardware key.** FIDO2/WebAuthn support planned for v0.3.0.
+- **Passphrase.** The master key is derived with Argon2id. Interactive setup can
+  enroll the credential in the platform keyring rather than writing it into a
+  harness configuration.
+- **Recovery key.** Agent-guided setup stages recovery material for private
+  operator custody without exposing it to the agent or stdout.
+- **Hardware-backed custody.** A roadmap item, not a shipped capability.
 
 ## MCP tools
 
-Once connected, your agent has access to these tools, organized by capability surface within Cooperative MCP (Charter).
+Once connected, your agent has access to these selected foundational tools,
+organized by capability surface within Cooperative MCP (Charter). The MCP
+protocol advertises bare tool names such as `identity_create`; clients may
+display them with the configured server namespace, for example
+`sanctuary/identity_create`.
 
 ### Cognitive Sovereignty
 | Tool | Description |
@@ -287,12 +298,13 @@ Environment variables:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `SANCTUARY_PASSPHRASE` | Passphrase for master key derivation | _(none; uses recovery key)_ |
+| `SANCTUARY_PASSPHRASE` | Explicit passphrase for master key derivation | _(none; enrolled host-local custody is used when available)_ |
+| `SANCTUARY_FORTRESS_PATH` | Operator-facing fortress directory override | _(none)_ |
 | `SANCTUARY_STORAGE_PATH` | Storage directory path | `~/.sanctuary` |
 | `SANCTUARY_TRANSPORT` | Transport mode (`stdio` or `http`) | `stdio` |
 | `SANCTUARY_DASHBOARD_ENABLED` | Enable web dashboard (`true`/`false`) | `false` |
 | `SANCTUARY_DASHBOARD_PORT` | Dashboard port | `3501` |
-| `SANCTUARY_DASHBOARD_AUTH_TOKEN` | Bearer token (`"auto"` to generate) | _(none)_ |
+| `SANCTUARY_DASHBOARD_AUTH_TOKEN` | Bearer token (`"auto"` creates a read-only launch session, not a decision-ready approval channel) | _(none)_ |
 | `SANCTUARY_DASHBOARD_TLS_CERT` | TLS certificate path | _(none)_ |
 | `SANCTUARY_DASHBOARD_TLS_KEY` | TLS private key path | _(none)_ |
 | `SANCTUARY_WEBHOOK_ENABLED` | Enable webhook approvals | `false` |
@@ -302,11 +314,17 @@ Environment variables:
 
 ## Running alongside another MCP server
 
-Sanctuary is designed to run as a parallel MCP server. It adds the substrate underneath your agent without replacing any of its existing tools. Both servers appear in the same session as independent tool providers. Castle Wall enforcement operates at the OS level regardless of which MCP servers the agent uses; the wall sees egress, not MCP routing.
+`sanctuary protect` preserves the harness's existing tool configuration and
+routes configured MCP servers through Sanctuary's cooperative gateway. Merely
+adding Sanctuary as an independent parallel MCP server does not apply
+cooperative policy gates to calls made directly to another server. Castle Wall
+enforcement, when installed and armed on macOS, operates at the OS level
+regardless of MCP routing; the wall sees egress, not MCP tool calls.
 
 For the full setup guide (installation options, passphrase management, bootstrap, rollback), see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
-For a reference MCP config, see [`docs/examples/parallel-mcp-config.json`](docs/examples/parallel-mcp-config.json).
+For the deliberately ungated parallel shape, see the caveats in
+[`docs/examples/`](docs/examples/README.md). Prefer `sanctuary protect`.
 
 For always-on agents with latency constraints, use the `persistent-agent` Principal Policy template which auto-allows routine operations and only gates destructive actions. See [`src/principal-policy/templates/persistent-agent.yaml`](src/principal-policy/templates/persistent-agent.yaml).
 
@@ -318,7 +336,10 @@ The Principal Policy is the human-controlled, agent-immutable configuration that
 
 **Tier 2: Behavioral anomaly detection.** The system tracks a behavioral baseline (namespaces accessed, counterparties seen, signing frequency, read patterns). Deviations trigger approval; a compromised agent accessing unfamiliar data or signing at unusual rates is caught automatically.
 
-**Tier 3: Always allowed (audit only).** Standard read/write/sign operations pass through without interruption, but every operation is audit-logged.
+**Tier 3: Always allowed (audit only).** Only operations explicitly classified
+as Tier 3 pass without interruption, and they remain audit-logged. An
+unclassified operation fails closed to Tier 1 rather than inheriting a broad
+read, write, or sign default.
 
 The policy file lives at `~/.sanctuary/principal-policy.yaml`. It is loaded once at startup and frozen; no MCP tool can modify it. The agent cannot see the policy rules in denial responses (preventing attacker learning). Approval requests flow through OS notifications (Castle Wall surface), the menubar dashboard, or external webhooks (Slack, Discord, etc., with HMAC-SHA256 signatures).
 
@@ -337,7 +358,7 @@ Sanctuary's security claims are structural, not cooperative-only.
 - Default-deny outbound with first-run wizard pre-allowing common developer endpoints where the macOS wall is armed
 - A prompt-injected agent cannot bypass the macOS wall within the proven scope: one host, one OS version, signed extension installed and armed
 
-**Sentinels observation (ships in v1.3):**
+**Sentinels observation (shipped; observation only):**
 - Process introspection via auditd-tail fallback and syscall-observation scaffolding; the eBPF probe loader is a placeholder today
 - Behavioral baselining with anomaly detection
 - Anomalies surface via OS notifications, not blocks
@@ -353,7 +374,8 @@ Sanctuary's security claims are structural, not cooperative-only.
 - Monotonic version numbers prevent state rollback
 - Principal Policy gates every tool call (three-tier approval)
 - Behavioral baseline detects anomalous agent behavior
-- Approval channel (stderr) is outside MCP protocol; agent cannot intercept
+- Stderr is informational and deny-only; decision-ready Tier 1 approval
+  requires an authenticated configured approval channel
 
 **Heralds cross-castle accountability:**
 - Concordia receipts for cross-castle commitments
@@ -373,64 +395,12 @@ npm test
 
 ## Architecture (source tree)
 
-The directory layout below reflects v1.2 shipped reality plus annotated v1.x and v1.3 placeholders for the Castle Wall and Sentinels work packages. Capability-surface directory names are the plain capability names (`cognitive/`, `operational/`, `disclosure/`, `reputation/`), renamed from the legacy `l1`-`l4` prefixes so the prefixes do not collide with the named Castle layers (Castle Wall, Sentinels, Charter, Heralds). Crypto domain-separation labels that embed a legacy token (e.g. the HKDF info string `l4-reputation`) are deliberately frozen and were NOT renamed.
-
-```
-src/
-├── core/                  # Cryptographic primitives
-│   ├── encryption.ts      # AES-256-GCM
-│   ├── hashing.ts         # SHA-256, HMAC, Merkle trees
-│   ├── identity.ts        # Ed25519, DID generation
-│   ├── key-derivation.ts  # Argon2id, HKDF
-│   ├── encoding.ts        # Base64url, constant-time compare
-│   └── random.ts          # CSPRNG
-├── castle-wall/           # Castle Wall: OS-level egress enforcement (planned, ships with WP-V1.x-CASTLE-WALL)
-├── sentinels/             # Sentinels: internal observation (planned, ships with v1.3 WP-V1.3-1, -2)
-├── storage/               # Pluggable storage backends
-│   ├── interface.ts       # Abstract StorageBackend
-│   ├── filesystem.ts      # Encrypted filesystem (default)
-│   └── memory.ts          # In-memory (testing)
-├── cognitive/          # Capability surface 1 (Charter): encrypted state plus identity
-│   ├── state-store.ts     # StateStore with Merkle verification
-│   └── tools.ts           # MCP tool definitions
-├── operational/        # Capability surface 2 (Charter): attestation plus monitoring
-│   └── audit-log.ts       # Encrypted append-only audit log
-├── disclosure/         # Capability surface 3 (Charter): commitments plus ZK proofs plus policies
-│   ├── commitments.ts     # SHA-256 commitment schemes
-│   ├── zk-proofs.ts       # Pedersen/Ristretto255, Schnorr proofs, range proofs
-│   ├── policies.ts        # Disclosure policy engine
-│   └── tools.ts           # MCP tool definitions
-├── reputation/         # Capability surface 4 (Charter): reputation plus bootstrap plus tiers
-│   ├── reputation-store.ts # Signed attestations, escrow, guarantees
-│   ├── tiers.ts           # Sovereignty-gated reputation tiers
-│   └── tools.ts           # MCP tool definitions
-├── shr/                   # Machine-readable sovereignty health reports
-├── handshake/             # Sovereignty handshake protocol
-├── federation/            # MCP-to-MCP federation registry
-├── bridge/                # Concordia bridge (negotiation to sovereignty)
-│   ├── types.ts           # Interface contract
-│   ├── bridge.ts          # Core: canonicalize, commit, verify
-│   └── tools.ts           # MCP tools plus BridgeStore
-├── principal-policy/      # Principal Policy (Cooperative MCP gate, Charter)
-│   ├── types.ts           # Policy, gate, baseline type definitions
-│   ├── loader.ts          # YAML/JSON policy parser plus defaults
-│   ├── baseline.ts        # Behavioral baseline tracker (encrypted)
-│   ├── approval-channel.ts # OS notification plus stderr plus webhook channels
-│   ├── menubar/           # macOS / Linux / Windows menubar status app (v1.2)
-│   ├── webhook.ts         # External webhook approval (HMAC-SHA256)
-│   ├── gate.ts            # Three-tier approval gate
-│   └── tools.ts           # Read-only policy/baseline MCP tools
-├── chat/                  # Concierge chat: operator-to-Sanctuary natural-language surface (v1.2)
-│                          # Direct-agent chat surfaces removed in the v1.2 chat-removal pass.
-├── router.ts              # MCP SDK tool router (with gate integration)
-├── config.ts              # Configuration management
-├── index.ts               # Server factory
-└── cli.ts                 # CLI entry point
-```
+The maintained module map is [`src/README.md`](src/README.md). It identifies
+the current module owners, confusable names, and frozen compatibility surfaces.
 
 ## Specification
 
-See [`rfcs/RFC-0001-sanctuary-mcp-server.md`](../rfcs/RFC-0001-sanctuary-mcp-server.md) for the core specification, [`rfcs/RFC-0002-principal-policy-operational-approval.md`](../rfcs/RFC-0002-principal-policy-operational-approval.md) for the Principal Policy specification, and [`rfcs/RFC-0003-castle-architecture.md`](../rfcs/RFC-0003-castle-architecture.md) for the Castle Architecture specification.
+See [`rfcs/RFC-0001-sanctuary-mcp-server.md`](../rfcs/RFC-0001-sanctuary-mcp-server.md) for the core specification, [`rfcs/RFC-0002-principal-policy-operational-approval.md`](../rfcs/RFC-0002-principal-policy-operational-approval.md) for the Principal Policy specification, and [`rfcs/RFC-0003-castle-architecture.md`](rfcs/RFC-0003-castle-architecture.md) for the Castle Architecture specification.
 
 ## License
 
