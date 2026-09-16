@@ -53,6 +53,10 @@ const ALLOWLIST: ReadonlyArray<string> = [
   ".github",
   ".gitignore",
   ".gitleaks.toml",
+  // Install-time hardening (engineering-practice ledger item E7,
+  // 2026-09-15): allow-git=none. See server/.npmrc for why ignore-scripts
+  // is NOT set here (it would suppress this package's own pretest build).
+  ".npmrc",
   ".test-baseline",
   ".test-baseline-overrides.log",
   "AGENTS.md",

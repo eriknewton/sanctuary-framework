@@ -68,7 +68,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: server
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Set up Python 3.12 for Concordia sidecar
         uses: actions/setup-python@v7
