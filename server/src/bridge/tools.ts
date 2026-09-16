@@ -452,7 +452,7 @@ class BridgeStore {
    * `true` (production always scans) -- an operator would flip this off
    * only after running an out-of-band migration that re-keys every legacy
    * record to its content id, at which point the guard collapses to a
-   * single content-id read. DEBT (owed, not built here -- out of scope per
+   * single content-id read. DEBT(BRIDGE-MIGRATE-IDS-VERB-MISSING) (owed, not built here -- out of scope per
    * the design brief V2-4 "optional operator-run maintenance verb"): no
    * `migrate-bridge-ids` CLI verb exists yet, so this flag has no way to
    * be safely turned off today; it stays `true` in practice until that
@@ -485,7 +485,7 @@ class BridgeStore {
    * same fail-closed posture ReputationStore.findExistingAttestationForDedup
    * already uses scanning this exact namespace.
    *
-   * DEBT (LD3 BRIDGE-BP-01, scope): this is an O(N) decrypt-scan on every
+   * DEBT(BRIDGE-DECRYPT-SCAN-COMPLEXITY) (LD3 BRIDGE-BP-01, scope): this is an O(N) decrypt-scan on every
    * write, same shape as the pre-existing bridge_attest/
    * hasLocalBridgeCommitmentForAttestation scans. Indexing `_bridge` by
    * origin (an in-memory count cache built once and maintained
@@ -1504,7 +1504,7 @@ export function createBridgeTools(
         // caller-supplied and the session_receipt is not verified here, so a
         // fresh session_id per call still self-inflates the tally.
         //
-        // DEBT (bridge self-inflation, unchanged by this fix): verify the
+        // DEBT(BRIDGE-SELF-INFLATION) (bridge self-inflation, unchanged by this fix): verify the
         // Concordia session_receipt (or another negotiation-unique anchor)
         // so one real negotiation cannot be re-committed under many
         // session_ids. That is a trust-boundary decision for Erik

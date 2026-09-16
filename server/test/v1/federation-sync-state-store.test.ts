@@ -1,8 +1,9 @@
+// fail-before-exempt: comment-only debt-handle retrofit (PR #1428); no behavior is asserted by this change, so the file cannot fail against pre-change source.
 /**
  * Store-level durability tests for the federation peer-sync security state
  * (Federation 3/3b P0).
  *
- * The DEBT these close: the per-sender accepted high-water, the outbound
+ * DEBT(FEDERATION-SYNC-STATE-DURABILITY): the per-sender accepted high-water, the outbound
  * high-water, and the folded node-revocation projection were in-memory ONLY, so
  * a daemon restart re-opened the whole-envelope replay window (no prior
  * high-water) AND silently un-revoked every evicted node until those evictions

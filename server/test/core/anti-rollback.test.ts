@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only debt-handle retrofit (PR #1428); no behavior is asserted by this change, so the file cannot fail against pre-change source.
 /**
  * Anti-Rollback Epoch Anchoring — Stage 1 tests.
  *
@@ -178,7 +179,7 @@ describe("epoch witness", () => {
   });
 });
 
-describe("baseline-established latch (DEBT-1 close-out)", () => {
+describe("baseline-established latch (CONFIG-BASELINE-ROLLBACK-CLOSED close-out)", () => {
   it("an untrusted (absent) witness reports established=false + witnessUntrusted", async () => {
     const storage = new MemoryStorage();
     const master = generateRandomKey();

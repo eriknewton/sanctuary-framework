@@ -187,7 +187,7 @@ export type ConfigDowngradeReason =
   | "verascore_autopublish_enabled"
   | "erc8004_confirmation_enabled"
   | "config_baseline_invalid"
-  // DEBT-1: the baseline record is absent (deleted) or presents an older schema
+  // DEBT(CONFIG-BASELINE-ROLLBACK-REASON): the baseline record is absent (deleted) or presents an older schema
   // (downgrade reseed) on a fortress whose boot-anchored monotonic witness
   // records a baseline was already established (a deletion/downgrade replay),
   // refused by the config gate (`core/config-baseline.ts`).

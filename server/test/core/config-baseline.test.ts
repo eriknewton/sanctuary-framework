@@ -1,3 +1,4 @@
+// fail-before-exempt: comment-only debt-handle retrofit (PR #1428); no behavior is asserted by this change, so the file cannot fail against pre-change source.
 /**
  * Authenticated config-security baseline — the custody-MAC config-downgrade
  * gate (boot step "5rc"; replaces #791's forgeable adjacent baseline file).
@@ -595,7 +596,7 @@ describe("detectConfigDowngrades comparator (reused #791 logic)", () => {
 });
 
 /**
- * DEBT-1 close-out: deletion-replay + older-schema-reseed, closed by binding the
+ * CONFIG-BASELINE-ROLLBACK-CLOSED close-out: deletion-replay + older-schema-reseed, closed by binding the
  * baseline's existence + sealed-schema floor into the boot-anchored monotonic
  * epoch witness (`core/anti-rollback.ts`). The attack under regression: an
  * on-host attacker WITHOUT the master key deletes the single deletable baseline
@@ -611,11 +612,11 @@ describe("detectConfigDowngrades comparator (reused #791 logic)", () => {
  *   4. legitimate forward upgrade     -> reseed allowed (no false brick;
  *                                        the #805 reseed-not-brick survives).
  */
-describe("config-security baseline — DEBT-1 deletion/downgrade replay (witness-anchored)", () => {
+describe("config-security baseline — CONFIG-BASELINE-ROLLBACK-CLOSED deletion/downgrade replay (witness-anchored)", () => {
   /** Hand-write an older-schema (v2) baseline record an attacker would forge.
    * The marker is present and the schema is < current, so the reseed branch is
-   * reached BEFORE any MAC check — exactly the unauthenticated path DEBT-1
-   * closes. The MAC bytes are irrelevant on this path (never verified). */
+   * reached BEFORE any MAC check — exactly the unauthenticated path
+   * CONFIG-BASELINE-ROLLBACK-CLOSED closes. The MAC bytes are irrelevant on this path (never verified). */
   async function writeOlderSchemaRecord(
     storage: MemoryStorage,
     schema: number
@@ -751,7 +752,7 @@ describe("config-security baseline — DEBT-1 deletion/downgrade replay (witness
     const storage = new MemoryStorage();
     const master = generateRandomKey();
 
-    // A pre-DEBT-1 witness that established the latch WITHOUT a schema floor
+    // A pre-CONFIG-BASELINE-ROLLBACK-CLOSED witness that established the latch WITHOUT a schema floor
     // (legacy). An older-schema record must not be treated as a downgrade when
     // there is no floor to compare against.
     await raiseBaselineEstablishedLatch(storage, master, 0);

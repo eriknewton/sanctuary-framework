@@ -191,7 +191,7 @@ export interface EpochWitnessData {
   epoch_id: string;
   witnessed_at: string;
   /**
-   * Monotonic "a config-security baseline has been established" latch (DEBT-1
+   * Monotonic "a config-security baseline has been established" latch (CONFIG-BASELINE-ROLLBACK-CLOSED
    * close-out for the #805/#791 config-downgrade gate). Once a fortress has
    * sealed a config-security baseline (`core/config-baseline.ts`), this is
    * raised to `true` in the master-MAC'd witness and NEVER lowered. It lets the
@@ -199,7 +199,7 @@ export interface EpochWitnessData {
    * single-deletable baseline record as a rollback: a missing/reseed baseline
    * on a fortress whose witness says one was established is a downgrade-replay
    * attempt, not a genuine first run. ADDITIVE: absent reads as `false`
-   * (pre-DEBT-1 / legacy witnesses), bound into the witness MAC because the MAC
+   * (pre-CONFIG-BASELINE-ROLLBACK-CLOSED / legacy witnesses), bound into the witness MAC because the MAC
    * covers `canonicalJson(data)`. The latch lives in the epoch-witness record,
    * a SEPARATE deletable location from the config-baseline record, so laundering
    * the deletion requires the attacker to ALSO delete the master-MAC'd witness;
@@ -210,7 +210,7 @@ export interface EpochWitnessData {
   baseline_established?: boolean;
   /**
    * Monotonic floor on the HIGHEST config-baseline schema version this fortress
-   * has ever sealed (DEBT-1, the reseed leg). It distinguishes a legitimate
+   * has ever sealed (CONFIG-BASELINE-RESEED-LEG). It distinguishes a legitimate
    * forward schema UPGRADE reseed from a backward DOWNGRADE reseed attack:
    *  - legit upgrade: the running binary seals a HIGHER schema than this floor →
    *    the floor advances, reseed allowed.
@@ -218,7 +218,7 @@ export interface EpochWitnessData {
    *    fortress whose floor already recorded a higher sealed schema → the
    *    presented schema is BELOW the floor → fail closed.
    * Like `baseline_established` it is ADDITIVE (absent reads as "no floor",
-   * legacy/pre-DEBT-1), never lowered, and bound into the witness MAC. It is set
+   * legacy/pre-CONFIG-BASELINE-ROLLBACK-CLOSED), never lowered, and bound into the witness MAC. It is set
    * together with the establishment latch.
    */
   baseline_schema?: number;
@@ -437,7 +437,7 @@ export async function writeEpochWitness(
   );
 }
 
-// ── Config-baseline establishment latch (DEBT-1 close-out) ──────────────────
+// ── Config-baseline establishment latch (CONFIG-BASELINE-ROLLBACK-CLOSED close-out) ──────────────────
 
 /**
  * Read the boot-anchored "a config-security baseline was established" latch from
@@ -457,7 +457,7 @@ export async function writeEpochWitness(
  *    fail closed; a reseed at a schema AT-OR-ABOVE `sealedSchema` is a legit
  *    forward upgrade → allowed.
  *  - `{ established: false }`: the witness authenticates and the latch is
- *    unset (genuine never-seeded fortress, or a legacy pre-DEBT-1 witness).
+ *    unset (genuine never-seeded fortress, or a legacy pre-CONFIG-BASELINE-ROLLBACK-CLOSED witness).
  *  - `{ established: false, witnessUntrusted: true }`: NO authenticated witness
  *    exists (absent or tampered). The caller MUST NOT read this as "no baseline
  *    was ever established"; it composes this with the OTHER surviving witnesses

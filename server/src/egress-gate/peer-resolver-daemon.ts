@@ -69,10 +69,11 @@
  *
  * MECHANISM (interim, per the build spec): `lsof` run AS ROOT via the SAME
  * `PeerCommandRunner`/`parseLsofPeer` pair `peer-identity.ts` already uses --
- * this reuses the exact tested parse logic instead of forking it. DEBT: the
- * native `proc_pidinfo`/`PROC_PIDFDSOCKETINFO` path (no subprocess spawn per
- * lookup) is the target end state; `peer-identity.ts`'s header already
- * tracked this DEBT for the pre-privilege design and it is UNCHANGED here --
+ * this reuses the exact tested parse logic instead of forking it. The native
+ * `proc_pidinfo`/`PROC_PIDFDSOCKETINFO` path (no subprocess spawn per
+ * lookup, tracked as EGRESS-PEER-NATIVE-LOOKUP) is the target end state;
+ * `peer-identity.ts`'s header already tracked this debt for the pre-privilege
+ * design and it is UNCHANGED here --
  * shelling `lsof` as root is still a subprocess-per-lookup cost, now paid by
  * root instead of failing outright. Ship interim first (this build); file the
  * native path as a follow-up.
