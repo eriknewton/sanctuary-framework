@@ -14,12 +14,53 @@ mod isolation;
 
 use castle_wall_daemon::cgroup;
 use castle_wall_daemon::nfqueue::{self, NfqueueConfig};
-use castle_wall_daemon::nftables::{self, AgentRulesetId, NftRuleFragment, CASTLE_FAMILY};
+use castle_wall_daemon::nftables::{
+    self, AgentRulesetId, AgentUidBinding, ExpectedAgentBinding, NftRuleFragment, CASTLE_FAMILY,
+};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::Ordering;
 
 // ---- helpers ---------------------------------------------------------------
+
+/// The fortress every agent binding in this file is sealed under. A single
+/// constant so a test that means to vary the FORTRESS has to say so.
+///
+/// Must match the `DaemonConfig.fortress_id` the end-to-end test boots with: the
+/// uid seal is recomputed under the fortress the CURRENT policy snapshot names,
+/// so a binding installed under one id does not verify under another.
+const TEST_FORTRESS: &str = "deadbeef";
+/// The system-uid allow ceiling these tests admit uids under. Mirrors the
+/// manifest floor (`AgentOrigin.system_uid_allow_ceiling`).
+const TEST_UID_CEILING: u32 = 1000;
+/// The uid every agent binding here matches. Comfortably above the ceiling, and
+/// deliberately a uid with NO account on the runner: the P0 probe established
+/// that nft lists an account-less uid as a bare integer, and nothing in the
+/// kernel match requires the account to exist.
+const TEST_AGENT_UID: u32 = 60123;
+
+fn test_binding() -> AgentUidBinding {
+    AgentUidBinding {
+        agent_uid: TEST_AGENT_UID,
+        system_uid_allow_ceiling: TEST_UID_CEILING,
+    }
+}
+
+fn ruleset_id(agent_id: &str) -> AgentRulesetId {
+    AgentRulesetId {
+        agent_id: agent_id.to_string(),
+        fortress_id: TEST_FORTRESS.to_string(),
+    }
+}
+
+/// The trusted expectation a healthy reclaim/health comparison would carry for
+/// the bindings this file installs.
+fn test_expectation() -> ExpectedAgentBinding {
+    ExpectedAgentBinding::Confined {
+        fortress_id: TEST_FORTRESS.to_string(),
+        agent_uid: TEST_AGENT_UID,
+    }
+}
 
 fn nft_cmd(args: &[&str]) -> String {
     let output = Command::new("nft")
@@ -74,26 +115,19 @@ fn nftables_load_and_remove_agent_ruleset() {
     cleanup_castle_table();
     nftables::install_castle_table().expect("install");
 
-    // Production rule emission requires a real cgroup at the path string
-    // because nft validates `socket cgroupv2 level <N> "<path>"` at
-    // rule-load time by walking `/sys/fs/cgroup/<path>`. Create a real
-    // agent scope via systemd-run so the lookup succeeds.
-    let scope = cgroup::create_agent_scope("test-agent-1").expect("create_agent_scope");
-    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
+    // Production rule emission needs no filesystem object: nft validates
+    // nothing about a `meta skuid` value at rule-load time, and the uid used
+    // here has no account on the runner (the P0 probe established that a rule
+    // for an account-less uid loads and lists as a bare integer).
 
-    let id = AgentRulesetId {
-        agent_id: "test-agent-1".to_string(),
-        cgroup_path: scope.cgroup_path.clone(),
-    };
+    let id = ruleset_id("test-agent-1");
 
     let frags = vec![NftRuleFragment {
         rule_id: "r-test-1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script =
-        nftables::build_agent_ruleset("test-agent-1", &cgroup_relative, scope.cgroup_level, &frags);
-    nftables::load_agent_ruleset(&id, &script, scope.cgroup_level, &cgroup_relative)
-        .expect("load_agent_ruleset");
+    let script = nftables::build_agent_ruleset("test-agent-1", TEST_AGENT_UID, &frags);
+    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load_agent_ruleset");
 
     let output = nft_cmd(&["list", "table", CASTLE_FAMILY, isolation::table()]);
     assert!(
@@ -103,13 +137,12 @@ fn nftables_load_and_remove_agent_ruleset() {
     );
 
     let listed = nftables::list_agent_rulesets().expect("list");
-    assert!(listed.iter().any(|r| r.agent_id == "test-agent-1"));
+    assert!(listed.iter().any(|id| id == "test-agent-1"));
 
     nftables::remove_agent_ruleset(&id).expect("remove_agent_ruleset");
     let listed = nftables::list_agent_rulesets().expect("list after remove");
-    assert!(!listed.iter().any(|r| r.agent_id == "test-agent-1"));
+    assert!(!listed.iter().any(|id| id == "test-agent-1"));
 
-    let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
 }
 
@@ -119,13 +152,7 @@ fn nftables_atomic_replace_updates_rules() {
     cleanup_castle_table();
     nftables::install_castle_table().expect("install");
 
-    let scope = cgroup::create_agent_scope("test-replace").expect("create_agent_scope");
-    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
-
-    let id = AgentRulesetId {
-        agent_id: "test-replace".to_string(),
-        cgroup_path: scope.cgroup_path.clone(),
-    };
+    let id = ruleset_id("test-replace");
 
     // Static fragments are intentionally IGNORED by `build_agent_ruleset` in the
     // NFQUEUE-only model: every unmatched packet is routed to the daemon's
@@ -138,14 +165,8 @@ fn nftables_atomic_replace_updates_rules() {
         rule_id: "r1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script1 = nftables::build_agent_ruleset(
-        "test-replace",
-        &cgroup_relative,
-        scope.cgroup_level,
-        &frags1,
-    );
-    nftables::load_agent_ruleset(&id, &script1, scope.cgroup_level, &cgroup_relative)
-        .expect("load v1");
+    let script1 = nftables::build_agent_ruleset("test-replace", TEST_AGENT_UID, &frags1);
+    nftables::load_agent_ruleset(&id, &script1, test_binding()).expect("load v1");
     let listing_v1 = nft_cmd(&[
         "-a",
         "list",
@@ -161,14 +182,8 @@ fn nftables_atomic_replace_updates_rules() {
         rule_id: "r2".to_string(),
         nft_expr: "tcp dport 8443 accept".to_string(),
     }];
-    let script2 = nftables::build_agent_ruleset(
-        "test-replace",
-        &cgroup_relative,
-        scope.cgroup_level,
-        &frags2,
-    );
-    nftables::load_agent_ruleset(&id, &script2, scope.cgroup_level, &cgroup_relative)
-        .expect("load v2");
+    let script2 = nftables::build_agent_ruleset("test-replace", TEST_AGENT_UID, &frags2);
+    nftables::load_agent_ruleset(&id, &script2, test_binding()).expect("load v2");
     let listing_v2 = nft_cmd(&[
         "-a",
         "list",
@@ -190,8 +205,12 @@ fn nftables_atomic_replace_updates_rules() {
         "exactly one NFQUEUE rule after atomic replace (no leaked duplicate): {listing_v2}"
     );
     assert!(
-        listing_v2.contains("socket cgroupv2"),
-        "agent chain must gate on the agent cgroup: {listing_v2}"
+        listing_v2.contains(&format!("meta skuid {TEST_AGENT_UID}")),
+        "agent chain must gate on the agent uid: {listing_v2}"
+    );
+    assert!(
+        !listing_v2.contains("cgroupv2"),
+        "the retired cgroup match must not survive anywhere in the live chain: {listing_v2}"
     );
     assert!(
         !listing_v2.contains("8443")
@@ -207,7 +226,72 @@ fn nftables_atomic_replace_updates_rules() {
         "atomic replace must swap the rule identity (v1 handle {handle_v1} == v2 handle {handle_v2})"
     );
 
-    let _ = cgroup::destroy_agent_scope(&scope);
+    cleanup_castle_table();
+}
+
+/// End-to-end agreement between what the emitter INSTALLS in the kernel and what
+/// the ownership parser will ACCEPT reading it back.
+///
+/// This is the test a pure parser test cannot be: the JSON here is nft's own
+/// rendering of a rule the daemon really loaded, not a fixture written by the
+/// same person who wrote the parser. A drift between emission and verification
+/// would otherwise install a wall that fails its own first health poll, and the
+/// operator would see a daemon that comes up and immediately re-arms deny-all
+/// with no obvious cause.
+#[test]
+fn installed_binding_verifies_under_the_manifest_uid_and_not_under_another() {
+    let _suite = isolation::guard();
+    cleanup_castle_table();
+    nftables::install_castle_table().expect("install");
+
+    let id = ruleset_id("agreement-test");
+    let script = nftables::build_agent_ruleset("agreement-test", TEST_AGENT_UID, &[]);
+    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load");
+
+    let json = nft_cmd(&[
+        "-a",
+        "-j",
+        "list",
+        "table",
+        CASTLE_FAMILY,
+        isolation::table(),
+    ]);
+
+    // The uid the manifest confines: the live inventory is the owned object.
+    nftables::parse_owned_table_identity(&json, &test_expectation())
+        .expect("a binding this daemon just installed must verify under the manifest uid");
+
+    // A DIFFERENT uid: the same live bytes, the same seal, the same shape, the
+    // same body/jump agreement. Only the trusted expectation separates them, and
+    // it must refuse.
+    let other = ExpectedAgentBinding::Confined {
+        fortress_id: TEST_FORTRESS.to_string(),
+        agent_uid: TEST_AGENT_UID + 1,
+    };
+    assert!(
+        nftables::parse_owned_table_identity(&json, &other).is_err(),
+        "a live binding for a uid the manifest does not confine must be refused"
+    );
+
+    // A different FORTRESS: the seal is domain-separated, so the same uid under
+    // another fortress is not this fortress's owned object.
+    let other_fortress = ExpectedAgentBinding::Confined {
+        fortress_id: "some-other-fortress".to_string(),
+        agent_uid: TEST_AGENT_UID,
+    };
+    assert!(
+        nftables::parse_owned_table_identity(&json, &other_fortress).is_err(),
+        "a live binding sealed under another fortress must be refused"
+    );
+
+    // Nothing confined: absent is not passing. A live per-agent binding with no
+    // trusted expectation to check it against is refused, never adopted.
+    assert!(
+        nftables::parse_owned_table_identity(&json, &ExpectedAgentBinding::NoneConfined).is_err(),
+        "a live binding must be refused when the current policy confines no uid"
+    );
+
+    nftables::remove_agent_ruleset(&id).expect("remove");
     cleanup_castle_table();
 }
 
@@ -234,21 +318,14 @@ fn nftables_ruleset_includes_nfqueue_catchall() {
     cleanup_castle_table();
     nftables::install_castle_table().expect("install");
 
-    let scope = cgroup::create_agent_scope("test-queue").expect("create_agent_scope");
-    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
-
-    let id = AgentRulesetId {
-        agent_id: "test-queue".to_string(),
-        cgroup_path: scope.cgroup_path.clone(),
-    };
+    let id = ruleset_id("test-queue");
 
     let frags = vec![NftRuleFragment {
         rule_id: "r1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script =
-        nftables::build_agent_ruleset("test-queue", &cgroup_relative, scope.cgroup_level, &frags);
-    nftables::load_agent_ruleset(&id, &script, scope.cgroup_level, &cgroup_relative).expect("load");
+    let script = nftables::build_agent_ruleset("test-queue", TEST_AGENT_UID, &frags);
+    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load");
 
     // nft canonicalizes the input rule form `queue num 0` to `queue to 0`
     // in its listing output, so the assertion matches the listing form.
@@ -265,7 +342,6 @@ fn nftables_ruleset_includes_nfqueue_catchall() {
         out
     );
 
-    let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
 }
 
@@ -282,24 +358,13 @@ fn gf1_deny_all_over_a_live_agent_table_forces_policy_drop_never_accept() {
     cleanup_castle_table();
 
     nftables::install_castle_table().expect("install accept-base table");
-    let scope = cgroup::create_agent_scope("gf1-live-agent").expect("create_agent_scope");
-    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
-    let id = AgentRulesetId {
-        agent_id: "gf1-live-agent".to_string(),
-        cgroup_path: scope.cgroup_path.clone(),
-    };
+    let id = ruleset_id("gf1-live-agent");
     let frags = vec![NftRuleFragment {
         rule_id: "r".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script = nftables::build_agent_ruleset(
-        "gf1-live-agent",
-        &cgroup_relative,
-        scope.cgroup_level,
-        &frags,
-    );
-    nftables::load_agent_ruleset(&id, &script, scope.cgroup_level, &cgroup_relative)
-        .expect("load_agent_ruleset");
+    let script = nftables::build_agent_ruleset("gf1-live-agent", TEST_AGENT_UID, &frags);
+    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load_agent_ruleset");
 
     // Precondition: the fail-OPEN shape -- accept base chain, agent wired.
     let before = nft_cmd(&["list", "table", CASTLE_FAMILY, isolation::table()]);
@@ -339,7 +404,6 @@ fn gf1_deny_all_over_a_live_agent_table_forces_policy_drop_never_accept() {
     );
 
     cleanup_castle_table();
-    let _ = cgroup::destroy_agent_scope(&scope);
 }
 
 #[test]
@@ -350,23 +414,17 @@ fn nftables_load_agent_ruleset_installs_base_chain_jump() {
     // gates entry from the base output chain. Without this, the per-agent
     // chain is dead and packets bypass enforcement entirely. After load,
     // the base output chain must contain exactly one `goto agent_<id>`
-    // rule with the cgroupv2 socket match.
+    // rule with the `meta skuid` match.
     cleanup_castle_table();
     nftables::install_castle_table().expect("install");
 
-    let scope = cgroup::create_agent_scope("jump-test").expect("create_agent_scope");
-    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
-    let id = AgentRulesetId {
-        agent_id: "jump-test".to_string(),
-        cgroup_path: scope.cgroup_path.clone(),
-    };
+    let id = ruleset_id("jump-test");
     let frags = vec![NftRuleFragment {
         rule_id: "r1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script =
-        nftables::build_agent_ruleset("jump-test", &cgroup_relative, scope.cgroup_level, &frags);
-    nftables::load_agent_ruleset(&id, &script, scope.cgroup_level, &cgroup_relative).expect("load");
+    let script = nftables::build_agent_ruleset("jump-test", TEST_AGENT_UID, &frags);
+    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load");
 
     // The base `output` chain now holds the jump rule.
     let listing = nft_cmd(&[
@@ -383,8 +441,15 @@ fn nftables_load_agent_ruleset_installs_base_chain_jump() {
         "base output chain must hold exactly one jump rule for jump-test; got: {listing}"
     );
     assert!(
-        listing.contains("socket cgroupv2"),
-        "jump rule must carry cgroupv2 socket match; got: {listing}"
+        listing.contains(&format!("meta skuid {TEST_AGENT_UID}")),
+        "jump rule must carry the agent-uid match; got: {listing}"
+    );
+    // INVARIANT: `goto`, never `jump`. A `jump` returns to the accept-policy base
+    // chain and silently undoes the per-agent verdict; the parse side pins the
+    // same verb, so a regression on either side is caught by the other.
+    assert!(
+        !listing.contains("jump agent_jump-test"),
+        "the base-chain verdict must be the terminating goto; got: {listing}"
     );
 
     nftables::remove_agent_ruleset(&id).expect("remove");
@@ -401,7 +466,6 @@ fn nftables_load_agent_ruleset_installs_base_chain_jump() {
         "remove_agent_ruleset must clean up the jump rule; got: {listing_after_remove}"
     );
 
-    let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
 }
 
@@ -416,21 +480,14 @@ fn nftables_load_agent_ruleset_idempotent_under_reload() {
     cleanup_castle_table();
     nftables::install_castle_table().expect("install");
 
-    let scope = cgroup::create_agent_scope("idem-test").expect("create_agent_scope");
-    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
-    let id = AgentRulesetId {
-        agent_id: "idem-test".to_string(),
-        cgroup_path: scope.cgroup_path.clone(),
-    };
+    let id = ruleset_id("idem-test");
 
     let frags1 = vec![NftRuleFragment {
         rule_id: "r1".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script1 =
-        nftables::build_agent_ruleset("idem-test", &cgroup_relative, scope.cgroup_level, &frags1);
-    nftables::load_agent_ruleset(&id, &script1, scope.cgroup_level, &cgroup_relative)
-        .expect("load v1");
+    let script1 = nftables::build_agent_ruleset("idem-test", TEST_AGENT_UID, &frags1);
+    nftables::load_agent_ruleset(&id, &script1, test_binding()).expect("load v1");
     let listing1 = nft_cmd(&[
         "-a",
         "list",
@@ -451,10 +508,8 @@ fn nftables_load_agent_ruleset_idempotent_under_reload() {
         rule_id: "r2".to_string(),
         nft_expr: "tcp dport 8443 accept".to_string(),
     }];
-    let script2 =
-        nftables::build_agent_ruleset("idem-test", &cgroup_relative, scope.cgroup_level, &frags2);
-    nftables::load_agent_ruleset(&id, &script2, scope.cgroup_level, &cgroup_relative)
-        .expect("load v2");
+    let script2 = nftables::build_agent_ruleset("idem-test", TEST_AGENT_UID, &frags2);
+    nftables::load_agent_ruleset(&id, &script2, test_binding()).expect("load v2");
     let listing2 = nft_cmd(&[
         "-a",
         "list",
@@ -470,126 +525,19 @@ fn nftables_load_agent_ruleset_idempotent_under_reload() {
     );
 
     nftables::remove_agent_ruleset(&id).expect("remove");
-    let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
 }
 
-// Ignored, not deleted: this test is the in-crate witness for the open
-// register row `defect.linux-recreated-agent-scope-refused-as-foreign`. The
-// change that closes that row removes this attribute in the same commit so the
-// assertions below run unedited; an ignore that outlives its row is a
-// drill-close defect.
-#[test]
-#[ignore = "witness for open register row defect.linux-recreated-agent-scope-refused-as-foreign; re-enabled by its fix"]
-fn nftables_scope_recreation_refresh_fails_closed_then_restores_queue() {
-    let _suite = isolation::guard();
-    cleanup_castle_table();
-    nftables::install_castle_table().expect("install");
-
-    let agent_id = "refresh-test";
-    let first_scope = cgroup::create_agent_scope(agent_id).expect("create first scope");
-    let first_relative = cgroup::cgroup_relative_path(&first_scope).expect("first relative");
-    let id = AgentRulesetId {
-        agent_id: agent_id.to_string(),
-        cgroup_path: first_scope.cgroup_path.clone(),
-    };
-    let frags = vec![NftRuleFragment {
-        rule_id: "r-refresh".to_string(),
-        nft_expr: "tcp dport 443 accept".to_string(),
-    }];
-    let first_script =
-        nftables::build_agent_ruleset(agent_id, &first_relative, first_scope.cgroup_level, &frags);
-    nftables::load_agent_ruleset(
-        &id,
-        &first_script,
-        first_scope.cgroup_level,
-        &first_relative,
-    )
-    .expect("load first ruleset");
-
-    cgroup::destroy_agent_scope(&first_scope).expect("destroy first scope");
-    let refreshed_scope = cgroup::create_agent_scope(agent_id).expect("create refreshed scope");
-    let refreshed_relative =
-        cgroup::cgroup_relative_path(&refreshed_scope).expect("refreshed relative");
-    let refreshed_id = AgentRulesetId {
-        agent_id: agent_id.to_string(),
-        cgroup_path: refreshed_scope.cgroup_path.clone(),
-    };
-
-    nftables::load_agent_fail_closed_ruleset(
-        &refreshed_id,
-        refreshed_scope.cgroup_level,
-        &refreshed_relative,
-    )
-    .expect("install fail-closed refreshed jump");
-    let fail_closed_chain = nft_cmd(&[
-        "list",
-        "chain",
-        CASTLE_FAMILY,
-        isolation::table(),
-        "agent_refresh-test",
-    ]);
-    assert!(
-        fail_closed_chain.contains("drop"),
-        "refresh stage must fail closed before restoring policy: {fail_closed_chain}"
-    );
-    assert!(
-        !fail_closed_chain.contains("queue"),
-        "fail-closed stage must not queue unmatched traffic: {fail_closed_chain}"
-    );
-
-    let refreshed_script = nftables::build_agent_ruleset(
-        agent_id,
-        &refreshed_relative,
-        refreshed_scope.cgroup_level,
-        &frags,
-    );
-    nftables::load_agent_ruleset(
-        &refreshed_id,
-        &refreshed_script,
-        refreshed_scope.cgroup_level,
-        &refreshed_relative,
-    )
-    .expect("restore refreshed ruleset");
-    let output_listing = nft_cmd(&[
-        "-a",
-        "list",
-        "chain",
-        CASTLE_FAMILY,
-        isolation::table(),
-        "output",
-    ]);
-    assert_eq!(
-        output_listing.matches("goto agent_refresh-test").count(),
-        1,
-        "refresh must leave exactly one jump for the agent: {output_listing}"
-    );
-    assert!(
-        output_listing.contains(&refreshed_relative),
-        "jump must point at refreshed cgroup path: {output_listing}"
-    );
-    if first_scope.cgroup_id != refreshed_scope.cgroup_id && first_relative != refreshed_relative {
-        assert!(
-            !output_listing.contains(&first_relative),
-            "stale cgroup jump must be removed after refresh: {output_listing}"
-        );
-    }
-    let restored_chain = nft_cmd(&[
-        "list",
-        "chain",
-        CASTLE_FAMILY,
-        isolation::table(),
-        "agent_refresh-test",
-    ]);
-    assert!(
-        restored_chain.contains("queue to 0"),
-        "normal policy must be restored after fail-closed stage: {restored_chain}"
-    );
-
-    nftables::remove_agent_ruleset(&refreshed_id).expect("remove refreshed ruleset");
-    let _ = cgroup::destroy_agent_scope(&refreshed_scope);
-    cleanup_castle_table();
-}
+// DELETED with the cgroup-identity match (A104 option B):
+// `nftables_scope_recreation_refresh_fails_closed_then_restores_queue` was the
+// in-crate witness for `defect.linux-recreated-agent-scope-refused-as-foreign`.
+// It observed a cgroup recreation invalidating the kernel binding, and that
+// scenario ceases to exist: a restarted agent gets a new cgroup and the SAME
+// uid, so the installed rule stays correct and there is nothing to refresh. The
+// witness is superseded by deletion rather than repaired, and its register row
+// closes with this change. A witness whose scenario no longer exists cannot be
+// re-enabled; keeping it ignored would be the drill-close defect it was written
+// to avoid.
 
 // ---- cgroup tests ---------------------------------------------------------
 
@@ -699,7 +647,7 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     use base64::Engine as _;
     use castle_wall_daemon::manifest::canonical_json::canonicalize_to_bytes;
     use castle_wall_daemon::manifest::verify::{
-        AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+        AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
     };
     use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
     use castle_wall_daemon::nftables::rule_to_nft_expr;
@@ -764,7 +712,22 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         fortress_id: "deadbeef".to_string(),
         issued_at: "2026-05-05T00:00:00Z".to_string(),
         generation: 1,
-        agent_origin: None,
+        // The SIGNED binding for the uid this test then installs a kernel rule
+        // for. A per-agent uid rule is legitimate only because a manifest in
+        // force confines that uid: with no origin the live binding is
+        // unverifiable, the daemon's health poll reads it as foreign and re-arms
+        // deny-all, and this end-to-end test would assert the evaluator path
+        // while skipping that supervision entirely.
+        // Must match `TEST_AGENT_UID` / `TEST_UID_CEILING` and `test_binding()`.
+        agent_origin: Some(AgentOrigin {
+            mode: "uid".to_string(),
+            egress_helper_signing_id: None,
+            egress_helper_team_id: None,
+            agent_runtime_port_range: None,
+            agent_uid: Some(TEST_AGENT_UID),
+            gate_uid: None,
+            system_uid_allow_ceiling: TEST_UID_CEILING,
+        }),
         operator_baseline: None,
         rules: vec![
             ManifestRuleEntry {
@@ -820,9 +783,13 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
 
     let handle = boot(config).expect("daemon boot");
 
-    // Install nftables table + agent ruleset.
-    cleanup_castle_table();
-    nftables::install_castle_table().expect("install castle table");
+    // NO cleanup/reinstall here. `boot` on a privileged Linux host ACQUIRES the
+    // castle table under the host lock and records its identity in the ownership
+    // journal, so deleting it and installing a replacement hands the daemon a
+    // table with a different owner marker: the next health proof must read that
+    // as drifted, and the ownership assertion below would then be asserting over
+    // an inventory production refuses. The agent ruleset is loaded INTO the
+    // acquired table, exactly as the production agent-management path does.
 
     let test_rule = AllowlistRule {
         id: "rule-allow-test".to_string(),
@@ -849,23 +816,26 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
          emitted into the privileged chain)"
     );
 
-    // End-to-end policy + audit flow with the production cgroupv2 match.
-    // Create a real agent scope so nft's path lookup at rule-load succeeds.
-    let scope = cgroup::create_agent_scope("test-e2e").expect("create_agent_scope");
-    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
-    let ruleset_script =
-        nftables::build_agent_ruleset("test-e2e", &cgroup_relative, scope.cgroup_level, &frags);
-    let agent_id = AgentRulesetId {
-        agent_id: "test-e2e".to_string(),
-        cgroup_path: scope.cgroup_path.clone(),
-    };
-    nftables::load_agent_ruleset(
-        &agent_id,
-        &ruleset_script,
-        scope.cgroup_level,
-        &cgroup_relative,
-    )
-    .expect("load");
+    // End-to-end policy + audit flow with the production uid match. No agent
+    // scope is created: nft validates nothing about a uid at rule-load time (the
+    // P0 probe loaded a rule for a uid with no account at all), so unlike the
+    // retired cgroup path there is no filesystem object the load depends on.
+    let ruleset_script = nftables::build_agent_ruleset("test-e2e", TEST_AGENT_UID, &frags);
+    let agent_id = ruleset_id("test-e2e");
+    nftables::load_agent_ruleset(&agent_id, &ruleset_script, test_binding()).expect("load");
+
+    // The daemon's own supervision must still read the live table as OWNED: the
+    // health poll recomputes the uid seal and compares the live `meta skuid`
+    // value against the uid the CURRENT signed manifest confines, so it passes
+    // only because the manifest above publishes the matching origin. Failure mode
+    // if this assertion is absent: the evaluator assertions below still pass over
+    // an inventory production would refuse. The shared helper waits out the
+    // readiness cache so this is an observation taken AFTER the load, not a
+    // cached reading of the table as it stood before it.
+    isolation::assert_ownership_health_after_install(
+        &handle,
+        "end-to-end fixture after uid-binding install",
+    );
 
     // Verify rules installed.
     let output = nft_cmd(&[
@@ -969,6 +939,5 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     drop(wal_guard);
 
     let _ = handle.stop();
-    let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
 }

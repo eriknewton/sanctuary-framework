@@ -14,12 +14,12 @@
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",
-    "@tauri-apps/plugin-notification": "2.3.3",
-    "@tauri-apps/plugin-http": "2.5.9"
+    "@tauri-apps/plugin-notification": "2.4.0",
+    "@tauri-apps/plugin-http": "2.6.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "2.11.4",
     "typescript": "6.0.3",
-    "vite": "8.2.2"
+    "vite": "8.3.0"
   }
 }
