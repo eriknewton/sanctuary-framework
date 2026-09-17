@@ -143,8 +143,13 @@ fn live_owned_identity() -> Result<nftables::CastleTableOwnership, String> {
     }
     let json = std::str::from_utf8(&output.stdout)
         .map_err(|err| format!("nft JSON was not UTF-8: {err}"))?;
-    nftables::parse_owned_table_identity(json)
-        .map_err(|err| format!("nft JSON lacked the required owned handles/shape: {err}"))
+    // NoneConfined: this suite installs no per-agent binding, so one appearing in
+    // the live table is state the helper cannot vouch for and must refuse.
+    nftables::parse_owned_table_identity(
+        json,
+        &castle_wall_daemon::nftables::ExpectedAgentBinding::NoneConfined,
+    )
+    .map_err(|err| format!("nft JSON lacked the required owned handles/shape: {err}"))
 }
 
 /// The isolated equivalent of the production `RuntimeDirectory=` /
@@ -541,8 +546,11 @@ fn structured_owned_table_listing_contains_required_live_handles() {
     let independent_identity =
         live_owned_identity().expect("independent nft -a -j listing must contain both handles");
     assert_eq!(production_identity, independent_identity);
-    nftables::verify_owned_castle_table(&production_identity)
-        .expect("the captured live handle identity must verify unchanged");
+    nftables::verify_owned_castle_table(
+        &production_identity,
+        &castle_wall_daemon::nftables::ExpectedAgentBinding::NoneConfined,
+    )
+    .expect("the captured live handle identity must verify unchanged");
     cleanup_castle_table();
 }
 

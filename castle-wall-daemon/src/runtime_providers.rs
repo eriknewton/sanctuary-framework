@@ -110,6 +110,7 @@ pub fn linux_production_plan(
             lock_path: config.lock_path.clone(),
             journal_path: config.journal_path.clone(),
             journal_key_path: config.journal_key_path.clone(),
+            decision_engine: Arc::clone(&decision_engine),
         }),
         Box::new(NfqueueProvider {
             decision_engine: Arc::clone(&decision_engine),
@@ -131,6 +132,12 @@ struct NftablesTableProvider {
     lock_path: PathBuf,
     journal_path: PathBuf,
     journal_key_path: PathBuf,
+    /// The verified manifest state the reclaim and health comparisons read the
+    /// CURRENT confined agent uid from. Held as the same `Arc` the decision
+    /// engine holds, never a copy of a value: the expectation must be re-read at
+    /// each comparison, so a manifest reload that changes the uid invalidates a
+    /// stale kernel binding instead of continuing to bless it.
+    decision_engine: Arc<DecisionEngine>,
 }
 
 /// Generate a fresh ownership marker: the [`crate::nftables::OWNER_MARKER_PREFIX`]
@@ -158,6 +165,45 @@ fn new_owner_marker() -> Result<String, EnforcementError> {
         crate::nftables::OWNER_MARKER_PREFIX,
         hex::encode(nonce)
     ))
+}
+
+/// Read the CURRENT trusted agent-binding expectation out of the live policy
+/// snapshot.
+///
+/// INVARIANT: read fresh at every comparison, never cached on the component. The
+/// whole point of comparing a live kernel rule against the manifest is that the
+/// manifest is the side an attacker with CAP_NET_ADMIN cannot rewrite; a value
+/// frozen at acquisition would keep blessing a binding the operator has since
+/// replaced.
+///
+/// Failure mode when the store is contended or poisoned: this returns
+/// `NoneConfined`, which REFUSES any live per-agent binding. That is the
+/// fail-closed direction — an indeterminate answer withdraws readiness and
+/// re-arms deny-all rather than passing.
+#[cfg(target_os = "linux")]
+fn current_expected_agent_binding(
+    decision_engine: &DecisionEngine,
+) -> crate::nftables::ExpectedAgentBinding {
+    use crate::nftables::ExpectedAgentBinding;
+    let Some(store) = decision_engine.manifest_store() else {
+        return ExpectedAgentBinding::NoneConfined;
+    };
+    // A blocking `lock()` here would put the health probe behind a control-plane
+    // fsync; `try_lock` failing is indeterminate, and indeterminate reads as
+    // not-confined, which refuses rather than passes.
+    let Ok(guard) = store.try_lock() else {
+        return ExpectedAgentBinding::NoneConfined;
+    };
+    match guard.current_snapshot() {
+        Some(snapshot) => match snapshot.confined_agent_uid {
+            Some(agent_uid) => ExpectedAgentBinding::Confined {
+                fortress_id: snapshot.fortress_id.clone(),
+                agent_uid,
+            },
+            None => ExpectedAgentBinding::NoneConfined,
+        },
+        None => ExpectedAgentBinding::NoneConfined,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -290,10 +336,27 @@ fn ensure_deny_all_net_installed_once(
 pub fn acquire_castle_table_component_for_test(
     config: &LinuxRuntimeConfig,
 ) -> Result<Box<dyn AcquiredComponent>, EnforcementError> {
+    // A STORE-LESS decision engine, so `current_expected_agent_binding` resolves
+    // to `NoneConfined`: this seam drives the table-lifecycle paths (fresh
+    // create, interrupted-acquisition reclaim, runtime loss) with NO agent
+    // wrapped, which is the posture those paths run in. `NoneConfined` is the
+    // strict reading there — a per-agent binding appearing in a table this seam
+    // owns would be refused — so the seam is never weaker than production.
+    let decision_engine = Arc::new(DecisionEngine::new_with_mutation_cancel(
+        "test-isolation-fortress".to_string(),
+        None,
+        None,
+        Arc::new(std::sync::Mutex::new(crate::audit::AuditRingBuffer::new(
+            1024,
+            Duration::from_secs(1),
+        ))),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    ));
     Box::new(NftablesTableProvider {
         lock_path: config.lock_path.clone(),
         journal_path: config.journal_path.clone(),
         journal_key_path: config.journal_key_path.clone(),
+        decision_engine,
     })
     .acquire()
 }
@@ -391,9 +454,17 @@ impl ComponentProvider for NftablesTableProvider {
                         base_chain_handle,
                         marker,
                     };
-                    if let Err(err) =
-                        crate::nftables::verify_and_register_owned_table_for_reclaim(&owned)
-                    {
+                    // Reclaim/adoption is one of the three sites the design
+                    // names for the trusted manifest comparison: a table
+                    // preserved across a restart may carry a per-agent binding
+                    // this process did not install, so it is adopted only if its
+                    // uid still equals the one the CURRENT signed manifest
+                    // confines.
+                    let expectation = current_expected_agent_binding(&self.decision_engine);
+                    if let Err(err) = crate::nftables::verify_and_register_owned_table_for_reclaim(
+                        &owned,
+                        &expectation,
+                    ) {
                         // GF1: the journal proves we own this table for THIS
                         // boot, but the LIVE table DRIFTED off the captured
                         // identity (external nft edit). Do NOT exit leaving a
@@ -577,6 +648,7 @@ impl ComponentProvider for NftablesTableProvider {
             Ok(Box::new(NftablesTableComponent {
                 lock: Some(lock),
                 ownership,
+                decision_engine: Arc::clone(&self.decision_engine),
                 probe: crate::health_probe::BoundedHealthProbe::new(nft_health_budget()),
                 released: false,
                 deny_all_net_installed: std::sync::atomic::AtomicBool::new(false),
@@ -586,7 +658,12 @@ impl ComponentProvider for NftablesTableProvider {
         {
             // No nftables on this host: fail-before so the plan lands
             // ControlPlaneOnly rather than reporting a table it cannot install.
-            let _ = (&self.lock_path, &self.journal_path, &self.journal_key_path);
+            let _ = (
+                &self.lock_path,
+                &self.journal_path,
+                &self.journal_key_path,
+                &self.decision_engine,
+            );
             Err(EnforcementError::NotAvailableOnPlatform(
                 ComponentKind::NftablesTable.as_str(),
             ))
@@ -804,6 +881,9 @@ struct NftablesTableComponent {
     /// re-verifies against this tuple; it is never used to delete on ordinary
     /// release. A same-name replacement never reads ready. (blocker 2)
     ownership: crate::nftables::CastleTableOwnership,
+    /// The live policy state each health poll re-reads its trusted agent-uid
+    /// expectation from. See [`current_expected_agent_binding`].
+    decision_engine: Arc<DecisionEngine>,
     /// Bounded, single-flight, rate-limited ownership proof. Owns the latching
     /// policy: a COMPLETED negative proof withdraws readiness permanently, while
     /// a deadline overrun is indeterminate and only latches once the consecutive
@@ -830,8 +910,15 @@ const NFT_HEALTH_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// still runs a fresh proof (a genuine loss is detected within one tick), while
 /// any additional caller inside the same window is served from the cached
 /// reading instead of forking a second `nft`.
+///
+/// Public because a reading served from that cache can predate whatever the
+/// caller just installed: the privileged integration suites derive their
+/// post-install freshness wait from THIS value (see
+/// `tests/isolation/mod.rs::assert_ownership_health_after_install`) rather than
+/// mirroring the number, so a change here moves the fixtures with it instead of
+/// silently letting them certify a pre-installation table.
 #[cfg(target_os = "linux")]
-const NFT_HEALTH_MIN_INTERVAL: Duration = Duration::from_millis(500);
+pub const NFT_HEALTH_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Consecutive indeterminate proofs tolerated before readiness is withdrawn
 /// fail-closed, while a single transient timeout under momentary load no longer
@@ -933,8 +1020,15 @@ impl AcquiredComponent for NftablesTableComponent {
         // fail-closed backstop for a wedged `nft` without the false restart a
         // single transient timeout used to cause.
         let ownership = self.ownership.clone();
+        // Live health is the third comparison site: the expectation is snapshot
+        // BEFORE the probe is scheduled (the closure may run on a worker thread)
+        // but read from the CURRENT snapshot on every poll, never cached.
+        let expectation = current_expected_agent_binding(&self.decision_engine);
         match self.probe.poll_result(move || {
-            classify_nft_ownership_probe(crate::nftables::verify_owned_castle_table(&ownership))
+            classify_nft_ownership_probe(crate::nftables::verify_owned_castle_table(
+                &ownership,
+                &expectation,
+            ))
         }) {
             ProbeOutcome::Ready => ComponentHealth::Ready,
             ProbeOutcome::Lost => {
@@ -1215,7 +1309,15 @@ pub fn disarm_castle_runtime(
 
         // 5) Re-validate the EXACT complete inventory immediately before deletion.
         //    A drift (replaced, mutated, foreign) -> refuse + RETAIN the journal.
-        if let Err(err) = crate::nftables::verify_owned_castle_table(&owned) {
+        // Structure-only: disarm holds no fortress id and no manifest, and its
+        // question is "has this drifted off the identity we captured, so that
+        // deleting it would clobber someone else's state?" A seal or uid mismatch
+        // here would wedge the operator's only recovery path while protecting
+        // nothing, since the table is deleted on the very next step.
+        if let Err(err) = crate::nftables::verify_owned_castle_table(
+            &owned,
+            &crate::nftables::ExpectedAgentBinding::StructureOnly,
+        ) {
             drop(lock);
             return Err(disarm_failed(format!(
                 "the live table no longer matches the owned identity; refusing to delete \
@@ -1225,7 +1327,10 @@ pub fn disarm_castle_runtime(
 
         // 6) Handle-qualified delete (re-verifies + deletes by handle internally).
         //    On error RETAIN the journal and fail.
-        if let Err(err) = crate::nftables::remove_owned_castle_table(&owned) {
+        if let Err(err) = crate::nftables::remove_owned_castle_table(
+            &owned,
+            &crate::nftables::ExpectedAgentBinding::StructureOnly,
+        ) {
             drop(lock);
             return Err(disarm_failed(format!(
                 "handle-qualified delete failed; retaining the journal: {err}"
