@@ -1295,6 +1295,18 @@ mod linux {
             }
             Err(e) => Err(e),
         }
+
+    /// D3 fix round: fetch the live castle table's raw JSON inventory, the same
+    /// `nft -j list table` read [`live_table_is_deny_all_safety_net_impl`] takes.
+    /// A caller combining a recogniser answer with a second, independent property
+    /// (the disarm `ReclaimOwned` arm's comment-key check) reads both off this
+    /// ONE inventory rather than taking a further kernel snapshot. Unlike the
+    /// recogniser's own wrapper, absence here is an ERROR, not `Ok(false)`: a
+    /// caller reaching for the raw inventory already knows a table is present
+    /// from its own prior state, so a missing table is a genuine race to
+    /// surface, not an "absence reads as not-the-net" case.
+    pub fn live_castle_table_json_impl() -> Result<String, NftablesError> {
+        run_nft(&["-j", "list", "table", CASTLE_FAMILY, castle_table()])
     }
 
     /// GF1.1 recovery: atomically replace the deny-all safety net with a FRESH
@@ -2246,6 +2258,37 @@ fn rule_is_kernel_nd_accept(rule: &serde_json::Value) -> bool {
     saw_icmpv6_type_set && saw_accept
 }
 
+/// D3 fix round: an independent check, over the SAME inventory
+/// [`is_deny_all_safety_net_json`] parses, that the live table's `comment` key
+/// is absent entirely. Both disarm arms (`ReclaimOwned` and
+/// `FinalizeInterrupted`) require this alongside a
+/// positive recogniser answer before it treats a live table as this daemon's
+/// safety net (D1 installs the net with no table comment at all); this
+/// function answers only the comment-key question and never touches, narrows,
+/// or duplicates the recogniser's own shape logic above, which is unchanged
+/// and stays the single source of truth for the net's shape. A malformed
+/// inventory or a missing matching table object cannot positively prove
+/// absence, so both read as "not confirmed absent" (`false`, fail closed).
+pub(crate) fn castle_table_comment_is_absent(json: &str) -> bool {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    let Some(items) = doc.get("nftables").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    for item in items {
+        let Some(table) = item.get("table") else {
+            continue;
+        };
+        let ours = table.get("family").and_then(|v| v.as_str()) == Some(CASTLE_FAMILY)
+            && table.get("name").and_then(|v| v.as_str()) == Some(castle_table());
+        if ours {
+            return table.get("comment").is_none();
+        }
+    }
+    false
+}
+
 /// Build the atomic nft script that CREATES the owned table + its base output
 /// chain using nft's fail-on-exists `create` verbs, stamping `marker` as the
 /// table comment. Pure/cross-platform so the "uses `create`, never `add`" and
@@ -3095,6 +3138,21 @@ pub fn live_table_is_deny_all_safety_net() -> Result<bool, NftablesError> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn live_table_is_deny_all_safety_net() -> Result<bool, NftablesError> {
+    Err(NftablesError::NotAvailableOnPlatform)
+}
+
+/// D3 fix round: fetch the live castle table's raw JSON inventory.
+/// See [`linux::live_castle_table_json_impl`]. Crate-private: consumed by both
+/// disarm arms (`ReclaimOwned` and `FinalizeInterrupted`) in
+/// `runtime_providers.rs`, and the recogniser above stays the only authority
+/// for the net's shape.
+#[cfg(target_os = "linux")]
+pub(crate) fn live_castle_table_json() -> Result<String, NftablesError> {
+    linux::live_castle_table_json_impl()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn live_castle_table_json() -> Result<String, NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
 
@@ -4479,6 +4537,39 @@ mod tests {
             &v2_identity_listing(&[65535, 100_000], &[65535, 100_000]),
             ov
         ));
+    }
+
+    #[test]
+    fn castle_table_comment_absence_check_is_independent_of_the_recognizer() {
+        let net = r#"{"nftables":[
+            {"metainfo":{"version":"1.0.9","json_schema_version":1}},
+            {"table":{"family":"inet","name":"sanctuary-castle","handle":7}},
+            {"chain":{"family":"inet","table":"sanctuary-castle","name":"output","handle":1,
+              "type":"filter","hook":"output","prio":0,"policy":"drop"}}
+        ]}"#;
+        // No comment key at all: absent, as [`is_deny_all_safety_net_json`]
+        // also independently requires for this shape.
+        assert!(castle_table_comment_is_absent(net));
+
+        // A comment key with ANY content (owner-prefixed or not) is present,
+        // regardless of what the recognizer's own owner-marker check answers.
+        let owner_commented = net.replace(
+            "\"name\":\"sanctuary-castle\",\"handle\":7",
+            "\"name\":\"sanctuary-castle\",\"handle\":7,\"comment\":\"sanctuary-castle-owner:v1:deadbeef\"",
+        );
+        assert!(!castle_table_comment_is_absent(&owner_commented));
+        let other_commented = net.replace(
+            "\"name\":\"sanctuary-castle\",\"handle\":7",
+            "\"name\":\"sanctuary-castle\",\"handle\":7,\"comment\":\"unrelated text\"",
+        );
+        assert!(!castle_table_comment_is_absent(&other_commented));
+
+        // A missing matching table object, or unparseable JSON, cannot
+        // positively prove absence: fail closed (`false`), never `true`.
+        assert!(!castle_table_comment_is_absent(
+            &net.replace("sanctuary-castle", "sanctuary-castle-test-x")
+        ));
+        assert!(!castle_table_comment_is_absent("not json"));
     }
 
     #[test]

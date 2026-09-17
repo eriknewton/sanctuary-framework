@@ -29,7 +29,7 @@ use castle_wall_daemon::ownership_journal::{
 use castle_wall_daemon::runtime_lock::HostRuntimeLock;
 use castle_wall_daemon::runtime_providers::{
     acquire_castle_table_component_for_test, disarm_castle_runtime, DisarmOutcome,
-    LinuxRuntimeConfig, NFT_HEALTH_MIN_INTERVAL, RECOVERY_RETRY_INTERVAL,
+    force_next_reclaim_owned_probe_error_for_test, LinuxRuntimeConfig, NFT_HEALTH_MIN_INTERVAL, RECOVERY_RETRY_INTERVAL,
 };
 use castle_wall_daemon::safety_net_uid::{
     validate_safety_net_uid, ConfinedUidSet, HostOverflowUid,
@@ -284,16 +284,43 @@ fn gf1_1_disarm_recovers_from_create_failure_wedge() {
     );
 }
 
-// D3 case (a): a same-boot `Owned` journal record (steady state, not the
-// `Preparing` wedge GF1.1 covers) whose LIVE table turns out to be this
-// daemon's own safety net. Fail-before: on the base commit this daemon does not
-// probe for the safety net from the `ReclaimOwned` arm at all, so it went
-// straight to `verify_owned_castle_table` against the safety net's shape
-// (`policy drop`, no per-agent jump) -- not the owned-wall shape that call
-// expects -- and refused with "the live table no longer matches the owned
-// identity ... has no valid ownership marker", leaving the net AND the journal
-// in place. That was the exact wedge D3 closes for the `Owned` steady state (the
-// same wedge GF1.1 already closed for `Preparing`).
+// D3 fix round: the same shared requirement proven at the `FinalizeInterrupted`
+// (Preparing) recovery site as `gf1_h1_zero_rule_non_owner_table_comment_refused`
+// proves at the `ReclaimOwned` site: a live table's comment key must be absent,
+// read from the same inventory the recognizer parses, before disarm treats it as
+// this daemon's own safety net. A zero-rule `policy drop` table carrying a table
+// comment routes to the existing marker-mismatch refusal instead.
+#[test]
+fn gf1_finalize_interrupted_zero_rule_non_owner_table_comment_refused() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let policy_dir = tempfile::tempdir().unwrap();
+    let paths = isolation::runtime_paths();
+    let cfg = config(&paths, policy_dir.path());
+    let table = isolation::table();
+
+    write_preparing_journal(&cfg);
+    let script = format!(
+        "add table {CASTLE_FAMILY} {table} {{ comment \"not-ours\" ; }}\n\
+         add chain {CASTLE_FAMILY} {table} output \
+         {{ type filter hook output priority 0 ; policy drop ; }}\n"
+    );
+    assert!(nft_script(&script), "fixture setup must succeed");
+
+    let err = disarm_castle_runtime(&cfg).expect_err("a commented table must refuse");
+    assert!(nftables::table_exists().unwrap(), "must be retained: {err}");
+    assert!(cfg.journal_path.exists(), "journal must be retained: {err}");
+}
+
+// D3 case (a): a same-boot `Owned` journal record whose live table is this
+// daemon's own safety net: disarm recognises the net, deletes it by name,
+// verifies absence and clears the record, returning `SafetyNetCleared`.
+// Fail-before: on the base this case returned a refusal and retained both the
+// table and the record (register id
+// `defect.linux-disarm-cannot-clear-own-safety-net-01`).
 #[test]
 fn gf1_owned_journal_plus_this_daemons_net_clears_as_safety_net() {
     let _suite = isolation::guard();
@@ -402,13 +429,40 @@ fn gf1_legacy_owned_record_plus_v1_net_still_clears() {
     assert!(!cfg.journal_path.exists());
 }
 
-// D3 case (g), the probe-error branch, is proven WITHOUT a real kernel by the
-// unit test `runtime_providers::tests::reclaim_owned_arm_probe_error_refuses_
-// without_guessing` through the injected-closure seam
-// (`classify_reclaim_owned_arm`), per this packet's own "Unit:" note: the
-// decision logic is not mockable without nft except through that one seam, so a
-// live-nft integration test cannot make `live_table_is_deny_all_safety_net`
-// itself fail on demand without a broken `nft` binary on the runner.
+// D3 case (g): the probe-error branch, driven through the PRODUCTION
+// `disarm_castle_runtime` path via the `test-isolation`-only force-error
+// override (a live-nft integration test cannot make a real probe fail on
+// demand without a broken `nft` binary on the runner, so this seam exists
+// solely to drive that one branch of the real code, not a substitute for it).
+// The classifier's own branch logic is additionally unit-tested in isolation
+// by `runtime_providers::tests::reclaim_owned_arm_probe_error_refuses_
+// without_guessing`.
+#[test]
+fn gf1_reclaim_owned_probe_error_refuses_and_retains() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let policy_dir = tempfile::tempdir().unwrap();
+    let paths = isolation::runtime_paths();
+    let cfg = config(&paths, policy_dir.path());
+
+    write_owned_journal(&cfg, "reclaim-owned-probe-error-fixture", 1, 2);
+    nftables::install_deny_all_safety_net().expect("arm the safety net");
+    assert!(nftables::live_table_is_deny_all_safety_net().unwrap());
+
+    force_next_reclaim_owned_probe_error_for_test();
+    let err = disarm_castle_runtime(&cfg).expect_err("a forced probe error must refuse");
+    assert!(
+        nftables::table_exists().unwrap(),
+        "the table must be retained: {err}"
+    );
+    assert!(
+        cfg.journal_path.exists(),
+        "the journal must be retained: {err}"
+    );
+}
 
 // D3 case (h), fixtures 2-4 (near-net drift THAT CARRIES A RULE): today's
 // recogniser (`is_deny_all_safety_net_json`, pre-PR-1/D2) already rejects ANY
@@ -495,11 +549,12 @@ fn gf1_near_net_drift_with_a_rule_still_refuses() {
 }
 
 // D3 case (h), fixture 1: a zero-rule `policy drop` table that carries a table
-// comment. The net is installed with no table comment, so this table is not the
-// net and disarm must refuse and retain. IGNORED on this base: the two-shape
-// recogniser arrives with PR-1; un-ignore after PR-2 rebases onto merged PR-1.
+// comment. The disarm `ReclaimOwned` arm requires the live table's comment key
+// to be absent, read from the same inventory the recognizer parses, before it
+// treats the table as this daemon's own safety net (D1 installs the net with
+// no table comment at all); a present comment routes to the ordinary reclaim
+// path instead, which refuses and retains on this table's mismatched identity.
 #[test]
-#[ignore = "requires PR-1's two-shape recogniser; un-ignore after the rebase onto merged PR-1"]
 fn gf1_h1_zero_rule_non_owner_table_comment_refused() {
     let _suite = isolation::guard();
     if !nft_available() {
