@@ -2269,6 +2269,10 @@ fn rule_is_kernel_nd_accept(rule: &serde_json::Value) -> bool {
 /// and stays the single source of truth for the net's shape. A malformed
 /// inventory or a missing matching table object cannot positively prove
 /// absence, so both read as "not confirmed absent" (`false`, fail closed).
+/// Gated `any(target_os = "linux", test)`, matching this crate's convention
+/// for a Linux-only production surface a cross-platform test suite still
+/// needs to name; its own test below is the reachability anchor.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn castle_table_comment_is_absent(json: &str) -> bool {
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
         return false;
@@ -3145,13 +3149,17 @@ pub fn live_table_is_deny_all_safety_net() -> Result<bool, NftablesError> {
 /// See [`linux::live_castle_table_json_impl`]. Crate-private: consumed by both
 /// disarm arms (`ReclaimOwned` and `FinalizeInterrupted`) in
 /// `runtime_providers.rs`, and the recogniser above stays the only authority
-/// for the net's shape.
+/// for the net's shape. Gated `any(target_os = "linux", test)`, matching this
+/// crate's convention for a Linux-only production surface that a cross-platform
+/// test suite still needs to name (its own off-Linux test below is the
+/// reachability anchor that keeps that build's dead-code check honest, rather
+/// than exempting the function from the check).
 #[cfg(target_os = "linux")]
 pub(crate) fn live_castle_table_json() -> Result<String, NftablesError> {
     linux::live_castle_table_json_impl()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), test))]
 pub(crate) fn live_castle_table_json() -> Result<String, NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
@@ -4570,6 +4578,20 @@ mod tests {
             &net.replace("sanctuary-castle", "sanctuary-castle-test-x")
         ));
         assert!(!castle_table_comment_is_absent("not json"));
+    }
+
+    // Off-Linux reachability anchor for `live_castle_table_json`'s stub, the
+    // same shape `disarm_is_not_available_off_linux` (runtime_providers.rs)
+    // proves for the disarm entry point: there is no nft runtime to read off
+    // Linux, so the crate-private inventory fetch reports
+    // `NotAvailableOnPlatform` rather than pretending to have read anything.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn live_castle_table_json_is_not_available_off_linux() {
+        assert!(matches!(
+            live_castle_table_json(),
+            Err(NftablesError::NotAvailableOnPlatform)
+        ));
     }
 
     #[test]

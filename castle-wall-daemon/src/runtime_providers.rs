@@ -2299,19 +2299,45 @@ fn classify_safety_net_recovery_probe(
 /// arm's probe, so the Linux integration suite can drive the PRODUCTION
 /// `disarm_castle_runtime` path through the probe-error branch. Absent from a
 /// normal build (compiled only under `test-isolation`); the production call
-/// site is unchanged when this feature is off. Consumed (reset to `false`) by
-/// the one call site that checks it, so a forgotten reset between tests cannot
-/// leak into a later, unrelated disarm call. Mirrors
+/// site is unchanged when this feature is off. The call site consumes it
+/// (resets to `false`) ONLY when that exact probe call is reached; a test that
+/// arms it and then exits early (an earlier assertion fails, a fixture setup
+/// step errors, or the disarm call takes a different arm than expected) would
+/// otherwise leave it set for whatever LATER, unrelated test's `ReclaimOwned`
+/// probe runs next. [`ForcedReclaimOwnedProbeError`] closes that gap: it is
+/// the only way to arm the latch, and its `Drop` clears it unconditionally, so
+/// the guarantee is scoped to one test's lifetime, never to "the call site
+/// happened to be reached." Mirrors
 /// `crate::nftables::reset_runtime_ownership_for_tests`'s test-only latch
-/// convention.
+/// convention, with an RAII clear in place of a manual one.
 #[cfg(all(target_os = "linux", feature = "test-isolation"))]
 static RECLAIM_OWNED_PROBE_FORCE_ERROR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Arm the override above for exactly the next `ReclaimOwned`-arm probe call.
+/// RAII handle for the override above. Construct with
+/// [`force_next_reclaim_owned_probe_error_for_test`] and bind it to a variable
+/// that lives for the rest of the test; the latch clears when that variable
+/// drops, whether the test returns normally, returns early, or panics.
 #[cfg(all(target_os = "linux", feature = "test-isolation"))]
-pub fn force_next_reclaim_owned_probe_error_for_test() {
+pub struct ForcedReclaimOwnedProbeError {
+    _private: (),
+}
+
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+impl Drop for ForcedReclaimOwnedProbeError {
+    fn drop(&mut self) {
+        RECLAIM_OWNED_PROBE_FORCE_ERROR.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Arm the override above for exactly the next `ReclaimOwned`-arm probe call.
+/// Returns a guard that clears the latch on drop; a test must bind it (not
+/// `let _ = ...`, which would drop it immediately and clear the latch before
+/// the disarm call it is meant to cover).
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub fn force_next_reclaim_owned_probe_error_for_test() -> ForcedReclaimOwnedProbeError {
     RECLAIM_OWNED_PROBE_FORCE_ERROR.store(true, std::sync::atomic::Ordering::SeqCst);
+    ForcedReclaimOwnedProbeError { _private: () }
 }
 
 /// GF1.1 / D3 disarm-path recovery: the live table has been positively

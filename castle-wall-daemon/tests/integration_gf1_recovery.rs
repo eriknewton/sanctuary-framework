@@ -452,7 +452,11 @@ fn gf1_reclaim_owned_probe_error_refuses_and_retains() {
     nftables::install_deny_all_safety_net().expect("arm the safety net");
     assert!(nftables::live_table_is_deny_all_safety_net().unwrap());
 
-    force_next_reclaim_owned_probe_error_for_test();
+    // Bound, not discarded: the returned guard must outlive the disarm call it
+    // covers, and its `Drop` clears the latch afterward so a later, unrelated
+    // test's `ReclaimOwned` probe never inherits a forced failure this test
+    // armed.
+    let _forced_probe_error = force_next_reclaim_owned_probe_error_for_test();
     let err = disarm_castle_runtime(&cfg).expect_err("a forced probe error must refuse");
     assert!(
         nftables::table_exists().unwrap(),
@@ -464,14 +468,15 @@ fn gf1_reclaim_owned_probe_error_refuses_and_retains() {
     );
 }
 
-// D3 case (h), fixtures 2-4 (near-net drift THAT CARRIES A RULE): today's
-// recogniser (`is_deny_all_safety_net_json`, pre-PR-1/D2) already rejects ANY
-// live table with one or more rules -- it only accepts a bare zero-rule
-// `policy drop` base chain -- so a v2-shaped table with a wrong rule comment, an
-// extra rule, or only the first of the three v2 rules are ALL "not the net"
-// under both today's recogniser and D2's future one, and disarm must fall
-// through to the unchanged exact-inventory refusal exactly as case (b) does.
-// These three do not need PR-1: any rule at all is enough to reject them today.
+// D3 case (h), fixtures 2-4 (near-net drift THAT CARRIES A RULE): the
+// recognizer's shape acceptance is exact (rule count, order, and every rule's
+// comment), so a complete v2 three-rule table with one comment altered, the
+// same three rules plus a fourth, or only the first of the three, are ALL
+// "not the net", and disarm must fall through to the unchanged exact-inventory
+// refusal exactly as case (b) does. None of the three needs PR-1's merge: a
+// live table carrying any rule at all is already refused on this base, and a
+// wrong comment or an extra rule is refused independently of that, so the
+// same assertion holds once PR-1's recognizer lands too.
 #[test]
 fn gf1_near_net_drift_with_a_rule_still_refuses() {
     let _suite = isolation::guard();
@@ -481,13 +486,20 @@ fn gf1_near_net_drift_with_a_rule_still_refuses() {
     }
     let table = isolation::table();
 
-    // h2: the v2 three-rule shape's rule 1, but with the WRONG comment.
+    // h2: the COMPLETE v2 three-rule shape (D1's exact transaction text, the
+    // same shape the (d)/(e) fixture installs), with ONLY rule 1's comment
+    // altered; rules 2 and 3 keep their correct text.
     let wrong_rule_comment = format!(
         "add table {CASTLE_FAMILY} {table}\n\
          add chain {CASTLE_FAMILY} {table} output \
          {{ type filter hook output priority 0 ; policy drop ; }}\n\
          add rule {CASTLE_FAMILY} {table} output meta skuid {{ 60123, 60124 }} drop \
-         comment \"not-the-real-comment\"\n"
+         comment \"not-the-real-comment\"\n\
+         add rule {CASTLE_FAMILY} {table} output icmpv6 type \
+         {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit }} accept \
+         comment \"sanctuary-castle-net:v2:kernel-nd\"\n\
+         add rule {CASTLE_FAMILY} {table} output meta skuid != {{ 60123, 60124 }} accept \
+         comment \"sanctuary-castle-net:v2:other-principals\"\n"
     );
     // h3: the correct v2 three rules plus a FOURTH, spurious rule.
     let extra_rule = format!(
