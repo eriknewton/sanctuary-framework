@@ -30,6 +30,8 @@ const ED25519_MULTICODEC_PREFIX = new Uint8Array([0xed, 0x01]);
  * `key-length-constants.test.ts` asserts the two declarations stay equal.
  */
 const ED25519_PUBLIC_KEY_LENGTH = 32;
+/** 64 = the RFC 8032 signature encoding: compressed point R then scalar S. */
+const ED25519_SIGNATURE_LENGTH = ED25519_PUBLIC_KEY_LENGTH * 2;
 
 /** Public identity information (safe to share) */
 export interface PublicIdentity {
@@ -352,10 +354,67 @@ export function verify(
   publicKey: Uint8Array
 ): boolean {
   try {
-    // Generic Ed25519 verification funnel used by tool-level and suite-level
-    // verifiers. Malformed signature or public-key bytes must return `false`
-    // here, not escape as caller-dependent exception handling.
-    return ed25519.verify(signature, payload, publicKey);
+    // Strict profile. RFC 8032 section 5.1.7 permits cofactored and
+    // cofactorless verification alike, and requires a prime-order check on
+    // neither A nor R, so two conformant verifiers can disagree about the
+    // same bytes. @noble's equation below is always the COFACTORED one;
+    // this gate is what turns the combined result COFACTORLESS STRICT
+    // (ed25519-dalek's `verify_strict`, what the Rust daemon runs), the
+    // funnel's INTENDED shared profile with the daemon. RFC 8032 5.1.3
+    // already rejects unreduced y; this gate adds the eight small-order
+    // points (the identity-key forgery is one) and torsion-bearing points,
+    // neither required by bare RFC 8032.
+    if (
+      !isStrictEd25519PointEncoding(publicKey) ||
+      signature.length !== ED25519_SIGNATURE_LENGTH ||
+      !isStrictEd25519PointEncoding(
+        signature.subarray(0, ED25519_PUBLIC_KEY_LENGTH)
+      )
+    ) {
+      return false;
+    }
+    // Malformed bytes must return `false`, not throw. `zip215: false` selects
+    // canonical decoding for A and R (RFC 8032 `y < p`); it
+    // does NOT select a cofactorless equation, and it does not gate the scalar check
+    // either: `S < L` runs unconditionally either way. @noble always evaluates the
+    // cofactored `[8](R + [k]A - [S]B) = 0`. The gate above puts A and R in the
+    // prime-order subgroup, so multiplying by 8 is invertible there and the
+    // cofactored check @noble runs is equivalent to the cofactorless one dalek's
+    // `verify_strict` runs (ed25519-dalek 2.1.1). No
+    // cross-implementation fixture in this PR pins that the two agree byte-for-byte
+    // on one signature.
+    return ed25519.verify(signature, payload, publicKey, { zip215: false });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Castle Wall's strict authority-point profile. Shared by the `verify` funnel
+ * above and by `castle-wall/allowlist/parse.ts`, not by every Ed25519 check in
+ * the server: several sites call `ed25519.verify` directly (for example
+ * `substrate/manifest.ts`, `intelligence/model-catalog-v3.ts`, and multiple
+ * exit and transparency sites) and are unaffected by this profile.
+ *
+ * Three rejections, in the order the checks run. A wrong length is not a point
+ * at all. `isSmallOrder() || !isTorsionFree()` rejects any point outside the
+ * prime-order subgroup, which is what makes a verified signature attributable
+ * to one key. The re-encode comparison rejects a non-canonical encoding of an
+ * otherwise-valid point: decoding is many-to-one, so two byte strings can name
+ * the same point, and any consumer that keys a pin, an id, or a cache on the
+ * BYTES would then split on what is really one authority.
+ *
+ * Exported because `castle-wall/allowlist/parse.ts` derives the signing-key id
+ * from these same bytes and must apply the identical profile; a private copy
+ * there is how the two drifted before.
+ */
+export function isStrictEd25519PointEncoding(bytes: Uint8Array): boolean {
+  if (bytes.length !== ED25519_PUBLIC_KEY_LENGTH) return false;
+  try {
+    const point = ed25519.Point.fromBytes(bytes, false);
+    if (point.isSmallOrder() || !point.isTorsionFree()) return false;
+    const canonical = point.toBytes();
+    return canonical.every((byte, index) => byte === bytes[index]);
   } catch {
     return false;
   }

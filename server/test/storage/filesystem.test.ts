@@ -18,7 +18,14 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import {
+  DIRECTORY_CAPABILITY_READY_TIMEOUT_MS,
+  FilesystemStorage,
+} from "../../src/storage/filesystem.js";
+
+it("keeps the directory-capability readiness bound load-tolerant and finite", () => {
+  expect(DIRECTORY_CAPABILITY_READY_TIMEOUT_MS).toBe(15_000);
+});
 
 describe("FilesystemStorage", () => {
   let basePath: string;

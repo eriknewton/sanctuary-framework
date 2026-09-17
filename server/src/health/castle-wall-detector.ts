@@ -57,6 +57,12 @@ import {
 import { IpcClient, type IpcTransport } from "../castle-wall/runtime/ipc-client.js";
 import { castleWallSnapshotFromHealth } from "./castle-wall-snapshot.js";
 import type { CastleWallRuntimeSnapshot } from "./evidence.js";
+// The vault-level wall claim + its ONE derivation chokepoint (writer:
+// wrap/init.ts). This detector reads it; nothing here writes it.
+import {
+  deriveCastleWallProvision,
+  readPersistedCastleWallProvision,
+} from "../castle-wall/provision-state.js";
 
 /**
  * Wall-clock ceiling for the whole detect call: connect + handshake + one status
@@ -365,12 +371,38 @@ export async function castleWallSnapshotForHealthReport(input: {
     const { fortressIdFromStoragePath } = await import(
       "../dashboard/v1_1/wiring.js"
     );
-    return await detectCastleWallRuntimeSnapshot({
+    const snapshot = await detectCastleWallRuntimeSnapshot({
       fortressStoragePath: input.config.storage_path,
       fortressId: fortressIdFromStoragePath(input.config.storage_path),
       masterKey: input.masterKey,
       ...input.overrides,
     });
+    // Carry THIS VAULT's own wall claim alongside the runtime verdict. The
+    // runtime verdict describes a daemon; the claim describes the vault, and a
+    // machine armed by an earlier install produces a healthy-looking runtime
+    // verdict for a vault that is on no wall. The reader never throws and an
+    // absent claim adds no field, so a fortress that predates the state reports
+    // exactly what it reported before.
+    //
+    // `armed: "unknown"` is the honest input here: this process observes the
+    // daemon, not this fortress's enforcement-evidenced arm state, so the
+    // derivation can only under-claim (AGENTS.md rule 1). The arm-state-bearing
+    // surface is `principal-policy/posture.ts`.
+    const claim = await readPersistedCastleWallProvision(input.config.storage_path);
+    if (claim.state !== "not-yet-walled") return snapshot;
+    const vaultProvision = deriveCastleWallProvision({
+      trustAnchor: "unknown",
+      armed: "unknown",
+    });
+    // A macOS host has NO runtime detector, so the detector returns undefined
+    // and there is nothing to spread the claim onto. Returning `undefined` here
+    // is what dropped the field on the platform the claim is actually about;
+    // the carrier below renders the identical runtime verdict and adds the
+    // claim. Cross-file pin: `runtimeDetectorApplies` must match the branch in
+    // `health/evidence.ts evaluateCastleWallRuntime`.
+    return snapshot === undefined
+      ? { runtimeDetectorApplies: false, vaultProvision }
+      : { ...snapshot, vaultProvision };
   } catch {
     // Deliberately swallowed: see the NEVER THROWS note above. `undefined` is
     // the same answer as "no wall here", which is the weakest claim available

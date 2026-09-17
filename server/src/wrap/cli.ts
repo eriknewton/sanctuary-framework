@@ -94,6 +94,12 @@ import {
   type ResolvedEnforcementAvailability,
 } from "../castle-wall/runtime/enforcement-availability.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
+// The vault-level wall claim written by wrap/init.ts. Wrap reads it and never
+// writes it.
+import {
+  CASTLE_WALL_NOT_YET_WALLED_SENTENCE,
+  readPersistedCastleWallProvision,
+} from "../castle-wall/provision-state.js";
 import {
   runAutoProvisionForWrap,
   type AutoProvisionSummary,
@@ -3559,7 +3565,7 @@ export async function runWrap(
         // plain writeFile, both of which follow a symlinked parent (e.g.
         // ~/.hermes -> /tmp/victim). Route it through the same safe-path
         // discipline as every other wrap sink.
-        // DEBT (hermes cli-config.json): this JSON file is a legacy compat
+        // DEBT(WRAP-CLI-HERMES-LEGACY-CONFIG) (hermes cli-config.json): this JSON file is a legacy compat
         // artifact. Hermes v0.16.0 does NOT consult it for MCP routing
         // (hermes-yaml.ts:4-10). It is kept because the generic wrap flow
         // keys off `agentConfig`, which detectAgentConfigWithDiagnostics
@@ -3621,7 +3627,7 @@ export async function runWrap(
   // detection only probes the legacy JSON compat surface
   // (`~/.hermes/cli-config.json` / `config.json`) -- never the authoritative
   // `~/.hermes/config.yaml` that v0.16.0 actually routes MCP traffic
-  // through (see the DEBT note above). A first-install/yaml-only Hermes
+  // through (see the WRAP-CLI-HERMES-LEGACY-CONFIG note above). A first-install/yaml-only Hermes
   // host therefore has `agentConfig === undefined` on the FIRST detection
   // call, and only resolves to a Hermes config once the bootstrap block
   // above has written the compat JSON file and re-detected. Checking before
@@ -3769,7 +3775,7 @@ export async function runWrap(
     if (agentConfig.platform === "hermes") {
       // F7 (v1.6.1 first-run honesty): the empty surface here is the legacy
       // cli-config.json artifact Hermes does NOT consult for MCP routing
-      // (see the DEBT note in the bootstrap path above). Printing "installed
+      // (see the WRAP-CLI-HERMES-LEGACY-CONFIG note in the bootstrap path above). Printing "installed
       // as the only MCP server" contradicted the config.yaml message printed
       // moments earlier ("existing MCP servers there are preserved"), so
       // point at the authoritative YAML surface instead.
@@ -4011,10 +4017,18 @@ export async function runWrap(
   }
 
   {
-    // Auto-bootstrap pinned-key state for the IPC handshake. Failures here
-    // warn but do not abort wrap: a missing pin surfaces cleanly at handshake
-    // time (sysext refuses connection) rather than as a wrap-startup abort.
-    // First-integration discipline: do no harm to the wrap critical path.
+    // Auto-bootstrap this fortress's OWN Castle key pair for the IPC handshake.
+    // Failures here warn but do not abort wrap: a missing local key surfaces
+    // cleanly at handshake time (sysext refuses connection) rather than as a
+    // wrap-startup abort. First-integration discipline: do no harm to the wrap
+    // critical path.
+    //
+    // INVARIANT (one anchor writer): this is fortress-local ONLY. `provision-pin`
+    // no longer writes the machine-wide enforcement anchor (see
+    // cli/castle-wall.ts), so wrap, which is an AGENT-invoked path with a
+    // non-interactive stdin, cannot move this machine's trust anchor. Only the
+    // confirmed `castle-wall re-pin` verb can. Do not re-add a machine-wide
+    // write here.
     //
     // provision-pin runs as a child with its OWN credential chain, which reads
     // only these two env vars plus the fortress's stored passphrase. Hand it
@@ -4043,6 +4057,17 @@ export async function runWrap(
         console.error(
           `\n  Sanctuary wrap: Castle Wall provision-pin auto-bootstrap exited ${pinResult}.` +
           `\n  Wrap continues; run 'sanctuary castle-wall provision-pin' manually if IPC handshake fails.`
+        );
+      }
+      // Required consumer of the vault-level wall claim: wrap is where an
+      // operator most often first sees a protected-looking banner, so a vault
+      // that is not on this machine's wall says so on its own line rather than
+      // letting the surrounding output imply protection.
+      const vaultProvision = await readPersistedCastleWallProvision(storagePath);
+      if (vaultProvision.state === "not-yet-walled") {
+        // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+        console.error(
+          `\n  Sanctuary wrap: ${CASTLE_WALL_NOT_YET_WALLED_SENTENCE}`
         );
       }
     } catch (err) {

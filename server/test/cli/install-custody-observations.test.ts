@@ -1,3 +1,4 @@
+// fail-before-exempt: fixture-only edit for this approval-readiness change. Existing InstallProbeResult literals gain tier1Approval="available" so their custody assertions continue reaching the same gate; no assertion changes here. The new approval behavior fails before in test/cli/install.test.ts.
 /**
  * Rung 1 install evidence: the read-only, ambient-env-blind daily-UX probe
  * (`custody_access` / `recovery_factor`) and the plan wiring that surfaces them
@@ -466,6 +467,7 @@ describe("buildAgentInstallPlan surfaces Rung 1 evidence and the restart action"
       custodyAccess: "usable",
       custodyMutation: "available",
       recoveryFactor: "present",
+      tier1Approval: "available",
       stagedRecoveryFile: "present",
       nodePath: "/usr/bin/node",
       castleWallApp: "not-applicable",
@@ -475,6 +477,9 @@ describe("buildAgentInstallPlan surfaces Rung 1 evidence and the restart action"
       contentFilter: "not-applicable",
       enforcement: "not-applicable",
       trustAnchor: "not-applicable",
+      // Base fixture: this vault carries no wall claim, which is not a claim of
+      // protection either. Tests that need one set it explicitly.
+      vaultProvision: "unknown",
       operatorTwin: "not-applicable",
       ...over,
     };
@@ -704,6 +709,10 @@ describe("buildAgentInstallPlan surfaces Rung 1 evidence and the restart action"
         enforcement: "live",
         trustAnchor: "consistent",
         operatorTwin: "absent",
+        // This case describes a fully armed host, so its vault is on that
+        // wall: a vault claim that could not be read would (correctly) stop
+        // the plan before the custody gate this test is about.
+        vaultProvision: "walled",
         custodyAccess: "absent",
         recoveryFactor: "unknown",
       }),
@@ -784,6 +793,7 @@ describe("staged recovery file observation, against the real filesystem", () => 
       custodyAccess: "usable",
       custodyMutation: "available",
       recoveryFactor: "present",
+      tier1Approval: "available",
     });
     const instructions = (observed: InstallProbeResult): string =>
       buildAgentInstallPlan({

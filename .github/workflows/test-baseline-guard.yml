@@ -28,7 +28,7 @@ name: Test Baseline Guard
 
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
   pull_request:
     branches: [main]
 
@@ -68,7 +68,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: server
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Set up Python 3.12 for Concordia sidecar
         uses: actions/setup-python@v7
@@ -128,9 +128,16 @@ jobs:
           FORCE_COLOR: "0"
         run: |
           set -o pipefail
-          # tee to both the GitHub Actions log and a file we parse
-          npm test 2>&1 | tee /tmp/vitest-output.log
-          exit "${PIPESTATUS[0]}"
+          node ../scripts/redact-test-output-self-test.mjs
+          # Redact before either the public Actions log or the parsed file sees
+          # diagnostic output. Preserve failures from npm, the redactor, or tee.
+          npm test 2>&1 | node ../scripts/redact-test-output.mjs | tee /tmp/vitest-output.log
+          statuses=("${PIPESTATUS[@]}")
+          for status in "${statuses[@]}"; do
+            if (( status != 0 )); then
+              exit "$status"
+            fi
+          done
 
       - name: Gate 2a - transform/collection error detection
         run: |

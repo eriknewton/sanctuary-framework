@@ -1653,8 +1653,26 @@ export function renderPostureHomeHTML(): string {
           : "") +
         "</div>";
     }
+    // ADDITIVE vault-level line, rendered whenever the posture carries the
+    // claim. The arm-state pill above is untouched: that is a claim about the
+    // MACHINE wall, and on a Mac armed by an earlier install it is green while
+    // this vault is on no wall. Placed directly under the pill so a reader
+    // cannot take the green as an answer about their vault. NOTE: this browser
+    // script lives inside a TypeScript template literal, so a backtick here
+    // would terminate it; comments in this file use plain words.
+    var vaultDetail = "";
+    if (w.castle_wall_provision === "not_yet_walled") {
+      vaultDetail =
+        '<div class="evidence">This vault: <code>not_yet_walled</code>' +
+        " &middot; this vault is not on the wall above, so its agents' traffic" +
+        " is not filtered by this vault's policy.</div>";
+    } else if (w.castle_wall_provision === "walled") {
+      vaultDetail =
+        '<div class="evidence">This vault: <code>walled</code></div>';
+    }
     el.innerHTML =
       "<div>" + wallPill(w.arm_state) + " &nbsp;" + esc(meaning) + "</div>" +
+      vaultDetail +
       exclusiveDetail +
       // S3 denominator: the three verdict counts are parts of one total, so the
       // total is stated rather than left for the reader to add up. A zero total

@@ -1219,6 +1219,16 @@ export function createReputationTools(
                 ],
                 overallScore,
                 evidence_basis: "derived from live health evidence (monitor_health)",
+                // The vault's own wall claim, carried onto the SIGNED, EXTERNALLY
+                // PUBLISHED payload. Everything above is a layer SCORE; none of
+                // those numbers says whether this vault is on the wall running on
+                // this machine, and the evidence object already carried the
+                // answer while this builder dropped it. Published under a
+                // signature, so omitting it is the over-claim: additive, and
+                // absent when the fortress carries no claim.
+                ...(evidence.castle_wall.vault_provision !== undefined
+                  ? { castle_wall_provision: evidence.castle_wall.vault_provision }
+                  : {}),
               };
               break;
             }

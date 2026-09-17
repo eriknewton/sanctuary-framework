@@ -42,10 +42,50 @@ describe("Core invariant comment hygiene", () => {
   it("keeps the identity Ed25519 verification funnel rationale at the verifier", () => {
     const source = read("server/src/core/identity.ts");
 
-    expectNear(source, "return ed25519.verify(signature, payload, publicKey);", [
-      "Generic Ed25519 verification funnel",
-      "Malformed signature or public-key bytes must return `false`",
+    expectNear(
+      source,
+      "return ed25519.verify(signature, payload, publicKey, { zip215: false });",
+      [
+        "must return `false`, not throw",
+        "zip215: false",
+        // `zip215: false` narrows @noble's point decoding; it does not switch
+        // which group equation @noble checks. Pin that distinction so a future
+        // edit cannot quietly reintroduce the "zip215 selects cofactorless"
+        // misreading this comment replaced.
+        "does NOT select a cofactorless equation",
+        "@noble runs is equivalent to the cofactorless",
+        "cross-implementation fixture in this PR pins",
+      ]
+    );
+
+    // The gate is only auditable if the site says which profile it implements
+    // and what that profile rejects that a plain RFC 8032 verifier would not.
+    expectNear(source, "!isStrictEd25519PointEncoding(publicKey) ||", [
+      "RFC 8032 section 5.1.7",
+      "COFACTORLESS STRICT",
+      "small-order",
+      "torsion-bearing",
+      // The comment must attribute the cofactored/cofactorless split to
+      // @noble's own equation, not to the `zip215` flag, matching the fuller
+      // explanation pinned at the `ed25519.verify` call above.
+      "always the",
+      "COFACTORED one",
+      "INTENDED shared profile",
     ]);
+
+    // The exported helper's own doc comment must say who it is actually
+    // shared with (this funnel and the allowlist parser) rather than
+    // overclaiming every Ed25519 verifier in the server, since most callers
+    // of `ed25519.verify` in this codebase bypass this funnel entirely.
+    expectNear(
+      source,
+      "Castle Wall's strict authority-point profile.",
+      [
+        "Shared by the `verify` funnel",
+        "not by every Ed25519 check in",
+        "unaffected by this profile",
+      ]
+    );
   });
 
   it("keeps signature-suite algorithm-confusion rationale at each gate", () => {

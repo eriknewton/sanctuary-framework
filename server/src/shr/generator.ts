@@ -21,6 +21,12 @@ import { toBase64url, stringToBytes, fromBase64url, bytesToString } from "../cor
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { SIGNATURE_SCHEME_V1 } from "../mesh/constants.js";
 import type { SovereigntyTier } from "../reputation/tiers.js";
+// The vault-level wall claim. This generator READS a value the caller resolved;
+// it never reads the fortress itself (it is pure and synchronous by contract).
+import {
+  CASTLE_WALL_NOT_YET_WALLED,
+  type CastleWallProvisionState,
+} from "../castle-wall/provision-state.js";
 
 /** Default SHR validity window: 1 hour */
 const DEFAULT_VALIDITY_MS = 60 * 60 * 1000;
@@ -102,6 +108,18 @@ export interface SHRGeneratorOptions {
    * Defaults to the current wall clock.
    */
   now?: Date;
+  /**
+   * THIS VAULT's own Castle Wall provisioning state
+   * (`castle-wall/provision-state.ts`), read by the caller because this
+   * generator is pure and synchronous.
+   *
+   * The SHR is a SIGNED, externally-published posture claim, so this is the one
+   * surface where over-claiming leaves the machine under a signature. Omitted =
+   * the fortress carries no claim and none is asserted; `not_yet_walled` emits
+   * the L2 degradation below. `walled` asserts nothing extra: this generator
+   * has no anchor verdict of its own and must not manufacture one.
+   */
+  vaultProvision?: CastleWallProvisionState;
 }
 
 /**
@@ -230,7 +248,15 @@ export function generateSHR(
   identityId: string | undefined,
   opts: SHRGeneratorOptions
 ): SignedSHR | string {
-  const { config, identityManager, masterKey, validityMs, l4Evidence, now: nowOverride } = opts;
+  const {
+    config,
+    identityManager,
+    masterKey,
+    validityMs,
+    l4Evidence,
+    vaultProvision,
+    now: nowOverride,
+  } = opts;
 
   // Resolve signing identity
   const identity = identityId
@@ -283,6 +309,22 @@ export function generateSHR(
     ? deriveReputationDegradations(l4Evidence, now)
     : [];
   degradations.push(...l4Degradations);
+
+  // A vault that is not on this machine's Castle Wall does not get to publish a
+  // signed posture that is silent about it. The machine's own wall state is a
+  // different question and is deliberately not consulted here: a leftover
+  // activated extension from an earlier install is not this vault's isolation.
+  if (vaultProvision === CASTLE_WALL_NOT_YET_WALLED) {
+    degradations.push({
+      layer: "l2",
+      code: "VAULT_NOT_ON_CASTLE_WALL" as DegradationCode,
+      severity: "warning",
+      description:
+        "This vault is not on this machine's Castle Wall, so its agents' outbound traffic is not filtered by this vault's policy",
+      mitigation:
+        "Complete the installer's Castle Wall step for this vault (castle-wall re-pin, then arm)",
+    });
+  }
 
   const l4Status: LayerStatus =
     l4Degradations.length > 0 ? "degraded" : "active";

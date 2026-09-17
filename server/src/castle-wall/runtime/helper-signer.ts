@@ -57,6 +57,23 @@ export interface HelperSignerClientOptions {
   timeoutMs?: number;
   /** Override the process runner (tests). */
   invoke?: ShimInvoker;
+  /**
+   * Hand the operator's terminal to the shim instead of piping its stdin/stderr.
+   *
+   * Set ONLY by the operator-present `castle-wall re-pin` path. The shim's own
+   * `re-pin` branch refuses unless ITS stdin is a terminal and the operator
+   * types the confirmation (`CastleWallSignerClient/main.swift`), and that gate
+   * is the one an agent-executed argv cannot skip, since the helper's caller
+   * check authenticates the shim binary and says nothing about operator
+   * presence. Piping stdin here would make the legitimate CLI path
+   * indistinguishable from that agent, so the terminal is passed through.
+   *
+   * FAILURE MODE if this is set on a signing path: the daemon's per-heartbeat
+   * signature would inherit a terminal it does not own and its stderr would
+   * stop being captured. It is set at exactly one call site for exactly one
+   * verb.
+   */
+  interactiveTerminal?: boolean;
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -66,11 +83,21 @@ const DEFAULT_TIMEOUT_MS = 10_000;
  * enforce a timeout. Returns the raw result; success/failure interpretation is
  * the client's job.
  */
-function spawnInvoker(clientBinaryPath: string, timeoutMs: number): ShimInvoker {
+function spawnInvoker(
+  clientBinaryPath: string,
+  timeoutMs: number,
+  interactiveTerminal: boolean,
+): ShimInvoker {
   return (args, stdin) =>
     new Promise<ShimResult>((resolve, reject) => {
+      // Interactive mode inherits stdin AND stderr: the shim prompts on stderr
+      // and reads the typed answer on stdin, so capturing either would leave the
+      // operator staring at a silent process that eventually times out. stdout
+      // stays piped because it carries the base64url result this client parses.
       const child = spawn(clientBinaryPath, args, {
-        stdio: ["pipe", "pipe", "pipe"],
+        stdio: interactiveTerminal
+          ? ["inherit", "pipe", "inherit"]
+          : ["pipe", "pipe", "pipe"],
       });
       let stdout = "";
       let stderr = "";
@@ -83,10 +110,14 @@ function spawnInvoker(clientBinaryPath: string, timeoutMs: number): ShimInvoker 
         reject(new HelperSignerError(`shim timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 
-      child.stdout.on("data", (d: Buffer) => {
+      // stdout is piped on BOTH paths (it carries the base64url result). stderr
+      // is null in interactive mode because it was inherited: the shim's prompt
+      // and its refusal text go straight to the operator's terminal, so there
+      // is nothing to accumulate and nothing to report back as `stderr`.
+      child.stdout?.on("data", (d: Buffer) => {
         stdout += d.toString("utf8");
       });
-      child.stderr.on("data", (d: Buffer) => {
+      child.stderr?.on("data", (d: Buffer) => {
         stderr += d.toString("utf8");
       });
       child.on("error", (err) => {
@@ -103,10 +134,15 @@ function spawnInvoker(clientBinaryPath: string, timeoutMs: number): ShimInvoker 
         resolve({ stdout, stderr, code });
       });
 
-      if (stdin && stdin.length > 0) {
-        child.stdin.write(Buffer.from(stdin));
+      // `child.stdin` is null when stdin was inherited; there is no payload to
+      // write on that path (the interactive verb takes none) and ending the
+      // operator's own terminal would close the stream they are typing into.
+      if (child.stdin) {
+        if (stdin && stdin.length > 0) {
+          child.stdin.write(Buffer.from(stdin));
+        }
+        child.stdin.end();
       }
-      child.stdin.end();
     });
 }
 
@@ -124,7 +160,12 @@ export class HelperSignerClient {
   constructor(options: HelperSignerClientOptions) {
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.invoke =
-      options.invoke ?? spawnInvoker(options.clientBinaryPath, timeoutMs);
+      options.invoke ??
+      spawnInvoker(
+        options.clientBinaryPath,
+        timeoutMs,
+        options.interactiveTerminal === true,
+      );
   }
 
   /** Fetch the helper's 32-byte public key (generates the keypair on first call). */

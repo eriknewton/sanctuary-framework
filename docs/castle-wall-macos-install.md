@@ -114,7 +114,7 @@ Failure modes:
 
 ## 5. Re-pin to the signer helper
 
-Migrate the enforcement trust anchor to the approved root signer helper:
+Put the enforcement trust anchor in the hands of the approved root signer helper. This is the only command that changes this Mac's trust anchor; creating a vault never does. It is not, by itself, the step that puts the vault you created on the Castle Wall: a vault is on the wall only when this Mac's anchor is consistent with the signer helper's key AND that vault has its own arm evidence. Re-pin supplies the first condition. Arming, later in this guide, supplies the second.
 
 ```bash
 sanctuary castle-wall re-pin
@@ -126,7 +126,9 @@ Expected stderr announcement starts with:
 Re-pinning trust anchor for fortress: <fortress-path>
 ```
 
-This line is informational even though it goes to stderr. The command derives the master key after this announcement, so a normal passphrase or custody prompt can still appear before it completes.
+The command then asks you to confirm, and continues only when you type the word it names. It asks **twice**, and both asks want the same word: the second one comes from the small native helper client the CLI hands the request to, which is separately executable and therefore does its own check for a person at a terminal. Typing the word once and walking away leaves the command waiting at the second prompt. It runs in a terminal you are sitting at: with no terminal either ask refuses, and there is no flag or environment variable that skips them. The master key is derived after the confirmation, so a normal passphrase or custody prompt can still appear before it completes.
+
+Failure mode: `Refusing: castle-wall re-pin requires an interactive terminal.` means the command was started by something that has no terminal (a script, a scheduled job, or an agent). Run it yourself from a local Terminal window. A message from `castle-wall-signer-client` saying re-pin requires an interactive terminal means the same thing, one layer down.
 
 Check helper readiness:
 

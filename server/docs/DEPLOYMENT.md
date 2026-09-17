@@ -104,65 +104,22 @@ to. A macOS launchd job before or without a GUI login has a locked login keychai
 the operator has set `SANCTUARY_PASSPHRASE`, believes custody is handled, and gets a service that
 will not start on a machine where nothing is wrong yet.
 
-Set `SANCTUARY_RECOVERY_OUT` for any headless first boot, or, better, provision the fortress
-interactively with `sanctuary init` before you enable the unit, capture the recovery key it
-prints, and this never fires at all.
+Set `SANCTUARY_RECOVERY_OUT` for any headless first boot. For a harness install,
+prefer `sanctuary protect --agent-guided`: it stages recovery material outside
+the fortress without printing it. The operator secures that file in a private
+local session and deletes the staged copy; an installing agent must never read
+or capture it.
 
-## Parallel MCP Server Configuration
+## Harness configuration
 
-Sanctuary runs alongside your agent's own MCP server. Both appear as separate tool providers in the same session.
+Use `sanctuary protect` to update a harness. It backs up the existing
+configuration, preserves its MCP entries, binds them to the selected fortress,
+and makes Sanctuary the cooperative gateway. A raw parallel MCP entry leaves
+direct calls to other servers outside Sanctuary's cooperative policy gate.
 
-### npx variant
-
-```json
-{
-  "mcpServers": {
-    "your-agent-server": {
-      "url": "http://localhost:8766/mcp"
-    },
-    "sanctuary": {
-      "command": "npx",
-      "args": ["-y", "@sanctuary-framework/mcp-server"],
-      "env": {
-        "SANCTUARY_PASSPHRASE": "your-passphrase-here"
-      }
-    }
-  }
-}
-```
-
-### Local install variant (recommended)
-
-```json
-{
-  "mcpServers": {
-    "your-agent-server": {
-      "url": "http://localhost:8766/mcp"
-    },
-    "sanctuary": {
-      "command": "node",
-      "args": ["./sanctuary/node_modules/.bin/sanctuary-mcp-server"],
-      "env": {
-        "SANCTUARY_PASSPHRASE": "your-passphrase-here"
-      }
-    }
-  }
-}
-```
-
-See [`docs/examples/parallel-mcp-config.json`](examples/parallel-mcp-config.json) for a reference config file.
-
-Failure mode: these two blocks put the passphrase literally inside the harness's MCP config, while
-the section above puts it in a mode-600 env file. Those are two copies of one credential, and only
-the env file is protected. The harness config is usually world-readable, lives in a directory that
-gets synced or backed up, and is the file people paste into issue reports.
-
-The copies also drift. The harness spawns its own child process using the `command` and `args`
-here and passes exactly this `env` block, so it never reads the env file, and a systemd unit never
-reads this JSON. When the two values disagree, whichever path ran first is the one that owns the
-fortress, and the other path fails with `CustodyUnlockError` while every configuration file on the
-machine looks correct. If you keep both surfaces, treat one of them as the source and re-derive the
-other from it, and tighten the permissions on the harness config to match the env file.
+Do not copy a passphrase or recovery key into harness JSON or YAML. Those files
+are commonly synced, backed up, or pasted into issue reports. Use the custody
+material enrolled for the exact fortress instead.
 
 ## Running under a service manager
 
@@ -188,7 +145,9 @@ if the resolved fortress path is absent it writes a single JSON line with
 `"code":"FORTRESS_NOT_FOUND"` to stderr and exits **78**. Under a supervisor with
 `Restart=on-failure` that is a restart loop whose only evidence is one JSON line per attempt, and
 harnesses commonly surface it as nothing more than "the MCP server failed to start". Run
-`sanctuary init` first, interactively, and capture the recovery key it prints. See
+`sanctuary protect --agent-guided` for a harness install, or initialize the
+fortress explicitly before starting a direct server. Recovery material is
+staged outside the fortress and is never printed to the agent. See
 [fortress-lifecycle.md](fortress-lifecycle.md).
 
 After installation, run these tools in your first agent session:

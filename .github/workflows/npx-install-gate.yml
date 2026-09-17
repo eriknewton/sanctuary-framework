@@ -47,7 +47,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: server
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Build dist
         working-directory: server

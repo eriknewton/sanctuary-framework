@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
   pull_request:
     branches: [main]
 
@@ -28,7 +28,12 @@ jobs:
 
       - name: Install dependencies
         working-directory: server
-        run: npm ci
+        # --ignore-scripts: dependency install scripts (preinstall/install/
+        # postinstall of packages under node_modules) are the supply-chain
+        # attack surface this closes. First-party lifecycle hooks (this
+        # package's own `pretest`/`prepublishOnly`) are unaffected , they run
+        # through `npm test`/`npm run`, not `npm ci`.
+        run: npm ci --ignore-scripts
 
       - name: Release dependency pin check
         run: |
@@ -141,7 +146,42 @@ jobs:
 
       - name: Install dependencies
         working-directory: server
-        run: npm ci
+        run: npm ci --ignore-scripts
+
+      - name: Workflow YAML parse check
+        # A workflow file that fails to parse produces a run with zero jobs
+        # and no check at all, which is invisible to `gh pr checks` (the
+        # PR looks green-by-omission rather than red) , PR #1398, 2026-09-09.
+        # Parsing every file under .github/workflows/ here turns that silent
+        # zero-job run into a loud, blocking failure on THIS required check
+        # before a malformed workflow can ship unnoticed.
+        #
+        # js-yaml is a lockfile-pinned devDependency (server/package.json,
+        # server/package-lock.json) rather than a pip install: ubuntu-latest's
+        # system Python is PEP 668 externally-managed, so `pip install --user`
+        # fails outright, and every other pip site in this repo needs a venv
+        # plus --require-hashes plus the retry-with-timeout wrapper after pip
+        # hung CI once already , none of that machinery is needed here when
+        # the dependency is already installed by the `npm ci --ignore-scripts`
+        # step above.
+        #
+        # Residual: a broken ci.yml cannot report on itself , see the separate
+        # workflow-yaml-parse.yml, which stays parseable to catch that case.
+        working-directory: server
+        timeout-minutes: 5
+        run: |
+          node -e "
+          const yaml = require('js-yaml');
+          const fs = require('fs');
+          for (const f of process.argv.slice(1)) {
+            try {
+              yaml.load(fs.readFileSync(f, 'utf8'));
+            } catch (e) {
+              console.error(f + ': ' + e.message);
+              process.exit(1);
+            }
+          }
+          " ../.github/workflows/*.yml
 
       - name: ESLint (src/)
         working-directory: server

@@ -50,6 +50,10 @@ const STREAM = config.streamUrl || "/api/stream";
 let TOKEN = config.authToken || sessionStorage.getItem("authToken") || "";
 const SANCTUARY_VERSION = config.sanctuaryVersion || "";
 const SESSION_KEY = "sanctuary-v11-sidebar";
+const URL_SESSION = (function () {
+  try { return new URLSearchParams(location.search || "").get("session") || ""; }
+  catch (_e) { return ""; }
+})();
 // The top-bar seal is the strongest visible protection claim on the page.
 // It must be backed by evidence, not just the backend arm-state label. Ten
 // minutes is only an upper bound here; if the payload supplies a smaller
@@ -212,6 +216,20 @@ function promptForOperatorToken() {
   return true;
 }
 
+function credentialedReadUrl(url, method) {
+  // The launch URL's short-lived session may authenticate same-origin reads and
+  // SSE only. Decisions continue to require the explicit operator bearer.
+  if (String(method || "GET").toUpperCase() !== "GET" || !URL_SESSION) return url;
+  try {
+    const parsed = new URL(url, location.origin);
+    if (parsed.origin !== location.origin) return url;
+    // A freshly minted stream session from an explicit bearer is newer and
+    // more specific than the launch URL's read session; never replace it.
+    if (!parsed.searchParams.has("session")) parsed.searchParams.set("session", URL_SESSION);
+    return parsed.pathname + parsed.search + parsed.hash;
+  } catch (_e) { return url; }
+}
+
 async function api(path, opts) {
   const init = Object.assign({ headers: {} }, opts || {});
   if (TOKEN) init.headers["Authorization"] = "Bearer " + TOKEN;
@@ -242,6 +260,7 @@ async function api(path, opts) {
   if (method === "GET") {
     url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
   }
+  url = credentialedReadUrl(url, method);
   let res = await fetch(url, init);
   if (res.status === 401 && method !== "GET" && promptForOperatorToken()) {
     init.headers["Authorization"] = "Bearer " + TOKEN;
@@ -263,7 +282,7 @@ async function honeypotApi(path) {
   const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
   if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
   const sep = path.indexOf("?") >= 0 ? "&" : "?";
-  const res = await fetch("/api/honeypot" + path + sep + "_t=" + Date.now(), {
+  const res = await fetch(credentialedReadUrl("/api/honeypot" + path + sep + "_t=" + Date.now(), "GET"), {
     headers,
     cache: "no-store"
   });
@@ -286,6 +305,7 @@ async function autoTriggerApi(path, opts) {
   let url = AUTO_TRIGGER + path;
   const method = (init.method || "GET").toUpperCase();
   if (method === "GET") url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
+  url = credentialedReadUrl(url, method);
   const res = await fetch(url, init);
   let body = null;
   try { body = await res.json(); } catch (e) { body = null; }
@@ -319,6 +339,7 @@ async function policyApi(path, opts) {
   let url = POLICY + path;
   const method = (init.method || "GET").toUpperCase();
   if (method === "GET") url += (path.indexOf("?") >= 0 ? "&" : "?") + "_t=" + Date.now();
+  url = credentialedReadUrl(url, method);
   let res = await fetch(url, init);
   if (res.status === 401 && method !== "GET" && promptForOperatorToken()) {
     init.headers["Authorization"] = "Bearer " + TOKEN;
@@ -2419,7 +2440,7 @@ function normalizeInboxPrefs(raw) {
 
 async function loadInboxPrefs() {
   try {
-    const res = await fetch(INBOX_PREFS, {
+    const res = await fetch(credentialedReadUrl(INBOX_PREFS, "GET"), {
       headers: TOKEN ? { "Authorization": "Bearer " + TOKEN } : {},
       cache: "no-store"
     });
@@ -2988,6 +3009,17 @@ function renderPostureScreen() {
       '</section>';
   }
   const wall = postureWallLabel(home.castle_wall && home.castle_wall.arm_state);
+  // ADDITIVE vault-level line. The wall label above is the MACHINE arm-state and
+  // is unchanged; a Mac armed by an earlier install renders it protected while
+  // this vault is on no wall, so the vault's own claim gets its own sentence
+  // rather than being folded into that label. NOTE: this whole browser script
+  // lives inside a TypeScript template literal, so a backtick here would
+  // terminate it; comments in this file use plain words, never code quotes.
+  const vaultProvision = home.castle_wall && home.castle_wall.castle_wall_provision;
+  const vaultNotice =
+    vaultProvision === "not_yet_walled"
+      ? '<p class="muted">This vault is not on this Mac\'s Castle Wall yet, so the wall state above is the machine\'s, not this vault\'s.</p>'
+      : "";
   const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
   const findings = home.anomaly_findings || [];
   const anomalyUnknown = home.anomaly_findings_unknown === true;
@@ -3026,6 +3058,7 @@ function renderPostureScreen() {
         fresh: wallEvidenceAt,
         freshNone: "no enforcement evidence yet",
       }) +
+      vaultNotice +
       postureMetricCard(escHtml(pending), "Approvals waiting") +
       postureMetricCard(anomalyUnknown ? '<span class="tone-degraded">?</span>' : escHtml(findings.length), "Open anomalies") +
       postureMetricCard(chainPill, "Audit chain", {
@@ -3137,7 +3170,7 @@ async function fetchSovereignty() {
   try {
     const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
     if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
-    const res = await fetch("/api/sovereignty?_t=" + Date.now(), { headers: headers, cache: "no-store" });
+    const res = await fetch(credentialedReadUrl("/api/sovereignty?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" });
     let body = null;
     try { body = await res.json(); } catch (e) { body = null; }
     if (!res.ok || !body || body.error) {
@@ -3168,7 +3201,7 @@ async function fetchPostureHome() {
   const headers = { "Cache-Control": "no-cache", "Pragma": "no-cache" };
   if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
   try {
-    const res = await fetch("/api/posture/home?_t=" + Date.now(), { headers: headers, cache: "no-store" });
+    const res = await fetch(credentialedReadUrl("/api/posture/home?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" });
     let body = null;
     try { body = await res.json(); } catch (e) { body = null; }
     if (!res.ok || !body || body.error) {
@@ -3190,7 +3223,7 @@ async function fetchPostureHome() {
       let findings = [];
       let anomalyUnknown = false;
       try {
-        const ar = await fetch("/api/anomaly/findings?_t=" + Date.now(), { headers: headers, cache: "no-store" });
+        const ar = await fetch(credentialedReadUrl("/api/anomaly/findings?_t=" + Date.now(), "GET"), { headers: headers, cache: "no-store" });
         if (ar.ok) {
           const ab = await ar.json();
           findings = (ab && ab.data && ab.data.findings) || [];
@@ -3773,7 +3806,7 @@ function connectStream() {
   async function open() {
     try {
       const sessionQuery = await createStreamSessionQuery();
-      const url = STREAM + sessionQuery;
+      const url = credentialedReadUrl(STREAM + sessionQuery, "GET");
       es = new EventSource(url);
     } catch (e) { schedulePolling(); return; }
     es.addEventListener("snapshot", function () { /* v1.0 snapshot pass-through; v1.1 projects from hub. */ });

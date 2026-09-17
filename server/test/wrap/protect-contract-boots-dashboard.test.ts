@@ -1,3 +1,4 @@
+// fail-before-exempt: fixture-only edit for this approval-readiness change. The InstallProbeResult literal gains tier1Approval="available" so this unchanged protect-contract test reaches its existing assertion; the new approval behavior fails before in test/cli/install.test.ts.
 /**
  * Capability under test (AGENTS.md rule 4, wired consumer): the credential
  * `sanctuary init` enrols is the credential every stage of the install
@@ -98,6 +99,7 @@ function baseProbe(over: Partial<InstallProbeResult>): InstallProbeResult {
     custodyAccess: "usable",
     custodyMutation: "available",
     recoveryFactor: "present",
+    tier1Approval: "available",
     nodePath: "/usr/bin/node",
     castleWallApp: "not-applicable",
     castleWallBuildSha: null,
@@ -106,6 +108,9 @@ function baseProbe(over: Partial<InstallProbeResult>): InstallProbeResult {
     contentFilter: "not-applicable",
     enforcement: "not-applicable",
     trustAnchor: "not-applicable",
+    // Base fixture: this vault carries no wall claim, which is not a claim of
+    // protection either. Tests that need one set it explicitly.
+    vaultProvision: "unknown",
     operatorTwin: "not-applicable",
     stagedRecoveryFile: "absent",
     ...over,

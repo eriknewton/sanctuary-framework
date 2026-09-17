@@ -187,7 +187,7 @@ export type ConfigDowngradeReason =
   | "verascore_autopublish_enabled"
   | "erc8004_confirmation_enabled"
   | "config_baseline_invalid"
-  // DEBT-1: the baseline record is absent (deleted) or presents an older schema
+  // DEBT(CONFIG-BASELINE-ROLLBACK-REASON): the baseline record is absent (deleted) or presents an older schema
   // (downgrade reseed) on a fortress whose boot-anchored monotonic witness
   // records a baseline was already established (a deletion/downgrade replay),
   // refused by the config gate (`core/config-baseline.ts`).
@@ -429,14 +429,7 @@ export async function loadConfig(
     // invalid JSON still quarantines as genuine corruption.
     if (raw.trim() !== "") {
       const fileConfig = JSON.parse(raw);
-      if (fileConfig === null || typeof fileConfig !== "object" || Array.isArray(fileConfig)) {
-        throw new Error("Sanctuary config field \"$root\" must be an object");
-      }
-      config = deepMerge(config, fileConfig);
-      // Catch shape regressions from a malformed user-supplied JSON
-      // (e.g. `dashboard: "not-an-object"`) before downstream code casts.
-      assertSanctuaryConfigShape(config as unknown as Record<string, unknown>);
-      validateConfig(config);
+      config = mergeFileConfig(config, fileConfig);
     }
   } catch (err) {
     if (isErrno(err, "ENOENT")) {
@@ -495,120 +488,7 @@ export async function loadConfig(
   }
 
   // Phase 2: Apply env var overrides ON TOP of file config (env always wins)
-  if (process.env.SANCTUARY_STORAGE_PATH) {
-    config.storage_path = process.env.SANCTUARY_STORAGE_PATH;
-  }
-  if (process.env.SANCTUARY_TRANSPORT) {
-    config.transport = process.env.SANCTUARY_TRANSPORT as "stdio" | "http";
-  }
-  if (process.env.SANCTUARY_HTTP_PORT) {
-    config.http_port = parseInt(process.env.SANCTUARY_HTTP_PORT, 10);
-  }
-  if (process.env.SANCTUARY_DASHBOARD_ENABLED === "true") {
-    config.dashboard.enabled = true;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_ENABLED === "false") {
-    config.dashboard.enabled = false;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_PORT) {
-    // Strict whole-string parse so an invalid value (e.g. "80abc") becomes NaN
-    // here and is refused by validateConfig, instead of parseInt silently
-    // truncating it to a bound-but-unintended port. Fail-closed on bad input.
-    config.dashboard.port = strictParseIntEnv(process.env.SANCTUARY_DASHBOARD_PORT);
-  }
-  if (process.env.SANCTUARY_DASHBOARD_HOST) {
-    config.dashboard.host = process.env.SANCTUARY_DASHBOARD_HOST;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN) {
-    config.dashboard.auth_token = process.env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_AUTO_OPEN === "true") {
-    config.dashboard.auto_open = true;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_AUTO_OPEN === "false") {
-    config.dashboard.auto_open = false;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_TLS_CERT && process.env.SANCTUARY_DASHBOARD_TLS_KEY) {
-    config.dashboard.tls = {
-      cert_path: process.env.SANCTUARY_DASHBOARD_TLS_CERT,
-      key_path: process.env.SANCTUARY_DASHBOARD_TLS_KEY,
-    };
-  }
-  if (process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE === "true") {
-    config.dashboard.allow_plaintext_remote = true;
-  }
-  if (process.env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE === "false") {
-    config.dashboard.allow_plaintext_remote = false;
-  }
-  if (process.env.SANCTUARY_WEBHOOK_ENABLED === "true") {
-    config.webhook.enabled = true;
-  }
-  if (process.env.SANCTUARY_WEBHOOK_ENABLED === "false") {
-    config.webhook.enabled = false;
-  }
-  if (process.env.SANCTUARY_WEBHOOK_URL) {
-    config.webhook.url = process.env.SANCTUARY_WEBHOOK_URL;
-  }
-  if (process.env.SANCTUARY_WEBHOOK_SECRET) {
-    config.webhook.secret = process.env.SANCTUARY_WEBHOOK_SECRET;
-  }
-  if (process.env.SANCTUARY_WEBHOOK_CALLBACK_PORT) {
-    config.webhook.callback_port = parseInt(process.env.SANCTUARY_WEBHOOK_CALLBACK_PORT, 10);
-  }
-  if (process.env.SANCTUARY_WEBHOOK_CALLBACK_HOST) {
-    config.webhook.callback_host = process.env.SANCTUARY_WEBHOOK_CALLBACK_HOST;
-  }
-  if (process.env.SANCTUARY_VERASCORE_URL) {
-    config.verascore.url = process.env.SANCTUARY_VERASCORE_URL;
-  }
-  if (process.env.SANCTUARY_AUTO_PUBLISH_TO_VERASCORE === "true") {
-    config.verascore.auto_publish_to_verascore = true;
-  }
-  if (process.env.SANCTUARY_AUTO_PUBLISH_TO_VERASCORE === "false") {
-    config.verascore.auto_publish_to_verascore = false;
-  }
-  if (process.env.SANCTUARY_AUTO_PUBLISH_HANDSHAKES === "true") {
-    config.verascore.auto_publish_handshakes = true;
-  }
-  if (process.env.SANCTUARY_AUTO_PUBLISH_HANDSHAKES === "false") {
-    config.verascore.auto_publish_handshakes = false;
-  }
-  if (process.env.SANCTUARY_ERC8004_REGISTRY_CONFIRMATION_ENABLED === "true") {
-    config.erc8004.registry_confirmation.enabled = true;
-  }
-  if (process.env.SANCTUARY_ERC8004_REGISTRY_CONFIRMATION_ENABLED === "false") {
-    config.erc8004.registry_confirmation.enabled = false;
-  }
-  if (process.env.SANCTUARY_ERC8004_RPC_URL) {
-    config.erc8004.registry_confirmation.rpc_url =
-      process.env.SANCTUARY_ERC8004_RPC_URL;
-  }
-  if (process.env.SANCTUARY_ERC8004_CHAIN_ID) {
-    config.erc8004.registry_confirmation.chain_id = strictParseIntEnv(
-      process.env.SANCTUARY_ERC8004_CHAIN_ID,
-    );
-  }
-  if (process.env.SANCTUARY_ERC8004_RPC_TIMEOUT_MS) {
-    config.erc8004.registry_confirmation.timeout_ms = strictParseIntEnv(
-      process.env.SANCTUARY_ERC8004_RPC_TIMEOUT_MS,
-    );
-  }
-  if (process.env.SANCTUARY_PRIVACY_FILTER) {
-    config.privacy_filter.mode = process.env.SANCTUARY_PRIVACY_FILTER as "local" | "opf" | "off";
-  }
-  if (process.env.SANCTUARY_PRIVACY_FILTER_FAIL_MODE) {
-    config.privacy_filter.fail_mode =
-      process.env.SANCTUARY_PRIVACY_FILTER_FAIL_MODE as "closed" | "fallback";
-  }
-  if (process.env.SANCTUARY_PRIVACY_FILTER_COMMAND) {
-    config.privacy_filter.command = process.env.SANCTUARY_PRIVACY_FILTER_COMMAND;
-  }
-  if (process.env.SANCTUARY_PRIVACY_FILTER_TIMEOUT_MS) {
-    config.privacy_filter.timeout_ms = parseInt(
-      process.env.SANCTUARY_PRIVACY_FILTER_TIMEOUT_MS,
-      10
-    );
-  }
+  applyConfigEnvOverrides(config, process.env);
 
   // Phase 3: Always stamp the running version from package.json (Bug 2 fix —
   // sanctuary.json may store a stale version from first run)
@@ -922,6 +802,154 @@ export function validateConfig(config: SanctuaryConfig): void {
     throw new Error(
       `${CONFIG_VALUE_ERROR_PREFIX}:\n${valueErrors.join("\n")}`
     );
+  }
+}
+
+/**
+ * Merge and validate the file stage before environment overrides are applied.
+ *
+ * Shared by `loadConfig` (the runtime boot path) and the read-only install
+ * probe (`cli/install.ts:probeTier1Approval`). Both callers validate again
+ * after environment overrides. File-stage validation belongs here so an
+ * override cannot replace an invalid file value before it is checked.
+ */
+export function mergeFileConfig(
+  base: SanctuaryConfig,
+  fileConfig: unknown
+): SanctuaryConfig {
+  if (fileConfig === null || typeof fileConfig !== "object" || Array.isArray(fileConfig)) {
+    throw new Error("Sanctuary config field \"$root\" must be an object");
+  }
+  const merged = deepMerge(base, fileConfig);
+  // Catch shape regressions from a malformed user-supplied JSON
+  // (e.g. `dashboard: "not-an-object"`) before downstream code casts.
+  assertSanctuaryConfigShape(merged as unknown as Record<string, unknown>);
+  validateConfig(merged);
+  return merged;
+}
+
+/**
+ * Apply the `SANCTUARY_*` environment overrides to `config` in place.
+ *
+ * Takes `env` as an explicit argument (never reads `process.env` itself) so
+ * the read-only install probe can run the SAME precedence logic against a
+ * synthetic environment without touching ambient process state. Mirrors the
+ * env-override contract in `loadConfig`'s "Phase 2" byte-for-byte; keep both
+ * callers on this one function rather than re-deriving the override set.
+ */
+export function applyConfigEnvOverrides(
+  config: SanctuaryConfig,
+  env: NodeJS.ProcessEnv
+): void {
+  if (env.SANCTUARY_STORAGE_PATH) {
+    config.storage_path = env.SANCTUARY_STORAGE_PATH;
+  }
+  if (env.SANCTUARY_TRANSPORT) {
+    config.transport = env.SANCTUARY_TRANSPORT as "stdio" | "http";
+  }
+  if (env.SANCTUARY_HTTP_PORT) {
+    config.http_port = parseInt(env.SANCTUARY_HTTP_PORT, 10);
+  }
+  if (env.SANCTUARY_DASHBOARD_ENABLED === "true") {
+    config.dashboard.enabled = true;
+  }
+  if (env.SANCTUARY_DASHBOARD_ENABLED === "false") {
+    config.dashboard.enabled = false;
+  }
+  if (env.SANCTUARY_DASHBOARD_PORT) {
+    // Strict whole-string parse so an invalid value (e.g. "80abc") becomes NaN
+    // here and is refused by validateConfig, instead of parseInt silently
+    // truncating it to a bound-but-unintended port. Fail-closed on bad input.
+    config.dashboard.port = strictParseIntEnv(env.SANCTUARY_DASHBOARD_PORT);
+  }
+  if (env.SANCTUARY_DASHBOARD_HOST) {
+    config.dashboard.host = env.SANCTUARY_DASHBOARD_HOST;
+  }
+  if (env.SANCTUARY_DASHBOARD_AUTH_TOKEN) {
+    config.dashboard.auth_token = env.SANCTUARY_DASHBOARD_AUTH_TOKEN;
+  }
+  if (env.SANCTUARY_DASHBOARD_AUTO_OPEN === "true") {
+    config.dashboard.auto_open = true;
+  }
+  if (env.SANCTUARY_DASHBOARD_AUTO_OPEN === "false") {
+    config.dashboard.auto_open = false;
+  }
+  if (env.SANCTUARY_DASHBOARD_TLS_CERT && env.SANCTUARY_DASHBOARD_TLS_KEY) {
+    config.dashboard.tls = {
+      cert_path: env.SANCTUARY_DASHBOARD_TLS_CERT,
+      key_path: env.SANCTUARY_DASHBOARD_TLS_KEY,
+    };
+  }
+  if (env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE === "true") {
+    config.dashboard.allow_plaintext_remote = true;
+  }
+  if (env.SANCTUARY_DASHBOARD_ALLOW_PLAINTEXT_REMOTE === "false") {
+    config.dashboard.allow_plaintext_remote = false;
+  }
+  if (env.SANCTUARY_WEBHOOK_ENABLED === "true") {
+    config.webhook.enabled = true;
+  }
+  if (env.SANCTUARY_WEBHOOK_ENABLED === "false") {
+    config.webhook.enabled = false;
+  }
+  if (env.SANCTUARY_WEBHOOK_URL) {
+    config.webhook.url = env.SANCTUARY_WEBHOOK_URL;
+  }
+  if (env.SANCTUARY_WEBHOOK_SECRET) {
+    config.webhook.secret = env.SANCTUARY_WEBHOOK_SECRET;
+  }
+  if (env.SANCTUARY_WEBHOOK_CALLBACK_PORT) {
+    config.webhook.callback_port = parseInt(env.SANCTUARY_WEBHOOK_CALLBACK_PORT, 10);
+  }
+  if (env.SANCTUARY_WEBHOOK_CALLBACK_HOST) {
+    config.webhook.callback_host = env.SANCTUARY_WEBHOOK_CALLBACK_HOST;
+  }
+  if (env.SANCTUARY_VERASCORE_URL) {
+    config.verascore.url = env.SANCTUARY_VERASCORE_URL;
+  }
+  if (env.SANCTUARY_AUTO_PUBLISH_TO_VERASCORE === "true") {
+    config.verascore.auto_publish_to_verascore = true;
+  }
+  if (env.SANCTUARY_AUTO_PUBLISH_TO_VERASCORE === "false") {
+    config.verascore.auto_publish_to_verascore = false;
+  }
+  if (env.SANCTUARY_AUTO_PUBLISH_HANDSHAKES === "true") {
+    config.verascore.auto_publish_handshakes = true;
+  }
+  if (env.SANCTUARY_AUTO_PUBLISH_HANDSHAKES === "false") {
+    config.verascore.auto_publish_handshakes = false;
+  }
+  if (env.SANCTUARY_ERC8004_REGISTRY_CONFIRMATION_ENABLED === "true") {
+    config.erc8004.registry_confirmation.enabled = true;
+  }
+  if (env.SANCTUARY_ERC8004_REGISTRY_CONFIRMATION_ENABLED === "false") {
+    config.erc8004.registry_confirmation.enabled = false;
+  }
+  if (env.SANCTUARY_ERC8004_RPC_URL) {
+    config.erc8004.registry_confirmation.rpc_url = env.SANCTUARY_ERC8004_RPC_URL;
+  }
+  if (env.SANCTUARY_ERC8004_CHAIN_ID) {
+    config.erc8004.registry_confirmation.chain_id = strictParseIntEnv(
+      env.SANCTUARY_ERC8004_CHAIN_ID,
+    );
+  }
+  if (env.SANCTUARY_ERC8004_RPC_TIMEOUT_MS) {
+    config.erc8004.registry_confirmation.timeout_ms = strictParseIntEnv(
+      env.SANCTUARY_ERC8004_RPC_TIMEOUT_MS,
+    );
+  }
+  if (env.SANCTUARY_PRIVACY_FILTER) {
+    config.privacy_filter.mode = env.SANCTUARY_PRIVACY_FILTER as "local" | "opf" | "off";
+  }
+  if (env.SANCTUARY_PRIVACY_FILTER_FAIL_MODE) {
+    config.privacy_filter.fail_mode =
+      env.SANCTUARY_PRIVACY_FILTER_FAIL_MODE as "closed" | "fallback";
+  }
+  if (env.SANCTUARY_PRIVACY_FILTER_COMMAND) {
+    config.privacy_filter.command = env.SANCTUARY_PRIVACY_FILTER_COMMAND;
+  }
+  if (env.SANCTUARY_PRIVACY_FILTER_TIMEOUT_MS) {
+    config.privacy_filter.timeout_ms = parseInt(env.SANCTUARY_PRIVACY_FILTER_TIMEOUT_MS, 10);
   }
 }
 

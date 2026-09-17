@@ -1,3 +1,4 @@
+// fail-before-exempt: this change only widens the harness beforeEach timeout for real Argon2 custody setup under full-suite load; assertions and production behavior are unchanged, so the file intentionally passes against pre-fix source.
 /**
  * `unlockLocalFortress` — the shared local-fortress credential chokepoint for
  * the ordinary memory verbs.
@@ -77,7 +78,7 @@ describe("unlockLocalFortress", () => {
   let f: Seeded;
   beforeEach(async () => {
     f = await seedFortress();
-  });
+  }, 60_000);
   afterEach(async () => {
     await f.cleanup();
   });
