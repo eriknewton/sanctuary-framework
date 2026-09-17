@@ -456,17 +456,34 @@ impl DaemonHandle {
                     Err(std::sync::TryLockError::Poisoned(_)) => {
                         RuntimeHealthState::Lost(crate::enforcement::NotReadyReason::ShuttingDown)
                     }
-                    Ok(runtime) => match runtime.status() {
-                        crate::enforcement::EnforcementStatus::KernelRuntimeReady => {
-                            RuntimeHealthState::Ready
+                    Ok(runtime) => {
+                        // BEFORE any exit arm: give a component that proved its resource
+                        // lost one safety-net attempt while this process still holds the
+                        // host lock. The status re-read below then observes whatever the
+                        // attempt produced, so a successful install shows up as
+                        // `Recovering` (not readiness) and the exit arm is not reached
+                        // with an attempt outstanding.
+                        runtime.attempt_post_ready_recovery(self.is_shutdown_requested());
+                        match runtime.status() {
+                            crate::enforcement::EnforcementStatus::KernelRuntimeReady => {
+                                RuntimeHealthState::Ready
+                            }
+                            crate::enforcement::EnforcementStatus::NotReady {
+                                reason: crate::enforcement::NotReadyReason::HealthProbeUnavailable,
+                            } => RuntimeHealthState::ProbeUnavailable,
+                            // The net is being installed or retried for a proven loss.
+                            // Published as its own state so the supervisor's exit arm is not
+                            // reached while the attempt is outstanding. Must match
+                            // `ComponentHealth::Recovering`.
+                            crate::enforcement::EnforcementStatus::NotReady {
+                                reason:
+                                    reason @ crate::enforcement::NotReadyReason::SafetyNetRecovering(_),
+                            } => RuntimeHealthState::Recovering(reason),
+                            crate::enforcement::EnforcementStatus::NotReady { reason } => {
+                                RuntimeHealthState::Lost(reason)
+                            }
                         }
-                        crate::enforcement::EnforcementStatus::NotReady {
-                            reason: crate::enforcement::NotReadyReason::HealthProbeUnavailable,
-                        } => RuntimeHealthState::ProbeUnavailable,
-                        crate::enforcement::EnforcementStatus::NotReady { reason } => {
-                            RuntimeHealthState::Lost(reason)
-                        }
-                    },
+                    }
                 }
             }
         }
@@ -552,9 +569,24 @@ impl DaemonHandle {
                             return SupervisionOutcome::KernelRuntimeLost(reason);
                         }
                     }
+                    // RECOVERING: a component proved its resource lost and the safety
+                    // net is being installed or retried for it RIGHT NOW, while this
+                    // process still holds the host lock. This arm exists BEFORE the exit
+                    // arm below on purpose: exiting here would drop the host lock and
+                    // end the process while the net still had an attempt outstanding,
+                    // and the restart cannot re-attempt what this process was in the
+                    // middle of. The loss is recorded as evidence, and the loop
+                    // continues on the retry interval so the controller gets its next
+                    // attempt. It is NOT readiness, so nothing downstream reads this as
+                    // enforcing.
+                    RuntimeHealthState::Recovering(reason) => {
+                        self.record_runtime_loss(reason);
+                        consecutive_unavailable = 0;
+                    }
                     RuntimeHealthState::Lost(reason) => {
-                        // A PROVEN loss is acted on immediately: no grace, no
-                        // budget. Only the indeterminate arm above is retried.
+                        // A PROVEN loss with no recovery attempt outstanding is acted on
+                        // immediately: no grace, no budget. Only the indeterminate arm
+                        // above and the recovering arm are retried.
                         self.record_runtime_loss(reason);
                         return SupervisionOutcome::KernelRuntimeLost(reason);
                     }
@@ -1856,6 +1888,7 @@ mod tests {
         // stays control-plane-only WITHOUT pretending enforcement is available.
         let err = EnforcementStartError::Component {
             failed: ComponentKind::NftablesTable,
+            evidence: None,
             reason: EnforcementError::NotAvailableOnPlatform(ComponentKind::NftablesTable.as_str()),
         };
         assert!(matches!(
@@ -1889,6 +1922,7 @@ mod tests {
         for reason in fatal_reasons {
             let err = EnforcementStartError::Component {
                 failed: ComponentKind::NftablesTable,
+                evidence: None,
                 reason,
             };
             assert!(

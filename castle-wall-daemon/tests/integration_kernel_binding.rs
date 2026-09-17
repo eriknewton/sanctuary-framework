@@ -385,7 +385,9 @@ fn gf1_deny_all_over_a_live_agent_table_forces_policy_drop_never_accept() {
     );
 
     // GF1 re-arm: install the deny-all safety net.
-    nftables::install_deny_all_safety_net().expect("install deny-all safety net");
+    // PR-1: the scope is a typed argument now; this leg drives the v1 host-wide shape, which is what the base installed.
+    nftables::install_deny_all_safety_net(&nftables::SafetyNetScope::HostWide)
+        .expect("install deny-all safety net");
 
     // POST-CONDITION: deny-all. Base chain policy drop; no accept base; no agent
     // chain -> every non-allowlisted packet is dropped, never accepted.

@@ -34,6 +34,43 @@ const VALID_MODES: ReadonlySet<string> = new Set<AgentOriginMode>(["nat", "uid"]
  */
 const UINT32_MAX = 0xffffffff;
 
+/**
+ * The two uid values a Linux consumer cannot attest, refused here so a manifest
+ * this publisher signs is never one the daemon then refuses to load.
+ *
+ *  - `UINT32_MAX` is the invalid-uid sentinel. It names no principal, and the
+ *    Linux daemon will not seal it into a kernel rule. This publisher ACCEPTED it
+ *    before, and its own test asserted that acceptance.
+ *  - `65534` is the conventional `kernel.overflowuid`, the value Linux renders for
+ *    every credential the reading namespace cannot map. A rule naming it would
+ *    deny an unbounded, unknown set of principals rather than one identity.
+ *
+ * THE ONE PRODUCER/CONSUMER ASYMMETRY, stated on both sides: the daemon refuses
+ * the value its OWN host has configured, read from `/proc/sys/kernel/overflowuid`,
+ * which a host may set to something other than 65534. The publisher has no host to
+ * read and therefore refuses the conventional value only. A manifest carrying a
+ * mapped 65534 on a host configured with `kernel.overflowuid=65533` is admitted by
+ * that daemon and refused here; that direction is safe (the publisher is stricter),
+ * and the reverse cannot happen. Must match the three refusals in
+ * `castle-wall-daemon/src/safety_net_uid.rs` (`validate_safety_net_uid`) and in
+ * `castle-wall-daemon/src/policy.rs`
+ * (`confined_agent_uid_from_loaded_manifest`).
+ *
+ * UPGRADE RULE: a manifest already signed with one of these values in `agent_uid`
+ * or `gate_uid` stops loading on a Linux daemon that enforces the bound. Reissue it
+ * through this publisher, which now refuses to mint one.
+ */
+const CONVENTIONAL_OVERFLOW_UID = 65534;
+const UNATTESTABLE_UIDS: ReadonlySet<number> = new Set([
+  CONVENTIONAL_OVERFLOW_UID,
+  UINT32_MAX,
+]);
+
+/** True when `n` is a uid no Linux consumer can attest to a single principal. */
+function isUnattestableUid(n: number): boolean {
+  return UNATTESTABLE_UIDS.has(n);
+}
+
 /** True when `n` is a non-negative integer (ports, ranges). */
 function isNonNegativeInt(n: unknown): n is number {
   return typeof n === "number" && Number.isInteger(n) && n >= 0;
@@ -97,6 +134,12 @@ export function validateAgentOrigin(candidate: unknown): AgentOrigin | null {
     if (c.agent_uid < 1 || c.agent_uid < systemUidAllowCeiling) {
       return null;
     }
+    // The ceiling floor above STAYS; this is an ADDITIONAL bound answering a
+    // different question. The ceiling proves the uid is outside the system-daemon
+    // band; this proves the uid names a single attestable principal at all.
+    if (isUnattestableUid(c.agent_uid)) {
+      return null;
+    }
 
     // `gate_uid` (S5-0, 2026-07-14): a SECOND optional confined principal,
     // valid only in UID mode. Applies the SAME floor invariants as
@@ -116,7 +159,10 @@ export function validateAgentOrigin(candidate: unknown): AgentOrigin | null {
       if (
         c.gate_uid < 1 ||
         c.gate_uid < systemUidAllowCeiling ||
-        c.gate_uid === agentUid
+        c.gate_uid === agentUid ||
+        // Same additional bound as `agent_uid`: the gate is a confined principal
+        // the net denies, so an unattestable gate uid is the same defect.
+        isUnattestableUid(c.gate_uid)
       ) {
         return null;
       }

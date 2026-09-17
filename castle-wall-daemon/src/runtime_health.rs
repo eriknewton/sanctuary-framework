@@ -54,6 +54,15 @@ pub enum RuntimeHealthState {
     /// No conclusion is available: the probe was in flight, timed out, or the
     /// view could not be read. Indeterminate — never treat as ready or as lost.
     ProbeUnavailable,
+    /// A required component was PROVEN lost AND the safety net is being installed or
+    /// retried for it while this process keeps the host lock.
+    ///
+    /// Its own state, not a flavour of `Lost`, because the supervisor exits on `Lost`
+    /// and must NOT exit while an attempt is outstanding: the process would drop the
+    /// host lock mid-attempt and the restart cannot resume what this one began. It is
+    /// NOT readiness either. The signed status projection carries it as its own token
+    /// so an operator can tell "the net is going in" from "the net is not going in".
+    Recovering(NotReadyReason),
 }
 
 impl RuntimeHealthState {
@@ -66,6 +75,11 @@ impl RuntimeHealthState {
             Self::Ready => "ready",
             Self::Lost(_) => "lost",
             Self::ProbeUnavailable => "probe_unavailable",
+            // A NEW wire token. Must match `RuntimeHealthToken` in
+            // `server/src/castle-wall/ipc/messages.ts`: producer and consumer change
+            // together, and a reader that does not know this token must treat it as
+            // not-ready rather than as ready.
+            Self::Recovering(_) => "safety_net_recovering",
         }
     }
 }

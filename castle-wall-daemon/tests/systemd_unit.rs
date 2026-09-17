@@ -171,6 +171,84 @@ fn unit_bounds_startup_at_the_process_level() {
         "TimeoutStartSec must be a concrete duration, got {:?}",
         values[0]
     );
+    // PINNED BY VALUE, not merely "a duration": the start-limit interval below is
+    // DERIVED from this number, so a change here without a matching change there
+    // silently makes the limit untrippable. Must match TimeoutStartSec and the
+    // derivation comment in systemd/sanctuary-castle-wall.service.
+    assert_eq!(
+        values[0], TIMEOUT_START_SEC,
+        "TimeoutStartSec is pinned; the start-limit interval is derived from it"
+    );
+}
+
+/// The unit's startup timeout, in seconds. Raised with the safety net because a
+/// startup ownership loss now installs the net inside the start window.
+/// Must match `TimeoutStartSec` in systemd/sanctuary-castle-wall.service.
+const TIMEOUT_START_SEC: &str = "60";
+
+/// The unit's restart delay, in seconds.
+/// Must match `RestartSec` in systemd/sanctuary-castle-wall.service.
+const RESTART_SEC: &str = "2";
+
+/// The unit's start burst.
+/// Must match `StartLimitBurst` in systemd/sanctuary-castle-wall.service.
+const START_LIMIT_BURST: &str = "5";
+
+/// The unit's start-limit window, in seconds.
+/// Must match `StartLimitIntervalSec` in systemd/sanctuary-castle-wall.service.
+const START_LIMIT_INTERVAL_SEC: &str = "600";
+
+#[test]
+fn unit_ships_a_finite_start_limit_whose_window_outlasts_five_worst_case_activations() {
+    let unit = unit_text();
+    let burst = directive_values(&unit, "StartLimitBurst");
+    let interval = directive_values(&unit, "StartLimitIntervalSec");
+    assert_eq!(burst.len(), 1, "exactly one StartLimitBurst must be set");
+    assert_eq!(
+        interval.len(),
+        1,
+        "exactly one StartLimitIntervalSec must be set"
+    );
+    assert_eq!(burst[0], START_LIMIT_BURST);
+    assert_eq!(interval[0], START_LIMIT_INTERVAL_SEC);
+
+    // INVARIANT, and the reason both values are pinned: systemd refuses a start
+    // only when MORE than `burst` starts fall inside one window, so all `burst`
+    // worst-case activations must FIT in the window. A worst case is an activation
+    // killed at TimeoutStartSec plus RestartSec. If this arithmetic ever fails, the
+    // unit restarts forever while network.target waits on the ordering edge, which
+    // is the boot lockout moved from nftables into systemd.
+    let burst_n: u64 = burst[0].parse().expect("burst is a count");
+    let interval_n: u64 = interval[0].parse().expect("interval is seconds");
+    let start_timeout: u64 = TIMEOUT_START_SEC.parse().expect("timeout is seconds");
+    let restart_delay: u64 = RESTART_SEC.parse().expect("restart delay is seconds");
+    let worst_case_span = burst_n * (start_timeout + restart_delay);
+    assert!(
+        interval_n > worst_case_span,
+        "StartLimitIntervalSec {interval_n} must exceed {burst_n} x ({start_timeout} + \
+         {restart_delay}) = {worst_case_span} seconds, or the limit never trips"
+    );
+
+    // And the unlimited form is never shipped here: it is what would move the boot
+    // lockout into systemd.
+    assert!(
+        !interval.contains(&"0"),
+        "StartLimitIntervalSec=0 (unlimited restarts) must never ship on a unit \
+         ordered Before=network.target"
+    );
+
+    // RestartSec is pinned too, because the derivation above reads it.
+    let restart = directive_values(&unit, "RestartSec");
+    assert_eq!(restart.len(), 1, "exactly one RestartSec must be set");
+    assert_eq!(restart[0], RESTART_SEC);
+
+    // The recovery an operator needs is named in the unit itself, because a plain
+    // `systemctl start` after the limit trips reports only "start request repeated
+    // too quickly" and reads as a broken unit file.
+    assert!(
+        unit.contains("reset-failed"),
+        "the unit must name `systemctl reset-failed` as the recovery"
+    );
 }
 
 #[test]

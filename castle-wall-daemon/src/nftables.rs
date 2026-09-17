@@ -28,6 +28,12 @@
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
+// The net's uid values come through the shared validator ONLY. `ConfinedUidSet`
+// has a private field there, so this module can carry it and render it but can
+// never mint one from a raw `u32`.
+// Must match `crate::safety_net_uid::ConfinedUidSet`'s constructor contract.
+use crate::safety_net_uid::{validate_safety_net_uid, ConfinedUidSet, HostOverflowUid};
+
 /// Errors emitted by the nftables module.
 #[derive(Debug, thiserror::Error)]
 pub enum NftablesError {
@@ -240,6 +246,387 @@ const AGENT_CHAIN_PREFIX: &str = "agent_";
 /// not count against the "zero rules" ownership invariant. Must match the marker
 /// the journal records for the same acquisition (see `ownership_journal`).
 pub const OWNER_MARKER_PREFIX: &str = "sanctuary-castle-owner:v1:";
+
+/// Rule `comment` on the safety net's DROP rule, which names the confined
+/// identity. This and the two comments below are the net's v2 wire shape: they
+/// are what `is_deny_all_safety_net_json` reads back to prove a live table is
+/// this daemon's own net, and the disarm verb's recovery arm keys on that same
+/// recognition. Emitter and recogniser are both in this file; the values are a
+/// PERMANENT product shape and must match the three rules in `D1` of
+/// `Review/Sanctuary/Linux_Safety_Net_Carveout_Design_2026-09-17.md`. They carry
+/// no `OWNER_MARKER_PREFIX`: the net is deliberately NOT a captured owned table
+/// (it is `policy drop`, while the owned parser requires `policy accept`).
+pub const NET_RULE_COMMENT_IDENTITY: &str = "sanctuary-castle-net:v2:confined-identity";
+
+/// Rule `comment` on the kernel neighbour-discovery accept rule.
+/// Must match the rule-2 comment in `is_deny_all_safety_net_json`.
+pub const NET_RULE_COMMENT_KERNEL_ND: &str = "sanctuary-castle-net:v2:kernel-nd";
+
+/// Rule `comment` on the "every other principal" accept rule.
+/// Must match the rule-3 comment in `is_deny_all_safety_net_json`.
+pub const NET_RULE_COMMENT_OTHERS: &str = "sanctuary-castle-net:v2:other-principals";
+
+/// The ONLY ICMPv6 types the net accepts while armed: the kernel's own
+/// neighbour-discovery messages, which carry no socket (`skb->sk` is null) and
+/// would otherwise fall to the drop policy and take IPv6 connectivity, an IPv6
+/// ssh session included, down with the agent.
+///
+/// MLD is deliberately ABSENT. An ordinary IPv6 datagram socket can join and
+/// leave multicast groups with no capability, and each membership change makes
+/// the kernel emit an MLD report with no socket, so an MLD accept would be a
+/// link-local channel the confined agent can drive. The cost is recorded as a
+/// residual in the design memo (IPv6 multicast memberships age out on
+/// MLD-snooping links while the net is armed; the IPv4 operator path is the
+/// documented repair path).
+///
+/// Must match the rule-2 type set the recogniser requires in
+/// `is_deny_all_safety_net_json`.
+pub const KERNEL_ND_ICMPV6_TYPES: [&str; 3] = [
+    "nd-neighbor-solicit",
+    "nd-neighbor-advert",
+    "nd-router-solicit",
+];
+
+/// Largest confined-uid set the net will name in one rule.
+///
+/// DERIVATION, not a preference: one agent uid and one gate uid per signed
+/// manifest, so 256 entries is 128 distinct admitted identities within a single
+/// boot with no disarm. An operating host rotates its confined identity a handful
+/// of times at most; a set larger than this comes from an attacker-crafted
+/// inventory, not from operation. Over the bound the net falls back to the
+/// host-wide shape with the `deny-set-over-capacity` reason rather than
+/// truncating, because a truncated set silently unconfines whichever identity
+/// fell off the end.
+pub const DENY_SET_MAX: usize = 256;
+
+/// Which principals the deny-all safety net denies.
+///
+/// `Identity` is the v2 shape and the only shape that preserves operator access:
+/// it denies exactly the uids in its [`ConfinedUidSet`] and accepts every other
+/// attestable principal. `HostWide` is the v1 shape (a bare `policy drop` base
+/// chain, no rules), installed ONLY when no confined identity can be named:
+/// an empty deny set, unknown history for this boot, or a deny set over
+/// [`DENY_SET_MAX`]. On that shape operator access is NOT preserved, and every
+/// refusal and audit row that carries it says so with its reason.
+///
+/// The variant is CLOSED: `ConfinedUidSet` has a private field and no constructor
+/// outside `crate::safety_net_uid`, so no caller anywhere in the crate can place
+/// uid 0, this host's `kernel.overflowuid` or `u32::MAX` into rule 1. This is the
+/// type-level half of D1c; the ceiling half stays at admission and at the
+/// emission floor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SafetyNetScope {
+    /// Deny exactly these uids; accept every other attestable principal.
+    Identity(ConfinedUidSet),
+    /// Deny every uid on this host. Operator access is not preserved.
+    HostWide,
+}
+
+impl SafetyNetScope {
+    /// The uids rule 1 denies, ascending; empty for the host-wide shape (which
+    /// denies by policy rather than by naming anyone).
+    pub fn denied_uids(&self) -> Vec<u32> {
+        match self {
+            SafetyNetScope::Identity(set) => set.uids(),
+            SafetyNetScope::HostWide => Vec::new(),
+        }
+    }
+
+    /// The shape tag the audit row and the signed health report carry.
+    /// Must match the `shape` values in `D4` of the design memo and in the
+    /// `safety_net` state this daemon emits.
+    pub fn shape_tag(&self) -> &'static str {
+        match self {
+            SafetyNetScope::Identity(_) => "v2-confined-identity",
+            SafetyNetScope::HostWide => "v1-host-wide",
+        }
+    }
+}
+
+/// Why the net was installed with the scope it was.
+///
+/// Every host-wide reason is DISTINCT and carries its own refusal sentence,
+/// because they are not the same operational situation and an operator acts
+/// differently on each. Folding them into one "unrecoverable" message is what made
+/// an over-capacity set read as unknown history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafetyNetReason {
+    /// A confined identity was recoverable and the net denies exactly it. This is
+    /// the only reason under which operator access is preserved.
+    Identity,
+    /// No confined identity was recoverable from any of the three sources.
+    EmptyDenySet,
+    /// The journal's `confined` key is ABSENT on a same-boot record, so neither
+    /// the manifest nor the live table can prove this boot's history.
+    UnknownHistory,
+    /// The deny set is known exactly but is larger than `DENY_SET_MAX`.
+    DenySetOverCapacity { count: usize, cap: usize },
+}
+
+impl SafetyNetReason {
+    /// The tag the audit row and the signed health report carry.
+    /// Must match the `reason` values in `D4` of the design memo.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            SafetyNetReason::Identity => "identity",
+            SafetyNetReason::EmptyDenySet => "empty-deny-set",
+            SafetyNetReason::UnknownHistory => "unknown-history",
+            SafetyNetReason::DenySetOverCapacity { .. } => "deny-set-over-capacity",
+        }
+    }
+}
+
+/// The repair order an operator must follow, in the order that WORKS.
+///
+/// FAILURE MODE this sentence exists to prevent: repairing the wall first and
+/// running disarm second does not work while the unit is running, because systemd
+/// restarts the daemon into the same refusal and it re-takes the host lock that
+/// disarm needs. Stopping the unit first is what makes the other two steps
+/// possible.
+pub const SAFETY_NET_REPAIR_ORDER: &str =
+    "stop the castle-wall unit, repair the wall, then run the disarm verb";
+
+/// The scope sentence a refusal on a net-install path carries, in plain words an
+/// operator can act on.
+///
+/// The identity form names the uids and states explicitly that every other
+/// principal is unaffected, because the first question an operator asks on seeing
+/// a deny-all net is whether their own session is about to die. Each host-wide
+/// form names its OWN reason and then says, in the same sentence, that operator
+/// access is NOT preserved on that path.
+pub fn safety_net_scope_sentence(scope: &SafetyNetScope, reason: &SafetyNetReason) -> String {
+    match scope {
+        SafetyNetScope::Identity(set) => format!(
+            "the net denies uids {:?}; every other principal, including root and ssh, \
+             is unaffected. {SAFETY_NET_REPAIR_ORDER}",
+            set.uids()
+        ),
+        SafetyNetScope::HostWide => {
+            let why = match reason {
+                SafetyNetReason::EmptyDenySet => "no confined identity was recoverable".to_string(),
+                SafetyNetReason::UnknownHistory => "history unknown for this boot".to_string(),
+                SafetyNetReason::DenySetOverCapacity { count, cap } => {
+                    format!("deny set over capacity ({count} of {cap})")
+                }
+                // `Identity` cannot pair with the host-wide shape; if it ever
+                // does, say so rather than printing a reason that is not true.
+                SafetyNetReason::Identity => {
+                    "a confined identity was named but the host-wide shape was installed \
+                     (this pairing is a defect)"
+                        .to_string()
+                }
+            };
+            format!(
+                "{why}; the net denies every uid on this host; operator access is not \
+                 preserved on this path. {SAFETY_NET_REPAIR_ORDER}"
+            )
+        }
+    }
+}
+
+/// The TAGGED `safety_net` state the `kernel_runtime_lost` WAL row and the signed
+/// health report carry (design memo D4).
+///
+/// INVARIANT, and the reason this is a tagged enum rather than a struct with an
+/// `installed: bool`: a status request or an audit row emitted WHILE a net install
+/// has failed must not attest to a protection that is not in place. A struct with
+/// optional fields reads as "installed, details missing"; these three variants
+/// cannot be confused for one another by a consumer.
+///
+/// Producer and consumer schemas change together. Must match the `safety_net`
+/// object the TypeScript reader parses on the `kernel_runtime_lost` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SafetyNetAuditState {
+    /// The net is in the kernel with this exact predicate.
+    Installed {
+        shape: &'static str,
+        reason: &'static str,
+        deny_set_size: usize,
+        deny_set_max: usize,
+        rules: Vec<String>,
+        denied_uids: Vec<u32>,
+        sources: SafetyNetSources,
+        kernel_nd_accepted: Vec<&'static str>,
+        unattestable_packets: &'static str,
+        coverage: &'static str,
+    },
+    /// An install was attempted for this scope and FAILED. No protection is
+    /// claimed.
+    InstallFailed {
+        attempted_scope: String,
+        error: String,
+    },
+    /// No install was attempted on this path (both nft-indeterminate rows).
+    NotAttempted,
+}
+
+/// Which of the three sources contributed to the deny set, so a reader can tell a
+/// set recovered from the journal from one recovered only from the live table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyNetSources {
+    pub journal: bool,
+    pub manifest: bool,
+    pub live_table: bool,
+}
+
+/// What the net does with a packet whose sending credential the kernel cannot
+/// attest. Named so the audit row and the doc comment cannot drift apart.
+pub const SAFETY_NET_UNATTESTABLE_DISPOSITION: &str = "drop-except-kernel-nd";
+
+/// The net's coverage limit, stated on every audit row that claims the net is
+/// installed. The net sits on the same hook as the wall, so a packet socket
+/// transmits below it; that bound is the launcher's to close, not this net's.
+pub const SAFETY_NET_COVERAGE_BOUND: &str = "inet output hook; packet sockets are outside it";
+
+impl SafetyNetAuditState {
+    /// Build the `Installed` state for a scope that is now in the kernel.
+    #[cfg(any(target_os = "linux", test))]
+    pub fn installed(
+        scope: &SafetyNetScope,
+        reason: &SafetyNetReason,
+        sources: SafetyNetSources,
+    ) -> Self {
+        let denied_uids = scope.denied_uids();
+        // The rule texts come from the SAME builder that produced the
+        // transaction, so the audit row cannot describe a predicate other than
+        // the one installed.
+        let rules: Vec<String> = build_deny_all_safety_net_script(scope)
+            .lines()
+            .filter(|line| line.starts_with("add rule "))
+            .map(|line| line.to_string())
+            .collect();
+        SafetyNetAuditState::Installed {
+            shape: scope.shape_tag(),
+            reason: reason.tag(),
+            deny_set_size: denied_uids.len(),
+            deny_set_max: DENY_SET_MAX,
+            rules,
+            denied_uids,
+            sources,
+            kernel_nd_accepted: match scope {
+                SafetyNetScope::Identity(_) => KERNEL_ND_ICMPV6_TYPES.to_vec(),
+                // The host-wide shape carries no rules at all, so it accepts no
+                // neighbour discovery either. Saying so is the honest row.
+                SafetyNetScope::HostWide => Vec::new(),
+            },
+            unattestable_packets: SAFETY_NET_UNATTESTABLE_DISPOSITION,
+            coverage: SAFETY_NET_COVERAGE_BOUND,
+        }
+    }
+
+    /// The tag a consumer switches on.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            SafetyNetAuditState::Installed { .. } => "installed",
+            SafetyNetAuditState::InstallFailed { .. } => "install_failed",
+            SafetyNetAuditState::NotAttempted => "not_attempted",
+        }
+    }
+
+    /// Render as the JSON object the WAL row and the signed report embed.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            SafetyNetAuditState::Installed {
+                shape,
+                reason,
+                deny_set_size,
+                deny_set_max,
+                rules,
+                denied_uids,
+                sources,
+                kernel_nd_accepted,
+                unattestable_packets,
+                coverage,
+            } => serde_json::json!({
+                "state": "installed",
+                "shape": shape,
+                "reason": reason,
+                "deny_set_size": deny_set_size,
+                "deny_set_max": deny_set_max,
+                "rules": rules,
+                "denied_uids": denied_uids,
+                "sources": {
+                    "journal": sources.journal,
+                    "manifest": sources.manifest,
+                    "live_table": sources.live_table,
+                },
+                "kernel_nd_accepted": kernel_nd_accepted,
+                "unattestable_packets": unattestable_packets,
+                "coverage": coverage,
+            }),
+            SafetyNetAuditState::InstallFailed {
+                attempted_scope,
+                error,
+            } => serde_json::json!({
+                "state": "install_failed",
+                "attempted_scope": attempted_scope,
+                "error": error,
+            }),
+            SafetyNetAuditState::NotAttempted => serde_json::json!({ "state": "not_attempted" }),
+        }
+    }
+}
+
+/// Render an nft set literal (`{ a, b }`) from ascending uids.
+///
+/// Gated the same way as its only caller, `build_deny_all_safety_net_script`:
+/// production-used on Linux and exercised by the cross-platform unit tests, so an
+/// ungated definition is a dead-code diagnostic under `clippy -D warnings` on the
+/// macOS dev lib build.
+#[cfg(any(target_os = "linux", test))]
+fn render_uid_set(uids: &[u32]) -> String {
+    let members: Vec<String> = uids.iter().map(|u| u.to_string()).collect();
+    format!("{{ {} }}", members.join(", "))
+}
+
+/// Build the ONE atomic transaction that arms the safety net for `scope`.
+///
+/// Pure and cross-platform so the exact transaction text, and above all the RULE
+/// ORDER, are unit-testable without a kernel.
+///
+/// INVARIANT, the rule order is the whole carve-out: rule 1 DROPS every
+/// attestable packet of the confined identity FIRST, so no later accept is
+/// reachable by an agent packet the kernel can attribute (including one sent on
+/// an `AF_INET`/`AF_INET6` raw or ping socket). Rule 2 then accepts the kernel's
+/// own neighbour-discovery messages, which carry no socket at all and therefore
+/// cannot be the agent's. Rule 3 accepts every other attestable principal, which
+/// is what keeps root, sshd and an ordinary human user's sockets alive. Reorder
+/// these and the net either denies the operator or lets the agent out; a
+/// reordered table is refused by the recogniser for exactly that reason.
+///
+/// Everything the three rules do not match falls to the chain's `policy drop`:
+/// an unattestable packet that is not kernel neighbour discovery (a closed
+/// socket's queued bytes with no file attached, a TIME_WAIT or orphaned socket,
+/// an ICMP error, an outbound packet-too-big) is DROPPED. That is deliberate,
+/// and it is why rule 2 exists at all.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn build_deny_all_safety_net_script(scope: &SafetyNetScope) -> String {
+    let castle_table = castle_table();
+    // add (ensure exists) -> delete (drop any drifted/leftover contents of OUR
+    // named table) -> add (fresh empty) -> base output chain, policy DROP. One
+    // transaction, so the kernel never observes the intermediate empty state:
+    // there is NO fail-open window between the teardown and the drop policy.
+    let mut script = format!(
+        "add table {CASTLE_FAMILY} {castle_table}\n\
+         delete table {CASTLE_FAMILY} {castle_table}\n\
+         add table {CASTLE_FAMILY} {castle_table}\n\
+         add chain {CASTLE_FAMILY} {castle_table} output \
+         {{ type filter hook output priority 0 ; policy drop ; }}\n"
+    );
+    if let SafetyNetScope::Identity(set) = scope {
+        let uid_set = render_uid_set(&set.uids());
+        let nd_types = KERNEL_ND_ICMPV6_TYPES.join(", ");
+        script.push_str(&format!(
+            "add rule {CASTLE_FAMILY} {castle_table} output meta skuid {uid_set} drop \
+             comment \"{NET_RULE_COMMENT_IDENTITY}\"\n\
+             add rule {CASTLE_FAMILY} {castle_table} output icmpv6 type {{ {nd_types} }} accept \
+             comment \"{NET_RULE_COMMENT_KERNEL_ND}\"\n\
+             add rule {CASTLE_FAMILY} {castle_table} output meta skuid != {uid_set} accept \
+             comment \"{NET_RULE_COMMENT_OTHERS}\"\n"
+        ));
+    }
+    script
+}
 
 /// nft's hard cap on a rule `comment`, in bytes (confirmed on nft 1.0.9). A
 /// comment over this is rejected at rule-load time, so every marker-bound
@@ -838,20 +1225,20 @@ mod linux {
     /// defect this net exists to prevent. The safety net's contract is "guarantee
     /// deny-all regardless of what currently holds the name," so add-delete-add is
     /// deliberate, not a bug to be narrowed.
-    pub fn install_deny_all_safety_net_impl() -> Result<(), NftablesError> {
-        let castle_table = castle_table();
-        // add (ensure exists) -> delete (drop any drifted/leftover contents of
-        // OUR named table) -> add (fresh empty) -> base output chain, policy DROP.
-        let script = format!(
-            "add table {CASTLE_FAMILY} {castle_table}\n\
-             delete table {CASTLE_FAMILY} {castle_table}\n\
-             add table {CASTLE_FAMILY} {castle_table}\n\
-             add chain {CASTLE_FAMILY} {castle_table} output \
-             {{ type filter hook output priority 0 ; policy drop ; }}\n"
-        );
+    pub fn install_deny_all_safety_net_impl(scope: &SafetyNetScope) -> Result<(), NftablesError> {
+        // The rule text, and above all the rule ORDER, comes from the shared pure
+        // builder so the transaction this installs is byte-identical to the one
+        // the unit tests assert. Must match `build_deny_all_safety_net_script`.
+        let script = super::build_deny_all_safety_net_script(scope);
         run_nft_stdin(&script).map_err(|err| {
+            let scope_text = match scope {
+                SafetyNetScope::Identity(set) => {
+                    format!("the confined identity {:?}", set.uids())
+                }
+                SafetyNetScope::HostWide => "every uid on this host".to_string(),
+            };
             NftablesError::InvocationFailed(format!(
-                "failed to install the GF1 deny-all safety net (kernel egress \
+                "failed to install the deny-all safety net for {scope_text} (kernel egress \
                  state for the owned scopes may be indeterminate): {err}"
             ))
         })
@@ -862,12 +1249,44 @@ mod linux {
     /// or an nft error reads as "not the net" (false / propagated error), so a
     /// caller only ever recovers on a positively-recognized fail-closed net.
     pub fn live_table_is_deny_all_safety_net_impl() -> Result<bool, NftablesError> {
+        // FAIL CLOSED on the recogniser's inputs: without the host's configured
+        // overflow uid the member revalidation cannot run, and an unrecognised
+        // table is the conservative answer (the caller neither resets nor deletes
+        // it). Must match the three-refusal contract in `crate::safety_net_uid`.
+        let overflow = match HostOverflowUid::from_host() {
+            Ok(value) => value,
+            Err(err) => {
+                return Err(NftablesError::InvocationFailed(format!(
+                    "cannot classify the live table without this host's configured \
+                     kernel.overflowuid: {err}"
+                )))
+            }
+        };
         match run_nft(&["-j", "list", "table", CASTLE_FAMILY, castle_table()]) {
-            Ok(json) => Ok(super::is_deny_all_safety_net_json(&json)),
+            Ok(json) => Ok(super::is_deny_all_safety_net_json(&json, overflow)),
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
             {
                 Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List the live castle table as `nft -j` JSON, or `None` when it is absent.
+    ///
+    /// FAILURE-MODE NOTE: nft reports an absent table as an invocation failure whose
+    /// stderr names the missing file or object, so absence must be recognised from
+    /// that text and mapped to `None`. Treating it as an error would make the safety
+    /// net read "no table" as "unreadable" and lose source (c) on every fresh host.
+    /// Must match the same recognition in `live_table_is_deny_all_safety_net_impl`.
+    pub fn list_castle_table_json_impl() -> Result<Option<String>, NftablesError> {
+        match run_nft(&["-j", "list", "table", CASTLE_FAMILY, castle_table()]) {
+            Ok(json) => Ok(Some(json)),
+            Err(NftablesError::InvocationFailed(msg))
+                if msg.contains("No such file or directory") || msg.contains("does not exist") =>
+            {
+                Ok(None)
             }
             Err(e) => Err(e),
         }
@@ -1006,7 +1425,15 @@ mod linux {
         expectation: &super::ExpectedAgentBinding,
     ) -> Result<Vec<String>, NftablesError> {
         let json = run_nft(&["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
-        let live = super::parse_owned_table_inventory(&json, expectation)?;
+        // This caller needs BOTH phases: it is a pre-mutation ownership
+        // precondition, so a drifted binding must refuse. Must match the polarity
+        // in `parse_owned_table_identity`.
+        let live = match super::parse_owned_table_inventory_phases(&json, expectation)? {
+            super::OwnedInventoryPhases::Verified(parsed) => parsed,
+            super::OwnedInventoryPhases::UidMismatch { detail, .. } => {
+                return Err(NftablesError::ForeignState(detail))
+            }
+        };
         if &live.ownership == ownership {
             Ok(live.agent_ids)
         } else {
@@ -1197,6 +1624,25 @@ mod linux {
                 binding.agent_uid, binding.system_uid_allow_ceiling
             )));
         }
+        // INVARIANT: the ceiling floor above STAYS and is not replaced by what
+        // follows. The ceiling proves the uid is outside the system-daemon band;
+        // these three refusals prove the uid names a single attestable principal
+        // at all. They answer different questions, and a uid must clear both
+        // before it is sealed into a kernel rule. Must match the same three
+        // refusals at admission in `crate::policy::confined_agent_uid_from_loaded_manifest`
+        // and the closed-set contract in `crate::safety_net_uid`.
+        let overflow = HostOverflowUid::from_host().map_err(|err| {
+            NftablesError::InvocationFailed(format!(
+                "cannot seal an agent uid into a kernel rule without this host's configured \
+                 kernel.overflowuid: {err}"
+            ))
+        })?;
+        validate_safety_net_uid(binding.agent_uid, overflow).map_err(|err| {
+            NftablesError::InvocationFailed(format!(
+                "agent uid {} may not be sealed into a kernel rule: {err}",
+                binding.agent_uid
+            ))
+        })?;
         Ok(())
     }
 
@@ -1472,26 +1918,46 @@ pub fn output_chain_shape_is_ours_json(json: &str) -> bool {
     found_ours
 }
 
-/// GF1.1: whether an `nft -j list table inet sanctuary-castle` JSON document is
-/// EXACTLY this daemon's deny-all safety net (`install_deny_all_safety_net_impl`
-/// output): one `inet/sanctuary-castle` table with NO owner marker comment, one
-/// base `output` chain (`type filter hook output priority 0`, `policy DROP`), and
-/// NOTHING else -- zero rules, zero agent chains, zero sets/maps.
+/// GF1.1/D2: whether an `nft -j list table inet sanctuary-castle` JSON document is
+/// EXACTLY this daemon's deny-all safety net, in either of its two permanent
+/// shapes, as `build_deny_all_safety_net_script` emits them.
 ///
-/// This is the recognizer for the create-failure recovery state. When the
-/// authenticated journal is `Preparing` for THIS boot but `capture` fails, the
-/// live table being this exact fail-CLOSED net (never any shape the owned path
-/// emits, which is always `policy accept`) is what distinguishes "our own
-/// half-finished acquisition that ReArmLostOwned armed" from a foreign table.
-/// Combined with the authenticated Preparing-this-boot journal at the call site,
-/// it is the "this boot + source" proof that the daemon created this net, so
-/// recovery may reset/clear it. Residual (a foreign actor swapping in an
-/// identical-shape `policy drop` net in the window) is the inherent CAP_NET_ADMIN
-/// bound documented on `install_deny_all_safety_net_impl` (GF1.4), and is
-/// fail-CLOSED either way.
+/// Both shapes require ONE `inet/sanctuary-castle` table with NO table `comment`
+/// key at all, and ONE base `output` chain (`type filter hook output priority 0`,
+/// `policy drop`). They differ only in the rules:
 ///
-/// Pure and cross-platform so the recognizer is unit-testable without a kernel.
-pub fn is_deny_all_safety_net_json(json: &str) -> bool {
+///   * the V2 identity shape: exactly the three rules of `D1`, IN ORDER, each
+///     carrying its own comment constant, with rule 1's and rule 3's uid sets
+///     EQUAL, non-empty, and every member passing the shared three-refusal
+///     validator;
+///   * the V1 host-wide shape: zero rules.
+///
+/// Anything else is "not the net": refuse, never recover.
+///
+/// INVARIANT, why the table comment must be ABSENT and not merely
+/// non-`OWNER_MARKER_PREFIX`: this predicate is what authorises the disarm verb's
+/// recovery arm to DELETE a live table by name. `build_deny_all_safety_net_script`
+/// stamps no table comment on either shape, so a `policy drop` table carrying ANY
+/// comment was armed by something other than this daemon and must not be deleted
+/// as if it were ours. Reading only the owner prefix here would accept a
+/// zero-rule `policy drop` table with a foreign comment.
+///
+/// INVARIANT, why the members are revalidated: the installer type cannot produce
+/// a set containing `0`, this host's `kernel.overflowuid` or `u32::MAX`, so a live
+/// table whose set carries one of those was not armed by this daemon however
+/// well-formed the rest of it looks. Accepting it would let the recovery arm
+/// delete a table this daemon could not have installed. `overflow` is the host's
+/// own configured value; a caller that cannot read it must treat the table as NOT
+/// the net, which is the conservative side (no delete, no reset).
+///
+/// Residual, accepted and unchanged from v1: a foreign actor holding
+/// `CAP_NET_ADMIN` can swap in an identical-shape table in the window between
+/// this recognition and the caller's next transaction. That is the inherent bound
+/// documented on `install_deny_all_safety_net_impl`, and it is fail-CLOSED either
+/// way.
+///
+/// Pure and cross-platform so the recogniser is unit-testable without a kernel.
+pub fn is_deny_all_safety_net_json(json: &str, overflow: HostOverflowUid) -> bool {
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
         return false;
     };
@@ -1500,6 +1966,7 @@ pub fn is_deny_all_safety_net_json(json: &str) -> bool {
     };
     let mut saw_table = false;
     let mut saw_drop_base_chain = false;
+    let mut rules: Vec<&serde_json::Value> = Vec::new();
     for item in items {
         let Some(obj) = item.as_object() else {
             return false;
@@ -1516,14 +1983,10 @@ pub fn is_deny_all_safety_net_json(json: &str) -> bool {
                     }
                     let ours = val.get("family").and_then(|v| v.as_str()) == Some(CASTLE_FAMILY)
                         && val.get("name").and_then(|v| v.as_str()) == Some(castle_table());
-                    // The net is UNMARKED by construction; an owner marker here
-                    // means this is NOT the bare safety net (it would be a captured
-                    // owned table, handled by the normal parser instead).
-                    let has_owner_marker = val
-                        .get("comment")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|c| c.starts_with(OWNER_MARKER_PREFIX));
-                    if !ours || has_owner_marker {
+                    // Neither net shape carries a table comment, so ANY comment
+                    // here (owner-prefixed or foreign) means this is not our net.
+                    let has_any_comment = val.get("comment").is_some();
+                    if !ours || has_any_comment {
                         return false;
                     }
                     saw_table = true;
@@ -1545,13 +2008,224 @@ pub fn is_deny_all_safety_net_json(json: &str) -> bool {
                     }
                     saw_drop_base_chain = true;
                 }
-                // A rule, agent chain, set, map, flowtable, or any other object
-                // means this is NOT the bare deny-all net.
+                "rule" => {
+                    let in_our_chain = val.get("family").and_then(|v| v.as_str())
+                        == Some(CASTLE_FAMILY)
+                        && val.get("table").and_then(|v| v.as_str()) == Some(castle_table())
+                        && val.get("chain").and_then(|v| v.as_str()) == Some("output");
+                    if !in_our_chain {
+                        return false;
+                    }
+                    rules.push(val);
+                }
+                // An agent chain, set, map, flowtable, or any other object means
+                // this is NOT the safety net in either shape.
                 _ => return false,
             }
         }
     }
-    saw_table && saw_drop_base_chain
+    if !(saw_table && saw_drop_base_chain) {
+        return false;
+    }
+    match rules.len() {
+        // V1 host-wide shape: zero rules under the drop policy.
+        0 => true,
+        // V2 identity shape: exactly the three rules, in order.
+        NET_V2_RULE_COUNT => net_v2_rules_match(&rules, overflow),
+        // One rule is a shape `build_deny_all_safety_net_script` never emits, and
+        // a fourth rule is drift or injection.
+        _ => false,
+    }
+}
+
+/// Rules in the net's v2 identity shape. Named so the recogniser's arm reads as
+/// "the three rules" rather than as a bare literal.
+/// Must match the rule count `build_deny_all_safety_net_script` emits for
+/// `SafetyNetScope::Identity`.
+const NET_V2_RULE_COUNT: usize = 3;
+
+/// Whether `rules` are EXACTLY the net's three v2 rules, in order.
+///
+/// INVARIANT: order is checked positionally, not by searching for each comment.
+/// A table carrying the same three rules in a different order is a DIFFERENT
+/// enforcement outcome (an accept ahead of the drop lets the agent out), so it
+/// must be refused, which a comment-set comparison would not do.
+fn net_v2_rules_match(rules: &[&serde_json::Value], overflow: HostOverflowUid) -> bool {
+    let Some(denied) =
+        rule_skuid_set_with_verdict(rules[0], "==", "drop", NET_RULE_COMMENT_IDENTITY, overflow)
+    else {
+        return false;
+    };
+    if !rule_is_kernel_nd_accept(rules[1]) {
+        return false;
+    }
+    let Some(excepted) =
+        rule_skuid_set_with_verdict(rules[2], "!=", "accept", NET_RULE_COMMENT_OTHERS, overflow)
+    else {
+        return false;
+    };
+    // INVARIANT: the two sets must be EQUAL. If rule 3 excepted a wider set than
+    // rule 1 denied, a uid in the difference would be accepted by rule 3 having
+    // never been dropped, which is the fail-open the ordering exists to prevent;
+    // a narrower rule 3 would deny an operator the net promised to spare.
+    denied == excepted
+}
+
+/// Parse one `meta skuid <op> { .. } <verdict>` rule and return its set, or
+/// `None` when the rule is not exactly that shape with exactly `comment`.
+///
+/// The returned set is ascending and deduplicated so the caller's equality check
+/// does not depend on the order nft listed the members in.
+fn rule_skuid_set_with_verdict(
+    rule: &serde_json::Value,
+    op: &str,
+    verdict: &str,
+    comment: &str,
+    overflow: HostOverflowUid,
+) -> Option<Vec<u32>> {
+    if rule.get("comment").and_then(|v| v.as_str()) != Some(comment) {
+        return None;
+    }
+    let exprs = rule.get("expr").and_then(|v| v.as_array())?;
+    // Exactly one match and one verdict: a third expression is an extra
+    // condition that narrows or widens what the rule does.
+    if exprs.len() != 2 {
+        return None;
+    }
+    let m = exprs[0].get("match")?;
+    if m.get("op").and_then(|v| v.as_str()) != Some(op) {
+        return None;
+    }
+    // `meta skuid` renders as a nested object; nothing else is accepted, so a
+    // match on any other key (a mark, an interface) is not this rule.
+    let left_key = m.get("left")?.get("meta")?.get("key")?.as_str()?;
+    if left_key != "skuid" {
+        return None;
+    }
+    let members = m.get("right")?.get("set")?.as_array()?;
+    if members.is_empty() {
+        return None;
+    }
+    let mut uids: Vec<u32> = Vec::with_capacity(members.len());
+    for member in members {
+        // `nft -j` without `-u` renders a uid as an integer (the scalar form the
+        // existing owned-table probe pinned on nft 1.0.9); a symbolic name here
+        // is a form this parser deliberately does not read.
+        let raw = member.as_u64()?;
+        let uid = u32::try_from(raw).ok()?;
+        // Revalidate through the shared three-refusal function: the closed
+        // installer type could not have produced 0, the host overflow uid or the
+        // sentinel, so a set carrying one was not armed by this daemon.
+        validate_safety_net_uid(uid, overflow).ok()?;
+        uids.push(uid);
+    }
+    uids.sort_unstable();
+    uids.dedup();
+    // A set that listed a uid twice is not the shape the installer emits (it
+    // deduplicates before rendering).
+    if uids.len() != members.len() {
+        return None;
+    }
+    // The verdict object is a single key with a null value (`{"drop": null}`).
+    let v = exprs[1].as_object()?;
+    if v.len() != 1 || !v.contains_key(verdict) {
+        return None;
+    }
+    Some(uids)
+}
+
+/// Whether `rule` is exactly the kernel neighbour-discovery accept rule.
+///
+/// FAILURE-MODE NOTE for anyone editing this: in the `inet` family nft compiles
+/// `icmpv6 type { .. }` into the payload match PLUS an implicit layer-4 protocol
+/// dependency, so the listed rule can carry a leading `meta l4proto`/`nfproto`
+/// match that the emitter never wrote. That dependency only NARROWS the rule to
+/// ICMPv6 traffic, so it is accepted here; any other extra expression is refused,
+/// because a widening condition on an accept rule ahead of nothing is exactly the
+/// carve-out an agent could aim for. The exact listed form is pinned by the
+/// Linux integration probe (`nft_set_json_forms_are_the_shapes_the_parser_reads`
+/// in `tests/integration_gf1_recovery.rs`), which runs where nft exists; this
+/// tolerance is what keeps the parser honest about a form a macOS builder cannot
+/// observe.
+fn rule_is_kernel_nd_accept(rule: &serde_json::Value) -> bool {
+    if rule.get("comment").and_then(|v| v.as_str()) != Some(NET_RULE_COMMENT_KERNEL_ND) {
+        return false;
+    }
+    let Some(exprs) = rule.get("expr").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    let mut saw_icmpv6_type_set = false;
+    let mut saw_accept = false;
+    for expr in exprs {
+        let Some(obj) = expr.as_object() else {
+            return false;
+        };
+        if obj.len() != 1 {
+            return false;
+        }
+        if let Some(m) = obj.get("match") {
+            let Some(left) = m.get("left") else {
+                return false;
+            };
+            // The implicit protocol dependency nft adds for an `inet`-family
+            // ICMPv6 match: narrowing only, so accepted.
+            if let Some(meta_key) = left
+                .get("meta")
+                .and_then(|v| v.get("key"))
+                .and_then(|v| v.as_str())
+            {
+                if matches!(meta_key, "l4proto" | "nfproto" | "protocol") {
+                    continue;
+                }
+                return false;
+            }
+            let Some(payload) = left.get("payload") else {
+                return false;
+            };
+            let proto_is_icmpv6 =
+                payload.get("protocol").and_then(|v| v.as_str()) == Some("icmpv6");
+            let field_is_type = payload.get("field").and_then(|v| v.as_str()) == Some("type");
+            if !(proto_is_icmpv6 && field_is_type) || saw_icmpv6_type_set {
+                return false;
+            }
+            if m.get("op").and_then(|v| v.as_str()) != Some("==") {
+                return false;
+            }
+            let Some(members) = m
+                .get("right")
+                .and_then(|v| v.get("set"))
+                .and_then(|v| v.as_array())
+            else {
+                return false;
+            };
+            // EXACTLY the three neighbour-discovery types, as a set. An extra
+            // type (an MLD report, an echo request) is a channel the confined
+            // agent may be able to drive, so the check is equality, never
+            // containment.
+            let mut listed: Vec<&str> = Vec::with_capacity(members.len());
+            for member in members {
+                match member.as_str() {
+                    Some(name) => listed.push(name),
+                    None => return false,
+                }
+            }
+            let mut expected: Vec<&str> = KERNEL_ND_ICMPV6_TYPES.to_vec();
+            listed.sort_unstable();
+            expected.sort_unstable();
+            if listed != expected {
+                return false;
+            }
+            saw_icmpv6_type_set = true;
+        } else if obj.contains_key("accept") {
+            if saw_accept {
+                return false;
+            }
+            saw_accept = true;
+        } else {
+            return false;
+        }
+    }
+    saw_icmpv6_type_set && saw_accept
 }
 
 /// Build the atomic nft script that CREATES the owned table + its base output
@@ -1813,6 +2487,46 @@ struct ParsedOwnedTableInventory {
     ownership: CastleTableOwnership,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     agent_ids: Vec<String>,
+    /// Every `agent_id -> uid` binding the owned shape declared, collected BEFORE
+    /// the trusted manifest comparison. This is source (c) of the safety net's
+    /// deny set.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    uid_bindings: std::collections::HashMap<String, u32>,
+}
+
+/// The TWO-PHASE result of parsing an owned-table inventory.
+///
+/// PHASE ONE is everything the kernel dump can prove about itself plus the
+/// ownership marker: shape, marker, handles, seal recomputation, body/jump
+/// agreement and cardinality. PHASE TWO is the single check whose input did NOT
+/// come from the dump: comparing the live uid against the uid the current signed
+/// manifest confines.
+///
+/// The two are separated because the safety net needs the uid bindings of a table
+/// that IS this daemon's own owned table but whose binding has drifted off the
+/// current manifest. Such a table is exactly the drift case the net exists for: a
+/// rotated-away uid may still have live processes, so its uid must enter the DENY
+/// set. Collapsing the two phases into one `Err` discarded those bindings and
+/// narrowed the net.
+///
+/// INVARIANT: a `Bindings` value is only ever produced after PHASE ONE has passed
+/// IN FULL. A structurally foreign table, a marker or handle mismatch, a malformed
+/// pairing or a seal failure is an `Err` and yields NOTHING, and a failure that
+/// lands after some bindings were already collected (a valid binding followed by a
+/// foreign rule) is also an `Err`, so no partial set escapes. Must match the
+/// late-failure test `owned_inventory_exposes_no_partial_binding_set_on_a_late_failure`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum OwnedInventoryPhases {
+    /// Both phases passed.
+    Verified(ParsedOwnedTableInventory),
+    /// Phase one passed IN FULL; phase two (the trusted uid comparison) failed.
+    /// The bindings are trustworthy as "what this owned table routes", which is
+    /// all source (c) claims, and `detail` is the refusal a caller that needs
+    /// phase two must still surface.
+    UidMismatch {
+        inventory: ParsedOwnedTableInventory,
+        detail: String,
+    },
 }
 
 /// Parse an owned-table inventory and check it against `expectation`.
@@ -1823,10 +2537,10 @@ struct ParsedOwnedTableInventory {
 /// expressions and both comments can also achieve. Only
 /// [`ExpectedAgentBinding::Confined`] compares the live uid against a value this
 /// process did not read out of the kernel.
-fn parse_owned_table_inventory(
+fn parse_owned_table_inventory_phases(
     json: &str,
     expectation: &ExpectedAgentBinding,
-) -> Result<ParsedOwnedTableInventory, NftablesError> {
+) -> Result<OwnedInventoryPhases, NftablesError> {
     let doc: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| NftablesError::ForeignState(format!("nft -j output did not parse: {e}")))?;
     let items = doc
@@ -2013,6 +2727,10 @@ fn parse_owned_table_inventory(
     let mut body_counts = std::collections::HashMap::<String, usize>::new();
     let mut jump_counts = std::collections::HashMap::<String, usize>::new();
     let mut uid_bindings = std::collections::HashMap::<String, u32>::new();
+    // The deferred PHASE TWO refusal. Only the FIRST mismatch is kept: the detail
+    // names the earliest drifted binding, and a later one adds nothing a caller
+    // acts on.
+    let mut pending_uid_mismatch: Option<String> = None;
     for (chain, comment, expr) in owned_rules {
         let is_jump = chain == "output";
         let fail_closed = !is_jump && comment.contains(":failclosed:");
@@ -2102,12 +2820,19 @@ fn parse_owned_table_inventory(
             // did not come from the kernel dump, so it is the only one a
             // self-consistent forgery cannot satisfy.
             if let ExpectedAgentBinding::Confined { agent_uid, .. } = expectation {
-                if expr_uid != *agent_uid {
-                    return Err(NftablesError::ForeignState(format!(
+                if expr_uid != *agent_uid && pending_uid_mismatch.is_none() {
+                    // PHASE TWO failure, DEFERRED rather than returned here. The
+                    // rest of phase one (cardinality, body/jump agreement, the
+                    // remaining rules) must still run, because a `Bindings` result
+                    // is only honest if the WHOLE owned shape passed. Every caller
+                    // that needs phase two still refuses; the safety net is the one
+                    // consumer that needs the bindings of a drifted-but-ours table,
+                    // since a rotated-away uid may still have live processes.
+                    pending_uid_mismatch = Some(format!(
                         "agent {agent_id:?} skuid match {expr_uid} is not the uid the current \
                          signed manifest confines ({agent_uid}); a live binding that routes \
                          a different uid is refused fail-closed"
-                    )));
+                    ));
                 }
             }
         } else if declared_seal.is_some() {
@@ -2147,14 +2872,21 @@ fn parse_owned_table_inventory(
     }
     let mut agent_ids: Vec<String> = agent_chains.into_values().collect();
     agent_ids.sort_unstable();
-    Ok(ParsedOwnedTableInventory {
+    let inventory = ParsedOwnedTableInventory {
         ownership: CastleTableOwnership {
             table_handle,
             base_chain_handle,
             marker,
         },
         agent_ids,
-    })
+        uid_bindings,
+    };
+    // Phase one has now passed IN FULL (every rule read, every pairing and count
+    // checked), so a deferred phase-two failure may safely expose the bindings.
+    match pending_uid_mismatch {
+        None => Ok(OwnedInventoryPhases::Verified(inventory)),
+        Some(detail) => Ok(OwnedInventoryPhases::UidMismatch { inventory, detail }),
+    }
 }
 
 /// Pure parser used by health and ownership checks. Parsing untrusted inventory
@@ -2163,7 +2895,85 @@ pub fn parse_owned_table_identity(
     json: &str,
     expectation: &ExpectedAgentBinding,
 ) -> Result<CastleTableOwnership, NftablesError> {
-    parse_owned_table_inventory(json, expectation).map(|parsed| parsed.ownership)
+    // POLARITY UNCHANGED for every existing caller: a phase-two uid mismatch is
+    // still a refusal here, with the same message. Only the safety-net resolver
+    // reads the two phases apart, through `parse_owned_table_inventory_phases`.
+    match parse_owned_table_inventory_phases(json, expectation)? {
+        OwnedInventoryPhases::Verified(parsed) => Ok(parsed.ownership),
+        OwnedInventoryPhases::UidMismatch { detail, .. } => {
+            Err(NftablesError::ForeignState(detail))
+        }
+    }
+}
+
+/// List the live `sanctuary-castle` table as `nft -j` JSON, or `None` when no such
+/// table exists.
+///
+/// Absence is `Ok(None)`, not an error: "there is no table" and "the table could
+/// not be read" resolve the safety net's source (c) differently, so they must not
+/// arrive as the same value.
+#[cfg(target_os = "linux")]
+pub fn list_castle_table_json() -> Result<Option<String>, NftablesError> {
+    linux::list_castle_table_json_impl()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn list_castle_table_json() -> Result<Option<String>, NftablesError> {
+    Err(NftablesError::NotAvailableOnPlatform)
+}
+
+/// Source (c) of the safety net's deny set: the `meta skuid` bindings the LIVE
+/// owned table declares.
+///
+/// INVARIANT on the three arms, and why each is distinct: `Bindings` comes only
+/// from a table whose whole owned shape passed, so the uids are what this
+/// daemon's own table routes. `NotOurTable` is a structurally foreign or
+/// ownership-mismatched table, which yields NOTHING; an identity-parser error is
+/// NEVER read as "the table has no bindings", because those two would resolve the
+/// net to different scopes. `Unreadable` keeps the reason so the audit row's
+/// `sources` field can say the live table was not consulted rather than implying
+/// it was empty.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveTableBindings {
+    /// The owned shape passed; these are its declared uids, ascending.
+    Bindings(Vec<u32>),
+    /// The live table is not this daemon's owned table. No uids.
+    NotOurTable { detail: String },
+    /// The live table could not be read at all. No uids, and the reason is kept.
+    Unreadable { detail: String },
+}
+
+/// Read source (c) from an owned-table listing.
+///
+/// Pure over the JSON so every arm is unit-testable without a kernel.
+#[cfg(any(target_os = "linux", test))]
+pub fn live_table_uid_bindings(
+    json: &str,
+    expectation: &ExpectedAgentBinding,
+) -> LiveTableBindings {
+    match parse_owned_table_inventory_phases(json, expectation) {
+        Ok(OwnedInventoryPhases::Verified(parsed)) => {
+            LiveTableBindings::Bindings(sorted_bindings(&parsed))
+        }
+        // A table that IS ours but whose binding drifted off the current manifest
+        // is exactly the case the net exists for: the drifted uid may still have
+        // live processes, so it must be DENIED even though the binding is refused.
+        Ok(OwnedInventoryPhases::UidMismatch { inventory, .. }) => {
+            LiveTableBindings::Bindings(sorted_bindings(&inventory))
+        }
+        Err(err) => LiveTableBindings::NotOurTable {
+            detail: err.to_string(),
+        },
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn sorted_bindings(parsed: &ParsedOwnedTableInventory) -> Vec<u32> {
+    let mut uids: Vec<u32> = parsed.uid_bindings.values().copied().collect();
+    uids.sort_unstable();
+    uids.dedup();
+    uids
 }
 
 // ---- Public API (platform-dispatching) ------------------------------------
@@ -2195,12 +3005,12 @@ pub fn install_castle_table() -> Result<(), NftablesError> {
 /// identity: deny-all is installed BEFORE the acquisition refuses, so the loop
 /// is fail-closed and `policy accept` is never left in force for a live agent.
 #[cfg(target_os = "linux")]
-pub fn install_deny_all_safety_net() -> Result<(), NftablesError> {
-    linux::install_deny_all_safety_net_impl()
+pub fn install_deny_all_safety_net(scope: &SafetyNetScope) -> Result<(), NftablesError> {
+    linux::install_deny_all_safety_net_impl(scope)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn install_deny_all_safety_net() -> Result<(), NftablesError> {
+pub fn install_deny_all_safety_net(_scope: &SafetyNetScope) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
 
@@ -2953,11 +3763,17 @@ mod tests {
         let marker = fixture_marker();
         let mark = crate::nfqueue::agent_mark("agent-one");
         let before = crate::nfqueue::resolve_agent_mark(mark);
-        let parsed = parse_owned_table_inventory(
+        let parsed = parse_owned_table_inventory_phases(
             &owned_agent_json(&marker, true, true),
             &fixture_expectation(),
         )
         .expect("complete inventory");
+        let parsed = match parsed {
+            OwnedInventoryPhases::Verified(inventory) => inventory,
+            OwnedInventoryPhases::UidMismatch { .. } => {
+                panic!("this fixture matches the manifest, so phase two passes")
+            }
+        };
         assert_eq!(parsed.agent_ids, vec!["agent-one".to_string()]);
         assert_eq!(
             crate::nfqueue::resolve_agent_mark(mark),
@@ -3141,40 +3957,283 @@ mod tests {
         .expect("an all-digit skuid value is the NORMAL owned shape, never a refusal trigger");
     }
 
-    #[test]
-    fn deny_all_safety_net_recognizer_accepts_only_the_bare_drop_net() {
-        // The exact shape `install_deny_all_safety_net_impl` produces: one unmarked
-        // inet/sanctuary-castle table + one base output chain, policy DROP, nothing
-        // else. This is the GF1.1 create-failure recovery recognizer.
-        let net = r#"{"nftables":[
+    /// The overflow uid the recogniser and scope tests validate against. A real
+    /// default, so the fixtures read like a host rather than like a number picked
+    /// to pass.
+    const TEST_HOST_OVERFLOW_UID: u32 = 65534;
+
+    fn test_overflow() -> HostOverflowUid {
+        HostOverflowUid::from_value(TEST_HOST_OVERFLOW_UID)
+    }
+
+    /// Build a `SafetyNetScope::Identity` through the only admitted path.
+    fn identity_scope(uids: &[u32]) -> SafetyNetScope {
+        let validated = uids
+            .iter()
+            .map(|&uid| {
+                validate_safety_net_uid(uid, test_overflow()).expect("fixture uid is attestable")
+            })
+            .collect::<Vec<_>>();
+        SafetyNetScope::Identity(
+            ConfinedUidSet::from_validated(validated).expect("fixture set is non-empty"),
+        )
+    }
+
+    /// The v1 host-wide listing: one unmarked table, one `policy drop` base
+    /// chain, zero rules.
+    fn v1_host_wide_listing() -> String {
+        r#"{"nftables":[
             {"metainfo":{"version":"1.0.9","json_schema_version":1}},
             {"table":{"family":"inet","name":"sanctuary-castle","handle":7}},
             {"chain":{"family":"inet","table":"sanctuary-castle","name":"output","handle":1,
               "type":"filter","hook":"output","prio":0,"policy":"drop"}}
-        ]}"#;
-        assert!(is_deny_all_safety_net_json(net));
+        ]}"#
+        .to_string()
+    }
 
-        // A `policy accept` base (the owned shape) is NOT the deny-all net.
-        assert!(!is_deny_all_safety_net_json(
-            &net.replace("\"drop\"", "\"accept\"")
+    /// The v2 identity listing, with each rule's set independently specifiable so
+    /// the unequal-set case can be constructed.
+    fn v2_identity_listing(denied: &[u32], excepted: &[u32]) -> String {
+        let set = |uids: &[u32]| {
+            uids.iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let nd_types = KERNEL_ND_ICMPV6_TYPES
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"nftables":[
+            {{"metainfo":{{"version":"1.0.9","json_schema_version":1}}}},
+            {{"table":{{"family":"inet","name":"sanctuary-castle","handle":7}}}},
+            {{"chain":{{"family":"inet","table":"sanctuary-castle","name":"output","handle":1,
+              "type":"filter","hook":"output","prio":0,"policy":"drop"}}}},
+            {{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":11,
+              "comment":"{identity}",
+              "expr":[{{"match":{{"op":"==","left":{{"meta":{{"key":"skuid"}}}},"right":{{"set":[{denied_set}]}}}}}},
+                      {{"drop":null}}]}}}},
+            {{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":12,
+              "comment":"{nd}",
+              "expr":[{{"match":{{"op":"==","left":{{"payload":{{"protocol":"icmpv6","field":"type"}}}},"right":{{"set":[{nd_types}]}}}}}},
+                      {{"accept":null}}]}}}},
+            {{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":13,
+              "comment":"{others}",
+              "expr":[{{"match":{{"op":"!=","left":{{"meta":{{"key":"skuid"}}}},"right":{{"set":[{excepted_set}]}}}}}},
+                      {{"accept":null}}]}}}}
+        ]}}"#,
+            identity = NET_RULE_COMMENT_IDENTITY,
+            nd = NET_RULE_COMMENT_KERNEL_ND,
+            others = NET_RULE_COMMENT_OTHERS,
+            denied_set = set(denied),
+            excepted_set = set(excepted),
+        )
+    }
+
+    #[test]
+    fn identity_scope_transaction_text_has_the_three_rules_in_order() {
+        let script = build_deny_all_safety_net_script(&identity_scope(&[60124, 60123]));
+        let rule_lines: Vec<&str> = script
+            .lines()
+            .filter(|line| line.starts_with("add rule "))
+            .collect();
+        assert_eq!(
+            rule_lines.len(),
+            NET_V2_RULE_COUNT,
+            "the identity net is exactly three rules: {script}"
+        );
+        // ORDER is the invariant: drop the confined identity FIRST, then the
+        // kernel's own neighbour discovery, then every other principal.
+        assert!(
+            rule_lines[0].contains("meta skuid { 60123, 60124 } drop")
+                && rule_lines[0].contains(NET_RULE_COMMENT_IDENTITY),
+            "rule 1: {}",
+            rule_lines[0]
+        );
+        assert!(
+            rule_lines[1].contains(
+                "icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit } accept"
+            ) && rule_lines[1].contains(NET_RULE_COMMENT_KERNEL_ND),
+            "rule 2: {}",
+            rule_lines[1]
+        );
+        assert!(
+            rule_lines[2].contains("meta skuid != { 60123, 60124 } accept")
+                && rule_lines[2].contains(NET_RULE_COMMENT_OTHERS),
+            "rule 3: {}",
+            rule_lines[2]
+        );
+        // MLD is not in the carve-out; an accepted MLD report would be a
+        // link-local channel an unprivileged multicast join can drive.
+        assert!(
+            !script.contains("mld"),
+            "MLD must not be accepted: {script}"
+        );
+        // Still one transaction with the add-delete-add fresh table and the drop
+        // policy, so no fail-open window exists between teardown and enforcement.
+        assert!(script.contains("policy drop"));
+        assert!(script.contains("delete table inet sanctuary-castle"));
+    }
+
+    #[test]
+    fn host_wide_scope_transaction_text_has_no_rules() {
+        let script = build_deny_all_safety_net_script(&SafetyNetScope::HostWide);
+        assert!(
+            !script.contains("add rule "),
+            "the host-wide shape is the bare drop policy: {script}"
+        );
+        assert!(script.contains("policy drop"));
+        assert_eq!(SafetyNetScope::HostWide.denied_uids(), Vec::<u32>::new());
+        assert_eq!(SafetyNetScope::HostWide.shape_tag(), "v1-host-wide");
+        assert_eq!(identity_scope(&[60123]).shape_tag(), "v2-confined-identity");
+    }
+
+    #[test]
+    fn deny_all_safety_net_recognizer_accepts_both_permanent_shapes() {
+        let v1 = v1_host_wide_listing();
+        assert!(is_deny_all_safety_net_json(&v1, test_overflow()));
+        let v2 = v2_identity_listing(&[60123, 60124], &[60123, 60124]);
+        assert!(is_deny_all_safety_net_json(&v2, test_overflow()));
+        // Set member order in the listing must not decide recognition.
+        let reordered_members = v2_identity_listing(&[60124, 60123], &[60123, 60124]);
+        assert!(is_deny_all_safety_net_json(
+            &reordered_members,
+            test_overflow()
         ));
-        // A table carrying an owner marker is a captured owned table, not the net.
-        let marked = net.replace(
+    }
+
+    #[test]
+    fn deny_all_safety_net_recognizer_refuses_every_near_miss() {
+        let v1 = v1_host_wide_listing();
+        let v2 = v2_identity_listing(&[60123, 60124], &[60123, 60124]);
+        let ov = test_overflow();
+
+        // A `policy accept` base (the owned shape) is NOT the net, in either shape.
+        assert!(!is_deny_all_safety_net_json(
+            &v1.replace("\"drop\"", "\"accept\""),
+            ov
+        ));
+        assert!(!is_deny_all_safety_net_json(
+            &v2.replace("\"policy\":\"drop\"", "\"policy\":\"accept\""),
+            ov
+        ));
+        // A table carrying an owner marker is a captured owned table.
+        let owner_marked = v1.replace(
             "\"name\":\"sanctuary-castle\",\"handle\":7",
             "\"name\":\"sanctuary-castle\",\"handle\":7,\"comment\":\"sanctuary-castle-owner:v1:deadbeef\"",
         );
-        assert!(!is_deny_all_safety_net_json(&marked));
-        // Any extra rule means it is not the BARE net.
-        let with_rule = net.replace(
-            "\"policy\":\"drop\"}}",
-            "\"policy\":\"drop\"}},{\"rule\":{\"family\":\"inet\",\"table\":\"sanctuary-castle\",\"chain\":\"output\",\"handle\":9,\"expr\":[{\"accept\":null}]}}",
+        assert!(!is_deny_all_safety_net_json(&owner_marked, ov));
+        // Neither net shape stamps a table comment, so a zero-rule `policy drop`
+        // table carrying any table comment is not the net; the disarm recovery
+        // arm relies on this refusal (PR-2's matrix case (h) names this fixture).
+        let foreign_comment = v1.replace(
+            "\"name\":\"sanctuary-castle\",\"handle\":7",
+            "\"name\":\"sanctuary-castle\",\"handle\":7,\"comment\":\"someone-elses-drop-table\"",
         );
-        assert!(!is_deny_all_safety_net_json(&with_rule));
-        // A wrong family/name table is not ours.
+        assert!(!is_deny_all_safety_net_json(&foreign_comment, ov));
+        let v2_foreign_comment = v2.replace(
+            "\"name\":\"sanctuary-castle\",\"handle\":7",
+            "\"name\":\"sanctuary-castle\",\"handle\":7,\"comment\":\"someone-elses-drop-table\"",
+        );
+        assert!(!is_deny_all_safety_net_json(&v2_foreign_comment, ov));
+
+        // A REORDERED v2 is a different enforcement outcome (an accept ahead of the
+        // drop lets the agent out), so recognition is positional and a swap must be
+        // refused rather than normalised. Swapping the two skuid rules' comments
+        // puts the `!=` accept in position 1 and the `==` drop in position 3.
+        let swapped = v2
+            .replace(NET_RULE_COMMENT_IDENTITY, "@@RULE1@@")
+            .replace(NET_RULE_COMMENT_OTHERS, NET_RULE_COMMENT_IDENTITY)
+            .replace("@@RULE1@@", NET_RULE_COMMENT_OTHERS);
+        assert!(!is_deny_all_safety_net_json(&swapped, ov));
+
+        // The ND accept rule MISSING (two rules) is not the three-rule shape.
+        let nd_removed: String = v2
+            .lines()
+            .filter(|line| !line.contains(NET_RULE_COMMENT_KERNEL_ND))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!is_deny_all_safety_net_json(&nd_removed, ov));
+
+        // UNEQUAL sets: rule 3 excepting a uid rule 1 never dropped is the
+        // fail-open the ordering exists to prevent.
         assert!(!is_deny_all_safety_net_json(
-            &net.replace("sanctuary-castle", "sanctuary-castle-test-x")
+            &v2_identity_listing(&[60123, 60124], &[60123]),
+            ov
         ));
-        assert!(!is_deny_all_safety_net_json("not json"));
+        assert!(!is_deny_all_safety_net_json(
+            &v2_identity_listing(&[60123], &[60123, 60124]),
+            ov
+        ));
+
+        // A FOURTH rule is drift or injection, even a bare accept.
+        let with_extra = v2.replace(
+            "\n        ]}",
+            ",{\"rule\":{\"family\":\"inet\",\"table\":\"sanctuary-castle\",\"chain\":\"output\",\
+             \"handle\":14,\"expr\":[{\"accept\":null}]}}\n        ]}",
+        );
+        assert_ne!(
+            with_extra, v2,
+            "the fourth-rule fixture must actually differ"
+        );
+        assert!(!is_deny_all_safety_net_json(&with_extra, ov));
+
+        // A DIFFERENT rule comment on any of the three.
+        assert!(!is_deny_all_safety_net_json(
+            &v2.replace(
+                NET_RULE_COMMENT_IDENTITY,
+                "sanctuary-castle-net:v2:something-else"
+            ),
+            ov
+        ));
+        assert!(!is_deny_all_safety_net_json(
+            &v2.replace(
+                NET_RULE_COMMENT_KERNEL_ND,
+                "sanctuary-castle-net:v2:something-else"
+            ),
+            ov
+        ));
+
+        // An extra ICMPv6 type in the carve-out (an MLD report) is a channel the
+        // agent may drive, so rule 2 is checked for EQUALITY, never containment.
+        assert!(!is_deny_all_safety_net_json(
+            &v2.replace(
+                "\"nd-router-solicit\"",
+                "\"nd-router-solicit\",\"mld-listener-report\""
+            ),
+            ov
+        ));
+
+        // A wrong family/name table is not ours, and malformed input is not the net.
+        assert!(!is_deny_all_safety_net_json(
+            &v1.replace("sanctuary-castle", "sanctuary-castle-test-x"),
+            ov
+        ));
+        assert!(!is_deny_all_safety_net_json("not json", ov));
+    }
+
+    #[test]
+    fn deny_all_safety_net_recognizer_refuses_sets_the_installer_could_not_have_armed() {
+        // The closed installer type cannot place 0, this host's kernel.overflowuid
+        // or the invalid sentinel in rule 1, so a well-formed three-rule table
+        // carrying one of them was armed by something other than this daemon and
+        // must not be recognised (the disarm recovery arm would otherwise delete
+        // it as ours).
+        let ov = test_overflow();
+        for refused in [0u32, TEST_HOST_OVERFLOW_UID, u32::MAX] {
+            let listing = v2_identity_listing(&[refused, 60123], &[refused, 60123]);
+            assert!(
+                !is_deny_all_safety_net_json(&listing, ov),
+                "a set carrying {refused} must not be recognised as this daemon's net"
+            );
+        }
+        // A mapped high uid IS attestable and stays recognised.
+        assert!(is_deny_all_safety_net_json(
+            &v2_identity_listing(&[65535, 100_000], &[65535, 100_000]),
+            ov
+        ));
     }
 
     #[test]

@@ -73,11 +73,25 @@ use std::time::{Duration, Instant};
 pub enum ProbeOutcome {
     /// A check completed and proved the resource is still ours.
     Ready,
-    /// A check completed and proved the resource is gone/drifted, or the
-    /// indeterminate budget was exhausted. Terminal for this process.
+    /// A check COMPLETED and proved the resource is gone or drifted. Terminal for
+    /// this process.
+    ///
+    /// This is the only outcome that is EVIDENCE about the resource, and it is the
+    /// only one a consumer may act on the kernel from. The exhausted-budget case is
+    /// [`Indeterminate`](Self::Indeterminate), not this.
     Lost,
+    /// The consecutive indeterminate budget was exhausted: no check ever completed,
+    /// so nothing about the resource was proven, but readiness can no longer be
+    /// asserted either. Terminal for this process.
+    ///
+    /// Split out from `Lost` because the two license different actions. A consumer
+    /// may withdraw readiness on either, but it may only act on the kernel from a
+    /// completed proof; acting on an exhausted budget would mutate state on the
+    /// strength of having learned nothing.
+    Indeterminate,
     /// No conclusion is available right now: another check is in flight, or this
-    /// one exceeded its deadline. NOT a loss and NOT readiness.
+    /// one exceeded its deadline, and the budget is not yet exhausted. NOT a loss
+    /// and NOT readiness.
     Unavailable,
 }
 
@@ -291,8 +305,11 @@ impl BoundedHealthProbe {
             // precisely because there is nothing in flight to collide with.
             state.in_flight_since = None;
             note_indeterminate(&mut state, self.budget.max_consecutive_unavailable);
+            // The exhausted budget is INDETERMINATE, not a completed negative proof:
+            // no check ever ran to conclusion, so nothing about the resource is known.
+            // A consumer may withdraw readiness on it but must not act on the kernel.
             return if state.latched_lost {
-                ProbeOutcome::Lost
+                ProbeOutcome::Indeterminate
             } else {
                 ProbeOutcome::Unavailable
             };
@@ -323,8 +340,10 @@ impl BoundedHealthProbe {
             // Deadline overrun. The worker still owns the slot and its `nft`
             // child is still running; we abandon the WAIT, not the check.
             note_indeterminate(&mut state, self.budget.max_consecutive_unavailable);
+            // Same polarity as the no-worker case above: an abandoned WAIT proves
+            // nothing about the resource. Must match that arm.
             return if state.latched_lost {
-                ProbeOutcome::Lost
+                ProbeOutcome::Indeterminate
             } else {
                 ProbeOutcome::Unavailable
             };
@@ -376,8 +395,9 @@ impl BoundedHealthProbe {
             return ProbeOutcome::Unavailable;
         }
         note_indeterminate(&mut state, self.budget.max_consecutive_unavailable);
+        // Same polarity as the two arms above. Must match them.
         if state.latched_lost {
-            ProbeOutcome::Lost
+            ProbeOutcome::Indeterminate
         } else {
             ProbeOutcome::Unavailable
         }
@@ -480,7 +500,7 @@ mod tests {
     /// Note the SHAPE this now takes: after the first overrun the later polls
     /// never start a check at all, they observe the wedged one.
     #[test]
-    fn consecutive_timeouts_exhaust_the_indeterminate_budget_and_latch_lost() {
+    fn consecutive_timeouts_exhaust_the_indeterminate_budget_and_latch_indeterminate() {
         let probe = BoundedHealthProbe::new(ProbeBudget {
             timeout: Duration::from_millis(30),
             min_interval: Duration::ZERO,
@@ -497,8 +517,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(40));
         assert_eq!(
             probe.poll(wedged),
-            ProbeOutcome::Lost,
-            "the third consecutive indeterminate reading must fail closed"
+            ProbeOutcome::Indeterminate,
+            "the exhausted budget must fail closed as INDETERMINATE: readiness is \
+             withdrawn, but no check ever completed, so nothing about the resource was \
+             proven and no consumer may act on the kernel from this reading"
         );
     }
 

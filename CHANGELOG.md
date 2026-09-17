@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- Linux only. The signed agent-origin descriptor no longer accepts two uid values that name no single principal on a Linux host: the conventional `kernel.overflowuid` (65534) and the invalid-uid sentinel (4294967295), for either `agent_uid` or `gate_uid`. The publisher refuses to mint such a descriptor, and the Linux daemon refuses to load one, reading its own host's configured `kernel.overflowuid` rather than assuming the conventional value. **Upgrade bound:** a manifest already signed with either value in either field will not load on the new Linux daemon. Reissue it through the publisher, which now refuses the value at signing time. Manifests that bind ordinary mapped uids, including 65533, 65535 and 100000, are unaffected. Linux Castle Wall enforcement remains `not_implemented` publicly.
+
 ## [1.8.6] - 2026-09-08
 
 One first-install fix on top of v1.8.5. No new capability; the capability bounds in the v1.8.4 notes stand. v1.8.5 was tagged and built but not published: its own acceptance run caught this defect on the exact install path.

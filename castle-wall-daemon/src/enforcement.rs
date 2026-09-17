@@ -197,9 +197,115 @@ pub trait AcquiredComponent: Send {
             ComponentHealth::Lost
         }
     }
+    /// Called when a STARTUP readiness check reads this component `Lost`, BEFORE the
+    /// reverse-order unwind and before any error is returned.
+    ///
+    /// The default is a no-op, which is the correct behaviour for every component
+    /// whose loss leaves the kernel egress gate intact: the daemon simply unwinds and
+    /// the preserved table is adopted on restart. The nftables component overrides it,
+    /// because a completed negative proof of ITS resource means adopted agents may be
+    /// live with no gate in the kernel, and the safety net has to be installed while
+    /// this process still holds the host lock.
+    ///
+    /// INVARIANT for any implementor: this runs BEFORE `release`, so it may still use
+    /// resources the component owns; it must not panic, because the unwind must
+    /// proceed either way, and it must not itself release anything.
+    fn on_startup_lost(&self) {}
+
+    /// Called when a STARTUP readiness check reads this component `Indeterminate`.
+    ///
+    /// An indeterminate reading is the ABSENCE of evidence, so an implementor must
+    /// install nothing here. The default is a no-op.
+    fn on_startup_indeterminate(&self) {}
+
+    /// POST-READY recovery for a COMPLETED negative proof of this component's
+    /// resource, invoked by the supervisor BEFORE any exit arm.
+    ///
+    /// The default is a no-op returning false, which is correct for every component
+    /// that has no kernel gate to re-arm. The nftables component overrides it to
+    /// install the safety net and then persist best-effort, and publishes `Recovering`
+    /// through its health while an attempt is outstanding.
+    ///
+    /// `shutting_down` is observed so `systemctl stop` is a clean exit rather than a
+    /// box that keeps re-arming while it is being taken down. Returns whether the
+    /// component now holds a gate in the kernel.
+    fn attempt_post_ready_recovery(&self, shutting_down: bool) -> bool {
+        let _ = shutting_down;
+        false
+    }
+
     /// Idempotent, panic-free teardown; joins owned threads before returning.
     /// Runs from `Drop`, so it must never unwrap a fallible join or lock.
     fn release(&mut self);
+}
+
+/// A component's readiness AT STARTUP, typed so the three outcomes drive three
+/// different actions instead of collapsing into a boolean.
+///
+/// INVARIANT, and why a boolean will not do here: `Lost` and `Indeterminate` both
+/// withhold readiness, so a boolean gate treats them identically. They are not
+/// identical. A COMPLETED negative ownership proof from the nftables component is
+/// evidence that the kernel no longer holds this daemon's table while adopted agents
+/// may still be live, and the safety net must be installed before the daemon unwinds.
+/// An indeterminate reading is the ABSENCE of evidence and must install nothing,
+/// because installing on no evidence would replace a healthy table on a momentarily
+/// contended probe. The `kind` rides along because only the nftables component's
+/// reading carries either action; every other component's loss leaves the table
+/// intact and keeps the existing path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupReadiness {
+    /// Proven ready.
+    Ready,
+    /// A COMPLETED negative proof: this component's resource provably does not hold.
+    Lost { kind: ComponentKind },
+    /// No answer. Proves nothing, and is never promoted to `Lost` here.
+    Indeterminate { kind: ComponentKind },
+}
+
+impl StartupReadiness {
+    /// Read a component's startup readiness from its three-valued health.
+    ///
+    /// Derived from [`AcquiredComponent::health`] rather than from `is_ready`, so a
+    /// probe that can time out reports its indeterminate arm instead of having it
+    /// folded into a loss. Must match the `ComponentHealth` arms below.
+    pub fn of(component: &dyn AcquiredComponent) -> Self {
+        let kind = component.kind();
+        match component.health() {
+            ComponentHealth::Ready => StartupReadiness::Ready,
+            ComponentHealth::Lost => StartupReadiness::Lost { kind },
+            ComponentHealth::ProbeUnavailable => StartupReadiness::Indeterminate { kind },
+            // The recovery controller is a POST-READY owner, so a component cannot be
+            // recovering during startup. If one ever reports it here, the reading it
+            // rests on is a completed negative proof, so treat it as the loss it is
+            // rather than as readiness.
+            ComponentHealth::Recovering => StartupReadiness::Lost { kind },
+        }
+    }
+
+    /// Whether this reading is the nftables component's, which is the only one whose
+    /// startup loss or indeterminacy carries a safety-net action.
+    pub fn nftables_kind(&self) -> Option<ComponentKind> {
+        match self {
+            StartupReadiness::Ready => None,
+            StartupReadiness::Lost { kind } | StartupReadiness::Indeterminate { kind } => {
+                (*kind == ComponentKind::NftablesTable).then_some(*kind)
+            }
+        }
+    }
+}
+
+/// Route a non-ready STARTUP reading to the component's own responder.
+///
+/// Kept as one function so the two checks in `start` cannot drift apart on which
+/// reading calls which responder, and so the polarity is stated once: `Lost` is a
+/// completed negative proof and may act on the kernel; `Indeterminate` proves
+/// nothing and must not.
+fn respond_to_startup_readiness(component: &dyn AcquiredComponent, readiness: StartupReadiness) {
+    match readiness {
+        StartupReadiness::Ready => {}
+        StartupReadiness::Lost { .. } => component.on_startup_lost(),
+        StartupReadiness::Indeterminate { .. } => component.on_startup_indeterminate(),
+    }
 }
 
 /// Three-valued component health. `ProbeUnavailable` is the indeterminate arm;
@@ -210,6 +316,15 @@ pub enum ComponentHealth {
     Ready,
     Lost,
     ProbeUnavailable,
+    /// A COMPLETED negative proof has been observed AND a recovery attempt for it is
+    /// in flight: the safety net is being installed or retried while this process
+    /// keeps the host lock.
+    ///
+    /// Distinct from `Lost` so no consumer reaches an exit arm before the net has had
+    /// its chance. It is NOT readiness: a consumer must never treat it as enforcing.
+    /// Every consumer that has an exit arm for `Lost` must have an explicit
+    /// non-exiting arm for this.
+    Recovering,
 }
 
 /// A factory that yields exactly one acquired component or fails.
@@ -264,6 +379,14 @@ pub enum NotReadyReason {
     /// The audit WAL suffered an ambiguous durable mutation or its lock was
     /// poisoned. Continuing could emit decisions without trustworthy evidence.
     AuditWalPoisoned,
+    /// A component proved its resource lost and the safety net is being installed or
+    /// retried for it while this process keeps the host lock.
+    ///
+    /// NOT readiness, and NOT an exit condition: a consumer that exits on
+    /// `ComponentLost` must WAIT on this instead, so the net has its chance before the
+    /// process goes away and the restart window opens. Must match
+    /// `ComponentHealth::Recovering`.
+    SafetyNetRecovering(ComponentKind),
 }
 
 /// Failure returned by [`EnforcementRuntime::start`] when the daemon could not
@@ -298,6 +421,14 @@ pub enum EnforcementStartError {
         /// to acquire or delivered the wrong kind, or — for the whole-set
         /// re-check — the earliest component found no longer ready.
         failed: ComponentKind,
+        /// The TYPED startup readiness that produced this failure, when the failure
+        /// came from one of the two readiness checks.
+        ///
+        /// Carried so a caller can tell a COMPLETED negative proof from an
+        /// indeterminate reading without re-deriving it from the message text. `None`
+        /// means the failure came from acquisition or a kind mismatch, where no
+        /// readiness reading was taken. Must match the arms of `StartupReadiness`.
+        evidence: Option<StartupReadiness>,
         #[source]
         reason: EnforcementError,
     },
@@ -395,21 +526,33 @@ impl EnforcementRuntime {
                         release_reverse(&mut components);
                         return Err(EnforcementStartError::Component {
                             failed: expected,
+                            // No readiness reading is taken on a kind mismatch.
+                            evidence: None,
                             reason: EnforcementError::ComponentKindMismatch {
                                 expected: expected.as_str(),
                                 actual: delivered.as_str(),
                             },
                         });
                     }
-                    // Per-step readiness: an unready just-acquired component is
-                    // torn down by the same reverse-order sweep as its
-                    // predecessors.
+                    // Per-step readiness, TYPED: the first of the two startup checks
+                    // memo D1b step 7 names. An unready just-acquired component is
+                    // torn down by the same reverse-order sweep as its predecessors,
+                    // but WHICH reading it gave decides what happens first.
                     // Safety: the delivered component was pushed onto `components` immediately
                     // above in this same iteration, so the vector is non-empty.
-                    if !components.last().expect("component just pushed").is_ready() {
+                    let just_acquired = components.last().expect("component just pushed");
+                    let readiness = StartupReadiness::of(just_acquired.as_ref());
+                    if readiness != StartupReadiness::Ready {
+                        // The component's own responder runs BEFORE the unwind, while
+                        // it still owns its resources and this process still holds any
+                        // host lock. `release_reverse` then runs unconditionally: it is
+                        // what releases the host lock the disarm verb needs, so it is
+                        // never skipped on this path.
+                        respond_to_startup_readiness(just_acquired.as_ref(), readiness);
                         release_reverse(&mut components);
                         return Err(EnforcementStartError::Component {
                             failed: expected,
+                            evidence: Some(readiness),
                             reason: EnforcementError::NotReadyAfterAcquire(expected.as_str()),
                         });
                     }
@@ -420,6 +563,8 @@ impl EnforcementRuntime {
                     release_reverse(&mut components);
                     return Err(EnforcementStartError::Component {
                         failed: expected,
+                        // No readiness reading is taken when acquisition itself failed.
+                        evidence: None,
                         reason,
                     });
                 }
@@ -434,14 +579,23 @@ impl EnforcementRuntime {
         // order and returning the FIRST not-ready component names the earliest
         // casualty. Without this a later acquisition could silently invalidate
         // an earlier component yet start() would return an "enforcing" runtime.
-        if let Some(failed) = components
+        // The second of the two startup checks, TYPED for the same reason. Iterating in
+        // acquisition order and acting on the FIRST non-ready reading names the earliest
+        // casualty.
+        if let Some((failed, readiness)) = components
             .iter()
-            .find(|component| !component.is_ready())
-            .map(|component| component.kind())
+            .map(|component| (component, StartupReadiness::of(component.as_ref())))
+            .find(|(_, readiness)| *readiness != StartupReadiness::Ready)
+            .map(|(component, readiness)| {
+                respond_to_startup_readiness(component.as_ref(), readiness);
+                (component.kind(), readiness)
+            })
         {
+            // Never skipped: this is what releases the host lock the disarm verb needs.
             release_reverse(&mut components);
             return Err(EnforcementStartError::Component {
                 failed,
+                evidence: Some(readiness),
                 reason: EnforcementError::NotReadyAfterAcquire(failed.as_str()),
             });
         }
@@ -493,10 +647,38 @@ impl EnforcementRuntime {
                             reason: NotReadyReason::HealthProbeUnavailable,
                         }
                     }
+                    // Withhold readiness WITHOUT reporting the loss that a supervisor
+                    // exits on: the net is being installed or retried right now.
+                    ComponentHealth::Recovering => {
+                        return EnforcementStatus::NotReady {
+                            reason: NotReadyReason::SafetyNetRecovering(required),
+                        }
+                    }
                 },
             }
         }
         EnforcementStatus::KernelRuntimeReady
+    }
+
+    /// Give every component that reports a COMPLETED negative proof one post-READY
+    /// recovery attempt, BEFORE the supervisor reaches any exit arm.
+    ///
+    /// INVARIANT on the ordering: this runs while the process still holds whatever host
+    /// lock its components took. Exiting first and recovering later is not available,
+    /// because the lock goes with the process and the restart cannot resume an attempt
+    /// this process began. Components that report `Ready`, `ProbeUnavailable` or
+    /// `Recovering` are not driven here: the first needs nothing, the second is the
+    /// absence of evidence, and the third already has an attempt outstanding.
+    ///
+    /// Returns true when at least one component reports a gate now in the kernel.
+    pub fn attempt_post_ready_recovery(&self, shutting_down: bool) -> bool {
+        let mut any = false;
+        for component in &self.components {
+            if matches!(component.health(), ComponentHealth::Lost) {
+                any |= component.attempt_post_ready_recovery(shutting_down);
+            }
+        }
+        any
     }
 
     /// Convenience: true iff [`status`](Self::status) is `KernelRuntimeReady`.
@@ -654,7 +836,7 @@ pub fn derive_daemon_state(
 #[cfg(test)]
 mod test_support {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     /// A component that is always ready and owns nothing to release.
@@ -685,6 +867,212 @@ mod test_support {
             self.ready.load(Ordering::SeqCst)
         }
         fn release(&mut self) {}
+    }
+
+    /// A component whose three-valued health is scriptable, recording which startup
+    /// responder and which recovery attempt it received. This is what makes the
+    /// reachability of each entry branch assertable without a kernel.
+    struct ScriptedHealth {
+        kind: ComponentKind,
+        health: Arc<std::sync::Mutex<ComponentHealth>>,
+        startup_lost_calls: Arc<AtomicUsize>,
+        startup_indeterminate_calls: Arc<AtomicUsize>,
+        recovery_calls: Arc<AtomicUsize>,
+        recovery_saw_shutdown: Arc<AtomicBool>,
+    }
+    impl AcquiredComponent for ScriptedHealth {
+        fn kind(&self) -> ComponentKind {
+            self.kind
+        }
+        fn is_ready(&self) -> bool {
+            matches!(self.health(), ComponentHealth::Ready)
+        }
+        fn health(&self) -> ComponentHealth {
+            *self.health.lock().expect("scripted health")
+        }
+        fn on_startup_lost(&self) {
+            self.startup_lost_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_startup_indeterminate(&self) {
+            self.startup_indeterminate_calls
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        fn attempt_post_ready_recovery(&self, shutting_down: bool) -> bool {
+            self.recovery_calls.fetch_add(1, Ordering::SeqCst);
+            if shutting_down {
+                self.recovery_saw_shutdown.store(true, Ordering::SeqCst);
+            }
+            !shutting_down
+        }
+        fn release(&mut self) {}
+    }
+
+    struct ScriptedProvider {
+        kind: ComponentKind,
+        health: Arc<std::sync::Mutex<ComponentHealth>>,
+        startup_lost_calls: Arc<AtomicUsize>,
+        startup_indeterminate_calls: Arc<AtomicUsize>,
+        recovery_calls: Arc<AtomicUsize>,
+        recovery_saw_shutdown: Arc<AtomicBool>,
+    }
+    impl ComponentProvider for ScriptedProvider {
+        fn kind(&self) -> ComponentKind {
+            self.kind
+        }
+        fn acquire(self: Box<Self>) -> Result<Box<dyn AcquiredComponent>, EnforcementError> {
+            Ok(Box::new(ScriptedHealth {
+                kind: self.kind,
+                health: self.health,
+                startup_lost_calls: self.startup_lost_calls,
+                startup_indeterminate_calls: self.startup_indeterminate_calls,
+                recovery_calls: self.recovery_calls,
+                recovery_saw_shutdown: self.recovery_saw_shutdown,
+            }))
+        }
+    }
+
+    /// One counter set, shared with the component the provider yields.
+    #[derive(Clone, Default)]
+    struct ResponderCounters {
+        startup_lost: Arc<AtomicUsize>,
+        startup_indeterminate: Arc<AtomicUsize>,
+        recovery: Arc<AtomicUsize>,
+        recovery_saw_shutdown: Arc<AtomicBool>,
+    }
+
+    fn scripted_plan(
+        nft_health: ComponentHealth,
+        counters: &ResponderCounters,
+    ) -> Vec<Box<dyn ComponentProvider>> {
+        vec![
+            Box::new(ScriptedProvider {
+                kind: ComponentKind::NftablesTable,
+                health: Arc::new(std::sync::Mutex::new(nft_health)),
+                startup_lost_calls: Arc::clone(&counters.startup_lost),
+                startup_indeterminate_calls: Arc::clone(&counters.startup_indeterminate),
+                recovery_calls: Arc::clone(&counters.recovery),
+                recovery_saw_shutdown: Arc::clone(&counters.recovery_saw_shutdown),
+            }),
+            Box::new(AlwaysReadyProvider(ComponentKind::Nfqueue)),
+            Box::new(AlwaysReadyProvider(ComponentKind::ManifestWatcher)),
+        ]
+    }
+
+    #[test]
+    fn a_startup_lost_reading_runs_the_loss_responder_then_unwinds_with_typed_evidence() {
+        let counters = ResponderCounters::default();
+        let err = EnforcementRuntime::start(scripted_plan(ComponentHealth::Lost, &counters))
+            .expect_err("a component that is not ready must not yield a runtime");
+        // The responder ran exactly once, BEFORE the unwind, and the indeterminate
+        // responder did not run at all.
+        assert_eq!(counters.startup_lost.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.startup_indeterminate.load(Ordering::SeqCst), 0);
+        // The error carries the TYPED evidence, so a caller can tell a completed
+        // negative proof from a no-answer without parsing the message.
+        match err {
+            EnforcementStartError::Component {
+                failed, evidence, ..
+            } => {
+                assert_eq!(failed, ComponentKind::NftablesTable);
+                assert_eq!(
+                    evidence,
+                    Some(StartupReadiness::Lost {
+                        kind: ComponentKind::NftablesTable
+                    })
+                );
+            }
+            other => panic!("expected a component failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_startup_indeterminate_reading_runs_only_the_indeterminate_responder() {
+        let counters = ResponderCounters::default();
+        let err =
+            EnforcementRuntime::start(scripted_plan(ComponentHealth::ProbeUnavailable, &counters))
+                .expect_err("an indeterminate reading withholds readiness");
+        // Nothing may be installed on the absence of evidence, so the LOSS responder
+        // must not run here.
+        assert_eq!(counters.startup_lost.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.startup_indeterminate.load(Ordering::SeqCst), 1);
+        match err {
+            EnforcementStartError::Component { evidence, .. } => assert_eq!(
+                evidence,
+                Some(StartupReadiness::Indeterminate {
+                    kind: ComponentKind::NftablesTable
+                })
+            ),
+            other => panic!("expected a component failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_ready_startup_runs_no_responder_at_all() {
+        let counters = ResponderCounters::default();
+        let runtime = EnforcementRuntime::start(scripted_plan(ComponentHealth::Ready, &counters))
+            .expect("a fully ready plan yields a runtime");
+        assert_eq!(counters.startup_lost.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.startup_indeterminate.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            runtime.status(),
+            EnforcementStatus::KernelRuntimeReady,
+            "a ready plan reports readiness"
+        );
+    }
+
+    #[test]
+    fn post_ready_recovery_is_driven_for_a_proven_loss_and_observes_the_shutdown_flag() {
+        let counters = ResponderCounters::default();
+        let health = Arc::new(std::sync::Mutex::new(ComponentHealth::Ready));
+        let runtime = EnforcementRuntime::start(vec![
+            Box::new(ScriptedProvider {
+                kind: ComponentKind::NftablesTable,
+                health: Arc::clone(&health),
+                startup_lost_calls: Arc::clone(&counters.startup_lost),
+                startup_indeterminate_calls: Arc::clone(&counters.startup_indeterminate),
+                recovery_calls: Arc::clone(&counters.recovery),
+                recovery_saw_shutdown: Arc::clone(&counters.recovery_saw_shutdown),
+            }),
+            Box::new(AlwaysReadyProvider(ComponentKind::Nfqueue)),
+            Box::new(AlwaysReadyProvider(ComponentKind::ManifestWatcher)),
+        ])
+        .expect("starts ready");
+
+        // READY: no recovery is driven, because there is nothing to re-arm.
+        assert!(!runtime.attempt_post_ready_recovery(false));
+        assert_eq!(counters.recovery.load(Ordering::SeqCst), 0);
+
+        // INDETERMINATE: still no recovery. This reading is the absence of evidence,
+        // so no kernel action may be taken from it.
+        *health.lock().unwrap() = ComponentHealth::ProbeUnavailable;
+        assert!(!runtime.attempt_post_ready_recovery(false));
+        assert_eq!(counters.recovery.load(Ordering::SeqCst), 0);
+
+        // LOST, a completed negative proof: recovery IS driven.
+        *health.lock().unwrap() = ComponentHealth::Lost;
+        assert!(runtime.attempt_post_ready_recovery(false));
+        assert_eq!(counters.recovery.load(Ordering::SeqCst), 1);
+
+        // The shutdown flag is threaded through, so `systemctl stop` is a clean exit
+        // rather than a box that keeps re-arming while it is taken down.
+        assert!(!runtime.attempt_post_ready_recovery(true));
+        assert!(counters.recovery_saw_shutdown.load(Ordering::SeqCst));
+
+        // RECOVERING: an attempt is already outstanding, so the component is not
+        // driven again from this path.
+        let before = counters.recovery.load(Ordering::SeqCst);
+        *health.lock().unwrap() = ComponentHealth::Recovering;
+        assert!(!runtime.attempt_post_ready_recovery(false));
+        assert_eq!(counters.recovery.load(Ordering::SeqCst), before);
+
+        // And `Recovering` withholds readiness without reporting the loss a
+        // supervisor exits on.
+        match runtime.status() {
+            EnforcementStatus::NotReady {
+                reason: NotReadyReason::SafetyNetRecovering(kind),
+            } => assert_eq!(kind, ComponentKind::NftablesTable),
+            other => panic!("expected the recovering reason, got {other:?}"),
+        }
     }
 
     struct AlwaysReadyProvider(ComponentKind);
@@ -1065,7 +1453,7 @@ mod tests {
     /// has its own dedicated tests, so a `PlanMismatch` here is a test bug.
     fn expect_component(err: EnforcementStartError) -> (ComponentKind, EnforcementError) {
         match err {
-            EnforcementStartError::Component { failed, reason } => (failed, reason),
+            EnforcementStartError::Component { failed, reason, .. } => (failed, reason),
             other => panic!("expected a component failure, got {other:?}"),
         }
     }

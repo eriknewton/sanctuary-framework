@@ -24,6 +24,9 @@ use castle_wall_daemon::runtime_providers::{
     acquire_castle_table_component_for_test, disarm_castle_runtime, DisarmOutcome,
     LinuxRuntimeConfig,
 };
+use castle_wall_daemon::safety_net_uid::{
+    validate_safety_net_uid, ConfinedUidSet, HostOverflowUid,
+};
 
 mod isolation;
 
@@ -191,7 +194,9 @@ fn gf1_1_disarm_recovers_from_create_failure_wedge() {
 
     // Reconstruct the armed wedge: Preparing journal + this daemon's deny-all net.
     write_preparing_journal(&cfg);
-    nftables::install_deny_all_safety_net().expect("arm the deny-all net");
+    // PR-1: the scope is a typed argument now; this leg drives the v1 host-wide shape, which is what the base installed.
+    nftables::install_deny_all_safety_net(&nftables::SafetyNetScope::HostWide)
+        .expect("arm the deny-all net");
     assert!(nftables::live_table_is_deny_all_safety_net().unwrap());
 
     // --disarm must recognize its own net for an interrupted acquisition, delete
@@ -208,12 +213,243 @@ fn gf1_1_disarm_recovers_from_create_failure_wedge() {
     );
 }
 
-// GF1.2 post-condition: the drift escalation's by-name delete leaves NO live
-// `policy accept` castle table. (The escalation SEQUENCE -- install-fail ->
-// delete -- is proven deterministically in the runtime_providers unit tests; this
-// asserts the delete achieves the fail-closed post-condition on real nft.)
+/// The live isolated table as `nft -j` JSON, or None when absent.
+fn live_table_json() -> Option<String> {
+    let out = Command::new("nft")
+        .args(["-j", "list", "table", CASTLE_FAMILY, isolation::table()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+/// The ordered `comment` of every rule in the live base output chain.
+fn live_rule_comments_in_order() -> Vec<String> {
+    let Some(json) = live_table_json() else {
+        return Vec::new();
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return Vec::new();
+    };
+    let Some(items) = doc.get("nftables").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| item.get("rule"))
+        .filter_map(|rule| rule.get("comment").and_then(|c| c.as_str()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Build an `Identity` scope through the ONLY admitted constructor path: validate
+/// each uid against this host's configured overflow value, then collect.
+fn identity_scope(uids: &[u32]) -> nftables::SafetyNetScope {
+    let overflow = HostOverflowUid::from_host().expect("a Linux host exposes kernel.overflowuid");
+    let validated: Vec<_> = uids
+        .iter()
+        .map(|&uid| validate_safety_net_uid(uid, overflow).expect("an attestable uid"))
+        .collect();
+    nftables::SafetyNetScope::Identity(
+        ConfinedUidSet::from_validated(validated).expect("a non-empty set"),
+    )
+}
+
+// D1/D2 on real nft: an `Identity` scope installs exactly the three rules, IN
+// ORDER, under a `drop` base policy, and the recogniser reads its own output back.
 #[test]
-fn gf1_2_by_name_delete_leaves_no_live_accept() {
+fn identity_scope_installs_three_ordered_rules_and_is_recognised() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    nftables::install_deny_all_safety_net(&identity_scope(&[60123, 60124]))
+        .expect("install the identity net");
+
+    // The base policy still DROPS, so anything the three rules do not match falls
+    // closed. This is what makes rule 2's carve-out necessary rather than cosmetic.
+    assert_eq!(live_base_policy().as_deref(), Some("drop"));
+
+    // ORDER is the invariant: the confined identity is dropped FIRST, so no later
+    // accept is reachable by a packet the kernel can attribute to it.
+    assert_eq!(
+        live_rule_comments_in_order(),
+        vec![
+            nftables::NET_RULE_COMMENT_IDENTITY.to_string(),
+            nftables::NET_RULE_COMMENT_KERNEL_ND.to_string(),
+            nftables::NET_RULE_COMMENT_OTHERS.to_string(),
+        ]
+    );
+
+    // The recogniser reads back the exact shape the installer emitted. Producer and
+    // consumer are proven against ONE kernel listing here, which a fixture written
+    // on a host without nft cannot do.
+    assert!(
+        nftables::live_table_is_deny_all_safety_net().expect("probe the live table"),
+        "the installer's own output must be recognised as this daemon's net"
+    );
+}
+
+// The host-wide shape on real nft: zero rules under the same drop policy, and it is
+// recognised as the net's other permanent shape.
+#[test]
+fn host_wide_scope_installs_no_rules_and_is_recognised() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    nftables::install_deny_all_safety_net(&nftables::SafetyNetScope::HostWide)
+        .expect("install the host-wide net");
+    assert_eq!(live_base_policy().as_deref(), Some("drop"));
+    assert!(live_rule_comments_in_order().is_empty());
+    assert!(nftables::live_table_is_deny_all_safety_net().expect("probe the live table"));
+}
+
+// FAIL-BEFORE (identity known, history known, deny set within the cap): the
+// installed table is NEVER the zero-rule shape. This is the assertion that
+// distinguishes a net that preserves operator access from one that does not.
+#[test]
+fn a_within_cap_identity_never_installs_the_zero_rule_shape() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    nftables::install_deny_all_safety_net(&identity_scope(&[60123, 60124]))
+        .expect("install the identity net");
+    let comments = live_rule_comments_in_order();
+    assert_eq!(
+        comments.len(),
+        3,
+        "a known identity within the cap must install the three-rule shape, not the \
+         zero-rule shape: {comments:?}"
+    );
+}
+
+// The cap's upper boundary on the target nft: DENY_SET_MAX distinct skuid values
+// install and are recognised, so the constant is proven on the platform rather than
+// assumed. One over the cap is resolved to the host-wide shape by the resolver,
+// which is unit-tested; this leg proves the kernel accepts the set AT the cap.
+#[test]
+fn a_full_cap_identity_set_installs_and_is_recognised_on_the_target_nft() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let uids: Vec<u32> = (0..nftables::DENY_SET_MAX as u32)
+        .map(|i| 60_000 + i)
+        .collect();
+    nftables::install_deny_all_safety_net(&identity_scope(&uids))
+        .expect("nft must accept a full-cap anonymous set in both rules");
+    assert_eq!(live_base_policy().as_deref(), Some("drop"));
+    assert_eq!(live_rule_comments_in_order().len(), 3);
+    assert!(
+        nftables::live_table_is_deny_all_safety_net().expect("probe the live table"),
+        "a full-cap set must still be recognised, in both the == and the != rule"
+    );
+}
+
+// The PROBE the parser rests on: record the JSON forms `nft -j` actually renders for
+// the set-valued `==` skuid match, the set-valued `!=` skuid match and the
+// `icmpv6 type` set, on the target nft.
+//
+// This test is the evidence for the parser's shape assumptions. It is written to
+// FAIL LOUDLY with the observed JSON if any form differs from what the parser reads,
+// so the recorded forms come from a kernel rather than from a fixture composed on a
+// host that has no nft.
+#[test]
+fn nft_set_json_forms_are_the_shapes_the_parser_reads() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let uids: Vec<u32> = (0..nftables::DENY_SET_MAX as u32)
+        .map(|i| 60_000 + i)
+        .collect();
+    nftables::install_deny_all_safety_net(&identity_scope(&uids)).expect("install");
+    let json = live_table_json().expect("list the live table");
+    // SAFETY: stderr is this test's evidence channel. The recorded forms are the
+    // artifact the parser's shape assumptions rest on, so they are emitted whether
+    // the assertions pass or fail.
+    eprintln!("RECORDED nft -j listing for the identity net:\n{json}");
+
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("nft -j parses");
+    let items = doc["nftables"].as_array().expect("an nftables array");
+    let rules: Vec<&serde_json::Value> = items.iter().filter_map(|item| item.get("rule")).collect();
+    assert_eq!(rules.len(), 3, "three rules: {json}");
+
+    // Rule 1: a set-valued `==` on `meta skuid`, with INTEGER members (nft renders
+    // uids as integers without `-u`), and a bare `drop` verdict object.
+    let m1 = &rules[0]["expr"][0]["match"];
+    assert_eq!(m1["op"], "==", "rule 1 op: {json}");
+    assert_eq!(m1["left"]["meta"]["key"], "skuid", "rule 1 left: {json}");
+    let set1 = m1["right"]["set"]
+        .as_array()
+        .expect("rule 1 right is a set");
+    assert_eq!(
+        set1.len(),
+        nftables::DENY_SET_MAX,
+        "rule 1 set size: {json}"
+    );
+    assert!(
+        set1.iter().all(|m| m.is_u64()),
+        "rule 1 set members must render as integers: {json}"
+    );
+    assert!(
+        rules[0]["expr"][1].get("drop").is_some(),
+        "rule 1 verdict: {json}"
+    );
+
+    // Rule 2: the `icmpv6 type` SET form. The parser tolerates a leading protocol
+    // dependency match that nft may add for an inet-family ICMPv6 match, so the
+    // recorded expression list is emitted above for exactly this reason.
+    let nd_exprs = rules[1]["expr"].as_array().expect("rule 2 expr");
+    let nd_match = nd_exprs
+        .iter()
+        .filter_map(|e| e.get("match"))
+        .find(|m| m["left"].get("payload").is_some())
+        .expect("rule 2 carries an icmpv6 payload match");
+    assert_eq!(nd_match["left"]["payload"]["protocol"], "icmpv6");
+    assert_eq!(nd_match["left"]["payload"]["field"], "type");
+    let nd_set = nd_match["right"]["set"]
+        .as_array()
+        .expect("rule 2 right is a set");
+    assert_eq!(nd_set.len(), 3, "exactly the three ND types: {json}");
+    assert!(
+        nd_set.iter().all(|m| m.is_string()),
+        "icmpv6 type set members render as symbolic names: {json}"
+    );
+
+    // Rule 3: the set-valued `!=` form, over the SAME set as rule 1.
+    let m3 = &rules[2]["expr"][0]["match"];
+    assert_eq!(m3["op"], "!=", "rule 3 op: {json}");
+    assert_eq!(m3["left"]["meta"]["key"], "skuid", "rule 3 left: {json}");
+    let set3 = m3["right"]["set"]
+        .as_array()
+        .expect("rule 3 right is a set");
+    assert_eq!(set1, set3, "the two sets must be equal: {json}");
+
+    // And the recogniser accepts the listing it just produced, which is the whole
+    // point of pinning the forms.
+    assert!(nftables::live_table_is_deny_all_safety_net().expect("probe"));
+}
+
+// The by-name delete primitive on real nft: after it runs, no live castle table and
+// therefore no live `policy accept` castle path remains.
+//
+// Its OWNER under Part A is the disarm verb's interrupted-acquisition recovery, which
+// is explicit operator teardown where deleting the table is the intended outcome. The
+// runtime-loss and reclaim-drift paths do NOT delete: they install the net and leave
+// the table standing, which their own tests assert. This test covers the primitive,
+// not those paths.
+#[test]
+fn by_name_delete_leaves_no_live_accept_table() {
     let _suite = isolation::guard();
     if !nft_available() {
         skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
@@ -224,7 +460,7 @@ fn gf1_2_by_name_delete_leaves_no_live_accept() {
     nftables::create_castle_table_exclusive(&marker).expect("create an accept table");
     assert_eq!(live_base_policy().as_deref(), Some("accept"));
 
-    // The escalation's last-resort action.
+    // The primitive the disarm verb's recovery arm uses.
     nftables::force_delete_castle_table_by_name().expect("force-delete by name");
     assert!(
         !nftables::table_exists().unwrap(),
@@ -233,10 +469,21 @@ fn gf1_2_by_name_delete_leaves_no_live_accept() {
     assert_eq!(live_base_policy(), None);
 }
 
-// GF1.3: an owned table deleted at runtime -> `health()` detects Lost -> installs
-// the deny-all net IMMEDIATELY (base chain drops), without waiting for a restart.
+// GF1.3: an owned table deleted at runtime is detected as a completed loss, and the
+// net goes into the kernel WITHOUT waiting for a restart.
+//
+// Part A splits that into two responsibilities, and this test pins both halves:
+// `health()` is a REPORT, so it answers `Lost` and touches no kernel state; the
+// POST-READY LOSS row's install belongs to the recovery controller, which the
+// supervisor drives on a completed `Lost` proof before any exit arm. The operator-
+// facing claim is unchanged and is what the final assertions state: runtime loss
+// installs the net without waiting for a restart.
+//
+// FAIL-BEFORE NOTE: an earlier revision of this suite asked `health()` for the
+// install. Under the current contract a health poll is a question, so the same
+// outcome is now reached through the controller entry the supervisor actually calls.
 #[test]
-fn gf1_3_runtime_loss_installs_deny_all_net_via_health() {
+fn gf1_3_runtime_loss_installs_the_net_through_the_recovery_controller() {
     let _suite = isolation::guard();
     if !nft_available() {
         skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
@@ -263,8 +510,9 @@ fn gf1_3_runtime_loss_installs_deny_all_net_via_health() {
     assert!(deleted.status.success(), "external delete must succeed");
     assert!(!nftables::table_exists().unwrap());
 
-    // 3) health() must detect the completed loss and install the deny-all net
-    //    immediately (not merely report Lost and wait for the systemd restart).
+    // 3) `health()` REPORTS the completed loss and installs NOTHING. Asserting the
+    //    table is still absent immediately after the report is what proves the poll
+    //    is a question rather than an action.
     let mut became_lost = false;
     for _ in 0..8 {
         if matches!(
@@ -281,13 +529,42 @@ fn gf1_3_runtime_loss_installs_deny_all_net_via_health() {
         "health() must report the completed loss as Lost"
     );
     assert!(
+        !nftables::table_exists().unwrap(),
+        "a health poll must install nothing: the table is still absent after the report"
+    );
+
+    // 4) Drive the production entry the supervisor uses on a completed Lost proof.
+    //    No restart happens anywhere in this test.
+    let in_force = component.attempt_post_ready_recovery(false);
+    assert!(
+        in_force,
+        "the recovery controller must report the net in force after a completed loss"
+    );
+
+    // 5) The net is in the kernel, dropping by policy. This fixture is store-less, so
+    //    no manifest names a confined identity and the journal's history is
+    //    known-empty: the deny set is empty and the host-wide shape is the correct
+    //    resolution, which the refusal texts and the audit row both name as its own
+    //    reason.
+    assert!(
         nftables::live_table_is_deny_all_safety_net().unwrap(),
-        "runtime loss must install the deny-all net without waiting for a restart"
+        "runtime loss installs the net without waiting for a restart"
     );
     assert_eq!(
         live_base_policy().as_deref(),
         Some("drop"),
         "a non-allowlisted packet is dropped, never accepted, after the loss"
+    );
+    assert!(
+        live_rule_comments_in_order().is_empty(),
+        "with no confined identity recoverable the net is the zero-rule host-wide shape"
+    );
+
+    // 6) The controller observes the shutdown flag, so `systemctl stop` is a clean
+    //    exit rather than a box that keeps re-arming while it is taken down.
+    assert!(
+        !component.attempt_post_ready_recovery(true),
+        "a shutting-down daemon must not re-arm"
     );
     drop(component);
 }

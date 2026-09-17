@@ -41,6 +41,15 @@ fn print_help() {
     // function, so each wrapped call would need its own duplicate annotation.
     // A single literal keeps the help text one block with one channel contract.
     println!(
+        "    --preflight-manifest          Answer whether THIS host will admit the installed\n\
+         \x20                                 manifest, WITHOUT taking the host lock and without\n\
+         \x20                                 touching kernel state, so it is safe to run while\n\
+         \x20                                 the daemon is up. Run it with the NEW binary BEFORE\n\
+         \x20                                 replacing the old one: exits non-zero and names the\n\
+         \x20                                 remediation when the manifest would not be admitted."
+    );
+    // SAFETY: stdout is the CLI --help contract, same as the blocks above.
+    println!(
         "    --disarm                      DELETE the owned nftables table and clear its\n\
          \x20                                 ownership journal, under the host lock. This is the\n\
          \x20                                 ONLY action that removes enforcement state; ordinary\n\
@@ -112,6 +121,64 @@ fn run_disarm(args: &[String]) -> ExitCode {
 // Supervision cadence lives in the library so the nft health-probe budget can be
 // DERIVED from it (a real ownership proof must complete inside one tick) and a
 // unit test can pin that relationship. Aliased here to keep `main` readable.
+/// Run the `--preflight-manifest` check and map its outcome to a process exit code.
+///
+/// INVARIANT: this function reaches NO lock and NO kernel path. It resolves two file
+/// paths, calls the pure check, prints one line and exits. `--disarm`'s
+/// `resolve_disarm_paths` is deliberately not reused here, because those are the
+/// host lock and journal paths and this verb must not open them.
+fn run_preflight_manifest(args: &[String]) -> ExitCode {
+    // The installed manifest lives under the fortress's own state directory, so the
+    // verb needs either the fortress id (to derive the canonical layout) or both
+    // paths explicitly. Naming the missing input beats defaulting to a directory the
+    // operator did not mean.
+    let explicit_policy_dir = flag_value(args, "--policy-dir").map(std::path::PathBuf::from);
+    let explicit_pinned = flag_value(args, "--pinned-public-key").map(std::path::PathBuf::from);
+    let derived = flag_value(args, "--fortress-id")
+        .map(castle_wall_daemon::config::DaemonConfig::defaults_for_fortress);
+    let (policy_dir, pinned_key) = match (explicit_policy_dir, explicit_pinned, derived) {
+        (Some(dir), Some(key), _) => (dir, key),
+        (dir, key, Some(defaults)) => (
+            dir.unwrap_or(defaults.policy_dir),
+            key.unwrap_or(defaults.pinned_public_key_path),
+        ),
+        _ => {
+            // SAFETY: stderr is the CLI preflight-failure contract, as below.
+            eprintln!(
+                "castle-wall-daemon: preflight-manifest FAILED — pass --fortress-id, or both \
+                 --policy-dir and --pinned-public-key, so the check reads the manifest you mean"
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let outcome = castle_wall_daemon::policy::preflight_manifest(&policy_dir, &pinned_key);
+    if outcome.is_ok() {
+        // SAFETY: stdout is the CLI preflight-result contract here, not a log channel.
+        // An operator and an upgrade script both read this exact line.
+        println!(
+            "castle-wall-daemon: preflight-manifest — {}",
+            outcome.message()
+        );
+        ExitCode::SUCCESS
+    } else {
+        // SAFETY: stderr is the CLI preflight-failure contract. The nonzero exit beside
+        // this line is what aborts an upgrade before the binary is replaced.
+        eprintln!(
+            "castle-wall-daemon: preflight-manifest FAILED — {}",
+            outcome.message()
+        );
+        ExitCode::from(1)
+    }
+}
+
+/// The value following `flag` in `args`, when present.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
 /// Which host-global paths `--disarm` operates on. Always production unless a
 /// test-isolation build was given `--isolated-runtime-root`.
 fn resolve_disarm_paths(args: &[String]) -> castle_wall_daemon::config::LinuxRuntimePaths {
@@ -183,6 +250,15 @@ fn main() -> ExitCode {
     // normal daemon lifecycle: ordinary shutdown / SIGTERM / systemd stop never
     // disarm. It needs no fortress config (it operates on the host-global lock,
     // journal, and table).
+    // Pre-replacement check. Handled BEFORE `--disarm` and before the run-config
+    // parser, and deliberately NOT a mode of the daemon lifecycle: it takes no lock,
+    // touches no kernel state, and so is the one verb that is safe to run while the
+    // daemon is up. Must match `crate::policy::preflight_manifest`, which enforces
+    // that by construction.
+    if has_structural_flag(&args, "--preflight-manifest") {
+        return run_preflight_manifest(&args);
+    }
+
     if has_structural_flag(&args, "--disarm") {
         return run_disarm(&args);
     }
@@ -270,6 +346,17 @@ fn main() -> ExitCode {
                 }
                 castle_wall_daemon::runtime_health::RuntimeHealthState::ProbeUnavailable => {
                     Some("kernel runtime health was unprovable".to_string())
+                }
+                // A proven loss with a safety-net attempt still outstanding. Reported
+                // as a smoke failure (it is not readiness) and NEVER treated as ready,
+                // but it is named distinctly from a plain loss so the harness output
+                // says the net was going in rather than implying nothing happened.
+                // Must match `RuntimeHealthState::Recovering`.
+                castle_wall_daemon::runtime_health::RuntimeHealthState::Recovering(reason) => {
+                    Some(format!(
+                        "kernel runtime was lost and the safety net is being installed \
+                         for it: {reason:?}"
+                    ))
                 }
                 castle_wall_daemon::runtime_health::RuntimeHealthState::Ready
                 | castle_wall_daemon::runtime_health::RuntimeHealthState::NoRuntime => None,
