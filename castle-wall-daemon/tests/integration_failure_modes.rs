@@ -53,7 +53,6 @@ mod isolation;
 
 use base64::Engine as _;
 use castle_wall_daemon::audit::WalWriter;
-use castle_wall_daemon::cgroup;
 use castle_wall_daemon::config::DaemonConfig;
 use castle_wall_daemon::daemon::{boot, mode_for_error, refuse_to_start_message, DaemonError};
 use castle_wall_daemon::failure::{default_disposition, FailureDisposition, FailureMode};
@@ -62,11 +61,26 @@ use castle_wall_daemon::ipc::framing::{frame, parse_frame, ParseStep};
 use castle_wall_daemon::ipc::messages::{IpcMessage, MessageEnvelope};
 use castle_wall_daemon::manifest::canonical_json::canonicalize_to_bytes;
 use castle_wall_daemon::manifest::verify::{
-    AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+    AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
 };
 use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
 use castle_wall_daemon::nfqueue::{NfqueueConfig, QueueHandle};
-use castle_wall_daemon::nftables::{self, AgentRulesetId, NftRuleFragment, CASTLE_FAMILY};
+use castle_wall_daemon::nftables::{
+    self, AgentRulesetId, AgentUidBinding, NftRuleFragment, CASTLE_FAMILY,
+};
+
+/// The uid these tests bind an agent to, and the manifest ceiling it clears.
+/// Deliberately a uid with no account: nft validates nothing about a `meta
+/// skuid` value at rule-load time, so no system user has to exist on the runner.
+const TEST_AGENT_UID: u32 = 60123;
+const TEST_UID_CEILING: u32 = 1000;
+
+fn test_binding() -> AgentUidBinding {
+    AgentUidBinding {
+        agent_uid: TEST_AGENT_UID,
+        system_uid_allow_ceiling: TEST_UID_CEILING,
+    }
+}
 use castle_wall_daemon::policy::{DeniedReason, EvaluationRequest, Verdict};
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
@@ -123,17 +137,30 @@ fn write_pinned_key(dir: &Path, signing: &SigningKey) -> PathBuf {
     path
 }
 
-fn write_signed_manifest_one_rule(policy_dir: &Path, signing: &SigningKey) {
+/// A manifest the daemon actually ADMITS, optionally carrying a signed
+/// `uid`-mode agent origin.
+///
+/// Its rule pins ip/port/protocol, which this daemon CAN enforce, so the manifest
+/// is genuinely in force. An earlier `match.host` writer lived here and was
+/// rejected at boot, leaving the daemon with NO policy; it was removed once its
+/// last caller (the F-3 IPC-persistence test) moved to this one, because a test
+/// that installs a per-agent kernel binding under a rejected manifest asserts over
+/// an inventory production refuses. Failure mode if a rejected manifest is used
+/// again: the daemon logs a manifest-refused line, runs with no policy, and the
+/// binding comparison refuses for a reason that has nothing to do with the uid.
+fn write_admitted_manifest_with_origin(
+    policy_dir: &Path,
+    signing: &SigningKey,
+    agent_origin: Option<AgentOrigin>,
+) {
     fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
-    let body = format!(
-        "{{\"id\":\"{}\",\"schema_version\":1,\"created_at\":\"2026-05-06T00:00:00Z\",\"match\":{{\"host\":[\"example.com\"],\"port\":[443],\"protocol\":\"tcp\"}},\"disposition\":\"allow\"}}",
-        "rule-allow-example"
-    );
-    let body_bytes = body.into_bytes();
-    let file = "rule-allow-example.json";
-    fs::write(policy_dir.join(RULES_SUBDIR).join(file), &body_bytes).unwrap();
-    // Every composed manifest must carry the genuine habeas local lane
-    // (always-on-lane gate); the daemon refuses a lane-less manifest.
+    let body = "{\"id\":\"rule-allow-ip\",\"schema_version\":1,\"created_at\":\"2026-05-06T00:00:00Z\",\"match\":{\"ip\":[\"203.0.113.10\"],\"port\":[443],\"protocol\":\"tcp\"},\"disposition\":\"allow\"}";
+    let body_bytes = body.as_bytes();
+    fs::write(
+        policy_dir.join(RULES_SUBDIR).join("rule-allow-ip.json"),
+        body_bytes,
+    )
+    .unwrap();
     let habeas_body = castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes();
     fs::write(
         policy_dir
@@ -142,19 +169,18 @@ fn write_signed_manifest_one_rule(policy_dir: &Path, signing: &SigningKey) {
         habeas_body,
     )
     .unwrap();
-
     let manifest = AllowlistManifest {
         schema_version: 1,
         fortress_id: "deadbeef".to_string(),
         issued_at: "2026-05-06T00:00:00Z".to_string(),
         generation: 1,
-        agent_origin: None,
+        agent_origin,
         operator_baseline: None,
         rules: vec![
             ManifestRuleEntry {
-                rule_id: "rule-allow-example".to_string(),
-                file: file.to_string(),
-                sha256: sha256_hex(&body_bytes),
+                rule_id: "rule-allow-ip".to_string(),
+                file: "rule-allow-ip.json".to_string(),
+                sha256: sha256_hex(body_bytes),
             },
             ManifestRuleEntry {
                 rule_id: "reserved_habeas_distress_local".to_string(),
@@ -177,8 +203,39 @@ fn write_signed_manifest_one_rule(policy_dir: &Path, signing: &SigningKey) {
                 .encode(sig.to_bytes()),
         },
     };
-    let serialized = serde_json::to_string_pretty(&signed).unwrap();
-    fs::write(policy_dir.join(MANIFEST_FILENAME), serialized).unwrap();
+    fs::write(
+        policy_dir.join(MANIFEST_FILENAME),
+        serde_json::to_string_pretty(&signed).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A manifest the daemon admits, carrying a signed `uid`-mode agent origin.
+///
+/// A per-agent kernel binding is only legitimate because a manifest in force
+/// confines that uid, so any test that installs one and then expects a restart to
+/// ADOPT it must publish the matching origin. Without it the restart is being
+/// asked to vouch for a binding nothing in force describes, and refusing is the
+/// correct answer, not a test failure.
+fn write_signed_manifest_one_rule_with_uid_origin(
+    policy_dir: &Path,
+    signing: &SigningKey,
+    agent_uid: u32,
+    system_uid_allow_ceiling: u32,
+) {
+    write_admitted_manifest_with_origin(
+        policy_dir,
+        signing,
+        Some(AgentOrigin {
+            mode: "uid".to_string(),
+            egress_helper_signing_id: None,
+            egress_helper_team_id: None,
+            agent_runtime_port_range: None,
+            agent_uid: Some(agent_uid),
+            gate_uid: None,
+            system_uid_allow_ceiling,
+        }),
+    )
 }
 
 fn write_bad_signature_manifest(policy_dir: &Path, signing: &SigningKey) {
@@ -373,27 +430,34 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
     let dir = TempDir::new().unwrap();
     let signing = SigningKey::generate(&mut OsRng);
     let config = fresh_config(&dir, &signing);
+    // A per-agent kernel binding exists only because a manifest in force confines
+    // that uid, so BOTH boots publish the signed origin. A restart asked to adopt
+    // a binding with no confining manifest correctly refuses, and that refusal has
+    // its own test below.
+    write_signed_manifest_one_rule_with_uid_origin(
+        &config.policy_dir,
+        &signing,
+        TEST_AGENT_UID,
+        TEST_UID_CEILING,
+    );
     let socket_path = config.socket_path.clone();
 
     let handle = boot(config).expect("boot");
     nftables::install_castle_table().expect("install_castle_table");
 
-    // Real agent scope so the production rule's cgroupv2 path lookup
-    // succeeds at rule-load time.
-    let scope = cgroup::create_agent_scope("f2-test").expect("create_agent_scope");
-    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
     let id = AgentRulesetId {
         agent_id: "f2-test".to_string(),
-        cgroup_path: scope.cgroup_path.clone(),
+        // Must match `DaemonConfig.fortress_id` in `fresh_config` and the
+        // `fortress_id` in the signed manifest: the seal is recomputed under the
+        // fortress the CURRENT snapshot names, so a mismatch reads as foreign.
+        fortress_id: "deadbeef".to_string(),
     };
     let frags = vec![NftRuleFragment {
         rule_id: "r-f2".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script =
-        nftables::build_agent_ruleset("f2-test", &cgroup_relative, scope.cgroup_level, &frags);
-    nftables::load_agent_ruleset(&id, &script, scope.cgroup_level, &cgroup_relative)
-        .expect("load_agent_ruleset");
+    let script = nftables::build_agent_ruleset("f2-test", TEST_AGENT_UID, &frags);
+    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load_agent_ruleset");
 
     // Sanity: the chain is in the kernel before the simulated crash.
     let pre = Command::new("nft")
@@ -430,6 +494,12 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
     let signing2 = SigningKey::generate(&mut OsRng);
     let dir2 = TempDir::new().unwrap();
     let config2 = fresh_config(&dir2, &signing2);
+    write_signed_manifest_one_rule_with_uid_origin(
+        &config2.policy_dir,
+        &signing2,
+        TEST_AGENT_UID,
+        TEST_UID_CEILING,
+    );
     let handle2 = boot(config2).expect("re-boot");
     nftables::install_castle_table().expect("install idempotent");
     let still_present = Command::new("nft")
@@ -453,7 +523,89 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
     }
 
     let _ = handle2.stop();
-    let _ = cgroup::destroy_agent_scope(&scope);
+    cleanup_castle_table();
+}
+
+/// A restart whose manifest confines NO agent uid must REFUSE a live per-agent
+/// binding rather than adopt it.
+///
+/// This is the security half of the reclaim comparison, and it is the case that
+/// separates "the kernel state is internally consistent" from "the kernel state
+/// is what the operator signed". The live table here is pristine: correct shape,
+/// correct seal, body and jump in agreement, exact rule counts. Everything that
+/// can be checked by reading the kernel passes. Only the trusted expectation is
+/// missing, and absent is not passing: a daemon that cannot say which uid it is
+/// supposed to be confining cannot vouch for a rule that confines one.
+///
+/// Failure mode if this regresses, as an operator sees it: a daemon boots with no
+/// policy in force, silently adopts whatever per-agent rule it finds in the
+/// kernel, and reports a healthy wall while enforcing a binding nothing in force
+/// describes.
+#[test]
+fn a_live_agent_binding_is_refused_when_the_restart_confines_no_uid() {
+    let _suite = isolation::guard();
+    cleanup_castle_table();
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    let config = fresh_config(&dir, &signing);
+    write_signed_manifest_one_rule_with_uid_origin(
+        &config.policy_dir,
+        &signing,
+        TEST_AGENT_UID,
+        TEST_UID_CEILING,
+    );
+
+    let handle = boot(config).expect("boot");
+    nftables::install_castle_table().expect("install_castle_table");
+    let id = AgentRulesetId {
+        agent_id: "unconfined-restart".to_string(),
+        fortress_id: "deadbeef".to_string(),
+    };
+    let script = nftables::build_agent_ruleset("unconfined-restart", TEST_AGENT_UID, &[]);
+    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load_agent_ruleset");
+    drop(handle);
+
+    // Restart with a manifest carrying NO agent origin: a legitimate unwrapped
+    // posture that confines nobody. The live binding is now unverifiable.
+    let signing2 = SigningKey::generate(&mut OsRng);
+    let dir2 = TempDir::new().unwrap();
+    let config2 = fresh_config(&dir2, &signing2);
+    // An ADMITTED manifest that simply carries no agent origin: the legitimate
+    // unwrapped posture. Using a manifest the daemon REJECTS would refuse the
+    // binding for the wrong reason and the test would pass without testing this.
+    write_admitted_manifest_with_origin(&config2.policy_dir, &signing2, None);
+
+    match boot(config2) {
+        Ok(_) => panic!(
+            "a restart that confines no agent uid must refuse a live per-agent binding, \
+             not adopt it"
+        ),
+        Err(err) => {
+            let message = err.to_string();
+            assert!(
+                matches!(err, DaemonError::KernelRuntimeActivation(_)),
+                "the refusal must be a kernel-runtime activation failure; got: {err:?}"
+            );
+            assert!(
+                message.contains("confines no agent uid"),
+                "the refusal must name WHY it refused, so an operator can act on it; got: {message}"
+            );
+        }
+    }
+
+    // Fail-CLOSED, not fail-open: no `policy accept` castle table may survive the
+    // refusal. A refusal that left an accept base standing would be a worse
+    // outcome than adopting, because it looks like a wall and is not one.
+    let after = Command::new("nft")
+        .args(["list", "table", CASTLE_FAMILY, isolation::table()])
+        .output()
+        .expect("post-refusal list");
+    let after_out = String::from_utf8_lossy(&after.stdout);
+    assert!(
+        !after_out.contains("policy accept"),
+        "the refusal must not leave a `policy accept` castle table standing; got: {after_out}"
+    );
+
     cleanup_castle_table();
 }
 
@@ -466,26 +618,52 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
     let dir = TempDir::new().unwrap();
     let signing = SigningKey::generate(&mut OsRng);
     let config = fresh_config(&dir, &signing);
-    write_signed_manifest_one_rule(&config.policy_dir, &signing);
+    // An ADMITTED manifest that publishes the SIGNED uid origin for the binding
+    // this test installs below. This test previously wrote a `match.host`
+    // manifest the daemon REJECTS, so it ran with no policy in force, the live
+    // per-agent binding was unverifiable, and the IPC-persistence assertion was
+    // made over an inventory production refuses.
+    write_signed_manifest_one_rule_with_uid_origin(
+        &config.policy_dir,
+        &signing,
+        TEST_AGENT_UID,
+        TEST_UID_CEILING,
+    );
     let socket_path = config.socket_path.clone();
     let fortress_id = config.fortress_id.clone();
 
     let handle = boot(config).expect("boot");
+    // Idempotent by contract (`install_castle_table_impl` re-adds nothing when the
+    // table exists), so this does NOT replace the table `boot` just acquired; it
+    // only covers a host where activation left no table to load into. Deleting
+    // and recreating here would hand the daemon a different owner marker and the
+    // ownership assertion below would be made over an inventory production
+    // refuses.
     nftables::install_castle_table().expect("install");
 
-    let scope = cgroup::create_agent_scope("f3-test").expect("create_agent_scope");
-    let cgroup_relative = cgroup::cgroup_relative_path(&scope).expect("cgroup_relative_path");
     let id = AgentRulesetId {
         agent_id: "f3-test".to_string(),
-        cgroup_path: scope.cgroup_path.clone(),
+        // Must match `DaemonConfig.fortress_id` in `fresh_config` and the
+        // `fortress_id` in the signed manifest: the seal is recomputed under the
+        // fortress the CURRENT snapshot names, so a mismatch reads as foreign.
+        fortress_id: "deadbeef".to_string(),
     };
     let frags = vec![NftRuleFragment {
         rule_id: "r-f3".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script =
-        nftables::build_agent_ruleset("f3-test", &cgroup_relative, scope.cgroup_level, &frags);
-    nftables::load_agent_ruleset(&id, &script, scope.cgroup_level, &cgroup_relative).expect("load");
+    let script = nftables::build_agent_ruleset("f3-test", TEST_AGENT_UID, &frags);
+    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load");
+
+    // The binding is legitimate only because the manifest in force confines this
+    // uid; prove the daemon's own health poll reads the live table as OWNED
+    // before the IPC drop, so what persists below is a supervised inventory. The
+    // shared helper waits out the readiness cache, so this is an observation
+    // taken AFTER the load rather than a cached reading of the pre-load table.
+    isolation::assert_ownership_health_after_install(
+        &handle,
+        "f3 fixture after uid-binding install",
+    );
 
     // Connect, handshake, then forcibly close the client side mid-session.
     let stream = connect_with_handshake(&socket_path, &signing, &fortress_id);
@@ -543,7 +721,6 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
 
     drop(stream2);
     let _ = handle.stop();
-    let _ = cgroup::destroy_agent_scope(&scope);
     cleanup_castle_table();
 }
 

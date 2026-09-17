@@ -2,14 +2,28 @@
 //!
 //! Per scope-lock section 1 Option A: the daemon shells out to the `nft` binary
 //! with atomic ruleset replacement, installs rules in a dedicated
-//! `sanctuary-castle` table (E7.2 namespace separation), binds rules to
-//! cgroup IDs via `socket cgroupv2 level N "<scope-path>"` matches.
+//! `sanctuary-castle` table (E7.2 namespace separation), and binds an agent's
+//! rules to that agent's uid via `meta skuid <uid>` matches.
+//!
+//! ## What `meta skuid` matches, precisely
+//!
+//! On Linux 6.8 `nft_meta` reads `sock->file->f_cred->fsuid`, translated through
+//! the user namespace of the socket's network namespace. The expression is
+//! UNAVAILABLE, so the packet does not match, in exactly three cases: no socket,
+//! no backing file, or a socket-versus-packet network-namespace mismatch. A uid
+//! with NO mapping in that user namespace is NOT one of them: the kernel renders
+//! it through `from_kuid_munged` as the overflow uid (65534), which then matches
+//! nothing the manifest names. Either way the packet falls through to the base
+//! chain's `policy accept`, but the two are different mechanisms and must not be
+//! collapsed. The guarantee is bounded to SOCKET credentials, and only while the
+//! rule exists: an inherited or passed socket, another network namespace, a
+//! `setfsuid` divergence, or a uid hop on a NEW socket all leave the match. Each
+//! of those is a row in the private defect register; none is closed here.
 //!
 //! All kernel-touching functions are `#[cfg(target_os = "linux")]`-gated;
 //! on macOS (the dev sandbox) the stubs return structured errors so
 //! `cargo check` passes cross-platform.
 
-use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -34,11 +48,98 @@ pub enum NftablesError {
     ForeignState(String),
 }
 
-/// Identifier for a wrapped agent's cgroup-bound ruleset.
+/// Identifier for a wrapped agent's uid-bound ruleset.
+///
+/// `fortress_id` is not decoration: it is a seal input, so the same agent id and
+/// uid under a DIFFERENT fortress produce a different `agent_uid_seal` and the
+/// live rule fails to verify. Must match `AllowlistManifest.fortress_id` in
+/// `src/manifest/verify.rs` and `PolicySnapshot::fortress_id` in `src/policy.rs`;
+/// the verification side reads it from the CURRENT policy snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRulesetId {
     pub agent_id: String,
-    pub cgroup_path: PathBuf,
+    pub fortress_id: String,
+}
+
+/// The manifest-derived kernel binding one agent's rules are emitted from.
+///
+/// BOTH fields come from the SIGNED manifest's `agent_origin` (must match
+/// `AgentOrigin.agent_uid` / `AgentOrigin.system_uid_allow_ceiling` in
+/// `src/manifest/verify.rs`, admitted by `confined_agent_uid_from_loaded_manifest`
+/// in `src/policy.rs`); neither is ever read from local configuration. The
+/// ceiling travels WITH the uid so the emission site can prove, at the moment it
+/// seals a uid into a kernel rule, that the uid still clears the floor admission
+/// accepted it under — a snapshot swap between admission and emission cannot
+/// silently lower it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentUidBinding {
+    pub agent_uid: u32,
+    pub system_uid_allow_ceiling: u32,
+}
+
+/// What a verification site knows about the agent binding the live kernel rules
+/// are ALLOWED to carry. Named states, because the three are not interchangeable
+/// and the difference is the whole security content of the check: an
+/// internally-consistent inventory whose uid and seal were BOTH rewritten is
+/// refused only by [`Self::Confined`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpectedAgentBinding {
+    /// The CURRENT policy snapshot confines `agent_uid` under `fortress_id`.
+    /// Every live per-agent binding must carry exactly this uid AND a seal that
+    /// recomputes under this fortress id. This is the trusted expectation the
+    /// design names, and it is read fresh at each comparison, never frozen at
+    /// acquisition: a manifest reload that changes the uid must invalidate a
+    /// stale kernel binding rather than keep blessing it.
+    Confined { fortress_id: String, agent_uid: u32 },
+    /// The current snapshot confines NO agent uid (absent `agent_origin`, or a
+    /// non-`uid` mode), or the table was just created and cannot yet hold one.
+    /// Any live per-agent binding is then unverifiable against a trusted
+    /// expectation, so it reads foreign — absent evidence is not passing
+    /// evidence.
+    NoneConfined,
+    /// Shape, seal, agreement and cardinality only, under `fortress_id`, with the
+    /// uid NOT compared against a manifest expectation.
+    ///
+    /// Used ONLY where the caller genuinely holds no trusted expectation and the
+    /// operation's direction is already fail-closed: the pre-mutation ownership
+    /// precondition (which is followed by a real health poll that DOES compare),
+    /// and the disarm path (which deletes the table outright, so refusing on a
+    /// uid mismatch would wedge recovery rather than protect anything). It is
+    /// never correct on the reclaim, adoption or health paths.
+    SealOnly { fortress_id: String },
+    /// Shape, body/jump agreement and cardinality only, with NEITHER the seal
+    /// recomputed nor the uid compared, because the caller holds neither a
+    /// fortress id nor a manifest expectation.
+    ///
+    /// Used ONLY by the disarm path, whose verification exists to answer one
+    /// question — has this table drifted off the identity we captured, so that
+    /// deleting it would clobber someone else's state? — and which then DELETES
+    /// the table. Refusing there on a seal or uid mismatch would wedge the one
+    /// recovery path an operator has, while protecting nothing: the table is
+    /// about to cease to exist either way. It is never correct on a path that
+    /// keeps the table standing.
+    StructureOnly,
+}
+
+impl ExpectedAgentBinding {
+    /// The fortress id the seal is recomputed under, when the site has one.
+    /// [`Self::NoneConfined`] has none and needs none: it refuses every
+    /// per-agent binding before any seal is recomputed.
+    fn seal_fortress_id(&self) -> Option<&str> {
+        match self {
+            Self::Confined { fortress_id, .. } | Self::SealOnly { fortress_id } => {
+                Some(fortress_id.as_str())
+            }
+            Self::NoneConfined | Self::StructureOnly => None,
+        }
+    }
+
+    /// Whether a live per-agent binding may stand without a recomputable seal.
+    /// True only for [`Self::StructureOnly`]; every other state either supplies
+    /// a fortress id to recompute against or refuses the binding outright.
+    fn tolerates_unverifiable_seal(&self) -> bool {
+        matches!(self, Self::StructureOnly)
+    }
 }
 
 /// The dedicated nftables table name PRODUCTION installs into. Per scope-lock
@@ -140,6 +241,59 @@ const AGENT_CHAIN_PREFIX: &str = "agent_";
 /// the journal records for the same acquisition (see `ownership_journal`).
 pub const OWNER_MARKER_PREFIX: &str = "sanctuary-castle-owner:v1:";
 
+/// nft's hard cap on a rule `comment`, in bytes (confirmed on nft 1.0.9). A
+/// comment over this is rejected at rule-load time, so every marker-bound
+/// comment this module emits must be proven to fit BEFORE emission — a
+/// load-time rejection mid-transaction leaves the agent with no binding at all.
+const NFT_RULE_COMMENT_MAX_LEN: usize = 128;
+
+/// Hex characters in an ownership marker's nonce: the acquisition path reads 16
+/// random bytes and hex-encodes them (see `new_owner_marker` in
+/// `runtime_providers.rs` and `fresh_install_owner_marker` below), and hex is 2
+/// characters per byte.
+const OWNER_MARKER_NONCE_HEX_LEN: usize = 2 * 16;
+
+/// Hex characters in an agent-uid seal: [`agent_uid_seal`] truncates SHA-256 to
+/// 8 bytes, and hex is 2 characters per byte.
+const AGENT_UID_SEAL_HEX_LEN: usize = 2 * 8;
+
+/// The delimiter that separates the agent id from its uid seal inside a
+/// marker-bound rule comment. Must match the split the inventory parser performs
+/// (`parse_owned_table_inventory`); the parser and the emitter share this
+/// constant precisely so the two can never disagree by a typo.
+const AGENT_UID_SEAL_INFIX: &str = ":uid:";
+
+/// The LONGEST role infix a SEALED rule comment can carry. `:jump:` is shorter,
+/// and `:failclosed:`, though longer still, carries no seal and no agent-uid
+/// suffix, so it is not the binding case (its worst comment is
+/// marker + 12 + MAX_AGENT_ID_LEN, comfortably inside the cap).
+const LONGEST_SEALED_ROLE_INFIX: &str = ":queue:";
+
+/// Longest byte length an agent id may carry and still leave every marker-bound
+/// rule comment inside nft's cap. Derived from the parts, never a literal, so a
+/// change to the marker, the seal width or the role names moves this with them:
+///
+/// ```text
+///   NFT_RULE_COMMENT_MAX_LEN      128
+/// - OWNER_MARKER_PREFIX.len()      26  "sanctuary-castle-owner:v1:"
+/// - OWNER_MARKER_NONCE_HEX_LEN     32  16 random bytes as hex
+/// - LONGEST_SEALED_ROLE_INFIX.len() 7  ":queue:"
+/// - AGENT_UID_SEAL_INFIX.len()      5  ":uid:"
+/// - AGENT_UID_SEAL_HEX_LEN         16  8 digest bytes as hex
+/// =                                42
+/// ```
+///
+/// This TIGHTENS the previous 128-byte agent-id grammar. An agent id between 43
+/// and 128 bytes that was accepted before is now refused at
+/// `validate_agent_binding_input` rather than accepted and then rejected by nft
+/// with an opaque load-time error.
+const MAX_AGENT_ID_LEN: usize = NFT_RULE_COMMENT_MAX_LEN
+    - OWNER_MARKER_PREFIX.len()
+    - OWNER_MARKER_NONCE_HEX_LEN
+    - LONGEST_SEALED_ROLE_INFIX.len()
+    - AGENT_UID_SEAL_INFIX.len()
+    - AGENT_UID_SEAL_HEX_LEN;
+
 /// The exact, verified identity of a `sanctuary-castle` table THIS daemon
 /// created and owns. (blocker 2/3)
 ///
@@ -230,8 +384,18 @@ pub fn reset_runtime_ownership_for_tests() {
 #[cfg(all(not(target_os = "linux"), feature = "test-isolation"))]
 pub fn reset_runtime_ownership_for_tests() {}
 
+/// Prove the live table is still exactly this process's owned object BEFORE a
+/// privileged agent mutation touches it.
+///
+/// `fortress_id` is the seal domain the caller is about to emit under, so a
+/// pre-existing binding sealed under a DIFFERENT fortress fails here. The uid is
+/// deliberately NOT compared: this is a precondition on the object being
+/// mutated, and the caller may legitimately be replacing an older uid binding.
+/// The trusted manifest comparison happens on the reclaim/adoption and health
+/// paths, which read the CURRENT snapshot; the next health poll after this
+/// mutation is that comparison.
 #[cfg(target_os = "linux")]
-fn verify_active_runtime_ownership() -> Result<(), NftablesError> {
+fn verify_active_runtime_ownership(fortress_id: &str) -> Result<(), NftablesError> {
     if castle_table() != CASTLE_TABLE {
         // The integration-test namespace has no production journal. Its
         // isolation prefix and test-build mutation guard are the boundary.
@@ -249,7 +413,12 @@ fn verify_active_runtime_ownership() -> Result<(), NftablesError> {
                     .to_string(),
             )
         })?;
-    verify_owned_castle_table(&active)
+    verify_owned_castle_table(
+        &active,
+        &ExpectedAgentBinding::SealOnly {
+            fortress_id: fortress_id.to_string(),
+        },
+    )
 }
 
 /// A single nftables rule fragment generated from a PolicySnapshot rule.
@@ -266,28 +435,20 @@ pub struct NftRuleFragment {
 /// `sanctuary-castle` table. The chain ends with a `queue num 0` verdict
 /// for any unmatched traffic (NFQUEUE with FAIL_OPEN explicitly off).
 ///
-/// `cgroup_relative_path` is the cgroup-v2 path with the `/sys/fs/cgroup/`
-/// prefix stripped, e.g. `system.slice/sanctuary-agent-foo.service`. nft
-/// expects a quoted path string at rule-load time and walks
-/// `/sys/fs/cgroup/<path>` at depth `cgroup_level` to validate the cgroup
-/// exists. Earlier production code emitted the cgroup inode integer
-/// instead, which nft 1.x rejects: the integer is the post-resolution
-/// internal form (what `nft list rules` displays back), not the documented
-/// input form. Compute the relative path via `cgroup::cgroup_relative_path`
-/// from a `ScopeHandle.cgroup_path`.
+/// `agent_uid` is the uid the SIGNED manifest binds this agent to
+/// (`agent_origin.agent_uid` in `src/manifest/verify.rs`), never a value read
+/// from local configuration. It is emitted NUMERICALLY, never as an account
+/// name: nft renders `meta skuid` through a uid symbol table, and the ownership
+/// parser accepts only an integer, so a name in either the text or the JSON
+/// listing would read a legitimate rule as foreign. Numeric emission is the one
+/// half of that this daemon controls; the listing form is probed per nftables
+/// version before the shape is trusted.
 ///
-/// `cgroup_level` is the depth at which the agent's cgroup lives in the
-/// cgroup-v2 hierarchy (counted from `/sys/fs/cgroup` as depth 0). It comes
-/// from `cgroup::ScopeHandle::cgroup_level`, which is derived from
-/// systemd's reported ControlGroup. If the level is wrong (because the
-/// deployment is nested), nft rejects with "cgroupv2 path fails: No such
-/// file or directory". Threading the actual level through avoids that.
-pub fn build_agent_ruleset(
-    agent_id: &str,
-    cgroup_relative_path: &str,
-    cgroup_level: u32,
-    rules: &[NftRuleFragment],
-) -> String {
+/// The trailing unconditional `drop` is the chain's fail-closed tail, but note
+/// that it is not what the live guarantee rests on: the `queue num 0` above it
+/// is emitted WITHOUT `bypass`, so an unreachable or unbound NFQUEUE drops the
+/// packet in the kernel rather than releasing it.
+pub fn build_agent_ruleset(agent_id: &str, agent_uid: u32, rules: &[NftRuleFragment]) -> String {
     let chain_name = agent_chain_name(agent_id);
     let castle_table = castle_table();
     let agent_mark = crate::nfqueue::register_agent_mark(agent_id);
@@ -296,8 +457,6 @@ pub fn build_agent_ruleset(
     script.push_str(&format!(
         "flush chain {CASTLE_FAMILY} {castle_table} {chain_name}\n"
     ));
-    // cgroup match: only packets from this agent's cgroup enter this chain.
-    // The cgroup match is installed as a jump rule in the base output chain.
     // Static fragments are intentionally ignored. All signed rule semantics
     // execute in the ordered Rust evaluator behind the one NFQUEUE rule below.
     // Keeping this parameter during the API migration avoids a broad caller
@@ -307,53 +466,48 @@ pub fn build_agent_ruleset(
     // Per scope-lock section 1: `queue num 0` without `bypass` flag.
     script.push_str(&format!(
         "add rule {CASTLE_FAMILY} {castle_table} {chain_name} \
-         socket cgroupv2 level {cgroup_level} \"{cgroup_relative_path}\" \
+         meta skuid {agent_uid} \
          meta mark set 0x{agent_mark:08x} queue num 0\n\
          add rule {CASTLE_FAMILY} {castle_table} {chain_name} drop\n"
     ));
     script
 }
 
-/// Build the jump rule that routes packets from an agent's cgroup-v2
-/// directory into its per-agent chain in the `sanctuary-castle` output
-/// chain. Pure helper: emits the nft rule string only; callers shell out
-/// to apply it.
+/// Build the jump rule that routes an agent's uid-owned packets into its
+/// per-agent chain in the `sanctuary-castle` output chain. Pure helper: emits
+/// the nft rule string only; callers shell out to apply it.
 ///
 /// The base `output` chain created by [`install_castle_table`] is hooked
 /// into netfilter (`type filter hook output priority 0`) but has no rules
 /// of its own. Per-agent chains are non-base chains and stay dead until
 /// something jumps to them. This helper produces the `goto agent_<id>`
-/// rule that gates entry into the per-agent chain on the cgroup-v2
-/// `socket cgroupv2 level <N> "<path>"` match: only packets owned by a
-/// socket inside the agent's cgroup transit the per-agent rules. Every
-/// other packet in the operator's host (browser, OS daemons, the
-/// operator's other apps) flows past the jump and is allowed by the base
+/// rule that gates entry into the per-agent chain on `meta skuid <uid>`:
+/// only packets whose socket carries the agent's uid transit the per-agent
+/// rules. Every other packet in the operator's host (browser, OS daemons,
+/// the operator's other apps) flows past the jump and is allowed by the base
 /// chain's `policy accept`.
 ///
-/// The path is quoted at emission time (the same correctness invariant
-/// pinned for [`build_agent_ruleset`] in PR #130). `cgroup_level` mirrors
-/// the same dynamic-depth shape: depth 2 in canonical
-/// `system.slice/<unit>` placement, deeper for nested deployments.
-pub fn build_agent_jump_rule(
-    agent_id: &str,
-    cgroup_level: u32,
-    cgroup_relative_path: &str,
-) -> String {
+/// INVARIANT: the verdict is `goto`, not `jump`. `goto` is TERMINATING, so
+/// control never returns to the accept-policy base chain after the per-agent
+/// chain runs; a `jump` would fall back through to `policy accept` and silently
+/// undo the per-agent decision. `validate_owned_jump_expr` pins the same verb on
+/// the parse side.
+pub fn build_agent_jump_rule(agent_id: &str, agent_uid: u32) -> String {
     let chain_name = agent_chain_name(agent_id);
     let castle_table = castle_table();
     format!(
         "add rule {CASTLE_FAMILY} {castle_table} output \
-         socket cgroupv2 level {cgroup_level} \"{cgroup_relative_path}\" goto {chain_name}"
+         meta skuid {agent_uid} goto {chain_name}"
     )
 }
 
-/// Build a fail-closed per-agent chain body for a refreshed cgroup.
+/// Build a fail-closed per-agent chain body: one unconditional `drop`.
 ///
-/// During systemd scope recreation there is a short interval where the old
-/// base-chain jump points at an obsolete cgroup identity and the new cgroup
-/// identity is not yet wired. This ruleset is the first stage of refresh:
-/// replace the per-agent chain with a single drop verdict, then wire the
-/// refreshed cgroup jump to it before the normal policy rules are restored.
+/// Used to park an agent's chain at deny while its binding is being replaced, so
+/// the window between "old body flushed" and "new body installed" can never be a
+/// window where the agent's packets fall through to `policy accept`. The body
+/// carries NO uid match and therefore NO seal — there is nothing to seal, and
+/// `parse_owned_table_inventory` refuses a fail-closed body that carries one.
 pub fn build_agent_fail_closed_ruleset(agent_id: &str) -> String {
     let chain_name = agent_chain_name(agent_id);
     let castle_table = castle_table();
@@ -827,7 +981,12 @@ mod linux {
         // default, while the ownership parser deliberately requires both the
         // table and base-chain handles as part of the exact live identity.
         let json = run_nft(&["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
-        let owned = super::parse_owned_table_identity(&json)?;
+        // A table this daemon just created with `create table` holds ZERO agent
+        // chains by construction, so any per-agent binding present here is
+        // something this process did not install: refuse it rather than capture
+        // an identity over state of unknown provenance.
+        let owned =
+            super::parse_owned_table_identity(&json, &super::ExpectedAgentBinding::NoneConfined)?;
         if owned.marker != expected_marker {
             return Err(NftablesError::ForeignState(format!(
                 "captured table marker does not match the marker just written \
@@ -844,9 +1003,10 @@ mod linux {
     /// chain, or a marker change all fail here. (blocker 2)
     pub fn verify_owned_castle_table_impl(
         ownership: &CastleTableOwnership,
+        expectation: &super::ExpectedAgentBinding,
     ) -> Result<Vec<String>, NftablesError> {
         let json = run_nft(&["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
-        let live = super::parse_owned_table_inventory(&json)?;
+        let live = super::parse_owned_table_inventory(&json, expectation)?;
         if &live.ownership == ownership {
             Ok(live.agent_ids)
         } else {
@@ -877,9 +1037,10 @@ mod linux {
     /// or resolves to a different object we already refused above.
     pub fn remove_owned_castle_table_impl(
         ownership: &CastleTableOwnership,
+        expectation: &super::ExpectedAgentBinding,
     ) -> Result<(), NftablesError> {
         // Prove the live table is still exactly ours before removing anything.
-        verify_owned_castle_table_impl(ownership)?;
+        verify_owned_castle_table_impl(ownership, expectation)?;
         run_nft(&[
             "delete",
             "table",
@@ -893,16 +1054,15 @@ mod linux {
     fn replace_agent_chain_and_jump_impl(
         id: &AgentRulesetId,
         ruleset_script: &str,
-        cgroup_level: u32,
-        cgroup_relative_path: &str,
+        binding: AgentUidBinding,
         fail_closed: bool,
     ) -> Result<(), NftablesError> {
-        super::verify_active_runtime_ownership()?;
-        validate_agent_binding_input(id, cgroup_level, cgroup_relative_path)?;
+        verify_active_runtime_ownership(&id.fortress_id)?;
+        validate_agent_binding_input(id, binding)?;
         let expected_script = if fail_closed {
             build_agent_fail_closed_ruleset(&id.agent_id)
         } else {
-            build_agent_ruleset(&id.agent_id, cgroup_relative_path, cgroup_level, &[])
+            build_agent_ruleset(&id.agent_id, binding.agent_uid, &[])
         };
         if ruleset_script != expected_script {
             return Err(NftablesError::InvocationFailed(
@@ -912,26 +1072,35 @@ mod linux {
         }
         let chain_name = agent_chain_name(&id.agent_id);
         let castle_table = castle_table();
-        let ownership = capture_owned_castle_table_impl_from_live_inventory()?;
+        let ownership = capture_owned_castle_table_impl_from_live_inventory(&id.fortress_id)?;
         let chain_comment = format!("{}:agent:{}", ownership.marker, id.agent_id);
         let rule_role = if fail_closed { "failclosed" } else { "queue" };
-        // GF2: seal the exact installed cgroup path into the authenticated,
-        // marker-bound comment of every rule that carries a `socket cgroupv2`
-        // match (the base-output jump always; the per-agent body only when it is
-        // the queued cgroup match, NOT the fail-closed unconditional drop, which
-        // has no cgroup match to seal). `parse_owned_table_inventory` recomputes
-        // this seal from the live match path and refuses a re-parented/widened
-        // match. Must match the seal the parser recomputes; see `cgroup_path_seal`.
-        let path_seal = super::cgroup_path_seal(cgroup_relative_path);
+        // Seal the exact installed uid into the authenticated, marker-bound
+        // comment of every rule that carries a `meta skuid` match (the
+        // base-output jump always; the per-agent body only when it is the queued
+        // uid match, NOT the fail-closed unconditional drop, which has no uid
+        // match to seal). `parse_owned_table_inventory` recomputes this seal from
+        // the live match value and refuses a rule whose uid was rewritten in
+        // place. Must match the seal the parser recomputes; see `agent_uid_seal`.
+        let uid_seal = super::agent_uid_seal(&id.fortress_id, &id.agent_id, binding.agent_uid);
         let queue_comment = if fail_closed {
             format!("{}:{rule_role}:{}", ownership.marker, id.agent_id)
         } else {
             format!(
-                "{}:{rule_role}:{}:cg:{}",
-                ownership.marker, id.agent_id, path_seal
+                "{}:{rule_role}:{}{}{}",
+                ownership.marker,
+                id.agent_id,
+                super::AGENT_UID_SEAL_INFIX,
+                uid_seal
             )
         };
-        let jump_comment = format!("{}:jump:{}:cg:{}", ownership.marker, id.agent_id, path_seal);
+        let jump_comment = format!(
+            "{}:jump:{}{}{}",
+            ownership.marker,
+            id.agent_id,
+            super::AGENT_UID_SEAL_INFIX,
+            uid_seal
+        );
         let listing = match run_nft(&["-a", "list", "chain", CASTLE_FAMILY, castle_table, "output"])
         {
             Ok(s) => s,
@@ -948,8 +1117,9 @@ mod linux {
             format!("add rule {CASTLE_FAMILY} {castle_table} {chain_name} drop comment \"{queue_comment}\"\n")
         } else {
             let agent_mark = crate::nfqueue::register_agent_mark(&id.agent_id);
+            let agent_uid = binding.agent_uid;
             format!(
-                "add rule {CASTLE_FAMILY} {castle_table} {chain_name} socket cgroupv2 level {cgroup_level} \"{cgroup_relative_path}\" meta mark set 0x{agent_mark:08x} queue num 0 comment \"{queue_comment}\"\n"
+                "add rule {CASTLE_FAMILY} {castle_table} {chain_name} meta skuid {agent_uid} meta mark set 0x{agent_mark:08x} queue num 0 comment \"{queue_comment}\"\n"
             )
         };
         // Chain creation/adoption, body replacement, stale-jump removal, and
@@ -965,46 +1135,67 @@ mod linux {
                 "delete rule {CASTLE_FAMILY} {castle_table} output handle {handle}\n"
             ));
         }
-        let rule = build_agent_jump_rule(&id.agent_id, cgroup_level, cgroup_relative_path);
+        let rule = build_agent_jump_rule(&id.agent_id, binding.agent_uid);
         script.push_str(&format!("{rule} comment \"{jump_comment}\"\n"));
         run_nft_stdin(&script)
     }
 
     fn capture_owned_castle_table_impl_from_live_inventory(
+        fortress_id: &str,
     ) -> Result<CastleTableOwnership, NftablesError> {
         let json = run_nft(&["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
-        super::parse_owned_table_identity(&json)
+        // Seal-only: this reads the marker off a table that may legitimately
+        // already carry an older agent binding, on the way to REPLACING it. The
+        // manifest-uid comparison belongs to the reclaim/adoption and health
+        // paths, which hold the current snapshot.
+        super::parse_owned_table_identity(
+            &json,
+            &ExpectedAgentBinding::SealOnly {
+                fortress_id: fortress_id.to_string(),
+            },
+        )
     }
 
     fn validate_agent_binding_input(
         id: &AgentRulesetId,
-        cgroup_level: u32,
-        cgroup_relative_path: &str,
+        binding: AgentUidBinding,
     ) -> Result<(), NftablesError> {
+        // INVARIANT: an agent id that cannot fit its own sealed comment must be
+        // refused HERE, not by nft. `MAX_AGENT_ID_LEN` is derived from the
+        // comment budget, so an over-long id would otherwise be caught only by an
+        // opaque nft load-time rejection in the middle of the atomic transaction.
         if id.agent_id.is_empty()
-            || id.agent_id.len() > 128
+            || id.agent_id.len() > MAX_AGENT_ID_LEN
             || !id
                 .agent_id
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
         {
+            return Err(NftablesError::InvocationFailed(format!(
+                "agent id is outside the typed nft identifier grammar or exceeds the \
+                 {MAX_AGENT_ID_LEN}-byte sealed-comment budget"
+            )));
+        }
+        // The fortress id is a SEAL INPUT, so an empty one would collapse the
+        // seal's domain separation and let a rule sealed under one fortress
+        // verify under another.
+        if id.fortress_id.is_empty() {
             return Err(NftablesError::InvocationFailed(
-                "agent id is outside the typed nft identifier grammar".to_string(),
+                "agent ruleset id carries no fortress id; the uid seal has no domain".to_string(),
             ));
         }
-        if cgroup_level == 0
-            || cgroup_relative_path.is_empty()
-            || cgroup_relative_path.starts_with('/')
-            || cgroup_relative_path
-                .split('/')
-                .any(|part| part.is_empty() || part == "." || part == "..")
-            || !cgroup_relative_path.bytes().all(|b| {
-                b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'@' | b':')
-            })
-        {
-            return Err(NftablesError::InvocationFailed(
-                "cgroup path/level is outside the typed nft path grammar".to_string(),
-            ));
+        // INVARIANT: uid 0 is root and is never a confined agent, and a uid below
+        // the manifest's `system_uid_allow_ceiling` is a SYSTEM account whose
+        // egress this wall must not claim to gate. Both are already refused at
+        // manifest admission (`confined_agent_uid_from_loaded_manifest` in
+        // `src/policy.rs`); re-checking at the emission site means a caller that
+        // reaches this function by any other route cannot seal a system uid into
+        // a kernel rule. Must match the floors in that function.
+        if binding.agent_uid < 1 || binding.agent_uid < binding.system_uid_allow_ceiling {
+            return Err(NftablesError::InvocationFailed(format!(
+                "agent uid {} is root or below the manifest system-uid allow ceiling {}",
+                binding.agent_uid, binding.system_uid_allow_ceiling
+            )));
         }
         Ok(())
     }
@@ -1012,38 +1203,24 @@ mod linux {
     pub fn load_agent_ruleset_impl(
         id: &AgentRulesetId,
         ruleset_script: &str,
-        cgroup_level: u32,
-        cgroup_relative_path: &str,
+        binding: AgentUidBinding,
     ) -> Result<(), NftablesError> {
-        // Atomically replace the per-agent chain body and the base output
-        // jump that reaches it. This keeps policy reloads and cgroup refresh
-        // from leaking a stale jump to an old cgroup identity.
-        replace_agent_chain_and_jump_impl(
-            id,
-            ruleset_script,
-            cgroup_level,
-            cgroup_relative_path,
-            false,
-        )
+        // Atomically replace the per-agent chain body and the base output jump
+        // that reaches it. This keeps a policy reload from leaking a stale jump
+        // bound to a superseded uid.
+        replace_agent_chain_and_jump_impl(id, ruleset_script, binding, false)
     }
 
     pub fn load_agent_fail_closed_ruleset_impl(
         id: &AgentRulesetId,
-        cgroup_level: u32,
-        cgroup_relative_path: &str,
+        binding: AgentUidBinding,
     ) -> Result<(), NftablesError> {
         let ruleset_script = build_agent_fail_closed_ruleset(&id.agent_id);
-        replace_agent_chain_and_jump_impl(
-            id,
-            &ruleset_script,
-            cgroup_level,
-            cgroup_relative_path,
-            true,
-        )
+        replace_agent_chain_and_jump_impl(id, &ruleset_script, binding, true)
     }
 
     pub fn remove_agent_ruleset_impl(id: &AgentRulesetId) -> Result<(), NftablesError> {
-        super::verify_active_runtime_ownership()?;
+        super::verify_active_runtime_ownership(&id.fortress_id)?;
         let chain_name = agent_chain_name(&id.agent_id);
         let castle_table = castle_table();
         let listing = match run_nft(&["-a", "list", "chain", CASTLE_FAMILY, castle_table, "output"])
@@ -1080,8 +1257,7 @@ mod linux {
     /// without leaking stale jumps.
     pub fn install_agent_jump_rule_impl(
         id: &AgentRulesetId,
-        cgroup_level: u32,
-        cgroup_relative_path: &str,
+        binding: AgentUidBinding,
     ) -> Result<(), NftablesError> {
         // Drop any existing jump rule for this agent before adding a new
         // one. Failures during the lookup are not fatal here: a missing
@@ -1089,7 +1265,7 @@ mod linux {
         // an error from `nft -a list chain`; the upcoming add will fail
         // with a clearer message if the table is genuinely absent.
         let _ = remove_agent_jump_rule_impl(id);
-        let rule = build_agent_jump_rule(&id.agent_id, cgroup_level, cgroup_relative_path);
+        let rule = build_agent_jump_rule(&id.agent_id, binding.agent_uid);
         let script = format!("{rule}\n");
         run_nft_stdin(&script)
     }
@@ -1168,7 +1344,13 @@ mod linux {
         handles
     }
 
-    pub fn list_agent_rulesets_impl() -> Result<Vec<AgentRulesetId>, NftablesError> {
+    /// Agent ids visible as `agent_*` chain names.
+    ///
+    /// Returns bare ids, NOT [`AgentRulesetId`]: a chain listing carries no
+    /// fortress id and no uid, so an `AgentRulesetId` synthesized here would be a
+    /// half-empty identity a caller could mistake for a real binding. Callers
+    /// that need the binding read it from the inventory parser.
+    pub fn list_agent_rulesets_impl() -> Result<Vec<String>, NftablesError> {
         let output = run_nft(&["list", "chains", CASTLE_FAMILY])?;
         let mut results = Vec::new();
         for line in output.lines() {
@@ -1180,10 +1362,7 @@ mod linux {
                     .and_then(|s| s.split_whitespace().next())
                 {
                     if let Some(agent_id) = name.strip_prefix("agent_") {
-                        results.push(AgentRulesetId {
-                            agent_id: agent_id.to_string(),
-                            cgroup_path: PathBuf::new(),
-                        });
+                        results.push(agent_id.to_string());
                     }
                 }
             }
@@ -1424,26 +1603,31 @@ fn has_exact_keys(value: &serde_json::Value, expected: &[&str]) -> bool {
     })
 }
 
-/// GF2 per-agent isolation seal: a fixed-length, domain-separated digest of the
-/// EXACT cgroup-v2 path the daemon installed for one agent's `socket cgroupv2`
-/// match. It is embedded in the marker-bound rule COMMENT (`:cg:<seal>`) so
-/// verification can reject a re-parented/widened match (same leaf, different
-/// parent — e.g. `other.slice/sanctuary-agent-x.service`) that the leaf-only pin
-/// accepted while the real agent's traffic missed the goto and hit `policy
-/// accept`.
+/// Per-agent isolation seal: a fixed-length, domain-separated digest of the
+/// EXACT uid the daemon installed for one agent's `meta skuid` match, bound to
+/// the fortress and the agent it was installed for. It is embedded in the
+/// marker-bound rule COMMENT (`:uid:<seal>`) so verification can reject a rule
+/// whose uid expression was rewritten in place while its comment was left
+/// intact.
 ///
-/// Why a digest, not the raw path: nft caps a comment at 128 bytes (confirmed nft
-/// 1.0.9), and `{marker}:queue:{agent_id}` already consumes most of that, so the
-/// path is sealed by its 64-bit digest. Why UNKEYED: the pure parser has no key,
-/// and the security level is deliberately exactly that of every other rule-shape
-/// check. An in-place expression mutation (the natural GF2 attack: rewrite only
-/// the `socket cgroupv2` path) leaves this comment intact, so the recomputed
-/// digest no longer matches and the rule is refused; only an actor that
-/// reconstructs a full marker-bound comment can evade it, which is the inherent
-/// CAP_NET_ADMIN nft threat boundary (see the GF1.4 note on
-/// `install_deny_all_safety_net_impl`), the same bar the ownership marker sets.
-/// 64 bits makes a second-preimage (a different path with the same seal AND the
-/// agent's own leaf) computationally infeasible.
+/// Why a digest, not the raw uid: the comment budget is already spent on the
+/// marker and the agent id (see [`MAX_AGENT_ID_LEN`]), and a raw uid in the
+/// comment would prove nothing the expression does not already say. The digest
+/// binds the uid to `fortress_id` and `agent_id` as well, so the same uid under a
+/// different fortress or a different agent does not verify.
+///
+/// Why UNKEYED: the pure parser has no key, and the security level is
+/// deliberately exactly that of every other rule-shape check. An in-place
+/// expression mutation (rewrite only the `meta skuid` value) leaves this comment
+/// intact, so the recomputed digest no longer matches and the rule is refused.
+/// An actor that reconstructs BOTH expressions AND both comments produces a
+/// self-consistent inventory this digest cannot catch — that case is caught only
+/// by the trusted MANIFEST uid comparison in `parse_owned_table_inventory`, which
+/// is why the seal is documented as a consistency check and never as authority.
+///
+/// `decimal(uid)` is ASCII decimal with no leading zeros and no sign (Rust's
+/// `u32` Display), so one uid has exactly one preimage and two spellings of the
+/// same uid cannot produce two seals.
 ///
 /// Pure and cross-platform (used by both the linux emission site and the pure
 /// parser, and by the adversarial-JSON tests) so it must not be linux-gated.
@@ -1455,78 +1639,62 @@ fn has_exact_keys(value: &serde_json::Value, expected: &[&str]) -> bool {
 /// Linux CI job and every `cargo test` are green, and the break appears only in
 /// a developer's macOS build or in a cross-language test that shells out to
 /// `cargo build`, which is exactly where a gate mismatch is hardest to read.
-pub(crate) fn cgroup_path_seal(cgroup_relative_path: &str) -> String {
+pub(crate) fn agent_uid_seal(fortress_id: &str, agent_id: &str, agent_uid: u32) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     // Domain separation: this digest is never interchangeable with any other
     // SHA-256 use in the daemon (WAL chaining, manifest hashing).
-    hasher.update(b"sanctuary-castle:cgroup-path-seal:v1\0");
-    hasher.update(cgroup_relative_path.as_bytes());
+    hasher.update(b"sanctuary-castle:agent-uid-seal:v1\0");
+    // NUL-separated, and neither a fortress id nor an agent id may contain NUL
+    // (both are ASCII identifier grammars), so the concatenation is unambiguous:
+    // no pair of distinct (fortress, agent, uid) triples shares a preimage.
+    hasher.update(fortress_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(agent_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(agent_uid.to_string().as_bytes());
     let digest = hasher.finalize();
-    // 8 bytes = 16 lowercase hex chars: the whole `:cg:<seal>` suffix is 20 bytes,
-    // leaving comment headroom under nft's 128-byte cap for the marker + agent id.
-    hex::encode(&digest[..8])
+    // Truncated to AGENT_UID_SEAL_HEX_LEN / 2 bytes; the hex width is what the
+    // comment budget above is derived from, so the two must move together.
+    hex::encode(&digest[..AGENT_UID_SEAL_HEX_LEN / 2])
 }
 
-fn parse_cgroup_match(expr: &serde_json::Value) -> Option<(u32, String)> {
+/// Parse an nft `meta skuid == <integer>` match expression into its uid.
+///
+/// INVARIANT: only a BARE INTEGER is accepted. nft renders `meta skuid` through
+/// a uid symbol table, so an account name could appear where the daemon wrote a
+/// number; a parser that accepted names would have to resolve them against
+/// `/etc/passwd` at verification time, making the kernel binding's meaning depend
+/// on a mutable file. Refusing a name is fail-closed (the binding reads foreign
+/// and deny-all re-arms) and the daemon always emits numerically. The listing
+/// form is probed per nftables version before this shape is trusted.
+///
+/// uid 0 is refused here as well as at emission: root is never a confined agent,
+/// and a `skuid 0` rule in an owned table is a widening, not a binding.
+fn parse_skuid_value(expr: &serde_json::Value) -> Option<u32> {
     if !has_exact_keys(expr, &["match"]) {
         return None;
     }
     let matched = expr.get("match")?;
     if !has_exact_keys(matched, &["op", "left", "right"])
-        || !has_exact_keys(matched.get("left")?, &["socket"])
+        || !has_exact_keys(matched.get("left")?, &["meta"])
+        || !has_exact_keys(matched.get("left")?.get("meta")?, &["key"])
     {
         return None;
     }
     if matched.get("op")?.as_str()? != "==" {
         return None;
     }
-    let socket = matched.get("left")?.get("socket")?;
-    // nft's JSON serializer for the cgroupv2 socket match omits the `level`
-    // field on some builds: confirmed on nft 1.0.9 / Ubuntu 24.04 (kernel 6.8),
-    // where a rule loaded with `socket cgroupv2 level 1 "system.slice"` round-
-    // trips as {"socket":{"key":"cgroupv2"}} with no `level`. Accept BOTH the
-    // level-present and level-absent shapes, and no other socket keys, so a
-    // foreign socket match (extra keys or a non-cgroupv2 key) is still rejected.
-    let level_present = if has_exact_keys(socket, &["key", "level"]) {
-        true
-    } else if has_exact_keys(socket, &["key"]) {
-        false
-    } else {
-        return None;
-    };
-    if socket.get("key")?.as_str()? != "cgroupv2" {
+    if matched.get("left")?.get("meta")?.get("key")?.as_str()? != "skuid" {
         return None;
     }
-    let path = matched.get("right")?.as_str()?.to_string();
-    if path.is_empty()
-        || path.starts_with('/')
-        || path
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-        || !path.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'@' | b':')
-        })
-    {
+    // `as_u64` refuses a string, a float, a bool and a nested object, so a name
+    // form or a structured range is rejected before the range check below.
+    let uid = u32::try_from(matched.get("right")?.as_u64()?).ok()?;
+    if uid < 1 {
         return None;
     }
-    // `level` is redundant with the path: nft requires the level to equal the
-    // path's component count at load time, so ownership is fully keyed by the
-    // marker-bound table + exact rule body + validated path, never by `level`.
-    // When nft omits it, reconstruct the depth from the already-validated path
-    // (no leading slash, no empty components) so the level-present and level-
-    // absent shapes yield the identical owned-binding tuple that body/jump
-    // agreement is checked against.
-    let level = if level_present {
-        let explicit = u32::try_from(socket.get("level")?.as_u64()?).ok()?;
-        if explicit == 0 {
-            return None;
-        }
-        explicit
-    } else {
-        u32::try_from(path.split('/').count()).ok()?
-    };
-    Some((level, path))
+    Some(uid)
 }
 
 fn parse_mark_assignment(expr: &serde_json::Value) -> Option<u32> {
@@ -1546,11 +1714,13 @@ fn parse_mark_assignment(expr: &serde_json::Value) -> Option<u32> {
     u32::try_from(mangle.get("value")?.as_u64()?).ok()
 }
 
+/// Validate one owned per-agent chain body and return the uid it binds, or
+/// `None` for the fail-closed unconditional-drop body, which binds no uid.
 fn validate_owned_body_expr(
     expr: &serde_json::Value,
     agent_id: &str,
     fail_closed: bool,
-) -> Result<Option<(u32, String)>, NftablesError> {
+) -> Result<Option<u32>, NftablesError> {
     let terms = expr.as_array().ok_or_else(|| {
         NftablesError::ForeignState("owned agent body has no expression array".to_string())
     })?;
@@ -1567,11 +1737,11 @@ fn validate_owned_body_expr(
     }
     if terms.len() != 3 {
         return Err(NftablesError::ForeignState(
-            "queued agent body is not the exact cgroup/mark/queue expression".to_string(),
+            "queued agent body is not the exact skuid/mark/queue expression".to_string(),
         ));
     }
-    let binding = parse_cgroup_match(&terms[0]).ok_or_else(|| {
-        NftablesError::ForeignState("queued agent body has no typed cgroup match".to_string())
+    let binding = parse_skuid_value(&terms[0]).ok_or_else(|| {
+        NftablesError::ForeignState("queued agent body has no typed skuid match".to_string())
     })?;
     if parse_mark_assignment(&terms[1]) != Some(crate::nfqueue::agent_mark(agent_id)) {
         return Err(NftablesError::ForeignState(
@@ -1596,20 +1766,21 @@ fn validate_owned_body_expr(
     Ok(Some(binding))
 }
 
+/// Validate the base-output jump for one agent and return the uid it routes.
 fn validate_owned_jump_expr(
     expr: &serde_json::Value,
     expected_chain: &str,
-) -> Result<(u32, String), NftablesError> {
+) -> Result<u32, NftablesError> {
     let terms = expr.as_array().ok_or_else(|| {
         NftablesError::ForeignState("owned output jump has no expression array".to_string())
     })?;
     if terms.len() != 2 {
         return Err(NftablesError::ForeignState(
-            "owned output jump is not the exact cgroup/jump expression".to_string(),
+            "owned output jump is not the exact skuid/goto expression".to_string(),
         ));
     }
-    let binding = parse_cgroup_match(&terms[0]).ok_or_else(|| {
-        NftablesError::ForeignState("owned output jump has no typed cgroup match".to_string())
+    let binding = parse_skuid_value(&terms[0]).ok_or_else(|| {
+        NftablesError::ForeignState("owned output jump has no typed skuid match".to_string())
     })?;
     // Must match `build_agent_jump_rule` and `parse_jump_rule_handles`: the base
     // output rule routes the agent cgroup with a `goto` (a TERMINATING verdict,
@@ -1644,7 +1815,18 @@ struct ParsedOwnedTableInventory {
     agent_ids: Vec<String>,
 }
 
-fn parse_owned_table_inventory(json: &str) -> Result<ParsedOwnedTableInventory, NftablesError> {
+/// Parse an owned-table inventory and check it against `expectation`.
+///
+/// `expectation` is the whole security content of the agent-binding half of this
+/// parse: shape, seal, body/jump agreement and cardinality all prove the
+/// inventory is INTERNALLY consistent, which an actor that rewrote both
+/// expressions and both comments can also achieve. Only
+/// [`ExpectedAgentBinding::Confined`] compares the live uid against a value this
+/// process did not read out of the kernel.
+fn parse_owned_table_inventory(
+    json: &str,
+    expectation: &ExpectedAgentBinding,
+) -> Result<ParsedOwnedTableInventory, NftablesError> {
     let doc: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| NftablesError::ForeignState(format!("nft -j output did not parse: {e}")))?;
     let items = doc
@@ -1733,7 +1915,11 @@ fn parse_owned_table_inventory(json: &str) -> Result<ParsedOwnedTableInventory, 
                             .strip_prefix(&format!("{}:agent:", expected_marker))
                             .filter(|id| !id.is_empty())
                             .unwrap_or("");
-                        let agent_id_is_typed = agent_id.len() <= 128
+                        // Must match `validate_agent_binding_input`: an agent id
+                        // longer than the sealed-comment budget could never have
+                        // been installed by this daemon, so one in a live table is
+                        // foreign.
+                        let agent_id_is_typed = agent_id.len() <= MAX_AGENT_ID_LEN
                             && agent_id.bytes().all(|byte| {
                                 byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
                             });
@@ -1826,14 +2012,14 @@ fn parse_owned_table_inventory(json: &str) -> Result<ParsedOwnedTableInventory, 
     })?;
     let mut body_counts = std::collections::HashMap::<String, usize>::new();
     let mut jump_counts = std::collections::HashMap::<String, usize>::new();
-    let mut cgroup_bindings = std::collections::HashMap::<String, (u32, String)>::new();
+    let mut uid_bindings = std::collections::HashMap::<String, u32>::new();
     for (chain, comment, expr) in owned_rules {
         let is_jump = chain == "output";
         let fail_closed = !is_jump && comment.contains(":failclosed:");
         // Strip the marker-bound role prefix. The remainder is `{agent_id}` for a
-        // fail-closed unconditional-drop body (no cgroup match to seal) or
-        // `{agent_id}:cg:{seal}` for any rule carrying a `socket cgroupv2` match
-        // (the base-output jump, and the queued per-agent body). See GF2 below.
+        // fail-closed unconditional-drop body (no uid match to seal) or
+        // `{agent_id}:uid:{seal}` for any rule carrying a `meta skuid` match
+        // (the base-output jump, and the queued per-agent body).
         let remainder = if is_jump {
             comment.strip_prefix(&format!("{}:jump:", expected_marker))
         } else {
@@ -1845,11 +2031,12 @@ fn parse_owned_table_inventory(json: &str) -> Result<ParsedOwnedTableInventory, 
         .ok_or_else(|| {
             NftablesError::ForeignState("owned rule comment has wrong role binding".to_string())
         })?;
-        // Separate the agent id from the authenticated cgroup-path seal. Agent ids
-        // are the typed identifier grammar (ASCII alphanumeric / `-` / `_`, no
-        // `:`), so the FIRST `:cg:` is always the seal delimiter and everything
-        // before it is the agent id.
-        let (agent_id, declared_seal) = match remainder.split_once(":cg:") {
+        // Separate the agent id from the authenticated uid seal. Agent ids are
+        // the typed identifier grammar (ASCII alphanumeric / `-` / `_`, no `:`),
+        // so the FIRST `AGENT_UID_SEAL_INFIX` is always the seal delimiter and
+        // everything before it is the agent id. Must match the comment the
+        // emitter writes in `replace_agent_chain_and_jump_impl`.
+        let (agent_id, declared_seal) = match remainder.split_once(AGENT_UID_SEAL_INFIX) {
             Some((id, seal)) => (id, Some(seal)),
             None => (remainder, None),
         };
@@ -1871,73 +2058,70 @@ fn parse_owned_table_inventory(json: &str) -> Result<ParsedOwnedTableInventory, 
         } else {
             validate_owned_body_expr(&expr, agent_id, fail_closed)?
         };
-        // GF2 per-agent isolation invariant: bind ownership to the EXACT per-agent
-        // cgroup, not merely to an internally-consistent pair of rules. The
-        // body/jump agreement below proves the two rules match EACH OTHER; it does
-        // NOT prove they match the AGENT they claim. A CAP_NET_ADMIN actor can
-        // rewrite BOTH the base jump `goto` and the per-agent body cgroup match to
-        // a PARENT scope (e.g. `other.slice/sanctuary-agent-x.service`, same leaf,
-        // wrong parent), keep the marker and pristine shape, and read as "owned"
-        // while the real agent's traffic misses the goto and hits `policy accept`.
-        // The old pin compared only the path LEAF (`scope_unit_name(agent_id)`) and
-        // so accepted a same-leaf re-parent. Every rule carrying a cgroup match now
-        // seals its EXACT installed path into the marker-bound comment; the live
-        // match path must hash to that seal. A mismatch (any re-parent/widening) is
-        // refused, which via verify_owned_castle_table / reclaim verification
-        // withdraws readiness or re-arms deny-all upstream (GF1).
-        if let Some((_level, ref expr_path)) = binding {
+        // Per-agent isolation invariant, in two layers that must not be
+        // confused. The body/jump agreement below proves the two rules match
+        // EACH OTHER, and the seal proves neither expression was rewritten
+        // without its comment; NEITHER proves the pair matches the uid the
+        // OPERATOR signed. An actor holding CAP_NET_ADMIN can rewrite both
+        // expressions AND recompute both unkeyed seals, producing a fully
+        // self-consistent inventory that routes some OTHER uid into the agent's
+        // chain while the real agent's traffic misses the goto and reaches
+        // `policy accept`. Only the manifest comparison below refuses that, and
+        // only where the caller supplied a trusted expectation.
+        if let Some(expr_uid) = binding {
             let declared_seal = declared_seal.ok_or_else(|| {
                 NftablesError::ForeignState(
-                    "a cgroup-matching owned rule carries no authenticated cgroup-path seal"
+                    "a skuid-matching owned rule carries no authenticated agent-uid seal"
                         .to_string(),
                 )
             })?;
-            // GF2 (round-3 re-gate) fail-closed on a numeric match value: an
-            // all-digit match is nft's RESOLVED cgroup-id display form, shown when
-            // the path no longer resolves (a DESTROYED agent cgroup) OR when an
-            // in-place expr mutation replaces the sealed path with a numeric form
-            // to DODGE the seal comparison below. Those two are indistinguishable
-            // from the dump, and the seal exists precisely to defend against an
-            // in-place match mutation, so a numeric match for an owned binding is
-            // never trustworthy: it must be refused as ForeignState (fail-closed),
-            // NOT skipped past the seal check. Skipping it let the exact attack the
-            // seal defends against read as "owned" whenever the mutated match was
-            // numeric while body/jump still agreed. Refusing it withdraws readiness
-            // / re-arms the GF1 deny-all upstream. The legitimate destroyed-cgroup
-            // rule matches no traffic, so failing it closed and re-arming deny-all
-            // is safe (nothing escapes); the owned table is re-adopted with a fresh,
-            // path-sealed binding on the next restart. INVARIANT: a live owned
-            // per-agent binding must always carry a verifiable full-path seal; a
-            // numeric-form match value never proves the owned per-agent binding.
-            let expr_is_resolved_numeric =
-                !expr_path.is_empty() && expr_path.bytes().all(|b| b.is_ascii_digit());
-            if expr_is_resolved_numeric {
-                return Err(NftablesError::ForeignState(format!(
-                    "agent {agent_id:?} cgroup match {expr_path:?} is a numeric resolved-id \
-                     form, not a verifiable full-path seal; a live owned per-agent binding \
-                     must carry its sealed cgroup path, so a numeric-form match is refused \
-                     fail-closed (re-arming deny-all), never adopted as owned"
-                )));
+            // The seal's fortress id is the caller's, never one read out of the
+            // dump: a seal recomputed under a fortress id the kernel state itself
+            // supplied would verify against whatever an attacker wrote.
+            match expectation.seal_fortress_id() {
+                Some(seal_fortress_id) => {
+                    if agent_uid_seal(seal_fortress_id, agent_id, expr_uid) != declared_seal {
+                        return Err(NftablesError::ForeignState(format!(
+                            "agent {agent_id:?} skuid match {expr_uid} does not match its \
+                             authenticated agent-uid seal; an in-place uid rewrite, a \
+                             wrong-agent or a wrong-fortress binding is not the owned \
+                             per-agent binding"
+                        )));
+                    }
+                }
+                None if expectation.tolerates_unverifiable_seal() => {}
+                None => {
+                    return Err(NftablesError::ForeignState(format!(
+                        "agent {agent_id:?} carries a live per-agent uid binding while the \
+                         current policy confines no agent uid; an unverifiable binding is \
+                         refused fail-closed rather than adopted as owned"
+                    )));
+                }
             }
-            if cgroup_path_seal(expr_path) != declared_seal {
-                return Err(NftablesError::ForeignState(format!(
-                    "agent {agent_id:?} cgroup match {expr_path:?} does not match its \
-                     authenticated cgroup-path seal; a widened or re-parented match is not \
-                     the owned per-agent binding"
-                )));
+            // The TRUSTED expectation. This is the only check here whose input
+            // did not come from the kernel dump, so it is the only one a
+            // self-consistent forgery cannot satisfy.
+            if let ExpectedAgentBinding::Confined { agent_uid, .. } = expectation {
+                if expr_uid != *agent_uid {
+                    return Err(NftablesError::ForeignState(format!(
+                        "agent {agent_id:?} skuid match {expr_uid} is not the uid the current \
+                         signed manifest confines ({agent_uid}); a live binding that routes \
+                         a different uid is refused fail-closed"
+                    )));
+                }
             }
         } else if declared_seal.is_some() {
-            // A non-cgroup-matching body (the fail-closed unconditional drop) must
-            // NOT carry a path seal: a seal there is a malformed/foreign comment.
+            // A non-skuid-matching body (the fail-closed unconditional drop) must
+            // NOT carry a uid seal: a seal there is a malformed/foreign comment.
             return Err(NftablesError::ForeignState(
-                "a fail-closed owned rule must not carry a cgroup-path seal".to_string(),
+                "a fail-closed owned rule must not carry an agent-uid seal".to_string(),
             ));
         }
         if let Some(binding) = binding {
-            if let Some(prior) = cgroup_bindings.insert(agent_id.to_string(), binding.clone()) {
+            if let Some(prior) = uid_bindings.insert(agent_id.to_string(), binding) {
                 if prior != binding {
                     return Err(NftablesError::ForeignState(
-                        "owned body and output jump disagree on cgroup binding".to_string(),
+                        "owned body and output jump disagree on the agent uid binding".to_string(),
                     ));
                 }
             }
@@ -1975,8 +2159,11 @@ fn parse_owned_table_inventory(json: &str) -> Result<ParsedOwnedTableInventory, 
 
 /// Pure parser used by health and ownership checks. Parsing untrusted inventory
 /// must never mutate the process-global packet-attribution registry.
-pub fn parse_owned_table_identity(json: &str) -> Result<CastleTableOwnership, NftablesError> {
-    parse_owned_table_inventory(json).map(|parsed| parsed.ownership)
+pub fn parse_owned_table_identity(
+    json: &str,
+    expectation: &ExpectedAgentBinding,
+) -> Result<CastleTableOwnership, NftablesError> {
+    parse_owned_table_inventory(json, expectation).map(|parsed| parsed.ownership)
 }
 
 // ---- Public API (platform-dispatching) ------------------------------------
@@ -2092,12 +2279,18 @@ pub fn capture_owned_castle_table(
 /// when a same-name replacement, mutation, injected rule, or extra chain has
 /// drifted the table off its owned identity, so readiness withdraws. (blocker 2)
 #[cfg(target_os = "linux")]
-pub fn verify_owned_castle_table(ownership: &CastleTableOwnership) -> Result<(), NftablesError> {
-    linux::verify_owned_castle_table_impl(ownership).map(|_| ())
+pub fn verify_owned_castle_table(
+    ownership: &CastleTableOwnership,
+    expectation: &ExpectedAgentBinding,
+) -> Result<(), NftablesError> {
+    linux::verify_owned_castle_table_impl(ownership, expectation).map(|_| ())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn verify_owned_castle_table(_ownership: &CastleTableOwnership) -> Result<(), NftablesError> {
+pub fn verify_owned_castle_table(
+    _ownership: &CastleTableOwnership,
+    _expectation: &ExpectedAgentBinding,
+) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
 
@@ -2107,8 +2300,9 @@ pub fn verify_owned_castle_table(_ownership: &CastleTableOwnership) -> Result<()
 #[cfg(target_os = "linux")]
 pub(crate) fn verify_and_register_owned_table_for_reclaim(
     ownership: &CastleTableOwnership,
+    expectation: &ExpectedAgentBinding,
 ) -> Result<(), NftablesError> {
-    let agent_ids = linux::verify_owned_castle_table_impl(ownership)?;
+    let agent_ids = linux::verify_owned_castle_table_impl(ownership, expectation)?;
     for agent_id in agent_ids {
         crate::nfqueue::register_agent_mark(&agent_id);
     }
@@ -2120,63 +2314,62 @@ pub(crate) fn verify_and_register_owned_table_for_reclaim(
 /// if the identity has drifted, so a foreign table squatting the name is never
 /// clobbered. (blocker 2/3)
 #[cfg(target_os = "linux")]
-pub fn remove_owned_castle_table(ownership: &CastleTableOwnership) -> Result<(), NftablesError> {
-    linux::remove_owned_castle_table_impl(ownership)
+pub fn remove_owned_castle_table(
+    ownership: &CastleTableOwnership,
+    expectation: &ExpectedAgentBinding,
+) -> Result<(), NftablesError> {
+    linux::remove_owned_castle_table_impl(ownership, expectation)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn remove_owned_castle_table(_ownership: &CastleTableOwnership) -> Result<(), NftablesError> {
+pub fn remove_owned_castle_table(
+    _ownership: &CastleTableOwnership,
+    _expectation: &ExpectedAgentBinding,
+) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
 
-/// Load a ruleset for one agent's cgroup. Atomic replace on the per-agent
-/// chain; existing connections preserved per nftables atomic-replace
-/// semantics. Also installs (or refreshes) the jump rule in the base
-/// `output` chain that gates entry into the per-agent chain on the
-/// cgroup-v2 socket match. Without that jump rule the per-agent chain is
-/// a dead chain and the kernel never consults it.
+/// Load a ruleset for one agent's uid. Atomic replace on the per-agent chain;
+/// existing connections preserved per nftables atomic-replace semantics. Also
+/// installs (or refreshes) the jump rule in the base `output` chain that gates
+/// entry into the per-agent chain on `meta skuid <uid>`. Without that jump rule
+/// the per-agent chain is a dead chain and the kernel never consults it.
 ///
-/// `cgroup_level` is the depth of the agent's cgroup in the cgroup-v2
-/// hierarchy (matches `ScopeHandle::cgroup_level`). `cgroup_relative_path`
-/// is the path with the `/sys/fs/cgroup/` prefix stripped (matches
-/// [`crate::cgroup::cgroup_relative_path`]).
+/// `binding` carries the manifest-signed uid and the ceiling it was admitted
+/// under; see [`AgentUidBinding`].
 #[cfg(target_os = "linux")]
 pub fn load_agent_ruleset(
     id: &AgentRulesetId,
     ruleset: &str,
-    cgroup_level: u32,
-    cgroup_relative_path: &str,
+    binding: AgentUidBinding,
 ) -> Result<(), NftablesError> {
-    linux::load_agent_ruleset_impl(id, ruleset, cgroup_level, cgroup_relative_path)
+    linux::load_agent_ruleset_impl(id, ruleset, binding)
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn load_agent_ruleset(
     _id: &AgentRulesetId,
     _ruleset: &str,
-    _cgroup_level: u32,
-    _cgroup_relative_path: &str,
+    _binding: AgentUidBinding,
 ) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
 
 /// Replace an agent ruleset with a fail-closed drop chain and atomically wire
-/// the refreshed cgroup jump to that chain. Used during scope recreation
-/// before the normal policy ruleset is restored.
+/// the uid jump to that chain. Used to park an agent at deny while its binding
+/// is replaced, so no window exists in which its packets reach `policy accept`.
 #[cfg(target_os = "linux")]
 pub fn load_agent_fail_closed_ruleset(
     id: &AgentRulesetId,
-    cgroup_level: u32,
-    cgroup_relative_path: &str,
+    binding: AgentUidBinding,
 ) -> Result<(), NftablesError> {
-    linux::load_agent_fail_closed_ruleset_impl(id, cgroup_level, cgroup_relative_path)
+    linux::load_agent_fail_closed_ruleset_impl(id, binding)
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn load_agent_fail_closed_ruleset(
     _id: &AgentRulesetId,
-    _cgroup_level: u32,
-    _cgroup_relative_path: &str,
+    _binding: AgentUidBinding,
 ) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
@@ -2195,20 +2388,17 @@ pub fn remove_agent_ruleset(_id: &AgentRulesetId) -> Result<(), NftablesError> {
 }
 
 /// Install the jump rule from the base `output` chain into the per-agent
-/// chain, gated on the cgroup-v2 socket match. Idempotent: a prior jump
-/// rule for the same agent is removed (handle-based delete) before the
-/// new one is added.
+/// chain, gated on `meta skuid <uid>`. Idempotent: a prior jump rule for the
+/// same agent is removed (handle-based delete) before the new one is added.
 ///
 /// Most callers should use [`load_agent_ruleset`], which combines the
-/// per-agent chain rules with the jump-rule wiring in one call. This
-/// granular surface is exposed for binding code that needs to refresh
-/// the jump rule independently (e.g., on a cgroup-id renumbering event
-/// where the chain rules have not changed).
+/// per-agent chain rules with the jump-rule wiring in one call. This granular
+/// surface is exposed for binding code that needs to refresh the jump rule
+/// independently.
 #[cfg(target_os = "linux")]
 pub fn install_agent_jump_rule(
     id: &AgentRulesetId,
-    cgroup_level: u32,
-    cgroup_relative_path: &str,
+    binding: AgentUidBinding,
 ) -> Result<(), NftablesError> {
     if castle_table() == CASTLE_TABLE {
         return Err(NftablesError::InvocationFailed(
@@ -2216,14 +2406,13 @@ pub fn install_agent_jump_rule(
                 .to_string(),
         ));
     }
-    linux::install_agent_jump_rule_impl(id, cgroup_level, cgroup_relative_path)
+    linux::install_agent_jump_rule_impl(id, binding)
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn install_agent_jump_rule(
     _id: &AgentRulesetId,
-    _cgroup_level: u32,
-    _cgroup_relative_path: &str,
+    _binding: AgentUidBinding,
 ) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
@@ -2249,12 +2438,12 @@ pub fn remove_agent_jump_rule(_id: &AgentRulesetId) -> Result<(), NftablesError>
 
 /// List current agent rulesets in `sanctuary-castle`.
 #[cfg(target_os = "linux")]
-pub fn list_agent_rulesets() -> Result<Vec<AgentRulesetId>, NftablesError> {
+pub fn list_agent_rulesets() -> Result<Vec<String>, NftablesError> {
     linux::list_agent_rulesets_impl()
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn list_agent_rulesets() -> Result<Vec<AgentRulesetId>, NftablesError> {
+pub fn list_agent_rulesets() -> Result<Vec<String>, NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
 
@@ -2321,56 +2510,130 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_cgroup_match_accepts_absent_level_like_nft_1_0_9() {
-        // nft 1.0.9 (Ubuntu 24.04, kernel 6.8) round-trips a rule loaded with
-        // `socket cgroupv2 level N "<path>"` WITHOUT the `level` field. Both the
-        // level-present shape (newer nft / our own emitter model) and the
-        // level-absent shape must parse to the identical owned-binding tuple, or
-        // a live daemon on that kernel class fails closed on every adopt.
-        let path = "system.slice/sanctuary-agent.scope";
-        let with_level = serde_json::json!({
-            "match": {"op": "==", "left": {"socket": {"key": "cgroupv2", "level": 2}}, "right": path}
+    fn parse_skuid_value_accepts_only_a_bare_integer_uid() {
+        // The P0 probe on nft 1.0.9 showed `meta skuid <uid>` listing as a bare
+        // integer in both text and JSON form, for a uid with an account and one
+        // without. This pins the parser to exactly that shape: a NAME, a string
+        // spelling of the number, a float, a nested range, or uid 0 are all
+        // refused, so a newer nft that renders names cannot be silently adopted.
+        let ok = serde_json::json!({
+            "match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 4242}
         });
-        let without_level = serde_json::json!({
-            "match": {"op": "==", "left": {"socket": {"key": "cgroupv2"}}, "right": path}
+        assert_eq!(parse_skuid_value(&ok), Some(4242));
+
+        let by_name = serde_json::json!({
+            "match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": "sanctuary-agent"}
         });
-        let a = parse_cgroup_match(&with_level).expect("with-level shape parses");
-        let b = parse_cgroup_match(&without_level).expect("absent-level shape parses");
-        assert_eq!(
-            a, b,
-            "level-present and level-absent must yield the same owned marker"
+        assert!(
+            parse_skuid_value(&by_name).is_none(),
+            "an account NAME must be refused; resolving it would make the kernel \
+             binding depend on a mutable /etc/passwd"
         );
-        assert_eq!(
-            a,
-            (2, path.to_string()),
-            "depth reconstructed from the 2-component path"
+        let stringified = serde_json::json!({
+            "match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": "4242"}
+        });
+        assert!(
+            parse_skuid_value(&stringified).is_none(),
+            "string uid refused"
+        );
+        let root = serde_json::json!({
+            "match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 0}
+        });
+        assert!(
+            parse_skuid_value(&root).is_none(),
+            "uid 0 is root and is never a confined agent binding"
+        );
+        let out_of_range = serde_json::json!({
+            "match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 4_294_967_296u64}
+        });
+        assert!(
+            parse_skuid_value(&out_of_range).is_none(),
+            "a value past u32 is not a uid"
         );
 
-        // Foreign socket matches stay rejected in both shapes: a non-cgroupv2 key,
-        // or any extra socket key beyond {key[, level]}, is not our owned rule.
+        // A different meta key, an extra key, or a non-equality operator is a
+        // foreign match, not this daemon's binding.
         let wrong_key = serde_json::json!({
-            "match": {"op": "==", "left": {"socket": {"key": "cgroupv1"}}, "right": path}
+            "match": {"op": "==", "left": {"meta": {"key": "skgid"}}, "right": 4242}
         });
         assert!(
-            parse_cgroup_match(&wrong_key).is_none(),
-            "non-cgroupv2 key rejected"
+            parse_skuid_value(&wrong_key).is_none(),
+            "skgid is not skuid"
         );
         let extra_key = serde_json::json!({
-            "match": {"op": "==", "left": {"socket": {"key": "cgroupv2", "foo": 1}}, "right": path}
+            "match": {"op": "==", "left": {"meta": {"key": "skuid", "foo": 1}}, "right": 4242}
         });
         assert!(
-            parse_cgroup_match(&extra_key).is_none(),
-            "extra socket key rejected"
+            parse_skuid_value(&extra_key).is_none(),
+            "extra meta key refused"
         );
-        // An explicit level 0 is still foreign (a real cgroup depth is >= 1).
-        let zero_level = serde_json::json!({
-            "match": {"op": "==", "left": {"socket": {"key": "cgroupv2", "level": 0}}, "right": path}
+        let not_equality = serde_json::json!({
+            "match": {"op": "!=", "left": {"meta": {"key": "skuid"}}, "right": 4242}
         });
         assert!(
-            parse_cgroup_match(&zero_level).is_none(),
-            "explicit level 0 rejected"
+            parse_skuid_value(&not_equality).is_none(),
+            "non-== op refused"
+        );
+        let socket_shape = serde_json::json!({
+            "match": {"op": "==", "left": {"socket": {"key": "cgroupv2"}}, "right": "system.slice"}
+        });
+        assert!(
+            parse_skuid_value(&socket_shape).is_none(),
+            "the retired cgroup match shape must not parse as a uid binding"
         );
     }
+
+    #[test]
+    fn agent_uid_seal_is_bound_to_fortress_agent_and_uid() {
+        // The seal is a consistency check, not authority, but it must at least be
+        // a FUNCTION of all three inputs: a seal that ignored the fortress or the
+        // agent would let a rule sealed for one binding verify under another.
+        let base = agent_uid_seal("fortress-a", "agent-one", 4242);
+        assert_eq!(base.len(), AGENT_UID_SEAL_HEX_LEN);
+        assert!(base.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(base, agent_uid_seal("fortress-b", "agent-one", 4242));
+        assert_ne!(base, agent_uid_seal("fortress-a", "agent-two", 4242));
+        assert_ne!(base, agent_uid_seal("fortress-a", "agent-one", 4243));
+        assert_eq!(base, agent_uid_seal("fortress-a", "agent-one", 4242));
+        // NUL separation, not concatenation: the shifted-boundary pair below would
+        // collide under a bare concatenation of the three fields.
+        assert_ne!(
+            agent_uid_seal("fortress", "a-agent", 1000),
+            agent_uid_seal("fortressa", "-agent", 1000)
+        );
+    }
+
+    #[test]
+    fn max_agent_id_len_leaves_every_sealed_comment_inside_the_nft_cap() {
+        // The derivation, checked rather than asserted by comment: a
+        // worst-case marker + role + agent id + seal must fit nft's comment cap,
+        // and the queue role must be the binding one.
+        let marker = format!(
+            "{OWNER_MARKER_PREFIX}{}",
+            "a".repeat(OWNER_MARKER_NONCE_HEX_LEN)
+        );
+        let agent_id = "a".repeat(MAX_AGENT_ID_LEN);
+        let seal = agent_uid_seal("fortress-id", &agent_id, 4242);
+        for role in [":queue:", ":jump:"] {
+            let comment = format!("{marker}{role}{agent_id}{AGENT_UID_SEAL_INFIX}{seal}");
+            assert!(
+                comment.len() <= NFT_RULE_COMMENT_MAX_LEN,
+                "{role} comment is {} bytes, over the {NFT_RULE_COMMENT_MAX_LEN}-byte cap",
+                comment.len()
+            );
+        }
+        // The fail-closed body carries no seal, so it is not the binding case.
+        let fail_closed = format!("{marker}:failclosed:{agent_id}");
+        assert!(fail_closed.len() <= NFT_RULE_COMMENT_MAX_LEN);
+        // One more byte of agent id would overflow the queue comment: the budget
+        // is tight, so this is a real bound and not a loose guess.
+        let over = format!(
+            "{marker}{LONGEST_SEALED_ROLE_INFIX}{}{AGENT_UID_SEAL_INFIX}{seal}",
+            "a".repeat(MAX_AGENT_ID_LEN + 1)
+        );
+        assert!(over.len() > NFT_RULE_COMMENT_MAX_LEN);
+    }
+
     use crate::policy::{AllowlistRule, RuleDisposition, RuleMatch, RuleScope};
 
     // ---- nft binary resolution: absolute-only, no PATH fallback -------------
@@ -2606,7 +2869,8 @@ mod tests {
     #[test]
     fn owned_identity_parses_handles_and_marker() {
         let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        let owned = parse_owned_table_identity(&owned_json(2, 1, &marker)).expect("owned");
+        let owned = parse_owned_table_identity(&owned_json(2, 1, &marker), &fixture_expectation())
+            .expect("owned");
         assert_eq!(
             owned,
             CastleTableOwnership {
@@ -2617,28 +2881,54 @@ mod tests {
         );
     }
 
+    /// The fortress every owned-agent fixture below seals under. A single
+    /// constant so a test that means to change the FORTRESS has to say so.
+    const FIXTURE_FORTRESS: &str = "fixture-fortress";
+    /// The uid every owned-agent fixture binds. Above any plausible system-uid
+    /// ceiling, so it is a legitimate confined-agent uid.
+    const FIXTURE_AGENT_UID: u32 = 4242;
+
+    /// The trusted expectation matching the fixtures: what a healthy reclaim or
+    /// health poll would carry.
+    fn fixture_expectation() -> ExpectedAgentBinding {
+        ExpectedAgentBinding::Confined {
+            fortress_id: FIXTURE_FORTRESS.to_string(),
+            agent_uid: FIXTURE_AGENT_UID,
+        }
+    }
+
     fn owned_agent_json(marker: &str, include_body: bool, include_jump: bool) -> String {
+        owned_agent_json_with_uid(marker, include_body, include_jump, FIXTURE_AGENT_UID)
+    }
+
+    /// An owned inventory whose per-agent rules bind `uid`, sealed CORRECTLY for
+    /// that uid. Sealing correctly is the point: a test that wants to exercise
+    /// the trusted-uid comparison must not be able to pass by accident because
+    /// the seal caught the mismatch first.
+    fn owned_agent_json_with_uid(
+        marker: &str,
+        include_body: bool,
+        include_jump: bool,
+        uid: u32,
+    ) -> String {
         let chain = agent_chain_name("agent-one");
         let mark = crate::nfqueue::agent_mark("agent-one");
-        // GF2: the installed cgroup match must target THIS agent's own scope
-        // unit (`scope_unit_name("agent-one")`), not an arbitrary/parent path,
-        // and the marker-bound comment carries the authenticated seal of that
-        // exact path (`:cg:<seal>`) that the parser recomputes from the live
-        // match. The fixture mirrors the exact `cgroup_path_seal` the production
-        // emission site writes.
-        let cgroup_path = "system.slice/sanctuary-agent-agent-one.service";
-        let seal = cgroup_path_seal(cgroup_path);
-        let cgroup_match = r#""match":{"op":"==","left":{"socket":{"key":"cgroupv2","level":2}},"right":"system.slice/sanctuary-agent-agent-one.service"}"#;
+        // The fixture mirrors the exact `agent_uid_seal` the production emission
+        // site writes: seal input is (fortress, agent, uid), and the parser
+        // recomputes it from the LIVE match value.
+        let seal = agent_uid_seal(FIXTURE_FORTRESS, "agent-one", uid);
+        let skuid_match =
+            format!(r#""match":{{"op":"==","left":{{"meta":{{"key":"skuid"}}}},"right":{uid}}}"#);
         let body = if include_body {
             format!(
-                r#",{{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"{chain}","handle":10,"comment":"{marker}:queue:agent-one:cg:{seal}","expr":[{{{cgroup_match}}},{{"mangle":{{"key":{{"meta":{{"key":"mark"}}}},"value":{mark}}}}},{{"queue":{{"num":0}}}}]}}}}"#
+                r#",{{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"{chain}","handle":10,"comment":"{marker}:queue:agent-one:uid:{seal}","expr":[{{{skuid_match}}},{{"mangle":{{"key":{{"meta":{{"key":"mark"}}}},"value":{mark}}}}},{{"queue":{{"num":0}}}}]}}}}"#
             )
         } else {
             String::new()
         };
         let jump = if include_jump {
             format!(
-                r#",{{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":11,"comment":"{marker}:jump:agent-one:cg:{seal}","expr":[{{{cgroup_match}}},{{"goto":{{"target":"{chain}"}}}}]}}}}"#
+                r#",{{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":11,"comment":"{marker}:jump:agent-one:uid:{seal}","expr":[{{{skuid_match}}},{{"goto":{{"target":"{chain}"}}}}]}}}}"#
             )
         } else {
             String::new()
@@ -2654,13 +2944,20 @@ mod tests {
         )
     }
 
+    fn fixture_marker() -> String {
+        format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef")
+    }
+
     #[test]
     fn ordinary_inventory_parsing_is_pure_and_reclaim_metadata_is_complete() {
-        let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
+        let marker = fixture_marker();
         let mark = crate::nfqueue::agent_mark("agent-one");
         let before = crate::nfqueue::resolve_agent_mark(mark);
-        let parsed = parse_owned_table_inventory(&owned_agent_json(&marker, true, true))
-            .expect("complete inventory");
+        let parsed = parse_owned_table_inventory(
+            &owned_agent_json(&marker, true, true),
+            &fixture_expectation(),
+        )
+        .expect("complete inventory");
         assert_eq!(parsed.agent_ids, vec!["agent-one".to_string()]);
         assert_eq!(
             crate::nfqueue::resolve_agent_mark(mark),
@@ -2671,98 +2968,177 @@ mod tests {
     }
 
     #[test]
-    fn owned_inventory_refuses_parent_cgroup_path_widening() {
-        // GF2 fault injection: a CAP_NET_ADMIN actor rewrites BOTH the base jump
-        // and the per-agent body cgroup match to a PARENT scope (`system.slice`),
-        // keeping the ownership marker, the pristine shape, and body/jump
-        // agreement intact. Pre-GF2 this read as "owned" (over-broad attribution
-        // of every process in the parent). The per-agent path pin must now reject
-        // it: the match leaf no longer equals the agent's own scope unit.
-        let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        let widened = owned_agent_json(&marker, true, true).replace(
-            "system.slice/sanctuary-agent-agent-one.service",
-            "system.slice",
-        );
-        let err = parse_owned_table_identity(&widened).unwrap_err();
+    fn owned_inventory_refuses_a_uid_the_manifest_does_not_confine() {
+        // THE core check of the uid migration, and the only one an actor holding
+        // CAP_NET_ADMIN cannot satisfy. Here the live table is fully
+        // self-consistent: both expressions bind uid 5555, both comments carry a
+        // CORRECTLY recomputed seal for 5555, body and jump agree, cardinality is
+        // exact, the marker is intact. Shape, seal, agreement and cardinality all
+        // pass. Only the manifest expectation refuses it — which is why the seal
+        // is documented as a consistency check and never as authority.
+        let marker = fixture_marker();
+        let other_uid = owned_agent_json_with_uid(&marker, true, true, 5555);
+        // Sanity: the forgery IS internally consistent, so it would pass every
+        // check that reads only the dump.
+        parse_owned_table_identity(
+            &other_uid,
+            &ExpectedAgentBinding::SealOnly {
+                fortress_id: FIXTURE_FORTRESS.to_string(),
+            },
+        )
+        .expect("the forgery is internally consistent and passes seal-only");
+
+        let err = parse_owned_table_identity(&other_uid, &fixture_expectation()).unwrap_err();
         assert!(
             matches!(err, NftablesError::ForeignState(_)),
-            "a widened parent-cgroup match must be refused as foreign, got: {err:?}"
+            "a self-consistent binding for a uid the manifest does not confine must be \
+             refused as foreign, got: {err:?}"
         );
-        // The pristine (correct-leaf) inventory still parses: the pin rejects
-        // ONLY the widening, never the legitimate per-agent binding.
-        parse_owned_table_identity(&owned_agent_json(&marker, true, true))
-            .expect("the correct per-agent binding must still parse");
+        // The legitimate binding still parses: the check rejects ONLY the wrong uid.
+        parse_owned_table_identity(
+            &owned_agent_json(&marker, true, true),
+            &fixture_expectation(),
+        )
+        .expect("the correct per-agent binding must still parse");
     }
 
     #[test]
-    fn owned_inventory_refuses_same_leaf_wrong_parent_cgroup_path() {
-        // GF2 (round-2 re-gate) fault injection: the wrong-PARENT-SAME-LEAF case
-        // the leaf-only pin missed. A CAP_NET_ADMIN actor rewrites BOTH the base
-        // jump and the per-agent body cgroup match to `other.slice/<same-leaf>`,
-        // keeping the marker, pristine shape, body/jump agreement, AND the exact
-        // agent scope-unit leaf. The pre-round-2 leaf comparison accepted this
-        // (`installed_leaf == expected_leaf`) while the real agent's traffic under
-        // `system.slice/<leaf>` missed the goto and hit `policy accept`. The
-        // full-path seal must now reject it: the re-parented match hashes to a
-        // different seal than the authenticated `:cg:` in the marker-bound comment.
-        let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        let reparented = owned_agent_json(&marker, true, true).replace(
-            "system.slice/sanctuary-agent-agent-one.service",
-            "other.slice/sanctuary-agent-agent-one.service",
-        );
-        // Sanity: the leaf is UNCHANGED, so a leaf-only check would still pass.
-        assert!(reparented.contains("other.slice/sanctuary-agent-agent-one.service"));
-        let err = parse_owned_table_identity(&reparented).unwrap_err();
+    fn owned_inventory_refuses_a_live_binding_when_the_manifest_confines_no_uid() {
+        // Absent is not passing. A manifest with no `agent_origin` (or a
+        // non-`uid` mode) confines nobody, so a live per-agent binding is
+        // something this process cannot vouch for: refuse it fail-closed rather
+        // than adopt it because nothing contradicted it.
+        let marker = fixture_marker();
+        let err = parse_owned_table_identity(
+            &owned_agent_json(&marker, true, true),
+            &ExpectedAgentBinding::NoneConfined,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, NftablesError::ForeignState(_)),
-            "a same-leaf, wrong-parent cgroup match must be refused as foreign, got: {err:?}"
+            "got: {err:?}"
         );
+        // A table with NO agent binding is still fine under the same expectation:
+        // that is the ordinary kernel-runtime-ready posture with nothing wrapped.
+        parse_owned_table_identity(
+            &owned_json(2, 1, &marker),
+            &ExpectedAgentBinding::NoneConfined,
+        )
+        .expect("an agent-free owned table is legitimate with nothing confined");
     }
 
     #[test]
-    fn owned_inventory_refuses_missing_or_forged_cgroup_path_seal() {
-        // A cgroup-matching rule with its `:cg:` seal stripped is refused (the seal
-        // is mandatory), and one whose seal does not match its own path is refused
-        // (an in-place expr mutation that forgot to also rewrite the seal).
-        let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        let seal = cgroup_path_seal("system.slice/sanctuary-agent-agent-one.service");
+    fn owned_inventory_refuses_a_wrong_fortress_or_wrong_agent_seal() {
+        // The seal binds (fortress, agent, uid). A binding sealed under another
+        // fortress, or for another agent id, is not this fortress's owned object
+        // even when the uid and the shape are right.
+        let marker = fixture_marker();
         let pristine = owned_agent_json(&marker, true, true);
-        // Drop the seal suffix from both cgroup-matching comments.
-        let unsealed = pristine.replace(&format!(":cg:{seal}"), "");
-        assert!(parse_owned_table_identity(&unsealed).is_err());
-        // Replace the seal with a valid-length but wrong digest.
-        let wrong = pristine.replace(&seal, "ffffffffffffffff");
-        assert!(parse_owned_table_identity(&wrong).is_err());
+        let correct_seal = agent_uid_seal(FIXTURE_FORTRESS, "agent-one", FIXTURE_AGENT_UID);
+
+        let wrong_fortress_seal =
+            agent_uid_seal("some-other-fortress", "agent-one", FIXTURE_AGENT_UID);
+        let forged = pristine.replace(&correct_seal, &wrong_fortress_seal);
+        assert!(parse_owned_table_identity(&forged, &fixture_expectation()).is_err());
+
+        let wrong_agent_seal = agent_uid_seal(FIXTURE_FORTRESS, "agent-two", FIXTURE_AGENT_UID);
+        let forged = pristine.replace(&correct_seal, &wrong_agent_seal);
+        assert!(parse_owned_table_identity(&forged, &fixture_expectation()).is_err());
+
+        // And verifying the correct fixture under a DIFFERENT fortress fails: the
+        // recompute uses the caller's fortress id, never one read from the dump.
+        let other_fortress = ExpectedAgentBinding::Confined {
+            fortress_id: "some-other-fortress".to_string(),
+            agent_uid: FIXTURE_AGENT_UID,
+        };
+        assert!(parse_owned_table_identity(&pristine, &other_fortress).is_err());
     }
 
     #[test]
-    fn owned_inventory_refuses_numeric_form_cgroup_match() {
-        // GF2 (round-3 re-gate) fault injection: an in-place expr mutation rewrites
-        // BOTH the base jump and the per-agent body cgroup match to a numeric
-        // resolved-id FORM (nft's display for an unresolvable/destroyed cgroup),
-        // keeping the ownership marker, the pristine shape, body/jump agreement, AND
-        // the original path's `:cg:` seal in the comment. Pre-round-3 the parser
-        // SKIPPED the seal comparison whenever the match was all-digits, so this
-        // mutation -- the exact in-place-match attack the seal defends against --
-        // read as "owned". The numeric-form match must now be refused as foreign
-        // (fail-closed, re-arming GF1 deny-all upstream): a live owned per-agent
-        // binding must always carry a verifiable full-path seal.
-        let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        let numeric = owned_agent_json(&marker, true, true)
-            .replace("system.slice/sanctuary-agent-agent-one.service", "12345");
-        // Sanity: both match values are now the numeric form, while the sealed
-        // comment still carries the original path's seal (the in-place dodge).
-        assert!(numeric.contains(r#""right":"12345""#));
-        assert!(numeric.contains(":cg:"));
-        let err = parse_owned_table_identity(&numeric).unwrap_err();
+    fn owned_inventory_refuses_missing_or_forged_agent_uid_seal() {
+        // A skuid-matching rule with its `:uid:` seal stripped is refused (the
+        // seal is mandatory), and one whose seal does not match its own uid is
+        // refused (an in-place expr mutation that forgot to also rewrite the
+        // seal). Retargeted from the cgroup-path-seal case, same class.
+        let marker = fixture_marker();
+        let seal = agent_uid_seal(FIXTURE_FORTRESS, "agent-one", FIXTURE_AGENT_UID);
+        let pristine = owned_agent_json(&marker, true, true);
+        let unsealed = pristine.replace(&format!(":uid:{seal}"), "");
+        assert!(parse_owned_table_identity(&unsealed, &fixture_expectation()).is_err());
+        let wrong = pristine.replace(&seal, "ffffffffffffffff");
+        assert!(parse_owned_table_identity(&wrong, &fixture_expectation()).is_err());
+    }
+
+    #[test]
+    fn owned_inventory_refuses_an_in_place_uid_rewrite_of_one_expression() {
+        // The natural in-place attack: rewrite ONE expression's uid, leave the
+        // comment. Two independent checks fire — the seal no longer recomputes,
+        // and body and jump no longer agree — and the test pins that the
+        // DISAGREEMENT alone is caught, by using a correctly-sealed comment for
+        // the rewritten value on the jump only.
+        let marker = fixture_marker();
+        let mut document: serde_json::Value =
+            serde_json::from_str(&owned_agent_json(&marker, true, true)).unwrap();
+        let items = document["nftables"].as_array_mut().unwrap();
+        let jump = items
+            .iter_mut()
+            .find_map(|item| {
+                let rule = item.get_mut("rule")?;
+                (rule.get("chain")?.as_str()? == "output").then_some(rule)
+            })
+            .unwrap();
+        jump["expr"][0]["match"]["right"] = serde_json::json!(FIXTURE_AGENT_UID + 1);
+        jump["comment"] = serde_json::json!(format!(
+            "{marker}:jump:agent-one:uid:{}",
+            agent_uid_seal(FIXTURE_FORTRESS, "agent-one", FIXTURE_AGENT_UID + 1)
+        ));
+        let err =
+            parse_owned_table_identity(&document.to_string(), &fixture_expectation()).unwrap_err();
         assert!(
             matches!(err, NftablesError::ForeignState(_)),
-            "a numeric-form cgroup match must be refused as foreign (fail-closed), got: {err:?}"
+            "a body/jump uid disagreement must be refused as foreign, got: {err:?}"
         );
-        // The pristine (real-path, sealed) inventory still parses: the fix rejects
-        // ONLY the numeric-form dodge, never the legitimate per-agent binding.
-        parse_owned_table_identity(&owned_agent_json(&marker, true, true))
-            .expect("the correct per-agent binding must still parse");
+    }
+
+    #[test]
+    fn owned_inventory_refuses_a_non_integer_or_out_of_range_skuid_expression() {
+        // A name form (a newer nft rendering `skuid` through the uid symbol
+        // table) and a past-u32 value both read as foreign rather than being
+        // resolved or truncated. Fail-closed: readiness withdraws and the GF1
+        // deny-all net re-arms, rather than the parser guessing.
+        let marker = fixture_marker();
+        let pristine = owned_agent_json(&marker, true, true);
+        let named = pristine.replace(
+            &format!(r#""right":{FIXTURE_AGENT_UID}"#),
+            r#""right":"sanctuary-agent""#,
+        );
+        assert!(named.contains(r#""right":"sanctuary-agent""#));
+        assert!(parse_owned_table_identity(&named, &fixture_expectation()).is_err());
+
+        let huge = pristine.replace(
+            &format!(r#""right":{FIXTURE_AGENT_UID}"#),
+            r#""right":4294967296"#,
+        );
+        assert!(parse_owned_table_identity(&huge, &fixture_expectation()).is_err());
+    }
+
+    #[test]
+    fn owned_inventory_carries_no_numeric_form_cgroup_refusal() {
+        // The numeric-form refusal existed ONLY because a destroyed cgroup and a
+        // hostile in-place rewrite displayed identically, and a bare integer was
+        // ambiguous. With a uid match an integer IS the shape, so that refusal is
+        // deleted; this test pins its ABSENCE so it is not reintroduced as
+        // cargo-culted defence that would refuse every legitimate binding.
+        let marker = fixture_marker();
+        let numeric_uid_binding = owned_agent_json_with_uid(&marker, true, true, 12345);
+        parse_owned_table_identity(
+            &numeric_uid_binding,
+            &ExpectedAgentBinding::Confined {
+                fortress_id: FIXTURE_FORTRESS.to_string(),
+                agent_uid: 12345,
+            },
+        )
+        .expect("an all-digit skuid value is the NORMAL owned shape, never a refusal trigger");
     }
 
     #[test]
@@ -2804,9 +3180,21 @@ mod tests {
     #[test]
     fn owned_identity_refuses_partial_agent_inventory_after_interrupted_mutation() {
         let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        assert!(parse_owned_table_identity(&owned_agent_json(&marker, false, true)).is_err());
-        assert!(parse_owned_table_identity(&owned_agent_json(&marker, true, false)).is_err());
-        assert!(parse_owned_table_identity(&owned_agent_json(&marker, false, false)).is_err());
+        assert!(parse_owned_table_identity(
+            &owned_agent_json(&marker, false, true),
+            &fixture_expectation()
+        )
+        .is_err());
+        assert!(parse_owned_table_identity(
+            &owned_agent_json(&marker, true, false),
+            &fixture_expectation()
+        )
+        .is_err());
+        assert!(parse_owned_table_identity(
+            &owned_agent_json(&marker, false, false),
+            &fixture_expectation()
+        )
+        .is_err());
     }
 
     #[test]
@@ -2826,7 +3214,7 @@ mod tests {
         // binding with a match-all queue. Comment-only verification would
         // falsely accept this as the owned runtime.
         body["expr"] = serde_json::json!([{ "queue": { "num": 0 } }]);
-        assert!(parse_owned_table_identity(&document.to_string()).is_err());
+        assert!(parse_owned_table_identity(&document.to_string(), &fixture_expectation()).is_err());
     }
 
     #[test]
@@ -2839,7 +3227,7 @@ mod tests {
                 "handle":1,"type":"filter","hook":"output","prio":0,"policy":"accept"}}}}
             ]}}"#
         );
-        assert!(parse_owned_table_identity(&missing_table_handle).is_err());
+        assert!(parse_owned_table_identity(&missing_table_handle, &fixture_expectation()).is_err());
 
         let missing_chain_handle = format!(
             r#"{{"nftables":[
@@ -2849,7 +3237,7 @@ mod tests {
                 "type":"filter","hook":"output","prio":0,"policy":"accept"}}}}
             ]}}"#
         );
-        assert!(parse_owned_table_identity(&missing_chain_handle).is_err());
+        assert!(parse_owned_table_identity(&missing_chain_handle, &fixture_expectation()).is_err());
     }
 
     #[test]
@@ -2866,7 +3254,7 @@ mod tests {
                 "expr":[{{"accept":null}}]}}}}
             ]}}"#
         );
-        assert!(parse_owned_table_identity(&json).is_err());
+        assert!(parse_owned_table_identity(&json, &fixture_expectation()).is_err());
     }
 
     #[test]
@@ -2882,7 +3270,7 @@ mod tests {
               {{"chain":{{"family":"inet","table":"sanctuary-castle","name":"extra","handle":3}}}}
             ]}}"#
         );
-        assert!(parse_owned_table_identity(&json).is_err());
+        assert!(parse_owned_table_identity(&json, &fixture_expectation()).is_err());
     }
 
     #[test]
@@ -2896,7 +3284,7 @@ mod tests {
               {{"set":{{"family":"inet","table":"sanctuary-castle","name":"s","handle":4}}}}
             ]}}"#
         );
-        assert!(parse_owned_table_identity(&json).is_err());
+        assert!(parse_owned_table_identity(&json, &fixture_expectation()).is_err());
     }
 
     #[test]
@@ -2908,7 +3296,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .insert("metainfo".to_string(), serde_json::json!({}));
-        assert!(parse_owned_table_identity(&document.to_string()).is_err());
+        assert!(parse_owned_table_identity(&document.to_string(), &fixture_expectation()).is_err());
     }
 
     #[test]
@@ -2919,14 +3307,14 @@ mod tests {
           {"chain":{"family":"inet","table":"sanctuary-castle","name":"output","handle":1,
             "type":"filter","hook":"output","prio":0,"policy":"accept"}}
         ]}"#;
-        assert!(parse_owned_table_identity(no_comment).is_err());
+        assert!(parse_owned_table_identity(no_comment, &fixture_expectation()).is_err());
         // A comment that is not our marker prefix -> foreign.
         let foreign_comment = r#"{"nftables":[
           {"table":{"family":"inet","name":"sanctuary-castle","handle":2,"comment":"someone else"}},
           {"chain":{"family":"inet","table":"sanctuary-castle","name":"output","handle":1,
             "type":"filter","hook":"output","prio":0,"policy":"accept"}}
         ]}"#;
-        assert!(parse_owned_table_identity(foreign_comment).is_err());
+        assert!(parse_owned_table_identity(foreign_comment, &fixture_expectation()).is_err());
     }
 
     #[test]
@@ -2936,8 +3324,10 @@ mod tests {
         // verify against the captured tuple (handle-bound) refuses it. This is
         // what makes "same-shape replacement withdraws readiness" hold.
         let marker = format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef");
-        let first = parse_owned_table_identity(&owned_json(2, 1, &marker)).unwrap();
-        let recreated = parse_owned_table_identity(&owned_json(7, 5, &marker)).unwrap();
+        let first =
+            parse_owned_table_identity(&owned_json(2, 1, &marker), &fixture_expectation()).unwrap();
+        let recreated =
+            parse_owned_table_identity(&owned_json(7, 5, &marker), &fixture_expectation()).unwrap();
         assert_ne!(
             first, recreated,
             "a same-shape recreate must not compare equal to the captured identity"
@@ -2946,9 +3336,9 @@ mod tests {
 
     #[test]
     fn owned_identity_refuses_unparseable_or_empty() {
-        assert!(parse_owned_table_identity("").is_err());
-        assert!(parse_owned_table_identity("{}").is_err());
-        assert!(parse_owned_table_identity(r#"{"nftables":[]}"#).is_err());
+        assert!(parse_owned_table_identity("", &fixture_expectation()).is_err());
+        assert!(parse_owned_table_identity("{}", &fixture_expectation()).is_err());
+        assert!(parse_owned_table_identity(r#"{"nftables":[]}"#, &fixture_expectation()).is_err());
     }
 
     fn make_rule(
@@ -3004,58 +3394,57 @@ mod tests {
     }
 
     #[test]
-    fn build_agent_ruleset_includes_cgroup_queue() {
+    fn build_agent_ruleset_queues_only_the_agent_uid() {
         let frags = vec![NftRuleFragment {
             rule_id: "r1".to_string(),
             nft_expr: "tcp dport 443 accept".to_string(),
         }];
-        let script = build_agent_ruleset(
-            "test-agent",
-            "system.slice/sanctuary-agent-test.service",
-            2,
-            &frags,
-        );
+        let script = build_agent_ruleset("test-agent", 4242, &frags);
         assert!(script.contains("flush chain"));
         assert!(!script.contains("tcp dport 443 accept"));
+        assert!(script.contains("meta skuid 4242"));
         assert!(script.contains("queue num 0"));
         assert!(script.contains("meta mark set"));
-        // Path is quoted, comes after the level, no leading slash. Level 2
-        // is the canonical depth for `/system.slice/<unit>`; nested
-        // deployments pass higher values, hence the rule encoding the level.
-        assert!(
-            script.contains("level 2 \"system.slice/sanctuary-agent-test.service\""),
-            "rule must emit quoted cgroup-relative path after level: {script}"
-        );
+        // No `bypass` flag: an unbound or unreachable NFQUEUE must drop, never
+        // release. This is the property the live guarantee actually rests on.
+        assert!(!script.contains("bypass"));
+        // The retired cgroup match must not reappear anywhere in the emission.
+        assert!(!script.contains("cgroupv2"));
+        assert!(!script.contains("level "));
     }
 
     #[test]
-    fn build_agent_ruleset_threads_dynamic_level() {
-        // In nested environments (CI runners, Docker-in-Docker) the agent's
-        // cgroup may be at depth 3 or 4; the rule must reflect that or nft
-        // rejects with "cgroupv2 path fails" at load time.
-        let frags = vec![NftRuleFragment {
-            rule_id: "r1".to_string(),
-            nft_expr: "tcp dport 443 accept".to_string(),
-        }];
-        let script = build_agent_ruleset(
-            "nested",
-            "system.slice/parent.service/sanctuary-agent-nested.service",
-            3,
-            &frags,
+    fn build_agent_ruleset_emits_a_bare_integer_uid_never_an_account_name() {
+        // The parser accepts only a bare integer (see
+        // `parse_skuid_value_accepts_only_a_bare_integer_uid`). Emitting a name
+        // here would produce a rule this daemon's own verifier reads as foreign,
+        // so the emitter and the parser are pinned to the same form from both
+        // sides. Failure mode if this regresses: the wall installs, then the very
+        // first health poll declares it foreign and re-arms deny-all.
+        let script = build_agent_ruleset("regression", 60123, &[]);
+        let skuid_lines: Vec<&str> = script.lines().filter(|l| l.contains("skuid")).collect();
+        assert_eq!(
+            skuid_lines.len(),
+            1,
+            "exactly one skuid rule expected: {script}"
         );
-        assert!(script
-            .contains("level 3 \"system.slice/parent.service/sanctuary-agent-nested.service\""));
-        assert!(!script.contains("level 2"));
+        let after = skuid_lines[0]
+            .split("meta skuid ")
+            .nth(1)
+            .expect("expected 'meta skuid ' marker");
+        assert!(
+            after.starts_with("60123 "),
+            "uid must be emitted as a bare decimal integer, got: {after}"
+        );
+        assert!(
+            !after.starts_with('"'),
+            "a quoted/name form is never emitted"
+        );
     }
 
     #[test]
     fn build_agent_ruleset_registers_mark_for_nfqueue_attribution() {
-        let script = build_agent_ruleset(
-            "attributed-agent",
-            "system.slice/sanctuary-agent-attributed-agent.service",
-            2,
-            &[],
-        );
+        let script = build_agent_ruleset("attributed-agent", 4242, &[]);
         let mark = crate::nfqueue::agent_mark("attributed-agent");
         assert!(
             script.contains(&format!("meta mark set 0x{mark:08x} queue num 0")),
@@ -3064,42 +3453,6 @@ mod tests {
         assert_eq!(
             crate::nfqueue::resolve_agent_mark(mark),
             Some("attributed-agent".to_string())
-        );
-    }
-
-    #[test]
-    fn build_agent_ruleset_emits_quoted_path_not_inode_integer() {
-        // Regression guard: earlier production code emitted the post-resolution
-        // inode integer where nft expects a quoted cgroup-relative path string.
-        // nft 1.x rejects integer input at rule-load time. This test pins the
-        // emission to the documented input form.
-        let frags = vec![NftRuleFragment {
-            rule_id: "r1".to_string(),
-            nft_expr: "tcp dport 443 accept".to_string(),
-        }];
-        let script = build_agent_ruleset(
-            "regression",
-            "system.slice/sanctuary-agent-regression.service",
-            2,
-            &frags,
-        );
-        // Path must be quoted.
-        assert!(
-            script.contains("\"system.slice/sanctuary-agent-regression.service\""),
-            "cgroup path must be quoted: {script}"
-        );
-        // Must not emit a bare integer where the path goes (i.e. no
-        // `level 2 <digit>` pattern without a quote).
-        let lines: Vec<&str> = script.lines().filter(|l| l.contains("cgroupv2")).collect();
-        assert_eq!(lines.len(), 1, "exactly one cgroupv2 rule expected");
-        let cgroupv2_line = lines[0];
-        let post_level = cgroupv2_line
-            .split("level 2 ")
-            .nth(1)
-            .expect("expected 'level 2 ' marker");
-        assert!(
-            post_level.starts_with('"'),
-            "after 'level 2 ' nft requires a quoted path, got: {post_level}"
         );
     }
 
@@ -3220,60 +3573,24 @@ mod tests {
 
     #[test]
     fn build_agent_jump_rule_emits_canonical_shape() {
-        // Pin the exact rule string for the canonical case: depth-2 cgroup
-        // under system.slice, single-segment agent id. This is what the
-        // base output chain needs to route packets from the agent's cgroup
-        // into the per-agent chain.
-        let rule = build_agent_jump_rule("alpha", 2, "system.slice/sanctuary-agent-alpha.service");
+        // Pin the exact rule string. This is what the base output chain needs to
+        // route the agent's uid-owned packets into the per-agent chain.
+        let rule = build_agent_jump_rule("alpha", 4242);
         assert_eq!(
             rule,
-            "add rule inet sanctuary-castle output \
-             socket cgroupv2 level 2 \"system.slice/sanctuary-agent-alpha.service\" \
-             goto agent_alpha"
+            "add rule inet sanctuary-castle output meta skuid 4242 goto agent_alpha"
         );
     }
 
     #[test]
-    fn build_agent_jump_rule_quotes_cgroup_path() {
-        // Defense against the integer-bug recurrence pattern PR #130 fixed
-        // for build_agent_ruleset: nft 1.x rejects unquoted path strings
-        // and unquoted integer-only inputs at rule-load time. The jump
-        // rule must always emit a quoted path.
-        let rule = build_agent_jump_rule(
-            "regression",
-            2,
-            "system.slice/sanctuary-agent-regression.service",
-        );
-        assert!(
-            rule.contains("\"system.slice/sanctuary-agent-regression.service\""),
-            "cgroup path must be quoted: {rule}"
-        );
-        // No bare integer where the path goes.
-        let post_level = rule
-            .split("level 2 ")
-            .nth(1)
-            .expect("expected 'level 2 ' marker");
-        assert!(
-            post_level.starts_with('"'),
-            "after 'level 2 ' nft requires a quoted path, got: {post_level}"
-        );
-    }
-
-    #[test]
-    fn build_agent_jump_rule_threads_dynamic_level() {
-        // Mirror the build_agent_ruleset dynamic-depth shape: nested
-        // deployments place the agent's cgroup deeper than depth 2, and
-        // the jump rule must reflect the actual depth or nft rejects with
-        // "cgroupv2 path fails".
-        let rule = build_agent_jump_rule(
-            "nested",
-            3,
-            "system.slice/parent.service/sanctuary-agent-nested.service",
-        );
-        assert!(
-            rule.contains("level 3 \"system.slice/parent.service/sanctuary-agent-nested.service\"")
-        );
-        assert!(!rule.contains("level 2"));
+    fn build_agent_jump_rule_uses_goto_not_jump() {
+        // INVARIANT: `goto` is terminating; `jump` returns to the accept-policy
+        // base chain and would silently undo the per-agent verdict. The parse
+        // side pins the same verb (`validate_owned_jump_expr`), so a regression
+        // on either side is caught by the other.
+        let rule = build_agent_jump_rule("alpha", 4242);
+        assert!(rule.contains(" goto agent_alpha"));
+        assert!(!rule.contains(" jump "));
     }
 
     #[test]
@@ -3282,7 +3599,7 @@ mod tests {
         // the per-agent chain created by load_agent_ruleset_impl is the
         // chain reached by this jump.
         for agent_id in &["alpha", "my-agent", "team_a.svc1", "weird/id"] {
-            let rule = build_agent_jump_rule(agent_id, 2, "system.slice/x.service");
+            let rule = build_agent_jump_rule(agent_id, 4242);
             let chain = agent_chain_name(agent_id);
             assert!(
                 rule.ends_with(&format!("goto {chain}")),
@@ -3290,6 +3607,18 @@ mod tests {
                  agent={agent_id} chain={chain} rule={rule}"
             );
         }
+    }
+
+    #[test]
+    fn body_and_jump_emit_the_same_uid_the_parser_requires_them_to_agree_on() {
+        // Cross-emitter agreement, pinned at the source: `parse_owned_table_inventory`
+        // refuses a body and jump that disagree on the uid, so the two emitters
+        // must derive their match from the same value. A drift here would install
+        // a wall that fails its own next health poll.
+        let body = build_agent_ruleset("agreed", 4242, &[]);
+        let jump = build_agent_jump_rule("agreed", 4242);
+        assert!(body.contains("meta skuid 4242"));
+        assert!(jump.contains("meta skuid 4242"));
     }
 
     #[test]
@@ -3311,12 +3640,17 @@ mod tests {
         // Synthetic `nft -a list chain` output with three rules: one
         // jumping to our chain, one jumping to a different chain, one
         // doing something else entirely.
+        //
+        // The jump lines carry the PRODUCTION `meta skuid <uid>` match this
+        // emitter now builds (`build_agent_jump_rule`); a fixture still depicting
+        // the retired `socket cgroupv2` match would keep testing the parser
+        // against a listing the kernel can no longer produce.
         let listing = "\
 table inet sanctuary-castle {
 \tchain output {
 \t\ttype filter hook output priority 0; policy accept;
-\t\tsocket cgroupv2 level 2 \"system.slice/sanctuary-agent-alpha.service\" goto agent_alpha # handle 5
-\t\tsocket cgroupv2 level 2 \"system.slice/sanctuary-agent-beta.service\" goto agent_beta # handle 7
+\t\tmeta skuid 4242 goto agent_alpha # handle 5
+\t\tmeta skuid 4243 goto agent_beta # handle 7
 \t\tudp dport 53 accept # handle 9
 \t}
 }";
@@ -3336,8 +3670,8 @@ table inet sanctuary-castle {
         // substring match for `agent_foo` would wrongly hit the line
         // ending in `goto agent_foo_bar`.
         let listing = "\
-\t\tsocket cgroupv2 level 2 \"system.slice/foo.service\" goto agent_foo # handle 11
-\t\tsocket cgroupv2 level 2 \"system.slice/foo_bar.service\" goto agent_foo_bar # handle 13
+\t\tmeta skuid 4242 goto agent_foo # handle 11
+\t\tmeta skuid 4243 goto agent_foo_bar # handle 13
 ";
         let handles_foo = linux::parse_jump_rule_handles(listing, "agent_foo");
         assert_eq!(handles_foo, vec![11], "must not match agent_foo_bar");
@@ -3353,9 +3687,9 @@ table inet sanctuary-castle {
         // delete-then-add prevents going forward), the parser must surface
         // every handle so a remove call cleans them all out.
         let listing = "\
-\t\tsocket cgroupv2 level 2 \"x\" goto agent_dup # handle 21
-\t\tsocket cgroupv2 level 2 \"x\" goto agent_dup # handle 22
-\t\tsocket cgroupv2 level 2 \"x\" goto agent_dup # handle 23
+\t\tmeta skuid 4242 goto agent_dup # handle 21
+\t\tmeta skuid 4242 goto agent_dup # handle 22
+\t\tmeta skuid 4242 goto agent_dup # handle 23
 ";
         let handles = linux::parse_jump_rule_handles(listing, "agent_dup");
         assert_eq!(handles, vec![21, 22, 23]);
