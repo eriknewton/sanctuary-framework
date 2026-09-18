@@ -657,6 +657,9 @@ impl DaemonHandle {
                 {
                     Ok(snapshot) => snapshot,
                     Err(()) => {
+                        // SAFETY: stderr is the operator channel for this fatal
+                        // supervisor refusal; systemd journals it even when the
+                        // published history cannot support an honest audit row.
                         eprintln!("castle-wall-daemon: unavailable or poisoned published runtime history; stopping supervision");
                         return SupervisionOutcome::FatalControlPath;
                     }

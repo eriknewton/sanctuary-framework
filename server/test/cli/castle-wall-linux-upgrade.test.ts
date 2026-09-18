@@ -61,6 +61,9 @@ describe("fixed privileged Linux upgrade boundary", () => {
     for (const args of [
       ["--route", "reboot", "--candidate", "relative"],
       ["--route", "disarm", "--candidate", "/root/../tmp/daemon"],
+      ["--route", "disarm", "--candidate", "/root/new\u0000bad"],
+      ["--route", "disarm", "--candidate", "/root/new\nbad"],
+      ["--route", "disarm", "--candidate", "/root/new\u007f"],
       ["--route", "disarm", "--candidate", EXEC],
       ["--route", "disarm", "--candidate", "/root/new", "--unit", "other.service"],
       ["--fortress-id", FORTRESS, "--route", "disarm"],

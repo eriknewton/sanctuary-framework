@@ -92,7 +92,7 @@ function assertFixedCommands(
       const key = part.slice(0, separator);
       const metadata = part.slice(separator + 1);
       if (separator < 1 || !allowedMetadata.has(key) || seen.has(key) ||
-          !/^[\w\s.\[\]:/+()\-]*$/.test(metadata)) {
+          !/^[\w\s.[\]:/+()-]*$/.test(metadata)) {
         reject(`unsupported ${field} metadata`);
       }
       seen.add(key);
@@ -137,7 +137,7 @@ export function parseFixedUnitShow(
     argv: [literalArgv, expandedArgv],
     control: "ignore_errors=no",
   }]);
-  const firstPreLiteral = "/usr/bin/install -d -m 0750 -o root -g sanctuary /run/sanctuary/\${SANCTUARY_FORTRESS_ID}";
+  const firstPreLiteral = "/usr/bin/install -d -m 0750 -o root -g sanctuary /run/sanctuary/${SANCTUARY_FORTRESS_ID}";
   const firstPreExpanded = `/usr/bin/install -d -m 0750 -o root -g sanctuary /run/sanctuary/${fortressId}`;
   const pre = [
     { path: "/usr/bin/install", argv: [firstPreLiteral, firstPreExpanded] },
@@ -173,12 +173,21 @@ export function parseFixedUnitEnvironment(raw: string): { fortressId: string; tr
   return { fortressId, trustedServiceUid };
 }
 
+/** Reject C0 and DEL in the candidate pathname without weakening the lint rule. */
+function hasAsciiControl(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
+}
+
 export function parseLinuxUpgradeArgv(
   argv: readonly string[], installedBinary = CASTLE_WALL_DAEMON_BINARY_DEFAULT,
 ): { route: LinuxUpgradeRoute; candidate: string } {
   if (argv.length !== 4 || argv[0] !== "--route" ||
       (argv[1] !== "disarm" && argv[1] !== "reboot") || argv[2] !== "--candidate" ||
-      !isAbsolute(argv[3]) || normalize(argv[3]) !== argv[3] || /[\x00-\x1f\x7f]/.test(argv[3]) ||
+      !isAbsolute(argv[3]) || normalize(argv[3]) !== argv[3] || hasAsciiControl(argv[3]) ||
       argv[3] === installedBinary) {
     reject("usage: sanctuary castle-wall upgrade-linux --route disarm|reboot --candidate ABSOLUTE_PATH");
   }

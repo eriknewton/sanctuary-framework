@@ -176,20 +176,6 @@ impl RuntimeHealthView {
         Ok((prior_health, prior_tag))
     }
 
-    #[cfg(test)]
-    pub(crate) fn hold_health_for_test(
-        &self,
-    ) -> std::sync::MutexGuard<'_, Option<(Instant, RuntimeHealthState)>> {
-        self.inner.lock().unwrap()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn hold_safety_net_for_test(
-        &self,
-    ) -> std::sync::MutexGuard<'_, Option<crate::nftables::SafetyNetAuditState>> {
-        self.safety_net.lock().unwrap()
-    }
-
     /// Publish an observation. Called by boot (initial state) and by the
     /// supervision loop on every health tick. The lock is held only for the
     /// duration of a two-word write, so a reader's `try_lock` effectively never
@@ -246,6 +232,20 @@ impl RuntimeHealthView {
 mod tests {
     use super::*;
     use crate::enforcement::ComponentKind;
+
+    impl RuntimeHealthView {
+        pub(crate) fn hold_health_for_test(
+            &self,
+        ) -> std::sync::MutexGuard<'_, Option<(Instant, RuntimeHealthState)>> {
+            self.inner.lock().unwrap()
+        }
+
+        pub(crate) fn hold_safety_net_for_test(
+            &self,
+        ) -> std::sync::MutexGuard<'_, Option<crate::nftables::SafetyNetAuditState>> {
+            self.safety_net.lock().unwrap()
+        }
+    }
 
     #[test]
     fn an_unpublished_view_is_indeterminate_never_ready() {
