@@ -309,25 +309,112 @@ fn host_wide_scope_installs_no_rules_and_is_recognised() {
     assert!(nftables::live_table_is_deny_all_safety_net().expect("probe the live table"));
 }
 
-// FAIL-BEFORE (identity known, history known, deny set within the cap): the
-// installed table is NEVER the zero-rule shape. This is the assertion that
-// distinguishes a net that preserves operator access from one that does not.
+/// Resolve a scope the way the daemon does, from the three sources, so a leg exercises
+/// the RESOLVER rather than a scope composed by the test.
+fn resolved_scope(
+    history: &[(u32, journal::ConfinedRole)],
+    admitted: Option<(u32, Option<u32>)>,
+    live: &[u32],
+) -> castle_wall_daemon::runtime_providers::SafetyNetResolution {
+    let overflow = HostOverflowUid::from_host().expect("a Linux host exposes kernel.overflowuid");
+    let entries: Vec<journal::ConfinedIdentity> = history
+        .iter()
+        .map(|&(uid, role)| journal::ConfinedIdentity { uid, role })
+        .collect();
+    castle_wall_daemon::runtime_providers::resolve_safety_net_scope(
+        &castle_wall_daemon::runtime_providers::ConfinedHistory::Known(entries),
+        admitted,
+        &nftables::LiveTableBindings::Bindings(live.to_vec()),
+        overflow,
+    )
+}
+
+// FAIL-BEFORE: with an identity KNOWN, history known and the deny set within the cap,
+// the installed table names that identity and is never the zero-rule shape. The scope
+// comes from `resolve_safety_net_scope`, so this leg fails on a build whose resolver
+// cannot produce an identity scope, rather than passing because the test handed the
+// installer one.
 #[test]
-fn a_within_cap_identity_never_installs_the_zero_rule_shape() {
+fn a_within_cap_identity_resolves_and_never_installs_the_zero_rule_shape() {
     let _suite = isolation::guard();
     if !nft_available() {
         skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
         return;
     }
-    nftables::install_deny_all_safety_net(&identity_scope(&[60123, 60124]))
-        .expect("install the identity net");
+    // Sources: (a) the journal names 60123, (b) the manifest names 60124 with a gate,
+    // (c) the live table contributes 60126.
+    let resolution = resolved_scope(
+        &[(60123, journal::ConfinedRole::Agent)],
+        Some((60124, Some(60125))),
+        &[60126],
+    );
+    assert_eq!(
+        resolution.reason,
+        nftables::SafetyNetReason::Identity,
+        "a known identity within the cap must resolve to the identity reason"
+    );
+    assert_eq!(
+        resolution.scope.denied_uids(),
+        vec![60123, 60124, 60125, 60126],
+        "the deny set is the union of all three sources"
+    );
+    // The KILL set excludes the live-table uid.
+    assert_eq!(resolution.kill_set, vec![60123, 60124, 60125]);
+
+    nftables::install_deny_all_safety_net(&resolution.scope).expect("install the resolved net");
     let comments = live_rule_comments_in_order();
     assert_eq!(
         comments.len(),
         3,
-        "a known identity within the cap must install the three-rule shape, not the \
+        "a known identity within the cap installs the three-rule shape, never the \
          zero-rule shape: {comments:?}"
     );
+    assert_eq!(live_base_policy().as_deref(), Some("drop"));
+    assert!(nftables::live_table_is_deny_all_safety_net().expect("probe"));
+}
+
+// OVER CAPACITY: a 257-entry union resolves to the zero-rule host-wide shape with the
+// over-capacity reason, and the INSTALLED table is that shape. Nothing is truncated:
+// a truncated set would stop denying whichever uid fell off the end.
+#[test]
+fn an_over_capacity_union_installs_the_zero_rule_shape_with_the_over_capacity_reason() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let over: Vec<u32> = (0..=nftables::DENY_SET_MAX as u32)
+        .map(|i| 60_000 + i)
+        .collect();
+    assert_eq!(over.len(), nftables::DENY_SET_MAX + 1);
+    let resolution = resolved_scope(&[], None, &over);
+    match resolution.reason {
+        nftables::SafetyNetReason::DenySetOverCapacity { count, cap } => {
+            assert_eq!(count, nftables::DENY_SET_MAX + 1);
+            assert_eq!(cap, nftables::DENY_SET_MAX);
+        }
+        other => panic!("expected the over-capacity reason, got {other:?}"),
+    }
+    assert_eq!(resolution.scope, nftables::SafetyNetScope::HostWide);
+    // The full union is still CARRIED, so a later recompute in the same process cannot
+    // narrow below what this one knew.
+    assert_eq!(resolution.deny_union.len(), nftables::DENY_SET_MAX + 1);
+
+    nftables::install_deny_all_safety_net(&resolution.scope).expect("install the host-wide net");
+    assert_eq!(live_base_policy().as_deref(), Some("drop"));
+    assert!(
+        live_rule_comments_in_order().is_empty(),
+        "the over-capacity resolution installs the zero-rule shape"
+    );
+    assert!(nftables::live_table_is_deny_all_safety_net().expect("probe"));
+    // And the refusal an operator reads names the count, the cap and that operator
+    // access is not preserved on this path.
+    let sentence = nftables::safety_net_scope_sentence(&resolution.scope, &resolution.reason);
+    assert!(
+        sentence.contains("deny set over capacity (257 of 256)"),
+        "{sentence}"
+    );
+    assert!(sentence.contains("operator access is not preserved on this path"));
 }
 
 // The cap's upper boundary on the target nft: DENY_SET_MAX distinct skuid values

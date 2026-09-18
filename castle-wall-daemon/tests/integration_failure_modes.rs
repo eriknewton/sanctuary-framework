@@ -457,7 +457,13 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
     let script = nftables::build_agent_ruleset("f2-test", TEST_AGENT_UID, &frags);
-    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load_agent_ruleset");
+    nftables::load_agent_ruleset(
+        &id,
+        &script,
+        test_binding(),
+        isolation::write_ahead_receipt_for(test_binding()),
+    )
+    .expect("load_agent_ruleset");
 
     // Sanity: the chain is in the kernel before the simulated crash.
     let pre = Command::new("nft")
@@ -562,7 +568,13 @@ fn a_live_agent_binding_is_refused_when_the_restart_confines_no_uid() {
         fortress_id: "deadbeef".to_string(),
     };
     let script = nftables::build_agent_ruleset("unconfined-restart", TEST_AGENT_UID, &[]);
-    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load_agent_ruleset");
+    nftables::load_agent_ruleset(
+        &id,
+        &script,
+        test_binding(),
+        isolation::write_ahead_receipt_for(test_binding()),
+    )
+    .expect("load_agent_ruleset");
     drop(handle);
 
     // Restart with a manifest carrying NO agent origin: a legitimate unwrapped
@@ -653,7 +665,13 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
     let script = nftables::build_agent_ruleset("f3-test", TEST_AGENT_UID, &frags);
-    nftables::load_agent_ruleset(&id, &script, test_binding()).expect("load");
+    nftables::load_agent_ruleset(
+        &id,
+        &script,
+        test_binding(),
+        isolation::write_ahead_receipt_for(test_binding()),
+    )
+    .expect("load");
 
     // The binding is legitimate only because the manifest in force confines this
     // uid; prove the daemon's own health poll reads the live table as OWNED

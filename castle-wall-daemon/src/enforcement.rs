@@ -234,6 +234,17 @@ pub trait AcquiredComponent: Send {
         false
     }
 
+    /// The tagged `safety_net` state this component last produced, for the audit row
+    /// and the signed status report.
+    ///
+    /// `None` from a component that has no safety net of its own, which is every
+    /// component but the nftables table. The default is `None` rather than
+    /// `NotAttempted`, so a component that cannot install one is distinguishable from
+    /// one that could and did not.
+    fn safety_net_audit_state(&self) -> Option<crate::nftables::SafetyNetAuditState> {
+        None
+    }
+
     /// Idempotent, panic-free teardown; joins owned threads before returning.
     /// Runs from `Drop`, so it must never unwrap a fallible join or lock.
     fn release(&mut self);
@@ -674,11 +685,30 @@ impl EnforcementRuntime {
     pub fn attempt_post_ready_recovery(&self, shutting_down: bool) -> bool {
         let mut any = false;
         for component in &self.components {
-            if matches!(component.health(), ComponentHealth::Lost) {
+            // BOTH readings drive the controller. `Lost` is the entry; `Recovering` is
+            // an attempt already outstanding, and it must be re-entered on the retry
+            // interval or a failed install would never be retried at all.
+            if matches!(
+                component.health(),
+                ComponentHealth::Lost | ComponentHealth::Recovering
+            ) {
                 any |= component.attempt_post_ready_recovery(shutting_down);
             }
         }
         any
+    }
+
+    /// The tagged `safety_net` state to stamp on an audit row or a signed report.
+    ///
+    /// INVARIANT: a row emitted while an install has FAILED must not attest to a
+    /// protection that is not in place, which is why this returns the component's own
+    /// recorded outcome rather than deriving one from the fact that a loss occurred.
+    /// `NotAttempted` when no component has attempted an install.
+    pub fn safety_net_audit_state(&self) -> crate::nftables::SafetyNetAuditState {
+        self.components
+            .iter()
+            .find_map(|component| component.safety_net_audit_state())
+            .unwrap_or(crate::nftables::SafetyNetAuditState::NotAttempted)
     }
 
     /// Convenience: true iff [`status`](Self::status) is `KernelRuntimeReady`.
@@ -958,6 +988,108 @@ mod test_support {
         ]
     }
 
+    /// ITEM 10, consumer one: the runtime surface that both the WAL row and the signed
+    /// report read. A failure-to-retry transition must be visible in it, so a row
+    /// emitted after a failed install never claims an installed protection.
+    #[test]
+    fn the_safety_net_audit_state_follows_the_install_transition() {
+        use crate::nftables::SafetyNetAuditState;
+
+        struct StateHolder {
+            kind: ComponentKind,
+            state: Arc<std::sync::Mutex<Option<SafetyNetAuditState>>>,
+        }
+        impl AcquiredComponent for StateHolder {
+            fn kind(&self) -> ComponentKind {
+                self.kind
+            }
+            fn is_ready(&self) -> bool {
+                true
+            }
+            fn safety_net_audit_state(&self) -> Option<SafetyNetAuditState> {
+                self.state.lock().expect("state").clone()
+            }
+            fn release(&mut self) {}
+        }
+        struct HolderProvider {
+            kind: ComponentKind,
+            state: Arc<std::sync::Mutex<Option<SafetyNetAuditState>>>,
+        }
+        impl ComponentProvider for HolderProvider {
+            fn kind(&self) -> ComponentKind {
+                self.kind
+            }
+            fn acquire(self: Box<Self>) -> Result<Box<dyn AcquiredComponent>, EnforcementError> {
+                Ok(Box::new(StateHolder {
+                    kind: self.kind,
+                    state: self.state,
+                }))
+            }
+        }
+
+        let state = Arc::new(std::sync::Mutex::new(None));
+        let runtime = EnforcementRuntime::start(vec![
+            Box::new(HolderProvider {
+                kind: ComponentKind::NftablesTable,
+                state: Arc::clone(&state),
+            }),
+            Box::new(AlwaysReadyProvider(ComponentKind::Nfqueue)),
+            Box::new(AlwaysReadyProvider(ComponentKind::ManifestWatcher)),
+        ])
+        .expect("starts ready");
+
+        // NOTHING ATTEMPTED yet: the surface says so rather than implying an install.
+        assert_eq!(
+            runtime.safety_net_audit_state(),
+            SafetyNetAuditState::NotAttempted
+        );
+
+        // An install FAILED: the surface reports the failure, with the scope attempted.
+        *state.lock().unwrap() = Some(SafetyNetAuditState::InstallFailed {
+            attempted_scope: "v2-confined-identity".to_string(),
+            error: "the safety net install failed and will be retried".to_string(),
+        });
+        let failed = runtime.safety_net_audit_state();
+        assert_eq!(failed.tag(), "install_failed");
+        assert_eq!(failed.to_json()["state"], "install_failed");
+        assert_eq!(failed.to_json()["attempted_scope"], "v2-confined-identity");
+
+        // THE RETRY takes: the surface flips to the installed predicate, with its
+        // coverage limit stated on the same row.
+        let set = crate::safety_net_uid::ConfinedUidSet::from_validated(vec![
+            crate::safety_net_uid::validate_safety_net_uid(
+                60123,
+                crate::safety_net_uid::HostOverflowUid::from_value(65534),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        *state.lock().unwrap() = Some(SafetyNetAuditState::installed(
+            &crate::nftables::SafetyNetScope::Identity(set),
+            &crate::nftables::SafetyNetReason::Identity,
+            crate::nftables::SafetyNetSources {
+                journal: true,
+                manifest: true,
+                live_table: false,
+            },
+        ));
+        let json = runtime.safety_net_audit_state().to_json();
+        assert_eq!(json["state"], "installed");
+        assert_eq!(json["shape"], "v2-confined-identity");
+        assert_eq!(json["reason"], "identity");
+        assert_eq!(json["deny_set_size"], 1);
+        assert_eq!(json["deny_set_max"], crate::nftables::DENY_SET_MAX);
+        assert_eq!(json["denied_uids"], serde_json::json!([60123]));
+        assert_eq!(json["rules"].as_array().unwrap().len(), 3);
+        assert_eq!(json["sources"]["journal"], true);
+        assert_eq!(json["kernel_nd_accepted"].as_array().unwrap().len(), 3);
+        assert_eq!(json["unattestable_packets"], "drop-except-kernel-nd");
+        assert!(json["coverage"]
+            .as_str()
+            .unwrap()
+            .contains("packet sockets"));
+    }
+
     #[test]
     fn a_startup_lost_reading_runs_the_loss_responder_then_unwinds_with_typed_evidence() {
         let counters = ResponderCounters::default();
@@ -1004,6 +1136,58 @@ mod test_support {
             ),
             other => panic!("expected a component failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_non_nft_component_loss_runs_no_responder_and_installs_nothing() {
+        // Every component but the nftables table leaves the kernel egress gate intact
+        // when it fails, so its loss keeps the existing path: unwind, refuse, and let the
+        // preserved table be adopted on restart. Installing a net for it would replace a
+        // healthy table, and firing the sweep hook would act on a loss that is not about
+        // the table at all.
+        let counters = ResponderCounters::default();
+        let lost_health = Arc::new(std::sync::Mutex::new(ComponentHealth::Lost));
+        let err = EnforcementRuntime::start(vec![
+            Box::new(AlwaysReadyProvider(ComponentKind::NftablesTable)),
+            Box::new(AlwaysReadyProvider(ComponentKind::Nfqueue)),
+            Box::new(ScriptedProvider {
+                kind: ComponentKind::ManifestWatcher,
+                health: Arc::clone(&lost_health),
+                startup_lost_calls: Arc::clone(&counters.startup_lost),
+                startup_indeterminate_calls: Arc::clone(&counters.startup_indeterminate),
+                recovery_calls: Arc::clone(&counters.recovery),
+                recovery_saw_shutdown: Arc::clone(&counters.recovery_saw_shutdown),
+            }),
+        ])
+        .expect_err("a lost component must not yield a runtime");
+
+        // The failure is attributed to the manifest watcher, and its own responder is the
+        // DEFAULT no-op, so nothing was installed and no hook fired.
+        match err {
+            EnforcementStartError::Component {
+                failed, evidence, ..
+            } => {
+                assert_eq!(failed, ComponentKind::ManifestWatcher);
+                assert_eq!(
+                    evidence,
+                    Some(StartupReadiness::Lost {
+                        kind: ComponentKind::ManifestWatcher
+                    })
+                );
+                // The reading is not the nftables component's, so it carries no
+                // safety-net action.
+                assert_eq!(
+                    evidence.and_then(|e| e.nftables_kind()),
+                    None,
+                    "only the nftables component's reading carries a net action"
+                );
+            }
+            other => panic!("expected a component failure, got {other:?}"),
+        }
+        // The scripted component counted its own responder calls; the DEFAULT trait
+        // methods are what ran, so these stay zero.
+        assert_eq!(counters.startup_lost.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.recovery.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1058,12 +1242,18 @@ mod test_support {
         assert!(!runtime.attempt_post_ready_recovery(true));
         assert!(counters.recovery_saw_shutdown.load(Ordering::SeqCst));
 
-        // RECOVERING: an attempt is already outstanding, so the component is not
-        // driven again from this path.
+        // RECOVERING: an attempt is outstanding, and the controller IS re-entered. This
+        // is what makes a failed install retry: the component keeps publishing
+        // `Recovering`, and every supervisor tick brings it back here until the
+        // resource is repaired or the unit is stopped.
         let before = counters.recovery.load(Ordering::SeqCst);
         *health.lock().unwrap() = ComponentHealth::Recovering;
-        assert!(!runtime.attempt_post_ready_recovery(false));
-        assert_eq!(counters.recovery.load(Ordering::SeqCst), before);
+        assert!(runtime.attempt_post_ready_recovery(false));
+        assert_eq!(
+            counters.recovery.load(Ordering::SeqCst),
+            before + 1,
+            "a recovering component must be re-driven so a failed install is retried"
+        );
 
         // And `Recovering` withholds readiness without reporting the loss a
         // supervisor exits on.

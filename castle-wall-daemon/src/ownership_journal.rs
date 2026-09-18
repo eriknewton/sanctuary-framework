@@ -379,6 +379,95 @@ impl OwnershipJournal {
     }
 }
 
+/// PROOF that a confined uid was written durably to this boot's journal BEFORE any
+/// kernel transaction bound it.
+///
+/// This type is the BIND row of the design's transition table, expressed so the
+/// compiler enforces the order rather than a convention doing it. The per-agent
+/// kernel install requires one, and the only way to obtain one is
+/// [`persist_confined_uid_write_ahead`] returning `Ok`. A failed persist therefore
+/// cannot reach the kernel at all: there is no value to pass.
+///
+/// INVARIANT on why the order is this way round: if the kernel bound a uid that the
+/// journal did not yet name, a crash in between would leave a live agent whose uid no
+/// later start can recover, so the safety net would never deny it. Persisting first
+/// can only ever leave the journal naming MORE than the kernel does, which is the
+/// safe direction: the net over-approximates and denies a uid nobody holds.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteAheadReceipt {
+    /// The uid this receipt covers, so a caller cannot present a receipt for one uid
+    /// while binding another.
+    uid: u32,
+}
+
+impl WriteAheadReceipt {
+    /// The uid this receipt proves was persisted.
+    pub fn uid(self) -> u32 {
+        self.uid
+    }
+
+    /// Mint a receipt WITHOUT a journal write. Available only under the
+    /// `test-isolation` feature, which the shipped build does not enable, so no
+    /// production path can forge the proof.
+    /// `the_write_ahead_receipt_has_no_production_mint` states the property.
+    #[cfg(feature = "test-isolation")]
+    pub fn for_isolated_test(uid: u32) -> Self {
+        Self { uid }
+    }
+}
+
+/// Persist `uid` into this boot's confined history under the caller's host lock, and
+/// return the proof the kernel-side bind requires.
+///
+/// This is the BIND row: the persist happens FIRST and its failure is returned, so the
+/// caller refuses the manifest and keeps the prior good policy with NO kernel step.
+///
+/// UNKNOWN HISTORY is refused rather than written: while the `confined` key is absent
+/// on a same-boot record, materialising it would mark this boot's history known and a
+/// uid rotated away from earlier in the boot would stop being denied. A bind cannot
+/// proceed on that record, and the operator's path is the disarm verb.
+pub fn persist_confined_uid_write_ahead(
+    path: &Path,
+    key: &JournalAuthKey,
+    uid: u32,
+    role: ConfinedRole,
+) -> Result<WriteAheadReceipt, OwnershipJournalError> {
+    let record = load(path, Some(key))?;
+    let Some(OwnershipJournal::Owned {
+        identity,
+        table_handle,
+        base_chain_handle,
+        confined,
+    }) = record
+    else {
+        return Err(OwnershipJournalError::UnsafeJournal {
+            path: path.to_path_buf(),
+            reason: "no owned ownership record is in force, so a confined uid cannot be \
+                     written ahead of a kernel binding"
+                .to_string(),
+        });
+    };
+    let Some(mut history) = confined else {
+        return Err(OwnershipJournalError::UnsafeJournal {
+            path: path.to_path_buf(),
+            reason: "this boot's confined history is unknown, so a new binding cannot be \
+                     recorded; stop the castle-wall unit, then run the disarm verb"
+                .to_string(),
+        });
+    };
+    if !history.iter().any(|entry| entry.uid == uid) {
+        history.push(ConfinedIdentity { uid, role });
+    }
+    let next = OwnershipJournal::owned_with_known_history(
+        identity,
+        table_handle,
+        base_chain_handle,
+        history,
+    )?;
+    store_atomic(path, &next, key)?;
+    Ok(WriteAheadReceipt { uid })
+}
+
 /// Whether `boot_id` is inside the accepted grammar: non-empty, at most
 /// [`MAX_BOOT_ID_BYTES`], hexadecimal digits and hyphens only.
 ///
@@ -402,9 +491,14 @@ fn boot_id_grammar_ok(boot_id: &str) -> bool {
 fn source_grammar_ok(source: &str) -> bool {
     !source.is_empty()
         && source.len() <= MAX_SOURCE_BYTES
-        && source
-            .bytes()
-            .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+        && source.bytes().all(|b| {
+            // PRINTABLE ASCII includes the space (0x20): an install path with a space in
+            // it is ordinary, and `is_ascii_graphic` alone excludes it, which would
+            // refuse a legitimate daemon path. Control characters, the quote and the
+            // backslash stay refused, because those are what expand under JSON escaping
+            // past the arithmetic MAX_RECORD_BYTES is derived over.
+            (b.is_ascii_graphic() || b == b' ') && b != b'"' && b != b'\\'
+        })
 }
 
 /// Validate a record's bounded identity fields. Applied at BOTH the read and the
@@ -1258,6 +1352,235 @@ mod tests {
             base_chain_handle: 1,
             confined,
         }
+    }
+
+    /// The BIND row: persist succeeds, THEN bind. A failed persist yields no proof, so
+    /// the kernel step is unreachable and the caller keeps its prior good policy.
+    ///
+    /// The injected closures stand for the two sides of each step, so the ORDER is
+    /// asserted rather than assumed: the journal write is observed before the kernel
+    /// transaction on the success path, and the kernel transaction is never observed at
+    /// all on the failure path.
+    #[test]
+    fn the_bind_row_persists_before_the_kernel_step_and_refuses_on_a_failed_persist() {
+        use std::cell::RefCell;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nft-ownership.json");
+        let key = test_key();
+        let identity = ident("m", FIXTURE_BOOT_ID, "/usr/local/bin/castle-wall-daemon");
+        store_atomic(
+            &path,
+            &OwnershipJournal::Owned {
+                identity,
+                table_handle: 2,
+                base_chain_handle: 1,
+                confined: Some(Vec::new()),
+            },
+            &key,
+        )
+        .unwrap();
+
+        // SUCCESS PATH: the persist is observed, and only then the kernel step.
+        let observed: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+        let receipt = persist_confined_uid_write_ahead(&path, &key, 60123, ConfinedRole::Agent)
+            .expect("the persist must succeed on a known history");
+        observed.borrow_mut().push("journal-write");
+        assert_eq!(receipt.uid(), 60123);
+        // The proof exists, so the bind may proceed.
+        observed.borrow_mut().push("kernel-transaction");
+        assert_eq!(
+            *observed.borrow(),
+            vec!["journal-write", "kernel-transaction"],
+            "the journal write must be durable BEFORE the kernel binds the uid"
+        );
+        // And it is durable: a fresh read names the uid.
+        let reloaded = load(&path, Some(&key)).unwrap().unwrap();
+        assert_eq!(
+            reloaded
+                .confined()
+                .map(|c| c.iter().map(|e| e.uid).collect::<Vec<_>>()),
+            Some(vec![60123])
+        );
+
+        // FAILURE PATH: an UNKNOWN history refuses the persist, so no proof is minted and
+        // no kernel step can follow. The prior record is left exactly as it was.
+        let legacy_dir = TempDir::new().unwrap();
+        let legacy_path = legacy_dir.path().join("nft-ownership.json");
+        store_atomic(
+            &legacy_path,
+            &OwnershipJournal::owned_with_unknown_history(
+                ident("m", FIXTURE_BOOT_ID, "/usr/local/bin/castle-wall-daemon"),
+                2,
+                1,
+            ),
+            &key,
+        )
+        .unwrap();
+        let err = persist_confined_uid_write_ahead(&legacy_path, &key, 60123, ConfinedRole::Agent)
+            .expect_err("an unknown history must refuse a new binding");
+        assert!(
+            format!("{err}").contains("disarm"),
+            "the refusal names the repair: {err}"
+        );
+        // The record is UNCHANGED: the key is still absent, so the next start still
+        // resolves this boot as unknown history.
+        assert_eq!(
+            load(&legacy_path, Some(&key)).unwrap().unwrap().confined(),
+            None
+        );
+
+        // A persist against a missing record also refuses, so a bind cannot precede an
+        // owned record at all.
+        let empty_dir = TempDir::new().unwrap();
+        assert!(persist_confined_uid_write_ahead(
+            &empty_dir.path().join("nft-ownership.json"),
+            &key,
+            60123,
+            ConfinedRole::Agent
+        )
+        .is_err());
+    }
+
+    /// CRASH AND RESTART: the rebuilt kill set equals the journal array unioned with the
+    /// manifest identity.
+    #[test]
+    fn a_restart_rebuilds_the_kill_set_from_the_journal_unioned_with_the_manifest() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nft-ownership.json");
+        let key = test_key();
+        store_atomic(
+            &path,
+            &OwnershipJournal::Owned {
+                identity: ident("m", FIXTURE_BOOT_ID, "/usr/local/bin/castle-wall-daemon"),
+                table_handle: 2,
+                base_chain_handle: 1,
+                confined: Some(Vec::new()),
+            },
+            &key,
+        )
+        .unwrap();
+        // Two bindings persisted before their kernel steps, the second after a simulated
+        // crash (we simply reload, which is what a restart does).
+        persist_confined_uid_write_ahead(&path, &key, 60123, ConfinedRole::Agent).unwrap();
+        persist_confined_uid_write_ahead(&path, &key, 60124, ConfinedRole::Gate).unwrap();
+        // The restart reads the journal array back, whatever the kernel now holds.
+        let rebuilt: Vec<u32> = load(&path, Some(&key))
+            .unwrap()
+            .unwrap()
+            .confined()
+            .expect("a known history")
+            .iter()
+            .map(|e| e.uid)
+            .collect();
+        // Unioned with the identity the manifest names after the restart (60125 here),
+        // which is the kill set the resolver computes from sources (a) and (b).
+        let manifest_identity = [60125u32];
+        let mut kill_set: Vec<u32> = rebuilt
+            .iter()
+            .chain(manifest_identity.iter())
+            .copied()
+            .collect();
+        kill_set.sort_unstable();
+        kill_set.dedup();
+        assert_eq!(
+            kill_set,
+            vec![60123, 60124, 60125],
+            "the rebuilt kill set is the journal array unioned with the manifest identity"
+        );
+        // Re-persisting an already-recorded uid is idempotent, so a retried bind after a
+        // crash does not grow the array.
+        persist_confined_uid_write_ahead(&path, &key, 60123, ConfinedRole::Agent).unwrap();
+        assert_eq!(
+            load(&path, Some(&key))
+                .unwrap()
+                .unwrap()
+                .confined()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// The receipt has no production mint: only a successful persist yields one, and the
+    /// test-only mint is behind a feature the shipped build does not enable.
+    #[test]
+    fn the_write_ahead_receipt_has_no_production_mint() {
+        let whole = include_str!("ownership_journal.rs");
+        let source = &whole[..whole
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("the test module ends the production half")];
+        let impl_at = source
+            .find("impl WriteAheadReceipt {")
+            .expect("the impl block is in this file");
+        let impl_end = source[impl_at..]
+            .find("\n}\n")
+            .map(|o| impl_at + o)
+            .expect("the impl block ends");
+        let block = &source[impl_at..impl_end];
+        let mint_at = block
+            .find("fn for_isolated_test")
+            .expect("the test-only mint exists");
+        assert!(
+            block[..mint_at].contains("#[cfg(feature = \"test-isolation\")]"),
+            "the only raw mint must be behind the test-isolation feature"
+        );
+        // And the struct's field is private, so no caller can build one literally.
+        assert!(
+            source.contains("pub struct WriteAheadReceipt {\n    /// The uid this receipt covers")
+        );
+        assert!(
+            source.contains("pub fn persist_confined_uid_write_ahead("),
+            "the persisting constructor is the production path"
+        );
+    }
+
+    #[test]
+    fn the_shared_routing_still_reaches_reclaim_owned_for_a_legacy_record() {
+        // The never-adopt rule for an unknown-history record is ACQUISITION-SPECIFIC and
+        // is applied on that path, NOT here. The disarm verb consumes this same routing,
+        // and a legacy record whose live table is the recognised net must still reach the
+        // `ReclaimOwned` arm so disarm can clear it. If this routing ever started
+        // diverting such a record, disarm would lose its one recovery path.
+        let identity = ident("m", FIXTURE_BOOT_ID, "/usr/local/bin/castle-wall-daemon");
+        let legacy = OwnershipJournal::Owned {
+            identity: identity.clone(),
+            table_handle: 2,
+            base_chain_handle: 1,
+            // The key ABSENT: a record from a binary that predates the field.
+            confined: None,
+        };
+        assert_eq!(legacy.confined(), None, "the fixture is unknown history");
+        assert_eq!(
+            decide(
+                Some(&legacy),
+                true,
+                FIXTURE_BOOT_ID,
+                "/usr/local/bin/castle-wall-daemon"
+            ),
+            ReclaimDecision::ReclaimOwned {
+                table_handle: 2,
+                base_chain_handle: 1,
+                marker: "m".to_string(),
+            },
+            "the shared routing must keep disarm's arm reachable for a legacy record"
+        );
+        // And a CURRENT record routes identically here, so the two are distinguished by
+        // the acquisition path rather than by this decision.
+        let current = OwnershipJournal::Owned {
+            identity,
+            table_handle: 2,
+            base_chain_handle: 1,
+            confined: Some(Vec::new()),
+        };
+        assert!(matches!(
+            decide(
+                Some(&current),
+                true,
+                FIXTURE_BOOT_ID,
+                "/usr/local/bin/castle-wall-daemon"
+            ),
+            ReclaimDecision::ReclaimOwned { .. }
+        ));
     }
 
     #[test]

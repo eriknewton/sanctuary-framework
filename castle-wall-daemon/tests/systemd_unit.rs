@@ -198,9 +198,56 @@ const START_LIMIT_BURST: &str = "5";
 /// Must match `StartLimitIntervalSec` in systemd/sanctuary-castle-wall.service.
 const START_LIMIT_INTERVAL_SEC: &str = "600";
 
+/// The INI section a directive appears in, or None when it is absent.
+///
+/// systemd reads a directive only in its own section and ignores it elsewhere, so a
+/// test that asserts a value without asserting the section cannot tell a live
+/// directive from a decorative one.
+fn section_of(unit: &str, directive: &str) -> Option<String> {
+    let mut current: Option<String> = None;
+    for line in unit.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+            current = Some(name.to_string());
+            continue;
+        }
+        if trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        if let Some((key, _)) = trimmed.split_once('=') {
+            if key.trim() == directive {
+                return current.clone();
+            }
+        }
+    }
+    None
+}
+
 #[test]
 fn unit_ships_a_finite_start_limit_whose_window_outlasts_five_worst_case_activations() {
     let unit = unit_text();
+    // SECTION MATTERS: `StartLimitBurst` and `StartLimitIntervalSec` are `[Unit]`
+    // directives. systemd silently IGNORES them under `[Service]`, so a unit that
+    // carries them in the wrong section has no start limit at all while reading as
+    // though it does. Assert the section, not just the value.
+    assert_eq!(
+        section_of(&unit, "StartLimitBurst").as_deref(),
+        Some("Unit"),
+        "StartLimitBurst must sit in [Unit]; systemd ignores it under [Service]"
+    );
+    assert_eq!(
+        section_of(&unit, "StartLimitIntervalSec").as_deref(),
+        Some("Unit"),
+        "StartLimitIntervalSec must sit in [Unit]; systemd ignores it under [Service]"
+    );
+    // And the directives that ARE per-service stay where they belong, so this test
+    // cannot pass by moving everything into one section.
+    assert_eq!(
+        section_of(&unit, "TimeoutStartSec").as_deref(),
+        Some("Service")
+    );
+    assert_eq!(section_of(&unit, "RestartSec").as_deref(), Some("Service"));
+
     let burst = directive_values(&unit, "StartLimitBurst");
     let interval = directive_values(&unit, "StartLimitIntervalSec");
     assert_eq!(burst.len(), 1, "exactly one StartLimitBurst must be set");

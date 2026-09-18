@@ -126,10 +126,17 @@ impl HostOverflowUid {
         Ok(Self(value))
     }
 
-    /// Construct from a known value. Used by a caller that has already read the
-    /// host's sysctl once and is validating a second uid against the same value,
-    /// and by tests that pin a specific host configuration.
-    pub fn from_value(value: u32) -> Self {
+    /// Construct from a known value. Test-only ON PURPOSE.
+    ///
+    /// The type exists so a caller cannot pass an arbitrary number where the HOST's own
+    /// configured value belongs. A public raw constructor would defeat that: any caller
+    /// could mint an overflow uid of its choosing and the three-refusal function would
+    /// then refuse the wrong value while admitting the real credential-collision one.
+    /// Production has exactly two mints, both readers: [`Self::from_host`] and
+    /// [`Self::read_at`]. `the_overflow_type_has_no_production_raw_constructor` states
+    /// the property.
+    #[cfg(test)]
+    pub(crate) fn from_value(value: u32) -> Self {
         Self(value)
     }
 
@@ -375,6 +382,86 @@ mod tests {
     /// property and exercises the only admitted path; a future edit that added a
     /// `pub` field or a `pub fn new(u32)` would make the module's doc comment and
     /// this test both false, and the reviewer's checklist is the enforcement.
+    /// Item 12: the overflow type has no production raw constructor.
+    ///
+    /// Structural, by reading this module's own source: the only `pub fn` that yields a
+    /// `HostOverflowUid` outside a `#[cfg(test)]` block must be one of the two readers.
+    /// A future edit adding a public raw constructor would have to change this
+    /// assertion, which is the point.
+    #[test]
+    fn the_overflow_type_has_no_production_raw_constructor() {
+        let source = include_str!("safety_net_uid.rs");
+        let impl_start = source
+            .find("impl HostOverflowUid {")
+            .expect("the impl block is in this file");
+        let impl_end = source[impl_start..]
+            .find("\n}\n")
+            .map(|o| impl_start + o)
+            .expect("the impl block ends");
+        let block = &source[impl_start..impl_end];
+        // `from_value` is the only raw mint and it is test-gated.
+        let from_value_at = block.find("fn from_value").expect("from_value exists");
+        assert!(
+            block[..from_value_at].contains("#[cfg(test)]"),
+            "the raw constructor must be test-gated, so production cannot choose an \
+             overflow value instead of reading the host's"
+        );
+        assert!(
+            !block.contains("pub fn from_value"),
+            "the raw constructor must not be public"
+        );
+        // And the two readers are present and public.
+        assert!(block.contains("pub fn from_host"));
+        assert!(block.contains("pub fn read_at"));
+    }
+
+    /// Grok B: the raw-uid construction proof for `ConfinedUidSet`.
+    ///
+    /// Structural for the same reason as above: the set's only constructor takes
+    /// already-validated values, and no public entry accepts a raw `u32` or a raw
+    /// collection. A caller elsewhere in the crate therefore cannot place an
+    /// unattestable number into rule 1 even deliberately.
+    #[test]
+    fn the_confined_set_has_no_raw_uid_constructor() {
+        // Scan the PRODUCTION half only: the test module below names these tokens in
+        // its own assertions, and a scan that included itself would always fire.
+        let whole = include_str!("safety_net_uid.rs");
+        let source = &whole[..whole
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("the test module marks the end of the production half")];
+        let impl_start = source
+            .find("impl ConfinedUidSet {")
+            .expect("the impl block is in this file");
+        let impl_end = source[impl_start..]
+            .find("\n}\n")
+            .map(|o| impl_start + o)
+            .expect("the impl block ends");
+        let block = &source[impl_start..impl_end];
+        assert!(
+            block.contains("pub fn from_validated"),
+            "the validated constructor is the admitted path"
+        );
+        for forbidden in [
+            "pub fn new(",
+            "pub fn from_uids",
+            "pub fn from_raw",
+            "impl Default for ConfinedUidSet",
+            "pub fn empty(",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "no public raw or empty constructor may exist: found {forbidden}"
+            );
+        }
+        // The field is private, so a struct literal is unavailable outside this module.
+        assert!(
+            source.contains("pub struct ConfinedUidSet(Vec<ValidatedSafetyNetUid>);"),
+            "the single field stays private"
+        );
+        // And the element type's own field is private for the same reason.
+        assert!(source.contains("pub struct ValidatedSafetyNetUid(u32);"));
+    }
+
     #[test]
     fn safety_net_scope_is_closed_to_raw_uids() {
         let host = fixture_host();

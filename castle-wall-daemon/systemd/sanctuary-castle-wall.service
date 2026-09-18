@@ -4,6 +4,35 @@ Documentation=https://github.com/eriknewton/sanctuary-framework
 After=network-pre.target
 Before=network.target
 Wants=network-pre.target
+# FINITE start limit, shipped explicitly so the terminal failed state does not
+# depend on a host manager default.
+#
+# DERIVATION of the interval, not a chosen number: systemd refuses a start only
+# when MORE than StartLimitBurst starts fall inside one StartLimitIntervalSec
+# window, so all five worst-case activations must fit in the window for the sixth
+# to be refused. A worst case is an activation killed at TimeoutStartSec (60 s)
+# plus RestartSec (2 s) = 62 s, so five of them span 310 s. 600 s exceeds that
+# with margin. A 60-second window would never trip at all, because each attempt
+# alone outlasts it.
+#
+# WHY NOT StartLimitIntervalSec=0 (unlimited): this unit declares
+# Before=network.target, so an activating Type=notify service that never reaches
+# READY=1 would restart forever while network.target, and sshd behind it, wait on
+# that ordering edge. That moves the boot lockout out of nftables and into
+# systemd, which is strictly worse: the net in the kernel at least spares every
+# principal that is not the confined identity. With the finite limit a fail-before
+# burst fails the unit, network.target completes, and the net stays in the kernel.
+#
+# FAILURE MODE an operator will actually meet: the limit counts EVERY start, not
+# only boot retries, so five failures inside 600 s after READY=1 (a post-READY
+# crash wave) also leave the unit failed. The owned table and the journal are
+# PRESERVED, because ordinary process loss deletes neither. Recovery is
+# `systemctl reset-failed sanctuary-castle-wall` then `systemctl start`; a plain
+# `start` alone returns "start request repeated too quickly" and looks like a
+# broken unit file.
+StartLimitBurst=5
+StartLimitIntervalSec=600
+
 
 [Service]
 Type=notify
@@ -37,34 +66,6 @@ Group=sanctuary
 # fail-before into a restart loop. Pinned by value in tests/systemd_unit.rs.
 TimeoutStartSec=60
 
-# FINITE start limit, shipped explicitly so the terminal failed state does not
-# depend on a host manager default.
-#
-# DERIVATION of the interval, not a chosen number: systemd refuses a start only
-# when MORE than StartLimitBurst starts fall inside one StartLimitIntervalSec
-# window, so all five worst-case activations must fit in the window for the sixth
-# to be refused. A worst case is an activation killed at TimeoutStartSec (60 s)
-# plus RestartSec (2 s) = 62 s, so five of them span 310 s. 600 s exceeds that
-# with margin. A 60-second window would never trip at all, because each attempt
-# alone outlasts it.
-#
-# WHY NOT StartLimitIntervalSec=0 (unlimited): this unit declares
-# Before=network.target, so an activating Type=notify service that never reaches
-# READY=1 would restart forever while network.target, and sshd behind it, wait on
-# that ordering edge. That moves the boot lockout out of nftables and into
-# systemd, which is strictly worse: the net in the kernel at least spares every
-# principal that is not the confined identity. With the finite limit a fail-before
-# burst fails the unit, network.target completes, and the net stays in the kernel.
-#
-# FAILURE MODE an operator will actually meet: the limit counts EVERY start, not
-# only boot retries, so five failures inside 600 s after READY=1 (a post-READY
-# crash wave) also leave the unit failed. The owned table and the journal are
-# PRESERVED, because ordinary process loss deletes neither. Recovery is
-# `systemctl reset-failed sanctuary-castle-wall` then `systemctl start`; a plain
-# `start` alone returns "start request repeated too quickly" and looks like a
-# broken unit file.
-StartLimitBurst=5
-StartLimitIntervalSec=600
 
 # Live nft ownership checks are isolated behind a one-second deadline. If the
 # underlying fork/netlink transaction remains wedged, shutdown still has a hard

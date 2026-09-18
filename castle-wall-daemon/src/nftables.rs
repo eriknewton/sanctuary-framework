@@ -2156,6 +2156,8 @@ fn rule_is_kernel_nd_accept(rule: &serde_json::Value) -> bool {
     };
     let mut saw_icmpv6_type_set = false;
     let mut saw_accept = false;
+    // At most ONE implicit protocol dependency may be skipped.
+    let mut saw_protocol_dependency = false;
     for expr in exprs {
         let Some(obj) = expr.as_object() else {
             return false;
@@ -2174,7 +2176,18 @@ fn rule_is_kernel_nd_accept(rule: &serde_json::Value) -> bool {
                 .and_then(|v| v.get("key"))
                 .and_then(|v| v.as_str())
             {
-                if matches!(meta_key, "l4proto" | "nfproto" | "protocol") {
+                // EXACTLY the implicit dependency the probe records, and at most once.
+                // A meta match is only safe to skip when it NARROWS the rule to ICMPv6;
+                // accepting any operator, any value or a repeat would let a crafted rule
+                // carry an extra condition, or a `!=` that inverts the narrowing, past a
+                // check whose whole job is to prove this is the shape the installer emits.
+                let narrowing_dependency = matches!(meta_key, "l4proto" | "nfproto")
+                    && m.get("op").and_then(|v| v.as_str()) == Some("==")
+                    && m.get("right")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|proto| matches!(proto, "icmpv6" | "ipv6-icmp"));
+                if narrowing_dependency && !saw_protocol_dependency {
+                    saw_protocol_dependency = true;
                     continue;
                 }
                 return false;
@@ -2951,7 +2964,18 @@ pub enum LiveTableBindings {
 pub fn live_table_uid_bindings(
     json: &str,
     expectation: &ExpectedAgentBinding,
+    overflow: HostOverflowUid,
 ) -> LiveTableBindings {
+    // FIRST: the live table may be this daemon's OWN net rather than an owned wall.
+    // The net carries no owner marker and `policy drop`, so the owned-table parser
+    // reads it as foreign; treating that as "no bindings" would drop the uids the net
+    // itself already denies, and a restart could then install a NARROWER net than the
+    // one currently in the kernel. When the live table is our net, source (c) IS rule
+    // 1's set, and it is empty for the zero-rule host-wide shape.
+    // Must match `is_deny_all_safety_net_json`, whose shape this reads.
+    if is_deny_all_safety_net_json(json, overflow) {
+        return LiveTableBindings::Bindings(net_rule_one_uids(json));
+    }
     match parse_owned_table_inventory_phases(json, expectation) {
         Ok(OwnedInventoryPhases::Verified(parsed)) => {
             LiveTableBindings::Bindings(sorted_bindings(&parsed))
@@ -2966,6 +2990,49 @@ pub fn live_table_uid_bindings(
             detail: err.to_string(),
         },
     }
+}
+
+/// Rule 1's uid set from a listing already recognised as this daemon's net.
+///
+/// Empty for the v1 host-wide shape, which carries no rules at all. Only called
+/// after `is_deny_all_safety_net_json` has accepted the listing, so the shape is
+/// already proven and a missing field here means the net has no identity rule.
+#[cfg(any(target_os = "linux", test))]
+fn net_rule_one_uids(json: &str) -> Vec<u32> {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(items) = doc.get("nftables").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    for item in items {
+        let Some(rule) = item.get("rule") else {
+            continue;
+        };
+        if rule.get("comment").and_then(|v| v.as_str()) != Some(NET_RULE_COMMENT_IDENTITY) {
+            continue;
+        }
+        let Some(members) = rule
+            .get("expr")
+            .and_then(|v| v.as_array())
+            .and_then(|exprs| exprs.first())
+            .and_then(|e| e.get("match"))
+            .and_then(|m| m.get("right"))
+            .and_then(|r| r.get("set"))
+            .and_then(|v| v.as_array())
+        else {
+            return Vec::new();
+        };
+        let mut uids: Vec<u32> = members
+            .iter()
+            .filter_map(|m| m.as_u64())
+            .filter_map(|v| u32::try_from(v).ok())
+            .collect();
+        uids.sort_unstable();
+        uids.dedup();
+        return uids;
+    }
+    Vec::new()
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -3147,12 +3214,22 @@ pub fn remove_owned_castle_table(
 ///
 /// `binding` carries the manifest-signed uid and the ceiling it was admitted
 /// under; see [`AgentUidBinding`].
+///
+/// `receipt` is the WRITE-AHEAD proof that this uid is already durably recorded in
+/// this boot's confined history. It is a required argument rather than a convention:
+/// the kernel must never bind a uid the journal does not yet name, because a crash
+/// between the two would leave a live agent whose uid no later start can recover, and
+/// the safety net would then never deny it. A failed persist yields no receipt, so the
+/// bind is unreachable and the caller keeps its prior good policy with no kernel step.
+/// Must match `WriteAheadReceipt` in `src/ownership_journal.rs`.
 #[cfg(target_os = "linux")]
 pub fn load_agent_ruleset(
     id: &AgentRulesetId,
     ruleset: &str,
     binding: AgentUidBinding,
+    receipt: crate::ownership_journal::WriteAheadReceipt,
 ) -> Result<(), NftablesError> {
+    receipt_covers_binding(&binding, receipt)?;
     linux::load_agent_ruleset_impl(id, ruleset, binding)
 }
 
@@ -3161,18 +3238,50 @@ pub fn load_agent_ruleset(
     _id: &AgentRulesetId,
     _ruleset: &str,
     _binding: AgentUidBinding,
+    _receipt: crate::ownership_journal::WriteAheadReceipt,
 ) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
+}
+
+/// Refuse a receipt that does not cover the uid being bound.
+///
+/// Holding SOME receipt is not the property that matters; holding one for THIS uid is.
+/// Without this check a caller with a receipt for an already-persisted uid could bind a
+/// different, unrecorded one.
+///
+/// Gated to Linux exactly like its two callers, the per-agent bind wrappers, so an
+/// ungated definition is not a dead-code diagnostic under `clippy -D warnings` on the
+/// macOS dev build.
+#[cfg(target_os = "linux")]
+fn receipt_covers_binding(
+    binding: &AgentUidBinding,
+    receipt: crate::ownership_journal::WriteAheadReceipt,
+) -> Result<(), NftablesError> {
+    if receipt.uid() != binding.agent_uid {
+        return Err(NftablesError::InvocationFailed(format!(
+            "the write-ahead proof covers uid {} but the binding names uid {}; the journal \
+             must record the uid a kernel rule is about to bind",
+            receipt.uid(),
+            binding.agent_uid
+        )));
+    }
+    Ok(())
 }
 
 /// Replace an agent ruleset with a fail-closed drop chain and atomically wire
 /// the uid jump to that chain. Used to park an agent at deny while its binding
 /// is replaced, so no window exists in which its packets reach `policy accept`.
+///
+/// Takes the same write-ahead proof as [`load_agent_ruleset`]: this path also installs
+/// a jump keyed on the uid, so the uid becomes live in the kernel and must be recorded
+/// first even though the chain it reaches drops.
 #[cfg(target_os = "linux")]
 pub fn load_agent_fail_closed_ruleset(
     id: &AgentRulesetId,
     binding: AgentUidBinding,
+    receipt: crate::ownership_journal::WriteAheadReceipt,
 ) -> Result<(), NftablesError> {
+    receipt_covers_binding(&binding, receipt)?;
     linux::load_agent_fail_closed_ruleset_impl(id, binding)
 }
 
@@ -3180,6 +3289,7 @@ pub fn load_agent_fail_closed_ruleset(
 pub fn load_agent_fail_closed_ruleset(
     _id: &AgentRulesetId,
     _binding: AgentUidBinding,
+    _receipt: crate::ownership_journal::WriteAheadReceipt,
 ) -> Result<(), NftablesError> {
     Err(NftablesError::NotAvailableOnPlatform)
 }
@@ -3783,6 +3893,93 @@ mod tests {
         );
     }
 
+    /// The late-failure guarantee of the two-phase parse: a valid binding followed by a
+    /// FOREIGN rule exposes NO partial set.
+    ///
+    /// A `Bindings` value is only honest if the WHOLE owned shape passed. If a partial
+    /// set escaped, a caller would treat uids collected before the failure as "what this
+    /// daemon's table routes" when the document was never proven to be that table.
+    #[test]
+    fn owned_inventory_exposes_no_partial_binding_set_on_a_late_failure() {
+        let marker = fixture_marker();
+        let valid = owned_agent_json(&marker, true, true);
+        // Sanity: the untouched fixture DOES yield its binding, so the assertion below
+        // is about the late failure and not about an empty fixture.
+        assert_eq!(
+            live_table_uid_bindings(&valid, &fixture_expectation(), test_overflow()),
+            LiveTableBindings::Bindings(vec![FIXTURE_AGENT_UID])
+        );
+
+        // Now append a FOREIGN rule after the valid binding: an unmarked rule in our base
+        // chain, which the owned shape never contains.
+        let with_foreign = valid.replace(
+            "\n            ]}",
+            ",{\"rule\":{\"family\":\"inet\",\"table\":\"sanctuary-castle\",\"chain\":\"output\",\
+             \"handle\":99,\"expr\":[{\"accept\":null}]}}\n            ]}",
+        );
+        assert_ne!(with_foreign, valid, "the late-failure fixture must differ");
+        match live_table_uid_bindings(&with_foreign, &fixture_expectation(), test_overflow()) {
+            LiveTableBindings::NotOurTable { .. } => {}
+            other => panic!(
+                "a document that fails phase one must yield NOTHING, not a partial set: \
+                 {other:?}"
+            ),
+        }
+    }
+
+    /// Source (c) across its three shapes.
+    #[test]
+    fn live_table_uid_bindings_reads_the_owned_wall_and_both_net_shapes() {
+        let ov = test_overflow();
+        // THE OWNED WALL: the declared per-agent binding.
+        assert_eq!(
+            live_table_uid_bindings(
+                &owned_agent_json(&fixture_marker(), true, true),
+                &fixture_expectation(),
+                ov
+            ),
+            LiveTableBindings::Bindings(vec![FIXTURE_AGENT_UID])
+        );
+
+        // AN OWNED WALL THAT DRIFTED off the current manifest still contributes its uids:
+        // a rotated-away uid may still have live processes, so the net must deny it even
+        // though the binding itself is refused for adoption.
+        assert_eq!(
+            live_table_uid_bindings(
+                &owned_agent_json_with_uid(&fixture_marker(), true, true, 5555),
+                &fixture_expectation(),
+                ov
+            ),
+            LiveTableBindings::Bindings(vec![5555])
+        );
+
+        // THE V1 NET: no rules at all, so source (c) is EMPTY. This is distinct from
+        // "not our table": the net IS ours and it names nobody.
+        assert_eq!(
+            live_table_uid_bindings(&v1_host_wide_listing(), &fixture_expectation(), ov),
+            LiveTableBindings::Bindings(Vec::new())
+        );
+
+        // THE V2 NET: rule 1's set, which is the set currently denying traffic in the
+        // kernel. Reading this as "not our table" would let a restart install a net
+        // narrower than the one already in force.
+        assert_eq!(
+            live_table_uid_bindings(
+                &v2_identity_listing(&[60123, 60124], &[60123, 60124]),
+                &fixture_expectation(),
+                ov
+            ),
+            LiveTableBindings::Bindings(vec![60123, 60124])
+        );
+
+        // A STRUCTURALLY FOREIGN table yields nothing, and that is not the same value as
+        // the empty set above.
+        match live_table_uid_bindings("{\"nftables\":[]}", &fixture_expectation(), ov) {
+            LiveTableBindings::NotOurTable { .. } => {}
+            other => panic!("a foreign document must yield nothing, got {other:?}"),
+        }
+    }
+
     #[test]
     fn owned_inventory_refuses_a_uid_the_manifest_does_not_confine() {
         // THE core check of the uid migration, and the only one an actor holding
@@ -4030,6 +4227,49 @@ mod tests {
             denied_set = set(denied),
             excepted_set = set(excepted),
         )
+    }
+
+    /// ITEM 16: the emission floor KEEPS its below-ceiling refusal.
+    ///
+    /// The three unattestable-uid refusals were added ALONGSIDE this floor, not in place
+    /// of it: the ceiling proves a uid is outside the system-daemon band, and the three
+    /// refusals prove a uid names one attestable principal. A uid must clear both before
+    /// it is sealed into a kernel rule, and this test is what keeps the ceiling half from
+    /// being dropped as redundant.
+    ///
+    /// The emission floor itself is Linux-only, so this asserts the invariant at the
+    /// source: the ceiling comparison is present and the three-refusal call does not
+    /// replace it.
+    #[test]
+    fn the_emission_floor_keeps_its_below_ceiling_refusal() {
+        let whole = include_str!("nftables.rs");
+        let start = whole
+            .find("fn validate_agent_binding_input(")
+            .expect("the emission floor is in this file");
+        let end = whole[start..]
+            .find("\n    pub fn load_agent_ruleset_impl(")
+            .map(|o| start + o)
+            .expect("the floor ends before the ruleset loader");
+        let region = &whole[start..end];
+        assert!(
+            region.contains("binding.agent_uid < binding.system_uid_allow_ceiling"),
+            "the below-ceiling refusal must stay at the emission site"
+        );
+        assert!(
+            region.contains("binding.agent_uid < 1"),
+            "the root refusal must stay at the emission site"
+        );
+        // And the three refusals are applied IN ADDITION, after the ceiling check.
+        let ceiling_at = region
+            .find("binding.agent_uid < binding.system_uid_allow_ceiling")
+            .expect("ceiling check");
+        let validator_at = region
+            .find("validate_safety_net_uid(binding.agent_uid")
+            .expect("the three-refusal call is present");
+        assert!(
+            ceiling_at < validator_at,
+            "the ceiling floor runs first and is never replaced by the three refusals"
+        );
     }
 
     #[test]

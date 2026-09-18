@@ -412,6 +412,21 @@ impl DaemonHandle {
     /// [`RuntimeHealthState::Ready`]: crate::runtime_health::RuntimeHealthState::Ready
     /// [`RuntimeHealthState::Lost`]: crate::runtime_health::RuntimeHealthState::Lost
     /// [`RuntimeHealthState::ProbeUnavailable`]: crate::runtime_health::RuntimeHealthState::ProbeUnavailable
+    /// The tagged `safety_net` state for the SIGNED status report.
+    ///
+    /// Exposed on the handle because the signed report is built from it, and the report
+    /// must describe the predicate actually installed together with its coverage limit.
+    /// A report emitted while an install has failed carries `InstallFailed`, so it never
+    /// attests to a protection that is not in place.
+    /// Must match the `safety_net` object on the `kernel_runtime_lost` WAL row.
+    pub fn safety_net_audit_state(&self) -> crate::nftables::SafetyNetAuditState {
+        self.enforcement
+            .as_ref()
+            .and_then(|runtime| runtime.try_lock().ok())
+            .map(|runtime| runtime.safety_net_audit_state())
+            .unwrap_or(crate::nftables::SafetyNetAuditState::NotAttempted)
+    }
+
     pub fn kernel_runtime_health(&self) -> RuntimeHealthState {
         match &self.enforcement {
             None => RuntimeHealthState::NoRuntime,
@@ -604,9 +619,20 @@ impl DaemonHandle {
             .update(LifecyclePhase::Degraded, DaemonRuntimeState::Degraded);
         self.runtime_health
             .publish(RuntimeHealthState::Lost(reason));
+        // The tagged `safety_net` state rides on the SAME row as the loss reason, so a
+        // reader never has to infer the protection from the fact that a loss happened.
+        // `NotAttempted` when no runtime is held or no install was tried; `InstallFailed`
+        // when one was tried and did not take, which is what stops this row from
+        // attesting to a protection that is not in place.
+        let safety_net = self
+            .enforcement
+            .as_ref()
+            .and_then(|runtime| runtime.try_lock().ok())
+            .map(|runtime| runtime.safety_net_audit_state())
+            .unwrap_or(crate::nftables::SafetyNetAuditState::NotAttempted);
         if let Err(audit_err) = self.decision_engine.append_control_audit_bounded(
             "kernel_runtime_lost",
-            &format!("reason={reason:?}"),
+            &format!("reason={reason:?} safety_net={}", safety_net.to_json()),
             crate::decision::FAILURE_AUDIT_BUDGET,
         ) {
             // The capability is already lost, so there is no mutation to roll
@@ -1675,6 +1701,21 @@ mod tests {
             assert!(loss
                 .event_canonical_json
                 .contains(&format!("ComponentLost({target:?})")));
+            // ITEM 10, consumer two: the tagged `safety_net` state rides on the SAME row
+            // as the loss reason, so a reader never infers the protection from the fact
+            // that a loss happened. This fixture holds no nftables component that can
+            // install one, so the honest value is `not_attempted` — and asserting that
+            // is what proves the row does not claim an install it never made.
+            assert!(
+                loss.event_canonical_json.contains("safety_net="),
+                "the loss row must carry the tagged safety-net state: {}",
+                loss.event_canonical_json
+            );
+            assert!(
+                loss.event_canonical_json.contains("not_attempted"),
+                "a row from a runtime with no installer must say nothing was attempted: {}",
+                loss.event_canonical_json
+            );
 
             handle.stop().expect("stop");
         }

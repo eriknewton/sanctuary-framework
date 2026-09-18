@@ -104,4 +104,20 @@ describe("castle-wall/ipc : runtime readiness from contradictory frames", () => 
       )
     ).toBe("degraded");
   });
+
+  it("treats a safety-net recovery as degraded, never as ready or unavailable", () => {
+    // The daemon proved a loss and is installing or retrying the Linux safety net
+    // while it still holds the host lock. The wall is DOWN, so the only safe answer
+    // is degraded: reading it as `unavailable` would let it pass a caller's
+    // fail-closed branch, and reading it as ready would claim a wall that is gone.
+    expect(
+      castleWallRuntimeReadiness(readyFrame({ runtime_health: "safety_net_recovering" }))
+    ).toBe("degraded");
+    // Even on a frame that CLAIMS enforcement, the health token wins.
+    expect(
+      castleWallRuntimeReadiness(
+        readyFrame({ enforcing: true, runtime_health: "safety_net_recovering" })
+      )
+    ).toBe("degraded");
+  });
 });

@@ -174,12 +174,19 @@ export function manifestFieldsAreAuthoritative(
  * - `lost`              a PROVEN loss of a required component
  * - `probe_unavailable` INDETERMINATE (contention, deadline, stale observation)
  * - `no_runtime`        this daemon holds no kernel runtime at all
+ * - `safety_net_recovering` a PROVEN loss for which the daemon is installing or
+ *   retrying the Linux safety net while it still holds the host lock. NOT
+ *   readiness, and NOT a plain loss: the daemon has not given up, so a caller
+ *   that tears a wall down on `lost` must not do so here.
  */
 export type RuntimeHealthToken =
   | "ready"
   | "lost"
   | "probe_unavailable"
-  | "no_runtime";
+  | "no_runtime"
+  // Must match `RuntimeHealthState::Recovering`'s token in
+  // `castle-wall-daemon/src/runtime_health.rs`; producer and consumer change together.
+  | "safety_net_recovering";
 
 /** Tagged union of every Castle Wall IPC message body. */
 export type CastleWallMessage =
@@ -347,6 +354,11 @@ export function castleWallRuntimeReadiness(
     return "unavailable";
   }
   // 4. Proven-bad states.
+  // A loss the daemon is actively resolving is DEGRADED, never ready: the wall is
+  // down. It is named separately from `lost` so a reader can tell that the daemon
+  // still holds the host lock and has an attempt outstanding, which is the difference
+  // between "wait" and "the daemon has stopped trying".
+  if (status.runtime_health === "safety_net_recovering") return "degraded";
   if (status.runtime_health === "lost") return "degraded";
   if (status.runtime_state === "degraded" || status.runtime_state === "stopping") {
     return "degraded";

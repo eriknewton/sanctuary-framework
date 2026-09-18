@@ -262,6 +262,15 @@ pub struct SafetyNetResolution {
     pub kill_set: Vec<u32>,
     /// Which sources contributed, for the audit row.
     pub sources: crate::nftables::SafetyNetSources,
+    /// The FULL deny union this resolution computed, before the cap and the
+    /// host-wide fallbacks were applied.
+    ///
+    /// Carried separately from `scope` because `scope.denied_uids()` is EMPTY for the
+    /// host-wide shape, and the retained in-memory set is seeded from a resolution.
+    /// Seeding from the scope would discard a known over-capacity union entirely, and a
+    /// later recompute could then produce a NARROWER net than the process already knew
+    /// about. The monotonic retained set is defined over this field.
+    pub deny_union: Vec<u32>,
 }
 
 /// Resolve the safety net's scope from the three sources of memo D1b.
@@ -338,11 +347,23 @@ pub fn resolve_safety_net_scope(
     kill_set.sort_unstable();
     kill_set.dedup();
 
+    // The full union, computed before any cap or fallback, so every resolution carries
+    // what this process knows even when the SCOPE it installs names nobody.
+    let mut deny_union: Vec<u32> = journal_uids
+        .iter()
+        .chain(manifest_uids.iter())
+        .chain(live_uids.iter())
+        .copied()
+        .collect();
+    deny_union.sort_unstable();
+    deny_union.dedup();
+
     let host_wide = |reason: SafetyNetReason| SafetyNetResolution {
         scope: SafetyNetScope::HostWide,
         reason,
         kill_set: kill_set.clone(),
         sources: sources.clone(),
+        deny_union: deny_union.clone(),
     };
 
     // UNKNOWN HISTORY short-circuits, and it is checked FIRST so no later branch
@@ -351,15 +372,8 @@ pub fn resolve_safety_net_scope(
         return host_wide(SafetyNetReason::UnknownHistory);
     }
 
-    // DENY SET = (a) union (b) union (c).
-    let mut deny: Vec<u32> = journal_uids
-        .iter()
-        .chain(manifest_uids.iter())
-        .chain(live_uids.iter())
-        .copied()
-        .collect();
-    deny.sort_unstable();
-    deny.dedup();
+    // DENY SET = (a) union (b) union (c), which is the union computed above.
+    let deny = deny_union.clone();
     if deny.len() > DENY_SET_MAX {
         // Over capacity: the identities are known EXACTLY but are too many to name
         // in one rule. Nothing is truncated, because a dropped uid stops being
@@ -384,6 +398,7 @@ pub fn resolve_safety_net_scope(
             reason: SafetyNetReason::Identity,
             kill_set,
             sources,
+            deny_union,
         },
         // An empty deny set: no confined identity was recoverable from any source.
         Err(_) => host_wide(SafetyNetReason::EmptyDenySet),
@@ -435,25 +450,19 @@ fn resolve_net_scope_at_site(
         })
     });
 
-    // Source (c): the live table's own skuid bindings, through the typed two-phase
-    // parse so a table that is ours but has drifted off the current manifest still
-    // contributes its uids.
-    let expectation = current_expected_agent_binding(decision_engine);
-    let live = match crate::nftables::list_castle_table_json() {
-        Ok(Some(json)) => crate::nftables::live_table_uid_bindings(&json, &expectation),
-        // No table at all is not a parse failure and not a foreign table.
-        Ok(None) => LiveTableBindings::Bindings(Vec::new()),
-        Err(err) => LiveTableBindings::Unreadable {
-            detail: err.to_string(),
-        },
-    };
-
     let overflow = match crate::safety_net_uid::HostOverflowUid::from_host() {
         Ok(value) => value,
         Err(_) => {
-            // No host value means no member can be validated, so no identity scope
-            // can be named. Host-wide is the conservative answer.
-            let mut kill_set: Vec<u32> = Vec::new();
+            // No host value means no member can be validated, so no identity scope can
+            // be named and the host-wide shape is the conservative answer for the NET.
+            // The KILL SET is unaffected: it is (a) union (b), identities the signed
+            // manifest admitted as the MAC-covered journal records them, and none of
+            // that evidence depends on the sysctl. Dropping the journal half here would
+            // silently narrow whose processes PR-3 may terminate.
+            let mut kill_set: Vec<u32> = match &history {
+                ConfinedHistory::Known(entries) => entries.iter().map(|e| e.uid).collect(),
+                ConfinedHistory::Unknown => Vec::new(),
+            };
             if let Some((agent, gate)) = admitted {
                 kill_set.push(agent);
                 if let Some(g) = gate {
@@ -465,14 +474,32 @@ fn resolve_net_scope_at_site(
             return SafetyNetResolution {
                 scope: SafetyNetScope::HostWide,
                 reason: SafetyNetReason::EmptyDenySet,
-                kill_set,
+                kill_set: kill_set.clone(),
                 sources: SafetyNetSources {
-                    journal: false,
+                    journal: matches!(history, ConfinedHistory::Known(ref e) if !e.is_empty()),
                     manifest: admitted.is_some(),
                     live_table: false,
                 },
+                // The union this process knows, even though the scope it installs names
+                // nobody: the retained set is seeded from here.
+                deny_union: kill_set.clone(),
             };
         }
+    };
+
+    // Source (c): the live table's own skuid bindings. Read AFTER the overflow value,
+    // because recognising this daemon's own net needs it: when the live table IS the
+    // net, (c) is rule 1's set, which is the set currently denying traffic in the
+    // kernel. Through the typed two-phase parse otherwise, so an owned table that has
+    // drifted off the current manifest still contributes its uids.
+    let expectation = current_expected_agent_binding(decision_engine);
+    let live = match crate::nftables::list_castle_table_json() {
+        Ok(Some(json)) => crate::nftables::live_table_uid_bindings(&json, &expectation, overflow),
+        // No table at all is not a parse failure and not a foreign table.
+        Ok(None) => LiveTableBindings::Bindings(Vec::new()),
+        Err(err) => LiveTableBindings::Unreadable {
+            detail: err.to_string(),
+        },
     };
     resolve_safety_net_scope(&history, admitted, &live, overflow)
 }
@@ -861,12 +888,34 @@ impl ComponentProvider for NftablesTableProvider {
                 }
             };
 
-            let ownership = match journal::decide(
+            // THE NEVER-ADOPT RULE, applied HERE and only here (memo D1b step 6).
+            //
+            // A same-boot `Owned` record whose `confined` key is ABSENT cannot prove
+            // which uids were bound during this boot, so this acquisition must not adopt
+            // its table however well the live identity matches: adopting would write a
+            // history naming only the CURRENT identity, marking this boot known, and a
+            // uid this daemon rotated away from would then be omitted from the net on
+            // the next start.
+            //
+            // It is ACQUISITION-SPECIFIC on purpose. The disarm verb consumes the same
+            // shared `journal::decide` routing, and a legacy record whose live table is
+            // the recognised net must still reach disarm's `ReclaimOwned` arm to be
+            // cleared. Putting the rule in `decide` would take that arm away. Must match
+            // the `ReclaimOwned` arm in `disarm_castle_runtime`, which PR-2 extends.
+            let decision = journal::decide(existing.as_ref(), table_present, &boot_id, &source);
+            let history_unknown_this_boot = matches!(
                 existing.as_ref(),
-                table_present,
-                &boot_id,
-                &source,
-            ) {
+                Some(crate::ownership_journal::OwnershipJournal::Owned { confined: None, .. })
+            );
+            let decision = match (&decision, history_unknown_this_boot) {
+                (ReclaimDecision::ReclaimOwned { .. }, true) => {
+                    // Route to the boot owner instead: it installs the host-wide net for
+                    // the unknown-history reason and skips the persist entirely.
+                    ReclaimDecision::ReArmLostOwned
+                }
+                _ => decision,
+            };
+            let ownership = match decision {
                 // A live table our Owned journal describes for THIS boot:
                 // re-verify the EXACT identity (handles + marker + pristine
                 // shape) still holds, then reclaim it. A drift (replaced,
@@ -1190,6 +1239,9 @@ impl ComponentProvider for NftablesTableProvider {
                 retained_deny_uids: std::sync::Mutex::new(seeded),
                 recovering: std::sync::atomic::AtomicBool::new(false),
                 last_recovery_attempt: std::sync::Mutex::new(None),
+                last_safety_net_state: std::sync::Mutex::new(
+                    crate::nftables::SafetyNetAuditState::NotAttempted,
+                ),
             }))
         }
         #[cfg(not(target_os = "linux"))]
@@ -1470,6 +1522,10 @@ struct NftablesTableComponent {
     /// When the recovery controller last attempted an install, so retries are spaced
     /// by `RECOVERY_RETRY_INTERVAL` with ONE attempt in flight.
     last_recovery_attempt: std::sync::Mutex<Option<std::time::Instant>>,
+    /// The tagged `safety_net` state this component last produced, recorded at EVERY
+    /// install transition so the audit row and the signed report describe the predicate
+    /// actually in the kernel rather than one derived from the fact of a loss.
+    last_safety_net_state: std::sync::Mutex<crate::nftables::SafetyNetAuditState>,
 }
 
 /// Maximum time a synchronous `nft -j list table` ownership proof may delay a
@@ -1590,6 +1646,7 @@ impl NftablesTableComponent {
                 reason: SafetyNetReason::EmptyDenySet,
                 kill_set: fresh.kill_set,
                 sources: fresh.sources,
+                deny_union: union.clone(),
             };
         }
         // Unknown history stays sticky for the life of this process: it is a property
@@ -1600,6 +1657,7 @@ impl NftablesTableComponent {
                 reason: SafetyNetReason::UnknownHistory,
                 kill_set: fresh.kill_set,
                 sources: fresh.sources,
+                deny_union: union.clone(),
             };
         }
         if union.len() > DENY_SET_MAX {
@@ -1611,6 +1669,7 @@ impl NftablesTableComponent {
                 },
                 kill_set: fresh.kill_set,
                 sources: fresh.sources,
+                deny_union: union.clone(),
             };
         }
         let Ok(overflow) = HostOverflowUid::from_host() else {
@@ -1619,6 +1678,7 @@ impl NftablesTableComponent {
                 reason: SafetyNetReason::EmptyDenySet,
                 kill_set: fresh.kill_set,
                 sources: fresh.sources,
+                deny_union: union.clone(),
             };
         };
         let validated: Vec<_> = union
@@ -1631,12 +1691,14 @@ impl NftablesTableComponent {
                 reason: SafetyNetReason::Identity,
                 kill_set: fresh.kill_set,
                 sources: fresh.sources,
+                deny_union: union.clone(),
             },
             Err(_) => SafetyNetResolution {
                 scope: SafetyNetScope::HostWide,
                 reason: SafetyNetReason::EmptyDenySet,
                 kill_set: fresh.kill_set,
                 sources: fresh.sources,
+                deny_union: union.clone(),
             },
         }
     }
@@ -1654,11 +1716,19 @@ impl NftablesTableComponent {
         if resolution.reason == crate::nftables::SafetyNetReason::UnknownHistory {
             return None;
         }
-        let key =
-            crate::ownership_journal::load_or_generate_auth_key(&self.journal_key_path).ok()?;
-        let record = crate::ownership_journal::load(&self.journal_path, Some(&key))
-            .ok()
-            .flatten()?;
+        // A read or authentication failure here is REPORTED, never swallowed: the caller
+        // names it so an operator knows the write did not happen.
+        let key = match crate::ownership_journal::load_or_generate_auth_key(&self.journal_key_path)
+        {
+            Ok(key) => key,
+            Err(err) => return Some(err.to_string()),
+        };
+        let record = match crate::ownership_journal::load(&self.journal_path, Some(&key)) {
+            Ok(Some(record)) => record,
+            // No record at all is not a failure: there is nothing to extend.
+            Ok(None) => return None,
+            Err(err) => return Some(err.to_string()),
+        };
         persist_kill_set_write_ahead(
             &self.journal_path,
             Some(&key),
@@ -1686,6 +1756,11 @@ impl NftablesTableComponent {
             crate::nftables::safety_net_scope_sentence(&resolution.scope, &resolution.reason);
         match crate::nftables::install_deny_all_safety_net(&resolution.scope) {
             Ok(()) => {
+                self.record_safety_net_state(crate::nftables::SafetyNetAuditState::installed(
+                    &resolution.scope,
+                    &resolution.reason,
+                    resolution.sources.clone(),
+                ));
                 // SAFETY: stderr is the operator channel. An operator reading the
                 // journal after a refused start needs to know the net is in force and
                 // whether their own session is affected.
@@ -1703,6 +1778,10 @@ impl NftablesTableComponent {
                 );
             }
             Err(err) => {
+                self.record_safety_net_state(crate::nftables::SafetyNetAuditState::InstallFailed {
+                    attempted_scope: resolution.scope.shape_tag().to_string(),
+                    error: err.to_string(),
+                });
                 safety_net_sweep_hook_pr3(
                     &resolution.kill_set,
                     "startup ownership loss: the safety net install failed before the unwind",
@@ -1767,6 +1846,32 @@ impl NftablesTableComponent {
             }
             *last = Some(std::time::Instant::now());
         }
+        // FIRST, on every attempt including the retries: ask whether the owned table
+        // has come back. An operator repairing the wall is the outcome this whole loop
+        // is waiting for, and a COMPLETED POSITIVE proof clears the probe latch, so the
+        // component can leave the recovering state instead of retrying forever.
+        let ownership = self.ownership.clone();
+        let expectation = current_expected_agent_binding(&self.decision_engine);
+        if matches!(
+            self.probe.reprobe_after_latch(move || {
+                classify_nft_ownership_probe(crate::nftables::verify_owned_castle_table(
+                    &ownership,
+                    &expectation,
+                ))
+            }),
+            crate::health_probe::ProbeOutcome::Ready
+        ) {
+            // The wall is back. Recovery is over: stop publishing `Recovering` and drop
+            // the install latch so a LATER loss installs the net again rather than
+            // assuming the first install still covers it.
+            self.recovering.store(false, Ordering::SeqCst);
+            self.deny_all_net_installed.store(false, Ordering::SeqCst);
+            return true;
+        }
+
+        // The loss stands. Publish `Recovering` BEFORE the install attempt, so a
+        // concurrent supervisor tick observing this component does not reach its exit
+        // arm while the attempt is in flight.
         self.recovering.store(true, Ordering::SeqCst);
         let resolution = self.net_scope_from_retained_set();
         // INSTALL FIRST. The persist follows.
@@ -1776,14 +1881,50 @@ impl NftablesTableComponent {
             &resolution.kill_set,
         );
         let in_force = installed || self.deny_all_net_installed.load(Ordering::SeqCst);
+        // Record the transition BEFORE anything else, so a row emitted concurrently
+        // describes what is actually in the kernel.
+        self.record_safety_net_state(if in_force {
+            crate::nftables::SafetyNetAuditState::installed(
+                &resolution.scope,
+                &resolution.reason,
+                resolution.sources.clone(),
+            )
+        } else {
+            crate::nftables::SafetyNetAuditState::InstallFailed {
+                attempted_scope: resolution.scope.shape_tag().to_string(),
+                error: "the safety net install failed and will be retried".to_string(),
+            }
+        });
         if in_force {
             // Best-effort persist AFTER the install, and a failure here never undoes it.
-            let _ = self.persist_boot_row_best_effort(&resolution);
-            // Recovery is complete: no further kernel action, and the component stops
-            // publishing `Recovering` so the runtime may report its real state.
-            self.recovering.store(false, Ordering::SeqCst);
+            if let Some(persist_err) = self.persist_boot_row_best_effort(&resolution) {
+                // SAFETY: stderr is the operator channel. The net is in force; the
+                // journal write is what did not happen, and the next start retries it.
+                eprintln!(
+                    "castle-wall-daemon: the safety net is in force after a runtime loss, but \
+                     the confined history could not be written to the journal: {persist_err}"
+                );
+            }
         }
+        // INVARIANT: `recovering` STAYS SET whether or not the install succeeded, and it
+        // is cleared only by the positive-proof arm above. Clearing it on a successful
+        // install would let the next supervisor tick read the still-latched probe as a
+        // plain loss and exit, discarding the recovery this controller just performed.
+        // Keeping it set is what makes the supervisor re-enter here on the retry
+        // interval until the wall is repaired or the operator stops the unit.
         in_force
+    }
+
+    /// Record the tagged state produced by an install transition.
+    ///
+    /// Called on EVERY transition, success or failure, so the state a consumer reads is
+    /// never a stale success left over from an earlier attempt.
+    fn record_safety_net_state(&self, state: crate::nftables::SafetyNetAuditState) {
+        let mut slot = match self.last_safety_net_state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *slot = state;
     }
 
     /// Whether this component is publishing the post-READY `Recovering` state.
@@ -1815,6 +1956,14 @@ impl AcquiredComponent for NftablesTableComponent {
     /// STARTUP INDETERMINATE. Installs nothing; the hook runs before the terminal exit.
     fn on_startup_indeterminate(&self) {
         self.hook_on_startup_indeterminate();
+    }
+
+    fn safety_net_audit_state(&self) -> Option<crate::nftables::SafetyNetAuditState> {
+        let slot = match self.last_safety_net_state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Some(slot.clone())
     }
 
     /// POST-READY LOSS. The supervisor calls this before any exit arm; the controller
@@ -1884,10 +2033,12 @@ impl AcquiredComponent for NftablesTableComponent {
             // completed negative proof: it keeps the exit-and-adopt path with the sweep
             // hook before the exit and installs nothing, because no evidence about the
             // table was obtained.
-            ProbeOutcome::Indeterminate => {
-                self.hook_on_startup_indeterminate();
-                ComponentHealth::ProbeUnavailable
-            }
+            // REPORT ONLY here too. The exhausted indeterminate budget withdraws
+            // readiness and installs nothing, and the sweep hook for it belongs to the
+            // supervisor's ordered hook-before-exit transition, which is the single
+            // caller. Firing it from a health poll would run it on every poll and
+            // outside that ordering.
+            ProbeOutcome::Indeterminate => ComponentHealth::ProbeUnavailable,
         }
     }
 
@@ -2688,6 +2839,48 @@ mod tests {
         ] {
             assert_eq!(classify_nft_ownership_probe(Err(indeterminate)), Err(()));
         }
+    }
+
+    #[test]
+    fn the_acquisition_path_never_adopts_an_unknown_history_record() {
+        // The rule lives on the acquisition path, not in the shared routing. This asserts
+        // it at the source: the acquisition arm recomputes the decision and diverts a
+        // same-boot record whose `confined` key is absent to the boot owner, which
+        // installs the host-wide net and skips the persist. The companion test in
+        // `ownership_journal` proves the SHARED routing still reaches `ReclaimOwned`, so
+        // disarm keeps its recovery path.
+        let whole = include_str!("runtime_providers.rs");
+        let start = whole
+            .find("// THE NEVER-ADOPT RULE, applied HERE and only here")
+            .expect("the rule is stated at the acquisition site");
+        let end = whole[start..]
+            .find("let ownership = match decision {")
+            .map(|o| start + o)
+            .expect("the rule precedes the routing match");
+        let region = &whole[start..end];
+        assert!(
+            region.contains("OwnershipJournal::Owned { confined: None, .. }"),
+            "the rule must key on the ABSENT confined key, not on the uid comparison"
+        );
+        assert!(
+            region.contains("ReclaimDecision::ReclaimOwned { .. }, true")
+                && region.contains("ReclaimDecision::ReArmLostOwned"),
+            "an unknown-history record must be diverted from adoption to the boot owner"
+        );
+        // And the rule is NOT in the shared decision function.
+        let journal_source = include_str!("ownership_journal.rs");
+        let decide_at = journal_source
+            .find("pub fn decide(")
+            .expect("the shared routing is in that file");
+        let decide_end = journal_source[decide_at..]
+            .find("\n#[cfg(test)]")
+            .map(|o| decide_at + o)
+            .unwrap_or(journal_source.len());
+        assert!(
+            !journal_source[decide_at..decide_end].contains("confined: None"),
+            "the shared routing must not carry the acquisition-specific rule, or disarm \
+             loses its recovery arm"
+        );
     }
 
     // ---- The safety net's scope resolver (memo D1b) ----
