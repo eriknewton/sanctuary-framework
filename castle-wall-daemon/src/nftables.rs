@@ -430,7 +430,7 @@ pub fn safety_net_scope_sentence(scope: &SafetyNetScope, reason: &SafetyNetReaso
 /// INVARIANT, and the reason this is a tagged enum rather than a struct with an
 /// `installed: bool`: a status request or an audit row emitted WHILE a net install
 /// has failed must not attest to a protection that is not in place. A struct with
-/// optional fields reads as "installed, details missing"; these three variants
+/// optional fields reads as "installed, details missing"; these variants
 /// cannot be confused for one another by a consumer.
 ///
 /// Producer and consumer schemas change together. Must match the `safety_net`
@@ -456,6 +456,9 @@ pub enum SafetyNetAuditState {
         attempted_scope: String,
         error: String,
     },
+    /// A prior install succeeded, but this poll did not re-prove kernel presence.
+    /// Carries no predicate or coverage assertion.
+    Unverified,
     /// No install was attempted on this path (both nft-indeterminate rows).
     NotAttempted,
 }
@@ -519,6 +522,7 @@ impl SafetyNetAuditState {
         match self {
             SafetyNetAuditState::Installed { .. } => "installed",
             SafetyNetAuditState::InstallFailed { .. } => "install_failed",
+            SafetyNetAuditState::Unverified => "unverified",
             SafetyNetAuditState::NotAttempted => "not_attempted",
         }
     }
@@ -562,6 +566,7 @@ impl SafetyNetAuditState {
                 "attempted_scope": attempted_scope,
                 "error": error,
             }),
+            SafetyNetAuditState::Unverified => serde_json::json!({ "state": "unverified" }),
             SafetyNetAuditState::NotAttempted => serde_json::json!({ "state": "not_attempted" }),
         }
     }

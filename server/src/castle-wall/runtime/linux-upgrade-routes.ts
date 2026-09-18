@@ -134,7 +134,7 @@ export type PreflightManifestTarget =
 
 /** One command's captured result. Exit code and text, never a re-interpretation. */
 export interface UpgradeCommandResult {
-  code: number;
+  code: number | null;
   stdout: string;
   stderr: string;
 }
@@ -268,6 +268,7 @@ export async function executeLinuxUpgradeRoute(
   });
 
   for (const step of steps) {
+    try {
     switch (step) {
       case "preflight_manifest_new_binary": {
         // The NEW binary answers, because it carries the bounds that will apply
@@ -329,6 +330,13 @@ export async function executeLinuxUpgradeRoute(
       }
     }
     completed.push(step);
+    } catch (err) {
+      return aborted({
+        step,
+        exit_code: null,
+        output: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   return {
@@ -469,7 +477,7 @@ export function realUpgradeCommandRunner(
           clearTimeout(timer);
           reject(err);
         });
-        child.on("close", (code) => finish({ code: code ?? -1, stdout, stderr }));
+        child.on("close", (code) => finish({ code, stdout, stderr }));
       });
     },
   };

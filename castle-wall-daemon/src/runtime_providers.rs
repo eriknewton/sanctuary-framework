@@ -743,30 +743,18 @@ fn drift_enforce_fail_closed(
     }
 }
 
-/// GF1.3: install the safety net at most once (latched), retrying on failure.
-/// Returns true iff this call installed it.
-///
-/// A FAILED install does NOT set the latch, so the next poll retries rather than
-/// recording an unprotected host as protected, and the PR-3 sweep hook runs on that
-/// failure. INVARIANT: Part A performs no table deletion here; removing the table
-/// would remove the only egress gate this daemon controls without replacing it.
-/// Injectable installer so the latch, the retry and the hook are unit-testable
-/// without a live nft.
+/// One post-READY safety-net install transaction, injectable so retries and the
+/// failed-install-only hook are unit-testable without a live nft. A prior success
+/// does not prove that an external actor left the net in place: each eligible
+/// completed loss must execute this transaction again. Part A never deletes the
+/// table on failure.
 #[cfg(any(target_os = "linux", test))]
-fn ensure_deny_all_net_installed_once(
-    latch: &std::sync::atomic::AtomicBool,
+fn install_deny_all_net_for_recovery(
     install: impl FnOnce() -> Result<(), crate::nftables::NftablesError>,
     kill_set: &[u32],
 ) -> bool {
-    use std::sync::atomic::Ordering;
-    if latch.load(Ordering::SeqCst) {
-        return false;
-    }
     match install() {
-        Ok(()) => {
-            latch.store(true, Ordering::SeqCst);
-            true
-        }
+        Ok(()) => true,
         Err(net_err) => {
             safety_net_sweep_hook_pr3(
                 kill_set,
@@ -780,6 +768,66 @@ fn ensure_deny_all_net_installed_once(
                  retried on the next poll: {net_err}"
             );
             false
+        }
+    }
+}
+
+/// The caller's completed Lost reading is the first recovery proof. Only later
+/// Recovering polls need a fresh ownership query; an unavailable second query
+/// must not veto the first protective install.
+#[cfg(any(target_os = "linux", test))]
+fn post_ready_recovery_proof(
+    retrying: bool,
+    reprobe: impl FnOnce() -> crate::health_probe::ProbeOutcome,
+) -> crate::health_probe::ProbeOutcome {
+    if retrying {
+        reprobe()
+    } else {
+        crate::health_probe::ProbeOutcome::Lost
+    }
+}
+
+/// Consume the probe's completed positive proof even when it arrives after an
+/// earlier caller timed out. This changes only recovery bookkeeping: `health()`
+/// remains a read and performs no kernel install or delete.
+#[cfg(any(target_os = "linux", test))]
+fn post_ready_component_health(
+    outcome: crate::health_probe::ProbeOutcome,
+    recovering: &std::sync::atomic::AtomicBool,
+    last_attempt: &std::sync::Mutex<Option<std::time::Instant>>,
+) -> crate::enforcement::ComponentHealth {
+    use crate::enforcement::ComponentHealth;
+    use crate::health_probe::ProbeOutcome;
+    use std::sync::atomic::Ordering;
+
+    match outcome {
+        ProbeOutcome::Ready => {
+            if recovering.swap(false, Ordering::SeqCst) {
+                let mut last = match last_attempt.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *last = None;
+            }
+            ComponentHealth::Ready
+        }
+        ProbeOutcome::Lost => {
+            if recovering.load(Ordering::SeqCst) {
+                ComponentHealth::Recovering
+            } else {
+                ComponentHealth::Lost
+            }
+        }
+        ProbeOutcome::Unavailable => {
+            if recovering.load(Ordering::SeqCst) {
+                ComponentHealth::Recovering
+            } else {
+                ComponentHealth::ProbeUnavailable
+            }
+        }
+        ProbeOutcome::Indeterminate => {
+            recovering.store(false, Ordering::SeqCst);
+            ComponentHealth::Indeterminate
         }
     }
 }
@@ -1234,7 +1282,6 @@ impl ComponentProvider for NftablesTableProvider {
                 decision_engine: Arc::clone(&self.decision_engine),
                 probe: crate::health_probe::BoundedHealthProbe::new(nft_health_budget()),
                 released: false,
-                deny_all_net_installed: std::sync::atomic::AtomicBool::new(false),
                 journal_path: journal_path.to_path_buf(),
                 journal_key_path: key_path.to_path_buf(),
                 retained_deny_uids: std::sync::Mutex::new(seeded),
@@ -1495,11 +1542,6 @@ struct NftablesTableComponent {
     /// poller from stacking `nft` forks. See [`crate::health_probe`].
     probe: crate::health_probe::BoundedHealthProbe,
     released: bool,
-    /// GF1.3: latches once the runtime-loss deny-all safety net has been installed
-    /// by `health()`, so a repeatedly-polled `Lost` health does not re-fork `nft`
-    /// to reinstall the (idempotent) net on every supervisor tick. Interior
-    /// mutability because `health()` takes `&self`.
-    deny_all_net_installed: std::sync::atomic::AtomicBool,
     /// Where this component's own journal record lives, so a startup-loss or
     /// post-READY recovery can run the boot rows' persist without re-deriving the
     /// path. Must match the paths `acquire` resolved.
@@ -1597,8 +1639,8 @@ fn classify_nft_ownership_probe(
 #[cfg(target_os = "linux")]
 impl NftablesTableComponent {
     /// The post-ready controller attempts the safety net after a completed
-    /// ownership loss. A successful install latches; a failed one remains
-    /// retryable on the controller interval. `health()` only reports evidence.
+    /// ownership loss and retries the real transaction on later eligible losses,
+    /// including after a prior success. `health()` only reports evidence.
     /// The net's scope for THIS process, from the retained in-memory deny set unioned
     /// with a fresh resolution.
     ///
@@ -1818,71 +1860,94 @@ impl NftablesTableComponent {
     /// Order, and why it differs from the boot rows: the net is installed FIRST from the
     /// in-memory deny set, because the kill set is already durable from the bind row and
     /// a net-install persist makes no uid live, so there is nothing to write ahead of.
-    /// The persist follows best-effort. The component then publishes `Recovering`, so no
-    /// consumer reaches an exit arm while an attempt is in flight, and retries on
-    /// `RECOVERY_RETRY_INTERVAL` with ONE attempt at a time. The sweep hook fires only
-    /// after a FAILED install, never on entry.
+    /// The persist follows best-effort. The first completed `Lost` proof is consumed
+    /// without a second probe that could be unavailable; later `Recovering` polls
+    /// re-probe before the INSTALL interval. `Recovering` is published before the
+    /// transaction, so no consumer reaches an exit arm while it is in flight.
+    /// The sweep hook fires only after a FAILED install, never on entry.
     ///
-    /// Returns whether the net is now in force.
-    fn recover_post_ready_loss(&self, shutting_down: bool) -> bool {
+    /// Return this call's exact result so the supervisor can audit real attempts.
+    fn recover_post_ready_loss(
+        &self,
+        shutting_down: bool,
+    ) -> crate::enforcement::PostReadyRecoveryResult {
+        use crate::enforcement::PostReadyRecoveryResult;
         use std::sync::atomic::Ordering;
         // The shutdown flag is observed so `systemctl stop` is a clean exit rather than
         // a box that keeps re-arming while it is being taken down.
         if shutting_down {
             self.recovering.store(false, Ordering::SeqCst);
-            return false;
+            return PostReadyRecoveryResult::NoInstall;
         }
-        // ONE attempt in flight, spaced by the retry interval.
-        {
-            let mut last = match self.last_recovery_attempt.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if let Some(at) = *last {
-                if at.elapsed() < RECOVERY_RETRY_INTERVAL {
-                    return self.deny_all_net_installed.load(Ordering::SeqCst);
-                }
-            }
-            *last = Some(std::time::Instant::now());
-        }
-        // FIRST, on every attempt including the retries: ask whether the owned table
-        // has come back. An operator repairing the wall is the outcome this whole loop
-        // is waiting for, and a COMPLETED POSITIVE proof clears the probe latch, so the
-        // component can leave the recovering state instead of retrying forever.
-        let ownership = self.ownership.clone();
-        let expectation = current_expected_agent_binding(&self.decision_engine);
-        if matches!(
+        self.mark_prior_install_unverified();
+        let retrying = self.is_recovering();
+        // The first entry already consumed a completed negative proof supplied by
+        // the runtime. Only LATER polls ask whether the original owned wall has
+        // returned. Doing this before the install clock recognizes a repair
+        // promptly; doing it on first entry could turn a proven loss into a
+        // transient no-answer and skip the first protective install.
+        let proof = post_ready_recovery_proof(retrying, || {
+            let ownership = self.ownership.clone();
+            let expectation = current_expected_agent_binding(&self.decision_engine);
             self.probe.reprobe_after_latch(move || {
                 classify_nft_ownership_probe(crate::nftables::verify_owned_castle_table(
                     &ownership,
                     &expectation,
                 ))
-            }),
-            crate::health_probe::ProbeOutcome::Ready
-        ) {
-            // The wall is back. Recovery is over: stop publishing `Recovering` and drop
-            // the install latch so a LATER loss installs the net again rather than
-            // assuming the first install still covers it.
-            self.recovering.store(false, Ordering::SeqCst);
-            self.deny_all_net_installed.store(false, Ordering::SeqCst);
-            return true;
+            })
+        });
+        match proof {
+            crate::health_probe::ProbeOutcome::Ready => {
+                self.recovering.store(false, Ordering::SeqCst);
+                let mut last = match self.last_recovery_attempt.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *last = None;
+                return PostReadyRecoveryResult::OwnedWallReady;
+            }
+            crate::health_probe::ProbeOutcome::Lost => {}
+            crate::health_probe::ProbeOutcome::Unavailable => {
+                return PostReadyRecoveryResult::NoInstall
+            }
+            crate::health_probe::ProbeOutcome::Indeterminate => {
+                // No completed proof licenses a kernel mutation. The status read
+                // after this call observes the terminal probe latch and reaches
+                // the supervisor's existing hook-before-exit arm.
+                self.recovering.store(false, Ordering::SeqCst);
+                return PostReadyRecoveryResult::NoInstall;
+            }
         }
 
-        // The loss stands. Publish `Recovering` BEFORE the install attempt, so a
-        // concurrent supervisor tick observing this component does not reach its exit
-        // arm while the attempt is in flight.
+        // The FIRST call consumes the caller's completed Lost proof immediately.
+        // Every later call reaches here only after another completed Lost proof.
+        // Publish Recovering BEFORE the install attempt and retain it through retries.
         self.recovering.store(true, Ordering::SeqCst);
+        // ONE install at a time, spaced by the retry interval. A distinct first
+        // loss is never throttled by the clock from a previously repaired wall.
+        {
+            let mut last = match self.last_recovery_attempt.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if retrying {
+                if let Some(at) = *last {
+                    if at.elapsed() < RECOVERY_RETRY_INTERVAL {
+                        return PostReadyRecoveryResult::NoInstall;
+                    }
+                }
+            }
+            *last = Some(std::time::Instant::now());
+        }
         let resolution = self.net_scope_from_retained_set();
         // INSTALL FIRST. The persist follows.
-        let installed = ensure_deny_all_net_installed_once(
-            &self.deny_all_net_installed,
+        let installed = install_deny_all_net_for_recovery(
             || crate::nftables::install_deny_all_safety_net(&resolution.scope),
             &resolution.kill_set,
         );
-        let in_force = installed || self.deny_all_net_installed.load(Ordering::SeqCst);
-        // Record the transition BEFORE anything else, so a row emitted concurrently
-        // describes what is actually in the kernel.
-        self.record_safety_net_state(if in_force {
+        // Record THIS transaction's result before the best-effort persist. A prior
+        // success is never used to turn a later failed transaction into Installed.
+        self.record_safety_net_state(if installed {
             crate::nftables::SafetyNetAuditState::installed(
                 &resolution.scope,
                 &resolution.reason,
@@ -1894,7 +1959,7 @@ impl NftablesTableComponent {
                 error: "the safety net install failed and will be retried".to_string(),
             }
         });
-        if in_force {
+        if installed {
             // Best-effort persist AFTER the install, and a failure here never undoes it.
             if let Some(persist_err) = self.persist_boot_row_best_effort(&resolution) {
                 // SAFETY: stderr is the operator channel. The net is in force; the
@@ -1905,13 +1970,23 @@ impl NftablesTableComponent {
                 );
             }
         }
-        // INVARIANT: `recovering` STAYS SET whether or not the install succeeded, and it
-        // is cleared only by the positive-proof arm above. Clearing it on a successful
-        // install would let the next supervisor tick read the still-latched probe as a
-        // plain loss and exit, discarding the recovery this controller just performed.
-        // Keeping it set is what makes the supervisor re-enter here on the retry
-        // interval until the wall is repaired or the operator stops the unit.
-        in_force
+        // INVARIANT: `recovering` STAYS SET whether or not the install succeeded.
+        // Clearing it on success would let the next tick read the latched loss and
+        // exit. A later positive wall proof, terminal indeterminate reading, or
+        // operator shutdown ends this controller; otherwise it retries on interval.
+        if installed {
+            PostReadyRecoveryResult::InstallSucceeded
+        } else {
+            PostReadyRecoveryResult::InstallFailed
+        }
+    }
+
+    fn mark_prior_install_unverified(&self) {
+        let mut slot = match self.last_safety_net_state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        demote_prior_install(&mut slot);
     }
 
     /// Record the tagged state produced by an install transition.
@@ -1929,6 +2004,16 @@ impl NftablesTableComponent {
     /// Whether this component is publishing the post-READY `Recovering` state.
     fn is_recovering(&self) -> bool {
         self.recovering.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn demote_prior_install(state: &mut crate::nftables::SafetyNetAuditState) {
+    if matches!(
+        *state,
+        crate::nftables::SafetyNetAuditState::Installed { .. }
+    ) {
+        *state = crate::nftables::SafetyNetAuditState::Unverified;
     }
 }
 
@@ -1973,13 +2058,15 @@ impl AcquiredComponent for NftablesTableComponent {
     /// POST-READY LOSS. The supervisor calls this before any exit arm; the controller
     /// installs the net first, then persists best-effort, and publishes `Recovering`
     /// while an attempt is outstanding.
-    fn attempt_post_ready_recovery(&self, shutting_down: bool) -> bool {
+    fn attempt_post_ready_recovery(
+        &self,
+        shutting_down: bool,
+    ) -> crate::enforcement::PostReadyRecoveryResult {
         self.recover_post_ready_loss(shutting_down)
     }
 
     fn health(&self) -> crate::enforcement::ComponentHealth {
         use crate::enforcement::ComponentHealth;
-        use crate::health_probe::ProbeOutcome;
         if self.released || self.lock.is_none() {
             return ComponentHealth::Lost;
         }
@@ -2003,47 +2090,23 @@ impl AcquiredComponent for NftablesTableComponent {
         // BEFORE the probe is scheduled (the closure may run on a worker thread)
         // but read from the CURRENT snapshot on every poll, never cached.
         let expectation = current_expected_agent_binding(&self.decision_engine);
-        match self.probe.poll_result(move || {
+        let outcome = self.probe.poll_result(move || {
             classify_nft_ownership_probe(crate::nftables::verify_owned_castle_table(
                 &ownership,
                 &expectation,
             ))
-        }) {
-            ProbeOutcome::Ready => ComponentHealth::Ready,
-            ProbeOutcome::Lost => {
-                // REPORT ONLY. This function installs nothing and deletes nothing.
-                //
-                // INVARIANT, and where each kernel action now lives: a health poll is a
-                // QUESTION, and a question that mutates the kernel cannot be asked
-                // safely from an arbitrary caller (a status request, a supervisor tick,
-                // a test) nor reasoned about when two callers ask at once. The startup
-                // install is owned by `EnforcementRuntime::start` through
-                // `on_startup_lost`; the post-READY install is owned by the recovery
-                // controller through `recover_post_ready_loss`, which the supervisor
-                // invokes before any exit arm. Both read this reading; neither is
-                // reached from inside it.
-                //
-                // While a recovery attempt is in flight the component publishes
-                // `Recovering` instead of `Lost`, so nothing downstream reaches an
-                // exit arm before the net has had its chance.
-                if self.is_recovering() {
-                    ComponentHealth::Recovering
-                } else {
-                    ComponentHealth::Lost
-                }
-            }
-            ProbeOutcome::Unavailable => ComponentHealth::ProbeUnavailable,
-            // The exhausted indeterminate budget is its OWN outcome, distinct from a
-            // completed negative proof: it keeps the exit-and-adopt path with the sweep
-            // hook before the exit and installs nothing, because no evidence about the
-            // table was obtained.
-            // REPORT ONLY here too. The exhausted indeterminate budget withdraws
-            // readiness and installs nothing, and the sweep hook for it belongs to the
-            // supervisor's ordered hook-before-exit transition, which is the single
-            // caller. Firing it from a health poll would run it on every poll and
-            // outside that ordering.
-            ProbeOutcome::Indeterminate => ComponentHealth::Indeterminate,
+        });
+        if outcome == crate::health_probe::ProbeOutcome::Indeterminate {
+            // The terminal no-answer bypasses the recovery controller, so it
+            // must withdraw any prior installed claim before the exit WAL row.
+            self.mark_prior_install_unverified();
         }
+        // REPORT ONLY: startup owns its install through `EnforcementRuntime::start`,
+        // and the supervisor owns the post-READY controller. A late completed Ready
+        // proof may clear our internal recovery flag/clock here without touching the
+        // kernel. Transient no-answer stays Recovering while this owner is active;
+        // exhausted Indeterminate still reaches the supervisor's hook-before-exit arm.
+        post_ready_component_health(outcome, &self.recovering, &self.last_recovery_attempt)
     }
 
     fn release(&mut self) {
@@ -2930,6 +2993,57 @@ mod tests {
     }
 
     #[test]
+    fn fresh_instance_rebuilds_kill_set_from_authenticated_journal_and_manifest_only() {
+        use crate::nftables::{LiveTableBindings, SafetyNetScope};
+        use crate::ownership_journal::{
+            self as journal, ConfinedIdentity, ConfinedRole, JournalIdentity, OwnershipJournal,
+        };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nft-ownership.json");
+        let key_path = dir.path().join("nft-journal-auth.key");
+        let first_key = journal::load_or_generate_auth_key(&key_path).unwrap();
+        let record = OwnershipJournal::owned_with_known_history(
+            JournalIdentity {
+                schema_version: journal::JOURNAL_SCHEMA_VERSION,
+                marker: "m".into(),
+                boot_id: "3f2b91c0-7d4e-4a18-b6c2-0e15a9d83b77".into(),
+                source: "/usr/local/bin/castle-wall-daemon".into(),
+            },
+            2,
+            1,
+            vec![ConfinedIdentity {
+                uid: 60001,
+                role: ConfinedRole::Agent,
+            }],
+        )
+        .unwrap();
+        journal::store_atomic(&path, &record, &first_key).unwrap();
+        drop(first_key);
+
+        // A new instance reads only the persisted authenticated record; it has
+        // no retained in-memory deny set from the process that wrote it.
+        let next_key = journal::load_or_generate_auth_key(&key_path).unwrap();
+        let reloaded = journal::load(&path, Some(&next_key)).unwrap().unwrap();
+        let history = ConfinedHistory::Known(reloaded.confined().unwrap().to_vec());
+        let resolution = resolve_safety_net_scope(
+            &history,
+            Some((60002, Some(60003))),
+            &LiveTableBindings::Bindings(vec![60004]),
+            overflow_fixture(),
+        );
+        let SafetyNetScope::Identity(set) = resolution.scope else {
+            panic!("known history confines the net");
+        };
+        assert_eq!(set.uids(), vec![60001, 60002, 60003, 60004]);
+        assert_eq!(resolution.kill_set, vec![60001, 60002, 60003]);
+        assert!(
+            resolution.sources.journal
+                && resolution.sources.manifest
+                && resolution.sources.live_table
+        );
+    }
+
+    #[test]
     fn unknown_history_resolves_host_wide_whatever_the_other_sources_say() {
         use crate::nftables::{LiveTableBindings, SafetyNetReason, SafetyNetScope};
         // The ABSENT-KEY row: a record from a previous binary cannot prove which
@@ -3178,6 +3292,11 @@ mod tests {
         assert_eq!(failed.to_json()["state"], "install_failed");
         assert_eq!(failed.tag(), "install_failed");
         assert_eq!(
+            SafetyNetAuditState::Unverified.to_json(),
+            serde_json::json!({ "state": "unverified" })
+        );
+        assert_eq!(SafetyNetAuditState::Unverified.tag(), "unverified");
+        assert_eq!(
             SafetyNetAuditState::NotAttempted.to_json()["state"],
             "not_attempted"
         );
@@ -3224,77 +3343,173 @@ mod tests {
         assert!(installed.get());
     }
 
-    // GF1.3: the runtime-loss net is installed at most once (latched) and retried on
-    // failure, and no branch deletes the table.
+    // A completed first loss is already an install-authorising proof. A second
+    // unavailable reading would not erase it; only later Recovering polls re-probe.
     #[test]
-    fn runtime_loss_net_latches_once_retries_on_failure_and_never_deletes() {
-        use crate::nftables::NftablesError;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    fn first_runtime_loss_consumes_proof_without_a_second_query() {
+        use crate::health_probe::ProbeOutcome;
+        let mut queries = 0;
+        let first = post_ready_recovery_proof(false, || {
+            queries += 1;
+            ProbeOutcome::Unavailable
+        });
+        assert_eq!(first, ProbeOutcome::Lost);
+        assert_eq!(
+            queries, 0,
+            "first loss must not be vetoed by a new no-answer"
+        );
+        let later = post_ready_recovery_proof(true, || {
+            queries += 1;
+            ProbeOutcome::Ready
+        });
+        assert_eq!(later, ProbeOutcome::Ready);
+        assert_eq!(queries, 1, "a later recovering poll must re-probe");
+    }
 
-        let latch = AtomicBool::new(false);
+    #[test]
+    fn no_answer_withdraws_only_a_prior_success_claim() {
+        use crate::nftables::{
+            SafetyNetAuditState, SafetyNetReason, SafetyNetScope, SafetyNetSources,
+        };
+        let mut success = SafetyNetAuditState::installed(
+            &SafetyNetScope::HostWide,
+            &SafetyNetReason::UnknownHistory,
+            SafetyNetSources {
+                journal: false,
+                manifest: false,
+                live_table: false,
+            },
+        );
+        demote_prior_install(&mut success);
+        assert_eq!(success, SafetyNetAuditState::Unverified);
+        let mut failure = SafetyNetAuditState::InstallFailed {
+            attempted_scope: "v1-host-wide".into(),
+            error: "injected".into(),
+        };
+        demote_prior_install(&mut failure);
+        assert_eq!(failure.tag(), "install_failed");
+        let mut never = SafetyNetAuditState::NotAttempted;
+        demote_prior_install(&mut never);
+        assert_eq!(never.tag(), "not_attempted");
+    }
+
+    #[test]
+    fn late_ready_clears_recovery_clock_so_a_distinct_loss_is_first_again() {
+        use crate::enforcement::ComponentHealth;
+        use crate::health_probe::ProbeOutcome;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let recovering = AtomicBool::new(true);
+        let last = std::sync::Mutex::new(Some(std::time::Instant::now()));
+        assert_eq!(
+            post_ready_component_health(ProbeOutcome::Unavailable, &recovering, &last),
+            ComponentHealth::Recovering,
+            "a timed-out recovery proof must not enter the generic no-answer exit path"
+        );
+        assert!(recovering.load(Ordering::SeqCst));
+        assert!(last.lock().unwrap().is_some());
+
+        // The same worker may complete after its caller's deadline. A later
+        // health poll consumes that positive proof without another probe.
+        assert_eq!(
+            post_ready_component_health(ProbeOutcome::Ready, &recovering, &last),
+            ComponentHealth::Ready
+        );
+        assert!(!recovering.load(Ordering::SeqCst));
+        assert!(last.lock().unwrap().is_none());
+
+        assert_eq!(
+            post_ready_component_health(ProbeOutcome::Lost, &recovering, &last),
+            ComponentHealth::Lost,
+            "a distinct completed loss must be a fresh immediate-install entry"
+        );
+        let mut redundant_queries = 0;
+        assert_eq!(
+            post_ready_recovery_proof(recovering.load(Ordering::SeqCst), || {
+                redundant_queries += 1;
+                ProbeOutcome::Unavailable
+            }),
+            ProbeOutcome::Lost
+        );
+        assert_eq!(redundant_queries, 0);
+    }
+
+    #[test]
+    fn terminal_indeterminate_overrides_recovering_no_answer() {
+        use crate::enforcement::ComponentHealth;
+        use crate::health_probe::ProbeOutcome;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let recovering = AtomicBool::new(true);
+        let last = std::sync::Mutex::new(Some(std::time::Instant::now()));
+        assert_eq!(
+            post_ready_component_health(ProbeOutcome::Unavailable, &recovering, &last),
+            ComponentHealth::Recovering
+        );
+        assert_eq!(
+            post_ready_component_health(ProbeOutcome::Indeterminate, &recovering, &last),
+            ComponentHealth::Indeterminate,
+            "exhausted no-answer must reach the hook-before-exit consumer"
+        );
+        assert!(!recovering.load(Ordering::SeqCst));
+    }
+
+    // GF1.3: every eligible post-READY loss executes a real install, including a
+    // second loss after a prior success. A later failure cannot inherit success.
+    #[test]
+    fn runtime_loss_net_reinstalls_after_success_and_reports_later_failure() {
+        use crate::nftables::NftablesError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let calls = AtomicUsize::new(0);
         let kill_set = [60123u32];
 
-        // First Lost with a FAILING install: not latched, so it will retry.
-        let installed = ensure_deny_all_net_installed_once(
-            &latch,
+        let first = install_deny_all_net_for_recovery(
             || {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Err(NftablesError::InvocationFailed("injected".into()))
+                Ok(())
             },
             &kill_set,
         );
-        assert!(!installed);
+        assert!(first);
+        let second = install_deny_all_net_for_recovery(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            &kill_set,
+        );
+        assert!(second);
+        let third = install_deny_all_net_for_recovery(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(NftablesError::InvocationFailed("later failure".into()))
+            },
+            &kill_set,
+        );
         assert!(
-            !latch.load(Ordering::SeqCst),
-            "a failed install must not latch"
+            !third,
+            "a previous success cannot report a failed retry installed"
         );
-
-        // Retry, now succeeding: latches.
-        let installed = ensure_deny_all_net_installed_once(
-            &latch,
-            || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-            &kill_set,
-        );
-        assert!(installed);
-        assert!(latch.load(Ordering::SeqCst));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-
-        // Latched: a further poll installs nothing.
-        let installed = ensure_deny_all_net_installed_once(
-            &latch,
-            || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-            &kill_set,
-        );
-        assert!(!installed);
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            2,
-            "the latch must prevent a third install"
+            3,
+            "every eligible loss must execute the actual transaction"
         );
     }
 
-    // A PERSISTENT install failure keeps re-attempting on every poll and never
-    // records an unprotected host as protected. The table is left standing on every
-    // failing poll and the PR-3 sweep hook fires each time.
+    // Persistent failure remains retryable; the PR-3 hook is entered only by the
+    // failed-install arm and Part A performs no by-name delete.
     #[test]
-    fn runtime_loss_persistent_install_failure_keeps_retrying_and_never_latches() {
+    fn runtime_loss_persistent_install_failure_keeps_retrying() {
         use crate::nftables::NftablesError;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let latch = AtomicBool::new(false);
         let attempts = AtomicUsize::new(0);
         let kill_set = [60123u32];
 
         for poll in 1..=3 {
-            let installed = ensure_deny_all_net_installed_once(
-                &latch,
+            let installed = install_deny_all_net_for_recovery(
                 || {
                     attempts.fetch_add(1, Ordering::SeqCst);
                     Err(NftablesError::InvocationFailed(
@@ -3304,15 +3519,11 @@ mod tests {
                 &kill_set,
             );
             assert!(!installed, "poll {poll} must not report an install");
-            assert!(
-                !latch.load(Ordering::SeqCst),
-                "poll {poll}: a failed install never latches, so the next poll retries"
-            );
         }
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             3,
-            "every poll must re-attempt the net while it is not latched"
+            "every eligible poll must re-attempt the net"
         );
     }
 

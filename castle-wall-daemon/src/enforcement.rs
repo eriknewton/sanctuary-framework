@@ -169,6 +169,22 @@ pub enum EnforcementError {
 /// aborts the whole process. An implementation therefore swallows (or logs)
 /// join and teardown failures rather than unwrapping them — a failed thread
 /// join or a poisoned lock is a degraded teardown, never an abort.
+/// One controller call's result, carried to the supervisor for exact attempt
+/// evidence. No variant is a persistent assertion about the wall or net.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostReadyRecoveryResult {
+    NoInstall,
+    OwnedWallReady,
+    InstallSucceeded,
+    InstallFailed,
+}
+
+impl PostReadyRecoveryResult {
+    pub fn holds_gate(self) -> bool {
+        matches!(self, Self::OwnedWallReady | Self::InstallSucceeded)
+    }
+}
+
 pub trait AcquiredComponent: Send {
     fn kind(&self) -> ComponentKind;
     /// Live readiness. A component that has lost its resource — a clobbered
@@ -231,11 +247,11 @@ pub trait AcquiredComponent: Send {
     /// through its health while an attempt is outstanding.
     ///
     /// `shutting_down` is observed so `systemctl stop` is a clean exit rather than a
-    /// box that keeps re-arming while it is being taken down. Returns whether the
-    /// component now holds a gate in the kernel.
-    fn attempt_post_ready_recovery(&self, shutting_down: bool) -> bool {
+    /// box that keeps re-arming while it is being taken down. The result describes
+    /// this call only; it is not a retained claim about kernel state.
+    fn attempt_post_ready_recovery(&self, shutting_down: bool) -> PostReadyRecoveryResult {
         let _ = shutting_down;
-        false
+        PostReadyRecoveryResult::NoInstall
     }
 
     /// The tagged `safety_net` state this component last produced, for the audit row
@@ -697,9 +713,9 @@ impl EnforcementRuntime {
     /// `Recovering` are not driven here: the first needs nothing, the second is the
     /// absence of evidence, and the third already has an attempt outstanding.
     ///
-    /// Returns true when at least one component reports a gate now in the kernel.
-    pub fn attempt_post_ready_recovery(&self, shutting_down: bool) -> bool {
-        let mut any = false;
+    /// Return the result of the selected component's call to the supervisor.
+    pub fn attempt_post_ready_recovery(&self, shutting_down: bool) -> PostReadyRecoveryResult {
+        let mut result = PostReadyRecoveryResult::NoInstall;
         for component in &self.components {
             // BOTH readings drive the controller. `Lost` is the entry; `Recovering` is
             // an attempt already outstanding, and it must be re-entered on the retry
@@ -708,10 +724,13 @@ impl EnforcementRuntime {
                 component.health(),
                 ComponentHealth::Lost | ComponentHealth::Recovering
             ) {
-                any |= component.attempt_post_ready_recovery(shutting_down);
+                let next = component.attempt_post_ready_recovery(shutting_down);
+                if next != PostReadyRecoveryResult::NoInstall {
+                    result = next;
+                }
             }
         }
-        any
+        result
     }
 
     /// The supervisor's terminal no-answer transition, before it releases the
@@ -958,12 +977,16 @@ mod test_support {
             self.post_ready_indeterminate_calls
                 .fetch_add(1, Ordering::SeqCst);
         }
-        fn attempt_post_ready_recovery(&self, shutting_down: bool) -> bool {
+        fn attempt_post_ready_recovery(&self, shutting_down: bool) -> PostReadyRecoveryResult {
             self.recovery_calls.fetch_add(1, Ordering::SeqCst);
             if shutting_down {
                 self.recovery_saw_shutdown.store(true, Ordering::SeqCst);
             }
-            !shutting_down
+            if shutting_down {
+                PostReadyRecoveryResult::NoInstall
+            } else {
+                PostReadyRecoveryResult::InstallSucceeded
+            }
         }
         fn release(&mut self) {}
     }
@@ -1260,13 +1283,19 @@ mod test_support {
         .expect("starts ready");
 
         // READY: no recovery is driven, because there is nothing to re-arm.
-        assert!(!runtime.attempt_post_ready_recovery(false));
+        assert_eq!(
+            runtime.attempt_post_ready_recovery(false),
+            PostReadyRecoveryResult::NoInstall
+        );
         assert_eq!(counters.recovery.load(Ordering::SeqCst), 0);
 
         // INDETERMINATE: still no recovery. This reading is the absence of evidence,
         // so no kernel action may be taken from it.
         *health.lock().unwrap() = ComponentHealth::ProbeUnavailable;
-        assert!(!runtime.attempt_post_ready_recovery(false));
+        assert_eq!(
+            runtime.attempt_post_ready_recovery(false),
+            PostReadyRecoveryResult::NoInstall
+        );
         assert_eq!(counters.recovery.load(Ordering::SeqCst), 0);
         runtime.hook_post_ready_indeterminate();
         assert_eq!(counters.post_ready_indeterminate.load(Ordering::SeqCst), 0);
@@ -1286,12 +1315,18 @@ mod test_support {
 
         // LOST, a completed negative proof: recovery IS driven.
         *health.lock().unwrap() = ComponentHealth::Lost;
-        assert!(runtime.attempt_post_ready_recovery(false));
+        assert_eq!(
+            runtime.attempt_post_ready_recovery(false),
+            PostReadyRecoveryResult::InstallSucceeded
+        );
         assert_eq!(counters.recovery.load(Ordering::SeqCst), 1);
 
         // The shutdown flag is threaded through, so `systemctl stop` is a clean exit
         // rather than a box that keeps re-arming while it is taken down.
-        assert!(!runtime.attempt_post_ready_recovery(true));
+        assert_eq!(
+            runtime.attempt_post_ready_recovery(true),
+            PostReadyRecoveryResult::NoInstall
+        );
         assert!(counters.recovery_saw_shutdown.load(Ordering::SeqCst));
 
         // RECOVERING: an attempt is outstanding, and the controller IS re-entered. This
@@ -1300,7 +1335,10 @@ mod test_support {
         // resource is repaired or the unit is stopped.
         let before = counters.recovery.load(Ordering::SeqCst);
         *health.lock().unwrap() = ComponentHealth::Recovering;
-        assert!(runtime.attempt_post_ready_recovery(false));
+        assert_eq!(
+            runtime.attempt_post_ready_recovery(false),
+            PostReadyRecoveryResult::InstallSucceeded
+        );
         assert_eq!(
             counters.recovery.load(Ordering::SeqCst),
             before + 1,
@@ -1315,6 +1353,18 @@ mod test_support {
             } => assert_eq!(kind, ComponentKind::NftablesTable),
             other => panic!("expected the recovering reason, got {other:?}"),
         }
+
+        // A later exhausted no-answer overrides Recovering and reaches the hook
+        // consumer. The transient no-answer above never did.
+        *health.lock().unwrap() = ComponentHealth::Indeterminate;
+        assert_eq!(
+            runtime.status(),
+            EnforcementStatus::NotReady {
+                reason: NotReadyReason::HealthProbeIndeterminate,
+            }
+        );
+        runtime.hook_post_ready_indeterminate();
+        assert_eq!(counters.post_ready_indeterminate.load(Ordering::SeqCst), 2);
     }
 
     struct AlwaysReadyProvider(ComponentKind);

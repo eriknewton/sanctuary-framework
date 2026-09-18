@@ -29,7 +29,7 @@ use castle_wall_daemon::ownership_journal::{
 use castle_wall_daemon::runtime_lock::HostRuntimeLock;
 use castle_wall_daemon::runtime_providers::{
     acquire_castle_table_component_for_test, disarm_castle_runtime, DisarmOutcome,
-    LinuxRuntimeConfig, NFT_HEALTH_MIN_INTERVAL,
+    LinuxRuntimeConfig, NFT_HEALTH_MIN_INTERVAL, RECOVERY_RETRY_INTERVAL,
 };
 use castle_wall_daemon::safety_net_uid::{
     validate_safety_net_uid, ConfinedUidSet, HostOverflowUid,
@@ -693,7 +693,7 @@ fn gf1_3_runtime_loss_installs_the_net_through_the_recovery_controller() {
     //    No restart happens anywhere in this test.
     let in_force = component.attempt_post_ready_recovery(false);
     assert!(
-        in_force,
+        in_force.holds_gate(),
         "the recovery controller must report the net in force after a completed loss"
     );
 
@@ -716,10 +716,55 @@ fn gf1_3_runtime_loss_installs_the_net_through_the_recovery_controller() {
         "with no confined identity recoverable the net is the zero-rule host-wide shape"
     );
 
-    // 6) The controller observes the shutdown flag, so `systemctl stop` is a clean
+    // 6) A second external loss WHILE Recovering must cause a second real
+    //    transaction. The first successful install is not evidence that this
+    //    externally deleted net remains in force. This was the reachable P1
+    //    success-latch bug: it reported Installed but skipped this reinstall.
+    let deleted_net = Command::new("nft")
+        .args(["delete", "table", CASTLE_FAMILY, isolation::table()])
+        .output()
+        .expect("delete the first installed net");
+    assert!(
+        deleted_net.status.success(),
+        "second external delete must succeed"
+    );
+    assert!(!nftables::table_exists().unwrap());
+    assert_eq!(
+        component.health(),
+        ComponentHealth::Recovering,
+        "the host lock owner stays in Recovering after its net is removed"
+    );
+    std::thread::sleep(RECOVERY_RETRY_INTERVAL + Duration::from_millis(100));
+    let mut reinstalled = false;
+    for _ in 0..8 {
+        if component.attempt_post_ready_recovery(false).holds_gate() {
+            reinstalled = true;
+            break;
+        }
+        assert!(
+            !nftables::table_exists().unwrap(),
+            "an unavailable retry may not claim a net that is still absent"
+        );
+        std::thread::sleep(Duration::from_millis(600));
+    }
+    assert!(
+        reinstalled,
+        "the next eligible completed loss must execute a second install"
+    );
+    assert!(
+        nftables::live_table_is_deny_all_safety_net().unwrap(),
+        "the second install must restore the real isolated nft net"
+    );
+    assert_eq!(
+        component.safety_net_audit_state().unwrap().tag(),
+        "installed",
+        "the audit claim follows the second actual successful transaction"
+    );
+
+    // 7) The controller observes the shutdown flag, so `systemctl stop` is a clean
     //    exit rather than a box that keeps re-arming while it is taken down.
     assert!(
-        !component.attempt_post_ready_recovery(true),
+        !component.attempt_post_ready_recovery(true).holds_gate(),
         "a shutting-down daemon must not re-arm"
     );
     drop(component);
@@ -944,7 +989,10 @@ impl AcquiredComponent for IndeterminateAtTheWholeSetCheck {
         self.inner.on_startup_indeterminate();
     }
 
-    fn attempt_post_ready_recovery(&self, shutting_down: bool) -> bool {
+    fn attempt_post_ready_recovery(
+        &self,
+        shutting_down: bool,
+    ) -> castle_wall_daemon::enforcement::PostReadyRecoveryResult {
         self.inner.attempt_post_ready_recovery(shutting_down)
     }
 
@@ -1227,7 +1275,7 @@ fn a_post_ready_non_nftables_loss_keeps_the_table_and_the_next_start_adopts_it()
     // the status is re-read. A component with no kernel gate of its own declines, so no
     // net is installed for it.
     assert!(
-        !runtime.attempt_post_ready_recovery(false),
+        !runtime.attempt_post_ready_recovery(false).holds_gate(),
         "a non-nftables loss must not put any gate in the kernel"
     );
     assert_eq!(

@@ -428,6 +428,13 @@ mod start_limit_against_real_systemd {
             .unwrap_or_default()
     }
 
+    /// The fixture-owned counter is the portable proof of actual activations. Some systemd
+    /// releases retain `Result=exit-code` after the manager refuses a rate-limited restart,
+    /// so that manager diagnostic cannot be the pass condition here.
+    fn activation_count(counter: &std::path::Path) -> Option<u64> {
+        std::fs::read_to_string(counter).ok()?.trim().parse().ok()
+    }
+
     /// Transient units this leg created, torn down on EVERY exit path.
     ///
     /// A `Drop` guard rather than teardown at the end of the test body: a panicking
@@ -616,45 +623,79 @@ mod start_limit_against_real_systemd {
         let waited_from = Instant::now();
         let mut active_state = String::new();
         let mut result = String::new();
+        let mut sub_state = String::new();
+        let mut n_restarts = String::new();
+        let mut starts = None;
         while waited_from.elapsed() < deadline {
             active_state = systemctl_property(&service, "ActiveState");
             result = systemctl_property(&service, "Result");
-            // A failed activation can briefly report `failed` with `exit-code`
-            // while systemd still has another start queued. Only the start-limit
-            // result proves that the restart budget has been exhausted.
-            if active_state == "failed" && result == "start-limit-hit" {
+            sub_state = systemctl_property(&service, "SubState");
+            n_restarts = systemctl_property(&service, "NRestarts");
+            starts = activation_count(&counter);
+            if starts.is_some_and(|count| count > burst) {
+                panic!(
+                    "systemd ran more than the shipped burst of {burst} activations: \
+                     starts={starts:?}, ActiveState={active_state}, SubState={sub_state}, \
+                     Result={result}, NRestarts={n_restarts}"
+                );
+            }
+            // The fixture counter, rather than Result, proves the service reached the exact
+            // allowed burst. `Result` is retained below as a diagnostic because some managers
+            // leave it at `exit-code` after a rate-limited restart is refused.
+            if active_state == "failed" && starts == Some(burst) {
                 break;
             }
             std::thread::sleep(POLL_SPACING);
         }
+        let diagnostic = format!(
+            "starts={starts:?}, ActiveState={active_state}, SubState={sub_state}, \
+             Result={result}, NRestarts={n_restarts}"
+        );
         assert_eq!(
             active_state, "failed",
             "a unit whose activation keeps failing must reach a TERMINAL failed state \
-             within {deadline:?}; ActiveState={active_state}, Result={result}"
+             within {deadline:?}; {diagnostic}"
         );
-        // The terminal state must come from the START LIMIT, which is what bounds the
-        // restart loop. Any other result would mean the loop ended for some other reason
-        // and the limit is untested.
         assert_eq!(
-            result, "start-limit-hit",
-            "the finite start limit must be what ends the restart loop"
+            starts,
+            Some(burst),
+            "the fixture must run exactly the shipped start burst before a retry is refused; \
+             {diagnostic}"
         );
 
-        // No more than the burst count of activations ran: systemd refuses the start
-        // AFTER the burst falls inside the window, so the counter is the direct evidence.
-        let starts: u64 = std::fs::read_to_string(&counter)
-            .expect("the activation counter must exist")
-            .trim()
-            .parse()
-            .expect("the counter holds a count");
-        assert!(
-            starts >= 2,
-            "the unit must actually have been RESTARTED, not merely started once: \
-             {starts} activation(s)"
+        // The next automatic retry is the one systemd must refuse. Keep observing for that
+        // full retry period plus the existing scheduler slack: a sixth activation fails
+        // immediately above, while a stable counter proves the restart loop is bounded.
+        let stability_deadline = Instant::now();
+        let stability_window = Duration::from_secs(restart_secs + TERMINAL_STATE_SLACK_SECS);
+        while stability_deadline.elapsed() < stability_window {
+            active_state = systemctl_property(&service, "ActiveState");
+            result = systemctl_property(&service, "Result");
+            sub_state = systemctl_property(&service, "SubState");
+            n_restarts = systemctl_property(&service, "NRestarts");
+            starts = activation_count(&counter);
+            if starts.is_some_and(|count| count > burst) {
+                panic!(
+                    "the retry after the shipped burst started a sixth activation: \
+                     starts={starts:?}, ActiveState={active_state}, SubState={sub_state}, \
+                     Result={result}, NRestarts={n_restarts}"
+                );
+            }
+            std::thread::sleep(POLL_SPACING);
+        }
+        let diagnostic = format!(
+            "starts={starts:?}, ActiveState={active_state}, SubState={sub_state}, \
+             Result={result}, NRestarts={n_restarts}"
         );
-        assert!(
-            starts <= burst,
-            "no more than the shipped burst of {burst} activations may run; {starts} did"
+        assert_eq!(
+            active_state, "failed",
+            "the service must remain terminally failed after its refused retry; {diagnostic}"
+        );
+        assert_eq!(
+            starts,
+            Some(burst),
+            "the activation counter must remain at the shipped burst after the refused retry; \
+             {diagnostic}"
         );
 
         // And the ordered dependent is released by that terminal state.

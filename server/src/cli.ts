@@ -1361,6 +1361,22 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runDeployPreflight(args.slice(1));
   }
 
+  if (command === "upgrade-linux") {
+    // Static CLI imports have already run. The trusted installed CLI/package
+    // and absolute Node invocation are pre-execution operator prerequisites;
+    // this refusal prevents loading the privileged handler from a checkout.
+    if (process.platform !== "linux" || process.geteuid?.() !== 0 ||
+        process.argv[1] !== "/usr/local/libexec/sanctuary/server/dist/cli.js" ||
+        !process.execPath.startsWith("/") || process.env.NODE_OPTIONS !== undefined ||
+        process.env.NODE_PATH !== undefined) {
+      // SAFETY: stderr tells the operator why the privileged offline CLI refused to load.
+      console.error("upgrade-linux requires Linux root and the trusted installed CLI under a sanitized absolute Node invocation");
+      return 1;
+    }
+    const { runCastleWallLinuxUpgrade } = await import("./cli/castle-wall-linux-upgrade.js");
+    return runCastleWallLinuxUpgrade(args.slice(1));
+  }
+
   if (command === "reload") {
     const { runReload } = await import("./cli/castle-wall.js");
     return runReload(args.slice(1));
@@ -1599,6 +1615,9 @@ function printCastleWallHelp(): void {
                      Exits 2 when the versions positively skew;
                      --allow-extension-skew accepts the skew and says what it
                      overrode.
+    upgrade-linux    Offline replacement for an already provisioned fixed Linux
+                     root service. Requires trusted installed CLI and root.
+                     --route disarm|reboot --candidate ABSOLUTE_PATH
     reload           Reload policy in the running fortress daemon.
                      Exits 0 even when no daemon was reachable to reload (a
                      fresh fortress has nothing to reload; this is intentional).

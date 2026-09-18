@@ -152,6 +152,44 @@ impl RuntimeHealthView {
             .and_then(|state| state.clone())
     }
 
+    /// The sole supervisor needs actual published history for transition and
+    /// WAL decisions. It may wait for these short mutexes, one at a time; IPC
+    /// retains its nonblocking and freshness-limited reads. Poison or an absent
+    /// first health publication is an error, never a fabricated prior state.
+    pub(crate) fn supervisor_snapshot(
+        &self,
+    ) -> Result<
+        (
+            RuntimeHealthState,
+            Option<crate::nftables::SafetyNetAuditState>,
+        ),
+        (),
+    > {
+        let prior_health = self
+            .inner
+            .lock()
+            .map_err(|_| ())?
+            .as_ref()
+            .map(|(_, state)| *state)
+            .ok_or(())?;
+        let prior_tag = self.safety_net.lock().map_err(|_| ())?.clone();
+        Ok((prior_health, prior_tag))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_health_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<(Instant, RuntimeHealthState)>> {
+        self.inner.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_safety_net_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<crate::nftables::SafetyNetAuditState>> {
+        self.safety_net.lock().unwrap()
+    }
+
     /// Publish an observation. Called by boot (initial state) and by the
     /// supervision loop on every health tick. The lock is held only for the
     /// duration of a two-word write, so a reader's `try_lock` effectively never
@@ -239,6 +277,40 @@ mod tests {
         );
         view.clear_safety_net();
         assert_eq!(view.read_safety_net(), None);
+    }
+
+    #[test]
+    fn poisoned_supervisor_tag_snapshot_is_an_error_not_an_absent_tag() {
+        let view = std::sync::Arc::new(RuntimeHealthView::new());
+        view.publish(RuntimeHealthState::Ready);
+        let poisoned = std::sync::Arc::clone(&view);
+        assert!(std::thread::spawn(move || {
+            let _held = poisoned.safety_net.lock().unwrap();
+            panic!("poison the test tag mutex");
+        })
+        .join()
+        .is_err());
+        assert_eq!(view.supervisor_snapshot(), Err(()));
+        // IPC remains nonblocking and withholds a predicate on poison.
+        assert_eq!(view.read_safety_net(), None);
+    }
+
+    #[test]
+    fn poisoned_supervisor_health_snapshot_is_an_error_not_status_fallback() {
+        let view = std::sync::Arc::new(RuntimeHealthView::new());
+        view.publish(RuntimeHealthState::Ready);
+        let poisoned = std::sync::Arc::clone(&view);
+        assert!(std::thread::spawn(move || {
+            let _held = poisoned.inner.lock().unwrap();
+            panic!("poison the test health mutex");
+        })
+        .join()
+        .is_err());
+        assert_eq!(view.supervisor_snapshot(), Err(()));
+        assert_eq!(
+            view.read(STATUS_FRESHNESS_WINDOW).state,
+            RuntimeHealthState::ProbeUnavailable
+        );
     }
 
     /// A `Ready` observation is evidence about WHEN it was taken. Past the

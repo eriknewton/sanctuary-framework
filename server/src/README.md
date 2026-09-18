@@ -295,6 +295,18 @@ This is the most onboarding-hostile collision.
     `kernel.overflowuid`, and that host-specific check is the ONE asymmetry between the two sides,
     which is why the daemon's verb, and never the TypeScript side, is the oracle the doctor path
     reports from.
+  - For an **already provisioned** fixed root Linux unit, the offline entry is
+    `sudo env -i PATH=/usr/bin:/bin /usr/bin/node /usr/local/libexec/sanctuary/server/dist/cli.js castle-wall upgrade-linux --route disarm --candidate /root/castle-wall-daemon.new`.
+    Choose `--route reboot` instead for the reboot route.
+    Before running it, the operator must install the Node interpreter and entire CLI/package tree
+    as root-owned, non-writable code. Static CLI imports run before privilege checks; a writable
+    checkout is not trusted for this command. The loaded unit must have the fixed `/etc/systemd/system/sanctuary-castle-wall.service`
+    fragment, no drop-ins or pending reload, and `/etc/sanctuary/castle-wall.env` mode 0600 with
+    exactly `SANCTUARY_FORTRESS_ID=<8..64 lowercase hex>` and
+    `SANCTUARY_TRUSTED_SERVICE_UID=<positive decimal>` assignments. A different provisioning
+    form refuses until brought into this fixed shape. Route B only requests reboot; if inhibited
+    or deferred, inspect the stopped unit and binary before manual recovery. This entry does not
+    install a fresh Linux service or make Linux enforcement publicly available.
 - **fortress** = the agent's posture MODE-TIER state machine (private/federated/interop, which mesh
   bits are live). Capability posture, NOT network enforcement. Distinct from the operator word
   "fortress" meaning the on-disk `SANCTUARY_FORTRESS_PATH` directory.

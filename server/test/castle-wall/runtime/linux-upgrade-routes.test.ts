@@ -49,6 +49,70 @@ function recordingRunner(
 }
 
 describe("Linux upgrade routes", () => {
+  it("turns a thrown runner error into a bounded preflight abort", async () => {
+    let replaced = false;
+    const result = await executeLinuxUpgradeRoute({
+      route: "disarm", newBinaryPath: NEW_BINARY,
+      target: { kind: "fortress_id", fortressId: FORTRESS_ID },
+      runner: { run: async () => { throw new Error("spawn refused"); } },
+      replaceBinary: async () => { replaced = true; },
+      systemctlBinary: "/usr/bin/systemctl",
+    });
+    expect(result).toMatchObject({ outcome: "aborted", completed_steps: [],
+      abort: { step: "preflight_manifest_new_binary", exit_code: null, output: "spawn refused" } });
+    expect(replaced).toBe(false);
+  });
+
+  it("treats a null command exit as failure before stop", async () => {
+    const calls: string[] = [];
+    const result = await executeLinuxUpgradeRoute({
+      route: "reboot", newBinaryPath: NEW_BINARY,
+      target: { kind: "fortress_id", fortressId: FORTRESS_ID },
+      runner: { run: async (command) => { calls.push(command); return { code: null, stdout: "", stderr: "signal" }; } },
+      replaceBinary: async () => { throw new Error("must not replace"); },
+      systemctlBinary: "/usr/bin/systemctl",
+    });
+    expect(result.abort).toMatchObject({ step: "preflight_manifest_new_binary", exit_code: null, output: "signal" });
+    expect(calls).toEqual([NEW_BINARY]);
+  });
+
+  it("aborts every remaining route step before any later command", async () => {
+    const cases = [
+      { route: "disarm", fail: "stop_unit", command: "stop" },
+      { route: "disarm", fail: "disarm_old_binary", command: DISARM_FLAG },
+      { route: "disarm", fail: "replace_binary", command: null },
+      { route: "disarm", fail: "start_unit", command: "start" },
+      { route: "reboot", fail: "stop_unit", command: "stop" },
+      { route: "reboot", fail: "replace_binary", command: null },
+      { route: "reboot", fail: "reboot_host", command: "reboot" },
+    ] as const;
+    for (const testCase of cases) {
+      const calls: string[] = [];
+      const result = await executeLinuxUpgradeRoute({
+        route: testCase.route, newBinaryPath: NEW_BINARY,
+        installedBinaryPath: OLD_BINARY,
+        target: { kind: "fortress_id", fortressId: FORTRESS_ID },
+        systemctlBinary: "/usr/bin/systemctl",
+        runner: { run: async (command, args) => {
+          calls.push(`${command} ${args.join(" ")}`);
+          return { code: args.includes(testCase.command ?? "never-matches") ? 7 : 0,
+            stdout: "", stderr: "step refused" };
+        } },
+        replaceBinary: async () => {
+          calls.push("replace");
+          if (testCase.fail === "replace_binary") throw new Error("replace refused");
+        },
+      });
+      const planned = testCase.route === "disarm" ? LINUX_UPGRADE_ROUTE_A_STEPS : LINUX_UPGRADE_ROUTE_B_STEPS;
+      const at = planned.indexOf(testCase.fail);
+      expect(result.outcome).toBe("aborted");
+      expect(result.abort?.step).toBe(testCase.fail);
+      expect(result.completed_steps).toEqual(planned.slice(0, at));
+      expect(calls.length).toBe(at + 1);
+      expect(result.abort?.output).toContain(testCase.command === null ? "replace refused" : "step refused");
+    }
+  });
+
   it("route A runs preflight, stop, disarm, replace, start in that order", async () => {
     const { runner, calls } = recordingRunner();
     let replacedAfter = -1;

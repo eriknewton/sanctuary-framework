@@ -291,6 +291,8 @@ export type SafetyNetAuditState =
       coverage: string;
     }
   | { state: "install_failed"; attempted_scope: string; error: string }
+  /** A prior install succeeded; this poll did not re-prove kernel presence. */
+  | { state: "unverified" }
   | { state: "not_attempted" };
 
 /**
