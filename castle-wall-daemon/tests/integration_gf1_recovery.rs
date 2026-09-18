@@ -28,8 +28,9 @@ use castle_wall_daemon::ownership_journal::{
 };
 use castle_wall_daemon::runtime_lock::HostRuntimeLock;
 use castle_wall_daemon::runtime_providers::{
-    acquire_castle_table_component_for_test, disarm_castle_runtime, DisarmOutcome,
-    LinuxRuntimeConfig, NFT_HEALTH_MIN_INTERVAL, RECOVERY_RETRY_INTERVAL,
+    acquire_castle_table_component_for_test, disarm_castle_runtime,
+    force_next_reclaim_owned_probe_error_for_test, DisarmOutcome, LinuxRuntimeConfig,
+    NFT_HEALTH_MIN_INTERVAL, RECOVERY_RETRY_INTERVAL,
 };
 use castle_wall_daemon::safety_net_uid::{
     validate_safety_net_uid, ConfinedUidSet, HostOverflowUid,
@@ -97,6 +98,81 @@ fn write_preparing_journal(cfg: &LinuxRuntimeConfig) {
         &key,
     )
     .expect("durably record the Preparing journal");
+}
+
+/// Write an `Owned` ownership journal for THIS boot, the durable state a
+/// successful acquisition leaves behind. `marker`/`table_handle`/
+/// `base_chain_handle` may be arbitrary: D3's `ReclaimOwned` arm probes the LIVE
+/// table's shape (is it this daemon's safety net?) before it ever trusts this
+/// record's own handles against a real inventory, so a case that only needs the
+/// safety-net branch (cases (a), (f)) never reaches the point where these values
+/// would have to be real; a case that needs the ordinary-reclaim branch (case
+/// (b)) supplies a live table whose actual handles will not match these anyway,
+/// which is the point of that case.
+fn write_owned_journal(
+    cfg: &LinuxRuntimeConfig,
+    marker: &str,
+    table_handle: u64,
+    base_chain_handle: u64,
+) {
+    write_owned_journal_with_history(cfg, marker, table_handle, base_chain_handle, Some(vec![]));
+}
+
+fn write_owned_journal_with_history(
+    cfg: &LinuxRuntimeConfig,
+    marker: &str,
+    table_handle: u64,
+    base_chain_handle: u64,
+    confined: Option<Vec<journal::ConfinedIdentity>>,
+) {
+    let key = journal::load_or_generate_auth_key(&cfg.journal_key_path)
+        .expect("load/generate the journal MAC key");
+    let identity = JournalIdentity {
+        schema_version: JOURNAL_SCHEMA_VERSION,
+        marker: marker.to_string(),
+        boot_id: journal::current_boot_id().expect("boot id"),
+        source: journal::current_source(),
+    };
+    let record = match confined {
+        Some(entries) => OwnershipJournal::owned_with_known_history(
+            identity,
+            table_handle,
+            base_chain_handle,
+            entries,
+        )
+        .expect("valid known history"),
+        None => {
+            OwnershipJournal::owned_with_unknown_history(identity, table_handle, base_chain_handle)
+        }
+    };
+    journal::store_atomic(&cfg.journal_path, &record, &key)
+        .expect("durably record the Owned journal");
+}
+
+/// Run a multi-statement nft script via `-f -` (stdin), mirroring the
+/// production `run_nft_stdin` transaction style so the near-net-drift fixtures
+/// below (D2, PR-2 packet case (h)) are built the same way the daemon itself
+/// builds tables, rather than through a sequence of separately-argv'd `nft`
+/// invocations that cannot express a `{ comment "..." ; }` table block cleanly.
+fn nft_script(script: &str) -> bool {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = match Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let wrote = child
+        .stdin
+        .take()
+        .map(|mut stdin| stdin.write_all(script.as_bytes()).is_ok())
+        .unwrap_or(false);
+    wrote && child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
 /// The live isolated table's base output chain policy (`accept`/`drop`), or None
@@ -207,9 +283,12 @@ fn gf1_1_disarm_recovers_from_create_failure_wedge() {
     assert!(nftables::live_table_is_deny_all_safety_net().unwrap());
 
     // --disarm must recognize its own net for an interrupted acquisition, delete
-    // it, confirm absence, and clear the record: StaleRecordCleared, not a wedge.
+    // it, confirm absence, and clear the record: SafetyNetCleared (D3; renamed
+    // from StaleRecordCleared now that `disarm_recover_deny_all_net` is also
+    // reachable from `ReclaimOwned`, where "a stale record" would be the wrong
+    // description), not a wedge. Packet test case (c).
     let outcome = disarm_castle_runtime(&cfg).expect("disarm must RECOVER, not wedge");
-    assert_eq!(outcome, DisarmOutcome::StaleRecordCleared);
+    assert_eq!(outcome, DisarmOutcome::SafetyNetCleared);
     assert!(
         !nftables::table_exists().unwrap(),
         "disarm must leave no live table"
@@ -218,6 +297,387 @@ fn gf1_1_disarm_recovers_from_create_failure_wedge() {
         !cfg.journal_path.exists(),
         "disarm must clear the interrupted ownership record"
     );
+}
+
+// D3 fix round: the same shared requirement proven at the `FinalizeInterrupted`
+// (Preparing) recovery site as `gf1_h1_zero_rule_non_owner_table_comment_refused`
+// proves at the `ReclaimOwned` site: a live table's comment key must be absent,
+// read from the same inventory the recognizer parses, before disarm treats it as
+// this daemon's own safety net. A zero-rule `policy drop` table carrying a table
+// comment routes to the existing marker-mismatch refusal instead.
+#[test]
+fn gf1_finalize_interrupted_zero_rule_non_owner_table_comment_refused() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let policy_dir = tempfile::tempdir().unwrap();
+    let paths = isolation::runtime_paths();
+    let cfg = config(&paths, policy_dir.path());
+    let table = isolation::table();
+
+    write_preparing_journal(&cfg);
+    let script = format!(
+        "add table {CASTLE_FAMILY} {table} {{ comment \"not-ours\" ; }}\n\
+         add chain {CASTLE_FAMILY} {table} output \
+         {{ type filter hook output priority 0 ; policy drop ; }}\n"
+    );
+    assert!(nft_script(&script), "fixture setup must succeed");
+
+    let err = disarm_castle_runtime(&cfg).expect_err("a commented table must refuse");
+    assert!(nftables::table_exists().unwrap(), "must be retained: {err}");
+    assert!(cfg.journal_path.exists(), "journal must be retained: {err}");
+}
+
+// D3 case (a): a same-boot `Owned` journal record whose live table is this
+// daemon's own safety net: disarm recognises the net, deletes it by name,
+// verifies absence and clears the record, returning `SafetyNetCleared`.
+// Fail-before: on the base this case returned a refusal and retained both the
+// table and the record (register id
+// `defect.linux-disarm-cannot-clear-own-safety-net-01`).
+#[test]
+fn gf1_owned_journal_plus_this_daemons_net_clears_as_safety_net() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let policy_dir = tempfile::tempdir().unwrap();
+    let paths = isolation::runtime_paths();
+    let cfg = config(&paths, policy_dir.path());
+
+    // Any marker/handles: the safety-net branch is reached from the LIVE
+    // table's shape, never from these journal-recorded values.
+    write_owned_journal(&cfg, "any-marker-disarm-must-not-trust-yet", 1, 2);
+    nftables::install_deny_all_safety_net(&nftables::SafetyNetScope::HostWide)
+        .expect("arm the safety net");
+    assert!(nftables::live_table_is_deny_all_safety_net().unwrap());
+
+    let outcome = disarm_castle_runtime(&cfg).expect("disarm must recover the safety net");
+    assert_eq!(outcome, DisarmOutcome::SafetyNetCleared);
+    assert!(
+        !nftables::table_exists().unwrap(),
+        "disarm must leave no live table"
+    );
+    assert!(
+        !cfg.journal_path.exists(),
+        "disarm must clear the Owned record"
+    );
+}
+
+// D3 case (b): an `Owned` journal record whose live table is a genuinely
+// DIFFERENT owned wall (`policy accept`, a foreign marker and foreign handles),
+// never this daemon's safety net. The new probe this PR-2 adds must say "not the
+// net" and fall through to the UNCHANGED exact-inventory re-validation, which
+// then refuses on the handle/marker mismatch exactly as it did before this
+// change -- the existing drift behavior, not a new one.
+#[test]
+fn gf1_owned_journal_plus_drifted_accept_table_still_refuses() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let policy_dir = tempfile::tempdir().unwrap();
+    let paths = isolation::runtime_paths();
+    let cfg = config(&paths, policy_dir.path());
+
+    // The journal names a marker/handles this live table will not carry.
+    write_owned_journal(
+        &cfg,
+        &format!("{OWNER_MARKER_PREFIX}{}", "c".repeat(32)),
+        999_001,
+        999_002,
+    );
+    let live_marker = format!("{OWNER_MARKER_PREFIX}{}", "d".repeat(32));
+    nftables::create_castle_table_exclusive(&live_marker).expect("create a drifted accept table");
+    assert!(
+        !nftables::live_table_is_deny_all_safety_net().unwrap(),
+        "a policy-accept owned table is never mistaken for the safety net"
+    );
+
+    let err = disarm_castle_runtime(&cfg).expect_err("a drifted table must still refuse");
+    assert!(
+        err.to_string()
+            .contains("no longer matches the owned identity"),
+        "the existing drift refusal text must be unchanged: {err}"
+    );
+    assert!(
+        nftables::table_exists().unwrap(),
+        "the drifted table must be retained, never deleted by name"
+    );
+    assert!(
+        cfg.journal_path.exists(),
+        "the journal must be retained on a refusal"
+    );
+}
+
+// D3 case (f): a same-boot legacy `Owned` record whose `confined` key is absent
+// plus the v1 host-wide safety net: still cleared. PR-1's never-adopt rule for
+// a legacy record (D1b step 6) lives in the
+// ACQUISITION path (`journal::decide`'s callers there), not in the shared
+// `decide` function disarm also calls, so a legacy record must keep reaching
+// THIS arm and being cleared. MUST MATCH the acquisition-specific gate PR-1
+// keeps around `ReclaimDecision::ReclaimOwned` in `ownership_journal.rs` /
+// `runtime_providers.rs`'s acquisition path (memo D3): if a future change makes
+// `decide` itself divert a legacy record away from `ReclaimOwned` for every
+// caller, this test starts failing and is the tripwire for that regression.
+#[test]
+fn gf1_legacy_owned_record_plus_v1_net_still_clears() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let policy_dir = tempfile::tempdir().unwrap();
+    let paths = isolation::runtime_paths();
+    let cfg = config(&paths, policy_dir.path());
+
+    write_owned_journal_with_history(&cfg, "legacy-record-no-confined-field", 1, 2, None);
+    let key = journal::load_or_generate_auth_key(&cfg.journal_key_path).expect("journal key");
+    let record = journal::load(&cfg.journal_path, Some(&key))
+        .expect("read legacy record")
+        .expect("legacy record exists");
+    assert_eq!(record.confined(), None, "the key must remain absent");
+    assert!(
+        !String::from_utf8(std::fs::read(&cfg.journal_path).unwrap())
+            .unwrap()
+            .contains("\"confined\""),
+        "legacy fixture must omit the confined key"
+    );
+    nftables::install_deny_all_safety_net(&nftables::SafetyNetScope::HostWide)
+        .expect("arm the v1 host-wide safety net");
+    assert!(nftables::live_table_is_deny_all_safety_net().unwrap());
+
+    let outcome = disarm_castle_runtime(&cfg).expect("a legacy record must still clear");
+    assert_eq!(outcome, DisarmOutcome::SafetyNetCleared);
+    assert!(!nftables::table_exists().unwrap());
+    assert!(!cfg.journal_path.exists());
+}
+
+// D3 case (g): the probe-error branch, driven through the PRODUCTION
+// `disarm_castle_runtime` path via the `test-isolation`-only force-error
+// override (a live-nft integration test cannot make a real probe fail on
+// demand without a broken `nft` binary on the runner, so this seam exists
+// solely to drive that one branch of the real code, not a substitute for it).
+// The classifier's own branch logic is additionally unit-tested in isolation
+// by `runtime_providers::tests::reclaim_owned_arm_probe_error_refuses_
+// without_guessing`.
+#[test]
+fn gf1_reclaim_owned_probe_error_refuses_and_retains() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let policy_dir = tempfile::tempdir().unwrap();
+    let paths = isolation::runtime_paths();
+    let cfg = config(&paths, policy_dir.path());
+
+    write_owned_journal(&cfg, "reclaim-owned-probe-error-fixture", 1, 2);
+    nftables::install_deny_all_safety_net(&nftables::SafetyNetScope::HostWide)
+        .expect("arm the safety net");
+    assert!(nftables::live_table_is_deny_all_safety_net().unwrap());
+
+    // Bound, not discarded: the returned guard must outlive the disarm call it
+    // covers, and its `Drop` clears the latch afterward so a later, unrelated
+    // test's `ReclaimOwned` probe never inherits a forced failure this test
+    // armed.
+    let _forced_probe_error = force_next_reclaim_owned_probe_error_for_test();
+    let err = disarm_castle_runtime(&cfg).expect_err("a forced probe error must refuse");
+    assert!(
+        nftables::table_exists().unwrap(),
+        "the table must be retained: {err}"
+    );
+    assert!(
+        cfg.journal_path.exists(),
+        "the journal must be retained: {err}"
+    );
+}
+
+// D3 case (h), fixtures 2-4 (near-net drift THAT CARRIES A RULE): the
+// recognizer's shape acceptance is exact (rule count, order, and every rule's
+// comment), so a complete v2 three-rule table with one comment altered, the
+// same three rules plus a fourth, or only the first of the three, are ALL
+// "not the net", and disarm must fall through to the unchanged exact-inventory
+// refusal exactly as case (b) does.
+#[test]
+fn gf1_near_net_drift_with_a_rule_still_refuses() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let table = isolation::table();
+
+    // h2: the COMPLETE v2 three-rule shape (D1's exact transaction text, the
+    // same shape the (d)/(e) fixture installs), with ONLY rule 1's comment
+    // altered; rules 2 and 3 keep their correct text.
+    let wrong_rule_comment = format!(
+        "add table {CASTLE_FAMILY} {table}\n\
+         add chain {CASTLE_FAMILY} {table} output \
+         {{ type filter hook output priority 0 ; policy drop ; }}\n\
+         add rule {CASTLE_FAMILY} {table} output meta skuid {{ 60123, 60124 }} drop \
+         comment \"not-the-real-comment\"\n\
+         add rule {CASTLE_FAMILY} {table} output icmpv6 type \
+         {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit }} accept \
+         comment \"sanctuary-castle-net:v2:kernel-nd\"\n\
+         add rule {CASTLE_FAMILY} {table} output meta skuid != {{ 60123, 60124 }} accept \
+         comment \"sanctuary-castle-net:v2:other-principals\"\n"
+    );
+    // h3: the correct v2 three rules plus a FOURTH, spurious rule.
+    let extra_rule = format!(
+        "add table {CASTLE_FAMILY} {table}\n\
+         add chain {CASTLE_FAMILY} {table} output \
+         {{ type filter hook output priority 0 ; policy drop ; }}\n\
+         add rule {CASTLE_FAMILY} {table} output meta skuid {{ 60123, 60124 }} drop \
+         comment \"sanctuary-castle-net:v2:confined-identity\"\n\
+         add rule {CASTLE_FAMILY} {table} output icmpv6 type \
+         {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit }} accept \
+         comment \"sanctuary-castle-net:v2:kernel-nd\"\n\
+         add rule {CASTLE_FAMILY} {table} output meta skuid != {{ 60123, 60124 }} accept \
+         comment \"sanctuary-castle-net:v2:other-principals\"\n\
+         add rule {CASTLE_FAMILY} {table} output tcp dport 22 accept comment \"extra\"\n"
+    );
+    // h4: the one-rule shape (D1 never installs this: only zero rules or all
+    // three at once).
+    let one_rule = format!(
+        "add table {CASTLE_FAMILY} {table}\n\
+         add chain {CASTLE_FAMILY} {table} output \
+         {{ type filter hook output priority 0 ; policy drop ; }}\n\
+         add rule {CASTLE_FAMILY} {table} output meta skuid {{ 60123, 60124 }} drop \
+         comment \"sanctuary-castle-net:v2:confined-identity\"\n"
+    );
+
+    for (label, script) in [
+        ("h2 wrong rule comment", wrong_rule_comment),
+        ("h3 extra rule", extra_rule),
+        ("h4 one-rule shape", one_rule),
+    ] {
+        let policy_dir = tempfile::tempdir().unwrap();
+        let paths = isolation::runtime_paths();
+        let cfg = config(&paths, policy_dir.path());
+        write_owned_journal(&cfg, "near-net-drift-fixture", 1, 2);
+        assert!(nft_script(&script), "{label}: fixture setup must succeed");
+        assert!(
+            !nftables::live_table_is_deny_all_safety_net().unwrap(),
+            "{label}: a drifted rule shape is not this daemon's safety net"
+        );
+
+        let err = disarm_castle_runtime(&cfg).expect_err(&format!("{label}: must refuse"));
+        assert!(
+            nftables::table_exists().unwrap(),
+            "{label}: the drifted table must be retained: {err}"
+        );
+        assert!(
+            cfg.journal_path.exists(),
+            "{label}: the journal must be retained: {err}"
+        );
+
+        // Clean up so the next fixture in this loop starts from an absent table
+        // (guard() only resets state on the NEXT test's entry, and this test
+        // drives three fixtures through one guard).
+        let _ = Command::new("nft")
+            .args(["delete", "table", CASTLE_FAMILY, table])
+            .output();
+        let _ = std::fs::remove_file(&cfg.journal_path);
+    }
+}
+
+// D3 case (h), fixture 1: a zero-rule `policy drop` table that carries a table
+// comment. The disarm `ReclaimOwned` arm requires the live table's comment key
+// to be absent, read from the same inventory the recognizer parses, before it
+// treats the table as this daemon's own safety net (D1 installs the net with
+// no table comment at all); a present comment routes to the ordinary reclaim
+// path instead, which refuses and retains on this table's mismatched identity.
+#[test]
+fn gf1_h1_zero_rule_non_owner_table_comment_refused() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let policy_dir = tempfile::tempdir().unwrap();
+    let paths = isolation::runtime_paths();
+    let cfg = config(&paths, policy_dir.path());
+    let table = isolation::table();
+
+    write_owned_journal(&cfg, "near-net-drift-h1", 1, 2);
+    let script = format!(
+        "add table {CASTLE_FAMILY} {table} {{ comment \"not-ours\" ; }}\n\
+         add chain {CASTLE_FAMILY} {table} output \
+         {{ type filter hook output priority 0 ; policy drop ; }}\n"
+    );
+    assert!(nft_script(&script), "fixture setup must succeed");
+
+    let err = disarm_castle_runtime(&cfg).expect_err("a non-owner-commented table must refuse");
+    assert!(nftables::table_exists().unwrap(), "must be retained: {err}");
+    assert!(cfg.journal_path.exists(), "journal must be retained: {err}");
+}
+
+// D3(d/e): a known Owned journal and PR-1's installed three-rule identity net
+// are classified by the live shape. The authenticated history is checked as a
+// fixture precondition, then disarm's clearing outcome is checked separately.
+fn assert_owned_journal_v2_net_clears(confined_uids: &[u32], expect_journal_mismatch: bool) {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let policy_dir = tempfile::tempdir().unwrap();
+    let paths = isolation::runtime_paths();
+    let cfg = config(&paths, policy_dir.path());
+    let confined: Vec<_> = confined_uids
+        .iter()
+        .map(|&uid| journal::ConfinedIdentity {
+            uid,
+            role: journal::ConfinedRole::Agent,
+        })
+        .collect();
+    write_owned_journal_with_history(&cfg, "v2-net-known-history", 1, 2, Some(confined.clone()));
+    let key = journal::load_or_generate_auth_key(&cfg.journal_key_path).expect("journal key");
+    let record = journal::load(&cfg.journal_path, Some(&key))
+        .expect("read known history")
+        .expect("record exists");
+    assert_eq!(record.confined(), Some(confined.as_slice()));
+    let scope = identity_scope(&[60123, 60124]);
+    let recorded_uids: Vec<_> = record
+        .confined()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.uid)
+        .collect();
+    if expect_journal_mismatch {
+        assert_ne!(
+            recorded_uids,
+            scope.denied_uids(),
+            "D3(e) requires distinct known sets"
+        );
+    } else {
+        assert_eq!(recorded_uids, scope.denied_uids());
+    }
+    nftables::install_deny_all_safety_net(&scope).expect("arm the three-rule identity net");
+    assert_eq!(live_rule_comments_in_order().len(), 3);
+    assert!(nftables::live_table_is_deny_all_safety_net().unwrap());
+
+    let outcome = disarm_castle_runtime(&cfg).expect("disarm must recover the v2 safety net");
+    assert_eq!(outcome, DisarmOutcome::SafetyNetCleared);
+    assert!(!nftables::table_exists().unwrap());
+    assert!(!cfg.journal_path.exists());
+}
+
+#[test]
+fn gf1_owned_journal_plus_v2_net_clears_as_safety_net() {
+    assert_owned_journal_v2_net_clears(&[60123, 60124], false);
+}
+
+// D3(e): a present, known authenticated array differs from the live net's
+// {60123, 60124} deny set. Shape recognition, not journal-set equality, decides
+// whether this explicit disarm removes the net.
+#[test]
+fn gf1_v2_net_with_different_known_journal_array_still_clears() {
+    assert_owned_journal_v2_net_clears(&[60125], true);
 }
 
 /// The live isolated table as `nft -j` JSON, or None when absent.

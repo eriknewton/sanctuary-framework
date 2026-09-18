@@ -2146,6 +2146,16 @@ pub enum DisarmOutcome {
     /// A live owned table was deleted (handle-qualified), its absence verified,
     /// and the authenticated journal cleared afterward.
     TableDeleted,
+    /// D3 (memo v2.21): the live table was recognized as this daemon's OWN
+    /// deny-all safety net (the v1 host-wide zero-rule shape, or the v2
+    /// identity-scoped three-rule shape D2 recognises once PR-1 lands), deleted
+    /// by name, its absence verified, and the journal cleared. Named apart from
+    /// `TableDeleted` (an ordinary owned WALL, `policy accept`, deleted by
+    /// handle) and from `StaleRecordCleared` (no live table at all) so an
+    /// operator or the drill harness can tell which of the three was cleared
+    /// (open sub-decision 5). Never described as "deny-all" alone in operator
+    /// text: the v2 shape denies exactly the confined identity, not the host.
+    SafetyNetCleared,
     /// No live owned table existed (already gone / prior boot); a stale ownership
     /// record was cleared after its absence was confirmed.
     StaleRecordCleared,
@@ -2157,6 +2167,9 @@ impl std::fmt::Display for DisarmOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             DisarmOutcome::TableDeleted => "owned table deleted and journal cleared",
+            DisarmOutcome::SafetyNetCleared => {
+                "this daemon's safety net deleted and journal cleared"
+            }
             DisarmOutcome::StaleRecordCleared => "no live table; stale ownership record cleared",
             DisarmOutcome::NothingToDisarm => "nothing to disarm (no owned table, no journal)",
         })
@@ -2169,38 +2182,204 @@ impl std::fmt::Display for DisarmOutcome {
 /// does (blocker 1). It is invoked by the unmistakable `--disarm` CLI action, NOT
 /// by SIGTERM/systemd stop.
 ///
-/// Safety contract (blockers 2, 6):
-/// * Runs UNDER the host ownership lock — a still-running daemon holds the lock,
-///   so disarm refuses (`AlreadyHeld`) rather than racing a live owner.
-/// * Deletes ONLY an object the AUTHENTICATED journal proves is ours for THIS
-///   boot/source; a foreign table (no proof, drifted identity, wrong boot) is
-///   REFUSED and left intact, never clobbered by name.
+/// Safety contract (blockers 2, 6) splits by which live object the
+/// authenticated journal's proof resolves to (D3: a same-boot `Owned` record
+/// can resolve to either):
+///
+/// ORDINARY-OWNED ARM (the journal's own owned wall):
 /// * Re-validates the EXACT complete inventory (handles + marker + pristine
-///   shape) IMMEDIATELY before deletion, deletes by the narrowest handle-qualified
-///   operation nft supports, and verifies ABSENCE immediately after.
+///   shape) IMMEDIATELY before deletion, deletes by the narrowest
+///   handle-qualified operation nft supports, and verifies ABSENCE
+///   immediately after.
+///
+/// SAFETY-NET ARM (D3: the live table is this daemon's own safety net, not the
+/// journal's owned wall): the net carries no per-agent handles to
+/// re-validate, so this arm instead requires a positive recogniser answer
+/// AND an independent check that the live table's comment key is absent, both
+/// read from one inventory fetch, before it deletes by name and verifies
+/// ABSENCE immediately after exactly as the ordinary arm does. See the
+/// `ReclaimOwned` arm's invariant comment and [`disarm_recover_deny_all_net`]
+/// for this arm's own TOCTOU bound.
+///
+/// BOTH ARMS:
+/// * Run UNDER the host ownership lock: a still-running daemon holds the lock,
+///   so disarm refuses (`AlreadyHeld`) rather than racing a live owner.
+/// * Require an AUTHENTICATED journal record for THIS boot/source before any
+///   delete. The ordinary-owned arm then deletes only the exact object the
+///   record proves (handle-qualified); the safety-net arm deletes by NAME after
+///   the shape probe and the absent-comment check, under the replace-between-
+///   probe-and-delete bound stated at its site. A foreign table (no record,
+///   drifted identity, wrong boot) is REFUSED and left intact on both arms.
 /// * The journal is cleared ONLY after deletion AND post-delete absence are both
-///   positively confirmed. On ANY ambiguity — corrupt/unauthenticated proof,
-///   identity drift, a delete error, or an absence-verification failure — the
+///   positively confirmed. On ANY ambiguity (corrupt/unauthenticated proof,
+///   identity drift, a delete error, or an absence-verification failure), the
 ///   journal is RETAINED and the call fails.
 ///
-/// Threat-boundary honesty: nftables offers no atomic compare-and-delete, so the
-/// verify→delete→verify sequence is a best-effort TOCTOU narrowing, not an atomic
-/// guarantee. A concurrent privileged host writer that swaps the table between the
-/// pre-delete revalidation and the handle delete could still be raced; deleting by
-/// the captured HANDLE (not by name) bounds the damage — a stale handle either no
-/// longer resolves (nft errors, we retain and fail) or resolves to a different
-/// object we already refused. This is the honest limit of what nft permits and is
-/// documented, not claimed away.
+/// Threat-boundary honesty (ORDINARY-OWNED ARM): nftables offers no atomic
+/// compare-and-delete, so the verify→delete→verify sequence is a best-effort
+/// TOCTOU narrowing, not an atomic guarantee. A concurrent privileged host writer
+/// that swaps the table between the pre-delete revalidation and the handle
+/// delete could still be raced; deleting by the captured HANDLE (not by name)
+/// bounds the damage: a stale handle either no longer resolves (nft errors, we
+/// retain and fail) or resolves to a different object we already refused. This
+/// is the honest limit of what nft permits and is documented, not claimed away.
+/// The SAFETY-NET ARM's own TOCTOU bound is different (a by-name delete, since
+/// the net carries no handles to qualify against) and is stated where that arm
+/// is implemented, not here.
 ///
-/// GF1.1 disarm-path recovery: the live table has been positively recognized as
-/// this daemon's own deny-all safety net for an interrupted (Preparing)
-/// acquisition (the create-failure wedge). Delete it by name, confirm absence,
-/// and clear the interrupted record. This is explicit teardown, so deny-all ->
-/// nothing is the intended outcome; on any ambiguity the record is RETAINED. Does
-/// NOT touch the host lock — the caller owns its lifetime and drops it after.
+/// D3 fix round: what a disarm recovery probe reads off ONE live inventory
+/// fetch. Two independent facts, BOTH required before EITHER of disarm's two
+/// recovery sites (the `ReclaimOwned` arm and the `FinalizeInterrupted` arm's
+/// capture-failure branch) treats the live table as this daemon's own safety
+/// net: the recogniser's own shape verdict
+/// ([`crate::nftables::is_deny_all_safety_net_json`], unchanged here) and an
+/// independent check that the same inventory's table object carries no
+/// comment key at all ([`crate::nftables::castle_table_comment_is_absent`]).
+/// Named fields, not a bare tuple, so a future caller cannot transpose the two
+/// booleans by accident. This is the ONE shared requirement named at both
+/// call sites below; it must read identically at each (pin comment on both
+/// arms).
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SafetyNetRecoveryProbeReading {
+    recognised_as_safety_net: bool,
+    table_comment_absent: bool,
+}
+
+/// Both disarm recovery arms classify one inventory with the same host-specific
+/// uid boundary. An unreadable overflow uid or vanished table is a probe error,
+/// never evidence that a live table belongs to this daemon.
+#[cfg(target_os = "linux")]
+fn read_safety_net_recovery_probe(
+) -> Result<SafetyNetRecoveryProbeReading, crate::nftables::NftablesError> {
+    let overflow = crate::safety_net_uid::HostOverflowUid::from_host().map_err(|err| {
+        crate::nftables::NftablesError::InvocationFailed(format!(
+            "cannot classify the live table without this host's configured kernel.overflowuid: {err}"
+        ))
+    })?;
+    let json = crate::nftables::live_castle_table_json()?;
+    Ok(SafetyNetRecoveryProbeReading {
+        recognised_as_safety_net: crate::nftables::is_deny_all_safety_net_json(&json, overflow),
+        table_comment_absent: crate::nftables::castle_table_comment_is_absent(&json),
+    })
+}
+
+/// D3 (memo v2.21, fix round): outcome of probing whether a disarm recovery
+/// site's live table is actually this daemon's own safety net rather than the
+/// object the journal state otherwise implies. Named states (not a bare
+/// bool/Result) because the probe-failure branch is a THIRD outcome, not a
+/// degenerate case of the other two: it refuses and retains rather than
+/// guessing either way. Shared by both the `ReclaimOwned` arm and the
+/// `FinalizeInterrupted` arm's capture-failure branch.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum SafetyNetRecoveryDecision {
+    /// The live table is this daemon's own safety net: recover it (delete,
+    /// confirm absence, clear the journal). Requires BOTH fields of
+    /// [`SafetyNetRecoveryProbeReading`] to hold; either alone is
+    /// `NotSafetyNet`.
+    RecoverSafetyNet,
+    /// Not the safety net: the caller's own existing refusal (`ReclaimOwned`'s
+    /// ordinary exact-inventory reclaim, or `FinalizeInterrupted`'s
+    /// marker-mismatch refusal) applies instead.
+    NotSafetyNet,
+    /// The probe itself failed: refuse and retain (never guess which branch
+    /// applies).
+    ProbeFailed(String),
+}
+
+/// D3: the ONE piece of disarm's recovery-site decisions that is pure and
+/// unit-testable without a real kernel, since everything else in
+/// `disarm_castle_runtime` needs an authenticated on-disk journal, the host
+/// lock, and a live nft table, so the rest of the proof is integration
+/// (packet: "the decision logic is not mockable without nft except through
+/// one narrow injected-closure seam for the recogniser probe"). `probe` reads
+/// the live inventory once and reports both fields of
+/// [`SafetyNetRecoveryProbeReading`]; production builds it from one
+/// `crate::nftables::live_castle_table_json` fetch at each call site (the
+/// `ReclaimOwned` arm and the `FinalizeInterrupted` arm below), and a unit
+/// test injects a closure returning `Err(..)`, or an arbitrary reading, to
+/// prove every branch without touching nft.
+#[cfg(any(target_os = "linux", test))]
+fn classify_safety_net_recovery_probe(
+    probe: impl FnOnce() -> Result<SafetyNetRecoveryProbeReading, crate::nftables::NftablesError>,
+) -> SafetyNetRecoveryDecision {
+    match probe() {
+        Ok(reading) if reading.recognised_as_safety_net && reading.table_comment_absent => {
+            SafetyNetRecoveryDecision::RecoverSafetyNet
+        }
+        Ok(_) => SafetyNetRecoveryDecision::NotSafetyNet,
+        Err(probe_err) => SafetyNetRecoveryDecision::ProbeFailed(probe_err.to_string()),
+    }
+}
+
+/// D3 fix round (packet item 3): test-only override for the `ReclaimOwned`
+/// arm's probe, so the Linux integration suite can drive the PRODUCTION
+/// `disarm_castle_runtime` path through the probe-error branch. Absent from a
+/// normal build (compiled only under `test-isolation`); the production call
+/// site is unchanged when this feature is off. The call site consumes it
+/// (resets to `false`) ONLY when that exact probe call is reached; a test that
+/// arms it and then exits early (an earlier assertion fails, a fixture setup
+/// step errors, or the disarm call takes a different arm than expected) would
+/// otherwise leave it set for whatever LATER, unrelated test's `ReclaimOwned`
+/// probe runs next. [`ForcedReclaimOwnedProbeError`] closes that gap: it is
+/// the only way to arm the latch, and its `Drop` clears it unconditionally, so
+/// the guarantee is scoped to one test's lifetime, never to "the call site
+/// happened to be reached." Mirrors
+/// `crate::nftables::reset_runtime_ownership_for_tests`'s test-only latch
+/// convention, with an RAII clear in place of a manual one.
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+static RECLAIM_OWNED_PROBE_FORCE_ERROR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII handle for the override above. Construct with
+/// [`force_next_reclaim_owned_probe_error_for_test`] and bind it to a variable
+/// that lives for the rest of the test; the latch clears when that variable
+/// drops, whether the test returns normally, returns early, or panics.
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub struct ForcedReclaimOwnedProbeError {
+    _private: (),
+}
+
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+impl Drop for ForcedReclaimOwnedProbeError {
+    fn drop(&mut self) {
+        RECLAIM_OWNED_PROBE_FORCE_ERROR.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Arm the override above for exactly the next `ReclaimOwned`-arm probe call.
+/// Returns a guard that clears the latch on drop; a test must bind it (not
+/// `let _ = ...`, which would drop it immediately and clear the latch before
+/// the disarm call it is meant to cover).
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub fn force_next_reclaim_owned_probe_error_for_test() -> ForcedReclaimOwnedProbeError {
+    RECLAIM_OWNED_PROBE_FORCE_ERROR.store(true, std::sync::atomic::Ordering::SeqCst);
+    ForcedReclaimOwnedProbeError { _private: () }
+}
+
+/// GF1.1 / D3 disarm-path recovery: the live table has been positively
+/// recognized as this daemon's own safety net (v1 host-wide or v2
+/// identity-scoped shape; never "deny-all" alone, since the v2 shape denies
+/// exactly the confined identity, not the host). Delete it by name, confirm
+/// absence, and clear the journal record. This is explicit teardown, so
+/// safety-net -> nothing is the intended outcome; on any ambiguity the record
+/// is RETAINED. Does NOT touch the host lock: the caller owns its lifetime and
+/// drops it after.
+///
+/// Two callers, two different calling states: `FinalizeInterrupted` (a
+/// `Preparing` record, the create-failure wedge, GF1.1) and `ReclaimOwned` (a
+/// same-boot `Owned` record whose live table turned out to be the safety net
+/// rather than the ordinary owned wall the record names, D3). `calling_state` is
+/// a short label for the journal state disarm found, so every message this
+/// helper produces says what it recovered FROM rather than assuming the
+/// Preparing case (the doc comment and error texts here used to say
+/// "an interrupted acquisition" unconditionally, which was false when this
+/// helper started being reachable from `Owned` too).
 #[cfg(target_os = "linux")]
 fn disarm_recover_deny_all_net(
     journal_path: &std::path::Path,
+    calling_state: &str,
 ) -> Result<DisarmOutcome, EnforcementError> {
     let disarm_failed = |detail: String| EnforcementError::AcquireFailed {
         kind: ComponentKind::NftablesTable.as_str(),
@@ -2208,32 +2387,32 @@ fn disarm_recover_deny_all_net(
     };
     crate::nftables::force_delete_castle_table_by_name().map_err(|del_err| {
         disarm_failed(format!(
-            "recognized this daemon's deny-all net for an interrupted acquisition but deleting it \
+            "recognized this daemon's safety net for {calling_state} but deleting it \
              failed; retaining the record: {del_err}"
         ))
     })?;
     match crate::nftables::table_exists() {
         Ok(false) => {}
         Ok(true) => {
-            return Err(disarm_failed(
-                "deny-all net still present after a by-name delete; retaining the record"
-                    .to_string(),
-            ))
+            return Err(disarm_failed(format!(
+                "safety net still present after a by-name delete for {calling_state}; \
+                 retaining the record"
+            )))
         }
         Err(exists_err) => {
             return Err(disarm_failed(format!(
-                "could not verify deny-all net absence after delete; retaining the record: \
-                 {exists_err}"
+                "could not verify safety net absence after delete for {calling_state}; \
+                 retaining the record: {exists_err}"
             )))
         }
     }
     crate::ownership_journal::clear(journal_path).map_err(|clear_err| {
         disarm_failed(format!(
-            "deleted the deny-all net but clearing the interrupted ownership record failed: \
-             {clear_err}"
+            "deleted the safety net for {calling_state} but clearing the ownership \
+             record failed: {clear_err}"
         ))
     })?;
-    Ok(DisarmOutcome::StaleRecordCleared)
+    Ok(DisarmOutcome::SafetyNetCleared)
 }
 
 pub fn disarm_castle_runtime(
@@ -2250,11 +2429,16 @@ pub fn disarm_castle_runtime(
         };
 
         // 1) Take the host lock. A live daemon holds it -> refuse (do not race).
+        // Repair-order text (memo D2's refusal convention, packet item 4): a bare
+        // "stop it" leaves an operator guessing at systemd's restart behavior; a
+        // still-running unit re-takes this same lock on its next restart, so a
+        // disarm retry without stopping the unit first just refuses again.
         let lock =
             crate::runtime_lock::HostRuntimeLock::acquire(&config.lock_path).map_err(|err| {
                 disarm_failed(format!(
-                    "cannot take the host ownership lock to disarm (is the daemon still \
-                     running? stop it first): {err}"
+                    "cannot take the host ownership lock to disarm; stop the castle-wall unit \
+                     first (systemd would otherwise restart it and re-take this same lock), \
+                     then run disarm: {err}"
                 ))
             })?;
 
@@ -2316,16 +2500,83 @@ pub fn disarm_castle_runtime(
                             .to_string(),
                     ));
                 }
-                // Our Owned table for this boot: the exact identity to delete.
+                // Our Owned table for this boot: normally the exact identity to
+                // delete, UNLESS the live table is actually this daemon's own
+                // safety net (D3): a runtime-loss or boot-drift recovery (memo
+                // D1b step 7) can install the safety net over what the journal
+                // still calls an `Owned` (steady-state) record, and the safety
+                // net's shape (drop policy, no per-agent jump) is NOT the
+                // owned-wall shape `verify_owned_castle_table` below expects, so
+                // without this check step 5 would refuse it as "drifted" and
+                // disarm would wedge exactly on the case it exists to recover.
+                // D1b's never-adopt rule for a same-boot LEGACY `Owned` record
+                // (the `confined` key absent, PR-1) is ACQUISITION-specific and
+                // must not reroute disarm away from this arm: a legacy record
+                // with a live recognised net still reaches here and is cleared
+                // (must match the acquisition-specific gate PR-1 adds around
+                // `ReclaimDecision::ReclaimOwned` in `ownership_journal.rs`,
+                // memo D3, PR-2 packet item 3 test case (f)).
+                //
+                // PIN (shared requirement, both arms; must match the identical
+                // requirement at the `FinalizeInterrupted` arm below): the
+                // recovery branch requires THREE things at once, all read
+                // fresh at this call site: a positive recogniser answer over
+                // the live inventory, that SAME inventory's table object
+                // carrying no comment key at all (D1 installs the net with no
+                // table comment; a comment of any content means `NotSafetyNet`
+                // instead, which here falls through to the ordinary reclaim,
+                // re-validating the exact inventory on its own terms and
+                // refusing on any mismatch it finds), and the authenticated
+                // this-boot `Owned` journal already established above. A
+                // by-name delete (inside `disarm_recover_deny_all_net`) is not
+                // atomic with the read that authorized it: another
+                // `CAP_NET_ADMIN` holder could replace the table in between,
+                // and the delete then removes whatever holds the name at that
+                // moment. That is the accepted TOCTOU bound nft's tooling
+                // permits (memo D3); this path never claims it deletes only
+                // what this daemon armed.
                 ReclaimDecision::ReclaimOwned {
                     table_handle,
                     base_chain_handle,
                     marker,
-                } => CastleTableOwnership {
-                    table_handle,
-                    base_chain_handle,
-                    marker,
-                },
+                } => {
+                    let probe =
+                    || -> Result<SafetyNetRecoveryProbeReading, crate::nftables::NftablesError> {
+                        #[cfg(all(target_os = "linux", feature = "test-isolation"))]
+                        if RECLAIM_OWNED_PROBE_FORCE_ERROR
+                            .swap(false, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            return Err(crate::nftables::NftablesError::InvocationFailed(
+                                "test-isolation: reclaim-owned probe forced to fail".to_string(),
+                            ));
+                        }
+                        read_safety_net_recovery_probe()
+                    };
+                    match classify_safety_net_recovery_probe(probe) {
+                        SafetyNetRecoveryDecision::RecoverSafetyNet => {
+                            let outcome = disarm_recover_deny_all_net(
+                                journal_path,
+                                "a same-boot Owned journal record whose live table is this \
+                                 daemon's safety net",
+                            );
+                            drop(lock);
+                            return outcome;
+                        }
+                        SafetyNetRecoveryDecision::NotSafetyNet => CastleTableOwnership {
+                            table_handle,
+                            base_chain_handle,
+                            marker,
+                        },
+                        SafetyNetRecoveryDecision::ProbeFailed(probe_err) => {
+                            drop(lock);
+                            return Err(disarm_failed(format!(
+                                "could not determine whether the live table is this daemon's \
+                                 safety net; refusing to delete (retaining the journal): \
+                                 {probe_err}"
+                            )));
+                        }
+                    }
+                }
                 // An interrupted (Preparing) acquisition with a live table: capture
                 // the live handles by marker. A marker mismatch (foreign) or nft
                 // error -> refuse + RETAIN.
@@ -2334,34 +2585,57 @@ pub fn disarm_castle_runtime(
                         Ok(o) => o,
                         // GF1.1 create-failure recovery on the DISARM path. The journal
                         // is Preparing for this boot but the live table is not a
-                        // capturable owned table. If it is this daemon's OWN deny-all net
-                        // (the create-failed-then-ReArmLostOwned wedge state), disarm can
-                        // clean it up (delete by name, confirm absence, clear the record)
-                        // since this is explicit teardown; otherwise refuse + RETAIN.
-                        // Without this, --disarm was wedged exactly like acquire.
-                        Err(err) => match crate::nftables::live_table_is_deny_all_safety_net() {
-                            Ok(true) => {
-                                let outcome = disarm_recover_deny_all_net(journal_path);
-                                drop(lock);
-                                return outcome;
+                        // capturable owned table. If it is this daemon's OWN safety
+                        // net (the create-failed-then-ReArmLostOwned wedge state),
+                        // disarm can clean it up (delete by name, confirm absence,
+                        // clear the record) since this is explicit teardown;
+                        // otherwise refuse + RETAIN. Without this, --disarm was
+                        // wedged exactly like acquire.
+                        //
+                        // PIN (shared requirement, both arms; must match the
+                        // identical requirement at the `ReclaimOwned` arm above):
+                        // the recovery branch requires the SAME two facts from ONE
+                        // inventory fetch, a positive recogniser answer AND that
+                        // inventory's table object carrying no comment key at all;
+                        // either alone is `NotSafetyNet`, which here takes the
+                        // existing marker-mismatch refusal below rather than a
+                        // further reclaim step (there is none once capture has
+                        // already failed).
+                        Err(err) => {
+                            let probe = || -> Result<
+                                SafetyNetRecoveryProbeReading,
+                                crate::nftables::NftablesError,
+                            > {
+                                read_safety_net_recovery_probe()
+                            };
+                            match classify_safety_net_recovery_probe(probe) {
+                                SafetyNetRecoveryDecision::RecoverSafetyNet => {
+                                    let outcome = disarm_recover_deny_all_net(
+                                        journal_path,
+                                        "an interrupted acquisition (Preparing)",
+                                    );
+                                    drop(lock);
+                                    return outcome;
+                                }
+                                SafetyNetRecoveryDecision::NotSafetyNet => {
+                                    drop(lock);
+                                    return Err(disarm_failed(format!(
+                                        "an interrupted acquisition's marker does not match \
+                                         the live table and it is not this daemon's safety \
+                                         net; refusing to delete (retaining the record): {err}"
+                                    )));
+                                }
+                                SafetyNetRecoveryDecision::ProbeFailed(probe_err) => {
+                                    drop(lock);
+                                    return Err(disarm_failed(format!(
+                                        "an interrupted acquisition could not be captured \
+                                         ({err}) and the safety-net recovery probe failed \
+                                         ({probe_err}); refusing without clobbering \
+                                         (retaining the record)"
+                                    )));
+                                }
                             }
-                            Ok(false) => {
-                                drop(lock);
-                                return Err(disarm_failed(format!(
-                                    "an interrupted acquisition's marker does not match the live \
-                                 table and it is not this daemon's deny-all net; refusing to \
-                                 delete (retaining the record): {err}"
-                                )));
-                            }
-                            Err(probe_err) => {
-                                drop(lock);
-                                return Err(disarm_failed(format!(
-                                "an interrupted acquisition could not be captured ({err}) and the \
-                                 deny-all-net recovery probe failed ({probe_err}); refusing \
-                                 without clobbering (retaining the record)"
-                            )));
-                            }
-                        },
+                        }
                     }
                 }
             };
@@ -4139,6 +4413,61 @@ mod tests {
         let err = disarm_castle_runtime(&test_config())
             .expect_err("disarm has no kernel adapter off Linux");
         assert!(matches!(err, EnforcementError::NotAvailableOnPlatform(_)));
+    }
+
+    // D3: the shared classifier both disarm recovery sites (`ReclaimOwned` and
+    // `FinalizeInterrupted`) call. `RecoverSafetyNet` requires BOTH fields of
+    // the reading; either alone, or a probe error, is exercised here at the
+    // pure-function level. The production wiring (one live inventory fetch
+    // feeding both the recogniser and the comment-absence check) is exercised
+    // end-to-end by the real-nft integration suite
+    // (tests/integration_gf1_recovery.rs, cases (a)-(f), (h)); the
+    // `ReclaimOwned` arm's probe-error branch is ALSO driven through the
+    // production path there (case (g), via the test-isolation-only
+    // force-error override), since a live-nft integration test cannot make a
+    // real probe fail on demand without a broken `nft` binary on the runner.
+    #[test]
+    fn safety_net_recovery_probe_error_refuses_without_guessing() {
+        use crate::nftables::NftablesError;
+
+        assert_eq!(
+            classify_safety_net_recovery_probe(|| Ok(SafetyNetRecoveryProbeReading {
+                recognised_as_safety_net: true,
+                table_comment_absent: true,
+            })),
+            SafetyNetRecoveryDecision::RecoverSafetyNet
+        );
+        assert_eq!(
+            classify_safety_net_recovery_probe(|| Ok(SafetyNetRecoveryProbeReading {
+                recognised_as_safety_net: true,
+                table_comment_absent: false,
+            })),
+            SafetyNetRecoveryDecision::NotSafetyNet,
+            "a positive recognizer answer alone must not be enough without an \
+             absent table comment"
+        );
+        assert_eq!(
+            classify_safety_net_recovery_probe(|| Ok(SafetyNetRecoveryProbeReading {
+                recognised_as_safety_net: false,
+                table_comment_absent: true,
+            })),
+            SafetyNetRecoveryDecision::NotSafetyNet,
+            "an absent table comment alone must not be enough without a \
+             positive recognizer answer"
+        );
+        match classify_safety_net_recovery_probe(|| {
+            Err(NftablesError::InvocationFailed(
+                "injected probe failure".to_string(),
+            ))
+        }) {
+            SafetyNetRecoveryDecision::ProbeFailed(detail) => {
+                assert!(
+                    detail.contains("injected probe failure"),
+                    "the probe error must reach the refusal text: {detail}"
+                );
+            }
+            other => panic!("expected ProbeFailed, got {other:?}"),
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
