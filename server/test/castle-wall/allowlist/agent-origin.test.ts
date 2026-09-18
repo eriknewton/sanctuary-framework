@@ -321,19 +321,88 @@ describe("castle-wall/allowlist/agent-origin : validateAgentOrigin", () => {
 
   const UINT32_MAX = 0xffffffff;
 
-  it("accepts agent_uid + gate_uid at exactly UInt32.max (boundary)", () => {
-    const out = validateAgentOrigin({
+  // `UInt32.max` is the invalid-uid sentinel: it names no principal, so a Linux
+  // consumer cannot attest a socket to it and will not seal it into a kernel rule.
+  // The publisher therefore refuses to mint a descriptor carrying it. The wire-range
+  // cap is proven separately, by the "above UInt32.max" case below.
+  it("rejects agent_uid and gate_uid at exactly UInt32.max (the invalid-uid sentinel)", () => {
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: UINT32_MAX,
+        gate_uid: UINT32_MAX - 1,
+        system_uid_allow_ceiling: 500,
+      })
+    ).toBeNull();
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: UINT32_MAX - 1,
+        gate_uid: UINT32_MAX,
+        system_uid_allow_ceiling: 500,
+      })
+    ).toBeNull();
+    // A uid just below the sentinel is an ordinary mapped uid and stays accepted,
+    // so the refusal is the sentinel itself and not a new ceiling.
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: UINT32_MAX - 1,
+        gate_uid: UINT32_MAX - 2,
+        system_uid_allow_ceiling: 500,
+      })
+    ).toEqual({
       mode: "uid",
-      agent_uid: UINT32_MAX,
-      gate_uid: UINT32_MAX - 1,
+      agent_uid: UINT32_MAX - 1,
+      gate_uid: UINT32_MAX - 2,
       system_uid_allow_ceiling: 500,
     });
-    expect(out).toEqual({
-      mode: "uid",
-      agent_uid: UINT32_MAX,
-      gate_uid: UINT32_MAX - 1,
-      system_uid_allow_ceiling: 500,
-    });
+  });
+
+  it("rejects the conventional kernel.overflowuid in agent_uid or gate_uid", () => {
+    // 65534 is what Linux renders for every credential the reading namespace
+    // cannot map, so a rule naming it denies an unbounded unknown set rather than
+    // one identity. The daemon refuses its OWN host's configured value; the
+    // publisher has no host to read and refuses the conventional one.
+    const CONVENTIONAL_OVERFLOW_UID = 65534;
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: CONVENTIONAL_OVERFLOW_UID,
+        system_uid_allow_ceiling: 500,
+      })
+    ).toBeNull();
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: 60123,
+        gate_uid: CONVENTIONAL_OVERFLOW_UID,
+        system_uid_allow_ceiling: 500,
+      })
+    ).toBeNull();
+  });
+
+  it("keeps the mapped uids either side of the overflow value admitted", () => {
+    // The refusal is the one value, not a band: 65533 and 65535 are ordinary
+    // mapped, attestable uids and a manifest may bind them.
+    for (const [agent, gate] of [
+      [65533, 65535],
+      [65535, 100000],
+    ]) {
+      expect(
+        validateAgentOrigin({
+          mode: "uid",
+          agent_uid: agent,
+          gate_uid: gate,
+          system_uid_allow_ceiling: 500,
+        })
+      ).toEqual({
+        mode: "uid",
+        agent_uid: agent,
+        gate_uid: gate,
+        system_uid_allow_ceiling: 500,
+      });
+    }
   });
 
   it("rejects agent_uid above UInt32.max (would fail the sysext UInt32 decode)", () => {

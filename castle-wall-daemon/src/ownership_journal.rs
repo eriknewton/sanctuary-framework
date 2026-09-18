@@ -93,15 +93,61 @@ pub const AUTH_KEY_LEN: usize = 32;
 /// the key file, of which there are none) from ever validating here.
 const MAC_DOMAIN: &[u8] = b"sanctuary.castle-wall.nft-ownership-journal.v1\n";
 
-/// Upper bound on the on-disk authenticated envelope size. The envelope is a tiny
-/// fixed-shape JSON object (base64 record + hex MAC + scheme tag); a file larger
-/// than this is malformed/hostile and is rejected before any parse, bounding the
-/// work an attacker who can write the StateDirectory could force.
-const MAX_ENVELOPE_BYTES: u64 = 8 * 1024;
+/// Upper bound on the on-disk authenticated envelope size.
+///
+/// DERIVATION from [`MAX_RECORD_BYTES`], not a chosen round number: the record is
+/// base64'd, so `4 * ceil(4096 / 3)` = 5464 bytes, plus the fixed envelope keys
+/// and punctuation (`mac_scheme`, `record_b64`, `mac_hex` with their quotes and
+/// commas, about 60 bytes), the 14-byte scheme tag and the 64-character hex MAC:
+/// 5602 bytes. Rounded up to 16 KiB so a future envelope field does not need a
+/// coordinated bound change, and a file larger than this is malformed or hostile
+/// and is rejected before any parse, bounding the work an attacker who can write
+/// the StateDirectory could force.
+const MAX_ENVELOPE_BYTES: u64 = 16 * 1024;
 
 /// Upper bound on the decoded record bytes (the canonical `OwnershipJournal`
-/// JSON). The record is a handful of short fields; anything larger is malformed.
-const MAX_RECORD_BYTES: usize = 2 * 1024;
+/// JSON).
+///
+/// DERIVATION over BOUNDED fields, so JSON serialisation cannot expand past it:
+/// the boot id is at most [`MAX_BOOT_ID_BYTES`] of hex and hyphens, the source is
+/// at most [`MAX_SOURCE_BYTES`] of printable ASCII with no quote or backslash (so
+/// no character escapes to two bytes), the marker is
+/// `OWNER_MARKER_PREFIX` (26) plus a 32-character hex nonce = 58 bytes, the two
+/// handles and the schema version are at most 20, 20 and 10 decimal digits, and
+/// the confined array is [`MAX_CONFINED_HISTORY`] entries of
+/// `{"uid":4294967295,"role":"agent"}` (33 bytes) plus 15 commas and 2 brackets =
+/// 545 bytes. With every fixed key, quote, colon and comma (about 150 bytes) the
+/// worst case is 512 + 64 + 58 + 50 + 545 + 150 = 1379 bytes. Rounded up to 4 KiB
+/// for headroom; `record_worst_case_fits_the_byte_bound` serialises the maximal
+/// record and asserts it, so the derivation is checked and not just asserted.
+const MAX_RECORD_BYTES: usize = 4 * 1024;
+
+/// Largest confined-uid history one boot's journal record may carry.
+///
+/// DERIVATION: a signed manifest names at most one agent uid and one gate uid, so
+/// 16 entries is 8 admitted identities within a single boot with no disarm. More
+/// than seven identity rotations in one boot is not an operating shape this daemon
+/// supports. A binding that would push the array past the cap is REFUSED, never
+/// truncated: a truncated history silently drops a uid whose processes may still
+/// be alive, which is the exact fail-open the array exists to close.
+/// Must match `DENY_SET_MAX` in `crate::nftables`, which bounds the LIVE deny set
+/// (a wider bound, because it also unions the live table's own bindings).
+pub const MAX_CONFINED_HISTORY: usize = 16;
+
+/// Longest accepted boot id, in bytes. A Linux `boot_id` is a formatted UUID (32
+/// hex digits plus 4 hyphens = 36), and the non-Linux sentinel is shorter; 64
+/// leaves room for a longer future form while keeping [`MAX_RECORD_BYTES`]
+/// derivable. A longer value is REFUSED at read and at store, never truncated,
+/// because a truncated boot id could collide with another boot's prefix and let a
+/// prior-boot record authorise a reclaim.
+const MAX_BOOT_ID_BYTES: usize = 64;
+
+/// Longest accepted source (the daemon binary path), in bytes. `PATH_MAX` on
+/// Linux is 4096, but a daemon installed deeper than 512 bytes is not an
+/// operating shape and the bound keeps [`MAX_RECORD_BYTES`] derivable. A longer
+/// path is REFUSED rather than truncated: two binaries sharing a 512-byte prefix
+/// would otherwise authorise each other's reclaim.
+const MAX_SOURCE_BYTES: usize = 512;
 
 /// The MAC scheme tag stamped in the envelope so a future scheme change is
 /// explicit rather than a silent reinterpretation of the tag bytes.
@@ -157,6 +203,15 @@ pub enum OwnershipJournalError {
     /// would let a prior-boot record masquerade as current.
     #[error("could not read a valid Linux boot id at {path}: {reason}")]
     BootId { path: PathBuf, reason: String },
+    /// A binding would push this boot's confined history past its cap. REFUSED,
+    /// never truncated: the repair is the disarm verb, which clears the journal so
+    /// the next acquisition starts a fresh history.
+    #[error(
+        "this boot's confined identity history is full ({count} entries, cap {cap}); \
+         the array is never truncated because a dropped uid would stop being denied. \
+         Stop the castle-wall unit, then run the disarm verb to clear the journal"
+    )]
+    ConfinedHistoryFull { count: usize, cap: usize },
 }
 
 /// The identity fields every journal record carries. All must match on restart
@@ -201,7 +256,57 @@ pub enum OwnershipJournal {
         identity: JournalIdentity,
         table_handle: u64,
         base_chain_handle: u64,
+        /// The confined identities this daemon has admitted during THIS boot,
+        /// written ahead of every kernel binding, and covered by the record MAC
+        /// exactly as every other field is.
+        ///
+        /// THREE STATES, and the distinction between the first two is
+        /// essential, which is why this is an `Option` and never a bare `Vec`
+        /// with a serde default:
+        ///
+        ///   * `None` (the key ABSENT on disk) means UNKNOWN HISTORY: the record
+        ///     was written by a binary that predates this field, so neither the
+        ///     manifest nor the live table can prove which uids were bound during
+        ///     this boot. The safety net for such a record is host-wide.
+        ///   * `Some(vec![])` means KNOWN-EMPTY: this binary wrote the record and
+        ///     no identity had been bound yet.
+        ///   * `Some(non-empty)` is the known history.
+        ///
+        /// A bare `Vec` with `#[serde(default)]` would read an ABSENT key as
+        /// known-empty, which would narrow the net over a previous binary's record
+        /// and let a rotated-away uid out. `skip_serializing_if` keeps `None` off
+        /// the disk entirely (the key is omitted, never written as `null`), while a
+        /// `Some(vec![])` IS written as `[]` because the skip never applies to a
+        /// `Some`. An explicit `null` on disk also reads back as `None`.
+        /// `confined_serialisation_keeps_absent_null_and_empty_distinct` pins all
+        /// three forms at the byte level.
+        ///
+        /// Only ADMITTED identities ever enter this array (write-ahead from the
+        /// manifest side). A uid observed only on the live kernel table informs the
+        /// DENY set and never this record, because a `CAP_NET_ADMIN` actor can
+        /// write a table but not a MAC-covered journal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confined: Option<Vec<ConfinedIdentity>>,
     },
+}
+
+/// Which confined principal a journal uid entry names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfinedRole {
+    /// The manifest's `agent_uid`.
+    Agent,
+    /// The manifest's optional, distinct `gate_uid`.
+    Gate,
+}
+
+/// One admitted confined identity, as the journal records it.
+/// Must match the `confined` array element shape in `D1b` step 1 of
+/// `Review/Sanctuary/Linux_Safety_Net_Carveout_Design_2026-09-17.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfinedIdentity {
+    pub uid: u32,
+    pub role: ConfinedRole,
 }
 
 impl OwnershipJournal {
@@ -211,6 +316,229 @@ impl OwnershipJournal {
             OwnershipJournal::Owned { identity, .. } => identity,
         }
     }
+
+    /// This boot's recorded confined history, or `None` for UNKNOWN HISTORY.
+    ///
+    /// A `Preparing` record carries no array at all and answers `None`, which is
+    /// correct for a different reason than a legacy `Owned` record does: no
+    /// binding has preceded it, so the caller resolves from the admitted identity.
+    /// The caller distinguishes the two by the record's state, never by this value
+    /// alone.
+    pub fn confined(&self) -> Option<&[ConfinedIdentity]> {
+        match self {
+            OwnershipJournal::Preparing { .. } => None,
+            OwnershipJournal::Owned { confined, .. } => confined.as_deref(),
+        }
+    }
+
+    /// Build an `Owned` record with a KNOWN history (possibly empty).
+    ///
+    /// Refuses a history over [`MAX_CONFINED_HISTORY`] rather than truncating: a
+    /// dropped entry is a uid whose processes may still be live and which the net
+    /// would then never deny. The caller keeps its prior good policy on this
+    /// refusal.
+    pub fn owned_with_known_history(
+        identity: JournalIdentity,
+        table_handle: u64,
+        base_chain_handle: u64,
+        confined: Vec<ConfinedIdentity>,
+    ) -> Result<Self, OwnershipJournalError> {
+        if confined.len() > MAX_CONFINED_HISTORY {
+            return Err(OwnershipJournalError::ConfinedHistoryFull {
+                count: confined.len(),
+                cap: MAX_CONFINED_HISTORY,
+            });
+        }
+        Ok(OwnershipJournal::Owned {
+            identity,
+            table_handle,
+            base_chain_handle,
+            confined: Some(confined),
+        })
+    }
+
+    /// Build an `Owned` record that keeps UNKNOWN HISTORY: the `confined` key is
+    /// omitted from the serialised record entirely.
+    ///
+    /// INVARIANT (D1b step 6, state-indexed): while the key is absent on a
+    /// same-boot record, NO store may materialise it. Writing `[B]` over an absent
+    /// key would turn unknown history into known history on the next start and let
+    /// a rotated-away uid out, so a re-store of such a record goes through here and
+    /// never through [`Self::owned_with_known_history`].
+    pub fn owned_with_unknown_history(
+        identity: JournalIdentity,
+        table_handle: u64,
+        base_chain_handle: u64,
+    ) -> Self {
+        OwnershipJournal::Owned {
+            identity,
+            table_handle,
+            base_chain_handle,
+            confined: None,
+        }
+    }
+}
+
+/// PROOF that a confined uid was written durably to this boot's journal BEFORE any
+/// kernel transaction bound it.
+///
+/// This type is the BIND row of the design's transition table, expressed so the
+/// compiler enforces the order rather than a convention doing it. The per-agent
+/// kernel install requires one, and the only way to obtain one is
+/// [`persist_confined_uid_write_ahead`] returning `Ok`. A failed persist therefore
+/// cannot reach the kernel at all: there is no value to pass.
+///
+/// INVARIANT on why the order is this way round: if the kernel bound a uid that the
+/// journal did not yet name, a crash in between would leave a live agent whose uid no
+/// later start can recover, so the safety net would never deny it. Persisting first
+/// can only ever leave the journal naming MORE than the kernel does, which is the
+/// safe direction: the net over-approximates and denies a uid nobody holds.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteAheadReceipt {
+    /// The uid this receipt covers, so a caller cannot present a receipt for one uid
+    /// while binding another.
+    uid: u32,
+}
+
+impl WriteAheadReceipt {
+    /// The uid this receipt proves was persisted.
+    pub fn uid(self) -> u32 {
+        self.uid
+    }
+
+    /// Mint a receipt WITHOUT a journal write. Available only under the
+    /// `test-isolation` feature, which the shipped build does not enable, so no
+    /// production path can forge the proof.
+    /// `the_write_ahead_receipt_has_no_production_mint` states the property.
+    #[cfg(feature = "test-isolation")]
+    pub fn for_isolated_test(uid: u32) -> Self {
+        Self { uid }
+    }
+}
+
+/// Persist `uid` into this boot's confined history under the caller's host lock, and
+/// return the proof the kernel-side bind requires.
+///
+/// This is the BIND row: the persist happens FIRST and its failure is returned, so the
+/// caller refuses the manifest and keeps the prior good policy with NO kernel step.
+///
+/// UNKNOWN HISTORY is refused rather than written: while the `confined` key is absent
+/// on a same-boot record, materialising it would mark this boot's history known and a
+/// uid rotated away from earlier in the boot would stop being denied. A bind cannot
+/// proceed on that record, and the operator's path is the disarm verb.
+pub fn persist_confined_uid_write_ahead(
+    path: &Path,
+    key: &JournalAuthKey,
+    uid: u32,
+    role: ConfinedRole,
+) -> Result<WriteAheadReceipt, OwnershipJournalError> {
+    persist_confined_uid_write_ahead_with_store(path, key, uid, role, store_atomic)
+}
+
+/// The injected store keeps durability failures testable at the production
+/// receipt-minting boundary. No receipt is returned until store succeeds.
+fn persist_confined_uid_write_ahead_with_store(
+    path: &Path,
+    key: &JournalAuthKey,
+    uid: u32,
+    role: ConfinedRole,
+    store: impl FnOnce(&Path, &OwnershipJournal, &JournalAuthKey) -> Result<(), OwnershipJournalError>,
+) -> Result<WriteAheadReceipt, OwnershipJournalError> {
+    let record = load(path, Some(key))?;
+    let Some(OwnershipJournal::Owned {
+        identity,
+        table_handle,
+        base_chain_handle,
+        confined,
+    }) = record
+    else {
+        return Err(OwnershipJournalError::UnsafeJournal {
+            path: path.to_path_buf(),
+            reason: "no owned ownership record is in force, so a confined uid cannot be \
+                     written ahead of a kernel binding"
+                .to_string(),
+        });
+    };
+    let Some(mut history) = confined else {
+        return Err(OwnershipJournalError::UnsafeJournal {
+            path: path.to_path_buf(),
+            reason: "this boot's confined history is unknown, so a new binding cannot be \
+                     recorded; stop the castle-wall unit, then run the disarm verb"
+                .to_string(),
+        });
+    };
+    if !history.iter().any(|entry| entry.uid == uid) {
+        history.push(ConfinedIdentity { uid, role });
+    }
+    let next = OwnershipJournal::owned_with_known_history(
+        identity,
+        table_handle,
+        base_chain_handle,
+        history,
+    )?;
+    store(path, &next, key)?;
+    Ok(WriteAheadReceipt { uid })
+}
+
+/// Whether `boot_id` is inside the accepted grammar: non-empty, at most
+/// [`MAX_BOOT_ID_BYTES`], hexadecimal digits and hyphens only.
+///
+/// The grammar is checked, not just the length, because [`MAX_RECORD_BYTES`] is
+/// DERIVED from these fields: a boot id carrying a quote or a control character
+/// would expand under JSON escaping past the byte arithmetic the bound rests on.
+fn boot_id_grammar_ok(boot_id: &str) -> bool {
+    !boot_id.is_empty()
+        && boot_id.len() <= MAX_BOOT_ID_BYTES
+        && boot_id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+}
+
+/// Whether `source` is inside the accepted grammar: non-empty, at most
+/// [`MAX_SOURCE_BYTES`], printable ASCII with no quote, backslash or control
+/// character.
+///
+/// Same reason as [`boot_id_grammar_ok`]: a quote or backslash escapes to two
+/// bytes in JSON and a control character to six, so an unvalidated source could
+/// serialise past the derived record bound and produce a record the daemon cannot
+/// reload.
+fn source_grammar_ok(source: &str) -> bool {
+    !source.is_empty()
+        && source.len() <= MAX_SOURCE_BYTES
+        && source.bytes().all(|b| {
+            // PRINTABLE ASCII includes the space (0x20): an install path with a space in
+            // it is ordinary, and `is_ascii_graphic` alone excludes it, which would
+            // refuse a legitimate daemon path. Control characters, the quote and the
+            // backslash stay refused, because those are what expand under JSON escaping
+            // past the arithmetic MAX_RECORD_BYTES is derived over.
+            (b.is_ascii_graphic() || b == b' ') && b != b'"' && b != b'\\'
+        })
+}
+
+/// Validate a record's bounded identity fields. Applied at BOTH the read and the
+/// store side, so the daemon can neither load nor write a record outside the
+/// grammar its size bound is derived from.
+fn validate_record_grammars(journal: &OwnershipJournal) -> Result<(), String> {
+    let identity = journal.identity();
+    if !boot_id_grammar_ok(&identity.boot_id) {
+        return Err(format!(
+            "boot id is outside the accepted grammar (hexadecimal digits and hyphens, \
+             1 to {MAX_BOOT_ID_BYTES} bytes)"
+        ));
+    }
+    if !source_grammar_ok(&identity.source) {
+        return Err(format!(
+            "source is outside the accepted grammar (printable ASCII with no quote or \
+             backslash, 1 to {MAX_SOURCE_BYTES} bytes)"
+        ));
+    }
+    if let Some(confined) = journal.confined() {
+        if confined.len() > MAX_CONFINED_HISTORY {
+            return Err(format!(
+                "confined history carries {} entries, over the {MAX_CONFINED_HISTORY} cap",
+                confined.len()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The on-disk AUTHENTICATED envelope: the exact canonical record bytes plus an
@@ -677,6 +1005,13 @@ pub fn load(
             journal.identity().schema_version
         )));
     }
+    // INVARIANT: the bounded-field grammars are checked on the READ side too, not
+    // only at store. An authentic record whose boot id or source is outside the
+    // grammar cannot have been written by this binary, and admitting it would
+    // admit a value the record-size bound is not derived over.
+    if let Err(reason) = validate_record_grammars(&journal) {
+        return Err(corrupt(reason));
+    }
     Ok(Some(journal))
 }
 
@@ -696,8 +1031,30 @@ pub fn store_atomic(
         source,
     };
 
+    // Grammar first: refuse before any bytes are produced, so a record outside the
+    // bounded-field grammar never reaches the temp file.
+    if let Err(reason) = validate_record_grammars(journal) {
+        return Err(OwnershipJournalError::UnsafeJournal {
+            path: path.to_path_buf(),
+            reason,
+        });
+    }
     let record_bytes = serde_json::to_vec(journal)
         .map_err(|e| mk_write(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    // INVARIANT: measure the REAL serialised bytes, never a parallel formula. A
+    // formula drifts from serde and from base64 padding, and the consequence of
+    // that drift is a record the daemon writes and then cannot reload, which
+    // presents at the next start as lost ownership over live agents.
+    if record_bytes.len() > MAX_RECORD_BYTES {
+        return Err(OwnershipJournalError::UnsafeJournal {
+            path: path.to_path_buf(),
+            reason: format!(
+                "serialised record is {} bytes, over the {MAX_RECORD_BYTES}-byte bound the \
+                 loader enforces; refusing before the rename so the journal stays readable",
+                record_bytes.len()
+            ),
+        });
+    }
     let mut mac = record_mac(key, &record_bytes);
     use base64::Engine;
     let envelope = AuthenticatedEnvelope {
@@ -708,6 +1065,18 @@ pub fn store_atomic(
     zeroize(&mut mac);
     let json = serde_json::to_vec(&envelope)
         .map_err(|e| mk_write(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    // Same measurement on the envelope, and again BEFORE the rename: the loader
+    // refuses an envelope over this bound, so writing one would strand ownership.
+    if json.len() as u64 > MAX_ENVELOPE_BYTES {
+        return Err(OwnershipJournalError::UnsafeJournal {
+            path: path.to_path_buf(),
+            reason: format!(
+                "serialised envelope is {} bytes, over the {MAX_ENVELOPE_BYTES}-byte bound the \
+                 loader enforces; refusing before the rename so the journal stays readable",
+                json.len()
+            ),
+        });
+    }
 
     write_private_file_atomic(path, &json)
 }
@@ -765,9 +1134,14 @@ pub fn current_boot_id() -> Result<String, OwnershipJournalError> {
 
 /// Non-Linux hosts have no nft runtime and never reach the reclaim path; a fixed
 /// sentinel keeps the journal serde tests runnable on the dev host.
+///
+/// The sentinel is deliberately inside the boot-id grammar (hexadecimal digits and
+/// hyphens): the store and load sides enforce that grammar, so a sentinel outside
+/// it would make every journal write on a dev host fail for a reason that has
+/// nothing to do with the code under test. Must match `boot_id_grammar_ok`.
 #[cfg(not(target_os = "linux"))]
 pub fn current_boot_id() -> Result<String, OwnershipJournalError> {
-    Ok("non-linux-host".to_string())
+    Ok("0de0-0000-0000-0000-000000000ded".to_string())
 }
 
 /// Read and strictly validate a boot-id file. A read failure OR an
@@ -784,6 +1158,19 @@ fn read_boot_id_strict(path: &Path) -> Result<String, OwnershipJournalError> {
         return Err(OwnershipJournalError::BootId {
             path: path.to_path_buf(),
             reason: "boot id is empty".to_string(),
+        });
+    }
+    // Same grammar the record read and store sides enforce, applied at the source:
+    // a boot id that would be refused when the record is stored must be refused
+    // here, where the error names the sysctl rather than the journal.
+    // Must match `boot_id_grammar_ok`.
+    if !boot_id_grammar_ok(&trimmed) {
+        return Err(OwnershipJournalError::BootId {
+            path: path.to_path_buf(),
+            reason: format!(
+                "boot id is outside the accepted grammar (hexadecimal digits and hyphens, \
+                 1 to {MAX_BOOT_ID_BYTES} bytes)"
+            ),
         });
     }
     Ok(trimmed)
@@ -873,10 +1260,20 @@ pub fn decide(
         };
     }
     match journal {
+        // PIN, and the reason this routing does NOT read `confined`: the
+        // never-adopt rule for a same-boot record with UNKNOWN HISTORY (the
+        // `confined` key absent) is ACQUISITION-SPECIFIC and lives on the
+        // acquisition path, never here. The disarm verb consumes this same shared
+        // decision, and a same-boot legacy record whose live table IS the
+        // recognised net must still reach disarm's `ReclaimOwned` arm to be
+        // cleared. Must match the `ReclaimOwned` arm in
+        // `crate::runtime_providers::disarm_castle_runtime`, which PR-2 extends to
+        // clear the net from that arm.
         Some(OwnershipJournal::Owned {
             identity,
             table_handle,
             base_chain_handle,
+            ..
         }) if identity.matches(boot_id, source) => ReclaimDecision::ReclaimOwned {
             table_handle: *table_handle,
             base_chain_handle: *base_chain_handle,
@@ -897,6 +1294,11 @@ pub fn decide(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A boot id in the real kernel shape (a formatted UUID), which the read and
+    /// store grammars accept. Fixtures that only need an OPAQUE identity for the
+    /// pure `decide` routing may use any string, because `decide` never stores.
+    const FIXTURE_BOOT_ID: &str = "3f2b91c0-7d4e-4a18-b6c2-0e15a9d83b77";
 
     fn ident(marker: &str, boot: &str, source: &str) -> JournalIdentity {
         JournalIdentity {
@@ -919,12 +1321,579 @@ mod tests {
         let path = dir.path().join("nft-ownership.json");
         let key = test_key();
         let journal = OwnershipJournal::Owned {
-            identity: ident("m", "boot-1", "src"),
+            // A REAL boot-id shape: the store and load sides both enforce the
+            // hexadecimal-and-hyphen grammar the record-size bound is derived over,
+            // so a fixture like "boot-1" is refused, correctly.
+            identity: ident("m", FIXTURE_BOOT_ID, "/usr/local/bin/castle-wall-daemon"),
             table_handle: 2,
             base_chain_handle: 1,
+            confined: Some(Vec::new()),
         };
         store_atomic(&path, &journal, &key).unwrap();
         assert_eq!(load(&path, Some(&key)).unwrap(), Some(journal));
+    }
+
+    fn store_and_reload(journal: &OwnershipJournal) -> OwnershipJournal {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nft-ownership.json");
+        let key = test_key();
+        store_atomic(&path, journal, &key).expect("store");
+        load(&path, Some(&key)).expect("load").expect("present")
+    }
+
+    /// The raw authenticated RECORD bytes on disk, so a test can assert on the
+    /// exact serialised form rather than on what serde round-trips to.
+    fn stored_record_json(journal: &OwnershipJournal) -> String {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nft-ownership.json");
+        let key = test_key();
+        store_atomic(&path, journal, &key).expect("store");
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("envelope");
+        use base64::Engine;
+        let record = base64::engine::general_purpose::STANDARD
+            .decode(envelope["record_b64"].as_str().expect("record_b64"))
+            .expect("decode");
+        String::from_utf8(record).expect("utf8")
+    }
+
+    fn owned_fixture(confined: Option<Vec<ConfinedIdentity>>) -> OwnershipJournal {
+        OwnershipJournal::Owned {
+            identity: ident("m", FIXTURE_BOOT_ID, "/usr/local/bin/castle-wall-daemon"),
+            table_handle: 2,
+            base_chain_handle: 1,
+            confined,
+        }
+    }
+
+    /// The BIND row: persist succeeds, THEN bind. A failed persist yields no proof, so
+    /// the kernel step is unreachable and the caller keeps its prior good policy.
+    ///
+    /// Inject a durability failure and crashes on either side of the journal
+    /// write. A receipt exists only after the durable store returns successfully.
+    #[test]
+    fn the_bind_row_persists_before_the_kernel_step_and_refuses_on_a_failed_persist() {
+        use std::cell::Cell;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nft-ownership.json");
+        let key = test_key();
+        let identity = ident("m", FIXTURE_BOOT_ID, "/usr/local/bin/castle-wall-daemon");
+        store_atomic(
+            &path,
+            &OwnershipJournal::Owned {
+                identity,
+                table_handle: 2,
+                base_chain_handle: 1,
+                confined: Some(Vec::new()),
+            },
+            &key,
+        )
+        .unwrap();
+
+        // The real store completes before a bind callback can use the receipt.
+        let receipt = persist_confined_uid_write_ahead(&path, &key, 60123, ConfinedRole::Agent)
+            .expect("the persist must succeed on a known history");
+        assert_eq!(receipt.uid(), 60123);
+        let reloaded = load(&path, Some(&key)).unwrap().unwrap();
+        assert_eq!(
+            reloaded
+                .confined()
+                .map(|c| c.iter().map(|e| e.uid).collect::<Vec<_>>()),
+            Some(vec![60123])
+        );
+
+        // A real error from the injected durability step mints no receipt, so
+        // the kernel callback is unreachable on this path.
+        let bound = Cell::new(false);
+        let failed = persist_confined_uid_write_ahead_with_store(
+            &path,
+            &key,
+            60124,
+            ConfinedRole::Gate,
+            |path, _, _| {
+                Err(OwnershipJournalError::Durability {
+                    path: path.to_path_buf(),
+                    source: std::io::Error::other("injected sync failure"),
+                })
+            },
+        );
+        if let Ok(proof) = failed.as_ref() {
+            bound.set(proof.uid() == 60124);
+        }
+        assert!(matches!(
+            failed,
+            Err(OwnershipJournalError::Durability { .. })
+        ));
+        assert!(!bound.get());
+        assert_eq!(
+            load(&path, Some(&key))
+                .unwrap()
+                .unwrap()
+                .confined()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // A crash immediately after the store returns leaves a wider durable
+        // history for the next process. No kernel callback has run yet.
+        let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            persist_confined_uid_write_ahead_with_store(
+                &path,
+                &key,
+                60124,
+                ConfinedRole::Gate,
+                |path, record, key| {
+                    store_atomic(path, record, key)?;
+                    panic!("injected post-store crash");
+                },
+            )
+        }));
+        assert!(crash.is_err());
+        let restarted = load(&path, Some(&key)).unwrap().unwrap();
+        assert_eq!(
+            restarted
+                .confined()
+                .unwrap()
+                .iter()
+                .map(|e| e.uid)
+                .collect::<Vec<_>>(),
+            vec![60123, 60124]
+        );
+
+        // FAILURE PATH: an UNKNOWN history refuses the persist, so no proof is minted and
+        // no kernel step can follow. The prior record is left exactly as it was.
+        let legacy_dir = TempDir::new().unwrap();
+        let legacy_path = legacy_dir.path().join("nft-ownership.json");
+        store_atomic(
+            &legacy_path,
+            &OwnershipJournal::owned_with_unknown_history(
+                ident("m", FIXTURE_BOOT_ID, "/usr/local/bin/castle-wall-daemon"),
+                2,
+                1,
+            ),
+            &key,
+        )
+        .unwrap();
+        let err = persist_confined_uid_write_ahead(&legacy_path, &key, 60123, ConfinedRole::Agent)
+            .expect_err("an unknown history must refuse a new binding");
+        assert!(
+            format!("{err}").contains("disarm"),
+            "the refusal names the repair: {err}"
+        );
+        // The record is UNCHANGED: the key is still absent, so the next start still
+        // resolves this boot as unknown history.
+        assert_eq!(
+            load(&legacy_path, Some(&key)).unwrap().unwrap().confined(),
+            None
+        );
+
+        // A persist against a missing record also refuses, so a bind cannot precede an
+        // owned record at all.
+        let empty_dir = TempDir::new().unwrap();
+        assert!(persist_confined_uid_write_ahead(
+            &empty_dir.path().join("nft-ownership.json"),
+            &key,
+            60123,
+            ConfinedRole::Agent
+        )
+        .is_err());
+    }
+
+    /// CRASH AND RESTART: the rebuilt kill set equals the journal array unioned with the
+    /// manifest identity.
+    #[test]
+    fn a_restart_rebuilds_the_kill_set_from_the_journal_unioned_with_the_manifest() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nft-ownership.json");
+        let key = test_key();
+        store_atomic(
+            &path,
+            &OwnershipJournal::Owned {
+                identity: ident("m", FIXTURE_BOOT_ID, "/usr/local/bin/castle-wall-daemon"),
+                table_handle: 2,
+                base_chain_handle: 1,
+                confined: Some(Vec::new()),
+            },
+            &key,
+        )
+        .unwrap();
+        // Two bindings persisted before their kernel steps, the second after a simulated
+        // crash (we simply reload, which is what a restart does).
+        persist_confined_uid_write_ahead(&path, &key, 60123, ConfinedRole::Agent).unwrap();
+        persist_confined_uid_write_ahead(&path, &key, 60124, ConfinedRole::Gate).unwrap();
+        // The restart reads the authenticated array and routes it through the
+        // same resolver that builds the daemon's deny and kill sets.
+        let rebuilt = load(&path, Some(&key))
+            .unwrap()
+            .unwrap()
+            .confined()
+            .expect("a known history")
+            .to_vec();
+        let resolution = crate::runtime_providers::resolve_safety_net_scope(
+            &crate::runtime_providers::ConfinedHistory::Known(rebuilt),
+            Some((60125, None)),
+            &crate::nftables::LiveTableBindings::Bindings(vec![60126]),
+            crate::safety_net_uid::HostOverflowUid::from_value(65534),
+        );
+        assert_eq!(
+            resolution.kill_set,
+            vec![60123, 60124, 60125],
+            "the rebuilt kill set is the journal array unioned with the manifest identity"
+        );
+        assert_eq!(resolution.deny_union, vec![60123, 60124, 60125, 60126]);
+        // Re-persisting an already-recorded uid is idempotent, so a retried bind after a
+        // crash does not grow the array.
+        persist_confined_uid_write_ahead(&path, &key, 60123, ConfinedRole::Agent).unwrap();
+        assert_eq!(
+            load(&path, Some(&key))
+                .unwrap()
+                .unwrap()
+                .confined()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// The receipt has no production mint: only a successful persist yields one, and the
+    /// test-only mint is behind a feature the shipped build does not enable.
+    #[test]
+    fn the_write_ahead_receipt_has_no_production_mint() {
+        let whole = include_str!("ownership_journal.rs");
+        let source = &whole[..whole
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("the test module ends the production half")];
+        let impl_at = source
+            .find("impl WriteAheadReceipt {")
+            .expect("the impl block is in this file");
+        let impl_end = source[impl_at..]
+            .find("\n}\n")
+            .map(|o| impl_at + o)
+            .expect("the impl block ends");
+        let block = &source[impl_at..impl_end];
+        let mint_at = block
+            .find("fn for_isolated_test")
+            .expect("the test-only mint exists");
+        assert!(
+            block[..mint_at].contains("#[cfg(feature = \"test-isolation\")]"),
+            "the only raw mint must be behind the test-isolation feature"
+        );
+        // And the struct's field is private, so no caller can build one literally.
+        assert!(
+            source.contains("pub struct WriteAheadReceipt {\n    /// The uid this receipt covers")
+        );
+        assert!(
+            source.contains("pub fn persist_confined_uid_write_ahead("),
+            "the persisting constructor is the production path"
+        );
+    }
+
+    #[test]
+    fn the_shared_routing_still_reaches_reclaim_owned_for_a_legacy_record() {
+        // The never-adopt rule for an unknown-history record is ACQUISITION-SPECIFIC and
+        // is applied on that path, NOT here. The disarm verb consumes this same routing,
+        // and a legacy record whose live table is the recognised net must still reach the
+        // `ReclaimOwned` arm so disarm can clear it. If this routing ever started
+        // diverting such a record, disarm would lose its one recovery path.
+        let identity = ident("m", FIXTURE_BOOT_ID, "/usr/local/bin/castle-wall-daemon");
+        let legacy = OwnershipJournal::Owned {
+            identity: identity.clone(),
+            table_handle: 2,
+            base_chain_handle: 1,
+            // The key ABSENT: a record from a binary that predates the field.
+            confined: None,
+        };
+        assert_eq!(legacy.confined(), None, "the fixture is unknown history");
+        assert_eq!(
+            decide(
+                Some(&legacy),
+                true,
+                FIXTURE_BOOT_ID,
+                "/usr/local/bin/castle-wall-daemon"
+            ),
+            ReclaimDecision::ReclaimOwned {
+                table_handle: 2,
+                base_chain_handle: 1,
+                marker: "m".to_string(),
+            },
+            "the shared routing must keep disarm's arm reachable for a legacy record"
+        );
+        // And a CURRENT record routes identically here, so the two are distinguished by
+        // the acquisition path rather than by this decision.
+        let current = OwnershipJournal::Owned {
+            identity,
+            table_handle: 2,
+            base_chain_handle: 1,
+            confined: Some(Vec::new()),
+        };
+        assert!(matches!(
+            decide(
+                Some(&current),
+                true,
+                FIXTURE_BOOT_ID,
+                "/usr/local/bin/castle-wall-daemon"
+            ),
+            ReclaimDecision::ReclaimOwned { .. }
+        ));
+    }
+
+    #[test]
+    fn confined_history_round_trips_and_the_mac_covers_it() {
+        let journal = owned_fixture(Some(vec![
+            ConfinedIdentity {
+                uid: 60123,
+                role: ConfinedRole::Agent,
+            },
+            ConfinedIdentity {
+                uid: 60124,
+                role: ConfinedRole::Gate,
+            },
+        ]));
+        assert_eq!(store_and_reload(&journal), journal);
+
+        // MAC COVERAGE: flipping a uid inside the array must fail authentication,
+        // exactly as tampering with any other field does. If the field rode outside
+        // the MAC, an actor who can write the StateDirectory could add or remove a
+        // confined uid and change who the net denies.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nft-ownership.json");
+        let key = test_key();
+        store_atomic(&path, &journal, &key).expect("store");
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let mut envelope: serde_json::Value = serde_json::from_str(&raw).expect("envelope");
+        use base64::Engine;
+        let record = base64::engine::general_purpose::STANDARD
+            .decode(envelope["record_b64"].as_str().unwrap())
+            .unwrap();
+        let tampered = String::from_utf8(record).unwrap().replace("60123", "60199");
+        envelope["record_b64"] = serde_json::Value::String(
+            base64::engine::general_purpose::STANDARD.encode(tampered.as_bytes()),
+        );
+        std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        let err = load(&path, Some(&key)).expect_err("a tampered confined array must not load");
+        assert!(
+            format!("{err}").contains("MAC does not verify"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn confined_serialisation_keeps_absent_null_and_empty_distinct() {
+        // `None` writes NO key. This is what makes UNKNOWN HISTORY durable: the next
+        // start reads an absent key and stays host-wide.
+        let absent = stored_record_json(&owned_fixture(None));
+        assert!(
+            !absent.contains("confined"),
+            "an unknown history must omit the key entirely, never write null: {absent}"
+        );
+        // `Some(vec![])` writes the key as an empty array, because the
+        // `skip_serializing_if` never applies to a `Some`. This is KNOWN-EMPTY.
+        let empty = stored_record_json(&owned_fixture(Some(Vec::new())));
+        assert!(
+            empty.contains("\"confined\":[]"),
+            "a known-empty history must write []: {empty}"
+        );
+        // And the two parse back to the two distinct states.
+        assert_eq!(store_and_reload(&owned_fixture(None)).confined(), None);
+        assert_eq!(
+            store_and_reload(&owned_fixture(Some(Vec::new()))).confined(),
+            Some(&[][..])
+        );
+        // An explicit `null` on disk also reads as None (unknown history), so a
+        // hand-edited or previous-shape record cannot be read as known-empty.
+        let record = absent.replace(
+            "\"base_chain_handle\":1",
+            "\"base_chain_handle\":1,\"confined\":null",
+        );
+        let parsed: OwnershipJournal = serde_json::from_str(&record).expect("null parses");
+        assert_eq!(parsed.confined(), None);
+    }
+
+    #[test]
+    fn a_previous_binary_record_reads_as_unknown_history_never_as_empty() {
+        // The `Option` exists to keep these two states distinct: a record written
+        // before this field existed authenticates with the key ABSENT and must read
+        // as UNKNOWN history, never as a known-empty set.
+        let legacy = format!(
+            r#"{{"state":"owned","identity":{{"schema_version":{JOURNAL_SCHEMA_VERSION},"marker":"m","boot_id":"{FIXTURE_BOOT_ID}","source":"/usr/local/bin/castle-wall-daemon"}},"table_handle":2,"base_chain_handle":1}}"#
+        );
+        let parsed: OwnershipJournal = serde_json::from_str(&legacy).expect("legacy parses");
+        assert_eq!(
+            parsed.confined(),
+            None,
+            "an absent key is unknown history, never a known-empty set"
+        );
+        // A re-store of such a record must NOT materialise the key.
+        let (identity, table_handle, base_chain_handle) = match &parsed {
+            OwnershipJournal::Owned {
+                identity,
+                table_handle,
+                base_chain_handle,
+                ..
+            } => (identity.clone(), *table_handle, *base_chain_handle),
+            _ => panic!("owned"),
+        };
+        let restored =
+            OwnershipJournal::owned_with_unknown_history(identity, table_handle, base_chain_handle);
+        let bytes = stored_record_json(&restored);
+        assert!(
+            !bytes.contains("confined"),
+            "re-storing an unknown history must keep the key absent: {bytes}"
+        );
+    }
+
+    #[test]
+    fn confined_history_is_refused_at_the_cap_plus_one_and_never_truncated() {
+        let identity = ident("m", FIXTURE_BOOT_ID, "/usr/local/bin/castle-wall-daemon");
+        let entries = |n: usize| {
+            (0..n)
+                .map(|i| ConfinedIdentity {
+                    uid: 60_000 + i as u32,
+                    role: if i % 2 == 0 {
+                        ConfinedRole::Agent
+                    } else {
+                        ConfinedRole::Gate
+                    },
+                })
+                .collect::<Vec<_>>()
+        };
+        // Exactly at the cap: accepted.
+        let at_cap = OwnershipJournal::owned_with_known_history(
+            identity.clone(),
+            2,
+            1,
+            entries(MAX_CONFINED_HISTORY),
+        )
+        .expect("the cap itself is an operating shape");
+        assert_eq!(
+            at_cap.confined().map(|c| c.len()),
+            Some(MAX_CONFINED_HISTORY)
+        );
+        // Cap plus one: REFUSED, and the array is not truncated to fit.
+        let err = OwnershipJournal::owned_with_known_history(
+            identity,
+            2,
+            1,
+            entries(MAX_CONFINED_HISTORY + 1),
+        )
+        .expect_err("over the cap must refuse");
+        assert!(matches!(
+            err,
+            OwnershipJournalError::ConfinedHistoryFull { count, cap }
+                if count == MAX_CONFINED_HISTORY + 1 && cap == MAX_CONFINED_HISTORY
+        ));
+        assert!(
+            format!("{err}").contains("disarm"),
+            "the refusal must name the repair: {err}"
+        );
+    }
+
+    #[test]
+    fn record_worst_case_fits_the_byte_bound() {
+        // The maximal grammar-valid record: the longest boot id and source the
+        // grammars accept, the real marker length, `u64::MAX` handles and a full
+        // ten-digit-uid history. This is what MAX_RECORD_BYTES is derived over, so
+        // the derivation is CHECKED here rather than only asserted in a comment.
+        let boot_id = "a".repeat(MAX_BOOT_ID_BYTES);
+        let source = "/".to_string() + &"s".repeat(MAX_SOURCE_BYTES - 1);
+        let marker = format!("sanctuary-castle-owner:v1:{}", "f".repeat(32));
+        let confined = (0..MAX_CONFINED_HISTORY)
+            .map(|i| ConfinedIdentity {
+                uid: u32::MAX - i as u32,
+                role: ConfinedRole::Gate,
+            })
+            .collect::<Vec<_>>();
+        let journal = OwnershipJournal::Owned {
+            identity: JournalIdentity {
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                marker,
+                boot_id,
+                source,
+            },
+            table_handle: u64::MAX,
+            base_chain_handle: u64::MAX,
+            confined: Some(confined),
+        };
+        let bytes = serde_json::to_vec(&journal).expect("serialise");
+        assert!(
+            bytes.len() <= MAX_RECORD_BYTES,
+            "worst-case record is {} bytes, over the {MAX_RECORD_BYTES}-byte bound",
+            bytes.len()
+        );
+        // And it survives a real store and load, so the envelope bound holds too.
+        assert_eq!(store_and_reload(&journal), journal);
+    }
+
+    #[test]
+    fn store_refuses_a_record_outside_the_bounded_grammars_before_the_rename() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nft-ownership.json");
+        let key = test_key();
+        // A boot id outside the hexadecimal-and-hyphen grammar.
+        let bad_boot = OwnershipJournal::Owned {
+            identity: ident("m", "boot-one", "/usr/local/bin/castle-wall-daemon"),
+            table_handle: 2,
+            base_chain_handle: 1,
+            confined: Some(Vec::new()),
+        };
+        assert!(store_atomic(&path, &bad_boot, &key).is_err());
+        // A source carrying a quote, which would escape to two bytes in JSON and
+        // break the arithmetic MAX_RECORD_BYTES rests on.
+        let bad_source = OwnershipJournal::Owned {
+            identity: ident("m", FIXTURE_BOOT_ID, "/usr/local/bin/\"quoted\""),
+            table_handle: 2,
+            base_chain_handle: 1,
+            confined: Some(Vec::new()),
+        };
+        assert!(store_atomic(&path, &bad_source, &key).is_err());
+        // An over-long source.
+        let long_source = OwnershipJournal::Owned {
+            identity: ident("m", FIXTURE_BOOT_ID, &"s".repeat(MAX_SOURCE_BYTES + 1)),
+            table_handle: 2,
+            base_chain_handle: 1,
+            confined: Some(Vec::new()),
+        };
+        assert!(store_atomic(&path, &long_source, &key).is_err());
+        // FAILURE-MODE NOTE: a refused store must leave NO file behind, so the
+        // prior good record (or the absence of one) still governs the next start.
+        assert!(
+            !path.exists(),
+            "a refused store must not leave a partial journal"
+        );
+    }
+
+    #[test]
+    fn load_refuses_an_authentic_record_outside_the_bounded_grammars() {
+        // A record whose MAC verifies but whose boot id is outside the grammar
+        // cannot have been written by this binary. Admitting it would admit a value
+        // the record-size bound is not derived over.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nft-ownership.json");
+        let key = test_key();
+        let record = format!(
+            r#"{{"state":"owned","identity":{{"schema_version":{JOURNAL_SCHEMA_VERSION},"marker":"m","boot_id":"boot-one","source":"/usr/local/bin/castle-wall-daemon"}},"table_handle":2,"base_chain_handle":1,"confined":[]}}"#
+        );
+        let mut mac = record_mac(&key, record.as_bytes());
+        use base64::Engine;
+        let envelope = serde_json::json!({
+            "mac_scheme": "hmac-sha256-v1",
+            "record_b64": base64::engine::general_purpose::STANDARD.encode(record.as_bytes()),
+            "mac_hex": hex::encode(mac),
+        });
+        zeroize(&mut mac);
+        std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        // The loader also enforces 0600 on the journal, and a default-umask write
+        // is 0644, so the fixture must set the mode the daemon itself writes.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let err = load(&path, Some(&key)).expect_err("grammar refusal");
+        assert!(
+            format!("{err}").contains("grammar"),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(unix)]
@@ -1028,6 +1997,7 @@ mod tests {
                 identity: ident("m", "b", "s"),
                 table_handle: 5,
                 base_chain_handle: 4,
+                confined: Some(Vec::new()),
             },
             &key,
         )
@@ -1260,6 +2230,7 @@ mod tests {
             identity: ident("m", "old-boot", "src"),
             table_handle: 2,
             base_chain_handle: 1,
+            confined: Some(Vec::new()),
         };
         assert_eq!(
             decide(Some(&owned), false, "new-boot", "src"),
@@ -1280,6 +2251,7 @@ mod tests {
             identity: ident("nonce", "boot-1", "src"),
             table_handle: 4,
             base_chain_handle: 3,
+            confined: Some(Vec::new()),
         };
         assert_eq!(
             decide(Some(&owned_this_boot), false, "boot-1", "src"),
@@ -1300,6 +2272,7 @@ mod tests {
             identity: ident("nonce", "OLD-boot", "src"),
             table_handle: 4,
             base_chain_handle: 3,
+            confined: Some(Vec::new()),
         };
         assert_eq!(
             decide(Some(&owned_prior_boot), false, "boot-1", "src"),
@@ -1317,6 +2290,7 @@ mod tests {
             identity: ident("nonce", "boot-1", "src"),
             table_handle: 4,
             base_chain_handle: 3,
+            confined: Some(Vec::new()),
         };
         assert_eq!(
             decide(Some(&owned), true, "boot-1", "src"),
@@ -1359,6 +2333,7 @@ mod tests {
             identity: ident("m", "OTHER-boot", "src"),
             table_handle: 2,
             base_chain_handle: 1,
+            confined: Some(Vec::new()),
         };
         assert_eq!(
             decide(Some(&owned_other_boot), true, "boot-1", "src"),
@@ -1369,6 +2344,7 @@ mod tests {
             identity: ident("m", "boot-1", "OTHER-binary"),
             table_handle: 2,
             base_chain_handle: 1,
+            confined: Some(Vec::new()),
         };
         assert_eq!(
             decide(Some(&owned_other_source), true, "boot-1", "src"),

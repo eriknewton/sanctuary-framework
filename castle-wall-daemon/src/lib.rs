@@ -41,6 +41,7 @@ pub mod policy;
 pub mod runtime_health;
 pub mod runtime_lock;
 pub mod runtime_providers;
+pub mod safety_net_uid;
 pub mod systemd_notify;
 pub mod thread_component;
 

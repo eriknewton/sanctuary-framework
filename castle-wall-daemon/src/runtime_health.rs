@@ -54,6 +54,18 @@ pub enum RuntimeHealthState {
     /// No conclusion is available: the probe was in flight, timed out, or the
     /// view could not be read. Indeterminate — never treat as ready or as lost.
     ProbeUnavailable,
+    /// The nft probe exhausted its no-answer budget. The supervisor runs the
+    /// hook and exits; no kernel replacement is inferred from this reading.
+    Indeterminate,
+    /// A required component was PROVEN lost AND the safety net is being installed or
+    /// retried for it while this process keeps the host lock.
+    ///
+    /// Its own state, not a flavour of `Lost`, because the supervisor exits on `Lost`
+    /// and must NOT exit while an attempt is outstanding: the process would drop the
+    /// host lock mid-attempt and the restart cannot resume what this one began. It is
+    /// NOT readiness either. The signed status projection carries it as its own token
+    /// so an operator can tell "the net is going in" from "the net is not going in".
+    Recovering(NotReadyReason),
 }
 
 impl RuntimeHealthState {
@@ -66,6 +78,12 @@ impl RuntimeHealthState {
             Self::Ready => "ready",
             Self::Lost(_) => "lost",
             Self::ProbeUnavailable => "probe_unavailable",
+            Self::Indeterminate => "indeterminate",
+            // A NEW wire token. Must match `RuntimeHealthToken` in
+            // `server/src/castle-wall/ipc/messages.ts`: producer and consumer change
+            // together, and a reader that does not know this token must treat it as
+            // not-ready rather than as ready.
+            Self::Recovering(_) => "safety_net_recovering",
         }
     }
 }
@@ -92,6 +110,7 @@ impl RuntimeHealthReading {
 #[derive(Debug)]
 pub struct RuntimeHealthView {
     inner: Mutex<Option<(Instant, RuntimeHealthState)>>,
+    safety_net: Mutex<Option<crate::nftables::SafetyNetAuditState>>,
 }
 
 impl Default for RuntimeHealthView {
@@ -104,7 +123,57 @@ impl RuntimeHealthView {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(None),
+            safety_net: Mutex::new(Some(crate::nftables::SafetyNetAuditState::NotAttempted)),
         }
+    }
+
+    /// Publish the component's tagged predicate without making an IPC status
+    /// request lock the enforcement runtime or run an ownership probe.
+    pub fn publish_safety_net(&self, state: crate::nftables::SafetyNetAuditState) {
+        if let Ok(mut slot) = self.safety_net.lock() {
+            *slot = Some(state);
+        }
+    }
+
+    /// Clear a prior predicate when the runtime cannot be read. Absence is
+    /// preferable to replaying an installed claim from before a loss.
+    pub fn clear_safety_net(&self) {
+        if let Ok(mut slot) = self.safety_net.lock() {
+            *slot = None;
+        }
+    }
+
+    /// A contended or poisoned read has no known state. It must not be
+    /// mislabeled `NotAttempted`, which means the install was never tried.
+    pub fn read_safety_net(&self) -> Option<crate::nftables::SafetyNetAuditState> {
+        self.safety_net
+            .try_lock()
+            .ok()
+            .and_then(|state| state.clone())
+    }
+
+    /// The sole supervisor needs actual published history for transition and
+    /// WAL decisions. It may wait for these short mutexes, one at a time; IPC
+    /// retains its nonblocking and freshness-limited reads. Poison or an absent
+    /// first health publication is an error, never a fabricated prior state.
+    pub(crate) fn supervisor_snapshot(
+        &self,
+    ) -> Result<
+        (
+            RuntimeHealthState,
+            Option<crate::nftables::SafetyNetAuditState>,
+        ),
+        (),
+    > {
+        let prior_health = self
+            .inner
+            .lock()
+            .map_err(|_| ())?
+            .as_ref()
+            .map(|(_, state)| *state)
+            .ok_or(())?;
+        let prior_tag = self.safety_net.lock().map_err(|_| ())?.clone();
+        Ok((prior_health, prior_tag))
     }
 
     /// Publish an observation. Called by boot (initial state) and by the
@@ -164,6 +233,20 @@ mod tests {
     use super::*;
     use crate::enforcement::ComponentKind;
 
+    impl RuntimeHealthView {
+        pub(crate) fn hold_health_for_test(
+            &self,
+        ) -> std::sync::MutexGuard<'_, Option<(Instant, RuntimeHealthState)>> {
+            self.inner.lock().unwrap()
+        }
+
+        pub(crate) fn hold_safety_net_for_test(
+            &self,
+        ) -> std::sync::MutexGuard<'_, Option<crate::nftables::SafetyNetAuditState>> {
+            self.safety_net.lock().unwrap()
+        }
+    }
+
     #[test]
     fn an_unpublished_view_is_indeterminate_never_ready() {
         let view = RuntimeHealthView::new();
@@ -180,6 +263,54 @@ mod tests {
         assert_eq!(reading.state, RuntimeHealthState::Ready);
         assert!(reading.proves_ready());
         assert!(reading.age.is_some());
+    }
+
+    #[test]
+    fn contended_safety_net_state_is_absent_from_status() {
+        let view = RuntimeHealthView::new();
+        let held = view.safety_net.lock().unwrap();
+        assert!(view.read_safety_net().is_none());
+        drop(held);
+        assert_eq!(
+            view.read_safety_net(),
+            Some(crate::nftables::SafetyNetAuditState::NotAttempted)
+        );
+        view.clear_safety_net();
+        assert_eq!(view.read_safety_net(), None);
+    }
+
+    #[test]
+    fn poisoned_supervisor_tag_snapshot_is_an_error_not_an_absent_tag() {
+        let view = std::sync::Arc::new(RuntimeHealthView::new());
+        view.publish(RuntimeHealthState::Ready);
+        let poisoned = std::sync::Arc::clone(&view);
+        assert!(std::thread::spawn(move || {
+            let _held = poisoned.safety_net.lock().unwrap();
+            panic!("poison the test tag mutex");
+        })
+        .join()
+        .is_err());
+        assert_eq!(view.supervisor_snapshot(), Err(()));
+        // IPC remains nonblocking and withholds a predicate on poison.
+        assert_eq!(view.read_safety_net(), None);
+    }
+
+    #[test]
+    fn poisoned_supervisor_health_snapshot_is_an_error_not_status_fallback() {
+        let view = std::sync::Arc::new(RuntimeHealthView::new());
+        view.publish(RuntimeHealthState::Ready);
+        let poisoned = std::sync::Arc::clone(&view);
+        assert!(std::thread::spawn(move || {
+            let _held = poisoned.inner.lock().unwrap();
+            panic!("poison the test health mutex");
+        })
+        .join()
+        .is_err());
+        assert_eq!(view.supervisor_snapshot(), Err(()));
+        assert_eq!(
+            view.read(STATUS_FRESHNESS_WINDOW).state,
+            RuntimeHealthState::ProbeUnavailable
+        );
     }
 
     /// A `Ready` observation is evidence about WHEN it was taken. Past the

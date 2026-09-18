@@ -499,13 +499,15 @@ impl KernelBypassFixture {
         // routes every unmatched packet to the daemon's userspace evaluator,
         // which is exactly what these bypass tests exercise.
         let script = nftables::build_agent_ruleset(agent_id, BYPASS_AGENT_UID, &[]);
+        let bypass_binding = AgentUidBinding {
+            agent_uid: BYPASS_AGENT_UID,
+            system_uid_allow_ceiling: BYPASS_UID_CEILING,
+        };
         nftables::load_agent_ruleset(
             &ruleset_id,
             &script,
-            AgentUidBinding {
-                agent_uid: BYPASS_AGENT_UID,
-                system_uid_allow_ceiling: BYPASS_UID_CEILING,
-            },
+            bypass_binding,
+            isolation::write_ahead_receipt_for(bypass_binding),
         )
         .expect("load_agent_ruleset into daemon-owned table");
 

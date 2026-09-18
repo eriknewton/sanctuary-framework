@@ -73,11 +73,25 @@ use std::time::{Duration, Instant};
 pub enum ProbeOutcome {
     /// A check completed and proved the resource is still ours.
     Ready,
-    /// A check completed and proved the resource is gone/drifted, or the
-    /// indeterminate budget was exhausted. Terminal for this process.
+    /// A check COMPLETED and proved the resource is gone or drifted. Terminal for
+    /// this process.
+    ///
+    /// This is the only outcome that is EVIDENCE about the resource, and it is the
+    /// only one a consumer may act on the kernel from. The exhausted-budget case is
+    /// [`Indeterminate`](Self::Indeterminate), not this.
     Lost,
+    /// The consecutive indeterminate budget was exhausted: no check ever completed,
+    /// so nothing about the resource was proven, but readiness can no longer be
+    /// asserted either. Terminal for this process.
+    ///
+    /// Split out from `Lost` because the two license different actions. A consumer
+    /// may withdraw readiness on either, but it may only act on the kernel from a
+    /// completed proof; acting on an exhausted budget would mutate state on the
+    /// strength of having learned nothing.
+    Indeterminate,
     /// No conclusion is available right now: another check is in flight, or this
-    /// one exceeded its deadline. NOT a loss and NOT readiness.
+    /// one exceeded its deadline, and the budget is not yet exhausted. NOT a loss
+    /// and NOT readiness.
     Unavailable,
 }
 
@@ -95,9 +109,8 @@ pub struct ProbeBudget {
     /// would be detected a tick late.
     pub min_interval: Duration,
     /// How many consecutive indeterminate readings may pass before the probe
-    /// latches `Lost`. This is the fail-closed backstop for an `nft` that never
-    /// returns: worst-case detection is `max_consecutive_unavailable` supervisor
-    /// ticks, not unbounded.
+    /// latches `Indeterminate`. This bounds the no-answer interval without
+    /// manufacturing a completed negative ownership proof.
     pub max_consecutive_unavailable: u32,
 }
 
@@ -116,8 +129,21 @@ struct ProbeState {
     completions: u64,
     /// Consecutive indeterminate readings since the last completed one.
     consecutive_unavailable: u32,
-    /// Set once readiness is permanently withdrawn for this process.
+    /// Set ONLY by a COMPLETED negative proof: a check ran to conclusion and
+    /// demonstrated the resource no longer holds.
+    ///
+    /// INVARIANT: an exhausted indeterminate budget does NOT set this. The two are
+    /// different evidence and license different actions, and a consumer that may act
+    /// on the kernel must be able to tell them apart. `latched_indeterminate` carries
+    /// the budget case. Cleared by a COMPLETED positive proof, which is how an
+    /// operator repairing the resource returns the probe to health.
     latched_lost: bool,
+    /// Set once the consecutive indeterminate budget is exhausted: readiness can no
+    /// longer be asserted, but nothing about the resource was proven.
+    ///
+    /// Stays set on every later poll until a COMPLETED proof of either polarity
+    /// arrives, so a wedged check never decays into a claim about the resource.
+    latched_indeterminate: bool,
 }
 
 #[derive(Debug)]
@@ -163,11 +189,17 @@ impl Drop for SlotGuard {
                 Some(Ok(ready)) => {
                     state.last = Some((Instant::now(), ready));
                     state.consecutive_unavailable = 0;
-                    if !ready {
-                        // A COMPLETED negative proof is terminal: current
-                        // ownership cannot be demonstrated, so readiness is
-                        // withdrawn for this process and systemd restart is the
-                        // recovery path.
+                    // A COMPLETED proof of either polarity settles the indeterminate
+                    // latch: the budget existed only because nothing had concluded.
+                    state.latched_indeterminate = false;
+                    if ready {
+                        // A COMPLETED POSITIVE proof clears the loss latch. This is the
+                        // path an operator who repairs the resource comes back through;
+                        // without it a resolved loss would keep reporting lost forever.
+                        state.latched_lost = false;
+                    } else {
+                        // A COMPLETED negative proof: current ownership cannot be
+                        // demonstrated, so readiness is withdrawn until a positive proof.
                         state.latched_lost = true;
                     }
                 }
@@ -193,7 +225,10 @@ impl Drop for SlotGuard {
 fn note_indeterminate(state: &mut ProbeState, max_consecutive_unavailable: u32) {
     state.consecutive_unavailable = state.consecutive_unavailable.saturating_add(1);
     if state.consecutive_unavailable >= max_consecutive_unavailable {
-        state.latched_lost = true;
+        // INVARIANT: the budget latches INDETERMINATE, never lost. Nothing about the
+        // resource was proven by a check that never concluded, and a consumer that
+        // acts on the kernel from this reading would be acting on no evidence.
+        state.latched_indeterminate = true;
     }
 }
 
@@ -215,6 +250,7 @@ impl BoundedHealthProbe {
                     completions: 0,
                     consecutive_unavailable: 0,
                     latched_lost: false,
+                    latched_indeterminate: false,
                 }),
                 terminated: Condvar::new(),
             }),
@@ -235,6 +271,36 @@ impl BoundedHealthProbe {
         self.poll_result(move || Ok(check()))
     }
 
+    /// Run a check EVEN WHEN a latch is set, so a resolved loss can be observed.
+    ///
+    /// `poll_result` short-circuits on a latch, which is correct for a readiness
+    /// question: once a loss is proven, readiness stays withdrawn. But it means the
+    /// probe can never see the resource come back, so the ONE caller that is actively
+    /// trying to resolve the loss needs a way to ask again. A COMPLETED positive proof
+    /// here clears both latches (the drop guard does it), which is how an operator who
+    /// repairs the resource returns the component to health.
+    ///
+    /// INVARIANT: this does NOT weaken the readiness claim. It runs a real check and
+    /// reports exactly what that check proves; it cannot manufacture readiness, and a
+    /// completed negative proof re-latches. It is bypassing a CACHE, not a gate.
+    /// Must match the latch handling in `poll_result`.
+    pub fn reprobe_after_latch<F>(&self, check: F) -> ProbeOutcome
+    where
+        F: FnOnce() -> Result<bool, ()> + Send + 'static,
+    {
+        {
+            let mut state = self.shared.lock();
+            // Clear the terminal readings so the shared scheduling path below runs a
+            // real check instead of returning the cached verdict. `last` is left alone:
+            // the min-interval cache is a rate limit, and a caller on the recovery
+            // interval is already slower than it.
+            state.latched_lost = false;
+            state.latched_indeterminate = false;
+            state.last = None;
+        }
+        self.poll_result(check)
+    }
+
     /// Three-valued variant for probes whose command may fail without proving
     /// resource loss. `Err(())` is indeterminate and consumes the same bounded
     /// retry budget as a timeout or failed spawn; it is never cached as `false`.
@@ -245,6 +311,11 @@ impl BoundedHealthProbe {
         let mut state = self.shared.lock();
         if state.latched_lost {
             return ProbeOutcome::Lost;
+        }
+        // The exhausted budget is its own terminal reading and stays that way until a
+        // completed proof arrives, so a wedged check is never reported as a loss.
+        if state.latched_indeterminate {
+            return ProbeOutcome::Indeterminate;
         }
         if let Some((at, ready)) = state.last {
             if at.elapsed() < self.budget.min_interval {
@@ -291,8 +362,11 @@ impl BoundedHealthProbe {
             // precisely because there is nothing in flight to collide with.
             state.in_flight_since = None;
             note_indeterminate(&mut state, self.budget.max_consecutive_unavailable);
-            return if state.latched_lost {
-                ProbeOutcome::Lost
+            // The exhausted budget is INDETERMINATE, not a completed negative proof:
+            // no check ever ran to conclusion, so nothing about the resource is known.
+            // A consumer may withdraw readiness on it but must not act on the kernel.
+            return if state.latched_indeterminate {
+                ProbeOutcome::Indeterminate
             } else {
                 ProbeOutcome::Unavailable
             };
@@ -323,8 +397,10 @@ impl BoundedHealthProbe {
             // Deadline overrun. The worker still owns the slot and its `nft`
             // child is still running; we abandon the WAIT, not the check.
             note_indeterminate(&mut state, self.budget.max_consecutive_unavailable);
-            return if state.latched_lost {
-                ProbeOutcome::Lost
+            // Same polarity as the no-worker case above: an abandoned WAIT proves
+            // nothing about the resource. Must match that arm.
+            return if state.latched_indeterminate {
+                ProbeOutcome::Indeterminate
             } else {
                 ProbeOutcome::Unavailable
             };
@@ -338,6 +414,9 @@ impl BoundedHealthProbe {
     fn outcome_after_completion(state: &ProbeState, started_at: Instant) -> ProbeOutcome {
         if state.latched_lost {
             return ProbeOutcome::Lost;
+        }
+        if state.latched_indeterminate {
+            return ProbeOutcome::Indeterminate;
         }
         match state.last {
             // `>=` rather than `>`: a check fast enough to complete inside the
@@ -376,8 +455,9 @@ impl BoundedHealthProbe {
             return ProbeOutcome::Unavailable;
         }
         note_indeterminate(&mut state, self.budget.max_consecutive_unavailable);
-        if state.latched_lost {
-            ProbeOutcome::Lost
+        // Same polarity as the two arms above. Must match them.
+        if state.latched_indeterminate {
+            ProbeOutcome::Indeterminate
         } else {
             ProbeOutcome::Unavailable
         }
@@ -480,7 +560,7 @@ mod tests {
     /// Note the SHAPE this now takes: after the first overrun the later polls
     /// never start a check at all, they observe the wedged one.
     #[test]
-    fn consecutive_timeouts_exhaust_the_indeterminate_budget_and_latch_lost() {
+    fn consecutive_timeouts_exhaust_the_indeterminate_budget_and_latch_indeterminate() {
         let probe = BoundedHealthProbe::new(ProbeBudget {
             timeout: Duration::from_millis(30),
             min_interval: Duration::ZERO,
@@ -497,9 +577,61 @@ mod tests {
         std::thread::sleep(Duration::from_millis(40));
         assert_eq!(
             probe.poll(wedged),
-            ProbeOutcome::Lost,
-            "the third consecutive indeterminate reading must fail closed"
+            ProbeOutcome::Indeterminate,
+            "the exhausted budget must fail closed as INDETERMINATE: readiness is \
+             withdrawn, but no check ever completed, so nothing about the resource was \
+             proven and no consumer may act on the kernel from this reading"
         );
+    }
+
+    #[test]
+    fn an_exhausted_budget_stays_indeterminate_on_every_later_poll() {
+        // The budget latches INDETERMINATE and stays there. A consumer that acts on
+        // the kernel must never see a wedged check turn into a claim about the
+        // resource, however many times it polls.
+        let probe = BoundedHealthProbe::new(ProbeBudget {
+            timeout: Duration::from_millis(30),
+            min_interval: Duration::ZERO,
+            max_consecutive_unavailable: 3,
+        });
+        let wedged = || {
+            std::thread::sleep(Duration::from_millis(400));
+            true
+        };
+        assert_eq!(probe.poll(wedged), ProbeOutcome::Unavailable);
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(probe.poll(wedged), ProbeOutcome::Unavailable);
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(probe.poll(wedged), ProbeOutcome::Indeterminate);
+        // The FOURTH poll, and every later one, is still indeterminate and never a
+        // completed negative proof.
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(probe.poll(wedged), ProbeOutcome::Indeterminate);
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(probe.poll(wedged), ProbeOutcome::Indeterminate);
+    }
+
+    #[test]
+    fn a_completed_positive_proof_clears_both_latches() {
+        let probe = BoundedHealthProbe::new(ProbeBudget {
+            timeout: Duration::from_secs(2),
+            min_interval: Duration::ZERO,
+            max_consecutive_unavailable: 2,
+        });
+        // A completed NEGATIVE proof latches the loss.
+        assert_eq!(probe.poll(|| false), ProbeOutcome::Lost);
+        assert_eq!(probe.poll(|| true), ProbeOutcome::Lost, "the latch holds");
+        // The recovery caller asks again, and a completed POSITIVE proof clears it, so
+        // an operator who repairs the resource returns the component to health.
+        assert_eq!(
+            probe.reprobe_after_latch(|| Ok(true)),
+            ProbeOutcome::Ready,
+            "a completed positive proof must clear the loss latch"
+        );
+        assert_eq!(probe.poll(|| true), ProbeOutcome::Ready);
+        // And a completed negative proof re-latches, so the re-probe is not a bypass.
+        assert_eq!(probe.reprobe_after_latch(|| Ok(false)), ProbeOutcome::Lost);
+        assert_eq!(probe.poll(|| true), ProbeOutcome::Lost);
     }
 
     /// ADVERSARIAL SCHEDULING (AGENTS rule 12): concurrent pollers must not each

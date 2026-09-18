@@ -6,7 +6,7 @@
 
 import { execSync as nodeExecSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, constants, readFile, stat } from "node:fs/promises";
+import { access, constants, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -42,6 +42,15 @@ import {
   castleWallProvisionRecordPath,
   readPersistedCastleWallProvision,
 } from "../castle-wall/provision-state.js";
+// The installed-manifest admission report. Doctor never re-implements an
+// admission bound: the daemon's own preflight verb is the oracle, because one of
+// those bounds is the host's configured overflow uid, which only the daemon reads.
+import {
+  discoverInstalledLinuxFortressIds,
+  realUpgradeCommandRunner,
+  reportInstalledManifestAdmission,
+  type UpgradeCommandRunner,
+} from "../castle-wall/runtime/linux-upgrade-routes.js";
 import { checkNodeVersion } from "./node-version.js";
 import { verifyFortressAuditFullPicture } from "../operational/audit-store-split.js";
 import {
@@ -164,6 +173,17 @@ export async function runDoctorChecks(opts: {
    */
   hermesConfigPath?: string;
   pyYamlProbe?: ParseParityOptions;
+  /**
+   * Test-only seams for the Linux installed-manifest admission check, on the same
+   * rule as `pyYamlProbe`: deliberately NOT on `DoctorCommandArgs`, so nothing on
+   * the CLI surface can steer which binary is asked or which state root is read.
+   */
+  manifestAdmission?: {
+    runner: UpgradeCommandRunner;
+    readDir?: (path: string) => Promise<string[]>;
+    stateRoot?: string;
+    binaryPath?: string;
+  };
 }): Promise<DoctorCheck[]> {
   const checks: DoctorCheck[] = [];
   checks.push(checkRequiredNodeVersion(opts.nodeVersion));
@@ -178,6 +198,7 @@ export async function runDoctorChecks(opts: {
   checks.push(checkRuntime());
   checks.push(await checkHermesConfigParser(opts));
   checks.push(await checkCastleWall(opts));
+  checks.push(await checkLinuxManifestAdmission(opts));
   const harnessIds = await collectWrappedHarnessAgentIds();
   checks.push(checkWrappedHarnessAgentIds(harnessIds));
   checks.push(await checkSdwOwnerTransferLock(opts.storagePath));
@@ -935,6 +956,85 @@ async function checkCastleWall(opts: {
       "run sanctuary castle-wall status",
     );
   }
+}
+
+/** Name of the Linux installed-manifest admission check. One string, one place. */
+const MANIFEST_ADMISSION_CHECK_NAME = "castle wall manifest admission";
+
+/**
+ * Does THIS host admit the manifest installed for its Castle Wall daemon?
+ *
+ * The daemon's `--preflight-manifest` verb answers, and this check reports its
+ * exit code and its text verbatim. Doctor classifies nothing about the uid values
+ * themselves: the verb reads the host's own configured overflow uid, and a second
+ * implementation here would be a second answer that could disagree with the one
+ * that governs loading.
+ *
+ * FAILURE MODE, and why a refusal is WARN rather than FAIL: the policy directory
+ * is root-owned mode 0700, so an unprivileged doctor run makes the verb exit
+ * non-zero because it could not read the manifest, which is not the same finding
+ * as a manifest this host will not admit. The verb's own line distinguishes the
+ * two, so the check prints that line instead of grading it.
+ */
+async function checkLinuxManifestAdmission(opts: {
+  platform: NodeJS.Platform;
+  manifestAdmission?: {
+    runner: UpgradeCommandRunner;
+    readDir?: (path: string) => Promise<string[]>;
+    stateRoot?: string;
+    binaryPath?: string;
+  };
+}): Promise<DoctorCheck> {
+  if (opts.platform !== "linux") {
+    return ok(MANIFEST_ADMISSION_CHECK_NAME, "n/a (not Linux)", "none");
+  }
+  const seam = opts.manifestAdmission;
+  const readDir = seam?.readDir ?? (async (path: string) => await readdir(path));
+  const fortressIds = await discoverInstalledLinuxFortressIds(readDir, seam?.stateRoot);
+  if (fortressIds.length === 0) {
+    return ok(
+      MANIFEST_ADMISSION_CHECK_NAME,
+      "n/a (no installed Linux Castle Wall state on this host)",
+      "none",
+    );
+  }
+  const runner = seam?.runner ?? realUpgradeCommandRunner();
+  for (const fortressId of fortressIds) {
+    const report = await reportInstalledManifestAdmission({
+      target: { kind: "fortress_id", fortressId },
+      runner,
+      binaryPath: seam?.binaryPath,
+    });
+    if (report.probe === "binary_absent") {
+      return ok(
+        MANIFEST_ADMISSION_CHECK_NAME,
+        "n/a (no Castle Wall daemon binary installed)",
+        "none",
+      );
+    }
+    if (report.probe === "unavailable") {
+      return warn(
+        MANIFEST_ADMISSION_CHECK_NAME,
+        `the admission check could not complete for ${fortressId}: ${report.daemon_output}`,
+        "run this check as the operator who can reach the Castle Wall state directory",
+      );
+    }
+    // INVARIANT: an unanswered or negative answer is never reported as admitted,
+    // and the daemon's line is passed through unchanged because it carries the
+    // remediation an operator has to act on.
+    if (!report.admitted) {
+      return warn(
+        MANIFEST_ADMISSION_CHECK_NAME,
+        `${fortressId}: ${report.daemon_output}`,
+        "reissue the manifest through the publisher, then run the daemon's preflight verb with the new binary before replacing the installed one",
+      );
+    }
+  }
+  return ok(
+    MANIFEST_ADMISSION_CHECK_NAME,
+    `this host admits the installed manifest (${fortressIds.length} checked)`,
+    "none",
+  );
 }
 
 async function resolveMasterKeyIfAvailable(

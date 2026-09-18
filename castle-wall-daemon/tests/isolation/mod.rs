@@ -65,6 +65,19 @@ fn isolated() -> &'static Isolated {
 /// Take the suite lock and re-assert isolation on EVERY test entry. A poisoned
 /// lock is recovered rather than cascading: one failing test must not convert the
 /// rest into false failures.
+/// The write-ahead proof the per-agent kernel bind requires, minted WITHOUT a journal
+/// write for a suite that is exercising the kernel path rather than the journal one.
+///
+/// Available only here, in a `test-isolation` build. The production bind can obtain a
+/// proof ONLY from a successful journal write, which is what makes the persist
+/// unskippable outside these suites; the journal-order property itself is asserted by
+/// the crate's own write-ahead tests rather than by these kernel suites.
+pub fn write_ahead_receipt_for(
+    binding: castle_wall_daemon::nftables::AgentUidBinding,
+) -> castle_wall_daemon::ownership_journal::WriteAheadReceipt {
+    castle_wall_daemon::ownership_journal::WriteAheadReceipt::for_isolated_test(binding.agent_uid)
+}
+
 pub fn guard() -> MutexGuard<'static, ()> {
     let lock = SUITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let iso = isolated();

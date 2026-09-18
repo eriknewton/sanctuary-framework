@@ -214,114 +214,620 @@ fn acquire_failed(detail: impl Into<String>) -> EnforcementError {
     }
 }
 
-/// GF1.2 outcome of enforcing "no live `policy accept` castle table remains" on a
+// ---- The safety net's scope: the deny set, the kill set, and the seven rows ----
+
+/// How often the post-READY recovery controller retries a persist and an install.
+///
+/// DERIVATION: short enough that an operator repairing the wall sees the net
+/// re-arm within one breath, long enough that a persistently failing nft is not
+/// forked in a tight loop. One attempt is in flight at a time, so this is the
+/// floor on the interval between attempts, not a deadline on any one of them.
+/// Must match the `RECOVERY_RETRY_INTERVAL = 5 s` named in memo D1b step 7.
+pub const RECOVERY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// This boot's confined history, as the authenticated journal records it.
+///
+/// The two variants are NOT interchangeable and the distinction decides the net's
+/// scope: `Unknown` resolves host-wide whatever the manifest and the live table
+/// say, because a previous binary's record cannot prove which uids were bound.
+/// `Known(vec![])` is this binary's own record before any identity was bound, and
+/// resolves from the other two sources.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfinedHistory {
+    /// The journal's `confined` key is present. These are its uids.
+    Known(Vec<crate::ownership_journal::ConfinedIdentity>),
+    /// The journal's `confined` key is ABSENT on a same-boot record.
+    Unknown,
+}
+
+/// The resolved scope plus everything a refusal, an audit row and the PR-3 sweep
+/// each need from the same computation.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyNetResolution {
+    /// What the net will deny.
+    pub scope: crate::nftables::SafetyNetScope,
+    /// Why it has that scope.
+    pub reason: crate::nftables::SafetyNetReason,
+    /// The KILL set: sources (a) and (b) ONLY, ascending.
+    ///
+    /// INVARIANT: source (c) never enters this. A live kernel table is safe
+    /// authority for DENYING a uid, because denying a uid that turns out to be
+    /// nobody's costs nothing. It is NOT authority for TERMINATING that uid's
+    /// processes, because a `CAP_NET_ADMIN` actor can write a jump naming any uid
+    /// and would then be choosing whose processes this daemon kills. Only
+    /// identities a signed manifest admitted, as the MAC-covered journal records
+    /// them, may be killed. PR-3 consumes this; Part A only carries it.
+    pub kill_set: Vec<u32>,
+    /// Which sources contributed, for the audit row.
+    pub sources: crate::nftables::SafetyNetSources,
+    /// The FULL deny union this resolution computed, before the cap and the
+    /// host-wide fallbacks were applied.
+    ///
+    /// Carried separately from `scope` because `scope.denied_uids()` is EMPTY for the
+    /// host-wide shape, and the retained in-memory set is seeded from a resolution.
+    /// Seeding from the scope would discard a known over-capacity union entirely, and a
+    /// later recompute could then produce a NARROWER net than the process already knew
+    /// about. The monotonic retained set is defined over this field.
+    pub deny_union: Vec<u32>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl SafetyNetResolution {
+    /// The in-process retention floor is the complete union, including when
+    /// the installed scope is host-wide and names no individual uid.
+    fn retained_deny_uids(&self) -> &[u32] {
+        &self.deny_union
+    }
+}
+
+/// Resolve the safety net's scope from the three sources of memo D1b.
+///
+/// SOURCES:
+///   * (a) the `Owned` journal record's `confined` array (admitted identities
+///     only, MAC-covered, written ahead of every binding);
+///   * (b) the currently admitted identity: the agent uid and, when the manifest
+///     names one, the distinct gate uid;
+///   * (c) the `meta skuid` bindings the LIVE owned table declares, taken from the
+///     typed two-phase parse so a table that is ours but has drifted off the
+///     current manifest still contributes.
+///
+/// DENY SET = (a) union (b) union (c). KILL SET = (a) union (b) only.
+///
+/// UNKNOWN HISTORY overrides everything: an absent `confined` key on a same-boot
+/// `Owned` record resolves the net to `HostWide` whatever (b) and (c) say, because
+/// the pre-upgrade reload path removed stale jumps while never terminating a
+/// rotated-away uid's processes, so neither remaining source can prove the
+/// history. The kill set is still (b), which is safe to sweep and may be empty.
+///
+/// Pure over its inputs, so every row of the resolution matrix is unit-testable on
+/// a host with no kernel. `overflow` is the host's configured `kernel.overflowuid`,
+/// read once by the caller.
+#[cfg(any(target_os = "linux", test))]
+pub fn resolve_safety_net_scope(
+    history: &ConfinedHistory,
+    admitted: Option<(u32, Option<u32>)>,
+    live_bindings: &crate::nftables::LiveTableBindings,
+    overflow: crate::safety_net_uid::HostOverflowUid,
+) -> SafetyNetResolution {
+    use crate::nftables::{
+        LiveTableBindings, SafetyNetReason, SafetyNetScope, SafetyNetSources, DENY_SET_MAX,
+    };
+    use crate::safety_net_uid::{validate_safety_net_uid, ConfinedUidSet};
+
+    // Source (a).
+    let journal_uids: Vec<u32> = match history {
+        ConfinedHistory::Known(entries) => entries.iter().map(|e| e.uid).collect(),
+        ConfinedHistory::Unknown => Vec::new(),
+    };
+    // Source (b): the agent uid and the gate uid travel TOGETHER. The gate is a
+    // confined principal the manifest names, and with the wall gone its own allow
+    // rules are gone too, so denying the agent while sparing the gate would leave
+    // a confined principal with egress.
+    let mut manifest_uids: Vec<u32> = Vec::new();
+    if let Some((agent_uid, gate_uid)) = admitted {
+        manifest_uids.push(agent_uid);
+        if let Some(gate) = gate_uid {
+            manifest_uids.push(gate);
+        }
+    }
+    // Source (c).
+    let live_uids: Vec<u32> = match live_bindings {
+        LiveTableBindings::Bindings(uids) => uids.clone(),
+        // An unreadable or foreign table yields NOTHING. It is never read as
+        // "empty", because those two resolve the net to different scopes.
+        LiveTableBindings::NotOurTable { .. } | LiveTableBindings::Unreadable { .. } => Vec::new(),
+    };
+
+    let sources = SafetyNetSources {
+        journal: !journal_uids.is_empty(),
+        manifest: !manifest_uids.is_empty(),
+        live_table: !live_uids.is_empty(),
+    };
+
+    // KILL SET = (a) union (b). Computed before any host-wide short circuit,
+    // because unknown history still yields a kill set from (b).
+    let mut kill_set: Vec<u32> = journal_uids
+        .iter()
+        .chain(manifest_uids.iter())
+        .copied()
+        .collect();
+    kill_set.sort_unstable();
+    kill_set.dedup();
+
+    // The full union, computed before any cap or fallback, so every resolution carries
+    // what this process knows even when the SCOPE it installs names nobody.
+    let mut deny_union: Vec<u32> = journal_uids
+        .iter()
+        .chain(manifest_uids.iter())
+        .chain(live_uids.iter())
+        .copied()
+        .collect();
+    deny_union.sort_unstable();
+    deny_union.dedup();
+
+    let host_wide = |reason: SafetyNetReason| SafetyNetResolution {
+        scope: SafetyNetScope::HostWide,
+        reason,
+        kill_set: kill_set.clone(),
+        sources: sources.clone(),
+        deny_union: deny_union.clone(),
+    };
+
+    // UNKNOWN HISTORY short-circuits, and it is checked FIRST so no later branch
+    // can narrow the net over a previous binary's record.
+    if matches!(history, ConfinedHistory::Unknown) {
+        return host_wide(SafetyNetReason::UnknownHistory);
+    }
+
+    // DENY SET = (a) union (b) union (c), which is the union computed above.
+    let deny = deny_union.clone();
+    if deny.len() > DENY_SET_MAX {
+        // Over capacity: the identities are known EXACTLY but are too many to name
+        // in one rule. Nothing is truncated, because a dropped uid stops being
+        // denied, and the journal is untouched.
+        return host_wide(SafetyNetReason::DenySetOverCapacity {
+            count: deny.len(),
+            cap: DENY_SET_MAX,
+        });
+    }
+    // The three refusals apply to every member, whatever source it came from: a
+    // uid the kernel cannot attest to one principal must not be named in rule 1.
+    // A refused member is DROPPED from the deny set rather than failing the whole
+    // resolution, because the remaining members are still real identities that
+    // must be denied. Must match `validate_safety_net_uid`.
+    let validated: Vec<_> = deny
+        .iter()
+        .filter_map(|&uid| validate_safety_net_uid(uid, overflow).ok())
+        .collect();
+    match ConfinedUidSet::from_validated(validated) {
+        Ok(set) => SafetyNetResolution {
+            scope: SafetyNetScope::Identity(set),
+            reason: SafetyNetReason::Identity,
+            kill_set,
+            sources,
+            deny_union,
+        },
+        // An empty deny set: no confined identity was recoverable from any source.
+        Err(_) => host_wide(SafetyNetReason::EmptyDenySet),
+    }
+}
+
+/// Gather the three sources at a live Linux site and resolve the net's scope.
+///
+/// The journal record supplies source (a) and, critically, whether this boot's
+/// history is KNOWN at all. `Preparing` answers `Known(vec![])` for a different
+/// reason than a legacy `Owned` record answers `Unknown`: no binding preceded a
+/// `Preparing` record, so there is no history to be missing.
+///
+/// FAILURE MODE worth stating: if the host's `kernel.overflowuid` cannot be read
+/// this returns the HOST-WIDE scope with the empty-deny-set reason rather than
+/// guessing. That is the conservative direction (the net still denies the agent),
+/// and the refusal text says operator access is not preserved, so the outcome is
+/// visible rather than silent.
+#[cfg(target_os = "linux")]
+fn resolve_net_scope_at_site(
+    journal_record: Option<&crate::ownership_journal::OwnershipJournal>,
+    decision_engine: &DecisionEngine,
+) -> SafetyNetResolution {
+    use crate::nftables::{LiveTableBindings, SafetyNetReason, SafetyNetScope, SafetyNetSources};
+    use crate::ownership_journal::OwnershipJournal;
+
+    let history = match journal_record {
+        Some(OwnershipJournal::Owned { confined, .. }) => match confined {
+            Some(entries) => ConfinedHistory::Known(entries.clone()),
+            // The key is ABSENT: a record from a binary that predates the field.
+            None => ConfinedHistory::Unknown,
+        },
+        // No binding preceded a `Preparing` record, and an absent record is a fresh
+        // start; both are a known-empty history, resolved from the other sources.
+        Some(OwnershipJournal::Preparing { .. }) | None => ConfinedHistory::Known(Vec::new()),
+    };
+
+    // Source (b): the agent uid and the gate uid together, from the current
+    // snapshot. A `try_lock` that fails inside a live process is indeterminate and
+    // contributes nothing here; source (a) still names the binding this process
+    // wrote ahead of it, which is why the write-ahead exists.
+    let admitted = decision_engine.manifest_store().and_then(|store| {
+        store.try_lock().ok().and_then(|guard| {
+            guard.current_snapshot().and_then(|snapshot| {
+                snapshot
+                    .confined_agent_uid
+                    .map(|agent| (agent, snapshot.confined_gate_uid))
+            })
+        })
+    });
+
+    let overflow = match crate::safety_net_uid::HostOverflowUid::from_host() {
+        Ok(value) => value,
+        Err(_) => {
+            // No host value means no member can be validated, so no identity scope can
+            // be named and the host-wide shape is the conservative answer for the NET.
+            // The KILL SET is unaffected: it is (a) union (b), identities the signed
+            // manifest admitted as the MAC-covered journal records them, and none of
+            // that evidence depends on the sysctl. Dropping the journal half here would
+            // silently narrow whose processes PR-3 may terminate.
+            let mut kill_set: Vec<u32> = match &history {
+                ConfinedHistory::Known(entries) => entries.iter().map(|e| e.uid).collect(),
+                ConfinedHistory::Unknown => Vec::new(),
+            };
+            if let Some((agent, gate)) = admitted {
+                kill_set.push(agent);
+                if let Some(g) = gate {
+                    kill_set.push(g);
+                }
+            }
+            kill_set.sort_unstable();
+            kill_set.dedup();
+            return SafetyNetResolution {
+                scope: SafetyNetScope::HostWide,
+                reason: SafetyNetReason::EmptyDenySet,
+                kill_set: kill_set.clone(),
+                sources: SafetyNetSources {
+                    journal: matches!(history, ConfinedHistory::Known(ref e) if !e.is_empty()),
+                    manifest: admitted.is_some(),
+                    live_table: false,
+                },
+                // The union this process knows, even though the scope it installs names
+                // nobody: the retained set is seeded from here.
+                deny_union: kill_set.clone(),
+            };
+        }
+    };
+
+    // Source (c): the live table's own skuid bindings. Read AFTER the overflow value,
+    // because recognising this daemon's own net needs it: when the live table IS the
+    // net, (c) is rule 1's set, which is the set currently denying traffic in the
+    // kernel. Through the typed two-phase parse otherwise, so an owned table that has
+    // drifted off the current manifest still contributes its uids.
+    let expectation = current_expected_agent_binding(decision_engine);
+    let live = match crate::nftables::list_castle_table_json() {
+        Ok(Some(json)) => crate::nftables::live_table_uid_bindings(&json, &expectation, overflow),
+        // No table at all is not a parse failure and not a foreign table.
+        Ok(None) => LiveTableBindings::Bindings(Vec::new()),
+        Err(err) => LiveTableBindings::Unreadable {
+            detail: err.to_string(),
+        },
+    };
+    resolve_safety_net_scope(&history, admitted, &live, overflow)
+}
+
+/// Write the kill set ((a) union (b)) to the journal AHEAD of a kernel step, and
+/// keep UNKNOWN HISTORY unknown.
+///
+/// INVARIANT, state-indexed (memo D1b step 6): while the `confined` key is ABSENT
+/// on a same-boot `Owned` record, NO store may materialise it. Writing the current
+/// identity over an absent key would turn unknown history into KNOWN history on the
+/// next start and let a rotated-away uid out of the net. So this function writes
+/// only when the history is already known, and otherwise re-stores the record with
+/// the key still omitted.
+///
+/// Returns the error for a caller to RECORD. Whether a failed persist aborts the
+/// caller's kernel step is the caller's decision and differs per row: the BIND row
+/// refuses, every net-install row proceeds, because installing the net makes no uid
+/// live and so cannot outrun the journal.
+#[cfg(target_os = "linux")]
+fn persist_kill_set_write_ahead(
+    journal_path: &std::path::Path,
+    key: Option<&crate::ownership_journal::JournalAuthKey>,
+    record: &crate::ownership_journal::OwnershipJournal,
+    kill_set: &[u32],
+    admitted: Option<(u32, Option<u32>)>,
+) -> Result<(), String> {
+    use crate::ownership_journal::{ConfinedIdentity, ConfinedRole, OwnershipJournal};
+    let key = key.ok_or_else(|| {
+        "no journal authentication key is available, so the confined history cannot be \
+         written ahead of the kernel step"
+            .to_string()
+    })?;
+    let OwnershipJournal::Owned {
+        identity,
+        table_handle,
+        base_chain_handle,
+        confined,
+    } = record
+    else {
+        // A `Preparing` record carries no history to extend; the write-ahead for a
+        // fresh create happens when the record becomes `Owned`.
+        return Ok(());
+    };
+    let next = match confined {
+        // UNKNOWN HISTORY stays unknown: re-store with the key omitted.
+        None => OwnershipJournal::owned_with_unknown_history(
+            identity.clone(),
+            *table_handle,
+            *base_chain_handle,
+        ),
+        Some(existing) => {
+            // Union the recorded history with the currently admitted identity,
+            // tagging each uid with the role the manifest gave it. The union only
+            // grows within a boot; a uid leaves it on disarm or reboot.
+            let mut merged = existing.clone();
+            let mut add = |uid: u32, role: ConfinedRole| {
+                if !merged.iter().any(|e| e.uid == uid) {
+                    merged.push(ConfinedIdentity { uid, role });
+                }
+            };
+            if let Some((agent, gate)) = admitted {
+                add(agent, ConfinedRole::Agent);
+                if let Some(g) = gate {
+                    add(g, ConfinedRole::Gate);
+                }
+            }
+            // Anything in the kill set that the manifest no longer names is an
+            // earlier admitted identity; it keeps its recorded role, and a uid that
+            // reached the kill set from source (a) is already present.
+            let _ = kill_set;
+            OwnershipJournal::owned_with_known_history(
+                identity.clone(),
+                *table_handle,
+                *base_chain_handle,
+                merged,
+            )
+            .map_err(|err| err.to_string())?
+        }
+    };
+    crate::ownership_journal::store_atomic(journal_path, &next, key).map_err(|err| err.to_string())
+}
+
+/// Build the `Owned` record to store, PRESERVING this boot's history state.
+///
+/// INVARIANT (memo D1b step 6, state-indexed): if the record already on disk has
+/// the `confined` key ABSENT, the new record must keep it absent. Writing the
+/// currently admitted identity over an absent key would turn UNKNOWN history into
+/// KNOWN history on the next start, and a uid this daemon rotated away from (whose
+/// processes it never terminated) would then be omitted from the net.
+///
+/// Otherwise the history is known and the currently admitted identity is UNIONED
+/// into it, tagged with the role the manifest gave each uid. This is the write-ahead
+/// itself: it runs under the host lock BEFORE the kernel step that makes the uid
+/// live, so a crash between the two leaves the journal naming MORE than the kernel
+/// does, never less.
+#[cfg(target_os = "linux")]
+fn owned_record_preserving_history(
+    journal_path: &std::path::Path,
+    key: &crate::ownership_journal::JournalAuthKey,
+    identity: crate::ownership_journal::JournalIdentity,
+    table_handle: u64,
+    base_chain_handle: u64,
+    admitted: Option<(u32, Option<u32>)>,
+) -> Result<crate::ownership_journal::OwnershipJournal, EnforcementError> {
+    use crate::ownership_journal::{
+        self as journal, ConfinedIdentity, ConfinedRole, OwnershipJournal,
+    };
+    // A read failure here must not be turned into "history is known": that is the
+    // direction that loses a rotated-away uid. Treat it as unknown.
+    let existing = journal::load(journal_path, Some(key)).ok().flatten();
+    let prior = match existing.as_ref() {
+        Some(OwnershipJournal::Owned { confined, .. }) => confined.clone(),
+        // A `Preparing` record or no record means no history has been recorded yet,
+        // which is known-empty, not unknown.
+        _ => Some(Vec::new()),
+    };
+    let Some(mut history) = prior else {
+        return Ok(OwnershipJournal::owned_with_unknown_history(
+            identity,
+            table_handle,
+            base_chain_handle,
+        ));
+    };
+    if let Some((agent, gate)) = admitted {
+        if !history.iter().any(|e| e.uid == agent) {
+            history.push(ConfinedIdentity {
+                uid: agent,
+                role: ConfinedRole::Agent,
+            });
+        }
+        if let Some(g) = gate {
+            if !history.iter().any(|e| e.uid == g) {
+                history.push(ConfinedIdentity {
+                    uid: g,
+                    role: ConfinedRole::Gate,
+                });
+            }
+        }
+    }
+    OwnershipJournal::owned_with_known_history(identity, table_handle, base_chain_handle, history)
+        .map_err(|err| {
+            acquire_failed(format!(
+                "this boot's confined identity history cannot take another binding: {err}"
+            ))
+        })
+}
+
+/// Source (b) alone: the identity the current signed manifest admits, agent uid
+/// and gate uid together.
+///
+/// A failed `try_lock` inside a live process is INDETERMINATE and yields `None`
+/// here. That is why the write-ahead exists: source (a) still names the binding
+/// this process wrote to the journal before it made the uid live, so an
+/// indeterminate snapshot read cannot narrow the net.
+#[cfg(target_os = "linux")]
+fn admitted_identity(decision_engine: &DecisionEngine) -> Option<(u32, Option<u32>)> {
+    let store = decision_engine.manifest_store()?;
+    let guard = store.try_lock().ok()?;
+    let snapshot = guard.current_snapshot()?;
+    snapshot
+        .confined_agent_uid
+        .map(|agent| (agent, snapshot.confined_gate_uid))
+}
+
+/// The PR-3 sweep hook. It is intentionally empty in Part A.
+/// The private register owns the remaining acceptance bound. It is called here,
+/// at the exact sites memo D1b step 7 names, so PR-3 changes one function body
+/// instead of finding five call sites: after a FAILED install on the four install
+/// rows, and before the exit on both nft-indeterminate rows. It is NEVER called on
+/// the BIND row (no kernel step happens there) nor on a non-nft loss (the table is
+/// intact), and never after a SUCCESSFUL install.
+///
+/// `kill_set` is sources (a) and (b) only, never the live table's bindings.
+#[cfg(any(target_os = "linux", test))]
+fn safety_net_sweep_hook_pr3(kill_set: &[u32], why: &str) {
+    // Deliberately empty. Reading the arguments keeps the signature honest about
+    // what PR-3 will consume and keeps this from being optimised into nothing that
+    // a reviewer could mistake for a wired sweep.
+    let _ = (kill_set, why);
+}
+
 /// reclaim drift. See [`drift_enforce_fail_closed`].
 #[cfg(any(target_os = "linux", test))]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum DriftFailClosedOutcome {
-    /// The deny-all net installed; the drifted table is now `policy drop`.
+    /// The safety net installed; the drifted table now carries the net's scope.
     NetInstalled,
-    /// The net install FAILED, so the drifted table was force-deleted by name and
-    /// no castle table (hence no `policy accept` path) remains.
-    EscalatedDeleteOk,
-    /// The net install FAILED and the escalating by-name delete ALSO failed: the
-    /// kernel egress state is genuinely indeterminate (loud refusal upstream).
+    /// The net install FAILED. The PR-3 sweep hook ran, and the table is LEFT
+    /// STANDING.
+    ///
+    /// INVARIANT: Part A performs NO table deletion outside the disarm verb. A
+    /// castle table that is present is one the disarm verb can still reason about,
+    /// and removing the table would remove the only egress gate this daemon
+    /// controls without putting anything in its place. The action that constrains
+    /// the confined identity on this branch is the sweep, which is PR-3's; until it
+    /// lands this branch carries the bound the register rows record.
     ///
     /// Tracked in the private register as
     /// `defect.linux-gf1-2-deny-all-and-escalating-delete-both-fail-leaves-kernel-state-indeterminate`.
-    /// A residual described only in prose is not owned risk (AGENTS rule 9);
-    /// the register row is the record and this line is its pointer.
-    Indeterminate { net_err: String, delete_err: String },
+    /// A residual described only in prose is not owned risk (AGENTS rule 9); the
+    /// register row is the record and this line is its pointer.
+    InstallFailedSweepHooked { net_err: String },
 }
 
-/// GF1.2: on a reclaim DRIFT, guarantee no live `policy accept` castle table can
-/// remain. The deny-all net install is REQUIRED, not best-effort; if it FAILS,
-/// escalate to a by-name delete so the host has NO castle-accept path. Injectable
-/// installer/deleter so the fail-closed escalation SEQUENCE is unit-testable
-/// without a broken nft (the production call site passes the real nft fns).
+/// GF1.2: on a reclaim DRIFT, install the safety net for the resolved scope.
+///
+/// The install is REQUIRED, not best-effort. On FAILURE the PR-3 sweep hook runs
+/// and the table is left standing; see
+/// [`DriftFailClosedOutcome::InstallFailedSweepHooked`] for why Part A no longer
+/// escalates to a by-name delete. Injectable installer so the sequence is
+/// unit-testable without a broken nft.
 #[cfg(any(target_os = "linux", test))]
 fn drift_enforce_fail_closed(
     install_deny_all: impl FnOnce() -> Result<(), crate::nftables::NftablesError>,
-    force_delete: impl FnOnce() -> Result<(), crate::nftables::NftablesError>,
+    kill_set: &[u32],
 ) -> DriftFailClosedOutcome {
     match install_deny_all() {
         Ok(()) => DriftFailClosedOutcome::NetInstalled,
-        Err(net_err) => match force_delete() {
-            Ok(()) => DriftFailClosedOutcome::EscalatedDeleteOk,
-            Err(delete_err) => DriftFailClosedOutcome::Indeterminate {
+        Err(net_err) => {
+            // The hook fires ONLY after a failed install, never after a successful
+            // one: a net that is in the kernel already denies the identity, and
+            // terminating its processes on top of that would be an action with no
+            // protection left to add.
+            safety_net_sweep_hook_pr3(
+                kill_set,
+                "reclaim drift: the safety net install failed before readiness was refused",
+            );
+            DriftFailClosedOutcome::InstallFailedSweepHooked {
                 net_err: net_err.to_string(),
-                delete_err: delete_err.to_string(),
-            },
-        },
+            }
+        }
     }
 }
 
-/// GF1.3: install the deny-all net at most once (latched), retrying on failure.
-/// Returns true iff this call installed it. Injectable installer + force-deleter so
-/// the latch + retry + fail-closed escalation are unit-testable without a
-/// live/broken nft; the production caller
-/// ([`NftablesTableComponent::ensure_runtime_loss_deny_all_net`]) passes the real
-/// installer and by-name deleter. A FAILED install does NOT set the latch, so the
-/// next health poll retries rather than silently giving up on a table-less host.
-///
-/// GF1.3 fail-closed escalation (mirrors GF1.2 [`drift_enforce_fail_closed`]): a
-/// runtime-loss `Lost` can observe an owned table that DRIFTED to `policy accept`.
-/// If the deny-all net install FAILS, leaving that live accept path up until a
-/// later retry is a fail-OPEN window, so we ESCALATE to a by-name delete exactly as
-/// the reclaim drift path does. INVARIANT: no live `policy accept` castle table may
-/// remain after a completed runtime loss is observed -- this holds on the install
-/// FAILURE branch (via the escalating delete), not only on the success branch. The
-/// latch stays unset either way, so the proper deny-all net (our table at `policy
-/// drop`) is still retried on the next health poll.
+/// One post-READY safety-net install transaction, injectable so retries and the
+/// failed-install-only hook are unit-testable without a live nft. A prior success
+/// does not prove that an external actor left the net in place: each eligible
+/// completed loss must execute this transaction again. Part A never deletes the
+/// table on failure.
 #[cfg(any(target_os = "linux", test))]
-fn ensure_deny_all_net_installed_once(
-    latch: &std::sync::atomic::AtomicBool,
+fn install_deny_all_net_for_recovery(
     install: impl FnOnce() -> Result<(), crate::nftables::NftablesError>,
-    force_delete: impl FnOnce() -> Result<(), crate::nftables::NftablesError>,
+    kill_set: &[u32],
 ) -> bool {
-    use std::sync::atomic::Ordering;
-    if latch.load(Ordering::SeqCst) {
-        return false;
-    }
     match install() {
-        Ok(()) => {
-            latch.store(true, Ordering::SeqCst);
-            true
-        }
+        Ok(()) => true,
         Err(net_err) => {
-            // Fail-closed escalation: the deny-all install failed, so an owned table
-            // that drifted to `policy accept` would otherwise stay LIVE until a
-            // later retry. Force-delete our table by name so no `policy accept`
-            // castle path remains (same this-boot authority as the GF1.2 drift path;
-            // the delete only ever targets OUR name). The latch stays unset so the
-            // proper deny-all net is retried on the next health poll.
-            match force_delete() {
-                Ok(()) => {
-                    // SAFETY: stderr is the operator channel for a kernel-egress escalation.
-                    // These branches report what the daemon did to the host's live nft state
-                    // after a safety-net install failed; systemd's journal is where an operator
-                    // reconstructs that sequence.
-                    eprintln!(
-                        "castle-wall-daemon: owned nft table lost at runtime and installing the \
-                         deny-all safety net FAILED; ESCALATED to a by-name delete so no live \
-                         `policy accept` castle table remains; will retry the deny-all net on the \
-                         next health poll: {net_err}"
-                    );
-                }
-                Err(delete_err) => {
-                    // SAFETY: same escalation channel as the branch above; this is the
-                    // both-attempts-failed case, where kernel egress state is indeterminate and
-                    // the operator must be told so in the journal.
-                    eprintln!(
-                        "castle-wall-daemon: owned nft table lost at runtime; BOTH the deny-all \
-                         safety net install AND the escalating by-name delete FAILED (kernel \
-                         egress state is genuinely indeterminate; a drifted `policy accept` castle \
-                         table may still be live); will retry on the next health poll: \
-                         net={net_err} delete={delete_err}"
-                    );
-                }
-            }
+            safety_net_sweep_hook_pr3(
+                kill_set,
+                "runtime loss: the safety net install failed and will be retried",
+            );
+            // SAFETY: stderr is the operator channel for a kernel-egress escalation.
+            // systemd's journal is where an operator reconstructs this sequence.
+            eprintln!(
+                "castle-wall-daemon: owned nft table lost at runtime and installing the \
+                 safety net FAILED; the castle table is left standing and the net is \
+                 retried on the next poll: {net_err}"
+            );
             false
+        }
+    }
+}
+
+/// The caller's completed Lost reading is the first recovery proof. Only later
+/// Recovering polls need a fresh ownership query; an unavailable second query
+/// must not veto the first protective install.
+#[cfg(any(target_os = "linux", test))]
+fn post_ready_recovery_proof(
+    retrying: bool,
+    reprobe: impl FnOnce() -> crate::health_probe::ProbeOutcome,
+) -> crate::health_probe::ProbeOutcome {
+    if retrying {
+        reprobe()
+    } else {
+        crate::health_probe::ProbeOutcome::Lost
+    }
+}
+
+/// Consume the probe's completed positive proof even when it arrives after an
+/// earlier caller timed out. This changes only recovery bookkeeping: `health()`
+/// remains a read and performs no kernel install or delete.
+#[cfg(any(target_os = "linux", test))]
+fn post_ready_component_health(
+    outcome: crate::health_probe::ProbeOutcome,
+    recovering: &std::sync::atomic::AtomicBool,
+    last_attempt: &std::sync::Mutex<Option<std::time::Instant>>,
+) -> crate::enforcement::ComponentHealth {
+    use crate::enforcement::ComponentHealth;
+    use crate::health_probe::ProbeOutcome;
+    use std::sync::atomic::Ordering;
+
+    match outcome {
+        ProbeOutcome::Ready => {
+            if recovering.swap(false, Ordering::SeqCst) {
+                let mut last = match last_attempt.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *last = None;
+            }
+            ComponentHealth::Ready
+        }
+        ProbeOutcome::Lost => {
+            if recovering.load(Ordering::SeqCst) {
+                ComponentHealth::Recovering
+            } else {
+                ComponentHealth::Lost
+            }
+        }
+        ProbeOutcome::Unavailable => {
+            if recovering.load(Ordering::SeqCst) {
+                ComponentHealth::Recovering
+            } else {
+                ComponentHealth::ProbeUnavailable
+            }
+        }
+        ProbeOutcome::Indeterminate => {
+            recovering.store(false, Ordering::SeqCst);
+            ComponentHealth::Indeterminate
         }
     }
 }
@@ -434,12 +940,34 @@ impl ComponentProvider for NftablesTableProvider {
                 }
             };
 
-            let ownership = match journal::decide(
+            // THE NEVER-ADOPT RULE, applied HERE and only here (memo D1b step 6).
+            //
+            // A same-boot `Owned` record whose `confined` key is ABSENT cannot prove
+            // which uids were bound during this boot, so this acquisition must not adopt
+            // its table however well the live identity matches: adopting would write a
+            // history naming only the CURRENT identity, marking this boot known, and a
+            // uid this daemon rotated away from would then be omitted from the net on
+            // the next start.
+            //
+            // It is ACQUISITION-SPECIFIC on purpose. The disarm verb consumes the same
+            // shared `journal::decide` routing, and a legacy record whose live table is
+            // the recognised net must still reach disarm's `ReclaimOwned` arm to be
+            // cleared. Putting the rule in `decide` would take that arm away. Must match
+            // the `ReclaimOwned` arm in `disarm_castle_runtime`, which PR-2 extends.
+            let decision = journal::decide(existing.as_ref(), table_present, &boot_id, &source);
+            let history_unknown_this_boot = matches!(
                 existing.as_ref(),
-                table_present,
-                &boot_id,
-                &source,
-            ) {
+                Some(crate::ownership_journal::OwnershipJournal::Owned { confined: None, .. })
+            );
+            let decision = match (&decision, history_unknown_this_boot) {
+                (ReclaimDecision::ReclaimOwned { .. }, true) => {
+                    // Route to the boot owner instead: it installs the host-wide net for
+                    // the unknown-history reason and skips the persist entirely.
+                    ReclaimDecision::ReArmLostOwned
+                }
+                _ => decision,
+            };
+            let ownership = match decision {
                 // A live table our Owned journal describes for THIS boot:
                 // re-verify the EXACT identity (handles + marker + pristine
                 // shape) still holds, then reclaim it. A drift (replaced,
@@ -478,42 +1006,79 @@ impl ComponentProvider for NftablesTableProvider {
                         // table we cannot prove is ours (RefuseForeign, which has
                         // no such proof, still never installs deny-all).
                         //
-                        // GF1.2 fail-closed post-condition: the deny-all install
-                        // is REQUIRED, not best-effort. If it FAILS, the drifted
-                        // (possibly `policy accept`) table would otherwise stay
-                        // live while we refuse -- a fail-OPEN residual. Escalate
-                        // to the strongest available fail-closed action: delete
-                        // the drifted table by name so NO live `policy accept`
-                        // castle path can remain (the daemon refuses readiness,
-                        // so no agent is launched behind the table-less host).
-                        // Post-condition after this block, install-ok or not: a
-                        // live `policy accept` sanctuary-castle table never
-                        // remains. If BOTH the net install and the escalating
-                        // delete fail, the kernel state is genuinely
-                        // indeterminate and the loud refusal says so.
-                        let refuse_detail = match drift_enforce_fail_closed(
-                            crate::nftables::install_deny_all_safety_net,
-                            crate::nftables::force_delete_castle_table_by_name,
+                        // A net-install failure refuses readiness and retains the
+                        // table for the disarm verb. This acquisition path never
+                        // deletes a table by name; D5 owns the separate escalation.
+                        // MEMO D1b STEP 7, the two BOOT rows, which differ only in
+                        // whether this boot's history is known:
+                        //
+                        //  * KNOWN HISTORY: persist the kill set BEST-EFFORT, then
+                        //    install the net REGARDLESS of the persist result, then the
+                        //    sweep hook on a failed install, then return the acquisition
+                        //    error naming any persist failure. Installing makes no uid
+                        //    live, so a failed persist must never stop the install; the
+                        //    live table's bindings recover the set on the next start.
+                        //  * ABSENT KEY: NEVER persist (a write would turn unknown
+                        //    history into known history and let a rotated-away uid out),
+                        //    install host-wide, the hook on a failed install, return.
+                        //
+                        // The resolver returns the host-wide scope with the
+                        // `unknown-history` reason for the absent-key case, so the
+                        // persist is skipped by checking that reason, not by a second
+                        // read of the journal.
+                        let resolution =
+                            resolve_net_scope_at_site(existing.as_ref(), &self.decision_engine);
+                        let mut persist_failure: Option<String> = None;
+                        if resolution.reason != crate::nftables::SafetyNetReason::UnknownHistory {
+                            if let Some(record) = existing.as_ref() {
+                                let admitted = admitted_identity(&self.decision_engine);
+                                if let Err(err) = persist_kill_set_write_ahead(
+                                    journal_path,
+                                    key_opt.as_ref(),
+                                    record,
+                                    &resolution.kill_set,
+                                    admitted,
+                                ) {
+                                    persist_failure = Some(err);
+                                }
+                            }
+                        }
+                        let scope_sentence = crate::nftables::safety_net_scope_sentence(
+                            &resolution.scope,
+                            &resolution.reason,
+                        );
+                        let (refuse_detail, net_installed) = match drift_enforce_fail_closed(
+                            || crate::nftables::install_deny_all_safety_net(&resolution.scope),
+                            &resolution.kill_set,
                         ) {
-                            DriftFailClosedOutcome::NetInstalled => format!(
-                                "journal marks an owned table but the live table no longer \
-                                 matches the captured identity; installed a deny-all safety net \
-                                 and refusing to adopt or clobber the drifted table: {err}"
+                            DriftFailClosedOutcome::NetInstalled => (
+                                format!(
+                                    "journal marks an owned table but the live table no longer \
+                                 matches the captured identity; installed the safety net and \
+                                 refusing to adopt or clobber the drifted table: {err}. \
+                                 {scope_sentence}"
+                                ),
+                                true,
                             ),
-                            DriftFailClosedOutcome::EscalatedDeleteOk => format!(
-                                "journal marks an owned table but the live table drifted; the \
-                                 deny-all safety net FAILED to install, so escalated to deleting \
-                                 the drifted table by name (no live `policy accept` castle path \
-                                 remains); refusing readiness: {err}"
+                            DriftFailClosedOutcome::InstallFailedSweepHooked { net_err } => (
+                                format!(
+                                    "owned kernel runtime could not be verified; safety net \
+                                     installation did not complete ({net_err}); refusing \
+                                     readiness: {err}. {}",
+                                    crate::nftables::SAFETY_NET_REPAIR_ORDER
+                                ),
+                                false,
                             ),
-                            DriftFailClosedOutcome::Indeterminate {
-                                net_err,
-                                delete_err,
-                            } => format!(
-                                "journal marks an owned table but the live table drifted; BOTH the \
-                                 deny-all safety net install ({net_err}) and the escalating \
-                                 by-name delete ({delete_err}) failed -- kernel egress state is \
-                                 indeterminate; refusing readiness: {err}"
+                        };
+                        let refuse_detail = match persist_failure {
+                            None => refuse_detail,
+                            Some(persist_err) if net_installed => format!(
+                                "{refuse_detail} The confined history could not be written to \
+                                 the journal ({persist_err}); the next start retries the write."
+                            ),
+                            Some(persist_err) => format!(
+                                "{refuse_detail} The confined history could not be written to \
+                                 the journal ({persist_err})."
                             ),
                         };
                         drop(lock);
@@ -557,6 +1122,7 @@ impl ComponentProvider for NftablesTableProvider {
                                         key_path,
                                         &boot_id,
                                         &source,
+                                        admitted_identity(&self.decision_engine),
                                     ) {
                                         Ok(recovered) => recovered,
                                         Err(recover_err) => {
@@ -593,7 +1159,14 @@ impl ComponentProvider for NftablesTableProvider {
                     // If we recovered above, the journal is already the fresh
                     // Owned record; finalize_owned is idempotent (rewrites Owned
                     // with the captured handles) so re-running it is safe.
-                    finalize_owned(journal_path, key_path, &owned, &boot_id, &source)?;
+                    finalize_owned(
+                        journal_path,
+                        key_path,
+                        &owned,
+                        &boot_id,
+                        &source,
+                        admitted_identity(&self.decision_engine),
+                    )?;
                     owned
                 }
                 // A live table with no ownership proof: refuse, never delete.
@@ -617,26 +1190,76 @@ impl ComponentProvider for NftablesTableProvider {
                 // wall; systemd restarts into the same deny-all state until the
                 // wall is repaired.
                 ReclaimDecision::ReArmLostOwned => {
-                    crate::nftables::install_deny_all_safety_net().map_err(|err| {
-                        acquire_failed(format!(
-                            "owned sanctuary-castle table vanished while the journal still \
-                                 asserts ownership, and installing the deny-all safety net FAILED \
-                                 (kernel egress state indeterminate): {err}"
-                        ))
-                    })?;
+                    // MEMO D1b STEP 7, the same two BOOT rows as the drift site: the
+                    // owned table vanished while the journal still asserts ownership, so
+                    // agents adopted earlier in this boot may still be live. Persist the
+                    // kill set best-effort unless the history is unknown, then install
+                    // REGARDLESS of the persist result.
+                    let resolution =
+                        resolve_net_scope_at_site(existing.as_ref(), &self.decision_engine);
+                    let mut persist_failure: Option<String> = None;
+                    if resolution.reason != crate::nftables::SafetyNetReason::UnknownHistory {
+                        if let Some(record) = existing.as_ref() {
+                            let admitted = admitted_identity(&self.decision_engine);
+                            if let Err(err) = persist_kill_set_write_ahead(
+                                journal_path,
+                                key_opt.as_ref(),
+                                record,
+                                &resolution.kill_set,
+                                admitted,
+                            ) {
+                                persist_failure = Some(err);
+                            }
+                        }
+                    }
+                    let scope_sentence = crate::nftables::safety_net_scope_sentence(
+                        &resolution.scope,
+                        &resolution.reason,
+                    );
+                    if let Err(err) =
+                        crate::nftables::install_deny_all_safety_net(&resolution.scope)
+                    {
+                        // The sweep hook fires ONLY after a failed install.
+                        safety_net_sweep_hook_pr3(
+                            &resolution.kill_set,
+                            "boot-time owned-table loss: the safety net install failed",
+                        );
+                        drop(lock);
+                        return Err(acquire_failed(format!(
+                            "owned kernel runtime could not be verified; safety net installation \
+                             did not complete ({err}); refusing readiness. {}",
+                            crate::nftables::SAFETY_NET_REPAIR_ORDER
+                        )));
+                    }
                     drop(lock);
-                    return Err(acquire_failed(
+                    // The net is in the kernel. Refuse readiness and name the scope, so
+                    // an operator reading the journal knows immediately whether their own
+                    // session is affected, and name any persist failure, which the next
+                    // start retries.
+                    let persisted = match persist_failure {
+                        None => String::new(),
+                        Some(err) => format!(
+                            " The confined history could not be written to the journal \
+                             ({err}); the net is installed anyway, because installing it \
+                             makes no uid live, and the next start retries the write."
+                        ),
+                    };
+                    return Err(acquire_failed(format!(
                         "owned sanctuary-castle table vanished (external delete) while the \
-                             ownership journal still asserts ownership; installed a deny-all \
-                             safety net (all egress for the owned scopes dropped) and refusing \
-                             readiness until the wall is repaired -- never re-arming policy accept",
-                    ));
+                         ownership journal still asserts ownership; installed the safety net \
+                         and refusing readiness until the wall is repaired, never re-arming \
+                         policy accept. {scope_sentence}{persisted}"
+                    )));
                 }
                 // No live table: fresh acquisition via prepare -> atomic create
                 // -> capture/verify -> finalize.
-                ReclaimDecision::FreshCreate => {
-                    fresh_acquire(journal_path, key_path, &boot_id, &source)?
-                }
+                ReclaimDecision::FreshCreate => fresh_acquire(
+                    journal_path,
+                    key_path,
+                    &boot_id,
+                    &source,
+                    admitted_identity(&self.decision_engine),
+                )?,
             };
 
             crate::nftables::activate_runtime_ownership(&ownership).map_err(|err| {
@@ -645,13 +1268,28 @@ impl ComponentProvider for NftablesTableProvider {
                 ))
             })?;
 
+            // Seed the retained deny set from the resolution this acquisition just
+            // computed, so a later loss installs the net from an IN-MEMORY set rather
+            // than depending on a journal read that may itself be failing.
+            // A host-wide scope has no rules, but its full union must survive
+            // for every later retry in this process.
+            let seeded = resolve_net_scope_at_site(existing.as_ref(), &self.decision_engine)
+                .retained_deny_uids()
+                .to_vec();
             Ok(Box::new(NftablesTableComponent {
                 lock: Some(lock),
                 ownership,
                 decision_engine: Arc::clone(&self.decision_engine),
                 probe: crate::health_probe::BoundedHealthProbe::new(nft_health_budget()),
                 released: false,
-                deny_all_net_installed: std::sync::atomic::AtomicBool::new(false),
+                journal_path: journal_path.to_path_buf(),
+                journal_key_path: key_path.to_path_buf(),
+                retained_deny_uids: std::sync::Mutex::new(seeded),
+                recovering: std::sync::atomic::AtomicBool::new(false),
+                last_recovery_attempt: std::sync::Mutex::new(None),
+                last_safety_net_state: std::sync::Mutex::new(
+                    crate::nftables::SafetyNetAuditState::NotAttempted,
+                ),
             }))
         }
         #[cfg(not(target_os = "linux"))]
@@ -689,6 +1327,9 @@ fn fresh_acquire(
     key_path: &std::path::Path,
     boot_id: &str,
     source: &str,
+    // The identity the current signed manifest admits, threaded in so the journal
+    // records it BEFORE the kernel step that can make the uid live.
+    admitted: Option<(u32, Option<u32>)>,
 ) -> Result<crate::nftables::CastleTableOwnership, EnforcementError> {
     use crate::ownership_journal::{self as journal, JournalIdentity, OwnershipJournal};
 
@@ -747,15 +1388,17 @@ fn fresh_acquire(
     // reclaims via FinalizeInterrupted (marker match) and re-finalizes. Deleting
     // here would violate fail-closed preservation of an acquired enforcement
     // object.
-    if let Err(err) = journal::store_atomic(
+    // WRITE-AHEAD at a fresh create: the record carries the admitted identity
+    // before any per-agent binding can make that uid live.
+    let record = owned_record_preserving_history(
         journal_path,
-        &OwnershipJournal::Owned {
-            identity,
-            table_handle: owned.table_handle,
-            base_chain_handle: owned.base_chain_handle,
-        },
         &key,
-    ) {
+        identity,
+        owned.table_handle,
+        owned.base_chain_handle,
+        admitted,
+    )?;
+    if let Err(err) = journal::store_atomic(journal_path, &record, &key) {
         return Err(acquire_failed(format!(
             "could not durably finalize the Owned ownership journal; preserving the created \
              table + Preparing record for a restart to reclaim (no rollback): {err}"
@@ -784,6 +1427,7 @@ fn recover_from_deny_all_net(
     key_path: &std::path::Path,
     boot_id: &str,
     source: &str,
+    admitted: Option<(u32, Option<u32>)>,
 ) -> Result<crate::nftables::CastleTableOwnership, EnforcementError> {
     use crate::ownership_journal::{self as journal, JournalIdentity, OwnershipJournal};
 
@@ -823,7 +1467,7 @@ fn recover_from_deny_all_net(
              identity; leaving it for a restart to reclaim rather than clobbering: {err}"
         ))
     })?;
-    finalize_owned(journal_path, key_path, &owned, boot_id, source)?;
+    finalize_owned(journal_path, key_path, &owned, boot_id, source, admitted)?;
     Ok(owned)
 }
 
@@ -838,22 +1482,29 @@ fn finalize_owned(
     owned: &crate::nftables::CastleTableOwnership,
     boot_id: &str,
     source: &str,
+    admitted: Option<(u32, Option<u32>)>,
 ) -> Result<(), EnforcementError> {
-    use crate::ownership_journal::{self as journal, JournalIdentity, OwnershipJournal};
+    use crate::ownership_journal::{self as journal, JournalIdentity};
     // A Preparing record (and therefore its authentication key) already exists on
     // this path; load_or_generate reads it (never generates a spurious second).
     let key = journal::load_or_generate_auth_key(key_path)
         .map_err(|err| acquire_failed(format!("journal authentication key unusable: {err}")))?;
-    let record = OwnershipJournal::Owned {
-        identity: JournalIdentity {
+    // WRITE-AHEAD, and it PRESERVES unknown history: this function is idempotent
+    // and is re-run on a reclaim, so a legacy record whose `confined` key is absent
+    // must come back out with the key still absent.
+    let record = owned_record_preserving_history(
+        journal_path,
+        &key,
+        JournalIdentity {
             schema_version: journal::JOURNAL_SCHEMA_VERSION,
             marker: owned.marker.clone(),
             boot_id: boot_id.to_string(),
             source: source.to_string(),
         },
-        table_handle: owned.table_handle,
-        base_chain_handle: owned.base_chain_handle,
-    };
+        owned.table_handle,
+        owned.base_chain_handle,
+        admitted,
+    )?;
     journal::store_atomic(journal_path, &record, &key).map_err(|err| {
         acquire_failed(format!(
             "could not finalize the reclaimed Owned ownership journal: {err}"
@@ -891,11 +1542,33 @@ struct NftablesTableComponent {
     /// poller from stacking `nft` forks. See [`crate::health_probe`].
     probe: crate::health_probe::BoundedHealthProbe,
     released: bool,
-    /// GF1.3: latches once the runtime-loss deny-all safety net has been installed
-    /// by `health()`, so a repeatedly-polled `Lost` health does not re-fork `nft`
-    /// to reinstall the (idempotent) net on every supervisor tick. Interior
-    /// mutability because `health()` takes `&self`.
-    deny_all_net_installed: std::sync::atomic::AtomicBool,
+    /// Where this component's own journal record lives, so a startup-loss or
+    /// post-READY recovery can run the boot rows' persist without re-deriving the
+    /// path. Must match the paths `acquire` resolved.
+    journal_path: PathBuf,
+    journal_key_path: PathBuf,
+    /// The net's scope as this process last resolved it, retained for the life of the
+    /// component.
+    ///
+    /// INVARIANT: MONOTONIC within one process. A later recompute, from a journal that
+    /// never took a write or from a live table whose jumps a reload pruned, may only
+    /// WIDEN this set. A narrowing recompute would stop denying a uid whose processes
+    /// may still be live, so the retained set is unioned into every later resolution
+    /// rather than replaced by it.
+    retained_deny_uids: std::sync::Mutex<Vec<u32>>,
+    /// Whether this component is currently in the post-READY `Recovering` state.
+    ///
+    /// Published through health so nothing downstream reaches an exit arm while a
+    /// recovery attempt is still in flight. Interior mutability because `health()`
+    /// takes `&self`.
+    recovering: std::sync::atomic::AtomicBool,
+    /// When the recovery controller last attempted an install, so retries are spaced
+    /// by `RECOVERY_RETRY_INTERVAL` with ONE attempt in flight.
+    last_recovery_attempt: std::sync::Mutex<Option<std::time::Instant>>,
+    /// The tagged `safety_net` state this component last produced, recorded at EVERY
+    /// install transition so the audit row and the signed report describe the predicate
+    /// actually in the kernel rather than one derived from the fact of a loss.
+    last_safety_net_state: std::sync::Mutex<crate::nftables::SafetyNetAuditState>,
 }
 
 /// Maximum time a synchronous `nft -j list table` ownership proof may delay a
@@ -965,23 +1638,382 @@ fn classify_nft_ownership_probe(
 
 #[cfg(target_os = "linux")]
 impl NftablesTableComponent {
-    /// GF1.3: install the deny-all safety net once when `health()` first observes a
-    /// completed loss of the owned table, so the host is fail-CLOSED in the window
-    /// between the loss and the systemd restart. Idempotent and latched: the first
-    /// `Lost` poll installs it; later `Lost` polls short-circuit so a wedged health
-    /// loop does not re-fork `nft` every tick. A failed install is logged loudly
-    /// and the latch stays UNSET so the next poll retries (never a silent give-up).
-    fn ensure_runtime_loss_deny_all_net(&self) {
-        // Delegates to the injectable, unit-tested latch+retry+escalate helper with
-        // the real nft installer and by-name deleter. A FAILED install ESCALATES to
-        // a by-name delete (no live `policy accept` castle table may remain after a
-        // completed loss) and leaves the latch unset so the next health poll retries
-        // the deny-all net rather than assuming a table-less host is protected.
-        let _ = ensure_deny_all_net_installed_once(
-            &self.deny_all_net_installed,
-            crate::nftables::install_deny_all_safety_net,
-            crate::nftables::force_delete_castle_table_by_name,
+    /// The post-ready controller attempts the safety net after a completed
+    /// ownership loss and retries the real transaction on later eligible losses,
+    /// including after a prior success. `health()` only reports evidence.
+    /// The net's scope for THIS process, from the retained in-memory deny set unioned
+    /// with a fresh resolution.
+    ///
+    /// INVARIANT: the retained set is MONOTONIC. A fresh resolution is unioned into it,
+    /// never substituted for it, so a journal that never took a write or a live table
+    /// whose jumps a reload pruned cannot narrow what the net denies while this process
+    /// lives. The union is then re-evaluated against `DENY_SET_MAX` on every install,
+    /// so an over-capacity process stays host-wide on every retry until it restarts.
+    fn net_scope_from_retained_set(&self) -> SafetyNetResolution {
+        use crate::nftables::{SafetyNetReason, SafetyNetScope, DENY_SET_MAX};
+        use crate::safety_net_uid::{validate_safety_net_uid, ConfinedUidSet, HostOverflowUid};
+
+        let journal_record =
+            crate::ownership_journal::load_or_generate_auth_key(&self.journal_key_path)
+                .ok()
+                .and_then(|key| {
+                    crate::ownership_journal::load(&self.journal_path, Some(&key))
+                        .ok()
+                        .flatten()
+                });
+        let fresh = resolve_net_scope_at_site(journal_record.as_ref(), &self.decision_engine);
+
+        let mut retained = match self.retained_deny_uids.lock() {
+            Ok(guard) => guard,
+            // A poisoned lock must not silently produce an EMPTY set, which would
+            // install the host-wide shape and deny the operator. Fall back to the fresh
+            // resolution, which is at least as wide as this process's last kernel state.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // HostWide has no rule set; its full union is still the retained floor.
+        for &uid in fresh.retained_deny_uids() {
+            if !retained.contains(&uid) {
+                retained.push(uid);
+            }
+        }
+        retained.sort_unstable();
+        retained.dedup();
+        let union = retained.clone();
+        drop(retained);
+
+        if union.is_empty() {
+            return SafetyNetResolution {
+                scope: SafetyNetScope::HostWide,
+                reason: SafetyNetReason::EmptyDenySet,
+                kill_set: fresh.kill_set,
+                sources: fresh.sources,
+                deny_union: union.clone(),
+            };
+        }
+        // Unknown history stays sticky for the life of this process: it is a property
+        // of the record on disk, not of the retained set.
+        if fresh.reason == SafetyNetReason::UnknownHistory {
+            return SafetyNetResolution {
+                scope: SafetyNetScope::HostWide,
+                reason: SafetyNetReason::UnknownHistory,
+                kill_set: fresh.kill_set,
+                sources: fresh.sources,
+                deny_union: union.clone(),
+            };
+        }
+        if union.len() > DENY_SET_MAX {
+            return SafetyNetResolution {
+                scope: SafetyNetScope::HostWide,
+                reason: SafetyNetReason::DenySetOverCapacity {
+                    count: union.len(),
+                    cap: DENY_SET_MAX,
+                },
+                kill_set: fresh.kill_set,
+                sources: fresh.sources,
+                deny_union: union.clone(),
+            };
+        }
+        let Ok(overflow) = HostOverflowUid::from_host() else {
+            return SafetyNetResolution {
+                scope: SafetyNetScope::HostWide,
+                reason: SafetyNetReason::EmptyDenySet,
+                kill_set: fresh.kill_set,
+                sources: fresh.sources,
+                deny_union: union.clone(),
+            };
+        };
+        let validated: Vec<_> = union
+            .iter()
+            .filter_map(|&uid| validate_safety_net_uid(uid, overflow).ok())
+            .collect();
+        match ConfinedUidSet::from_validated(validated) {
+            Ok(set) => SafetyNetResolution {
+                scope: SafetyNetScope::Identity(set),
+                reason: SafetyNetReason::Identity,
+                kill_set: fresh.kill_set,
+                sources: fresh.sources,
+                deny_union: union.clone(),
+            },
+            Err(_) => SafetyNetResolution {
+                scope: SafetyNetScope::HostWide,
+                reason: SafetyNetReason::EmptyDenySet,
+                kill_set: fresh.kill_set,
+                sources: fresh.sources,
+                deny_union: union.clone(),
+            },
+        }
+    }
+
+    /// Persist this boot's kill set BEST-EFFORT, per the two boot rows.
+    ///
+    /// Returns the error for the caller to RECORD. The caller never aborts a net
+    /// install on it: installing the net makes no uid live, so the install can never
+    /// outrun the journal, and the next start retries the write.
+    ///
+    /// INVARIANT: a record whose `confined` key is ABSENT is NOT written here at all.
+    /// `persist_kill_set_write_ahead` keeps such a record's key absent, and the caller
+    /// skips this entirely on the unknown-history reason.
+    fn persist_boot_row_best_effort(&self, resolution: &SafetyNetResolution) -> Option<String> {
+        if resolution.reason == crate::nftables::SafetyNetReason::UnknownHistory {
+            return None;
+        }
+        // A read or authentication failure here is REPORTED, never swallowed: the caller
+        // names it so an operator knows the write did not happen.
+        let key = match crate::ownership_journal::load_or_generate_auth_key(&self.journal_key_path)
+        {
+            Ok(key) => key,
+            Err(err) => return Some(err.to_string()),
+        };
+        let record = match crate::ownership_journal::load(&self.journal_path, Some(&key)) {
+            Ok(Some(record)) => record,
+            // No record at all is not a failure: there is nothing to extend.
+            Ok(None) => return None,
+            Err(err) => return Some(err.to_string()),
+        };
+        persist_kill_set_write_ahead(
+            &self.journal_path,
+            Some(&key),
+            &record,
+            &resolution.kill_set,
+            admitted_identity(&self.decision_engine),
+        )
+        .err()
+    }
+
+    /// STARTUP LOST (memo D1b step 7): a COMPLETED negative ownership proof at either
+    /// startup readiness check.
+    ///
+    /// Order, and each step's reason: persist per the two boot rows (best-effort with a
+    /// known history, never with the key absent), then install the net from the
+    /// IN-MEMORY deny set REGARDLESS of the persist result, because installing makes no
+    /// uid live and so cannot outrun the journal, then the sweep hook ONLY on a failed
+    /// install. The caller then runs the reverse-order unwind, which releases the host
+    /// lock the disarm verb needs, and returns the acquisition error with the typed
+    /// evidence.
+    fn install_net_on_startup_loss(&self) {
+        let resolution = self.net_scope_from_retained_set();
+        let persist_failure = self.persist_boot_row_best_effort(&resolution);
+        let scope_sentence =
+            crate::nftables::safety_net_scope_sentence(&resolution.scope, &resolution.reason);
+        match crate::nftables::install_deny_all_safety_net(&resolution.scope) {
+            Ok(()) => {
+                self.record_safety_net_state(crate::nftables::SafetyNetAuditState::installed(
+                    &resolution.scope,
+                    &resolution.reason,
+                    resolution.sources.clone(),
+                ));
+                // SAFETY: stderr is the operator channel. An operator reading the
+                // journal after a refused start needs to know the net is in force and
+                // whether their own session is affected.
+                eprintln!(
+                    "castle-wall-daemon: a startup ownership check proved the owned nft table \
+                     no longer holds; installed the safety net before unwinding. \
+                     {scope_sentence}{}",
+                    match &persist_failure {
+                        None => String::new(),
+                        Some(err) => format!(
+                            " The confined history could not be written to the journal ({err}); \
+                             the net is installed regardless, and the next start retries the write."
+                        ),
+                    }
+                );
+            }
+            Err(err) => {
+                self.record_safety_net_state(crate::nftables::SafetyNetAuditState::InstallFailed {
+                    attempted_scope: resolution.scope.shape_tag().to_string(),
+                    error: err.to_string(),
+                });
+                safety_net_sweep_hook_pr3(
+                    &resolution.kill_set,
+                    "startup ownership loss: the safety net install failed before the unwind",
+                );
+                // SAFETY: same operator channel; this is the branch where no protection
+                // is in place and the refusal must say so.
+                eprintln!(
+                    "castle-wall-daemon: a startup ownership check proved the owned nft table \
+                     no longer holds AND installing the safety net FAILED ({err}); \
+                     {scope_sentence}"
+                );
+            }
+        }
+    }
+
+    /// STARTUP INDETERMINATE (memo D1b step 7): an nft-specific indeterminate reading at
+    /// either startup check.
+    ///
+    /// Installs NOTHING. An indeterminate reading is the ABSENCE of evidence, and
+    /// installing the net on it would replace a table that may be perfectly healthy.
+    /// The sweep hook runs before the terminal exit, which is the one action that is
+    /// safe without evidence about the table, and the existing exit-and-adopt path then
+    /// proceeds unchanged.
+    fn hook_on_startup_indeterminate(&self) {
+        let kill_set = self.net_scope_from_retained_set().kill_set;
+        safety_net_sweep_hook_pr3(
+            &kill_set,
+            "startup ownership reading indeterminate: no install is attempted on absent evidence",
         );
+    }
+
+    /// POST-READY LOSS (memo D1b step 7): the runtime-level recovery controller, entered
+    /// ONLY from a COMPLETED negative ownership proof from this component.
+    ///
+    /// Order, and why it differs from the boot rows: the net is installed FIRST from the
+    /// in-memory deny set, because the kill set is already durable from the bind row and
+    /// a net-install persist makes no uid live, so there is nothing to write ahead of.
+    /// The persist follows best-effort. The first completed `Lost` proof is consumed
+    /// without a second probe that could be unavailable; later `Recovering` polls
+    /// re-probe before the INSTALL interval. `Recovering` is published before the
+    /// transaction, so no consumer reaches an exit arm while it is in flight.
+    /// The sweep hook fires only after a FAILED install, never on entry.
+    ///
+    /// Return this call's exact result so the supervisor can audit real attempts.
+    fn recover_post_ready_loss(
+        &self,
+        shutting_down: bool,
+    ) -> crate::enforcement::PostReadyRecoveryResult {
+        use crate::enforcement::PostReadyRecoveryResult;
+        use std::sync::atomic::Ordering;
+        // The shutdown flag is observed so `systemctl stop` is a clean exit rather than
+        // a box that keeps re-arming while it is being taken down.
+        if shutting_down {
+            self.recovering.store(false, Ordering::SeqCst);
+            return PostReadyRecoveryResult::NoInstall;
+        }
+        self.mark_prior_install_unverified();
+        let retrying = self.is_recovering();
+        // The first entry already consumed a completed negative proof supplied by
+        // the runtime. Only LATER polls ask whether the original owned wall has
+        // returned. Doing this before the install clock recognizes a repair
+        // promptly; doing it on first entry could turn a proven loss into a
+        // transient no-answer and skip the first protective install.
+        let proof = post_ready_recovery_proof(retrying, || {
+            let ownership = self.ownership.clone();
+            let expectation = current_expected_agent_binding(&self.decision_engine);
+            self.probe.reprobe_after_latch(move || {
+                classify_nft_ownership_probe(crate::nftables::verify_owned_castle_table(
+                    &ownership,
+                    &expectation,
+                ))
+            })
+        });
+        match proof {
+            crate::health_probe::ProbeOutcome::Ready => {
+                self.recovering.store(false, Ordering::SeqCst);
+                let mut last = match self.last_recovery_attempt.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *last = None;
+                return PostReadyRecoveryResult::OwnedWallReady;
+            }
+            crate::health_probe::ProbeOutcome::Lost => {}
+            crate::health_probe::ProbeOutcome::Unavailable => {
+                return PostReadyRecoveryResult::NoInstall
+            }
+            crate::health_probe::ProbeOutcome::Indeterminate => {
+                // No completed proof licenses a kernel mutation. The status read
+                // after this call observes the terminal probe latch and reaches
+                // the supervisor's existing hook-before-exit arm.
+                self.recovering.store(false, Ordering::SeqCst);
+                return PostReadyRecoveryResult::NoInstall;
+            }
+        }
+
+        // The FIRST call consumes the caller's completed Lost proof immediately.
+        // Every later call reaches here only after another completed Lost proof.
+        // Publish Recovering BEFORE the install attempt and retain it through retries.
+        self.recovering.store(true, Ordering::SeqCst);
+        // ONE install at a time, spaced by the retry interval. A distinct first
+        // loss is never throttled by the clock from a previously repaired wall.
+        {
+            let mut last = match self.last_recovery_attempt.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if retrying {
+                if let Some(at) = *last {
+                    if at.elapsed() < RECOVERY_RETRY_INTERVAL {
+                        return PostReadyRecoveryResult::NoInstall;
+                    }
+                }
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let resolution = self.net_scope_from_retained_set();
+        // INSTALL FIRST. The persist follows.
+        let installed = install_deny_all_net_for_recovery(
+            || crate::nftables::install_deny_all_safety_net(&resolution.scope),
+            &resolution.kill_set,
+        );
+        // Record THIS transaction's result before the best-effort persist. A prior
+        // success is never used to turn a later failed transaction into Installed.
+        self.record_safety_net_state(if installed {
+            crate::nftables::SafetyNetAuditState::installed(
+                &resolution.scope,
+                &resolution.reason,
+                resolution.sources.clone(),
+            )
+        } else {
+            crate::nftables::SafetyNetAuditState::InstallFailed {
+                attempted_scope: resolution.scope.shape_tag().to_string(),
+                error: "the safety net install failed and will be retried".to_string(),
+            }
+        });
+        if installed {
+            // Best-effort persist AFTER the install, and a failure here never undoes it.
+            if let Some(persist_err) = self.persist_boot_row_best_effort(&resolution) {
+                // SAFETY: stderr is the operator channel. The net is in force; the
+                // journal write is what did not happen, and the next start retries it.
+                eprintln!(
+                    "castle-wall-daemon: the safety net is in force after a runtime loss, but \
+                     the confined history could not be written to the journal: {persist_err}"
+                );
+            }
+        }
+        // INVARIANT: `recovering` STAYS SET whether or not the install succeeded.
+        // Clearing it on success would let the next tick read the latched loss and
+        // exit. A later positive wall proof, terminal indeterminate reading, or
+        // operator shutdown ends this controller; otherwise it retries on interval.
+        if installed {
+            PostReadyRecoveryResult::InstallSucceeded
+        } else {
+            PostReadyRecoveryResult::InstallFailed
+        }
+    }
+
+    fn mark_prior_install_unverified(&self) {
+        let mut slot = match self.last_safety_net_state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        demote_prior_install(&mut slot);
+    }
+
+    /// Record the tagged state produced by an install transition.
+    ///
+    /// Called on EVERY transition, success or failure, so the state a consumer reads is
+    /// never a stale success left over from an earlier attempt.
+    fn record_safety_net_state(&self, state: crate::nftables::SafetyNetAuditState) {
+        let mut slot = match self.last_safety_net_state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *slot = state;
+    }
+
+    /// Whether this component is publishing the post-READY `Recovering` state.
+    fn is_recovering(&self) -> bool {
+        self.recovering.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn demote_prior_install(state: &mut crate::nftables::SafetyNetAuditState) {
+    if matches!(
+        *state,
+        crate::nftables::SafetyNetAuditState::Installed { .. }
+    ) {
+        *state = crate::nftables::SafetyNetAuditState::Unverified;
     }
 }
 
@@ -992,15 +2024,49 @@ impl AcquiredComponent for NftablesTableComponent {
     }
 
     fn is_ready(&self) -> bool {
-        // Two-valued gate: indeterminate fails closed here. This is what the
-        // startup all-or-nothing readiness check uses, where "no answer" must
-        // not let a runtime escape as ready.
+        // Two-valued gate: indeterminate fails closed here. The startup checks read
+        // the THREE-valued `health()` through `StartupReadiness` instead, because a
+        // completed negative proof and a no-answer drive different actions there.
         matches!(self.health(), crate::enforcement::ComponentHealth::Ready)
+    }
+
+    /// STARTUP LOST. Must match the row in memo D1b step 7: persist per the boot rows,
+    /// install from the in-memory deny set, hook only on a failed install. The caller
+    /// then unwinds through `release_reverse`, which is what releases the host lock.
+    fn on_startup_lost(&self) {
+        self.install_net_on_startup_loss();
+    }
+
+    /// STARTUP INDETERMINATE. Installs nothing; the hook runs before the terminal exit.
+    fn on_startup_indeterminate(&self) {
+        self.hook_on_startup_indeterminate();
+    }
+
+    fn on_post_ready_indeterminate(&self) {
+        let kill_set = self.net_scope_from_retained_set().kill_set;
+        safety_net_sweep_hook_pr3(&kill_set, "post-ready ownership reading indeterminate");
+    }
+
+    fn safety_net_audit_state(&self) -> Option<crate::nftables::SafetyNetAuditState> {
+        let slot = match self.last_safety_net_state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Some(slot.clone())
+    }
+
+    /// POST-READY LOSS. The supervisor calls this before any exit arm; the controller
+    /// installs the net first, then persists best-effort, and publishes `Recovering`
+    /// while an attempt is outstanding.
+    fn attempt_post_ready_recovery(
+        &self,
+        shutting_down: bool,
+    ) -> crate::enforcement::PostReadyRecoveryResult {
+        self.recover_post_ready_loss(shutting_down)
     }
 
     fn health(&self) -> crate::enforcement::ComponentHealth {
         use crate::enforcement::ComponentHealth;
-        use crate::health_probe::ProbeOutcome;
         if self.released || self.lock.is_none() {
             return ComponentHealth::Lost;
         }
@@ -1024,30 +2090,23 @@ impl AcquiredComponent for NftablesTableComponent {
         // BEFORE the probe is scheduled (the closure may run on a worker thread)
         // but read from the CURRENT snapshot on every poll, never cached.
         let expectation = current_expected_agent_binding(&self.decision_engine);
-        match self.probe.poll_result(move || {
+        let outcome = self.probe.poll_result(move || {
             classify_nft_ownership_probe(crate::nftables::verify_owned_castle_table(
                 &ownership,
                 &expectation,
             ))
-        }) {
-            ProbeOutcome::Ready => ComponentHealth::Ready,
-            ProbeOutcome::Lost => {
-                // GF1.3 runtime-loss invariant: a COMPLETED negative proof means
-                // the owned table was deleted or drifted off its identity WHILE the
-                // daemon is live. Reporting `Lost` and waiting for the systemd
-                // restart leaves a multi-second window with NO castle table (host
-                // default `accept`) for any live agent. Install the deny-all safety
-                // net IMMEDIATELY so egress is fail-CLOSED without waiting for the
-                // restart. We hold this component's authenticated this-boot
-                // ownership identity, so forcing OUR named table to deny-all never
-                // clobbers a table we cannot prove is ours (same authority as the
-                // reclaim drift/loss paths; the net only ever rewrites our name).
-                // Idempotent + latched so a repeatedly-`Lost` poll forks `nft` once.
-                self.ensure_runtime_loss_deny_all_net();
-                ComponentHealth::Lost
-            }
-            ProbeOutcome::Unavailable => ComponentHealth::ProbeUnavailable,
+        });
+        if outcome == crate::health_probe::ProbeOutcome::Indeterminate {
+            // The terminal no-answer bypasses the recovery controller, so it
+            // must withdraw any prior installed claim before the exit WAL row.
+            self.mark_prior_install_unverified();
         }
+        // REPORT ONLY: startup owns its install through `EnforcementRuntime::start`,
+        // and the supervisor owns the post-READY controller. A late completed Ready
+        // proof may clear our internal recovery flag/clock here without touching the
+        // kernel. Transient no-answer stays Recovering while this owner is active;
+        // exhausted Indeterminate still reaches the supervisor's hook-before-exit arm.
+        post_ready_component_health(outcome, &self.recovering, &self.last_recovery_attempt)
     }
 
     fn release(&mut self) {
@@ -1849,215 +2908,622 @@ mod tests {
         }
     }
 
-    // GF1.2: a reclaim drift whose deny-all net install FAILS must ESCALATE to a
-    // by-name delete (so no live `policy accept` castle path remains), and a
-    // successful install must NOT delete. Injected closures make the escalation
-    // sequence deterministic without a live/broken nft; the real-nft post-condition
-    // (a by-name delete leaves no live table) is asserted in the integration suite.
     #[test]
-    fn drift_escalates_to_delete_only_when_deny_all_net_install_fails() {
+    fn the_acquisition_path_never_adopts_an_unknown_history_record() {
+        // The rule lives on the acquisition path, not in the shared routing. This asserts
+        // it at the source: the acquisition arm recomputes the decision and diverts a
+        // same-boot record whose `confined` key is absent to the boot owner, which
+        // installs the host-wide net and skips the persist. The companion test in
+        // `ownership_journal` proves the SHARED routing still reaches `ReclaimOwned`, so
+        // disarm keeps its recovery path.
+        let whole = include_str!("runtime_providers.rs");
+        let start = whole
+            .find("// THE NEVER-ADOPT RULE, applied HERE and only here")
+            .expect("the rule is stated at the acquisition site");
+        let end = whole[start..]
+            .find("let ownership = match decision {")
+            .map(|o| start + o)
+            .expect("the rule precedes the routing match");
+        let region = &whole[start..end];
+        assert!(
+            region.contains("OwnershipJournal::Owned { confined: None, .. }"),
+            "the rule must key on the ABSENT confined key, not on the uid comparison"
+        );
+        assert!(
+            region.contains("ReclaimDecision::ReclaimOwned { .. }, true")
+                && region.contains("ReclaimDecision::ReArmLostOwned"),
+            "an unknown-history record must be diverted from adoption to the boot owner"
+        );
+        // And the rule is NOT in the shared decision function.
+        let journal_source = include_str!("ownership_journal.rs");
+        let decide_at = journal_source
+            .find("pub fn decide(")
+            .expect("the shared routing is in that file");
+        let decide_end = journal_source[decide_at..]
+            .find("\n#[cfg(test)]")
+            .map(|o| decide_at + o)
+            .unwrap_or(journal_source.len());
+        assert!(
+            !journal_source[decide_at..decide_end].contains("confined: None"),
+            "the shared routing must not carry the acquisition-specific rule, or disarm \
+             loses its recovery arm"
+        );
+    }
+
+    // ---- The safety net's scope resolver (memo D1b) ----
+
+    fn overflow_fixture() -> crate::safety_net_uid::HostOverflowUid {
+        crate::safety_net_uid::HostOverflowUid::from_value(65534)
+    }
+
+    fn known(uids: &[(u32, crate::ownership_journal::ConfinedRole)]) -> ConfinedHistory {
+        ConfinedHistory::Known(
+            uids.iter()
+                .map(|&(uid, role)| crate::ownership_journal::ConfinedIdentity { uid, role })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn deny_set_is_the_union_of_all_three_sources_and_the_kill_set_excludes_the_live_table() {
+        use crate::nftables::{LiveTableBindings, SafetyNetReason, SafetyNetScope};
+        use crate::ownership_journal::ConfinedRole;
+
+        let resolution = resolve_safety_net_scope(
+            // (a) the journal's recorded history
+            &known(&[(60001, ConfinedRole::Agent), (60002, ConfinedRole::Gate)]),
+            // (b) the currently admitted identity
+            Some((60003, Some(60004))),
+            // (c) the live table's own bindings
+            &LiveTableBindings::Bindings(vec![60005]),
+            overflow_fixture(),
+        );
+        let SafetyNetScope::Identity(set) = &resolution.scope else {
+            panic!("an identity is recoverable, so the scope is the identity net");
+        };
+        assert_eq!(set.uids(), vec![60001, 60002, 60003, 60004, 60005]);
+        assert_eq!(resolution.reason, SafetyNetReason::Identity);
+        // KILL SET = (a) union (b) ONLY. 60005 came from the live kernel table,
+        // which a CAP_NET_ADMIN actor can write, so it may be DENIED but never
+        // KILLED.
+        assert_eq!(resolution.kill_set, vec![60001, 60002, 60003, 60004]);
+        assert!(resolution.sources.journal);
+        assert!(resolution.sources.manifest);
+        assert!(resolution.sources.live_table);
+    }
+
+    #[test]
+    fn fresh_instance_rebuilds_kill_set_from_authenticated_journal_and_manifest_only() {
+        use crate::nftables::{LiveTableBindings, SafetyNetScope};
+        use crate::ownership_journal::{
+            self as journal, ConfinedIdentity, ConfinedRole, JournalIdentity, OwnershipJournal,
+        };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nft-ownership.json");
+        let key_path = dir.path().join("nft-journal-auth.key");
+        let first_key = journal::load_or_generate_auth_key(&key_path).unwrap();
+        let record = OwnershipJournal::owned_with_known_history(
+            JournalIdentity {
+                schema_version: journal::JOURNAL_SCHEMA_VERSION,
+                marker: "m".into(),
+                boot_id: "3f2b91c0-7d4e-4a18-b6c2-0e15a9d83b77".into(),
+                source: "/usr/local/bin/castle-wall-daemon".into(),
+            },
+            2,
+            1,
+            vec![ConfinedIdentity {
+                uid: 60001,
+                role: ConfinedRole::Agent,
+            }],
+        )
+        .unwrap();
+        journal::store_atomic(&path, &record, &first_key).unwrap();
+        drop(first_key);
+
+        // A new instance reads only the persisted authenticated record; it has
+        // no retained in-memory deny set from the process that wrote it.
+        let next_key = journal::load_or_generate_auth_key(&key_path).unwrap();
+        let reloaded = journal::load(&path, Some(&next_key)).unwrap().unwrap();
+        let history = ConfinedHistory::Known(reloaded.confined().unwrap().to_vec());
+        let resolution = resolve_safety_net_scope(
+            &history,
+            Some((60002, Some(60003))),
+            &LiveTableBindings::Bindings(vec![60004]),
+            overflow_fixture(),
+        );
+        let SafetyNetScope::Identity(set) = resolution.scope else {
+            panic!("known history confines the net");
+        };
+        assert_eq!(set.uids(), vec![60001, 60002, 60003, 60004]);
+        assert_eq!(resolution.kill_set, vec![60001, 60002, 60003]);
+        assert!(
+            resolution.sources.journal
+                && resolution.sources.manifest
+                && resolution.sources.live_table
+        );
+    }
+
+    #[test]
+    fn unknown_history_resolves_host_wide_whatever_the_other_sources_say() {
+        use crate::nftables::{LiveTableBindings, SafetyNetReason, SafetyNetScope};
+        // The ABSENT-KEY row: a record from a previous binary cannot prove which
+        // uids were bound this boot, because the pre-upgrade reload path removed
+        // stale jumps while never terminating a rotated-away uid's processes.
+        let resolution = resolve_safety_net_scope(
+            &ConfinedHistory::Unknown,
+            Some((60003, Some(60004))),
+            &LiveTableBindings::Bindings(vec![60005]),
+            overflow_fixture(),
+        );
+        assert_eq!(resolution.scope, SafetyNetScope::HostWide);
+        assert_eq!(resolution.reason, SafetyNetReason::UnknownHistory);
+        // The kill set is still (b): an admitted identity is safe to sweep.
+        assert_eq!(resolution.kill_set, vec![60003, 60004]);
+    }
+
+    #[test]
+    fn a_known_empty_history_still_resolves_from_the_manifest_and_the_live_table() {
+        use crate::nftables::{LiveTableBindings, SafetyNetReason, SafetyNetScope};
+        // FAIL-BEFORE / the distinction that matters: this is `Some(vec![])`, this
+        // binary's own record before any identity was bound, NOT an absent key. It
+        // must narrow to the identity net, while the absent-key case above must not.
+        let resolution = resolve_safety_net_scope(
+            &known(&[]),
+            Some((60003, None)),
+            &LiveTableBindings::Bindings(vec![60005]),
+            overflow_fixture(),
+        );
+        let SafetyNetScope::Identity(set) = &resolution.scope else {
+            panic!("a known-empty history resolves from the other two sources");
+        };
+        assert_eq!(set.uids(), vec![60003, 60005]);
+        assert_eq!(resolution.reason, SafetyNetReason::Identity);
+    }
+
+    #[test]
+    fn an_empty_union_resolves_host_wide_with_its_own_reason() {
+        use crate::nftables::{LiveTableBindings, SafetyNetReason, SafetyNetScope};
+        let resolution = resolve_safety_net_scope(
+            &known(&[]),
+            None,
+            &LiveTableBindings::Bindings(Vec::new()),
+            overflow_fixture(),
+        );
+        assert_eq!(resolution.scope, SafetyNetScope::HostWide);
+        // A DISTINCT reason from unknown history: the operator action differs, and
+        // folding the two made an over-capacity set read as unknown history.
+        assert_eq!(resolution.reason, SafetyNetReason::EmptyDenySet);
+        assert!(resolution.kill_set.is_empty());
+    }
+
+    #[test]
+    fn a_foreign_or_unreadable_live_table_contributes_nothing_and_is_not_read_as_empty() {
+        use crate::nftables::{LiveTableBindings, SafetyNetScope};
+        // Source (c) yields NOTHING for a table that is not ours, and an
+        // identity-parser error is never read as "the table has no bindings".
+        for live in [
+            LiveTableBindings::NotOurTable {
+                detail: "foreign rule".into(),
+            },
+            LiveTableBindings::Unreadable {
+                detail: "nft timed out".into(),
+            },
+        ] {
+            let resolution = resolve_safety_net_scope(
+                &known(&[]),
+                Some((60003, None)),
+                &live,
+                overflow_fixture(),
+            );
+            let SafetyNetScope::Identity(set) = &resolution.scope else {
+                panic!("the manifest still names an identity");
+            };
+            assert_eq!(set.uids(), vec![60003]);
+            assert!(
+                !resolution.sources.live_table,
+                "the audit row must not claim the live table contributed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deny_set_over_capacity_resolves_host_wide_with_the_count_and_the_cap() {
+        use crate::nftables::{LiveTableBindings, SafetyNetReason, SafetyNetScope, DENY_SET_MAX};
+        use crate::ownership_journal::ConfinedRole;
+        // FAIL-BEFORE (the packet's deny-set bound test): at the cap the identity net
+        // installs; one over it the host-wide shape installs with the
+        // `deny-set-over-capacity` reason, and NOTHING is truncated, because a
+        // dropped uid stops being denied.
+        let at_cap: Vec<u32> = (0..DENY_SET_MAX as u32).map(|i| 60_000 + i).collect();
+        let bindings = LiveTableBindings::Bindings(at_cap.clone());
+        let resolution = resolve_safety_net_scope(&known(&[]), None, &bindings, overflow_fixture());
+        let SafetyNetScope::Identity(set) = &resolution.scope else {
+            panic!("exactly at the cap is an operating shape");
+        };
+        assert_eq!(set.len(), DENY_SET_MAX);
+
+        let over: Vec<u32> = (0..=DENY_SET_MAX as u32).map(|i| 60_000 + i).collect();
+        let resolution = resolve_safety_net_scope(
+            &known(&[(59_999, ConfinedRole::Agent)]),
+            None,
+            &LiveTableBindings::Bindings(over),
+            overflow_fixture(),
+        );
+        assert_eq!(resolution.scope, SafetyNetScope::HostWide);
+        assert_eq!(resolution.retained_deny_uids().len(), DENY_SET_MAX + 2);
+        assert!(resolution.retained_deny_uids().contains(&59_999));
+        match resolution.reason {
+            SafetyNetReason::DenySetOverCapacity { count, cap } => {
+                assert_eq!(count, DENY_SET_MAX + 2);
+                assert_eq!(cap, DENY_SET_MAX);
+            }
+            other => panic!("expected the over-capacity reason, got {other:?}"),
+        }
+        // The kill set is unaffected by the cap: it is sources (a) and (b) only.
+        assert_eq!(resolution.kill_set, vec![59_999]);
+    }
+
+    #[test]
+    fn an_unattestable_uid_from_any_source_never_reaches_rule_one() {
+        use crate::nftables::{LiveTableBindings, SafetyNetScope};
+        use crate::ownership_journal::ConfinedRole;
+        // A live kernel table a CAP_NET_ADMIN actor wrote could name 0 or the host's
+        // overflow uid. Those are dropped from the deny set while the real
+        // identities are kept, so one hostile member cannot collapse the net to
+        // host-wide (which would deny the operator).
+        let resolution = resolve_safety_net_scope(
+            &known(&[(60001, ConfinedRole::Agent)]),
+            None,
+            &LiveTableBindings::Bindings(vec![0, 65534, u32::MAX, 60005]),
+            overflow_fixture(),
+        );
+        let SafetyNetScope::Identity(set) = &resolution.scope else {
+            panic!("the attestable members still form an identity net");
+        };
+        assert_eq!(set.uids(), vec![60001, 60005]);
+    }
+
+    #[test]
+    fn refusal_texts_name_the_scope_and_the_repair_order() {
+        use crate::nftables::{
+            safety_net_scope_sentence, SafetyNetReason, SafetyNetScope, DENY_SET_MAX,
+        };
+        use crate::safety_net_uid::{validate_safety_net_uid, ConfinedUidSet};
+        let set = ConfinedUidSet::from_validated(vec![
+            validate_safety_net_uid(60123, overflow_fixture()).unwrap(),
+            validate_safety_net_uid(60124, overflow_fixture()).unwrap(),
+        ])
+        .unwrap();
+        let identity =
+            safety_net_scope_sentence(&SafetyNetScope::Identity(set), &SafetyNetReason::Identity);
+        assert!(identity.contains("60123"));
+        assert!(
+            identity.contains("including root and ssh, is unaffected"),
+            "an operator's first question is whether their own session dies: {identity}"
+        );
+        assert!(identity.contains("stop the castle-wall unit"));
+
+        // ONE TEXT PER REASON, each naming that reason and then stating plainly that
+        // operator access is NOT preserved.
+        for (reason, expected) in [
+            (
+                SafetyNetReason::EmptyDenySet,
+                "no confined identity was recoverable",
+            ),
+            (
+                SafetyNetReason::UnknownHistory,
+                "history unknown for this boot",
+            ),
+            (
+                SafetyNetReason::DenySetOverCapacity {
+                    count: DENY_SET_MAX + 1,
+                    cap: DENY_SET_MAX,
+                },
+                "deny set over capacity (257 of 256)",
+            ),
+        ] {
+            let text = safety_net_scope_sentence(&SafetyNetScope::HostWide, &reason);
+            assert!(
+                text.contains(expected),
+                "reason text missing {expected}: {text}"
+            );
+            assert!(text.contains("operator access is not preserved on this path"));
+            // The repair order, in the order that WORKS: stopping the unit first is
+            // what stops systemd restarting the daemon into the same refusal and
+            // re-taking the host lock disarm needs.
+            assert!(text
+                .contains("stop the castle-wall unit, repair the wall, then run the disarm verb"));
+        }
+    }
+
+    #[test]
+    fn the_audit_state_describes_only_the_predicate_actually_installed() {
+        use crate::nftables::{
+            SafetyNetAuditState, SafetyNetReason, SafetyNetScope, SafetyNetSources,
+        };
+        use crate::safety_net_uid::{validate_safety_net_uid, ConfinedUidSet};
+        let set = ConfinedUidSet::from_validated(vec![validate_safety_net_uid(
+            60123,
+            overflow_fixture(),
+        )
+        .unwrap()])
+        .unwrap();
+        let sources = SafetyNetSources {
+            journal: true,
+            manifest: true,
+            live_table: false,
+        };
+        let installed = SafetyNetAuditState::installed(
+            &SafetyNetScope::Identity(set),
+            &SafetyNetReason::Identity,
+            sources.clone(),
+        );
+        let json = installed.to_json();
+        assert_eq!(json["state"], "installed");
+        assert_eq!(json["shape"], "v2-confined-identity");
+        assert_eq!(json["reason"], "identity");
+        assert_eq!(json["denied_uids"], serde_json::json!([60123]));
+        assert_eq!(json["rules"].as_array().expect("rules").len(), 3);
+        assert_eq!(json["unattestable_packets"], "drop-except-kernel-nd");
+        assert_eq!(json["kernel_nd_accepted"].as_array().unwrap().len(), 3);
+        assert!(json["coverage"]
+            .as_str()
+            .unwrap()
+            .contains("packet sockets"));
+
+        // The host-wide shape accepts NO neighbour discovery, because it carries no
+        // rules at all. Saying so is the honest row.
+        let host_wide = SafetyNetAuditState::installed(
+            &SafetyNetScope::HostWide,
+            &SafetyNetReason::UnknownHistory,
+            sources,
+        );
+        let json = host_wide.to_json();
+        assert_eq!(json["shape"], "v1-host-wide");
+        assert_eq!(json["kernel_nd_accepted"], serde_json::json!([]));
+        assert_eq!(json["rules"], serde_json::json!([]));
+
+        // A FAILED install never attests to a protection that is not in place, and a
+        // path that attempted nothing says so distinctly.
+        let failed = SafetyNetAuditState::InstallFailed {
+            attempted_scope: "v2-confined-identity".into(),
+            error: "nft timed out".into(),
+        };
+        assert_eq!(failed.to_json()["state"], "install_failed");
+        assert_eq!(failed.tag(), "install_failed");
+        assert_eq!(
+            SafetyNetAuditState::Unverified.to_json(),
+            serde_json::json!({ "state": "unverified" })
+        );
+        assert_eq!(SafetyNetAuditState::Unverified.tag(), "unverified");
+        assert_eq!(
+            SafetyNetAuditState::NotAttempted.to_json()["state"],
+            "not_attempted"
+        );
+    }
+
+    // Part A performs no table deletion outside the disarm verb. These two tests pin
+    // that: a failed net install leaves the castle table standing and fires the PR-3
+    // sweep hook, and a successful install fires no hook at all.
+    #[test]
+    fn drift_never_deletes_the_table_and_hooks_the_sweep_only_on_a_failed_install() {
         use crate::nftables::NftablesError;
         use std::cell::Cell;
 
-        // Install fails -> escalate to delete.
-        let deleted = Cell::new(false);
+        let kill_set = [60123u32, 60124];
+
+        // Install fails -> the table is LEFT STANDING and the hook fires.
         let outcome = drift_enforce_fail_closed(
             || {
                 Err(NftablesError::InvocationFailed(
                     "injected net failure".into(),
                 ))
             },
-            || {
-                deleted.set(true);
-                Ok(())
-            },
+            &kill_set,
         );
-        assert!(matches!(outcome, DriftFailClosedOutcome::EscalatedDeleteOk));
-        assert!(
-            deleted.get(),
-            "a failed deny-all install must escalate to a by-name delete"
-        );
+        match outcome {
+            DriftFailClosedOutcome::InstallFailedSweepHooked { net_err } => {
+                assert!(net_err.contains("injected net failure"));
+            }
+            other => panic!("expected the hooked failure arm, got {other:?}"),
+        }
 
-        // Install succeeds -> never delete.
-        let deleted2 = Cell::new(false);
+        // Install succeeds -> the net is in force and nothing further happens. The
+        // hook must NOT fire after a successful install: the net already denies the
+        // identity, so terminating its processes adds no protection.
+        let installed = Cell::new(false);
         let outcome2 = drift_enforce_fail_closed(
-            || Ok(()),
             || {
-                deleted2.set(true);
+                installed.set(true);
                 Ok(())
             },
+            &kill_set,
         );
-        assert!(matches!(outcome2, DriftFailClosedOutcome::NetInstalled));
-        assert!(
-            !deleted2.get(),
-            "a successful deny-all install must not delete the table"
-        );
-
-        // Both fail -> indeterminate (loud upstream), delete still attempted.
-        let outcome3 = drift_enforce_fail_closed(
-            || Err(NftablesError::InvocationFailed("net".into())),
-            || Err(NftablesError::InvocationFailed("del".into())),
-        );
-        assert!(matches!(
-            outcome3,
-            DriftFailClosedOutcome::Indeterminate { .. }
-        ));
+        assert_eq!(outcome2, DriftFailClosedOutcome::NetInstalled);
+        assert!(installed.get());
     }
 
-    // GF1.3: the runtime-loss deny-all net is installed at most once (latched) and
-    // retried on failure. Injected installer + deleter make latch/retry/escalation
-    // deterministic. On a FAILED install the by-name delete ESCALATION fires (no
-    // live `policy accept` may remain) and the latch stays unset so it still retries.
+    // A completed first loss is already an install-authorising proof. A second
+    // unavailable reading would not erase it; only later Recovering polls re-probe.
     #[test]
-    fn runtime_loss_deny_all_net_latches_once_and_retries_on_failure() {
+    fn first_runtime_loss_consumes_proof_without_a_second_query() {
+        use crate::health_probe::ProbeOutcome;
+        let mut queries = 0;
+        let first = post_ready_recovery_proof(false, || {
+            queries += 1;
+            ProbeOutcome::Unavailable
+        });
+        assert_eq!(first, ProbeOutcome::Lost);
+        assert_eq!(
+            queries, 0,
+            "first loss must not be vetoed by a new no-answer"
+        );
+        let later = post_ready_recovery_proof(true, || {
+            queries += 1;
+            ProbeOutcome::Ready
+        });
+        assert_eq!(later, ProbeOutcome::Ready);
+        assert_eq!(queries, 1, "a later recovering poll must re-probe");
+    }
+
+    #[test]
+    fn no_answer_withdraws_only_a_prior_success_claim() {
+        use crate::nftables::{
+            SafetyNetAuditState, SafetyNetReason, SafetyNetScope, SafetyNetSources,
+        };
+        let mut success = SafetyNetAuditState::installed(
+            &SafetyNetScope::HostWide,
+            &SafetyNetReason::UnknownHistory,
+            SafetyNetSources {
+                journal: false,
+                manifest: false,
+                live_table: false,
+            },
+        );
+        demote_prior_install(&mut success);
+        assert_eq!(success, SafetyNetAuditState::Unverified);
+        let mut failure = SafetyNetAuditState::InstallFailed {
+            attempted_scope: "v1-host-wide".into(),
+            error: "injected".into(),
+        };
+        demote_prior_install(&mut failure);
+        assert_eq!(failure.tag(), "install_failed");
+        let mut never = SafetyNetAuditState::NotAttempted;
+        demote_prior_install(&mut never);
+        assert_eq!(never.tag(), "not_attempted");
+    }
+
+    #[test]
+    fn late_ready_clears_recovery_clock_so_a_distinct_loss_is_first_again() {
+        use crate::enforcement::ComponentHealth;
+        use crate::health_probe::ProbeOutcome;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let recovering = AtomicBool::new(true);
+        let last = std::sync::Mutex::new(Some(std::time::Instant::now()));
+        assert_eq!(
+            post_ready_component_health(ProbeOutcome::Unavailable, &recovering, &last),
+            ComponentHealth::Recovering,
+            "a timed-out recovery proof must not enter the generic no-answer exit path"
+        );
+        assert!(recovering.load(Ordering::SeqCst));
+        assert!(last.lock().unwrap().is_some());
+
+        // The same worker may complete after its caller's deadline. A later
+        // health poll consumes that positive proof without another probe.
+        assert_eq!(
+            post_ready_component_health(ProbeOutcome::Ready, &recovering, &last),
+            ComponentHealth::Ready
+        );
+        assert!(!recovering.load(Ordering::SeqCst));
+        assert!(last.lock().unwrap().is_none());
+
+        assert_eq!(
+            post_ready_component_health(ProbeOutcome::Lost, &recovering, &last),
+            ComponentHealth::Lost,
+            "a distinct completed loss must be a fresh immediate-install entry"
+        );
+        let mut redundant_queries = 0;
+        assert_eq!(
+            post_ready_recovery_proof(recovering.load(Ordering::SeqCst), || {
+                redundant_queries += 1;
+                ProbeOutcome::Unavailable
+            }),
+            ProbeOutcome::Lost
+        );
+        assert_eq!(redundant_queries, 0);
+    }
+
+    #[test]
+    fn terminal_indeterminate_overrides_recovering_no_answer() {
+        use crate::enforcement::ComponentHealth;
+        use crate::health_probe::ProbeOutcome;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let recovering = AtomicBool::new(true);
+        let last = std::sync::Mutex::new(Some(std::time::Instant::now()));
+        assert_eq!(
+            post_ready_component_health(ProbeOutcome::Unavailable, &recovering, &last),
+            ComponentHealth::Recovering
+        );
+        assert_eq!(
+            post_ready_component_health(ProbeOutcome::Indeterminate, &recovering, &last),
+            ComponentHealth::Indeterminate,
+            "exhausted no-answer must reach the hook-before-exit consumer"
+        );
+        assert!(!recovering.load(Ordering::SeqCst));
+    }
+
+    // GF1.3: every eligible post-READY loss executes a real install, including a
+    // second loss after a prior success. A later failure cannot inherit success.
+    #[test]
+    fn runtime_loss_net_reinstalls_after_success_and_reports_later_failure() {
         use crate::nftables::NftablesError;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let latch = AtomicBool::new(false);
         let calls = AtomicUsize::new(0);
-        let deletes = AtomicUsize::new(0);
+        let kill_set = [60123u32];
 
-        // First Lost with a FAILING install: not latched, so it will retry, AND it
-        // escalates to a by-name delete so no drifted `policy accept` table lingers.
-        let installed = ensure_deny_all_net_installed_once(
-            &latch,
+        let first = install_deny_all_net_for_recovery(
             || {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Err(NftablesError::InvocationFailed("injected".into()))
-            },
-            || {
-                deletes.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             },
+            &kill_set,
         );
-        assert!(!installed);
+        assert!(first);
+        let second = install_deny_all_net_for_recovery(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            &kill_set,
+        );
+        assert!(second);
+        let third = install_deny_all_net_for_recovery(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(NftablesError::InvocationFailed("later failure".into()))
+            },
+            &kill_set,
+        );
         assert!(
-            !latch.load(Ordering::SeqCst),
-            "a failed install must not latch"
+            !third,
+            "a previous success cannot report a failed retry installed"
         );
-        assert_eq!(
-            deletes.load(Ordering::SeqCst),
-            1,
-            "a failed deny-all install must escalate to a by-name delete"
-        );
-
-        // Retry, now succeeding: latches, and does NOT delete.
-        let installed = ensure_deny_all_net_installed_once(
-            &latch,
-            || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-            || {
-                deletes.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-        );
-        assert!(installed);
-        assert!(latch.load(Ordering::SeqCst));
-        assert_eq!(
-            deletes.load(Ordering::SeqCst),
-            1,
-            "a successful install must not escalate to a delete"
-        );
-
-        // Subsequent Lost polls must NOT re-fork nft: neither installer nor deleter
-        // is called once the net is latched in.
-        let installed = ensure_deny_all_net_installed_once(
-            &latch,
-            || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-            || {
-                deletes.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-        );
-        assert!(!installed);
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            2,
-            "installer runs only until it first succeeds (retry once, then latched)"
-        );
-        assert_eq!(
-            deletes.load(Ordering::SeqCst),
-            1,
-            "no delete after the net is latched"
+            3,
+            "every eligible loss must execute the actual transaction"
         );
     }
 
-    // GF1.3 (round-3 re-gate) fault injection: a PERSISTENT deny-all install failure
-    // at runtime loss must stay fail-CLOSED. Each failing poll escalates to a
-    // by-name delete so no drifted `policy accept` castle table remains live, and
-    // when BOTH the install and the escalating delete fail the state is genuinely
-    // indeterminate (loud) but never silently latched as "protected". This closes
-    // the escalation asymmetry the round-2 re-gate found: the runtime-loss path
-    // installed the net but, unlike the GF1.2 drift path, did not escalate on an
-    // install failure, so a persistent failure left a drifted `policy accept` table
-    // live until a later retry.
+    // Persistent failure remains retryable; the PR-3 hook is entered only by the
+    // failed-install arm and Part A performs no by-name delete.
     #[test]
-    fn runtime_loss_persistent_install_failure_escalates_and_stays_fail_closed() {
+    fn runtime_loss_persistent_install_failure_keeps_retrying() {
         use crate::nftables::NftablesError;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let latch = AtomicBool::new(false);
-        let deletes = AtomicUsize::new(0);
+        let attempts = AtomicUsize::new(0);
+        let kill_set = [60123u32];
 
-        // Poll 1: install fails, escalating delete succeeds -> no live accept path,
-        // latch unset (will retry).
-        let installed = ensure_deny_all_net_installed_once(
-            &latch,
-            || {
-                Err(NftablesError::InvocationFailed(
-                    "persistent net failure".into(),
-                ))
-            },
-            || {
-                deletes.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-        );
-        assert!(!installed);
-        assert!(
-            !latch.load(Ordering::SeqCst),
-            "a failed install never latches"
-        );
-        assert_eq!(deletes.load(Ordering::SeqCst), 1);
-
-        // Poll 2: still failing -> escalates AGAIN (fail-closed on every poll, never
-        // a one-shot that then gives up).
-        let installed = ensure_deny_all_net_installed_once(
-            &latch,
-            || {
-                Err(NftablesError::InvocationFailed(
-                    "persistent net failure".into(),
-                ))
-            },
-            || {
-                deletes.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            },
-        );
-        assert!(!installed);
-        assert!(!latch.load(Ordering::SeqCst));
+        for poll in 1..=3 {
+            let installed = install_deny_all_net_for_recovery(
+                || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err(NftablesError::InvocationFailed(
+                        "persistent net failure".into(),
+                    ))
+                },
+                &kill_set,
+            );
+            assert!(!installed, "poll {poll} must not report an install");
+        }
         assert_eq!(
-            deletes.load(Ordering::SeqCst),
-            2,
-            "a persistent install failure re-escalates the by-name delete on every poll"
-        );
-
-        // Poll 3: BOTH install and the escalating delete fail -> indeterminate, but
-        // still NOT latched (never records a table-less host as protected).
-        let installed = ensure_deny_all_net_installed_once(
-            &latch,
-            || Err(NftablesError::InvocationFailed("net".into())),
-            || Err(NftablesError::InvocationFailed("del".into())),
-        );
-        assert!(!installed);
-        assert!(
-            !latch.load(Ordering::SeqCst),
-            "even a both-failed poll must not latch a table-less host as protected"
+            attempts.load(Ordering::SeqCst),
+            3,
+            "every eligible poll must re-attempt the net"
         );
     }
 
@@ -2686,7 +4152,7 @@ mod tests {
         let err = crate::enforcement::EnforcementRuntime::start(plan)
             .expect_err("no kernel adapter on this platform -> fail-before");
         match err {
-            crate::enforcement::EnforcementStartError::Component { failed, reason } => {
+            crate::enforcement::EnforcementStartError::Component { failed, reason, .. } => {
                 assert_eq!(failed, ComponentKind::NftablesTable);
                 assert!(matches!(
                     reason,

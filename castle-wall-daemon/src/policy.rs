@@ -13,6 +13,7 @@
 //! policy authority and deliberately carries no kernel mutation capability.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -492,6 +493,17 @@ pub struct PolicySnapshot {
     /// Must match `AgentOrigin.system_uid_allow_ceiling` in
     /// `src/manifest/verify.rs`.
     pub confined_agent_uid_ceiling: Option<u32>,
+    /// The SECOND confined principal the manifest optionally names, admitted
+    /// alongside `confined_agent_uid` and distinct from it.
+    ///
+    /// Threaded through so the Linux safety net's deny set can name it. With the
+    /// wall gone the gate's own allow rules are gone too, so a net that denied the
+    /// agent while sparing the gate would leave a confined principal with egress.
+    /// `None` here means the manifest named no gate, never "a gate was named and
+    /// dropped": admission REFUSES an invalid or colliding gate uid rather than
+    /// zeroing it. Must match `AgentOrigin.gate_uid` in `src/manifest/verify.rs`
+    /// and the `gate_uid` validation in `agent-origin.ts` on the publishing side.
+    pub confined_gate_uid: Option<u32>,
 }
 
 /// Errors produced when constructing a [`PolicySnapshot`] from a
@@ -651,6 +663,10 @@ impl PolicySnapshot {
             manifest_signature_b64url: Some(loaded.manifest_signature_b64url.clone()),
             fortress_id: loaded.signed.manifest.fortress_id.clone(),
             confined_agent_uid: confined_agent_uid.map(|admitted| admitted.agent_uid),
+            // WHOLE-SET threading: the gate uid rides the same admitted value as
+            // the agent uid and the ceiling, so all three are set together or none
+            // is. `snapshot_threads_the_whole_admitted_set` asserts that.
+            confined_gate_uid: confined_agent_uid.and_then(|admitted| admitted.gate_uid),
             confined_agent_uid_ceiling: confined_agent_uid
                 .map(|admitted| admitted.system_uid_allow_ceiling),
         })
@@ -704,6 +720,11 @@ impl PolicySnapshot {
 struct AdmittedAgentUid {
     agent_uid: u32,
     system_uid_allow_ceiling: u32,
+    /// The optional, distinct gate uid the same manifest admitted. Carried on the
+    /// SAME value as the agent uid so a consumer cannot pick up one confined
+    /// principal while dropping the other: the net denies the whole confined
+    /// identity or none of it, never half.
+    gate_uid: Option<u32>,
 }
 
 /// Resolve the confined agent uid a signed manifest binds, or REFUSE the
@@ -727,6 +748,48 @@ struct AdmittedAgentUid {
 /// principal because of the SECOND's defect.
 fn confined_agent_uid_from_loaded_manifest(
     loaded: &LoadedManifest,
+) -> Result<Option<AdmittedAgentUid>, PolicySnapshotError> {
+    confined_agent_uid_with_overflow_source(loaded, &host_overflow_uid_source())
+}
+
+/// Where admission reads this host's `kernel.overflowuid` from.
+///
+/// A path, not a value, so the read happens INSIDE admission and its failure is an
+/// admission failure rather than something a caller can forget to check. Tests
+/// inject a fixture path; production uses the real sysctl.
+#[derive(Debug, Clone)]
+pub struct HostOverflowUidSource {
+    path: PathBuf,
+    /// True on a host where this daemon's uid-mode confinement is actually
+    /// enforced. On such a host an unreadable sysctl FAILS admission closed.
+    required: bool,
+}
+
+/// The production source.
+///
+/// REQUIRED on Linux, where the uid-mode manifest drives real kernel enforcement:
+/// admitting a uid without knowing the host's credential-collision value would let
+/// an unattestable number reach a kernel rule, so an unreadable sysctl refuses the
+/// manifest and keeps the prior good snapshot.
+///
+/// NOT required elsewhere. A non-Linux host has no nftables runtime and no
+/// `/proc/sys/kernel/overflowuid`, so requiring it there would refuse every signed
+/// manifest for a reason that has nothing to do with the manifest. macOS admission
+/// has its own enforcement path and its own lockout analysis.
+/// Must match `crate::safety_net_uid::OVERFLOW_UID_SYSCTL_PATH`.
+fn host_overflow_uid_source() -> HostOverflowUidSource {
+    HostOverflowUidSource {
+        path: PathBuf::from(crate::safety_net_uid::OVERFLOW_UID_SYSCTL_PATH),
+        required: cfg!(target_os = "linux"),
+    }
+}
+
+/// Admission with the overflow source injected, so the fixture cases (a trailing
+/// newline, an empty file, an unreadable file, a host configured differently from
+/// the convention) are testable on any host.
+fn confined_agent_uid_with_overflow_source(
+    loaded: &LoadedManifest,
+    overflow_source: &HostOverflowUidSource,
 ) -> Result<Option<AdmittedAgentUid>, PolicySnapshotError> {
     let Some(origin) = loaded.signed.manifest.agent_origin.as_ref() else {
         return Ok(None);
@@ -766,10 +829,179 @@ fn confined_agent_uid_from_loaded_manifest(
         }
     }
 
+    // D1c: the three refusals, applied IN ADDITION to the ceiling floors above and
+    // never in place of them. The ceiling proves the uid is outside the
+    // system-daemon band; these prove the uid names ONE attestable principal, which
+    // is what the safety net's `meta skuid` match rests on. A uid that fails either
+    // check must not reach a kernel rule.
+    //
+    // FAIL CLOSED on the sysctl itself: an unknown credential-collision value is
+    // never turned into an admission. On a container without the sysctl this refuses
+    // every uid-mode manifest, and the net for such a host then comes from the
+    // journal and the live table instead.
+    match crate::safety_net_uid::HostOverflowUid::read_at(&overflow_source.path) {
+        Ok(overflow) => {
+            for (field, uid) in [
+                ("agent_uid", Some(agent_uid)),
+                ("gate_uid", origin.gate_uid),
+            ] {
+                let Some(uid) = uid else { continue };
+                if let Err(err) = crate::safety_net_uid::validate_safety_net_uid(uid, overflow) {
+                    return Err(unusable(format!(
+                        "{field} {uid} is not an attestable confined identity: {err}. \
+                         Reissue the manifest with a valid uid through the publisher \
+                         (`agent-origin.ts`); the prior good policy stays in force"
+                    )));
+                }
+            }
+        }
+        Err(err) if overflow_source.required => {
+            return Err(unusable(format!(
+                "cannot admit a uid-mode manifest without this host's configured \
+                 kernel.overflowuid: {err}"
+            )))
+        }
+        // Not required on this platform: the uid-mode descriptor is not driving a
+        // Linux kernel rule here, so the three refusals cannot be applied and are
+        // not claimed.
+        Err(_) => {}
+    }
+
     Ok(Some(AdmittedAgentUid {
         agent_uid,
         system_uid_allow_ceiling: origin.system_uid_allow_ceiling,
+        gate_uid: origin.gate_uid,
     }))
+}
+
+/// The outcome of the `preflight-manifest` verb.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreflightOutcome {
+    /// The manifest binds a confined identity this host will admit.
+    Admits {
+        agent_uid: u32,
+        gate_uid: Option<u32>,
+    },
+    /// The manifest declares no uid-mode confinement, so there is no uid to bound.
+    /// Not a failure: the unwrapped posture and a non-uid descriptor are both
+    /// legitimate.
+    NothingConfined,
+    /// This host will NOT admit the manifest. `detail` names the remediation.
+    Refused { detail: String },
+}
+
+impl PreflightOutcome {
+    /// The operator-facing line the verb prints.
+    pub fn message(&self) -> String {
+        match self {
+            PreflightOutcome::Admits {
+                agent_uid,
+                gate_uid,
+            } => match gate_uid {
+                Some(gate) => format!(
+                    "this host admits the installed manifest: agent uid {agent_uid}, \
+                     gate uid {gate}"
+                ),
+                None => format!(
+                    "this host admits the installed manifest: agent uid {agent_uid}, no gate uid"
+                ),
+            },
+            PreflightOutcome::NothingConfined => {
+                "the installed manifest declares no uid-mode confinement; there is no \
+                 confined uid for this host to bound"
+                    .to_string()
+            }
+            PreflightOutcome::Refused { detail } => detail.clone(),
+        }
+    }
+
+    /// Whether the verb should exit zero.
+    pub fn is_ok(&self) -> bool {
+        !matches!(self, PreflightOutcome::Refused { .. })
+    }
+}
+
+/// `preflight-manifest`: answer "will THIS host admit the manifest that is
+/// installed?" before an operator replaces the daemon binary.
+///
+/// LOCK-FREE and NFT-FREE by construction, and that is the whole point of the verb
+/// existing separately from admission: it never opens the host ownership lock the
+/// running daemon holds, and it touches no kernel state. A check that took the lock
+/// could not be run while the daemon is up, which is exactly when an operator needs
+/// the answer; a check that touched nftables could perturb a live wall. It reads two
+/// files and computes.
+///
+/// FAILURE MODE this exists to prevent, stated plainly for the runbook: admission
+/// happens at daemon start, so without this verb the first sign that a manifest is
+/// not admissible on this host is a daemon that will not come up after the binary
+/// has already been replaced. Running this with the NEW binary before the
+/// replacement moves that answer to before the change.
+///
+/// It applies the SAME admission code the daemon uses, including this host's
+/// `kernel.overflowuid` read, so the two cannot answer differently. An unreadable
+/// sysctl FAILS CLOSED here for the same reason it does at admission: an unknown
+/// credential-collision value is never turned into an admission.
+pub fn preflight_manifest(
+    policy_dir: &std::path::Path,
+    pinned_public_key_path: &std::path::Path,
+) -> PreflightOutcome {
+    let refused = |detail: String| PreflightOutcome::Refused { detail };
+
+    let pinned_bytes = match std::fs::read(pinned_public_key_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return refused(format!(
+                "cannot read the pinned fortress public key at \
+                 {}: {err}. The manifest cannot be verified without it",
+                pinned_public_key_path.display()
+            ))
+        }
+    };
+    let pinned_key: [u8; 32] = match pinned_bytes.try_into() {
+        Ok(key) => key,
+        Err(_) => {
+            return refused(format!(
+                "the pinned fortress public key at {} is not a 32-byte raw key",
+                pinned_public_key_path.display()
+            ))
+        }
+    };
+
+    let loaded =
+        match crate::manifest::store::load_signed_manifest_from_disk(policy_dir, &pinned_key) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                return refused(format!(
+                    "the installed manifest under {} could not be loaded or its signature \
+                 did not verify: {err}",
+                    policy_dir.display()
+                ))
+            }
+        };
+
+    preflight_loaded_manifest(&loaded, &host_overflow_uid_source())
+}
+
+/// The computation half of [`preflight_manifest`], with the overflow source
+/// injected so the fixture cases are testable on any host.
+fn preflight_loaded_manifest(
+    loaded: &LoadedManifest,
+    overflow_source: &HostOverflowUidSource,
+) -> PreflightOutcome {
+    match confined_agent_uid_with_overflow_source(loaded, overflow_source) {
+        Ok(Some(admitted)) => PreflightOutcome::Admits {
+            agent_uid: admitted.agent_uid,
+            gate_uid: admitted.gate_uid,
+        },
+        Ok(None) => PreflightOutcome::NothingConfined,
+        Err(err) => PreflightOutcome::Refused {
+            detail: format!(
+                "this host will NOT admit the installed manifest: {err}. \
+                 Reissue the manifest with a valid uid through the publisher, then \
+                 re-run this check before replacing the daemon"
+            ),
+        },
+    }
 }
 
 /// Validate a parsed rule's match axes at snapshot-build time (codex round-4
@@ -1275,6 +1507,7 @@ mod tests {
             fortress_id: "deadbeef".to_string(),
             confined_agent_uid: Some(503),
             confined_agent_uid_ceiling: Some(500),
+            confined_gate_uid: None,
         }
     }
 
@@ -1876,6 +2109,257 @@ mod tests {
         ]);
         loaded.signed.manifest.agent_origin = origin;
         loaded
+    }
+
+    /// An overflow-uid source pointing at a fixture file, REQUIRED, so the three
+    /// refusals are exercised on any host.
+    fn fixture_overflow_source(dir: &std::path::Path, contents: &str) -> HostOverflowUidSource {
+        let path = dir.join("overflowuid");
+        std::fs::write(&path, contents).expect("write fixture");
+        HostOverflowUidSource {
+            path,
+            required: true,
+        }
+    }
+
+    #[test]
+    fn preflight_admits_a_manifest_whose_uids_this_host_will_admit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = fixture_overflow_source(dir.path(), "65534\n");
+        for (agent, gate) in [
+            (1u32, None),
+            (65533, None),
+            (65535, Some(100_000)),
+            (100_000, Some(65535)),
+        ] {
+            let loaded = loaded_with_origin(Some(uid_origin(Some(agent), gate, 1)));
+            assert_eq!(
+                preflight_loaded_manifest(&loaded, &source),
+                PreflightOutcome::Admits {
+                    agent_uid: agent,
+                    gate_uid: gate
+                },
+                "agent {agent} gate {gate:?} must preflight clean"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_refuses_each_unattestable_uid_and_names_the_remediation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = fixture_overflow_source(dir.path(), "65534\n");
+        for refused in [0u32, 65534, u32::MAX] {
+            for loaded in [
+                loaded_with_origin(Some(uid_origin(Some(refused), None, 1))),
+                loaded_with_origin(Some(uid_origin(Some(60123), Some(refused), 1))),
+            ] {
+                let outcome = preflight_loaded_manifest(&loaded, &source);
+                match &outcome {
+                    PreflightOutcome::Refused { detail } => {
+                        // The verb's whole purpose is to be actionable BEFORE the binary
+                        // is replaced, so the remediation must be in the text itself.
+                        assert!(
+                            detail.contains(
+                                "Reissue the manifest with a valid uid through the publisher"
+                            ),
+                            "no remediation named for {refused}: {detail}"
+                        );
+                    }
+                    other => panic!("uid {refused} must be refused, got {other:?}"),
+                }
+                assert!(!outcome.is_ok(), "a refusal must exit non-zero");
+                assert!(!outcome.message().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn preflight_fails_closed_when_the_host_overflow_value_is_unreadable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let loaded = loaded_with_origin(Some(uid_origin(Some(60123), Some(60124), 1)));
+        let missing = HostOverflowUidSource {
+            path: dir.path().join("does-not-exist"),
+            required: true,
+        };
+        assert!(!preflight_loaded_manifest(&loaded, &missing).is_ok());
+    }
+
+    #[test]
+    fn preflight_reports_nothing_confined_rather_than_a_refusal() {
+        // No uid-mode descriptor is a legitimate posture, not a failure, so the verb
+        // exits ZERO and says so. Reporting it as a refusal would make an upgrade
+        // script abort on a perfectly deployable manifest.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = fixture_overflow_source(dir.path(), "65534\n");
+        let outcome = preflight_loaded_manifest(&loaded_with_origin(None), &source);
+        assert_eq!(outcome, PreflightOutcome::NothingConfined);
+        assert!(outcome.is_ok());
+        assert!(outcome.message().contains("no uid-mode confinement"));
+    }
+
+    #[test]
+    fn preflight_reaches_no_lock_and_no_kernel_path() {
+        // The verb must be safe to run WHILE the daemon is up, which is exactly when an
+        // operator needs its answer. That property is structural: this test reads the
+        // source of the two preflight functions and asserts they name no lock and no
+        // nftables path. A future edit that reached for either would have to change
+        // this assertion, which is the point.
+        let source = include_str!("policy.rs");
+        let start = source
+            .find("pub fn preflight_manifest(")
+            .expect("the verb is defined in this file");
+        let end = source[start..]
+            .find("/// Validate a parsed rule's match axes")
+            .map(|offset| start + offset)
+            .expect("the verb's region ends before the rule-axis validator");
+        let region = &source[start..end];
+        for forbidden in [
+            "runtime_lock",
+            "HostRuntimeLock",
+            "host_lock_path",
+            "nftables",
+            "install_deny_all",
+            "run_nft",
+        ] {
+            assert!(
+                !region.contains(forbidden),
+                "the preflight verb must not reach {forbidden}: it has to run while the \
+                 daemon holds the host lock, and it must not perturb kernel state"
+            );
+        }
+        // And it does read the two things it is supposed to read.
+        assert!(region.contains("load_signed_manifest_from_disk"));
+        assert!(region.contains("confined_agent_uid_with_overflow_source"));
+    }
+
+    #[test]
+    fn admission_refuses_the_three_unattestable_uids_per_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A trailing newline is the REAL procfs form; an untrimmed parse would fail
+        // on a perfectly healthy host.
+        let source = fixture_overflow_source(dir.path(), "65534\n");
+
+        // Accepted: every mapped uid on either side of the overflow value, and the
+        // boundary at the ceiling itself.
+        for (agent, gate) in [
+            (1u32, None),
+            (65533, None),
+            (65535, Some(100_000)),
+            (100_000, Some(65535)),
+        ] {
+            let loaded = loaded_with_origin(Some(uid_origin(Some(agent), gate, 1)));
+            let admitted = confined_agent_uid_with_overflow_source(&loaded, &source)
+                .unwrap_or_else(|e| panic!("agent {agent} gate {gate:?} must be admitted: {e}"))
+                .expect("uid mode admits");
+            assert_eq!(admitted.agent_uid, agent);
+            assert_eq!(admitted.gate_uid, gate);
+        }
+
+        // Refused, per field: 0, the HOST's configured overflow uid, the sentinel.
+        // (0 is already refused by the root floor; asserted here so the per-field
+        // matrix is complete.)
+        for refused in [0u32, 65534, u32::MAX] {
+            let agent_case = loaded_with_origin(Some(uid_origin(Some(refused), None, 1)));
+            assert!(
+                confined_agent_uid_with_overflow_source(&agent_case, &source).is_err(),
+                "agent_uid {refused} must be refused"
+            );
+            let gate_case = loaded_with_origin(Some(uid_origin(Some(60123), Some(refused), 1)));
+            assert!(
+                confined_agent_uid_with_overflow_source(&gate_case, &source).is_err(),
+                "gate_uid {refused} must be refused"
+            );
+        }
+
+        // The refusal names the remediation, because an operator meeting it has an
+        // already-signed manifest that has stopped loading.
+        let err = confined_agent_uid_with_overflow_source(
+            &loaded_with_origin(Some(uid_origin(Some(65534), None, 1))),
+            &source,
+        )
+        .expect_err("refused");
+        let text = format!("{err}");
+        assert!(text.contains("Reissue"), "no remediation named: {text}");
+    }
+
+    #[test]
+    fn admission_reads_the_hosts_own_overflow_value_never_a_constant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A host configured with kernel.overflowuid=65533 keeps a MAPPED 65534
+        // admitted, which is why the daemon never hard-codes 65534.
+        let source = fixture_overflow_source(dir.path(), "65533\n");
+        assert!(confined_agent_uid_with_overflow_source(
+            &loaded_with_origin(Some(uid_origin(Some(65533), None, 1))),
+            &source
+        )
+        .is_err());
+        assert!(confined_agent_uid_with_overflow_source(
+            &loaded_with_origin(Some(uid_origin(Some(65534), None, 1))),
+            &source
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn admission_fails_closed_when_the_overflow_sysctl_is_unusable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let loaded = loaded_with_origin(Some(uid_origin(Some(60123), Some(60124), 1)));
+        for contents in ["", "   \n", "not-a-number\n"] {
+            let source = fixture_overflow_source(dir.path(), contents);
+            assert!(
+                confined_agent_uid_with_overflow_source(&loaded, &source).is_err(),
+                "an unusable sysctl value {contents:?} must refuse the manifest"
+            );
+        }
+        // A MISSING file is the container case, and it refuses too: an unknown
+        // credential-collision value is never turned into an admission.
+        let missing = HostOverflowUidSource {
+            path: dir.path().join("does-not-exist"),
+            required: true,
+        };
+        assert!(confined_agent_uid_with_overflow_source(&loaded, &missing).is_err());
+    }
+
+    #[test]
+    fn the_fs_overflowuid_is_never_the_one_admission_reads() {
+        // A host may configure kernel.overflowuid and fs.overflowuid to different
+        // values. Reading the fs one would refuse the wrong uid and admit the real
+        // credential-collision value.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("fs_overflowuid"), "60000\n").expect("write");
+        let source = fixture_overflow_source(dir.path(), "65534\n");
+        assert!(confined_agent_uid_with_overflow_source(
+            &loaded_with_origin(Some(uid_origin(Some(60000), None, 1))),
+            &source
+        )
+        .is_ok());
+        assert!(crate::safety_net_uid::OVERFLOW_UID_SYSCTL_PATH.contains("/kernel/"));
+    }
+
+    #[test]
+    fn snapshot_threads_the_whole_admitted_set() {
+        // WHOLE-SET parity: the agent uid, the ceiling and the gate uid are set
+        // together or not at all. A snapshot carrying the agent uid while dropping
+        // the gate uid would let the safety net deny half the confined identity.
+        let loaded = loaded_with_origin(Some(uid_origin(Some(60123), Some(60124), 500)));
+        let snap = PolicySnapshot::from_loaded_manifest(&loaded).expect("snapshot");
+        assert_eq!(snap.confined_agent_uid, Some(60123));
+        assert_eq!(snap.confined_agent_uid_ceiling, Some(500));
+        assert_eq!(snap.confined_gate_uid, Some(60124));
+
+        // No gate named: the agent half is still whole, and the gate is `None`
+        // because the manifest named none, never because one was dropped.
+        let no_gate = loaded_with_origin(Some(uid_origin(Some(60123), None, 500)));
+        let snap = PolicySnapshot::from_loaded_manifest(&no_gate).expect("snapshot");
+        assert_eq!(snap.confined_agent_uid, Some(60123));
+        assert_eq!(snap.confined_gate_uid, None);
+
+        // No uid-mode origin at all: every member of the set is absent together.
+        let none = loaded_with_origin(None);
+        let snap = PolicySnapshot::from_loaded_manifest(&none).expect("snapshot");
+        assert_eq!(snap.confined_agent_uid, None);
+        assert_eq!(snap.confined_agent_uid_ceiling, None);
+        assert_eq!(snap.confined_gate_uid, None);
     }
 
     #[test]
