@@ -18,6 +18,23 @@ def one(pattern, text, label):
     return matches[0]
 
 
+def table_construction_verbs(source, name):
+    """Read only the named production function's nft table commands."""
+    lines = source.splitlines()
+    headers = [index for index, line in enumerate(lines) if re.search(rf"\bfn {re.escape(name)}\b", line)]
+    if len(headers) != 1:
+        fail(f"expected one production {name} function")
+    start = headers[0]
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = next((index for index in range(start + 1, len(lines))
+                if lines[index] == " " * indent + "}"), None)
+    if end is None:
+        fail(f"cannot bound production {name} function")
+    commands = re.findall(r'(?m)^\s*"?\s*(add|delete|create) table (\S+) (\{[^}]+\}|[A-Za-z0-9_-]+)',
+                          "\n".join(lines[start:end]))
+    return [(verb, family, table) for verb, family, table in commands]
+
+
 def main():
     here = Path(__file__).resolve().parent
     crate = here.parent.parent
@@ -57,11 +74,18 @@ def main():
     if constants.get("UNIT_PATH") != "/etc/systemd/system/sanctuary-castle-wall.service":
         fail("unit path changed outside first-slice contract")
     family = one(r'^pub const CASTLE_FAMILY: &str = "([^"]+)";', nft, "nft family")
-    # Bind the guard to the daemon's actual table construction, not merely to
-    # another literal that could drift independently.
-    table_families = re.findall(r'(?:add|delete|create) table (\S+) \{castle_table\}', nft)
-    if not table_families or any(token != "{CASTLE_FAMILY}" for token in table_families):
-        fail("daemon table construction does not use CASTLE_FAMILY throughout")
+    # Check each bounded production construction site. A renamed table
+    # placeholder must fail just as a changed family or omitted verb does.
+    sites = {
+        "build_deny_all_safety_net_script": ("add", "delete", "add"),
+        "atomic_reset_deny_all_net_to_fresh_owned_impl": ("add", "delete", "create"),
+        "force_delete_castle_table_by_name_impl": ("add", "delete"),
+        "build_create_castle_table_script": ("create",),
+    }
+    for name, verbs in sites.items():
+        expected_commands = [(verb, "{CASTLE_FAMILY}", "{castle_table}") for verb in verbs]
+        if table_construction_verbs(nft, name) != expected_commands:
+            fail(f"daemon table construction drifted in {name}")
     if family != "inet" or constants.get("NFT_FAMILY") != family:
         fail("nft family changed outside first-slice contract")
     supported_unit_roots = (

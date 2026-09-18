@@ -167,7 +167,8 @@ unset 'dependency_set[systemd]' 'dependency_set[systemd:amd64]'
 unset 'dependency_set[nftables]' 'dependency_set[nftables:amd64]'
 [[ ${#dependency_set[@]} -gt 0 ]] || die "runtime dependency derivation produced no packages"
 mapfile -t runtime_dependencies < <(printf '%s\n' "${!dependency_set[@]}" | LC_ALL=C sort)
-runtime_depends="$(IFS=', '; echo "${runtime_dependencies[*]}")"
+printf -v runtime_depends '%s, ' "${runtime_dependencies[@]}"
+runtime_depends="${runtime_depends%, }"
 pre_depends="systemd, nftables, python3"
 
 install -d -m 0755 \

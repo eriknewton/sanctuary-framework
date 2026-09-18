@@ -100,6 +100,14 @@ jobs:
             echo 'planted daemon table-construction drift was accepted' >&2
             exit 1
           fi
+          sed -i '0,/add table ip {castle_table}/s//add table {CASTLE_FAMILY} {castle_table}/' \
+            "$negative/castle-wall-daemon/src/nftables.rs"
+          sed -i '0,/add table {CASTLE_FAMILY} {castle_table}/s//add table {CASTLE_FAMILY} {renamed_table}/' \
+            "$negative/castle-wall-daemon/src/nftables.rs"
+          if python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py"; then
+            echo 'planted daemon table-placeholder drift was accepted' >&2
+            exit 1
+          fi
           cat > "$negative/misleading-Cargo.toml" <<'TOML'
           [unrelated]
           version = "99.0.0"

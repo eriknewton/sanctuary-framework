@@ -23,30 +23,42 @@ ARCHIVE = runpy.run_path(str(Path(__file__).with_name("assert-archive.py")))
 
 class GuardTests(unittest.TestCase):
     def test_archive_root_requires_exact_directory_custody(self):
-        def inspect(name, mode, uid=0, directory=True):
+        def inspect(name, mode, uid=0, gid=0, directory=True, duplicate=False, with_payload=False):
             stream = io.BytesIO()
             with tarfile.open(fileobj=stream, mode="w:") as tar:
                 root = tarfile.TarInfo(name)
                 root.type = tarfile.DIRTYPE if directory else tarfile.REGTYPE
-                root.mode, root.uid, root.gid = mode, uid, 0
+                root.mode, root.uid, root.gid = mode, uid, gid
                 tar.addfile(root, io.BytesIO(b"") if not directory else None)
+                if duplicate:
+                    tar.addfile(root, io.BytesIO(b"") if not directory else None)
+                if with_payload:
+                    child = tarfile.TarInfo("./etc/")
+                    child.type = tarfile.DIRTYPE
+                    child.mode, child.uid, child.gid = 0o755, 0, 0
+                    tar.addfile(child)
             with patch.object(ARCHIVE["archive"].__globals__["subprocess"], "run",
                               return_value=SimpleNamespace(stdout=stream.getvalue())):
                 return ARCHIVE["archive"](Path("unused.deb"), "--fsys-tarfile")
 
         self.assertEqual(inspect(".", 0o755), {})
         self.assertEqual(inspect("./", 0o755), {})
-        for name, mode, uid, directory in ((".", 0o777, 0, True),
-                                           (".", 0o755, 1, True),
-                                           (".", 0o755, 0, False)):
-            with self.subTest(name=name, mode=mode, uid=uid, directory=directory):
+        self.assertEqual(set(inspect(".", 0o755, with_payload=True)), {"etc"})
+        for name, mode, uid, gid, directory, duplicate in ((".", 0o777, 0, 0, True, False),
+                                                           (".", 0o755, 1, 0, True, False),
+                                                           (".", 0o755, 0, 1, True, False),
+                                                           (".", 0o755, 0, 0, False, False),
+                                                           (".", 0o755, 0, 0, True, True)):
+            with self.subTest(name=name, mode=mode, uid=uid, gid=gid,
+                              directory=directory, duplicate=duplicate):
                 with self.assertRaises(ValueError):
-                    inspect(name, mode, uid, directory)
+                    inspect(name, mode, uid, gid, directory, duplicate)
 
     def test_runtime_depends_rejects_dev_relations_and_whitespace(self):
         script = Path(__file__).with_name("assert-structure.sh")
         for field in ("libc6, libfixture-dev", "libc6, libfixture-dev (>= 1)",
-                      "libc6, libfixture-dev   , libmnl0"):
+                      "libc6, libfixture-dev   , libmnl0", "libc6,\nlibmnl0",
+                      "libc6,\rlibmnl0"):
             with self.subTest(field=field):
                 result = subprocess.run(["bash", str(script), "--check-depends", field],
                                         capture_output=True, text=True, check=False)
@@ -55,6 +67,10 @@ class GuardTests(unittest.TestCase):
                     ARCHIVE["validate_runtime_depends"](field)
         self.assertEqual(ARCHIVE["validate_runtime_depends"]("libc6, libmnl0:amd64"),
                          ["libc6", "libmnl0:amd64"])
+        self.assertEqual(ARCHIVE["validate_runtime_depends"]("libc6,libmnl0"),
+                         ARCHIVE["validate_runtime_depends"]("libc6, libmnl0"))
+        self.assertNotEqual(ARCHIVE["validate_runtime_depends"]("libc6,libmnl0"),
+                            ARCHIVE["validate_runtime_depends"]("libc6, libcap2"))
     def status(self, content):
         with patch.dict(GUARD["dpkg_status"].__globals__, {"checked_file": lambda *_: None, "stable_read": lambda *_: content}):
             return GUARD["dpkg_status"]()

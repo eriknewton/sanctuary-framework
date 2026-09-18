@@ -97,11 +97,13 @@ package=sanctuary-castle-wall-internal
 unit=sanctuary-castle-wall.service
 daemon=/usr/local/libexec/sanctuary/castle-wall-daemon
 unit_file=/etc/systemd/system/sanctuary-castle-wall.service
+identity_file=/usr/share/doc/sanctuary-castle-wall-internal/build-identity
 v1_version="$(dpkg-deb -f "$v1" Version)"
 v2_version="$(dpkg-deb -f "$v2" Version)"
 dpkg --compare-versions "$v1_version" lt "$v2_version" || die "package revisions not increasing"
 v1_daemon_sha="$(dpkg-deb --fsys-tarfile "$v1" | tar -xOf - ./usr/local/libexec/sanctuary/castle-wall-daemon | sha256sum | cut -d' ' -f1)"
 v1_unit_sha="$(dpkg-deb --fsys-tarfile "$v1" | tar -xOf - ./etc/systemd/system/sanctuary-castle-wall.service | sha256sum | cut -d' ' -f1)"
+v1_identity_sha="$(dpkg-deb --fsys-tarfile "$v1" | tar -xOf - ./usr/share/doc/sanctuary-castle-wall-internal/build-identity | sha256sum | cut -d' ' -f1)"
 {
   echo "scenario=$scenario"
   echo "source_commit=${GITHUB_SHA:-unknown}"
@@ -143,6 +145,63 @@ nft_check() {
   nft -j list tables | python3 -c 'import json,sys; data=json.load(sys.stdin); assert isinstance(data.get("nftables"),list); assert not any(x.get("table",{}).get("family")=="inet" and x.get("table",{}).get("name")=="sanctuary-castle" for x in data["nftables"])'
 }
 
+# Compare the ten exact archive directories with the state observed before
+# installation. Shared /etc and /usr ancestors may already exist; a fresh
+# refusal must leave their type/custody intact rather than require absence.
+payload_dir_state() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+mode, baseline_path = sys.argv[1:]
+paths = (
+    "/etc", "/etc/systemd", "/etc/systemd/system", "/usr", "/usr/local",
+    "/usr/local/libexec", "/usr/local/libexec/sanctuary", "/usr/share",
+    "/usr/share/doc", "/usr/share/doc/sanctuary-castle-wall-internal",
+)
+def observe(path):
+    try:
+        item = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return ["directory" if stat.S_ISDIR(item.st_mode) else "other",
+            item.st_uid, item.st_gid, stat.S_IMODE(item.st_mode)]
+
+current = {path: observe(path) for path in paths}
+if mode == "capture":
+    for path, item in current.items():
+        if item is not None and item != ["directory", 0, 0, 0o755]:
+            raise SystemExit(f"unsafe preflight package directory: {path}: {item!r}")
+    print(json.dumps(current, sort_keys=True))
+else:
+    baseline = json.loads(Path(baseline_path).read_text())
+    if set(baseline) != set(paths):
+        raise SystemExit("payload directory baseline incomplete")
+    for path in paths:
+        before, after = baseline[path], current[path]
+        expected = ["directory", 0, 0, 0o755] if mode == "installed-first" and before is None else before
+        if after != expected:
+            raise SystemExit(f"package directory changed unexpectedly: {path}: {before!r} -> {after!r}")
+    if mode == "installed-first":
+        print(json.dumps(current, sort_keys=True))
+    elif mode != "compare":
+        raise SystemExit("unknown directory inventory mode")
+PY
+}
+
+assert_payload_absent() {
+  python3 - "$daemon" "$unit_file" "$identity_file" <<'PY'
+import os
+import sys
+for path in sys.argv[1:]:
+    if os.path.lexists(path):
+        raise SystemExit(f"package payload leaf exists after refusal: {path}")
+PY
+}
+
 snapshot() {
   local out="$evidence/$1"
   mkdir -m 0755 -- "$out"
@@ -153,15 +212,13 @@ snapshot() {
   nft -j list tables > "$out/nft-tables.json"
   if [[ -f "$daemon" ]]; then sha256sum "$daemon" > "$out/daemon.sha256"; fi
   if [[ -f "$unit_file" ]]; then sha256sum "$unit_file" > "$out/unit.sha256"; fi
+  if [[ -f "$identity_file" ]]; then sha256sum "$identity_file" > "$out/build-identity.sha256"; fi
   find /etc/sanctuary /var/lib/sanctuary /run/sanctuary -maxdepth 2 -print \
     > "$out/bounded-paths.txt" 2> "$out/find-stderr.txt" || true
 }
 
 assert_absent() {
-  [[ ! -e "$daemon" && ! -L "$daemon" && ! -e "$unit_file" && ! -L "$unit_file" \
-     && ! -e /usr/share/doc/sanctuary-castle-wall-internal/build-identity \
-     && ! -L /usr/share/doc/sanctuary-castle-wall-internal/build-identity ]] \
-    || die "package payload already exists"
+  assert_payload_absent || die "package payload already exists"
   [[ ! -e /etc/sanctuary/castle-wall.env && ! -L /etc/sanctuary/castle-wall.env ]] \
     || die "Castle Wall environment exists"
   for root in /var/lib/sanctuary /run/sanctuary; do
@@ -179,11 +236,38 @@ assert_absent() {
 }
 
 assert_installed_v1() {
-  [[ "$(status | head -n1)" == 'install ok installed' ]] || die "v1 no longer in exact installed state"
+  local want="${1:-upgrade}" observed path expected mode
+  observed="$(status | head -n1)"
+  if [[ "$want" == remove-veto ]]; then
+    [[ "$observed" == 'install ok installed' || "$observed" == 'deinstall ok installed' \
+       || "$observed" == 'purge ok installed' ]] \
+      || die "refused remove left v1 outside admitted installed Want state: $observed"
+    printf 'remove_veto_observed_status=%s\n' "$observed" > "$evidence/remove-veto-status.txt"
+  else
+    [[ "$observed" == 'install ok installed' ]] || die "v1 no longer in exact upgrade/install state"
+  fi
   [[ "$(status | tail -n1)" == "$v1_version" ]] || die "v1 Version changed"
-  [[ -f "$daemon" && -f "$unit_file" ]] || die "old recovery payload lost"
-  [[ "$(sha256sum "$daemon" | cut -d' ' -f1)" == "$v1_daemon_sha" ]] || die "old daemon bytes changed"
-  [[ "$(sha256sum "$unit_file" | cut -d' ' -f1)" == "$v1_unit_sha" ]] || die "old unit bytes changed"
+  for path in "$daemon" "$unit_file" "$identity_file"; do
+    case "$path" in
+      "$daemon") expected="$v1_daemon_sha"; mode=755 ;;
+      "$unit_file") expected="$v1_unit_sha"; mode=644 ;;
+      "$identity_file") expected="$v1_identity_sha"; mode=644 ;;
+    esac
+    [[ -f "$path" && ! -L "$path" ]] || die "old package leaf missing or not regular: $path"
+    [[ "$(stat -c '%u:%g:%a' -- "$path")" == "0:0:$mode" ]] \
+      || die "old package leaf custody changed: $path"
+    [[ "$(sha256sum "$path" | cut -d' ' -f1)" == "$expected" ]] \
+      || die "old package leaf bytes changed: $path"
+    [[ "$(dpkg-query -S -- "$path")" == "$package: $path" ]] \
+      || die "old package leaf is not solely owned by expected package: $path"
+  done
+  if [[ ! -e "$evidence/payload-dirs-v1.json" ]]; then
+    payload_dir_state installed-first "$evidence/payload-dirs-preflight.json" > "$evidence/payload-dirs-v1.json" \
+      || die "installed v1 directory custody differs from preflight baseline"
+  else
+    payload_dir_state compare "$evidence/payload-dirs-v1.json" \
+      || die "installed v1 directory custody changed"
+  fi
   cmp -s "$unit_file" "$(dirname "${BASH_SOURCE[0]}")/../../systemd/sanctuary-castle-wall.service" \
     || die "installed unit differs from source"
   nft_check || die "Castle Wall nft table appeared"
@@ -251,11 +335,13 @@ attempt_refusal() {
 assert_fresh_refusal_did_not_unpack() {
   [[ "$(status | head -n1)" == 'install ok not-installed' && "$(status | tail -n1)" == NO_VERSION ]] \
     || die "fresh refusal left an unadmitted dpkg status"
-  [[ ! -e "$daemon" && ! -L "$daemon" && ! -e "$unit_file" && ! -L "$unit_file" ]] \
-    || die "fresh refusal unpacked package payload"
+  assert_payload_absent || die "fresh refusal unpacked package payload"
+  payload_dir_state compare "$evidence/payload-dirs-preflight.json" \
+    || die "fresh refusal changed package directory baseline"
 }
 
 snapshot preflight
+payload_dir_state capture - > "$evidence/payload-dirs-preflight.json"
 assert_absent
 python3 - "$script_dir/lifecycle-guard.py" <<'PY'
 import runpy, sys
@@ -298,7 +384,9 @@ case "$scenario" in
     dpkg --remove "$package" > "$evidence/remove.stdout" 2> "$evidence/remove.stderr"
     snapshot removed
     post_remove_snapshot=removed
-    [[ ! -e "$daemon" && ! -e "$unit_file" ]] || die "guarded remove retained payload"
+    assert_payload_absent || die "guarded remove retained payload"
+    payload_dir_state compare "$evidence/payload-dirs-preflight.json" \
+      || die "guarded remove changed package directory baseline"
     if [[ "$(status | head -n1)" == 'deinstall ok config-files' ]]; then
       dpkg --purge "$package" > "$evidence/purge.stdout" 2> "$evidence/purge.stderr"
       snapshot purged
@@ -325,8 +413,9 @@ case "$scenario" in
       printf 'stale_reinstall_veto_unexercised=manager_already_fresh\n' >> "$evidence/stale-manager-coverage.txt"
     else
       attempt_refusal stale-manager-reinstall-veto "$v1" 'fresh unit is still effective or stale'
-      [[ ! -e "$daemon" && ! -e "$unit_file" ]] \
-        || die "stale-manager refusal unpacked package bytes"
+      assert_payload_absent || die "stale-manager refusal unpacked package bytes"
+      payload_dir_state compare "$evidence/payload-dirs-preflight.json" \
+        || die "stale-manager refusal changed package directory baseline"
       printf 'stale_reinstall_veto_observed=yes\n' >> "$evidence/stale-manager-coverage.txt"
     fi
     # This is the explicit operator step, never a maintainer-script action.
@@ -451,7 +540,7 @@ PY
       /etc/systemd/system/multi-user.target.wants/sanctuary-castle-wall.service
     snapshot dangling-link
     attempt_refusal dangling-link-veto "$v1" 'systemd alias or enablement symlink'
-    [[ ! -e "$daemon" ]] || die "payload appeared after refusal"
+    assert_fresh_refusal_did_not_unpack
     ;;
   local-dangling)
     [[ ! -e /usr/local/lib/systemd/system/codex-package-fixture.wants \
@@ -462,8 +551,7 @@ PY
       /usr/local/lib/systemd/system/codex-package-fixture.wants/sanctuary-castle-wall.service
     snapshot local-search-root-dangling
     attempt_refusal local-search-root-veto "$v1" 'systemd alias or enablement symlink'
-    [[ "$(status | head -n1)" == 'install ok not-installed' && ! -e "$daemon" ]] \
-      || die "out-of-old-roots dangling link refusal unpacked package bytes"
+    assert_fresh_refusal_did_not_unpack
     ;;
   writable-wants)
     [[ ! -e /etc/systemd/system/codex-package-fixture.wants \
@@ -474,8 +562,7 @@ PY
     attempt_refusal unsafe-enable-directory-veto "$v1" 'unsafe systemd directory'
     grep -F 'unsafe systemd directory' "$evidence/unsafe-enable-directory-veto.stderr" >/dev/null \
       || die "empty writable enablement directory was not the refusal cause"
-    [[ "$(status | head -n1)" == 'install ok not-installed' && ! -e "$daemon" ]] \
-      || die "unsafe-directory refusal unpacked package bytes"
+    assert_fresh_refusal_did_not_unpack
     ;;
   env-collision)
     [[ ! -e /etc/sanctuary && ! -L /etc/sanctuary ]] \
@@ -485,7 +572,7 @@ PY
     chmod 0600 /etc/sanctuary/castle-wall.env
     snapshot env-collision
     attempt_refusal env-veto "$v1" 'Castle Wall environment present'
-    [[ ! -e "$daemon" ]] || die "payload appeared after refusal"
+    assert_fresh_refusal_did_not_unpack
     ;;
   fresh-retry)
     [[ ! -e /etc/sanctuary && ! -L /etc/sanctuary ]] \
@@ -496,9 +583,7 @@ PY
     attempt_refusal fresh-preinst-veto "$v1" 'Castle Wall environment present'
     grep -F 'Castle Wall environment present' "$evidence/fresh-preinst-veto.stderr" >/dev/null \
       || die "fresh refusal did not come from the guard's preinst"
-    [[ "$(status | head -n1)" == 'install ok not-installed' && "$(status | tail -n1)" == NO_VERSION ]] \
-      || die "fresh refusal left an unadmitted dpkg status"
-    [[ ! -e "$daemon" && ! -e "$unit_file" ]] || die "fresh refusal unpacked payload"
+    assert_fresh_refusal_did_not_unpack
     [[ ! -e "/var/lib/dpkg/info/$package.prerm" && ! -e "/var/lib/dpkg/info/$package.postrm" ]] \
       || die "fresh refusal installed unexpected package callbacks"
     rm -- /etc/sanctuary/castle-wall.env
@@ -517,16 +602,16 @@ PY
     attempt_refusal fresh-preinst-veto "$v1" 'Castle Wall environment present'
     grep -F 'Castle Wall environment present' "$evidence/fresh-preinst-veto.stderr" >/dev/null \
       || die "fresh refusal did not come from the guard's preinst"
-    [[ "$(status | head -n1)" == 'install ok not-installed' && "$(status | tail -n1)" == NO_VERSION ]] \
-      || die "fresh refusal left an unadmitted dpkg status"
-    [[ ! -e "$daemon" && ! -e "$unit_file" ]] || die "fresh refusal unpacked payload"
+    assert_fresh_refusal_did_not_unpack
     [[ ! -e "/var/lib/dpkg/info/$package.prerm" && ! -e "/var/lib/dpkg/info/$package.postrm" ]] \
       || die "fresh refusal installed unexpected package callbacks"
     dpkg --purge "$package" > "$evidence/fresh-purge.stdout" 2> "$evidence/fresh-purge.stderr"
     snapshot fresh-purged
     [[ "$(status | head -n1)" == 'purge ok not-installed' && "$(status | tail -n1)" == NO_VERSION ]] \
       || die "ordinary purge after fresh refusal left an unadmitted status"
-    [[ ! -e "$daemon" && ! -e "$unit_file" ]] || die "ordinary purge installed package payload"
+    assert_payload_absent || die "ordinary purge installed package payload"
+    payload_dir_state compare "$evidence/payload-dirs-preflight.json" \
+      || die "ordinary purge after fresh refusal changed package directory baseline"
     [[ ! -e "/var/lib/dpkg/info/$package.prerm" && ! -e "/var/lib/dpkg/info/$package.postrm" ]] \
       || die "ordinary purge retained unexpected callbacks"
     ;;
@@ -602,7 +687,7 @@ PY
       "$evidence/remove-veto.stderr" >/dev/null || die "remove did not hit guard veto"
     assert_phase_calls 'old-prerm remove'
     snapshot remove-veto
-    assert_installed_v1
+    assert_installed_v1 remove-veto
     [[ -f /etc/sanctuary/castle-wall.env ]] || die "remove veto lost colliding environment"
     ;;
   *) die "unknown isolated scenario: $scenario" ;;

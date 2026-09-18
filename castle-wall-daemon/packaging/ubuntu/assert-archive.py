@@ -37,6 +37,8 @@ def validate_runtime_depends(depends):
     # The builder emits only plain, exact package names. Reject relationship
     # syntax (including versioned -dev packages) instead of trying to guess
     # whether a more complex expression has an acceptable alternative.
+    if "\r" in depends or "\n" in depends:
+        fail("runtime Depends must be a single line")
     names = [part.strip() for part in depends.split(",")]
     if not names or any(not re.fullmatch(r"[a-z0-9][a-z0-9+.-]*(?::amd64)?", name) for name in names):
         fail("runtime Depends is not a plain package-name list")
@@ -133,9 +135,10 @@ def main(deb):
     if field(deb, "Pre-Depends") != "systemd, nftables, python3" or identity["pre_depends"] != "systemd, nftables, python3":
         fail("early probe dependency metadata mismatch")
     depends = field(deb, "Depends")
-    validate_runtime_depends(depends)
-    if depends != identity["runtime_depends"]:
-        fail("runtime dependency metadata contains probe or -dev package")
+    depends_names = validate_runtime_depends(depends)
+    identity_names = validate_runtime_depends(identity["runtime_depends"])
+    if depends_names != identity_names:
+        fail("runtime dependency metadata/build identity mismatch")
     daemon = payload["usr/local/libexec/sanctuary/castle-wall-daemon"][1]
     unit = payload["etc/systemd/system/sanctuary-castle-wall.service"][1]
     if hashlib.sha256(daemon).hexdigest() != identity["daemon_sha256"] or hashlib.sha256(unit).hexdigest() != identity["unit_sha256"]:
