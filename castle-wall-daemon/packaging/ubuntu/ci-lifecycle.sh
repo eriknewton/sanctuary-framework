@@ -236,7 +236,7 @@ assert_absent() {
 }
 
 assert_installed_v1() {
-  local want="${1:-upgrade}" observed path expected mode
+  local want="${1:-upgrade}" observed path expected mode owner
   observed="$(status | head -n1)"
   if [[ "$want" == remove-veto ]]; then
     [[ "$observed" == 'install ok installed' || "$observed" == 'deinstall ok installed' \
@@ -258,7 +258,8 @@ assert_installed_v1() {
       || die "old package leaf custody changed: $path"
     [[ "$(sha256sum "$path" | cut -d' ' -f1)" == "$expected" ]] \
       || die "old package leaf bytes changed: $path"
-    [[ "$(dpkg-query -S -- "$path")" == "$package: $path" ]] \
+    owner="$(dpkg-query -S -- "$path")"
+    [[ "$owner" == "$package: $path" || "$owner" == "$package:amd64: $path" ]] \
       || die "old package leaf is not solely owned by expected package: $path"
   done
   if [[ ! -e "$evidence/payload-dirs-v1.json" ]]; then

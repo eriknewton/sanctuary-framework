@@ -138,7 +138,7 @@ def main(deb):
     depends_names = validate_runtime_depends(depends)
     identity_names = validate_runtime_depends(identity["runtime_depends"])
     if depends_names != identity_names:
-        fail("runtime dependency metadata/build identity mismatch")
+        fail(f"runtime dependency metadata/build identity mismatch: {depends_names!r} != {identity_names!r}")
     daemon = payload["usr/local/libexec/sanctuary/castle-wall-daemon"][1]
     unit = payload["etc/systemd/system/sanctuary-castle-wall.service"][1]
     if hashlib.sha256(daemon).hexdigest() != identity["daemon_sha256"] or hashlib.sha256(unit).hexdigest() != identity["unit_sha256"]:

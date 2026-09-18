@@ -2,9 +2,16 @@
 """Fail when the read-only guard's bounded paths drift from daemon/unit source."""
 
 import ast
+import hashlib
 import re
 import sys
 from pathlib import Path
+
+
+# Exact reviewed daemon nft source for this unprovisioned package slice. This
+# is deliberately a source pin, not a Rust parser: any edit requires a new
+# source review and explicit pin refresh before a package can be asserted.
+NFTABLES_SOURCE_SHA256 = "25a1266acb92a2d8c3a0f32d2552d1bd40f7a491c313a2bdfe5a6e48a08bea5a"
 
 
 def fail(message):
@@ -16,23 +23,6 @@ def one(pattern, text, label):
     if len(matches) != 1:
         fail(f"expected one parseable {label}; found {len(matches)}")
     return matches[0]
-
-
-def table_construction_verbs(source, name):
-    """Read only the named production function's nft table commands."""
-    lines = source.splitlines()
-    headers = [index for index, line in enumerate(lines) if re.search(rf"\bfn {re.escape(name)}\b", line)]
-    if len(headers) != 1:
-        fail(f"expected one production {name} function")
-    start = headers[0]
-    indent = len(lines[start]) - len(lines[start].lstrip())
-    end = next((index for index in range(start + 1, len(lines))
-                if lines[index] == " " * indent + "}"), None)
-    if end is None:
-        fail(f"cannot bound production {name} function")
-    commands = re.findall(r'(?m)^\s*"?\s*(add|delete|create) table (\S+) (\{[^}]+\}|[A-Za-z0-9_-]+)',
-                          "\n".join(lines[start:end]))
-    return [(verb, family, table) for verb, family, table in commands]
 
 
 def main():
@@ -50,7 +40,11 @@ def main():
     config = (crate / "src/config.rs").read_text()
     journal = (crate / "src/ownership_journal.rs").read_text()
     lock = (crate / "src/runtime_lock.rs").read_text()
-    nft = (crate / "src/nftables.rs").read_text()
+    nft_bytes = (crate / "src/nftables.rs").read_bytes()
+    nft_sha256 = hashlib.sha256(nft_bytes).hexdigest()
+    if nft_sha256 != NFTABLES_SOURCE_SHA256:
+        fail(f"unreviewed nftables.rs source: {nft_sha256} != {NFTABLES_SOURCE_SHA256}")
+    nft = nft_bytes.decode("utf-8")
     env = one(r"^EnvironmentFile=(\S+)$", unit, "EnvironmentFile")
     start = one(r"^ExecStart=(.+)$", unit, "ExecStart")
     runtime_dir = one(r"^RuntimeDirectory=(\S+)$", unit, "RuntimeDirectory")
@@ -74,18 +68,6 @@ def main():
     if constants.get("UNIT_PATH") != "/etc/systemd/system/sanctuary-castle-wall.service":
         fail("unit path changed outside first-slice contract")
     family = one(r'^pub const CASTLE_FAMILY: &str = "([^"]+)";', nft, "nft family")
-    # Check each bounded production construction site. A renamed table
-    # placeholder must fail just as a changed family or omitted verb does.
-    sites = {
-        "build_deny_all_safety_net_script": ("add", "delete", "add"),
-        "atomic_reset_deny_all_net_to_fresh_owned_impl": ("add", "delete", "create"),
-        "force_delete_castle_table_by_name_impl": ("add", "delete"),
-        "build_create_castle_table_script": ("create",),
-    }
-    for name, verbs in sites.items():
-        expected_commands = [(verb, "{CASTLE_FAMILY}", "{castle_table}") for verb in verbs]
-        if table_construction_verbs(nft, name) != expected_commands:
-            fail(f"daemon table construction drifted in {name}")
     if family != "inet" or constants.get("NFT_FAMILY") != family:
         fail("nft family changed outside first-slice contract")
     supported_unit_roots = (
