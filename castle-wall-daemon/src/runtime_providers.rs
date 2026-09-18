@@ -668,9 +668,10 @@ fn admitted_identity(decision_engine: &DecisionEngine) -> Option<(u32, Option<u3
 ///
 /// PIN: this is a NO-OP in Part A and PR-3 fills it
 /// (`Review/Sanctuary/Linux_SafetyNet_PR3_Escalation_Packet_2026-09-17.md`, design
-/// memo D5). Until then a failed net install leaves the confined identity
-/// unconstrained by this daemon, which is the bound the register rows record. It is
-/// called here,
+/// memo D5). Until then the failed-install rows record their outcome in the audit
+/// state and the private register row
+/// `defect.linux-safety-net-legacy-history-with-failed-install-is-fail-open` owns
+/// the residual. It is called here,
 /// at the exact sites memo D1b step 7 names, so PR-3 changes one function body
 /// instead of finding five call sites: after a FAILED install on the four install
 /// rows, and before the exit on both nft-indeterminate rows. It is NEVER called on
@@ -1019,9 +1020,9 @@ impl ComponentProvider for NftablesTableProvider {
                                 format!(
                                     "journal marks an owned table but the live table drifted, and \
                                      the safety net FAILED to install ({net_err}); the castle \
-                                     table is LEFT STANDING, because deleting it would leave the \
-                                     host's default egress accepting the confined agent; \
-                                     refusing readiness: {err}. {scope_sentence}"
+                                     table is left standing (deletion is never a recovery \
+                                     action; the disarm verb owns it); refusing readiness: \
+                                     {err}. {scope_sentence}"
                                 )
                             }
                         };
