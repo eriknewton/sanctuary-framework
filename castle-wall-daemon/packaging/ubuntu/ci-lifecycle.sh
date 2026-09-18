@@ -497,18 +497,6 @@ PY
   unpack-fault)
     dpkg --install "$v1" > "$evidence/install-v1.stdout" 2> "$evidence/install-v1.stderr"
     assert_installed_v1
-    # Diagnostic old-script wrapper records the real dpkg callback and then
-    # delegates to the unchanged guarded Python preinst. It is confined to
-    # this terminal fresh-VM fault case, not shipped in either accepted deb.
-    old_preinst="/var/lib/dpkg/info/$package.preinst"
-    cp -- "$old_preinst" "$evidence/original-old-preinst"
-    python3 - "$old_preinst" "$evidence/original-old-preinst" "$evidence/old-preinst-calls.txt" <<'PY'
-from pathlib import Path
-import shlex,sys
-target, original, log = map(Path, sys.argv[1:])
-target.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> ' + shlex.quote(str(log)) + '\nexec /usr/bin/python3 ' + shlex.quote(str(original)) + ' "$@"\n')
-target.chmod(0o755)
-PY
     fixture="$evidence/unpack-fault-diagnostic"
     dpkg-deb --raw-extract "$v2" "$fixture"
     doc="$fixture/usr/share/doc/sanctuary-castle-wall-internal"
@@ -551,12 +539,70 @@ evidence.write_text(json.dumps({
 }, sort_keys=True) + "\n")
 PY
     dpkg-deb --root-owner-group --build "$fixture" "$evidence/unpack-fault-diagnostic.deb" >/dev/null
-    attempt_refusal post-unpack-fault "$evidence/unpack-fault-diagnostic.deb" callback:abort-upgrade
-    grep -Eq '^abort-upgrade( |$)' "$evidence/old-preinst-calls.txt" \
-      || die "old preinst abort-upgrade callback not observed after unpack fault"
+    if dpkg --install "$evidence/unpack-fault-diagnostic.deb" \
+      > "$evidence/post-unpack-fault.stdout" 2> "$evidence/post-unpack-fault.stderr"; then
+      die "post-unpack-fault unexpectedly succeeded"
+    fi
+    snapshot post-unpack-fault
+    assert_installed_v1
+    assert_inert
     grep -F "trying to overwrite '$collision', which is also in package $collision_package" \
       "$evidence/post-unpack-fault.stderr" >/dev/null \
       || die "unpack fault did not report exact ownership conflict"
+    ;;
+  postrm-unwind)
+    callback_log="$evidence/postrm-callbacks.txt"
+    v1_fixture="$evidence/postrm-unwind-v1"
+    dpkg-deb --raw-extract "$v1" "$v1_fixture"
+    python3 - "$v1_fixture/DEBIAN/postrm" "$callback_log" <<'PY'
+from pathlib import Path
+import shlex,sys
+target, log = map(Path, sys.argv[1:])
+log = shlex.quote(str(log))
+target.write_text('#!/bin/sh\nset -eu\nprintf "old-postrm %s\\n" "$*" >> ' + log + '\nif [ "$1" = upgrade ]; then exit 41; fi\nexit 0\n')
+target.chmod(0o755)
+PY
+    dpkg-deb --root-owner-group --build "$v1_fixture" "$evidence/postrm-unwind-v1.deb" >/dev/null
+    dpkg --install "$evidence/postrm-unwind-v1.deb" > "$evidence/install-v1.stdout" 2> "$evidence/install-v1.stderr"
+    assert_installed_v1
+    [[ "$(dpkg-query -W -f='${Status}' "$package")" == 'install ok installed' ]] \
+      || die "postrm diagnostic v1 is not installed"
+    postrm_v1_version="$v1_version"
+    old_preinst="/var/lib/dpkg/info/$package.preinst"
+    cp -- "$old_preinst" "$evidence/original-old-preinst"
+    python3 - "$old_preinst" "$callback_log" <<'PY'
+from pathlib import Path
+import shlex,sys
+target, log = map(Path, sys.argv[1:])
+source = target.read_text(); header = '#!/usr/bin/python3\n'
+if not source.startswith(header): raise SystemExit('unexpected old preinst header')
+target.write_text(header + 'import sys\nwith open(' + repr(str(log)) + ', "a", encoding="utf-8") as trace_file:\n    trace_file.write("old-preinst " + " ".join(sys.argv[1:]) + "\\n")\n' + source[len(header):])
+target.chmod(0o755)
+PY
+    v2_fixture="$evidence/postrm-unwind-v2"
+    dpkg-deb --raw-extract "$v2" "$v2_fixture"
+    python3 - "$v2_fixture/DEBIAN/postrm" "$callback_log" <<'PY'
+from pathlib import Path
+import shlex,sys
+target, log = map(Path, sys.argv[1:])
+log = shlex.quote(str(log))
+target.write_text('#!/bin/sh\nset -eu\nprintf "new-postrm %s\\n" "$*" >> ' + log + '\nif [ "$1" = failed-upgrade ]; then exit 42; fi\nexit 0\n')
+target.chmod(0o755)
+PY
+    dpkg-deb --root-owner-group --build "$v2_fixture" "$evidence/postrm-unwind-v2.deb" >/dev/null
+    if dpkg --install "$evidence/postrm-unwind-v2.deb" \
+      > "$evidence/postrm-unwind.stdout" 2> "$evidence/postrm-unwind.stderr"; then
+      die "postrm-unwind unexpectedly succeeded"
+    fi
+    snapshot postrm-unwind
+    printf 'postrm-unwind-status-after-failure\n' > "$evidence/postrm-unwind-status.txt"
+    status >> "$evidence/postrm-unwind-status.txt"
+    diff -u <(printf 'old-postrm upgrade %s\nnew-postrm failed-upgrade %s %s\nold-preinst abort-upgrade %s\nnew-postrm abort-upgrade %s %s\n' "$v2_version" "$postrm_v1_version" "$v2_version" "$v2_version" "$postrm_v1_version" "$v2_version") \
+      "$callback_log" || die "unexpected postrm unwind callback order"
+    grep -Fx "old-preinst abort-upgrade $v2_version" "$callback_log" >/dev/null \
+      || die "old preinst abort-upgrade callback not observed after postrm unwind"
+    assert_installed_v1
+    assert_inert
     ;;
   legacy)
     fixture="$evidence/legacy-unbound-diagnostic"

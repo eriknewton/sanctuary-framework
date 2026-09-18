@@ -196,7 +196,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [happy, old-veto, new-veto, unpack-fault, legacy, dangling, local-dangling, writable-wants, env-collision, fresh-retry, fresh-purge, probe-unusable, nft-collision, state-unreadable, remove-veto]
+        scenario: [happy, old-veto, new-veto, unpack-fault, postrm-unwind, legacy, dangling, local-dangling, writable-wants, env-collision, fresh-retry, fresh-purge, probe-unusable, nft-collision, state-unreadable, remove-veto]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
