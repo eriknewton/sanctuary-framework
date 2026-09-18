@@ -513,7 +513,38 @@ PY
     dpkg-deb --raw-extract "$v2" "$fixture"
     doc="$fixture/usr/share/doc/sanctuary-castle-wall-internal"
     printf 'fault injection only\n' > "$doc/unpack-fault"
-    mkdir -m 0755 /usr/share/doc/sanctuary-castle-wall-internal/unpack-fault
+    collision="/usr/share/doc/sanctuary-castle-wall-internal/unpack-fault"
+    mkdir -m 0755 "$collision"
+    install -m 0644 /dev/null "$collision/retain-on-unpack-failure"
+    printf 'diagnostic unpack collision marker\n' > "$collision/retain-on-unpack-failure"
+    python3 - "$collision" "$doc/unpack-fault" "$evidence/unpack-fault-marker-before.json" <<'PY'
+import json, os, stat, sys
+from pathlib import Path
+collision, incoming, evidence = map(Path, sys.argv[1:])
+marker = collision / "retain-on-unpack-failure"
+expected = b"diagnostic unpack collision marker\n"
+directory_info = os.lstat(collision)
+marker_info = os.lstat(marker)
+incoming_info = os.lstat(incoming)
+if (not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != 0 or
+        directory_info.st_gid != 0 or stat.S_IMODE(directory_info.st_mode) != 0o755 or
+        not stat.S_ISREG(marker_info.st_mode) or marker_info.st_uid != 0 or
+        marker_info.st_gid != 0 or stat.S_IMODE(marker_info.st_mode) != 0o644 or
+        marker.read_bytes() != expected or not stat.S_ISREG(incoming_info.st_mode) or
+        incoming.read_bytes() != b"fault injection only\n" or
+        [entry.name for entry in collision.iterdir()] != [marker.name]):
+    raise SystemExit("unpack-fault collision fixture is not an exact nonempty root-owned directory")
+evidence.write_text(json.dumps({
+    "collision": str(collision), "type": "directory",
+    "uid": directory_info.st_uid, "gid": directory_info.st_gid,
+    "mode": format(stat.S_IMODE(directory_info.st_mode), "04o"),
+    "marker": marker.name, "marker_type": "regular",
+    "marker_uid": marker_info.st_uid, "marker_gid": marker_info.st_gid,
+    "marker_mode": format(stat.S_IMODE(marker_info.st_mode), "04o"),
+    "marker_content": marker.read_bytes().decode(),
+    "incoming_type": "regular", "incoming_content": incoming.read_bytes().decode(),
+}, sort_keys=True) + "\n")
+PY
     dpkg-deb --root-owner-group --build "$fixture" "$evidence/unpack-fault-diagnostic.deb" >/dev/null
     attempt_refusal post-unpack-fault "$evidence/unpack-fault-diagnostic.deb" callback:abort-upgrade
     grep -Eq '^abort-upgrade( |$)' "$evidence/old-preinst-calls.txt" \
