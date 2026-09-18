@@ -277,19 +277,51 @@ jobs:
           before="$(snapshot_parents)"
           printf '%s\n' "$before" > "$parent_evidence/before.json"
           printf 'package_parent_before=%s\n' "$before"
-          share_mode="$(python3 - "$before" <<'PY'
+          parent_modes="$(python3 - "$before" <<'PY'
           import json, sys
-          item = json.loads(sys.argv[1])['/usr/share']
-          if item is None or item['type'] != 'directory' or (item['uid'], item['gid']) != (0, 0):
-              raise SystemExit('unsafe /usr/share type or owner on isolated runner')
-          print(item['mode'])
+          observed = json.loads(sys.argv[1])
+          selected = ('/usr/share', '/usr/share/doc')
+          expected = {'type': 'directory', 'uid': 0, 'gid': 0, 'mode': '0755'}
+          for path, item in observed.items():
+              if path not in selected and item is not None and item != expected:
+                  raise SystemExit(f'unsafe other package parent before mutation: {path}: {item}')
+          modes = []
+          for path in selected:
+              item = observed[path]
+              if item is None or item['type'] != 'directory' or (item['uid'], item['gid']) != (0, 0):
+                  raise SystemExit(f'unsafe {path} type or owner on isolated runner')
+              if item['mode'] not in ('0755', '0777'):
+                  raise SystemExit(f'unrecognised {path} mode: {item["mode"]}')
+              modes.append(item['mode'])
+          print(' '.join(modes))
           PY
           )"
-          case "$share_mode" in
-            0755) : ;;
-            0777) sudo chmod 0755 -- /usr/share ;;
-            *) echo "unrecognised /usr/share mode: $share_mode" >&2; exit 1 ;;
+          case "$parent_modes" in
+            '0755 0755'|'0755 0777'|'0777 0755'|'0777 0777') : ;;
+            *) echo "unrecognised fixed parent modes: $parent_modes" >&2; exit 1 ;;
           esac
+          read -r share_mode before_doc_mode <<< "$parent_modes"
+          if [[ "$share_mode" == 0777 ]]; then sudo chmod 0755 -- /usr/share; fi
+          doc_mode="$(python3 - <<'PY'
+          import os, stat
+          def checked_mode(path):
+              try:
+                  item = os.lstat(path)
+              except OSError as exc:
+                  raise SystemExit(f'cannot recheck {path} after parent closure: {exc}')
+              if not stat.S_ISDIR(item.st_mode) or (item.st_uid, item.st_gid) != (0, 0):
+                  raise SystemExit(f'unsafe {path} type or owner after parent closure')
+              return format(stat.S_IMODE(item.st_mode), '04o')
+          if checked_mode('/usr/share') != '0755':
+              raise SystemExit('/usr/share did not reach exact mode 0755 before child mutation')
+          mode = checked_mode('/usr/share/doc')
+          if mode not in ('0755', '0777'):
+              raise SystemExit(f'unrecognised /usr/share/doc mode after parent closure: {mode}')
+          print(mode)
+          PY
+          )"
+          [[ "$doc_mode" == "$before_doc_mode" ]] || { echo "doc mode changed between snapshots" >&2; exit 1; }
+          if [[ "$doc_mode" == 0777 ]]; then sudo chmod 0755 -- /usr/share/doc; fi
           after="$(snapshot_parents)"
           printf '%s\n' "$after" > "$parent_evidence/after.json"
           printf 'package_parent_after=%s\n' "$after"
@@ -297,8 +329,9 @@ jobs:
           import json, sys
           observed = json.loads(sys.argv[1])
           expected = {'type': 'directory', 'uid': 0, 'gid': 0, 'mode': '0755'}
-          if observed['/usr/share'] != expected:
-              raise SystemExit('/usr/share did not reach exact root-owned mode 0755')
+          for path in ('/usr/share', '/usr/share/doc'):
+              if observed[path] != expected:
+                  raise SystemExit(f'{path} did not reach exact root-owned mode 0755')
           for path, item in observed.items():
               if item is not None and item != expected:
                   raise SystemExit(f'unsafe package parent remains; no other path is repaired: {path}: {item}')
