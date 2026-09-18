@@ -283,6 +283,18 @@ This is the most onboarding-hostile collision.
 - **castle-wall** = the IN-SERVER (TypeScript) enforcement surface: allowlist schema, IPC wire
   contract, audit-event ingestion with producer-signature verify, in-process egress CONNECT proxy.
   It only types, frames, and audits the native enforcers - it is not the OS filter.
+  - Linux daemon upgrades go through `runtime/linux-upgrade-routes.ts`, which owns the two ROUTES and
+    their fixed order. ROUTE A (disarm): run the daemon's `--preflight-manifest` verb with the NEW
+    binary, `systemctl stop`, `--disarm` with the OLD binary, replace the binary, start. ROUTE B
+    (reboot): preflight with the NEW binary, stop, replace, reboot. The reboot IS route B's start
+    boundary, so route B has no start step: a same-boot start over the preserved ownership record
+    resolves to the host-wide net instead of the confined identity. Any step's failure aborts the
+    route, and the preflight is first, so a host that will not admit the installed manifest still has
+    its old binary in place. The publisher (`allowlist/agent-origin.ts`) refuses the unattestable uid
+    values it can know without a host; the daemon additionally reads THIS host's configured
+    `kernel.overflowuid`, and that host-specific check is the ONE asymmetry between the two sides,
+    which is why the daemon's verb, and never the TypeScript side, is the oracle the doctor path
+    reports from.
 - **fortress** = the agent's posture MODE-TIER state machine (private/federated/interop, which mesh
   bits are live). Capability posture, NOT network enforcement. Distinct from the operator word
   "fortress" meaning the on-disk `SANCTUARY_FORTRESS_PATH` directory.

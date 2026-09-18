@@ -12,17 +12,24 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use castle_wall_daemon::config::LinuxRuntimePaths;
+use castle_wall_daemon::enforcement::{
+    AcquiredComponent, ComponentHealth, ComponentKind, ComponentProvider, EnforcementError,
+    EnforcementRuntime, EnforcementStartError, EnforcementStatus, NotReadyReason, StartupReadiness,
+};
 use castle_wall_daemon::nfqueue::NfqueueConfig;
-use castle_wall_daemon::nftables::{self, CASTLE_FAMILY, OWNER_MARKER_PREFIX};
+use castle_wall_daemon::nftables::{self, SafetyNetAuditState, CASTLE_FAMILY, OWNER_MARKER_PREFIX};
 use castle_wall_daemon::ownership_journal::{
     self as journal, JournalIdentity, OwnershipJournal, JOURNAL_SCHEMA_VERSION,
 };
+use castle_wall_daemon::runtime_lock::HostRuntimeLock;
 use castle_wall_daemon::runtime_providers::{
     acquire_castle_table_component_for_test, disarm_castle_runtime, DisarmOutcome,
-    LinuxRuntimeConfig,
+    LinuxRuntimeConfig, NFT_HEALTH_MIN_INTERVAL,
 };
 use castle_wall_daemon::safety_net_uid::{
     validate_safety_net_uid, ConfinedUidSet, HostOverflowUid,
@@ -684,4 +691,529 @@ fn live_owned_identity() -> Result<nftables::CastleTableOwnership, String> {
         &castle_wall_daemon::nftables::ExpectedAgentBinding::NoneConfined,
     )
     .map_err(|err| format!("not an owned table: {err}"))
+}
+
+// ---------------------------------------------------------------------------
+// The two STARTUP readiness rows of memo D1b step 7, and the EXCLUDED non-nftables
+// loss, driven through the real `EnforcementRuntime::start` against real nft.
+//
+// Why a composed plan instead of the production one: `start`'s plan gate requires the
+// advertised kinds to equal `ComponentKind::REQUIRED_IN_ORDER` exactly, and the property
+// under test is what the two startup readiness checks do to the KERNEL when the nftables
+// component's reading is not `Ready`. The FIRST provider is the real acquisition path
+// through the `test-isolation` seam, so the component whose reading is read, whose
+// responder runs, whose deny set is resolved and whose host lock is released is the
+// production one. The later two providers stand in for NFQUEUE and the manifest watcher:
+// they own no kernel object, and one of them is where the loss lands, which is exactly
+// the window the whole-set re-check exists for (a later acquisition invalidating an
+// earlier component).
+// ---------------------------------------------------------------------------
+
+/// Slack added to `NFT_HEALTH_MIN_INTERVAL` before a reading is expected to reflect a
+/// kernel change. Absorbs sleep granularity only; it is not a retry budget and must
+/// never be raised to make a fixture pass.
+const READING_FRESHNESS_MARGIN: Duration = Duration::from_millis(100);
+
+/// What the live table looked like at one moment, read straight from `nft`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveTableObservation {
+    net_recognised: bool,
+    base_policy: Option<String>,
+}
+
+fn observe_live_table() -> LiveTableObservation {
+    LiveTableObservation {
+        net_recognised: nftables::live_table_is_deny_all_safety_net().unwrap_or(false),
+        base_policy: live_base_policy(),
+    }
+}
+
+/// The real nftables table component, acquired through the production acquisition path.
+///
+/// `indeterminate_at_the_whole_set_check` wraps the acquired component in the scripted
+/// decorator below; `None` leaves the production component exactly as it is.
+struct RealNftTableProvider {
+    cfg: LinuxRuntimeConfig,
+    indeterminate_at_the_whole_set_check: Option<Arc<AtomicUsize>>,
+}
+
+impl ComponentProvider for RealNftTableProvider {
+    fn kind(&self) -> ComponentKind {
+        ComponentKind::NftablesTable
+    }
+
+    fn acquire(self: Box<Self>) -> Result<Box<dyn AcquiredComponent>, EnforcementError> {
+        let component = acquire_castle_table_component_for_test(&self.cfg)?;
+        match self.indeterminate_at_the_whole_set_check {
+            None => Ok(component),
+            Some(responder_calls) => Ok(Box::new(IndeterminateAtTheWholeSetCheck {
+                inner: component,
+                health_polls: AtomicUsize::new(0),
+                responder_calls,
+            })),
+        }
+    }
+}
+
+/// A stand-in for a component that owns no kernel egress object, with a readiness the
+/// test scripts.
+///
+/// INVARIANT this stub must keep, and the reason it proves anything: it does NOT
+/// override `on_startup_lost`, `on_startup_indeterminate` or
+/// `attempt_post_ready_recovery`. The trait defaults are no-ops, which IS the contract
+/// for every component but the nftables table, whose loss is the only one that can mean
+/// adopted agents are live with no gate in the kernel. A stub that overrode them would
+/// be asserting its own behaviour rather than the routing under test.
+struct NonNftStubComponent {
+    kind: ComponentKind,
+    health: Arc<Mutex<ComponentHealth>>,
+    /// Filled on this stub's `release`. Teardown runs in REVERSE acquisition order, so
+    /// the last-acquired stub is released FIRST: an observation recorded here is taken
+    /// before the nftables component's own release, which is how the leg proves the net
+    /// reached the kernel ahead of the unwind rather than during it.
+    observation: Option<Arc<Mutex<Vec<LiveTableObservation>>>>,
+    released: bool,
+}
+
+impl AcquiredComponent for NonNftStubComponent {
+    fn kind(&self) -> ComponentKind {
+        self.kind
+    }
+
+    fn is_ready(&self) -> bool {
+        matches!(self.health(), ComponentHealth::Ready)
+    }
+
+    fn health(&self) -> ComponentHealth {
+        // A poisoned lock is recovered rather than unwrapped: `health` is reachable from
+        // a teardown path that must not panic.
+        *self
+            .health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn release(&mut self) {
+        if self.released {
+            return; // idempotent, per the trait contract
+        }
+        if let Some(sink) = &self.observation {
+            let mut sink = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            sink.push(observe_live_table());
+        }
+        self.released = true;
+    }
+}
+
+struct NonNftStubProvider {
+    kind: ComponentKind,
+    health: Arc<Mutex<ComponentHealth>>,
+    observation: Option<Arc<Mutex<Vec<LiveTableObservation>>>>,
+    /// Runs INSIDE `acquire`, which is the only place a test can act during the window
+    /// between the nftables per-component check and the whole-set check.
+    during_acquire: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl ComponentProvider for NonNftStubProvider {
+    fn kind(&self) -> ComponentKind {
+        self.kind
+    }
+
+    fn acquire(self: Box<Self>) -> Result<Box<dyn AcquiredComponent>, EnforcementError> {
+        let this = *self;
+        if let Some(act) = this.during_acquire {
+            act();
+        }
+        Ok(Box::new(NonNftStubComponent {
+            kind: this.kind,
+            health: this.health,
+            observation: this.observation,
+            released: false,
+        }))
+    }
+}
+
+/// The REAL nftables component with one scripted reading: the second health poll of a
+/// start answers indeterminate.
+///
+/// Why scripted here and real in the loss leg: a COMPLETED negative proof is producible
+/// from a test by deleting the table, so that row is driven end to end against the
+/// kernel. An indeterminate reading is by definition the ABSENCE of an answer from the
+/// bounded `nft` ownership proof, and a healthy kernel cannot be asked to withhold one on
+/// demand. Everything else on this path is the production component: the responder that
+/// runs, the kill set it resolves, the host lock it releases, and the table every
+/// assertion reads back from the kernel.
+///
+/// The poll count is the script: poll one is the per-component check after acquisition
+/// and delegates to the real proof, poll two is the whole-set check before `READY=1`.
+/// `is_ready` delegates instead of routing through `health`, so a readiness query cannot
+/// consume a scripted reading.
+struct IndeterminateAtTheWholeSetCheck {
+    inner: Box<dyn AcquiredComponent>,
+    health_polls: AtomicUsize,
+    responder_calls: Arc<AtomicUsize>,
+}
+
+impl AcquiredComponent for IndeterminateAtTheWholeSetCheck {
+    fn kind(&self) -> ComponentKind {
+        self.inner.kind()
+    }
+
+    fn is_ready(&self) -> bool {
+        self.inner.is_ready()
+    }
+
+    fn health(&self) -> ComponentHealth {
+        if self.health_polls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return self.inner.health();
+        }
+        ComponentHealth::ProbeUnavailable
+    }
+
+    fn on_startup_lost(&self) {
+        // Delegated rather than swallowed: if the routing ever sent an indeterminate
+        // reading here, the production responder would run and the leg's kernel
+        // assertions below would fail loudly instead of passing on a stub.
+        self.inner.on_startup_lost();
+    }
+
+    fn on_startup_indeterminate(&self) {
+        self.responder_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.on_startup_indeterminate();
+    }
+
+    fn attempt_post_ready_recovery(&self, shutting_down: bool) -> bool {
+        self.inner.attempt_post_ready_recovery(shutting_down)
+    }
+
+    fn safety_net_audit_state(&self) -> Option<SafetyNetAuditState> {
+        self.inner.safety_net_audit_state()
+    }
+
+    fn release(&mut self) {
+        self.inner.release();
+    }
+}
+
+/// Leave an owned table and an `Owned` ownership record behind, the exact durable state
+/// a previous daemon lifetime leaves: ordinary release drops the host lock ONLY, so both
+/// survive for the next start to adopt.
+fn leave_an_adopted_table(cfg: &LinuxRuntimeConfig) -> nftables::CastleTableOwnership {
+    let first = acquire_castle_table_component_for_test(cfg).expect("fresh acquire an owned table");
+    assert!(first.is_ready(), "the freshly owned table must read ready");
+    drop(first);
+    let adopted = live_owned_identity().expect("the released table is still owned");
+    assert_eq!(
+        live_base_policy().as_deref(),
+        Some("accept"),
+        "the preserved table is the wall, not the net"
+    );
+    adopted
+}
+
+// STARTUP LOST (memo D1b step 7): a COMPLETED negative ownership proof at the whole-set
+// readiness check installs the net from the in-memory deny set BEFORE the unwind, returns
+// the typed evidence, and leaves the host lock free for the disarm verb.
+#[test]
+fn a_startup_ownership_loss_installs_the_net_before_the_unwind_and_frees_the_host_lock() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let policy_dir = tempfile::tempdir().unwrap();
+    let paths = isolation::runtime_paths();
+    let cfg = config(&paths, policy_dir.path());
+
+    // The posture the row is about: an adopted table with the agents of a previous
+    // lifetime potentially still live, which is why a proven loss here cannot simply
+    // unwind and wait for a restart.
+    let adopted = leave_an_adopted_table(&cfg);
+    assert!(adopted.marker.starts_with(OWNER_MARKER_PREFIX));
+
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let providers: Vec<Box<dyn ComponentProvider>> = vec![
+        Box::new(RealNftTableProvider {
+            cfg: cfg.clone(),
+            indeterminate_at_the_whole_set_check: None,
+        }),
+        Box::new(NonNftStubProvider {
+            kind: ComponentKind::Nfqueue,
+            health: Arc::new(Mutex::new(ComponentHealth::Ready)),
+            observation: None,
+            during_acquire: Some(Box::new(|| {
+                // The loss: the adopted table goes away while a LATER component is being
+                // acquired. The per-component check already passed, so this is the window
+                // the whole-set re-check exists for.
+                let deleted = Command::new("nft")
+                    .args(["delete", "table", CASTLE_FAMILY, isolation::table()])
+                    .output()
+                    .expect("delete the adopted table");
+                assert!(deleted.status.success(), "the external delete must succeed");
+                // The ownership proof is rate-limited: a reading younger than
+                // NFT_HEALTH_MIN_INTERVAL is served from the last completed check.
+                // Waiting one whole interval past the delete bounds the age of any cached
+                // reading below the time since the delete, so the whole-set check either
+                // forks a fresh proof or serves one taken after it. Failure mode if this
+                // is skipped: the check reads the PRE-DELETE table, `start` hands back a
+                // ready runtime, and the row under test is never reached at all.
+                std::thread::sleep(NFT_HEALTH_MIN_INTERVAL + READING_FRESHNESS_MARGIN);
+            })),
+        }),
+        Box::new(NonNftStubProvider {
+            kind: ComponentKind::ManifestWatcher,
+            health: Arc::new(Mutex::new(ComponentHealth::Ready)),
+            observation: Some(Arc::clone(&observations)),
+            during_acquire: None,
+        }),
+    ];
+
+    let err = EnforcementRuntime::start(providers)
+        .expect_err("a proven startup ownership loss must refuse the start");
+    match err {
+        EnforcementStartError::Component {
+            failed, evidence, ..
+        } => {
+            assert_eq!(
+                failed,
+                ComponentKind::NftablesTable,
+                "the earliest casualty is the nftables table"
+            );
+            // The TYPED evidence is what lets a caller tell a completed negative proof
+            // from a no-answer without re-deriving it from message text.
+            assert_eq!(
+                evidence,
+                Some(StartupReadiness::Lost {
+                    kind: ComponentKind::NftablesTable
+                }),
+                "the acquisition error must carry the typed loss reading"
+            );
+        }
+        other => panic!("expected a component start failure, got {other:?}"),
+    }
+
+    // BEFORE `release`: the first component released during the reverse unwind already
+    // saw the net in the kernel, dropping by policy.
+    let observed = observations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(
+        observed.len(),
+        1,
+        "exactly one release observation is recorded: {observed:?}"
+    );
+    assert!(
+        observed[0].net_recognised,
+        "the net must be in the kernel before the reverse-order unwind begins: {:?}",
+        observed[0]
+    );
+    assert_eq!(
+        observed[0].base_policy.as_deref(),
+        Some("drop"),
+        "a non-allowlisted packet is dropped, never accepted, from the moment the net is \
+         installed: {:?}",
+        observed[0]
+    );
+    drop(observed);
+
+    // And it is still in force after the unwind: release drops the host lock only.
+    assert!(
+        nftables::live_table_is_deny_all_safety_net().expect("probe the live table"),
+        "the net survives the teardown that returns the acquisition error"
+    );
+    assert_eq!(live_base_policy().as_deref(), Some("drop"));
+    // This fixture is store-less, so no manifest names a confined identity and the
+    // journal's history is known-empty: the empty deny set resolves to the host-wide
+    // shape, which the refusal text and the audit row both name as their own reason.
+    assert!(
+        live_rule_comments_in_order().is_empty(),
+        "with no confined identity recoverable the net is the zero-rule shape"
+    );
+
+    // The host lock is free, which is the disarm verb's precondition. `flock` is held per
+    // open file description, so this acquisition genuinely fails if the refused start had
+    // kept the lock.
+    let mut lock = HostRuntimeLock::acquire(&cfg.lock_path)
+        .expect("the host lock must be re-acquirable after a refused start");
+    lock.release();
+}
+
+// STARTUP INDETERMINATE (memo D1b step 7), the sibling of the row above: an indeterminate
+// reading at the same check installs NOTHING and leaves the adopted table exactly as it
+// was. Absence of evidence is not evidence, and installing on it would replace a table
+// that may be perfectly healthy.
+#[test]
+fn a_startup_indeterminate_reading_installs_nothing_and_leaves_the_adopted_table_as_it_was() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let policy_dir = tempfile::tempdir().unwrap();
+    let paths = isolation::runtime_paths();
+    let cfg = config(&paths, policy_dir.path());
+
+    let adopted = leave_an_adopted_table(&cfg);
+    let responder_calls = Arc::new(AtomicUsize::new(0));
+    let providers: Vec<Box<dyn ComponentProvider>> = vec![
+        Box::new(RealNftTableProvider {
+            cfg: cfg.clone(),
+            indeterminate_at_the_whole_set_check: Some(Arc::clone(&responder_calls)),
+        }),
+        Box::new(NonNftStubProvider {
+            kind: ComponentKind::Nfqueue,
+            health: Arc::new(Mutex::new(ComponentHealth::Ready)),
+            observation: None,
+            during_acquire: None,
+        }),
+        Box::new(NonNftStubProvider {
+            kind: ComponentKind::ManifestWatcher,
+            health: Arc::new(Mutex::new(ComponentHealth::Ready)),
+            observation: None,
+            during_acquire: None,
+        }),
+    ];
+
+    let err = EnforcementRuntime::start(providers)
+        .expect_err("an indeterminate startup reading withholds readiness");
+    match err {
+        EnforcementStartError::Component {
+            failed, evidence, ..
+        } => {
+            assert_eq!(failed, ComponentKind::NftablesTable);
+            assert_eq!(
+                evidence,
+                Some(StartupReadiness::Indeterminate {
+                    kind: ComponentKind::NftablesTable
+                }),
+                "an indeterminate reading must never be reported as a completed loss"
+            );
+        }
+        other => panic!("expected a component start failure, got {other:?}"),
+    }
+    assert_eq!(
+        responder_calls.load(Ordering::SeqCst),
+        1,
+        "the indeterminate responder runs exactly once, before the unwind"
+    );
+
+    // The table is exactly what it was: the same owned object, handles and marker
+    // included, still the wall and never the net.
+    assert_eq!(
+        live_owned_identity().expect("the adopted table is still owned"),
+        adopted,
+        "an indeterminate reading installs nothing and replaces nothing"
+    );
+    assert_eq!(live_base_policy().as_deref(), Some("accept"));
+    assert!(
+        !nftables::live_table_is_deny_all_safety_net().expect("probe the live table"),
+        "no net may be installed on absent evidence"
+    );
+    let mut lock = HostRuntimeLock::acquire(&cfg.lock_path)
+        .expect("the host lock must be re-acquirable after a refused start");
+    lock.release();
+}
+
+// EXCLUDED from every install row (memo D1b step 7): a non-nftables component's
+// post-READY loss. The kernel egress gate is intact, so nothing is installed and nothing
+// is deleted; the daemon keeps today's exit-and-adopt path and the next start adopts the
+// preserved table.
+#[test]
+fn a_post_ready_non_nftables_loss_keeps_the_table_and_the_next_start_adopts_it() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let policy_dir = tempfile::tempdir().unwrap();
+    let paths = isolation::runtime_paths();
+    let cfg = config(&paths, policy_dir.path());
+
+    let nfqueue_health = Arc::new(Mutex::new(ComponentHealth::Ready));
+    let providers: Vec<Box<dyn ComponentProvider>> = vec![
+        Box::new(RealNftTableProvider {
+            cfg: cfg.clone(),
+            indeterminate_at_the_whole_set_check: None,
+        }),
+        Box::new(NonNftStubProvider {
+            kind: ComponentKind::Nfqueue,
+            health: Arc::clone(&nfqueue_health),
+            observation: None,
+            during_acquire: None,
+        }),
+        Box::new(NonNftStubProvider {
+            kind: ComponentKind::ManifestWatcher,
+            health: Arc::new(Mutex::new(ComponentHealth::Ready)),
+            observation: None,
+            during_acquire: None,
+        }),
+    ];
+
+    let mut runtime =
+        EnforcementRuntime::start(providers).expect("a fully ready plan reaches readiness");
+    assert!(runtime.is_kernel_runtime_ready());
+    let owned = live_owned_identity().expect("the started runtime owns a table");
+    assert_eq!(live_base_policy().as_deref(), Some("accept"));
+
+    // POST-READY: the non-nftables component proves ITS resource lost.
+    *nfqueue_health
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = ComponentHealth::Lost;
+
+    // The supervisor's order, and both halves matter: every component reporting a
+    // completed negative proof is offered one recovery attempt BEFORE any exit arm, then
+    // the status is re-read. A component with no kernel gate of its own declines, so no
+    // net is installed for it.
+    assert!(
+        !runtime.attempt_post_ready_recovery(false),
+        "a non-nftables loss must not put any gate in the kernel"
+    );
+    assert_eq!(
+        runtime.status(),
+        EnforcementStatus::NotReady {
+            reason: NotReadyReason::ComponentLost(ComponentKind::Nfqueue)
+        },
+        "the loss withdraws readiness and names the component"
+    );
+    assert!(
+        matches!(
+            runtime.safety_net_audit_state(),
+            SafetyNetAuditState::NotAttempted
+        ),
+        "no install was attempted, and the audit state must say so rather than claim a \
+         protection"
+    );
+    assert!(
+        !nftables::live_table_is_deny_all_safety_net().expect("probe the live table"),
+        "the table is untouched by another component's loss"
+    );
+    assert_eq!(live_base_policy().as_deref(), Some("accept"));
+    assert_eq!(
+        live_owned_identity().expect("still owned"),
+        owned,
+        "no install and no delete: the same owned object stands"
+    );
+
+    // The exit path: reverse-order teardown, which drops the host lock and nothing else.
+    runtime.shutdown();
+    assert!(
+        nftables::table_exists().unwrap(),
+        "the table survives the exit"
+    );
+    assert_eq!(
+        live_owned_identity().expect("owned after the exit"),
+        owned,
+        "fail-closed preservation: process exit deletes neither the table nor the record"
+    );
+
+    // And the next start ADOPTS it: the same handles and marker, never a fresh create.
+    let readopted = acquire_castle_table_component_for_test(&cfg)
+        .expect("a fresh start must adopt the preserved table");
+    assert!(readopted.is_ready(), "the adopted table reads ready");
+    assert_eq!(
+        live_owned_identity().expect("owned after adoption"),
+        owned,
+        "adoption re-uses the preserved object rather than replacing it"
+    );
+    drop(readopted);
 }

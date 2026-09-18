@@ -373,3 +373,300 @@ fn unit_has_a_reboot_persistence_target_and_safe_mode() {
         .any(|v| v.contains("CAP_NET_ADMIN")));
     assert_eq!(directive_values(&unit, "NoNewPrivileges"), vec!["true"]);
 }
+
+// ---------------------------------------------------------------------------
+// The finite start limit, exercised against a real systemd rather than parsed.
+//
+// The structural tests above prove the unit CARRIES the four values in the right
+// sections and that the window outlasts five worst-case activations. They cannot prove
+// what the values DO: that a service which keeps failing reaches a terminal failed state
+// instead of restarting forever, and that a unit ordered behind it is released. This leg
+// builds a transient service from those exact shipped values, drives it to the limit, and
+// reads the outcome back from systemd.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod start_limit_against_real_systemd {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// Seconds subtracted from `TimeoutStartSec` for the one slow activation. It must be
+    /// strictly less than the start timeout so the activation FAILS on its own rather
+    /// than being killed by the timeout: both count toward the limit, and the first is
+    /// the one a test can drive deterministically.
+    const SLOW_ACTIVATION_HEADROOM_SECS: u64 = 5;
+
+    /// Extra seconds added to the derived wait before the terminal state is expected.
+    /// Absorbs scheduling and bus latency only; it is not a retry budget.
+    const TERMINAL_STATE_SLACK_SECS: u64 = 20;
+
+    /// How often the unit's state is re-read while waiting.
+    const POLL_SPACING: Duration = Duration::from_millis(500);
+
+    /// One directive value, parsed from the SHIPPED unit rather than restated here, so
+    /// this leg exercises what the unit actually carries.
+    /// Must match the directive of the same name in
+    /// systemd/sanctuary-castle-wall.service.
+    fn shipped(directive: &str) -> String {
+        let unit = super::unit_text();
+        let values = super::directive_values(&unit, directive);
+        assert_eq!(
+            values.len(),
+            1,
+            "the shipped unit must set exactly one {directive}"
+        );
+        values[0].to_string()
+    }
+
+    /// One unit property as systemd reports it, or an empty string when the read failed.
+    /// An empty value never satisfies an assertion below, so a failed read cannot pass.
+    fn systemctl_property(unit: &str, property: &str) -> String {
+        Command::new("systemctl")
+            .args(["show", "--value", "-p", property, unit])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Transient units this leg created, torn down on EVERY exit path.
+    ///
+    /// A `Drop` guard rather than teardown at the end of the test body: a panicking
+    /// assertion would otherwise leave a failed transient unit and its start-limit state
+    /// on the host for the whole window, and the next run of this leg would inherit it.
+    struct TransientUnits {
+        names: Vec<String>,
+    }
+
+    impl Drop for TransientUnits {
+        fn drop(&mut self) {
+            for name in &self.names {
+                let _ = Command::new("systemctl").args(["stop", name]).output();
+                // `reset-failed` is required as well as `stop`: a unit that hit the start
+                // limit stays in the failed state with its counter armed until it is
+                // reset, which is the same recovery the shipped unit's comment names for
+                // an operator.
+                let _ = Command::new("systemctl")
+                    .args(["reset-failed", name])
+                    .output();
+            }
+        }
+    }
+
+    /// True when a transient unit can be created at all. Reports the reason it cannot, so
+    /// a skip is never silent.
+    fn systemd_run_available() -> bool {
+        match Command::new("systemd-run").arg("--version").output() {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                eprintln!(
+                    "SKIP (systemd-run unusable): exit {:?}: {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                return false;
+            }
+            Err(err) => {
+                eprintln!("SKIP (systemd-run not present): {err}");
+                return false;
+            }
+        }
+        // A system bus is the second requirement: without it (a container with no
+        // systemd, or an unprivileged caller with no polkit agent) a transient unit
+        // cannot be created and the leg has nothing to drive.
+        match Command::new("systemctl")
+            .args(["show", "--value", "-p", "Version"])
+            .output()
+        {
+            Ok(out) if out.status.success() => true,
+            Ok(out) => {
+                eprintln!(
+                    "SKIP (no usable system bus): {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                false
+            }
+            Err(err) => {
+                eprintln!("SKIP (systemctl not present): {err}");
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_failures_reach_a_terminal_failed_state_and_release_the_ordered_dependent() {
+        if !systemd_run_available() {
+            return;
+        }
+        let burst: u64 = shipped("StartLimitBurst")
+            .parse()
+            .expect("burst is a count");
+        let interval = shipped("StartLimitIntervalSec");
+        let restart_secs: u64 = shipped("RestartSec")
+            .parse()
+            .expect("restart delay is seconds");
+        let start_timeout: u64 = shipped("TimeoutStartSec")
+            .parse()
+            .expect("start timeout is seconds");
+        assert!(
+            start_timeout > SLOW_ACTIVATION_HEADROOM_SECS,
+            "the slow activation must fit inside the shipped start timeout"
+        );
+        let slow_activation_secs = start_timeout - SLOW_ACTIVATION_HEADROOM_SECS;
+
+        let work = tempfile::tempdir().expect("a work directory for the transient unit");
+        let counter = work.path().join("starts");
+        let script = work.path().join("failing-activation.sh");
+        // The activation: count this start, sleep only on the FIRST one, then fail
+        // without ever notifying readiness. That is the shape the unit's own worst case
+        // has, a Type=notify activation that never reaches READY=1, and the reason the
+        // first start is the slow one is that the ordered dependent below must be shown
+        // waiting behind a slow activation rather than behind an instant failure.
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 n=$(cat \"{counter}\" 2>/dev/null || echo 0)\n\
+                 n=$((n+1))\n\
+                 printf '%s' \"$n\" > \"{counter}\"\n\
+                 if [ \"$n\" = \"1\" ]; then sleep {slow_activation_secs}; fi\n\
+                 exit 1\n",
+                counter = counter.display(),
+                slow_activation_secs = slow_activation_secs,
+            ),
+        )
+        .expect("write the activation script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o700);
+        }
+        std::fs::set_permissions(&script, perms).expect("make the activation executable");
+
+        // Unique per process AND per run: a name reused while its predecessor is still in
+        // the failed state would inherit that unit's armed start counter.
+        let tag = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or_default()
+        );
+        let service = format!("sanctuary-start-limit-{tag}.service");
+        let dependent = format!("sanctuary-start-limit-dependent-{tag}.service");
+        let _cleanup = TransientUnits {
+            names: vec![dependent.clone(), service.clone()],
+        };
+
+        let started = Command::new("systemd-run")
+            .args([
+                format!("--unit={service}"),
+                "--property=Type=notify".to_string(),
+                "--property=Restart=on-failure".to_string(),
+                format!("--property=RestartSec={restart_secs}"),
+                format!("--property=TimeoutStartSec={start_timeout}"),
+                format!("--property=StartLimitBurst={burst}"),
+                format!("--property=StartLimitIntervalSec={interval}"),
+                "--no-block".to_string(),
+                "/bin/sh".to_string(),
+                script.display().to_string(),
+            ])
+            .output()
+            .expect("run systemd-run");
+        if !started.status.success() {
+            eprintln!(
+                "SKIP (the transient service could not be created): {}",
+                String::from_utf8_lossy(&started.stderr).trim()
+            );
+            return;
+        }
+
+        // The ordered dependent, which stands in for the shipped unit's
+        // `Before=network.target` edge: a WEAK requirement plus an ordering edge, so the
+        // failing unit delays it and a failure does not fail it. If the failing unit
+        // never reached a terminal state, this would never become active, which is the
+        // boot lockout the finite limit exists to prevent.
+        let dep = Command::new("systemd-run")
+            .args([
+                format!("--unit={dependent}"),
+                "--property=Type=oneshot".to_string(),
+                "--property=RemainAfterExit=yes".to_string(),
+                format!("--property=After={service}"),
+                format!("--property=Wants={service}"),
+                "--no-block".to_string(),
+                "/bin/true".to_string(),
+            ])
+            .output()
+            .expect("run systemd-run for the dependent unit");
+        if !dep.status.success() {
+            eprintln!(
+                "SKIP (the ordered dependent could not be created): {}",
+                String::from_utf8_lossy(&dep.stderr).trim()
+            );
+            return;
+        }
+
+        // DERIVED, not chosen: one slow activation, then the remaining starts of the
+        // burst each separated by the shipped restart delay, plus scheduling slack.
+        let deadline = Duration::from_secs(
+            slow_activation_secs + burst * (restart_secs + 1) + TERMINAL_STATE_SLACK_SECS,
+        );
+        let waited_from = Instant::now();
+        let mut active_state = String::new();
+        while waited_from.elapsed() < deadline {
+            active_state = systemctl_property(&service, "ActiveState");
+            if active_state == "failed" {
+                break;
+            }
+            std::thread::sleep(POLL_SPACING);
+        }
+        let result = systemctl_property(&service, "Result");
+        assert_eq!(
+            active_state, "failed",
+            "a unit whose activation keeps failing must reach a TERMINAL failed state \
+             within {deadline:?}; ActiveState={active_state}, Result={result}"
+        );
+        // The terminal state must come from the START LIMIT, which is what bounds the
+        // restart loop. Any other result would mean the loop ended for some other reason
+        // and the limit is untested.
+        assert_eq!(
+            result, "start-limit-hit",
+            "the finite start limit must be what ends the restart loop"
+        );
+
+        // No more than the burst count of activations ran: systemd refuses the start
+        // AFTER the burst falls inside the window, so the counter is the direct evidence.
+        let starts: u64 = std::fs::read_to_string(&counter)
+            .expect("the activation counter must exist")
+            .trim()
+            .parse()
+            .expect("the counter holds a count");
+        assert!(
+            starts >= 2,
+            "the unit must actually have been RESTARTED, not merely started once: \
+             {starts} activation(s)"
+        );
+        assert!(
+            starts <= burst,
+            "no more than the shipped burst of {burst} activations may run; {starts} did"
+        );
+
+        // And the ordered dependent is released by that terminal state.
+        let mut dependent_state = String::new();
+        let dependent_deadline = Instant::now();
+        while dependent_deadline.elapsed() < Duration::from_secs(TERMINAL_STATE_SLACK_SECS) {
+            dependent_state = systemctl_property(&dependent, "ActiveState");
+            if dependent_state == "active" {
+                break;
+            }
+            std::thread::sleep(POLL_SPACING);
+        }
+        assert_eq!(
+            dependent_state, "active",
+            "the unit ordered behind the failing service must become active once that \
+             service reaches its terminal state"
+        );
+    }
+}
