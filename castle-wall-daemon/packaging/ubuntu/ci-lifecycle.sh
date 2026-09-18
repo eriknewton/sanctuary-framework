@@ -258,7 +258,9 @@ assert_installed_v1() {
       || die "old package leaf custody changed: $path"
     [[ "$(sha256sum "$path" | cut -d' ' -f1)" == "$expected" ]] \
       || die "old package leaf bytes changed: $path"
-    owner="$(dpkg-query -S -- "$path")"
+    if ! owner="$(dpkg-query -S -- "$path")"; then
+      die "old package leaf ownership query failed: $path"
+    fi
     [[ "$owner" == "$package: $path" || "$owner" == "$package:amd64: $path" ]] \
       || die "old package leaf is not solely owned by expected package: $path"
   done

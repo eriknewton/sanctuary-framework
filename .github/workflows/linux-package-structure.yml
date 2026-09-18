@@ -78,6 +78,10 @@ jobs:
           negative="$RUNNER_TEMP/package-negative"
           mkdir -p "$negative"
           cp -a castle-wall-daemon "$negative/castle-wall-daemon"
+          python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py" || {
+            echo "unmodified copied source was refused" >&2
+            exit 1
+          }
           sed -i 's/NFT_TABLE = "sanctuary-castle"/NFT_TABLE = "wrong-table"/' \
             "$negative/castle-wall-daemon/packaging/ubuntu/lifecycle-guard.py"
           if python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py"; then
@@ -87,28 +91,28 @@ jobs:
           sed -i 's/NFT_TABLE = "wrong-table"/NFT_TABLE = "sanctuary-castle"/' \
             "$negative/castle-wall-daemon/packaging/ubuntu/lifecycle-guard.py"
           nft_source="$negative/castle-wall-daemon/src/nftables.rs"
-          cp "$nft_source" "$negative/nftables-reviewed.rs"
+          cp "$nft_source" "$negative/nftables-baseline.rs"
           sed -i 's/pub const CASTLE_FAMILY: &str = "inet";/pub const CASTLE_FAMILY: \&str = "ip";/' \
             "$nft_source"
           if python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py"; then
             echo 'planted daemon nft-family drift was accepted' >&2
             exit 1
           fi
-          cp "$negative/nftables-reviewed.rs" "$nft_source"
+          cp "$negative/nftables-baseline.rs" "$nft_source"
           sed -i '0,/add table {CASTLE_FAMILY} {castle_table}/s//add table ip {castle_table}/' \
             "$nft_source"
           if python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py"; then
             echo 'planted daemon table-construction drift was accepted' >&2
             exit 1
           fi
-          cp "$negative/nftables-reviewed.rs" "$nft_source"
+          cp "$negative/nftables-baseline.rs" "$nft_source"
           sed -i '0,/add table {CASTLE_FAMILY} {castle_table}/s//add table {CASTLE_FAMILY} {renamed_table}/' \
             "$nft_source"
           if python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py"; then
             echo 'planted daemon table-placeholder drift was accepted' >&2
             exit 1
           fi
-          cp "$negative/nftables-reviewed.rs" "$nft_source"
+          cp "$negative/nftables-baseline.rs" "$nft_source"
           cat >> "$nft_source" <<'RUST'
           fn unreviewed_fifth_table_helper() -> &'static str {
               "add table ip extra"
@@ -118,12 +122,17 @@ jobs:
             echo 'planted fifth table helper was accepted' >&2
             exit 1
           fi
-          cp "$negative/nftables-reviewed.rs" "$nft_source"
+          cp "$negative/nftables-baseline.rs" "$nft_source"
           printf '\nfn unreviewed_inline_table_helper() { let _ = "add table ip extra"; }\n' >> "$nft_source"
           if python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py"; then
             echo 'planted inline table command was accepted' >&2
             exit 1
           fi
+          cp "$negative/nftables-baseline.rs" "$nft_source"
+          python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py" || {
+            echo "restored copied source was refused" >&2
+            exit 1
+          }
           cat > "$negative/misleading-Cargo.toml" <<'TOML'
           [unrelated]
           version = "99.0.0"
@@ -262,7 +271,11 @@ jobs:
           print(json.dumps(observed, sort_keys=True))
           PY
           }
+          parent_evidence="$RUNNER_TEMP/sanctuary-linux-parent-evidence"
+          [[ ! -e "$parent_evidence" && ! -L "$parent_evidence" ]] || { echo "parent evidence already exists" >&2; exit 1; }
+          mkdir -m 0755 -- "$parent_evidence"
           before="$(snapshot_parents)"
+          printf '%s\n' "$before" > "$parent_evidence/before.json"
           printf 'package_parent_before=%s\n' "$before"
           share_mode="$(python3 - "$before" <<'PY'
           import json, sys
@@ -278,6 +291,7 @@ jobs:
             *) echo "unrecognised /usr/share mode: $share_mode" >&2; exit 1 ;;
           esac
           after="$(snapshot_parents)"
+          printf '%s\n' "$after" > "$parent_evidence/after.json"
           printf 'package_parent_after=%s\n' "$after"
           python3 - "$after" <<'PY'
           import json, sys
@@ -306,6 +320,8 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sanctuary-linux-lifecycle-${{ matrix.scenario }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/sanctuary-linux-lifecycle-evidence
+          path: |
+            ${{ runner.temp }}/sanctuary-linux-lifecycle-evidence
+            ${{ runner.temp }}/sanctuary-linux-parent-evidence
           retention-days: 7
           if-no-files-found: warn

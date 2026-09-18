@@ -8,9 +8,10 @@ import sys
 from pathlib import Path
 
 
-# Exact reviewed daemon nft source for this unprovisioned package slice. This
-# is deliberately a source pin, not a Rust parser: any edit requires a new
-# source review and explicit pin refresh before a package can be asserted.
+# Exact byte identity of daemon nft source at repository baseline
+# 17d251f50514a885d0cd9666e363d19dbc963574. This source pin is not a Rust
+# parser or a claim of whole-file review. Any edit requires source review and
+# an explicit pin refresh before a package can be asserted.
 NFTABLES_SOURCE_SHA256 = "25a1266acb92a2d8c3a0f32d2552d1bd40f7a491c313a2bdfe5a6e48a08bea5a"
 
 
@@ -43,7 +44,7 @@ def main():
     nft_bytes = (crate / "src/nftables.rs").read_bytes()
     nft_sha256 = hashlib.sha256(nft_bytes).hexdigest()
     if nft_sha256 != NFTABLES_SOURCE_SHA256:
-        fail(f"unreviewed nftables.rs source: {nft_sha256} != {NFTABLES_SOURCE_SHA256}")
+        fail(f"nftables.rs source differs from pinned baseline: {nft_sha256} != {NFTABLES_SOURCE_SHA256}")
     nft = nft_bytes.decode("utf-8")
     env = one(r"^EnvironmentFile=(\S+)$", unit, "EnvironmentFile")
     start = one(r"^ExecStart=(.+)$", unit, "ExecStart")

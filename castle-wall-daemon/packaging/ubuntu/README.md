@@ -10,10 +10,11 @@ writes a `.deb`, checksum, manifest and root-custodied build identity. It puts
 the hook's early `systemd`, `nftables` and `python3` probes in `Pre-Depends`;
 finished-ELF libraries remain in ordinary `Depends`. Source inputs must be
 clean, including untracked files, before the build stamps a commit identity.
-`assert-source-constants.py` pins the reviewed **entire** `src/nftables.rs`
-source by SHA-256 and also checks the relevant literal constants. This is a
-deliberately narrow source pin, not a general Rust parser: any nft source edit,
-including a new table-construction helper or an inline command, must receive
+`assert-source-constants.py` pins the exact `src/nftables.rs` bytes from
+repository baseline `17d251f50514a885d0cd9666e363d19dbc963574` by SHA-256
+and checks the relevant literal constants. This byte-identity pin is not a
+general Rust parser or a claim of whole-file review: any nft source edit,
+including a new table-construction helper or an inline command, requires
 source review and an explicit pin update before package assertion can pass.
 
 The control archive contains only `control`, `preinst` and `prerm`. These
