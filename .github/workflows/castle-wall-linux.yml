@@ -230,6 +230,44 @@ jobs:
           # precondition disappears rather than producing a false green.
           SANCTUARY_EXPECT_PRIVILEGED_LINUX: "1"
 
+      - name: Prove real systemd start-limit case ran without a fixture skip
+        working-directory: castle-wall-daemon
+        timeout-minutes: 5
+        run: |
+          # The all-targets run captures this test's eprintln! output, so an
+          # early `SKIP` return looks like a passing test. Rerun the exact case
+          # with uncaptured output and refuse that false-positive shape.
+          set -o pipefail
+          case_name='start_limit_against_real_systemd::repeated_failures_reach_a_terminal_failed_state_and_release_the_ordered_dependent'
+          sudo -E env "PATH=$PATH" CARGO_TERM_COLOR=never cargo test --locked --features test-isolation \
+            --test systemd_unit --color never "$case_name" -- --exact --nocapture --test-threads=1 \
+            2>&1 | tee systemd-start-limit-focused.log
+          grep -Fxq "test $case_name ... ok" systemd-start-limit-focused.log || {
+            echo "FAIL: exact real-systemd case did not report ok"
+            exit 1
+          }
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+(\.[0-9]+)?s$' systemd-start-limit-focused.log || {
+            echo "FAIL: focused real-systemd result was absent, skipped, or malformed"
+            exit 1
+          }
+          if grep -Fq 'SKIP' systemd-start-limit-focused.log; then
+            echo "FAIL: real-systemd fixture returned early with SKIP"
+            exit 1
+          fi
+        env:
+          SANCTUARY_EXPECT_PRIVILEGED_LINUX: "1"
+
+      - name: Retain Linux integration and real-systemd evidence logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: castle-wall-linux-integration-logs
+          path: |
+            castle-wall-daemon/cargo-test.log
+            castle-wall-daemon/cargo-test.plain.log
+            castle-wall-daemon/systemd-start-limit-focused.log
+          if-no-files-found: warn
+
       - name: Cleanup nftables state
         if: always()
         run: |
