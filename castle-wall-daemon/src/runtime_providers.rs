@@ -2246,6 +2246,24 @@ struct SafetyNetRecoveryProbeReading {
     table_comment_absent: bool,
 }
 
+/// Both disarm recovery arms classify one inventory with the same host-specific
+/// uid boundary. An unreadable overflow uid or vanished table is a probe error,
+/// never evidence that a live table belongs to this daemon.
+#[cfg(target_os = "linux")]
+fn read_safety_net_recovery_probe(
+) -> Result<SafetyNetRecoveryProbeReading, crate::nftables::NftablesError> {
+    let overflow = crate::safety_net_uid::HostOverflowUid::from_host().map_err(|err| {
+        crate::nftables::NftablesError::InvocationFailed(format!(
+            "cannot classify the live table without this host's configured kernel.overflowuid: {err}"
+        ))
+    })?;
+    let json = crate::nftables::live_castle_table_json()?;
+    Ok(SafetyNetRecoveryProbeReading {
+        recognised_as_safety_net: crate::nftables::is_deny_all_safety_net_json(&json, overflow),
+        table_comment_absent: crate::nftables::castle_table_comment_is_absent(&json),
+    })
+}
+
 /// D3 (memo v2.21, fix round): outcome of probing whether a disarm recovery
 /// site's live table is actually this daemon's own safety net rather than the
 /// object the journal state otherwise implies. Named states (not a bare
@@ -2532,15 +2550,7 @@ pub fn disarm_castle_runtime(
                                 "test-isolation: reclaim-owned probe forced to fail".to_string(),
                             ));
                         }
-                        let json = crate::nftables::live_castle_table_json()?;
-                        Ok(SafetyNetRecoveryProbeReading {
-                            recognised_as_safety_net: crate::nftables::is_deny_all_safety_net_json(
-                                &json,
-                            ),
-                            table_comment_absent: crate::nftables::castle_table_comment_is_absent(
-                                &json,
-                            ),
-                        })
+                        read_safety_net_recovery_probe()
                     };
                     match classify_safety_net_recovery_probe(probe) {
                         SafetyNetRecoveryDecision::RecoverSafetyNet => {
@@ -2596,13 +2606,7 @@ pub fn disarm_castle_runtime(
                                 SafetyNetRecoveryProbeReading,
                                 crate::nftables::NftablesError,
                             > {
-                                let json = crate::nftables::live_castle_table_json()?;
-                                Ok(SafetyNetRecoveryProbeReading {
-                                    recognised_as_safety_net:
-                                        crate::nftables::is_deny_all_safety_net_json(&json),
-                                    table_comment_absent:
-                                        crate::nftables::castle_table_comment_is_absent(&json),
-                                })
+                                read_safety_net_recovery_probe()
                             };
                             match classify_safety_net_recovery_probe(probe) {
                                 SafetyNetRecoveryDecision::RecoverSafetyNet => {

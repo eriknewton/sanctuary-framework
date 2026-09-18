@@ -1295,9 +1295,10 @@ mod linux {
             }
             Err(e) => Err(e),
         }
+    }
 
-    /// D3 fix round: fetch the live castle table's raw JSON inventory, the same
-    /// `nft -j list table` read [`live_table_is_deny_all_safety_net_impl`] takes.
+    /// D3: fetch the live castle table's raw JSON inventory using the existing
+    /// optional-table read, treating an absent table as a failed recovery probe.
     /// A caller combining a recogniser answer with a second, independent property
     /// (the disarm `ReclaimOwned` arm's comment-key check) reads both off this
     /// ONE inventory rather than taking a further kernel snapshot. Unlike the
@@ -1306,7 +1307,11 @@ mod linux {
     /// from its own prior state, so a missing table is a genuine race to
     /// surface, not an "absence reads as not-the-net" case.
     pub fn live_castle_table_json_impl() -> Result<String, NftablesError> {
-        run_nft(&["-j", "list", "table", CASTLE_FAMILY, castle_table()])
+        list_castle_table_json_impl()?.ok_or_else(|| {
+            NftablesError::InvocationFailed(
+                "castle table disappeared before the disarm recovery probe".to_string(),
+            )
+        })
     }
 
     /// GF1.1 recovery: atomically replace the deny-all safety net with a FRESH

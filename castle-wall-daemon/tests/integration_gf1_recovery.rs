@@ -28,8 +28,9 @@ use castle_wall_daemon::ownership_journal::{
 };
 use castle_wall_daemon::runtime_lock::HostRuntimeLock;
 use castle_wall_daemon::runtime_providers::{
-    acquire_castle_table_component_for_test, disarm_castle_runtime, DisarmOutcome,
-    force_next_reclaim_owned_probe_error_for_test, LinuxRuntimeConfig, NFT_HEALTH_MIN_INTERVAL, RECOVERY_RETRY_INTERVAL,
+    acquire_castle_table_component_for_test, disarm_castle_runtime,
+    force_next_reclaim_owned_probe_error_for_test, DisarmOutcome, LinuxRuntimeConfig,
+    NFT_HEALTH_MIN_INTERVAL, RECOVERY_RETRY_INTERVAL,
 };
 use castle_wall_daemon::safety_net_uid::{
     validate_safety_net_uid, ConfinedUidSet, HostOverflowUid,
@@ -114,6 +115,16 @@ fn write_owned_journal(
     table_handle: u64,
     base_chain_handle: u64,
 ) {
+    write_owned_journal_with_history(cfg, marker, table_handle, base_chain_handle, Some(vec![]));
+}
+
+fn write_owned_journal_with_history(
+    cfg: &LinuxRuntimeConfig,
+    marker: &str,
+    table_handle: u64,
+    base_chain_handle: u64,
+    confined: Option<Vec<journal::ConfinedIdentity>>,
+) {
     let key = journal::load_or_generate_auth_key(&cfg.journal_key_path)
         .expect("load/generate the journal MAC key");
     let identity = JournalIdentity {
@@ -122,16 +133,20 @@ fn write_owned_journal(
         boot_id: journal::current_boot_id().expect("boot id"),
         source: journal::current_source(),
     };
-    journal::store_atomic(
-        &cfg.journal_path,
-        &OwnershipJournal::Owned {
+    let record = match confined {
+        Some(entries) => OwnershipJournal::owned_with_known_history(
             identity,
             table_handle,
             base_chain_handle,
-        },
-        &key,
-    )
-    .expect("durably record the Owned journal");
+            entries,
+        )
+        .expect("valid known history"),
+        None => {
+            OwnershipJournal::owned_with_unknown_history(identity, table_handle, base_chain_handle)
+        }
+    };
+    journal::store_atomic(&cfg.journal_path, &record, &key)
+        .expect("durably record the Owned journal");
 }
 
 /// Run a multi-statement nft script via `-f -` (stdin), mirroring the
@@ -335,7 +350,8 @@ fn gf1_owned_journal_plus_this_daemons_net_clears_as_safety_net() {
     // Any marker/handles: the safety-net branch is reached from the LIVE
     // table's shape, never from these journal-recorded values.
     write_owned_journal(&cfg, "any-marker-disarm-must-not-trust-yet", 1, 2);
-    nftables::install_deny_all_safety_net().expect("arm the safety net");
+    nftables::install_deny_all_safety_net(&nftables::SafetyNetScope::HostWide)
+        .expect("arm the safety net");
     assert!(nftables::live_table_is_deny_all_safety_net().unwrap());
 
     let outcome = disarm_castle_runtime(&cfg).expect("disarm must recover the safety net");
@@ -397,14 +413,13 @@ fn gf1_owned_journal_plus_drifted_accept_table_still_refuses() {
     );
 }
 
-// D3 case (f): a same-boot legacy `Owned` record (written with today's schema,
-// which has no `confined` field at all -- PR-1/D1b step 1 adds it) plus the v1
-// host-wide safety net: still cleared. This pins memo D3's second review note --
-// PR-1's future never-adopt rule for a legacy record (D1b step 6) lives in the
+// D3 case (f): a same-boot legacy `Owned` record whose `confined` key is absent
+// plus the v1 host-wide safety net: still cleared. PR-1's never-adopt rule for
+// a legacy record (D1b step 6) lives in the
 // ACQUISITION path (`journal::decide`'s callers there), not in the shared
 // `decide` function disarm also calls, so a legacy record must keep reaching
 // THIS arm and being cleared. MUST MATCH the acquisition-specific gate PR-1
-// adds around `ReclaimDecision::ReclaimOwned` in `ownership_journal.rs` /
+// keeps around `ReclaimDecision::ReclaimOwned` in `ownership_journal.rs` /
 // `runtime_providers.rs`'s acquisition path (memo D3): if a future change makes
 // `decide` itself divert a legacy record away from `ReclaimOwned` for every
 // caller, this test starts failing and is the tripwire for that regression.
@@ -419,8 +434,20 @@ fn gf1_legacy_owned_record_plus_v1_net_still_clears() {
     let paths = isolation::runtime_paths();
     let cfg = config(&paths, policy_dir.path());
 
-    write_owned_journal(&cfg, "legacy-record-no-confined-field", 1, 2);
-    nftables::install_deny_all_safety_net().expect("arm the v1 host-wide safety net");
+    write_owned_journal_with_history(&cfg, "legacy-record-no-confined-field", 1, 2, None);
+    let key = journal::load_or_generate_auth_key(&cfg.journal_key_path).expect("journal key");
+    let record = journal::load(&cfg.journal_path, Some(&key))
+        .expect("read legacy record")
+        .expect("legacy record exists");
+    assert_eq!(record.confined(), None, "the key must remain absent");
+    assert!(
+        !String::from_utf8(std::fs::read(&cfg.journal_path).unwrap())
+            .unwrap()
+            .contains("\"confined\""),
+        "legacy fixture must omit the confined key"
+    );
+    nftables::install_deny_all_safety_net(&nftables::SafetyNetScope::HostWide)
+        .expect("arm the v1 host-wide safety net");
     assert!(nftables::live_table_is_deny_all_safety_net().unwrap());
 
     let outcome = disarm_castle_runtime(&cfg).expect("a legacy record must still clear");
@@ -449,7 +476,8 @@ fn gf1_reclaim_owned_probe_error_refuses_and_retains() {
     let cfg = config(&paths, policy_dir.path());
 
     write_owned_journal(&cfg, "reclaim-owned-probe-error-fixture", 1, 2);
-    nftables::install_deny_all_safety_net().expect("arm the safety net");
+    nftables::install_deny_all_safety_net(&nftables::SafetyNetScope::HostWide)
+        .expect("arm the safety net");
     assert!(nftables::live_table_is_deny_all_safety_net().unwrap());
 
     // Bound, not discarded: the returned guard must outlive the disarm call it
@@ -473,10 +501,7 @@ fn gf1_reclaim_owned_probe_error_refuses_and_retains() {
 // comment), so a complete v2 three-rule table with one comment altered, the
 // same three rules plus a fourth, or only the first of the three, are ALL
 // "not the net", and disarm must fall through to the unchanged exact-inventory
-// refusal exactly as case (b) does. None of the three needs PR-1's merge: a
-// live table carrying any rule at all is already refused on this base, and a
-// wrong comment or an extra rule is refused independently of that, so the
-// same assertion holds once PR-1's recognizer lands too.
+// refusal exactly as case (b) does.
 #[test]
 fn gf1_near_net_drift_with_a_rule_still_refuses() {
     let _suite = isolation::guard();
@@ -537,7 +562,7 @@ fn gf1_near_net_drift_with_a_rule_still_refuses() {
         assert!(nft_script(&script), "{label}: fixture setup must succeed");
         assert!(
             !nftables::live_table_is_deny_all_safety_net().unwrap(),
-            "{label}: a table carrying any rule is never the bare safety net"
+            "{label}: a drifted rule shape is not this daemon's safety net"
         );
 
         let err = disarm_castle_runtime(&cfg).expect_err(&format!("{label}: must refuse"));
@@ -591,14 +616,10 @@ fn gf1_h1_zero_rule_non_owner_table_comment_refused() {
     assert!(cfg.journal_path.exists(), "journal must be retained: {err}");
 }
 
-// D3 cases (d) and (e): the v2 identity-scoped three-rule shape. IGNORED on this
-// base: the two-shape recogniser arrives with PR-1; un-ignore after PR-2 rebases
-// onto merged PR-1. Built by hand via `nft_script` (D1's exact transaction text)
-// rather than PR-1's Rust installer API, so this file has no compile-time
-// dependency on PR-1.
-#[test]
-#[ignore = "requires PR-1's two-shape recogniser; un-ignore after the rebase onto merged PR-1"]
-fn gf1_owned_journal_plus_v2_net_clears_as_safety_net() {
+// D3(d/e): a known Owned journal and PR-1's installed three-rule identity net
+// are classified by the live shape. The authenticated history is checked as a
+// fixture precondition, then disarm's clearing outcome is checked separately.
+fn assert_owned_journal_v2_net_clears(confined_uids: &[u32], expect_journal_mismatch: bool) {
     let _suite = isolation::guard();
     if !nft_available() {
         skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
@@ -607,33 +628,56 @@ fn gf1_owned_journal_plus_v2_net_clears_as_safety_net() {
     let policy_dir = tempfile::tempdir().unwrap();
     let paths = isolation::runtime_paths();
     let cfg = config(&paths, policy_dir.path());
-    let table = isolation::table();
-
-    // Case (e) is folded into this same fixture: the deny set {60123, 60124}
-    // deliberately differs from the journal's own (marker-only, no `confined`
-    // array on this base) record -- D2 and D3 identify the net by SHAPE, never
-    // by journal equality, so a deny set that differs from the journal is not a
-    // refusal.
-    write_owned_journal(&cfg, "v2-net-journal-marker-differs-from-deny-set", 1, 2);
-    let script = format!(
-        "add table {CASTLE_FAMILY} {table}\n\
-         add chain {CASTLE_FAMILY} {table} output \
-         {{ type filter hook output priority 0 ; policy drop ; }}\n\
-         add rule {CASTLE_FAMILY} {table} output meta skuid {{ 60123, 60124 }} drop \
-         comment \"sanctuary-castle-net:v2:confined-identity\"\n\
-         add rule {CASTLE_FAMILY} {table} output icmpv6 type \
-         {{ nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit }} accept \
-         comment \"sanctuary-castle-net:v2:kernel-nd\"\n\
-         add rule {CASTLE_FAMILY} {table} output meta skuid != {{ 60123, 60124 }} accept \
-         comment \"sanctuary-castle-net:v2:other-principals\"\n"
-    );
-    assert!(nft_script(&script), "fixture setup must succeed");
+    let confined: Vec<_> = confined_uids
+        .iter()
+        .map(|&uid| journal::ConfinedIdentity {
+            uid,
+            role: journal::ConfinedRole::Agent,
+        })
+        .collect();
+    write_owned_journal_with_history(&cfg, "v2-net-known-history", 1, 2, Some(confined.clone()));
+    let key = journal::load_or_generate_auth_key(&cfg.journal_key_path).expect("journal key");
+    let record = journal::load(&cfg.journal_path, Some(&key))
+        .expect("read known history")
+        .expect("record exists");
+    assert_eq!(record.confined(), Some(confined.as_slice()));
+    let scope = identity_scope(&[60123, 60124]);
+    let recorded_uids: Vec<_> = record
+        .confined()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.uid)
+        .collect();
+    if expect_journal_mismatch {
+        assert_ne!(
+            recorded_uids,
+            scope.denied_uids(),
+            "D3(e) requires distinct known sets"
+        );
+    } else {
+        assert_eq!(recorded_uids, scope.denied_uids());
+    }
+    nftables::install_deny_all_safety_net(&scope).expect("arm the three-rule identity net");
+    assert_eq!(live_rule_comments_in_order().len(), 3);
     assert!(nftables::live_table_is_deny_all_safety_net().unwrap());
 
     let outcome = disarm_castle_runtime(&cfg).expect("disarm must recover the v2 safety net");
     assert_eq!(outcome, DisarmOutcome::SafetyNetCleared);
     assert!(!nftables::table_exists().unwrap());
     assert!(!cfg.journal_path.exists());
+}
+
+#[test]
+fn gf1_owned_journal_plus_v2_net_clears_as_safety_net() {
+    assert_owned_journal_v2_net_clears(&[60123, 60124], false);
+}
+
+// D3(e): a present, known authenticated array differs from the live net's
+// {60123, 60124} deny set. Shape recognition, not journal-set equality, decides
+// whether this explicit disarm removes the net.
+#[test]
+fn gf1_v2_net_with_different_known_journal_array_still_clears() {
+    assert_owned_journal_v2_net_clears(&[60125], true);
 }
 
 /// The live isolated table as `nft -j` JSON, or None when absent.
