@@ -360,13 +360,55 @@ case "$scenario" in
     snapshot installed-v1
     assert_installed_v1
     assert_inert
-    # Recopy the exact A119 bytes into the already package-owned leaf after
-    # querying the real manager. Record whether its cache actually reports
-    # staleness; an inactive unit may have been garbage-collected meanwhile.
+    # Force the real manager to load castle-wall's unit (systemctl show above
+    # already did this) and pin it loaded via a fixed-name CI-only anchor
+    # unit whose only relation is an After= ordering reference. Per
+    # systemd.unit(5) Unit Garbage Collection, a loaded unit referenced by
+    # another loaded unit's dependency is not collected while inactive, so
+    # castle-wall's cached copy survives long enough to genuinely go stale.
+    # The anchor never Wants/Requires/BindsTo castle-wall, so it never starts,
+    # enables, or stops it.
+    anchor=zz-ci-castle-wall-stale-anchor.service
+    anchor_unit_file="/etc/systemd/system/$anchor"
+    [[ ! -e "$anchor_unit_file" && ! -L "$anchor_unit_file" ]] || die "stale-witness anchor unit already exists"
+    cat > "$anchor_unit_file" <<EOF
+[Unit]
+Description=CI-only stale-manager witness anchor (never starts Castle Wall)
+After=$unit
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/true
+EOF
+    chmod 0644 -- "$anchor_unit_file"
+    systemctl start "$anchor" || die "stale-witness anchor failed to start"
+    [[ "$(systemctl show "$anchor" --property=ActiveState --value)" == active \
+       && "$(systemctl show "$anchor" --property=SubState --value)" == exited ]] \
+      || die "stale-witness anchor did not reach active/exited"
+    anchor_after="$(systemctl show "$anchor" --property=After --value)"
+    [[ " $anchor_after " == *" $unit "* ]] \
+      || die "stale-witness anchor does not actually depend on $unit"
+    baseline_load="$(systemctl show "$unit" --property=LoadState --value)"
+    baseline_active="$(systemctl show "$unit" --property=ActiveState --value)"
+    baseline_reload="$(systemctl show "$unit" --property=NeedDaemonReload --value)"
+    printf 'anchor_after=%s\nbaseline_load_state=%s\nbaseline_active_state=%s\nbaseline_need_daemon_reload=%s\n' \
+      "$anchor_after" "$baseline_load" "$baseline_active" "$baseline_reload" > "$evidence/stale-manager-anchor.txt"
+    [[ "$baseline_load" == loaded && "$baseline_active" == inactive && "$baseline_reload" == no ]] \
+      || die "anchor pin did not establish a clean pinned-but-fresh baseline"
+    assert_inert
+    [[ "$(systemctl show "$unit" --property=SubState --value)" == dead ]] \
+      || die "pinned unit is not inactive/dead"
+    # Recopy the exact A119 bytes into the already package-owned leaf while the
+    # anchor keeps castle-wall pinned loaded. sleep 1 guarantees a real mtime
+    # bump so the manager's cached copy becomes genuinely, not just nominally, stale.
     unit_before="$(sha256sum "$unit_file" | cut -d' ' -f1)"
+    sleep 1
     install -m 0644 "$script_dir/../../systemd/sanctuary-castle-wall.service" "$unit_file"
     [[ "$(sha256sum "$unit_file" | cut -d' ' -f1)" == "$unit_before" ]] \
       || die "stale-manager fixture changed unit bytes"
+    assert_installed_v1
+    assert_inert
     snapshot inert-stale-before-upgrade
     upgrade_snapshot="$evidence/inert-stale-before-upgrade/systemctl-show.txt"
     [[ "$(grep -c '^NeedDaemonReload=' "$upgrade_snapshot")" == 1 ]] \
@@ -374,12 +416,10 @@ case "$scenario" in
     upgrade_reload="$(sed -n 's/^NeedDaemonReload=//p' "$upgrade_snapshot")"
     upgrade_load="$(sed -n 's/^LoadState=//p' "$upgrade_snapshot")"
     upgrade_unit_file="$(sed -n 's/^UnitFileState=//p' "$upgrade_snapshot")"
-    [[ "$upgrade_reload" == yes || "$upgrade_reload" == no ]] \
-      || die "real manager did not expose an exact daemon-reload state"
     printf 'upgrade_load_state=%s\nupgrade_unit_file_state=%s\nupgrade_need_daemon_reload=%s\n' \
       "$upgrade_load" "$upgrade_unit_file" "$upgrade_reload" > "$evidence/stale-manager-coverage.txt"
     [[ "$upgrade_reload" == yes ]] \
-      || printf 'stale_upgrade_unexercised=manager_did_not_report_yes\n' >> "$evidence/stale-manager-coverage.txt"
+      || die "real manager did not observe genuine NeedDaemonReload=yes after the pinned unit fragment was recopied"
     dpkg --install "$v2" > "$evidence/upgrade-v2.stdout" 2> "$evidence/upgrade-v2.stderr"
     snapshot upgraded-v2
     [[ "$(status | tail -n1)" == "$v2_version" ]] || die "upgrade Version mismatch"
@@ -421,6 +461,9 @@ case "$scenario" in
         || die "stale-manager refusal changed package directory baseline"
       printf 'stale_reinstall_veto_observed=yes\n' >> "$evidence/stale-manager-coverage.txt"
     fi
+    # Release only our anchor after the real stale-removal observation/refusal.
+    systemctl stop "$anchor"
+    rm -- "$anchor_unit_file"
     # This is the explicit operator step, never a maintainer-script action.
     systemctl daemon-reload
     snapshot operator-reloaded
