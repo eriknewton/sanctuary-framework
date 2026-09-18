@@ -4,8 +4,26 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --artifact-dir <directory>" >&2
+  echo "usage: $0 --artifact-dir <directory> | --check-depends <field>" >&2
   exit 64
+}
+
+validate_runtime_depends() {
+  local depends="$1" part name
+  local -a parts=()
+  [[ -n "$depends" ]] || { echo "runtime Depends is empty" >&2; return 1; }
+  [[ "$depends" != ,* && "$depends" != *, && "$depends" != *,,* ]] \
+    || { echo "runtime Depends has an empty package token" >&2; return 1; }
+  IFS=',' read -r -a parts <<< "$depends"
+  for part in "${parts[@]}"; do
+    name="${part#"${part%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+    [[ "$name" =~ ^[a-z0-9][a-z0-9+.-]*(:amd64)?$ ]] \
+      || { echo "runtime Depends must contain plain package names only" >&2; return 1; }
+    name="${name%:amd64}"
+    [[ "$name" != *-dev && "$name" != systemd && "$name" != nftables ]] \
+      || { echo "runtime Depends contains probe or -dev package" >&2; return 1; }
+  done
 }
 
 validate_checksum_record() {
@@ -31,12 +49,9 @@ while [[ $# -gt 0 ]]; do
       artifact_dir="$2"
       shift 2
       ;;
-    --check-checksum-record)
-      [[ $# -eq 3 ]] || usage
-      validate_checksum_record "$2" "$3" || {
-        echo "checksum must be exactly one canonical sibling-deb record" >&2
-        exit 1
-      }
+    --check-depends)
+      [[ $# -eq 2 ]] || usage
+      validate_runtime_depends "$2"
       exit 0
       ;;
     *) usage ;;
@@ -51,7 +66,7 @@ unit_source="$crate_dir/systemd/sanctuary-castle-wall.service"
 [[ -f "$repo_root/AGENTS.md" && -f "$crate_dir/Cargo.toml" && -f "$unit_source" ]] \
   || { echo "package script is not under the Castle Wall daemon subtree" >&2; exit 1; }
 
-for command in cmp dpkg-deb grep sha256sum tar; do
+for command in cmp dpkg-deb grep python3 sha256sum tar; do
   command -v "$command" >/dev/null 2>&1 || { echo "missing command: $command" >&2; exit 1; }
 done
 
@@ -78,11 +93,11 @@ validate_checksum_record "$checksum_path" "$(basename -- "$deb_path")" || {
 [[ "$(dpkg-deb -f "$deb_path" Package)" == "sanctuary-castle-wall-internal" ]]
 [[ "$(dpkg-deb -f "$deb_path" Architecture)" == "amd64" ]]
 depends="$(dpkg-deb -f "$deb_path" Depends)"
-[[ -n "$depends" ]]
-if grep -Eq '(^|[ ,])-dev(:amd64)?($|[ ,])' <<<"$depends"; then
-  echo "runtime Depends must be derived from runtime ownership, never -dev packages" >&2
+validate_runtime_depends "$depends"
+[[ "$(dpkg-deb -f "$deb_path" Pre-Depends)" == "systemd, nftables, python3" ]] || {
+  echo "guard probe Pre-Depends metadata mismatch" >&2
   exit 1
-fi
+}
 grep -Fx 'artifact_kind=internal-structural-deb' "$manifest_path"
 grep -Fx 'install_ready=false' "$manifest_path"
 grep -Fqx 'artifact_kind=internal-structural-deb' <(
@@ -96,11 +111,7 @@ grep -Fqx 'install_ready=false' <(
 dpkg-deb --fsys-tarfile "$deb_path" | tar -xOf - \
   ./etc/systemd/system/sanctuary-castle-wall.service | cmp - "$unit_source"
 
-# No control scripts means package installation cannot enable, start, stop,
-# disarm, or delete a Castle Wall runtime.
-if dpkg-deb --ctrl-tarfile "$deb_path" | tar -tf - | grep -Eq '(^|/)(postinst|prerm|postrm|preinst)$'; then
-  echo "internal structural package must not contain maintainer lifecycle scripts" >&2
-  exit 1
-fi
+python3 "$script_dir/assert-source-constants.py"
+python3 "$script_dir/assert-archive.py" "$deb_path"
 
-echo "internal package structure is valid; no install or service action was run"
+echo "internal guarded package structure is valid; no install or service action was run"

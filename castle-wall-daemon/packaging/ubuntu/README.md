@@ -1,24 +1,34 @@
-# Internal Ubuntu package scaffold
+# Internal Ubuntu package refusal guard
 
-This directory builds one **internal structural** Ubuntu 24.04 amd64 `.deb` for
-`castle-wall-daemon`. It does not make the daemon install-ready and does not
+This directory builds an **internal, unprovisioned-only** Ubuntu 24.04 amd64
+`.deb` for `castle-wall-daemon`. It remains `install_ready=false` and does not
 establish a Linux enforcement claim.
 
-`build-deb.sh` builds the locked, default-feature daemon binary, copies the
-current source systemd unit verbatim at build time, derives Ubuntu runtime
-dependencies from the finished ELF and required executables through
-`dpkg-query`, and writes a `.deb`, checksum, manifest, and in-package build
-identity to an empty output directory.
+`build-deb.sh` takes an explicit positive package revision, builds the locked
+default-feature daemon, copies the current source unit byte for byte, and
+writes a `.deb`, checksum, manifest and root-custodied build identity. It puts
+the hook's early `systemd`, `nftables` and `python3` probes in `Pre-Depends`;
+finished-ELF libraries remain in ordinary `Depends`. Source inputs must be
+clean, including untracked files, before the build stamps a commit identity.
 
-The scaffold intentionally contains no Debian maintainer scripts. It creates
-no environment file, policy/key/state material, system user/group, or nftables
-state, and it cannot enable, start, stop, disarm, or remove a service. Those
-lifecycle decisions remain blocked on the finalized A119 safe-disarm contract
-and on install-grade evidence in a disposable Ubuntu environment.
+The control archive contains only `control`, `preinst` and `prerm`. These
+self-contained scripts read bounded dpkg/filesystem/systemd/nft state and
+refuse a fresh install unless the package and Castle Wall footprint are
+positively absent. Upgrade and removal require an exact old package identity,
+inert disabled unit and absent runtime state. No hook provisions, starts,
+stops, reloads or disarms. A refused old `prerm upgrade` is backed by the new
+`prerm failed-upgrade` veto. After a guarded removal, the operator purges an
+ordinary `config-files` residue if present, then runs `systemctl daemon-reload`
+and rechecks full absence before reinstall. Hooks never do those actions.
+
+The first slice assumes a quiescent operator-controlled host with no direct
+daemon or concurrent root provisioning actor; hooks cannot prove that process
+or transaction exclusion. Provisioned package upgrades/removal, trusted CLI
+delivery and target-host Linux acceptance remain separate work.
 
 Example build command (builds only; it does not install):
 
 ```bash
-bash castle-wall-daemon/packaging/ubuntu/build-deb.sh --output /tmp/sanctuary-linux-package
+bash castle-wall-daemon/packaging/ubuntu/build-deb.sh --revision 1 --output /tmp/sanctuary-linux-package
 bash castle-wall-daemon/packaging/ubuntu/assert-structure.sh --artifact-dir /tmp/sanctuary-linux-package
 ```
