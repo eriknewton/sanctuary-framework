@@ -512,43 +512,51 @@ PY
     fixture="$evidence/unpack-fault-diagnostic"
     dpkg-deb --raw-extract "$v2" "$fixture"
     doc="$fixture/usr/share/doc/sanctuary-castle-wall-internal"
+    collision_package=sanctuary-castle-wall-unpack-collision
+    collision_version=0.0.1
+    collision_relative=usr/share/doc/sanctuary-castle-wall-internal/unpack-fault
+    collision="/$collision_relative"
     printf 'fault injection only\n' > "$doc/unpack-fault"
-    collision="/usr/share/doc/sanctuary-castle-wall-internal/unpack-fault"
-    mkdir -m 0755 "$collision"
-    install -m 0644 /dev/null "$collision/retain-on-unpack-failure"
-    printf 'diagnostic unpack collision marker\n' > "$collision/retain-on-unpack-failure"
-    python3 - "$collision" "$doc/unpack-fault" "$evidence/unpack-fault-marker-before.json" <<'PY'
+    collision_fixture="$evidence/unpack-fault-collision-package"
+    install -d -m 0755 "$collision_fixture/DEBIAN" "$collision_fixture/$(dirname "$collision_relative")"
+    cat > "$collision_fixture/DEBIAN/control" <<EOF
+Package: $collision_package
+Version: $collision_version
+Section: misc
+Priority: optional
+Architecture: all
+Maintainer: CI diagnostic fixture <ci@example.invalid>
+Description: isolated dpkg ownership collision fixture
+ Diagnostic-only package with no maintainer scripts, units, dependencies, or privileges.
+EOF
+    printf 'collision package canonical content\n' > "$collision_fixture/$collision_relative"
+    dpkg-deb --root-owner-group --build "$collision_fixture" "$evidence/unpack-fault-collision.deb" >/dev/null
+    dpkg --install "$evidence/unpack-fault-collision.deb" > "$evidence/install-collision.stdout" 2> "$evidence/install-collision.stderr"
+    dpkg-query -W -f='${Package}\n${Version}\n${Status}\n' "$collision_package" > "$evidence/collision-package-status.txt"
+    dpkg-query -S "$collision" > "$evidence/collision-owner.txt"
+    sha256sum "$collision" > "$evidence/collision-file.sha256"
+    python3 - "$collision" "$evidence/collision-file-before.json" <<'PY'
 import json, os, stat, sys
 from pathlib import Path
-collision, incoming, evidence = map(Path, sys.argv[1:])
-marker = collision / "retain-on-unpack-failure"
-expected = b"diagnostic unpack collision marker\n"
-directory_info = os.lstat(collision)
-marker_info = os.lstat(marker)
-incoming_info = os.lstat(incoming)
-if (not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != 0 or
-        directory_info.st_gid != 0 or stat.S_IMODE(directory_info.st_mode) != 0o755 or
-        not stat.S_ISREG(marker_info.st_mode) or marker_info.st_uid != 0 or
-        marker_info.st_gid != 0 or stat.S_IMODE(marker_info.st_mode) != 0o644 or
-        marker.read_bytes() != expected or not stat.S_ISREG(incoming_info.st_mode) or
-        incoming.read_bytes() != b"fault injection only\n" or
-        [entry.name for entry in collision.iterdir()] != [marker.name]):
-    raise SystemExit("unpack-fault collision fixture is not an exact nonempty root-owned directory")
+path, evidence = map(Path, sys.argv[1:])
+info = os.lstat(path)
+expected = b"collision package canonical content\n"
+if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != 0o644 or path.read_bytes() != expected):
+    raise SystemExit("collision package did not install exact root-owned regular file")
 evidence.write_text(json.dumps({
-    "collision": str(collision), "type": "directory",
-    "uid": directory_info.st_uid, "gid": directory_info.st_gid,
-    "mode": format(stat.S_IMODE(directory_info.st_mode), "04o"),
-    "marker": marker.name, "marker_type": "regular",
-    "marker_uid": marker_info.st_uid, "marker_gid": marker_info.st_gid,
-    "marker_mode": format(stat.S_IMODE(marker_info.st_mode), "04o"),
-    "marker_content": marker.read_bytes().decode(),
-    "incoming_type": "regular", "incoming_content": incoming.read_bytes().decode(),
+    "path": str(path), "type": "regular", "uid": info.st_uid,
+    "gid": info.st_gid, "mode": format(stat.S_IMODE(info.st_mode), "04o"),
+    "content": path.read_bytes().decode(),
 }, sort_keys=True) + "\n")
 PY
     dpkg-deb --root-owner-group --build "$fixture" "$evidence/unpack-fault-diagnostic.deb" >/dev/null
     attempt_refusal post-unpack-fault "$evidence/unpack-fault-diagnostic.deb" callback:abort-upgrade
     grep -Eq '^abort-upgrade( |$)' "$evidence/old-preinst-calls.txt" \
       || die "old preinst abort-upgrade callback not observed after unpack fault"
+    grep -F "trying to overwrite '$collision', which is also in package $collision_package" \
+      "$evidence/post-unpack-fault.stderr" >/dev/null \
+      || die "unpack fault did not report exact ownership conflict"
     ;;
   legacy)
     fixture="$evidence/legacy-unbound-diagnostic"
