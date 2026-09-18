@@ -109,9 +109,8 @@ pub struct ProbeBudget {
     /// would be detected a tick late.
     pub min_interval: Duration,
     /// How many consecutive indeterminate readings may pass before the probe
-    /// latches `Lost`. This is the fail-closed backstop for an `nft` that never
-    /// returns: worst-case detection is `max_consecutive_unavailable` supervisor
-    /// ticks, not unbounded.
+    /// latches `Indeterminate`. This bounds the no-answer interval without
+    /// manufacturing a completed negative ownership proof.
     pub max_consecutive_unavailable: u32,
 }
 

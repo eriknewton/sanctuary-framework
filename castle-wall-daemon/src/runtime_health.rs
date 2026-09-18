@@ -54,6 +54,9 @@ pub enum RuntimeHealthState {
     /// No conclusion is available: the probe was in flight, timed out, or the
     /// view could not be read. Indeterminate — never treat as ready or as lost.
     ProbeUnavailable,
+    /// The nft probe exhausted its no-answer budget. The supervisor runs the
+    /// hook and exits; no kernel replacement is inferred from this reading.
+    Indeterminate,
     /// A required component was PROVEN lost AND the safety net is being installed or
     /// retried for it while this process keeps the host lock.
     ///
@@ -75,6 +78,7 @@ impl RuntimeHealthState {
             Self::Ready => "ready",
             Self::Lost(_) => "lost",
             Self::ProbeUnavailable => "probe_unavailable",
+            Self::Indeterminate => "indeterminate",
             // A NEW wire token. Must match `RuntimeHealthToken` in
             // `server/src/castle-wall/ipc/messages.ts`: producer and consumer change
             // together, and a reader that does not know this token must treat it as
@@ -106,6 +110,7 @@ impl RuntimeHealthReading {
 #[derive(Debug)]
 pub struct RuntimeHealthView {
     inner: Mutex<Option<(Instant, RuntimeHealthState)>>,
+    safety_net: Mutex<Option<crate::nftables::SafetyNetAuditState>>,
 }
 
 impl Default for RuntimeHealthView {
@@ -118,7 +123,33 @@ impl RuntimeHealthView {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(None),
+            safety_net: Mutex::new(Some(crate::nftables::SafetyNetAuditState::NotAttempted)),
         }
+    }
+
+    /// Publish the component's tagged predicate without making an IPC status
+    /// request lock the enforcement runtime or run an ownership probe.
+    pub fn publish_safety_net(&self, state: crate::nftables::SafetyNetAuditState) {
+        if let Ok(mut slot) = self.safety_net.lock() {
+            *slot = Some(state);
+        }
+    }
+
+    /// Clear a prior predicate when the runtime cannot be read. Absence is
+    /// preferable to replaying an installed claim from before a loss.
+    pub fn clear_safety_net(&self) {
+        if let Ok(mut slot) = self.safety_net.lock() {
+            *slot = None;
+        }
+    }
+
+    /// A contended or poisoned read has no known state. It must not be
+    /// mislabeled `NotAttempted`, which means the install was never tried.
+    pub fn read_safety_net(&self) -> Option<crate::nftables::SafetyNetAuditState> {
+        self.safety_net
+            .try_lock()
+            .ok()
+            .and_then(|state| state.clone())
     }
 
     /// Publish an observation. Called by boot (initial state) and by the
@@ -194,6 +225,20 @@ mod tests {
         assert_eq!(reading.state, RuntimeHealthState::Ready);
         assert!(reading.proves_ready());
         assert!(reading.age.is_some());
+    }
+
+    #[test]
+    fn contended_safety_net_state_is_absent_from_status() {
+        let view = RuntimeHealthView::new();
+        let held = view.safety_net.lock().unwrap();
+        assert!(view.read_safety_net().is_none());
+        drop(held);
+        assert_eq!(
+            view.read_safety_net(),
+            Some(crate::nftables::SafetyNetAuditState::NotAttempted)
+        );
+        view.clear_safety_net();
+        assert_eq!(view.read_safety_net(), None);
     }
 
     /// A `Ready` observation is evidence about WHEN it was taken. Past the

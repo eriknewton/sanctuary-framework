@@ -1608,6 +1608,10 @@ fn dispatch(
                 runtime_health_age_ms: health
                     .age
                     .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX)),
+                safety_net: state
+                    .runtime_health
+                    .read_safety_net()
+                    .map(|state| state.to_json()),
             };
             Some(MessageEnvelope {
                 jsonrpc: "2.0".to_string(),
@@ -2010,6 +2014,33 @@ mod tests {
             }
             other => panic!("expected a status response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn status_carries_the_tagged_safety_net_transition() {
+        use crate::nftables::SafetyNetAuditState;
+
+        let state = running_kernel_ready_state();
+        state
+            .runtime_health
+            .publish_safety_net(SafetyNetAuditState::InstallFailed {
+                attempted_scope: "v2-confined-identity".to_string(),
+                error: "install did not complete".to_string(),
+            });
+        let failed = dispatch_once(&status_request_envelope(), &state, &v2_peer()).unwrap();
+        let IpcMessage::StatusResponse { safety_net, .. } = failed.params else {
+            panic!("expected status response");
+        };
+        assert_eq!(safety_net.unwrap()["state"], "install_failed");
+
+        state
+            .runtime_health
+            .publish_safety_net(SafetyNetAuditState::NotAttempted);
+        let retry = dispatch_once(&status_request_envelope(), &state, &v2_peer()).unwrap();
+        let IpcMessage::StatusResponse { safety_net, .. } = retry.params else {
+            panic!("expected status response");
+        };
+        assert_eq!(safety_net.unwrap()["state"], "not_attempted");
     }
 
     /// FAIL-BEFORE for "status collapses lock contention into not-ready": an

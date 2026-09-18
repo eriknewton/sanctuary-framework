@@ -347,6 +347,9 @@ fn main() -> ExitCode {
                 castle_wall_daemon::runtime_health::RuntimeHealthState::ProbeUnavailable => {
                     Some("kernel runtime health was unprovable".to_string())
                 }
+                castle_wall_daemon::runtime_health::RuntimeHealthState::Indeterminate => {
+                    Some("kernel runtime health remained indeterminate".to_string())
+                }
                 // A proven loss with a safety-net attempt still outstanding. Reported
                 // as a smoke failure (it is not readiness) and NEVER treated as ready,
                 // but it is named distinctly from a plain loss so the harness output

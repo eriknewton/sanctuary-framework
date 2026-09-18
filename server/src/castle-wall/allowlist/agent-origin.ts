@@ -161,7 +161,7 @@ export function validateAgentOrigin(candidate: unknown): AgentOrigin | null {
         c.gate_uid < systemUidAllowCeiling ||
         c.gate_uid === agentUid ||
         // Same additional bound as `agent_uid`: the gate is a confined principal
-        // the net denies, so an unattestable gate uid is the same defect.
+        // the net denies, so it must meet the same identity bound.
         isUnattestableUid(c.gate_uid)
       ) {
         return null;

@@ -218,6 +218,10 @@ pub trait AcquiredComponent: Send {
     /// install nothing here. The default is a no-op.
     fn on_startup_indeterminate(&self) {}
 
+    /// Post-ready exhausted probe budget: run the hook once before exit.
+    /// A transient unavailable reading never reaches this method.
+    fn on_post_ready_indeterminate(&self) {}
+
     /// POST-READY recovery for a COMPLETED negative proof of this component's
     /// resource, invoked by the supervisor BEFORE any exit arm.
     ///
@@ -285,6 +289,7 @@ impl StartupReadiness {
             ComponentHealth::Ready => StartupReadiness::Ready,
             ComponentHealth::Lost => StartupReadiness::Lost { kind },
             ComponentHealth::ProbeUnavailable => StartupReadiness::Indeterminate { kind },
+            ComponentHealth::Indeterminate => StartupReadiness::Indeterminate { kind },
             // The recovery controller is a POST-READY owner, so a component cannot be
             // recovering during startup. If one ever reports it here, the reading it
             // rests on is a completed negative proof, so treat it as the loss it is
@@ -327,6 +332,9 @@ pub enum ComponentHealth {
     Ready,
     Lost,
     ProbeUnavailable,
+    /// The probe's own consecutive no-answer budget has been exhausted.
+    /// This is a terminal no-evidence outcome, distinct from a transient poll.
+    Indeterminate,
     /// A COMPLETED negative proof has been observed AND a recovery attempt for it is
     /// in flight: the safety net is being installed or retried while this process
     /// keeps the host lock.
@@ -387,6 +395,9 @@ pub enum NotReadyReason {
     /// The shared runtime health object could not be locked. Readiness probes
     /// fail closed rather than returning the last cached healthy value.
     HealthProbeUnavailable,
+    /// The nft ownership probe exhausted its no-answer budget. No kernel
+    /// replacement is justified, but the hook must run before exit.
+    HealthProbeIndeterminate,
     /// The audit WAL suffered an ambiguous durable mutation or its lock was
     /// poisoned. Continuing could emit decisions without trustworthy evidence.
     AuditWalPoisoned,
@@ -658,6 +669,11 @@ impl EnforcementRuntime {
                             reason: NotReadyReason::HealthProbeUnavailable,
                         }
                     }
+                    ComponentHealth::Indeterminate => {
+                        return EnforcementStatus::NotReady {
+                            reason: NotReadyReason::HealthProbeIndeterminate,
+                        }
+                    }
                     // Withhold readiness WITHOUT reporting the loss that a supervisor
                     // exits on: the net is being installed or retried right now.
                     ComponentHealth::Recovering => {
@@ -696,6 +712,16 @@ impl EnforcementRuntime {
             }
         }
         any
+    }
+
+    /// The supervisor's terminal no-answer transition, before it releases the
+    /// runtime. Only a component with an exhausted probe budget runs its hook.
+    pub fn hook_post_ready_indeterminate(&self) {
+        for component in &self.components {
+            if component.health() == ComponentHealth::Indeterminate {
+                component.on_post_ready_indeterminate();
+            }
+        }
     }
 
     /// The tagged `safety_net` state to stamp on an audit row or a signed report.
@@ -907,6 +933,7 @@ mod test_support {
         health: Arc<std::sync::Mutex<ComponentHealth>>,
         startup_lost_calls: Arc<AtomicUsize>,
         startup_indeterminate_calls: Arc<AtomicUsize>,
+        post_ready_indeterminate_calls: Arc<AtomicUsize>,
         recovery_calls: Arc<AtomicUsize>,
         recovery_saw_shutdown: Arc<AtomicBool>,
     }
@@ -927,6 +954,10 @@ mod test_support {
             self.startup_indeterminate_calls
                 .fetch_add(1, Ordering::SeqCst);
         }
+        fn on_post_ready_indeterminate(&self) {
+            self.post_ready_indeterminate_calls
+                .fetch_add(1, Ordering::SeqCst);
+        }
         fn attempt_post_ready_recovery(&self, shutting_down: bool) -> bool {
             self.recovery_calls.fetch_add(1, Ordering::SeqCst);
             if shutting_down {
@@ -942,6 +973,7 @@ mod test_support {
         health: Arc<std::sync::Mutex<ComponentHealth>>,
         startup_lost_calls: Arc<AtomicUsize>,
         startup_indeterminate_calls: Arc<AtomicUsize>,
+        post_ready_indeterminate_calls: Arc<AtomicUsize>,
         recovery_calls: Arc<AtomicUsize>,
         recovery_saw_shutdown: Arc<AtomicBool>,
     }
@@ -955,6 +987,7 @@ mod test_support {
                 health: self.health,
                 startup_lost_calls: self.startup_lost_calls,
                 startup_indeterminate_calls: self.startup_indeterminate_calls,
+                post_ready_indeterminate_calls: self.post_ready_indeterminate_calls,
                 recovery_calls: self.recovery_calls,
                 recovery_saw_shutdown: self.recovery_saw_shutdown,
             }))
@@ -966,6 +999,7 @@ mod test_support {
     struct ResponderCounters {
         startup_lost: Arc<AtomicUsize>,
         startup_indeterminate: Arc<AtomicUsize>,
+        post_ready_indeterminate: Arc<AtomicUsize>,
         recovery: Arc<AtomicUsize>,
         recovery_saw_shutdown: Arc<AtomicBool>,
     }
@@ -980,6 +1014,7 @@ mod test_support {
                 health: Arc::new(std::sync::Mutex::new(nft_health)),
                 startup_lost_calls: Arc::clone(&counters.startup_lost),
                 startup_indeterminate_calls: Arc::clone(&counters.startup_indeterminate),
+                post_ready_indeterminate_calls: Arc::clone(&counters.post_ready_indeterminate),
                 recovery_calls: Arc::clone(&counters.recovery),
                 recovery_saw_shutdown: Arc::clone(&counters.recovery_saw_shutdown),
             }),
@@ -1155,6 +1190,7 @@ mod test_support {
                 health: Arc::clone(&lost_health),
                 startup_lost_calls: Arc::clone(&counters.startup_lost),
                 startup_indeterminate_calls: Arc::clone(&counters.startup_indeterminate),
+                post_ready_indeterminate_calls: Arc::clone(&counters.post_ready_indeterminate),
                 recovery_calls: Arc::clone(&counters.recovery),
                 recovery_saw_shutdown: Arc::clone(&counters.recovery_saw_shutdown),
             }),
@@ -1214,6 +1250,7 @@ mod test_support {
                 health: Arc::clone(&health),
                 startup_lost_calls: Arc::clone(&counters.startup_lost),
                 startup_indeterminate_calls: Arc::clone(&counters.startup_indeterminate),
+                post_ready_indeterminate_calls: Arc::clone(&counters.post_ready_indeterminate),
                 recovery_calls: Arc::clone(&counters.recovery),
                 recovery_saw_shutdown: Arc::clone(&counters.recovery_saw_shutdown),
             }),
@@ -1230,6 +1267,21 @@ mod test_support {
         // so no kernel action may be taken from it.
         *health.lock().unwrap() = ComponentHealth::ProbeUnavailable;
         assert!(!runtime.attempt_post_ready_recovery(false));
+        assert_eq!(counters.recovery.load(Ordering::SeqCst), 0);
+        runtime.hook_post_ready_indeterminate();
+        assert_eq!(counters.post_ready_indeterminate.load(Ordering::SeqCst), 0);
+
+        // The terminal no-answer outcome reaches the hook only when the
+        // supervisor explicitly takes its ordered hook-before-exit arm.
+        *health.lock().unwrap() = ComponentHealth::Indeterminate;
+        assert_eq!(
+            runtime.status(),
+            EnforcementStatus::NotReady {
+                reason: NotReadyReason::HealthProbeIndeterminate,
+            }
+        );
+        runtime.hook_post_ready_indeterminate();
+        assert_eq!(counters.post_ready_indeterminate.load(Ordering::SeqCst), 1);
         assert_eq!(counters.recovery.load(Ordering::SeqCst), 0);
 
         // LOST, a completed negative proof: recovery IS driven.
@@ -1364,6 +1416,43 @@ mod test_support {
                     shutdown_done: false,
                 },
                 toggle,
+            )
+        }
+
+        /// A ready runtime whose nft probe can later exhaust its no-answer
+        /// budget, with a counter for the supervisor's ordered hook.
+        pub(crate) fn all_ready_with_indeterminate_probe() -> (
+            Self,
+            Arc<std::sync::Mutex<ComponentHealth>>,
+            Arc<AtomicUsize>,
+        ) {
+            let health = Arc::new(std::sync::Mutex::new(ComponentHealth::Ready));
+            let hook_calls = Arc::new(AtomicUsize::new(0));
+            let components: Vec<Box<dyn AcquiredComponent>> = ComponentKind::REQUIRED_IN_ORDER
+                .into_iter()
+                .map(|kind| {
+                    if kind == ComponentKind::NftablesTable {
+                        Box::new(ScriptedHealth {
+                            kind,
+                            health: Arc::clone(&health),
+                            startup_lost_calls: Arc::new(AtomicUsize::new(0)),
+                            startup_indeterminate_calls: Arc::new(AtomicUsize::new(0)),
+                            post_ready_indeterminate_calls: Arc::clone(&hook_calls),
+                            recovery_calls: Arc::new(AtomicUsize::new(0)),
+                            recovery_saw_shutdown: Arc::new(AtomicBool::new(false)),
+                        }) as Box<dyn AcquiredComponent>
+                    } else {
+                        Box::new(AlwaysReady(kind)) as Box<dyn AcquiredComponent>
+                    }
+                })
+                .collect();
+            (
+                Self {
+                    components,
+                    shutdown_done: false,
+                },
+                health,
+                hook_calls,
             )
         }
     }

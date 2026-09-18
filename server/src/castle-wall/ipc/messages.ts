@@ -173,6 +173,7 @@ export function manifestFieldsAreAuthoritative(
  * - `ready`             a fresh positive proof
  * - `lost`              a PROVEN loss of a required component
  * - `probe_unavailable` INDETERMINATE (contention, deadline, stale observation)
+ * - `indeterminate`     the nft probe exhausted its no-answer budget; exit follows
  * - `no_runtime`        this daemon holds no kernel runtime at all
  * - `safety_net_recovering` a PROVEN loss for which the daemon is installing or
  *   retrying the Linux safety net while it still holds the host lock. NOT
@@ -183,6 +184,7 @@ export type RuntimeHealthToken =
   | "ready"
   | "lost"
   | "probe_unavailable"
+  | "indeterminate"
   | "no_runtime"
   // Must match `RuntimeHealthState::Recovering`'s token in
   // `castle-wall-daemon/src/runtime_health.rs`; producer and consumer change together.
@@ -269,7 +271,27 @@ export interface StatusResponse {
   runtime_health?: RuntimeHealthToken;
   /** Age of the observation behind `runtime_health`, in milliseconds. */
   runtime_health_age_ms?: number;
+  /** Must match `SafetyNetAuditState::to_json` in the Linux daemon. */
+  safety_net?: SafetyNetAuditState;
 }
+
+/** Tagged predicate on the authenticated status response and signed WAL row. */
+export type SafetyNetAuditState =
+  | {
+      state: "installed";
+      shape: "v2-confined-identity" | "v1-host-wide";
+      reason: "identity" | "empty-deny-set" | "unknown-history" | "deny-set-over-capacity";
+      deny_set_size: number;
+      deny_set_max: number;
+      rules: string[];
+      denied_uids: number[];
+      sources: { journal: boolean; manifest: boolean; live_table: boolean };
+      kernel_nd_accepted: string[];
+      unattestable_packets: "drop-except-kernel-nd";
+      coverage: string;
+    }
+  | { state: "install_failed"; attempted_scope: string; error: string }
+  | { state: "not_attempted" };
 
 /**
  * The TRUTHFUL, reachable states of the Linux kernel runtime as a consumer can
@@ -350,7 +372,7 @@ export function castleWallRuntimeReadiness(
     return "unavailable";
   }
   // 3. The daemon reports it but has no current proof behind it.
-  if (status.runtime_health === "probe_unavailable") {
+  if (status.runtime_health === "probe_unavailable" || status.runtime_health === "indeterminate") {
     return "unavailable";
   }
   // 4. Proven-bad states.

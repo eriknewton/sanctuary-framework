@@ -261,7 +261,7 @@ pub enum OwnershipJournal {
         /// exactly as every other field is.
         ///
         /// THREE STATES, and the distinction between the first two is
-        /// load-bearing, which is why this is an `Option` and never a bare `Vec`
+        /// essential, which is why this is an `Option` and never a bare `Vec`
         /// with a serde default:
         ///
         ///   * `None` (the key ABSENT on disk) means UNKNOWN HISTORY: the record
@@ -432,6 +432,18 @@ pub fn persist_confined_uid_write_ahead(
     uid: u32,
     role: ConfinedRole,
 ) -> Result<WriteAheadReceipt, OwnershipJournalError> {
+    persist_confined_uid_write_ahead_with_store(path, key, uid, role, store_atomic)
+}
+
+/// The injected store keeps durability failures testable at the production
+/// receipt-minting boundary. No receipt is returned until store succeeds.
+fn persist_confined_uid_write_ahead_with_store(
+    path: &Path,
+    key: &JournalAuthKey,
+    uid: u32,
+    role: ConfinedRole,
+    store: impl FnOnce(&Path, &OwnershipJournal, &JournalAuthKey) -> Result<(), OwnershipJournalError>,
+) -> Result<WriteAheadReceipt, OwnershipJournalError> {
     let record = load(path, Some(key))?;
     let Some(OwnershipJournal::Owned {
         identity,
@@ -464,7 +476,7 @@ pub fn persist_confined_uid_write_ahead(
         base_chain_handle,
         history,
     )?;
-    store_atomic(path, &next, key)?;
+    store(path, &next, key)?;
     Ok(WriteAheadReceipt { uid })
 }
 
@@ -1357,13 +1369,11 @@ mod tests {
     /// The BIND row: persist succeeds, THEN bind. A failed persist yields no proof, so
     /// the kernel step is unreachable and the caller keeps its prior good policy.
     ///
-    /// The injected closures stand for the two sides of each step, so the ORDER is
-    /// asserted rather than assumed: the journal write is observed before the kernel
-    /// transaction on the success path, and the kernel transaction is never observed at
-    /// all on the failure path.
+    /// Inject a durability failure and crashes on either side of the journal
+    /// write. A receipt exists only after the durable store returns successfully.
     #[test]
     fn the_bind_row_persists_before_the_kernel_step_and_refuses_on_a_failed_persist() {
-        use std::cell::RefCell;
+        use std::cell::Cell;
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nft-ownership.json");
         let key = test_key();
@@ -1380,26 +1390,75 @@ mod tests {
         )
         .unwrap();
 
-        // SUCCESS PATH: the persist is observed, and only then the kernel step.
-        let observed: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+        // The real store completes before a bind callback can use the receipt.
         let receipt = persist_confined_uid_write_ahead(&path, &key, 60123, ConfinedRole::Agent)
             .expect("the persist must succeed on a known history");
-        observed.borrow_mut().push("journal-write");
         assert_eq!(receipt.uid(), 60123);
-        // The proof exists, so the bind may proceed.
-        observed.borrow_mut().push("kernel-transaction");
-        assert_eq!(
-            *observed.borrow(),
-            vec!["journal-write", "kernel-transaction"],
-            "the journal write must be durable BEFORE the kernel binds the uid"
-        );
-        // And it is durable: a fresh read names the uid.
         let reloaded = load(&path, Some(&key)).unwrap().unwrap();
         assert_eq!(
             reloaded
                 .confined()
                 .map(|c| c.iter().map(|e| e.uid).collect::<Vec<_>>()),
             Some(vec![60123])
+        );
+
+        // A real error from the injected durability step mints no receipt, so
+        // the kernel callback is unreachable on this path.
+        let bound = Cell::new(false);
+        let failed = persist_confined_uid_write_ahead_with_store(
+            &path,
+            &key,
+            60124,
+            ConfinedRole::Gate,
+            |path, _, _| {
+                Err(OwnershipJournalError::Durability {
+                    path: path.to_path_buf(),
+                    source: std::io::Error::other("injected sync failure"),
+                })
+            },
+        );
+        if let Ok(proof) = failed.as_ref() {
+            bound.set(proof.uid() == 60124);
+        }
+        assert!(matches!(
+            failed,
+            Err(OwnershipJournalError::Durability { .. })
+        ));
+        assert!(!bound.get());
+        assert_eq!(
+            load(&path, Some(&key))
+                .unwrap()
+                .unwrap()
+                .confined()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // A crash immediately after the store returns leaves a wider durable
+        // history for the next process. No kernel callback has run yet.
+        let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            persist_confined_uid_write_ahead_with_store(
+                &path,
+                &key,
+                60124,
+                ConfinedRole::Gate,
+                |path, record, key| {
+                    store_atomic(path, record, key)?;
+                    panic!("injected post-store crash");
+                },
+            )
+        }));
+        assert!(crash.is_err());
+        let restarted = load(&path, Some(&key)).unwrap().unwrap();
+        assert_eq!(
+            restarted
+                .confined()
+                .unwrap()
+                .iter()
+                .map(|e| e.uid)
+                .collect::<Vec<_>>(),
+            vec![60123, 60124]
         );
 
         // FAILURE PATH: an UNKNOWN history refuses the persist, so no proof is minted and
@@ -1463,30 +1522,26 @@ mod tests {
         // crash (we simply reload, which is what a restart does).
         persist_confined_uid_write_ahead(&path, &key, 60123, ConfinedRole::Agent).unwrap();
         persist_confined_uid_write_ahead(&path, &key, 60124, ConfinedRole::Gate).unwrap();
-        // The restart reads the journal array back, whatever the kernel now holds.
-        let rebuilt: Vec<u32> = load(&path, Some(&key))
+        // The restart reads the authenticated array and routes it through the
+        // same resolver that builds the daemon's deny and kill sets.
+        let rebuilt = load(&path, Some(&key))
             .unwrap()
             .unwrap()
             .confined()
             .expect("a known history")
-            .iter()
-            .map(|e| e.uid)
-            .collect();
-        // Unioned with the identity the manifest names after the restart (60125 here),
-        // which is the kill set the resolver computes from sources (a) and (b).
-        let manifest_identity = [60125u32];
-        let mut kill_set: Vec<u32> = rebuilt
-            .iter()
-            .chain(manifest_identity.iter())
-            .copied()
-            .collect();
-        kill_set.sort_unstable();
-        kill_set.dedup();
+            .to_vec();
+        let resolution = crate::runtime_providers::resolve_safety_net_scope(
+            &crate::runtime_providers::ConfinedHistory::Known(rebuilt),
+            Some((60125, None)),
+            &crate::nftables::LiveTableBindings::Bindings(vec![60126]),
+            crate::safety_net_uid::HostOverflowUid::from_value(65534),
+        );
         assert_eq!(
-            kill_set,
+            resolution.kill_set,
             vec![60123, 60124, 60125],
             "the rebuilt kill set is the journal array unioned with the manifest identity"
         );
+        assert_eq!(resolution.deny_union, vec![60123, 60124, 60125, 60126]);
         // Re-persisting an already-recorded uid is idempotent, so a retried bind after a
         // crash does not grow the array.
         persist_confined_uid_write_ahead(&path, &key, 60123, ConfinedRole::Agent).unwrap();

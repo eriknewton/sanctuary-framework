@@ -380,6 +380,68 @@ fn a_within_cap_identity_resolves_and_never_installs_the_zero_rule_shape() {
     assert!(nftables::live_table_is_deny_all_safety_net().expect("probe"));
 }
 
+// A known-empty journal is a present history key. The resolver carries both
+// the admitted and the live-table identities into the installed predicate.
+#[test]
+fn known_empty_history_installs_the_resolved_identity_scope() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let resolution = resolved_scope(&[], Some((60124, None)), &[60123]);
+    assert_eq!(resolution.scope.denied_uids(), vec![60123, 60124]);
+    nftables::install_deny_all_safety_net(&resolution.scope).expect("install resolved scope");
+    assert_eq!(live_rule_comments_in_order().len(), 3);
+    assert!(nftables::live_table_is_deny_all_safety_net().expect("probe installed scope"));
+}
+
+// An absent history key selects the host-wide shape. Installation must not
+// rewrite the authenticated journal or turn that absence into a known history.
+#[test]
+fn absent_history_key_installs_the_resolved_host_wide_scope_without_a_store() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("isolated journal directory");
+    let path = dir.path().join("ownership.json");
+    let key_path = dir.path().join("ownership.key");
+    let key = journal::load_or_generate_auth_key(&key_path).expect("journal key");
+    let record = OwnershipJournal::owned_with_unknown_history(
+        JournalIdentity {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            marker: format!("{OWNER_MARKER_PREFIX}{}", "a".repeat(32)),
+            boot_id: journal::current_boot_id().expect("boot id"),
+            source: journal::current_source(),
+        },
+        2,
+        1,
+    );
+    journal::store_atomic(&path, &record, &key).expect("store unknown history");
+    let before = std::fs::read(&path).expect("read journal before install");
+    let reloaded = journal::load(&path, Some(&key)).unwrap().unwrap();
+    assert_eq!(reloaded.confined(), None);
+    let resolution = castle_wall_daemon::runtime_providers::resolve_safety_net_scope(
+        &castle_wall_daemon::runtime_providers::ConfinedHistory::Unknown,
+        Some((60124, None)),
+        &nftables::LiveTableBindings::Bindings(vec![60123]),
+        HostOverflowUid::from_host().expect("host overflow uid"),
+    );
+    assert_eq!(resolution.scope, nftables::SafetyNetScope::HostWide);
+    nftables::install_deny_all_safety_net(&resolution.scope).expect("install resolved scope");
+    assert!(live_rule_comments_in_order().is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        journal::load(&path, Some(&key))
+            .unwrap()
+            .unwrap()
+            .confined(),
+        None
+    );
+}
+
 // OVER CAPACITY: a 257-entry union resolves to the zero-rule host-wide shape with the
 // over-capacity reason, and the INSTALLED table is that shape. Nothing is truncated:
 // a truncated set would stop denying whichever uid fell off the end.

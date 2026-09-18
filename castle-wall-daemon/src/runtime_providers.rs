@@ -273,6 +273,15 @@ pub struct SafetyNetResolution {
     pub deny_union: Vec<u32>,
 }
 
+#[cfg(any(target_os = "linux", test))]
+impl SafetyNetResolution {
+    /// The in-process retention floor is the complete union, including when
+    /// the installed scope is host-wide and names no individual uid.
+    fn retained_deny_uids(&self) -> &[u32] {
+        &self.deny_union
+    }
+}
+
 /// Resolve the safety net's scope from the three sources of memo D1b.
 ///
 /// SOURCES:
@@ -664,14 +673,8 @@ fn admitted_identity(decision_engine: &DecisionEngine) -> Option<(u32, Option<u3
         .map(|agent| (agent, snapshot.confined_gate_uid))
 }
 
-/// The PR-3 sweep, as a HOOK.
-///
-/// PIN: this is a NO-OP in Part A and PR-3 fills it
-/// (`Review/Sanctuary/Linux_SafetyNet_PR3_Escalation_Packet_2026-09-17.md`, design
-/// memo D5). Until then the failed-install rows record their outcome in the audit
-/// state and the private register row
-/// `defect.linux-safety-net-legacy-history-with-failed-install-is-fail-open` owns
-/// the residual. It is called here,
+/// The PR-3 sweep hook. It is intentionally empty in Part A.
+/// The private register owns the remaining acceptance bound. It is called here,
 /// at the exact sites memo D1b step 7 names, so PR-3 changes one function body
 /// instead of finding five call sites: after a FAILED install on the four install
 /// rows, and before the exit on both nft-indeterminate rows. It is NEVER called on
@@ -955,19 +958,9 @@ impl ComponentProvider for NftablesTableProvider {
                         // table we cannot prove is ours (RefuseForeign, which has
                         // no such proof, still never installs deny-all).
                         //
-                        // GF1.2 fail-closed post-condition: the deny-all install
-                        // is REQUIRED, not best-effort. If it FAILS, the drifted
-                        // (possibly `policy accept`) table would otherwise stay
-                        // live while we refuse -- a fail-OPEN residual. Escalate
-                        // to the strongest available fail-closed action: delete
-                        // the drifted table by name so NO live `policy accept`
-                        // castle path can remain (the daemon refuses readiness,
-                        // so no agent is launched behind the table-less host).
-                        // Post-condition after this block, install-ok or not: a
-                        // live `policy accept` sanctuary-castle table never
-                        // remains. If BOTH the net install and the escalating
-                        // delete fail, the kernel state is genuinely
-                        // indeterminate and the loud refusal says so.
+                        // A net-install failure refuses readiness and retains the
+                        // table for the disarm verb. This acquisition path never
+                        // deletes a table by name; D5 owns the separate escalation.
                         // MEMO D1b STEP 7, the two BOOT rows, which differ only in
                         // whether this boot's history is known:
                         //
@@ -1006,33 +999,38 @@ impl ComponentProvider for NftablesTableProvider {
                             &resolution.scope,
                             &resolution.reason,
                         );
-                        let refuse_detail = match drift_enforce_fail_closed(
+                        let (refuse_detail, net_installed) = match drift_enforce_fail_closed(
                             || crate::nftables::install_deny_all_safety_net(&resolution.scope),
                             &resolution.kill_set,
                         ) {
-                            DriftFailClosedOutcome::NetInstalled => format!(
-                                "journal marks an owned table but the live table no longer \
+                            DriftFailClosedOutcome::NetInstalled => (
+                                format!(
+                                    "journal marks an owned table but the live table no longer \
                                  matches the captured identity; installed the safety net and \
                                  refusing to adopt or clobber the drifted table: {err}. \
                                  {scope_sentence}"
+                                ),
+                                true,
                             ),
-                            DriftFailClosedOutcome::InstallFailedSweepHooked { net_err } => {
+                            DriftFailClosedOutcome::InstallFailedSweepHooked { net_err } => (
                                 format!(
-                                    "journal marks an owned table but the live table drifted, and \
-                                     the safety net FAILED to install ({net_err}); the castle \
-                                     table is left standing (deletion is never a recovery \
-                                     action; the disarm verb owns it); refusing readiness: \
-                                     {err}. {scope_sentence}"
-                                )
-                            }
+                                    "owned kernel runtime could not be verified; safety net \
+                                     installation did not complete ({net_err}); refusing \
+                                     readiness: {err}. {}",
+                                    crate::nftables::SAFETY_NET_REPAIR_ORDER
+                                ),
+                                false,
+                            ),
                         };
                         let refuse_detail = match persist_failure {
                             None => refuse_detail,
+                            Some(persist_err) if net_installed => format!(
+                                "{refuse_detail} The confined history could not be written to \
+                                 the journal ({persist_err}); the next start retries the write."
+                            ),
                             Some(persist_err) => format!(
                                 "{refuse_detail} The confined history could not be written to \
-                                 the journal ({persist_err}); the net is installed anyway, \
-                                 because installing it makes no uid live, and the next start \
-                                 retries the write."
+                                 the journal ({persist_err})."
                             ),
                         };
                         drop(lock);
@@ -1180,9 +1178,9 @@ impl ComponentProvider for NftablesTableProvider {
                         );
                         drop(lock);
                         return Err(acquire_failed(format!(
-                            "owned sanctuary-castle table vanished while the journal still \
-                             asserts ownership, and installing the safety net FAILED (kernel \
-                             egress state indeterminate): {err}. {scope_sentence}"
+                            "owned kernel runtime could not be verified; safety net installation \
+                             did not complete ({err}); refusing readiness. {}",
+                            crate::nftables::SAFETY_NET_REPAIR_ORDER
                         )));
                     }
                     drop(lock);
@@ -1225,9 +1223,11 @@ impl ComponentProvider for NftablesTableProvider {
             // Seed the retained deny set from the resolution this acquisition just
             // computed, so a later loss installs the net from an IN-MEMORY set rather
             // than depending on a journal read that may itself be failing.
+            // A host-wide scope has no rules, but its full union must survive
+            // for every later retry in this process.
             let seeded = resolve_net_scope_at_site(existing.as_ref(), &self.decision_engine)
-                .scope
-                .denied_uids();
+                .retained_deny_uids()
+                .to_vec();
             Ok(Box::new(NftablesTableComponent {
                 lock: Some(lock),
                 ownership,
@@ -1596,12 +1596,9 @@ fn classify_nft_ownership_probe(
 
 #[cfg(target_os = "linux")]
 impl NftablesTableComponent {
-    /// GF1.3: install the deny-all safety net once when `health()` first observes a
-    /// completed loss of the owned table, so the host is fail-CLOSED in the window
-    /// between the loss and the systemd restart. Idempotent and latched: the first
-    /// `Lost` poll installs it; later `Lost` polls short-circuit so a wedged health
-    /// loop does not re-fork `nft` every tick. A failed install is logged loudly
-    /// and the latch stays UNSET so the next poll retries (never a silent give-up).
+    /// The post-ready controller attempts the safety net after a completed
+    /// ownership loss. A successful install latches; a failed one remains
+    /// retryable on the controller interval. `health()` only reports evidence.
     /// The net's scope for THIS process, from the retained in-memory deny set unioned
     /// with a fresh resolution.
     ///
@@ -1631,7 +1628,8 @@ impl NftablesTableComponent {
             // resolution, which is at least as wide as this process's last kernel state.
             Err(poisoned) => poisoned.into_inner(),
         };
-        for uid in fresh.scope.denied_uids() {
+        // HostWide has no rule set; its full union is still the retained floor.
+        for &uid in fresh.retained_deny_uids() {
             if !retained.contains(&uid) {
                 retained.push(uid);
             }
@@ -1959,6 +1957,11 @@ impl AcquiredComponent for NftablesTableComponent {
         self.hook_on_startup_indeterminate();
     }
 
+    fn on_post_ready_indeterminate(&self) {
+        let kill_set = self.net_scope_from_retained_set().kill_set;
+        safety_net_sweep_hook_pr3(&kill_set, "post-ready ownership reading indeterminate");
+    }
+
     fn safety_net_audit_state(&self) -> Option<crate::nftables::SafetyNetAuditState> {
         let slot = match self.last_safety_net_state.lock() {
             Ok(guard) => guard,
@@ -2039,7 +2042,7 @@ impl AcquiredComponent for NftablesTableComponent {
             // supervisor's ordered hook-before-exit transition, which is the single
             // caller. Firing it from a health poll would run it on every poll and
             // outside that ordering.
-            ProbeOutcome::Indeterminate => ComponentHealth::ProbeUnavailable,
+            ProbeOutcome::Indeterminate => ComponentHealth::Indeterminate,
         }
     }
 
@@ -3033,6 +3036,8 @@ mod tests {
             overflow_fixture(),
         );
         assert_eq!(resolution.scope, SafetyNetScope::HostWide);
+        assert_eq!(resolution.retained_deny_uids().len(), DENY_SET_MAX + 2);
+        assert!(resolution.retained_deny_uids().contains(&59_999));
         match resolution.reason {
             SafetyNetReason::DenySetOverCapacity { count, cap } => {
                 assert_eq!(count, DENY_SET_MAX + 2);

@@ -217,13 +217,28 @@ impl DecisionEngine {
         detail: &str,
         budget: Duration,
     ) -> Result<u64, ControlAuditError> {
-        let event = serde_json::json!({
+        self.append_control_audit_bounded_with_safety_net(operation, detail, None, budget)
+    }
+
+    /// Keep the safety-net predicate as a structured sibling of `detail` in the
+    /// canonical WAL body. The signed audit drain then covers the same field.
+    pub(crate) fn append_control_audit_bounded_with_safety_net(
+        &self,
+        operation: &str,
+        detail: &str,
+        safety_net: Option<serde_json::Value>,
+        budget: Duration,
+    ) -> Result<u64, ControlAuditError> {
+        let mut event = serde_json::json!({
             "layer": crate::constants::AUDIT_LAYER,
             "operation": operation,
             "schema_version": crate::constants::SCHEMA_VERSION_V1,
             "fortress_id": self.fortress_id,
             "detail": detail,
         });
+        if let Some(state) = safety_net {
+            event["safety_net"] = state;
+        }
         let event_canonical_json = crate::manifest::canonical_json::canonicalize(&event)
             .map_err(ControlAuditError::Canonicalize)?;
         let wal = self
@@ -721,6 +736,46 @@ fn cancellable_lock<'a, T>(
 mod mutation_tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn loss_audit_keeps_the_tagged_predicate_separate_from_detail() {
+        let dir = TempDir::new().unwrap();
+        let wal = Arc::new(Mutex::new(
+            WalWriter::open(&dir.path().join("audit.wal")).unwrap(),
+        ));
+        let ring = Arc::new(Mutex::new(AuditRingBuffer::new(
+            1024 * 1024,
+            Duration::from_secs(60),
+        )));
+        let engine = DecisionEngine::new("f".to_string(), None, Some(Arc::clone(&wal)), ring);
+        engine
+            .append_control_audit_bounded_with_safety_net(
+                "kernel_runtime_lost",
+                "reason=lost",
+                Some(serde_json::json!({"state": "install_failed"})),
+                FAILURE_AUDIT_BUDGET,
+            )
+            .unwrap();
+        engine
+            .append_control_audit_bounded_with_safety_net(
+                "kernel_runtime_lost",
+                "reason=retry",
+                Some(serde_json::json!({"state": "not_attempted"})),
+                FAILURE_AUDIT_BUDGET,
+            )
+            .unwrap();
+        let entries = wal.lock().unwrap().snapshot_after(None, 10).unwrap();
+        let states: Vec<String> = entries
+            .iter()
+            .map(|entry| {
+                let row: serde_json::Value =
+                    serde_json::from_str(&entry.event_canonical_json).unwrap();
+                assert!(row["detail"].as_str().unwrap().starts_with("reason="));
+                row["safety_net"]["state"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(states, ["install_failed", "not_attempted"]);
+    }
 
     #[test]
     fn poisoned_ring_is_rejected_before_durable_authorization_receipt() {

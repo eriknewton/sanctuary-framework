@@ -615,14 +615,18 @@ mod start_limit_against_real_systemd {
         );
         let waited_from = Instant::now();
         let mut active_state = String::new();
+        let mut result = String::new();
         while waited_from.elapsed() < deadline {
             active_state = systemctl_property(&service, "ActiveState");
-            if active_state == "failed" {
+            result = systemctl_property(&service, "Result");
+            // A failed activation can briefly report `failed` with `exit-code`
+            // while systemd still has another start queued. Only the start-limit
+            // result proves that the restart budget has been exhausted.
+            if active_state == "failed" && result == "start-limit-hit" {
                 break;
             }
             std::thread::sleep(POLL_SPACING);
         }
-        let result = systemctl_property(&service, "Result");
         assert_eq!(
             active_state, "failed",
             "a unit whose activation keeps failing must reach a TERMINAL failed state \

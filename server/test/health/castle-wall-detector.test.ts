@@ -396,6 +396,34 @@ describe("castle-wall detector: the evidence source never throws into a health t
     // contradict the other about the same wall.
     expect(report.egress.enforcement).toBe("degraded");
   });
+
+  it("carries the daemon's tagged safety-net predicate into the report", async () => {
+    const snapshot = await detect({
+      statusFields: {
+        runtime_health: "indeterminate",
+        kernel_runtime_ready: false,
+        safety_net: {
+          state: "install_failed",
+          attempted_scope: "v2-confined-identity",
+          error: "install did not complete",
+        },
+      },
+    });
+    const report = buildHealthEvidenceReport({
+      config: {
+        execution: { environment: "local", attestation: false },
+        state: { encryption: "aes-256-gcm", integrity: "hmac-sha256" },
+        disclosure: { proof_system: "commitment-only" },
+        reputation: { export: true },
+        storage_path: tmp,
+      } as unknown as SanctuaryConfig,
+      identityCount: 1,
+      storageBackendName: "FilesystemStorage",
+      castleWall: snapshot,
+    });
+    expect(report.castle_wall.safety_net?.state).toBe("install_failed");
+    expect(report.castle_wall.status).not.toBe("active");
+  });
 });
 
 /**

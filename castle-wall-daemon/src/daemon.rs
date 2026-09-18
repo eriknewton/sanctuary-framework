@@ -419,12 +419,14 @@ impl DaemonHandle {
     /// A report emitted while an install has failed carries `InstallFailed`, so it never
     /// attests to a protection that is not in place.
     /// Must match the `safety_net` object on the `kernel_runtime_lost` WAL row.
-    pub fn safety_net_audit_state(&self) -> crate::nftables::SafetyNetAuditState {
-        self.enforcement
-            .as_ref()
-            .and_then(|runtime| runtime.try_lock().ok())
-            .map(|runtime| runtime.safety_net_audit_state())
-            .unwrap_or(crate::nftables::SafetyNetAuditState::NotAttempted)
+    pub fn safety_net_audit_state(&self) -> Option<crate::nftables::SafetyNetAuditState> {
+        match &self.enforcement {
+            None => Some(crate::nftables::SafetyNetAuditState::NotAttempted),
+            Some(runtime) => runtime
+                .try_lock()
+                .ok()
+                .map(|runtime| runtime.safety_net_audit_state()),
+        }
     }
 
     pub fn kernel_runtime_health(&self) -> RuntimeHealthState {
@@ -486,6 +488,9 @@ impl DaemonHandle {
                             crate::enforcement::EnforcementStatus::NotReady {
                                 reason: crate::enforcement::NotReadyReason::HealthProbeUnavailable,
                             } => RuntimeHealthState::ProbeUnavailable,
+                            crate::enforcement::EnforcementStatus::NotReady {
+                                reason: crate::enforcement::NotReadyReason::HealthProbeIndeterminate,
+                            } => RuntimeHealthState::Indeterminate,
                             // The net is being installed or retried for a proven loss.
                             // Published as its own state so the supervisor's exit arm is not
                             // reached while the attempt is outstanding. Must match
@@ -546,6 +551,11 @@ impl DaemonHandle {
         // arriving in the first health interval reads a real observation rather
         // than "nothing published yet".
         self.runtime_health.publish(self.kernel_runtime_health());
+        if let Some(safety_net) = self.safety_net_audit_state() {
+            self.runtime_health.publish_safety_net(safety_net);
+        } else {
+            self.runtime_health.clear_safety_net();
+        }
         loop {
             // Fatal wins over normal shutdown even when the IPC handler sets
             // both atomics before this thread is scheduled.
@@ -568,6 +578,11 @@ impl DaemonHandle {
             if last_health.elapsed() >= health_interval {
                 last_health = Instant::now();
                 let observed = self.kernel_runtime_health();
+                if let Some(safety_net) = self.safety_net_audit_state() {
+                    self.runtime_health.publish_safety_net(safety_net);
+                } else {
+                    self.runtime_health.clear_safety_net();
+                }
                 // The supervisor is the SOLE writer of this view; status IPC only
                 // reads it. That is what removes the per-status-request `nft` fork
                 // and stops runtime-mutex contention from being read as loss.
@@ -580,9 +595,21 @@ impl DaemonHandle {
                         consecutive_unavailable = consecutive_unavailable.saturating_add(1);
                         if consecutive_unavailable >= MAX_CONSECUTIVE_UNAVAILABLE_HEALTH_READINGS {
                             let reason = crate::enforcement::NotReadyReason::HealthProbeUnavailable;
-                            self.record_runtime_loss(reason);
+                            self.record_runtime_loss(reason, false);
                             return SupervisionOutcome::KernelRuntimeLost(reason);
                         }
+                    }
+                    RuntimeHealthState::Indeterminate => {
+                        // No kernel mutation follows from an absent answer. The
+                        // hook is nevertheless an ordered step before exit.
+                        if let Some(runtime) = &self.enforcement {
+                            if let Ok(runtime) = runtime.lock() {
+                                runtime.hook_post_ready_indeterminate();
+                            }
+                        }
+                        let reason = crate::enforcement::NotReadyReason::HealthProbeIndeterminate;
+                        self.record_runtime_loss(reason, false);
+                        return SupervisionOutcome::KernelRuntimeLost(reason);
                     }
                     // RECOVERING: a component proved its resource lost and the safety
                     // net is being installed or retried for it RIGHT NOW, while this
@@ -595,14 +622,14 @@ impl DaemonHandle {
                     // attempt. It is NOT readiness, so nothing downstream reads this as
                     // enforcing.
                     RuntimeHealthState::Recovering(reason) => {
-                        self.record_runtime_loss(reason);
+                        self.record_runtime_loss(reason, true);
                         consecutive_unavailable = 0;
                     }
                     RuntimeHealthState::Lost(reason) => {
                         // A PROVEN loss with no recovery attempt outstanding is acted on
                         // immediately: no grace, no budget. Only the indeterminate arm
                         // above and the recovering arm are retried.
-                        self.record_runtime_loss(reason);
+                        self.record_runtime_loss(reason, false);
                         return SupervisionOutcome::KernelRuntimeLost(reason);
                     }
                 }
@@ -614,27 +641,36 @@ impl DaemonHandle {
     /// fsync-backed `kernel_runtime_lost` WAL record. Shared by the proven-loss
     /// and exhausted-indeterminate-budget arms so both routes out of supervision
     /// leave identical evidence.
-    fn record_runtime_loss(&self, reason: crate::enforcement::NotReadyReason) {
+    fn record_runtime_loss(&self, reason: crate::enforcement::NotReadyReason, recovering: bool) {
         self.live_status
             .update(LifecyclePhase::Degraded, DaemonRuntimeState::Degraded);
-        self.runtime_health
-            .publish(RuntimeHealthState::Lost(reason));
+        // Recovery retains the lock and owns the retry. The published state must
+        // preserve that fact until an exit arm actually runs.
+        self.runtime_health.publish(if recovering {
+            RuntimeHealthState::Recovering(reason)
+        } else {
+            RuntimeHealthState::Lost(reason)
+        });
         // The tagged `safety_net` state rides on the SAME row as the loss reason, so a
         // reader never has to infer the protection from the fact that a loss happened.
-        // `NotAttempted` when no runtime is held or no install was tried; `InstallFailed`
-        // when one was tried and did not take, which is what stops this row from
-        // attesting to a protection that is not in place.
-        let safety_net = self
-            .enforcement
-            .as_ref()
-            .and_then(|runtime| runtime.try_lock().ok())
-            .map(|runtime| runtime.safety_net_audit_state())
-            .unwrap_or(crate::nftables::SafetyNetAuditState::NotAttempted);
-        if let Err(audit_err) = self.decision_engine.append_control_audit_bounded(
-            "kernel_runtime_lost",
-            &format!("reason={reason:?} safety_net={}", safety_net.to_json()),
-            crate::decision::FAILURE_AUDIT_BUDGET,
-        ) {
+        // `NotAttempted` means no install was tried; `InstallFailed` means an
+        // attempt did not take. If the runtime is contended, omit the field
+        // rather than claim a transition from a stale observation.
+        let safety_net = self.safety_net_audit_state();
+        if let Some(state) = &safety_net {
+            self.runtime_health.publish_safety_net(state.clone());
+        } else {
+            self.runtime_health.clear_safety_net();
+        }
+        if let Err(audit_err) = self
+            .decision_engine
+            .append_control_audit_bounded_with_safety_net(
+                "kernel_runtime_lost",
+                &format!("reason={reason:?}"),
+                safety_net.map(|state| state.to_json()),
+                crate::decision::FAILURE_AUDIT_BUDGET,
+            )
+        {
             // The capability is already lost, so there is no mutation to roll
             // back. Do not hide the audit failure: exit/restart remains mandatory
             // and systemd captures this diagnostic.
@@ -1079,6 +1115,13 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     } else {
         RuntimeHealthState::NoRuntime
     });
+    runtime_health.publish_safety_net(
+        enforcement
+            .as_ref()
+            .and_then(|runtime| runtime.lock().ok())
+            .map(|runtime| runtime.safety_net_audit_state())
+            .unwrap_or(crate::nftables::SafetyNetAuditState::NotAttempted),
+    );
 
     // Activation includes supervisor readiness delivery. Do not publish the
     // Running phase until that final gate succeeds; authenticated status during
@@ -1706,19 +1749,51 @@ mod tests {
             // that a loss happened. This fixture holds no nftables component that can
             // install one, so the honest value is `not_attempted` — and asserting that
             // is what proves the row does not claim an install it never made.
-            assert!(
-                loss.event_canonical_json.contains("safety_net="),
-                "the loss row must carry the tagged safety-net state: {}",
-                loss.event_canonical_json
-            );
-            assert!(
-                loss.event_canonical_json.contains("not_attempted"),
-                "a row from a runtime with no installer must say nothing was attempted: {}",
-                loss.event_canonical_json
-            );
+            let row: serde_json::Value =
+                serde_json::from_str(&loss.event_canonical_json).expect("canonical WAL row");
+            assert_eq!(row["safety_net"]["state"], "not_attempted");
+            assert_eq!(row["detail"], format!("reason=ComponentLost({target:?})"));
 
             handle.stop().expect("stop");
         }
+    }
+
+    #[test]
+    fn terminal_nft_indeterminate_runs_its_hook_before_supervision_exits() {
+        use crate::enforcement::{ComponentHealth, NotReadyReason};
+
+        let dir = TempDir::new().unwrap();
+        let (config, _signing) = fresh_config_in(&dir);
+        let mut handle = boot(config).expect("boot");
+        let (runtime, probe, hook_calls) = EnforcementRuntime::all_ready_with_indeterminate_probe();
+        handle.set_enforcement_for_test(runtime);
+        *probe.lock().unwrap() = ComponentHealth::Indeterminate;
+
+        assert_eq!(
+            handle.supervise_until_shutdown(Duration::ZERO, Duration::ZERO),
+            SupervisionOutcome::KernelRuntimeLost(NotReadyReason::HealthProbeIndeterminate)
+        );
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+        handle.stop().expect("stop");
+    }
+
+    #[test]
+    fn a_recovery_audit_preserves_the_published_recovering_state() {
+        use crate::enforcement::{ComponentKind, NotReadyReason};
+
+        let dir = TempDir::new().unwrap();
+        let (config, _signing) = fresh_config_in(&dir);
+        let handle = boot(config).expect("boot");
+        let reason = NotReadyReason::SafetyNetRecovering(ComponentKind::NftablesTable);
+        handle.record_runtime_loss(reason, true);
+        assert_eq!(
+            handle
+                .runtime_health
+                .read(crate::runtime_health::STATUS_FRESHNESS_WINDOW)
+                .state,
+            RuntimeHealthState::Recovering(reason)
+        );
+        handle.stop().expect("stop");
     }
 
     #[test]
