@@ -1,0 +1,70 @@
+name: Linux Internal Package Structure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/linux-package-structure.yml'
+      - 'castle-wall-daemon/packaging/ubuntu/**'
+      - 'castle-wall-daemon/Cargo.lock'
+      - 'castle-wall-daemon/Cargo.toml'
+      - 'castle-wall-daemon/src/**'
+      - 'castle-wall-daemon/systemd/sanctuary-castle-wall.service'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/linux-package-structure.yml'
+      - 'castle-wall-daemon/packaging/ubuntu/**'
+      - 'castle-wall-daemon/Cargo.lock'
+      - 'castle-wall-daemon/Cargo.toml'
+      - 'castle-wall-daemon/src/**'
+      - 'castle-wall-daemon/systemd/sanctuary-castle-wall.service'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  internal-package-structure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # nftables supplies the runtime executable that the package maps through
+      # dpkg-query. The two -dev inputs are build-only and never copied into
+      # the generated Depends field.
+      - name: Install native build dependencies
+        uses: ./.github/actions/apt-install-resilient
+        timeout-minutes: 22
+        with:
+          packages: nftables libnetfilter-queue-dev libnfnetlink-dev
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned 2026-06-16
+        with:
+          toolchain: 1.95.0
+
+      - name: Build internal structural artifact
+        run: |
+          bash castle-wall-daemon/packaging/ubuntu/build-deb.sh \
+            --output "$RUNNER_TEMP/sanctuary-linux-package"
+
+      - name: Assert package structure only
+        run: |
+          bash castle-wall-daemon/packaging/ubuntu/assert-structure.sh \
+            --artifact-dir "$RUNNER_TEMP/sanctuary-linux-package"
+
+      # This upload is CI retention for review. It is not a release, registry
+      # publication, install action, or drill result.
+      - name: Retain internal structural artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sanctuary-linux-package-structure-${{ github.run_id }}
+          path: ${{ runner.temp }}/sanctuary-linux-package
+          retention-days: 7
+          if-no-files-found: error
