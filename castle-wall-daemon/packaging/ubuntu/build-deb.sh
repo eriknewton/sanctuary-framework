@@ -35,7 +35,7 @@ crate_dir="$(cd -- "$script_dir/../.." && pwd -P)"
 repo_root="$(cd -- "$crate_dir/.." && pwd -P)"
 unit_source="$crate_dir/systemd/sanctuary-castle-wall.service"
 
-for command in cargo dpkg dpkg-deb dpkg-query git ldd rustc sha256sum tar; do
+for command in cargo dpkg dpkg-deb dpkg-query git ldd readlink rustc sha256sum tar; do
   command -v "$command" >/dev/null 2>&1 || die "required command missing: $command"
 done
 [[ "$(uname -s)" == "Linux" ]] || die "Ubuntu/Linux build host required"
@@ -68,11 +68,18 @@ binary="$target_dir/release/castle-wall-daemon"
 
 declare -A dependency_set=()
 add_debian_owner() {
-  local filesystem_path="$1"
+  local filesystem_path="$1" canonical_path
   local owner_line owner
-  owner_line="$(dpkg-query -S -- "$filesystem_path" 2>/dev/null | head -n 1)" \
-    || die "no Debian package owns required runtime path: $filesystem_path"
-  [[ -n "$owner_line" ]] || die "no Debian package owns required runtime path: $filesystem_path"
+  # On usr-merged Ubuntu, ldd can report a /lib alias while dpkg records the
+  # owner at /usr/lib. Resolve every real runtime input first; an unresolved
+  # path still fails closed rather than being omitted from Depends.
+  canonical_path="$(readlink -f -- "$filesystem_path")" \
+    || die "could not canonicalize required runtime path: $filesystem_path"
+  [[ -e "$canonical_path" ]] || die "required runtime path does not exist: $filesystem_path"
+  owner_line="$(dpkg-query -S -- "$canonical_path" 2>/dev/null | head -n 1)" \
+    || die "no Debian package owns required runtime path: $canonical_path (from $filesystem_path)"
+  [[ -n "$owner_line" ]] \
+    || die "no Debian package owns required runtime path: $canonical_path (from $filesystem_path)"
   # dpkg-query's separator is ': '; retaining a possible ':amd64' suffix makes
   # the generated dependency unambiguous on the Ubuntu architecture we build.
   owner="${owner_line%%: *}"
@@ -93,13 +100,13 @@ done < <(ldd "$binary" | awk '$1 ~ /^\// { print $1; next } $3 ~ /^\// { print $
 # host paths through dpkg-query too, rather than hard-coding package names.
 systemctl_path=/usr/bin/systemctl
 [[ -x "$systemctl_path" ]] || die "systemctl was not found on the Ubuntu build host"
-add_debian_owner "$(readlink -f -- "$systemctl_path")"
+add_debian_owner "$systemctl_path"
 [[ -n "${dependency_set[systemd]:-}" || -n "${dependency_set[systemd:amd64]:-}" ]] \
   || die "systemctl was not mapped to a Debian systemd package"
 found_nft=false
 for executable in /usr/sbin/nft /usr/bin/nft; do
   if [[ -x "$executable" ]]; then
-    add_debian_owner "$(readlink -f -- "$executable")"
+    add_debian_owner "$executable"
     found_nft=true
     break
   fi
