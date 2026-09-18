@@ -26,6 +26,10 @@ daemon or concurrent root provisioning actor; hooks cannot prove that process
 or transaction exclusion. Provisioned package upgrades/removal, trusted CLI
 delivery and target-host Linux acceptance remain separate work.
 
+The public repository's CI retains the inert internal `.deb` and lifecycle
+evidence as downloadable Actions artifacts for seven days. This is review
+visibility, not confidential storage, a package publication, or a release.
+
 Example build command (builds only; it does not install):
 
 ```bash

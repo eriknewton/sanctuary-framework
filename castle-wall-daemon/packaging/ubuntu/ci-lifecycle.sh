@@ -248,6 +248,13 @@ attempt_refusal() {
   snapshot "$label"
 }
 
+assert_fresh_refusal_did_not_unpack() {
+  [[ "$(status | head -n1)" == 'install ok not-installed' && "$(status | tail -n1)" == NO_VERSION ]] \
+    || die "fresh refusal left an unadmitted dpkg status"
+  [[ ! -e "$daemon" && ! -L "$daemon" && ! -e "$unit_file" && ! -L "$unit_file" ]] \
+    || die "fresh refusal unpacked package payload"
+}
+
 snapshot preflight
 assert_absent
 python3 - "$script_dir/lifecycle-guard.py" <<'PY'
@@ -276,9 +283,12 @@ case "$scenario" in
     [[ "$(grep -c '^NeedDaemonReload=' "$upgrade_snapshot")" == 1 ]] \
       || die "upgrade manager observation incomplete"
     upgrade_reload="$(sed -n 's/^NeedDaemonReload=//p' "$upgrade_snapshot")"
+    upgrade_load="$(sed -n 's/^LoadState=//p' "$upgrade_snapshot")"
+    upgrade_unit_file="$(sed -n 's/^UnitFileState=//p' "$upgrade_snapshot")"
     [[ "$upgrade_reload" == yes || "$upgrade_reload" == no ]] \
       || die "real manager did not expose an exact daemon-reload state"
-    printf 'upgrade_need_daemon_reload=%s\n' "$upgrade_reload" > "$evidence/stale-manager-coverage.txt"
+    printf 'upgrade_load_state=%s\nupgrade_unit_file_state=%s\nupgrade_need_daemon_reload=%s\n' \
+      "$upgrade_load" "$upgrade_unit_file" "$upgrade_reload" > "$evidence/stale-manager-coverage.txt"
     [[ "$upgrade_reload" == yes ]] \
       || printf 'stale_upgrade_unexercised=manager_did_not_report_yes\n' >> "$evidence/stale-manager-coverage.txt"
     dpkg --install "$v2" > "$evidence/upgrade-v2.stdout" 2> "$evidence/upgrade-v2.stderr"
@@ -305,6 +315,8 @@ case "$scenario" in
     manager_fragment="$(sed -n 's/^FragmentPath=//p' "$manager_snapshot")"
     manager_unit_file="$(sed -n 's/^UnitFileState=//p' "$manager_snapshot")"
     manager_reload="$(sed -n 's/^NeedDaemonReload=//p' "$manager_snapshot")"
+    printf 'post_remove_load_state=%s\npost_remove_unit_file_state=%s\npost_remove_need_daemon_reload=%s\n' \
+      "$manager_load" "$manager_unit_file" "$manager_reload" >> "$evidence/stale-manager-coverage.txt"
     [[ -n "$manager_load" && ( "$manager_reload" == yes || "$manager_reload" == no ) ]] \
       || die "post-removal manager observation incomplete"
     if [[ "$manager_load" == not-found && -z "$manager_fragment" \
@@ -320,6 +332,11 @@ case "$scenario" in
     # This is the explicit operator step, never a maintainer-script action.
     systemctl daemon-reload
     snapshot operator-reloaded
+    reloaded_snapshot="$evidence/operator-reloaded/systemctl-show.txt"
+    for field in LoadState UnitFileState NeedDaemonReload; do
+      printf 'operator_reloaded_%s=%s\n' "$field" "$(sed -n "s/^$field=//p" "$reloaded_snapshot")" \
+        >> "$evidence/stale-manager-coverage.txt"
+    done
     dpkg --install "$v1" > "$evidence/reinstall.stdout" 2> "$evidence/reinstall.stderr"
     snapshot reinstalled
     assert_installed_v1
@@ -512,6 +529,81 @@ PY
     [[ ! -e "$daemon" && ! -e "$unit_file" ]] || die "ordinary purge installed package payload"
     [[ ! -e "/var/lib/dpkg/info/$package.prerm" && ! -e "/var/lib/dpkg/info/$package.postrm" ]] \
       || die "ordinary purge retained unexpected callbacks"
+    ;;
+  probe-unusable)
+    # A process-local Python fault makes the actual maintainer hook see an
+    # nft invocation failure. No host binary, PATH or global probe is changed.
+    fixture="$evidence/probe-unusable-site"
+    install -d -m 0755 "$fixture"
+    cat > "$fixture/sitecustomize.py" <<'PY'
+import subprocess
+
+original = subprocess.run
+def unavailable(argv, *args, **kwargs):
+    if isinstance(argv, (list, tuple)) and argv and argv[0] in ("/usr/sbin/nft", "/usr/bin/nft"):
+        raise OSError("isolated CI nft probe failure")
+    return original(argv, *args, **kwargs)
+subprocess.run = unavailable
+PY
+    if PYTHONPATH="$fixture" dpkg --install "$v1" > "$evidence/probe-unusable.stdout" 2> "$evidence/probe-unusable.stderr"; then
+      die "unusable nft probe unexpectedly allowed install"
+    fi
+    grep -F 'Castle Wall package guard refused: probe unavailable:' "$evidence/probe-unusable.stderr" >/dev/null \
+      || die "unusable nft probe did not produce the guard refusal"
+    snapshot probe-unusable
+    assert_fresh_refusal_did_not_unpack
+    ;;
+  nft-collision)
+    nft add table inet sanctuary-castle
+    snapshot nft-collision
+    attempt_refusal nft-collision-veto "$v1" 'Castle Wall nft table exists'
+    assert_fresh_refusal_did_not_unpack
+    ;;
+  state-unreadable)
+    [[ ! -e /var/lib/sanctuary && ! -L /var/lib/sanctuary ]] \
+      || die "state-inventory fixture root already exists"
+    install -d -m 0700 /var/lib/sanctuary
+    # Root can still read chmod 000. Inject EACCES into the hook process's
+    # exact os.scandir call instead, without changing other host processes.
+    fixture="$evidence/state-unreadable-site"
+    install -d -m 0755 "$fixture"
+    cat > "$fixture/sitecustomize.py" <<'PY'
+import os
+
+original = os.scandir
+def unreadable(path):
+    if os.fspath(path) == "/var/lib/sanctuary":
+        raise PermissionError("isolated CI state inventory failure")
+    return original(path)
+os.scandir = unreadable
+PY
+    if PYTHONPATH="$fixture" dpkg --install "$v1" > "$evidence/state-unreadable.stdout" 2> "$evidence/state-unreadable.stderr"; then
+      die "unreadable state inventory unexpectedly allowed install"
+    fi
+    grep -F 'Castle Wall package guard refused: unreadable runtime root /var/lib/sanctuary:' \
+      "$evidence/state-unreadable.stderr" >/dev/null \
+      || die "unreadable state inventory did not produce the guard refusal"
+    snapshot state-unreadable
+    assert_fresh_refusal_did_not_unpack
+    ;;
+  remove-veto)
+    dpkg --install "$v1" > "$evidence/install-v1.stdout" 2> "$evidence/install-v1.stderr"
+    assert_installed_v1
+    trace_python_hook "/var/lib/dpkg/info/$package.prerm" old-prerm
+    [[ ! -e /etc/sanctuary && ! -L /etc/sanctuary ]] \
+      || die "remove-veto fixture root already exists"
+    install -d -m 0755 /etc/sanctuary
+    printf 'dummy collision\n' > /etc/sanctuary/castle-wall.env
+    chmod 0600 /etc/sanctuary/castle-wall.env
+    if dpkg --remove "$package" > "$evidence/remove-veto.stdout" 2> "$evidence/remove-veto.stderr"; then
+      die "remove with provisioned environment unexpectedly succeeded"
+    fi
+    grep -F 'Castle Wall package guard refused: Castle Wall environment present' \
+      "$evidence/remove-veto.stderr" >/dev/null || die "remove did not hit guard veto"
+    assert_phase_calls 'old-prerm remove'
+    snapshot remove-veto
+    assert_installed_v1
+    [[ -f /etc/sanctuary/castle-wall.env ]] || die "remove veto lost colliding environment"
     ;;
   *) die "unknown isolated scenario: $scenario" ;;
 esac

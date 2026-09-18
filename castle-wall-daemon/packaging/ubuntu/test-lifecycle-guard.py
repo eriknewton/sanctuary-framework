@@ -2,9 +2,11 @@
 """Focused parser/decision tests; real dpkg/systemd acceptance runs in CI."""
 
 import json
+import io
 import os
 import runpy
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +22,27 @@ ARCHIVE = runpy.run_path(str(Path(__file__).with_name("assert-archive.py")))
 
 
 class GuardTests(unittest.TestCase):
+    def test_archive_root_requires_exact_directory_custody(self):
+        def inspect(name, mode, uid=0, directory=True):
+            stream = io.BytesIO()
+            with tarfile.open(fileobj=stream, mode="w:") as tar:
+                root = tarfile.TarInfo(name)
+                root.type = tarfile.DIRTYPE if directory else tarfile.REGTYPE
+                root.mode, root.uid, root.gid = mode, uid, 0
+                tar.addfile(root, io.BytesIO(b"") if not directory else None)
+            with patch.object(ARCHIVE["archive"].__globals__["subprocess"], "run",
+                              return_value=SimpleNamespace(stdout=stream.getvalue())):
+                return ARCHIVE["archive"](Path("unused.deb"), "--fsys-tarfile")
+
+        self.assertEqual(inspect(".", 0o755), {})
+        self.assertEqual(inspect("./", 0o755), {})
+        for name, mode, uid, directory in ((".", 0o777, 0, True),
+                                           (".", 0o755, 1, True),
+                                           (".", 0o755, 0, False)):
+            with self.subTest(name=name, mode=mode, uid=uid, directory=directory):
+                with self.assertRaises(ValueError):
+                    inspect(name, mode, uid, directory)
+
     def test_runtime_depends_rejects_dev_relations_and_whitespace(self):
         script = Path(__file__).with_name("assert-structure.sh")
         for field in ("libc6, libfixture-dev", "libc6, libfixture-dev (>= 1)",

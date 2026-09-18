@@ -48,11 +48,19 @@ def validate_runtime_depends(depends):
 def archive(deb, option):
     result = subprocess.run(["dpkg-deb", option, str(deb)], capture_output=True, check=True)
     answer = {}
+    saw_root = False
     with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as tar:
         for entry in tar:
+            # dpkg-deb can emit the archive root as `.` rather than `./`.
+            # It is not payload, but still must have exact safe metadata.
+            if entry.name in (".", "./"):
+                if saw_root or not entry.isdir() or entry.uid != 0 or entry.gid != 0 or (entry.mode & 0o7777) != 0o755:
+                    fail("unsafe or duplicate archive root")
+                saw_root = True
+                continue
             name = entry.name.removeprefix("./").rstrip("/")
             if not name:
-                continue
+                fail("unexpected empty archive path")
             if name in answer:
                 fail(f"duplicate archive entry: {name}")
             if not entry.isfile() and not entry.isdir():

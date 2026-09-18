@@ -84,6 +84,41 @@ jobs:
             echo 'planted guard/source drift was accepted' >&2
             exit 1
           fi
+          sed -i 's/NFT_TABLE = "wrong-table"/NFT_TABLE = "sanctuary-castle"/' \
+            "$negative/castle-wall-daemon/packaging/ubuntu/lifecycle-guard.py"
+          sed -i 's/pub const CASTLE_FAMILY: &str = "inet";/pub const CASTLE_FAMILY: \&str = "ip";/' \
+            "$negative/castle-wall-daemon/src/nftables.rs"
+          if python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py"; then
+            echo 'planted daemon nft-family drift was accepted' >&2
+            exit 1
+          fi
+          sed -i 's/pub const CASTLE_FAMILY: \&str = "ip";/pub const CASTLE_FAMILY: \&str = "inet";/' \
+            "$negative/castle-wall-daemon/src/nftables.rs"
+          sed -i '0,/add table {CASTLE_FAMILY} {castle_table}/s//add table ip {castle_table}/' \
+            "$negative/castle-wall-daemon/src/nftables.rs"
+          if python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py"; then
+            echo 'planted daemon table-construction drift was accepted' >&2
+            exit 1
+          fi
+          cat > "$negative/misleading-Cargo.toml" <<'TOML'
+          [unrelated]
+          version = "99.0.0"
+          [package]
+          name = "castle-wall-daemon"
+          version = "0.1.0"
+          TOML
+          [[ "$(bash "$source/build-deb.sh" --check-package-version "$negative/misleading-Cargo.toml")" == '0.1.0' ]] \
+            || { echo 'earlier non-package version was selected' >&2; exit 1; }
+          printf '[unrelated]\nversion = "99.0.0"\n' > "$negative/missing-package-version.toml"
+          if bash "$source/build-deb.sh" --check-package-version "$negative/missing-package-version.toml"; then
+            echo 'missing package version was accepted' >&2
+            exit 1
+          fi
+          printf '[package]\nversion = 12\n' > "$negative/invalid-package-version.toml"
+          if bash "$source/build-deb.sh" --check-package-version "$negative/invalid-package-version.toml"; then
+            echo 'non-string package version was accepted' >&2
+            exit 1
+          fi
           deb=("$RUNNER_TEMP"/sanctuary-linux-package/revision-1/*.deb)
           dpkg-deb --raw-extract "${deb[0]}" "$negative/tampered"
           sed -i '/^Depends: /s/$/, libfixture-dev/' "$negative/tampered/DEBIAN/control"
@@ -93,7 +128,7 @@ jobs:
             echo 'shell -dev dependency check accepted the planted field' >&2
             exit 1
           fi
-          for planted_depends in 'libc6, libfixture-dev (>= 1)' 'libc6, libfixture-dev   , libmnl0'; do
+          for planted_depends in 'libc6, libfixture-dev (>= 1)' 'libc6, libfixture-dev   , libmnl0' $'libc6, libmnl0\n libfixture-dev'; do
             if bash "$source/assert-structure.sh" --check-depends "$planted_depends"; then
               echo 'shell -dev dependency check accepted relation or whitespace syntax' >&2
               exit 1
@@ -110,8 +145,9 @@ jobs:
           fi
           rm -- "$source/untracked-negative-fixture"
 
-      # This upload is CI retention for review. It is not a release, registry
-      # publication, install action, or drill result.
+      # Public-repository Actions artifacts are downloadable to permitted
+      # viewers for seven days. This is review retention of an inert internal
+      # artifact, not confidential storage, a release, or an install action.
       - name: Retain internal structural artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -127,7 +163,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [happy, old-veto, new-veto, unpack-fault, legacy, dangling, local-dangling, writable-wants, env-collision, fresh-retry, fresh-purge]
+        scenario: [happy, old-veto, new-veto, unpack-fault, legacy, dangling, local-dangling, writable-wants, env-collision, fresh-retry, fresh-purge, probe-unusable, nft-collision, state-unreadable, remove-veto]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -181,6 +217,8 @@ jobs:
             "$RUNNER_TEMP/sanctuary-linux-package" \
             "$RUNNER_TEMP/sanctuary-linux-lifecycle-evidence"
 
+      # This public-repository Actions evidence is downloadable to permitted
+      # viewers for seven days; it is not confidential or an install claim.
       - name: Retain lifecycle evidence for review
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

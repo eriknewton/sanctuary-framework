@@ -7,7 +7,7 @@ set -euo pipefail
 umask 022
 
 usage() {
-  echo "usage: $0 --revision <positive-decimal> --output <empty-artifact-directory>" >&2
+  echo "usage: $0 --revision <positive-decimal> --output <empty-artifact-directory> | --check-package-version <Cargo.toml>" >&2
   exit 64
 }
 
@@ -15,6 +15,28 @@ die() {
   echo "linux package build: $*" >&2
   exit 1
 }
+
+read_package_version() {
+  python3 - "$1" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+with pathlib.Path(sys.argv[1]).open("rb") as source:
+    document = tomllib.load(source)
+package = document.get("package")
+version = package.get("version") if isinstance(package, dict) else None
+if not isinstance(version, str) or not version:
+    raise SystemExit("Cargo [package].version is missing or invalid")
+print(version)
+PY
+}
+
+if [[ "${1:-}" == --check-package-version ]]; then
+  [[ $# -eq 2 ]] || usage
+  read_package_version "$2"
+  exit 0
+fi
 
 output_dir=""
 revision=""
@@ -51,7 +73,8 @@ done
 [[ -z "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all)" ]] \
   || die "refusing dirty or untracked source inputs"
 source_commit="$(git -C "$repo_root" rev-parse HEAD)"
-source_version="$(sed -nE 's/^version = "([^"]+)"$/\1/p' "$crate_dir/Cargo.toml" | head -n 1)"
+source_version="$(read_package_version "$crate_dir/Cargo.toml")" \
+  || die "could not read daemon [package].version from Cargo.toml"
 [[ -n "$source_version" ]] || die "could not read daemon version from Cargo.toml"
 [[ "$source_version" =~ ^[0-9][0-9A-Za-z.+~-]*$ ]] || die "daemon source version is not safe for Debian package metadata"
 package_version="${source_version}-${revision}"

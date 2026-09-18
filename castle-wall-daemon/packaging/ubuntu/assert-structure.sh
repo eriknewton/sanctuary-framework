@@ -12,6 +12,8 @@ validate_runtime_depends() {
   local depends="$1" part name
   local -a parts=()
   [[ -n "$depends" ]] || { echo "runtime Depends is empty" >&2; return 1; }
+  [[ "$depends" != *$'\n'* && "$depends" != *$'\r'* ]] \
+    || { echo "runtime Depends must be a single line" >&2; return 1; }
   [[ "$depends" != ,* && "$depends" != *, && "$depends" != *,,* ]] \
     || { echo "runtime Depends has an empty package token" >&2; return 1; }
   IFS=',' read -r -a parts <<< "$depends"

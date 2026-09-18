@@ -56,7 +56,13 @@ def main():
         fail("fortress roots differ from unit RuntimeDirectory/StateDirectory")
     if constants.get("UNIT_PATH") != "/etc/systemd/system/sanctuary-castle-wall.service":
         fail("unit path changed outside first-slice contract")
-    if constants.get("NFT_FAMILY") != "inet":
+    family = one(r'^pub const CASTLE_FAMILY: &str = "([^"]+)";', nft, "nft family")
+    # Bind the guard to the daemon's actual table construction, not merely to
+    # another literal that could drift independently.
+    table_families = re.findall(r'(?:add|delete|create) table (\S+) \{castle_table\}', nft)
+    if not table_families or any(token != "{CASTLE_FAMILY}" for token in table_families):
+        fail("daemon table construction does not use CASTLE_FAMILY throughout")
+    if family != "inet" or constants.get("NFT_FAMILY") != family:
         fail("nft family changed outside first-slice contract")
     supported_unit_roots = (
         "/etc/systemd/system.control", "/run/systemd/system.control",
