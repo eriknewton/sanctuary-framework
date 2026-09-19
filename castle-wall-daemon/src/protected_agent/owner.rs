@@ -1144,7 +1144,9 @@ fn nonblocking_connect(socket_path: &Path, deadline: Instant) -> io::Result<Unix
         return Err(bad("socket path too long"));
     }
     for (dest, src) in addr.sun_path.iter_mut().zip(path) {
-        *dest = *src as i8;
+        // c_char is i8 on glibc x86_64 and u8 on musl and aarch64; the cast must name the
+        // platform type or the static musl build of this library fails to compile.
+        *dest = *src as libc::c_char;
     }
     let len = (std::mem::size_of::<libc::sa_family_t>() + path.len() + 1) as libc::socklen_t;
     let rc = unsafe { libc::connect(fd, &addr as *const _ as *const libc::sockaddr, len) };
