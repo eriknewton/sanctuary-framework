@@ -569,6 +569,15 @@ impl JournalAuthKey {
     fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// Separate current-boot protected-agent reservation domain. This does not
+    /// change the existing key reader, first-acquisition generation, or nft
+    /// journal envelope. Only the daemon holding this key can mint a reservation.
+    pub fn reservation_mac(&self, canonical: &[u8]) -> String {
+        let mut message = b"sanctuary.protected-agent.reservation/v1\n".to_vec();
+        message.extend_from_slice(canonical);
+        hex::encode(hmac_sha256(self.as_bytes(), &message))
+    }
 }
 
 impl Drop for JournalAuthKey {

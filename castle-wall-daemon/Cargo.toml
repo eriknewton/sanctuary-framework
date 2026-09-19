@@ -23,6 +23,29 @@ path = "src/bin/sanctuary-jail.rs"
 name = "sanctuary-plugin-launcher"
 path = "src/bin/sanctuary-plugin-launcher.rs"
 
+[[bin]]
+name = "sanctuary-stop-owner"
+path = "src/bin/sanctuary-stop-owner.rs"
+
+[[bin]]
+name = "sanctuary-protected-wait"
+path = "src/bin/sanctuary-protected-wait.rs"
+
+[[bin]]
+name = "castle-wall-prestart-v1"
+path = "src/bin/castle-wall-prestart-v1.rs"
+
+[[bin]]
+name = "castle-wall-stop-notify-v1"
+path = "src/bin/castle-wall-stop-notify-v1.rs"
+
+# Isolation-only fixed pathname connect-and-close probe. Packaging must not
+# install this binary or enable test-isolation in the shipped service build.
+[[bin]]
+name = "castle-wall-prestart-socket-probe"
+path = "src/bin/castle-wall-prestart-socket-probe.rs"
+required-features = ["test-isolation"]
+
 [features]
 # Compiles the TEST-ISOLATION seams into the crate: `LinuxRuntimePaths::isolated_under`
 # and `nftables::use_isolated_castle_table`. Integration tests that drive the real

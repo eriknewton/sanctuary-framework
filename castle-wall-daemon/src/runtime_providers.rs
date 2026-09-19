@@ -673,8 +673,7 @@ fn admitted_identity(decision_engine: &DecisionEngine) -> Option<(u32, Option<u3
         .map(|agent| (agent, snapshot.confined_gate_uid))
 }
 
-/// The PR-3 sweep hook. It is intentionally empty in Part A.
-/// The private register owns the remaining acceptance bound. It is called here,
+/// The PR-3 stop hook is called here,
 /// at the exact sites memo D1b step 7 names, so PR-3 changes one function body
 /// instead of finding five call sites: after a FAILED install on the four install
 /// rows, and before the exit on both nft-indeterminate rows. It is NEVER called on
@@ -683,11 +682,42 @@ fn admitted_identity(decision_engine: &DecisionEngine) -> Option<(u32, Option<u3
 ///
 /// `kill_set` is sources (a) and (b) only, never the live table's bindings.
 #[cfg(any(target_os = "linux", test))]
-fn safety_net_sweep_hook_pr3(kill_set: &[u32], why: &str) {
-    // Deliberately empty. Reading the arguments keeps the signature honest about
-    // what PR-3 will consume and keeps this from being optimised into nothing that
-    // a reviewer could mistake for a wired sweep.
-    let _ = (kill_set, why);
+fn safety_net_sweep_hook_pr3(
+    kill_set: &[u32],
+    attempted_scope: Option<&crate::nftables::SafetyNetScope>,
+    why: &str,
+) {
+    // Only a fresh strict live-net shape covering the *attempted* install can
+    // suppress an owner stop. A read error, different scope or foreign table
+    // has no such meaning. Indeterminate hooks install/probe nothing.
+    if let Some(scope) = attempted_scope {
+        if matches!(crate::nftables::live_net_covers_attempt(scope), Ok(true)) {
+            // SAFETY: stderr is the operator channel for the stop hook's single
+            // outcome line. This branch records that a fresh strict live net
+            // already covers the attempted install, which is the only shape that
+            // suppresses an owner stop, so the suppression must be visible.
+            eprintln!("castle-wall-daemon: stop_hook={why} owner_outcome=covered_net");
+            return;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let outcome =
+        crate::protected_agent::owner::stop_failure_for_hook(kill_set, why, attempted_scope);
+    #[cfg(not(target_os = "linux"))]
+    let outcome = {
+        let _ = kill_set;
+        crate::protected_agent::owner_outcome_unavailable()
+    };
+    let class = match outcome {
+        crate::protected_agent::StopClass::IntentAccepted => "intent_accepted",
+        crate::protected_agent::StopClass::NoOwnedRelease => "no_owned_release",
+        crate::protected_agent::StopClass::OwnerUnavailable => "owner_unavailable",
+        crate::protected_agent::StopClass::Inhibit => "inhibit",
+    };
+    // SAFETY: stderr is the operator channel for the stop hook's single outcome
+    // line. The class is the whole local record of what the owner answered, and
+    // no result transport carries it anywhere else.
+    eprintln!("castle-wall-daemon: stop_hook={why} owner_outcome={class}");
 }
 
 /// reclaim drift. See [`drift_enforce_fail_closed`].
@@ -724,6 +754,7 @@ enum DriftFailClosedOutcome {
 fn drift_enforce_fail_closed(
     install_deny_all: impl FnOnce() -> Result<(), crate::nftables::NftablesError>,
     kill_set: &[u32],
+    attempted_scope: &crate::nftables::SafetyNetScope,
 ) -> DriftFailClosedOutcome {
     match install_deny_all() {
         Ok(()) => DriftFailClosedOutcome::NetInstalled,
@@ -734,6 +765,7 @@ fn drift_enforce_fail_closed(
             // protection left to add.
             safety_net_sweep_hook_pr3(
                 kill_set,
+                Some(attempted_scope),
                 "reclaim drift: the safety net install failed before readiness was refused",
             );
             DriftFailClosedOutcome::InstallFailedSweepHooked {
@@ -752,12 +784,14 @@ fn drift_enforce_fail_closed(
 fn install_deny_all_net_for_recovery(
     install: impl FnOnce() -> Result<(), crate::nftables::NftablesError>,
     kill_set: &[u32],
+    attempted_scope: &crate::nftables::SafetyNetScope,
 ) -> bool {
     match install() {
         Ok(()) => true,
         Err(net_err) => {
             safety_net_sweep_hook_pr3(
                 kill_set,
+                Some(attempted_scope),
                 "runtime loss: the safety net install failed and will be retried",
             );
             // SAFETY: stderr is the operator channel for a kernel-egress escalation.
@@ -1050,6 +1084,7 @@ impl ComponentProvider for NftablesTableProvider {
                         let (refuse_detail, net_installed) = match drift_enforce_fail_closed(
                             || crate::nftables::install_deny_all_safety_net(&resolution.scope),
                             &resolution.kill_set,
+                            &resolution.scope,
                         ) {
                             DriftFailClosedOutcome::NetInstalled => (
                                 format!(
@@ -1222,6 +1257,7 @@ impl ComponentProvider for NftablesTableProvider {
                         // The sweep hook fires ONLY after a failed install.
                         safety_net_sweep_hook_pr3(
                             &resolution.kill_set,
+                            Some(&resolution.scope),
                             "boot-time owned-table loss: the safety net install failed",
                         );
                         drop(lock);
@@ -1825,6 +1861,7 @@ impl NftablesTableComponent {
                 });
                 safety_net_sweep_hook_pr3(
                     &resolution.kill_set,
+                    Some(&resolution.scope),
                     "startup ownership loss: the safety net install failed before the unwind",
                 );
                 // SAFETY: same operator channel; this is the branch where no protection
@@ -1850,6 +1887,7 @@ impl NftablesTableComponent {
         let kill_set = self.net_scope_from_retained_set().kill_set;
         safety_net_sweep_hook_pr3(
             &kill_set,
+            None,
             "startup ownership reading indeterminate: no install is attempted on absent evidence",
         );
     }
@@ -1944,6 +1982,7 @@ impl NftablesTableComponent {
         let installed = install_deny_all_net_for_recovery(
             || crate::nftables::install_deny_all_safety_net(&resolution.scope),
             &resolution.kill_set,
+            &resolution.scope,
         );
         // Record THIS transaction's result before the best-effort persist. A prior
         // success is never used to turn a later failed transaction into Installed.
@@ -2044,7 +2083,11 @@ impl AcquiredComponent for NftablesTableComponent {
 
     fn on_post_ready_indeterminate(&self) {
         let kill_set = self.net_scope_from_retained_set().kill_set;
-        safety_net_sweep_hook_pr3(&kill_set, "post-ready ownership reading indeterminate");
+        safety_net_sweep_hook_pr3(
+            &kill_set,
+            None,
+            "post-ready ownership reading indeterminate",
+        );
     }
 
     fn safety_net_audit_state(&self) -> Option<crate::nftables::SafetyNetAuditState> {
@@ -3594,6 +3637,7 @@ mod tests {
                 ))
             },
             &kill_set,
+            &crate::nftables::SafetyNetScope::HostWide,
         );
         match outcome {
             DriftFailClosedOutcome::InstallFailedSweepHooked { net_err } => {
@@ -3612,6 +3656,7 @@ mod tests {
                 Ok(())
             },
             &kill_set,
+            &crate::nftables::SafetyNetScope::HostWide,
         );
         assert_eq!(outcome2, DriftFailClosedOutcome::NetInstalled);
         assert!(installed.get());
@@ -3744,6 +3789,7 @@ mod tests {
                 Ok(())
             },
             &kill_set,
+            &crate::nftables::SafetyNetScope::HostWide,
         );
         assert!(first);
         let second = install_deny_all_net_for_recovery(
@@ -3752,6 +3798,7 @@ mod tests {
                 Ok(())
             },
             &kill_set,
+            &crate::nftables::SafetyNetScope::HostWide,
         );
         assert!(second);
         let third = install_deny_all_net_for_recovery(
@@ -3760,6 +3807,7 @@ mod tests {
                 Err(NftablesError::InvocationFailed("later failure".into()))
             },
             &kill_set,
+            &crate::nftables::SafetyNetScope::HostWide,
         );
         assert!(
             !third,
@@ -3791,6 +3839,7 @@ mod tests {
                     ))
                 },
                 &kill_set,
+                &crate::nftables::SafetyNetScope::HostWide,
             );
             assert!(!installed, "poll {poll} must not report an install");
         }

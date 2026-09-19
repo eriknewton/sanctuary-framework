@@ -96,6 +96,100 @@ fn unit_provisions_the_runtime_directory_for_the_ipc_socket() {
     );
 }
 
+/// Reads the stop-owner unit that ships in the crate as a source artifact.
+/// Nothing installs, enables, or starts it in this slice; see the header of
+/// `systemd/sanctuary-stop-owner.service`, which states the same bound.
+fn stop_owner_unit_text() -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("systemd/sanctuary-stop-owner.service"),
+    )
+    .expect("the stop-owner unit ships beside the daemon unit in this crate")
+}
+
+#[test]
+fn the_shipped_daemon_unit_starts_independently_of_the_stop_owner_artifact() {
+    // The stop owner refuses READY until launch artifacts that no package
+    // delivers today are installed, so the filter daemon's start must not
+    // depend on it in any direction. Failure mode if this pin is dropped: the
+    // package installs cleanly and Castle Wall simply never reaches active on
+    // a host that has the package and nothing else.
+    let daemon = unit_text();
+    assert!(
+        !daemon.contains("sanctuary-stop-owner"),
+        "the shipped daemon unit must not name the stop-owner unit, its socket, \
+         or its private state while that owner is an uninstalled artifact"
+    );
+    assert!(
+        directive_values(&daemon, "BindsTo").is_empty(),
+        "no BindsTo edge may tie filter enforcement to a unit that is not installed"
+    );
+    assert!(
+        directive_values(&daemon, "ExecStopPost").is_empty(),
+        "shutdown must not call a stop notifier that the package does not install"
+    );
+}
+
+#[test]
+fn the_stop_owner_unit_grants_no_cgroup_write_path_and_keeps_its_socket_parent_volatile() {
+    let owner = stop_owner_unit_text();
+    assert_eq!(directive_values(&owner, "User"), vec!["root"]);
+    assert_eq!(directive_values(&owner, "Group"), vec!["root"]);
+    assert_eq!(
+        directive_values(&owner, "StateDirectory"),
+        vec!["sanctuary-stop-owner"]
+    );
+    assert_eq!(directive_values(&owner, "StateDirectoryMode"), vec!["0700"]);
+    assert_eq!(
+        directive_values(&owner, "RuntimeDirectoryMode"),
+        vec!["0700"]
+    );
+    assert_eq!(
+        directive_values(&owner, "InaccessiblePaths"),
+        vec!["/var/lib/sanctuary"]
+    );
+    assert!(directive_values(&owner, "BindsTo").is_empty());
+    assert_eq!(
+        directive_values(&owner, "ReadWritePaths"),
+        vec!["/var/lib/sanctuary-stop-owner /run/sanctuary-stop-owner"]
+    );
+    // `ProtectSystem=strict` leaves `/sys` writable on its own, so the cgroup
+    // hierarchy is read-only for this unit ONLY while ProtectControlGroups is
+    // true. Failure mode if this flips: nothing visibly breaks, because the
+    // unit GAINS write access to every cgroup on the host rather than losing
+    // access to one, so the loss of the bound is silent on a running system and
+    // this assertion is the only place it shows.
+    assert_eq!(
+        directive_values(&owner, "ProtectSystem"),
+        vec!["strict"],
+        "the owner's filesystem must stay read-only except its two declared paths"
+    );
+    assert_eq!(
+        directive_values(&owner, "ProtectControlGroups"),
+        vec!["true"],
+        "a release-disabled owner is granted no writable cgroup path anywhere"
+    );
+    assert!(
+        !owner.contains("/sys/fs/cgroup"),
+        "no explicit cgroup path may be added to the owner's writable set"
+    );
+    // MUST MATCH the restart-custody invariant at the socket-bind refusal in
+    // `src/protected_agent/owner.rs` (`serve_production`): the owner refuses to
+    // start when its socket path already exists, which is safe to do only
+    // because systemd removes RuntimeDirectory= on every stop. Declaring
+    // RuntimeDirectoryPreserve here would keep a crashed run's socket inode
+    // and turn each crash into a permanent refusal to start.
+    assert_eq!(
+        directive_values(&owner, "RuntimeDirectory"),
+        vec!["sanctuary-stop-owner"],
+        "the socket parent must be systemd-owned so it is recreated empty per start"
+    );
+    assert!(
+        directive_values(&owner, "RuntimeDirectoryPreserve").is_empty(),
+        "preserving the runtime directory would carry a stale socket across a restart"
+    );
+}
+
 #[test]
 fn unit_provisions_the_durable_state_directory_for_the_ownership_journal() {
     // blocker 3: the ownership journal must live on a DURABLE, root-owned path

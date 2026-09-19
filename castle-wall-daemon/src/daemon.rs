@@ -710,7 +710,21 @@ impl DaemonHandle {
                         if let Some(runtime) = &self.enforcement {
                             if let Ok(runtime) = runtime.lock() {
                                 runtime.hook_post_ready_indeterminate();
+                            } else {
+                                // SAFETY: stderr is the operator channel for the
+                                // terminal dispatch record. These two branches are
+                                // the cases where NO provider hook runs at all, and
+                                // the distinction between a poisoned lock and an
+                                // absent runtime is what tells an operator whether
+                                // enforcement state is unknown or simply gone.
+                                eprintln!(
+                                    "castle-wall-daemon: terminal_dispatch=runtime_lock_poisoned"
+                                );
                             }
+                        } else {
+                            // SAFETY: same operator channel and the same terminal
+                            // record; no runtime exists to dispatch through.
+                            eprintln!("castle-wall-daemon: terminal_dispatch=runtime_absent");
                         }
                         let reason = crate::enforcement::NotReadyReason::HealthProbeIndeterminate;
                         self.record_runtime_loss(reason, false);

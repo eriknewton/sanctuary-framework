@@ -12,7 +12,11 @@ from pathlib import Path
 # 17d251f50514a885d0cd9666e363d19dbc963574. This source pin is not a Rust
 # parser or a claim of whole-file review. Any edit requires source review and
 # an explicit pin refresh before a package can be asserted.
-NFTABLES_SOURCE_SHA256 = "25a1266acb92a2d8c3a0f32d2552d1bd40f7a491c313a2bdfe5a6e48a08bea5a"
+# Refreshed for PR-3a (2026-09-18): the only nftables.rs change since the baseline above is
+# four `else { return None; }` arms of recognized_net_json rewritten with the `?` operator to
+# satisfy the clippy gate; two independent-family source reviews accepted it as
+# semantics-preserving before this pin moved. The guard constants it mirrors are unchanged.
+NFTABLES_SOURCE_SHA256 = "9f1d5f2b972b496ca7bcad8cfe4f054e8ee1dab0661961eabe435438823ee2a1"
 
 
 def fail(message):
