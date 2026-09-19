@@ -1,0 +1,62 @@
+# UNINSTALLED ARTIFACT. Nothing in this slice installs, enables, starts, or
+# references this unit: the Debian package builds only the filter daemon, the
+# shipped sanctuary-castle-wall.service names neither this unit nor its socket,
+# and no deployment document points at it. It ships as reviewable source for a
+# later slice that also delivers the launch artifacts the owner requires before
+# it will signal READY. Failure mode if that order is reversed: installing this
+# unit on a host without those artifacts produces a service that starts, exits
+# 1, and restarts until the start limit is reached.
+[Unit]
+Description=Sanctuary protected-agent stop owner (release disabled)
+After=local-fs.target
+StartLimitBurst=5
+StartLimitIntervalSec=600
+
+[Service]
+Type=notify
+ExecStart=/usr/local/libexec/sanctuary/sanctuary-stop-owner
+User=root
+Group=root
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=30
+TimeoutStopSec=10
+WatchdogSec=10s
+KillMode=control-group
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+StateDirectory=sanctuary-stop-owner
+StateDirectoryMode=0700
+# MUST MATCH the socket-bind refusal in `src/protected_agent/owner.rs`
+# (`serve_production`), which refuses to start when its socket path already
+# exists. That refusal is safe only because systemd removes this runtime
+# directory, socket inode included, on every stop of the unit, including the
+# stop that precedes a Restart=on-failure. Never add RuntimeDirectoryPreserve
+# here: a preserved directory carries a crashed run's socket into the next
+# start, and the owner then refuses forever instead of restarting cleanly.
+RuntimeDirectory=sanctuary-stop-owner
+RuntimeDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Effective private-parent mask is mandatory before owner READY. The daemon
+# package transaction prepares this parent even before the journal key exists.
+InaccessiblePaths=/var/lib/sanctuary
+# This release-disabled unit grants no cgroup write path. ProtectSystem=strict
+# alone does NOT achieve that: it leaves /sys writable, so omitting the cgroup
+# tree from ReadWritePaths would still hand this unit write access to every
+# cgroup on the host. ProtectControlGroups=true is what makes the hierarchy
+# read-only, so the exact-path adapter's cgroup.kill write fails with a
+# permission error, is propagated, and leaves the record INHIBIT with no signed
+# completion. Narrow installed write access to one cgroup path is an activation
+# blocker for the producer slice; it is not granted here.
+ReadWritePaths=/var/lib/sanctuary-stop-owner /run/sanctuary-stop-owner
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

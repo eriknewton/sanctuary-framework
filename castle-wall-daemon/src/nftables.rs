@@ -1278,6 +1278,19 @@ mod linux {
         }
     }
 
+    /// Strict, fresh coverage for the scope whose installation just failed.
+    pub fn live_net_covers_attempt_impl(scope: &SafetyNetScope) -> Result<bool, NftablesError> {
+        let overflow = HostOverflowUid::from_host().map_err(|e| {
+            NftablesError::InvocationFailed(format!(
+                "cannot classify live safety net without kernel.overflowuid: {e}"
+            ))
+        })?;
+        let json = run_nft(&["-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
+        Ok(super::deny_all_net_covers_scope_json(
+            &json, overflow, scope,
+        ))
+    }
+
     /// List the live castle table as `nft -j` JSON, or `None` when it is absent.
     ///
     /// FAILURE-MODE NOTE: nft reports an absent table as an invocation failure whose
@@ -1980,28 +1993,50 @@ pub fn output_chain_shape_is_ours_json(json: &str) -> bool {
 ///
 /// Pure and cross-platform so the recogniser is unit-testable without a kernel.
 pub fn is_deny_all_safety_net_json(json: &str, overflow: HostOverflowUid) -> bool {
+    recognized_net_json(json, overflow).is_some()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecognizedNet {
+    HostWide,
+    Identity(Vec<u32>),
+}
+
+/// Coverage uses the identical strict parser that authorizes disarm recognition.
+pub fn deny_all_net_covers_scope_json(
+    json: &str,
+    overflow: HostOverflowUid,
+    attempted: &SafetyNetScope,
+) -> bool {
+    match (recognized_net_json(json, overflow), attempted) {
+        (Some(RecognizedNet::HostWide), _) => true,
+        (Some(RecognizedNet::Identity(live)), SafetyNetScope::Identity(attempt)) => attempt
+            .uids()
+            .iter()
+            .all(|uid| live.binary_search(uid).is_ok()),
+        _ => false,
+    }
+}
+
+fn recognized_net_json(json: &str, overflow: HostOverflowUid) -> Option<RecognizedNet> {
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
-        return false;
+        return None;
     };
-    let Some(items) = doc.get("nftables").and_then(|v| v.as_array()) else {
-        return false;
-    };
+    let items = doc.get("nftables").and_then(|v| v.as_array())?;
     let mut saw_table = false;
     let mut saw_drop_base_chain = false;
     let mut rules: Vec<&serde_json::Value> = Vec::new();
     for item in items {
-        let Some(obj) = item.as_object() else {
-            return false;
-        };
+        let obj = item.as_object()?;
         if obj.len() != 1 {
-            return false;
+            return None;
         }
         for (kind, val) in obj {
             match kind.as_str() {
                 "metainfo" => {}
                 "table" => {
                     if saw_table {
-                        return false; // more than one table object
+                        return None; // more than one table object
                     }
                     let ours = val.get("family").and_then(|v| v.as_str()) == Some(CASTLE_FAMILY)
                         && val.get("name").and_then(|v| v.as_str()) == Some(castle_table());
@@ -2009,13 +2044,13 @@ pub fn is_deny_all_safety_net_json(json: &str, overflow: HostOverflowUid) -> boo
                     // here (owner-prefixed or foreign) means this is not our net.
                     let has_any_comment = val.get("comment").is_some();
                     if !ours || has_any_comment {
-                        return false;
+                        return None;
                     }
                     saw_table = true;
                 }
                 "chain" => {
                     if saw_drop_base_chain {
-                        return false; // more than one chain
+                        return None; // more than one chain
                     }
                     let is_deny_all_base = val.get("family").and_then(|v| v.as_str())
                         == Some(CASTLE_FAMILY)
@@ -2026,7 +2061,7 @@ pub fn is_deny_all_safety_net_json(json: &str, overflow: HostOverflowUid) -> boo
                         && val.get("prio").and_then(|v| v.as_i64()) == Some(0)
                         && val.get("policy").and_then(|v| v.as_str()) == Some("drop");
                     if !is_deny_all_base {
-                        return false;
+                        return None;
                     }
                     saw_drop_base_chain = true;
                 }
@@ -2036,27 +2071,27 @@ pub fn is_deny_all_safety_net_json(json: &str, overflow: HostOverflowUid) -> boo
                         && val.get("table").and_then(|v| v.as_str()) == Some(castle_table())
                         && val.get("chain").and_then(|v| v.as_str()) == Some("output");
                     if !in_our_chain {
-                        return false;
+                        return None;
                     }
                     rules.push(val);
                 }
                 // An agent chain, set, map, flowtable, or any other object means
                 // this is NOT the safety net in either shape.
-                _ => return false,
+                _ => return None,
             }
         }
     }
     if !(saw_table && saw_drop_base_chain) {
-        return false;
+        return None;
     }
     match rules.len() {
         // V1 host-wide shape: zero rules under the drop policy.
-        0 => true,
+        0 => Some(RecognizedNet::HostWide),
         // V2 identity shape: exactly the three rules, in order.
-        NET_V2_RULE_COUNT => net_v2_rules_match(&rules, overflow),
+        NET_V2_RULE_COUNT => net_v2_rules_match(&rules, overflow).map(RecognizedNet::Identity),
         // One rule is a shape `build_deny_all_safety_net_script` never emits, and
         // a fourth rule is drift or injection.
-        _ => false,
+        _ => None,
     }
 }
 
@@ -2072,25 +2107,23 @@ const NET_V2_RULE_COUNT: usize = 3;
 /// A table carrying the same three rules in a different order is a DIFFERENT
 /// enforcement outcome (an accept ahead of the drop lets the agent out), so it
 /// must be refused, which a comment-set comparison would not do.
-fn net_v2_rules_match(rules: &[&serde_json::Value], overflow: HostOverflowUid) -> bool {
-    let Some(denied) =
-        rule_skuid_set_with_verdict(rules[0], "==", "drop", NET_RULE_COMMENT_IDENTITY, overflow)
-    else {
-        return false;
-    };
+fn net_v2_rules_match(rules: &[&serde_json::Value], overflow: HostOverflowUid) -> Option<Vec<u32>> {
+    let denied =
+        rule_skuid_set_with_verdict(rules[0], "==", "drop", NET_RULE_COMMENT_IDENTITY, overflow)?;
     if !rule_is_kernel_nd_accept(rules[1]) {
-        return false;
+        return None;
     }
-    let Some(excepted) =
-        rule_skuid_set_with_verdict(rules[2], "!=", "accept", NET_RULE_COMMENT_OTHERS, overflow)
-    else {
-        return false;
-    };
+    let excepted =
+        rule_skuid_set_with_verdict(rules[2], "!=", "accept", NET_RULE_COMMENT_OTHERS, overflow)?;
     // INVARIANT: the two sets must be EQUAL. If rule 3 excepted a wider set than
     // rule 1 denied, a uid in the difference would be accepted by rule 3 having
     // never been dropped, which is the fail-open the ordering exists to prevent;
     // a narrower rule 3 would deny an operator the net promised to spare.
-    denied == excepted
+    if denied == excepted {
+        Some(denied)
+    } else {
+        None
+    }
 }
 
 /// Parse one `meta skuid <op> { .. } <verdict>` rule and return its set, or
@@ -3143,6 +3176,16 @@ pub fn install_deny_all_safety_net(_scope: &SafetyNetScope) -> Result<(), Nftabl
 #[cfg(target_os = "linux")]
 pub fn live_table_is_deny_all_safety_net() -> Result<bool, NftablesError> {
     linux::live_table_is_deny_all_safety_net_impl()
+}
+
+#[cfg(target_os = "linux")]
+pub fn live_net_covers_attempt(scope: &SafetyNetScope) -> Result<bool, NftablesError> {
+    linux::live_net_covers_attempt_impl(scope)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn live_net_covers_attempt(_scope: &SafetyNetScope) -> Result<bool, NftablesError> {
+    Err(NftablesError::NotAvailableOnPlatform)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -4417,6 +4460,31 @@ mod tests {
         assert!(is_deny_all_safety_net_json(
             &reordered_members,
             test_overflow()
+        ));
+    }
+
+    #[test]
+    fn strict_live_net_coverage_matches_the_attempted_scope() {
+        let ov = test_overflow();
+        let host = SafetyNetScope::HostWide;
+        let narrow = identity_scope(&[60123]);
+        let wide = identity_scope(&[60123, 60124]);
+        let v1 = v1_host_wide_listing();
+        let v2 = v2_identity_listing(&[60123, 60124], &[60123, 60124]);
+        assert!(deny_all_net_covers_scope_json(&v1, ov, &host));
+        assert!(deny_all_net_covers_scope_json(&v1, ov, &wide));
+        assert!(deny_all_net_covers_scope_json(&v2, ov, &narrow));
+        assert!(deny_all_net_covers_scope_json(&v2, ov, &wide));
+        assert!(!deny_all_net_covers_scope_json(&v2, ov, &host));
+        assert!(!deny_all_net_covers_scope_json(
+            &v2_identity_listing(&[60123], &[60123]),
+            ov,
+            &wide
+        ));
+        assert!(!deny_all_net_covers_scope_json(
+            &v1.replace("\"policy\":\"drop\"", "\"policy\":\"accept\""),
+            ov,
+            &host
         ));
     }
 

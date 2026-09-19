@@ -736,11 +736,22 @@ impl EnforcementRuntime {
     /// The supervisor's terminal no-answer transition, before it releases the
     /// runtime. Only a component with an exhausted probe budget runs its hook.
     pub fn hook_post_ready_indeterminate(&self) {
+        let mut dispatched = 0usize;
         for component in &self.components {
             if component.health() == ComponentHealth::Indeterminate {
                 component.on_post_ready_indeterminate();
+                dispatched = dispatched.saturating_add(1);
             }
         }
+        let class = match dispatched {
+            0 => "no_provider_reached",
+            1 => "one_provider_dispatched",
+            _ => "multiple_providers_dispatched",
+        };
+        // SAFETY: stderr is the operator channel for the one terminal dispatch
+        // line of this transition. Its cardinality class is the evidence that
+        // exactly the components with an exhausted probe budget were reached.
+        eprintln!("castle-wall-daemon: terminal_dispatch={class}");
     }
 
     /// The tagged `safety_net` state to stamp on an audit row or a signed report.

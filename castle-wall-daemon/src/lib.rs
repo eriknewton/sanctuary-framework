@@ -38,6 +38,7 @@ pub mod nfqueue;
 pub mod nftables;
 pub mod ownership_journal;
 pub mod policy;
+pub mod protected_agent;
 pub mod runtime_health;
 pub mod runtime_lock;
 pub mod runtime_providers;
