@@ -156,8 +156,9 @@ fn the_stop_owner_unit_grants_no_cgroup_write_path_and_keeps_its_socket_parent_v
     // `ProtectSystem=strict` leaves `/sys` writable on its own, so the cgroup
     // hierarchy is read-only for this unit ONLY while ProtectControlGroups is
     // true. Failure mode if this flips: nothing visibly breaks, because the
-    // unit gains write access to every cgroup on the host rather than losing
-    // access to one, and the adapter's refusal path stops being reachable.
+    // unit GAINS write access to every cgroup on the host rather than losing
+    // access to one, so the loss of the bound is silent on a running system and
+    // this assertion is the only place it shows.
     assert_eq!(
         directive_values(&owner, "ProtectSystem"),
         vec!["strict"],

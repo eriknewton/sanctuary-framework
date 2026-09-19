@@ -1,10 +1,16 @@
-//! Stop-authority decisions, separated from the Linux-only owner that acts on
-//! them. Three different sites ask the same three questions (is a stop signal
-//! owed for this release, may this cgroup still be acted on, and is this open
-//! record owed a resumed stop), and each answer is a named state rather than a
-//! bare boolean so the acting site reads as the decision it implements. Keeping
-//! them here also makes every polarity provable on any host, while the code
-//! that performs the stop remains Linux-only.
+//! Stop-authority DECISIONS, separated from the Linux-only owner that consumes
+//! them. Three questions are asked here (is a stop signal owed for this release,
+//! does the durable identity still describe what is running, and is this open
+//! record one a resuming scan owes work to), and each answer is a named state
+//! rather than a bare boolean so a consuming site reads as the decision it
+//! implements. Keeping them here makes every polarity provable on any host.
+//!
+//! Every function in this module is pure: it reads values and returns a verdict.
+//! The owner shipped alongside it accepts stop intent, fsyncs it and answers;
+//! the execution that would act on these verdicts is not in this slice, so
+//! `MainProcessAuthority` and `ReconcileVerdict` currently have no acting site
+//! at all. They are proven here so that the slice which adds one inherits a
+//! decision that is already tested rather than writing a fresh one inline.
 use super::{
     ledger::GenerationState,
     receipt::{Generation, ManagerIdentity},
@@ -83,24 +89,30 @@ pub fn main_process_authority(
     }
 }
 
-/// Named outcomes of the owner's periodic reconciliation scan.
+/// Named verdicts a reconciliation scan reaches about ONE ledger record.
+///
+/// A verdict is a reading of records, never an execution and never a schedule.
+/// The owner in this slice runs no scan at all: it accepts intent, fsyncs it and
+/// answers, and these verdicts are the decision the scan that resumes such a
+/// record will implement when the execution slice supplies it. Nothing here is a
+/// recovery bound, and no interval anywhere promises one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReconcileVerdict {
     /// Leave the record exactly as it is.
     LeaveOpen,
-    /// A durable stop intent exists whose outcome was never recorded, so the
-    /// stop and its signed outcome are driven again.
+    /// A durable stop intent exists whose outcome was never recorded, so this
+    /// record is one a resuming scan owes work to.
     ResumeStop,
 }
 
 /// Reconciliation RESUMES work that was already authorised and fsynced; it is
 /// never itself an authority to stop something. The predicate is therefore the
 /// accepted attempt row, which both the daemon failure hook and the shutdown
-/// notifier write and fsync before any stop runs, and not the presence of a
+/// notifier write and fsync before any stop could run, and not the presence of a
 /// release. Two consequences, and both are the point: a healthy released agent
 /// that nobody asked to stop has no attempt row and survives every scan, and a
-/// Prepared-plus-manager record whose notifier died mid-stop has one and is
-/// finished even though no release was ever copied to the owner. A record whose
+/// Prepared-plus-manager record whose notifier died mid-stop has one and is owed
+/// completion even though no release was ever copied to the owner. A record whose
 /// outcome is already recorded is closed and is never reopened.
 pub fn reconcile_verdict(entry: &GenerationState) -> ReconcileVerdict {
     if entry.is_open() && entry.manager.is_some() && !entry.attempts.is_empty() {
@@ -110,9 +122,10 @@ pub fn reconcile_verdict(entry: &GenerationState) -> ReconcileVerdict {
     }
 }
 
-/// The exact pair a resumed stop acts on, or `None` when the record is not
-/// eligible. Callers use this rather than reading the fields themselves so the
-/// verdict and the values acted on cannot drift apart.
+/// The exact pair a resumed stop would act on, or `None` when the record is not
+/// eligible. A caller uses this rather than reading the fields itself so the
+/// verdict and the values it names cannot drift apart. It reads a record and
+/// returns values; it performs nothing.
 pub fn reconcile_target(entry: &GenerationState) -> Option<(Generation, ManagerIdentity)> {
     match reconcile_verdict(entry) {
         ReconcileVerdict::LeaveOpen => None,
@@ -181,6 +194,29 @@ mod tests {
         .expect("a scoped extinction body signs")
     }
 
+    /// The signed row a daemon writes when it has released an agent and does
+    /// not yet know the stop outcome. It is built for real here, rather than
+    /// left absent, because an entry whose `release` is `None` cannot tell the
+    /// shipped predicate apart from one that stops every released record.
+    fn released_row(g: &Generation, m: &ManagerIdentity) -> SignedReceipt {
+        let body = ReceiptBody {
+            generation: g.clone(),
+            manager: Some(m.clone()),
+            hook: None,
+            attempt_id: None,
+            attempted_scope: None,
+            candidate_uids: Vec::new(),
+            old_release_hash: None,
+            positive_extinction: None,
+        };
+        receipt::sign(
+            Domain::ReleasedUnresolvedV1,
+            body,
+            &SigningKey::from_bytes(&[6; 32]),
+        )
+        .expect("a released-unresolved body signs")
+    }
+
     #[test]
     fn a_stop_signal_is_owed_only_for_a_release_whose_account_the_net_denied() {
         // Nothing was denied: an unresolved release is someone else's business.
@@ -242,8 +278,17 @@ mod tests {
             prepared: Some(g.clone()),
             manager: Some(m.clone()),
             attempts,
-            // A release copy is not needed to decide the verdict; the accepted
-            // attempt is the whole predicate.
+            // A real signed release, so "leave a released agent alone" is a
+            // claim about a released record and not about an absent field.
+            release: Some(released_row(&g, &m)),
+            outcome: None,
+        };
+        let prepared_only = |attempts: Attempts| GenerationState {
+            prepared: Some(g.clone()),
+            manager: Some(m.clone()),
+            attempts,
+            // The record whose release was never copied to the owner, which is
+            // the other half of the predicate: the accepted attempt decides.
             release: None,
             outcome: None,
         };
@@ -253,7 +298,7 @@ mod tests {
             reconcile_verdict(&released(none.clone())),
             ReconcileVerdict::LeaveOpen
         );
-        assert_eq!(reconcile_target(&released(none)), None);
+        assert_eq!(reconcile_target(&released(none.clone())), None);
         // The same record once a stop intent has been fsynced.
         assert_eq!(
             reconcile_verdict(&released(attempt())),
@@ -261,6 +306,22 @@ mod tests {
         );
         assert_eq!(
             reconcile_target(&released(attempt())),
+            Some((g.clone(), m.clone()))
+        );
+        // Prepared plus a manager identity and an accepted attempt, with no
+        // release ever copied: the notifier died mid-stop and the scan finishes
+        // the work. Beside the released pair above, the two cases show the
+        // predicate is the accepted attempt and never the release.
+        assert_eq!(
+            reconcile_verdict(&prepared_only(none)),
+            ReconcileVerdict::LeaveOpen
+        );
+        assert_eq!(
+            reconcile_verdict(&prepared_only(attempt())),
+            ReconcileVerdict::ResumeStop
+        );
+        assert_eq!(
+            reconcile_target(&prepared_only(attempt())),
             Some((g.clone(), m.clone()))
         );
         // A Prepared-plus-manager record with no manager identity cannot name a

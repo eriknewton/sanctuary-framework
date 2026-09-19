@@ -47,10 +47,11 @@ InaccessiblePaths=/var/lib/sanctuary
 # alone does NOT achieve that: it leaves /sys writable, so omitting the cgroup
 # tree from ReadWritePaths would still hand this unit write access to every
 # cgroup on the host. ProtectControlGroups=true is what makes the hierarchy
-# read-only, so the exact-path adapter's cgroup.kill write fails with a
-# permission error, is propagated, and leaves the record INHIBIT with no signed
-# completion. Narrow installed write access to one cgroup path is an activation
-# blocker for the producer slice; it is not granted here.
+# read-only, so this unit can write no cgroup file at all. That matches what the
+# owner binary does: it accepts and records stop INTENT and executes nothing, so
+# neither the unit nor the source has a path into a producer's cgroup. Narrow
+# installed write access to one cgroup path is an activation blocker for the
+# slice that adds execution; it is not granted here.
 ReadWritePaths=/var/lib/sanctuary-stop-owner /run/sanctuary-stop-owner
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_UNIX

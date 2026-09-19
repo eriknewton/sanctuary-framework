@@ -26,6 +26,7 @@ use castle_wall_daemon::nftables::{self, SafetyNetAuditState, CASTLE_FAMILY, OWN
 use castle_wall_daemon::ownership_journal::{
     self as journal, JournalIdentity, OwnershipJournal, JOURNAL_SCHEMA_VERSION,
 };
+use castle_wall_daemon::protected_agent::owner;
 use castle_wall_daemon::runtime_lock::HostRuntimeLock;
 use castle_wall_daemon::runtime_providers::{
     acquire_castle_table_component_for_test, disarm_castle_runtime,
@@ -1682,6 +1683,43 @@ fn a_startup_indeterminate_reading_installs_nothing_and_leaves_the_adopted_table
     let mut lock = HostRuntimeLock::acquire(&cfg.lock_path)
         .expect("the host lock must be re-acquirable after a refused start");
     lock.release();
+}
+
+// The startup rows above also reach the DAEMON-SIDE STOP HOOK, which resolves a
+// host-global tree of its own: the owner socket, the receipt pins, the daemon
+// release log and the keys beside them. In a `test-isolation` binary that tree is
+// this run's isolated root and nothing else, and the shipped hook entry point
+// answers from it. Asserted beside the suites that drive the hook rather than in
+// the crate's own unit tests, because `cfg(test)` and `--features test-isolation`
+// are different build configurations and only this one links the library the way
+// an integration binary does. No kernel privilege is involved, so this row runs
+// wherever the suite runs.
+#[test]
+fn the_stop_hook_reads_only_this_runs_isolated_tree_in_a_test_isolation_binary() {
+    let _suite = isolation::guard();
+    let hook_tree =
+        owner::resolved_hook_paths().expect("a test-isolation binary resolves the bound tree");
+    for name in hook_tree.every_path() {
+        assert!(
+            name.starts_with(isolation::root()),
+            "the stop hook must read nothing outside the bound tree: {name:?}"
+        );
+    }
+    assert!(
+        hook_tree.is_isolated_from_production(),
+        "no name the hook resolves may be an installed one"
+    );
+    // The SHIPPED entry point is what the startup path calls. The bound socket
+    // does not exist, so an answer at all is evidence that the name it looked
+    // for was the bound one: an installed owner on this host would answer
+    // differently, and the bound names stay absent afterwards.
+    assert_eq!(
+        owner::stop_failure_for_hook(&[1001], "post-ready ownership reading indeterminate", None),
+        owner::OwnerOutcome::OwnerUnavailable
+    );
+    assert!(!hook_tree.socket.exists());
+    assert!(!hook_tree.pins.exists());
+    assert!(!hook_tree.release_log.exists());
 }
 
 // EXCLUDED from every install row (memo D1b step 7): a non-nftables component's

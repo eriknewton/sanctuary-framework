@@ -58,6 +58,19 @@ fn isolated() -> &'static Isolated {
             paths.is_isolated_from_production(),
             "every host-global path this suite uses must be off the production set"
         );
+        // The daemon-side stop hook resolves a host-global tree of its own: the
+        // owner socket, the receipt pins, the daemon release log and the keys
+        // beside them. Bind it to this run's root before any test can reach the
+        // startup path that calls it. Linux-only, because the owner module is.
+        //
+        // Failure mode without this: a `test-isolation` binary is not
+        // `cfg(test)`, so the hook resolves the INSTALLED tree and a `cargo
+        // test` run reads the operator's own owner socket and pins on any host
+        // with Sanctuary installed, with no error attributable to the suite
+        // that did it.
+        #[cfg(target_os = "linux")]
+        castle_wall_daemon::protected_agent::owner::use_isolated_owner_paths(root.path())
+            .expect("bind the daemon-side stop hook to this run's isolated tree");
         Isolated { root, paths, table }
     })
 }
@@ -87,6 +100,25 @@ pub fn guard() -> MutexGuard<'static, ()> {
     );
     assert!(iso.table.starts_with(ISOLATED_TABLE_PREFIX));
     assert!(iso.paths.is_isolated_from_production());
+    // Re-read what the daemon-side stop hook itself resolves, not what this
+    // module asked it to resolve: the assertion is about the tree the hook
+    // reaches, so it calls the resolver rather than restating the binding.
+    #[cfg(target_os = "linux")]
+    {
+        let hook_tree = castle_wall_daemon::protected_agent::owner::resolved_hook_paths()
+            .expect("the daemon-side stop hook must resolve this run's isolated tree");
+        assert!(
+            hook_tree.is_isolated_from_production(),
+            "the stop hook must carry no installed name in an isolated suite"
+        );
+        assert!(
+            hook_tree
+                .every_path()
+                .iter()
+                .all(|name| name.starts_with(iso.root.path())),
+            "every name the stop hook reads must be inside this run's isolated root"
+        );
+    }
     // Each test must begin from the clean ownership state a freshly-exec'd daemon
     // would have. A production daemon holds ONE authenticated nft runtime identity
     // for its whole life; a test binary re-acquires one per test, so without this

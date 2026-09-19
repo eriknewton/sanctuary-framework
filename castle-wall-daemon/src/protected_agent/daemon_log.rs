@@ -47,13 +47,25 @@ pub fn reservation_hash(g: &Generation, mac: &str) -> io::Result<String> {
     Ok(hex::encode(Sha256::digest(payload)))
 }
 
-fn mac_key() -> io::Result<JournalAuthKey> {
-    ownership_journal::read_auth_key(Path::new(ownership_journal::DEFAULT_JOURNAL_AUTH_KEY_PATH))
+/// Reads the journal MAC key from the path the caller named. The path is a
+/// parameter and never the installed constant, because this key is the second
+/// host-global name a replay touches: a caller that injects a log path but not
+/// a key path still opens the operator's installed key, which is exactly the
+/// installed-state read the injection boundary exists to prevent.
+fn mac_key(path: &Path) -> io::Result<JournalAuthKey> {
+    ownership_journal::read_auth_key(path)
         .map_err(|_| bad("journal MAC key unreadable"))?
         .ok_or_else(|| bad("journal MAC key missing"))
 }
 
-pub fn replay(path: &Path, pins: &Pins) -> io::Result<State> {
+/// Replays the daemon's reservation/release log. Both names come from the
+/// caller: `path` MUST MATCH the `release_log` field and `mac_key_path` the
+/// `journal_mac_key` field of the `OwnerPaths` the caller is serving, in
+/// `owner.rs`. Failure mode if either is read from its constant instead: the
+/// module works in production and quietly reaches installed state from a test
+/// run, which surfaces as an unrelated flake on whichever machine happens to
+/// have Sanctuary installed.
+pub fn replay(path: &Path, mac_key_path: &Path, pins: &Pins) -> io::Result<State> {
     let bytes = match receipt::read_custodied_file(
         path,
         0,
@@ -65,7 +77,7 @@ pub fn replay(path: &Path, pins: &Pins) -> io::Result<State> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(State::default()),
         Err(e) => return Err(e),
     };
-    replay_rows(&bytes, pins, mac_key)
+    replay_rows(&bytes, pins, || mac_key(mac_key_path))
 }
 
 fn replay_rows(
@@ -181,12 +193,18 @@ pub fn fresh_fixture_reservation(
 /// The sole production daemon-log writer is a verified owner completion copy.
 /// Reservation and release writers remain fixture-only. The log path is passed
 /// in rather than read from the constant so that every name this module
-/// touches comes from the caller's `OwnerPaths`; MUST MATCH the `release_log`
-/// the caller replayed, since the completion is matched against that replay.
-pub fn accept_completion_copy(path: &Path, receipt: SignedReceipt, pins: &Pins) -> io::Result<()> {
+/// touches comes from the caller's `OwnerPaths`; `path` MUST MATCH the
+/// `release_log` and `mac_key_path` the `journal_mac_key` the caller replayed,
+/// since the completion is matched against that same replay.
+pub fn accept_completion_copy(
+    path: &Path,
+    mac_key_path: &Path,
+    receipt: SignedReceipt,
+    pins: &Pins,
+) -> io::Result<()> {
     let (_, completion_key) = pins.validate().map_err(bad)?;
     receipt::verify(&receipt, Domain::StopCompletionV1, &completion_key).map_err(bad)?;
-    let state = replay(path, pins)?;
+    let state = replay(path, mac_key_path, pins)?;
     if let Some(old) = state.completion {
         return if old == receipt {
             Ok(())
@@ -385,5 +403,18 @@ mod tests {
                 .unwrap())
         })
         .is_err());
+        // Same log bytes, three different injected key paths, three different
+        // outcomes: the key the caller names is the one a replay authenticates
+        // against, so no replay can be satisfied by a key this tree does not
+        // contain.
+        let other_key_path = dir.path().join("other-journal-key");
+        std::fs::write(&other_key_path, [9u8; 32]).unwrap();
+        std::fs::set_permissions(&other_key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let absent_key_path = dir.path().join("no-journal-key-here");
+        let log = std::fs::read(&path).unwrap();
+        assert!(replay_rows(&log, &pins, || mac_key(&key_path)).is_ok());
+        assert!(replay_rows(&log, &pins, || mac_key(&other_key_path)).is_err());
+        assert!(replay_rows(&log, &pins, || mac_key(&absent_key_path)).is_err());
+        assert!(!absent_key_path.exists());
     }
 }
