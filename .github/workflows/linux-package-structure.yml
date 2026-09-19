@@ -28,10 +28,13 @@ defaults:
   run:
     shell: bash
 
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
 jobs:
   internal-package-structure:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -49,18 +52,135 @@ jobs:
         with:
           toolchain: 1.95.0
 
-      - name: Build internal structural artifact
+      - name: Check guard decisions and pinned source paths
+        run: |
+          python3 castle-wall-daemon/packaging/ubuntu/test-lifecycle-guard.py
+          python3 castle-wall-daemon/packaging/ubuntu/assert-source-constants.py
+
+      - name: Build two increasing internal package revisions
         run: |
           bash castle-wall-daemon/packaging/ubuntu/build-deb.sh \
-            --output "$RUNNER_TEMP/sanctuary-linux-package"
+            --revision 1 --output "$RUNNER_TEMP/sanctuary-linux-package/revision-1"
+          bash castle-wall-daemon/packaging/ubuntu/build-deb.sh \
+            --revision 2 --output "$RUNNER_TEMP/sanctuary-linux-package/revision-2"
 
-      - name: Assert package structure only
+      - name: Assert both exact guarded archives
         run: |
           bash castle-wall-daemon/packaging/ubuntu/assert-structure.sh \
-            --artifact-dir "$RUNNER_TEMP/sanctuary-linux-package"
+            --artifact-dir "$RUNNER_TEMP/sanctuary-linux-package/revision-1"
+          bash castle-wall-daemon/packaging/ubuntu/assert-structure.sh \
+            --artifact-dir "$RUNNER_TEMP/sanctuary-linux-package/revision-2"
 
-      # This upload is CI retention for review. It is not a release, registry
-      # publication, install action, or drill result.
+      - name: Negative archive and source-drift fixtures
+        run: |
+          set -euo pipefail
+          source=castle-wall-daemon/packaging/ubuntu
+          negative="$RUNNER_TEMP/package-negative"
+          mkdir -p "$negative"
+          cp -a castle-wall-daemon "$negative/castle-wall-daemon"
+          python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py" || {
+            echo "unmodified copied source was refused" >&2
+            exit 1
+          }
+          sed -i 's/NFT_TABLE = "sanctuary-castle"/NFT_TABLE = "wrong-table"/' \
+            "$negative/castle-wall-daemon/packaging/ubuntu/lifecycle-guard.py"
+          if python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py"; then
+            echo 'planted guard/source drift was accepted' >&2
+            exit 1
+          fi
+          sed -i 's/NFT_TABLE = "wrong-table"/NFT_TABLE = "sanctuary-castle"/' \
+            "$negative/castle-wall-daemon/packaging/ubuntu/lifecycle-guard.py"
+          nft_source="$negative/castle-wall-daemon/src/nftables.rs"
+          cp "$nft_source" "$negative/nftables-baseline.rs"
+          sed -i 's/pub const CASTLE_FAMILY: &str = "inet";/pub const CASTLE_FAMILY: \&str = "ip";/' \
+            "$nft_source"
+          if python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py"; then
+            echo 'planted daemon nft-family drift was accepted' >&2
+            exit 1
+          fi
+          cp "$negative/nftables-baseline.rs" "$nft_source"
+          sed -i '0,/add table {CASTLE_FAMILY} {castle_table}/s//add table ip {castle_table}/' \
+            "$nft_source"
+          if python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py"; then
+            echo 'planted daemon table-construction drift was accepted' >&2
+            exit 1
+          fi
+          cp "$negative/nftables-baseline.rs" "$nft_source"
+          sed -i '0,/add table {CASTLE_FAMILY} {castle_table}/s//add table {CASTLE_FAMILY} {renamed_table}/' \
+            "$nft_source"
+          if python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py"; then
+            echo 'planted daemon table-placeholder drift was accepted' >&2
+            exit 1
+          fi
+          cp "$negative/nftables-baseline.rs" "$nft_source"
+          cat >> "$nft_source" <<'RUST'
+          fn unreviewed_fifth_table_helper() -> &'static str {
+              "add table ip extra"
+          }
+          RUST
+          if python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py"; then
+            echo 'planted fifth table helper was accepted' >&2
+            exit 1
+          fi
+          cp "$negative/nftables-baseline.rs" "$nft_source"
+          printf '\nfn unreviewed_inline_table_helper() { let _ = "add table ip extra"; }\n' >> "$nft_source"
+          if python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py"; then
+            echo 'planted inline table command was accepted' >&2
+            exit 1
+          fi
+          cp "$negative/nftables-baseline.rs" "$nft_source"
+          python3 "$negative/castle-wall-daemon/packaging/ubuntu/assert-source-constants.py" || {
+            echo "restored copied source was refused" >&2
+            exit 1
+          }
+          cat > "$negative/misleading-Cargo.toml" <<'TOML'
+          [unrelated]
+          version = "99.0.0"
+          [package]
+          name = "castle-wall-daemon"
+          version = "0.1.0"
+          TOML
+          [[ "$(bash "$source/build-deb.sh" --check-package-version "$negative/misleading-Cargo.toml")" == '0.1.0' ]] \
+            || { echo 'earlier non-package version was selected' >&2; exit 1; }
+          printf '[unrelated]\nversion = "99.0.0"\n' > "$negative/missing-package-version.toml"
+          if bash "$source/build-deb.sh" --check-package-version "$negative/missing-package-version.toml"; then
+            echo 'missing package version was accepted' >&2
+            exit 1
+          fi
+          printf '[package]\nversion = 12\n' > "$negative/invalid-package-version.toml"
+          if bash "$source/build-deb.sh" --check-package-version "$negative/invalid-package-version.toml"; then
+            echo 'non-string package version was accepted' >&2
+            exit 1
+          fi
+          deb=("$RUNNER_TEMP"/sanctuary-linux-package/revision-1/*.deb)
+          dpkg-deb --raw-extract "${deb[0]}" "$negative/tampered"
+          sed -i '/^Depends: /s/$/, libfixture-dev/' "$negative/tampered/DEBIAN/control"
+          dpkg-deb --root-owner-group --build "$negative/tampered" "$negative/dev-dependency.deb" >/dev/null
+          if bash "$source/assert-structure.sh" --check-depends \
+            "$(dpkg-deb -f "$negative/dev-dependency.deb" Depends)"; then
+            echo 'shell -dev dependency check accepted the planted field' >&2
+            exit 1
+          fi
+          for planted_depends in 'libc6, libfixture-dev (>= 1)' 'libc6, libfixture-dev   , libmnl0' $'libc6, libmnl0\n libfixture-dev'; do
+            if bash "$source/assert-structure.sh" --check-depends "$planted_depends"; then
+              echo 'shell -dev dependency check accepted relation or whitespace syntax' >&2
+              exit 1
+            fi
+          done
+          if python3 "$source/assert-archive.py" "$negative/dev-dependency.deb"; then
+            echo 'planted -dev dependency was accepted' >&2
+            exit 1
+          fi
+          touch "$source/untracked-negative-fixture"
+          if bash "$source/build-deb.sh" --revision 3 --output "$negative/should-not-build"; then
+            echo 'untracked source input was accepted' >&2
+            exit 1
+          fi
+          rm -- "$source/untracked-negative-fixture"
+
+      # Public-repository Actions artifacts are downloadable to permitted
+      # viewers for seven days. This is review retention of an inert internal
+      # artifact, not confidential storage, a release, or an install action.
       - name: Retain internal structural artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -68,3 +188,173 @@ jobs:
           path: ${{ runner.temp }}/sanctuary-linux-package
           retention-days: 7
           if-no-files-found: error
+
+  internal-package-lifecycle:
+    needs: internal-package-structure
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [happy, old-veto, new-veto, unpack-fault, postrm-unwind, legacy, dangling, local-dangling, writable-wants, env-collision, fresh-retry, fresh-purge, probe-unusable, nft-collision, state-unreadable, remove-veto]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install nftables probe on the fresh runner
+        uses: ./.github/actions/apt-install-resilient
+        timeout-minutes: 15
+        with:
+          packages: nftables
+
+      - name: Download exact internally retained package revisions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sanctuary-linux-package-structure-${{ github.run_id }}
+          path: ${{ runner.temp }}/sanctuary-linux-package
+
+      - name: Reverify downloaded archives and install their exact runtime Depends
+        run: |
+          set -euo pipefail
+          source=castle-wall-daemon/packaging/ubuntu
+          root="$RUNNER_TEMP/sanctuary-linux-package"
+          for revision in 1 2; do
+            bash "$source/assert-structure.sh" --artifact-dir "$root/revision-$revision"
+          done
+          v1=("$root"/revision-1/*.deb)
+          v2=("$root"/revision-2/*.deb)
+          [[ ${#v1[@]} == 1 && ${#v2[@]} == 1 ]]
+          depends="$(dpkg-deb -f "${v1[0]}" Depends)"
+          [[ "$depends" == "$(dpkg-deb -f "${v2[0]}" Depends)" ]]
+          packages="$(python3 - "$depends" <<'PY'
+          import re, sys
+          names = [part.strip() for part in sys.argv[1].split(',')]
+          if not names or any(not re.fullmatch(r'[a-z0-9][a-z0-9+.-]*(?::amd64)?', name) for name in names):
+              raise SystemExit('downloaded runtime Depends is not a plain package-name list')
+          print('\n'.join(names))
+          PY
+          )"
+          mapfile -t runtime_packages <<< "$packages"
+          [[ ${#runtime_packages[@]} -gt 0 ]]
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends "${runtime_packages[@]}"
+          for package in "${runtime_packages[@]}"; do
+            [[ "$(dpkg-query -W -f='${Status}' "$package")" == 'install ok installed' ]]
+          done
+
+      - name: Prepare exact fresh-runner directory custody for lifecycle witness
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted \
+             && "${RUNNER_OS:-}" == Linux ]] || { echo 'not a fresh GitHub-hosted Linux job' >&2; exit 1; }
+          grep -Fx 'ID=ubuntu' /etc/os-release >/dev/null
+          grep -Eq '^VERSION_ID="?24\.04"?$' /etc/os-release
+          snapshot_parents() {
+            python3 - <<'PY'
+          import json, os, stat
+          paths = (
+              '/etc', '/etc/systemd', '/etc/systemd/system', '/usr', '/usr/local',
+              '/usr/local/libexec', '/usr/local/libexec/sanctuary', '/usr/share',
+              '/usr/share/doc', '/usr/share/doc/sanctuary-castle-wall-internal',
+          )
+          observed = {}
+          for path in paths:
+              try:
+                  item = os.lstat(path)
+              except FileNotFoundError:
+                  observed[path] = None
+                  continue
+              observed[path] = {
+                  'type': 'directory' if stat.S_ISDIR(item.st_mode) else 'other',
+                  'uid': item.st_uid, 'gid': item.st_gid,
+                  'mode': format(stat.S_IMODE(item.st_mode), '04o'),
+              }
+          print(json.dumps(observed, sort_keys=True))
+          PY
+          }
+          parent_evidence="$RUNNER_TEMP/sanctuary-linux-parent-evidence"
+          [[ ! -e "$parent_evidence" && ! -L "$parent_evidence" ]] || { echo "parent evidence already exists" >&2; exit 1; }
+          mkdir -m 0755 -- "$parent_evidence"
+          before="$(snapshot_parents)"
+          printf '%s\n' "$before" > "$parent_evidence/before.json"
+          printf 'package_parent_before=%s\n' "$before"
+          parent_modes="$(python3 - "$before" <<'PY'
+          import json, sys
+          observed = json.loads(sys.argv[1])
+          selected = ('/usr/share', '/usr/share/doc')
+          expected = {'type': 'directory', 'uid': 0, 'gid': 0, 'mode': '0755'}
+          for path, item in observed.items():
+              if path not in selected and item is not None and item != expected:
+                  raise SystemExit(f'unsafe other package parent before mutation: {path}: {item}')
+          modes = []
+          for path in selected:
+              item = observed[path]
+              if item is None or item['type'] != 'directory' or (item['uid'], item['gid']) != (0, 0):
+                  raise SystemExit(f'unsafe {path} type or owner on isolated runner')
+              if item['mode'] not in ('0755', '0777'):
+                  raise SystemExit(f'unrecognised {path} mode: {item["mode"]}')
+              modes.append(item['mode'])
+          print(' '.join(modes))
+          PY
+          )"
+          case "$parent_modes" in
+            '0755 0755'|'0755 0777'|'0777 0755'|'0777 0777') : ;;
+            *) echo "unrecognised fixed parent modes: $parent_modes" >&2; exit 1 ;;
+          esac
+          read -r share_mode before_doc_mode <<< "$parent_modes"
+          if [[ "$share_mode" == 0777 ]]; then sudo chmod 0755 -- /usr/share; fi
+          doc_mode="$(python3 - <<'PY'
+          import os, stat
+          def checked_mode(path):
+              try:
+                  item = os.lstat(path)
+              except OSError as exc:
+                  raise SystemExit(f'cannot recheck {path} after parent closure: {exc}')
+              if not stat.S_ISDIR(item.st_mode) or (item.st_uid, item.st_gid) != (0, 0):
+                  raise SystemExit(f'unsafe {path} type or owner after parent closure')
+              return format(stat.S_IMODE(item.st_mode), '04o')
+          if checked_mode('/usr/share') != '0755':
+              raise SystemExit('/usr/share did not reach exact mode 0755 before child mutation')
+          mode = checked_mode('/usr/share/doc')
+          if mode not in ('0755', '0777'):
+              raise SystemExit(f'unrecognised /usr/share/doc mode after parent closure: {mode}')
+          print(mode)
+          PY
+          )"
+          [[ "$doc_mode" == "$before_doc_mode" ]] || { echo "doc mode changed between snapshots" >&2; exit 1; }
+          if [[ "$doc_mode" == 0777 ]]; then sudo chmod 0755 -- /usr/share/doc; fi
+          after="$(snapshot_parents)"
+          printf '%s\n' "$after" > "$parent_evidence/after.json"
+          printf 'package_parent_after=%s\n' "$after"
+          python3 - "$after" <<'PY'
+          import json, sys
+          observed = json.loads(sys.argv[1])
+          expected = {'type': 'directory', 'uid': 0, 'gid': 0, 'mode': '0755'}
+          for path in ('/usr/share', '/usr/share/doc'):
+              if observed[path] != expected:
+                  raise SystemExit(f'{path} did not reach exact root-owned mode 0755')
+          for path, item in observed.items():
+              if item is not None and item != expected:
+                  raise SystemExit(f'unsafe package parent remains; no other path is repaired: {path}: {item}')
+          PY
+
+      - name: Real dpkg, systemd and nft lifecycle witness
+        timeout-minutes: 8
+        run: |
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS \
+            bash castle-wall-daemon/packaging/ubuntu/ci-lifecycle.sh \
+            '${{ matrix.scenario }}' \
+            "$RUNNER_TEMP/sanctuary-linux-package" \
+            "$RUNNER_TEMP/sanctuary-linux-lifecycle-evidence"
+
+      # This public-repository Actions evidence is downloadable to permitted
+      # viewers for seven days; it is not confidential or an install claim.
+      - name: Retain lifecycle evidence for review
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sanctuary-linux-lifecycle-${{ matrix.scenario }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/sanctuary-linux-lifecycle-evidence
+            ${{ runner.temp }}/sanctuary-linux-parent-evidence
+          retention-days: 7
+          if-no-files-found: warn
