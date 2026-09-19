@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hooks/deny-protected-surfaces.sh || echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Blocked: deny-protected-surfaces.sh is missing or not executable, so the protected-surfaces guard cannot evaluate this call. Failing closed per AGENTS.md rule 5 (never silently degrade to a less-secure behavior on error). Restore scripts/hooks/deny-protected-surfaces.sh and its executable bit.\"}}'"
+          }
+        ]
+      }
+    ]
+  }
+}
