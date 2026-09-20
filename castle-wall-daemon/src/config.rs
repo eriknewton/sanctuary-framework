@@ -35,16 +35,6 @@ pub struct LinuxRuntimePaths {
     pub ownership_journal_path: PathBuf,
     /// Root-owned 0600 MAC key that authenticates the journal.
     pub journal_auth_key_path: PathBuf,
-    /// The operator's agent registry: which local account this wall is expected
-    /// to confine. Read once at activation and never written.
-    ///
-    /// It belongs in THIS struct, beside the lock, journal and key, because it
-    /// has the same property they do: a test that pointed the other three at a
-    /// temporary root but left this one at the shipped path would read the
-    /// operator's real registry, and `is_isolated_from_production` below is what
-    /// makes that a caught mistake rather than a silent one. See
-    /// [`crate::agent_registry`].
-    pub agent_registry_path: PathBuf,
 }
 
 impl LinuxRuntimePaths {
@@ -60,10 +50,6 @@ impl LinuxRuntimePaths {
             journal_auth_key_path: PathBuf::from(
                 crate::ownership_journal::DEFAULT_JOURNAL_AUTH_KEY_PATH,
             ),
-            // Must match `DEFAULT_AGENT_REGISTRY_PATH` in `src/agent_registry.rs`,
-            // which is where the constant is defined and where the file's shape is
-            // parsed.
-            agent_registry_path: PathBuf::from(crate::agent_registry::DEFAULT_AGENT_REGISTRY_PATH),
         }
     }
 
@@ -78,7 +64,6 @@ impl LinuxRuntimePaths {
             host_lock_path: root.join("castle-wall.nft.lock"),
             ownership_journal_path: root.join("nft-ownership.json"),
             journal_auth_key_path: root.join("nft-journal-auth.key"),
-            agent_registry_path: root.join("agent-registry-v1.json"),
         }
     }
 
@@ -96,11 +81,6 @@ impl LinuxRuntimePaths {
                 != std::path::Path::new(crate::ownership_journal::DEFAULT_OWNERSHIP_JOURNAL_PATH)
             && self.journal_auth_key_path.as_path()
                 != std::path::Path::new(crate::ownership_journal::DEFAULT_JOURNAL_AUTH_KEY_PATH)
-            // The registry joined this set the moment the daemon started READING
-            // it: a boot with three temporary paths and the production registry
-            // would refuse (or admit) on the operator's own file.
-            && self.agent_registry_path.as_path()
-                != std::path::Path::new(crate::agent_registry::DEFAULT_AGENT_REGISTRY_PATH)
     }
 }
 
@@ -476,17 +456,17 @@ mod tests {
     // A partially-isolated path set is the shape that still reads or mutates
     // operator state, so the predicate has to fail on EACH path individually.
     #[test]
-    fn a_production_registry_beside_isolated_paths_is_not_isolated() {
+    fn a_production_journal_beside_isolated_paths_is_not_isolated() {
         let root = std::path::Path::new("/tmp/castle-wall-isolation-fixture");
         let isolated = LinuxRuntimePaths::isolated_under(root);
         assert!(isolated.is_isolated_from_production());
         let mut leaky = isolated.clone();
-        leaky.agent_registry_path =
-            PathBuf::from(crate::agent_registry::DEFAULT_AGENT_REGISTRY_PATH);
+        leaky.journal_auth_key_path =
+            PathBuf::from(crate::ownership_journal::DEFAULT_JOURNAL_AUTH_KEY_PATH);
         assert!(
             !leaky.is_isolated_from_production(),
-            "a boot with three temporary paths and the operator's own registry would refuse \
-             (or admit) on the operator's own file"
+            "a boot with two temporary paths and the operator's own journal key would \
+             authenticate against operator state"
         );
         assert!(!LinuxRuntimePaths::production().is_isolated_from_production());
     }

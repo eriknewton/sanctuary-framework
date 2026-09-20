@@ -1584,16 +1584,72 @@ mod armed_identity_tests {
             .collect()
     }
 
+    /// Every `.rs` file under `src/`, recursively, as (relative path, contents).
+    /// A caller-count assertion that reads ONE file cannot see a second caller
+    /// added anywhere else, which is the drift this guard exists to catch.
+    fn production_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).expect("readable source directory") {
+                let path = entry.expect("readable directory entry").path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let relative = path
+                        .strip_prefix(root)
+                        .expect("every walked path is under the crate root")
+                        .to_string_lossy()
+                        .into_owned();
+                    out.push((
+                        relative,
+                        std::fs::read_to_string(&path).expect("readable source"),
+                    ));
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut out = Vec::new();
+        walk(&root.join("src"), root, &mut out);
+        assert!(
+            out.len() > 20,
+            "the walk must find the whole module tree, not a stub: {}",
+            out.len()
+        );
+        out
+    }
+
     #[test]
     fn the_boot_freeze_has_exactly_one_production_call_site_and_one_marker() {
-        let daemon = source("src/daemon.rs");
-        let callers = production_lines(&daemon)
+        // PRODUCT-WIDE, not daemon.rs-wide: a second production caller added in
+        // any other module is a second thing allowed to write the frozen cell,
+        // and a per-file count would stay green for it. `#[cfg(test)]` blocks are
+        // excluded per file, so this module's own mentions do not count.
+        let callers: Vec<String> = production_sources()
             .iter()
-            .filter(|line| line.contains("reload_manifest_authorized_at_boot("))
-            .count();
+            .flat_map(|(relative, body)| {
+                production_lines(body)
+                    .iter()
+                    // The DEFINITION is not a call site. It carries `fn` and is
+                    // the one line the entry point is allowed to occupy; a
+                    // filter that counted it would report 2 on correct code and
+                    // the assertion would have to be loosened to 2, which is
+                    // exactly the number a genuine second caller produces.
+                    .filter(|line| {
+                        line.contains("reload_manifest_authorized_at_boot(")
+                            && !line.contains("fn reload_manifest_authorized_at_boot(")
+                    })
+                    .map(|line| format!("{relative}: {}", line.trim()))
+                    .collect::<Vec<String>>()
+            })
+            .collect();
         assert_eq!(
-            callers, 1,
-            "the boot entry must have exactly one production caller, the boot match in daemon.rs"
+            callers.len(),
+            1,
+            "the boot entry must have exactly one production caller across all of src/: \
+             {callers:?}"
+        );
+        assert!(
+            callers[0].starts_with("src/daemon.rs:"),
+            "that one caller must be the boot match in daemon.rs: {callers:?}"
         );
         let decision = source("src/decision.rs");
         // The marker as an ARGUMENT (trailing comma), which is the form that

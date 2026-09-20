@@ -151,9 +151,6 @@ pub fn disarm_with(
         lock_path: paths.host_lock_path.clone(),
         journal_path: paths.ownership_journal_path.clone(),
         journal_key_path: paths.journal_auth_key_path.clone(),
-        // Disarm touches only the host lock/journal/table; these fields are unused
-        // by the disarm path but the shared config type carries them.
-        agent_registry_path: paths.agent_registry_path.clone(),
         policy_dir: PathBuf::from("/var/lib/sanctuary"),
         poll_interval: KERNEL_RUNTIME_POLL_INTERVAL,
         nfqueue: crate::nfqueue::NfqueueConfig::default(),
@@ -1429,9 +1426,6 @@ fn activate_kernel_runtime(
             // Authenticated-journal MAC key, root-owned under the same StateDirectory
             // (blocker 3). Generated on first acquisition; a present-but-unsafe key or
             // a MAC mismatch fails the activation closed.
-            // The operator's agent registry, from the same path set as the lock,
-            // journal and key so an isolated boot cannot read the real one.
-            agent_registry_path: config.linux_runtime_paths.agent_registry_path.clone(),
             journal_key_path: config.linux_runtime_paths.journal_auth_key_path.clone(),
             policy_dir: config.policy_dir.clone(),
             poll_interval: KERNEL_RUNTIME_POLL_INTERVAL,

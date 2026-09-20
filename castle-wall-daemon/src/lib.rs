@@ -17,7 +17,6 @@
 //! Source: Castle_Wall_Phase1_Scope_Lock_2026-05-03.md (sections 1, 4, 5,
 //! 6, 7, 8). Parent ADR: Castle_Architecture_ADR_2026-04-30.md.
 
-pub mod agent_registry;
 pub mod approval;
 pub mod audit;
 pub mod cgroup;
