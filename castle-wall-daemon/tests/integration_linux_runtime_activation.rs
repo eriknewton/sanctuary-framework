@@ -1719,20 +1719,25 @@ fn installed_net_rule_one_uids() -> Vec<u32> {
         {
             continue;
         }
-        let Some(members) = rule
+        // nft renders a one-member anonymous set as a bare scalar (`meta skuid
+        // 60123`) and a larger one as `{"set": [..]}`; both are rule 1's scope.
+        // Reading only the set form returned an empty scope for a live one-uid
+        // net on the first privileged run of this suite.
+        let Some(right) = rule
             .get("expr")
             .and_then(|v| v.as_array())
             .and_then(|exprs| exprs.first())
             .and_then(|e| e.get("match"))
             .and_then(|m| m.get("right"))
-            .and_then(|r| r.get("set"))
-            .and_then(|v| v.as_array())
         else {
             return Vec::new();
         };
+        let members: Vec<u64> = match right.get("set").and_then(|v| v.as_array()) {
+            Some(set) => set.iter().filter_map(|m| m.as_u64()).collect(),
+            None => right.as_u64().into_iter().collect(),
+        };
         let mut uids: Vec<u32> = members
-            .iter()
-            .filter_map(|m| m.as_u64())
+            .into_iter()
             .filter_map(|v| u32::try_from(v).ok())
             .collect();
         uids.sort_unstable();
