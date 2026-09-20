@@ -1342,12 +1342,14 @@ fn the_isolation_seam_cannot_be_aimed_at_a_production_or_foreign_table() {
 /// asserted here. Rust's default test harness captures `eprintln!` inside the
 /// harness before it reaches file descriptor 2, so an fd-2 swap in this process
 /// reads empty whether or not the line was emitted, and an assertion over that
-/// buffer would stay green if the emission moved above the readback guard. The
-/// emission's ABSENCE is observed out of process, where the daemon's real fd 2
-/// is a pipe this suite reads, by
-/// `readback_line_is_emitted_on_a_boot_that_reaches_readiness`'s subprocess
-/// reader; what this test asserts is the readiness datagram, which crosses a
-/// socket the harness does not touch.
+/// buffer would stay green if the emission moved above the readback guard. That
+/// absence is NOT covered out of process either:
+/// `readback_line_is_emitted_on_a_boot_that_reaches_readiness` boots
+/// successfully and asserts the line's PRESENCE on that different, non-failing
+/// boot, never its absence on this one. What this test asserts instead is the
+/// readiness datagram's absence, which crosses a socket the harness does not
+/// touch; moving the emission above the readback guard would still leave both
+/// tests green, which is a named residual, not a covered case.
 #[test]
 fn a_forced_readback_mismatch_withholds_readiness() {
     let _suite = suite_guard();

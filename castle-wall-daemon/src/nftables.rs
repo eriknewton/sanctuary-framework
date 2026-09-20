@@ -102,7 +102,9 @@ pub enum ExpectedAgentBinding {
     Confined { fortress_id: String, agent_uid: u32 },
     /// The identity this process FROZE at boot confines NO agent uid (the frozen
     /// cell is `Unconfined`: absent `agent_origin`, or a non-`uid` mode), or the
-    /// cell is not set yet because the table was just created. Read from the same
+    /// cell is not set yet because the boot freeze has not run (the freeze runs
+    /// BEFORE table creation, so an unset cell here is never explained by the
+    /// table having just been created). Read from the same
     /// write-once cell as [`Self::Confined`] (`AdmittedIdentity` in
     /// `src/decision.rs`, by way of `current_expected_agent_binding` in
     /// `src/runtime_providers.rs`), never from a fresh store read, so the two

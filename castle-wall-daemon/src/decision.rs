@@ -1155,6 +1155,11 @@ mod armed_identity_tests {
         let wal = Arc::new(Mutex::new(
             WalWriter::open(&dir.path().join("audit.wal")).unwrap(),
         ));
+        // 64 * 1024 bytes and 60s TTL: both far larger than any single test's
+        // audit volume and runtime, so capacity- or time-based eviction never
+        // interferes with what a fixture's assertions expect to still be in
+        // the ring; the value is a headroom margin, not a tuned production
+        // capacity.
         let ring = Arc::new(Mutex::new(AuditRingBuffer::new(
             64 * 1024,
             Duration::from_secs(60),
@@ -1314,6 +1319,9 @@ mod armed_identity_tests {
     }
 
     fn audit_operations(wal: &Arc<Mutex<WalWriter>>) -> Vec<String> {
+        // 100: a snapshot cap far above any test's operation count, so this
+        // helper returns the whole audit trail a fixture wrote rather than a
+        // truncated prefix of it; not a tuned production limit.
         wal.lock()
             .unwrap()
             .snapshot_after(None, 100)
@@ -1576,11 +1584,147 @@ mod armed_identity_tests {
             .unwrap_or_else(|err| panic!("read {relative}: {err}"))
     }
 
-    /// A `#[cfg(test)]` block is not production code, so a token inside one must
-    /// not count toward a production-call-site assertion.
+    /// A top-level (`#[cfg(test)]` at column 0) attribute gates exactly the one
+    /// item it annotates (a fn, a `mod`, an enum, ...), not the rest of the
+    /// file. `nfqueue.rs` and `audit.rs` both carry production code after an
+    /// earlier test-only item, so a caller-count assertion that stopped at the
+    /// first such attribute would go blind to a production caller placed after
+    /// it — the exact miss this function exists to avoid. It skips only the
+    /// annotated item's own lines, by brace-matching that item's body, then
+    /// resumes scanning the rest of the file as production.
     fn production_lines(body: &str) -> Vec<&str> {
-        body.lines()
-            .take_while(|line| !line.starts_with("#[cfg(test)]"))
+        let lines: Vec<&str> = body.lines().collect();
+        let mut skip = vec![false; lines.len()];
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i] != "#[cfg(test)]" {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            // A stacked attribute (`#[derive(..)]`, a second `#[cfg(..)]`, a
+            // doc comment does not use `#[...]` so it is not swallowed here)
+            // still belongs to the same test-only item.
+            let mut j = start + 1;
+            while j < lines.len() && lines[j].starts_with('#') {
+                j += 1;
+            }
+            let item_start = j;
+            let mut depth: i32 = 0;
+            let mut opened = false;
+            let mut ended_without_braces = false;
+            let mut in_block_comment = false;
+            let mut in_string = false;
+            let mut in_char = false;
+            while j < lines.len() && !ended_without_braces {
+                let mut in_line_comment = false;
+                let chars: Vec<char> = lines[j].chars().collect();
+                let mut k = 0;
+                while k < chars.len() {
+                    if in_line_comment {
+                        break;
+                    }
+                    let c = chars[k];
+                    if in_block_comment {
+                        if c == '*' && chars.get(k + 1) == Some(&'/') {
+                            in_block_comment = false;
+                            k += 2;
+                        } else {
+                            k += 1;
+                        }
+                        continue;
+                    }
+                    if in_string {
+                        if c == '\\' {
+                            k += 2;
+                        } else {
+                            if c == '"' {
+                                in_string = false;
+                            }
+                            k += 1;
+                        }
+                        continue;
+                    }
+                    if in_char {
+                        if c == '\\' {
+                            k += 2;
+                        } else {
+                            if c == '\'' {
+                                in_char = false;
+                            }
+                            k += 1;
+                        }
+                        continue;
+                    }
+                    match c {
+                        '/' if chars.get(k + 1) == Some(&'/') => {
+                            in_line_comment = true;
+                            k += 2;
+                        }
+                        '/' if chars.get(k + 1) == Some(&'*') => {
+                            in_block_comment = true;
+                            k += 2;
+                        }
+                        '"' => {
+                            in_string = true;
+                            k += 1;
+                        }
+                        // A char literal closes within one or two characters
+                        // (`'x'`, or an escape like `'\n'`); a lifetime
+                        // (`'static`, `'a`) never does. Entering string-like
+                        // mode for a lifetime tick would consume the rest of
+                        // the file hunting a closing quote that never comes,
+                        // and this codebase's test modules use `&'static`
+                        // routinely.
+                        '\'' if chars.get(k + 1) == Some(&'\\')
+                            && chars.get(k + 3) == Some(&'\'') =>
+                        {
+                            in_char = true;
+                            k += 1;
+                        }
+                        '\'' if chars.get(k + 1).is_some() && chars.get(k + 2) == Some(&'\'') => {
+                            in_char = true;
+                            k += 1;
+                        }
+                        '{' => {
+                            depth += 1;
+                            opened = true;
+                            k += 1;
+                        }
+                        '}' => {
+                            depth -= 1;
+                            k += 1;
+                        }
+                        // A brace-less item (`#[cfg(test)] use ...;`, a const,
+                        // a type alias) ends at its own top-level `;`; without
+                        // this, `opened` would never flip true and the scan
+                        // would run to end of file exactly like the bug this
+                        // rewrite fixes.
+                        ';' if !opened && depth == 0 => {
+                            ended_without_braces = true;
+                            k += 1;
+                        }
+                        _ => {
+                            k += 1;
+                        }
+                    }
+                }
+                j += 1;
+                if opened && depth <= 0 {
+                    break;
+                }
+            }
+            let end = j.max(item_start + 1).min(lines.len());
+            for line in skip.iter_mut().take(end).skip(start) {
+                *line = true;
+            }
+            i = end;
+        }
+        lines
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, _)| !skip[*idx])
+            .map(|(_, line)| line)
             .collect()
     }
 
@@ -1609,11 +1753,29 @@ mod armed_identity_tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut out = Vec::new();
         walk(&root.join("src"), root, &mut out);
-        assert!(
-            out.len() > 20,
-            "the walk must find the whole module tree, not a stub: {}",
-            out.len()
-        );
+        // A count threshold drifts silently as files are added or removed and
+        // says nothing about WHICH files matter; naming the modules that
+        // actually carry a `reload_manifest_authorized_at_boot` caller or its
+        // only production wrapper makes a walk that silently narrowed to a
+        // stub (or skipped a directory) fail on the specific file it lost,
+        // not on an arbitrary count.
+        for must_have in [
+            "daemon.rs",
+            "decision.rs",
+            "nftables.rs",
+            "runtime_providers.rs",
+            "nfqueue.rs",
+            "audit.rs",
+        ] {
+            assert!(
+                out.iter()
+                    .any(|(relative, _)| relative.ends_with(must_have)),
+                "the walk lost {must_have}; a caller placed there would be invisible: \
+                 found {} files: {:?}",
+                out.len(),
+                out.iter().map(|(relative, _)| relative).collect::<Vec<_>>()
+            );
+        }
         out
     }
 
@@ -1693,6 +1855,67 @@ mod armed_identity_tests {
                 "{entry} must keep its signature so src/ipc/ needs no edit"
             );
         }
+    }
+
+    /// Regression fixture for the round-4 P2: a production caller placed
+    /// AFTER an earlier top-level `#[cfg(test)]` function (the real shape in
+    /// `nfqueue.rs`, where a test-only helper at line 154 is followed by
+    /// ordinary production functions) must still be counted. The prior
+    /// `take_while` implementation stopped reading the whole file at the
+    /// first such attribute and would report zero callers here.
+    #[test]
+    fn a_production_caller_after_a_test_only_fn_is_still_counted() {
+        let source = "\
+fn real_caller() {\n\
+    reload_manifest_authorized_at_boot();\n\
+}\n\
+\n\
+#[cfg(test)]\n\
+fn test_only_helper() {\n\
+    let _ = 1 + 1;\n\
+}\n\
+\n\
+fn later_real_caller() {\n\
+    reload_manifest_authorized_at_boot();\n\
+}\n";
+        let callers: Vec<&str> = production_lines(source)
+            .into_iter()
+            .filter(|line| line.contains("reload_manifest_authorized_at_boot("))
+            .collect();
+        assert_eq!(
+            callers.len(),
+            2,
+            "both the caller before and the caller after the test-only fn must be seen: {callers:?}"
+        );
+    }
+
+    /// Companion fixture: a caller INSIDE a `#[cfg(test)] mod tests { .. }`
+    /// block (the real shape in `audit.rs` and `nfqueue.rs`, whose test
+    /// modules run to end of file) must not be counted, while a production
+    /// caller that follows the module in the same file still is.
+    #[test]
+    fn a_caller_inside_a_cfg_test_mod_block_is_not_counted() {
+        let source = "\
+#[cfg(test)]\n\
+mod tests {\n\
+    fn calls_it_from_a_test() {\n\
+        reload_manifest_authorized_at_boot();\n\
+    }\n\
+}\n\
+\n\
+fn real_caller_after_the_module() {\n\
+    reload_manifest_authorized_at_boot();\n\
+}\n";
+        let callers: Vec<&str> = production_lines(source)
+            .into_iter()
+            .filter(|line| line.contains("reload_manifest_authorized_at_boot("))
+            .collect();
+        assert_eq!(
+            callers.len(),
+            1,
+            "the call inside the test module must be excluded and the one after it kept: \
+             {callers:?}"
+        );
     }
 
     #[test]

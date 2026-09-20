@@ -945,9 +945,16 @@ pub const AGENT_BINDING_WRITE_AHEAD_LINE_PREFIX: &str =
 ///
 /// SCOPED TO THIS BOOT, and the boot-id comparison is the whole reason this is a
 /// separate function from the mapping inside `resolve_net_scope_at_site`: that
-/// one runs only on paths `journal::decide` already matched to this boot, so it
-/// can take the record's history at face value. This one also runs on a FRESH
-/// acquisition, where the record on disk may be a previous boot's. A previous
+/// one takes the record's history at face value because it normally runs only
+/// on paths `journal::decide` already matched to this boot. The one exception
+/// is the retained-deny seed taken right after a `FreshCreate` acquisition,
+/// which calls it with the PRE-MATCH record (still possibly a previous boot's)
+/// because this boot's own record does not exist yet to compare against;
+/// reading a stale boot's uids into that seed can only WIDEN the deny set
+/// (more uids named, never fewer), so the exception stays conservative rather
+/// than defeating what this function's boot-id guard protects. This one also
+/// runs on a FRESH acquisition, where the record on disk may be a previous
+/// boot's. A previous
 /// boot's uids cannot have live processes after a reboot, so reading them as
 /// this boot's history would refuse every first start after a reboot that
 /// changed the manifest. `Unknown` is preserved rather than flattened: a
@@ -1091,13 +1098,17 @@ fn refuse_by_predicate(
 
 /// THE WHOLE SLICE-A DECISION, as a pure function of its three inputs.
 ///
-/// SCOPE BOUND at this line: this decision is taken from the SIGNED manifest and
-/// the kernel alone. It reads no operator-declared account list and resolves no
-/// system account, so the boot path it governs depends on neither the filesystem
-/// nor a name service. The account join belongs with the slice that provisions
-/// and starts the agent account, which is the first point at which such a join
-/// protects anything; adding one here would be new capability, not a
-/// preserved one.
+/// SCOPE BOUND at this line: this function itself is a pure decision over the
+/// SIGNED manifest identity, the kernel-read live bindings B, and this boot's
+/// history H (H is journal-derived; the caller reads it from disk before this
+/// call, and the executor that later acts on the returned plan reads the
+/// authentication key and persists the journal, so the boot path AROUND this
+/// decision is not filesystem-free). What this line's bound is about is
+/// narrower: this function reads no operator-declared account list and
+/// resolves no system account. The account join belongs with the slice that
+/// provisions and starts the agent account, which is the first point at which
+/// such a join protects anything; adding one here would be new capability, not
+/// a preserved one.
 ///
 /// Order, and each step depends on the one before it: the armed identity, the set
 /// rule over B, then this boot's history reconciliation.
@@ -2963,12 +2974,15 @@ impl AcquiredComponent for NftablesTableComponent {
         if self.released || self.lock.is_none() {
             return ComponentHealth::Lost;
         }
-        // Live re-poll of the EXACT owned identity (handles + marker + pristine
-        // shape via structured nft -j), not mere table-name existence and not a
-        // name-only shape check. (blocker 2) A table deleted, flushed, mutated,
-        // or DELETED-AND-RECREATED with the same shape (new handles, or our
-        // marker absent) fails this check, dropping the runtime out of
-        // KernelRuntimeReady on the next status query.
+        // Live re-poll of the EXACT owned identity AND the expected agent
+        // binding (handles + marker + pristine shape via structured nft -j,
+        // compared against the frozen uid expectation captured below), not
+        // mere table-name existence and not a name-only shape check. (blocker
+        // 2) A table deleted, flushed, mutated, or DELETED-AND-RECREATED with
+        // the same shape (new handles, or our marker absent), OR one whose
+        // per-agent binding no longer matches that expectation, fails this
+        // check, dropping the runtime out of KernelRuntimeReady on the next
+        // status query.
         //
         // The proof is COMPLETION-latched, not attempt-latched: a completed
         // negative proof means ownership provably no longer holds and withdraws

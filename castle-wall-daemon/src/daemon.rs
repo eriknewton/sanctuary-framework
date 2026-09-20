@@ -1156,12 +1156,17 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         Err(err) => return Err(DaemonError::ManifestStoreInit(err.to_string())),
     }
 
-    // A REAL CHECK, not a `debug_assert`: a release build with an unset cell
-    // would bind the socket, accept an authenticated publish and have nothing to
-    // compare it against, which is the exact window the freeze exists to close.
-    // Both continuing outcomes above write the cell (a committed snapshot, or
-    // `Unconfined` on a verification failure), so reaching here unset is a
-    // composition-root bug and refusing to start is the honest response.
+    // A REAL CHECK, not a `debug_assert`: both continuing outcomes above write
+    // the cell (a committed snapshot, or `Unconfined` on a verification
+    // failure), so reaching here unset is a composition-root bug, and refusing
+    // to start is the honest response rather than running a half-initialized
+    // daemon. This is a SECOND, INDEPENDENT refusal, not the only barrier: an
+    // authenticated publish that later reached the identity chokepoint with an
+    // unset cell would already be refused there too
+    // (`refuse_identity_change` in `src/decision.rs` treats an absent frozen
+    // identity as unprovable and denies the reload). This check exists to fail
+    // the boot loudly instead of letting the bug run until some other reader
+    // interprets the unset cell a different way.
     if decision_engine.armed_identity().is_none() {
         return Err(DaemonError::ArmedIdentityNotFrozen);
     }
