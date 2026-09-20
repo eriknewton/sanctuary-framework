@@ -118,19 +118,32 @@ impl AccountLookup for SystemAccountLookup {
         use std::ffi::CString;
         let c_account = CString::new(account)
             .map_err(|_| "the account name contains an interior NUL byte".to_string())?;
-        // DERIVATION of the buffer size: `sysconf(_SC_GETPW_R_SIZE_MAX)` is the
+        // DERIVATION of the ceiling: a `passwd` record is five short strings and
+        // two integers; 16 KiB is three orders of magnitude above any real one,
+        // so a record that does not fit is a pathological or hostile NSS answer
+        // and is treated as indeterminate rather than absent.
+        const MAX_PASSWD_BUFFER_BYTES: usize = 16 * 1024;
+        // DERIVATION of the fallback: `sysconf` may answer -1 ("no definite
+        // limit"), and glibc's own documented starting point for that case is
+        // 1 KiB, which holds an ordinary local record in one pass.
+        const DEFAULT_PASSWD_BUFFER_BYTES: usize = 1024;
+        // DERIVATION of the starting size: `sysconf(_SC_GETPW_R_SIZE_MAX)` is the
         // platform's own answer and is the value glibc documents for this call.
         // It is advisory (it may be -1, and a large NSS record can still exceed
         // it), so an ERANGE answer grows the buffer rather than being read as
-        // "no such account"; 16 KiB is the ceiling, above which the record is
-        // treated as indeterminate rather than absent.
+        // "no such account".
+        //
+        // INVARIANT at this line: the suggestion is CLAMPED to the ceiling before
+        // it is ever allocated. Without the clamp the ceiling is a claim the code
+        // does not keep: a platform (or a hostile `sysconf` shim) answering a
+        // huge value would have this allocate it in one shot, which is exactly
+        // the unbounded allocation the ceiling exists to prevent.
         let suggested = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
         let mut size: usize = if suggested > 0 {
-            suggested as usize
+            (suggested as usize).min(MAX_PASSWD_BUFFER_BYTES)
         } else {
-            1024
+            DEFAULT_PASSWD_BUFFER_BYTES
         };
-        const MAX_PASSWD_BUFFER_BYTES: usize = 16 * 1024;
         loop {
             let mut passwd: libc::passwd = unsafe { std::mem::zeroed() };
             let mut result: *mut libc::passwd = std::ptr::null_mut();

@@ -858,9 +858,70 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         after_boot.contains(&format!(":agent:{daemon_agent_id}\"")),
         "boot must install the admitted uid's own agent chain: {after_boot}"
     );
-    assert!(
-        after_boot.contains(&format!("\"right\":{TEST_AGENT_UID}")),
-        "the installed jump must match the uid the SIGNED manifest admits: {after_boot}"
+    // The binding set B is asserted from the PARSED ruleset, not from the text.
+    // A raw search for `"right":<uid>` fails on valid output that spaces the
+    // colon, and finding that scalar anywhere does not prove it belongs to the
+    // output jump or that B is the exact singleton. Must match the chain name
+    // `agent_wall::nftables::agent_chain_name` derives from the agent id.
+    let expected_chain = format!("agent_{daemon_agent_id}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&after_boot).expect("nft -j must emit parseable JSON");
+    let objects = parsed["nftables"]
+        .as_array()
+        .expect("nft -j emits a `nftables` array");
+    let mut skuid_jumps: Vec<(u64, String, String)> = Vec::new();
+    for object in objects {
+        let Some(rule) = object.get("rule") else {
+            continue;
+        };
+        let Some(exprs) = rule["expr"].as_array() else {
+            continue;
+        };
+        let mut skuid: Option<u64> = None;
+        let mut target: Option<String> = None;
+        for expr in exprs {
+            if let Some(m) = expr.get("match") {
+                if m["left"]["meta"]["key"] == "skuid" {
+                    skuid = m["right"].as_u64();
+                }
+            }
+            // `goto` is the terminating verdict the binding uses; `jump` is
+            // accepted here only so a regression to the non-terminating form is
+            // reported as a WRONG verdict rather than as a missing binding.
+            for verdict in ["goto", "jump"] {
+                if let Some(v) = expr.get(verdict) {
+                    if let Some(name) = v["target"].as_str() {
+                        target = Some(name.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(uid) = skuid {
+            skuid_jumps.push((
+                uid,
+                target.unwrap_or_default(),
+                rule["chain"].as_str().unwrap_or_default().to_string(),
+            ));
+        }
+    }
+    assert_eq!(
+        skuid_jumps.len(),
+        1,
+        "B must be the exact singleton the armed identity requires: {skuid_jumps:?}"
+    );
+    let (bound_uid, jump_target, from_chain) = &skuid_jumps[0];
+    assert_eq!(
+        *bound_uid,
+        u64::from(TEST_AGENT_UID),
+        "the installed jump must match the uid the SIGNED manifest admits"
+    );
+    assert_eq!(
+        jump_target, &expected_chain,
+        "the admitted uid must be routed into its OWN per-agent chain"
+    );
+    assert_eq!(
+        from_chain, "output",
+        "the jump must sit in the hooked base output chain, not a dead chain"
     );
 
     // NO cleanup/reinstall here. `boot` on a privileged Linux host ACQUIRES the

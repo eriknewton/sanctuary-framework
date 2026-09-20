@@ -34,6 +34,19 @@ const BOOT_MANIFEST_LOAD_OPERATION: &str = "boot_manifest_load_authorized";
 /// `BOOT_MANIFEST_LOAD_OPERATION`'s row in `crate::daemon::boot`.
 const BOOT_MANIFEST_LOAD_CONTEXT: &str = "boot";
 
+/// How long a manifest reload waits for the store and audit mutexes before it
+/// gives up.
+///
+/// DERIVATION: it is a SHUTDOWN budget, not a work deadline. The mutation it
+/// guards is a signature verification plus a WAL append, all local, so a wait
+/// this long means another holder is wedged rather than slow; two seconds is
+/// short enough that a shutdown is not visibly delayed by it and long enough
+/// that an fsync under load is not mistaken for a wedge. The boot load and the
+/// IPC/watcher reloads share one value on purpose: a boot that timed out on a
+/// budget the running daemon would have honoured would refuse to start for a
+/// reason the same host tolerates a minute later.
+const MANIFEST_RELOAD_LOCK_BUDGET: Duration = Duration::from_secs(2);
+
 /// The identity this process is ARMED with: written once, at the boot manifest
 /// load, and never again while the process lives.
 ///
@@ -72,18 +85,23 @@ pub(crate) enum AdmittedSubject {
 impl AdmittedIdentity {
     /// Derive the armed identity from a COMMITTED policy snapshot.
     ///
-    /// INVARIANT this enforces at the point of derivation: `confined_agent_uid`
-    /// and `confined_agent_uid_ceiling` are `Some` together or not at all
-    /// (`PolicySnapshot` states it; `snapshot_threads_the_whole_admitted_set`
-    /// asserts it). A uid with no ceiling would mean sealing a uid into a kernel
-    /// rule without the floor admission accepted it under, so it is refused here
+    /// INVARIANT this enforces at the point of derivation, and it is SYMMETRIC:
+    /// `confined_agent_uid` and `confined_agent_uid_ceiling` are `Some` together
+    /// or not at all (`PolicySnapshot` states it;
+    /// `snapshot_threads_the_whole_admitted_set` asserts it). A uid with no
+    /// ceiling would mean sealing a uid into a kernel rule without the floor
+    /// admission accepted it under. A ceiling with NO uid is the same defect seen
+    /// from the other side: the snapshot carries an admission bound that no
+    /// subject was derived from, so reading it as `Unconfined` would silently
+    /// discard half of an inconsistent pair and arm a wall that confines nobody
+    /// under a manifest that meant to confine someone. Both are refused here
     /// rather than defaulted.
     pub(crate) fn from_snapshot(snapshot: &PolicySnapshot) -> Result<Self, String> {
         let subject = match (
             snapshot.confined_agent_uid,
             snapshot.confined_agent_uid_ceiling,
         ) {
-            (None, _) => AdmittedSubject::Unconfined,
+            (None, None) => AdmittedSubject::Unconfined,
             (Some(agent_uid), Some(ceiling)) => AdmittedSubject::Confined {
                 agent_uid,
                 ceiling,
@@ -93,6 +111,12 @@ impl AdmittedIdentity {
                 return Err(format!(
                     "the policy snapshot confines uid {agent_uid} with no admission ceiling; \
                      the two are set together or not at all"
+                ))
+            }
+            (None, Some(ceiling)) => {
+                return Err(format!(
+                    "the policy snapshot carries an admission ceiling {ceiling} with no confined \
+                     uid; the two are set together or not at all"
                 ))
             }
         };
@@ -464,7 +488,7 @@ impl DecisionEngine {
             operation,
             context,
             self.mutation_cancel.as_ref(),
-            Duration::from_secs(2),
+            MANIFEST_RELOAD_LOCK_BUDGET,
         )
     }
 
@@ -497,7 +521,7 @@ impl DecisionEngine {
             BOOT_MANIFEST_LOAD_OPERATION,
             BOOT_MANIFEST_LOAD_CONTEXT,
             self.mutation_cancel.as_ref(),
-            Duration::from_secs(2),
+            MANIFEST_RELOAD_LOCK_BUDGET,
             IdentityGate::BootFreeze,
         )
     }
@@ -948,7 +972,15 @@ pub(crate) enum ManifestReloadAuthorizationError {
     /// The candidate would change the identity this process armed at boot. A
     /// POLICY refusal: the prior snapshot stays live and the component that saw
     /// it keeps running, which is why it is not an `Audit` failure.
-    #[error("manifest reload refused: {0}")]
+    ///
+    /// CROSS-FILE CONTRACT: the variant NAME is part of the message on purpose.
+    /// `src/ipc/server.rs` surfaces this error through an unchanged
+    /// `to_string()`, so the identifying token is the only thing an operator or a
+    /// drill leg can match on; removing it from the format string would silently
+    /// empty the L-R evidence string while every type check still passed. Must
+    /// match the needle in the L-R leg of
+    /// `Review/Sanctuary/Linux_PR3b_Design_Packet_2026-09-19.md`.
+    #[error("manifest reload refused: IdentityChangeWhileArmed: {0}")]
     IdentityChangeWhileArmed(String),
     /// The armed-identity cell could not be written or was already written. A
     /// composition-root bug rather than an operator condition; `boot` turns it
@@ -994,7 +1026,11 @@ pub(crate) enum ControlAuditError {
     /// is an audit failure. Both engine match blocks map it to
     /// [`ManifestReloadAuthorizationError::IdentityChangeWhileArmed`] ahead of
     /// their catch-all so the distinction survives the boundary.
-    #[error("admitted identity change refused while armed: {0}")]
+    /// CROSS-FILE CONTRACT: the variant name is part of the message for the same
+    /// reason as on `ManifestReloadAuthorizationError`. A caller that surfaces
+    /// THIS error's `to_string()` without the mapping above must still produce
+    /// the identifying token.
+    #[error("admitted identity change refused while armed: IdentityChangeWhileArmed: {0}")]
     IdentityChangeWhileArmed(String),
 }
 
@@ -1140,11 +1176,35 @@ mod armed_identity_tests {
     }
 
     /// One signed manifest bundle: the manifest bytes plus its rule files.
+    /// The ceiling every fixture manifest admits unless a test asks for another.
+    /// Named so a test that means to CHANGE the ceiling can, which a hard-coded
+    /// literal in the helper quietly prevented.
+    const FIXTURE_CEILING: u32 = 500;
+
     fn signed_bundle(
         signing: &SigningKey,
         generation: u64,
         agent_uid: Option<u32>,
         gate_uid: Option<u32>,
+        rule_id: &str,
+    ) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+        signed_bundle_with_ceiling(
+            signing,
+            generation,
+            agent_uid,
+            gate_uid,
+            FIXTURE_CEILING,
+            rule_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn signed_bundle_with_ceiling(
+        signing: &SigningKey,
+        generation: u64,
+        agent_uid: Option<u32>,
+        gate_uid: Option<u32>,
+        ceiling: u32,
         rule_id: &str,
     ) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
         use crate::manifest::verify::{
@@ -1170,7 +1230,7 @@ mod armed_identity_tests {
                 agent_runtime_port_range: None,
                 agent_uid: Some(uid),
                 gate_uid,
-                system_uid_allow_ceiling: 500,
+                system_uid_allow_ceiling: ceiling,
             }),
             operator_baseline: None,
             rules: vec![
@@ -1217,9 +1277,30 @@ mod armed_identity_tests {
         gate_uid: Option<u32>,
         rule_id: &str,
     ) {
+        write_policy_with_ceiling(
+            policy_dir,
+            signing,
+            generation,
+            agent_uid,
+            gate_uid,
+            FIXTURE_CEILING,
+            rule_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_policy_with_ceiling(
+        policy_dir: &std::path::Path,
+        signing: &SigningKey,
+        generation: u64,
+        agent_uid: Option<u32>,
+        gate_uid: Option<u32>,
+        ceiling: u32,
+        rule_id: &str,
+    ) {
         use crate::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
         let (manifest_bytes, rules) =
-            signed_bundle(signing, generation, agent_uid, gate_uid, rule_id);
+            signed_bundle_with_ceiling(signing, generation, agent_uid, gate_uid, ceiling, rule_id);
         std::fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
         for (name, body) in rules {
             std::fs::write(policy_dir.join(RULES_SUBDIR).join(name), body).unwrap();
@@ -1346,12 +1427,27 @@ mod armed_identity_tests {
     }
 
     #[test]
-    fn admitted_to_none_and_a_changed_ceiling_are_both_identity_changes() {
-        for (agent_uid, gate_uid) in [(None, None), (Some(60123), Some(60124))] {
+    fn admitted_to_none_a_gate_uid_and_a_changed_ceiling_are_all_identity_changes() {
+        // The third row is the one the helper used to make unreachable: the
+        // bundle hard-coded ceiling 500, so a "changed ceiling" case was really a
+        // second gate-uid case and the ceiling comparison was never exercised.
+        for (agent_uid, gate_uid, ceiling) in [
+            (None, None, FIXTURE_CEILING),
+            (Some(60123), Some(60124), FIXTURE_CEILING),
+            (Some(60123), None, FIXTURE_CEILING + 100),
+        ] {
             let f = fixture();
             write_policy(&f.policy_dir, &f.signing, 1, Some(60123), None, "r1");
             f.engine.reload_manifest_authorized_at_boot().unwrap();
-            write_policy(&f.policy_dir, &f.signing, 2, agent_uid, gate_uid, "r2");
+            write_policy_with_ceiling(
+                &f.policy_dir,
+                &f.signing,
+                2,
+                agent_uid,
+                gate_uid,
+                ceiling,
+                "r2",
+            );
             let err = f
                 .engine
                 .reload_manifest_authorized("manifest_watcher_reload_authorized", "watcher")
@@ -1361,7 +1457,7 @@ mod armed_identity_tests {
                     err,
                     ManifestReloadAuthorizationError::IdentityChangeWhileArmed(_)
                 ),
-                "uid {agent_uid:?} gate {gate_uid:?} must be refused"
+                "uid {agent_uid:?} gate {gate_uid:?} ceiling {ceiling} must be refused"
             );
         }
     }

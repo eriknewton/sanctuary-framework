@@ -39,7 +39,7 @@ use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine as _;
 use castle_wall_daemon::config::LinuxRuntimePaths;
@@ -51,7 +51,7 @@ use castle_wall_daemon::manifest::verify::{
 use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
 use castle_wall_daemon::nftables::{self, CASTLE_FAMILY, CASTLE_TABLE, ISOLATED_TABLE_PREFIX};
 use castle_wall_daemon::ownership_journal::{
-    DEFAULT_JOURNAL_AUTH_KEY_PATH, DEFAULT_OWNERSHIP_JOURNAL_PATH,
+    self, DEFAULT_JOURNAL_AUTH_KEY_PATH, DEFAULT_OWNERSHIP_JOURNAL_PATH,
 };
 use castle_wall_daemon::runtime_lock::DEFAULT_HOST_LOCK_PATH;
 use castle_wall_daemon::runtime_providers::{
@@ -1389,22 +1389,137 @@ fn a_forced_readback_mismatch_withholds_readiness() {
     cleanup_journal();
 }
 
-/// A7 ordering: the pinned readback line must reach the daemon's stderr no
-/// later than the moment this harness observes `READY=1`.
+/// CAPABILITY: after a fresh acquisition, the ownership journal names THIS
+/// boot's identity, owner marker and kernel handles, and keeps naming them
+/// through a refusal that withholds readiness.
 ///
-/// Real subprocess (`spawn_long_running_daemon`), because the property is
-/// about wall-clock order between two independently-observed events (a stderr
-/// line and a `NOTIFY_SOCKET` datagram) on the REAL boot path; an in-process
-/// call has no separate readiness signal to order against. Both observations
-/// are timestamped by THIS process's own clock as they arrive, which is a
-/// coarser proof than journald's `__MONOTONIC_TIMESTAMP` (what the L-A drill
-/// leg uses on the real systemd unit) but is sufficient to prove the same
-/// causal order the production code enforces: `eprintln!` of the pinned line
-/// happens-before the `activate_kernel_runtime` return that gates `READY=1`
-/// (see the invariant comment beside the `eprintln!` call in
-/// `runtime_providers.rs`).
+/// Why it needs a wired test rather than a unit test: the record is rewritten by
+/// the same best-effort journal write the safety net uses, so the property is
+/// about what the whole acquisition leaves on disk, not about one function's
+/// return value. The schedule drives it end to end: a valid previous-boot
+/// `Owned` record is planted (authenticated with the real key, so the
+/// acquisition treats it as genuine) with no live table, which routes the
+/// acquisition to `FreshCreate`; the readback is then forced to fail, which
+/// drives the refusal path that writes the journal. The journal is READ BACK and
+/// must name this boot, the new marker and the new handles.
+/// Register: defect.linux-pr3b-refusal-record.
 #[test]
-fn readback_line_on_stderr_precedes_readiness() {
+fn a_refusal_after_a_fresh_acquisition_never_restores_the_previous_boots_record() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    write_confining_manifest(dir.path(), &signing);
+    let config = fresh_confining_config(&dir, &signing);
+
+    // PLANT the previous boot's record. The values are deliberately distinctive
+    // so a restored record is unmistakable in the assertion below.
+    const PLANTED_TABLE_HANDLE: u64 = 999_001;
+    const PLANTED_BASE_CHAIN_HANDLE: u64 = 999_002;
+    // CROSS-FILE PIN: the prefix must match `OWNER_MARKER_PREFIX` in
+    // `src/nftables.rs`; the 32 hex digits are the 128-bit nonce `new_owner_marker`
+    // emits, spelled out here so this planted value can never collide with a real
+    // one drawn from /dev/urandom.
+    let planted_marker = format!(
+        "{}deadbeefdeadbeefdeadbeefdeadbeef",
+        nftables::OWNER_MARKER_PREFIX
+    );
+    let planted_boot_id = "00000000-0000-4000-8000-0000000pr3b".to_string();
+    let key = ownership_journal::load_or_generate_auth_key(&journal_auth_key_path())
+        .expect("the isolated key path must be writable");
+    let planted = ownership_journal::OwnershipJournal::owned_with_known_history(
+        ownership_journal::JournalIdentity {
+            schema_version: ownership_journal::JOURNAL_SCHEMA_VERSION,
+            marker: planted_marker.clone(),
+            boot_id: planted_boot_id.clone(),
+            source: ownership_journal::current_source(),
+        },
+        PLANTED_TABLE_HANDLE,
+        PLANTED_BASE_CHAIN_HANDLE,
+        Vec::new(),
+    )
+    .expect("the planted record must be constructible");
+    ownership_journal::store_atomic(&ownership_journal_path(), &planted, &key)
+        .expect("the planted record must store");
+
+    let _forced_mismatch = force_next_agent_binding_readback_mismatch_for_test();
+    let boot_result = daemon::boot(config);
+    let message = match boot_result {
+        Ok(_handle) => panic!("a forced readback mismatch must withhold READY=1"),
+        Err(err) => err.to_string(),
+    };
+    if !message.contains("forced to mismatch") {
+        cleanup_castle_table();
+        cleanup_journal();
+        skip_or_fail_unprivileged(&format!(
+            "boot did not reach the forced readback seam: {message}"
+        ));
+        return;
+    }
+
+    // READ THE JOURNAL BACK. Against the round-1 bytes this is the planted
+    // record again; the fix makes it the record this acquisition created.
+    let after = ownership_journal::load(&ownership_journal_path(), Some(&key))
+        .expect("the journal must still authenticate after the refusal")
+        .expect("the refusal must not clear the ownership record");
+    match after {
+        ownership_journal::OwnershipJournal::Owned {
+            identity,
+            table_handle,
+            base_chain_handle,
+            ..
+        } => {
+            assert_ne!(
+                identity.boot_id, planted_boot_id,
+                "a refusal must not restore a previous boot's identity"
+            );
+            assert_eq!(
+                identity.boot_id,
+                ownership_journal::current_boot_id().expect("a readable boot id"),
+                "the record must name THIS boot"
+            );
+            assert_ne!(
+                identity.marker, planted_marker,
+                "a refusal must not restore a previous boot's owner marker"
+            );
+            assert_ne!(
+                table_handle, PLANTED_TABLE_HANDLE,
+                "a refusal must not restore a previous boot's table handle"
+            );
+            assert_ne!(
+                base_chain_handle, PLANTED_BASE_CHAIN_HANDLE,
+                "a refusal must not restore a previous boot's base chain handle"
+            );
+        }
+        other => panic!("the refusal must leave an Owned record, got {other:?}"),
+    }
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+/// The pinned readback line is emitted on a boot that reaches readiness.
+///
+/// BOUND: this asserts PRESENCE, not order. Timestamping a stderr line on one
+/// consumer thread and a `NOTIFY_SOCKET` datagram on another measures when THIS
+/// process was scheduled to observe each, so a correctly emitted line can sit in
+/// a pipe buffer until after readiness is seen (a red on a correct daemon) and a
+/// slow reader can hide a reversed emission (a green on a wrong one). A test that
+/// can fail on correct code and pass on wrong code is not evidence either way, so
+/// the ordering claim is carried elsewhere.
+///
+/// The ORDERING claim is carried by two things that do not depend on reader
+/// scheduling: the line is emitted from the readback parse result and from
+/// nowhere else (`AGENT_BINDING_READBACK_LINE_PREFIX` has exactly one emission
+/// site), and `agent_binding_readback_mismatch_withholds_readiness` proves a
+/// failed readback withholds `READY=1` entirely. The L-A drill leg orders the two
+/// on the real unit using journald `__MONOTONIC_TIMESTAMP` and the unit's
+/// `ActiveEnterTimestampMonotonic`, which is one clock rather than two threads.
+#[test]
+fn readback_line_is_emitted_on_a_boot_that_reaches_readiness() {
     let _suite = suite_guard();
     cleanup_castle_table();
     cleanup_journal();
@@ -1420,12 +1535,10 @@ fn readback_line_on_stderr_precedes_readiness() {
     let mut child = spawn_long_running_daemon(&dir, &pinned, &notify_path);
 
     // Drain stderr on a background thread so a full pipe can never make the
-    // daemon block on a write while this test is also waiting on the notify
-    // socket below; record the FIRST arrival of the pinned line under a lock
-    // so the reader thread and this thread agree on one instant.
+    // daemon block on a write while this thread waits on the notify socket.
     let stderr = child.stderr.take().expect("stderr must be piped");
-    let readback_seen: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
-    let readback_seen_writer = Arc::clone(&readback_seen);
+    let seen: Arc<Mutex<(bool, bool)>> = Arc::new(Mutex::new((false, false)));
+    let seen_writer = Arc::clone(&seen);
     let reader = std::thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut line = String::new();
@@ -1434,11 +1547,15 @@ fn readback_line_on_stderr_precedes_readiness() {
             match reader.read_line(&mut line) {
                 Ok(0) => break, // EOF: the child closed its stderr end.
                 Ok(_) => {
+                    let mut flags = seen_writer.lock().unwrap();
                     if line.contains(runtime_providers::AGENT_BINDING_READBACK_LINE_PREFIX) {
-                        let mut seen = readback_seen_writer.lock().unwrap();
-                        if seen.is_none() {
-                            *seen = Some(Instant::now());
-                        }
+                        flags.0 = true;
+                    }
+                    // CROSS-FILE PIN: the write-ahead needle L-A3 run 1 greps.
+                    // Must match `AGENT_BINDING_WRITE_AHEAD_LINE_PREFIX` in
+                    // `src/runtime_providers.rs`.
+                    if line.contains(runtime_providers::AGENT_BINDING_WRITE_AHEAD_LINE_PREFIX) {
+                        flags.1 = true;
                     }
                 }
                 Err(_) => break,
@@ -1455,35 +1572,23 @@ fn readback_line_on_stderr_precedes_readiness() {
         skip_or_fail_unprivileged(&reason);
         return;
     }
-    let ready_at = Instant::now();
-
-    // The pinned line is written before `activate_kernel_runtime` returns,
-    // which is itself before `READY=1` is sent, so it should already be
-    // captured; poll briefly for pipe/scheduling slack rather than assuming
-    // the reader thread has been scheduled by this exact instant.
-    let mut readback_at = None;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if let Some(t) = *readback_seen.lock().unwrap() {
-            readback_at = Some(t);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
 
     let pid = child.id().to_string();
     let _ = Command::new("kill").args(["-TERM", pid.as_str()]).status();
     let _ = child.wait();
+    // Joining the reader after the child has exited drains stderr to EOF, so the
+    // flags below are read after every line the daemon wrote, not after whatever
+    // this thread happened to be scheduled to see.
     let _ = reader.join();
 
+    let (readback_seen, write_ahead_seen) = *seen.lock().unwrap();
     assert!(
-        readback_at.is_some(),
+        readback_seen,
         "the pinned readback line must appear on stderr for a boot that reaches READY=1"
     );
     assert!(
-        readback_at.unwrap() <= ready_at,
-        "the readback line must be observed on stderr no later than readiness; \
-         readback_at={readback_at:?} ready_at={ready_at:?}"
+        write_ahead_seen,
+        "the pinned write-ahead line must appear for a boot that installed the binding"
     );
 
     cleanup_castle_table();

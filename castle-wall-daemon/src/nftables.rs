@@ -90,12 +90,15 @@ pub struct AgentUidBinding {
 /// refused only by [`Self::Confined`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpectedAgentBinding {
-    /// The CURRENT policy snapshot confines `agent_uid` under `fortress_id`.
-    /// Every live per-agent binding must carry exactly this uid AND a seal that
-    /// recomputes under this fortress id. This is the trusted expectation the
-    /// design names, and it is read fresh at each comparison, never frozen at
-    /// acquisition: a manifest reload that changes the uid must invalidate a
-    /// stale kernel binding rather than keep blessing it.
+    /// The identity this process FROZE at boot confines `agent_uid` under
+    /// `fortress_id`. Every live per-agent binding must carry exactly this uid
+    /// AND a seal that recomputes under this fortress id. This is the trusted
+    /// expectation the design names, and it is read from the write-once armed
+    /// identity cell (`AdmittedIdentity` in `src/decision.rs`, by way of
+    /// `current_expected_agent_binding` in `src/runtime_providers.rs`), never
+    /// re-derived from the live store: a reload that would change the uid is
+    /// REFUSED while armed, so there is no later value for a comparison to drift
+    /// against.
     Confined { fortress_id: String, agent_uid: u32 },
     /// The current snapshot confines NO agent uid (absent `agent_origin`, or a
     /// non-`uid` mode), or the table was just created and cannot yet hold one.
