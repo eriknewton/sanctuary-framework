@@ -869,7 +869,13 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     let objects = parsed["nftables"]
         .as_array()
         .expect("nft -j emits a `nftables` array");
-    let mut skuid_jumps: Vec<(u64, String, String)> = Vec::new();
+    // TWO DISJOINT SETS, and collecting them together is what made the previous
+    // shape fail on a CORRECT install: a healthy ruleset carries a `skuid` match
+    // TWICE. Once in the hooked base `output` chain (the binding: match the uid,
+    // `goto` its own chain) and once inside that agent chain's own body (match
+    // the uid, mark, queue). Only the first set is B.
+    let mut output_bindings: Vec<(u64, Option<(&'static str, String)>)> = Vec::new();
+    let mut agent_chain_body_uids: Vec<u64> = Vec::new();
     for object in objects {
         let Some(rule) = object.get("rule") else {
             continue;
@@ -877,51 +883,63 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         let Some(exprs) = rule["expr"].as_array() else {
             continue;
         };
+        let chain = rule["chain"].as_str().unwrap_or_default();
         let mut skuid: Option<u64> = None;
-        let mut target: Option<String> = None;
+        // The VERDICT KIND is retained, not flattened: `goto` is the terminating
+        // form the binding requires, and a regression to `jump` must report as a
+        // WRONG verdict rather than pass as a present one.
+        let mut verdict: Option<(&'static str, String)> = None;
         for expr in exprs {
             if let Some(m) = expr.get("match") {
                 if m["left"]["meta"]["key"] == "skuid" {
                     skuid = m["right"].as_u64();
                 }
             }
-            // `goto` is the terminating verdict the binding uses; `jump` is
-            // accepted here only so a regression to the non-terminating form is
-            // reported as a WRONG verdict rather than as a missing binding.
-            for verdict in ["goto", "jump"] {
-                if let Some(v) = expr.get(verdict) {
+            for kind in ["goto", "jump"] {
+                if let Some(v) = expr.get(kind) {
                     if let Some(name) = v["target"].as_str() {
-                        target = Some(name.to_string());
+                        verdict = Some((kind, name.to_string()));
                     }
                 }
             }
         }
-        if let Some(uid) = skuid {
-            skuid_jumps.push((
-                uid,
-                target.unwrap_or_default(),
-                rule["chain"].as_str().unwrap_or_default().to_string(),
-            ));
+        let Some(uid) = skuid else {
+            continue;
+        };
+        if chain == "output" {
+            output_bindings.push((uid, verdict));
+        } else if chain == expected_chain {
+            agent_chain_body_uids.push(uid);
         }
     }
     assert_eq!(
-        skuid_jumps.len(),
+        output_bindings.len(),
         1,
-        "B must be the exact singleton the armed identity requires: {skuid_jumps:?}"
+        "B must be the exact singleton the armed identity requires: {output_bindings:?}"
     );
-    let (bound_uid, jump_target, from_chain) = &skuid_jumps[0];
+    let (bound_uid, verdict) = &output_bindings[0];
     assert_eq!(
         *bound_uid,
         u64::from(TEST_AGENT_UID),
         "the installed jump must match the uid the SIGNED manifest admits"
     );
+    let Some((verdict_kind, jump_target)) = verdict else {
+        panic!("the binding rule must carry a verdict: {output_bindings:?}");
+    };
+    assert_eq!(
+        *verdict_kind, "goto",
+        "the binding uses the TERMINATING verdict; a `jump` returns to `output` and lets \
+         later rules run: {output_bindings:?}"
+    );
     assert_eq!(
         jump_target, &expected_chain,
         "the admitted uid must be routed into its OWN per-agent chain"
     );
+    // The BODY, validated separately: the agent chain re-matches the same uid.
     assert_eq!(
-        from_chain, "output",
-        "the jump must sit in the hooked base output chain, not a dead chain"
+        agent_chain_body_uids,
+        vec![u64::from(TEST_AGENT_UID)],
+        "the agent chain's own body must match the admitted uid and nobody else"
     );
 
     // NO cleanup/reinstall here. `boot` on a privileged Linux host ACQUIRES the

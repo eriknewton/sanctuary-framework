@@ -100,11 +100,15 @@ pub enum ExpectedAgentBinding {
     /// REFUSED while armed, so there is no later value for a comparison to drift
     /// against.
     Confined { fortress_id: String, agent_uid: u32 },
-    /// The current snapshot confines NO agent uid (absent `agent_origin`, or a
-    /// non-`uid` mode), or the table was just created and cannot yet hold one.
-    /// Any live per-agent binding is then unverifiable against a trusted
-    /// expectation, so it reads foreign — absent evidence is not passing
-    /// evidence.
+    /// The identity this process FROZE at boot confines NO agent uid (the frozen
+    /// cell is `Unconfined`: absent `agent_origin`, or a non-`uid` mode), or the
+    /// cell is not set yet because the table was just created. Read from the same
+    /// write-once cell as [`Self::Confined`] (`AdmittedIdentity` in
+    /// `src/decision.rs`, by way of `current_expected_agent_binding` in
+    /// `src/runtime_providers.rs`), never from a fresh store read, so the two
+    /// variants cannot disagree about which snapshot they describe. Any live
+    /// per-agent binding is unverifiable against a trusted expectation under this
+    /// variant, so it reads foreign: absent evidence is not passing evidence.
     NoneConfined,
     /// Shape, seal, agreement and cardinality only, under `fortress_id`, with the
     /// uid NOT compared against a manifest expectation.

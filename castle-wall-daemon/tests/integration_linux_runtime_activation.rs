@@ -56,6 +56,7 @@ use castle_wall_daemon::ownership_journal::{
 use castle_wall_daemon::runtime_lock::DEFAULT_HOST_LOCK_PATH;
 use castle_wall_daemon::runtime_providers::{
     self, force_next_agent_binding_readback_mismatch_for_test,
+    force_next_agent_binding_write_ahead_error_for_test,
 };
 use castle_wall_daemon::DaemonConfig;
 use ed25519_dalek::{Signer, SigningKey};
@@ -1354,7 +1355,13 @@ fn a_forced_readback_mismatch_withholds_readiness() {
     // `integration_gf1_recovery.rs`.
     let _forced_mismatch = force_next_agent_binding_readback_mismatch_for_test();
 
-    match daemon::boot(config) {
+    // The two NEGATIVE observations this test owes (Codex 4b): the readback
+    // success line must not be on stderr, and no readiness datagram may reach a
+    // configured NOTIFY_SOCKET. Both are armed BEFORE the boot call.
+    let readiness = ReadinessProbe::armed();
+    let (boot_result, stderr_text) = stderr_captured(|| daemon::boot(config));
+
+    match boot_result {
         Ok(_handle) => panic!(
             "a forced readback mismatch must withhold READY=1 (return Err), not hand back a \
              ready handle"
@@ -1382,6 +1389,14 @@ fn a_forced_readback_mismatch_withholds_readiness() {
                 "the refusal must go through the A4 readback guard, not some unrelated \
                  acquisition failure; got: {message}"
             );
+            // CROSS-FILE PIN: the needle is the one production emission site's
+            // prefix in `src/runtime_providers.rs`. Asserting its ABSENCE is what
+            // makes moving the emission above the readback branch a RED here.
+            assert!(
+                !stderr_text.contains(runtime_providers::AGENT_BINDING_READBACK_LINE_PREFIX),
+                "a failed readback must emit no readback-success line: {stderr_text}"
+            );
+            readiness.assert_silent();
         }
     }
 
@@ -1390,18 +1405,23 @@ fn a_forced_readback_mismatch_withholds_readiness() {
 }
 
 /// CAPABILITY: after a fresh acquisition, the ownership journal names THIS
-/// boot's identity, owner marker and kernel handles, and keeps naming them
-/// through a refusal that withholds readiness.
+/// boot's identity, owner marker and kernel handles, and a refusal that
+/// withholds readiness leaves that record exactly as the acquisition wrote it.
 ///
-/// Why it needs a wired test rather than a unit test: the record is rewritten by
-/// the same best-effort journal write the safety net uses, so the property is
-/// about what the whole acquisition leaves on disk, not about one function's
-/// return value. The schedule drives it end to end: a valid previous-boot
-/// `Owned` record is planted (authenticated with the real key, so the
-/// acquisition treats it as genuine) with no live table, which routes the
-/// acquisition to `FreshCreate`; the readback is then forced to fail, which
-/// drives the refusal path that writes the journal. The journal is READ BACK and
-/// must name this boot, the new marker and the new handles.
+/// Why it needs a wired test rather than a unit test: the property is about what
+/// the whole acquisition leaves on disk, not about one function's return value.
+/// The schedule drives it end to end: a valid previous-boot `Owned` record is
+/// planted (authenticated with the real key, so the acquisition treats it as
+/// genuine) with no live table, which routes the acquisition to `FreshCreate`;
+/// the readback is then forced to fail, which drives the refusal path. The
+/// journal is READ BACK and must hold the FRESH record, its confined history
+/// exactly the one uid the write-ahead put there.
+///
+/// BOUND on what it proves: the refusal path no longer writes the journal at
+/// all, so this is a regression guard on the record's contents, not a
+/// discriminator between a correct write and a stale one. The property that
+/// there is no write to get wrong is pinned at the source by
+/// `the_slice_a_refusal_path_never_reads_or_writes_the_journal`.
 /// Register: defect.linux-pr3b-refusal-record.
 #[test]
 fn a_refusal_after_a_fresh_acquisition_never_restores_the_previous_boots_record() {
@@ -1427,7 +1447,13 @@ fn a_refusal_after_a_fresh_acquisition_never_restores_the_previous_boots_record(
         "{}deadbeefdeadbeefdeadbeefdeadbeef",
         nftables::OWNER_MARKER_PREFIX
     );
-    let planted_boot_id = "00000000-0000-4000-8000-0000000pr3b".to_string();
+    // CROSS-FILE PIN: the journal's boot-id grammar is hexadecimal digits and
+    // hyphens only (`ownership_journal::store_atomic` validates it before
+    // writing), so a mnemonic suffix makes the plant unstorable and the test
+    // panics before the schedule it means to drive. These 32 hex digits are
+    // distinct from any real `/proc/sys/kernel/random/boot_id` by construction:
+    // the host's value is random and this one is a fixed pattern.
+    let planted_boot_id = "00000000-0000-4000-8000-00000000d1fe".to_string();
     let key = ownership_journal::load_or_generate_auth_key(&journal_auth_key_path())
         .expect("the isolated key path must be writable");
     let planted = ownership_journal::OwnershipJournal::owned_with_known_history(
@@ -1460,8 +1486,8 @@ fn a_refusal_after_a_fresh_acquisition_never_restores_the_previous_boots_record(
         return;
     }
 
-    // READ THE JOURNAL BACK. Against the round-1 bytes this is the planted
-    // record again; the fix makes it the record this acquisition created.
+    // READ THE JOURNAL BACK: the record this acquisition created, unchanged by
+    // the refusal that followed it.
     let after = ownership_journal::load(&ownership_journal_path(), Some(&key))
         .expect("the journal must still authenticate after the refusal")
         .expect("the refusal must not clear the ownership record");
@@ -1470,7 +1496,7 @@ fn a_refusal_after_a_fresh_acquisition_never_restores_the_previous_boots_record(
             identity,
             table_handle,
             base_chain_handle,
-            ..
+            confined,
         } => {
             assert_ne!(
                 identity.boot_id, planted_boot_id,
@@ -1493,12 +1519,174 @@ fn a_refusal_after_a_fresh_acquisition_never_restores_the_previous_boots_record(
                 base_chain_handle, PLANTED_BASE_CHAIN_HANDLE,
                 "a refusal must not restore a previous boot's base chain handle"
             );
+            // The history is EXACTLY what the acquisition's own write-ahead put
+            // there: one entry, the admitted uid. A refusal that appended to it
+            // would show up here as a second member or a changed role.
+            let history = confined.expect("the fresh record's history is known, not absent");
+            let uids: Vec<u32> = history.iter().map(|entry| entry.uid).collect();
+            assert_eq!(
+                uids,
+                vec![TEST_AGENT_UID],
+                "the refusal must leave the write-ahead's history untouched"
+            );
         }
         other => panic!("the refusal must leave an Owned record, got {other:?}"),
     }
 
     cleanup_castle_table();
     cleanup_journal();
+}
+
+/// CAPABILITY: when the confined-uid write-ahead fails, the daemon refuses
+/// readiness AND installs a safety net that names the uid it was about to bind.
+///
+/// Why it needs a fault-injected wired test rather than a unit test: neither the
+/// pure planner's tests nor a source-region pin can show what the kernel ends up
+/// holding on this arm, and the arm needs a journal failure to reach. The seam
+/// forces the SAME `Result` the real persist returns, so the branch taken here
+/// is the production one. Register: defect.linux-pr3b-refusal-record.
+///
+/// FAILURE MODE worth stating: on an unprivileged runner the boot fails before
+/// it ever reaches the write-ahead, which looks identical to a pass unless the
+/// refusal text is checked; that is what the skip branch below is for, and
+/// `SANCTUARY_EXPECT_PRIVILEGED_LINUX=1` turns the skip into a hard failure.
+#[test]
+fn a_failed_write_ahead_refuses_readiness_and_installs_a_net_naming_the_uid() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    write_confining_manifest(dir.path(), &signing);
+    let config = fresh_confining_config(&dir, &signing);
+
+    // Bound, not discarded: the guard's `Drop` clears the latch, so it must
+    // outlive the one `daemon::boot` call it exists to cover.
+    let _forced_error = force_next_agent_binding_write_ahead_error_for_test();
+    let readiness = ReadinessProbe::armed();
+    let (boot_result, stderr_text) = stderr_captured(|| daemon::boot(config));
+
+    let message = match boot_result {
+        Ok(_handle) => panic!("a failed write-ahead must withhold READY=1"),
+        Err(err) => {
+            assert_activation_failure(&err);
+            err.to_string()
+        }
+    };
+    if !message.contains("write-ahead forced to fail") {
+        cleanup_castle_table();
+        cleanup_journal();
+        skip_or_fail_unprivileged(&format!(
+            "boot did not reach the forced write-ahead seam: {message}"
+        ));
+        return;
+    }
+    assert!(
+        message.contains("could not be written into this boot's confined history"),
+        "the refusal must go through the write-ahead guard: {message}"
+    );
+    // THE NET IS INSTALLED, and its scope NAMES the uid. `net_scope_for_refusal`
+    // unions the resolver's sources with the planner's uncovered list and B, so
+    // the admitted uid reaches rule 1 through source (b) even though nothing was
+    // written to the journal on this path.
+    assert!(
+        message.contains("Installed the safety net"),
+        "a failed write-ahead must not leave the refusal netless: {message}"
+    );
+    assert!(
+        message.contains(&format!("{TEST_AGENT_UID}")),
+        "the installed scope must name the uid the bind was about to make live: {message}"
+    );
+    // The uid was never bound, so neither pinned line may have been emitted.
+    assert!(
+        !stderr_text.contains(runtime_providers::AGENT_BINDING_WRITE_AHEAD_LINE_PREFIX),
+        "a failed write-ahead emits no write-ahead-ok line: {stderr_text}"
+    );
+    assert!(
+        !stderr_text.contains(runtime_providers::AGENT_BINDING_READBACK_LINE_PREFIX),
+        "a boot that never bound emits no readback-success line: {stderr_text}"
+    );
+    readiness.assert_silent();
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+/// Capture this process's stderr for the duration of `body`, and return what it
+/// wrote.
+///
+/// FAILURE MODE worth stating: this swaps fd 2 for the whole PROCESS, so it is
+/// only sound inside the suite guard, which serialises every test in this file.
+/// Run it outside that guard and a concurrent test's stderr lands in the buffer
+/// and a correct daemon reads as a wrong one.
+fn stderr_captured<T>(body: impl FnOnce() -> T) -> (T, String) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    std::io::stderr().flush().ok();
+    let mut file = tempfile::tempfile().expect("a capture file");
+    // SAFETY: plain fd duplication. `saved` is restored onto fd 2 before this
+    // function returns, on every path, so the process keeps a valid stderr.
+    let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+    assert!(saved >= 0, "stderr must be duplicable");
+    use std::os::fd::AsRawFd;
+    // SAFETY: as above.
+    assert!(unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } >= 0);
+    let out = body();
+    std::io::stderr().flush().ok();
+    // SAFETY: as above.
+    unsafe {
+        libc::dup2(saved, libc::STDERR_FILENO);
+        libc::close(saved);
+    }
+    file.seek(SeekFrom::Start(0)).expect("rewind the capture");
+    let mut text = String::new();
+    file.read_to_string(&mut text).expect("read the capture");
+    (out, text)
+}
+
+/// A bound `NOTIFY_SOCKET` that can answer "was `READY=1` ever sent".
+///
+/// FAILURE MODE worth stating: the beacon reads the environment variable ONCE
+/// per boot, so the variable has to be set before `daemon::boot` is called, not
+/// after; set it late and the test proves nothing because no socket was ever
+/// configured.
+struct ReadinessProbe {
+    socket: UnixDatagram,
+    _dir: TempDir,
+}
+
+impl ReadinessProbe {
+    fn armed() -> Self {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("notify.sock");
+        let socket = UnixDatagram::bind(&path).expect("a bindable notify socket");
+        socket
+            .set_nonblocking(true)
+            .expect("the probe must never block the test");
+        std::env::set_var("NOTIFY_SOCKET", &path);
+        Self { socket, _dir: dir }
+    }
+
+    /// Assert nothing was delivered. A readiness datagram that arrives after a
+    /// refusal is the failure this exists to catch.
+    fn assert_silent(&self) {
+        let mut buf = [0u8; 64];
+        match self.socket.recv(&mut buf) {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(n) => panic!(
+                "a refused boot must send no readiness datagram; got {:?}",
+                String::from_utf8_lossy(&buf[..n])
+            ),
+            Err(err) => panic!("unexpected notify-socket error: {err}"),
+        }
+    }
+}
+
+impl Drop for ReadinessProbe {
+    fn drop(&mut self) {
+        std::env::remove_var("NOTIFY_SOCKET");
+    }
 }
 
 /// The pinned readback line is emitted on a boot that reaches readiness.

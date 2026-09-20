@@ -16,13 +16,13 @@ from pathlib import Path
 # four `else { return None; }` arms of recognized_net_json rewritten with the `?` operator to
 # satisfy the clippy gate; two independent-family source reviews accepted it as
 # semantics-preserving before this pin moved. The guard constants it mirrors are unchanged.
-# Refreshed for PR-3b slice A (2026-09-20): nftables.rs gained the inventory-returning
+# Refreshed for PR-3b slice A (2026-09-20, after code-gate round 3): nftables.rs gained the inventory-returning
 # binding-set helper beside verify_owned_castle_table (the set rule shared by acquisition,
 # readback and health), the shared `uid-<U>` agent-id derivation, and doc comments describing
 # the frozen-cell expectation; the rule grammar, the inventory parser and its enum variants,
 # the receipt mint and the net script are byte-unchanged. Two independent-family code gates
 # review the slice before this pin moves. The guard constants it mirrors are unchanged.
-NFTABLES_SOURCE_SHA256 = "17f906825a9c896ecaf905af39238e9ae5357ef73404f201a87bf9b53171c260"
+NFTABLES_SOURCE_SHA256 = "d49c1ec870a2a02a52e6e3c683a474a37d789e780e48126cb4e5191c5e2b95a6"
 
 
 def fail(message):

@@ -25,8 +25,13 @@ use crate::policy::{
 ///
 /// Pinned here rather than at the call site because the boot entry, not
 /// `daemon.rs`, is now the only thing that may use it: the boot entry is what
-/// freezes the armed identity, and an audit row carrying this operation name is
-/// the claim that the freeze happened. Must match the `boot_manifest_load_authorized`
+/// freezes the armed identity.
+///
+/// BOUND on what the row proves: this operation is appended BEFORE the snapshot
+/// is committed and before the identity is frozen, so the row is evidence that
+/// the boot load was AUTHORIZED, never that the freeze happened. The freeze is
+/// proven by the frozen cell itself (`armed_identity`), which is what every
+/// expectation reader consults. Must match the `boot_manifest_load_authorized`
 /// row the drill harness greps and the boot call in `crate::daemon::boot`.
 const BOOT_MANIFEST_LOAD_OPERATION: &str = "boot_manifest_load_authorized";
 

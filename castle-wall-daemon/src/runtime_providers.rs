@@ -1224,6 +1224,10 @@ fn plan_admitted_binding(
         );
     }
 
+    // DEBT(LINUX-PR3B-TYPED-ACQUIRE-REASONS): acquisition refusal reasons travel
+    // as text inside AcquireFailed; typing them touches every acquire_failed
+    // consumer and is a follow-up PR.
+    //
     // (3) THE REGISTRY GATE, exactly once, after the table is proven ours and
     // after the set rule, never inside or ahead of a refusing arm.
     //
@@ -1243,125 +1247,184 @@ fn plan_admitted_binding(
     staged
 }
 
-/// Read the journal record that is CURRENT right now, with the key that is on
-/// disk right now.
+/// THE REFUSAL NET's SCOPE, as a pure function of three already-read inputs.
 ///
-/// INVARIANT this exists to make structural: every refusal after the ownership
-/// proof bases its journal write on the record the acquisition has actually left
-/// behind, never on the pre-match record the acquisition started from. On a fresh
-/// acquisition over a RETAINED previous-boot journal those two differ in boot
-/// identity, owner marker and both handles, and
-/// [`persist_kill_set_write_ahead`] copies all four out of whatever record it is
-/// handed — so writing the pre-match record back would restore the previous
-/// boot's ownership over the record this boot just created, and the next start
-/// would read its own live net as foreign.
+/// INVARIANT at this line, and why the UNION is the floor: each of the three
+/// inputs is evidence, independently obtained, that a particular uid may have a
+/// live process behind the wall this refusal is about to leave standing. The
+/// resolver's kill set and union carry sources (a) the pre-match journal record's
+/// confined history, (b) the identity this process froze at boot and (c) the live
+/// table as the resolver could read it; `uncovered_uids` carries the uids the
+/// PLANNER proved the new binding would not cover; `live_binding_uids` carries
+/// the binding set B the EXECUTOR already parsed. Dropping any one of them
+/// narrows the net below what this process knows, which is the fail-open
+/// direction: the narrowed net's other-principals rule then ACCEPTS a uid whose
+/// jump was deleted while its process kept running. So the answer is never
+/// narrower than the resolution the read-only resolver produced, and widening is
+/// always allowed.
 ///
-/// FAILURE MODE worth stating: an unreadable key or an unauthenticated record
-/// answers `(None, None)`. That skips the best-effort journal write (there is no
-/// record to extend) and never falls back to a stale one; the net is still
-/// installed, resolved from the admitted identity and the live table.
-#[cfg(target_os = "linux")]
-fn current_journal_record(
-    journal_path: &std::path::Path,
-    key_path: &std::path::Path,
-) -> (
-    Option<crate::ownership_journal::JournalAuthKey>,
-    Option<crate::ownership_journal::OwnershipJournal>,
-) {
-    let key = match crate::ownership_journal::read_auth_key(key_path) {
-        Ok(key) => key,
-        Err(_) => return (None, None),
+/// INVARIANT at this line, and why NO journal read or write happens here or
+/// anywhere on the slice-A refusal path: a re-read can fail, and a failed read of
+/// an authenticated record is indistinguishable from an absent one, which reads
+/// as an EMPTY history and narrows the net. The inputs above were all read before
+/// the refusal, so there is nothing left here that can fail and nothing that can
+/// write a record. The journal keeps whatever the acquisition's own match arm
+/// already wrote or confirmed. Register: defect.linux-pr3b-refusal-record.
+///
+/// A raw `u32` cannot be minted into rule 1 outside `crate::safety_net_uid` (that
+/// is the point of [`crate::safety_net_uid::ConfinedUidSet`]'s privacy), so when
+/// a member of the union is NOT already a validated member of the resolution's
+/// identity set the answer is the host-wide shape. That is the widening
+/// direction: host-wide denies that member too.
+#[cfg(any(target_os = "linux", test))]
+fn net_scope_for_refusal(
+    resolution: &SafetyNetResolution,
+    uncovered_uids: &[u32],
+    live_binding_uids: &[u32],
+) -> crate::nftables::SafetyNetScope {
+    use crate::nftables::SafetyNetScope;
+    let named = match &resolution.scope {
+        // Already the widest shape: unknown history, an over-capacity union, an
+        // unreadable overflow value, or an empty deny set. Nothing below may
+        // narrow it, and no union member can widen it further.
+        SafetyNetScope::HostWide => return SafetyNetScope::HostWide,
+        SafetyNetScope::Identity(set) => set.uids(),
     };
-    let record = crate::ownership_journal::load(journal_path, key.as_ref())
-        .ok()
-        .flatten();
-    (key, record)
+    // The resolution's own two lists are the authenticated floor; the planner's
+    // and the executor's lists are the evidence the resolver did not have. A
+    // member the resolver DROPPED (an unattestable uid its validator refused) is
+    // still covered, because it is not in `named` and therefore widens to
+    // host-wide rather than disappearing.
+    let union_is_named = resolution
+        .kill_set
+        .iter()
+        .chain(resolution.deny_union.iter())
+        .chain(uncovered_uids.iter())
+        .chain(live_binding_uids.iter())
+        .all(|uid| named.contains(uid));
+    if union_is_named {
+        resolution.scope.clone()
+    } else {
+        SafetyNetScope::HostWide
+    }
+}
+
+/// The operator sentence for the scope a refusal ACTUALLY installs.
+///
+/// Delegates to the shared producer [`crate::nftables::safety_net_scope_sentence`]
+/// for every pairing that producer models. The one pairing it cannot model is the
+/// widening above (an identity resolution installed host-wide), which it prints as
+/// a defect; that pairing is not a defect here, it is the union covering a uid the
+/// resolution's validated set could not name, so it gets its own sentence.
+/// Must match the repair order in `crate::nftables::SAFETY_NET_REPAIR_ORDER`.
+#[cfg(any(target_os = "linux", test))]
+fn refusal_scope_sentence(
+    installed: &crate::nftables::SafetyNetScope,
+    resolution: &SafetyNetResolution,
+) -> String {
+    use crate::nftables::{SafetyNetScope, SAFETY_NET_REPAIR_ORDER};
+    match (installed, &resolution.scope) {
+        (SafetyNetScope::HostWide, SafetyNetScope::Identity(_)) => format!(
+            "the refusal must cover a uid the deny set could not name, so the net denies \
+             every uid on this host; operator access is not preserved on this path. \
+             {SAFETY_NET_REPAIR_ORDER}"
+        ),
+        _ => crate::nftables::safety_net_scope_sentence(installed, &resolution.reason),
+    }
+}
+
+/// Everything a slice-A refusal needs to install the safety net.
+///
+/// Deliberately carries NO journal path, key path or record: the slice-A refusal
+/// path neither reads nor writes the journal, and a struct with no handle to it
+/// cannot. See the second invariant on [`net_scope_for_refusal`].
+#[cfg(target_os = "linux")]
+struct RefusalNet {
+    /// The scope actually installed, from [`net_scope_for_refusal`].
+    scope: crate::nftables::SafetyNetScope,
+    /// The PR-3 sweep's kill set, sources (a) and (b) only, carried through from
+    /// the read-only resolution.
+    kill_set: Vec<u32>,
+    /// The operator sentence already rendered for `scope`.
+    sentence: String,
 }
 
 /// Refuse an acquisition that has already proven the table is ours, installing
 /// the safety net exactly when the evidence says a uid may be live.
 ///
-/// THE NET-ON-REFUSAL RULE's single execution site. The DECISION is not taken
-/// here: `install_net` comes from [`net_required_on_refusal`] by way of
-/// [`plan_admitted_binding`], so the rule is stated once and applied once.
+/// THE NET-ON-REFUSAL RULE's single execution site. Neither the DECISION nor the
+/// SCOPE is taken here: `net` is `Some` exactly when [`net_required_on_refusal`]
+/// (by way of [`plan_admitted_binding`]) said a uid may be live, and its scope
+/// came from [`net_scope_for_refusal`]. This function executes.
 ///
-/// The record this writes and resolves the net's scope from is READ HERE, at the
-/// moment of refusal, rather than passed in. That is deliberate and structural:
-/// a journal write must be based on the record the acquisition has actually left
-/// on disk, and a caller cannot hand this function anything else because there is
-/// no parameter to hand one through. Register: defect.linux-pr3b-refusal-record.
-///
-/// FAILURE MODE worth stating: the persist is best-effort and the install is not.
-/// Installing the net makes no uid live, so a journal that could not be written
-/// must never stop it; the reverse order would trade a real protection for a
-/// record of one.
+/// FAILURE MODE worth stating: the install is REQUIRED, not best-effort, and a
+/// failed install hooks the PR-3 sweep and still refuses readiness. There is no
+/// journal write on this path at all, so there is no best-effort persist whose
+/// failure could be mistaken for a failed protection.
 #[cfg(target_os = "linux")]
-fn refuse_after_owned_table(
-    decision_engine: &DecisionEngine,
-    journal_path: &std::path::Path,
-    key_path: &std::path::Path,
-    install_net: bool,
-    reason: String,
-) -> EnforcementError {
-    if !install_net {
+fn refuse_after_owned_table(net: Option<RefusalNet>, reason: String) -> EnforcementError {
+    let Some(net) = net else {
         return acquire_failed(format!(
             "{reason} No safety net was installed: this boot's confined history names no uid \
              and the live table carries no per-agent binding, so no agent can have been \
              started under this wall."
         ));
-    }
-    // The CURRENT record, read at the moment of refusal: both the net's scope
-    // (source (a), this boot's confined history) and the journal write below are
-    // based on what the acquisition has actually left on disk.
-    let (key, record_for_journal_write) = current_journal_record(journal_path, key_path);
-    let resolution = resolve_net_scope_at_site(record_for_journal_write.as_ref(), decision_engine);
-    let mut persist_failure: Option<String> = None;
-    if resolution.reason != crate::nftables::SafetyNetReason::UnknownHistory {
-        if let Some(record) = record_for_journal_write.as_ref() {
-            let admitted = admitted_identity(decision_engine);
-            if let Err(err) = persist_kill_set_write_ahead(
-                journal_path,
-                key.as_ref(),
-                record,
-                &resolution.kill_set,
-                admitted,
-            ) {
-                persist_failure = Some(err);
-            }
-        }
-    }
-    let scope_sentence =
-        crate::nftables::safety_net_scope_sentence(&resolution.scope, &resolution.reason);
-    let (refuse_detail, net_installed) = match drift_enforce_fail_closed(
-        || crate::nftables::install_deny_all_safety_net(&resolution.scope),
-        &resolution.kill_set,
-        &resolution.scope,
-    ) {
-        DriftFailClosedOutcome::NetInstalled => (
-            format!("{reason} Installed the safety net and refusing readiness. {scope_sentence}"),
-            true,
-        ),
-        DriftFailClosedOutcome::InstallFailedSweepHooked { net_err } => (
-            format!(
-                "{reason} Safety net installation did not complete ({net_err}); refusing \
-                 readiness. {}",
-                crate::nftables::SAFETY_NET_REPAIR_ORDER
-            ),
-            false,
-        ),
     };
-    let refuse_detail = match persist_failure {
-        None => refuse_detail,
-        Some(persist_err) if net_installed => format!(
-            "{refuse_detail} The confined history could not be written to the journal \
-             ({persist_err}); the next start retries the write."
-        ),
-        Some(persist_err) => format!(
-            "{refuse_detail} The confined history could not be written to the journal \
-             ({persist_err})."
+    let RefusalNet {
+        scope,
+        kill_set,
+        sentence,
+    } = net;
+    let refuse_detail = match drift_enforce_fail_closed(
+        || crate::nftables::install_deny_all_safety_net(&scope),
+        &kill_set,
+        &scope,
+    ) {
+        DriftFailClosedOutcome::NetInstalled => {
+            format!("{reason} Installed the safety net and refusing readiness. {sentence}")
+        }
+        DriftFailClosedOutcome::InstallFailedSweepHooked { net_err } => format!(
+            "{reason} Safety net installation did not complete ({net_err}); refusing \
+             readiness. {}",
+            crate::nftables::SAFETY_NET_REPAIR_ORDER
         ),
     };
     acquire_failed(refuse_detail)
+}
+
+/// Fault-injection seam: forces the NEXT confined-uid write-ahead inside
+/// [`bind_admitted_uid_before_ready`] to fail, so the Linux integration suite can
+/// drive the PRODUCTION persist-failure branch (the one that refuses readiness
+/// and installs the net over the pre-match evidence) without corrupting a real
+/// journal or removing its key mid-boot. Mirrors `RECLAIM_OWNED_PROBE_FORCE_ERROR`
+/// and the readback latch below: absent from a normal build (compiled only under
+/// `test-isolation`), and cleared unconditionally by the RAII guard so a test that
+/// arms it and exits early cannot leave it armed for a later test's persist.
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+static AGENT_BINDING_WRITE_AHEAD_FORCE_ERROR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII handle for the override above; see
+/// [`force_next_agent_binding_write_ahead_error_for_test`].
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub struct ForcedAgentBindingWriteAheadError {
+    _private: (),
+}
+
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+impl Drop for ForcedAgentBindingWriteAheadError {
+    fn drop(&mut self) {
+        AGENT_BINDING_WRITE_AHEAD_FORCE_ERROR.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Arm the override above for exactly the next write-ahead. Returns a guard that
+/// clears the latch on drop; a test must bind it (not `let _ = ...`, which would
+/// drop it immediately and clear the latch before the boot call it covers).
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub fn force_next_agent_binding_write_ahead_error_for_test() -> ForcedAgentBindingWriteAheadError {
+    AGENT_BINDING_WRITE_AHEAD_FORCE_ERROR.store(true, std::sync::atomic::Ordering::SeqCst);
+    ForcedAgentBindingWriteAheadError { _private: () }
 }
 
 /// A7 fail-before test seam: forces the NEXT readback inside
@@ -1436,19 +1499,18 @@ fn bind_admitted_uid_before_ready(
     use crate::nftables::{AgentRulesetId, AgentUidBinding, OwnedBindingSet};
     use crate::ownership_journal::{self as journal, ConfinedRole};
 
-    // TWO NAMED VALUES, TWO CONSUMERS (design round 5, P2-1), and the whole
-    // reason they are named here rather than inlined:
+    // H, computed ONCE from the PRE-MATCH record and scoped to this boot id, and
+    // the whole reason it is named here rather than inlined: it decides WHETHER a
+    // refusal installs a net, and nothing else. A re-read after a fresh create
+    // would already name the admitted uid (the create's own write-ahead put it
+    // there), so a refusal on a table that never bound anyone would install a net
+    // on every fresh registry refusal.
     //
-    //  * `history_for_net_decision` is H, computed ONCE from the PRE-MATCH record
-    //    and scoped to this boot id. It decides WHETHER a refusal installs a net.
-    //    A re-read after a fresh create would already name the admitted uid (the
-    //    create's own write-ahead put it there), so a refusal on a table that
-    //    never bound anyone would install a net on every fresh registry refusal.
-    //  * The record any journal WRITE is based on is read at the moment of the
-    //    write, inside `refuse_after_owned_table`, from the journal as it stands
-    //    THEN. It is never this pre-match value: on a fresh acquisition over a
-    //    retained previous-boot journal the two differ in boot identity, marker
-    //    and both handles.
+    // NO refusal below writes the journal, and none re-reads it: the record this
+    // acquisition's own match arm wrote or confirmed stands, and the net's scope
+    // comes from `net_scope_for_refusal` over evidence already in hand. See the
+    // second invariant on that function for why a re-read here was the fail-open
+    // shape.
     let history_for_net_decision = this_boot_confined_history(existing, boot_id);
 
     let identity = decision_engine.armed_identity();
@@ -1457,12 +1519,14 @@ fn bind_admitted_uid_before_ready(
     // B, the live set of `(agent_id, uid)` bindings, reduced to what the decision
     // consults. The table has already been read once to prove it is ours; this is
     // the read that says what it ROUTES.
+    let mut live_set_inventory: Option<Vec<(String, u32)>> = None;
     let live = match crate::nftables::owned_table_binding_set(ownership, &expectation) {
         Ok(set) => {
             // |B| is read through the ONE accessor that answers it for both
             // outcomes, so the count the net decision consults cannot diverge
             // between the verified and the mismatching arm.
             let binding_count = set.inventory().bindings.len();
+            live_set_inventory = Some(set.inventory().bindings.clone());
             match set {
                 OwnedBindingSet::Verified(_) => LiveBindingSet::Verified { binding_count },
                 OwnedBindingSet::UidMismatch { detail, .. } => LiveBindingSet::Mismatch {
@@ -1476,6 +1540,38 @@ fn bind_admitted_uid_before_ready(
         },
     };
 
+    // B's UIDS, kept from the parse above rather than re-read at the refusal.
+    // The resolver's source (c) reads the live table a SECOND time and yields
+    // nothing when that read fails, so a uid the executor has already seen
+    // routed would drop out of the net on exactly the schedule where the table
+    // is misbehaving. Must match the inventory the set rule consults.
+    let live_binding_uids: Vec<u32> = match &live_set_inventory {
+        Some(bindings) => bindings.iter().map(|(_agent, uid)| *uid).collect(),
+        None => Vec::new(),
+    };
+
+    // THE ONE PLACE a slice-A refusal's net scope is computed, shared by every
+    // arm below. The resolution is read-only (it takes the PRE-MATCH record this
+    // function was handed and never opens the journal), and the union with the
+    // planner's uncovered uids and B is what keeps the installed scope at or
+    // above the authenticated floor. See `net_scope_for_refusal`.
+    let refuse = |install_net: bool, uncovered_uids: &[u32], reason: String| -> EnforcementError {
+        if !install_net {
+            return refuse_after_owned_table(None, reason);
+        }
+        let resolution = resolve_net_scope_at_site(existing, decision_engine);
+        let scope = net_scope_for_refusal(&resolution, uncovered_uids, &live_binding_uids);
+        let sentence = refusal_scope_sentence(&scope, &resolution);
+        refuse_after_owned_table(
+            Some(RefusalNet {
+                scope,
+                kill_set: resolution.kill_set,
+                sentence,
+            }),
+            reason,
+        )
+    };
+
     // EVERY decision this slice makes is taken here, by a pure function whose
     // tests run on any platform. Below this line the code only executes a plan.
     let plan = plan_admitted_binding(identity, &live, &history_for_net_decision, &|subject| {
@@ -1487,24 +1583,11 @@ fn bind_admitted_uid_before_ready(
     });
 
     let (agent_uid, ceiling, install_required) = match plan {
-        BindPlan::RefuseWithNet { reason, .. } => {
-            return Err(refuse_after_owned_table(
-                decision_engine,
-                journal_path,
-                key_path,
-                true,
-                reason,
-            ))
-        }
-        BindPlan::RefuseWithoutNet { reason } => {
-            return Err(refuse_after_owned_table(
-                decision_engine,
-                journal_path,
-                key_path,
-                false,
-                reason,
-            ))
-        }
+        BindPlan::RefuseWithNet {
+            reason,
+            uncovered_uids,
+        } => return Err(refuse(true, &uncovered_uids, reason)),
+        BindPlan::RefuseWithoutNet { reason } => return Err(refuse(false, &[], reason)),
         BindPlan::NothingToBind => return Ok(()),
         BindPlan::Adopt { agent_uid } => (agent_uid, 0, false),
         BindPlan::Install { agent_uid, ceiling } => (agent_uid, ceiling, true),
@@ -1531,11 +1614,9 @@ fn bind_admitted_uid_before_ready(
             Err(err) => {
                 // NOTHING has been written and nothing bound, so the same two
                 // sources the plan consulted still decide the net.
-                return Err(refuse_after_owned_table(
-                    decision_engine,
-                    journal_path,
-                    key_path,
+                return Err(refuse(
                     net_required_mid_plan,
+                    &[],
                     format!(
                         "the journal authentication key is unusable ({err}) so the admitted \
                          uid cannot be written ahead of the kernel bind; refusing readiness."
@@ -1546,23 +1627,39 @@ fn bind_admitted_uid_before_ready(
         // WRITE AHEAD, then bind. The receipt is the kernel loader's required
         // proof that the journal already names this uid: a crash between the
         // two must leave the journal naming MORE than the kernel, never less.
-        let receipt = match journal::persist_confined_uid_write_ahead(
-            journal_path,
-            &key,
-            agent_uid,
-            ConfinedRole::Agent,
-        ) {
+        // TEST-ISOLATION SEAM: a forced error is folded into the SAME `Result` the
+        // real persist returns, BEFORE the branch below, so a test that arms it
+        // exercises the identical production refusal a genuine journal failure
+        // takes, never a parallel test-only path. See
+        // `force_next_agent_binding_write_ahead_error_for_test`.
+        #[cfg(all(target_os = "linux", feature = "test-isolation"))]
+        let forced_write_ahead_error =
+            AGENT_BINDING_WRITE_AHEAD_FORCE_ERROR.swap(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(all(target_os = "linux", feature = "test-isolation")))]
+        let forced_write_ahead_error = false;
+        let persisted = if forced_write_ahead_error {
+            Err(journal::OwnershipJournalError::UnsafeJournal {
+                path: journal_path.to_path_buf(),
+                reason: "test-isolation: confined-uid write-ahead forced to fail".to_string(),
+            })
+        } else {
+            journal::persist_confined_uid_write_ahead(
+                journal_path,
+                &key,
+                agent_uid,
+                ConfinedRole::Agent,
+            )
+        };
+        let receipt = match persisted {
             Ok(receipt) => receipt,
             Err(err) => {
                 // The persist FAILED, so no uid was made live by this process and
                 // the pre-match history decides the net. It is the PREDICATE that
                 // decides, not this arm: H can already name a uid whose jump was
                 // deleted before this start, and that uid is still live.
-                return Err(refuse_after_owned_table(
-                    decision_engine,
-                    journal_path,
-                    key_path,
+                return Err(refuse(
                     net_required_mid_plan,
+                    &[],
                     format!(
                         "the admitted uid {agent_uid} could not be written into this boot's \
                          confined history ({err}), so it must not be bound; refusing \
@@ -1597,15 +1694,14 @@ fn bind_admitted_uid_before_ready(
         ) {
             // The write-ahead SUCCEEDED, so the journal now names this uid even
             // though the kernel step did not complete. The net is unconditional
-            // here BY CONSTRUCTION, not by a skipped predicate: the record on disk
-            // names the uid, so `net_required_on_refusal` over the CURRENT history
-            // would answer yes, and the pre-match value is the wrong input once
-            // the journal has moved.
-            return Err(refuse_after_owned_table(
-                decision_engine,
-                journal_path,
-                key_path,
+            // here BY CONSTRUCTION, not by a skipped predicate: a uid that has
+            // been written ahead may be bound, so the answer over CURRENT evidence
+            // is yes whatever the pre-match predicate said. The SCOPE still covers
+            // it: `agent_uid` is source (b) of the resolution, which reads the
+            // frozen identity cell.
+            return Err(refuse(
                 true,
+                &[],
                 format!(
                     "the admitted uid {agent_uid} was written into this boot's confined \
                      history but the kernel binding did not load ({err}); refusing readiness."
@@ -1638,14 +1734,13 @@ fn bind_admitted_uid_before_ready(
     if let Some(detail) = readback_failure {
         // The net is unconditional here BY CONSTRUCTION: either the write-ahead
         // above just named this uid in the journal, or the plan adopted a live
-        // singleton that names it in the kernel. Both make the predicate's answer
-        // yes over the CURRENT evidence, and the pre-match value would be the
-        // wrong input on the first of the two.
-        return Err(refuse_after_owned_table(
-            decision_engine,
-            journal_path,
-            key_path,
+        // singleton that names it in the kernel. Both make the answer over CURRENT
+        // evidence yes whatever the pre-match predicate said. The SCOPE covers the
+        // uid either way: it is source (b) on the first and source (c) plus B on
+        // the second.
+        return Err(refuse(
             true,
+            &[],
             format!(
                 "the admitted uid's binding did not read back from the kernel ({detail}); \
                  refusing readiness."
@@ -2120,8 +2215,10 @@ impl ComponentProvider for NftablesTableProvider {
             // after: `load_agent_ruleset` refuses a production mutation that has
             // no authenticated active ownership identity, so the order here is a
             // precondition of the bind rather than bookkeeping. An isolated table
-            // skips that check, which is exactly why a macOS or isolated run
-            // cannot show the miss and the Linux wired test asserts the order.
+            // skips that check, which is why a macOS or isolated run cannot show
+            // the miss. The order is pinned at the SOURCE by
+            // `runtime_ownership_is_activated_before_the_agent_ruleset_is_loaded`;
+            // no test in this repo observes it at runtime today.
             crate::nftables::activate_runtime_ownership(&ownership).map_err(|err| {
                 acquire_failed(format!(
                     "could not activate authenticated nft ownership: {err}"
@@ -5752,9 +5849,12 @@ mod tests {
                 "the refused candidate's identity must not have reached the live snapshot"
             );
         }
-        // The component is still acquired: every watcher event above returned
-        // `Ok(())`, which is what keeps the watcher's own supervision loop alive,
-        // and the cell is still the one boot froze.
+        // BOUND on what this test observes: it calls the reload helper directly
+        // and constructs NO watcher component, so it cannot say a component is
+        // still acquired. What it does show is the two facts the component's
+        // supervision loop depends on: every event above returned `Ok(())` (a
+        // refused identity change is non-fatal), and the cell is still the one
+        // boot froze.
         assert_eq!(
             engine.armed_identity().map(|id| id.subject),
             Some(AdmittedSubject::Unconfined)
@@ -6030,6 +6130,40 @@ mod tests {
     }
 
     #[test]
+    fn a_deleted_jump_over_a_historical_uid_plus_a_broken_registry_refuses_with_the_net() {
+        // Packet A7's named schedule (Grok P2-1), the one the two neighbouring
+        // registry tests do NOT plant: B is EMPTY because the jump was deleted,
+        // this boot's history still names 60123, and the registry refuses. The
+        // history alone must carry the decision here: an empty B proves only
+        // that the kernel routes nobody NOW, never that nobody was routed
+        // earlier under this boot's wall.
+        let gate = RecordingGate::refuses();
+        let plan = plan_admitted_binding(
+            Some(&armed_confined(60123, 500)),
+            &empty_binding_set(),
+            &known_history(&[60123]),
+            &gate.gate(),
+        );
+        assert!(
+            matches!(plan, BindPlan::RefuseWithNet { .. }),
+            "the history alone must carry the net decision: got {plan:?}"
+        );
+        assert_eq!(
+            gate.calls.get(),
+            1,
+            "the gate runs once, after reconciliation"
+        );
+        // AND the net that refusal installs NAMES 60123: the plan's own uncovered
+        // list is empty here (the manifest still admits 60123), so the uid can
+        // only reach rule 1 through the resolution's source (a) and (b).
+        let resolution = resolution_at_site(&[60123], Some((60123, None)), &[]);
+        assert_eq!(
+            net_scope_for_refusal(&resolution, &[], &[]).denied_uids(),
+            vec![60123]
+        );
+    }
+
+    #[test]
     fn an_unset_armed_identity_is_a_typed_refusal_that_never_reads_the_registry() {
         let gate = RecordingGate::refuses();
         assert!(matches!(
@@ -6116,6 +6250,132 @@ mod tests {
         ));
     }
 
+    // ---- The refusal net's scope (S1: no journal read, no journal write) ----
+
+    /// The resolution a read-only resolver would produce at a site, built from
+    /// the same pure function production calls. `history` is source (a), `admitted`
+    /// is (b), `live` is (c).
+    fn resolution_at_site(
+        history: &[u32],
+        admitted: Option<(u32, Option<u32>)>,
+        live: &[u32],
+    ) -> SafetyNetResolution {
+        use crate::nftables::LiveTableBindings;
+        use crate::ownership_journal::ConfinedRole;
+        let entries: Vec<(u32, ConfinedRole)> = history
+            .iter()
+            .map(|&uid| (uid, ConfinedRole::Agent))
+            .collect();
+        resolve_safety_net_scope(
+            &known(&entries),
+            admitted,
+            &LiveTableBindings::Bindings(live.to_vec()),
+            overflow_fixture(),
+        )
+    }
+
+    #[test]
+    fn the_codex_1_schedule_names_both_the_historical_and_the_admitted_uid() {
+        // THE SCHEDULE: uid 60123 was bound under this boot's wall, its jump was
+        // deleted, and the daemon restarts admitting 60124. The refusal's net must
+        // deny BOTH: 60124 because the manifest confines it, and 60123 because a
+        // process of its may still be live behind a wall that no longer routes it.
+        // The scope is resolved from evidence already in hand, never from a read
+        // taken at the moment of refusal, so no single failing read can shrink
+        // it. Register: defect.linux-pr3b-refusal-record.
+        let resolution = resolution_at_site(&[60123], Some((60124, None)), &[]);
+        let scope = net_scope_for_refusal(&resolution, &[60123], &[]);
+        let crate::nftables::SafetyNetScope::Identity(set) = &scope else {
+            panic!("both uids are attestable, so the identity scope is installed: {scope:?}");
+        };
+        assert_eq!(set.uids(), vec![60123, 60124]);
+    }
+
+    #[test]
+    fn an_uncovered_uid_is_never_dropped_from_the_refusal_scope() {
+        // The planner's uncovered list is independent evidence. Where the
+        // resolution already names it the scope names it; where the resolution
+        // does NOT (the resolver's own validator refused the member, or its read
+        // of the live table came back without it), the answer widens to host-wide
+        // rather than losing the uid.
+        let named = resolution_at_site(&[60123], Some((60124, None)), &[]);
+        assert!(matches!(
+            net_scope_for_refusal(&named, &[60123], &[]),
+            crate::nftables::SafetyNetScope::Identity(_)
+        ));
+        let without = resolution_at_site(&[], Some((60124, None)), &[]);
+        assert_eq!(
+            net_scope_for_refusal(&without, &[60123], &[]),
+            crate::nftables::SafetyNetScope::HostWide,
+            "a uid the resolution cannot name must widen the net, never vanish from it"
+        );
+    }
+
+    #[test]
+    fn a_live_binding_uid_is_never_dropped_from_the_refusal_scope() {
+        // B is the set the EXECUTOR parsed. The resolver reads the live table a
+        // second time, and that read can fail; when it does, source (c) is empty
+        // and only this input still carries the uid the kernel is routing.
+        let resolution = resolution_at_site(&[], Some((60124, None)), &[]);
+        assert_eq!(
+            net_scope_for_refusal(&resolution, &[], &[60999]),
+            crate::nftables::SafetyNetScope::HostWide,
+            "a uid B names and the resolution does not must widen the net"
+        );
+        let both = resolution_at_site(&[], Some((60124, None)), &[60999]);
+        let scope = net_scope_for_refusal(&both, &[], &[60999]);
+        let crate::nftables::SafetyNetScope::Identity(set) = &scope else {
+            panic!("both reads agree, so the identity scope is installed: {scope:?}");
+        };
+        assert_eq!(set.uids(), vec![60124, 60999]);
+    }
+
+    #[test]
+    fn an_unknown_history_stays_host_wide_whatever_the_other_inputs_say() {
+        use crate::nftables::{LiveTableBindings, SafetyNetReason, SafetyNetScope};
+        let resolution = resolve_safety_net_scope(
+            &ConfinedHistory::Unknown,
+            Some((60124, None)),
+            &LiveTableBindings::Bindings(vec![60125]),
+            overflow_fixture(),
+        );
+        assert_eq!(resolution.reason, SafetyNetReason::UnknownHistory);
+        assert_eq!(
+            net_scope_for_refusal(&resolution, &[60123], &[60125]),
+            SafetyNetScope::HostWide,
+            "no later input may narrow a host-wide resolution"
+        );
+    }
+
+    #[test]
+    fn the_persist_failure_arms_scope_input_is_the_union_the_subtraction_defines() {
+        // Codex 4(a), macOS half. The Linux fault test drives the arm itself; what
+        // a kernel-free run can prove is that the arm's INPUTS resolve to a scope
+        // naming the admitted uid, which is the uid the failed write-ahead was
+        // about to bind. The arm passes no uncovered list (the planner staged an
+        // install, so nothing was uncovered) and B, which is empty on that arm.
+        let resolution = resolution_at_site(&[60123], Some((60123, None)), &[]);
+        let scope = net_scope_for_refusal(&resolution, &[], &[]);
+        assert_eq!(scope.denied_uids(), vec![60123]);
+    }
+
+    #[test]
+    fn the_refusal_sentence_describes_the_scope_that_was_installed() {
+        use crate::nftables::SafetyNetScope;
+        let resolution = resolution_at_site(&[], Some((60124, None)), &[]);
+        let widened = net_scope_for_refusal(&resolution, &[60123], &[]);
+        assert_eq!(widened, SafetyNetScope::HostWide);
+        let sentence = refusal_scope_sentence(&widened, &resolution);
+        assert!(
+            sentence.contains("could not name") && sentence.contains("every uid on this host"),
+            "the widened pairing gets its own sentence, not the defect one: {sentence}"
+        );
+        assert!(
+            !sentence.contains("this pairing is a defect"),
+            "the widening is the design, not a defect: {sentence}"
+        );
+    }
+
     /// The source-region pins for the two properties a macOS run cannot execute:
     /// the net decision at the kernel-step failures, and the record a refusal
     /// bases its journal write on.
@@ -6146,47 +6406,108 @@ mod tests {
             2,
             "the key-load and write-ahead failure arms both pass the predicate"
         );
-        let literal_false = body.matches("            false,\n").count();
-        assert_eq!(
-            literal_false, 1,
-            "the only literal `false` is the plan's own RefuseWithoutNet arm"
-        );
-        let refuse_without_net = body
-            .find("BindPlan::RefuseWithoutNet { reason } => {")
+        // ANCHORED, not distance-measured: find the plan's own no-net arm by its
+        // match pattern and require the ONE literal-false refusal in the whole
+        // body to be the one that arm makes. A byte-distance threshold silently
+        // stops covering the arm the moment the arm grows past it, and it has to
+        // be re-tuned every time rustfmt rewraps the line.
+        let arm_start = body
+            .find("BindPlan::RefuseWithoutNet { reason }")
             .expect("the plan's no-net arm must exist");
-        let false_at = body.find("            false,\n").unwrap();
+        let arm_end = body[arm_start..]
+            .find("\n        BindPlan::")
+            .expect("another plan arm must follow the no-net one")
+            + arm_start;
+        let arm = &body[arm_start..arm_end];
         assert!(
-            false_at > refuse_without_net && false_at - refuse_without_net < 400,
-            "the literal `false` belongs to the RefuseWithoutNet arm and nowhere else"
+            arm.contains("refuse(false,"),
+            "the no-net arm is the one that refuses without a net: {arm}"
+        );
+        assert_eq!(
+            body.matches("refuse(false,").count(),
+            1,
+            "no other arm may hard-code the no-net answer"
         );
     }
 
     #[test]
-    fn a_refusal_after_the_ownership_proof_cannot_be_handed_a_stale_journal_record() {
-        // CAPABILITY: a refusal's journal write is based on the record that is
-        // current at the moment of the write. The helper reads that record
-        // itself and takes no record parameter, so the property holds for every
-        // call site by construction rather than by each one remembering to.
-        let source = fs::read_to_string(
+    fn the_slice_a_refusal_path_never_reads_or_writes_the_journal() {
+        // CAPABILITY: after the ownership proof, a slice-A refusal neither reads
+        // nor writes the ownership journal. The record the acquisition's own
+        // match arm wrote or confirmed stands, and the net's scope comes from
+        // evidence already in hand, so there is no read that can fail and narrow
+        // the net and no write that can restore a superseded record.
+        //
+        // DERIVATION of the needles: `persist_kill_set_write_ahead` is the only
+        // function that writes a confined-history record from a caller-supplied
+        // record, and `journal::load(` / `ownership_journal::load(` is the only
+        // authenticated read. `journal::load_or_generate_auth_key` shares the
+        // `journal::load` prefix and is NOT a record read, which is why both
+        // needles carry the opening parenthesis.
+        let whole = fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime_providers.rs"),
         )
         .unwrap();
-        let start = source
+        let production = &whole[..whole.find("\n#[cfg(test)]\n").expect("a test module")];
+        assert!(
+            !production.contains("fn current_journal_record("),
+            "the refusal-time record re-read is deleted, not merely unused"
+        );
+
+        let helper_start = production
             .find("fn refuse_after_owned_table(")
             .expect("the refusal helper must exist");
-        let signature =
-            &source[start..start + source[start..].find(") -> EnforcementError").unwrap()];
-        assert!(
-            !signature.contains("OwnershipJournal"),
-            "no caller may supply the record a refusal writes: {signature}"
+        let helper_end = production[helper_start..]
+            .find("\n/// Fault-injection seam")
+            .expect("the refusal helper must be followed by the write-ahead seam")
+            + helper_start;
+        let helper = &production[helper_start..helper_end];
+        for needle in [
+            "persist_kill_set_write_ahead",
+            "journal::load(",
+            "ownership_journal::load(",
+            "journal_path",
+            "key_path",
+        ] {
+            assert!(
+                !helper.contains(needle),
+                "the refusal helper must not mention {needle}; it has no journal handle at all"
+            );
+        }
+
+        // The refusal closure inside the bind function is the other half: it is
+        // where the scope is computed, and it must reach the journal no more than
+        // the helper does. The bind function's INSTALL path legitimately writes
+        // ahead (`persist_confined_uid_write_ahead`), so the span checked here is
+        // the closure, anchored at its own `let refuse =` binding.
+        let body = bind_function_source();
+        let closure_start = body
+            .find("let refuse = |install_net: bool")
+            .expect("the one refusal closure must exist");
+        let closure_end = body[closure_start..]
+            .find("\n    };\n")
+            .expect("the refusal closure must close")
+            + closure_start;
+        let closure = &body[closure_start..closure_end];
+        for needle in [
+            "persist_kill_set_write_ahead",
+            "journal::load(",
+            "ownership_journal::load(",
+        ] {
+            assert!(
+                !closure.contains(needle),
+                "the refusal closure must not mention {needle}"
+            );
+        }
+        assert_eq!(
+            body.matches("net_scope_for_refusal(").count(),
+            1,
+            "every refusal arm shares ONE scope computation"
         );
-        assert!(
-            signature.contains("key_path: &std::path::Path"),
-            "the helper resolves the key itself: {signature}"
-        );
-        assert!(
-            bind_function_source().contains("history_for_net_decision"),
-            "the pre-match history keeps its own name, and decides only the net"
+        assert_eq!(
+            body.matches("refuse_after_owned_table(").count(),
+            2,
+            "the helper is reached only through that closure's two arms"
         );
     }
 
