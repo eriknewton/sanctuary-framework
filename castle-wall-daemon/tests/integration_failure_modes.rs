@@ -445,8 +445,16 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
     let handle = boot(config).expect("boot");
     nftables::install_castle_table().expect("install_castle_table");
 
+    // Slice A: this boot's manifest confines `TEST_AGENT_UID`, so `boot` above
+    // already installed the daemon's own `uid-<U>` chain (A3 ii, fresh table).
+    // Loading under a distinct agent id here would bind a SECOND chain to the
+    // same uid, which the live-binding set rule (A3 iii) reads as a proven
+    // loss on the daemon's own health poll and re-arms the deny-all net,
+    // wiping this test's own binding out from under it. Using the same
+    // derived id makes this load a REFRESH of the daemon's own chain instead.
+    let daemon_agent_id = nftables::confined_agent_id(TEST_AGENT_UID);
     let id = AgentRulesetId {
-        agent_id: "f2-test".to_string(),
+        agent_id: daemon_agent_id.clone(),
         // Must match `DaemonConfig.fortress_id` in `fresh_config` and the
         // `fortress_id` in the signed manifest: the seal is recomputed under the
         // fortress the CURRENT snapshot names, so a mismatch reads as foreign.
@@ -456,7 +464,7 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
         rule_id: "r-f2".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script = nftables::build_agent_ruleset("f2-test", TEST_AGENT_UID, &frags);
+    let script = nftables::build_agent_ruleset(&daemon_agent_id, TEST_AGENT_UID, &frags);
     nftables::load_agent_ruleset(
         &id,
         &script,
@@ -471,7 +479,11 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
         .output()
         .expect("pre-list");
     let pre_out = String::from_utf8_lossy(&pre.stdout);
-    assert!(pre_out.contains("agent_f2-test"), "pre-drop chain present");
+    let daemon_chain_needle = format!("agent_{daemon_agent_id}");
+    assert!(
+        pre_out.contains(&daemon_chain_needle),
+        "pre-drop chain present"
+    );
 
     // Simulate daemon crash: drop the handle without orderly shutdown. The
     // IpcServer's Drop impl unbinds the socket; the kernel ruleset is in
@@ -485,7 +497,7 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
         .expect("post-list");
     let post_out = String::from_utf8_lossy(&post.stdout);
     assert!(
-        post_out.contains("agent_f2-test"),
+        post_out.contains(&daemon_chain_needle),
         "section 9 F-2: kernel ruleset must survive a daemon crash; got: {post_out}"
     );
 
@@ -514,7 +526,7 @@ fn f2_runtime_daemon_crash_kernel_rules_persist_after_handle_drop() {
         .expect("re-list");
     let still_out = String::from_utf8_lossy(&still_present.stdout);
     assert!(
-        still_out.contains("agent_f2-test"),
+        still_out.contains(&daemon_chain_needle),
         "rules persist into re-boot"
     );
 
@@ -563,11 +575,20 @@ fn a_live_agent_binding_is_refused_when_the_restart_confines_no_uid() {
 
     let handle = boot(config).expect("boot");
     nftables::install_castle_table().expect("install_castle_table");
+    // Slice A: this boot's manifest confines `TEST_AGENT_UID`, so `boot` above
+    // already installed the daemon's own `uid-<U>` chain. A distinct agent id
+    // here would bind a second chain to the same uid, which the live-binding
+    // set rule (A3 iii) reads as a proven loss on the daemon's own health poll
+    // while `handle` is still alive, unwinding the very binding this test
+    // means to leave live for the restart below. The derived id makes this
+    // load a refresh of the daemon's own chain, so the live table stays the
+    // pristine singleton the restart's reclaim comparison is meant to see.
+    let daemon_agent_id = nftables::confined_agent_id(TEST_AGENT_UID);
     let id = AgentRulesetId {
-        agent_id: "unconfined-restart".to_string(),
+        agent_id: daemon_agent_id.clone(),
         fortress_id: "deadbeef".to_string(),
     };
-    let script = nftables::build_agent_ruleset("unconfined-restart", TEST_AGENT_UID, &[]);
+    let script = nftables::build_agent_ruleset(&daemon_agent_id, TEST_AGENT_UID, &[]);
     nftables::load_agent_ruleset(
         &id,
         &script,
@@ -653,8 +674,16 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
     // refuses.
     nftables::install_castle_table().expect("install");
 
+    // Slice A: this boot's manifest confines `TEST_AGENT_UID`, so `boot` above
+    // already installed the daemon's own `uid-<U>` chain. A distinct agent id
+    // here would bind a second chain to the same uid, which the live-binding
+    // set rule (A3 iii) reads as a proven loss on the very health poll this
+    // test waits on below, healing the table into the deny-all net instead of
+    // the OWNED verdict the test expects. The derived id makes this load a
+    // refresh of the daemon's own chain.
+    let daemon_agent_id = nftables::confined_agent_id(TEST_AGENT_UID);
     let id = AgentRulesetId {
-        agent_id: "f3-test".to_string(),
+        agent_id: daemon_agent_id.clone(),
         // Must match `DaemonConfig.fortress_id` in `fresh_config` and the
         // `fortress_id` in the signed manifest: the seal is recomputed under the
         // fortress the CURRENT snapshot names, so a mismatch reads as foreign.
@@ -664,7 +693,7 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
         rule_id: "r-f3".to_string(),
         nft_expr: "tcp dport 443 accept".to_string(),
     }];
-    let script = nftables::build_agent_ruleset("f3-test", TEST_AGENT_UID, &frags);
+    let script = nftables::build_agent_ruleset(&daemon_agent_id, TEST_AGENT_UID, &frags);
     nftables::load_agent_ruleset(
         &id,
         &script,
@@ -701,7 +730,7 @@ fn f3_runtime_ipc_drop_kernel_rules_persist_and_daemon_stays_up() {
         .expect("post-drop list");
     let out = String::from_utf8_lossy(&kernel_after_drop.stdout);
     assert!(
-        out.contains("agent_f3-test"),
+        out.contains(&format!("agent_{daemon_agent_id}")),
         "section 9 F-3: kernel rules persist on IPC drop; got: {out}"
     );
 

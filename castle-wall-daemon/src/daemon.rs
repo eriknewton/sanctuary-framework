@@ -70,6 +70,14 @@ const MAX_CONSECUTIVE_UNAVAILABLE_HEALTH_READINGS: u32 = 3;
 pub enum DaemonError {
     #[error("F-1 startup failure: {0}")]
     StartupConfig(String),
+    /// The boot manifest load did not leave an armed identity behind. A
+    /// composition-root bug, refused as a startup failure because a daemon with
+    /// no armed identity cannot refuse an identity change it never recorded.
+    #[error(
+        "F-1 startup failure: the boot manifest load left no armed identity, so a policy \
+         change could not be proven to preserve the kernel binding"
+    )]
+    ArmedIdentityNotFrozen,
     #[error("F-4 startup failure: pinned public key load failed: {0}")]
     PinnedKeyLoad(String),
     #[error("F-3 startup failure: IPC bind failed: {0}")]
@@ -145,6 +153,7 @@ pub fn disarm_with(
         journal_key_path: paths.journal_auth_key_path.clone(),
         // Disarm touches only the host lock/journal/table; these fields are unused
         // by the disarm path but the shared config type carries them.
+        agent_registry_path: paths.agent_registry_path.clone(),
         policy_dir: PathBuf::from("/var/lib/sanctuary"),
         poll_interval: KERNEL_RUNTIME_POLL_INTERVAL,
         nfqueue: crate::nfqueue::NfqueueConfig::default(),
@@ -174,6 +183,7 @@ pub fn mode_for_error(err: &DaemonError) -> FailureMode {
         // Disarm is an explicit operator recovery action, not a boot path; it is
         // routed through the filter-install failure mode for a consistent
         // fail-closed operator message when it refuses.
+        DaemonError::ArmedIdentityNotFrozen => FailureMode::StartupPolicyParseFailed,
         DaemonError::Disarm(_) => FailureMode::StartupFilterInstallFailed,
     }
 }
@@ -1133,7 +1143,10 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     // through the same verify -> durable authorization receipt -> exact commit
     // chokepoint used by watcher and IPC. Invalid/absent policy remains a loud
     // deny-default boot; failure of the durable authorization path is fatal.
-    match decision_engine.reload_manifest_authorized("boot_manifest_load_authorized", "boot") {
+    // THE BOOT ENTRY, and the only reload that may write the armed identity. It
+    // freezes the identity under the store guard before it returns, so the
+    // check below is a real state assertion and not a hope.
+    match decision_engine.reload_manifest_authorized_at_boot() {
         Ok(_) => {}
         Err(crate::decision::ManifestReloadAuthorizationError::Verify(err)) => {
             // SAFETY: stderr is the boot-diagnostic contract. A deny-by-default boot with
@@ -1144,6 +1157,16 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
             );
         }
         Err(err) => return Err(DaemonError::ManifestStoreInit(err.to_string())),
+    }
+
+    // A REAL CHECK, not a `debug_assert`: a release build with an unset cell
+    // would bind the socket, accept an authenticated publish and have nothing to
+    // compare it against, which is the exact window the freeze exists to close.
+    // Both continuing outcomes above write the cell (a committed snapshot, or
+    // `Unconfined` on a verification failure), so reaching here unset is a
+    // composition-root bug and refusing to start is the honest response.
+    if decision_engine.armed_identity().is_none() {
+        return Err(DaemonError::ArmedIdentityNotFrozen);
     }
 
     let live_status = Arc::new(LiveStatus::activating());
@@ -1406,6 +1429,9 @@ fn activate_kernel_runtime(
             // Authenticated-journal MAC key, root-owned under the same StateDirectory
             // (blocker 3). Generated on first acquisition; a present-but-unsafe key or
             // a MAC mismatch fails the activation closed.
+            // The operator's agent registry, from the same path set as the lock,
+            // journal and key so an isolated boot cannot read the real one.
+            agent_registry_path: config.linux_runtime_paths.agent_registry_path.clone(),
             journal_key_path: config.linux_runtime_paths.journal_auth_key_path.clone(),
             policy_dir: config.policy_dir.clone(),
             poll_interval: KERNEL_RUNTIME_POLL_INTERVAL,

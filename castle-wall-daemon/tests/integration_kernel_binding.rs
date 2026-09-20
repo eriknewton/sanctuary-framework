@@ -839,6 +839,30 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
 
     let handle = boot(config).expect("daemon boot");
 
+    // WIRED-CONSUMER ASSERTION for slice A: the PRODUCTION composition root, not
+    // a test seam, has already installed the manifest-admitted uid's jump by the
+    // time `boot` returns. A capability whose only witness is its own unit test
+    // is not shipped, and this is the witness that the boot path reaches the
+    // loader. It runs BEFORE the fixture's own load below, so the singleton it
+    // observes can only be the daemon's.
+    let daemon_agent_id = nftables::confined_agent_id(TEST_AGENT_UID);
+    let after_boot = nft_cmd(&[
+        "-a",
+        "-j",
+        "list",
+        "table",
+        CASTLE_FAMILY,
+        isolation::table(),
+    ]);
+    assert!(
+        after_boot.contains(&format!(":agent:{daemon_agent_id}\"")),
+        "boot must install the admitted uid's own agent chain: {after_boot}"
+    );
+    assert!(
+        after_boot.contains(&format!("\"right\":{TEST_AGENT_UID}")),
+        "the installed jump must match the uid the SIGNED manifest admits: {after_boot}"
+    );
+
     // NO cleanup/reinstall here. `boot` on a privileged Linux host ACQUIRES the
     // castle table under the host lock and records its identity in the ownership
     // journal, so deleting it and installing a replacement hands the daemon a
@@ -876,8 +900,12 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     // scope is created: nft validates nothing about a uid at rule-load time (the
     // P0 probe loaded a rule for a uid with no account at all), so unlike the
     // retired cgroup path there is no filesystem object the load depends on.
-    let ruleset_script = nftables::build_agent_ruleset("test-e2e", TEST_AGENT_UID, &frags);
-    let agent_id = ruleset_id("test-e2e");
+    // The SAME agent id the daemon's own boot-time bind used. Under slice A the
+    // live binding set must be exactly `{(uid-<U>, U)}`, so a second chain for
+    // this uid under another id would read as a proven loss on the next health
+    // poll; this load is therefore a refresh of the daemon's chain, not a rival.
+    let ruleset_script = nftables::build_agent_ruleset(&daemon_agent_id, TEST_AGENT_UID, &frags);
+    let agent_id = ruleset_id(&daemon_agent_id);
     nftables::load_agent_ruleset(
         &agent_id,
         &ruleset_script,

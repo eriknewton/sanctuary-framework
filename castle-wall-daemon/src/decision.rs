@@ -8,15 +8,115 @@
 //! packets through the daemon's policy state.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use crate::audit::{AuditRingBuffer, WalError, WalWriter};
 use crate::failure::{default_disposition, FailureDisposition, FailureMode};
 use crate::manifest::canonical_json::CanonicalJsonError;
 use crate::manifest::store::AuthorizedReloadError;
+use crate::manifest::LoadedManifest;
 use crate::manifest::{ManifestStore, ManifestStoreError};
-use crate::policy::{build_audit_event_canonical_json, DeniedReason, EvaluationRequest, Verdict};
+use crate::policy::{
+    build_audit_event_canonical_json, DeniedReason, EvaluationRequest, PolicySnapshot, Verdict,
+};
+
+/// The operation string the boot manifest load audits under.
+///
+/// Pinned here rather than at the call site because the boot entry, not
+/// `daemon.rs`, is now the only thing that may use it: the boot entry is what
+/// freezes the armed identity, and an audit row carrying this operation name is
+/// the claim that the freeze happened. Must match the `boot_manifest_load_authorized`
+/// row the drill harness greps and the boot call in `crate::daemon::boot`.
+const BOOT_MANIFEST_LOAD_OPERATION: &str = "boot_manifest_load_authorized";
+
+/// The context string the boot manifest load audits under. Must match
+/// `BOOT_MANIFEST_LOAD_OPERATION`'s row in `crate::daemon::boot`.
+const BOOT_MANIFEST_LOAD_CONTEXT: &str = "boot";
+
+/// The identity this process is ARMED with: written once, at the boot manifest
+/// load, and never again while the process lives.
+///
+/// `fortress_id` travels WITH the subject so no expectation reader has to reach
+/// back into the manifest store for it. The store is behind a mutex a
+/// control-plane operation can hold across an fsync, and every reader that used
+/// to `try_lock` it had to treat contention as "not confined" — an indeterminate
+/// answer where a definite one exists. The cell is the definite one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdmittedIdentity {
+    /// The fortress the boot snapshot was admitted under. Must match
+    /// `PolicySnapshot::fortress_id` in `src/policy.rs` and
+    /// `AgentRulesetId::fortress_id` in `src/nftables.rs`, which reads it from here.
+    pub(crate) fortress_id: String,
+    /// Who the manifest confines, if anyone.
+    pub(crate) subject: AdmittedSubject,
+}
+
+/// Who a manifest confines. The two variants are not interchangeable: a kernel
+/// binding is legitimate under exactly one of them, so collapsing them into an
+/// `Option<u32>` would lose the difference between "this manifest confines
+/// nobody" and "this manifest's confinement is unknown".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmittedSubject {
+    /// The manifest admits no agent uid. No per-agent binding may be live.
+    Unconfined,
+    /// The manifest admits `agent_uid` under `ceiling`, optionally beside a
+    /// distinct `gate_uid`. All three move together (see `PolicySnapshot`).
+    Confined {
+        agent_uid: u32,
+        ceiling: u32,
+        gate_uid: Option<u32>,
+    },
+}
+
+impl AdmittedIdentity {
+    /// Derive the armed identity from a COMMITTED policy snapshot.
+    ///
+    /// INVARIANT this enforces at the point of derivation: `confined_agent_uid`
+    /// and `confined_agent_uid_ceiling` are `Some` together or not at all
+    /// (`PolicySnapshot` states it; `snapshot_threads_the_whole_admitted_set`
+    /// asserts it). A uid with no ceiling would mean sealing a uid into a kernel
+    /// rule without the floor admission accepted it under, so it is refused here
+    /// rather than defaulted.
+    pub(crate) fn from_snapshot(snapshot: &PolicySnapshot) -> Result<Self, String> {
+        let subject = match (
+            snapshot.confined_agent_uid,
+            snapshot.confined_agent_uid_ceiling,
+        ) {
+            (None, _) => AdmittedSubject::Unconfined,
+            (Some(agent_uid), Some(ceiling)) => AdmittedSubject::Confined {
+                agent_uid,
+                ceiling,
+                gate_uid: snapshot.confined_gate_uid,
+            },
+            (Some(agent_uid), None) => {
+                return Err(format!(
+                    "the policy snapshot confines uid {agent_uid} with no admission ceiling; \
+                     the two are set together or not at all"
+                ))
+            }
+        };
+        Ok(Self {
+            fortress_id: snapshot.fortress_id.clone(),
+            subject,
+        })
+    }
+}
+
+/// Which side of the identity freeze a reload is on.
+///
+/// The boot load is distinguished by THIS TYPE, never by the context string: a
+/// context string is data an IPC caller could someday supply, and the whole
+/// property rests on exactly one reload being allowed to write the cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityGate {
+    /// The one boot-time load. It admits with the cell unset and WRITES the cell
+    /// before returning.
+    BootFreeze,
+    /// Every other reload (watcher, IPC reload, IPC publish). It compares the
+    /// candidate against the frozen cell and refuses any change.
+    Frozen,
+}
 
 /// Fatal-loss reporting must never inherit the liveness failure it is trying
 /// to report. Keep this short: the process still emits a loud diagnostic and
@@ -31,6 +131,14 @@ pub struct DecisionEngine {
     wal_writer: Option<Arc<Mutex<WalWriter>>>,
     audit_buffer: Arc<Mutex<AuditRingBuffer>>,
     mutation_cancel: Arc<AtomicBool>,
+    /// The write-once armed identity, SHARED by every clone of this engine.
+    ///
+    /// It is an `Arc<OnceLock<_>>` and not an `OnceLock<_>` for the same reason
+    /// `mutation_cancel` is an `Arc<AtomicBool>`: the engine is constructed once
+    /// at the composition root and handed to IPC, the watcher and the kernel
+    /// verdict path, and a per-clone cell would be a freeze those paths cannot
+    /// observe.
+    armed_identity: Arc<OnceLock<AdmittedIdentity>>,
 }
 
 impl DecisionEngine {
@@ -63,7 +171,35 @@ impl DecisionEngine {
             wal_writer,
             audit_buffer,
             mutation_cancel,
+            armed_identity: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// The fortress this engine was constructed for.
+    ///
+    /// Exposed so an emission site can name the fortress in a kernel seal without
+    /// reaching into the manifest store. Must match `AgentRulesetId::fortress_id`
+    /// in `src/nftables.rs`, which is the seal input this value becomes.
+    pub(crate) fn fortress_id(&self) -> &str {
+        &self.fortress_id
+    }
+
+    /// The identity frozen at boot, or `None` before the boot load ran.
+    ///
+    /// INVARIANT for every caller: `None` is the FAIL-CLOSED reading. It means
+    /// the boot entry has not written the cell yet, so nothing may be bound and
+    /// no live binding may be blessed. It is never "unconfined".
+    pub(crate) fn armed_identity(&self) -> Option<&AdmittedIdentity> {
+        self.armed_identity.get()
+    }
+
+    /// Freeze an identity WITHOUT a manifest load. Available only to the test
+    /// builds (`cfg(test)` and the `test-isolation` integration feature, the same
+    /// gate `WriteAheadReceipt::for_isolated_test` uses), so no production path
+    /// can freeze an identity the boot manifest load did not derive.
+    #[cfg(any(test, feature = "test-isolation"))]
+    pub(crate) fn freeze_armed_identity_for_test(&self, identity: AdmittedIdentity) -> bool {
+        self.armed_identity.set(identity).is_ok()
     }
 
     /// The shared teardown MUTATION FENCE.
@@ -332,6 +468,86 @@ impl DecisionEngine {
         )
     }
 
+    /// THE BOOT LOAD, and the only reload that may write the armed identity.
+    ///
+    /// It is a separate entry point rather than a flag on the shared one because
+    /// the distinction is a security property, not a mode: every other caller
+    /// keeps its existing signature and passes [`IdentityGate::Frozen`], so no
+    /// edit to `src/ipc/` or `src/manifest/` can reach the freeze.
+    ///
+    /// Ordering that makes the unset-cell admission safe: this runs at
+    /// `daemon::boot` BEFORE `IpcServer::start` binds the socket and before the
+    /// manifest watcher is acquired (the watcher is acquired only inside kernel
+    /// activation), so no other reload can exist while the cell is unset.
+    ///
+    /// A repeat call is a composition-root bug, not an operator condition, and is
+    /// refused BEFORE the reload so a second boot load cannot re-verify a
+    /// manifest under an already-frozen identity.
+    pub(crate) fn reload_manifest_authorized_at_boot(
+        &self,
+    ) -> Result<ManifestReloadSummary, ManifestReloadAuthorizationError> {
+        if self.armed_identity.get().is_some() {
+            return Err(ManifestReloadAuthorizationError::IdentityFreeze(
+                "the boot manifest load ran twice in one process; the armed identity is \
+                 write-once and a second boot load would read as a legitimate change"
+                    .to_string(),
+            ));
+        }
+        self.reload_manifest_authorized_gated(
+            BOOT_MANIFEST_LOAD_OPERATION,
+            BOOT_MANIFEST_LOAD_CONTEXT,
+            self.mutation_cancel.as_ref(),
+            Duration::from_secs(2),
+            IdentityGate::BootFreeze,
+        )
+    }
+
+    /// Refuse a candidate manifest whose admitted identity differs from the one
+    /// this process froze at boot.
+    ///
+    /// INVARIANT, and why it is here rather than after the commit: the kernel has
+    /// a uid bound to it and nothing in this process can un-bind it atomically
+    /// with a policy swap, so an identity change must be refused BEFORE the
+    /// durable authorization receipt that licenses the commit. The refusal is
+    /// therefore the callback's first act after the shutdown check.
+    ///
+    /// The derivation is `PolicySnapshot::from_loaded_manifest` over the exact
+    /// bytes the store already prepared, so the comparison is against the
+    /// candidate that would become live, never against a re-read of disk.
+    fn refuse_identity_change(&self, loaded: &LoadedManifest) -> Result<(), ControlAuditError> {
+        let Some(frozen) = self.armed_identity.get() else {
+            // An unset cell on a NON-boot reload means the freeze has not happened
+            // yet, so there is no identity to compare against. Absent evidence is
+            // not passing evidence: refuse.
+            return Err(ControlAuditError::IdentityChangeWhileArmed(
+                "this process has not frozen an admitted identity yet, so a policy change \
+                 cannot be proven to preserve it"
+                    .to_string(),
+            ));
+        };
+        let candidate = PolicySnapshot::from_loaded_manifest(loaded)
+            .map_err(|err| {
+                ControlAuditError::IdentityChangeWhileArmed(format!(
+                    "the candidate manifest's admitted identity could not be derived ({err}), \
+                     so it cannot be proven to preserve the armed identity"
+                ))
+            })
+            .and_then(|snapshot| {
+                AdmittedIdentity::from_snapshot(&snapshot)
+                    .map_err(ControlAuditError::IdentityChangeWhileArmed)
+            })?;
+        if candidate.subject == frozen.subject {
+            return Ok(());
+        }
+        Err(ControlAuditError::IdentityChangeWhileArmed(format!(
+            "the candidate manifest changes the admitted identity this process armed \
+             (armed={:?} candidate={:?}); the kernel binding cannot follow a live identity \
+             change, so the reload is refused and the prior policy stays live. Repair order: \
+             stop the wall, --disarm, start",
+            frozen.subject, candidate.subject
+        )))
+    }
+
     /// IPC form of the same chokepoint. Mutex acquisition is polled under a
     /// short deadline and shutdown cancellation is checked after every
     /// potentially blocking filesystem/WAL step and immediately before commit.
@@ -343,6 +559,26 @@ impl DecisionEngine {
         context: &str,
         shutdown: &AtomicBool,
         max_wait: Duration,
+    ) -> Result<ManifestReloadSummary, ManifestReloadAuthorizationError> {
+        self.reload_manifest_authorized_gated(
+            operation,
+            context,
+            shutdown,
+            max_wait,
+            IdentityGate::Frozen,
+        )
+    }
+
+    /// The shared implementation behind both reload entry points. `gate` is the
+    /// only difference between them and it is a private type, so the boot
+    /// behaviour cannot be reached from another module.
+    fn reload_manifest_authorized_gated(
+        &self,
+        operation: &str,
+        context: &str,
+        shutdown: &AtomicBool,
+        max_wait: Duration,
+        gate: IdentityGate,
     ) -> Result<ManifestReloadSummary, ManifestReloadAuthorizationError> {
         let deadline = Instant::now() + max_wait;
         let store = self
@@ -356,35 +592,115 @@ impl DecisionEngine {
             }
         })?;
         let mut summary = None;
-        match guard.reload_with_authorization(|loaded| {
-            if shutdown.load(Ordering::SeqCst) {
-                return Err(ControlAuditError::Cancelled);
-            }
-            let candidate = ManifestReloadSummary {
-                signature_b64url: loaded.manifest_signature_b64url.clone(),
-                rule_count: loaded.rule_count,
-            };
-            let detail = format!(
-                "context={context} signature={} rules={}",
-                candidate.signature_b64url, candidate.rule_count
-            );
-            self.append_control_audit_cancellable(operation, &detail, shutdown, deadline)?;
-            summary = Some(candidate);
-            Ok(())
-        }) {
+        // `map(|_| ())` DROPS the `&LoadedManifest` the store hands back. The
+        // borrow is of `guard`, and the boot freeze below has to read
+        // `guard.current_snapshot()` while still holding the same guard; keeping
+        // the returned borrow alive across that read would not compile, and
+        // releasing the guard first would open the window this whole design
+        // closes.
+        let outcome = guard
+            .reload_with_authorization(|loaded| {
+                if shutdown.load(Ordering::SeqCst) {
+                    return Err(ControlAuditError::Cancelled);
+                }
+                // The identity comparison runs BEFORE the success audit append:
+                // a refused reload must leave no `..._authorized` row claiming a
+                // policy change this process did not make.
+                if matches!(gate, IdentityGate::Frozen) {
+                    self.refuse_identity_change(loaded)?;
+                }
+                let candidate = ManifestReloadSummary {
+                    signature_b64url: loaded.manifest_signature_b64url.clone(),
+                    rule_count: loaded.rule_count,
+                };
+                let detail = format!(
+                    "context={context} signature={} rules={}",
+                    candidate.signature_b64url, candidate.rule_count
+                );
+                self.append_control_audit_cancellable(operation, &detail, shutdown, deadline)?;
+                summary = Some(candidate);
+                Ok(())
+            })
+            .map(|_| ());
+        let result = match outcome {
             // Safety: the Ok arm means the authorization callback ran to completion,
             // and its last statement assigns `summary`. Any early return inside the
             // callback yields Err, which the arms below handle.
-            Ok(_) => Ok(summary.expect("authorization callback completed")),
+            Ok(()) => Ok(summary.expect("authorization callback completed")),
             Err(AuthorizedReloadError::Verify(err)) => {
                 Err(ManifestReloadAuthorizationError::Verify(err))
             }
             Err(AuthorizedReloadError::Authorization(ControlAuditError::Cancelled)) => {
                 Err(ManifestReloadAuthorizationError::Cancelled)
             }
+            // AHEAD of the catch-all below on purpose: a refused identity change is
+            // a typed policy refusal, not a failure of the audit channel, and a
+            // consumer that reads it as `Audit` would treat it as fatal.
+            Err(AuthorizedReloadError::Authorization(
+                ControlAuditError::IdentityChangeWhileArmed(detail),
+            )) => Err(ManifestReloadAuthorizationError::IdentityChangeWhileArmed(
+                detail,
+            )),
             Err(AuthorizedReloadError::Authorization(err)) => {
                 Err(ManifestReloadAuthorizationError::Audit(err))
             }
+        };
+        match gate {
+            IdentityGate::Frozen => result,
+            // THE FREEZE, under the store guard this function still holds, for
+            // every outcome that lets boot continue. Returning before the write
+            // would leave a window in which the daemon is running with no armed
+            // identity, and `boot` refuses to start IPC in exactly that state.
+            IdentityGate::BootFreeze => self.freeze_at_boot(&guard, result),
+        }
+    }
+
+    /// Write the armed identity from the outcome of the boot load.
+    ///
+    /// Three outcomes, and each is a different claim about what is live:
+    /// * `Ok`  — the snapshot COMMITTED, read back from the store rather than
+    ///   from the candidate, so the frozen identity is the one being enforced.
+    /// * `Verify` — nothing committed and the daemon continues deny-by-default
+    ///   with no policy, which confines nobody: `Unconfined`, under this
+    ///   engine's own fortress id.
+    /// * anything else — boot aborts, so the cell stays unset and no later
+    ///   reader can mistake a half-started process for an armed one.
+    fn freeze_at_boot(
+        &self,
+        guard: &MutexGuard<'_, ManifestStore>,
+        result: Result<ManifestReloadSummary, ManifestReloadAuthorizationError>,
+    ) -> Result<ManifestReloadSummary, ManifestReloadAuthorizationError> {
+        let identity = match &result {
+            Ok(_) => {
+                let Some(snapshot) = guard.current_snapshot() else {
+                    // A committed reload with no snapshot is a composition bug in
+                    // the store, not an operator condition. Continuing would freeze
+                    // an implicit `Unconfined` over a policy that may confine.
+                    return Err(ManifestReloadAuthorizationError::IdentityFreeze(
+                        "the boot manifest load reported success but the store holds no \
+                         policy snapshot to freeze an identity from"
+                            .to_string(),
+                    ));
+                };
+                match AdmittedIdentity::from_snapshot(snapshot) {
+                    Ok(identity) => identity,
+                    Err(detail) => {
+                        return Err(ManifestReloadAuthorizationError::IdentityFreeze(detail))
+                    }
+                }
+            }
+            Err(ManifestReloadAuthorizationError::Verify(_)) => AdmittedIdentity {
+                fortress_id: self.fortress_id().to_string(),
+                subject: AdmittedSubject::Unconfined,
+            },
+            Err(_) => return result,
+        };
+        match self.armed_identity.set(identity) {
+            Ok(()) => result,
+            Err(_) => Err(ManifestReloadAuthorizationError::IdentityFreeze(
+                "the armed identity was already frozen when the boot load tried to write it"
+                    .to_string(),
+            )),
         }
     }
 
@@ -416,6 +732,11 @@ impl DecisionEngine {
             if shutdown.load(Ordering::SeqCst) {
                 return Err(ControlAuditError::Cancelled);
             }
+            // Publication is an ordinary armed caller: it gets the same refusal,
+            // in the same place (before the success audit append). A publish that
+            // arrives between the boot freeze and kernel activation is refused
+            // against the cell, which is why activation can trust it.
+            self.refuse_identity_change(loaded)?;
             let candidate = ManifestReloadSummary {
                 signature_b64url: loaded.manifest_signature_b64url.clone(),
                 rule_count: loaded.rule_count,
@@ -447,6 +768,14 @@ impl DecisionEngine {
             Err(AuthorizedReloadError::Authorization(ControlAuditError::Cancelled)) => {
                 Err(ManifestReloadAuthorizationError::Cancelled)
             }
+            // AHEAD of the catch-all below, for the same reason as the reload
+            // path: the typed identity refusal must not surface as an audit
+            // failure, which consumers treat as fatal.
+            Err(AuthorizedReloadError::Authorization(
+                ControlAuditError::IdentityChangeWhileArmed(detail),
+            )) => Err(ManifestReloadAuthorizationError::IdentityChangeWhileArmed(
+                detail,
+            )),
             Err(AuthorizedReloadError::Authorization(err)) => {
                 Err(ManifestReloadAuthorizationError::Audit(err))
             }
@@ -616,6 +945,16 @@ pub(crate) enum ManifestReloadAuthorizationError {
     Audit(ControlAuditError),
     #[error("manifest reload cancelled during daemon shutdown")]
     Cancelled,
+    /// The candidate would change the identity this process armed at boot. A
+    /// POLICY refusal: the prior snapshot stays live and the component that saw
+    /// it keeps running, which is why it is not an `Audit` failure.
+    #[error("manifest reload refused: {0}")]
+    IdentityChangeWhileArmed(String),
+    /// The armed-identity cell could not be written or was already written. A
+    /// composition-root bug rather than an operator condition; `boot` turns it
+    /// into a refuse-to-start.
+    #[error("armed identity could not be frozen: {0}")]
+    IdentityFreeze(String),
 }
 
 impl ManifestReloadAuthorizationError {
@@ -650,6 +989,13 @@ pub(crate) enum ControlAuditError {
     Cancelled,
     #[error("control-audit mutex acquisition exceeded shutdown budget")]
     LockTimeout,
+    /// Carried through the authorization callback's error channel because that
+    /// is the only channel the store's mutation primitive offers, NOT because it
+    /// is an audit failure. Both engine match blocks map it to
+    /// [`ManifestReloadAuthorizationError::IdentityChangeWhileArmed`] ahead of
+    /// their catch-all so the distinction survives the boundary.
+    #[error("admitted identity change refused while armed: {0}")]
+    IdentityChangeWhileArmed(String),
 }
 
 impl ControlAuditError {
@@ -728,6 +1074,498 @@ fn cancellable_lock<'a, T>(
             Ok(guard) => return Ok(guard),
             Err(TryLockError::Poisoned(_)) => return Err(LockAcquireError::Poisoned),
             Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}
+
+// The daemon binds the uid a signed manifest admits, and holds that identity for
+// as long as the process runs. These tests cover the freeze at boot, the refusal
+// of any later identity change, and the structural facts the two must rest on.
+// Register: defect.linux-readiness-precedes-confinement.
+#[cfg(test)]
+mod armed_identity_tests {
+    use super::*;
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    use tempfile::TempDir;
+
+    struct Fixture {
+        _dir: TempDir,
+        policy_dir: std::path::PathBuf,
+        signing: SigningKey,
+        store: Arc<Mutex<ManifestStore>>,
+        wal: Arc<Mutex<WalWriter>>,
+        engine: DecisionEngine,
+    }
+
+    const FORTRESS: &str = "deadbeef";
+
+    fn fixture() -> Fixture {
+        let dir = TempDir::new().unwrap();
+        let policy_dir = dir.path().join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let store = Arc::new(Mutex::new(ManifestStore::new(
+            policy_dir.clone(),
+            dir.path().join("pinned.key"),
+            signing.verifying_key().to_bytes(),
+            FORTRESS.to_string(),
+        )));
+        let wal = Arc::new(Mutex::new(
+            WalWriter::open(&dir.path().join("audit.wal")).unwrap(),
+        ));
+        let ring = Arc::new(Mutex::new(AuditRingBuffer::new(
+            64 * 1024,
+            Duration::from_secs(60),
+        )));
+        let engine = DecisionEngine::new(
+            FORTRESS.to_string(),
+            Some(Arc::clone(&store)),
+            Some(Arc::clone(&wal)),
+            ring,
+        );
+        Fixture {
+            _dir: dir,
+            policy_dir,
+            signing,
+            store,
+            wal,
+            engine,
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// One signed manifest bundle: the manifest bytes plus its rule files.
+    fn signed_bundle(
+        signing: &SigningKey,
+        generation: u64,
+        agent_uid: Option<u32>,
+        gate_uid: Option<u32>,
+        rule_id: &str,
+    ) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+        use crate::manifest::verify::{
+            AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+        };
+        let rule_file = format!("{rule_id}.json");
+        let rule_body = format!(
+            "{{\"id\":\"{rule_id}\",\"schema_version\":1,\"created_at\":\"2026-09-19T00:00:00Z\",\
+             \"match\":{{\"ip\":[\"203.0.113.7\"]}},\"disposition\":\"allow\"}}"
+        )
+        .into_bytes();
+        let habeas_file = format!("{}.json", crate::habeas::HABEAS_LOCAL_RULE_ID);
+        let habeas_body = crate::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes().to_vec();
+        let manifest = AllowlistManifest {
+            schema_version: crate::constants::SCHEMA_VERSION_V1,
+            fortress_id: FORTRESS.to_string(),
+            issued_at: "2026-09-19T00:00:00Z".to_string(),
+            generation,
+            agent_origin: agent_uid.map(|uid| AgentOrigin {
+                mode: "uid".to_string(),
+                egress_helper_signing_id: None,
+                egress_helper_team_id: None,
+                agent_runtime_port_range: None,
+                agent_uid: Some(uid),
+                gate_uid,
+                system_uid_allow_ceiling: 500,
+            }),
+            operator_baseline: None,
+            rules: vec![
+                ManifestRuleEntry {
+                    rule_id: rule_id.to_string(),
+                    file: rule_file.clone(),
+                    sha256: sha256_hex(&rule_body),
+                },
+                ManifestRuleEntry {
+                    rule_id: crate::habeas::HABEAS_LOCAL_RULE_ID.to_string(),
+                    file: habeas_file.clone(),
+                    sha256: sha256_hex(&habeas_body),
+                },
+            ],
+        };
+        let canonical = crate::manifest::canonical_json::canonicalize_to_bytes(
+            &serde_json::to_value(&manifest).unwrap(),
+        )
+        .unwrap();
+        let signature = signing.sign(&canonical);
+        let signed = SignedManifest {
+            manifest,
+            signature: ManifestSignature {
+                signature_scheme: crate::constants::SIGNATURE_SCHEME_V1.to_string(),
+                signing_key_id: crate::crypto::castle_wall_signing_key_id(
+                    &signing.verifying_key().to_bytes(),
+                )
+                .unwrap(),
+                signature_b64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(signature.to_bytes()),
+            },
+        };
+        (
+            serde_json::to_vec_pretty(&signed).unwrap(),
+            vec![(rule_file, rule_body), (habeas_file, habeas_body)],
+        )
+    }
+
+    fn write_policy(
+        policy_dir: &std::path::Path,
+        signing: &SigningKey,
+        generation: u64,
+        agent_uid: Option<u32>,
+        gate_uid: Option<u32>,
+        rule_id: &str,
+    ) {
+        use crate::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
+        let (manifest_bytes, rules) =
+            signed_bundle(signing, generation, agent_uid, gate_uid, rule_id);
+        std::fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
+        for (name, body) in rules {
+            std::fs::write(policy_dir.join(RULES_SUBDIR).join(name), body).unwrap();
+        }
+        std::fs::write(policy_dir.join(MANIFEST_FILENAME), manifest_bytes).unwrap();
+    }
+
+    fn audit_operations(wal: &Arc<Mutex<WalWriter>>) -> Vec<String> {
+        wal.lock()
+            .unwrap()
+            .snapshot_after(None, 100)
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                let row: serde_json::Value =
+                    serde_json::from_str(&entry.event_canonical_json).unwrap();
+                row["operation"].as_str().unwrap_or_default().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_verify_failure_at_boot_freezes_unconfined_before_anything_else_can_run() {
+        let f = fixture();
+        // No manifest on disk: the boot load fails verification and the daemon
+        // continues deny-by-default with no policy, which confines nobody.
+        let err = f.engine.reload_manifest_authorized_at_boot().unwrap_err();
+        assert!(matches!(err, ManifestReloadAuthorizationError::Verify(_)));
+        let identity = f.engine.armed_identity().expect("the cell must be written");
+        assert_eq!(identity.subject, AdmittedSubject::Unconfined);
+        assert_eq!(identity.fortress_id, FORTRESS);
+    }
+
+    #[test]
+    fn a_successful_boot_freezes_the_committed_snapshot_identity() {
+        let f = fixture();
+        write_policy(&f.policy_dir, &f.signing, 1, Some(60123), Some(60124), "r1");
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        let identity = f.engine.armed_identity().unwrap();
+        assert_eq!(
+            identity.subject,
+            AdmittedSubject::Confined {
+                agent_uid: 60123,
+                ceiling: 500,
+                gate_uid: Some(60124),
+            }
+        );
+        // The frozen identity is the COMMITTED snapshot's, not a candidate's.
+        let guard = f.store.lock().unwrap();
+        let snapshot = guard.current_snapshot().unwrap();
+        assert_eq!(snapshot.confined_agent_uid, Some(60123));
+        assert_eq!(identity.fortress_id, snapshot.fortress_id);
+    }
+
+    #[test]
+    fn a_frozen_reload_with_an_unset_cell_is_refused() {
+        let f = fixture();
+        write_policy(&f.policy_dir, &f.signing, 1, Some(60123), None, "r1");
+        // No boot load has run, so nothing has been frozen.
+        let err = f
+            .engine
+            .reload_manifest_authorized("watcher_reload", "watcher")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ManifestReloadAuthorizationError::IdentityChangeWhileArmed(_)
+            ),
+            "an unset cell must refuse, never admit: {err}"
+        );
+    }
+
+    #[test]
+    fn a_reload_that_changes_the_admitted_uid_is_refused_and_keeps_the_prior_policy() {
+        let f = fixture();
+        write_policy(&f.policy_dir, &f.signing, 1, Some(60123), None, "r1");
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        // A valid, correctly signed manifest that admits a DIFFERENT uid.
+        write_policy(&f.policy_dir, &f.signing, 2, Some(60125), None, "r2");
+        let err = f
+            .engine
+            .reload_manifest_authorized("manifest_watcher_reload_authorized", "watcher")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ManifestReloadAuthorizationError::IdentityChangeWhileArmed(_)
+        ));
+        // The prior snapshot is still live and the frozen identity is unchanged.
+        assert_eq!(
+            f.store
+                .lock()
+                .unwrap()
+                .current_snapshot()
+                .unwrap()
+                .confined_agent_uid,
+            Some(60123)
+        );
+        assert_eq!(
+            f.engine.armed_identity().unwrap().subject,
+            AdmittedSubject::Confined {
+                agent_uid: 60123,
+                ceiling: 500,
+                gate_uid: None
+            }
+        );
+        // The refusal returns BEFORE the success audit append, so exactly one
+        // authorized row exists: the boot one.
+        let operations = audit_operations(&f.wal);
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|op| op.as_str() == "manifest_watcher_reload_authorized")
+                .count(),
+            0,
+            "a refused reload must leave no success row: {operations:?}"
+        );
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|op| op.as_str() == BOOT_MANIFEST_LOAD_OPERATION)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn admitted_to_none_and_a_changed_ceiling_are_both_identity_changes() {
+        for (agent_uid, gate_uid) in [(None, None), (Some(60123), Some(60124))] {
+            let f = fixture();
+            write_policy(&f.policy_dir, &f.signing, 1, Some(60123), None, "r1");
+            f.engine.reload_manifest_authorized_at_boot().unwrap();
+            write_policy(&f.policy_dir, &f.signing, 2, agent_uid, gate_uid, "r2");
+            let err = f
+                .engine
+                .reload_manifest_authorized("manifest_watcher_reload_authorized", "watcher")
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ManifestReloadAuthorizationError::IdentityChangeWhileArmed(_)
+                ),
+                "uid {agent_uid:?} gate {gate_uid:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_same_identity_rule_change_still_commits_with_its_audit_row() {
+        let f = fixture();
+        write_policy(&f.policy_dir, &f.signing, 1, Some(60123), None, "r1");
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        write_policy(&f.policy_dir, &f.signing, 2, Some(60123), None, "r2");
+        f.engine
+            .reload_manifest_authorized("manifest_watcher_reload_authorized", "watcher")
+            .expect("a rule change that keeps the identity must commit");
+        assert!(audit_operations(&f.wal)
+            .iter()
+            .any(|op| op == "manifest_watcher_reload_authorized"));
+    }
+
+    #[test]
+    fn a_publish_arriving_before_activation_is_refused_against_the_frozen_cell() {
+        let f = fixture();
+        write_policy(&f.policy_dir, &f.signing, 1, Some(60123), None, "r1");
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        let (manifest_bytes, rules) = signed_bundle(&f.signing, 2, Some(60125), None, "r2");
+        let shutdown = AtomicBool::new(false);
+        let err = f
+            .engine
+            .publish_manifest_bundle_authorized_cancellable(
+                &manifest_bytes,
+                &rules,
+                "ipc",
+                &shutdown,
+                Duration::from_secs(2),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ManifestReloadAuthorizationError::IdentityChangeWhileArmed(_)
+            ),
+            "publication must surface the typed refusal, never an audit failure: {err}"
+        );
+        assert_eq!(
+            f.store
+                .lock()
+                .unwrap()
+                .current_snapshot()
+                .unwrap()
+                .confined_agent_uid,
+            Some(60123)
+        );
+    }
+
+    #[test]
+    fn the_second_boot_load_is_refused_before_it_reloads_anything() {
+        let f = fixture();
+        write_policy(&f.policy_dir, &f.signing, 1, Some(60123), None, "r1");
+        f.engine.reload_manifest_authorized_at_boot().unwrap();
+        // Plant a divergent manifest; the refusal must come from the cell check,
+        // so this manifest is never read.
+        write_policy(&f.policy_dir, &f.signing, 2, Some(60125), None, "r2");
+        let err = f.engine.reload_manifest_authorized_at_boot().unwrap_err();
+        assert!(matches!(
+            err,
+            ManifestReloadAuthorizationError::IdentityFreeze(_)
+        ));
+        assert_eq!(
+            f.store
+                .lock()
+                .unwrap()
+                .current_snapshot()
+                .unwrap()
+                .confined_agent_uid,
+            Some(60123),
+            "the refused second boot load must not have reloaded anything"
+        );
+    }
+
+    #[test]
+    fn every_clone_of_the_engine_observes_one_cell() {
+        let f = fixture();
+        write_policy(&f.policy_dir, &f.signing, 1, Some(60123), None, "r1");
+        let shared = Arc::new(f.engine);
+        let other = Arc::clone(&shared);
+        shared.reload_manifest_authorized_at_boot().unwrap();
+        assert_eq!(
+            other.armed_identity().map(|identity| identity.subject),
+            Some(AdmittedSubject::Confined {
+                agent_uid: 60123,
+                ceiling: 500,
+                gate_uid: None
+            }),
+            "a freeze the IPC-side handle cannot see is not a freeze"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_with_a_uid_and_no_ceiling_is_refused_rather_than_defaulted() {
+        let snapshot = PolicySnapshot {
+            confined_agent_uid: Some(60123),
+            confined_agent_uid_ceiling: None,
+            ..PolicySnapshot::default()
+        };
+        assert!(AdmittedIdentity::from_snapshot(&snapshot).is_err());
+    }
+
+    // ---- structural facts the freeze rests on -------------------------------
+
+    fn source(relative: &str) -> String {
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative))
+            .unwrap_or_else(|err| panic!("read {relative}: {err}"))
+    }
+
+    /// A `#[cfg(test)]` block is not production code, so a token inside one must
+    /// not count toward a production-call-site assertion.
+    fn production_lines(body: &str) -> Vec<&str> {
+        body.lines()
+            .take_while(|line| !line.starts_with("#[cfg(test)]"))
+            .collect()
+    }
+
+    #[test]
+    fn the_boot_freeze_has_exactly_one_production_call_site_and_one_marker() {
+        let daemon = source("src/daemon.rs");
+        let callers = production_lines(&daemon)
+            .iter()
+            .filter(|line| line.contains("reload_manifest_authorized_at_boot("))
+            .count();
+        assert_eq!(
+            callers, 1,
+            "the boot entry must have exactly one production caller, the boot match in daemon.rs"
+        );
+        let decision = source("src/decision.rs");
+        // The marker as an ARGUMENT (trailing comma), which is the form that
+        // selects the freeze. The match arm that READS it is a different shape
+        // and counting it would make this assertion meaningless.
+        let production = production_lines(&decision);
+        let marker_lines: Vec<usize> = production
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim() == "IdentityGate::BootFreeze,")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            marker_lines.len(),
+            1,
+            "the BootFreeze marker must be passed at exactly one site; a second would be a \
+             second thing allowed to write the cell"
+        );
+        // And that one site is INSIDE the boot wrapper, not in some other call.
+        let wrapper_at = production
+            .iter()
+            .position(|line| line.contains("fn reload_manifest_authorized_at_boot("))
+            .expect("the boot wrapper must exist");
+        let next_fn_at = production
+            .iter()
+            .enumerate()
+            .skip(wrapper_at + 1)
+            .find(|(_, line)| line.starts_with("    fn ") || line.starts_with("    pub(crate) fn "))
+            .map(|(index, _)| index)
+            .unwrap_or(production.len());
+        assert!(
+            marker_lines[0] > wrapper_at && marker_lines[0] < next_fn_at,
+            "the BootFreeze argument must sit inside reload_manifest_authorized_at_boot"
+        );
+        for entry in [
+            "reload_manifest_authorized_cancellable",
+            "publish_manifest_bundle_authorized_cancellable",
+        ] {
+            assert!(
+                decision.contains(entry),
+                "{entry} must keep its signature so src/ipc/ needs no edit"
+            );
+        }
+    }
+
+    #[test]
+    fn the_identity_refusal_arm_precedes_the_catch_all_in_both_engine_match_blocks() {
+        let decision = source("src/decision.rs");
+        let production = production_lines(&decision);
+        let typed_positions: Vec<usize> = production
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.trim() == "ControlAuditError::IdentityChangeWhileArmed(detail),"
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let catch_all_positions: Vec<usize> = production
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.trim() == "Err(AuthorizedReloadError::Authorization(err)) => {"
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(typed_positions.len(), 2, "one arm per engine match block");
+        assert_eq!(catch_all_positions.len(), 2);
+        for (typed_at, catch_all_at) in typed_positions.iter().zip(catch_all_positions.iter()) {
+            assert!(
+                typed_at < catch_all_at,
+                "the typed identity arm must precede the catch-all, or the refusal reads as an \
+                 audit failure"
+            );
         }
     }
 }

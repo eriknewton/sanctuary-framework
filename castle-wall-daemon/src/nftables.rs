@@ -1455,6 +1455,17 @@ mod linux {
     /// owned identity — same handles, same marker, same pristine shape. A
     /// delete/recreate (new handles), a mutation, an injected rule, an extra
     /// chain, or a marker change all fail here. (blocker 2)
+    /// The handle-bearing listing the owned-table parser needs.
+    ///
+    /// `-a` is not optional here and is the reason this is a named helper rather
+    /// than the plain `list_castle_table_json_impl`: without it nft omits the
+    /// handles, and the parser would read a perfectly good owned table as having
+    /// no table handle at all. Must match the argv in
+    /// [`verify_owned_castle_table_impl`], whose parse this one mirrors.
+    pub fn list_owned_castle_table_json_for_binding_set() -> Result<String, NftablesError> {
+        run_nft(&["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])
+    }
+
     pub fn verify_owned_castle_table_impl(
         ownership: &CastleTableOwnership,
         expectation: &super::ExpectedAgentBinding,
@@ -2992,6 +3003,170 @@ fn parse_owned_table_inventory_phases(
     }
 }
 
+/// The agent-id prefix the daemon derives from a manifest-admitted uid.
+///
+/// The derivation has to be a FUNCTION and not a `format!` at each site because
+/// three separate places must agree on it byte-for-byte: the acquisition that
+/// installs the binding, the readback that proves it, and the set rule that
+/// health re-applies on every poll. It is also a seal input through
+/// [`AgentRulesetId::agent_id`], so a drift here would make a legitimate rule
+/// fail to verify after a restart. Must match the protection subject
+/// `<fortress>/uid-<U>` the WAL attributes denials to.
+pub const CONFINED_AGENT_ID_PREFIX: &str = "uid-";
+
+/// The agent id for a manifest-admitted uid. See [`CONFINED_AGENT_ID_PREFIX`].
+///
+/// Public because the privileged integration suite has to name the SAME chain
+/// the daemon installs: a test that spelled the id itself would be a
+/// hand-mirrored copy of this derivation, and the first change here would leave
+/// it silently installing a second chain for the same uid.
+#[cfg(any(target_os = "linux", test))]
+pub fn confined_agent_id(agent_uid: u32) -> String {
+    format!("{CONFINED_AGENT_ID_PREFIX}{agent_uid}")
+}
+
+/// Every live `(agent_id, uid)` binding an owned table declares: the set the
+/// slice-A rule is stated over.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnedBindingInventory {
+    /// Ascending by agent id, so a comparison against the expected singleton is
+    /// an equality and not a search.
+    pub(crate) bindings: Vec<(String, u32)>,
+}
+
+/// The owned table's binding set, with the slice-A set rule applied.
+///
+/// This MIRRORS `OwnedInventoryPhases` (same two variants, inventory in both)
+/// rather than re-exporting it: the phases enum is the frozen parser's own
+/// result and phase two there is the uid comparison alone, whereas the verdict
+/// here also carries the cardinality and agent-id half of the set rule. Both
+/// outcomes carry the inventory because the safety net's deny set needs the uids
+/// of a table that IS ours but whose binding set is wrong.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OwnedBindingSet {
+    /// The live set is exactly what the armed identity requires.
+    Verified(OwnedBindingInventory),
+    /// The owned shape passed in full, but the live set is not the one the armed
+    /// identity requires. `detail` is the refusal a caller must surface.
+    UidMismatch {
+        inventory: OwnedBindingInventory,
+        detail: String,
+    },
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl OwnedBindingSet {
+    /// The inventory, whichever outcome this is.
+    pub(crate) fn inventory(&self) -> &OwnedBindingInventory {
+        match self {
+            Self::Verified(inventory) | Self::UidMismatch { inventory, .. } => inventory,
+        }
+    }
+}
+
+/// THE SET RULE, over an already-parsed owned inventory. Pure over the JSON so
+/// every arm is unit-testable without a kernel.
+///
+/// INVARIANT this states, and why a uid comparison alone does not: the frozen
+/// parser compares the uid of each live binding and never the agent id or the
+/// cardinality, so a SECOND chain bound to the same uid under another agent id
+/// reads as `Verified` there. Such a chain would take the uid's packets on rule
+/// order, and its WAL rows would attribute to the wrong protection subject. The
+/// live set must therefore be exactly `{(uid-<U>, U)}` under `Confined { U }`,
+/// and exactly empty under any expectation that confines nobody.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn owned_table_binding_set_from_json(
+    json: &str,
+    ownership: &CastleTableOwnership,
+    expectation: &ExpectedAgentBinding,
+) -> Result<OwnedBindingSet, NftablesError> {
+    let (parsed, phase_two_detail) = match parse_owned_table_inventory_phases(json, expectation)? {
+        OwnedInventoryPhases::Verified(parsed) => (parsed, None),
+        OwnedInventoryPhases::UidMismatch { inventory, detail } => (inventory, Some(detail)),
+    };
+    if &parsed.ownership != ownership {
+        return Err(NftablesError::ForeignState(format!(
+            "sanctuary-castle table identity changed since acquisition \
+             (expected handles table={}/chain={} marker={}, found table={}/chain={} marker={}); \
+             a same-name replacement or mutation is not the owned object",
+            ownership.table_handle,
+            ownership.base_chain_handle,
+            ownership.marker,
+            parsed.ownership.table_handle,
+            parsed.ownership.base_chain_handle,
+            parsed.ownership.marker,
+        )));
+    }
+    let mut bindings: Vec<(String, u32)> = parsed
+        .uid_bindings
+        .iter()
+        .map(|(agent_id, uid)| (agent_id.clone(), *uid))
+        .collect();
+    bindings.sort_unstable();
+    let inventory = OwnedBindingInventory { bindings };
+    // A phase-two uid failure is already a set failure; keep the parser's wording
+    // so the two layers do not describe the same drift differently.
+    if let Some(detail) = phase_two_detail {
+        return Ok(OwnedBindingSet::UidMismatch { inventory, detail });
+    }
+    let expected: Vec<(String, u32)> = match expectation {
+        ExpectedAgentBinding::Confined { agent_uid, .. } => {
+            vec![(confined_agent_id(*agent_uid), *agent_uid)]
+        }
+        // Every other expectation means "no trusted confined uid to bind here",
+        // and the empty expected set is what makes that explicit rather than
+        // implied. The three are listed rather than folded into a wildcard so a
+        // NEW expectation variant has to state its own set-rule answer instead of
+        // silently inheriting "expect nothing", which would read a live binding
+        // as legitimate.
+        ExpectedAgentBinding::NoneConfined
+        | ExpectedAgentBinding::SealOnly { .. }
+        | ExpectedAgentBinding::StructureOnly => Vec::new(),
+    };
+    if inventory.bindings == expected {
+        return Ok(OwnedBindingSet::Verified(inventory));
+    }
+    let detail = format!(
+        "the live per-agent binding set is {:?}, not the {:?} the armed identity requires; a \
+         second chain for the same uid, a chain under another agent id, or a missing binding \
+         is refused fail-closed",
+        inventory.bindings, expected
+    );
+    Ok(OwnedBindingSet::UidMismatch { inventory, detail })
+}
+
+/// [`owned_table_binding_set_from_json`] against the LIVE table.
+#[cfg(target_os = "linux")]
+pub(crate) fn owned_table_binding_set(
+    ownership: &CastleTableOwnership,
+    expectation: &ExpectedAgentBinding,
+) -> Result<OwnedBindingSet, NftablesError> {
+    let json = linux::list_owned_castle_table_json_for_binding_set()?;
+    owned_table_binding_set_from_json(&json, ownership, expectation)
+}
+
+/// The health-path reading of [`owned_table_binding_set`]: anything but the
+/// exact required set is a PROVEN loss of the owned wall.
+///
+/// INVARIANT at this line: health must require the BINDING, not merely the
+/// table. A table whose agent chain was deleted still verifies as the owned
+/// object under the ownership checks alone, and readiness would survive the
+/// removal of the only rule that confines the agent. Mapping a wrong set to
+/// `ForeignState` is what makes `classify_nft_ownership_probe` read it as a
+/// proven loss and re-arm the net that names the uid.
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_owned_castle_table_binding(
+    ownership: &CastleTableOwnership,
+    expectation: &ExpectedAgentBinding,
+) -> Result<(), NftablesError> {
+    match owned_table_binding_set(ownership, expectation)? {
+        OwnedBindingSet::Verified(_) => Ok(()),
+        OwnedBindingSet::UidMismatch { detail, .. } => Err(NftablesError::ForeignState(detail)),
+    }
+}
+
 /// Pure parser used by health and ownership checks. Parsing untrusted inventory
 /// must never mutate the process-global packet-attribution registry.
 pub fn parse_owned_table_identity(
@@ -3985,6 +4160,182 @@ mod tests {
 
     fn fixture_marker() -> String {
         format!("{OWNER_MARKER_PREFIX}0123456789abcdef0123456789abcdef")
+    }
+
+    /// An owned inventory carrying an ARBITRARY set of `(agent_id, uid)`
+    /// bindings, each correctly sealed. The set rule's whole subject is
+    /// cardinality and agent identity, so the fixture has to be able to build
+    /// tables the single-agent fixture above cannot: two chains for one uid, and
+    /// a chain under a foreign agent id bound to the admitted uid. Both are
+    /// shapes the frozen parser ACCEPTS, which is why the set rule exists.
+    fn owned_table_with_bindings(marker: &str, bindings: &[(&str, u32)]) -> String {
+        let mut chains = String::new();
+        let mut rules = String::new();
+        // Handles are distinct per object; the parser only compares the table and
+        // base-chain handles, so the per-agent values only have to be unique.
+        let mut next_handle = 9u64;
+        for (agent_id, uid) in bindings {
+            let chain = agent_chain_name(agent_id);
+            let mark = crate::nfqueue::agent_mark(agent_id);
+            let seal = agent_uid_seal(FIXTURE_FORTRESS, agent_id, *uid);
+            let skuid_match = format!(
+                r#""match":{{"op":"==","left":{{"meta":{{"key":"skuid"}}}},"right":{uid}}}"#
+            );
+            chains.push_str(&format!(
+                r#",{{"chain":{{"family":"inet","table":"sanctuary-castle","name":"{chain}","handle":{next_handle},"comment":"{marker}:agent:{agent_id}"}}}}"#
+            ));
+            next_handle += 1;
+            rules.push_str(&format!(
+                r#",{{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"{chain}","handle":{next_handle},"comment":"{marker}:queue:{agent_id}:uid:{seal}","expr":[{{{skuid_match}}},{{"mangle":{{"key":{{"meta":{{"key":"mark"}}}},"value":{mark}}}}},{{"queue":{{"num":0}}}}]}}}}"#
+            ));
+            next_handle += 1;
+            rules.push_str(&format!(
+                r#",{{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":{next_handle},"comment":"{marker}:jump:{agent_id}:uid:{seal}","expr":[{{{skuid_match}}},{{"goto":{{"target":"{chain}"}}}}]}}}}"#
+            ));
+            next_handle += 1;
+        }
+        format!(
+            r#"{{"nftables":[
+              {{"table":{{"family":"inet","name":"sanctuary-castle","handle":2,"comment":"{marker}"}}}},
+              {{"chain":{{"family":"inet","table":"sanctuary-castle","name":"output","handle":1,
+                "type":"filter","hook":"output","prio":0,"policy":"accept"}}}}{chains}{rules}
+            ]}}"#
+        )
+    }
+
+    fn fixture_ownership(marker: &str) -> CastleTableOwnership {
+        CastleTableOwnership {
+            table_handle: 2,
+            base_chain_handle: 1,
+            marker: marker.to_string(),
+        }
+    }
+
+    fn confined(uid: u32) -> ExpectedAgentBinding {
+        ExpectedAgentBinding::Confined {
+            fortress_id: FIXTURE_FORTRESS.to_string(),
+            agent_uid: uid,
+        }
+    }
+
+    #[test]
+    fn the_set_rule_adopts_exactly_the_required_singleton() {
+        let marker = fixture_marker();
+        let uid = 60123;
+        let json = owned_table_with_bindings(&marker, &[(&confined_agent_id(uid), uid)]);
+        let set =
+            owned_table_binding_set_from_json(&json, &fixture_ownership(&marker), &confined(uid))
+                .expect("the owned shape passes");
+        assert!(matches!(set, OwnedBindingSet::Verified(_)));
+        assert_eq!(
+            set.inventory().bindings,
+            vec![(confined_agent_id(uid), uid)]
+        );
+    }
+
+    #[test]
+    fn the_set_rule_refuses_a_foreign_agent_id_bound_to_the_admitted_uid() {
+        let marker = fixture_marker();
+        let uid = 60123;
+        // The frozen parser compares the UID only, so this table is `Verified`
+        // there. The set rule is the only thing that refuses it.
+        let json = owned_table_with_bindings(&marker, &[("shadow", uid)]);
+        assert!(matches!(
+            parse_owned_table_inventory_phases(&json, &confined(uid)).unwrap(),
+            OwnedInventoryPhases::Verified(_)
+        ));
+        let set =
+            owned_table_binding_set_from_json(&json, &fixture_ownership(&marker), &confined(uid))
+                .unwrap();
+        match set {
+            OwnedBindingSet::UidMismatch { inventory, .. } => {
+                // The inventory survives the refusal: the safety net's deny set
+                // needs the uid a drifted-but-ours table routes.
+                assert_eq!(inventory.bindings, vec![("shadow".to_string(), uid)]);
+            }
+            OwnedBindingSet::Verified(_) => {
+                panic!("a chain under another agent id must not be adopted")
+            }
+        }
+    }
+
+    #[test]
+    fn the_set_rule_refuses_two_chains_for_the_same_uid() {
+        let marker = fixture_marker();
+        let uid = 60123;
+        let json =
+            owned_table_with_bindings(&marker, &[(&confined_agent_id(uid), uid), ("shadow", uid)]);
+        let set =
+            owned_table_binding_set_from_json(&json, &fixture_ownership(&marker), &confined(uid))
+                .unwrap();
+        assert!(matches!(set, OwnedBindingSet::UidMismatch { .. }));
+        assert_eq!(set.inventory().bindings.len(), 2);
+    }
+
+    #[test]
+    fn the_set_rule_reads_an_empty_table_as_a_mismatch_under_confined_and_verified_under_none() {
+        let marker = fixture_marker();
+        let json = owned_table_with_bindings(&marker, &[]);
+        // Under a confining manifest an empty set is NOT the required set. Health
+        // reads that as a proven loss; acquisition reads the same inventory and
+        // installs.
+        let set =
+            owned_table_binding_set_from_json(&json, &fixture_ownership(&marker), &confined(60123))
+                .unwrap();
+        assert!(matches!(set, OwnedBindingSet::UidMismatch { .. }));
+        assert!(set.inventory().bindings.is_empty());
+        // Under a manifest that confines nobody, empty IS the required set.
+        assert!(matches!(
+            owned_table_binding_set_from_json(
+                &json,
+                &fixture_ownership(&marker),
+                &ExpectedAgentBinding::NoneConfined,
+            )
+            .unwrap(),
+            OwnedBindingSet::Verified(_)
+        ));
+    }
+
+    #[test]
+    fn the_set_rule_refuses_a_table_whose_handles_drifted() {
+        let marker = fixture_marker();
+        let uid = 60123;
+        let json = owned_table_with_bindings(&marker, &[(&confined_agent_id(uid), uid)]);
+        let wrong = CastleTableOwnership {
+            table_handle: 999,
+            base_chain_handle: 1,
+            marker: marker.clone(),
+        };
+        assert!(matches!(
+            owned_table_binding_set_from_json(&json, &wrong, &confined(uid)),
+            Err(NftablesError::ForeignState(_))
+        ));
+    }
+
+    #[test]
+    fn the_set_rule_keeps_the_parsers_wording_for_a_uid_drift() {
+        let marker = fixture_marker();
+        // The live binding routes a uid the manifest no longer admits.
+        let json = owned_table_with_bindings(&marker, &[(&confined_agent_id(60123), 60123)]);
+        let set =
+            owned_table_binding_set_from_json(&json, &fixture_ownership(&marker), &confined(60125))
+                .unwrap();
+        match set {
+            OwnedBindingSet::UidMismatch { detail, inventory } => {
+                assert!(
+                    detail.contains("is not the uid the current signed manifest confines"),
+                    "the two layers must not describe one drift differently: {detail}"
+                );
+                assert_eq!(inventory.bindings, vec![(confined_agent_id(60123), 60123)]);
+            }
+            OwnedBindingSet::Verified(_) => panic!("a drifted uid must not be adopted"),
+        }
+    }
+
+    #[test]
+    fn the_confined_agent_id_derivation_is_one_function() {
+        assert_eq!(confined_agent_id(60123), "uid-60123");
+        assert!(confined_agent_id(0).starts_with(CONFINED_AGENT_ID_PREFIX));
     }
 
     #[test]

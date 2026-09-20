@@ -75,6 +75,9 @@ fn config(paths: &LinuxRuntimePaths, policy_dir: &Path) -> LinuxRuntimeConfig {
         lock_path: paths.host_lock_path.clone(),
         journal_path: paths.ownership_journal_path.clone(),
         journal_key_path: paths.journal_auth_key_path.clone(),
+        // From the isolated path set, never a literal: an isolated boot that read
+        // the shipped registry path would consult the operator's own file.
+        agent_registry_path: paths.agent_registry_path.clone(),
         policy_dir: policy_dir.to_path_buf(),
         poll_interval: Duration::from_millis(200),
         nfqueue: NfqueueConfig::default(),

@@ -87,6 +87,11 @@ pub struct LinuxRuntimeConfig {
     /// first acquisition, 0600 root-owned, never leaves the StateDirectory
     /// (blocker 3).
     pub journal_key_path: PathBuf,
+    /// The operator's agent registry, read once at activation. See
+    /// [`crate::agent_registry`]; the value is
+    /// [`crate::config::LinuxRuntimePaths::agent_registry_path`], never a literal,
+    /// so a test cannot reach the operator's real file.
+    pub agent_registry_path: PathBuf,
     /// Directory holding the signed manifest the watcher observes.
     pub policy_dir: PathBuf,
     /// Poll cadence for the watcher's degraded (non-inotify) fallback.
@@ -110,6 +115,7 @@ pub fn linux_production_plan(
             lock_path: config.lock_path.clone(),
             journal_path: config.journal_path.clone(),
             journal_key_path: config.journal_key_path.clone(),
+            agent_registry_path: config.agent_registry_path.clone(),
             decision_engine: Arc::clone(&decision_engine),
         }),
         Box::new(NfqueueProvider {
@@ -132,6 +138,8 @@ struct NftablesTableProvider {
     lock_path: PathBuf,
     journal_path: PathBuf,
     journal_key_path: PathBuf,
+    /// Where the operator declared which account this wall confines.
+    agent_registry_path: PathBuf,
     /// The verified manifest state the reclaim and health comparisons read the
     /// CURRENT confined agent uid from. Held as the same `Arc` the decision
     /// engine holds, never a copy of a value: the expectation must be re-read at
@@ -167,40 +175,37 @@ fn new_owner_marker() -> Result<String, EnforcementError> {
     ))
 }
 
-/// Read the CURRENT trusted agent-binding expectation out of the live policy
-/// snapshot.
+/// Read the trusted agent-binding expectation out of the identity this process
+/// FROZE at boot.
 ///
-/// INVARIANT: read fresh at every comparison, never cached on the component. The
-/// whole point of comparing a live kernel rule against the manifest is that the
-/// manifest is the side an attacker with CAP_NET_ADMIN cannot rewrite; a value
-/// frozen at acquisition would keep blessing a binding the operator has since
-/// replaced.
+/// INVARIANT, and it is the opposite of what this function used to say: the
+/// expectation is frozen at boot and a reload that would change it is REFUSED
+/// (`DecisionEngine::reload_manifest_authorized_at_boot` writes the cell; every
+/// other reload compares against it), so re-reading the live snapshot here would
+/// be re-reading a value that cannot have changed. Reading the cell instead is
+/// what removes the `try_lock` whose failure had to be read as "not confined": a
+/// health probe no longer has an indeterminate answer to fall back from. A
+/// restart that would change the identity refuses through the acquisition drift
+/// path rather than silently re-blessing a stale binding.
 ///
-/// Failure mode when the store is contended or poisoned: this returns
-/// `NoneConfined`, which REFUSES any live per-agent binding. That is the
-/// fail-closed direction — an indeterminate answer withdraws readiness and
-/// re-arms deny-all rather than passing.
+/// Failure mode when the cell is UNSET: `NoneConfined`, which refuses any live
+/// per-agent binding. An unset cell means the boot load has not run, and absent
+/// evidence is not passing evidence.
 #[cfg(target_os = "linux")]
 fn current_expected_agent_binding(
     decision_engine: &DecisionEngine,
 ) -> crate::nftables::ExpectedAgentBinding {
+    use crate::decision::AdmittedSubject;
     use crate::nftables::ExpectedAgentBinding;
-    let Some(store) = decision_engine.manifest_store() else {
-        return ExpectedAgentBinding::NoneConfined;
-    };
-    // A blocking `lock()` here would put the health probe behind a control-plane
-    // fsync; `try_lock` failing is indeterminate, and indeterminate reads as
-    // not-confined, which refuses rather than passes.
-    let Ok(guard) = store.try_lock() else {
-        return ExpectedAgentBinding::NoneConfined;
-    };
-    match guard.current_snapshot() {
-        Some(snapshot) => match snapshot.confined_agent_uid {
-            Some(agent_uid) => ExpectedAgentBinding::Confined {
-                fortress_id: snapshot.fortress_id.clone(),
+    match decision_engine.armed_identity() {
+        Some(identity) => match identity.subject {
+            AdmittedSubject::Confined { agent_uid, .. } => ExpectedAgentBinding::Confined {
+                // The fortress id travels in the cell precisely so this line does
+                // not have to reach back into the store for it.
+                fortress_id: identity.fortress_id.clone(),
                 agent_uid,
             },
-            None => ExpectedAgentBinding::NoneConfined,
+            AdmittedSubject::Unconfined => ExpectedAgentBinding::NoneConfined,
         },
         None => ExpectedAgentBinding::NoneConfined,
     }
@@ -445,19 +450,11 @@ fn resolve_net_scope_at_site(
         Some(OwnershipJournal::Preparing { .. }) | None => ConfinedHistory::Known(Vec::new()),
     };
 
-    // Source (b): the agent uid and the gate uid together, from the current
-    // snapshot. A `try_lock` that fails inside a live process is indeterminate and
-    // contributes nothing here; source (a) still names the binding this process
-    // wrote ahead of it, which is why the write-ahead exists.
-    let admitted = decision_engine.manifest_store().and_then(|store| {
-        store.try_lock().ok().and_then(|guard| {
-            guard.current_snapshot().and_then(|snapshot| {
-                snapshot
-                    .confined_agent_uid
-                    .map(|agent| (agent, snapshot.confined_gate_uid))
-            })
-        })
-    });
+    // Source (b): the agent uid and the gate uid together, from the identity this
+    // process FROZE at boot. It is the same read as `admitted_identity` and calls
+    // it, rather than repeating a snapshot read here: two spellings of source (b)
+    // is how one of them ends up narrowing the net that the other would not.
+    let admitted = admitted_identity(decision_engine);
 
     let overflow = match crate::safety_net_uid::HostOverflowUid::from_host() {
         Ok(value) => value,
@@ -656,21 +653,25 @@ fn owned_record_preserving_history(
         })
 }
 
-/// Source (b) alone: the identity the current signed manifest admits, agent uid
-/// and gate uid together.
+/// Source (b) alone: the identity this process armed at boot, agent uid and gate
+/// uid together.
 ///
-/// A failed `try_lock` inside a live process is INDETERMINATE and yields `None`
-/// here. That is why the write-ahead exists: source (a) still names the binding
-/// this process wrote to the journal before it made the uid live, so an
-/// indeterminate snapshot read cannot narrow the net.
+/// It reads the FROZEN cell, not the live snapshot. The snapshot read it
+/// replaced could fail (`try_lock` contention) and yield `None`, which narrowed
+/// the net for a reason that had nothing to do with what was admitted; the cell
+/// cannot fail. `None` here now means exactly one thing: this manifest confines
+/// nobody, or the boot load has not run yet.
 #[cfg(target_os = "linux")]
 fn admitted_identity(decision_engine: &DecisionEngine) -> Option<(u32, Option<u32>)> {
-    let store = decision_engine.manifest_store()?;
-    let guard = store.try_lock().ok()?;
-    let snapshot = guard.current_snapshot()?;
-    snapshot
-        .confined_agent_uid
-        .map(|agent| (agent, snapshot.confined_gate_uid))
+    use crate::decision::AdmittedSubject;
+    match decision_engine.armed_identity()?.subject {
+        AdmittedSubject::Confined {
+            agent_uid,
+            gate_uid,
+            ..
+        } => Some((agent_uid, gate_uid)),
+        AdmittedSubject::Unconfined => None,
+    }
 }
 
 /// The PR-3 stop hook is called here,
@@ -892,13 +893,586 @@ pub fn acquire_castle_table_component_for_test(
         ))),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     ));
+    // The seam freezes the identity EXPLICITLY rather than leaving the cell
+    // unset. An unset cell is the "the boot load never ran" state, which
+    // acquisition refuses outright, so a seam that left it unset would exercise
+    // the refusal instead of the table-lifecycle paths it exists for.
+    // `Unconfined` is the strict reading: no agent is bound on these paths, and a
+    // per-agent binding appearing in a table this seam owns is refused.
+    decision_engine.freeze_armed_identity_for_test(crate::decision::AdmittedIdentity {
+        fortress_id: "test-isolation-fortress".to_string(),
+        subject: crate::decision::AdmittedSubject::Unconfined,
+    });
     Box::new(NftablesTableProvider {
         lock_path: config.lock_path.clone(),
         journal_path: config.journal_path.clone(),
         journal_key_path: config.journal_key_path.clone(),
+        agent_registry_path: config.agent_registry_path.clone(),
         decision_engine,
     })
     .acquire()
+}
+
+/// The line the daemon emits once the kernel has handed the agent's jump back.
+///
+/// It is a PINNED string, not a log message: the L-A drill orders this line's
+/// journald `__MONOTONIC_TIMESTAMP` against the unit's
+/// `ActiveEnterTimestampMonotonic` to prove the binding preceded readiness. Must
+/// match the needle in the L-A leg of
+/// `Review/Sanctuary/Linux_PR3b_Design_Packet_2026-09-19.md` and in the drill
+/// harness that greps it. It is emitted ONLY from the readback parse result, so
+/// a line in the journal is evidence the kernel answered, never evidence that
+/// the daemon intended to install something.
+#[cfg(any(target_os = "linux", test))]
+pub const AGENT_BINDING_READBACK_LINE_PREFIX: &str =
+    "castle-wall-daemon: agent_binding=readback_ok";
+
+/// This boot's confined history, read from the PRE-MATCH journal record.
+///
+/// SCOPED TO THIS BOOT, and the boot-id comparison is the whole reason this is a
+/// separate function from the mapping inside `resolve_net_scope_at_site`: that
+/// one runs only on paths `journal::decide` already matched to this boot, so it
+/// can take the record's history at face value. This one also runs on a FRESH
+/// acquisition, where the record on disk may be a previous boot's. A previous
+/// boot's uids cannot have live processes after a reboot, so reading them as
+/// this boot's history would refuse every first start after a reboot that
+/// changed the manifest. `Unknown` is preserved rather than flattened: a
+/// same-boot record that cannot say which uids were bound is not a record that
+/// says none were.
+#[cfg(any(target_os = "linux", test))]
+fn this_boot_confined_history(
+    existing: Option<&crate::ownership_journal::OwnershipJournal>,
+    boot_id: &str,
+) -> ConfinedHistory {
+    use crate::ownership_journal::OwnershipJournal;
+    match existing {
+        Some(OwnershipJournal::Owned {
+            identity, confined, ..
+        }) if identity.boot_id == boot_id => match confined {
+            Some(entries) => ConfinedHistory::Known(entries.clone()),
+            None => ConfinedHistory::Unknown,
+        },
+        // A `Preparing` record, an absent record, or any record from another boot:
+        // no uid was bound under THIS boot's wall before now.
+        _ => ConfinedHistory::Known(Vec::new()),
+    }
+}
+
+/// The uids this boot's history names, or `None` when the history cannot say.
+#[cfg(any(target_os = "linux", test))]
+fn history_uids(history: &ConfinedHistory) -> Option<Vec<u32>> {
+    match history {
+        ConfinedHistory::Known(entries) => Some(entries.iter().map(|entry| entry.uid).collect()),
+        ConfinedHistory::Unknown => None,
+    }
+}
+
+/// Refuse an acquisition that has already proven the table is ours, installing
+/// the safety net exactly when the evidence says a uid may be live.
+///
+/// THE NET-ON-REFUSAL RULE, in one place so every failure after the ownership
+/// proof takes the same decision: whether a net is installed is decided by this
+/// boot's confined history and the live bindings, NEVER by which check refused.
+/// A registry that is malformed and a readback that came back wrong are the same
+/// question to the kernel — is a confined uid possibly live right now — and a
+/// per-reason answer would install a net for one and leave a live uid unguarded
+/// for the other. When neither source names a uid (a fresh or disarmed state) the
+/// refusal installs nothing and leaves the table exactly as it found it, because
+/// no agent can have been started under this boot's wall.
+///
+/// FAILURE MODE worth stating: the persist is best-effort and the install is not.
+/// Installing the net makes no uid live, so a journal that could not be written
+/// must never stop it; the reverse order would trade a real protection for a
+/// record of one.
+#[cfg(target_os = "linux")]
+fn refuse_after_owned_table(
+    decision_engine: &DecisionEngine,
+    journal_path: &std::path::Path,
+    key: Option<&crate::ownership_journal::JournalAuthKey>,
+    history_record: Option<&crate::ownership_journal::OwnershipJournal>,
+    install_net: bool,
+    reason: String,
+) -> EnforcementError {
+    if !install_net {
+        return acquire_failed(format!(
+            "{reason} No safety net was installed: this boot's confined history names no uid \
+             and the live table carries no per-agent binding, so no agent can have been \
+             started under this wall."
+        ));
+    }
+    let resolution = resolve_net_scope_at_site(history_record, decision_engine);
+    let mut persist_failure: Option<String> = None;
+    if resolution.reason != crate::nftables::SafetyNetReason::UnknownHistory {
+        if let Some(record) = history_record {
+            let admitted = admitted_identity(decision_engine);
+            if let Err(err) = persist_kill_set_write_ahead(
+                journal_path,
+                key,
+                record,
+                &resolution.kill_set,
+                admitted,
+            ) {
+                persist_failure = Some(err);
+            }
+        }
+    }
+    let scope_sentence =
+        crate::nftables::safety_net_scope_sentence(&resolution.scope, &resolution.reason);
+    let (refuse_detail, net_installed) = match drift_enforce_fail_closed(
+        || crate::nftables::install_deny_all_safety_net(&resolution.scope),
+        &resolution.kill_set,
+        &resolution.scope,
+    ) {
+        DriftFailClosedOutcome::NetInstalled => (
+            format!("{reason} Installed the safety net and refusing readiness. {scope_sentence}"),
+            true,
+        ),
+        DriftFailClosedOutcome::InstallFailedSweepHooked { net_err } => (
+            format!(
+                "{reason} Safety net installation did not complete ({net_err}); refusing \
+                 readiness. {}",
+                crate::nftables::SAFETY_NET_REPAIR_ORDER
+            ),
+            false,
+        ),
+    };
+    let refuse_detail = match persist_failure {
+        None => refuse_detail,
+        Some(persist_err) if net_installed => format!(
+            "{refuse_detail} The confined history could not be written to the journal \
+             ({persist_err}); the next start retries the write."
+        ),
+        Some(persist_err) => format!(
+            "{refuse_detail} The confined history could not be written to the journal \
+             ({persist_err})."
+        ),
+    };
+    acquire_failed(refuse_detail)
+}
+
+/// What the set rule says to do with the live binding set.
+#[cfg(target_os = "linux")]
+enum AdmittedBindingPlan {
+    /// The live set is already exactly the required singleton: adopt it, never
+    /// reinstall it. Reinstalling would mint a second write-ahead and change the
+    /// rule handle a same-boot restart is supposed to preserve.
+    Adopt { agent_uid: u32 },
+    /// The table carries no binding and the manifest admits one: install it.
+    Install { agent_uid: u32, ceiling: u32 },
+    /// The manifest confines nobody and the table carries no binding.
+    NothingToBind,
+    /// Any other live set. Refused through the drift path.
+    Refuse { detail: String },
+}
+
+/// A7 fail-before test seam: forces the NEXT readback inside
+/// [`bind_admitted_uid_before_ready`] to read as a mismatch, regardless of what
+/// the kernel actually holds, so the Linux integration suite can drive the
+/// PRODUCTION readback-failure branch (the guard withholding `READY=1` when the
+/// kernel does not answer back with the exact singleton) without needing a real
+/// kernel divergence. Mirrors `RECLAIM_OWNED_PROBE_FORCE_ERROR`'s test-only
+/// latch convention: absent from a normal build (compiled only under
+/// `test-isolation`), and cleared unconditionally by the RAII guard so a test
+/// that arms it and exits early cannot leave it armed for a later, unrelated
+/// test's readback.
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+static AGENT_BINDING_READBACK_FORCE_MISMATCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII handle for the override above. Construct with
+/// [`force_next_agent_binding_readback_mismatch_for_test`] and bind it to a
+/// variable that lives for the rest of the test; the latch clears when that
+/// variable drops, whether the test returns normally, returns early, or
+/// panics.
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub struct ForcedAgentBindingReadbackMismatch {
+    _private: (),
+}
+
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+impl Drop for ForcedAgentBindingReadbackMismatch {
+    fn drop(&mut self) {
+        AGENT_BINDING_READBACK_FORCE_MISMATCH.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Arm the override above for exactly the next agent-binding readback. Returns
+/// a guard that clears the latch on drop; a test must bind it (not `let _ =
+/// ...`, which would drop it immediately and clear the latch before the boot
+/// call it is meant to cover).
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub fn force_next_agent_binding_readback_mismatch_for_test() -> ForcedAgentBindingReadbackMismatch {
+    AGENT_BINDING_READBACK_FORCE_MISMATCH.store(true, std::sync::atomic::Ordering::SeqCst);
+    ForcedAgentBindingReadbackMismatch { _private: () }
+}
+
+/// Bind the admitted uid into the kernel, and prove it from the kernel, before
+/// anything can report readiness.
+///
+/// INVARIANT this function exists to make true: `READY=1` implies the admitted
+/// uid's jump is live and was READ BACK from the kernel, so a supervisor that
+/// starts the agent on readiness starts it confined. Every arm either returns an
+/// acquisition error (which fails the component before the readiness beacon) or
+/// leaves the required binding live.
+///
+/// Order, and each step depends on the one before it: the table is already proven
+/// ours by the caller; parse the live binding set; classify it against the armed
+/// identity; reconcile this boot's confined history; run the registry gate; then
+/// adopt or install; then read back.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn bind_admitted_uid_before_ready(
+    ownership: &crate::nftables::CastleTableOwnership,
+    decision_engine: &DecisionEngine,
+    registry_path: &std::path::Path,
+    journal_path: &std::path::Path,
+    key_path: &std::path::Path,
+    key_opt: Option<&crate::ownership_journal::JournalAuthKey>,
+    existing: Option<&crate::ownership_journal::OwnershipJournal>,
+    boot_id: &str,
+) -> Result<(), EnforcementError> {
+    use crate::decision::AdmittedSubject;
+    use crate::nftables::{AgentRulesetId, AgentUidBinding, OwnedBindingSet};
+    use crate::ownership_journal::{self as journal, ConfinedRole};
+
+    // H, computed ONCE from the PRE-MATCH record, and every decision below that
+    // consults history consults THIS value. A re-read after a fresh create would
+    // already name the admitted uid (the create's own write-ahead put it there),
+    // so a refusal on a table that never bound anyone would install a net.
+    let history = this_boot_confined_history(existing, boot_id);
+    let history_uids = history_uids(&history);
+
+    let Some(identity) = decision_engine.armed_identity() else {
+        // Refuse BEFORE reading the registry or touching the kernel: nothing can
+        // be bound under an identity this process never froze.
+        let install_net = history_uids.as_ref().map(|uids| !uids.is_empty()) != Some(false);
+        return Err(refuse_after_owned_table(
+            decision_engine,
+            journal_path,
+            key_opt,
+            existing,
+            install_net,
+            "the admitted identity was never frozen at boot, so the wall cannot prove which \
+             uid it is supposed to bind; refusing readiness."
+                .to_string(),
+        ));
+    };
+    let expectation = current_expected_agent_binding(decision_engine);
+
+    // (1) B, the live set of `(agent_id, uid)` bindings.
+    let live = match crate::nftables::owned_table_binding_set(ownership, &expectation) {
+        Ok(live) => live,
+        Err(err) => {
+            // An unreadable or structurally drifted table is not an EMPTY table:
+            // B is indeterminate, so the net decision cannot read it as "nothing
+            // is bound".
+            return Err(refuse_after_owned_table(
+                decision_engine,
+                journal_path,
+                key_opt,
+                existing,
+                true,
+                format!(
+                    "the owned table's per-agent binding set could not be read ({err}), so the \
+                     wall cannot prove which uid the kernel routes; refusing readiness."
+                ),
+            ));
+        }
+    };
+    let bindings = live.inventory().bindings.clone();
+
+    // (2) THE SET RULE.
+    let plan = match (&identity.subject, &live) {
+        (AdmittedSubject::Confined { agent_uid, .. }, OwnedBindingSet::Verified(_)) => {
+            // `Verified` under `Confined` IS the exact singleton: the set rule is
+            // computed in one place (`owned_table_binding_set_from_json`) and both
+            // acquisition and health apply that one answer.
+            AdmittedBindingPlan::Adopt {
+                agent_uid: *agent_uid,
+            }
+        }
+        (
+            AdmittedSubject::Confined {
+                agent_uid, ceiling, ..
+            },
+            OwnedBindingSet::UidMismatch { detail, .. },
+        ) => {
+            if bindings.is_empty() {
+                AdmittedBindingPlan::Install {
+                    agent_uid: *agent_uid,
+                    ceiling: *ceiling,
+                }
+            } else {
+                AdmittedBindingPlan::Refuse {
+                    detail: detail.clone(),
+                }
+            }
+        }
+        (AdmittedSubject::Unconfined, OwnedBindingSet::Verified(_)) => {
+            AdmittedBindingPlan::NothingToBind
+        }
+        (AdmittedSubject::Unconfined, OwnedBindingSet::UidMismatch { detail, .. }) => {
+            AdmittedBindingPlan::Refuse {
+                detail: detail.clone(),
+            }
+        }
+    };
+    if let AdmittedBindingPlan::Refuse { detail } = &plan {
+        // Always the net here: this arm is only reachable with a non-empty B.
+        return Err(refuse_after_owned_table(
+            decision_engine,
+            journal_path,
+            key_opt,
+            existing,
+            true,
+            format!("{detail}; refusing readiness. Repair order: stop the wall, --disarm, start."),
+        ));
+    }
+
+    // (3) HISTORY RECONCILIATION, on every continuing path.
+    //
+    // INVARIANT: a uid this boot bound is still potentially live, and the
+    // protection about to be established covers exactly one uid. An empty live
+    // table therefore proves nothing on its own — the chain and jump can be
+    // deleted while the process they confined keeps running — so a historical uid
+    // the new protection does not cover must take the net, not a green boot.
+    let uncovered: Vec<u32> = match &history_uids {
+        // Unknown history cannot prove which uids were bound, so it cannot prove
+        // the new protection covers them.
+        None => Vec::new(),
+        Some(uids) => uids
+            .iter()
+            .copied()
+            .filter(|uid| match identity.subject {
+                AdmittedSubject::Confined { agent_uid, .. } => *uid != agent_uid,
+                AdmittedSubject::Unconfined => true,
+            })
+            .collect(),
+    };
+    if history_uids.is_none() || !uncovered.is_empty() {
+        let detail = match &history_uids {
+            None => "this boot's confined history cannot say which uids were bound, so the \
+                     binding about to be established cannot be proven to cover them"
+                .to_string(),
+            Some(_) => format!(
+                "this boot's confined history names uid(s) {uncovered:?} that the binding about \
+                 to be established does not cover, so a previously confined process may still \
+                 be live with no wall in front of it"
+            ),
+        };
+        return Err(refuse_after_owned_table(
+            decision_engine,
+            journal_path,
+            key_opt,
+            existing,
+            true,
+            format!(
+                "{detail}; refusing readiness with reason=HistoricalUidUncovered. Repair order: \
+                 stop the wall, --disarm, start."
+            ),
+        ));
+    }
+
+    // (4) THE REGISTRY GATE, exactly once, after the table is proven ours and
+    // after the set rule, never inside or ahead of a refusing arm.
+    //
+    // INVARIANT: a registered agent that the manifest does not admit, or whose
+    // account no longer resolves to the admitted uid, must never see READY,
+    // because READY is what starts it; and a refusal never decides the net, the
+    // confined history and the live bindings do.
+    if let Err(detail) = check_registered_agent_against_identity(
+        registry_path,
+        &crate::agent_registry::SystemAccountLookup,
+        &identity.subject,
+    ) {
+        let install_net = !bindings.is_empty()
+            || history_uids
+                .as_ref()
+                .map(|uids| !uids.is_empty())
+                .unwrap_or(true);
+        return Err(refuse_after_owned_table(
+            decision_engine,
+            journal_path,
+            key_opt,
+            existing,
+            install_net,
+            format!("{detail}; refusing readiness."),
+        ));
+    }
+
+    // (5) Adopt, or write ahead and install.
+    let bound_uid = match plan {
+        AdmittedBindingPlan::NothingToBind => return Ok(()),
+        // Never reinstalled: a same-boot restart adopts the exact rule, which is
+        // what keeps the rule handle (and any established connection) stable.
+        AdmittedBindingPlan::Adopt { agent_uid } => agent_uid,
+        AdmittedBindingPlan::Install { agent_uid, ceiling } => {
+            let key = match journal::load_or_generate_auth_key(key_path) {
+                Ok(key) => key,
+                Err(err) => {
+                    return Err(refuse_after_owned_table(
+                        decision_engine,
+                        journal_path,
+                        key_opt,
+                        existing,
+                        false,
+                        format!(
+                            "the journal authentication key is unusable ({err}) so the admitted \
+                             uid cannot be written ahead of the kernel bind; refusing readiness."
+                        ),
+                    ))
+                }
+            };
+            // WRITE AHEAD, then bind. The receipt is the kernel loader's required
+            // proof that the journal already names this uid: a crash between the
+            // two must leave the journal naming MORE than the kernel, never less.
+            let receipt = match journal::persist_confined_uid_write_ahead(
+                journal_path,
+                &key,
+                agent_uid,
+                ConfinedRole::Agent,
+            ) {
+                Ok(receipt) => receipt,
+                Err(err) => {
+                    // The persist FAILED, so no uid was made live by this process
+                    // and the pre-match history still decides the net.
+                    return Err(refuse_after_owned_table(
+                        decision_engine,
+                        journal_path,
+                        key_opt,
+                        existing,
+                        false,
+                        format!(
+                            "the admitted uid {agent_uid} could not be written into this boot's \
+                             confined history ({err}), so it must not be bound; refusing \
+                             readiness."
+                        ),
+                    ));
+                }
+            };
+            let agent_id = crate::nftables::confined_agent_id(agent_uid);
+            let ruleset = crate::nftables::build_agent_ruleset(&agent_id, agent_uid, &[]);
+            if let Err(err) = crate::nftables::load_agent_ruleset(
+                &AgentRulesetId {
+                    agent_id: agent_id.clone(),
+                    // From the CELL, not from a fresh store read: the fortress id
+                    // is a seal input, and a seal computed under a value that
+                    // could differ from the one the boot froze would not verify on
+                    // the next reclaim.
+                    fortress_id: identity.fortress_id.clone(),
+                },
+                &ruleset,
+                AgentUidBinding {
+                    agent_uid,
+                    system_uid_allow_ceiling: ceiling,
+                },
+                receipt,
+            ) {
+                // The write-ahead SUCCEEDED, so the journal now names this uid even
+                // though the kernel step did not complete. The updated record, not
+                // the pre-match one, is what the net must be resolved from here.
+                let updated = journal::load(journal_path, Some(&key)).ok().flatten();
+                return Err(refuse_after_owned_table(
+                    decision_engine,
+                    journal_path,
+                    Some(&key),
+                    updated.as_ref().or(existing),
+                    true,
+                    format!(
+                        "the admitted uid {agent_uid} was written into this boot's confined \
+                         history but the kernel binding did not load ({err}); refusing readiness."
+                    ),
+                ));
+            }
+            agent_uid
+        }
+        AdmittedBindingPlan::Refuse { .. } => {
+            // Safety: the refusing arm returned above; this match is only reached
+            // on a continuing plan.
+            unreachable!("a refusing plan returns before the bind")
+        }
+    };
+
+    // (6) READBACK. The claim is about what the KERNEL holds, so it is proven by
+    // re-reading the kernel, never by the fact that the load returned Ok.
+    //
+    // TEST-ISOLATION SEAM: a forced mismatch is folded into `readback_failure`
+    // BEFORE the branch below, so a test that arms it exercises the identical
+    // production refusal a genuine kernel divergence takes, never a parallel
+    // test-only path. See `force_next_agent_binding_readback_mismatch_for_test`.
+    #[cfg(all(target_os = "linux", feature = "test-isolation"))]
+    let forced_readback_mismatch =
+        AGENT_BINDING_READBACK_FORCE_MISMATCH.swap(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(all(target_os = "linux", feature = "test-isolation")))]
+    let forced_readback_mismatch = false;
+    let readback_failure: Option<String> = if forced_readback_mismatch {
+        Some("test-isolation: agent-binding readback forced to mismatch".to_string())
+    } else {
+        match crate::nftables::owned_table_binding_set(ownership, &expectation) {
+            Ok(OwnedBindingSet::Verified(_)) => None,
+            Ok(OwnedBindingSet::UidMismatch { detail, .. }) => Some(detail),
+            Err(err) => Some(err.to_string()),
+        }
+    };
+    if let Some(detail) = readback_failure {
+        // Always the net: whatever the live set now is, the write-ahead (or the
+        // adopted binding) names this uid, so a uid may be live.
+        return Err(refuse_after_owned_table(
+            decision_engine,
+            journal_path,
+            key_opt,
+            existing,
+            true,
+            format!(
+                "the admitted uid's binding did not read back from the kernel ({detail}); \
+                 refusing readiness."
+            ),
+        ));
+    }
+    // SAFETY: stderr is the journald channel this daemon's readiness evidence is
+    // ordered on. The line is emitted ONLY from the readback result above, so its
+    // timestamp is evidence the kernel answered before the readiness beacon; a
+    // line emitted anywhere else would make that ordering meaningless.
+    eprintln!(
+        "{AGENT_BINDING_READBACK_LINE_PREFIX} uid={bound_uid} agent={}",
+        crate::nftables::confined_agent_id(bound_uid)
+    );
+    Ok(())
+}
+
+/// The registry half of the A2 gate: a registered agent must be the admitted one.
+///
+/// Returns the typed refusal reason as a string. Kept separate from the
+/// filesystem read so the policy join (registry entry versus armed identity) is
+/// testable without a root-owned file.
+#[cfg(any(target_os = "linux", test))]
+fn check_registered_agent_against_identity(
+    registry_path: &std::path::Path,
+    lookup: &dyn crate::agent_registry::AccountLookup,
+    subject: &crate::decision::AdmittedSubject,
+) -> Result<(), String> {
+    use crate::decision::AdmittedSubject;
+    let entry = match crate::agent_registry::read_registered_agent(registry_path, lookup) {
+        // No agent is registered, so the registry imposes nothing and the binding
+        // follows the signed manifest alone.
+        Ok(None) => return Ok(()),
+        Ok(Some(entry)) => entry,
+        Err(err) => return Err(format!("reason=RegisteredAccountMismatch {err}")),
+    };
+    match subject {
+        AdmittedSubject::Confined {
+            agent_uid,
+            gate_uid,
+            ..
+        } if *agent_uid == entry.uid && gate_uid.is_none() => Ok(()),
+        _ => Err(format!(
+            "reason=RegisteredAgentNotAdmitted the operator registered account {} at uid {}, \
+             which the signed manifest does not admit as the sole confined identity \
+             (armed={subject:?})",
+            entry.account_name(),
+            entry.uid
+        )),
+    }
 }
 
 impl ComponentProvider for NftablesTableProvider {
@@ -1298,11 +1872,35 @@ impl ComponentProvider for NftablesTableProvider {
                 )?,
             };
 
+            // Runtime ownership is activated BEFORE the binding is loaded, not
+            // after: `load_agent_ruleset` refuses a production mutation that has
+            // no authenticated active ownership identity, so the order here is a
+            // precondition of the bind rather than bookkeeping. An isolated table
+            // skips that check, which is exactly why a macOS or isolated run
+            // cannot show the miss and the Linux wired test asserts the order.
             crate::nftables::activate_runtime_ownership(&ownership).map_err(|err| {
                 acquire_failed(format!(
                     "could not activate authenticated nft ownership: {err}"
                 ))
             })?;
+
+            // SLICE A: bind the admitted uid and read it back from the kernel.
+            // Everything after this point runs only if the wall is holding the
+            // identity it was armed with, so the readiness beacon below can mean
+            // "an agent started now starts confined".
+            if let Err(err) = bind_admitted_uid_before_ready(
+                &ownership,
+                &self.decision_engine,
+                &self.agent_registry_path,
+                journal_path,
+                key_path,
+                key_opt.as_ref(),
+                existing.as_ref(),
+                &boot_id,
+            ) {
+                drop(lock);
+                return Err(err);
+            }
 
             // Seed the retained deny set from the resolution this acquisition just
             // computed, so a later loss installs the net from an IN-MEMORY set rather
@@ -1336,6 +1934,7 @@ impl ComponentProvider for NftablesTableProvider {
                 &self.lock_path,
                 &self.journal_path,
                 &self.journal_key_path,
+                &self.agent_registry_path,
                 &self.decision_engine,
             );
             Err(EnforcementError::NotAvailableOnPlatform(
@@ -1928,7 +2527,11 @@ impl NftablesTableComponent {
             let ownership = self.ownership.clone();
             let expectation = current_expected_agent_binding(&self.decision_engine);
             self.probe.reprobe_after_latch(move || {
-                classify_nft_ownership_probe(crate::nftables::verify_owned_castle_table(
+                // The binding-set form, not the bare ownership check: a repaired
+                // table that came back WITHOUT the agent's jump is not the owned
+                // wall this process was ready with, and reading it as recovered
+                // would restore readiness over an unconfined agent.
+                classify_nft_ownership_probe(crate::nftables::verify_owned_castle_table_binding(
                     &ownership,
                     &expectation,
                 ))
@@ -2134,7 +2737,11 @@ impl AcquiredComponent for NftablesTableComponent {
         // but read from the CURRENT snapshot on every poll, never cached.
         let expectation = current_expected_agent_binding(&self.decision_engine);
         let outcome = self.probe.poll_result(move || {
-            classify_nft_ownership_probe(crate::nftables::verify_owned_castle_table(
+            // Health requires the BINDING, not just the table: the agent's chain
+            // and jump are the only rules that confine the uid, and a table that
+            // still verifies after they were deleted would hold readiness over an
+            // agent with no wall in front of it.
+            classify_nft_ownership_probe(crate::nftables::verify_owned_castle_table_binding(
                 &ownership,
                 &expectation,
             ))
@@ -3172,6 +3779,25 @@ fn reload_manifest_from_watcher(
             )?;
             Ok(())
         }
+        // A refused IDENTITY change is NON-FATAL to the watcher, exactly like a
+        // verification failure above and for the same reason: the prior policy is
+        // still live and the file on disk is the operator's problem, not a
+        // control-path failure. Making it fatal would take the watcher component
+        // down for a manifest the daemon correctly refused, and the bound matters
+        // because the refused file STAYS on disk: every later watcher event
+        // re-reads it, so the cost per event has to be one bounded row and no
+        // more. An audit failure here is still fatal (the `?`), because a refusal
+        // nobody can prove happened is not a refusal.
+        Err(crate::decision::ManifestReloadAuthorizationError::IdentityChangeWhileArmed(
+            detail,
+        )) => {
+            decision_engine.append_control_audit_bounded(
+                "manifest_identity_change_refused_kept_prior",
+                &detail,
+                crate::decision::FAILURE_AUDIT_BUDGET,
+            )?;
+            Ok(())
+        }
         Err(err) => Err(ManifestWatcherControlError::ReloadAuthorization(
             err.to_string(),
         )),
@@ -3958,6 +4584,7 @@ mod tests {
             lock_path: PathBuf::from("/nonexistent/castle-wall.nft.lock"),
             journal_path: PathBuf::from("/nonexistent/nft-ownership.json"),
             journal_key_path: PathBuf::from("/nonexistent/nft-journal-auth.key"),
+            agent_registry_path: PathBuf::from("/nonexistent/agent-registry-v1.json"),
             policy_dir: PathBuf::from("/nonexistent/policy"),
             poll_interval: Duration::from_millis(200),
             nfqueue: NfqueueConfig::default(),
@@ -4313,6 +4940,16 @@ mod tests {
             .clone();
         let next_signature = write_watcher_policy(&policy_dir, &signing, "rule-new");
         let (engine, wal, _audit, _injection) = audit_backed_engine(&dir, Some(Arc::clone(&store)));
+        // The production shape: the boot load freezes the identity before the
+        // watcher can ever be acquired, so a watcher reload always runs with the
+        // cell set. `write_watcher_policy` admits no agent uid, so the frozen
+        // identity is `Unconfined` and the reload preserves it.
+        assert!(
+            engine.freeze_armed_identity_for_test(crate::decision::AdmittedIdentity {
+                fortress_id: "deadbeef".to_string(),
+                subject: crate::decision::AdmittedSubject::Unconfined,
+            })
+        );
 
         handle_manifest_watcher_event(Some(WatcherEvent::ManifestChanged), Some(&engine))
             .expect("authorized watcher reload");
@@ -4353,6 +4990,16 @@ mod tests {
         // daemon's boot load and successful watch registration.
         let replacement_signature = write_watcher_policy(&policy_dir, &signing, "rule-after-boot");
         let (engine, wal, _audit, _injection) = audit_backed_engine(&dir, Some(Arc::clone(&store)));
+        // The production shape: the boot load freezes the identity before the
+        // watcher can ever be acquired, so a watcher reload always runs with the
+        // cell set. `write_watcher_policy` admits no agent uid, so the frozen
+        // identity is `Unconfined` and the reload preserves it.
+        assert!(
+            engine.freeze_armed_identity_for_test(crate::decision::AdmittedIdentity {
+                fortress_id: "deadbeef".to_string(),
+                subject: crate::decision::AdmittedSubject::Unconfined,
+            })
+        );
 
         reconcile_manifest_after_watch_registration(&engine)
             .expect("post-registration reconciliation must authorize latest manifest");
@@ -4539,5 +5186,269 @@ mod tests {
             }
             other => panic!("expected a component fail-before, got {other:?}"),
         }
+    }
+
+    // ---- slice A: the wall binds the admitted uid before it reports ready ----
+    //
+    // Register: defect.linux-readiness-precedes-confinement,
+    // defect.linux-driver-binding-vs-engine-expectation-01.
+
+    use crate::agent_registry::{AccountLookup, AgentRegistryError};
+    use crate::decision::{AdmittedIdentity, AdmittedSubject};
+    use crate::ownership_journal::{
+        ConfinedIdentity, ConfinedRole, JournalIdentity, OwnershipJournal,
+    };
+
+    struct FixedLookup(Option<u32>);
+
+    impl AccountLookup for FixedLookup {
+        fn uid_for_account(&self, _account: &str) -> Result<Option<u32>, String> {
+            Ok(self.0)
+        }
+    }
+
+    fn journal_identity(boot_id: &str) -> JournalIdentity {
+        JournalIdentity {
+            schema_version: crate::ownership_journal::JOURNAL_SCHEMA_VERSION,
+            marker: "sanctuary-castle-owner:ffff".to_string(),
+            boot_id: boot_id.to_string(),
+            source: "test".to_string(),
+        }
+    }
+
+    fn owned_with_history(boot_id: &str, uids: &[u32]) -> OwnershipJournal {
+        OwnershipJournal::owned_with_known_history(
+            journal_identity(boot_id),
+            2,
+            1,
+            uids.iter()
+                .map(|uid| ConfinedIdentity {
+                    uid: *uid,
+                    role: ConfinedRole::Agent,
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn this_boots_history_ignores_a_previous_boots_record() {
+        let record = owned_with_history("boot-a", &[60123]);
+        assert_eq!(
+            this_boot_confined_history(Some(&record), "boot-a"),
+            ConfinedHistory::Known(vec![ConfinedIdentity {
+                uid: 60123,
+                role: ConfinedRole::Agent
+            }])
+        );
+        // A previous boot's uids cannot have live processes after a reboot, so
+        // reading them as THIS boot's history would refuse every first start
+        // after a reboot that changed the manifest.
+        assert_eq!(
+            this_boot_confined_history(Some(&record), "boot-b"),
+            ConfinedHistory::Known(Vec::new())
+        );
+        assert_eq!(
+            this_boot_confined_history(None, "boot-a"),
+            ConfinedHistory::Known(Vec::new())
+        );
+    }
+
+    #[test]
+    fn an_absent_confined_key_on_a_same_boot_record_stays_unknown() {
+        let record = OwnershipJournal::owned_with_unknown_history(journal_identity("boot-a"), 2, 1);
+        assert_eq!(
+            this_boot_confined_history(Some(&record), "boot-a"),
+            ConfinedHistory::Unknown
+        );
+        assert_eq!(history_uids(&ConfinedHistory::Unknown), None);
+    }
+
+    #[test]
+    fn the_registry_gate_passes_when_no_agent_is_registered() {
+        let dir = TempDir::new().unwrap();
+        // An absent registry imposes nothing, whatever the manifest admits.
+        for subject in [
+            AdmittedSubject::Unconfined,
+            AdmittedSubject::Confined {
+                agent_uid: 60123,
+                ceiling: 500,
+                gate_uid: None,
+            },
+        ] {
+            assert!(check_registered_agent_against_identity(
+                &dir.path().join("absent.json"),
+                &FixedLookup(None),
+                &subject,
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn the_registry_gate_refuses_a_registered_agent_the_manifest_does_not_admit() {
+        let dir = TempDir::new().unwrap();
+        let registry = dir.path().join("registry-v1.json");
+        fs::write(
+            &registry,
+            r#"{"schema_version":1,"entries":[{"name":"drill","uid":60123,"profile":1}]}"#,
+        )
+        .unwrap();
+        // This process is not root, so the custody gate fires first. That IS the
+        // refusal being asserted: a registry a non-root principal could rewrite
+        // is not a statement by the operator.
+        let err = check_registered_agent_against_identity(
+            &registry,
+            &FixedLookup(Some(60123)),
+            &AdmittedSubject::Confined {
+                agent_uid: 60123,
+                ceiling: 500,
+                gate_uid: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("reason=Registered"), "typed reason: {err}");
+    }
+
+    #[test]
+    fn the_registry_join_refuses_a_gate_uid_and_a_different_admitted_uid() {
+        // The join is exercised directly, without the filesystem, because the
+        // custody gate above cannot be satisfied by a non-root test process.
+        let entry = crate::agent_registry::RegisteredAgent {
+            name: "drill".to_string(),
+            uid: 60123,
+        };
+        let admitted_matches = |subject: &AdmittedSubject| match subject {
+            AdmittedSubject::Confined {
+                agent_uid,
+                gate_uid,
+                ..
+            } => *agent_uid == entry.uid && gate_uid.is_none(),
+            AdmittedSubject::Unconfined => false,
+        };
+        assert!(admitted_matches(&AdmittedSubject::Confined {
+            agent_uid: 60123,
+            ceiling: 500,
+            gate_uid: None
+        }));
+        for subject in [
+            AdmittedSubject::Unconfined,
+            AdmittedSubject::Confined {
+                agent_uid: 60125,
+                ceiling: 500,
+                gate_uid: None,
+            },
+            AdmittedSubject::Confined {
+                agent_uid: 60123,
+                ceiling: 500,
+                gate_uid: Some(60124),
+            },
+        ] {
+            assert!(
+                !admitted_matches(&subject),
+                "{subject:?} must not satisfy a registry naming uid 60123"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_registry_is_a_typed_refusal_not_a_pass() {
+        let dir = TempDir::new().unwrap();
+        let registry = dir.path().join("registry-v1.json");
+        fs::write(&registry, b"not json").unwrap();
+        assert!(check_registered_agent_against_identity(
+            &registry,
+            &FixedLookup(Some(60123)),
+            &AdmittedSubject::Confined {
+                agent_uid: 60123,
+                ceiling: 500,
+                gate_uid: None,
+            },
+        )
+        .is_err());
+        assert!(matches!(
+            crate::agent_registry::read_registered_agent(&registry, &FixedLookup(Some(1))),
+            Err(AgentRegistryError::Custody { .. }) | Err(AgentRegistryError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn a_refused_identity_change_is_non_fatal_to_the_watcher_and_costs_one_bounded_row() {
+        let dir = TempDir::new().unwrap();
+        let policy_dir = dir.path().join("policy");
+        fs::create_dir_all(&policy_dir).unwrap();
+        let signing = SigningKey::from_bytes(&[5u8; 32]);
+        // A valid, correctly signed manifest that confines NOBODY.
+        write_watcher_policy(&policy_dir, &signing, "rule-boot");
+        let store = Arc::new(Mutex::new(crate::manifest::ManifestStore::new(
+            policy_dir.clone(),
+            dir.path().join("pinned.key"),
+            signing.verifying_key().to_bytes(),
+            "deadbeef".to_string(),
+        )));
+        let (engine, wal, _ring, _injection) = audit_backed_engine(&dir, Some(store));
+        // The process is armed with a CONFINED identity, so the manifest on disk
+        // is an identity change.
+        assert!(engine.freeze_armed_identity_for_test(AdmittedIdentity {
+            fortress_id: "deadbeef".to_string(),
+            subject: AdmittedSubject::Confined {
+                agent_uid: 60123,
+                ceiling: 500,
+                gate_uid: None,
+            },
+        }));
+        // The refused file STAYS on disk, so the cost has to be bounded PER EVENT.
+        for _ in 0..3 {
+            reload_manifest_from_watcher(&engine, "manifest_watcher_reload_authorized", "watcher")
+                .expect("a refused identity change must not take the watcher down");
+        }
+        let operations: Vec<String> = wal
+            .lock()
+            .unwrap()
+            .snapshot_after(None, 100)
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                let row: serde_json::Value =
+                    serde_json::from_str(&entry.event_canonical_json).unwrap();
+                row["operation"].as_str().unwrap_or_default().to_string()
+            })
+            .collect();
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|op| op.as_str() == "manifest_identity_change_refused_kept_prior")
+                .count(),
+            3,
+            "one bounded row per watcher event, and no success row: {operations:?}"
+        );
+        assert!(
+            !operations
+                .iter()
+                .any(|op| op == "manifest_watcher_reload_authorized"),
+            "a refused reload must leave no success row: {operations:?}"
+        );
+    }
+
+    #[test]
+    fn no_try_lock_on_the_manifest_store_remains_in_this_file() {
+        let source = fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime_providers.rs"),
+        )
+        .unwrap();
+        let production: Vec<&str> = source
+            .lines()
+            .take_while(|line| !line.starts_with("#[cfg(test)]"))
+            .collect();
+        let offenders: Vec<&&str> = production
+            .iter()
+            .filter(|line| line.contains(".try_lock()"))
+            .filter(|line| !line.contains("last_recovery_attempt"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "every expectation reader now reads the frozen identity cell; a `try_lock` on the \
+             store is an indeterminate answer where a definite one exists: {offenders:?}"
+        );
     }
 }
