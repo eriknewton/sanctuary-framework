@@ -1012,7 +1012,7 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         "chain",
         CASTLE_FAMILY,
         isolation::table(),
-        "agent_test-e2e",
+        expected_chain.as_str(),
     ]);
     assert!(
         output.contains("queue"),
