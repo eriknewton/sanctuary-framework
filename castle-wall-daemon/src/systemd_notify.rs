@@ -43,6 +43,11 @@ pub const NOTIFY_SOCKET_ENV: &str = "NOTIFY_SOCKET";
 
 /// The readiness datagram payload. `\n`-terminated per the `sd_notify` wire
 /// format (state assignments are newline-separated).
+///
+/// CROSS-FILE PIN: this byte length is the base `READINESS_DATAGRAM_BUFFER_BYTES`
+/// in `tests/integration_linux_runtime_activation.rs` derives from (that constant
+/// is 8x this length, for margin). Changing this payload's length changes what
+/// that test's derivation comment is claiming.
 const READY_DATAGRAM: &[u8] = b"READY=1\n";
 
 /// Errors from sending a readiness notification. Only surfaced when a socket

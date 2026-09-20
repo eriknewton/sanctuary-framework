@@ -628,7 +628,15 @@ impl Drop for KernelBypassFixture {
 #[test]
 fn kernel_drops_plain_dns_to_unallowed_resolver() {
     let _suite = isolation::guard();
-    let fixture = KernelBypassFixture::setup("dns-bypass-test");
+    // Slice A: `boot_with_only_example_com_443_allowed`'s manifest confines
+    // `BYPASS_AGENT_UID`, so the daemon itself installs the `uid-<U>` chain
+    // before this fixture ever runs. Passing that SAME derived id into `setup`
+    // makes its `load_agent_ruleset` call a REFRESH of the daemon's own chain;
+    // a distinct fixture id here would create a second chain bound to the same
+    // uid, which the live-binding set rule (A3 iii) reads as a proven loss on
+    // the next health poll, healing it into the deny-all net and taking the
+    // fixture's own binding down with it.
+    let fixture = KernelBypassFixture::setup(&nftables::confined_agent_id(BYPASS_AGENT_UID));
 
     // UDP send to 8.8.8.8:53 as the agent uid. `setpriv` switches credentials
     // and then execs, so the socket is created AFTER the switch and carries that
@@ -665,7 +673,9 @@ fn kernel_drops_plain_dns_to_unallowed_resolver() {
 #[test]
 fn kernel_drops_doh_to_unallowed_provider() {
     let _suite = isolation::guard();
-    let fixture = KernelBypassFixture::setup("doh-bypass-test");
+    // Same agent id as `kernel_drops_plain_dns_to_unallowed_resolver` above:
+    // refreshes the daemon's own `uid-<U>` chain rather than rivaling it.
+    let fixture = KernelBypassFixture::setup(&nftables::confined_agent_id(BYPASS_AGENT_UID));
 
     // TCP SYN to 8.8.8.8:443 as the agent uid. `connect_ex` returns errno
     // instead of raising, so a single-line Python emits exactly one SYN whose
@@ -698,7 +708,9 @@ fn kernel_drops_doh_to_unallowed_provider() {
 #[test]
 fn kernel_drops_dot_to_unallowed_resolver() {
     let _suite = isolation::guard();
-    let fixture = KernelBypassFixture::setup("dot-bypass-test");
+    // Same agent id as `kernel_drops_plain_dns_to_unallowed_resolver` above:
+    // refreshes the daemon's own `uid-<U>` chain rather than rivaling it.
+    let fixture = KernelBypassFixture::setup(&nftables::confined_agent_id(BYPASS_AGENT_UID));
 
     // Single-line valid Python via `connect_ex`; one TCP SYN to 1.1.1.1:853
     // from a process running as the agent uid.

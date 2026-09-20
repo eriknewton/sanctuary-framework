@@ -839,6 +839,109 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
 
     let handle = boot(config).expect("daemon boot");
 
+    // WIRED-CONSUMER ASSERTION for slice A: the PRODUCTION composition root, not
+    // a test seam, has already installed the manifest-admitted uid's jump by the
+    // time `boot` returns. A capability whose only witness is its own unit test
+    // is not shipped, and this is the witness that the boot path reaches the
+    // loader. It runs BEFORE the fixture's own load below, so the singleton it
+    // observes can only be the daemon's.
+    let daemon_agent_id = nftables::confined_agent_id(TEST_AGENT_UID);
+    let after_boot = nft_cmd(&[
+        "-a",
+        "-j",
+        "list",
+        "table",
+        CASTLE_FAMILY,
+        isolation::table(),
+    ]);
+    assert!(
+        after_boot.contains(&format!(":agent:{daemon_agent_id}\"")),
+        "boot must install the admitted uid's own agent chain: {after_boot}"
+    );
+    // The binding set B is asserted from the PARSED ruleset, not from the text.
+    // A raw search for `"right":<uid>` fails on valid output that spaces the
+    // colon, and finding that scalar anywhere does not prove it belongs to the
+    // output jump or that B is the exact singleton. Must match the chain name
+    // `agent_wall::nftables::agent_chain_name` derives from the agent id.
+    let expected_chain = format!("agent_{daemon_agent_id}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&after_boot).expect("nft -j must emit parseable JSON");
+    let objects = parsed["nftables"]
+        .as_array()
+        .expect("nft -j emits a `nftables` array");
+    // TWO DISJOINT SETS, and collecting them together is what made the previous
+    // shape fail on a CORRECT install: a healthy ruleset carries a `skuid` match
+    // TWICE. Once in the hooked base `output` chain (the binding: match the uid,
+    // `goto` its own chain) and once inside that agent chain's own body (match
+    // the uid, mark, queue). Only the first set is B.
+    let mut output_bindings: Vec<(u64, Option<(&'static str, String)>)> = Vec::new();
+    let mut agent_chain_body_uids: Vec<u64> = Vec::new();
+    for object in objects {
+        let Some(rule) = object.get("rule") else {
+            continue;
+        };
+        let Some(exprs) = rule["expr"].as_array() else {
+            continue;
+        };
+        let chain = rule["chain"].as_str().unwrap_or_default();
+        let mut skuid: Option<u64> = None;
+        // The VERDICT KIND is retained, not flattened: `goto` is the terminating
+        // form the binding requires, and a regression to `jump` must report as a
+        // WRONG verdict rather than pass as a present one.
+        let mut verdict: Option<(&'static str, String)> = None;
+        for expr in exprs {
+            if let Some(m) = expr.get("match") {
+                if m["left"]["meta"]["key"] == "skuid" {
+                    skuid = m["right"].as_u64();
+                }
+            }
+            for kind in ["goto", "jump"] {
+                if let Some(v) = expr.get(kind) {
+                    if let Some(name) = v["target"].as_str() {
+                        verdict = Some((kind, name.to_string()));
+                    }
+                }
+            }
+        }
+        let Some(uid) = skuid else {
+            continue;
+        };
+        if chain == "output" {
+            output_bindings.push((uid, verdict));
+        } else if chain == expected_chain {
+            agent_chain_body_uids.push(uid);
+        }
+    }
+    assert_eq!(
+        output_bindings.len(),
+        1,
+        "B must be the exact singleton the armed identity requires: {output_bindings:?}"
+    );
+    let (bound_uid, verdict) = &output_bindings[0];
+    assert_eq!(
+        *bound_uid,
+        u64::from(TEST_AGENT_UID),
+        "the installed jump must match the uid the SIGNED manifest admits"
+    );
+    let Some((verdict_kind, jump_target)) = verdict else {
+        panic!("the binding rule must carry a verdict: {output_bindings:?}");
+    };
+    assert_eq!(
+        *verdict_kind, "goto",
+        "the binding uses the TERMINATING verdict; a `jump` returns to `output` and lets \
+         later rules run: {output_bindings:?}"
+    );
+    assert_eq!(
+        jump_target, &expected_chain,
+        "the admitted uid must be routed into its OWN per-agent chain"
+    );
+    // The BODY, validated separately: the agent chain re-matches the same uid.
+    assert_eq!(
+        agent_chain_body_uids,
+        vec![u64::from(TEST_AGENT_UID)],
+        "the agent chain's own body must match the admitted uid and nobody else"
+    );
+
     // NO cleanup/reinstall here. `boot` on a privileged Linux host ACQUIRES the
     // castle table under the host lock and records its identity in the ownership
     // journal, so deleting it and installing a replacement hands the daemon a
@@ -876,8 +979,12 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
     // scope is created: nft validates nothing about a uid at rule-load time (the
     // P0 probe loaded a rule for a uid with no account at all), so unlike the
     // retired cgroup path there is no filesystem object the load depends on.
-    let ruleset_script = nftables::build_agent_ruleset("test-e2e", TEST_AGENT_UID, &frags);
-    let agent_id = ruleset_id("test-e2e");
+    // The SAME agent id the daemon's own boot-time bind used. Under slice A the
+    // live binding set must be exactly `{(uid-<U>, U)}`, so a second chain for
+    // this uid under another id would read as a proven loss on the next health
+    // poll; this load is therefore a refresh of the daemon's chain, not a rival.
+    let ruleset_script = nftables::build_agent_ruleset(&daemon_agent_id, TEST_AGENT_UID, &frags);
+    let agent_id = ruleset_id(&daemon_agent_id);
     nftables::load_agent_ruleset(
         &agent_id,
         &ruleset_script,
@@ -905,7 +1012,7 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         "chain",
         CASTLE_FAMILY,
         isolation::table(),
-        "agent_test-e2e",
+        expected_chain.as_str(),
     ]);
     assert!(
         output.contains("queue"),

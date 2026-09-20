@@ -34,22 +34,42 @@
 
 #![cfg(target_os = "linux")]
 
+use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
 use castle_wall_daemon::config::LinuxRuntimePaths;
 use castle_wall_daemon::daemon::{self, DaemonError, DaemonRuntimeState};
+use castle_wall_daemon::manifest::canonical_json::canonicalize_to_bytes;
+use castle_wall_daemon::manifest::verify::{
+    AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
+};
+use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
 use castle_wall_daemon::nftables::{self, CASTLE_FAMILY, CASTLE_TABLE, ISOLATED_TABLE_PREFIX};
 use castle_wall_daemon::ownership_journal::{
-    DEFAULT_JOURNAL_AUTH_KEY_PATH, DEFAULT_OWNERSHIP_JOURNAL_PATH,
+    self, DEFAULT_JOURNAL_AUTH_KEY_PATH, DEFAULT_OWNERSHIP_JOURNAL_PATH,
 };
 use castle_wall_daemon::runtime_lock::DEFAULT_HOST_LOCK_PATH;
+use castle_wall_daemon::runtime_providers::{
+    self, force_next_agent_binding_readback_mismatch_for_test,
+    force_next_agent_binding_write_ahead_error_for_test,
+};
 use castle_wall_daemon::DaemonConfig;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+
+/// The uid these two A7 tests confine, and the manifest ceiling it clears.
+/// `bind_admitted_uid_before_ready`'s install and readback steps (A3, A4) only
+/// run under a `Confined` identity, so both the fail-before and the ordering
+/// test need a manifest that actually confines someone.
+const TEST_AGENT_UID: u32 = 60123;
+const TEST_UID_CEILING: u32 = 1000;
 
 /// The host-global runtime dir the boot path's lock lives under in PRODUCTION.
 /// Named here only so the isolation assertions can prove this suite stays out
@@ -185,6 +205,115 @@ fn fresh_config(dir: &TempDir) -> DaemonConfig {
         // the suite's temp root, never in /var/lib/sanctuary.
         linux_runtime_paths: isolated_paths(),
     }
+}
+
+/// Like [`fresh_config`], but keyed to a CALLER-SUPPLIED signing key, so the
+/// caller can also sign a manifest under that same key before boot. The pinned
+/// key and the manifest signature must trace to one key pair, or the daemon
+/// rejects the manifest at signature verification for a reason that has
+/// nothing to do with the confined uid these two A7 tests mean to exercise.
+fn fresh_confining_config(dir: &TempDir, signing: &SigningKey) -> DaemonConfig {
+    DaemonConfig {
+        fortress_id: "deadbeef".to_string(),
+        socket_path: dir.path().join("filter.sock"),
+        policy_dir: dir.path().to_path_buf(),
+        wal_path: dir.path().join("wal.jsonl"),
+        pinned_public_key_path: write_pinned_key(dir, signing),
+        producer_key_path: dir.path().join("audit-producer.key"),
+        producer_pub_key_path: dir.path().join("audit-producer.pub"),
+        prompt_timeout: Duration::from_secs(30),
+        no_wall_max_duration: Duration::from_secs(3600),
+        wal_ttl: Duration::from_secs(86_400),
+        wal_size_cap_bytes: 16 * 1024 * 1024,
+        trusted_service_uid: Some(unsafe { libc::geteuid() }),
+        linux_runtime_paths: isolated_paths(),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let out = hasher.finalize();
+    let mut s = String::with_capacity(out.len() * 2);
+    for b in out.iter() {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+/// Write a manifest the daemon admits, confining [`TEST_AGENT_UID`]. Mirrors
+/// `write_signed_manifest_one_rule_with_uid_origin` in
+/// `integration_failure_modes.rs`: a per-agent kernel binding is only
+/// legitimate because a manifest in force confines that uid, and both A7 tests
+/// below need `bind_admitted_uid_before_ready` to actually reach the install
+/// and readback steps (A3, A4), which run only under a `Confined` identity.
+fn write_confining_manifest(policy_dir: &Path, signing: &SigningKey) {
+    std::fs::create_dir_all(policy_dir.join(RULES_SUBDIR)).unwrap();
+    let body = b"{\"id\":\"rule-allow-ip\",\"schema_version\":1,\"created_at\":\"2026-05-06T00:00:00Z\",\"match\":{\"ip\":[\"203.0.113.10\"],\"port\":[443],\"protocol\":\"tcp\"},\"disposition\":\"allow\"}";
+    std::fs::write(
+        policy_dir.join(RULES_SUBDIR).join("rule-allow-ip.json"),
+        body,
+    )
+    .unwrap();
+    // Every composed manifest must carry the genuine habeas local lane
+    // (always-on-lane gate), or the daemon rejects it at parse.
+    let habeas_body = castle_wall_daemon::habeas::HABEAS_LOCAL_RULE_BODY.as_bytes();
+    std::fs::write(
+        policy_dir
+            .join(RULES_SUBDIR)
+            .join("reserved_habeas_distress_local.json"),
+        habeas_body,
+    )
+    .unwrap();
+    let manifest = AllowlistManifest {
+        schema_version: 1,
+        fortress_id: "deadbeef".to_string(),
+        issued_at: "2026-05-06T00:00:00Z".to_string(),
+        generation: 1,
+        // Must match TEST_AGENT_UID / TEST_UID_CEILING above.
+        agent_origin: Some(AgentOrigin {
+            mode: "uid".to_string(),
+            egress_helper_signing_id: None,
+            egress_helper_team_id: None,
+            agent_runtime_port_range: None,
+            agent_uid: Some(TEST_AGENT_UID),
+            gate_uid: None,
+            system_uid_allow_ceiling: TEST_UID_CEILING,
+        }),
+        operator_baseline: None,
+        rules: vec![
+            ManifestRuleEntry {
+                rule_id: "rule-allow-ip".to_string(),
+                file: "rule-allow-ip.json".to_string(),
+                sha256: sha256_hex(body),
+            },
+            ManifestRuleEntry {
+                rule_id: "reserved_habeas_distress_local".to_string(),
+                file: "reserved_habeas_distress_local.json".to_string(),
+                sha256: sha256_hex(habeas_body),
+            },
+        ],
+    };
+    let canonical = canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();
+    let sig = signing.sign(&canonical);
+    let signed = SignedManifest {
+        manifest,
+        signature: ManifestSignature {
+            signature_scheme: "ed25519-v1".to_string(),
+            signing_key_id: castle_wall_daemon::crypto::castle_wall_signing_key_id(
+                &signing.verifying_key().to_bytes(),
+            )
+            .unwrap(),
+            signature_b64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(sig.to_bytes()),
+        },
+    };
+    std::fs::write(
+        policy_dir.join(MANIFEST_FILENAME),
+        serde_json::to_string_pretty(&signed).unwrap(),
+    )
+    .unwrap();
 }
 
 /// Assert a boot error is the typed kernel-runtime activation fail-before, not
@@ -622,6 +751,14 @@ fn spawn_long_running_daemon(
         // and delete the operator's real `sanctuary-castle` table.
         .args(isolation_args())
         .env("NOTIFY_SOCKET", notify_socket)
+        // Piped so a caller that needs to observe the daemon's own stderr (the
+        // A7 readback-ordering test below) can read it incrementally while the
+        // daemon is still running, without waiting for it to exit. A caller
+        // that never takes `child.stderr` is unaffected: the daemon's own
+        // startup/shutdown stderr output stays well under a pipe buffer, so an
+        // undrained pipe cannot make it block on a full buffer during this
+        // suite's short-lived runs.
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn the shipped daemon binary (long-running)")
 }
@@ -1173,4 +1310,588 @@ fn the_isolation_seam_cannot_be_aimed_at_a_production_or_foreign_table() {
     let err = nftables::use_isolated_castle_table(&format!("{ISOLATED_TABLE_PREFIX}other"))
         .expect_err("switching tables mid-process must be refused");
     assert!(err.contains("already resolved"), "{err}");
+}
+
+// ---- A7: readback fail-before, and readback-before-readiness ordering -----
+//
+// Slice A design packet section 2 (A4) and section 5 (leg L-A): `READY=1`
+// implies the admitted uid's jump was READ BACK from the kernel, not merely
+// that the load call returned `Ok`. The two tests below are the builder's
+// deviation item 6 ("the clearest gap against A7"), closed here.
+
+/// A7 fail-before: a forced kernel readback mismatch must withhold readiness.
+///
+/// `bind_admitted_uid_before_ready`'s readback step (A4) is the ONLY thing
+/// standing between "the kernel accepted the load call" and "the kernel
+/// actually holds the admitted uid's jump"; an `Ok` from the load proves
+/// nothing about what a concurrent actor did a moment later. This test cannot
+/// wait for a genuine race to lose that way on demand, so it drives the exact
+/// branch through the test-isolation seam
+/// (`force_next_agent_binding_readback_mismatch_for_test`,
+/// `runtime_providers.rs`) and asserts the daemon takes the IDENTICAL
+/// production refusal a real kernel divergence would, never a parallel
+/// test-only path: the forced detail is folded into the same
+/// `readback_failure` variable a genuine `UidMismatch` would produce, before
+/// the branch that returns `refuse_after_owned_table`.
+///
+/// In-process (not `spawn_long_running_daemon`): the seam is a static in this
+/// same address space, and a subprocess would boot with its own fresh, unarmed
+/// copy of it, so nothing here would need to reach across a process boundary.
+///
+/// BOUND on what it observes: the ABSENCE of the readback-success line is NOT
+/// asserted here. Rust's default test harness captures `eprintln!` inside the
+/// harness before it reaches file descriptor 2, so an fd-2 swap in this process
+/// reads empty whether or not the line was emitted, and an assertion over that
+/// buffer would stay green if the emission moved above the readback guard. That
+/// absence is NOT covered out of process either:
+/// `readback_line_is_emitted_on_a_boot_that_reaches_readiness` boots
+/// successfully and asserts the line's PRESENCE on that different, non-failing
+/// boot, never its absence on this one. What this test asserts instead is the
+/// readiness datagram's absence, which crosses a socket the harness does not
+/// touch; moving the emission above the readback guard would still leave both
+/// tests green, which is a named residual, not a covered case.
+#[test]
+fn a_forced_readback_mismatch_withholds_readiness() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    write_confining_manifest(dir.path(), &signing);
+    let config = fresh_confining_config(&dir, &signing);
+
+    // Bound, not discarded: the guard's `Drop` clears the latch, so it must
+    // outlive the one `daemon::boot` call below it exists to cover, exactly as
+    // `force_next_reclaim_owned_probe_error_for_test`'s callers already do in
+    // `integration_gf1_recovery.rs`.
+    let _forced_mismatch = force_next_agent_binding_readback_mismatch_for_test();
+
+    // The NEGATIVE observation this test owes: no readiness datagram may reach a
+    // configured NOTIFY_SOCKET. Armed BEFORE the boot call, because the beacon
+    // reads the variable once.
+    let readiness = ReadinessProbe::armed();
+    let boot_result = daemon::boot(config);
+
+    match boot_result {
+        Ok(_handle) => panic!(
+            "a forced readback mismatch must withhold READY=1 (return Err), not hand back a \
+             ready handle"
+        ),
+        Err(err) => {
+            assert_activation_failure(&err);
+            let message = err.to_string();
+            if !message.contains("forced to mismatch") {
+                // The daemon failed-before for some OTHER reason (most likely an
+                // unprivileged runner that cannot acquire nft/CAP_NET_ADMIN at
+                // all) before ever reaching the A4 readback step this test means
+                // to exercise. Skip like every other privileged-path test in this
+                // file, rather than asserting text this run could never produce;
+                // `SANCTUARY_EXPECT_PRIVILEGED_LINUX=1` turns this into a hard
+                // failure on the privileged CI job, same as the rest of the file.
+                cleanup_castle_table();
+                cleanup_journal();
+                skip_or_fail_unprivileged(&format!(
+                    "boot did not reach the forced readback seam: {message}"
+                ));
+                return;
+            }
+            assert!(
+                message.contains("did not read back from the kernel"),
+                "the refusal must go through the A4 readback guard, not some unrelated \
+                 acquisition failure; got: {message}"
+            );
+            readiness.assert_silent();
+        }
+    }
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+/// CAPABILITY: after a fresh acquisition, the ownership journal names THIS
+/// boot's identity, owner marker and kernel handles, and a refusal that
+/// withholds readiness leaves that record exactly as the acquisition wrote it.
+///
+/// Why it needs a wired test rather than a unit test: the property is about what
+/// the whole acquisition leaves on disk, not about one function's return value.
+/// The schedule drives it end to end: a valid previous-boot `Owned` record is
+/// planted (authenticated with the real key, so the acquisition treats it as
+/// genuine) with no live table, which routes the acquisition to `FreshCreate`;
+/// the readback is then forced to fail, which drives the refusal path. The
+/// journal is READ BACK and must hold the FRESH record, its confined history
+/// exactly the one uid the write-ahead put there.
+///
+/// BOUND on what it proves: the refusal path no longer writes the journal at
+/// all, so this is a regression guard on the record's contents, not a
+/// discriminator between a correct write and a stale one. The property that
+/// there is no write to get wrong is pinned at the source by
+/// `the_slice_a_refusal_path_never_reads_or_writes_the_journal`.
+/// Register: defect.linux-pr3b-refusal-record.
+#[test]
+fn a_refusal_after_a_fresh_acquisition_never_restores_the_previous_boots_record() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    write_confining_manifest(dir.path(), &signing);
+    let config = fresh_confining_config(&dir, &signing);
+
+    // PLANT the previous boot's record. The values are deliberately distinctive
+    // so a restored record is unmistakable in the assertion below.
+    const PLANTED_TABLE_HANDLE: u64 = 999_001;
+    const PLANTED_BASE_CHAIN_HANDLE: u64 = 999_002;
+    // CROSS-FILE PIN: the prefix must match `OWNER_MARKER_PREFIX` in
+    // `src/nftables.rs`; the 32 hex digits are the 128-bit nonce `new_owner_marker`
+    // emits, spelled out here so this planted value can never collide with a real
+    // one drawn from /dev/urandom.
+    let planted_marker = format!(
+        "{}deadbeefdeadbeefdeadbeefdeadbeef",
+        nftables::OWNER_MARKER_PREFIX
+    );
+    // CROSS-FILE PIN: the journal's boot-id grammar is hexadecimal digits and
+    // hyphens only (`ownership_journal::store_atomic` validates it before
+    // writing), so a mnemonic suffix makes the plant unstorable and the test
+    // panics before the schedule it means to drive. These 32 hex digits are
+    // distinct from any real `/proc/sys/kernel/random/boot_id` by construction:
+    // the host's value is random and this one is a fixed pattern.
+    let planted_boot_id = "00000000-0000-4000-8000-00000000d1fe".to_string();
+    let key = ownership_journal::load_or_generate_auth_key(&journal_auth_key_path())
+        .expect("the isolated key path must be writable");
+    let planted = ownership_journal::OwnershipJournal::owned_with_known_history(
+        ownership_journal::JournalIdentity {
+            schema_version: ownership_journal::JOURNAL_SCHEMA_VERSION,
+            marker: planted_marker.clone(),
+            boot_id: planted_boot_id.clone(),
+            source: ownership_journal::current_source(),
+        },
+        PLANTED_TABLE_HANDLE,
+        PLANTED_BASE_CHAIN_HANDLE,
+        Vec::new(),
+    )
+    .expect("the planted record must be constructible");
+    ownership_journal::store_atomic(&ownership_journal_path(), &planted, &key)
+        .expect("the planted record must store");
+
+    let _forced_mismatch = force_next_agent_binding_readback_mismatch_for_test();
+    let boot_result = daemon::boot(config);
+    let message = match boot_result {
+        Ok(_handle) => panic!("a forced readback mismatch must withhold READY=1"),
+        Err(err) => err.to_string(),
+    };
+    if !message.contains("forced to mismatch") {
+        cleanup_castle_table();
+        cleanup_journal();
+        skip_or_fail_unprivileged(&format!(
+            "boot did not reach the forced readback seam: {message}"
+        ));
+        return;
+    }
+
+    // READ THE JOURNAL BACK: the record this acquisition created, unchanged by
+    // the refusal that followed it.
+    let after = ownership_journal::load(&ownership_journal_path(), Some(&key))
+        .expect("the journal must still authenticate after the refusal")
+        .expect("the refusal must not clear the ownership record");
+    match after {
+        ownership_journal::OwnershipJournal::Owned {
+            identity,
+            table_handle,
+            base_chain_handle,
+            confined,
+        } => {
+            assert_ne!(
+                identity.boot_id, planted_boot_id,
+                "a refusal must not restore a previous boot's identity"
+            );
+            assert_eq!(
+                identity.boot_id,
+                ownership_journal::current_boot_id().expect("a readable boot id"),
+                "the record must name THIS boot"
+            );
+            assert_ne!(
+                identity.marker, planted_marker,
+                "a refusal must not restore a previous boot's owner marker"
+            );
+            assert_ne!(
+                table_handle, PLANTED_TABLE_HANDLE,
+                "a refusal must not restore a previous boot's table handle"
+            );
+            assert_ne!(
+                base_chain_handle, PLANTED_BASE_CHAIN_HANDLE,
+                "a refusal must not restore a previous boot's base chain handle"
+            );
+            // The history is EXACTLY what the acquisition's own write-ahead put
+            // there: one entry, the admitted uid. A refusal that appended to it
+            // would show up here as a second member or a changed role.
+            let history = confined.expect("the fresh record's history is known, not absent");
+            let uids: Vec<u32> = history.iter().map(|entry| entry.uid).collect();
+            assert_eq!(
+                uids,
+                vec![TEST_AGENT_UID],
+                "the refusal must leave the write-ahead's history untouched"
+            );
+        }
+        other => panic!("the refusal must leave an Owned record, got {other:?}"),
+    }
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+/// CAPABILITY: when the confined-uid write-ahead fails, the daemon refuses
+/// readiness AND the kernel is left holding a safety net whose rule 1 denies the
+/// uid it was about to bind.
+///
+/// Why it needs a fault-injected wired test rather than a unit test: neither the
+/// pure planner's tests nor a source-region pin can show what the kernel ends up
+/// holding on this arm, and the arm needs a journal failure to reach. The seam
+/// forces the SAME `Result` the real persist returns, so the branch taken here
+/// is the production one. Register: defect.linux-pr3b-refusal-record.
+///
+/// THE PLANTED SCHEDULE, and why a fresh first start is the wrong one: the
+/// net-on-refusal predicate reads this boot's confined history and the live
+/// binding set, and on a first start both are empty, so the production answer is
+/// correctly NO NET and an assertion that a net was installed fails on a correct
+/// daemon. The schedule that requires one is the deleted-jump shape: the wall
+/// owns a table, this boot's authenticated record already names the uid, and the
+/// per-agent jump is not in the table. That is planted here by booting once over
+/// a manifest that confines nobody (which leaves an owned, jump-free table),
+/// rewriting the record it wrote to carry this boot's history `[TEST_AGENT_UID]`
+/// under the real MAC key, and only then arming the fault.
+///
+/// FAILURE MODE worth stating: on an unprivileged runner the boot fails before
+/// it ever reaches the write-ahead, which looks identical to a pass unless the
+/// refusal text is checked; that is what the skip branches below are for, and
+/// `SANCTUARY_EXPECT_PRIVILEGED_LINUX=1` turns a skip into a hard failure.
+///
+/// BOUND on what it observes: as in `a_forced_readback_mismatch_withholds_readiness`,
+/// the absence of the two pinned stderr lines is not asserted in this process,
+/// because the default test harness captures `eprintln!` before file descriptor
+/// 2 and such an assertion would be vacuous. The readiness datagram and the
+/// INSTALLED kernel scope are what this test observes, and neither goes through
+/// the harness.
+#[test]
+fn a_failed_write_ahead_refuses_readiness_and_installs_a_net_naming_the_uid() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    // FIRST BOOT, over a manifest that confines nobody: it creates and owns the
+    // table and writes this boot's record, and it installs no per-agent jump, so
+    // what it leaves behind is exactly the owned, EMPTY table the schedule needs.
+    match daemon::boot(fresh_config(&dir)) {
+        Ok(handle) => {
+            assert_eq!(
+                handle.runtime_state(),
+                DaemonRuntimeState::KernelRuntimeReady
+            );
+            handle.stop().expect("clean stop");
+        }
+        Err(err) => {
+            assert_activation_failure(&err);
+            cleanup_castle_table();
+            cleanup_journal();
+            skip_or_fail_unprivileged(&format!(
+                "first daemon could not establish the owned-empty-table precondition: {err}"
+            ));
+            return;
+        }
+    }
+
+    // REWRITE THE RECORD so this boot's confined history names the uid, keeping
+    // the identity and both kernel handles the first boot captured: those are
+    // what the reclaim matches the live table against, and a synthesised marker
+    // or handle would route the next boot to a refusal before the bind.
+    let key = ownership_journal::load_or_generate_auth_key(&journal_auth_key_path())
+        .expect("the isolated key path must be writable");
+    let planted = match ownership_journal::load(&ownership_journal_path(), Some(&key))
+        .expect("the first boot's record must authenticate")
+        .expect("the first boot must leave an ownership record")
+    {
+        ownership_journal::OwnershipJournal::Owned {
+            identity,
+            table_handle,
+            base_chain_handle,
+            ..
+        } => ownership_journal::OwnershipJournal::owned_with_known_history(
+            identity,
+            table_handle,
+            base_chain_handle,
+            vec![ownership_journal::ConfinedIdentity {
+                uid: TEST_AGENT_UID,
+                role: ownership_journal::ConfinedRole::Agent,
+            }],
+        )
+        .expect("the planted record must be constructible"),
+        other => panic!("the first boot must leave an Owned record, got {other:?}"),
+    };
+    ownership_journal::store_atomic(&ownership_journal_path(), &planted, &key)
+        .expect("the planted record must store");
+
+    // SECOND BOOT: the manifest now admits the uid, the table is owned and holds
+    // no jump for it, and the write-ahead is forced to fail.
+    let signing = SigningKey::generate(&mut OsRng);
+    write_confining_manifest(dir.path(), &signing);
+    let config = fresh_confining_config(&dir, &signing);
+
+    // Bound, not discarded: the guard's `Drop` clears the latch, so it must
+    // outlive the one `daemon::boot` call it exists to cover.
+    let _forced_error = force_next_agent_binding_write_ahead_error_for_test();
+    let readiness = ReadinessProbe::armed();
+    let boot_result = daemon::boot(config);
+
+    let message = match boot_result {
+        Ok(_handle) => panic!("a failed write-ahead must withhold READY=1"),
+        Err(err) => {
+            assert_activation_failure(&err);
+            err.to_string()
+        }
+    };
+    if !message.contains("write-ahead forced to fail") {
+        cleanup_castle_table();
+        cleanup_journal();
+        skip_or_fail_unprivileged(&format!(
+            "boot did not reach the forced write-ahead seam: {message}"
+        ));
+        return;
+    }
+    assert!(
+        message.contains("could not be written into this boot's confined history"),
+        "the refusal must go through the write-ahead guard: {message}"
+    );
+    assert!(
+        message.contains("Installed the safety net"),
+        "a failed write-ahead over a history that names a uid must not leave the refusal \
+         netless: {message}"
+    );
+    // THE KERNEL, not the sentence. The refusal's introductory text names the
+    // admitted uid whatever scope was installed, so searching the message for it
+    // would pass on a net that protects somebody else. This reads rule 1 back out
+    // of the table the daemon left behind.
+    let denied = installed_net_rule_one_uids();
+    assert!(
+        denied.contains(&TEST_AGENT_UID),
+        "rule 1 of the installed net must deny the uid the bind was about to make live; \
+         denied={denied:?}, refusal={message}"
+    );
+    readiness.assert_silent();
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+/// Rule 1's uid set, read back out of the live isolated table.
+///
+/// CROSS-FILE PIN: the rule is recognised by its comment, which must match
+/// `NET_RULE_COMMENT_IDENTITY` in `src/nftables.rs`; the emitter and this reader
+/// share that one constant rather than two copies of a string. The uid set is
+/// taken from the PARSED ruleset for the same reason `integration_kernel_binding.rs`
+/// parses rather than greps: a text search for the number finds it in a comment,
+/// in a handle, or in another rule, none of which is rule 1's scope.
+///
+/// FAILURE MODE worth stating: an empty return reads the same whether the net is
+/// host-wide (the v1 shape carries no rules) or absent, so a caller asserting
+/// membership must also have asserted that a net was installed at all.
+fn installed_net_rule_one_uids() -> Vec<u32> {
+    let out = Command::new("nft")
+        .args(["-j", "list", "table", CASTLE_FAMILY, isolation::table()])
+        .output()
+        .expect("nft -j list table");
+    let listing = String::from_utf8_lossy(&out.stdout).to_string();
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&listing) else {
+        return Vec::new();
+    };
+    let Some(items) = doc.get("nftables").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    for item in items {
+        let Some(rule) = item.get("rule") else {
+            continue;
+        };
+        if rule.get("comment").and_then(|v| v.as_str()) != Some(nftables::NET_RULE_COMMENT_IDENTITY)
+        {
+            continue;
+        }
+        // nft renders a one-member anonymous set as a bare scalar (`meta skuid
+        // 60123`) and a larger one as `{"set": [..]}`; both are rule 1's scope.
+        // Reading only the set form returned an empty scope for a live one-uid
+        // net on the first privileged run of this suite.
+        let Some(right) = rule
+            .get("expr")
+            .and_then(|v| v.as_array())
+            .and_then(|exprs| exprs.first())
+            .and_then(|e| e.get("match"))
+            .and_then(|m| m.get("right"))
+        else {
+            return Vec::new();
+        };
+        let members: Vec<u64> = match right.get("set").and_then(|v| v.as_array()) {
+            Some(set) => set.iter().filter_map(|m| m.as_u64()).collect(),
+            None => right.as_u64().into_iter().collect(),
+        };
+        let mut uids: Vec<u32> = members
+            .into_iter()
+            .filter_map(|v| u32::try_from(v).ok())
+            .collect();
+        uids.sort_unstable();
+        uids.dedup();
+        return uids;
+    }
+    Vec::new()
+}
+
+/// Room for any datagram the beacon can send, with margin to spare.
+///
+/// DERIVATION: `READY_DATAGRAM` in `src/systemd_notify.rs` is `READY=1\n`, which
+/// is 8 bytes, and it is the ONLY datagram `signal_ready` writes. 64 is 8 times
+/// that, so a datagram this probe receives is reported whole in the panic message
+/// rather than truncated into bytes that read like a different message. The
+/// margin exists because a truncated read here would be indistinguishable from a
+/// correct one, and the failure would be a misleading panic string rather than a
+/// missed refusal.
+const READINESS_DATAGRAM_BUFFER_BYTES: usize = 64;
+
+/// A bound `NOTIFY_SOCKET` that can answer "was `READY=1` ever sent".
+///
+/// FAILURE MODE worth stating: the beacon reads the environment variable ONCE
+/// per boot, so the variable has to be set before `daemon::boot` is called, not
+/// after; set it late and the test proves nothing because no socket was ever
+/// configured.
+struct ReadinessProbe {
+    socket: UnixDatagram,
+    _dir: TempDir,
+}
+
+impl ReadinessProbe {
+    fn armed() -> Self {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("notify.sock");
+        let socket = UnixDatagram::bind(&path).expect("a bindable notify socket");
+        socket
+            .set_nonblocking(true)
+            .expect("the probe must never block the test");
+        std::env::set_var("NOTIFY_SOCKET", &path);
+        Self { socket, _dir: dir }
+    }
+
+    /// Assert nothing was delivered. A readiness datagram that arrives after a
+    /// refusal is the failure this exists to catch.
+    fn assert_silent(&self) {
+        let mut buf = [0u8; READINESS_DATAGRAM_BUFFER_BYTES];
+        match self.socket.recv(&mut buf) {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(n) => panic!(
+                "a refused boot must send no readiness datagram; got {:?}",
+                String::from_utf8_lossy(&buf[..n])
+            ),
+            Err(err) => panic!("unexpected notify-socket error: {err}"),
+        }
+    }
+}
+
+impl Drop for ReadinessProbe {
+    fn drop(&mut self) {
+        std::env::remove_var("NOTIFY_SOCKET");
+    }
+}
+
+/// The pinned readback line is emitted on a boot that reaches readiness.
+///
+/// BOUND: this asserts PRESENCE, not order. Timestamping a stderr line on one
+/// consumer thread and a `NOTIFY_SOCKET` datagram on another measures when THIS
+/// process was scheduled to observe each, so a correctly emitted line can sit in
+/// a pipe buffer until after readiness is seen (a red on a correct daemon) and a
+/// slow reader can hide a reversed emission (a green on a wrong one). A test that
+/// can fail on correct code and pass on wrong code is not evidence either way, so
+/// the ordering claim is carried elsewhere.
+///
+/// The ORDERING claim is carried by two things that do not depend on reader
+/// scheduling: the line is emitted from the readback parse result and from
+/// nowhere else (`AGENT_BINDING_READBACK_LINE_PREFIX` has exactly one emission
+/// site), and `agent_binding_readback_mismatch_withholds_readiness` proves a
+/// failed readback withholds `READY=1` entirely. The L-A drill leg orders the two
+/// on the real unit using journald `__MONOTONIC_TIMESTAMP` and the unit's
+/// `ActiveEnterTimestampMonotonic`, which is one clock rather than two threads.
+#[test]
+fn readback_line_is_emitted_on_a_boot_that_reaches_readiness() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    let pinned = write_pinned_key(&dir, &signing);
+    write_confining_manifest(dir.path(), &signing);
+
+    let notify_path = dir.path().join("notify.sock");
+    let listener = UnixDatagram::bind(&notify_path).expect("bind notify socket");
+    let mut child = spawn_long_running_daemon(&dir, &pinned, &notify_path);
+
+    // Drain stderr on a background thread so a full pipe can never make the
+    // daemon block on a write while this thread waits on the notify socket.
+    let stderr = child.stderr.take().expect("stderr must be piped");
+    let seen: Arc<Mutex<(bool, bool)>> = Arc::new(Mutex::new((false, false)));
+    let seen_writer = Arc::clone(&seen);
+    let reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // EOF: the child closed its stderr end.
+                Ok(_) => {
+                    let mut flags = seen_writer.lock().unwrap();
+                    if line.contains(runtime_providers::AGENT_BINDING_READBACK_LINE_PREFIX) {
+                        flags.0 = true;
+                    }
+                    // CROSS-FILE PIN: the write-ahead needle L-A3 run 1 greps.
+                    // Must match `AGENT_BINDING_WRITE_AHEAD_LINE_PREFIX` in
+                    // `src/runtime_providers.rs`.
+                    if line.contains(runtime_providers::AGENT_BINDING_WRITE_AHEAD_LINE_PREFIX) {
+                        flags.1 = true;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    if let Err(reason) = wait_for_ready(&mut child, &listener, Duration::from_secs(10)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        cleanup_castle_table();
+        cleanup_journal();
+        skip_or_fail_unprivileged(&reason);
+        return;
+    }
+
+    let pid = child.id().to_string();
+    let _ = Command::new("kill").args(["-TERM", pid.as_str()]).status();
+    let _ = child.wait();
+    // Joining the reader after the child has exited drains stderr to EOF, so the
+    // flags below are read after every line the daemon wrote, not after whatever
+    // this thread happened to be scheduled to see.
+    let _ = reader.join();
+
+    let (readback_seen, write_ahead_seen) = *seen.lock().unwrap();
+    assert!(
+        readback_seen,
+        "the pinned readback line must appear on stderr for a boot that reaches READY=1"
+    );
+    assert!(
+        write_ahead_seen,
+        "the pinned write-ahead line must appear for a boot that installed the binding"
+    );
+
+    cleanup_castle_table();
+    cleanup_journal();
 }

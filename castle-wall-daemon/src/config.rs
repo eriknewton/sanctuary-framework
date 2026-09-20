@@ -452,4 +452,22 @@ mod tests {
         let err = DaemonConfig::from_argv(["--fortress-id", "x", "--rogue", "y"]).unwrap_err();
         assert!(matches!(err, ConfigError::Unknown(s) if s == "--rogue"));
     }
+
+    // A partially-isolated path set is the shape that still reads or mutates
+    // operator state, so the predicate has to fail on EACH path individually.
+    #[test]
+    fn a_production_journal_beside_isolated_paths_is_not_isolated() {
+        let root = std::path::Path::new("/tmp/castle-wall-isolation-fixture");
+        let isolated = LinuxRuntimePaths::isolated_under(root);
+        assert!(isolated.is_isolated_from_production());
+        let mut leaky = isolated.clone();
+        leaky.journal_auth_key_path =
+            PathBuf::from(crate::ownership_journal::DEFAULT_JOURNAL_AUTH_KEY_PATH);
+        assert!(
+            !leaky.is_isolated_from_production(),
+            "a boot with two temporary paths and the operator's own journal key would \
+             authenticate against operator state"
+        );
+        assert!(!LinuxRuntimePaths::production().is_isolated_from_production());
+    }
 }
