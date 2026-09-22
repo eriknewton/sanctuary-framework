@@ -11,6 +11,7 @@ import {
   classifyApprovalRequest,
   canonicalJson,
   fingerprintIdentityId,
+  fixedDenial,
   normalizedArgsHash,
   sha256,
   type SessionBinding,
@@ -30,6 +31,18 @@ async function callTool(
 ): Promise<Record<string, unknown>> {
   const tool = tools.find((candidate) => candidate.name === name);
   if (!tool) throw new Error(`missing tool: ${name}`);
+  // Mirror router.ts:229 (the gate-time projection runs on the SAME args
+  // object the handler receives, before the handler runs) and router.ts's
+  // catch around it (a throwing approvalTargetArgs denies rather than
+  // propagating). For state_export this is also what attaches the
+  // approval binding the handler now requires (SDW-pattern exact-consent
+  // binding, cognitive/tools.ts); tools without approvalTargetArgs are
+  // unaffected.
+  try {
+    await tool.approvalTargetArgs?.(args);
+  } catch {
+    return fixedDenial(`audit:gate:${name}`) as unknown as Record<string, unknown>;
+  }
   const result = await tool.handler(args);
   return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
 }

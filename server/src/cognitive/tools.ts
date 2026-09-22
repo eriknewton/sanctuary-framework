@@ -43,6 +43,7 @@ import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
 import { InterruptedExitImportPendingError } from "../storage/exit-import-journal.js";
 import {
   fixedDenial,
+  normalizedArgsHash,
   OpaqueNamespaceRegistry,
   resolveActiveSessionIdentity,
   type SessionBinding,
@@ -815,6 +816,85 @@ async function refuseIdentityOverwrite(
     "failure"
   );
   throw new IdentityOverwriteRefusedError();
+}
+
+// ── state_export approval binding (defect.tier1-approval-binding-state-export-namespace-toctou-01) ──
+//
+// Mirrors the SDW "exact consent binding" (server/src/sdw/tools.ts:8-33,
+// 150-211): `approvalTargetArgs` runs at GATE time and freezes the namespace
+// set the human's Tier-1 approval prompt was shown onto the ORIGINAL per-call
+// args object (a private, non-enumerable Symbol property JSON args can never
+// carry, so nothing an agent submits can forge or overwrite it). The handler
+// consumes that binding instead of re-deriving the set from live state.
+// Before this fix, `state_export`'s handler called the same non-pure
+// `sessionOwnedExportNamespaces()` a second, independent time at execution,
+// so a namespace warmed or reassigned during the human's approval wait could
+// silently reach an export the human never saw. Consuming the binding closes
+// that window: the handler can only export the set this call's own approval
+// prompt displayed, never a set recomputed after approval.
+const STATE_EXPORT_APPROVAL_BINDING = Symbol(
+  "sanctuary.state_export.approval-binding"
+);
+
+/**
+ * Whose approval this carries: the human who approved THIS Tier-1
+ * `state_export` call, for THIS exact args hash. Its evidence source is
+ * `approvalTargetArgs`'s gate-time computation; its verifier is
+ * `takeStateExportApprovalBinding` in the handler. Consuming it means: the
+ * handler exports exactly `namespaces`, never a live re-derivation.
+ */
+interface StateExportApprovalBinding {
+  readonly toolName: "state_export";
+  /** Must match `normalizedArgsHash` in ../agent-native/safety-base.ts — a
+   *  mismatch means the args object changed after gate time. */
+  readonly argsHash: string;
+  readonly namespaces: readonly string[];
+  readonly storedAtMs: number;
+}
+
+interface StateExportBindableArgs extends Record<string, unknown> {
+  [STATE_EXPORT_APPROVAL_BINDING]?: StateExportApprovalBinding;
+}
+
+// 15 minutes: comfortably bounds a human-speed interactive approval
+// (dashboard/webhook `timeout_seconds`, typically seconds to a few minutes,
+// principal-policy/types.ts:36) while keeping a stale, unconsumed binding
+// from being usable indefinitely. Same value and rationale as SDW's
+// APPROVAL_BINDING_TTL_MS (server/src/sdw/tools.ts:79-85).
+const STATE_EXPORT_APPROVAL_BINDING_TTL_MS = 15 * 60_000;
+
+function attachStateExportApprovalBinding(
+  args: Record<string, unknown>,
+  binding: StateExportApprovalBinding
+): void {
+  Object.defineProperty(args, STATE_EXPORT_APPROVAL_BINDING, {
+    value: binding,
+    enumerable: false,
+    configurable: true,
+    writable: false,
+  });
+}
+
+/**
+ * Consume (single-use) the approval binding for this call. Returns null —
+ * the caller MUST fail closed, never fall back to recomputing the namespace
+ * set (Sanctuary MUST-NEVER rule 5) — when no binding exists (gate not
+ * configured or `approvalTargetArgs` never ran), the binding was minted for
+ * a different tool, it exceeded the freshness window, or the args object
+ * changed after gate time (hash mismatch).
+ */
+function takeStateExportApprovalBinding(
+  args: Record<string, unknown>,
+  nowMs: number
+): StateExportApprovalBinding | null {
+  const bindable = args as StateExportBindableArgs;
+  const binding = bindable[STATE_EXPORT_APPROVAL_BINDING];
+  if (binding === undefined) return null;
+  delete bindable[STATE_EXPORT_APPROVAL_BINDING];
+  if (binding.toolName !== "state_export") return null;
+  if (nowMs - binding.storedAtMs > STATE_EXPORT_APPROVAL_BINDING_TTL_MS) return null;
+  if (binding.argsHash !== normalizedArgsHash(args)) return null;
+  return binding;
 }
 
 /**
@@ -1685,32 +1765,68 @@ export function createCognitiveTools(
           format: { type: "string", default: "sanctuary-v1" },
         },
       },
-      approvalTargetArgs: (args) =>
-        typeof args.namespace === "string"
+      // Gate-time namespace freeze (defect
+      // .tier1-approval-binding-state-export-namespace-toctou-01): compute
+      // the exact set the Tier-1 approval prompt will show ONCE, here, and
+      // bind it to the original per-call args object. The explicit
+      // single-namespace form is bound too (namespaces: [args.namespace]) so
+      // there is no unbound path through this tool — every state_export call
+      // executes on the set its own approval was minted for, never a set
+      // re-derived live after the human decided.
+      approvalTargetArgs: async (args) => {
+        let namespaces: string[];
+        if (typeof args.namespace === "string") {
+          namespaces = [args.namespace];
+        } else if (options?.currentSessionBinding?.()) {
+          try {
+            namespaces = sessionOwnedExportNamespaces();
+          } catch {
+            await denyNamespaceAccess("state_export", "state_export");
+            throw new Error("namespace_ownership_ambiguous");
+          }
+        } else {
+          namespaces = sessionOwnedExportNamespaces();
+        }
+        attachStateExportApprovalBinding(args, {
+          toolName: "state_export",
+          argsHash: normalizedArgsHash(args),
+          namespaces,
+          storedAtMs: Date.now(),
+        });
+        return typeof args.namespace === "string"
           ? args
-          : { ...args, namespaces: sessionOwnedExportNamespaces() },
+          : { ...args, namespaces };
+      },
       handler: async (args) => {
-        let namespaces: string[] | undefined;
+        // Consume the gate-time binding instead of recomputing the
+        // namespace set: recomputation here (via the live export cache /
+        // namespace registry) is exactly the TOCTOU this closes — a
+        // namespace warmed or reassigned while the human's approval was
+        // pending must never reach the bundle. Absent, mismatched, or
+        // expired binding is a denial, never a fallback to recomputation
+        // (Sanctuary MUST-NEVER rule 5: no silent degrade on error).
+        const binding = takeStateExportApprovalBinding(args, Date.now());
+        if (binding === null) {
+          return denyNamespaceAccess(
+            "state_export",
+            typeof args.namespace === "string" ? args.namespace : "state_export"
+          );
+        }
+        const namespaces = [...binding.namespaces];
+
         if (typeof args.namespace === "string") {
           try {
             assertOpaqueNamespaceOwned(args.namespace);
           } catch {
             return denyNamespaceAccess("state_export", args.namespace);
           }
-        } else if (options?.currentSessionBinding?.()) {
-          try {
-            namespaces = sessionOwnedExportNamespaces();
-          } catch {
-            return denyNamespaceAccess("state_export", "state_export");
-          }
-        } else {
-          namespaces = sessionOwnedExportNamespaces();
         }
 
-        const result =
-          typeof args.namespace === "string"
-            ? await stateStore.export(args.namespace)
-            : await stateStore.exportNamespaces(namespaces);
+        // `exportNamespaces` (state-store.ts) filters reserved `_`-prefixed
+        // namespaces and de-duplicates; a namespace the gate-time set never
+        // included cannot reappear here because `namespaces` is exactly the
+        // approved binding, not a re-derived live set.
+        const result = await stateStore.exportNamespaces(namespaces);
 
         await recordCriticalAudit(auditLog, "l1", "state_export", "principal", {
           namespaces: result.namespaces,

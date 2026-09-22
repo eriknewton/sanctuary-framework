@@ -25,6 +25,19 @@ async function callTool(
 ): Promise<Record<string, unknown>> {
   const tool = tools.find((t) => t.name === name);
   if (!tool) throw new Error(`missing tool: ${name}`);
+  // Mirror router.ts:229 (the gate-time projection runs on the SAME args
+  // object the handler later receives, before the handler is invoked) and
+  // router.ts's catch around it (a throwing approvalTargetArgs denies
+  // rather than propagating — e.g. state_import's tampered-bundle
+  // rejection). For tools with an exact-consent binding (e.g. state_export,
+  // following the SDW pattern in sdw/tools.ts), this is also what attaches
+  // the approval binding the handler now requires; tools without one are
+  // unaffected.
+  try {
+    await tool.approvalTargetArgs?.(args);
+  } catch {
+    return fixedDenial(`audit:gate:${name}`) as unknown as Record<string, unknown>;
+  }
   const result = await tool.handler(args);
   return JSON.parse(result.content[0]!.text);
 }
