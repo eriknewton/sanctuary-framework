@@ -1,3 +1,4 @@
+// fail-before-exempt: this file's callTool helper now runs a tool's approvalTargetArgs before its handler, matching router.ts's gate-time projection order, so a gated tool (e.g. state_export) is exercised the way the shipped composition root wires it instead of denying on a missing binding; no new product behavior is asserted by this edit.
 import { describe, expect, it } from "vitest";
 import { ApprovalGate } from "../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../src/principal-policy/baseline.js";

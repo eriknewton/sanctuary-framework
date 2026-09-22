@@ -1,3 +1,4 @@
+// fail-before-exempt: this file's callTool helper now runs a tool's approvalTargetArgs before its handler, matching router.ts's gate-time projection order, so a gated tool is exercised the way the shipped composition root wires it instead of denying on a missing binding; no new product behavior is asserted by this edit.
 /**
  * F1: `importExitBundle` activation is atomic under a hard process kill,
  * not just under a caught JS exception. A durable per-import rollback
