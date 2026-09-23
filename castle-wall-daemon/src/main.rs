@@ -477,7 +477,7 @@ mod tests {
     fn supervision_exit_status_preserves_repair_and_shutdown_matrix() {
         let reason = NotReadyReason::SafetyNetRecovering(ComponentKind::NftablesTable);
         let repair = daemon::SupervisionOutcome::RepairRequired {
-            reason: reason.clone(),
+            reason,
             install_result: PostReadyRecoveryResult::InstallSucceeded,
         };
         assert_eq!(supervision_exit_status(&repair, true), 78);
