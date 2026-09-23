@@ -34,6 +34,7 @@ let package = Package(
         .macOS(.v13),
     ],
     products: [
+        .library(name: "MemoryGrantPeer", targets: ["MemoryGrantPeer"]),
         .library(
             name: "CastleWallIPC",
             targets: ["CastleWallIPC"]
@@ -74,6 +75,12 @@ let package = Package(
         ),
     ],
     targets: [
+        .target(name: "MemoryGrantPeer", path: "Sources/MemoryGrantPeer"),
+        .testTarget(
+            name: "MemoryGrantPeerTests",
+            dependencies: ["MemoryGrantPeer"],
+            path: "Tests/MemoryGrantPeerTests"
+        ),
         .target(
             name: "CastleWallIPC",
             path: "Sources/CastleWallIPC"
