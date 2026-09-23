@@ -413,24 +413,36 @@ fn main() -> ExitCode {
             "castle-wall-daemon: fatal control-path durability failure after commit; \
              tearing down and exiting nonzero so systemd restarts enforcement"
         ),
+        daemon::SupervisionOutcome::RepairRequired {
+            reason,
+            install_result,
+        } => {
+            let detail = match install_result {
+                castle_wall_daemon::enforcement::PostReadyRecoveryResult::InstallSucceeded => {
+                    "the net install returned success, but journal persistence may have failed"
+                }
+                castle_wall_daemon::enforcement::PostReadyRecoveryResult::InstallFailed => {
+                    "protection could not be proved"
+                }
+                _ => "unexpected recovery result",
+            };
+            eprintln!("castle-wall-daemon: repair required after runtime loss ({reason:?}): {detail}; repair the host, then run `systemctl reset-failed sanctuary-castle-wall.service` and explicitly start the service; starting before repair may exit 78 again");
+        }
         daemon::SupervisionOutcome::ShutdownRequested => {}
     }
-    let report = match handle.stop() {
-        Ok(r) => r,
+    let stop_result = handle.stop();
+    let report = match stop_result {
+        Ok(r) => Some(r),
         Err(err) => {
-            // SAFETY: stderr is the CLI shutdown-error contract here, not a
-            // log channel. Emitted after the audit channel has been drained;
-            // this is the operator-visible failure signal on the normal
-            // shutdown path.
             eprintln!("castle-wall-daemon: shutdown error: {}", err);
-            return ExitCode::from(75);
+            None
         }
     };
-    // A post-ready runtime loss is a failure exit even though teardown was
-    // clean: systemd must see nonzero to apply Restart=on-failure.
-    if !matches!(outcome, daemon::SupervisionOutcome::ShutdownRequested) {
-        return ExitCode::from(75);
+    let exit_status = supervision_exit_status(&outcome, report.is_some());
+    if exit_status != 0 {
+        return ExitCode::from(exit_status);
     }
+    let report = report.expect("clean shutdown has a report");
     // SAFETY: stdout is the CLI clean-exit contract here, not a log channel.
     // Operators rely on this line to confirm the daemon stopped cleanly.
     println!(
@@ -438,4 +450,50 @@ fn main() -> ExitCode {
         report.uptime, report.audit_overflow_count, report.audit_remaining
     );
     ExitCode::SUCCESS
+}
+
+fn supervision_exit_status(outcome: &daemon::SupervisionOutcome, stop_succeeded: bool) -> u8 {
+    match outcome {
+        daemon::SupervisionOutcome::RepairRequired { .. } => 78,
+        daemon::SupervisionOutcome::ShutdownRequested if stop_succeeded => 0,
+        daemon::SupervisionOutcome::ShutdownRequested
+        | daemon::SupervisionOutcome::KernelRuntimeLost(_)
+        | daemon::SupervisionOutcome::FatalControlPath => 75,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use castle_wall_daemon::enforcement::{ComponentKind, NotReadyReason, PostReadyRecoveryResult};
+
+    #[test]
+    fn supervision_exit_status_preserves_repair_and_shutdown_matrix() {
+        let reason = NotReadyReason::SafetyNetRecovering(ComponentKind::NftablesTable);
+        let repair = daemon::SupervisionOutcome::RepairRequired {
+            reason: reason.clone(),
+            install_result: PostReadyRecoveryResult::InstallSucceeded,
+        };
+        assert_eq!(supervision_exit_status(&repair, true), 78);
+        assert_eq!(supervision_exit_status(&repair, false), 78);
+        assert_eq!(
+            supervision_exit_status(&daemon::SupervisionOutcome::ShutdownRequested, true),
+            0
+        );
+        assert_eq!(
+            supervision_exit_status(&daemon::SupervisionOutcome::ShutdownRequested, false),
+            75
+        );
+        assert_eq!(
+            supervision_exit_status(&daemon::SupervisionOutcome::FatalControlPath, true),
+            75
+        );
+        assert_eq!(
+            supervision_exit_status(&daemon::SupervisionOutcome::FatalControlPath, false),
+            75
+        );
+        let lost = daemon::SupervisionOutcome::KernelRuntimeLost(reason);
+        assert_eq!(supervision_exit_status(&lost, true), 75);
+        assert_eq!(supervision_exit_status(&lost, false), 75);
+    }
 }
