@@ -43,6 +43,7 @@ EnvironmentFile=/etc/sanctuary/castle-wall.env
 ExecStartPre=/usr/bin/install -d -m 0750 -o root -g sanctuary /run/sanctuary/${SANCTUARY_FORTRESS_ID}
 ExecStart=/usr/local/libexec/sanctuary/castle-wall-daemon --fortress-id ${SANCTUARY_FORTRESS_ID} --trusted-service-uid ${SANCTUARY_TRUSTED_SERVICE_UID}
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=2
 User=root
 Group=sanctuary

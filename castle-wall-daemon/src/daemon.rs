@@ -608,6 +608,34 @@ impl DaemonHandle {
         // arriving in the first health interval reads a real observation rather
         // than "nothing published yet".
         let (initial_health, initial_recovery) = self.kernel_runtime_health_with_recovery();
+        match recovery_call_decision(
+            self.is_fatal_control_path_requested(),
+            self.is_shutdown_requested(),
+            initial_health,
+            initial_recovery,
+        ) {
+            RecoveryCallDecision::FatalControlPath => return SupervisionOutcome::FatalControlPath,
+            RecoveryCallDecision::ShutdownRequested => {
+                return SupervisionOutcome::ShutdownRequested
+            }
+            RecoveryCallDecision::RepairRequired {
+                reason,
+                install_result,
+            } => {
+                self.record_recovery_attempt(reason, install_result);
+                return SupervisionOutcome::RepairRequired {
+                    reason,
+                    install_result,
+                };
+            }
+            RecoveryCallDecision::Inconsistent => {
+                // SAFETY: stderr is the last-resort operator channel when a returned
+                // install result conflicts with its health observation before READY.
+                eprintln!("castle-wall-daemon: recovery install result returned without a Recovering observation; refusing READY");
+                return SupervisionOutcome::FatalControlPath;
+            }
+            RecoveryCallDecision::Continue => {}
+        }
         self.runtime_health.publish(initial_health);
         if initial_health == RuntimeHealthState::Ready {
             self.runtime_health.clear_safety_net();
@@ -618,24 +646,6 @@ impl DaemonHandle {
         }
         if let RuntimeHealthState::Recovering(reason) = initial_health {
             self.record_runtime_loss(reason, true);
-            if matches!(
-                initial_recovery,
-                crate::enforcement::PostReadyRecoveryResult::InstallSucceeded
-                    | crate::enforcement::PostReadyRecoveryResult::InstallFailed
-            ) {
-                self.record_recovery_attempt(reason, initial_recovery);
-            }
-        } else if matches!(
-            initial_recovery,
-            crate::enforcement::PostReadyRecoveryResult::InstallSucceeded
-                | crate::enforcement::PostReadyRecoveryResult::InstallFailed
-        ) {
-            self.record_recovery_attempt(
-                crate::enforcement::NotReadyReason::SafetyNetRecovering(
-                    crate::enforcement::ComponentKind::NftablesTable,
-                ),
-                initial_recovery,
-            );
         }
         loop {
             // Fatal wins over normal shutdown even when the IPC handler sets
@@ -823,8 +833,8 @@ impl DaemonHandle {
         reason: crate::enforcement::NotReadyReason,
         result: crate::enforcement::PostReadyRecoveryResult,
     ) {
-        // The supervisor has already published this poll's health and tag. A
-        // transaction row must not overwrite a terminal or repaired observation.
+        // Record the exact result and current safety-net tag without changing the
+        // published observation; the caller owns this call's supervision disposition.
         self.append_runtime_loss_row(reason, Some(result), self.safety_net_audit_state());
     }
 
@@ -847,8 +857,8 @@ impl DaemonHandle {
             )
         {
             // The capability is already lost, so there is no mutation to roll
-            // back. Do not hide the audit failure: exit/restart remains mandatory
-            // and systemd captures this diagnostic.
+            // back. Do not hide the audit failure: the caller preserves its exit
+            // disposition and systemd captures this diagnostic.
             // SAFETY: stderr is the last-resort operator channel when the DURABLE audit
             // channel itself failed; there is no other place this loss can be recorded,
             // and systemd's journal is where an operator looks after a restart.
@@ -1042,6 +1052,48 @@ pub enum SupervisionOutcome {
     /// daemon must NOT keep reporting itself active while non-enforcing: `main`
     /// tears down and exits nonzero so systemd restarts it.
     KernelRuntimeLost(crate::enforcement::NotReadyReason),
+    /// A returned safety-net install needs operator repair before restart.
+    RepairRequired {
+        reason: crate::enforcement::NotReadyReason,
+        install_result: crate::enforcement::PostReadyRecoveryResult,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryCallDecision {
+    FatalControlPath,
+    ShutdownRequested,
+    Continue,
+    Inconsistent,
+    RepairRequired {
+        reason: crate::enforcement::NotReadyReason,
+        install_result: crate::enforcement::PostReadyRecoveryResult,
+    },
+}
+
+fn recovery_call_decision(
+    fatal: bool,
+    shutdown: bool,
+    observed: RuntimeHealthState,
+    result: crate::enforcement::PostReadyRecoveryResult,
+) -> RecoveryCallDecision {
+    if fatal {
+        return RecoveryCallDecision::FatalControlPath;
+    }
+    if shutdown {
+        return RecoveryCallDecision::ShutdownRequested;
+    }
+    use crate::enforcement::PostReadyRecoveryResult::{InstallFailed, InstallSucceeded};
+    if !matches!(result, InstallSucceeded | InstallFailed) {
+        return RecoveryCallDecision::Continue;
+    }
+    match observed {
+        RuntimeHealthState::Recovering(reason) => RecoveryCallDecision::RepairRequired {
+            reason,
+            install_result: result,
+        },
+        _ => RecoveryCallDecision::Inconsistent,
+    }
 }
 
 /// Summary of a daemon run; surfaced to the operator on shutdown.
@@ -1592,6 +1644,145 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[derive(Clone, Copy)]
+    enum AttemptSideEffect {
+        None,
+        Fatal,
+        Shutdown,
+        FatalAndShutdown,
+    }
+
+    struct InitialAttemptComponent {
+        kind: crate::enforcement::ComponentKind,
+        health: Arc<Mutex<crate::enforcement::ComponentHealth>>,
+        attempts: Arc<AtomicUsize>,
+        tag: Arc<Mutex<crate::nftables::SafetyNetAuditState>>,
+        result: crate::enforcement::PostReadyRecoveryResult,
+        post_health: crate::enforcement::ComponentHealth,
+        side_effect: AttemptSideEffect,
+        fatal: Arc<AtomicBool>,
+        shutdown: Arc<AtomicBool>,
+    }
+
+    impl crate::enforcement::AcquiredComponent for InitialAttemptComponent {
+        fn kind(&self) -> crate::enforcement::ComponentKind {
+            self.kind
+        }
+        fn is_ready(&self) -> bool {
+            self.health() == crate::enforcement::ComponentHealth::Ready
+        }
+        fn health(&self) -> crate::enforcement::ComponentHealth {
+            *self.health.lock().unwrap()
+        }
+        fn safety_net_audit_state(&self) -> Option<crate::nftables::SafetyNetAuditState> {
+            (self.kind == crate::enforcement::ComponentKind::NftablesTable)
+                .then(|| self.tag.lock().unwrap().clone())
+        }
+        fn attempt_post_ready_recovery(
+            &self,
+            shutting_down: bool,
+        ) -> crate::enforcement::PostReadyRecoveryResult {
+            use crate::enforcement::{ComponentKind, PostReadyRecoveryResult as R};
+            if shutting_down || self.kind != ComponentKind::NftablesTable {
+                return R::NoInstall;
+            }
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            *self.health.lock().unwrap() = self.post_health;
+            match self.result {
+                R::InstallSucceeded => {
+                    *self.tag.lock().unwrap() = crate::nftables::SafetyNetAuditState::Installed {
+                        shape: "v1-host-wide",
+                        reason: "unknown-history",
+                        deny_set_size: 0,
+                        deny_set_max: 1,
+                        rules: vec![],
+                        denied_uids: vec![],
+                        sources: crate::nftables::SafetyNetSources {
+                            journal: false,
+                            manifest: false,
+                            live_table: false,
+                        },
+                        kernel_nd_accepted: vec![],
+                        unattestable_packets: "drop-except-kernel-nd",
+                        coverage: "inet output hook",
+                    }
+                }
+                R::InstallFailed => {
+                    *self.tag.lock().unwrap() =
+                        crate::nftables::SafetyNetAuditState::InstallFailed {
+                            attempted_scope: "v1-host-wide".into(),
+                            error: "injected failure".into(),
+                        }
+                }
+                R::NoInstall | R::OwnedWallReady => {}
+            }
+            match self.side_effect {
+                AttemptSideEffect::None => {}
+                AttemptSideEffect::Fatal => self.fatal.store(true, Ordering::SeqCst),
+                AttemptSideEffect::Shutdown => self.shutdown.store(true, Ordering::SeqCst),
+                AttemptSideEffect::FatalAndShutdown => {
+                    self.shutdown.store(true, Ordering::SeqCst);
+                    self.fatal.store(true, Ordering::SeqCst);
+                }
+            }
+            self.result
+        }
+        fn release(&mut self) {}
+    }
+
+    struct InitialAttemptProvider(InitialAttemptComponent);
+    impl crate::enforcement::ComponentProvider for InitialAttemptProvider {
+        fn kind(&self) -> crate::enforcement::ComponentKind {
+            self.0.kind
+        }
+        fn acquire(
+            self: Box<Self>,
+        ) -> Result<
+            Box<dyn crate::enforcement::AcquiredComponent>,
+            crate::enforcement::EnforcementError,
+        > {
+            Ok(Box::new(self.0))
+        }
+    }
+
+    fn install_initial_attempt_fixture(
+        handle: &mut DaemonHandle,
+        result: crate::enforcement::PostReadyRecoveryResult,
+        post_health: crate::enforcement::ComponentHealth,
+        side_effect: AttemptSideEffect,
+    ) -> Arc<AtomicUsize> {
+        use crate::enforcement::{ComponentHealth, ComponentKind, EnforcementRuntime};
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let health = Arc::new(Mutex::new(ComponentHealth::Ready));
+        let tag = Arc::new(Mutex::new(
+            crate::nftables::SafetyNetAuditState::NotAttempted,
+        ));
+        let providers = ComponentKind::REQUIRED_IN_ORDER
+            .iter()
+            .copied()
+            .map(|kind| {
+                Box::new(InitialAttemptProvider(InitialAttemptComponent {
+                    kind,
+                    health: if kind == ComponentKind::NftablesTable {
+                        Arc::clone(&health)
+                    } else {
+                        Arc::new(Mutex::new(ComponentHealth::Ready))
+                    },
+                    attempts: Arc::clone(&attempts),
+                    tag: Arc::clone(&tag),
+                    result,
+                    post_health,
+                    side_effect,
+                    fatal: Arc::clone(&handle.fatal_control_path),
+                    shutdown: Arc::clone(&handle.shutdown_flag),
+                })) as Box<dyn crate::enforcement::ComponentProvider>
+            })
+            .collect();
+        handle.set_enforcement_for_test(EnforcementRuntime::start(providers).unwrap());
+        *health.lock().unwrap() = ComponentHealth::Lost;
+        attempts
+    }
+
     #[test]
     fn recovery_wal_rows_cover_every_install_and_only_one_throttle_transition() {
         use crate::enforcement::{
@@ -1671,6 +1862,203 @@ mod tests {
             ),
             (false, false, true)
         );
+    }
+
+    #[test]
+    fn initial_poll_handles_attempt_precedence_protocol_and_audit_matrix() {
+        use crate::enforcement::{
+            ComponentHealth, ComponentKind, NotReadyReason, PostReadyRecoveryResult as R,
+        };
+        use crate::nftables::SafetyNetAuditState as Tag;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Expected {
+            Repair,
+            Fatal,
+            Shutdown,
+        }
+        let reason = NotReadyReason::SafetyNetRecovering(ComponentKind::NftablesTable);
+        let cases = [
+            (
+                R::InstallSucceeded,
+                ComponentHealth::Recovering,
+                AttemptSideEffect::None,
+                false,
+                Expected::Repair,
+            ),
+            (
+                R::InstallFailed,
+                ComponentHealth::Recovering,
+                AttemptSideEffect::None,
+                false,
+                Expected::Repair,
+            ),
+            (
+                R::InstallFailed,
+                ComponentHealth::Recovering,
+                AttemptSideEffect::Fatal,
+                false,
+                Expected::Fatal,
+            ),
+            (
+                R::InstallFailed,
+                ComponentHealth::Recovering,
+                AttemptSideEffect::FatalAndShutdown,
+                false,
+                Expected::Fatal,
+            ),
+            (
+                R::InstallFailed,
+                ComponentHealth::Recovering,
+                AttemptSideEffect::Shutdown,
+                false,
+                Expected::Shutdown,
+            ),
+            (
+                R::InstallSucceeded,
+                ComponentHealth::Ready,
+                AttemptSideEffect::None,
+                false,
+                Expected::Fatal,
+            ),
+            (
+                R::InstallFailed,
+                ComponentHealth::Recovering,
+                AttemptSideEffect::None,
+                true,
+                Expected::Repair,
+            ),
+            (
+                R::NoInstall,
+                ComponentHealth::Ready,
+                AttemptSideEffect::None,
+                false,
+                Expected::Shutdown,
+            ),
+            (
+                R::OwnedWallReady,
+                ComponentHealth::Ready,
+                AttemptSideEffect::None,
+                false,
+                Expected::Shutdown,
+            ),
+        ];
+        for (result, post_health, side_effect, fail_audit, expected) in cases {
+            let dir = TempDir::new().unwrap();
+            let (config, _) = fresh_config_in(&dir);
+            let mut handle = boot(config).unwrap();
+            let attempts =
+                install_initial_attempt_fixture(&mut handle, result, post_health, side_effect);
+            if fail_audit {
+                let buffer = Arc::clone(&handle.audit_buffer);
+                assert!(std::thread::spawn(move || {
+                    let _guard = buffer.lock().unwrap();
+                    panic!("inject recovery audit append failure");
+                })
+                .join()
+                .is_err());
+            }
+            let view = Arc::clone(handle.runtime_health_view());
+            let shutdown_after_ready = matches!(result, R::NoInstall | R::OwnedWallReady);
+            if matches!(result, R::NoInstall | R::OwnedWallReady) {
+                view.publish(RuntimeHealthState::Recovering(reason));
+                view.publish_safety_net(Tag::Unverified);
+            }
+            let shutdown_waiter = if shutdown_after_ready {
+                let shutdown = Arc::clone(&handle.shutdown_flag);
+                let ready_view = Arc::clone(&view);
+                Some(std::thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        if ready_view.supervisor_snapshot().unwrap().0 == RuntimeHealthState::Ready
+                        {
+                            shutdown.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        if Instant::now() >= deadline {
+                            shutdown.store(true, Ordering::SeqCst);
+                            panic!("initial READY was not published");
+                        }
+                        std::thread::yield_now();
+                    }
+                }))
+            } else {
+                None
+            };
+            let before = view.supervisor_snapshot().unwrap();
+            let outcome =
+                handle.supervise_until_shutdown(Duration::from_millis(1), Duration::from_secs(60));
+            if let Some(waiter) = shutdown_waiter {
+                waiter.join().unwrap();
+            }
+            match expected {
+                Expected::Repair => assert_eq!(
+                    outcome,
+                    SupervisionOutcome::RepairRequired {
+                        reason,
+                        install_result: result
+                    }
+                ),
+                Expected::Fatal => assert_eq!(outcome, SupervisionOutcome::FatalControlPath),
+                Expected::Shutdown => assert_eq!(outcome, SupervisionOutcome::ShutdownRequested),
+            }
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            let rows = handle
+                .decision_engine()
+                .wal_writer()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .snapshot_after(None, 32)
+                .unwrap()
+                .into_iter()
+                .filter(|entry| entry.event_canonical_json.contains("kernel_runtime_lost"))
+                .map(|entry| {
+                    serde_json::from_str::<serde_json::Value>(&entry.event_canonical_json).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows.len(),
+                if matches!(expected, Expected::Repair) && !fail_audit {
+                    1
+                } else {
+                    0
+                }
+            );
+            if matches!(expected, Expected::Repair) && !fail_audit {
+                assert!(rows[0]["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("reason={reason:?}")));
+                assert!(rows[0]["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("recovery={result:?}")));
+                assert_eq!(
+                    rows[0]["safety_net"]["state"].as_str(),
+                    Some(if result == R::InstallSucceeded {
+                        "installed"
+                    } else {
+                        "install_failed"
+                    })
+                );
+            }
+            if !matches!(result, R::NoInstall | R::OwnedWallReady) {
+                assert_eq!(
+                    view.supervisor_snapshot().unwrap(),
+                    before,
+                    "terminal result must not publish a same-turn READY or synthetic health state"
+                );
+            }
+            assert!(
+                !handle.is_fatal_control_path_requested()
+                    || matches!(
+                        side_effect,
+                        AttemptSideEffect::Fatal | AttemptSideEffect::FatalAndShutdown
+                    )
+            );
+            let _ = handle.stop();
+        }
     }
 
     #[test]
@@ -1893,197 +2281,6 @@ mod tests {
                 SupervisionOutcome::FatalControlPath
             );
         }
-    }
-
-    #[test]
-    fn recovery_status_and_wal_follow_installed_unverified_failed_attempts() {
-        use crate::enforcement::{
-            AcquiredComponent, ComponentHealth, ComponentKind, ComponentProvider, EnforcementError,
-            EnforcementRuntime, PostReadyRecoveryResult,
-        };
-        use crate::nftables::{SafetyNetAuditState as Tag, SafetyNetSources};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct ScriptedComponent {
-            kind: ComponentKind,
-            health: Arc<Mutex<ComponentHealth>>,
-            tag: Arc<Mutex<Tag>>,
-            attempts: Arc<AtomicUsize>,
-            terminal_hooks: Arc<AtomicUsize>,
-            published: Arc<crate::runtime_health::RuntimeHealthView>,
-            observed_tags: Arc<Mutex<Vec<Option<String>>>>,
-        }
-        impl AcquiredComponent for ScriptedComponent {
-            fn kind(&self) -> ComponentKind {
-                self.kind
-            }
-            fn is_ready(&self) -> bool {
-                self.health() == ComponentHealth::Ready
-            }
-            fn health(&self) -> ComponentHealth {
-                *self.health.lock().unwrap()
-            }
-            fn safety_net_audit_state(&self) -> Option<Tag> {
-                (self.kind == ComponentKind::NftablesTable)
-                    .then(|| self.tag.lock().unwrap().clone())
-            }
-            fn on_post_ready_indeterminate(&self) {
-                self.terminal_hooks.fetch_add(1, Ordering::SeqCst);
-            }
-            fn attempt_post_ready_recovery(&self, shutting_down: bool) -> PostReadyRecoveryResult {
-                if shutting_down || self.kind != ComponentKind::NftablesTable {
-                    return PostReadyRecoveryResult::NoInstall;
-                }
-                self.observed_tags.lock().unwrap().push(
-                    self.published
-                        .read_safety_net()
-                        .map(|tag| tag.tag().to_string()),
-                );
-                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                match attempt {
-                    1 => {
-                        *self.tag.lock().unwrap() = Tag::Installed {
-                            shape: "v1-host-wide",
-                            reason: "unknown-history",
-                            deny_set_size: 0,
-                            deny_set_max: 1,
-                            rules: vec![],
-                            denied_uids: vec![],
-                            sources: SafetyNetSources {
-                                journal: false,
-                                manifest: false,
-                                live_table: false,
-                            },
-                            kernel_nd_accepted: vec![],
-                            unattestable_packets: "drop-except-kernel-nd",
-                            coverage: "inet output hook",
-                        };
-                        *self.health.lock().unwrap() = ComponentHealth::Recovering;
-                        PostReadyRecoveryResult::InstallSucceeded
-                    }
-                    2 => {
-                        *self.tag.lock().unwrap() = Tag::Unverified;
-                        PostReadyRecoveryResult::NoInstall
-                    }
-                    3 => PostReadyRecoveryResult::NoInstall,
-                    4 => {
-                        *self.tag.lock().unwrap() = Tag::InstallFailed {
-                            attempted_scope: "v1-host-wide".into(),
-                            error: "injected retry failure".into(),
-                        };
-                        PostReadyRecoveryResult::InstallFailed
-                    }
-                    _ => {
-                        *self.health.lock().unwrap() = ComponentHealth::Indeterminate;
-                        PostReadyRecoveryResult::NoInstall
-                    }
-                }
-            }
-            fn release(&mut self) {}
-        }
-        struct Provider(ScriptedComponent);
-        impl ComponentProvider for Provider {
-            fn kind(&self) -> ComponentKind {
-                self.0.kind
-            }
-            fn acquire(self: Box<Self>) -> Result<Box<dyn AcquiredComponent>, EnforcementError> {
-                Ok(Box::new(self.0))
-            }
-        }
-
-        let dir = TempDir::new().unwrap();
-        let (config, _) = fresh_config_in(&dir);
-        let mut handle = boot(config).unwrap();
-        let health = Arc::new(Mutex::new(ComponentHealth::Ready));
-        let tag = Arc::new(Mutex::new(Tag::NotAttempted));
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let hooks = Arc::new(AtomicUsize::new(0));
-        let observed_tags = Arc::new(Mutex::new(Vec::new()));
-        let providers = ComponentKind::REQUIRED_IN_ORDER
-            .iter()
-            .copied()
-            .map(|kind| {
-                Box::new(Provider(ScriptedComponent {
-                    kind,
-                    health: if kind == ComponentKind::NftablesTable {
-                        Arc::clone(&health)
-                    } else {
-                        Arc::new(Mutex::new(ComponentHealth::Ready))
-                    },
-                    tag: Arc::clone(&tag),
-                    attempts: Arc::clone(&attempts),
-                    terminal_hooks: Arc::clone(&hooks),
-                    published: Arc::clone(handle.runtime_health_view()),
-                    observed_tags: Arc::clone(&observed_tags),
-                })) as Box<dyn ComponentProvider>
-            })
-            .collect();
-        let runtime = EnforcementRuntime::start(providers).unwrap();
-        handle.set_enforcement_for_test(runtime);
-        *health.lock().unwrap() = ComponentHealth::Lost;
-        assert_eq!(
-            handle.supervise_until_shutdown(Duration::ZERO, Duration::ZERO),
-            SupervisionOutcome::KernelRuntimeLost(
-                crate::enforcement::NotReadyReason::HealthProbeIndeterminate
-            )
-        );
-        assert_eq!(attempts.load(Ordering::SeqCst), 5);
-        assert_eq!(hooks.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            observed_tags.lock().unwrap().as_slice(),
-            &[
-                Some("not_attempted".into()),
-                Some("installed".into()),
-                Some("unverified".into()),
-                Some("unverified".into()),
-                Some("install_failed".into())
-            ]
-        );
-        assert_eq!(
-            handle
-                .runtime_health_view()
-                .read_safety_net()
-                .unwrap()
-                .tag(),
-            "install_failed"
-        );
-        let engine = handle.decision_engine();
-        let wal = engine.wal_writer().unwrap();
-        let rows: Vec<serde_json::Value> = wal
-            .lock()
-            .unwrap()
-            .snapshot_after(None, 32)
-            .unwrap()
-            .into_iter()
-            .filter(|entry| entry.event_canonical_json.contains("kernel_runtime_lost"))
-            .map(|entry| serde_json::from_str(&entry.event_canonical_json).unwrap())
-            .collect();
-        assert_eq!(
-            rows.len(),
-            5,
-            "initial, success, one unverified, failure, terminal"
-        );
-        assert_eq!(
-            rows.iter()
-                .map(|row| row["safety_net"]["state"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            vec![
-                "installed",
-                "installed",
-                "unverified",
-                "install_failed",
-                "install_failed"
-            ]
-        );
-        assert!(rows[1]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("InstallSucceeded"));
-        assert!(rows[3]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("InstallFailed"));
-        handle.stop().unwrap();
     }
 
     fn write_pinned_key(dir: &TempDir, signing: &SigningKey) -> PathBuf {

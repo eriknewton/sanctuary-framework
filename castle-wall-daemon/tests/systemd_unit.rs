@@ -17,8 +17,6 @@
 //!   binds (there is no in-process bind timeout anymore).
 //! * `TimeoutStopSec` + `KillMode=control-group` — bound shutdown and reap an
 //!   isolated nft health child if its fork/netlink transaction wedged.
-//! * `Restart=on-failure` — fail-before and post-ready health loss exit nonzero;
-//!   systemd must restart so the preserved kernel object is re-adopted.
 //! * `WantedBy=multi-user.target` — the reboot-survival / persistence path.
 
 use castle_wall_daemon::ownership_journal::DEFAULT_OWNERSHIP_JOURNAL_PATH;
@@ -44,6 +42,25 @@ fn directive_values<'a>(unit: &'a str, key: &str) -> Vec<&'a str> {
         .collect()
 }
 
+fn section_text<'a>(unit: &'a str, name: &str) -> &'a str {
+    let header = format!("[{name}]");
+    let start = unit.find(&header).expect("required unit section") + header.len();
+    let tail = &unit[start..];
+    let end = tail.find("\n[").unwrap_or(tail.len());
+    &tail[..end]
+}
+
+fn section_values<'a>(section: &'a str, key: &str) -> Vec<&'a str> {
+    section
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.strip_prefix(key))
+        .filter_map(|rest| rest.strip_prefix('='))
+        .map(str::trim)
+        .collect()
+}
+
 #[test]
 fn unit_is_type_notify() {
     assert_eq!(
@@ -62,6 +79,30 @@ fn unit_restarts_after_fail_before_or_runtime_loss() {
     );
 }
 
+#[test]
+fn repair_required_exit_is_failed_without_automatic_restart() {
+    let unit = unit_text();
+    let service = section_text(&unit, "Service");
+    let prevent: Vec<&str> = section_values(service, "RestartPreventExitStatus")
+        .iter()
+        .flat_map(|value| value.split_whitespace())
+        .collect();
+    assert!(
+        prevent.contains(&"78"),
+        "exit 78 must suppress automatic restart in [Service]"
+    );
+    for directive in ["SuccessExitStatus", "RestartForceExitStatus"] {
+        let values: Vec<&str> = section_values(service, directive)
+            .iter()
+            .flat_map(|value| value.split_whitespace())
+            .collect();
+        assert!(
+            !values.contains(&"78"),
+            "{directive} must not reclassify exit 78"
+        );
+    }
+    assert_eq!(section_values(service, "Restart"), vec!["on-failure"]);
+}
 #[test]
 fn unit_requires_explicit_trusted_service_uid_configuration() {
     let unit = unit_text();
