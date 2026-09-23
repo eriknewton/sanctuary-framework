@@ -629,6 +629,8 @@ impl DaemonHandle {
                 };
             }
             RecoveryCallDecision::Inconsistent => {
+                // SAFETY: stderr is the last-resort operator channel when a returned
+                // install result conflicts with its health observation before READY.
                 eprintln!("castle-wall-daemon: recovery install result returned without a Recovering observation; refusing READY");
                 return SupervisionOutcome::FatalControlPath;
             }

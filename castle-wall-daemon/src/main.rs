@@ -426,6 +426,8 @@ fn main() -> ExitCode {
                 }
                 _ => "unexpected recovery result",
             };
+            // SAFETY: stderr is the operator-visible repair-required exit contract;
+            // it names this returned recovery result before teardown.
             eprintln!("castle-wall-daemon: repair required after runtime loss ({reason:?}): {detail}; repair the host, then run `systemctl reset-failed sanctuary-castle-wall.service` and explicitly start the service; starting before repair may exit 78 again");
         }
         daemon::SupervisionOutcome::ShutdownRequested => {}
@@ -434,6 +436,8 @@ fn main() -> ExitCode {
     let report = match stop_result {
         Ok(r) => Some(r),
         Err(err) => {
+            // SAFETY: stderr is the shutdown-error contract after teardown;
+            // the operator needs this signal even when no report is available.
             eprintln!("castle-wall-daemon: shutdown error: {}", err);
             None
         }
