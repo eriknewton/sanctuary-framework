@@ -458,7 +458,7 @@ fn stop_failure_for_hook_at(
     let result = (|| -> io::Result<OwnerOutcome> {
         // The socket is checked FIRST, and when it is absent it is the only
         // name this hook touches. No listening owner means there is no stop
-        // authority to ask, whatever the pins, the log or the group database
+        // authority to ask, whatever the pins, the log or the service group
         // would say, so reading them could only produce a misleading outcome
         // and reach installed state from hosts and test runs that have no
         // owner at all.
@@ -469,7 +469,15 @@ fn stop_failure_for_hook_at(
             return Err(bad("owner private parent readable from daemon"));
         }
         let pins = read_pins(&paths.pins)?;
-        let mut log = super::daemon_log::replay(&paths.release_log, &paths.journal_mac_key, &pins)?;
+        // The shipped unit runs with Group=sanctuary; use the kernel's current
+        // service gid for every custody read in this hook, not a fresh NSS answer.
+        let service_gid = nix::unistd::getegid().as_raw();
+        let mut log = super::daemon_log::replay(
+            &paths.release_log,
+            &paths.journal_mac_key,
+            &pins,
+            service_gid,
+        )?;
         // Cloned before the pull so no borrow of `log` is alive across the
         // reassignment below.
         let unresolved_unit = log
@@ -488,11 +496,13 @@ fn stop_failure_for_hook_at(
                         &paths.journal_mac_key,
                         completion,
                         &pins,
+                        service_gid,
                     )?;
                     log = super::daemon_log::replay(
                         &paths.release_log,
                         &paths.journal_mac_key,
                         &pins,
+                        service_gid,
                     )?;
                 }
             }
@@ -517,22 +527,18 @@ fn stop_failure_for_hook_at(
         if g.boot_id != boot.trim() || g.daemon_invocation != invocation {
             return Ok(OwnerOutcome::Inhibit);
         }
-        let gid = nix::unistd::Group::from_name("sanctuary")?
-            .ok_or_else(|| bad("sanctuary group absent"))?
-            .gid
-            .as_raw();
         for parent in &paths.admission_key_parents {
             let m = fs::symlink_metadata(parent)?;
             if !m.file_type().is_dir()
                 || m.uid() != 0
-                || ![0, gid].contains(&m.gid())
+                || ![0, service_gid].contains(&m.gid())
                 || m.mode() & 0o7777 != 0o700
             {
                 return Err(bad("admission signer parent custody"));
             }
         }
         let mut bytes =
-            receipt::read_custodied_file(&paths.admission_key, 0, &[0, gid], 0o600, 128)?;
+            receipt::read_custodied_file(&paths.admission_key, 0, &[0, service_gid], 0o600, 128)?;
         let seed: [u8; 32] = bytes
             .as_slice()
             .try_into()
@@ -1332,6 +1338,7 @@ fn nonblocking_connect(socket_path: &Path, deadline: Instant) -> io::Result<Unix
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// The isolated layout, built by the SAME constructor the integration seam
@@ -1368,6 +1375,178 @@ mod tests {
         assert_eq!(
             stop_failure_for_hook(&[1001], "post-ready ownership reading indeterminate", None),
             OwnerOutcome::OwnerUnavailable
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn present_owner_hook_uses_the_running_group_for_log_custody() {
+        // The privileged Linux CI job runs this against an isolated root-owned
+        // tree; non-root developer runs cannot create the production uid-0 files.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let dir = tempfile::Builder::new()
+            .prefix("sanctuary-owner-gid-fixture-")
+            .tempdir_in("/var/lib")
+            .unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let paths = temporary_paths(dir.path());
+        let _listener = UnixListener::bind(&paths.socket).unwrap();
+
+        let admission = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let completion = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+        fs::write(
+            &paths.pins,
+            serde_json::to_vec(&fixture_pins(&admission, &completion)).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&paths.pins, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&paths.release_log, b"").unwrap();
+        fs::set_permissions(&paths.release_log, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(
+            stop_failure_for_hook_at(&paths, &[1001], "fixture hook", None),
+            OwnerOutcome::NoOwnedRelease,
+            "a present owner with an empty custodied log has no release to stop"
+        );
+
+        let wrong_gid = if nix::unistd::getegid().as_raw() == 42420 {
+            42421
+        } else {
+            42420
+        };
+        nix::unistd::chown(
+            &paths.release_log,
+            None,
+            Some(nix::unistd::Gid::from_raw(wrong_gid)),
+        )
+        .unwrap();
+        assert_eq!(
+            stop_failure_for_hook_at(&paths, &[1001], "fixture hook", None),
+            OwnerOutcome::OwnerUnavailable,
+            "the hook must refuse a log grouped for a different service identity"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn present_owner_hook_still_inhibits_a_stale_release() {
+        const CHILD: &str = "SANCTUARY_B1D_INHIBIT_FIXTURE_CHILD";
+        const ROOT: &str = "SANCTUARY_B1D_INHIBIT_FIXTURE_ROOT";
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        if std::env::var_os(CHILD).is_none() {
+            // A child test process scopes INVOCATION_ID without changing the
+            // environment seen by concurrent unit tests in the parent.
+            let dir = tempfile::Builder::new()
+                .prefix("sanctuary-owner-inhibit-fixture-")
+                .tempdir_in("/var/lib")
+                .unwrap();
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "protected_agent::owner::tests::present_owner_hook_still_inhibits_a_stale_release",
+                ])
+                .env(CHILD, "1")
+                .env(ROOT, dir.path())
+                .env("INVOCATION_ID", "fixture-invocation")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => {}
+                    Err(err) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("isolated hook fixture wait failed: {err}");
+                    }
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated hook fixture exceeded its test deadline");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            assert!(status.success(), "isolated hook fixture failed: {stderr}");
+            return;
+        }
+
+        let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+        let paths = temporary_paths(&root);
+        let _listener = UnixListener::bind(&paths.socket).unwrap();
+
+        let admission = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let completion = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+        fs::write(
+            &paths.pins,
+            serde_json::to_vec(&fixture_pins(&admission, &completion)).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&paths.pins, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&paths.journal_mac_key, [7u8; 32]).unwrap();
+        fs::set_permissions(&paths.journal_mac_key, fs::Permissions::from_mode(0o600)).unwrap();
+        let mac_key = crate::ownership_journal::read_auth_key(&paths.journal_mac_key)
+            .unwrap()
+            .unwrap();
+        let (generation, mac) =
+            super::super::daemon_log::fresh_fixture_reservation(fixture_generation(), &mac_key)
+                .unwrap();
+        super::super::daemon_log::append_fixture(
+            &paths.release_log,
+            &super::super::daemon_log::Row::Reservation {
+                generation: generation.clone(),
+                mac,
+            },
+        )
+        .unwrap();
+        let manager = ManagerIdentity {
+            cgroup_path: format!("system.slice/{}", generation.unit_name),
+            unit_name: generation.unit_name.clone(),
+            cgroup_dev: 1,
+            cgroup_ino: 2,
+            main_pid: 10,
+            main_start_time: 100,
+        };
+        let released = receipt::sign(
+            Domain::ReleasedUnresolvedV1,
+            receipt::ReceiptBody {
+                generation,
+                manager: Some(manager),
+                hook: None,
+                attempt_id: None,
+                attempted_scope: None,
+                candidate_uids: Vec::new(),
+                old_release_hash: None,
+                positive_extinction: None,
+            },
+            &admission,
+        )
+        .unwrap();
+        super::super::daemon_log::append_fixture(
+            &paths.release_log,
+            &super::super::daemon_log::Row::Released { receipt: released },
+        )
+        .unwrap();
+
+        assert_eq!(
+            stop_failure_for_hook_at(&paths, &[1001], "fixture hook", None),
+            OwnerOutcome::Inhibit,
+            "a signed release from another boot must still be inhibited"
         );
     }
 

@@ -71,6 +71,16 @@ fn unit_is_type_notify() {
 }
 
 #[test]
+fn wall_daemon_runs_with_the_service_group_used_for_owner_custody() {
+    let unit = unit_text();
+    let service = section_text(&unit, "Service");
+    // owner::stop_failure_for_hook_at uses getegid() for log and key custody;
+    // these exact directives bind that kernel gid to the sanctuary group.
+    assert_eq!(section_values(service, "User"), vec!["root"]);
+    assert_eq!(section_values(service, "Group"), vec!["sanctuary"]);
+}
+
+#[test]
 fn unit_restarts_after_fail_before_or_runtime_loss() {
     assert_eq!(
         directive_values(&unit_text(), "Restart"),
