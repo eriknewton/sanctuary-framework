@@ -331,6 +331,66 @@ describe("memory file CLI: fortress-backed round trip", () => {
     return (await auditEntries()).map((entry) => entry.operation);
   }
 
+  it("honors an operator policy allowing plain ingest without a dialog, while a classifier waiver still needs approval", async () => {
+    await writeFile(join(fortress, "principal-policy.yaml"), [
+      "version: 1",
+      "tier1_always_approve: []",
+      "tier3_always_allow:",
+      "  - memory_ingest",
+      "approval_channel:",
+      "  type: stderr",
+      "  timeout_seconds: 300",
+    ].join("\n"));
+    const source = await copyFixtureSet("basic", "memfile-unattended-source");
+    let dialogs = 0;
+    const noDialog = () => {
+      dialogs += 1;
+      return { status: 0, signal: null, stdout: Buffer.from("deny\n") };
+    };
+    const out = makeSink();
+    const err = makeSink();
+    const plain = await runMemoryIngestCommandProduction({
+      argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress],
+      out: out.stream,
+      err: err.stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      dialogRunner: noDialog,
+    });
+    expect(plain, err.text()).toBe(0);
+    expect(dialogs).toBe(0);
+    expect((await auditEntries()).find((entry) => entry.operation === "memory_ingest")?.details).toMatchObject({
+      policy_tier: 3,
+      approval_basis: "operator_policy_tier3",
+    });
+
+    const waived = await runMemoryIngestCommandProduction({
+      argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress, "--allow-file", "MEMORY.md"],
+      out: makeSink().stream,
+      err: makeSink().stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      dialogRunner: noDialog,
+    });
+    expect(waived).toBe(1);
+    expect(dialogs).toBe(1);
+
+    const approved = await runMemoryIngestCommandProduction({
+      argv: ["--harness", "claude-code", "--dir", source, "--fortress", fortress, "--allow-file", "MEMORY.md"],
+      out: makeSink().stream,
+      err: makeSink().stream,
+      env: { SANCTUARY_PASSPHRASE: PASSPHRASE },
+      dialogRunner: () => {
+        dialogs += 1;
+        return APPROVE_DIALOG();
+      },
+    });
+    expect(approved).toBe(0);
+    expect(dialogs).toBe(2);
+    expect((await auditEntries()).filter((entry) => entry.operation === "memory_ingest").at(-1)?.details).toMatchObject({
+      policy_tier: 1,
+      approval_basis: "human",
+    });
+  }, 60_000);
+
   it("writes no plaintext when the local human denies memory_emit", async () => {
     const source = await copyFixtureSet("basic", "memfile-deny-source");
     expect(await runMemoryIngestCommand({
