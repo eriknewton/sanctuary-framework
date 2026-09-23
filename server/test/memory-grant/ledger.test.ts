@@ -76,6 +76,7 @@ describe("memory-grant record contract", () => {
     expect(parseMemoryGrantRecord({ ...record(), subject_agent_uid: -1 })).toBeNull();
     expect(parseMemoryGrantRecord({ ...record(), subject_agent_uid: 0 })).toBeNull();
     expect(parseMemoryGrantRecord({ ...record(), subject_agent_uid: 1.5 })).toBeNull();
+    expect(parseMemoryGrantRecord({ ...record(), subject_agent_uid: 0xFFFFFFFF })).toBeNull();
   });
 
   it("requires every identity and scope binding at use, including inode and classifier", () => {
@@ -123,5 +124,16 @@ describe("memory-grant record contract", () => {
     expect(revokeMemoryGrant(added, ID, Number.MAX_SAFE_INTEGER)).toBeNull();
     expect(isMemoryGrantUseAllowed(revoked, use(), middle)).toBe(false);
     expect(parseMemoryGrantLedger({ schema_version: 1, grants: [record(), record()] })).toBeNull();
+  });
+
+  it("accepts the capacity boundary and refuses another grant", () => {
+    const grants = Array.from({ length: 1024 }, (_, index) => ({
+      ...record(),
+      grant_id: `123e4567-e89b-42d3-a456-${String(index).padStart(12, "0")}`,
+    }));
+    const full = { schema_version: 1, grants };
+    expect(parseMemoryGrantLedger(full)).not.toBeNull();
+    expect(addMemoryGrant(full, record())).toBeNull();
+    expect(parseMemoryGrantLedger({ schema_version: 1, grants: [...grants, record()] })).toBeNull();
   });
 });

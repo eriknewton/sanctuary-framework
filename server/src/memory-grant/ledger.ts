@@ -117,6 +117,7 @@ export function parseMemoryGrantRecord(value: unknown): MemoryGrantRecord | null
       typeof value.grant_id !== "string" || !GRANT_ID.test(value.grant_id) ||
       !identifier(value.fortress_id) || !identifier(value.subject_agent_id) ||
       !Number.isSafeInteger(value.subject_agent_uid) || (value.subject_agent_uid as number) <= 0 ||
+      (value.subject_agent_uid as number) >= 0xFFFFFFFF ||
       typeof value.harness !== "string" || !HARNESS_KINDS.has(value.harness) ||
       !sourceRoot(value.source_root) || !identifier(value.owner_ref) ||
       value.classifier_override !== false || created === null || expires === null ||
