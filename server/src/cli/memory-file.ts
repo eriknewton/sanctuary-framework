@@ -20,6 +20,7 @@ import {
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { AuditLog } from "../operational/audit-log.js";
 import { BaselineTracker } from "../principal-policy/baseline.js";
+import type { ApprovalChannel } from "../principal-policy/approval-channel.js";
 import { ApprovalGate } from "../principal-policy/gate.js";
 import { loadPrincipalPolicy } from "../principal-policy/loader.js";
 import {
@@ -119,13 +120,18 @@ export async function runMemoryIngestCommand(
   }
   const allowFiles: ReadonlySet<string> = new Set(allowFileFlags.values);
 
-  // S4: memory_ingest is a Tier-1 operation in principal-policy (loader.ts), so
-  // it MUST pass the human ApprovalGate like emit/transcode/restore do. Without
-  // this a same-uid process could write operator-signed provenance records into
-  // the vault with no prompt — a claim/gate mismatch. The channel is built
-  // before unlock so a missing local approval interaction fails closed early.
-  const approvalChannel = createLocalHumanApprovalInteraction(args.dialogRunner, err);
-  if (!approvalChannel) return 1;
+  // The generated policy makes memory_ingest Tier 1. An operator may relax
+  // plain ingest to Tier 3; a classifier waiver stays forced Tier 1. On hosts
+  // without a reviewed OS dialog, Tier 3 can still proceed while every human
+  // approval request is denied.
+  const humanChannel = process.platform === "darwin" || args.dialogRunner !== undefined
+    ? createLocalHumanApprovalInteraction(args.dialogRunner, err)
+    : null;
+  const approvalChannel: ApprovalChannel = humanChannel ?? {
+    async requestApproval() {
+      return { decision: "deny", decided_at: new Date().toISOString(), decided_by: "channel_failure" };
+    },
+  };
 
   const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
   if (!boot) return 1;
@@ -143,11 +149,17 @@ export async function runMemoryIngestCommand(
       harness: parsed.harness,
       source_dir: parsed.dir,
       owner_ref: parsed.ownerRef,
+      allow_files: [...allowFiles],
     });
-    if (!decision.allowed || !decision.approval_audit_id) {
-      write(err, "Denied: memory ingest was not approved by the local operator.\n");
+    const unattended = decision.allowed && decision.tier === 3 && allowFiles.size === 0;
+    const humanApproved = decision.allowed &&
+      (decision.tier === 1 || (allowFiles.size === 0 && decision.tier === 2)) &&
+      Boolean(decision.approval_audit_id);
+    if (!unattended && !humanApproved) {
+      write(err, "Denied: memory ingest was not permitted by the local policy.\n");
       return 1;
     }
+    const approvalBasis = unattended ? "operator_policy_tier3" : "human";
     let sourceFileCount = 0;
     // Preflight-only: screen decides accept / skip /
     // override and validates allow_files (assertAllowFilesKnown, inside
@@ -194,6 +206,8 @@ export async function runMemoryIngestCommand(
         owner_ref: parsed.ownerRef,
         source_file_count: sourceFileCount,
         allow_files: [...allowFiles].sort(),
+        policy_tier: decision.tier,
+        approval_basis: approvalBasis,
         approval_audit_id: decision.approval_audit_id,
       },
     });
@@ -243,6 +257,8 @@ export async function runMemoryIngestCommand(
         overridden_file_count: result.overridden.length,
         unused_allow_files: result.unused_allow_files,
         complete: result.complete,
+        policy_tier: decision.tier,
+        approval_basis: approvalBasis,
         skipped: result.skipped.map((skip) => ({
           source_path: skip.source_path,
           reason: skip.reason,
