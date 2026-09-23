@@ -682,6 +682,37 @@ impl DaemonHandle {
                     }
                 };
                 let (observed, recovery_result) = self.kernel_runtime_health_with_recovery();
+                // A returned attempt is terminal before any observation publication or
+                // retry; fresh control flags take precedence over that result.
+                match recovery_call_decision(
+                    self.is_fatal_control_path_requested(),
+                    self.is_shutdown_requested(),
+                    observed,
+                    recovery_result,
+                ) {
+                    RecoveryCallDecision::FatalControlPath => {
+                        return SupervisionOutcome::FatalControlPath
+                    }
+                    RecoveryCallDecision::ShutdownRequested => {
+                        return SupervisionOutcome::ShutdownRequested
+                    }
+                    RecoveryCallDecision::RepairRequired {
+                        reason,
+                        install_result,
+                    } => {
+                        self.record_recovery_attempt(reason, install_result);
+                        return SupervisionOutcome::RepairRequired {
+                            reason,
+                            install_result,
+                        };
+                    }
+                    RecoveryCallDecision::Inconsistent => {
+                        // SAFETY: systemd captures the protocol conflict even without a WAL row.
+                        eprintln!("castle-wall-daemon: recovery install result returned without a Recovering observation; refusing READY");
+                        return SupervisionOutcome::FatalControlPath;
+                    }
+                    RecoveryCallDecision::Continue => {}
+                }
                 let current_tag = self.safety_net_audit_state();
                 if observed == RuntimeHealthState::Ready {
                     self.runtime_health.clear_safety_net();
@@ -694,20 +725,6 @@ impl DaemonHandle {
                 // reads it. That is what removes the per-status-request `nft` fork
                 // and stops runtime-mutex contention from being read as loss.
                 self.runtime_health.publish(observed);
-                if !matches!(observed, RuntimeHealthState::Recovering(_))
-                    && matches!(
-                        recovery_result,
-                        crate::enforcement::PostReadyRecoveryResult::InstallSucceeded
-                            | crate::enforcement::PostReadyRecoveryResult::InstallFailed
-                    )
-                {
-                    self.record_recovery_attempt(
-                        crate::enforcement::NotReadyReason::SafetyNetRecovering(
-                            crate::enforcement::ComponentKind::NftablesTable,
-                        ),
-                        recovery_result,
-                    );
-                }
                 match observed {
                     RuntimeHealthState::NoRuntime | RuntimeHealthState::Ready => {
                         consecutive_unavailable = 0;
@@ -747,18 +764,10 @@ impl DaemonHandle {
                         self.record_runtime_loss(reason, false);
                         return SupervisionOutcome::KernelRuntimeLost(reason);
                     }
-                    // RECOVERING: a component proved its resource lost and the safety
-                    // net is being installed or retried for it RIGHT NOW, while this
-                    // process still holds the host lock. This arm exists BEFORE the exit
-                    // arm below on purpose: exiting here would drop the host lock and
-                    // end the process while the net still had an attempt outstanding,
-                    // and the restart cannot re-attempt what this process was in the
-                    // middle of. The loss is recorded as evidence, and the loop
-                    // continues on the retry interval so the controller gets its next
-                    // attempt. It is NOT readiness, so nothing downstream reads this as
-                    // enforcing.
+                    // No attempt returned on this call. Preserve recovery observations
+                    // and tag transitions without manufacturing another attempt row.
                     RuntimeHealthState::Recovering(reason) => {
-                        let (initial_row, tag_transition_row, attempt_row) = recovery_row_actions(
+                        let (initial_row, tag_transition_row, _) = recovery_row_actions(
                             previous_health,
                             previous_tag.as_ref(),
                             current_tag.as_ref(),
@@ -766,9 +775,6 @@ impl DaemonHandle {
                         );
                         if initial_row || tag_transition_row {
                             self.record_runtime_loss(reason, true);
-                        }
-                        if attempt_row {
-                            self.record_recovery_attempt(reason, recovery_result);
                         }
                         consecutive_unavailable = 0;
                     }
@@ -1660,6 +1666,7 @@ mod tests {
         result: crate::enforcement::PostReadyRecoveryResult,
         post_health: crate::enforcement::ComponentHealth,
         side_effect: AttemptSideEffect,
+        later_interval: bool,
         fatal: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
     }
@@ -1686,7 +1693,17 @@ mod tests {
             if shutting_down || self.kind != ComponentKind::NftablesTable {
                 return R::NoInstall;
             }
-            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let call = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.later_interval && call == 1 {
+                // Survive the real initial poll with a prior recovery observation.
+                *self.health.lock().unwrap() = crate::enforcement::ComponentHealth::Recovering;
+                return R::NoInstall;
+            }
+            if self.later_interval && call > 2 {
+                // Bound a regression that forgets to terminalize the interval call.
+                self.shutdown.store(true, Ordering::SeqCst);
+                return R::NoInstall;
+            }
             *self.health.lock().unwrap() = self.post_health;
             match self.result {
                 R::InstallSucceeded => {
@@ -1750,6 +1767,7 @@ mod tests {
         result: crate::enforcement::PostReadyRecoveryResult,
         post_health: crate::enforcement::ComponentHealth,
         side_effect: AttemptSideEffect,
+        later_interval: bool,
     ) -> Arc<AtomicUsize> {
         use crate::enforcement::{ComponentHealth, ComponentKind, EnforcementRuntime};
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -1773,6 +1791,7 @@ mod tests {
                     result,
                     post_health,
                     side_effect,
+                    later_interval,
                     fatal: Arc::clone(&handle.fatal_control_path),
                     shutdown: Arc::clone(&handle.shutdown_flag),
                 })) as Box<dyn crate::enforcement::ComponentProvider>
@@ -1866,6 +1885,15 @@ mod tests {
 
     #[test]
     fn initial_poll_handles_attempt_precedence_protocol_and_audit_matrix() {
+        run_attempt_precedence_protocol_and_audit_matrix(false);
+    }
+
+    #[test]
+    fn later_interval_handles_attempt_precedence_protocol_and_audit_matrix() {
+        run_attempt_precedence_protocol_and_audit_matrix(true);
+    }
+
+    fn run_attempt_precedence_protocol_and_audit_matrix(later_interval: bool) {
         use crate::enforcement::{
             ComponentHealth, ComponentKind, NotReadyReason, PostReadyRecoveryResult as R,
         };
@@ -1947,8 +1975,13 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let (config, _) = fresh_config_in(&dir);
             let mut handle = boot(config).unwrap();
-            let attempts =
-                install_initial_attempt_fixture(&mut handle, result, post_health, side_effect);
+            let attempts = install_initial_attempt_fixture(
+                &mut handle,
+                result,
+                post_health,
+                side_effect,
+                later_interval,
+            );
             if fail_audit {
                 let buffer = Arc::clone(&handle.audit_buffer);
                 assert!(std::thread::spawn(move || {
@@ -1986,8 +2019,14 @@ mod tests {
                 None
             };
             let before = view.supervisor_snapshot().unwrap();
-            let outcome =
-                handle.supervise_until_shutdown(Duration::from_millis(1), Duration::from_secs(60));
+            let outcome = handle.supervise_until_shutdown(
+                Duration::from_millis(1),
+                if later_interval {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(60)
+                },
+            );
             if let Some(waiter) = shutdown_waiter {
                 waiter.join().unwrap();
             }
@@ -2002,7 +2041,10 @@ mod tests {
                 Expected::Fatal => assert_eq!(outcome, SupervisionOutcome::FatalControlPath),
                 Expected::Shutdown => assert_eq!(outcome, SupervisionOutcome::ShutdownRequested),
             }
-            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                if later_interval { 2 } else { 1 }
+            );
             let rows = handle
                 .decision_engine()
                 .wal_writer()
@@ -2012,7 +2054,10 @@ mod tests {
                 .snapshot_after(None, 32)
                 .unwrap()
                 .into_iter()
-                .filter(|entry| entry.event_canonical_json.contains("kernel_runtime_lost"))
+                .filter(|entry| {
+                    entry.event_canonical_json.contains("kernel_runtime_lost")
+                        && entry.event_canonical_json.contains("recovery=")
+                })
                 .map(|entry| {
                     serde_json::from_str::<serde_json::Value>(&entry.event_canonical_json).unwrap()
                 })
@@ -2046,8 +2091,26 @@ mod tests {
             if !matches!(result, R::NoInstall | R::OwnedWallReady) {
                 assert_eq!(
                     view.supervisor_snapshot().unwrap(),
-                    before,
+                    if later_interval {
+                        (
+                            RuntimeHealthState::Recovering(reason),
+                            Some(Tag::NotAttempted),
+                        )
+                    } else {
+                        before
+                    },
                     "terminal result must not publish a same-turn READY or synthetic health state"
+                );
+            }
+            if later_interval {
+                let status = handle.live_status.snapshot();
+                assert_eq!(
+                    status.lifecycle_state,
+                    if matches!(result, R::NoInstall | R::OwnedWallReady) {
+                        "running"
+                    } else {
+                        "degraded"
+                    }
                 );
             }
             assert!(
