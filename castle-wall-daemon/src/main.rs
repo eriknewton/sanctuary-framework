@@ -442,6 +442,8 @@ fn main() -> ExitCode {
     if exit_status != 0 {
         return ExitCode::from(exit_status);
     }
+    // Safety: status zero is possible only after a successful shutdown stop,
+    // so the report is present on this branch.
     let report = report.expect("clean shutdown has a report");
     // SAFETY: stdout is the CLI clean-exit contract here, not a log channel.
     // Operators rely on this line to confirm the daemon stopped cleanly.
