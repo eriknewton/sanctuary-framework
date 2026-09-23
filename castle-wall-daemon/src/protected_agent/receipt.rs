@@ -293,20 +293,18 @@ pub fn read_custodied_file(
     mode: u32,
     limit: usize,
 ) -> std::io::Result<Vec<u8>> {
-    use std::os::unix::{
-        fs::{MetadataExt, OpenOptionsExt},
-        io::AsRawFd,
-    };
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     let mut file = opts.open(path)?;
     let meta = file.metadata()?;
+    let within_limit = u64::try_from(limit).is_ok_and(|limit| meta.len() <= limit);
     if !meta.file_type().is_file()
         || meta.uid() != uid
         || !gids.contains(&meta.gid())
         || (meta.mode() & 0o7777) != mode
-        || meta.len() as usize > limit
+        || !within_limit
         || meta.nlink() != 1
     {
         return Err(std::io::Error::new(
@@ -314,9 +312,23 @@ pub fn read_custodied_file(
             "unsafe custody",
         ));
     }
-    let _ = file.as_raw_fd();
+    read_capped(&mut file, limit)
+}
+
+fn read_capped(reader: &mut impl std::io::Read, limit: usize) -> std::io::Result<Vec<u8>> {
+    let max_read = limit.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "file limit overflow")
+    })?;
     let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    let mut chunk = [0u8; 8192];
+    while bytes.len() < max_read {
+        let take = chunk.len().min(max_read - bytes.len());
+        let count = reader.read(&mut chunk[..take])?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
     if bytes.len() > limit {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -329,6 +341,191 @@ pub fn read_custodied_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn custodied_reader_accepts_empty_and_multiple_gids_and_rejects_unsafe_paths() {
+        use std::{
+            ffi::CString,
+            os::fd::FromRawFd,
+            os::unix::fs::{MetadataExt, PermissionsExt},
+            time::Instant,
+        };
+
+        const CHILD: &str = "B1A_RECEIPT_FILE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "protected_agent::receipt::tests::custodied_reader_accepts_empty_and_multiple_gids_and_rejects_unsafe_paths",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "custody test child failed with {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("custody test child exceeded five seconds and was killed");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ordinary");
+        std::fs::write(&path, b"payload").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            read_custodied_file(
+                &path,
+                metadata.uid(),
+                &[u32::MAX, metadata.gid()],
+                0o644,
+                32
+            )
+            .unwrap(),
+            b"payload"
+        );
+        assert!(read_custodied_file(
+            &path,
+            metadata.uid().wrapping_add(1),
+            &[metadata.gid()],
+            0o644,
+            32
+        )
+        .is_err());
+        assert!(read_custodied_file(&path, metadata.uid(), &[metadata.gid()], 0o600, 32).is_err());
+        if unsafe { libc::geteuid() } == 0 {
+            assert_eq!(
+                read_custodied_file(&path, 0, &[0], 0o644, 32).unwrap(),
+                b"payload"
+            );
+        }
+
+        let empty = dir.path().join("empty");
+        std::fs::File::create(&empty).unwrap();
+        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let empty_meta = std::fs::metadata(&empty).unwrap();
+        assert_eq!(
+            read_custodied_file(&empty, empty_meta.uid(), &[0, empty_meta.gid()], 0o600, 32)
+                .unwrap(),
+            b""
+        );
+        let key = dir.path().join("key");
+        std::fs::write(&key, b"secret").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let key_meta = std::fs::metadata(&key).unwrap();
+        assert_eq!(
+            read_custodied_file(&key, key_meta.uid(), &[key_meta.gid()], 0o600, 32).unwrap(),
+            b"secret"
+        );
+        if unsafe { libc::geteuid() } == 0 {
+            assert_eq!(
+                read_custodied_file(&key, 0, &[0], 0o600, 32).unwrap(),
+                b"secret"
+            );
+        }
+
+        let alias = dir.path().join("hardlink");
+        std::fs::hard_link(&path, &alias).unwrap();
+        assert!(read_custodied_file(&path, metadata.uid(), &[metadata.gid()], 0o644, 32).is_err());
+        std::fs::remove_file(&alias).unwrap();
+        let link = dir.path().join("symlink");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(read_custodied_file(&link, metadata.uid(), &[metadata.gid()], 0o644, 32).is_err());
+        assert!(
+            read_custodied_file(dir.path(), metadata.uid(), &[metadata.gid()], 0o755, 32).is_err()
+        );
+        if std::path::Path::new("/dev/null").exists() {
+            assert_eq!(
+                read_custodied_file(
+                    std::path::Path::new("/dev/null"),
+                    0,
+                    &[0, metadata.gid()],
+                    0o600,
+                    32
+                )
+                .unwrap_err()
+                .to_string(),
+                "unsafe custody"
+            );
+        }
+        if std::path::Path::new("/dev/zero").exists() {
+            assert_eq!(
+                read_custodied_file(std::path::Path::new("/dev/zero"), 0, &[0], 0o644, 32)
+                    .unwrap_err()
+                    .to_string(),
+                "unsafe custody"
+            );
+        }
+
+        let fifo = dir.path().join("fifo");
+        let c_path = CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        assert_eq!(
+            read_custodied_file(&fifo, metadata.uid(), &[metadata.gid()], 0o600, 32)
+                .unwrap_err()
+                .to_string(),
+            "unsafe custody"
+        );
+        assert!(
+            started.elapsed().as_secs() < 5,
+            "FIFO open/read was not prompt"
+        );
+
+        let held_fifo = dir.path().join("held-fifo");
+        let held_c_path = CString::new(held_fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(held_c_path.as_ptr(), 0o600) }, 0);
+        let held_writer =
+            unsafe { libc::open(held_c_path.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+        assert!(held_writer >= 0);
+        let held_writer = unsafe { std::fs::File::from_raw_fd(held_writer) };
+        assert_eq!(
+            read_custodied_file(&held_fifo, metadata.uid(), &[metadata.gid()], 0o600, 32)
+                .unwrap_err()
+                .to_string(),
+            "unsafe custody"
+        );
+        drop(held_writer);
+    }
+
+    #[test]
+    fn capped_reader_detects_growth_after_the_initial_chunk() {
+        struct GrowingReader {
+            reads: usize,
+        }
+        impl std::io::Read for GrowingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.reads == 1 {
+                    let count = buf.len().min(2);
+                    buf[..count].fill(b'a');
+                    Ok(count)
+                } else if self.reads == 2 {
+                    let count = buf.len().min(4);
+                    buf[..count].fill(b'b');
+                    Ok(count)
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+        assert_eq!(
+            read_capped(&mut GrowingReader { reads: 0 }, 4)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
     #[test]
     fn domains_and_pins_do_not_alias() {
         let g = Generation {

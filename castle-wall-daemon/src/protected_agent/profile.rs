@@ -69,7 +69,6 @@ fn read_exact_file(path: &Path, mode: u32, max: usize) -> io::Result<Vec<u8>> {
 
 #[cfg(unix)]
 pub fn validate_installed() -> io::Result<ValidatedProfile> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     for (p, mode) in [
         ("/etc", 0o755),
         ("/etc/sanctuary", 0o755),
@@ -127,12 +126,23 @@ pub fn validate_installed() -> io::Result<ValidatedProfile> {
     {
         return Err(bad("registry/NSS mismatch"));
     }
+    validate_executable(Path::new(EXECUTABLE_PATH), &profile.executable_sha256)?;
+    Ok(ValidatedProfile {
+        profile,
+        registry,
+        profile_sha256: profile_hash,
+    })
+}
+
+#[cfg(unix)]
+fn validate_executable(path: &Path, expected_sha256: &str) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut opts = fs::OpenOptions::new();
     opts.read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let mut elf = opts.open(EXECUTABLE_PATH)?;
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    let mut elf = opts.open(path)?;
     let m = elf.metadata()?;
-    if !m.is_file()
+    if !m.file_type().is_file()
         || m.nlink() != 1
         || m.uid() != 0
         || m.gid() != 0
@@ -142,30 +152,224 @@ pub fn validate_installed() -> io::Result<ValidatedProfile> {
     {
         return Err(bad("executable custody"));
     }
+    let digest = hash_executable(&mut elf, MAX_EXECUTABLE)?;
+    if hex::encode(digest) != expected_sha256 {
+        return Err(bad("executable digest mismatch"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn hash_executable(
+    reader: &mut (impl Read + std::io::Seek),
+    max_bytes: u64,
+) -> io::Result<[u8; 32]> {
     let mut magic = [0u8; 4];
-    elf.read_exact(&mut magic)?;
+    reader.read_exact(&mut magic)?;
     if magic != *b"\x7fELF" {
         return Err(bad("executable is not ELF"));
     }
-    use std::io::Seek;
-    elf.rewind()?;
+    reader.rewind()?;
     let mut h = Sha256::new();
     let mut buf = [0u8; 16384];
+    let mut total = 0u64;
     loop {
-        let n = elf.read(&mut buf)?;
+        let remaining_plus_one = max_bytes
+            .checked_add(1)
+            .and_then(|max| max.checked_sub(total))
+            .ok_or_else(|| bad("executable oversized"))?;
+        let take = usize::try_from(remaining_plus_one.min(buf.len() as u64))
+            .map_err(|_| bad("executable oversized"))?;
+        let n = reader.read(&mut buf[..take])?;
         if n == 0 {
             break;
         }
+        total = total
+            .checked_add(n as u64)
+            .ok_or_else(|| bad("executable oversized"))?;
+        if total > max_bytes {
+            return Err(bad("executable oversized"));
+        }
         h.update(&buf[..n]);
     }
-    if hex::encode(h.finalize()) != profile.executable_sha256 {
-        return Err(bad("executable digest mismatch"));
+    Ok(h.finalize().into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_registry_and_executable_fifo_paths_refuse_promptly() {
+        use std::{ffi::CString, os::fd::FromRawFd, time::Instant};
+        const CHILD: &str = "B1A_PROFILE_FIFO_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "protected_agent::profile::tests::profile_registry_and_executable_fifo_paths_refuse_promptly",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "profile FIFO child failed with {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("profile FIFO child exceeded five seconds and was killed");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["profile", "registry", "executable"] {
+            let path = dir.path().join(name);
+            let c_path = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            let started = Instant::now();
+            let result = if name == "executable" {
+                validate_executable(&path, "00")
+            } else {
+                read_exact_file(&path, 0o644, MAX_PROFILE).map(|_| ())
+            };
+            let error = result.expect_err(&format!("{name} FIFO unexpectedly accepted"));
+            assert_eq!(
+                error.to_string(),
+                if name == "executable" {
+                    "executable custody"
+                } else {
+                    "unsafe custody"
+                },
+                "{name} FIFO did not fail at custody/type validation"
+            );
+            assert!(
+                started.elapsed().as_secs() < 5,
+                "{name} FIFO did not refuse promptly"
+            );
+            let held_writer = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            assert!(held_writer >= 0);
+            let held_writer = unsafe { fs::File::from_raw_fd(held_writer) };
+            let held_result = if name == "executable" {
+                validate_executable(&path, "00")
+            } else {
+                read_exact_file(&path, 0o644, MAX_PROFILE).map(|_| ())
+            };
+            let held_error = held_result.expect_err("held-writer FIFO unexpectedly accepted");
+            assert_eq!(
+                held_error.to_string(),
+                if name == "executable" {
+                    "executable custody"
+                } else {
+                    "unsafe custody"
+                }
+            );
+            drop(held_writer);
+        }
+
+        let zero = Path::new("/dev/zero");
+        if zero.exists() {
+            assert_eq!(
+                validate_executable(zero, "00").unwrap_err().to_string(),
+                "executable custody"
+            );
+        }
     }
-    Ok(ValidatedProfile {
-        profile,
-        registry,
-        profile_sha256: profile_hash,
-    })
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_validation_keeps_elf_and_digest_checks() {
+        use std::os::unix::fs::PermissionsExt;
+        // The production contract requires root:root ownership, which only root can create.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("elf");
+        let mut bytes = vec![b'x'; MAX_EXECUTABLE as usize];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        fs::write(&path, &bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let expected = hex::encode(Sha256::digest(&bytes));
+        validate_executable(&path, &expected).unwrap();
+        assert!(validate_executable(&path, "00").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_hasher_rejects_growth_after_prefix_and_accepts_exact_limit() {
+        use std::io::{Cursor, Read, Seek, SeekFrom};
+
+        struct GrowingAfterRewind {
+            bytes: Vec<u8>,
+            position: usize,
+            rewinds: usize,
+        }
+        impl Read for GrowingAfterRewind {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                let count = out
+                    .len()
+                    .min(self.bytes.len().saturating_sub(self.position));
+                out[..count].copy_from_slice(&self.bytes[self.position..self.position + count]);
+                self.position += count;
+                Ok(count)
+            }
+        }
+        impl Seek for GrowingAfterRewind {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                match position {
+                    SeekFrom::Start(0) => {
+                        if self.rewinds == 0 {
+                            self.bytes.extend_from_slice(b"-grew");
+                        }
+                        self.rewinds += 1;
+                        self.position = 0;
+                    }
+                    SeekFrom::Current(0) => {}
+                    _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek")),
+                }
+                Ok(self.position as u64)
+            }
+        }
+
+        let mut exact = vec![b'x'; 16];
+        exact[..4].copy_from_slice(b"\x7fELF");
+        let expected: [u8; 32] = Sha256::digest(&exact).into();
+        assert_eq!(
+            hash_executable(&mut Cursor::new(exact.clone()), 16).unwrap(),
+            expected
+        );
+        hash_executable(&mut Cursor::new(exact), MAX_EXECUTABLE).unwrap();
+
+        let mut exact_cap = vec![b'x'; MAX_EXECUTABLE as usize];
+        exact_cap[..4].copy_from_slice(b"\x7fELF");
+        let exact_cap_hash: [u8; 32] = Sha256::digest(&exact_cap).into();
+        assert_eq!(
+            hash_executable(&mut Cursor::new(exact_cap), MAX_EXECUTABLE).unwrap(),
+            exact_cap_hash
+        );
+
+        let mut growing = GrowingAfterRewind {
+            bytes: b"\x7fELF".to_vec(),
+            position: 0,
+            rewinds: 0,
+        };
+        assert_eq!(
+            hash_executable(&mut growing, 8).unwrap_err().to_string(),
+            "executable oversized"
+        );
+    }
 }
 
 #[cfg(not(unix))]
