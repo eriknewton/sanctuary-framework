@@ -360,6 +360,8 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()
                 .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
