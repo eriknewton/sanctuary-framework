@@ -2146,6 +2146,55 @@ fn net_v2_rules_match(rules: &[&serde_json::Value], overflow: HostOverflowUid) -
     }
 }
 
+/// One uid from a bare-scalar JSON value (or a `"set"` value that itself
+/// collapsed to a bare scalar): `as_u64` refuses a string, a float, a bool
+/// and a nested object, so a name form or an unrecognised shape yields `None`
+/// rather than a wrong uid.
+fn one_skuid_scalar(value: &serde_json::Value) -> Option<u32> {
+    u32::try_from(value.as_u64()?).ok()
+}
+
+/// The uid members of a `meta skuid <op> <right>` match's `right` value, in
+/// nft's listed order and with duplicates intact: the caller validates,
+/// sorts, dedups and checks cardinality to its own contract. `None` means
+/// `right` is not one of the forms nft renders a skuid set as; a non-numeric
+/// member anywhere refuses the WHOLE match rather than silently reading a
+/// partial set, matching a shape this daemon's own installer never emits.
+///
+/// SHARED single source of truth for the safety-net recogniser
+/// (`rule_skuid_set_with_verdict`, below) and the live-binding reader
+/// (`net_rule_one_uids`): nft collapses a single-member anonymous set to a
+/// bare scalar with no `"set"` wrapper at all. The real-kernel witness for
+/// this collapse is `integration_linux_runtime_activation.rs:1722-1725`
+/// (reading only the set form "returned an empty scope for a live one-uid
+/// net on the first privileged run of this suite") and the sibling case in
+/// `nft_set_json_forms_are_the_shapes_the_parser_reads`
+/// (`tests/integration_gf1_recovery.rs`), not `parse_skuid_value`: that
+/// function pins a DIFFERENT rule (the per-agent chain's bare `meta skuid ==
+/// <uid>`, written without set syntax at all) and says nothing about whether
+/// an anonymous SET of one member collapses. `render_uid_set` always writes
+/// explicit `{ .. }` braces, even for one uid, so a live table with exactly
+/// one denied or excepted uid is exactly where this collapse is reachable.
+/// Reading only the multi-member array form in the recogniser would refuse
+/// to recognise this daemon's OWN single-uid net as the safety net at all;
+/// reading only the array form in the live-binding reader would drop that
+/// already-installed uid from source (c) of `resolve_safety_net_scope`. Both
+/// callers must resolve every shape nft may emit for the same one-member
+/// match identically, or they silently disagree about the SAME live kernel
+/// state.
+///
+/// The accepted surface is kept equal to the set of OBSERVED nft outputs: a
+/// `"set"` key whose own value is itself a bare scalar (rather than a
+/// one-element array) is not a shape any witness records nft emitting, and
+/// is refused rather than speculatively normalised.
+fn skuid_right_members(right: &serde_json::Value) -> Option<Vec<u32>> {
+    match right.get("set") {
+        Some(members) => members.as_array()?.iter().map(one_skuid_scalar).collect(),
+        // No "set" wrapper at all: the fully-flattened singleton form.
+        None => Some(vec![one_skuid_scalar(right)?]),
+    }
+}
+
 /// Parse one `meta skuid <op> { .. } <verdict>` rule and return its set, or
 /// `None` when the rule is not exactly that shape with exactly `comment`.
 ///
@@ -2177,28 +2226,26 @@ fn rule_skuid_set_with_verdict(
     if left_key != "skuid" {
         return None;
     }
-    let members = m.get("right")?.get("set")?.as_array()?;
-    if members.is_empty() {
+    // See `skuid_right_members`'s doc: this is the SAME shape-tolerant read
+    // `net_rule_one_uids` uses, so the recogniser and the live-binding reader
+    // never disagree about what a live table's rule 1/rule 3 denies.
+    let raw_members = skuid_right_members(m.get("right")?)?;
+    if raw_members.is_empty() {
         return None;
     }
-    let mut uids: Vec<u32> = Vec::with_capacity(members.len());
-    for member in members {
-        // `nft -j` without `-u` renders a uid as an integer (the scalar form the
-        // existing owned-table probe pinned on nft 1.0.9); a symbolic name here
-        // is a form this parser deliberately does not read.
-        let raw = member.as_u64()?;
-        let uid = u32::try_from(raw).ok()?;
+    let mut uids: Vec<u32> = Vec::with_capacity(raw_members.len());
+    for raw_uid in &raw_members {
         // Revalidate through the shared three-refusal function: the closed
         // installer type could not have produced 0, the host overflow uid or the
         // sentinel, so a set carrying one was not armed by this daemon.
-        validate_safety_net_uid(uid, overflow).ok()?;
-        uids.push(uid);
+        validate_safety_net_uid(*raw_uid, overflow).ok()?;
+        uids.push(*raw_uid);
     }
     uids.sort_unstable();
     uids.dedup();
     // A set that listed a uid twice is not the shape the installer emits (it
     // deduplicates before rendering).
-    if uids.len() != members.len() {
+    if uids.len() != raw_members.len() {
         return None;
     }
     // The verdict object is a single key with a null value (`{"drop": null}`).
@@ -3286,22 +3333,24 @@ fn net_rule_one_uids(json: &str) -> Vec<u32> {
         if rule.get("comment").and_then(|v| v.as_str()) != Some(NET_RULE_COMMENT_IDENTITY) {
             continue;
         }
-        let Some(members) = rule
+        let Some(right) = rule
             .get("expr")
             .and_then(|v| v.as_array())
             .and_then(|exprs| exprs.first())
             .and_then(|e| e.get("match"))
             .and_then(|m| m.get("right"))
-            .and_then(|r| r.get("set"))
-            .and_then(|v| v.as_array())
         else {
             return Vec::new();
         };
-        let mut uids: Vec<u32> = members
-            .iter()
-            .filter_map(|m| m.as_u64())
-            .filter_map(|v| u32::try_from(v).ok())
-            .collect();
+        // SHARED with the safety-net recogniser's `rule_skuid_set_with_verdict`:
+        // see `skuid_right_members`'s doc for why every shape nft may emit for a
+        // one-member `meta skuid { .. }` match must resolve to the same uid, or
+        // this reader and the recogniser silently disagree about the SAME live
+        // kernel state.
+        let mut uids = match skuid_right_members(right) {
+            Some(members) => members,
+            None => return Vec::new(),
+        };
         uids.sort_unstable();
         uids.dedup();
         return uids;
@@ -4459,6 +4508,97 @@ mod tests {
         }
     }
 
+    /// A realistic `nft -j list ruleset` fragment for rule 1 of the deny-all
+    /// identity net when the denied set names exactly ONE uid. Real nft
+    /// collapses a single-member anonymous set to a bare scalar under
+    /// `right`, never `{"set":[..]}`; the real-kernel witness is
+    /// `integration_linux_runtime_activation.rs:1722-1725` and the sibling
+    /// case in `nft_set_json_forms_are_the_shapes_the_parser_reads`
+    /// (`tests/integration_gf1_recovery.rs`), not `parse_skuid_value` (that
+    /// probe covers a different, always-bare rule and says nothing about a
+    /// one-member SET collapsing). `net_rule_one_uids` reads only rule 1, so
+    /// the fixture carries just that rule plus the table/chain wrapper the
+    /// function does not inspect.
+    fn net_rule_json_with_right(right_json: &str) -> String {
+        format!(
+            r#"{{"nftables":[
+            {{"table":{{"family":"inet","name":"sanctuary-castle","handle":7}}}},
+            {{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":11,
+              "comment":"{identity}",
+              "expr":[{{"match":{{"op":"==","left":{{"meta":{{"key":"skuid"}}}},"right":{right}}}}},
+                      {{"drop":null}}]}}}}
+        ]}}"#,
+            identity = NET_RULE_COMMENT_IDENTITY,
+            right = right_json,
+        )
+    }
+
+    /// The confirmed defect: a single-uid identity rule, in the scalar form nft
+    /// actually renders it, must still surface its uid. Reading only the
+    /// `{"set":[..]}` array form drops this daemon's own already-installed
+    /// deny-all uid from source (c) of `resolve_safety_net_scope`, and
+    /// `live_table_uid_bindings`'s own comment above is explicit that
+    /// undercounting here can install a net NARROWER than the one already
+    /// enforcing in the kernel.
+    #[test]
+    fn net_rule_one_uids_reads_the_single_member_scalar_form() {
+        let json = net_rule_json_with_right("60123");
+        assert_eq!(
+            net_rule_one_uids(&json),
+            vec![60123],
+            "a scalar `right` for a one-member meta skuid match must yield that uid"
+        );
+    }
+
+    /// The existing multi-member array form keeps working, unsorted and with a
+    /// duplicate, since the function's own contract is ascending + deduplicated.
+    #[test]
+    fn net_rule_one_uids_reads_the_multi_member_set_form() {
+        let json = net_rule_json_with_right(r#"{"set":[60124,60123,60124]}"#);
+        assert_eq!(net_rule_one_uids(&json), vec![60123, 60124]);
+    }
+
+    /// A "set" key whose own value is itself a bare scalar (rather than a
+    /// one-element array) is NOT a shape any real-kernel witness records nft
+    /// emitting (see `skuid_right_members`'s doc): the accepted surface is
+    /// kept equal to observed nft outputs, so this speculative shape refuses
+    /// exactly like the other unrecognised shapes below rather than being
+    /// normalised.
+    #[test]
+    fn net_rule_one_uids_refuses_a_scalar_nested_under_set() {
+        let json = net_rule_json_with_right(r#"{"set":60123}"#);
+        assert_eq!(net_rule_one_uids(&json), Vec::<u32>::new());
+    }
+
+    /// Malformed shapes the function does not recognise must never be read as
+    /// "this rule denies nobody" in a way that differs from "no such rule was
+    /// found at all"; both already return the empty vec, and this test pins
+    /// that the malformed cases do not instead panic or silently pick a wrong
+    /// member. `{"range":[1000,2000]}` is the one listed form nft genuinely
+    /// emits for `meta skuid 1000-2000`, so it is the case most worth pinning
+    /// here rather than only a hand-composed name/null/object/array/float;
+    /// `{"set":[60123,"root"]}` pins that ONE non-numeric member anywhere in
+    /// an otherwise-valid array refuses the WHOLE match, not a partial read.
+    #[test]
+    fn net_rule_one_uids_refuses_unrecognised_right_shapes() {
+        for right in [
+            "\"sanctuary-agent\"",
+            "null",
+            "{}",
+            "[]",
+            "4.5",
+            r#"{"range":[1000,2000]}"#,
+            r#"{"set":[60123,"root"]}"#,
+        ] {
+            let json = net_rule_json_with_right(right);
+            assert_eq!(
+                net_rule_one_uids(&json),
+                Vec::<u32>::new(),
+                "unrecognised right shape {right} must not be read as any uid"
+            );
+        }
+    }
+
     #[test]
     fn owned_inventory_refuses_a_uid_the_manifest_does_not_confine() {
         // THE core check of the uid migration, and the only one an actor holding
@@ -4708,6 +4848,45 @@ mod tests {
         )
     }
 
+    /// The v2 identity listing in the shape real nft renders it for exactly
+    /// ONE denied/excepted uid: a bare scalar `right`, no `{"set": [..]}`
+    /// wrapper at all (see `skuid_right_members`'s doc). `v2_identity_listing`
+    /// above always emits the array form even for one member, which is the
+    /// synthetic shape a fixture composer would reach for and NOT the shape a
+    /// single-uid net is actually listed as; this sibling exists so the
+    /// recogniser is tested against the real collapse, not just the
+    /// convenient one.
+    fn v2_identity_listing_single_uid_scalar(denied: &str, excepted: &str) -> String {
+        let nd_types = KERNEL_ND_ICMPV6_TYPES
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"nftables":[
+            {{"metainfo":{{"version":"1.0.9","json_schema_version":1}}}},
+            {{"table":{{"family":"inet","name":"sanctuary-castle","handle":7}}}},
+            {{"chain":{{"family":"inet","table":"sanctuary-castle","name":"output","handle":1,
+              "type":"filter","hook":"output","prio":0,"policy":"drop"}}}},
+            {{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":11,
+              "comment":"{identity}",
+              "expr":[{{"match":{{"op":"==","left":{{"meta":{{"key":"skuid"}}}},"right":{denied}}}}},
+                      {{"drop":null}}]}}}},
+            {{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":12,
+              "comment":"{nd}",
+              "expr":[{{"match":{{"op":"==","left":{{"payload":{{"protocol":"icmpv6","field":"type"}}}},"right":{{"set":[{nd_types}]}}}}}},
+                      {{"accept":null}}]}}}},
+            {{"rule":{{"family":"inet","table":"sanctuary-castle","chain":"output","handle":13,
+              "comment":"{others}",
+              "expr":[{{"match":{{"op":"!=","left":{{"meta":{{"key":"skuid"}}}},"right":{excepted}}}}},
+                      {{"accept":null}}]}}}}
+        ]}}"#,
+            identity = NET_RULE_COMMENT_IDENTITY,
+            nd = NET_RULE_COMMENT_KERNEL_ND,
+            others = NET_RULE_COMMENT_OTHERS,
+        )
+    }
+
     /// ITEM 16: the emission floor KEEPS its below-ceiling refusal.
     ///
     /// The three unattestable-uid refusals were added ALONGSIDE this floor, not in place
@@ -4821,6 +5000,81 @@ mod tests {
             &reordered_members,
             test_overflow()
         ));
+    }
+
+    /// The confirmed defect's recogniser-side twin: a live table whose ONE
+    /// denied uid nft rendered as a bare scalar (the real collapse, not the
+    /// convenient array `v2_identity_listing` composes) must still be
+    /// recognised as this daemon's OWN deny-all safety net, and
+    /// `net_rule_one_uids`/`live_table_uid_bindings` must agree with the
+    /// recogniser on the uid it denies. Before `rule_skuid_set_with_verdict`
+    /// shared `skuid_right_members` with `net_rule_one_uids`, this scalar
+    /// shape refused recognition entirely (`is_deny_all_safety_net_json`
+    /// false), which would have let a restart re-arm a net that dropped the
+    /// live kernel's already-installed single-uid deny rule.
+    #[test]
+    fn deny_all_safety_net_recognizer_accepts_a_single_denied_uid_scalar_net() {
+        let ov = test_overflow();
+        let json = v2_identity_listing_single_uid_scalar("60123", "60123");
+        assert!(
+            is_deny_all_safety_net_json(&json, ov),
+            "a single-uid net in nft's real scalar form must be recognised: {json}"
+        );
+        assert_eq!(
+            net_rule_one_uids(&json),
+            vec![60123],
+            "the live-binding reader must agree with the recogniser on the same JSON"
+        );
+        assert_eq!(
+            live_table_uid_bindings(&json, &fixture_expectation(), ov),
+            LiveTableBindings::Bindings(vec![60123])
+        );
+    }
+
+    /// The recogniser must still REJECT a scalar-shaped look-alike whose rule 1
+    /// and rule 3 name different uids: accepting it would let rule 3 accept a
+    /// uid that rule 1 never actually drops (the ordering-invariant this
+    /// module documents at `net_v2_rules_match`), and the scalar form must not
+    /// get a laxer equality check than the array form already enforces.
+    #[test]
+    fn deny_all_safety_net_recognizer_rejects_a_single_uid_scalar_mismatch() {
+        let ov = test_overflow();
+        let mismatched = v2_identity_listing_single_uid_scalar("60123", "60124");
+        assert!(
+            !is_deny_all_safety_net_json(&mismatched, ov),
+            "rule 1 and rule 3 naming different uids must never be recognised as the net"
+        );
+    }
+
+    /// And a scalar `right` that is not a valid attestable uid at all (root,
+    /// the host overflow uid, or a value past `u32`) must be refused exactly
+    /// as the array form already is, since the shared extractor must not
+    /// bypass the three-refusal revalidation `rule_skuid_set_with_verdict`
+    /// applies to every member.
+    #[test]
+    fn deny_all_safety_net_recognizer_rejects_an_unattestable_scalar_uid() {
+        let ov = test_overflow();
+        let root = v2_identity_listing_single_uid_scalar("0", "0");
+        assert!(
+            !is_deny_all_safety_net_json(&root, ov),
+            "uid 0 must never be recognised as a live denied identity: {root}"
+        );
+        let past_u32 = v2_identity_listing_single_uid_scalar("4294967296", "4294967296");
+        assert!(
+            !is_deny_all_safety_net_json(&past_u32, ov),
+            "a value past u32 must never be recognised: {past_u32}"
+        );
+        // The host overflow uid is the one of the three refusals that depends
+        // on the injected `overflow` argument actually reaching
+        // `validate_safety_net_uid` through the new shared extractor, rather
+        // than on a constant this test would pass even if `overflow` were
+        // silently dropped on the scalar path.
+        let overflow_uid = TEST_HOST_OVERFLOW_UID.to_string();
+        let overflow_net = v2_identity_listing_single_uid_scalar(&overflow_uid, &overflow_uid);
+        assert!(
+            !is_deny_all_safety_net_json(&overflow_net, ov),
+            "the host's own overflow uid must never be recognised: {overflow_net}"
+        );
     }
 
     #[test]

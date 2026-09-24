@@ -1057,6 +1057,66 @@ fn nft_set_json_forms_are_the_shapes_the_parser_reads() {
     assert!(nftables::live_table_is_deny_all_safety_net().expect("probe"));
 }
 
+// The sibling case the probe above never exercised: a ONE-uid identity net. The
+// full-cap probe above only ever recorded the multi-member `{"set":[..]}` form,
+// so nothing in CI installed a single-uid net and read it back on a real kernel
+// before this case existed. This is the real-kernel witness for the collapse
+// `skuid_right_members` (`castle-wall-daemon/src/nftables.rs`) reads: rule 1's
+// `right` for exactly one denied uid renders as a BARE SCALAR, not
+// `{"set":[N]}`, and the recogniser must still accept it as this daemon's own
+// deny-all safety net.
+#[test]
+fn nft_set_json_forms_are_the_shapes_the_parser_reads_for_one_uid() {
+    let _suite = isolation::guard();
+    if !nft_available() {
+        skip_or_fail_unprivileged("nft add/delete on the isolated table failed");
+        return;
+    }
+    nftables::install_deny_all_safety_net(&identity_scope(&[60123])).expect("install");
+    let json = live_table_json().expect("list the live table");
+    // SAFETY: stderr is this test's evidence channel, exactly as the sibling
+    // full-cap probe above: the recorded form is the artifact the parser's
+    // single-member shape assumption rests on.
+    eprintln!("RECORDED nft -j listing for the one-uid identity net:\n{json}");
+
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("nft -j parses");
+    let items = doc["nftables"].as_array().expect("an nftables array");
+    let rules: Vec<&serde_json::Value> = items.iter().filter_map(|item| item.get("rule")).collect();
+    assert_eq!(rules.len(), 3, "three rules: {json}");
+
+    // Rule 1: the ONE-member collapse. `right` is the bare uid, with NO "set"
+    // wrapper at all -- this is the exact shape `skuid_right_members` exists to
+    // read, and the exact shape the module's array-only history never covered.
+    let m1 = &rules[0]["expr"][0]["match"];
+    assert_eq!(m1["op"], "==", "rule 1 op: {json}");
+    assert_eq!(m1["left"]["meta"]["key"], "skuid", "rule 1 left: {json}");
+    assert!(
+        m1["right"].get("set").is_none(),
+        "a one-member skuid set must NOT keep the \"set\" wrapper: {json}"
+    );
+    assert_eq!(
+        m1["right"].as_u64(),
+        Some(60123),
+        "rule 1 right must be the bare scalar uid: {json}"
+    );
+
+    // Rule 3: the same collapse on the `!=` form, over the SAME uid as rule 1.
+    let m3 = &rules[2]["expr"][0]["match"];
+    assert_eq!(m3["op"], "!=", "rule 3 op: {json}");
+    assert!(
+        m3["right"].get("set").is_none(),
+        "rule 3's one-member skuid set must NOT keep the \"set\" wrapper: {json}"
+    );
+    assert_eq!(m3["right"].as_u64(), m1["right"].as_u64(), "the two rules must name the same uid: {json}");
+
+    // And the recogniser accepts this real one-uid listing as its own deny-all
+    // safety net -- the whole point of pinning this sibling form.
+    assert!(
+        nftables::live_table_is_deny_all_safety_net().expect("probe"),
+        "a real one-uid net must be recognised as the safety net: {json}"
+    );
+}
+
 // The by-name delete primitive on real nft: after it runs, no live castle table and
 // therefore no live `policy accept` castle path remains.
 //
