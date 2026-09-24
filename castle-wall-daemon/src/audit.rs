@@ -613,20 +613,14 @@ fn write_progress_entry(progress: &mut TruncateProgress, entry: &WalEntry) -> Re
         path: progress.tmp_path.clone(),
         source_message: err.to_string(),
     })?;
-    progress
-        .tmp
-        .write_all(serialized.as_bytes())
-        .map_err(|err| WalError::Io {
-            path: progress.tmp_path.clone(),
-            source_message: err.to_string(),
-        })?;
-    progress.tmp.write_all(b"\n").map_err(|err| WalError::Io {
+    // One row, one buffer (shared with `append` through `wal_row_bytes`), so
+    // this writer cannot leave a row body without its newline either.
+    let row = wal_row_bytes(&serialized);
+    progress.tmp.write_all(&row).map_err(|err| WalError::Io {
         path: progress.tmp_path.clone(),
         source_message: err.to_string(),
     })?;
-    progress.new_bytes = progress
-        .new_bytes
-        .saturating_add(serialized.len() as u64 + 1);
+    progress.new_bytes = progress.new_bytes.saturating_add(row.len() as u64);
     progress.new_chain_hash = Some(sha256_hex(entry.event_canonical_json.as_bytes()));
     Ok(())
 }
@@ -1437,16 +1431,15 @@ impl WalWriter {
                 path: tmp_path.clone(),
                 source_message: err.to_string(),
             })?;
-            tmp.write_all(serialized.as_bytes())
-                .map_err(|err| WalError::Io {
-                    path: tmp_path.clone(),
-                    source_message: err.to_string(),
-                })?;
-            tmp.write_all(b"\n").map_err(|err| WalError::Io {
+            // One row, one buffer (shared with `append` through
+            // `wal_row_bytes`), so the replay rewrite cannot leave a row body
+            // without its newline either.
+            let row = wal_row_bytes(&serialized);
+            tmp.write_all(&row).map_err(|err| WalError::Io {
                 path: tmp_path.clone(),
                 source_message: err.to_string(),
             })?;
-            new_bytes += serialized.len() as u64 + 1;
+            new_bytes += row.len() as u64;
             new_chain_hash = Some(sha256_hex(entry.event_canonical_json.as_bytes()));
             Ok(())
         };
@@ -1880,6 +1873,20 @@ mod wal_tests {
         details.insert("seq".to_string(), serde_json::json!(seq));
         details.insert("prior_sha256_hex".to_string(), serde_json::json!(prior));
         entry.event_canonical_json = crate::manifest::canonical_json::canonicalize(&event).unwrap();
+    }
+
+    /// Structural (LINUX-WAL-OTHER-ROW-WRITERS-01): every WAL row writer in
+    /// this file goes through `wal_row_bytes`, so no writer emits a row body
+    /// and its newline as two calls. Fails if a separate newline write returns.
+    #[test]
+    fn no_wal_writer_writes_the_row_newline_separately() {
+        let source = include_str!("audit.rs");
+        let separate_newline_write = "write_all(b\"\\n\")";
+        assert_eq!(
+            source.matches(separate_newline_write).count(),
+            0,
+            "a WAL row writer writes its newline as a separate call; build the row with wal_row_bytes"
+        );
     }
 
     #[test]
