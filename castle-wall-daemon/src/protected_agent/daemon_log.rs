@@ -65,18 +65,21 @@ fn mac_key(path: &Path) -> io::Result<JournalAuthKey> {
 /// module works in production and quietly reaches installed state from a test
 /// run, which surfaces as an unrelated flake on whichever machine happens to
 /// have Sanctuary installed.
-pub fn replay(path: &Path, mac_key_path: &Path, pins: &Pins) -> io::Result<State> {
-    let bytes = match receipt::read_custodied_file(
-        path,
-        0,
-        &[0, group_sanctuary()?],
-        0o600,
-        MAX_LOG as usize,
-    ) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(State::default()),
-        Err(e) => return Err(e),
-    };
+/// `service_gid` MUST MATCH the single `getegid()` snapshot in
+/// `owner::stop_failure_for_hook_at`, so all log and admission-key custody
+/// checks in one hook use the group assigned to the running daemon.
+pub fn replay(
+    path: &Path,
+    mac_key_path: &Path,
+    pins: &Pins,
+    service_gid: u32,
+) -> io::Result<State> {
+    let bytes =
+        match receipt::read_custodied_file(path, 0, &[0, service_gid], 0o600, MAX_LOG as usize) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(State::default()),
+            Err(e) => return Err(e),
+        };
     replay_rows(&bytes, pins, || mac_key(mac_key_path))
 }
 
@@ -160,18 +163,6 @@ fn replay_rows(
     Ok(state)
 }
 
-#[cfg(unix)]
-fn group_sanctuary() -> io::Result<u32> {
-    Ok(nix::unistd::Group::from_name("sanctuary")?
-        .ok_or_else(|| bad("sanctuary group missing"))?
-        .gid
-        .as_raw())
-}
-#[cfg(not(unix))]
-fn group_sanctuary() -> io::Result<u32> {
-    Err(bad("unsupported platform"))
-}
-
 #[cfg(any(test, feature = "test-isolation"))]
 pub fn fresh_fixture_reservation(
     mut generation: Generation,
@@ -195,16 +186,19 @@ pub fn fresh_fixture_reservation(
 /// in rather than read from the constant so that every name this module
 /// touches comes from the caller's `OwnerPaths`; `path` MUST MATCH the
 /// `release_log` and `mac_key_path` the `journal_mac_key` the caller replayed,
-/// since the completion is matched against that same replay.
+/// since the completion is matched against that same replay. `service_gid`
+/// MUST MATCH the gid passed to the surrounding `replay` calls in
+/// `owner::stop_failure_for_hook_at`.
 pub fn accept_completion_copy(
     path: &Path,
     mac_key_path: &Path,
     receipt: SignedReceipt,
     pins: &Pins,
+    service_gid: u32,
 ) -> io::Result<()> {
     let (_, completion_key) = pins.validate().map_err(bad)?;
     receipt::verify(&receipt, Domain::StopCompletionV1, &completion_key).map_err(bad)?;
-    let state = replay(path, mac_key_path, pins)?;
+    let state = replay(path, mac_key_path, pins, service_gid)?;
     if let Some(old) = state.completion {
         return if old == receipt {
             Ok(())
@@ -270,6 +264,34 @@ mod tests {
     use crate::protected_agent::receipt::{self, ReceiptBody};
     use ed25519_dalek::SigningKey;
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replay_checks_the_supplied_service_group_against_file_custody() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("releases.log");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let service_gid = 42420;
+        nix::unistd::chown(&path, None, Some(nix::unistd::Gid::from_raw(service_gid))).unwrap();
+
+        let admission = SigningKey::from_bytes(&[3; 32]);
+        let completion = SigningKey::from_bytes(&[4; 32]);
+        let pins = Pins {
+            schema: 1,
+            algorithm: "ed25519".into(),
+            admission_public: hex::encode(admission.verifying_key().as_bytes()),
+            admission_key_id: receipt::key_id(&admission.verifying_key()),
+            completion_public: hex::encode(completion.verifying_key().as_bytes()),
+            completion_key_id: receipt::key_id(&completion.verifying_key()),
+        };
+        let key_path = dir.path().join("unused-key");
+        assert!(replay(&path, &key_path, &pins, service_gid).is_ok());
+        assert!(replay(&path, &key_path, &pins, service_gid + 1).is_err());
+    }
 
     #[test]
     fn fixture_reservation_release_and_exact_completion_replay() {
