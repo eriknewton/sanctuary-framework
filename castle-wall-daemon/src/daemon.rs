@@ -282,6 +282,17 @@ pub struct DaemonHandle {
     /// clone.
     #[cfg(test)]
     ipc_stop_flag: Arc<AtomicBool>,
+    /// TEST-ISOLATION ONLY (W1b, register id LINUX-STOP-LOSS-RACE-01). One-shot
+    /// latch armed by `arm_test_shutdown_at_pre_recovery`; consumed inside
+    /// `kernel_runtime_health_with_recovery`, which flips `shutdown_flag`
+    /// immediately before calling `attempt_post_ready_recovery` so a wired
+    /// integration test can prove the site-5 precedence fix (a first-entry
+    /// proven loss still gets its one net-install attempt when shutdown races
+    /// this exact call) without depending on OS signal-delivery timing.
+    /// Compiled out of release builds: must match the CLI seam name
+    /// `--test-shutdown-at=pre-recovery` in `main.rs`.
+    #[cfg(feature = "test-isolation")]
+    test_shutdown_at_pre_recovery: Arc<AtomicBool>,
     started_at: Instant,
 }
 
@@ -535,6 +546,18 @@ impl DaemonHandle {
                         // attempt produced, so a successful install shows up as
                         // `Recovering` (not readiness) and the exit arm is not reached
                         // with an attempt outstanding.
+                        // TEST-ISOLATION ONLY (W1b, LINUX-STOP-LOSS-RACE-01): must match
+                        // `arm_test_shutdown_at_pre_recovery`'s doc comment. Flips the real
+                        // shutdown flag at the exact call boundary the site-5 precedence fix
+                        // protects, one-shot (swap-and-clear so a later retry poll is not
+                        // re-armed), BEFORE `is_shutdown_requested()` is read for this call.
+                        #[cfg(feature = "test-isolation")]
+                        if self
+                            .test_shutdown_at_pre_recovery
+                            .swap(false, Ordering::SeqCst)
+                        {
+                            self.request_stop();
+                        }
                         let recovery =
                             runtime.attempt_post_ready_recovery(self.is_shutdown_requested());
                         let observed = match runtime.status() {
@@ -894,6 +917,20 @@ impl DaemonHandle {
         self.fatal_control_path.store(true, Ordering::SeqCst);
     }
 
+    /// TEST-ISOLATION ONLY (W1b, register id LINUX-STOP-LOSS-RACE-01). Arms the
+    /// one-shot seam documented on the `test_shutdown_at_pre_recovery` field:
+    /// the NEXT call into `kernel_runtime_health_with_recovery` flips the real
+    /// shutdown flag immediately before `attempt_post_ready_recovery` runs,
+    /// then disarms itself. This proves the site-5 precedence fix through the
+    /// real `main` binary without racing an OS signal against the health call.
+    /// Absent from release builds; must match the CLI seam name
+    /// `--test-shutdown-at=pre-recovery` in `main.rs`.
+    #[cfg(feature = "test-isolation")]
+    pub fn arm_test_shutdown_at_pre_recovery(&self) {
+        self.test_shutdown_at_pre_recovery
+            .store(true, Ordering::SeqCst);
+    }
+
     /// Test-only: attach an enforcement runtime so the readiness derivation can
     /// be exercised without a real kernel. Never compiled into the shipped
     /// daemon.
@@ -1167,6 +1204,10 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     let ipc_stop_flag = Arc::new(AtomicBool::new(false));
     let mutation_cancel_flag = Arc::new(AtomicBool::new(false));
     let fatal_control_path = Arc::new(AtomicBool::new(false));
+    // TEST-ISOLATION ONLY (W1b, LINUX-STOP-LOSS-RACE-01): unarmed on every boot;
+    // must match `arm_test_shutdown_at_pre_recovery`'s doc comment on the field.
+    #[cfg(feature = "test-isolation")]
+    let test_shutdown_at_pre_recovery = Arc::new(AtomicBool::new(false));
 
     // Slice L1: load (or first-boot generate) the daemon-held audit-producer
     // key. The private half stays in this process / a root-owned 0600 file and
@@ -1399,6 +1440,8 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
         mutation_cancel_flag,
         #[cfg(test)]
         ipc_stop_flag,
+        #[cfg(feature = "test-isolation")]
+        test_shutdown_at_pre_recovery,
         started_at: Instant::now(),
     })
 }

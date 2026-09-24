@@ -70,6 +70,14 @@ fn has_structural_flag(args: &[String], wanted: &str) -> bool {
         "--trusted-service-uid",
         "--isolated-runtime-root",
         "--isolated-castle-table-tag",
+        // W1a/W1b (LINUX-STOP-LOSS-RACE-01): value-taking test-isolation seams.
+        // Listed here (like the two isolation flags above) only so this scan
+        // correctly skips their value while looking for `--disarm` /
+        // `--preflight-manifest`; the flags themselves are parsed and stripped
+        // only under `#[cfg(feature = "test-isolation")]` in `main`, and the
+        // real behavior they arm never compiles into a release build.
+        "--test-health-interval-ms",
+        "--test-shutdown-at",
     ];
     // Invariant: `args` is already `std::env::args().skip(1)` (the program name
     // is stripped by the caller), so scanning MUST start at index 0. Starting at
@@ -228,6 +236,14 @@ fn main() -> ExitCode {
     #[cfg_attr(not(feature = "test-isolation"), allow(unused_mut))]
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
+    // W1a/W1b (LINUX-STOP-LOSS-RACE-01): the two wired-consumer test seams.
+    // Declared outside the block below so their parsed values survive it; both
+    // stay `None` and unread on every non-test-isolation build.
+    #[cfg(feature = "test-isolation")]
+    let mut test_health_interval_ms: Option<u64> = None;
+    #[cfg(feature = "test-isolation")]
+    let mut test_shutdown_at: Option<String> = None;
+
     #[cfg(feature = "test-isolation")]
     {
         if has_structural_flag(&args, "--test-trigger-nfqueue-deadline-fail-stop") {
@@ -241,6 +257,40 @@ fn main() -> ExitCode {
         }
         if let Some(index) = args.iter().position(|a| a == "--isolated-castle-table-tag") {
             args.drain(index..=(index + 1).min(args.len() - 1));
+        }
+        // W1a: drained (name + value) before the run-config parser sees it, or
+        // that parser rejects it as unknown. Space-separated, matching every
+        // other value-taking flag in this file (e.g. `--isolated-runtime-root
+        // <path>`), not the `--flag=value` form the design memo uses as prose.
+        if let Some(index) = args.iter().position(|a| a == "--test-health-interval-ms") {
+            let value = args.get(index + 1).cloned();
+            args.drain(index..=(index + 1).min(args.len() - 1));
+            match value.and_then(|v| v.parse::<u64>().ok()) {
+                Some(ms) => test_health_interval_ms = Some(ms),
+                None => {
+                    // SAFETY: stderr is the CLI parse-error contract, as above.
+                    eprintln!(
+                        "castle-wall-daemon: --test-health-interval-ms requires a numeric \
+                         millisecond value"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        // W1b: same drain-before-parse requirement. The only supported value is
+        // `pre-recovery`; must match `DaemonHandle::arm_test_shutdown_at_pre_recovery`'s
+        // doc comment in `daemon.rs`.
+        if let Some(index) = args.iter().position(|a| a == "--test-shutdown-at") {
+            let value = args.get(index + 1).cloned();
+            args.drain(index..=(index + 1).min(args.len() - 1));
+            match value.as_deref() {
+                Some("pre-recovery") => test_shutdown_at = value,
+                _ => {
+                    // SAFETY: stderr is the CLI parse-error contract, as above.
+                    eprintln!("castle-wall-daemon: --test-shutdown-at accepts only 'pre-recovery'");
+                    return ExitCode::from(2);
+                }
+            }
         }
     }
 
@@ -331,6 +381,12 @@ fn main() -> ExitCode {
     if trigger_fatal_control_path {
         handle.request_fatal_control_path_for_test();
     }
+    // W1b: armed only after a successful boot, so the seam cannot fire before a
+    // handle exists to flip.
+    #[cfg(feature = "test-isolation")]
+    if test_shutdown_at.is_some() {
+        handle.arm_test_shutdown_at_pre_recovery();
+    }
 
     if boot_and_exit {
         // SAFETY: stdout is the CLI boot-and-exit lifecycle contract here,
@@ -397,7 +453,18 @@ fn main() -> ExitCode {
     // KernelRuntimeLost, which we turn into an ordered teardown and a NONZERO
     // exit so systemd (Restart=on-failure) restarts the daemon instead of
     // leaving a live-but-not-enforcing service reporting itself active.
-    let outcome = handle.supervise_until_shutdown(SHUTDOWN_TICK, HEALTH_INTERVAL);
+    // W1a: a large `--test-health-interval-ms` keeps the periodic health tick
+    // from firing again inside the harness's SIGTERM window, so the daemon's
+    // OWN shutdown-time final health pass (S_STOP_FINAL_HEALTH) is what proves
+    // the loss, not a race against the normal interval. Every non-test build
+    // (and a test build that omits the flag) keeps the production constant.
+    #[cfg(feature = "test-isolation")]
+    let health_interval = test_health_interval_ms
+        .map(Duration::from_millis)
+        .unwrap_or(HEALTH_INTERVAL);
+    #[cfg(not(feature = "test-isolation"))]
+    let health_interval = HEALTH_INTERVAL;
+    let outcome = handle.supervise_until_shutdown(SHUTDOWN_TICK, health_interval);
     match &outcome {
         // SAFETY: stderr is the operator-visible supervision-outcome contract. These
         // two arms explain a NONZERO exit that systemd is about to restart; the
