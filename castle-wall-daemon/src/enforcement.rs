@@ -989,11 +989,15 @@ mod test_support {
                 .fetch_add(1, Ordering::SeqCst);
         }
         fn attempt_post_ready_recovery(&self, shutting_down: bool) -> PostReadyRecoveryResult {
-            self.recovery_calls.fetch_add(1, Ordering::SeqCst);
+            // C2a1(a) site 6 (LINUX-STOP-LOSS-RACE-01): a stop never leaves a proven
+            // loss without its one net attempt, so the FIRST call installs
+            // regardless of `shutting_down`; only a later call under shutdown
+            // (a retrying re-probe) returns NoInstall.
+            let call_number = self.recovery_calls.fetch_add(1, Ordering::SeqCst) + 1;
             if shutting_down {
                 self.recovery_saw_shutdown.store(true, Ordering::SeqCst);
             }
-            if shutting_down {
+            if shutting_down && call_number > 1 {
                 PostReadyRecoveryResult::NoInstall
             } else {
                 PostReadyRecoveryResult::InstallSucceeded
@@ -1324,21 +1328,27 @@ mod test_support {
         assert_eq!(counters.post_ready_indeterminate.load(Ordering::SeqCst), 1);
         assert_eq!(counters.recovery.load(Ordering::SeqCst), 0);
 
-        // LOST, a completed negative proof: recovery IS driven.
+        // LOST, a completed negative proof, encountered WHILE ALREADY SHUTTING
+        // DOWN. C2a1(a) (LINUX-STOP-LOSS-RACE-01, inverted contract): a stop
+        // never leaves a proven loss without its one net attempt, so the FIRST
+        // entry installs even under shutdown. Pre-fix this call returned
+        // NoInstall; this assertion is the fail-before witness.
         *health.lock().unwrap() = ComponentHealth::Lost;
         assert_eq!(
-            runtime.attempt_post_ready_recovery(false),
-            PostReadyRecoveryResult::InstallSucceeded
+            runtime.attempt_post_ready_recovery(true),
+            PostReadyRecoveryResult::InstallSucceeded,
+            "a stop must not leave a proven loss without its one net attempt"
         );
         assert_eq!(counters.recovery.load(Ordering::SeqCst), 1);
+        assert!(counters.recovery_saw_shutdown.load(Ordering::SeqCst));
 
-        // The shutdown flag is threaded through, so `systemctl stop` is a clean exit
-        // rather than a box that keeps re-arming while it is taken down.
+        // A SECOND poll under shutdown, with the loss still outstanding, is the
+        // gated retrying re-probe path: no second install, no readiness restore.
         assert_eq!(
             runtime.attempt_post_ready_recovery(true),
             PostReadyRecoveryResult::NoInstall
         );
-        assert!(counters.recovery_saw_shutdown.load(Ordering::SeqCst));
+        assert_eq!(counters.recovery.load(Ordering::SeqCst), 2);
 
         // RECOVERING: an attempt is outstanding, and the controller IS re-entered. This
         // is what makes a failed install retry: the component keeps publishing

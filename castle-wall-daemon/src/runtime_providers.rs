@@ -2768,14 +2768,19 @@ impl NftablesTableComponent {
     ) -> crate::enforcement::PostReadyRecoveryResult {
         use crate::enforcement::PostReadyRecoveryResult;
         use std::sync::atomic::Ordering;
-        // The shutdown flag is observed so `systemctl stop` is a clean exit rather than
-        // a box that keeps re-arming while it is being taken down.
-        if shutting_down {
-            self.recovering.store(false, Ordering::SeqCst);
+        // C2a1(a) site 5 (LINUX-STOP-LOSS-RACE-01): a stop never leaves a proven loss
+        // without its one net attempt. Shutdown no longer skips this call outright;
+        // it gates only the RETRYING re-probe path below (no `OwnedWallReady`
+        // readiness restoration during a stop) and the throttled-retry interval. A
+        // first entry for a proven loss still consumes the Lost proof and attempts
+        // the install exactly once, even while shutting down.
+        let retrying = self.is_recovering();
+        if shutting_down && retrying {
+            // A stop must not restore readiness or keep re-probing; only the FIRST
+            // entry for a fresh proven loss gets the one-shot install below.
             return PostReadyRecoveryResult::NoInstall;
         }
         self.mark_prior_install_unverified();
-        let retrying = self.is_recovering();
         // The first entry already consumed a completed negative proof supplied by
         // the runtime. Only LATER polls ask whether the original owned wall has
         // returned. Doing this before the install clock recognizes a repair
@@ -2839,6 +2844,38 @@ impl NftablesTableComponent {
             *last = Some(std::time::Instant::now());
         }
         let resolution = self.net_scope_from_retained_set();
+        // A155 (Erik, 2026-09-24): a routine stop never installs a host-wide net.
+        // `SafetyNetScope::HostWide` here means no confined uid is known (or the
+        // retained set overflowed), so a stop-time install would have nothing
+        // legitimate to scope the drop to and would instead silence the operator's
+        // own live sessions on every ordinary `systemctl stop`. With a known
+        // confined identity (`SafetyNetScope::Identity`) this branch is not taken
+        // and the install proceeds as normal, in or out of shutdown.
+        if shutting_down && matches!(resolution.scope, crate::nftables::SafetyNetScope::HostWide) {
+            self.record_safety_net_state(crate::nftables::SafetyNetAuditState::NotAttempted);
+            const RESIDUAL_REASON: &str = "stop_time_net_skipped_no_known_identity";
+            if let Err(audit_err) = self.decision_engine.append_control_audit_bounded(
+                RESIDUAL_REASON,
+                "stop-time proven loss observed no known confined identity (HostWide scope); \
+                 A155 refuses a host-wide install at stop, so no net was installed",
+                crate::decision::FAILURE_AUDIT_BUDGET,
+            ) {
+                // SAFETY: stderr is the operator channel of last resort when even
+                // the bounded residual audit row cannot be written.
+                eprintln!(
+                    "castle-wall-daemon: {RESIDUAL_REASON} (audit row failed: {audit_err:?})"
+                );
+            } else {
+                // SAFETY: stderr is the operator channel naming the A155 residual;
+                // the durable record is the audit row appended just above.
+                eprintln!("castle-wall-daemon: {RESIDUAL_REASON}");
+            }
+            // Return the same result the no-install paths above return (Unavailable/
+            // Indeterminate), so the caller reads this the same way: not a proven
+            // install, and NOT mapped to a clean exit-0 (the `Recovering` observation
+            // already published above keeps the supervisor's exit arm nonzero).
+            return PostReadyRecoveryResult::NoInstall;
+        }
         // INSTALL FIRST. The persist follows.
         let installed = install_deny_all_net_for_recovery(
             || crate::nftables::install_deny_all_safety_net(&resolution.scope),
@@ -4866,6 +4903,108 @@ mod tests {
             poll_interval: Duration::from_millis(200),
             nfqueue: NfqueueConfig::default(),
         }
+    }
+
+    /// A hand-built [`NftablesTableComponent`] bypassing `acquire` (no real host
+    /// lock or kernel table), for U2/U2b below. `net_scope_from_retained_set`
+    /// still shells out to `nft` to read live table bindings, so these tests
+    /// need real `nft` privileges (the same caveat as W1a/W1b) and run in the
+    /// privileged Linux CI integration lane, not on an unprivileged dev host.
+    #[cfg(target_os = "linux")]
+    fn fixture_component(
+        decision_engine: Arc<DecisionEngine>,
+        journal_dir: &Path,
+        retained_deny_uids: Vec<u32>,
+    ) -> NftablesTableComponent {
+        NftablesTableComponent {
+            lock: None,
+            ownership: crate::nftables::CastleTableOwnership {
+                table_handle: 1,
+                base_chain_handle: 2,
+                marker: "test-marker".to_string(),
+            },
+            decision_engine,
+            probe: crate::health_probe::BoundedHealthProbe::new(nft_health_budget()),
+            released: false,
+            journal_path: journal_dir.join("nonexistent-ownership.json"),
+            journal_key_path: journal_dir.join("nonexistent-ownership.key"),
+            retained_deny_uids: std::sync::Mutex::new(retained_deny_uids),
+            recovering: std::sync::atomic::AtomicBool::new(false),
+            last_recovery_attempt: std::sync::Mutex::new(None),
+            last_safety_net_state: std::sync::Mutex::new(
+                crate::nftables::SafetyNetAuditState::NotAttempted,
+            ),
+        }
+    }
+
+    /// U2 (LINUX-STOP-LOSS-RACE-01): `recover_post_ready_loss(true)` on a proven
+    /// Lost with a known confined identity (Identity scope): installs once. A
+    /// SECOND call under shutdown is the retrying re-probe path, which shutdown
+    /// still gates: no re-probe, no install, no readiness restore. Fails on
+    /// dd2e5b06, which returns `NoInstall` unconditionally under shutdown (the
+    /// first call never attempts anything).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn u2_first_entry_under_shutdown_installs_once_identity_scope() {
+        use crate::enforcement::PostReadyRecoveryResult as R;
+
+        let dir = TempDir::new().unwrap();
+        let component = fixture_component(test_decision_engine(), dir.path(), vec![65_000]);
+
+        let first = component.recover_post_ready_loss(true);
+        assert_ne!(
+            first,
+            R::NoInstall,
+            "a stop must not leave a first-entry proven loss without its one net attempt"
+        );
+        assert!(
+            component.is_recovering(),
+            "recovering must be set after the attempt, success or failure"
+        );
+
+        let second = component.recover_post_ready_loss(true);
+        assert_eq!(
+            second,
+            R::NoInstall,
+            "a later poll under shutdown is the gated retrying re-probe path"
+        );
+    }
+
+    /// U2b (A155): HostWide scope (no known confined identity, or overflow)
+    /// under shutdown installs nothing and records the residual, instead of
+    /// installing a host-wide net that would silence the operator's own live
+    /// sessions on an ordinary `systemctl stop`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn u2b_hostwide_scope_under_shutdown_skips_install_and_records_residual() {
+        use crate::enforcement::PostReadyRecoveryResult as R;
+
+        let dir = TempDir::new().unwrap();
+        let (decision_engine, wal, _audit, _injection) = audit_backed_engine(&dir, None);
+        // Empty retained set, no journal/manifest history: net_scope_from_retained_set
+        // resolves HostWide (EmptyDenySet), i.e. no known confined identity.
+        let component = fixture_component(decision_engine, dir.path(), Vec::new());
+
+        let result = component.recover_post_ready_loss(true);
+        assert_eq!(
+            result,
+            R::NoInstall,
+            "A155: a routine stop must never install a host-wide net"
+        );
+
+        let rows = wal
+            .lock()
+            .unwrap()
+            .snapshot_after(None, 32)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .event_canonical_json
+                    .contains("stop_time_net_skipped_no_known_identity")
+            })
+            .count();
+        assert_eq!(rows, 1, "the A155 residual must be recorded");
     }
 
     // ---- drive_manifest_watcher_at: hard poll error terminates (blocker 5) ----

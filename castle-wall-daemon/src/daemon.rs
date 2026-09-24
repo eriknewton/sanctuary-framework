@@ -677,14 +677,19 @@ impl DaemonHandle {
                 return SupervisionOutcome::FatalControlPath;
             }
             if self.is_shutdown_requested() {
-                return SupervisionOutcome::ShutdownRequested;
+                // C2a1(a) site 2 (LINUX-STOP-LOSS-RACE-01): a bare shutdown check must
+                // not exit 0 ahead of a final health pass, or a proven loss racing this
+                // stop leaves the confined identity with no table and no net.
+                return self.stop_final_health_outcome();
             }
             std::thread::sleep(tick);
             if self.is_fatal_control_path_requested() {
                 return SupervisionOutcome::FatalControlPath;
             }
             if self.is_shutdown_requested() {
-                return SupervisionOutcome::ShutdownRequested;
+                // C2a1(a) site 3: same final-health requirement as site 2, shared via
+                // the same helper so the logic cannot drift between the two call sites.
+                return self.stop_final_health_outcome();
             }
             if let Ok(mut buf) = self.audit_buffer.lock() {
                 buf.evict_expired(std::time::SystemTime::now());
@@ -809,6 +814,96 @@ impl DaemonHandle {
                         return SupervisionOutcome::KernelRuntimeLost(reason);
                     }
                 }
+            }
+        }
+    }
+
+    /// `S_STOP_FINAL_HEALTH` (C2a1(a), register id LINUX-STOP-LOSS-RACE-01):
+    /// the state a shutdown-requested supervision loop enters instead of
+    /// exiting immediately. Runs exactly one `kernel_runtime_health_with_recovery`
+    /// pass (the shutdown flag is already set, so the runtime's own recovery
+    /// attempt runs with `shutting_down=true`, giving a proven loss its one net
+    /// install per `recover_post_ready_loss`), classifies the result through
+    /// [`recovery_call_decision`], and exits 0 only when the observation is
+    /// genuinely healthy. A manager stop must never report a clean exit while a
+    /// runtime loss is unresolved or unproven-safe; no retry budget applies here
+    /// because this state runs the probe exactly once.
+    fn stop_final_health_outcome(&self) -> SupervisionOutcome {
+        let (observed, recovery_result) = self.kernel_runtime_health_with_recovery();
+        match recovery_call_decision(
+            self.is_fatal_control_path_requested(),
+            self.is_shutdown_requested(),
+            observed,
+            recovery_result,
+        ) {
+            RecoveryCallDecision::FatalControlPath => return SupervisionOutcome::FatalControlPath,
+            RecoveryCallDecision::RepairRequired {
+                reason,
+                install_result,
+            } => {
+                self.record_recovery_attempt(reason, install_result);
+                return SupervisionOutcome::RepairRequired {
+                    reason,
+                    install_result,
+                };
+            }
+            RecoveryCallDecision::Inconsistent => {
+                // SAFETY: stderr is the last-resort operator channel when a returned
+                // install result conflicts with its health observation at stop time.
+                eprintln!("castle-wall-daemon: recovery install result returned without a Recovering observation; refusing READY");
+                return SupervisionOutcome::FatalControlPath;
+            }
+            RecoveryCallDecision::ShutdownRequested | RecoveryCallDecision::Continue => {}
+        }
+        self.runtime_health.publish(observed);
+        if observed == RuntimeHealthState::Ready {
+            self.runtime_health.clear_safety_net();
+        } else if let Some(safety_net) = self.safety_net_audit_state() {
+            self.runtime_health.publish_safety_net(safety_net);
+        } else {
+            self.runtime_health.clear_safety_net();
+        }
+        match observed {
+            // Exit 0 (the clean-stop path) only for a genuinely healthy observation.
+            RuntimeHealthState::NoRuntime | RuntimeHealthState::Ready => {
+                SupervisionOutcome::ShutdownRequested
+            }
+            RuntimeHealthState::Lost(reason) => {
+                self.record_runtime_loss(reason, false);
+                SupervisionOutcome::KernelRuntimeLost(reason)
+            }
+            RuntimeHealthState::Indeterminate => {
+                if let Some(runtime) = &self.enforcement {
+                    if let Ok(runtime) = runtime.lock() {
+                        runtime.hook_post_ready_indeterminate();
+                    } else {
+                        // SAFETY: stderr is the operator channel for the terminal
+                        // dispatch record when the runtime lock itself is poisoned.
+                        eprintln!("castle-wall-daemon: terminal_dispatch=runtime_lock_poisoned");
+                    }
+                } else {
+                    // SAFETY: same operator channel; no runtime exists to dispatch through.
+                    eprintln!("castle-wall-daemon: terminal_dispatch=runtime_absent");
+                }
+                let reason = crate::enforcement::NotReadyReason::HealthProbeIndeterminate;
+                self.record_runtime_loss(reason, false);
+                SupervisionOutcome::KernelRuntimeLost(reason)
+            }
+            RuntimeHealthState::ProbeUnavailable => {
+                // A stop-time pass gets no retry budget (S_STOP_FINAL_HEALTH runs the
+                // probe exactly once); unresolved contention at stop is not proven
+                // healthy, so it fails closed instead of exiting 0.
+                let reason = crate::enforcement::NotReadyReason::HealthProbeUnavailable;
+                self.record_runtime_loss(reason, false);
+                SupervisionOutcome::KernelRuntimeLost(reason)
+            }
+            RuntimeHealthState::Recovering(reason) => {
+                // Reachable only when this pass' own result did not win the
+                // RepairRequired match above (a throttled retry returned NoInstall
+                // while a prior attempt's Recovering tag is still published). Not
+                // proven healthy: fail closed rather than exit 0.
+                self.record_runtime_loss(reason, false);
+                SupervisionOutcome::KernelRuntimeLost(reason)
             }
         }
     }
@@ -1120,23 +1215,30 @@ fn recovery_call_decision(
     observed: RuntimeHealthState,
     result: crate::enforcement::PostReadyRecoveryResult,
 ) -> RecoveryCallDecision {
+    // C2a1(b) precedence (LINUX-STOP-LOSS-RACE-01): fatal always outranks
+    // every install result; a returned InstallSucceeded/InstallFailed with a
+    // Recovering observation outranks shutdown, because a stop that raced a
+    // proven loss must still report the repair, not silently exit clean.
+    // Only after both checks does a bare shutdown request win.
     if fatal {
         return RecoveryCallDecision::FatalControlPath;
+    }
+    use crate::enforcement::PostReadyRecoveryResult::{InstallFailed, InstallSucceeded};
+    if matches!(result, InstallSucceeded | InstallFailed) {
+        if let RuntimeHealthState::Recovering(reason) = observed {
+            return RecoveryCallDecision::RepairRequired {
+                reason,
+                install_result: result,
+            };
+        }
     }
     if shutdown {
         return RecoveryCallDecision::ShutdownRequested;
     }
-    use crate::enforcement::PostReadyRecoveryResult::{InstallFailed, InstallSucceeded};
     if !matches!(result, InstallSucceeded | InstallFailed) {
         return RecoveryCallDecision::Continue;
     }
-    match observed {
-        RuntimeHealthState::Recovering(reason) => RecoveryCallDecision::RepairRequired {
-            reason,
-            install_result: result,
-        },
-        _ => RecoveryCallDecision::Inconsistent,
-    }
+    RecoveryCallDecision::Inconsistent
 }
 
 /// Summary of a daemon run; surfaced to the operator on shutdown.
@@ -1733,10 +1835,16 @@ mod tests {
             shutting_down: bool,
         ) -> crate::enforcement::PostReadyRecoveryResult {
             use crate::enforcement::{ComponentKind, PostReadyRecoveryResult as R};
-            if shutting_down || self.kind != ComponentKind::NftablesTable {
+            if self.kind != ComponentKind::NftablesTable {
                 return R::NoInstall;
             }
             let call = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            // C2a1(a) site 6 (LINUX-STOP-LOSS-RACE-01): shutdown gates only a
+            // retry (any call after this component's first substantive attempt),
+            // never the first entry for a proven loss.
+            if shutting_down && call > 1 {
+                return R::NoInstall;
+            }
             if self.later_interval && call == 1 {
                 // Survive the real initial poll with a prior recovery observation.
                 *self.health.lock().unwrap() = crate::enforcement::ComponentHealth::Recovering;
@@ -1926,6 +2034,88 @@ mod tests {
         );
     }
 
+    /// U1 decision matrix (LINUX-STOP-LOSS-RACE-01): fatal x shutdown x
+    /// {none, InstallSucceeded, InstallFailed}. Fatal always wins; a returned
+    /// InstallSucceeded/InstallFailed with a Recovering observation outranks
+    /// shutdown (C2a1(b)); a bare shutdown with no returned install still wins
+    /// over Continue.
+    #[test]
+    fn u1_recovery_call_decision_matrix() {
+        use crate::enforcement::{ComponentKind, NotReadyReason, PostReadyRecoveryResult as R};
+        let recovering_reason = NotReadyReason::SafetyNetRecovering(ComponentKind::NftablesTable);
+        let recovering = RuntimeHealthState::Recovering(recovering_reason);
+        let ready = RuntimeHealthState::Ready;
+
+        // Fatal outranks everything, in or out of shutdown, with or without a
+        // returned install.
+        for shutdown in [false, true] {
+            for (observed, result) in [
+                (ready, R::NoInstall),
+                (recovering, R::InstallSucceeded),
+                (recovering, R::InstallFailed),
+            ] {
+                assert_eq!(
+                    recovery_call_decision(true, shutdown, observed, result),
+                    RecoveryCallDecision::FatalControlPath,
+                    "fatal must win regardless of shutdown={shutdown} or result={result:?}"
+                );
+            }
+        }
+
+        // Not fatal, not shutdown, no install returned: Continue.
+        assert_eq!(
+            recovery_call_decision(false, false, ready, R::NoInstall),
+            RecoveryCallDecision::Continue
+        );
+
+        // Not fatal, shutdown, no install returned: ShutdownRequested.
+        assert_eq!(
+            recovery_call_decision(false, true, ready, R::NoInstall),
+            RecoveryCallDecision::ShutdownRequested
+        );
+
+        // Not fatal, NOT shutdown, InstallSucceeded/InstallFailed with a
+        // Recovering observation: RepairRequired (today's baseline behavior).
+        for result in [R::InstallSucceeded, R::InstallFailed] {
+            assert_eq!(
+                recovery_call_decision(false, false, recovering, result),
+                RecoveryCallDecision::RepairRequired {
+                    reason: recovering_reason,
+                    install_result: result,
+                }
+            );
+        }
+
+        // C2a1(b), the changed row: shutdown IS set, but a returned install with a
+        // Recovering observation still outranks it and reports RepairRequired
+        // rather than ShutdownRequested. Fails on dd2e5b06 (pre-fix returns
+        // ShutdownRequested here).
+        for result in [R::InstallSucceeded, R::InstallFailed] {
+            assert_eq!(
+                recovery_call_decision(false, true, recovering, result),
+                RecoveryCallDecision::RepairRequired {
+                    reason: recovering_reason,
+                    install_result: result,
+                },
+                "an install result must outrank a bare shutdown flag"
+            );
+        }
+
+        // A returned install result WITHOUT a Recovering observation never wins
+        // the (b) precedence (that precedence is keyed on the Recovering
+        // observation, not merely on "some install result came back"), so a bare
+        // shutdown flag still wins over it, exactly as before C2a1.
+        assert_eq!(
+            recovery_call_decision(false, true, ready, R::InstallSucceeded),
+            RecoveryCallDecision::ShutdownRequested
+        );
+        // Out of shutdown, the same mismatched combination is Inconsistent.
+        assert_eq!(
+            recovery_call_decision(false, false, ready, R::InstallSucceeded),
+            RecoveryCallDecision::Inconsistent
+        );
+    }
+
     #[test]
     fn initial_poll_handles_attempt_precedence_protocol_and_audit_matrix() {
         run_attempt_precedence_protocol_and_audit_matrix(false);
@@ -1979,11 +2169,16 @@ mod tests {
                 Expected::Fatal,
             ),
             (
+                // C2a1(b) (LINUX-STOP-LOSS-RACE-01): a returned InstallFailed with a
+                // Recovering observation now outranks a shutdown flag that flips true
+                // during this same call (row 4a in the design memo: InstallFailed
+                // under shutdown still reports RepairRequired, not a clean exit).
+                // Pre-fix this case expected Shutdown; that was the bug.
                 R::InstallFailed,
                 ComponentHealth::Recovering,
                 AttemptSideEffect::Shutdown,
                 false,
-                Expected::Shutdown,
+                Expected::Repair,
             ),
             (
                 R::InstallSucceeded,
@@ -2165,6 +2360,67 @@ mod tests {
             );
             let _ = handle.stop();
         }
+    }
+
+    /// U3 (LINUX-STOP-LOSS-RACE-01): shutdown already set BEFORE the loop even
+    /// starts (site 1, the initial pre-loop call), with a proven Lost
+    /// component. The daemon must still take the C2a1(b) RepairRequired
+    /// precedence: install once and leave a recovery WAL row, never report a
+    /// bare `ShutdownRequested` (exit 0) while the loss is unresolved. Fails
+    /// on dd2e5b06 (pre-fix: shutdown wins outright, no install, no WAL row).
+    #[test]
+    fn u3_shutdown_set_before_loop_top_with_lost_component_repairs() {
+        use crate::enforcement::PostReadyRecoveryResult as R;
+        use crate::enforcement::{ComponentHealth, ComponentKind, NotReadyReason};
+
+        let dir = TempDir::new().unwrap();
+        let (config, _) = fresh_config_in(&dir);
+        let mut handle = boot(config).unwrap();
+        let attempts = install_initial_attempt_fixture(
+            &mut handle,
+            R::InstallSucceeded,
+            ComponentHealth::Recovering,
+            AttemptSideEffect::None,
+            false,
+        );
+        // Shutdown is requested before supervision even begins its first poll.
+        handle.request_stop();
+
+        let outcome =
+            handle.supervise_until_shutdown(Duration::from_millis(1), Duration::from_secs(60));
+
+        let reason = NotReadyReason::SafetyNetRecovering(ComponentKind::NftablesTable);
+        assert_eq!(
+            outcome,
+            SupervisionOutcome::RepairRequired {
+                reason,
+                install_result: R::InstallSucceeded,
+            },
+            "a shutdown set before the loop must not exit clean while a proven loss is unresolved"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "exactly one install attempt, even though shutdown was already requested"
+        );
+
+        let rows = handle
+            .decision_engine()
+            .wal_writer()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .snapshot_after(None, 32)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| {
+                entry.event_canonical_json.contains("kernel_runtime_lost")
+                    && entry.event_canonical_json.contains("recovery=")
+            })
+            .count();
+        assert_eq!(rows, 1, "the recovery attempt must leave a WAL row");
+
+        let _ = handle.stop();
     }
 
     #[test]
