@@ -469,11 +469,19 @@ impl DaemonHandle {
     }
 
     pub fn kernel_runtime_health(&self) -> RuntimeHealthState {
-        self.kernel_runtime_health_with_recovery().0
+        self.kernel_runtime_health_with_recovery(false).0
     }
 
+    /// `force_fresh` (R3, LINUX-STOP-LOSS-RACE-01, Claude F3): when true,
+    /// bypasses the nft component's `NFT_HEALTH_MIN_INTERVAL` cache so the
+    /// returned observation is a live proof, not a reading that may be up to
+    /// `NFT_HEALTH_MIN_INTERVAL` old. Only `stop_final_health_outcome` passes
+    /// true: `S_STOP_FINAL_HEALTH` runs exactly one pass and its exit-0 arm
+    /// must never be reached on a cached `Ready` that predates a loss which
+    /// happened inside the cache window.
     fn kernel_runtime_health_with_recovery(
         &self,
+        force_fresh: bool,
     ) -> (
         RuntimeHealthState,
         crate::enforcement::PostReadyRecoveryResult,
@@ -546,21 +554,44 @@ impl DaemonHandle {
                         // attempt produced, so a successful install shows up as
                         // `Recovering` (not readiness) and the exit arm is not reached
                         // with an attempt outstanding.
+                        //
+                        // R2 (LINUX-STOP-LOSS-RACE-01, Grok 2 / Claude F2): the shutdown
+                        // state is read LIVE, from inside this closure, by
+                        // `recover_post_ready_loss` itself -- at the moment it actually
+                        // decides -- rather than copied into a `bool` here before the
+                        // component's own health probe (the call that decided Lost/
+                        // Recovering and is what gates whether the runtime even reaches
+                        // this closure) has run. A stop landing inside that probe is a
+                        // stop `is_shutdown_requested()` now observes.
+                        //
                         // TEST-ISOLATION ONLY (W1b, LINUX-STOP-LOSS-RACE-01): must match
-                        // `arm_test_shutdown_at_pre_recovery`'s doc comment. Flips the real
-                        // shutdown flag at the exact call boundary the site-5 precedence fix
-                        // protects, one-shot (swap-and-clear so a later retry poll is not
-                        // re-armed), BEFORE `is_shutdown_requested()` is read for this call.
-                        #[cfg(feature = "test-isolation")]
-                        if self
-                            .test_shutdown_at_pre_recovery
-                            .swap(false, Ordering::SeqCst)
-                        {
-                            self.request_stop();
-                        }
-                        let recovery =
-                            runtime.attempt_post_ready_recovery(self.is_shutdown_requested());
-                        let observed = match runtime.status() {
+                        // `arm_test_shutdown_at_pre_recovery`'s doc comment. The seam lives
+                        // INSIDE this closure, not before the call, so it can only ever
+                        // fire on an invocation `recover_post_ready_loss` actually reaches
+                        // -- which happens only after this component's own health probe
+                        // already returned a proven Lost or Recovering (the guard in
+                        // `EnforcementRuntime::attempt_post_ready_recovery`, below). A
+                        // health call whose probe saw a healthy table never calls this
+                        // closure at all, so it cannot consume the one-shot latch. One-shot
+                        // (swap-and-clear so a later retry poll is not re-armed).
+                        let recovery = runtime.attempt_post_ready_recovery(
+                            &|| {
+                                #[cfg(feature = "test-isolation")]
+                                if self
+                                    .test_shutdown_at_pre_recovery
+                                    .swap(false, Ordering::SeqCst)
+                                {
+                                    self.request_stop();
+                                }
+                                self.is_shutdown_requested()
+                            },
+                            force_fresh,
+                        );
+                        let observed = match if force_fresh {
+                            runtime.status_fresh()
+                        } else {
+                            runtime.status()
+                        } {
                             crate::enforcement::EnforcementStatus::KernelRuntimeReady => {
                                 RuntimeHealthState::Ready
                             }
@@ -630,7 +661,7 @@ impl DaemonHandle {
         // Publish the boot-time truth before the first tick so a status query
         // arriving in the first health interval reads a real observation rather
         // than "nothing published yet".
-        let (initial_health, initial_recovery) = self.kernel_runtime_health_with_recovery();
+        let (initial_health, initial_recovery) = self.kernel_runtime_health_with_recovery(false);
         match recovery_call_decision(
             self.is_fatal_control_path_requested(),
             self.is_shutdown_requested(),
@@ -709,7 +740,7 @@ impl DaemonHandle {
                         return SupervisionOutcome::FatalControlPath;
                     }
                 };
-                let (observed, recovery_result) = self.kernel_runtime_health_with_recovery();
+                let (observed, recovery_result) = self.kernel_runtime_health_with_recovery(false);
                 // A returned attempt is terminal before any observation publication or
                 // retry; fresh control flags take precedence over that result.
                 match recovery_call_decision(
@@ -822,14 +853,22 @@ impl DaemonHandle {
     /// the state a shutdown-requested supervision loop enters instead of
     /// exiting immediately. Runs exactly one `kernel_runtime_health_with_recovery`
     /// pass (the shutdown flag is already set, so the runtime's own recovery
-    /// attempt runs with `shutting_down=true`, giving a proven loss its one net
-    /// install per `recover_post_ready_loss`), classifies the result through
-    /// [`recovery_call_decision`], and exits 0 only when the observation is
-    /// genuinely healthy. A manager stop must never report a clean exit while a
-    /// runtime loss is unresolved or unproven-safe; no retry budget applies here
-    /// because this state runs the probe exactly once.
+    /// attempt runs with a closure reading `shutting_down=true`, giving a
+    /// proven loss its one net-install ATTEMPT per `recover_post_ready_loss` --
+    /// Grok 4 (LINUX-STOP-LOSS-RACE-01): an attempt, not a guaranteed install;
+    /// the A155 host-wide skip is itself one such attempt that installs
+    /// nothing and records a residual instead, per gate I4), classifies the
+    /// result through [`recovery_call_decision`], and exits 0 only when the
+    /// observation is genuinely healthy. A manager stop must never report a
+    /// clean exit while a runtime loss is unresolved or unproven-safe; no
+    /// retry budget applies here because this state runs the probe exactly
+    /// once.
     fn stop_final_health_outcome(&self) -> SupervisionOutcome {
-        let (observed, recovery_result) = self.kernel_runtime_health_with_recovery();
+        // R3 (LINUX-STOP-LOSS-RACE-01, Claude F3): force_fresh=true bypasses the
+        // nft component's NFT_HEALTH_MIN_INTERVAL cache, so this one stop-time
+        // pass cannot read a loss younger than the cache window as a stale
+        // cached Ready.
+        let (observed, recovery_result) = self.kernel_runtime_health_with_recovery(true);
         match recovery_call_decision(
             self.is_fatal_control_path_requested(),
             self.is_shutdown_requested(),
@@ -898,10 +937,15 @@ impl DaemonHandle {
                 SupervisionOutcome::KernelRuntimeLost(reason)
             }
             RuntimeHealthState::Recovering(reason) => {
-                // Reachable only when this pass' own result did not win the
-                // RepairRequired match above (a throttled retry returned NoInstall
-                // while a prior attempt's Recovering tag is still published). Not
-                // proven healthy: fail closed rather than exit 0.
+                // Grok 4 (LINUX-STOP-LOSS-RACE-01): reachable whenever this
+                // pass' own result did not win the RepairRequired match above
+                // -- NOT only the throttled-retry case (a NoInstall while a
+                // prior attempt's Recovering tag is still published), but also
+                // a FIRST entry that hit the A155 host-wide skip on this same
+                // pass (an install was attempted, Recovering was published,
+                // and the skip itself returns NoInstall because there is no
+                // known confined identity to scope it to). Neither is proven
+                // healthy: fail closed rather than exit 0, in both cases.
                 self.record_runtime_loss(reason, false);
                 SupervisionOutcome::KernelRuntimeLost(reason)
             }
@@ -1231,14 +1275,36 @@ fn recovery_call_decision(
                 install_result: result,
             };
         }
+        // R1 (LINUX-STOP-LOSS-RACE-01, Claude F1 case 4 / gate I2): an install
+        // result WITHOUT a Recovering observation is a protocol violation
+        // (the caller that ran the install always publishes Recovering while
+        // the attempt is in flight or just completed). That must read as
+        // Inconsistent -> FatalControlPath(75) regardless of shutdown; a
+        // stop in flight must never turn a protocol violation into a clean
+        // exit. This is checked BEFORE the shutdown branch below so shutdown
+        // can never route around it.
+        return RecoveryCallDecision::Inconsistent;
     }
     if shutdown {
-        return RecoveryCallDecision::ShutdownRequested;
+        // R1 (LINUX-STOP-LOSS-RACE-01, Claude F1 / Grok 1, gate I4): a
+        // shutdown request reads as a clean stop ONLY when the observation is
+        // genuinely healthy. No install was returned this call (the branch
+        // above already handled every case where one was), so the only
+        // question left is whether the daemon is actually up: Ready or
+        // NoRuntime exits clean; Lost, Recovering (an outstanding attempt
+        // this call did not win, e.g. a throttled retry or the A155
+        // host-wide skip), Indeterminate and ProbeUnavailable must all take
+        // the exact same nonzero arm they take out of shutdown, so this
+        // falls through to Continue and lets the caller's own observation
+        // match decide, precisely as it would with shutdown=false.
+        if matches!(
+            observed,
+            RuntimeHealthState::Ready | RuntimeHealthState::NoRuntime
+        ) {
+            return RecoveryCallDecision::ShutdownRequested;
+        }
     }
-    if !matches!(result, InstallSucceeded | InstallFailed) {
-        return RecoveryCallDecision::Continue;
-    }
-    RecoveryCallDecision::Inconsistent
+    RecoveryCallDecision::Continue
 }
 
 /// Summary of a daemon run; surfaced to the operator on shutdown.
@@ -1832,16 +1898,20 @@ mod tests {
         }
         fn attempt_post_ready_recovery(
             &self,
-            shutting_down: bool,
+            shutting_down: &dyn Fn() -> bool,
         ) -> crate::enforcement::PostReadyRecoveryResult {
             use crate::enforcement::{ComponentKind, PostReadyRecoveryResult as R};
             if self.kind != ComponentKind::NftablesTable {
                 return R::NoInstall;
             }
+            let shutting_down = shutting_down();
             let call = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
-            // C2a1(a) site 6 (LINUX-STOP-LOSS-RACE-01): shutdown gates only a
-            // retry (any call after this component's first substantive attempt),
-            // never the first entry for a proven loss.
+            // C2a1(a) site 6 (LINUX-STOP-LOSS-RACE-01, F6): shutdown gates only
+            // a retry -- any call after the first, whatever that first call
+            // did -- never the first entry for a proven loss. `call` counts
+            // every invocation of this method, including an early return below
+            // that performs no install attempt, so "the first call" (not "the
+            // first substantive attempt") is the literally true description.
             if shutting_down && call > 1 {
                 return R::NoInstall;
             }
@@ -2101,19 +2171,60 @@ mod tests {
             );
         }
 
-        // A returned install result WITHOUT a Recovering observation never wins
-        // the (b) precedence (that precedence is keyed on the Recovering
-        // observation, not merely on "some install result came back"), so a bare
-        // shutdown flag still wins over it, exactly as before C2a1.
+        // R1 (LINUX-STOP-LOSS-RACE-01, Claude F1 case 4): a returned install
+        // result WITHOUT a Recovering observation never wins the (b)
+        // precedence (that precedence is keyed on the Recovering observation,
+        // not merely on "some install result came back"); it is ALWAYS
+        // Inconsistent -> FatalControlPath(75), in or out of shutdown. Before
+        // the R1 fix, shutdown=true masked this protocol violation as a clean
+        // ShutdownRequested exit-0; this assertion is that fail-before
+        // witness (it fails on 75a779a1, which returns ShutdownRequested here).
+        for shutdown in [false, true] {
+            assert_eq!(
+                recovery_call_decision(false, shutdown, ready, R::InstallSucceeded),
+                RecoveryCallDecision::Inconsistent,
+                "an install result without a Recovering observation must stay \
+                 Inconsistent regardless of shutdown={shutdown}"
+            );
+        }
+
+        // R1 case 1/2 (LINUX-STOP-LOSS-RACE-01, Claude F1 case 1 / Grok
+        // finding 1, gate I4): a bare shutdown with NO returned install and an
+        // observation that is NOT genuinely healthy must never read as a
+        // clean stop. This is the A155 host-wide skip (Recovering published,
+        // NoInstall returned) and the gated throttled-retry path (same
+        // combination). Fails on 75a779a1, which returns ShutdownRequested
+        // here (the bug both Claude F1 and Grok finding 1 report).
         assert_eq!(
-            recovery_call_decision(false, true, ready, R::InstallSucceeded),
-            RecoveryCallDecision::ShutdownRequested
+            recovery_call_decision(false, true, recovering, R::NoInstall),
+            RecoveryCallDecision::Continue,
+            "an A155 host-wide skip or a throttled retry must not read as a clean stop"
         );
-        // Out of shutdown, the same mismatched combination is Inconsistent.
+
+        // R1 case 3 (LINUX-STOP-LOSS-RACE-01, Claude F1 case 3): a proven Lost
+        // with NO recovery call at all (e.g. AuditWalPoisoned, which never
+        // reaches the runtime's recovery controller) must not read as a clean
+        // stop either. Fails on 75a779a1 for the same reason as case 1/2.
+        let lost = RuntimeHealthState::Lost(crate::enforcement::NotReadyReason::AuditWalPoisoned);
         assert_eq!(
-            recovery_call_decision(false, false, ready, R::InstallSucceeded),
-            RecoveryCallDecision::Inconsistent
+            recovery_call_decision(false, true, lost, R::NoInstall),
+            RecoveryCallDecision::Continue,
+            "a proven loss with no recovery call must not read as a clean stop"
         );
+
+        // The remaining not-genuinely-healthy observations, for completeness
+        // (I7: enumerate every reachable combination, not just the named
+        // examples).
+        for observed in [
+            RuntimeHealthState::Indeterminate,
+            RuntimeHealthState::ProbeUnavailable,
+        ] {
+            assert_eq!(
+                recovery_call_decision(false, true, observed, R::NoInstall),
+                RecoveryCallDecision::Continue,
+                "observed={observed:?} must not read as a clean stop under shutdown"
+            );
+        }
     }
 
     #[test]

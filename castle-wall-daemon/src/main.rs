@@ -59,7 +59,8 @@ fn print_help() {
 }
 
 fn has_structural_flag(args: &[String], wanted: &str) -> bool {
-    let value_options = [
+    #[allow(unused_mut)]
+    let mut value_options: Vec<&str> = vec![
         "--fortress-id",
         "--socket-path",
         "--policy-dir",
@@ -70,15 +71,23 @@ fn has_structural_flag(args: &[String], wanted: &str) -> bool {
         "--trusted-service-uid",
         "--isolated-runtime-root",
         "--isolated-castle-table-tag",
-        // W1a/W1b (LINUX-STOP-LOSS-RACE-01): value-taking test-isolation seams.
-        // Listed here (like the two isolation flags above) only so this scan
-        // correctly skips their value while looking for `--disarm` /
-        // `--preflight-manifest`; the flags themselves are parsed and stripped
-        // only under `#[cfg(feature = "test-isolation")]` in `main`, and the
-        // real behavior they arm never compiles into a release build.
-        "--test-health-interval-ms",
-        "--test-shutdown-at",
     ];
+    // F5 (LINUX-STOP-LOSS-RACE-01, Claude F5, gate I5): the two W1a/W1b
+    // value-taking test-isolation seams are listed here ONLY under
+    // `test-isolation`, so this scan correctly skips their value while
+    // looking for `--disarm` / `--preflight-manifest` in a test-isolation
+    // build. A release build never carries these two entries, so its argv
+    // scan is byte-identical to base: `--test-health-interval-ms` /
+    // `--test-shutdown-at` are unrecognized structural flags there and their
+    // value is scanned as an ordinary positional argument, exactly as before
+    // this seam existed. The flags themselves are parsed and stripped only
+    // under `#[cfg(feature = "test-isolation")]` in `main`, and the real
+    // behavior they arm never compiles into a release build either way.
+    #[cfg(feature = "test-isolation")]
+    {
+        value_options.push("--test-health-interval-ms");
+        value_options.push("--test-shutdown-at");
+    }
     // Invariant: `args` is already `std::env::args().skip(1)` (the program name
     // is stripped by the caller), so scanning MUST start at index 0. Starting at
     // 1 silently skips a structural flag that is the FIRST argument, which is
@@ -568,5 +577,24 @@ mod tests {
         let lost = daemon::SupervisionOutcome::KernelRuntimeLost(reason);
         assert_eq!(supervision_exit_status(&lost, true), 75);
         assert_eq!(supervision_exit_status(&lost, false), 75);
+    }
+
+    /// F5 (LINUX-STOP-LOSS-RACE-01, Claude F5, gate I5): in a build with the
+    /// `test-isolation` feature OFF (this test file's own default build,
+    /// unless `cargo test --features test-isolation` is explicitly requested),
+    /// the two W1a/W1b seam names must be absent from `value_options`, so a
+    /// trailing unrecognized flag never gets treated as a value-taking one and
+    /// swallows the token after it. Before the F5 fix this args slice found no
+    /// `--disarm` (the seam name unconditionally consumed `--disarm` as its own
+    /// value); after the fix the scan is byte-identical to base and finds it.
+    #[test]
+    #[cfg(not(feature = "test-isolation"))]
+    fn default_build_disarm_detection_unchanged_by_a_trailing_unknown_flag() {
+        let args = vec!["--test-shutdown-at".to_string(), "--disarm".to_string()];
+        assert!(
+            has_structural_flag(&args, "--disarm"),
+            "a default (non-test-isolation) build must not treat the test-only seam name \
+             as a value-taking flag; the argv scan here must match base exactly"
+        );
     }
 }
