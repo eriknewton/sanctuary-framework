@@ -89,18 +89,40 @@ export function selectApprovalChannelByPolicy(
             // F5 (dashboard-bind-degrade, 2026-09-24): request the SAME
             // EADDRINUSE classification `DashboardApprovalChannel.start`
             // already gives the supervised LaunchAgent boot (dashboard.ts,
-            // `exitCleanOnAddrInUse`) rather than a second one — AGENTS rule
-            // 5, one source. This ONLY changes what a busy port does inside
-            // `start()` (resolve with `addrInUse()` true instead of reject);
-            // it does not exit or degrade anything by itself. The MCP stdio
-            // boot (index.ts) is the caller that decides what "busy port"
-            // means for it: check `addrInUse()` after this resolves and swap
-            // in a deny-all approval channel, never auto-approve. The
-            // standalone dashboard boot (dashboard-standalone.ts) and the
-            // supervised LaunchAgent path call `DashboardApprovalChannel`
+            // `exitCleanOnAddrInUse`), AGENTS rule 5, one source. This
+            // ONLY changes what a busy port does inside `start()` (resolve
+            // with `addrInUse()` true instead of reject); it does not
+            // itself decide what a busy port means for the caller.
+            //
+            // This selector is reached by EVERY `createSanctuaryServer`
+            // caller, not only the daily-fortress MCP stdio boot: the CLI's
+            // stdio path (including an operator's explicit `sanctuary
+            // --dashboard`, cli.ts), the evidence-pack CLI (evidence-pack/
+            // cli.ts), and the EU AI Act compliance CLI (compliance/
+            // eu_ai_act/cli.ts) all construct the server through this same
+            // function. All of them now degrade to deny-all on a busy
+            // dashboard port instead of refusing startup; none of them is
+            // exempted. `index.ts` is the caller this repo currently wires
+            // to check `addrInUse()` and swap in a deny-all approval
+            // channel; the other two callers inherit the resolve-instead-
+            // of-reject change but do not (yet) add that swap themselves.
+            //
+            // `silentAddrInUse: true`: the supervised-path stderr line this
+            // same EADDRINUSE branch prints ("standing down (single-
+            // owner)") describes standing DOWN, which this process does
+            // not do -- it keeps serving MCP tools. Suppress that one line
+            // here so only the caller's own, accurate message prints; the
+            // supervised LaunchAgent path (dashboard-standalone.ts) never
+            // passes this flag, so its message is unchanged.
+            //
+            // The standalone dashboard boot (dashboard-standalone.ts) and
+            // the supervised LaunchAgent path call `DashboardApprovalChannel`
             // directly and never go through this selector, so they are
             // unaffected by this change.
-            await dashboard.start({ exitCleanOnAddrInUse: true });
+            await dashboard.start({
+              exitCleanOnAddrInUse: true,
+              silentAddrInUse: true,
+            });
           } catch (err) {
             throw new Error(
               `Sanctuary cannot start: principal policy selects approval_channel.type=dashboard, ` +
