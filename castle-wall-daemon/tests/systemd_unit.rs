@@ -17,12 +17,11 @@
 //!   binds (there is no in-process bind timeout anymore).
 //! * `TimeoutStopSec` + `KillMode=control-group` — bound shutdown and reap an
 //!   isolated nft health child if its fork/netlink transaction wedged.
-//! * `Restart=on-failure` — fail-before and post-ready health loss exit nonzero;
-//!   systemd must restart so the preserved kernel object is re-adopted.
 //! * `WantedBy=multi-user.target` — the reboot-survival / persistence path.
 
 use castle_wall_daemon::ownership_journal::DEFAULT_OWNERSHIP_JOURNAL_PATH;
 use castle_wall_daemon::runtime_lock::DEFAULT_HOST_LOCK_PATH;
+use sha2::{Digest, Sha256};
 
 fn unit_text() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -44,12 +43,46 @@ fn directive_values<'a>(unit: &'a str, key: &str) -> Vec<&'a str> {
         .collect()
 }
 
+fn section_text<'a>(unit: &'a str, name: &str) -> &'a str {
+    let header = format!("[{name}]");
+    let start = unit.find(&header).expect("required unit section") + header.len();
+    let tail = &unit[start..];
+    let end = tail.find("\n[").unwrap_or(tail.len());
+    &tail[..end]
+}
+
+fn section_values<'a>(section: &'a str, key: &str) -> Vec<&'a str> {
+    section
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split_once('='))
+        .filter(|(name, _)| name.trim() == key)
+        .map(|(_, value)| value.trim())
+        .collect()
+}
+
 #[test]
 fn unit_is_type_notify() {
     assert_eq!(
         directive_values(&unit_text(), "Type"),
         vec!["notify"],
         "the daemon fires sd_notify READY=1; the unit must be Type=notify"
+    );
+}
+
+#[test]
+fn shipped_wall_unit_identity_bytes_are_pinned() {
+    let unit = unit_text();
+    // The audited unit has one [Service] section with User=root and
+    // Group=sanctuary. Pin its exact bytes: the generic section helper below
+    // does not model systemd's comments, continuations, or repeated sections.
+    // Any unit edit needs a fresh review of the effective identity before this
+    // digest is updated. Drop-ins and host configuration require host checks.
+    assert_eq!(
+        format!("{:x}", Sha256::digest(unit.as_bytes())),
+        "d9efca36caf21d362921ff086a06b1ebbc608499e6b6ca68b8f9c233fb546d10",
+        "the audited castle-wall service identity or unit bytes changed"
     );
 }
 
@@ -62,6 +95,30 @@ fn unit_restarts_after_fail_before_or_runtime_loss() {
     );
 }
 
+#[test]
+fn repair_required_exit_is_failed_without_automatic_restart() {
+    let unit = unit_text();
+    let service = section_text(&unit, "Service");
+    let prevent: Vec<&str> = section_values(service, "RestartPreventExitStatus")
+        .iter()
+        .flat_map(|value| value.split_whitespace())
+        .collect();
+    assert!(
+        prevent.contains(&"78"),
+        "exit 78 must suppress automatic restart in [Service]"
+    );
+    for directive in ["SuccessExitStatus", "RestartForceExitStatus"] {
+        let values: Vec<&str> = section_values(service, directive)
+            .iter()
+            .flat_map(|value| value.split_whitespace())
+            .collect();
+        assert!(
+            !values.contains(&"78"),
+            "{directive} must not reclassify exit 78"
+        );
+    }
+    assert_eq!(section_values(service, "Restart"), vec!["on-failure"]);
+}
 #[test]
 fn unit_requires_explicit_trusted_service_uid_configuration() {
     let unit = unit_text();

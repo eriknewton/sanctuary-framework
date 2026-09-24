@@ -793,14 +793,14 @@ fn install_deny_all_net_for_recovery(
             safety_net_sweep_hook_pr3(
                 kill_set,
                 Some(attempted_scope),
-                "runtime loss: the safety net install failed and will be retried",
+                "runtime loss: the safety net install failed; protection could not be proved",
             );
             // SAFETY: stderr is the operator channel for a kernel-egress escalation.
             // systemd's journal is where an operator reconstructs this sequence.
             eprintln!(
                 "castle-wall-daemon: owned nft table lost at runtime and installing the \
-                 safety net FAILED; the castle table is left standing and the net is \
-                 retried on the next poll: {net_err}"
+                 safety net FAILED; the castle table is left standing and protection \
+                 could not be proved: {net_err}"
             );
             false
         }
@@ -2856,14 +2856,14 @@ impl NftablesTableComponent {
         } else {
             crate::nftables::SafetyNetAuditState::InstallFailed {
                 attempted_scope: resolution.scope.shape_tag().to_string(),
-                error: "the safety net install failed and will be retried".to_string(),
+                error: "the safety net install failed; protection could not be proved".to_string(),
             }
         });
         if installed {
             // Best-effort persist AFTER the install, and a failure here never undoes it.
             if let Some(persist_err) = self.persist_boot_row_best_effort(&resolution) {
                 // SAFETY: stderr is the operator channel. The net is in force; the
-                // journal write is what did not happen, and the next start retries it.
+                // journal write is what did not happen; no retry or restart is promised here.
                 eprintln!(
                     "castle-wall-daemon: the safety net is in force after a runtime loss, but \
                      the confined history could not be written to the journal: {persist_err}"
@@ -2871,9 +2871,10 @@ impl NftablesTableComponent {
             }
         }
         // INVARIANT: `recovering` STAYS SET whether or not the install succeeded.
-        // Clearing it on success would let the next tick read the latched loss and
-        // exit. A later positive wall proof, terminal indeterminate reading, or
-        // operator shutdown ends this controller; otherwise it retries on interval.
+        // The supervisor's initial post-READY poll consumes this returned result
+        // in the same turn and exits repair-required; a successful net install
+        // does not establish journal durability. Later interval polls retain
+        // their existing behavior.
         if installed {
             PostReadyRecoveryResult::InstallSucceeded
         } else {

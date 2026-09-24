@@ -456,11 +456,13 @@ async function readRegularFileNoSymlink(path: string): Promise<Uint8Array> {
   // refusal atomic. Falling back to zero turns the preceding lstat into a
   // check-then-open race: an attacker could replace an allowlisted memory file
   // with a symlink between those calls and redirect the read outside memories/.
-  const noFollow = requireCodexNoFollowFlag(fsConstants.O_NOFOLLOW);
+  requireCodexNoFollowFlag(fsConstants.O_NOFOLLOW);
   // Read only. No O_CREAT or write flag is present. The explicit O_NOFOLLOW is
   // the security boundary for a final-component swap, including when a test
   // fixture lives under the operating system's temporary directory.
-  const handle = await open(path, fsConstants.O_RDONLY | noFollow);
+  // Mode is ignored for this read-only open; pin it to owner-only permissions
+  // so a future flag change cannot accidentally create a permissive file.
+  const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW, 0o600);
   try {
     const fileStat = await handle.stat();
     if (!fileStat.isFile()) {
