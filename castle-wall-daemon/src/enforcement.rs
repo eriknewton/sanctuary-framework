@@ -246,10 +246,15 @@ pub trait AcquiredComponent: Send {
     /// install the safety net and then persist best-effort, and publishes `Recovering`
     /// through its health while an attempt is outstanding.
     ///
-    /// `shutting_down` is observed so `systemctl stop` is a clean exit rather than a
-    /// box that keeps re-arming while it is being taken down. The result describes
-    /// this call only; it is not a retained claim about kernel state.
-    fn attempt_post_ready_recovery(&self, shutting_down: bool) -> PostReadyRecoveryResult {
+    /// `shutting_down` is a closure (LINUX-STOP-LOSS-RACE-01 W1b seam
+    /// relocation) so an implementor reads the current shutdown state at the
+    /// moment it actually decides, not a value copied before this call. The
+    /// result describes this call only; it is not a retained claim about
+    /// kernel state.
+    fn attempt_post_ready_recovery(
+        &self,
+        shutting_down: &dyn Fn() -> bool,
+    ) -> PostReadyRecoveryResult {
         let _ = shutting_down;
         PostReadyRecoveryResult::NoInstall
     }
@@ -713,8 +718,15 @@ impl EnforcementRuntime {
     /// `Recovering` are not driven here: the first needs nothing, the second is the
     /// absence of evidence, and the third already has an attempt outstanding.
     ///
+    /// `shutting_down` is read live by the selected component's own
+    /// `attempt_post_ready_recovery` (LINUX-STOP-LOSS-RACE-01 W1b seam
+    /// relocation), not copied into a `bool` here.
+    ///
     /// Return the result of the selected component's call to the supervisor.
-    pub fn attempt_post_ready_recovery(&self, shutting_down: bool) -> PostReadyRecoveryResult {
+    pub fn attempt_post_ready_recovery(
+        &self,
+        shutting_down: &dyn Fn() -> bool,
+    ) -> PostReadyRecoveryResult {
         let mut result = PostReadyRecoveryResult::NoInstall;
         for component in &self.components {
             // BOTH readings drive the controller. `Lost` is the entry; `Recovering` is
@@ -988,7 +1000,11 @@ mod test_support {
             self.post_ready_indeterminate_calls
                 .fetch_add(1, Ordering::SeqCst);
         }
-        fn attempt_post_ready_recovery(&self, shutting_down: bool) -> PostReadyRecoveryResult {
+        fn attempt_post_ready_recovery(
+            &self,
+            shutting_down: &dyn Fn() -> bool,
+        ) -> PostReadyRecoveryResult {
+            let shutting_down = shutting_down();
             self.recovery_calls.fetch_add(1, Ordering::SeqCst);
             if shutting_down {
                 self.recovery_saw_shutdown.store(true, Ordering::SeqCst);
@@ -1295,7 +1311,7 @@ mod test_support {
 
         // READY: no recovery is driven, because there is nothing to re-arm.
         assert_eq!(
-            runtime.attempt_post_ready_recovery(false),
+            runtime.attempt_post_ready_recovery(&|| false),
             PostReadyRecoveryResult::NoInstall
         );
         assert_eq!(counters.recovery.load(Ordering::SeqCst), 0);
@@ -1304,7 +1320,7 @@ mod test_support {
         // so no kernel action may be taken from it.
         *health.lock().unwrap() = ComponentHealth::ProbeUnavailable;
         assert_eq!(
-            runtime.attempt_post_ready_recovery(false),
+            runtime.attempt_post_ready_recovery(&|| false),
             PostReadyRecoveryResult::NoInstall
         );
         assert_eq!(counters.recovery.load(Ordering::SeqCst), 0);
@@ -1327,7 +1343,7 @@ mod test_support {
         // LOST, a completed negative proof: recovery IS driven.
         *health.lock().unwrap() = ComponentHealth::Lost;
         assert_eq!(
-            runtime.attempt_post_ready_recovery(false),
+            runtime.attempt_post_ready_recovery(&|| false),
             PostReadyRecoveryResult::InstallSucceeded
         );
         assert_eq!(counters.recovery.load(Ordering::SeqCst), 1);
@@ -1335,7 +1351,7 @@ mod test_support {
         // The shutdown flag is threaded through, so `systemctl stop` is a clean exit
         // rather than a box that keeps re-arming while it is taken down.
         assert_eq!(
-            runtime.attempt_post_ready_recovery(true),
+            runtime.attempt_post_ready_recovery(&|| true),
             PostReadyRecoveryResult::NoInstall
         );
         assert!(counters.recovery_saw_shutdown.load(Ordering::SeqCst));
@@ -1347,7 +1363,7 @@ mod test_support {
         let before = counters.recovery.load(Ordering::SeqCst);
         *health.lock().unwrap() = ComponentHealth::Recovering;
         assert_eq!(
-            runtime.attempt_post_ready_recovery(false),
+            runtime.attempt_post_ready_recovery(&|| false),
             PostReadyRecoveryResult::InstallSucceeded
         );
         assert_eq!(

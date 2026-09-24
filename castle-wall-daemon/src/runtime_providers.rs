@@ -2762,15 +2762,25 @@ impl NftablesTableComponent {
     /// The sweep hook fires only after a FAILED install, never on entry.
     ///
     /// Return this call's exact result so the supervisor can audit real attempts.
+    /// LINUX-STOP-LOSS-RACE-01 (W1b seam relocation, applied to this
+    /// fail-before base so the wired W1b witness races the correct call):
+    /// `shutting_down` is a closure, read live at the moment this function
+    /// decides, so the W1b test seam (armed from inside this closure by the
+    /// caller) can only ever fire on a call this function is actually
+    /// reached for -- i.e. after the runtime's own health probe already
+    /// observed Lost/Recovering -- never on an earlier call against a
+    /// healthy table. This changes ONLY where the read happens, not the
+    /// unconditional-skip behavior below, which is the defect this
+    /// fail-before base still carries.
     fn recover_post_ready_loss(
         &self,
-        shutting_down: bool,
+        shutting_down: &dyn Fn() -> bool,
     ) -> crate::enforcement::PostReadyRecoveryResult {
         use crate::enforcement::PostReadyRecoveryResult;
         use std::sync::atomic::Ordering;
         // The shutdown flag is observed so `systemctl stop` is a clean exit rather than
         // a box that keeps re-arming while it is being taken down.
-        if shutting_down {
+        if shutting_down() {
             self.recovering.store(false, Ordering::SeqCst);
             return PostReadyRecoveryResult::NoInstall;
         }
@@ -2965,7 +2975,7 @@ impl AcquiredComponent for NftablesTableComponent {
     /// while an attempt is outstanding.
     fn attempt_post_ready_recovery(
         &self,
-        shutting_down: bool,
+        shutting_down: &dyn Fn() -> bool,
     ) -> crate::enforcement::PostReadyRecoveryResult {
         self.recover_post_ready_loss(shutting_down)
     }

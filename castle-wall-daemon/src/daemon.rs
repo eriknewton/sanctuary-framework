@@ -546,20 +546,28 @@ impl DaemonHandle {
                         // attempt produced, so a successful install shows up as
                         // `Recovering` (not readiness) and the exit arm is not reached
                         // with an attempt outstanding.
-                        // TEST-ISOLATION ONLY (W1b, LINUX-STOP-LOSS-RACE-01): must match
-                        // `arm_test_shutdown_at_pre_recovery`'s doc comment. Flips the real
-                        // shutdown flag at the exact call boundary the site-5 precedence fix
-                        // protects, one-shot (swap-and-clear so a later retry poll is not
-                        // re-armed), BEFORE `is_shutdown_requested()` is read for this call.
-                        #[cfg(feature = "test-isolation")]
-                        if self
-                            .test_shutdown_at_pre_recovery
-                            .swap(false, Ordering::SeqCst)
-                        {
-                            self.request_stop();
-                        }
-                        let recovery =
-                            runtime.attempt_post_ready_recovery(self.is_shutdown_requested());
+                        // TEST-ISOLATION ONLY (W1b, LINUX-STOP-LOSS-RACE-01, seam
+                        // relocation applied to this fail-before base): must match
+                        // `arm_test_shutdown_at_pre_recovery`'s doc comment. The
+                        // seam lives INSIDE this closure, not before the call, so
+                        // it can only ever fire on an invocation
+                        // `recover_post_ready_loss` actually reaches -- which
+                        // happens only after this component's own health probe
+                        // already returned a proven Lost or Recovering. A health
+                        // call whose probe saw a healthy table never calls this
+                        // closure at all, so it cannot consume the one-shot latch.
+                        // One-shot (swap-and-clear so a later retry poll is not
+                        // re-armed).
+                        let recovery = runtime.attempt_post_ready_recovery(&|| {
+                            #[cfg(feature = "test-isolation")]
+                            if self
+                                .test_shutdown_at_pre_recovery
+                                .swap(false, Ordering::SeqCst)
+                            {
+                                self.request_stop();
+                            }
+                            self.is_shutdown_requested()
+                        });
                         let observed = match runtime.status() {
                             crate::enforcement::EnforcementStatus::KernelRuntimeReady => {
                                 RuntimeHealthState::Ready
@@ -1730,10 +1738,10 @@ mod tests {
         }
         fn attempt_post_ready_recovery(
             &self,
-            shutting_down: bool,
+            shutting_down: &dyn Fn() -> bool,
         ) -> crate::enforcement::PostReadyRecoveryResult {
             use crate::enforcement::{ComponentKind, PostReadyRecoveryResult as R};
-            if shutting_down || self.kind != ComponentKind::NftablesTable {
+            if shutting_down() || self.kind != ComponentKind::NftablesTable {
                 return R::NoInstall;
             }
             let call = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
