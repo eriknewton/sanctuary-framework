@@ -49,7 +49,9 @@ use castle_wall_daemon::manifest::verify::{
     AgentOrigin, AllowlistManifest, ManifestRuleEntry, ManifestSignature, SignedManifest,
 };
 use castle_wall_daemon::manifest::{MANIFEST_FILENAME, RULES_SUBDIR};
-use castle_wall_daemon::nftables::{self, CASTLE_FAMILY, CASTLE_TABLE, ISOLATED_TABLE_PREFIX};
+use castle_wall_daemon::nftables::{
+    self, SafetyNetScope, CASTLE_FAMILY, CASTLE_TABLE, ISOLATED_TABLE_PREFIX,
+};
 use castle_wall_daemon::ownership_journal::{
     self, DEFAULT_JOURNAL_AUTH_KEY_PATH, DEFAULT_OWNERSHIP_JOURNAL_PATH,
 };
@@ -57,6 +59,9 @@ use castle_wall_daemon::runtime_lock::DEFAULT_HOST_LOCK_PATH;
 use castle_wall_daemon::runtime_providers::{
     self, force_next_agent_binding_readback_mismatch_for_test,
     force_next_agent_binding_write_ahead_error_for_test,
+};
+use castle_wall_daemon::safety_net_uid::{
+    validate_safety_net_uid, ConfinedUidSet, HostOverflowUid,
 };
 use castle_wall_daemon::DaemonConfig;
 use ed25519_dalek::{Signer, SigningKey};
@@ -1903,6 +1908,279 @@ fn readback_line_is_emitted_on_a_boot_that_reaches_readiness() {
     assert!(
         write_ahead_seen,
         "the pinned write-ahead line must appear for a boot that installed the binding"
+    );
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+// --- W1a/W1b: wired-consumer tests for C2a1(a), register id
+// LINUX-STOP-LOSS-RACE-01 (design memo `Linux_C2a_FailClosed_Architecture_v2`
+// §4 test table). AGENTS.md rule 4: a capability that claims a live effect
+// needs a test that constructs the real production object graph and proves
+// the consumer is reached; U1-U4 (this crate's unit tests) prove the decision
+// function and the runtime-provider skip removal in isolation, not that the
+// real `main` binary reaches them. These two tests close that gap.
+
+/// Spawn the shipped daemon exactly like [`spawn_long_running_daemon`], with
+/// additional argv appended after the isolation args. Kept as a separate
+/// function (rather than widening the existing signature) so W1a/W1b's
+/// test-isolation-only seam arguments cannot leak onto the three call sites
+/// above that must keep exercising the daemon's ordinary long-running argv.
+fn spawn_long_running_daemon_with_extra_args(
+    dir: &TempDir,
+    pinned: &std::path::Path,
+    notify_socket: &std::path::Path,
+    extra_args: &[&str],
+) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_castle-wall-daemon"))
+        .args([
+            "--fortress-id",
+            "deadbeef",
+            "--socket-path",
+            dir.path().join("filter.sock").to_str().unwrap(),
+            "--policy-dir",
+            dir.path().to_str().unwrap(),
+            "--wal-path",
+            dir.path().join("wal.jsonl").to_str().unwrap(),
+            "--pinned-public-key",
+            pinned.to_str().unwrap(),
+            "--producer-key",
+            dir.path().join("audit-producer.key").to_str().unwrap(),
+            "--producer-pub-key",
+            dir.path().join("audit-producer.pub").to_str().unwrap(),
+        ])
+        .args(isolation_args())
+        .args(extra_args)
+        .env("NOTIFY_SOCKET", notify_socket)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the shipped daemon binary (long-running, with test seam args)")
+}
+
+/// Wait up to `timeout` for `child` to exit on its own, polling like
+/// [`wait_for_ready`] rather than blocking indefinitely. On timeout the child
+/// is SIGKILLed and reaped so a wedged daemon cannot hang the suite; the
+/// caller sees that as a failed bound, not a hang.
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> Result<std::process::ExitStatus, String> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| format!("could not inspect daemon child: {err}"))?
+        {
+            return Ok(status);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "daemon did not exit within {timeout:?} of the loss/shutdown seam"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Build an `Identity` scope through the ONLY admitted constructor path,
+/// mirroring `identity_scope` in `integration_gf1_recovery.rs` (AGENTS.md rule
+/// 5: one source rather than a second hand-mirrored copy would be preferable,
+/// but the two suites are separate compilation units with no shared non-`isolation`
+/// module today, so this is the smallest faithful duplication).
+fn identity_scope(uids: &[u32]) -> SafetyNetScope {
+    let overflow = HostOverflowUid::from_host().expect("a Linux host exposes kernel.overflowuid");
+    let validated: Vec<_> = uids
+        .iter()
+        .map(|&uid| validate_safety_net_uid(uid, overflow).expect("an attestable uid"))
+        .collect();
+    SafetyNetScope::Identity(ConfinedUidSet::from_validated(validated).expect("a non-empty set"))
+}
+
+/// Whether the WAL this run wrote holds a `kernel_runtime_lost` control row
+/// carrying a recovery attempt. Deliberately a raw substring scan rather than
+/// parsing the nested canonical-JSON-inside-JSON `WalEntry` shape
+/// (`audit.rs`'s `append_control_audit_bounded_with_safety_net` embeds the
+/// operation event as an escaped string field): the row's `operation` and
+/// `detail` text survive that escaping unbroken, and this test only needs to
+/// prove the row is present, not parse its full structure.
+fn wal_contains_recovery_row(dir: &TempDir) -> bool {
+    let Ok(contents) = std::fs::read_to_string(dir.path().join("wal.jsonl")) else {
+        return false;
+    };
+    contents.contains("kernel_runtime_lost") && contents.contains("recovery=")
+}
+
+/// W1a (memo §4 test table): the real `main` binary, `--test-health-interval-ms`
+/// set large so no periodic tick follows the initial one, then a proven loss
+/// (the isolated table deleted out from under a READY daemon) racing a manager
+/// stop (SIGTERM). Exercises sites 2/3 (`stop_final_health_outcome` /
+/// `S_STOP_FINAL_HEALTH`): on `174475fe` this exits 0 with the table absent
+/// (mutants M2/M3 restore that bare shutdown-wins-over-loss ordering); after
+/// C2a1(a) it must exit 78 with a freshly installed, recognised net.
+#[test]
+fn stop_racing_a_proven_loss_installs_the_net_w1a() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    let pinned = write_pinned_key(&dir, &signing);
+    // A known confined identity, so the stop-time install is Identity-scoped
+    // (A155): with no confined identity a HostWide install is skipped under
+    // shutdown and only a residual audit row is recorded instead.
+    write_confining_manifest(dir.path(), &signing);
+
+    let notify_path = dir.path().join("notify-w1a.sock");
+    let listener = UnixDatagram::bind(&notify_path).expect("bind notify socket");
+    // 600000ms (10 minutes): far longer than this test's bounded wait below, so
+    // the periodic health tick cannot fire a second time and race the SIGTERM;
+    // the daemon's OWN stop-time final health pass must be what proves the loss.
+    const NO_SECOND_TICK_MS: &str = "600000";
+    let mut child = spawn_long_running_daemon_with_extra_args(
+        &dir,
+        &pinned,
+        &notify_path,
+        &["--test-health-interval-ms", NO_SECOND_TICK_MS],
+    );
+
+    if let Err(reason) = wait_for_ready(&mut child, &listener, Duration::from_secs(10)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        cleanup_castle_table();
+        cleanup_journal();
+        skip_or_fail_unprivileged(&reason);
+        return;
+    }
+
+    // Inject the loss: delete the isolated owned table out from under the
+    // ready daemon, the same real-kernel loss an external delete or `nft
+    // flush` would produce.
+    cleanup_castle_table();
+    assert!(
+        !nftables::table_exists().unwrap_or(true),
+        "the loss injection must actually remove the isolated table before SIGTERM races it"
+    );
+
+    let pid = child.id().to_string();
+    let _ = Command::new("kill").args(["-TERM", pid.as_str()]).status();
+    let status = match wait_for_exit(&mut child, Duration::from_secs(15)) {
+        Ok(status) => status,
+        Err(reason) => {
+            cleanup_castle_table();
+            cleanup_journal();
+            panic!("{reason}");
+        }
+    };
+
+    assert_eq!(
+        status.code(),
+        Some(78),
+        "a proven loss racing a manager stop must exit 78 (RepairRequired), never 0; got {status:?}"
+    );
+    assert!(
+        nftables::table_exists().unwrap_or(false),
+        "the stop-time recovery must have installed a fresh table before exit"
+    );
+    assert!(
+        matches!(
+            nftables::live_net_covers_attempt(&identity_scope(&[TEST_AGENT_UID])),
+            Ok(true)
+        ),
+        "the installed table must be the recognised Identity-scoped deny-all net for the \
+         confined uid (A155: a known confined identity gets Identity scope, never HostWide)"
+    );
+    assert!(
+        wal_contains_recovery_row(&dir),
+        "the audit WAL must hold a kernel_runtime_lost row carrying the recovery attempt result"
+    );
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+/// W1b (memo §4 test table, site 5): the real `main` binary with the
+/// `--test-shutdown-at pre-recovery` seam armed, which flips the real
+/// shutdown flag on the first live shutdown read inside the recovery
+/// controller, after the component's probe has already seen the loss, so it
+/// proves the site-5 precedence fix (a first-entry proven loss still gets its
+/// one net-install attempt when a stop lands between the probe and the
+/// decision) without racing an OS signal.
+/// No SIGTERM is sent in this test; the daemon stops itself. On `174475fe`
+/// this exits 0 with `NoInstall` (mutant M1's skip, and M3); after C2a1(a) it
+/// must exit 78 with the net live.
+#[test]
+fn shutdown_observed_at_pre_recovery_still_installs_the_net_w1b() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    let pinned = write_pinned_key(&dir, &signing);
+    write_confining_manifest(dir.path(), &signing);
+
+    let notify_path = dir.path().join("notify-w1b.sock");
+    let listener = UnixDatagram::bind(&notify_path).expect("bind notify socket");
+    // A short interval: the seam must fire on the NEXT periodic health call
+    // after the loss is injected below, well inside this test's bounded wait.
+    const HEALTH_TICK_MS: &str = "200";
+    let mut child = spawn_long_running_daemon_with_extra_args(
+        &dir,
+        &pinned,
+        &notify_path,
+        &[
+            "--test-health-interval-ms",
+            HEALTH_TICK_MS,
+            "--test-shutdown-at",
+            "pre-recovery",
+        ],
+    );
+
+    if let Err(reason) = wait_for_ready(&mut child, &listener, Duration::from_secs(10)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        cleanup_castle_table();
+        cleanup_journal();
+        skip_or_fail_unprivileged(&reason);
+        return;
+    }
+
+    cleanup_castle_table();
+    assert!(
+        !nftables::table_exists().unwrap_or(true),
+        "the loss injection must actually remove the isolated table before the next health tick"
+    );
+
+    // No external signal: the armed seam sets the shutdown flag itself on the
+    // next health call, immediately before the recovery attempt it protects.
+    let status = match wait_for_exit(&mut child, Duration::from_secs(15)) {
+        Ok(status) => status,
+        Err(reason) => {
+            cleanup_castle_table();
+            cleanup_journal();
+            panic!("{reason}");
+        }
+    };
+
+    assert_eq!(
+        status.code(),
+        Some(78),
+        "shutdown observed at the pre-recovery call boundary must still exit 78 \
+         (RepairRequired), never 0; got {status:?}"
+    );
+    assert!(
+        nftables::table_exists().unwrap_or(false),
+        "the recovery attempt this seam races must have installed a fresh table"
+    );
+    assert!(
+        matches!(
+            nftables::live_net_covers_attempt(&identity_scope(&[TEST_AGENT_UID])),
+            Ok(true)
+        ),
+        "the installed table must be the recognised Identity-scoped deny-all net"
     );
 
     cleanup_castle_table();

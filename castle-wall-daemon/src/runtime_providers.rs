@@ -2762,20 +2762,33 @@ impl NftablesTableComponent {
     /// The sweep hook fires only after a FAILED install, never on entry.
     ///
     /// Return this call's exact result so the supervisor can audit real attempts.
+    ///
+    /// R2 (LINUX-STOP-LOSS-RACE-01, Grok 2 / Claude F2): `shutting_down` is a
+    /// closure, called fresh at EACH decision point below rather than once into
+    /// a stored `bool`. The caller's own health probe (which is what gated
+    /// whether this function is reached at all) can take up to
+    /// `NFT_HEALTH_QUERY_TIMEOUT`; a stop landing during that probe must be
+    /// visible to every gate in this function, not just the one a value copied
+    /// before the probe would have seen.
     fn recover_post_ready_loss(
         &self,
-        shutting_down: bool,
+        shutting_down: &dyn Fn() -> bool,
     ) -> crate::enforcement::PostReadyRecoveryResult {
         use crate::enforcement::PostReadyRecoveryResult;
         use std::sync::atomic::Ordering;
-        // The shutdown flag is observed so `systemctl stop` is a clean exit rather than
-        // a box that keeps re-arming while it is being taken down.
-        if shutting_down {
-            self.recovering.store(false, Ordering::SeqCst);
+        // C2a1(a) site 5 (LINUX-STOP-LOSS-RACE-01): a stop never leaves a proven loss
+        // without its one net attempt. Shutdown no longer skips this call outright;
+        // it gates only the RETRYING re-probe path below (no `OwnedWallReady`
+        // readiness restoration during a stop) and the throttled-retry interval. A
+        // first entry for a proven loss still consumes the Lost proof and attempts
+        // the install exactly once, even while shutting down.
+        let retrying = self.is_recovering();
+        if shutting_down() && retrying {
+            // A stop must not restore readiness or keep re-probing; only the FIRST
+            // entry for a fresh proven loss gets the one-shot install below.
             return PostReadyRecoveryResult::NoInstall;
         }
         self.mark_prior_install_unverified();
-        let retrying = self.is_recovering();
         // The first entry already consumed a completed negative proof supplied by
         // the runtime. Only LATER polls ask whether the original owned wall has
         // returned. Doing this before the install clock recognizes a repair
@@ -2839,6 +2852,61 @@ impl NftablesTableComponent {
             *last = Some(std::time::Instant::now());
         }
         let resolution = self.net_scope_from_retained_set();
+        // A155 (Erik, 2026-09-24): a routine stop never installs a host-wide net.
+        // `SafetyNetScope::HostWide` here means no confined uid is known (or the
+        // retained set overflowed), so a stop-time install would have nothing
+        // legitimate to scope the drop to and would instead silence the operator's
+        // own live sessions on every ordinary `systemctl stop`. With a known
+        // confined identity (`SafetyNetScope::Identity`) this branch is not taken
+        // and the install proceeds as normal, in or out of shutdown.
+        //
+        // R2 (LINUX-STOP-LOSS-RACE-01, Grok 2): `shutting_down()` is read AGAIN
+        // here, live, rather than reusing the value the `retrying` gate above
+        // read. A stop that lands between that gate and this one (inside the
+        // scope resolution above, which can shell out to `nft`) must still be
+        // seen here, or a host-wide net could be installed after a stop was
+        // already requested.
+        if shutting_down() && matches!(resolution.scope, crate::nftables::SafetyNetScope::HostWide)
+        {
+            // F8 (LINUX-STOP-LOSS-RACE-01, Claude F8): do NOT overwrite attempt
+            // history here. `mark_prior_install_unverified()` above already
+            // demoted a prior `Installed` to `Unverified`; any other prior tag
+            // (`Unverified`, `InstallFailed`, or the untouched `NotAttempted`
+            // default) is left exactly as it was. Stamping `NotAttempted`
+            // unconditionally would erase the fact that THIS process attempted
+            // and installed earlier in its own lifetime (reachable whenever
+            // `recovering == false` because an earlier loss already recovered
+            // to `OwnedWallReady` before this new one). The skip itself is
+            // recorded durably by the residual audit row below, which is the
+            // record this branch owns; the safety-net tag records install
+            // history, not this reason.
+            const RESIDUAL_REASON: &str = "stop_time_net_skipped_no_known_identity";
+            if let Err(audit_err) = self.decision_engine.append_control_audit_bounded(
+                RESIDUAL_REASON,
+                "stop-time proven loss observed no known confined identity (HostWide scope); \
+                 A155 refuses a host-wide install at stop, so no net was installed",
+                crate::decision::FAILURE_AUDIT_BUDGET,
+            ) {
+                // SAFETY: stderr is the operator channel of last resort when even
+                // the bounded residual audit row cannot be written.
+                eprintln!(
+                    "castle-wall-daemon: {RESIDUAL_REASON} (audit row failed: {audit_err:?})"
+                );
+            } else {
+                // SAFETY: stderr is the operator channel naming the A155 residual;
+                // the durable record is the audit row appended just above.
+                eprintln!("castle-wall-daemon: {RESIDUAL_REASON}");
+            }
+            // Return the same result the no-install paths above return (Unavailable/
+            // Indeterminate), so the caller reads this the same way: not a proven
+            // install, and NOT mapped to a clean exit-0. `recovering` was set true
+            // above (before this branch), so the `Recovering` observation this
+            // process now publishes keeps every supervisor exit arm nonzero
+            // (R1, LINUX-STOP-LOSS-RACE-01: `recovery_call_decision` only reads
+            // ShutdownRequested off a Ready/NoRuntime observation, at every call
+            // site, not only the ones that already ran a full health match).
+            return PostReadyRecoveryResult::NoInstall;
+        }
         // INSTALL FIRST. The persist follows.
         let installed = install_deny_all_net_for_recovery(
             || crate::nftables::install_deny_all_safety_net(&resolution.scope),
@@ -2906,6 +2974,74 @@ impl NftablesTableComponent {
     fn is_recovering(&self) -> bool {
         self.recovering.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Shared body for [`AcquiredComponent::health`] and
+    /// [`AcquiredComponent::health_fresh`] (R3, LINUX-STOP-LOSS-RACE-01, Claude
+    /// F3). `fresh=false` uses `BoundedHealthProbe::poll_result`, which may
+    /// return a reading cached for up to `NFT_HEALTH_MIN_INTERVAL`;
+    /// `fresh=true` uses `reprobe_after_latch`, which clears that cache before
+    /// running the same check, so the result is a live proof. Must match the
+    /// latch-handling invariant documented on `reprobe_after_latch` itself:
+    /// this is bypassing a cache, not weakening the readiness claim.
+    fn health_impl(&self, fresh: bool) -> crate::enforcement::ComponentHealth {
+        use crate::enforcement::ComponentHealth;
+        if self.released || self.lock.is_none() {
+            return ComponentHealth::Lost;
+        }
+        // Live re-poll of the EXACT owned identity AND the expected agent
+        // binding (handles + marker + pristine shape via structured nft -j,
+        // compared against the frozen uid expectation captured below), not
+        // mere table-name existence and not a name-only shape check. (blocker
+        // 2) A table deleted, flushed, mutated, or DELETED-AND-RECREATED with
+        // the same shape (new handles, or our marker absent), OR one whose
+        // per-agent binding no longer matches that expectation, fails this
+        // check, dropping the runtime out of KernelRuntimeReady on the next
+        // status query.
+        //
+        // The proof is COMPLETION-latched, not attempt-latched: a completed
+        // negative proof means ownership provably no longer holds and withdraws
+        // readiness permanently for this process (systemd restart re-adopts the
+        // preserved exact table). A deadline overrun proves nothing, so it is
+        // reported indeterminate and only latches after
+        // NFT_HEALTH_MAX_CONSECUTIVE_UNAVAILABLE consecutive no-answers — the
+        // fail-closed backstop for a wedged `nft` without the false restart a
+        // single transient timeout used to cause.
+        let ownership = self.ownership.clone();
+        // Live health is the third comparison site. The expectation is read from
+        // the FROZEN identity cell here, before the probe is scheduled, and moved
+        // into the closure that may run on a worker thread. Capturing it is sound
+        // precisely because the cell is write-once: the value a later poll would
+        // read is the same value, so there is nothing to go stale against. Before
+        // the freeze this had to be a fresh read at each comparison, and that is
+        // the sentence this comment replaces.
+        let expectation = current_expected_agent_binding(&self.decision_engine);
+        let check = move || {
+            // Health requires the BINDING, not just the table: the agent's chain
+            // and jump are the only rules that confine the uid, and a table that
+            // still verifies after they were deleted would hold readiness over an
+            // agent with no wall in front of it.
+            classify_nft_ownership_probe(crate::nftables::verify_owned_castle_table_binding(
+                &ownership,
+                &expectation,
+            ))
+        };
+        let outcome = if fresh {
+            self.probe.reprobe_after_latch(check)
+        } else {
+            self.probe.poll_result(check)
+        };
+        if outcome == crate::health_probe::ProbeOutcome::Indeterminate {
+            // The terminal no-answer bypasses the recovery controller, so it
+            // must withdraw any prior installed claim before the exit WAL row.
+            self.mark_prior_install_unverified();
+        }
+        // REPORT ONLY: startup owns its install through `EnforcementRuntime::start`,
+        // and the supervisor owns the post-READY controller. A late completed Ready
+        // proof may clear our internal recovery flag/clock here without touching the
+        // kernel. Transient no-answer stays Recovering while this owner is active;
+        // exhausted Indeterminate still reaches the supervisor's hook-before-exit arm.
+        post_ready_component_health(outcome, &self.recovering, &self.last_recovery_attempt)
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -2965,64 +3101,20 @@ impl AcquiredComponent for NftablesTableComponent {
     /// while an attempt is outstanding.
     fn attempt_post_ready_recovery(
         &self,
-        shutting_down: bool,
+        shutting_down: &dyn Fn() -> bool,
     ) -> crate::enforcement::PostReadyRecoveryResult {
         self.recover_post_ready_loss(shutting_down)
     }
 
     fn health(&self) -> crate::enforcement::ComponentHealth {
-        use crate::enforcement::ComponentHealth;
-        if self.released || self.lock.is_none() {
-            return ComponentHealth::Lost;
-        }
-        // Live re-poll of the EXACT owned identity AND the expected agent
-        // binding (handles + marker + pristine shape via structured nft -j,
-        // compared against the frozen uid expectation captured below), not
-        // mere table-name existence and not a name-only shape check. (blocker
-        // 2) A table deleted, flushed, mutated, or DELETED-AND-RECREATED with
-        // the same shape (new handles, or our marker absent), OR one whose
-        // per-agent binding no longer matches that expectation, fails this
-        // check, dropping the runtime out of KernelRuntimeReady on the next
-        // status query.
-        //
-        // The proof is COMPLETION-latched, not attempt-latched: a completed
-        // negative proof means ownership provably no longer holds and withdraws
-        // readiness permanently for this process (systemd restart re-adopts the
-        // preserved exact table). A deadline overrun proves nothing, so it is
-        // reported indeterminate and only latches after
-        // NFT_HEALTH_MAX_CONSECUTIVE_UNAVAILABLE consecutive no-answers — the
-        // fail-closed backstop for a wedged `nft` without the false restart a
-        // single transient timeout used to cause.
-        let ownership = self.ownership.clone();
-        // Live health is the third comparison site. The expectation is read from
-        // the FROZEN identity cell here, before the probe is scheduled, and moved
-        // into the closure that may run on a worker thread. Capturing it is sound
-        // precisely because the cell is write-once: the value a later poll would
-        // read is the same value, so there is nothing to go stale against. Before
-        // the freeze this had to be a fresh read at each comparison, and that is
-        // the sentence this comment replaces.
-        let expectation = current_expected_agent_binding(&self.decision_engine);
-        let outcome = self.probe.poll_result(move || {
-            // Health requires the BINDING, not just the table: the agent's chain
-            // and jump are the only rules that confine the uid, and a table that
-            // still verifies after they were deleted would hold readiness over an
-            // agent with no wall in front of it.
-            classify_nft_ownership_probe(crate::nftables::verify_owned_castle_table_binding(
-                &ownership,
-                &expectation,
-            ))
-        });
-        if outcome == crate::health_probe::ProbeOutcome::Indeterminate {
-            // The terminal no-answer bypasses the recovery controller, so it
-            // must withdraw any prior installed claim before the exit WAL row.
-            self.mark_prior_install_unverified();
-        }
-        // REPORT ONLY: startup owns its install through `EnforcementRuntime::start`,
-        // and the supervisor owns the post-READY controller. A late completed Ready
-        // proof may clear our internal recovery flag/clock here without touching the
-        // kernel. Transient no-answer stays Recovering while this owner is active;
-        // exhausted Indeterminate still reaches the supervisor's hook-before-exit arm.
-        post_ready_component_health(outcome, &self.recovering, &self.last_recovery_attempt)
+        self.health_impl(false)
+    }
+
+    /// R3 (LINUX-STOP-LOSS-RACE-01, Claude F3): the fresh variant `health_impl(true)`
+    /// selects, using `reprobe_after_latch` instead of `poll_result` so the read
+    /// bypasses `NFT_HEALTH_MIN_INTERVAL`. See `health_impl` for the shared body.
+    fn health_fresh(&self) -> crate::enforcement::ComponentHealth {
+        self.health_impl(true)
     }
 
     fn release(&mut self) {
@@ -4866,6 +4958,243 @@ mod tests {
             poll_interval: Duration::from_millis(200),
             nfqueue: NfqueueConfig::default(),
         }
+    }
+
+    /// A hand-built [`NftablesTableComponent`] bypassing `acquire` (no real host
+    /// lock or kernel table), for U2/U2b below. `net_scope_from_retained_set`
+    /// still shells out to `nft` to read live table bindings, so these tests
+    /// need real `nft` privileges (the same caveat as W1a/W1b). They are
+    /// ordinary `#[test]` functions with no skip guard (F7, Claude F7):
+    /// unlike the integration suite's privileged tests (which call
+    /// `skip_or_fail_unprivileged`), these run in the unprivileged unit lane
+    /// too, on every `cargo test`, and fail (not skip) without `nft`
+    /// privileges -- the same lane every other test in this module runs in.
+    #[cfg(target_os = "linux")]
+    fn fixture_component(
+        decision_engine: Arc<DecisionEngine>,
+        journal_dir: &Path,
+        retained_deny_uids: Vec<u32>,
+    ) -> NftablesTableComponent {
+        NftablesTableComponent {
+            lock: None,
+            ownership: crate::nftables::CastleTableOwnership {
+                table_handle: 1,
+                base_chain_handle: 2,
+                marker: "test-marker".to_string(),
+            },
+            decision_engine,
+            probe: crate::health_probe::BoundedHealthProbe::new(nft_health_budget()),
+            released: false,
+            journal_path: journal_dir.join("nonexistent-ownership.json"),
+            journal_key_path: journal_dir.join("nonexistent-ownership.key"),
+            retained_deny_uids: std::sync::Mutex::new(retained_deny_uids),
+            recovering: std::sync::atomic::AtomicBool::new(false),
+            last_recovery_attempt: std::sync::Mutex::new(None),
+            last_safety_net_state: std::sync::Mutex::new(
+                crate::nftables::SafetyNetAuditState::NotAttempted,
+            ),
+        }
+    }
+
+    /// U2 (LINUX-STOP-LOSS-RACE-01): `recover_post_ready_loss(&|| true)` on a
+    /// proven Lost with a known confined identity (Identity scope): installs
+    /// once. A
+    /// SECOND call under shutdown is the retrying re-probe path, which shutdown
+    /// still gates: no re-probe, no install, no readiness restore. Fails on
+    /// dd2e5b06, which returns `NoInstall` unconditionally under shutdown (the
+    /// first call never attempts anything).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn u2_first_entry_under_shutdown_installs_once_identity_scope() {
+        use crate::enforcement::PostReadyRecoveryResult as R;
+
+        let dir = TempDir::new().unwrap();
+        // F7 (LINUX-STOP-LOSS-RACE-01, Claude F7): 65_000 is a fixture uid, not
+        // a derived one; its only requirement is that it not collide with
+        // THIS host's `kernel.overflowuid` (validate_safety_net_uid refuses
+        // exactly that collision, which would resolve HostWide instead of the
+        // Identity scope this test needs). Assert the precondition rather than
+        // silently depending on it, so a host configured with overflowuid=65000
+        // fails loudly here instead of failing confusingly inside the install.
+        let overflow = crate::safety_net_uid::HostOverflowUid::from_host()
+            .expect("this host's kernel.overflowuid must be readable in CI");
+        assert_ne!(
+            65_000,
+            overflow.value(),
+            "fixture uid 65_000 must not equal this host's kernel.overflowuid, or it \
+             would be refused and resolve HostWide instead of the Identity scope this test needs"
+        );
+        let component = fixture_component(test_decision_engine(), dir.path(), vec![65_000]);
+
+        let first = component.recover_post_ready_loss(&|| true);
+        assert_ne!(
+            first,
+            R::NoInstall,
+            "a stop must not leave a first-entry proven loss without its one net attempt"
+        );
+        assert!(
+            component.is_recovering(),
+            "recovering must be set after the attempt, success or failure"
+        );
+
+        let second = component.recover_post_ready_loss(&|| true);
+        assert_eq!(
+            second,
+            R::NoInstall,
+            "a later poll under shutdown is the gated retrying re-probe path"
+        );
+    }
+
+    /// U2b (A155): HostWide scope (no known confined identity, or overflow)
+    /// under shutdown installs nothing and records the residual, instead of
+    /// installing a host-wide net that would silence the operator's own live
+    /// sessions on an ordinary `systemctl stop`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn u2b_hostwide_scope_under_shutdown_skips_install_and_records_residual() {
+        use crate::enforcement::PostReadyRecoveryResult as R;
+
+        let dir = TempDir::new().unwrap();
+        let (decision_engine, wal, _audit, _injection) = audit_backed_engine(&dir, None);
+        // Empty retained set, no journal/manifest history: net_scope_from_retained_set
+        // resolves HostWide (EmptyDenySet), i.e. no known confined identity.
+        let component = fixture_component(decision_engine, dir.path(), Vec::new());
+
+        let result = component.recover_post_ready_loss(&|| true);
+        assert_eq!(
+            result,
+            R::NoInstall,
+            "A155: a routine stop must never install a host-wide net"
+        );
+
+        let rows = wal
+            .lock()
+            .unwrap()
+            .snapshot_after(None, 32)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .event_canonical_json
+                    .contains("stop_time_net_skipped_no_known_identity")
+            })
+            .count();
+        assert_eq!(rows, 1, "the A155 residual must be recorded");
+    }
+
+    /// R2 (LINUX-STOP-LOSS-RACE-01, Grok 2): the exact race window Grok finding
+    /// 2 named -- a stop landing AFTER the health probe that gated this call but
+    /// BEFORE `recover_post_ready_loss` reaches its HostWide decision. Before
+    /// R2, the caller copied `is_shutdown_requested()` into a `bool` before the
+    /// probe ran, so a stop in that window was invisible to this function and a
+    /// HostWide install would proceed uninterrupted. Modelled here with a
+    /// closure that returns false on its first call (the `retrying` gate, which
+    /// this first entry must pass to reach the HostWide decision at all) and
+    /// true on every call after (simulating the stop arriving in the window),
+    /// so the LATER read -- the one the HostWide branch itself takes -- is what
+    /// must see it live. Fails if `recover_post_ready_loss` reads the closure
+    /// only once and discards the value, or reads it before the retrying gate
+    /// and reuses that stale reading for the HostWide branch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn u2c_shutdown_set_between_probe_and_hostwide_decision_installs_nothing() {
+        use crate::enforcement::PostReadyRecoveryResult as R;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let (decision_engine, wal, _audit, _injection) = audit_backed_engine(&dir, None);
+        // Empty retained set: HostWide scope, same precondition as u2b.
+        let component = fixture_component(decision_engine, dir.path(), Vec::new());
+
+        let calls = AtomicUsize::new(0);
+        let shutting_down = || calls.fetch_add(1, Ordering::SeqCst) > 0;
+
+        let result = component.recover_post_ready_loss(&shutting_down);
+        assert_eq!(
+            result,
+            R::NoInstall,
+            "a stop observed only between the probe and the HostWide decision must \
+             still skip the host-wide install, exactly as a stop observed before the \
+             call would -- the live read must reach the HostWide branch, not just the \
+             earlier retrying gate"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "the function must read the closure more than once: once for the \
+             retrying gate (which this first entry must pass as false) and again, \
+             live, for the HostWide decision"
+        );
+
+        let rows = wal
+            .lock()
+            .unwrap()
+            .snapshot_after(None, 32)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .event_canonical_json
+                    .contains("stop_time_net_skipped_no_known_identity")
+            })
+            .count();
+        assert_eq!(
+            rows, 1,
+            "the A155 residual must still be recorded when the stop is observed late"
+        );
+    }
+
+    /// F8 (LINUX-STOP-LOSS-RACE-01, Claude F8): the A155 host-wide skip must not
+    /// overwrite attempt history with `NotAttempted`. A component that
+    /// installed earlier in this SAME process (recovering==false again because
+    /// that earlier loss recovered to `OwnedWallReady`) and now hits a fresh
+    /// loss with a HostWide scope must retain `Unverified` (the demotion
+    /// `mark_prior_install_unverified` already applied to the prior
+    /// `Installed` tag), not have it erased back to `NotAttempted` -- that
+    /// would under-claim: it would say no install was EVER attempted this
+    /// process, when one was.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn u2d_hostwide_skip_preserves_prior_attempt_history_as_unverified() {
+        use crate::enforcement::PostReadyRecoveryResult as R;
+        use crate::nftables::SafetyNetAuditState as Tag;
+
+        let dir = TempDir::new().unwrap();
+        let (decision_engine, _wal, _audit, _injection) = audit_backed_engine(&dir, None);
+        let component = fixture_component(decision_engine, dir.path(), Vec::new());
+        // Simulate an earlier successful install THIS process already made and
+        // that has since gone unverified again (the state `record_safety_net_state`
+        // would carry into a later loss).
+        *component.last_safety_net_state.lock().unwrap() = Tag::Installed {
+            shape: "v1-host-wide",
+            reason: "unknown-history",
+            deny_set_size: 0,
+            deny_set_max: 1,
+            rules: vec![],
+            denied_uids: vec![],
+            sources: crate::nftables::SafetyNetSources {
+                journal: false,
+                manifest: false,
+                live_table: false,
+            },
+            kernel_nd_accepted: vec![],
+            unattestable_packets: "drop-except-kernel-nd",
+            coverage: "inet output hook",
+        };
+
+        let result = component.recover_post_ready_loss(&|| true);
+        assert_eq!(
+            result,
+            R::NoInstall,
+            "A155 still skips the host-wide install"
+        );
+
+        let tag = component.safety_net_audit_state().unwrap();
+        assert_eq!(
+            tag.tag(),
+            "unverified",
+            "a prior Installed claim demoted to Unverified must not be further \
+             overwritten to NotAttempted by the A155 skip; got {tag:?}"
+        );
     }
 
     // ---- drive_manifest_watcher_at: hard poll error terminates (blocker 5) ----

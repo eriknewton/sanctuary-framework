@@ -1234,7 +1234,7 @@ fn gf1_3_runtime_loss_installs_the_net_through_the_recovery_controller() {
 
     // 4) Drive the production entry the supervisor uses on a completed Lost proof.
     //    No restart happens anywhere in this test.
-    let in_force = component.attempt_post_ready_recovery(false);
+    let in_force = component.attempt_post_ready_recovery(&|| false);
     assert!(
         in_force.holds_gate(),
         "the recovery controller must report the net in force after a completed loss"
@@ -1280,7 +1280,10 @@ fn gf1_3_runtime_loss_installs_the_net_through_the_recovery_controller() {
     std::thread::sleep(RECOVERY_RETRY_INTERVAL + Duration::from_millis(100));
     let mut reinstalled = false;
     for _ in 0..8 {
-        if component.attempt_post_ready_recovery(false).holds_gate() {
+        if component
+            .attempt_post_ready_recovery(&|| false)
+            .holds_gate()
+        {
             reinstalled = true;
             break;
         }
@@ -1307,7 +1310,7 @@ fn gf1_3_runtime_loss_installs_the_net_through_the_recovery_controller() {
     // 7) The controller observes the shutdown flag, so `systemctl stop` is a clean
     //    exit rather than a box that keeps re-arming while it is taken down.
     assert!(
-        !component.attempt_post_ready_recovery(true).holds_gate(),
+        !component.attempt_post_ready_recovery(&|| true).holds_gate(),
         "a shutting-down daemon must not re-arm"
     );
     drop(component);
@@ -1534,7 +1537,7 @@ impl AcquiredComponent for IndeterminateAtTheWholeSetCheck {
 
     fn attempt_post_ready_recovery(
         &self,
-        shutting_down: bool,
+        shutting_down: &dyn Fn() -> bool,
     ) -> castle_wall_daemon::enforcement::PostReadyRecoveryResult {
         self.inner.attempt_post_ready_recovery(shutting_down)
     }
@@ -1855,7 +1858,9 @@ fn a_post_ready_non_nftables_loss_keeps_the_table_and_the_next_start_adopts_it()
     // the status is re-read. A component with no kernel gate of its own declines, so no
     // net is installed for it.
     assert!(
-        !runtime.attempt_post_ready_recovery(false).holds_gate(),
+        !runtime
+            .attempt_post_ready_recovery(&|| false, false)
+            .holds_gate(),
         "a non-nftables loss must not put any gate in the kernel"
     );
     assert_eq!(
