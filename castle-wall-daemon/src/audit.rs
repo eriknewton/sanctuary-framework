@@ -1875,18 +1875,32 @@ mod wal_tests {
         entry.event_canonical_json = crate::manifest::canonical_json::canonicalize(&event).unwrap();
     }
 
-    /// Structural (LINUX-WAL-OTHER-ROW-WRITERS-01): every WAL row writer in
-    /// this file goes through `wal_row_bytes`, so no writer emits a row body
-    /// and its newline as two calls. Fails if a separate newline write returns.
+    /// Structural tripwire (LINUX-WAL-OTHER-ROW-WRITERS-01): fails if any of
+    /// the common spellings of a bare newline write reappears anywhere in this
+    /// file. It is a regression tripwire for the row writers that now build
+    /// their rows with `wal_row_bytes`, not a proof that every possible
+    /// spelling is caught (a newline written through an unlisted form would
+    /// pass). The needles are escaped string literals on purpose: written as
+    /// raw strings they would match this test's own source and fail forever.
     #[test]
     fn no_wal_writer_writes_the_row_newline_separately() {
         let source = include_str!("audit.rs");
-        let separate_newline_write = "write_all(b\"\\n\")";
-        assert_eq!(
-            source.matches(separate_newline_write).count(),
-            0,
-            "a WAL row writer writes its newline as a separate call; build the row with wal_row_bytes"
-        );
+        let separate_newline_writes = [
+            "write_all(b\"\\n\")",
+            "write(b\"\\n\")",
+            "write_all(&[b'\\n'])",
+            "\"\\n\".as_bytes()",
+            // Split so this test's own source does not contain the macro name.
+            concat!("writel", "n!("),
+        ];
+        for needle in separate_newline_writes {
+            assert_eq!(
+                source.matches(needle).count(),
+                0,
+                "`{needle}` found in audit.rs: build WAL rows with wal_row_bytes (or, for a deliberate \
+                 test fixture, write the bytes another way and say why)"
+            );
+        }
     }
 
     #[test]
