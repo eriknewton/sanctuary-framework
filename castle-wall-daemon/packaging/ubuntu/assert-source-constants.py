@@ -22,7 +22,13 @@ from pathlib import Path
 # the frozen-cell expectation; the rule grammar, the inventory parser and its enum variants,
 # the receipt mint and the net script are byte-unchanged. Two independent-family code gates
 # review the slice before this pin moves. The guard constants it mirrors are unchanged.
-NFTABLES_SOURCE_SHA256 = "dd78e36f0b24b2875a33358407a5a7f7992304ac3b636b6fd4a6ecc9bbc918fb"
+# Refreshed for the single-uid listing fix (2026-09-24): the deny-all net recognizer and the
+# live-binding reader now share one right-hand-side extractor that accepts the array form and
+# the bare-scalar form nft emits for a one-member skuid set, and refuses every other shape.
+# Rule grammar, the owned-table parser, the receipt mint and the net script are byte-unchanged.
+# Claude and Grok code gates (three rounds, final dry) reviewed it before this pin moved.
+# The guard constants it mirrors are unchanged.
+NFTABLES_SOURCE_SHA256 = "2e4cc8a85918f6e545052eef74649ffd5ba18504894a11b8409374c868ec8e91"
 
 
 def fail(message):
