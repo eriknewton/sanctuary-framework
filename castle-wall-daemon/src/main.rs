@@ -587,6 +587,10 @@ mod tests {
     /// swallows the token after it. Before the F5 fix this args slice found no
     /// `--disarm` (the seam name unconditionally consumed `--disarm` as its own
     /// value); after the fix the scan is byte-identical to base and finds it.
+    /// Lane note: CI runs every `cargo test` with `--features test-isolation`,
+    /// so this witness runs only in a default-feature `cargo test` on a
+    /// developer host; the structural guarantee is the `#[cfg]` on the two
+    /// `value_options` entries.
     #[test]
     #[cfg(not(feature = "test-isolation"))]
     fn default_build_disarm_detection_unchanged_by_a_trailing_unknown_flag() {

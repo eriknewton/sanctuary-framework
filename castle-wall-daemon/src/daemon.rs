@@ -283,12 +283,17 @@ pub struct DaemonHandle {
     #[cfg(test)]
     ipc_stop_flag: Arc<AtomicBool>,
     /// TEST-ISOLATION ONLY (W1b, register id LINUX-STOP-LOSS-RACE-01). One-shot
-    /// latch armed by `arm_test_shutdown_at_pre_recovery`; consumed inside
-    /// `kernel_runtime_health_with_recovery`, which flips `shutdown_flag`
-    /// immediately before calling `attempt_post_ready_recovery` so a wired
+    /// latch armed by `arm_test_shutdown_at_pre_recovery`; consumed on the
+    /// first read of the live shutdown closure that
+    /// `kernel_runtime_health_with_recovery` passes to
+    /// `attempt_post_ready_recovery`. That closure is read only inside
+    /// `recover_post_ready_loss`, which is reached only after the component's
+    /// own probe returned Lost or Recovering, so a healthy poll never consumes
+    /// the latch. On that read it flips `shutdown_flag`, so a wired
     /// integration test can prove the site-5 precedence fix (a first-entry
-    /// proven loss still gets its one net-install attempt when shutdown races
-    /// this exact call) without depending on OS signal-delivery timing.
+    /// proven loss still gets its one net-install attempt when a stop lands
+    /// between the probe and the decision) without depending on OS
+    /// signal-delivery timing.
     /// Compiled out of release builds: must match the CLI seam name
     /// `--test-shutdown-at=pre-recovery` in `main.rs`.
     #[cfg(feature = "test-isolation")]
@@ -1058,9 +1063,9 @@ impl DaemonHandle {
 
     /// TEST-ISOLATION ONLY (W1b, register id LINUX-STOP-LOSS-RACE-01). Arms the
     /// one-shot seam documented on the `test_shutdown_at_pre_recovery` field:
-    /// the NEXT call into `kernel_runtime_health_with_recovery` flips the real
-    /// shutdown flag immediately before `attempt_post_ready_recovery` runs,
-    /// then disarms itself. This proves the site-5 precedence fix through the
+    /// the first live shutdown read inside `recover_post_ready_loss` (reached
+    /// only after the component's probe saw a loss) flips the real shutdown
+    /// flag, then disarms itself. This proves the site-5 precedence fix through the
     /// real `main` binary without racing an OS signal against the health call.
     /// Absent from release builds; must match the CLI seam name
     /// `--test-shutdown-at=pre-recovery` in `main.rs`.
@@ -1263,7 +1268,8 @@ fn recovery_call_decision(
     // every install result; a returned InstallSucceeded/InstallFailed with a
     // Recovering observation outranks shutdown, because a stop that raced a
     // proven loss must still report the repair, not silently exit clean.
-    // Only after both checks does a bare shutdown request win.
+    // After both checks a shutdown request yields a clean stop only when the
+    // observation is Ready or NoRuntime (the shutdown branch below).
     if fatal {
         return RecoveryCallDecision::FatalControlPath;
     }
@@ -1293,10 +1299,12 @@ fn recovery_call_decision(
         // question left is whether the daemon is actually up: Ready or
         // NoRuntime exits clean; Lost, Recovering (an outstanding attempt
         // this call did not win, e.g. a throttled retry or the A155
-        // host-wide skip), Indeterminate and ProbeUnavailable must all take
-        // the exact same nonzero arm they take out of shutdown, so this
-        // falls through to Continue and lets the caller's own observation
-        // match decide, precisely as it would with shutdown=false.
+        // host-wide skip), Indeterminate and ProbeUnavailable must all end
+        // on a nonzero arm, so this falls through to Continue and lets the
+        // caller's own observation match decide. The one difference from
+        // shutdown=false: under shutdown the next loop top runs
+        // `stop_final_health_outcome`, which grants ProbeUnavailable no
+        // consecutive-reading budget and fails closed on the first one.
         if matches!(
             observed,
             RuntimeHealthState::Ready | RuntimeHealthState::NoRuntime
@@ -2107,8 +2115,9 @@ mod tests {
     /// U1 decision matrix (LINUX-STOP-LOSS-RACE-01): fatal x shutdown x
     /// {none, InstallSucceeded, InstallFailed}. Fatal always wins; a returned
     /// InstallSucceeded/InstallFailed with a Recovering observation outranks
-    /// shutdown (C2a1(b)); a bare shutdown with no returned install still wins
-    /// over Continue.
+    /// shutdown (C2a1(b)); a shutdown with no returned install yields
+    /// ShutdownRequested only for a Ready or NoRuntime observation, and every
+    /// other observation falls through to Continue (R1).
     #[test]
     fn u1_recovery_call_decision_matrix() {
         use crate::enforcement::{ComponentKind, NotReadyReason, PostReadyRecoveryResult as R};

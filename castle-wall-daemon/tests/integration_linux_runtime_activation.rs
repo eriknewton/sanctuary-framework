@@ -2102,10 +2102,11 @@ fn stop_racing_a_proven_loss_installs_the_net_w1a() {
 
 /// W1b (memo §4 test table, site 5): the real `main` binary with the
 /// `--test-shutdown-at pre-recovery` seam armed, which flips the real
-/// shutdown flag inside `kernel_runtime_health_with_recovery` immediately
-/// before `attempt_post_ready_recovery` runs -- proving the site-5 precedence
-/// fix (a first-entry proven loss still gets its one net-install attempt even
-/// when shutdown is observed at that exact call) without racing an OS signal.
+/// shutdown flag on the first live shutdown read inside the recovery
+/// controller, after the component's probe has already seen the loss, so it
+/// proves the site-5 precedence fix (a first-entry proven loss still gets its
+/// one net-install attempt when a stop lands between the probe and the
+/// decision) without racing an OS signal.
 /// No SIGTERM is sent in this test; the daemon stops itself. On `174475fe`
 /// this exits 0 with `NoInstall` (mutant M1's skip, and M3); after C2a1(a) it
 /// must exit 78 with the net live.
