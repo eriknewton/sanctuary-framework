@@ -32,7 +32,10 @@ import type {
   PrincipalPolicy,
 } from "./principal-policy/types.js";
 import { BaselineTracker } from "./principal-policy/baseline.js";
-import type { ApprovalChannel } from "./principal-policy/approval-channel.js";
+import {
+  StderrApprovalChannel,
+  type ApprovalChannel,
+} from "./principal-policy/approval-channel.js";
 import { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
 import { selectApprovalChannelByPolicy } from "./principal-policy/channel-selection.js";
 import { ApprovalGate } from "./principal-policy/gate.js";
@@ -1331,7 +1334,69 @@ export async function createSanctuaryServer(options?: {
       dashboard.setAutoAuthLocalhost(true);
     }
     await selectedApprovalChannel.start();
-    approvalChannel = dashboard;
+    if (dashboard.addrInUse()) {
+      // F5 (dashboard-bind-degrade, 2026-09-24 dogfood finding): the
+      // embedded dashboard's bind failed with EADDRINUSE. That
+      // classification is errno-only (dashboard.ts's onStartupError):
+      // nothing here identifies WHO holds the port. It could be another
+      // Sanctuary session, or any other local process bound to it first.
+      // Exiting on this would leave THIS session with no Sanctuary tools
+      // at all; instead the server finishes booting, but its approval
+      // channel becomes deny-all.
+      //
+      // Why swap instead of leaving the unbound `dashboard` object as the
+      // channel: that object still fails CLOSED on a timeout (SEC-002,
+      // dashboard.ts's requestApproval), never open, so the swap is not
+      // about correctness. It is about latency and load: every Tier-1/
+      // Tier-2 request would sit in `dashboard.pending` for the full
+      // `approval_channel.timeout_seconds` before denying, and the queue
+      // of pending entries grows with call volume until each one times
+      // out. `StderrApprovalChannel` already IS Sanctuary's
+      // deny-everything channel (SEC-002/SEC-016: no config can turn it
+      // into an approval, no timer, no TTY read) and MUST-NEVER #7
+      // already governs what its denial reveals, so this reuses it
+      // (AGENTS rule 5: one source) rather than adding a second deny-all
+      // implementation, and denies immediately instead of per-call.
+      //
+      // BOUND: if `policy.approval_redirect.enabled` is true and its mode
+      // resolves to "replace" (default: disabled, loader.ts), the
+      // `AggregatorBackedChannel` wrapper built below never calls the
+      // underlying channel at all (aggregator-backed-channel.ts), so this
+      // swap is inert for that policy and every gated call reverts to the
+      // per-call timeout-then-deny wait this swap exists to avoid. The
+      // deny outcome still holds either way; only the immediacy does not.
+      //
+      // `dashboard` itself stays assigned below: the `if (dashboard)`
+      // wiring blocks (SSE broadcast, sentinel dispatcher, honeypot
+      // registry, unified inbox) still run and attach to it. They do not
+      // no-op; they attach to an object with no bound listener, so it has
+      // no route through which to receive or deliver an approval
+      // decision. `cleanup()` still calls this channel's `stop()`
+      // unconditionally for the dashboard case, which stops its session
+      // timer and any other handles the constructor started.
+      approvalChannel = new StderrApprovalChannel(policy.approval_channel);
+      // SAFETY: no structured logger module is wired in server/src/ yet;
+      // until one lands, raw stderr is the runtime warning channel for
+      // this site. Port number only: no token, path, or policy detail.
+      // No "who owns it" claim: see the comment above on why that cannot
+      // be attributed from an EADDRINUSE errno alone.
+      process.stderr.write(
+        `\n  Sanctuary: dashboard port ${config.dashboard.port} is already ` +
+          `in use; this session's approval-gated operations ` +
+          `are refused, not approved.\n\n`,
+      );
+      await auditLog.appendCritical({
+        layer: "l2",
+        operation: "dashboard_bind_unavailable",
+        identity_id: fortressIdFromStoragePath(config.storage_path),
+        result: "failure",
+        details: {
+          port: config.dashboard.port,
+        },
+      });
+    } else {
+      approvalChannel = dashboard;
+    }
     break;
   }
   case "webhook":

@@ -5572,8 +5572,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    *   can exit 0 and KeepAlive treats it as a successful run (no churn). When
    *   false/omitted (interactive `sanctuary dashboard`), EADDRINUSE still
    *   prints the loud operator banner and rejects.
+   * @param opts.silentAddrInUse F5 (2026-09-24): when true, suppresses the
+   *   "standing down (single-owner)" stderr line this same EADDRINUSE branch
+   *   would otherwise print alongside `exitCleanOnAddrInUse`. Only a caller
+   *   that does NOT actually stand down (it keeps running with a different
+   *   approval channel, rather than exiting) should pass this, so it prints
+   *   its own accurate message instead. Ignored when `exitCleanOnAddrInUse`
+   *   is false/omitted. Never passed by the supervised LaunchAgent path
+   *   (dashboard-standalone.ts): that path's message is unchanged.
    */
-  async start(opts?: { exitCleanOnAddrInUse?: boolean }): Promise<void> {
+  async start(opts?: {
+    exitCleanOnAddrInUse?: boolean;
+    silentAddrInUse?: boolean;
+  }): Promise<void> {
     if (this.startPromise) return this.startPromise;
     if (this.httpServer) return;
     this._addrInUse = false;
@@ -5587,6 +5598,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
   private async startHttpServer(opts?: {
     exitCleanOnAddrInUse?: boolean;
+    silentAddrInUse?: boolean;
   }): Promise<void> {
     // C1: enforce TLS for non-loopback bindings. Plaintext approve/deny
     // over the wire is a credential-theft vector. The operator can opt
@@ -5648,10 +5660,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             // loses, quietly.
             if (opts?.exitCleanOnAddrInUse) {
               this._addrInUse = true;
-              process.stderr.write(
-                `\n  Sanctuary Dashboard: port ${port} already owned by another ` +
-                  `instance; standing down (single-owner).\n\n`,
-              );
+              if (!opts?.silentAddrInUse) {
+                process.stderr.write(
+                  `\n  Sanctuary Dashboard: port ${port} already owned by another ` +
+                    `instance; standing down (single-owner).\n\n`,
+                );
+              }
               resolve();
               return;
             }
