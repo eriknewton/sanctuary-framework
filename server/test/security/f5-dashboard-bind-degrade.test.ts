@@ -121,11 +121,12 @@ describe("F5: a busy embedded-dashboard port degrades the MCP stdio boot instead
       const port = randomTestPort();
       await new Promise<void>((resolve, reject) => {
         const srv = createServer();
-        srv.once("error", (err) => {
+        const onSetupError = (err: Error): void => {
           srv.close(() => reject(err));
-        });
+        };
+        srv.once("error", onSetupError);
         srv.listen(port, "127.0.0.1", () => {
-          srv.off("error", reject);
+          srv.off("error", onSetupError);
           occupyingServer = srv;
           resolve();
         });

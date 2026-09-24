@@ -1381,8 +1381,8 @@ export async function createSanctuaryServer(options?: {
       // No "who owns it" claim: see the comment above on why that cannot
       // be attributed from an EADDRINUSE errno alone.
       process.stderr.write(
-        `\n  Sanctuary: dashboard port ${config.dashboard.port} is in use ` +
-          `by another process; this session's approval-gated operations ` +
+        `\n  Sanctuary: dashboard port ${config.dashboard.port} is already ` +
+          `in use; this session's approval-gated operations ` +
           `are refused, not approved.\n\n`,
       );
       await auditLog.appendCritical({

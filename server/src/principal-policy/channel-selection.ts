@@ -102,10 +102,9 @@ export function selectApprovalChannelByPolicy(
             // eu_ai_act/cli.ts) all construct the server through this same
             // function. All of them now degrade to deny-all on a busy
             // dashboard port instead of refusing startup; none of them is
-            // exempted. `index.ts` is the caller this repo currently wires
-            // to check `addrInUse()` and swap in a deny-all approval
-            // channel; the other two callers inherit the resolve-instead-
-            // of-reject change but do not (yet) add that swap themselves.
+            // exempted. The `addrInUse()` check and the deny-all swap live
+            // in the shared `createSanctuaryServer` body (`index.ts`), so
+            // every one of those callers gets both halves.
             //
             // `silentAddrInUse: true`: the supervised-path stderr line this
             // same EADDRINUSE branch prints ("standing down (single-

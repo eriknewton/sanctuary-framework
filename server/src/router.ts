@@ -74,6 +74,8 @@ const AGENT_CATALOG_HIDDEN_TOOLS = new Set([
   "context_gate_apply_template",
 ]);
 
+// Must match GENERIC_GATE_DENIAL_REMEDIATION in
+// test/security/f5-dashboard-bind-degrade.test.ts (not exported; the test pins it).
 const GENERIC_GATE_DENIAL_REMEDIATION = "unavailable" as const;
 
 /** Options for server creation */
