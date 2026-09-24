@@ -508,6 +508,38 @@ mod tests {
         assert_eq!(probe.poll(|| true), ProbeOutcome::Lost);
     }
 
+    /// R3 (LINUX-STOP-LOSS-RACE-01, Claude F3): the exact cache Claude F3
+    /// named. A loss that occurs INSIDE `min_interval` of the last completed
+    /// check must read as cached `Ready` through `poll_result` (the ordinary
+    /// path every periodic health call uses) -- that caching is intentional,
+    /// the status-poll amplification guard the test above proves -- but MUST
+    /// be seen as `Lost` through `reprobe_after_latch`, the primitive the
+    /// stop-time final pass now uses instead. This is the unit-level proof
+    /// that the primitive `stop_final_health_outcome` was changed to call
+    /// actually bypasses the cache it must bypass.
+    #[test]
+    fn reprobe_after_latch_sees_a_loss_inside_the_cache_window_that_poll_result_would_miss() {
+        let probe = BoundedHealthProbe::new(budget());
+        // Seed the cache with a completed positive check.
+        assert_eq!(probe.poll_result(|| Ok(true)), ProbeOutcome::Ready);
+        // The table is lost NOW, well inside `min_interval` (50ms budget here).
+        // The ordinary cached path must not see it yet:
+        assert_eq!(
+            probe.poll_result(|| Ok(false)),
+            ProbeOutcome::Ready,
+            "inside min_interval, poll_result must return the cached reading, \
+             not re-run the check -- this is the amplification guard, and it is \
+             exactly what would mask a stop-time loss without R3's fix"
+        );
+        // The stop-time primitive must see the real, current state instead:
+        assert_eq!(
+            probe.reprobe_after_latch(|| Ok(false)),
+            ProbeOutcome::Lost,
+            "reprobe_after_latch must bypass the cache and run a live check, so a \
+             loss inside the cache window is never read as a stale Ready"
+        );
+    }
+
     /// FAIL-BEFORE for the "one timeout latches health failure permanently"
     /// defect: a single deadline overrun must be INDETERMINATE and must be
     /// recoverable by the next successful check.

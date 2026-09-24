@@ -213,6 +213,18 @@ pub trait AcquiredComponent: Send {
             ComponentHealth::Lost
         }
     }
+    /// R3 (LINUX-STOP-LOSS-RACE-01, Claude F3): the same three-valued read as
+    /// [`health`](Self::health), but MUST bypass any internal rate-limit cache
+    /// so the result is a live proof, never a reading up to that cache's
+    /// window old. The default delegates to `health`, which is correct for
+    /// every component with no such cache (an in-process flag, a thread
+    /// liveness bit). The nftables component overrides this to re-probe
+    /// instead of reusing its `NFT_HEALTH_MIN_INTERVAL` cached reading.
+    /// `stop_final_health_outcome`'s one stop-time pass is the only caller
+    /// that needs this; the periodic supervision loop keeps using `health`.
+    fn health_fresh(&self) -> ComponentHealth {
+        self.health()
+    }
     /// Called when a STARTUP readiness check reads this component `Lost`, BEFORE the
     /// reverse-order unwind and before any error is returned.
     ///
@@ -246,10 +258,19 @@ pub trait AcquiredComponent: Send {
     /// install the safety net and then persist best-effort, and publishes `Recovering`
     /// through its health while an attempt is outstanding.
     ///
-    /// `shutting_down` is observed so `systemctl stop` is a clean exit rather than a
-    /// box that keeps re-arming while it is being taken down. The result describes
-    /// this call only; it is not a retained claim about kernel state.
-    fn attempt_post_ready_recovery(&self, shutting_down: bool) -> PostReadyRecoveryResult {
+    /// F4 / C2a1(a) (LINUX-STOP-LOSS-RACE-01): `shutting_down` is a closure so an
+    /// implementor reads the CURRENT shutdown state at the moment it actually
+    /// decides, not a value copied before this call was reached (R2: a stop can
+    /// land during the health probe that gated this call). A stop never leaves a
+    /// proven loss without its one net attempt: the first entry for a fresh loss
+    /// installs regardless of what the closure returns; shutdown gates only a
+    /// later retry (no re-probe, no readiness restoration) and any host-wide
+    /// install (A155). The result describes this call only; it is not a
+    /// retained claim about kernel state.
+    fn attempt_post_ready_recovery(
+        &self,
+        shutting_down: &dyn Fn() -> bool,
+    ) -> PostReadyRecoveryResult {
         let _ = shutting_down;
         PostReadyRecoveryResult::NoInstall
     }
@@ -649,6 +670,20 @@ impl EnforcementRuntime {
     /// a shut-down runtime all read as not-ready. Readiness is a precondition
     /// for enforcing a wrapped agent, never enforcement itself (module docs).
     pub fn status(&self) -> EnforcementStatus {
+        self.status_impl(false)
+    }
+
+    /// R3 (LINUX-STOP-LOSS-RACE-01, Claude F3): the same projection as
+    /// [`status`](Self::status), but every component is read through
+    /// [`AcquiredComponent::health_fresh`] instead of `health`, bypassing any
+    /// rate-limit cache. The one caller is `stop_final_health_outcome`'s
+    /// `S_STOP_FINAL_HEALTH` pass, which must never classify a loss as clean
+    /// because it landed inside the nft component's cache window.
+    pub fn status_fresh(&self) -> EnforcementStatus {
+        self.status_impl(true)
+    }
+
+    fn status_impl(&self, force_fresh: bool) -> EnforcementStatus {
         if self.shutdown_done {
             return EnforcementStatus::NotReady {
                 reason: NotReadyReason::ShuttingDown,
@@ -673,7 +708,11 @@ impl EnforcementRuntime {
                 // rather than `ComponentLost`, so a supervisor can retry a
                 // no-answer instead of restarting the daemon on it, while a
                 // status reader still gets no readiness assertion.
-                Some(component) => match component.health() {
+                Some(component) => match if force_fresh {
+                    component.health_fresh()
+                } else {
+                    component.health()
+                } {
                     ComponentHealth::Ready => {}
                     ComponentHealth::Lost => {
                         return EnforcementStatus::NotReady {
@@ -713,17 +752,28 @@ impl EnforcementRuntime {
     /// `Recovering` are not driven here: the first needs nothing, the second is the
     /// absence of evidence, and the third already has an attempt outstanding.
     ///
+    /// `shutting_down` is read live by the selected component's own
+    /// `attempt_post_ready_recovery`, not copied into a `bool` here (R2). `force_fresh`
+    /// (R3) selects `health_fresh` over `health` for the gate check below, matching
+    /// whichever the caller used to decide this is the stop-time final pass.
+    ///
     /// Return the result of the selected component's call to the supervisor.
-    pub fn attempt_post_ready_recovery(&self, shutting_down: bool) -> PostReadyRecoveryResult {
+    pub fn attempt_post_ready_recovery(
+        &self,
+        shutting_down: &dyn Fn() -> bool,
+        force_fresh: bool,
+    ) -> PostReadyRecoveryResult {
         let mut result = PostReadyRecoveryResult::NoInstall;
         for component in &self.components {
             // BOTH readings drive the controller. `Lost` is the entry; `Recovering` is
             // an attempt already outstanding, and it must be re-entered on the retry
             // interval or a failed install would never be retried at all.
-            if matches!(
-                component.health(),
-                ComponentHealth::Lost | ComponentHealth::Recovering
-            ) {
+            let health = if force_fresh {
+                component.health_fresh()
+            } else {
+                component.health()
+            };
+            if matches!(health, ComponentHealth::Lost | ComponentHealth::Recovering) {
                 let next = component.attempt_post_ready_recovery(shutting_down);
                 if next != PostReadyRecoveryResult::NoInstall {
                     result = next;
@@ -988,12 +1038,20 @@ mod test_support {
             self.post_ready_indeterminate_calls
                 .fetch_add(1, Ordering::SeqCst);
         }
-        fn attempt_post_ready_recovery(&self, shutting_down: bool) -> PostReadyRecoveryResult {
-            self.recovery_calls.fetch_add(1, Ordering::SeqCst);
+        fn attempt_post_ready_recovery(
+            &self,
+            shutting_down: &dyn Fn() -> bool,
+        ) -> PostReadyRecoveryResult {
+            // C2a1(a) site 6 (LINUX-STOP-LOSS-RACE-01): a stop never leaves a proven
+            // loss without its one net attempt, so the FIRST call installs
+            // regardless of `shutting_down`; only a later call under shutdown
+            // (a retrying re-probe) returns NoInstall.
+            let shutting_down = shutting_down();
+            let call_number = self.recovery_calls.fetch_add(1, Ordering::SeqCst) + 1;
             if shutting_down {
                 self.recovery_saw_shutdown.store(true, Ordering::SeqCst);
             }
-            if shutting_down {
+            if shutting_down && call_number > 1 {
                 PostReadyRecoveryResult::NoInstall
             } else {
                 PostReadyRecoveryResult::InstallSucceeded
@@ -1295,7 +1353,7 @@ mod test_support {
 
         // READY: no recovery is driven, because there is nothing to re-arm.
         assert_eq!(
-            runtime.attempt_post_ready_recovery(false),
+            runtime.attempt_post_ready_recovery(&|| false, false),
             PostReadyRecoveryResult::NoInstall
         );
         assert_eq!(counters.recovery.load(Ordering::SeqCst), 0);
@@ -1304,7 +1362,7 @@ mod test_support {
         // so no kernel action may be taken from it.
         *health.lock().unwrap() = ComponentHealth::ProbeUnavailable;
         assert_eq!(
-            runtime.attempt_post_ready_recovery(false),
+            runtime.attempt_post_ready_recovery(&|| false, false),
             PostReadyRecoveryResult::NoInstall
         );
         assert_eq!(counters.recovery.load(Ordering::SeqCst), 0);
@@ -1324,21 +1382,27 @@ mod test_support {
         assert_eq!(counters.post_ready_indeterminate.load(Ordering::SeqCst), 1);
         assert_eq!(counters.recovery.load(Ordering::SeqCst), 0);
 
-        // LOST, a completed negative proof: recovery IS driven.
+        // LOST, a completed negative proof, encountered WHILE ALREADY SHUTTING
+        // DOWN. C2a1(a) (LINUX-STOP-LOSS-RACE-01, inverted contract): a stop
+        // never leaves a proven loss without its one net attempt, so the FIRST
+        // entry installs even under shutdown. Pre-fix this call returned
+        // NoInstall; this assertion is the fail-before witness.
         *health.lock().unwrap() = ComponentHealth::Lost;
         assert_eq!(
-            runtime.attempt_post_ready_recovery(false),
-            PostReadyRecoveryResult::InstallSucceeded
+            runtime.attempt_post_ready_recovery(&|| true, false),
+            PostReadyRecoveryResult::InstallSucceeded,
+            "a stop must not leave a proven loss without its one net attempt"
         );
         assert_eq!(counters.recovery.load(Ordering::SeqCst), 1);
+        assert!(counters.recovery_saw_shutdown.load(Ordering::SeqCst));
 
-        // The shutdown flag is threaded through, so `systemctl stop` is a clean exit
-        // rather than a box that keeps re-arming while it is taken down.
+        // A SECOND poll under shutdown, with the loss still outstanding, is the
+        // gated retrying re-probe path: no second install, no readiness restore.
         assert_eq!(
-            runtime.attempt_post_ready_recovery(true),
+            runtime.attempt_post_ready_recovery(&|| true, false),
             PostReadyRecoveryResult::NoInstall
         );
-        assert!(counters.recovery_saw_shutdown.load(Ordering::SeqCst));
+        assert_eq!(counters.recovery.load(Ordering::SeqCst), 2);
 
         // RECOVERING: an attempt is outstanding, and the controller IS re-entered. This
         // is what makes a failed install retry: the component keeps publishing
@@ -1347,7 +1411,7 @@ mod test_support {
         let before = counters.recovery.load(Ordering::SeqCst);
         *health.lock().unwrap() = ComponentHealth::Recovering;
         assert_eq!(
-            runtime.attempt_post_ready_recovery(false),
+            runtime.attempt_post_ready_recovery(&|| false, false),
             PostReadyRecoveryResult::InstallSucceeded
         );
         assert_eq!(
