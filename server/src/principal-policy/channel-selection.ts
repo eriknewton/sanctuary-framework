@@ -86,7 +86,21 @@ export function selectApprovalChannelByPolicy(
         channel: dashboard,
         start: async () => {
           try {
-            await dashboard.start();
+            // F5 (dashboard-bind-degrade, 2026-09-24): request the SAME
+            // EADDRINUSE classification `DashboardApprovalChannel.start`
+            // already gives the supervised LaunchAgent boot (dashboard.ts,
+            // `exitCleanOnAddrInUse`) rather than a second one — AGENTS rule
+            // 5, one source. This ONLY changes what a busy port does inside
+            // `start()` (resolve with `addrInUse()` true instead of reject);
+            // it does not exit or degrade anything by itself. The MCP stdio
+            // boot (index.ts) is the caller that decides what "busy port"
+            // means for it: check `addrInUse()` after this resolves and swap
+            // in a deny-all approval channel, never auto-approve. The
+            // standalone dashboard boot (dashboard-standalone.ts) and the
+            // supervised LaunchAgent path call `DashboardApprovalChannel`
+            // directly and never go through this selector, so they are
+            // unaffected by this change.
+            await dashboard.start({ exitCleanOnAddrInUse: true });
           } catch (err) {
             throw new Error(
               `Sanctuary cannot start: principal policy selects approval_channel.type=dashboard, ` +

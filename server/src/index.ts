@@ -32,7 +32,10 @@ import type {
   PrincipalPolicy,
 } from "./principal-policy/types.js";
 import { BaselineTracker } from "./principal-policy/baseline.js";
-import type { ApprovalChannel } from "./principal-policy/approval-channel.js";
+import {
+  StderrApprovalChannel,
+  type ApprovalChannel,
+} from "./principal-policy/approval-channel.js";
 import { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
 import { selectApprovalChannelByPolicy } from "./principal-policy/channel-selection.js";
 import { ApprovalGate } from "./principal-policy/gate.js";
@@ -1331,7 +1334,45 @@ export async function createSanctuaryServer(options?: {
       dashboard.setAutoAuthLocalhost(true);
     }
     await selectedApprovalChannel.start();
-    approvalChannel = dashboard;
+    if (dashboard.addrInUse()) {
+      // F5 (dashboard-bind-degrade, 2026-09-24 dogfood finding): a second
+      // Sanctuary session's embedded dashboard already owns
+      // 127.0.0.1:<port> in this daily-fortress setup. Exiting here would
+      // leave THIS session with no Sanctuary tools at all; instead the
+      // server finishes booting, but its approval channel becomes
+      // deny-all. A dashboard object whose listener never bound cannot
+      // deliver an operator decision to anyone, so treating it as the live
+      // approval channel would mean every Tier-1/Tier-2 request hangs
+      // until timeout — a slower, quieter way of failing open under load.
+      // StderrApprovalChannel already IS Sanctuary's deny-everything
+      // channel (SEC-002/SEC-016: no config can turn it into an approval),
+      // and MUST-NEVER #7 already governs what its denial reveals, so this
+      // reuses it (AGENTS rule 5: one source) rather than adding a second
+      // deny-all implementation. `dashboard` itself stays assigned below
+      // (SSE broadcast, sentinel, honeypot wiring all null-check it and
+      // no-op against an unbound listener); only the approval channel this
+      // process consults changes.
+      approvalChannel = new StderrApprovalChannel(policy.approval_channel);
+      // SAFETY: no structured logger module is wired in server/src/ yet;
+      // until one lands, raw stderr is the runtime warning channel for
+      // this site. Port number only: no token, path, or policy detail.
+      process.stderr.write(
+        `\n  Sanctuary: dashboard port ${config.dashboard.port} is busy ` +
+          `(another session owns it); this session's approval-gated ` +
+          `operations are refused, not approved.\n\n`,
+      );
+      await auditLog.appendCritical({
+        layer: "l2",
+        operation: "dashboard_bind_unavailable",
+        identity_id: fortressIdFromStoragePath(config.storage_path),
+        result: "failure",
+        details: {
+          port: config.dashboard.port,
+        },
+      });
+    } else {
+      approvalChannel = dashboard;
+    }
     break;
   }
   case "webhook":
