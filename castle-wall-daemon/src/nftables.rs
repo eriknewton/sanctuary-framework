@@ -2165,10 +2165,11 @@ fn one_skuid_scalar(value: &serde_json::Value) -> Option<u32> {
 /// (`rule_skuid_set_with_verdict`, below) and the live-binding reader
 /// (`net_rule_one_uids`): nft collapses a single-member anonymous set to a
 /// bare scalar with no `"set"` wrapper at all. The real-kernel witness for
-/// this collapse is `integration_linux_runtime_activation.rs:1722-1725`
-/// (reading only the set form "returned an empty scope for a live one-uid
-/// net on the first privileged run of this suite") and the sibling case in
-/// `nft_set_json_forms_are_the_shapes_the_parser_reads`
+/// this collapse is `installed_net_rule_one_uids` in
+/// `integration_linux_runtime_activation.rs` (reading only the set form
+/// "returned an empty scope for a live one-uid net on the first privileged
+/// run of this suite") and the sibling case
+/// `nft_set_json_forms_are_the_shapes_the_parser_reads_for_one_uid`
 /// (`tests/integration_gf1_recovery.rs`), not `parse_skuid_value`: that
 /// function pins a DIFFERENT rule (the per-agent chain's bare `meta skuid ==
 /// <uid>`, written without set syntax at all) and says nothing about whether
@@ -4512,8 +4513,9 @@ mod tests {
     /// identity net when the denied set names exactly ONE uid. Real nft
     /// collapses a single-member anonymous set to a bare scalar under
     /// `right`, never `{"set":[..]}`; the real-kernel witness is
-    /// `integration_linux_runtime_activation.rs:1722-1725` and the sibling
-    /// case in `nft_set_json_forms_are_the_shapes_the_parser_reads`
+    /// `installed_net_rule_one_uids` in `integration_linux_runtime_activation.rs`
+    /// and the sibling case
+    /// `nft_set_json_forms_are_the_shapes_the_parser_reads_for_one_uid`
     /// (`tests/integration_gf1_recovery.rs`), not `parse_skuid_value` (that
     /// probe covers a different, always-bare rule and says nothing about a
     /// one-member SET collapsing). `net_rule_one_uids` reads only rule 1, so

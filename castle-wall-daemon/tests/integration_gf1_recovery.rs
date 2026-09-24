@@ -1107,13 +1107,35 @@ fn nft_set_json_forms_are_the_shapes_the_parser_reads_for_one_uid() {
         m3["right"].get("set").is_none(),
         "rule 3's one-member skuid set must NOT keep the \"set\" wrapper: {json}"
     );
-    assert_eq!(m3["right"].as_u64(), m1["right"].as_u64(), "the two rules must name the same uid: {json}");
+    assert_eq!(
+        m3["right"].as_u64(),
+        m1["right"].as_u64(),
+        "the two rules must name the same uid: {json}"
+    );
 
     // And the recogniser accepts this real one-uid listing as its own deny-all
     // safety net -- the whole point of pinning this sibling form.
     assert!(
         nftables::live_table_is_deny_all_safety_net().expect("probe"),
         "a real one-uid net must be recognised as the safety net: {json}"
+    );
+
+    // The DIRECT witness for the confirmed defect, which is on the READER side:
+    // `installed_net_rule_one_uids` (`integration_linux_runtime_activation.rs`)
+    // records that reading only the `{"set":[..]}` array form "returned an
+    // empty scope for a live one-uid net on the first privileged run of this
+    // suite." `expectation` here is `NoneConfined`, which the safety-net
+    // recognition branch of `live_table_uid_bindings` never reads, so this
+    // exercises exactly source (c) of `resolve_safety_net_scope`, on the SAME
+    // real kernel listing the recogniser assertion above just accepted.
+    assert_eq!(
+        nftables::live_table_uid_bindings(
+            &json,
+            &nftables::ExpectedAgentBinding::NoneConfined,
+            HostOverflowUid::from_host().expect("a Linux host exposes kernel.overflowuid"),
+        ),
+        nftables::LiveTableBindings::Bindings(vec![60123]),
+        "source (c) must read the live one-uid net's own uid, not an empty scope: {json}"
     );
 }
 
