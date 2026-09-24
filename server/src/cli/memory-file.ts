@@ -20,25 +20,20 @@ import {
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import { AuditLog } from "../operational/audit-log.js";
 import { BaselineTracker } from "../principal-policy/baseline.js";
+import type { ApprovalChannel } from "../principal-policy/approval-channel.js";
 import { ApprovalGate } from "../principal-policy/gate.js";
 import { loadPrincipalPolicy } from "../principal-policy/loader.js";
 import {
   CLAUDE_CODE_MEMORY_HARNESS,
-  commitClaudeCodeMemorySnapshot,
   emitClaudeCodeMemoryDirectory,
-  readClaudeCodeMemoryDirectory,
-  screenClaudeCodeMemorySnapshot,
 } from "../sdw/adapters/claude-code-file-adapter.js";
 import {
   CODEX_MEMORY_HARNESS,
-  commitCodexMemorySnapshot,
   emitCodexMemoryDirectory,
-  readCodexMemoryDirectory,
-  screenCodexMemorySnapshot,
 } from "../sdw/adapters/codex-memory-file-adapter.js";
 import { SdwValidationError, sdwClassifierReasonText } from "../sdw/errors.js";
 import { SdwMemoryBackendAdapter } from "../sdw/adapters/sdw-memory-backend.js";
-import { MEMORY_INGEST_CLASSIFIER_OVERRIDE } from "../sdw/adapters/memory-file-allow-list.js";
+import { ingestMemoryFiles } from "../sdw/memory-file-ingest-service.js";
 import {
   MEMORY_TRANSCODE_MODE,
   restoreMemoryTranscodeArchive,
@@ -119,137 +114,73 @@ export async function runMemoryIngestCommand(
   }
   const allowFiles: ReadonlySet<string> = new Set(allowFileFlags.values);
 
-  // S4: memory_ingest is a Tier-1 operation in principal-policy (loader.ts), so
-  // it MUST pass the human ApprovalGate like emit/transcode/restore do. Without
-  // this a same-uid process could write operator-signed provenance records into
-  // the vault with no prompt — a claim/gate mismatch. The channel is built
-  // before unlock so a missing local approval interaction fails closed early.
-  const approvalChannel = createLocalHumanApprovalInteraction(args.dialogRunner, err);
-  if (!approvalChannel) return 1;
+  // The generated policy makes memory_ingest Tier 1. An operator may relax
+  // plain ingest to Tier 3; a classifier waiver stays forced Tier 1. On hosts
+  // without a reviewed OS dialog, Tier 3 can still proceed while every human
+  // approval request is denied.
+  const humanChannel = process.platform === "darwin" || args.dialogRunner !== undefined
+    ? createLocalHumanApprovalInteraction(args.dialogRunner, err)
+    : null;
+  const approvalChannel: ApprovalChannel = humanChannel ?? {
+    async requestApproval() {
+      return { decision: "deny", decided_at: new Date().toISOString(), decided_by: "channel_failure" };
+    },
+  };
 
   const boot = await bootstrap(parsed, env, err, args.stdin ?? process.stdin, args.observeMasterKey);
   if (!boot) return 1;
 
   try {
-    // Tier-1 gate FIRST: no vault write, audit intent, or classifier override is
-    // recorded until the local operator approves this exact ingest.
-    const decision = await new ApprovalGate(
-      await loadPrincipalPolicy(boot.fortressPath),
-      boot.baseline,
-      approvalChannel,
-      boot.auditLog,
-    ).evaluate("memory_ingest", {
-      agent_id: null,
+    const result = await ingestMemoryFiles({
+      adapter: boot.adapter,
+      auditLog: boot.auditLog,
       harness: parsed.harness,
-      source_dir: parsed.dir,
-      owner_ref: parsed.ownerRef,
-    });
-    if (!decision.allowed || !decision.approval_audit_id) {
-      write(err, "Denied: memory ingest was not approved by the local operator.\n");
-      return 1;
-    }
-    let sourceFileCount = 0;
-    // Preflight-only: screen decides accept / skip /
-    // override and validates allow_files (assertAllowFilesKnown, inside
-    // screenMemoryFileEntries) WITHOUT writing anything to the vault. The
-    // override audit records below are durably appended, and can abort the
-    // whole ingest, BEFORE the commit call further down ever runs, so a
-    // crash after this point can only crash AFTER the waiver is already on
-    // the record, never before.
-    let screened:
-      | { readonly kind: "claude-code"; readonly value: ReturnType<typeof screenClaudeCodeMemorySnapshot> }
-      | { readonly kind: "codex"; readonly value: ReturnType<typeof screenCodexMemorySnapshot> };
-    if (parsed.harness === CLAUDE_CODE_MEMORY_HARNESS) {
-      const snapshot = await readClaudeCodeMemoryDirectory(parsed.dir);
-      sourceFileCount = snapshot.entries.length;
-      screened = {
-        kind: "claude-code",
-        value: screenClaudeCodeMemorySnapshot(boot.adapter, snapshot, { allowFiles }),
-      };
-    } else {
-      const snapshot = await readCodexMemoryDirectory(parsed.dir);
-      sourceFileCount = snapshot.entries.length;
-      screened = {
-        kind: "codex",
-        value: screenCodexMemorySnapshot(boot.adapter, snapshot, { allowFiles }),
-      };
-    }
-    const outcome = screened.value.outcome;
-
-    // Write-ahead INTENT, durable before any vault write. If appendCritical
-    // throws, the command aborts with no ingested memory files. It is labelled
-    // `_started` because nothing is committed yet and the count is only what
-    // was read. allow_files is included here (not only on the post-commit
-    // record and the per-file override record below) because it is a
-    // PRE-WRITE WITNESS too, cheap insurance on top of the screen-then-audit-
-    // then-commit ordering below.
-    await boot.auditLog.appendCritical({
-      layer: "l1",
-      operation: "memory_ingest_started",
-      identity_id: "principal",
-      result: "success",
-      details: {
-        harness: parsed.harness,
-        source_dir: parsed.dir,
-        owner_ref: parsed.ownerRef,
-        source_file_count: sourceFileCount,
-        allow_files: [...allowFiles].sort(),
-        approval_audit_id: decision.approval_audit_id,
-      },
-    });
-
-    // One record per overridden file (Rung-1 point 3), durably appended
-    // BEFORE any vault write: the operator waived the
-    // classifier for this exact path, so the audit trail names it
-    // individually rather than folding it into the aggregate outcome record
-    // below. The refusal metadata the classifier would have reported is
-    // retained here, never the matched content. If ANY of these audit writes
-    // throws, the catch block below denies the whole ingest and NOTHING is
-    // committed.
-    for (const override of outcome.overridden) {
-      await boot.auditLog.appendCritical({
-        layer: "l1",
-        operation: MEMORY_INGEST_CLASSIFIER_OVERRIDE,
-        identity_id: "principal",
-        result: "success",
-        details: {
+      sourceDir: parsed.dir,
+      ownerRef: parsed.ownerRef,
+      allowFiles,
+      // The CLI's human/policy approval is a one-shot decision for this call.
+      // A delegated grant caller must recheck its grant before commit.
+      beforeCommit: async () => {},
+      authorize: async () => {
+        // Tier-1 gate FIRST: the service reads no source and writes no vault
+        // content or ingest-intent audit until this exact request is allowed.
+        const decision = await new ApprovalGate(
+          await loadPrincipalPolicy(boot.fortressPath),
+          boot.baseline,
+          approvalChannel,
+          boot.auditLog,
+        ).evaluate("memory_ingest", {
+          agent_id: null,
           harness: parsed.harness,
           source_dir: parsed.dir,
           owner_ref: parsed.ownerRef,
-          source_path: override.source_path,
-          reason: override.reason,
-          detector: override.detector,
-          line: override.line,
-        },
-      });
-    }
-
-    const result =
-      screened.kind === "claude-code"
-        ? await commitClaudeCodeMemorySnapshot(boot.adapter, screened.value)
-        : await commitCodexMemorySnapshot(boot.adapter, screened.value);
-    await boot.auditLog.appendCritical({
-      layer: "l1",
-      operation: "memory_ingest",
-      identity_id: "principal",
-      result: "success",
-      details: {
-        harness: parsed.harness,
-        source_dir: parsed.dir,
-        owner_ref: parsed.ownerRef,
-        source_file_count: result.source_file_count,
-        committed_file_count: result.ingested.length,
-        skipped_file_count: result.skipped.length,
-        overridden_file_count: result.overridden.length,
-        unused_allow_files: result.unused_allow_files,
-        complete: result.complete,
-        skipped: result.skipped.map((skip) => ({
-          source_path: skip.source_path,
-          reason: skip.reason,
-        })),
-        approval_audit_id: decision.approval_audit_id,
+          allow_files: [...allowFiles],
+        });
+        const unattended = decision.allowed && decision.tier === 3 && allowFiles.size === 0;
+        const humanApproved = decision.allowed &&
+          (decision.tier === 1 || (allowFiles.size === 0 && decision.tier === 2)) &&
+          Boolean(decision.approval_audit_id);
+        if (unattended) {
+          return {
+            approvalBasis: "operator_policy_tier3" as const,
+            policyTier: 3 as const,
+            ...(decision.approval_audit_id ? { approvalAuditId: decision.approval_audit_id } : {}),
+          };
+        }
+        if (humanApproved) {
+          return {
+            approvalBasis: "human" as const,
+            policyTier: decision.tier as 1 | 2,
+            approvalAuditId: decision.approval_audit_id!,
+          };
+        }
+        return null;
       },
     });
+    if (result === null) {
+      write(err, "Denied: memory ingest was not permitted by the local policy.\n");
+      return 1;
+    }
     write(
       out,
       `memory_ingest: ingested ${String(result.ingested.length)} of ${String(result.source_file_count)} ${harnessLabel(parsed.harness)} memory files into owner_ref ${parsed.ownerRef}\n`,

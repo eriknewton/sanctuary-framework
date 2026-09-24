@@ -47,7 +47,7 @@ Every proposed change must serve both human sovereignty and agent sovereignty. T
 
 ### Development Guidelines
 
-- New to the server? Start with the module map at `server/src/README.md` (the 61-module index; 53 of 61 modules have a barrel; plus confusable-name disambiguations and the frozen-surface list)
+- New to the server? Start with the module map at `server/src/README.md` (the 62-module index; 54 of 62 modules have a barrel; plus confusable-name disambiguations and the frozen-surface list)
 - Document the consumer-facing surface, not every line. Public functions and types get a doc-comment that captures the contract and the *why* (inputs, returns, failure modes, gotchas). **MCP tool `description` fields especially are written for the AI agents that read them** in their tool catalog: what the tool does, when to use it, what it returns, and key constraints. New public surface gets documented; existing gaps are backfilled opportunistically.
 - TypeScript with strict mode, ESM + CJS dual output
 - All MCP tools must include input validation via Zod schemas

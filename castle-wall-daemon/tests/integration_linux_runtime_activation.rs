@@ -1699,6 +1699,19 @@ fn a_failed_write_ahead_refuses_readiness_and_installs_a_net_naming_the_uid() {
 /// FAILURE MODE worth stating: an empty return reads the same whether the net is
 /// host-wide (the v1 shape carries no rules) or absent, so a caller asserting
 /// membership must also have asserted that a net was installed at all.
+///
+/// DELIBERATELY LAXER than the product's shared `skuid_right_members`
+/// (`src/nftables.rs`), and not a hand-mirrored copy of it in the sense that
+/// rule warns against: neither `skuid_right_members` nor `one_skuid_scalar`
+/// is `pub`, so this integration-test crate cannot call either one at all,
+/// only the crate's public surface. This helper's `filter_map` on a mixed
+/// `{"set":[60123,"root"]}` member list silently drops the non-numeric entry
+/// rather than refusing the whole match; the product function refuses. That
+/// divergence is safe here because this is a read-only diagnostic reader over
+/// a table THIS test just installed (never adversarial input), and no real
+/// nft output mixes a numeric and a non-numeric member in one skuid set, so
+/// the laxer read never fires on anything but a hand-crafted test fixture the
+/// product-level unit tests already cover separately.
 fn installed_net_rule_one_uids() -> Vec<u32> {
     let out = Command::new("nft")
         .args(["-j", "list", "table", CASTLE_FAMILY, isolation::table()])

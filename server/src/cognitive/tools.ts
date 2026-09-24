@@ -43,6 +43,7 @@ import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
 import { InterruptedExitImportPendingError } from "../storage/exit-import-journal.js";
 import {
   fixedDenial,
+  normalizedArgsHash,
   OpaqueNamespaceRegistry,
   resolveActiveSessionIdentity,
   type SessionBinding,
@@ -815,6 +816,172 @@ async function refuseIdentityOverwrite(
     "failure"
   );
   throw new IdentityOverwriteRefusedError();
+}
+
+// ── state_export approval binding (defect.tier1-approval-binding-state-export-namespace-toctou-01) ──
+//
+// Mirrors the SDW "exact consent binding" (server/src/sdw/tools.ts:8-33,
+// 150-211): `approvalTargetArgs` runs at GATE time and freezes the namespace
+// set computed for this call's Tier-1 approval request onto the ORIGINAL
+// per-call args object (a private, non-enumerable Symbol property JSON args
+// can never carry, so nothing an agent submits can forge or overwrite it).
+// The handler consumes that binding instead of re-deriving the set from
+// live state. Before this fix, `state_export`'s handler called the same
+// non-pure `sessionOwnedExportNamespaces()` a second, independent time at
+// execution, so a namespace warmed or reassigned during the human's
+// approval wait could silently reach an export the human never saw.
+// Consuming the binding closes that window: the handler can only export
+// the set frozen at gate time for THIS call, never a set recomputed after
+// approval. This says nothing about what the operator's prompt actually
+// rendered on screen — see the "does NOT prove" paragraph below; on the
+// bulk path the prompt shows a count, not the names.
+const STATE_EXPORT_APPROVAL_BINDING = Symbol(
+  "sanctuary.state_export.approval-binding"
+);
+
+/**
+ * Trust-bearing field (Sanctuary AGENTS.md rule 7). Whose credibility this
+ * carries: NOT a signature or a value the human's approval decision itself
+ * hashed — it is this SERVER PROCESS's own gate-time computation, written
+ * by `approvalTargetArgs` and read back nowhere else. What it is actually
+ * verified against: `takeStateExportApprovalBinding` checks the tool name
+ * and that `normalizedArgsHash(args)` at execution time still matches
+ * `argsHash` as computed at gate time on the SAME per-call args object —
+ * i.e. that the caller's enumerable arguments were not mutated between gate
+ * time and execution, plus single-use consumption (the binding is deleted
+ * on read). What consuming it means: the handler exports exactly
+ * `namespaces` as frozen at gate time, never a value re-derived from live
+ * state.
+ *
+ * The per-call args object this binding lives on does NOT by itself bound
+ * how long the binding stays usable, and an earlier version of this
+ * comment claimed the operator's configured `approval_channel
+ * .timeout_seconds` (principal-policy/types.ts) made a separate expiry
+ * redundant — that claim is false for the shipped callback channel and is
+ * the reason this fixed ceiling exists. `CallbackApprovalChannel
+ * .requestApproval` (approval-channel.ts) awaits its callback with no
+ * timer of its own, and with redirects disabled the aggregator wrapper
+ * (aggregator-backed-channel.ts) delegates straight through without adding
+ * one; separately, the router keeps `handlerArgs` alive across `await
+ * gate.evaluate` and does not check whether the originating MCP call was
+ * cancelled before invoking the handler. So a binding minted for a call
+ * the caller has since cancelled can still be approved and consumed
+ * arbitrarily long afterward with nothing else in this file stopping it.
+ * `STATE_EXPORT_APPROVAL_BINDING_TTL_MS` is a FIXED conservative ceiling,
+ * not a copy or a derivation of the operator's configured timeout and it
+ * does not track that value: dashboard, webhook, and redirect-enabled
+ * aggregator waits already deny on their own configured timer, but the
+ * plain callback channel has none, so this ceiling is the only bound on
+ * that path, and it applies uniformly to every path regardless of which
+ * channel is configured. An operator who sets a longer timeout than this
+ * ceiling and approves after the ceiling has passed will see the export
+ * denied even though a human did approve it; that denial is the
+ * deliberate direction (MUST-NEVER rule 5: never silently execute an
+ * export the ceiling can no longer vouch for the freshness of), not a bug
+ * to relax by widening the constant. Failure mode as it looks from the
+ * outside: an operator who approves late sees a refusal with no error
+ * message pointing at a cause — that refusal is this ceiling doing its
+ * job, not a crash elsewhere in the path. MUST-NEVER rule 5 also governs
+ * every other check below: absent, wrong-tool, aged-out, or
+ * hash-mismatched is a denial, never a fallback to recomputation.
+ *
+ * What this does NOT prove, stated plainly because an earlier version of
+ * this comment overstated it: for the bulk (all-owned-namespaces) form,
+ * `argsHash` is NOT the same hash the human's `ApprovalRequest.args_binding`
+ * carries. `argsHash` here is computed on the ORIGINAL args object (no
+ * `namespaces` key); the approval request's hash is computed on the
+ * PROJECTED object `approvalTargetArgs` returns (`{ ...args, namespaces }`,
+ * see the `return` below) — two different objects, two different hashes.
+ * The argsHash check therefore proves only "the caller's own arguments
+ * were not changed after gate time," not "this binding's namespace set is
+ * the one the human's approval request hashed." Scope correspondence
+ * between the gate-time projected set and what executes rests on the
+ * per-call object flow instead: `namespaces` is computed exactly once per
+ * call, in this same closure, and stored directly on the binding attached
+ * to this call's own args object — no second computation, no shared/global
+ * slot, so there is no step at which a different call's set could
+ * substitute. This is a claim about which set executes, not about which
+ * set the operator's screen rendered; see the header comment above and the
+ * bulk-path note at the `return` below for what the prompt shows.
+ */
+interface StateExportApprovalBinding {
+  readonly toolName: "state_export";
+  /** Must match `normalizedArgsHash` in ../agent-native/safety-base.ts — a
+   *  mismatch means the args object changed after gate time. */
+  readonly argsHash: string;
+  readonly namespaces: readonly string[];
+  /** `Date.now()` at gate time; checked against
+   *  `STATE_EXPORT_APPROVAL_BINDING_TTL_MS` below, not against the
+   *  operator's configured approval timeout — see the trust-bearing-field
+   *  comment above for why the two are deliberately not the same value. */
+  readonly storedAtMs: number;
+}
+
+interface StateExportBindableArgs extends Record<string, unknown> {
+  [STATE_EXPORT_APPROVAL_BINDING]?: StateExportApprovalBinding;
+}
+
+// 15 minutes: comfortably bounds a human-speed interactive approval
+// (dashboard/webhook `timeout_seconds`, typically seconds to a few minutes,
+// principal-policy/types.ts:36) while keeping a stale, unconsumed binding
+// from being usable indefinitely. Same value and rationale as SDW's
+// APPROVAL_BINDING_TTL_MS (server/src/sdw/tools.ts:79-85).
+//
+// This is a copied constant, not a derivation of the operator's actual
+// `approval_channel.timeout_seconds` (principal-policy/types.ts, no upper
+// cap) — an operator who configures a timeout longer than 15 minutes and
+// approves an export after minute 15 gets a fail-closed denial of an
+// export a human DID approve, not a wider export (MUST-NEVER rule 5 still
+// holds: the failure mode is "deny", never "recompute and proceed"). The
+// honest reason this stays a constant instead of `timeout_seconds +
+// margin` in this fix round: `createCognitiveTools` (this function) runs
+// at server/src/index.ts's composition-root step 7, and the
+// `PrincipalPolicy` that carries `approval_channel.timeout_seconds` is not
+// loaded until step further down (`loadPrincipalPolicy`, index.ts) — well
+// after this closure is constructed and captured. Deriving the window
+// correctly would mean either reordering fortress boot so policy loads
+// before the cognitive tools are built, or adding a lazy config getter to
+// `createCognitiveTools`'s `options` the same shape as
+// `currentSessionBinding`, and threading it through the composition root.
+// Both are boot-sequencing changes wider than this narrowing fix round;
+// tracked as a follow-up rather than done here under time pressure with an
+// unreviewed initialization-order change.
+const STATE_EXPORT_APPROVAL_BINDING_TTL_MS = 15 * 60_000;
+
+function attachStateExportApprovalBinding(
+  args: Record<string, unknown>,
+  binding: StateExportApprovalBinding
+): void {
+  Object.defineProperty(args, STATE_EXPORT_APPROVAL_BINDING, {
+    value: binding,
+    enumerable: false,
+    configurable: true,
+    writable: false,
+  });
+}
+
+/**
+ * Consume (single-use) the approval binding for this call. Returns null —
+ * the caller MUST fail closed, never fall back to recomputing the namespace
+ * set (Sanctuary MUST-NEVER rule 5) — when no binding exists (gate not
+ * configured or `approvalTargetArgs` never ran), the binding was minted for
+ * a different tool, it exceeded the fixed freshness ceiling (see the
+ * trust-bearing-field comment on `StateExportApprovalBinding` above for why
+ * that ceiling is not the operator's configured approval timeout), or the
+ * args object changed after gate time (hash mismatch).
+ */
+function takeStateExportApprovalBinding(
+  args: Record<string, unknown>,
+  nowMs: number
+): StateExportApprovalBinding | null {
+  const bindable = args as StateExportBindableArgs;
+  const binding = bindable[STATE_EXPORT_APPROVAL_BINDING];
+  if (binding === undefined) return null;
+  delete bindable[STATE_EXPORT_APPROVAL_BINDING];
+  if (binding.toolName !== "state_export") return null;
+  if (nowMs - binding.storedAtMs > STATE_EXPORT_APPROVAL_BINDING_TTL_MS) return null;
+  if (binding.argsHash !== normalizedArgsHash(args)) return null;
+  return binding;
 }
 
 /**
@@ -1685,32 +1852,97 @@ export function createCognitiveTools(
           format: { type: "string", default: "sanctuary-v1" },
         },
       },
-      approvalTargetArgs: (args) =>
-        typeof args.namespace === "string"
+      // Gate-time namespace freeze (defect
+      // .tier1-approval-binding-state-export-namespace-toctou-01): compute
+      // the exact set this call's Tier-1 approval is gated on ONCE, here,
+      // and bind it to the original per-call args object — this is a claim
+      // about which set the gate evaluates and the handler later executes,
+      // not about which set the operator's screen renders (the bulk path
+      // below still shows a count, not the names). The explicit
+      // single-namespace form is bound too (namespaces: [args.namespace]) so
+      // there is no unbound path through this tool — every state_export call
+      // executes on the set its own approval was minted for, never a set
+      // re-derived live after the human decided.
+      approvalTargetArgs: async (args) => {
+        let namespaces: string[];
+        if (typeof args.namespace === "string") {
+          // Reject a reserved namespace BEFORE the human is asked to
+          // approve it, rather than after: `exportNamespaces` (state-
+          // store.ts F6) filters `_`-prefixed namespaces at execution, so
+          // binding and requesting approval for a reserved name would ask
+          // the human to approve a scope that ships as an empty export —
+          // a subset, not a widening, but "the executed set equals the
+          // approved set" is the property this binding exists to hold, in
+          // both directions. Mirrors the ambiguous-ownership refusal below:
+          // audit at gate time, then throw so the router's catch around
+          // `approvalTargetArgs` (router.ts) denies without ever calling
+          // `gate.evaluate` — the prompt is never shown.
+          const reservedViolation = getReservedNamespaceViolation(args.namespace);
+          if (reservedViolation) {
+            await denyNamespaceAccess("state_export", args.namespace);
+            throw new Error("namespace_reserved");
+          }
+          namespaces = [args.namespace];
+        } else if (options?.currentSessionBinding?.()) {
+          try {
+            namespaces = sessionOwnedExportNamespaces();
+          } catch {
+            await denyNamespaceAccess("state_export", "state_export");
+            throw new Error("namespace_ownership_ambiguous");
+          }
+        } else {
+          namespaces = sessionOwnedExportNamespaces();
+        }
+        attachStateExportApprovalBinding(args, {
+          toolName: "state_export",
+          argsHash: normalizedArgsHash(args),
+          namespaces,
+          storedAtMs: Date.now(),
+        });
+        // The `namespaces` key added here feeds the gate's args-binding
+        // hash for the bulk form (see the "does NOT prove" section of the
+        // binding's trust-bearing-field comment above); the operator's
+        // approval prompt itself still renders a count for this form, not
+        // the names — that is pre-existing behaviour this fix does not
+        // change or claim to fix.
+        return typeof args.namespace === "string"
           ? args
-          : { ...args, namespaces: sessionOwnedExportNamespaces() },
+          : { ...args, namespaces };
+      },
       handler: async (args) => {
-        let namespaces: string[] | undefined;
+        // Consume the gate-time binding instead of recomputing the
+        // namespace set: recomputation here (via the live export cache /
+        // namespace registry) is exactly the TOCTOU this closes — a
+        // namespace warmed or reassigned while the human's approval was
+        // pending must never reach the bundle. Absent, aged past the
+        // fixed freshness ceiling (see `StateExportApprovalBinding`'s
+        // trust-bearing-field comment above for why that ceiling exists
+        // and is not the operator's configured approval timeout), or
+        // hash-mismatched binding is a denial, never a fallback to
+        // recomputation (Sanctuary MUST-NEVER rule 5: no silent degrade on
+        // error).
+        const binding = takeStateExportApprovalBinding(args, Date.now());
+        if (binding === null) {
+          return denyNamespaceAccess(
+            "state_export",
+            typeof args.namespace === "string" ? args.namespace : "state_export"
+          );
+        }
+        const namespaces = [...binding.namespaces];
+
         if (typeof args.namespace === "string") {
           try {
             assertOpaqueNamespaceOwned(args.namespace);
           } catch {
             return denyNamespaceAccess("state_export", args.namespace);
           }
-        } else if (options?.currentSessionBinding?.()) {
-          try {
-            namespaces = sessionOwnedExportNamespaces();
-          } catch {
-            return denyNamespaceAccess("state_export", "state_export");
-          }
-        } else {
-          namespaces = sessionOwnedExportNamespaces();
         }
 
-        const result =
-          typeof args.namespace === "string"
-            ? await stateStore.export(args.namespace)
-            : await stateStore.exportNamespaces(namespaces);
+        // `exportNamespaces` (state-store.ts) filters reserved `_`-prefixed
+        // namespaces and de-duplicates; a namespace the gate-time set never
+        // included cannot reappear here because `namespaces` is exactly the
+        // approved binding, not a re-derived live set.
+        const result = await stateStore.exportNamespaces(namespaces);
 
         await recordCriticalAudit(auditLog, "l1", "state_export", "principal", {
           namespaces: result.namespaces,
