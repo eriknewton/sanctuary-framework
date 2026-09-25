@@ -94,13 +94,13 @@ pub struct LinuxRuntimeConfig {
     /// NFQUEUE bind configuration (queue number, FAIL_OPEN off, deadlines).
     pub nfqueue: NfqueueConfig,
     /// A162 (Erik, 2026-09-24): the daemon's shutdown-REQUEST flag, threaded from
-    /// `boot()` into this config so a future acquisition-path fix can see a stop
-    /// requested before kernel activation completes, the same way the
-    /// post-READY supervisor sees it. `install_shutdown_signal_handlers` sets
-    /// this BEFORE kernel activation runs. Not yet consulted by the
-    /// acquisition path in this commit (LINUX-BOOT-STOP-HOSTWIDE-NET-01's
-    /// wired-consumer tests below are the fail-before witness); must be the
-    /// SAME `Arc` `boot()` hands `DaemonHandle::shutdown_flag`, never a copy.
+    /// `boot()` all the way into the nftables provider/component so every
+    /// pre-READY (boot-phase) safety-net install site can see a stop that was
+    /// requested before kernel activation completes, the same way the post-READY
+    /// supervisor sees it. `install_shutdown_signal_handlers` sets this BEFORE
+    /// kernel activation runs; without this field the boot-phase install sites
+    /// read no shutdown state at all (LINUX-BOOT-STOP-HOSTWIDE-NET-01). Must be
+    /// the SAME `Arc` `boot()` hands `DaemonHandle::shutdown_flag`, never a copy.
     pub shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -120,6 +120,7 @@ pub fn linux_production_plan(
             journal_path: config.journal_path.clone(),
             journal_key_path: config.journal_key_path.clone(),
             decision_engine: Arc::clone(&decision_engine),
+            shutdown_requested: Arc::clone(&config.shutdown_requested),
         }),
         Box::new(NfqueueProvider {
             decision_engine: Arc::clone(&decision_engine),
@@ -149,6 +150,11 @@ struct NftablesTableProvider {
     /// frozen value rather than re-deriving one that could differ between two
     /// reads of the same boot.
     decision_engine: Arc<DecisionEngine>,
+    /// A162: live read of the daemon's shutdown-request flag. Must match
+    /// [`LinuxRuntimeConfig::shutdown_requested`]; carried onto the acquired
+    /// [`NftablesTableComponent`] so a startup-lost install after `acquire()`
+    /// returns can see it too.
+    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Generate a fresh ownership marker: the [`crate::nftables::OWNER_MARKER_PREFIX`]
@@ -736,6 +742,11 @@ fn safety_net_sweep_hook_pr3(
 enum DriftFailClosedOutcome {
     /// The safety net installed; the drifted table now carries the net's scope.
     NetInstalled,
+    /// A162 (Erik, 2026-09-24): a stop was already requested and the resolved
+    /// scope was HostWide (no known confined identity); no kernel mutation was
+    /// attempted. See [`stop_time_hostwide_skip`]. This is not a failure: the
+    /// residual audit row and stderr line were already written by that call.
+    HostWideSkippedForRequestedStop,
     /// The net install FAILED. The PR-3 sweep hook ran, and the table is LEFT
     /// STANDING.
     ///
@@ -753,6 +764,62 @@ enum DriftFailClosedOutcome {
     InstallFailedSweepHooked { net_err: String },
 }
 
+/// A162 (Erik, 2026-09-24), the boot-phase extension of A155: a routine stop
+/// never installs a HOST-WIDE net, whether it lands before `READY=1` (a boot
+/// acquisition install: the reclaim-drift site, the `ReArmLostOwned` site, the
+/// slice-A refusal path routed through [`refuse_after_owned_table`], and the
+/// STARTUP LOST path in [`NftablesTableComponent::install_net_on_startup_loss`])
+/// or after it (the post-READY controller,
+/// [`NftablesTableComponent::recover_post_ready_loss`]). `HostWide` here means
+/// no confined uid is known for this boot (or the retained/deny set
+/// overflowed), so an install at stop time would have nothing legitimate to
+/// scope the drop to and would instead silence every principal on the host on
+/// an ordinary `systemctl stop` that merely raced acquisition or a runtime
+/// loss. With a known confined identity (`SafetyNetScope::Identity`) this
+/// returns `false` and the caller installs as normal, in or out of shutdown: a
+/// proven loss with a known identity still gets its one net attempt (memo
+/// `Linux_C2a_FailClosed_Architecture_v2` §1 invariant; register
+/// LINUX-BOOT-STOP-HOSTWIDE-NET-01 for the boot-phase legs, A155 for the
+/// post-READY leg).
+///
+/// THE ONE site that decides "skip or install" for a requested stop. Every
+/// caller above passes through here before mutating the kernel; do not
+/// re-implement this check at a new call site. When it returns `true` it has
+/// ALREADY recorded the residual audit row and the stderr line naming the
+/// skip, so the caller performs no further recording for the skip itself (a
+/// caller may still record its own install-history tag, or leave it
+/// untouched, per its own contract).
+#[cfg(any(target_os = "linux", test))]
+fn stop_time_hostwide_skip(
+    decision_engine: &DecisionEngine,
+    shutdown_requested: bool,
+    scope: &crate::nftables::SafetyNetScope,
+) -> bool {
+    if !shutdown_requested || !matches!(scope, crate::nftables::SafetyNetScope::HostWide) {
+        return false;
+    }
+    // Must match the one literal every caller's audit trail and any operator
+    // grep for this residual class relies on; keep this the SOLE definition.
+    const RESIDUAL_REASON: &str = "stop_time_net_skipped_no_known_identity";
+    if let Err(audit_err) = decision_engine.append_control_audit_bounded(
+        RESIDUAL_REASON,
+        "a stop was already requested when a proven table loss (or boot-time \
+         acquisition failure) resolved to a host-wide net with no known confined \
+         identity; the install was skipped so an ordinary stop cannot silence \
+         every principal on the host",
+        crate::decision::FAILURE_AUDIT_BUDGET,
+    ) {
+        // SAFETY: stderr is the operator channel of last resort when even the
+        // bounded residual audit row cannot be written.
+        eprintln!("castle-wall-daemon: {RESIDUAL_REASON} (audit row failed: {audit_err:?})");
+    } else {
+        // SAFETY: stderr is the operator channel naming the A155/A162 residual;
+        // the durable record is the audit row appended just above.
+        eprintln!("castle-wall-daemon: {RESIDUAL_REASON}");
+    }
+    true
+}
+
 /// GF1.2: on a reclaim DRIFT, install the safety net for the resolved scope.
 ///
 /// The install is REQUIRED, not best-effort. On FAILURE the PR-3 sweep hook runs
@@ -762,10 +829,19 @@ enum DriftFailClosedOutcome {
 /// unit-testable without a broken nft.
 #[cfg(any(target_os = "linux", test))]
 fn drift_enforce_fail_closed(
+    decision_engine: &DecisionEngine,
+    shutdown_requested: bool,
     install_deny_all: impl FnOnce() -> Result<(), crate::nftables::NftablesError>,
     kill_set: &[u32],
     attempted_scope: &crate::nftables::SafetyNetScope,
 ) -> DriftFailClosedOutcome {
+    // A162: THE ONE gate every pre-READY installer that routes through this
+    // function passes through before touching the kernel. Do not re-implement
+    // this check at a new call site; add a new caller to `drift_enforce_fail_closed`
+    // instead.
+    if stop_time_hostwide_skip(decision_engine, shutdown_requested, attempted_scope) {
+        return DriftFailClosedOutcome::HostWideSkippedForRequestedStop;
+    }
     match install_deny_all() {
         Ok(()) => DriftFailClosedOutcome::NetInstalled,
         Err(net_err) => {
@@ -1354,7 +1430,12 @@ struct RefusalNet {
 /// journal write on this path at all, so there is no best-effort persist whose
 /// failure could be mistaken for a failed protection.
 #[cfg(target_os = "linux")]
-fn refuse_after_owned_table(net: Option<RefusalNet>, reason: String) -> EnforcementError {
+fn refuse_after_owned_table(
+    decision_engine: &DecisionEngine,
+    shutdown_requested: bool,
+    net: Option<RefusalNet>,
+    reason: String,
+) -> EnforcementError {
     let Some(net) = net else {
         return acquire_failed(format!(
             "{reason} No safety net was installed: this boot's confined history names no uid \
@@ -1368,6 +1449,8 @@ fn refuse_after_owned_table(net: Option<RefusalNet>, reason: String) -> Enforcem
         sentence,
     } = net;
     let refuse_detail = match drift_enforce_fail_closed(
+        decision_engine,
+        shutdown_requested,
         || crate::nftables::install_deny_all_safety_net(&scope),
         &kill_set,
         &scope,
@@ -1375,6 +1458,14 @@ fn refuse_after_owned_table(net: Option<RefusalNet>, reason: String) -> Enforcem
         DriftFailClosedOutcome::NetInstalled => {
             format!("{reason} Installed the safety net and refusing readiness. {sentence}")
         }
+        // A162: a stop was already requested with no confined identity known; the
+        // host-wide install was skipped rather than silencing every principal on
+        // the host. The residual audit row is already written.
+        DriftFailClosedOutcome::HostWideSkippedForRequestedStop => format!(
+            "{reason} A stop was already requested and no confined identity is known for \
+             this boot; skipped the host-wide safety net install (A162) rather than \
+             silencing every principal on the host. Refusing readiness."
+        ),
         DriftFailClosedOutcome::InstallFailedSweepHooked { net_err } => format!(
             "{reason} Safety net installation did not complete ({net_err}); refusing \
              readiness. {}",
@@ -1482,6 +1573,7 @@ pub fn force_next_agent_binding_readback_mismatch_for_test() -> ForcedAgentBindi
 fn bind_admitted_uid_before_ready(
     ownership: &crate::nftables::CastleTableOwnership,
     decision_engine: &DecisionEngine,
+    shutdown_requested: bool,
     journal_path: &std::path::Path,
     key_path: &std::path::Path,
     existing: Option<&crate::ownership_journal::OwnershipJournal>,
@@ -1548,12 +1640,14 @@ fn bind_admitted_uid_before_ready(
     // above the authenticated floor. See `net_scope_for_refusal`.
     let refuse = |install_net: bool, uncovered_uids: &[u32], reason: String| -> EnforcementError {
         if !install_net {
-            return refuse_after_owned_table(None, reason);
+            return refuse_after_owned_table(decision_engine, shutdown_requested, None, reason);
         }
         let resolution = resolve_net_scope_at_site(existing, decision_engine);
         let scope = net_scope_for_refusal(&resolution, uncovered_uids, &live_binding_uids);
         let sentence = refusal_scope_sentence(&scope, &resolution);
         refuse_after_owned_table(
+            decision_engine,
+            shutdown_requested,
             Some(RefusalNet {
                 scope,
                 kill_set: resolution.kill_set,
@@ -1924,6 +2018,9 @@ impl ComponentProvider for NftablesTableProvider {
                             &resolution.reason,
                         );
                         let (refuse_detail, net_installed) = match drift_enforce_fail_closed(
+                            &self.decision_engine,
+                            self.shutdown_requested
+                                .load(std::sync::atomic::Ordering::SeqCst),
                             || crate::nftables::install_deny_all_safety_net(&resolution.scope),
                             &resolution.kill_set,
                             &resolution.scope,
@@ -1936,6 +2033,20 @@ impl ComponentProvider for NftablesTableProvider {
                                  {scope_sentence}"
                                 ),
                                 true,
+                            ),
+                            // A162: a stop was already requested with no confined identity
+                            // known for this boot; the host-wide install was skipped rather
+                            // than silencing every principal on the host. Not a failure: the
+                            // residual audit row is already written.
+                            DriftFailClosedOutcome::HostWideSkippedForRequestedStop => (
+                                format!(
+                                    "journal marks an owned table but the live table no longer \
+                                 matches the captured identity; a stop was already requested \
+                                 and no confined identity is known for this boot, so the \
+                                 host-wide safety net install was skipped (A162) rather than \
+                                 silencing every principal on the host: {err}."
+                                ),
+                                false,
                             ),
                             DriftFailClosedOutcome::InstallFailedSweepHooked { net_err } => (
                                 format!(
@@ -2093,6 +2204,37 @@ impl ComponentProvider for NftablesTableProvider {
                         &resolution.scope,
                         &resolution.reason,
                     );
+                    // Named once, reused by every one of this arm's exit branches, so the
+                    // persist-failure note is worded identically whether the net installed,
+                    // failed to install, or was skipped under A162.
+                    let persisted = match &persist_failure {
+                        None => String::new(),
+                        Some(err) => format!(
+                            " The confined history could not be written to the journal \
+                             ({err}); the next start retries the write."
+                        ),
+                    };
+                    // A162: a stop was already requested and this boot's history names no
+                    // confined identity (HostWide scope); skip the host-wide install rather
+                    // than silencing every principal on the host on an ordinary stop that
+                    // merely raced boot. The residual audit row is already written by
+                    // `stop_time_hostwide_skip`.
+                    if stop_time_hostwide_skip(
+                        &self.decision_engine,
+                        self.shutdown_requested
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                        &resolution.scope,
+                    ) {
+                        drop(lock);
+                        return Err(acquire_failed(format!(
+                            "owned sanctuary-castle table vanished (external delete) while the \
+                             ownership journal still asserts ownership; a stop was already \
+                             requested and no confined identity is known for this boot, so the \
+                             host-wide safety net install was skipped (A162) rather than \
+                             silencing every principal on the host; refusing readiness until \
+                             the wall is repaired. {scope_sentence}{persisted}"
+                        )));
+                    }
                     if let Err(err) =
                         crate::nftables::install_deny_all_safety_net(&resolution.scope)
                     {
@@ -2114,14 +2256,6 @@ impl ComponentProvider for NftablesTableProvider {
                     // an operator reading the journal knows immediately whether their own
                     // session is affected, and name any persist failure, which the next
                     // start retries.
-                    let persisted = match persist_failure {
-                        None => String::new(),
-                        Some(err) => format!(
-                            " The confined history could not be written to the journal \
-                             ({err}); the net is installed anyway, because installing it \
-                             makes no uid live, and the next start retries the write."
-                        ),
-                    };
                     return Err(acquire_failed(format!(
                         "owned sanctuary-castle table vanished (external delete) while the \
                          ownership journal still asserts ownership; installed the safety net \
@@ -2161,6 +2295,8 @@ impl ComponentProvider for NftablesTableProvider {
             if let Err(err) = bind_admitted_uid_before_ready(
                 &ownership,
                 &self.decision_engine,
+                self.shutdown_requested
+                    .load(std::sync::atomic::Ordering::SeqCst),
                 journal_path,
                 key_path,
                 existing.as_ref(),
@@ -2192,6 +2328,7 @@ impl ComponentProvider for NftablesTableProvider {
                 last_safety_net_state: std::sync::Mutex::new(
                     crate::nftables::SafetyNetAuditState::NotAttempted,
                 ),
+                shutdown_requested: Arc::clone(&self.shutdown_requested),
             }))
         }
         #[cfg(not(target_os = "linux"))]
@@ -2203,6 +2340,7 @@ impl ComponentProvider for NftablesTableProvider {
                 &self.journal_path,
                 &self.journal_key_path,
                 &self.decision_engine,
+                &self.shutdown_requested,
             );
             Err(EnforcementError::NotAvailableOnPlatform(
                 ComponentKind::NftablesTable.as_str(),
@@ -2471,6 +2609,11 @@ struct NftablesTableComponent {
     /// install transition so the audit row and the signed report describe the predicate
     /// actually in the kernel rather than one derived from the fact of a loss.
     last_safety_net_state: std::sync::Mutex<crate::nftables::SafetyNetAuditState>,
+    /// A162: live read of the daemon's shutdown-request flag, carried over from
+    /// [`NftablesTableProvider`] so [`Self::install_net_on_startup_loss`] (which
+    /// runs AFTER `acquire()` returns, from the STARTUP LOST hook) can see a stop
+    /// requested during boot the same way the post-READY controller does.
+    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Maximum time a synchronous `nft -j list table` ownership proof may delay a
@@ -2697,6 +2840,34 @@ impl NftablesTableComponent {
         let persist_failure = self.persist_boot_row_best_effort(&resolution);
         let scope_sentence =
             crate::nftables::safety_net_scope_sentence(&resolution.scope, &resolution.reason);
+        // A162: a stop was already requested with no confined identity known for
+        // this boot (HostWide scope); skip the host-wide install rather than
+        // silencing every principal on the host. The residual audit row is
+        // already written by `stop_time_hostwide_skip`. Leave
+        // `last_safety_net_state` untouched, matching the post-READY A155 skip:
+        // the tag records install history, not this reason.
+        if stop_time_hostwide_skip(
+            &self.decision_engine,
+            self.shutdown_requested
+                .load(std::sync::atomic::Ordering::SeqCst),
+            &resolution.scope,
+        ) {
+            // SAFETY: stderr is the operator channel; the durable record is the
+            // residual audit row `stop_time_hostwide_skip` already appended.
+            eprintln!(
+                "castle-wall-daemon: a startup ownership check proved the owned nft table no \
+                 longer holds, but a stop was already requested and no confined identity is \
+                 known for this boot; skipped the host-wide safety net install (A162) rather \
+                 than silencing every principal on the host. {scope_sentence}{}",
+                match &persist_failure {
+                    None => String::new(),
+                    Some(err) => format!(
+                        " The confined history could not be written to the journal ({err})."
+                    ),
+                }
+            );
+            return;
+        }
         match crate::nftables::install_deny_all_safety_net(&resolution.scope) {
             Ok(()) => {
                 self.record_safety_net_state(crate::nftables::SafetyNetAuditState::installed(
@@ -2875,8 +3046,7 @@ impl NftablesTableComponent {
         // scope resolution above, which can shell out to `nft`) must still be
         // seen here, or a host-wide net could be installed after a stop was
         // already requested.
-        if shutting_down() && matches!(resolution.scope, crate::nftables::SafetyNetScope::HostWide)
-        {
+        if stop_time_hostwide_skip(&self.decision_engine, shutting_down(), &resolution.scope) {
             // F8 (LINUX-STOP-LOSS-RACE-01, Claude F8): do NOT overwrite attempt
             // history here. `mark_prior_install_unverified()` above already
             // demoted a prior `Installed` to `Unverified`; any other prior tag
@@ -2886,26 +3056,10 @@ impl NftablesTableComponent {
             // and installed earlier in its own lifetime (reachable whenever
             // `recovering == false` because an earlier loss already recovered
             // to `OwnedWallReady` before this new one). The skip itself is
-            // recorded durably by the residual audit row below, which is the
-            // record this branch owns; the safety-net tag records install
-            // history, not this reason.
-            const RESIDUAL_REASON: &str = "stop_time_net_skipped_no_known_identity";
-            if let Err(audit_err) = self.decision_engine.append_control_audit_bounded(
-                RESIDUAL_REASON,
-                "stop-time proven loss observed no known confined identity (HostWide scope); \
-                 A155 refuses a host-wide install at stop, so no net was installed",
-                crate::decision::FAILURE_AUDIT_BUDGET,
-            ) {
-                // SAFETY: stderr is the operator channel of last resort when even
-                // the bounded residual audit row cannot be written.
-                eprintln!(
-                    "castle-wall-daemon: {RESIDUAL_REASON} (audit row failed: {audit_err:?})"
-                );
-            } else {
-                // SAFETY: stderr is the operator channel naming the A155 residual;
-                // the durable record is the audit row appended just above.
-                eprintln!("castle-wall-daemon: {RESIDUAL_REASON}");
-            }
+            // recorded durably by the residual audit row `stop_time_hostwide_skip`
+            // already wrote; the safety-net tag records install history, not this
+            // reason.
+            //
             // Return the same result the no-install paths above return (Unavailable/
             // Indeterminate), so the caller reads this the same way: not a proven
             // install, and NOT mapped to a clean exit-0. `recovering` was set true
@@ -4620,10 +4774,13 @@ mod tests {
         use crate::nftables::NftablesError;
         use std::cell::Cell;
 
+        let engine = test_decision_engine();
         let kill_set = [60123u32, 60124];
 
         // Install fails -> the table is LEFT STANDING and the hook fires.
         let outcome = drift_enforce_fail_closed(
+            &engine,
+            false,
             || {
                 Err(NftablesError::InvocationFailed(
                     "injected net failure".into(),
@@ -4644,6 +4801,8 @@ mod tests {
         // identity, so terminating its processes adds no protection.
         let installed = Cell::new(false);
         let outcome2 = drift_enforce_fail_closed(
+            &engine,
+            false,
             || {
                 installed.set(true);
                 Ok(())
@@ -4653,6 +4812,109 @@ mod tests {
         );
         assert_eq!(outcome2, DriftFailClosedOutcome::NetInstalled);
         assert!(installed.get());
+    }
+
+    // A162: a stop already requested with no confined identity known (HostWide)
+    // skips the install entirely -- the installer closure is never called -- and
+    // reports the dedicated outcome rather than either install arm.
+    #[test]
+    fn drift_enforce_fail_closed_skips_hostwide_install_on_a_requested_stop() {
+        use std::cell::Cell;
+
+        let engine = test_decision_engine();
+        let kill_set = [60123u32, 60124];
+        let called = Cell::new(false);
+        let outcome = drift_enforce_fail_closed(
+            &engine,
+            true,
+            || {
+                called.set(true);
+                Ok(())
+            },
+            &kill_set,
+            &crate::nftables::SafetyNetScope::HostWide,
+        );
+        assert_eq!(
+            outcome,
+            DriftFailClosedOutcome::HostWideSkippedForRequestedStop
+        );
+        assert!(!called.get(), "the installer must not run on an A162 skip");
+    }
+
+    // The identity-scoped counterpart: a known confined identity still installs
+    // even while a stop is requested (the memo's invariant that a proven loss
+    // with a known identity always gets its one net attempt).
+    #[test]
+    fn drift_enforce_fail_closed_still_installs_identity_scope_on_a_requested_stop() {
+        use crate::safety_net_uid::{validate_safety_net_uid, ConfinedUidSet};
+        use std::cell::Cell;
+
+        let engine = test_decision_engine();
+        let kill_set = [60123u32];
+        let set = ConfinedUidSet::from_validated(vec![validate_safety_net_uid(
+            60123,
+            overflow_fixture(),
+        )
+        .unwrap()])
+        .unwrap();
+        let called = Cell::new(false);
+        let outcome = drift_enforce_fail_closed(
+            &engine,
+            true,
+            || {
+                called.set(true);
+                Ok(())
+            },
+            &kill_set,
+            &crate::nftables::SafetyNetScope::Identity(set),
+        );
+        assert_eq!(outcome, DriftFailClosedOutcome::NetInstalled);
+        assert!(
+            called.get(),
+            "a known confined identity must still install under shutdown"
+        );
+    }
+
+    // U1 (A162): the decision matrix `stop_time_hostwide_skip` itself, over every
+    // reachable (scope, shutdown_requested) pair, independent of any call site.
+    #[test]
+    fn stop_time_hostwide_skip_decision_matrix() {
+        use crate::safety_net_uid::{validate_safety_net_uid, ConfinedUidSet};
+
+        let engine = test_decision_engine();
+        let identity_set = ConfinedUidSet::from_validated(vec![validate_safety_net_uid(
+            60123,
+            overflow_fixture(),
+        )
+        .unwrap()])
+        .unwrap();
+
+        // HostWide + shutdown requested: skip.
+        assert!(stop_time_hostwide_skip(
+            &engine,
+            true,
+            &crate::nftables::SafetyNetScope::HostWide
+        ));
+        // HostWide + no shutdown: never skip (an ordinary boot/runtime loss still
+        // installs).
+        assert!(!stop_time_hostwide_skip(
+            &engine,
+            false,
+            &crate::nftables::SafetyNetScope::HostWide
+        ));
+        // Identity + shutdown requested: never skip (memo §1 invariant -- a known
+        // confined identity always gets its one net attempt).
+        assert!(!stop_time_hostwide_skip(
+            &engine,
+            true,
+            &crate::nftables::SafetyNetScope::Identity(identity_set.clone())
+        ));
+        // Identity + no shutdown: never skip.
+        assert!(!stop_time_hostwide_skip(
+            &engine,
+            false,
+            &crate::nftables::SafetyNetScope::Identity(identity_set)
+        ));
     }
 
     // A completed first loss is already an install-authorising proof. A second
