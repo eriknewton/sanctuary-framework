@@ -1705,9 +1705,9 @@ fn activate_kernel_runtime(
     decision_engine: Arc<DecisionEngine>,
     // A162 (LINUX-BOOT-STOP-HOSTWIDE-NET-01): the SAME `Arc` as
     // `DaemonHandle::shutdown_flag`, threaded into the boot-phase acquisition
-    // path so the reclaim-drift, `ReArmLostOwned` and startup-loss install
-    // sites read a stop requested before kernel activation completes (the
-    // slice-A refusal path does not consult it yet: register
+    // path so the reclaim-drift, `ReArmLostOwned`, startup-loss and slice-A
+    // refusal install sites read a stop requested before kernel activation
+    // completes (registers LINUX-BOOT-STOP-HOSTWIDE-NET-01 and
     // LINUX-BOOT-STOP-SLICEA-REFUSAL-01). `install_shutdown_signal_handlers`
     // (called above, before this function) is what actually flips it.
     shutdown_flag: Arc<AtomicBool>,

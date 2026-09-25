@@ -100,13 +100,12 @@ pub struct LinuxRuntimeConfig {
     /// post-READY supervisor sees it. `install_shutdown_signal_handlers` sets
     /// this BEFORE kernel activation runs; without this field the boot-phase
     /// install sites read no shutdown state at all. Every site downstream that
-    /// consults this field (the reclaim-drift site, `ReArmLostOwned`, and
-    /// startup loss) loads it FRESH at its own decision point rather than
-    /// caching a copy earlier, so a stop that arrives mid-acquisition is still
-    /// observed. The slice-A refusal path does NOT consult this field today;
-    /// see register LINUX-BOOT-STOP-SLICEA-REFUSAL-01 (a separate, later
-    /// slice). Must be the SAME `Arc` `boot()` hands `DaemonHandle::shutdown_flag`,
-    /// never a copy.
+    /// consults this field (the reclaim-drift site, `ReArmLostOwned`, startup
+    /// loss, and, as of register LINUX-BOOT-STOP-SLICEA-REFUSAL-01, the slice-A
+    /// refusal path via [`refuse_after_owned_table`]) loads it FRESH at its own
+    /// decision point rather than caching a copy earlier, so a stop that
+    /// arrives mid-acquisition is still observed. Must be the SAME `Arc`
+    /// `boot()` hands `DaemonHandle::shutdown_flag`, never a copy.
     pub shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -774,12 +773,11 @@ enum DriftFailClosedOutcome {
 
 /// A162 (Erik, 2026-09-24), the boot-phase extension of A155: a routine stop
 /// never installs a HOST-WIDE net, whether it lands before `READY=1` (a boot
-/// acquisition install: the reclaim-drift site, the `ReArmLostOwned` site, and
-/// the STARTUP LOST path in
-/// [`NftablesTableComponent::install_net_on_startup_loss`]; the slice-A
-/// refusal path routed through [`refuse_after_owned_table`] does NOT
-/// participate yet, see register LINUX-BOOT-STOP-SLICEA-REFUSAL-01) or after
-/// it (the post-READY controller,
+/// acquisition install: the reclaim-drift site, the `ReArmLostOwned` site, the
+/// STARTUP LOST path in
+/// [`NftablesTableComponent::install_net_on_startup_loss`], and, as of
+/// register LINUX-BOOT-STOP-SLICEA-REFUSAL-01, the slice-A refusal path routed
+/// through [`refuse_after_owned_table`]) or after it (the post-READY controller,
 /// [`NftablesTableComponent::recover_post_ready_loss`]). `HostWide` here means
 /// no confined uid is known for this boot (or the retained/deny set
 /// overflowed), so an install at stop time would have nothing legitimate to
@@ -1445,6 +1443,12 @@ struct RefusalNet {
 #[cfg(target_os = "linux")]
 fn refuse_after_owned_table(
     decision_engine: &DecisionEngine,
+    // LINUX-BOOT-STOP-SLICEA-REFUSAL-01: the LIVE `Arc`; the parameter type
+    // is what makes a pre-resolution sample unrepresentable. Loaded fresh below, after the caller's scope resolution has
+    // already returned (`net` is only `Some` once `resolve_net_scope_at_site`
+    // and `net_scope_for_refusal` have both produced their answer) and
+    // immediately before the one nft transaction this function can issue.
+    shutdown_requested: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     net: Option<RefusalNet>,
     reason: String,
 ) -> EnforcementError {
@@ -1460,14 +1464,26 @@ fn refuse_after_owned_table(
         kill_set,
         sentence,
     } = net;
-    // slice-A refusal path: register LINUX-BOOT-STOP-SLICEA-REFUSAL-01 (a
-    // separate slice) is the stop-time HostWide skip for this site; until it
-    // lands this call always passes `false`, so `drift_enforce_fail_closed`
-    // never takes its skip arm here and this site's behavior is unchanged from
-    // before that predicate existed.
+    // TEST-ISOLATION ONLY: simulate a stop landing in the window between the
+    // caller's scope resolution (already complete; `net` is `Some`) and the
+    // live load immediately below. See
+    // `arm_shutdown_after_slice_a_scope_resolution_for_test`.
+    #[cfg(all(target_os = "linux", feature = "test-isolation"))]
+    // One-shot, like the write-ahead seam: consumed on the first `Some(net)`
+    // entry so the doc-comment's "exactly the next call" is what the code does.
+    if ARM_SHUTDOWN_AFTER_SLICE_A_SCOPE_RESOLUTION_FOR_TEST
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        shutdown_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    // register LINUX-BOOT-STOP-SLICEA-REFUSAL-01: loaded HERE, live, not
+    // captured by the caller — this is after scope resolution and immediately
+    // before the nft transaction `drift_enforce_fail_closed` may issue, so a
+    // stop that lands during that resolution is still observed.
+    let shutdown_requested_now = shutdown_requested.load(std::sync::atomic::Ordering::SeqCst);
     let refuse_detail = match drift_enforce_fail_closed(
         decision_engine,
-        false,
+        shutdown_requested_now,
         || crate::nftables::install_deny_all_safety_net(&scope),
         &kill_set,
         &scope,
@@ -1475,18 +1491,17 @@ fn refuse_after_owned_table(
         DriftFailClosedOutcome::NetInstalled => {
             format!("{reason} Installed the safety net and refusing readiness. {sentence}")
         }
-        // Unreachable from this call site (see the comment above): kept only
-        // because this match is over the shared `DriftFailClosedOutcome` enum.
-        // A162: a stop was already requested with no confined identity known; the
-        // host-wide install was skipped rather than silencing every principal on
-        // the host. `stop_time_hostwide_skip` has already ATTEMPTED the residual
-        // audit row and always emitted the stderr line naming the skip (which
-        // names the append failure too, if the bounded append could not
-        // complete); the row itself is best-effort, not guaranteed.
+        // A162/LINUX-BOOT-STOP-SLICEA-REFUSAL-01: a stop was already requested
+        // with no confined identity known; the host-wide install was skipped
+        // rather than silencing every principal on the host. `stop_time_hostwide_skip`
+        // has already ATTEMPTED the residual audit row (best-effort within
+        // `FAILURE_AUDIT_BUDGET`; a failed bounded append is itself named on
+        // stderr, not guaranteed written) and always emitted the stderr line
+        // naming the skip.
         DriftFailClosedOutcome::HostWideSkippedForRequestedStop => format!(
             "{reason} A stop was already requested and no confined identity is known for \
-             this boot; skipped the host-wide safety net install (register \
-             LINUX-BOOT-STOP-HOSTWIDE-NET-01) rather than silencing every \
+             this boot; the host-wide safety net install was skipped (register \
+             LINUX-BOOT-STOP-SLICEA-REFUSAL-01) rather than silencing every \
              principal on the host. Refusing readiness."
         ),
         DriftFailClosedOutcome::InstallFailedSweepHooked { net_err } => format!(
@@ -1574,6 +1589,52 @@ pub fn force_next_agent_binding_readback_mismatch_for_test() -> ForcedAgentBindi
     ForcedAgentBindingReadbackMismatch { _private: () }
 }
 
+/// LINUX-BOOT-STOP-SLICEA-REFUSAL-01 fail-before seam: simulates a SIGTERM
+/// landing in the window between the slice-A refusal path's scope resolution
+/// (`resolve_net_scope_at_site` / `net_scope_for_refusal`, run by the `refuse`
+/// closure inside [`bind_admitted_uid_before_ready`]) returning and
+/// [`refuse_after_owned_table`]'s own live load of the shared flag. Arming this
+/// sets the SAME shared `Arc<AtomicBool>` a real signal handler sets -- it is
+/// not a parallel flag -- so, on the single production boot, its effect on
+/// the refusal decision is the one a signal would have (a second in-process
+/// boot in a test keeps the first boot's handler allocation; these tests boot
+/// once before arming). Absent from a normal build
+/// (compiled only under `test-isolation`), and cleared unconditionally by the
+/// RAII guard so a test that arms it and exits early cannot leave it armed for
+/// a later test's boot.
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+static ARM_SHUTDOWN_AFTER_SLICE_A_SCOPE_RESOLUTION_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII handle for the override above; see
+/// [`arm_shutdown_after_slice_a_scope_resolution_for_test`].
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub struct ArmedShutdownAfterSliceAScopeResolutionForTest {
+    _private: (),
+}
+
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+impl Drop for ArmedShutdownAfterSliceAScopeResolutionForTest {
+    fn drop(&mut self) {
+        ARM_SHUTDOWN_AFTER_SLICE_A_SCOPE_RESOLUTION_FOR_TEST
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Arm the override above for exactly the next call to
+/// [`refuse_after_owned_table`] that reaches its `Some(net)` arm (i.e. the
+/// slice-A refusal path's scope resolution has already produced a scope to
+/// install). Returns a guard that clears the latch on drop; a test must bind
+/// it (not `let _ = ...`, which would drop it immediately and clear the latch
+/// before the boot call it covers).
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub fn arm_shutdown_after_slice_a_scope_resolution_for_test(
+) -> ArmedShutdownAfterSliceAScopeResolutionForTest {
+    ARM_SHUTDOWN_AFTER_SLICE_A_SCOPE_RESOLUTION_FOR_TEST
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    ArmedShutdownAfterSliceAScopeResolutionForTest { _private: () }
+}
+
 /// Bind the admitted uid into the kernel, and prove it from the kernel, before
 /// anything can report readiness.
 ///
@@ -1596,6 +1657,10 @@ pub fn force_next_agent_binding_readback_mismatch_for_test() -> ForcedAgentBindi
 fn bind_admitted_uid_before_ready(
     ownership: &crate::nftables::CastleTableOwnership,
     decision_engine: &DecisionEngine,
+    // LINUX-BOOT-STOP-SLICEA-REFUSAL-01: threaded straight through to
+    // `refuse_after_owned_table`, which loads it live after scope resolution.
+    // The `Arc`, never a `bool`: see that function's own parameter doc.
+    shutdown_requested: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     journal_path: &std::path::Path,
     key_path: &std::path::Path,
     existing: Option<&crate::ownership_journal::OwnershipJournal>,
@@ -1660,18 +1725,23 @@ fn bind_admitted_uid_before_ready(
     // function was handed and never opens the journal), and the union with the
     // planner's uncovered uids and B is what keeps the installed scope at or
     // above the authenticated floor. See `net_scope_for_refusal`.
-    // slice-A refusal path: stop-time HostWide skip is register
-    // LINUX-BOOT-STOP-SLICEA-REFUSAL-01 (separate slice); this site reads no
-    // shutdown state yet.
+    // LINUX-BOOT-STOP-SLICEA-REFUSAL-01: the resolution below is read-only and
+    // does not itself consult `shutdown_requested`; the live load happens
+    // inside `refuse_after_owned_table`, after this closure's resolution has
+    // returned and immediately before that function's one nft transaction, so
+    // a stop landing anywhere in `resolve_net_scope_at_site` /
+    // `net_scope_for_refusal` (including the `nft -j list table` shell-out
+    // inside resolution) is still observed at the decision.
     let refuse = |install_net: bool, uncovered_uids: &[u32], reason: String| -> EnforcementError {
         if !install_net {
-            return refuse_after_owned_table(decision_engine, None, reason);
+            return refuse_after_owned_table(decision_engine, shutdown_requested, None, reason);
         }
         let resolution = resolve_net_scope_at_site(existing, decision_engine);
         let scope = net_scope_for_refusal(&resolution, uncovered_uids, &live_binding_uids);
         let sentence = refusal_scope_sentence(&scope, &resolution);
         refuse_after_owned_table(
             decision_engine,
+            shutdown_requested,
             Some(RefusalNet {
                 scope,
                 kill_set: resolution.kill_set,
@@ -2333,6 +2403,7 @@ impl ComponentProvider for NftablesTableProvider {
             if let Err(err) = bind_admitted_uid_before_ready(
                 &ownership,
                 &self.decision_engine,
+                &self.shutdown_requested,
                 journal_path,
                 key_path,
                 existing.as_ref(),

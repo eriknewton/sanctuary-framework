@@ -57,7 +57,8 @@ use castle_wall_daemon::ownership_journal::{
 };
 use castle_wall_daemon::runtime_lock::DEFAULT_HOST_LOCK_PATH;
 use castle_wall_daemon::runtime_providers::{
-    self, force_next_agent_binding_readback_mismatch_for_test,
+    self, arm_shutdown_after_slice_a_scope_resolution_for_test,
+    force_next_agent_binding_readback_mismatch_for_test,
     force_next_agent_binding_write_ahead_error_for_test,
 };
 use castle_wall_daemon::safety_net_uid::{
@@ -1191,8 +1192,9 @@ fn gf1_lost_owned_table_then_restart_re_arms_deny_all_never_fresh_accept() {
 
 // --- A162 (register LINUX-BOOT-STOP-HOSTWIDE-NET-01): a stop requested during
 // the BOOT phase never installs a host-wide net, extending A155's post-READY
-// rule to the reclaim-drift, ReArmLostOwned and startup-loss install sites
-// (the slice-A refusal path is a separate slice, LINUX-BOOT-STOP-SLICEA-REFUSAL-01). Both tests below drive the
+// rule to the reclaim-drift, ReArmLostOwned and startup-loss install sites;
+// the slice-A refusal path is covered by its own tests below
+// (LINUX-BOOT-STOP-SLICEA-REFUSAL-01). Both tests below drive the
 // SAME ReArmLostOwned site the two GF1 tests above exercise (boot to ready,
 // stop, delete the table out from under the surviving journal, boot again),
 // but the second boot pre-arms `test_boot_time_shutdown_requested` (the
@@ -1345,6 +1347,269 @@ fn a162_boot_stop_still_installs_identity_scope_net_with_known_confined_history(
             Ok(true)
         ),
         "the installed table must be the recognised Identity-scoped deny-all net, never HostWide"
+    );
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+// --- LINUX-BOOT-STOP-SLICEA-REFUSAL-01: the slice-A refusal path's own
+// stop-time HostWide skip, extending A162 to the fourth pre-READY install
+// site. `refuse_after_owned_table` loads the shared shutdown flag live, after
+// the caller's scope resolution has already produced a scope to install and
+// immediately before the one nft transaction this path can issue. Both tests
+// below arm `arm_shutdown_after_slice_a_scope_resolution_for_test` BEFORE
+// calling `daemon::boot`, exactly like the two A162 siblings above arm
+// `test_boot_time_shutdown_requested`; the seam itself only flips the flag
+// once this boot's resolution has already returned a scope, so a stop
+// "already requested" here is observed at the same point a genuine SIGTERM
+// landing in that window would be.
+
+/// Slice-A, widened-scope leg: first boot admits nobody, leaving an owned,
+/// jump-free table. Before the second boot, this boot's KNOWN history is
+/// planted naming uid 0 (root) as a previously confined identity: a same-boot
+/// `Owned` record with an ABSENT `confined` key never reaches this function at
+/// all, because `bind_admitted_uid_before_ready`'s own caller reroutes that
+/// shape (a same-boot record whose history is UNKNOWN) straight to the
+/// `ReArmLostOwned` boot-owner arm before the slice-A decision ever runs (see
+/// the `history_unknown_this_boot` reroute a few lines above the call into
+/// this module's acquisition match). A KNOWN history naming an uncovered uid
+/// does reach it. The second boot admits [`TEST_AGENT_UID`]; since root is
+/// never equal to the admitted uid, `plan_admitted_binding`'s history
+/// reconciliation returns `RefuseWithNet` with `uncovered_uids = [0]` before
+/// any write-ahead runs (the forced write-ahead failure is armed as a belt for
+/// the known-history sibling below and is not what reaches this arm here).
+/// `net_scope_for_refusal` then widens the scope: `validate_safety_net_uid`
+/// refuses uid 0 outright (`SafetyNetUidError::Root`), so the resolved
+/// deny set cannot name it, and a member the validator dropped still widens
+/// the installed scope past `Identity` to `HostWide` rather than silently
+/// disappearing. With the seam armed, the host-wide install must be SKIPPED
+/// entirely: the pre-existing table is left exactly as the first boot made
+/// it, never mutated into a deny-all net.
+#[test]
+fn a162_slicea_boot_stop_after_resolution_skips_hostwide_net() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+
+    // First boot: no manifest written yet, so the admitted identity is
+    // Unconfined and the table is created with no per-agent binding.
+    match daemon::boot(fresh_confining_config(&dir, &signing)) {
+        Ok(handle) => {
+            assert_eq!(
+                handle.runtime_state(),
+                DaemonRuntimeState::KernelRuntimeReady
+            );
+            handle.stop().expect("clean stop");
+        }
+        Err(err) => {
+            assert_activation_failure(&err);
+            cleanup_castle_table();
+            cleanup_journal();
+            skip_or_fail_unprivileged(&format!(
+                "first daemon could not establish the reclaim precondition: {err}"
+            ));
+            return;
+        }
+    }
+    assert!(
+        nftables::table_exists().unwrap_or(false),
+        "precondition: the owned table survives an ordinary clean stop"
+    );
+
+    // Rewrite the journal in place: keep the real identity/handles (so the
+    // second boot's ownership match still verifies against the live table),
+    // but plant a KNOWN history naming uid 0 (root) as a previously confined
+    // identity. Root can never be the admitted uid, so this boot's history
+    // reconciliation always treats it as uncovered, and `validate_safety_net_uid`
+    // always refuses it (`SafetyNetUidError::Root`), which is what drives the
+    // widened HostWide scope this test asserts on. Planting `confined: None`
+    // (UNKNOWN history) instead would never reach this function's decision at
+    // all: the acquisition match a few lines above the call into this module
+    // reroutes a same-boot record with an ABSENT `confined` key straight to
+    // `ReArmLostOwned` before the slice-A path runs.
+    let key = ownership_journal::load_or_generate_auth_key(&journal_auth_key_path())
+        .expect("the isolated key path must be writable");
+    let existing = ownership_journal::load(&ownership_journal_path(), Some(&key))
+        .expect("the journal must authenticate")
+        .expect("the first boot must have left an Owned record");
+    let (identity, table_handle, base_chain_handle) = match existing {
+        ownership_journal::OwnershipJournal::Owned {
+            identity,
+            table_handle,
+            base_chain_handle,
+            ..
+        } => (identity, table_handle, base_chain_handle),
+        other => panic!("the first boot must leave an Owned record, got {other:?}"),
+    };
+    let stale_root_history = ownership_journal::OwnershipJournal::owned_with_known_history(
+        identity,
+        table_handle,
+        base_chain_handle,
+        vec![ownership_journal::ConfinedIdentity {
+            uid: 0,
+            role: ownership_journal::ConfinedRole::Agent,
+        }],
+    )
+    .expect("the planted record must be constructible");
+    ownership_journal::store_atomic(&ownership_journal_path(), &stale_root_history, &key)
+        .expect("rewriting the journal to the planted history must store");
+
+    // Second boot: a CONFINING manifest admitting TEST_AGENT_UID (never equal
+    // to the planted root uid, so the history reconciliation's install-net arm
+    // is reached from the reconciliation step itself, before any write-ahead
+    // would run; the forced write-ahead failure is armed only as a belt for
+    // the known-history sibling below), and the seam armed so a stop is
+    // observed once this boot's scope resolution has already run.
+    write_confining_manifest(dir.path(), &signing);
+    let _forced_write_ahead_error = force_next_agent_binding_write_ahead_error_for_test();
+    let _armed_stop_after_resolution = arm_shutdown_after_slice_a_scope_resolution_for_test();
+    let err = daemon::boot(fresh_confining_config(&dir, &signing))
+        .err()
+        .expect("a boot-phase stop observed at the refusal decision must still fail-before");
+    assert_activation_failure(&err);
+
+    let after = nft_list_isolated_table();
+    assert!(
+        !after.contains("policy drop"),
+        "a stop observed at the refusal decision must skip the host-wide install, not race it \
+         in: {after}"
+    );
+    assert!(
+        after.contains("policy accept"),
+        "the pre-existing table (from the first, Unconfined boot) must be left exactly as it \
+         was, never mutated by the skipped install: {after}"
+    );
+    assert!(
+        error_names_the_slicea_refusal_skip(&err.to_string()),
+        "the boot error must specifically name the LINUX-BOOT-STOP-SLICEA-REFUSAL-01 skip, not \
+         just fail for some other reason that happens to leave the table unchanged: {err}"
+    );
+    assert!(
+        wal_contains_hostwide_skip_residual_row(&dir),
+        "the residual audit row `stop_time_net_skipped_no_known_identity` must be present"
+    );
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+/// Slice-A, known-identity sibling of the widened-scope leg above: the first
+/// boot runs without a confining manifest and the test then plants
+/// [`TEST_AGENT_UID`] in this boot's history (see the body), so the journal
+/// names it before the second boot. The second boot's forced write-ahead
+/// failure routes through the same `install_net=true` arm, but this time the
+/// pre-match history names only the uid the second boot itself admits, so
+/// nothing is uncovered and `validate_safety_net_uid` accepts it, and the
+/// resolution is `SafetyNetScope::Identity` with no widening. Memo
+/// `Linux_C2a_FailClosed_Architecture_v2` §1 invariant: a known confined
+/// identity always gets its one net attempt, so even with the seam armed the
+/// install must proceed, never skip.
+#[test]
+fn a162_slicea_boot_stop_after_resolution_still_installs_identity_scope_net() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    // First boot, over a manifest that confines nobody: it creates and owns
+    // the table and writes this boot's record with no per-agent jump.
+    match daemon::boot(fresh_config(&dir)) {
+        Ok(handle) => {
+            assert_eq!(
+                handle.runtime_state(),
+                DaemonRuntimeState::KernelRuntimeReady
+            );
+            handle.stop().expect("clean stop");
+        }
+        Err(err) => {
+            assert_activation_failure(&err);
+            cleanup_castle_table();
+            cleanup_journal();
+            skip_or_fail_unprivileged(&format!(
+                "first daemon could not establish the owned-empty-table precondition: {err}"
+            ));
+            return;
+        }
+    }
+
+    // Rewrite the record so this boot's confined history names the uid,
+    // keeping the identity and both kernel handles the first boot captured.
+    let key = ownership_journal::load_or_generate_auth_key(&journal_auth_key_path())
+        .expect("the isolated key path must be writable");
+    let planted = match ownership_journal::load(&ownership_journal_path(), Some(&key))
+        .expect("the first boot's record must authenticate")
+        .expect("the first boot must leave an ownership record")
+    {
+        ownership_journal::OwnershipJournal::Owned {
+            identity,
+            table_handle,
+            base_chain_handle,
+            ..
+        } => ownership_journal::OwnershipJournal::owned_with_known_history(
+            identity,
+            table_handle,
+            base_chain_handle,
+            vec![ownership_journal::ConfinedIdentity {
+                uid: TEST_AGENT_UID,
+                role: ownership_journal::ConfinedRole::Agent,
+            }],
+        )
+        .expect("the planted record must be constructible"),
+        other => panic!("the first boot must leave an Owned record, got {other:?}"),
+    };
+    ownership_journal::store_atomic(&ownership_journal_path(), &planted, &key)
+        .expect("the planted record must store");
+
+    // Second boot: the manifest now admits the uid, the write-ahead is forced
+    // to fail, and the seam is armed so a stop is observed once this boot's
+    // scope resolution has already run.
+    let signing = SigningKey::generate(&mut OsRng);
+    write_confining_manifest(dir.path(), &signing);
+    let config = fresh_confining_config(&dir, &signing);
+    let _forced_error = force_next_agent_binding_write_ahead_error_for_test();
+    let _armed_stop_after_resolution = arm_shutdown_after_slice_a_scope_resolution_for_test();
+    let boot_result = daemon::boot(config);
+
+    let message = match boot_result {
+        Ok(_handle) => panic!("a failed write-ahead must withhold READY=1"),
+        Err(err) => {
+            assert_activation_failure(&err);
+            err.to_string()
+        }
+    };
+    if !message.contains("write-ahead forced to fail") {
+        cleanup_castle_table();
+        cleanup_journal();
+        skip_or_fail_unprivileged(&format!(
+            "boot did not reach the forced write-ahead seam: {message}"
+        ));
+        return;
+    }
+    assert!(
+        message.contains("Installed the safety net and refusing readiness"),
+        "a known confined identity must still get its one net attempt under a boot-phase stop \
+         observed at the refusal decision, via the slice-A refusal site \
+         (`refuse_after_owned_table`'s exact sentence), never via the `ReArmLostOwned` boot-owner \
+         arm (whose own install sentence differs: \"table vanished (external delete)\" with a \
+         lower-case \"installed\"): {message}"
+    );
+    assert!(
+        !message.contains("table vanished (external delete)"),
+        "this leg must reach the slice-A refusal path (`bind_admitted_uid_before_ready`), not the \
+         `ReArmLostOwned` boot-owner arm that a same-boot record with UNKNOWN history would \
+         reroute to: {message}"
+    );
+    let denied = installed_net_rule_one_uids();
+    assert!(
+        denied.contains(&TEST_AGENT_UID),
+        "rule 1 of the installed net must deny the uid the bind was about to make live; \
+         denied={denied:?}, refusal={message}"
     );
 
     cleanup_castle_table();
@@ -2197,6 +2462,15 @@ fn wal_contains_hostwide_skip_residual_row(dir: &TempDir) -> bool {
 /// the skip decision.
 fn error_names_the_hostwide_skip(message: &str) -> bool {
     message.contains("LINUX-BOOT-STOP-HOSTWIDE-NET-01")
+        && message.contains("safety net install was skipped")
+        && !message.contains("Installed the safety net")
+}
+
+/// The slice-A-specific sibling of [`error_names_the_hostwide_skip`]: pins the
+/// failure to the LINUX-BOOT-STOP-SLICEA-REFUSAL-01 skip, never to some other
+/// reason that happens to leave the table unchanged.
+fn error_names_the_slicea_refusal_skip(message: &str) -> bool {
+    message.contains("LINUX-BOOT-STOP-SLICEA-REFUSAL-01")
         && message.contains("safety net install was skipped")
         && !message.contains("Installed the safety net")
 }
