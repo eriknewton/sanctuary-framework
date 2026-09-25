@@ -57,7 +57,8 @@ use castle_wall_daemon::ownership_journal::{
 };
 use castle_wall_daemon::runtime_lock::DEFAULT_HOST_LOCK_PATH;
 use castle_wall_daemon::runtime_providers::{
-    self, force_next_agent_binding_readback_mismatch_for_test,
+    self, arm_shutdown_at_slice_a_refuse_for_test,
+    force_next_agent_binding_readback_mismatch_for_test,
     force_next_agent_binding_write_ahead_error_for_test,
 };
 use castle_wall_daemon::safety_net_uid::{
@@ -1259,7 +1260,21 @@ fn a162_boot_stop_skips_hostwide_net_with_unknown_confined_history() {
     assert!(
         !nftables::table_exists().unwrap_or(true),
         "a stop already requested with no confined identity known must skip the host-wide \
-         install entirely (A162), never install-then-refuse"
+         install entirely, never install-then-refuse"
+    );
+    // SPECIFICITY (Claude Lens B round 1): the table's absence alone would also
+    // pass if boot failed earlier for an unrelated reason. Pin the failure to
+    // THIS skip: the error names the register id and the skip verb, never the
+    // install arm's text, AND the residual audit row this skip is required to
+    // attempt is actually present in the WAL.
+    assert!(
+        error_names_the_hostwide_skip(&err.to_string()),
+        "the boot error must specifically name the LINUX-BOOT-STOP-HOSTWIDE-NET-01 skip, \
+         not just fail for some other reason that happens to leave the table absent: {err}"
+    );
+    assert!(
+        wal_contains_hostwide_skip_residual_row(&dir),
+        "the residual audit row `stop_time_net_skipped_no_known_identity` must be present"
     );
 
     cleanup_castle_table();
@@ -1330,6 +1345,136 @@ fn a162_boot_stop_still_installs_identity_scope_net_with_known_confined_history(
             Ok(true)
         ),
         "the installed table must be the recognised Identity-scoped deny-all net, never HostWide"
+    );
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+/// LINUX-BOOT-STOP-HOSTWIDE-NET-01, timing regression (round-1 gate finding
+/// F1): the two siblings above pre-arm the shutdown flag through
+/// `test_boot_time_shutdown_requested` BEFORE `daemon::boot` is even called,
+/// which the round-1 defect would ALSO have caught, since the stale `bool`
+/// this fix replaced was sampled once, early, and stayed set for the whole
+/// boot. This test proves the narrower and more dangerous case: a stop that
+/// arrives AFTER `bind_admitted_uid_before_ready` has already started its
+/// kernel/journal work, but BEFORE its refusal decision. The round-1 shape
+/// sampled the flag into a `bool` at the CALL SITE, before this function ran
+/// at all, so a stop arriving anywhere inside it -- including here -- would
+/// never have been observed. The fix threads the live `Arc` in and loads it
+/// fresh at the decision instead; the seam below arms the SAME shared flag
+/// only once this function has already begun, exercising exactly that gap.
+///
+/// Scenario: boot once with no confining manifest (Unconfined), so the table
+/// is created with no per-agent binding. Stop cleanly (table + journal
+/// survive). Rewrite the on-disk journal in place so its `confined` key
+/// becomes ABSENT (UNKNOWN HISTORY) while every other field -- boot id,
+/// marker, table/base-chain handles -- is left exactly as the real boot left
+/// it, so the second boot's `ReclaimOwned` verification still succeeds
+/// against the live table. Boot again with a CONFINING manifest (same signing
+/// key): the live table still carries no binding for the newly admitted uid,
+/// so the plan is `Install`; the pre-match history is UNKNOWN, so the net
+/// resolves HostWide; forcing the confined-uid write-ahead to fail routes
+/// through the mid-plan failure arm's `refuse(net_required_mid_plan, ...)`,
+/// with `net_required_mid_plan` forced true by the unknown history -- the
+/// exact call this fix's `refuse` closure serves.
+#[test]
+fn a162_slice_a_refuse_reads_the_live_flag_not_a_copy_sampled_before_the_call() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+
+    // First boot: no manifest written yet, so the admitted identity is
+    // Unconfined and the table is created with no per-agent binding.
+    match daemon::boot(fresh_confining_config(&dir, &signing)) {
+        Ok(handle) => {
+            assert_eq!(
+                handle.runtime_state(),
+                DaemonRuntimeState::KernelRuntimeReady
+            );
+            handle.stop().expect("clean stop");
+        }
+        Err(err) => {
+            assert_activation_failure(&err);
+            cleanup_castle_table();
+            cleanup_journal();
+            skip_or_fail_unprivileged(&format!(
+                "first daemon could not establish the reclaim precondition: {err}"
+            ));
+            return;
+        }
+    }
+    assert!(
+        nftables::table_exists().unwrap_or(false),
+        "precondition: the owned table survives an ordinary clean stop"
+    );
+
+    // Rewrite the journal in place: keep the real identity/handles (so
+    // ReclaimOwned still verifies against the live table on the next boot),
+    // but drop the `confined` key to UNKNOWN -- a record from a binary that
+    // predates the field, or one this boot never wrote a confined entry into.
+    let key = ownership_journal::load_or_generate_auth_key(&journal_auth_key_path())
+        .expect("the isolated key path must be writable");
+    let existing = ownership_journal::load(&ownership_journal_path(), Some(&key))
+        .expect("the journal must authenticate")
+        .expect("the first boot must have left an Owned record");
+    let (identity, table_handle, base_chain_handle) = match existing {
+        ownership_journal::OwnershipJournal::Owned {
+            identity,
+            table_handle,
+            base_chain_handle,
+            ..
+        } => (identity, table_handle, base_chain_handle),
+        other => panic!("the first boot must leave an Owned record, got {other:?}"),
+    };
+    let unknown_history = ownership_journal::OwnershipJournal::owned_with_unknown_history(
+        identity,
+        table_handle,
+        base_chain_handle,
+    );
+    ownership_journal::store_atomic(&ownership_journal_path(), &unknown_history, &key)
+        .expect("rewriting the journal to unknown history must store");
+
+    // Second boot: a CONFINING manifest this time. Force the write-ahead
+    // persist to fail (driving the mid-plan failure `refuse` call), and arm
+    // the timing seam so the stop is only requested once
+    // `bind_admitted_uid_before_ready` has already begun -- never before
+    // `daemon::boot` is even called.
+    write_confining_manifest(dir.path(), &signing);
+    let _forced_write_ahead_error = force_next_agent_binding_write_ahead_error_for_test();
+    let _armed_late_stop = arm_shutdown_at_slice_a_refuse_for_test();
+    let err = daemon::boot(fresh_confining_config(&dir, &signing))
+        .err()
+        .expect("a boot-phase stop that arrives mid-bind must still fail-before");
+    assert_activation_failure(&err);
+
+    // FAIL-BEFORE CHECK: without the F1 fix, this exact scenario installs a
+    // host-wide net -- the stale `bool` sampled before the call is `false`
+    // here, since the seam only sets the flag once this function has already
+    // begun running, well after the caller's old sample point.
+    let after = nft_list_isolated_table();
+    assert!(
+        !after.contains("policy drop"),
+        "a stop that arrives mid-bind must still skip the host-wide install, not race it in: \
+         {after}"
+    );
+    assert!(
+        after.contains("policy accept"),
+        "the pre-existing table (from the first, Unconfined boot) must be left exactly as it \
+         was, never mutated by the skipped install: {after}"
+    );
+    assert!(
+        error_names_the_hostwide_skip(&err.to_string()),
+        "the boot error must specifically name the LINUX-BOOT-STOP-HOSTWIDE-NET-01 skip, not \
+         just fail for some other reason that happens to leave the table unchanged: {err}"
+    );
+    assert!(
+        wal_contains_hostwide_skip_residual_row(&dir),
+        "the residual audit row `stop_time_net_skipped_no_known_identity` must be present"
     );
 
     cleanup_castle_table();
@@ -2157,6 +2302,33 @@ fn wal_contains_recovery_row(dir: &TempDir) -> bool {
         return false;
     };
     contents.contains("kernel_runtime_lost") && contents.contains("recovery=")
+}
+
+/// Whether the WAL this run wrote holds the LINUX-BOOT-STOP-HOSTWIDE-NET-01 /
+/// A155 residual row `stop_time_hostwide_skip` appends on every host-wide skip
+/// under a requested stop. Same raw-substring-scan rationale as
+/// `wal_contains_recovery_row` above: the operation name is the one literal
+/// every caller's audit trail and any operator grep for this residual class
+/// relies on (`runtime_providers.rs`'s `RESIDUAL_REASON` constant), and this
+/// test only needs to prove the row is present, not parse its full structure.
+fn wal_contains_hostwide_skip_residual_row(dir: &TempDir) -> bool {
+    let Ok(contents) = std::fs::read_to_string(dir.path().join("wal.jsonl")) else {
+        return false;
+    };
+    contents.contains("stop_time_net_skipped_no_known_identity")
+}
+
+/// Whether a boot error's text is SPECIFICALLY the LINUX-BOOT-STOP-HOSTWIDE-NET-01
+/// host-wide skip (never a generic install or an unrelated failure that would
+/// also leave the table absent). Checked by the register id every A162 skip
+/// message carries plus the "skipped" verb, and the ABSENCE of the install
+/// arm's "Installed the safety net" text, so a test asserting on this cannot
+/// pass because the daemon failed for some other reason before ever reaching
+/// the skip decision.
+fn error_names_the_hostwide_skip(message: &str) -> bool {
+    message.contains("LINUX-BOOT-STOP-HOSTWIDE-NET-01")
+        && message.contains("safety net install was skipped")
+        && !message.contains("Installed the safety net")
 }
 
 /// W1a (memo §4 test table): the real `main` binary, `--test-health-interval-ms`

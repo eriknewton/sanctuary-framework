@@ -78,6 +78,7 @@ fn config(paths: &LinuxRuntimePaths, policy_dir: &Path) -> LinuxRuntimeConfig {
         policy_dir: policy_dir.to_path_buf(),
         poll_interval: Duration::from_millis(200),
         nfqueue: NfqueueConfig::default(),
+        shutdown_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }
 

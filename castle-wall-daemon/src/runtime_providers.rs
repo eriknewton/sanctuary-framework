@@ -93,14 +93,20 @@ pub struct LinuxRuntimeConfig {
     pub poll_interval: Duration,
     /// NFQUEUE bind configuration (queue number, FAIL_OPEN off, deadlines).
     pub nfqueue: NfqueueConfig,
-    /// A162 (Erik, 2026-09-24): the daemon's shutdown-REQUEST flag, threaded from
-    /// `boot()` all the way into the nftables provider/component so every
-    /// pre-READY (boot-phase) safety-net install site can see a stop that was
-    /// requested before kernel activation completes, the same way the post-READY
-    /// supervisor sees it. `install_shutdown_signal_handlers` sets this BEFORE
-    /// kernel activation runs; without this field the boot-phase install sites
-    /// read no shutdown state at all (LINUX-BOOT-STOP-HOSTWIDE-NET-01). Must be
-    /// the SAME `Arc` `boot()` hands `DaemonHandle::shutdown_flag`, never a copy.
+    /// LINUX-BOOT-STOP-HOSTWIDE-NET-01: the daemon's shutdown-REQUEST flag,
+    /// threaded from `boot()` all the way into the nftables provider/component
+    /// so every pre-READY (boot-phase) safety-net install site can see a stop
+    /// that was requested before kernel activation completes, the same way the
+    /// post-READY supervisor sees it. `install_shutdown_signal_handlers` sets
+    /// this BEFORE kernel activation runs; without this field the boot-phase
+    /// install sites read no shutdown state at all. Every site downstream that
+    /// consults this field (drift, `ReArmLostOwned`, startup loss, and the
+    /// slice-A refusal path) loads it FRESH at its own decision point rather
+    /// than caching a copy earlier, so a stop that arrives mid-acquisition is
+    /// still observed; see `bind_admitted_uid_before_ready`'s doc comment for
+    /// why the slice-A site takes this `Arc` rather than a sampled `bool`. Must
+    /// be the SAME `Arc` `boot()` hands `DaemonHandle::shutdown_flag`, never a
+    /// copy.
     pub shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -993,6 +999,7 @@ pub fn acquire_castle_table_component_for_test(
         journal_path: config.journal_path.clone(),
         journal_key_path: config.journal_key_path.clone(),
         decision_engine,
+        shutdown_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
     .acquire()
 }
@@ -1460,11 +1467,15 @@ fn refuse_after_owned_table(
         }
         // A162: a stop was already requested with no confined identity known; the
         // host-wide install was skipped rather than silencing every principal on
-        // the host. The residual audit row is already written.
+        // the host. `stop_time_hostwide_skip` has already ATTEMPTED the residual
+        // audit row and always emitted the stderr line naming the skip (which
+        // names the append failure too, if the bounded append could not
+        // complete); the row itself is best-effort, not guaranteed.
         DriftFailClosedOutcome::HostWideSkippedForRequestedStop => format!(
             "{reason} A stop was already requested and no confined identity is known for \
-             this boot; skipped the host-wide safety net install (A162) rather than \
-             silencing every principal on the host. Refusing readiness."
+             this boot; skipped the host-wide safety net install (register \
+             LINUX-BOOT-STOP-HOSTWIDE-NET-01) rather than silencing every \
+             principal on the host. Refusing readiness."
         ),
         DriftFailClosedOutcome::InstallFailedSweepHooked { net_err } => format!(
             "{reason} Safety net installation did not complete ({net_err}); refusing \
@@ -1551,6 +1562,43 @@ pub fn force_next_agent_binding_readback_mismatch_for_test() -> ForcedAgentBindi
     ForcedAgentBindingReadbackMismatch { _private: () }
 }
 
+/// LINUX-BOOT-STOP-HOSTWIDE-NET-01 fail-before seam: simulates a SIGTERM landing
+/// the instant [`bind_admitted_uid_before_ready`] begins its kernel and journal
+/// work, the exact window the round-1 defect (a `bool` sampled by the CALLER
+/// before this function was even entered) could not observe. Arming this sets
+/// the SAME shared `Arc<AtomicBool>` a real signal handler sets -- it is not a
+/// parallel flag -- so its effect on the refusal decision is indistinguishable
+/// from a genuine signal. Absent from a normal build (compiled only under
+/// `test-isolation`), and cleared unconditionally by the RAII guard so a test
+/// that arms it and exits early cannot leave it armed for a later test's boot.
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+static ARM_SHUTDOWN_AT_SLICE_A_REFUSE_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII handle for the override above; see
+/// [`arm_shutdown_at_slice_a_refuse_for_test`].
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub struct ArmedShutdownAtSliceARefuseForTest {
+    _private: (),
+}
+
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+impl Drop for ArmedShutdownAtSliceARefuseForTest {
+    fn drop(&mut self) {
+        ARM_SHUTDOWN_AT_SLICE_A_REFUSE_FOR_TEST.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Arm the override above for exactly the next call to
+/// [`bind_admitted_uid_before_ready`]. Returns a guard that clears the latch on
+/// drop; a test must bind it (not `let _ = ...`, which would drop it
+/// immediately and clear the latch before the boot call it covers).
+#[cfg(all(target_os = "linux", feature = "test-isolation"))]
+pub fn arm_shutdown_at_slice_a_refuse_for_test() -> ArmedShutdownAtSliceARefuseForTest {
+    ARM_SHUTDOWN_AT_SLICE_A_REFUSE_FOR_TEST.store(true, std::sync::atomic::Ordering::SeqCst);
+    ArmedShutdownAtSliceARefuseForTest { _private: () }
+}
+
 /// Bind the admitted uid into the kernel, and prove it from the kernel, before
 /// anything can report readiness.
 ///
@@ -1573,7 +1621,13 @@ pub fn force_next_agent_binding_readback_mismatch_for_test() -> ForcedAgentBindi
 fn bind_admitted_uid_before_ready(
     ownership: &crate::nftables::CastleTableOwnership,
     decision_engine: &DecisionEngine,
-    shutdown_requested: bool,
+    // LINUX-BOOT-STOP-HOSTWIDE-NET-01: the LIVE flag, not a sampled copy. This
+    // function does real kernel and journal work (the binding-set read, the
+    // journal key load, `load_agent_ruleset`) between being called and the
+    // `refuse` closure's decision below; a `bool` taken here would go stale
+    // across that work and could let a stop that lands mid-function install a
+    // host-wide net anyway. The closure loads it fresh at the decision instead.
+    shutdown_requested: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     journal_path: &std::path::Path,
     key_path: &std::path::Path,
     existing: Option<&crate::ownership_journal::OwnershipJournal>,
@@ -1581,6 +1635,14 @@ fn bind_admitted_uid_before_ready(
 ) -> Result<(), EnforcementError> {
     use crate::nftables::{AgentRulesetId, AgentUidBinding, OwnedBindingSet};
     use crate::ownership_journal::{self as journal, ConfinedRole};
+
+    // TEST-ISOLATION ONLY, fail-before seam: simulates a SIGTERM landing the
+    // instant this function begins, before any of the kernel/journal work below
+    // runs. See `arm_shutdown_at_slice_a_refuse_for_test`.
+    #[cfg(all(target_os = "linux", feature = "test-isolation"))]
+    if ARM_SHUTDOWN_AT_SLICE_A_REFUSE_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst) {
+        shutdown_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 
     // H, computed ONCE from the PRE-MATCH record and scoped to this boot id, and
     // the whole reason it is named here rather than inlined: it decides WHETHER a
@@ -1639,15 +1701,20 @@ fn bind_admitted_uid_before_ready(
     // planner's uncovered uids and B is what keeps the installed scope at or
     // above the authenticated floor. See `net_scope_for_refusal`.
     let refuse = |install_net: bool, uncovered_uids: &[u32], reason: String| -> EnforcementError {
+        // Loaded HERE, at the decision, not captured from the caller: this is
+        // after scope resolution and immediately before `refuse_after_owned_table`
+        // may issue an nft transaction, so a stop that arrives anywhere earlier
+        // in this function's kernel/journal work is still observed.
+        let shutdown_requested_now = shutdown_requested.load(std::sync::atomic::Ordering::SeqCst);
         if !install_net {
-            return refuse_after_owned_table(decision_engine, shutdown_requested, None, reason);
+            return refuse_after_owned_table(decision_engine, shutdown_requested_now, None, reason);
         }
         let resolution = resolve_net_scope_at_site(existing, decision_engine);
         let scope = net_scope_for_refusal(&resolution, uncovered_uids, &live_binding_uids);
         let sentence = refusal_scope_sentence(&scope, &resolution);
         refuse_after_owned_table(
             decision_engine,
-            shutdown_requested,
+            shutdown_requested_now,
             Some(RefusalNet {
                 scope,
                 kill_set: resolution.kill_set,
@@ -2036,15 +2103,19 @@ impl ComponentProvider for NftablesTableProvider {
                             ),
                             // A162: a stop was already requested with no confined identity
                             // known for this boot; the host-wide install was skipped rather
-                            // than silencing every principal on the host. Not a failure: the
-                            // residual audit row is already written.
+                            // than silencing every principal on the host. Not a failure:
+                            // `stop_time_hostwide_skip` has already ATTEMPTED the residual
+                            // audit row and always emitted the stderr line naming the skip
+                            // (which names the append failure too, if the bounded append
+                            // could not complete); the row itself is best-effort.
                             DriftFailClosedOutcome::HostWideSkippedForRequestedStop => (
                                 format!(
                                     "journal marks an owned table but the live table no longer \
                                  matches the captured identity; a stop was already requested \
                                  and no confined identity is known for this boot, so the \
-                                 host-wide safety net install was skipped (A162) rather than \
-                                 silencing every principal on the host: {err}."
+                                 host-wide safety net install was skipped (register \
+                                 LINUX-BOOT-STOP-HOSTWIDE-NET-01) rather than silencing every \
+                                 principal on the host: {err}."
                                 ),
                                 false,
                             ),
@@ -2217,8 +2288,10 @@ impl ComponentProvider for NftablesTableProvider {
                     // A162: a stop was already requested and this boot's history names no
                     // confined identity (HostWide scope); skip the host-wide install rather
                     // than silencing every principal on the host on an ordinary stop that
-                    // merely raced boot. The residual audit row is already written by
-                    // `stop_time_hostwide_skip`.
+                    // merely raced boot. `stop_time_hostwide_skip` has already ATTEMPTED the
+                    // residual audit row (best-effort: its own stderr line names the append
+                    // failure if the write could not complete) and always emitted its
+                    // stderr line naming the skip.
                     if stop_time_hostwide_skip(
                         &self.decision_engine,
                         self.shutdown_requested
@@ -2230,9 +2303,10 @@ impl ComponentProvider for NftablesTableProvider {
                             "owned sanctuary-castle table vanished (external delete) while the \
                              ownership journal still asserts ownership; a stop was already \
                              requested and no confined identity is known for this boot, so the \
-                             host-wide safety net install was skipped (A162) rather than \
-                             silencing every principal on the host; refusing readiness until \
-                             the wall is repaired. {scope_sentence}{persisted}"
+                             host-wide safety net install was skipped (register \
+                             LINUX-BOOT-STOP-HOSTWIDE-NET-01) rather than silencing every \
+                             principal on the host; refusing readiness until the wall is \
+                             repaired. {scope_sentence}{persisted}"
                         )));
                     }
                     if let Err(err) =
@@ -2295,8 +2369,7 @@ impl ComponentProvider for NftablesTableProvider {
             if let Err(err) = bind_admitted_uid_before_ready(
                 &ownership,
                 &self.decision_engine,
-                self.shutdown_requested
-                    .load(std::sync::atomic::Ordering::SeqCst),
+                &self.shutdown_requested,
                 journal_path,
                 key_path,
                 existing.as_ref(),
@@ -2842,8 +2915,10 @@ impl NftablesTableComponent {
             crate::nftables::safety_net_scope_sentence(&resolution.scope, &resolution.reason);
         // A162: a stop was already requested with no confined identity known for
         // this boot (HostWide scope); skip the host-wide install rather than
-        // silencing every principal on the host. The residual audit row is
-        // already written by `stop_time_hostwide_skip`. Leave
+        // silencing every principal on the host. `stop_time_hostwide_skip` has
+        // already ATTEMPTED the residual audit row (best-effort: its own stderr
+        // line names the append failure if the write could not complete) and
+        // always emitted its stderr line naming the skip. Leave
         // `last_safety_net_state` untouched, matching the post-READY A155 skip:
         // the tag records install history, not this reason.
         if stop_time_hostwide_skip(
@@ -2857,8 +2932,9 @@ impl NftablesTableComponent {
             eprintln!(
                 "castle-wall-daemon: a startup ownership check proved the owned nft table no \
                  longer holds, but a stop was already requested and no confined identity is \
-                 known for this boot; skipped the host-wide safety net install (A162) rather \
-                 than silencing every principal on the host. {scope_sentence}{}",
+                 known for this boot; skipped the host-wide safety net install (register \
+                 LINUX-BOOT-STOP-HOSTWIDE-NET-01) rather than silencing every principal on \
+                 the host. {scope_sentence}{}",
                 match &persist_failure {
                     None => String::new(),
                     Some(err) => format!(
@@ -5265,6 +5341,7 @@ mod tests {
             last_safety_net_state: std::sync::Mutex::new(
                 crate::nftables::SafetyNetAuditState::NotAttempted,
             ),
+            shutdown_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -6485,7 +6562,6 @@ mod tests {
         live: &[u32],
     ) -> SafetyNetResolution {
         use crate::nftables::LiveTableBindings;
-        use crate::ownership_journal::ConfinedRole;
         let entries: Vec<(u32, ConfinedRole)> = history
             .iter()
             .map(|&uid| (uid, ConfinedRole::Agent))

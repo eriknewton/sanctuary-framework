@@ -1375,10 +1375,16 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     // Daemon shutdown-REQUEST flag: set by signal handlers and request_stop,
     // observed by wait_for_shutdown. It drives the DECISION to shut down.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
-    // TEST-ISOLATION ONLY (A162, LINUX-BOOT-STOP-HOSTWIDE-NET-01): pre-set the
-    // flag before kernel activation runs, simulating a stop already requested
-    // during the boot phase -- exactly what a real signal handler would have
-    // done had SIGTERM landed before this point. This is the boot-phase
+    // TEST-ISOLATION ONLY (LINUX-BOOT-STOP-HOSTWIDE-NET-01): pre-set the flag
+    // before kernel activation runs, simulating a stop already requested
+    // during the boot phase. This is a DIRECT set of the flag's state, not a
+    // replayed signal: `install_shutdown_signal_handlers` (below, at the call
+    // site that installs the real SIGTERM/SIGINT handlers) has not run yet at
+    // this point, so an actual SIGTERM delivered this early would not be
+    // caught by this daemon's own handler at all. What this seam reproduces is
+    // the STATE the flag is in once a handler has observed a stop request --
+    // the state every boot-phase site downstream reads -- so those sites can
+    // be exercised without an actual signal race. This is the boot-phase
     // counterpart of `--test-shutdown-at pre-recovery` (which arms AFTER a
     // successful boot, through `DaemonHandle`): the acquisition path below has
     // no `DaemonHandle` to arm yet, so the seam pre-sets the flag `boot()`
@@ -2026,7 +2032,7 @@ mod tests {
         side_effect: AttemptSideEffect,
         later_interval: bool,
     ) -> Arc<AtomicUsize> {
-        use crate::enforcement::{ComponentHealth, ComponentKind, EnforcementRuntime};
+        use crate::enforcement::{ComponentHealth, ComponentKind};
         let attempts = Arc::new(AtomicUsize::new(0));
         let health = Arc::new(Mutex::new(ComponentHealth::Ready));
         let tag = Arc::new(Mutex::new(
