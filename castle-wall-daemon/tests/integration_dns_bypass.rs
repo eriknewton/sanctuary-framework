@@ -117,6 +117,7 @@ fn boot_with_only_example_com_443_allowed() -> (DaemonHandle, TempDir) {
         // host lock, ownership journal, and journal MAC key land in this run's
         // temp root, never in /var/lib/sanctuary.
         linux_runtime_paths: isolation::runtime_paths(),
+        test_boot_time_shutdown_requested: false,
     };
     let handle = boot(config).expect("boot");
     (handle, dir)

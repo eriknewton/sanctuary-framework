@@ -142,6 +142,7 @@ fn boot_daemon_with_policy(rule_count: usize) -> BootedDaemon {
         // the isolated paths is what keeps them from drifting per suite
         // (AGENTS rule 5).
         linux_runtime_paths: isolation::runtime_paths(),
+        test_boot_time_shutdown_requested: false,
     };
     let handle = boot(cfg).expect("boot daemon");
     BootedDaemon {

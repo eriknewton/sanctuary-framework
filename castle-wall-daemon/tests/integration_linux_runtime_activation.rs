@@ -209,6 +209,7 @@ fn fresh_config(dir: &TempDir) -> DaemonConfig {
         // The host-global lock / ownership journal / journal MAC key all land in
         // the suite's temp root, never in /var/lib/sanctuary.
         linux_runtime_paths: isolated_paths(),
+        test_boot_time_shutdown_requested: false,
     }
 }
 
@@ -232,6 +233,7 @@ fn fresh_confining_config(dir: &TempDir, signing: &SigningKey) -> DaemonConfig {
         wal_size_cap_bytes: 16 * 1024 * 1024,
         trusted_service_uid: Some(unsafe { libc::geteuid() }),
         linux_runtime_paths: isolated_paths(),
+        test_boot_time_shutdown_requested: false,
     }
 }
 
@@ -1181,6 +1183,153 @@ fn gf1_lost_owned_table_then_restart_re_arms_deny_all_never_fresh_accept() {
     assert!(
         !after.contains("policy accept"),
         "post: a lost owned table must never be re-armed as policy accept: {after}"
+    );
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+// --- A162 (register LINUX-BOOT-STOP-HOSTWIDE-NET-01): a stop requested during
+// the BOOT phase never installs a host-wide net, extending A155's post-READY
+// rule to every pre-READY safety-net install site. Both tests below drive the
+// SAME ReArmLostOwned site the two GF1 tests above exercise (boot to ready,
+// stop, delete the table out from under the surviving journal, boot again),
+// but the second boot pre-arms `test_boot_time_shutdown_requested` (the
+// boot-phase counterpart of `--test-shutdown-at pre-recovery`, applied to
+// `DaemonConfig` directly here since these are in-process `daemon::boot()`
+// wired-consumer tests, the same production composition root the GF1 tests
+// above exercise). AGENTS.md rule 4: this proves the production acquisition
+// path reaches the A162 skip, not merely that `stop_time_hostwide_skip` (a
+// unit test in `runtime_providers.rs`) returns the right bool in isolation.
+
+/// A162, unknown-identity leg: the first boot admits no agent (no confining
+/// manifest), so its journal record's `confined` key is absent. On restart the
+/// vanished table resolves ReArmLostOwned with UNKNOWN history -> HostWide
+/// scope. With a stop already requested, the host-wide install must be
+/// SKIPPED entirely (the table stays absent), never installed and then
+/// refused -- unlike the ordinary (no-stop) GF1 re-arm above, which DOES
+/// install it.
+#[test]
+fn a162_boot_stop_skips_hostwide_net_with_unknown_confined_history() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    match daemon::boot(fresh_config(&dir)) {
+        Ok(handle) => {
+            assert_eq!(
+                handle.runtime_state(),
+                DaemonRuntimeState::KernelRuntimeReady
+            );
+            handle.stop().expect("clean stop");
+        }
+        Err(err) => {
+            assert_activation_failure(&err);
+            cleanup_castle_table();
+            cleanup_journal();
+            skip_or_fail_unprivileged(&format!(
+                "first daemon could not establish the lost-owned-table precondition: {err}"
+            ));
+            return;
+        }
+    }
+    // The journal survived the ordinary stop; delete the table out from under
+    // it, exactly like the GF1 restart test above.
+    assert!(ownership_journal_path().exists());
+    cleanup_castle_table();
+    assert!(
+        !nftables::table_exists().unwrap_or(true),
+        "precondition: the owned table was deleted while the journal asserts ownership"
+    );
+
+    // Boot again with a stop ALREADY requested before kernel activation (the
+    // A162 seam). decide -> ReArmLostOwned; this boot's history is unknown
+    // (no confining manifest was ever admitted), so the resolution is HostWide.
+    let mut config = fresh_config(&dir);
+    config.test_boot_time_shutdown_requested = true;
+    let err = daemon::boot(config).err().expect(
+        "a boot-phase stop over an unknown identity must still fail-before (never reach READY)",
+    );
+    assert_activation_failure(&err);
+
+    // POST-CONDITION, the A162 assertion: unlike the ordinary GF1 re-arm, NO
+    // net was installed. The table stays absent.
+    assert!(
+        !nftables::table_exists().unwrap_or(true),
+        "a stop already requested with no confined identity known must skip the host-wide \
+         install entirely (A162), never install-then-refuse"
+    );
+
+    cleanup_castle_table();
+    cleanup_journal();
+}
+
+/// A162, known-identity sibling: the first boot DOES admit a confined agent
+/// (a confining manifest), so the journal record's `confined` key names
+/// [`TEST_AGENT_UID`]. On restart the vanished table resolves ReArmLostOwned
+/// with a KNOWN identity -> `SafetyNetScope::Identity`. A stop already
+/// requested must NOT skip this install (memo `Linux_C2a_FailClosed_Architecture_v2`
+/// §1 invariant: a proven loss with a known confined identity always gets its
+/// one net attempt) -- the table must be re-armed exactly as the ordinary
+/// (no-stop) GF1 test above re-arms it.
+#[test]
+fn a162_boot_stop_still_installs_identity_scope_net_with_known_confined_history() {
+    let _suite = suite_guard();
+    cleanup_castle_table();
+    cleanup_journal();
+    ensure_runtime_dir();
+
+    let dir = TempDir::new().unwrap();
+    let signing = SigningKey::generate(&mut OsRng);
+    write_confining_manifest(dir.path(), &signing);
+    match daemon::boot(fresh_confining_config(&dir, &signing)) {
+        Ok(handle) => {
+            assert_eq!(
+                handle.runtime_state(),
+                DaemonRuntimeState::KernelRuntimeReady
+            );
+            handle.stop().expect("clean stop");
+        }
+        Err(err) => {
+            assert_activation_failure(&err);
+            cleanup_castle_table();
+            cleanup_journal();
+            skip_or_fail_unprivileged(&format!(
+                "first daemon could not establish the confined lost-owned-table precondition: \
+                 {err}"
+            ));
+            return;
+        }
+    }
+    assert!(ownership_journal_path().exists());
+    cleanup_castle_table();
+    assert!(
+        !nftables::table_exists().unwrap_or(true),
+        "precondition: the owned table was deleted while the journal asserts ownership"
+    );
+
+    let mut config = fresh_confining_config(&dir, &signing);
+    config.test_boot_time_shutdown_requested = true;
+    let err = daemon::boot(config)
+        .err()
+        .expect("a vanished owned table must still fail-before even with a stop already requested");
+    assert_activation_failure(&err);
+
+    // POST-CONDITION: a KNOWN confined identity still gets its one net attempt
+    // under a requested boot-phase stop; the table is re-armed as an
+    // Identity-scoped deny-all net, never skipped.
+    assert!(
+        nftables::table_exists().unwrap_or(false),
+        "a known confined identity must still install its net even under a boot-phase stop"
+    );
+    assert!(
+        matches!(
+            nftables::live_net_covers_attempt(&identity_scope(&[TEST_AGENT_UID])),
+            Ok(true)
+        ),
+        "the installed table must be the recognised Identity-scoped deny-all net, never HostWide"
     );
 
     cleanup_castle_table();

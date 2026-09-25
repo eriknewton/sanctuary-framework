@@ -93,6 +93,15 @@ pub struct LinuxRuntimeConfig {
     pub poll_interval: Duration,
     /// NFQUEUE bind configuration (queue number, FAIL_OPEN off, deadlines).
     pub nfqueue: NfqueueConfig,
+    /// A162 (Erik, 2026-09-24): the daemon's shutdown-REQUEST flag, threaded from
+    /// `boot()` into this config so a future acquisition-path fix can see a stop
+    /// requested before kernel activation completes, the same way the
+    /// post-READY supervisor sees it. `install_shutdown_signal_handlers` sets
+    /// this BEFORE kernel activation runs. Not yet consulted by the
+    /// acquisition path in this commit (LINUX-BOOT-STOP-HOSTWIDE-NET-01's
+    /// wired-consumer tests below are the fail-before witness); must be the
+    /// SAME `Arc` `boot()` hands `DaemonHandle::shutdown_flag`, never a copy.
+    pub shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Build the production Linux enforcement plan in acquisition order. The order
@@ -4957,6 +4966,7 @@ mod tests {
             policy_dir: PathBuf::from("/nonexistent/policy"),
             poll_interval: Duration::from_millis(200),
             nfqueue: NfqueueConfig::default(),
+            shutdown_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

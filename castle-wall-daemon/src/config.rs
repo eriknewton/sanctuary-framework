@@ -129,6 +129,17 @@ pub struct DaemonConfig {
     /// it, and doing so is what keeps the suite off the operator's live lock,
     /// journal, and journal MAC key.
     pub linux_runtime_paths: LinuxRuntimePaths,
+    /// TEST-ISOLATION ONLY (A162, LINUX-BOOT-STOP-HOSTWIDE-NET-01): when set,
+    /// `boot()` pre-sets the daemon's shutdown-request flag before kernel
+    /// activation runs, simulating a stop already requested during the boot
+    /// phase (signal handlers installed, kernel activation not yet reached) --
+    /// the boot-phase counterpart of `--test-shutdown-at pre-recovery`. Set via
+    /// `--test-shutdown-at boot-acquire` in `main.rs`, applied to `config`
+    /// AFTER `from_argv` returns (mirroring `test_health_interval_ms`), never
+    /// parsed by `from_argv` itself. Compiled out of the shipped binary, so a
+    /// production boot has no argv path that can pre-arm this.
+    #[cfg(feature = "test-isolation")]
+    pub test_boot_time_shutdown_requested: bool,
 }
 
 impl DaemonConfig {
@@ -152,6 +163,8 @@ impl DaemonConfig {
             wal_size_cap_bytes: DEFAULT_WAL_SIZE_CAP_BYTES,
             trusted_service_uid: None,
             linux_runtime_paths: LinuxRuntimePaths::production(),
+            #[cfg(feature = "test-isolation")]
+            test_boot_time_shutdown_requested: false,
         }
     }
 

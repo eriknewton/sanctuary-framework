@@ -298,6 +298,7 @@ fn fresh_config(dir: &TempDir, signing: &SigningKey) -> DaemonConfig {
         // host lock, ownership journal, and journal MAC key land in this run's
         // temp root, never in /var/lib/sanctuary.
         linux_runtime_paths: isolation::runtime_paths(),
+        test_boot_time_shutdown_requested: false,
     }
 }
 
