@@ -100,13 +100,13 @@ pub struct LinuxRuntimeConfig {
     /// post-READY supervisor sees it. `install_shutdown_signal_handlers` sets
     /// this BEFORE kernel activation runs; without this field the boot-phase
     /// install sites read no shutdown state at all. Every site downstream that
-    /// consults this field (drift, `ReArmLostOwned`, startup loss, and the
-    /// slice-A refusal path) loads it FRESH at its own decision point rather
-    /// than caching a copy earlier, so a stop that arrives mid-acquisition is
-    /// still observed; see `bind_admitted_uid_before_ready`'s doc comment for
-    /// why the slice-A site takes this `Arc` rather than a sampled `bool`. Must
-    /// be the SAME `Arc` `boot()` hands `DaemonHandle::shutdown_flag`, never a
-    /// copy.
+    /// consults this field (the reclaim-drift site, `ReArmLostOwned`, and
+    /// startup loss) loads it FRESH at its own decision point rather than
+    /// caching a copy earlier, so a stop that arrives mid-acquisition is still
+    /// observed. The slice-A refusal path does NOT consult this field today;
+    /// see register LINUX-BOOT-STOP-SLICEA-REFUSAL-01 (a separate, later
+    /// slice). Must be the SAME `Arc` `boot()` hands `DaemonHandle::shutdown_flag`,
+    /// never a copy.
     pub shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -751,7 +751,9 @@ enum DriftFailClosedOutcome {
     /// A162 (Erik, 2026-09-24): a stop was already requested and the resolved
     /// scope was HostWide (no known confined identity); no kernel mutation was
     /// attempted. See [`stop_time_hostwide_skip`]. This is not a failure: the
-    /// residual audit row and stderr line were already written by that call.
+    /// stderr line naming the skip is always emitted by that call; the residual
+    /// audit row is best-effort within `FAILURE_AUDIT_BUDGET` and its absence
+    /// (on a failed bounded append) is named on stderr, not guaranteed written.
     HostWideSkippedForRequestedStop,
     /// The net install FAILED. The PR-3 sweep hook ran, and the table is LEFT
     /// STANDING.
@@ -772,10 +774,12 @@ enum DriftFailClosedOutcome {
 
 /// A162 (Erik, 2026-09-24), the boot-phase extension of A155: a routine stop
 /// never installs a HOST-WIDE net, whether it lands before `READY=1` (a boot
-/// acquisition install: the reclaim-drift site, the `ReArmLostOwned` site, the
-/// slice-A refusal path routed through [`refuse_after_owned_table`], and the
-/// STARTUP LOST path in [`NftablesTableComponent::install_net_on_startup_loss`])
-/// or after it (the post-READY controller,
+/// acquisition install: the reclaim-drift site, the `ReArmLostOwned` site, and
+/// the STARTUP LOST path in
+/// [`NftablesTableComponent::install_net_on_startup_loss`]; the slice-A
+/// refusal path routed through [`refuse_after_owned_table`] does NOT
+/// participate yet, see register LINUX-BOOT-STOP-SLICEA-REFUSAL-01) or after
+/// it (the post-READY controller,
 /// [`NftablesTableComponent::recover_post_ready_loss`]). `HostWide` here means
 /// no confined uid is known for this boot (or the retained/deny set
 /// overflowed), so an install at stop time would have nothing legitimate to
@@ -791,10 +795,12 @@ enum DriftFailClosedOutcome {
 /// THE ONE site that decides "skip or install" for a requested stop. Every
 /// caller above passes through here before mutating the kernel; do not
 /// re-implement this check at a new call site. When it returns `true` it has
-/// ALREADY recorded the residual audit row and the stderr line naming the
-/// skip, so the caller performs no further recording for the skip itself (a
-/// caller may still record its own install-history tag, or leave it
-/// untouched, per its own contract).
+/// ALREADY emitted the stderr line naming the skip (always) and ATTEMPTED the
+/// residual audit row within `FAILURE_AUDIT_BUDGET` (best-effort: a failed
+/// bounded append is itself named on stderr, not retried), so the caller
+/// performs no further recording for the skip itself (a caller may still
+/// record its own install-history tag, or leave it untouched, per its own
+/// contract).
 #[cfg(any(target_os = "linux", test))]
 fn stop_time_hostwide_skip(
     decision_engine: &DecisionEngine,
@@ -1439,7 +1445,6 @@ struct RefusalNet {
 #[cfg(target_os = "linux")]
 fn refuse_after_owned_table(
     decision_engine: &DecisionEngine,
-    shutdown_requested: bool,
     net: Option<RefusalNet>,
     reason: String,
 ) -> EnforcementError {
@@ -1455,9 +1460,14 @@ fn refuse_after_owned_table(
         kill_set,
         sentence,
     } = net;
+    // slice-A refusal path: register LINUX-BOOT-STOP-SLICEA-REFUSAL-01 (a
+    // separate slice) is the stop-time HostWide skip for this site; until it
+    // lands this call always passes `false`, so `drift_enforce_fail_closed`
+    // never takes its skip arm here and this site's behavior is unchanged from
+    // before that predicate existed.
     let refuse_detail = match drift_enforce_fail_closed(
         decision_engine,
-        shutdown_requested,
+        false,
         || crate::nftables::install_deny_all_safety_net(&scope),
         &kill_set,
         &scope,
@@ -1465,6 +1475,8 @@ fn refuse_after_owned_table(
         DriftFailClosedOutcome::NetInstalled => {
             format!("{reason} Installed the safety net and refusing readiness. {sentence}")
         }
+        // Unreachable from this call site (see the comment above): kept only
+        // because this match is over the shared `DriftFailClosedOutcome` enum.
         // A162: a stop was already requested with no confined identity known; the
         // host-wide install was skipped rather than silencing every principal on
         // the host. `stop_time_hostwide_skip` has already ATTEMPTED the residual
@@ -1562,43 +1574,6 @@ pub fn force_next_agent_binding_readback_mismatch_for_test() -> ForcedAgentBindi
     ForcedAgentBindingReadbackMismatch { _private: () }
 }
 
-/// LINUX-BOOT-STOP-HOSTWIDE-NET-01 fail-before seam: simulates a SIGTERM landing
-/// the instant [`bind_admitted_uid_before_ready`] begins its kernel and journal
-/// work, the exact window the round-1 defect (a `bool` sampled by the CALLER
-/// before this function was even entered) could not observe. Arming this sets
-/// the SAME shared `Arc<AtomicBool>` a real signal handler sets -- it is not a
-/// parallel flag -- so its effect on the refusal decision is indistinguishable
-/// from a genuine signal. Absent from a normal build (compiled only under
-/// `test-isolation`), and cleared unconditionally by the RAII guard so a test
-/// that arms it and exits early cannot leave it armed for a later test's boot.
-#[cfg(all(target_os = "linux", feature = "test-isolation"))]
-static ARM_SHUTDOWN_AT_SLICE_A_REFUSE_FOR_TEST: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// RAII handle for the override above; see
-/// [`arm_shutdown_at_slice_a_refuse_for_test`].
-#[cfg(all(target_os = "linux", feature = "test-isolation"))]
-pub struct ArmedShutdownAtSliceARefuseForTest {
-    _private: (),
-}
-
-#[cfg(all(target_os = "linux", feature = "test-isolation"))]
-impl Drop for ArmedShutdownAtSliceARefuseForTest {
-    fn drop(&mut self) {
-        ARM_SHUTDOWN_AT_SLICE_A_REFUSE_FOR_TEST.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-/// Arm the override above for exactly the next call to
-/// [`bind_admitted_uid_before_ready`]. Returns a guard that clears the latch on
-/// drop; a test must bind it (not `let _ = ...`, which would drop it
-/// immediately and clear the latch before the boot call it covers).
-#[cfg(all(target_os = "linux", feature = "test-isolation"))]
-pub fn arm_shutdown_at_slice_a_refuse_for_test() -> ArmedShutdownAtSliceARefuseForTest {
-    ARM_SHUTDOWN_AT_SLICE_A_REFUSE_FOR_TEST.store(true, std::sync::atomic::Ordering::SeqCst);
-    ArmedShutdownAtSliceARefuseForTest { _private: () }
-}
-
 /// Bind the admitted uid into the kernel, and prove it from the kernel, before
 /// anything can report readiness.
 ///
@@ -1621,13 +1596,6 @@ pub fn arm_shutdown_at_slice_a_refuse_for_test() -> ArmedShutdownAtSliceARefuseF
 fn bind_admitted_uid_before_ready(
     ownership: &crate::nftables::CastleTableOwnership,
     decision_engine: &DecisionEngine,
-    // LINUX-BOOT-STOP-HOSTWIDE-NET-01: the LIVE flag, not a sampled copy. This
-    // function does real kernel and journal work (the binding-set read, the
-    // journal key load, `load_agent_ruleset`) between being called and the
-    // `refuse` closure's decision below; a `bool` taken here would go stale
-    // across that work and could let a stop that lands mid-function install a
-    // host-wide net anyway. The closure loads it fresh at the decision instead.
-    shutdown_requested: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     journal_path: &std::path::Path,
     key_path: &std::path::Path,
     existing: Option<&crate::ownership_journal::OwnershipJournal>,
@@ -1635,14 +1603,6 @@ fn bind_admitted_uid_before_ready(
 ) -> Result<(), EnforcementError> {
     use crate::nftables::{AgentRulesetId, AgentUidBinding, OwnedBindingSet};
     use crate::ownership_journal::{self as journal, ConfinedRole};
-
-    // TEST-ISOLATION ONLY, fail-before seam: simulates a SIGTERM landing the
-    // instant this function begins, before any of the kernel/journal work below
-    // runs. See `arm_shutdown_at_slice_a_refuse_for_test`.
-    #[cfg(all(target_os = "linux", feature = "test-isolation"))]
-    if ARM_SHUTDOWN_AT_SLICE_A_REFUSE_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst) {
-        shutdown_requested.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
 
     // H, computed ONCE from the PRE-MATCH record and scoped to this boot id, and
     // the whole reason it is named here rather than inlined: it decides WHETHER a
@@ -1700,21 +1660,18 @@ fn bind_admitted_uid_before_ready(
     // function was handed and never opens the journal), and the union with the
     // planner's uncovered uids and B is what keeps the installed scope at or
     // above the authenticated floor. See `net_scope_for_refusal`.
+    // slice-A refusal path: stop-time HostWide skip is register
+    // LINUX-BOOT-STOP-SLICEA-REFUSAL-01 (separate slice); this site reads no
+    // shutdown state yet.
     let refuse = |install_net: bool, uncovered_uids: &[u32], reason: String| -> EnforcementError {
-        // Loaded HERE, at the decision, not captured from the caller: this is
-        // after scope resolution and immediately before `refuse_after_owned_table`
-        // may issue an nft transaction, so a stop that arrives anywhere earlier
-        // in this function's kernel/journal work is still observed.
-        let shutdown_requested_now = shutdown_requested.load(std::sync::atomic::Ordering::SeqCst);
         if !install_net {
-            return refuse_after_owned_table(decision_engine, shutdown_requested_now, None, reason);
+            return refuse_after_owned_table(decision_engine, None, reason);
         }
         let resolution = resolve_net_scope_at_site(existing, decision_engine);
         let scope = net_scope_for_refusal(&resolution, uncovered_uids, &live_binding_uids);
         let sentence = refusal_scope_sentence(&scope, &resolution);
         refuse_after_owned_table(
             decision_engine,
-            shutdown_requested_now,
             Some(RefusalNet {
                 scope,
                 kill_set: resolution.kill_set,
@@ -2275,9 +2232,12 @@ impl ComponentProvider for NftablesTableProvider {
                         &resolution.scope,
                         &resolution.reason,
                     );
-                    // Named once, reused by every one of this arm's exit branches, so the
-                    // persist-failure note is worded identically whether the net installed,
-                    // failed to install, or was skipped under A162.
+                    // Named once and reused by the skip and the successful-install exit
+                    // branches below, so the persist-failure note is worded identically
+                    // on those two paths; the install-FAILED branch below does not
+                    // include it (that message already names the install error and
+                    // points at the repair order, and a persist failure there is
+                    // subsumed by the retry the next start performs regardless).
                     let persisted = match &persist_failure {
                         None => String::new(),
                         Some(err) => format!(
@@ -2369,7 +2329,6 @@ impl ComponentProvider for NftablesTableProvider {
             if let Err(err) = bind_admitted_uid_before_ready(
                 &ownership,
                 &self.decision_engine,
-                &self.shutdown_requested,
                 journal_path,
                 key_path,
                 existing.as_ref(),
@@ -2927,8 +2886,10 @@ impl NftablesTableComponent {
                 .load(std::sync::atomic::Ordering::SeqCst),
             &resolution.scope,
         ) {
-            // SAFETY: stderr is the operator channel; the durable record is the
-            // residual audit row `stop_time_hostwide_skip` already appended.
+            // SAFETY: stderr always names the skip here; the residual audit row
+            // `stop_time_hostwide_skip` attempted is best-effort within
+            // `FAILURE_AUDIT_BUDGET` and its absence on a failed bounded append
+            // is itself named on stderr by that call, not guaranteed written.
             eprintln!(
                 "castle-wall-daemon: a startup ownership check proved the owned nft table no \
                  longer holds, but a stop was already requested and no confined identity is \
@@ -3131,9 +3092,11 @@ impl NftablesTableComponent {
             // unconditionally would erase the fact that THIS process attempted
             // and installed earlier in its own lifetime (reachable whenever
             // `recovering == false` because an earlier loss already recovered
-            // to `OwnedWallReady` before this new one). The skip itself is
-            // recorded durably by the residual audit row `stop_time_hostwide_skip`
-            // already wrote; the safety-net tag records install history, not this
+            // to `OwnedWallReady` before this new one). The skip itself is named
+            // on stderr always, and `stop_time_hostwide_skip` attempted the
+            // residual audit row (best-effort within `FAILURE_AUDIT_BUDGET`; a
+            // failed bounded append is itself named on stderr, not guaranteed
+            // written); the safety-net tag records install history, not this
             // reason.
             //
             // Return the same result the no-install paths above return (Unavailable/
