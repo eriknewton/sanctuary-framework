@@ -801,6 +801,10 @@ fn stop_time_hostwide_skip(
     shutdown_requested: bool,
     scope: &crate::nftables::SafetyNetScope,
 ) -> bool {
+    // WITNESS MUTANT M1 (throwaway PR, never merged): the predicate never sees
+    // a requested stop, so every HostWide site installs as before this slice.
+    let _ = shutdown_requested;
+    let shutdown_requested = false;
     if !shutdown_requested || !matches!(scope, crate::nftables::SafetyNetScope::HostWide) {
         return false;
     }
