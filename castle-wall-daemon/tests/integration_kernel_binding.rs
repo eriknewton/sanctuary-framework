@@ -835,6 +835,7 @@ fn end_to_end_nftables_then_evaluate_then_audit() {
         // host lock, ownership journal, and journal MAC key land in this run's
         // temp root, never in /var/lib/sanctuary.
         linux_runtime_paths: isolation::runtime_paths(),
+        test_boot_time_shutdown_requested: false,
     };
 
     let handle = boot(config).expect("daemon boot");

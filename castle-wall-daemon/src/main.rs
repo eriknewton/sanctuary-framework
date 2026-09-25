@@ -286,17 +286,24 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // W1b: same drain-before-parse requirement. The only supported value is
-        // `pre-recovery`; must match `DaemonHandle::arm_test_shutdown_at_pre_recovery`'s
-        // doc comment in `daemon.rs`.
+        // W1b: same drain-before-parse requirement. `pre-recovery` must match
+        // `DaemonHandle::arm_test_shutdown_at_pre_recovery`'s doc comment in
+        // `daemon.rs`. `boot-acquire` is the boot-phase counterpart (A162,
+        // LINUX-BOOT-STOP-HOSTWIDE-NET-01): applied to `config` below, BEFORE
+        // `daemon::boot` is called, rather than armed on the handle afterward,
+        // because the sites it exercises run inside `boot()`'s acquisition,
+        // before any `DaemonHandle` exists.
         if let Some(index) = args.iter().position(|a| a == "--test-shutdown-at") {
             let value = args.get(index + 1).cloned();
             args.drain(index..=(index + 1).min(args.len() - 1));
             match value.as_deref() {
-                Some("pre-recovery") => test_shutdown_at = value,
+                Some("pre-recovery") | Some("boot-acquire") => test_shutdown_at = value,
                 _ => {
                     // SAFETY: stderr is the CLI parse-error contract, as above.
-                    eprintln!("castle-wall-daemon: --test-shutdown-at accepts only 'pre-recovery'");
+                    eprintln!(
+                        "castle-wall-daemon: --test-shutdown-at accepts only 'pre-recovery' or \
+                         'boot-acquire'"
+                    );
                     return ExitCode::from(2);
                 }
             }
@@ -343,7 +350,8 @@ fn main() -> ExitCode {
         })
         .collect();
 
-    let config = match DaemonConfig::from_argv(parser_args.iter().map(|s| s.as_str())) {
+    #[cfg_attr(not(feature = "test-isolation"), allow(unused_mut))]
+    let mut config = match DaemonConfig::from_argv(parser_args.iter().map(|s| s.as_str())) {
         Ok(c) => c,
         Err(ConfigError::HelpRequested) => {
             print_help();
@@ -358,6 +366,14 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // A162: applied to `config` BEFORE `daemon::boot` runs, unlike
+    // `test_health_interval_ms` and `arm_test_shutdown_at_pre_recovery` (both
+    // applied after boot returns a handle) -- this seam's sites run INSIDE
+    // `boot()`'s acquisition, before any handle exists.
+    #[cfg(feature = "test-isolation")]
+    if test_shutdown_at.as_deref() == Some("boot-acquire") {
+        config.test_boot_time_shutdown_requested = true;
+    }
 
     // SAFETY: stdout is the CLI startup-banner contract here, not a log
     // channel. The banner is emitted before daemon::boot installs the audit
@@ -391,9 +407,10 @@ fn main() -> ExitCode {
         handle.request_fatal_control_path_for_test();
     }
     // W1b: armed only after a successful boot, so the seam cannot fire before a
-    // handle exists to flip.
+    // handle exists to flip. `boot-acquire` is applied to `config` earlier
+    // instead (its sites run before a handle exists), so it is excluded here.
     #[cfg(feature = "test-isolation")]
-    if test_shutdown_at.is_some() {
+    if test_shutdown_at.as_deref() == Some("pre-recovery") {
         handle.arm_test_shutdown_at_pre_recovery();
     }
 

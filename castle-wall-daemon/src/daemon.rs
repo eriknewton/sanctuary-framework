@@ -154,6 +154,10 @@ pub fn disarm_with(
         policy_dir: PathBuf::from("/var/lib/sanctuary"),
         poll_interval: KERNEL_RUNTIME_POLL_INTERVAL,
         nfqueue: crate::nfqueue::NfqueueConfig::default(),
+        // `--disarm` is an explicit operator recovery action, never a boot
+        // acquisition; it never reaches the A162 install sites this flag gates,
+        // so a fresh unset flag (never "requested") is the honest value here.
+        shutdown_requested: Arc::new(AtomicBool::new(false)),
     };
     crate::runtime_providers::disarm_castle_runtime(&linux_runtime_config)
         .map_err(|err| DaemonError::Disarm(err.to_string()))
@@ -1371,6 +1375,25 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     // Daemon shutdown-REQUEST flag: set by signal handlers and request_stop,
     // observed by wait_for_shutdown. It drives the DECISION to shut down.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+    // TEST-ISOLATION ONLY (LINUX-BOOT-STOP-HOSTWIDE-NET-01): pre-set the flag
+    // before kernel activation runs, simulating a stop already requested
+    // during the boot phase. This is a DIRECT set of the flag's state, not a
+    // replayed signal: `install_shutdown_signal_handlers` (below, at the call
+    // site that installs the real SIGTERM/SIGINT handlers) has not run yet at
+    // this point, so an actual SIGTERM delivered this early would not be
+    // caught by this daemon's own handler at all. What this seam reproduces is
+    // the STATE the flag is in once a handler has observed a stop request --
+    // the state every boot-phase site downstream reads -- so those sites can
+    // be exercised without an actual signal race. This is the boot-phase
+    // counterpart of `--test-shutdown-at pre-recovery` (which arms AFTER a
+    // successful boot, through `DaemonHandle`): the acquisition path below has
+    // no `DaemonHandle` to arm yet, so the seam pre-sets the flag `boot()`
+    // itself threads into `LinuxRuntimeConfig::shutdown_requested`. Compiled
+    // out of the shipped binary.
+    #[cfg(feature = "test-isolation")]
+    if config.test_boot_time_shutdown_requested {
+        shutdown_flag.store(true, Ordering::SeqCst);
+    }
     // IPC-owned accept-loop stop flag, DISTINCT from the daemon request flag
     // above. Only IpcServer::stop_and_join (called from teardown AFTER
     // enforcement.shutdown) sets it, so a signal or request_stop can never stop
@@ -1536,7 +1559,11 @@ pub fn boot(config: DaemonConfig) -> Result<DaemonHandle, DaemonError> {
     //   table and authenticated journal for fail-closed restart adoption. We
     //   tear the boot-acquired IPC control surface down in order and return a
     //   typed error BEFORE the readiness beacon, so no `READY=1` is ever sent.
-    let enforcement = match activate_kernel_runtime(&config, Arc::clone(&decision_engine)) {
+    let enforcement = match activate_kernel_runtime(
+        &config,
+        Arc::clone(&decision_engine),
+        Arc::clone(&shutdown_flag),
+    ) {
         KernelRuntimeActivation::Activated(runtime) => Some(runtime),
         KernelRuntimeActivation::UnsupportedPlatform => None,
         KernelRuntimeActivation::Failed(err) => {
@@ -1676,6 +1703,14 @@ fn classify_activation(
 fn activate_kernel_runtime(
     config: &DaemonConfig,
     decision_engine: Arc<DecisionEngine>,
+    // A162 (LINUX-BOOT-STOP-HOSTWIDE-NET-01): the SAME `Arc` as
+    // `DaemonHandle::shutdown_flag`, threaded into the boot-phase acquisition
+    // path so the reclaim-drift, `ReArmLostOwned` and startup-loss install
+    // sites read a stop requested before kernel activation completes (the
+    // slice-A refusal path does not consult it yet: register
+    // LINUX-BOOT-STOP-SLICEA-REFUSAL-01). `install_shutdown_signal_handlers`
+    // (called above, before this function) is what actually flips it.
+    shutdown_flag: Arc<AtomicBool>,
 ) -> KernelRuntimeActivation {
     #[cfg(test)]
     {
@@ -1684,7 +1719,7 @@ fn activate_kernel_runtime(
         // the library without `cfg(test)` and opt into `test-isolation`, so they
         // still exercise this exact production activation path against an
         // isolated nftables table and isolated runtime paths.
-        let _ = (config, decision_engine);
+        let _ = (config, decision_engine, shutdown_flag);
         KernelRuntimeActivation::UnsupportedPlatform
     }
 
@@ -1712,6 +1747,7 @@ fn activate_kernel_runtime(
             policy_dir: config.policy_dir.clone(),
             poll_interval: KERNEL_RUNTIME_POLL_INTERVAL,
             nfqueue: crate::nfqueue::NfqueueConfig::default(),
+            shutdown_requested: shutdown_flag,
         };
         let plan =
             crate::runtime_providers::linux_production_plan(decision_engine, &linux_runtime_config);
@@ -1998,7 +2034,7 @@ mod tests {
         side_effect: AttemptSideEffect,
         later_interval: bool,
     ) -> Arc<AtomicUsize> {
-        use crate::enforcement::{ComponentHealth, ComponentKind, EnforcementRuntime};
+        use crate::enforcement::{ComponentHealth, ComponentKind};
         let attempts = Arc::new(AtomicUsize::new(0));
         let health = Arc::new(Mutex::new(ComponentHealth::Ready));
         let tag = Arc::new(Mutex::new(
@@ -2793,6 +2829,8 @@ mod tests {
             // key. Pointing them at the per-test temp dir is what stops a
             // `cargo test` on a Linux host from mutating operator-owned state.
             linux_runtime_paths: crate::config::LinuxRuntimePaths::isolated_under(dir.path()),
+            #[cfg(feature = "test-isolation")]
+            test_boot_time_shutdown_requested: false,
         };
         (config, signing)
     }
