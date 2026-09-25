@@ -2007,14 +2007,17 @@ impl ComponentProvider for NftablesTableProvider {
                         // whether this boot's history is known:
                         //
                         //  * KNOWN HISTORY: persist the kill set BEST-EFFORT, then
-                        //    install the net REGARDLESS of the persist result, then the
+                        //    install the net REGARDLESS of the persist result (unless a
+                        //    stop is requested and the scope is HostWide: then the A155
+                        //    skip below returns before any nft transaction), then the
                         //    sweep hook on a failed install, then return the acquisition
                         //    error naming any persist failure. Installing makes no uid
                         //    live, so a failed persist must never stop the install; the
                         //    live table's bindings recover the set on the next start.
                         //  * ABSENT KEY: NEVER persist (a write would turn unknown
                         //    history into known history and let a rotated-away uid out),
-                        //    install host-wide, the hook on a failed install, return.
+                        //    install host-wide (or, under a requested stop, take the
+                        //    A155 skip below), the hook on a failed install, return.
                         //
                         // The resolver returns the host-wide scope with the
                         // `unknown-history` reason for the absent-key case, so the
@@ -2210,7 +2213,8 @@ impl ComponentProvider for NftablesTableProvider {
                     // owned table vanished while the journal still asserts ownership, so
                     // agents adopted earlier in this boot may still be live. Persist the
                     // kill set best-effort unless the history is unknown, then install
-                    // REGARDLESS of the persist result.
+                    // REGARDLESS of the persist result, except that a requested stop
+                    // with HostWide scope takes the A155 skip below instead of installing.
                     let resolution =
                         resolve_net_scope_at_site(existing.as_ref(), &self.decision_engine);
                     let mut persist_failure: Option<String> = None;
@@ -2863,7 +2867,8 @@ impl NftablesTableComponent {
     /// Order, and each step's reason: persist per the two boot rows (best-effort with a
     /// known history, never with the key absent), then install the net from the
     /// IN-MEMORY deny set REGARDLESS of the persist result, because installing makes no
-    /// uid live and so cannot outrun the journal, then the sweep hook ONLY on a failed
+    /// uid live and so cannot outrun the journal (a requested stop with HostWide scope
+    /// takes the A155 skip instead of installing), then the sweep hook ONLY on a failed
     /// install. The caller then runs the reverse-order unwind, which releases the host
     /// lock the disarm verb needs, and returns the acquisition error with the typed
     /// evidence.

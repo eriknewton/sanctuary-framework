@@ -1191,7 +1191,8 @@ fn gf1_lost_owned_table_then_restart_re_arms_deny_all_never_fresh_accept() {
 
 // --- A162 (register LINUX-BOOT-STOP-HOSTWIDE-NET-01): a stop requested during
 // the BOOT phase never installs a host-wide net, extending A155's post-READY
-// rule to every pre-READY safety-net install site. Both tests below drive the
+// rule to the reclaim-drift, ReArmLostOwned and startup-loss install sites
+// (the slice-A refusal path is a separate slice, LINUX-BOOT-STOP-SLICEA-REFUSAL-01). Both tests below drive the
 // SAME ReArmLostOwned site the two GF1 tests above exercise (boot to ready,
 // stop, delete the table out from under the surviving journal, boot again),
 // but the second boot pre-arms `test_boot_time_shutdown_requested` (the
