@@ -99,15 +99,20 @@ export function resolveHooksDir(root) {
   throw new Error(`Unexpected .git entry type at ${dotGit}`);
 }
 
+// Both hook names installed by this script. `pre-commit` is the fast tier
+// (typecheck + changed-path tests, every commit); `pre-push` is the full
+// test-baseline guard (the full suite + the floor comparison, every push).
+// See .githooks/pre-commit's header for why the guard was split this way.
+// Keep this list in sync with the two files that actually exist under
+// .githooks/ - a name added here with no matching source file fails loudly
+// below rather than silently installing nothing for it.
+const HOOK_NAMES = ["pre-commit", "pre-push"];
+
 function main() {
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = path.dirname(__filename);
   const root = path.resolve(__dirname, "..", "..");
-  const src = path.join(root, ".githooks", "pre-commit");
-  if (!fs.existsSync(src)) {
-    console.error(`Error: .githooks/pre-commit not found at ${src}`);
-    process.exit(1);
-  }
+
   let hooksDir;
   try {
     hooksDir = resolveHooksDir(root);
@@ -116,10 +121,18 @@ function main() {
     process.exit(1);
   }
   fs.mkdirSync(hooksDir, { recursive: true });
-  const dst = path.join(hooksDir, "pre-commit");
-  fs.copyFileSync(src, dst);
-  fs.chmodSync(dst, 0o755);
-  console.log(`Installed pre-commit hook: ${dst}`);
+
+  for (const hookName of HOOK_NAMES) {
+    const src = path.join(root, ".githooks", hookName);
+    if (!fs.existsSync(src)) {
+      console.error(`Error: .githooks/${hookName} not found at ${src}`);
+      process.exit(1);
+    }
+    const dst = path.join(hooksDir, hookName);
+    fs.copyFileSync(src, dst);
+    fs.chmodSync(dst, 0o755);
+    console.log(`Installed ${hookName} hook: ${dst}`);
+  }
 }
 
 if (

@@ -1,5 +1,18 @@
 # Sanctuary Test Baseline Hardening Plan
 
+**2026-09-26 update: the plan below is historical, not current-state.** This
+document predates the shipped implementation and describes an earlier design
+(`.husky/pre-commit`, a single hook running everything) that was not what was
+actually built. The as-shipped hooks are `.githooks/pre-commit` and
+`.githooks/pre-push`; as of 2026-09-26 the baseline-floor comparison, the
+transform-error scan against the full suite, and the silent-test-file-drop
+check run in `.githooks/pre-push` (on `git push`), not in `.githooks/pre-commit`
+(which now runs only `npm run typecheck` plus `vitest related` on the commit's
+own changed files, with no baseline check). See `.githooks/pre-commit`'s own
+header comment for the full rationale for that split. The narrative and
+acceptance criteria below are kept for incident lineage; do not read them as a
+description of the hook that runs today.
+
 **Context:** During the 2026-04-10 EU AI Act compliance generator build, Claude Code discovered that commit `4ac95830` ("fix: restore loader.ts") had silently broken the test baseline. A single stray token (the `],` absorbed into a line comment inside `src/policy/loader.ts`) caused 10 test files to abort before running. The regression went undetected for a full session cycle because no one ran `npm test` before or after the fix commit landed. Trigger incident technical detail: see `review/commit-4ac95830-postmortem.md`.
 
 **Corrected drift numbers:** the pre-incident true baseline was **1113** passing / 69 test files, not 1079 — tests were added between when 1079 was recorded and the loader.ts break. After the loader.ts break, 1015 were running (59 files). After the 1-line fix in commit `3bc5cc6`, the baseline is back to 1113. The 1079 figure in earlier session notes is stale. This correction matters for the load-bearing nature of the hardening plan: **the silent drift was 1113 → 1015, 98 tests ghosted**, not 64. A failure mode where a "fix" commit causes the passing count to go *up* after the next legitimate change (because parse-broken files come back online) is exactly as dangerous as the count going down, and is why transform-error detection in Step 2 is not optional.
