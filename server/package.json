@@ -58,6 +58,7 @@
     "test:conformance": "vitest run test/conformance",
     "test:zero-pii-regression": "vitest run test/query-anonymity/zero-pii-regression.test.ts",
     "test:qla-perf-budget": "vitest run test/query-anonymity/performance-budget.test.ts",
+    "test:mutation": "stryker run",
     "synthetic-coverage": "tsx ../scripts/synthetic-coverage/run.ts",
     "synthetic-coverage:parity": "tsx ../scripts/synthetic-coverage/parity-cli.ts",
     "synthetic-coverage:baseline": "tsx ../scripts/synthetic-coverage/gen-coverage-baseline.ts",
@@ -112,6 +113,8 @@
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@playwright/test": "1.63.0",
+    "@stryker-mutator/core": "^10.0.0",
+    "@stryker-mutator/vitest-runner": "^10.0.0",
     "@types/node": "26.6.1",
     "@types/pg": "8.23.1",
     "@vitest/coverage-v8": "4.1.11",
