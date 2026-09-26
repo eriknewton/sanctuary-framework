@@ -12,5 +12,9 @@ exclude_globs = [
 ]
 
 # Mutants that hang (an infinite loop, or a blocked read) time out rather than
-# stall the run; the value is a multiplier over the measured unmutated test time.
+# stall the run. cargo-mutants derives each mutant's timeout from the measured
+# unmutated test time scaled by `timeout_multiplier`; `minimum_test_timeout` is
+# the floor in seconds under that derived value, so a very fast baseline does
+# not produce an unreasonably short per-mutant limit.
+timeout_multiplier = 3.0
 minimum_test_timeout = 20

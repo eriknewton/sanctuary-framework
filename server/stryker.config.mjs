@@ -8,19 +8,27 @@
  * useful here" before that investment. See docs/audit/mutation-testing.md
  * for how to run it, how to read a score, and the test-pruning rule.
  *
- * `coverageAnalysis: "perTest"` matters for cost, not just correctness: it
- * asks the vitest runner which test files exercise each mutated file so a
- * mutant reruns only those files, not the whole suite. Without it, every
- * mutant would pay the full-suite cost, and the module-scoped mutate list
- * below would not save any wall-clock time. `concurrency: 4` bounds worker
+ * Two settings bound the work per mutant: `vitest.related` limits each run
+ * to the test files whose import graph reaches the mutated file, and
+ * `coverageAnalysis: "perTest"` reruns only the tests whose coverage hit
+ * the mutated line. They are different filters; see the doc. `concurrency: 4` bounds worker
  * count so a laptop-class box does not thrash; raise it on a beefier CI
  * runner once this graduates out of a scoped baseline.
  */
 export default {
   packageManager: "npm",
   testRunner: "vitest",
+  // `vitest.related` (the runner default, pinned here on purpose) selects the
+  // test files whose import graph reaches the mutated file; `perTest` then
+  // reruns only the tests whose recorded coverage executed the mutated line.
+  vitest: { related: true },
   coverageAnalysis: "perTest",
   concurrency: 4,
+  // The initial unmutated run for widely imported core modules on one vitest
+  // worker can exceed Stryker's 5-minute default; an aborted dry run yields no
+  // incremental file and no score, so this is the cap that decides whether a
+  // run starts at all. 30 minutes = about 1.5x the CI full-suite shard time.
+  dryRunTimeoutMinutes: 30,
   reporters: ["html", "clear-text", "progress", "json"],
   htmlReporter: {
     fileName: "reports/mutation/mutation.html",
