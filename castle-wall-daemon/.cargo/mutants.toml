@@ -1,0 +1,20 @@
+# cargo-mutants config for castle-wall-daemon (decision A164, D4).
+#
+# Read automatically by `cargo mutants` from the crate root; see
+# docs/audit/mutation-testing.md for how to install the tool, run it, and read a
+# score. No CI job runs this yet (operator-run only for now).
+#
+# Only the integration test tree is excluded from mutation: mutating a test
+# proves nothing about the source. Enforcement and policy modules are mutated
+# like any other source; a surviving mutant there is a finding, never noise.
+exclude_globs = [
+    "tests/**",
+]
+
+# Mutants that hang (an infinite loop, or a blocked read) time out rather than
+# stall the run. cargo-mutants derives each mutant's timeout from the measured
+# unmutated test time scaled by `timeout_multiplier`; `minimum_test_timeout` is
+# the floor in seconds under that derived value, so a very fast baseline does
+# not produce an unreasonably short per-mutant limit.
+timeout_multiplier = 3.0
+minimum_test_timeout = 20
