@@ -10,11 +10,15 @@ This file is a briefing for any AI coding agent working in these codebases. Read
 
 Every commit to Sanctuary main MUST run `npm run typecheck && npm test` against a clean working tree before staging; block the commit if either fails, if any transform/collection error appears in vitest output, or if the passing-test count drops below the integer in `.test-baseline` at repo root.
 
-**This rule is now backed by structural enforcement, not just instruction:**
+**This rule is now backed by structural enforcement, not just instruction, split across two local hooks by cost (2026-09-26):**
 
-- **Pre-commit hook** at `.githooks/pre-commit` runs both gates locally on every `git commit`. Install once with `cd server && npm run install-hooks` (copies the hook into `.git/hooks/pre-commit`). The hook takes ~21 seconds on a modern Mac. Emergency bypass: `SKIP_TEST_BASELINE=1 git commit ...` (logged to `.test-baseline-overrides.log` for audit).
-- **CI check** at `.github/workflows/test-baseline-guard.yml` runs the same two gates on every PR and every push to main. This is the second enforcement layer for commits that bypass the local hook with `--no-verify` or from uninstalled environments. See `docs/audit/branch-protection-setup.md` for the Git branch-protection runbook required to make this check a hard merge gate.
+- **Pre-commit hook** at `.githooks/pre-commit` runs the fast tier locally on every `git commit`: `npm run typecheck`, then `npx vitest related --run` scoped to the commit's own staged `.ts`/`.tsx` files under `server/`, with the same transform/collection-error scan. It does NOT check `.test-baseline` (measured shape is under a minute on a modern Mac). Bypass with `git commit --no-verify`.
+- **Pre-push hook** at `.githooks/pre-push` runs the full tier on every `git push`: the complete `npm test`, the transform/collection-error scan, the silent-test-file-drop check, and the `.test-baseline` floor comparison (both directions), unchanged logic from what used to run inline in pre-commit. Measured shape is the full suite's own wall-clock time, roughly 8 to 19 minutes depending on the machine. Emergency bypass: `SKIP_TEST_BASELINE=1 git push ...` (logged to `.test-baseline-overrides.log` for audit).
+- Install both once with `cd server && npm run install-hooks` (copies both files into the real hooks directory git will execute from).
+- **CI check** at `.github/workflows/test-baseline-guard.yml` is UNCHANGED by this split: it runs the same full-suite gates on every PR and every push to main, and remains the merge gate. This is the enforcement layer for pushes that bypass the local pre-push hook with `--no-verify`, `SKIP_TEST_BASELINE=1`, or from an uninstalled environment. See `docs/audit/branch-protection-setup.md` for the Git branch-protection runbook required to make this check a hard merge gate.
 - **Written instruction (this block)** remains the human-facing contract. The structural layers make violations hard; this rule makes the intent explicit so a reviewer or auditor can cite it.
+
+The failure mode worth naming: a clean `git commit` no longer means the baseline floor was checked. It means only typecheck and the tests related to what you touched passed. The full accounting happens at `git push`, or in CI if the push-time hook is skipped or missing.
 
 See `docs/audit/test-baseline-hardening-plan.md` for the full three-layer hardening plan, `docs/audit/commit-4ac95830-postmortem.md` for the trigger incident, and `docs/audit/branch-protection-setup.md` for the GitHub branch-protection runbook.
 

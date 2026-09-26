@@ -616,7 +616,7 @@ test/query-anonymity/pii-rewrite.test.ts(224,7): error TS2322: Type '"claude-ant
 test/query-anonymity/tier3-transport.test.ts(198,21): error TS2345: Argument of type 'Duplex' is not assignable to parameter of type 'Socket'.
 test/query-anonymity/tier3-transport.test.ts(199,55): error TS2345: Argument of type 'Duplex' is not assignable to parameter of type 'Socket'.
 test/recognition/did-web-fortress-config.test.ts(66,7): error TS2322: Type '{ "@context": string[]; id: string; verificationMethod: { id: string; type: string; controller: string; publicKeyJwk: { kty: string; crv: string; x: string; }; }[]; authentication: string[]; assertionMethod: string[]; }' is not assignable to type 'DidDocument'.
-test/scripts/install-hooks.test.ts(6,33): error TS7016: Could not find a declaration file for module '../../scripts/install-hooks.js'. '<server>/scripts/install-hooks.js' implicitly has an 'any' type.
+test/scripts/install-hooks.test.ts(11,8): error TS7016: Could not find a declaration file for module '../../scripts/install-hooks.js'. '<server>/scripts/install-hooks.js' implicitly has an 'any' type.
 test/sdw/memory-tools-wiring.test.ts(227,42): error TS2345: Argument of type 'Record<string, unknown> | Promise<Record<string, unknown>>' is not assignable to parameter of type 'Record<string, unknown>'.
 test/sdw/memory-tools-wiring.test.ts(23,8): error TS2459: Module '"../../src/principal-policy/approval-channel.js"' declares 'ApprovalRequest' locally, but it is not exported.
 test/sdw/sdw-d2-export-import.test.ts(1243,7): error TS2322: Type 'Record<string, unknown> | Promise<Record<string, unknown>>' is not assignable to type 'Record<string, unknown>'.
