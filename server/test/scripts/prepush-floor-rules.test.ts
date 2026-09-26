@@ -160,7 +160,8 @@ function runHook(
   stdinLine: string,
   extraEnv: NodeJS.ProcessEnv = {},
 ): { status: number | null; stdout: string; stderr: string } {
-  const result = spawnSync("bash", [HOOK_PATH], {
+  // git invokes the hook as `pre-push <remote-name> <remote-url>`; the hook reads $1.
+  const result = spawnSync("bash", [HOOK_PATH, "origin", "origin"], {
     cwd: repoDir,
     input: stdinLine,
     encoding: "utf8",
@@ -247,7 +248,7 @@ describe(".githooks/pre-push floor rules (end-to-end fixture)", () => {
 
     expect(status).not.toBe(0);
     expect(stderr).toContain("BELOW THE PREVIOUS FLOOR");
-    expect(stderr).toContain("freshly fetched origin/main");
+    expect(stderr).toContain("freshly fetched main of remote 'origin'");
     expect(stderr).toContain("10");
     expect(stderr).toContain("5");
   });
@@ -307,6 +308,22 @@ describe(".githooks/pre-push floor rules (end-to-end fixture)", () => {
 
     expect(status).toBe(0);
     expect(stderr).toContain("All baseline-guard checks passed");
+  });
+
+  it("(ix) refuses when the suite passes fewer tests than the pushed commit's own floor (rule a)", () => {
+    const { repoDir, headSha, mainSha } = buildRepo({
+      baselineMain: 10,
+      baselineHead: 10,
+    });
+    track(repoDir);
+
+    const stdin = `refs/heads/main ${headSha} refs/heads/main ${mainSha}\n`;
+    const { status, stderr } = runHook(repoDir, stdin, {
+      SANCTUARY_PREPUSH_TEST_CMD: ACCEPTED_TEST_STUB.replace("Tests  50 passed (50)", "Tests  4 passed (4)"),
+    });
+
+    expect(status).not.toBe(0);
+    expect(stderr).toContain("TEST BASELINE REGRESSION");
   });
 
   it("(viii) refuses a local SHA that is not HEAD's commit", () => {

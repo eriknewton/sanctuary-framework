@@ -229,6 +229,8 @@ push_local_refs=()
 push_local_shas=()
 push_remote_refs=()
 push_remote_shas=()
+# git passes the remote name as $1 and its URL as $2 to every pre-push hook.
+push_remote_name="${1:-origin}"
 while IFS=' ' read -r _local_ref _local_sha _remote_ref _remote_sha; do
   [[ -z "${_local_ref:-}" ]] && continue
   push_local_refs+=("$_local_ref")
@@ -508,15 +510,21 @@ for _i in "${!non_delete_local_refs[@]}"; do
     # the floor comes from main - fetched fresh right here, since this push
     # is about to talk to that same remote anyway. Fetched at most once
     # even if several new refs are being pushed in the same invocation.
+    # The floor is read from FETCH_HEAD of the remote this push targets
+    # ($1 is the remote name git hands every pre-push hook), never from a
+    # remote-tracking ref: whether `git fetch <remote> main` also moves
+    # refs/remotes/<remote>/main depends on the configured refspec, and a
+    # push to a remote other than origin must be ratcheted against THAT
+    # remote's main.
     if [[ -z "$fetched_origin_main" ]]; then
-      if ! git fetch --quiet origin main; then
-        fail "could not refresh origin/main"
+      if ! git fetch --quiet "$push_remote_name" main; then
+        fail "could not fetch main from remote '$push_remote_name'"
         exit 1
       fi
       fetched_origin_main=1
     fi
-    prev_floor=$(git show origin/main:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
-    prev_floor_source="freshly fetched origin/main"
+    prev_floor=$(git show FETCH_HEAD:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+    prev_floor_source="freshly fetched main of remote '$push_remote_name'"
   fi
 
   if [[ -z "$prev_floor" ]] || ! [[ "$prev_floor" =~ ^(0|[1-9][0-9]*)$ ]]; then
@@ -553,7 +561,10 @@ done
 # scheme or an ssh host is a real remote and the override is refused.
 if [[ -n "${SANCTUARY_PREPUSH_TEST_CMD:-}" ]]; then
   origin_url=$(git remote get-url origin 2>/dev/null || echo "")
-  if [[ -z "$origin_url" || "$origin_url" == *://* || "$origin_url" == *@*:* ]]; then
+  # Refused shapes: any URL scheme, ssh user@host:path, and scp-style
+  # host:path with no user (a colon before the first slash). Only a plain
+  # filesystem path, absolute or relative, is a fixture origin.
+  if [[ -z "$origin_url" || "$origin_url" == *://* || "$origin_url" == *@*:* || "${origin_url%%/*}" == *:* ]]; then
     echo "[baseline-guard] SANCTUARY_PREPUSH_TEST_CMD is set but origin '${origin_url:-<none>}' is a real remote; refusing the override - push blocked"
     exit 1
   fi
