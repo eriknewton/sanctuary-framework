@@ -2,6 +2,7 @@
 #
 # Sanctuary pre-commit hook - fast tier (typecheck + changed-path tests)
 # Copyright 2026 Erik Newton
+# sanctuary-managed-hook: install-hooks.js owns this file
 # SPDX-License-Identifier: Apache-2.0
 #
 # HISTORY (read before touching the scope split): this hook used to run the

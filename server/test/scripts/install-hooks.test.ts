@@ -242,4 +242,50 @@ describe("install-hooks installHooksInto ordering + foreign-hook backup", () => 
       backupExistingForeignHook(path.join(hooksDir, "nonexistent-hook")),
     ).toBe(null);
   });
+
+  // REGRESSION (2026-09-26): MARKER_LINE used to be the generic
+  // "# Copyright 2026 Erik Newton" line, which any unrelated file (or a
+  // foreign hook whose author happened to copyright-stamp it the same way)
+  // could carry, silently defeating the foreign-hook backup below. A
+  // distinctive token cannot collide with an ordinary copyright header.
+  it("MARKER_LINE is a distinctive token, not a generic copyright line", () => {
+    expect(MARKER_LINE).not.toBe("# Copyright 2026 Erik Newton");
+    expect(MARKER_LINE.toLowerCase()).toContain("sanctuary-managed-hook");
+    // A plausible foreign hook that just happens to carry Erik's copyright
+    // boilerplate (e.g. copied from another file in this repo) must NOT be
+    // mistaken for a prior Sanctuary install.
+    const lookalike = "#!/bin/sh\n# Copyright 2026 Erik Newton\necho hi\n";
+    expect(lookalike.includes(MARKER_LINE)).toBe(false);
+  });
+
+  // REGRESSION (2026-09-26): a fixed `<name>.pre-sanctuary.bak` path meant a
+  // SECOND foreign hook backed up at some later run would silently
+  // overwrite the FIRST foreign hook's backup - destroying exactly the kind
+  // of file this function exists to preserve, one layer down. A UTC
+  // timestamp suffix is used instead once a backup already exists.
+  it("never clobbers an existing backup - suffixes a UTC timestamp instead", () => {
+    const dst = path.join(hooksDir, "pre-push");
+    const firstForeign = "#!/bin/sh\necho first foreign hook\n";
+    fs.writeFileSync(dst, firstForeign, "utf8");
+
+    const firstBackup = backupExistingForeignHook(dst);
+    expect(firstBackup).toBe(`${dst}.pre-sanctuary.bak`);
+    expect(fs.readFileSync(firstBackup!, "utf8")).toBe(firstForeign);
+
+    // Simulate a second foreign hook later occupying the same path (e.g. the
+    // Sanctuary hook was installed, then removed, then a different foreign
+    // tool's hook was placed there) - the FIRST backup must survive.
+    const secondForeign = "#!/bin/sh\necho second foreign hook\n";
+    fs.writeFileSync(dst, secondForeign, "utf8");
+
+    const secondBackup = backupExistingForeignHook(dst);
+    expect(secondBackup).not.toBe(null);
+    expect(secondBackup).not.toBe(firstBackup);
+    expect(secondBackup!.startsWith(`${dst}.pre-sanctuary.`)).toBe(true);
+    expect(secondBackup!.endsWith(".bak")).toBe(true);
+
+    // Both backups must exist, unmodified, side by side.
+    expect(fs.readFileSync(firstBackup!, "utf8")).toBe(firstForeign);
+    expect(fs.readFileSync(secondBackup!, "utf8")).toBe(secondForeign);
+  });
 });

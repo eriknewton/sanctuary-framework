@@ -126,7 +126,17 @@ const HOOK_NAMES = ["pre-push", "pre-commit"];
 // that happens to occupy this path" - a foreign pre-commit/pre-push hook
 // (from another tool, or hand-written by a developer) must never be
 // silently destroyed by this installer.
-export const MARKER_LINE = "# Copyright 2026 Erik Newton";
+// MUST stay a string that only the two Sanctuary-shipped hooks carry
+// verbatim in their header (see the top of .githooks/pre-commit and
+// .githooks/pre-push). The previous marker was the generic
+// "# Copyright 2026 Erik Newton" line, which any file in this repository
+// (or any hook a developer wrote and happened to copyright-stamp the same
+// way) could carry - so a foreign hook whose author reused that boilerplate
+// line would read as "ours" and be silently overwritten in place with no
+// backup, defeating the whole point of this check. A distinctive,
+// hook-specific token cannot collide with an unrelated file's copyright
+// header.
+export const MARKER_LINE = "# sanctuary-managed-hook: install-hooks.js owns this file";
 
 // If `dst` already exists and does NOT carry MARKER_LINE, it is a foreign
 // hook (not one this installer put there) - back it up before it gets
@@ -134,6 +144,14 @@ export const MARKER_LINE = "# Copyright 2026 Erik Newton";
 // backup path, or null when there was nothing foreign to back up (no file
 // at dst, or the file at dst already carries the marker and is safe to
 // replace in place).
+//
+// NEVER CLOBBERS AN EXISTING BACKUP (2026-09-26): the previous version
+// always wrote to the same fixed `<name>.pre-sanctuary.bak` path, so a
+// SECOND foreign hook backed up at some later run would silently overwrite
+// the FIRST foreign hook's backup - the exact "destroy what was already
+// there" failure this function exists to prevent, one layer down. When a
+// backup already exists at that path, this suffixes a UTC timestamp instead
+// of overwriting it.
 export function backupExistingForeignHook(dst) {
   if (!fs.existsSync(dst)) {
     return null;
@@ -150,7 +168,15 @@ export function backupExistingForeignHook(dst) {
   if (existing.includes(MARKER_LINE)) {
     return null;
   }
-  const backupPath = `${dst}.pre-sanctuary.bak`;
+  let backupPath = `${dst}.pre-sanctuary.bak`;
+  if (fs.existsSync(backupPath)) {
+    // Colons are not valid in Windows path segments and are needlessly
+    // shell-unfriendly on POSIX; strip them from the ISO timestamp so the
+    // suffix is safe to embed in a filename on every platform this repo
+    // targets.
+    const timestamp = new Date().toISOString().replace(/[:]/g, "");
+    backupPath = `${dst}.pre-sanctuary.${timestamp}.bak`;
+  }
   fs.copyFileSync(dst, backupPath);
   return backupPath;
 }
