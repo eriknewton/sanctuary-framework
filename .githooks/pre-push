@@ -31,7 +31,27 @@
 # defense is the CI mirror (.github/workflows/test-baseline-guard.yml),
 # which runs on the PR, not the push.
 #
-# Two gates, both must pass. The push is blocked if either fails.
+# ONE CONSOLIDATED GATE. The push is blocked if any of its checks fail:
+# the commit-binding check below, the full-suite run, the transform-error
+# scan, the silent-test-file-drop check, and the baseline-floor comparison
+# all gate the same push and any one of them can refuse it.
+#
+#   Commit-binding check (2026-09-26, MANDATORY): before anything else
+#     runs, this hook refuses the push unless the working tree is clean for
+#     tracked files AND HEAD equals the local SHA of every non-delete ref
+#     being pushed.
+#
+#     INVARIANT enforced at the refusal site below: this gate validates
+#     exactly the commit being pushed, so the worktree must BE that commit.
+#     Without this check, the two floors the old logic computed - the
+#     `.test-baseline` value read from `$local_sha` (the object git is about
+#     to send) and the `npm test` run against whatever the working tree
+#     happens to contain right now - could silently diverge: an uncommitted
+#     edit, a detached HEAD, or a push of a ref other than the one checked
+#     out would let a clean working tree run the suite while a DIFFERENT
+#     commit's `.test-baseline` supplied the floor, and vice versa. Binding
+#     both sides to the same commit is what makes "the floor for this push"
+#     and "the suite this push runs" the same claim.
 #
 #   Gate 1: transform-error detection + test baseline check
 #     Runs `npm test` in server/, redacts secret-bearing diagnostic values,
@@ -96,16 +116,44 @@
 # reads that instead of guessing at a tracking branch. On a brand-new ref
 # (remote sha is all zeros - first push of a branch) there is no remote
 # position to diff from; the old position is taken to be the merge-base with
-# origin/main, and if even that cannot be resolved (offline, or origin/main
-# unreachable), the comparison fails CLOSED: treat the previous baseline as 0
-# and treat server/ as touched, so the full accounting is required rather
-# than silently skipped.
+# origin/main.
 #
-# This repo's normal workflow pushes one ref at a time (a single feature
-# branch). If multiple ref updates are ever pushed in the same invocation,
-# only the FIRST non-delete ref update is gated below - documented here as a
-# known narrowing, not a silent gap. A ref deletion (local sha of all zeros)
-# is skipped: there is nothing to test.
+# FAIL-CLOSED ON AN UNRESOLVABLE PREVIOUS POSITION (2026-09-26, MANDATORY):
+# a shallow clone or a partial fetch can leave `prev_sha` naming an object
+# this repository does not have - `git diff` against a missing object fails,
+# and the OLD code let that failure fall through silently (via `2>/dev/null
+# || true`), leaving BOTH `baseline_touched_in_push` and
+# `server_test_surface_touched_in_push` empty. An empty
+# `server_test_surface_touched_in_push` is exactly the condition the
+# PLATFORM-DELTA CARVE-OUT above reads as "this push cannot have added a
+# test" - so an unresolvable previous ref could silently grant the macOS
+# carve-out AND let a lowered `.test-baseline` through the strict-upward
+# check (which only runs `if [[ -n "$baseline_touched_in_push" ]]`, also
+# empty). Every non-delete ref's `prev_sha` is now verified resolvable with
+# `git cat-file -e "$prev_sha^{commit}"` before it is trusted for anything.
+# When it is empty or unresolvable, this hook fails CLOSED instead of
+# guessing: both flags are forced on (so the full accounting always runs),
+# and the pushed floor is refused outright if it is lower than
+# `origin/main`'s own committed floor (read with `git show
+# origin/main:.test-baseline`, itself refusing if unreadable). A lowered
+# floor with no resolvable previous ref to prove the lowering was intentional
+# and reviewed is never allowed - see the fail-closed block below for where
+# this is enforced.
+#
+# MULTI-REF PUSHES (2026-09-26, fixed - previously only the FIRST non-delete
+# ref was gated, via a `break` after it, silently leaving any additional
+# pushed ref unchecked): every non-delete ref on stdin is now collected and
+# is subject to the commit-binding check above (its local SHA must equal
+# HEAD, same as any other pushed ref). For the baseline/server-touched
+# accounting, the flags are the logical OR across every pushed ref's own
+# range (touched-anywhere-in-any-ref counts as touched), and the
+# strict-upward floor comparison uses the HIGHEST previous-floor value seen
+# across the pushed refs, so a pushed `.test-baseline` bump is never counted
+# sufficient against one ref's history while actually falling short of
+# another's. This repo's normal workflow still pushes one ref at a time; the
+# loop exists so a multi-ref push is not silently narrowed to the first one.
+# A ref deletion (local sha of all zeros) is skipped: there is nothing to
+# test.
 #
 # Runtime budget: the full suite's own wall-clock time. Measured 2026-09-26:
 # 15 to 19 minutes. This is why this gate runs at push time, not on every
@@ -115,8 +163,12 @@
 # Use only for emergency pushes. The override is REFUSED unless a
 # human-readable justification is also supplied in SKIP_REASON, e.g.:
 #   SKIP_TEST_BASELINE=1 SKIP_REASON="hotfix: CI runner outage, see #NNN" git push ...
+# The override is checked and logged AFTER stdin is parsed (see below), so
+# the log records every ref this push actually targets, not just HEAD - a
+# push can target a ref other than the checked-out branch, and logging HEAD
+# in that case would misattribute the audit record.
 # The override is logged to .test-baseline-overrides.log with timestamp,
-# HEAD SHA, branch, author (whoami), and the reason for audit.
+# the pushed refs and SHAs, branch, author (whoami), and the reason for audit.
 #
 # Enforcement status (be precise - do NOT call this hook "not
 # bypassable"): this LOCAL hook is CI-backed with an audited emergency
@@ -205,6 +257,31 @@ validate_counter() {
   return 0
 }
 
+zero_sha="0000000000000000000000000000000000000000"
+
+# ── Read stdin FIRST, before the emergency-override check ───────────
+# Git feeds pre-push exactly one line per ref update on stdin:
+#   <local ref> <local sha> <remote ref> <remote sha>
+# Parsing this before SKIP_TEST_BASELINE is checked (finding 2026-09-26) is
+# what lets the override's audit log record the actual pushed refs and SHAs
+# instead of HEAD: HEAD is not necessarily what is being pushed (a detached
+# checkout, or a push of a ref other than the one checked out), so logging
+# HEAD there was an inaccurate audit record, not just an early convenience.
+#
+# Built with plain arrays and a while-read loop, not `mapfile`/`readarray`:
+# the macOS system bash is 3.2 (mapfile/readarray are bash-4+ builtins).
+push_local_refs=()
+push_local_shas=()
+push_remote_refs=()
+push_remote_shas=()
+while IFS=' ' read -r _local_ref _local_sha _remote_ref _remote_sha; do
+  [[ -z "${_local_ref:-}" ]] && continue
+  push_local_refs+=("$_local_ref")
+  push_local_shas+=("${_local_sha:-}")
+  push_remote_refs+=("${_remote_ref:-}")
+  push_remote_shas+=("${_remote_sha:-}")
+done
+
 # ── Emergency override ───────────────────────────────────────────────
 if [[ "${SKIP_TEST_BASELINE:-}" == "1" ]]; then
   # An accountable override REQUIRES a reason. Refuse a bare bypass: an
@@ -224,14 +301,27 @@ if [[ "${SKIP_TEST_BASELINE:-}" == "1" ]]; then
   warn "This push is being made without running the baseline guard."
   warn "Override is logged to .test-baseline-overrides.log for audit."
   timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  head_sha=$(git rev-parse HEAD 2>/dev/null || echo "pre-push")
+  # Record every pushed ref and SHA (not just HEAD - see the header comment
+  # on why HEAD is not a reliable stand-in for what is actually being pushed).
+  # Deletions (local sha all zeros) are included too, since the override
+  # bypasses this hook's checks entirely regardless of ref type.
+  pushed_refs_summary=""
+  for _i in "${!push_local_refs[@]}"; do
+    _entry="${push_local_refs[$_i]}=${push_local_shas[$_i]:-<none>}"
+    if [[ -z "$pushed_refs_summary" ]]; then
+      pushed_refs_summary="$_entry"
+    else
+      pushed_refs_summary="${pushed_refs_summary},${_entry}"
+    fi
+  done
+  [[ -z "$pushed_refs_summary" ]] && pushed_refs_summary="<no-ref-updates-on-stdin>"
   branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown-branch")
   author=$(whoami 2>/dev/null || echo "unknown-user")
   repo_root_for_log=$(git rev-parse --show-toplevel)
-  # Tab-delimited: timestamp <tab> sha <tab> branch <tab> author <tab> reason.
+  # Tab-delimited: timestamp <tab> pushed-refs <tab> branch <tab> author <tab> reason.
   # Append-only; union-merged on rebase via .gitattributes (DoE 3a/N-3).
   printf '%s\t%s\t%s\t%s\t%s\n' \
-    "$timestamp" "$head_sha" "$branch" "$author" "$skip_reason" \
+    "$timestamp" "$pushed_refs_summary" "$branch" "$author" "$skip_reason" \
     >> "$repo_root_for_log/.test-baseline-overrides.log"
   exit 0
 fi
@@ -240,40 +330,87 @@ fi
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
-zero_sha="0000000000000000000000000000000000000000"
-
-# ── Resolve what is actually being pushed ───────────────────────────
-# Git feeds pre-push exactly one line per ref update on stdin:
-#   <local ref> <local sha> <remote ref> <remote sha>
-# See the SCOPE-SPLIT header comment above for why this replaces the staged-
-# index diff the pre-commit ancestor of this gate used to read.
-local_sha=""
-prev_sha=""
-while read -r _local_ref _local_sha _remote_ref _remote_sha; do
-  [[ -z "${_local_sha:-}" ]] && continue
-  if [[ "$_local_sha" == "$zero_sha" ]]; then
-    # A ref deletion. Nothing to test.
-    continue
-  fi
-  local_sha="$_local_sha"
-  if [[ "$_remote_sha" == "$zero_sha" ]]; then
-    # First push of this ref: no remote position to diff from. Fall back to
-    # the merge-base with origin/main; if that also cannot be resolved, leave
-    # prev_sha empty and fail CLOSED below (treat as "everything changed").
-    prev_sha=$(git merge-base "$local_sha" origin/main 2>/dev/null || echo "")
-  else
-    prev_sha="$_remote_sha"
-  fi
-  break
+# ── Collect every non-delete ref update ──────────────────────────────
+# Previously only the FIRST non-delete ref was gated (a `break` after it).
+# Every ref on stdin is now collected; a deletion (local sha all zeros) is
+# skipped, as before - there is nothing to test for a ref that is going away.
+non_delete_local_refs=()
+non_delete_local_shas=()
+non_delete_remote_shas=()
+for _i in "${!push_local_refs[@]}"; do
+  _lsha="${push_local_shas[$_i]:-}"
+  [[ -z "$_lsha" ]] && continue
+  [[ "$_lsha" == "$zero_sha" ]] && continue
+  non_delete_local_refs+=("${push_local_refs[$_i]}")
+  non_delete_local_shas+=("$_lsha")
+  non_delete_remote_shas+=("${push_remote_shas[$_i]:-}")
 done
 
-if [[ -z "$local_sha" ]]; then
+if (( ${#non_delete_local_shas[@]} == 0 )); then
   log "No non-delete ref updates to check. Push allowed."
   exit 0
 fi
 
+# ── Commit-binding check (2026-09-26, MANDATORY) ─────────────────────
+# INVARIANT: this gate validates exactly the commit being pushed - the
+# worktree must BE that commit, or the floor this hook reads and the suite
+# it runs are claims about two different commits. Refuse before running
+# anything expensive.
+#
+# 1. The working tree must be clean for TRACKED files. An uncommitted edit
+#    means `npm test` below would exercise code that is not part of any
+#    commit on the pushed ref - the push could carry a clean, tested commit
+#    while the local run that "proved" it actually ran different bytes.
+#    Untracked files are excluded deliberately: an untracked scratch file
+#    cannot affect a commit that does not reference it, and demanding a
+#    fully clean `git status` would also block routine local scratch state
+#    unrelated to what is being pushed.
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+  fail "WORKING TREE HAS UNCOMMITTED CHANGES TO TRACKED FILES - push blocked"
+  printf '\n' >&2
+  fail "This gate validates exactly the commit being pushed: it reads the"
+  fail ".test-baseline floor from the pushed commit and then runs the suite"
+  fail "against the working tree. An uncommitted change means those would be"
+  fail "two different claims about two different sets of bytes."
+  printf '\n' >&2
+  git status --porcelain --untracked-files=no >&2
+  printf '\n' >&2
+  fail "Commit or stash the changes above, then push again."
+  exit 1
+fi
+
+# 2. HEAD must equal the local SHA of every non-delete ref being pushed.
+#    Applied to ALL collected refs (see the MULTI-REF PUSHES header note),
+#    not only the first one.
+head_sha=$(git rev-parse HEAD)
+mismatched=()
+for _i in "${!non_delete_local_refs[@]}"; do
+  if [[ "${non_delete_local_shas[$_i]}" != "$head_sha" ]]; then
+    mismatched+=("${non_delete_local_refs[$_i]} (pushing ${non_delete_local_shas[$_i]})")
+  fi
+done
+if (( ${#mismatched[@]} > 0 )); then
+  fail "PUSHED REF DOES NOT MATCH THE CHECKED-OUT COMMIT - push blocked"
+  printf '\n' >&2
+  fail "This worktree's HEAD is $head_sha. This gate validates exactly the"
+  fail "commit being pushed, so the worktree must be checked out to that"
+  fail "same commit - otherwise the suite run below proves nothing about"
+  fail "what is actually being sent."
+  printf '\n' >&2
+  for _m in "${mismatched[@]}"; do
+    printf '[baseline-guard]   %s\n' "$_m" >&2
+  done
+  printf '\n' >&2
+  fail "Check out the commit you intend to push (or push HEAD), then push again."
+  exit 1
+fi
+
 # ── Gate 1: transform-error detection + test baseline ───────────────
 log "Gate 1/1: npm test + transform-error detection + baseline check"
+
+# All non-delete refs are now proven to be HEAD (the commit-binding check
+# above). One SHA to test, one SHA to read the floor from.
+local_sha="$head_sha"
 
 # Resolve the enforcement floor from the TIP OF WHAT IS BEING PUSHED
 # (`$local_sha:.test-baseline`), never the unstaged working tree. The floor
@@ -289,34 +426,104 @@ if ! [[ "$baseline" =~ ^(0|[1-9][0-9]*)$ ]]; then
   exit 1
 fi
 
-# Did THIS PUSH touch .test-baseline, and did it touch anything under
-# server/ (excluding the public package README and server/docs/**)? Both
-# are answered from the commit range being pushed (prev_sha..local_sha), the
-# push-time analog of the staged-index diff the pre-commit ancestor used.
+# ── Resolve each pushed ref's previous position, fail CLOSED on any that
+#    do not resolve ─────────────────────────────────────────────────
 #
-# Fail-CLOSED fallback: if prev_sha could not be resolved (new ref, no
-# reachable origin/main), treat the range as fully unknown - assume
-# .test-baseline was NOT already accounted for and that server/ WAS
-# touched, so the full accounting is demanded rather than silently skipped.
+# For EVERY non-delete ref (see the MULTI-REF PUSHES header note - this used
+# to run once, for the first ref only), work out:
+#   - did THIS PUSH touch .test-baseline (between that ref's previous
+#     position and $local_sha)?
+#   - did it touch anything under server/ (excluding the public package
+#     README and server/docs/**)?
+#   - what floor did .test-baseline carry at that ref's previous position?
+#
+# and combine across refs conservatively: touched-in-ANY-ref counts as
+# touched (OR), and the previous-floor value used for the strict-upward
+# check is the HIGHEST one seen (so a bump is never judged sufficient
+# against one ref's history while actually falling short of another's).
+#
+# FAIL-CLOSED (2026-09-26, MANDATORY): a shallow clone or partial fetch can
+# leave a ref's previous SHA naming an object this repo does not have. The
+# old code let `git diff` against a missing object fail silently (redirected
+# to /dev/null with `|| true`), leaving both flags empty - which is read
+# elsewhere as "this push cannot have touched a test" and would both grant
+# the macOS platform-delta carve-out AND skip the strict-upward floor check.
+# Every previous SHA is now verified resolvable with `git cat-file -e
+# "$prev_sha^{commit}"` before it is trusted for anything; an empty or
+# unresolvable one flips a global fail-closed flag instead of silently
+# producing empty diffs.
 baseline_touched_in_push=""
 server_test_surface_touched_in_push=""
-if [[ -z "$prev_sha" ]]; then
-  server_test_surface_touched_in_push="yes"
-  prev_baseline=0
-else
-  if git diff --name-only "$prev_sha".."$local_sha" 2>/dev/null | grep -qx ".test-baseline"; then
+any_prev_unresolvable=""
+max_prev_baseline=0
+
+for _i in "${!non_delete_local_refs[@]}"; do
+  _remote_sha="${non_delete_remote_shas[$_i]}"
+  if [[ -z "$_remote_sha" || "$_remote_sha" == "$zero_sha" ]]; then
+    # First push of this ref: no remote position to diff from. Fall back to
+    # the merge-base with origin/main.
+    _prev_sha=$(git merge-base "$local_sha" origin/main 2>/dev/null || echo "")
+  else
+    _prev_sha="$_remote_sha"
+  fi
+
+  if [[ -z "$_prev_sha" ]] || ! git cat-file -e "${_prev_sha}^{commit}" 2>/dev/null; then
+    any_prev_unresolvable="yes"
+    continue
+  fi
+
+  if git diff --name-only "$_prev_sha".."$local_sha" 2>/dev/null | grep -qx ".test-baseline"; then
     baseline_touched_in_push="yes"
   fi
-  if git diff --name-only "$prev_sha".."$local_sha" 2>/dev/null \
+  if git diff --name-only "$_prev_sha".."$local_sha" 2>/dev/null \
     | grep -E '^server/' \
     | grep -qvE '^server/(README\.md|docs/)'; then
     server_test_surface_touched_in_push="yes"
   fi
-  prev_baseline=$(git show "$prev_sha":.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
-  if [[ -z "$prev_baseline" ]] || ! [[ "$prev_baseline" =~ ^(0|[1-9][0-9]*)$ ]]; then
-    prev_baseline=0
+  _prev_baseline=$(git show "$_prev_sha":.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+  if [[ -z "$_prev_baseline" ]] || ! [[ "$_prev_baseline" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    _prev_baseline=0
+  fi
+  if (( _prev_baseline > max_prev_baseline )); then
+    max_prev_baseline="$_prev_baseline"
+  fi
+done
+
+if [[ -n "$any_prev_unresolvable" ]]; then
+  # Fail CLOSED: force the full accounting to run rather than silently
+  # skipping it, and refuse outright any pushed floor lower than the floor
+  # currently on origin/main - a lowered floor with no resolvable previous
+  # ref to prove the lowering was intentional and reviewed is never allowed.
+  baseline_touched_in_push="yes"
+  server_test_surface_touched_in_push="yes"
+  warn "One or more pushed refs' previous position could not be resolved"
+  warn "(shallow clone or partial fetch). Failing CLOSED: the full baseline"
+  warn "accounting runs, and the pushed floor is checked against origin/main."
+
+  main_baseline=$(git show origin/main:.test-baseline 2>/dev/null | tr -d '[:space:]' || true)
+  if [[ -z "$main_baseline" ]] || ! [[ "$main_baseline" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    fail "origin/main:.test-baseline is unreadable, and this push has an"
+    fail "unresolvable previous ref - there is no floor left to fail closed"
+    fail "against. Push blocked."
+    exit 1
+  fi
+  if (( baseline < main_baseline )); then
+    fail "LOWERED FLOOR WITH NO RESOLVABLE PREVIOUS REF - push blocked"
+    printf '[baseline-guard]   origin/main .test-baseline: %s\n' "$main_baseline" >&2
+    printf '[baseline-guard]   Pushed .test-baseline:      %s\n' "$baseline" >&2
+    printf '\n' >&2
+    fail "A lowered floor can only be accepted when this hook can prove it"
+    fail "against the actual previous position of the ref. With that position"
+    fail "unresolvable (shallow clone / partial fetch), a lower floor is"
+    fail "indistinguishable from one that was never reviewed. Fetch the full"
+    fail "history, or push from a clone that has origin/main, and try again."
+    exit 1
+  fi
+  if (( max_prev_baseline < main_baseline )); then
+    max_prev_baseline="$main_baseline"
   fi
 fi
+prev_baseline="$max_prev_baseline"
 
 # STRICT-UPWARD CHECK RUNS UNCONDITIONALLY when .test-baseline was touched in
 # this push: a flat re-push of the same number, or a lowered edit, is not an

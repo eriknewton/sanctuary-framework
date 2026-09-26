@@ -44,9 +44,31 @@
 #     cannot resolve), and runs `npx vitest related --run <those files>` in
 #     server/: vitest's own dependency-graph feature, which maps each staged
 #     source file to the test files that import it (transitively) and runs
-#     only those, or runs a staged test file directly. If nothing staged is a
-#     `.ts`/`.tsx` file under server/, this gate is a no-op (nothing under
-#     test could have changed).
+#     only those, or runs a staged test file directly.
+#
+#     UNSTAGED-MODIFICATION REFUSAL (2026-09-26, MANDATORY): `vitest
+#     related` reads the WORKTREE copy of the files it is given, not the
+#     staged blob - so a staged file that also carries an unstaged edit
+#     would be tested with content that is not what `git commit` is about
+#     to record. This gate exists to test the blob being committed, so it
+#     refuses the commit outright (see the check below) when any staged
+#     path under server/ also has an unstaged modification, rather than
+#     silently testing the wrong bytes.
+#
+#     WHAT THIS GATE COVERS, AND WHAT IT DEFERS (2026-09-26, corrected -
+#     the previous wording claimed deletions were "covered" when in fact a
+#     staged change consisting only of a deleted `*.test.ts` file, or of
+#     `server/package.json`, `server/package-lock.json`,
+#     `server/vitest.config*`, `server/tsconfig*.json`,
+#     `server/tsup.config*`, or a plain `.js`/`.mjs` file under server/,
+#     gives `vitest related` nothing to run and this gate falls through to
+#     a silent no-op): this gate covers only staged `.ts`/`.tsx` files
+#     under server/ that `vitest related` can resolve a module graph from.
+#     A staged change that is ENTIRELY one or more of the kinds listed
+#     above prints a one-line notice below that this fast tier cannot judge
+#     it, and defers to `.githooks/pre-push` (the full suite) and the CI
+#     floor guard - it does not block the commit on its own, since neither
+#     typecheck nor a related-tests run is meaningful for those paths.
 #
 #     The output is redacted the same way the full suite's output is (see
 #     scripts/redact-test-output.mjs) and scanned with the SAME
@@ -171,6 +193,38 @@ fi
 ok "Gate 1/2: typecheck clean."
 
 # ── Gate 2: changed-path tests (vitest related) ─────────────────────
+
+# UNSTAGED-MODIFICATION REFUSAL (2026-09-26, MANDATORY): `vitest related`
+# below is handed absolute paths and reads them off the WORKTREE, not the
+# git index - there is no way to make vitest execute the staged blob
+# directly. So if a staged file under server/ ALSO carries an unstaged
+# edit, the worktree copy vitest would run is not the blob `git commit` is
+# about to record; a pass here would prove nothing about the commit being
+# made. Refuse before running anything, and name every offending path so
+# the fix (stage the rest, or stash it) is obvious.
+staged_server_paths=$(git diff --cached --name-only --diff-filter=ACMR -- server || true)
+unstaged_server_paths=$(git diff --name-only -- server || true)
+unstaged_conflict_paths=$(comm -12 \
+  <(printf '%s\n' "$staged_server_paths" | sort) \
+  <(printf '%s\n' "$unstaged_server_paths" | sort))
+
+if [[ -n "$unstaged_conflict_paths" ]]; then
+  fail "STAGED FILE(S) ALSO HAVE UNSTAGED EDITS - commit blocked"
+  printf '\n' >&2
+  fail "This gate tests the blob being committed. 'vitest related' reads the"
+  fail "worktree copy of each file, so a path that is both staged and"
+  fail "further modified would be tested with content that is not what this"
+  fail "commit is about to record:"
+  printf '\n' >&2
+  printf '%s\n' "$unstaged_conflict_paths" | while IFS= read -r _p; do
+    printf '[fast-tier]   %s\n' "$_p" >&2
+  done
+  printf '\n' >&2
+  fail "Stage the remaining changes to these files, or stash/revert the"
+  fail "unstaged edit, then commit again."
+  exit 1
+fi
+
 # Staged .ts/.tsx files under server/, added/copied/modified/renamed only -
 # a deleted file has nothing left for `vitest related` to resolve a module
 # graph from, and excluding it is correct, not a gap: the test files that
@@ -183,7 +237,31 @@ ok "Gate 1/2: typecheck clean."
 staged_ts_files=()
 while IFS= read -r _f; do
   [[ -n "$_f" ]] && staged_ts_files+=("$_f")
-done < <(git diff --cached --name-only --diff-filter=ACMR -- server | grep -E '\.tsx?$' || true)
+done < <(printf '%s\n' "$staged_server_paths" | grep -E '\.tsx?$' || true)
+
+# DEFERRED-SCOPE NOTICE (2026-09-26, MANDATORY - see the header's
+# WHAT THIS GATE COVERS section): a staged change under server/ that is a
+# deleted `*.test.ts`/`*.test.tsx`, or one of the build/config files below,
+# or a plain `.js`/`.mjs` file, gives `vitest related` nothing to resolve a
+# module graph from. Name it explicitly rather than letting the commit pass
+# with an unqualified "all checks passed" when this tier could not actually
+# judge that change; pre-push (the full suite) and the CI floor guard are
+# the gates that cover it.
+deleted_test_files=$(git diff --cached --name-only --diff-filter=D -- server \
+  | grep -E '\.test\.tsx?$' || true)
+staged_config_files=$(printf '%s\n' "$staged_server_paths" \
+  | grep -E '(^server/package\.json$|^server/package-lock\.json$|^server/vitest\.config\.[cm]?[jt]s$|^server/tsconfig(\..+)?\.json$|^server/tsup\.config\.[cm]?[jt]s$)' || true)
+staged_plain_js_files=$(printf '%s\n' "$staged_server_paths" | grep -E '\.m?js$' || true)
+undeferrable_paths=$(printf '%s\n%s\n%s\n' \
+  "$deleted_test_files" "$staged_config_files" "$staged_plain_js_files" | grep -v '^$' || true)
+
+if [[ -n "$undeferrable_paths" ]]; then
+  log "Gate 2/2 notice: the fast tier cannot judge these staged path(s) (no .ts/.tsx module graph to run 'vitest related' against):"
+  printf '%s\n' "$undeferrable_paths" | while IFS= read -r _p; do
+    printf '[fast-tier]   %s\n' "$_p" >&2
+  done
+  log "pre-push (the full suite) and the CI floor guard are the gates for these paths."
+fi
 
 if (( ${#staged_ts_files[@]} == 0 )); then
   log "Gate 2/2: no staged .ts/.tsx files under server/ - nothing for vitest related to run."

@@ -3,7 +3,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { resolveHooksDir } from "../../scripts/install-hooks.js";
+import {
+  resolveHooksDir,
+  installHooksInto,
+  backupExistingForeignHook,
+  MARKER_LINE,
+} from "../../scripts/install-hooks.js";
 
 describe("install-hooks resolveHooksDir", () => {
   let tmpRoot: string;
@@ -123,5 +128,118 @@ describe("install-hooks resolveHooksDir", () => {
 
   it("throws when the root has no .git entry", () => {
     expect(() => resolveHooksDir(tmpRoot)).toThrow(/Not a git repository/);
+  });
+});
+
+// REGRESSION (2026-09-26): pre-push (the full test-baseline guard) must be
+// installed BEFORE pre-commit (the fast tier). If the second copy in the
+// loop fails, installing pre-commit first would leave a repo with the fast
+// tier in place and no full-suite gate at all - a partial install that
+// looks complete for every commit made afterward. These tests exercise the
+// real `installHooksInto`/`backupExistingForeignHook`/`MARKER_LINE` exports,
+// not a re-implementation, and use temp directories throughout (never the
+// developer's own hooks directory) per this suite's isolation discipline.
+describe("install-hooks installHooksInto ordering + foreign-hook backup", () => {
+  let tmpRoot: string;
+  let fakeRoot: string;
+  let hooksDir: string;
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "sanctuary-install-hooks-order-"),
+    );
+    fakeRoot = path.join(tmpRoot, "fake-repo-root");
+    hooksDir = path.join(tmpRoot, "hooks-dir");
+    fs.mkdirSync(path.join(fakeRoot, ".githooks"), { recursive: true });
+    fs.mkdirSync(hooksDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it("installs pre-push before pre-commit, so a failing second copy still leaves the full-suite gate in place", () => {
+    // Only the pre-push source exists - pre-commit's source is deliberately
+    // absent, simulating the second copy in HOOK_NAMES failing (a missing
+    // file behaves the same as any other mid-loop failure for this
+    // purpose: the loop throws after the first hook is already on disk).
+    fs.writeFileSync(
+      path.join(fakeRoot, ".githooks", "pre-push"),
+      `#!/usr/bin/env bash\n${MARKER_LINE}\necho pre-push\n`,
+      "utf8",
+    );
+
+    expect(() => installHooksInto(fakeRoot, hooksDir)).toThrow(
+      /pre-commit not found/,
+    );
+
+    // pre-push (the expensive, harder-to-bypass gate) must have made it to
+    // disk before the failure on pre-commit.
+    expect(fs.existsSync(path.join(hooksDir, "pre-push"))).toBe(true);
+    // pre-commit's source never existed, so nothing should have been
+    // written for it.
+    expect(fs.existsSync(path.join(hooksDir, "pre-commit"))).toBe(false);
+  });
+
+  it("backs up an existing foreign hook (no MARKER_LINE) before overwriting it, for both hook names", () => {
+    const foreignPrePush = "#!/bin/sh\necho some other tool's pre-push\n";
+    const foreignPreCommit = "#!/bin/sh\necho some other tool's pre-commit\n";
+    fs.writeFileSync(path.join(hooksDir, "pre-push"), foreignPrePush, "utf8");
+    fs.writeFileSync(
+      path.join(hooksDir, "pre-commit"),
+      foreignPreCommit,
+      "utf8",
+    );
+
+    const sanctuaryPrePush = `#!/usr/bin/env bash\n${MARKER_LINE}\necho sanctuary pre-push\n`;
+    const sanctuaryPreCommit = `#!/usr/bin/env bash\n${MARKER_LINE}\necho sanctuary pre-commit\n`;
+    fs.writeFileSync(
+      path.join(fakeRoot, ".githooks", "pre-push"),
+      sanctuaryPrePush,
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(fakeRoot, ".githooks", "pre-commit"),
+      sanctuaryPreCommit,
+      "utf8",
+    );
+
+    installHooksInto(fakeRoot, hooksDir);
+
+    const prePushBackup = path.join(hooksDir, "pre-push.pre-sanctuary.bak");
+    const preCommitBackup = path.join(
+      hooksDir,
+      "pre-commit.pre-sanctuary.bak",
+    );
+    expect(fs.readFileSync(prePushBackup, "utf8")).toBe(foreignPrePush);
+    expect(fs.readFileSync(preCommitBackup, "utf8")).toBe(foreignPreCommit);
+    expect(fs.readFileSync(path.join(hooksDir, "pre-push"), "utf8")).toBe(
+      sanctuaryPrePush,
+    );
+    expect(fs.readFileSync(path.join(hooksDir, "pre-commit"), "utf8")).toBe(
+      sanctuaryPreCommit,
+    );
+  });
+
+  it("does not back up an existing hook that already carries MARKER_LINE (a prior Sanctuary install)", () => {
+    const priorSanctuaryPrePush = `#!/usr/bin/env bash\n${MARKER_LINE}\necho old sanctuary pre-push\n`;
+    fs.writeFileSync(
+      path.join(hooksDir, "pre-push"),
+      priorSanctuaryPrePush,
+      "utf8",
+    );
+
+    expect(backupExistingForeignHook(path.join(hooksDir, "pre-push"))).toBe(
+      null,
+    );
+    expect(
+      fs.existsSync(path.join(hooksDir, "pre-push.pre-sanctuary.bak")),
+    ).toBe(false);
+  });
+
+  it("returns null from backupExistingForeignHook when there is nothing at dst yet", () => {
+    expect(
+      backupExistingForeignHook(path.join(hooksDir, "nonexistent-hook")),
+    ).toBe(null);
   });
 });
