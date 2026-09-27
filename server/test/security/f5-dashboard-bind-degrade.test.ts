@@ -42,15 +42,18 @@
  */
 
 import { createServer, type Server as NetServer } from "node:net";
+import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { fixedDenial } from "../../src/agent-native/safety-base.js";
 import { createSanctuaryServer } from "../../src/index.js";
 import {
   StderrApprovalChannel,
 } from "../../src/principal-policy/approval-channel.js";
+import { refuseDashboardBindRace } from "../../src/principal-policy/channel-selection.js";
+import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
 import {
   DEFAULT_POLICY,
   generateDefaultPolicyYaml,
@@ -80,9 +83,16 @@ function parseToolResult(result: {
   return JSON.parse(result.content[0]!.text);
 }
 
+// A163 fix round 1 (Claude minor 6): SANCTUARY_DASHBOARD_ENABLED is included
+// here even though `explicitDashboardRequested` (index.ts) no longer reads
+// it -- this keeps the F5 (implicit-case) suite below env-insensitive: with
+// that var exported ambiently, the F5 suite must still boot the #1458
+// degrade, not the A163 refusal, since the refusal now keys off the boot
+// option this suite never sets, not the env var.
 const DASHBOARD_ENV_KEYS = [
   "SANCTUARY_DASHBOARD_HOST",
   "SANCTUARY_DASHBOARD_PORT",
+  "SANCTUARY_DASHBOARD_ENABLED",
 ] as const;
 
 // Must match `GENERIC_GATE_DENIAL_REMEDIATION` in router.ts (not exported):
@@ -219,34 +229,32 @@ describe("F5: a busy embedded-dashboard port degrades the MCP stdio boot instead
 });
 
 describe("A163: an explicitly requested dashboard refuses startup on a busy port instead of degrading", () => {
-  // Wired-consumer test, same object graph as the F5 suite above, with the
-  // ONE variable A163 introduces: `SANCTUARY_DASHBOARD_ENABLED=true`, the
-  // env var `--dashboard` sets (cli.ts) and config.ts reads into
-  // `config.dashboard.enabled`. That flag is this test's stand-in for an
-  // operator's explicit ask; the F5 suite above never sets it, so it proves
-  // the unchanged IMPLICIT-ask degrade and this suite proves the new
-  // EXPLICIT-ask refusal. Fails on unmodified `origin/main` today: main has
-  // no such branch, so boot completes and this `rejects` assertion times out
-  // waiting for a rejection that never comes (recorded as the fail-before
-  // witness in the A163 report).
+  // Fix round 1 (code-gate 2026-09-27, Claude-2/Grok-1 blocking): the signal
+  // is now the boot-local `explicitDashboardRequested` option on
+  // `createSanctuaryServer`, set ONLY by cli.ts's `--dashboard` argv parse --
+  // never `SANCTUARY_DASHBOARD_ENABLED` / `config.dashboard.enabled`, both of
+  // which persist past the process that set them (`saveConfig`, `wrap`) and
+  // so read as "some earlier setup asked" on every later boot, not "this
+  // operator asked now". `DASHBOARD_ENV_KEYS` above already restores
+  // `SANCTUARY_DASHBOARD_ENABLED` around every test in this file so the F5
+  // suite stays env-insensitive; this suite does not set that env var at all
+  // and instead passes the boot option directly.
+  //
+  // Fail-before note (Claude-5 minor correction): on unmodified `origin/main`
+  // (no `explicitDashboardRequested` branch and no preflight), `boot` rejects
+  // nothing -- `createSanctuaryServer()` RESOLVES, degrading like the F5
+  // path. `expect(promise).rejects.toThrow(...)` against a resolving promise
+  // fails immediately with "promise resolved instead of rejecting", not a
+  // timeout; that is the actual fail-before witness for this suite.
   let fortress: TempFortress;
   let occupyingServer: NetServer | undefined;
   let dashboardPort: number;
   let restoreEnv: Map<string, string | undefined>;
   let boot: Awaited<ReturnType<typeof createSanctuaryServer>> | undefined;
 
-  const A163_ENV_KEYS = [...DASHBOARD_ENV_KEYS, "SANCTUARY_DASHBOARD_ENABLED"] as const;
-
   beforeEach(async () => {
     fortress = await createTempFortress("sanctuary-a163-dashbind");
-    restoreEnv = new Map(A163_ENV_KEYS.map((key) => [key, process.env[key]]));
-
-    await mkdir(fortress.storagePath, { recursive: true, mode: 0o700 });
-    await writeFile(
-      join(fortress.storagePath, "principal-policy.yaml"),
-      generateDefaultPolicyYaml().replace("type: stderr", "type: dashboard"),
-      { mode: 0o600 },
-    );
+    restoreEnv = new Map(DASHBOARD_ENV_KEYS.map((key) => [key, process.env[key]]));
 
     await bindWithRetry(async () => {
       const port = randomTestPort();
@@ -267,8 +275,6 @@ describe("A163: an explicitly requested dashboard refuses startup on a busy port
 
     process.env.SANCTUARY_DASHBOARD_HOST = "127.0.0.1";
     process.env.SANCTUARY_DASHBOARD_PORT = String(dashboardPort);
-    // The explicit-ask signal under test.
-    process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
   });
 
   afterEach(async () => {
@@ -291,19 +297,94 @@ describe("A163: an explicitly requested dashboard refuses startup on a busy port
     }
   });
 
-  it("refuses to start, naming the port, and serves no MCP tool", async () => {
-    // (a) boot REJECTS -- does not complete, does not degrade to deny-all.
-    await expect(createSanctuaryServer()).rejects.toThrow(
+  it("virgin fortress: refuses before any fortress write, naming the port", async () => {
+    // No mkdir, no principal-policy.yaml, no prior boot: this fortress has
+    // never been touched. The preflight probe (`refuseIfDashboardPortUnavailable`
+    // in index.ts) runs immediately after `loadConfig`, before the storage-dir
+    // mkdir, before `establishMaster`'s custody envelope, before
+    // `loadPrincipalPolicy`'s ENOENT-triggered default-policy write.
+    await expect(
+      createSanctuaryServer({ explicitDashboardRequested: true }),
+    ).rejects.toThrow(
       new RegExp(`dashboard.*explicitly requested.*${dashboardPort}.*already in use`, "is"),
     );
-
-    // No partial server escapes the rejected promise: `boot` is never
-    // assigned, so there is no `server` object this test (or a caller) could
-    // route a tools/call request through. This is the "no MCP tool is
-    // served" half of the acceptance criterion -- a rejected
-    // `createSanctuaryServer()` never returns the `{ server, ... }` a caller
-    // needs to reach `router.ts`'s dispatch at all.
     boot = undefined;
+
+    // Nothing was written: the whole fortress directory (custody envelope,
+    // config file, principal-policy.yaml, audit log) never came into being.
+    expect(existsSync(fortress.storagePath)).toBe(false);
+  });
+
+  it("does NOT refuse an implicit boot on the same busy port (explicitDashboardRequested omitted)", async () => {
+    // Sanity check that the new option, not ambient state, gates the
+    // refusal: same busy port, same fortress shape, but this call never
+    // opts in, so `loadPrincipalPolicy`'s ENOENT default (type: stderr)
+    // means the dashboard branch is never reached at all and boot completes
+    // normally.
+    boot = await createSanctuaryServer();
+    expect(boot.policy.approval_channel.type).toBe("stderr");
+  });
+
+  it("race path: after custody exists, a lost bind race is audited and the channel is stopped through its real stop()", async () => {
+    // Reproducing the actual bind-timing race (preflight sees the port free,
+    // the real `dashboard.start()` loses it moments later) deterministically
+    // through the full boot is not practical; `refuseDashboardBindRace` is
+    // exported from `channel-selection.ts` (not re-exported from
+    // `src/index.ts`, so it never touches the public-surface-snapshot guard)
+    // specifically so this path is testable directly against REAL objects
+    // instead of being left uncovered. This is the
+    // "passphrase-established fortress" case Grok-2 named: custody already
+    // exists (this boot's own `createTempFortress` pins `SANCTUARY_PASSPHRASE`),
+    // so the audit row and the channel-stop side effect are the only things
+    // under test, not the preflight (which is covered by the first `it`).
+    boot = await createSanctuaryServer();
+    const { auditLog } = boot;
+
+    // Observe the REAL `setInterval`/`clearInterval` calls without replacing
+    // real timer scheduling (no `vi.useFakeTimers`, which would risk hanging
+    // the dashboard's real HTTP bind/close I/O below). `setIntervalSpy` calls
+    // through to the genuine implementation; it only lets this test see the
+    // handle `DashboardApprovalChannel`'s constructor arms unconditionally
+    // (`dashboard.ts`'s `sessionCleanupTimer`, before any bind attempt).
+    const setIntervalSpy = vi.spyOn(global, "setInterval");
+    const dashboard = new DashboardApprovalChannel({
+      port: dashboardPort,
+      host: "127.0.0.1",
+      timeout_seconds: DEFAULT_POLICY.approval_channel.timeout_seconds,
+      auth_token: "a163-race-test-token",
+    });
+    const sessionCleanupTimerHandle = setIntervalSpy.mock.results.at(-1)?.value;
+    setIntervalSpy.mockRestore();
+    expect(sessionCleanupTimerHandle).toBeDefined();
+
+    // The occupying server (bound in beforeEach) makes this `start()` lose
+    // the race exactly as the real dashboard case's `start()` would.
+    await dashboard.start({ exitCleanOnAddrInUse: true, silentAddrInUse: true });
+    expect(dashboard.addrInUse()).toBe(true);
+
+    const clearIntervalSpy = vi.spyOn(global, "clearInterval");
+    const err = await refuseDashboardBindRace(
+      dashboard,
+      auditLog,
+      boot.config.storage_path,
+      dashboardPort,
+    );
+    expect(err.message).toContain(String(dashboardPort));
+    expect(err.message).toContain("already in use");
+
+    // stop() was reached through the REAL channel: the exact timer handle
+    // its constructor armed was cleared, not a substitute or a mock.
+    expect(clearIntervalSpy).toHaveBeenCalledWith(sessionCleanupTimerHandle);
+    clearIntervalSpy.mockRestore();
+
+    // The fortress's own trail records why: same shape as the #1458 degrade
+    // path's audit row.
+    const auditResult = await auditLog.query({
+      operation_type: "dashboard_bind_unavailable",
+    });
+    expect(auditResult.entries).toHaveLength(1);
+    expect(auditResult.entries[0]!.result).toBe("failure");
+    expect(auditResult.entries[0]!.details).toEqual({ port: dashboardPort });
   });
 });
 

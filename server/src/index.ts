@@ -37,7 +37,11 @@ import {
   type ApprovalChannel,
 } from "./principal-policy/approval-channel.js";
 import { DashboardApprovalChannel } from "./principal-policy/dashboard.js";
-import { selectApprovalChannelByPolicy } from "./principal-policy/channel-selection.js";
+import {
+  selectApprovalChannelByPolicy,
+  refuseIfDashboardPortUnavailable,
+  refuseDashboardBindRace,
+} from "./principal-policy/channel-selection.js";
 import { ApprovalGate } from "./principal-policy/gate.js";
 import {
   ApprovalAggregator,
@@ -281,6 +285,21 @@ export async function createSanctuaryServer(options?: {
    */
   approvalCallback?: (request: ApprovalRequest) => Promise<ApprovalResponse>;
   /**
+   * A163: true ONLY when THIS boot's own operator asked for the embedded
+   * dashboard just now. Set by exactly one site, the `--dashboard` argv parse
+   * in `cli.ts` (must match the consumer here); every other caller
+   * (evidence-pack CLI, EU AI Act compliance CLI, an in-process embedder, a
+   * test that omits this option) defaults to false. Never derive this from
+   * `config.dashboard.enabled` or `SANCTUARY_DASHBOARD_ENABLED`: both persist
+   * past this process (`saveConfig` below writes the config back to
+   * `sanctuary.json`; `wrap` copies the env var into every harness's MCP
+   * client config), so either one reads as "some earlier setup asked" on
+   * every later boot, not "this operator asked right now" -- the exact
+   * defect the code-gate round 1 review caught in the first cut of this
+   * fix (config.dashboard.enabled).
+   */
+  explicitDashboardRequested?: boolean;
+  /**
    * TEST ONLY: fake the exact-fortress stored-passphrase read the shared
    * resolver performs at its `stored-passphrase` step. Defaults to the real
    * {@link readStoredPassphrase}. Injected so a wired-consumer test can boot
@@ -301,6 +320,36 @@ export async function createSanctuaryServer(options?: {
 }): Promise<SanctuaryServer> {
   // 1. Load configuration
   const config = await loadConfig(options?.configPath);
+
+  // A163 (fix round 1, 2026-09-27, Grok-2 blocking finding): an explicit
+  // dashboard ask probes the bind BEFORE any fortress write below -- the
+  // storage-dir mkdir two lines down, and `establishMaster`'s custody
+  // envelope and minted recovery key further down. A virgin fortress must
+  // stay virgin when the port this operator asked for is unavailable:
+  // refusing AFTER `establishMaster` would already have minted and, on a
+  // no-passphrase first run, orphaned a recovery key for a server that never
+  // starts, with nothing on this path to roll that envelope back. The probe
+  // only binds-and-closes on an ephemeral check; it never constructs the real
+  // `DashboardApprovalChannel`, so it cannot collide with or double-register
+  // the real listener `start()` builds later in the dashboard case below.
+  // BOUND: this is a point-in-time check. If another process wins the same
+  // port between this probe and the real `start()`, the race-path refusal in
+  // the dashboard case (below, guarded by the same `explicitDashboardRequested`)
+  // still fires; by then custody IS established, so that refusal records the
+  // `dashboard_bind_unavailable` audit row and stops the channel before
+  // throwing, since a refusal after custody exists should leave the fortress's
+  // own trail and no leaked handle, even though it can no longer stay virgin.
+  //
+  // CALLER OUT OF THIS SCOPE: `castle-wall-macos`'s `SanctuaryServerBridge.swift`
+  // spawns `sanctuary --dashboard`, so this refusal (and the message on its
+  // stderr) is what that spawn now produces on a busy port instead of the
+  // #1458 degrade. Making that app surface the refusal instead of discarding
+  // stderr and reporting a healthy badge is a separate, already-registered
+  // defect (register row MACOS-APP-SERVER-HEALTH-FOREIGN-PORT-01) with its
+  // own Swift fix queued; no Swift change lands in this PR.
+  if (options?.explicitDashboardRequested) {
+    await refuseIfDashboardPortUnavailable(config.dashboard.host, config.dashboard.port);
+  }
 
   // 2. Ensure storage directory exists with correct permissions
   await mkdir(config.storage_path, { recursive: true, mode: 0o700 });
@@ -1335,28 +1384,39 @@ export async function createSanctuaryServer(options?: {
     }
     await selectedApprovalChannel.start();
     if (dashboard.addrInUse()) {
-      // A163 (2026-09-27, Erik decision = option A): `config.dashboard.enabled`
-      // is true ONLY when THIS boot's own CLI flag (`--dashboard`, cli.ts) or
-      // config key explicitly asked for the embedded dashboard -- it is
-      // false whenever the dashboard channel was selected implicitly, i.e.
-      // this fortress's persisted `principal-policy.yaml` already says
-      // `approval_channel.type=dashboard` from an earlier session's setup,
-      // but this particular invocation did not ask for one (config.ts's
-      // SANCTUARY_DASHBOARD_ENABLED handling; the default is false). An
-      // operator who explicitly requested the dashboard and silently got a
-      // server with no dashboard has been handed a different product than
-      // the one they asked for (AGENTS MUST-NEVER #5: never silently
-      // degrade), so this refuses startup exactly as every non-EADDRINUSE
-      // dashboard bind error already does (the `catch` in
+      // A163 (2026-09-27, Erik decision = option A; fix round 1 replaces the
+      // signal with `explicitDashboardRequested`, see that option's doc
+      // comment above): an operator who explicitly requested the dashboard
+      // and silently got a server with no dashboard has been handed a
+      // different product than the one they asked for (AGENTS MUST-NEVER #5:
+      // never silently degrade), so this refuses startup exactly as every
+      // non-EADDRINUSE dashboard bind error already does (the `catch` in
       // `selectApprovalChannelByPolicy`'s dashboard case, channel-
-      // selection.ts) -- naming the port only, no rule or tier. The
-      // IMPLICIT case (this flag/key false) is unchanged from #1458 and
-      // falls through to the deny-all degrade below.
-      if (config.dashboard.enabled) {
-        throw new Error(
-          `Sanctuary cannot start: the dashboard was explicitly requested ` +
-            `(--dashboard, or config.dashboard.enabled), but the dashboard ` +
-            `port ${config.dashboard.port} is already in use.`,
+      // selection.ts) -- naming the port only, no rule or tier. The IMPLICIT
+      // case (`explicitDashboardRequested` false or omitted, e.g. this
+      // fortress's persisted `principal-policy.yaml` already says
+      // `approval_channel.type=dashboard` from an earlier session but THIS
+      // invocation's argv carried no `--dashboard`) is unchanged from #1458
+      // and falls through to the deny-all degrade below.
+      //
+      // RACE PATH: the preflight probe above (`refuseIfDashboardPortUnavailable`)
+      // already refused before custody existed for the common case; reaching
+      // HERE with `explicitDashboardRequested` true means the port was free at
+      // the probe and taken before this `start()` -- a lost race, not the
+      // common case. Custody now exists, so this refusal, unlike the
+      // preflight's, records the SAME `dashboard_bind_unavailable` audit row
+      // the degrade path below writes (an operator's own fortress trail must
+      // show why the process it just started is gone) and stops the dashboard
+      // channel before throwing (its constructor already started an
+      // un-`unref`'d session-cleanup interval, `dashboard.ts`'s
+      // `sessionCleanupTimer`; only `stop()` clears it, and the boot-failure
+      // catch below releases the master-key barrier but never calls it).
+      if (options?.explicitDashboardRequested) {
+        throw await refuseDashboardBindRace(
+          dashboard,
+          auditLog,
+          config.storage_path,
+          config.dashboard.port,
         );
       }
       // F5 (dashboard-bind-degrade, 2026-09-24 dogfood finding): the

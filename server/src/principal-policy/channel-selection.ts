@@ -1,5 +1,8 @@
 import { randomBytes } from "node:crypto";
+import { createServer as createNetProbeServer } from "node:net";
 import type { SanctuaryConfig } from "../config.js";
+import type { AuditLog } from "../operational/audit-log.js";
+import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import {
   CallbackApprovalChannel,
   StderrApprovalChannel,
@@ -12,6 +15,81 @@ import type {
   ApprovalResponse,
   PrincipalPolicy,
 } from "./types.js";
+
+/**
+ * A163 (fix round 1, 2026-09-27): bind-and-close probe for an explicitly
+ * requested dashboard, called from `createSanctuaryServer` (index.ts)
+ * immediately after `loadConfig`, BEFORE any fortress write (the storage-dir
+ * mkdir, `establishMaster`'s custody envelope). This never constructs a
+ * `DashboardApprovalChannel` and never leaves a listener behind either way:
+ * the probe's own server is closed on both the success and the error path
+ * before this function's promise settles. Kept in this module (not index.ts)
+ * so it is not part of `src/index.ts`'s re-exported public surface (the
+ * `public-surface-snapshot` structure test freezes that surface's exported
+ * NAMES; this is boot-internal wiring, not a package consumer's API).
+ */
+export async function refuseIfDashboardPortUnavailable(
+  host: string,
+  port: number,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const probe = createNetProbeServer();
+    probe.once("error", (err: NodeJS.ErrnoException) => {
+      probe.close(() => {
+        reject(
+          new Error(
+            `Sanctuary cannot start: the dashboard was explicitly requested ` +
+              `(--dashboard), but the dashboard port ${port} is already in ` +
+              `use: ${err.message}`,
+          ),
+        );
+      });
+    });
+    probe.listen(port, host, () => {
+      probe.close(() => resolve());
+    });
+  });
+}
+
+/**
+ * A163 race path (fix round 1, Claude-3/Claude-4/Grok-2): called from
+ * `createSanctuaryServer` (index.ts) ONLY when `explicitDashboardRequested`
+ * is true and the real dashboard bind still lost to EADDRINUSE despite
+ * `refuseIfDashboardPortUnavailable` seeing the port free -- i.e. another
+ * process won the port in the window between the probe and the real
+ * `start()`. Custody already exists on this path (the preflight above is
+ * what keeps a VIRGIN fortress from reaching here at all), so unlike the
+ * preflight's plain throw, this records the SAME `dashboard_bind_unavailable`
+ * audit row the #1458 degrade path writes -- an operator's own fortress
+ * trail must show why the process it just started is gone -- and stops the
+ * `DashboardApprovalChannel` `start()` already constructed: its constructor
+ * starts an un-`unref`'d 60s session-cleanup interval (`dashboard.ts`'s
+ * `sessionCleanupTimer`) unconditionally, before any bind attempt, and only
+ * `stop()` clears it. index.ts's boot-failure `catch` releases the
+ * master-key write barrier but never reaches this channel, so `stop()` must
+ * happen here, before the returned Error is thrown.
+ */
+export async function refuseDashboardBindRace(
+  dashboard: DashboardApprovalChannel,
+  auditLog: AuditLog,
+  storagePath: string,
+  port: number,
+): Promise<Error> {
+  await auditLog.appendCritical({
+    layer: "l2",
+    operation: "dashboard_bind_unavailable",
+    identity_id: fortressIdFromStoragePath(storagePath),
+    result: "failure",
+    details: {
+      port,
+    },
+  });
+  await dashboard.stop();
+  return new Error(
+    `Sanctuary cannot start: the dashboard was explicitly requested ` +
+      `(--dashboard), but the dashboard port ${port} is already in use.`,
+  );
+}
 
 type DashboardChannelConfig = ConstructorParameters<
   typeof DashboardApprovalChannel
@@ -101,12 +179,17 @@ export function selectApprovalChannelByPolicy(
             // cli.ts), and the EU AI Act compliance CLI (compliance/
             // eu_ai_act/cli.ts) all construct the server through this same
             // function. On a busy dashboard port, all of them either
-            // degrade to deny-all or refuse startup, decided by
-            // `config.dashboard.enabled` (A163, 2026-09-27): an operator who
-            // did NOT explicitly ask for the dashboard this boot gets the
-            // deny-all degrade (#1458); one who did (`--dashboard`, or an
-            // equivalent config key) gets a startup refusal naming the port,
-            // matching every other dashboard bind failure. The
+            // degrade to deny-all or refuse startup, decided by the
+            // `explicitDashboardRequested` boot option (A163, 2026-09-27
+            // fix round 1; must match its doc comment in index.ts) --
+            // a boot-local flag set ONLY by cli.ts's `--dashboard` argv
+            // parse, never derived from `config.dashboard.enabled` or
+            // `SANCTUARY_DASHBOARD_ENABLED`, both of which persist past this
+            // process. An operator who did NOT explicitly ask for the
+            // dashboard this boot gets the deny-all degrade (#1458); one who
+            // did gets a startup refusal naming the port (pre-flighted before
+            // any fortress write, or at this `addrInUse()` check on a lost
+            // race), matching every other dashboard bind failure. The
             // `addrInUse()` check and this decision live in the shared
             // `createSanctuaryServer` body (`index.ts`), so every one of
             // those callers gets the same behavior.

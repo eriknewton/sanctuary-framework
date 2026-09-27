@@ -154,7 +154,9 @@ Sanctuary lives in your menubar. When your agent wants to do something risky, yo
 The dashboard is for setup, inspection, and authenticated operator approvals.
 It includes the substrate selector, policy editor, audit deep-dive, exit bundle
 drill, and fortress configuration. The menubar keeps routine status and
-approval entry points close at hand.
+approval entry points close at hand. When started with `--dashboard`, a busy
+dashboard port refuses startup and names the port rather than starting a
+server with no dashboard.
 
 Concierge chat is a read-oriented natural-language interface to fortress state.
 "What's going on?" returns a summary from the audit log. "Why did my Hermes
@@ -302,7 +304,7 @@ Environment variables:
 | `SANCTUARY_FORTRESS_PATH` | Operator-facing fortress directory override | _(none)_ |
 | `SANCTUARY_STORAGE_PATH` | Storage directory path | `~/.sanctuary` |
 | `SANCTUARY_TRANSPORT` | Transport mode (`stdio` or `http`) | `stdio` |
-| `SANCTUARY_DASHBOARD_ENABLED` | Enable web dashboard (`true`/`false`); with `--dashboard` or this set explicitly, a busy dashboard port refuses startup naming the port rather than starting without one | `false` |
+| `SANCTUARY_DASHBOARD_ENABLED` | Enable web dashboard (`true`/`false`) | `false` |
 | `SANCTUARY_DASHBOARD_PORT` | Dashboard port | `3501` |
 | `SANCTUARY_DASHBOARD_AUTH_TOKEN` | Bearer token (`"auto"` creates a read-only launch session, not a decision-ready approval channel) | _(none)_ |
 | `SANCTUARY_DASHBOARD_TLS_CERT` | TLS certificate path | _(none)_ |
