@@ -212,6 +212,45 @@ pub enum OwnershipJournalError {
          Stop the castle-wall unit, then run the disarm verb to clear the journal"
     )]
     ConfinedHistoryFull { count: usize, cap: usize },
+    /// A write after activation found no `Owned` record for the activation this
+    /// process runs under, so it stored NOTHING. Register
+    /// `LINUX-JOURNAL-OWNED-WRITERS-01`: extending a foreign activation's record
+    /// would attribute this process's bindings to a table it does not hold, and
+    /// silently returning `Ok` over a `Preparing` or absent record would hide that
+    /// the confined history was not written.
+    #[error(
+        "ownership journal at {path} is not the Owned record for this process's \
+         activation ({observed}); nothing was written"
+    )]
+    NotOwnedForActivation {
+        path: PathBuf,
+        observed: ActivationMismatch,
+    },
+}
+
+/// Why a post-activation journal write found no `Owned` record for its activation.
+///
+/// Each variant is a distinct regression of the journal under a live daemon; the
+/// write refuses on all three (see [`OwnedJournalHandle`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationMismatch {
+    /// No journal file is present.
+    Absent,
+    /// The record is `Preparing` (for any identity): no history exists to extend.
+    Preparing,
+    /// The record is `Owned`, but for a different activation (any of schema,
+    /// marker, boot id, source, table handle or base chain handle differs).
+    OtherActivation,
+}
+
+impl std::fmt::Display for ActivationMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ActivationMismatch::Absent => "the record is absent",
+            ActivationMismatch::Preparing => "the record is Preparing",
+            ActivationMismatch::OtherActivation => "the record is Owned for another activation",
+        })
+    }
 }
 
 /// The identity fields every journal record carries. All must match on restart
@@ -379,6 +418,161 @@ impl OwnershipJournal {
     }
 }
 
+/// The activation this process runs under: the exact `Owned` identity it activated.
+///
+/// Must match `CastleTableOwnership` in `src/nftables.rs` (marker, table_handle,
+/// base_chain_handle) plus this boot's `boot_id` and `source`. The fields are
+/// private and [`JournalActivation::new`] is the one constructor, so the pin lives
+/// at one site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JournalActivation {
+    identity: JournalIdentity,
+    table_handle: u64,
+    base_chain_handle: u64,
+}
+
+impl JournalActivation {
+    /// Name an activation. `schema_version` is always [`JOURNAL_SCHEMA_VERSION`]: an
+    /// activation is only ever this binary's. Must match `CastleTableOwnership` in
+    /// `src/nftables.rs`: the marker and both handles come from that value.
+    // Its one production caller is the Linux-only acquisition.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn new(
+        marker: String,
+        table_handle: u64,
+        base_chain_handle: u64,
+        boot_id: String,
+        source: String,
+    ) -> Self {
+        Self {
+            identity: JournalIdentity {
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                marker,
+                boot_id,
+                source,
+            },
+            table_handle,
+            base_chain_handle,
+        }
+    }
+}
+
+/// PROOF TOKEN, not a cache: this value proves the journal was `Owned` for
+/// `activation` when it was built, and nothing about what the record holds now.
+///
+/// INVARIANT (register `LINUX-JOURNAL-OWNED-WRITERS-01`): it carries no record and
+/// no history on purpose. A handle that carried the record would make every later
+/// write a stale overwrite, dropping each uid another write recorded since
+/// construction (C2a2 gate F4); every writer therefore re-loads and re-validates
+/// through [`OwnedJournalHandle::reload_for_activation`] and mutates only the record
+/// that call returned. The fields are private, so [`OwnedJournalHandle::establish`]
+/// is the only way to obtain one, and the type is not `Clone`: the component owns
+/// the one instance and writers borrow it.
+#[derive(Debug)]
+pub struct OwnedJournalHandle {
+    path: PathBuf,
+    activation: JournalActivation,
+}
+
+/// The fields of an `Owned` record loaded IN THIS CALL. Returned by value and never
+/// stored: holding one across a write is the stale-snapshot shape the handle exists
+/// to prevent.
+#[must_use]
+pub(crate) struct OwnedRecordNow {
+    pub(crate) identity: JournalIdentity,
+    pub(crate) table_handle: u64,
+    pub(crate) base_chain_handle: u64,
+    pub(crate) confined: Option<Vec<ConfinedIdentity>>,
+}
+
+impl OwnedJournalHandle {
+    /// Build the proof token from a fresh authenticated load.
+    ///
+    /// INVARIANT: built once, after `activate_runtime_ownership` accepted this exact
+    /// identity and from a fresh load, so the token can only name the activation this
+    /// process runs under. A record that is not `Owned` for that activation here
+    /// means the proof the acquisition just wrote or confirmed is not on disk, and
+    /// readiness is refused rather than continued on an unproven journal. The record
+    /// this load returns is DISCARDED: the token keeps the path and the activation
+    /// only.
+    // Its one production caller is the Linux-only acquisition.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn establish(
+        path: &Path,
+        key: &JournalAuthKey,
+        activation: JournalActivation,
+    ) -> Result<Self, OwnershipJournalError> {
+        let record = load(path, Some(key))?;
+        let _discarded = owned_for_activation(path, &activation, record)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            activation,
+        })
+    }
+
+    /// `W_RELOAD` then `W_VALIDATE`: an authenticated load of this handle's path, and
+    /// the fields of that record if and only if it is `Owned` for this handle's
+    /// activation; otherwise `NotOwnedForActivation`. Every post-activation writer
+    /// starts here and mutates only what this call returned.
+    pub(crate) fn reload_for_activation(
+        &self,
+        key: &JournalAuthKey,
+    ) -> Result<OwnedRecordNow, OwnershipJournalError> {
+        let record = load(&self.path, Some(key))?;
+        owned_for_activation(&self.path, &self.activation, record)
+    }
+
+    /// The journal file this handle proves ownership of.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// `W_VALIDATE`, shared by [`OwnedJournalHandle::establish`] and
+/// [`OwnedJournalHandle::reload_for_activation`] so the two can never disagree about
+/// what "Owned for this activation" means.
+fn owned_for_activation(
+    path: &Path,
+    activation: &JournalActivation,
+    record: Option<OwnershipJournal>,
+) -> Result<OwnedRecordNow, OwnershipJournalError> {
+    let refuse = |observed: ActivationMismatch| OwnershipJournalError::NotOwnedForActivation {
+        path: path.to_path_buf(),
+        observed,
+    };
+    match record {
+        None => Err(refuse(ActivationMismatch::Absent)),
+        Some(OwnershipJournal::Preparing { .. }) => Err(refuse(ActivationMismatch::Preparing)),
+        Some(OwnershipJournal::Owned {
+            identity,
+            table_handle,
+            base_chain_handle,
+            confined,
+        }) => {
+            // INVARIANT: equality is over the WHOLE activation (schema, marker, boot
+            // id, source, both kernel handles), because a record for a different
+            // marker describes a different acquisition's table: writing this
+            // process's history into it would attribute our bindings to a table we
+            // do not hold, and overwriting it would erase that acquisition's history.
+            // The cost of the refusal is bounded in the C2a2b design packet section
+            // 8: after it, this process's confined history is durable nowhere until
+            // the next start re-derives it.
+            if identity != activation.identity
+                || table_handle != activation.table_handle
+                || base_chain_handle != activation.base_chain_handle
+            {
+                return Err(refuse(ActivationMismatch::OtherActivation));
+            }
+            Ok(OwnedRecordNow {
+                identity,
+                table_handle,
+                base_chain_handle,
+                confined,
+            })
+        }
+    }
+}
+
 /// PROOF that a confined uid was written durably to this boot's journal BEFORE any
 /// kernel transaction bound it.
 ///
@@ -422,61 +616,57 @@ impl WriteAheadReceipt {
 /// This is the BIND row: the persist happens FIRST and its failure is returned, so the
 /// caller refuses the manifest and keeps the prior good policy with NO kernel step.
 ///
+/// The journal is named by an [`OwnedJournalHandle`], never by a bare path: the write
+/// re-loads the record, refuses unless it is `Owned` for the handle's activation, and
+/// pushes onto the history THIS call loaded (register `LINUX-JOURNAL-OWNED-WRITERS-01`).
+///
 /// UNKNOWN HISTORY is refused rather than written: while the `confined` key is absent
 /// on a same-boot record, materialising it would mark this boot's history known and a
 /// uid rotated away from earlier in the boot would stop being denied. A bind cannot
 /// proceed on that record, and the operator's path is the disarm verb.
 pub fn persist_confined_uid_write_ahead(
-    path: &Path,
+    journal: &OwnedJournalHandle,
     key: &JournalAuthKey,
     uid: u32,
     role: ConfinedRole,
 ) -> Result<WriteAheadReceipt, OwnershipJournalError> {
-    persist_confined_uid_write_ahead_with_store(path, key, uid, role, store_atomic)
+    persist_confined_uid_write_ahead_with_store(journal, key, uid, role, store_atomic)
 }
 
 /// The injected store keeps durability failures testable at the production
-/// receipt-minting boundary. No receipt is returned until store succeeds.
+/// receipt-minting boundary. No receipt is returned until store succeeds. The store
+/// is only ever handed the handle's own path.
 fn persist_confined_uid_write_ahead_with_store(
-    path: &Path,
+    journal: &OwnedJournalHandle,
     key: &JournalAuthKey,
     uid: u32,
     role: ConfinedRole,
     store: impl FnOnce(&Path, &OwnershipJournal, &JournalAuthKey) -> Result<(), OwnershipJournalError>,
 ) -> Result<WriteAheadReceipt, OwnershipJournalError> {
-    let record = load(path, Some(key))?;
-    let Some(OwnershipJournal::Owned {
-        identity,
-        table_handle,
-        base_chain_handle,
-        confined,
-    }) = record
-    else {
+    // W_RELOAD + W_VALIDATE: a record that is absent, `Preparing`, or `Owned` for
+    // another activation refuses here and nothing is stored.
+    let now = journal.reload_for_activation(key)?;
+    let Some(mut history) = now.confined else {
         return Err(OwnershipJournalError::UnsafeJournal {
-            path: path.to_path_buf(),
-            reason: "no owned ownership record is in force, so a confined uid cannot be \
-                     written ahead of a kernel binding"
-                .to_string(),
-        });
-    };
-    let Some(mut history) = confined else {
-        return Err(OwnershipJournalError::UnsafeJournal {
-            path: path.to_path_buf(),
+            path: journal.path().to_path_buf(),
             reason: "this boot's confined history is unknown, so a new binding cannot be \
                      recorded; stop the castle-wall unit, then run the disarm verb"
                 .to_string(),
         });
     };
+    // W_MUTATE. INVARIANT: the history pushed onto here is the one loaded in this
+    // call; a writer that reused an earlier load would overwrite uids recorded since.
     if !history.iter().any(|entry| entry.uid == uid) {
         history.push(ConfinedIdentity { uid, role });
     }
     let next = OwnershipJournal::owned_with_known_history(
-        identity,
-        table_handle,
-        base_chain_handle,
+        now.identity,
+        now.table_handle,
+        now.base_chain_handle,
         history,
     )?;
-    store(path, &next, key)?;
+    // W_STORE.
+    store(journal.path(), &next, key)?;
     Ok(WriteAheadReceipt { uid })
 }
 
@@ -1375,6 +1565,24 @@ mod tests {
         }
     }
 
+    /// The activation `owned_fixture` records.
+    fn fixture_activation() -> JournalActivation {
+        JournalActivation::new(
+            "m".to_string(),
+            2,
+            1,
+            FIXTURE_BOOT_ID.to_string(),
+            "/usr/local/bin/castle-wall-daemon".to_string(),
+        )
+    }
+
+    /// A proof token over the record already stored at `path` for the fixture
+    /// activation.
+    fn fixture_handle(path: &Path, key: &JournalAuthKey) -> OwnedJournalHandle {
+        OwnedJournalHandle::establish(path, key, fixture_activation())
+            .expect("the fixture record is Owned for the fixture activation")
+    }
+
     /// The BIND row: persist succeeds, THEN bind. A failed persist yields no proof, so
     /// the kernel step is unreachable and the caller keeps its prior good policy.
     ///
@@ -1398,9 +1606,10 @@ mod tests {
             &key,
         )
         .unwrap();
+        let handle = fixture_handle(&path, &key);
 
         // The real store completes before a bind callback can use the receipt.
-        let receipt = persist_confined_uid_write_ahead(&path, &key, 60123, ConfinedRole::Agent)
+        let receipt = persist_confined_uid_write_ahead(&handle, &key, 60123, ConfinedRole::Agent)
             .expect("the persist must succeed on a known history");
         assert_eq!(receipt.uid(), 60123);
         let reloaded = load(&path, Some(&key)).unwrap().unwrap();
@@ -1415,7 +1624,7 @@ mod tests {
         // the kernel callback is unreachable on this path.
         let bound = Cell::new(false);
         let failed = persist_confined_uid_write_ahead_with_store(
-            &path,
+            &handle,
             &key,
             60124,
             ConfinedRole::Gate,
@@ -1448,7 +1657,7 @@ mod tests {
         // history for the next process. No kernel callback has run yet.
         let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             persist_confined_uid_write_ahead_with_store(
-                &path,
+                &handle,
                 &key,
                 60124,
                 ConfinedRole::Gate,
@@ -1484,8 +1693,12 @@ mod tests {
             &key,
         )
         .unwrap();
-        let err = persist_confined_uid_write_ahead(&legacy_path, &key, 60123, ConfinedRole::Agent)
-            .expect_err("an unknown history must refuse a new binding");
+        // The handle does not witness history: it establishes over `confined: None`,
+        // and the WRITER refuses at its unknown-history arm.
+        let legacy_handle = fixture_handle(&legacy_path, &key);
+        let err =
+            persist_confined_uid_write_ahead(&legacy_handle, &key, 60123, ConfinedRole::Agent)
+                .expect_err("an unknown history must refuse a new binding");
         assert!(
             format!("{err}").contains("disarm"),
             "the refusal names the repair: {err}"
@@ -1497,16 +1710,28 @@ mod tests {
             None
         );
 
-        // A persist against a missing record also refuses, so a bind cannot precede an
-        // owned record at all.
-        let empty_dir = TempDir::new().unwrap();
-        assert!(persist_confined_uid_write_ahead(
-            &empty_dir.path().join("nft-ownership.json"),
-            &key,
-            60123,
-            ConfinedRole::Agent
-        )
-        .is_err());
+        // A persist against a record removed after the handle was built refuses with the
+        // typed `Absent` mismatch and creates no file, so a bind cannot precede an owned
+        // record at all. (`establish` itself refuses a missing record: T1.)
+        let removed_dir = TempDir::new().unwrap();
+        let removed_path = removed_dir.path().join("nft-ownership.json");
+        store_atomic(&removed_path, &owned_fixture(Some(Vec::new())), &key).unwrap();
+        let removed_handle = fixture_handle(&removed_path, &key);
+        std::fs::remove_file(&removed_path).unwrap();
+        let err =
+            persist_confined_uid_write_ahead(&removed_handle, &key, 60123, ConfinedRole::Agent)
+                .expect_err("a missing record refuses");
+        assert!(
+            matches!(
+                err,
+                OwnershipJournalError::NotOwnedForActivation {
+                    observed: ActivationMismatch::Absent,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(!removed_path.exists(), "a refused persist creates no file");
     }
 
     /// CRASH AND RESTART: the rebuilt kill set equals the journal array unioned with the
@@ -1529,8 +1754,9 @@ mod tests {
         .unwrap();
         // Two bindings persisted before their kernel steps, the second after a simulated
         // crash (we simply reload, which is what a restart does).
-        persist_confined_uid_write_ahead(&path, &key, 60123, ConfinedRole::Agent).unwrap();
-        persist_confined_uid_write_ahead(&path, &key, 60124, ConfinedRole::Gate).unwrap();
+        let handle = fixture_handle(&path, &key);
+        persist_confined_uid_write_ahead(&handle, &key, 60123, ConfinedRole::Agent).unwrap();
+        persist_confined_uid_write_ahead(&handle, &key, 60124, ConfinedRole::Gate).unwrap();
         // The restart reads the authenticated array and routes it through the
         // same resolver that builds the daemon's deny and kill sets.
         let rebuilt = load(&path, Some(&key))
@@ -1553,7 +1779,7 @@ mod tests {
         assert_eq!(resolution.deny_union, vec![60123, 60124, 60125, 60126]);
         // Re-persisting an already-recorded uid is idempotent, so a retried bind after a
         // crash does not grow the array.
-        persist_confined_uid_write_ahead(&path, &key, 60123, ConfinedRole::Agent).unwrap();
+        persist_confined_uid_write_ahead(&handle, &key, 60123, ConfinedRole::Agent).unwrap();
         assert_eq!(
             load(&path, Some(&key))
                 .unwrap()
@@ -2359,6 +2585,286 @@ mod tests {
             decide(Some(&owned_other_source), true, "boot-1", "src"),
             ReclaimDecision::RefuseForeign,
             "a record written by a different binary must not authorize reclaim"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // C2a2b: the journal's proof token (LINUX-JOURNAL-OWNED-WRITERS-01).
+    // ---------------------------------------------------------------------
+
+    /// The inode and bytes of the journal file, so a test can prove a refused write
+    /// stored nothing (every successful store renames a new inode into place).
+    fn file_fingerprint(path: &Path) -> (u64, Vec<u8>) {
+        use std::os::unix::fs::MetadataExt;
+        (
+            std::fs::metadata(path).expect("journal present").ino(),
+            std::fs::read(path).expect("journal bytes"),
+        )
+    }
+
+    fn confined_uids(path: &Path, key: &JournalAuthKey) -> Vec<(u32, ConfinedRole)> {
+        load(path, Some(key))
+            .unwrap()
+            .unwrap()
+            .confined()
+            .expect("a known history")
+            .iter()
+            .map(|e| (e.uid, e.role))
+            .collect()
+    }
+
+    fn assert_mismatch<T>(result: Result<T, OwnershipJournalError>, expected: ActivationMismatch) {
+        match result {
+            Err(OwnershipJournalError::NotOwnedForActivation { observed, .. }) => {
+                assert_eq!(observed, expected)
+            }
+            Err(other) => panic!("expected NotOwnedForActivation({expected:?}), got {other}"),
+            Ok(_) => panic!("expected NotOwnedForActivation({expected:?}), got Ok"),
+        }
+    }
+
+    /// T1 (LINUX-JOURNAL-OWNED-WRITERS-01): the proof token is built only over a
+    /// record that is `Owned` for EXACTLY its activation. An absent or `Preparing`
+    /// record, or an `Owned` record differing in any one activation field, refuses
+    /// with the matching typed reason; the exact record succeeds, and so does one
+    /// with unknown history, because the token does not witness history.
+    #[test]
+    fn t1_establish_accepts_only_the_exact_activation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nft-ownership.json");
+        let key = test_key();
+
+        assert_mismatch(
+            OwnedJournalHandle::establish(&path, &key, fixture_activation()),
+            ActivationMismatch::Absent,
+        );
+
+        store_atomic(
+            &path,
+            &OwnershipJournal::Preparing {
+                identity: ident("m", FIXTURE_BOOT_ID, "/usr/local/bin/castle-wall-daemon"),
+            },
+            &key,
+        )
+        .unwrap();
+        assert_mismatch(
+            OwnedJournalHandle::establish(&path, &key, fixture_activation()),
+            ActivationMismatch::Preparing,
+        );
+
+        // Each single-field change of the activation, as a record on disk.
+        let other_boot = "00000000-0000-4000-8000-000000000000";
+        let variants: Vec<(&str, OwnershipJournal)> = vec![
+            ("marker", {
+                let mut r = owned_fixture(Some(Vec::new()));
+                if let OwnershipJournal::Owned { identity, .. } = &mut r {
+                    identity.marker = "m2".to_string();
+                }
+                r
+            }),
+            ("boot id", {
+                let mut r = owned_fixture(Some(Vec::new()));
+                if let OwnershipJournal::Owned { identity, .. } = &mut r {
+                    identity.boot_id = other_boot.to_string();
+                }
+                r
+            }),
+            ("source", {
+                let mut r = owned_fixture(Some(Vec::new()));
+                if let OwnershipJournal::Owned { identity, .. } = &mut r {
+                    identity.source = "/opt/other/castle-wall-daemon".to_string();
+                }
+                r
+            }),
+            ("schema", {
+                let mut r = owned_fixture(Some(Vec::new()));
+                if let OwnershipJournal::Owned { identity, .. } = &mut r {
+                    identity.schema_version = JOURNAL_SCHEMA_VERSION + 1;
+                }
+                r
+            }),
+            ("table handle", {
+                let mut r = owned_fixture(Some(Vec::new()));
+                if let OwnershipJournal::Owned { table_handle, .. } = &mut r {
+                    *table_handle += 1;
+                }
+                r
+            }),
+            ("base chain handle", {
+                let mut r = owned_fixture(Some(Vec::new()));
+                if let OwnershipJournal::Owned {
+                    base_chain_handle, ..
+                } = &mut r
+                {
+                    *base_chain_handle += 1;
+                }
+                r
+            }),
+        ];
+        assert_eq!(variants.len(), 6, "one variant per activation field");
+        for (field, record) in variants {
+            // The comparison itself, over every field including the schema.
+            assert!(
+                matches!(
+                    owned_for_activation(&path, &fixture_activation(), Some(record.clone())),
+                    Err(OwnershipJournalError::NotOwnedForActivation {
+                        observed: ActivationMismatch::OtherActivation,
+                        ..
+                    })
+                ),
+                "a record differing only in its {field} is another activation"
+            );
+            if field == "schema" {
+                // A record at another schema is refused by the authenticated load
+                // before the comparison is reached, so it cannot be staged on disk.
+                continue;
+            }
+            store_atomic(&path, &record, &key).unwrap();
+            assert_mismatch(
+                OwnedJournalHandle::establish(&path, &key, fixture_activation()),
+                ActivationMismatch::OtherActivation,
+            );
+        }
+
+        store_atomic(&path, &owned_fixture(Some(Vec::new())), &key).unwrap();
+        let handle = OwnedJournalHandle::establish(&path, &key, fixture_activation())
+            .expect("the exact record establishes");
+        assert_eq!(handle.path(), path.as_path());
+
+        store_atomic(&path, &owned_fixture(None), &key).unwrap();
+        OwnedJournalHandle::establish(&path, &key, fixture_activation())
+            .expect("unknown history still establishes: the token does not witness history");
+    }
+
+    /// T2 (LINUX-JOURNAL-OWNED-WRITERS-01): the proof token's field set is exactly
+    /// `{path, activation}` and the activation's is exactly `{identity,
+    /// table_handle, base_chain_handle}`, none carrying a visibility modifier. A
+    /// `record` or `confined` field on the handle is the stale-snapshot shape: every
+    /// later write through it would overwrite uids recorded since.
+    #[test]
+    fn t2_the_handle_carries_no_record() {
+        use crate::source_scan::{production_part, without_comment_lines};
+        let code = without_comment_lines(&production_part(include_str!("ownership_journal.rs")));
+        for (decl, expected) in [
+            (
+                "pub struct OwnedJournalHandle {",
+                vec![("path", "PathBuf"), ("activation", "JournalActivation")],
+            ),
+            (
+                "pub(crate) struct JournalActivation {",
+                vec![
+                    ("identity", "JournalIdentity"),
+                    ("table_handle", "u64"),
+                    ("base_chain_handle", "u64"),
+                ],
+            ),
+        ] {
+            let fields = struct_fields(&code, decl);
+            let got: Vec<(&str, &str)> = fields
+                .iter()
+                .map(|(n, t)| (n.as_str(), t.as_str()))
+                .collect();
+            assert_eq!(got, expected, "{decl} field set (no visibility modifier)");
+        }
+    }
+
+    /// The `(name, type)` fields of the struct declared by `decl`, via the shared
+    /// scanner. A field with a visibility modifier reads as `pub name`.
+    fn struct_fields(code: &str, decl: &str) -> Vec<(String, String)> {
+        let at = code
+            .find(decl)
+            .unwrap_or_else(|| panic!("{decl} must exist"));
+        let open = at + decl.len() - 1;
+        let close = crate::source_scan::matching_brace(code, open).expect("struct closes");
+        crate::source_scan::top_level_params(&format!("({})", &code[open + 1..close]))
+    }
+
+    /// T3 (LINUX-JOURNAL-OWNED-WRITERS-01): the confined-uid writer reloads and
+    /// re-validates on EVERY write. (i) A same-activation store made between two
+    /// writes is observed by the second, so no uid it recorded is lost. (ii) A
+    /// record replaced by another activation's `Owned` record refuses with
+    /// `OtherActivation` and stores nothing. (iii) A record swapped to `Preparing`
+    /// refuses with `Preparing` and stores nothing.
+    #[test]
+    fn t3_the_confined_writer_reloads_and_revalidates_every_write() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nft-ownership.json");
+        let key = test_key();
+        let a = ConfinedIdentity {
+            uid: 60100,
+            role: ConfinedRole::Agent,
+        };
+        store_atomic(&path, &owned_fixture(Some(vec![a])), &key).unwrap();
+        let handle = fixture_handle(&path, &key);
+
+        // (i)
+        persist_confined_uid_write_ahead(&handle, &key, 60101, ConfinedRole::Gate).unwrap();
+        let external = ConfinedIdentity {
+            uid: 60102,
+            role: ConfinedRole::Agent,
+        };
+        let mut history: Vec<ConfinedIdentity> = load(&path, Some(&key))
+            .unwrap()
+            .unwrap()
+            .confined()
+            .unwrap()
+            .to_vec();
+        history.push(external);
+        store_atomic(&path, &owned_fixture(Some(history)), &key).unwrap();
+        persist_confined_uid_write_ahead(&handle, &key, 60103, ConfinedRole::Agent).unwrap();
+        assert_eq!(
+            confined_uids(&path, &key),
+            vec![
+                (60100, ConfinedRole::Agent),
+                (60101, ConfinedRole::Gate),
+                (60102, ConfinedRole::Agent),
+                (60103, ConfinedRole::Agent),
+            ],
+            "the second write observed the store made between the two"
+        );
+
+        // (ii)
+        let foreign = OwnershipJournal::owned_with_known_history(
+            ident(
+                "m-foreign",
+                FIXTURE_BOOT_ID,
+                "/usr/local/bin/castle-wall-daemon",
+            ),
+            2,
+            1,
+            vec![a],
+        )
+        .unwrap();
+        store_atomic(&path, &foreign, &key).unwrap();
+        let before = file_fingerprint(&path);
+        assert_mismatch(
+            persist_confined_uid_write_ahead(&handle, &key, 60104, ConfinedRole::Agent),
+            ActivationMismatch::OtherActivation,
+        );
+        assert_eq!(
+            file_fingerprint(&path),
+            before,
+            "another activation's record is left exactly as it was"
+        );
+
+        // (iii)
+        store_atomic(
+            &path,
+            &OwnershipJournal::Preparing {
+                identity: ident("m", FIXTURE_BOOT_ID, "/usr/local/bin/castle-wall-daemon"),
+            },
+            &key,
+        )
+        .unwrap();
+        let before = file_fingerprint(&path);
+        assert_mismatch(
+            persist_confined_uid_write_ahead(&handle, &key, 60104, ConfinedRole::Agent),
+            ActivationMismatch::Preparing,
+        );
+        assert_eq!(
+            file_fingerprint(&path),
+            before,
+            "a Preparing record is untouched"
         );
     }
 }

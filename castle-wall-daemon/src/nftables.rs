@@ -1030,6 +1030,10 @@ const MAX_AGENT_ID_LEN: usize = NFT_RULE_COMMENT_MAX_LEN
 /// carry our random marker, so binding readiness and teardown to this tuple —
 /// not to the name — is what makes "same-shape replacement withdraws readiness"
 /// and "release deletes only the exact owned object, never by name" true.
+///
+/// Must match `JournalActivation` in `src/ownership_journal.rs`: the journal's
+/// post-activation writers compare a record against exactly these three fields
+/// (plus the boot id and source), so a field added here must be added there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CastleTableOwnership {
     /// nft-assigned handle of the owned `inet sanctuary-castle` table.
