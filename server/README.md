@@ -302,7 +302,7 @@ Environment variables:
 | `SANCTUARY_FORTRESS_PATH` | Operator-facing fortress directory override | _(none)_ |
 | `SANCTUARY_STORAGE_PATH` | Storage directory path | `~/.sanctuary` |
 | `SANCTUARY_TRANSPORT` | Transport mode (`stdio` or `http`) | `stdio` |
-| `SANCTUARY_DASHBOARD_ENABLED` | Enable web dashboard (`true`/`false`) | `false` |
+| `SANCTUARY_DASHBOARD_ENABLED` | Enable web dashboard (`true`/`false`); with `--dashboard` or this set explicitly, a busy dashboard port refuses startup naming the port rather than starting without one | `false` |
 | `SANCTUARY_DASHBOARD_PORT` | Dashboard port | `3501` |
 | `SANCTUARY_DASHBOARD_AUTH_TOKEN` | Bearer token (`"auto"` creates a read-only launch session, not a decision-ready approval channel) | _(none)_ |
 | `SANCTUARY_DASHBOARD_TLS_CERT` | TLS certificate path | _(none)_ |

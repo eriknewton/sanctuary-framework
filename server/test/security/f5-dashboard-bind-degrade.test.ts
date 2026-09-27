@@ -218,6 +218,95 @@ describe("F5: a busy embedded-dashboard port degrades the MCP stdio boot instead
   });
 });
 
+describe("A163: an explicitly requested dashboard refuses startup on a busy port instead of degrading", () => {
+  // Wired-consumer test, same object graph as the F5 suite above, with the
+  // ONE variable A163 introduces: `SANCTUARY_DASHBOARD_ENABLED=true`, the
+  // env var `--dashboard` sets (cli.ts) and config.ts reads into
+  // `config.dashboard.enabled`. That flag is this test's stand-in for an
+  // operator's explicit ask; the F5 suite above never sets it, so it proves
+  // the unchanged IMPLICIT-ask degrade and this suite proves the new
+  // EXPLICIT-ask refusal. Fails on unmodified `origin/main` today: main has
+  // no such branch, so boot completes and this `rejects` assertion times out
+  // waiting for a rejection that never comes (recorded as the fail-before
+  // witness in the A163 report).
+  let fortress: TempFortress;
+  let occupyingServer: NetServer | undefined;
+  let dashboardPort: number;
+  let restoreEnv: Map<string, string | undefined>;
+  let boot: Awaited<ReturnType<typeof createSanctuaryServer>> | undefined;
+
+  const A163_ENV_KEYS = [...DASHBOARD_ENV_KEYS, "SANCTUARY_DASHBOARD_ENABLED"] as const;
+
+  beforeEach(async () => {
+    fortress = await createTempFortress("sanctuary-a163-dashbind");
+    restoreEnv = new Map(A163_ENV_KEYS.map((key) => [key, process.env[key]]));
+
+    await mkdir(fortress.storagePath, { recursive: true, mode: 0o700 });
+    await writeFile(
+      join(fortress.storagePath, "principal-policy.yaml"),
+      generateDefaultPolicyYaml().replace("type: stderr", "type: dashboard"),
+      { mode: 0o600 },
+    );
+
+    await bindWithRetry(async () => {
+      const port = randomTestPort();
+      await new Promise<void>((resolve, reject) => {
+        const srv = createServer();
+        const onSetupError = (err: Error): void => {
+          srv.close(() => reject(err));
+        };
+        srv.once("error", onSetupError);
+        srv.listen(port, "127.0.0.1", () => {
+          srv.off("error", onSetupError);
+          occupyingServer = srv;
+          resolve();
+        });
+      });
+      dashboardPort = port;
+    });
+
+    process.env.SANCTUARY_DASHBOARD_HOST = "127.0.0.1";
+    process.env.SANCTUARY_DASHBOARD_PORT = String(dashboardPort);
+    // The explicit-ask signal under test.
+    process.env.SANCTUARY_DASHBOARD_ENABLED = "true";
+  });
+
+  afterEach(async () => {
+    try {
+      await boot?.cleanup().catch(() => undefined);
+    } finally {
+      boot = undefined;
+      try {
+        if (occupyingServer) {
+          await new Promise<void>((resolve) => occupyingServer!.close(() => resolve()));
+        }
+      } finally {
+        occupyingServer = undefined;
+        for (const [key, value] of restoreEnv) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        await fortress.cleanup();
+      }
+    }
+  });
+
+  it("refuses to start, naming the port, and serves no MCP tool", async () => {
+    // (a) boot REJECTS -- does not complete, does not degrade to deny-all.
+    await expect(createSanctuaryServer()).rejects.toThrow(
+      new RegExp(`dashboard.*explicitly requested.*${dashboardPort}.*already in use`, "is"),
+    );
+
+    // No partial server escapes the rejected promise: `boot` is never
+    // assigned, so there is no `server` object this test (or a caller) could
+    // route a tools/call request through. This is the "no MCP tool is
+    // served" half of the acceptance criterion -- a rejected
+    // `createSanctuaryServer()` never returns the `{ server, ... }` a caller
+    // needs to reach `router.ts`'s dispatch at all.
+    boot = undefined;
+  });
+});
+
 describe("F5 unit: StderrApprovalChannel is the deny-all channel the degrade swap constructs", () => {
   // The degrade site constructs `new StderrApprovalChannel(policy.approval_channel)`,
   // a config whose `type` field is "dashboard" (the policy that selected the

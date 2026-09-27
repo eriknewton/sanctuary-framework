@@ -100,11 +100,16 @@ export function selectApprovalChannelByPolicy(
             // --dashboard`, cli.ts), the evidence-pack CLI (evidence-pack/
             // cli.ts), and the EU AI Act compliance CLI (compliance/
             // eu_ai_act/cli.ts) all construct the server through this same
-            // function. All of them now degrade to deny-all on a busy
-            // dashboard port instead of refusing startup; none of them is
-            // exempted. The `addrInUse()` check and the deny-all swap live
-            // in the shared `createSanctuaryServer` body (`index.ts`), so
-            // every one of those callers gets both halves.
+            // function. On a busy dashboard port, all of them either
+            // degrade to deny-all or refuse startup, decided by
+            // `config.dashboard.enabled` (A163, 2026-09-27): an operator who
+            // did NOT explicitly ask for the dashboard this boot gets the
+            // deny-all degrade (#1458); one who did (`--dashboard`, or an
+            // equivalent config key) gets a startup refusal naming the port,
+            // matching every other dashboard bind failure. The
+            // `addrInUse()` check and this decision live in the shared
+            // `createSanctuaryServer` body (`index.ts`), so every one of
+            // those callers gets the same behavior.
             //
             // `silentAddrInUse: true`: the supervised-path stderr line this
             // same EADDRINUSE branch prints ("standing down (single-

@@ -1335,6 +1335,30 @@ export async function createSanctuaryServer(options?: {
     }
     await selectedApprovalChannel.start();
     if (dashboard.addrInUse()) {
+      // A163 (2026-09-27, Erik decision = option A): `config.dashboard.enabled`
+      // is true ONLY when THIS boot's own CLI flag (`--dashboard`, cli.ts) or
+      // config key explicitly asked for the embedded dashboard -- it is
+      // false whenever the dashboard channel was selected implicitly, i.e.
+      // this fortress's persisted `principal-policy.yaml` already says
+      // `approval_channel.type=dashboard` from an earlier session's setup,
+      // but this particular invocation did not ask for one (config.ts's
+      // SANCTUARY_DASHBOARD_ENABLED handling; the default is false). An
+      // operator who explicitly requested the dashboard and silently got a
+      // server with no dashboard has been handed a different product than
+      // the one they asked for (AGENTS MUST-NEVER #5: never silently
+      // degrade), so this refuses startup exactly as every non-EADDRINUSE
+      // dashboard bind error already does (the `catch` in
+      // `selectApprovalChannelByPolicy`'s dashboard case, channel-
+      // selection.ts) -- naming the port only, no rule or tier. The
+      // IMPLICIT case (this flag/key false) is unchanged from #1458 and
+      // falls through to the deny-all degrade below.
+      if (config.dashboard.enabled) {
+        throw new Error(
+          `Sanctuary cannot start: the dashboard was explicitly requested ` +
+            `(--dashboard, or config.dashboard.enabled), but the dashboard ` +
+            `port ${config.dashboard.port} is already in use.`,
+        );
+      }
       // F5 (dashboard-bind-degrade, 2026-09-24 dogfood finding): the
       // embedded dashboard's bind failed with EADDRINUSE. That
       // classification is errno-only (dashboard.ts's onStartupError):
