@@ -204,9 +204,11 @@ impl Drop for SlotGuard {
                     }
                 }
                 Some(Err(())) | None => {
-                    // The worker panicked. No answer is not a loss, so the slot
+                    // The worker panicked, or the check concluded nothing (an nft
+                    // child that timed out, could not be proven exited or reaped,
+                    // or was refused a slot). No answer is not a loss, so the slot
                     // is released without a reading — but it IS an indeterminate
-                    // reading, so a check that panics every time still latches
+                    // reading, so a check that never concludes still latches
                     // fail-closed instead of retrying forever.
                     note_indeterminate(&mut state, self.max_consecutive_unavailable);
                 }
@@ -220,8 +222,9 @@ impl Drop for SlotGuard {
 
 /// Record one indeterminate reading and apply the fail-closed backstop.
 /// Shared by every indeterminate route (deadline overrun, spawn failure, panicked
-/// worker, proven-wedged in-flight check) so all four latch on the same budget
-/// rather than each site re-deriving it.
+/// worker, proven-wedged in-flight check, and a check that returned `Err(())`
+/// because its nft child was stuck or refused a slot, LINUX-NFT-PID-REUSE-KILL-01)
+/// so all five latch on the same budget rather than each site re-deriving it.
 fn note_indeterminate(state: &mut ProbeState, max_consecutive_unavailable: u32) {
     state.consecutive_unavailable = state.consecutive_unavailable.saturating_add(1);
     if state.consecutive_unavailable >= max_consecutive_unavailable {
@@ -475,6 +478,30 @@ mod tests {
             min_interval: Duration::from_millis(50),
             max_consecutive_unavailable: 3,
         }
+    }
+
+    /// T8 (probe half, LINUX-NFT-PID-REUSE-KILL-01): a check that concludes
+    /// nothing (`Err(())`, which is what a stuck or slot-refused nft child maps
+    /// to) counts one indeterminate reading, leaves the cached `last` reading
+    /// untouched, and at budget latches INDETERMINATE, never lost.
+    #[test]
+    fn t8_an_inconclusive_check_counts_toward_indeterminate_and_never_writes_last() {
+        let probe = BoundedHealthProbe::new(ProbeBudget {
+            timeout: Duration::from_millis(200),
+            min_interval: Duration::ZERO,
+            max_consecutive_unavailable: 3,
+        });
+        assert_eq!(probe.poll_result(|| Ok(true)), ProbeOutcome::Ready);
+        let seeded = probe.shared.lock().last;
+        assert_eq!(probe.poll_result(|| Err(())), ProbeOutcome::Unavailable);
+        assert_eq!(probe.shared.lock().consecutive_unavailable, 1);
+        assert_eq!(probe.shared.lock().last, seeded, "no answer is not a reading");
+        assert_eq!(probe.poll_result(|| Err(())), ProbeOutcome::Unavailable);
+        assert_eq!(probe.poll_result(|| Err(())), ProbeOutcome::Indeterminate);
+        let state = probe.shared.lock();
+        assert!(state.latched_indeterminate);
+        assert!(!state.latched_lost, "an inconclusive budget is never a proven loss");
+        assert_eq!(state.last, seeded);
     }
 
     #[test]

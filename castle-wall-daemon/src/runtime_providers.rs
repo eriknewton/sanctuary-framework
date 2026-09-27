@@ -2778,6 +2778,13 @@ fn classify_nft_ownership_probe(
     match result {
         Ok(()) => Ok(true),
         Err(NftablesError::ForeignState(_)) => Ok(false),
+        // LINUX-NFT-PID-REUSE-KILL-01: a child that could not be proven finished,
+        // or a call refused a slot, concluded NOTHING about the table. Explicit
+        // arms ahead of the string arms below, so a future reshaping into
+        // `InvocationFailed(String)` can never read one as a proven loss.
+        Err(NftablesError::ChildStuck { .. }) | Err(NftablesError::ChildSlotsExhausted { .. }) => {
+            Err(())
+        }
         Err(NftablesError::InvocationFailed(message))
             if message.contains("No such file or directory")
                 || message.contains("does not exist") =>
@@ -4443,6 +4450,41 @@ fn reload_manifest_from_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T8 (LINUX-NFT-PID-REUSE-KILL-01): an nft child that could not be proven
+    /// finished, or a call refused a slot, is INDETERMINATE for the ownership
+    /// probe (`Err(())`), never a proven loss (`Ok(false)`) and never health.
+    #[test]
+    fn t8_a_stuck_or_refused_nft_child_classifies_as_indeterminate() {
+        use crate::nftables::{ChildStuckStage, NftOrigin, NftablesError};
+        for stage in [
+            ChildStuckStage::WaiterSpawnFailed,
+            ChildStuckStage::NotExited,
+            ChildStuckStage::NotReaped,
+        ] {
+            let err = NftablesError::ChildStuck { stage };
+            assert!(
+                !err.to_string().contains("No such file or directory")
+                    && !err.to_string().contains("does not exist"),
+                "a stuck child's message must never read like a missing table"
+            );
+            assert_eq!(classify_nft_ownership_probe(Err(err)), Err(()), "{stage:?}");
+        }
+        for origin in [NftOrigin::General, NftOrigin::SafetyNet] {
+            assert_eq!(
+                classify_nft_ownership_probe(Err(NftablesError::ChildSlotsExhausted { origin })),
+                Err(()),
+                "{origin:?}"
+            );
+        }
+        // The string arm that WOULD read a loss stays scoped to InvocationFailed.
+        assert_eq!(
+            classify_nft_ownership_probe(Err(NftablesError::InvocationFailed(
+                "No such file or directory".to_string()
+            ))),
+            Ok(false)
+        );
+    }
     use crate::audit::{AuditRingBuffer, WalWriter};
     use crate::crypto::castle_wall_signing_key_id;
     use crate::manifest::canonical_json::canonicalize_to_bytes;
