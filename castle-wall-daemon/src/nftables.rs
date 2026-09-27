@@ -97,7 +97,176 @@ pub const NFT_CHILD_SLOTS_GENERAL: usize = 4;
 /// Slots only a `SafetyNet` call may take: one net install in flight at a time.
 pub const NFT_CHILD_SLOTS_SAFETY_NET_RESERVED: usize = 1;
 /// Every slot, computed: `GENERAL + SAFETY_NET_RESERVED`.
-pub const NFT_CHILD_SLOTS_TOTAL: usize = NFT_CHILD_SLOTS_GENERAL + NFT_CHILD_SLOTS_SAFETY_NET_RESERVED;
+pub const NFT_CHILD_SLOTS_TOTAL: usize =
+    NFT_CHILD_SLOTS_GENERAL + NFT_CHILD_SLOTS_SAFETY_NET_RESERVED;
+
+/// How an `nft` invocation passes its command: argv or a `-f -` stdin script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NftSiteKind {
+    Argv,
+    Stdin,
+}
+
+/// Every `run_nft` / `run_nft_stdin` call site in this file's production code,
+/// as (enclosing fn, kind, mutating, origin); a function with two calls appears
+/// twice. Line numbers are deliberately absent (they drift); function names are
+/// not. The T12 inventory test parses every field back out of the call site
+/// itself and requires multiset equality, so a new call site, a retagged origin
+/// (a General site taking the reserved `SafetyNet` slot) or a new mutating argv
+/// verb cannot land without an edit here. Must match the call sites below.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const NFT_INVOCATION_SITES: &[(&str, NftSiteKind, bool, NftOrigin)] = &[
+    (
+        "install_castle_table_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "install_castle_table_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "install_deny_all_safety_net_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::SafetyNet,
+    ),
+    (
+        "live_table_is_deny_all_safety_net_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "live_net_covers_attempt_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::SafetyNet,
+    ),
+    (
+        "list_castle_table_json_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "atomic_reset_deny_all_net_to_fresh_owned_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "force_delete_castle_table_by_name_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "create_castle_table_exclusive_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "capture_owned_castle_table_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "list_owned_castle_table_json_for_binding_set",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "verify_owned_castle_table_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "remove_owned_castle_table_impl",
+        NftSiteKind::Argv,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "replace_agent_chain_and_jump_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "replace_agent_chain_and_jump_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "capture_owned_castle_table_impl_from_live_inventory",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "remove_agent_ruleset_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "remove_agent_ruleset_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "install_agent_jump_rule_impl",
+        NftSiteKind::Stdin,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "remove_agent_jump_rule_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "remove_agent_jump_rule_impl",
+        NftSiteKind::Argv,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "list_agent_rulesets_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "remove_castle_table_impl",
+        NftSiteKind::Argv,
+        true,
+        NftOrigin::General,
+    ),
+    (
+        "table_exists_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+    (
+        "verify_castle_table_shape_impl",
+        NftSiteKind::Argv,
+        false,
+        NftOrigin::General,
+    ),
+];
 
 /// A child held in a slot after its call returned without proving it finished.
 #[cfg(any(target_os = "linux", test))]
@@ -1122,7 +1291,9 @@ static TEST_NFT_BINARY: std::sync::OnceLock<String> = std::sync::OnceLock::new()
 #[cfg(feature = "test-isolation")]
 pub fn use_test_nft_binary(path: String) -> Result<(), String> {
     if !path.starts_with('/') {
-        return Err(format!("--test-nft-binary must be an absolute path, got {path:?}"));
+        return Err(format!(
+            "--test-nft-binary must be an absolute path, got {path:?}"
+        ));
     }
     TEST_NFT_BINARY
         .set(path)
@@ -1303,7 +1474,9 @@ mod linux {
         // SAFETY: a plain syscall with integer arguments; the result is an fd the
         // kernel just created for us, or -1.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        let fd = std::os::fd::RawFd::try_from(fd).ok().filter(|fd| *fd >= 0)?;
+        let fd = std::os::fd::RawFd::try_from(fd)
+            .ok()
+            .filter(|fd| *fd >= 0)?;
         // SAFETY: `fd` is a fresh descriptor owned by nothing else.
         Some(unsafe { OwnedFd::from_raw_fd(fd) })
     }
@@ -1353,8 +1526,7 @@ mod linux {
             if rc == 0 {
                 return false;
             }
-            let interrupted =
-                std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR);
+            let interrupted = std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR);
             if !interrupted || remaining.is_zero() {
                 return false;
             }
@@ -1632,7 +1804,10 @@ mod linux {
             // single-threaded test / agent-management path, so a racing writer is
             // out of scope (the ACQUISITION path uses the host-lock-guarded
             // `create_castle_table_exclusive_impl`).
-            run_nft_stdin(NftOrigin::General, &super::build_create_castle_table_script(&marker))?;
+            run_nft_stdin(
+                NftOrigin::General,
+                &super::build_create_castle_table_script(&marker),
+            )?;
         } else {
             // Idempotent: the marked table already exists. Ensure the base output
             // chain is present without disturbing the marker; `add chain` is a
@@ -1728,7 +1903,10 @@ mod linux {
                 )))
             }
         };
-        match run_nft(NftOrigin::General, &["-j", "list", "table", CASTLE_FAMILY, castle_table()]) {
+        match run_nft(
+            NftOrigin::General,
+            &["-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        ) {
             Ok(json) => Ok(super::is_deny_all_safety_net_json(&json, overflow)),
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -1746,7 +1924,10 @@ mod linux {
                 "cannot classify live safety net without kernel.overflowuid: {e}"
             ))
         })?;
-        let json = run_nft(NftOrigin::SafetyNet, &["-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
+        let json = run_nft(
+            NftOrigin::SafetyNet,
+            &["-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )?;
         Ok(super::deny_all_net_covers_scope_json(
             &json, overflow, scope,
         ))
@@ -1760,7 +1941,10 @@ mod linux {
     /// net read "no table" as "unreadable" and lose source (c) on every fresh host.
     /// Must match the same recognition in `live_table_is_deny_all_safety_net_impl`.
     pub fn list_castle_table_json_impl() -> Result<Option<String>, NftablesError> {
-        match run_nft(NftOrigin::General, &["-j", "list", "table", CASTLE_FAMILY, castle_table()]) {
+        match run_nft(
+            NftOrigin::General,
+            &["-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        ) {
             Ok(json) => Ok(Some(json)),
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -1895,7 +2079,10 @@ mod linux {
         // `-a/--handle` is mandatory: libnftables omits handles from listings by
         // default, while the ownership parser deliberately requires both the
         // table and base-chain handles as part of the exact live identity.
-        let json = run_nft(NftOrigin::General, &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
+        let json = run_nft(
+            NftOrigin::General,
+            &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )?;
         // A table this daemon just created with `create table` holds ZERO agent
         // chains by construction, so any per-agent binding present here is
         // something this process did not install: refuse it rather than capture
@@ -1924,14 +2111,20 @@ mod linux {
     /// no table handle at all. Must match the argv in
     /// [`verify_owned_castle_table_impl`], whose parse this one mirrors.
     pub fn list_owned_castle_table_json_for_binding_set() -> Result<String, NftablesError> {
-        run_nft(NftOrigin::General, &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])
+        run_nft(
+            NftOrigin::General,
+            &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )
     }
 
     pub fn verify_owned_castle_table_impl(
         ownership: &CastleTableOwnership,
         expectation: &super::ExpectedAgentBinding,
     ) -> Result<Vec<String>, NftablesError> {
-        let json = run_nft(NftOrigin::General, &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
+        let json = run_nft(
+            NftOrigin::General,
+            &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )?;
         // This caller needs BOTH phases: it is a pre-mutation ownership
         // precondition, so a drifted binding must refuse. Must match the polarity
         // in `parse_owned_table_identity`.
@@ -1975,13 +2168,16 @@ mod linux {
     ) -> Result<(), NftablesError> {
         // Prove the live table is still exactly ours before removing anything.
         verify_owned_castle_table_impl(ownership, expectation)?;
-        run_nft(NftOrigin::General, &[
-            "delete",
-            "table",
-            CASTLE_FAMILY,
-            "handle",
-            &ownership.table_handle.to_string(),
-        ])
+        run_nft(
+            NftOrigin::General,
+            &[
+                "delete",
+                "table",
+                CASTLE_FAMILY,
+                "handle",
+                &ownership.table_handle.to_string(),
+            ],
+        )
         .map(|_| ())
     }
 
@@ -2035,8 +2231,10 @@ mod linux {
             super::AGENT_UID_SEAL_INFIX,
             uid_seal
         );
-        let listing = match run_nft(NftOrigin::General, &["-a", "list", "chain", CASTLE_FAMILY, castle_table, "output"])
-        {
+        let listing = match run_nft(
+            NftOrigin::General,
+            &["-a", "list", "chain", CASTLE_FAMILY, castle_table, "output"],
+        ) {
             Ok(s) => s,
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -2077,7 +2275,10 @@ mod linux {
     fn capture_owned_castle_table_impl_from_live_inventory(
         fortress_id: &str,
     ) -> Result<CastleTableOwnership, NftablesError> {
-        let json = run_nft(NftOrigin::General, &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
+        let json = run_nft(
+            NftOrigin::General,
+            &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )?;
         // Seal-only: this reads the marker off a table that may legitimately
         // already carry an older agent binding, on the way to REPLACING it. The
         // manifest-uid comparison belongs to the reclaim/adoption and health
@@ -2176,8 +2377,10 @@ mod linux {
         super::verify_active_runtime_ownership(&id.fortress_id)?;
         let chain_name = agent_chain_name(&id.agent_id);
         let castle_table = castle_table();
-        let listing = match run_nft(NftOrigin::General, &["-a", "list", "chain", CASTLE_FAMILY, castle_table, "output"])
-        {
+        let listing = match run_nft(
+            NftOrigin::General,
+            &["-a", "list", "chain", CASTLE_FAMILY, castle_table, "output"],
+        ) {
             Ok(s) => s,
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -2231,14 +2434,17 @@ mod linux {
         let chain_name = agent_chain_name(&id.agent_id);
         // `-a` annotates each rule with `# handle <N>`; we parse those
         // handles for any rule whose verdict targets our chain.
-        let listing = match run_nft(NftOrigin::General, &[
-            "-a",
-            "list",
-            "chain",
-            CASTLE_FAMILY,
-            castle_table(),
-            "output",
-        ]) {
+        let listing = match run_nft(
+            NftOrigin::General,
+            &[
+                "-a",
+                "list",
+                "chain",
+                CASTLE_FAMILY,
+                castle_table(),
+                "output",
+            ],
+        ) {
             Ok(s) => s,
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -2251,15 +2457,18 @@ mod linux {
         };
         let handles = parse_jump_rule_handles(&listing, &chain_name);
         for handle in handles {
-            run_nft(NftOrigin::General, &[
-                "delete",
-                "rule",
-                CASTLE_FAMILY,
-                castle_table(),
-                "output",
-                "handle",
-                &handle.to_string(),
-            ])?;
+            run_nft(
+                NftOrigin::General,
+                &[
+                    "delete",
+                    "rule",
+                    CASTLE_FAMILY,
+                    castle_table(),
+                    "output",
+                    "handle",
+                    &handle.to_string(),
+                ],
+            )?;
         }
         Ok(())
     }
@@ -2324,11 +2533,18 @@ mod linux {
     }
 
     pub fn remove_castle_table_impl() -> Result<(), NftablesError> {
-        run_nft(NftOrigin::General, &["delete", "table", CASTLE_FAMILY, castle_table()]).map(|_| ())
+        run_nft(
+            NftOrigin::General,
+            &["delete", "table", CASTLE_FAMILY, castle_table()],
+        )
+        .map(|_| ())
     }
 
     pub fn table_exists_impl() -> Result<bool, NftablesError> {
-        match run_nft(NftOrigin::General, &["list", "table", CASTLE_FAMILY, castle_table()]) {
+        match run_nft(
+            NftOrigin::General,
+            &["list", "table", CASTLE_FAMILY, castle_table()],
+        ) {
             Ok(_) => Ok(true),
             Err(NftablesError::InvocationFailed(msg))
                 if msg.contains("No such file or directory") || msg.contains("does not exist") =>
@@ -2346,7 +2562,10 @@ mod linux {
         // take. Structured parsing (not a substring scan) is what lets us tell a
         // base output chain from a same-named regular chain, and a chain in our
         // table from one in a foreign table. (blocker 2)
-        let json = run_nft(NftOrigin::General, &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()])?;
+        let json = run_nft(
+            NftOrigin::General,
+            &["-a", "-j", "list", "table", CASTLE_FAMILY, castle_table()],
+        )?;
         // A table that shares the `sanctuary-castle` name but lacks our exact
         // base-output-chain shape — or carries any foreign base chain — is
         // foreign/incompatible state (another owner, a hand-edited ruleset, a
@@ -6296,12 +6515,19 @@ mod child_slot_tests {
     }
 
     fn check_bounds(table: &ChildSlotTable<FakeChild>) {
-        assert!(table.held() <= NFT_CHILD_SLOTS_TOTAL, "held {} over the cap", table.held());
+        assert!(
+            table.held() <= NFT_CHILD_SLOTS_TOTAL,
+            "held {} over the cap",
+            table.held()
+        );
         assert!(
             table.held_by(NftOrigin::General) <= NFT_CHILD_SLOTS_GENERAL,
             "General took the reserved slot"
         );
-        assert!(table.last_sweep_polls() <= NFT_CHILD_SLOTS_TOTAL, "unbounded sweep work");
+        assert!(
+            table.last_sweep_polls() <= NFT_CHILD_SLOTS_TOTAL,
+            "unbounded sweep work"
+        );
     }
 
     /// T10 (AGENTS rules 8 and 12): 10 x NFT_CHILD_SLOTS_TOTAL wedge episodes in
@@ -6315,7 +6541,9 @@ mod child_slot_tests {
         let mut pending: Vec<Rc<Cell<bool>>> = Vec::new();
         while episodes < 10 * NFT_CHILD_SLOTS_TOTAL {
             // A call that completes normally frees its slot at once.
-            let done = table.admit(NftOrigin::General).expect("an empty table admits");
+            let done = table
+                .admit(NftOrigin::General)
+                .expect("an empty table admits");
             table.release(done);
             assert_eq!(table.held(), 0, "a completed call holds nothing");
             // Admit: general until refused, never past its pool.
@@ -6330,11 +6558,18 @@ mod child_slot_tests {
                 }
                 check_bounds(&table);
             }
-            assert!(table.held() >= NFT_CHILD_SLOTS_GENERAL, "general refused only when full");
+            assert!(
+                table.held() >= NFT_CHILD_SLOTS_GENERAL,
+                "general refused only when full"
+            );
             // While general is exhausted and the reserved slot is free, the net
             // install still gets in.
             let net = if table.held() < NFT_CHILD_SLOTS_TOTAL {
-                Some(table.admit(NftOrigin::SafetyNet).expect("the reserved slot admits a net"))
+                Some(
+                    table
+                        .admit(NftOrigin::SafetyNet)
+                        .expect("the reserved slot admits a net"),
+                )
             } else {
                 None
             };
@@ -6348,7 +6583,11 @@ mod child_slot_tests {
                 episodes += 1;
                 check_bounds(&table);
             }
-            assert_eq!(table.held(), NFT_CHILD_SLOTS_TOTAL, "parking never frees a slot");
+            assert_eq!(
+                table.held(),
+                NFT_CHILD_SLOTS_TOTAL,
+                "parking never frees a slot"
+            );
             assert!(table.admit(NftOrigin::General).is_err());
             assert!(table.admit(NftOrigin::SafetyNet).is_err());
             check_bounds(&table);
@@ -6359,7 +6598,11 @@ mod child_slot_tests {
             }
             table.sweep();
             check_bounds(&table);
-            assert_eq!(table.parked(), pending.len(), "the sweep frees exactly the finished");
+            assert_eq!(
+                table.parked(),
+                pending.len(),
+                "the sweep frees exactly the finished"
+            );
             // The rest complete before the next wave.
             for finished in pending.drain(..) {
                 finished.set(true);
@@ -6387,7 +6630,9 @@ mod child_slot_tests {
             })
         ));
         // General is exhausted and the reserved slot is free: the net gets in.
-        let net = table.admit(NftOrigin::SafetyNet).expect("the reserved slot admits");
+        let net = table
+            .admit(NftOrigin::SafetyNet)
+            .expect("the reserved slot admits");
         let (child, _never_finishes) = fake(&polls);
         table.park(net, child);
         check_bounds(&table);
@@ -6402,6 +6647,94 @@ mod child_slot_tests {
         assert!(table.admit(NftOrigin::General).is_err());
         assert_eq!(table.held_by(NftOrigin::General), NFT_CHILD_SLOTS_GENERAL);
         check_bounds(&table);
+    }
+
+    /// T12 (LINUX-NFT-PID-REUSE-KILL-01): the nft site inventory. Every field is
+    /// parsed at the call site (kind from the callee token, origin from the
+    /// `NftOrigin::` first argument, mutating from the verb) and compared to
+    /// `NFT_INVOCATION_SITES` by multiset equality over the full tuple; there are
+    /// exactly two spawn paths and the bounded wait is reached only through them.
+    #[test]
+    fn t12_the_nft_invocation_inventory_matches_every_call_site() {
+        use crate::source_scan::{
+            enclosing_fn, fn_body, offsets_of, production_part, without_comment_lines,
+        };
+        let code = without_comment_lines(&production_part(include_str!("nftables.rs")));
+        let mut found: Vec<String> = Vec::new();
+        for (token, kind) in [
+            ("run_nft(", NftSiteKind::Argv),
+            ("run_nft_stdin(", NftSiteKind::Stdin),
+        ] {
+            for at in offsets_of(&code, token) {
+                let before = &code[..at];
+                if before.ends_with("fn ")
+                    || before
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                let args = code[at + token.len()..].trim_start();
+                let origin = if args.starts_with("NftOrigin::General") {
+                    NftOrigin::General
+                } else if args.starts_with("NftOrigin::SafetyNet") {
+                    NftOrigin::SafetyNet
+                } else {
+                    panic!("a call site at {at} does not name its NftOrigin first");
+                };
+                let mutating = match kind {
+                    NftSiteKind::Stdin => true,
+                    NftSiteKind::Argv => {
+                        let open = args.find('"').expect("an argv site names its verb");
+                        let verb = &args[open + 1..];
+                        let verb = &verb[..verb.find('"').expect("closed literal")];
+                        match verb {
+                            "delete" => true,
+                            "-j" | "-a" | "list" => false,
+                            other => panic!(
+                                "unclassified nft argv verb {other:?}: classify it by hand \
+                                 in NFT_INVOCATION_SITES"
+                            ),
+                        }
+                    }
+                };
+                found.push(format!(
+                    "{:?}",
+                    (enclosing_fn(&code, at), kind, mutating, origin)
+                ));
+            }
+        }
+        let mut expected: Vec<String> = NFT_INVOCATION_SITES
+            .iter()
+            .map(|(f, kind, mutating, origin)| {
+                format!("{:?}", (f.to_string(), *kind, *mutating, *origin))
+            })
+            .collect();
+        found.sort();
+        expected.sort();
+        assert_eq!(found, expected);
+
+        let spawns: Vec<String> = offsets_of(&code, "Command::new(")
+            .into_iter()
+            .map(|at| enclosing_fn(&code, at))
+            .collect();
+        assert_eq!(
+            spawns,
+            vec!["run_nft".to_string(), "run_nft_stdin".to_string()]
+        );
+        let waits: Vec<String> = offsets_of(&code, "wait_nft_bounded(")
+            .into_iter()
+            .filter(|at| !code[..*at].ends_with("fn "))
+            .map(|at| enclosing_fn(&code, at))
+            .collect();
+        assert_eq!(
+            waits,
+            vec!["run_nft".to_string(), "run_nft_stdin".to_string()]
+        );
+        for runner in ["run_nft", "run_nft_stdin"] {
+            assert!(fn_body(&code, runner).contains("admit_slot(&NFT_CHILD_SLOTS, origin)?"));
+        }
     }
 
     /// T11 (structural half): production code never signals a bare pid.
@@ -6435,8 +6768,7 @@ mod child_slot_tests {
     #[cfg(target_os = "linux")]
     mod linux_children {
         use super::super::linux::{
-            admit_slot, pidfd_kill, pidfd_open, wait_nft_bounded_with, NftSlotTable,
-            NftWaitBudget,
+            admit_slot, pidfd_kill, pidfd_open, wait_nft_bounded_with, NftSlotTable, NftWaitBudget,
         };
         use super::super::{ChildSlotTable, ChildStuckStage, NftOrigin, NftablesError};
         use std::process::{Command, Stdio};
@@ -6518,7 +6850,10 @@ mod child_slot_tests {
             unsafe { libc::kill(pid, libc::SIGKILL) };
             let deadline = Instant::now() + Duration::from_secs(10);
             while held(table) != 0 {
-                assert!(Instant::now() < deadline, "the sweep never reclaimed the slot");
+                assert!(
+                    Instant::now() < deadline,
+                    "the sweep never reclaimed the slot"
+                );
                 table.lock().unwrap_or_else(|e| e.into_inner()).sweep();
                 std::thread::sleep(Duration::from_millis(10));
             }

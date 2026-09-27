@@ -411,9 +411,15 @@ mod tests {
 
         assert!(guard.enable(3));
         assert_eq!(guard.guard_state(), GUARD_IDLE);
-        assert!(!guard.enable(9), "a second enable must not replace the deadline");
+        assert!(
+            !guard.enable(9),
+            "a second enable must not replace the deadline"
+        );
         assert!(guard.arm_with(&backend));
-        assert!(!guard.arm_with(&backend), "a second request must not re-arm");
+        assert!(
+            !guard.arm_with(&backend),
+            "a second request must not re-arm"
+        );
         assert_eq!(backend.calls(), vec![3]);
         assert_eq!(guard.guard_state(), GUARD_ARMED);
     }
@@ -517,7 +523,11 @@ mod tests {
                         winners.push(claimant);
                     }
                 }
-                assert_eq!(winners, vec![order[0]], "one winner, the first, in {order:?}");
+                assert_eq!(
+                    winners,
+                    vec![order[0]],
+                    "one winner, the first, in {order:?}"
+                );
             }
         }
     }
@@ -529,8 +539,8 @@ mod tests {
 #[cfg(test)]
 mod structure {
     use crate::source_scan::{
-        cfg_test_module_ranges, daemon_sources, enclosing_fn, in_ranges, line_of, offsets_of,
-        production_part, receiver_before, without_comment_lines,
+        cfg_test_module_ranges, daemon_sources, enclosing_fn, fn_body, in_ranges, line_of,
+        offsets_of, production_part, receiver_before, without_comment_lines,
     };
     use std::collections::BTreeSet;
 
@@ -562,7 +572,12 @@ mod structure {
     /// decided 78 (the unit's RestartPreventExitStatus) into a restarting 75.
     #[test]
     fn t4_no_raw_process_exit_outside_the_exit_gate() {
-        let tokens = ["process::exit(", "libc::_exit(", "libc::exit(", "unistd::_exit("];
+        let tokens = [
+            "process::exit(",
+            "libc::_exit(",
+            "libc::exit(",
+            "unistd::_exit(",
+        ];
         let mut hits = Vec::new();
         for (path, text) in daemon_sources() {
             if path == "src/exit_guard.rs" {
@@ -671,7 +686,10 @@ mod structure {
         let expected_callers: BTreeSet<(String, String)> = [
             ("src/daemon.rs", "handle_termination_signal"),
             ("src/daemon.rs", "request_stop"),
-            ("src/ipc/server.rs", "withdraw_after_activation_audit_failure"),
+            (
+                "src/ipc/server.rs",
+                "withdraw_after_activation_audit_failure",
+            ),
         ]
         .into_iter()
         .map(|(p, f)| (p.to_string(), f.to_string()))
@@ -679,32 +697,12 @@ mod structure {
         assert_eq!(callers, expected_callers);
     }
 
-    /// The body text of `fn <name>(` in `code`, from the signature to its
-    /// matching close brace.
-    fn fn_body<'a>(code: &'a str, name: &str) -> &'a str {
-        let start = code
-            .find(&format!("fn {name}("))
-            .unwrap_or_else(|| panic!("fn {name} must exist"));
-        let open = start + code[start..].find('{').unwrap_or_else(|| panic!("{name} body"));
-        let mut depth = 0usize;
-        for (i, c) in code[open..].char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return &code[start..open + i + 1];
-                    }
-                }
-                _ => {}
-            }
-        }
-        panic!("{name} body is unterminated")
-    }
-
     /// The next non-blank line after byte `offset`'s line.
     fn next_code_line(text: &str, offset: usize) -> &str {
-        let line_end = text[offset..].find('\n').map(|i| offset + i + 1).unwrap_or(text.len());
+        let line_end = text[offset..]
+            .find('\n')
+            .map(|i| offset + i + 1)
+            .unwrap_or(text.len());
         text[line_end..]
             .lines()
             .map(str::trim)
@@ -732,7 +730,10 @@ mod structure {
         let daemon = without_comment_lines(&production_part(&source("src/daemon.rs")));
         let mut sites = Vec::new();
         for at in offsets_of(&daemon, "self.decide_and_arm(") {
-            sites.push((enclosing_fn(&daemon, at), next_code_line(&daemon, at).to_string()));
+            sites.push((
+                enclosing_fn(&daemon, at),
+                next_code_line(&daemon, at).to_string(),
+            ));
         }
         let per_fn = |name: &str| sites.iter().filter(|(f, _)| f == name).count();
         assert_eq!(sites.len(), 10, "{sites:?}");
@@ -753,7 +754,10 @@ mod structure {
         // arm, so a new audited decision cannot write before it arms.
         for name in ["supervise_until_shutdown_body", "stop_final_health_outcome"] {
             let body = fn_body(&daemon, name);
-            for needle in ["self.record_recovery_attempt(", "self.record_runtime_loss(reason, false)"] {
+            for needle in [
+                "self.record_recovery_attempt(",
+                "self.record_runtime_loss(reason, false)",
+            ] {
                 for at in offsets_of(body, needle) {
                     assert!(
                         previous_code_line(body, at).starts_with("self.decide_and_arm(&outcome);"),
@@ -766,9 +770,13 @@ mod structure {
             // just before each recovery-attempt arm names that variant.
             for at in offsets_of(body, "self.record_recovery_attempt(") {
                 let head = &body[..at];
-                let built = head.rfind("let outcome = SupervisionOutcome::").map(|i| &head[i..]);
+                let built = head
+                    .rfind("let outcome = SupervisionOutcome::")
+                    .map(|i| &head[i..]);
                 assert!(
-                    built.is_some_and(|b| b.starts_with("let outcome = SupervisionOutcome::RepairRequired")),
+                    built.is_some_and(
+                        |b| b.starts_with("let outcome = SupervisionOutcome::RepairRequired")
+                    ),
                     "{name}: a recovery-attempt write must follow a RepairRequired decision"
                 );
             }

@@ -200,7 +200,10 @@ pub(crate) fn enclosing_fn(text: &str, offset: usize) -> String {
             }
         }
         if let Some(rest) = t.strip_prefix("fn ") {
-            return rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            return rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
         }
     }
     String::new()
@@ -229,4 +232,35 @@ pub(crate) fn in_ranges(ranges: &[(usize, usize)], offset: usize) -> bool {
 /// 1-based line number of byte `offset`.
 pub(crate) fn line_of(text: &str, offset: usize) -> usize {
     text[..offset].matches('\n').count() + 1
+}
+
+/// The text of `fn <name>(` in `code`, from the signature to the brace that
+/// closes its body. Braces in literals are not modelled; the functions this is
+/// used on contain none that are unbalanced.
+pub(crate) fn fn_body<'a>(code: &'a str, name: &str) -> &'a str {
+    let start = code
+        .find(&format!("fn {name}("))
+        .unwrap_or_else(|| panic!("fn {name} must exist"));
+    let open = start
+        + code[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("fn {name} must have a body"));
+    let close = matching_brace(code, open).unwrap_or_else(|| panic!("fn {name} is unterminated"));
+    &code[start..=close]
+}
+
+/// The `///` doc-comment block immediately above `fn <name>(` in `text`.
+pub(crate) fn doc_block_of(text: &str, name: &str) -> String {
+    let at = text
+        .find(&format!("fn {name}("))
+        .unwrap_or_else(|| panic!("fn {name} must exist"));
+    let mut docs: Vec<&str> = text[..at]
+        .lines()
+        .rev()
+        .skip(1)
+        .map(str::trim)
+        .take_while(|l| l.starts_with("///") || l.starts_with("#["))
+        .collect();
+    docs.reverse();
+    docs.join("\n")
 }

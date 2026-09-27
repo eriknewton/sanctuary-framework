@@ -294,13 +294,32 @@ impl BoundedHealthProbe {
         {
             let mut state = self.shared.lock();
             // Clear the terminal readings so the shared scheduling path below runs a
-            // real check instead of returning the cached verdict. `last` is left alone:
-            // the min-interval cache is a rate limit, and a caller on the recovery
-            // interval is already slower than it.
+            // real check instead of returning the cached verdict. `last` is cleared
+            // too, so the min-interval cache cannot answer in place of that check.
             state.latched_lost = false;
             state.latched_indeterminate = false;
             state.last = None;
         }
+        self.poll_result(check)
+    }
+
+    /// Run a live check, bypassing ONLY the min-interval cache (LINUX-STOP-FRESH-PROBE-LATCH-01).
+    ///
+    /// The stop-time final health pass needs a reading no older than the stop
+    /// request, so it must not be served a cached `Ready` younger than
+    /// [`ProbeBudget::min_interval`]; but it must also never re-litigate a proven
+    /// loss or an exhausted budget, which is what clearing the latches (as
+    /// [`reprobe_after_latch`](Self::reprobe_after_latch) does for the recovery
+    /// controller) would allow.
+    ///
+    /// INVARIANT: bypasses the rate-limit cache and nothing else; the terminal
+    /// latches are read before `last` in `poll_result`, so a stop-time read can
+    /// never restore readiness. Must match the latch order in `poll_result`.
+    pub fn poll_bypassing_cache<F>(&self, check: F) -> ProbeOutcome
+    where
+        F: FnOnce() -> Result<bool, ()> + Send + 'static,
+    {
+        self.shared.lock().last = None;
         self.poll_result(check)
     }
 
@@ -495,12 +514,19 @@ mod tests {
         let seeded = probe.shared.lock().last;
         assert_eq!(probe.poll_result(|| Err(())), ProbeOutcome::Unavailable);
         assert_eq!(probe.shared.lock().consecutive_unavailable, 1);
-        assert_eq!(probe.shared.lock().last, seeded, "no answer is not a reading");
+        assert_eq!(
+            probe.shared.lock().last,
+            seeded,
+            "no answer is not a reading"
+        );
         assert_eq!(probe.poll_result(|| Err(())), ProbeOutcome::Unavailable);
         assert_eq!(probe.poll_result(|| Err(())), ProbeOutcome::Indeterminate);
         let state = probe.shared.lock();
         assert!(state.latched_indeterminate);
-        assert!(!state.latched_lost, "an inconclusive budget is never a proven loss");
+        assert!(
+            !state.latched_lost,
+            "an inconclusive budget is never a proven loss"
+        );
         assert_eq!(state.last, seeded);
     }
 
@@ -535,13 +561,88 @@ mod tests {
         assert_eq!(probe.poll(|| true), ProbeOutcome::Lost);
     }
 
+    fn counting_check(
+        calls: &Arc<AtomicU32>,
+        answer: bool,
+    ) -> impl FnOnce() -> Result<bool, ()> + Send + 'static {
+        let calls = Arc::clone(calls);
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(answer)
+        }
+    }
+
+    /// T6 case A (LINUX-STOP-FRESH-PROBE-LATCH-01, R3 non-regression): a fresh
+    /// cached Ready inside `min_interval` does not answer for the stop-time read;
+    /// the check runs and its loss is seen.
+    #[test]
+    fn t6_a_the_stop_time_read_runs_a_live_check_inside_the_cache_window() {
+        let probe = BoundedHealthProbe::new(budget());
+        assert_eq!(probe.poll_result(|| Ok(true)), ProbeOutcome::Ready);
+        let calls = Arc::new(AtomicU32::new(0));
+        assert_eq!(
+            probe.poll_bypassing_cache(counting_check(&calls, false)),
+            ProbeOutcome::Lost
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the live check must run");
+    }
+
+    /// T6 case B: after a completed negative proof, a stop-time read that would
+    /// prove Ready runs NO check and stays Lost; both latches are untouched.
+    #[test]
+    fn t6_b_the_stop_time_read_never_clears_a_proven_loss() {
+        let probe = BoundedHealthProbe::new(budget());
+        assert_eq!(probe.poll_result(|| Ok(false)), ProbeOutcome::Lost);
+        let indeterminate_before = probe.shared.lock().latched_indeterminate;
+        let calls = Arc::new(AtomicU32::new(0));
+        assert_eq!(
+            probe.poll_bypassing_cache(counting_check(&calls, true)),
+            ProbeOutcome::Lost
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a latched loss runs no check"
+        );
+        let state = probe.shared.lock();
+        assert!(
+            state.latched_lost,
+            "the loss latch survives the stop-time read"
+        );
+        assert_eq!(state.latched_indeterminate, indeterminate_before);
+    }
+
+    /// T6 case C: the same for an exhausted indeterminate budget.
+    #[test]
+    fn t6_c_the_stop_time_read_never_clears_an_exhausted_budget() {
+        let probe = BoundedHealthProbe::new(ProbeBudget {
+            timeout: Duration::from_millis(200),
+            min_interval: Duration::ZERO,
+            max_consecutive_unavailable: 1,
+        });
+        assert_eq!(probe.poll_result(|| Err(())), ProbeOutcome::Indeterminate);
+        let calls = Arc::new(AtomicU32::new(0));
+        assert_eq!(
+            probe.poll_bypassing_cache(counting_check(&calls, true)),
+            ProbeOutcome::Indeterminate
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a latched budget runs no check"
+        );
+        let state = probe.shared.lock();
+        assert!(state.latched_indeterminate, "the budget latch survives");
+        assert!(!state.latched_lost);
+    }
+
     /// R3 (LINUX-STOP-LOSS-RACE-01, Claude F3): the exact cache Claude F3
     /// named. A loss that occurs INSIDE `min_interval` of the last completed
     /// check must read as cached `Ready` through `poll_result` (the ordinary
     /// path every periodic health call uses) -- that caching is intentional,
     /// the status-poll amplification guard the test above proves -- but MUST
-    /// be seen as `Lost` through `reprobe_after_latch`, the primitive the
-    /// stop-time final pass now uses instead. This is the unit-level proof
+    /// be seen as `Lost` through `poll_bypassing_cache`, the primitive the
+    /// stop-time final pass uses. This is the unit-level proof
     /// that the primitive `stop_final_health_outcome` was changed to call
     /// actually bypasses the cache it must bypass.
     #[test]
@@ -560,9 +661,9 @@ mod tests {
         );
         // The stop-time primitive must see the real, current state instead:
         assert_eq!(
-            probe.reprobe_after_latch(|| Ok(false)),
+            probe.poll_bypassing_cache(|| Ok(false)),
             ProbeOutcome::Lost,
-            "reprobe_after_latch must bypass the cache and run a live check, so a \
+            "poll_bypassing_cache must bypass the cache and run a live check, so a \
              loss inside the cache window is never read as a stale Ready"
         );
     }

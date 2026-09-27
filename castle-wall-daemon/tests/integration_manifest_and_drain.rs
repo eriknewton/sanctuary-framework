@@ -1386,7 +1386,10 @@ fn t3w_run(trigger: T3wTrigger) -> Option<T3wRun> {
         .arg(policy_dir.join("audit-producer.pub"))
         .args(isolation::subprocess_args())
         .arg("--test-hang-teardown")
-        .args(["--test-stop-guard-deadline-secs", &T3W_DEADLINE_SECS.to_string()])
+        .args([
+            "--test-stop-guard-deadline-secs",
+            &T3W_DEADLINE_SECS.to_string(),
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     if matches!(trigger, T3wTrigger::FatalControlPath) {
@@ -1510,9 +1513,12 @@ fn t3w_b_sigterm_with_a_wedged_teardown_exits_75_by_the_guard() {
     let Some(run) = t3w_run(T3wTrigger::Sigterm) else {
         return;
     };
-    let sigterm_at = run
-        .sigterm_at
-        .unwrap_or_else(|| panic!("the daemon never became signalable. stderr:\n{}", run.stderr));
+    let sigterm_at = run.sigterm_at.unwrap_or_else(|| {
+        panic!(
+            "the daemon never became signalable. stderr:\n{}",
+            run.stderr
+        )
+    });
     assert!(
         run.armed_at.is_some(),
         "the SIGTERM must arm the guard. stderr:\n{}",

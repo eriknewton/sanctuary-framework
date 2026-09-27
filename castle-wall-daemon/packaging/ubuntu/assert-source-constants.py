@@ -28,7 +28,14 @@ from pathlib import Path
 # Rule grammar, the owned-table parser, the receipt mint and the net script are byte-unchanged.
 # Claude and Grok code gates (three rounds, final dry) reviewed it before this pin moved.
 # The guard constants it mirrors are unchanged.
-NFTABLES_SOURCE_SHA256 = "2e4cc8a85918f6e545052eef74649ffd5ba18504894a11b8409374c868ec8e91"
+# Refreshed for C2a2 (2026-09-27, builder refresh; the slice's two-family code gate reviews
+# it before merge): nftables.rs gained the pid-safe bounded wait (pidfd kill, bounded
+# post-kill waits, parked children), the per-origin child slot table, an NftOrigin first
+# argument at every run_nft/run_nft_stdin call site, the NFT_INVOCATION_SITES inventory, the
+# test-isolation --test-nft-binary seam, and tests. The rule grammar, the owned-table parser,
+# the receipt mint and the net script are byte-unchanged. The guard constants it mirrors are
+# unchanged.
+NFTABLES_SOURCE_SHA256 = "f4fbdbd397e3bd4138deefefc46a2dea5d9241ee93773ba2c0355130d14f77c0"
 
 
 def fail(message):
