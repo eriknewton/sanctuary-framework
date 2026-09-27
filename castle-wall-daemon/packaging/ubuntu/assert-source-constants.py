@@ -42,7 +42,10 @@ from pathlib import Path
 # Refreshed for the round-2 polish (2026-09-27): ChildSlotTable::park refuses an id that is
 # not in flight, and the waiter-spawn failure path recovers a poisoned cell instead of
 # dropping the child. The rule grammar, parser, receipt mint and net script are unchanged.
-NFTABLES_SOURCE_SHA256 = "428c4a7017063d71b2c35dc309b587728f3525d83569504e6b38493a06aa4624"
+# Refreshed for C2a2b (2026-09-27): the only nftables.rs change is a doc-comment cross-file
+# pin on CastleTableOwnership ("must match JournalActivation in src/ownership_journal.rs").
+# No code line changed; the rule grammar, parser, receipt mint and net script are unchanged.
+NFTABLES_SOURCE_SHA256 = "84975b87a7e17879b2f1280fb75adbb6866ce3b99d49ce808adb4c6f8b3d7a2b"
 
 
 def fail(message):

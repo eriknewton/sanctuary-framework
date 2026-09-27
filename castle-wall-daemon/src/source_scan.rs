@@ -386,6 +386,9 @@ pub(crate) fn struct_fields(code: &str, decl: &str) -> Vec<(String, String)> {
         .find(decl)
         .unwrap_or_else(|| panic!("{decl} must exist"));
     let open = at + decl.len() - 1;
+    // Safety: `open` is the `{` that ends `decl`, a struct declaration's opening brace
+    // found in the crate's own compiling source, so a matching `}` exists; this is a
+    // test-only scanner over source text and never runs in the shipped daemon.
     let close = matching_brace(code, open).expect("the struct closes");
     top_level_params(&format!("({})", &code[open + 1..close]))
 }
